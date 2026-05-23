@@ -3,3 +3,11 @@
 # The wrapper keeps old protobuf-build version parsing compatible with modern
 # libprotoc versions while still executing the real compiler.
 PROTOC = { value = "scripts/protoc-compat.py", relative = true }
+
+# pyo3 `extension-module` leaves Python C-API symbols (__Py_*) unresolved
+# in the cdylib — the host interpreter provides them at .so load time.
+# Linux ELF tolerates this by default; macOS Mach-O does not. Maturin
+# normally injects these flags; we set them here so plain `cargo build`
+# can produce nexus_runtime.dylib without maturin.
+[target.'cfg(target_os = "macos")']
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
