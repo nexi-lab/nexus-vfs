@@ -186,7 +186,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // plane's ids are random, so the witness must JoinZone like
         // any other late-arriving voter rather than self-bootstrapping.
         let join_registry = registry.clone();
-        let join_zones: Vec<String> = std::iter::once(contracts::ROOT_ZONE_ID.to_string())
+        let join_zones: Vec<String> = std::iter::once(nexus_core::contracts::ROOT_ZONE_ID.to_string())
             .chain(federation_zones.iter().cloned())
             .collect();
         tokio::spawn(async move {
@@ -293,7 +293,7 @@ async fn tls_bootstrap_loop(
                 &peer.endpoint,
                 node_id,
                 node_address,
-                contracts::ROOT_ZONE_ID,
+                nexus_core::contracts::ROOT_ZONE_ID,
                 password,
                 10, // timeout
             )

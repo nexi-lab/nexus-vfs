@@ -14,7 +14,7 @@
 //!
 //! This module lives in the ``rpc`` driver-layer crate where both
 //! proto families are reachable: ``vfs.proto`` stubs come through
-//! ``kernel::kernel::vfs_proto`` (kernel re-exports the generated
+//! ``nexus_core::kernel::kernel::vfs_proto`` (kernel re-exports the generated
 //! module) and ``transport.proto`` ships in the raft rlib that rpc
 //! depends on for proto stubs.
 
@@ -30,7 +30,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
-use kernel::kernel::vfs_proto;
+use nexus_core::kernel::kernel::vfs_proto;
 use nexus_raft::federation::TofuTrustStore;
 use nexus_raft::transport::proto::nexus::raft::{
     zone_api_service_client::ZoneApiServiceClient, JoinZoneRequest,

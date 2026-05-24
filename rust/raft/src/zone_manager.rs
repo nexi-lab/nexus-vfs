@@ -1283,9 +1283,9 @@ impl ZoneManager {
         // "/__shares__/corp/eng/shared-X". Empty / non-absolute inputs
         // fall back to prefix itself (caller should have validated).
         if origin_path.is_empty() || !origin_path.starts_with('/') {
-            contracts::SHARE_REGISTRY_PREFIX.to_string()
+            nexus_core::contracts::SHARE_REGISTRY_PREFIX.to_string()
         } else {
-            format!("{}{}", contracts::SHARE_REGISTRY_PREFIX, origin_path)
+            format!("{}{}", nexus_core::contracts::SHARE_REGISTRY_PREFIX, origin_path)
         }
     }
 
@@ -1298,7 +1298,7 @@ impl ZoneManager {
     pub fn register_share(&self, origin_path: &str, zone_id: &str) -> Result<()> {
         let root = self
             .registry
-            .get_node(contracts::ROOT_ZONE_ID)
+            .get_node(nexus_core::contracts::ROOT_ZONE_ID)
             .ok_or_else(|| {
                 RaftError::InvalidState(
                     "root zone not found — share registry requires a live root raft group"
@@ -1309,7 +1309,7 @@ impl ZoneManager {
         // Encode as a DT_REG FileMetadata; target_zone_id carries the
         // advertised zone. backend_name is a marker that tells readers
         // "this is a share registry row, not a user inode".
-        let value = encode_file_metadata(&key, DT_REG, contracts::ROOT_ZONE_ID, zone_id);
+        let value = encode_file_metadata(&key, DT_REG, nexus_core::contracts::ROOT_ZONE_ID, zone_id);
         let handle = self.rt().handle().clone();
         propose_set_metadata(&handle, &root, &key, value)
     }
@@ -1320,7 +1320,7 @@ impl ZoneManager {
     pub fn lookup_share(&self, origin_path: &str) -> Result<Option<String>> {
         let root = self
             .registry
-            .get_node(contracts::ROOT_ZONE_ID)
+            .get_node(nexus_core::contracts::ROOT_ZONE_ID)
             .ok_or_else(|| {
                 RaftError::InvalidState(
                     "root zone not found — share registry requires a live root raft group"

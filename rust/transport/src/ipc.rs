@@ -36,8 +36,8 @@ use chrono::SecondsFormat;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use kernel::kernel::Kernel;
-use kernel::kernel::{KernelError, OperationContext};
+use nexus_core::kernel::kernel::Kernel;
+use nexus_core::kernel::kernel::{KernelError, OperationContext};
 
 // ── Path conventions (mirrors bricks/ipc/conventions.py) ────────────────────
 

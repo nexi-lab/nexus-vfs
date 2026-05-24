@@ -26,14 +26,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use contracts::lock_state::Locks;
+use nexus_core::contracts::lock_state::Locks;
 use dashmap::DashMap;
-use kernel::abc::meta_store::MetaStore;
-use kernel::core::vfs_router::canonicalize_mount_path as canonicalize;
-use kernel::hal::distributed_coordinator::{
+use nexus_core::kernel::abc::meta_store::MetaStore;
+use nexus_core::kernel::core::vfs_router::canonicalize_mount_path as canonicalize;
+use nexus_core::kernel::hal::distributed_coordinator::{
     ClusterInfo, CoordinatorResult, DistributedCoordinator, ShareInfo,
 };
-use kernel::kernel::Kernel;
+use nexus_core::kernel::kernel::Kernel;
 
 use crate::transport::NodeAddress;
 use crate::zone_meta_store::ZoneMetaStore;
@@ -1052,7 +1052,7 @@ impl RaftDistributedCoordinator {
         // `Progress[new_id].matched=0` from the moment AddNode commits,
         // so heartbeats with `m.commit=0` cannot trip `commit_to`'s
         // panic.  Witness binaries still derive ID from hostname (see
-        // `lib::transport_primitives::hostname_to_node_id`) — they
+        // `nexus_core::util::transport_primitives::hostname_to_node_id`) — they
         // never wipe-rejoin in practice and live at well-known
         // addresses, so the contract doesn't apply there.
         let node_id = read_or_mint_node_id(&zones_dir)?;
@@ -1575,7 +1575,7 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
         // mount is the prefix passed to `share_subtree_core`.
         let route = kernel
             .vfs_router_arc()
-            .route(local_path, contracts::ROOT_ZONE_ID)
+            .route(local_path, nexus_core::contracts::ROOT_ZONE_ID)
             .map_err(|e| format!("share_zone route '{local_path}': {e:?}"))?;
         let parent_zone = route.zone_id.clone();
         let prefix = if route.backend_path.is_empty() {
@@ -1643,7 +1643,7 @@ fn reconstruct_global_path(
     parent_zone_id: &str,
     mount_path: &str,
 ) -> Option<String> {
-    if parent_zone_id == contracts::ROOT_ZONE_ID || parent_zone_id.is_empty() {
+    if parent_zone_id == nexus_core::contracts::ROOT_ZONE_ID || parent_zone_id.is_empty() {
         return Some(mount_path.to_string());
     }
     let parent_global = cross_zone_mounts
@@ -1671,8 +1671,8 @@ fn reconstruct_global_path(
 /// every follower when raft applies a DT_MOUNT commit.
 #[allow(clippy::too_many_arguments)]
 fn wire_mount_core(
-    vfs_router: &Arc<kernel::core::vfs_router::VFSRouter>,
-    lock_manager: &Arc<kernel::core::lock::LockManager>,
+    vfs_router: &Arc<nexus_core::kernel::core::vfs_router::VFSRouter>,
+    lock_manager: &Arc<nexus_core::kernel::core::lock::LockManager>,
     registry: &Arc<crate::raft::ZoneRaftRegistry>,
     runtime: &tokio::runtime::Handle,
     cross_zone_mounts: &DashMap<String, Vec<CrossZoneMountTuple>>,
@@ -1716,7 +1716,7 @@ fn wire_mount_core(
         runtime.clone(),
         global_path.clone(),
     );
-    let root_canonical = canonicalize("/", contracts::ROOT_ZONE_ID);
+    let root_canonical = canonicalize("/", nexus_core::contracts::ROOT_ZONE_ID);
     let root_backend = vfs_router
         .get_canonical(&root_canonical)
         .and_then(|e| e.backend.clone());
@@ -1724,18 +1724,18 @@ fn wire_mount_core(
     // 4. Install into VFSRouter under the root zone.
     vfs_router.add_federation_mount(
         &global_path,
-        contracts::ROOT_ZONE_ID,
+        nexus_core::contracts::ROOT_ZONE_ID,
         root_backend,
         target_zone_id,
         false,
     );
-    let canonical = canonicalize(&global_path, contracts::ROOT_ZONE_ID);
+    let canonical = canonicalize(&global_path, nexus_core::contracts::ROOT_ZONE_ID);
     vfs_router.install_metastore(&canonical, metastore);
 
     // 5. LockManager upgrade on first federated mount — distributed
     //    locks bound to the ROOT zone's consensus.
     if !lock_manager.locks_installed() {
-        match registry.get_node(contracts::ROOT_ZONE_ID) {
+        match registry.get_node(nexus_core::contracts::ROOT_ZONE_ID) {
             Some(root_consensus) => {
                 tracing::info!(
                     parent_zone = %parent_zone_id,
@@ -1790,7 +1790,7 @@ fn wire_mount_core(
 /// mount no longer routes so subsequent ``sys_stat`` synthesises the
 /// absence of a DT_MOUNT directly from the empty routing entry.
 fn unwire_mount_core(
-    vfs_router: &Arc<kernel::core::vfs_router::VFSRouter>,
+    vfs_router: &Arc<nexus_core::kernel::core::vfs_router::VFSRouter>,
     cross_zone_mounts: &DashMap<String, Vec<CrossZoneMountTuple>>,
     parent_zone_id: &str,
     mount_path: &str,
@@ -1816,7 +1816,7 @@ fn unwire_mount_core(
         cross_zone_mounts.remove(&target);
     }
     if let Some(global) = unwired_global {
-        vfs_router.remove(&global, contracts::ROOT_ZONE_ID);
+        vfs_router.remove(&global, nexus_core::contracts::ROOT_ZONE_ID);
     }
 }
 
@@ -1827,8 +1827,8 @@ fn unwire_mount_core(
 /// the original `sys_setattr`).
 #[allow(clippy::too_many_arguments)]
 fn install_mount_apply_cb_impl(
-    vfs_router: &Arc<kernel::core::vfs_router::VFSRouter>,
-    lock_manager: &Arc<kernel::core::lock::LockManager>,
+    vfs_router: &Arc<nexus_core::kernel::core::vfs_router::VFSRouter>,
+    lock_manager: &Arc<nexus_core::kernel::core::lock::LockManager>,
     registry: &Arc<crate::raft::ZoneRaftRegistry>,
     runtime: &tokio::runtime::Handle,
     cross_zone_mounts: &Arc<DashMap<String, Vec<CrossZoneMountTuple>>>,

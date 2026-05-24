@@ -497,7 +497,7 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
                 }
                 let root_peers = self
                     .registry
-                    .get_peers(contracts::ROOT_ZONE_ID)
+                    .get_peers(nexus_core::contracts::ROOT_ZONE_ID)
                     .ok_or_else(|| {
                         Status::not_found(format!("zone '{}' not found on this node", req.zone_id))
                     })?;
@@ -1052,7 +1052,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
                 error: Some("zone_id must not be empty".to_string()),
             }));
         }
-        if zone_id == contracts::ROOT_ZONE_ID {
+        if zone_id == nexus_core::contracts::ROOT_ZONE_ID {
             return Ok(Response::new(DeleteZoneResponse {
                 success: false,
                 error: Some("root zone cannot be deleted by DeleteZone".to_string()),
@@ -1141,7 +1141,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
 
         // --- Sign node certificate ---
         let zone_id = if req.zone_id.is_empty() {
-            contracts::ROOT_ZONE_ID
+            nexus_core::contracts::ROOT_ZONE_ID
         } else {
             &req.zone_id
         };
@@ -1537,7 +1537,7 @@ impl WitnessZoneRegistry {
     }
 
     fn current_auto_join_peers(&self) -> Vec<NodeAddress> {
-        if let Some(root) = self.zones.get(contracts::ROOT_ZONE_ID) {
+        if let Some(root) = self.zones.get(nexus_core::contracts::ROOT_ZONE_ID) {
             let peers = root.peers.read().unwrap();
             if !peers.is_empty() {
                 return peers.values().cloned().collect();

@@ -109,7 +109,7 @@ pub mod pyo3_bindings;
 //
 //   distributed_coordinator.rs — `RaftDistributedCoordinator` impl of the
 //                                Control-Plane HAL §3.B.1 trait
-//   zone_meta_store.rs         — Raft-backed `kernel::abc::MetaStore` impl
+//   zone_meta_store.rs         — Raft-backed `nexus_core::kernel::abc::MetaStore` impl
 //   blob_fetcher_handler.rs    — `KernelBlobFetcher` server-side handler
 //                                co-located with `ZoneApiService` on the
 //                                raft port; reaches kernel data plane
@@ -117,7 +117,7 @@ pub mod pyo3_bindings;
 //
 // Distributed state (`ZoneManager`, `ZoneRaftRegistry`, tokio runtime,
 // cross-zone mounts reverse index) lives on the coordinator. WAL stream
-// / pipe backends live in `kernel::core::stream::wal` / `kernel::core::pipe::wal`
+// / pipe backends live in `nexus_core::kernel::core::stream::wal` / `nexus_core::kernel::core::pipe::wal`
 // — kernel primitives that compose whatever distributed `MetaStore` impl
 // the coordinator DI's (typically `ZoneMetaStore` below).
 #[cfg(all(feature = "grpc", has_protos))]
@@ -125,7 +125,7 @@ pub mod blob_fetcher_handler;
 #[cfg(all(feature = "grpc", has_protos))]
 pub mod distributed_coordinator;
 // WAL stream / pipe backends moved into the kernel crate
-// (`kernel::core::stream::wal`, `kernel::core::pipe::wal`) — they
+// (`nexus_core::kernel::core::stream::wal`, `nexus_core::kernel::core::pipe::wal`) — they
 // are kernel primitives that compose whatever distributed `MetaStore`
 // federation has DI'd (typically `ZoneMetaStore` below).  Raft no
 // longer ships its own `WalConsensus` trait; the kernel-side

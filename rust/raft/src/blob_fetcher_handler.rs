@@ -25,8 +25,8 @@ use std::sync::Arc;
 
 use crate::blob_fetcher::BlobFetcher;
 
-use kernel::kernel::OperationContext;
-use kernel::vfs_router::VFSRouter;
+use nexus_core::kernel::kernel::OperationContext;
+use nexus_core::kernel::vfs_router::VFSRouter;
 
 /// Closure type for "look up locally-stored content_id at this path" —
 /// federation builds this from `Kernel::content_id_lookup_fn` so the
@@ -83,10 +83,10 @@ impl BlobFetcher for KernelBlobFetcher {
         if content_id.is_empty() {
             return Err("empty content_id".to_string());
         }
-        let ctx = OperationContext::new("system", contracts::ROOT_ZONE_ID, true, None, true);
+        let ctx = OperationContext::new("system", nexus_core::contracts::ROOT_ZONE_ID, true, None, true);
 
         // Step 1: try path-style routing → local mount read.
-        if let Ok(route) = self.vfs_router.route(content_id, contracts::ROOT_ZONE_ID) {
+        if let Ok(route) = self.vfs_router.route(content_id, nexus_core::contracts::ROOT_ZONE_ID) {
             let local_content_id = (self.lookup_local_content_id)(content_id)
                 .unwrap_or_else(|| route.backend_path.clone());
             if let Some(bytes) = route
@@ -120,7 +120,7 @@ impl BlobFetcher for KernelBlobFetcher {
 }
 
 /// Install hook called from `nexus-cdylib`'s `#[pymodule]` boot after
-/// `kernel::python::register` so the raft server's `BlobFetcherSlot`
+/// `nexus_core::kernel::python::register` so the raft server's `BlobFetcherSlot`
 /// carries a kernel-backed fetcher before the first federation read.
 ///
 /// No-op when `Kernel::pending_blob_fetcher_slot` is empty (federation
@@ -129,7 +129,7 @@ impl BlobFetcher for KernelBlobFetcher {
 /// Kernel hands back the slot as `Box<dyn Any + Send + Sync>`; this
 /// handler downcasts to the concrete `BlobFetcherSlot` here, which
 /// is fine because the handler lives in raft alongside the type.
-pub fn install(kernel: &Arc<kernel::kernel::Kernel>) {
+pub fn install(kernel: &Arc<nexus_core::kernel::kernel::Kernel>) {
     let Some(any_slot) = kernel.take_pending_blob_fetcher_slot() else {
         return;
     };
@@ -143,7 +143,7 @@ pub fn install(kernel: &Arc<kernel::kernel::Kernel>) {
             return;
         }
     };
-    let lookup = kernel.content_id_lookup_fn(contracts::ROOT_ZONE_ID);
+    let lookup = kernel.content_id_lookup_fn(nexus_core::contracts::ROOT_ZONE_ID);
     let fetcher = Arc::new(KernelBlobFetcher::new(kernel.vfs_router_arc(), lookup));
     *slot.write() = Some(fetcher as Arc<dyn BlobFetcher>);
 }

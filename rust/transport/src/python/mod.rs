@@ -1,7 +1,7 @@
 //! `transport::python` — transport-tier PyO3 surface.
 //!
-//! Mirrors `kernel::python::register`, `services::python::register`,
-//! `backends::python::register` — single entry point the
+//! Mirrors `nexus_core::kernel::python::register`, `nexus_core::services::python::register`,
+//! `nexus_core::backends::python::register` — single entry point the
 //! `nexus-cdylib` `#[pymodule] fn nexus_runtime` invokes.
 //!
 //! Registers:
@@ -12,7 +12,7 @@
 //!   replaces the kernel's `NoopPeerBlobClient` with the real
 //!   `transport::peer_blob::PeerBlobClient` impl.
 
-use kernel::generated_kernel_abi_pyo3::PyKernel;
+use nexus_core::kernel::generated_kernel_abi_pyo3::PyKernel;
 use pyo3::prelude::*;
 
 use crate::federation;

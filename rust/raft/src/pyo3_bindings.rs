@@ -793,7 +793,7 @@ fn hostname_to_node_id(hostname: &str) -> u64 {
 /// Raft is an rlib inside the ``nexus_runtime`` cdylib; kernel's own
 /// ``#[pymodule]`` calls this function to expose ``MetaStore`` and the
 /// federation wiring helpers from the single ``nexus_runtime`` Python
-/// module. Kept ``pub`` so ``kernel::lib::nexus_runtime`` can reach
+/// module. Kept ``pub`` so ``nexus_core::kernel::lib::nexus_runtime`` can reach
 /// it via the ``nexus_raft_lib::register_python_classes`` path.
 pub fn register_python_classes(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMetaStore>()?;
@@ -809,7 +809,7 @@ pub fn register_python_classes(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     #[cfg(feature = "grpc")]
     {
-        use lib::transport_primitives::{PyTofuTrustStore, PyTrustedZone};
+        use nexus_core::util::transport_primitives::{PyTofuTrustStore, PyTrustedZone};
         m.add_class::<PyTofuTrustStore>()?;
         m.add_class::<PyTrustedZone>()?;
     }
@@ -840,7 +840,7 @@ pub fn register_python_classes(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[pyfunction]
 #[pyo3(name = "federation_is_initialized")]
 fn federation_is_initialized_py(
-    kernel: PyRef<'_, kernel::generated_kernel_abi_pyo3::PyKernel>,
+    kernel: PyRef<'_, nexus_core::kernel::generated_kernel_abi_pyo3::PyKernel>,
 ) -> PyResult<bool> {
     let k = kernel.kernel_ref();
     // Routes through the trait's `is_initialized` method (RaftDistributedCoordinator
@@ -864,7 +864,7 @@ fn federation_is_initialized_py(
 #[pyfunction]
 #[pyo3(name = "install_federation_wiring")]
 fn install_federation_wiring_py(
-    kernel: PyRef<'_, kernel::generated_kernel_abi_pyo3::PyKernel>,
+    kernel: PyRef<'_, nexus_core::kernel::generated_kernel_abi_pyo3::PyKernel>,
 ) -> PyResult<()> {
     let kernel_arc = kernel.kernel_arc();
     crate::distributed_coordinator::install(&kernel_arc)
@@ -887,7 +887,7 @@ fn install_federation_wiring_py(
 #[pyo3(name = "federation_remove_zone")]
 #[pyo3(signature = (kernel, zone_id, force=false))]
 fn federation_remove_zone_py(
-    kernel: PyRef<'_, kernel::generated_kernel_abi_pyo3::PyKernel>,
+    kernel: PyRef<'_, nexus_core::kernel::generated_kernel_abi_pyo3::PyKernel>,
     zone_id: &str,
     force: bool,
 ) -> PyResult<()> {
@@ -904,7 +904,7 @@ fn federation_remove_zone_py(
 #[pyo3(name = "federation_join_zone")]
 #[pyo3(signature = (kernel, zone_id, as_learner=false))]
 fn federation_join_zone_py(
-    kernel: PyRef<'_, kernel::generated_kernel_abi_pyo3::PyKernel>,
+    kernel: PyRef<'_, nexus_core::kernel::generated_kernel_abi_pyo3::PyKernel>,
     zone_id: &str,
     as_learner: bool,
 ) -> PyResult<String> {
@@ -926,7 +926,7 @@ fn federation_join_zone_py(
 #[pyo3(name = "federation_share_zone")]
 fn federation_share_zone_py<'py>(
     py: pyo3::Python<'py>,
-    kernel: PyRef<'_, kernel::generated_kernel_abi_pyo3::PyKernel>,
+    kernel: PyRef<'_, nexus_core::kernel::generated_kernel_abi_pyo3::PyKernel>,
     local_path: &str,
     new_zone_id: &str,
 ) -> PyResult<pyo3::Bound<'py, pyo3::types::PyDict>> {
@@ -948,7 +948,7 @@ fn federation_share_zone_py<'py>(
 #[pyfunction]
 #[pyo3(name = "federation_lookup_share")]
 fn federation_lookup_share_py(
-    kernel: PyRef<'_, kernel::generated_kernel_abi_pyo3::PyKernel>,
+    kernel: PyRef<'_, nexus_core::kernel::generated_kernel_abi_pyo3::PyKernel>,
     remote_path: &str,
 ) -> PyResult<Option<String>> {
     let k = kernel.kernel_ref();
@@ -969,7 +969,7 @@ fn federation_lookup_share_py(
 #[pyo3(name = "federation_cluster_info")]
 fn federation_cluster_info_py<'py>(
     py: pyo3::Python<'py>,
-    kernel: PyRef<'_, kernel::generated_kernel_abi_pyo3::PyKernel>,
+    kernel: PyRef<'_, nexus_core::kernel::generated_kernel_abi_pyo3::PyKernel>,
     zone_id: &str,
 ) -> PyResult<pyo3::Bound<'py, pyo3::types::PyDict>> {
     use pyo3::types::PyDict;

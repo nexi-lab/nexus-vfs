@@ -86,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // single-node group and self-elects. Peer nodes join later via
         // the JoinZone RPC once they come online.
         registry
-            .create_zone(contracts::ROOT_ZONE_ID, vec![], &runtime_handle)
+            .create_zone(nexus_core::contracts::ROOT_ZONE_ID, vec![], &runtime_handle)
             .map_err(|e| format!("create root zone: {}", e))?;
 
         let server = RaftGrpcServer::new(

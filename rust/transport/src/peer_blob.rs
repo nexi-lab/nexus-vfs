@@ -49,7 +49,7 @@ pub struct PeerBlobClient {
     /// (same cert material that `ZoneManager` uses for raft RPCs — one
     /// trust anchor per cluster). When absent, plaintext HTTP/2 — the
     /// docker federation test intentionally sets `NEXUS_RAFT_TLS=false`.
-    tls: parking_lot::RwLock<Option<lib::transport_primitives::TlsConfig>>,
+    tls: parking_lot::RwLock<Option<nexus_core::util::transport_primitives::TlsConfig>>,
 }
 
 #[allow(dead_code)]
@@ -73,7 +73,7 @@ impl PeerBlobClient {
     /// reconnects over TLS. Called from `Kernel::init_federation_from_env`
     /// once the leader / joiner has resolved the cluster CA + node
     /// cert.
-    pub fn install_tls_config(&self, tls: lib::transport_primitives::TlsConfig) {
+    pub fn install_tls_config(&self, tls: nexus_core::util::transport_primitives::TlsConfig) {
         *self.tls.write() = Some(tls);
         self.channels.clear();
     }
@@ -101,11 +101,11 @@ impl PeerBlobClient {
         } else {
             format!("{}://{}", scheme, address)
         };
-        let client_cfg = lib::transport_primitives::ClientConfig {
+        let client_cfg = nexus_core::util::transport_primitives::ClientConfig {
             tls,
             ..Default::default()
         };
-        let channel = lib::transport_primitives::create_channel(&endpoint, &client_cfg)
+        let channel = nexus_core::util::transport_primitives::create_channel(&endpoint, &client_cfg)
             .await
             .map_err(|e| format!("peer channel {}: {}", address, e))?;
         self.channels
@@ -159,10 +159,10 @@ impl PeerBlobClient {
         // cluster mTLS). Message caps match the server: tonic's
         // default 4 MiB decode cap would reject any CAS chunk above
         // that threshold (16 MiB CDC boundary).
-        // SSOT: ``contracts::MAX_GRPC_MESSAGE_BYTES``.
+        // SSOT: ``nexus_core::contracts::MAX_GRPC_MESSAGE_BYTES``.
         let mut client = ZoneApiServiceClient::new(channel)
-            .max_decoding_message_size(contracts::MAX_GRPC_MESSAGE_BYTES)
-            .max_encoding_message_size(contracts::MAX_GRPC_MESSAGE_BYTES);
+            .max_decoding_message_size(nexus_core::contracts::MAX_GRPC_MESSAGE_BYTES)
+            .max_encoding_message_size(nexus_core::contracts::MAX_GRPC_MESSAGE_BYTES);
         let mut request = tonic::Request::new(ReadBlobRequest {
             content_id: content_id.to_string(),
         });
@@ -202,12 +202,12 @@ pub fn build_kernel_runtime() -> Arc<tokio::runtime::Runtime> {
 
 // ── HAL trait wiring ─────────────────────────────────────────────────
 //
-// Kernel holds an `Arc<dyn kernel::hal::peer::PeerBlobClient>`. The
+// Kernel holds an `Arc<dyn nexus_core::kernel::hal::peer::PeerBlobClient>`. The
 // impl block adapts the inherent `fetch` / `install_tls_config`
 // methods to the trait's `fetch` / `install_tls` shape.
 
-impl kernel::hal::peer::PeerBlobClient for PeerBlobClient {
-    fn fetch(&self, addr: &str, content_id: &str) -> kernel::hal::peer::PeerBlobResult<Vec<u8>> {
+impl nexus_core::kernel::hal::peer::PeerBlobClient for PeerBlobClient {
+    fn fetch(&self, addr: &str, content_id: &str) -> nexus_core::kernel::hal::peer::PeerBlobResult<Vec<u8>> {
         // Inherent method shadows the trait method — fully-qualify.
         PeerBlobClient::fetch(self, addr, content_id)
     }
@@ -215,7 +215,7 @@ impl kernel::hal::peer::PeerBlobClient for PeerBlobClient {
     fn install_tls(&self, ca_pem: &[u8], cert_pem: Option<&[u8]>, key_pem: Option<&[u8]>) {
         // mTLS requires *both* a client cert and key — if either is
         // missing the trait caller is in CA-only / server-auth mode,
-        // which the underlying `lib::transport_primitives::TlsConfig`
+        // which the underlying `nexus_core::util::transport_primitives::TlsConfig`
         // does not yet model (its `cert_pem`/`key_pem` are `Vec<u8>`,
         // not `Option<Vec<u8>>`). Drop the install in that case so the
         // peer client stays plaintext rather than constructing an
@@ -229,7 +229,7 @@ impl kernel::hal::peer::PeerBlobClient for PeerBlobClient {
         };
         PeerBlobClient::install_tls_config(
             self,
-            lib::transport_primitives::TlsConfig {
+            nexus_core::util::transport_primitives::TlsConfig {
                 ca_pem: ca_pem.to_vec(),
                 cert_pem: cert.to_vec(),
                 key_pem: key.to_vec(),
@@ -242,9 +242,9 @@ impl kernel::hal::peer::PeerBlobClient for PeerBlobClient {
 /// constructs a `PeerBlobClient` on the kernel-owned tokio runtime
 /// and installs it via `Kernel::set_peer_client`, replacing the
 /// `NoopPeerBlobClient` default.
-pub fn install(kernel: &kernel::kernel::Kernel) {
+pub fn install(kernel: &nexus_core::kernel::kernel::Kernel) {
     let client = Arc::new(PeerBlobClient::new(Arc::clone(kernel.runtime())));
-    kernel.set_peer_client(client as Arc<dyn kernel::hal::peer::PeerBlobClient>);
+    kernel.set_peer_client(client as Arc<dyn nexus_core::kernel::hal::peer::PeerBlobClient>);
 }
 
 #[cfg(test)]

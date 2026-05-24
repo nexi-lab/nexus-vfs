@@ -15,10 +15,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::storage::{RedbStore, RedbTree};
 
-// Advisory lock types are the shared SSOT, defined in `contracts::lock_state`.
+// Advisory lock types are the shared SSOT, defined in `nexus_core::contracts::lock_state`.
 // Re-exported from this module (and from `crate::raft`) so existing
 // callers keep their `use raft::{LockMode, ...}` paths.
-pub use contracts::lock_state::{
+pub use nexus_core::contracts::lock_state::{
     HolderInfo, LockAcquireResult, LockEntry, LockInfo, LockMode, LockState,
 };
 
@@ -181,7 +181,7 @@ pub enum CommandResult {
 
 // Advisory lock types — `LockMode`, `HolderInfo`, `LockInfo`,
 // `LockAcquireResult`, `LockEntry`, `LockState` — are now defined in
-// `contracts::lock_state` and re-exported at the top of this file. All
+// `nexus_core::contracts::lock_state` and re-exported at the top of this file. All
 // state-transition logic lives on `LockState` (the shared BTreeMap-based
 // SSOT) so the local `LockManager` path and the raft apply path go
 // through the same primitives under the same mutex.

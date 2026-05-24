@@ -1,7 +1,7 @@
 //! Rust-native gRPC server for `NexusVFSService`.
 //!
 //! Owns the :2028 socket via tonic. Auth is handled by
-//! `services::auth::AuthProvider` (pure Rust).
+//! `nexus_core::services::auth::AuthProvider` (pure Rust).
 //!
 //! Per-RPC architecture:
 //!
@@ -16,18 +16,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use services::auth::AuthProvider;
+use nexus_core::services::auth::AuthProvider;
 use tokio::sync::oneshot;
 use tonic::{transport::Server, Request, Response, Status};
 
 use crate::TlsConfig;
-use kernel::kernel::vfs_proto::{
+use nexus_core::kernel::kernel::vfs_proto::{
     nexus_vfs_service_server::{NexusVfsService, NexusVfsServiceServer},
     BatchReadItemResponse, BatchReadRequest, BatchReadResponse, CallRequest, CallResponse,
     DeleteRequest, DeleteResponse, InitializeRequest, InitializeResponse, PingRequest,
     PingResponse, ReadRequest, ReadResponse, WriteRequest, WriteResponse,
 };
-use kernel::kernel::{Kernel, KernelError, OperationContext};
+use nexus_core::kernel::kernel::{Kernel, KernelError, OperationContext};
 
 /// Configuration for the VFS gRPC server.
 #[derive(Clone)]
@@ -36,7 +36,7 @@ pub struct VfsGrpcConfig {
     /// Optional mTLS config (PEM bytes). `None` = plaintext HTTP/2.
     pub tls: Option<TlsConfig>,
     /// Max gRPC message size in bytes (default 64 MiB to match
-    /// `contracts::constants::MAX_GRPC_MESSAGE_BYTES`).
+    /// `nexus_core::contracts::constants::MAX_GRPC_MESSAGE_BYTES`).
     pub max_message_bytes: usize,
     /// Server `version` advertised in `Ping` responses.
     pub server_version: String,
@@ -109,7 +109,7 @@ impl VfsServiceImpl {
     pub(crate) fn for_test(kernel: Arc<Kernel>) -> Self {
         Self {
             kernel,
-            auth: Arc::new(services::auth::ApiKeyAuth::new("test-key")),
+            auth: Arc::new(nexus_core::services::auth::ApiKeyAuth::new("test-key")),
             server_started_at: Instant::now(),
             server_version: Arc::from("test"),
             started_secs: Arc::new(AtomicU64::new(0)),
@@ -255,10 +255,10 @@ impl NexusVfsService for VfsServiceImpl {
             ));
         }
 
-        let rust_reqs: Vec<kernel::kernel::ReadRequest> = req
+        let rust_reqs: Vec<nexus_core::kernel::kernel::ReadRequest> = req
             .items
             .into_iter()
-            .map(|it| kernel::kernel::ReadRequest {
+            .map(|it| nexus_core::kernel::kernel::ReadRequest {
                 path: it.path,
                 offset: it.offset,
                 len: it.length,
@@ -467,11 +467,11 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
 
-    use kernel::abc::object_store::{ObjectStore, StorageError, WriteResult};
-    use kernel::kernel::vfs_proto::{
+    use nexus_core::kernel::abc::object_store::{ObjectStore, StorageError, WriteResult};
+    use nexus_core::kernel::kernel::vfs_proto::{
         nexus_vfs_service_server::NexusVfsService, BatchReadItemRequest, BatchReadRequest,
     };
-    use kernel::kernel::Kernel;
+    use nexus_core::kernel::kernel::Kernel;
 
     #[derive(Default)]
     struct MemBackend {
@@ -487,7 +487,7 @@ mod tests {
             &self,
             content: &[u8],
             content_id: &str,
-            _ctx: &kernel::kernel::OperationContext,
+            _ctx: &nexus_core::kernel::kernel::OperationContext,
             offset: u64,
         ) -> Result<WriteResult, StorageError> {
             let mut map = self.blobs.lock().unwrap();
@@ -512,7 +512,7 @@ mod tests {
         fn read_content(
             &self,
             content_id: &str,
-            _ctx: &kernel::kernel::OperationContext,
+            _ctx: &nexus_core::kernel::kernel::OperationContext,
         ) -> Result<Vec<u8>, StorageError> {
             self.blobs
                 .lock()
@@ -534,7 +534,7 @@ mod tests {
             None,
             None,
             "",
-            kernel::ROOT_ZONE_ID,
+            nexus_core::kernel::ROOT_ZONE_ID,
             false,
             0,
             None,

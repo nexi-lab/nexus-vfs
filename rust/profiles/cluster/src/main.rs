@@ -21,11 +21,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use backends::storage::path_local::PathLocalBackend;
+use nexus_core::backends::storage::path_local::PathLocalBackend;
 use clap::{Parser, Subcommand};
-use kernel::abc::object_store::ObjectStore;
-use kernel::kernel::Kernel;
-use kernel::meta_store::DT_MOUNT;
+use nexus_core::kernel::abc::object_store::ObjectStore;
+use nexus_core::kernel::kernel::Kernel;
+use nexus_core::kernel::meta_store::DT_MOUNT;
 
 use nexus_raft::distributed_coordinator::{
     bootstrap_or_join_zone, read_or_mint_node_id, validate_bootstrap_mode,
@@ -272,7 +272,7 @@ fn open_zone_manager(
     } else {
         let bundle = bootstrap_tls(
             &common.data_dir,
-            contracts::ROOT_ZONE_ID,
+            nexus_core::contracts::ROOT_ZONE_ID,
             &hostname,
             node_id,
         )
@@ -394,7 +394,7 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
             None,
             None,
             "memory",
-            contracts::ROOT_ZONE_ID,
+            nexus_core::contracts::ROOT_ZONE_ID,
             false,
             0,
             None,
@@ -417,7 +417,7 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
 
     // Build VFS gRPC service as tonic Routes — co-hosted on the raft
     // port via ZoneManager. Uses NoAuth (mTLS is the boundary).
-    let vfs_auth: Arc<dyn services::auth::AuthProvider> = Arc::new(services::auth::NoAuth);
+    let vfs_auth: Arc<dyn nexus_core::services::auth::AuthProvider> = Arc::new(nexus_core::services::auth::NoAuth);
     let vfs_routes = transport::grpc::build_vfs_routes(
         Arc::clone(&kernel),
         vfs_auth,
@@ -497,7 +497,7 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     let zm_for_loop = zm.clone();
     let topology_handle = tokio::spawn(async move {
         loop {
-            match zm_for_loop.apply_topology(contracts::ROOT_ZONE_ID) {
+            match zm_for_loop.apply_topology(nexus_core::contracts::ROOT_ZONE_ID) {
                 Ok(true) => {
                     if !zm_for_loop.pending_mounts().is_empty() {
                         tokio::time::sleep(TOPOLOGY_TICK).await;
@@ -652,7 +652,7 @@ fn run_mount(
 fn run_unmount(common: CommonArgs, mount_point: &str) -> Result<()> {
     let _bundle = open_zone_manager(&common, None)?;
     let kernel = Arc::new(Kernel::new());
-    let ctx = contracts::OperationContext::new(
+    let ctx = nexus_core::contracts::OperationContext::new(
         /* user_id */ "operator", /* zone_id */ "root", /* is_admin */ true,
         /* agent_id */ None, /* is_system */ true,
     );

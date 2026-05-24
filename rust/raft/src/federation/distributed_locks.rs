@@ -1,6 +1,6 @@
 //! Distributed advisory-lock backend.
 //!
-//! Implements the ``contracts::Locks`` trait on top of a
+//! Implements the ``nexus_core::contracts::Locks`` trait on top of a
 //! ``ZoneConsensus<FullStateMachine>``. Write operations propose a
 //! ``Command::{Acquire,Release,Force,Extend}Lock`` through raft; the
 //! apply path mutates the shared ``Arc<Mutex<LockState>>`` on every
@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use contracts::lock_state::{LockInfo, LockMode, LockState, Locks};
+use nexus_core::contracts::lock_state::{LockInfo, LockMode, LockState, Locks};
 
 use crate::raft::{Command, CommandResult, FullStateMachine, ZoneConsensus};
 
@@ -65,7 +65,7 @@ impl DistributedLocks {
         // Adopt the state machine's shared advisory Arc.  Two callers
         // reach this path:
         //
-        //   1. ``kernel::sys_setattr DT_MOUNT`` — sync gRPC handler
+        //   1. ``nexus_core::kernel::sys_setattr DT_MOUNT`` — sync gRPC handler
         //      thread, no tokio runtime context.
         //   2. ``mount_apply_cb`` on followers — the closure fires
         //      inside the raft apply loop, which IS a tokio task on

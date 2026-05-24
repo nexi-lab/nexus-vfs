@@ -5,7 +5,7 @@
 //! * In-bound (server side): VFS gRPC server on port 2028, IPC
 //!   envelope helpers.
 //! * Out-bound (driver-side clients): peer-blob fetch client
-//!   implementing `lib::transport_primitives::PeerBlobClient`,
+//!   implementing `nexus_core::util::transport_primitives::PeerBlobClient`,
 //!   federation peer client (`PyFederationClient`) for discover/join
 //!   flows.
 //!
@@ -41,17 +41,17 @@ pub mod peer_blob;
 #[cfg(feature = "python")]
 pub mod python;
 
-/// Out-bound VFS gRPC client. Re-exported from `kernel::rpc_transport`
+/// Out-bound VFS gRPC client. Re-exported from `nexus_core::kernel::rpc_transport`
 /// where the type is declared (kernel-internal `RemoteMetaStore`
 /// wrappers wrap the same struct).
 pub mod vfs {
-    pub use kernel::rpc_transport::{RpcTransport, TlsConfig as VfsTlsConfig};
+    pub use nexus_core::kernel::rpc_transport::{RpcTransport, TlsConfig as VfsTlsConfig};
 }
 
 // Re-export low-level primitive types under the transport crate's
 // namespace so existing call sites keep working.
-pub use lib::transport_primitives::{
+pub use nexus_core::util::transport_primitives::{
     create_channel, hostname_to_node_id, ClientConfig, ConnectionPool, NodeAddress, PeerAddress,
     ServerConfig, TlsConfig, TransportError,
 };
-pub type Result<T> = lib::transport_primitives::Result<T>;
+pub type Result<T> = nexus_core::util::transport_primitives::Result<T>;

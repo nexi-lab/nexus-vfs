@@ -26,10 +26,10 @@ use std::sync::Arc;
 
 use crate::prelude::{Command, FullStateMachine, ZoneConsensus};
 use crate::transport::proto::nexus::core::FileMetadata as ProtoFileMetadata;
-use contracts::VFS_ROOT;
+use nexus_core::contracts::VFS_ROOT;
 use prost::Message;
 
-use kernel::meta_store::{FileMetadata as KernelFileMetadata, MetaStore, MetaStoreError};
+use nexus_core::kernel::meta_store::{FileMetadata as KernelFileMetadata, MetaStore, MetaStoreError};
 
 fn bridge_block_on<F>(handle: &tokio::runtime::Handle, fut: F) -> F::Output
 where
@@ -42,7 +42,7 @@ where
     }
 }
 
-/// ``kernel::MetaStore`` impl backed by a single ``ZoneConsensus``.
+/// ``nexus_core::kernel::MetaStore`` impl backed by a single ``ZoneConsensus``.
 ///
 /// The ``mount_point`` field is the VFS-global prefix this zone is
 /// exposed under (e.g. ``/corp``). It is used to translate between
