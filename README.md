@@ -1,6 +1,6 @@
 # Nexus — VFS + Rust Core (trimmed)
 
-Private fork of [`nexi-lab/nexus`](https://github.com/nexi-lab/nexus) with the
+Trimmed fork of [`nexi-lab/nexus`](https://github.com/nexi-lab/nexus) with the
 Python codebase, Docker/k8s stack, docs, and benchmarks stripped out. What
 remains is the Rust core workspace and the standalone FUSE daemon.
 
