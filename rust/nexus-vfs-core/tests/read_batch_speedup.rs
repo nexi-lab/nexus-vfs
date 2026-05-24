@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use kernel::abc::object_store::{ObjectStore, StorageError, WriteResult};
-use kernel::kernel::{Kernel, OperationContext, ReadRequest};
+use nexus_vfs_core::kernel::abc::object_store::{ObjectStore, StorageError, WriteResult};
+use nexus_vfs_core::kernel::kernel::{Kernel, OperationContext, ReadRequest};
 
 // ── Helpers shared with benches/read_batch.rs ───────────────────────────────
 // Duplicated by design: benches and integration tests live in different
@@ -140,7 +140,7 @@ fn setup_kernel_with_100_files() -> Kernel {
         None,
         None,
         "",
-        kernel::ROOT_ZONE_ID,
+        nexus_vfs_core::kernel::ROOT_ZONE_ID,
         false,
         0,
         None,
@@ -175,7 +175,7 @@ fn setup_kernel_with_100_files() -> Kernel {
         None,
         None,
         "",
-        kernel::ROOT_ZONE_ID,
+        nexus_vfs_core::kernel::ROOT_ZONE_ID,
         false,
         0,
         None,

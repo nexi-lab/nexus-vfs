@@ -19,8 +19,8 @@
 //!
 //! # Usage
 //!
-//! ```no_run
-//! use nexus_runtime::ipc::{send_message, wait_for_message, MessageEnvelope};
+//! ```ignore
+//! use nexus_vfs_cluster::transport::ipc::{send_message, wait_for_message, MessageEnvelope};
 //!
 //! // Send
 //! let envelope = MessageEnvelope::new("agent:sender", "agent:reviewer", "task", payload);

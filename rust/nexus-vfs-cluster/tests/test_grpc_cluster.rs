@@ -21,8 +21,8 @@
 
 #[cfg(all(feature = "grpc", has_protos))]
 mod grpc_cluster {
-    use nexus_raft::raft::{RaftStorage, ZoneRaftRegistry};
-    use nexus_raft::transport::{
+    use nexus_vfs_cluster::raft::raft::{RaftStorage, ZoneRaftRegistry};
+    use nexus_vfs_cluster::raft::transport::{
         ClientConfig, NodeAddress, RaftApiClient, RaftGrpcServer, ServerConfig,
     };
     use raft::eraftpb::ConfState;
@@ -52,7 +52,7 @@ mod grpc_cluster {
     async fn connect_client(
         endpoint: &str,
         config: ClientConfig,
-    ) -> nexus_raft::transport::Result<RaftApiClient> {
+    ) -> nexus_vfs_cluster::raft::transport::Result<RaftApiClient> {
         RaftApiClient::connect(endpoint, config)
             .await
             .map(|c| c.with_zone_id("default".into()))
@@ -244,7 +244,7 @@ mod grpc_cluster {
             .expect("Failed to connect to leader");
 
         // Construct a FileMetadata proto message
-        use nexus_raft::transport::proto::nexus::core::FileMetadata;
+        use nexus_vfs_cluster::raft::transport::proto::nexus::core::FileMetadata;
         let metadata = FileMetadata {
             path: "/test/hello.txt".to_string(),
             size: 42,
@@ -399,18 +399,19 @@ mod grpc_cluster {
         tracing::info!("All tests passed ✓");
     }
 
-    /// Test against a live Docker cluster (ports 2026/2027/2028).
+    /// Test against a live Docker cluster (ports 2126/2127/2128).
     ///
-    /// Runs by default. Skip with `NEXUS_DOCKER_TEST=0`.
-    /// Start the cluster first:
+    /// Opt-in: run with `cargo test -- --ignored`. Requires the cluster
+    /// to be up; start it with:
     ///   docker compose -f dockerfiles/docker-compose.cross-platform-test.yml up -d
+    ///
+    /// (The earlier probe-and-skip default was fragile: any unrelated
+    /// process listening on :2126 — e.g. a local nexus-vfsd dev daemon —
+    /// passed the probe and then made the test fail "Leader election
+    /// timed out" against a single-node cluster.)
     #[tokio::test]
+    #[ignore = "requires live Docker cluster (cross-platform-test compose)"]
     async fn test_docker_cluster() {
-        // Skip if explicitly disabled
-        if std::env::var("NEXUS_DOCKER_TEST").unwrap_or_default() == "0" {
-            eprintln!("Skipping Docker cluster test (NEXUS_DOCKER_TEST=0)");
-            return;
-        }
 
         // Check if Docker cluster is reachable before running
         let probe_config = ClientConfig {
@@ -499,7 +500,7 @@ mod grpc_cluster {
             .await
             .expect("Failed to connect to leader");
 
-        use nexus_raft::transport::proto::nexus::core::FileMetadata;
+        use nexus_vfs_cluster::raft::transport::proto::nexus::core::FileMetadata;
         let metadata = FileMetadata {
             path: "/docker-test/hello.txt".to_string(),
             size: 123,

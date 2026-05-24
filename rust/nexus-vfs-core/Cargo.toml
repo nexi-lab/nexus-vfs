@@ -133,3 +133,4 @@ protoc-bin-vendored = "3"
 [dev-dependencies]
 rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
 tempfile = "3"
+proptest = "1"

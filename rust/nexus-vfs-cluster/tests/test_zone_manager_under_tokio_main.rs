@@ -25,7 +25,7 @@
 
 #![cfg(all(feature = "grpc", has_protos))]
 
-use nexus_raft::ZoneManager;
+use nexus_vfs_cluster::raft::ZoneManager;
 use std::time::Duration;
 use tempfile::TempDir;
 

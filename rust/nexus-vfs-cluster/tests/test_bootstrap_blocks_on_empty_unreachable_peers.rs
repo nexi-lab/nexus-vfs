@@ -11,8 +11,8 @@
 
 use std::time::Duration;
 
-use nexus_raft::transport::call_join_zone_rpc;
-use nexus_raft::ZoneManager;
+use nexus_vfs_cluster::raft::transport::call_join_zone_rpc;
+use nexus_vfs_cluster::raft::ZoneManager;
 use tempfile::TempDir;
 
 fn mint_random_id() -> u64 {

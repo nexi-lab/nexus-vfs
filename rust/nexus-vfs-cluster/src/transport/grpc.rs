@@ -544,13 +544,31 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
+            None,
         )
         .expect("kernel_with_mem_backend: sys_setattr DT_MOUNT");
         k
     }
 
-    #[tokio::test]
-    async fn batch_read_returns_per_item_results_in_order() {
+    // Plain `#[test]` (not `#[tokio::test]`) — `Kernel` owns its own
+    // tokio runtime and dropping it from inside an outer async runtime
+    // panics with "Cannot drop a runtime in a context where blocking
+    // is not allowed". We build a runtime explicitly, block_on the RPC
+    // through it, then drop the kernel after the runtime exits.
+    fn run_async<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    #[test]
+    fn batch_read_returns_per_item_results_in_order() {
         let kernel = std::sync::Arc::new(kernel_with_mem_backend());
         let ctx = OperationContext::new("test", "root", true, None, true);
         kernel
@@ -580,7 +598,7 @@ mod tests {
             ],
         });
 
-        let resp = svc.batch_read(req).await.expect("rpc ok").into_inner();
+        let resp = run_async(svc.batch_read(req)).expect("rpc ok").into_inner();
         assert_eq!(resp.results.len(), 3);
         assert!(!resp.results[0].is_error);
         assert_eq!(resp.results[0].content, b"hello");
@@ -589,8 +607,8 @@ mod tests {
         assert_eq!(resp.results[2].content, b"ell");
     }
 
-    #[tokio::test]
-    async fn batch_read_empty_items_returns_empty_results() {
+    #[test]
+    fn batch_read_empty_items_returns_empty_results() {
         let kernel = std::sync::Arc::new(kernel_with_mem_backend());
         let svc = VfsServiceImpl::for_test(kernel);
 
@@ -599,7 +617,7 @@ mod tests {
             items: vec![],
         });
 
-        let resp = svc.batch_read(req).await.expect("rpc ok").into_inner();
+        let resp = run_async(svc.batch_read(req)).expect("rpc ok").into_inner();
         assert_eq!(resp.results.len(), 0);
     }
 }
