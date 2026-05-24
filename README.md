@@ -1,22 +1,23 @@
-# Nexus — VFS + Rust Core (trimmed)
+# nexus-vfs
 
-Trimmed fork of [`nexi-lab/nexus`](https://github.com/nexi-lab/nexus). The
-Python codebase, Docker/k8s stack, docs, benchmarks, agent connectors, and
-the Python wheel cdylib are stripped out. Upstream's 9-crate workspace is
-consolidated into 3 crates.
+Pure-Rust VFS extracted from [`nexi-lab/nexus`](https://github.com/nexi-lab/nexus).
+The Python codebase, Docker/k8s stack, docs, benchmarks, agent connectors,
+and the Python wheel cdylib are stripped out. Upstream's 9-crate workspace
+is consolidated into 3 publishable crates plus an umbrella facade.
 
 ## Layout
 
 ```
-rust/                       # cargo workspace (3 crates)
-├── nexus-core/             # contracts + util + kernel + backends + services
+rust/                       # cargo workspace
+├── nexus-vfs/              # umbrella crate (re-exports core + optional cluster)
+├── nexus-vfs-core/         # contracts + util + kernel + backends + services
 │                           # (was 5 separate rlib tier-crates upstream)
-├── nexus-cluster/          # Raft consensus + VFS gRPC server/client + federation
+├── nexus-vfs-cluster/      # Raft consensus + VFS gRPC server/client + federation
 │                           # (was raft + transport upstream)
-└── nexusd/                 # daemon binary — `cargo install`-able entry point
+└── nexus-vfsd/             # daemon binary — `cargo install`-able entry point
 
 nexus-fuse/                 # standalone FUSE client (separate workspace)
-proto/                      # .proto files used by nexus-core + nexus-cluster build.rs
+proto/                      # .proto files used by core + cluster build.rs
 scripts/protoc-compat.py    # PROTOC shim for raft-rs's protobuf-build 0.14
 ```
 
@@ -24,7 +25,7 @@ scripts/protoc-compat.py    # PROTOC shim for raft-rs's protobuf-build 0.14
 
 ```bash
 cargo build --release --workspace
-./target/release/nexusd --no-tls --bootstrap-mode static --data-dir /tmp/nexus
+./target/release/nexus-vfsd --no-tls --bootstrap-mode static --data-dir /tmp/nexus
 # VFS gRPC :2028,  Raft federation :2126
 
 # Optional FUSE client (Linux/macFUSE only)

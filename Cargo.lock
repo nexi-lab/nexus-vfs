@@ -1612,8 +1612,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
 
 [[package]]
-name = "nexus-cluster"
-version = "0.10.0"
+name = "nexus-vfs"
+version = "0.1.0"
+dependencies = [
+ "nexus-vfs-cluster",
+ "nexus-vfs-core",
+]
+
+[[package]]
+name = "nexus-vfs-cluster"
+version = "0.1.0"
 dependencies = [
  "base64",
  "bincode",
@@ -1623,7 +1631,7 @@ dependencies = [
  "futures",
  "gethostname",
  "mimalloc",
- "nexus-core",
+ "nexus-vfs-core",
  "parking_lot",
  "pem",
  "prost",
@@ -1652,8 +1660,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "nexus-core"
-version = "0.10.0"
+name = "nexus-vfs-core"
+version = "0.1.0"
 dependencies = [
  "ahash",
  "axum",
@@ -1710,14 +1718,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "nexusd"
-version = "0.10.0"
+name = "nexus-vfsd"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
  "gethostname",
- "nexus-cluster",
- "nexus-core",
+ "nexus-vfs-cluster",
+ "nexus-vfs-core",
  "tokio",
  "tonic",
  "tracing",

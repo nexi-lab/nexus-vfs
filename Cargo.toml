@@ -1,15 +1,16 @@
 [workspace]
 resolver = "2"
 members = [
-    "rust/nexus-core",
-    "rust/nexus-cluster",
-    "rust/nexusd",
+    "rust/nexus-vfs",
+    "rust/nexus-vfs-core",
+    "rust/nexus-vfs-cluster",
+    "rust/nexus-vfsd",
 ]
 exclude = ["nexus-fuse"]
 
 [workspace.dependencies]
-nexus-core = { path = "rust/nexus-core", default-features = false }
-nexus-cluster = { path = "rust/nexus-cluster", default-features = false }
+nexus-vfs-core = { path = "rust/nexus-vfs-core", version = "0.1.0", default-features = false }
+nexus-vfs-cluster = { path = "rust/nexus-vfs-cluster", version = "0.1.0", default-features = false }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -42,5 +43,5 @@ codegen-units = 1
 opt-level = 3
 strip = "symbols"
 
-[profile.release.package.nexusd]
+[profile.release.package.nexus-vfsd]
 opt-level = "z"
