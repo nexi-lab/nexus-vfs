@@ -2,24 +2,21 @@
 name = "backends"
 version = "0.1.0"
 edition = "2021"
-description = "ObjectStore driver impls — connector backends, CAS local, path local, blob-pack local. Implements kernel::core::traits::ObjectStore. Driver-layer crate."
+description = "ObjectStore driver impls — CAS local, path local, blob-pack, S3, GCS. Implements kernel::core::traits::ObjectStore."
 
 [lib]
 name = "backends"
 crate-type = ["rlib"]
 
 [features]
-# Default = every driver compiled in.  Python deployments (`nexus-cdylib`)
-# carry the runtime gate (`set_enabled_drivers`) to limit what an active
-# profile can mount, so they need every backend present in the binary.
-# Slim deployments (`nexus-cluster`) opt out by setting
-# `default-features = false` and naming only the drivers they want.
+# Default = every driver compiled in. Slim deployments (`nexusd`) can opt
+# out by setting `default-features = false` and naming only what they want.
 default = [
     "driver-path-local",
     "driver-cas-local",
     "driver-local-connector",
     "driver-remote",
-    "connectors",
+    "cloud-blob",
 ]
 
 # Local-host backends (kernel-shipped, no network).
@@ -27,45 +24,27 @@ driver-path-local = []
 driver-cas-local = []
 driver-local-connector = []
 
-# Cross-node RPC proxy — federation primitive.  Always available in
-# Python deployments, opt-in for slim Rust binaries.
+# Cross-node RPC proxy — federation primitive.
 driver-remote = []
 
-# Connector umbrella: every external-API / cloud-blob backend plus the
-# shared HTTP / crypto / streaming dependency stack they all need.
-connectors = [
-    "driver-openai",
-    "driver-anthropic",
+# Cloud blob storage drivers + the HTTP / crypto / streaming dep stack
+# they share. (S3 + GCS only — agent-style connectors removed in the
+# trim fork.)
+cloud-blob = [
     "driver-s3",
     "driver-gcs",
-    "driver-gdrive",
-    "driver-gmail",
-    "driver-slack",
-    "driver-x",
-    "driver-hn",
-    "driver-cli",
     "dep:reqwest",
     "dep:hmac",
     "dep:sha2",
     "dep:futures-util",
 ]
 
-# Per-connector features.  Selectable individually for downstream
-# binaries that want, say, only `driver-cli` without the full HTTP stack.
-driver-openai = []
-driver-anthropic = []
+# Per-driver fine-grained features (selectable if you want, say, only s3).
 driver-s3 = []
 driver-gcs = []
-driver-gdrive = []
-driver-gmail = []
-driver-slack = []
-driver-x = []
-driver-hn = []
-driver-cli = []
 
-# `python` enables `backends::python` PyO3 wrappers. Mirrors
-# kernel/lib's gating: pure-Rust by default, kernel cdylib pulls
-# `features = ["python"]` to expose `#[pyclass]` types.
+# Legacy: kept for backwards-compat with any external caller that still
+# enables it. Maps to the new cloud-blob umbrella.
 python = ["dep:pyo3"]
 
 [dependencies]
@@ -100,11 +79,7 @@ futures = "0.3"
 tracing = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 base64 = "0.22"
-# pyo3 features unioned by cargo when kernel cdylib enables `extension-module`
-# on its own pyo3 dep — backends does not need to set extension-module here.
 pyo3 = { version = "0.28.3", features = ["hashbrown"], optional = true }
-# Connector / cloud HTTP stack — feature-gated so non-connector builds
-# stay slim.
 reqwest = { version = "0.13", features = ["json", "stream", "rustls"], default-features = false, optional = true }
 hmac = { version = "0.13", optional = true }
 sha2 = { version = "0.11", optional = true }
