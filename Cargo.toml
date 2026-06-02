@@ -1,24 +1,20 @@
 [workspace]
 resolver = "2"
 members = [
-    # Tier-neutral packages (KERNEL-ARCHITECTURE.md §6):
+    # Tier-neutral packages:
     #   contracts/ — types / enums / exceptions / constants (zero deps).
     #   lib/       — pure-Rust implementations (algorithms + transport
     #                primitives). Every peer crate depends on it; it
     #                depends only on `contracts`.
     "rust/contracts",
     "rust/lib",
-    # OS proper + driver / service tiers (§6.1).
+    # OS proper + driver tiers.
     "rust/transport",
     "rust/kernel",
     "rust/backends",
-    "rust/services",
     "rust/raft",
     # Deployment binaries.
     "rust/profiles/cluster",
-    # nexusd-vault — single-purpose binary hosting PasswordVaultService
-    # over gRPC. Runs alongside (not bundled into) cluster.
-    "rust/profiles/vault",
 ]
 
 [workspace.dependencies]
@@ -30,7 +26,7 @@ contracts = { path = "rust/contracts" }
 # `transport` features are opt-in.
 lib = { path = "rust/lib" }
 transport = { path = "rust/transport" }
-services = { path = "rust/services" }
+# services lives in the nexus repo (nexus-owned consumer code).
 # Driver impls. `default-features = false` so transitive workspace
 # consumers (e.g. `nexus-cluster`) can pick a slim driver set without
 # fighting Cargo's feature unification.
