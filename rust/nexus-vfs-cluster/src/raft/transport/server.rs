@@ -1193,8 +1193,8 @@ impl ZoneApiService for ZoneApiServiceImpl {
             return Err(Status::not_found(format!("Zone '{}' not found", zone_id)));
         }
 
-        let caps =
-            crate::raft::raft::read_search_caps(self.registry.base_path(), &zone_id).unwrap_or_default();
+        let caps = crate::raft::raft::read_search_caps(self.registry.base_path(), &zone_id)
+            .unwrap_or_default();
 
         Ok(Response::new(SearchCapabilities {
             zone_id,

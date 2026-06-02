@@ -105,9 +105,10 @@ impl PeerBlobClient {
             tls,
             ..Default::default()
         };
-        let channel = nexus_vfs_core::util::transport_primitives::create_channel(&endpoint, &client_cfg)
-            .await
-            .map_err(|e| format!("peer channel {}: {}", address, e))?;
+        let channel =
+            nexus_vfs_core::util::transport_primitives::create_channel(&endpoint, &client_cfg)
+                .await
+                .map_err(|e| format!("peer channel {}: {}", address, e))?;
         self.channels
             .entry(address.to_string())
             .or_insert_with(|| channel.clone());
@@ -207,7 +208,11 @@ pub fn build_kernel_runtime() -> Arc<tokio::runtime::Runtime> {
 // methods to the trait's `fetch` / `install_tls` shape.
 
 impl nexus_vfs_core::kernel::hal::peer::PeerBlobClient for PeerBlobClient {
-    fn fetch(&self, addr: &str, content_id: &str) -> nexus_vfs_core::kernel::hal::peer::PeerBlobResult<Vec<u8>> {
+    fn fetch(
+        &self,
+        addr: &str,
+        content_id: &str,
+    ) -> nexus_vfs_core::kernel::hal::peer::PeerBlobResult<Vec<u8>> {
         // Inherent method shadows the trait method — fully-qualify.
         PeerBlobClient::fetch(self, addr, content_id)
     }

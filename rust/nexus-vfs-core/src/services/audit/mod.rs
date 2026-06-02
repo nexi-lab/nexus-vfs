@@ -27,8 +27,8 @@
 use std::sync::mpsc;
 use std::sync::Arc;
 
-use chrono::SecondsFormat;
 use crate::contracts::{is_system_path, OperationContext};
+use chrono::SecondsFormat;
 use serde::Serialize;
 
 use crate::kernel::abi::KernelAbi;
@@ -110,8 +110,7 @@ impl<K: KernelAbi> AuditHook<K> {
                 while let Ok(record) = rx.recv() {
                     match serde_json::to_vec(&record) {
                         Ok(json) => {
-                            if let Err(e) =
-                                kernel_for_thread.sys_write(&audit_path, &ctx, &json, 0)
+                            if let Err(e) = kernel_for_thread.sys_write(&audit_path, &ctx, &json, 0)
                             {
                                 tracing::warn!(error = ?e, "audit stream write failed");
                             }

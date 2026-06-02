@@ -25,4 +25,6 @@ pub use topology::{
 // crate so existing `nexus_raft::federation::TofuTrustStore` callers
 // keep working through the move.
 #[cfg(feature = "grpc")]
-pub use nexus_vfs_core::util::transport_primitives::{TofuError, TofuResult, TofuTrustStore, TrustedZone};
+pub use nexus_vfs_core::util::transport_primitives::{
+    TofuError, TofuResult, TofuTrustStore, TrustedZone,
+};

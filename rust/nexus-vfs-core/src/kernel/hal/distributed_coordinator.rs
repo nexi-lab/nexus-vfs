@@ -34,8 +34,8 @@
 
 use std::sync::Arc;
 
-use crate::kernel::abc::meta_store::MetaStore;
 use crate::contracts::lock_state::Locks;
+use crate::kernel::abc::meta_store::MetaStore;
 
 /// Result type used across the Control-Plane HAL. String errors carry
 /// the raft / gRPC status messages verbatim from the underlying impl.
@@ -131,7 +131,11 @@ pub trait DistributedCoordinator: Send + Sync + 'static {
     /// Idempotent — repeat calls return the same zone. Wires the
     /// kernel-side apply-cb so DT_MOUNT events on the new zone
     /// propagate to the VFSRouter + Python DLC.
-    fn create_zone(&self, kernel: &crate::kernel::kernel::Kernel, zone_id: &str) -> CoordinatorResult<()>;
+    fn create_zone(
+        &self,
+        kernel: &crate::kernel::kernel::Kernel,
+        zone_id: &str,
+    ) -> CoordinatorResult<()>;
 
     /// Remove a raft zone, cascade-unmounting every cross-zone mount
     /// pointing to it first. `force=true` honors the POSIX-style

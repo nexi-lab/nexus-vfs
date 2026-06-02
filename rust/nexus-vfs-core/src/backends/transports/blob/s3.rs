@@ -8,9 +8,9 @@
 
 #![allow(dead_code)]
 
-use hmac::{Hmac, KeyInit, Mac};
 use crate::kernel::abc::object_store::{ExternalTransport, ObjectStore, StorageError, WriteResult};
 use crate::kernel::kernel::OperationContext;
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use std::io;
 

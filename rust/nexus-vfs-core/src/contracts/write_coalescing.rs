@@ -94,6 +94,9 @@ mod tests {
 
     #[test]
     fn default_policy_preserves_write_through_visibility() {
-        assert_eq!(WriteCoalescingPolicy::default(), WriteCoalescingPolicy::strict());
+        assert_eq!(
+            WriteCoalescingPolicy::default(),
+            WriteCoalescingPolicy::strict()
+        );
     }
 }

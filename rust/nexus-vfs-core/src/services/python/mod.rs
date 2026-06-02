@@ -138,7 +138,10 @@ pub fn register(m: &Bound<PyModule>) -> PyResult<()> {
     // ACP service wiring — hand-written hooks (boot install + Python
     // AgentRegistry bridge + on-terminate callbacks). Hosts
     // `AgentKind::UNMANAGED` agents (subprocess + ACP-over-stdio).
-    m.add_function(wrap_pyfunction!(crate::services::acp::pyo3::nx_acp_install, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        crate::services::acp::pyo3::nx_acp_install,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(
         crate::services::acp::pyo3::nx_acp_set_agent_registry,
         m

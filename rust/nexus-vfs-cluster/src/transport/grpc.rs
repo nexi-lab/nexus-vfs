@@ -174,10 +174,7 @@ impl NexusVfsService for VfsServiceImpl {
                 "federation token: use Call dispatch (sys_write RPC) — typed Write bypasses zone authorization",
             ))));
         }
-        match self
-            .kernel
-            .sys_write_one(&req.path, &ctx, &req.content, 0)
-        {
+        match self.kernel.sys_write_one(&req.path, &ctx, &req.content, 0) {
             Ok(result) => Ok(Response::new(WriteResponse {
                 content_id: result.content_id.unwrap_or_default(),
                 size: result.size as i64,
@@ -326,12 +323,7 @@ pub fn spawn(
         .build()
         .map_err(|e| format!("vfs-grpc runtime: {e}"))?;
 
-    let routes = build_vfs_routes(
-        kernel,
-        auth,
-        cfg.max_message_bytes,
-        &cfg.server_version,
-    );
+    let routes = build_vfs_routes(kernel, auth, cfg.max_message_bytes, &cfg.server_version);
 
     let mut server_builder = Server::builder()
         .max_concurrent_streams(Some(1024))

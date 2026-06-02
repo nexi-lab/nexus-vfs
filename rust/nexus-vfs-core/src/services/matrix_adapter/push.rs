@@ -53,7 +53,8 @@ mod tests {
     fn fixture() -> axum::Router {
         let backend = Arc::new(StubAuthBackend::new(SERVER));
         backend.add_user("ethan", "hunter2");
-        let state = AdapterState::<crate::kernel::kernel::Kernel>::new(backend, Arc::from(SERVER), None);
+        let state =
+            AdapterState::<crate::kernel::kernel::Kernel>::new(backend, Arc::from(SERVER), None);
         build_router(state)
     }
 
@@ -72,8 +73,7 @@ mod tests {
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
         let v: Value =
-            serde_json::from_slice(&to_bytes(resp.into_body(), 64 * 1024).await.unwrap())
-                .unwrap();
+            serde_json::from_slice(&to_bytes(resp.into_body(), 64 * 1024).await.unwrap()).unwrap();
         v["access_token"].as_str().unwrap().to_string()
     }
 
@@ -92,8 +92,7 @@ mod tests {
             .unwrap();
         let status = resp.status();
         let v: Value =
-            serde_json::from_slice(&to_bytes(resp.into_body(), 64 * 1024).await.unwrap())
-                .unwrap();
+            serde_json::from_slice(&to_bytes(resp.into_body(), 64 * 1024).await.unwrap()).unwrap();
         (status, v)
     }
 

@@ -256,7 +256,8 @@ pub struct LockManager {
 impl LockManager {
     pub fn new() -> Self {
         let state = Arc::new(Mutex::new(SharedLockState::new()));
-        let default_backend: Arc<dyn Locks> = Arc::new(crate::kernel::locks::LocalLocks::new(state));
+        let default_backend: Arc<dyn Locks> =
+            Arc::new(crate::kernel::locks::LocalLocks::new(state));
         Self {
             io_state: Mutex::new(IOLockState::default()),
             locks: RwLock::new(default_backend),
