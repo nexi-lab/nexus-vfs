@@ -1,0 +1,31 @@
+[package]
+name = "nexus-vfsd"
+version = "0.1.0"
+edition = "2021"
+description = "Nexus VFS daemon — pure-Rust binary serving VFS gRPC + Raft federation"
+license = "Apache-2.0"
+repository = "https://github.com/nexi-lab/nexus-vfs"
+homepage = "https://github.com/nexi-lab/nexus-vfs"
+readme = "../../README.md"
+keywords = ["vfs", "filesystem", "grpc", "daemon", "raft"]
+categories = ["filesystem", "command-line-utilities"]
+
+[[bin]]
+name = "nexus-vfsd"
+path = "src/main.rs"
+
+[dependencies]
+nexus-vfs-core = { workspace = true, default-features = false, features = [
+    "driver-path-local",
+    "service-audit",
+    "service-permission",
+] }
+nexus-vfs-cluster = { workspace = true, default-features = false, features = ["grpc"] }
+
+tonic = { workspace = true }
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+gethostname = "1.1"

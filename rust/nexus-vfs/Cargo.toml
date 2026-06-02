@@ -1,0 +1,25 @@
+[package]
+name = "nexus-vfs"
+version = "0.1.0"
+edition = "2021"
+description = "Nexus VFS — umbrella crate re-exporting nexus-vfs-core and nexus-vfs-cluster"
+license = "Apache-2.0"
+repository = "https://github.com/nexi-lab/nexus-vfs"
+homepage = "https://github.com/nexi-lab/nexus-vfs"
+readme = "../../README.md"
+keywords = ["vfs", "filesystem", "raft", "grpc", "storage"]
+categories = ["filesystem"]
+
+[lib]
+name = "nexus_vfs"
+crate-type = ["rlib"]
+
+[features]
+default = []
+# Pull in the cluster networking layer (Raft + gRPC). Off by default so
+# pure local-VFS embedders don't drag in tonic + tikv-raft.
+cluster = ["dep:nexus-vfs-cluster"]
+
+[dependencies]
+nexus-vfs-core = { workspace = true, default-features = false }
+nexus-vfs-cluster = { workspace = true, default-features = false, optional = true }
