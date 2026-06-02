@@ -2,7 +2,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use std::hint::black_box;
 
 #[allow(dead_code)]
-#[path = "../src/core/dispatch/ops_registry.rs"]
+#[path = "../src/kernel/core/dispatch/ops_registry.rs"]
 mod ops_registry;
 
 use ops_registry::{BackendKind, CatHandlerKind, FileType, OpHandler, OpKey, OpName, OpsRegistry};
