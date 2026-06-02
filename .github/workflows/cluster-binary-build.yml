@@ -26,10 +26,6 @@ jobs:
             artifact_name: nexusd-cluster-macos-arm64
             binary: nexusd-cluster
             max_size_bytes: 13107200  # 12.5 MiB
-          - os: macos-13
-            artifact_name: nexusd-cluster-macos-x86_64
-            binary: nexusd-cluster
-            max_size_bytes: 13107200  # 12.5 MiB
           - os: windows-latest
             artifact_name: nexusd-cluster-windows-x86_64
             binary: nexusd-cluster.exe

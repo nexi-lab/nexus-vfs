@@ -28,14 +28,13 @@ use kernel::kernel::vfs_proto::{
     BatchReadItemResponse, BatchReadRequest, BatchReadResponse, BatchStatItem, BatchStatRequest,
     BatchStatResponse, BatchWriteItemResponse, BatchWriteRequest, BatchWriteResponse, CallRequest,
     CallResponse, CopyRequest, CopyResponse, DeleteRequest, DeleteResponse, GetXattrBulkItem,
-    GetXattrBulkRequest, GetXattrBulkResponse, GetXattrRequest, GetXattrResponse, IpcAck,
-    IpcEmpty, IpcHasResponse, IpcPathRequest, LockRequest, LockResponse, MkdirRequest,
-    MkdirResponse, PingRequest, PingResponse,
-    ReaddirEntry, ReaddirRequest, ReaddirResponse, ReadRequest, ReadResponse, RenameRequest,
-    RenameResponse, SetXattrRequest, SetXattrResponse, SetattrRequest, SetattrResponse,
-    StatRequest, StatResponse, StreamCollectAllResponse, StreamReadAtRequest, StreamReadAtResponse,
-    StreamWriteRequest, StreamWriteResponse, UnlockRequest, UnlockResponse, WatchRequest,
-    WatchResponse, WriteRequest, WriteResponse,
+    GetXattrBulkRequest, GetXattrBulkResponse, GetXattrRequest, GetXattrResponse, IpcAck, IpcEmpty,
+    IpcHasResponse, IpcPathRequest, LockRequest, LockResponse, MkdirRequest, MkdirResponse,
+    PingRequest, PingResponse, ReadRequest, ReadResponse, ReaddirEntry, ReaddirRequest,
+    ReaddirResponse, RenameRequest, RenameResponse, SetXattrRequest, SetXattrResponse,
+    SetattrRequest, SetattrResponse, StatRequest, StatResponse, StreamCollectAllResponse,
+    StreamReadAtRequest, StreamReadAtResponse, StreamWriteRequest, StreamWriteResponse,
+    UnlockRequest, UnlockResponse, WatchRequest, WatchResponse, WriteRequest, WriteResponse,
 };
 use kernel::kernel::{Kernel, KernelError, OperationContext};
 
@@ -176,7 +175,9 @@ impl NexusVfsService for VfsServiceImpl {
         let kernel = self.kernel.clone();
         let path = req.path;
         let offset = req.offset;
-        let read_res = run_blocking(move || KernelAbi::sys_read(&*kernel, &path, &ctx, timeout_ms, offset)).await?;
+        let read_res =
+            run_blocking(move || KernelAbi::sys_read(&*kernel, &path, &ctx, timeout_ms, offset))
+                .await?;
         match read_res {
             Ok(result) => {
                 let bytes = result.data.unwrap_or_default();
@@ -221,7 +222,8 @@ impl NexusVfsService for VfsServiceImpl {
         let kernel = self.kernel.clone();
         let path = req.path;
         let content = req.content;
-        let write_res = run_blocking(move || KernelAbi::sys_write(&*kernel, &path, &ctx, &content, 0)).await?;
+        let write_res =
+            run_blocking(move || KernelAbi::sys_write(&*kernel, &path, &ctx, &content, 0)).await?;
         match write_res {
             Ok(result) => Ok(Response::new(WriteResponse {
                 content_id: result.content_id.unwrap_or_default(),
@@ -258,7 +260,8 @@ impl NexusVfsService for VfsServiceImpl {
         let kernel = self.kernel.clone();
         let path = req.path;
         let recursive = req.recursive;
-        let del_res = run_blocking(move || KernelAbi::sys_unlink(&*kernel, &path, &ctx, recursive)).await?;
+        let del_res =
+            run_blocking(move || KernelAbi::sys_unlink(&*kernel, &path, &ctx, recursive)).await?;
         match del_res {
             Ok(result) => Ok(Response::new(DeleteResponse {
                 success: result.hit,
@@ -284,10 +287,7 @@ impl NexusVfsService for VfsServiceImpl {
         }
     }
 
-    async fn mkdir(
-        &self,
-        req: Request<MkdirRequest>,
-    ) -> Result<Response<MkdirResponse>, Status> {
+    async fn mkdir(&self, req: Request<MkdirRequest>) -> Result<Response<MkdirResponse>, Status> {
         let req = req.into_inner();
         let ctx = match self.resolve_context(&req.auth_token) {
             Ok(c) => c,
@@ -472,7 +472,8 @@ impl NexusVfsService for VfsServiceImpl {
         let kernel = self.kernel.clone();
         let path = req.path;
         let new_path = req.new_path;
-        let rename_res = run_blocking(move || KernelAbi::sys_rename(&*kernel, &path, &new_path, &ctx)).await?;
+        let rename_res =
+            run_blocking(move || KernelAbi::sys_rename(&*kernel, &path, &new_path, &ctx)).await?;
         match rename_res {
             Ok(r) => Ok(Response::new(RenameResponse {
                 hit: r.hit,
@@ -512,7 +513,8 @@ impl NexusVfsService for VfsServiceImpl {
         let kernel = self.kernel.clone();
         let src = req.src;
         let dst = req.dst;
-        let copy_res = run_blocking(move || KernelAbi::sys_copy(&*kernel, &src, &dst, &ctx)).await?;
+        let copy_res =
+            run_blocking(move || KernelAbi::sys_copy(&*kernel, &src, &dst, &ctx)).await?;
         match copy_res {
             Ok(r) => Ok(Response::new(CopyResponse {
                 hit: r.hit,
@@ -554,7 +556,8 @@ impl NexusVfsService for VfsServiceImpl {
         let kernel = self.kernel.clone();
         let path = req.path;
         let lock_id_req = req.lock_id;
-        let lock_res = run_blocking(move || kernel.sys_lock(&path, &lock_id_req, 1, ttl_secs, "")).await?;
+        let lock_res =
+            run_blocking(move || kernel.sys_lock(&path, &lock_id_req, 1, ttl_secs, "")).await?;
         match lock_res {
             Ok(Some(id)) => Ok(Response::new(LockResponse {
                 acquired: true,
@@ -617,9 +620,11 @@ impl NexusVfsService for VfsServiceImpl {
         let path = req.path;
         let timeout_ms = req.timeout_ms;
         let matched = run_blocking(move || {
-            kernel.sys_watch(&path, timeout_ms)
+            kernel
+                .sys_watch(&path, timeout_ms)
                 .map(|evt| (evt.path().to_string(), format!("{:?}", evt.event_type)))
-        }).await?;
+        })
+        .await?;
         match matched {
             Some((path, event_type)) => Ok(Response::new(WatchResponse {
                 matched: true,
@@ -741,10 +746,7 @@ impl NexusVfsService for VfsServiceImpl {
         }
     }
 
-    async fn close_pipe(
-        &self,
-        req: Request<IpcPathRequest>,
-    ) -> Result<Response<IpcAck>, Status> {
+    async fn close_pipe(&self, req: Request<IpcPathRequest>) -> Result<Response<IpcAck>, Status> {
         let req = req.into_inner();
         let _ctx = match self.resolve_context(&req.auth_token) {
             Ok(c) => c,
@@ -781,10 +783,7 @@ impl NexusVfsService for VfsServiceImpl {
         }))
     }
 
-    async fn close_all_pipes(
-        &self,
-        req: Request<IpcEmpty>,
-    ) -> Result<Response<IpcAck>, Status> {
+    async fn close_all_pipes(&self, req: Request<IpcEmpty>) -> Result<Response<IpcAck>, Status> {
         let req = req.into_inner();
         let _ctx = match self.resolve_context(&req.auth_token) {
             Ok(c) => c,
@@ -797,10 +796,7 @@ impl NexusVfsService for VfsServiceImpl {
         }))
     }
 
-    async fn close_stream(
-        &self,
-        req: Request<IpcPathRequest>,
-    ) -> Result<Response<IpcAck>, Status> {
+    async fn close_stream(&self, req: Request<IpcPathRequest>) -> Result<Response<IpcAck>, Status> {
         let req = req.into_inner();
         let _ctx = match self.resolve_context(&req.auth_token) {
             Ok(c) => c,
@@ -878,9 +874,9 @@ impl NexusVfsService for VfsServiceImpl {
             let path = req.path;
             let offset = req.offset as usize;
             let timeout_ms = req.timeout_ms;
-            let blk_res = run_blocking(move || {
-                kernel.stream_read_at_blocking(&path, offset, timeout_ms)
-            }).await?;
+            let blk_res =
+                run_blocking(move || kernel.stream_read_at_blocking(&path, offset, timeout_ms))
+                    .await?;
             match blk_res {
                 Ok((data, next)) => Ok(Response::new(StreamReadAtResponse {
                     data,
@@ -1113,7 +1109,8 @@ impl NexusVfsService for VfsServiceImpl {
 
         // Offload: batch write waits on VFS write lock per item
         let kernel = self.kernel.clone();
-        let results = run_blocking(move || KernelConvenience::write_batch(&*kernel, &items, &ctx)).await?;
+        let results =
+            run_blocking(move || KernelConvenience::write_batch(&*kernel, &items, &ctx)).await?;
 
         let mapped: Vec<BatchWriteItemResponse> = results
             .into_iter()
@@ -1150,7 +1147,8 @@ impl NexusVfsService for VfsServiceImpl {
         let kernel = self.kernel.clone();
         let method = req.method;
         let payload = req.payload;
-        run_blocking(move || crate::call_dispatch::dispatch(&kernel, &ctx, &method, &payload)).await?
+        run_blocking(move || crate::call_dispatch::dispatch(&kernel, &ctx, &method, &payload))
+            .await?
     }
 }
 
