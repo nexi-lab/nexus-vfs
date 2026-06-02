@@ -20,7 +20,9 @@ use crate::services::matrix_adapter::rooms::{
     room_state_event,
 };
 use crate::services::matrix_adapter::sync::sync;
-use crate::services::matrix_adapter::types::{EmptyResponse, LoginRequest, LoginResponse, WhoAmIResponse};
+use crate::services::matrix_adapter::types::{
+    EmptyResponse, LoginRequest, LoginResponse, WhoAmIResponse,
+};
 
 /// Per-user joined-room set: Matrix user_id → set of stream paths the
 /// user has currently joined. Maintained in-memory by the room
@@ -131,10 +133,7 @@ pub fn build_router<K: crate::kernel::abi::KernelAbi>(state: AdapterState<K>) ->
         )
         .route("/_matrix/client/v3/pushrules", get(push::pushrules))
         .route("/_matrix/client/v3/pushers", get(push::pushers))
-        .route_layer(from_fn_with_state(
-            state.clone(),
-            require_access_token::<K>,
-        ));
+        .route_layer(from_fn_with_state(state.clone(), require_access_token::<K>));
 
     public.merge(protected).with_state(state)
 }
@@ -189,9 +188,7 @@ async fn logout<K: crate::kernel::abi::KernelAbi>(
     Ok(Json(EmptyResponse::default()))
 }
 
-async fn whoami(
-    Extension(session): Extension<AuthSession>,
-) -> Json<WhoAmIResponse> {
+async fn whoami(Extension(session): Extension<AuthSession>) -> Json<WhoAmIResponse> {
     Json(WhoAmIResponse {
         user_id: session.user_id,
         device_id: session.device_id,
@@ -278,10 +275,7 @@ mod tests {
     #[tokio::test]
     async fn login_wrong_password_is_forbidden() {
         let app = fixture(&[("ethan", "hunter2")]);
-        let resp = app
-            .oneshot(login_request("ethan", "wrong"))
-            .await
-            .unwrap();
+        let resp = app.oneshot(login_request("ethan", "wrong")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         let body = json_body(resp).await;
         assert_eq!(body["errcode"], "M_FORBIDDEN");
@@ -290,10 +284,7 @@ mod tests {
     #[tokio::test]
     async fn login_unknown_user_is_forbidden() {
         let app = fixture(&[]);
-        let resp = app
-            .oneshot(login_request("ghost", "x"))
-            .await
-            .unwrap();
+        let resp = app.oneshot(login_request("ghost", "x")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 

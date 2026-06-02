@@ -2454,7 +2454,8 @@ impl Kernel {
                     wrote_dst_bytes = true;
                     Ok((wr.content_id, wr.size))
                 }
-                Some(Err(crate::kernel::abc::object_store::StorageError::NotSupported(_))) | None => {
+                Some(Err(crate::kernel::abc::object_store::StorageError::NotSupported(_)))
+                | None => {
                     // No backend / operation not supported: fall back per addressing mode.
                     // For CAS: metadata-only copy is correct — same content_id, different path.
                     // For PAS: read+write to avoid creating a metadata alias pointing at
@@ -3026,7 +3027,8 @@ impl Kernel {
 
         // 4. Write each item — collect metadata for batch put
         // Tuple: (mount_point, path, FileMetadata) for per-mount metastore support
-        let mut batch_meta: Vec<(String, String, crate::kernel::meta_store::FileMetadata)> = Vec::new();
+        let mut batch_meta: Vec<(String, String, crate::kernel::meta_store::FileMetadata)> =
+            Vec::new();
 
         for (i, (req, route_opt)) in reqs.iter().zip(routes.iter()).enumerate() {
             let route = match route_opt {
@@ -3108,7 +3110,8 @@ impl Kernel {
         // the corresponding result entry from hit=true → hit=false so the
         // caller learns which items actually committed.
         if !batch_meta.is_empty() {
-            let mut global_items: Vec<(String, crate::kernel::meta_store::FileMetadata)> = Vec::new();
+            let mut global_items: Vec<(String, crate::kernel::meta_store::FileMetadata)> =
+                Vec::new();
             let mut global_idx: Vec<usize> = Vec::new();
             for (idx, (mp, path, meta)) in batch_meta.into_iter().enumerate() {
                 let has_per_mount = self
@@ -3565,7 +3568,9 @@ impl Kernel {
         let entries: Vec<(String, u8)> = if needs_zone_filter {
             seen.into_iter()
                 .filter(|(_, (_, entry_zone))| {
-                    let ez = entry_zone.as_deref().unwrap_or(crate::contracts::ROOT_ZONE_ID);
+                    let ez = entry_zone
+                        .as_deref()
+                        .unwrap_or(crate::contracts::ROOT_ZONE_ID);
                     ez == crate::contracts::ROOT_ZONE_ID || ez == zone_id
                 })
                 .map(|(path, (etype, _))| (path, etype))
@@ -3680,9 +3685,9 @@ impl Kernel {
 
 #[cfg(test)]
 mod read_batch_tests {
+    use crate::contracts::OperationContext;
     use crate::kernel::abc::object_store::{ObjectStore, StorageError, WriteResult};
     use crate::kernel::kernel::{Kernel, KernelError};
-    use crate::contracts::OperationContext;
     use parking_lot::Mutex;
     use std::collections::HashMap;
     use std::sync::Arc;

@@ -1738,10 +1738,11 @@ impl PyKernel {
         // (R20.18.3), so Python always passes `None` for raft_backend.
         let metastore: Option<Arc<dyn crate::kernel::meta_store::MetaStore>> =
             if let Some(ms_path) = metastore_path {
-                let ms = crate::kernel::meta_store::LocalMetaStore::open(std::path::Path::new(ms_path))
-                    .map_err(|e| {
-                        pyo3::exceptions::PyIOError::new_err(format!("LocalMetaStore: {e:?}"))
-                    })?;
+                let ms =
+                    crate::kernel::meta_store::LocalMetaStore::open(std::path::Path::new(ms_path))
+                        .map_err(|e| {
+                            pyo3::exceptions::PyIOError::new_err(format!("LocalMetaStore: {e:?}"))
+                        })?;
                 Some(Arc::new(ms) as Arc<dyn crate::kernel::meta_store::MetaStore>)
             } else {
                 None

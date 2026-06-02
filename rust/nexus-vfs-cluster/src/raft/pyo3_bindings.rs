@@ -741,7 +741,9 @@ fn join_cluster(
 
     // Verify CA fingerprint matches the join token
     let ca_fingerprint = crate::raft::transport::certgen::ca_fingerprint_from_pem(&result.ca_pem)
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to compute CA fingerprint: {}", e)))?;
+        .map_err(|e| {
+        PyRuntimeError::new_err(format!("Failed to compute CA fingerprint: {}", e))
+    })?;
     if ca_fingerprint != expected_fingerprint {
         return Err(PyRuntimeError::new_err(format!(
             "CA fingerprint mismatch: expected '{}', got '{}'",

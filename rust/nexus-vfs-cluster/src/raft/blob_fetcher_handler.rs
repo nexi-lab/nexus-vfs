@@ -83,10 +83,19 @@ impl BlobFetcher for KernelBlobFetcher {
         if content_id.is_empty() {
             return Err("empty content_id".to_string());
         }
-        let ctx = OperationContext::new("system", nexus_vfs_core::contracts::ROOT_ZONE_ID, true, None, true);
+        let ctx = OperationContext::new(
+            "system",
+            nexus_vfs_core::contracts::ROOT_ZONE_ID,
+            true,
+            None,
+            true,
+        );
 
         // Step 1: try path-style routing → local mount read.
-        if let Ok(route) = self.vfs_router.route(content_id, nexus_vfs_core::contracts::ROOT_ZONE_ID) {
+        if let Ok(route) = self
+            .vfs_router
+            .route(content_id, nexus_vfs_core::contracts::ROOT_ZONE_ID)
+        {
             let local_content_id = (self.lookup_local_content_id)(content_id)
                 .unwrap_or_else(|| route.backend_path.clone());
             if let Some(bytes) = route

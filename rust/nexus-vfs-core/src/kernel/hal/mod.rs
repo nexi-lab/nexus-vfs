@@ -58,5 +58,7 @@ pub mod object_store_provider;
 // Re-exported here so `crate::kernel::kernel::hal::peer::PeerBlobClient` callers
 // keep their canonical import path.
 pub mod peer {
-    pub use crate::util::transport_primitives::{NoopPeerBlobClient, PeerBlobClient, PeerBlobResult};
+    pub use crate::util::transport_primitives::{
+        NoopPeerBlobClient, PeerBlobClient, PeerBlobResult,
+    };
 }

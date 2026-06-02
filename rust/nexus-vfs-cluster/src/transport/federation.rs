@@ -30,11 +30,11 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
-use nexus_vfs_core::kernel::kernel::vfs_proto;
 use crate::raft::federation::TofuTrustStore;
 use crate::raft::transport::proto::nexus::raft::{
     zone_api_service_client::ZoneApiServiceClient, JoinZoneRequest,
 };
+use nexus_vfs_core::kernel::kernel::vfs_proto;
 
 /// mTLS material supplied by the caller (Python ``ZoneTlsConfig``).
 ///

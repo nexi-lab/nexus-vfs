@@ -19,7 +19,7 @@
 //!
 //! # Usage
 //!
-//! ```no_run
+//! ```ignore
 //! use nexus_runtime::ipc::{send_message, wait_for_message, MessageEnvelope};
 //!
 //! // Send

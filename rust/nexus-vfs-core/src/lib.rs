@@ -15,8 +15,8 @@
 //! nexus_vfs_core::services    — post-syscall services (audit/agents/etc)
 //! ```
 
-pub mod contracts;
-pub mod util;
-pub mod kernel;
 pub mod backends;
+pub mod contracts;
+pub mod kernel;
 pub mod services;
+pub mod util;

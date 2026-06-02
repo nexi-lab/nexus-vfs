@@ -26,8 +26,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use nexus_vfs_core::contracts::lock_state::Locks;
 use dashmap::DashMap;
+use nexus_vfs_core::contracts::lock_state::Locks;
 use nexus_vfs_core::kernel::abc::meta_store::MetaStore;
 use nexus_vfs_core::kernel::core::vfs_router::canonicalize_mount_path as canonicalize;
 use nexus_vfs_core::kernel::hal::distributed_coordinator::{
@@ -1220,8 +1220,11 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
             .get_node(zone_id)
             .ok_or_else(|| format!("zone '{zone_id}' not loaded locally"))?;
         let kernel_state = kernel.lock_manager_arc().advisory_state_arc();
-        let backend =
-            crate::raft::federation::DistributedLocks::new(consensus, runtime.clone(), kernel_state);
+        let backend = crate::raft::federation::DistributedLocks::new(
+            consensus,
+            runtime.clone(),
+            kernel_state,
+        );
         Ok(Arc::new(backend))
     }
 

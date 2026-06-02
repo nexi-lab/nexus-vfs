@@ -29,7 +29,9 @@ use crate::raft::transport::proto::nexus::core::FileMetadata as ProtoFileMetadat
 use nexus_vfs_core::contracts::VFS_ROOT;
 use prost::Message;
 
-use nexus_vfs_core::kernel::meta_store::{FileMetadata as KernelFileMetadata, MetaStore, MetaStoreError};
+use nexus_vfs_core::kernel::meta_store::{
+    FileMetadata as KernelFileMetadata, MetaStore, MetaStoreError,
+};
 
 fn bridge_block_on<F>(handle: &tokio::runtime::Handle, fut: F) -> F::Output
 where
@@ -334,7 +336,10 @@ impl MetaStore for ZoneMetaStore {
         let cmd = Command::DeleteMetadata { key: zone_key };
         let result = bridge_block_on(&self.runtime, self.node.propose(cmd))
             .map_err(|e| MetaStoreError::IOError(format!("ZoneMetaStore.delete({path}): {e}")))?;
-        Ok(matches!(result, crate::raft::prelude::CommandResult::Success))
+        Ok(matches!(
+            result,
+            crate::raft::prelude::CommandResult::Success
+        ))
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<KernelFileMetadata>, MetaStoreError> {

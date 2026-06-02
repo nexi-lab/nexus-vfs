@@ -55,7 +55,8 @@ pub(crate) fn encode_file_metadata(
 /// Decode `FileMetadata` proto bytes.
 pub(crate) fn decode_file_metadata(
     bytes: &[u8],
-) -> std::result::Result<crate::raft::transport::proto::nexus::core::FileMetadata, prost::DecodeError> {
+) -> std::result::Result<crate::raft::transport::proto::nexus::core::FileMetadata, prost::DecodeError>
+{
     use crate::raft::transport::proto::nexus::core::FileMetadata as ProtoFileMetadata;
     use prost::Message;
     ProtoFileMetadata::decode(bytes)
@@ -1285,7 +1286,11 @@ impl ZoneManager {
         if origin_path.is_empty() || !origin_path.starts_with('/') {
             nexus_vfs_core::contracts::SHARE_REGISTRY_PREFIX.to_string()
         } else {
-            format!("{}{}", nexus_vfs_core::contracts::SHARE_REGISTRY_PREFIX, origin_path)
+            format!(
+                "{}{}",
+                nexus_vfs_core::contracts::SHARE_REGISTRY_PREFIX,
+                origin_path
+            )
         }
     }
 
@@ -1309,7 +1314,12 @@ impl ZoneManager {
         // Encode as a DT_REG FileMetadata; target_zone_id carries the
         // advertised zone. backend_name is a marker that tells readers
         // "this is a share registry row, not a user inode".
-        let value = encode_file_metadata(&key, DT_REG, nexus_vfs_core::contracts::ROOT_ZONE_ID, zone_id);
+        let value = encode_file_metadata(
+            &key,
+            DT_REG,
+            nexus_vfs_core::contracts::ROOT_ZONE_ID,
+            zone_id,
+        );
         let handle = self.rt().handle().clone();
         propose_set_metadata(&handle, &root, &key, value)
     }
@@ -1439,8 +1449,9 @@ pub fn join_cluster_and_provision_tls(
         ))
         .map_err(|e| RaftError::Raft(format!("JoinCluster RPC failed: {}", e)))?;
 
-    let ca_fingerprint = crate::raft::transport::certgen::ca_fingerprint_from_pem(&result.ca_pem)
-        .map_err(|e| RaftError::Raft(format!("Failed to compute CA fingerprint: {}", e)))?;
+    let ca_fingerprint =
+        crate::raft::transport::certgen::ca_fingerprint_from_pem(&result.ca_pem)
+            .map_err(|e| RaftError::Raft(format!("Failed to compute CA fingerprint: {}", e)))?;
     if ca_fingerprint != expected_fingerprint {
         return Err(RaftError::Raft(format!(
             "CA fingerprint mismatch: expected '{}', got '{}'",

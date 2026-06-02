@@ -21,8 +21,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use nexus_vfs_core::backends::storage::path_local::PathLocalBackend;
 use clap::{Parser, Subcommand};
+use nexus_vfs_core::backends::storage::path_local::PathLocalBackend;
 use nexus_vfs_core::kernel::abc::object_store::ObjectStore;
 use nexus_vfs_core::kernel::kernel::Kernel;
 use nexus_vfs_core::kernel::meta_store::DT_MOUNT;
@@ -31,7 +31,9 @@ use nexus_vfs_cluster::raft::distributed_coordinator::{
     bootstrap_or_join_zone, read_or_mint_node_id, validate_bootstrap_mode,
     validate_peers_excludes_self, BootstrapMode,
 };
-use nexus_vfs_cluster::raft::federation::{parse_federation_env, ENV_FEDERATION_MOUNTS, ENV_FEDERATION_ZONES};
+use nexus_vfs_cluster::raft::federation::{
+    parse_federation_env, ENV_FEDERATION_MOUNTS, ENV_FEDERATION_ZONES,
+};
 use nexus_vfs_cluster::raft::transport::{bootstrap_tls, NodeAddress};
 use nexus_vfs_cluster::raft::{TlsFiles, ZoneManager};
 
@@ -399,15 +401,15 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
             0,
             None,
             None,
-            None,         // mime_type
-            None,         // modified_at_ms
-            None,         // content_id
-            None,         // size
-            None,         // version
-            None,         // created_at_ms
-            None,         // link_target
-            None,         // source
-            None,         // remote_metastore
+            None, // mime_type
+            None, // modified_at_ms
+            None, // content_id
+            None, // size
+            None, // version
+            None, // created_at_ms
+            None, // link_target
+            None, // source
+            None, // remote_metastore
         )
         .map_err(|e| anyhow::anyhow!("mount / via path_local: {:?}", e))?;
     tracing::info!(
@@ -417,7 +419,8 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
 
     // Build VFS gRPC service as tonic Routes — co-hosted on the raft
     // port via ZoneManager. Uses NoAuth (mTLS is the boundary).
-    let vfs_auth: Arc<dyn nexus_vfs_core::services::auth::AuthProvider> = Arc::new(nexus_vfs_core::services::auth::NoAuth);
+    let vfs_auth: Arc<dyn nexus_vfs_core::services::auth::AuthProvider> =
+        Arc::new(nexus_vfs_core::services::auth::NoAuth);
     let vfs_routes = nexus_vfs_cluster::transport::grpc::build_vfs_routes(
         Arc::clone(&kernel),
         vfs_auth,

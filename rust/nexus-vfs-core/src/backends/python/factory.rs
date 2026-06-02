@@ -228,13 +228,13 @@ impl ObjectStoreProvider for DefaultObjectStoreProvider {
                         .server_address
                         .ok_or("backend_type='remote' requires server_address")?;
                     let token = args.remote_auth_token.unwrap_or("");
-                    let tls = args
-                        .remote_ca_pem
-                        .map(|ca| crate::kernel::rpc_transport::TlsConfig {
-                            ca_pem: ca.to_vec(),
-                            cert_pem: args.remote_cert_pem.map(|b| b.to_vec()),
-                            key_pem: args.remote_key_pem.map(|b| b.to_vec()),
-                        });
+                    let tls =
+                        args.remote_ca_pem
+                            .map(|ca| crate::kernel::rpc_transport::TlsConfig {
+                                ca_pem: ca.to_vec(),
+                                cert_pem: args.remote_cert_pem.map(|b| b.to_vec()),
+                                key_pem: args.remote_key_pem.map(|b| b.to_vec()),
+                            });
                     let timeout =
                         std::time::Duration::from_secs_f64(if args.remote_timeout > 0.0 {
                             args.remote_timeout
@@ -252,10 +252,11 @@ impl ObjectStoreProvider for DefaultObjectStoreProvider {
                         )
                         .map_err(|e| e.to_string())?,
                     );
-                    let remote_ms =
-                        Arc::new(crate::kernel::core::meta_store::remote::RemoteMetaStore::new(
-                            Arc::clone(&transport),
-                        )) as Arc<dyn MetaStore>;
+                    let remote_ms = Arc::new(
+                        crate::kernel::core::meta_store::remote::RemoteMetaStore::new(Arc::clone(
+                            &transport,
+                        )),
+                    ) as Arc<dyn MetaStore>;
                     pending_remote_meta_store = Some(remote_ms);
                     let b = crate::backends::storage::remote::RemoteBackend::new(transport);
                     Some(Arc::new(b) as Arc<dyn ObjectStore>)
@@ -289,9 +290,13 @@ impl ObjectStoreProvider for DefaultObjectStoreProvider {
                     let cmd = args.cli_command.unwrap_or("");
                     let svc = args.cli_service.unwrap_or("");
                     let auth = args.cli_auth_env_json.unwrap_or("");
-                    let b =
-                        crate::backends::transports::api::cli::CLIBackend::new(backend_name, cmd, svc, auth)
-                            .map_err(|e| e.to_string())?;
+                    let b = crate::backends::transports::api::cli::CLIBackend::new(
+                        backend_name,
+                        cmd,
+                        svc,
+                        auth,
+                    )
+                    .map_err(|e| e.to_string())?;
                     Some(Arc::new(b) as Arc<dyn ObjectStore>)
                 }
                 #[cfg(not(feature = "driver-cli"))]
@@ -303,8 +308,11 @@ impl ObjectStoreProvider for DefaultObjectStoreProvider {
                 #[cfg(feature = "driver-x")]
                 {
                     let token = args.x_bearer_token.unwrap_or("");
-                    let b = crate::backends::transports::api::social::x::XBackend::new(backend_name, token)
-                        .map_err(|e| e.to_string())?;
+                    let b = crate::backends::transports::api::social::x::XBackend::new(
+                        backend_name,
+                        token,
+                    )
+                    .map_err(|e| e.to_string())?;
                     Some(Arc::new(b) as Arc<dyn ObjectStore>)
                 }
                 #[cfg(not(feature = "driver-x"))]

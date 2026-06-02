@@ -783,8 +783,9 @@ pub struct Kernel {
     // is `NoopDistributedCoordinator`; nexus-cdylib boot installs the real
     // raft-side impl via `Kernel::set_distributed_coordinator`. Same DI
     // shape as the PeerBlobClient slot above.
-    pub(crate) distributed_coordinator:
-        parking_lot::RwLock<Arc<dyn crate::kernel::hal::distributed_coordinator::DistributedCoordinator>>,
+    pub(crate) distributed_coordinator: parking_lot::RwLock<
+        Arc<dyn crate::kernel::hal::distributed_coordinator::DistributedCoordinator>,
+    >,
     // No `chunk_fetcher` field: `Kernel::peer_client` is the SSOT for
     // the cross-node blob client.  `PyKernel::sys_setattr` constructs a
     // fresh `GrpcChunkFetcher` per `DT_MOUNT` against the just-cloned
@@ -1332,7 +1333,8 @@ impl Kernel {
             if canonical == routed_mount {
                 continue;
             }
-            let (_zone, user_mp) = crate::kernel::vfs_router::extract_zone_from_canonical(&canonical);
+            let (_zone, user_mp) =
+                crate::kernel::vfs_router::extract_zone_from_canonical(&canonical);
             // Child mount must sit strictly under the list prefix. Root list
             // (`/`) sees every mount. Non-root prefix `/a` matches `/a/b` but
             // not `/a` itself (caller already has the DT_MOUNT entry from the
@@ -2089,7 +2091,8 @@ impl Kernel {
                     "io_profile=wal requires federation (set NEXUS_PEERS): {e}"
                 ))
             })?;
-            let backend = crate::kernel::core::stream::wal::WalStreamCore::new(store, path.to_string());
+            let backend =
+                crate::kernel::core::stream::wal::WalStreamCore::new(store, path.to_string());
             self.stream_manager
                 .register(path, Arc::new(backend))
                 .map_err(stream_mgr_err)?;
@@ -2735,7 +2738,8 @@ impl Kernel {
                     Err(_) => continue,
                 };
                 let remaining = max_results.saturating_sub(all_matches.len());
-                let matches = crate::util::search::search_lines(fpath, content, &search_mode, remaining);
+                let matches =
+                    crate::util::search::search_lines(fpath, content, &search_mode, remaining);
                 all_matches.extend(matches);
             }
             return Ok(all_matches);
@@ -2769,7 +2773,8 @@ impl Kernel {
                 Err(_) => continue,
             };
             let remaining = max_results.saturating_sub(all_matches.len());
-            let matches = crate::util::search::search_lines(&fpath, content, &search_mode, remaining);
+            let matches =
+                crate::util::search::search_lines(&fpath, content, &search_mode, remaining);
             all_matches.extend(matches);
         }
         Ok(all_matches)
@@ -2819,7 +2824,9 @@ impl Kernel {
         f: F,
     ) -> Result<R, KernelError>
     where
-        F: FnOnce(&crate::kernel::cas_engine::CASEngine) -> Result<R, crate::kernel::cas_engine::CASError>,
+        F: FnOnce(
+            &crate::kernel::cas_engine::CASEngine,
+        ) -> Result<R, crate::kernel::cas_engine::CASError>,
     {
         let canonical = canonicalize(mount_point, zone_id);
         let entry = self.vfs_router.get_canonical(&canonical).ok_or_else(|| {
@@ -2950,7 +2957,11 @@ impl Kernel {
 // back-reference to ``Kernel`` itself.
 // ─────────────────────────────────────────────────────────────────────
 
-fn cas_err_to_kernel(e: crate::kernel::cas_engine::CASError, mount_point: &str, op: &str) -> KernelError {
+fn cas_err_to_kernel(
+    e: crate::kernel::cas_engine::CASError,
+    mount_point: &str,
+    op: &str,
+) -> KernelError {
     use crate::kernel::cas_engine::CASError;
     match e {
         CASError::NotFound(hash) => {
@@ -3312,11 +3323,13 @@ mod tests {
         ));
 
         let lm = k.lock_manager_arc();
-        let dst_handle = lm.blocking_acquire("/dst.txt", crate::kernel::lock_manager::LockMode::Write, 0);
+        let dst_handle =
+            lm.blocking_acquire("/dst.txt", crate::kernel::lock_manager::LockMode::Write, 0);
         assert_ne!(dst_handle, 0, "destination VFS lock leaked");
         lm.do_release(dst_handle);
 
-        let src_handle = lm.blocking_acquire("/src.txt", crate::kernel::lock_manager::LockMode::Write, 0);
+        let src_handle =
+            lm.blocking_acquire("/src.txt", crate::kernel::lock_manager::LockMode::Write, 0);
         assert_ne!(src_handle, 0, "source VFS lock leaked");
         lm.do_release(src_handle);
     }
@@ -4061,8 +4074,10 @@ mod tests {
         let ms = Arc::new(LocalMetaStore::open(&_td.path().join("meta.redb")).unwrap());
         k.vfs_router.add_mount("/mnt", zone, None, false);
         let canon = crate::kernel::vfs_router::canonicalize_mount_path("/mnt", zone);
-        k.vfs_router
-            .install_metastore(&canon, ms.clone() as Arc<dyn crate::kernel::meta_store::MetaStore>);
+        k.vfs_router.install_metastore(
+            &canon,
+            ms.clone() as Arc<dyn crate::kernel::meta_store::MetaStore>,
+        );
 
         // Seed a DT_MOUNT entry at the mount root and a child file.
         let mount_meta = FileMetadata {
@@ -4291,17 +4306,23 @@ mod tests {
                 content_id: &str,
                 _ctx: &OperationContext,
                 offset: u64,
-            ) -> Result<crate::kernel::abc::object_store::WriteResult, crate::kernel::abc::object_store::StorageError>
-            {
+            ) -> Result<
+                crate::kernel::abc::object_store::WriteResult,
+                crate::kernel::abc::object_store::StorageError,
+            > {
                 if self.fail_writes.load(Ordering::Relaxed) {
-                    return Err(crate::kernel::abc::object_store::StorageError::NotSupported(
-                        "injected write failure",
-                    ));
+                    return Err(
+                        crate::kernel::abc::object_store::StorageError::NotSupported(
+                            "injected write failure",
+                        ),
+                    );
                 }
                 if offset != 0 {
-                    return Err(crate::kernel::abc::object_store::StorageError::NotSupported(
-                        "nonzero test offset",
-                    ));
+                    return Err(
+                        crate::kernel::abc::object_store::StorageError::NotSupported(
+                            "nonzero test offset",
+                        ),
+                    );
                 }
                 self.writes.fetch_add(1, Ordering::Relaxed);
                 self.content
@@ -4341,9 +4362,11 @@ mod tests {
                 let mut content = self.content.lock();
                 let has_children = content.keys().any(|key| key.starts_with(&prefix));
                 if has_children && !recursive {
-                    return Err(crate::kernel::abc::object_store::StorageError::NotSupported(
-                        "directory not empty",
-                    ));
+                    return Err(
+                        crate::kernel::abc::object_store::StorageError::NotSupported(
+                            "directory not empty",
+                        ),
+                    );
                 }
                 content.retain(|key, _| key != path && !key.starts_with(&prefix));
                 Ok(())
@@ -4385,7 +4408,8 @@ mod tests {
         fn mounted_counting_kernel() -> (Kernel, Arc<CountingObjectStore>, OperationContext) {
             let kernel = Kernel::new();
             let backend = Arc::new(CountingObjectStore::new());
-            let mount_backend: Arc<dyn crate::kernel::abc::object_store::ObjectStore> = backend.clone();
+            let mount_backend: Arc<dyn crate::kernel::abc::object_store::ObjectStore> =
+                backend.clone();
             kernel
                 .add_mount("/workspace", "root", Some(mount_backend), None, None, false)
                 .unwrap();
@@ -4416,7 +4440,10 @@ mod tests {
         #[test]
         fn strict_write_through_still_writes_each_call() {
             let (kernel, backend, ctx) = mounted_counting_kernel();
-            kernel.set_write_coalescing_policy("/", crate::contracts::WriteCoalescingPolicy::strict());
+            kernel.set_write_coalescing_policy(
+                "/",
+                crate::contracts::WriteCoalescingPolicy::strict(),
+            );
 
             kernel
                 .sys_write_one("/workspace/a.txt", &ctx, b"one", 0)
@@ -4435,7 +4462,10 @@ mod tests {
         #[test]
         fn latency_policy_coalesces_burst_until_flush() {
             let (kernel, backend, ctx) = mounted_counting_kernel();
-            kernel.set_write_coalescing_policy("/", crate::contracts::WriteCoalescingPolicy::latency());
+            kernel.set_write_coalescing_policy(
+                "/",
+                crate::contracts::WriteCoalescingPolicy::latency(),
+            );
 
             for idx in 0..100 {
                 let payload = format!("payload-{idx}");
@@ -4461,7 +4491,8 @@ mod tests {
         fn background_flusher_drains_idle_latency_writes() {
             let kernel = Arc::new(Kernel::new());
             let backend = Arc::new(CountingObjectStore::new());
-            let mount_backend: Arc<dyn crate::kernel::abc::object_store::ObjectStore> = backend.clone();
+            let mount_backend: Arc<dyn crate::kernel::abc::object_store::ObjectStore> =
+                backend.clone();
             kernel
                 .add_mount("/workspace", "root", Some(mount_backend), None, None, false)
                 .unwrap();
@@ -4501,7 +4532,10 @@ mod tests {
         #[test]
         fn stat_access_and_readdir_flush_dirty_creates_for_metadata_visibility() {
             let (kernel, backend, ctx) = mounted_counting_kernel();
-            kernel.set_write_coalescing_policy("/", crate::contracts::WriteCoalescingPolicy::latency());
+            kernel.set_write_coalescing_policy(
+                "/",
+                crate::contracts::WriteCoalescingPolicy::latency(),
+            );
 
             kernel
                 .sys_write_one("/workspace/new.txt", &ctx, b"new", 0)
@@ -4521,7 +4555,10 @@ mod tests {
         #[test]
         fn copy_flushes_dirty_source_before_metadata_lookup() {
             let (kernel, backend, ctx) = mounted_counting_kernel();
-            kernel.set_write_coalescing_policy("/", crate::contracts::WriteCoalescingPolicy::latency());
+            kernel.set_write_coalescing_policy(
+                "/",
+                crate::contracts::WriteCoalescingPolicy::latency(),
+            );
 
             kernel
                 .sys_write_one("/workspace/source.txt", &ctx, b"source", 0)
@@ -4564,7 +4601,10 @@ mod tests {
         #[test]
         fn unlink_flushes_dirty_file_before_delete() {
             let (kernel, backend, ctx) = mounted_counting_kernel();
-            kernel.set_write_coalescing_policy("/", crate::contracts::WriteCoalescingPolicy::latency());
+            kernel.set_write_coalescing_policy(
+                "/",
+                crate::contracts::WriteCoalescingPolicy::latency(),
+            );
 
             kernel
                 .sys_write_one("/workspace/a.txt", &ctx, b"abc", 0)
@@ -4582,7 +4622,10 @@ mod tests {
         #[test]
         fn rename_flushes_dirty_old_path_before_move() {
             let (kernel, backend, ctx) = mounted_counting_kernel();
-            kernel.set_write_coalescing_policy("/", crate::contracts::WriteCoalescingPolicy::latency());
+            kernel.set_write_coalescing_policy(
+                "/",
+                crate::contracts::WriteCoalescingPolicy::latency(),
+            );
 
             kernel
                 .sys_write_one("/workspace/a.txt", &ctx, b"abc", 0)
@@ -4605,7 +4648,10 @@ mod tests {
         #[test]
         fn rename_directory_flushes_dirty_children_before_move() {
             let (kernel, backend, ctx) = mounted_counting_kernel();
-            kernel.set_write_coalescing_policy("/", crate::contracts::WriteCoalescingPolicy::latency());
+            kernel.set_write_coalescing_policy(
+                "/",
+                crate::contracts::WriteCoalescingPolicy::latency(),
+            );
             kernel
                 .sys_mkdir("/workspace/dir", &ctx, true, false)
                 .unwrap();
@@ -4631,7 +4677,10 @@ mod tests {
         #[test]
         fn rmdir_recursive_flushes_dirty_children_before_delete() {
             let (kernel, backend, ctx) = mounted_counting_kernel();
-            kernel.set_write_coalescing_policy("/", crate::contracts::WriteCoalescingPolicy::latency());
+            kernel.set_write_coalescing_policy(
+                "/",
+                crate::contracts::WriteCoalescingPolicy::latency(),
+            );
             kernel
                 .sys_mkdir("/workspace/dir", &ctx, true, false)
                 .unwrap();
@@ -4654,12 +4703,16 @@ mod tests {
             let kernel = Kernel::new();
             let tempdir = tempfile::tempdir().unwrap();
             let metastore = Arc::new(
-                crate::kernel::meta_store::LocalMetaStore::open(&tempdir.path().join("meta.redb")).unwrap(),
+                crate::kernel::meta_store::LocalMetaStore::open(&tempdir.path().join("meta.redb"))
+                    .unwrap(),
             );
             kernel
                 .add_mount("/workspace", "root", None, Some(metastore), None, false)
                 .unwrap();
-            kernel.set_write_coalescing_policy("/", crate::contracts::WriteCoalescingPolicy::latency());
+            kernel.set_write_coalescing_policy(
+                "/",
+                crate::contracts::WriteCoalescingPolicy::latency(),
+            );
             let ctx = OperationContext::new("test", "root", true, None, true);
 
             let result = kernel
@@ -4673,7 +4726,10 @@ mod tests {
         #[test]
         fn locked_barrier_drains_dirty_path_without_reacquiring_lock() {
             let (kernel, backend, ctx) = mounted_counting_kernel();
-            kernel.set_write_coalescing_policy("/", crate::contracts::WriteCoalescingPolicy::latency());
+            kernel.set_write_coalescing_policy(
+                "/",
+                crate::contracts::WriteCoalescingPolicy::latency(),
+            );
             kernel
                 .sys_write_one("/workspace/a.txt", &ctx, b"abc", 0)
                 .unwrap();
@@ -4699,7 +4755,10 @@ mod tests {
         #[test]
         fn locked_prefix_barrier_uses_directory_lock_to_fence_children() {
             let (kernel, backend, ctx) = mounted_counting_kernel();
-            kernel.set_write_coalescing_policy("/", crate::contracts::WriteCoalescingPolicy::latency());
+            kernel.set_write_coalescing_policy(
+                "/",
+                crate::contracts::WriteCoalescingPolicy::latency(),
+            );
             kernel
                 .sys_mkdir("/workspace/dir", &ctx, true, false)
                 .unwrap();
@@ -4737,12 +4796,18 @@ mod tests {
         #[test]
         fn unlink_locked_flush_error_releases_path_lock() {
             let (kernel, backend, ctx) = mounted_counting_kernel();
-            kernel.set_write_coalescing_policy("/", crate::contracts::WriteCoalescingPolicy::strict());
+            kernel.set_write_coalescing_policy(
+                "/",
+                crate::contracts::WriteCoalescingPolicy::strict(),
+            );
             kernel
                 .sys_write_one("/workspace/a.txt", &ctx, b"seed", 0)
                 .unwrap();
 
-            kernel.set_write_coalescing_policy("/", crate::contracts::WriteCoalescingPolicy::latency());
+            kernel.set_write_coalescing_policy(
+                "/",
+                crate::contracts::WriteCoalescingPolicy::latency(),
+            );
             kernel
                 .sys_write_one("/workspace/a.txt", &ctx, b"dirty", 0)
                 .unwrap();
@@ -4764,7 +4829,10 @@ mod tests {
         #[test]
         fn ordinary_flush_does_not_claim_dirty_while_waiting_for_lock() {
             let (kernel, _backend, ctx) = mounted_counting_kernel();
-            kernel.set_write_coalescing_policy("/", crate::contracts::WriteCoalescingPolicy::latency());
+            kernel.set_write_coalescing_policy(
+                "/",
+                crate::contracts::WriteCoalescingPolicy::latency(),
+            );
             kernel
                 .sys_write_one("/workspace/a.txt", &ctx, b"abc", 0)
                 .unwrap();
@@ -4803,7 +4871,10 @@ mod tests {
         #[test]
         fn ordinary_flush_timeout_does_not_clear_existing_barrier_claim() {
             let (kernel, _backend, ctx) = mounted_counting_kernel();
-            kernel.set_write_coalescing_policy("/", crate::contracts::WriteCoalescingPolicy::latency());
+            kernel.set_write_coalescing_policy(
+                "/",
+                crate::contracts::WriteCoalescingPolicy::latency(),
+            );
             kernel.set_vfs_lock_timeout(1);
             kernel
                 .sys_write_one("/workspace/a.txt", &ctx, b"abc", 0)
@@ -4843,12 +4914,18 @@ mod tests {
         #[test]
         fn buffered_partial_write_reads_own_spliced_bytes() {
             let (kernel, backend, ctx) = mounted_counting_kernel();
-            kernel.set_write_coalescing_policy("/", crate::contracts::WriteCoalescingPolicy::strict());
+            kernel.set_write_coalescing_policy(
+                "/",
+                crate::contracts::WriteCoalescingPolicy::strict(),
+            );
             kernel
                 .sys_write_one("/workspace/a.txt", &ctx, b"hello", 0)
                 .unwrap();
 
-            kernel.set_write_coalescing_policy("/", crate::contracts::WriteCoalescingPolicy::latency());
+            kernel.set_write_coalescing_policy(
+                "/",
+                crate::contracts::WriteCoalescingPolicy::latency(),
+            );
             kernel
                 .sys_write_one("/workspace/a.txt", &ctx, b"XX", 1)
                 .unwrap();
@@ -4864,7 +4941,10 @@ mod tests {
         fn metadata_missing_partial_buffered_write_uses_backend_base() {
             let (kernel, backend, ctx) = mounted_counting_kernel();
             backend.seed("seed.txt", b"hello");
-            kernel.set_write_coalescing_policy("/", crate::contracts::WriteCoalescingPolicy::latency());
+            kernel.set_write_coalescing_policy(
+                "/",
+                crate::contracts::WriteCoalescingPolicy::latency(),
+            );
 
             kernel
                 .sys_write_one("/workspace/seed.txt", &ctx, b"XX", 1)
@@ -4886,12 +4966,18 @@ mod tests {
         #[test]
         fn flush_uses_original_dirty_metadata_snapshot_for_version() {
             let (kernel, _backend, ctx) = mounted_counting_kernel();
-            kernel.set_write_coalescing_policy("/", crate::contracts::WriteCoalescingPolicy::strict());
+            kernel.set_write_coalescing_policy(
+                "/",
+                crate::contracts::WriteCoalescingPolicy::strict(),
+            );
             kernel
                 .sys_write_one("/workspace/a.txt", &ctx, b"hello", 0)
                 .unwrap();
 
-            kernel.set_write_coalescing_policy("/", crate::contracts::WriteCoalescingPolicy::latency());
+            kernel.set_write_coalescing_policy(
+                "/",
+                crate::contracts::WriteCoalescingPolicy::latency(),
+            );
             kernel
                 .sys_write_one("/workspace/a.txt", &ctx, b"dirty", 0)
                 .unwrap();
@@ -4927,7 +5013,10 @@ mod tests {
         #[test]
         fn buffered_flush_observer_uses_latest_writer_identity() {
             let (kernel, _backend, _ctx) = mounted_counting_kernel();
-            kernel.set_write_coalescing_policy("/", crate::contracts::WriteCoalescingPolicy::latency());
+            kernel.set_write_coalescing_policy(
+                "/",
+                crate::contracts::WriteCoalescingPolicy::latency(),
+            );
             let captured = Arc::new(parking_lot::Mutex::new(None));
             kernel.register_observer(
                 Arc::new(CapturingObserver {

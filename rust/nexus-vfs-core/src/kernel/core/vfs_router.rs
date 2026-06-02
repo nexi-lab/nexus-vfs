@@ -819,8 +819,10 @@ mod tests {
             fn get(
                 &self,
                 _: &str,
-            ) -> Result<Option<crate::kernel::meta_store::FileMetadata>, crate::kernel::meta_store::MetaStoreError>
-            {
+            ) -> Result<
+                Option<crate::kernel::meta_store::FileMetadata>,
+                crate::kernel::meta_store::MetaStoreError,
+            > {
                 Ok(None)
             }
             fn put(
@@ -836,8 +838,10 @@ mod tests {
             fn list(
                 &self,
                 _: &str,
-            ) -> Result<Vec<crate::kernel::meta_store::FileMetadata>, crate::kernel::meta_store::MetaStoreError>
-            {
+            ) -> Result<
+                Vec<crate::kernel::meta_store::FileMetadata>,
+                crate::kernel::meta_store::MetaStoreError,
+            > {
                 Ok(Vec::new())
             }
             fn exists(&self, _: &str) -> Result<bool, crate::kernel::meta_store::MetaStoreError> {
