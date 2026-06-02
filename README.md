@@ -11,10 +11,8 @@ Rust VFS kernel workspace extracted from the [nexus](https://github.com/nexi-lab
 | `transport` | `rust/transport` | gRPC transport layer |
 | `kernel` | `rust/kernel` | VFS kernel (syscalls, metastore, drivers) |
 | `backends` | `rust/backends` | Storage backend implementations |
-| `services` | `rust/services` | Service-tier (password vault, etc.) |
 | `raft` | `rust/raft` | Raft consensus for federation |
 | `nexus-cluster` | `rust/profiles/cluster` | Standalone cluster binary (`nexusd-cluster`) |
-| `nexus-vault` | `rust/profiles/vault` | Password vault binary (`nexusd-vault`) |
 
 ## Build
 
