@@ -1,48 +1,61 @@
 # nexus-vfs
 
-Rust VFS kernel workspace extracted from the [nexus](https://github.com/nexi-lab/nexus) monorepo.
+Pure-Rust VFS extracted from [`nexi-lab/nexus`](https://github.com/nexi-lab/nexus).
+The Python codebase, Docker/k8s stack, docs, benchmarks, agent connectors,
+and the Python wheel cdylib are stripped out. Upstream's 9-crate workspace
+is consolidated into 3 publishable crates plus an umbrella facade.
 
-## Crates
+## Layout
 
-| Crate | Path | Description |
-|-------|------|-------------|
-| `contracts` | `rust/contracts` | Types, enums, constants (zero deps) |
-| `lib` | `rust/lib` | Algorithms + transport primitives |
-| `transport` | `rust/transport` | gRPC transport layer |
-| `kernel` | `rust/kernel` | VFS kernel (syscalls, metastore, drivers) |
-| `backends` | `rust/backends` | Storage backend implementations |
-| `services` | `rust/services` | Service-tier (password vault, etc.) |
-| `raft` | `rust/raft` | Raft consensus for federation |
-| `nexus-cluster` | `rust/profiles/cluster` | Standalone cluster binary (`nexusd-cluster`) |
-| `nexus-vault` | `rust/profiles/vault` | Password vault binary (`nexusd-vault`) |
+```
+rust/                       # cargo workspace
+├── nexus-vfs/              # umbrella crate (re-exports core + optional cluster)
+├── nexus-vfs-core/         # contracts + util + kernel + backends + services
+│                           # (was 5 separate rlib tier-crates upstream)
+├── nexus-vfs-cluster/      # Raft consensus + VFS gRPC server/client + federation
+│                           # (was raft + transport upstream)
+└── nexus-vfsd/             # daemon binary — `cargo install`-able entry point
 
-## Build
+nexus-fuse/                 # standalone FUSE client (separate workspace)
+proto/                      # .proto files used by core + cluster build.rs
+scripts/protoc-compat.py    # PROTOC shim for raft-rs's protobuf-build 0.14
+```
+
+## Build & run
 
 ```bash
-cargo check --workspace
-cargo test --workspace
-cargo clippy --workspace
+cargo build --release --workspace
+./target/release/nexus-vfsd --no-tls --bootstrap-mode static --data-dir /tmp/nexus
+# VFS gRPC :2028,  Raft federation :2126
+
+# Optional FUSE client (Linux/macFUSE only)
+cd nexus-fuse && cargo build --release
 ```
 
-## Option B: In-process Cargo git dependency
+Toolchain: `stable` (see `rust-toolchain.toml`).
 
-Add to your `Cargo.toml`:
+## What's served on the wire
 
-```toml
-[dependencies]
-kernel = { git = "https://github.com/nexi-lab/nexus-vfs", default-features = false }
-```
+| Endpoint | Service | RPCs verified |
+|---|---|---|
+| `:2028` | `nexus.grpc.vfs.NexusVFSService` | `Ping`, `Write`, `Read`, `Delete`, `Call` |
+| `:2126` | `nexus.raft.ZoneApiService` | `GetClusterInfo`, `GetSearchCapabilities`, `JoinZone`, `Propose`, `Query` |
+| `:2126` | `nexus.raft.ZoneTransportService` | `StepMessage`, `ReplicateEntries` (inter-node Raft) |
 
-This compiles the kernel as an rlib linked directly into your binary --
-no gRPC, no subprocess. The consumer changes only the git URL.
+`Initialize` and `BatchRead` RPCs are declared in `vfs.proto` but the Rust
+server returns `Unimplemented` — upstream wired these handlers only on the
+Python side and the trim doesn't backfill them.
 
-## Option C: gRPC subprocess (production default)
+## What was removed
 
-Build and run `nexusd-cluster`:
+Python source (`src/`), Alembic migrations, `pyproject.toml`/`uv.lock`,
+Dockerfiles/compose, k8s charts, observability, MkDocs, Python tests and
+benchmarks, the `buf` Python proto pipeline, `.github/` workflows, the
+`nexus-bench` crate, the `nexus-cdylib` Python wheel cdylib (along with its
+`sudocode` git-dep), the 8 agent connectors in `backends/` (OpenAI,
+Anthropic, GDrive, Gmail, Slack, X, HN, CLI), and raft's auxiliary
+`nexus-witness` / `nexus-federation-server` binaries.
 
-```bash
-cargo build --release -p nexus-cluster
-./target/release/nexusd-cluster --help
-```
+## License
 
-The Python app layer connects via gRPC (`RPCTransport`).
+Apache-2.0 — inherited from upstream. See `LICENSE`.
