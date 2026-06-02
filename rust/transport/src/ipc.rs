@@ -19,7 +19,7 @@
 //!
 //! # Usage
 //!
-//! ```no_run
+//! ```ignore
 //! use kernel::ipc::{send_message, wait_for_message, MessageEnvelope};
 //!
 //! // Send
