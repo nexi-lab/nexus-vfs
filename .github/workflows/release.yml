@@ -40,6 +40,11 @@ jobs:
             bin: nexusd-cluster
             package_dir: nexusd-cluster-macos-aarch64
             archive_name: nexusd-cluster-macos-aarch64.tar.gz
+          - name: macos-x86_64
+            os: macos-13
+            bin: nexusd-cluster
+            package_dir: nexusd-cluster-macos-x86_64
+            archive_name: nexusd-cluster-macos-x86_64.tar.gz
           - name: windows-x86_64
             os: windows-2022
             bin: nexusd-cluster.exe
