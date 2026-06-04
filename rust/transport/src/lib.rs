@@ -35,10 +35,10 @@
 /// JWT, OIDC, …) live in the deployment-tier service that introduces
 /// them, not here.
 pub mod auth;
-/// Federation peer client — discover/join RPCs for cross-zone membership.
-pub mod federation;
 /// Generic `Call` RPC dispatcher — JSON in, kernel syscall, JSON out.
 pub mod call_dispatch;
+/// Federation peer client — discover/join RPCs for cross-zone membership.
+pub mod federation;
 /// VFS gRPC server (in-bound). Always compiled.
 pub mod grpc;
 pub mod ipc;

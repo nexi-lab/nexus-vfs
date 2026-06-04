@@ -1758,10 +1758,14 @@ mod tests {
             match args.backend_type {
                 "s3" => {
                     // The handler must thread the request's S3 params through.
-                    let _bucket = args.backend_params.get("s3_bucket")
+                    let _bucket = args
+                        .backend_params
+                        .get("s3_bucket")
                         .filter(|v| !v.is_empty())
                         .ok_or("fake s3: missing s3_bucket")?;
-                    let _region = args.backend_params.get("aws_region")
+                    let _region = args
+                        .backend_params
+                        .get("aws_region")
                         .filter(|v| !v.is_empty())
                         .ok_or("fake s3: missing aws_region")?;
                     Ok(ObjectStoreBuildResult {
@@ -1797,7 +1801,10 @@ mod tests {
                     ("aws_region".into(), "auto".into()),
                     ("aws_access_key".into(), "AKID".into()),
                     ("aws_secret_key".into(), "SECRET".into()),
-                    ("s3_endpoint".into(), "https://acct.r2.cloudflarestorage.com".into()),
+                    (
+                        "s3_endpoint".into(),
+                        "https://acct.r2.cloudflarestorage.com".into(),
+                    ),
                 ]),
                 ..Default::default()
             }))

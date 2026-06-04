@@ -266,9 +266,7 @@ mod tests {
         let rt = build_kernel_runtime();
         let client = PeerBlobClient::new(rt.handle().clone());
         // Smoke: drives a trivial future through the borrowed Handle.
-        let _ = client
-            .runtime
-            .block_on(async { 1 + 1 });
+        let _ = client.runtime.block_on(async { 1 + 1 });
     }
 
     #[test]

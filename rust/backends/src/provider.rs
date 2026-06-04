@@ -30,7 +30,10 @@ pub struct DefaultObjectStoreProvider;
 
 /// Get a non-empty string param from the map, coercing empty to `None`.
 fn param<'a>(params: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
-    params.get(key).map(|s| s.as_str()).filter(|s| !s.is_empty())
+    params
+        .get(key)
+        .map(|s| s.as_str())
+        .filter(|s| !s.is_empty())
 }
 
 /// Get a required param or return an error.
@@ -253,9 +256,7 @@ fn insecure_grpc_allowed() -> bool {
 /// Returns `None` when no CA is supplied (plaintext gRPC); PEM values
 /// are stored as UTF-8 strings in the map and converted to bytes.
 #[cfg(feature = "driver-remote")]
-fn build_tls_config(
-    p: &HashMap<String, String>,
-) -> Option<kernel::rpc_transport::TlsConfig> {
+fn build_tls_config(p: &HashMap<String, String>) -> Option<kernel::rpc_transport::TlsConfig> {
     let ca = param(p, "remote_ca_pem")?;
     Some(kernel::rpc_transport::TlsConfig {
         ca_pem: ca.as_bytes().to_vec(),
@@ -308,7 +309,9 @@ mod tests {
     }
 
     fn params(kvs: &[(&str, &str)]) -> HashMap<String, String> {
-        kvs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        kvs.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[cfg(feature = "driver-path-local")]
@@ -319,7 +322,9 @@ mod tests {
         let pc = noop_peer_client();
         let rt = noop_runtime();
         let args = mk_args("path_local", &p, &pc, &rt);
-        let r = DefaultObjectStoreProvider.build(&args).expect("should succeed");
+        let r = DefaultObjectStoreProvider
+            .build(&args)
+            .expect("should succeed");
         assert!(r.backend.is_some());
         assert!(r.pending_remote_meta_store.is_none());
     }
@@ -344,7 +349,9 @@ mod tests {
         let rt = noop_runtime();
         let mut args = mk_args("cas-local", &p, &pc, &rt);
         args.self_address = Some("nexus-self:2126");
-        let r = DefaultObjectStoreProvider.build(&args).expect("should succeed");
+        let r = DefaultObjectStoreProvider
+            .build(&args)
+            .expect("should succeed");
         assert!(r.backend.is_some());
     }
 
@@ -356,7 +363,9 @@ mod tests {
         let pc = noop_peer_client();
         let rt = noop_runtime();
         let args = mk_args("local_connector", &p, &pc, &rt);
-        let r = DefaultObjectStoreProvider.build(&args).expect("should succeed");
+        let r = DefaultObjectStoreProvider
+            .build(&args)
+            .expect("should succeed");
         assert!(r.backend.is_some());
     }
 
@@ -373,7 +382,9 @@ mod tests {
         let pc = noop_peer_client();
         let rt = noop_runtime();
         let args = mk_args("s3", &p, &pc, &rt);
-        let r = DefaultObjectStoreProvider.build(&args).expect("should succeed");
+        let r = DefaultObjectStoreProvider
+            .build(&args)
+            .expect("should succeed");
         assert!(r.backend.is_some());
     }
 
@@ -403,7 +414,9 @@ mod tests {
         let pc = noop_peer_client();
         let rt = noop_runtime();
         let args = mk_args("gcs", &p, &pc, &rt);
-        let r = DefaultObjectStoreProvider.build(&args).expect("should succeed");
+        let r = DefaultObjectStoreProvider
+            .build(&args)
+            .expect("should succeed");
         assert!(r.backend.is_some());
     }
 
@@ -417,7 +430,9 @@ mod tests {
         let pc = noop_peer_client();
         let rt = noop_runtime();
         let args = mk_args("remote", &p, &pc, &rt);
-        let r = DefaultObjectStoreProvider.build(&args).expect("should succeed");
+        let r = DefaultObjectStoreProvider
+            .build(&args)
+            .expect("should succeed");
         assert!(r.backend.is_some());
         assert!(r.pending_remote_meta_store.is_some());
     }
@@ -442,7 +457,8 @@ mod tests {
         for root in ["/", ""] {
             let mut args = mk_args("remote", &p, &pc, &rt);
             args.mount_path = Some(root);
-            let r = DefaultObjectStoreProvider.build(&args)
+            let r = DefaultObjectStoreProvider
+                .build(&args)
                 .unwrap_or_else(|e| panic!("root mount_path {root:?} should build: {e}"));
             assert!(r.backend.is_some());
             assert!(r.pending_remote_meta_store.is_some());
@@ -458,7 +474,10 @@ mod tests {
         let mut args = mk_args("remote", &p, &pc, &rt);
         args.mount_path = Some("/zone/acme");
         let err = expect_err(DefaultObjectStoreProvider.build(&args));
-        assert!(err.contains("sub-path mount") && err.contains("/zone/acme"), "err was: {err}");
+        assert!(
+            err.contains("sub-path mount") && err.contains("/zone/acme"),
+            "err was: {err}"
+        );
     }
 
     #[cfg(feature = "driver-remote")]
@@ -483,7 +502,10 @@ mod tests {
         let rt = noop_runtime();
         let args = mk_args("remote", &p, &pc, &rt);
         let err = expect_err(DefaultObjectStoreProvider.build(&args));
-        assert!(err.contains("non-loopback") && err.contains("NEXUS_GRPC_ALLOW_INSECURE"), "err was: {err}");
+        assert!(
+            err.contains("non-loopback") && err.contains("NEXUS_GRPC_ALLOW_INSECURE"),
+            "err was: {err}"
+        );
     }
 
     #[cfg(feature = "driver-remote")]
@@ -508,7 +530,8 @@ mod tests {
                 ("remote_timeout", &bad.to_string()),
             ]);
             let args = mk_args("remote", &p, &pc, &rt);
-            let r = DefaultObjectStoreProvider.build(&args)
+            let r = DefaultObjectStoreProvider
+                .build(&args)
                 .unwrap_or_else(|e| panic!("timeout={bad}: {e}"));
             assert!(r.backend.is_some());
         }
@@ -518,15 +541,30 @@ mod tests {
     #[test]
     fn tls_config_assembly() {
         let empty = HashMap::new();
-        assert!(build_tls_config(&empty).is_none(), "no CA should mean plaintext");
+        assert!(
+            build_tls_config(&empty).is_none(),
+            "no CA should mean plaintext"
+        );
 
         let p = params(&[
-            ("remote_ca_pem", "-----BEGIN CERTIFICATE-----CA-----END CERTIFICATE-----"),
-            ("remote_cert_pem", "-----BEGIN CERTIFICATE-----CERT-----END CERTIFICATE-----"),
-            ("remote_key_pem", "-----BEGIN PRIVATE KEY-----KEY-----END PRIVATE KEY-----"),
+            (
+                "remote_ca_pem",
+                "-----BEGIN CERTIFICATE-----CA-----END CERTIFICATE-----",
+            ),
+            (
+                "remote_cert_pem",
+                "-----BEGIN CERTIFICATE-----CERT-----END CERTIFICATE-----",
+            ),
+            (
+                "remote_key_pem",
+                "-----BEGIN PRIVATE KEY-----KEY-----END PRIVATE KEY-----",
+            ),
         ]);
         let tls = build_tls_config(&p).expect("CA present should yield Some");
-        assert_eq!(tls.ca_pem, b"-----BEGIN CERTIFICATE-----CA-----END CERTIFICATE-----");
+        assert_eq!(
+            tls.ca_pem,
+            b"-----BEGIN CERTIFICATE-----CA-----END CERTIFICATE-----"
+        );
         assert!(tls.cert_pem.is_some());
         assert!(tls.key_pem.is_some());
     }
