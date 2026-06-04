@@ -101,15 +101,6 @@ impl ObjectStoreProvider for DefaultObjectStoreProvider {
             #[cfg(feature = "driver-remote")]
             "remote" => {
                 let raw_address = required_param(p, "server_address", "remote")?;
-                if let Some(mp) = args.mount_path {
-                    if !mp.trim_end_matches('/').is_empty() {
-                        return Err(format!(
-                            "remote sub-path mount '{mp}' not yet supported \
-                             (RemoteBackend path reconstruction — Issue #4273); \
-                             mount remote zones at \"/\" for now"
-                        ));
-                    }
-                }
                 let auth_token = param(p, "remote_auth_token").unwrap_or("");
                 let tls = build_tls_config(p);
                 let address = resolve_remote_address(raw_address, tls.is_some())?;
@@ -133,8 +124,46 @@ impl ObjectStoreProvider for DefaultObjectStoreProvider {
                 let meta_store: Arc<dyn kernel::meta_store::MetaStore> = Arc::new(
                     kernel::meta_store::remote::RemoteMetaStore::new(Arc::clone(&transport)),
                 );
-                let backend: Arc<dyn kernel::abc::object_store::ObjectStore> =
-                    Arc::new(crate::storage::remote::RemoteBackend::new(transport));
+                // Issue #4273: thread the mount point so sub-path remote mounts
+                // reconstruct absolute server paths. A `None`/root (`""`/`"/"`)
+                // `mount_path` keeps root-mount semantics (empty zone_path).
+                let backend: Arc<dyn kernel::abc::object_store::ObjectStore> = match args.mount_path
+                {
+                    Some(mp) if !mp.trim_matches('/').is_empty() => {
+                        // The VFS router keys mounts by the raw mount path
+                        // (`canonicalize_mount_path` strips only LEADING slashes)
+                        // and the DT_MOUNT install path does NOT run the normal
+                        // `validate_path_fast`, so a non-canonical mount path
+                        // installs a mount that ordinary syscalls can't address
+                        // (they reject `..`/NUL and canonicalize differently),
+                        // silently misplacing data. Require every segment to be a
+                        // clean, non-empty name — no NUL, `.`, `..`, trailing
+                        // slash, or empty `//` component — rather than build a
+                        // mis-routing mount.
+                        let rel = mp.trim_start_matches('/');
+                        let noncanonical = mp.contains('\0')
+                            || rel
+                                .split('/')
+                                .any(|seg| seg.is_empty() || seg == "." || seg == "..");
+                        if noncanonical {
+                            let canonical: String = rel
+                                .split('/')
+                                .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+                                .collect::<Vec<_>>()
+                                .join("/");
+                            return Err(format!(
+                                "remote mount_path '{mp}' is not canonical (segments must be \
+                                 non-empty and not '.'/'..', no NUL or trailing slash); \
+                                 use '/{canonical}'"
+                            ));
+                        }
+                        Arc::new(crate::storage::remote::RemoteBackend::with_zone_path(
+                            transport,
+                            format!("/{rel}"),
+                        ))
+                    }
+                    _ => Arc::new(crate::storage::remote::RemoteBackend::new(transport)),
+                };
                 Ok(ObjectStoreBuildResult {
                     backend: Some(backend),
                     pending_remote_meta_store: Some(meta_store),
@@ -467,17 +496,53 @@ mod tests {
 
     #[cfg(feature = "driver-remote")]
     #[test]
-    fn remote_subpath_mount_rejected() {
+    fn remote_subpath_mount_builds() {
+        // Issue #4273: canonical sub-path remote mounts are supported — the
+        // mount point is threaded into `RemoteBackend::with_zone_path`, so the
+        // provider builds them instead of failing closed. Both leading-slash
+        // and bare forms are accepted (the router strips leading slashes).
         let p = params(&[("server_address", "127.0.0.1:2126")]);
         let pc = noop_peer_client();
         let rt = noop_runtime();
-        let mut args = mk_args("remote", &p, &pc, &rt);
-        args.mount_path = Some("/zone/acme");
-        let err = expect_err(DefaultObjectStoreProvider.build(&args));
-        assert!(
-            err.contains("sub-path mount") && err.contains("/zone/acme"),
-            "err was: {err}"
-        );
+        for mp in ["/zone/acme", "zone/acme"] {
+            let mut args = mk_args("remote", &p, &pc, &rt);
+            args.mount_path = Some(mp);
+            let r = DefaultObjectStoreProvider
+                .build(&args)
+                .unwrap_or_else(|e| panic!("sub-path mount_path {mp:?} should build: {e}"));
+            assert!(r.backend.is_some());
+            assert!(r.pending_remote_meta_store.is_some());
+        }
+    }
+
+    #[cfg(feature = "driver-remote")]
+    #[test]
+    fn remote_noncanonical_mount_path_rejected() {
+        // Any non-canonical segment (trailing slash, empty `//`, `.`, `..`, NUL)
+        // would install a mount the VFS router can't reach by normal
+        // `/zone/acme/file` lookups (the router canonicalizes only leading
+        // slashes, and DT_MOUNT skips `validate_path_fast`), so the provider
+        // rejects it rather than silently misplace data. (Issue #4273, rounds 5-6.)
+        let p = params(&[("server_address", "127.0.0.1:2126")]);
+        let pc = noop_peer_client();
+        let rt = noop_runtime();
+        for mp in [
+            "/zone/acme/",
+            "/zone//acme",
+            "zone/acme/",
+            "/zone/../acme",
+            "/zone/acme/..",
+            "/zone/./acme",
+            "/zone/\0/acme",
+        ] {
+            let mut args = mk_args("remote", &p, &pc, &rt);
+            args.mount_path = Some(mp);
+            let err = expect_err(DefaultObjectStoreProvider.build(&args));
+            assert!(
+                err.contains("not canonical"),
+                "mount_path {mp:?} err was: {err}"
+            );
+        }
     }
 
     #[cfg(feature = "driver-remote")]
