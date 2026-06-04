@@ -29,6 +29,8 @@ pub fn apply_server_limits(builder: Server) -> Server {
         .http2_keepalive_interval(Some(Duration::from_secs(
             GRPC_HTTP2_KEEPALIVE_INTERVAL_SECS,
         )))
-        .http2_keepalive_timeout(Some(Duration::from_secs(GRPC_HTTP2_KEEPALIVE_TIMEOUT_SECS)))
+        .http2_keepalive_timeout(Some(Duration::from_secs(
+            GRPC_HTTP2_KEEPALIVE_TIMEOUT_SECS,
+        )))
         .tcp_keepalive(Some(Duration::from_secs(GRPC_TCP_KEEPALIVE_SECS)))
 }

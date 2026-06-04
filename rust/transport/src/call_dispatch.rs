@@ -63,6 +63,7 @@ pub fn dispatch(
         "agent_heartbeat" => do_agent_heartbeat(kernel, &params),
 
         // Xattr (file metadata side-car)
+
         _ => Err(call_err(
             RpcErrorCode::InternalError,
             &format!("unknown Call method: {method}"),
@@ -363,6 +364,7 @@ fn do_agent_heartbeat(
         )),
     }
 }
+
 
 #[cfg(test)]
 mod tests {

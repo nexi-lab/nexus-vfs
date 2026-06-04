@@ -131,9 +131,11 @@ impl LockState {
     /// Any holder on a strict ancestor blocks descendant acquires.
     /// Hierarchical lock = "I'm using this subtree, leave it alone."
     fn ancestor_conflict(&self, path: &str) -> bool {
-        ancestors(path)
-            .into_iter()
-            .any(|anc| self.locks.get(anc).is_some_and(|entry| !entry.is_empty()))
+        ancestors(path).into_iter().any(|anc| {
+            self.locks
+                .get(anc)
+                .is_some_and(|entry| !entry.is_empty())
+        })
     }
 
     /// Any holder on a strict descendant blocks ancestor acquires.
