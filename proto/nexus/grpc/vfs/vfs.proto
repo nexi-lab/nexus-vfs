@@ -348,6 +348,25 @@ message SetattrRequest {
   string io_profile = 12;
   bool is_external = 13;
   uint64 capacity = 14;
+
+  // ── DT_MOUNT backend-construction params (entry_type == 2) ──────────
+  //
+  // `backend_type` is the dispatch key (matches DRIVER_* values:
+  // "s3", "gcs", "remote", …). Empty ⇒ metadata-only / local re-mount.
+  // `backend_params` carries all app-layer constructor params as an
+  // opaque string map — each backend arm in the provider parses its
+  // own required keys (e.g. "s3_bucket", "aws_region"). This keeps the
+  // proto extensible: adding a new backend or param requires zero
+  // proto changes.
+  string backend_type = 15;
+
+  // Old flat backend fields (16-30) replaced by the opaque map.
+  reserved 16 to 30;
+
+  // Opaque app-layer backend-construction params. Keys match the
+  // provider arm's expected param names (e.g. "s3_bucket", "aws_region",
+  // "server_address"). Binary data (PEM certs) is stored as UTF-8 text.
+  map<string, string> backend_params = 31;
 }
 
 message SetattrResponse {

@@ -10,6 +10,9 @@ publish = false
 name = "nexusd-cluster"
 path = "src/main.rs"
 
+[features]
+default = []
+
 [dependencies]
 # raft owns federation orchestration (ZoneManager, bootstrap_tls, etc.).
 # Only the grpc feature — that is all this binary needs and dropping the
