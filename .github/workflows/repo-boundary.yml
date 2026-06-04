@@ -1,0 +1,47 @@
+name: Repo Boundary
+
+# DRY between nexus + nexus-vfs.  This repo holds the kernel tier
+# (contracts / lib / transport / kernel / backends / raft +
+# profiles/cluster + proto).  Service-tier code lives in nexus
+# (rust/services, rust/profiles/vault) and MUST NOT reappear here —
+# the dual-repo split was made specifically to prevent that drift.
+#
+# Companion gate in nexus repo forbids the kernel-tier paths.  Either
+# gate firing means the cross-repo boundary is being violated; the
+# fix is to move the offending path back to the correct repo, not to
+# disable the gate.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  forbid-service-tier-paths:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Forbid service-tier paths
+        run: |
+          set -e
+          forbidden=(
+            rust/services
+            rust/profiles/vault
+          )
+          violations=()
+          for p in "${forbidden[@]}"; do
+            if [ -e "$p" ]; then
+              violations+=("$p")
+            fi
+          done
+          if [ "${#violations[@]}" -gt 0 ]; then
+            for v in "${violations[@]}"; do
+              echo "::error::path '$v' belongs in the nexus repo, not nexus-vfs (kernel-tier SSOT)"
+            done
+            echo ""
+            echo "If you intentionally meant to move this path into nexus-vfs, update"
+            echo "the boundary list in .github/workflows/repo-boundary.yml in BOTH"
+            echo "repos and document the move in the PR body."
+            exit 1
+          fi
+          echo "Repo boundary OK — no service-tier paths present."
