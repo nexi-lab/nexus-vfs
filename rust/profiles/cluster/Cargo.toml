@@ -1,6 +1,6 @@
 [package]
 name = "nexus-cluster"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Nexus cluster-profile runtime — pure Rust binary for Raft + IPC + federation"
 authors = ["Nexus Team"]
