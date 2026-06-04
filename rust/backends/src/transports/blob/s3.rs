@@ -181,6 +181,67 @@ impl S3Transport {
             ),
         ]
     }
+
+    /// SigV4 variant that includes the `x-amz-copy-source` header, used by
+    /// [`ObjectStore::rename`] to perform an S3 server-side copy.
+    /// Canonical headers MUST be sorted lexicographically by lowercase name:
+    /// `host`, `x-amz-content-sha256`, `x-amz-copy-source`, `x-amz-date`.
+    fn sign_request_with_copy_source(
+        &self,
+        method: &str,
+        path: &str,
+        content_sha256: &str,
+        copy_source: &str,
+        now: &chrono::DateTime<chrono::Utc>,
+    ) -> Vec<(String, String)> {
+        let date_stamp = now.format("%Y%m%d").to_string();
+        let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+        let credential_scope = format!("{}/{}/s3/aws4_request", date_stamp, self.region);
+
+        let canonical_headers = format!(
+            "host:{}\nx-amz-content-sha256:{}\nx-amz-copy-source:{}\nx-amz-date:{}\n",
+            self.host(),
+            content_sha256,
+            copy_source,
+            amz_date
+        );
+        let signed_headers = "host;x-amz-content-sha256;x-amz-copy-source;x-amz-date";
+
+        let canonical_request = format!(
+            "{}\n{}\n\n{}\n{}\n{}",
+            method, path, canonical_headers, signed_headers, content_sha256
+        );
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n{}\n{}\n{}",
+            amz_date,
+            credential_scope,
+            hex::encode(Sha256::digest(canonical_request.as_bytes()))
+        );
+
+        let k_date = hmac_sha256(
+            format!("AWS4{}", self.secret_key).as_bytes(),
+            date_stamp.as_bytes(),
+        );
+        let k_region = hmac_sha256(&k_date, self.region.as_bytes());
+        let k_service = hmac_sha256(&k_region, b"s3");
+        let k_signing = hmac_sha256(&k_service, b"aws4_request");
+        let signature = hex::encode(hmac_sha256(&k_signing, string_to_sign.as_bytes()));
+
+        let auth = format!(
+            "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
+            self.access_key, credential_scope, signed_headers, signature
+        );
+
+        vec![
+            ("Authorization".to_string(), auth),
+            ("x-amz-date".to_string(), amz_date),
+            (
+                "x-amz-content-sha256".to_string(),
+                content_sha256.to_string(),
+            ),
+            ("x-amz-copy-source".to_string(), copy_source.to_string()),
+        ]
+    }
 }
 
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
@@ -320,6 +381,56 @@ impl ObjectStore for S3Transport {
 
     fn delete_file(&self, path: &str) -> Result<(), StorageError> {
         self.delete_content(path)
+    }
+
+    /// S3 has no native rename. Emulate with a server-side copy
+    /// (PUT {dst} + `x-amz-copy-source: /{bucket}/{src}`) followed by a
+    /// DELETE of the source. Copy-on-server avoids round-tripping the
+    /// bytes through the client.
+    fn rename(&self, old_path: &str, new_path: &str) -> Result<(), StorageError> {
+        let src_key = self.object_key(old_path);
+        let dst_key = self.object_key(new_path);
+        let dst_path = self.request_path(&dst_key);
+        let url = format!("{}{}", self.base_url().trim_end_matches('/'), dst_path);
+
+        // `x-amz-copy-source` is always bucket-qualified and URL-encoded,
+        // independent of path- vs virtual-hosted addressing.
+        let copy_source = format!(
+            "/{}/{}",
+            s3_uri_encode(&self.bucket),
+            encode_s3_path(&src_key)
+        );
+        // CopyObject carries an empty request body.
+        let empty_sha = hex::encode(Sha256::digest(b""));
+        let now = chrono::Utc::now();
+        let headers =
+            self.sign_request_with_copy_source("PUT", &dst_path, &empty_sha, &copy_source, &now);
+
+        self.runtime.block_on(async {
+            let client = reqwest::Client::new();
+            let mut req = client.put(&url);
+            for (k, v) in &headers {
+                req = req.header(k.as_str(), v.as_str());
+            }
+            let resp = req
+                .send()
+                .await
+                .map_err(|e| StorageError::IOError(io::Error::other(format!("S3 COPY: {e}"))))?;
+            if resp.status().as_u16() == 404 {
+                return Err(StorageError::NotFound(old_path.to_string()));
+            }
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(StorageError::IOError(io::Error::other(format!(
+                    "S3 COPY {status}: {body}"
+                ))));
+            }
+            Ok::<(), StorageError>(())
+        })?;
+
+        // Source removed only after the copy succeeded.
+        self.delete_content(old_path)
     }
 
     fn mkdir(&self, _path: &str, _parents: bool, _exist_ok: bool) -> Result<(), StorageError> {
