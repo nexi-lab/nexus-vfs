@@ -58,11 +58,20 @@ the same `ServiceRegistry` / `VFSRouter` primitives; the kernel sees a uniform
 `Arc<dyn RustService>` or `Arc<dyn ObjectStore>` regardless of how the code was
 loaded.
 
-| Mode | Mechanism | Hot-swap | Perf | VFS hooks | Applicable scenarios |
-|------|-----------|----------|------|-----------|---------------------|
-| **Compiled-in** | Cargo feature gate (§7.2) | No (recompile) | Best (zero-cost Rust trait dispatch) | Full (direct trait objects) | Kernel-coupled services (ReBAC hooks, AuditHook, AgentStatusResolver), perf-critical drivers |
-| **dylib** | `PluginLoader` loads `.so`/`.dylib` via `dlopen` (§10) | Yes (load/unload/reload) | Good (~ns C ABI call) | Limited — RPC dispatch OK; VFS hooks need C ABI wrapper (no stable Rust ABI across dlopen) | Cross-repo services (vault), dispatch-only services, independent storage drivers |
-| **gRPC sidecar** | Separate process, proxied via `ManagedServiceGrpcProxy` | Inherent (separate process) | ~100μs (network round-trip) | No (out-of-process) | Other-language services (Python, Go), fully independent microservices |
+| Mode | Mechanism | Runtime swap | Perf | VFS hooks | Applicable scenarios |
+|------|-----------|-------------|------|-----------|---------------------|
+| **Compiled-in** | Cargo feature gate (§7.2) | Instance swap (same binary) | Best (zero-cost Rust trait dispatch) | Full (direct trait objects) | Kernel-coupled services (ReBAC hooks, AuditHook, AgentStatusResolver), perf-critical drivers |
+| **dylib** | `PluginLoader` loads `.so`/`.dylib` via `dlopen` (§10) | Code swap (load/unload/reload new `.so`) + instance swap | Good (~ns C ABI call) | RPC dispatch; VFS hooks require C ABI wrapper (§10) | Cross-repo services (vault), dispatch-only services, independent storage drivers |
+| **gRPC sidecar** | Separate process, proxied via `ManagedServiceGrpcProxy` | Process restart (independent lifecycle) | ~100μs (network round-trip) | Out-of-process | Other-language services (Python, Go), fully independent microservices |
+
+**Instance swap** is a kernel primitive shared by all three modes.
+`swap_managed_service()` executes unhook → drain → replace → rehook:
+the kernel removes the old service's hooks/observers, waits for in-flight
+calls to drain, atomically replaces the `ServiceRegistry` entry, and the
+caller registers new hooks. Use cases: config-driven re-initialization,
+feature flag toggling, dylib code reload. **Code swap** (loading new
+compiled code at runtime) is exclusive to the dylib mode via
+`PluginLoader`.
 
 **Invariant:** Services depend on kernel interfaces, never the reverse.
 The kernel operates with zero services loaded. Kernel code (`core/nexus_fs.py`)
