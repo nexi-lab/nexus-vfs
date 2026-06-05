@@ -54,11 +54,12 @@ impl Kernel {
         Ok(name)
     }
 
-    /// Unload a plugin by name. Service plugins are unregistered from
-    /// ServiceRegistry first (drain + stop).
+    /// Unload a plugin by name. Service plugins have their hooks removed
+    /// and are unregistered from ServiceRegistry first (drain + stop).
     pub fn unload_plugin(&self, name: &str) -> Result<(), String> {
-        // Check if it's a service — unregister before destroy
+        // Check if it's a service — unhook + unregister before destroy
         if self.service_registry.contains(name) {
+            self.unhook_service(name);
             self.service_registry.unregister(name);
         }
         self.plugin_loader.unload(name)

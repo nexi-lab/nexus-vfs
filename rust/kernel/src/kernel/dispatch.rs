@@ -188,6 +188,69 @@ impl Kernel {
         self.native_hooks.write().unregister(name)
     }
 
+    // ── Service ↔ hook lifecycle ────────────────────────────────────────
+    //
+    // Port of Python `swap_service()` 4-step flow:
+    //   1. Unhook old service's hooks (NativeHookRegistry + ObserverRegistry)
+    //   2. Drain (ServiceRegistry.drain — refcount → 0)
+    //   3. Replace (ServiceRegistry.swap / enlist)
+    //   4. Rehook new service's hooks
+    //
+    // Services register hooks via `register_service_hook` /
+    // `register_service_observer` which also record the mapping in
+    // `service_hook_names` / `service_observer_names`. Swap/unregister
+    // use the map to batch-remove stale hooks.
+
+    /// Register a native hook AND record it as belonging to `service_name`.
+    /// On swap/unregister of `service_name`, the kernel auto-removes it.
+    pub fn register_service_hook(&self, service_name: &str, hook: Box<dyn NativeInterceptHook>) {
+        let hook_name = hook.name().to_string();
+        self.native_hooks.write().register(hook);
+        self.service_hook_names
+            .lock()
+            .entry(service_name.to_string())
+            .or_default()
+            .push(hook_name);
+    }
+
+    /// Register an observer AND record it as belonging to `service_name`.
+    pub fn register_service_observer(
+        &self,
+        service_name: &str,
+        observer: std::sync::Arc<dyn crate::dispatch::MutationObserver>,
+        observer_name: String,
+        event_mask: u32,
+    ) {
+        let name_clone = observer_name.clone();
+        self.observers
+            .write()
+            .register(observer, observer_name, event_mask);
+        self.service_observer_names
+            .lock()
+            .entry(service_name.to_string())
+            .or_default()
+            .push(name_clone);
+    }
+
+    /// Remove all hooks and observers belonging to a service.
+    /// Called internally before swap/unregister.
+    pub(crate) fn unhook_service(&self, service_name: &str) {
+        // Remove native hooks
+        if let Some(hook_names) = self.service_hook_names.lock().remove(service_name) {
+            let mut registry = self.native_hooks.write();
+            for name in &hook_names {
+                registry.unregister(name);
+            }
+        }
+        // Remove observers
+        if let Some(observer_names) = self.service_observer_names.lock().remove(service_name) {
+            let mut registry = self.observers.write();
+            for name in &observer_names {
+                registry.unregister(name);
+            }
+        }
+    }
+
     // ── Service registry facade ───────────────────────────────────────
     //
     // Every ServiceRegistry method is exposed through Kernel so that
@@ -205,12 +268,20 @@ impl Kernel {
             .enlist(name, instance, exports, allow_overwrite)
     }
 
-    /// Unregister a service by name. Returns true if found.
+    /// Unregister a service by name. Removes associated hooks/observers
+    /// first (Python `swap_service` unhook step). Returns true if found.
     pub fn unregister_service(&self, name: &str) -> bool {
+        self.unhook_service(name);
         self.service_registry.unregister(name)
     }
 
-    /// Hot-swap a managed service: drain → replace.
+    /// Hot-swap a managed service: unhook → drain → replace → (caller rehooks).
+    ///
+    /// Port of Python `nexus_fs.py:swap_service()` 4-step flow.
+    /// Steps 1-3 are handled here; step 4 (rehook) is the caller's
+    /// responsibility — they register new hooks via
+    /// `register_service_hook` / `register_service_observer` after
+    /// swap returns.
     pub fn swap_managed_service(
         &self,
         name: &str,
@@ -218,6 +289,9 @@ impl Kernel {
         exports: Vec<String>,
         timeout_ms: u64,
     ) -> Result<(), String> {
+        // 1. Unhook old service's hooks
+        self.unhook_service(name);
+        // 2+3. Drain + replace (ServiceRegistry handles both)
         self.service_registry
             .swap(name, new_instance, exports, timeout_ms)
     }
@@ -385,8 +459,7 @@ impl Kernel {
                 let name = req["name"]
                     .as_str()
                     .ok_or_else(|| RustCallError::InvalidArgument("missing 'name'".into()))?;
-                self.unload_plugin(name)
-                    .map_err(RustCallError::Internal)?;
+                self.unload_plugin(name).map_err(RustCallError::Internal)?;
                 Ok(b"{}".to_vec())
             }
             // plugin.load and plugin.reload require Arc<Kernel> (self:

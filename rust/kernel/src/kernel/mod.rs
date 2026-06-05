@@ -638,6 +638,17 @@ pub struct Kernel {
     // Runtime dlopen-based loading of service and driver plugins.
     // Constructed empty; populated via `load_plugin()` / `--plugin-dir`.
     pub(crate) plugin_loader: crate::core::plugin_loader::PluginLoader,
+
+    // ── Service ↔ hook lifecycle map ─────────────────────────────────
+    //
+    // Tracks which NativeInterceptHook / MutationObserver names belong
+    // to which service. On swap/unregister, the kernel uses this map to
+    // batch-remove stale hooks before installing the replacement.
+    //
+    // Python equivalent: `nexus_fs.py:_hook_specs` + `swap_service()`
+    // unhook → drain → replace → rehook flow.
+    service_hook_names: parking_lot::Mutex<std::collections::HashMap<String, Vec<String>>>,
+    service_observer_names: parking_lot::Mutex<std::collections::HashMap<String, Vec<String>>>,
 }
 
 impl Kernel {
@@ -722,6 +733,8 @@ impl Kernel {
             permission_admin_bypass: AtomicBool::new(true),
             has_permission_provider: AtomicBool::new(false),
             plugin_loader: crate::core::plugin_loader::PluginLoader::new(),
+            service_hook_names: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            service_observer_names: parking_lot::Mutex::new(std::collections::HashMap::new()),
         };
         // Distributed-coordinator bootstrap is driven by
         // `RaftDistributedCoordinator::install_with_kernel`. The host
