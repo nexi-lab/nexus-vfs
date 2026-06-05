@@ -1437,11 +1437,9 @@ impl ZoneManager {
         let parent = parent_zone_id.to_string();
         let path = mount_path.to_string();
         let target = target_zone_id.to_string();
-        tokio::task::spawn_blocking(move || {
-            this.mount(&parent, &path, &target, increment_links)
-        })
-        .await
-        .map_err(|e| RaftError::InvalidState(format!("mount_async task panicked: {e}")))?
+        tokio::task::spawn_blocking(move || this.mount(&parent, &path, &target, increment_links))
+            .await
+            .map_err(|e| RaftError::InvalidState(format!("mount_async task panicked: {e}")))?
     }
 
     /// Async wrapper for [`Self::create_zone`].
@@ -1454,9 +1452,7 @@ impl ZoneManager {
         let zone_id = zone_id.to_string();
         tokio::task::spawn_blocking(move || this.create_zone(&zone_id, peers))
             .await
-            .map_err(|e| {
-                RaftError::InvalidState(format!("create_zone_async task panicked: {e}"))
-            })?
+            .map_err(|e| RaftError::InvalidState(format!("create_zone_async task panicked: {e}")))?
     }
 
     /// Async wrapper for [`Self::share_subtree_core`].
