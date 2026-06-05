@@ -732,11 +732,29 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
     }
 
     /// Check if this node is the leader (atomic read, no channel).
+    ///
+    /// SSOT — derives from [`Self::leader_id`] rather than the parallel
+    /// `cached_role` atomic.  `cached_role` and `cached_leader_id` are
+    /// updated independently in [`ZoneConsensusDriver::update_cached_status`]
+    /// (two `Relaxed` stores), so reading them as two separate signals
+    /// creates a race window where a caller can observe (role=Follower,
+    /// leader=self) — exactly the gap that made `submit_to_channel`
+    /// return `NotLeader` and `propose` drop into `forward_to_leader` for
+    /// 1-voter founder zones, then fail the self-forward via gRPC
+    /// (Tailscale-style own-public-IP hairpin).  By reading the SAME
+    /// atomic as `leader_id`, both observations are now consistent and
+    /// the race is eliminated at source — no spawning-pool patch or
+    /// "wait then retry" loop needed at any of the 15+ `is_leader()`
+    /// callers in raft / distributed_coordinator / transport server.
     pub fn is_leader(&self) -> bool {
-        self.role() == NodeRole::Leader
+        self.leader_id() == Some(self.config.id)
     }
 
     /// Get the current leader ID (atomic read, no channel).
+    ///
+    /// Companion to [`Self::is_leader`] — both read from
+    /// `cached_leader_id` so they always agree.  `Some(self.id)` ↔
+    /// `is_leader() == true`.
     pub fn leader_id(&self) -> Option<u64> {
         let leader = self.cached_leader_id.load(Ordering::Relaxed);
         if leader == 0 {
@@ -1090,6 +1108,47 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
                     }
                 }
             };
+
+            // Leader-is-self path: don't RPC-forward to ourselves.
+            //
+            // Forwarding via gRPC to our own advertised address either
+            // hits a hairpin failure (Tailscale: own public IP
+            // unreachable from self on Windows / macOS) or uselessly
+            // round-trips the proposal across two extra HTTP/2 hops
+            // back to the same process.  The reason we're in
+            // `forward_to_leader` despite being leader is the boot-time
+            // window where `submit_to_channel` ran before
+            // `update_cached_status` reflected post-election state.
+            // That window closes within one driver tick (~10ms), so
+            // bounded local retry of `submit_to_channel` resolves
+            // cleanly without ever leaving the process.
+            //
+            // PROPOSAL_TIMEOUT_SECS aligns this path's bound with the
+            // leader-path timeout above; 20ms backoff is two
+            // tick_intervals so each retry samples fresh raft state.
+            if leader_id == self.config.id {
+                let deadline =
+                    tokio::time::Instant::now() + Duration::from_secs(PROPOSAL_TIMEOUT_SECS);
+                loop {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(RaftError::Timeout(PROPOSAL_TIMEOUT_SECS));
+                    }
+                    match self.submit_to_channel(command.clone()) {
+                        Ok(rx) => {
+                            let remaining =
+                                deadline.saturating_duration_since(tokio::time::Instant::now());
+                            return match tokio::time::timeout(remaining, rx).await {
+                                Ok(Ok(result)) => result,
+                                Ok(Err(_)) => Err(RaftError::ProposalDropped),
+                                Err(_) => Err(RaftError::Timeout(PROPOSAL_TIMEOUT_SECS)),
+                            };
+                        }
+                        Err(RaftError::NotLeader { .. }) => continue,
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
 
             let leader_addr = {
                 let peers = ctx.peers.read().unwrap();
