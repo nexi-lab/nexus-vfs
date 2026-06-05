@@ -1,0 +1,11 @@
+[package]
+name = "nexus-plugin-abi"
+version = "0.1.0"
+edition = "2021"
+description = "Stable C ABI contract between the Nexus kernel and dynamically-loaded plugins (.so/.dylib)"
+
+[lib]
+name = "nexus_plugin_abi"
+crate-type = ["rlib"]
+
+[dependencies]

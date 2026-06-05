@@ -13,12 +13,15 @@ members = [
     "rust/kernel",
     "rust/backends",
     "rust/raft",
+    # Plugin ABI — stable C ABI contract for dylib plugins.
+    "rust/plugin-abi",
     # Deployment binaries.
     "rust/profiles/cluster",
 ]
 
 [workspace.dependencies]
 contracts = { path = "rust/contracts" }
+nexus-plugin-abi = { path = "rust/plugin-abi" }
 # `lib` is the tier-neutral implementation crate per §6 — algorithms
 # (bitmap, bloom, glob, hash, rebac, search, simd, trigram) plus the
 # `transport_primitives` module (TLS / pool / addressing / TOFU /

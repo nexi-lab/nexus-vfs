@@ -64,3 +64,7 @@ pub(crate) mod shm_header;
 // File-descriptor table — pre-opened fds for PAS fast-path reads
 // (§4 PermissionGate row's FileDescriptorTable peer).
 pub mod fdt;
+
+// dylib plugin loader — moved to kernel/plugins/loader.rs (§10).
+// `PluginLoader` is an implementation detail of kernel plugin management,
+// not a shared core primitive.

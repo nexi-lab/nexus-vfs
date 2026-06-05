@@ -89,6 +89,12 @@ struct CommonArgs {
     #[arg(long, env = "NEXUS_ROOT_FS", global = true)]
     root_path: Option<PathBuf>,
 
+    /// Directory of plugin dylibs to auto-load at startup.
+    /// All `.so` / `.dylib` files in this directory are loaded via
+    /// `Kernel::load_plugin_dir` after the kernel is created.
+    #[arg(long, env = "NEXUS_PLUGIN_DIR", global = true)]
+    plugin_dir: Option<PathBuf>,
+
     /// Bootstrap mode declaration — `static`, `dynamic`, or `restart`.
     ///
     /// Operator must declare intent at startup so the daemon does not
@@ -395,6 +401,27 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
         root_fs = %root_fs.display(),
         "mounted host-fs at \"/\" via PathLocalBackend",
     );
+
+    // ── Plugin loading (§10) ─────────────────────────────────────────
+    // Auto-load all .so/.dylib files from --plugin-dir (if specified).
+    // Runs after kernel + root mount so plugins can use sys_read/sys_write.
+    if let Some(ref plugin_dir) = common.plugin_dir {
+        match kernel.load_plugin_dir(plugin_dir) {
+            Ok(names) => {
+                if !names.is_empty() {
+                    tracing::info!(
+                        count = names.len(),
+                        names = ?names,
+                        dir = %plugin_dir.display(),
+                        "plugins loaded from --plugin-dir",
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(err = %e, dir = %plugin_dir.display(), "plugin dir scan failed")
+            }
+        }
+    }
 
     // Build VFS gRPC service as tonic Routes — co-hosted on the raft
     // port via ZoneManager. Uses NoAuth (mTLS is the boundary).

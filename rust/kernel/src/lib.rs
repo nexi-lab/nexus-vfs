@@ -37,6 +37,14 @@ pub mod llm_streaming;
 pub(crate) use core::dispatch;
 pub(crate) use core::dlc;
 pub(crate) use core::file_watch;
+
+// Types needed by peer crates (services, transport) and integration
+// tests to implement / register NativeInterceptHook / MutationObserver
+// without reaching into the `pub(crate)` dispatch flat alias.
+pub use core::dispatch::{
+    DeleteHookCtx, FileEvent, FileEventType, HookContext, HookIdentity, HookOutcome,
+    MutationObserver, NativeInterceptHook, ReadHookCtx, RenameHookCtx, WriteHookCtx,
+};
 pub use core::lock as lock_manager;
 pub use core::lock::locks;
 pub use core::meta_store;
