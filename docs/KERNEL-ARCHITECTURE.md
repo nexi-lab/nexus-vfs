@@ -51,6 +51,19 @@ Follows Linux's monolithic kernel model, not microkernel:
 | Drivers | Runtime mount/unmount | redb, S3, PostgreSQL, Dragonfly, SearchBrick | `sys_setattr(DT_MOUNT)` / `rmdir` | `mount`/`umount` |
 | Services | Runtime register/swap/unregister | 40+ protocols (ReBAC, Mount, Auth, Agents, Search, Skills, ...) | `sys_setattr("/__sys__/services/X")` / `sys_unlink` | `insmod`/`rmmod` |
 
+#### Deployment Modes
+
+Services and drivers support three deployment modes. All three register through
+the same `ServiceRegistry` / `VFSRouter` primitives; the kernel sees a uniform
+`Arc<dyn RustService>` or `Arc<dyn ObjectStore>` regardless of how the code was
+loaded.
+
+| Mode | Mechanism | Linux analogue | Trade-off |
+|------|-----------|----------------|-----------|
+| **Compiled-in** | Cargo feature gate (§7.2) | `CONFIG_FOO=y` | Zero-overhead static dispatch; requires recompilation to change |
+| **dylib** | `PluginLoader` loads `.so`/`.dylib` via `dlopen` (§10) | `CONFIG_FOO=m` + `insmod foo.ko` | Runtime load/unload/reload; ~1 vtable indirection per call |
+| **gRPC sidecar** | Separate process, proxied via `ManagedServiceGrpcProxy` | Userspace FUSE daemon | Language-agnostic; ~100μs per RPC round-trip |
+
 **Invariant:** Services depend on kernel interfaces, never the reverse.
 The kernel operates with zero services loaded. Kernel code (`core/nexus_fs.py`)
 has zero reads of service containers — all service wiring flows through
@@ -612,6 +625,7 @@ with them indirectly through syscalls. See §2.2 for per-syscall usage.
 | **PermissionGate** | `rust/kernel/src/kernel/dispatch.rs` + `rust/kernel/src/core/permission_cache.rs` | LSM `security_inode_permission` | Kernel permission gate called before NativeInterceptHook dispatch on every `sys_*`. Decision cascade with lease cache (~100-200ns). Details in §2.4.1 |
 | **AgentRegistry** | `rust/kernel/src/core/agents/registry.rs` | Linux `task_struct` table + signal queue | Kernel SSOT for agent lifecycle: PID allocation, parent/child tree, signal semantics (SIGTERM/SIGSTOP/SIGCONT/SIGKILL/SIGUSR1), `AgentState::can_transition_to` validation, per-PID condvar wake-ups. Shared `Arc` exposed to procfs view (`AgentStatusResolver`) — no dual-write. Details in §1 Service Lifecycle |
 | **DT_LINK** | `proto/nexus/core/metadata.proto` (`DT_LINK = 6`) + `FileMetadata.link_target` | `symlink(2)` | Path-internal symlink resolved by `VFSRouter::route()` before reaching the backend. Single-hop redirect with `ELOOP` on chained or self-loop links. Details in §4.4 |
+| **PluginLoader** | `rust/kernel/src/core/plugin_loader.rs` | `module_loader` (`kernel/module/main.c`) | Runtime `dlopen`-based loading of service and driver plugins. C ABI contract for version/kind/lifecycle symbols. Wraps dylib instances as `DylibRustService` (`Arc<dyn RustService>`) or `DylibObjectStore` (`Arc<dyn ObjectStore>`) for uniform kernel dispatch. Details in §10 |
 | **PermissionLeaseCache** | `rust/kernel/src/core/permission_cache.rs` | LSM credential cache | Two-level DashMap of `(path, agent_id) → expiry` short-circuiting the permission gate's full ReBAC walk on a recent hit. Inheritance-aware: a parent-directory lease covers child files. Details in §2.4.1. |
 
 ### 4.1 Unified LockManager — I/O Lock + Advisory Lock
@@ -1092,6 +1106,9 @@ two dispatch paths in order:
    - Flat backward-compat: methods with the prefix `acp_` or
      `managed_agent_` route to that service with the full method name
      preserved (matches Python `@rpc_expose` naming).
+   dylib-loaded plugins (§10) register as `Arc<dyn RustService>` via the
+   `DylibRustService` wrapper, so they dispatch through this same path
+   with zero special-casing in the Call handler.
 2. **Python `@rpc_expose`** — fallback path when the Rust dispatch
    returns `None` (no Rust service for that name) or `NotFound`
    (service exists but doesn't expose the method). The handler hands
@@ -1120,7 +1137,119 @@ permission hooks added to the dispatch path land in one place.
 
 ---
 
-## 9. Cross-References
+## 10. Plugin Architecture — dylib Hot-Swap
+
+**Category:** Kernel Primitive (internal) | **Linux analogue:** Loadable Kernel Modules (`.ko`)
+
+`PluginLoader` (`rust/kernel/src/core/plugin_loader.rs`) enables runtime loading
+of services and drivers from shared libraries (`.so` on Linux, `.dylib` on macOS)
+via `dlopen`. The mechanism mirrors Linux loadable kernel modules: a stable C ABI
+contract lets independently-compiled plugins register into the same `ServiceRegistry`
+and `VFSRouter` primitives that compiled-in code uses.
+
+### 10.1 Plugin ABI Contract
+
+Every plugin dylib exports a set of C ABI symbols. The kernel validates
+`nexus_plugin_api_version()` at load time and rejects incompatible plugins.
+
+| Symbol | Signature | Purpose |
+|--------|-----------|---------|
+| `nexus_plugin_api_version` | `() -> u32` | ABI version number — kernel rejects mismatches |
+| `nexus_plugin_kind` | `() -> u32` | Plugin kind: `1` = Service, `2` = Driver |
+| `nexus_plugin_name` | `() -> *const c_char` | Null-terminated UTF-8 plugin name |
+
+**Service plugins** (kind=1) additionally export:
+
+| Symbol | Signature | Purpose |
+|--------|-----------|---------|
+| `nexus_service_create` | `(kernel: *const c_void) -> *mut c_void` | Construct service instance; receives opaque `KernelHandle` |
+| `nexus_service_dispatch` | `(svc, method, payload, payload_len, out_buf, out_len) -> i32` | RPC dispatch (0 = ok, negative = error) |
+| `nexus_service_destroy` | `(svc: *mut c_void)` | Stop + destroy the service instance |
+
+**Driver plugins** (kind=2) additionally export:
+
+| Symbol | Signature | Purpose |
+|--------|-----------|---------|
+| `nexus_driver_create` | `(kernel: *const c_void, config_json: *const c_char) -> *mut c_void` | Construct `ObjectStore` instance for a mount point |
+| `nexus_driver_read` | `(drv, path, out_buf, out_len) -> i32` | Read content |
+| `nexus_driver_write` | `(drv, path, data, data_len) -> i32` | Write content |
+| `nexus_driver_destroy` | `(drv: *mut c_void)` | Destroy driver instance |
+
+### 10.2 KernelHandle — Plugin Callback Surface
+
+Plugins call back into the kernel through a `#[repr(C)]` vtable of function
+pointers (`KernelHandle`). This is the plugin's view of the kernel — an opaque,
+ABI-stable surface that decouples plugin compilation from kernel internals.
+
+```rust
+#[repr(C)]
+pub struct KernelHandle {
+    pub sys_read:  unsafe extern "C" fn(kernel: *const c_void, path: *const c_char,
+                                        out_buf: *mut *mut u8, out_len: *mut usize) -> i32,
+    pub sys_write: unsafe extern "C" fn(kernel: *const c_void, path: *const c_char,
+                                        data: *const u8, data_len: usize) -> i32,
+    pub sys_stat:  unsafe extern "C" fn(kernel: *const c_void, path: *const c_char,
+                                        out_json: *mut *mut c_char) -> i32,
+    pub kernel_ptr: *const c_void,  // opaque pointer to Arc<Kernel>
+}
+```
+
+### 10.3 Wrapper Types — C ABI → Rust Trait
+
+`PluginLoader` wraps raw C ABI function pointers in trait-implementing structs so
+the rest of the kernel sees standard Rust trait objects:
+
+| Wrapper | Wraps | Implements | Registration target |
+|---------|-------|------------|---------------------|
+| `DylibRustService` | Service plugin C ABI | `Arc<dyn RustService>` | `ServiceRegistry.enlist_rust()` |
+| `DylibObjectStore` | Driver plugin C ABI | `Arc<dyn ObjectStore>` | `VFSRouter` (caller mounts via `sys_setattr`) |
+
+Both wrappers are `Send + Sync` (the C ABI contract requires thread-safe
+plugin implementations). The wrappers own the raw `*mut c_void` handle and call
+the plugin's destroy function on `Drop`.
+
+### 10.4 PluginLoader Lifecycle
+
+```
+PluginLoader
+├── load(path, kernel)
+│   1. dlopen(path) via libloading::Library
+│   2. Validate nexus_plugin_api_version() compatibility
+│   3. Match kind:
+│      Service → nexus_service_create(KernelHandle) → DylibRustService → enlist_rust()
+│      Driver  → nexus_driver_create(KernelHandle, config) → DylibObjectStore → caller mounts
+│   4. Store in loaded map (DashMap<name, LoadedPlugin>)
+├── unload(name)
+│   1. Service: unregister from ServiceRegistry (drain + stop)
+│      Driver: remove from VFSRouter
+│   2. nexus_service_destroy() / nexus_driver_destroy()
+│   3. dlclose()
+└── reload(name, new_path)
+    1. unload(name)
+    2. load(new_path, kernel)
+```
+
+`reload` provides zero-downtime hot-swap: `ServiceRegistry.drain()` waits for
+in-flight references to reach zero before replacing the service (§4
+ServiceRegistry), then loads the new version from the updated dylib.
+
+### 10.5 Plugin Management Surface
+
+Plugin operations are exposed through the gRPC `Call` RPC:
+
+| Method | Payload | Effect |
+|--------|---------|--------|
+| `plugin.load` | `{"path": "/plugins/vault.so"}` | Load + register |
+| `plugin.unload` | `{"name": "vault"}` | Drain + destroy + dlclose |
+| `plugin.reload` | `{"name": "vault", "path": "/plugins/vault.so"}` | Atomic unload + load |
+| `plugin.list` | `{}` | List loaded plugins (name, kind, path) |
+
+The `nexusd-cluster` binary accepts `--plugin-dir` to auto-load all `.so`/`.dylib`
+files from a directory at startup.
+
+---
+
+## 11. Cross-References
 
 | Topic | Document |
 |-------|----------|
