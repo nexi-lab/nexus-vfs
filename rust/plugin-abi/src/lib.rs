@@ -11,7 +11,7 @@
 //! - A `declare_service_plugin!` macro that generates the required
 //!   `#[no_mangle] pub extern "C"` symbols from a Rust impl
 //!
-//! The kernel's `PluginLoader` (in `kernel::core::plugin_loader`) is the
+//! The kernel's `PluginLoader` (in `kernel::kernel::plugins::loader`) is the
 //! consumer side — it `dlopen`s a `.so`, resolves these symbols, and
 //! wraps the raw C handles as `Arc<dyn RustService>` or
 //! `Arc<dyn ObjectStore>`.

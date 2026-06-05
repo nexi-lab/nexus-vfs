@@ -65,6 +65,6 @@ pub(crate) mod shm_header;
 // (§4 PermissionGate row's FileDescriptorTable peer).
 pub mod fdt;
 
-// dylib plugin loader — runtime load/unload/reload of services and
-// drivers from shared libraries (.so/.dylib) via dlopen (§10).
-pub mod plugin_loader;
+// dylib plugin loader — moved to kernel/plugins/loader.rs (§10).
+// `PluginLoader` is an implementation detail of kernel plugin management,
+// not a shared core primitive.

@@ -1,8 +1,14 @@
-//! Plugin management methods on `Kernel`.
+//! Plugin management — `Kernel` methods + `PluginLoader`.
 //!
-//! These are the kernel-internal API for loading, unloading, and listing
-//! dylib plugins. The gRPC `Call` surface (Phase 3) dispatches through
-//! these methods.
+//! Contains:
+//! - `loader.rs` — `PluginLoader` + `DylibRustService` wrapper (was `core/plugin_loader.rs`)
+//! - `mod.rs` — `Kernel::load_plugin` / `unload_plugin` / `list_plugins` methods
+//!
+//! The `PluginLoader` was moved from `core/` because it is not a
+//! shared kernel primitive — it is an implementation detail of plugin
+//! management, only consumed by the `Kernel` methods in this module.
+
+pub(crate) mod loader;
 
 use std::path::Path;
 use std::sync::Arc;

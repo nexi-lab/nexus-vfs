@@ -637,7 +637,7 @@ pub struct Kernel {
     //
     // Runtime dlopen-based loading of service and driver plugins.
     // Constructed empty; populated via `load_plugin()` / `--plugin-dir`.
-    pub(crate) plugin_loader: crate::core::plugin_loader::PluginLoader,
+    pub(crate) plugin_loader: plugins::loader::PluginLoader,
 
     // ── Service ↔ hook lifecycle map ─────────────────────────────────
     //
@@ -732,7 +732,7 @@ impl Kernel {
             ),
             permission_admin_bypass: AtomicBool::new(true),
             has_permission_provider: AtomicBool::new(false),
-            plugin_loader: crate::core::plugin_loader::PluginLoader::new(),
+            plugin_loader: plugins::loader::PluginLoader::new(),
             service_hook_names: parking_lot::Mutex::new(std::collections::HashMap::new()),
             service_observer_names: parking_lot::Mutex::new(std::collections::HashMap::new()),
         };
