@@ -9,7 +9,9 @@ crate-type = ["rlib"]
 
 [dependencies]
 contracts = { workspace = true }
+nexus-plugin-abi = { workspace = true }
 lib = { workspace = true, features = ["transport"] }
+libloading = "0.8"
 serde = { workspace = true }
 serde_json = { workspace = true }
 ahash = { workspace = true }

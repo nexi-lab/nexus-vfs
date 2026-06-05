@@ -64,3 +64,7 @@ pub(crate) mod shm_header;
 // File-descriptor table — pre-opened fds for PAS fast-path reads
 // (§4 PermissionGate row's FileDescriptorTable peer).
 pub mod fdt;
+
+// dylib plugin loader — runtime load/unload/reload of services and
+// drivers from shared libraries (.so/.dylib) via dlopen (§10).
+pub mod plugin_loader;
