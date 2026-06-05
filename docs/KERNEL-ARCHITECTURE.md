@@ -58,11 +58,11 @@ the same `ServiceRegistry` / `VFSRouter` primitives; the kernel sees a uniform
 `Arc<dyn RustService>` or `Arc<dyn ObjectStore>` regardless of how the code was
 loaded.
 
-| Mode | Mechanism | Linux analogue | Trade-off |
-|------|-----------|----------------|-----------|
-| **Compiled-in** | Cargo feature gate (§7.2) | `CONFIG_FOO=y` | Zero-overhead static dispatch; requires recompilation to change |
-| **dylib** | `PluginLoader` loads `.so`/`.dylib` via `dlopen` (§10) | `CONFIG_FOO=m` + `insmod foo.ko` | Runtime load/unload/reload; ~1 vtable indirection per call |
-| **gRPC sidecar** | Separate process, proxied via `ManagedServiceGrpcProxy` | Userspace FUSE daemon | Language-agnostic; ~100μs per RPC round-trip |
+| Mode | Mechanism | Hot-swap | Perf | VFS hooks | Applicable scenarios |
+|------|-----------|----------|------|-----------|---------------------|
+| **Compiled-in** | Cargo feature gate (§7.2) | No (recompile) | Best (zero-cost Rust trait dispatch) | Full (direct trait objects) | Kernel-coupled services (ReBAC hooks, AuditHook, AgentStatusResolver), perf-critical drivers |
+| **dylib** | `PluginLoader` loads `.so`/`.dylib` via `dlopen` (§10) | Yes (load/unload/reload) | Good (~ns C ABI call) | Limited — RPC dispatch OK; VFS hooks need C ABI wrapper (no stable Rust ABI across dlopen) | Cross-repo services (vault), dispatch-only services, independent storage drivers |
+| **gRPC sidecar** | Separate process, proxied via `ManagedServiceGrpcProxy` | Inherent (separate process) | ~100μs (network round-trip) | No (out-of-process) | Other-language services (Python, Go), fully independent microservices |
 
 **Invariant:** Services depend on kernel interfaces, never the reverse.
 The kernel operates with zero services loaded. Kernel code (`core/nexus_fs.py`)
