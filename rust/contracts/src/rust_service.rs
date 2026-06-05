@@ -81,4 +81,12 @@ pub trait RustService: Send + Sync {
     fn dispatch(&self, _method: &str, _payload: &[u8]) -> Result<Vec<u8>, RustCallError> {
         Err(RustCallError::NotFound)
     }
+
+    /// Declared RPC method names this service exports. Used by
+    /// diagnostics (`service_snapshot`) and the future gRPC
+    /// `capabilities` endpoint. Default: empty (the service handles
+    /// dispatch internally without pre-declaring methods).
+    fn exports(&self) -> Vec<String> {
+        vec![]
+    }
 }
