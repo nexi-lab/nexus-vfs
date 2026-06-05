@@ -1,0 +1,11 @@
+# Static link CRT on Windows to avoid DLL dependency issues.
+# This ensures nexusd.exe works on machines without Visual C++ Redistributable installed.
+#
+# Error 0xC0000135 (STATUS_DLL_NOT_FOUND) occurs when vcruntime140.dll etc. are missing.
+# Static linking embeds the CRT into the binary itself.
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
