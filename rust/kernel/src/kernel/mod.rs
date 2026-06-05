@@ -96,6 +96,7 @@ mod ipc;
 mod locks;
 mod mount;
 mod observability;
+mod plugins;
 
 // ── KernelError ────────────────────────────────────────────────────────────
 
@@ -631,6 +632,12 @@ pub struct Kernel {
     /// registered. AtomicBool so the hot path is a single relaxed load
     /// (~1ns) — not even a pointer dereference.
     has_permission_provider: AtomicBool,
+
+    // ── §10 Plugin loader ────────────────────────────────────────────
+    //
+    // Runtime dlopen-based loading of service and driver plugins.
+    // Constructed empty; populated via `load_plugin()` / `--plugin-dir`.
+    pub(crate) plugin_loader: crate::core::plugin_loader::PluginLoader,
 }
 
 impl Kernel {
@@ -714,6 +721,7 @@ impl Kernel {
             ),
             permission_admin_bypass: AtomicBool::new(true),
             has_permission_provider: AtomicBool::new(false),
+            plugin_loader: crate::core::plugin_loader::PluginLoader::new(),
         };
         // Distributed-coordinator bootstrap is driven by
         // `RaftDistributedCoordinator::install_with_kernel`. The host
