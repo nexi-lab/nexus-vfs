@@ -776,6 +776,22 @@ impl NativeHookRegistry {
         self.hooks.push(NativeHookEntry { hook });
     }
 
+    /// Unregister a hook by name. Returns true if found.
+    /// Also rebuilds the `mutating_suffixes` cache.
+    pub(crate) fn unregister(&mut self, name: &str) -> bool {
+        if let Some(pos) = self.hooks.iter().position(|e| e.hook.name() == name) {
+            self.hooks.remove(pos);
+            // Rebuild mutating_suffixes from remaining hooks
+            self.mutating_suffixes = self
+                .hooks
+                .iter()
+                .filter_map(|e| e.hook.mutating_path_suffix())
+                .collect();
+            return true;
+        }
+        false
+    }
+
     /// Dispatch pre-hooks. Returns Err on first abort. The
     /// `HookOutcome::Replace` variant is propagated to the caller via
     /// the returned bytes; today only `sys_write` honours it, other
@@ -1054,6 +1070,64 @@ mod tests {
         assert_eq!(FileEventType::FileCopy.as_str(), "file_copy");
         assert_eq!(FileEventType::Mount.as_str(), "mount");
         assert_eq!(FileEventType::Unmount.as_str(), "unmount");
+    }
+
+    // ── NativeHookRegistry unregister tests ────────────────────────────
+
+    struct DummyHook {
+        hook_name: &'static str,
+        suffix: Option<&'static str>,
+    }
+
+    impl NativeInterceptHook for DummyHook {
+        fn name(&self) -> &str {
+            self.hook_name
+        }
+        fn mutating_path_suffix(&self) -> Option<&'static str> {
+            self.suffix
+        }
+    }
+
+    #[test]
+    fn test_hook_registry_unregister_by_name() {
+        let mut reg = NativeHookRegistry::new();
+        reg.register(Box::new(DummyHook {
+            hook_name: "audit",
+            suffix: None,
+        }));
+        reg.register(Box::new(DummyHook {
+            hook_name: "rebac",
+            suffix: None,
+        }));
+        assert_eq!(reg.count(), 2);
+        assert!(reg.unregister("audit"));
+        assert_eq!(reg.count(), 1);
+        assert!(!reg.unregister("audit")); // already removed
+        assert!(reg.unregister("rebac"));
+        assert_eq!(reg.count(), 0);
+    }
+
+    #[test]
+    fn test_hook_registry_unregister_rebuilds_mutating_suffixes() {
+        let mut reg = NativeHookRegistry::new();
+        reg.register(Box::new(DummyHook {
+            hook_name: "stamper",
+            suffix: Some("/chat-with-me"),
+        }));
+        reg.register(Box::new(DummyHook {
+            hook_name: "audit",
+            suffix: None,
+        }));
+        assert!(reg.has_mutating_match("/zone/chat-with-me"));
+        reg.unregister("stamper");
+        assert!(!reg.has_mutating_match("/zone/chat-with-me"));
+        assert_eq!(reg.count(), 1); // audit remains
+    }
+
+    #[test]
+    fn test_hook_registry_unregister_nonexistent() {
+        let mut reg = NativeHookRegistry::new();
+        assert!(!reg.unregister("nope"));
     }
 
     #[test]

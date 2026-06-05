@@ -180,6 +180,14 @@ impl Kernel {
         self.native_hooks.write().register(hook);
     }
 
+    /// Unregister a native Rust hook by name. Returns true if found.
+    ///
+    /// Used by the hook lifecycle coordinator during service swap/unregister
+    /// to remove stale hooks before replacing a service.
+    pub fn unregister_native_hook(&self, name: &str) -> bool {
+        self.native_hooks.write().unregister(name)
+    }
+
     // ── Service registry facade ───────────────────────────────────────
     //
     // Every ServiceRegistry method is exposed through Kernel so that
