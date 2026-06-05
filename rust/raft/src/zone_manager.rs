@@ -1397,6 +1397,113 @@ impl ZoneManager {
     }
 }
 
+// ── Async wrappers for `#[tokio::main]` callers ───────────────────
+//
+// `ZoneManager` exposes the sync façade above for callers that drive
+// it from a sync context — the `DistributedCoordinator` trait impl
+// reached from `Kernel::setattr_mount` (sync because the kernel is
+// sync), and tests / founder paths that build their runtime around
+// `main()`.
+//
+// `nexusd-cluster`'s `run_daemon` / `run_share` / `run_join` and
+// `nexus-federation-server` are `#[tokio::main]` async, so calling
+// the sync methods from them needs a `spawn_blocking` hop off the
+// async worker — otherwise the inner runtime's `block_on` from
+// `bridge_block_on` panics if its `block_in_place` releases a worker
+// holding an `Arc<Runtime>` referent (same panic shape PR #4011
+// introduced `spawn_blocking` for `bootstrap_or_join_zone`).
+//
+// Rather than push that `spawn_blocking` pattern onto every async call
+// site (DRY violation + repeated leaky abstraction), host one wrapper
+// per affected method here.  Sync API, `bridge_block_on`,
+// `propose_set_metadata`, runtime ownership, and `Drop` semantics are
+// all unchanged — zero raft contract risk; the wrappers only add an
+// async-friendly entry point.
+//
+// Only methods that internally (directly or transitively) use
+// `bridge_block_on` get a wrapper.  Pure state-read methods like
+// `pending_mounts` (mutex lock only, no nested runtime) are safe to
+// call from async contexts unwrapped.
+impl ZoneManager {
+    /// Async wrapper for [`Self::mount`].
+    pub async fn mount_async(
+        self: &Arc<Self>,
+        parent_zone_id: &str,
+        mount_path: &str,
+        target_zone_id: &str,
+        increment_links: bool,
+    ) -> Result<()> {
+        let this = Arc::clone(self);
+        let parent = parent_zone_id.to_string();
+        let path = mount_path.to_string();
+        let target = target_zone_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            this.mount(&parent, &path, &target, increment_links)
+        })
+        .await
+        .map_err(|e| RaftError::InvalidState(format!("mount_async task panicked: {e}")))?
+    }
+
+    /// Async wrapper for [`Self::create_zone`].
+    pub async fn create_zone_async(
+        self: &Arc<Self>,
+        zone_id: &str,
+        peers: Vec<String>,
+    ) -> Result<Arc<ZoneHandle>> {
+        let this = Arc::clone(self);
+        let zone_id = zone_id.to_string();
+        tokio::task::spawn_blocking(move || this.create_zone(&zone_id, peers))
+            .await
+            .map_err(|e| {
+                RaftError::InvalidState(format!("create_zone_async task panicked: {e}"))
+            })?
+    }
+
+    /// Async wrapper for [`Self::share_subtree_core`].
+    pub async fn share_subtree_core_async(
+        self: &Arc<Self>,
+        parent_zone_id: &str,
+        prefix: &str,
+        new_zone_id: &str,
+    ) -> Result<usize> {
+        let this = Arc::clone(self);
+        let parent = parent_zone_id.to_string();
+        let prefix = prefix.to_string();
+        let new_zone = new_zone_id.to_string();
+        tokio::task::spawn_blocking(move || this.share_subtree_core(&parent, &prefix, &new_zone))
+            .await
+            .map_err(|e| {
+                RaftError::InvalidState(format!("share_subtree_core_async task panicked: {e}"))
+            })?
+    }
+
+    /// Async wrapper for [`Self::bootstrap_static`].
+    pub async fn bootstrap_static_async(
+        self: &Arc<Self>,
+        zones: Vec<String>,
+        peers: Vec<String>,
+        mounts: BTreeMap<String, String>,
+    ) -> Result<()> {
+        let this = Arc::clone(self);
+        tokio::task::spawn_blocking(move || this.bootstrap_static(&zones, peers, &mounts))
+            .await
+            .map_err(|e| {
+                RaftError::InvalidState(format!("bootstrap_static_async task panicked: {e}"))
+            })?
+    }
+
+    /// Async wrapper for [`Self::apply_topology`].
+    pub async fn apply_topology_async(self: &Arc<Self>, root_zone_id: &str) -> Result<bool> {
+        let this = Arc::clone(self);
+        let root = root_zone_id.to_string();
+        tokio::task::spawn_blocking(move || this.apply_topology(&root))
+            .await
+            .map_err(|e| {
+                RaftError::InvalidState(format!("apply_topology_async task panicked: {e}"))
+            })?
+    }
+}
+
 impl Drop for ZoneManager {
     fn drop(&mut self) {
         self.registry.shutdown_all();
