@@ -1736,6 +1736,440 @@ mod tests {
         k
     }
 
+    // ── Issue #4273: sub-path remote mount path reconstruction (e2e) ──
+    //
+    // `RemoteBackend` is the cluster's CLIENT to a federation hub. In
+    // production that hub is the Python Nexus server, which serves the
+    // generic `Call` RPC (sys_write/sys_stat/sys_rename/mkdir/sys_rmdir) plus
+    // typed Read/Delete. The native Rust `VfsServiceImpl` deliberately stubs
+    // `Call`, so this test stands up a faithful hub stub that mirrors the
+    // Python hub's contract (path-shaped, zone-prefixed content IDs) and drives
+    // a real `RemoteBackend` against it over a real `RpcTransport` / gRPC.
+
+    use kernel::kernel::vfs_proto::nexus_vfs_service_server::NexusVfsServiceServer;
+
+    /// In-memory federation hub stub. Stores blobs keyed by the ABSOLUTE server
+    /// path it receives, and records every write path so the test can assert
+    /// what `RemoteBackend` reconstructed onto the wire.
+    #[derive(Clone, Default)]
+    struct HubStub {
+        blobs: Arc<StdMutex<HashMap<String, Vec<u8>>>>,
+        writes: Arc<StdMutex<Vec<String>>>,
+    }
+
+    impl HubStub {
+        fn write_paths(&self) -> Vec<String> {
+            self.writes.lock().unwrap().clone()
+        }
+        fn ok(payload: serde_json::Value) -> Result<Response<CallResponse>, Status> {
+            Ok(Response::new(CallResponse {
+                payload: serde_json::to_vec(&payload).unwrap(),
+                is_error: false,
+            }))
+        }
+        fn call_err(msg: &str) -> Result<Response<CallResponse>, Status> {
+            Ok(Response::new(CallResponse {
+                payload: serde_json::to_vec(&serde_json::json!({"code": -32603, "message": msg}))
+                    .unwrap(),
+                is_error: true,
+            }))
+        }
+    }
+
+    #[tonic::async_trait]
+    impl NexusVfsService for HubStub {
+        async fn call(
+            &self,
+            request: Request<CallRequest>,
+        ) -> Result<Response<CallResponse>, Status> {
+            let req = request.into_inner();
+            let v: serde_json::Value = serde_json::from_slice(&req.payload)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            match req.method.as_str() {
+                "sys_write" => {
+                    let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                    let b64 = v
+                        .get("buf")
+                        .and_then(|b| b.get("data"))
+                        .and_then(|d| d.as_str())
+                        .unwrap_or("");
+                    use base64::Engine;
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(b64)
+                        .map_err(|e| Status::internal(e.to_string()))?;
+                    let n = bytes.len() as u64;
+                    self.writes.lock().unwrap().push(path.to_string());
+                    self.blobs.lock().unwrap().insert(path.to_string(), bytes);
+                    // Hub echoes a zone-prefixed (slash-stripped) path content id.
+                    Self::ok(serde_json::json!({
+                        "result": {
+                            "content_id": path.trim_start_matches('/'),
+                            "size": n,
+                            "bytes_written": n,
+                        }
+                    }))
+                }
+                "sys_stat" => {
+                    let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                    match self.blobs.lock().unwrap().get(path) {
+                        Some(b) => Self::ok(serde_json::json!({"result": {"size": b.len()}})),
+                        None => Self::call_err(&format!("sys_stat({path}): not found")),
+                    }
+                }
+                "sys_rename" => {
+                    let old = v.get("old_path").and_then(|p| p.as_str()).unwrap_or("");
+                    let new = v.get("new_path").and_then(|p| p.as_str()).unwrap_or("");
+                    let mut blobs = self.blobs.lock().unwrap();
+                    match blobs.remove(old) {
+                        Some(data) => {
+                            blobs.insert(new.to_string(), data);
+                            Self::ok(serde_json::json!({"result": {}}))
+                        }
+                        None => {
+                            drop(blobs);
+                            Self::call_err(&format!("sys_rename({old}): not found"))
+                        }
+                    }
+                }
+                "mkdir" | "sys_rmdir" => Self::ok(serde_json::json!({"result": {}})),
+                other => Self::call_err(&format!("unknown Call method: {other}")),
+            }
+        }
+
+        async fn read(
+            &self,
+            request: Request<ReadRequest>,
+        ) -> Result<Response<ReadResponse>, Status> {
+            let path = request.into_inner().path;
+            match self.blobs.lock().unwrap().get(&path) {
+                Some(b) => Ok(Response::new(ReadResponse {
+                    content: b.clone(),
+                    content_id: path.trim_start_matches('/').to_string(),
+                    size: b.len() as i64,
+                    is_error: false,
+                    ..Default::default()
+                })),
+                None => Ok(Response::new(ReadResponse {
+                    is_error: true,
+                    error_payload: br#"{"code":-32603,"message":"not found"}"#.to_vec(),
+                    ..Default::default()
+                })),
+            }
+        }
+
+        async fn delete(
+            &self,
+            request: Request<DeleteRequest>,
+        ) -> Result<Response<DeleteResponse>, Status> {
+            let path = request.into_inner().path;
+            let removed = self.blobs.lock().unwrap().remove(&path).is_some();
+            Ok(Response::new(DeleteResponse {
+                success: removed,
+                is_error: false,
+                ..Default::default()
+            }))
+        }
+
+        async fn ping(
+            &self,
+            _request: Request<PingRequest>,
+        ) -> Result<Response<PingResponse>, Status> {
+            Ok(Response::new(PingResponse {
+                version: "hub-stub".into(),
+                ..Default::default()
+            }))
+        }
+
+        // RemoteBackend never invokes these against the hub; stub them out.
+        async fn write(&self, _: Request<WriteRequest>) -> Result<Response<WriteResponse>, Status> {
+            Err(Status::unimplemented("hub stub"))
+        }
+        async fn batch_read(
+            &self,
+            _: Request<BatchReadRequest>,
+        ) -> Result<Response<BatchReadResponse>, Status> {
+            Err(Status::unimplemented("hub stub"))
+        }
+        async fn batch_write(
+            &self,
+            _: Request<BatchWriteRequest>,
+        ) -> Result<Response<BatchWriteResponse>, Status> {
+            Err(Status::unimplemented("hub stub"))
+        }
+        async fn stat(&self, _: Request<StatRequest>) -> Result<Response<StatResponse>, Status> {
+            Err(Status::unimplemented("hub stub"))
+        }
+        async fn readdir(
+            &self,
+            _: Request<ReaddirRequest>,
+        ) -> Result<Response<ReaddirResponse>, Status> {
+            Err(Status::unimplemented("hub stub"))
+        }
+        async fn batch_stat(
+            &self,
+            _: Request<BatchStatRequest>,
+        ) -> Result<Response<BatchStatResponse>, Status> {
+            Err(Status::unimplemented("hub stub"))
+        }
+        async fn setattr(
+            &self,
+            _: Request<SetattrRequest>,
+        ) -> Result<Response<SetattrResponse>, Status> {
+            Err(Status::unimplemented("hub stub"))
+        }
+        async fn rename(
+            &self,
+            _: Request<RenameRequest>,
+        ) -> Result<Response<RenameResponse>, Status> {
+            Err(Status::unimplemented("hub stub"))
+        }
+        async fn copy(&self, _: Request<CopyRequest>) -> Result<Response<CopyResponse>, Status> {
+            Err(Status::unimplemented("hub stub"))
+        }
+        async fn lock(&self, _: Request<LockRequest>) -> Result<Response<LockResponse>, Status> {
+            Err(Status::unimplemented("hub stub"))
+        }
+        async fn unlock(
+            &self,
+            _: Request<UnlockRequest>,
+        ) -> Result<Response<UnlockResponse>, Status> {
+            Err(Status::unimplemented("hub stub"))
+        }
+        async fn watch(&self, _: Request<WatchRequest>) -> Result<Response<WatchResponse>, Status> {
+            Err(Status::unimplemented("hub stub"))
+        }
+        async fn get_xattr(
+            &self,
+            _: Request<GetXattrRequest>,
+        ) -> Result<Response<GetXattrResponse>, Status> {
+            Err(Status::unimplemented("hub stub"))
+        }
+        async fn set_xattr(
+            &self,
+            _: Request<SetXattrRequest>,
+        ) -> Result<Response<SetXattrResponse>, Status> {
+            Err(Status::unimplemented("hub stub"))
+        }
+        async fn get_xattr_bulk(
+            &self,
+            _: Request<GetXattrBulkRequest>,
+        ) -> Result<Response<GetXattrBulkResponse>, Status> {
+            Err(Status::unimplemented("hub stub"))
+        }
+        async fn mkdir(&self, _: Request<MkdirRequest>) -> Result<Response<MkdirResponse>, Status> {
+            Err(Status::unimplemented("hub stub"))
+        }
+        async fn close_pipe(&self, _: Request<IpcPathRequest>) -> Result<Response<IpcAck>, Status> {
+            Err(Status::unimplemented("hub stub"))
+        }
+        async fn has_pipe(
+            &self,
+            _: Request<IpcPathRequest>,
+        ) -> Result<Response<IpcHasResponse>, Status> {
+            Err(Status::unimplemented("hub stub"))
+        }
+        async fn close_all_pipes(&self, _: Request<IpcEmpty>) -> Result<Response<IpcAck>, Status> {
+            Err(Status::unimplemented("hub stub"))
+        }
+        async fn close_stream(
+            &self,
+            _: Request<IpcPathRequest>,
+        ) -> Result<Response<IpcAck>, Status> {
+            Err(Status::unimplemented("hub stub"))
+        }
+        async fn has_stream(
+            &self,
+            _: Request<IpcPathRequest>,
+        ) -> Result<Response<IpcHasResponse>, Status> {
+            Err(Status::unimplemented("hub stub"))
+        }
+        async fn stream_write_nowait(
+            &self,
+            _: Request<StreamWriteRequest>,
+        ) -> Result<Response<StreamWriteResponse>, Status> {
+            Err(Status::unimplemented("hub stub"))
+        }
+        async fn stream_read_at(
+            &self,
+            _: Request<StreamReadAtRequest>,
+        ) -> Result<Response<StreamReadAtResponse>, Status> {
+            Err(Status::unimplemented("hub stub"))
+        }
+        async fn stream_collect_all(
+            &self,
+            _: Request<IpcPathRequest>,
+        ) -> Result<Response<StreamCollectAllResponse>, Status> {
+            Err(Status::unimplemented("hub stub"))
+        }
+    }
+
+    /// Compare a server-received path ignoring an optional leading slash.
+    fn path_eq(got: &str, want: &str) -> bool {
+        got.trim_start_matches('/') == want.trim_start_matches('/')
+    }
+
+    /// Full end-to-end: a `RemoteBackend` mounted at the sub-path `/zone/acme`
+    /// drives a faithful federation hub stub over a real `RpcTransport` / gRPC.
+    /// Validates Issue #4273 path reconstruction on the wire: writes land at
+    /// `/zone/acme/...`, write→read/stat/rename/delete all round-trip, the
+    /// stored content id is mount-relative, and a crafted relative path stays
+    /// inside the subtree.
+    #[test]
+    fn remote_subpath_mount_e2e_over_grpc() {
+        use backends::storage::remote::RemoteBackend;
+        use kernel::rpc_transport::RpcTransport;
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        let hub = HubStub::default();
+
+        // Ephemeral port + a real tonic server hosting the hub stub.
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let bind: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let server_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        {
+            let svc = NexusVfsServiceServer::new(hub.clone());
+            server_rt.spawn(async move {
+                tonic::transport::Server::builder()
+                    .add_service(svc)
+                    .serve(bind)
+                    .await
+                    .ok();
+            });
+        }
+
+        // Client: RpcTransport → RemoteBackend at sub-path /zone/acme.
+        let client_rt = std::sync::Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let addr = format!("127.0.0.1:{port}");
+        let transport = std::sync::Arc::new(
+            RpcTransport::new(client_rt, &addr, "", None, Duration::from_secs(10))
+                .expect("rpc transport"),
+        );
+
+        // The channel is lazy and the server binds asynchronously — wait until
+        // it actually answers before asserting.
+        let mut ready = false;
+        for _ in 0..50 {
+            if transport.ping().is_ok() {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(ready, "server did not become reachable");
+
+        let backend =
+            RemoteBackend::with_zone_path(std::sync::Arc::clone(&transport), "/zone/acme");
+        let ctx = kernel::kernel::OperationContext::new("test", "root", false, None, false);
+
+        // 1. write → hub must receive the reconstructed absolute path. The
+        //    content id is persisted VERBATIM (the hub's own zone-prefixed id)
+        //    so the remote metastore writes the correct id back to the hub
+        //    (Issue #4273 — do NOT rewrite it to a mount-relative value).
+        let wr = backend
+            .write_content(b"hello sub-path", "file.txt", &ctx, 0)
+            .expect("write_content");
+        assert_eq!(
+            wr.content_id, "zone/acme/file.txt",
+            "stored content_id must be the hub's verbatim zone-prefixed id (Issue #4273)"
+        );
+        assert!(
+            hub.write_paths()
+                .iter()
+                .any(|p| path_eq(p, "zone/acme/file.txt")),
+            "hub should receive /zone/acme/file.txt; saw {:?}",
+            hub.write_paths()
+        );
+
+        // 2. read back through the stored (mount-relative) content_id round-trips.
+        let data = backend
+            .read_content(&wr.content_id, &ctx)
+            .expect("read_content");
+        assert_eq!(data, b"hello sub-path", "write->read round-trip failed");
+
+        // 3. stat resolves on the hub (path reconstruction for sys_stat).
+        let size = backend
+            .get_content_size("file.txt")
+            .expect("get_content_size");
+        assert_eq!(size, b"hello sub-path".len() as u64);
+
+        // 4. rename then read the new name (path reconstruction for sys_rename).
+        backend.rename("file.txt", "renamed.txt").expect("rename");
+        let after = backend
+            .read_content("renamed.txt", &ctx)
+            .expect("read renamed");
+        assert_eq!(after, b"hello sub-path");
+
+        // 5. delete then confirm gone (path reconstruction for sys_unlink).
+        backend.delete_file("renamed.txt").expect("delete_file");
+        assert!(
+            backend.read_content("renamed.txt", &ctx).is_err(),
+            "file should be gone after delete"
+        );
+
+        // 6. a crafted relative path cannot escape the mounted subtree.
+        let _ = backend.write_content(b"x", "zone/acme2/secret", &ctx, 0);
+        let writes = hub.write_paths();
+        assert!(
+            writes
+                .iter()
+                .any(|p| path_eq(p, "zone/acme/zone/acme2/secret")),
+            "crafted path should be contained under the mount; saw {writes:?}"
+        );
+        assert!(
+            !writes.iter().any(|p| path_eq(p, "zone/acme2/secret")),
+            "crafted path ESCAPED to a sibling subtree: {writes:?}"
+        );
+
+        // 7. Federation read-repair correctness (round-3 review case): the
+        //    kernel cache-write passes a stored content id (e.g.
+        //    "zone/acme/file.txt") through write_content. It is already
+        //    zone-prefixed, so it must map to "/zone/acme/file.txt" — NOT be
+        //    re-prefixed to "/zone/acme/zone/acme/file.txt" (which would orphan
+        //    or corrupt hub data on a failover read miss).
+        let wr2 = backend
+            .write_content(b"repair", "zone/acme/repair.txt", &ctx, 0)
+            .expect("write content-id");
+        let writes2 = hub.write_paths();
+        assert!(
+            writes2.iter().any(|p| path_eq(p, "zone/acme/repair.txt")),
+            "zone-prefixed write must pass through, not double; saw {writes2:?}"
+        );
+        assert!(
+            !writes2
+                .iter()
+                .any(|p| path_eq(p, "zone/acme/zone/acme/repair.txt")),
+            "zone-prefixed write was double-prefixed (read-repair misroute): {writes2:?}"
+        );
+        // Readback round-trips through the same pass-through reconstruction.
+        assert_eq!(
+            backend
+                .read_content(&wr2.content_id, &ctx)
+                .expect("read content-id"),
+            b"repair"
+        );
+        // NOTE: a real route path that literally re-uses the mount prefix
+        // (`/zone/acme/zone/acme/...`) is indistinguishable from a content id
+        // and is consistently aliased to the collapsed path — the documented
+        // kernel-API limitation (see RemoteBackend::to_server_path).
+
+        drop(server_rt);
+    }
+
     // ── bridge-2 (#4262): DT_MOUNT builds a live backend via the provider ──
 
     use kernel::hal::object_store_provider::{

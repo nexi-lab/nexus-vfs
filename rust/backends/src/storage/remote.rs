@@ -26,8 +26,9 @@ pub struct RemoteBackend {
     transport: Arc<RpcTransport>,
     /// Mount point of this backend (e.g. "/zone/shared" or "/").
     /// Used to reconstruct the absolute path sent to the hub.
-    /// Defaults to empty (root mount) until factory threads the
-    /// mount path through; see Issue #3786 follow-up.
+    /// Empty (or "/") means a root mount; the provider threads a
+    /// non-root mount point via [`RemoteBackend::with_zone_path`]
+    /// (Issue #4273, completing the Issue #3786 follow-up).
     zone_path: String,
 }
 
@@ -47,29 +48,70 @@ impl RemoteBackend {
     }
 }
 
-/// Reconstruct the absolute server path from mount point + backend_path.
+/// Reconstruct the absolute server path from mount point + `backend_path`.
 ///
-/// * Root mounts (`zone_path` is `""` or `"/"`): backend_path is already
-///   absolute — just ensure a leading slash.
-/// * Sub-path mounts (e.g. `"/zone/shared"`): prepend zone_path so the
-///   hub receives `/zone/shared/file.txt` rather than `/file.txt`.
+/// The `ObjectStore` API hands every method a single `backend_path`/`content_id`
+/// slot that the kernel fills with one of two shapes, and (for sub-path mounts)
+/// the backend is not told which:
+///
+///   * **Mount-relative route paths** — the VFS router strips the mount prefix,
+///     so a file at `/zone/shared/file.txt` arrives as `file.txt`. Every op can
+///     receive this: dir ops + `get_content_size` always do; `write_content`
+///     does on a normal `sys_write`; `read_content` does on a metastore miss
+///     (io.rs:228).
+///   * **Server content IDs** — the hub's own zone-prefixed path id (e.g.
+///     `zone/shared/file.txt`) that we persist verbatim. `read_content` gets it
+///     on a metastore hit (io.rs:345); `write_content` gets it on the
+///     federation read-repair cache-write (io.rs:455, `cache_key =
+///     entry.content_id`). It is already absolute and must NOT be prefixed.
+///
+/// So this one rule serves both: prepend the mount point UNLESS `backend_path`
+/// is already zone-prefixed on a path-component boundary (equals the mount or
+/// starts with `"<mount>/"`). Root mounts (`zone_path` `""`/`"/"`) just ensure a
+/// leading slash.
+///
+/// Issue #4273: the boundary check closes the security escape. The old code
+/// used a bare `starts_with(zone_path)` with no separator, so a crafted sibling
+/// `zone/acme2/file` under `/zone/acme` matched the `zone/acme` prefix and was
+/// emitted as `/zone/acme2/file` — escaping to a sibling subtree. With the `/`
+/// boundary, `zone/acme2/...` is treated as mount-relative and stays contained
+/// at `/zone/acme/zone/acme2/...`.
+///
+/// KNOWN LIMITATION (kernel-API level): a route path that *literally re-uses*
+/// the mount's own prefix — a real subdir at `/zone/acme/zone/acme/x`, route
+/// `zone/acme/x` — is indistinguishable from the content id `zone/acme/x`, so it
+/// is treated as already-absolute and maps to `/zone/acme/x`. This only ever
+/// aliases WITHIN the mounted subtree (never a cross-tenant escape) and is
+/// applied CONSISTENTLY across read/write/delete/rename (so a self-prefixed file
+/// is read and deleted at the same place it was written). Fully resolving it
+/// requires the kernel to signal route-vs-content-id to the backend (split the
+/// `ObjectStore` API, or skip read-repair caching for path-addressed backends);
+/// tracked as a #4273 follow-up. The normal (non-self-prefixed) case — every
+/// real file — is exact.
 fn to_server_path(zone_path: &str, backend_path: &str) -> String {
-    let bp = if backend_path.is_empty() {
-        "/".to_string()
+    let bp = if backend_path.is_empty() || backend_path == "/" {
+        String::new()
     } else if backend_path.starts_with('/') {
         backend_path.to_string()
     } else {
         format!("/{backend_path}")
     };
-    if zone_path.is_empty()
-        || zone_path == "/"
-        || bp
-            .trim_start_matches('/')
-            .starts_with(zone_path.trim_start_matches('/'))
-    {
-        bp
+    if zone_path.is_empty() || zone_path == "/" {
+        if bp.is_empty() {
+            "/".to_string()
+        } else {
+            bp
+        }
     } else {
-        format!("{zone_path}{bp}")
+        let zp = zone_path.trim_matches('/'); // "zone/acme"
+        let rel = bp.trim_start_matches('/'); // "zone/acme/file.txt" or "file.txt"
+        if rel == zp || rel.starts_with(&format!("{zp}/")) {
+            // Already zone-prefixed (a server content id) — absolute as-is.
+            format!("/{rel}")
+        } else {
+            // Mount-relative route path — prepend the mount point.
+            format!("/{zp}{bp}")
+        }
     }
 }
 
@@ -223,6 +265,12 @@ impl ObjectStore for RemoteBackend {
             )))
         })?;
 
+        // Issue #4273: persist the hub's content id VERBATIM (zone-prefixed,
+        // e.g. "zone/shared/file.txt"). The remote mount's `RemoteMetaStore`
+        // writes this id straight back to the hub via `sys_setattr`, so it
+        // must stay the hub's own server-relative id. Readback re-derives the
+        // absolute path via `to_server_path`, whose boundary check recognises
+        // the already-prefixed id and does not double-prefix it.
         let write_result = parse_write_result(&path, result)?;
 
         tracing::debug!(
@@ -370,6 +418,110 @@ mod tests {
         assert_eq!(
             parse_stat_size_from_response("/zone/shared/existing.txt", &response).unwrap(),
             42
+        );
+    }
+
+    // ---- Issue #4273: sub-path mount path reconstruction ----
+
+    #[test]
+    fn to_server_path_root_mount_passes_through() {
+        // Root mounts leave backend_path absolute (only ensure a leading slash).
+        assert_eq!(to_server_path("", "file.txt"), "/file.txt");
+        assert_eq!(to_server_path("/", "/zone/x/file.txt"), "/zone/x/file.txt");
+        assert_eq!(to_server_path("", ""), "/");
+    }
+
+    #[test]
+    fn to_server_path_subpath_prefixes_mount_relative_route() {
+        // A mount-relative route path is prepended with the mount point.
+        assert_eq!(
+            to_server_path("/zone/acme", "file.txt"),
+            "/zone/acme/file.txt"
+        );
+        assert_eq!(
+            to_server_path("/zone/acme", "sub/dir/file.txt"),
+            "/zone/acme/sub/dir/file.txt"
+        );
+        // Empty backend_path resolves to the mount root, not "/".
+        assert_eq!(to_server_path("/zone/acme", ""), "/zone/acme");
+    }
+
+    #[test]
+    fn to_server_path_subpath_contains_crafted_relative_path() {
+        // A crafted relative path that shares a textual prefix with the mount
+        // ("zone/acme" vs "zone/acme2") must NOT escape the mounted subtree.
+        // It is treated as mount-relative and stays under "/zone/acme/".
+        let out = to_server_path("/zone/acme", "zone/acme2/secret");
+        assert!(
+            out.starts_with("/zone/acme/"),
+            "crafted path escaped the mount: {out}"
+        );
+        assert_eq!(out, "/zone/acme/zone/acme2/secret");
+    }
+
+    #[test]
+    fn to_server_path_subpath_does_not_double_prefix_zone_content_id() {
+        // The hub returns (and we persist verbatim) a zone-prefixed content id.
+        // On readback it is already absolute and must NOT be prefixed again.
+        assert_eq!(
+            to_server_path("/zone/shared", "zone/shared/readback.txt"),
+            "/zone/shared/readback.txt"
+        );
+        // A leading-slash content id is also recognised, not double-prefixed.
+        assert_eq!(
+            to_server_path("/zone/shared", "/zone/shared/sub/f.txt"),
+            "/zone/shared/sub/f.txt"
+        );
+        // Exact-mount id maps to the mount root.
+        assert_eq!(
+            to_server_path("/zone/shared", "zone/shared"),
+            "/zone/shared"
+        );
+    }
+
+    #[test]
+    fn subpath_content_id_round_trips_to_same_server_path() {
+        // Invariant: write sends `server_path`; the hub echoes that path as a
+        // (slash-stripped) content id which we persist VERBATIM; readback
+        // `to_server_path(stored_id)` must land on the original `server_path`.
+        let zone = "/zone/acme";
+        for route in ["file.txt", "sub/dir/file.txt"] {
+            let server_path = to_server_path(zone, route); // what write_content sends
+            let stored = server_path.trim_start_matches('/').to_string(); // hub echo, stored as-is
+            assert_eq!(
+                to_server_path(zone, &stored),
+                server_path,
+                "round-trip mismatch for route {route}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_repair_content_id_is_not_double_prefixed() {
+        // The federation read-repair cache-write (io.rs:455) hands write_content
+        // a stored content id. It is already zone-prefixed, so it must map to
+        // the same absolute path the hub wrote — NOT be doubled (which would
+        // orphan/corrupt hub data). Same rule serves read_content's hit path.
+        assert_eq!(
+            to_server_path("/zone/acme", "zone/acme/file.txt"),
+            "/zone/acme/file.txt"
+        );
+    }
+
+    #[test]
+    fn self_prefixed_route_aliases_consistently_known_limitation() {
+        // KNOWN LIMITATION (kernel-API level): a route path that literally
+        // re-uses the mount's own prefix is indistinguishable from a content id,
+        // so it aliases to the collapsed path. This is applied CONSISTENTLY to
+        // every op (read/write/delete/rename/stat all agree), so a self-prefixed
+        // file is read and deleted at the same place it was written, and it never
+        // escapes the mounted subtree. Pinning the behavior so a future
+        // kernel-side fix (route-vs-content-id signal) updates it deliberately.
+        let aliased = to_server_path("/zone/acme", "zone/acme/x");
+        assert_eq!(aliased, "/zone/acme/x");
+        assert!(
+            aliased.starts_with("/zone/acme"),
+            "must stay within the mount: {aliased}"
         );
     }
 }
