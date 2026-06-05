@@ -500,7 +500,8 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
             ENV_FEDERATION_ZONES,
             ENV_FEDERATION_MOUNTS,
         );
-        zm.bootstrap_static(&zones, peers_str.clone(), &mounts)
+        zm.bootstrap_static_async(zones.clone(), peers_str.clone(), mounts.clone())
+            .await
             .map_err(|e| anyhow::anyhow!("bootstrap_static: {}", e))?;
     }
 
@@ -529,7 +530,10 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     let zm_for_loop = zm.clone();
     let topology_handle = tokio::spawn(async move {
         loop {
-            match zm_for_loop.apply_topology(contracts::ROOT_ZONE_ID) {
+            match zm_for_loop
+                .apply_topology_async(contracts::ROOT_ZONE_ID)
+                .await
+            {
                 Ok(true) => {
                     if !zm_for_loop.pending_mounts().is_empty() {
                         tokio::time::sleep(TOPOLOGY_TICK).await;
@@ -607,7 +611,8 @@ async fn run_share(
         .collect();
 
     if zm.get_zone(new_zone_id).is_none() {
-        zm.create_zone(new_zone_id, peers_str)
+        zm.create_zone_async(new_zone_id, peers_str)
+            .await
             .map_err(|e| anyhow::anyhow!("create_zone({}): {}", new_zone_id, e))?;
     }
 
@@ -616,7 +621,8 @@ async fn run_share(
     // the actual write target).  Reads on ``parent_zone`` are local
     // sequential-consistency, no leader required.
     let copied = zm
-        .share_subtree_core(parent_zone, path, new_zone_id)
+        .share_subtree_core_async(parent_zone, path, new_zone_id)
+        .await
         .map_err(|e| anyhow::anyhow!("share_subtree: {}", e))?;
 
     println!(
@@ -634,7 +640,8 @@ async fn run_share(
     // Idempotent re-mount to the same target is a no-op (see
     // `zm.mount`).
     if let Some(mount_path) = mount_at {
-        zm.mount(parent_zone, mount_path, new_zone_id, true)
+        zm.mount_async(parent_zone, mount_path, new_zone_id, true)
+            .await
             .map_err(|e| anyhow::anyhow!("mount({mount_path}): {e}"))?;
         println!("Mounted zone '{new_zone_id}' at '{mount_path}' in parent zone '{parent_zone}'");
     }
@@ -710,7 +717,8 @@ async fn run_join(
     .map_err(|e| anyhow::anyhow!("join task panicked: {}", e))?
     .map_err(|e| anyhow::anyhow!("bootstrap_or_join_zone({}): {}", remote_zone_id, e))?;
 
-    zm.mount(parent_zone, local_path, remote_zone_id, true)
+    zm.mount_async(parent_zone, local_path, remote_zone_id, true)
+        .await
         .map_err(|e| anyhow::anyhow!("mount: {}", e))?;
 
     println!(
