@@ -417,7 +417,9 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
                     );
                 }
             }
-            Err(e) => tracing::warn!(err = %e, dir = %plugin_dir.display(), "plugin dir scan failed"),
+            Err(e) => {
+                tracing::warn!(err = %e, dir = %plugin_dir.display(), "plugin dir scan failed")
+            }
         }
     }
 

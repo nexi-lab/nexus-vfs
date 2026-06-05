@@ -369,8 +369,7 @@ impl Kernel {
                         })
                     })
                     .collect();
-                serde_json::to_vec(&list)
-                    .map_err(|e| RustCallError::Internal(e.to_string()))
+                serde_json::to_vec(&list).map_err(|e| RustCallError::Internal(e.to_string()))
             }
             "unload" => {
                 let req: serde_json::Value = serde_json::from_slice(payload)
@@ -379,7 +378,7 @@ impl Kernel {
                     .as_str()
                     .ok_or_else(|| RustCallError::InvalidArgument("missing 'name'".into()))?;
                 self.unload_plugin(name)
-                    .map_err(|e| RustCallError::Internal(e))?;
+                    .map_err(RustCallError::Internal)?;
                 Ok(b"{}".to_vec())
             }
             // plugin.load and plugin.reload require Arc<Kernel> (self:

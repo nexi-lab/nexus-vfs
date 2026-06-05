@@ -17,8 +17,8 @@ use std::sync::Mutex;
 
 use contracts::rust_service::{RustCallError, RustService};
 use nexus_plugin_abi::{
-    KernelHandle, PluginKind, PluginResult, PLUGIN_API_VERSION,
-    ServiceCreateFn, ServiceDestroyFn, ServiceDispatchFn,
+    KernelHandle, PluginKind, PluginResult, ServiceCreateFn, ServiceDestroyFn, ServiceDispatchFn,
+    PLUGIN_API_VERSION,
 };
 
 // ── LoadedPlugin ────────────────────────────────────────────────────
@@ -67,9 +67,8 @@ impl RustService for DylibRustService {
     }
 
     fn dispatch(&self, method: &str, payload: &[u8]) -> Result<Vec<u8>, RustCallError> {
-        let method_c = CString::new(method).map_err(|_| {
-            RustCallError::InvalidArgument("method contains null byte".to_string())
-        })?;
+        let method_c = CString::new(method)
+            .map_err(|_| RustCallError::InvalidArgument("method contains null byte".to_string()))?;
         let mut out_buf: *mut u8 = std::ptr::null_mut();
         let mut out_len: usize = 0;
 
@@ -96,9 +95,9 @@ impl RustService for DylibRustService {
                 Ok(data)
             }
             rc if rc == PluginResult::NotFound as i32 => Err(RustCallError::NotFound),
-            rc if rc == PluginResult::InvalidArgument as i32 => {
-                Err(RustCallError::InvalidArgument("plugin rejected argument".into()))
-            }
+            rc if rc == PluginResult::InvalidArgument as i32 => Err(
+                RustCallError::InvalidArgument("plugin rejected argument".into()),
+            ),
             rc => Err(RustCallError::Internal(format!("plugin error code {rc}"))),
         }
     }
@@ -115,11 +114,17 @@ pub struct PluginLoader {
     loaded: Mutex<HashMap<String, LoadedPlugin>>,
 }
 
-impl PluginLoader {
-    pub fn new() -> Self {
+impl Default for PluginLoader {
+    fn default() -> Self {
         Self {
             loaded: Mutex::new(HashMap::new()),
         }
+    }
+}
+
+impl PluginLoader {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Load a plugin from a shared library.

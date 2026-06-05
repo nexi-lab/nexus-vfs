@@ -71,8 +71,8 @@ impl Kernel {
 
     /// Load all `.so` / `.dylib` files from a directory.
     pub fn load_plugin_dir(self: &Arc<Self>, dir: &Path) -> Result<Vec<String>, String> {
-        let entries = std::fs::read_dir(dir)
-            .map_err(|e| format!("read_dir({}): {e}", dir.display()))?;
+        let entries =
+            std::fs::read_dir(dir).map_err(|e| format!("read_dir({}): {e}", dir.display()))?;
 
         let mut loaded = Vec::new();
         for entry in entries.flatten() {

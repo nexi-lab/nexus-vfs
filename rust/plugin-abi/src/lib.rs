@@ -174,8 +174,7 @@ pub unsafe extern "C" fn nexus_free(ptr: *mut u8, len: usize) {
 // ── Service plugin type aliases ─────────────────────────────────────
 
 /// Type of the `nexus_service_create` symbol.
-pub type ServiceCreateFn =
-    unsafe extern "C" fn(kernel: *const KernelHandle) -> *mut c_void;
+pub type ServiceCreateFn = unsafe extern "C" fn(kernel: *const KernelHandle) -> *mut c_void;
 
 /// Type of the `nexus_service_dispatch` symbol.
 pub type ServiceDispatchFn = unsafe extern "C" fn(
@@ -193,10 +192,8 @@ pub type ServiceDestroyFn = unsafe extern "C" fn(svc: *mut c_void);
 // ── Driver plugin type aliases ──────────────────────────────────────
 
 /// Type of the `nexus_driver_create` symbol.
-pub type DriverCreateFn = unsafe extern "C" fn(
-    kernel: *const KernelHandle,
-    config_json: *const c_char,
-) -> *mut c_void;
+pub type DriverCreateFn =
+    unsafe extern "C" fn(kernel: *const KernelHandle, config_json: *const c_char) -> *mut c_void;
 
 /// Type of the `nexus_driver_read` symbol.
 pub type DriverReadFn = unsafe extern "C" fn(
