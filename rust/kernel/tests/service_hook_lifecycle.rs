@@ -198,13 +198,8 @@ fn hook_fires_then_stops_after_unregister_service() {
     let (k, ctx) = setup_kernel();
 
     // Register a managed service
-    k.register_managed_service(
-        "svc-a",
-        Box::new(StubService::new("StubA")),
-        vec![],
-        false,
-    )
-    .expect("enlist svc-a");
+    k.register_managed_service("svc-a", Box::new(StubService::new("StubA")), vec![], false)
+        .expect("enlist svc-a");
 
     // Register a hook owned by svc-a
     let (hook, pre_count, _post_count) = CountingHook::new("svc-a-hook");
@@ -216,7 +211,11 @@ fn hook_fires_then_stops_after_unregister_service() {
 
     // Second write
     assert!(do_write(&k, &ctx, "/test/file2.txt"));
-    assert_eq!(pre_count.load(Ordering::SeqCst), 2, "hook should fire twice");
+    assert_eq!(
+        pre_count.load(Ordering::SeqCst),
+        2,
+        "hook should fire twice"
+    );
 
     // Unregister the service — this must remove the hook
     let removed = k.unregister_service("svc-a");
@@ -359,11 +358,7 @@ fn unhook_one_service_leaves_others_intact() {
         1,
         "alpha hook must stop after unregister"
     );
-    assert_eq!(
-        pre_b.load(Ordering::SeqCst),
-        2,
-        "beta hook must still fire"
-    );
+    assert_eq!(pre_b.load(Ordering::SeqCst), 2, "beta hook must still fire");
 
     // One more write for good measure
     assert!(do_write(&k, &ctx, "/test/only_b2.txt"));
