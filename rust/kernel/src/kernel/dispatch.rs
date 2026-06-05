@@ -338,7 +338,58 @@ impl Kernel {
         method: &str,
         payload: &[u8],
     ) -> Option<Result<Vec<u8>, crate::service_registry::RustCallError>> {
+        // Built-in kernel plugin management (§10). Handled before
+        // ServiceRegistry lookup so plugin.* methods are always
+        // available regardless of what services are registered.
+        if name == "plugin" {
+            return Some(self.dispatch_plugin_call(method, payload));
+        }
         let svc = self.service_registry.lookup_rust(name)?;
         Some(svc.dispatch(method, payload))
+    }
+
+    /// Handle `plugin.*` RPC methods — kernel-built-in, not a registered
+    /// RustService. Needs &self (Kernel) to call load/unload/list.
+    fn dispatch_plugin_call(
+        &self,
+        method: &str,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, crate::service_registry::RustCallError> {
+        use crate::service_registry::RustCallError;
+        match method {
+            "list" => {
+                let plugins = self.plugin_loader.list();
+                let list: Vec<serde_json::Value> = plugins
+                    .iter()
+                    .map(|(name, kind, path)| {
+                        serde_json::json!({
+                            "name": name,
+                            "kind": format!("{:?}", kind),
+                            "path": path.display().to_string(),
+                        })
+                    })
+                    .collect();
+                serde_json::to_vec(&list)
+                    .map_err(|e| RustCallError::Internal(e.to_string()))
+            }
+            "unload" => {
+                let req: serde_json::Value = serde_json::from_slice(payload)
+                    .map_err(|e| RustCallError::InvalidArgument(e.to_string()))?;
+                let name = req["name"]
+                    .as_str()
+                    .ok_or_else(|| RustCallError::InvalidArgument("missing 'name'".into()))?;
+                self.unload_plugin(name)
+                    .map_err(|e| RustCallError::Internal(e))?;
+                Ok(b"{}".to_vec())
+            }
+            // plugin.load and plugin.reload require Arc<Kernel> (self:
+            // &Arc<Self>). They are called from the cluster binary's
+            // --plugin-dir boot path, not through gRPC Call dispatch.
+            // gRPC callers use the nexusd-cluster CLI subcommands.
+            "load" | "reload" => Err(RustCallError::InvalidArgument(
+                "plugin.load/reload must be invoked via CLI, not gRPC Call".into(),
+            )),
+            _ => Err(RustCallError::NotFound),
+        }
     }
 }
