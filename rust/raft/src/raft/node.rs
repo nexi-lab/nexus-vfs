@@ -46,7 +46,7 @@
 //! `"not leader but has new msg after advance"` panic under concurrent load.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -221,30 +221,6 @@ impl RaftConfig {
     }
 }
 
-/// Role of a Raft node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NodeRole {
-    /// Follower: accepts log entries from leader.
-    Follower,
-    /// Candidate: requesting votes for leader election.
-    Candidate,
-    /// Leader: handles client requests and replicates log.
-    Leader,
-    /// Pre-candidate: pre-vote phase before becoming candidate.
-    PreCandidate,
-}
-
-impl From<raft::StateRole> for NodeRole {
-    fn from(role: raft::StateRole) -> Self {
-        match role {
-            raft::StateRole::Follower => NodeRole::Follower,
-            raft::StateRole::Candidate => NodeRole::Candidate,
-            raft::StateRole::Leader => NodeRole::Leader,
-            raft::StateRole::PreCandidate => NodeRole::PreCandidate,
-        }
-    }
-}
-
 /// Pending proposal waiting for commit.
 struct PendingProposal {
     /// Channel to send result back.
@@ -333,9 +309,8 @@ pub struct ZoneConsensus<S: StateMachine + 'static> {
     state_machine: Arc<RwLock<S>>,
     /// Node configuration.
     config: RaftConfig,
-    /// Cached role, updated by driver after each advance().
-    cached_role: Arc<AtomicU8>,
-    /// Cached leader ID, updated by driver after each advance().
+    /// Cached leader ID, updated by driver after each advance().  SSOT
+    /// for [`Self::is_leader`] — `is_leader() = leader_id() == Some(self.id)`.
     cached_leader_id: Arc<AtomicU64>,
     /// Cached term, updated by driver after each advance().
     cached_term: Arc<AtomicU64>,
@@ -406,7 +381,6 @@ impl<S: StateMachine + 'static> Clone for ZoneConsensus<S> {
             msg_tx: self.msg_tx.clone(),
             state_machine: self.state_machine.clone(),
             config: self.config.clone(),
-            cached_role: self.cached_role.clone(),
             cached_leader_id: self.cached_leader_id.clone(),
             cached_term: self.cached_term.clone(),
             cached_commit_index: self.cached_commit_index.clone(),
@@ -469,8 +443,6 @@ pub struct ZoneConsensusDriver<S: StateMachine + 'static> {
     last_tick: Instant,
     /// Bounded channel receiver — messages from the handle.
     msg_rx: mpsc::Receiver<RaftMsg>,
-    /// Cached role (shared with handle for reads).
-    cached_role: Arc<AtomicU8>,
     /// Cached leader ID (shared with handle for reads).
     cached_leader_id: Arc<AtomicU64>,
     /// Cached term (shared with handle for reads).
@@ -492,34 +464,8 @@ pub struct ZoneConsensusDriver<S: StateMachine + 'static> {
 // ZoneConsensus (handle) implementation
 // ---------------------------------------------------------------------------
 
-/// Atomic encoding for [`NodeRole`].
-const ROLE_FOLLOWER: u8 = 0;
-const ROLE_CANDIDATE: u8 = 1;
-const ROLE_LEADER: u8 = 2;
-const ROLE_PRE_CANDIDATE: u8 = 3;
-
 /// Timeout for proposals and conf changes waiting for commit.
 const PROPOSAL_TIMEOUT_SECS: u64 = 10;
-
-impl NodeRole {
-    fn to_u8(self) -> u8 {
-        match self {
-            NodeRole::Follower => ROLE_FOLLOWER,
-            NodeRole::Candidate => ROLE_CANDIDATE,
-            NodeRole::Leader => ROLE_LEADER,
-            NodeRole::PreCandidate => ROLE_PRE_CANDIDATE,
-        }
-    }
-
-    fn from_u8(v: u8) -> Self {
-        match v {
-            ROLE_CANDIDATE => NodeRole::Candidate,
-            ROLE_LEADER => NodeRole::Leader,
-            ROLE_PRE_CANDIDATE => NodeRole::PreCandidate,
-            _ => NodeRole::Follower,
-        }
-    }
-}
 
 impl<S: StateMachine + 'static> ZoneConsensus<S> {
     /// Create a new Raft node, returning a (handle, driver) pair.
@@ -638,7 +584,6 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         // Shared state
         let state_machine = Arc::new(RwLock::new(state_machine));
         let proposal_id = Arc::new(AtomicU64::new(0));
-        let cached_role = Arc::new(AtomicU8::new(ROLE_FOLLOWER));
         let cached_leader_id = Arc::new(AtomicU64::new(0));
         let cached_term = Arc::new(AtomicU64::new(0));
         let cached_commit_index = Arc::new(AtomicU64::new(0));
@@ -651,7 +596,6 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             msg_tx,
             state_machine: state_machine.clone(),
             config: config.clone(),
-            cached_role: cached_role.clone(),
             cached_leader_id: cached_leader_id.clone(),
             cached_term: cached_term.clone(),
             cached_commit_index: cached_commit_index.clone(),
@@ -678,7 +622,6 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             proposal_id,
             last_tick: Instant::now(),
             msg_rx,
-            cached_role,
             cached_leader_id,
             cached_term,
             cached_commit_index,
@@ -726,26 +669,13 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         self.config.is_witness
     }
 
-    /// Get the current role (atomic read, no channel).
-    pub fn role(&self) -> NodeRole {
-        NodeRole::from_u8(self.cached_role.load(Ordering::Relaxed))
-    }
-
     /// Check if this node is the leader (atomic read, no channel).
     ///
-    /// SSOT — derives from [`Self::leader_id`] rather than the parallel
-    /// `cached_role` atomic.  `cached_role` and `cached_leader_id` are
-    /// updated independently in [`ZoneConsensusDriver::update_cached_status`]
-    /// (two `Relaxed` stores), so reading them as two separate signals
-    /// creates a race window where a caller can observe (role=Follower,
-    /// leader=self) — exactly the gap that made `submit_to_channel`
-    /// return `NotLeader` and `propose` drop into `forward_to_leader` for
-    /// 1-voter founder zones, then fail the self-forward via gRPC
-    /// (Tailscale-style own-public-IP hairpin).  By reading the SAME
-    /// atomic as `leader_id`, both observations are now consistent and
-    /// the race is eliminated at source — no spawning-pool patch or
-    /// "wait then retry" loop needed at any of the 15+ `is_leader()`
-    /// callers in raft / distributed_coordinator / transport server.
+    /// SSOT — derives from [`Self::leader_id`].  raft-rs's invariant is
+    /// `raft.leader_id == raft.id` iff `state == Leader`, so a single
+    /// `cached_leader_id` atomic carries the full "am I leader" signal.
+    /// Both `is_leader()` and `leader_id()` read the same atomic, so no
+    /// caller of either ever observes an inconsistent view.
     pub fn is_leader(&self) -> bool {
         self.leader_id() == Some(self.config.id)
     }
@@ -1859,8 +1789,6 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
     /// ``apply``), and ``ZoneConsensus::applied_index_atom`` borrows
     /// that Arc. Keeping the SSOT on the state machine avoids shadowing.
     fn update_cached_status(&self) {
-        let role: NodeRole = self.raw_node.raft.state.into();
-        self.cached_role.store(role.to_u8(), Ordering::Relaxed);
         self.cached_leader_id
             .store(self.raw_node.raft.leader_id, Ordering::Relaxed);
         self.cached_term
@@ -1961,7 +1889,7 @@ mod tests {
 
         assert_eq!(handle.id(), 1);
         assert!(!handle.is_witness());
-        assert_eq!(handle.role(), NodeRole::Follower);
+        assert!(!handle.is_leader());
     }
 
     #[tokio::test]
@@ -2018,7 +1946,7 @@ mod tests {
 
         let (handle, _driver) = ZoneConsensus::new(config, storage, state_machine, None).unwrap();
         assert_eq!(handle.id(), 1);
-        assert_eq!(handle.role(), NodeRole::Follower);
+        assert!(!handle.is_leader());
     }
 
     #[tokio::test]
@@ -2427,8 +2355,7 @@ mod tests {
         let (handle, mut driver) =
             ZoneConsensus::new(config, storage, state_machine, None).unwrap();
 
-        // Before campaign: should be Follower
-        assert_eq!(handle.role(), NodeRole::Follower);
+        // Before campaign: should be a follower (not leader)
         assert!(!handle.is_leader());
 
         // Spawn campaign on a separate task (it blocks waiting for driver response).
@@ -2451,7 +2378,6 @@ mod tests {
             handle.is_leader(),
             "is_leader() must be true after campaign() + process_messages(), without advance()"
         );
-        assert_eq!(handle.role(), NodeRole::Leader);
         assert_eq!(handle.leader_id(), Some(1));
     }
 }

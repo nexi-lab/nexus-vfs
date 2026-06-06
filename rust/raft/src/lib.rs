@@ -155,7 +155,7 @@ pub mod prelude {
     };
 
     #[cfg(feature = "consensus")]
-    pub use crate::raft::{NodeRole, RaftConfig, RaftStorage, ZoneConsensus};
+    pub use crate::raft::{RaftConfig, RaftStorage, ZoneConsensus};
 
     #[cfg(all(feature = "grpc", has_protos))]
     pub use crate::transport::{

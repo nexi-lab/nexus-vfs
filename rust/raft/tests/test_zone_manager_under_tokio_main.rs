@@ -103,6 +103,87 @@ async fn zone_manager_create_and_apply_topology_under_tokio_main() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_voter_propose_converges_without_self_forward_loop() {
+    // Regression: PR #25 (F1 + F2 — leader-detection race fix).
+    //
+    // F1: `is_leader()` derives from `leader_id()` rather than the
+    //     parallel `cached_role` atomic, eliminating the inter-atomic
+    //     race during the post-election update window.
+    // F2: `forward_to_leader` detects "leader is self" and retries
+    //     `submit_to_channel` locally instead of RPC-forwarding to
+    //     self's advertised address (which would hairpin on
+    //     Tailscale-on-Windows/macOS or round-trip back to the same
+    //     process).
+    //
+    // Symptom before the fix: a 1-voter founder boot would log one
+    // `Forward to leader failed (unreachable?): leader=<self_node_id>`
+    // warning, then the `apply_topology` retry loop in the cluster
+    // binary would paper over it by re-proposing every TOPOLOGY_TICK
+    // until convergence — measured ~10 s on local hardware.  After the
+    // fix the very first `apply_topology` propose lands cleanly within
+    // a few election ticks.
+    //
+    // This test pins both invariants:
+    //   1. `apply_topology` must return Ok on a 1-voter zone whose
+    //      election has had time to fire.
+    //   2. It must do so well under the apply_topology-retry-loop
+    //      timescale — 2 s is comfortably above the ~100 ms election
+    //      timer + propose pipeline budget and comfortably below the
+    //      pre-fix ~10 s convergence floor.
+    let tmp = TempDir::new().unwrap();
+    let bind = ephemeral_bind_addr();
+    let zm = ZoneManager::new(
+        "regression-host",
+        tmp.path().to_str().unwrap(),
+        vec![],
+        &bind,
+        None,
+    )
+    .expect("ZoneManager::new");
+
+    zm.create_zone("root", vec![]).expect("create_zone");
+
+    // Election timer ~150 ms; give the driver a small margin to settle
+    // cached_leader_id post-self-vote.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // `apply_topology` drives `ensure_root_entry` → `propose_set_metadata`
+    // through `bridge_block_on(node.propose(...))`.  On a 1-voter zone
+    // this is the exact path that hit the leader-detection race before
+    // PR #25.  Bound the whole operation to 2 s — that's already ~20×
+    // the pre-fix's pessimistic 10 s convergence budget under the
+    // retry-loop workaround.
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::task::spawn_blocking({
+            let zm = zm.clone();
+            move || zm.apply_topology("root")
+        }),
+    )
+    .await
+    .expect("apply_topology must not exceed 2 s — pre-#25 this took ~10 s")
+    .expect("spawn_blocking join")
+    .expect("apply_topology must return Ok on a 1-voter founder");
+    let elapsed = started.elapsed();
+
+    // `apply_topology` returns true on the "root entry written, nothing
+    // pending" path and false on the "leader not yet stable" deferral.
+    // Both are fine — what we're catching is the timeout / Err that the
+    // pre-fix race produced.
+    let _ = outcome;
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "1-voter founder propose must converge in <2 s (got {:?}); before #25 \
+         this took ~10 s because forward_to_leader's self-RPC hairpin failure \
+         was being papered over by an apply_topology retry loop",
+        elapsed,
+    );
+
+    zm.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn zone_manager_remove_zone_under_tokio_main() {
     // Phase 3: remove_zone bridges to the only inherently-async
     // registry op (awaits transport_handle JoinHandle for graceful
