@@ -53,13 +53,35 @@ impl S3Transport {
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .build()
             .map_err(|e| io::Error::other(format!("S3 client build: {e}")))?;
+        // Credential resolution: prefer explicit args (a mount that carries
+        // them), else fall back to the standard AWS env vars. This lets a
+        // deployment inject creds via the cluster environment from a secret
+        // store / IAM-role exporter instead of persisting them inline in the
+        // mount config (which lands in the DB). `region` resolves the same way.
+        let access_key = if access_key.is_empty() {
+            std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_default()
+        } else {
+            access_key.to_string()
+        };
+        let secret_key = if secret_key.is_empty() {
+            std::env::var("AWS_SECRET_ACCESS_KEY").unwrap_or_default()
+        } else {
+            secret_key.to_string()
+        };
+        let region = if region.is_empty() {
+            std::env::var("AWS_DEFAULT_REGION")
+                .or_else(|_| std::env::var("AWS_REGION"))
+                .unwrap_or_else(|_| "us-east-1".to_string())
+        } else {
+            region.to_string()
+        };
         Ok(Self {
             backend_name: name.to_string(),
             bucket: bucket.to_string(),
             prefix: prefix.trim_matches('/').to_string(),
-            region: region.to_string(),
-            access_key: access_key.to_string(),
-            secret_key: secret_key.to_string(),
+            region,
+            access_key,
+            secret_key,
             endpoint: endpoint.map(|s| s.to_string()),
             runtime,
             client,
