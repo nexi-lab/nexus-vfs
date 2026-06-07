@@ -25,11 +25,18 @@ pub(crate) struct S3Transport {
     access_key: String,
     secret_key: String,
     endpoint: Option<String>,
-    runtime: tokio::runtime::Runtime,
+    /// Multi-thread runtime kept alive for the backend's lifetime. A
+    /// `current_thread` runtime only drives its reactor *during* `block_on`,
+    /// so the pooled client's idle keep-alive connections aren't maintained
+    /// between ops and every request pays a fresh TLS handshake. A persistent
+    /// multi-thread reactor keeps the pool warm so back-to-back ops reuse the
+    /// connection (R2 GET ~150ms -> ~70ms). `Option` so `Drop` can take it and
+    /// `shutdown_background()` when dropped inside another runtime (a plain
+    /// multi-thread `Runtime` drop in async context panics).
+    runtime: Option<tokio::runtime::Runtime>,
     /// One pooled HTTP client reused across all requests. `reqwest::Client`
-    /// owns a connection pool, so reusing it keeps TLS connections to R2/S3
-    /// alive (keep-alive) instead of paying a fresh TCP+TLS handshake per
-    /// op — measured ~116ms/op saved on R2 GET (p50 207ms -> 90ms).
+    /// owns a connection pool; reusing it (with the persistent runtime above)
+    /// keeps TLS connections to R2/S3 alive instead of a handshake per op.
     client: reqwest::Client,
 }
 
@@ -43,7 +50,10 @@ impl S3Transport {
         secret_key: &str,
         endpoint: Option<&str>,
     ) -> Result<Self, io::Error> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
+        // Multi-thread (1 worker) so the I/O reactor stays alive between
+        // block_on calls and the pooled client's connections are reused.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
             .enable_all()
             .build()?;
         // Build the pooled client once. Keep idle connections warm so
@@ -83,9 +93,17 @@ impl S3Transport {
             access_key,
             secret_key,
             endpoint: endpoint.map(|s| s.to_string()),
-            runtime,
+            runtime: Some(runtime),
             client,
         })
+    }
+
+    /// The backend's persistent runtime. Present for the whole lifetime;
+    /// only `Drop` takes it.
+    fn rt(&self) -> &tokio::runtime::Runtime {
+        self.runtime
+            .as_ref()
+            .expect("S3Transport runtime present until drop")
     }
 
     fn object_key(&self, content_id: &str) -> String {
@@ -323,7 +341,7 @@ impl ObjectStore for S3Transport {
         let content_owned = content.to_vec();
         let size = content.len() as u64;
 
-        self.runtime.block_on(async {
+        self.rt().block_on(async {
             let client = &self.client;
             let mut req = client.put(&url).body(content_owned);
             for (k, v) in &headers {
@@ -359,7 +377,7 @@ impl ObjectStore for S3Transport {
         let now = chrono::Utc::now();
         let headers = self.sign_request("GET", &path, "UNSIGNED-PAYLOAD", &now);
 
-        self.runtime.block_on(async {
+        self.rt().block_on(async {
             let client = &self.client;
             let mut req = client.get(&url);
             for (k, v) in &headers {
@@ -393,7 +411,7 @@ impl ObjectStore for S3Transport {
         let now = chrono::Utc::now();
         let headers = self.sign_request("DELETE", &path, "UNSIGNED-PAYLOAD", &now);
 
-        self.runtime.block_on(async {
+        self.rt().block_on(async {
             let client = &self.client;
             let mut req = client.delete(&url);
             for (k, v) in &headers {
@@ -441,7 +459,7 @@ impl ObjectStore for S3Transport {
         let headers =
             self.sign_request_with_copy_source("PUT", &dst_path, &empty_sha, &copy_source, &now);
 
-        self.runtime.block_on(async {
+        self.rt().block_on(async {
             let client = &self.client;
             let mut req = client.put(&url);
             for (k, v) in &headers {
@@ -476,6 +494,22 @@ impl ObjectStore for S3Transport {
     fn rmdir(&self, _path: &str, _recursive: bool) -> Result<(), StorageError> {
         // S3 has no real directories
         Ok(())
+    }
+}
+
+impl Drop for S3Transport {
+    fn drop(&mut self) {
+        // Dropping a multi-thread `Runtime` blocks until its workers exit, which
+        // tokio forbids from inside another runtime's async context ("Cannot
+        // drop a runtime in a context where blocking is not allowed"). If we're
+        // inside a runtime (e.g. dropped from an async mount-teardown handler),
+        // hand the shutdown off-thread; otherwise the natural blocking drop is
+        // fine.
+        if let Some(rt) = self.runtime.take() {
+            if tokio::runtime::Handle::try_current().is_ok() {
+                rt.shutdown_background();
+            }
+        }
     }
 }
 
