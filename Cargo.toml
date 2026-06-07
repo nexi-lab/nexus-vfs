@@ -17,6 +17,11 @@ members = [
     "rust/plugin-abi",
     # Deployment binaries.
     "rust/profiles/cluster",
+    # `full` = cluster + the S3/R2 object-store driver. Kept separate from
+    # `cluster` so the federation binary stays pure (Raft + local/remote) and
+    # under its size gate; third-party blob drivers live here instead. Per
+    # nexus-vfs#27 kernel-team review.
+    "rust/profiles/full",
 ]
 
 [workspace.dependencies]

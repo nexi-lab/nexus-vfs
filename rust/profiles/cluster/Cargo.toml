@@ -12,12 +12,6 @@ path = "src/main.rs"
 
 [features]
 default = []
-# Opt-in S3/R2 serving. Pulls the HTTP+SigV4 stack (reqwest/hmac/sha2), which
-# pushes the binary past the slim size gate — so it is NOT in the default
-# build. Enable for S3-serving deployments with
-# `cargo install ... --features driver-s3` (e.g. the full nexus image's
-# Dockerfile). The default `nexusd-cluster` stays local+remote only and small.
-driver-s3 = ["backends/driver-s3"]
 
 [dependencies]
 # raft owns federation orchestration (ZoneManager, bootstrap_tls, etc.).
