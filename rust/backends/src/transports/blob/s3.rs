@@ -16,6 +16,13 @@ use std::io;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Max idle keep-alive connections the pooled client retains per host.
+const S3_POOL_MAX_IDLE_PER_HOST: usize = 16;
+/// How long an idle pooled connection is kept before it is reaped, in seconds.
+const S3_POOL_IDLE_TIMEOUT_SECS: u64 = 90;
+/// Region used only when neither the mount nor the AWS env vars specify one.
+const S3_DEFAULT_REGION: &str = "us-east-1";
+
 /// S3-compatible object storage backend.
 pub(crate) struct S3Transport {
     backend_name: String,
@@ -39,6 +46,18 @@ pub(crate) struct S3Transport {
 }
 
 impl S3Transport {
+    /// Construct an `S3Transport`.
+    ///
+    /// **Credential / region resolution order** (highest precedence first):
+    /// 1. the explicit argument (`access_key` / `secret_key` / `region`) when
+    ///    non-empty — a mount that carries them inline;
+    /// 2. the standard AWS env vars — `AWS_ACCESS_KEY_ID`,
+    ///    `AWS_SECRET_ACCESS_KEY`, and `AWS_DEFAULT_REGION` (then `AWS_REGION`)
+    ///    — so a deployment can inject creds via the cluster environment from a
+    ///    secret store / IAM-role exporter instead of persisting them in the
+    ///    mount config (which lands in the DB);
+    /// 3. for `region` only, a hardcoded [`S3_DEFAULT_REGION`] fallback, logged
+    ///    at WARN so a silent cross-region default is visible.
     pub(crate) fn new(
         name: &str,
         bucket: &str,
@@ -54,8 +73,8 @@ impl S3Transport {
         // Build the pooled client once. Keep idle connections warm so
         // back-to-back ops reuse the same TLS session to R2/S3.
         let client = reqwest::Client::builder()
-            .pool_max_idle_per_host(16)
-            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .pool_max_idle_per_host(S3_POOL_MAX_IDLE_PER_HOST)
+            .pool_idle_timeout(std::time::Duration::from_secs(S3_POOL_IDLE_TIMEOUT_SECS))
             .build()
             .map_err(|e| io::Error::other(format!("S3 client build: {e}")))?;
         // Credential resolution: prefer explicit args (a mount that carries
@@ -73,12 +92,21 @@ impl S3Transport {
         } else {
             secret_key.to_string()
         };
-        let region = if region.is_empty() {
-            std::env::var("AWS_DEFAULT_REGION")
-                .or_else(|_| std::env::var("AWS_REGION"))
-                .unwrap_or_else(|_| "us-east-1".to_string())
-        } else {
+        let region = if !region.is_empty() {
             region.to_string()
+        } else if let Ok(env_region) =
+            std::env::var("AWS_DEFAULT_REGION").or_else(|_| std::env::var("AWS_REGION"))
+        {
+            env_region
+        } else {
+            tracing::warn!(
+                backend = name,
+                default = S3_DEFAULT_REGION,
+                "S3 region unset (no arg, no AWS_DEFAULT_REGION/AWS_REGION) — \
+                 falling back to default; set the region explicitly to avoid \
+                 surprise cross-region latency"
+            );
+            S3_DEFAULT_REGION.to_string()
         };
         Ok(Self {
             backend_name: name.to_string(),
