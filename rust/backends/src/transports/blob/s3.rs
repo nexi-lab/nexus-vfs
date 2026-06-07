@@ -26,10 +26,15 @@ pub(crate) struct S3Transport {
     secret_key: String,
     endpoint: Option<String>,
     runtime: tokio::runtime::Runtime,
-    /// One pooled HTTP client reused across all requests. `reqwest::Client`
-    /// owns a connection pool, so reusing it keeps TLS connections to R2/S3
-    /// alive (keep-alive) instead of paying a fresh TCP+TLS handshake per
-    /// op — measured ~116ms/op saved on R2 GET (p50 207ms -> 90ms).
+    /// One pooled HTTP client built once and reused across all requests,
+    /// instead of constructing a fresh `reqwest::Client` (TLS connector, DNS
+    /// resolver, pool) per op. `reqwest::Client` owns a connection pool, so a
+    /// single op's redirects/retries and its header→body read reuse the live
+    /// connection. NOTE: cross-op keep-alive is bounded by the `current_thread`
+    /// runtime below — its reactor only runs *during* `block_on`, so idle
+    /// connections aren't actively maintained between ops; the warm-reuse win
+    /// is realized when ops are driven back-to-back on a co-located deployment
+    /// (low-RTT region + same-region bucket), where it matters least anyway.
     client: reqwest::Client,
 }
 
