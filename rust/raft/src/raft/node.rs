@@ -574,7 +574,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
                 })?;
 
                 let cc = ConfChange {
-                    change_type: ConfChangeType::AddNode.into(),
+                    change_type: ConfChangeType::AddNode,
                     node_id: config.id,
                     ..Default::default()
                 };
@@ -583,7 +583,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
                 })?;
 
                 let bootstrap_entry = Entry {
-                    entry_type: EntryType::EntryConfChange.into(),
+                    entry_type: EntryType::EntryConfChange,
                     term: 1,
                     index: 1,
                     data: cc_data.into(),
