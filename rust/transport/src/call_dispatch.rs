@@ -62,7 +62,41 @@ pub fn dispatch(
         "agent_signal" => do_agent_signal(kernel, &params),
         "agent_heartbeat" => do_agent_heartbeat(kernel, &params),
 
-        // Xattr (file metadata side-car)
+        // Plugin service dispatch — "service_name.method_name" routes to
+        // kernel.dispatch_rust_call(service, method, payload). This is
+        // the gRPC entry point for cdylib plugin services (e.g. vault
+        // plugin's "password-vault.secret_put").
+        _ if method.contains('.') => {
+            if let Some((svc, svc_method)) = method.split_once('.') {
+                match kernel.dispatch_rust_call(svc, svc_method, payload) {
+                    Some(Ok(response_bytes)) => Ok(response_bytes),
+                    Some(Err(e)) => {
+                        let code = match &e {
+                            contracts::rust_service::RustCallError::NotFound => {
+                                RpcErrorCode::FileNotFound
+                            }
+                            contracts::rust_service::RustCallError::InvalidArgument(_) => {
+                                RpcErrorCode::ValidationError
+                            }
+                            contracts::rust_service::RustCallError::Internal(_) => {
+                                RpcErrorCode::InternalError
+                            }
+                        };
+                        Err(call_err(code, &e.to_string()))
+                    }
+                    None => Err(call_err(
+                        RpcErrorCode::InternalError,
+                        &format!("service not found: {svc}"),
+                    )),
+                }
+            } else {
+                Err(call_err(
+                    RpcErrorCode::InternalError,
+                    &format!("unknown Call method: {method}"),
+                ))
+            }
+        }
+
         _ => Err(call_err(
             RpcErrorCode::InternalError,
             &format!("unknown Call method: {method}"),
