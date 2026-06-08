@@ -173,9 +173,14 @@ impl ObjectStoreProvider for DefaultObjectStoreProvider {
             #[cfg(feature = "driver-s3")]
             "s3" => {
                 let bucket = required_param(p, "s3_bucket", "s3")?;
-                let region = required_param(p, "aws_region", "s3")?;
-                let access_key = required_param(p, "aws_access_key", "s3")?;
-                let secret_key = required_param(p, "aws_secret_key", "s3")?;
+                // Creds + region are optional: when absent the S3 backend falls
+                // back to the AWS env chain (AWS_ACCESS_KEY_ID / _SECRET_ACCESS_KEY
+                // / _DEFAULT_REGION), so a deployment can inject them via the
+                // cluster environment from a secret store instead of inline mount
+                // config. Explicit params still win.
+                let region = param(p, "aws_region").unwrap_or("");
+                let access_key = param(p, "aws_access_key").unwrap_or("");
+                let secret_key = param(p, "aws_secret_key").unwrap_or("");
                 let prefix = param(p, "s3_prefix").unwrap_or("");
                 let endpoint = param(p, "s3_endpoint");
                 let backend = crate::transports::blob::s3::S3Transport::new(

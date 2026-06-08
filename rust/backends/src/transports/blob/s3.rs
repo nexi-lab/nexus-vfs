@@ -16,6 +16,13 @@ use std::io;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Max idle keep-alive connections the pooled client retains per host.
+const S3_POOL_MAX_IDLE_PER_HOST: usize = 16;
+/// How long an idle pooled connection is kept before it is reaped, in seconds.
+const S3_POOL_IDLE_TIMEOUT_SECS: u64 = 90;
+/// Region used only when neither the mount nor the AWS env vars specify one.
+const S3_DEFAULT_REGION: &str = "us-east-1";
+
 /// S3-compatible object storage backend.
 pub(crate) struct S3Transport {
     backend_name: String,
@@ -26,9 +33,31 @@ pub(crate) struct S3Transport {
     secret_key: String,
     endpoint: Option<String>,
     runtime: tokio::runtime::Runtime,
+    /// One pooled HTTP client built once and reused across all requests,
+    /// instead of constructing a fresh `reqwest::Client` (TLS connector, DNS
+    /// resolver, pool) per op. `reqwest::Client` owns a connection pool, so a
+    /// single op's redirects/retries and its header→body read reuse the live
+    /// connection. NOTE: cross-op keep-alive is bounded by the `current_thread`
+    /// runtime below — its reactor only runs *during* `block_on`, so idle
+    /// connections aren't actively maintained between ops; the warm-reuse win
+    /// is realized when ops are driven back-to-back on a co-located deployment
+    /// (low-RTT region + same-region bucket), where it matters least anyway.
+    client: reqwest::Client,
 }
 
 impl S3Transport {
+    /// Construct an `S3Transport`.
+    ///
+    /// **Credential / region resolution order** (highest precedence first):
+    /// 1. the explicit argument (`access_key` / `secret_key` / `region`) when
+    ///    non-empty — a mount that carries them inline;
+    /// 2. the standard AWS env vars — `AWS_ACCESS_KEY_ID`,
+    ///    `AWS_SECRET_ACCESS_KEY`, and `AWS_DEFAULT_REGION` (then `AWS_REGION`)
+    ///    — so a deployment can inject creds via the cluster environment from a
+    ///    secret store / IAM-role exporter instead of persisting them in the
+    ///    mount config (which lands in the DB);
+    /// 3. for `region` only, a hardcoded [`S3_DEFAULT_REGION`] fallback, logged
+    ///    at WARN so a silent cross-region default is visible.
     pub(crate) fn new(
         name: &str,
         bucket: &str,
@@ -41,15 +70,54 @@ impl S3Transport {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
+        // Build the pooled client once. Keep idle connections warm so
+        // back-to-back ops reuse the same TLS session to R2/S3.
+        let client = reqwest::Client::builder()
+            .pool_max_idle_per_host(S3_POOL_MAX_IDLE_PER_HOST)
+            .pool_idle_timeout(std::time::Duration::from_secs(S3_POOL_IDLE_TIMEOUT_SECS))
+            .build()
+            .map_err(|e| io::Error::other(format!("S3 client build: {e}")))?;
+        // Credential resolution: prefer explicit args (a mount that carries
+        // them), else fall back to the standard AWS env vars. This lets a
+        // deployment inject creds via the cluster environment from a secret
+        // store / IAM-role exporter instead of persisting them inline in the
+        // mount config (which lands in the DB). `region` resolves the same way.
+        let access_key = if access_key.is_empty() {
+            std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_default()
+        } else {
+            access_key.to_string()
+        };
+        let secret_key = if secret_key.is_empty() {
+            std::env::var("AWS_SECRET_ACCESS_KEY").unwrap_or_default()
+        } else {
+            secret_key.to_string()
+        };
+        let region = if !region.is_empty() {
+            region.to_string()
+        } else if let Ok(env_region) =
+            std::env::var("AWS_DEFAULT_REGION").or_else(|_| std::env::var("AWS_REGION"))
+        {
+            env_region
+        } else {
+            tracing::warn!(
+                backend = name,
+                default = S3_DEFAULT_REGION,
+                "S3 region unset (no arg, no AWS_DEFAULT_REGION/AWS_REGION) — \
+                 falling back to default; set the region explicitly to avoid \
+                 surprise cross-region latency"
+            );
+            S3_DEFAULT_REGION.to_string()
+        };
         Ok(Self {
             backend_name: name.to_string(),
             bucket: bucket.to_string(),
             prefix: prefix.trim_matches('/').to_string(),
-            region: region.to_string(),
-            access_key: access_key.to_string(),
-            secret_key: secret_key.to_string(),
+            region,
+            access_key,
+            secret_key,
             endpoint: endpoint.map(|s| s.to_string()),
             runtime,
+            client,
         })
     }
 
@@ -289,7 +357,7 @@ impl ObjectStore for S3Transport {
         let size = content.len() as u64;
 
         self.runtime.block_on(async {
-            let client = reqwest::Client::new();
+            let client = &self.client;
             let mut req = client.put(&url).body(content_owned);
             for (k, v) in &headers {
                 req = req.header(k.as_str(), v.as_str());
@@ -325,7 +393,7 @@ impl ObjectStore for S3Transport {
         let headers = self.sign_request("GET", &path, "UNSIGNED-PAYLOAD", &now);
 
         self.runtime.block_on(async {
-            let client = reqwest::Client::new();
+            let client = &self.client;
             let mut req = client.get(&url);
             for (k, v) in &headers {
                 req = req.header(k.as_str(), v.as_str());
@@ -359,7 +427,7 @@ impl ObjectStore for S3Transport {
         let headers = self.sign_request("DELETE", &path, "UNSIGNED-PAYLOAD", &now);
 
         self.runtime.block_on(async {
-            let client = reqwest::Client::new();
+            let client = &self.client;
             let mut req = client.delete(&url);
             for (k, v) in &headers {
                 req = req.header(k.as_str(), v.as_str());
@@ -407,7 +475,7 @@ impl ObjectStore for S3Transport {
             self.sign_request_with_copy_source("PUT", &dst_path, &empty_sha, &copy_source, &now);
 
         self.runtime.block_on(async {
-            let client = reqwest::Client::new();
+            let client = &self.client;
             let mut req = client.put(&url);
             for (k, v) in &headers {
                 req = req.header(k.as_str(), v.as_str());
