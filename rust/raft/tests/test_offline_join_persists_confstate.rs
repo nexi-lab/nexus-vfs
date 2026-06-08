@@ -76,14 +76,24 @@ async fn offline_join_persists_confstate_before_returning() {
     let founder_dir = TempDir::new().expect("founder tmpdir");
     let founder_bind = ephemeral_bind_addr();
     let founder_self_addr = founder_bind.clone();
-    let founder_zm = ZoneManager::new(
+    let founder_node_id_seed = nexus_raft::transport::hostname_to_node_id(FOUNDER_HOSTNAME);
+    let founder_zm = ZoneManager::with_node_id(
         FOUNDER_HOSTNAME,
+        founder_node_id_seed,
         founder_dir.path().to_str().expect("utf-8 tmp path"),
         vec![],
         &founder_bind,
         None,
+        // Production nexusd-cluster always passes Some(self_address).
+        // Pre-populating registry.self_address() is what the bootstrap
+        // entry's `context` field reads from — without it the entry
+        // ships with empty context, joiner replay learns ConfState but
+        // not the founder's address, and the L1 cross-machine read
+        // milestone wedges (see RaftConfig::bootstrap_self_address).
+        Some(founder_self_addr.clone()),
+        None,
     )
-    .expect("founder ZoneManager::new");
+    .expect("founder ZoneManager::with_node_id");
 
     founder_zm
         .create_zone(ZONE_ID, vec![])
@@ -110,14 +120,18 @@ async fn offline_join_persists_confstate_before_returning() {
     let joiner_dir = TempDir::new().expect("joiner tmpdir");
     let joiner_bind = ephemeral_bind_addr();
     let joiner_self_addr = joiner_bind.clone();
-    let joiner_zm = ZoneManager::new(
+    let joiner_node_id_seed = nexus_raft::transport::hostname_to_node_id(JOINER_HOSTNAME);
+    let joiner_zm = ZoneManager::with_node_id(
         JOINER_HOSTNAME,
+        joiner_node_id_seed,
         joiner_dir.path().to_str().expect("utf-8 tmp path"),
         vec![],
         &joiner_bind,
         None,
+        Some(joiner_self_addr.clone()),
+        None,
     )
-    .expect("joiner ZoneManager::new");
+    .expect("joiner ZoneManager::with_node_id");
 
     // -------------------------------------------------------------
     // 3. Invoke `bootstrap_or_join_zone` exactly as `run_join` does.
@@ -139,7 +153,7 @@ async fn offline_join_persists_confstate_before_returning() {
     let peer_addrs = vec![peer];
     let joiner_zm_for_task = joiner_zm.clone();
     let joiner_self_addr_for_task = joiner_self_addr.clone();
-    let joiner_node_id = nexus_raft::transport::hostname_to_node_id(JOINER_HOSTNAME);
+    let joiner_node_id = joiner_node_id_seed;
 
     tokio::task::spawn_blocking(move || {
         bootstrap_or_join_zone(
@@ -267,5 +281,46 @@ async fn offline_join_persists_confstate_before_returning() {
          learners: {:?}",
         persisted.conf_state.voters,
         persisted.conf_state.learners,
+    );
+
+    // -------------------------------------------------------------
+    // 6. Stronger contract — the founder's bootstrap log entry at
+    //    index 1 must carry the founder's advertise address in its
+    //    `context` field.  On daemon restart the joiner re-runs the
+    //    apply loop over all committed entries (raft-rs's default
+    //    `applied = first_index - 1 = 0`) which calls
+    //    `node_address_from_conf_context` per entry to repopulate
+    //    `peer_map`.  Without the address in context the joiner
+    //    finishes restart with ConfState=[founder, joiner-learner]
+    //    but no way to dial the founder; the transport loop has no
+    //    heartbeat target and `leader_id` never stabilises locally —
+    //    exactly the symptom the L1 cross-machine read milestone
+    //    was failing on before this commit.
+    // -------------------------------------------------------------
+    let log_entries = joiner_storage
+        .entries(1, 2, None, raft::GetEntriesContext::empty(false))
+        .expect("read joiner log entry 1");
+    let bootstrap_entry = log_entries
+        .first()
+        .expect("joiner's log must contain entry 1 after AppendEntries replay");
+    assert_eq!(
+        bootstrap_entry.entry_type,
+        raft::eraftpb::EntryType::EntryConfChange,
+        "bootstrap entry must be EntryConfChange — observed: {:?}",
+        bootstrap_entry.entry_type,
+    );
+    let cc: raft::eraftpb::ConfChange = protobuf::Message::parse_from_bytes(&bootstrap_entry.data)
+        .expect("decode ConfChange from bootstrap entry");
+    assert_eq!(
+        cc.node_id, founder_node_id,
+        "bootstrap entry must add the founder — observed node_id: {}",
+        cc.node_id,
+    );
+    let cc_address = std::str::from_utf8(&cc.context).expect("context must be valid UTF-8");
+    assert!(
+        cc_address.contains(&founder_self_addr),
+        "bootstrap entry's context must carry the founder's advertise address ({founder_self_addr:?}) \
+         so a joiner's apply populates its peer_map with (founder_id -> founder_address) via \
+         node_address_from_conf_context.  Observed context: {cc_address:?}",
     );
 }
