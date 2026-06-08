@@ -37,7 +37,7 @@ use kernel::kernel::Kernel;
 
 use crate::transport::NodeAddress;
 use crate::zone_meta_store::ZoneMetaStore;
-use crate::ZoneManager;
+use crate::{ZoneHandle, ZoneManager};
 
 /// Node-level random ID filename — opaque random u64 minted at first
 /// daemon boot, persisted across restarts, regenerated after a wipe.
@@ -59,6 +59,16 @@ const JOIN_ZONE_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 /// Per-attempt timeout for the JoinZone RPC during bootstrap.
 const JOIN_ZONE_RPC_TIMEOUT_SECS: u64 = 5;
 const FOUNDER_REJOIN_PROBE_ATTEMPTS: u32 = 3;
+
+/// Upper bound on the post-`JoinZone` wait for the joiner's local
+/// raft state machine to receive + apply the leader's first
+/// AppendEntries.  Bounds offline `nexusd-cluster join` so a stuck
+/// leader / lossy network terminates the CLI with a clear error
+/// rather than silently writing a half-baked data dir.  10 s easily
+/// covers the typical 10 ms tick + replication round-trip; a stalled
+/// AppendEntries past that point is operator-actionable.
+const JOIN_ZONE_APPLY_WAIT: Duration = Duration::from_secs(10);
+const JOIN_ZONE_APPLY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Triple keyed by target zone: `(parent_zone_id, mount_path, global_path)`.
 type CrossZoneMountTuple = (String, String, String);
@@ -672,6 +682,70 @@ fn remove_local_probe_zone(zm: &ZoneManager, zone_id: &str) {
     }
 }
 
+/// Block until the joiner's local raft state machine has received,
+/// committed, and persisted the leader's first AppendEntries after
+/// a successful `JoinZone` RPC.
+///
+/// Contract this enforces (and the SSOT for it):
+///
+/// The JoinZone RPC returns "success" the moment the leader's
+/// `AddNode`/`AddLearnerNode` proposal commits on the leader's log.
+/// At that instant the joiner's persisted on-disk state still
+/// reflects the pre-join `skip_bootstrap=true` registration —
+/// `peers=0`, no `leader_id`, no log entries.  Authoritative
+/// `ConfState` only lands on the joiner's disk once raft-rs replays
+/// the leader's append-entries through its `Ready` cycle: the
+/// driver loop calls `apply_entries`, which invokes
+/// `storage.set_conf_state(&cs)` synchronously for the conf-change
+/// entry, then `update_cached_status` refreshes `cached_commit_index`
+/// from `raft_log.committed`.  Order matters: `cached_commit_index`
+/// transitions 0 → ≥1 AFTER the `set_conf_state` write returns Ok.
+///
+/// Without this gate, an offline `nexusd-cluster join` CLI that
+/// returns immediately after the RPC ack leaves the data dir in a
+/// "solo cluster of self" state.  The next daemon restart loads
+/// the pre-snapshot state, treats the zone as 1-voter (self only),
+/// and floods `raft: cannot step as peer not found` when the
+/// leader's heartbeats finally arrive — because the leader was
+/// never added to the joiner's `Progress` map.
+///
+/// Termination signal: `leader_id().is_some()` (we have heard from
+/// the leader) AND `commit_index() > 0` (the apply pipeline has
+/// completed at least one cycle, which by construction includes the
+/// conf-change containing our membership — `applied_index` would be
+/// the stricter signal but it only advances for data entries, since
+/// `FullStateMachine::apply(Noop)` short-circuits past
+/// `last_applied.store(...)`; conf-only commits stay invisible to
+/// it).  The pair is what `bootstrap_or_join_zone`'s "snapshot has
+/// installed authoritative ConfState locally" comment promised —
+/// this function makes the claim true instead of aspirational.
+fn wait_for_join_to_apply(zh: &ZoneHandle, zone_id: &str, timeout: Duration) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        let leader = zh.leader_id();
+        let commit = zh.commit_index();
+        if leader.is_some() && commit > 0 {
+            tracing::info!(
+                zone = %zone_id,
+                leader_id = ?leader,
+                commit_index = commit,
+                "ConfState installed; local raft state caught up to leader",
+            );
+            return Ok(());
+        }
+        std::thread::sleep(JOIN_ZONE_APPLY_POLL_INTERVAL);
+    }
+    Err(format!(
+        "JoinZone RPC succeeded on the leader but joiner's local raft \
+         state did not install the resulting ConfState within {timeout:?} \
+         (leader_id={:?}, commit_index={}).  Data dir would be left in a \
+         pre-membership state — daemon restart would treat the zone as a \
+         solo cluster of self.  Refusing to exit on stale state.",
+        zh.leader_id(),
+        zh.commit_index(),
+    ))
+}
+
 // Same rationale as `bootstrap_or_join_zone` above — every arg is a
 // primitive descriptor the caller already names, bundling them adds
 // boilerplate without expressive gain.
@@ -727,8 +801,25 @@ fn attempt_join_zone_round(
                         endpoint = %endpoint,
                         zone = %zone_id,
                         node_id,
-                        "joined zone via leader",
+                        "joined zone via leader — waiting for ConfState install",
                     );
+                    // The leader's `AddNode`/`AddLearnerNode` commit
+                    // is asynchronous w.r.t. our local raft state.
+                    // Block here until the resulting AppendEntries
+                    // lands + applies on this node, so the data dir
+                    // exits the join with authoritative ConfState
+                    // persisted.  Without this, the offline
+                    // `nexusd-cluster join` CLI would return rc=0
+                    // while leaving the joiner in a "solo of self"
+                    // state on disk — see `wait_for_join_to_apply`
+                    // for the full failure mode.
+                    let zh = zm.get_zone(zone_id).ok_or_else(|| {
+                        format!(
+                            "zone '{zone_id}' missing from registry after \
+                             successful JoinZone — internal invariant broken",
+                        )
+                    })?;
+                    wait_for_join_to_apply(&zh, zone_id, JOIN_ZONE_APPLY_WAIT)?;
                     return Ok(());
                 }
                 Ok(result) => {
