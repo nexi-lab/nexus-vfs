@@ -682,9 +682,9 @@ fn remove_local_probe_zone(zm: &ZoneManager, zone_id: &str) {
     }
 }
 
-/// Block until the joiner's local raft state machine has received +
-/// applied the leader's first AppendEntries after a successful
-/// `JoinZone` RPC.
+/// Block until the joiner's local raft state machine has received,
+/// committed, and persisted the leader's first AppendEntries after
+/// a successful `JoinZone` RPC.
 ///
 /// Contract this enforces (and the SSOT for it):
 ///
@@ -694,8 +694,12 @@ fn remove_local_probe_zone(zm: &ZoneManager, zone_id: &str) {
 /// reflects the pre-join `skip_bootstrap=true` registration —
 /// `peers=0`, no `leader_id`, no log entries.  Authoritative
 /// `ConfState` only lands on the joiner's disk once raft-rs replays
-/// the leader's append-entries through its `Ready` cycle, which
-/// requires the local tick loop to advance at least once.
+/// the leader's append-entries through its `Ready` cycle: the
+/// driver loop calls `apply_entries`, which invokes
+/// `storage.set_conf_state(&cs)` synchronously for the conf-change
+/// entry, then `update_cached_status` refreshes `cached_commit_index`
+/// from `raft_log.committed`.  Order matters: `cached_commit_index`
+/// transitions 0 → ≥1 AFTER the `set_conf_state` write returns Ok.
 ///
 /// Without this gate, an offline `nexusd-cluster join` CLI that
 /// returns immediately after the RPC ack leaves the data dir in a
@@ -706,12 +710,15 @@ fn remove_local_probe_zone(zm: &ZoneManager, zone_id: &str) {
 /// never added to the joiner's `Progress` map.
 ///
 /// Termination signal: `leader_id().is_some()` (we have heard from
-/// the leader) AND `applied_index() > 0` (we have applied at least
-/// one entry through the storage layer, which means the conf-change
-/// containing our membership has been persisted).  The pair is what
-/// `bootstrap_or_join_zone`'s "snapshot has installed authoritative
-/// ConfState locally" comment promised — this function makes the
-/// claim true instead of aspirational.
+/// the leader) AND `commit_index() > 0` (the apply pipeline has
+/// completed at least one cycle, which by construction includes the
+/// conf-change containing our membership — `applied_index` would be
+/// the stricter signal but it only advances for data entries, since
+/// `FullStateMachine::apply(Noop)` short-circuits past
+/// `last_applied.store(...)`; conf-only commits stay invisible to
+/// it).  The pair is what `bootstrap_or_join_zone`'s "snapshot has
+/// installed authoritative ConfState locally" comment promised —
+/// this function makes the claim true instead of aspirational.
 fn wait_for_join_to_apply(
     zh: &ZoneHandle,
     zone_id: &str,
@@ -720,12 +727,12 @@ fn wait_for_join_to_apply(
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
         let leader = zh.leader_id();
-        let applied = zh.applied_index();
-        if leader.is_some() && applied > 0 {
+        let commit = zh.commit_index();
+        if leader.is_some() && commit > 0 {
             tracing::info!(
                 zone = %zone_id,
                 leader_id = ?leader,
-                applied_index = applied,
+                commit_index = commit,
                 "ConfState installed; local raft state caught up to leader",
             );
             return Ok(());
@@ -735,11 +742,11 @@ fn wait_for_join_to_apply(
     Err(format!(
         "JoinZone RPC succeeded on the leader but joiner's local raft \
          state did not install the resulting ConfState within {timeout:?} \
-         (leader_id={:?}, applied_index={}).  Data dir would be left in a \
+         (leader_id={:?}, commit_index={}).  Data dir would be left in a \
          pre-membership state — daemon restart would treat the zone as a \
          solo cluster of self.  Refusing to exit on stale state.",
         zh.leader_id(),
-        zh.applied_index(),
+        zh.commit_index(),
     ))
 }
 
