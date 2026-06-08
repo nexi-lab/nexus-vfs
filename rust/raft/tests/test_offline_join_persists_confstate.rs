@@ -122,8 +122,17 @@ async fn offline_join_persists_confstate_before_returning() {
     //    The function is sync; the production CLI wraps it in
     //    spawn_blocking, so mirror that shape here so the test
     //    actually exercises the CLI-side contract.
+    //
+    //    Peer-string format mirrors runbook §3b's
+    //    `<A_node_id>@<A_tailscale_ip>:2126` — `NodeAddress::parse`
+    //    will derive the node id from `hostname_to_node_id(host)` if
+    //    no `id@` prefix is given, which on localhost-IP test setups
+    //    produces a node id that does NOT match the founder's actual
+    //    id and breaks transport routing.  Carry the founder's real
+    //    id explicitly.
     // -------------------------------------------------------------
-    let peer = NodeAddress::parse(&founder_self_addr, /* use_tls */ false)
+    let founder_peer_str = format!("{founder_node_id}@{founder_self_addr}");
+    let peer = NodeAddress::parse(&founder_peer_str, /* use_tls */ false)
         .expect("parse founder peer addr");
     let peer_addrs = vec![peer];
     let joiner_zm_for_task = joiner_zm.clone();
