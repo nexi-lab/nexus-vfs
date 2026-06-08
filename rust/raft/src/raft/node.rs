@@ -1923,10 +1923,20 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
     /// ``apply``), and ``ZoneConsensus::applied_index_atom`` borrows
     /// that Arc. Keeping the SSOT on the state machine avoids shadowing.
     fn update_cached_status(&self) {
-        self.cached_leader_id
-            .store(self.raw_node.raft.leader_id, Ordering::Relaxed);
-        self.cached_term
-            .store(self.raw_node.raft.term, Ordering::Relaxed);
+        let lid = self.raw_node.raft.leader_id;
+        let term = self.raw_node.raft.term;
+        let prev_cached = self.cached_leader_id.load(Ordering::Relaxed);
+        if prev_cached != lid {
+            tracing::trace!(
+                self_id = self.config.id,
+                prev_cached_leader_id = prev_cached,
+                raft_leader_id = lid,
+                raft_term = term,
+                "update_cached_status.leader_change"
+            );
+        }
+        self.cached_leader_id.store(lid, Ordering::Relaxed);
+        self.cached_term.store(term, Ordering::Relaxed);
         self.cached_commit_index
             .store(self.raw_node.raft.raft_log.committed, Ordering::Relaxed);
         self.cached_last_index
