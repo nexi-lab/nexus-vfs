@@ -573,31 +573,36 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
                     RaftError::Storage(format!("failed to set initial ConfState: {e}"))
                 })?;
 
-                let mut cc = ConfChange::default();
-                cc.set_change_type(ConfChangeType::AddNode);
-                cc.node_id = config.id;
+                let cc = ConfChange {
+                    change_type: ConfChangeType::AddNode.into(),
+                    node_id: config.id,
+                    ..Default::default()
+                };
                 let cc_data = protobuf::Message::write_to_bytes(&cc).map_err(|e| {
                     RaftError::Storage(format!("encode bootstrap AddNode ConfChange: {e}"))
                 })?;
 
-                let mut bootstrap_entry = Entry::default();
-                bootstrap_entry.set_entry_type(EntryType::EntryConfChange);
-                bootstrap_entry.term = 1;
-                bootstrap_entry.index = 1;
-                bootstrap_entry.data = cc_data.into();
-                bootstrap_entry.context = Default::default();
+                let bootstrap_entry = Entry {
+                    entry_type: EntryType::EntryConfChange.into(),
+                    term: 1,
+                    index: 1,
+                    data: cc_data.into(),
+                    ..Default::default()
+                };
 
                 storage.append(&[bootstrap_entry]).map_err(|e| {
                     RaftError::Storage(format!("append bootstrap AddNode entry: {e}"))
                 })?;
 
-                let mut hs = HardState::default();
-                hs.term = 1;
-                hs.commit = 1;
-                hs.vote = 0;
-                storage.set_hard_state(&hs).map_err(|e| {
-                    RaftError::Storage(format!("set bootstrap hard state: {e}"))
-                })?;
+                let hs = HardState {
+                    term: 1,
+                    commit: 1,
+                    vote: 0,
+                    ..Default::default()
+                };
+                storage
+                    .set_hard_state(&hs)
+                    .map_err(|e| RaftError::Storage(format!("set bootstrap hard state: {e}")))?;
 
                 tracing::info!(
                     "Bootstrapped ConfState with voters: {:?}; \
