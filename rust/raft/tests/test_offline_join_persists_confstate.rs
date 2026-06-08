@@ -48,8 +48,10 @@
 #![cfg(all(feature = "grpc", has_protos))]
 
 use nexus_raft::distributed_coordinator::bootstrap_or_join_zone;
+use nexus_raft::raft::RaftStorage;
 use nexus_raft::transport::NodeAddress;
 use nexus_raft::ZoneManager;
+use raft::Storage;
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -185,9 +187,85 @@ async fn offline_join_persists_confstate_before_returning() {
          on-disk ConfState was still the skip_bootstrap stub"
     );
 
+    // Capture the joiner's zone path BEFORE shutdown so we can re-open
+    // the RaftStorage in isolation.
+    let joiner_zone_raft_path = joiner_dir.path().join(ZONE_ID).join("raft");
+
     // Cleanup — ordered so neither runtime drop races the other.
     drop(joiner_handle);
     drop(founder_handle);
     joiner_zm.shutdown();
     founder_zm.shutdown();
+
+    // -------------------------------------------------------------
+    // 5. Stricter contract check — read the joiner's PERSISTED
+    //    ConfState directly off disk and assert it contains the
+    //    founder as voter.
+    //
+    //    Why this is the right SSOT signal:
+    //
+    //    Pre-fix #31 the wait gate (commit_index > 0 + leader_id
+    //    Some) could fire while the joiner's actual ConfState was
+    //    still empty.  raft-rs's apply path silently skips a
+    //    rejected ConfChange ("removed all voters" — see
+    //    raft-0.7.0/src/confchange/changer.rs:181) but still
+    //    advances commit_index.  So the gate said "applied" while
+    //    the storage's ConfState voters list was still [], which
+    //    meant the joiner thought it was a standalone cluster of
+    //    nothing and downstream catchup never converged.
+    //
+    //    The fix seeds the joiner's local ConfState with the
+    //    peer-list voter id BEFORE raft starts (see
+    //    `ZoneRaftRegistry::join_zone` in
+    //    `rust/raft/src/raft/zone_registry.rs`).  Replay of the
+    //    leader's AppendEntries then applies AddLearnerNode-for-
+    //    self on top of voters=[founder] → voters=[founder],
+    //    learners=[joiner] — no rejection, ConfState is consistent
+    //    with the leader's authoritative view.
+    // -------------------------------------------------------------
+    // `shutdown()` signals the transport loop + registry workers but the
+    // underlying redb file lock is released only when the last
+    // `Arc<RaftStorage>` drops on the worker threads.  A fixed-duration
+    // sleep here would be flaky — instead, poll until the file is
+    // openable or a generous deadline elapses.  If the deadline trips,
+    // that's a real shutdown bug to surface, not a timing flake.
+    let lock_release_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let joiner_storage = loop {
+        match RaftStorage::open(&joiner_zone_raft_path) {
+            Ok(s) => break s,
+            Err(e) if std::time::Instant::now() < lock_release_deadline => {
+                let _ = e;
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => panic!(
+                "joiner raft storage still locked 5s after ZoneManager::shutdown() — \
+                 likely a shutdown bug, not a test timing issue: {e}",
+            ),
+        }
+    };
+    let persisted = joiner_storage
+        .initial_state()
+        .expect("read joiner initial state");
+    assert!(
+        persisted.conf_state.voters.contains(&founder_node_id),
+        "joiner's persisted ConfState must contain the founder as a voter \
+         (post-replay of AddLearnerNode-for-self should not remove the only \
+         voter).  Pre-fix this list was empty because (a) the joiner's local \
+         ConfState was never seeded with the leader, and (b) raft-rs's \
+         Changer::simple rejects any ConfChange that leaves voters empty, \
+         silently dropping the AddLearnerNode-for-self entry.  \
+         Observed voters: {:?}, learners: {:?}; expected founder id: {}",
+        persisted.conf_state.voters,
+        persisted.conf_state.learners,
+        founder_node_id,
+    );
+    assert!(
+        persisted.conf_state.learners.contains(&joiner_node_id),
+        "joiner's persisted ConfState must list the joiner itself as a learner \
+         (the AddLearnerNode entry that was committed by the leader for \
+         joiner_node_id={joiner_node_id} during JoinZone).  Observed voters: {:?}, \
+         learners: {:?}",
+        persisted.conf_state.voters,
+        persisted.conf_state.learners,
+    );
 }
