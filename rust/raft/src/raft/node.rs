@@ -1438,15 +1438,30 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         while let Ok(msg) = self.msg_rx.try_recv() {
             match msg {
                 RaftMsg::Step { msg } => {
+                    let msg_from = msg.from;
+                    let msg_to = msg.to;
+                    let msg_type = msg.get_msg_type();
+                    let msg_term = msg.term;
                     tracing::trace!(
-                        from = msg.from,
-                        to = msg.to,
-                        msg_type = ?msg.get_msg_type(),
-                        "raft.driver.step"
+                        from = msg_from,
+                        to = msg_to,
+                        msg_type = ?msg_type,
+                        msg_term,
+                        "raft.driver.step.before"
                     );
                     if let Err(e) = self.raw_node.step(msg) {
                         tracing::warn!("raft step error: {}", e);
                     }
+                    tracing::trace!(
+                        msg_from,
+                        msg_to,
+                        ?msg_type,
+                        msg_term,
+                        post_leader_id = self.raw_node.raft.leader_id,
+                        post_term = self.raw_node.raft.term,
+                        post_state = ?self.raw_node.raft.state,
+                        "raft.driver.step.after"
+                    );
                 }
                 RaftMsg::Propose { data, tx, .. } => {
                     // Generate the real proposal ID here in the driver
