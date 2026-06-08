@@ -164,6 +164,26 @@ pub struct RaftConfig {
     /// the leader to send a snapshot with the correct voter set.
     /// Per raft contract: joining nodes must NOT bootstrap themselves.
     pub skip_bootstrap: bool,
+
+    /// Founder's advertise address — embedded in the bootstrap
+    /// `AddNode(self)` ConfChange's `context` field so future joiners,
+    /// after replaying that entry, populate their local peer map with
+    /// `(self.id -> bootstrap_self_address)` via the same code path
+    /// runtime `AddNode`/`AddLearnerNode` entries use
+    /// (`node_address_from_conf_context`).  Without this address the
+    /// bootstrap entry is structurally identical to a runtime
+    /// `AddNode` minus an address book entry — joiner reconstructs
+    /// ConfState correctly but has no way to reach the founder, so the
+    /// transport loop never delivers heartbeats and `leader_id` never
+    /// stabilises on the joiner.
+    ///
+    /// Empty `String` is treated as "no address known" — bootstrap
+    /// then writes the entry with an empty `context` (degraded mode,
+    /// joiner must learn the address via inbound transport on first
+    /// contact).  Callers should set this from `ZoneRaftRegistry::self_address()`
+    /// which is populated by `ZoneManager::new` before any zone is
+    /// registered.
+    pub bootstrap_self_address: String,
 }
 
 impl Default for RaftConfig {
@@ -178,6 +198,7 @@ impl Default for RaftConfig {
             is_witness: false,
             tick_interval: Duration::from_millis(10),
             skip_bootstrap: false,
+            bootstrap_self_address: String::new(),
         }
     }
 }
@@ -573,9 +594,19 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
                     RaftError::Storage(format!("failed to set initial ConfState: {e}"))
                 })?;
 
+                // Embed the founder's advertise address in `context` so
+                // a joiner's apply of this entry populates its peer map
+                // with `(config.id -> bootstrap_self_address)` via the
+                // same path runtime conf changes use (see
+                // `node_address_from_conf_context` + the apply branch
+                // around line 1714).  Without this the joiner replays
+                // ConfState correctly but never learns how to reach the
+                // founder; the transport loop has no heartbeat target
+                // and `leader_id` never stabilises.
                 let cc = ConfChange {
                     change_type: ConfChangeType::AddNode,
                     node_id: config.id,
+                    context: config.bootstrap_self_address.as_bytes().to_vec().into(),
                     ..Default::default()
                 };
                 let cc_data = protobuf::Message::write_to_bytes(&cc).map_err(|e| {
