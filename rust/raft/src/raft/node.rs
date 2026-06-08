@@ -51,7 +51,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use raft::eraftpb::{
-    ConfChange, ConfChangeType, ConfChangeV2, ConfState, Entry, EntryType, Message,
+    ConfChange, ConfChangeType, ConfChangeV2, ConfState, Entry, EntryType, HardState, Message,
 };
 use raft::{Config, RawNode, Storage};
 use slog::{o, Logger};
@@ -534,9 +534,37 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
 
             if needs_bootstrap {
                 // Bootstrap: 1-voter ConfState consisting of self only.
-                // Joining nodes (skip_bootstrap=true) skip this branch;
-                // they receive the authoritative ConfState via snapshot
-                // from the leader (per raft contract).
+                // Joining nodes (skip_bootstrap=true) skip this branch.
+                //
+                // The bootstrap writes BOTH the runtime ConfState (so
+                // raft-rs can elect at startup — Configuration::new
+                // requires a non-empty voter set) AND a matching
+                // AddNode(self) entry at log index 1 with hard_state
+                // commit advanced to cover it.  These are two views of
+                // the same fact: every ConfState change is also a log
+                // entry.
+                //
+                // Why the log entry matters: a future joiner catches up
+                // via plain AppendEntries replay.  Without an AddNode
+                // entry to apply, the joiner's local ConfState stays
+                // empty through replay; the eventual AddLearnerNode-
+                // for-self entry then applies on top of voters=[] and
+                // raft-rs's Changer::simple rejects with "removed all
+                // voters" (raft-0.7.0 src/confchange/changer.rs:181).
+                // Logging AddNode(self) at bootstrap turns the log
+                // into the full SSOT for ConfState — joiner replay
+                // reconstructs exactly what the leader's authoritative
+                // view holds, no out-of-band seeding required.
+                //
+                // raft-rs's normal leader-init NoOp will land at index
+                // 2 with the post-election term; entry 1 here is
+                // committed before any election runs (term=1, the term
+                // raft-rs's first election will adopt — Configuration
+                // accepts both equal- and lower-term log prefixes when
+                // a candidate steps up).  Apply of entry 1 is
+                // idempotent: AddNode(self) on a ConfState that
+                // already includes self is a no-op via Changer's
+                // membership-set semantics.
                 let cs = ConfState {
                     voters: voters.clone(),
                     ..Default::default()
@@ -544,11 +572,66 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
                 storage.set_conf_state(&cs).map_err(|e| {
                     RaftError::Storage(format!("failed to set initial ConfState: {e}"))
                 })?;
-                tracing::info!("Bootstrapped ConfState with voters: {:?}", voters);
+
+                let mut cc = ConfChange::default();
+                cc.set_change_type(ConfChangeType::AddNode);
+                cc.node_id = config.id;
+                let cc_data = protobuf::Message::write_to_bytes(&cc).map_err(|e| {
+                    RaftError::Storage(format!("encode bootstrap AddNode ConfChange: {e}"))
+                })?;
+
+                let mut bootstrap_entry = Entry::default();
+                bootstrap_entry.set_entry_type(EntryType::EntryConfChange);
+                bootstrap_entry.term = 1;
+                bootstrap_entry.index = 1;
+                bootstrap_entry.data = cc_data.into();
+                bootstrap_entry.context = Default::default();
+
+                storage.append(&[bootstrap_entry]).map_err(|e| {
+                    RaftError::Storage(format!("append bootstrap AddNode entry: {e}"))
+                })?;
+
+                let mut hs = HardState::default();
+                hs.term = 1;
+                hs.commit = 1;
+                hs.vote = 0;
+                storage.set_hard_state(&hs).map_err(|e| {
+                    RaftError::Storage(format!("set bootstrap hard state: {e}"))
+                })?;
+
+                tracing::info!(
+                    "Bootstrapped ConfState with voters: {:?}; \
+                     persisted AddNode(self) log entry at index 1, term 1, commit 1",
+                    voters
+                );
             }
         }
 
-        let raft_config = config.to_raft_config();
+        let mut raft_config = config.to_raft_config();
+
+        // If the founder bootstrap wrote AddNode(self) at log index 1
+        // (the `if needs_bootstrap` branch above), mark it pre-applied so
+        // raft-rs's `hup` does not block the first election with "still
+        // pending configuration changes to apply" — see
+        // raft-0.7.0/src/raft.rs:1551.  The bootstrap entry is
+        // semantically already applied: `storage.set_conf_state([self])`
+        // ran before this RawNode is constructed, so the application
+        // state (ConfState) already reflects what the entry says.
+        // `c.applied` on `Raft::new` just calls
+        // `r.commit_apply(c.applied)` which advances `raft_log.applied`
+        // past the bootstrap entry — Aaron-correct, no replay drift.
+        let initial_state_after_bootstrap = storage
+            .initial_state()
+            .map_err(|e| RaftError::Storage(e.to_string()))?;
+        if initial_state_after_bootstrap.hard_state.commit > 0
+            && !initial_state_after_bootstrap.conf_state.voters.is_empty()
+            && initial_state.conf_state.voters.is_empty()
+        {
+            // Fresh-bootstrap case: there was no ConfState before
+            // (initial_state was empty above) AND now there's a
+            // committed log entry (we wrote one).  Mark it applied.
+            raft_config.applied = initial_state_after_bootstrap.hard_state.commit;
+        }
 
         // Create a discard logger for raft-rs (we use tracing for our own logging)
         let logger = Logger::root(slog::Discard, o!());
