@@ -251,6 +251,12 @@ impl ZoneRaftRegistry {
         let config = RaftConfig {
             id: self.node_id,
             peers: peer_ids,
+            // Carry the registry's advertise address through to the
+            // bootstrap `AddNode(self)` entry's `context` field so
+            // joiners that later replay the log learn how to dial the
+            // founder (see `RaftConfig::bootstrap_self_address` for
+            // the rationale).
+            bootstrap_self_address: self.self_address(),
             ..Default::default()
         };
 
