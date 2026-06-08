@@ -16,9 +16,11 @@
 //!
 //! The fix lives in `attempt_join_zone_round`: after a successful
 //! `JoinZone` RPC, block until `leader_id().is_some()` AND
-//! `applied_index() > 0` (the conf-change containing the joiner's
-//! membership has been received, applied, and persisted by raft-rs's
-//! storage layer).
+//! `commit_index() > 0` (the conf-change containing the joiner's
+//! membership has been committed by raft-rs's apply loop, which
+//! synchronously invokes `storage.set_conf_state(&cs)` for the
+//! conf-change entry before `update_cached_status` refreshes
+//! `cached_commit_index`).
 //!
 //! This test pins both contract points by:
 //!
@@ -29,12 +31,19 @@
 //!   4. Asserting — IMMEDIATELY after the call returns, without any
 //!      additional sleep — that the joiner's local raft state reflects
 //!      the AddLearnerNode: `leader_id` is `Some(founder_id)` and
-//!      `applied_index > 0`.
+//!      `commit_index > 0`.
 //!
 //! Pre-fix the assertion would fail (both reads return defaults
 //! because the leader's first AppendEntries hasn't landed yet).
 //! Post-fix `bootstrap_or_join_zone` blocks until the conditions hold,
 //! so the immediate assertion always passes.
+//!
+//! `applied_index` is NOT a usable signal here: `FullStateMachine`
+//! only advances `last_applied` in the metadata-write path of
+//! `sm.apply`, which conf-change entries bypass via `Command::Noop`.
+//! A conf-only sequence would leave `applied_index` at 0 forever.
+//! `commit_index` is the SSOT for "the apply_entries call (and its
+//! set_conf_state write) has fired".
 
 #![cfg(all(feature = "grpc", has_protos))]
 
@@ -148,7 +157,7 @@ async fn offline_join_persists_confstate_before_returning() {
         .expect("joiner zone registered post-join");
 
     let observed_leader = joiner_handle.leader_id();
-    let observed_applied = joiner_handle.applied_index();
+    let observed_commit = joiner_handle.commit_index();
 
     assert_eq!(
         observed_leader,
@@ -159,10 +168,12 @@ async fn offline_join_persists_confstate_before_returning() {
          before the leader's first heartbeat arrived"
     );
     assert!(
-        observed_applied > 0,
-        "joiner's applied_index must be >0 before the CLI exits — \
+        observed_commit > 0,
+        "joiner's commit_index must be >0 before the CLI exits — \
          pre-fix it was 0 because the conf-change entry containing \
-         the joiner's membership had not been applied to storage yet"
+         the joiner's membership had not been processed by raft-rs's \
+         apply loop, so `set_conf_state` had not been called and the \
+         on-disk ConfState was still the skip_bootstrap stub"
     );
 
     // Cleanup — ordered so neither runtime drop races the other.

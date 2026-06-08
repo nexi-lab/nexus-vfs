@@ -719,11 +719,7 @@ fn remove_local_probe_zone(zm: &ZoneManager, zone_id: &str) {
 /// it).  The pair is what `bootstrap_or_join_zone`'s "snapshot has
 /// installed authoritative ConfState locally" comment promised —
 /// this function makes the claim true instead of aspirational.
-fn wait_for_join_to_apply(
-    zh: &ZoneHandle,
-    zone_id: &str,
-    timeout: Duration,
-) -> Result<(), String> {
+fn wait_for_join_to_apply(zh: &ZoneHandle, zone_id: &str, timeout: Duration) -> Result<(), String> {
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
         let leader = zh.leader_id();
