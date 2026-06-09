@@ -1,10 +1,17 @@
 name: Repo Boundary
 
 # DRY between nexus + nexus-vfs.  This repo holds the kernel tier
-# (contracts / lib / transport / kernel / backends / raft +
-# profiles/cluster + proto).  Service-tier code lives in nexus
-# (rust/services, rust/profiles/vault) and MUST NOT reappear here —
-# the dual-repo split was made specifically to prevent that drift.
+# (contracts / lib / transport / kernel / backends source crate / raft
+# + profiles/cluster + proto).  Service-tier code lives in nexus
+# (rust/services + its dylib sub-crates; rust/backends/local-connector
+# + future driver-plugin dylibs) and MUST NOT reappear here — the
+# dual-repo split was made specifically to prevent that drift.
+#
+# `rust/backends/` itself is shared at the directory level: this repo
+# owns the source crate (Cargo.toml + src/ at the directory root);
+# nexus owns the driver-plugin dylib sub-crates underneath.  The gate
+# below blocks every sub-crate nexus already publishes, so a drift
+# moving one into nexus-vfs trips immediately.
 #
 # Companion gate in nexus repo forbids the kernel-tier paths.  Either
 # gate firing means the cross-repo boundary is being violated; the
@@ -24,9 +31,14 @@ jobs:
       - name: Forbid service-tier paths
         run: |
           set -e
+          # rust/services covers both the service-crate source and the
+          # service-plugin dylib sub-crates that sit under it
+          # (e.g. rust/services/vault/).  Driver-plugin dylibs live
+          # next to the kernel-tier `backends` source crate at
+          # rust/backends/<name>/ and are listed individually.
           forbidden=(
             rust/services
-            rust/profiles/vault
+            rust/backends/local-connector
           )
           violations=()
           for p in "${forbidden[@]}"; do
