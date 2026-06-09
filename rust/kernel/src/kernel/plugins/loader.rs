@@ -180,7 +180,12 @@ impl ObjectStore for DylibObjectStore {
         })?;
 
         let rc = unsafe {
-            (self.write_fn)(self.handle, path_c.as_ptr(), content.as_ptr(), content.len())
+            (self.write_fn)(
+                self.handle,
+                path_c.as_ptr(),
+                content.as_ptr(),
+                content.len(),
+            )
         };
 
         match rc {
@@ -199,7 +204,10 @@ impl ObjectStore for DylibObjectStore {
             rc if rc == PluginResult::InvalidArgument as i32 => {
                 Err(StorageError::IOError(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    format!("driver '{}' rejected write to '{content_id}'", self.drv_name),
+                    format!(
+                        "driver '{}' rejected write to '{content_id}'",
+                        self.drv_name
+                    ),
                 )))
             }
             rc => Err(StorageError::IOError(std::io::Error::other(format!(
@@ -223,14 +231,8 @@ impl ObjectStore for DylibObjectStore {
         let mut out_buf: *mut u8 = std::ptr::null_mut();
         let mut out_len: usize = 0;
 
-        let rc = unsafe {
-            (self.read_fn)(
-                self.handle,
-                path_c.as_ptr(),
-                &mut out_buf,
-                &mut out_len,
-            )
-        };
+        let rc =
+            unsafe { (self.read_fn)(self.handle, path_c.as_ptr(), &mut out_buf, &mut out_len) };
 
         match rc {
             0 => {
@@ -465,8 +467,8 @@ impl PluginLoader {
                 .map_err(|e| format!("symbol {}: {e}", nexus_plugin_abi::symbols::DRIVER_DESTROY))?
         };
 
-        let config_c = CString::new(config_json)
-            .map_err(|_| "config_json contains null byte".to_string())?;
+        let config_c =
+            CString::new(config_json).map_err(|_| "config_json contains null byte".to_string())?;
 
         let handle = unsafe { create_fn(kernel_handle as *const KernelHandle, config_c.as_ptr()) };
         if handle.is_null() {
