@@ -99,19 +99,26 @@ struct CommonArgs {
     ///
     /// Syntax: `<plugin-name>:<zone-id>:<vfs-path>:<config-json>`
     ///
-    /// Example:
+    /// Example (single-node, root zone):
+    /// `--mount-driver local-connector:root:/tasks:{"local_root":"/home/me/.claude/tasks"}`
+    ///
+    /// Example (separate zone):
     /// `--mount-driver local-connector:my-docs:/files:{"local_root":"/home/me/docs"}`
     ///
     /// The plugin must already be loaded (drop its `.so` into
-    /// `--plugin-dir` first).  `<zone-id>` is the non-root zone the
-    /// mount lives in; `<config-json>` is passed verbatim to
+    /// `--plugin-dir` first).  `<vfs-path>` may live in any zone the
+    /// operator chooses (root for node-local single-canonical
+    /// routing, a separate raft zone when federation extends the
+    /// mount); `<config-json>` is passed verbatim to
     /// `nexus_driver_create` and may contain its own colons (the
     /// 4-part split is left-anchored to the first three `:`).
     ///
-    /// `<zone-id>` must be non-root — root is reserved for
-    /// kernel-managed mounts (PathLocalBackend at `/` and the
-    /// DT_MOUNT entries installed at `/<mount>` by the federation
-    /// static-topology bootstrap).
+    /// `<vfs-path>` must not be `/`.  The boot-time
+    /// `PathLocalBackend` already owns that mount point, and
+    /// `Kernel::add_mount`'s `rebind_missing_backends` branch keys
+    /// on `(zone="root", mount_point="/")` — replacing that mount
+    /// silently re-points every backend-less federation child mount
+    /// at the operator's driver.
     ///
     /// Loaded-but-not-mounted is a no-op: `--plugin-dir` registers
     /// the dylib's name but does not mutate the VFS topology.  Only
@@ -141,13 +148,15 @@ struct CommonArgs {
 /// is the JSON config so embedded `:` in values (which JSON object
 /// syntax always contains) survives the split.
 ///
-/// `zone` must be non-root.  The root zone is reserved for
-/// kernel-managed mounts (the boot-time `PathLocalBackend` at `/`,
-/// and the DT_MOUNT entries the federation static-topology bootstrap
-/// installs at `/<mount>` for each federated zone).  Operator-defined
-/// driver mounts live in their own non-root zone — single-voter for
-/// node-local "expose host fs into VFS" use cases, or multi-voter
-/// for cross-machine sharing.
+/// `vfs-path` must not be the root path `/`.  The boot-time
+/// `PathLocalBackend` already owns that mount point, and
+/// `Kernel::add_mount`'s `rebind_missing_backends` branch keys
+/// specifically on `(zone="root", mount_point="/")` — overwriting
+/// that mount silently re-points every backend-less federation child
+/// mount at the operator's driver.  Any non-root path is fine;
+/// `zone` is operator-supplied with no kernel-imposed constraint
+/// (root is the common single-node case, a separate raft zone is the
+/// federated case).
 #[derive(Debug, Clone)]
 struct MountDriverSpec {
     name: String,
@@ -179,18 +188,16 @@ fn parse_mount_driver_spec(raw: &str) -> Result<MountDriverSpec, String> {
             "--mount-driver: name / zone / vfs-path / config-json must all be non-empty in '{raw}'"
         ));
     }
-    if zone_id == contracts::ROOT_ZONE_ID {
-        return Err(format!(
-            "--mount-driver: zone '{}' is reserved for kernel-managed mounts \
-             (PathLocalBackend + federation DT_MOUNTs).  Operator mounts must \
-             use a non-root zone (single-voter for node-local exposure, \
-             multi-voter for cross-machine sharing).",
-            contracts::ROOT_ZONE_ID,
-        ));
-    }
     if !vfs_path.starts_with('/') {
         return Err(format!(
             "--mount-driver: vfs-path must start with '/' in '{raw}' (got '{vfs_path}')"
+        ));
+    }
+    if vfs_path == "/" {
+        return Err(format!(
+            "--mount-driver: vfs-path '/' is reserved for the boot-time \
+             PathLocalBackend mount.  Operator-defined driver mounts must \
+             use a non-root path (e.g. '/tasks', '/external/blobs').",
         ));
     }
     Ok(MountDriverSpec {
@@ -632,18 +639,17 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     //      `RaftDistributedCoordinator::install_with_kernel` has just
     //      flipped `is_initialized` to true.  That gates the
     //      `kernel.mount(..)` zone-create-on-mount path inside
-    //      `sys_setattr DT_MOUNT` — without it, mounting into a
-    //      non-root zone errors out at `metastore = None`.
+    //      `sys_setattr DT_MOUNT` — required when the operator names
+    //      a separate zone that doesn't yet exist.
     //   3. PeerBlobClient is installed so cross-node fetches on
     //      `last_writer_address` already-replicated bytes have a
     //      transport to ride.
     //
-    // `zone` is operator-supplied and must be non-root; root is
-    // reserved for kernel-managed mounts (PathLocalBackend at `/` and
-    // the DT_MOUNT entries at `/<mount>` the bootstrap installed
-    // above).  Single-voter non-root zones are the "expose host fs
-    // into VFS" node-local use case; multi-voter zones extend the
-    // same mount to peers via federation.
+    // `vfs_path` must be non-`/` (the boot mount owns that point);
+    // `zone` is operator-supplied without further constraint — root
+    // is the single-canonical node-local case (same-zone routing
+    // keeps it strictly local), a separate raft zone is the case
+    // operators reach for when extending the mount across peers.
     for raw in &common.mount_drivers {
         let spec = parse_mount_driver_spec(raw)
             .map_err(|e| anyhow::anyhow!("--mount-driver parse error: {e}"))?;
@@ -960,14 +966,38 @@ mod tests {
     }
 
     #[test]
-    fn mount_driver_rejects_root_zone() {
-        let err =
-            parse_mount_driver_spec("local-connector:root:/anywhere:{\"local_root\":\"/host\"}")
-                .unwrap_err();
-        assert!(
-            err.contains("reserved for kernel-managed mounts"),
-            "got: {err}",
-        );
+    fn mount_driver_rejects_root_mount_path() {
+        // `/` collides with the boot-time PathLocalBackend mount and
+        // trips `add_mount`'s `rebind_missing_backends` SSOT branch
+        // (the operator's driver would silently re-point every
+        // backend-less federation child mount at host fs).
+        let err = parse_mount_driver_spec("local-connector:root:/:{\"local_root\":\"/host\"}")
+            .unwrap_err();
+        assert!(err.contains("reserved for the boot-time"), "got: {err}");
+    }
+
+    #[test]
+    fn mount_driver_accepts_root_zone_non_root_path() {
+        // Root zone with a non-`/` path is the canonical single-node
+        // host-fs exposure case — same-canonical routing keeps it
+        // local (no federation replication or zone create-on-mount).
+        let spec =
+            parse_mount_driver_spec("local-connector:root:/tasks:{\"local_root\":\"/host/tasks\"}")
+                .expect("root zone is allowed for non-root paths");
+        assert_eq!(spec.zone_id, "root");
+        assert_eq!(spec.vfs_path, "/tasks");
+    }
+
+    #[test]
+    fn mount_driver_accepts_separate_zone() {
+        // Separate-zone mounts stay first-class — they're how a
+        // future cross-node operator-mount substrate will compose.
+        let spec = parse_mount_driver_spec(
+            "local-connector:my-docs:/files:{\"local_root\":\"/home/me/docs\"}",
+        )
+        .expect("any non-empty zone name is accepted");
+        assert_eq!(spec.zone_id, "my-docs");
+        assert_eq!(spec.vfs_path, "/files");
     }
 
     #[test]
@@ -989,16 +1019,5 @@ mod tests {
         assert!(parse_mount_driver_spec("local-connector").is_err());
         assert!(parse_mount_driver_spec("local-connector:myzone").is_err());
         assert!(parse_mount_driver_spec("local-connector:myzone:/path").is_err());
-    }
-
-    #[test]
-    fn mount_driver_accepts_single_voter_local_zone() {
-        // Non-root single-voter zone is the canonical "node-local host-fs
-        // exposure" use case (no federation involved).
-        let spec = parse_mount_driver_spec(
-            "local-connector:my-docs:/files:{\"local_root\":\"/home/me/docs\"}",
-        )
-        .expect("non-root zone is allowed regardless of voter count");
-        assert_eq!(spec.zone_id, "my-docs");
     }
 }
