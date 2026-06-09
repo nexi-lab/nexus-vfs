@@ -485,6 +485,47 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
         }
     }
 
+    // ── Driver-plugin mounts (§10) ───────────────────────────────────
+    // Parse `--mount-driver name:vfs-path:config-json` and mount each
+    // entry through the kernel's normal mount surface.  Runs AFTER the
+    // plugin dir scan so the driver dylibs are already loaded.  Runs
+    // BEFORE federation static-topology bootstrap so a more-specific
+    // local mount (e.g. /shared/cc-tasks/<hostname>) sits underneath
+    // the federation DT_MOUNT entry that lands next — VFSRouter
+    // prefix-match precedence then routes the sub-path to the
+    // LocalConnector directly without re-entering federation.
+    for raw in &common.mount_drivers {
+        let spec = parse_mount_driver_spec(raw)
+            .map_err(|e| anyhow::anyhow!("--mount-driver parse error: {e}"))?;
+        let backend = kernel
+            .make_driver(&spec.name, &spec.config_json)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "make_driver({}, …): {e} \
+                     (is the dylib in --plugin-dir and was it loaded?)",
+                    spec.name,
+                )
+            })?;
+        kernel
+            .mount(
+                &spec.vfs_path,
+                MountOptions::new(&spec.name).with_backend(backend),
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "mount driver '{}' at '{}': {:?}",
+                    spec.name,
+                    spec.vfs_path,
+                    e,
+                )
+            })?;
+        tracing::info!(
+            driver = %spec.name,
+            vfs_path = %spec.vfs_path,
+            "mounted driver plugin",
+        );
+    }
+
     // Build VFS gRPC service as tonic Routes — co-hosted on the raft
     // port via ZoneManager. Uses NoAuth (mTLS is the boundary).
     let vfs_auth: Arc<dyn transport::auth::AuthProvider> = Arc::new(transport::auth::NoAuth);
