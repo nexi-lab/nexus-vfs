@@ -486,6 +486,51 @@ mod tests {
     }
 
     #[test]
+    fn dot_notation_routes_to_kernel_dispatch_rust_call() {
+        let kernel = Arc::new(Kernel::new());
+        let ctx = OperationContext::new("admin", kernel::ROOT_ZONE_ID, true, None, true);
+
+        // No service registered → service not found
+        let resp = dispatch(&kernel, &ctx, "password-vault.secret_put", b"{}")
+            .expect("dispatch")
+            .into_inner();
+        assert!(resp.is_error, "unregistered service should return error");
+        let err: serde_json::Value =
+            serde_json::from_slice(&resp.payload).expect("error JSON");
+        let msg = err["message"].as_str().unwrap_or("");
+        assert!(
+            msg.contains("service not found") || msg.contains("password-vault"),
+            "error should mention service name, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn dot_notation_unknown_service_returns_error_not_panic() {
+        let kernel = Arc::new(Kernel::new());
+        let ctx = OperationContext::new("admin", kernel::ROOT_ZONE_ID, true, None, true);
+
+        let resp = dispatch(&kernel, &ctx, "nonexistent-svc.some_method", b"")
+            .expect("dispatch")
+            .into_inner();
+        assert!(resp.is_error);
+    }
+
+    #[test]
+    fn plain_unknown_method_still_errors() {
+        let kernel = Arc::new(Kernel::new());
+        let ctx = OperationContext::new("admin", kernel::ROOT_ZONE_ID, true, None, true);
+
+        let resp = dispatch(&kernel, &ctx, "totally_unknown", b"{}")
+            .expect("dispatch")
+            .into_inner();
+        assert!(resp.is_error);
+        let err: serde_json::Value =
+            serde_json::from_slice(&resp.payload).expect("error JSON");
+        let msg = err["message"].as_str().unwrap_or("");
+        assert!(msg.contains("unknown Call method"), "got: {msg}");
+    }
+
+    #[test]
     fn agent_registry_dispatch_maps_lifecycle_errors_to_client_codes() {
         let kernel = Arc::new(Kernel::new());
         let ctx = OperationContext::new("admin", kernel::ROOT_ZONE_ID, true, None, true);
