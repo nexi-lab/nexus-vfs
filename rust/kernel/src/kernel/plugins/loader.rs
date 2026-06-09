@@ -119,15 +119,32 @@ impl RustService for DylibRustService {
 /// authors that need `mkdir`/`rmdir`/`list_dir`/etc. through a dylib
 /// will get their ABI extension when a concrete need lands — keeping
 /// the C surface minimal until then.
-// `dead_code` suppression is dropped in the follow-up commit that
-// wires `PluginKind::Driver` through the loader; this struct is staged
-// in isolation so the diff stays bisectable.
-#[allow(dead_code)]
+///
+/// Lifetime: a `DylibObjectStore` owns the driver instance handle —
+/// `Drop` calls `nexus_driver_destroy(handle)` so each mount's
+/// resources release deterministically when its `Arc` count hits zero.
+/// The underlying `libloading::Library` is held by the
+/// `PluginLoader::loaded` map; callers must keep the plugin loaded
+/// (no `unload_plugin`) for the entire lifetime of any mount it
+/// backs.
 pub(crate) struct DylibObjectStore {
     drv_name: String,
     handle: *mut c_void,
     read_fn: DriverReadFn,
     write_fn: DriverWriteFn,
+    destroy_fn: DriverDestroyFn,
+}
+
+impl Drop for DylibObjectStore {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            // SAFETY: handle was returned by nexus_driver_create on the
+            // same library; destroy_fn was resolved from the same
+            // library. The PluginLoader keeps the library loaded for
+            // the program lifetime, so the symbol stays valid here.
+            unsafe { (self.destroy_fn)(self.handle) };
+        }
+    }
 }
 
 // SAFETY: The plugin C ABI contract requires thread-safe driver
@@ -392,6 +409,80 @@ impl PluginLoader {
         map.insert(name.clone(), loaded);
 
         Ok((name, kind))
+    }
+
+    /// Create a fresh driver instance for a loaded driver plugin and
+    /// return a `DylibObjectStore` wrapping its handle.
+    ///
+    /// Calls `nexus_driver_create(kernel_handle, config_json)` on the
+    /// dylib. Each invocation mints an independent instance — operators
+    /// can `--mount-driver` the same dylib at multiple VFS paths with
+    /// different `local_root` configs, and each mount gets its own
+    /// state.
+    ///
+    /// Returns `Err` if the plugin is not loaded, is not a driver,
+    /// missing a required symbol, or if `create_fn` returned null
+    /// (typically: bad config JSON, or the driver rejected the config).
+    pub(crate) fn make_driver(
+        &self,
+        name: &str,
+        kernel_handle: &KernelHandle,
+        config_json: &str,
+    ) -> Result<DylibObjectStore, String> {
+        let map = self.loaded.lock().unwrap();
+        let plugin = map
+            .get(name)
+            .ok_or_else(|| format!("driver plugin '{name}' not loaded"))?;
+        if plugin.kind != PluginKind::Driver {
+            return Err(format!(
+                "plugin '{name}' is not a driver (kind={:?})",
+                plugin.kind
+            ));
+        }
+
+        let create_fn: DriverCreateFn = unsafe {
+            *plugin
+                ._lib
+                .get(nexus_plugin_abi::symbols::DRIVER_CREATE.as_bytes())
+                .map_err(|e| format!("symbol {}: {e}", nexus_plugin_abi::symbols::DRIVER_CREATE))?
+        };
+        let read_fn: DriverReadFn = unsafe {
+            *plugin
+                ._lib
+                .get(nexus_plugin_abi::symbols::DRIVER_READ.as_bytes())
+                .map_err(|e| format!("symbol {}: {e}", nexus_plugin_abi::symbols::DRIVER_READ))?
+        };
+        let write_fn: DriverWriteFn = unsafe {
+            *plugin
+                ._lib
+                .get(nexus_plugin_abi::symbols::DRIVER_WRITE.as_bytes())
+                .map_err(|e| format!("symbol {}: {e}", nexus_plugin_abi::symbols::DRIVER_WRITE))?
+        };
+        let destroy_fn: DriverDestroyFn = unsafe {
+            *plugin
+                ._lib
+                .get(nexus_plugin_abi::symbols::DRIVER_DESTROY.as_bytes())
+                .map_err(|e| format!("symbol {}: {e}", nexus_plugin_abi::symbols::DRIVER_DESTROY))?
+        };
+
+        let config_c = CString::new(config_json)
+            .map_err(|_| "config_json contains null byte".to_string())?;
+
+        let handle = unsafe { create_fn(kernel_handle as *const KernelHandle, config_c.as_ptr()) };
+        if handle.is_null() {
+            return Err(format!(
+                "nexus_driver_create returned null for '{name}' \
+                 — driver rejected config (check JSON: {config_json})"
+            ));
+        }
+
+        Ok(DylibObjectStore {
+            drv_name: name.to_string(),
+            handle,
+            read_fn,
+            write_fn,
+            destroy_fn,
+        })
     }
 
     /// Take the `DylibRustService` wrapper for a loaded service plugin.
