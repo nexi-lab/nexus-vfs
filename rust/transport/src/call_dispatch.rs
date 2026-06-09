@@ -62,7 +62,38 @@ pub fn dispatch(
         "agent_signal" => do_agent_signal(kernel, &params),
         "agent_heartbeat" => do_agent_heartbeat(kernel, &params),
 
-        // Xattr (file metadata side-car)
+        // Dot-notation: "service_name.method" → dispatch to registered
+        // RustService or dylib plugin via Kernel::dispatch_rust_call.
+        // Used by vault plugin ("password-vault.secret_put") and any
+        // future service plugins.
+        _ if method.contains('.') => {
+            if let Some((svc_name, svc_method)) = method.split_once('.') {
+                match kernel.dispatch_rust_call(svc_name, svc_method, payload) {
+                    Some(Ok(raw_bytes)) => {
+                        // Plugin dispatch returns raw protobuf bytes — pass
+                        // through without JSON wrapping.
+                        return Ok(Response::new(CallResponse {
+                            payload: raw_bytes,
+                            is_error: false,
+                        }));
+                    }
+                    Some(Err(e)) => Err(call_err(
+                        RpcErrorCode::InternalError,
+                        &format!("{svc_name}.{svc_method}: {e}"),
+                    )),
+                    None => Err(call_err(
+                        RpcErrorCode::InternalError,
+                        &format!("service not found: {svc_name}"),
+                    )),
+                }
+            } else {
+                Err(call_err(
+                    RpcErrorCode::InternalError,
+                    &format!("unknown Call method: {method}"),
+                ))
+            }
+        }
+
         _ => Err(call_err(
             RpcErrorCode::InternalError,
             &format!("unknown Call method: {method}"),
@@ -452,6 +483,49 @@ mod tests {
         .into_inner();
         assert_eq!(result_payload(unregister), serde_json::json!(true));
         assert!(kernel.agent_registry().get("admin,e2e").is_none());
+    }
+
+    #[test]
+    fn dot_notation_routes_to_kernel_dispatch_rust_call() {
+        let kernel = Arc::new(Kernel::new());
+        let ctx = OperationContext::new("admin", kernel::ROOT_ZONE_ID, true, None, true);
+
+        // No service registered → service not found
+        let resp = dispatch(&kernel, &ctx, "password-vault.secret_put", b"{}")
+            .expect("dispatch")
+            .into_inner();
+        assert!(resp.is_error, "unregistered service should return error");
+        let err: serde_json::Value = serde_json::from_slice(&resp.payload).expect("error JSON");
+        let msg = err["message"].as_str().unwrap_or("");
+        assert!(
+            msg.contains("service not found") || msg.contains("password-vault"),
+            "error should mention service name, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn dot_notation_unknown_service_returns_error_not_panic() {
+        let kernel = Arc::new(Kernel::new());
+        let ctx = OperationContext::new("admin", kernel::ROOT_ZONE_ID, true, None, true);
+
+        let resp = dispatch(&kernel, &ctx, "nonexistent-svc.some_method", b"")
+            .expect("dispatch")
+            .into_inner();
+        assert!(resp.is_error);
+    }
+
+    #[test]
+    fn plain_unknown_method_still_errors() {
+        let kernel = Arc::new(Kernel::new());
+        let ctx = OperationContext::new("admin", kernel::ROOT_ZONE_ID, true, None, true);
+
+        let resp = dispatch(&kernel, &ctx, "totally_unknown", b"{}")
+            .expect("dispatch")
+            .into_inner();
+        assert!(resp.is_error);
+        let err: serde_json::Value = serde_json::from_slice(&resp.payload).expect("error JSON");
+        let msg = err["message"].as_str().unwrap_or("");
+        assert!(msg.contains("unknown Call method"), "got: {msg}");
     }
 
     #[test]
