@@ -17,9 +17,11 @@ use std::sync::Mutex;
 
 use contracts::rust_service::{RustCallError, RustService};
 use nexus_plugin_abi::{
-    KernelHandle, PluginKind, PluginResult, ServiceCreateFn, ServiceDestroyFn, ServiceDispatchFn,
-    PLUGIN_API_VERSION,
+    DriverReadFn, DriverWriteFn, KernelHandle, PluginKind, PluginResult, ServiceCreateFn,
+    ServiceDestroyFn, ServiceDispatchFn, PLUGIN_API_VERSION,
 };
+
+use crate::abc::object_store::{ObjectStore, StorageError, WriteResult};
 
 // ── LoadedPlugin ────────────────────────────────────────────────────
 
@@ -99,6 +101,138 @@ impl RustService for DylibRustService {
                 RustCallError::InvalidArgument("plugin rejected argument".into()),
             ),
             rc => Err(RustCallError::Internal(format!("plugin error code {rc}"))),
+        }
+    }
+}
+
+// ── DylibObjectStore ────────────────────────────────────────────────
+
+/// Wraps a driver plugin's C ABI function pointers as an
+/// `Arc<dyn ObjectStore>`. Cluster binaries mount it like any compiled-
+/// in backend (`PathLocalBackend`, `CasLocalBackend`) — the kernel sees
+/// a uniform `ObjectStore` trait object regardless of how the driver
+/// was loaded.
+///
+/// Only `name`, `read_content`, `write_content(offset=0)` are wired
+/// through the C ABI in v1. All other `ObjectStore` methods fall
+/// through to the trait's default `NotSupported` impls. Driver
+/// authors that need `mkdir`/`rmdir`/`list_dir`/etc. through a dylib
+/// will get their ABI extension when a concrete need lands — keeping
+/// the C surface minimal until then.
+// `dead_code` suppression is dropped in the follow-up commit that
+// wires `PluginKind::Driver` through the loader; this struct is staged
+// in isolation so the diff stays bisectable.
+#[allow(dead_code)]
+pub(crate) struct DylibObjectStore {
+    drv_name: String,
+    handle: *mut c_void,
+    read_fn: DriverReadFn,
+    write_fn: DriverWriteFn,
+}
+
+// SAFETY: The plugin C ABI contract requires thread-safe driver
+// instances. The handle pointer is only accessed through the C ABI
+// functions, which are themselves Send + Sync.
+unsafe impl Send for DylibObjectStore {}
+unsafe impl Sync for DylibObjectStore {}
+
+impl ObjectStore for DylibObjectStore {
+    fn name(&self) -> &str {
+        &self.drv_name
+    }
+
+    fn write_content(
+        &self,
+        content: &[u8],
+        content_id: &str,
+        _ctx: &crate::kernel::OperationContext,
+        offset: u64,
+    ) -> Result<WriteResult, StorageError> {
+        if offset != 0 {
+            // pwrite slow path is the driver's responsibility to advertise
+            // through an ABI extension; v1 ships full-overwrite only.
+            return Err(StorageError::NotSupported(
+                "DylibObjectStore: offset > 0 (pwrite) not supported in v1 ABI",
+            ));
+        }
+        let path_c = CString::new(content_id).map_err(|_| {
+            StorageError::IOError(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "content_id contains null byte",
+            ))
+        })?;
+
+        let rc = unsafe {
+            (self.write_fn)(self.handle, path_c.as_ptr(), content.as_ptr(), content.len())
+        };
+
+        match rc {
+            0 => Ok(WriteResult {
+                content_id: content_id.to_string(),
+                // Kernel-side hash so OCC version semantics stay
+                // backend-agnostic. The driver only acks success; it
+                // doesn't have to thread an ABI-stable hash back through
+                // C.
+                version: lib::hash::hash_content(content),
+                size: content.len() as u64,
+            }),
+            rc if rc == PluginResult::NotFound as i32 => {
+                Err(StorageError::NotFound(content_id.to_string()))
+            }
+            rc if rc == PluginResult::InvalidArgument as i32 => {
+                Err(StorageError::IOError(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("driver '{}' rejected write to '{content_id}'", self.drv_name),
+                )))
+            }
+            rc => Err(StorageError::IOError(std::io::Error::other(format!(
+                "driver '{}' write_content returned {rc}",
+                self.drv_name
+            )))),
+        }
+    }
+
+    fn read_content(
+        &self,
+        content_id: &str,
+        _ctx: &crate::kernel::OperationContext,
+    ) -> Result<Vec<u8>, StorageError> {
+        let path_c = CString::new(content_id).map_err(|_| {
+            StorageError::IOError(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "content_id contains null byte",
+            ))
+        })?;
+        let mut out_buf: *mut u8 = std::ptr::null_mut();
+        let mut out_len: usize = 0;
+
+        let rc = unsafe {
+            (self.read_fn)(
+                self.handle,
+                path_c.as_ptr(),
+                &mut out_buf,
+                &mut out_len,
+            )
+        };
+
+        match rc {
+            0 => {
+                let data = if out_buf.is_null() || out_len == 0 {
+                    Vec::new()
+                } else {
+                    // SAFETY: the plugin allocated this Vec and handed
+                    // ownership to us via ManuallyDrop in declare_driver_plugin!.
+                    unsafe { Vec::from_raw_parts(out_buf, out_len, out_len) }
+                };
+                Ok(data)
+            }
+            rc if rc == PluginResult::NotFound as i32 => {
+                Err(StorageError::NotFound(content_id.to_string()))
+            }
+            rc => Err(StorageError::IOError(std::io::Error::other(format!(
+                "driver '{}' read_content returned {rc}",
+                self.drv_name
+            )))),
         }
     }
 }
