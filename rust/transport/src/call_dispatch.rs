@@ -62,7 +62,38 @@ pub fn dispatch(
         "agent_signal" => do_agent_signal(kernel, &params),
         "agent_heartbeat" => do_agent_heartbeat(kernel, &params),
 
-        // Xattr (file metadata side-car)
+        // Dot-notation: "service_name.method" → dispatch to registered
+        // RustService or dylib plugin via Kernel::dispatch_rust_call.
+        // Used by vault plugin ("password-vault.secret_put") and any
+        // future service plugins.
+        _ if method.contains('.') => {
+            if let Some((svc_name, svc_method)) = method.split_once('.') {
+                match kernel.dispatch_rust_call(svc_name, svc_method, payload) {
+                    Some(Ok(raw_bytes)) => {
+                        // Plugin dispatch returns raw protobuf bytes — pass
+                        // through without JSON wrapping.
+                        return Ok(Response::new(CallResponse {
+                            payload: raw_bytes,
+                            is_error: false,
+                        }));
+                    }
+                    Some(Err(e)) => Err(call_err(
+                        RpcErrorCode::InternalError,
+                        &format!("{svc_name}.{svc_method}: {e}"),
+                    )),
+                    None => Err(call_err(
+                        RpcErrorCode::InternalError,
+                        &format!("service not found: {svc_name}"),
+                    )),
+                }
+            } else {
+                Err(call_err(
+                    RpcErrorCode::InternalError,
+                    &format!("unknown Call method: {method}"),
+                ))
+            }
+        }
+
         _ => Err(call_err(
             RpcErrorCode::InternalError,
             &format!("unknown Call method: {method}"),
