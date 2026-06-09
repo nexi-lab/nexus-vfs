@@ -518,49 +518,6 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
         }
     }
 
-    // ── Driver-plugin mounts (§10) ───────────────────────────────────
-    // Parse `--mount-driver name:zone:vfs-path:config-json` and mount
-    // each entry through the kernel's normal mount surface.  Runs
-    // AFTER the plugin dir scan so the driver dylibs are already
-    // loaded.  `zone` is operator-supplied and must be non-root —
-    // root is reserved for kernel-managed mounts (PathLocalBackend at
-    // / and federation DT_MOUNT entries at /<mount>).
-    for raw in &common.mount_drivers {
-        let spec = parse_mount_driver_spec(raw)
-            .map_err(|e| anyhow::anyhow!("--mount-driver parse error: {e}"))?;
-        let backend = kernel
-            .make_driver(&spec.name, &spec.config_json)
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "make_driver({}, …): {e} \
-                     (is the dylib in --plugin-dir and was it loaded?)",
-                    spec.name,
-                )
-            })?;
-        kernel
-            .mount(
-                &spec.vfs_path,
-                MountOptions::new(&spec.name)
-                    .with_backend(backend)
-                    .with_zone(&spec.zone_id),
-            )
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "mount driver '{}' at zone '{}' path '{}': {:?}",
-                    spec.name,
-                    spec.zone_id,
-                    spec.vfs_path,
-                    e,
-                )
-            })?;
-        tracing::info!(
-            driver = %spec.name,
-            zone_id = %spec.zone_id,
-            vfs_path = %spec.vfs_path,
-            "mounted driver plugin",
-        );
-    }
-
     // Build VFS gRPC service as tonic Routes — co-hosted on the raft
     // port via ZoneManager. Uses NoAuth (mTLS is the boundary).
     let vfs_auth: Arc<dyn transport::auth::AuthProvider> = Arc::new(transport::auth::NoAuth);
@@ -664,6 +621,64 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     // from origin nodes on local-backend misses.  Sits above raft in
     // the dep graph; kept out of `install_with_kernel` for that reason.
     transport::peer_blob::install(kernel.as_ref());
+
+    // ── Driver-plugin mounts (§10) ───────────────────────────────────
+    // Parse `--mount-driver name:zone:vfs-path:config-json` and mount
+    // each entry through the kernel's normal mount surface.  Order
+    // contract:
+    //   1. `--plugin-dir` scan already loaded the dylibs above.
+    //   2. Federation static-topology bootstrap has already created
+    //      the env-listed zones (`NEXUS_FEDERATION_ZONES`), and
+    //      `RaftDistributedCoordinator::install_with_kernel` has just
+    //      flipped `is_initialized` to true.  That gates the
+    //      `kernel.mount(..)` zone-create-on-mount path inside
+    //      `sys_setattr DT_MOUNT` — without it, mounting into a
+    //      non-root zone errors out at `metastore = None`.
+    //   3. PeerBlobClient is installed so cross-node fetches on
+    //      `last_writer_address` already-replicated bytes have a
+    //      transport to ride.
+    //
+    // `zone` is operator-supplied and must be non-root; root is
+    // reserved for kernel-managed mounts (PathLocalBackend at `/` and
+    // the DT_MOUNT entries at `/<mount>` the bootstrap installed
+    // above).  Single-voter non-root zones are the "expose host fs
+    // into VFS" node-local use case; multi-voter zones extend the
+    // same mount to peers via federation.
+    for raw in &common.mount_drivers {
+        let spec = parse_mount_driver_spec(raw)
+            .map_err(|e| anyhow::anyhow!("--mount-driver parse error: {e}"))?;
+        let backend = kernel
+            .make_driver(&spec.name, &spec.config_json)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "make_driver({}, …): {e} \
+                     (is the dylib in --plugin-dir and was it loaded?)",
+                    spec.name,
+                )
+            })?;
+        kernel
+            .mount(
+                &spec.vfs_path,
+                MountOptions::new(&spec.name)
+                    .with_backend(backend)
+                    .with_zone(&spec.zone_id),
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "mount driver '{}' at zone '{}' path '{}': {:?}",
+                    spec.name,
+                    spec.zone_id,
+                    spec.vfs_path,
+                    e,
+                )
+            })?;
+        tracing::info!(
+            driver = %spec.name,
+            zone_id = %spec.zone_id,
+            vfs_path = %spec.vfs_path,
+            "mounted driver plugin",
+        );
+    }
 
     let zm_for_loop = zm.clone();
     let topology_handle = tokio::spawn(async move {
