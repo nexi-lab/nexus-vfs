@@ -17,8 +17,8 @@ use std::sync::Mutex;
 
 use contracts::rust_service::{RustCallError, RustService};
 use nexus_plugin_abi::{
-    DriverReadFn, DriverWriteFn, KernelHandle, PluginKind, PluginResult, ServiceCreateFn,
-    ServiceDestroyFn, ServiceDispatchFn, PLUGIN_API_VERSION,
+    DriverCreateFn, DriverDestroyFn, DriverReadFn, DriverWriteFn, KernelHandle, PluginKind,
+    PluginResult, ServiceCreateFn, ServiceDestroyFn, ServiceDispatchFn, PLUGIN_API_VERSION,
 };
 
 use crate::abc::object_store::{ObjectStore, StorageError, WriteResult};
@@ -330,9 +330,46 @@ impl PluginLoader {
                 (handle, destroy_fn)
             }
             PluginKind::Driver => {
-                // Driver plugins will be implemented when we have a
-                // concrete driver plugin to test with.
-                return Err("driver plugins not yet implemented".to_string());
+                // Driver instances are NOT created at load time. Driver
+                // dylibs come up via `--plugin-dir` without any
+                // operator config; the config (`local_root`, etc.) is
+                // only known when `--mount-driver name:vfs-path:config`
+                // is parsed. `make_driver` calls `nexus_driver_create`
+                // with that JSON and returns a per-mount instance.
+                //
+                // Load-time validation still resolves all four driver
+                // symbols so a malformed dylib fails fast rather than
+                // surfacing as a confusing mount-time error.
+                let _create_fn: DriverCreateFn = unsafe {
+                    *lib.get(nexus_plugin_abi::symbols::DRIVER_CREATE.as_bytes())
+                        .map_err(|e| {
+                            format!("symbol {}: {e}", nexus_plugin_abi::symbols::DRIVER_CREATE)
+                        })?
+                };
+                let _read_fn: DriverReadFn = unsafe {
+                    *lib.get(nexus_plugin_abi::symbols::DRIVER_READ.as_bytes())
+                        .map_err(|e| {
+                            format!("symbol {}: {e}", nexus_plugin_abi::symbols::DRIVER_READ)
+                        })?
+                };
+                let _write_fn: DriverWriteFn = unsafe {
+                    *lib.get(nexus_plugin_abi::symbols::DRIVER_WRITE.as_bytes())
+                        .map_err(|e| {
+                            format!("symbol {}: {e}", nexus_plugin_abi::symbols::DRIVER_WRITE)
+                        })?
+                };
+                let destroy_fn: DriverDestroyFn = unsafe {
+                    *lib.get(nexus_plugin_abi::symbols::DRIVER_DESTROY.as_bytes())
+                        .map_err(|e| {
+                            format!("symbol {}: {e}", nexus_plugin_abi::symbols::DRIVER_DESTROY)
+                        })?
+                };
+                // Handle stays null in the LoadedPlugin entry. Each
+                // `make_driver` call mints its own (handle, destroy_fn)
+                // pair owned by the returned DylibObjectStore.
+                // `PluginLoader::unload` already skips destroy when
+                // handle is null, so the lifecycle stays correct.
+                (std::ptr::null_mut(), destroy_fn)
             }
         };
 
