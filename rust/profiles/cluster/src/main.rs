@@ -194,11 +194,10 @@ fn parse_mount_driver_spec(raw: &str) -> Result<MountDriverSpec, String> {
         ));
     }
     if vfs_path == "/" {
-        return Err(format!(
-            "--mount-driver: vfs-path '/' is reserved for the boot-time \
+        return Err("--mount-driver: vfs-path '/' is reserved for the boot-time \
              PathLocalBackend mount.  Operator-defined driver mounts must \
-             use a non-root path (e.g. '/tasks', '/external/blobs').",
-        ));
+             use a non-root path (e.g. '/tasks', '/external/blobs')."
+            .to_string());
     }
     Ok(MountDriverSpec {
         name: name.to_string(),
