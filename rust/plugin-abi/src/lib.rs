@@ -311,6 +311,155 @@ macro_rules! declare_service_plugin {
     };
 }
 
+// ── Helper macro for driver plugins ─────────────────────────────────
+
+/// Generate the required C ABI symbols for a driver plugin.
+///
+/// Mirrors [`declare_service_plugin!`] but for the driver (object store)
+/// dispatch shape. The kernel loader resolves the generated symbols and
+/// wraps the driver instance behind an `Arc<dyn ObjectStore>` (see
+/// `kernel::kernel::plugins::loader::DylibObjectStore`).
+///
+/// The macro expects:
+/// - `$name:expr` — plugin name (string literal). Becomes the driver's
+///   backend identifier.
+/// - `$ty:ty` — the Rust type holding driver state.
+/// - `create: $create:expr` — a closure
+///   `|kernel: &KernelHandle, config_json: &str| -> Result<Box<T>, i32>`
+///   that constructs the driver from its operator-supplied JSON config.
+///   Return `Err(code)` to fail the load; the kernel logs the code and
+///   skips the dylib.
+/// - `read: $read:expr` — a closure
+///   `|drv: &T, path: &str| -> Result<Vec<u8>, i32>`. The kernel calls
+///   this on read syscalls routed to the driver's mount.
+/// - `write: $write:expr` — a closure
+///   `|drv: &T, path: &str, data: &[u8]| -> Result<(), i32>`. The
+///   kernel calls this on write syscalls routed to the driver's mount.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use nexus_plugin_abi::{declare_driver_plugin, KernelHandle};
+///
+/// struct LocalDriver { root: std::path::PathBuf }
+///
+/// declare_driver_plugin!("local-connector", LocalDriver, {
+///     create: |_kernel, config_json| {
+///         let cfg: serde_json::Value =
+///             serde_json::from_str(config_json).map_err(|_| -2)?;
+///         let root = cfg["local_root"].as_str().ok_or(-2)?;
+///         Ok(Box::new(LocalDriver { root: root.into() }))
+///     },
+///     read: |drv, path| {
+///         std::fs::read(drv.root.join(path.trim_start_matches('/')))
+///             .map_err(|_| -3)
+///     },
+///     write: |drv, path, data| {
+///         std::fs::write(drv.root.join(path.trim_start_matches('/')), data)
+///             .map_err(|_| -3)
+///     },
+/// });
+/// ```
+#[macro_export]
+macro_rules! declare_driver_plugin {
+    ($name:expr, $ty:ty, {
+        create: $create:expr,
+        read: $read:expr,
+        write: $write:expr $(,)?
+    }) => {
+        #[no_mangle]
+        pub extern "C" fn nexus_plugin_api_version() -> u32 {
+            $crate::PLUGIN_API_VERSION
+        }
+
+        #[no_mangle]
+        pub extern "C" fn nexus_plugin_kind() -> u32 {
+            $crate::PluginKind::Driver as u32
+        }
+
+        #[no_mangle]
+        pub extern "C" fn nexus_plugin_name() -> *const std::ffi::c_char {
+            concat!($name, "\0").as_ptr() as *const std::ffi::c_char
+        }
+
+        #[no_mangle]
+        pub unsafe extern "C" fn nexus_driver_create(
+            kernel: *const $crate::KernelHandle,
+            config_json: *const std::ffi::c_char,
+        ) -> *mut std::os::raw::c_void {
+            let kernel_ref = &*kernel;
+            let config_str = if config_json.is_null() {
+                ""
+            } else {
+                match std::ffi::CStr::from_ptr(config_json).to_str() {
+                    Ok(s) => s,
+                    Err(_) => return std::ptr::null_mut(),
+                }
+            };
+            let create_fn: fn(&$crate::KernelHandle, &str) -> Result<Box<$ty>, i32> = $create;
+            match create_fn(kernel_ref, config_str) {
+                Ok(boxed) => Box::into_raw(boxed) as *mut std::os::raw::c_void,
+                Err(_) => std::ptr::null_mut(),
+            }
+        }
+
+        #[no_mangle]
+        pub unsafe extern "C" fn nexus_driver_read(
+            drv: *mut std::os::raw::c_void,
+            path: *const std::ffi::c_char,
+            out_buf: *mut *mut u8,
+            out_len: *mut usize,
+        ) -> i32 {
+            let drv = &*(drv as *const $ty);
+            let path = match std::ffi::CStr::from_ptr(path).to_str() {
+                Ok(s) => s,
+                Err(_) => return -2,
+            };
+            let read_fn: fn(&$ty, &str) -> Result<Vec<u8>, i32> = $read;
+            match read_fn(drv, path) {
+                Ok(data) => {
+                    let mut data = std::mem::ManuallyDrop::new(data);
+                    *out_buf = data.as_mut_ptr();
+                    *out_len = data.len();
+                    0
+                }
+                Err(code) => code,
+            }
+        }
+
+        #[no_mangle]
+        pub unsafe extern "C" fn nexus_driver_write(
+            drv: *mut std::os::raw::c_void,
+            path: *const std::ffi::c_char,
+            data: *const u8,
+            data_len: usize,
+        ) -> i32 {
+            let drv = &*(drv as *const $ty);
+            let path = match std::ffi::CStr::from_ptr(path).to_str() {
+                Ok(s) => s,
+                Err(_) => return -2,
+            };
+            let bytes = if data.is_null() || data_len == 0 {
+                &[][..]
+            } else {
+                std::slice::from_raw_parts(data, data_len)
+            };
+            let write_fn: fn(&$ty, &str, &[u8]) -> Result<(), i32> = $write;
+            match write_fn(drv, path, bytes) {
+                Ok(()) => 0,
+                Err(code) => code,
+            }
+        }
+
+        #[no_mangle]
+        pub unsafe extern "C" fn nexus_driver_destroy(drv: *mut std::os::raw::c_void) {
+            if !drv.is_null() {
+                drop(Box::from_raw(drv as *mut $ty));
+            }
+        }
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

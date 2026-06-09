@@ -53,11 +53,34 @@ impl Kernel {
                 tracing::info!(name, path = %path.display(), "service plugin loaded + registered");
             }
             PluginKind::Driver => {
-                // Caller would mount via sys_setattr(DT_MOUNT) after load.
+                // Driver instances aren't created here — they're minted
+                // per-mount by `make_driver(name, config_json)` once the
+                // operator supplies their JSON config via the cluster
+                // binary's `--mount-driver` flag.  Loading just validates
+                // the dylib's symbols + makes its name available for
+                // subsequent `make_driver` lookups.
                 tracing::info!(name, path = %path.display(), "driver plugin loaded");
             }
         }
         Ok(name)
+    }
+
+    /// Instantiate a driver plugin with the operator-supplied JSON
+    /// config and return an `Arc<dyn ObjectStore>` ready to mount.
+    ///
+    /// Each call mints an independent driver instance so the same
+    /// dylib can back multiple `--mount-driver` mounts with different
+    /// configs.  The returned `Arc` owns the driver instance handle;
+    /// drop it (or unmount the VFS path it backs) to call
+    /// `nexus_driver_destroy` and release the driver's resources.
+    pub fn make_driver(
+        self: &Arc<Self>,
+        name: &str,
+        config_json: &str,
+    ) -> Result<Arc<dyn crate::abc::object_store::ObjectStore>, String> {
+        let handle = self.build_kernel_handle();
+        let store = self.plugin_loader.make_driver(name, &handle, config_json)?;
+        Ok(Arc::new(store))
     }
 
     /// Unload a plugin by name. Service plugins have their hooks removed

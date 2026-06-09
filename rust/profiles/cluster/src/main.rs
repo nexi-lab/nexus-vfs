@@ -95,6 +95,24 @@ struct CommonArgs {
     #[arg(long, env = "NEXUS_PLUGIN_DIR", global = true)]
     plugin_dir: Option<PathBuf>,
 
+    /// Mount a driver plugin into the VFS at startup.  Repeatable.
+    ///
+    /// Syntax: `<plugin-name>:<vfs-path>:<config-json>`
+    ///
+    /// Example:
+    /// `--mount-driver local-connector:/shared/cc-tasks/mac:{"local_root":"/host/tasks-mac"}`
+    ///
+    /// The plugin must already be loaded (drop its `.so` into
+    /// `--plugin-dir` first).  `<config-json>` is passed verbatim to
+    /// `nexus_driver_create`; everything after the second `:` is one
+    /// JSON object so the value may contain its own colons.
+    ///
+    /// Loaded-but-not-mounted is a no-op: `--plugin-dir` registers the
+    /// dylib's name but does not mutate the VFS topology.  Only
+    /// `--mount-driver` flips a driver into the routing table.
+    #[arg(long = "mount-driver", value_name = "NAME:PATH:CONFIG", global = true)]
+    mount_drivers: Vec<String>,
+
     /// Bootstrap mode declaration — `static`, `dynamic`, or `restart`.
     ///
     /// Operator must declare intent at startup so the daemon does not
@@ -104,6 +122,50 @@ struct CommonArgs {
     /// validator since they always operate on existing state.
     #[arg(long, env = "NEXUS_BOOTSTRAP_MODE", global = true)]
     bootstrap_mode: Option<String>,
+}
+
+/// Parsed `--mount-driver` argument.
+///
+/// Splitting on `:` is left-anchored with a 3-part cap (`splitn(3, ':')`):
+/// everything after the second `:` is the JSON config so embedded `:`
+/// in values (which JSON object syntax always contains) survives the
+/// split unchanged.
+#[derive(Debug, Clone)]
+struct MountDriverSpec {
+    name: String,
+    vfs_path: String,
+    config_json: String,
+}
+
+fn parse_mount_driver_spec(raw: &str) -> Result<MountDriverSpec, String> {
+    let mut parts = raw.splitn(3, ':');
+    let name = parts
+        .next()
+        .ok_or_else(|| format!("--mount-driver: missing name in '{raw}'"))?
+        .trim();
+    let vfs_path = parts
+        .next()
+        .ok_or_else(|| format!("--mount-driver: missing vfs-path in '{raw}'"))?
+        .trim();
+    let config_json = parts
+        .next()
+        .ok_or_else(|| format!("--mount-driver: missing config-json in '{raw}'"))?
+        .trim();
+    if name.is_empty() || vfs_path.is_empty() || config_json.is_empty() {
+        return Err(format!(
+            "--mount-driver: name / vfs-path / config-json must all be non-empty in '{raw}'"
+        ));
+    }
+    if !vfs_path.starts_with('/') {
+        return Err(format!(
+            "--mount-driver: vfs-path must start with '/' in '{raw}' (got '{vfs_path}')"
+        ));
+    }
+    Ok(MountDriverSpec {
+        name: name.to_string(),
+        vfs_path: vfs_path.to_string(),
+        config_json: config_json.to_string(),
+    })
 }
 
 impl CommonArgs {
@@ -421,6 +483,47 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
                 tracing::warn!(err = %e, dir = %plugin_dir.display(), "plugin dir scan failed")
             }
         }
+    }
+
+    // ── Driver-plugin mounts (§10) ───────────────────────────────────
+    // Parse `--mount-driver name:vfs-path:config-json` and mount each
+    // entry through the kernel's normal mount surface.  Runs AFTER the
+    // plugin dir scan so the driver dylibs are already loaded.  Runs
+    // BEFORE federation static-topology bootstrap so a more-specific
+    // local mount (e.g. /shared/cc-tasks/<hostname>) sits underneath
+    // the federation DT_MOUNT entry that lands next — VFSRouter
+    // prefix-match precedence then routes the sub-path to the
+    // LocalConnector directly without re-entering federation.
+    for raw in &common.mount_drivers {
+        let spec = parse_mount_driver_spec(raw)
+            .map_err(|e| anyhow::anyhow!("--mount-driver parse error: {e}"))?;
+        let backend = kernel
+            .make_driver(&spec.name, &spec.config_json)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "make_driver({}, …): {e} \
+                     (is the dylib in --plugin-dir and was it loaded?)",
+                    spec.name,
+                )
+            })?;
+        kernel
+            .mount(
+                &spec.vfs_path,
+                MountOptions::new(&spec.name).with_backend(backend),
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "mount driver '{}' at '{}': {:?}",
+                    spec.name,
+                    spec.vfs_path,
+                    e,
+                )
+            })?;
+        tracing::info!(
+            driver = %spec.name,
+            vfs_path = %spec.vfs_path,
+            "mounted driver plugin",
+        );
     }
 
     // Build VFS gRPC service as tonic Routes — co-hosted on the raft
@@ -773,4 +876,53 @@ async fn wait_for_shutdown() {
 async fn wait_for_shutdown() {
     let _ = tokio::signal::ctrl_c().await;
     tracing::info!("Received Ctrl+C");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mount_driver_parses_basic_spec() {
+        let spec = parse_mount_driver_spec(
+            "local-connector:/shared/cc-tasks/mac:{\"local_root\":\"/host/tasks-mac\"}",
+        )
+        .expect("valid spec");
+        assert_eq!(spec.name, "local-connector");
+        assert_eq!(spec.vfs_path, "/shared/cc-tasks/mac");
+        assert_eq!(spec.config_json, "{\"local_root\":\"/host/tasks-mac\"}");
+    }
+
+    #[test]
+    fn mount_driver_preserves_colons_in_json() {
+        // JSON object literal has 2 colons inside (key:value pairs); the
+        // 3-part splitn must keep them all in `config_json`.
+        let raw = "s3-conn:/external/blobs:{\"endpoint\":\"https://s3.example.com:9000\",\"bucket\":\"x\"}";
+        let spec = parse_mount_driver_spec(raw).expect("colons in JSON survive split");
+        assert_eq!(spec.name, "s3-conn");
+        assert_eq!(spec.vfs_path, "/external/blobs");
+        assert_eq!(
+            spec.config_json,
+            "{\"endpoint\":\"https://s3.example.com:9000\",\"bucket\":\"x\"}"
+        );
+    }
+
+    #[test]
+    fn mount_driver_rejects_relative_path() {
+        let err = parse_mount_driver_spec("local-connector:relative/path:{}").unwrap_err();
+        assert!(err.contains("must start with '/'"), "got: {err}");
+    }
+
+    #[test]
+    fn mount_driver_rejects_empty_parts() {
+        assert!(parse_mount_driver_spec("::").is_err());
+        assert!(parse_mount_driver_spec("name::config").is_err());
+        assert!(parse_mount_driver_spec("name:/path:").is_err());
+    }
+
+    #[test]
+    fn mount_driver_rejects_too_few_parts() {
+        assert!(parse_mount_driver_spec("local-connector").is_err());
+        assert!(parse_mount_driver_spec("local-connector:/path").is_err());
+    }
 }

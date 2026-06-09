@@ -1150,7 +1150,7 @@ permission hooks added to the dispatch path land in one place.
 
 **Category:** Kernel Primitive (internal) | **Linux analogue:** Loadable Kernel Modules (`.ko`)
 
-`PluginLoader` (`rust/kernel/src/core/plugin_loader.rs`) enables runtime loading
+`PluginLoader` (`rust/kernel/src/kernel/plugins/loader.rs`) enables runtime loading
 of services and drivers from shared libraries (`.so` on Linux, `.dylib` on macOS)
 via `dlopen`. The mechanism mirrors Linux loadable kernel modules: a stable C ABI
 contract lets independently-compiled plugins register into the same `ServiceRegistry`
@@ -1226,21 +1226,46 @@ PluginLoader
 │   2. Validate nexus_plugin_api_version() compatibility
 │   3. Match kind:
 │      Service → nexus_service_create(KernelHandle) → DylibRustService → enlist_rust()
-│      Driver  → nexus_driver_create(KernelHandle, config) → DylibObjectStore → caller mounts
+│      Driver  → resolve create/read/write/destroy symbols → register dylib name
 │   4. Store in loaded map (DashMap<name, LoadedPlugin>)
+├── make_driver(name, config_json) → Arc<dyn ObjectStore>
+│      nexus_driver_create(KernelHandle, config_json) → DylibObjectStore
+│      (one fresh instance per call — same dylib can back many mounts)
 ├── unload(name)
 │   1. Service: unregister from ServiceRegistry (drain + stop)
-│      Driver: remove from VFSRouter
-│   2. nexus_service_destroy() / nexus_driver_destroy()
+│      Driver: each DylibObjectStore runs nexus_driver_destroy on Drop
+│   2. nexus_service_destroy() for service kind
 │   3. dlclose()
 └── reload(name, new_path)
     1. unload(name)
     2. load(new_path, kernel)
 ```
 
+Service plugins get one instance per dylib, minted by `load`.  Driver
+plugins are minted lazily — `load` validates symbols and registers the
+name; `make_driver(name, config_json)` constructs each per-mount
+instance with operator-supplied configuration.  Each
+`DylibObjectStore` owns its handle and calls `nexus_driver_destroy` on
+`Drop`, so mount lifecycle = driver-instance lifecycle.
+
 `reload` provides zero-downtime hot-swap: `ServiceRegistry.drain()` waits for
 in-flight references to reach zero before replacing the service (§4
 ServiceRegistry), then loads the new version from the updated dylib.
+
+### 10.4a Operator Mount Surface
+
+Driver dylibs reach the VFS through the `nexusd-cluster` binary's two
+flags:
+
+| Flag | Effect |
+|------|--------|
+| `--plugin-dir <dir>` | `load`-time scan: every `.so` / `.dylib` in `<dir>` is loaded and its plugin name registered |
+| `--mount-driver <name>:<vfs-path>:<config-json>` | `make_driver(name, config_json)` → `kernel.mount(vfs-path, …)` |
+
+`--mount-driver` is repeatable; the same dylib name can appear multiple
+times to project different host paths into different VFS subtrees.
+Parsing uses `splitn(3, ':')` so embedded `:` characters in the JSON
+config (URLs, key-value pairs) survive the split intact.
 
 ### 10.5 Plugin Management Surface
 
