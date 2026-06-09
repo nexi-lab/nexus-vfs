@@ -1260,12 +1260,29 @@ flags:
 | Flag | Effect |
 |------|--------|
 | `--plugin-dir <dir>` | `load`-time scan: every `.so` / `.dylib` in `<dir>` is loaded and its plugin name registered |
-| `--mount-driver <name>:<vfs-path>:<config-json>` | `make_driver(name, config_json)` → `kernel.mount(vfs-path, …)` |
+| `--mount-driver <name>:<zone>:<vfs-path>:<config-json>` | `make_driver(name, config_json)` → `kernel.mount(vfs-path, opts.with_zone(zone))` |
 
 `--mount-driver` is repeatable; the same dylib name can appear multiple
 times to project different host paths into different VFS subtrees.
-Parsing uses `splitn(3, ':')` so embedded `:` characters in the JSON
+Parsing uses `splitn(4, ':')` so embedded `:` characters in the JSON
 config (URLs, key-value pairs) survive the split intact.
+
+`<zone>` is the non-root zone the mount lives in.  Root is reserved
+for kernel-managed mounts — the boot-time `PathLocalBackend` at `/`
+plus the DT_MOUNT entries the federation static-topology bootstrap
+installs at `/<mount>` per env-listed zone.  Operator mounts go into
+their own non-root zone:
+
+* a **single-voter** zone for the node-local "expose a host fs subtree
+  through the VFS so other syscall-tier consumers (search, audit,
+  agents) can see it" use case — no federation involved
+* a **multi-voter** zone for cross-machine sharing — composes with the
+  federation read path (§3.B.1 control-plane HAL)
+
+The flag runs after `RaftDistributedCoordinator::install_with_kernel`
+on boot so the zone-create-on-mount branch inside `sys_setattr DT_MOUNT`
+is live; a non-root zone the operator names at this point is minted
+on-demand by the coordinator if it doesn't already exist locally.
 
 ### 10.5 Plugin Management Surface
 
