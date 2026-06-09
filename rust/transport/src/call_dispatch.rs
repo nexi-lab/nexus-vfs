@@ -495,8 +495,7 @@ mod tests {
             .expect("dispatch")
             .into_inner();
         assert!(resp.is_error, "unregistered service should return error");
-        let err: serde_json::Value =
-            serde_json::from_slice(&resp.payload).expect("error JSON");
+        let err: serde_json::Value = serde_json::from_slice(&resp.payload).expect("error JSON");
         let msg = err["message"].as_str().unwrap_or("");
         assert!(
             msg.contains("service not found") || msg.contains("password-vault"),
@@ -524,8 +523,7 @@ mod tests {
             .expect("dispatch")
             .into_inner();
         assert!(resp.is_error);
-        let err: serde_json::Value =
-            serde_json::from_slice(&resp.payload).expect("error JSON");
+        let err: serde_json::Value = serde_json::from_slice(&resp.payload).expect("error JSON");
         let msg = err["message"].as_str().unwrap_or("");
         assert!(msg.contains("unknown Call method"), "got: {msg}");
     }
