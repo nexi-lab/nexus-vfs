@@ -769,12 +769,23 @@ fn wait_for_join_to_apply(zh: &ZoneHandle, zone_id: &str, timeout: Duration) -> 
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
         let leader = zh.leader_id();
-        let commit = zh.commit_index();
-        if leader.is_some() && commit > 0 {
+        // SSOT with Branch 1 (`check_zone_resumable_from_indices`) and the
+        // `nexusd-cluster doctor` audit — the same "durable state landed"
+        // signal across all three sites.  `last_log_index` reads the cache
+        // populated by `update_cached_status`, which the driver loop runs
+        // *after* `storage.append` / `set_hard_state` / `apply_snapshot`
+        // commit to redb (see `raft/node.rs` process_ready ordering).
+        // So `>= 1` here is gated on durable-or-better state — same
+        // invariant Branch 1 uses to decide a zone is safely resumable.
+        // The previous `commit_index > 0` gate was a different scalar
+        // (in-memory `raft_log.committed`) that risked drifting from the
+        // durable-state SSOT as the substrate evolved.
+        let last_log = zh.last_log_index();
+        if leader.is_some() && last_log >= 1 {
             tracing::info!(
                 zone = %zone_id,
                 leader_id = ?leader,
-                commit_index = commit,
+                last_log_index = last_log,
                 "ConfState installed; local raft state caught up to leader",
             );
             return Ok(());
@@ -784,11 +795,11 @@ fn wait_for_join_to_apply(zh: &ZoneHandle, zone_id: &str, timeout: Duration) -> 
     Err(format!(
         "JoinZone RPC succeeded on the leader but joiner's local raft \
          state did not install the resulting ConfState within {timeout:?} \
-         (leader_id={:?}, commit_index={}).  Data dir would be left in a \
-         pre-membership state — daemon restart would treat the zone as a \
-         solo cluster of self.  Refusing to exit on stale state.",
+         (leader_id={:?}, last_log_index={}).  Data dir would be left in \
+         a pre-membership state — daemon restart would treat the zone as \
+         a solo cluster of self.  Refusing to exit on stale state.",
         zh.leader_id(),
-        zh.commit_index(),
+        zh.last_log_index(),
     ))
 }
 
