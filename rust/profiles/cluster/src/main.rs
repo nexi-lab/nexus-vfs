@@ -523,8 +523,15 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     // bytes stayed on disk. Swap in a redb inside the data dir BEFORE
     // the first mount so the DT_MOUNT entry lands in the durable
     // store too.
+    //
+    // The override env is deliberately `NEXUS_KERNEL_METASTORE_PATH`
+    // (the `NEXUS_KERNEL_*` namespace, like `NEXUS_KERNEL_BINARY`),
+    // NOT `NEXUS_METASTORE_PATH`: the Python server sets the latter
+    // for its own legacy metadata path and copies its env into this
+    // subprocess — reusing it here would point the kernel at the
+    // Python-era redb file instead of this node's own store.
     if let Some(ms_path) = resolve_metastore_path(
-        std::env::var("NEXUS_METASTORE_PATH").ok().as_deref(),
+        std::env::var("NEXUS_KERNEL_METASTORE_PATH").ok().as_deref(),
         &common.data_dir,
     ) {
         if let Some(parent) = ms_path.parent() {
@@ -538,7 +545,7 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
         tracing::info!(path = %ms_path.display(), "durable metastore opened (namespace survives restarts)");
     } else {
         tracing::warn!(
-            "NEXUS_METASTORE_PATH=\"\" — ephemeral tempfile metastore; \
+            "NEXUS_KERNEL_METASTORE_PATH=\"\" — ephemeral tempfile metastore; \
              the namespace will NOT survive a restart"
         );
     }
@@ -1148,8 +1155,8 @@ fn resolve_hostname(cli: Option<&str>) -> String {
 /// Resolve the durable metastore path for this node (#4343).
 ///
 /// Precedence:
-///   * `NEXUS_METASTORE_PATH` set and non-empty → that file path.
-///   * `NEXUS_METASTORE_PATH` set but EMPTY → `None` — explicit opt-out
+///   * `NEXUS_KERNEL_METASTORE_PATH` set and non-empty → that file path.
+///   * `NEXUS_KERNEL_METASTORE_PATH` set but EMPTY → `None` — explicit opt-out
 ///     back into the ephemeral tempfile metastore (debug escape hatch;
 ///     the namespace then dies with the process).
 ///   * unset → `<data_dir>/metastore.redb`.
