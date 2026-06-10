@@ -594,18 +594,46 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
         .map(NodeAddress::to_raft_peer_str)
         .collect();
 
-    let (zones, mounts) = parse_federation_env();
-    if !zones.is_empty() || !mounts.is_empty() {
+    let fed = parse_federation_env();
+    // Surface every dropped `NEXUS_FEDERATION_MOUNTS` entry so the
+    // operator sees them in boot logs.  When the input was non-empty
+    // but the parser ate everything (the Mac↔Win L1 smoke wedge:
+    // Windows MSYS Git Bash mangling `/shared=sharedzone` into
+    // `C:/Program Files/Git/shared=sharedzone`), refuse to boot —
+    // a silent `mount_count=0` federation leaves the operator
+    // chasing downstream raft-replication symptoms for hours.
+    for d in &fed.mounts.dropped {
+        tracing::error!(
+            raw = %d.raw,
+            reason = d.reason,
+            env_var = ENV_FEDERATION_MOUNTS,
+            "federation mount entry dropped at parse",
+        );
+    }
+    if fed.mounts.is_silent_dropall() {
+        return Err(anyhow::anyhow!(
+            "{} parsed to zero mounts despite non-empty input — refusing to start \
+             with a silently broken federation topology.  Inspect the per-entry \
+             reasons logged above (one common trigger is MSYS path conversion on \
+             Windows Git Bash; export MSYS_NO_PATHCONV=1 or single-quote the value).",
+            ENV_FEDERATION_MOUNTS,
+        ));
+    }
+    if !fed.zones.is_empty() || !fed.mounts.mounts.is_empty() {
         tracing::info!(
-            ?zones,
-            mount_count = mounts.len(),
+            zones = ?fed.zones,
+            mount_count = fed.mounts.mounts.len(),
             "Bootstrapping static topology from {} / {}",
             ENV_FEDERATION_ZONES,
             ENV_FEDERATION_MOUNTS,
         );
-        zm.bootstrap_static_async(zones.clone(), peers_str.clone(), mounts.clone())
-            .await
-            .map_err(|e| anyhow::anyhow!("bootstrap_static: {}", e))?;
+        zm.bootstrap_static_async(
+            fed.zones.clone(),
+            peers_str.clone(),
+            fed.mounts.mounts.clone(),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("bootstrap_static: {}", e))?;
     }
 
     // Canonical coordinator boot wiring: self-address publish, DT_MOUNT
