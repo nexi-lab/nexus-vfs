@@ -719,6 +719,48 @@ fn remove_local_probe_zone(zm: &ZoneManager, zone_id: &str) {
 /// it).  The pair is what `bootstrap_or_join_zone`'s "snapshot has
 /// installed authoritative ConfState locally" comment promised —
 /// this function makes the claim true instead of aspirational.
+/// Operator-experience integrity check on a loaded zone before
+/// short-circuiting `bootstrap_or_join_zone` to "resume from ConfState".
+///
+/// **Resumability invariant (this commit ships condition (a) only — see
+/// commit body for (b)/(c) follow-up):**
+///
+/// (a) `last_log_index() >= 1` — every successful raft bootstrap or join
+///     advances log_last past 0.  Founder writes `AddNode(self)` to log
+///     index 1 during bootstrap (nexus-vfs#33).  Joiner receives the
+///     leader's snapshot (which sets log_last to `snapshot.last_included_index`)
+///     or the AppendEntries containing the AddNode/AddLearnerNode entry —
+///     either way log_last lands at >= 1 by the time a successful join
+///     CLI exits.  A zone whose log_last is still 0 at daemon restart
+///     means the ConfState was persisted but the log entries that
+///     followed were not — the half-installed state that wedged the
+///     Mac↔Win L1 smoke for 8 hours.
+///
+/// Returns `Ok(())` when state is safely resumable, `Err(reason)`
+/// otherwise.  Caller decides whether to refuse-and-error (daemon
+/// restart with no peers — operator must repair) or fall-through to
+/// re-JoinZone (CLI invocation with peer addresses).
+fn check_zone_resumable(zh: &ZoneHandle) -> Result<(), String> {
+    check_zone_resumable_from_indices(zh.last_log_index())
+}
+
+/// Pure-data variant for unit testing — the integrity invariants do
+/// not depend on anything that isn't already an atomic-cached scalar
+/// on `ZoneHandle`, so the check is reducible to a function over those
+/// scalars.
+fn check_zone_resumable_from_indices(last_log_index: u64) -> Result<(), String> {
+    if last_log_index == 0 {
+        return Err(
+            "log_last_index = 0 (no persisted entries); ConfState may exist on disk \
+             but no log entry has been fsynced past it — the half-installed state \
+             that follows a crashed `nexusd-cluster join` between snapshot install \
+             and log fsync"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn wait_for_join_to_apply(zh: &ZoneHandle, zone_id: &str, timeout: Duration) -> Result<(), String> {
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
@@ -965,14 +1007,53 @@ pub fn bootstrap_or_join_zone(
     max_attempts: Option<u32>,
     as_learner: bool,
 ) -> Result<(), String> {
-    // Branch 1: zone already loaded from disk.
-    if zm.get_zone(zone_id).is_some() {
-        tracing::info!(
-            node_id,
-            zone = %zone_id,
-            "zone loaded from persisted storage; resuming from ConfState",
-        );
-        return Ok(());
+    // Branch 1: zone already loaded from disk.  Resume only when the
+    // persisted state is consistent — the previous short-circuit accepted
+    // any registered zone, which silently admitted half-installed states
+    // (e.g. ConfState set by a crashed `nexusd-cluster join` whose log
+    // entries weren't fsynced).  See `check_zone_resumable` for the
+    // invariant set.
+    if let Some(zh) = zm.get_zone(zone_id) {
+        match check_zone_resumable(zh.as_ref()) {
+            Ok(()) => {
+                tracing::info!(
+                    node_id,
+                    zone = %zone_id,
+                    last_log_index = zh.last_log_index(),
+                    "zone loaded from persisted storage; resuming from ConfState",
+                );
+                return Ok(());
+            }
+            Err(reason) => {
+                if peer_addrs.is_empty() {
+                    return Err(format!(
+                        "loaded {zone_id} state is not safely resumable ({reason}).  \
+                         This typically indicates a previous `nexusd-cluster join` \
+                         crashed between updating ConfState and fsyncing the log entries \
+                         that followed.  Daemon restart cannot self-repair without peer \
+                         addresses to re-JoinZone against — to recover, either:\n  \
+                         (a) stop the daemon, run `nexusd-cluster join \
+                         <leader_node_id>@<leader_addr> {zone_id} /<mount> \
+                         --data-dir <data_dir> --no-tls`, then restart in restart mode; or\n  \
+                         (b) `rm -rf <data_dir>/{zone_id}` (this zone's subdirectory only) \
+                         and restart in static mode."
+                    ));
+                }
+                tracing::warn!(
+                    node_id,
+                    zone = %zone_id,
+                    reason = %reason,
+                    "loaded zone state not safely resumable; falling through to JoinZone \
+                     against the configured peers (substrate will re-install ConfState + \
+                     log entries from the leader)",
+                );
+                // Fall through to Branch 3 — the existing JoinZone loop
+                // re-sends the RPC and re-installs state from the leader.
+                // Branch 3 sees `get_zone()` still returns Some and skips
+                // local registration, which is exactly what we want
+                // (preserve the live driver / msg channel).
+            }
+        }
     }
 
     // Branch 2: founder — either operator explicit (`bootstrap_new`)
@@ -1903,6 +1984,50 @@ mod tests {
         std::fs::write(&path, [0u8; 8]).expect("write zero");
         let result = read_or_mint_node_id(dir.path().to_str().expect("utf-8"));
         assert!(result.is_err(), "must reject zero id on disk");
+    }
+
+    /// `check_zone_resumable` accepts any persisted zone whose log has
+    /// advanced past the bootstrap / join entry — that's every healthy
+    /// daemon restart by raft contract.
+    #[test]
+    fn check_zone_resumable_passes_when_log_advanced() {
+        // Founder bootstrap writes AddNode(self) to index 1 — log_last
+        // is at least 1 on a healthy founder restart.
+        assert!(check_zone_resumable_from_indices(1).is_ok());
+        // Joiner that completed snapshot install lands at >= snapshot
+        // last_included_index, which is the AddLearnerNode commit index
+        // (typically 3 on the canonical sharedzone join).
+        assert!(check_zone_resumable_from_indices(3).is_ok());
+        // Long-running cluster — many entries, still resumable.
+        assert!(check_zone_resumable_from_indices(1_000_000).is_ok());
+    }
+
+    /// Regression for the Mac↔Win L1 smoke half-installed-state wedge:
+    /// the joiner's `nexusd-cluster join` advanced the in-memory
+    /// commit_index to 3 (`wait_for_join_to_apply` gated on it) but
+    /// crashed before fsyncing the log entries.  At daemon restart the
+    /// loaded zone has ConfState present but log_last == 0 — the
+    /// previous Branch 1 short-circuit returned Ok and the daemon
+    /// then spent hours floods "Clamping inbound raft commit hint" /
+    /// "raft step error: cannot step as peer not found" before the
+    /// operator deduced the root cause.  This commit makes the same
+    /// state a hard error.
+    #[test]
+    fn check_zone_resumable_rejects_empty_log_with_confstate_present() {
+        let err = check_zone_resumable_from_indices(0).unwrap_err();
+        assert!(
+            err.contains("log_last_index = 0"),
+            "expected explicit log_last_index = 0 framing, got: {err}"
+        );
+        // The error message must point operators at the recovery path
+        // it documents (offline join CLI or wipe + rebootstrap) —
+        // that's what the caller appends to the error before
+        // propagating; here we only sanity-check the empty-log framing
+        // landed.
+        assert!(
+            err.contains("ConfState may exist on disk"),
+            "expected ConfState-exists framing, got: {err}"
+        );
     }
 
     fn parse_peer(s: &str) -> NodeAddress {
