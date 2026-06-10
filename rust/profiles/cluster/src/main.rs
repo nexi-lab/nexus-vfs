@@ -514,6 +514,34 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     // Created BEFORE ZoneManager so the VFS gRPC service can be
     // co-hosted on the same port as the raft gRPC server.
     let kernel = Arc::new(Kernel::new());
+
+    // ── Durable metastore (#4343) ─────────────────────────────────
+    // `Kernel::new()` boots on a tempfile-backed `LocalMetaStore` —
+    // fine for tests and benches, fatal for a server: the namespace
+    // (the inode SSOT) drops with the process, so every restart made
+    // all previously-registered files invisible while their payload
+    // bytes stayed on disk. Swap in a redb inside the data dir BEFORE
+    // the first mount so the DT_MOUNT entry lands in the durable
+    // store too.
+    if let Some(ms_path) = resolve_metastore_path(
+        std::env::var("NEXUS_METASTORE_PATH").ok().as_deref(),
+        &common.data_dir,
+    ) {
+        if let Some(parent) = ms_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create metastore dir {}", parent.display()))?;
+        }
+        let ms_str = ms_path.to_str().context("metastore path must be UTF-8")?;
+        kernel.set_metastore_path(ms_str).map_err(|e| {
+            anyhow::anyhow!("open durable metastore at {}: {:?}", ms_path.display(), e)
+        })?;
+        tracing::info!(path = %ms_path.display(), "durable metastore opened (namespace survives restarts)");
+    } else {
+        tracing::warn!(
+            "NEXUS_METASTORE_PATH=\"\" — ephemeral tempfile metastore; \
+             the namespace will NOT survive a restart"
+        );
+    }
     let root_fs = common.root_fs_path();
     std::fs::create_dir_all(&root_fs)
         .with_context(|| format!("create cluster root mount dir {}", root_fs.display()))?;
@@ -1117,6 +1145,22 @@ fn resolve_hostname(cli: Option<&str>) -> String {
     gethostname::gethostname().to_string_lossy().into_owned()
 }
 
+/// Resolve the durable metastore path for this node (#4343).
+///
+/// Precedence:
+///   * `NEXUS_METASTORE_PATH` set and non-empty → that file path.
+///   * `NEXUS_METASTORE_PATH` set but EMPTY → `None` — explicit opt-out
+///     back into the ephemeral tempfile metastore (debug escape hatch;
+///     the namespace then dies with the process).
+///   * unset → `<data_dir>/metastore.redb`.
+fn resolve_metastore_path(env_value: Option<&str>, data_dir: &std::path::Path) -> Option<PathBuf> {
+    match env_value {
+        Some("") => None,
+        Some(v) => Some(PathBuf::from(v)),
+        None => Some(data_dir.join("metastore.redb")),
+    }
+}
+
 #[cfg(unix)]
 async fn wait_for_shutdown() {
     use tokio::signal::unix::{signal, SignalKind};
@@ -1136,6 +1180,26 @@ async fn wait_for_shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metastore_path_defaults_into_data_dir() {
+        let p = resolve_metastore_path(None, std::path::Path::new("/data"));
+        assert_eq!(p, Some(PathBuf::from("/data/metastore.redb")));
+    }
+
+    #[test]
+    fn metastore_path_env_overrides() {
+        let p = resolve_metastore_path(Some("/elsewhere/ms.redb"), std::path::Path::new("/data"));
+        assert_eq!(p, Some(PathBuf::from("/elsewhere/ms.redb")));
+    }
+
+    #[test]
+    fn metastore_path_empty_env_opts_out() {
+        assert_eq!(
+            resolve_metastore_path(Some(""), std::path::Path::new("/data")),
+            None
+        );
+    }
 
     #[test]
     fn mount_driver_parses_basic_spec() {
