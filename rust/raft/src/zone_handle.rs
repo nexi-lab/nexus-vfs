@@ -90,6 +90,20 @@ impl ZoneHandle {
         self.node.applied_index()
     }
 
+    /// Highest persisted raft log index — atomic read of the cache the
+    /// driver maintains via `update_cached_status`.
+    ///
+    /// Read on the operator-experience integrity path: a freshly-loaded
+    /// zone whose `last_log_index() == 0` cannot have completed bootstrap
+    /// (founder writes `AddNode(self)` to index 1) or join (joiner
+    /// receives the snapshot or AppendEntries that contain the
+    /// AddNode/AddLearnerNode entry, advancing log_last past 0).
+    /// `bootstrap_or_join_zone` uses it to refuse a Branch 1 short-
+    /// circuit on a half-installed state.
+    pub fn last_log_index(&self) -> u64 {
+        self.node.last_index()
+    }
+
     pub fn is_committed(&self, token: u64) -> Option<String> {
         self.node.is_committed(token).map(|s| s.to_string())
     }

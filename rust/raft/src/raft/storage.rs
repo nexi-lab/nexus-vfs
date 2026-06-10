@@ -86,6 +86,17 @@ impl RaftStorage {
         Self::new(store)
     }
 
+    /// Inherent wrapper around `<Self as raft::Storage>::initial_state`
+    /// so callers that don't already have the trait in scope can read
+    /// the persisted `(HardState, ConfState)` pair directly off the
+    /// storage handle.  Used by `nexusd-cluster doctor` to audit a
+    /// stopped daemon's per-zone state without spinning up the raft
+    /// driver.
+    pub fn initial_state_impl(&self) -> Result<raft::RaftState> {
+        <Self as raft::Storage>::initial_state(self)
+            .map_err(|e| RaftError::Storage(format!("initial_state: {e}")))
+    }
+
     /// Get the first index in the log.
     pub fn first_index_impl(&self) -> Result<u64> {
         match self.state.get(KEY_FIRST_INDEX)? {

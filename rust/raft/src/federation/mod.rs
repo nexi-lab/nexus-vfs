@@ -17,8 +17,8 @@ pub mod topology;
 
 pub use distributed_locks::DistributedLocks;
 pub use topology::{
-    parse_federation_env, parse_mounts_env, parse_zones_env, ENV_FEDERATION_MOUNTS,
-    ENV_FEDERATION_ZONES,
+    parse_federation_env, parse_mounts_env, parse_zones_env, DroppedMount, FederationParse,
+    MountsParse, ENV_FEDERATION_MOUNTS, ENV_FEDERATION_ZONES,
 };
 
 // TOFU trust store re-exports from the shared `transport-primitives`
