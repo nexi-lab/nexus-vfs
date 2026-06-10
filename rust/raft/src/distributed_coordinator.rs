@@ -748,7 +748,11 @@ fn check_zone_resumable(zh: &ZoneHandle) -> Result<(), String> {
 /// not depend on anything that isn't already an atomic-cached scalar
 /// on `ZoneHandle`, so the check is reducible to a function over those
 /// scalars.
-fn check_zone_resumable_from_indices(last_log_index: u64) -> Result<(), String> {
+///
+/// Public so the `nexusd-cluster doctor` subcommand can cross-check
+/// every persisted zone against the same invariant Branch 1 uses
+/// (single SSOT for "resumable state").
+pub fn check_zone_resumable_from_indices(last_log_index: u64) -> Result<(), String> {
     if last_log_index == 0 {
         return Err(
             "log_last_index = 0 (no persisted entries); ConfState may exist on disk \
