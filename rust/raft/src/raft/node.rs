@@ -700,13 +700,37 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             .last_applied_shared()
             .unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
 
-        // Shared state
+        // Shared state.  The cached atoms exist so sync callers (boot
+        // `bootstrap_or_join_zone`, doctor, stats) can read raft state
+        // without acquiring the raw_node lock.  They are refreshed by
+        // the driver loop's `update_cached_status` AFTER every ready
+        // is acknowledged (post-storage write), which makes them lag
+        // durability — never lead it.
+        //
+        // Seed from `raw_node` BEFORE constructing the driver: on a
+        // freshly opened storage with persisted entries (snapshot
+        // installed during a prior `nexusd-cluster join`, or routine
+        // restart), `RawNode::new` already restored `raft_log` from
+        // `Storage::initial_state` / `Storage::last_index`.  Leaving
+        // the atoms at 0 until the first ready tick creates a window
+        // where `last_log_index()` lies to sync callers, breaking
+        // `check_zone_resumable`'s "log_last >= 1 implies state
+        // durable past bootstrap milestone" invariant against the
+        // legitimate just-loaded case.  One call to the SSOT mapping
+        // helper pins all four atoms to truth from t=0.
         let state_machine = Arc::new(RwLock::new(state_machine));
         let proposal_id = Arc::new(AtomicU64::new(0));
         let cached_leader_id = Arc::new(AtomicU64::new(0));
         let cached_term = Arc::new(AtomicU64::new(0));
         let cached_commit_index = Arc::new(AtomicU64::new(0));
         let cached_last_index = Arc::new(AtomicU64::new(0));
+        refresh_cached_status_from_raw_node(
+            &raw_node,
+            &cached_leader_id,
+            &cached_term,
+            &cached_commit_index,
+            &cached_last_index,
+        );
 
         // Bounded channel with backpressure
         let (msg_tx, msg_rx) = mpsc::channel(DRIVER_CHANNEL_CAPACITY);
@@ -1908,15 +1932,36 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
     /// ``apply``), and ``ZoneConsensus::applied_index_atom`` borrows
     /// that Arc. Keeping the SSOT on the state machine avoids shadowing.
     fn update_cached_status(&self) {
-        self.cached_leader_id
-            .store(self.raw_node.raft.leader_id, Ordering::Relaxed);
-        self.cached_term
-            .store(self.raw_node.raft.term, Ordering::Relaxed);
-        self.cached_commit_index
-            .store(self.raw_node.raft.raft_log.committed, Ordering::Relaxed);
-        self.cached_last_index
-            .store(self.raw_node.raft.raft_log.last_index(), Ordering::Relaxed);
+        refresh_cached_status_from_raw_node(
+            &self.raw_node,
+            &self.cached_leader_id,
+            &self.cached_term,
+            &self.cached_commit_index,
+            &self.cached_last_index,
+        );
     }
+}
+
+/// Mirror the four scalar fields from `raw_node.raft.*` into their
+/// cached atoms.  SSOT for "which raft-rs field feeds which cached
+/// atom" — called both at construction (so sync readers see the
+/// persisted-storage-restored values from t=0) and from the driver
+/// loop's post-ready `update_cached_status` (so subsequent ticks keep
+/// the atoms fresh after storage writes).  Without this single SSOT,
+/// a new cached_* field added to one site but not the other would
+/// silently drift — the exact hazard that produced the boot-race bug
+/// this helper exists to close.
+fn refresh_cached_status_from_raw_node(
+    raw_node: &RawNode<RaftStorage>,
+    leader_id: &AtomicU64,
+    term: &AtomicU64,
+    commit_index: &AtomicU64,
+    last_index: &AtomicU64,
+) {
+    leader_id.store(raw_node.raft.leader_id, Ordering::Relaxed);
+    term.store(raw_node.raft.term, Ordering::Relaxed);
+    commit_index.store(raw_node.raft.raft_log.committed, Ordering::Relaxed);
+    last_index.store(raw_node.raft.raft_log.last_index(), Ordering::Relaxed);
 }
 
 #[cfg(feature = "grpc")]
