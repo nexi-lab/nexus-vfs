@@ -1800,6 +1800,42 @@ fn wire_mount_core(
         "wire_mount_core entered"
     );
 
+    // Same-zone short-circuit: when target == parent, the DT_MOUNT is
+    // a driver-mount inside an already-routed zone (e.g.
+    // `--mount-driver local-connector:sharedzone:/shared/cc-tasks/founder`
+    // — parent path `/shared/cc-tasks` routes to sharedzone, mount
+    // target zone is also sharedzone).  Two structural reasons to
+    // exit here:
+    //
+    //   1. `add_federation_mount` below would install root_backend
+    //      as the route's backend, **overwriting** the driver-mount
+    //      backend that `kernel.add_mount` already installed on this
+    //      node when `--mount-driver` ran.  vfs_write/vfs_read then
+    //      route through the wrong backend (root's PathLocal instead
+    //      of the LocalConnector), and the host-fs SSOT property
+    //      silently breaks for every read/write under the mount.
+    //
+    //   2. There's nothing to wire: the routing already lands in
+    //      `parent_zone`'s namespace; no cross-zone redirection is
+    //      meaningful.  Followers replicating the DT_MOUNT entry
+    //      will have already populated the same driver-mount via
+    //      their own `--mount-driver` invocation (driver mounts are
+    //      per-node by construction — the backend instance carries
+    //      node-local config like `local_root`, not raft-replicable).
+    //
+    // Cross-zone DT_MOUNTs (e.g. /shared → sharedzone, a true
+    // federation mount) fall through to the wire below and install
+    // the federation routing as before.
+    if parent_zone_id == target_zone_id {
+        tracing::debug!(
+            parent_zone_id = %parent_zone_id,
+            mount_path = %mount_path,
+            "wire_mount_core: same-zone DT_MOUNT — driver-mount backend \
+             stays node-local, no federation routing to install"
+        );
+        return Ok(());
+    }
+
     // 1. Look up target zone.
     let Some(target_consensus) = registry.get_node(target_zone_id) else {
         tracing::warn!(
