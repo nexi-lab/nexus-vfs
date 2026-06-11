@@ -1,0 +1,8 @@
+# nexus-team-signing-v1
+# Ed25519 public key, 32 raw bytes, base64-encoded (one key per file).
+# Generated 2026-06-11 by kernel team for plugin .so/.dylib/.dll signature
+# verification. Corresponding private key lives ONLY in nexi-lab/nexus
+# repository secret PLUGIN_SIGNING_PRIVKEY.
+# Format contract: plugin-abi crate (SIGNATURE_FILE_SUFFIX = ".sig", raw
+# 64-byte Ed25519 signature over the unmodified plugin binary bytes).
+p2dq1m9fMjvWUdsLfh1X9BzkWvNiI8Du6DeND5aFkuI=

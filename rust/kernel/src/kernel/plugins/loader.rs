@@ -10,18 +10,124 @@
 //! See KERNEL-ARCHITECTURE.md §10 for the full design.
 
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsString};
 use std::os::raw::c_void;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use contracts::rust_service::{RustCallError, RustService};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use nexus_plugin_abi::{
+    signing::{PUBKEY_LENGTH, SIGNATURE_FILE_SUFFIX, SIGNATURE_LENGTH},
     DriverCreateFn, DriverDestroyFn, DriverReadFn, DriverWriteFn, KernelHandle, PluginKind,
     PluginResult, ServiceCreateFn, ServiceDestroyFn, ServiceDispatchFn, PLUGIN_API_VERSION,
 };
 
 use crate::abc::object_store::{ObjectStore, StorageError, WriteResult};
+
+// ── Trusted plugin signing keys ─────────────────────────────────────
+//
+// Embedded at compile time from `kernel/trusted_keys/*.pub`. Each file
+// is base64(32-byte Ed25519 raw pubkey) with optional `#` comment
+// lines. Adding a new trust root = add a `.pub` file + a line below +
+// rebuild. Removing one = delete the file + the line below + rebuild
+// (this is the revocation mechanism for 0→1).
+
+const TRUSTED_KEY_FILES: &[&[u8]] = &[
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/trusted_keys/nexus-team.pub")),
+];
+
+fn trusted_keys() -> &'static [VerifyingKey] {
+    static KEYS: OnceLock<Vec<VerifyingKey>> = OnceLock::new();
+    KEYS.get_or_init(|| {
+        TRUSTED_KEY_FILES
+            .iter()
+            .map(|raw| {
+                let text = std::str::from_utf8(raw)
+                    .expect("trusted_keys/*.pub must be UTF-8 (embedded at compile time)");
+                parse_pubkey_file(text)
+                    .expect("trusted_keys/*.pub must parse (embedded at compile time)")
+            })
+            .collect()
+    })
+}
+
+/// Parse a `trusted_keys/*.pub` file: skip `#`-prefixed and blank lines,
+/// take the first remaining line as base64 of `PUBKEY_LENGTH` raw bytes.
+fn parse_pubkey_file(content: &str) -> Result<VerifyingKey, String> {
+    let line = content
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with('#'))
+        .ok_or_else(|| "no base64 pubkey line found".to_string())?;
+    let bytes = BASE64
+        .decode(line)
+        .map_err(|e| format!("base64 decode: {e}"))?;
+    if bytes.len() != PUBKEY_LENGTH {
+        return Err(format!(
+            "pubkey length {} != expected {PUBKEY_LENGTH}",
+            bytes.len()
+        ));
+    }
+    let arr: [u8; PUBKEY_LENGTH] = bytes
+        .try_into()
+        .map_err(|_| "pubkey slice to [u8; PUBKEY_LENGTH] failed".to_string())?;
+    VerifyingKey::from_bytes(&arr).map_err(|e| format!("ed25519 pubkey: {e}"))
+}
+
+/// Read `<plugin>.sig` next to the plugin and Ed25519-verify against
+/// the plugin's raw bytes using any embedded trusted key.
+///
+/// Fail-loud: a missing sig file, wrong-length sig, or sig that none of
+/// the trusted keys verifies → `Err`. There is no `--allow-unsigned`
+/// escape hatch — by design, every plugin loaded by the kernel must be
+/// signed by a key the kernel was compiled to trust.
+fn verify_signature(plugin_path: &Path) -> Result<(), String> {
+    verify_signature_against(plugin_path, trusted_keys())
+}
+
+/// Verify the sibling `.sig` of `plugin_path` against a caller-supplied
+/// keyring. Internal seam exposed so unit tests can run the full path
+/// (read sig file → read plugin → verify) against a fresh test key
+/// without going through the compile-time-embedded keys.
+fn verify_signature_against(plugin_path: &Path, keys: &[VerifyingKey]) -> Result<(), String> {
+    let mut sig_path: OsString = plugin_path.as_os_str().to_owned();
+    sig_path.push(SIGNATURE_FILE_SUFFIX);
+    let sig_path = PathBuf::from(sig_path);
+
+    let sig_bytes = std::fs::read(&sig_path).map_err(|e| {
+        format!(
+            "plugin signature missing or unreadable ({}): {e}",
+            sig_path.display()
+        )
+    })?;
+    if sig_bytes.len() != SIGNATURE_LENGTH {
+        return Err(format!(
+            "signature length {} != expected {SIGNATURE_LENGTH} ({})",
+            sig_bytes.len(),
+            sig_path.display()
+        ));
+    }
+    let sig_arr: [u8; SIGNATURE_LENGTH] = sig_bytes
+        .try_into()
+        .map_err(|_| "signature slice to [u8; SIGNATURE_LENGTH] failed".to_string())?;
+    let sig = Signature::from_bytes(&sig_arr);
+
+    let plugin_bytes = std::fs::read(plugin_path)
+        .map_err(|e| format!("read plugin for verify ({}): {e}", plugin_path.display()))?;
+
+    let any_pass = keys.iter().any(|k| k.verify(&plugin_bytes, &sig).is_ok());
+    if !any_pass {
+        return Err(format!(
+            "signature did not verify against any of {} trusted key(s) — {}",
+            keys.len(),
+            plugin_path.display()
+        ));
+    }
+    tracing::debug!(plugin = %plugin_path.display(), "plugin signature verified");
+    Ok(())
+}
 
 // ── LoadedPlugin ────────────────────────────────────────────────────
 
@@ -290,6 +396,12 @@ impl PluginLoader {
         path: &Path,
         kernel_handle: &KernelHandle,
     ) -> Result<(String, PluginKind), String> {
+        // 0. Verify the detached Ed25519 signature next to the plugin
+        // against the compile-time-embedded trusted public keys. Done
+        // BEFORE `dlopen` so a tampered or unsigned plugin never gets a
+        // chance to run constructor / `_init` code in the process.
+        verify_signature(path)?;
+
         // 1. dlopen
         let lib = unsafe { libloading::Library::new(path) }
             .map_err(|e| format!("dlopen({}): {e}", path.display()))?;
@@ -578,5 +690,115 @@ mod tests {
         let loader = PluginLoader::new();
         loader.unload_all();
         assert!(loader.list().is_empty());
+    }
+
+    // ── signing format tests ────────────────────────────────────────
+
+    #[test]
+    fn parse_pubkey_file_round_trip() {
+        use ed25519_dalek::SigningKey;
+        // Use a real Ed25519 pubkey (not arbitrary 32 bytes — those
+        // rarely form a valid Edwards point so `from_bytes` rejects them).
+        let pub_bytes = SigningKey::from_bytes(&[3u8; 32]).verifying_key().to_bytes();
+        let b64 = BASE64.encode(pub_bytes);
+        let content = format!("# header comment\n#  another\n\n{b64}\n");
+        let key = parse_pubkey_file(&content).expect("must parse");
+        assert_eq!(key.to_bytes(), pub_bytes);
+    }
+
+    #[test]
+    fn parse_pubkey_file_rejects_short_key() {
+        let content = format!("{}\n", BASE64.encode([1u8; 16])); // wrong length
+        assert!(parse_pubkey_file(&content)
+            .unwrap_err()
+            .contains("pubkey length"));
+    }
+
+    #[test]
+    fn parse_pubkey_file_rejects_invalid_base64() {
+        assert!(parse_pubkey_file("not-base64-at-all!@#")
+            .unwrap_err()
+            .contains("base64"));
+    }
+
+    #[test]
+    fn parse_pubkey_file_rejects_all_comments() {
+        let err = parse_pubkey_file("# only comments\n# more comments").unwrap_err();
+        assert!(err.contains("no base64 pubkey line"));
+    }
+
+    #[test]
+    fn embedded_trusted_keys_parse_at_runtime() {
+        // The OnceLock initialiser asserts UTF-8 + parseable, so the
+        // very act of getting trusted_keys() succeeds means every
+        // `.pub` file in TRUSTED_KEY_FILES is well-formed.
+        let keys = trusted_keys();
+        assert!(
+            !keys.is_empty(),
+            "kernel must embed at least one trusted plugin signing key"
+        );
+    }
+
+    #[test]
+    fn verify_signature_against_round_trip() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin = tmp.path().join("fake.so");
+        let plugin_bytes = b"pretend this is a dylib";
+        std::fs::write(&plugin, plugin_bytes).unwrap();
+
+        // Sign with a fresh test keypair, write .sig next to plugin.
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        let sig: Signature = signing.sign(plugin_bytes);
+        std::fs::write(
+            tmp.path().join(format!("fake.so{SIGNATURE_FILE_SUFFIX}")),
+            sig.to_bytes(),
+        )
+        .unwrap();
+
+        // Verify with the test's own pubkey — fine.
+        verify_signature_against(&plugin, &[signing.verifying_key()])
+            .expect("real sig must verify");
+
+        // Verify with an unrelated pubkey — must fail.
+        let other = SigningKey::from_bytes(&[7u8; 32]).verifying_key();
+        let err = verify_signature_against(&plugin, &[other]).unwrap_err();
+        assert!(
+            err.contains("did not verify"),
+            "wrong-key error must be loud: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_signature_missing_sig_file_fails_loud() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin = tmp.path().join("solo.so");
+        std::fs::write(&plugin, b"no sig file next to me").unwrap();
+
+        let err = verify_signature_against(&plugin, trusted_keys()).unwrap_err();
+        assert!(
+            err.contains("signature missing"),
+            "missing-sig error must be loud: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_signature_wrong_length_sig_fails_loud() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin = tmp.path().join("trunc.so");
+        std::fs::write(&plugin, b"payload").unwrap();
+        // Write a too-short "sig" (real sig must be 64 bytes).
+        std::fs::write(
+            tmp.path().join(format!("trunc.so{SIGNATURE_FILE_SUFFIX}")),
+            [0u8; 8],
+        )
+        .unwrap();
+
+        let err = verify_signature_against(&plugin, trusted_keys()).unwrap_err();
+        assert!(
+            err.contains("signature length"),
+            "short-sig error must be loud: {err}"
+        );
     }
 }
