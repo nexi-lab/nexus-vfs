@@ -1769,13 +1769,36 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                                 if let Some(address) =
                                     node_address_from_conf_context(cc.node_id, &cc.context)
                                 {
-                                    peer_map.write().unwrap().insert(cc.node_id, address);
+                                    let mut guard = peer_map.write().unwrap();
+                                    guard.insert(cc.node_id, address.clone());
+                                    let new_len = guard.len();
+                                    drop(guard);
+                                    tracing::debug!(
+                                        index = entry.index,
+                                        node_id = cc.node_id,
+                                        endpoint = %address.endpoint,
+                                        new_len,
+                                        "conf_change apply: peer_map inserted from cc.context"
+                                    );
+                                } else {
+                                    tracing::debug!(
+                                        index = entry.index,
+                                        node_id = cc.node_id,
+                                        context_len = cc.context.len(),
+                                        "conf_change apply: cc.context yielded no address — peer_map NOT updated"
+                                    );
                                 }
                             }
                             ConfChangeType::RemoveNode => {
                                 peer_map.write().unwrap().remove(&cc.node_id);
                             }
                         }
+                    } else {
+                        tracing::debug!(
+                            index = entry.index,
+                            node_id = cc.node_id,
+                            "conf_change apply: self.peer_map is None — etcd-pattern populate skipped"
+                        );
                     }
 
                     tracing::info!(

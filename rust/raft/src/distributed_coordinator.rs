@@ -1287,14 +1287,26 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
         //     fan-out, no point fanning back to ourselves.
         //   * Witnesses — vote-only nodes that never serve content.
         let Some(zm) = self.zm() else {
+            tracing::debug!(zone = %zone_id, "zone_peers: zm not available, returning empty");
             return Vec::new();
         };
         let local_id = zm.node_id();
-        zm.zone_peers(zone_id)
+        let raw = zm.zone_peers(zone_id);
+        let raw_len = raw.len();
+        let filtered: Vec<String> = raw
             .into_iter()
             .filter(|(id, _, _, is_witness)| !is_witness && *id != local_id)
             .map(|(_, _, endpoint, _)| endpoint)
-            .collect()
+            .collect();
+        tracing::debug!(
+            zone = %zone_id,
+            local_id,
+            raw_peer_count = raw_len,
+            filtered_count = filtered.len(),
+            peers = ?filtered,
+            "zone_peers: result"
+        );
+        filtered
     }
 
     fn metastore_for_zone(
