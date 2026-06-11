@@ -341,6 +341,63 @@ fn cross_zone_mount_without_replicated_parent_store_uses_durable_global_fallback
 }
 
 #[test]
+fn cross_zone_unmount_removes_durable_row_and_live_route() {
+    // #4343 review round 6: the live route is installed under the
+    // mount's TARGET zone while the durable row lives in the parent
+    // zone's store. sys_unlink must remove BOTH — removing the row but
+    // leaving the target-zone route accessible (or vice versa) is the
+    // half-unmounted state the fail-closed work exists to prevent.
+    let td = tempfile::tempdir().expect("tempdir");
+    let ms = td.path().join("metastore.redb");
+
+    let (k, ctx) = boot(Some(&ms));
+    k.sys_setattr(
+        "/corp",
+        2, // DT_MOUNT
+        "mem-corp",
+        Some(Arc::new(MemBackend::default()) as Arc<dyn ObjectStore>),
+        None,
+        None,
+        "",
+        "zone-corp",
+        false,
+        0,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None, // created_at_ms
+        None, // link_target
+        None, // source
+        None, // metastore
+    )
+    .expect("cross-zone mount /corp");
+    assert!(
+        k.has_mount("/corp", "zone-corp"),
+        "live route present in the target zone after mounting"
+    );
+
+    let unlink =
+        KernelAbi::sys_unlink(&k, "/corp", &ctx, false).expect("cross-zone unmount succeeds");
+    assert!(unlink.hit, "unlink reports the mount as removed");
+    assert!(
+        !k.has_mount("/corp", "zone-corp"),
+        "live route must be gone from the TARGET zone after unmount"
+    );
+    assert!(
+        !k.has_mount("/corp", kernel::ROOT_ZONE_ID),
+        "no stray route under the parent zone either"
+    );
+    assert!(
+        KernelAbi::sys_stat(&k, "/corp", kernel::ROOT_ZONE_ID).is_none(),
+        "durable DT_MOUNT row must be gone after unmount"
+    );
+}
+
+#[test]
 fn unmount_keeps_route_when_durable_row_delete_fails() {
     // #4343 review round 5: with the metastore durable by default, a
     // failed DT_MOUNT row delete must NOT let the unmount look

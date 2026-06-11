@@ -1161,7 +1161,10 @@ enum MetastoreMode {
 /// Precedence:
 ///   * unset → `<data_dir>/metastore.redb` (durable default).
 ///   * the literal `ephemeral` → tempfile metastore (explicit opt-out).
-///   * any other non-empty value → that file path.
+///   * any other non-empty value → that file path. Relative paths are
+///     resolved against `data_dir`, NOT the process cwd — a cwd-relative
+///     store would silently re-anchor when a wrapper or restart changes
+///     the working directory, which presents as namespace loss.
 ///   * set but EMPTY → hard error. An empty value usually means broken
 ///     templating or an unset secret, and silently degrading to the
 ///     ephemeral store would reintroduce the exact restart data-loss
@@ -1179,7 +1182,14 @@ fn resolve_metastore_path(
              a non-durable metastore (the namespace will NOT survive restarts)."
                 .to_string(),
         ),
-        Some(v) => Ok(MetastoreMode::Durable(PathBuf::from(v))),
+        Some(v) => {
+            let p = PathBuf::from(v);
+            Ok(MetastoreMode::Durable(if p.is_absolute() {
+                p
+            } else {
+                data_dir.join(p)
+            }))
+        }
     }
 }
 
@@ -1255,6 +1265,20 @@ mod tests {
         assert_eq!(
             p,
             Ok(MetastoreMode::Durable(PathBuf::from("/elsewhere/ms.redb")))
+        );
+    }
+
+    #[test]
+    fn metastore_path_relative_env_resolves_against_data_dir() {
+        // A cwd-relative store would silently re-anchor when a wrapper
+        // changes the working directory — relative overrides must pin
+        // to the data dir instead.
+        let p = resolve_metastore_path(Some("custom/ms.redb"), std::path::Path::new("/data"));
+        assert_eq!(
+            p,
+            Ok(MetastoreMode::Durable(PathBuf::from(
+                "/data/custom/ms.redb"
+            )))
         );
     }
 
