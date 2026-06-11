@@ -205,8 +205,25 @@ impl Kernel {
         // 2. Route (pure Rust LPM)
         let route = match self.vfs_router.route(path, &ctx.zone_id) {
             Some(r) => r,
-            None => return Err(not_found()),
+            None => {
+                tracing::debug!(
+                    path = %path,
+                    ctx_zone = %ctx.zone_id,
+                    "sys_read: route() returned None — no mount covers path"
+                );
+                return Err(not_found());
+            }
         };
+        tracing::debug!(
+            path = %path,
+            ctx_zone = %ctx.zone_id,
+            mount = %route.mount_point,
+            route_zone = %route.zone_id,
+            backend_present = route.backend.is_some(),
+            metastore_present = route.metastore.is_some(),
+            backend_path = %route.backend_path,
+            "sys_read: route resolved"
+        );
 
         // 3. MetaStore lookup. The metastore impl serves cache hits from
         // its own internal `DashMap` projection (see
@@ -269,22 +286,52 @@ impl Kernel {
                     let peers = self
                         .distributed_coordinator()
                         .zone_peers(self, &route.zone_id);
+                    tracing::debug!(
+                        path = %path,
+                        zone_id = %route.zone_id,
+                        peer_count = peers.len(),
+                        peers = ?peers,
+                        "sys_read fan-out: backend miss, attempting peers"
+                    );
                     if !peers.is_empty() {
                         let client = self.peer_client_arc();
                         for peer_addr in &peers {
-                            if let Ok(data) = client.fetch(peer_addr, path) {
-                                return Ok(SysReadResult {
-                                    data: Some(data),
-                                    post_hook_needed: self.read_hook_count.load(Ordering::Relaxed)
-                                        > 0,
-                                    content_id: None,
-                                    gen: 0,
-                                    entry_type: DT_REG,
-                                    stream_next_offset: None,
-                                });
+                            match client.fetch(peer_addr, path) {
+                                Ok(data) => {
+                                    tracing::debug!(
+                                        path = %path,
+                                        peer = %peer_addr,
+                                        bytes = data.len(),
+                                        "sys_read fan-out: peer hit"
+                                    );
+                                    return Ok(SysReadResult {
+                                        data: Some(data),
+                                        post_hook_needed: self
+                                            .read_hook_count
+                                            .load(Ordering::Relaxed)
+                                            > 0,
+                                        content_id: None,
+                                        gen: 0,
+                                        entry_type: DT_REG,
+                                        stream_next_offset: None,
+                                    });
+                                }
+                                Err(e) => {
+                                    tracing::debug!(
+                                        path = %path,
+                                        peer = %peer_addr,
+                                        error = %e,
+                                        "sys_read fan-out: peer fetch failed"
+                                    );
+                                }
                             }
                         }
                     }
+                } else {
+                    tracing::debug!(
+                        path = %path,
+                        "sys_read fan-out: skipped (propagates_cross_node=true — peer-served ctx)"
+                    );
                 }
                 return Err(not_found());
             }
