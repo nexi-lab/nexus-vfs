@@ -495,11 +495,45 @@ impl VFSRouter {
     /// wrapper paid for every miss, including `.ok()` callers that
     /// discarded it.
     pub fn route(&self, path: &str, zone_id: &str) -> Option<RouteResult> {
-        self.route_in_zone(path, zone_id).or_else(|| {
+        let initial = self.route_in_zone(path, zone_id).or_else(|| {
             (zone_id != contracts::ROOT_ZONE_ID)
                 .then(|| self.route_in_zone(path, contracts::ROOT_ZONE_ID))
                 .flatten()
-        })
+        })?;
+
+        // Federation-mount recursion: when the LPM hit is a
+        // federation_mount (resolved_zone != lookup zone), retry the
+        // route inside the target zone's namespace.  Operator-installed
+        // driver mounts (e.g. `--mount-driver
+        // local-connector:sharedzone:/shared/cc-tasks/founder:{...}`)
+        // are keyed under their own zone (`/sharedzone/...`), so an
+        // initial root-zone LPM walks through the parent federation
+        // mount (`/root/shared` → sharedzone) and hands back the
+        // root_backend the federation install carries.  Without this
+        // recursion the more-specific driver mount in the target zone
+        // is unreachable, and reads/writes against paths under it
+        // silently route through root's PathLocal instead of the
+        // operator-configured backend.
+        //
+        // Cost is amortised at most one extra LPM walk per syscall, and
+        // ONLY when the first walk actually resolves into a different
+        // zone (i.e. the path crosses a federation mount) — the
+        // overwhelming hit pattern (`/root/...` paths in the local zone)
+        // takes a single walk and the early-return below skips the
+        // second.
+        if initial.zone_id != zone_id {
+            if let Some(deeper) = self.route_in_zone(path, &initial.zone_id) {
+                // Only prefer the deeper hit when it's *strictly more
+                // specific* than the federation mount we routed
+                // through — same canonical mount point means the
+                // federation mount itself; keep the initial answer.
+                if deeper.mount_point != initial.mount_point {
+                    return Some(deeper);
+                }
+            }
+        }
+
+        Some(initial)
     }
 
     fn route_in_zone(&self, path: &str, zone_id: &str) -> Option<RouteResult> {
