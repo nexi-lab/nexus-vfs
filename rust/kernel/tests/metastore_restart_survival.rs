@@ -218,6 +218,76 @@ fn non_root_mount_entry_row_survives_kernel_restart() {
 }
 
 #[test]
+fn remount_persists_dt_mount_row_into_parent_store_not_child() {
+    // Regression (#4343 review round 3): DLC::mount used to route
+    // `mount_point` itself when picking the store for the DT_MOUNT row.
+    // On a REMOUNT of an existing mount that carries a per-mount
+    // metastore, that exact-match routes to the child — the row lands
+    // in the child's own store and the parent's copy goes stale. The
+    // fix walks up to the parent path first (symmetric with unmount).
+    //
+    // Discriminator: remount /sub (same zone — canonical routing keys
+    // embed the zone, so only a same-zone remount hits the exact-match
+    // trap), then open both stores directly. The child's per-mount
+    // store must stay CLEAN; the old code wrote the remount row there.
+    use kernel::meta_store::{LocalMetaStore, MetaStore};
+
+    let td = tempfile::tempdir().expect("tempdir");
+    let ms = td.path().join("metastore.redb");
+    let sub_ms_path = td.path().join("sub-mount.redb");
+
+    {
+        let (k, _ctx) = boot(Some(&ms));
+        let mount_sub = |per_mount: Arc<dyn MetaStore>| {
+            k.sys_setattr(
+                "/sub",
+                2, // DT_MOUNT
+                "mem-sub",
+                Some(Arc::new(MemBackend::default()) as Arc<dyn ObjectStore>),
+                Some(per_mount),
+                None,
+                "",
+                kernel::ROOT_ZONE_ID,
+                false,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None, // created_at_ms
+                None, // link_target
+                None, // source
+                None, // metastore
+            )
+        };
+        let sub_store: Arc<dyn MetaStore> =
+            Arc::new(LocalMetaStore::open(&sub_ms_path).expect("open per-mount store"));
+        mount_sub(Arc::clone(&sub_store)).expect("first mount /sub");
+        // Same-zone remount: route(mount_point) now exact-matches /sub
+        // itself — the row must STILL go to the parent store.
+        mount_sub(sub_store).expect("remount /sub");
+        k.release_metastores();
+    }
+
+    let parent = LocalMetaStore::open(&ms).expect("reopen parent store");
+    let row = parent
+        .get("/sub")
+        .expect("read parent store")
+        .expect("DT_MOUNT row for /sub must live in the PARENT store");
+    assert_eq!(row.entry_type, 2, "row must be a DT_MOUNT entry");
+
+    let child = LocalMetaStore::open(&sub_ms_path).expect("reopen child store");
+    assert!(
+        child.get("/sub").expect("read child store").is_none(),
+        "the DT_MOUNT row for /sub must NOT leak into /sub's own \
+         per-mount store on remount (old exact-match routing wrote it there)"
+    );
+}
+
+#[test]
 fn non_root_mount_without_parent_route_fails_closed() {
     // #4343 follow-up: a non-root mount with no enclosing route has
     // nowhere to persist its DT_MOUNT entry. Installing it anyway would

@@ -65,7 +65,19 @@ impl DriverLifecycleCoordinator {
         // it would NOT find the right (parent) zone — use `route()`'s
         // longest-prefix walk to find the enclosing mount, then write
         // through that mount's metastore with the full path as the key.
-        let route = kernel.vfs_router_arc().route(mount_point, "root");
+        // Symmetric with `unmount()`: looking up `mount_point` itself
+        // routes through an EXISTING mount at that exact path (the
+        // remount/rebind case) and would persist the DT_MOUNT row into
+        // the child's own store instead of the parent's — after a
+        // restart the parent store would replay a stale or missing
+        // entry. Walk up to the parent path first so longest-prefix
+        // routing skips this mount and finds the actual parent.
+        let parent_path = mount_point
+            .rfind('/')
+            .filter(|&i| i > 0)
+            .map(|i| mount_point[..i].to_string())
+            .unwrap_or_else(|| "/".to_string());
+        let route = kernel.vfs_router_arc().route(&parent_path, "root");
         if route.is_none() && mount_point != "/" {
             // Fail closed (#4343): a non-root mount with no enclosing route
             // has nowhere to persist its DT_MOUNT entry — installing it
