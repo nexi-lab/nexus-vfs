@@ -2800,6 +2800,7 @@ mod tests {
             request_id: "req-1".to_string(),
             context_zone_id: None,
             zone_perms: vec![],
+            propagates_cross_node: false,
         };
 
         kernel.dispatch_mutation(FileEventType::FileWrite, "/foo.txt", &ctx, |ev| {
@@ -2850,6 +2851,7 @@ mod tests {
             request_id: String::new(),
             context_zone_id: None,
             zone_perms: vec![],
+            propagates_cross_node: false,
         };
 
         kernel.dispatch_mutation(FileEventType::DirCreate, "/d", &ctx, |_ev| {});
