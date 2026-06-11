@@ -398,6 +398,65 @@ fn cross_zone_unmount_removes_durable_row_and_live_route() {
 }
 
 #[test]
+fn orphan_mount_row_unlinks_after_restart_without_live_route() {
+    // #4343 review round 8 counter-case: after a restart the durable
+    // DT_MOUNT rows exist but no routes are replayed (bare kernel).
+    // Unlinking such an orphan row must SUCCEED row-only — refusing
+    // because no live route can be removed would make post-restart
+    // cleanup impossible.
+    let td = tempfile::tempdir().expect("tempdir");
+    let ms = td.path().join("metastore.redb");
+
+    {
+        let (k, _ctx) = boot(Some(&ms));
+        k.sys_setattr(
+            "/corp",
+            2, // DT_MOUNT
+            "mem-corp",
+            Some(Arc::new(MemBackend::default()) as Arc<dyn ObjectStore>),
+            None,
+            None,
+            "",
+            "zone-corp",
+            false,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None, // created_at_ms
+            None, // link_target
+            None, // source
+            None, // metastore
+        )
+        .expect("cross-zone mount /corp");
+        k.release_metastores();
+    }
+
+    // Restart: only "/" re-mounted, /corp row durable but route absent.
+    let (k2, ctx) = boot(Some(&ms));
+    assert!(
+        !k2.has_mount("/corp", "zone-corp"),
+        "precondition: no live route after restart (bare kernel does not replay)"
+    );
+    assert!(
+        KernelAbi::sys_stat(&k2, "/corp", kernel::ROOT_ZONE_ID).is_some(),
+        "precondition: durable row survived the restart"
+    );
+
+    let unlink = KernelAbi::sys_unlink(&k2, "/corp", &ctx, false)
+        .expect("unlinking an orphan mount row must succeed");
+    assert!(unlink.hit, "row-only unlink still counts as a removal");
+    assert!(
+        KernelAbi::sys_stat(&k2, "/corp", kernel::ROOT_ZONE_ID).is_none(),
+        "durable row must be gone after the orphan unlink"
+    );
+}
+
+#[test]
 fn unmount_keeps_route_when_durable_row_delete_fails() {
     // #4343 review round 5: with the metastore durable by default, a
     // failed DT_MOUNT row delete must NOT let the unmount look

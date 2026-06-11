@@ -1240,21 +1240,12 @@ impl Kernel {
                 // Fail closed (#4343): a failed durable-row delete keeps
                 // the route installed and surfaces here, instead of the
                 // unmount looking successful and the mount resurrecting
-                // on the next restart/replay.
+                // on the next restart/replay. A row WITHOUT a live route
+                // is the normal pre-replay shape and unlinks row-only —
+                // `removed` reflects whether anything actually went away.
                 let removed = self.dlc.unmount(self, path, &zone_id)?;
-                if !removed {
-                    // The durable row existed (we just resolved it) but no
-                    // live route was removed — routing/metastore drift.
-                    // Surfacing it beats returning hit=true with a route
-                    // still installed.
-                    return Err(KernelError::IOError(format!(
-                        "DT_MOUNT unlink for {path}: durable row handled but no live \
-                         route was removed in zone {zone_id} — routing/metastore \
-                         inconsistency"
-                    )));
-                }
                 return Ok(SysUnlinkResult {
-                    hit: true,
+                    hit: removed,
                     entry_type: DT_MOUNT,
                     post_hook_needed: self.delete_hook_count.load(Ordering::Relaxed) > 0,
                     path: path.to_string(),

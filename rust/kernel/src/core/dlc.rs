@@ -185,11 +185,17 @@ impl DriverLifecycleCoordinator {
 
     /// Unmount with full lifecycle: metastore delete + routing remove.
     ///
-    /// Returns `Ok(true)` if the mount was removed, `Ok(false)` if not
-    /// found. Fails closed (#4343): when the durable DT_MOUNT row cannot
-    /// be deleted, the live route is NOT removed — otherwise the unmount
+    /// Returns `Ok(true)` when something was actually removed (durable
+    /// row, live route, or both), `Ok(false)` when neither existed.
+    ///
+    /// Fail-closed semantics (#4343): the durable row is the
+    /// authoritative state. When its delete FAILS, the live route is
+    /// NOT removed and the error propagates — otherwise the unmount
     /// looks successful while the stale row resurrects the mount on the
-    /// next restart/replay.
+    /// next restart/replay. A row WITHOUT a live route is, by contrast,
+    /// a normal shape (post-restart rows exist before any replay wires
+    /// routes back), so unlinking it succeeds row-only with a debug log
+    /// rather than an error.
     pub fn unmount(
         &self,
         kernel: &Kernel,
@@ -212,12 +218,13 @@ impl DriverLifecycleCoordinator {
             .map(|i| mount_point[..i].to_string())
             .unwrap_or_else(|| "/".to_string());
         let route = kernel.vfs_router_arc().route(&parent_path, "root");
+        let mut row_existed = false;
         if let Some(parent_route) = route {
             let deleted =
                 kernel.with_metastore(&parent_route.mount_point, |ms| ms.delete(mount_point));
             match deleted {
                 // Ok(false) = row already absent — idempotent, fine.
-                Some(Ok(_existed)) => {}
+                Some(Ok(existed)) => row_existed = existed,
                 Some(Err(e)) => {
                     tracing::error!(
                         target: "kernel::dlc",
@@ -237,7 +244,19 @@ impl DriverLifecycleCoordinator {
         }
 
         // 2. Remove from routing table — the per-mount metastore Arc
-        // (with its internal cache) drops with the MountEntry.
-        Ok(kernel.remove_mount(mount_point, zone_id))
+        // (with its internal cache) drops with the MountEntry. A row
+        // without a live route is a normal post-restart shape (rows
+        // survive; routes wait for replay), so this is observational,
+        // not an error.
+        let route_removed = kernel.remove_mount(mount_point, zone_id);
+        if row_existed && !route_removed {
+            tracing::debug!(
+                target: "kernel::dlc",
+                mount = mount_point,
+                zone = zone_id,
+                "DT_MOUNT row removed with no live route present (normal before replay wires routes back)",
+            );
+        }
+        Ok(row_existed || route_removed)
     }
 }
