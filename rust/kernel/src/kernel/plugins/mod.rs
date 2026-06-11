@@ -251,7 +251,10 @@ mod tests {
             if ext == std::env::consts::DLL_EXTENSION {
                 continue;
             }
-            assert!(!is_plugin_extension(ext), "should reject foreign ext {ext:?}");
+            assert!(
+                !is_plugin_extension(ext),
+                "should reject foreign ext {ext:?}"
+            );
         }
     }
 
