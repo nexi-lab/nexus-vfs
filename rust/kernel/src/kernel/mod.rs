@@ -1032,9 +1032,20 @@ impl Kernel {
             return;
         }
 
+        tracing::debug!(
+            path = %path,
+            zone_id = %zone_id,
+            size,
+            "observe_backend_content: peer-served ctx, attempting propose"
+        );
+
         // Idempotency check: skip propose if a metadata row already
         // covers this path.
         if matches!(self.metastore_get(path), Ok(Some(_))) {
+            tracing::debug!(
+                path = %path,
+                "observe_backend_content: metadata already present, skipping propose"
+            );
             return;
         }
 
@@ -1071,6 +1082,10 @@ impl Kernel {
             );
             return;
         }
+        tracing::debug!(
+            path = %path,
+            "observe_backend_content: metastore_put succeeded"
+        );
 
         // Fire a FileWrite observer event so search-index / audit hooks
         // see the materialization the same way they see an explicit
