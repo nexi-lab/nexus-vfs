@@ -34,9 +34,10 @@ use crate::abc::object_store::{ObjectStore, StorageError, WriteResult};
 // rebuild. Removing one = delete the file + the line below + rebuild
 // (this is the revocation mechanism for 0→1).
 
-const TRUSTED_KEY_FILES: &[&[u8]] = &[
-    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/trusted_keys/nexus-team.pub")),
-];
+const TRUSTED_KEY_FILES: &[&[u8]] = &[include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/trusted_keys/nexus-team.pub"
+))];
 
 fn trusted_keys() -> &'static [VerifyingKey] {
     static KEYS: OnceLock<Vec<VerifyingKey>> = OnceLock::new();
@@ -699,7 +700,9 @@ mod tests {
         use ed25519_dalek::SigningKey;
         // Use a real Ed25519 pubkey (not arbitrary 32 bytes — those
         // rarely form a valid Edwards point so `from_bytes` rejects them).
-        let pub_bytes = SigningKey::from_bytes(&[3u8; 32]).verifying_key().to_bytes();
+        let pub_bytes = SigningKey::from_bytes(&[3u8; 32])
+            .verifying_key()
+            .to_bytes();
         let b64 = BASE64.encode(pub_bytes);
         let content = format!("# header comment\n#  another\n\n{b64}\n");
         let key = parse_pubkey_file(&content).expect("must parse");
