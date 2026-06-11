@@ -1280,6 +1280,23 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
         self.bootstrap_done.load(Ordering::Acquire)
     }
 
+    fn zone_peers(&self, _kernel: &Kernel, zone_id: &str) -> Vec<String> {
+        // SSOT — `ZoneManager::zone_peers` enumerates the ConfState
+        // roster.  Filter out:
+        //   * The local node — it's already the caller of the
+        //     fan-out, no point fanning back to ourselves.
+        //   * Witnesses — vote-only nodes that never serve content.
+        let Some(zm) = self.zm() else {
+            return Vec::new();
+        };
+        let local_id = zm.node_id();
+        zm.zone_peers(zone_id)
+            .into_iter()
+            .filter(|(id, _, _, is_witness)| !is_witness && *id != local_id)
+            .map(|(_, _, endpoint, _)| endpoint)
+            .collect()
+    }
+
     fn metastore_for_zone(
         &self,
         _kernel: &Kernel,

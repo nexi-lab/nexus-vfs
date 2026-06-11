@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use crate::blob_fetcher::BlobFetcher;
 
-use kernel::kernel::OperationContext;
+use kernel::kernel::{Kernel, OperationContext};
 use kernel::vfs_router::VFSRouter;
 
 /// Closure type for "look up locally-stored content_id at this path" —
@@ -39,13 +39,19 @@ type LocalContentIdLookup = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 /// Kernel-side `BlobFetcher` — backed by the kernel's `VFSRouter` plus
 /// a narrow content-id-lookup closure.
 pub struct KernelBlobFetcher {
+    kernel: Arc<Kernel>,
     vfs_router: Arc<VFSRouter>,
     lookup_local_content_id: LocalContentIdLookup,
 }
 
 impl KernelBlobFetcher {
-    pub fn new(vfs_router: Arc<VFSRouter>, lookup_local_content_id: LocalContentIdLookup) -> Self {
+    pub fn new(
+        kernel: Arc<Kernel>,
+        vfs_router: Arc<VFSRouter>,
+        lookup_local_content_id: LocalContentIdLookup,
+    ) -> Self {
         Self {
+            kernel,
             vfs_router,
             lookup_local_content_id,
         }
@@ -85,7 +91,18 @@ impl BlobFetcher for KernelBlobFetcher {
         if content_id.is_empty() {
             return Err("empty content_id".to_string());
         }
-        let ctx = OperationContext::new("system", contracts::ROOT_ZONE_ID, true, None, true);
+        // Peer-served call: the consumer of this read is a remote node
+        // demanding bytes via the ReadBlob RPC.  Setting
+        // `propagates_cross_node = true` does TWO things in lockstep
+        // via the duality contract on OperationContext:
+        //   1. Any backend hit triggers `observe_backend_content` to
+        //      materialize metadata with `last_writer_address = self`,
+        //      so the demanding peer's next read uses
+        //      `try_remote_fetch` directly (no second round-trip).
+        //   2. Fan-out is disabled — we already are the one being
+        //      asked, no looping back to peers.
+        let mut ctx = OperationContext::new("system", contracts::ROOT_ZONE_ID, true, None, true);
+        ctx.propagates_cross_node = true;
 
         // Step 1: try path-style routing → local mount read.
         if let Some(route) = self.vfs_router.route(content_id, contracts::ROOT_ZONE_ID) {
@@ -96,6 +113,15 @@ impl BlobFetcher for KernelBlobFetcher {
                 .as_ref()
                 .and_then(|b| b.read_content(&local_content_id, &ctx).ok())
             {
+                // `content_id` here is the global VFS path the peer
+                // asked for — that's the key the metadata is keyed on.
+                self.kernel.observe_backend_content(
+                    content_id,
+                    bytes.len() as u64,
+                    None,
+                    &route.zone_id,
+                    &ctx,
+                );
                 return Ok(bytes);
             }
         }
@@ -146,6 +172,10 @@ pub fn install(kernel: &Arc<kernel::kernel::Kernel>) {
         }
     };
     let lookup = kernel.content_id_lookup_fn(contracts::ROOT_ZONE_ID);
-    let fetcher = Arc::new(KernelBlobFetcher::new(kernel.vfs_router_arc(), lookup));
+    let fetcher = Arc::new(KernelBlobFetcher::new(
+        Arc::clone(kernel),
+        kernel.vfs_router_arc(),
+        lookup,
+    ));
     *slot.write() = Some(fetcher as Arc<dyn BlobFetcher>);
 }
