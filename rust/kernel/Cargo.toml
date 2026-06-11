@@ -46,6 +46,10 @@ sha2 = { version = "0.11", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["sink"], optional = true }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 base64 = "0.22"
+# Ed25519 signature verification for dlopen'd plugins (PluginLoader::load
+# rejects an unsigned or wrong-signed plugin). Trusted public keys live
+# in `trusted_keys/*.pub` and are embedded at compile time.
+ed25519-dalek = "2"
 bytes = "1"
 mimalloc = { workspace = true, optional = true }
 
