@@ -957,6 +957,134 @@ impl Kernel {
         }
     }
 
+    /// Lazily materialize metadata for a path whose backend just produced
+    /// bytes — the single kernel-side hook unifying sys_write commit and
+    /// peer-served read paths.
+    ///
+    /// # Contract
+    ///
+    /// One rule, gated by [`OperationContext::propagates_cross_node`]:
+    /// **propose metadata iff the current operation's consumer is
+    /// federation-visible**.
+    ///
+    /// Three call sites converge here:
+    ///
+    /// 1. **`sys_write` commit** — the caller explicitly chose to write
+    ///    through Nexus; `propagates_cross_node = true` is set at sys_write
+    ///    entry.  Metadata always proposed.
+    ///
+    /// 2. **`sys_read` backend fallback (metastore-miss → backend hit)** —
+    ///    for a local user the ctx is `propagates_cross_node = false`, so
+    ///    this helper is a near-zero-cost no-op (one inlined bool check).
+    ///    For a peer-served call (the BlobFetcher entry synthesises a ctx
+    ///    with `propagates_cross_node = true`), the bytes from the local
+    ///    backend get a metadata entry whose `last_writer_address` makes
+    ///    every future cross-node read routable via existing
+    ///    `try_remote_fetch` (no new substrate, no new field).
+    ///
+    /// 3. **Anywhere a future caller wants the same "lazy materialize"
+    ///    semantic** — by routing through this helper with the appropriate
+    ///    ctx flag, that caller automatically picks up the same idempotency
+    ///    + raft-aware proposal flow.
+    ///
+    /// # Idempotency
+    ///
+    /// Pre-checks `metastore_get` and short-circuits if the entry already
+    /// exists.  Concurrent observers (e.g. two peers fan-out-served by the
+    /// same host in the same instant) race only on the small window
+    /// between the get and the put; raft serialises any double-propose, and
+    /// the second apply is a last-writer-wins no-op against an entry of the
+    /// same shape.
+    ///
+    /// # last_writer_address semantic
+    ///
+    /// Auto-filled by `build_metadata` from `self.self_address` — for the
+    /// peer-served case (call site #2 above), the helper runs on the
+    /// **byte host** node (the peer responding to a `ReadBlob`), so the
+    /// `last_writer_address` records "where to fetch the bytes from",
+    /// which IS what `try_remote_fetch` needs.  No new routing layer
+    /// required.
+    ///
+    /// # Known limitations
+    ///
+    /// * **Delete propagation** — host-fs deletions don't trigger this
+    ///   helper.  Metadata can outlive the file briefly; on remote
+    ///   `ReadBlob` against deleted content the host returns a backend
+    ///   error and the caller sees `FileNotFound`.  Acceptable for the
+    ///   cc-tasks-share use case (append-mostly); other drivers may want
+    ///   TTL or a ReadBlob-miss-but-metadata-exists invalidation hook.
+    ///
+    /// * **Stale `size` / `modified_at_ms`** — content changes in-place
+    ///   (host-fs overwrite) keep serving correct bytes via `try_remote_fetch`,
+    ///   but `vfs_stat` returns the metadata's frozen snapshot.  Acceptable
+    ///   for cc-tasks-share (CC doesn't depend on precise stat).
+    pub(crate) fn observe_backend_content(
+        &self,
+        path: &str,
+        size: u64,
+        content_id: Option<String>,
+        zone_id: &str,
+        ctx: &OperationContext,
+    ) {
+        // Single duality gate.  Local-user reads early-return — one
+        // predicted-not-taken branch on the hot path, fully inlinable.
+        if !ctx.propagates_cross_node() {
+            return;
+        }
+
+        // Idempotency check: skip propose if a metadata row already
+        // covers this path.
+        if matches!(self.metastore_get(path), Ok(Some(_))) {
+            return;
+        }
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+
+        let meta = self.build_metadata(
+            path,
+            zone_id,
+            crate::meta_store::DT_REG,
+            size,
+            content_id,
+            /* gen */ 0,
+            /* version */ 1,
+            /* mime_type */ None,
+            /* created_at_ms */ Some(now_ms),
+            /* modified_at_ms */ Some(now_ms),
+        );
+
+        if let Err(e) = self.metastore_put(path, meta) {
+            // Best-effort.  Failure means the next read on this node
+            // still benefits from the backend-fallback path, and the
+            // next peer-served call will retry the propose.  The
+            // alternative — surfacing the error to the read path —
+            // would let a transient raft hiccup convert a successful
+            // read into a failure, which is the wrong trade-off.
+            tracing::warn!(
+                target: "kernel::observe",
+                path = %path,
+                error = ?e,
+                "observe_backend_content: metastore_put failed; metadata not materialized this round",
+            );
+            return;
+        }
+
+        // Fire a FileWrite observer event so search-index / audit hooks
+        // see the materialization the same way they see an explicit
+        // sys_write.  Same shape, so downstream consumers stay uniform.
+        self.dispatch_mutation(
+            crate::core::dispatch::FileEventType::FileWrite,
+            path,
+            ctx,
+            |ev| {
+                ev.size = Some(size);
+            },
+        );
+    }
+
     // ── MetaStore proxy methods (for Python RustMetastoreProxy) ────────
     //
     // These route via ``vfs_router.route(path, ROOT_ZONE_ID, ...)`` so a
