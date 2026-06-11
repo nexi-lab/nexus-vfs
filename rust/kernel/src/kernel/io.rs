@@ -248,6 +248,44 @@ impl Kernel {
                         stream_next_offset: None,
                     });
                 }
+                // Local backend miss — fan out to peers in this zone
+                // if this is a local-user read (peer-served calls have
+                // `propagates_cross_node = true`, so `fan_out_allowed`
+                // is false; they short-circuit here to a clean
+                // not-found rather than looping back through the
+                // federation transport).
+                //
+                // Cold cross-node first read: Mac's CC wrote a JSON to
+                // host fs (no Nexus involvement, no metadata).  Win's
+                // first read finds no metadata, no local backend hit,
+                // and reaches here.  The fan-out dials each peer's
+                // `BlobFetcher::read`; the peer that hits its own
+                // backend materialises metadata in the shared zone
+                // (via `observe_backend_content` in BlobFetcher) so
+                // Win's next read on the same path goes through the
+                // existing `try_remote_fetch` fast path with no
+                // fan-out cost.
+                if ctx.fan_out_allowed() {
+                    let peers = self
+                        .distributed_coordinator()
+                        .zone_peers(self, &route.zone_id);
+                    if !peers.is_empty() {
+                        let client = self.peer_client_arc();
+                        for peer_addr in &peers {
+                            if let Ok(data) = client.fetch(peer_addr, path) {
+                                return Ok(SysReadResult {
+                                    data: Some(data),
+                                    post_hook_needed: self.read_hook_count.load(Ordering::Relaxed)
+                                        > 0,
+                                    content_id: None,
+                                    gen: 0,
+                                    entry_type: DT_REG,
+                                    stream_next_offset: None,
+                                });
+                            }
+                        }
+                    }
+                }
                 return Err(not_found());
             }
         };
