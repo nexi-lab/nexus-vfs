@@ -40,6 +40,36 @@ fn unwrap_result_envelope(value: &serde_json::Value) -> &serde_json::Value {
     value.get("result").unwrap_or(value)
 }
 
+/// Interpret a `sys_unlink` Call response for `MetaStore::delete`.
+///
+/// Error envelopes are REAL failures and must surface as `Err` — the
+/// old `Ok(!is_error)` collapsed them into "row absent", which let
+/// fail-closed unmount callers (#4343) remove live routes while the
+/// authoritative remote row persisted. Miss vs removed mirrors
+/// `sys_unlink`'s `hit` field when present; an absent or malformed
+/// body still acks the delete (`Ok(true)`).
+fn interpret_unlink_response(
+    path: &str,
+    resp: &[u8],
+    is_error: bool,
+) -> Result<bool, MetaStoreError> {
+    if is_error {
+        return Err(MetaStoreError::IOError(format!(
+            "sys_unlink failed for {path}"
+        )));
+    }
+    let existed = serde_json::from_slice::<serde_json::Value>(resp)
+        .ok()
+        .map(|v| {
+            unwrap_result_envelope(&v)
+                .get("hit")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true)
+        })
+        .unwrap_or(true);
+    Ok(existed)
+}
+
 impl MetaStore for RemoteMetaStore {
     fn get(&self, path: &str) -> Result<Option<FileMetadata>, MetaStoreError> {
         if let Some(cached) = self.cache.get(path) {
@@ -122,12 +152,12 @@ impl MetaStore for RemoteMetaStore {
         let bytes =
             serde_json::to_vec(&payload).map_err(|e| MetaStoreError::IOError(e.to_string()))?;
 
-        let (_resp, is_error) = self
+        let (resp, is_error) = self
             .transport
             .call("sys_unlink", &bytes)
             .map_err(MetaStoreError::IOError)?;
 
-        Ok(!is_error)
+        interpret_unlink_response(path, &resp, is_error)
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<FileMetadata>, MetaStoreError> {
@@ -328,6 +358,33 @@ fn parse_metadata_from_json(value: &serde_json::Value) -> Result<FileMetadata, M
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unlink_response_error_envelope_is_err_not_miss() {
+        // #4343: collapsing a remote error into Ok(false) ("row absent")
+        // let unmount remove live routes while the remote row persisted.
+        let r = interpret_unlink_response("/m", br#"{"error":"boom"}"#, true);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn unlink_response_hit_false_is_clean_miss() {
+        let r = interpret_unlink_response("/m", br#"{"hit":false}"#, false);
+        assert_eq!(r.unwrap(), false);
+    }
+
+    #[test]
+    fn unlink_response_hit_true_and_bare_ack_are_removals() {
+        assert_eq!(
+            interpret_unlink_response("/m", br#"{"hit":true}"#, false).unwrap(),
+            true
+        );
+        assert_eq!(interpret_unlink_response("/m", b"", false).unwrap(), true);
+        assert_eq!(
+            interpret_unlink_response("/m", br#"{"result":{"hit":false}}"#, false).unwrap(),
+            false
+        );
+    }
 
     #[test]
     fn parse_metadata_from_json_preserves_gen() {

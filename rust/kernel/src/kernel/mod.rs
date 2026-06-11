@@ -3067,6 +3067,11 @@ mod tests {
     #[test]
     fn sys_setattr_mount_dispatches_mount_event() {
         let kernel = Kernel::new();
+        // Root mount first — DLC::mount fails closed on a non-root mount
+        // with no enclosing route (#4343), matching production flows
+        // which always establish "/" before zone mounts. Registered
+        // before the observer so only "/zone-new" is captured below.
+        setattr(&kernel, "/", 2).unwrap();
         let captured = Arc::new(parking_lot::Mutex::new(None));
         kernel.register_observer(
             Arc::new(CapturingObserver {

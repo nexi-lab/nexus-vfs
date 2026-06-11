@@ -1175,20 +1175,16 @@ impl Kernel {
             let req = &reqs[0];
             return vec![self.sys_unlink_single(&req.path, ctx, req.recursive)];
         }
+        // Per-item errors propagate as-is — the return type is
+        // Vec<Result> precisely so batch callers see them, and the
+        // single-item fast path above already propagates. Mapping real
+        // failures to hit=false misses hid fail-closed unmount errors
+        // (#4343): a DT_MOUNT whose durable-row delete failed kept its
+        // live route, while the batch caller got a silent miss and no
+        // retry signal. True misses are Ok(hit=false) from
+        // sys_unlink_single already, not Err.
         reqs.iter()
-            .map(
-                |req| match self.sys_unlink_single(&req.path, ctx, req.recursive) {
-                    Ok(r) => Ok(r),
-                    Err(_) => Ok(SysUnlinkResult {
-                        hit: false,
-                        entry_type: 0,
-                        post_hook_needed: false,
-                        path: req.path.clone(),
-                        content_id: None,
-                        size: 0,
-                    }),
-                },
-            )
+            .map(|req| self.sys_unlink_single(&req.path, ctx, req.recursive))
             .collect()
     }
 
@@ -1323,10 +1319,26 @@ impl Kernel {
             // Python-side `unmount()` shim — `sys_unlink(mount_path)` is the
             // single entry point.
             DT_MOUNT => {
-                let zone_id = entry.zone_id.clone().unwrap_or_else(|| ctx.zone_id.clone());
-                self.dlc.unmount(self, path, &zone_id);
+                // The live route was installed under the mount's TARGET
+                // zone (`add_mount(path, target_zone)`), while metastore
+                // rows carry the PARENT zone in `zone_id` and the target
+                // in `target_zone_id`. Synthesized entries set both to
+                // the target. Prefer `target_zone_id` so the route
+                // removal below hits the right zone in both shapes.
+                let zone_id = entry
+                    .target_zone_id
+                    .clone()
+                    .or_else(|| entry.zone_id.clone())
+                    .unwrap_or_else(|| ctx.zone_id.clone());
+                // Fail closed (#4343): a failed durable-row delete keeps
+                // the route installed and surfaces here, instead of the
+                // unmount looking successful and the mount resurrecting
+                // on the next restart/replay. A row WITHOUT a live route
+                // is the normal pre-replay shape and unlinks row-only —
+                // `removed` reflects whether anything actually went away.
+                let removed = self.dlc.unmount(self, path, &zone_id)?;
                 return Ok(SysUnlinkResult {
-                    hit: true,
+                    hit: removed,
                     entry_type: DT_MOUNT,
                     post_hook_needed: self.delete_hook_count.load(Ordering::Relaxed) > 0,
                     path: path.to_string(),
