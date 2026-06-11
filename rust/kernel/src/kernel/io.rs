@@ -418,13 +418,33 @@ impl Kernel {
             }
         }
 
-        // Content identifier: CAS backends use content_id (hash). Path-addressed
-        // backends derive their physical path from `path - mount_prefix`
-        // inside the backend itself; the kernel always passes the content_id.
-        let content_id = match entry.content_id.as_deref().filter(|s| !s.is_empty()) {
-            Some(id) => id,
-            None => return Err(not_found()),
-        };
+        // Content identifier: CAS backends use content_id (hash).
+        // Path-addressed backends derive their physical path from `path
+        // - mount_prefix` inside the backend itself; the kernel always
+        // passes the content_id.
+        //
+        // Lazy-observe (#46) entries materialised by a peer's
+        // `BlobFetcher::read` carry an empty content_id by design —
+        // metadata records that some node served bytes for `path` once,
+        // not where those bytes live in any local backend.  Skipping the
+        // local-backend probe in that case is correct: the local backend
+        // necessarily has nothing addressable under "" anyway.
+        // `try_remote_fetch` further down handles the empty content_id
+        // path by falling back to the global `path` as the peer fetch
+        // key (line 527), routing through `last_writer_address` to the
+        // origin node's `BlobFetcher::read` which path-routes through
+        // its own `VFSRouter`.  The previous `return Err(not_found())`
+        // bail-out at this point pre-empted that fast path and broke
+        // every cross-node read of an observe-materialised entry.
+        let content_id_opt = entry.content_id.as_deref().filter(|s| !s.is_empty());
+        tracing::debug!(
+            path = %path,
+            entry_type = entry.entry_type,
+            content_id_present = content_id_opt.is_some(),
+            last_writer = ?entry.last_writer_address,
+            "sys_read: entry-exists branch"
+        );
+
         // 4. VFS lock (blocking acquire — wrapper releases GIL before calling this)
         let lock_handle =
             self.lock_manager
@@ -435,11 +455,15 @@ impl Kernel {
             )));
         }
 
-        // 5. Backend read (Rust-native ObjectStore)
-        let content = route
-            .backend
-            .as_ref()
-            .and_then(|b| b.read_content(content_id, ctx).ok());
+        // 5. Backend read (Rust-native ObjectStore) — only when we have
+        //    an addressing key for it.  Empty content_id (observe-
+        //    materialised entry, or any future metadata-only record)
+        //    short-circuits to `None` so the path immediately falls
+        //    through to `try_remote_fetch`.
+        let content = match content_id_opt {
+            Some(cid) => route.backend.as_ref().and_then(|b| b.read_content(cid, ctx).ok()),
+            None => None,
+        };
 
         // 6. Release VFS lock (always, even on miss)
         self.lock_manager.do_release(lock_handle);
@@ -485,8 +509,20 @@ impl Kernel {
 
         let origin = match entry.last_writer_address.as_deref() {
             Some(s) if !s.is_empty() => s,
-            _ => return Err(not_found()),
+            _ => {
+                tracing::debug!(
+                    path = %path,
+                    last_writer = ?entry.last_writer_address,
+                    "try_remote_fetch: last_writer_address empty/None, returning not_found"
+                );
+                return Err(not_found());
+            }
         };
+        tracing::debug!(
+            path = %path,
+            origin,
+            "try_remote_fetch: attempting peer fetch"
+        );
 
         // Don't loop back to self — we're the writer, blob is truly missing.
         if let Some(addr) = self.self_address.read().as_deref() {
