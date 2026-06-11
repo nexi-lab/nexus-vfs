@@ -532,6 +532,11 @@ fn unmount_keeps_route_when_durable_row_delete_fails() {
         "the mount must still be present after the failed unmount \
          (fail closed — no silent route removal with a stale durable row)"
     );
+    assert!(
+        k.has_mount("/sub", "zone-corp"),
+        "the LIVE route must remain installed after the failed unmount — \
+         the row alone passing sys_stat would not prove route retention"
+    );
 
     // Batch mode must surface the same error per item — it used to map
     // every Err into a silent hit=false miss (#4343 review round 9),
@@ -574,6 +579,10 @@ fn unmount_keeps_route_when_durable_row_delete_fails() {
     assert!(
         KernelAbi::sys_stat(&k, "/sub", kernel::ROOT_ZONE_ID).is_some(),
         "the mount must still be present after failed batch unmounts"
+    );
+    assert!(
+        k.has_mount("/sub", "zone-corp"),
+        "the LIVE route must remain installed after failed batch unmounts"
     );
 }
 
