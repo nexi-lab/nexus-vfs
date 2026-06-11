@@ -68,7 +68,7 @@ impl DriverLifecycleCoordinator {
         let route = kernel.vfs_router_arc().route(mount_point, "root");
         if let Some(parent_route) = route {
             // RouteResult.mount_point is already a canonical key (e.g. "/root").
-            kernel.with_metastore(&parent_route.mount_point, |ms| {
+            let persist = kernel.with_metastore(&parent_route.mount_point, |ms| {
                 let meta = crate::meta_store::FileMetadata {
                     path: mount_point.to_string(),
                     size: 0,
@@ -87,15 +87,24 @@ impl DriverLifecycleCoordinator {
                     link_target: None,
                     owner_id: None,
                 };
-                if let Err(e) = ms.put(mount_point, meta) {
-                    tracing::warn!(
-                        target: "kernel::dlc",
-                        mount = mount_point,
-                        zone = zone_id,
-                        "DT_MOUNT metadata write failed; router will still install the mount but on-disk metadata is out of sync: {e:?}",
-                    );
-                }
+                ms.put(mount_point, meta)
             });
+            if let Some(Err(e)) = persist {
+                // Fail closed (#4343): installing a route whose DT_MOUNT
+                // entry never persisted means the mount silently vanishes
+                // (or goes stale) after a restart, with no error at mount
+                // time. Callers already handle mount errors — add_mount
+                // below returns through the same channel.
+                tracing::error!(
+                    target: "kernel::dlc",
+                    mount = mount_point,
+                    zone = zone_id,
+                    "DT_MOUNT metadata write failed; refusing to install unpersisted mount: {e:?}",
+                );
+                return Err(KernelError::IOError(format!(
+                    "DT_MOUNT metadata persist failed for {mount_point}: {e:?}"
+                )));
+            }
         }
 
         // Apply-side cache coherence is the metastore impl's

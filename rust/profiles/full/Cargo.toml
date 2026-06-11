@@ -34,3 +34,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 gethostname = "1.1"
+
+[dev-dependencies]
+# The shared cluster main.rs test module opens real redb files in a temp dir.
+tempfile = "3"

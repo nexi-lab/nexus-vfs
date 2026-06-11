@@ -523,32 +523,11 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     // bytes stayed on disk. Swap in a redb inside the data dir BEFORE
     // the first mount so the DT_MOUNT entry lands in the durable
     // store too.
-    //
-    // The override env is deliberately `NEXUS_KERNEL_METASTORE_PATH`
-    // (the `NEXUS_KERNEL_*` namespace, like `NEXUS_KERNEL_BINARY`),
-    // NOT `NEXUS_METASTORE_PATH`: the Python server sets the latter
-    // for its own legacy metadata path and copies its env into this
-    // subprocess — reusing it here would point the kernel at the
-    // Python-era redb file instead of this node's own store.
-    if let Some(ms_path) = resolve_metastore_path(
+    wire_durable_metastore(
+        &kernel,
         std::env::var("NEXUS_KERNEL_METASTORE_PATH").ok().as_deref(),
         &common.data_dir,
-    ) {
-        if let Some(parent) = ms_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create metastore dir {}", parent.display()))?;
-        }
-        let ms_str = ms_path.to_str().context("metastore path must be UTF-8")?;
-        kernel.set_metastore_path(ms_str).map_err(|e| {
-            anyhow::anyhow!("open durable metastore at {}: {:?}", ms_path.display(), e)
-        })?;
-        tracing::info!(path = %ms_path.display(), "durable metastore opened (namespace survives restarts)");
-    } else {
-        tracing::warn!(
-            "NEXUS_KERNEL_METASTORE_PATH=\"\" — ephemeral tempfile metastore; \
-             the namespace will NOT survive a restart"
-        );
-    }
+    )?;
     let root_fs = common.root_fs_path();
     std::fs::create_dir_all(&root_fs)
         .with_context(|| format!("create cluster root mount dir {}", root_fs.display()))?;
@@ -1152,19 +1131,83 @@ fn resolve_hostname(cli: Option<&str>) -> String {
     gethostname::gethostname().to_string_lossy().into_owned()
 }
 
-/// Resolve the durable metastore path for this node (#4343).
+/// Metastore mode resolved from the environment (#4343).
+#[derive(Debug, PartialEq, Eq)]
+enum MetastoreMode {
+    /// Open a durable redb at this path (the production default).
+    Durable(PathBuf),
+    /// Keep the kernel's boot tempfile metastore — the namespace dies
+    /// with the process. Debug-only escape hatch, must be requested
+    /// with the explicit literal `ephemeral`.
+    Ephemeral,
+}
+
+/// Resolve the durable metastore mode for this node (#4343).
+///
+/// The override env is deliberately `NEXUS_KERNEL_METASTORE_PATH`
+/// (the `NEXUS_KERNEL_*` namespace, like `NEXUS_KERNEL_BINARY`),
+/// NOT `NEXUS_METASTORE_PATH`: the Python server sets the latter for
+/// its own legacy metadata path and copies its env into this
+/// subprocess — reusing it here would point the kernel at the
+/// Python-era redb file instead of this node's own store.
 ///
 /// Precedence:
-///   * `NEXUS_KERNEL_METASTORE_PATH` set and non-empty → that file path.
-///   * `NEXUS_KERNEL_METASTORE_PATH` set but EMPTY → `None` — explicit opt-out
-///     back into the ephemeral tempfile metastore (debug escape hatch;
-///     the namespace then dies with the process).
-///   * unset → `<data_dir>/metastore.redb`.
-fn resolve_metastore_path(env_value: Option<&str>, data_dir: &std::path::Path) -> Option<PathBuf> {
-    match env_value {
-        Some("") => None,
-        Some(v) => Some(PathBuf::from(v)),
-        None => Some(data_dir.join("metastore.redb")),
+///   * unset → `<data_dir>/metastore.redb` (durable default).
+///   * the literal `ephemeral` → tempfile metastore (explicit opt-out).
+///   * any other non-empty value → that file path.
+///   * set but EMPTY → hard error. An empty value usually means broken
+///     templating or an unset secret, and silently degrading to the
+///     ephemeral store would reintroduce the exact restart data-loss
+///     this wiring exists to prevent. Fail closed.
+fn resolve_metastore_path(
+    env_value: Option<&str>,
+    data_dir: &std::path::Path,
+) -> Result<MetastoreMode, String> {
+    match env_value.map(str::trim) {
+        None => Ok(MetastoreMode::Durable(data_dir.join("metastore.redb"))),
+        Some("ephemeral") => Ok(MetastoreMode::Ephemeral),
+        Some("") => Err(
+            "NEXUS_KERNEL_METASTORE_PATH is set but empty — refusing to guess. \
+             Set a file path, or the literal 'ephemeral' to explicitly opt into \
+             a non-durable metastore (the namespace will NOT survive restarts)."
+                .to_string(),
+        ),
+        Some(v) => Ok(MetastoreMode::Durable(PathBuf::from(v))),
+    }
+}
+
+/// Wire the kernel's durable metastore from env + data dir (#4343).
+///
+/// This is the real production wiring `run_daemon` uses — kept as a
+/// standalone function so tests can drive the exact same path
+/// (resolution, parent-dir creation, `set_metastore_path`) against a
+/// temp data dir. Returns the durable path, or `None` in (explicitly
+/// requested) ephemeral mode.
+fn wire_durable_metastore(
+    kernel: &Kernel,
+    env_value: Option<&str>,
+    data_dir: &std::path::Path,
+) -> Result<Option<PathBuf>> {
+    match resolve_metastore_path(env_value, data_dir).map_err(|e| anyhow::anyhow!(e))? {
+        MetastoreMode::Durable(ms_path) => {
+            if let Some(parent) = ms_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("create metastore dir {}", parent.display()))?;
+            }
+            let ms_str = ms_path.to_str().context("metastore path must be UTF-8")?;
+            kernel.set_metastore_path(ms_str).map_err(|e| {
+                anyhow::anyhow!("open durable metastore at {}: {:?}", ms_path.display(), e)
+            })?;
+            tracing::info!(path = %ms_path.display(), "durable metastore opened (namespace survives restarts)");
+            Ok(Some(ms_path))
+        }
+        MetastoreMode::Ephemeral => {
+            tracing::warn!(
+                "NEXUS_KERNEL_METASTORE_PATH=ephemeral — tempfile metastore; \
+                 the namespace will NOT survive a restart"
+            );
+            Ok(None)
+        }
     }
 }
 
@@ -1191,21 +1234,75 @@ mod tests {
     #[test]
     fn metastore_path_defaults_into_data_dir() {
         let p = resolve_metastore_path(None, std::path::Path::new("/data"));
-        assert_eq!(p, Some(PathBuf::from("/data/metastore.redb")));
+        assert_eq!(
+            p,
+            Ok(MetastoreMode::Durable(PathBuf::from(
+                "/data/metastore.redb"
+            )))
+        );
     }
 
     #[test]
     fn metastore_path_env_overrides() {
         let p = resolve_metastore_path(Some("/elsewhere/ms.redb"), std::path::Path::new("/data"));
-        assert_eq!(p, Some(PathBuf::from("/elsewhere/ms.redb")));
+        assert_eq!(
+            p,
+            Ok(MetastoreMode::Durable(PathBuf::from("/elsewhere/ms.redb")))
+        );
     }
 
     #[test]
-    fn metastore_path_empty_env_opts_out() {
+    fn metastore_path_ephemeral_literal_opts_out() {
         assert_eq!(
-            resolve_metastore_path(Some(""), std::path::Path::new("/data")),
-            None
+            resolve_metastore_path(Some("ephemeral"), std::path::Path::new("/data")),
+            Ok(MetastoreMode::Ephemeral)
         );
+    }
+
+    #[test]
+    fn metastore_path_empty_env_fails_closed() {
+        // Empty usually means broken templating / unset secret — silently
+        // booting ephemeral would reintroduce the #4343 data loss.
+        assert!(resolve_metastore_path(Some(""), std::path::Path::new("/data")).is_err());
+        assert!(resolve_metastore_path(Some("   "), std::path::Path::new("/data")).is_err());
+    }
+
+    #[test]
+    fn wire_durable_metastore_creates_redb_in_data_dir() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let kernel = Kernel::new();
+        let wired = wire_durable_metastore(&kernel, None, td.path()).expect("wire");
+        let expect = td.path().join("metastore.redb");
+        assert_eq!(wired, Some(expect.clone()));
+        assert!(expect.is_file(), "durable redb must exist on disk");
+        kernel.release_metastores();
+    }
+
+    #[test]
+    fn wire_durable_metastore_creates_missing_parent_dirs() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let nested = td.path().join("deep/nested/ms.redb");
+        let kernel = Kernel::new();
+        let wired = wire_durable_metastore(&kernel, nested.to_str(), td.path()).expect("wire");
+        assert_eq!(wired, Some(nested.clone()));
+        assert!(nested.is_file());
+        kernel.release_metastores();
+    }
+
+    #[test]
+    fn wire_durable_metastore_empty_env_refuses_to_boot() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let kernel = Kernel::new();
+        assert!(wire_durable_metastore(&kernel, Some(""), td.path()).is_err());
+    }
+
+    #[test]
+    fn wire_durable_metastore_ephemeral_keeps_boot_store() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let kernel = Kernel::new();
+        let wired = wire_durable_metastore(&kernel, Some("ephemeral"), td.path()).expect("wire");
+        assert_eq!(wired, None);
+        assert!(!td.path().join("metastore.redb").exists());
     }
 
     #[test]

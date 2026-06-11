@@ -158,6 +158,61 @@ fn namespace_survives_kernel_restart_with_durable_metastore() {
 }
 
 #[test]
+fn non_root_mount_entry_survives_kernel_restart() {
+    // A non-root DT_MOUNT goes through DLC::mount, which persists the
+    // entry into the parent (root) zone's metastore — and since #4343
+    // fails closed when that persist fails. After a restart the entry
+    // must still resolve from the durable store, with only the root
+    // mount re-established (the daemon re-mounts "/" at boot; child
+    // mount ENTRIES must come back from the metastore, not re-mounting).
+    let td = tempfile::tempdir().expect("tempdir");
+    let ms = td.path().join("metastore.redb");
+
+    {
+        let (k, _ctx) = boot(Some(&ms));
+        let sub_backend = Arc::new(MemBackend::default());
+        k.sys_setattr(
+            "/sub",
+            2, // DT_MOUNT
+            "mem-sub",
+            Some(sub_backend as Arc<dyn ObjectStore>),
+            None,
+            None,
+            "",
+            kernel::ROOT_ZONE_ID,
+            false,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None, // created_at_ms
+            None, // link_target
+            None, // source
+            None, // metastore
+        )
+        .expect("mount /sub");
+        assert!(
+            KernelAbi::sys_stat(&k, "/sub", kernel::ROOT_ZONE_ID).is_some(),
+            "mount entry visible after mounting"
+        );
+        k.release_metastores();
+    }
+
+    // Second boot: only "/" is re-mounted (what the daemon does at boot).
+    let (k2, _ctx) = boot(Some(&ms));
+    let stat = KernelAbi::sys_stat(&k2, "/sub", kernel::ROOT_ZONE_ID);
+    assert!(
+        stat.is_some(),
+        "non-root DT_MOUNT entry must survive a kernel restart via the \
+         durable parent-zone metastore (nexi-lab/nexus#4343)"
+    );
+}
+
+#[test]
 fn namespace_is_lost_across_restart_without_durable_metastore() {
     // The footgun this crate's boot default creates: no set_metastore_path
     // → registrations live in the kernel's boot tempdir and die with it.
