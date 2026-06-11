@@ -96,7 +96,8 @@ struct CommonArgs {
     root_path: Option<PathBuf>,
 
     /// Directory of plugin dylibs to auto-load at startup.
-    /// All `.so` / `.dylib` files in this directory are loaded via
+    /// All dynamic-library files in this directory whose extension matches
+    /// the current platform (`so` / `dylib` / `dll`) are loaded via
     /// `Kernel::load_plugin_dir` after the kernel is created.
     #[arg(long, env = "NEXUS_PLUGIN_DIR", global = true)]
     plugin_dir: Option<PathBuf>,
@@ -111,7 +112,7 @@ struct CommonArgs {
     /// Example (separate zone):
     /// `--mount-driver local-connector:my-docs:/files:{"local_root":"/home/me/docs"}`
     ///
-    /// The plugin must already be loaded (drop its `.so` into
+    /// The plugin must already be loaded (drop the dynamic library into
     /// `--plugin-dir` first).  `<vfs-path>` may live in any zone the
     /// operator chooses (root for node-local single-canonical
     /// routing, a separate raft zone when federation extends the

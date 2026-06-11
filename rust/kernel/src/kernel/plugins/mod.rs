@@ -99,7 +99,9 @@ impl Kernel {
         self.plugin_loader.list()
     }
 
-    /// Load all `.so` / `.dylib` files from a directory.
+    /// Load all dynamic-library files from a directory whose extension
+    /// matches the current platform (see `std::env::consts::DLL_EXTENSION`:
+    /// `so` on Linux, `dylib` on macOS, `dll` on Windows).
     pub fn load_plugin_dir(self: &Arc<Self>, dir: &Path) -> Result<Vec<String>, String> {
         let entries =
             std::fs::read_dir(dir).map_err(|e| format!("read_dir({}): {e}", dir.display()))?;
@@ -108,7 +110,7 @@ impl Kernel {
         for entry in entries.flatten() {
             let path = entry.path();
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if ext == "so" || ext == "dylib" {
+            if is_plugin_extension(ext) {
                 match self.load_plugin(&path) {
                     Ok(name) => loaded.push(name),
                     Err(e) => tracing::warn!(path = %path.display(), err = %e, "skip plugin"),
@@ -120,6 +122,14 @@ impl Kernel {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
+
+/// Returns true iff `ext` matches the dynamic-library extension of the
+/// current platform (`so` on Linux, `dylib` on macOS, `dll` on Windows).
+/// Backed by `std::env::consts::DLL_EXTENSION` so new targets are picked
+/// up automatically without touching this code.
+fn is_plugin_extension(ext: &str) -> bool {
+    ext == std::env::consts::DLL_EXTENSION
+}
 
 /// Build a system-level `OperationContext` for plugin callbacks.
 /// Bypasses all permission checks (`is_system = true`).
@@ -213,5 +223,45 @@ unsafe extern "C" fn kernel_cb_sys_stat(
             0
         }
         None => -1, // NotFound
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_plugin_extension;
+
+    #[test]
+    fn matches_current_platform_extension() {
+        assert!(is_plugin_extension(std::env::consts::DLL_EXTENSION));
+    }
+
+    #[test]
+    fn rejects_unrelated_extensions() {
+        for ext in ["txt", "", "rs", "toml", "log"] {
+            assert!(!is_plugin_extension(ext), "should reject {ext:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_other_platform_extensions() {
+        // Strict per-platform matching: foreign dynamic-library extensions
+        // must be filtered before reaching libloading, to keep
+        // tracing-warn noise off the discovery path.
+        for ext in ["so", "dylib", "dll"] {
+            if ext == std::env::consts::DLL_EXTENSION {
+                continue;
+            }
+            assert!(!is_plugin_extension(ext), "should reject foreign ext {ext:?}");
+        }
+    }
+
+    #[test]
+    fn extension_match_is_case_sensitive() {
+        // Path::extension preserves source casing; DLL_EXTENSION is all
+        // lowercase. Byte-level `==` must therefore reject the upper form.
+        let upper = std::env::consts::DLL_EXTENSION.to_ascii_uppercase();
+        if upper != std::env::consts::DLL_EXTENSION {
+            assert!(!is_plugin_extension(&upper));
+        }
     }
 }
