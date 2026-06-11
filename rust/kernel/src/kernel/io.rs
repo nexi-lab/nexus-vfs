@@ -461,7 +461,10 @@ impl Kernel {
         //    short-circuits to `None` so the path immediately falls
         //    through to `try_remote_fetch`.
         let content = match content_id_opt {
-            Some(cid) => route.backend.as_ref().and_then(|b| b.read_content(cid, ctx).ok()),
+            Some(cid) => route
+                .backend
+                .as_ref()
+                .and_then(|b| b.read_content(cid, ctx).ok()),
             None => None,
         };
 

@@ -886,17 +886,15 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
         if let Some(ms) = parent_metastore {
             opts = opts.with_metastore(ms);
         }
-        kernel
-            .mount(&spec.vfs_path, opts)
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "mount driver '{}' at zone '{}' path '{}': {:?}",
-                    spec.name,
-                    spec.zone_id,
-                    spec.vfs_path,
-                    e,
-                )
-            })?;
+        kernel.mount(&spec.vfs_path, opts).map_err(|e| {
+            anyhow::anyhow!(
+                "mount driver '{}' at zone '{}' path '{}': {:?}",
+                spec.name,
+                spec.zone_id,
+                spec.vfs_path,
+                e,
+            )
+        })?;
         tracing::info!(
             driver = %spec.name,
             zone_id = %spec.zone_id,
