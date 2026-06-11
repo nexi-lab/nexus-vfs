@@ -288,45 +288,133 @@ fn remount_persists_dt_mount_row_into_parent_store_not_child() {
 }
 
 #[test]
-fn cross_zone_mount_without_replicated_parent_store_fails_closed() {
-    // #4343 review round 4: a cross-zone mount is a federation topology
-    // event — its DT_MOUNT row must land in the parent zone's
-    // REPLICATED metastore. When the parent route has no per-mount
-    // store, the write would silently fall back to the node-local
-    // global store (durable locally, invisible to the cluster), so
-    // DLC::mount must refuse.
+fn cross_zone_mount_without_replicated_parent_store_uses_durable_global_fallback() {
+    // #4343 review rounds 4-5: a cross-zone DT_MOUNT row should land in
+    // the parent zone's REPLICATED store, but the documented
+    // `--mount-driver` boot shape mounts "/" backend-only before zone
+    // wiring — hard-failing would break those boots. The contract for
+    // now: the mount SUCCEEDS, the row lands in the node-local durable
+    // global store (local-only durability, warned at runtime), and the
+    // proper root-store wiring is tracked with nexus-vfs#44.
+    use kernel::meta_store::{LocalMetaStore, MetaStore};
+
     let td = tempfile::tempdir().expect("tempdir");
     let ms = td.path().join("metastore.redb");
 
-    let (k, _ctx) = boot(Some(&ms)); // "/" mounted with NO per-mount store
-    let backend = Arc::new(MemBackend::default());
-    let mounted = k.sys_setattr(
-        "/corp",
-        2, // DT_MOUNT
-        "mem-corp",
-        Some(backend as Arc<dyn ObjectStore>),
-        None,
-        None,
-        "",
-        "zone-corp", // != parent zone ("root")
-        false,
-        0,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None, // created_at_ms
-        None, // link_target
-        None, // source
-        None, // metastore
+    {
+        let (k, _ctx) = boot(Some(&ms)); // "/" mounted with NO per-mount store
+        let backend = Arc::new(MemBackend::default());
+        k.sys_setattr(
+            "/corp",
+            2, // DT_MOUNT
+            "mem-corp",
+            Some(backend as Arc<dyn ObjectStore>),
+            None,
+            None,
+            "",
+            "zone-corp", // != parent zone ("root")
+            false,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None, // created_at_ms
+            None, // link_target
+            None, // source
+            None, // metastore
+        )
+        .expect("cross-zone mount with bare parent must still succeed (warn-only)");
+        k.release_metastores();
+    }
+
+    let global = LocalMetaStore::open(&ms).expect("reopen global store");
+    let row = global
+        .get("/corp")
+        .expect("read global store")
+        .expect("cross-zone DT_MOUNT row must be durable in the global fallback store");
+    assert_eq!(row.entry_type, 2);
+    assert_eq!(row.target_zone_id.as_deref(), Some("zone-corp"));
+}
+
+#[test]
+fn unmount_keeps_route_when_durable_row_delete_fails() {
+    // #4343 review round 5: with the metastore durable by default, a
+    // failed DT_MOUNT row delete must NOT let the unmount look
+    // successful — the stale row would resurrect the mount on the next
+    // restart/replay. DLC::unmount fails closed and keeps the route.
+    use kernel::meta_store::{FileMetadata, LocalMetaStore, MetaStore, MetaStoreError};
+
+    /// Delegates everything to an inner LocalMetaStore; `delete` always
+    /// fails — simulates a redb/raft write error during unmount.
+    struct FailingDeleteStore(LocalMetaStore);
+    impl MetaStore for FailingDeleteStore {
+        fn get(&self, path: &str) -> Result<Option<FileMetadata>, MetaStoreError> {
+            self.0.get(path)
+        }
+        fn put(&self, path: &str, metadata: FileMetadata) -> Result<(), MetaStoreError> {
+            self.0.put(path, metadata)
+        }
+        fn delete(&self, _path: &str) -> Result<bool, MetaStoreError> {
+            Err(MetaStoreError::IOError("injected delete failure".into()))
+        }
+        fn list(&self, prefix: &str) -> Result<Vec<FileMetadata>, MetaStoreError> {
+            self.0.list(prefix)
+        }
+        fn exists(&self, path: &str) -> Result<bool, MetaStoreError> {
+            self.0.exists(path)
+        }
+    }
+
+    let td = tempfile::tempdir().expect("tempdir");
+    let root_store: Arc<dyn MetaStore> = Arc::new(FailingDeleteStore(
+        LocalMetaStore::open(&td.path().join("root.redb")).expect("open root store"),
+    ));
+
+    let k = Kernel::new();
+    let mount = |path: &str, zone: &str, per_mount: Option<Arc<dyn MetaStore>>| {
+        k.sys_setattr(
+            path,
+            2, // DT_MOUNT
+            "mem",
+            Some(Arc::new(MemBackend::default()) as Arc<dyn ObjectStore>),
+            per_mount,
+            None,
+            "",
+            zone,
+            false,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None, // created_at_ms
+            None, // link_target
+            None, // source
+            None, // metastore
+        )
+    };
+    mount("/", kernel::ROOT_ZONE_ID, Some(Arc::clone(&root_store)))
+        .expect("mount / with failing-delete store");
+    mount("/sub", "zone-corp", None).expect("mount /sub (cross-zone)");
+
+    let ctx = OperationContext::new("test", "root", true, None, true);
+    let unlink = KernelAbi::sys_unlink(&k, "/sub", &ctx, false);
+    assert!(
+        unlink.is_err(),
+        "sys_unlink of a mount must fail when the durable DT_MOUNT row \
+         cannot be deleted"
     );
     assert!(
-        mounted.is_err(),
-        "cross-zone mount must fail closed when the parent mount has no \
-         replicated metastore (row would fall back to the node-local store)"
+        KernelAbi::sys_stat(&k, "/sub", kernel::ROOT_ZONE_ID).is_some(),
+        "the mount must still be present after the failed unmount \
+         (fail closed — no silent route removal with a stale durable row)"
     );
 }
 

@@ -90,21 +90,29 @@ impl DriverLifecycleCoordinator {
         }
         if let Some(parent_route) = route {
             // Cross-zone mounts are federation topology events: their
-            // DT_MOUNT row must land in the parent zone's REPLICATED
+            // DT_MOUNT row should land in the parent zone's REPLICATED
             // metastore so raft replay and followers see it. If the
             // parent route carries no per-mount (zone) metastore, the
-            // write below would silently fall back to the node-local
-            // global store — durable on this node, invisible to the
-            // cluster. Fail closed instead. Same-zone mounts keep the
-            // global fallback: in single-node mode the global store IS
-            // that zone's store.
+            // write below falls back to the node-local global store —
+            // durable on THIS node, invisible to the cluster. This is
+            // the documented `--mount-driver` boot shape today (the
+            // cluster profile mounts "/" backend-only before zone
+            // wiring), so hard-failing here would break boots; warn
+            // loudly instead. Proper fix — attaching the root
+            // ZoneMetaStore to the root route during coordinator
+            // install — is tracked with the boot-ordering work in
+            // nexus-vfs#44. Same-zone mounts are fine by construction:
+            // in single-node mode the global store IS that zone's store.
             if zone_id != parent_route.zone_id && parent_route.metastore.is_none() {
-                return Err(KernelError::IOError(format!(
-                    "cross-zone mount {mount_point} (zone {zone_id}) requires parent \
-                     mount {} (zone {}) to carry a replicated metastore — refusing \
-                     to persist the DT_MOUNT row into the node-local fallback store",
-                    parent_route.mount_point, parent_route.zone_id
-                )));
+                tracing::warn!(
+                    target: "kernel::dlc",
+                    mount = mount_point,
+                    zone = zone_id,
+                    parent = %parent_route.mount_point,
+                    "cross-zone DT_MOUNT row persisted to the node-local fallback \
+                     store (parent has no replicated metastore) — local-only \
+                     durability; raft replay/followers will not see it (#44)",
+                );
             }
             // RouteResult.mount_point is already a canonical key (e.g. "/root").
             let persist = kernel.with_metastore(&parent_route.mount_point, |ms| {
@@ -177,8 +185,17 @@ impl DriverLifecycleCoordinator {
 
     /// Unmount with full lifecycle: metastore delete + routing remove.
     ///
-    /// Returns `true` if mount was removed, `false` if not found.
-    pub fn unmount(&self, kernel: &Kernel, mount_point: &str, zone_id: &str) -> bool {
+    /// Returns `Ok(true)` if the mount was removed, `Ok(false)` if not
+    /// found. Fails closed (#4343): when the durable DT_MOUNT row cannot
+    /// be deleted, the live route is NOT removed — otherwise the unmount
+    /// looks successful while the stale row resurrects the mount on the
+    /// next restart/replay.
+    pub fn unmount(
+        &self,
+        kernel: &Kernel,
+        mount_point: &str,
+        zone_id: &str,
+    ) -> Result<bool, KernelError> {
         // 1. Delete the DT_MOUNT metadata from the PARENT zone (the one
         //    that "owns" `mount_point`).  Symmetric with `mount()`:
         //    federation's apply-cb on the parent zone fires
@@ -196,20 +213,31 @@ impl DriverLifecycleCoordinator {
             .unwrap_or_else(|| "/".to_string());
         let route = kernel.vfs_router_arc().route(&parent_path, "root");
         if let Some(parent_route) = route {
-            kernel.with_metastore(&parent_route.mount_point, |ms| {
-                if let Err(e) = ms.delete(mount_point) {
-                    tracing::warn!(
+            let deleted =
+                kernel.with_metastore(&parent_route.mount_point, |ms| ms.delete(mount_point));
+            match deleted {
+                // Ok(false) = row already absent — idempotent, fine.
+                Some(Ok(_existed)) => {}
+                Some(Err(e)) => {
+                    tracing::error!(
                         target: "kernel::dlc",
                         mount = mount_point,
                         zone = zone_id,
-                        "DT_MOUNT metadata delete failed; router will still remove the mount but on-disk metadata may be stale: {e:?}",
+                        "DT_MOUNT metadata delete failed; refusing to remove live route while the durable row persists: {e:?}",
                     );
+                    return Err(KernelError::IOError(format!(
+                        "DT_MOUNT metadata delete failed for {mount_point}: {e:?}"
+                    )));
                 }
-            });
+                // No metastore anywhere (only possible between
+                // release_metastores and re-wiring): there is no durable
+                // row to go stale, so removing the route is safe.
+                None => {}
+            }
         }
 
         // 2. Remove from routing table — the per-mount metastore Arc
         // (with its internal cache) drops with the MountEntry.
-        kernel.remove_mount(mount_point, zone_id)
+        Ok(kernel.remove_mount(mount_point, zone_id))
     }
 }

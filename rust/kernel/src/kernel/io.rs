@@ -1227,7 +1227,11 @@ impl Kernel {
             // single entry point.
             DT_MOUNT => {
                 let zone_id = entry.zone_id.clone().unwrap_or_else(|| ctx.zone_id.clone());
-                self.dlc.unmount(self, path, &zone_id);
+                // Fail closed (#4343): a failed durable-row delete keeps
+                // the route installed and surfaces here, instead of the
+                // unmount looking successful and the mount resurrecting
+                // on the next restart/replay.
+                self.dlc.unmount(self, path, &zone_id)?;
                 return Ok(SysUnlinkResult {
                     hit: true,
                     entry_type: DT_MOUNT,
