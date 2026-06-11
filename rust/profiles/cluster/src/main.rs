@@ -687,22 +687,69 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     // each entry through the kernel's normal mount surface.  Order
     // contract:
     //   1. `--plugin-dir` scan already loaded the dylibs above.
-    //   2. Federation static-topology bootstrap has already created
-    //      the env-listed zones (`NEXUS_FEDERATION_ZONES`), and
-    //      `RaftDistributedCoordinator::install_with_kernel` has just
-    //      flipped `is_initialized` to true.  That gates the
+    //   2. Federation static-topology bootstrap has staged the
+    //      env-listed zones + cross-zone mounts (`NEXUS_FEDERATION_*`)
+    //      and `RaftDistributedCoordinator::install_with_kernel` has
+    //      just flipped `is_initialized` to true.  That gates the
     //      `kernel.mount(..)` zone-create-on-mount path inside
     //      `sys_setattr DT_MOUNT` — required when the operator names
     //      a separate zone that doesn't yet exist.
     //   3. PeerBlobClient is installed so cross-node fetches on
     //      `last_writer_address` already-replicated bytes have a
     //      transport to ride.
+    //   4. **Topology has fully converged** (the drain below).  Without
+    //      this gate, `--mount-driver`'s `dlc.mount` call runs while
+    //      the env-listed cross-zone mounts (e.g. `/shared=sharedzone`)
+    //      are still in `pending_mounts` — `vfs_router.route()` for the
+    //      driver's vfs-path then finds only `/` (root) as the parent,
+    //      so the DT_MOUNT entry lands in root's metastore (non-
+    //      federated, never replicated) instead of the operator-
+    //      specified target zone's state machine, and peers joining
+    //      later see `count=1` from `replay_existing_mounts` — only
+    //      the `/shared` mount itself, not the nested driver mount
+    //      operators installed under it.  The single sync drain
+    //      collapses the race deterministically.
     //
     // `vfs_path` must be non-`/` (the boot mount owns that point);
     // `zone` is operator-supplied without further constraint — root
     // is the single-canonical node-local case (same-zone routing
     // keeps it strictly local), a separate raft zone is the case
     // operators reach for when extending the mount across peers.
+
+    // Order step (4): drain pending mounts before any driver-mount
+    // runs.  `apply_topology_async` is idempotent + crash-safe; when
+    // `pending_mounts` is empty (no FEDERATION env, or topology
+    // already converged from a prior tick) this is a near-zero-cost
+    // no-op.
+    if !common.mount_drivers.is_empty() && !zm.pending_mounts().is_empty() {
+        // Bounded retry: under contention the leader may not be elected
+        // yet on the very first call.  Cap at 30 ticks of TOPOLOGY_TICK
+        // so a genuinely stuck topology surfaces a startup error rather
+        // than silently dropping driver mounts into the wrong zone.
+        let mut converged = false;
+        for _ in 0..30 {
+            match zm.apply_topology_async(contracts::ROOT_ZONE_ID).await {
+                Ok(true) if zm.pending_mounts().is_empty() => {
+                    converged = true;
+                    break;
+                }
+                Ok(_) => tokio::time::sleep(TOPOLOGY_TICK).await,
+                Err(err) => {
+                    tracing::warn!(%err, "apply_topology error during driver-mount drain; retrying");
+                    tokio::time::sleep(TOPOLOGY_TICK).await;
+                }
+            }
+        }
+        if !converged {
+            return Err(anyhow::anyhow!(
+                "--mount-driver pre-drain: federation topology did not converge \
+                 within 30 ticks; refusing to install driver mounts whose parent \
+                 routing would silently land in the wrong zone.  Pending: {:?}",
+                zm.pending_mounts(),
+            ));
+        }
+    }
+
     for raw in &common.mount_drivers {
         let spec = parse_mount_driver_spec(raw)
             .map_err(|e| anyhow::anyhow!("--mount-driver parse error: {e}"))?;
