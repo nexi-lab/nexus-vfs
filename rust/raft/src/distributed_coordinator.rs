@@ -1280,6 +1280,23 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
         self.bootstrap_done.load(Ordering::Acquire)
     }
 
+    fn zone_peers(&self, _kernel: &Kernel, zone_id: &str) -> Vec<String> {
+        // SSOT — `ZoneManager::zone_peers` enumerates the ConfState
+        // roster.  Filter out:
+        //   * The local node — it's already the caller of the
+        //     fan-out, no point fanning back to ourselves.
+        //   * Witnesses — vote-only nodes that never serve content.
+        let Some(zm) = self.zm() else {
+            return Vec::new();
+        };
+        let local_id = zm.node_id();
+        zm.zone_peers(zone_id)
+            .into_iter()
+            .filter(|(id, _, _, is_witness)| !is_witness && *id != local_id)
+            .map(|(_, _, endpoint, _)| endpoint)
+            .collect()
+    }
+
     fn metastore_for_zone(
         &self,
         _kernel: &Kernel,
@@ -1782,6 +1799,42 @@ fn wire_mount_core(
         target_zone_id = %target_zone_id,
         "wire_mount_core entered"
     );
+
+    // Same-zone short-circuit: when target == parent, the DT_MOUNT is
+    // a driver-mount inside an already-routed zone (e.g.
+    // `--mount-driver local-connector:sharedzone:/shared/cc-tasks/founder`
+    // — parent path `/shared/cc-tasks` routes to sharedzone, mount
+    // target zone is also sharedzone).  Two structural reasons to
+    // exit here:
+    //
+    //   1. `add_federation_mount` below would install root_backend
+    //      as the route's backend, **overwriting** the driver-mount
+    //      backend that `kernel.add_mount` already installed on this
+    //      node when `--mount-driver` ran.  vfs_write/vfs_read then
+    //      route through the wrong backend (root's PathLocal instead
+    //      of the LocalConnector), and the host-fs SSOT property
+    //      silently breaks for every read/write under the mount.
+    //
+    //   2. There's nothing to wire: the routing already lands in
+    //      `parent_zone`'s namespace; no cross-zone redirection is
+    //      meaningful.  Followers replicating the DT_MOUNT entry
+    //      will have already populated the same driver-mount via
+    //      their own `--mount-driver` invocation (driver mounts are
+    //      per-node by construction — the backend instance carries
+    //      node-local config like `local_root`, not raft-replicable).
+    //
+    // Cross-zone DT_MOUNTs (e.g. /shared → sharedzone, a true
+    // federation mount) fall through to the wire below and install
+    // the federation routing as before.
+    if parent_zone_id == target_zone_id {
+        tracing::debug!(
+            parent_zone_id = %parent_zone_id,
+            mount_path = %mount_path,
+            "wire_mount_core: same-zone DT_MOUNT — driver-mount backend \
+             stays node-local, no federation routing to install"
+        );
+        return Ok(());
+    }
 
     // 1. Look up target zone.
     let Some(target_consensus) = registry.get_node(target_zone_id) else {

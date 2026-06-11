@@ -74,6 +74,26 @@ struct CommonArgs {
     )]
     data_dir: PathBuf,
 
+    /// Durable global metastore (redb) — the kernel's VFS namespace.
+    /// File registrations survive restarts only if this lives on
+    /// persistent storage. Defaults to `<data_dir>/metastore.redb`;
+    /// relative values resolve against the data dir (a cwd-anchored
+    /// store would silently re-anchor when a wrapper changes the
+    /// working directory). The literal `ephemeral` opts into the
+    /// non-durable boot tempfile store (debug escape hatch — the
+    /// namespace then dies with the process); an explicitly EMPTY
+    /// value refuses to boot.
+    ///
+    /// The env is deliberately `NEXUS_KERNEL_METASTORE_PATH` (the
+    /// `NEXUS_KERNEL_*` subprocess-control namespace, like
+    /// `NEXUS_KERNEL_BINARY`), NOT `NEXUS_METASTORE_PATH`: the Python
+    /// server sets the latter for its own legacy metadata path and
+    /// copies its environment into this subprocess — reusing it here
+    /// would point the kernel at the Python-era redb file instead of
+    /// this node's own store.
+    #[arg(long, env = "NEXUS_KERNEL_METASTORE_PATH", global = true)]
+    metastore_path: Option<PathBuf>,
+
     /// Comma-separated raft peers in `id@host:port` form.
     #[arg(long, env = "NEXUS_PEERS", default_value = "", global = true)]
     peers: String,
@@ -510,7 +530,7 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     set_provider(Arc::new(DefaultObjectStoreProvider))
         .unwrap_or_else(|_| tracing::warn!("ObjectStoreProvider already registered"));
 
-    // ── Data plane: mount host-fs at "/" via PathLocalBackend ──
+    // ── Data plane: kernel + durable metastore + host-fs "/" mount ──
     // Created BEFORE ZoneManager so the VFS gRPC service can be
     // co-hosted on the same port as the raft gRPC server.
     let kernel = Arc::new(Kernel::new());
@@ -522,19 +542,12 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     // all previously-registered files invisible while their payload
     // bytes stayed on disk. Swap in a redb inside the data dir BEFORE
     // the first mount so the DT_MOUNT entry lands in the durable
-    // store too.
-    let ms_env = match std::env::var("NEXUS_KERNEL_METASTORE_PATH") {
-        Ok(v) => Some(v),
-        Err(std::env::VarError::NotPresent) => None,
-        // Fail closed: collapsing NotUnicode into "unset" would silently
-        // open the default store under a *different* identity than the
-        // operator configured — refuse to boot instead.
-        Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!(
-            "NEXUS_KERNEL_METASTORE_PATH is set but not valid UTF-8 — \
-             refusing to boot; fix or unset the variable"
-        ),
-    };
-    wire_durable_metastore(&kernel, ms_env.as_deref(), &common.data_dir)?;
+    // store too. Fail the boot if the redb cannot open: a silent
+    // tempdir fallback is exactly the data-loss defect this guards
+    // against. `--metastore-path` / NEXUS_KERNEL_METASTORE_PATH
+    // overrides (see the arg docs for the env-name rationale and the
+    // `ephemeral` escape hatch).
+    wire_durable_metastore(&kernel, common.metastore_path.as_deref(), &common.data_dir)?;
     let root_fs = common.root_fs_path();
     std::fs::create_dir_all(&root_fs)
         .with_context(|| format!("create cluster root mount dir {}", root_fs.display()))?;
@@ -708,22 +721,69 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     // each entry through the kernel's normal mount surface.  Order
     // contract:
     //   1. `--plugin-dir` scan already loaded the dylibs above.
-    //   2. Federation static-topology bootstrap has already created
-    //      the env-listed zones (`NEXUS_FEDERATION_ZONES`), and
-    //      `RaftDistributedCoordinator::install_with_kernel` has just
-    //      flipped `is_initialized` to true.  That gates the
+    //   2. Federation static-topology bootstrap has staged the
+    //      env-listed zones + cross-zone mounts (`NEXUS_FEDERATION_*`)
+    //      and `RaftDistributedCoordinator::install_with_kernel` has
+    //      just flipped `is_initialized` to true.  That gates the
     //      `kernel.mount(..)` zone-create-on-mount path inside
     //      `sys_setattr DT_MOUNT` — required when the operator names
     //      a separate zone that doesn't yet exist.
     //   3. PeerBlobClient is installed so cross-node fetches on
     //      `last_writer_address` already-replicated bytes have a
     //      transport to ride.
+    //   4. **Topology has fully converged** (the drain below).  Without
+    //      this gate, `--mount-driver`'s `dlc.mount` call runs while
+    //      the env-listed cross-zone mounts (e.g. `/shared=sharedzone`)
+    //      are still in `pending_mounts` — `vfs_router.route()` for the
+    //      driver's vfs-path then finds only `/` (root) as the parent,
+    //      so the DT_MOUNT entry lands in root's metastore (non-
+    //      federated, never replicated) instead of the operator-
+    //      specified target zone's state machine, and peers joining
+    //      later see `count=1` from `replay_existing_mounts` — only
+    //      the `/shared` mount itself, not the nested driver mount
+    //      operators installed under it.  The single sync drain
+    //      collapses the race deterministically.
     //
     // `vfs_path` must be non-`/` (the boot mount owns that point);
     // `zone` is operator-supplied without further constraint — root
     // is the single-canonical node-local case (same-zone routing
     // keeps it strictly local), a separate raft zone is the case
     // operators reach for when extending the mount across peers.
+
+    // Order step (4): drain pending mounts before any driver-mount
+    // runs.  `apply_topology_async` is idempotent + crash-safe; when
+    // `pending_mounts` is empty (no FEDERATION env, or topology
+    // already converged from a prior tick) this is a near-zero-cost
+    // no-op.
+    if !common.mount_drivers.is_empty() && !zm.pending_mounts().is_empty() {
+        // Bounded retry: under contention the leader may not be elected
+        // yet on the very first call.  Cap at 30 ticks of TOPOLOGY_TICK
+        // so a genuinely stuck topology surfaces a startup error rather
+        // than silently dropping driver mounts into the wrong zone.
+        let mut converged = false;
+        for _ in 0..30 {
+            match zm.apply_topology_async(contracts::ROOT_ZONE_ID).await {
+                Ok(true) if zm.pending_mounts().is_empty() => {
+                    converged = true;
+                    break;
+                }
+                Ok(_) => tokio::time::sleep(TOPOLOGY_TICK).await,
+                Err(err) => {
+                    tracing::warn!(%err, "apply_topology error during driver-mount drain; retrying");
+                    tokio::time::sleep(TOPOLOGY_TICK).await;
+                }
+            }
+        }
+        if !converged {
+            return Err(anyhow::anyhow!(
+                "--mount-driver pre-drain: federation topology did not converge \
+                 within 30 ticks; refusing to install driver mounts whose parent \
+                 routing would silently land in the wrong zone.  Pending: {:?}",
+                zm.pending_mounts(),
+            ));
+        }
+    }
+
     for raw in &common.mount_drivers {
         let spec = parse_mount_driver_spec(raw)
             .map_err(|e| anyhow::anyhow!("--mount-driver parse error: {e}"))?;
@@ -1151,12 +1211,9 @@ enum MetastoreMode {
 
 /// Resolve the durable metastore mode for this node (#4343).
 ///
-/// The override env is deliberately `NEXUS_KERNEL_METASTORE_PATH`
-/// (the `NEXUS_KERNEL_*` namespace, like `NEXUS_KERNEL_BINARY`),
-/// NOT `NEXUS_METASTORE_PATH`: the Python server sets the latter for
-/// its own legacy metadata path and copies its env into this
-/// subprocess — reusing it here would point the kernel at the
-/// Python-era redb file instead of this node's own store.
+/// `override_path` is the `--metastore-path` flag (env:
+/// `NEXUS_KERNEL_METASTORE_PATH` — see the arg docs for why it is NOT
+/// `NEXUS_METASTORE_PATH`).
 ///
 /// Precedence:
 ///   * unset → `<data_dir>/metastore.redb` (durable default).
@@ -1169,31 +1226,39 @@ enum MetastoreMode {
 ///     templating or an unset secret, and silently degrading to the
 ///     ephemeral store would reintroduce the exact restart data-loss
 ///     this wiring exists to prevent. Fail closed.
+///   * non-UTF-8 values pass through here and fail closed at the
+///     explicit UTF-8 check in `wire_durable_metastore`.
 fn resolve_metastore_path(
-    env_value: Option<&str>,
+    override_path: Option<&std::path::Path>,
     data_dir: &std::path::Path,
 ) -> Result<MetastoreMode, String> {
-    match env_value.map(str::trim) {
-        None => Ok(MetastoreMode::Durable(data_dir.join("metastore.redb"))),
-        Some("ephemeral") => Ok(MetastoreMode::Ephemeral),
+    let Some(p) = override_path else {
+        return Ok(MetastoreMode::Durable(data_dir.join("metastore.redb")));
+    };
+    let anchor = |pb: PathBuf| {
+        if pb.is_absolute() {
+            pb
+        } else {
+            data_dir.join(pb)
+        }
+    };
+    match p.to_str().map(str::trim) {
         Some("") => Err(
-            "NEXUS_KERNEL_METASTORE_PATH is set but empty — refusing to guess. \
-             Set a file path, or the literal 'ephemeral' to explicitly opt into \
-             a non-durable metastore (the namespace will NOT survive restarts)."
+            "metastore path (--metastore-path / NEXUS_KERNEL_METASTORE_PATH) is set \
+             but empty — refusing to guess. Set a file path, or the literal \
+             'ephemeral' to explicitly opt into a non-durable metastore (the \
+             namespace will NOT survive restarts)."
                 .to_string(),
         ),
-        Some(v) => {
-            let p = PathBuf::from(v);
-            Ok(MetastoreMode::Durable(if p.is_absolute() {
-                p
-            } else {
-                data_dir.join(p)
-            }))
-        }
+        Some("ephemeral") => Ok(MetastoreMode::Ephemeral),
+        Some(v) => Ok(MetastoreMode::Durable(anchor(PathBuf::from(v)))),
+        // Non-UTF-8: anchor as-is; wire_durable_metastore rejects it.
+        None => Ok(MetastoreMode::Durable(anchor(p.to_path_buf()))),
     }
 }
 
-/// Wire the kernel's durable metastore from env + data dir (#4343).
+/// Wire the kernel's durable metastore from the flag/env + data dir
+/// (#4343).
 ///
 /// This is the real production wiring `run_daemon` uses — kept as a
 /// standalone function so tests can drive the exact same path
@@ -1202,10 +1267,10 @@ fn resolve_metastore_path(
 /// requested) ephemeral mode.
 fn wire_durable_metastore(
     kernel: &Kernel,
-    env_value: Option<&str>,
+    override_path: Option<&std::path::Path>,
     data_dir: &std::path::Path,
 ) -> Result<Option<PathBuf>> {
-    match resolve_metastore_path(env_value, data_dir).map_err(|e| anyhow::anyhow!(e))? {
+    match resolve_metastore_path(override_path, data_dir).map_err(|e| anyhow::anyhow!(e))? {
         MetastoreMode::Durable(ms_path) => {
             if let Some(parent) = ms_path.parent() {
                 std::fs::create_dir_all(parent)
@@ -1260,8 +1325,11 @@ mod tests {
     }
 
     #[test]
-    fn metastore_path_env_overrides() {
-        let p = resolve_metastore_path(Some("/elsewhere/ms.redb"), std::path::Path::new("/data"));
+    fn metastore_path_flag_overrides() {
+        let p = resolve_metastore_path(
+            Some(std::path::Path::new("/elsewhere/ms.redb")),
+            std::path::Path::new("/data"),
+        );
         assert_eq!(
             p,
             Ok(MetastoreMode::Durable(PathBuf::from("/elsewhere/ms.redb")))
@@ -1269,11 +1337,14 @@ mod tests {
     }
 
     #[test]
-    fn metastore_path_relative_env_resolves_against_data_dir() {
+    fn metastore_path_relative_flag_resolves_against_data_dir() {
         // A cwd-relative store would silently re-anchor when a wrapper
         // changes the working directory — relative overrides must pin
         // to the data dir instead.
-        let p = resolve_metastore_path(Some("custom/ms.redb"), std::path::Path::new("/data"));
+        let p = resolve_metastore_path(
+            Some(std::path::Path::new("custom/ms.redb")),
+            std::path::Path::new("/data"),
+        );
         assert_eq!(
             p,
             Ok(MetastoreMode::Durable(PathBuf::from(
@@ -1285,17 +1356,28 @@ mod tests {
     #[test]
     fn metastore_path_ephemeral_literal_opts_out() {
         assert_eq!(
-            resolve_metastore_path(Some("ephemeral"), std::path::Path::new("/data")),
+            resolve_metastore_path(
+                Some(std::path::Path::new("ephemeral")),
+                std::path::Path::new("/data")
+            ),
             Ok(MetastoreMode::Ephemeral)
         );
     }
 
     #[test]
-    fn metastore_path_empty_env_fails_closed() {
+    fn metastore_path_empty_flag_fails_closed() {
         // Empty usually means broken templating / unset secret — silently
         // booting ephemeral would reintroduce the #4343 data loss.
-        assert!(resolve_metastore_path(Some(""), std::path::Path::new("/data")).is_err());
-        assert!(resolve_metastore_path(Some("   "), std::path::Path::new("/data")).is_err());
+        assert!(resolve_metastore_path(
+            Some(std::path::Path::new("")),
+            std::path::Path::new("/data")
+        )
+        .is_err());
+        assert!(resolve_metastore_path(
+            Some(std::path::Path::new("   ")),
+            std::path::Path::new("/data")
+        )
+        .is_err());
     }
 
     #[test]
@@ -1314,7 +1396,8 @@ mod tests {
         let td = tempfile::tempdir().expect("tempdir");
         let nested = td.path().join("deep/nested/ms.redb");
         let kernel = Kernel::new();
-        let wired = wire_durable_metastore(&kernel, nested.to_str(), td.path()).expect("wire");
+        let wired =
+            wire_durable_metastore(&kernel, Some(nested.as_path()), td.path()).expect("wire");
         assert_eq!(wired, Some(nested.clone()));
         assert!(nested.is_file());
         kernel.release_metastores();
@@ -1324,14 +1407,18 @@ mod tests {
     fn wire_durable_metastore_empty_env_refuses_to_boot() {
         let td = tempfile::tempdir().expect("tempdir");
         let kernel = Kernel::new();
-        assert!(wire_durable_metastore(&kernel, Some(""), td.path()).is_err());
+        assert!(
+            wire_durable_metastore(&kernel, Some(std::path::Path::new("")), td.path()).is_err()
+        );
     }
 
     #[test]
     fn wire_durable_metastore_ephemeral_keeps_boot_store() {
         let td = tempfile::tempdir().expect("tempdir");
         let kernel = Kernel::new();
-        let wired = wire_durable_metastore(&kernel, Some("ephemeral"), td.path()).expect("wire");
+        let wired =
+            wire_durable_metastore(&kernel, Some(std::path::Path::new("ephemeral")), td.path())
+                .expect("wire");
         assert_eq!(wired, None);
         assert!(!td.path().join("metastore.redb").exists());
     }

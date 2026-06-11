@@ -205,8 +205,25 @@ impl Kernel {
         // 2. Route (pure Rust LPM)
         let route = match self.vfs_router.route(path, &ctx.zone_id) {
             Some(r) => r,
-            None => return Err(not_found()),
+            None => {
+                tracing::debug!(
+                    path = %path,
+                    ctx_zone = %ctx.zone_id,
+                    "sys_read: route() returned None — no mount covers path"
+                );
+                return Err(not_found());
+            }
         };
+        tracing::debug!(
+            path = %path,
+            ctx_zone = %ctx.zone_id,
+            mount = %route.mount_point,
+            route_zone = %route.zone_id,
+            backend_present = route.backend.is_some(),
+            metastore_present = route.metastore.is_some(),
+            backend_path = %route.backend_path,
+            "sys_read: route resolved"
+        );
 
         // 3. MetaStore lookup. The metastore impl serves cache hits from
         // its own internal `DashMap` projection (see
@@ -221,12 +238,24 @@ impl Kernel {
             Some(meta) => meta,
             None => {
                 // MetaStore miss → try backend directly (all backend types
-                // uniformly).
+                // uniformly).  LocalConnector hits the host fs by path here;
+                // PathLocal hits its backend slot; CAS / remote backends
+                // return miss (they have nothing to serve without a hash).
                 if let Some(data) = route
                     .backend
                     .as_ref()
                     .and_then(|b| b.read_content(&route.backend_path, ctx).ok())
                 {
+                    let size = data.len() as u64;
+                    // Lazy metadata materialization — single duality gate
+                    // inside the helper.  For a local-user ctx
+                    // (`propagates_cross_node = false`) this is a near-
+                    // zero-cost early return.  For a peer-served ctx (set
+                    // at the BlobFetcher entry) this proposes metadata
+                    // so the next cross-node read takes the fast
+                    // `try_remote_fetch` path with `last_writer_address`
+                    // pointing here.
+                    self.observe_backend_content(path, size, None, &route.zone_id, ctx);
                     return Ok(SysReadResult {
                         data: Some(data),
                         post_hook_needed: self.read_hook_count.load(Ordering::Relaxed) > 0,
@@ -235,6 +264,74 @@ impl Kernel {
                         entry_type: DT_REG,
                         stream_next_offset: None,
                     });
+                }
+                // Local backend miss — fan out to peers in this zone
+                // if this is a local-user read (peer-served calls have
+                // `propagates_cross_node = true`, so `fan_out_allowed`
+                // is false; they short-circuit here to a clean
+                // not-found rather than looping back through the
+                // federation transport).
+                //
+                // Cold cross-node first read: Mac's CC wrote a JSON to
+                // host fs (no Nexus involvement, no metadata).  Win's
+                // first read finds no metadata, no local backend hit,
+                // and reaches here.  The fan-out dials each peer's
+                // `BlobFetcher::read`; the peer that hits its own
+                // backend materialises metadata in the shared zone
+                // (via `observe_backend_content` in BlobFetcher) so
+                // Win's next read on the same path goes through the
+                // existing `try_remote_fetch` fast path with no
+                // fan-out cost.
+                if ctx.fan_out_allowed() {
+                    let peers = self
+                        .distributed_coordinator()
+                        .zone_peers(self, &route.zone_id);
+                    tracing::debug!(
+                        path = %path,
+                        zone_id = %route.zone_id,
+                        peer_count = peers.len(),
+                        peers = ?peers,
+                        "sys_read fan-out: backend miss, attempting peers"
+                    );
+                    if !peers.is_empty() {
+                        let client = self.peer_client_arc();
+                        for peer_addr in &peers {
+                            match client.fetch(peer_addr, path) {
+                                Ok(data) => {
+                                    tracing::debug!(
+                                        path = %path,
+                                        peer = %peer_addr,
+                                        bytes = data.len(),
+                                        "sys_read fan-out: peer hit"
+                                    );
+                                    return Ok(SysReadResult {
+                                        data: Some(data),
+                                        post_hook_needed: self
+                                            .read_hook_count
+                                            .load(Ordering::Relaxed)
+                                            > 0,
+                                        content_id: None,
+                                        gen: 0,
+                                        entry_type: DT_REG,
+                                        stream_next_offset: None,
+                                    });
+                                }
+                                Err(e) => {
+                                    tracing::debug!(
+                                        path = %path,
+                                        peer = %peer_addr,
+                                        error = %e,
+                                        "sys_read fan-out: peer fetch failed"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    tracing::debug!(
+                        path = %path,
+                        "sys_read fan-out: skipped (propagates_cross_node=true — peer-served ctx)"
+                    );
                 }
                 return Err(not_found());
             }

@@ -124,6 +124,39 @@ pub struct KernelHandle {
 unsafe impl Send for KernelHandle {}
 unsafe impl Sync for KernelHandle {}
 
+// ── Signing format (cross-repo contract) ────────────────────────────
+
+/// Detached-signature format for plugin binaries.
+///
+/// **Cross-repo contract.** The signer side (nexus repository's vault
+/// release CI, `scripts/sign_plugin.py`) and the verifier side
+/// (`kernel::plugins::loader::PluginLoader::load`) both reference the
+/// constants in this module. Drift between the two means plugins fail
+/// to verify — keep this the single source of truth.
+///
+/// File layout produced by the signer and expected by the verifier:
+/// ```text
+/// libnexus_vault.so          (the plugin binary; signed verbatim)
+/// libnexus_vault.so.sig      (the detached signature, 64 raw bytes)
+/// ```
+///
+/// Public keys live in `nexus-vfs/rust/kernel/trusted_keys/*.pub` as
+/// base64-encoded text files (lines starting with `#` are comments).
+pub mod signing {
+    /// File suffix appended to the plugin binary name to locate its
+    /// detached signature on disk.
+    pub const SIGNATURE_FILE_SUFFIX: &str = ".sig";
+
+    /// Raw Ed25519 signature length, bytes. The `.sig` file is exactly
+    /// this many bytes — no encoding, no PEM header, no minisign frame.
+    pub const SIGNATURE_LENGTH: usize = 64;
+
+    /// Raw Ed25519 public key length, bytes. Trusted-key files in
+    /// `rust/kernel/trusted_keys/*.pub` are base64 of exactly this many
+    /// raw bytes (one key per file, with optional `#` comment lines).
+    pub const PUBKEY_LENGTH: usize = 32;
+}
+
 // ── Symbol name constants ───────────────────────────────────────────
 
 /// Expected symbol names in every plugin dylib.
@@ -483,5 +516,17 @@ mod tests {
     #[test]
     fn nexus_free_null_is_safe() {
         unsafe { nexus_free(std::ptr::null_mut(), 0) };
+    }
+
+    #[test]
+    fn signing_format_constants() {
+        // Pinned values — the signer (nexus repo CI) and the verifier
+        // (kernel::plugins::loader) read this same module. Changing any
+        // of these silently breaks every existing signed plugin, so the
+        // test makes the values explicit rather than just "whatever the
+        // constant says".
+        assert_eq!(signing::SIGNATURE_FILE_SUFFIX, ".sig");
+        assert_eq!(signing::SIGNATURE_LENGTH, 64);
+        assert_eq!(signing::PUBKEY_LENGTH, 32);
     }
 }

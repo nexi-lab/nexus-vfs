@@ -99,7 +99,13 @@ impl Kernel {
         self.plugin_loader.list()
     }
 
-    /// Load all `.so` / `.dylib` files from a directory.
+    /// Load every shared-library file in `dir` as a plugin.
+    ///
+    /// Accepts `.so` (Linux), `.dylib` (macOS), and `.dll` (Windows) —
+    /// missing `.dll` was the symptom in nexi-lab/nexus-vfs#45 (Windows
+    /// vault plugin silently not loading). Sibling `.sig` files are
+    /// consumed by [`PluginLoader::load`] for signature verification and
+    /// are not iterated here.
     pub fn load_plugin_dir(self: &Arc<Self>, dir: &Path) -> Result<Vec<String>, String> {
         let entries =
             std::fs::read_dir(dir).map_err(|e| format!("read_dir({}): {e}", dir.display()))?;
@@ -108,7 +114,7 @@ impl Kernel {
         for entry in entries.flatten() {
             let path = entry.path();
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if ext == "so" || ext == "dylib" {
+            if matches!(ext, "so" | "dylib" | "dll") {
                 match self.load_plugin(&path) {
                     Ok(name) => loaded.push(name),
                     Err(e) => tracing::warn!(path = %path.display(), err = %e, "skip plugin"),

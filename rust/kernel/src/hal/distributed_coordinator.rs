@@ -128,6 +128,23 @@ pub trait DistributedCoordinator: Send + Sync + 'static {
         zone_id: &str,
     ) -> CoordinatorResult<ClusterInfo>;
 
+    /// Peer endpoints (`host:port`) for every node in `zone_id`,
+    /// **excluding** the local node and witness peers (witnesses don't
+    /// serve content, only votes).
+    ///
+    /// Used by the kernel's sys_read backend-miss fan-out: when a
+    /// federated zone's local backend has no bytes for a path, the
+    /// kernel tries each peer's `BlobFetcher::read` via the
+    /// `PeerBlobClient`.  Empty for non-federated zones or unknown
+    /// zone ids, which makes the fan-out loop a natural no-op.
+    ///
+    /// Default impl returns `Vec::new()` so shim coordinators
+    /// (`Noop` in tests / WASM) keep federation-disabled behavior
+    /// without being forced to override.
+    fn zone_peers(&self, _kernel: &crate::kernel::Kernel, _zone_id: &str) -> Vec<String> {
+        Vec::new()
+    }
+
     // ── Zone lifecycle ────────────────────────────────────────────────
 
     /// Create (or look up an existing) raft zone with `zone_id`.
