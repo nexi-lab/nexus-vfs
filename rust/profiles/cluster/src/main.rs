@@ -523,11 +523,18 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     // bytes stayed on disk. Swap in a redb inside the data dir BEFORE
     // the first mount so the DT_MOUNT entry lands in the durable
     // store too.
-    wire_durable_metastore(
-        &kernel,
-        std::env::var("NEXUS_KERNEL_METASTORE_PATH").ok().as_deref(),
-        &common.data_dir,
-    )?;
+    let ms_env = match std::env::var("NEXUS_KERNEL_METASTORE_PATH") {
+        Ok(v) => Some(v),
+        Err(std::env::VarError::NotPresent) => None,
+        // Fail closed: collapsing NotUnicode into "unset" would silently
+        // open the default store under a *different* identity than the
+        // operator configured — refuse to boot instead.
+        Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!(
+            "NEXUS_KERNEL_METASTORE_PATH is set but not valid UTF-8 — \
+             refusing to boot; fix or unset the variable"
+        ),
+    };
+    wire_durable_metastore(&kernel, ms_env.as_deref(), &common.data_dir)?;
     let root_fs = common.root_fs_path();
     std::fs::create_dir_all(&root_fs)
         .with_context(|| format!("create cluster root mount dir {}", root_fs.display()))?;

@@ -66,6 +66,16 @@ impl DriverLifecycleCoordinator {
         // longest-prefix walk to find the enclosing mount, then write
         // through that mount's metastore with the full path as the key.
         let route = kernel.vfs_router_arc().route(mount_point, "root");
+        if route.is_none() && mount_point != "/" {
+            // Fail closed (#4343): a non-root mount with no enclosing route
+            // has nowhere to persist its DT_MOUNT entry — installing it
+            // anyway would create a route that silently vanishes on
+            // restart. Mount the root first.
+            return Err(KernelError::IOError(format!(
+                "no parent route for non-root mount {mount_point}; \
+                 mount the root first so the DT_MOUNT entry can be persisted"
+            )));
+        }
         if let Some(parent_route) = route {
             // RouteResult.mount_point is already a canonical key (e.g. "/root").
             let persist = kernel.with_metastore(&parent_route.mount_point, |ms| {
@@ -89,21 +99,35 @@ impl DriverLifecycleCoordinator {
                 };
                 ms.put(mount_point, meta)
             });
-            if let Some(Err(e)) = persist {
-                // Fail closed (#4343): installing a route whose DT_MOUNT
-                // entry never persisted means the mount silently vanishes
-                // (or goes stale) after a restart, with no error at mount
-                // time. Callers already handle mount errors — add_mount
-                // below returns through the same channel.
-                tracing::error!(
-                    target: "kernel::dlc",
-                    mount = mount_point,
-                    zone = zone_id,
-                    "DT_MOUNT metadata write failed; refusing to install unpersisted mount: {e:?}",
-                );
-                return Err(KernelError::IOError(format!(
-                    "DT_MOUNT metadata persist failed for {mount_point}: {e:?}"
-                )));
+            match persist {
+                Some(Ok(())) => {}
+                Some(Err(e)) => {
+                    // Fail closed (#4343): installing a route whose DT_MOUNT
+                    // entry never persisted means the mount silently vanishes
+                    // (or goes stale) after a restart, with no error at mount
+                    // time. Callers already handle mount errors — add_mount
+                    // below returns through the same channel.
+                    tracing::error!(
+                        target: "kernel::dlc",
+                        mount = mount_point,
+                        zone = zone_id,
+                        "DT_MOUNT metadata write failed; refusing to install unpersisted mount: {e:?}",
+                    );
+                    return Err(KernelError::IOError(format!(
+                        "DT_MOUNT metadata persist failed for {mount_point}: {e:?}"
+                    )));
+                }
+                // `with_metastore` falls back to the kernel global metastore,
+                // so None means no per-mount AND no global store (possible
+                // only between release_metastores and re-wiring). Same fail-
+                // closed rationale as the write-failure arm.
+                None => {
+                    return Err(KernelError::IOError(format!(
+                        "no metastore available to persist DT_MOUNT entry for \
+                         {mount_point} (parent mount {})",
+                        parent_route.mount_point
+                    )));
+                }
             }
         }
 

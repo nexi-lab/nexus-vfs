@@ -158,13 +158,17 @@ fn namespace_survives_kernel_restart_with_durable_metastore() {
 }
 
 #[test]
-fn non_root_mount_entry_survives_kernel_restart() {
+fn non_root_mount_entry_row_survives_kernel_restart() {
     // A non-root DT_MOUNT goes through DLC::mount, which persists the
-    // entry into the parent (root) zone's metastore — and since #4343
-    // fails closed when that persist fails. After a restart the entry
-    // must still resolve from the durable store, with only the root
-    // mount re-established (the daemon re-mounts "/" at boot; child
-    // mount ENTRIES must come back from the metastore, not re-mounting).
+    // entry into the (parent-routed) metastore — and since #4343 fails
+    // closed when that persist fails or no store is available.
+    //
+    // Scope honesty: this proves the durable *metadata row* survives a
+    // kernel restart (visible via sys_stat with only the root mount
+    // re-established). Replaying the row back into the VFSRouter as a
+    // live route is the daemon/raft layer's job
+    // (`replay_existing_mounts`, see nexus-vfs#41) and is covered by
+    // the raft-side tests — a bare kernel does not replay routes.
     let td = tempfile::tempdir().expect("tempdir");
     let ms = td.path().join("metastore.redb");
 
@@ -204,11 +208,56 @@ fn non_root_mount_entry_survives_kernel_restart() {
 
     // Second boot: only "/" is re-mounted (what the daemon does at boot).
     let (k2, _ctx) = boot(Some(&ms));
-    let stat = KernelAbi::sys_stat(&k2, "/sub", kernel::ROOT_ZONE_ID);
+    let stat = KernelAbi::sys_stat(&k2, "/sub", kernel::ROOT_ZONE_ID)
+        .expect("non-root DT_MOUNT row must survive a kernel restart (nexi-lab/nexus#4343)");
+    assert_eq!(
+        stat.entry_type,
+        2, // DT_MOUNT
+        "the surviving row must still be a DT_MOUNT entry, not a plain file"
+    );
+}
+
+#[test]
+fn non_root_mount_without_parent_route_fails_closed() {
+    // #4343 follow-up: a non-root mount with no enclosing route has
+    // nowhere to persist its DT_MOUNT entry. Installing it anyway would
+    // create a route that silently vanishes on restart — DLC::mount must
+    // reject it instead.
+    let td = tempfile::tempdir().expect("tempdir");
+    let ms = td.path().join("metastore.redb");
+
+    let k = Kernel::new();
+    k.set_metastore_path(ms.to_str().expect("utf-8 metastore path"))
+        .expect("open durable metastore");
+    // NOTE: no "/" mount — the router is empty.
+    let backend = Arc::new(MemBackend::default());
+    let mounted = k.sys_setattr(
+        "/orphan",
+        2, // DT_MOUNT
+        "mem",
+        Some(backend as Arc<dyn ObjectStore>),
+        None,
+        None,
+        "",
+        kernel::ROOT_ZONE_ID,
+        false,
+        0,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None, // created_at_ms
+        None, // link_target
+        None, // source
+        None, // metastore
+    );
     assert!(
-        stat.is_some(),
-        "non-root DT_MOUNT entry must survive a kernel restart via the \
-         durable parent-zone metastore (nexi-lab/nexus#4343)"
+        mounted.is_err(),
+        "mounting a non-root path with no parent route must fail closed \
+         instead of installing an unpersistable mount"
     );
 }
 
