@@ -288,6 +288,124 @@ fn remount_persists_dt_mount_row_into_parent_store_not_child() {
 }
 
 #[test]
+fn cross_zone_mount_without_replicated_parent_store_fails_closed() {
+    // #4343 review round 4: a cross-zone mount is a federation topology
+    // event — its DT_MOUNT row must land in the parent zone's
+    // REPLICATED metastore. When the parent route has no per-mount
+    // store, the write would silently fall back to the node-local
+    // global store (durable locally, invisible to the cluster), so
+    // DLC::mount must refuse.
+    let td = tempfile::tempdir().expect("tempdir");
+    let ms = td.path().join("metastore.redb");
+
+    let (k, _ctx) = boot(Some(&ms)); // "/" mounted with NO per-mount store
+    let backend = Arc::new(MemBackend::default());
+    let mounted = k.sys_setattr(
+        "/corp",
+        2, // DT_MOUNT
+        "mem-corp",
+        Some(backend as Arc<dyn ObjectStore>),
+        None,
+        None,
+        "",
+        "zone-corp", // != parent zone ("root")
+        false,
+        0,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None, // created_at_ms
+        None, // link_target
+        None, // source
+        None, // metastore
+    );
+    assert!(
+        mounted.is_err(),
+        "cross-zone mount must fail closed when the parent mount has no \
+         replicated metastore (row would fall back to the node-local store)"
+    );
+}
+
+#[test]
+fn cross_zone_mount_persists_row_into_parent_per_mount_store() {
+    // Companion to the fail-closed test: when the parent DOES carry a
+    // per-mount store (ZoneMetaStore in production; LocalMetaStore here),
+    // the cross-zone DT_MOUNT row must land in THAT store.
+    use kernel::meta_store::{LocalMetaStore, MetaStore};
+
+    let td = tempfile::tempdir().expect("tempdir");
+    let root_ms_path = td.path().join("root-mount.redb");
+
+    let k = Kernel::new();
+    let root_store: Arc<dyn MetaStore> =
+        Arc::new(LocalMetaStore::open(&root_ms_path).expect("open root per-mount store"));
+    k.sys_setattr(
+        "/",
+        2, // DT_MOUNT
+        "mem",
+        Some(Arc::new(MemBackend::default()) as Arc<dyn ObjectStore>),
+        Some(root_store),
+        None,
+        "",
+        kernel::ROOT_ZONE_ID,
+        false,
+        0,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None, // created_at_ms
+        None, // link_target
+        None, // source
+        None, // metastore
+    )
+    .expect("mount / with per-mount store");
+
+    k.sys_setattr(
+        "/corp",
+        2, // DT_MOUNT
+        "mem-corp",
+        Some(Arc::new(MemBackend::default()) as Arc<dyn ObjectStore>),
+        None,
+        None,
+        "",
+        "zone-corp",
+        false,
+        0,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None, // created_at_ms
+        None, // link_target
+        None, // source
+        None, // metastore
+    )
+    .expect("cross-zone mount with replicated parent store");
+
+    k.release_metastores();
+    drop(k);
+
+    let root_store = LocalMetaStore::open(&root_ms_path).expect("reopen root store");
+    let row = root_store
+        .get("/corp")
+        .expect("read root store")
+        .expect("cross-zone DT_MOUNT row must land in the parent's per-mount store");
+    assert_eq!(row.entry_type, 2);
+    assert_eq!(row.target_zone_id.as_deref(), Some("zone-corp"));
+}
+
+#[test]
 fn non_root_mount_without_parent_route_fails_closed() {
     // #4343 follow-up: a non-root mount with no enclosing route has
     // nowhere to persist its DT_MOUNT entry. Installing it anyway would

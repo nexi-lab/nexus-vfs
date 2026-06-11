@@ -89,6 +89,23 @@ impl DriverLifecycleCoordinator {
             )));
         }
         if let Some(parent_route) = route {
+            // Cross-zone mounts are federation topology events: their
+            // DT_MOUNT row must land in the parent zone's REPLICATED
+            // metastore so raft replay and followers see it. If the
+            // parent route carries no per-mount (zone) metastore, the
+            // write below would silently fall back to the node-local
+            // global store — durable on this node, invisible to the
+            // cluster. Fail closed instead. Same-zone mounts keep the
+            // global fallback: in single-node mode the global store IS
+            // that zone's store.
+            if zone_id != parent_route.zone_id && parent_route.metastore.is_none() {
+                return Err(KernelError::IOError(format!(
+                    "cross-zone mount {mount_point} (zone {zone_id}) requires parent \
+                     mount {} (zone {}) to carry a replicated metastore — refusing \
+                     to persist the DT_MOUNT row into the node-local fallback store",
+                    parent_route.mount_point, parent_route.zone_id
+                )));
+            }
             // RouteResult.mount_point is already a canonical key (e.g. "/root").
             let persist = kernel.with_metastore(&parent_route.mount_point, |ms| {
                 let meta = crate::meta_store::FileMetadata {
