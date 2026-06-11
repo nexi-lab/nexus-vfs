@@ -1018,7 +1018,7 @@ impl Kernel {
     ///   (host-fs overwrite) keep serving correct bytes via `try_remote_fetch`,
     ///   but `vfs_stat` returns the metadata's frozen snapshot.  Acceptable
     ///   for cc-tasks-share (CC doesn't depend on precise stat).
-    pub(crate) fn observe_backend_content(
+    pub fn observe_backend_content(
         &self,
         path: &str,
         size: u64,
