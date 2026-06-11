@@ -74,6 +74,12 @@ struct CommonArgs {
     )]
     data_dir: PathBuf,
 
+    /// Durable global metastore (redb) — the kernel's VFS namespace.
+    /// File registrations survive restarts only if this lives on
+    /// persistent storage. Defaults to `<data_dir>/metastore.redb`.
+    #[arg(long, env = "NEXUS_METASTORE_PATH", global = true)]
+    metastore_path: Option<PathBuf>,
+
     /// Comma-separated raft peers in `id@host:port` form.
     #[arg(long, env = "NEXUS_PEERS", default_value = "", global = true)]
     peers: String,
@@ -214,6 +220,12 @@ impl CommonArgs {
         self.root_path
             .clone()
             .unwrap_or_else(|| self.data_dir.join("root"))
+    }
+
+    fn metastore_db_path(&self) -> PathBuf {
+        self.metastore_path
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("metastore.redb"))
     }
 }
 
@@ -510,10 +522,30 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     set_provider(Arc::new(DefaultObjectStoreProvider))
         .unwrap_or_else(|_| tracing::warn!("ObjectStoreProvider already registered"));
 
-    // ── Data plane: mount host-fs at "/" via PathLocalBackend ──
+    // ── Data plane: kernel + durable metastore + host-fs "/" mount ──
     // Created BEFORE ZoneManager so the VFS gRPC service can be
     // co-hosted on the same port as the raft gRPC server.
     let kernel = Arc::new(Kernel::new());
+
+    // ── Durable metastore (nexus#4343) ─────────────────────────────
+    // Kernel::new() boots with a tempfile-backed LocalMetaStore;
+    // without this swap every restart drops the whole VFS namespace.
+    // Wire the durable redb BEFORE the first mount or gRPC traffic —
+    // registrations made before the swap die with the boot tempdir.
+    // Fail the boot if the redb cannot open: a silent tempdir
+    // fallback is exactly the data-loss defect this guards against.
+    let metastore_db = common.metastore_db_path();
+    kernel
+        .set_metastore_path(
+            metastore_db
+                .to_str()
+                .context("metastore path must be UTF-8")?,
+        )
+        .map_err(|e| {
+            anyhow::anyhow!("open durable metastore {}: {:?}", metastore_db.display(), e)
+        })?;
+    tracing::info!(metastore_db = %metastore_db.display(), "durable metastore wired");
+
     let root_fs = common.root_fs_path();
     std::fs::create_dir_all(&root_fs)
         .with_context(|| format!("create cluster root mount dir {}", root_fs.display()))?;
