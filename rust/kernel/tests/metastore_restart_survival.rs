@@ -532,6 +532,49 @@ fn unmount_keeps_route_when_durable_row_delete_fails() {
         "the mount must still be present after the failed unmount \
          (fail closed — no silent route removal with a stale durable row)"
     );
+
+    // Batch mode must surface the same error per item — it used to map
+    // every Err into a silent hit=false miss (#4343 review round 9),
+    // hiding the fail-closed signal from batch callers.
+    let batch = k.sys_unlink(
+        &[kernel::kernel::UnlinkRequest {
+            path: "/sub".to_string(),
+            recursive: false,
+        }],
+        &ctx,
+    );
+    // Force the multi-item code path too (single-item fast path already
+    // propagates): a second, nonexistent path must be a plain miss.
+    let batch_multi = k.sys_unlink(
+        &[
+            kernel::kernel::UnlinkRequest {
+                path: "/sub".to_string(),
+                recursive: false,
+            },
+            kernel::kernel::UnlinkRequest {
+                path: "/no-such-file.txt".to_string(),
+                recursive: false,
+            },
+        ],
+        &ctx,
+    );
+    assert!(
+        batch[0].is_err(),
+        "single-item batch unlink must surface the fail-closed unmount error"
+    );
+    assert!(
+        batch_multi[0].is_err(),
+        "multi-item batch unlink must surface the fail-closed unmount error \
+         instead of mapping it to a hit=false miss"
+    );
+    assert!(
+        matches!(&batch_multi[1], Ok(r) if !r.hit),
+        "a genuinely missing path stays an Ok(hit=false) miss in batch mode"
+    );
+    assert!(
+        KernelAbi::sys_stat(&k, "/sub", kernel::ROOT_ZONE_ID).is_some(),
+        "the mount must still be present after failed batch unmounts"
+    );
 }
 
 #[test]
