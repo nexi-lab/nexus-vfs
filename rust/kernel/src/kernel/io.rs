@@ -221,12 +221,24 @@ impl Kernel {
             Some(meta) => meta,
             None => {
                 // MetaStore miss → try backend directly (all backend types
-                // uniformly).
+                // uniformly).  LocalConnector hits the host fs by path here;
+                // PathLocal hits its backend slot; CAS / remote backends
+                // return miss (they have nothing to serve without a hash).
                 if let Some(data) = route
                     .backend
                     .as_ref()
                     .and_then(|b| b.read_content(&route.backend_path, ctx).ok())
                 {
+                    let size = data.len() as u64;
+                    // Lazy metadata materialization — single duality gate
+                    // inside the helper.  For a local-user ctx
+                    // (`propagates_cross_node = false`) this is a near-
+                    // zero-cost early return.  For a peer-served ctx (set
+                    // at the BlobFetcher entry) this proposes metadata
+                    // so the next cross-node read takes the fast
+                    // `try_remote_fetch` path with `last_writer_address`
+                    // pointing here.
+                    self.observe_backend_content(path, size, None, &route.zone_id, ctx);
                     return Ok(SysReadResult {
                         data: Some(data),
                         post_hook_needed: self.read_hook_count.load(Ordering::Relaxed) > 0,
