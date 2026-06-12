@@ -27,7 +27,15 @@ use std::os::raw::c_void;
 /// Bump when the C ABI changes in a backward-incompatible way.
 /// The kernel rejects plugins whose `nexus_plugin_api_version()` does
 /// not match this value.
-pub const PLUGIN_API_VERSION: u32 = 1;
+///
+/// History:
+///   * v1 — initial: `sys_read` / `sys_write` / `sys_stat` only.
+///   * v2 — added `sys_readdir` / `sys_unlink` / `sys_mkdir` /
+///     `sys_rmdir` / `sys_rename` for the FUSE service plugin
+///     (nexus#4375).  Existing plugins (vault, local-connector) need
+///     a clean rebuild against v2; binaries that still report v1
+///     are rejected with a clear ABI-mismatch error at load time.
+pub const PLUGIN_API_VERSION: u32 = 2;
 
 // ── Plugin kind ─────────────────────────────────────────────────────
 
@@ -111,6 +119,58 @@ pub struct KernelHandle {
         path: *const c_char,
         out_json: *mut *mut u8,
         out_len: *mut usize,
+    ) -> i32,
+
+    /// `sys_readdir(kernel, parent_path, out_json, out_len) -> i32`
+    ///
+    /// Lists directory entries.  On success (0), `*out_json` points to
+    /// a heap-allocated UTF-8 JSON array of `{"name":<str>,"entry_type":<u8>}`
+    /// objects (one per child).  The plugin must call
+    /// `nexus_free(out_json, out_len)` when done.  Returns
+    /// `PluginResult::NotFound` (-1) when the directory does not
+    /// exist; an empty directory is `Ok(0)` with `[]` payload.
+    ///
+    /// `entry_type` values match `kernel::meta_store::DT_*`
+    /// constants (DT_REG=0, DT_DIR=1, DT_MOUNT=2, ...).
+    pub sys_readdir: unsafe extern "C" fn(
+        kernel: *const c_void,
+        parent_path: *const c_char,
+        out_json: *mut *mut u8,
+        out_len: *mut usize,
+    ) -> i32,
+
+    /// `sys_unlink(kernel, path) -> i32`
+    ///
+    /// Remove a single regular-file inode.  Non-recursive: returns
+    /// `PluginResult::InvalidArgument` (-2) when `path` resolves to a
+    /// directory.  Use `sys_rmdir` for directories.
+    pub sys_unlink: unsafe extern "C" fn(kernel: *const c_void, path: *const c_char) -> i32,
+
+    /// `sys_mkdir(kernel, path) -> i32`
+    ///
+    /// Create a directory inode at `path`.  Parent directory must
+    /// already exist (no `mkdir -p` semantic — that lives one layer up
+    /// in the kernel's tier-2 convenience method).  Returns
+    /// `PluginResult::Internal` (-3) on EEXIST so the FUSE layer can
+    /// translate to the right POSIX errno.
+    pub sys_mkdir: unsafe extern "C" fn(kernel: *const c_void, path: *const c_char) -> i32,
+
+    /// `sys_rmdir(kernel, path) -> i32`
+    ///
+    /// Remove an empty directory.  Non-recursive: returns
+    /// `PluginResult::Internal` (-3) when the directory still has
+    /// children, mirroring POSIX `ENOTEMPTY`.
+    pub sys_rmdir: unsafe extern "C" fn(kernel: *const c_void, path: *const c_char) -> i32,
+
+    /// `sys_rename(kernel, old_path, new_path) -> i32`
+    ///
+    /// Atomic rename, mirrors POSIX `rename(2)`.  Caller can move
+    /// across directories within the same federation zone; cross-
+    /// zone moves are rejected with `PluginResult::Internal` (-3).
+    pub sys_rename: unsafe extern "C" fn(
+        kernel: *const c_void,
+        old_path: *const c_char,
+        new_path: *const c_char,
     ) -> i32,
 
     /// Opaque kernel pointer — passed back as first arg to every callback.

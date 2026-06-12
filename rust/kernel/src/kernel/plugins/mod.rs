@@ -30,6 +30,11 @@ impl Kernel {
             sys_read: kernel_cb_sys_read,
             sys_write: kernel_cb_sys_write,
             sys_stat: kernel_cb_sys_stat,
+            sys_readdir: kernel_cb_sys_readdir,
+            sys_unlink: kernel_cb_sys_unlink,
+            sys_mkdir: kernel_cb_sys_mkdir,
+            sys_rmdir: kernel_cb_sys_rmdir,
+            sys_rename: kernel_cb_sys_rename,
             kernel_ptr: Arc::as_ptr(self) as *const std::os::raw::c_void,
         }
     }
@@ -219,5 +224,126 @@ unsafe extern "C" fn kernel_cb_sys_stat(
             0
         }
         None => -1, // NotFound
+    }
+}
+
+unsafe extern "C" fn kernel_cb_sys_readdir(
+    kernel: *const std::os::raw::c_void,
+    parent_path: *const std::ffi::c_char,
+    out_json: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    let kernel = &*(kernel as *const Kernel);
+    let parent_path = match std::ffi::CStr::from_ptr(parent_path).to_str() {
+        Ok(s) => s,
+        Err(_) => return -2,
+    };
+    // System-context readdir: bypass admin gating (the kernel-side
+    // permission check is the SSOT for any access policy plugins
+    // care about).
+    let entries = kernel.sys_readdir(parent_path, contracts::ROOT_ZONE_ID, true);
+    // Hand-roll JSON to avoid a serde_json dep on the kernel-side
+    // callback closure.  Each entry is one
+    // `{"name":<escaped>,"entry_type":<u8>}` object.  Names are
+    // returned by the kernel as plain VFS path components, so the only
+    // characters needing JSON-escape are `"` and `\` — extremely rare
+    // in path segments but cheap to handle correctly.
+    let mut json = String::from("[");
+    let mut first = true;
+    for (name, entry_type) in entries {
+        if !first {
+            json.push(',');
+        }
+        first = false;
+        json.push_str("{\"name\":\"");
+        for ch in name.chars() {
+            match ch {
+                '"' => json.push_str("\\\""),
+                '\' => json.push_str("\\\\"),
+                c => json.push(c),
+            }
+        }
+        json.push_str("\",\"entry_type\":");
+        json.push_str(&entry_type.to_string());
+        json.push('}');
+    }
+    json.push(']');
+    let mut bytes = std::mem::ManuallyDrop::new(json.into_bytes());
+    *out_json = bytes.as_mut_ptr();
+    *out_len = bytes.len();
+    0
+}
+
+unsafe extern "C" fn kernel_cb_sys_unlink(
+    kernel: *const std::os::raw::c_void,
+    path: *const std::ffi::c_char,
+) -> i32 {
+    let kernel = &*(kernel as *const Kernel);
+    let path = match std::ffi::CStr::from_ptr(path).to_str() {
+        Ok(s) => s,
+        Err(_) => return -2,
+    };
+    let ctx = system_ctx();
+    match kernel.sys_unlink(path, &ctx, /* recursive */ false) {
+        Ok(_) => 0,
+        Err(_) => -3,
+    }
+}
+
+unsafe extern "C" fn kernel_cb_sys_mkdir(
+    kernel: *const std::os::raw::c_void,
+    path: *const std::ffi::c_char,
+) -> i32 {
+    let kernel = &*(kernel as *const Kernel);
+    let path = match std::ffi::CStr::from_ptr(path).to_str() {
+        Ok(s) => s,
+        Err(_) => return -2,
+    };
+    let ctx = system_ctx();
+    // DT_DIR (entry_type=1) via tier-2 mkdir.  parents=false enforces
+    // the ABI contract that the parent must already exist; exist_ok=
+    // false surfaces EEXIST as -3 so the FUSE layer can translate.
+    match kernel.mkdir(path, &ctx, /* parents */ false, /* exist_ok */ false) {
+        Ok(_) => 0,
+        Err(_) => -3,
+    }
+}
+
+unsafe extern "C" fn kernel_cb_sys_rmdir(
+    kernel: *const std::os::raw::c_void,
+    path: *const std::ffi::c_char,
+) -> i32 {
+    let kernel = &*(kernel as *const Kernel);
+    let path = match std::ffi::CStr::from_ptr(path).to_str() {
+        Ok(s) => s,
+        Err(_) => return -2,
+    };
+    let ctx = system_ctx();
+    // sys_unlink with recursive=false; the kernel surfaces ENOTEMPTY
+    // for non-empty directories which maps to -3 here.
+    match kernel.sys_unlink(path, &ctx, /* recursive */ false) {
+        Ok(_) => 0,
+        Err(_) => -3,
+    }
+}
+
+unsafe extern "C" fn kernel_cb_sys_rename(
+    kernel: *const std::os::raw::c_void,
+    old_path: *const std::ffi::c_char,
+    new_path: *const std::ffi::c_char,
+) -> i32 {
+    let kernel = &*(kernel as *const Kernel);
+    let old_path = match std::ffi::CStr::from_ptr(old_path).to_str() {
+        Ok(s) => s,
+        Err(_) => return -2,
+    };
+    let new_path = match std::ffi::CStr::from_ptr(new_path).to_str() {
+        Ok(s) => s,
+        Err(_) => return -2,
+    };
+    let ctx = system_ctx();
+    match kernel.sys_rename(old_path, new_path, &ctx) {
+        Ok(_) => 0,
+        Err(_) => -3,
     }
 }
