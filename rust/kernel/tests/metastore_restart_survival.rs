@@ -663,17 +663,44 @@ fn cross_zone_mount_persists_row_into_parent_per_mount_store() {
 
 #[test]
 fn non_root_mount_without_parent_route_fails_closed() {
-    // #4343 follow-up: a non-root mount with no enclosing route has
-    // nowhere to persist its DT_MOUNT entry. Installing it anyway would
-    // create a route that silently vanishes on restart — DLC::mount must
-    // reject it instead.
+    // #4343 follow-up: with EXISTING topology, a non-root mount whose
+    // parent cannot be routed has nowhere to persist its DT_MOUNT
+    // entry. Installing it anyway would create a route that silently
+    // vanishes on restart — DLC::mount must reject it. (An EMPTY
+    // router is the bootstrap exception — covered by the test below.)
     let td = tempfile::tempdir().expect("tempdir");
     let ms = td.path().join("metastore.redb");
 
     let k = Kernel::new();
     k.set_metastore_path(ms.to_str().expect("utf-8 metastore path"))
         .expect("open durable metastore");
-    // NOTE: no "/" mount — the router is empty.
+    // Existing topology WITHOUT a root mount: /vault is routable,
+    // /orphan has no enclosing route.
+    let vault_backend = Arc::new(MemBackend::default());
+    k.sys_setattr(
+        "/vault",
+        2, // DT_MOUNT
+        "mem-vault",
+        Some(vault_backend as Arc<dyn ObjectStore>),
+        None,
+        None,
+        "",
+        kernel::ROOT_ZONE_ID,
+        false,
+        0,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None, // created_at_ms
+        None, // link_target
+        None, // source
+        None, // metastore
+    )
+    .expect("first-mount bootstrap of /vault on an empty router must be allowed");
     let backend = Arc::new(MemBackend::default());
     let mounted = k.sys_setattr(
         "/orphan",
@@ -700,9 +727,45 @@ fn non_root_mount_without_parent_route_fails_closed() {
     );
     assert!(
         mounted.is_err(),
-        "mounting a non-root path with no parent route must fail closed \
-         instead of installing an unpersistable mount"
+        "mounting a non-root path with no parent route (and existing \
+         topology) must fail closed instead of installing an \
+         unpersistable mount"
     );
+}
+
+#[test]
+fn first_mount_bootstrap_of_non_root_subtree_is_allowed() {
+    // Downstream services bootstrap their subtree as the very first
+    // mount on a bare kernel (nexus password vault mounts /vault with
+    // no root mount). An empty router has no parent zone to persist
+    // into — exactly like the root bootstrap — so this must succeed.
+    let k = Kernel::new();
+    let backend = Arc::new(MemBackend::default());
+    k.sys_setattr(
+        "/vault",
+        2, // DT_MOUNT
+        "mem-vault",
+        Some(backend as Arc<dyn ObjectStore>),
+        None,
+        None,
+        "",
+        kernel::ROOT_ZONE_ID,
+        false,
+        0,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None, // created_at_ms
+        None, // link_target
+        None, // source
+        None, // metastore
+    )
+    .expect("first-mount bootstrap on an empty router must be allowed");
+    assert!(k.has_mount("/vault", kernel::ROOT_ZONE_ID));
 }
 
 #[test]

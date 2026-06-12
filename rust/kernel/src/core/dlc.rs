@@ -78,14 +78,20 @@ impl DriverLifecycleCoordinator {
             .map(|i| mount_point[..i].to_string())
             .unwrap_or_else(|| "/".to_string());
         let route = kernel.vfs_router_arc().route(&parent_path, "root");
-        if route.is_none() && mount_point != "/" {
-            // Fail closed (#4343): a non-root mount with no enclosing route
-            // has nowhere to persist its DT_MOUNT entry — installing it
-            // anyway would create a route that silently vanishes on
-            // restart. Mount the root first.
+        if route.is_none() && mount_point != "/" && !kernel.vfs_router_arc().is_empty() {
+            // Fail closed (#4343): with EXISTING topology, a non-root
+            // mount whose parent cannot be routed has nowhere to persist
+            // its DT_MOUNT entry — installing it anyway would create a
+            // route that silently vanishes on restart. An EMPTY router is
+            // different: services bootstrap their subtree as the very
+            // first mount on a bare kernel (e.g. the password vault
+            // mounting /vault) — there is no parent zone to persist into
+            // yet, exactly like the root bootstrap, so that shape is
+            // allowed (pre-#4343 parity: no row is written).
             return Err(KernelError::IOError(format!(
-                "no parent route for non-root mount {mount_point}; \
-                 mount the root first so the DT_MOUNT entry can be persisted"
+                "no parent route for non-root mount {mount_point} with existing \
+                 topology; mount the enclosing tree first so the DT_MOUNT entry \
+                 can be persisted"
             )));
         }
         if let Some(parent_route) = route {
