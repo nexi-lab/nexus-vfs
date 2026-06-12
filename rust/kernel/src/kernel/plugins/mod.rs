@@ -307,7 +307,9 @@ unsafe extern "C" fn kernel_cb_sys_mkdir(
     // DT_DIR (entry_type=1) via tier-2 mkdir.  parents=false enforces
     // the ABI contract that the parent must already exist; exist_ok=
     // false surfaces EEXIST as -3 so the FUSE layer can translate.
-    match kernel.mkdir(path, &ctx, /* parents */ false, /* exist_ok */ false) {
+    match kernel.mkdir(
+        path, &ctx, /* parents */ false, /* exist_ok */ false,
+    ) {
         Ok(_) => 0,
         Err(_) => -3,
     }
