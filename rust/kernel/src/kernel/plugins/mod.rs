@@ -284,9 +284,13 @@ unsafe extern "C" fn kernel_cb_sys_unlink(
         Err(_) => return -2,
     };
     let ctx = system_ctx();
-    match kernel.sys_unlink(path, &ctx, /* recursive */ false) {
-        Ok(_) => 0,
-        Err(_) => -3,
+    let reqs = [crate::kernel::UnlinkRequest {
+        path: path.to_string(),
+        recursive: false,
+    }];
+    match kernel.sys_unlink(&reqs, &ctx).into_iter().next() {
+        Some(Ok(_)) => 0,
+        _ => -3,
     }
 }
 
@@ -321,9 +325,13 @@ unsafe extern "C" fn kernel_cb_sys_rmdir(
     let ctx = system_ctx();
     // sys_unlink with recursive=false; the kernel surfaces ENOTEMPTY
     // for non-empty directories which maps to -3 here.
-    match kernel.sys_unlink(path, &ctx, /* recursive */ false) {
-        Ok(_) => 0,
-        Err(_) => -3,
+    let reqs = [crate::kernel::UnlinkRequest {
+        path: path.to_string(),
+        recursive: false,
+    }];
+    match kernel.sys_unlink(&reqs, &ctx).into_iter().next() {
+        Some(Ok(_)) => 0,
+        _ => -3,
     }
 }
 
