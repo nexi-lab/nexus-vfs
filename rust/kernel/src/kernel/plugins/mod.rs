@@ -259,7 +259,7 @@ unsafe extern "C" fn kernel_cb_sys_readdir(
         for ch in name.chars() {
             match ch {
                 '"' => json.push_str("\\\""),
-                '\' => json.push_str("\\\\"),
+                '\\' => json.push_str("\\\\"),
                 c => json.push(c),
             }
         }
