@@ -725,20 +725,9 @@ impl ZoneRaftRegistry {
     /// gates that).
     pub fn learn_peer_address(&self, zone_id: &str, peer_id: u64, endpoint: &str) -> bool {
         if endpoint.is_empty() || peer_id == 0 {
-            tracing::debug!(
-                zone = %zone_id,
-                peer_id,
-                endpoint,
-                "learn_peer_address: skipped (empty endpoint or zero peer_id)"
-            );
             return false;
         }
         let Some(entry) = self.zones.get(zone_id) else {
-            tracing::debug!(
-                zone = %zone_id,
-                peer_id,
-                "learn_peer_address: skipped (zone not in registry)"
-            );
             return false;
         };
         let mut peers = entry.peers.write().unwrap();
@@ -753,27 +742,9 @@ impl ZoneRaftRegistry {
                 p.id = peer_id;
                 p
             }
-            Err(e) => {
-                tracing::debug!(
-                    zone = %zone_id,
-                    peer_id,
-                    endpoint,
-                    error = %e,
-                    "learn_peer_address: NodeAddress::parse failed"
-                );
-                return false;
-            }
+            Err(_) => return false,
         };
         peers.insert(peer_id, parsed);
-        let new_len = peers.len();
-        drop(peers);
-        tracing::debug!(
-            zone = %zone_id,
-            peer_id,
-            endpoint,
-            new_len,
-            "learn_peer_address: inserted"
-        );
         true
     }
 

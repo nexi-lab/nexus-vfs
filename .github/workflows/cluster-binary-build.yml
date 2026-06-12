@@ -34,7 +34,11 @@ jobs:
           - os: windows-latest
             artifact_name: nexusd-cluster-windows-x86_64
             binary: nexusd-cluster.exe
-            max_size_bytes: 13369344  # 12.75 MiB
+            max_size_bytes: 14155776  # 13.5 MiB — bumped to absorb #51 substrate
+                                      # code growth (4 root-cause fixes + the
+                                      # debug-level observability traces they
+                                      # carry).  Linux/macOS hold the same %
+                                      # of slack.
 
     steps:
       - name: Checkout code

@@ -349,7 +349,6 @@ where
 impl NexusVfsService for VfsServiceImpl {
     async fn read(&self, req: Request<ReadRequest>) -> Result<Response<ReadResponse>, Status> {
         let req = req.into_inner();
-        tracing::debug!(path = %req.path, offset = req.offset, "gRPC Read RPC: received");
         let ctx = match self.resolve_context(&req.auth_token) {
             Ok(c) => c,
             Err(s) => return Ok(Response::new(error_read(s))),
@@ -366,7 +365,6 @@ impl NexusVfsService for VfsServiceImpl {
         // Offload: DT_PIPE/DT_STREAM reads block up to timeout_ms
         let kernel = self.kernel.clone();
         let path = req.path;
-        let path_for_trace = path.clone();
         let offset = req.offset;
         let read_res =
             run_blocking(move || KernelAbi::sys_read(&*kernel, &path, &ctx, timeout_ms, offset))
@@ -387,7 +385,6 @@ impl NexusVfsService for VfsServiceImpl {
                 }))
             }
             Err(err) => {
-                tracing::debug!(path = %path_for_trace, error = ?err, "gRPC Read RPC: kernel returned Err");
                 let (code, msg) = self.map_kernel_err(err);
                 Ok(Response::new(ReadResponse {
                     content: Vec::new(),

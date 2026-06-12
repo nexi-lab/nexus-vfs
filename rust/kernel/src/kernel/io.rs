@@ -205,25 +205,8 @@ impl Kernel {
         // 2. Route (pure Rust LPM)
         let route = match self.vfs_router.route(path, &ctx.zone_id) {
             Some(r) => r,
-            None => {
-                tracing::debug!(
-                    path = %path,
-                    ctx_zone = %ctx.zone_id,
-                    "sys_read: route() returned None — no mount covers path"
-                );
-                return Err(not_found());
-            }
+            None => return Err(not_found()),
         };
-        tracing::debug!(
-            path = %path,
-            ctx_zone = %ctx.zone_id,
-            mount = %route.mount_point,
-            route_zone = %route.zone_id,
-            backend_present = route.backend.is_some(),
-            metastore_present = route.metastore.is_some(),
-            backend_path = %route.backend_path,
-            "sys_read: route resolved"
-        );
 
         // 3. MetaStore lookup. The metastore impl serves cache hits from
         // its own internal `DashMap` projection (see
@@ -437,13 +420,6 @@ impl Kernel {
         // bail-out at this point pre-empted that fast path and broke
         // every cross-node read of an observe-materialised entry.
         let content_id_opt = entry.content_id.as_deref().filter(|s| !s.is_empty());
-        tracing::debug!(
-            path = %path,
-            entry_type = entry.entry_type,
-            content_id_present = content_id_opt.is_some(),
-            last_writer = ?entry.last_writer_address,
-            "sys_read: entry-exists branch"
-        );
 
         // 4. VFS lock (blocking acquire — wrapper releases GIL before calling this)
         let lock_handle =
@@ -512,20 +488,8 @@ impl Kernel {
 
         let origin = match entry.last_writer_address.as_deref() {
             Some(s) if !s.is_empty() => s,
-            _ => {
-                tracing::debug!(
-                    path = %path,
-                    last_writer = ?entry.last_writer_address,
-                    "try_remote_fetch: last_writer_address empty/None, returning not_found"
-                );
-                return Err(not_found());
-            }
+            _ => return Err(not_found()),
         };
-        tracing::debug!(
-            path = %path,
-            origin,
-            "try_remote_fetch: attempting peer fetch"
-        );
 
         // Don't loop back to self — we're the writer, blob is truly missing.
         if let Some(addr) = self.self_address.read().as_deref() {
