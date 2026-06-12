@@ -703,11 +703,13 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     // would carry no `last_writer_address`, and ReadBlob would have
     // nothing to serve.  Held until shutdown so the apply-cb closures +
     // their Arc clones see a stable provider lifetime.
-    let _dist_coord = {
-        let coord = nexus_raft::distributed_coordinator::RaftDistributedCoordinator::new();
-        coord.install_with_kernel(zm.clone(), zm.runtime_handle(), &self_address, &kernel);
-        coord
-    };
+    // Construct the provider as `Arc<RaftDistributedCoordinator>` so
+    // `install_with_kernel` can clone it into the kernel's coordinator
+    // slot (the slot type is `Arc<dyn DistributedCoordinator>`).  Once
+    // wired, the kernel keeps the provider alive for the lifetime of
+    // the kernel — no separate local `_dist_coord` holder needed.
+    Arc::new(nexus_raft::distributed_coordinator::RaftDistributedCoordinator::new())
+        .install_with_kernel(zm.clone(), zm.runtime_handle(), &self_address, &kernel);
 
     // Outbound peer-blob client — installs a `PeerBlobClient` over
     // the kernel-shared tokio runtime, replacing the `NoopPeerBlobClient`
@@ -787,6 +789,38 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     for raw in &common.mount_drivers {
         let spec = parse_mount_driver_spec(raw)
             .map_err(|e| anyhow::anyhow!("--mount-driver parse error: {e}"))?;
+
+        // `--mount-driver` installs a backend INSIDE a zone.  The zone
+        // itself is created elsewhere — via `NEXUS_FEDERATION_ZONES`
+        // bootstrap (founder), or via `nexusd-cluster join` (joiner).
+        // If the target zone isn't loaded yet, skipping is the correct
+        // semantic: re-running the cluster after the operator-driven
+        // zone-create / join completes lets the daemon re-attempt the
+        // mount with the zone present.
+        //
+        // The alternative — letting `kernel.mount` fall through to
+        // `sys_setattr DT_MOUNT`'s zone-create-on-mount branch — would
+        // bootstrap a parallel 1-voter zone on the joiner, diverging
+        // from the cluster's authoritative ConfState.  Offline join's
+        // `bootstrap_or_join_zone` Branch 1 then short-circuits on the
+        // "zone already loaded from persisted storage" check and never
+        // dials JoinZone against the founder, leaving the joiner in a
+        // solo split-brain that silently passes liveness probes.  Root
+        // is the one mountable zone that may legitimately be bootstrapped
+        // here (single-node founder default), so it falls through.
+        if spec.zone_id != contracts::ROOT_ZONE_ID && zm.get_zone(&spec.zone_id).is_none() {
+            tracing::info!(
+                driver = %spec.name,
+                zone_id = %spec.zone_id,
+                vfs_path = %spec.vfs_path,
+                "skipping --mount-driver: target zone not loaded on this node — \
+                 declare via NEXUS_FEDERATION_ZONES (founder) or run \
+                 `nexusd-cluster join` (joiner) to bring the zone in first, \
+                 then restart; --mount-driver re-applies on restart",
+            );
+            continue;
+        }
+
         let backend = kernel
             .make_driver(&spec.name, &spec.config_json)
             .map_err(|e| {
@@ -796,22 +830,73 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
                     spec.name,
                 )
             })?;
-        kernel
-            .mount(
-                &spec.vfs_path,
-                MountOptions::new(&spec.name)
-                    .with_backend(backend)
-                    .with_zone(&spec.zone_id),
+
+        // Inherit the parent federation mount's `ZoneMetaStore` Arc so
+        // this driver mount sees the SAME path-translation anchor as
+        // every other surface on the same federated zone.
+        //
+        // Why: `coordinator.metastore_for_zone(zone)` (the auto-fallback
+        // `sys_setattr DT_MOUNT` would take on `(None, None)`) returns
+        // a fresh `ZoneMetaStore` rooted at canonical `/<zone_id>` — the
+        // raft-internal namespace.  But the federation mount (e.g.
+        // `/shared` → sharedzone) installed its own `ZoneMetaStore`
+        // rooted at the global path `/shared` via
+        // `wire_mount_core::install_metastore`.  Two different mount
+        // points = two different `to_zone_key` translations applied to
+        // the same state machine — writes through one anchor end up
+        // under keys reads through the other never look up.  The
+        // smoking-gun symptom: joiner serves bytes + `observe_backend_content`
+        // proposes metadata, raft replicates the entry, but founder's
+        // `vfs_stat` still reports `found=False` because its lookup
+        // translates the path differently from the writer's.
+        //
+        // The federation mount's metastore is the SSOT for the federated
+        // zone's namespace.  Look it up via `vfs_router.route()` against
+        // the parent directory (parent of `vfs_path`); the recursive
+        // descent (#48) routes through the federation mount and hands
+        // back its installed `metastore`.  Pass that exact `Arc` into
+        // `MountOptions.with_metastore` so `sys_setattr DT_MOUNT` takes
+        // the explicit-metastore branch and skips the auto-fallback
+        // entirely.
+        //
+        // Falls back to no override when the parent route has no
+        // metastore (driver mount under a non-federation parent, e.g.
+        // root with a `PathLocal` backend): `sys_setattr` will then take
+        // its `(None, _) => None` branch as before, which is correct —
+        // such mounts route to the kernel's global metastore where
+        // `to_zone_key` is a no-op.
+        let parent_metastore = {
+            let parent_dir = spec
+                .vfs_path
+                .rsplit_once('/')
+                .map(|(p, _)| p)
+                .unwrap_or("/");
+            let parent_dir = if parent_dir.is_empty() {
+                "/"
+            } else {
+                parent_dir
+            };
+            kernel
+                .vfs_router_arc()
+                .route(parent_dir, contracts::ROOT_ZONE_ID)
+                .and_then(|r| r.metastore)
+        };
+
+        let mut opts = MountOptions::new(&spec.name)
+            .with_backend(backend)
+            .with_zone(&spec.zone_id);
+        if let Some(ms) = parent_metastore {
+            opts = opts.with_metastore(ms);
+        }
+        kernel.mount(&spec.vfs_path, opts).map_err(|e| {
+            anyhow::anyhow!(
+                "mount driver '{}' at zone '{}' path '{}': {:?}",
+                spec.name,
+                spec.zone_id,
+                spec.vfs_path,
+                e,
             )
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "mount driver '{}' at zone '{}' path '{}': {:?}",
-                    spec.name,
-                    spec.zone_id,
-                    spec.vfs_path,
-                    e,
-                )
-            })?;
+        })?;
         tracing::info!(
             driver = %spec.name,
             zone_id = %spec.zone_id,

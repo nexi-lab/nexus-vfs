@@ -244,6 +244,29 @@ RaftMetadataStore          PyZoneManager (Rust/redb/Raft)
 
 **API Privilege Levels**: File I/O (agents/users) → Federation ops (`share/join`) → Zone lifecycle (admin). Agents do NOT get mount/unmount APIs.
 
+### 6.7 Cross-Node Read Paths — Two Modes, One Routing Pointer
+
+A cross-node `sys_read` on a federated path resolves through one of two paths.  Both consult the same SSOT (`FileMetadata.last_writer_address`) so the metadata-driven fast path and the cold fan-out path stay aligned on which peer holds the bytes.
+
+**Mode A — `try_remote_fetch` (metadata-driven fast path).**  The reader's local metastore has a `FileMetadata` entry for the path.  `last_writer_address` names the node that wrote it.  `sys_read` sends `ReadBlob(content_id)` directly to that peer; the peer's `BlobFetcher::read` path-routes through its own VFSRouter (CAS hash or backend path, opaque to the kernel) and returns bytes.  One round-trip, no peer enumeration.
+
+This is the path Federation E2E's L1 cross-machine read uses: every `sys_write` carries `last_writer_address` set from the writer's `self_address`, so subsequent peer reads have a routing pointer baked in.
+
+**Mode B — `zone_peers` fan-out (cold cross-node first read).**  There is no metadata yet — typical when a workflow writes bytes directly to host fs outside Nexus (Claude Code dropping `~/.claude/tasks/<n>.json`).  The reader's metastore miss falls through to its local backend (miss — bytes are on a peer's host fs); the kernel fans out via `DistributedCoordinator::zone_peers(zone_id)` and dials each non-self, non-witness peer's `BlobFetcher::read`.  The peer that hits its own backend serves the bytes and runs `observe_backend_content`, which:
+
+  1. **Sets `last_writer_address = self_address`** on the synthesised metadata, materialising the routing pointer that Mode A consumes on every subsequent read.
+  2. **Leaves `content_id` empty** — the substrate explicitly does not assume any local addressing scheme.  The reader-side path handles this by treating empty `content_id` as a "no local addressing key" signal and letting control flow fall through to `try_remote_fetch`, which uses the global VFS path as the peer fetch key (`unwrap_or(path)` fallback).
+
+Cold fan-out cost is paid **once** per `(path, reader)` pair: the second read on the same path takes Mode A.
+
+**Wiring invariants** (production failures here surface as `peer_count=0` empty fan-out or `FileNotFound` on metadata-present reads):
+
+  * `RaftDistributedCoordinator::install_with_kernel` wires the kernel's `DistributedCoordinator` slot via `Kernel::set_distributed_coordinator(Arc::clone(self))`.  Without this, `kernel.distributed_coordinator().zone_peers(...)` returns `NoopDistributedCoordinator`'s default empty `Vec`, and Mode B's fan-out enumerates zero peers — silently broken regardless of how many peers ConfState actually contains.  Federation E2E (Mode A only) sails past this; cc-tasks-share (Mode B) is the canonical regression catcher.
+  * `--mount-driver` defers when its target zone is not yet loaded on this node.  The kernel-internal "create-on-mount" branch in `sys_setattr DT_MOUNT` is reserved for the operator-driven joiner / creator flow (`mount addr:/zone /local` or explicit founder bootstrap); driver mounts are intent-orthogonal to zone creation, so triggering it from `--mount-driver` would solo-bootstrap a parallel raft group on a joiner that's supposed to JOIN.  Surfaces as a split-brain — two same-named raft groups, diverging silently.
+  * Driver mounts inside a federated zone inherit the federation mount's `Arc<dyn MetaStore>` via `MountOptions::with_metastore`.  Two `ZoneMetaStore` instances rooted at different mount points (one at `/<zone_id>` from `metastore_for_zone`, one at the federation's global path from `wire_mount_core::install_metastore`) translate the same VFS path to *different* state-machine keys — writes through one anchor live under keys reads through the other never look up.  Single SSOT eliminates that.
+
+The Docker-compose cc-tasks-share E2E (`tests/e2e/docker/test_cc_tasks_share_e2e.py`) pins Mode B end-to-end against this invariant set; the cross-machine federation runbook (`docs/federation-cross-machine-runbook.md`) continues to pin Mode A as the L1 byte-exact target.
+
 ---
 
 ## 7. Extended Design Topics

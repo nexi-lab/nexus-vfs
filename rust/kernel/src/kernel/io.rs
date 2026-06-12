@@ -205,25 +205,8 @@ impl Kernel {
         // 2. Route (pure Rust LPM)
         let route = match self.vfs_router.route(path, &ctx.zone_id) {
             Some(r) => r,
-            None => {
-                tracing::debug!(
-                    path = %path,
-                    ctx_zone = %ctx.zone_id,
-                    "sys_read: route() returned None — no mount covers path"
-                );
-                return Err(not_found());
-            }
+            None => return Err(not_found()),
         };
-        tracing::debug!(
-            path = %path,
-            ctx_zone = %ctx.zone_id,
-            mount = %route.mount_point,
-            route_zone = %route.zone_id,
-            backend_present = route.backend.is_some(),
-            metastore_present = route.metastore.is_some(),
-            backend_path = %route.backend_path,
-            "sys_read: route resolved"
-        );
 
         // 3. MetaStore lookup. The metastore impl serves cache hits from
         // its own internal `DashMap` projection (see
@@ -418,13 +401,26 @@ impl Kernel {
             }
         }
 
-        // Content identifier: CAS backends use content_id (hash). Path-addressed
-        // backends derive their physical path from `path - mount_prefix`
-        // inside the backend itself; the kernel always passes the content_id.
-        let content_id = match entry.content_id.as_deref().filter(|s| !s.is_empty()) {
-            Some(id) => id,
-            None => return Err(not_found()),
-        };
+        // Content identifier: CAS backends use content_id (hash).
+        // Path-addressed backends derive their physical path from `path
+        // - mount_prefix` inside the backend itself; the kernel always
+        // passes the content_id.
+        //
+        // Lazy-observe (#46) entries materialised by a peer's
+        // `BlobFetcher::read` carry an empty content_id by design —
+        // metadata records that some node served bytes for `path` once,
+        // not where those bytes live in any local backend.  Skipping the
+        // local-backend probe in that case is correct: the local backend
+        // necessarily has nothing addressable under "" anyway.
+        // `try_remote_fetch` further down handles the empty content_id
+        // path by falling back to the global `path` as the peer fetch
+        // key (line 527), routing through `last_writer_address` to the
+        // origin node's `BlobFetcher::read` which path-routes through
+        // its own `VFSRouter`.  The previous `return Err(not_found())`
+        // bail-out at this point pre-empted that fast path and broke
+        // every cross-node read of an observe-materialised entry.
+        let content_id_opt = entry.content_id.as_deref().filter(|s| !s.is_empty());
+
         // 4. VFS lock (blocking acquire — wrapper releases GIL before calling this)
         let lock_handle =
             self.lock_manager
@@ -435,11 +431,18 @@ impl Kernel {
             )));
         }
 
-        // 5. Backend read (Rust-native ObjectStore)
-        let content = route
-            .backend
-            .as_ref()
-            .and_then(|b| b.read_content(content_id, ctx).ok());
+        // 5. Backend read (Rust-native ObjectStore) — only when we have
+        //    an addressing key for it.  Empty content_id (observe-
+        //    materialised entry, or any future metadata-only record)
+        //    short-circuits to `None` so the path immediately falls
+        //    through to `try_remote_fetch`.
+        let content = match content_id_opt {
+            Some(cid) => route
+                .backend
+                .as_ref()
+                .and_then(|b| b.read_content(cid, ctx).ok()),
+            None => None,
+        };
 
         // 6. Release VFS lock (always, even on miss)
         self.lock_manager.do_release(lock_handle);

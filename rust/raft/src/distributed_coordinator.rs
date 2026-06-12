@@ -146,7 +146,7 @@ impl RaftDistributedCoordinator {
     ///     reach this node's raft / blob-fetch RPCs (typically
     ///     `<hostname>:<bind_port>`).
     pub fn install_with_kernel(
-        &self,
+        self: &Arc<Self>,
         zm: Arc<ZoneManager>,
         runtime: tokio::runtime::Handle,
         self_address: &str,
@@ -195,6 +195,31 @@ impl RaftDistributedCoordinator {
         // self-bootstrap semantics — same failure class as the
         // `last_writer_address` gap closed above.
         self.bootstrap_done.store(true, Ordering::Release);
+
+        // Wire the kernel's `DistributedCoordinator` slot to this
+        // provider — every accessor `kernel.distributed_coordinator()`
+        // (sys_setattr DT_MOUNT's `federation_active`, the WAL stream
+        // metastore lookup, `sys_read`'s cold cross-node fan-out via
+        // `zone_peers`, the procfs `/__sys__/zones` synthesiser, …)
+        // resolves through this slot.  Mirrors `set_peer_client`
+        // (wired separately by `transport::peer_blob::install`); both
+        // are required for the kernel's federation surface to behave.
+        //
+        // Done LAST so the federation-active guard above flips at the
+        // same moment the slot becomes the real impl — callers polling
+        // `is_initialized()` never observe a "ready but routes still
+        // through Noop" half-state where create_zone / zone_peers /
+        // metastore_for_zone return errors / empties.
+        //
+        // Federation E2E never exercised this path because its workflow
+        // resolves cross-node reads through `Kernel::peer_client`'s
+        // `try_remote_fetch` (slot wired separately by
+        // `transport::peer_blob::install`); the kernel's DC slot
+        // accessors aren't on that hot path.  cc-tasks-share's
+        // host-fs-direct write workflow is the first to hit the cold
+        // cross-node fan-out arm (`sys_read → zone_peers`), surfacing
+        // the missing wiring.
+        kernel.set_distributed_coordinator(Arc::clone(self) as Arc<dyn DistributedCoordinator>);
     }
 
     fn zm(&self) -> Option<&Arc<ZoneManager>> {
@@ -1287,14 +1312,26 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
         //     fan-out, no point fanning back to ourselves.
         //   * Witnesses — vote-only nodes that never serve content.
         let Some(zm) = self.zm() else {
+            tracing::debug!(zone = %zone_id, "zone_peers: zm not available, returning empty");
             return Vec::new();
         };
         let local_id = zm.node_id();
-        zm.zone_peers(zone_id)
+        let raw = zm.zone_peers(zone_id);
+        let raw_len = raw.len();
+        let filtered: Vec<String> = raw
             .into_iter()
             .filter(|(id, _, _, is_witness)| !is_witness && *id != local_id)
             .map(|(_, _, endpoint, _)| endpoint)
-            .collect()
+            .collect();
+        tracing::debug!(
+            zone = %zone_id,
+            local_id,
+            raw_peer_count = raw_len,
+            filtered_count = filtered.len(),
+            peers = ?filtered,
+            "zone_peers: result"
+        );
+        filtered
     }
 
     fn metastore_for_zone(
