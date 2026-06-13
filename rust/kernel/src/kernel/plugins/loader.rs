@@ -35,10 +35,21 @@ use crate::abc::object_store::{ObjectStore, StorageError, WriteResult};
 // rebuild. Removing one = delete the file + the line below + rebuild
 // (this is the revocation mechanism for 0→1).
 
-const TRUSTED_KEY_FILES: &[&[u8]] = &[include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/trusted_keys/nexus-team.pub"
-))];
+const TRUSTED_KEY_FILES: &[&[u8]] = &[
+    include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/trusted_keys/nexus-team.pub"
+    )),
+    // Sealed-keystore dogfood root — provisioned 2026-06-13 against the
+    // nexi-lab/nexus VAULT_SIGNING_MASTER_KEY secret via
+    // scripts/provision_dogfood_key.py. Signs every non-vault plugin
+    // (local-connector, fuse-plugin, future drivers/services) so the
+    // bootstrap nexus-team.pub stays scoped to vault only.
+    include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/trusted_keys/kernel-dogfood-v1.pub"
+    )),
+];
 
 fn trusted_keys() -> &'static [VerifyingKey] {
     static KEYS: OnceLock<Vec<VerifyingKey>> = OnceLock::new();
