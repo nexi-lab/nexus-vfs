@@ -258,15 +258,36 @@ unsafe extern "C" fn kernel_cb_sys_readdir(
     // permission check is the SSOT for any access policy plugins
     // care about).
     let entries = kernel.sys_readdir(parent_path, contracts::ROOT_ZONE_ID, true);
+    // `kernel.sys_readdir` returns each child's *full* VFS path (e.g.
+    // `/alpha-dir`, not `alpha-dir`); the JSON shape this callback
+    // exports is documented under key `"name"` and consumers like the
+    // FUSE plugin feed it directly into `reply.add(_, _, kind, name)`
+    // where a leading slash makes the kernel-side FUSE driver reject
+    // the readdir reply with EIO.  Strip the parent-path prefix here
+    // so the JSON `"name"` field actually is a name.  The kernel
+    // already filters direct children only (see io.rs §sys_readdir
+    // parent_depth check), so a single `rsplit_once('/')` is the
+    // canonical leaf extraction.
+    //
     // Hand-roll JSON to avoid a serde_json dep on the kernel-side
     // callback closure.  Each entry is one
-    // `{"name":<escaped>,"entry_type":<u8>}` object.  Names are
-    // returned by the kernel as plain VFS path components, so the only
-    // characters needing JSON-escape are `"` and `\` — extremely rare
-    // in path segments but cheap to handle correctly.
+    // `{"name":<escaped>,"entry_type":<u8>}` object.  Only `"` and
+    // `\` need JSON-escape — extremely rare in path segments but
+    // cheap to handle correctly.
     let mut json = String::from("[");
     let mut first = true;
-    for (name, entry_type) in entries {
+    for (full_path, entry_type) in entries {
+        let name = full_path
+            .rsplit_once('/')
+            .map(|(_, leaf)| leaf)
+            .unwrap_or(full_path.as_str());
+        if name.is_empty() {
+            // Defensive: the parent itself slipped through (shouldn't
+            // happen with the kernel's depth filter, but if it does the
+            // FUSE layer would `reply.add` an empty name and the
+            // kernel driver rejects the whole batch).
+            continue;
+        }
         if !first {
             json.push(',');
         }
