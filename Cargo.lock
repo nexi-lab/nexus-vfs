@@ -3580,12 +3580,17 @@ dependencies = [
 name = "transport"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "backends",
  "base64",
+ "bytes",
  "chrono",
  "contracts",
  "dashmap",
  "futures",
+ "http",
+ "http-body",
+ "http-body-util",
  "kernel",
  "lib",
  "parking_lot",
@@ -3598,8 +3603,12 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
  "tonic",
+ "tonic-prost",
+ "tower",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

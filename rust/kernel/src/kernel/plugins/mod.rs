@@ -18,6 +18,8 @@ use nexus_plugin_abi::{KernelHandle, PluginKind};
 
 use crate::kernel::Kernel;
 
+pub use loader::PluginGrpcEndpoint;
+
 impl Kernel {
     /// Build a `KernelHandle` vtable that plugins use to call back into
     /// the kernel. The handle is valid for the lifetime of the plugin
@@ -102,6 +104,20 @@ impl Kernel {
     /// List loaded plugins: `(name, kind, path)`.
     pub fn list_plugins(&self) -> Vec<(String, PluginKind, std::path::PathBuf)> {
         self.plugin_loader.list()
+    }
+
+    /// Collect every `(service_name, dispatcher)` pair declared by a
+    /// loaded service plugin via the optional
+    /// `nexus_plugin_grpc_services` ABI symbol.  Consumed by the
+    /// cluster glue (in `nexus-transport`) to merge plugin services
+    /// into the same tonic Routes as the built-in VFS service —
+    /// external gRPC clients reach plugin RPCs on the same port and
+    /// trust root.
+    ///
+    /// Cheap: a snapshot copy + `Arc` clones.  Suitable to call at
+    /// cluster boot after `load_plugin_dir`.
+    pub fn plugin_grpc_endpoints(&self) -> Vec<PluginGrpcEndpoint> {
+        self.plugin_loader.collect_grpc_endpoints()
     }
 
     /// Load every shared-library file in `dir` as a plugin.
