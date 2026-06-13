@@ -931,11 +931,11 @@ mod tests {
     // ── grpc_services symbol parsing ───────────────────────────────
 
     unsafe extern "C" fn stub_grpc_services_two() -> *const std::ffi::c_char {
-        b"[\"foo.v1.Bar\",\"baz.v1.Qux\"]\0".as_ptr() as *const std::ffi::c_char
+        c"[\"foo.v1.Bar\",\"baz.v1.Qux\"]".as_ptr()
     }
 
     unsafe extern "C" fn stub_grpc_services_empty() -> *const std::ffi::c_char {
-        b"[]\0".as_ptr() as *const std::ffi::c_char
+        c"[]".as_ptr()
     }
 
     unsafe extern "C" fn stub_grpc_services_null() -> *const std::ffi::c_char {
@@ -943,11 +943,11 @@ mod tests {
     }
 
     unsafe extern "C" fn stub_grpc_services_malformed() -> *const std::ffi::c_char {
-        b"not a json array\0".as_ptr() as *const std::ffi::c_char
+        c"not a json array".as_ptr()
     }
 
     unsafe extern "C" fn stub_grpc_services_wrong_shape() -> *const std::ffi::c_char {
-        b"[1, 2, 3]\0".as_ptr() as *const std::ffi::c_char
+        c"[1, 2, 3]".as_ptr()
     }
 
     #[test]
