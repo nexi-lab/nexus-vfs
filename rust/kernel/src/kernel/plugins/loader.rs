@@ -13,15 +13,16 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString, OsString};
 use std::os::raw::c_void;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use contracts::rust_service::{RustCallError, RustService};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use nexus_plugin_abi::{
     signing::{PUBKEY_LENGTH, SIGNATURE_FILE_SUFFIX, SIGNATURE_LENGTH},
-    DriverCreateFn, DriverDestroyFn, DriverReadFn, DriverWriteFn, KernelHandle, PluginKind,
-    PluginResult, ServiceCreateFn, ServiceDestroyFn, ServiceDispatchFn, PLUGIN_API_VERSION,
+    DriverCreateFn, DriverDestroyFn, DriverReadFn, DriverWriteFn, KernelHandle, PluginGrpcServicesFn,
+    PluginKind, PluginResult, ServiceCreateFn, ServiceDestroyFn, ServiceDispatchFn,
+    PLUGIN_API_VERSION,
 };
 
 use crate::abc::object_store::{ObjectStore, StorageError, WriteResult};
@@ -130,6 +131,42 @@ fn verify_signature_against(plugin_path: &Path, keys: &[VerifyingKey]) -> Result
     Ok(())
 }
 
+// ── gRPC services opt-in (optional symbol) ──────────────────────────
+
+/// Invoke the optional `nexus_plugin_grpc_services` symbol and parse
+/// its JSON-array return value into a `Vec<String>` of service names.
+///
+/// The contract (mirrored in plugin-abi's `symbols::SERVICE_GRPC_SERVICES`):
+///
+/// - Return is a `*const c_char` pointing at a null-terminated UTF-8
+///   JSON document.  Pointer must outlive every load of the dylib
+///   (static storage).  The kernel does not free it.
+/// - JSON must be an array of strings, each a fully-qualified gRPC
+///   service name (`<package>.<Service>`).  A null pointer or an
+///   empty array → plugin is loaded but no external gRPC routing.
+///
+/// Returns `Err` only on hard contract violations (non-UTF-8, malformed
+/// JSON, non-string element).  A plugin whose symbol returns null or
+/// `[]` loads fine — gRPC routing is purely opt-in.
+fn parse_grpc_services_symbol(
+    sym: PluginGrpcServicesFn,
+    plugin_name: &str,
+) -> Result<Vec<String>, String> {
+    let ptr = unsafe { sym() };
+    if ptr.is_null() {
+        return Ok(Vec::new());
+    }
+    let json = unsafe { CStr::from_ptr(ptr) }
+        .to_str()
+        .map_err(|e| format!("{plugin_name}: grpc_services JSON not UTF-8: {e}"))?;
+    let parsed: Vec<String> = serde_json::from_str(json).map_err(|e| {
+        format!(
+            "{plugin_name}: grpc_services JSON parse failed (expected array of strings): {e}"
+        )
+    })?;
+    Ok(parsed)
+}
+
 // ── LoadedPlugin ────────────────────────────────────────────────────
 
 /// A loaded plugin — tracks the library handle and instance pointer so
@@ -146,6 +183,10 @@ struct LoadedPlugin {
     handle: *mut c_void,
     /// Destroy function — called before dlclose.
     destroy_fn: unsafe extern "C" fn(*mut c_void),
+    /// Fully-qualified gRPC service names this plugin opted into
+    /// exposing via the optional `nexus_plugin_grpc_services` symbol.
+    /// Empty for plugins (or driver kind) that did not export it.
+    grpc_services: Vec<String>,
 }
 
 // SAFETY: The plugin C ABI contract requires all plugin instances to be
@@ -153,6 +194,36 @@ struct LoadedPlugin {
 // through the C ABI functions which are themselves `Send + Sync`.
 unsafe impl Send for LoadedPlugin {}
 unsafe impl Sync for LoadedPlugin {}
+
+// ── PluginGrpcEndpoint (public surface to cluster glue) ─────────────
+
+/// One plugin-exposed gRPC service ready for cluster-side tonic
+/// routing.  Returned by [`PluginLoader::collect_grpc_endpoints`].
+///
+/// The cluster builds one tower `Service` per endpoint, registered at
+/// `/{service_name}/{{*method}}` in tonic's axum router.  Inbound
+/// requests strip the gRPC frame header, pass the request bytes to
+/// `service.dispatch(full_path, bytes)`, and re-frame the returned
+/// response bytes.
+///
+/// Contract for the plugin's `RustService::dispatch`:
+///
+/// - `method` is the request URL path, e.g.
+///   `"/nexus.secrets.v1.GenericSecretsService/PutSecret"`.  The
+///   leading `/` distinguishes a gRPC-routed call from the legacy
+///   short-method `Call` RPC convention (`"secret_put"`); plugins
+///   that serve both branches simply match on the prefix.
+/// - `payload` is the proto-encoded request body (gRPC framing
+///   already stripped on the cluster side).
+/// - Returned bytes are the proto-encoded response body; the cluster
+///   re-frames and emits `grpc-status: 0` trailers on success.
+/// - `RustCallError::NotFound` → gRPC `Unimplemented`;
+///   `InvalidArgument` → `InvalidArgument`; `Internal(_)` → `Internal`.
+pub struct PluginGrpcEndpoint {
+    pub service_name: String,
+    pub plugin_name: String,
+    pub service: Arc<dyn RustService>,
+}
 
 // ── DylibRustService ────────────────────────────────────────────────
 
@@ -441,6 +512,7 @@ impl PluginLoader {
         };
 
         // 3. Construct instance based on kind
+        let mut grpc_services: Vec<String> = Vec::new();
         let (handle, destroy_fn) = match kind {
             PluginKind::Service => {
                 let create_fn: ServiceCreateFn = unsafe {
@@ -458,6 +530,26 @@ impl PluginLoader {
                 let handle = unsafe { create_fn(kernel_handle as *const KernelHandle) };
                 if handle.is_null() {
                     return Err(format!("nexus_service_create returned null for '{name}'"));
+                }
+                // Optional gRPC opt-in.  Plugin authors that want to be
+                // routed as an external gRPC service export
+                // `nexus_plugin_grpc_services` returning a JSON array
+                // of fully-qualified service names — see plugin-abi
+                // `symbols::SERVICE_GRPC_SERVICES` for the contract.
+                // Plugins without the symbol load unchanged.
+                if let Ok(sym) =
+                    unsafe { lib.get::<PluginGrpcServicesFn>(
+                        nexus_plugin_abi::symbols::SERVICE_GRPC_SERVICES.as_bytes(),
+                    ) }
+                {
+                    grpc_services = parse_grpc_services_symbol(*sym, &name)?;
+                    if !grpc_services.is_empty() {
+                        tracing::info!(
+                            plugin = name,
+                            services = ?grpc_services,
+                            "plugin opted into external gRPC routing",
+                        );
+                    }
                 }
                 (handle, destroy_fn)
             }
@@ -513,6 +605,7 @@ impl PluginLoader {
             path: path.to_path_buf(),
             handle,
             destroy_fn,
+            grpc_services,
         };
 
         let mut map = self.loaded.lock().unwrap();
@@ -598,6 +691,57 @@ impl PluginLoader {
             write_fn,
             destroy_fn,
         })
+    }
+
+    /// Enumerate every `(service_name, dispatcher)` pair declared by a
+    /// loaded service plugin via the optional
+    /// `nexus_plugin_grpc_services` symbol.
+    ///
+    /// One `PluginGrpcEndpoint` is returned per service-name × plugin.
+    /// A single plugin exposing N services produces N endpoints sharing
+    /// one underlying `RustService` dispatcher (one plugin instance);
+    /// the cluster wires each as its own URL prefix in tonic Routes.
+    ///
+    /// Driver plugins are skipped (no service-dispatch surface).
+    /// Plugins that did not export the optional symbol are skipped.
+    pub fn collect_grpc_endpoints(&self) -> Vec<PluginGrpcEndpoint> {
+        let map = self.loaded.lock().unwrap();
+        let mut out = Vec::new();
+        for (plugin_name, plugin) in map.iter() {
+            if plugin.kind != PluginKind::Service || plugin.grpc_services.is_empty() {
+                continue;
+            }
+            // Resolve dispatch_fn once per plugin; share the Arc across
+            // every service-name the plugin claims.
+            let dispatch_fn: ServiceDispatchFn = match unsafe {
+                plugin
+                    ._lib
+                    .get(nexus_plugin_abi::symbols::SERVICE_DISPATCH.as_bytes())
+            } {
+                Ok(sym) => *sym,
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = plugin_name,
+                        err = %e,
+                        "skip plugin gRPC endpoints — dispatch symbol missing",
+                    );
+                    continue;
+                }
+            };
+            let svc: Arc<dyn RustService> = Arc::new(DylibRustService {
+                svc_name: plugin_name.clone(),
+                handle: plugin.handle,
+                dispatch_fn,
+            });
+            for service_name in &plugin.grpc_services {
+                out.push(PluginGrpcEndpoint {
+                    service_name: service_name.clone(),
+                    plugin_name: plugin_name.clone(),
+                    service: Arc::clone(&svc),
+                });
+            }
+        }
+        out
     }
 
     /// Take the `DylibRustService` wrapper for a loaded service plugin.
@@ -784,6 +928,59 @@ mod tests {
             err.contains("signature missing"),
             "missing-sig error must be loud: {err}"
         );
+    }
+
+    // ── grpc_services symbol parsing ───────────────────────────────
+
+    unsafe extern "C" fn stub_grpc_services_two() -> *const std::ffi::c_char {
+        b"[\"foo.v1.Bar\",\"baz.v1.Qux\"]\0".as_ptr() as *const std::ffi::c_char
+    }
+
+    unsafe extern "C" fn stub_grpc_services_empty() -> *const std::ffi::c_char {
+        b"[]\0".as_ptr() as *const std::ffi::c_char
+    }
+
+    unsafe extern "C" fn stub_grpc_services_null() -> *const std::ffi::c_char {
+        std::ptr::null()
+    }
+
+    unsafe extern "C" fn stub_grpc_services_malformed() -> *const std::ffi::c_char {
+        b"not a json array\0".as_ptr() as *const std::ffi::c_char
+    }
+
+    unsafe extern "C" fn stub_grpc_services_wrong_shape() -> *const std::ffi::c_char {
+        b"[1, 2, 3]\0".as_ptr() as *const std::ffi::c_char
+    }
+
+    #[test]
+    fn parse_grpc_services_happy_path() {
+        let out = parse_grpc_services_symbol(stub_grpc_services_two, "test").unwrap();
+        assert_eq!(out, vec!["foo.v1.Bar".to_string(), "baz.v1.Qux".to_string()]);
+    }
+
+    #[test]
+    fn parse_grpc_services_empty_array_is_ok() {
+        let out = parse_grpc_services_symbol(stub_grpc_services_empty, "test").unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn parse_grpc_services_null_ptr_is_ok() {
+        let out = parse_grpc_services_symbol(stub_grpc_services_null, "test").unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn parse_grpc_services_malformed_fails_loud() {
+        let err = parse_grpc_services_symbol(stub_grpc_services_malformed, "test").unwrap_err();
+        assert!(err.contains("grpc_services JSON parse failed"));
+        assert!(err.contains("test"));
+    }
+
+    #[test]
+    fn parse_grpc_services_non_string_element_fails_loud() {
+        let err = parse_grpc_services_symbol(stub_grpc_services_wrong_shape, "test").unwrap_err();
+        assert!(err.contains("grpc_services JSON parse failed"));
     }
 
     #[test]

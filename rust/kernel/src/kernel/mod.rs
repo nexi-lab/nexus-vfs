@@ -97,6 +97,7 @@ mod locks;
 mod mount;
 mod observability;
 mod plugins;
+pub use plugins::PluginGrpcEndpoint;
 
 // ── KernelError ────────────────────────────────────────────────────────────
 
