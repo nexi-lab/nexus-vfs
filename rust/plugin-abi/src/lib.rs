@@ -35,6 +35,13 @@ use std::os::raw::c_void;
 ///     (nexus#4375).  Existing plugins (vault, local-connector) need
 ///     a clean rebuild against v2; binaries that still report v1
 ///     are rejected with a clear ABI-mismatch error at load time.
+///   * v2 (additive, no bump) — service plugins MAY now export the
+///     optional [`symbols::SERVICE_GRPC_SERVICES`] symbol to be exposed
+///     as external gRPC services through the cluster.  The dispatch
+///     surface reuses [`symbols::SERVICE_DISPATCH`] with a full-path
+///     `method` argument; no new dispatch FFI is introduced.  Plugins
+///     compiled against v2 without the new symbol continue to load
+///     unchanged — gRPC routing is opt-in per plugin.
 pub const PLUGIN_API_VERSION: u32 = 2;
 
 // ── Plugin kind ─────────────────────────────────────────────────────
@@ -235,6 +242,27 @@ pub mod symbols {
     pub const SERVICE_DISPATCH: &str = "nexus_service_dispatch";
     /// `fn(svc: *mut c_void)`
     pub const SERVICE_DESTROY: &str = "nexus_service_destroy";
+    /// `fn() -> *const c_char` — OPTIONAL.
+    ///
+    /// When present, the kernel's cluster glue exposes this plugin as
+    /// an external gRPC service: every `/{service}/{method}` request
+    /// whose `{service}` is listed in the returned JSON is routed back
+    /// through the existing [`SERVICE_DISPATCH`] symbol, with `method`
+    /// set to the full path string (`/service/method`) and `payload`
+    /// set to the raw proto-encoded request bytes (gRPC frame stripped
+    /// by the cluster). The plugin returns proto-encoded response
+    /// bytes; the cluster re-frames them and emits trailers.
+    ///
+    /// Return format: null-terminated UTF-8 JSON array of strings,
+    /// each a fully-qualified gRPC service name. Example:
+    /// `["nexus.secrets.v1.GenericSecretsService"]`. The pointer must
+    /// outlive every load of the dylib (static storage); the kernel
+    /// does not free it.
+    ///
+    /// Plugins that do not export this symbol still load and register
+    /// as `RustService` for the legacy in-process `Call` RPC path —
+    /// the symbol is purely additive and does not change the v2 ABI.
+    pub const SERVICE_GRPC_SERVICES: &str = "nexus_plugin_grpc_services";
 
     // ── Driver plugin symbols ───────────────────────────────────
     /// `fn(kernel: *const KernelHandle, config: *const c_char) -> *mut c_void`
@@ -281,6 +309,10 @@ pub type ServiceDispatchFn = unsafe extern "C" fn(
 
 /// Type of the `nexus_service_destroy` symbol.
 pub type ServiceDestroyFn = unsafe extern "C" fn(svc: *mut c_void);
+
+/// Type of the `nexus_plugin_grpc_services` symbol. See
+/// [`symbols::SERVICE_GRPC_SERVICES`] for the contract.
+pub type PluginGrpcServicesFn = unsafe extern "C" fn() -> *const c_char;
 
 // ── Driver plugin type aliases ──────────────────────────────────────
 
@@ -576,6 +608,15 @@ mod tests {
     #[test]
     fn nexus_free_null_is_safe() {
         unsafe { nexus_free(std::ptr::null_mut(), 0) };
+    }
+
+    #[test]
+    fn grpc_services_symbol_constant_is_stable() {
+        // Pinned: the kernel loader (nexus-vfs) and any plugin author
+        // (e.g. nexus vault) both reference this name verbatim when
+        // calling `dlsym`.  Renaming it silently disables gRPC routing
+        // for every plugin in the wild — make the value explicit.
+        assert_eq!(symbols::SERVICE_GRPC_SERVICES, "nexus_plugin_grpc_services");
     }
 
     #[test]
