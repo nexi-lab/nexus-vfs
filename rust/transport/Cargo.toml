@@ -42,7 +42,22 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 uuid = { version = "1", features = ["v4"] }
 futures = "0.3"
 base64 = "0.22"
+# Manual gRPC framing for plugin-proxy routing (Routes wiring of plugin
+# cdylibs into the cluster's tonic server — bytes-in / bytes-out path
+# that bypasses tonic's typed codec).
+bytes = "1"
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+axum = { version = "0.8", default-features = false }
+tower = { version = "0.5", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
 rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
+# E2E: real tonic client round-trips a request through PluginProxyService.
+# tonic-prost provides ProstCodec for the raw unary path; prost emits the
+# Message derive for the inline EchoMsg type the test exchanges.
+tonic-prost = { version = "0.14" }
+tokio-stream = { version = "0.1", features = ["net"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
