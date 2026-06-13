@@ -20,9 +20,9 @@ use contracts::rust_service::{RustCallError, RustService};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use nexus_plugin_abi::{
     signing::{PUBKEY_LENGTH, SIGNATURE_FILE_SUFFIX, SIGNATURE_LENGTH},
-    DriverCreateFn, DriverDestroyFn, DriverReadFn, DriverWriteFn, KernelHandle, PluginGrpcServicesFn,
-    PluginKind, PluginResult, ServiceCreateFn, ServiceDestroyFn, ServiceDispatchFn,
-    PLUGIN_API_VERSION,
+    DriverCreateFn, DriverDestroyFn, DriverReadFn, DriverWriteFn, KernelHandle,
+    PluginGrpcServicesFn, PluginKind, PluginResult, ServiceCreateFn, ServiceDestroyFn,
+    ServiceDispatchFn, PLUGIN_API_VERSION,
 };
 
 use crate::abc::object_store::{ObjectStore, StorageError, WriteResult};
@@ -160,9 +160,7 @@ fn parse_grpc_services_symbol(
         .to_str()
         .map_err(|e| format!("{plugin_name}: grpc_services JSON not UTF-8: {e}"))?;
     let parsed: Vec<String> = serde_json::from_str(json).map_err(|e| {
-        format!(
-            "{plugin_name}: grpc_services JSON parse failed (expected array of strings): {e}"
-        )
+        format!("{plugin_name}: grpc_services JSON parse failed (expected array of strings): {e}")
     })?;
     Ok(parsed)
 }
@@ -537,11 +535,11 @@ impl PluginLoader {
                 // of fully-qualified service names — see plugin-abi
                 // `symbols::SERVICE_GRPC_SERVICES` for the contract.
                 // Plugins without the symbol load unchanged.
-                if let Ok(sym) =
-                    unsafe { lib.get::<PluginGrpcServicesFn>(
+                if let Ok(sym) = unsafe {
+                    lib.get::<PluginGrpcServicesFn>(
                         nexus_plugin_abi::symbols::SERVICE_GRPC_SERVICES.as_bytes(),
-                    ) }
-                {
+                    )
+                } {
                     grpc_services = parse_grpc_services_symbol(*sym, &name)?;
                     if !grpc_services.is_empty() {
                         tracing::info!(
@@ -955,7 +953,10 @@ mod tests {
     #[test]
     fn parse_grpc_services_happy_path() {
         let out = parse_grpc_services_symbol(stub_grpc_services_two, "test").unwrap();
-        assert_eq!(out, vec!["foo.v1.Bar".to_string(), "baz.v1.Qux".to_string()]);
+        assert_eq!(
+            out,
+            vec!["foo.v1.Bar".to_string(), "baz.v1.Qux".to_string()]
+        );
     }
 
     #[test]

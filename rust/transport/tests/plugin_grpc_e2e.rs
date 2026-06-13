@@ -79,10 +79,7 @@ async fn external_grpc_client_round_trips_through_plugin_proxy() {
         plugin_name: "echo-test".to_string(),
         service: Arc::new(EchoDispatcher),
     }];
-    let routes = extend_routes_with_plugin_endpoints(
-        tonic::service::Routes::default(),
-        endpoints,
-    );
+    let routes = extend_routes_with_plugin_endpoints(tonic::service::Routes::default(), endpoints);
 
     // ── 2. Serve on an ephemeral port ──────────────────────────────
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -118,7 +115,13 @@ async fn external_grpc_client_round_trips_through_plugin_proxy() {
 
     let payload = b"hello from external client".to_vec();
     let response = grpc
-        .unary(Request::new(EchoMsg { data: payload.clone() }), path, codec)
+        .unary(
+            Request::new(EchoMsg {
+                data: payload.clone(),
+            }),
+            path,
+            codec,
+        )
         .await
         .expect("unary call");
 
@@ -136,10 +139,7 @@ async fn empty_endpoints_passes_routes_through_unchanged() {
     // Cluster boots without any plugin opting in → glue must not
     // perturb existing Routes (otherwise it would silently break the
     // VFS route by reshuffling the axum fallback).
-    let routes = extend_routes_with_plugin_endpoints(
-        tonic::service::Routes::default(),
-        vec![],
-    );
+    let routes = extend_routes_with_plugin_endpoints(tonic::service::Routes::default(), vec![]);
     // No panic on into_axum_router → routes survived.
     let _ = routes.into_axum_router();
 }
