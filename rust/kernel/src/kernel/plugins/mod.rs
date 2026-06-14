@@ -37,6 +37,7 @@ impl Kernel {
             sys_mkdir: kernel_cb_sys_mkdir,
             sys_rmdir: kernel_cb_sys_rmdir,
             sys_rename: kernel_cb_sys_rename,
+            sys_stat_batch: kernel_cb_sys_stat_batch,
             kernel_ptr: Arc::as_ptr(self) as *const std::os::raw::c_void,
         }
     }
@@ -393,4 +394,80 @@ unsafe extern "C" fn kernel_cb_sys_rename(
         Ok(_) => 0,
         Err(_) => -3,
     }
+}
+
+unsafe extern "C" fn kernel_cb_sys_stat_batch(
+    kernel: *const std::os::raw::c_void,
+    paths_json: *const std::ffi::c_char,
+    out_json: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    let kernel = &*(kernel as *const Kernel);
+    let paths_json = match std::ffi::CStr::from_ptr(paths_json).to_str() {
+        Ok(s) => s,
+        Err(_) => return -2,
+    };
+    // Parse the input JSON array of path strings — same minimal
+    // hand-rolled approach the other callbacks use to keep
+    // `serde_json` off the kernel side.  Only the kernel-emitted
+    // shape `["/foo","/bar"]` (or with the `"` and `\` escapes the
+    // callback's matching output side handles) is accepted.
+    let paths = parse_stat_batch_input(paths_json);
+    use crate::kernel::convenience::KernelConvenience;
+    let results = kernel.stat_batch(&paths, contracts::ROOT_ZONE_ID);
+    // Hand-roll the response JSON.  Output shape per kernel-side
+    // entry:
+    //   * `Some(StatResult)` → `[<size>, <entry_type>]`
+    //   * `None`             → `null`
+    let mut json = String::from("[");
+    let mut first = true;
+    for r in results {
+        if !first {
+            json.push(',');
+        }
+        first = false;
+        match r {
+            Some(stat) => {
+                json.push('[');
+                json.push_str(&stat.size.to_string());
+                json.push(',');
+                json.push_str(&stat.entry_type.to_string());
+                json.push(']');
+            }
+            None => json.push_str("null"),
+        }
+    }
+    json.push(']');
+    let mut bytes = std::mem::ManuallyDrop::new(json.into_bytes());
+    *out_json = bytes.as_mut_ptr();
+    *out_len = bytes.len();
+    0
+}
+
+/// Parse the `sys_stat_batch` input JSON — an array of path strings,
+/// `"`-quoted with `"` / `\` escapes the same way the readdir output
+/// is escaped.  Returns paths as plain `String`s in array order;
+/// invalid input parses what it can and discards the rest (an empty
+/// vector hands the caller back an empty result array, not -2).
+fn parse_stat_batch_input(json: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = json;
+    while let Some((_, after_open)) = rest.split_once('"') {
+        let mut name = String::new();
+        let mut chars = after_open.chars();
+        loop {
+            match chars.next() {
+                Some('\\') => match chars.next() {
+                    Some(c) => name.push(c),
+                    None => return out,
+                },
+                Some('"') => break,
+                Some(c) => name.push(c),
+                None => return out,
+            }
+        }
+        out.push(name);
+        rest = chars.as_str();
+    }
+    out
 }
