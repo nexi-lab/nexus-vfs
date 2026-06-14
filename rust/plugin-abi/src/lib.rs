@@ -42,7 +42,17 @@ use std::os::raw::c_void;
 ///     `method` argument; no new dispatch FFI is introduced.  Plugins
 ///     compiled against v2 without the new symbol continue to load
 ///     unchanged — gRPC routing is opt-in per plugin.
-pub const PLUGIN_API_VERSION: u32 = 2;
+///   * v3 — added `sys_stat_batch` for plugins that need many stats in
+///     one round-trip (the WinFsp adapter's `read_directory` populates
+///     `FileInfo` with size for every entry; v2's per-entry
+///     `sys_stat` was N FFI calls + N kernel `with_metastore_route`
+///     traversals per `ls`).  Wraps the existing `kernel.stat_batch`
+///     Tier 2 convenience (kernel/src/kernel/convenience.rs §33),
+///     serialising the `Vec<Option<StatResult>>` as a JSON array.
+///     Existing plugins (vault, local-connector, fuse) need a clean
+///     rebuild against v3; binaries that still report v2 are rejected
+///     with a clear ABI-mismatch error at load time.
+pub const PLUGIN_API_VERSION: u32 = 3;
 
 // ── Plugin kind ─────────────────────────────────────────────────────
 
@@ -178,6 +188,29 @@ pub struct KernelHandle {
         kernel: *const c_void,
         old_path: *const c_char,
         new_path: *const c_char,
+    ) -> i32,
+
+    /// `sys_stat_batch(kernel, paths_json, out_json, out_len) -> i32`
+    ///
+    /// Batched `sys_stat` — the kernel takes a JSON array of path
+    /// strings (`["/foo","/bar","/baz"]`) and returns a JSON array
+    /// of `[size, entry_type]` pairs (`[[12,0],[0,0],null,...]`)
+    /// where `null` slots correspond to paths the kernel could not
+    /// stat (the per-path `Option<StatResult>` in the underlying
+    /// `kernel::stat_batch` Tier 2 convenience).  Same allocation
+    /// contract as the other JSON-returning callbacks: caller frees
+    /// `*out_json` with [`nexus_free`].
+    ///
+    /// Added in v3 for the WinFsp adapter's `read_directory` which
+    /// must populate `FileInfo.file_size` for every entry — without
+    /// this callback each directory listing required one FFI hop per
+    /// entry into per-path `sys_stat`.  Plugins that don't need
+    /// batched stats can ignore the callback entirely.
+    pub sys_stat_batch: unsafe extern "C" fn(
+        kernel: *const c_void,
+        paths_json: *const c_char,
+        out_json: *mut *mut u8,
+        out_len: *mut usize,
     ) -> i32,
 
     /// Opaque kernel pointer — passed back as first arg to every callback.
