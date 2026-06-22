@@ -96,57 +96,30 @@ See **[Kernel Architecture](../README.md)** (SSOT) for the OS-inspired layered a
 
 | Mode | Writes | Reads | Latency | Use case |
 |------|--------|-------|---------|----------|
-| **EC** | Local WAL append + sync state-machine apply; async replicate | Eventual | ~5–50µs (local redb) | sys_setattr / sys_unlink metadata (the kernel hot path), media, high-throughput |
-| **SC** | Raft consensus (majority ACK) | Linearizable | ~5–10ms intra-DC | Lock acquire / release, CAS (`put_if_version`), stream WAL appends, control-plane (mount install, ConfChange) |
+| **SC** (default) | Raft consensus (majority ACK) | Linearizable | ~5-10ms intra-DC | sys_setattr / sys_unlink metadata, locks, CAS, stream WALs, control-plane |
+| **EC** (opt-in via `zone_handle::set_metadata(.., Consistency::Ec)`) | Local WAL append + sync state-machine apply; async drain to peers | Eventual | ~5-50µs (local redb) | High-throughput callers that can tolerate async cross-node visibility (media-style workloads); **not yet wired into the kernel hot path** |
 
-Per-call routing — same zone exposes both surfaces, the call site picks:
+Per-call routing — same zone exposes both surfaces, the call site picks via the `Consistency` parameter on `zone_handle.rs::set_metadata` / `delete_metadata`.  Today the kernel hot path (`ZoneMetaStore::put` / `delete`, which `sys_setattr` / `sys_unlink` drive) hardcodes `Sc`; an attempt to route it through `Ec` is blocked on the EC drain hardening (see *EC kernel-hot-path activation* below).
 
-* **EC** — `ZoneMetaStore::put` / `delete` (the kernel `sys_setattr` /
-  `sys_unlink` hot path) routes through `ZoneConsensus::propose_ec_local`.
-  WAL-first guarantees crash safety: if the node dies between WAL append
-  and local apply, the entry is recoverable via replication.  No
-  quorum required, so any node — voter, learner, leader, follower —
-  can write metadata locally; cross-node visibility lands via async
-  raft replication once peers come back online.  Read-your-writes
-  is preserved on the writer node because local apply happens before
-  the call returns.  Conflict resolution is LWW on `modified_at_ms`
-  for the rare case two nodes write the same path concurrently;
-  workflows where each peer owns its own subpath have no contention.
+#### EC kernel-hot-path activation (deferred)
 
-* **SC** — `ZoneMetaStore::put_if_version` (CAS),
-  `append_stream_entry`, and `DistributedLocks::acquire` / `release`
-  route through `ZoneConsensus::propose` for linearizable semantics.
-  Quorum required; non-leader nodes either forward to the leader or
-  surface `NotLeader` to the caller.
+nexi-lab/nexus-vfs PR #61 attempted to route `ZoneMetaStore::put` / `delete` through `propose_ec_local` so the cc-tasks-share Mac↔Win symmetric peer workflow could write metadata without quorum (Mac as a Learner blocks on `NotLeader` under SC).  The activation exposed correctness / liveness issues in `transport_loop.rs::replicate_ec_entries` that only surface in a 1-voter + 1-learner topology: after a larger founder-side write attempt, subsequent founder→learner sys_setattr writes stop reaching the learner's local state machine within typical wait-budgets — per-peer exponential backoff accumulates without recovery.
 
-The per-call split is the load-bearing choice for the cc-tasks-share
-operator workflow: Mac↔Win each owns its own `/shared/cc-tasks/<host>/`
-subpath, both peers write sys_setattr locally (EC), neither side
-blocks on the other being online.  Locks and CAS — when needed — still
-go through SC because their callers (search index commit, MUTEX-style
-acquire) need the linearizability that EC can't provide.
+Until the EC drain is hardened (separate substrate work), the kernel hot path stays on SC.  Operators reach the cc-tasks-share-style symmetric peer pattern via `nexusd-cluster join --as voter` so both peers can propose SC writes (PR #62 finalised the `--as` CLI surface).
 
 ---
 
 ## 5. Write Flow
 
 ```
-5.1 Single-Node:           Client → NexusFS.write() → SQLAlchemyMetadataStore → Backend.write()
-5.2 Raft Local:            Client → NexusFS.write() → RaftMetadataStore (gRPC ~1ms) → redb → Backend
-5.3a Raft Distributed EC:  Client → NexusFS.write() → ZoneConsensus.propose_ec_local()
-                                                    → ReplicationLog.append() (WAL) → StateMachine.apply_local()
-                                                    → ack to caller          ← read-your-writes preserved
-                                                    → background drain ships WAL → followers’ StateMachine.apply()
-                                                    → per-mount dcache.evict(key)  ← cache coherence
-5.3b Raft Distributed SC:  Client → NexusFS.write() → ZoneConsensus.propose() → gRPC replicate
-                                                    → Majority ACK → StateMachine.apply() on all → redb
-                                                    → per-voter dcache.evict(key)  ← cache coherence
-                                                    (used for locks, CAS, control-plane only)
+5.1 Single-Node:        Client → NexusFS.write() → SQLAlchemyMetadataStore → Backend.write()
+5.2 Raft Local:         Client → NexusFS.write() → RaftMetadataStore (gRPC ~1ms) → redb → Backend
+5.3 Raft Distributed:   Client → NexusFS.write() → ZoneConsensus.propose() → gRPC replicate
+                                                 → Majority ACK → StateMachine.apply() on all → redb
+                                                 → per-voter dcache.evict(key)  ← cache coherence
 ```
 
 raft-rs only handles consensus (log replication, election). Transport (gRPC) is our responsibility.
-
-5.3a EC is the default for `sys_setattr` / `sys_unlink` metadata writes — see §4.1 for the per-call routing rationale.  5.3b SC stays the path for operations that need linearizability (CAS, locks, control-plane mount/ConfChange).
 
 Cache coherence: every voter's `StateMachine.apply` fires the invalidation callback the kernel DLC installed at mount time (see [README](../README.md) §4 DLC row), so a leader-forwarded follower write — or any replicated mutation — evicts stale dcache entries on nodes that didn't originate the write. Without this step, `sys_stat` / `sys_read` on non-writer voters would keep returning the pre-write `etag` from local dcache even after raft applied the new state.
 
@@ -183,9 +156,8 @@ Creates a **new independent zone**.  Permissions (read-only vs read-write) live 
 | Aspect | Behavior |
 |--------|----------|
 | Read latency | ~5µs (local redb) — always local |
-| Write latency (EC sys_setattr) | ~5–50µs (WAL append + local apply; async replicate) |
-| Write latency (SC lock/CAS) | Raft propose → majority ACK (~5–10ms intra-DC) |
-| Consistency | EC for metadata writes (LWW on `modified_at_ms`), SC for lock/CAS (linearizable) |
+| Write latency | Raft propose → commit (~5–10ms intra-DC) |
+| Consistency | Linearizable (kernel hot path is SC today; EC is per-call opt-in via `zone_handle::set_metadata(.., Consistency::Ec)` — see §4.1) |
 | Data locality | Full metadata replica in local redb |
 
 **Why not redirect + cache?** Redirect = gRPC every read (~200ms). Client cache = re-inventing weaker Raft. Raft already solves consistent multi-party views.
