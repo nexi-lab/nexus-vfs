@@ -2,32 +2,49 @@
 //!
 //! Federation mounts install a ``ZoneMetaStore`` on the kernel's per-mount
 //! metastore slot so ``Kernel::with_metastore(mount_point)`` hits the
-//! zone's Raft state machine on cold-dcache lookups. Reads hit the local
-//! state machine directly.
+//! zone's Raft state machine on cold-dcache lookups. Writes go through
+//! ``propose`` (Raft consensus); reads hit the local state machine
+//! directly.
 //!
 //! ## Write consistency
 //!
-//! The MetaStore trait carries two write surfaces with different
-//! consistency contracts:
+//! ``put`` / ``delete`` / CAS / WAL stream appends all route through
+//! ``ZoneConsensus::propose`` (SC — Raft consensus, majority ACK).
+//! This is the standard kernel hot path.
 //!
-//! * **``put`` / ``delete``** — sys_setattr / sys_unlink metadata writes.
-//!   Routed through ``propose_ec_local`` (EC, eventually consistent):
-//!   WAL-first append + synchronous local state-machine apply, then
-//!   async replication to peers via the existing raft replication path.
-//!   Any node (voter, learner, leader, follower) can write — no quorum
-//!   required, no NotLeader error.  Read-your-writes preserved on the
-//!   writer node because local apply happens before ``put`` returns.
-//!   Two callers writing the same path on different nodes use
-//!   last-writer-wins by ``modified_at_ms``; cc-tasks-share-style
-//!   workflows where each peer writes its own subpath have no contention.
+//! ### Why not EC by default
 //!
-//! * **``append_stream_entry`` / ``put_if_version`` (CAS)** — keep SC
-//!   (``propose`` through raft consensus).  Stream WALs need ordered
-//!   commit and CAS needs linearizability; both contracts would break
-//!   under EC.
+//! The raft layer exposes a per-call ``propose_ec_local`` (WAL-first +
+//! sync local apply + async drain-to-peers) on every ``ZoneConsensus``,
+//! and the operator-facing ``zone_handle.rs::set_metadata`` already
+//! takes a ``Consistency: Sc | Ec`` parameter.  Routing
+//! ``ZoneMetaStore::put`` through ``propose_ec_local`` was attempted in
+//! nexi-lab/nexus-vfs PR #61 to remove the "Learner cannot write" gate
+//! that blocks the cc-tasks-share Mac↔Win symmetric peer workflow.
 //!
-//! The choice is per-call, not per-zone — the same zone exposes both EC
-//! and SC writes depending on which trait method the caller invokes.
+//! The activation broke ``Federation E2E (Docker)`` on the companion
+//! nexus PR (#4411): the EC drain → ``ReplicateEntries`` RPC →
+//! ``apply_ec_from_peer`` path has correctness / liveness issues that
+//! only surface in a 1-voter + 1-learner topology after the first
+//! larger-payload write — subsequent founder→learner sys_setattr
+//! writes stop reaching the learner's local state machine within the
+//! 60 s test budget (per-peer exponential backoff in
+//! ``transport_loop.rs::replicate_ec_entries`` accumulates; tests
+//! that worked pre-#61 — joiner-side-reads of founder writes —
+//! timeout reliably).  Hardening the EC drain is a substrate fix
+//! out of scope here.
+//!
+//! Until then, SC is the safe default for the kernel hot path.  The
+//! ``--as voter`` operator surface (PR #62 finished the CLI rename)
+//! is the recommended path for the cc-tasks-share-style symmetric
+//! peer workflow: both peers join as Voters, both can propose SC
+//! writes, quorum loss is the only failure mode (and the operator
+//! is aware of it).
+//!
+//! Callers that need the EC path explicitly still reach it through
+//! ``zone_handle.rs::set_metadata(..., Consistency::Ec)``.  The
+//! kernel-hot-path activation is tracked separately (see
+//! nexi-lab/nexus-vfs issue for the EC replicate hardening).
 //!
 //! ``ZoneMetaStore`` owns the full↔zone-relative path translation.
 //! The trait boundary always sees full global paths; the state
@@ -305,18 +322,42 @@ impl MetaStore for ZoneMetaStore {
         // originating mount's global path, not its own.
         metadata.path = zone_key.clone();
         let value = kernel_to_proto(&metadata);
+        let value_snapshot = value.clone();
         let cmd = Command::SetMetadata {
-            key: zone_key,
+            key: zone_key.clone(),
             value,
         };
-        // EC write: WAL-first append + synchronous local state-machine
-        // apply.  No quorum required; any node (voter, learner, leader,
-        // follower) can write.  Local apply happens before this returns,
-        // so read-your-writes is preserved without the explicit
-        // wait_until loop the old SC propose path needed.  See module
-        // docstring for the per-call EC/SC split rationale.
-        let _seq = bridge_block_on(&self.runtime, self.node.propose_ec_local(cmd))
+        let result = bridge_block_on(&self.runtime, self.node.propose(cmd))
             .map_err(|e| MetaStoreError::IOError(format!("ZoneMetaStore.put({path}): {e}")))?;
+        match result {
+            crate::prelude::CommandResult::Success => {}
+            crate::prelude::CommandResult::Error(e) => {
+                return Err(MetaStoreError::IOError(format!(
+                    "ZoneMetaStore.put({path}) rejected: {e}"
+                )));
+            }
+            _ => {}
+        }
+        // Read-your-writes: poll local state machine until the exact
+        // bytes we just wrote show up. Propose returns on leader commit;
+        // on a follower, local apply lags by up to one raft tick.
+        // SSOT = raft state machine.
+        let runtime = self.runtime.clone();
+        let node = self.node.clone();
+        let key = zone_key.clone();
+        let _ = self.node.wait_until(
+            || {
+                let poll_key = key.clone();
+                let observed = bridge_block_on(
+                    &runtime,
+                    node.with_state_machine(move |sm: &FullStateMachine| {
+                        sm.get_metadata(&poll_key)
+                    }),
+                );
+                matches!(&observed, Ok(Some(bytes)) if *bytes == value_snapshot)
+            },
+            500,
+        );
         // Write-through: cache the caller-facing form (rewrite the
         // path field back to global so cache reads match the get()
         // contract).
@@ -331,12 +372,9 @@ impl MetaStore for ZoneMetaStore {
         self.cache.remove(path);
         let zone_key = self.to_zone_key(path);
         let cmd = Command::DeleteMetadata { key: zone_key };
-        // EC delete — same rationale as ``put``.  Local apply commits
-        // synchronously before returning; replication picks it up
-        // async.
-        bridge_block_on(&self.runtime, self.node.propose_ec_local(cmd))
+        let result = bridge_block_on(&self.runtime, self.node.propose(cmd))
             .map_err(|e| MetaStoreError::IOError(format!("ZoneMetaStore.delete({path}): {e}")))?;
-        Ok(true)
+        Ok(matches!(result, crate::prelude::CommandResult::Success))
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<KernelFileMetadata>, MetaStoreError> {
@@ -537,70 +575,6 @@ mod tests {
         assert_eq!(got.content_id, meta.content_id);
         let listed = store.list("/corp").expect("list from runtime");
         assert_eq!(listed.len(), 1);
-
-        registry.shutdown_all();
-    }
-
-    /// EC-default contract: put + delete must succeed on a node that
-    /// is NOT the elected leader.  Before this commit ZoneMetaStore
-    /// hardcoded ``node.propose`` (SC) which surfaced `NotLeader` on
-    /// any follower / learner / pre-election voter.  EC routing
-    /// (``propose_ec_local``) lets every node write metadata locally
-    /// regardless of raft role; cross-node visibility follows via the
-    /// background replication drain.
-    ///
-    /// The test deliberately skips ``node.campaign().await`` so the
-    /// underlying ZoneConsensus has no leader.  A regression that
-    /// puts ``propose`` back here would surface as a `NotLeader`
-    /// error from ``store.put`` and fail this test.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn put_and_delete_succeed_without_leader() {
-        let tmp = TempDir::new().unwrap();
-        let registry = ZoneRaftRegistry::new(tmp.path().to_path_buf(), 1);
-        let runtime = tokio::runtime::Handle::current();
-        let node = registry
-            .create_zone("shared", vec![], &runtime)
-            .expect("create test zone");
-        // Intentionally NOT calling node.campaign() — pins the
-        // "any node, any role, can write" contract.
-        let store = ZoneMetaStore::new(node, runtime, "/shared".to_string());
-        let path = "/shared/peer-write.json";
-        let meta = KernelFileMetadata {
-            path: path.to_string(),
-            size: 14,
-            content_id: Some("peer-write-hash".to_string()),
-            gen: 1,
-            version: 1,
-            entry_type: 0,
-            zone_id: Some("shared".to_string()),
-            mime_type: Some("application/json".to_string()),
-            created_at_ms: None,
-            modified_at_ms: None,
-            last_writer_address: Some("100.64.0.27:2126".to_string()),
-            target_zone_id: None,
-            link_target: None,
-            owner_id: None,
-        };
-
-        store
-            .put(path, meta.clone())
-            .expect("put must succeed without leader (EC path)");
-
-        let got = store
-            .get(path)
-            .expect("get without leader")
-            .expect("metadata visible read-your-writes");
-        assert_eq!(got.path, path);
-        assert_eq!(got.size, 14);
-
-        let deleted = store
-            .delete(path)
-            .expect("delete must succeed without leader (EC path)");
-        assert!(deleted, "delete returns true on success");
-        assert!(
-            store.get(path).expect("get after delete").is_none(),
-            "deleted entry no longer visible locally"
-        );
 
         registry.shutdown_all();
     }

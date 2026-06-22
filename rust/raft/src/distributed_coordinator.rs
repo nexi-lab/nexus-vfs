@@ -1083,34 +1083,31 @@ fn record_join_attempt(
 /// the operator.
 ///
 /// `as_learner` selects the membership role on the **joiner** branch
-/// (branch 3) — the leader proposes `AddLearnerNode` vs `AddNode`,
-/// which changes quorum participation but **not** write capability:
-/// per-call EC routing in `ZoneMetaStore::put`/`delete` means any
-/// node (voter, learner, leader, follower) can write metadata
-/// locally without quorum (see `ZoneMetaStore` module docstring +
-/// `federation-architecture.md §4.1` for the per-call EC/SC split).
-/// The `as_learner` choice is about quorum participation for SC
-/// writes (locks, CAS, control-plane) and the wipe-rejoin safety
-/// profile, not about who can write sys_setattr metadata.
+/// (branch 3) — the leader proposes `AddLearnerNode` instead of
+/// `AddNode`, so the new node receives full replication but does not
+/// count toward quorum.  Picking the right value is a contract
+/// distinction, not an operator knob:
 ///
 ///   * **`as_learner=false`** (voter) — root zone bootstrap OR
-///     symmetric-peer subtree share (cc-tasks-share-style).  Joiner
-///     counts toward quorum; SC writes succeed only with majority
-///     ACK.  Wipe-rejoin risk re-emerges if a voter goes through SSD
-///     swap without first transferring its voter slot away — operator
-///     must remove + re-add the voter to dodge stale-ConfState
-///     deadlock.  For root clusters use ≥3 voters (+optional
-///     witness) so single-node loss doesn't lose quorum; for 2-peer
-///     symmetric subtree shares the EC-by-default sys_setattr path
-///     means single-peer-online still lets that peer write metadata.
-///   * **`as_learner=true`**  — owner-pattern subtree share / mount.
+///     symmetric-peer subtree share (cc-tasks-share-style).  Every
+///     voter can propose `sys_setattr` writes through raft consensus
+///     — the joiner forwards to whichever voter currently holds
+///     leadership.  Quorum is essential for any write; for root
+///     clusters use ≥3 voters (+optional witness) so single-node
+///     loss does not lose quorum.  Symmetric-peer 2-voter setups
+///     work as long as both peers stay online together; once one is
+///     unreachable the other can't commit until it returns.
+///   * **`as_learner=true`** — owner-pattern subtree share / mount.
 ///     One authoritative voter (the `share` creator); joiners receive
-///     full replication and write sys_setattr metadata via the same
-///     EC path voters use, but never participate in quorum.  This
-///     keeps wipe-rejoin safe by construction — losing or replacing
-///     a learner has zero quorum impact, so SSD swap / OS reinstall /
-///     device migration cannot strand the zone in `not leader`
-///     deadlock the way a fragile 2-voter pattern can.
+///     full replication but cannot propose writes (every `vfs_write`
+///     on a learner surfaces `NotLeader`).  Wipe-rejoin safe by
+///     construction — losing a learner has zero quorum impact, so
+///     SSD swap / OS reinstall / device migration cannot strand the
+///     zone in `not leader` deadlock the way a 2-voter pattern can.
+///     A per-call EC opt-in (`zone_handle::set_metadata(.., Consistency::Ec)`)
+///     lets a learner write metadata without quorum when the caller
+///     can tolerate async cross-node visibility — not the kernel hot
+///     path yet (see `ZoneMetaStore` module docstring).
 ///
 /// The branch-1 (restart) and branch-2 (founder) paths ignore
 /// `as_learner` — restart resumes from persisted ConfState (which
