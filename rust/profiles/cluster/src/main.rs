@@ -327,7 +327,11 @@ enum Cmd {
         /// impact on the owner's ability to commit, so SSD swap / OS
         /// reinstall / device migration cannot strand the zone in
         /// `not leader` deadlock.
-        #[arg(long, value_enum, default_value_t = JoinRole::Learner)]
+        // Field name is `as_role` because `as` is a Rust keyword.
+        // `long = "as"` overrides clap's default snake-to-kebab
+        // derivation (which would give `--as-role`) so the
+        // operator-facing flag reads naturally: `--as voter`.
+        #[arg(long = "as", value_enum, default_value_t = JoinRole::Learner)]
         as_role: JoinRole,
     },
 }
@@ -1473,6 +1477,64 @@ async fn wait_for_shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    /// Pin the operator-facing flag name for the join subcommand's
+    /// membership-role selector.  Clap derives `--as-role` by default
+    /// from the field name `as_role` (snake-to-kebab); the
+    /// `long = "as"` override on the field is what gives the natural
+    /// `--as voter` / `--as learner` UX the runbook (and every doc /
+    /// commit / downstream test in nexus's federation E2E) refers to.
+    ///
+    /// A regression that drops or renames the `long = "as"` override
+    /// would surface here as a clap parse error.
+    #[test]
+    fn join_cli_accepts_as_voter_and_as_learner_flags() {
+        let parsed_voter = Args::try_parse_from([
+            "nexusd-cluster",
+            "join",
+            "1@host:2126",
+            "sharedzone",
+            "/shared",
+            "--as",
+            "voter",
+        ])
+        .expect("--as voter must parse");
+        match parsed_voter.cmd.expect("join cmd") {
+            Cmd::Join { as_role, .. } => assert!(matches!(as_role, JoinRole::Voter)),
+            other => panic!("expected Join, got {other:?}"),
+        }
+
+        let parsed_learner = Args::try_parse_from([
+            "nexusd-cluster",
+            "join",
+            "1@host:2126",
+            "sharedzone",
+            "/shared",
+            "--as",
+            "learner",
+        ])
+        .expect("--as learner must parse");
+        match parsed_learner.cmd.expect("join cmd") {
+            Cmd::Join { as_role, .. } => assert!(matches!(as_role, JoinRole::Learner)),
+            other => panic!("expected Join, got {other:?}"),
+        }
+
+        // Default (no --as flag) must stay Learner to preserve
+        // backward compatibility with every pre-flag operator script.
+        let parsed_default = Args::try_parse_from([
+            "nexusd-cluster",
+            "join",
+            "1@host:2126",
+            "sharedzone",
+            "/shared",
+        ])
+        .expect("default (no --as) must parse");
+        match parsed_default.cmd.expect("join cmd") {
+            Cmd::Join { as_role, .. } => assert!(matches!(as_role, JoinRole::Learner)),
+            other => panic!("expected Join, got {other:?}"),
+        }
+    }
 
     #[test]
     fn metastore_path_defaults_into_data_dir() {
