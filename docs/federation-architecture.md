@@ -96,24 +96,57 @@ See **[Kernel Architecture](../README.md)** (SSOT) for the OS-inspired layered a
 
 | Mode | Writes | Reads | Latency | Use case |
 |------|--------|-------|---------|----------|
-| **SC** (default) | Raft consensus (majority ACK) | Linearizable | ~5-10ms intra-DC | Financial, compliance |
-| **EC** (opt-in) | Local + async replicate | Eventual | ~5us (local redb) | Media, high-throughput |
+| **EC** | Local WAL append + sync state-machine apply; async replicate | Eventual | ~5–50µs (local redb) | sys_setattr / sys_unlink metadata (the kernel hot path), media, high-throughput |
+| **SC** | Raft consensus (majority ACK) | Linearizable | ~5–10ms intra-DC | Lock acquire / release, CAS (`put_if_version`), stream WAL appends, control-plane (mount install, ConfChange) |
 
-Per-operation parameter (`consistency="sc"` or `"ec"`), not per-zone. SC uses Raft consensus core; EC uses async ReplicationLog + LWW conflict resolution.
+Per-call routing — same zone exposes both surfaces, the call site picks:
+
+* **EC** — `ZoneMetaStore::put` / `delete` (the kernel `sys_setattr` /
+  `sys_unlink` hot path) routes through `ZoneConsensus::propose_ec_local`.
+  WAL-first guarantees crash safety: if the node dies between WAL append
+  and local apply, the entry is recoverable via replication.  No
+  quorum required, so any node — voter, learner, leader, follower —
+  can write metadata locally; cross-node visibility lands via async
+  raft replication once peers come back online.  Read-your-writes
+  is preserved on the writer node because local apply happens before
+  the call returns.  Conflict resolution is LWW on `modified_at_ms`
+  for the rare case two nodes write the same path concurrently;
+  workflows where each peer owns its own subpath have no contention.
+
+* **SC** — `ZoneMetaStore::put_if_version` (CAS),
+  `append_stream_entry`, and `DistributedLocks::acquire` / `release`
+  route through `ZoneConsensus::propose` for linearizable semantics.
+  Quorum required; non-leader nodes either forward to the leader or
+  surface `NotLeader` to the caller.
+
+The per-call split is the load-bearing choice for the cc-tasks-share
+operator workflow: Mac↔Win each owns its own `/shared/cc-tasks/<host>/`
+subpath, both peers write sys_setattr locally (EC), neither side
+blocks on the other being online.  Locks and CAS — when needed — still
+go through SC because their callers (search index commit, MUTEX-style
+acquire) need the linearizability that EC can't provide.
 
 ---
 
 ## 5. Write Flow
 
 ```
-5.1 Single-Node:        Client → NexusFS.write() → SQLAlchemyMetadataStore → Backend.write()
-5.2 Raft Local:         Client → NexusFS.write() → RaftMetadataStore (gRPC ~1ms) → redb → Backend
-5.3 Raft Distributed:   Client → NexusFS.write() → ZoneConsensus.propose() → gRPC replicate
-                                                  → Majority ACK → StateMachine.apply() on all → redb
-                                                  → per-voter dcache.evict(key)  ← cache coherence
+5.1 Single-Node:           Client → NexusFS.write() → SQLAlchemyMetadataStore → Backend.write()
+5.2 Raft Local:            Client → NexusFS.write() → RaftMetadataStore (gRPC ~1ms) → redb → Backend
+5.3a Raft Distributed EC:  Client → NexusFS.write() → ZoneConsensus.propose_ec_local()
+                                                    → ReplicationLog.append() (WAL) → StateMachine.apply_local()
+                                                    → ack to caller          ← read-your-writes preserved
+                                                    → background drain ships WAL → followers’ StateMachine.apply()
+                                                    → per-mount dcache.evict(key)  ← cache coherence
+5.3b Raft Distributed SC:  Client → NexusFS.write() → ZoneConsensus.propose() → gRPC replicate
+                                                    → Majority ACK → StateMachine.apply() on all → redb
+                                                    → per-voter dcache.evict(key)  ← cache coherence
+                                                    (used for locks, CAS, control-plane only)
 ```
 
 raft-rs only handles consensus (log replication, election). Transport (gRPC) is our responsibility.
+
+5.3a EC is the default for `sys_setattr` / `sys_unlink` metadata writes — see §4.1 for the per-call routing rationale.  5.3b SC stays the path for operations that need linearizability (CAS, locks, control-plane mount/ConfChange).
 
 Cache coherence: every voter's `StateMachine.apply` fires the invalidation callback the kernel DLC installed at mount time (see [README](../README.md) §4 DLC row), so a leader-forwarded follower write — or any replicated mutation — evicts stale dcache entries on nodes that didn't originate the write. Without this step, `sys_stat` / `sys_read` on non-writer voters would keep returning the pre-write `etag` from local dcache even after raft applied the new state.
 
@@ -133,25 +166,31 @@ Security (GDPR data sovereignty), space (millions of users), latency (cross-cont
 
 **Spanner comparison**: Spanner Universe → Federation, Spanner Zone → Zone, Paxos Group → Raft group. Key difference: Spanner's Paxos Group and Zone are orthogonal; in NexusFS, Zone and Raft group are 1:1 (Multi-Raft sharding within a zone possible later).
 
-### 6.2 Mount = Create New Zone, All Voters
+### 6.2 Mount = Create New Zone, Operator-Chosen Membership Role
 
 **NFS-style UX:**
 ```bash
 nexus mount /my-project bob:/my-project
 ```
 
-Creates a **new independent zone**. All participants are **equal Voters** (not Learners). Permissions (read-only vs read-write) via ReBAC, not Raft roles.
+Creates a **new independent zone**.  Permissions (read-only vs read-write) live in ReBAC, not Raft roles — so membership role is an availability tradeoff, not an authorization tradeoff:
+
+| Role | Quorum impact | Wipe-rejoin | When to pick |
+|------|---------------|-------------|--------------|
+| **Voter** | Counts toward quorum | Hard — re-introducing a wiped voter with stale ConfState risks `not leader` deadlock until manual recovery | Symmetric peer workflows (cc-tasks-share: Mac↔Win mutually sharing CC task dirs).  Each side has equal SC-write authority.  EC-routed sys_setattr (the kernel hot path; see §4.1) means a voter can still write metadata locally when peers are offline. |
+| **Learner** (default) | Zero quorum impact | Safe — losing or replacing a learner leaves the owner-side commit ability untouched | Owner-pattern share-with-readers (one authoritative writer publishes a subtree, many machines mirror).  SSD swap / OS reinstall / device migration is operator-trivial. |
 
 | Aspect | Behavior |
 |--------|----------|
-| Read latency | ~5us (local redb) — always local |
-| Write latency | Raft propose → commit |
-| Consistency | Linearizable (no cache invalidation needed) |
+| Read latency | ~5µs (local redb) — always local |
+| Write latency (EC sys_setattr) | ~5–50µs (WAL append + local apply; async replicate) |
+| Write latency (SC lock/CAS) | Raft propose → majority ACK (~5–10ms intra-DC) |
+| Consistency | EC for metadata writes (LWW on `modified_at_ms`), SC for lock/CAS (linearizable) |
 | Data locality | Full metadata replica in local redb |
 
 **Why not redirect + cache?** Redirect = gRPC every read (~200ms). Client cache = re-inventing weaker Raft. Raft already solves consistent multi-party views.
 
-**Sharer side**: `nexusd-cluster share <path> --zone-id <id> [--mount-at <local-path>]` creates the new zone's raft group + copies the subtree's metadata in; with `--mount-at` it also writes the DT_MOUNT entry under the parent zone in the same operation. **Joiner side**: `nexusd-cluster join <peer> <zone> <local-path>` subscribes to the zone's raft replica set + writes the same DT_MOUNT entry. The mount entry lives in the parent zone's raft state, so every member converges to the same mount table without separate coordination — symmetric semantics either side. Decision logic: contributes new metadata → share (create zone); only consumes → join existing zone.
+**Sharer side**: `nexusd-cluster share <path> --zone-id <id> [--mount-at <local-path>]` creates the new zone's raft group as the single founding voter + copies the subtree's metadata in; with `--mount-at` it also writes the DT_MOUNT entry under the parent zone in the same operation. **Joiner side**: `nexusd-cluster join <peer> <zone> <local-path> [--as voter|learner]` subscribes to the zone's raft replica set + writes the same DT_MOUNT entry; `--as learner` is the safe default (owner-pattern), `--as voter` is the symmetric-peer opt-in. The mount entry lives in the parent zone's raft state, so every member converges to the same mount table without separate coordination — symmetric semantics either side. Decision logic: contributes new metadata + wants symmetric write authority → join `--as voter`; only consumes (or contributes but wants owner-pattern safety) → join `--as learner`.
 
 ### 6.3 Peer Discovery: No Custom DNS
 
