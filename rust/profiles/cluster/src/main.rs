@@ -309,7 +309,47 @@ enum Cmd {
         /// Parent zone for the mount entry; defaults to root.
         #[arg(long, default_value = "root")]
         parent_zone: String,
+        /// Membership role on the shared zone — ``learner`` (default,
+        /// owner-pattern: joiner gets full replication but doesn't
+        /// affect the owner's ability to commit; wipe-rejoin-safe) or
+        /// ``voter`` (symmetric-peer pattern: joiner counts toward
+        /// quorum, equal write authority as the founder).
+        ///
+        /// ``voter`` is the right pick for cc-tasks-share-style
+        /// symmetric peer workflows (Mac↔Win sharing each other's CC
+        /// task dirs).  Per-write EC routing means a voter joiner can
+        /// still write metadata locally even when the founder is
+        /// offline — quorum is only required for SC writes
+        /// (locks / CAS), not for the default sys_setattr path.
+        ///
+        /// ``learner`` keeps the owner-pattern guarantees from
+        /// nexus-vfs PR #57: losing or replacing a learner has zero
+        /// impact on the owner's ability to commit, so SSD swap / OS
+        /// reinstall / device migration cannot strand the zone in
+        /// `not leader` deadlock.
+        #[arg(long, value_enum, default_value_t = JoinRole::Learner)]
+        as_role: JoinRole,
     },
+}
+
+/// Membership role a new node takes when joining an existing zone.
+///
+/// See the doc comment on ``Cmd::Join::as_role`` for the operator
+/// decision matrix.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum JoinRole {
+    /// Joiner does not count toward quorum.  Wipe-rejoin-safe.
+    Learner,
+    /// Joiner counts toward quorum.  Symmetric peer authority.
+    Voter,
+}
+
+impl JoinRole {
+    /// Translate to the ``as_learner: bool`` flag the underlying
+    /// ``bootstrap_or_join_zone`` API takes today.
+    fn is_learner(self) -> bool {
+        matches!(self, JoinRole::Learner)
+    }
 }
 
 fn main() -> Result<()> {
@@ -355,6 +395,7 @@ fn main() -> Result<()> {
                     remote_zone_id,
                     local_path,
                     parent_zone,
+                    as_role,
                 }) => {
                     run_join(
                         args.common,
@@ -362,6 +403,7 @@ fn main() -> Result<()> {
                         &remote_zone_id,
                         &local_path,
                         &parent_zone,
+                        as_role.is_learner(),
                     )
                     .await
                 }
@@ -1051,6 +1093,7 @@ async fn run_join(
     remote_zone_id: &str,
     local_path: &str,
     parent_zone: &str,
+    as_learner: bool,
 ) -> Result<()> {
     let ZoneManagerBundle {
         zm,
@@ -1074,16 +1117,29 @@ async fn run_join(
     // confirms the change + the snapshot has installed authoritative
     // ConfState locally.
     //
-    // ``as_learner=true`` — `share` / `join` is the owner-pattern
-    // subtree-mount flow.  The creator of the shared zone (`share`)
-    // is the authoritative single voter; every joiner enters as a
-    // Learner so it receives full replication but never participates
-    // in quorum.  This makes wipe-rejoin safe by construction —
-    // losing or replacing a learner has zero impact on the owner's
-    // ability to commit, so SSD swap / OS reinstall / device
-    // migration cannot strand the zone in `not leader` deadlock the
-    // way the historical 2-voter pattern could (the failure that
-    // motivated this change).
+    // ``as_learner`` is now operator-configurable via ``--as
+    // learner|voter`` (default ``learner``):
+    //
+    //   * **learner** — owner-pattern subtree-mount flow.  The creator
+    //     of the shared zone (`share`) is the authoritative voter;
+    //     joiners enter as Learners so they receive full replication
+    //     but never participate in quorum.  Wipe-rejoin-safe — losing
+    //     or replacing a learner has zero impact on the owner's
+    //     ability to commit, so SSD swap / OS reinstall / device
+    //     migration cannot strand the zone in `not leader` deadlock
+    //     (this was the failure that motivated PR #57's Learner
+    //     default).  Default because the owner-pattern is the broader
+    //     use case.
+    //
+    //   * **voter** — symmetric-peer pattern (cc-tasks-share-style,
+    //     Mac↔Win mutually sharing CC task dirs).  Joiner counts
+    //     toward quorum.  Per-write EC routing on sys_setattr means
+    //     a voter joiner can still write metadata locally when the
+    //     founder is offline (Ec WAL + local apply, async replicate);
+    //     only SC writes (locks, CAS) require quorum.  The
+    //     wipe-rejoin risk re-emerges if a voter goes through
+    //     SSD swap without first transferring its voter slot away —
+    //     operator-aware tradeoff.
     //
     // ``max_attempts=Some(15)`` × ``JOIN_ZONE_RETRY_INTERVAL`` (2 s)
     // ≈ 30 s upper bound on the operator command — long enough to
@@ -1107,7 +1163,7 @@ async fn run_join(
             &peer_addrs,
             /* bootstrap_new */ false,
             /* max_attempts  */ Some(15),
-            /* as_learner    */ true,
+            as_learner,
         )
     })
     .await
@@ -1118,9 +1174,10 @@ async fn run_join(
         .await
         .map_err(|e| anyhow::anyhow!("mount: {}", e))?;
 
+    let role = if as_learner { "learner" } else { "voter" };
     println!(
-        "Joined remote zone '{}' (via {}); mounted at '{}' inside zone '{}'",
-        remote_zone_id, peer_addr, local_path, parent_zone
+        "Joined remote zone '{}' as {} (via {}); mounted at '{}' inside zone '{}'",
+        remote_zone_id, role, peer_addr, local_path, parent_zone
     );
     Ok(())
 }
