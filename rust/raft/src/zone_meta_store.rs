@@ -2,9 +2,32 @@
 //!
 //! Federation mounts install a ``ZoneMetaStore`` on the kernel's per-mount
 //! metastore slot so ``Kernel::with_metastore(mount_point)`` hits the
-//! zone's Raft state machine on cold-dcache lookups. Writes go through
-//! ``propose`` (Raft consensus); reads hit the local state machine
-//! directly.
+//! zone's Raft state machine on cold-dcache lookups. Reads hit the local
+//! state machine directly.
+//!
+//! ## Write consistency
+//!
+//! The MetaStore trait carries two write surfaces with different
+//! consistency contracts:
+//!
+//! * **``put`` / ``delete``** — sys_setattr / sys_unlink metadata writes.
+//!   Routed through ``propose_ec_local`` (EC, eventually consistent):
+//!   WAL-first append + synchronous local state-machine apply, then
+//!   async replication to peers via the existing raft replication path.
+//!   Any node (voter, learner, leader, follower) can write — no quorum
+//!   required, no NotLeader error.  Read-your-writes preserved on the
+//!   writer node because local apply happens before ``put`` returns.
+//!   Two callers writing the same path on different nodes use
+//!   last-writer-wins by ``modified_at_ms``; cc-tasks-share-style
+//!   workflows where each peer writes its own subpath have no contention.
+//!
+//! * **``append_stream_entry`` / ``put_if_version`` (CAS)** — keep SC
+//!   (``propose`` through raft consensus).  Stream WALs need ordered
+//!   commit and CAS needs linearizability; both contracts would break
+//!   under EC.
+//!
+//! The choice is per-call, not per-zone — the same zone exposes both EC
+//! and SC writes depending on which trait method the caller invokes.
 //!
 //! ``ZoneMetaStore`` owns the full↔zone-relative path translation.
 //! The trait boundary always sees full global paths; the state
@@ -282,42 +305,18 @@ impl MetaStore for ZoneMetaStore {
         // originating mount's global path, not its own.
         metadata.path = zone_key.clone();
         let value = kernel_to_proto(&metadata);
-        let value_snapshot = value.clone();
         let cmd = Command::SetMetadata {
-            key: zone_key.clone(),
+            key: zone_key,
             value,
         };
-        let result = bridge_block_on(&self.runtime, self.node.propose(cmd))
+        // EC write: WAL-first append + synchronous local state-machine
+        // apply.  No quorum required; any node (voter, learner, leader,
+        // follower) can write.  Local apply happens before this returns,
+        // so read-your-writes is preserved without the explicit
+        // wait_until loop the old SC propose path needed.  See module
+        // docstring for the per-call EC/SC split rationale.
+        let _seq = bridge_block_on(&self.runtime, self.node.propose_ec_local(cmd))
             .map_err(|e| MetaStoreError::IOError(format!("ZoneMetaStore.put({path}): {e}")))?;
-        match result {
-            crate::prelude::CommandResult::Success => {}
-            crate::prelude::CommandResult::Error(e) => {
-                return Err(MetaStoreError::IOError(format!(
-                    "ZoneMetaStore.put({path}) rejected: {e}"
-                )));
-            }
-            _ => {}
-        }
-        // Read-your-writes: poll local state machine until the exact
-        // bytes we just wrote show up. Propose returns on leader commit;
-        // on a follower, local apply lags by up to one raft tick.
-        // SSOT = raft state machine.
-        let runtime = self.runtime.clone();
-        let node = self.node.clone();
-        let key = zone_key.clone();
-        let _ = self.node.wait_until(
-            || {
-                let poll_key = key.clone();
-                let observed = bridge_block_on(
-                    &runtime,
-                    node.with_state_machine(move |sm: &FullStateMachine| {
-                        sm.get_metadata(&poll_key)
-                    }),
-                );
-                matches!(&observed, Ok(Some(bytes)) if *bytes == value_snapshot)
-            },
-            500,
-        );
         // Write-through: cache the caller-facing form (rewrite the
         // path field back to global so cache reads match the get()
         // contract).
@@ -332,9 +331,12 @@ impl MetaStore for ZoneMetaStore {
         self.cache.remove(path);
         let zone_key = self.to_zone_key(path);
         let cmd = Command::DeleteMetadata { key: zone_key };
-        let result = bridge_block_on(&self.runtime, self.node.propose(cmd))
+        // EC delete — same rationale as ``put``.  Local apply commits
+        // synchronously before returning; replication picks it up
+        // async.
+        bridge_block_on(&self.runtime, self.node.propose_ec_local(cmd))
             .map_err(|e| MetaStoreError::IOError(format!("ZoneMetaStore.delete({path}): {e}")))?;
-        Ok(matches!(result, crate::prelude::CommandResult::Success))
+        Ok(true)
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<KernelFileMetadata>, MetaStoreError> {
