@@ -540,4 +540,68 @@ mod tests {
 
         registry.shutdown_all();
     }
+
+    /// EC-default contract: put + delete must succeed on a node that
+    /// is NOT the elected leader.  Before this commit ZoneMetaStore
+    /// hardcoded ``node.propose`` (SC) which surfaced `NotLeader` on
+    /// any follower / learner / pre-election voter.  EC routing
+    /// (``propose_ec_local``) lets every node write metadata locally
+    /// regardless of raft role; cross-node visibility follows via the
+    /// background replication drain.
+    ///
+    /// The test deliberately skips ``node.campaign().await`` so the
+    /// underlying ZoneConsensus has no leader.  A regression that
+    /// puts ``propose`` back here would surface as a `NotLeader`
+    /// error from ``store.put`` and fail this test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn put_and_delete_succeed_without_leader() {
+        let tmp = TempDir::new().unwrap();
+        let registry = ZoneRaftRegistry::new(tmp.path().to_path_buf(), 1);
+        let runtime = tokio::runtime::Handle::current();
+        let node = registry
+            .create_zone("shared", vec![], &runtime)
+            .expect("create test zone");
+        // Intentionally NOT calling node.campaign() — pins the
+        // "any node, any role, can write" contract.
+        let store = ZoneMetaStore::new(node, runtime, "/shared".to_string());
+        let path = "/shared/peer-write.json";
+        let meta = KernelFileMetadata {
+            path: path.to_string(),
+            size: 14,
+            content_id: Some("peer-write-hash".to_string()),
+            gen: 1,
+            version: 1,
+            entry_type: 0,
+            zone_id: Some("shared".to_string()),
+            mime_type: Some("application/json".to_string()),
+            created_at_ms: None,
+            modified_at_ms: None,
+            last_writer_address: Some("100.64.0.27:2126".to_string()),
+            target_zone_id: None,
+            link_target: None,
+            owner_id: None,
+        };
+
+        store
+            .put(path, meta.clone())
+            .expect("put must succeed without leader (EC path)");
+
+        let got = store
+            .get(path)
+            .expect("get without leader")
+            .expect("metadata visible read-your-writes");
+        assert_eq!(got.path, path);
+        assert_eq!(got.size, 14);
+
+        let deleted = store
+            .delete(path)
+            .expect("delete must succeed without leader (EC path)");
+        assert!(deleted, "delete returns true on success");
+        assert!(
+            store.get(path).expect("get after delete").is_none(),
+            "deleted entry no longer visible locally"
+        );
+
+        registry.shutdown_all();
+    }
 }
