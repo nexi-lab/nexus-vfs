@@ -248,19 +248,36 @@ impl ReplicationLog {
         Ok(())
     }
 
-    /// Get all unreplicated entries (seq > watermark).
+    /// Get all entries currently in the WAL (`earliest_seq..max_seq`).
     ///
-    /// Uses a single redb range scan (O(log n + k)) instead of individual
-    /// point lookups (O(k log n)) for better performance with large backlogs.
+    /// Returns entries from the persistent WAL boundary, NOT from the
+    /// quorum watermark.  This is the SSOT for "what is still here and
+    /// might need shipping to a peer" — the caller's per-peer filter
+    /// (e.g. `seq > state.acked_seq` in the EC drain) decides what to
+    /// actually send to each peer.  Tying drain to the watermark
+    /// confused two distinct concerns: quorum read-safety (watermark)
+    /// vs. WAL retention (`earliest_seq`).  Under any topology where
+    /// the watermark advances unilaterally (single-voter clusters
+    /// with learner peers — the 1V+1L cc-tasks-share pattern) drain
+    /// would otherwise hide entries from learner replication the
+    /// moment the watermark moved past them, even though those entries
+    /// were still physically present in WAL and the learner had not
+    /// yet acked (nexi-lab/nexus-vfs#64).
+    ///
+    /// Uses a single redb range scan (O(log n + k)) instead of
+    /// individual point lookups (O(k log n)) for better performance
+    /// with large backlogs.
     pub fn drain_unreplicated(&self) -> Result<Vec<(u64, ReplicationEntry)>> {
-        let watermark = self.replicated_watermark.load(Ordering::Acquire);
+        let earliest = self.earliest_seq.load(Ordering::Acquire);
         let max = self.next_seq.load(Ordering::Acquire);
 
-        if watermark + 1 >= max {
+        // `earliest` starts at 1 (next_seq init); `max` is exclusive
+        // (next-seq-to-allocate).  Nothing to drain if WAL is empty.
+        if earliest >= max {
             return Ok(Vec::new());
         }
 
-        let start_key = (watermark + 1).to_be_bytes();
+        let start_key = earliest.to_be_bytes();
         // max is exclusive (next_seq), so the last valid entry is max - 1
         let end_key = (max - 1).to_be_bytes();
 
@@ -397,15 +414,26 @@ mod tests {
         log.append(b"cmd2").unwrap();
         log.append(b"cmd3").unwrap();
 
-        // All unreplicated
+        // All in WAL
         let entries = log.drain_unreplicated().unwrap();
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].0, 1);
         assert_eq!(entries[0].1.node_id, 42);
         assert_eq!(entries[0].1.command, b"cmd1");
 
-        // Advance watermark to 2
+        // Advance watermark to 2 — drain is now decoupled from the
+        // quorum watermark, so all WAL entries are still returned
+        // (per-peer filtering at the caller decides what's actually
+        // shipped).  Compaction is what trims drain's start point.
         log.advance_watermark(2).unwrap();
+        let entries = log.drain_unreplicated().unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].0, 1);
+        assert_eq!(entries[2].0, 3);
+
+        // Compact removes entries from the WAL — drain now starts at
+        // the new earliest_seq.
+        log.compact(2).unwrap();
         let entries = log.drain_unreplicated().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, 3);
