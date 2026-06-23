@@ -52,7 +52,7 @@ use std::os::raw::c_void;
 ///     Existing plugins (vault, local-connector, fuse) need a clean
 ///     rebuild against v3; binaries that still report v2 are rejected
 ///     with a clear ABI-mismatch error at load time.
-pub const PLUGIN_API_VERSION: u32 = 3;
+pub const PLUGIN_API_VERSION: u32 = 4;
 
 // ── Plugin kind ─────────────────────────────────────────────────────
 
@@ -304,6 +304,16 @@ pub mod symbols {
     pub const DRIVER_READ: &str = "nexus_driver_read";
     /// `fn(drv, path, data, data_len) -> i32`
     pub const DRIVER_WRITE: &str = "nexus_driver_write";
+    /// `fn(drv, path, out_buf, out_len) -> i32`
+    ///
+    /// Output buffer encodes a JSON array of strings, one per child,
+    /// using the `ObjectStore::list_dir` convention: directories
+    /// carry a trailing `/`, plain files do not.  A driver that cannot
+    /// meaningfully enumerate at `path` (e.g. a CAS-only store, or a
+    /// content-addressed mount) returns an empty JSON array — the
+    /// kernel's `sys_readdir` then falls back to metastore-only
+    /// children for that path.
+    pub const DRIVER_READDIR: &str = "nexus_driver_readdir";
     /// `fn(drv: *mut c_void)`
     pub const DRIVER_DESTROY: &str = "nexus_driver_destroy";
 }
@@ -367,6 +377,15 @@ pub type DriverWriteFn = unsafe extern "C" fn(
     path: *const c_char,
     data: *const u8,
     data_len: usize,
+) -> i32;
+
+/// Type of the optional `nexus_driver_readdir` symbol.  See
+/// [`symbols::DRIVER_READDIR`] for the wire-format contract.
+pub type DriverReaddirFn = unsafe extern "C" fn(
+    drv: *mut c_void,
+    path: *const c_char,
+    out_buf: *mut *mut u8,
+    out_len: *mut usize,
 ) -> i32;
 
 /// Type of the `nexus_driver_destroy` symbol.
@@ -523,7 +542,8 @@ macro_rules! declare_driver_plugin {
     ($name:expr, $ty:ty, {
         create: $create:expr,
         read: $read:expr,
-        write: $write:expr $(,)?
+        write: $write:expr,
+        readdir: $readdir:expr $(,)?
     }) => {
         #[no_mangle]
         pub extern "C" fn nexus_plugin_api_version() -> u32 {
@@ -605,6 +625,39 @@ macro_rules! declare_driver_plugin {
             let write_fn: fn(&$ty, &str, &[u8]) -> Result<(), i32> = $write;
             match write_fn(drv, path, bytes) {
                 Ok(()) => 0,
+                Err(code) => code,
+            }
+        }
+
+        #[no_mangle]
+        pub unsafe extern "C" fn nexus_driver_readdir(
+            drv: *mut std::os::raw::c_void,
+            path: *const std::ffi::c_char,
+            out_buf: *mut *mut u8,
+            out_len: *mut usize,
+        ) -> i32 {
+            let drv = &*(drv as *const $ty);
+            let path = match std::ffi::CStr::from_ptr(path).to_str() {
+                Ok(s) => s,
+                Err(_) => return -2,
+            };
+            let readdir_fn: fn(&$ty, &str) -> Result<Vec<String>, i32> = $readdir;
+            match readdir_fn(drv, path) {
+                Ok(entries) => {
+                    // JSON array of strings; the kernel's
+                    // `DylibObjectStore::list_dir` parses this back
+                    // into a `Vec<String>`.  Directories carry a
+                    // trailing `/` per the ObjectStore::list_dir
+                    // convention.
+                    let json = match serde_json::to_vec(&entries) {
+                        Ok(v) => v,
+                        Err(_) => return -3,
+                    };
+                    let mut data = std::mem::ManuallyDrop::new(json);
+                    *out_buf = data.as_mut_ptr();
+                    *out_len = data.len();
+                    0
+                }
                 Err(code) => code,
             }
         }

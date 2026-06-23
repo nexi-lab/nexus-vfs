@@ -1116,6 +1116,65 @@ impl Kernel {
                         owner_id: None,
                     });
                 }
+                // Backend-only existence check.  `sys_readdir` already
+                // merges `backend.list_dir(...)` output into its
+                // result set (lines 3102-3118 below), so a directory
+                // mounted from a host fs (LocalConnector) enumerates
+                // its real children.  `sys_stat` was inconsistent —
+                // returning None for those same entries — which broke
+                // every `open` / `get_security_by_name` against them,
+                // visible to operators as `cd M:\songym-win\<session>`
+                // failing with ENOENT immediately after `ls` listed
+                // the directory.  Make stat symmetric: ask the route's
+                // backend whether the basename is among the parent's
+                // children.
+                //
+                // No ABI change — uses only the existing
+                // `ObjectStore::list_dir` already exercised by
+                // sys_readdir.  O(N) in parent-dir size today; a
+                // `DRIVER_STAT` ABI extension can replace this with
+                // O(1) point lookup if a hot caller materialises.
+                if let Some((parent_path, name)) = path.rsplit_once('/') {
+                    let parent_for_route = if parent_path.is_empty() {
+                        contracts::VFS_ROOT
+                    } else {
+                        parent_path
+                    };
+                    if let Some(parent_route) = self.vfs_router.route(parent_for_route, zone_id) {
+                        if let Some(backend) = parent_route.backend.as_ref() {
+                            if let Ok(entries) = backend.list_dir(&parent_route.backend_path) {
+                                for entry in &entries {
+                                    let is_dir = entry.ends_with('/');
+                                    let clean = entry.trim_end_matches('/');
+                                    if clean == name {
+                                        return Some(StatResult {
+                                            path: path.to_string(),
+                                            size: if is_dir { 4096 } else { 0 },
+                                            content_id: None,
+                                            mime_type: if is_dir {
+                                                "inode/directory".to_string()
+                                            } else {
+                                                "application/octet-stream".to_string()
+                                            },
+                                            is_directory: is_dir,
+                                            entry_type: if is_dir { DT_DIR } else { DT_REG },
+                                            mode: if is_dir { 0o755 } else { 0o644 },
+                                            version: 0,
+                                            gen: 0,
+                                            zone_id: Some(parent_route.zone_id.clone()),
+                                            created_at_ms: None,
+                                            modified_at_ms: None,
+                                            last_writer_address: None,
+                                            lock: None,
+                                            link_target: None,
+                                            owner_id: None,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 return None;
             }
         };

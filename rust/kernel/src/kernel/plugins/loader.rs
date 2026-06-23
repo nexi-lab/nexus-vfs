@@ -20,7 +20,7 @@ use contracts::rust_service::{RustCallError, RustService};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use nexus_plugin_abi::{
     signing::{PUBKEY_LENGTH, SIGNATURE_FILE_SUFFIX, SIGNATURE_LENGTH},
-    DriverCreateFn, DriverDestroyFn, DriverReadFn, DriverWriteFn, KernelHandle,
+    DriverCreateFn, DriverDestroyFn, DriverReadFn, DriverReaddirFn, DriverWriteFn, KernelHandle,
     PluginGrpcServicesFn, PluginKind, PluginResult, ServiceCreateFn, ServiceDestroyFn,
     ServiceDispatchFn, PLUGIN_API_VERSION,
 };
@@ -319,6 +319,13 @@ pub(crate) struct DylibObjectStore {
     handle: *mut c_void,
     read_fn: DriverReadFn,
     write_fn: DriverWriteFn,
+    /// `nexus_driver_readdir` symbol.  `<Self as ObjectStore>::list_dir`
+    /// delegates here so the kernel's `sys_readdir` surfaces
+    /// driver-owned entries the same way it does for in-process
+    /// backends like `PathLocalBackend`.  Drivers that cannot
+    /// enumerate return `Ok([])`, which surfaces the same observable
+    /// shape as `sys_readdir` on an empty directory.
+    readdir_fn: DriverReaddirFn,
     destroy_fn: DriverDestroyFn,
 }
 
@@ -437,6 +444,49 @@ impl ObjectStore for DylibObjectStore {
             }
             rc => Err(StorageError::IOError(std::io::Error::other(format!(
                 "driver '{}' read_content returned {rc}",
+                self.drv_name
+            )))),
+        }
+    }
+
+    fn list_dir(&self, path: &str) -> Result<Vec<String>, StorageError> {
+        let path_c = CString::new(path).map_err(|_| {
+            StorageError::IOError(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path contains null byte",
+            ))
+        })?;
+        let mut out_buf: *mut u8 = std::ptr::null_mut();
+        let mut out_len: usize = 0;
+
+        let rc =
+            unsafe { (self.readdir_fn)(self.handle, path_c.as_ptr(), &mut out_buf, &mut out_len) };
+
+        match rc {
+            0 => {
+                let json = if out_buf.is_null() || out_len == 0 {
+                    Vec::new()
+                } else {
+                    // SAFETY: plugin allocated this Vec and handed
+                    // ownership over via ManuallyDrop in the
+                    // `declare_driver_plugin!` readdir arm.
+                    unsafe { Vec::from_raw_parts(out_buf, out_len, out_len) }
+                };
+                if json.is_empty() {
+                    return Ok(Vec::new());
+                }
+                serde_json::from_slice::<Vec<String>>(&json).map_err(|e| {
+                    StorageError::IOError(std::io::Error::other(format!(
+                        "driver '{}' readdir returned non-array JSON: {e}",
+                        self.drv_name
+                    )))
+                })
+            }
+            rc if rc == PluginResult::NotFound as i32 => {
+                Err(StorageError::NotFound(path.to_string()))
+            }
+            rc => Err(StorageError::IOError(std::io::Error::other(format!(
+                "driver '{}' readdir returned {rc}",
                 self.drv_name
             )))),
         }
@@ -675,6 +725,12 @@ impl PluginLoader {
                 .get(nexus_plugin_abi::symbols::DRIVER_WRITE.as_bytes())
                 .map_err(|e| format!("symbol {}: {e}", nexus_plugin_abi::symbols::DRIVER_WRITE))?
         };
+        let readdir_fn: DriverReaddirFn = unsafe {
+            *plugin
+                ._lib
+                .get(nexus_plugin_abi::symbols::DRIVER_READDIR.as_bytes())
+                .map_err(|e| format!("symbol {}: {e}", nexus_plugin_abi::symbols::DRIVER_READDIR))?
+        };
         let destroy_fn: DriverDestroyFn = unsafe {
             *plugin
                 ._lib
@@ -698,6 +754,7 @@ impl PluginLoader {
             handle,
             read_fn,
             write_fn,
+            readdir_fn,
             destroy_fn,
         })
     }
