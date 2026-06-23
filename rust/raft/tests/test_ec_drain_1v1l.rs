@@ -181,14 +181,8 @@ async fn test_ec_drain_1v1l_learner_receives_propose_ec_local() {
     while std::time::Instant::now() < deadline {
         let (small, large) = learner_consensus
             .with_state_machine(|sm| {
-                let s = sm
-                    .get_metadata("/ec-drain-1v1l/small")
-                    .ok()
-                    .flatten();
-                let l = sm
-                    .get_metadata("/ec-drain-1v1l/large")
-                    .ok()
-                    .flatten();
+                let s = sm.get_metadata("/ec-drain-1v1l/small").ok().flatten();
+                let l = sm.get_metadata("/ec-drain-1v1l/large").ok().flatten();
                 (s, l)
             })
             .await;

@@ -681,8 +681,7 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
         // handled in the unilateral fast path earlier in this function,
         // so `compute_ec_watermark` is only meaningful for total_voters >= 2.
         if total_voters >= 2 {
-            let new_watermark =
-                compute_ec_watermark(&self.ec_peer_state, &voter_ids, self.node_id);
+            let new_watermark = compute_ec_watermark(&self.ec_peer_state, &voter_ids, self.node_id);
             if let Some(wm) = new_watermark {
                 if let Err(e) = repl_log.advance_watermark(wm) {
                     tracing::error!("Failed to advance EC watermark: {}", e);

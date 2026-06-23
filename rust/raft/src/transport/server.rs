@@ -590,10 +590,7 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
                     );
                     return Ok(Response::new(ReplicateEntriesResponse {
                         success: false,
-                        error: Some(format!(
-                            "deserialize failed at seq {}: {}",
-                            entry.seq, e
-                        )),
+                        error: Some(format!("deserialize failed at seq {}: {}", entry.seq, e)),
                         applied_up_to: max_applied,
                     }));
                 }
