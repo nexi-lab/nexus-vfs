@@ -35,7 +35,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
-use tokio::task::JoinSet;
 
 use std::time::Duration as StdDuration;
 
@@ -51,6 +50,17 @@ use std::time::Duration as StdDuration;
 struct TransportFailure {
     peer_id: u64,
     is_snapshot: bool,
+}
+
+/// Outcome of an EC replication attempt — surfaced back from a spawned
+/// send task to the driver loop so `ec_peer_state` can be updated
+/// without taking a lock across `await` points.  Mirrors the
+/// `TransportFailure` pattern: per-peer state lives only on the
+/// run-loop side and is mutated only via drained channel events.
+#[derive(Debug)]
+enum EcCompletion {
+    Acked { peer_id: u64, applied_up_to: u64 },
+    Failed { peer_id: u64, error: String },
 }
 
 /// Base backoff interval for EC replication retries.
@@ -125,6 +135,14 @@ struct PeerReplicationState {
     next_attempt: Instant,
     /// Peer has fallen behind compacted WAL — needs full snapshot to catch up.
     needs_snapshot: bool,
+    /// True between spawning a fire-and-forget EC send task and
+    /// receiving its [`EcCompletion`] back through the run-loop
+    /// channel.  Prevents the next tick from spawning a duplicate
+    /// concurrent send to the same peer — without this gate, a peer
+    /// stuck on a slow handshake would accumulate one detached task
+    /// per tick and the acks would race in arbitrary order through
+    /// the completion channel.
+    in_flight: bool,
 }
 
 impl PeerReplicationState {
@@ -134,6 +152,7 @@ impl PeerReplicationState {
             backoff: EC_BACKOFF_BASE,
             next_attempt: Instant::now(),
             needs_snapshot: false,
+            in_flight: false,
         }
     }
 
@@ -188,6 +207,15 @@ pub struct TransportLoop<S: StateMachine + 'static> {
     /// calls — without those, raft-rs's `Progress` tracker stays in
     /// `Replicate` / `Snapshot` state forever after a single failure.
     failure_rx: mpsc::UnboundedReceiver<TransportFailure>,
+    /// Sender half of the EC-completion channel.  Cloned into each
+    /// `spawn_ec_replications` task so success/failure can be reported
+    /// back without taking a lock on `ec_peer_state` across `await`
+    /// points.  Mirrors `failure_tx` — same fire-and-forget pattern.
+    ec_completion_tx: mpsc::UnboundedSender<EcCompletion>,
+    /// Receiver half of the EC-completion channel.  Drained at the top
+    /// of each [`Self::run`] iteration; ack updates land before the
+    /// next round of `spawn_ec_replications` consults `ec_peer_state`.
+    ec_completion_rx: mpsc::UnboundedReceiver<EcCompletion>,
 }
 
 impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
@@ -203,6 +231,7 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
         let tick_interval = driver.config().tick_interval;
         let node_id = driver.config().id;
         let (failure_tx, failure_rx) = mpsc::unbounded_channel();
+        let (ec_completion_tx, ec_completion_rx) = mpsc::unbounded_channel();
         Self {
             driver,
             peers,
@@ -214,6 +243,8 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
             ec_peer_state: HashMap::new(),
             failure_tx,
             failure_rx,
+            ec_completion_tx,
+            ec_completion_rx,
         }
     }
 
@@ -262,19 +293,57 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
                 }
             }
 
-            // 0. Drain any transport send failures reported by previously
-            //    spawned send tasks and forward them to raft-rs.  Must
-            //    run before `process_messages` / `advance` so the next
-            //    tick's outgoing-message set reflects the updated
-            //    `Progress` state (peer in Probe rather than stuck in
-            //    Replicate / Snapshot).  Cheap: non-blocking try_recv
-            //    drain, returns immediately when the channel is empty
-            //    (the steady-state happy path).
+            // 0a. Drain any transport send failures reported by previously
+            //     spawned send tasks and forward them to raft-rs.  Must
+            //     run before `process_messages` / `advance` so the next
+            //     tick's outgoing-message set reflects the updated
+            //     `Progress` state (peer in Probe rather than stuck in
+            //     Replicate / Snapshot).  Cheap: non-blocking try_recv
+            //     drain, returns immediately when the channel is empty
+            //     (the steady-state happy path).
             while let Ok(failure) = self.failure_rx.try_recv() {
                 self.driver.report_unreachable(failure.peer_id);
                 if failure.is_snapshot {
                     self.driver
                         .report_snapshot(failure.peer_id, raft::SnapshotStatus::Failure);
+                }
+            }
+
+            // 0b. Drain EC replication completions from previously
+            //     spawned send tasks.  Must run before
+            //     `spawn_ec_replications` below so the next round of
+            //     peer scheduling sees up-to-date `acked_seq` /
+            //     `backoff` / `in_flight` state.  Cheap non-blocking
+            //     drain — same pattern as the failure drain above.
+            while let Ok(completion) = self.ec_completion_rx.try_recv() {
+                match completion {
+                    EcCompletion::Acked {
+                        peer_id,
+                        applied_up_to,
+                    } => {
+                        if let Some(state) = self.ec_peer_state.get_mut(&peer_id) {
+                            state.in_flight = false;
+                            state.acked_seq = state.acked_seq.max(applied_up_to);
+                            state.reset_backoff();
+                            tracing::debug!(
+                                peer = peer_id,
+                                applied_up_to,
+                                "EC entries replicated to peer"
+                            );
+                        }
+                    }
+                    EcCompletion::Failed { peer_id, error } => {
+                        if let Some(state) = self.ec_peer_state.get_mut(&peer_id) {
+                            state.in_flight = false;
+                            state.increase_backoff();
+                            tracing::debug!(
+                                peer = peer_id,
+                                backoff_ms = state.backoff.as_millis(),
+                                "EC replication failed: {}",
+                                error
+                            );
+                        }
+                    }
                 }
             }
 
@@ -293,8 +362,13 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
                 }
             }
 
-            // 3. EC Phase C: async replication to peers
-            self.replicate_ec_entries().await;
+            // 3. EC Phase C: fire-and-forget replication to peers.  Each
+            //    peer's send runs as a detached task; completion lands
+            //    back via `ec_completion_rx` and is drained at the top
+            //    of the next tick.  The transport loop never awaits an
+            //    EC send — raft heartbeats and elections are not held
+            //    behind a slow EC handshake.
+            self.spawn_ec_replications();
         }
     }
 
@@ -394,14 +468,28 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
     // EC Phase C: Background replication
     // =========================================================================
 
-    /// Drain unreplicated EC entries and send to peers.
+    /// Drain unreplicated EC entries and spawn fire-and-forget sends
+    /// to eligible peers.
     ///
-    /// Uses per-peer exponential backoff (base=100ms, cap=60s) to avoid
-    /// wasting resources on unreachable peers. Backoff resets on success.
+    /// Architecture mirror of [`Self::send_messages_fire_and_forget`]:
+    /// each per-peer send runs as a detached `tokio::spawn` task; the
+    /// run loop never awaits the result.  Success / failure is
+    /// reported back through [`Self::ec_completion_rx`] and drained
+    /// at the top of the next tick (the only site that mutates
+    /// `ec_peer_state`).  Raft heartbeats and elections are therefore
+    /// never blocked behind a slow EC handshake, even with
+    /// `EC_SEND_TIMEOUT` measured in seconds.
     ///
-    /// After sending, computes the majority quorum watermark and advances
-    /// the ReplicationLog so `is_committed(token)` returns "committed".
-    async fn replicate_ec_entries(&mut self) {
+    /// Per-peer exponential backoff (base=100ms, capped at
+    /// [`EC_BACKOFF_CAP`]) still rate-limits sends; `in_flight`
+    /// suppresses duplicate concurrent sends to the same peer.
+    ///
+    /// After spawning, computes the voter-majority quorum watermark
+    /// and advances the `ReplicationLog`.  The watermark uses the
+    /// `acked_seq` state as of the last completion drain (one-tick
+    /// lag), which is the correct conservative pin — we only mark
+    /// "safe to read" what we know was acked.
+    fn spawn_ec_replications(&mut self) {
         let repl_log = match self.driver.replication_log() {
             Some(log) => Arc::clone(log),
             None => return, // No replication log (witness node)
@@ -466,6 +554,15 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
                 .ec_peer_state
                 .entry(*peer_id)
                 .or_insert_with(PeerReplicationState::new);
+
+            // Skip if a previous send is still in flight — its
+            // completion will land via `ec_completion_rx` and update
+            // `acked_seq` / `backoff` before the next tick reaches
+            // here.  Without this gate, a peer stuck on a slow
+            // handshake would accumulate one detached task per tick.
+            if state.in_flight {
+                continue;
+            }
 
             // Skip if in backoff period
             if now < state.next_attempt {
@@ -534,67 +631,48 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
             });
         }
 
-        // Fan out EC replication sends in parallel
-        if !tasks.is_empty() {
-            let mut join_set: JoinSet<(u64, std::result::Result<u64, String>)> = JoinSet::new();
-
-            for task in tasks {
-                let client_pool = self.client_pool.clone();
-                let zone_id = self.zone_id.clone();
-                let node_id = self.node_id;
-
-                join_set.spawn(async move {
-                    let send = send_ec_entries(
-                        &client_pool,
-                        &task.peer_addr,
-                        zone_id,
-                        task.entries,
-                        node_id,
-                    );
-                    match tokio::time::timeout(EC_SEND_TIMEOUT, send).await {
-                        Ok(Ok(applied_up_to)) => (task.peer_id, Ok(applied_up_to)),
-                        Ok(Err(e)) => (task.peer_id, Err(e)),
-                        Err(_) => (
-                            task.peer_id,
-                            Err(format!(
-                                "EC replication timed out after {:?}",
-                                EC_SEND_TIMEOUT
-                            )),
-                        ),
-                    }
-                });
+        // Fire-and-forget per-peer send tasks.  Mark each peer
+        // `in_flight = true` BEFORE spawning so the next tick (which
+        // may run before the spawn even starts work) skips a duplicate
+        // send.  Cleared in the run-loop drain when the completion
+        // arrives.
+        for task in tasks {
+            if let Some(state) = self.ec_peer_state.get_mut(&task.peer_id) {
+                state.in_flight = true;
             }
 
-            // Collect results and update per-peer state
-            while let Some(result) = join_set.join_next().await {
-                match result {
-                    Ok((peer_id, Ok(applied_up_to))) => {
-                        if let Some(state) = self.ec_peer_state.get_mut(&peer_id) {
-                            state.acked_seq = state.acked_seq.max(applied_up_to);
-                            state.reset_backoff();
-                            tracing::debug!(
-                                peer = peer_id,
-                                applied_up_to,
-                                "EC entries replicated to peer"
-                            );
-                        }
-                    }
-                    Ok((peer_id, Err(e))) => {
-                        if let Some(state) = self.ec_peer_state.get_mut(&peer_id) {
-                            state.increase_backoff();
-                            tracing::debug!(
-                                peer = peer_id,
-                                backoff_ms = state.backoff.as_millis(),
-                                "EC replication failed: {}",
-                                e
-                            );
-                        }
-                    }
-                    Err(join_err) => {
-                        tracing::error!("EC replication task panicked: {}", join_err);
-                    }
-                }
-            }
+            let client_pool = self.client_pool.clone();
+            let zone_id = self.zone_id.clone();
+            let node_id = self.node_id;
+            let completion_tx = self.ec_completion_tx.clone();
+
+            tokio::spawn(async move {
+                let send = send_ec_entries(
+                    &client_pool,
+                    &task.peer_addr,
+                    zone_id,
+                    task.entries,
+                    node_id,
+                );
+                let completion = match tokio::time::timeout(EC_SEND_TIMEOUT, send).await {
+                    Ok(Ok(applied_up_to)) => EcCompletion::Acked {
+                        peer_id: task.peer_id,
+                        applied_up_to,
+                    },
+                    Ok(Err(e)) => EcCompletion::Failed {
+                        peer_id: task.peer_id,
+                        error: e,
+                    },
+                    Err(_) => EcCompletion::Failed {
+                        peer_id: task.peer_id,
+                        error: format!("EC replication timed out after {:?}", EC_SEND_TIMEOUT),
+                    },
+                };
+                // Best-effort signal back.  Receiver drop only happens
+                // at shutdown, in which case a missed completion is
+                // harmless.
+                let _ = completion_tx.send(completion);
+            });
         }
 
         // Compute quorum watermark and advance.  Only voter peers count
@@ -728,6 +806,7 @@ mod tests {
             backoff: EC_BACKOFF_BASE,
             next_attempt: Instant::now(),
             needs_snapshot: false,
+            in_flight: false,
         }
     }
 
