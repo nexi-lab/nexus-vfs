@@ -309,29 +309,32 @@ enum Cmd {
         /// Parent zone for the mount entry; defaults to root.
         #[arg(long, default_value = "root")]
         parent_zone: String,
-        /// Membership role on the shared zone — ``learner`` (default,
-        /// owner-pattern: joiner gets full replication but doesn't
-        /// affect the owner's ability to commit; wipe-rejoin-safe) or
-        /// ``voter`` (symmetric-peer pattern: joiner counts toward
-        /// quorum, equal write authority as the founder).
+        /// Membership role on the shared zone — ``voter`` (default,
+        /// symmetric-peer pattern: joiner counts toward quorum, equal
+        /// write authority as the founder) or ``learner``
+        /// (owner-pattern: joiner gets full replication but doesn't
+        /// affect the owner's ability to commit; wipe-rejoin-safe).
         ///
-        /// ``voter`` is the right pick for cc-tasks-share-style
-        /// symmetric peer workflows (Mac↔Win sharing each other's CC
-        /// task dirs).  Per-write EC routing means a voter joiner can
-        /// still write metadata locally even when the founder is
-        /// offline — quorum is only required for SC writes
-        /// (locks / CAS), not for the default sys_setattr path.
+        /// ``voter`` is the default because the canonical federation
+        /// workflows we ship for (cc-tasks-share Mac↔Win, corp-zone
+        /// partition smoke) are symmetric — both sides write and need
+        /// to keep writing during partition.  It also aligns the CLI
+        /// with the wire-level protocol default: `JoinZoneRequest`'s
+        /// `bool as_learner` field defaults to `false` (voter) under
+        /// proto3, so operators driving JoinZone via grpcurl already
+        /// got voter by omission.
         ///
-        /// ``learner`` keeps the owner-pattern guarantees from
-        /// nexus-vfs PR #57: losing or replacing a learner has zero
-        /// impact on the owner's ability to commit, so SSD swap / OS
-        /// reinstall / device migration cannot strand the zone in
-        /// `not leader` deadlock.
+        /// ``learner`` is the right pick for owner-pattern workloads
+        /// (single owner, dispensable followers): the guarantees from
+        /// nexus-vfs PR #57 mean losing or replacing a learner has
+        /// zero impact on the owner's ability to commit, so SSD swap
+        /// / OS reinstall / device migration cannot strand the zone
+        /// in `not leader` deadlock.  Pass `--as learner` to opt in.
         // Field name is `as_role` because `as` is a Rust keyword.
         // `long = "as"` overrides clap's default snake-to-kebab
         // derivation (which would give `--as-role`) so the
         // operator-facing flag reads naturally: `--as voter`.
-        #[arg(long = "as", value_enum, default_value_t = JoinRole::Learner)]
+        #[arg(long = "as", value_enum, default_value_t = JoinRole::Voter)]
         as_role: JoinRole,
     },
 }
@@ -1520,8 +1523,12 @@ mod tests {
             other => panic!("expected Join, got {other:?}"),
         }
 
-        // Default (no --as flag) must stay Learner to preserve
-        // backward compatibility with every pre-flag operator script.
+        // Default (no --as flag) is Voter — symmetric peer is the
+        // canonical workload (Mac↔Win cc-tasks-share, corp-zone
+        // partition) and aligns the CLI default with the wire-level
+        // protocol default (`JoinZoneRequest.as_learner` defaults to
+        // `false` under proto3).  Operators wanting owner-pattern
+        // semantics opt in with `--as learner`.
         let parsed_default = Args::try_parse_from([
             "nexusd-cluster",
             "join",
@@ -1531,7 +1538,7 @@ mod tests {
         ])
         .expect("default (no --as) must parse");
         match parsed_default.cmd.expect("join cmd") {
-            Cmd::Join { as_role, .. } => assert!(matches!(as_role, JoinRole::Learner)),
+            Cmd::Join { as_role, .. } => assert!(matches!(as_role, JoinRole::Voter)),
             other => panic!("expected Join, got {other:?}"),
         }
     }
