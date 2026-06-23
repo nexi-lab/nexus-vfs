@@ -567,8 +567,35 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
             let command: Command = match bincode::deserialize(&entry.command) {
                 Ok(cmd) => cmd,
                 Err(e) => {
-                    tracing::warn!(seq = entry.seq, "Failed to deserialize EC entry: {}", e);
-                    continue;
+                    // A bincode deserialize failure on an EC entry
+                    // means the wire format itself is wrong — the
+                    // sender shipped bytes this version of the
+                    // server cannot decode (mismatched build /
+                    // schema-drift bug).  Returning success=true and
+                    // skipping the entry let the sender treat the
+                    // gap as "applied" (because `applied_up_to`
+                    // would still cover later entries that DID
+                    // deserialise) and silently desync the
+                    // state machines.  Treat it as a hard failure
+                    // and surface it: stop applying further entries
+                    // in this batch, return `success=false` with the
+                    // last definitely-applied seq, and let the
+                    // sender's per-peer backoff rate-limit the
+                    // retry against the version-skew condition.
+                    tracing::warn!(
+                        seq = entry.seq,
+                        sender = req.sender_node_id,
+                        "EC entry deserialize failed — wire-format mismatch: {}",
+                        e
+                    );
+                    return Ok(Response::new(ReplicateEntriesResponse {
+                        success: false,
+                        error: Some(format!(
+                            "deserialize failed at seq {}: {}",
+                            entry.seq, e
+                        )),
+                        applied_up_to: max_applied,
+                    }));
                 }
             };
 
