@@ -9,7 +9,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use kernel::abc::object_store::{ObjectStore, StorageError, WriteResult};
+use kernel::abc::object_store::{BackendStat, ObjectStore, StorageError, WriteResult};
 
 ///
 /// Mounts an external local folder into Nexus. Files remain at original
@@ -228,6 +228,25 @@ impl ObjectStore for LocalConnectorBackend {
             content_id: dst_path.to_string(),
             version: hash,
             size,
+        })
+    }
+
+    fn stat(&self, path: &str) -> Result<BackendStat, StorageError> {
+        let target = if path.is_empty() {
+            self.root_path.clone()
+        } else {
+            self.resolve_path(path)?
+        };
+        let md = fs::metadata(&target).map_err(|e| {
+            if e.kind() == io::ErrorKind::NotFound {
+                StorageError::NotFound(path.to_string())
+            } else {
+                StorageError::IOError(e)
+            }
+        })?;
+        Ok(BackendStat {
+            size: if md.is_dir() { 0 } else { md.len() },
+            is_dir: md.is_dir(),
         })
     }
 

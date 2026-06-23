@@ -46,6 +46,22 @@ pub struct WriteResult {
     pub size: u64,
 }
 
+/// Backend-side metadata snapshot for a single path.
+///
+/// Returned by [`ObjectStore::stat`] so the kernel's `sys_stat` can
+/// surface backend-owned entries (LocalConnector-mounted host fs)
+/// without paying the cost of reading the file's bytes just to learn
+/// its size.  The shape is intentionally minimal — kernel `StatResult`
+/// fields the backend cannot meaningfully populate (zone_id, lock,
+/// link_target, mtime, …) stay synthesised at the kernel layer.
+#[derive(Debug, Clone, Copy)]
+pub struct BackendStat {
+    /// Content size in bytes.  Directories report 0.
+    pub size: u64,
+    /// True for directories, false for regular files.
+    pub is_dir: bool,
+}
+
 /// ObjectStore pillar — kernel `file_operations` contract.
 ///
 /// Rust equivalent of Python `ObjectStoreABC` (one of the Four Storage Pillars).
@@ -204,6 +220,24 @@ pub trait ObjectStore: Send + Sync {
     fn list_dir(&self, path: &str) -> Result<Vec<String>, StorageError> {
         let _ = path;
         Err(StorageError::NotSupported("list_dir"))
+    }
+
+    /// Point-lookup metadata for a backend-owned path.
+    ///
+    /// Sister of [`Self::list_dir`] — where `list_dir` enumerates a
+    /// directory's children, `stat` answers a single (size, is_dir)
+    /// question about one path.  Used by the kernel's `sys_stat`
+    /// backend fallback so backend-owned files (LocalConnector-mounted
+    /// host fs entries) become statable without reading their bytes
+    /// to measure the size.
+    ///
+    /// Default returns `NotSupported`.  Filesystem backends override
+    /// via `std::fs::metadata`; API connectors synthesise from their
+    /// virtual namespace.  Driver plugins delegate through the
+    /// `nexus_driver_stat` ABI symbol.
+    fn stat(&self, path: &str) -> Result<BackendStat, StorageError> {
+        let _ = path;
+        Err(StorageError::NotSupported("stat"))
     }
 
     /// Resolve a content_id to a physical filesystem path for pread/pwrite.

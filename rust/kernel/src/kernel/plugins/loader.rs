@@ -20,12 +20,12 @@ use contracts::rust_service::{RustCallError, RustService};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use nexus_plugin_abi::{
     signing::{PUBKEY_LENGTH, SIGNATURE_FILE_SUFFIX, SIGNATURE_LENGTH},
-    DriverCreateFn, DriverDestroyFn, DriverReadFn, DriverReaddirFn, DriverWriteFn, KernelHandle,
-    PluginGrpcServicesFn, PluginKind, PluginResult, ServiceCreateFn, ServiceDestroyFn,
-    ServiceDispatchFn, PLUGIN_API_VERSION,
+    DriverCreateFn, DriverDeleteFileFn, DriverDestroyFn, DriverReadFn, DriverReaddirFn,
+    DriverStatFn, DriverWriteFn, KernelHandle, PluginGrpcServicesFn, PluginKind, PluginResult,
+    ServiceCreateFn, ServiceDestroyFn, ServiceDispatchFn, PLUGIN_API_VERSION,
 };
 
-use crate::abc::object_store::{ObjectStore, StorageError, WriteResult};
+use crate::abc::object_store::{BackendStat, ObjectStore, StorageError, WriteResult};
 
 // ── Trusted plugin signing keys ─────────────────────────────────────
 //
@@ -322,10 +322,26 @@ pub(crate) struct DylibObjectStore {
     /// `nexus_driver_readdir` symbol.  `<Self as ObjectStore>::list_dir`
     /// delegates here so the kernel's `sys_readdir` surfaces
     /// driver-owned entries the same way it does for in-process
-    /// backends like `PathLocalBackend`.  Drivers that cannot
-    /// enumerate return `Ok([])`, which surfaces the same observable
-    /// shape as `sys_readdir` on an empty directory.
+    /// backends like `PathLocalBackend`.
     readdir_fn: DriverReaddirFn,
+    /// Optional `nexus_driver_delete_file` symbol — sister of
+    /// `DRIVER_WRITE`.  Drivers that cannot meaningfully delete
+    /// (CAS-only stores, read-only API connectors) omit it; the
+    /// `ObjectStore::delete_file` impl below then returns
+    /// `NotSupported`, the trait default.  Drivers that DO export
+    /// it close the FUSE-`rm`-leaves-ghost-file gap (the
+    /// metastore entry got removed but the host fs file persisted
+    /// and the now-working `list_dir` re-surfaced it).
+    delete_file_fn: Option<DriverDeleteFileFn>,
+    /// Optional `nexus_driver_stat` symbol — point-lookup
+    /// `{size, is_dir}` for a single path.  When present, the
+    /// kernel's `sys_stat` backend fallback uses it (O(1)); when
+    /// absent, the fallback returns `None` for backend-owned
+    /// paths and the FUSE layer gets ENOENT for entries that
+    /// `readdir` would have listed.  LocalConnector and any
+    /// driver wrapping a real filesystem should export it;
+    /// virtual-namespace drivers may legitimately not.
+    stat_fn: Option<DriverStatFn>,
     destroy_fn: DriverDestroyFn,
 }
 
@@ -487,6 +503,90 @@ impl ObjectStore for DylibObjectStore {
             }
             rc => Err(StorageError::IOError(std::io::Error::other(format!(
                 "driver '{}' readdir returned {rc}",
+                self.drv_name
+            )))),
+        }
+    }
+
+    fn delete_file(&self, path: &str) -> Result<(), StorageError> {
+        // Optional symbol — drivers that don't export it surface
+        // the trait default of `NotSupported`, matching pre-v4
+        // behaviour for any driver-backed mount.  Operators see
+        // `sys_unlink` reach the metastore but not the host fs;
+        // explicit cleanup is the operator's responsibility for
+        // such drivers.
+        let delete_fn = self.delete_file_fn.ok_or(StorageError::NotSupported(
+            "driver plugin does not export nexus_driver_delete_file",
+        ))?;
+        let path_c = CString::new(path).map_err(|_| {
+            StorageError::IOError(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path contains null byte",
+            ))
+        })?;
+        let rc = unsafe { delete_fn(self.handle, path_c.as_ptr()) };
+        match rc {
+            0 => Ok(()),
+            rc if rc == PluginResult::NotFound as i32 => {
+                Err(StorageError::NotFound(path.to_string()))
+            }
+            rc => Err(StorageError::IOError(std::io::Error::other(format!(
+                "driver '{}' delete_file returned {rc}",
+                self.drv_name
+            )))),
+        }
+    }
+
+    fn stat(&self, path: &str) -> Result<BackendStat, StorageError> {
+        // Optional symbol — same NotSupported fallback as
+        // `delete_file` above.  When absent, the kernel's
+        // `sys_stat` backend fallback returns `None` for paths
+        // covered only by the driver's `list_dir` (no individual
+        // metadata available), which the FUSE layer surfaces as
+        // ENOENT.
+        let stat_fn = self.stat_fn.ok_or(StorageError::NotSupported(
+            "driver plugin does not export nexus_driver_stat",
+        ))?;
+        let path_c = CString::new(path).map_err(|_| {
+            StorageError::IOError(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path contains null byte",
+            ))
+        })?;
+        let mut out_buf: *mut u8 = std::ptr::null_mut();
+        let mut out_len: usize = 0;
+        let rc = unsafe { stat_fn(self.handle, path_c.as_ptr(), &mut out_buf, &mut out_len) };
+        match rc {
+            0 => {
+                let json = if out_buf.is_null() || out_len == 0 {
+                    Vec::new()
+                } else {
+                    // SAFETY: plugin allocated this Vec and handed
+                    // ownership over via ManuallyDrop in the
+                    // `declare_driver_plugin!` stat arm.
+                    unsafe { Vec::from_raw_parts(out_buf, out_len, out_len) }
+                };
+                #[derive(serde::Deserialize)]
+                struct StatWire {
+                    size: u64,
+                    is_dir: bool,
+                }
+                let parsed: StatWire = serde_json::from_slice(&json).map_err(|e| {
+                    StorageError::IOError(std::io::Error::other(format!(
+                        "driver '{}' stat returned non-stat JSON: {e}",
+                        self.drv_name
+                    )))
+                })?;
+                Ok(BackendStat {
+                    size: parsed.size,
+                    is_dir: parsed.is_dir,
+                })
+            }
+            rc if rc == PluginResult::NotFound as i32 => {
+                Err(StorageError::NotFound(path.to_string()))
+            }
+            rc => Err(StorageError::IOError(std::io::Error::other(format!(
+                "driver '{}' stat returned {rc}",
                 self.drv_name
             )))),
         }
@@ -731,6 +831,25 @@ impl PluginLoader {
                 .get(nexus_plugin_abi::symbols::DRIVER_READDIR.as_bytes())
                 .map_err(|e| format!("symbol {}: {e}", nexus_plugin_abi::symbols::DRIVER_READDIR))?
         };
+        // Optional v4-additive symbols.  Missing symbol → fall back
+        // to the `ObjectStore` trait defaults (`NotSupported`) so
+        // drivers that legitimately don't have a delete or stat
+        // primitive (CAS-only stores, read-only API connectors)
+        // keep loading.
+        let delete_file_fn: Option<DriverDeleteFileFn> = unsafe {
+            plugin
+                ._lib
+                .get::<DriverDeleteFileFn>(nexus_plugin_abi::symbols::DRIVER_DELETE_FILE.as_bytes())
+                .ok()
+                .map(|sym| *sym)
+        };
+        let stat_fn: Option<DriverStatFn> = unsafe {
+            plugin
+                ._lib
+                .get::<DriverStatFn>(nexus_plugin_abi::symbols::DRIVER_STAT.as_bytes())
+                .ok()
+                .map(|sym| *sym)
+        };
         let destroy_fn: DriverDestroyFn = unsafe {
             *plugin
                 ._lib
@@ -755,6 +874,8 @@ impl PluginLoader {
             read_fn,
             write_fn,
             readdir_fn,
+            delete_file_fn,
+            stat_fn,
             destroy_fn,
         })
     }

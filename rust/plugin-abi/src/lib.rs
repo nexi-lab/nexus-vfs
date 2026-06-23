@@ -52,6 +52,27 @@ use std::os::raw::c_void;
 ///     Existing plugins (vault, local-connector, fuse) need a clean
 ///     rebuild against v3; binaries that still report v2 are rejected
 ///     with a clear ABI-mismatch error at load time.
+///   * v4 — driver plugins MUST export
+///     [`symbols::DRIVER_READDIR`] so `DylibObjectStore::list_dir`
+///     surfaces driver-owned entries through the kernel's
+///     `sys_readdir`.  Without it, `ls M:\<mount>\` saw the global
+///     VFS root instead of the configured subtree.  Unblocks
+///     `cc tasks list` cross-machine — `cc tasks list` walks the
+///     federation mount via FUSE and needs enumeration to surface
+///     the peer's `~/.claude/tasks/<session>/…` files.
+///   * v4 (additive, no bump) — driver plugins MAY export
+///     [`symbols::DRIVER_DELETE_FILE`] (sister of `DRIVER_WRITE`,
+///     so FUSE `rm` reaches the host fs file instead of leaving a
+///     ghost the readdir would re-surface) and
+///     [`symbols::DRIVER_STAT`] (point-lookup metadata returning
+///     `{size, is_dir}` — replaces the kernel's pre-stat-ABI
+///     fallback that read full file content just to measure size).
+///     Drivers that cannot meaningfully delete or stat (CAS-only
+///     stores, read-only API connectors) skip the symbols entirely
+///     — the kernel falls back to the `ObjectStore` trait default
+///     of `NotSupported` and callers handle the absence the same
+///     way they did pre-v4.  The cc-tasks-share LocalConnector
+///     is the first opt-in for both.
 pub const PLUGIN_API_VERSION: u32 = 4;
 
 // ── Plugin kind ─────────────────────────────────────────────────────
@@ -314,6 +335,31 @@ pub mod symbols {
     /// kernel's `sys_readdir` then falls back to metastore-only
     /// children for that path.
     pub const DRIVER_READDIR: &str = "nexus_driver_readdir";
+    /// `fn(drv, path) -> i32`
+    ///
+    /// **Optional.**  Sister of `DRIVER_WRITE` — removes the backend
+    /// file at `path`.  Drivers that cannot meaningfully delete
+    /// (CAS-only stores where GC owns the lifecycle, read-only API
+    /// connectors) skip the symbol; the kernel then falls back to
+    /// the `ObjectStore::delete_file` trait default of `NotSupported`
+    /// and `sys_unlink` surfaces that the same way it does for any
+    /// non-PAS backend today.  When present: returns 0 on success,
+    /// `PluginResult::NotFound` if the path doesn't exist,
+    /// `PluginResult::Internal` on I/O failure.
+    pub const DRIVER_DELETE_FILE: &str = "nexus_driver_delete_file";
+    /// `fn(drv, path, out_buf, out_len) -> i32`
+    ///
+    /// **Optional.**  Point-lookup metadata for a single path.
+    /// Output buffer encodes a JSON object
+    /// `{"size": <u64>, "is_dir": <bool>}`.  Used by the kernel's
+    /// `sys_stat` backend fallback so backend-owned entries become
+    /// statable in O(1).  Drivers that cannot meaningfully stat
+    /// (purely-virtual content addressing without size, etc.) skip
+    /// the symbol; the kernel falls back to the
+    /// `ObjectStore::stat` trait default of `NotSupported` and
+    /// `sys_stat` returns `None` for that path.  When present:
+    /// returns `PluginResult::NotFound` for missing paths.
+    pub const DRIVER_STAT: &str = "nexus_driver_stat";
     /// `fn(drv: *mut c_void)`
     pub const DRIVER_DESTROY: &str = "nexus_driver_destroy";
 }
@@ -379,9 +425,22 @@ pub type DriverWriteFn = unsafe extern "C" fn(
     data_len: usize,
 ) -> i32;
 
-/// Type of the optional `nexus_driver_readdir` symbol.  See
+/// Type of the `nexus_driver_readdir` symbol.  See
 /// [`symbols::DRIVER_READDIR`] for the wire-format contract.
 pub type DriverReaddirFn = unsafe extern "C" fn(
+    drv: *mut c_void,
+    path: *const c_char,
+    out_buf: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32;
+
+/// Type of the `nexus_driver_delete_file` symbol.  See
+/// [`symbols::DRIVER_DELETE_FILE`] for the contract.
+pub type DriverDeleteFileFn = unsafe extern "C" fn(drv: *mut c_void, path: *const c_char) -> i32;
+
+/// Type of the `nexus_driver_stat` symbol.  See
+/// [`symbols::DRIVER_STAT`] for the wire-format contract.
+pub type DriverStatFn = unsafe extern "C" fn(
     drv: *mut c_void,
     path: *const c_char,
     out_buf: *mut *mut u8,
@@ -543,7 +602,10 @@ macro_rules! declare_driver_plugin {
         create: $create:expr,
         read: $read:expr,
         write: $write:expr,
-        readdir: $readdir:expr $(,)?
+        readdir: $readdir:expr
+        $(, delete_file: $delete_file:expr)?
+        $(, stat: $stat:expr)?
+        $(,)?
     }) => {
         #[no_mangle]
         pub extern "C" fn nexus_plugin_api_version() -> u32 {
@@ -661,6 +723,57 @@ macro_rules! declare_driver_plugin {
                 Err(code) => code,
             }
         }
+
+        $(
+            #[no_mangle]
+            pub unsafe extern "C" fn nexus_driver_delete_file(
+                drv: *mut std::os::raw::c_void,
+                path: *const std::ffi::c_char,
+            ) -> i32 {
+                let drv = &*(drv as *const $ty);
+                let path = match std::ffi::CStr::from_ptr(path).to_str() {
+                    Ok(s) => s,
+                    Err(_) => return -2,
+                };
+                let delete_fn: fn(&$ty, &str) -> Result<(), i32> = $delete_file;
+                match delete_fn(drv, path) {
+                    Ok(()) => 0,
+                    Err(code) => code,
+                }
+            }
+        )?
+
+        $(
+            #[no_mangle]
+            pub unsafe extern "C" fn nexus_driver_stat(
+                drv: *mut std::os::raw::c_void,
+                path: *const std::ffi::c_char,
+                out_buf: *mut *mut u8,
+                out_len: *mut usize,
+            ) -> i32 {
+                let drv = &*(drv as *const $ty);
+                let path = match std::ffi::CStr::from_ptr(path).to_str() {
+                    Ok(s) => s,
+                    Err(_) => return -2,
+                };
+                let stat_fn: fn(&$ty, &str) -> Result<(u64, bool), i32> = $stat;
+                match stat_fn(drv, path) {
+                    Ok((size, is_dir)) => {
+                        // JSON wire format mirrors the readdir symbol's
+                        // ManuallyDrop-malloc-and-yield pattern.  Kernel's
+                        // `DylibObjectStore::stat` parses this back into a
+                        // `BackendStat { size, is_dir }`.
+                        let json = format!("{{\"size\":{},\"is_dir\":{}}}", size, is_dir);
+                        let bytes = json.into_bytes();
+                        let mut data = std::mem::ManuallyDrop::new(bytes);
+                        *out_buf = data.as_mut_ptr();
+                        *out_len = data.len();
+                        0
+                    }
+                    Err(code) => code,
+                }
+            }
+        )?
 
         #[no_mangle]
         pub unsafe extern "C" fn nexus_driver_destroy(drv: *mut std::os::raw::c_void) {
