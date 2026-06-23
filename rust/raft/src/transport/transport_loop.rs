@@ -392,19 +392,33 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
             }
         };
 
-        // Get current peer snapshot (read lock, released immediately)
+        // Get current peer snapshot (read lock, released immediately).
+        // Peer-map carries voters AND learners; we replicate to both
+        // but quorum sizing must be voter-only (see `voter_ids` below).
         let peer_map = self.snapshot_peers();
         let peer_snapshot: Vec<(u64, NodeAddress)> = peer_map.into_iter().collect();
 
-        let total_voters = peer_snapshot.len() + 1; // peers + self
+        // Voter set is the raft-rs SSOT — never derive total_voters from
+        // `peer_snapshot.len() + 1`, which over-counts whenever any
+        // learner is in the peer-map.  In a 1V+1L topology that
+        // over-count required a learner ack for quorum; the learner is
+        // not part of consensus so its `acked_seq` stayed 0 in backoff
+        // and the watermark could never advance (nexi-lab/nexus-vfs#64).
+        let voter_ids = self.driver.voter_ids();
+        let total_voters = voter_ids.len();
 
-        // Single node: advance watermark immediately (no peers to replicate to)
-        if peer_snapshot.is_empty() {
+        // Single-voter cluster: self is the majority — advance watermark
+        // unilaterally.  Do NOT return early when learner peers exist:
+        // they still need EC replication so they can serve reads of
+        // already-watermarked metadata.
+        if total_voters <= 1 {
             let max_seq = repl_log.max_seq();
             if max_seq > 1 {
                 let _ = repl_log.advance_watermark(max_seq - 1);
             }
-            return;
+            if peer_snapshot.is_empty() {
+                return;
+            }
         }
 
         // Nothing to replicate
@@ -559,11 +573,18 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
             }
         }
 
-        // Compute quorum watermark and advance
-        let new_watermark = compute_ec_watermark(&self.ec_peer_state, &peer_snapshot, total_voters);
-        if let Some(wm) = new_watermark {
-            if let Err(e) = repl_log.advance_watermark(wm) {
-                tracing::error!("Failed to advance EC watermark: {}", e);
+        // Compute quorum watermark and advance.  Only voter peers count
+        // toward the quorum — learner acks are ignored here even though
+        // we still replicate to them above.  The single-voter case is
+        // handled in the unilateral fast path earlier in this function,
+        // so `compute_ec_watermark` is only meaningful for total_voters >= 2.
+        if total_voters >= 2 {
+            let new_watermark =
+                compute_ec_watermark(&self.ec_peer_state, &voter_ids, self.node_id);
+            if let Some(wm) = new_watermark {
+                if let Err(e) = repl_log.advance_watermark(wm) {
+                    tracing::error!("Failed to advance EC watermark: {}", e);
+                }
             }
         }
 
@@ -633,26 +654,36 @@ async fn send_ec_entries(
         })
 }
 
-/// Compute the EC replication watermark based on peer acknowledgements.
+/// Compute the EC replication watermark based on voter acknowledgements.
 ///
-/// Self always counts as having applied all entries. We need `total_voters / 2`
-/// additional peer acks for a majority (integer division).
+/// `voter_ids` is the full raft voter set including self (raft-rs SSOT).
+/// Self always counts as having applied all entries; we need
+/// `voter_ids.len() / 2` additional acks from the non-self voters for a
+/// majority (integer division).  Learners are NEVER considered here —
+/// they are not part of consensus and a learner sitting in backoff
+/// would otherwise pin the watermark indefinitely
+/// (nexi-lab/nexus-vfs#64).
 ///
-/// Returns `None` if quorum cannot be reached (not enough peer acks).
+/// Returns `None` if quorum cannot be reached (not enough voter peer
+/// acks).  The single-voter case is handled by the caller and is also
+/// guarded here by returning `None` when no peer acks are needed.
 fn compute_ec_watermark(
     peer_state: &HashMap<u64, PeerReplicationState>,
-    peer_snapshot: &[(u64, NodeAddress)],
-    total_voters: usize,
+    voter_ids: &[u64],
+    self_id: u64,
 ) -> Option<u64> {
+    let total_voters = voter_ids.len();
     let needed_peer_acks = total_voters / 2; // self already counted
     if needed_peer_acks == 0 {
-        return None; // single node — handled separately
+        return None; // single voter — caller advances watermark unilaterally
     }
 
-    // Collect acked_seq for known peers
-    let mut acks: Vec<u64> = peer_snapshot
+    // Collect acked_seq for the non-self VOTER peers.  Learners in
+    // `peer_state` are skipped because they are not in `voter_ids`.
+    let mut acks: Vec<u64> = voter_ids
         .iter()
-        .filter_map(|(id, _)| peer_state.get(id).map(|s| s.acked_seq))
+        .filter(|id| **id != self_id)
+        .filter_map(|id| peer_state.get(id).map(|s| s.acked_seq))
         .collect();
 
     // Sort descending: highest acks first
@@ -667,83 +698,95 @@ fn compute_ec_watermark(
 mod tests {
     use super::*;
 
+    fn mk_peer_state(acked_seq: u64) -> PeerReplicationState {
+        PeerReplicationState {
+            acked_seq,
+            backoff: EC_BACKOFF_BASE,
+            next_attempt: Instant::now(),
+            needs_snapshot: false,
+        }
+    }
+
     #[test]
-    fn test_compute_ec_watermark_3_nodes() {
-        // 3 nodes: self + 2 peers. Need 1 peer ack for majority.
+    fn test_compute_ec_watermark_3_voters() {
+        // 3 voters: self (1) + voter peers 2, 3. Need 1 peer ack for majority.
         let mut peer_state = HashMap::new();
-        peer_state.insert(
-            2,
-            PeerReplicationState {
-                acked_seq: 5,
-                backoff: EC_BACKOFF_BASE,
-                next_attempt: Instant::now(),
-                needs_snapshot: false,
-            },
-        );
-        peer_state.insert(
-            3,
-            PeerReplicationState {
-                acked_seq: 3,
-                backoff: EC_BACKOFF_BASE,
-                next_attempt: Instant::now(),
-                needs_snapshot: false,
-            },
-        );
+        peer_state.insert(2, mk_peer_state(5));
+        peer_state.insert(3, mk_peer_state(3));
 
-        let addr = NodeAddress::new(0, "");
-        let peers = vec![(2, addr.clone()), (3, addr)];
+        let voter_ids = vec![1, 2, 3];
 
-        // total_voters = 3 (self + 2 peers), needed = 3/2 = 1
+        // total_voters = 3, needed_peer_acks = 3/2 = 1
         // sorted acks desc: [5, 3], take index 0 = 5
-        let wm = compute_ec_watermark(&peer_state, &peers, 3);
+        let wm = compute_ec_watermark(&peer_state, &voter_ids, 1);
         assert_eq!(wm, Some(5));
     }
 
     #[test]
-    fn test_compute_ec_watermark_5_nodes() {
-        // 5 nodes: self + 4 peers. Need 2 peer acks for majority.
+    fn test_compute_ec_watermark_5_voters() {
+        // 5 voters: self (1) + voter peers 2..5. Need 2 peer acks.
         let mut peer_state = HashMap::new();
-        let addr = NodeAddress::new(0, "");
-        let mut peers = Vec::new();
-
         for (id, ack) in [(2, 10), (3, 8), (4, 5), (5, 3)] {
-            peer_state.insert(
-                id,
-                PeerReplicationState {
-                    acked_seq: ack,
-                    backoff: EC_BACKOFF_BASE,
-                    next_attempt: Instant::now(),
-                    needs_snapshot: false,
-                },
-            );
-            peers.push((id, addr.clone()));
+            peer_state.insert(id, mk_peer_state(ack));
         }
+        let voter_ids = vec![1, 2, 3, 4, 5];
 
         // total_voters = 5, needed = 5/2 = 2
         // sorted acks desc: [10, 8, 5, 3], take index 1 = 8
-        let wm = compute_ec_watermark(&peer_state, &peers, 5);
+        let wm = compute_ec_watermark(&peer_state, &voter_ids, 1);
         assert_eq!(wm, Some(8));
     }
 
     #[test]
     fn test_compute_ec_watermark_no_acks() {
         let peer_state = HashMap::new();
-        let addr = NodeAddress::new(0, "");
-        let peers = vec![(2, addr.clone()), (3, addr)];
+        let voter_ids = vec![1, 2, 3];
 
         // No acks yet — should return None
-        let wm = compute_ec_watermark(&peer_state, &peers, 3);
+        let wm = compute_ec_watermark(&peer_state, &voter_ids, 1);
         assert_eq!(wm, None);
     }
 
     #[test]
-    fn test_compute_ec_watermark_single_node() {
+    fn test_compute_ec_watermark_single_voter() {
         let peer_state = HashMap::new();
-        let peers: Vec<(u64, NodeAddress)> = vec![];
+        let voter_ids = vec![1];
 
-        // Single node: needed = 0, returns None (handled separately in run loop)
-        let wm = compute_ec_watermark(&peer_state, &peers, 1);
+        // Single voter: needed = 0, returns None (caller advances unilaterally)
+        let wm = compute_ec_watermark(&peer_state, &voter_ids, 1);
         assert_eq!(wm, None);
+    }
+
+    #[test]
+    fn test_compute_ec_watermark_ignores_learner_acks() {
+        // 1V+1L topology — bug nexi-lab/nexus-vfs#64:
+        // self (1) is the only voter; peer 2 is a learner sitting at acked=0
+        // in backoff. Before the fix, total_voters was derived from
+        // peer_snapshot.len()+1=2 and the function required a learner ack
+        // for quorum; the watermark could never advance. After the fix,
+        // voter_ids contains only [1] so the function returns None and
+        // the caller advances the watermark unilaterally.
+        let mut peer_state = HashMap::new();
+        peer_state.insert(2, mk_peer_state(0)); // learner, never acked
+        let voter_ids = vec![1]; // only self
+
+        let wm = compute_ec_watermark(&peer_state, &voter_ids, 1);
+        assert_eq!(wm, None);
+    }
+
+    #[test]
+    fn test_compute_ec_watermark_skips_learner_in_2v1l() {
+        // 2V+1L: voters {1=self, 2}, learner {3}. needed_peer_acks = 1.
+        // Voter peer 2 has acked seq=5; learner 3 has acked seq=99.
+        // The learner's ack must NOT advance the watermark past the
+        // voter peer's ack.
+        let mut peer_state = HashMap::new();
+        peer_state.insert(2, mk_peer_state(5)); // voter
+        peer_state.insert(3, mk_peer_state(99)); // learner — must be ignored
+        let voter_ids = vec![1, 2];
+
+        let wm = compute_ec_watermark(&peer_state, &voter_ids, 1);
+        assert_eq!(wm, Some(5));
     }
 
     #[test]
