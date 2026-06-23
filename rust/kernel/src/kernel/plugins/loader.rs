@@ -21,8 +21,8 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use nexus_plugin_abi::{
     signing::{PUBKEY_LENGTH, SIGNATURE_FILE_SUFFIX, SIGNATURE_LENGTH},
     DriverCreateFn, DriverDeleteFileFn, DriverDestroyFn, DriverReadFn, DriverReaddirFn,
-    DriverStatFn, DriverWriteFn, KernelHandle, PluginGrpcServicesFn, PluginKind, PluginResult,
-    ServiceCreateFn, ServiceDestroyFn, ServiceDispatchFn, PLUGIN_API_VERSION,
+    DriverRmdirFn, DriverStatFn, DriverWriteFn, KernelHandle, PluginGrpcServicesFn, PluginKind,
+    PluginResult, ServiceCreateFn, ServiceDestroyFn, ServiceDispatchFn, PLUGIN_API_VERSION,
 };
 
 use crate::abc::object_store::{BackendStat, ObjectStore, StorageError, WriteResult};
@@ -333,6 +333,17 @@ pub(crate) struct DylibObjectStore {
     /// metastore entry got removed but the host fs file persisted
     /// and the now-working `list_dir` re-surfaced it).
     delete_file_fn: Option<DriverDeleteFileFn>,
+    /// Optional `nexus_driver_rmdir` symbol — sister of
+    /// `DRIVER_DELETE_FILE` for directories.  When present, the
+    /// `ObjectStore::rmdir` impl below delegates and `sys_rmdir`
+    /// clears the metastore row plus the host fs directory in
+    /// lockstep.  When absent, falls back to the trait default
+    /// `NotSupported`, leaving the host fs directory in place
+    /// (which then surfaces through the `sys_stat` backend
+    /// fallback — closes the test_mkdir gap on cc-tasks-share).
+    /// Only single-dir rmdir is exposed; recursive removal stays
+    /// on the kernel side until a concrete need surfaces.
+    rmdir_fn: Option<DriverRmdirFn>,
     /// Optional `nexus_driver_stat` symbol — point-lookup
     /// `{size, is_dir}` for a single path.  When present, the
     /// kernel's `sys_stat` backend fallback uses it (O(1)); when
@@ -532,6 +543,39 @@ impl ObjectStore for DylibObjectStore {
             }
             rc => Err(StorageError::IOError(std::io::Error::other(format!(
                 "driver '{}' delete_file returned {rc}",
+                self.drv_name
+            )))),
+        }
+    }
+
+    fn rmdir(&self, path: &str, recursive: bool) -> Result<(), StorageError> {
+        // Single-dir rmdir only.  Recursive removal stays on the
+        // kernel side until a concrete need surfaces — the v1
+        // driver-rmdir surface is the minimum needed to close the
+        // post-rmdir-host-fs-ghost gap that nexus#4413's
+        // `test_mkdir` pinned.
+        if recursive {
+            return Err(StorageError::NotSupported(
+                "driver plugin rmdir is non-recursive (recursive=true)",
+            ));
+        }
+        let rmdir_fn = self.rmdir_fn.ok_or(StorageError::NotSupported(
+            "driver plugin does not export nexus_driver_rmdir",
+        ))?;
+        let path_c = CString::new(path).map_err(|_| {
+            StorageError::IOError(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path contains null byte",
+            ))
+        })?;
+        let rc = unsafe { rmdir_fn(self.handle, path_c.as_ptr()) };
+        match rc {
+            0 => Ok(()),
+            rc if rc == PluginResult::NotFound as i32 => {
+                Err(StorageError::NotFound(path.to_string()))
+            }
+            rc => Err(StorageError::IOError(std::io::Error::other(format!(
+                "driver '{}' rmdir returned {rc}",
                 self.drv_name
             )))),
         }
@@ -843,6 +887,13 @@ impl PluginLoader {
                 .ok()
                 .map(|sym| *sym)
         };
+        let rmdir_fn: Option<DriverRmdirFn> = unsafe {
+            plugin
+                ._lib
+                .get::<DriverRmdirFn>(nexus_plugin_abi::symbols::DRIVER_RMDIR.as_bytes())
+                .ok()
+                .map(|sym| *sym)
+        };
         let stat_fn: Option<DriverStatFn> = unsafe {
             plugin
                 ._lib
@@ -875,6 +926,7 @@ impl PluginLoader {
             write_fn,
             readdir_fn,
             delete_file_fn,
+            rmdir_fn,
             stat_fn,
             destroy_fn,
         })
