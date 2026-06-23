@@ -459,9 +459,8 @@ impl ObjectStore for DylibObjectStore {
         let mut out_buf: *mut u8 = std::ptr::null_mut();
         let mut out_len: usize = 0;
 
-        let rc = unsafe {
-            (self.readdir_fn)(self.handle, path_c.as_ptr(), &mut out_buf, &mut out_len)
-        };
+        let rc =
+            unsafe { (self.readdir_fn)(self.handle, path_c.as_ptr(), &mut out_buf, &mut out_len) };
 
         match rc {
             0 => {
@@ -940,7 +939,6 @@ mod tests {
         let err = parse_pubkey_file("# only comments\n# more comments").unwrap_err();
         assert!(err.contains("no base64 pubkey line"));
     }
-
 
     #[test]
     fn embedded_trusted_keys_parse_at_runtime() {
