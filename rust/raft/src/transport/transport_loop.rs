@@ -56,7 +56,18 @@ struct TransportFailure {
 /// Base backoff interval for EC replication retries.
 const EC_BACKOFF_BASE: Duration = Duration::from_millis(100);
 /// Maximum backoff interval (cap) for EC replication retries.
-const EC_BACKOFF_CAP: Duration = Duration::from_secs(60);
+///
+/// The cap and the default `wait_nodes_caught_up` test budget used to
+/// match exactly at 60 s — once a peer hit the cap the next retry was
+/// scheduled past every test's timeout, so a single transient send
+/// failure looked like a permanent stall (nexi-lab/nexus-vfs#64).
+/// 10 s bounds the at-cap latency well under those budgets while
+/// still letting genuinely-unreachable peers compress their retry
+/// rate.  Recovery faster than 10 s is handled by the at-cap reset
+/// path in `replicate_ec_entries` — fresh WAL entries arriving past a
+/// stalled peer's `acked_seq` reset `next_attempt` to `now` so the
+/// next tick probes immediately.
+const EC_BACKOFF_CAP: Duration = Duration::from_secs(10);
 
 /// Timeout for individual Raft consensus message sends.
 ///
@@ -800,6 +811,21 @@ mod tests {
 
         let wm = compute_ec_watermark(&peer_state, &voter_ids, 1);
         assert_eq!(wm, Some(5));
+    }
+
+    #[test]
+    fn test_backoff_cap_is_test_budget_safe() {
+        // Regression pin for the original test-timing race that
+        // surfaced in PR #61: with EC_BACKOFF_CAP == 60s and a 60s
+        // wait-budget on the caller side, a single transient send
+        // failure looked like a permanent stall.  10s gives us a
+        // comfortable margin under realistic test budgets while still
+        // compressing the retry rate for genuinely unreachable peers.
+        assert!(
+            EC_BACKOFF_CAP <= Duration::from_secs(10),
+            "EC_BACKOFF_CAP must stay <= 10s so test budgets clear it; \
+             see nexi-lab/nexus-vfs#64"
+        );
     }
 
     #[test]
