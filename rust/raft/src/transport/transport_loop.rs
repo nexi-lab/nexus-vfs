@@ -81,10 +81,23 @@ const RAFT_SEND_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 
 /// Timeout for a single EC replication send.
 ///
-/// EC replication is background data movement; it must not stall the transport
-/// loop that drives Raft ticks and elections. Unreachable peers are retried by
-/// the per-peer backoff below.
-const EC_SEND_TIMEOUT: StdDuration = StdDuration::from_millis(250);
+/// EC replication is background data movement; it must not stall the
+/// transport loop that drives Raft ticks and elections.  Unreachable
+/// peers are retried by the per-peer backoff below.
+///
+/// Sized for a cold gRPC client first-connect: `client_pool.get`
+/// performs a tonic/H2 handshake (TLS negotiation when enabled, DNS
+/// resolution, and on Tailscale a DERP warm-up) before the EC
+/// replication call itself can even start.  Over a cross-machine
+/// Tailscale path the round-trip on a freshly-minted channel
+/// routinely sits in the 300-700 ms band, well above the previous
+/// 250 ms budget; one spurious timeout would put the peer into the
+/// backoff loop even though the link was fine.  2 s gives the cold
+/// path adequate room while staying within tonic's H2 keep-alive
+/// window so it cannot mask genuine peer unreachability — the keep-
+/// alive will surface a dead peer on its own time scale and the
+/// per-peer backoff still bounds the retry rate.
+const EC_SEND_TIMEOUT: StdDuration = StdDuration::from_secs(2);
 
 /// Maximum entries to send per peer per EC replication cycle.
 /// Caps memory and prevents the tonic request timeout from being exceeded
