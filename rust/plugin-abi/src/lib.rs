@@ -347,6 +347,20 @@ pub mod symbols {
     /// `PluginResult::NotFound` if the path doesn't exist,
     /// `PluginResult::Internal` on I/O failure.
     pub const DRIVER_DELETE_FILE: &str = "nexus_driver_delete_file";
+    /// `fn(drv, path) -> i32`
+    ///
+    /// **Optional.**  Sister of `DRIVER_DELETE_FILE` for directories
+    /// — removes the backend directory at `path`.  Drivers that
+    /// cannot meaningfully rmdir (virtual-namespace API connectors,
+    /// CAS-only stores) skip the symbol; the kernel then falls back
+    /// to the `ObjectStore::rmdir` trait default of `NotSupported`.
+    /// When present and combined with the `sys_stat` backend.stat
+    /// fallback (driver_stat), `sys_rmdir` clears both the metastore
+    /// row AND the host fs directory in lockstep — without this,
+    /// `rm -rf` on a driver-backed mount removes the metastore entry
+    /// but the now-orphan host fs directory keeps surfacing through
+    /// `sys_stat`'s backend fallback.
+    pub const DRIVER_RMDIR: &str = "nexus_driver_rmdir";
     /// `fn(drv, path, out_buf, out_len) -> i32`
     ///
     /// **Optional.**  Point-lookup metadata for a single path.
@@ -437,6 +451,11 @@ pub type DriverReaddirFn = unsafe extern "C" fn(
 /// Type of the `nexus_driver_delete_file` symbol.  See
 /// [`symbols::DRIVER_DELETE_FILE`] for the contract.
 pub type DriverDeleteFileFn = unsafe extern "C" fn(drv: *mut c_void, path: *const c_char) -> i32;
+
+/// Type of the `nexus_driver_rmdir` symbol.  Same shape as
+/// [`DriverDeleteFileFn`] — single-path side effect.  See
+/// [`symbols::DRIVER_RMDIR`] for the contract.
+pub type DriverRmdirFn = unsafe extern "C" fn(drv: *mut c_void, path: *const c_char) -> i32;
 
 /// Type of the `nexus_driver_stat` symbol.  See
 /// [`symbols::DRIVER_STAT`] for the wire-format contract.
@@ -604,6 +623,7 @@ macro_rules! declare_driver_plugin {
         write: $write:expr,
         readdir: $readdir:expr
         $(, delete_file: $delete_file:expr)?
+        $(, rmdir: $rmdir:expr)?
         $(, stat: $stat:expr)?
         $(,)?
     }) => {
@@ -737,6 +757,25 @@ macro_rules! declare_driver_plugin {
                 };
                 let delete_fn: fn(&$ty, &str) -> Result<(), i32> = $delete_file;
                 match delete_fn(drv, path) {
+                    Ok(()) => 0,
+                    Err(code) => code,
+                }
+            }
+        )?
+
+        $(
+            #[no_mangle]
+            pub unsafe extern "C" fn nexus_driver_rmdir(
+                drv: *mut std::os::raw::c_void,
+                path: *const std::ffi::c_char,
+            ) -> i32 {
+                let drv = &*(drv as *const $ty);
+                let path = match std::ffi::CStr::from_ptr(path).to_str() {
+                    Ok(s) => s,
+                    Err(_) => return -2,
+                };
+                let rmdir_fn: fn(&$ty, &str) -> Result<(), i32> = $rmdir;
+                match rmdir_fn(drv, path) {
                     Ok(()) => 0,
                     Err(code) => code,
                 }
