@@ -35,7 +35,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
-use tokio::task::JoinSet;
 
 use std::time::Duration as StdDuration;
 
@@ -53,10 +52,32 @@ struct TransportFailure {
     is_snapshot: bool,
 }
 
+/// Outcome of an EC replication attempt — surfaced back from a spawned
+/// send task to the driver loop so `ec_peer_state` can be updated
+/// without taking a lock across `await` points.  Mirrors the
+/// `TransportFailure` pattern: per-peer state lives only on the
+/// run-loop side and is mutated only via drained channel events.
+#[derive(Debug)]
+enum EcCompletion {
+    Acked { peer_id: u64, applied_up_to: u64 },
+    Failed { peer_id: u64, error: String },
+}
+
 /// Base backoff interval for EC replication retries.
 const EC_BACKOFF_BASE: Duration = Duration::from_millis(100);
 /// Maximum backoff interval (cap) for EC replication retries.
-const EC_BACKOFF_CAP: Duration = Duration::from_secs(60);
+///
+/// The cap and the default `wait_nodes_caught_up` test budget used to
+/// match exactly at 60 s — once a peer hit the cap the next retry was
+/// scheduled past every test's timeout, so a single transient send
+/// failure looked like a permanent stall (nexi-lab/nexus-vfs#64).
+/// 10 s bounds the at-cap latency well under those budgets while
+/// still letting genuinely-unreachable peers compress their retry
+/// rate.  Recovery faster than 10 s is handled by the at-cap reset
+/// path in `replicate_ec_entries` — fresh WAL entries arriving past a
+/// stalled peer's `acked_seq` reset `next_attempt` to `now` so the
+/// next tick probes immediately.
+const EC_BACKOFF_CAP: Duration = Duration::from_secs(10);
 
 /// Timeout for individual Raft consensus message sends.
 ///
@@ -81,10 +102,23 @@ const RAFT_SEND_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 
 /// Timeout for a single EC replication send.
 ///
-/// EC replication is background data movement; it must not stall the transport
-/// loop that drives Raft ticks and elections. Unreachable peers are retried by
-/// the per-peer backoff below.
-const EC_SEND_TIMEOUT: StdDuration = StdDuration::from_millis(250);
+/// EC replication is background data movement; it must not stall the
+/// transport loop that drives Raft ticks and elections.  Unreachable
+/// peers are retried by the per-peer backoff below.
+///
+/// Sized for a cold gRPC client first-connect: `client_pool.get`
+/// performs a tonic/H2 handshake (TLS negotiation when enabled, DNS
+/// resolution, and on Tailscale a DERP warm-up) before the EC
+/// replication call itself can even start.  Over a cross-machine
+/// Tailscale path the round-trip on a freshly-minted channel
+/// routinely sits in the 300-700 ms band, well above the previous
+/// 250 ms budget; one spurious timeout would put the peer into the
+/// backoff loop even though the link was fine.  2 s gives the cold
+/// path adequate room while staying within tonic's H2 keep-alive
+/// window so it cannot mask genuine peer unreachability — the keep-
+/// alive will surface a dead peer on its own time scale and the
+/// per-peer backoff still bounds the retry rate.
+const EC_SEND_TIMEOUT: StdDuration = StdDuration::from_secs(2);
 
 /// Maximum entries to send per peer per EC replication cycle.
 /// Caps memory and prevents the tonic request timeout from being exceeded
@@ -101,6 +135,14 @@ struct PeerReplicationState {
     next_attempt: Instant,
     /// Peer has fallen behind compacted WAL — needs full snapshot to catch up.
     needs_snapshot: bool,
+    /// True between spawning a fire-and-forget EC send task and
+    /// receiving its [`EcCompletion`] back through the run-loop
+    /// channel.  Prevents the next tick from spawning a duplicate
+    /// concurrent send to the same peer — without this gate, a peer
+    /// stuck on a slow handshake would accumulate one detached task
+    /// per tick and the acks would race in arbitrary order through
+    /// the completion channel.
+    in_flight: bool,
 }
 
 impl PeerReplicationState {
@@ -110,6 +152,7 @@ impl PeerReplicationState {
             backoff: EC_BACKOFF_BASE,
             next_attempt: Instant::now(),
             needs_snapshot: false,
+            in_flight: false,
         }
     }
 
@@ -164,6 +207,15 @@ pub struct TransportLoop<S: StateMachine + 'static> {
     /// calls — without those, raft-rs's `Progress` tracker stays in
     /// `Replicate` / `Snapshot` state forever after a single failure.
     failure_rx: mpsc::UnboundedReceiver<TransportFailure>,
+    /// Sender half of the EC-completion channel.  Cloned into each
+    /// `spawn_ec_replications` task so success/failure can be reported
+    /// back without taking a lock on `ec_peer_state` across `await`
+    /// points.  Mirrors `failure_tx` — same fire-and-forget pattern.
+    ec_completion_tx: mpsc::UnboundedSender<EcCompletion>,
+    /// Receiver half of the EC-completion channel.  Drained at the top
+    /// of each [`Self::run`] iteration; ack updates land before the
+    /// next round of `spawn_ec_replications` consults `ec_peer_state`.
+    ec_completion_rx: mpsc::UnboundedReceiver<EcCompletion>,
 }
 
 impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
@@ -179,6 +231,7 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
         let tick_interval = driver.config().tick_interval;
         let node_id = driver.config().id;
         let (failure_tx, failure_rx) = mpsc::unbounded_channel();
+        let (ec_completion_tx, ec_completion_rx) = mpsc::unbounded_channel();
         Self {
             driver,
             peers,
@@ -190,6 +243,8 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
             ec_peer_state: HashMap::new(),
             failure_tx,
             failure_rx,
+            ec_completion_tx,
+            ec_completion_rx,
         }
     }
 
@@ -238,19 +293,57 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
                 }
             }
 
-            // 0. Drain any transport send failures reported by previously
-            //    spawned send tasks and forward them to raft-rs.  Must
-            //    run before `process_messages` / `advance` so the next
-            //    tick's outgoing-message set reflects the updated
-            //    `Progress` state (peer in Probe rather than stuck in
-            //    Replicate / Snapshot).  Cheap: non-blocking try_recv
-            //    drain, returns immediately when the channel is empty
-            //    (the steady-state happy path).
+            // 0a. Drain any transport send failures reported by previously
+            //     spawned send tasks and forward them to raft-rs.  Must
+            //     run before `process_messages` / `advance` so the next
+            //     tick's outgoing-message set reflects the updated
+            //     `Progress` state (peer in Probe rather than stuck in
+            //     Replicate / Snapshot).  Cheap: non-blocking try_recv
+            //     drain, returns immediately when the channel is empty
+            //     (the steady-state happy path).
             while let Ok(failure) = self.failure_rx.try_recv() {
                 self.driver.report_unreachable(failure.peer_id);
                 if failure.is_snapshot {
                     self.driver
                         .report_snapshot(failure.peer_id, raft::SnapshotStatus::Failure);
+                }
+            }
+
+            // 0b. Drain EC replication completions from previously
+            //     spawned send tasks.  Must run before
+            //     `spawn_ec_replications` below so the next round of
+            //     peer scheduling sees up-to-date `acked_seq` /
+            //     `backoff` / `in_flight` state.  Cheap non-blocking
+            //     drain — same pattern as the failure drain above.
+            while let Ok(completion) = self.ec_completion_rx.try_recv() {
+                match completion {
+                    EcCompletion::Acked {
+                        peer_id,
+                        applied_up_to,
+                    } => {
+                        if let Some(state) = self.ec_peer_state.get_mut(&peer_id) {
+                            state.in_flight = false;
+                            state.acked_seq = state.acked_seq.max(applied_up_to);
+                            state.reset_backoff();
+                            tracing::debug!(
+                                peer = peer_id,
+                                applied_up_to,
+                                "EC entries replicated to peer"
+                            );
+                        }
+                    }
+                    EcCompletion::Failed { peer_id, error } => {
+                        if let Some(state) = self.ec_peer_state.get_mut(&peer_id) {
+                            state.in_flight = false;
+                            state.increase_backoff();
+                            tracing::debug!(
+                                peer = peer_id,
+                                backoff_ms = state.backoff.as_millis(),
+                                "EC replication failed: {}",
+                                error
+                            );
+                        }
+                    }
                 }
             }
 
@@ -269,8 +362,13 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
                 }
             }
 
-            // 3. EC Phase C: async replication to peers
-            self.replicate_ec_entries().await;
+            // 3. EC Phase C: fire-and-forget replication to peers.  Each
+            //    peer's send runs as a detached task; completion lands
+            //    back via `ec_completion_rx` and is drained at the top
+            //    of the next tick.  The transport loop never awaits an
+            //    EC send — raft heartbeats and elections are not held
+            //    behind a slow EC handshake.
+            self.spawn_ec_replications();
         }
     }
 
@@ -370,14 +468,28 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
     // EC Phase C: Background replication
     // =========================================================================
 
-    /// Drain unreplicated EC entries and send to peers.
+    /// Drain unreplicated EC entries and spawn fire-and-forget sends
+    /// to eligible peers.
     ///
-    /// Uses per-peer exponential backoff (base=100ms, cap=60s) to avoid
-    /// wasting resources on unreachable peers. Backoff resets on success.
+    /// Architecture mirror of [`Self::send_messages_fire_and_forget`]:
+    /// each per-peer send runs as a detached `tokio::spawn` task; the
+    /// run loop never awaits the result.  Success / failure is
+    /// reported back through [`Self::ec_completion_rx`] and drained
+    /// at the top of the next tick (the only site that mutates
+    /// `ec_peer_state`).  Raft heartbeats and elections are therefore
+    /// never blocked behind a slow EC handshake, even with
+    /// `EC_SEND_TIMEOUT` measured in seconds.
     ///
-    /// After sending, computes the majority quorum watermark and advances
-    /// the ReplicationLog so `is_committed(token)` returns "committed".
-    async fn replicate_ec_entries(&mut self) {
+    /// Per-peer exponential backoff (base=100ms, capped at
+    /// [`EC_BACKOFF_CAP`]) still rate-limits sends; `in_flight`
+    /// suppresses duplicate concurrent sends to the same peer.
+    ///
+    /// After spawning, computes the voter-majority quorum watermark
+    /// and advances the `ReplicationLog`.  The watermark uses the
+    /// `acked_seq` state as of the last completion drain (one-tick
+    /// lag), which is the correct conservative pin — we only mark
+    /// "safe to read" what we know was acked.
+    fn spawn_ec_replications(&mut self) {
         let repl_log = match self.driver.replication_log() {
             Some(log) => Arc::clone(log),
             None => return, // No replication log (witness node)
@@ -392,19 +504,33 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
             }
         };
 
-        // Get current peer snapshot (read lock, released immediately)
+        // Get current peer snapshot (read lock, released immediately).
+        // Peer-map carries voters AND learners; we replicate to both
+        // but quorum sizing must be voter-only (see `voter_ids` below).
         let peer_map = self.snapshot_peers();
         let peer_snapshot: Vec<(u64, NodeAddress)> = peer_map.into_iter().collect();
 
-        let total_voters = peer_snapshot.len() + 1; // peers + self
+        // Voter set is the raft-rs SSOT — never derive total_voters from
+        // `peer_snapshot.len() + 1`, which over-counts whenever any
+        // learner is in the peer-map.  In a 1V+1L topology that
+        // over-count required a learner ack for quorum; the learner is
+        // not part of consensus so its `acked_seq` stayed 0 in backoff
+        // and the watermark could never advance (nexi-lab/nexus-vfs#64).
+        let voter_ids = self.driver.voter_ids();
+        let total_voters = voter_ids.len();
 
-        // Single node: advance watermark immediately (no peers to replicate to)
-        if peer_snapshot.is_empty() {
+        // Single-voter cluster: self is the majority — advance watermark
+        // unilaterally.  Do NOT return early when learner peers exist:
+        // they still need EC replication so they can serve reads of
+        // already-watermarked metadata.
+        if total_voters <= 1 {
             let max_seq = repl_log.max_seq();
             if max_seq > 1 {
                 let _ = repl_log.advance_watermark(max_seq - 1);
             }
-            return;
+            if peer_snapshot.is_empty() {
+                return;
+            }
         }
 
         // Nothing to replicate
@@ -428,6 +554,15 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
                 .ec_peer_state
                 .entry(*peer_id)
                 .or_insert_with(PeerReplicationState::new);
+
+            // Skip if a previous send is still in flight — its
+            // completion will land via `ec_completion_rx` and update
+            // `acked_seq` / `backoff` before the next tick reaches
+            // here.  Without this gate, a peer stuck on a slow
+            // handshake would accumulate one detached task per tick.
+            if state.in_flight {
+                continue;
+            }
 
             // Skip if in backoff period
             if now < state.next_attempt {
@@ -496,74 +631,61 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
             });
         }
 
-        // Fan out EC replication sends in parallel
-        if !tasks.is_empty() {
-            let mut join_set: JoinSet<(u64, std::result::Result<u64, String>)> = JoinSet::new();
-
-            for task in tasks {
-                let client_pool = self.client_pool.clone();
-                let zone_id = self.zone_id.clone();
-                let node_id = self.node_id;
-
-                join_set.spawn(async move {
-                    let send = send_ec_entries(
-                        &client_pool,
-                        &task.peer_addr,
-                        zone_id,
-                        task.entries,
-                        node_id,
-                    );
-                    match tokio::time::timeout(EC_SEND_TIMEOUT, send).await {
-                        Ok(Ok(applied_up_to)) => (task.peer_id, Ok(applied_up_to)),
-                        Ok(Err(e)) => (task.peer_id, Err(e)),
-                        Err(_) => (
-                            task.peer_id,
-                            Err(format!(
-                                "EC replication timed out after {:?}",
-                                EC_SEND_TIMEOUT
-                            )),
-                        ),
-                    }
-                });
+        // Fire-and-forget per-peer send tasks.  Mark each peer
+        // `in_flight = true` BEFORE spawning so the next tick (which
+        // may run before the spawn even starts work) skips a duplicate
+        // send.  Cleared in the run-loop drain when the completion
+        // arrives.
+        for task in tasks {
+            if let Some(state) = self.ec_peer_state.get_mut(&task.peer_id) {
+                state.in_flight = true;
             }
 
-            // Collect results and update per-peer state
-            while let Some(result) = join_set.join_next().await {
-                match result {
-                    Ok((peer_id, Ok(applied_up_to))) => {
-                        if let Some(state) = self.ec_peer_state.get_mut(&peer_id) {
-                            state.acked_seq = state.acked_seq.max(applied_up_to);
-                            state.reset_backoff();
-                            tracing::debug!(
-                                peer = peer_id,
-                                applied_up_to,
-                                "EC entries replicated to peer"
-                            );
-                        }
-                    }
-                    Ok((peer_id, Err(e))) => {
-                        if let Some(state) = self.ec_peer_state.get_mut(&peer_id) {
-                            state.increase_backoff();
-                            tracing::debug!(
-                                peer = peer_id,
-                                backoff_ms = state.backoff.as_millis(),
-                                "EC replication failed: {}",
-                                e
-                            );
-                        }
-                    }
-                    Err(join_err) => {
-                        tracing::error!("EC replication task panicked: {}", join_err);
-                    }
-                }
-            }
+            let client_pool = self.client_pool.clone();
+            let zone_id = self.zone_id.clone();
+            let node_id = self.node_id;
+            let completion_tx = self.ec_completion_tx.clone();
+
+            tokio::spawn(async move {
+                let send = send_ec_entries(
+                    &client_pool,
+                    &task.peer_addr,
+                    zone_id,
+                    task.entries,
+                    node_id,
+                );
+                let completion = match tokio::time::timeout(EC_SEND_TIMEOUT, send).await {
+                    Ok(Ok(applied_up_to)) => EcCompletion::Acked {
+                        peer_id: task.peer_id,
+                        applied_up_to,
+                    },
+                    Ok(Err(e)) => EcCompletion::Failed {
+                        peer_id: task.peer_id,
+                        error: e,
+                    },
+                    Err(_) => EcCompletion::Failed {
+                        peer_id: task.peer_id,
+                        error: format!("EC replication timed out after {:?}", EC_SEND_TIMEOUT),
+                    },
+                };
+                // Best-effort signal back.  Receiver drop only happens
+                // at shutdown, in which case a missed completion is
+                // harmless.
+                let _ = completion_tx.send(completion);
+            });
         }
 
-        // Compute quorum watermark and advance
-        let new_watermark = compute_ec_watermark(&self.ec_peer_state, &peer_snapshot, total_voters);
-        if let Some(wm) = new_watermark {
-            if let Err(e) = repl_log.advance_watermark(wm) {
-                tracing::error!("Failed to advance EC watermark: {}", e);
+        // Compute quorum watermark and advance.  Only voter peers count
+        // toward the quorum — learner acks are ignored here even though
+        // we still replicate to them above.  The single-voter case is
+        // handled in the unilateral fast path earlier in this function,
+        // so `compute_ec_watermark` is only meaningful for total_voters >= 2.
+        if total_voters >= 2 {
+            let new_watermark = compute_ec_watermark(&self.ec_peer_state, &voter_ids, self.node_id);
+            if let Some(wm) = new_watermark {
+                if let Err(e) = repl_log.advance_watermark(wm) {
+                    tracing::error!("Failed to advance EC watermark: {}", e);
+                }
             }
         }
 
@@ -633,26 +755,36 @@ async fn send_ec_entries(
         })
 }
 
-/// Compute the EC replication watermark based on peer acknowledgements.
+/// Compute the EC replication watermark based on voter acknowledgements.
 ///
-/// Self always counts as having applied all entries. We need `total_voters / 2`
-/// additional peer acks for a majority (integer division).
+/// `voter_ids` is the full raft voter set including self (raft-rs SSOT).
+/// Self always counts as having applied all entries; we need
+/// `voter_ids.len() / 2` additional acks from the non-self voters for a
+/// majority (integer division).  Learners are NEVER considered here —
+/// they are not part of consensus and a learner sitting in backoff
+/// would otherwise pin the watermark indefinitely
+/// (nexi-lab/nexus-vfs#64).
 ///
-/// Returns `None` if quorum cannot be reached (not enough peer acks).
+/// Returns `None` if quorum cannot be reached (not enough voter peer
+/// acks).  The single-voter case is handled by the caller and is also
+/// guarded here by returning `None` when no peer acks are needed.
 fn compute_ec_watermark(
     peer_state: &HashMap<u64, PeerReplicationState>,
-    peer_snapshot: &[(u64, NodeAddress)],
-    total_voters: usize,
+    voter_ids: &[u64],
+    self_id: u64,
 ) -> Option<u64> {
+    let total_voters = voter_ids.len();
     let needed_peer_acks = total_voters / 2; // self already counted
     if needed_peer_acks == 0 {
-        return None; // single node — handled separately
+        return None; // single voter — caller advances watermark unilaterally
     }
 
-    // Collect acked_seq for known peers
-    let mut acks: Vec<u64> = peer_snapshot
+    // Collect acked_seq for the non-self VOTER peers.  Learners in
+    // `peer_state` are skipped because they are not in `voter_ids`.
+    let mut acks: Vec<u64> = voter_ids
         .iter()
-        .filter_map(|(id, _)| peer_state.get(id).map(|s| s.acked_seq))
+        .filter(|id| **id != self_id)
+        .filter_map(|id| peer_state.get(id).map(|s| s.acked_seq))
         .collect();
 
     // Sort descending: highest acks first
@@ -667,83 +799,111 @@ fn compute_ec_watermark(
 mod tests {
     use super::*;
 
+    fn mk_peer_state(acked_seq: u64) -> PeerReplicationState {
+        PeerReplicationState {
+            acked_seq,
+            backoff: EC_BACKOFF_BASE,
+            next_attempt: Instant::now(),
+            needs_snapshot: false,
+            in_flight: false,
+        }
+    }
+
     #[test]
-    fn test_compute_ec_watermark_3_nodes() {
-        // 3 nodes: self + 2 peers. Need 1 peer ack for majority.
+    fn test_compute_ec_watermark_3_voters() {
+        // 3 voters: self (1) + voter peers 2, 3. Need 1 peer ack for majority.
         let mut peer_state = HashMap::new();
-        peer_state.insert(
-            2,
-            PeerReplicationState {
-                acked_seq: 5,
-                backoff: EC_BACKOFF_BASE,
-                next_attempt: Instant::now(),
-                needs_snapshot: false,
-            },
-        );
-        peer_state.insert(
-            3,
-            PeerReplicationState {
-                acked_seq: 3,
-                backoff: EC_BACKOFF_BASE,
-                next_attempt: Instant::now(),
-                needs_snapshot: false,
-            },
-        );
+        peer_state.insert(2, mk_peer_state(5));
+        peer_state.insert(3, mk_peer_state(3));
 
-        let addr = NodeAddress::new(0, "");
-        let peers = vec![(2, addr.clone()), (3, addr)];
+        let voter_ids = vec![1, 2, 3];
 
-        // total_voters = 3 (self + 2 peers), needed = 3/2 = 1
+        // total_voters = 3, needed_peer_acks = 3/2 = 1
         // sorted acks desc: [5, 3], take index 0 = 5
-        let wm = compute_ec_watermark(&peer_state, &peers, 3);
+        let wm = compute_ec_watermark(&peer_state, &voter_ids, 1);
         assert_eq!(wm, Some(5));
     }
 
     #[test]
-    fn test_compute_ec_watermark_5_nodes() {
-        // 5 nodes: self + 4 peers. Need 2 peer acks for majority.
+    fn test_compute_ec_watermark_5_voters() {
+        // 5 voters: self (1) + voter peers 2..5. Need 2 peer acks.
         let mut peer_state = HashMap::new();
-        let addr = NodeAddress::new(0, "");
-        let mut peers = Vec::new();
-
         for (id, ack) in [(2, 10), (3, 8), (4, 5), (5, 3)] {
-            peer_state.insert(
-                id,
-                PeerReplicationState {
-                    acked_seq: ack,
-                    backoff: EC_BACKOFF_BASE,
-                    next_attempt: Instant::now(),
-                    needs_snapshot: false,
-                },
-            );
-            peers.push((id, addr.clone()));
+            peer_state.insert(id, mk_peer_state(ack));
         }
+        let voter_ids = vec![1, 2, 3, 4, 5];
 
         // total_voters = 5, needed = 5/2 = 2
         // sorted acks desc: [10, 8, 5, 3], take index 1 = 8
-        let wm = compute_ec_watermark(&peer_state, &peers, 5);
+        let wm = compute_ec_watermark(&peer_state, &voter_ids, 1);
         assert_eq!(wm, Some(8));
     }
 
     #[test]
     fn test_compute_ec_watermark_no_acks() {
         let peer_state = HashMap::new();
-        let addr = NodeAddress::new(0, "");
-        let peers = vec![(2, addr.clone()), (3, addr)];
+        let voter_ids = vec![1, 2, 3];
 
         // No acks yet — should return None
-        let wm = compute_ec_watermark(&peer_state, &peers, 3);
+        let wm = compute_ec_watermark(&peer_state, &voter_ids, 1);
         assert_eq!(wm, None);
     }
 
     #[test]
-    fn test_compute_ec_watermark_single_node() {
+    fn test_compute_ec_watermark_single_voter() {
         let peer_state = HashMap::new();
-        let peers: Vec<(u64, NodeAddress)> = vec![];
+        let voter_ids = vec![1];
 
-        // Single node: needed = 0, returns None (handled separately in run loop)
-        let wm = compute_ec_watermark(&peer_state, &peers, 1);
+        // Single voter: needed = 0, returns None (caller advances unilaterally)
+        let wm = compute_ec_watermark(&peer_state, &voter_ids, 1);
         assert_eq!(wm, None);
+    }
+
+    #[test]
+    fn test_compute_ec_watermark_ignores_learner_acks() {
+        // 1V+1L topology — bug nexi-lab/nexus-vfs#64:
+        // self (1) is the only voter; peer 2 is a learner sitting at acked=0
+        // in backoff. Before the fix, total_voters was derived from
+        // peer_snapshot.len()+1=2 and the function required a learner ack
+        // for quorum; the watermark could never advance. After the fix,
+        // voter_ids contains only [1] so the function returns None and
+        // the caller advances the watermark unilaterally.
+        let mut peer_state = HashMap::new();
+        peer_state.insert(2, mk_peer_state(0)); // learner, never acked
+        let voter_ids = vec![1]; // only self
+
+        let wm = compute_ec_watermark(&peer_state, &voter_ids, 1);
+        assert_eq!(wm, None);
+    }
+
+    #[test]
+    fn test_compute_ec_watermark_skips_learner_in_2v1l() {
+        // 2V+1L: voters {1=self, 2}, learner {3}. needed_peer_acks = 1.
+        // Voter peer 2 has acked seq=5; learner 3 has acked seq=99.
+        // The learner's ack must NOT advance the watermark past the
+        // voter peer's ack.
+        let mut peer_state = HashMap::new();
+        peer_state.insert(2, mk_peer_state(5)); // voter
+        peer_state.insert(3, mk_peer_state(99)); // learner — must be ignored
+        let voter_ids = vec![1, 2];
+
+        let wm = compute_ec_watermark(&peer_state, &voter_ids, 1);
+        assert_eq!(wm, Some(5));
+    }
+
+    #[test]
+    fn test_backoff_cap_is_test_budget_safe() {
+        // Regression pin for the original test-timing race that
+        // surfaced in PR #61: with EC_BACKOFF_CAP == 60s and a 60s
+        // wait-budget on the caller side, a single transient send
+        // failure looked like a permanent stall.  10s gives us a
+        // comfortable margin under realistic test budgets while still
+        // compressing the retry rate for genuinely unreachable peers.
+        assert!(
+            EC_BACKOFF_CAP <= Duration::from_secs(10),
+            "EC_BACKOFF_CAP must stay <= 10s so test budgets clear it; \
+             see nexi-lab/nexus-vfs#64"
+        );
     }
 
     #[test]

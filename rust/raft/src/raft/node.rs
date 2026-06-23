@@ -1423,6 +1423,32 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         self.replication_log.as_ref()
     }
 
+    /// Snapshot of the current voter set (raft-rs SSOT).
+    ///
+    /// Returns the union of incoming and outgoing voters in the active
+    /// `JointConfig`, so during a joint-consensus transition both
+    /// configurations are reflected — the safe interpretation for
+    /// quorum sizing.  Learners are deliberately excluded: they must
+    /// never count toward an EC replication quorum.
+    ///
+    /// Cheap: a raft-rs `ProgressTracker` read; no lock, no copy
+    /// beyond a small `Vec`.  Suitable to call once per transport-loop
+    /// tick.
+    pub fn voter_ids(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self
+            .raw_node
+            .raft
+            .prs()
+            .conf()
+            .voters()
+            .ids()
+            .iter()
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
     /// Tell raft-rs that a peer became unreachable.
     ///
     /// Required by raft-rs's driver contract — when the transport
