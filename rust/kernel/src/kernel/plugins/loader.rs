@@ -341,8 +341,10 @@ pub(crate) struct DylibObjectStore {
     /// `NotSupported`, leaving the host fs directory in place
     /// (which then surfaces through the `sys_stat` backend
     /// fallback — closes the test_mkdir gap on cc-tasks-share).
-    /// Only single-dir rmdir is exposed; recursive removal stays
-    /// on the kernel side until a concrete need surfaces.
+    /// Carries the `recursive` flag through to the driver (v5);
+    /// drivers that can only do single-dir removal must surface
+    /// `NotSupported` for `recursive=true` so the kernel falls
+    /// back to its walk + per-entry delete path.
     rmdir_fn: Option<DriverRmdirFn>,
     /// Optional `nexus_driver_stat` symbol — point-lookup
     /// `{size, is_dir}` for a single path.  When present, the
@@ -549,16 +551,13 @@ impl ObjectStore for DylibObjectStore {
     }
 
     fn rmdir(&self, path: &str, recursive: bool) -> Result<(), StorageError> {
-        // Single-dir rmdir only.  Recursive removal stays on the
-        // kernel side until a concrete need surfaces — the v1
-        // driver-rmdir surface is the minimum needed to close the
-        // post-rmdir-host-fs-ghost gap that nexus#4413's
-        // `test_mkdir` pinned.
-        if recursive {
-            return Err(StorageError::NotSupported(
-                "driver plugin rmdir is non-recursive (recursive=true)",
-            ));
-        }
+        // v5 ABI passes `recursive` through to the driver; backends
+        // with a cheap bulk-remove primitive (`fs::remove_dir_all`,
+        // future S3 bulk delete) satisfy `rm -rf` in a single FFI
+        // call instead of the v4 walk + N+1 per-entry deletes that
+        // `sys_rmdir` used to fall back to.  Drivers that can only
+        // do single-dir removal surface `NotSupported` for
+        // `recursive=true` and the kernel handles the walk itself.
         let rmdir_fn = self.rmdir_fn.ok_or(StorageError::NotSupported(
             "driver plugin does not export nexus_driver_rmdir",
         ))?;
@@ -568,14 +567,14 @@ impl ObjectStore for DylibObjectStore {
                 "path contains null byte",
             ))
         })?;
-        let rc = unsafe { rmdir_fn(self.handle, path_c.as_ptr()) };
+        let rc = unsafe { rmdir_fn(self.handle, path_c.as_ptr(), recursive) };
         match rc {
             0 => Ok(()),
             rc if rc == PluginResult::NotFound as i32 => {
                 Err(StorageError::NotFound(path.to_string()))
             }
             rc => Err(StorageError::IOError(std::io::Error::other(format!(
-                "driver '{}' rmdir returned {rc}",
+                "driver '{}' rmdir(recursive={recursive}) returned {rc}",
                 self.drv_name
             )))),
         }
@@ -1223,6 +1222,104 @@ mod tests {
     fn parse_grpc_services_non_string_element_fails_loud() {
         let err = parse_grpc_services_symbol(stub_grpc_services_wrong_shape, "test").unwrap_err();
         assert!(err.contains("grpc_services JSON parse failed"));
+    }
+
+    // ── DylibObjectStore::rmdir wire-through ────────────────────────
+
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::Mutex;
+
+    static RMDIR_LAST_RECURSIVE: AtomicU8 = AtomicU8::new(0xff);
+    static RMDIR_LAST_PATH: Mutex<String> = Mutex::new(String::new());
+
+    unsafe extern "C" fn stub_rmdir_record(
+        _drv: *mut std::os::raw::c_void,
+        path: *const std::ffi::c_char,
+        recursive: bool,
+    ) -> i32 {
+        let p = std::ffi::CStr::from_ptr(path).to_str().unwrap().to_string();
+        *RMDIR_LAST_PATH.lock().unwrap() = p;
+        RMDIR_LAST_RECURSIVE.store(u8::from(recursive), Ordering::SeqCst);
+        0
+    }
+
+    unsafe extern "C" fn stub_read_noop(
+        _drv: *mut std::os::raw::c_void,
+        _path: *const std::ffi::c_char,
+        _out_buf: *mut *mut u8,
+        _out_len: *mut usize,
+    ) -> i32 {
+        -3
+    }
+    unsafe extern "C" fn stub_write_noop(
+        _drv: *mut std::os::raw::c_void,
+        _path: *const std::ffi::c_char,
+        _data: *const u8,
+        _data_len: usize,
+    ) -> i32 {
+        -3
+    }
+    unsafe extern "C" fn stub_readdir_noop(
+        _drv: *mut std::os::raw::c_void,
+        _path: *const std::ffi::c_char,
+        _out_buf: *mut *mut u8,
+        _out_len: *mut usize,
+    ) -> i32 {
+        -3
+    }
+    unsafe extern "C" fn stub_destroy_noop(_drv: *mut std::os::raw::c_void) {}
+
+    fn build_stub_store_with_rmdir(rmdir_fn: Option<DriverRmdirFn>) -> DylibObjectStore {
+        DylibObjectStore {
+            drv_name: "stub".into(),
+            // Null handle is fine — stubs ignore it.  Drop calls
+            // destroy_fn(null) which is a no-op stub.
+            handle: std::ptr::null_mut(),
+            read_fn: stub_read_noop,
+            write_fn: stub_write_noop,
+            readdir_fn: stub_readdir_noop,
+            delete_file_fn: None,
+            rmdir_fn,
+            stat_fn: None,
+            destroy_fn: stub_destroy_noop,
+        }
+    }
+
+    #[test]
+    fn dylib_rmdir_passes_recursive_flag_through_to_driver() {
+        // v5 ABI pin: when the driver exports nexus_driver_rmdir,
+        // DylibObjectStore::rmdir(_, recursive=true) reaches the
+        // symbol with recursive=true (no NotSupported short-circuit
+        // like v4 used to apply).
+        let store = build_stub_store_with_rmdir(Some(stub_rmdir_record));
+
+        store
+            .rmdir("/some/dir", true)
+            .expect("recursive rmdir must reach stub");
+        assert_eq!(RMDIR_LAST_RECURSIVE.load(Ordering::SeqCst), 1);
+        assert_eq!(*RMDIR_LAST_PATH.lock().unwrap(), "/some/dir");
+
+        store
+            .rmdir("/other/dir", false)
+            .expect("non-recursive rmdir must reach stub");
+        assert_eq!(RMDIR_LAST_RECURSIVE.load(Ordering::SeqCst), 0);
+        assert_eq!(*RMDIR_LAST_PATH.lock().unwrap(), "/other/dir");
+    }
+
+    #[test]
+    fn dylib_rmdir_without_symbol_returns_not_supported() {
+        // Sanity: drivers that omit the symbol still surface as
+        // NotSupported regardless of the recursive flag.  Lets the
+        // kernel fall back to its walk + per-entry delete path.
+        let store = build_stub_store_with_rmdir(None);
+        match store.rmdir("/x", false) {
+            Err(StorageError::NotSupported(_)) => (),
+            other => panic!("expected NotSupported, got {other:?}"),
+        }
+        match store.rmdir("/x", true) {
+            Err(StorageError::NotSupported(_)) => (),
+            other => panic!("expected NotSupported, got {other:?}"),
+        }
     }
 
     #[test]

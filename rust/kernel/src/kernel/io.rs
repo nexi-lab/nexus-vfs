@@ -563,6 +563,138 @@ impl Kernel {
             stream_next_offset: None,
         })
     }
+
+    /// Generic federation-peer dispatch.
+    ///
+    /// Iterates non-self voters of [`route.target_zone_id`] via
+    /// [`DistributedCoordinator::zone_peers`] and runs `op` against
+    /// each one with the [`FederationPeerClient`] arc + the peer
+    /// address.  The closure encodes which typed `NexusVFSService`
+    /// method to call.  Returns the first successful hit; transport
+    /// errors are logged at debug and the next peer is tried.
+    ///
+    /// Returns `None` when:
+    ///   - the route has no `target_zone_id` (plain local mount, not
+    ///     a federation peer mount — caller should not have dispatched);
+    ///   - the zone has no peers loaded yet (federation discovery
+    ///     pending — caller falls through to local not-found);
+    ///   - every peer errored or returned `Ok(None)` (no SSOT-side
+    ///     copy of the path under any voter).
+    ///
+    /// Loop-avoidance: sys_readdir's signature predates
+    /// `OperationContext`, so the helper accepts dispatch from any
+    /// syscall regardless of ctx state.  In the canonical 2-node
+    /// cc-tasks-share topology only the non-SSOT side reaches a
+    /// backend-less placeholder MountEntry — re-entry is structurally
+    /// impossible.  For pathological multi-node topologies where two
+    /// nodes both observe `backend=None` for the same path, the typed
+    /// server-side handler sets `ctx.propagates_cross_node` (see
+    /// `transport::grpc::VfsServiceImpl`) — when that wiring is
+    /// threaded into sys_readdir / sys_stat / sys_unlink (their
+    /// signatures currently lack ctx), this helper grows a guard.
+    #[inline]
+    pub(crate) fn dispatch_federation_peer<T, F>(
+        &self,
+        route: &crate::vfs_router::RouteResult,
+        op_name: &'static str,
+        peer_path: &str,
+        mut op: F,
+    ) -> Option<T>
+    where
+        F: FnMut(
+            &std::sync::Arc<dyn crate::hal::federation_peer::FederationPeerClient>,
+            &str,
+        ) -> Result<Option<T>, String>,
+    {
+        let target_zone = route.target_zone_id.as_deref()?;
+        let peers = self.distributed_coordinator().zone_peers(self, target_zone);
+        if peers.is_empty() {
+            return None;
+        }
+        let self_addr = self.self_address.read().clone();
+        let client = self.federation_peer_client_arc();
+        for peer_addr in peers {
+            if let Some(ref s) = self_addr {
+                if s == &peer_addr {
+                    continue;
+                }
+            }
+            match op(&client, &peer_addr) {
+                Ok(Some(result)) => return Some(result),
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::debug!(
+                        op = op_name,
+                        peer = %peer_addr,
+                        path = %peer_path,
+                        error = %e,
+                        "federation peer dispatch failed; trying next voter"
+                    );
+                }
+            }
+        }
+        None
+    }
+
+    /// `sys_readdir` arm of [`Self::dispatch_federation_peer`] — the
+    /// per-syscall thin wrapper that names the op and threads the
+    /// trait method.  Kept as a separate function so the caller stays
+    /// readable.
+    #[inline]
+    pub(crate) fn federation_peer_readdir(
+        &self,
+        route: &crate::vfs_router::RouteResult,
+        peer_path: &str,
+    ) -> Option<Vec<(String, u8)>> {
+        self.dispatch_federation_peer::<Vec<(String, u8)>, _>(
+            route,
+            "readdir",
+            peer_path,
+            |client, addr| {
+                // Empty result is meaningful for readdir ("dir exists
+                // but empty") — distinguish from not-found by ALWAYS
+                // returning `Some(entries)` on transport success.
+                client.list_dir(addr, peer_path).map(Some)
+            },
+        )
+    }
+
+    /// `sys_stat` arm — point-lookup metadata for a backend-less
+    /// federation mount.  The trait method returns `Ok(None)` for
+    /// not-found in-band; the dispatch helper forwards that as
+    /// "try the next peer" so a stale voter doesn't shadow a fresh
+    /// one's hit.
+    #[inline]
+    pub(crate) fn federation_peer_stat(
+        &self,
+        route: &crate::vfs_router::RouteResult,
+        peer_path: &str,
+    ) -> Option<crate::abc::object_store::BackendStat> {
+        self.dispatch_federation_peer::<crate::abc::object_store::BackendStat, _>(
+            route,
+            "stat",
+            peer_path,
+            |client, addr| client.stat(addr, peer_path),
+        )
+    }
+
+    /// `sys_unlink` arm for regular files — delegates to the SSOT
+    /// peer's `NexusVFSService.Delete`.  The peer's typed handler
+    /// runs the full unlink lifecycle (metastore delete + backend
+    /// delete_file + raft replication) so cleanup is symmetric:
+    /// metadata removed from raft for every voter, host fs row gone
+    /// from the SSOT side's LocalConnector.
+    #[inline]
+    pub(crate) fn federation_peer_delete_file(
+        &self,
+        route: &crate::vfs_router::RouteResult,
+        peer_path: &str,
+    ) -> bool {
+        self.dispatch_federation_peer::<(), _>(route, "delete_file", peer_path, |client, addr| {
+            client.delete_file(addr, peer_path).map(|()| Some(()))
+        })
+        .is_some()
+    }
 }
 
 struct WriteCommitInput<'a> {
@@ -874,9 +1006,40 @@ impl Kernel {
                     }
                 }
             }
-            // Mount has no Rust backend (Python-side connector) — caller treats
-            // as a hit=false miss.
-            None => None,
+            // Mount has no Rust backend.  Two sub-cases:
+            //
+            //   (a) Python-side connector — caller treats as a
+            //       hit=false miss (the legacy shape, preserved).
+            //
+            //   (b) Federation peer mount — `target_zone_id` is set
+            //       on the placeholder MountEntry wire_mount_core
+            //       installed; the SSOT for these bytes lives on a
+            //       peer voter.  Hand the write to that peer via
+            //       `NexusVFSService.Write` (typed) so the peer's
+            //       sys_write runs the full lifecycle: bytes to its
+            //       LocalConnector → host fs, metastore put → raft
+            //       propose → replication.  We then proceed through
+            //       this method's metastore put just like a local
+            //       hit; LWW on `modified_at` dedups against the
+            //       peer's apply.
+            //
+            //   Same loop-avoidance caveat as the sys_readdir /
+            //   sys_stat / sys_unlink hooks — for canonical 2-node
+            //   cc-tasks-share the SSOT side has `backend = Some` and
+            //   never enters this arm, so re-entry is structurally
+            //   impossible.
+            None => {
+                if input.route.target_zone_id.is_some() && input.offset == 0 {
+                    self.dispatch_federation_peer::<crate::abc::object_store::WriteResult, _>(
+                        input.route,
+                        "write",
+                        input.path,
+                        |client, addr| client.write(addr, input.path, input.content).map(Some),
+                    )
+                } else {
+                    None
+                }
+            }
         };
 
         // 6. After write -> build metadata + metastore.put + dcache update
@@ -1161,6 +1324,43 @@ impl Kernel {
                         });
                     }
                 }
+                // Federation peer dispatch — sister of sys_readdir's
+                // arm above: when the routed entry has no local
+                // backend (placeholder MountEntry shape installed by
+                // wire_mount_core for follower nodes) BUT the entry
+                // carries a `target_zone_id`, ask any non-self voter
+                // of that zone via `NexusVFSService.Stat`.  Closes the
+                // sys_stat half of the boundary leak so FUSE lookup
+                // (the gate before every cat / open / unlink) sees
+                // peer-owned entries with no Nexus-side metadata.
+                // Same shape sys_readdir uses; same loop-avoidance
+                // caveat documented on `dispatch_federation_peer`.
+                if route.backend.is_none() && route.target_zone_id.is_some() {
+                    if let Some(bs) = self.federation_peer_stat(&route, path) {
+                        return Some(StatResult {
+                            path: path.to_string(),
+                            size: if bs.is_dir { 4096 } else { bs.size },
+                            content_id: None,
+                            mime_type: if bs.is_dir {
+                                "inode/directory".to_string()
+                            } else {
+                                "application/octet-stream".to_string()
+                            },
+                            is_directory: bs.is_dir,
+                            entry_type: if bs.is_dir { DT_DIR } else { DT_REG },
+                            mode: if bs.is_dir { 0o755 } else { 0o644 },
+                            version: 0,
+                            gen: 0,
+                            zone_id: Some(route.zone_id.clone()),
+                            created_at_ms: None,
+                            modified_at_ms: None,
+                            last_writer_address: None,
+                            lock: None,
+                            link_target: None,
+                            owner_id: None,
+                        });
+                    }
+                }
                 return None;
             }
         };
@@ -1317,7 +1517,43 @@ impl Kernel {
 
             match meta {
                 Some(e) => e,
-                None => return miss(0),
+                None => {
+                    // Federation peer dispatch — sister of sys_readdir
+                    // / sys_stat hooks: when the routed entry has no
+                    // local backend (placeholder MountEntry shape
+                    // installed by wire_mount_core for follower
+                    // nodes) AND the entry carries `target_zone_id`,
+                    // the file's SSOT lives on a peer.  Hand the
+                    // delete to that peer's typed
+                    // `NexusVFSService.Delete` so its sys_unlink runs
+                    // the full lifecycle (metastore delete + backend
+                    // delete_file + raft replication).  Result is
+                    // symmetric: every voter's metastore drops the
+                    // row, the SSOT-side LocalConnector removes the
+                    // host fs entry.
+                    //
+                    // Same loop-avoidance caveat the helper documents:
+                    // sys_unlink_single has `ctx`, but the dispatch
+                    // helper doesn't gate on `propagates_cross_node`
+                    // yet — for canonical 2-node cc-tasks-share the
+                    // SSOT side has `backend = Some` and never
+                    // reaches this branch, so re-entry is structurally
+                    // impossible.
+                    if route.backend.is_none()
+                        && route.target_zone_id.is_some()
+                        && self.federation_peer_delete_file(&route, path)
+                    {
+                        return Ok(SysUnlinkResult {
+                            hit: true,
+                            entry_type: DT_REG,
+                            post_hook_needed: self.delete_hook_count.load(Ordering::Relaxed) > 0,
+                            path: path.to_string(),
+                            content_id: None,
+                            size: 0,
+                        });
+                    }
+                    return miss(0);
+                }
             }
         };
 
@@ -3159,6 +3395,31 @@ impl Kernel {
                 let child_path = format!("{}/{}", parent_for_join, clean);
                 seen.entry(child_path)
                     .or_insert((etype, Some(route.zone_id.clone())));
+            }
+        } else if route.backend.is_none() && route.target_zone_id.is_some() {
+            // Federation peer dispatch: no local backend for this
+            // mount, but the routing entry's `target_zone_id` says the
+            // SSOT lives on a peer.  Pick any non-self voter and call
+            // `NexusVFSService.Readdir` against it.  Same dispatch
+            // helper the sys_stat / sys_unlink hooks use — single
+            // SSOT for "iterate non-self voters, break on first hit".
+            // For cc-tasks-share (Mac=SSOT with LocalConnector,
+            // Win=client without) the SSOT side never reaches this
+            // branch — backend is Some on Mac — so no loop is
+            // possible in the canonical 2-node topology.
+            if let Some(entries) = self.federation_peer_readdir(&route, parent_path) {
+                for (peer_path, etype) in entries {
+                    // Peer returns absolute peer paths; rebase to the
+                    // local global namespace by stripping the peer's
+                    // mount root and re-prepending `parent_for_join`.
+                    let basename = peer_path.rsplit('/').next().unwrap_or(&peer_path);
+                    if basename.is_empty() {
+                        continue;
+                    }
+                    let child_path = format!("{}/{}", parent_for_join, basename);
+                    seen.entry(child_path)
+                        .or_insert((etype, Some(route.zone_id.clone())));
+                }
             }
         }
 

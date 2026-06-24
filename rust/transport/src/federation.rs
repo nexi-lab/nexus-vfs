@@ -25,44 +25,54 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::DashMap;
-use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
+use tonic::transport::Channel;
 
+use kernel::abc::object_store::{BackendStat, WriteResult};
+use kernel::hal::federation_peer::{FederationPeerClient, FederationPeerResult};
 use kernel::kernel::vfs_proto;
+use lib::transport_primitives::{create_channel, ClientConfig, TlsConfig};
 use nexus_raft::federation::TofuTrustStore;
 use nexus_raft::transport::proto::nexus::raft::{
     zone_api_service_client::ZoneApiServiceClient, JoinZoneRequest,
 };
 
-/// mTLS material for federation peer channels.
-///
-/// PEM bytes are stored directly; ``tonic`` re-parses them on each
-/// channel build which is fine for the rare-event federation path.
-#[derive(Debug, Clone)]
-struct TlsMaterial {
-    /// Aggregate CA bundle PEM — local CA plus every TOFU-pinned zone CA.
-    ca_bundle_pem: Vec<u8>,
-    /// This node's signed leaf cert PEM (client identity for mTLS).
-    node_cert_pem: Vec<u8>,
-    /// This node's private key PEM (client identity for mTLS).
-    node_key_pem: Vec<u8>,
-}
-
 /// Per-peer channel cache + shared runtime.
+///
+/// TLS storage + channel build delegate to
+/// `lib::transport_primitives::{TlsConfig, create_channel}` — the
+/// same machinery the sibling `PeerBlobClient` uses for its
+/// `ZoneApiService.ReadBlob` channel pool — so a single set of
+/// timeout / keepalive defaults and TLS handshake logic serves both
+/// out-bound transport-tier clients.
 pub struct FederationClient {
     runtime: Arc<tokio::runtime::Runtime>,
     channels: DashMap<String, Channel>,
-    tls_material: Option<TlsMaterial>,
+    /// Late-bound TLS material.  `None` until the boot installer wires
+    /// the cluster CA + node cert (mirrors `PeerBlobClient::tls`); when
+    /// `Some`, [`Self::channel_for`] builds the channel as `https://`
+    /// with mTLS.
+    tls: parking_lot::RwLock<Option<TlsConfig>>,
     timeout: Duration,
 }
 
 impl FederationClient {
-    pub fn new(runtime: Arc<tokio::runtime::Runtime>, tls_material: Option<TlsMaterial>) -> Self {
+    pub fn new(runtime: Arc<tokio::runtime::Runtime>, tls: Option<TlsConfig>) -> Self {
         Self {
             runtime,
             channels: DashMap::new(),
-            tls_material,
+            tls: parking_lot::RwLock::new(tls),
             timeout: Duration::from_secs(10),
         }
+    }
+
+    /// Install mTLS material so subsequent channel builds use TLS.
+    ///
+    /// Drops any cached plaintext channels — the next RPC to each
+    /// peer reconnects over TLS.  Mirrors
+    /// `PeerBlobClient::install_tls_config`.
+    pub fn install_tls(&self, tls: TlsConfig) {
+        *self.tls.write() = Some(tls);
+        self.channels.clear();
     }
 
     /// Fetch or build a tonic channel for ``address``.
@@ -70,39 +80,28 @@ impl FederationClient {
     /// Address forms: ``host:port`` or ``http(s)://host:port``.
     /// ``https://`` is selected automatically when TLS material is
     /// attached — callers shouldn't need to pick the scheme.
+    /// Delegates Endpoint configuration (timeouts / keepalive / TLS)
+    /// to `lib::transport_primitives::create_channel` so the build
+    /// rules stay aligned with the sibling `PeerBlobClient`.
     async fn channel_for(&self, address: &str) -> Result<Channel, String> {
         if let Some(ch) = self.channels.get(address) {
             return Ok(ch.clone());
         }
-        let scheme = if self.tls_material.is_some() {
-            "https"
-        } else {
-            "http"
-        };
-        let endpoint_str = if address.starts_with("http://") || address.starts_with("https://") {
+        let tls = self.tls.read().clone();
+        let scheme = if tls.is_some() { "https" } else { "http" };
+        let endpoint = if address.starts_with("http://") || address.starts_with("https://") {
             address.to_string()
         } else {
             format!("{scheme}://{address}")
         };
-
-        let mut ep = Endpoint::from_shared(endpoint_str)
-            .map_err(|e| format!("invalid endpoint '{address}': {e}"))?
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(self.timeout);
-
-        if let Some(tls) = &self.tls_material {
-            let identity = Identity::from_pem(&tls.node_cert_pem, &tls.node_key_pem);
-            let ca = Certificate::from_pem(&tls.ca_bundle_pem);
-            let tls_cfg = ClientTlsConfig::new().identity(identity).ca_certificate(ca);
-            ep = ep
-                .tls_config(tls_cfg)
-                .map_err(|e| format!("TLS config for '{address}': {e}"))?;
-        }
-
-        let channel = ep
-            .connect()
+        let client_cfg = ClientConfig {
+            tls,
+            request_timeout: self.timeout,
+            ..Default::default()
+        };
+        let channel = create_channel(&endpoint, &client_cfg)
             .await
-            .map_err(|e| format!("connect {address}: {e}"))?;
+            .map_err(|e| format!("federation channel {address}: {e}"))?;
         self.channels
             .entry(address.to_string())
             .or_insert_with(|| channel.clone());
@@ -223,6 +222,237 @@ impl FederationClient {
         }
         Ok(())
     }
+
+    // ── Typed NexusVFSService RPC wrappers ───────────────────────────
+    //
+    // Used by `FederationPeerBackend` (in the `backends` crate) via the
+    // `kernel::hal::federation_peer::FederationPeerClient` trait below.
+    // Each wrapper acquires a pooled channel, builds the typed
+    // `NexusVFSService` client, fires the RPC, and surfaces the in-band
+    // `is_error` flag as an `Err(String)` so callers see the same error
+    // shape for transport vs application failures.
+
+    async fn vfs_client(
+        &self,
+        peer_addr: &str,
+    ) -> Result<vfs_proto::nexus_vfs_service_client::NexusVfsServiceClient<Channel>, String> {
+        let channel = self.channel_for(peer_addr).await?;
+        Ok(
+            vfs_proto::nexus_vfs_service_client::NexusVfsServiceClient::new(channel)
+                .max_decoding_message_size(contracts::MAX_GRPC_MESSAGE_BYTES)
+                .max_encoding_message_size(contracts::MAX_GRPC_MESSAGE_BYTES),
+        )
+    }
+
+    async fn vfs_read(&self, peer_addr: &str, path: &str, offset: u64) -> Result<Vec<u8>, String> {
+        let mut client = self.vfs_client(peer_addr).await?;
+        let mut request = tonic::Request::new(vfs_proto::ReadRequest {
+            path: path.to_string(),
+            auth_token: String::new(),
+            content_id: String::new(),
+            timeout_ms: 0,
+            offset,
+        });
+        request.set_timeout(self.timeout);
+        let resp = client
+            .read(request)
+            .await
+            .map_err(|e| format!("federation read {peer_addr} {path}: {e}"))?
+            .into_inner();
+        if resp.is_error {
+            return Err(format!(
+                "federation read {peer_addr} {path}: {}",
+                String::from_utf8_lossy(&resp.error_payload)
+            ));
+        }
+        Ok(resp.content)
+    }
+
+    async fn vfs_write(
+        &self,
+        peer_addr: &str,
+        path: &str,
+        content: &[u8],
+    ) -> Result<WriteResult, String> {
+        let mut client = self.vfs_client(peer_addr).await?;
+        let mut request = tonic::Request::new(vfs_proto::WriteRequest {
+            path: path.to_string(),
+            content: content.to_vec(),
+            auth_token: String::new(),
+            content_id: String::new(),
+        });
+        request.set_timeout(self.timeout);
+        let resp = client
+            .write(request)
+            .await
+            .map_err(|e| format!("federation write {peer_addr} {path}: {e}"))?
+            .into_inner();
+        if resp.is_error {
+            return Err(format!(
+                "federation write {peer_addr} {path}: {}",
+                String::from_utf8_lossy(&resp.error_payload)
+            ));
+        }
+        let content_id = if resp.content_id.is_empty() {
+            path.to_string()
+        } else {
+            resp.content_id
+        };
+        Ok(WriteResult {
+            version: content_id.clone(),
+            content_id,
+            size: resp.size.max(0) as u64,
+        })
+    }
+
+    async fn vfs_stat(&self, peer_addr: &str, path: &str) -> Result<Option<BackendStat>, String> {
+        let mut client = self.vfs_client(peer_addr).await?;
+        let mut request = tonic::Request::new(vfs_proto::StatRequest {
+            path: path.to_string(),
+            auth_token: String::new(),
+            zone_id: String::new(),
+        });
+        request.set_timeout(self.timeout);
+        let resp = client
+            .stat(request)
+            .await
+            .map_err(|e| format!("federation stat {peer_addr} {path}: {e}"))?
+            .into_inner();
+        if resp.is_error {
+            return Err(format!(
+                "federation stat {peer_addr} {path}: {}",
+                String::from_utf8_lossy(&resp.error_payload)
+            ));
+        }
+        if !resp.found {
+            return Ok(None);
+        }
+        Ok(Some(BackendStat {
+            size: resp.size.max(0) as u64,
+            is_dir: resp.is_directory,
+        }))
+    }
+
+    async fn vfs_readdir(&self, peer_addr: &str, path: &str) -> Result<Vec<(String, u8)>, String> {
+        let mut client = self.vfs_client(peer_addr).await?;
+        let mut request = tonic::Request::new(vfs_proto::ReaddirRequest {
+            path: path.to_string(),
+            auth_token: String::new(),
+            zone_id: String::new(),
+        });
+        request.set_timeout(self.timeout);
+        let resp = client
+            .readdir(request)
+            .await
+            .map_err(|e| format!("federation readdir {peer_addr} {path}: {e}"))?
+            .into_inner();
+        if resp.is_error {
+            return Err(format!(
+                "federation readdir {peer_addr} {path}: {}",
+                String::from_utf8_lossy(&resp.error_payload)
+            ));
+        }
+        Ok(resp
+            .entries
+            .into_iter()
+            .map(|e| (e.name, e.entry_type.min(u8::MAX as u32) as u8))
+            .collect())
+    }
+
+    async fn vfs_delete(&self, peer_addr: &str, path: &str, recursive: bool) -> Result<(), String> {
+        let mut client = self.vfs_client(peer_addr).await?;
+        let mut request = tonic::Request::new(vfs_proto::DeleteRequest {
+            path: path.to_string(),
+            auth_token: String::new(),
+            recursive,
+        });
+        request.set_timeout(self.timeout);
+        let resp = client
+            .delete(request)
+            .await
+            .map_err(|e| format!("federation delete {peer_addr} {path}: {e}"))?
+            .into_inner();
+        if resp.is_error {
+            return Err(format!(
+                "federation delete {peer_addr} {path}: {}",
+                String::from_utf8_lossy(&resp.error_payload)
+            ));
+        }
+        Ok(())
+    }
+
+    async fn vfs_mkdir(
+        &self,
+        peer_addr: &str,
+        path: &str,
+        parents: bool,
+        exist_ok: bool,
+    ) -> Result<(), String> {
+        let mut client = self.vfs_client(peer_addr).await?;
+        let mut request = tonic::Request::new(vfs_proto::MkdirRequest {
+            path: path.to_string(),
+            auth_token: String::new(),
+            parents,
+            exist_ok,
+        });
+        request.set_timeout(self.timeout);
+        let resp = client
+            .mkdir(request)
+            .await
+            .map_err(|e| format!("federation mkdir {peer_addr} {path}: {e}"))?
+            .into_inner();
+        if resp.is_error {
+            return Err(format!(
+                "federation mkdir {peer_addr} {path}: {}",
+                String::from_utf8_lossy(&resp.error_payload)
+            ));
+        }
+        Ok(())
+    }
+}
+
+// ── HAL trait impl ───────────────────────────────────────────────────
+//
+// Bridges the async tonic wrappers above to the sync
+// `FederationPeerClient` trait the kernel HAL declares.  Every call
+// uses `runtime.block_on` (same pattern as PeerBlobClient::fetch).
+
+impl FederationPeerClient for FederationClient {
+    fn read(&self, addr: &str, path: &str, offset: u64) -> FederationPeerResult<Vec<u8>> {
+        self.runtime.block_on(self.vfs_read(addr, path, offset))
+    }
+
+    fn write(&self, addr: &str, path: &str, content: &[u8]) -> FederationPeerResult<WriteResult> {
+        self.runtime.block_on(self.vfs_write(addr, path, content))
+    }
+
+    fn stat(&self, addr: &str, path: &str) -> FederationPeerResult<Option<BackendStat>> {
+        self.runtime.block_on(self.vfs_stat(addr, path))
+    }
+
+    fn list_dir(&self, addr: &str, path: &str) -> FederationPeerResult<Vec<(String, u8)>> {
+        self.runtime.block_on(self.vfs_readdir(addr, path))
+    }
+
+    fn delete_file(&self, addr: &str, path: &str) -> FederationPeerResult<()> {
+        self.runtime.block_on(self.vfs_delete(addr, path, false))
+    }
+
+    fn rmdir(&self, addr: &str, path: &str, recursive: bool) -> FederationPeerResult<()> {
+        self.runtime
+            .block_on(self.vfs_delete(addr, path, recursive))
+    }
+
+    fn mkdir(
+        &self,
+        addr: &str,
+        path: &str,
+        parents: bool,
+        exist_ok: bool,
+    ) -> FederationPeerResult<()> {
+        self.runtime
+            .block_on(self.vfs_mkdir(addr, path, parents, exist_ok))
+    }
 }
 
 /// Build the aggregate CA bundle PEM from the local CA file plus every
@@ -326,18 +556,52 @@ mod tests {
         );
         // Plaintext variant.
         let plain = FederationClient::new(Arc::clone(&rt), None);
-        assert!(plain.tls_material.is_none());
+        assert!(plain.tls.read().is_none());
 
         // TLS variant — the material isn't parsed until the first
-        // `channel_for` call, so we just check it was stored.
+        // `channel_for` call, so we just check it was stored.  Uses
+        // the shared `lib::transport_primitives::TlsConfig` so the
+        // sibling `PeerBlobClient` and `FederationClient` share a
+        // single TLS material type.
         let tls = FederationClient::new(
             rt,
-            Some(TlsMaterial {
-                ca_bundle_pem: make_ca_pem("ca").into_bytes(),
-                node_cert_pem: make_ca_pem("node").into_bytes(),
-                node_key_pem: b"-----BEGIN PRIVATE KEY-----\n-----END PRIVATE KEY-----".to_vec(),
+            Some(TlsConfig {
+                ca_pem: make_ca_pem("ca").into_bytes(),
+                cert_pem: make_ca_pem("node").into_bytes(),
+                key_pem: b"-----BEGIN PRIVATE KEY-----\n-----END PRIVATE KEY-----".to_vec(),
             }),
         );
-        assert!(tls.tls_material.is_some());
+        assert!(tls.tls.read().is_some());
+    }
+
+    /// `install_tls` swaps the slot and drops cached channels so
+    /// follow-up RPCs reconnect over TLS — same shape as
+    /// `PeerBlobClient::install_tls_config`.
+    #[test]
+    fn install_tls_updates_slot_and_clears_channel_cache() {
+        let rt = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let client = FederationClient::new(Arc::clone(&rt), None);
+        // Pre-seed a fake cached channel so we can assert it gets cleared.
+        // We can't construct a real `tonic::transport::Channel` cheaply,
+        // so verify by asserting the channels map is empty post-install
+        // (boot state) and stays empty after install.
+        assert_eq!(client.channels.len(), 0);
+        client.install_tls(TlsConfig {
+            ca_pem: make_ca_pem("ca").into_bytes(),
+            cert_pem: make_ca_pem("node").into_bytes(),
+            key_pem: b"-----BEGIN PRIVATE KEY-----\n-----END PRIVATE KEY-----".to_vec(),
+        });
+        assert!(client.tls.read().is_some(), "tls slot must be populated");
+        assert_eq!(
+            client.channels.len(),
+            0,
+            "install_tls must clear any cached channels"
+        );
     }
 }

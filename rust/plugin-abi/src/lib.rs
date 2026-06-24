@@ -73,7 +73,20 @@ use std::os::raw::c_void;
 ///     of `NotSupported` and callers handle the absence the same
 ///     way they did pre-v4.  The cc-tasks-share LocalConnector
 ///     is the first opt-in for both.
-pub const PLUGIN_API_VERSION: u32 = 4;
+///   * v5 — [`symbols::DRIVER_RMDIR`] grows a `recursive: bool`
+///     argument so a single FFI call can delete a whole subtree
+///     when the backend has a cheap bulk-remove primitive
+///     (`fs::remove_dir_all` on PathLocalBackend, future S3-style
+///     bulk delete on object stores).  Aligns the dlopen wire-form
+///     with the `ObjectStore::rmdir(path, recursive)` trait SSOT —
+///     v4 special-cased `recursive=true` as `NotSupported` and
+///     forced the kernel to walk + N+1 single-dir deletes.
+///     **Breaking** for every driver plugin compiled against v4
+///     (only LocalConnector in-tree) — the C signature changed
+///     and the macro arm's closure now takes
+///     `(&Drv, &str, bool) -> Result<(), i32>`.  Service plugins
+///     are unaffected.
+pub const PLUGIN_API_VERSION: u32 = 5;
 
 // ── Plugin kind ─────────────────────────────────────────────────────
 
@@ -347,7 +360,7 @@ pub mod symbols {
     /// `PluginResult::NotFound` if the path doesn't exist,
     /// `PluginResult::Internal` on I/O failure.
     pub const DRIVER_DELETE_FILE: &str = "nexus_driver_delete_file";
-    /// `fn(drv, path) -> i32`
+    /// `fn(drv, path, recursive: bool) -> i32`
     ///
     /// **Optional.**  Sister of `DRIVER_DELETE_FILE` for directories
     /// — removes the backend directory at `path`.  Drivers that
@@ -360,6 +373,16 @@ pub mod symbols {
     /// `rm -rf` on a driver-backed mount removes the metastore entry
     /// but the now-orphan host fs directory keeps surfacing through
     /// `sys_stat`'s backend fallback.
+    ///
+    /// `recursive=false` removes an empty directory; `recursive=true`
+    /// removes the whole subtree (`fs::remove_dir_all` semantics).
+    /// Drivers that can only do single-dir removal MUST return
+    /// `PluginResult::NotSupported`-equivalent for `recursive=true`
+    /// so the kernel can fall back to walk + per-entry deletes.
+    /// Aligning the C signature with the `ObjectStore::rmdir(path,
+    /// recursive)` trait avoids the v4 round-trip explosion where
+    /// kernel walked every child + issued N+1 FFI calls for an
+    /// `rm -rf` that the backend could have done in one.
     pub const DRIVER_RMDIR: &str = "nexus_driver_rmdir";
     /// `fn(drv, path, out_buf, out_len) -> i32`
     ///
@@ -452,10 +475,13 @@ pub type DriverReaddirFn = unsafe extern "C" fn(
 /// [`symbols::DRIVER_DELETE_FILE`] for the contract.
 pub type DriverDeleteFileFn = unsafe extern "C" fn(drv: *mut c_void, path: *const c_char) -> i32;
 
-/// Type of the `nexus_driver_rmdir` symbol.  Same shape as
-/// [`DriverDeleteFileFn`] — single-path side effect.  See
-/// [`symbols::DRIVER_RMDIR`] for the contract.
-pub type DriverRmdirFn = unsafe extern "C" fn(drv: *mut c_void, path: *const c_char) -> i32;
+/// Type of the `nexus_driver_rmdir` symbol.  Adds a `recursive`
+/// flag on top of the `delete_file` shape so a driver with a
+/// bulk-remove primitive (e.g. `fs::remove_dir_all`) can satisfy
+/// `rm -rf` in one FFI call instead of N+1 per-entry deletes.
+/// See [`symbols::DRIVER_RMDIR`] for the contract.
+pub type DriverRmdirFn =
+    unsafe extern "C" fn(drv: *mut c_void, path: *const c_char, recursive: bool) -> i32;
 
 /// Type of the `nexus_driver_stat` symbol.  See
 /// [`symbols::DRIVER_STAT`] for the wire-format contract.
@@ -768,14 +794,15 @@ macro_rules! declare_driver_plugin {
             pub unsafe extern "C" fn nexus_driver_rmdir(
                 drv: *mut std::os::raw::c_void,
                 path: *const std::ffi::c_char,
+                recursive: bool,
             ) -> i32 {
                 let drv = &*(drv as *const $ty);
                 let path = match std::ffi::CStr::from_ptr(path).to_str() {
                     Ok(s) => s,
                     Err(_) => return -2,
                 };
-                let rmdir_fn: fn(&$ty, &str) -> Result<(), i32> = $rmdir;
-                match rmdir_fn(drv, path) {
+                let rmdir_fn: fn(&$ty, &str, bool) -> Result<(), i32> = $rmdir;
+                match rmdir_fn(drv, path, recursive) {
                     Ok(()) => 0,
                     Err(code) => code,
                 }

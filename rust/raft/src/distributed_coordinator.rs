@@ -1873,11 +1873,37 @@ fn wire_mount_core(
     // federation mount) fall through to the wire below and install
     // the federation routing as before.
     if parent_zone_id == target_zone_id {
-        tracing::debug!(
+        // Driver-mount path: the SSOT node ran `--mount-driver` and
+        // `kernel.add_mount` already registered its LocalConnector
+        // (or other ObjectStore) at `mount_path` BEFORE the DT_MOUNT
+        // row replicated.  On that node the canonical entry exists —
+        // re-installing here would clobber the live backend with a
+        // backend-less placeholder.  Detect via `vfs_router.has`
+        // and bail.
+        if vfs_router.has(mount_path, parent_zone_id) {
+            tracing::debug!(
+                parent_zone_id = %parent_zone_id,
+                mount_path = %mount_path,
+                "wire_mount_core: same-zone DT_MOUNT — driver-mount backend \
+                 already installed locally, nothing to wire"
+            );
+            return Ok(());
+        }
+
+        // Follower / non-SSOT node: install a placeholder MountEntry
+        // that routes through to the federation-peer client at io.rs
+        // dispatch time.  `backend = None` is the boundary signal
+        // (`route.backend.is_none() && route.target_zone_id.is_some()`
+        // means "this mount lives on a peer node — route through
+        // FederationPeerClient against a peer voter").  Symmetric to
+        // the existing cross-zone branch below: same shape (None
+        // backend + Some target_zone_id), same routing surface.
+        vfs_router.add_federation_mount(mount_path, parent_zone_id, None, target_zone_id, false);
+        tracing::info!(
             parent_zone_id = %parent_zone_id,
             mount_path = %mount_path,
-            "wire_mount_core: same-zone DT_MOUNT — driver-mount backend \
-             stays node-local, no federation routing to install"
+            "wire_mount_core: same-zone DT_MOUNT — installed federation-peer \
+             placeholder MountEntry (no local backend present)"
         );
         return Ok(());
     }

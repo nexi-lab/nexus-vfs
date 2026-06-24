@@ -50,69 +50,15 @@ impl RemoteBackend {
 
 /// Reconstruct the absolute server path from mount point + `backend_path`.
 ///
-/// The `ObjectStore` API hands every method a single `backend_path`/`content_id`
-/// slot that the kernel fills with one of two shapes, and (for sub-path mounts)
-/// the backend is not told which:
-///
-///   * **Mount-relative route paths** — the VFS router strips the mount prefix,
-///     so a file at `/zone/shared/file.txt` arrives as `file.txt`. Every op can
-///     receive this: dir ops + `get_content_size` always do; `write_content`
-///     does on a normal `sys_write`; `read_content` does on a metastore miss
-///     (io.rs:228).
-///   * **Server content IDs** — the hub's own zone-prefixed path id (e.g.
-///     `zone/shared/file.txt`) that we persist verbatim. `read_content` gets it
-///     on a metastore hit (io.rs:345); `write_content` gets it on the
-///     federation read-repair cache-write (io.rs:455, `cache_key =
-///     entry.content_id`). It is already absolute and must NOT be prefixed.
-///
-/// So this one rule serves both: prepend the mount point UNLESS `backend_path`
-/// is already zone-prefixed on a path-component boundary (equals the mount or
-/// starts with `"<mount>/"`). Root mounts (`zone_path` `""`/`"/"`) just ensure a
-/// leading slash.
-///
-/// Issue #4273: the boundary check closes the security escape. The old code
-/// used a bare `starts_with(zone_path)` with no separator, so a crafted sibling
-/// `zone/acme2/file` under `/zone/acme` matched the `zone/acme` prefix and was
-/// emitted as `/zone/acme2/file` — escaping to a sibling subtree. With the `/`
-/// boundary, `zone/acme2/...` is treated as mount-relative and stays contained
-/// at `/zone/acme/zone/acme2/...`.
-///
-/// KNOWN LIMITATION (kernel-API level): a route path that *literally re-uses*
-/// the mount's own prefix — a real subdir at `/zone/acme/zone/acme/x`, route
-/// `zone/acme/x` — is indistinguishable from the content id `zone/acme/x`, so it
-/// is treated as already-absolute and maps to `/zone/acme/x`. This only ever
-/// aliases WITHIN the mounted subtree (never a cross-tenant escape) and is
-/// applied CONSISTENTLY across read/write/delete/rename (so a self-prefixed file
-/// is read and deleted at the same place it was written). Fully resolving it
-/// requires the kernel to signal route-vs-content-id to the backend (split the
-/// `ObjectStore` API, or skip read-repair caching for path-addressed backends);
-/// tracked as a #4273 follow-up. The normal (non-self-prefixed) case — every
-/// real file — is exact.
+/// Thin wrapper around the shared
+/// [`super::mount_path::to_mount_path`] helper — both `RemoteBackend`
+/// (this file) and `FederationPeerBackend` (sibling proxy ObjectStore)
+/// apply the SAME boundary rule when reassembling the absolute path
+/// the remote expects.  See `mount_path.rs` for the full Issue #4273
+/// rationale (mount-relative-vs-zone-rooted content id ambiguity,
+/// `/`-boundary check, known self-prefix limitation).
 fn to_server_path(zone_path: &str, backend_path: &str) -> String {
-    let bp = if backend_path.is_empty() || backend_path == "/" {
-        String::new()
-    } else if backend_path.starts_with('/') {
-        backend_path.to_string()
-    } else {
-        format!("/{backend_path}")
-    };
-    if zone_path.is_empty() || zone_path == "/" {
-        if bp.is_empty() {
-            "/".to_string()
-        } else {
-            bp
-        }
-    } else {
-        let zp = zone_path.trim_matches('/'); // "zone/acme"
-        let rel = bp.trim_start_matches('/'); // "zone/acme/file.txt" or "file.txt"
-        if rel == zp || rel.starts_with(&format!("{zp}/")) {
-            // Already zone-prefixed (a server content id) — absolute as-is.
-            format!("/{rel}")
-        } else {
-            // Mount-relative route path — prepend the mount point.
-            format!("/{zp}{bp}")
-        }
-    }
+    super::mount_path::to_mount_path(zone_path, backend_path)
 }
 
 fn parse_write_result(path: &str, result: &serde_json::Value) -> Result<WriteResult, StorageError> {
@@ -421,107 +367,26 @@ mod tests {
         );
     }
 
-    // ---- Issue #4273: sub-path mount path reconstruction ----
+    // Issue #4273 boundary rule unit tests moved to
+    // `super::mount_path::tests` — the rule is shared by the sibling
+    // `FederationPeerBackend`, so the SSOT for the boundary check
+    // lives next to the helper.  One thin sanity test below proves
+    // `to_server_path` (the wrapper) delegates with the right
+    // `zone_path` argument; the rule's full edge cases live in the
+    // shared module.
 
     #[test]
-    fn to_server_path_root_mount_passes_through() {
-        // Root mounts leave backend_path absolute (only ensure a leading slash).
-        assert_eq!(to_server_path("", "file.txt"), "/file.txt");
-        assert_eq!(to_server_path("/", "/zone/x/file.txt"), "/zone/x/file.txt");
-        assert_eq!(to_server_path("", ""), "/");
-    }
-
-    #[test]
-    fn to_server_path_subpath_prefixes_mount_relative_route() {
-        // A mount-relative route path is prepended with the mount point.
+    fn to_server_path_delegates_with_zone_path_argument() {
+        // Wrapper proves it threads `zone_path` through unchanged —
+        // boundary-rule edge cases (escape, double-prefix, root-mount,
+        // self-prefix limitation) are pinned in `mount_path::tests`.
         assert_eq!(
             to_server_path("/zone/acme", "file.txt"),
             "/zone/acme/file.txt"
         );
         assert_eq!(
-            to_server_path("/zone/acme", "sub/dir/file.txt"),
-            "/zone/acme/sub/dir/file.txt"
-        );
-        // Empty backend_path resolves to the mount root, not "/".
-        assert_eq!(to_server_path("/zone/acme", ""), "/zone/acme");
-    }
-
-    #[test]
-    fn to_server_path_subpath_contains_crafted_relative_path() {
-        // A crafted relative path that shares a textual prefix with the mount
-        // ("zone/acme" vs "zone/acme2") must NOT escape the mounted subtree.
-        // It is treated as mount-relative and stays under "/zone/acme/".
-        let out = to_server_path("/zone/acme", "zone/acme2/secret");
-        assert!(
-            out.starts_with("/zone/acme/"),
-            "crafted path escaped the mount: {out}"
-        );
-        assert_eq!(out, "/zone/acme/zone/acme2/secret");
-    }
-
-    #[test]
-    fn to_server_path_subpath_does_not_double_prefix_zone_content_id() {
-        // The hub returns (and we persist verbatim) a zone-prefixed content id.
-        // On readback it is already absolute and must NOT be prefixed again.
-        assert_eq!(
-            to_server_path("/zone/shared", "zone/shared/readback.txt"),
-            "/zone/shared/readback.txt"
-        );
-        // A leading-slash content id is also recognised, not double-prefixed.
-        assert_eq!(
-            to_server_path("/zone/shared", "/zone/shared/sub/f.txt"),
-            "/zone/shared/sub/f.txt"
-        );
-        // Exact-mount id maps to the mount root.
-        assert_eq!(
-            to_server_path("/zone/shared", "zone/shared"),
-            "/zone/shared"
-        );
-    }
-
-    #[test]
-    fn subpath_content_id_round_trips_to_same_server_path() {
-        // Invariant: write sends `server_path`; the hub echoes that path as a
-        // (slash-stripped) content id which we persist VERBATIM; readback
-        // `to_server_path(stored_id)` must land on the original `server_path`.
-        let zone = "/zone/acme";
-        for route in ["file.txt", "sub/dir/file.txt"] {
-            let server_path = to_server_path(zone, route); // what write_content sends
-            let stored = server_path.trim_start_matches('/').to_string(); // hub echo, stored as-is
-            assert_eq!(
-                to_server_path(zone, &stored),
-                server_path,
-                "round-trip mismatch for route {route}"
-            );
-        }
-    }
-
-    #[test]
-    fn read_repair_content_id_is_not_double_prefixed() {
-        // The federation read-repair cache-write (io.rs:455) hands write_content
-        // a stored content id. It is already zone-prefixed, so it must map to
-        // the same absolute path the hub wrote — NOT be doubled (which would
-        // orphan/corrupt hub data). Same rule serves read_content's hit path.
-        assert_eq!(
             to_server_path("/zone/acme", "zone/acme/file.txt"),
             "/zone/acme/file.txt"
-        );
-    }
-
-    #[test]
-    fn self_prefixed_route_aliases_consistently_known_limitation() {
-        // KNOWN LIMITATION (kernel-API level): a route path that literally
-        // re-uses the mount's own prefix is indistinguishable from a content id,
-        // so it aliases to the collapsed path. This is applied CONSISTENTLY to
-        // every op (read/write/delete/rename/stat all agree), so a self-prefixed
-        // file is read and deleted at the same place it was written, and it never
-        // escapes the mounted subtree. Pinning the behavior so a future
-        // kernel-side fix (route-vs-content-id signal) updates it deliberately.
-        let aliased = to_server_path("/zone/acme", "zone/acme/x");
-        assert_eq!(aliased, "/zone/acme/x");
-        assert!(
-            aliased.starts_with("/zone/acme"),
-            "must stay within the mount: {aliased}"
         );
     }
 }
