@@ -786,6 +786,18 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     // the dep graph; kept out of `install_with_kernel` for that reason.
     transport::peer_blob::install(kernel.as_ref());
 
+    // Outbound federation-peer client — installs a `FederationClient`
+    // over the kernel-shared tokio runtime, replacing the
+    // `NoopFederationPeerClient` default so the typed
+    // `NexusVFSService.{Read,Write,Stat,Readdir,Delete,Mkdir}`
+    // dispatch arms in `Kernel::dispatch_federation_peer` (sys_readdir
+    // / sys_stat / sys_unlink / sys_write hooks for backend-less
+    // federation MountEntries) can actually reach peer voters.
+    // Without this hook every cross-node typed dispatch falls back to
+    // the Noop error path — the symptom that surfaced as empty
+    // cross-node readdir listings in the cc-tasks-share E2E.
+    transport::federation::install(kernel.as_ref());
+
     // ── Driver-plugin mounts (§10) ───────────────────────────────────
     // Parse `--mount-driver name:zone:vfs-path:config-json` and mount
     // each entry through the kernel's normal mount surface.  Order
