@@ -93,33 +93,12 @@ impl FederationPeerBackend {
     }
 
     /// Reassemble the absolute peer path from `vfs_root` + the
-    /// mount-stripped `backend_path` the kernel hands us.  Same rules as
-    /// `RemoteBackend::to_server_path` (Issue #4273) — including the
-    /// `/`-boundary check that prevents double-prefixing a content id
-    /// that is already zone-rooted.
+    /// mount-stripped `backend_path` the kernel hands us.  Delegates
+    /// to the shared [`super::mount_path::to_mount_path`] helper —
+    /// same rule the sibling [`RemoteBackend`](super::remote) applies
+    /// against the Python hub (Issue #4273 boundary check).
     fn to_peer_path(&self, backend_path: &str) -> String {
-        let bp = if backend_path.is_empty() || backend_path == "/" {
-            String::new()
-        } else if backend_path.starts_with('/') {
-            backend_path.to_string()
-        } else {
-            format!("/{backend_path}")
-        };
-        if self.vfs_root.is_empty() || self.vfs_root == "/" {
-            if bp.is_empty() {
-                "/".to_string()
-            } else {
-                bp
-            }
-        } else {
-            let root = self.vfs_root.trim_matches('/');
-            let rel = bp.trim_start_matches('/');
-            if rel == root || rel.starts_with(&format!("{root}/")) {
-                format!("/{rel}")
-            } else {
-                format!("/{root}{bp}")
-            }
-        }
+        super::mount_path::to_mount_path(&self.vfs_root, backend_path)
     }
 }
 

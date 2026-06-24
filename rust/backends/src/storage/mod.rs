@@ -18,6 +18,8 @@ pub mod cas_local;
 pub mod federation_peer;
 #[cfg(feature = "driver-local-connector")]
 pub mod local_connector;
+#[cfg(any(feature = "driver-federation-peer", feature = "driver-remote"))]
+mod mount_path;
 #[cfg(feature = "driver-path-local")]
 pub mod path_local;
 #[cfg(feature = "driver-remote")]
