@@ -1873,38 +1873,72 @@ fn wire_mount_core(
     runtime: &tokio::runtime::Handle,
     cross_zone_mounts: &DashMap<String, Vec<CrossZoneMountTuple>>,
     parent_zone_id: &str,
-    mount_path: &str,
+    // RENAMED: the apply event delivers this in parent-zone's
+    // ZoneMetaStore-stripped form (e.g. `/cc-tasks/founder` for a
+    // row written at global `/shared/cc-tasks/founder`).  Routing
+    // entries MUST use the global form, not this one — see
+    // `global_path` derivation immediately below.  The only
+    // legitimate consumer of this zone-relative form is the
+    // `cross_zone_mounts` reverse-index bookkeeping at the end of
+    // the cross-zone branch (used by `unwire_mount_core` to find
+    // the tuple by zone-relative key when the row is deleted).
+    zone_relative_mount_path: &str,
     target_zone_id: &str,
 ) -> CoordinatorResult<()> {
     tracing::debug!(
         parent_zone_id = %parent_zone_id,
-        mount_path = %mount_path,
+        zone_relative_mount_path = %zone_relative_mount_path,
         target_zone_id = %target_zone_id,
         "wire_mount_core entered"
     );
+
+    // ── SSOT: translate to the global VFS path ONCE, up front ──────
+    //
+    // The SSOT-side `kernel.add_mount` installs its routing entry
+    // using the GLOBAL form, and federation routing recursion looks
+    // the entry up by canonicalizing the GLOBAL form against the
+    // parent zone.  So every branch below MUST install routing
+    // entries keyed by `global_path`, not by the zone-relative
+    // parameter — otherwise we install at a canonical key the
+    // consumer never queries.
+    //
+    // PR #70's original C3 same-zone branch took the zone-relative
+    // parameter as-is and installed at `/sharedzone/cc-tasks/founder`;
+    // routing looked for `/sharedzone/shared/cc-tasks/founder`;
+    // placeholder was never found on the joiner; cross-node readdir
+    // silently returned empty (cc-tasks-share E2E regression).
+    // Lifting the reconstruct here + the parameter rename above
+    // makes the form-mismatch impossible to reintroduce by reading
+    // the code casually: the un-translated parameter spells its
+    // zone-relative-ness in the name; the safe form is named
+    // `global_path`.
+    let global_path = match reconstruct_global_path(
+        cross_zone_mounts,
+        parent_zone_id,
+        zone_relative_mount_path,
+    ) {
+        Some(g) => g,
+        None => {
+            tracing::warn!(
+                parent_zone_id = %parent_zone_id,
+                zone_relative_mount_path = %zone_relative_mount_path,
+                "wire_mount_core: reconstruct_global_path returned None — \
+                 parent mount not yet in cross_zone_mounts, deferring"
+            );
+            return Ok(());
+        }
+    };
 
     // Same-zone short-circuit: when target == parent, the DT_MOUNT is
     // a driver-mount inside an already-routed zone (e.g.
     // `--mount-driver local-connector:sharedzone:/shared/cc-tasks/founder`
     // — parent path `/shared/cc-tasks` routes to sharedzone, mount
-    // target zone is also sharedzone).  Two structural reasons to
-    // exit here:
-    //
-    //   1. `add_federation_mount` below would install root_backend
-    //      as the route's backend, **overwriting** the driver-mount
-    //      backend that `kernel.add_mount` already installed on this
-    //      node when `--mount-driver` ran.  vfs_write/vfs_read then
-    //      route through the wrong backend (root's PathLocal instead
-    //      of the LocalConnector), and the host-fs SSOT property
-    //      silently breaks for every read/write under the mount.
-    //
-    //   2. There's nothing to wire: the routing already lands in
-    //      `parent_zone`'s namespace; no cross-zone redirection is
-    //      meaningful.  Followers replicating the DT_MOUNT entry
-    //      will have already populated the same driver-mount via
-    //      their own `--mount-driver` invocation (driver mounts are
-    //      per-node by construction — the backend instance carries
-    //      node-local config like `local_root`, not raft-replicable).
+    // target zone is also sharedzone).  On the SSOT node `kernel.add_mount`
+    // already registered its LocalConnector at the global path; on
+    // follower nodes we install a backend-less placeholder MountEntry
+    // so the io.rs `FederationPeerClient` dispatch (sys_readdir /
+    // sys_stat / sys_unlink / sys_write) can route through to the
+    // SSOT peer.
     //
     // Cross-zone DT_MOUNTs (e.g. /shared → sharedzone, a true
     // federation mount) fall through to the wire below and install
@@ -1912,15 +1946,14 @@ fn wire_mount_core(
     if parent_zone_id == target_zone_id {
         // Driver-mount path: the SSOT node ran `--mount-driver` and
         // `kernel.add_mount` already registered its LocalConnector
-        // (or other ObjectStore) at `mount_path` BEFORE the DT_MOUNT
-        // row replicated.  On that node the canonical entry exists —
-        // re-installing here would clobber the live backend with a
-        // backend-less placeholder.  Detect via `vfs_router.has`
-        // and bail.
-        if vfs_router.has(mount_path, parent_zone_id) {
+        // at `global_path` BEFORE the DT_MOUNT row replicated.  On
+        // that node the canonical entry exists — re-installing here
+        // would clobber the live backend with a backend-less
+        // placeholder.  Detect via `vfs_router.has` and bail.
+        if vfs_router.has(&global_path, parent_zone_id) {
             tracing::debug!(
                 parent_zone_id = %parent_zone_id,
-                mount_path = %mount_path,
+                global_path = %global_path,
                 "wire_mount_core: same-zone DT_MOUNT — driver-mount backend \
                  already installed locally, nothing to wire"
             );
@@ -1933,12 +1966,12 @@ fn wire_mount_core(
         // (`route.backend.is_none() && route.target_zone_id.is_some()`
         // means "this mount lives on a peer node — route through
         // FederationPeerClient against a peer voter").  Symmetric to
-        // the existing cross-zone branch below: same shape (None
-        // backend + Some target_zone_id), same routing surface.
-        vfs_router.add_federation_mount(mount_path, parent_zone_id, None, target_zone_id, false);
+        // the cross-zone branch below: same shape (None backend +
+        // Some target_zone_id), same routing surface.
+        vfs_router.add_federation_mount(&global_path, parent_zone_id, None, target_zone_id, false);
         tracing::info!(
             parent_zone_id = %parent_zone_id,
-            mount_path = %mount_path,
+            global_path = %global_path,
             "wire_mount_core: same-zone DT_MOUNT — installed federation-peer \
              placeholder MountEntry (no local backend present)"
         );
@@ -1952,19 +1985,6 @@ fn wire_mount_core(
             "wire_mount: target zone not loaded locally — deferring"
         );
         return Ok(());
-    };
-
-    // 2. Reconstruct the global VFS path.
-    let global_path = match reconstruct_global_path(cross_zone_mounts, parent_zone_id, mount_path) {
-        Some(g) => g,
-        None => {
-            tracing::warn!(
-                parent_zone_id = %parent_zone_id,
-                mount_path = %mount_path,
-                "wire_mount: reconstruct_global_path returned None"
-            );
-            return Ok(());
-        }
     };
 
     // 3. Build a ZoneMetaStore rooted at global_path against the target's
@@ -1997,7 +2017,7 @@ fn wire_mount_core(
             Some(root_consensus) => {
                 tracing::info!(
                     parent_zone = %parent_zone_id,
-                    mount_path = %mount_path,
+                    global_path = %global_path,
                     "wire_mount: installing distributed locks bound to ROOT zone"
                 );
                 let kernel_state = lock_manager.advisory_state_arc();
@@ -2025,13 +2045,17 @@ fn wire_mount_core(
     // (raft/zone_meta_store.rs), so installing one here would just
     // duplicate the registration.
 
-    // 8. Update reverse index.
+    // 8. Update reverse index.  The middle field holds the
+    // ZONE-RELATIVE form so `unwire_mount_core` can find the tuple
+    // by the same form the DT_MOUNT-delete apply event delivers.
+    // This is the ONLY legitimate use of the zone-relative arg in
+    // this function — every routing call above used `global_path`.
     let mut bucket = cross_zone_mounts
         .entry(target_zone_id.to_string())
         .or_default();
     let tuple = (
         parent_zone_id.to_string(),
-        mount_path.to_string(),
+        zone_relative_mount_path.to_string(),
         global_path,
     );
     if !bucket.contains(&tuple) {
