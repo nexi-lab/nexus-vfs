@@ -1552,6 +1552,51 @@ impl Kernel {
                             size: 0,
                         });
                     }
+                    // SSOT-local fall-through for backend-only files:
+                    // when the local backend is present BUT metastore
+                    // has no entry, the file may exist as a host-fs-only
+                    // write (e.g. Mac CC writing directly to
+                    // ~/.claude/tasks/<n>.json without going through
+                    // Nexus).  Without this fall-through, sys_unlink
+                    // would treat it as miss(0), backend.delete_file
+                    // never fires, and the host fs file persists as
+                    // an orphan.  Symmetric with sys_stat / sys_readdir
+                    // which already merge backend results when the
+                    // metastore has nothing.
+                    if let Some(backend) = route.backend.as_ref() {
+                        match backend.delete_file(&route.backend_path) {
+                            Ok(()) => {
+                                return Ok(SysUnlinkResult {
+                                    hit: true,
+                                    entry_type: DT_REG,
+                                    post_hook_needed: self
+                                        .delete_hook_count
+                                        .load(Ordering::Relaxed)
+                                        > 0,
+                                    path: path.to_string(),
+                                    content_id: None,
+                                    size: 0,
+                                });
+                            }
+                            Err(crate::abc::object_store::StorageError::NotFound(_)) => {
+                                // backend agrees the file isn't there
+                                // — genuine miss, fall through.
+                            }
+                            Err(crate::abc::object_store::StorageError::NotSupported(_)) => {
+                                // backend doesn't support delete_file
+                                // (CAS / remote / api connectors) —
+                                // legacy miss behaviour.
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    path = %path,
+                                    error = ?e,
+                                    "sys_unlink: backend.delete_file failed on metastore-miss \
+                                     fall-through; surfacing as miss",
+                                );
+                            }
+                        }
+                    }
                     return miss(0);
                 }
             }
