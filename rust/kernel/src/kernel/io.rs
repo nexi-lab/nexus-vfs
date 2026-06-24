@@ -1637,6 +1637,36 @@ impl Kernel {
             _ => {}
         }
 
+        // 5a. Federation-peer mount short-circuit: when this mount
+        // has no local backend (placeholder MountEntry installed by
+        // wire_mount_core on the non-SSOT node) but carries a
+        // `target_zone_id`, the SSOT for these bytes lives on a peer
+        // voter.  Defer the ENTIRE unlink to that peer's typed
+        // `NexusVFSService.Delete` — peer's sys_unlink runs the full
+        // lifecycle (metastore delete + LocalConnector.delete_file +
+        // raft replicates the metastore delete back to us).
+        //
+        // Order matters: dispatch BEFORE the local metastore delete.
+        // If we deleted locally first, raft would replicate the
+        // delete to the peer.  When our dispatch RPC then arrived,
+        // the peer's sys_unlink would see the entry already gone
+        // (metastore miss → miss(0)), skip its backend.delete_file,
+        // and the host fs file would persist as an orphan.  Deferring
+        // entirely to the peer avoids the race and keeps the SSOT
+        // contract clean: ONE sys_unlink runs (the peer's), one
+        // metastore commit happens, one backend delete fires.
+        if route.backend.is_none() && route.target_zone_id.is_some() {
+            let ok = self.federation_peer_delete_file(&route, path);
+            return Ok(SysUnlinkResult {
+                hit: ok,
+                entry_type: entry.entry_type,
+                post_hook_needed: self.delete_hook_count.load(Ordering::Relaxed) > 0,
+                path: path.to_string(),
+                content_id: entry.content_id,
+                size: entry.size,
+            });
+        }
+
         // 5. VFS write lock (DT_REG path)
         let lock_handle =
             self.lock_manager
