@@ -1335,7 +1335,7 @@ impl Kernel {
                 // peer-owned entries with no Nexus-side metadata.
                 // Same shape sys_readdir uses; same loop-avoidance
                 // caveat documented on `dispatch_federation_peer`.
-                if route.backend.is_none() && route.target_zone_id.is_some() {
+                if route.is_federation_peer_mount() {
                     if let Some(bs) = self.federation_peer_stat(&route, path) {
                         return Some(StatResult {
                             path: path.to_string(),
@@ -1539,8 +1539,7 @@ impl Kernel {
                     // SSOT side has `backend = Some` and never
                     // reaches this branch, so re-entry is structurally
                     // impossible.
-                    if route.backend.is_none()
-                        && route.target_zone_id.is_some()
+                    if route.is_federation_peer_mount()
                         && self.federation_peer_delete_file(&route, path)
                     {
                         return Ok(SysUnlinkResult {
@@ -1700,7 +1699,7 @@ impl Kernel {
         // entirely to the peer avoids the race and keeps the SSOT
         // contract clean: ONE sys_unlink runs (the peer's), one
         // metastore commit happens, one backend delete fires.
-        if route.backend.is_none() && route.target_zone_id.is_some() {
+        if route.is_federation_peer_mount() {
             let ok = self.federation_peer_delete_file(&route, path);
             return Ok(SysUnlinkResult {
                 hit: ok,
@@ -1743,25 +1742,14 @@ impl Kernel {
         // and orphaned bytes are harmless pending GC. CAS backends do not track
         // content by path; their GC handles unreferenced blobs independently.
         //
-        // Federation-peer dispatch arm: when this mount has no local
-        // backend (placeholder MountEntry installed by wire_mount_core
-        // on the non-SSOT node) but carries a `target_zone_id`, the
-        // SSOT for these bytes lives on a peer voter.  Hand the
-        // backend-side delete to that peer's typed
-        // `NexusVFSService.Delete` so its sys_unlink runs the full
-        // lifecycle — its own LocalConnector removes the host fs row.
-        // Without this, metastore delete propagates via raft but
-        // the SSOT-side host fs file persists (orphan), and a future
-        // `cc tasks list` re-surfaces the entry the operator just
-        // rm'd.  This was the cc-tasks-share E2E regression in
-        // `test_joiner_fuse_unlink_propagates_to_founder_host_fs`
-        // after PR #75 made joiner's metastore lookup HIT (so the
-        // metastore-miss federation_peer dispatch arm earlier in
-        // this function no longer fires for these paths).
+        // No federation-peer fallback here: the
+        // `is_federation_peer_mount()` short-circuit earlier in this
+        // function already deferred the entire unlink to the peer and
+        // returned, so any path that reaches step 7 has either a local
+        // backend or no peer dispatch is appropriate (e.g. a connector
+        // mount with no Rust backend and no target_zone_id).
         if let Some(backend) = route.backend.as_ref() {
             let _ = backend.delete_file(&route.backend_path);
-        } else if route.target_zone_id.is_some() {
-            self.federation_peer_delete_file(&route, path);
         }
 
         // 7b. FDT cleanup — close pre-opened fd (if any).
@@ -3488,7 +3476,7 @@ impl Kernel {
                 seen.entry(child_path)
                     .or_insert((etype, Some(route.zone_id.clone())));
             }
-        } else if route.backend.is_none() && route.target_zone_id.is_some() {
+        } else if route.is_federation_peer_mount() {
             // Federation peer dispatch: no local backend for this
             // mount, but the routing entry's `target_zone_id` says the
             // SSOT lives on a peer.  Pick any non-self voter and call

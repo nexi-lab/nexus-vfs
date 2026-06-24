@@ -193,6 +193,22 @@ impl RouteResult {
             .map(Arc::clone)
             .or_else(|| global_fallback.map(Arc::clone))
     }
+
+    /// True when this route is a federation-peer mount — i.e. the routed
+    /// MountEntry is the placeholder shape installed by
+    /// `wire_mount_core` on non-SSOT voters (no local backend) but
+    /// carries a `target_zone_id` pointing at the peer that owns the
+    /// LocalConnector for these bytes.
+    ///
+    /// io.rs federation peer dispatch sites (sys_readdir / sys_stat /
+    /// sys_unlink) gate on this exact pair; centralising the predicate
+    /// here keeps the three call sites in sync and documents the
+    /// shape ("placeholder MountEntry with target_zone_id set") as a
+    /// first-class concept rather than an ad-hoc field pair.
+    #[inline]
+    pub fn is_federation_peer_mount(&self) -> bool {
+        self.backend.is_none() && self.target_zone_id.is_some()
+    }
 }
 
 impl std::fmt::Debug for RouteResult {
