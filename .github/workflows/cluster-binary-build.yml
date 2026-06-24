@@ -21,7 +21,17 @@ jobs:
           - os: ubuntu-latest
             artifact_name: nexusd-cluster-linux-x86_64
             binary: nexusd-cluster
-            max_size_bytes: 15204352  # 14.5 MiB
+            max_size_bytes: 16252928  # 15.5 MiB — bumped to absorb PR #70/71
+                                      # cross-node typed RPC infra
+                                      # (FederationPeerClient HAL trait +
+                                      # FederationPeerBackend + generic
+                                      # dispatch_federation_peer helper +
+                                      # transport-side typed VFS RPC wrappers
+                                      # & install hook).  Genuinely new
+                                      # functionality — closes the cross-node
+                                      # sys_readdir/stat/unlink/write boundary
+                                      # leak that was the cc-tasks-list mega
+                                      # goal blocker.
           - os: macos-14
             artifact_name: nexusd-cluster-macos-arm64
             binary: nexusd-cluster
@@ -30,7 +40,8 @@ jobs:
             artifact_name: nexusd-cluster-macos-x86_64
             binary: nexusd-cluster
             target: x86_64-apple-darwin
-            max_size_bytes: 15204352  # 14.5 MiB
+            max_size_bytes: 16252928  # 15.5 MiB — same bump as linux for
+                                      # PR #70/71.  Holds the same slack %.
           - os: windows-latest
             artifact_name: nexusd-cluster-windows-x86_64
             binary: nexusd-cluster.exe
