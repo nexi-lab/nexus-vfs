@@ -171,15 +171,13 @@ impl RaftDistributedCoordinator {
 
         // Apply-cb install on every loaded zone — root, federation
         // zones from `NEXUS_FEDERATION_ZONES`, zones restored from
-        // disk after restart.
+        // disk after restart.  `install_apply_cb_for_zone` bakes the
+        // DT_MOUNT replay scan into the install (atomic "install +
+        // catch up" semantics — see its docstring) so we don't need
+        // a separate `replay_existing_mounts` call after the loop.
         for zone_id in zm.list_zones() {
             self.install_apply_cb_for_zone(kernel, &zone_id);
         }
-
-        // Replay scan — apply-cb only fires on NEW raft applies, so
-        // without this a restart leaves restored DT_MOUNTs unwired in
-        // VFSRouter / DCache.
-        self.replay_existing_mounts(kernel);
 
         // Drain the pending blob-fetcher slot stashed above and bind
         // the kernel-backed `KernelBlobFetcher` to the raft gRPC
@@ -226,13 +224,27 @@ impl RaftDistributedCoordinator {
         self.zone_manager.get()
     }
 
-    /// Install the DT_MOUNT apply-cb on `zone_id`'s consensus.  Called
-    /// from boot ([`Self::install_with_kernel`] for every loaded zone)
-    /// and from `create_zone` so every locally-loaded zone fires
-    /// `wire_mount_core` on raft-applied DT_MOUNT events — the
-    /// follower-side mechanism that keeps cross-zone routing in sync.
-    /// Idempotent — re-installation replaces the closure with an
-    /// equivalent one on the same `coherence_id`.
+    /// Install the DT_MOUNT apply-cb on `zone_id`'s consensus AND
+    /// catch up on any DT_MOUNT entries already applied to the state
+    /// machine.  Atomic "install + catch up" semantics — callers can
+    /// never forget the pairing because the function does both.
+    ///
+    /// Why both: the apply-cb only fires on FUTURE log applies, but
+    /// snapshots-from-leader (`join_cluster`) and disk-restore at
+    /// boot deliver DT_MOUNT entries that applied BEFORE the cb was
+    /// installed.  Without the catch-up scan, every cross-node
+    /// sys_readdir / sys_stat / sys_unlink / sys_write against a
+    /// snapshot-delivered federation mount silently fell through to
+    /// root.  This was the cc-tasks-share Docker E2E regression
+    /// fixed in PR #72 — originally as explicit
+    /// `replay_existing_mounts` calls in each caller, then DRY'd
+    /// into the install function so the bug is impossible to
+    /// reintroduce.
+    ///
+    /// Idempotent: the apply-cb install replaces any existing
+    /// closure on the same `coherence_id`; the replay's
+    /// `wire_mount_core` no-ops on entries whose route is already
+    /// installed (`vfs_router.has(...)` guard).
     fn install_apply_cb_for_zone(&self, kernel: &Kernel, zone_id: &str) {
         let Some(zm) = self.zm() else {
             return;
@@ -255,6 +267,19 @@ impl RaftDistributedCoordinator {
             zone_id,
             &consensus,
         );
+        // Catch up on past-applied DT_MOUNT entries.  `replay_existing_mounts`
+        // scans every loaded zone (necessary for nested federation mounts
+        // where a child needs its parent wired first — the function's
+        // topological retry loop handles that ordering).  Calling it
+        // per-zone here is redundant at boot when the loop calls us many
+        // times, but the redundancy is bounded (M zones × N entries, each
+        // wire_mount_core call is an O(1) DashMap lookup + early-out via
+        // `vfs_router.has`) and the alternative — a non-atomic
+        // "install + remember to replay" contract that join_cluster
+        // forgot — is what shipped the original regression.  SSOT
+        // alternative was rejected because per-zone replay can't
+        // satisfy the cross-zone topological retry requirement.
+        self.replay_existing_mounts(kernel);
     }
 
     /// Re-wire every DT_MOUNT entry already applied in any zone's state
@@ -1637,6 +1662,10 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
         let peers = zm.current_peer_strings();
         zm.join_zone(zone_id, peers, as_learner)
             .map_err(|e| e.to_string())?;
+        // install_apply_cb_for_zone now atomically pairs the cb
+        // install with a DT_MOUNT replay scan (see its docstring),
+        // so snapshot-delivered entries that applied before this
+        // call wire correctly without a separate replay step.
         self.install_apply_cb_for_zone(kernel, zone_id);
         Ok(())
     }
@@ -1694,6 +1723,14 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
                         self_id = self_id,
                         "join_cluster: leader committed ConfChangeV2 AddNode"
                     );
+                    // install_apply_cb_for_zone now atomically pairs
+                    // the cb install with a DT_MOUNT replay scan (see
+                    // its docstring), so the leader's snapshot-
+                    // delivered entries that applied before this call
+                    // wire correctly on the joiner without a separate
+                    // replay step.  The original cc-tasks-share E2E
+                    // regression (joiner-empty cross-node readdir)
+                    // was a missed pairing here.
                     self.install_apply_cb_for_zone(kernel, zone_id);
                     return Ok(());
                 }
