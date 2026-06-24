@@ -1638,6 +1638,14 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
         zm.join_zone(zone_id, peers, as_learner)
             .map_err(|e| e.to_string())?;
         self.install_apply_cb_for_zone(kernel, zone_id);
+        // Catch up on DT_MOUNT entries that applied to this zone's
+        // state machine before the cb was installed (snapshot install
+        // path).  Mirrors install_with_kernel's boot-time pairing of
+        // (install_apply_cb_for_zone → replay_existing_mounts) — the
+        // cb only fires on FUTURE applies, so without this replay the
+        // joiner's VFSRouter never gets the placeholder MountEntry
+        // for federation mounts already committed on the leader.
+        self.replay_existing_mounts(kernel);
         Ok(())
     }
 
@@ -1695,6 +1703,17 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
                         "join_cluster: leader committed ConfChangeV2 AddNode"
                     );
                     self.install_apply_cb_for_zone(kernel, zone_id);
+                    // Catch up on DT_MOUNT entries that the leader's
+                    // snapshot delivered before the cb was installed.
+                    // Without this replay, federation mounts already
+                    // committed on the leader never wire on the joiner —
+                    // the symptom that surfaced as joiner-empty
+                    // cross-node readdir in the cc-tasks-share E2E
+                    // (placeholder MountEntry C3 installs was never
+                    // reached because wire_mount_core was never called
+                    // on the joiner for the snapshot-applied row).
+                    // Mirrors install_with_kernel's boot-time pairing.
+                    self.replay_existing_mounts(kernel);
                     return Ok(());
                 }
                 Ok(result) => {
