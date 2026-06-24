@@ -168,6 +168,16 @@ pub struct RouteResult {
     /// that would re-probe the entry table for the same mount we just
     /// routed to.
     pub backend: Option<Arc<dyn ObjectStore>>,
+    /// Mirror of [`MountEntry::target_zone_id`].  `Some` when the routed
+    /// entry is a federation mount (cross-zone or peer-only same-zone);
+    /// `None` for plain local mounts.  Carried inline so io.rs federation
+    /// peer dispatch can detect "this route lives on a peer node" without
+    /// a second `vfs_router.get_canonical` lookup. `route.zone_id` alone
+    /// is the RESOLVED zone (target if set, caller otherwise) — it can't
+    /// distinguish "I routed into the caller's own zone" from "I routed
+    /// into a federation target that happens to equal the caller's
+    /// zone", which is the signal the placeholder MountEntry needs.
+    pub target_zone_id: Option<String>,
 }
 
 impl RouteResult {
@@ -565,6 +575,7 @@ impl VFSRouter {
                     .unwrap_or_else(|| zone_id.to_string());
                 let metastore = entry.metastore.as_ref().map(Arc::clone);
                 let backend = entry.backend.as_ref().map(Arc::clone);
+                let target_zone_id = entry.target_zone_id.clone();
                 drop(entry);
 
                 return Some(RouteResult {
@@ -575,6 +586,7 @@ impl VFSRouter {
                     is_cas,
                     metastore,
                     backend,
+                    target_zone_id,
                 });
             }
 

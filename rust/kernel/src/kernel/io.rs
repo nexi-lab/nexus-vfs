@@ -563,6 +563,66 @@ impl Kernel {
             stream_next_offset: None,
         })
     }
+
+    /// Federation peer dispatch for `sys_readdir`.
+    ///
+    /// Called when [`route.backend`] is `None` and
+    /// [`route.target_zone_id`] is `Some` — the placeholder MountEntry
+    /// shape that wire_mount_core installs on follower / non-SSOT
+    /// nodes for same-zone DT_MOUNTs.  Iterates non-self voters of
+    /// the target zone via [`DistributedCoordinator::zone_peers`] and
+    /// asks each one through
+    /// [`crate::hal::federation_peer::FederationPeerClient::list_dir`]
+    /// (typed `NexusVFSService.Readdir` RPC).  Returns one
+    /// `(peer_addr, entries)` per successful peer reply so the caller
+    /// can break on the first hit.  Failures are logged at debug.
+    ///
+    /// No loop-avoidance ctx is threaded here yet — sys_readdir's
+    /// signature predates `OperationContext`.  In the canonical
+    /// 2-node cc-tasks-share topology only the non-SSOT side hits
+    /// this branch, so re-entry is structurally impossible.
+    /// Pathological multi-node topologies that bounce through this
+    /// path are flagged as a follow-up.
+    pub(crate) fn federation_peer_readdir(
+        &self,
+        route: &crate::vfs_router::RouteResult,
+        peer_path: &str,
+    ) -> Vec<(String, Vec<(String, u8)>)> {
+        let Some(target_zone) = route.target_zone_id.as_deref() else {
+            return Vec::new();
+        };
+        let peers = self
+            .distributed_coordinator()
+            .zone_peers(self, target_zone);
+        if peers.is_empty() {
+            return Vec::new();
+        }
+        let self_addr = self.self_address.read().clone();
+        let client = self.federation_peer_client_arc();
+        let mut hits = Vec::new();
+        for peer_addr in peers {
+            if let Some(ref s) = self_addr {
+                if s == &peer_addr {
+                    continue;
+                }
+            }
+            match client.list_dir(&peer_addr, peer_path) {
+                Ok(entries) => {
+                    hits.push((peer_addr, entries));
+                    break;
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        peer = %peer_addr,
+                        path = %peer_path,
+                        error = %e,
+                        "federation_peer_readdir: peer Readdir failed"
+                    );
+                }
+            }
+        }
+        hits
+    }
 }
 
 struct WriteCommitInput<'a> {
@@ -3159,6 +3219,38 @@ impl Kernel {
                 let child_path = format!("{}/{}", parent_for_join, clean);
                 seen.entry(child_path)
                     .or_insert((etype, Some(route.zone_id.clone())));
+            }
+        } else if route.backend.is_none() && route.target_zone_id.is_some() {
+            // Federation peer dispatch: no local backend for this
+            // mount, but the routing entry's `target_zone_id` says the
+            // SSOT lives on a peer.  Pick any non-self voter and call
+            // `NexusVFSService.Readdir` against it.  Same shape the
+            // typed RPC handler uses — no ctx threaded yet (sys_readdir
+            // is signature-locked, see follow-up TODO) so callers
+            // dispatching from a SERVER-side handler must protect
+            // against re-entry themselves.  For cc-tasks-share
+            // (Mac=SSOT with LocalConnector, Win=client without) the
+            // SSOT side never reaches this branch — backend is Some on
+            // Mac — so no loop is possible in the canonical 2-node
+            // topology.
+            for (peer_addr, entries) in self.federation_peer_readdir(&route, parent_path) {
+                for (peer_path, etype) in entries {
+                    // Peer returns absolute peer paths; rebase to the
+                    // local global namespace by stripping the peer's
+                    // mount root and re-prepending `parent_for_join`.
+                    // For the cc-tasks-share topology paths come back
+                    // unchanged because parent_path == peer_path's
+                    // dir, so we strip the parent prefix and use the
+                    // basename.
+                    let basename = peer_path.rsplit('/').next().unwrap_or(&peer_path);
+                    if basename.is_empty() {
+                        continue;
+                    }
+                    let child_path = format!("{}/{}", parent_for_join, basename);
+                    seen.entry(child_path).or_insert((etype, Some(route.zone_id.clone())));
+                }
+                let _ = peer_addr;
+                break; // first successful peer wins; rest is fallback
             }
         }
 
