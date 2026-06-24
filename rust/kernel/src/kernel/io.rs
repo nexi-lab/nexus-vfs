@@ -1667,10 +1667,27 @@ impl Kernel {
         // Errors are not surfaced to the caller — the namespace is already clean
         // and orphaned bytes are harmless pending GC. CAS backends do not track
         // content by path; their GC handles unreferenced blobs independently.
-        let _ = route
-            .backend
-            .as_ref()
-            .map(|b| b.delete_file(&route.backend_path));
+        //
+        // Federation-peer dispatch arm: when this mount has no local
+        // backend (placeholder MountEntry installed by wire_mount_core
+        // on the non-SSOT node) but carries a `target_zone_id`, the
+        // SSOT for these bytes lives on a peer voter.  Hand the
+        // backend-side delete to that peer's typed
+        // `NexusVFSService.Delete` so its sys_unlink runs the full
+        // lifecycle — its own LocalConnector removes the host fs row.
+        // Without this, metastore delete propagates via raft but
+        // the SSOT-side host fs file persists (orphan), and a future
+        // `cc tasks list` re-surfaces the entry the operator just
+        // rm'd.  This was the cc-tasks-share E2E regression in
+        // `test_joiner_fuse_unlink_propagates_to_founder_host_fs`
+        // after PR #75 made joiner's metastore lookup HIT (so the
+        // metastore-miss federation_peer dispatch arm earlier in
+        // this function no longer fires for these paths).
+        if let Some(backend) = route.backend.as_ref() {
+            let _ = backend.delete_file(&route.backend_path);
+        } else if route.target_zone_id.is_some() {
+            self.federation_peer_delete_file(&route, path);
+        }
 
         // 7b. FDT cleanup — close pre-opened fd (if any).
         self.fdt.remove(path);
