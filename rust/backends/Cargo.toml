@@ -17,6 +17,7 @@ default = [
     "driver-cas-local",
     "driver-local-connector",
     "driver-remote",
+    "driver-federation-peer",
     "connectors",
 ]
 
@@ -28,6 +29,13 @@ driver-local-connector = []
 # Cross-node RPC proxy — federation primitive.  Always available in
 # Python deployments, opt-in for slim Rust binaries.
 driver-remote = []
+
+# Federation peer proxy — typed `NexusVFSService` gRPC backend used by
+# DT_MOUNT entries whose SSOT data lives on another node. Sibling to
+# `driver-remote` (which speaks Call-RPC to a Python hub).  Always
+# enabled in the kernel build; slim binaries that ship without
+# federation can opt out.
+driver-federation-peer = []
 
 # Connector umbrella: every external-API / cloud-blob backend plus the
 # shared HTTP / crypto / streaming dependency stack they all need.

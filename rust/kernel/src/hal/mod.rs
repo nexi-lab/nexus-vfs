@@ -51,6 +51,7 @@
 //! concrete types.
 
 pub mod distributed_coordinator;
+pub mod federation_peer;
 pub mod object_store_provider;
 
 // `PeerBlobClient` lives in `lib::transport_primitives` — the

@@ -27,6 +27,8 @@ use std::time::Duration;
 use dashmap::DashMap;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
+use kernel::abc::object_store::{BackendStat, WriteResult};
+use kernel::hal::federation_peer::{FederationPeerClient, FederationPeerResult};
 use kernel::kernel::vfs_proto;
 use nexus_raft::federation::TofuTrustStore;
 use nexus_raft::transport::proto::nexus::raft::{
@@ -222,6 +224,265 @@ impl FederationClient {
             ));
         }
         Ok(())
+    }
+
+    // ── Typed NexusVFSService RPC wrappers ───────────────────────────
+    //
+    // Used by `FederationPeerBackend` (in the `backends` crate) via the
+    // `kernel::hal::federation_peer::FederationPeerClient` trait below.
+    // Each wrapper acquires a pooled channel, builds the typed
+    // `NexusVFSService` client, fires the RPC, and surfaces the in-band
+    // `is_error` flag as an `Err(String)` so callers see the same error
+    // shape for transport vs application failures.
+
+    async fn vfs_client(
+        &self,
+        peer_addr: &str,
+    ) -> Result<vfs_proto::nexus_vfs_service_client::NexusVfsServiceClient<Channel>, String> {
+        let channel = self.channel_for(peer_addr).await?;
+        Ok(
+            vfs_proto::nexus_vfs_service_client::NexusVfsServiceClient::new(channel)
+                .max_decoding_message_size(contracts::MAX_GRPC_MESSAGE_BYTES)
+                .max_encoding_message_size(contracts::MAX_GRPC_MESSAGE_BYTES),
+        )
+    }
+
+    async fn vfs_read(
+        &self,
+        peer_addr: &str,
+        path: &str,
+        offset: u64,
+    ) -> Result<Vec<u8>, String> {
+        let mut client = self.vfs_client(peer_addr).await?;
+        let mut request = tonic::Request::new(vfs_proto::ReadRequest {
+            path: path.to_string(),
+            auth_token: String::new(),
+            content_id: String::new(),
+            timeout_ms: 0,
+            offset,
+        });
+        request.set_timeout(self.timeout);
+        let resp = client
+            .read(request)
+            .await
+            .map_err(|e| format!("federation read {peer_addr} {path}: {e}"))?
+            .into_inner();
+        if resp.is_error {
+            return Err(format!(
+                "federation read {peer_addr} {path}: {}",
+                String::from_utf8_lossy(&resp.error_payload)
+            ));
+        }
+        Ok(resp.content)
+    }
+
+    async fn vfs_write(
+        &self,
+        peer_addr: &str,
+        path: &str,
+        content: &[u8],
+    ) -> Result<WriteResult, String> {
+        let mut client = self.vfs_client(peer_addr).await?;
+        let mut request = tonic::Request::new(vfs_proto::WriteRequest {
+            path: path.to_string(),
+            content: content.to_vec(),
+            auth_token: String::new(),
+            content_id: String::new(),
+        });
+        request.set_timeout(self.timeout);
+        let resp = client
+            .write(request)
+            .await
+            .map_err(|e| format!("federation write {peer_addr} {path}: {e}"))?
+            .into_inner();
+        if resp.is_error {
+            return Err(format!(
+                "federation write {peer_addr} {path}: {}",
+                String::from_utf8_lossy(&resp.error_payload)
+            ));
+        }
+        let content_id = if resp.content_id.is_empty() {
+            path.to_string()
+        } else {
+            resp.content_id
+        };
+        Ok(WriteResult {
+            version: content_id.clone(),
+            content_id,
+            size: resp.size.max(0) as u64,
+        })
+    }
+
+    async fn vfs_stat(
+        &self,
+        peer_addr: &str,
+        path: &str,
+    ) -> Result<Option<BackendStat>, String> {
+        let mut client = self.vfs_client(peer_addr).await?;
+        let mut request = tonic::Request::new(vfs_proto::StatRequest {
+            path: path.to_string(),
+            auth_token: String::new(),
+            zone_id: String::new(),
+        });
+        request.set_timeout(self.timeout);
+        let resp = client
+            .stat(request)
+            .await
+            .map_err(|e| format!("federation stat {peer_addr} {path}: {e}"))?
+            .into_inner();
+        if resp.is_error {
+            return Err(format!(
+                "federation stat {peer_addr} {path}: {}",
+                String::from_utf8_lossy(&resp.error_payload)
+            ));
+        }
+        if !resp.found {
+            return Ok(None);
+        }
+        Ok(Some(BackendStat {
+            size: resp.size.max(0) as u64,
+            is_dir: resp.is_directory,
+        }))
+    }
+
+    async fn vfs_readdir(
+        &self,
+        peer_addr: &str,
+        path: &str,
+    ) -> Result<Vec<(String, u8)>, String> {
+        let mut client = self.vfs_client(peer_addr).await?;
+        let mut request = tonic::Request::new(vfs_proto::ReaddirRequest {
+            path: path.to_string(),
+            auth_token: String::new(),
+            zone_id: String::new(),
+        });
+        request.set_timeout(self.timeout);
+        let resp = client
+            .readdir(request)
+            .await
+            .map_err(|e| format!("federation readdir {peer_addr} {path}: {e}"))?
+            .into_inner();
+        if resp.is_error {
+            return Err(format!(
+                "federation readdir {peer_addr} {path}: {}",
+                String::from_utf8_lossy(&resp.error_payload)
+            ));
+        }
+        Ok(resp
+            .entries
+            .into_iter()
+            .map(|e| (e.name, e.entry_type.min(u8::MAX as u32) as u8))
+            .collect())
+    }
+
+    async fn vfs_delete(
+        &self,
+        peer_addr: &str,
+        path: &str,
+        recursive: bool,
+    ) -> Result<(), String> {
+        let mut client = self.vfs_client(peer_addr).await?;
+        let mut request = tonic::Request::new(vfs_proto::DeleteRequest {
+            path: path.to_string(),
+            auth_token: String::new(),
+            recursive,
+        });
+        request.set_timeout(self.timeout);
+        let resp = client
+            .delete(request)
+            .await
+            .map_err(|e| format!("federation delete {peer_addr} {path}: {e}"))?
+            .into_inner();
+        if resp.is_error {
+            return Err(format!(
+                "federation delete {peer_addr} {path}: {}",
+                String::from_utf8_lossy(&resp.error_payload)
+            ));
+        }
+        Ok(())
+    }
+
+    async fn vfs_mkdir(
+        &self,
+        peer_addr: &str,
+        path: &str,
+        parents: bool,
+        exist_ok: bool,
+    ) -> Result<(), String> {
+        let mut client = self.vfs_client(peer_addr).await?;
+        let mut request = tonic::Request::new(vfs_proto::MkdirRequest {
+            path: path.to_string(),
+            auth_token: String::new(),
+            parents,
+            exist_ok,
+        });
+        request.set_timeout(self.timeout);
+        let resp = client
+            .mkdir(request)
+            .await
+            .map_err(|e| format!("federation mkdir {peer_addr} {path}: {e}"))?
+            .into_inner();
+        if resp.is_error {
+            return Err(format!(
+                "federation mkdir {peer_addr} {path}: {}",
+                String::from_utf8_lossy(&resp.error_payload)
+            ));
+        }
+        Ok(())
+    }
+}
+
+// ── HAL trait impl ───────────────────────────────────────────────────
+//
+// Bridges the async tonic wrappers above to the sync
+// `FederationPeerClient` trait the kernel HAL declares.  Every call
+// uses `runtime.block_on` (same pattern as PeerBlobClient::fetch).
+
+impl FederationPeerClient for FederationClient {
+    fn read(&self, addr: &str, path: &str, offset: u64) -> FederationPeerResult<Vec<u8>> {
+        self.runtime.block_on(self.vfs_read(addr, path, offset))
+    }
+
+    fn write(
+        &self,
+        addr: &str,
+        path: &str,
+        content: &[u8],
+    ) -> FederationPeerResult<WriteResult> {
+        self.runtime.block_on(self.vfs_write(addr, path, content))
+    }
+
+    fn stat(&self, addr: &str, path: &str) -> FederationPeerResult<Option<BackendStat>> {
+        self.runtime.block_on(self.vfs_stat(addr, path))
+    }
+
+    fn list_dir(
+        &self,
+        addr: &str,
+        path: &str,
+    ) -> FederationPeerResult<Vec<(String, u8)>> {
+        self.runtime.block_on(self.vfs_readdir(addr, path))
+    }
+
+    fn delete_file(&self, addr: &str, path: &str) -> FederationPeerResult<()> {
+        self.runtime
+            .block_on(self.vfs_delete(addr, path, false))
+    }
+
+    fn rmdir(&self, addr: &str, path: &str, recursive: bool) -> FederationPeerResult<()> {
+        self.runtime
+            .block_on(self.vfs_delete(addr, path, recursive))
+    }
+
+    fn mkdir(
+        &self,
+        addr: &str,
+        path: &str,
+        parents: bool,
+        exist_ok: bool,
+    ) -> FederationPeerResult<()> {
+        self.runtime
+            .block_on(self.vfs_mkdir(addr, path, parents, exist_ok))
     }
 }
 
