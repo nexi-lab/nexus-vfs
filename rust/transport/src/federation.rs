@@ -433,33 +433,62 @@ pub fn install(kernel: &kernel::kernel::Kernel) {
 // ── HAL trait impl ───────────────────────────────────────────────────
 //
 // Bridges the async tonic wrappers above to the sync
-// `FederationPeerClient` trait the kernel HAL declares.  Every call
-// uses `runtime.block_on` (same pattern as PeerBlobClient::fetch).
+// `FederationPeerClient` trait the kernel HAL declares.
+//
+// CRITICAL: every block_on must go through `block_on_safely` so the
+// call is re-entrancy-safe when the caller already runs on a tokio
+// worker thread (gRPC handler, FUSE callback, raft apply task).
+// `Runtime::block_on` panics with "Cannot start a runtime from
+// within a runtime" if called from a thread that's currently
+// executing on that same runtime; `block_in_place` releases the
+// worker before delegating to `Handle::block_on`, which IS safe to
+// call from any context.  Mirrors `RpcTransport::block_on` (kernel
+// crate) — same SSOT for the runtime-recursion guard.
+//
+// PR #74 added this after PR #73's correct canonical-key fix
+// exposed the recursion: io.rs sys_stat / sys_readdir hooks call
+// FederationPeerClient methods from the gRPC handler thread (which
+// runs on the kernel runtime), which is the same runtime this
+// client's `block_on` would try to enter.
+
+impl FederationClient {
+    /// Run `fut` on the client's runtime in a way that's safe to
+    /// call from BOTH plain sync threads AND tokio worker threads
+    /// inside the same runtime.  Mirrors the kernel-side guard in
+    /// `kernel::rpc_transport::RpcTransport::block_on`.
+    #[inline]
+    fn block_on_safely<F: std::future::Future>(&self, fut: F) -> F::Output {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::block_in_place(|| self.runtime.handle().block_on(fut))
+        } else {
+            self.runtime.block_on(fut)
+        }
+    }
+}
 
 impl FederationPeerClient for FederationClient {
     fn read(&self, addr: &str, path: &str, offset: u64) -> FederationPeerResult<Vec<u8>> {
-        self.runtime.block_on(self.vfs_read(addr, path, offset))
+        self.block_on_safely(self.vfs_read(addr, path, offset))
     }
 
     fn write(&self, addr: &str, path: &str, content: &[u8]) -> FederationPeerResult<WriteResult> {
-        self.runtime.block_on(self.vfs_write(addr, path, content))
+        self.block_on_safely(self.vfs_write(addr, path, content))
     }
 
     fn stat(&self, addr: &str, path: &str) -> FederationPeerResult<Option<BackendStat>> {
-        self.runtime.block_on(self.vfs_stat(addr, path))
+        self.block_on_safely(self.vfs_stat(addr, path))
     }
 
     fn list_dir(&self, addr: &str, path: &str) -> FederationPeerResult<Vec<(String, u8)>> {
-        self.runtime.block_on(self.vfs_readdir(addr, path))
+        self.block_on_safely(self.vfs_readdir(addr, path))
     }
 
     fn delete_file(&self, addr: &str, path: &str) -> FederationPeerResult<()> {
-        self.runtime.block_on(self.vfs_delete(addr, path, false))
+        self.block_on_safely(self.vfs_delete(addr, path, false))
     }
 
     fn rmdir(&self, addr: &str, path: &str, recursive: bool) -> FederationPeerResult<()> {
-        self.runtime
-            .block_on(self.vfs_delete(addr, path, recursive))
+        self.block_on_safely(self.vfs_delete(addr, path, recursive))
     }
 
     fn mkdir(
@@ -469,8 +498,7 @@ impl FederationPeerClient for FederationClient {
         parents: bool,
         exist_ok: bool,
     ) -> FederationPeerResult<()> {
-        self.runtime
-            .block_on(self.vfs_mkdir(addr, path, parents, exist_ok))
+        self.block_on_safely(self.vfs_mkdir(addr, path, parents, exist_ok))
     }
 }
 
