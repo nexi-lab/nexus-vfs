@@ -411,6 +411,25 @@ impl FederationClient {
     }
 }
 
+/// Install hook called during kernel process boot —
+/// constructs a `FederationClient` borrowing the kernel's tokio
+/// runtime and installs it via `Kernel::set_federation_peer_client`,
+/// replacing the `NoopFederationPeerClient` default.  Mirrors
+/// [`super::peer_blob::install`].
+///
+/// Without this hook the kernel's federation-peer slot stays at the
+/// Noop default and every `sys_readdir` / `sys_stat` / `sys_unlink` /
+/// `sys_write` dispatch through `Kernel::dispatch_federation_peer`
+/// returns "federation peer client not installed" — the symptom that
+/// surfaced as empty cross-node listings in the cc-tasks-share E2E
+/// before this hook was wired.
+pub fn install(kernel: &kernel::kernel::Kernel) {
+    let client = Arc::new(FederationClient::new(Arc::clone(kernel.runtime()), None));
+    kernel.set_federation_peer_client(
+        client as Arc<dyn kernel::hal::federation_peer::FederationPeerClient>,
+    );
+}
+
 // ── HAL trait impl ───────────────────────────────────────────────────
 //
 // Bridges the async tonic wrappers above to the sync
