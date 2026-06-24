@@ -182,10 +182,36 @@ impl PeerBlobClient {
     }
 
     /// Blocking sync wrapper — drives ``fetch_async`` via the shared
-    /// runtime. Safe to call from any thread.
+    /// runtime. Safe to call from any thread, including from a tokio
+    /// worker already executing on the same runtime: see
+    /// [`Self::block_on_safely`].
     pub(crate) fn fetch(&self, address: &str, content_id: &str) -> Result<Vec<u8>, String> {
         let fut = self.fetch_async(address, content_id);
-        self.runtime.block_on(fut)
+        self.block_on_safely(fut)
+    }
+
+    /// Re-entrancy-safe `block_on` — mirrors `FederationClient::block_on_safely`
+    /// (added in PR #74) and `RpcTransport::block_on` (kernel crate).
+    ///
+    /// `Handle::block_on` panics with "Cannot start a runtime from
+    /// within a runtime" when invoked from a thread that's currently
+    /// executing on that same runtime — which is exactly the shape a
+    /// kernel hot path takes when a gRPC handler / FUSE callback / raft
+    /// apply task calls into `Kernel::sys_read` → routing → backend →
+    /// `PeerBlobClient::fetch` on the shared kernel runtime.
+    ///
+    /// `block_in_place` releases the worker thread before delegating to
+    /// `Handle::block_on`, which IS safe to call from any context.
+    /// When the caller is NOT already on a tokio runtime we take the
+    /// plain `block_on` path so non-tokio callers (cli tools, sync
+    /// tests, the shutdown path) still work.
+    #[inline]
+    fn block_on_safely<F: std::future::Future>(&self, fut: F) -> F::Output {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::block_in_place(|| self.runtime.block_on(fut))
+        } else {
+            self.runtime.block_on(fut)
+        }
     }
 }
 
@@ -281,5 +307,31 @@ mod tests {
             "0000000000000000000000000000000000000000000000000000000000000000",
         );
         assert!(result.is_err());
+    }
+
+    /// Re-entrancy regression pin: invoking `fetch` from inside a tokio
+    /// worker on the SAME runtime must not panic with "Cannot start a
+    /// runtime from within a runtime". This mirrors PR #74's reentrancy
+    /// guard for `FederationClient::block_on_safely`; without the guard
+    /// here, `PeerBlobClient::fetch` panics any time a kernel hot path
+    /// (gRPC handler, FUSE callback, raft apply) reaches it.
+    #[test]
+    fn test_fetch_from_within_runtime_does_not_panic() {
+        let rt = build_kernel_runtime();
+        let mut client = PeerBlobClient::new(rt.handle().clone());
+        client.timeout = Duration::from_millis(200);
+        let client = Arc::new(client);
+        let client_for_task = Arc::clone(&client);
+        let result = rt.block_on(async move {
+            tokio::spawn(async move {
+                client_for_task.fetch(
+                    "127.0.0.1:1",
+                    "0000000000000000000000000000000000000000000000000000000000000000",
+                )
+            })
+            .await
+            .expect("spawn join")
+        });
+        assert!(result.is_err(), "expected connection error, got Ok");
     }
 }
