@@ -244,12 +244,7 @@ impl FederationClient {
         )
     }
 
-    async fn vfs_read(
-        &self,
-        peer_addr: &str,
-        path: &str,
-        offset: u64,
-    ) -> Result<Vec<u8>, String> {
+    async fn vfs_read(&self, peer_addr: &str, path: &str, offset: u64) -> Result<Vec<u8>, String> {
         let mut client = self.vfs_client(peer_addr).await?;
         let mut request = tonic::Request::new(vfs_proto::ReadRequest {
             path: path.to_string(),
@@ -310,11 +305,7 @@ impl FederationClient {
         })
     }
 
-    async fn vfs_stat(
-        &self,
-        peer_addr: &str,
-        path: &str,
-    ) -> Result<Option<BackendStat>, String> {
+    async fn vfs_stat(&self, peer_addr: &str, path: &str) -> Result<Option<BackendStat>, String> {
         let mut client = self.vfs_client(peer_addr).await?;
         let mut request = tonic::Request::new(vfs_proto::StatRequest {
             path: path.to_string(),
@@ -342,11 +333,7 @@ impl FederationClient {
         }))
     }
 
-    async fn vfs_readdir(
-        &self,
-        peer_addr: &str,
-        path: &str,
-    ) -> Result<Vec<(String, u8)>, String> {
+    async fn vfs_readdir(&self, peer_addr: &str, path: &str) -> Result<Vec<(String, u8)>, String> {
         let mut client = self.vfs_client(peer_addr).await?;
         let mut request = tonic::Request::new(vfs_proto::ReaddirRequest {
             path: path.to_string(),
@@ -372,12 +359,7 @@ impl FederationClient {
             .collect())
     }
 
-    async fn vfs_delete(
-        &self,
-        peer_addr: &str,
-        path: &str,
-        recursive: bool,
-    ) -> Result<(), String> {
+    async fn vfs_delete(&self, peer_addr: &str, path: &str, recursive: bool) -> Result<(), String> {
         let mut client = self.vfs_client(peer_addr).await?;
         let mut request = tonic::Request::new(vfs_proto::DeleteRequest {
             path: path.to_string(),
@@ -440,12 +422,7 @@ impl FederationPeerClient for FederationClient {
         self.runtime.block_on(self.vfs_read(addr, path, offset))
     }
 
-    fn write(
-        &self,
-        addr: &str,
-        path: &str,
-        content: &[u8],
-    ) -> FederationPeerResult<WriteResult> {
+    fn write(&self, addr: &str, path: &str, content: &[u8]) -> FederationPeerResult<WriteResult> {
         self.runtime.block_on(self.vfs_write(addr, path, content))
     }
 
@@ -453,17 +430,12 @@ impl FederationPeerClient for FederationClient {
         self.runtime.block_on(self.vfs_stat(addr, path))
     }
 
-    fn list_dir(
-        &self,
-        addr: &str,
-        path: &str,
-    ) -> FederationPeerResult<Vec<(String, u8)>> {
+    fn list_dir(&self, addr: &str, path: &str) -> FederationPeerResult<Vec<(String, u8)>> {
         self.runtime.block_on(self.vfs_readdir(addr, path))
     }
 
     fn delete_file(&self, addr: &str, path: &str) -> FederationPeerResult<()> {
-        self.runtime
-            .block_on(self.vfs_delete(addr, path, false))
+        self.runtime.block_on(self.vfs_delete(addr, path, false))
     }
 
     fn rmdir(&self, addr: &str, path: &str, recursive: bool) -> FederationPeerResult<()> {

@@ -59,8 +59,7 @@ pub trait FederationPeerClient: Send + Sync {
     /// peer either accepts a full-file write or rejects it.  Callers
     /// that need pwrite semantics handle the read-modify-write locally
     /// before calling this.
-    fn write(&self, addr: &str, path: &str, content: &[u8])
-        -> FederationPeerResult<WriteResult>;
+    fn write(&self, addr: &str, path: &str, content: &[u8]) -> FederationPeerResult<WriteResult>;
 
     /// Stat one path via `NexusVFSService.Stat`.
     ///
@@ -73,8 +72,7 @@ pub trait FederationPeerClient: Send + Sync {
     /// Each child is `(name, entry_type)`, mirroring
     /// `MetaStore::list_dir`'s shape.  Names are bare filenames (not
     /// full paths) so callers append to `path` themselves.
-    fn list_dir(&self, addr: &str, path: &str)
-        -> FederationPeerResult<Vec<(String, u8)>>;
+    fn list_dir(&self, addr: &str, path: &str) -> FederationPeerResult<Vec<(String, u8)>>;
 
     /// Delete a file via `NexusVFSService.Delete`.
     fn delete_file(&self, addr: &str, path: &str) -> FederationPeerResult<()>;
@@ -114,11 +112,7 @@ impl FederationPeerClient for NoopFederationPeerClient {
     fn stat(&self, _addr: &str, _path: &str) -> FederationPeerResult<Option<BackendStat>> {
         Err("federation peer client not installed".into())
     }
-    fn list_dir(
-        &self,
-        _addr: &str,
-        _path: &str,
-    ) -> FederationPeerResult<Vec<(String, u8)>> {
+    fn list_dir(&self, _addr: &str, _path: &str) -> FederationPeerResult<Vec<(String, u8)>> {
         Err("federation peer client not installed".into())
     }
     fn delete_file(&self, _addr: &str, _path: &str) -> FederationPeerResult<()> {

@@ -199,7 +199,13 @@ impl ObjectStore for FederationPeerBackend {
         const DT_DIR: u8 = 4;
         Ok(entries
             .into_iter()
-            .map(|(name, et)| if et == DT_DIR { format!("{name}/") } else { name })
+            .map(|(name, et)| {
+                if et == DT_DIR {
+                    format!("{name}/")
+                } else {
+                    name
+                }
+            })
             .collect())
     }
 
@@ -244,12 +250,7 @@ mod tests {
             self.record("read", addr, path);
             Ok(self.read_reply.lock().clone().unwrap_or_default())
         }
-        fn write(
-            &self,
-            addr: &str,
-            path: &str,
-            _content: &[u8],
-        ) -> Result<WriteResult, String> {
+        fn write(&self, addr: &str, path: &str, _content: &[u8]) -> Result<WriteResult, String> {
             self.record("write", addr, path);
             Ok(self.write_reply.lock().take().unwrap_or(WriteResult {
                 content_id: path.trim_start_matches('/').to_string(),
@@ -261,11 +262,7 @@ mod tests {
             self.record("stat", addr, path);
             Ok(self.stat_reply.lock().clone().unwrap_or(None))
         }
-        fn list_dir(
-            &self,
-            addr: &str,
-            path: &str,
-        ) -> Result<Vec<(String, u8)>, String> {
+        fn list_dir(&self, addr: &str, path: &str) -> Result<Vec<(String, u8)>, String> {
             self.record("list_dir", addr, path);
             Ok(self.list_dir_reply.lock().clone().unwrap_or_default())
         }

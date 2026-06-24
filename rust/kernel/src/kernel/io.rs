@@ -690,12 +690,9 @@ impl Kernel {
         route: &crate::vfs_router::RouteResult,
         peer_path: &str,
     ) -> bool {
-        self.dispatch_federation_peer::<(), _>(
-            route,
-            "delete_file",
-            peer_path,
-            |client, addr| client.delete_file(addr, peer_path).map(|()| Some(())),
-        )
+        self.dispatch_federation_peer::<(), _>(route, "delete_file", peer_path, |client, addr| {
+            client.delete_file(addr, peer_path).map(|()| Some(()))
+        })
         .is_some()
     }
 }
@@ -1037,9 +1034,7 @@ impl Kernel {
                         input.route,
                         "write",
                         input.path,
-                        |client, addr| {
-                            client.write(addr, input.path, input.content).map(Some)
-                        },
+                        |client, addr| client.write(addr, input.path, input.content).map(Some),
                     )
                 } else {
                     None
@@ -1551,10 +1546,7 @@ impl Kernel {
                         return Ok(SysUnlinkResult {
                             hit: true,
                             entry_type: DT_REG,
-                            post_hook_needed: self
-                                .delete_hook_count
-                                .load(Ordering::Relaxed)
-                                > 0,
+                            post_hook_needed: self.delete_hook_count.load(Ordering::Relaxed) > 0,
                             path: path.to_string(),
                             content_id: None,
                             size: 0,
@@ -3425,7 +3417,8 @@ impl Kernel {
                         continue;
                     }
                     let child_path = format!("{}/{}", parent_for_join, basename);
-                    seen.entry(child_path).or_insert((etype, Some(route.zone_id.clone())));
+                    seen.entry(child_path)
+                        .or_insert((etype, Some(route.zone_id.clone())));
                 }
             }
         }

@@ -1898,13 +1898,7 @@ fn wire_mount_core(
         // FederationPeerClient against a peer voter").  Symmetric to
         // the existing cross-zone branch below: same shape (None
         // backend + Some target_zone_id), same routing surface.
-        vfs_router.add_federation_mount(
-            mount_path,
-            parent_zone_id,
-            None,
-            target_zone_id,
-            false,
-        );
+        vfs_router.add_federation_mount(mount_path, parent_zone_id, None, target_zone_id, false);
         tracing::info!(
             parent_zone_id = %parent_zone_id,
             mount_path = %mount_path,

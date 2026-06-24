@@ -1293,11 +1293,15 @@ mod tests {
         // like v4 used to apply).
         let store = build_stub_store_with_rmdir(Some(stub_rmdir_record));
 
-        store.rmdir("/some/dir", true).expect("recursive rmdir must reach stub");
+        store
+            .rmdir("/some/dir", true)
+            .expect("recursive rmdir must reach stub");
         assert_eq!(RMDIR_LAST_RECURSIVE.load(Ordering::SeqCst), 1);
         assert_eq!(*RMDIR_LAST_PATH.lock().unwrap(), "/some/dir");
 
-        store.rmdir("/other/dir", false).expect("non-recursive rmdir must reach stub");
+        store
+            .rmdir("/other/dir", false)
+            .expect("non-recursive rmdir must reach stub");
         assert_eq!(RMDIR_LAST_RECURSIVE.load(Ordering::SeqCst), 0);
         assert_eq!(*RMDIR_LAST_PATH.lock().unwrap(), "/other/dir");
     }
