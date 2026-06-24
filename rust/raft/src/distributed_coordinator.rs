@@ -1969,6 +1969,39 @@ fn wire_mount_core(
         // the cross-zone branch below: same shape (None backend +
         // Some target_zone_id), same routing surface.
         vfs_router.add_federation_mount(&global_path, parent_zone_id, None, target_zone_id, false);
+
+        // CRITICAL: inherit the parent federation gateway's metastore.
+        // The cross-zone gateway (e.g. /shared/cc-tasks → sharedzone)
+        // installs a ZoneMetaStore at its canonical key — that store
+        // is where federation-replicated DT_REG / DT_DIR metadata
+        // rows land (raft replicates them under the gateway's
+        // ZoneMetaStore namespace).  Our more-specific placeholder
+        // entry at /<parent_zone>/<global_path> SHADOWS the gateway
+        // for routing AND with_metastore_route; without inheriting
+        // the gateway's metastore, the placeholder has `metastore =
+        // None` and `with_metastore_route` falls back to the global
+        // LocalMetaStore — which doesn't carry the replicated rows.
+        // Joiner sys_stat / sys_read then report "not found" for
+        // paths the founder wrote through FUSE, even though the row
+        // is present in raft on the joiner's side.
+        //
+        // Mirrors what `--mount-driver` does on the SSOT side via
+        // `MountOptions.with_metastore(parent_metastore)` (cluster
+        // main.rs:947): the LocalConnector mount inherits its parent
+        // federation gateway's metastore.  Same SSOT inheritance —
+        // the placeholder is the joiner-side analogue of that mount.
+        let parent_path_for_metastore = global_path
+            .rsplit_once('/')
+            .map(|(p, _)| if p.is_empty() { "/" } else { p })
+            .unwrap_or("/");
+        if let Some(parent_metastore) = vfs_router
+            .route(parent_path_for_metastore, contracts::ROOT_ZONE_ID)
+            .and_then(|r| r.metastore)
+        {
+            let canonical_key = canonicalize(&global_path, parent_zone_id);
+            vfs_router.install_metastore(&canonical_key, parent_metastore);
+        }
+
         tracing::info!(
             parent_zone_id = %parent_zone_id,
             global_path = %global_path,
