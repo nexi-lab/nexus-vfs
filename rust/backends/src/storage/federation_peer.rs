@@ -84,6 +84,7 @@ impl FederationPeerBackend {
         *self.peer_addr.write() = addr;
     }
 
+    #[inline]
     fn current_peer_addr(&self) -> Result<String, StorageError> {
         self.peer_addr.read().clone().ok_or_else(|| {
             StorageError::IOError(std::io::Error::other(
@@ -97,6 +98,7 @@ impl FederationPeerBackend {
     /// to the shared [`super::mount_path::to_mount_path`] helper —
     /// same rule the sibling [`RemoteBackend`](super::remote) applies
     /// against the Python hub (Issue #4273 boundary check).
+    #[inline]
     fn to_peer_path(&self, backend_path: &str) -> String {
         super::mount_path::to_mount_path(&self.vfs_root, backend_path)
     }

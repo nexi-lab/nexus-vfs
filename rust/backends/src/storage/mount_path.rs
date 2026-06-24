@@ -37,6 +37,11 @@
 /// kernel-stripped `backend_path`.  See module docs for the boundary
 /// rule that prevents both directory-escape (cross-tenant) and
 /// double-prefixing (zone-rooted content ids).
+///
+/// `#[inline]` so the proxy ObjectStore's hot path (every `read_content`
+/// / `write_content` / `stat` call) eats only the body, not the function
+/// call frame.
+#[inline]
 pub(crate) fn to_mount_path(mount_root: &str, backend_path: &str) -> String {
     let bp = if backend_path.is_empty() || backend_path == "/" {
         String::new()
