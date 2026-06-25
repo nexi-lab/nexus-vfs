@@ -704,6 +704,47 @@ impl Kernel {
         )
     }
 
+    /// `sys_setattr` arm for DT_REG metadata updates — delegates
+    /// to the SSOT peer's `NexusVFSService.Setattr`.  Restricted
+    /// to DT_REG because (1) DT_MOUNT mount-construction is
+    /// node-local (per-node driver instance + backend wiring),
+    /// (2) DT_PIPE / DT_STREAM are IPC endpoints that can't
+    /// cross machine boundaries, (3) DT_LINK is path-internal
+    /// symlink (kernel-internal, no cross-node concept).
+    ///
+    /// Mirror of `federation_peer_mkdir` / `_delete_file` /
+    /// `_write` — same dispatch helper, same single-proposer
+    /// semantics.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    pub(crate) fn federation_peer_setattr(
+        &self,
+        route: &crate::vfs_router::RouteResult,
+        peer_path: &str,
+        mime_type: Option<&str>,
+        content_id: Option<&str>,
+        modified_at_ms: Option<i64>,
+        created_at_ms: Option<i64>,
+        size: Option<u64>,
+        version: Option<u32>,
+    ) -> bool {
+        self.dispatch_federation_peer::<(), _>(route, "setattr", peer_path, |client, addr| {
+            client
+                .setattr(
+                    addr,
+                    peer_path,
+                    mime_type,
+                    content_id,
+                    modified_at_ms,
+                    created_at_ms,
+                    size,
+                    version,
+                )
+                .map(|()| Some(()))
+        })
+        .is_some()
+    }
+
     /// `sys_rename` arm — delegates to the SSOT peer's
     /// `NexusVFSService.Rename`.  The peer's typed handler runs
     /// `backend.rename` against its own LocalConnector + the

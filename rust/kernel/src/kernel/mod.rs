@@ -1945,6 +1945,58 @@ impl Kernel {
         // when no VFS route covers the path (e.g. boot-time, tests).
         let route = self.vfs_router.route(path, zone_id);
 
+        // §setattr_update.A. Federation-peer mount short-circuit:
+        // when this mount has no local backend (placeholder
+        // MountEntry installed by wire_mount_core on the non-SSOT
+        // node) but carries a `target_zone_id`, defer the ENTIRE
+        // setattr to the peer's typed `NexusVFSService.Setattr`.
+        // Peer runs the full lifecycle (single authoritative
+        // metastore.put for the updated row; raft apply replicates
+        // it back to every voter).
+        //
+        // Mirror of sys_write §5a (PR #80) / sys_unlink §5a (#77)
+        // / sys_mkdir §2.7 / sys_rename §2.5.  Same
+        // `is_federation_peer_mount()` gate.  Silent-miss on
+        // dispatch failure (PR #81 lesson — kernel-background
+        // setattrs during startup retry under legacy shape).
+        //
+        // Restricted to DT_REG: DT_MOUNT mount-construction is
+        // node-local (per-node driver+backend wiring), DT_PIPE/
+        // DT_STREAM are IPC, DT_LINK is kernel-internal.  The
+        // dispatcher caller (`sys_setattr`'s entry_type match arm
+        // `0 => self.setattr_update(...)`) already filters to
+        // DT_REG before reaching us.
+        if let Some(ref r) = route {
+            if r.is_federation_peer_mount() {
+                if self.federation_peer_setattr(
+                    r,
+                    path,
+                    mime_type,
+                    content_id,
+                    modified_at_ms,
+                    created_at_ms,
+                    size,
+                    version,
+                ) {
+                    return Ok(SysSetAttrResult {
+                        path: path.to_string(),
+                        created: false,
+                        entry_type: crate::meta_store::DT_REG as i32,
+                        backend_name: None,
+                        capacity: None,
+                        updated: Vec::new(),
+                        shm_path: None,
+                        data_rd_fd: None,
+                        space_rd_fd: None,
+                    });
+                }
+                // dispatch failed (no reachable voter / RPC error)
+                // → fall through to the legacy local-only path so
+                // boot-time / zone-discovery retries keep working
+                // (PR #81-equivalent silent-miss semantics).
+            }
+        }
+
         let existing: Option<crate::meta_store::FileMetadata> = if let Some(ref r) = route {
             self.with_metastore_route(r, |ms| ms.get(path).ok().flatten())
                 .flatten()
