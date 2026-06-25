@@ -1033,14 +1033,22 @@ impl Kernel {
         // side has `backend = Some` and never enters this arm, so
         // re-entry is structurally impossible.
         if input.route.is_federation_peer_mount() && input.offset == 0 {
-            let wr = self
-                .federation_peer_write(input.route, input.path, input.content)
-                .ok_or_else(|| {
-                    KernelError::IOError(format!(
-                        "federation peer write failed: {} (no reachable voter or RPC error)",
-                        input.path
-                    ))
-                })?;
+            // Preserve legacy miss-on-dispatch-failure semantics: the
+            // pre-PR-#80 shape had `dispatch_federation_peer` return
+            // `Option<WriteResult>` straight into the `match write_result
+            // { Some => ..., None => miss() }` arm, so a transient
+            // unreachable peer (still in zone-discovery handshake, peer
+            // restarting, network blip) surfaced as `hit=false` and
+            // callers retried.  Surfacing it as `KernelError::IOError`
+            // instead breaks tests where a kernel-background write
+            // (raft state seed, DT_MOUNT replay) silently retried under
+            // the old shape — see cc-tasks-share E2E TestCrossNode*
+            // regressions on first PR #80 attempt.  Return miss so the
+            // caller's existing retry / quiesce paths kick in unchanged.
+            let wr = match self.federation_peer_write(input.route, input.path, input.content) {
+                Some(wr) => wr,
+                None => return miss(),
+            };
 
             // Best-effort old-state snapshot for OBSERVE + native
             // POST hook.  Joiner's local metastore may or may not
