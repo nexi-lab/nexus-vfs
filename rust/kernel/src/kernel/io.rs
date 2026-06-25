@@ -704,6 +704,32 @@ impl Kernel {
         )
     }
 
+    /// `sys_rename` arm — delegates to the SSOT peer's
+    /// `NexusVFSService.Rename`.  The peer's typed handler runs
+    /// `backend.rename` against its own LocalConnector + the
+    /// authoritative metastore mutations (delete old key, put new
+    /// key, raft propose).  Raft replicates the result back to
+    /// every voter via apply.
+    ///
+    /// Cross-mount rename is rejected upstream by the peer's
+    /// sys_rename (in-band error); the dispatch helper surfaces
+    /// that as a `false` return value so the caller's miss()
+    /// path fires.
+    #[inline]
+    pub(crate) fn federation_peer_rename(
+        &self,
+        route: &crate::vfs_router::RouteResult,
+        old_peer_path: &str,
+        new_peer_path: &str,
+    ) -> bool {
+        self.dispatch_federation_peer::<(), _>(route, "rename", old_peer_path, |client, addr| {
+            client
+                .rename(addr, old_peer_path, new_peer_path)
+                .map(|()| Some(()))
+        })
+        .is_some()
+    }
+
     /// `sys_mkdir` arm — delegates to the SSOT peer's
     /// `NexusVFSService.Mkdir`.  The peer's typed handler runs
     /// `backend.mkdir` against its own LocalConnector + the
@@ -1974,6 +2000,48 @@ impl Kernel {
             Some(r) => r,
             None => return miss(),
         };
+
+        // §2.5. Federation-peer mount short-circuit: when the
+        // old-path route is a placeholder federation mount
+        // (backend=None + target_zone_id=Some), defer the ENTIRE
+        // rename to the peer's typed `NexusVFSService.Rename`.
+        // Peer runs the full lifecycle (its own backend.rename
+        // against LocalConnector + the single authoritative
+        // metastore delete-old + put-new, raft propose).
+        //
+        // We gate on `old_route` only — cross-mount rename is
+        // rejected upstream by the peer's sys_rename (it surfaces
+        // an in-band error), so wire that through as a
+        // dispatch-failure miss().  Same shape sys_unlink and
+        // sys_write took (PR #77 / PR #80).
+        //
+        // Pre-this-PR shape: joiner did its own metastore mutations
+        // for the rename (raft-replicated to founder), but NEITHER
+        // node ran `backend.rename` — joiner has no backend,
+        // founder's raft apply doesn't trigger backend side
+        // effects.  Symptom: bytes stayed at the old name on
+        // founder's host fs, metadata pointed at the new name.
+        // CC's atomic-rename pattern (`write .tmp; rename .tmp
+        // -> final`) silently corrupted state on the SSOT side.
+        //
+        // PR #81-equivalent silent-miss semantics: dispatch
+        // failure returns miss() so kernel-background renames
+        // during cluster startup retry under the legacy shape.
+        if old_route.is_federation_peer_mount() {
+            if self.federation_peer_rename(&old_route, old_path, new_path) {
+                return Ok(SysRenameResult {
+                    hit: true,
+                    success: true,
+                    post_hook_needed: false,
+                    is_directory: false,
+                    old_content_id: None,
+                    old_size: None,
+                    old_version: None,
+                    old_modified_at_ms: None,
+                });
+            }
+            return miss();
+        }
 
         // 3. Sorted VFS lock acquire (deadlock-free: min(old,new) first)
         let (first, second) = if old_path <= new_path {
