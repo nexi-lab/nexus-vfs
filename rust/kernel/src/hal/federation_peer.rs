@@ -166,12 +166,7 @@ impl FederationPeerClient for NoopFederationPeerClient {
     ) -> FederationPeerResult<()> {
         Err("federation peer client not installed".into())
     }
-    fn rename(
-        &self,
-        _addr: &str,
-        _old_path: &str,
-        _new_path: &str,
-    ) -> FederationPeerResult<()> {
+    fn rename(&self, _addr: &str, _old_path: &str, _new_path: &str) -> FederationPeerResult<()> {
         Err("federation peer client not installed".into())
     }
     fn setattr(
