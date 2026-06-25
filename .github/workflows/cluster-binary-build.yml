@@ -35,7 +35,17 @@ jobs:
           - os: macos-14
             artifact_name: nexusd-cluster-macos-arm64
             binary: nexusd-cluster
-            max_size_bytes: 13107200  # 12.5 MiB
+            max_size_bytes: 13631488  # 13.0 MiB — bumped from 12.5 MiB
+                                      # to absorb PR #85's HAL surface
+                                      # extension (rename + setattr on
+                                      # FederationPeerClient: 2 new trait
+                                      # methods + 2 new Noop impls + 2
+                                      # new async vfs_X wrappers + 2 new
+                                      # sync trait bridges, all using
+                                      # the existing block_on_safely
+                                      # pattern).  ~520 KiB headroom
+                                      # symmetric with the post-#85
+                                      # actual size.
           - os: macos-14
             artifact_name: nexusd-cluster-macos-x86_64
             binary: nexusd-cluster
