@@ -704,6 +704,31 @@ impl Kernel {
         )
     }
 
+    /// `sys_mkdir` arm — delegates to the SSOT peer's
+    /// `NexusVFSService.Mkdir`.  The peer's typed handler runs
+    /// `backend.mkdir` against its own LocalConnector + the
+    /// authoritative `metastore.put` for the new DT_DIR row.
+    /// Raft replicates the put back to every voter via apply.
+    ///
+    /// Mirror of `federation_peer_delete_file` — same dispatch
+    /// helper, same loop-avoidance caveat, same single-proposer
+    /// semantics PR #80 established for sys_write.
+    #[inline]
+    pub(crate) fn federation_peer_mkdir(
+        &self,
+        route: &crate::vfs_router::RouteResult,
+        peer_path: &str,
+        parents: bool,
+        exist_ok: bool,
+    ) -> bool {
+        self.dispatch_federation_peer::<(), _>(route, "mkdir", peer_path, |client, addr| {
+            client
+                .mkdir(addr, peer_path, parents, exist_ok)
+                .map(|()| Some(()))
+        })
+        .is_some()
+    }
+
     /// `sys_unlink` arm for regular files — delegates to the SSOT
     /// peer's `NexusVFSService.Delete`.  The peer's typed handler
     /// runs the full unlink lifecycle (metastore delete + backend
@@ -2656,6 +2681,46 @@ impl Kernel {
             }
             return Ok(SysMkdirResult {
                 hit: true,
+                post_hook_needed: false,
+            });
+        }
+
+        // §2.7. Federation-peer mount short-circuit: when this mount
+        // has no local backend (placeholder MountEntry installed by
+        // wire_mount_core on the non-SSOT node) but carries a
+        // `target_zone_id`, defer the ENTIRE mkdir to that peer's
+        // typed `NexusVFSService.Mkdir`.  Peer runs the full
+        // lifecycle (backend.mkdir + the single authoritative
+        // metastore.put + raft replication of the DT_DIR row back
+        // to us via apply).
+        //
+        // Pre-this-PR shape: backend.mkdir silently skipped (step
+        // 4 below: `route.backend.as_ref().map(...)`) AND joiner
+        // proposed its own metastore.put (step 7) — host fs dir
+        // NEVER got created on the SSOT side, only metadata
+        // appeared.  Symptom in the cc-tasks-share runbook: the
+        // operator on the non-SSOT machine creates a new CC
+        // session dir via FUSE; the SSOT side's CC then walks
+        // ~/.claude/tasks/ directly via host fs and sees ENOENT.
+        //
+        // Mirror of `sys_write` §5a (PR #80) + `sys_unlink_single`
+        // §5a (PR #77).  Same `is_federation_peer_mount()` gate,
+        // same single-proposer raft semantics.  No
+        // `dispatch_native_post(Mkdir)` here — kernel doesn't
+        // route POST hooks for mkdir (the DirCreate observer
+        // event below is the only mutation-event shape mkdir
+        // produces; peer fires its own when it runs sys_mkdir).
+        //
+        // PR #81-equivalent silent-miss semantics: when the
+        // dispatch can't reach a voter, return `hit=false`
+        // instead of surfacing an error.  Kernel-background
+        // mkdirs during cluster startup / zone discovery
+        // depend on the legacy "transient peer-unreachable =
+        // retry later" shape.
+        if route.is_federation_peer_mount() {
+            let ok = self.federation_peer_mkdir(&route, path, parents, exist_ok);
+            return Ok(SysMkdirResult {
+                hit: ok,
                 post_hook_needed: false,
             });
         }
