@@ -35,7 +35,13 @@ jobs:
           - os: macos-14
             artifact_name: nexusd-cluster-macos-arm64
             binary: nexusd-cluster
-            max_size_bytes: 13107200  # 12.5 MiB
+            max_size_bytes: 13631488  # 13.0 MiB — bumped from 12.5 MiB
+                                      # to absorb PR #82 (sys_mkdir /
+                                      # sys_rename / sys_setattr defer-to-
+                                      # peer + the rename/setattr HAL surface
+                                      # extension that closes the cross-node
+                                      # mutation matrix).  Genuine new
+                                      # functionality, ~525 KiB headroom.
           - os: macos-14
             artifact_name: nexusd-cluster-macos-x86_64
             binary: nexusd-cluster

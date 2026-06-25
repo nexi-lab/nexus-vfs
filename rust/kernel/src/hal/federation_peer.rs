@@ -88,6 +88,42 @@ pub trait FederationPeerClient: Send + Sync {
         parents: bool,
         exist_ok: bool,
     ) -> FederationPeerResult<()>;
+
+    /// Rename a file or directory via `NexusVFSService.Rename`.
+    ///
+    /// Both paths are absolute zone-canonical paths on the peer.
+    /// Rename across mount boundaries is rejected upstream (the
+    /// peer's sys_rename surfaces the error in-band); callers
+    /// here just relay it.
+    fn rename(&self, addr: &str, old_path: &str, new_path: &str) -> FederationPeerResult<()>;
+
+    /// Update a DT_REG metadata row via `NexusVFSService.Setattr`.
+    ///
+    /// Cross-node setattr is intentionally restricted to DT_REG
+    /// (regular-file metadata) — DT_MOUNT mount-construction is
+    /// node-local (driver wiring + per-node backend instance),
+    /// DT_PIPE / DT_STREAM are IPC endpoints that can't cross
+    /// machine boundaries.  The optional fields mirror the
+    /// SetattrRequest proto: presence-tracked (None survives the
+    /// wire) so callers can patch only the fields they actually
+    /// want to update.
+    ///
+    /// Returns `Ok(())` when the peer's sys_setattr completed; the
+    /// peer's metastore.put + observe + post-hook dispatch run on
+    /// its side, and the raft apply replicates the row back to
+    /// this voter.
+    #[allow(clippy::too_many_arguments)]
+    fn setattr(
+        &self,
+        addr: &str,
+        path: &str,
+        mime_type: Option<&str>,
+        content_id: Option<&str>,
+        modified_at_ms: Option<i64>,
+        created_at_ms: Option<i64>,
+        size: Option<u64>,
+        version: Option<u32>,
+    ) -> FederationPeerResult<()>;
 }
 
 /// No-op fallback installed at `Kernel::new` so the slot always carries
@@ -127,6 +163,22 @@ impl FederationPeerClient for NoopFederationPeerClient {
         _path: &str,
         _parents: bool,
         _exist_ok: bool,
+    ) -> FederationPeerResult<()> {
+        Err("federation peer client not installed".into())
+    }
+    fn rename(&self, _addr: &str, _old_path: &str, _new_path: &str) -> FederationPeerResult<()> {
+        Err("federation peer client not installed".into())
+    }
+    fn setattr(
+        &self,
+        _addr: &str,
+        _path: &str,
+        _mime_type: Option<&str>,
+        _content_id: Option<&str>,
+        _modified_at_ms: Option<i64>,
+        _created_at_ms: Option<i64>,
+        _size: Option<u64>,
+        _version: Option<u32>,
     ) -> FederationPeerResult<()> {
         Err("federation peer client not installed".into())
     }
