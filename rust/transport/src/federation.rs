@@ -409,6 +409,85 @@ impl FederationClient {
         }
         Ok(())
     }
+
+    async fn vfs_rename(
+        &self,
+        peer_addr: &str,
+        old_path: &str,
+        new_path: &str,
+    ) -> Result<(), String> {
+        let mut client = self.vfs_client(peer_addr).await?;
+        let mut request = tonic::Request::new(vfs_proto::RenameRequest {
+            path: old_path.to_string(),
+            new_path: new_path.to_string(),
+            auth_token: String::new(),
+        });
+        request.set_timeout(self.timeout);
+        let resp = client
+            .rename(request)
+            .await
+            .map_err(|e| format!("federation rename {peer_addr} {old_path} -> {new_path}: {e}"))?
+            .into_inner();
+        if resp.is_error {
+            return Err(format!(
+                "federation rename {peer_addr} {old_path} -> {new_path}: {}",
+                String::from_utf8_lossy(&resp.error_payload)
+            ));
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn vfs_setattr(
+        &self,
+        peer_addr: &str,
+        path: &str,
+        mime_type: Option<&str>,
+        content_id: Option<&str>,
+        modified_at_ms: Option<i64>,
+        created_at_ms: Option<i64>,
+        size: Option<u64>,
+        version: Option<u32>,
+    ) -> Result<(), String> {
+        let mut client = self.vfs_client(peer_addr).await?;
+        // DT_REG entry_type fixed at 0 (regular file) — cross-node
+        // setattr is intentionally limited to DT_REG metadata
+        // updates; DT_MOUNT mount-construction is node-local
+        // (driver wiring + per-node backend instance), DT_PIPE /
+        // DT_STREAM are IPC.  Same restriction the HAL trait
+        // doc commits to.
+        let mut request = tonic::Request::new(vfs_proto::SetattrRequest {
+            path: path.to_string(),
+            auth_token: String::new(),
+            entry_type: 0,
+            zone_id: String::new(),
+            mime_type: mime_type.map(|s| s.to_string()),
+            content_id: content_id.map(|s| s.to_string()),
+            modified_at_ms,
+            created_at_ms,
+            size,
+            version,
+            backend_name: String::new(),
+            io_profile: String::new(),
+            is_external: false,
+            capacity: 0,
+            backend_type: String::new(),
+            backend_params: Default::default(),
+        });
+        request.set_timeout(self.timeout);
+        let resp = client
+            .setattr(request)
+            .await
+            .map_err(|e| format!("federation setattr {peer_addr} {path}: {e}"))?
+            .into_inner();
+        if resp.is_error {
+            return Err(format!(
+                "federation setattr {peer_addr} {path}: {}",
+                String::from_utf8_lossy(&resp.error_payload)
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Install hook called during kernel process boot —
@@ -499,6 +578,33 @@ impl FederationPeerClient for FederationClient {
         exist_ok: bool,
     ) -> FederationPeerResult<()> {
         self.block_on_safely(self.vfs_mkdir(addr, path, parents, exist_ok))
+    }
+
+    fn rename(&self, addr: &str, old_path: &str, new_path: &str) -> FederationPeerResult<()> {
+        self.block_on_safely(self.vfs_rename(addr, old_path, new_path))
+    }
+
+    fn setattr(
+        &self,
+        addr: &str,
+        path: &str,
+        mime_type: Option<&str>,
+        content_id: Option<&str>,
+        modified_at_ms: Option<i64>,
+        created_at_ms: Option<i64>,
+        size: Option<u64>,
+        version: Option<u32>,
+    ) -> FederationPeerResult<()> {
+        self.block_on_safely(self.vfs_setattr(
+            addr,
+            path,
+            mime_type,
+            content_id,
+            modified_at_ms,
+            created_at_ms,
+            size,
+            version,
+        ))
     }
 }
 
