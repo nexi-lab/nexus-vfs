@@ -284,24 +284,6 @@ mod tests {
             self.record("mkdir", addr, path);
             Ok(())
         }
-        fn rename(&self, addr: &str, old_path: &str, _new_path: &str) -> Result<(), String> {
-            self.record("rename", addr, old_path);
-            Ok(())
-        }
-        fn setattr(
-            &self,
-            addr: &str,
-            path: &str,
-            _mime_type: Option<&str>,
-            _content_id: Option<&str>,
-            _modified_at_ms: Option<i64>,
-            _created_at_ms: Option<i64>,
-            _size: Option<u64>,
-            _version: Option<u32>,
-        ) -> Result<(), String> {
-            self.record("setattr", addr, path);
-            Ok(())
-        }
     }
 
     fn ctx() -> kernel::kernel::OperationContext {
