@@ -2512,6 +2512,37 @@ impl Kernel {
             });
         }
 
+        // §2.7. Federation-peer mount side effect: when this mount has
+        // no local backend (placeholder MountEntry installed by
+        // wire_mount_core on the non-SSOT node) but carries a
+        // `target_zone_id`, FIRE the peer's typed
+        // `NexusVFSService.Mkdir` so the SSOT-side LocalConnector
+        // materialises the host fs directory.  CRITICAL: this is a
+        // SUPPLEMENT, not a defer-and-return — the local-side flow
+        // BELOW (existence check + metastore.put for the DT_DIR row)
+        // STILL runs so the joiner's VFSRouter has the DT_DIR
+        // routable IMMEDIATELY for subsequent ops on children of
+        // the new dir.  Raft LWW dedupes the peer's mirror put
+        // against ours on apply.
+        //
+        // This is the corrected-design fix for reverted PR #82's
+        // mkdir/rename/setattr regression: pure defer-to-peer
+        // (which works for sys_write / sys_unlink because their
+        // SSOT is BYTES) broke mkdir's routing because the joiner
+        // needed the row LOCAL immediately, not async via raft
+        // apply.  See `feedback_defer_to_peer_only_for_byte_ops`
+        // memory for the full rationale.
+        //
+        // Best-effort: when `federation_peer_mkdir` returns false
+        // (no reachable voter / RPC error / Noop client) we DON'T
+        // surface the error — the local-side flow proceeds
+        // regardless, preserving the legacy "metadata-only mkdir on
+        // backend-less mount succeeds" shape.  PR #81-equivalent
+        // silent-miss semantics.
+        if route.is_federation_peer_mount() {
+            let _ = self.federation_peer_mkdir(&route, path, parents, exist_ok);
+        }
+
         // 3. Existence check: explicit entry OR implicit directory (children
         //    exist under this prefix). Eliminates Python's router.route() +
         //    metastore.get() + is_implicit_directory() pre-check (Crossing 3a).

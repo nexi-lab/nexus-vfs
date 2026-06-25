@@ -338,4 +338,38 @@ impl Kernel {
         })
         .is_some()
     }
+
+    /// `sys_mkdir` arm — fires the SSOT peer's
+    /// `NexusVFSService.Mkdir` to materialise the directory on the
+    /// peer's LocalConnector (host fs side effect).
+    ///
+    /// Unlike `federation_peer_write` / `federation_peer_delete_file`
+    /// (whose callers DEFER ENTIRELY to the peer because the result
+    /// is BYTES on the SSOT side), the `sys_mkdir` caller invokes
+    /// this as a SUPPLEMENT — see
+    /// `feedback_defer_to_peer_only_for_byte_ops`.  The local
+    /// metastore.put for the DT_DIR row STILL runs locally so the
+    /// joiner's VFSRouter can route children of the new directory
+    /// IMMEDIATELY (sub-second), without waiting for the peer's
+    /// metastore.put to round-trip through raft apply.  Raft LWW
+    /// dedupes the peer's mirror put against ours.
+    ///
+    /// Returns `true` when the dispatch succeeded.  `false` is a
+    /// silent miss (no reachable voter / RPC error / Noop client) —
+    /// caller's local-side path proceeds regardless.
+    #[inline]
+    pub(crate) fn federation_peer_mkdir(
+        &self,
+        route: &crate::vfs_router::RouteResult,
+        peer_path: &str,
+        parents: bool,
+        exist_ok: bool,
+    ) -> bool {
+        self.dispatch_federation_peer::<(), _>(route, "mkdir", peer_path, |client, addr| {
+            client
+                .mkdir(addr, peer_path, parents, exist_ok)
+                .map(|()| Some(()))
+        })
+        .is_some()
+    }
 }
