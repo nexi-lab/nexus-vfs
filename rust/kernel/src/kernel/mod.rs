@@ -2145,24 +2145,12 @@ impl Kernel {
         *self.peer_client.write() = client;
     }
 
-    /// Replace the kernel's `federation_peer_client` slot.  Kernel boots
-    /// with `NoopFederationPeerClient`; the host binary installs the
-    /// real `transport::federation::FederationClient` once per kernel.
-    /// `FederationPeerBackend` (in the `backends` crate) reads this
-    /// slot to make typed VFS RPCs against peer-owned mounts.
-    pub fn set_federation_peer_client(
-        &self,
-        client: Arc<dyn crate::hal::federation_peer::FederationPeerClient>,
-    ) {
-        *self.federation_peer_client.write() = client;
-    }
-
-    /// Borrow the federation-peer client — read-locked snapshot.
-    pub fn federation_peer_client_arc(
-        &self,
-    ) -> Arc<dyn crate::hal::federation_peer::FederationPeerClient> {
-        Arc::clone(&self.federation_peer_client.read())
-    }
+    // `set_federation_peer_client` + `federation_peer_client_arc`
+    // slot accessors live in `kernel/federation.rs` next to the
+    // sister `DistributedCoordinator` slot accessors (per
+    // `docs/KERNEL-ARCHITECTURE.md` §3, kernel-side §3.B
+    // Control-Plane HAL wiring is owned by the federation-family
+    // submodule).
 
     /// Borrow the current peer-client trait object — read-locked
     /// snapshot.  Internal callers use this to issue federation
