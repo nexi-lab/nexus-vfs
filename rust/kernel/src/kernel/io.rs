@@ -678,6 +678,32 @@ impl Kernel {
         )
     }
 
+    /// `sys_write` arm for federation-peer mounts — delegates the
+    /// FULL write lifecycle to the SSOT peer's `NexusVFSService.Write`.
+    /// The peer's typed handler runs `backend.write_content` against
+    /// its own LocalConnector + the single authoritative `metastore.put`
+    /// (raft proposal).  The replicated apply lands back on every
+    /// voter's local metastore — symmetric with the cleanup shape of
+    /// `federation_peer_delete_file`.
+    ///
+    /// Returning the peer's `WriteResult` lets the caller fire its
+    /// own OBSERVE event + native POST hook with the canonical
+    /// `(content_id, size)` from the SSOT side.
+    #[inline]
+    pub(crate) fn federation_peer_write(
+        &self,
+        route: &crate::vfs_router::RouteResult,
+        peer_path: &str,
+        content: &[u8],
+    ) -> Option<crate::abc::object_store::WriteResult> {
+        self.dispatch_federation_peer::<crate::abc::object_store::WriteResult, _>(
+            route,
+            "write",
+            peer_path,
+            |client, addr| client.write(addr, peer_path, content).map(Some),
+        )
+    }
+
     /// `sys_unlink` arm for regular files — delegates to the SSOT
     /// peer's `NexusVFSService.Delete`.  The peer's typed handler
     /// runs the full unlink lifecycle (metastore delete + backend
@@ -964,6 +990,113 @@ impl Kernel {
             })
         };
 
+        // §5a. Federation-peer mount short-circuit: when this mount
+        // has no local backend (placeholder MountEntry installed by
+        // wire_mount_core on the non-SSOT node) but carries a
+        // `target_zone_id`, the SSOT for these bytes lives on a peer
+        // voter.  Defer the ENTIRE write to that peer's typed
+        // `NexusVFSService.Write` — peer's sys_write runs the full
+        // lifecycle (LocalConnector write_content + the single
+        // authoritative metastore.put + raft replication of that put
+        // back to us via apply).
+        //
+        // Mirror of `sys_unlink_single`'s federation-peer short-circuit
+        // (PR #77, commit 7a4fdd8d6).  The shape that arm replaced
+        // had joiner do its own metastore.put AFTER the dispatch RPC
+        // returned — double-propose:
+        //   - founder's sys_write proposes the put, raft replicates;
+        //   - joiner's sys_write proposes ANOTHER put for the same
+        //     (zone, path) key with a later modified_at_ms timestamp;
+        //   - LWW dedupes, but the racing apply order is observable
+        //     through joiner's local metastore view (the joiner-readback
+        //     gap discovered in nexus PR #4433's docker E2E:
+        //     founder host fs received bytes byte-exact, joiner's own
+        //     FUSE lookup for the same path missed for >30s).
+        //
+        // Deferring entirely produces single-proposer semantics —
+        // ONE sys_write runs (the peer's), ONE metastore commit
+        // happens, ONE backend write fires.  Joiner sees the row
+        // when raft apply lands on its zone metastore; if the read
+        // races the apply, sys_stat's federation_peer_stat fallback
+        // covers it.  Same SSOT contract sys_unlink already enforces.
+        //
+        // Offset > 0 (partial writes) NOT short-circuited here: the
+        // FederationPeerClient.write trait method takes (addr, path,
+        // content) with no offset (HAL doc explicitly says "Partial
+        // writes are not modelled at this layer"), and partial-write
+        // semantics need read-modify-write the caller handles
+        // locally first.  For placeholder mounts the partial-write
+        // path returns miss — preserved legacy behaviour.
+        //
+        // Same loop-avoidance caveat the dispatch helper documents:
+        // for the canonical 2-node cc-tasks-share topology the SSOT
+        // side has `backend = Some` and never enters this arm, so
+        // re-entry is structurally impossible.
+        if input.route.is_federation_peer_mount() && input.offset == 0 {
+            let wr = self
+                .federation_peer_write(input.route, input.path, input.content)
+                .ok_or_else(|| {
+                    KernelError::IOError(format!(
+                        "federation peer write failed: {} (no reachable voter or RPC error)",
+                        input.path
+                    ))
+                })?;
+
+            // Best-effort old-state snapshot for OBSERVE + native
+            // POST hook.  Joiner's local metastore may or may not
+            // have a row pre-write; founder's post-write metastore.put
+            // will eventually replicate via raft and supersede.  When
+            // local has nothing, treat as first-write (is_new = true)
+            // — consistent with "this voter has never observed this
+            // path before".
+            let old_entry = self.commit_old_metadata(&input);
+            let old_version = old_entry.as_ref().map(|e| e.version).unwrap_or(0);
+            let old_gen = old_entry.as_ref().map(|e| e.gen).unwrap_or(0);
+            let old_content_id = old_entry.as_ref().and_then(|e| e.content_id.clone());
+            let new_version = old_version + 1;
+            let new_gen = old_gen.saturating_add(1);
+            let result_is_new = old_entry.is_none();
+            let result_old_etag = old_content_id.clone();
+            let result_old_size = old_entry.as_ref().map(|e| e.size);
+            let result_old_version = old_entry.as_ref().map(|e| e.version);
+            let result_old_modified_at_ms = old_entry.as_ref().and_then(|e| e.modified_at_ms);
+
+            let content_id_for_event = wr.content_id.clone();
+            let size_for_event = wr.size;
+            self.dispatch_mutation(FileEventType::FileWrite, input.path, input.ctx, |ev| {
+                ev.size = Some(size_for_event);
+                ev.content_id = Some(content_id_for_event);
+                ev.version = Some(new_version);
+                ev.gen = Some(new_gen);
+                ev.is_new = old_version == 0;
+                ev.old_content_id = old_content_id;
+            });
+
+            self.dispatch_native_post(&HookContext::Write(WriteHookCtx {
+                path: input.path.to_string(),
+                identity: HookIdentity::from(input.ctx),
+                content: vec![],
+                is_new_file: result_is_new,
+                content_id: None,
+                new_version: new_version.into(),
+                size_bytes: Some(wr.size),
+            }));
+
+            return Ok(SysWriteResult {
+                hit: true,
+                content_id: Some(wr.content_id),
+                post_hook_needed: self.write_hook_count.load(Ordering::Relaxed) > 0,
+                version: new_version,
+                gen: new_gen,
+                size: wr.size,
+                is_new: result_is_new,
+                old_content_id: result_old_etag,
+                old_size: result_old_size,
+                old_version: result_old_version,
+                old_modified_at_ms: result_old_modified_at_ms,
+            });
+        }
+
         // 5. Backend write (Rust-native ObjectStore).
         //    Pass backend_path as content_id for PAS; for CAS at offset=0
         //    content_id is ignored, but for offset>0 we need the OLD
@@ -1006,40 +1139,15 @@ impl Kernel {
                     }
                 }
             }
-            // Mount has no Rust backend.  Two sub-cases:
-            //
-            //   (a) Python-side connector — caller treats as a
-            //       hit=false miss (the legacy shape, preserved).
-            //
-            //   (b) Federation peer mount — `target_zone_id` is set
-            //       on the placeholder MountEntry wire_mount_core
-            //       installed; the SSOT for these bytes lives on a
-            //       peer voter.  Hand the write to that peer via
-            //       `NexusVFSService.Write` (typed) so the peer's
-            //       sys_write runs the full lifecycle: bytes to its
-            //       LocalConnector → host fs, metastore put → raft
-            //       propose → replication.  We then proceed through
-            //       this method's metastore put just like a local
-            //       hit; LWW on `modified_at` dedups against the
-            //       peer's apply.
-            //
-            //   Same loop-avoidance caveat as the sys_readdir /
-            //   sys_stat / sys_unlink hooks — for canonical 2-node
-            //   cc-tasks-share the SSOT side has `backend = Some` and
-            //   never enters this arm, so re-entry is structurally
-            //   impossible.
-            None => {
-                if input.route.target_zone_id.is_some() && input.offset == 0 {
-                    self.dispatch_federation_peer::<crate::abc::object_store::WriteResult, _>(
-                        input.route,
-                        "write",
-                        input.path,
-                        |client, addr| client.write(addr, input.path, input.content).map(Some),
-                    )
-                } else {
-                    None
-                }
-            }
+            // Mount has no Rust backend.  Only sub-case remaining:
+            // Python-side connector — caller treats as a hit=false
+            // miss (the legacy shape, preserved).  The federation-peer
+            // sub-case is handled by the §5a short-circuit at the top
+            // of this method (PR #77-equivalent for sys_write); any
+            // path reaching here that has `target_zone_id` set already
+            // failed the `offset == 0` predicate (partial writes on
+            // placeholder mounts return miss — same as before).
+            None => None,
         };
 
         // 6. After write -> build metadata + metastore.put + dcache update
