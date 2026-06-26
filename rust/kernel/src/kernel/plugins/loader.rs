@@ -49,6 +49,13 @@ const TRUSTED_KEY_FILES: &[&[u8]] = &[
         env!("CARGO_MANIFEST_DIR"),
         "/trusted_keys/kernel-dogfood-v1.pub"
     )),
+    // LOCAL DEV ONLY — songym's Windows dev pubkey.  DO NOT COMMIT.
+    // Per `reference_local_plugin_signing_dev_root` memory; revert
+    // before pushing.
+    include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/trusted_keys/songym-win-dev.pub"
+    )),
 ];
 
 fn trusted_keys() -> &'static [VerifyingKey] {
