@@ -1945,6 +1945,42 @@ impl Kernel {
         // when no VFS route covers the path (e.g. boot-time, tests).
         let route = self.vfs_router.route(path, zone_id);
 
+        // §X.7. Federation-peer mount side effect: when the route is
+        // a placeholder MountEntry (backend=None + target_zone_id=Some,
+        // installed by `wire_mount_core` on non-SSOT voters), FIRE the
+        // peer's typed `NexusVFSService.Setattr` so the SSOT-side
+        // metastore.put commits the DT_REG row authoritatively on the
+        // peer.  SUPPLEMENT, not defer-and-return — the local-side
+        // metastore put / upsert BELOW STILL runs so the joiner's
+        // dcache observes the updated row IMMEDIATELY, without
+        // waiting for the peer's raft apply to round-trip.  Raft LWW
+        // dedupes the two metastore mutations on `modified_at_ms`.
+        //
+        // Best-effort: when `federation_peer_setattr` returns false
+        // (no reachable voter / RPC error / Noop client) we DON'T
+        // surface the error — the local-side flow proceeds
+        // regardless, preserving the legacy "metadata-only setattr
+        // on backend-less mount succeeds" shape.  PR #81-equivalent
+        // silent-miss semantics.  See
+        // `feedback_defer_to_peer_only_for_byte_ops` for why this is
+        // a supplement (setattr produces metadata the joiner needs
+        // LOCAL immediately for subsequent read consistency) rather
+        // than the pure-defer pattern sys_write / sys_unlink use.
+        if let Some(ref r) = route {
+            if r.is_federation_peer_mount() {
+                let _ = self.federation_peer_setattr(
+                    r,
+                    path,
+                    mime_type,
+                    content_id,
+                    modified_at_ms,
+                    created_at_ms,
+                    size,
+                    version,
+                );
+            }
+        }
+
         let existing: Option<crate::meta_store::FileMetadata> = if let Some(ref r) = route {
             self.with_metastore_route(r, |ms| ms.get(path).ok().flatten())
                 .flatten()

@@ -402,4 +402,54 @@ impl Kernel {
         })
         .is_some()
     }
+
+    /// `sys_setattr` UPDATE arm — fires the SSOT peer's
+    /// `NexusVFSService.Setattr` so the peer's metastore.put for the
+    /// DT_REG row commits authoritatively on the SSOT side.  Used
+    /// for the entry_type=0 (UPDATE/upsert DT_REG) branch only;
+    /// DT_MOUNT / DT_PIPE / DT_STREAM / DT_DIR / DT_LINK setattr
+    /// branches are node-local (driver wiring, IPC endpoints,
+    /// directory inodes, VFS-internal symlinks) and do not cross
+    /// machine boundaries.
+    ///
+    /// SUPPLEMENT, not replacement — same rationale as
+    /// `federation_peer_mkdir`: setattr produces metadata that the
+    /// joiner's VFSRouter / dcache must observe LOCALLY and
+    /// IMMEDIATELY for subsequent reads of the path to see the
+    /// updated row.  The local `metastore.put` runs in the caller
+    /// alongside this peer-side fire; raft LWW dedupes on
+    /// `modified_at_ms`.
+    ///
+    /// Returns `true` when the dispatch succeeded.  `false` is a
+    /// silent miss (no reachable voter / RPC error / Noop client) —
+    /// caller's local-side path proceeds regardless.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    pub(crate) fn federation_peer_setattr(
+        &self,
+        route: &crate::vfs_router::RouteResult,
+        peer_path: &str,
+        mime_type: Option<&str>,
+        content_id: Option<&str>,
+        modified_at_ms: Option<i64>,
+        created_at_ms: Option<i64>,
+        size: Option<u64>,
+        version: Option<u32>,
+    ) -> bool {
+        self.dispatch_federation_peer::<(), _>(route, "setattr", peer_path, |client, addr| {
+            client
+                .setattr(
+                    addr,
+                    peer_path,
+                    mime_type,
+                    content_id,
+                    modified_at_ms,
+                    created_at_ms,
+                    size,
+                    version,
+                )
+                .map(|()| Some(()))
+        })
+        .is_some()
+    }
 }
