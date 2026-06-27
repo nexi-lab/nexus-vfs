@@ -90,7 +90,6 @@ pub mod vfs_proto {
 // way.
 pub mod convenience;
 mod dispatch;
-mod federation;
 mod io;
 mod ipc;
 mod locks;
@@ -569,7 +568,7 @@ pub struct Kernel {
     // Node advertise address — set in federation mode so sys_write encodes
     // origin in backend_name (e.g. "cas-local@nexus-1:2126"). Enables
     // on-demand remote content fetch on other nodes.
-    self_address: parking_lot::RwLock<Option<String>>,
+    pub(crate) self_address: parking_lot::RwLock<Option<String>>,
     /// Kernel-owned tokio runtime — built once at `Kernel::new` and
     /// shared across every async caller (peer RPC fan-out, federation
     /// remote reads, LLM connector streaming). Kernel owns the runtime
