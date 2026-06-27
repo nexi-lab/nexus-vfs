@@ -1834,6 +1834,40 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
 /// Reconstruct the global VFS path for a DT_MOUNT entry.  Root-zone parents
 /// already publish a global path; nested mounts pre-pend the parent's own
 /// global path looked up via `cross_zone_mounts`.
+///
+/// When `cross_zone_mounts[parent_zone_id]` has MORE THAN ONE entry,
+/// pick the **gateway from root** — i.e. the cross-zone mount whose
+/// `parent_zone_id == ROOT_ZONE_ID`.  That entry is the canonical
+/// federation gateway INTO `parent_zone_id`, and its `global_path` is
+/// the prefix the parent zone's namespace anchors against.
+///
+/// The previous shape used `.min()` over `global_path`, which was a
+/// stand-in for "pick the gateway" that happened to work whenever a
+/// zone had exactly one cross-zone mount pointing into it (CI's
+/// typical 2-node topology).  In a topology where the same zone is
+/// reached via the root gateway AND has children that were ALSO
+/// recorded in `cross_zone_mounts` (for example, when an apply race
+/// or the kernel::dlc fallback path persists a same-zone driver-mount
+/// as cross-zone — see the `(parent=/root)` WARN at issue #44), the
+/// non-root entries' lexicographic order picks the wrong prefix and
+/// the same-zone DT_MOUNT placeholder lands at a path like
+/// `/shared/cc-tasks/joiner/cc-tasks/founder` instead of
+/// `/shared/cc-tasks/founder`.  Joiner's FUSE then sees nothing at
+/// `/mnt/cc-tasks/founder/` and every `host_task_write`-seeded
+/// cross-node test fails — exactly the cc-tasks-share + Federation
+/// E2E regression that PR #82 and reverted Phase 3a both surfaced
+/// without being the cause.
+///
+/// Selection rule (in priority order):
+///
+///   1. If any entry has `parent_zone_id == ROOT_ZONE_ID`, use its
+///      `global_path` — that's the federation gateway INTO this zone.
+///   2. Otherwise fall back to the shortest `global_path` — the
+///      most "gateway-like" prefix (closest to root, fewest path
+///      segments).  Lexicographic `.min()` happens to agree with
+///      length for path strings that share a prefix; using length
+///      explicitly makes the SSOT semantics — "pick the gateway,
+///      not the deepest child" — visible.
 fn reconstruct_global_path(
     cross_zone_mounts: &DashMap<String, Vec<CrossZoneMountTuple>>,
     parent_zone_id: &str,
@@ -1842,9 +1876,17 @@ fn reconstruct_global_path(
     if parent_zone_id == contracts::ROOT_ZONE_ID || parent_zone_id.is_empty() {
         return Some(mount_path.to_string());
     }
-    let parent_global = cross_zone_mounts
-        .get(parent_zone_id)
-        .and_then(|v| v.iter().map(|(_, _, g)| g.clone()).min())?;
+    let entries = cross_zone_mounts.get(parent_zone_id)?;
+    let parent_global = entries
+        .iter()
+        .find(|(pz, _, _)| pz == contracts::ROOT_ZONE_ID)
+        .map(|(_, _, g)| g.clone())
+        .or_else(|| {
+            entries
+                .iter()
+                .map(|(_, _, g)| g.clone())
+                .min_by_key(|g| g.len())
+        })?;
     if mount_path == parent_global || mount_path.starts_with(&format!("{}/", parent_global)) {
         Some(mount_path.to_string())
     } else if mount_path == "/" {
