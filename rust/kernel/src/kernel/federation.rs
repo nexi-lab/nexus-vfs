@@ -372,4 +372,34 @@ impl Kernel {
         })
         .is_some()
     }
+
+    /// `sys_rename` arm — fires the SSOT peer's
+    /// `NexusVFSService.Rename` so the peer's LocalConnector renames
+    /// the host fs entry (and the peer's metastore.rename_path
+    /// raft-proposes the metadata move on its side).
+    ///
+    /// SUPPLEMENT, not replacement — same rationale as
+    /// `federation_peer_mkdir`: rename produces ROUTING state (new
+    /// path → metadata + backend mapping), and the joiner's VFSRouter
+    /// must observe the rename LOCALLY and IMMEDIATELY for any child
+    /// op on the new path to route correctly.  The local
+    /// `metastore.rename_path` runs in the caller alongside this
+    /// peer-side fire; raft LWW dedupes the two metastore mutations
+    /// on `modified_at_ms`.
+    ///
+    /// Returns `true` when the dispatch succeeded.  `false` is a
+    /// silent miss (no reachable voter / RPC error / Noop client) —
+    /// caller's local-side path proceeds regardless.
+    #[inline]
+    pub(crate) fn federation_peer_rename(
+        &self,
+        route: &crate::vfs_router::RouteResult,
+        old_path: &str,
+        new_path: &str,
+    ) -> bool {
+        self.dispatch_federation_peer::<(), _>(route, "rename", old_path, |client, addr| {
+            client.rename(addr, old_path, new_path).map(|()| Some(()))
+        })
+        .is_some()
+    }
 }
