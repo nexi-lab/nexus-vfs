@@ -10,16 +10,14 @@
 //! `rust/transport/` (`FederationClient`).  This module owns ONLY the
 //! kernel-side concerns:
 //!
-//! * **§3.B.1 `DistributedCoordinator` wiring** — slot accessors
-//!   + `/__sys__/zones/` procfs synthesisers
-//!   ([`coordinator_wiring`]).
-//! * **§3.B.X `FederationPeerClient` wiring** — slot accessors +
-//!   generic [`dispatch_federation_peer`](peer_dispatch::Kernel::dispatch_federation_peer)
-//!   convention + per-syscall thin wrappers (`federation_peer_readdir`
-//!   / `_stat` / `_write` / `_delete_file` / `_mkdir` / `_rename` /
-//!   `_setattr`) ([`peer_dispatch`]).
-//! * **Blob-fetcher slot plumbing** — boot-time stash for the raft-tier
-//!   handler to drain ([`blob_fetcher_slot`]).
+//! * **§3.B.1 `DistributedCoordinator` wiring** ([`coordinator_wiring`]) —
+//!   slot accessors plus `/__sys__/zones/` procfs synthesisers.
+//! * **§3.B.X `FederationPeerClient` wiring** ([`peer_dispatch`]) — slot
+//!   accessors, the generic `dispatch_federation_peer` convention, and
+//!   per-syscall thin wrappers (`federation_peer_readdir` / `_stat` /
+//!   `_write` / `_delete_file` / `_mkdir` / `_rename` / `_setattr`).
+//! * **Blob-fetcher slot plumbing** ([`blob_fetcher_slot`]) — boot-time
+//!   stash for the raft-tier handler to drain.
 //!
 //! All methods stay members of [`crate::kernel::Kernel`] via
 //! `impl Kernel { ... }` blocks — the file split is a code-organization

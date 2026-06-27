@@ -1830,9 +1830,7 @@ impl Kernel {
         // a supplement (rename produces routing state the joiner
         // needs LOCAL immediately) rather than the pure-defer pattern
         // sys_write / sys_unlink use.
-        if old_route.mount_point == new_route.mount_point
-            && old_route.is_federation_peer_mount()
-        {
+        if old_route.mount_point == new_route.mount_point && old_route.is_federation_peer_mount() {
             let _ = self.federation_peer_rename(&old_route, old_path, new_path);
         }
 
