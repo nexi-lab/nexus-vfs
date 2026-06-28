@@ -23,6 +23,7 @@ pub use contracts::ROOT_ZONE_ID;
 //                     pillars).
 pub mod abc;
 pub mod core;
+pub mod federation;
 pub mod hal;
 
 // §3.A.2 ObjectStore extension hook — connector-backend SSE streaming.

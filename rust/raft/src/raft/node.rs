@@ -1993,14 +1993,40 @@ fn refresh_cached_status_from_raw_node(
 #[cfg(feature = "grpc")]
 impl ZoneConsensus<super::state_machine::FullStateMachine> {
     /// Sync wrapper around ``FullStateMachine::iter_dt_mount_entries``
-    /// for the kernel's startup DT_MOUNT replay. Uses ``try_read`` so
-    /// a contended lock returns an empty Vec rather than blocking —
-    /// the kernel's reconcile loop handles "come back later" naturally.
-    pub fn iter_dt_mount_entries(&self) -> super::Result<Vec<(String, String)>> {
-        match self.state_machine.try_read() {
-            Ok(sm) => sm.iter_dt_mount_entries(),
-            Err(_) => Ok(Vec::new()),
-        }
+    /// for the kernel's startup DT_MOUNT replay.  Blocks on the
+    /// state-machine RwLock via ``block_in_place`` + ``handle.block_on``
+    /// so the read always observes the durable post-apply state.
+    ///
+    /// The prior ``try_read`` shape returned an empty Vec on contention
+    /// — indistinguishable from "no DT_MOUNTs exist" — and at boot on
+    /// restart the raft driver is actively applying entries restored
+    /// from storage, so every try_read lost the race and
+    /// ``replay_existing_mounts`` silently saw 0 entries against a zone
+    /// whose state machine actually held DT_MOUNTs (the ``/shared``
+    /// gateway).  The cross-zone mount install in ``dlc.mount`` then
+    /// fell back to the node-local store under the ``#44`` warning,
+    /// and federated cross-node reads on the affected mount returned
+    /// FileNotFound until a fresh DT_MOUNT replicated to drive a new
+    /// apply-cb fire.  No reconcile loop existed to catch the empty
+    /// scan — the doc claim of "come back later" was false.
+    ///
+    /// ``block_in_place`` requires a multi-threaded outer runtime,
+    /// which every async caller of ``ZoneManager`` already uses
+    /// (``#[tokio::main(flavor = "multi_thread")]``).  Sound because
+    /// ``replay_existing_mounts`` first waits for
+    /// ``applied_index >= commit_index`` via
+    /// ``wait_for_state_machine_caught_up`` — by the time we reach
+    /// here the apply pass has released its write lock and the
+    /// blocking read returns immediately in the steady-state.  The
+    /// blocking shape only matters at the boot-window edge where the
+    /// driver is still finalising the last apply; we wait that out
+    /// rather than aliasing the result to "empty".
+    pub fn iter_dt_mount_entries(
+        &self,
+        handle: &tokio::runtime::Handle,
+    ) -> super::Result<Vec<(String, String)>> {
+        let sm = tokio::task::block_in_place(|| handle.block_on(self.state_machine.read()));
+        sm.iter_dt_mount_entries()
     }
 
     /// Sync handle to the state machine's shared advisory lock state.

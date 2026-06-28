@@ -1,154 +1,17 @@
-//! Federation syscalls + Control-Plane HAL §3.B wiring.
+//! `FederationPeerClient` slot + generic dispatch convention + per-syscall
+//! thin wrappers.
 //!
-//! Per-family submodule extracted from the monolithic `kernel/mod.rs`
-//! (consistent with other syscall-family submodules `io.rs`, `ipc.rs`,
-//! `locks.rs`, `dispatch.rs`, `observability.rs`). Methods stay
-//! members of [`Kernel`] via `impl Kernel { ... }` blocks — the split
-//! is a file-organization change, not an API change.
-//!
-//! Per `docs/KERNEL-ARCHITECTURE.md` §3, the three-way directory
-//! split is `abc/` for §3.A pillars, `hal/` for §3.B DI surfaces
-//! (strict trait declarations + Noop fallbacks), and `core/` for
-//! primitives.  Kernel-side WIRING for §3.B traits (slot accessors +
-//! consumer-side dispatch conventions) belongs in this file, next to
-//! the sister `DistributedCoordinator` wiring.
-//!
-//! Owns:
-//!
-//! * **§3.B.1 `DistributedCoordinator` wiring** — slot accessors
-//!   ([`Kernel::distributed_coordinator`],
-//!   [`Kernel::set_distributed_coordinator`]).
-//! * **Federation procfs** — `/__sys__/zones/` synthesisers
-//!   ([`Kernel::zones_procfs_stat`], [`Kernel::zones_procfs_readdir`]).
-//! * **Blob-fetcher slot plumbing** — boot-time stash for the
-//!   raft-tier handler to drain
-//!   ([`Kernel::stash_blob_fetcher_slot`],
-//!   [`Kernel::take_pending_blob_fetcher_slot`]).
-//! * **§3.B.X `FederationPeerClient` wiring** — slot accessors
-//!   ([`Kernel::federation_peer_client_arc`],
-//!   [`Kernel::set_federation_peer_client`]).
-//! * **Federation-peer dispatch convention** — the kernel-side
-//!   "iterate non-self voters, call the typed HAL method, return
-//!   first hit" convention every cross-node syscall short-circuit
-//!   reaches through.  Generic core
-//!   [`Kernel::dispatch_federation_peer`] plus per-syscall thin
-//!   wrappers [`Kernel::federation_peer_readdir`] /
-//!   [`Kernel::federation_peer_stat`] /
-//!   [`Kernel::federation_peer_write`] /
-//!   [`Kernel::federation_peer_delete_file`].
+//! Every cross-node syscall short-circuit (sys_stat / sys_readdir /
+//! sys_unlink / sys_write / sys_mkdir / sys_rename / sys_setattr) reaches
+//! one of the `federation_peer_X` wrappers below; the generic
+//! [`Kernel::dispatch_federation_peer`] encodes the "iterate non-self
+//! voters, call the typed HAL method, return first hit" convention.
 
 use std::sync::Arc;
 
-use super::{Kernel, StatResult};
+use crate::kernel::Kernel;
 
 impl Kernel {
-    /// Replace the kernel's coordinator slot with a concrete
-    /// `DistributedCoordinator` impl. Kernel boots with
-    /// `NoopDistributedCoordinator`; the host binary's boot path calls
-    /// this with the real `nexus_raft::distributed_coordinator` impl
-    /// once per kernel. Mirrors `set_peer_client`.
-    pub fn set_distributed_coordinator(
-        &self,
-        coordinator: Arc<dyn crate::hal::distributed_coordinator::DistributedCoordinator>,
-    ) {
-        *self.distributed_coordinator.write() = coordinator;
-    }
-
-    /// Borrow the current distributed coordinator — read-locked snapshot.
-    /// Internal callers use this to issue federation calls without
-    /// holding the lock across `.await`. After `set_distributed_coordinator`
-    /// runs at boot, this returns the real raft-backed impl; before
-    /// then, a `NoopDistributedCoordinator` that errors on every call.
-    pub fn distributed_coordinator(
-        &self,
-    ) -> Arc<dyn crate::hal::distributed_coordinator::DistributedCoordinator> {
-        Arc::clone(&self.distributed_coordinator.read())
-    }
-
-    /// Federation procfs: synthesise a `StatResult` for paths under the
-    /// `/__sys__/zones/` virtual namespace.  Read-only — like Linux
-    /// `/proc`, callers cannot create / remove a zone by writing to
-    /// this path.  Returns `Some` for `/__sys__/zones/` (directory
-    /// marker) and `/__sys__/zones/<id>` (per-zone synthesised entry);
-    /// `None` otherwise so the caller falls through to normal routing.
-    pub(crate) fn zones_procfs_stat(&self, path: &str) -> Option<StatResult> {
-        let suffix = path.strip_prefix("/__sys__/zones")?;
-        let provider = self.distributed_coordinator();
-        // Directory marker.
-        if suffix.is_empty() || suffix == "/" {
-            return Some(StatResult {
-                path: path.to_string(),
-                size: 4096,
-                content_id: None,
-                mime_type: "inode/directory".to_string(),
-                is_directory: true,
-                entry_type: crate::meta_store::DT_DIR,
-                mode: 0o555, // r-x — read-only namespace
-                version: 0,
-                gen: 0,
-                zone_id: Some("root".to_string()),
-                created_at_ms: None,
-                modified_at_ms: None,
-                last_writer_address: None,
-                lock: None,
-                link_target: None,
-                owner_id: None,
-            });
-        }
-        // /__sys__/zones/<id>: synthesise from federation list.
-        let zone_id = suffix.trim_start_matches('/');
-        if zone_id.is_empty() || zone_id.contains('/') {
-            return None;
-        }
-        if !provider.list_zones(self).iter().any(|z| z == zone_id) {
-            return None;
-        }
-        Some(StatResult {
-            path: path.to_string(),
-            size: 0,
-            content_id: None,
-            mime_type: "application/x-nexus-zone".to_string(),
-            is_directory: false,
-            entry_type: crate::meta_store::DT_REG,
-            mode: 0o444,
-            version: 0,
-            gen: 0,
-            zone_id: Some(zone_id.to_string()),
-            created_at_ms: None,
-            modified_at_ms: None,
-            last_writer_address: self.self_address_string(),
-            lock: None,
-            link_target: None,
-            owner_id: None,
-        })
-    }
-
-    /// Federation procfs: list zones for `/__sys__/zones/` directory
-    /// reads.  Returns `None` for paths outside the namespace so the
-    /// caller falls through to normal routing.
-    #[allow(dead_code)] // reserved for readdir `/__sys__/zones/` integration
-    pub(crate) fn zones_procfs_readdir(&self, path: &str) -> Option<Vec<String>> {
-        let suffix = path.strip_prefix("/__sys__/zones")?;
-        if !suffix.is_empty() && suffix != "/" {
-            return None;
-        }
-        Some(self.distributed_coordinator().list_zones(self))
-    }
-
-    /// Stash the raft-tier blob-fetcher slot. Drained by
-    /// `nexus_raft::blob_fetcher_handler::install` during boot.
-    /// Typed as `Box<dyn Any>` so kernel does not name the raft-side
-    /// `BlobFetcherSlot` concrete type.
-    pub fn stash_blob_fetcher_slot(&self, slot: Box<dyn std::any::Any + Send + Sync>) {
-        *self.pending_blob_fetcher_slot.lock() = Some(slot);
-    }
-
-    /// Drain the previously stashed blob-fetcher slot. Returns `None`
-    /// after the first drain so repeat-boot scenarios stay safe.
-    pub fn take_pending_blob_fetcher_slot(&self) -> Option<Box<dyn std::any::Any + Send + Sync>> {
-        self.pending_blob_fetcher_slot.lock().take()
-    }
-
     // ── §3.B.X FederationPeerClient slot accessors ────────────────────
     //
     // The kernel boots with `NoopFederationPeerClient` (errors on
@@ -335,6 +198,120 @@ impl Kernel {
     ) -> bool {
         self.dispatch_federation_peer::<(), _>(route, "delete_file", peer_path, |client, addr| {
             client.delete_file(addr, peer_path).map(|()| Some(()))
+        })
+        .is_some()
+    }
+
+    /// `sys_mkdir` arm — fires the SSOT peer's
+    /// `NexusVFSService.Mkdir` to materialise the directory on the
+    /// peer's LocalConnector (host fs side effect).
+    ///
+    /// Unlike `federation_peer_write` / `federation_peer_delete_file`
+    /// (whose callers DEFER ENTIRELY to the peer because the result
+    /// is BYTES on the SSOT side), the `sys_mkdir` caller invokes
+    /// this as a SUPPLEMENT — see
+    /// `feedback_defer_to_peer_only_for_byte_ops`.  The local
+    /// metastore.put for the DT_DIR row STILL runs locally so the
+    /// joiner's VFSRouter can route children of the new directory
+    /// IMMEDIATELY (sub-second), without waiting for the peer's
+    /// metastore.put to round-trip through raft apply.  Raft LWW
+    /// dedupes the peer's mirror put against ours.
+    ///
+    /// Returns `true` when the dispatch succeeded.  `false` is a
+    /// silent miss (no reachable voter / RPC error / Noop client) —
+    /// caller's local-side path proceeds regardless.
+    #[inline]
+    pub(crate) fn federation_peer_mkdir(
+        &self,
+        route: &crate::vfs_router::RouteResult,
+        peer_path: &str,
+        parents: bool,
+        exist_ok: bool,
+    ) -> bool {
+        self.dispatch_federation_peer::<(), _>(route, "mkdir", peer_path, |client, addr| {
+            client
+                .mkdir(addr, peer_path, parents, exist_ok)
+                .map(|()| Some(()))
+        })
+        .is_some()
+    }
+
+    /// `sys_rename` arm — fires the SSOT peer's
+    /// `NexusVFSService.Rename` so the peer's LocalConnector renames
+    /// the host fs entry (and the peer's metastore.rename_path
+    /// raft-proposes the metadata move on its side).
+    ///
+    /// SUPPLEMENT, not replacement — same rationale as
+    /// `federation_peer_mkdir`: rename produces ROUTING state (new
+    /// path → metadata + backend mapping), and the joiner's VFSRouter
+    /// must observe the rename LOCALLY and IMMEDIATELY for any child
+    /// op on the new path to route correctly.  The local
+    /// `metastore.rename_path` runs in the caller alongside this
+    /// peer-side fire; raft LWW dedupes the two metastore mutations
+    /// on `modified_at_ms`.
+    ///
+    /// Returns `true` when the dispatch succeeded.  `false` is a
+    /// silent miss (no reachable voter / RPC error / Noop client) —
+    /// caller's local-side path proceeds regardless.
+    #[inline]
+    pub(crate) fn federation_peer_rename(
+        &self,
+        route: &crate::vfs_router::RouteResult,
+        old_path: &str,
+        new_path: &str,
+    ) -> bool {
+        self.dispatch_federation_peer::<(), _>(route, "rename", old_path, |client, addr| {
+            client.rename(addr, old_path, new_path).map(|()| Some(()))
+        })
+        .is_some()
+    }
+
+    /// `sys_setattr` UPDATE arm — fires the SSOT peer's
+    /// `NexusVFSService.Setattr` so the peer's metastore.put for the
+    /// DT_REG row commits authoritatively on the SSOT side.  Used
+    /// for the entry_type=0 (UPDATE/upsert DT_REG) branch only;
+    /// DT_MOUNT / DT_PIPE / DT_STREAM / DT_DIR / DT_LINK setattr
+    /// branches are node-local (driver wiring, IPC endpoints,
+    /// directory inodes, VFS-internal symlinks) and do not cross
+    /// machine boundaries.
+    ///
+    /// SUPPLEMENT, not replacement — same rationale as
+    /// `federation_peer_mkdir`: setattr produces metadata that the
+    /// joiner's VFSRouter / dcache must observe LOCALLY and
+    /// IMMEDIATELY for subsequent reads of the path to see the
+    /// updated row.  The local `metastore.put` runs in the caller
+    /// alongside this peer-side fire; raft LWW dedupes on
+    /// `modified_at_ms`.
+    ///
+    /// Returns `true` when the dispatch succeeded.  `false` is a
+    /// silent miss (no reachable voter / RPC error / Noop client) —
+    /// caller's local-side path proceeds regardless.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    pub(crate) fn federation_peer_setattr(
+        &self,
+        route: &crate::vfs_router::RouteResult,
+        peer_path: &str,
+        mime_type: Option<&str>,
+        content_id: Option<&str>,
+        modified_at_ms: Option<i64>,
+        created_at_ms: Option<i64>,
+        size: Option<u64>,
+        version: Option<u32>,
+    ) -> bool {
+        self.dispatch_federation_peer::<(), _>(route, "setattr", peer_path, |client, addr| {
+            client
+                .setattr(
+                    addr,
+                    peer_path,
+                    mime_type,
+                    content_id,
+                    modified_at_ms,
+                    created_at_ms,
+                    size,
+                    version,
+                )
+                .map(|()| Some(()))
         })
         .is_some()
     }

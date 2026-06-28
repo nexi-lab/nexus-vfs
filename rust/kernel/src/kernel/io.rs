@@ -1802,6 +1802,38 @@ impl Kernel {
             None => return miss(),
         };
 
+        // §2.7. Federation-peer mount side effect: when both paths
+        // share a placeholder MountEntry (backend=None +
+        // target_zone_id=Some, installed by `wire_mount_core` on
+        // non-SSOT voters), FIRE the peer's typed
+        // `NexusVFSService.Rename` so the SSOT-side LocalConnector
+        // moves the host fs entry.  SUPPLEMENT, not defer-and-return
+        // — the local-side flow BELOW (existence check + metastore
+        // rename_path for the DT_REG / DT_DIR row) STILL runs so the
+        // joiner's VFSRouter / dcache observes the new path
+        // IMMEDIATELY for subsequent ops, without waiting for the
+        // peer's metastore mutations to round-trip through raft
+        // apply.  Raft LWW dedupes the two metastore mutations on
+        // `modified_at_ms`.
+        //
+        // Same-mount gate: cross-mount rename is rejected unconditionally
+        // at §6 below (no atomic 2PC for moving bytes across backends),
+        // so firing the peer for cross-mount paths would waste an RPC.
+        //
+        // Best-effort: when `federation_peer_rename` returns false
+        // (no reachable voter / RPC error / Noop client) we DON'T
+        // surface the error — the local-side flow proceeds
+        // regardless, preserving the legacy "metadata-only rename on
+        // backend-less mount succeeds" shape.  PR #81-equivalent
+        // silent-miss semantics.  See
+        // `feedback_defer_to_peer_only_for_byte_ops` for why this is
+        // a supplement (rename produces routing state the joiner
+        // needs LOCAL immediately) rather than the pure-defer pattern
+        // sys_write / sys_unlink use.
+        if old_route.mount_point == new_route.mount_point && old_route.is_federation_peer_mount() {
+            let _ = self.federation_peer_rename(&old_route, old_path, new_path);
+        }
+
         // 3. Sorted VFS lock acquire (deadlock-free: min(old,new) first)
         let (first, second) = if old_path <= new_path {
             (old_path, new_path)
@@ -2510,6 +2542,37 @@ impl Kernel {
                 hit: true,
                 post_hook_needed: false,
             });
+        }
+
+        // §2.7. Federation-peer mount side effect: when this mount has
+        // no local backend (placeholder MountEntry installed by
+        // wire_mount_core on the non-SSOT node) but carries a
+        // `target_zone_id`, FIRE the peer's typed
+        // `NexusVFSService.Mkdir` so the SSOT-side LocalConnector
+        // materialises the host fs directory.  CRITICAL: this is a
+        // SUPPLEMENT, not a defer-and-return — the local-side flow
+        // BELOW (existence check + metastore.put for the DT_DIR row)
+        // STILL runs so the joiner's VFSRouter has the DT_DIR
+        // routable IMMEDIATELY for subsequent ops on children of
+        // the new dir.  Raft LWW dedupes the peer's mirror put
+        // against ours on apply.
+        //
+        // This is the corrected-design fix for reverted PR #82's
+        // mkdir/rename/setattr regression: pure defer-to-peer
+        // (which works for sys_write / sys_unlink because their
+        // SSOT is BYTES) broke mkdir's routing because the joiner
+        // needed the row LOCAL immediately, not async via raft
+        // apply.  See `feedback_defer_to_peer_only_for_byte_ops`
+        // memory for the full rationale.
+        //
+        // Best-effort: when `federation_peer_mkdir` returns false
+        // (no reachable voter / RPC error / Noop client) we DON'T
+        // surface the error — the local-side flow proceeds
+        // regardless, preserving the legacy "metadata-only mkdir on
+        // backend-less mount succeeds" shape.  PR #81-equivalent
+        // silent-miss semantics.
+        if route.is_federation_peer_mount() {
+            let _ = self.federation_peer_mkdir(&route, path, parents, exist_ok);
         }
 
         // 3. Existence check: explicit entry OR implicit directory (children
