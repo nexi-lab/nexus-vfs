@@ -187,9 +187,11 @@ Etcd / TiKV-style opaque IDs + leader-driven `AddNode`.
 
   | Mode | Required state | Required flags | Forbidden flags | Bootstrap dispatch |
   |------|---------------|----------------|-----------------|---------------------|
-  | `static` | Empty data dir | `NEXUS_BOOTSTRAP_NEW=1` (founder) **or** `NEXUS_PEERS` non-empty (joiner) | — | Founder: `create_zone("root")` 1-voter.  Joiner: loop on JoinZone RPC against `NEXUS_PEERS`, indefinite |
+  | `static` | Empty data dir | `NEXUS_BOOTSTRAP_NEW=1` (founder) | `NEXUS_PEERS` non-empty (root is per-node SOLO — see below) | Founder: `create_zone("root")` 1-voter |
   | `dynamic` | Empty data dir | — | `NEXUS_BOOTSTRAP_NEW`, `NEXUS_PEERS` | Daemon comes up rootless; runtime API (`nexusd-cluster share`/`join`, Python `federation_create_zone`) drives zone formation |
   | `restart` | Data dir holds `<dir>/root/raft/` | — | `NEXUS_BOOTSTRAP_NEW`, `NEXUS_PEERS` | Resume from persisted ConfState — state on disk is the SSOT, env flags would be ambiguous |
+
+- **Root is per-node SOLO** — every nexus daemon owns its OWN 1-voter `root` zone.  Federation between independent nodes happens through NAMED zones (e.g. `sharedzone`), joined via the `nexusd-cluster join` sidecar — NEVER by adding another node into a peer's root cluster.  `NEXUS_PEERS` is reserved for in-cluster transport seeding; setting it at boot time on a fresh data dir is rejected with a clear error (`bootstrap_or_join_zone` SOLO-invariant gate) so the operator-facing misconfig "I want to federate with `<peer>`, so I set `NEXUS_PEERS=<peer>`" surfaces at boot rather than cascading through ConfChange / heartbeat / cross-federation pollution.  HA scenarios use named zones: 3 nodes wanting shared data create + join `dc1-namespace`; their per-node roots stay independent.  Pinned by [`test_root_zone_solo_contract`](../../rust/raft/tests/test_root_zone_solo_contract.rs).
 
 - **Wipe-rejoin** — wiping `<NEXUS_DATA_DIR>` mints a fresh `node_id` on the next boot; the daemon JoinZones, the leader commits `AddNode(new_id)`.
 

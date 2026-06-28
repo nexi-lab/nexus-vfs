@@ -504,10 +504,30 @@ pub fn validate_bootstrap_mode(
             let _ = data_dir_has_root;
             // Empty `bootstrap_new_set` AND empty `peers_non_empty` is
             // the single-node founder default — every cluster starts
-            // as a 1-voter group.  Non-empty peers triggers the
-            // joiner retry loop on empty state.  Both can coexist
-            // (explicit founder declaration with hostname-only peers
-            // list).
+            // as a 1-voter group.
+            //
+            // `NEXUS_PEERS` non-empty at static-mode boot is REJECTED:
+            // the static-mode boot path calls `bootstrap_or_join_zone`
+            // with zone_id="root", and root is per-node SOLO by design
+            // (each daemon owns its own 1-voter root namespace).
+            // Federation between independent nodes goes through NAMED
+            // zones via the `nexusd-cluster join` sidecar — never by
+            // dragging another node into a peer's root cluster.  The
+            // reject here mirrors the `bootstrap_or_join_zone` SOLO
+            // gate (defense in depth) so the misconfig is named at
+            // the operator-facing layer ("set mode = static + peers")
+            // BEFORE the kernel-internal layer rejects it again.
+            if peers_non_empty {
+                return Err(
+                    "bootstrap mode = static forbids NEXUS_PEERS / --peers — root is per-node \
+                     SOLO by design (each daemon owns its own 1-voter root namespace).  \
+                     NEXUS_PEERS would JoinZone(root) into the peer's cluster, which is \
+                     misuse for federation.  Fix: leave NEXUS_PEERS empty, then federate via \
+                     a named zone (`nexusd-cluster join <leader_id>@<addr> <named-zone> \
+                     <mount-path>` sidecar).  See docs/federation-architecture.md §6.3.1."
+                        .to_string(),
+                );
+            }
             Ok(())
         }
         BootstrapMode::Dynamic => {
@@ -1156,6 +1176,45 @@ pub fn bootstrap_or_join_zone(
     max_attempts: Option<u32>,
     as_learner: bool,
 ) -> Result<(), String> {
+    // Root-SOLO invariant: every nexus daemon owns its own per-node `root`
+    // zone (1-voter, local namespace).  Federation between independent
+    // nodes happens through NAMED zones (e.g. `sharedzone`) joined via
+    // the `nexusd-cluster join` sidecar — never by adding another node
+    // into a peer's root cluster.
+    //
+    // Reject peers-against-root at the only kernel-internal entry point
+    // that could JOIN root into a peer's cluster, so the operator-facing
+    // misconfig surfaces here with a clear error instead of cascading
+    // through ConfChange / heartbeat / clamping / cross-federation
+    // pollution.  The common misuse this catches is setting
+    // `NEXUS_PEERS=<peer-addr>` on a node that intended to federate
+    // with `<peer-addr>` over a named zone — `NEXUS_PEERS` is consumed
+    // by the boot path that calls this function with `zone_id="root"`,
+    // and a non-empty list there would trigger `JoinPeers` /
+    // `ProbePeersThenFound`, sending `JoinZone(root)` to the peer.
+    //
+    // Same-zone restart (Branch 1 below) is unaffected: zone loaded
+    // from disk resumes via persisted ConfState regardless of this
+    // gate, so an existing multi-voter root data dir (legacy) still
+    // boots — only NEW JoinZone / Found probes are rejected.  Named
+    // federation zones (non-root) pass through unchanged.
+    if zone_id == contracts::ROOT_ZONE_ID && !peer_addrs.is_empty() {
+        let peer_list: Vec<String> = peer_addrs
+            .iter()
+            .map(NodeAddress::to_raft_peer_str)
+            .collect();
+        return Err(format!(
+            "root zone is per-node SOLO by design (each nexus daemon owns its \
+             own 1-voter root namespace).  NEXUS_PEERS={peer_list:?} was \
+             applied to root, which would JoinZone(root) into the peer's \
+             cluster — that's misuse for federation.  Fix: leave NEXUS_PEERS \
+             empty on this node, then federate via a named zone \
+             (`nexusd-cluster join <leader_id>@<addr> <named-zone> <mount-path>` \
+             sidecar, or `--mount-driver local-connector:<named-zone>:...`).  \
+             See docs/federation-architecture.md §6.3.1."
+        ));
+    }
+
     // Branch 1: zone already loaded from disk.  Resume only when the
     // persisted state is consistent — the previous short-circuit accepted
     // any registered zone, which silently admitted half-installed states
@@ -2510,15 +2569,36 @@ mod tests {
         // Founder with explicit BOOTSTRAP_NEW (redundant under
         // empty peers but a legal documented alias).
         validate_bootstrap_mode(BootstrapMode::Static, false, true, false).expect("founder ok");
-        // Joiner: peers non-empty, BOOTSTRAP_NEW unset, data dir empty.
-        validate_bootstrap_mode(BootstrapMode::Static, false, false, true).expect("joiner ok");
-        // Belt-and-suspenders: both set is OK (founder with peer hint).
-        validate_bootstrap_mode(BootstrapMode::Static, false, true, true).expect("both ok");
+    }
+
+    #[test]
+    fn validate_static_rejects_peers_for_root_solo_invariant() {
+        // Root is per-node SOLO by design.  `NEXUS_PEERS` at static-mode
+        // boot would call `bootstrap_or_join_zone("root", peers=...)`
+        // which `JoinZone(root)`s into the peer's cluster — misuse for
+        // federation.  Validator catches it BEFORE the kernel-internal
+        // SOLO gate, so the operator sees a clear "mode + peers"
+        // shaped error.
+        let err = validate_bootstrap_mode(BootstrapMode::Static, false, false, true)
+            .expect_err("static + peers must be rejected (root SOLO invariant)");
+        assert!(err.contains("root is per-node SOLO"));
+        assert!(err.contains("NEXUS_PEERS"));
+        assert!(err.contains("nexusd-cluster join"));
+
+        // Even with BOOTSTRAP_NEW set (would-be probe-then-found):
+        // peers still applies to root, still rejected.
+        let err = validate_bootstrap_mode(BootstrapMode::Static, false, true, true)
+            .expect_err("static + bootstrap_new + peers must be rejected (root SOLO invariant)");
+        assert!(err.contains("root is per-node SOLO"));
     }
 
     #[test]
     fn validate_static_allows_existing_state_for_container_restart() {
-        validate_bootstrap_mode(BootstrapMode::Static, true, true, true)
+        // Persisted root resumes via Branch 1 (zone loaded from disk) —
+        // the SOLO gate only fires when peers is non-empty AND we'd
+        // need to JoinZone(root).  Restart with peers=empty resumes
+        // cleanly regardless of data_dir_has_root.
+        validate_bootstrap_mode(BootstrapMode::Static, true, true, false)
             .expect("static bootstrap with persisted state resumes after container restart");
     }
 
