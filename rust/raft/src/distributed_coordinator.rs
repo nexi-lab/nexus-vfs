@@ -330,7 +330,7 @@ impl RaftDistributedCoordinator {
                 &zone_id,
                 std::time::Duration::from_secs(10),
             );
-            let entries = consensus.iter_dt_mount_entries().unwrap_or_default();
+            let entries = consensus.iter_dt_mount_entries(runtime).unwrap_or_default();
             for (key, target_zone_id) in entries {
                 pending.push((zone_id.clone(), key, target_zone_id));
             }
