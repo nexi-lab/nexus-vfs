@@ -559,11 +559,39 @@ impl NexusVfsService for VfsServiceImpl {
         // `is_admin` comes from the auth-resolved context, never the
         // request — clients can't spoof admin reads of `/__sys__/zones/`.
         let entries = self.kernel.sys_readdir(&req.path, zone_id, ctx.is_admin);
+        // `Kernel::sys_readdir` returns full VFS paths for compose
+        // convenience to Tier 2 callers (vault storage, password_vault,
+        // ACP — they feed the entry path directly into a follow-up
+        // `read` / `stat`).  Transport boundaries are different:
+        // external POSIX consumers (FUSE plugin through the FFI bridge,
+        // gRPC clients here) want `readdir(3)`-shaped basenames so
+        // `reply.add(name)` / `dir entry name` aren't a malformed
+        // path-with-`/`.  The FFI bridge at
+        // `kernel/src/kernel/plugins/mod.rs` already strips; this is
+        // the symmetric strip on the gRPC side.
+        //
+        // Pre-this-fix the gRPC handler mapped `name → name` verbatim,
+        // so external gRPC clients saw `"/shared/cc-tasks/macos"`
+        // where they expected `"macos"`.  On macOS FUSE-T the
+        // kernel-side `reply.add(_, _, _, "/shared/cc-tasks/macos")`
+        // dropped the entry because POSIX dirent names can't contain
+        // `/`; on Windows WinFsp auto-extracted the trailing segment
+        // and the divergence stayed latent.  This re-establishes
+        // FFI/gRPC symmetry at the transport boundary without
+        // touching `Kernel::sys_readdir`'s Tier 1 contract (18+ Tier 2
+        // callers compose with full-path return — changing that would
+        // ripple).
         let mapped: Vec<ReaddirEntry> = entries
             .into_iter()
-            .map(|(name, dt)| ReaddirEntry {
-                name,
-                entry_type: dt as u32,
+            .filter_map(|(path, dt)| {
+                let name = path.rsplit('/').next()?;
+                if name.is_empty() {
+                    return None;
+                }
+                Some(ReaddirEntry {
+                    name: name.to_string(),
+                    entry_type: dt as u32,
+                })
             })
             .collect();
         Ok(Response::new(ReaddirResponse {
@@ -2736,5 +2764,77 @@ mod tests {
 
         let resp = svc.batch_write(req).await.expect("rpc ok").into_inner();
         assert_eq!(resp.results.len(), 0);
+    }
+
+    /// gRPC `Readdir` must return POSIX-shaped basenames in
+    /// `ReaddirEntry.name`, symmetric with the FFI plugin bridge at
+    /// `kernel/src/kernel/plugins/mod.rs::kernel_cb_sys_readdir`.
+    ///
+    /// Pre-this-fix the gRPC handler mapped each
+    /// `(full_path, entry_type)` from `Kernel::sys_readdir` verbatim
+    /// into the response, so external clients (the Mac↔Win
+    /// cc-tasks-share Direction A smoke is the canonical surfacing)
+    /// received `"/a/b/c"` where they expected `"c"`.  On macOS
+    /// FUSE-T the kernel-side `reply.add(_, _, _, "/a/b/c")` dropped
+    /// the entry — POSIX dirent names cannot contain `/`.  On Windows
+    /// WinFsp auto-extracted the trailing segment and masked the bug.
+    ///
+    /// `Kernel::sys_readdir` keeps its full-path return shape (Tier 1
+    /// infra ABI used by 18+ Tier 2 callers — vault storage,
+    /// password_vault, ACP — that benefit from full-path-return for
+    /// compose convenience).  The strip lives at the transport
+    /// boundary where external POSIX consumers live, matching the
+    /// existing FFI bridge convention.
+    #[tokio::test]
+    async fn readdir_returns_basenames_not_full_paths_for_grpc_clients() {
+        let kernel = std::sync::Arc::new(kernel_with_mem_backend());
+        // Seed two direct children of "/" via `KernelAbi::sys_write`
+        // (the same pattern other tests in this module use to materialize
+        // DT_REG entries — see `setattr_dt_mount_s3_builds_backend_and_serves_io`).
+        let ctx = OperationContext::new("test", "root", true, None, true);
+        KernelAbi::sys_write(&*kernel, "/alpha.txt", &ctx, b"a", 0)
+            .expect("seed /alpha.txt");
+        KernelAbi::sys_write(&*kernel, "/beta.json", &ctx, b"b", 0)
+            .expect("seed /beta.json");
+
+        let svc = VfsServiceImpl::for_test(kernel.clone());
+        let resp = svc
+            .readdir(tonic::Request::new(ReaddirRequest {
+                path: "/".into(),
+                auth_token: "test-key".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect("readdir rpc ok")
+            .into_inner();
+
+        assert!(!resp.is_error, "readdir must succeed: {resp:?}");
+        let names: Vec<&str> = resp.entries.iter().map(|e| e.name.as_str()).collect();
+
+        // The two children must appear as bare basenames.
+        assert!(
+            names.contains(&"alpha.txt"),
+            "gRPC readdir must return basename 'alpha.txt' (not '/alpha.txt'); got {names:?}",
+        );
+        assert!(
+            names.contains(&"beta.json"),
+            "gRPC readdir must return basename 'beta.json' (not '/beta.json'); got {names:?}",
+        );
+
+        // The SSOT regression sentinel: any leading-slash name means the
+        // pre-fix verbatim full-path mapping has come back, which would
+        // re-surface the macOS FUSE-T silent-drop bug Mac↔Win smoke hit.
+        for entry in &resp.entries {
+            assert!(
+                !entry.name.starts_with('/'),
+                "gRPC readdir entry must be a basename, not a full path; got: {:?}",
+                entry.name,
+            );
+            assert!(
+                !entry.name.contains('/'),
+                "gRPC readdir entry must contain no '/' (POSIX dirent rule); got: {:?}",
+                entry.name,
+            );
+        }
     }
 }
