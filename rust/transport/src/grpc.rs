@@ -2792,10 +2792,8 @@ mod tests {
         // (the same pattern other tests in this module use to materialize
         // DT_REG entries — see `setattr_dt_mount_s3_builds_backend_and_serves_io`).
         let ctx = OperationContext::new("test", "root", true, None, true);
-        KernelAbi::sys_write(&*kernel, "/alpha.txt", &ctx, b"a", 0)
-            .expect("seed /alpha.txt");
-        KernelAbi::sys_write(&*kernel, "/beta.json", &ctx, b"b", 0)
-            .expect("seed /beta.json");
+        KernelAbi::sys_write(&*kernel, "/alpha.txt", &ctx, b"a", 0).expect("seed /alpha.txt");
+        KernelAbi::sys_write(&*kernel, "/beta.json", &ctx, b"b", 0).expect("seed /beta.json");
 
         let svc = VfsServiceImpl::for_test(kernel.clone());
         let resp = svc
