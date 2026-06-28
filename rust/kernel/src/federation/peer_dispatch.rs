@@ -86,20 +86,65 @@ impl Kernel {
             &str,
         ) -> Result<Option<T>, String>,
     {
-        let target_zone = route.target_zone_id.as_deref()?;
+        let target_zone = match route.target_zone_id.as_deref() {
+            Some(z) => z,
+            None => {
+                // RouteResult without a target_zone_id reached the
+                // federation dispatch branch — the routing layer marked
+                // this as a federation-peer mount (caller checked
+                // `route.is_federation_peer_mount()`) but didn't fill
+                // in which zone owns the SSOT.  Indicates a routing-
+                // table SSOT regression; warn-loud because the caller
+                // (e.g., FUSE readdir) sees the resulting None as an
+                // empty directory and operators can't tell from the
+                // outside.
+                tracing::warn!(
+                    op = op_name,
+                    path = %peer_path,
+                    "federation peer dispatch: route is federation-peer-mount but \
+                     target_zone_id is None — routing-table SSOT regression, caller \
+                     will see empty result indistinguishable from a real empty dir"
+                );
+                return None;
+            }
+        };
         let peers = self.distributed_coordinator().zone_peers(self, target_zone);
         if peers.is_empty() {
+            // `zone_peers` returned empty for a zone we believe is
+            // federated.  Three concrete deployment shapes hit this:
+            //   * The joiner hasn't actually joined the target zone yet
+            //     (boot-replay timing, sidecar didn't run, root SOLO
+            //     misconfig — see [[feedback_distributed_ssot]]).
+            //   * `zone_peers` is computed against a stale conf state
+            //     that doesn't yet contain the SSOT peer.
+            //   * The zone exists locally but has 0 voters configured
+            //     (federation never bootstrapped on this side).
+            // All three present to the caller as "directory is empty"
+            // — exactly the Mac↔Win Direction-A wedge signature.
+            // Surface at warn-level so operators can grep this single
+            // line without enabling per-module trace logging.
+            tracing::warn!(
+                op = op_name,
+                target_zone = %target_zone,
+                path = %peer_path,
+                "federation peer dispatch: zone_peers returned empty — caller will \
+                 see empty result indistinguishable from a real empty dir; check that \
+                 the joiner actually joined this zone (sidecar log + raft conf state)"
+            );
             return None;
         }
         let self_addr = self.self_address.read().clone();
         let client = self.federation_peer_client_arc();
-        for peer_addr in peers {
+        let mut errors: Vec<String> = Vec::new();
+        let mut attempted = 0usize;
+        for peer_addr in &peers {
             if let Some(ref s) = self_addr {
-                if s == &peer_addr {
+                if s == peer_addr {
                     continue;
                 }
             }
-            match op(&client, &peer_addr) {
+            attempted += 1;
+            match op(&client, peer_addr) {
                 Ok(Some(result)) => return Some(result),
                 Ok(None) => continue,
                 Err(e) => {
@@ -110,8 +155,40 @@ impl Kernel {
                         error = %e,
                         "federation peer dispatch failed; trying next voter"
                     );
+                    errors.push(format!("{peer_addr}: {e}"));
                 }
             }
+        }
+        // Fell through every voter without a hit.  Distinguish three
+        // sub-cases so operators can act:
+        //   * `attempted == 0` — every voter in `peers` was self_addr
+        //     (single-node federation arrangement; dispatch is
+        //     impossible until a peer actually joins).
+        //   * `errors.len() == attempted` — every non-self voter's
+        //     RPC errored (network / cert / WinFsp-side panic).
+        //     Surface at warn so it isn't lost in debug noise.
+        //   * Otherwise — every non-self voter returned Ok(None),
+        //     i.e., they all legitimately don't have the entry
+        //     (true miss; remain debug-level — high-volume normal case).
+        if attempted == 0 {
+            tracing::warn!(
+                op = op_name,
+                target_zone = %target_zone,
+                path = %peer_path,
+                voters = peers.len(),
+                "federation peer dispatch: all voters resolved to self_addr — no peer \
+                 to dispatch to; caller will see empty result"
+            );
+        } else if errors.len() == attempted {
+            tracing::warn!(
+                op = op_name,
+                target_zone = %target_zone,
+                path = %peer_path,
+                attempted,
+                errors = %errors.join(" | "),
+                "federation peer dispatch: every non-self voter's RPC failed; caller \
+                 will see empty result indistinguishable from a real empty dir"
+            );
         }
         None
     }
