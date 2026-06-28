@@ -3431,7 +3431,22 @@ impl Kernel {
     /// are filtered to only include those belonging to the caller's zone or
     /// the root zone (global namespace).
     ///
-    /// Returns Vec of (child_path, entry_type) tuples.
+    /// Returns Vec of `(basename, entry_type)` tuples — each entry is the
+    /// last path segment under `parent_path`, matching POSIX `readdir(3)`
+    /// semantics.  Callers needing the full child path compose it via
+    /// `{parent_path}/{basename}` (rare — most callers consume the
+    /// basename verbatim for FUSE / gRPC / `cc tasks list` shapes).
+    ///
+    /// SSOT note: the basename strip lives HERE so every transport
+    /// (FFI plugin bridge, gRPC handler) and every kernel-internal
+    /// caller (`readdir_paged`, `get_top_level_mounts`) sees the same
+    /// shape.  Pre-this-refactor the kernel returned full paths and
+    /// only the FFI bridge stripped — gRPC accidentally exposed full
+    /// paths to network clients, surfacing as the Mac↔Win cc-tasks-share
+    /// smoke gap where Mac FUSE-T silently dropped name-with-`/`
+    /// entries from `reply.add` while Win WinFsp auto-extracted the
+    /// trailing segment.  Returning basenames at the kernel layer
+    /// eliminates the divergence by construction.
     pub fn sys_readdir(
         &self,
         parent_path: &str,
@@ -3461,14 +3476,12 @@ impl Kernel {
 
         let needs_zone_filter = !is_admin && zone_id != contracts::ROOT_ZONE_ID;
 
-        // Track (entry_type, zone_id) so we can zone-filter at the end.
+        // Track basename → (entry_type, zone_id) so we can zone-filter
+        // at the end.  Keyed by basename for the SSOT-of-shape note
+        // above; sort order is identical to full-path keying because
+        // every key shares the same parent prefix within one call.
         let mut seen: std::collections::BTreeMap<String, (u8, Option<String>)> =
             std::collections::BTreeMap::new();
-        let parent_for_join = if parent_path == contracts::VFS_ROOT {
-            ""
-        } else {
-            parent_path.trim_end_matches('/')
-        };
 
         if let Some(ms_children) =
             self.with_metastore_route(&route, |ms| ms.list(&global_prefix).ok())
@@ -3482,7 +3495,11 @@ impl Kernel {
                 if !meta.path.starts_with(&global_prefix) {
                     continue;
                 }
-                seen.entry(meta.path)
+                let basename = match meta.path.rsplit('/').next() {
+                    Some(b) if !b.is_empty() => b.to_string(),
+                    _ => continue,
+                };
+                seen.entry(basename)
                     .or_insert((meta.entry_type, meta.zone_id));
             }
         }
@@ -3503,8 +3520,7 @@ impl Kernel {
                     continue;
                 }
                 let etype = if is_dir { DT_DIR } else { DT_REG };
-                let child_path = format!("{}/{}", parent_for_join, clean);
-                seen.entry(child_path)
+                seen.entry(clean.to_string())
                     .or_insert((etype, Some(route.zone_id.clone())));
             }
         } else if route.is_federation_peer_mount() {
@@ -3520,15 +3536,17 @@ impl Kernel {
             // possible in the canonical 2-node topology.
             if let Some(entries) = self.federation_peer_readdir(&route, parent_path) {
                 for (peer_path, etype) in entries {
-                    // Peer returns absolute peer paths; rebase to the
-                    // local global namespace by stripping the peer's
-                    // mount root and re-prepending `parent_for_join`.
-                    let basename = peer_path.rsplit('/').next().unwrap_or(&peer_path);
-                    if basename.is_empty() {
-                        continue;
-                    }
-                    let child_path = format!("{}/{}", parent_for_join, basename);
-                    seen.entry(child_path)
+                    // Peer's `list_dir` already returns basenames
+                    // (post-SSOT-fix the FFI / gRPC layer convention).
+                    // Defensive rsplit handles the unlikely case where
+                    // a peer returns a full path (e.g. pre-fix peer
+                    // node, mixed-version cluster during rolling
+                    // upgrade).
+                    let basename = match peer_path.rsplit('/').next() {
+                        Some(b) if !b.is_empty() => b.to_string(),
+                        _ => continue,
+                    };
+                    seen.entry(basename)
                         .or_insert((etype, Some(route.zone_id.clone())));
                 }
             }
@@ -3540,11 +3558,11 @@ impl Kernel {
                     let ez = entry_zone.as_deref().unwrap_or(contracts::ROOT_ZONE_ID);
                     ez == contracts::ROOT_ZONE_ID || ez == zone_id
                 })
-                .map(|(path, (etype, _))| (path, etype))
+                .map(|(name, (etype, _))| (name, etype))
                 .collect()
         } else {
             seen.into_iter()
-                .map(|(path, (etype, _))| (path, etype))
+                .map(|(name, (etype, _))| (name, etype))
                 .collect()
         };
         entries
