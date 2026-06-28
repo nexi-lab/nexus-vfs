@@ -258,35 +258,22 @@ unsafe extern "C" fn kernel_cb_sys_readdir(
     // System-context readdir: bypass admin gating (the kernel-side
     // permission check is the SSOT for any access policy plugins
     // care about).
-    let entries = kernel.sys_readdir(parent_path, contracts::ROOT_ZONE_ID, true);
-    // `kernel.sys_readdir` returns each child's *full* VFS path (e.g.
-    // `/alpha-dir`, not `alpha-dir`); the JSON shape this callback
-    // exports is documented under key `"name"` and consumers like the
-    // FUSE plugin feed it directly into `reply.add(_, _, kind, name)`
-    // where a leading slash makes the kernel-side FUSE driver reject
-    // the readdir reply with EIO.  Strip the parent-path prefix here
-    // so the JSON `"name"` field actually is a name.  The kernel
-    // already filters direct children only (see io.rs §sys_readdir
-    // parent_depth check), so a single `rsplit_once('/')` is the
-    // canonical leaf extraction.
+    //
+    // `kernel.sys_readdir` returns basenames (POSIX `readdir(3)`
+    // semantics — see io.rs sys_readdir doc).  The FUSE plugin feeds
+    // each `"name"` directly into `reply.add(_, _, kind, name)`; the
+    // kernel-side basename strip means we don't dup-strip here.
     //
     // Hand-roll JSON to avoid a serde_json dep on the kernel-side
     // callback closure.  Each entry is one
     // `{"name":<escaped>,"entry_type":<u8>}` object.  Only `"` and
     // `\` need JSON-escape — extremely rare in path segments but
     // cheap to handle correctly.
+    let entries = kernel.sys_readdir(parent_path, contracts::ROOT_ZONE_ID, true);
     let mut json = String::from("[");
     let mut first = true;
-    for (full_path, entry_type) in entries {
-        let name = full_path
-            .rsplit_once('/')
-            .map(|(_, leaf)| leaf)
-            .unwrap_or(full_path.as_str());
+    for (name, entry_type) in entries {
         if name.is_empty() {
-            // Defensive: the parent itself slipped through (shouldn't
-            // happen with the kernel's depth filter, but if it does the
-            // FUSE layer would `reply.add` an empty name and the
-            // kernel driver rejects the whole batch).
             continue;
         }
         if !first {
