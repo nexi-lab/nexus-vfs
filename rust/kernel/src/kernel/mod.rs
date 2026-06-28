@@ -3346,15 +3346,143 @@ mod tests {
         );
 
         // sys_readdir should list the child we just created under /data
+        // — returns basename (POSIX readdir semantics, SSOT-aligned
+        // across FFI / gRPC transports).
         let entries = k.sys_readdir("/data", "root", true);
         assert!(
             !entries.is_empty(),
             "sys_readdir must return the created child"
         );
         assert!(
-            entries.iter().any(|(name, _)| name == "/data/reports"),
-            "sys_readdir must include '/data/reports': {:?}",
+            entries.iter().any(|(name, _)| name == "reports"),
+            "sys_readdir must include basename 'reports' (not '/data/reports'): {:?}",
             entries
+        );
+    }
+
+    /// `sys_readdir` basename-shape SSOT pin — see io.rs `sys_readdir`
+    /// doc for why this matters.  Guards against any future
+    /// reintroduction of the full-path return shape that the Mac↔Win
+    /// cc-tasks-share smoke surfaced (FUSE-T silently dropped
+    /// name-with-`/` entries, WinFsp auto-extracted the trailing
+    /// segment — divergence stayed latent until cross-machine smoke).
+    ///
+    /// Four scenarios are pinned together because the function has
+    /// independently-walked codepaths and the divergence regression
+    /// would re-emerge if only one shape were tested.
+    #[test]
+    fn sys_readdir_basename_shape_all_scenarios() {
+        use crate::kernel::convenience::{KernelConvenience, MountOptions};
+        use crate::meta_store::{FileMetadata, LocalMetaStore};
+        use std::sync::Arc;
+
+        const DT_REG: u8 = 0;
+        const DT_DIR: u8 = 1;
+        const ROOT_ZONE: &str = contracts::ROOT_ZONE_ID;
+
+        let put = |k: &Kernel, path: &str, etype: u8| {
+            let meta = FileMetadata {
+                path: path.to_string(),
+                size: 0,
+                content_id: None,
+                gen: 0,
+                version: 1,
+                entry_type: etype,
+                zone_id: Some(ROOT_ZONE.to_string()),
+                mime_type: None,
+                created_at_ms: None,
+                modified_at_ms: None,
+                last_writer_address: None,
+                target_zone_id: None,
+                link_target: None,
+                owner_id: None,
+            };
+            k.metastore_put(path, meta).expect("metastore_put");
+        };
+
+        let fresh = || {
+            let td = tempfile::tempdir().expect("tempdir");
+            let ms = Arc::new(LocalMetaStore::open(&td.path().join("ms.redb")).expect("open"));
+            let kernel = Kernel::new();
+            let opts = MountOptions::new("local")
+                .with_metastore(ms as Arc<dyn crate::meta_store::MetaStore>)
+                .with_zone(ROOT_ZONE);
+            kernel.mount("/", opts).expect("mount /");
+            (kernel, td)
+        };
+
+        // Scenario 1: children directly under "/" — trickiest case
+        // because parent_path == "/" has no prefix to strip.
+        let (kernel, _td) = fresh();
+        put(&kernel, "/alpha.txt", DT_REG);
+        put(&kernel, "/beta", DT_DIR);
+        let entries = kernel.sys_readdir("/", ROOT_ZONE, true);
+        let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&"alpha.txt"),
+            "(/): expected basename 'alpha.txt', got {names:?}",
+        );
+        assert!(
+            names.contains(&"beta"),
+            "(/): expected basename 'beta', got {names:?}",
+        );
+        for (name, _) in &entries {
+            assert!(
+                !name.starts_with('/'),
+                "(/): regression — leading-slash means full-path shape came back: {name:?}",
+            );
+        }
+
+        // Scenario 2: nested dir with direct child + grandchild —
+        // grandchild must NOT appear in direct readdir, basenames
+        // must not contain '/'.
+        let (kernel, _td) = fresh();
+        put(&kernel, "/data", DT_DIR);
+        put(&kernel, "/data/reports", DT_DIR);
+        put(&kernel, "/data/reports/q1.csv", DT_REG);
+        put(&kernel, "/data/reports/archive/2024.csv", DT_REG);
+        let entries = kernel.sys_readdir("/data/reports", ROOT_ZONE, true);
+        let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&"q1.csv"),
+            "(/data/reports): expected basename 'q1.csv', got {names:?}",
+        );
+        assert!(
+            !names.iter().any(|n| n.contains('/')),
+            "(/data/reports): basename must not contain '/', got {names:?}",
+        );
+        assert!(
+            !names.contains(&"2024.csv"),
+            "(/data/reports): grandchild must NOT appear in direct readdir, got {names:?}",
+        );
+
+        // Scenario 3: trailing-slash normalisation produces the same
+        // basenames as the no-slash form.
+        let (kernel, _td) = fresh();
+        put(&kernel, "/data", DT_DIR);
+        put(&kernel, "/data/foo", DT_REG);
+        let without_slash = kernel.sys_readdir("/data", ROOT_ZONE, true);
+        let with_slash = kernel.sys_readdir("/data/", ROOT_ZONE, true);
+        assert_eq!(
+            without_slash, with_slash,
+            "trailing-slash normalisation must yield identical basenames",
+        );
+        let names: Vec<&str> = without_slash.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["foo"],
+            "(/data trailing): expected ['foo'], got {names:?}",
+        );
+
+        // Scenario 4: empty dir → empty Vec (caller distinguishes
+        // empty vs missing via sys_stat; sys_readdir of an existing
+        // empty dir is just []).
+        let (kernel, _td) = fresh();
+        put(&kernel, "/empty", DT_DIR);
+        let entries = kernel.sys_readdir("/empty", ROOT_ZONE, true);
+        assert!(
+            entries.is_empty(),
+            "empty dir must yield empty vec, got {entries:?}",
         );
     }
 
