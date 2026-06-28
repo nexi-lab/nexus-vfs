@@ -393,3 +393,244 @@ impl Kernel {
         .is_some()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Behavioral pins for `dispatch_federation_peer` — the SSOT
+    //! helper every federation-peer syscall (readdir / stat / write /
+    //! delete_file / rmdir / mkdir / rename / setattr) goes through.
+    //!
+    //! The seven scenarios below pin the three silent-failure code
+    //! paths the observability warn-lines name, plus the three
+    //! happy-path returns.  If any of these regresses, an operator
+    //! loses ground-truth signal in the next Mac↔Win Direction-A
+    //! re-investigation — exactly the failure mode that led to the
+    //! wrong-hypothesis loop closed by PR #93.
+
+    use std::sync::{Arc, Mutex};
+
+    use crate::core::vfs_router::RouteResult;
+    use crate::federation::test_support::build_kernel_with_peers;
+    use crate::hal::federation_peer::FederationPeerClient;
+
+    /// Construct a `RouteResult` shaped like a federation-peer mount
+    /// (`target_zone_id = Some(...)`) for the dispatch helper to
+    /// iterate over.  All other fields take harmless defaults — the
+    /// dispatch helper only reads `target_zone_id`.
+    fn fed_route(target_zone: Option<&str>) -> RouteResult {
+        RouteResult {
+            mount_point: "/sharedzone/cc-tasks/founder".into(),
+            backend_path: String::new(),
+            zone_id: "sharedzone".into(),
+            is_external: false,
+            is_cas: false,
+            metastore: None,
+            backend: None,
+            target_zone_id: target_zone.map(|s| s.to_string()),
+        }
+    }
+
+    type DispatchClosure<T> =
+        Box<dyn FnMut(&Arc<dyn FederationPeerClient>, &str) -> Result<Option<T>, String>>;
+
+    /// Shared call recorder — every invocation of the dispatch closure
+    /// pushes the `peer_addr` it was called with.  Lets each test
+    /// assert which peers were actually iterated (loop-back skip,
+    /// all-errors, early-return on first hit).
+    type CallRecorder = Arc<Mutex<Vec<String>>>;
+
+    fn new_recorder() -> CallRecorder {
+        Arc::new(Mutex::new(Vec::new()))
+    }
+
+    fn recorded(rec: &CallRecorder) -> Vec<String> {
+        rec.lock().expect("recorder mutex").clone()
+    }
+
+    /// Build a dispatch closure with explicit per-peer-address results.
+    /// `responses` is `(peer_addr, Result<Option<T>, String>)`; unmatched
+    /// addresses default to `Ok(None)` (treated as a legit miss).
+    fn closure_with_responses<T: Clone + 'static>(
+        responses: Vec<(String, Result<Option<T>, String>)>,
+        rec: CallRecorder,
+    ) -> DispatchClosure<T> {
+        Box::new(move |_client, addr| {
+            rec.lock().expect("recorder mutex").push(addr.to_string());
+            responses
+                .iter()
+                .find(|(a, _)| a == addr)
+                .map(|(_, r)| r.clone())
+                .unwrap_or(Ok(None))
+        })
+    }
+
+    /// Failure path (a): `route.target_zone_id == None`.  Caller's
+    /// `is_federation_peer_mount` check let it slip through to dispatch
+    /// but the routing entry never filled in `target_zone_id` — must
+    /// short-circuit None without consulting peers or invoking the op.
+    #[test]
+    fn dispatch_target_zone_none_returns_none_without_invoking_op() {
+        let k = build_kernel_with_peers(Some("self:1"), Vec::<String>::new());
+        let route = fed_route(None);
+        let rec = new_recorder();
+        let closure = closure_with_responses::<()>(Vec::new(), Arc::clone(&rec));
+        let result = k.dispatch_federation_peer::<(), _>(&route, "readdir", "/x", closure);
+        assert!(result.is_none(), "target_zone_id=None must yield None");
+        let calls = recorded(&rec);
+        assert!(
+            calls.is_empty(),
+            "op closure must NOT be invoked when target_zone_id is None; got {calls:?}"
+        );
+    }
+
+    /// Failure path (b): `zone_peers` returns empty.  Joiner-not-joined
+    /// / stale-conf / 0-voter-zone shape — must short-circuit None
+    /// without invoking the op even once.
+    #[test]
+    fn dispatch_empty_zone_peers_returns_none_without_invoking_op() {
+        let k = build_kernel_with_peers(Some("self:1"), Vec::<String>::new());
+        let route = fed_route(Some("sharedzone"));
+        let rec = new_recorder();
+        let closure = closure_with_responses::<u32>(Vec::new(), Arc::clone(&rec));
+        let result = k.dispatch_federation_peer::<u32, _>(&route, "stat", "/y", closure);
+        assert!(result.is_none(), "empty peers must yield None");
+        let calls = recorded(&rec);
+        assert!(
+            calls.is_empty(),
+            "op closure must NOT be invoked when peers list is empty; got {calls:?}"
+        );
+    }
+
+    /// Failure path (c): every non-self voter errors.  Dispatch must
+    /// iterate every non-self peer, accumulate errors, and return None.
+    #[test]
+    fn dispatch_all_peers_err_iterates_all_then_returns_none() {
+        let k = build_kernel_with_peers(Some("self:1"), ["self:1", "peer:a", "peer:b"]);
+        let route = fed_route(Some("sharedzone"));
+        let rec = new_recorder();
+        let closure = closure_with_responses::<()>(
+            vec![
+                ("peer:a".to_string(), Err("connect refused".into())),
+                ("peer:b".to_string(), Err("tls handshake failed".into())),
+            ],
+            Arc::clone(&rec),
+        );
+        let result = k.dispatch_federation_peer::<(), _>(&route, "readdir", "/p", closure);
+        assert!(result.is_none(), "all-peers-error must yield None");
+        assert_eq!(
+            recorded(&rec),
+            vec!["peer:a".to_string(), "peer:b".to_string()],
+            "self:1 must be loop-back-skipped; every non-self peer must be \
+             attempted exactly once and in the order zone_peers returned them"
+        );
+    }
+
+    /// Sub-case of (c): every peer in `zone_peers` resolves to
+    /// `self_addr` — loop-back guard skips all of them, the op closure
+    /// is never invoked, and the helper returns None.  Tracks the
+    /// "single-node arrangement" warn line.
+    #[test]
+    fn dispatch_all_peers_are_self_addr_skips_all_then_returns_none() {
+        let k = build_kernel_with_peers(Some("self:1"), ["self:1", "self:1"]);
+        let route = fed_route(Some("sharedzone"));
+        let rec = new_recorder();
+        let closure = closure_with_responses::<()>(Vec::new(), Arc::clone(&rec));
+        let result = k.dispatch_federation_peer::<(), _>(&route, "mkdir", "/q", closure);
+        assert!(
+            result.is_none(),
+            "all-voters-are-self must yield None (no peer to dispatch to)"
+        );
+        let calls = recorded(&rec);
+        assert!(
+            calls.is_empty(),
+            "op closure must NOT be invoked when every voter is self_addr; got {calls:?}"
+        );
+    }
+
+    /// Happy path: first non-self peer returns `Ok(Some(v))` — dispatch
+    /// returns that value immediately without trying subsequent peers.
+    #[test]
+    fn dispatch_first_peer_hit_short_circuits_with_value() {
+        let k = build_kernel_with_peers(Some("self:1"), ["self:1", "peer:a", "peer:b"]);
+        let route = fed_route(Some("sharedzone"));
+        let rec = new_recorder();
+        let closure = closure_with_responses::<u64>(
+            vec![
+                ("peer:a".to_string(), Ok(Some(42u64))),
+                ("peer:b".to_string(), Ok(Some(99u64))),
+            ],
+            Arc::clone(&rec),
+        );
+        let result = k.dispatch_federation_peer::<u64, _>(&route, "stat", "/r", closure);
+        assert_eq!(
+            result,
+            Some(42),
+            "first-hit short-circuit must return peer:a's Ok(Some(42)), not peer:b's"
+        );
+        assert_eq!(
+            recorded(&rec),
+            vec!["peer:a".to_string()],
+            "peer:b must NOT be queried once peer:a returns Ok(Some(_))"
+        );
+    }
+
+    /// Happy path: a peer returns `Ok(None)` (legit miss) — dispatch
+    /// continues to the next peer.  This is the "no warn" sub-case of
+    /// the all-fall-through return — true miss, no operator action.
+    #[test]
+    fn dispatch_ok_none_continues_to_next_peer() {
+        let k = build_kernel_with_peers(Some("self:1"), ["peer:a", "peer:b"]);
+        let route = fed_route(Some("sharedzone"));
+        let rec = new_recorder();
+        let closure = closure_with_responses::<String>(
+            vec![
+                ("peer:a".to_string(), Ok(None)),
+                ("peer:b".to_string(), Ok(Some("found".to_string()))),
+            ],
+            Arc::clone(&rec),
+        );
+        let result = k.dispatch_federation_peer::<String, _>(&route, "stat", "/s", closure);
+        assert_eq!(
+            result.as_deref(),
+            Some("found"),
+            "peer:a's Ok(None) must be treated as miss-and-try-next, surfacing peer:b's value"
+        );
+        assert_eq!(
+            recorded(&rec),
+            vec!["peer:a".to_string(), "peer:b".to_string()],
+            "both peers must be queried in zone_peers order; peer:b's value must surface"
+        );
+    }
+
+    /// Mixed path: some peers err, some return Ok(None), one returns
+    /// Ok(Some) later in the list — dispatch must surface the hit and
+    /// iterate up to it (no further).
+    #[test]
+    fn dispatch_mixed_err_then_ok_none_then_hit_surfaces_hit() {
+        let k = build_kernel_with_peers(
+            Some("self:1"),
+            ["self:1", "peer:a", "peer:b", "peer:c", "peer:d"],
+        );
+        let route = fed_route(Some("sharedzone"));
+        let rec = new_recorder();
+        let closure = closure_with_responses::<u8>(
+            vec![
+                ("peer:a".to_string(), Err("503".into())),
+                ("peer:b".to_string(), Ok(None)),
+                ("peer:c".to_string(), Ok(Some(7u8))),
+            ],
+            Arc::clone(&rec),
+        );
+        let result = k.dispatch_federation_peer::<u8, _>(&route, "write", "/t", closure);
+        assert_eq!(result, Some(7), "peer:c's hit must surface");
+        assert_eq!(
+            recorded(&rec),
+            vec![
+                "peer:a".to_string(),
+                "peer:b".to_string(),
+                "peer:c".to_string()
+            ],
+            "iteration must stop at peer:c — peer:d MUST NOT be queried after a hit"
+        );
+    }
+}

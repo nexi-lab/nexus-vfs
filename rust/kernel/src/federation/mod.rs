@@ -28,3 +28,6 @@
 mod blob_fetcher_slot;
 mod coordinator_wiring;
 mod peer_dispatch;
+
+#[cfg(test)]
+mod test_support;
