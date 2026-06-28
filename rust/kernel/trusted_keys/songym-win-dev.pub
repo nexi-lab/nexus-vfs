@@ -1,8 +1,0 @@
-# local dev trust root — songym Windows box only
-# NOT for commit; used to sign locally-built plugin dylibs for
-# Mac↔Win runbook §3g manual smoke when the release pipeline can't
-# emit signed Windows artifacts.
-# Matching privkey persisted at ~/.nexus/dev-keys/songym-win-dev.privkey
-# (gitignored area; do NOT commit). Regenerate via
-# `py -c "..."` (see reference_local_plugin_signing_dev_root memory).
-G6D3fLPjoRsnd52rVQwbS79sgbe3qf/IRmVwGU808F8=
