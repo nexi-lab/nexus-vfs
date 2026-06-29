@@ -1966,18 +1966,16 @@ impl Kernel {
         // LOCAL immediately for subsequent read consistency) rather
         // than the pure-defer pattern sys_write / sys_unlink use.
         if let Some(ref r) = route {
-            if r.is_federation_peer_mount() {
-                let _ = self.federation_peer_setattr(
-                    r,
-                    path,
-                    mime_type,
-                    content_id,
-                    modified_at_ms,
-                    created_at_ms,
-                    size,
-                    version,
-                );
-            }
+            r.supplement_setattr(
+                self,
+                path,
+                mime_type,
+                content_id,
+                modified_at_ms,
+                created_at_ms,
+                size,
+                version,
+            );
         }
 
         let existing: Option<crate::meta_store::FileMetadata> = if let Some(ref r) = route {

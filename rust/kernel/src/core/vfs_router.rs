@@ -200,14 +200,188 @@ impl RouteResult {
     /// carries a `target_zone_id` pointing at the peer that owns the
     /// LocalConnector for these bytes.
     ///
-    /// io.rs federation peer dispatch sites (sys_readdir / sys_stat /
-    /// sys_unlink) gate on this exact pair; centralising the predicate
-    /// here keeps the three call sites in sync and documents the
-    /// shape ("placeholder MountEntry with target_zone_id set") as a
-    /// first-class concept rather than an ad-hoc field pair.
+    /// Used internally by the `via_federation_*` / `supplement_*`
+    /// behavior methods below to gate per-route — callers in
+    /// `kernel/io.rs` and `kernel/mod.rs` should reach for those
+    /// methods rather than predicating on this directly, so the
+    /// federation-peer-mount concept stays a one-place check.
     #[inline]
     pub fn is_federation_peer_mount(&self) -> bool {
         self.backend.is_none() && self.target_zone_id.is_some()
+    }
+
+    // ── Federation-peer behavior methods ───────────────────────────────
+    //
+    // Two patterns for federation-peer-mounts (placeholder MountEntry
+    // shape; no local backend; target_zone_id points at the SSOT peer):
+    //
+    // * **PURE-DEFER** (`via_federation_*`) — peer-only dispatch; the
+    //   caller's local-side path runs only when this returns `None`,
+    //   meaning "this route is not a federation-peer-mount; fall
+    //   through to your local handling".  `Some(value)` carries the
+    //   peer dispatch result and the caller short-circuits with it.
+    //
+    // * **SUPPLEMENT** (`supplement_*`) — peer fires ALONGSIDE the
+    //   caller's local-side path; no return value.  For mkdir /
+    //   rename / setattr, the local metastore mutation must happen
+    //   IMMEDIATELY so the joiner's VFSRouter routes children of
+    //   the new entry correctly — raft LWW dedupes the peer's
+    //   eventual replicated mirror against ours.  See
+    //   [[feedback_defer_to_peer_only_for_byte_ops]] for the full
+    //   rationale on which syscalls take which pattern.
+    //
+    // No-op on non-federation-peer-mount routes — the methods become
+    // zero-cost when the routed mount has a local backend (the common
+    // case).  Internally each delegates to the kernel's
+    // `federation_peer_*` dispatch arms; the later HAL collapse
+    // re-points these bodies to `kernel.distributed_coordinator()
+    // .peer_*` without touching call sites.
+
+    /// Pure-defer write: peer's `NexusVFSService.Write` runs the full
+    /// write lifecycle authoritatively on the SSOT side.
+    ///
+    /// Three-state return — sys_write needs to distinguish
+    /// "fall-through-to-local" from "return-miss-without-local-fallback"
+    /// because federation-peer-mounts have no local backend to fall
+    /// back on:
+    ///   * `None` — not a federation-peer-mount; caller falls through
+    ///     to the normal local write path.
+    ///   * `Some(None)` — federation route, dispatch missed (peer
+    ///     unreachable / Noop / observability warns fire); caller
+    ///     returns a miss-shaped result WITHOUT attempting any local
+    ///     fallback (preserves the PR #80 retry contract).
+    ///   * `Some(Some(wr))` — federation route, dispatch hit; caller
+    ///     short-circuits with `wr` carrying the peer's canonical
+    ///     `(content_id, size)`.
+    #[inline]
+    pub fn via_federation_write(
+        &self,
+        kernel: &crate::kernel::Kernel,
+        peer_path: &str,
+        content: &[u8],
+    ) -> Option<Option<crate::abc::object_store::WriteResult>> {
+        if !self.is_federation_peer_mount() {
+            return None;
+        }
+        Some(kernel.federation_peer_write(self, peer_path, content))
+    }
+
+    /// Pure-defer stat: peer's `NexusVFSService.Stat` is authoritative
+    /// for the placeholder mount.  Returns `Some(BackendStat)` on hit,
+    /// `None` for non-federation routes or no-peer-hit (the latter is
+    /// indistinguishable from "real not found" — same legacy semantics).
+    #[inline]
+    pub fn via_federation_stat(
+        &self,
+        kernel: &crate::kernel::Kernel,
+        peer_path: &str,
+    ) -> Option<crate::abc::object_store::BackendStat> {
+        if !self.is_federation_peer_mount() {
+            return None;
+        }
+        kernel.federation_peer_stat(self, peer_path)
+    }
+
+    /// Pure-defer readdir: peer's `NexusVFSService.Readdir` enumerates
+    /// the placeholder mount's children.  Empty Vec is meaningful
+    /// (real empty dir) — distinguish from "not found" by the
+    /// `Some(entries)` / `None` split: `Some(_)` = peer dispatch hit
+    /// (entries may be empty), `None` = not a federation route.
+    #[inline]
+    pub fn via_federation_readdir(
+        &self,
+        kernel: &crate::kernel::Kernel,
+        peer_path: &str,
+    ) -> Option<Vec<(String, u8)>> {
+        if !self.is_federation_peer_mount() {
+            return None;
+        }
+        kernel.federation_peer_readdir(self, peer_path)
+    }
+
+    /// Pure-defer unlink: peer's `NexusVFSService.Delete` runs the
+    /// full unlink lifecycle (metastore delete + backend delete_file
+    /// + raft replication).  `Some(true)` = peer delete succeeded;
+    /// `Some(false)` = federation route but dispatch missed (peer
+    /// unreachable / Noop client / observability warns fire);
+    /// `None` = not a federation route (caller falls through to
+    /// local unlink).
+    #[inline]
+    pub fn via_federation_unlink(
+        &self,
+        kernel: &crate::kernel::Kernel,
+        peer_path: &str,
+    ) -> Option<bool> {
+        if !self.is_federation_peer_mount() {
+            return None;
+        }
+        Some(kernel.federation_peer_delete_file(self, peer_path))
+    }
+
+    /// Supplement mkdir: fires the peer's `NexusVFSService.Mkdir`
+    /// alongside the caller's local metastore.put for the DT_DIR row.
+    /// Best-effort — dispatch failure is logged by the kernel-side
+    /// observability path, not surfaced to the caller, so the local
+    /// flow proceeds regardless.  See module-level rationale.
+    #[inline]
+    pub fn supplement_mkdir(
+        &self,
+        kernel: &crate::kernel::Kernel,
+        peer_path: &str,
+        parents: bool,
+        exist_ok: bool,
+    ) {
+        if !self.is_federation_peer_mount() {
+            return;
+        }
+        let _ = kernel.federation_peer_mkdir(self, peer_path, parents, exist_ok);
+    }
+
+    /// Supplement rename: fires the peer's `NexusVFSService.Rename`
+    /// alongside the caller's local `metastore.rename_path`.
+    /// Best-effort — same silent-miss semantics as `supplement_mkdir`.
+    #[inline]
+    pub fn supplement_rename(
+        &self,
+        kernel: &crate::kernel::Kernel,
+        old_path: &str,
+        new_path: &str,
+    ) {
+        if !self.is_federation_peer_mount() {
+            return;
+        }
+        let _ = kernel.federation_peer_rename(self, old_path, new_path);
+    }
+
+    /// Supplement setattr (DT_REG only): fires the peer's
+    /// `NexusVFSService.Setattr` alongside the caller's local
+    /// metastore.put for the DT_REG row.  Best-effort.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    pub fn supplement_setattr(
+        &self,
+        kernel: &crate::kernel::Kernel,
+        peer_path: &str,
+        mime_type: Option<&str>,
+        content_id: Option<&str>,
+        modified_at_ms: Option<i64>,
+        created_at_ms: Option<i64>,
+        size: Option<u64>,
+        version: Option<u32>,
+    ) {
+        if !self.is_federation_peer_mount() {
+            return;
+        }
+        let _ = kernel.federation_peer_setattr(
+            self,
+            peer_path,
+            mime_type,
+            content_id,
+            modified_at_ms,
+            created_at_ms,
+            size,
+            version,
+        );
     }
 }
 

@@ -884,77 +884,100 @@ impl Kernel {
         // for the canonical 2-node cc-tasks-share topology the SSOT
         // side has `backend = Some` and never enters this arm, so
         // re-entry is structurally impossible.
-        if input.route.is_federation_peer_mount() && input.offset == 0 {
-            // Preserve legacy miss-on-dispatch-failure semantics: the
-            // pre-PR-#80 shape had `dispatch_federation_peer` return
-            // `Option<WriteResult>` straight into the `match write_result
-            // { Some => ..., None => miss() }` arm, so a transient
-            // unreachable peer (still in zone-discovery handshake, peer
-            // restarting, network blip) surfaced as `hit=false` and
-            // callers retried.  Surfacing it as `KernelError::IOError`
-            // instead breaks tests where a kernel-background write
-            // (raft state seed, DT_MOUNT replay) silently retried under
-            // the old shape — see cc-tasks-share E2E TestCrossNode*
-            // regressions on first PR #80 attempt.  Return miss so the
-            // caller's existing retry / quiesce paths kick in unchanged.
-            let wr = match self.federation_peer_write(input.route, input.path, input.content) {
-                Some(wr) => wr,
-                None => return miss(),
-            };
+        if input.offset == 0 {
+            // PR #80 short-circuit: pure-defer the write to the SSOT
+            // peer when the routed entry is a federation-peer-mount
+            // placeholder.  Three-state return from
+            // [`RouteResult::via_federation_write`]:
+            //   * outer `None` — not a federation route; fall through
+            //     to the normal local write path.
+            //   * outer `Some(None)` — federation route + dispatch
+            //     missed; return miss() WITHOUT a local fallback.
+            //     Federation-peer-mounts have no local backend, and
+            //     surfacing the failure as `KernelError::IOError`
+            //     broke kernel-background writes in the first PR #80
+            //     attempt — the legacy retry contract (hit=false →
+            //     caller retries) is what cc-tasks-share E2E pins.
+            //   * outer `Some(Some(wr))` — federation route +
+            //     dispatch hit; short-circuit with `wr` carrying the
+            //     peer's canonical `(content_id, size)`.
+            //
+            // Offset > 0 (partial writes) NOT short-circuited here:
+            // the wire shape takes (addr, path, content) with no
+            // offset, and partial-write semantics need RMW the caller
+            // handles locally first.  For placeholder mounts the
+            // partial-write path returns miss — preserved legacy
+            // behaviour.
+            if let Some(write_outcome) =
+                input
+                    .route
+                    .via_federation_write(self, input.path, input.content)
+            {
+                let wr = match write_outcome {
+                    Some(wr) => wr,
+                    None => return miss(),
+                };
 
-            // Best-effort old-state snapshot for OBSERVE + native
-            // POST hook.  Joiner's local metastore may or may not
-            // have a row pre-write; founder's post-write metastore.put
-            // will eventually replicate via raft and supersede.  When
-            // local has nothing, treat as first-write (is_new = true)
-            // — consistent with "this voter has never observed this
-            // path before".
-            let old_entry = self.commit_old_metadata(&input);
-            let old_version = old_entry.as_ref().map(|e| e.version).unwrap_or(0);
-            let old_gen = old_entry.as_ref().map(|e| e.gen).unwrap_or(0);
-            let old_content_id = old_entry.as_ref().and_then(|e| e.content_id.clone());
-            let new_version = old_version + 1;
-            let new_gen = old_gen.saturating_add(1);
-            let result_is_new = old_entry.is_none();
-            let result_old_etag = old_content_id.clone();
-            let result_old_size = old_entry.as_ref().map(|e| e.size);
-            let result_old_version = old_entry.as_ref().map(|e| e.version);
-            let result_old_modified_at_ms = old_entry.as_ref().and_then(|e| e.modified_at_ms);
+                // Best-effort old-state snapshot for OBSERVE + native
+                // POST hook.  Joiner's local metastore may or may not
+                // have a row pre-write; founder's post-write metastore.put
+                // will eventually replicate via raft and supersede.  When
+                // local has nothing, treat as first-write (is_new = true)
+                // — consistent with "this voter has never observed this
+                // path before".
+                let old_entry = self.commit_old_metadata(&input);
+                let old_version = old_entry.as_ref().map(|e| e.version).unwrap_or(0);
+                let old_gen = old_entry.as_ref().map(|e| e.gen).unwrap_or(0);
+                let old_content_id = old_entry.as_ref().and_then(|e| e.content_id.clone());
+                let new_version = old_version + 1;
+                let new_gen = old_gen.saturating_add(1);
+                let result_is_new = old_entry.is_none();
+                let result_old_etag = old_content_id.clone();
+                let result_old_size = old_entry.as_ref().map(|e| e.size);
+                let result_old_version = old_entry.as_ref().map(|e| e.version);
+                let result_old_modified_at_ms =
+                    old_entry.as_ref().and_then(|e| e.modified_at_ms);
 
-            let content_id_for_event = wr.content_id.clone();
-            let size_for_event = wr.size;
-            self.dispatch_mutation(FileEventType::FileWrite, input.path, input.ctx, |ev| {
-                ev.size = Some(size_for_event);
-                ev.content_id = Some(content_id_for_event);
-                ev.version = Some(new_version);
-                ev.gen = Some(new_gen);
-                ev.is_new = old_version == 0;
-                ev.old_content_id = old_content_id;
-            });
+                let content_id_for_event = wr.content_id.clone();
+                let size_for_event = wr.size;
+                self.dispatch_mutation(
+                    FileEventType::FileWrite,
+                    input.path,
+                    input.ctx,
+                    |ev| {
+                        ev.size = Some(size_for_event);
+                        ev.content_id = Some(content_id_for_event);
+                        ev.version = Some(new_version);
+                        ev.gen = Some(new_gen);
+                        ev.is_new = old_version == 0;
+                        ev.old_content_id = old_content_id;
+                    },
+                );
 
-            self.dispatch_native_post(&HookContext::Write(WriteHookCtx {
-                path: input.path.to_string(),
-                identity: HookIdentity::from(input.ctx),
-                content: vec![],
-                is_new_file: result_is_new,
-                content_id: None,
-                new_version: new_version.into(),
-                size_bytes: Some(wr.size),
-            }));
+                self.dispatch_native_post(&HookContext::Write(WriteHookCtx {
+                    path: input.path.to_string(),
+                    identity: HookIdentity::from(input.ctx),
+                    content: vec![],
+                    is_new_file: result_is_new,
+                    content_id: None,
+                    new_version: new_version.into(),
+                    size_bytes: Some(wr.size),
+                }));
 
-            return Ok(SysWriteResult {
-                hit: true,
-                content_id: Some(wr.content_id),
-                post_hook_needed: self.write_hook_count.load(Ordering::Relaxed) > 0,
-                version: new_version,
-                gen: new_gen,
-                size: wr.size,
-                is_new: result_is_new,
-                old_content_id: result_old_etag,
-                old_size: result_old_size,
-                old_version: result_old_version,
-                old_modified_at_ms: result_old_modified_at_ms,
-            });
+                return Ok(SysWriteResult {
+                    hit: true,
+                    content_id: Some(wr.content_id),
+                    post_hook_needed: self.write_hook_count.load(Ordering::Relaxed) > 0,
+                    version: new_version,
+                    gen: new_gen,
+                    size: wr.size,
+                    is_new: result_is_new,
+                    old_content_id: result_old_etag,
+                    old_size: result_old_size,
+                    old_version: result_old_version,
+                    old_modified_at_ms: result_old_modified_at_ms,
+                });
+            }
         }
 
         // 5. Backend write (Rust-native ObjectStore).
@@ -1301,33 +1324,34 @@ impl Kernel {
                 // sys_stat half of the boundary leak so FUSE lookup
                 // (the gate before every cat / open / unlink) sees
                 // peer-owned entries with no Nexus-side metadata.
-                // Same shape sys_readdir uses; same loop-avoidance
-                // caveat documented on `dispatch_federation_peer`.
-                if route.is_federation_peer_mount() {
-                    if let Some(bs) = self.federation_peer_stat(&route, path) {
-                        return Some(StatResult {
-                            path: path.to_string(),
-                            size: if bs.is_dir { 4096 } else { bs.size },
-                            content_id: None,
-                            mime_type: if bs.is_dir {
-                                "inode/directory".to_string()
-                            } else {
-                                "application/octet-stream".to_string()
-                            },
-                            is_directory: bs.is_dir,
-                            entry_type: if bs.is_dir { DT_DIR } else { DT_REG },
-                            mode: if bs.is_dir { 0o755 } else { 0o644 },
-                            version: 0,
-                            gen: 0,
-                            zone_id: Some(route.zone_id.clone()),
-                            created_at_ms: None,
-                            modified_at_ms: None,
-                            last_writer_address: None,
-                            lock: None,
-                            link_target: None,
-                            owner_id: None,
-                        });
-                    }
+                // Same shape sys_readdir uses.
+                //
+                // `via_federation_stat` returns `None` for non-federation
+                // routes (caller falls through to local stat) — the
+                // is-peer-mount predicate is encapsulated.
+                if let Some(bs) = route.via_federation_stat(self, path) {
+                    return Some(StatResult {
+                        path: path.to_string(),
+                        size: if bs.is_dir { 4096 } else { bs.size },
+                        content_id: None,
+                        mime_type: if bs.is_dir {
+                            "inode/directory".to_string()
+                        } else {
+                            "application/octet-stream".to_string()
+                        },
+                        is_directory: bs.is_dir,
+                        entry_type: if bs.is_dir { DT_DIR } else { DT_REG },
+                        mode: if bs.is_dir { 0o755 } else { 0o644 },
+                        version: 0,
+                        gen: 0,
+                        zone_id: Some(route.zone_id.clone()),
+                        created_at_ms: None,
+                        modified_at_ms: None,
+                        last_writer_address: None,
+                        lock: None,
+                        link_target: None,
+                        owner_id: None,
+                    });
                 }
                 return None;
             }
@@ -1507,9 +1531,19 @@ impl Kernel {
                     // SSOT side has `backend = Some` and never
                     // reaches this branch, so re-entry is structurally
                     // impossible.
-                    if route.is_federation_peer_mount()
-                        && self.federation_peer_delete_file(&route, path)
-                    {
+                    // Three-way unlink semantics encoded by
+                    // `via_federation_unlink`:
+                    //   * `None` — not a federation route; fall
+                    //     through to the SSOT-local backend cleanup
+                    //     below.
+                    //   * `Some(true)` — federation route + peer
+                    //     delete succeeded; short-circuit success.
+                    //   * `Some(false)` — federation route + peer
+                    //     delete missed; treat as "no hit in this
+                    //     metastore-miss branch" and fall through
+                    //     to the SSOT-local check (preserves the
+                    //     original `&&`-gated behaviour).
+                    if matches!(route.via_federation_unlink(self, path), Some(true)) {
                         return Ok(SysUnlinkResult {
                             hit: true,
                             entry_type: DT_REG,
@@ -1667,10 +1701,14 @@ impl Kernel {
         // entirely to the peer avoids the race and keeps the SSOT
         // contract clean: ONE sys_unlink runs (the peer's), one
         // metastore commit happens, one backend delete fires.
-        if route.is_federation_peer_mount() {
-            let ok = self.federation_peer_delete_file(&route, path);
+        // Pure-defer unlink for federation-peer-mounts.  `Some(hit)`
+        // = federation route, dispatch result is `hit`; return the
+        // SysUnlinkResult with that flag.  `None` = not a federation
+        // route; fall through to the local VFS-write-lock + backend
+        // delete path below.
+        if let Some(hit) = route.via_federation_unlink(self, path) {
             return Ok(SysUnlinkResult {
-                hit: ok,
+                hit,
                 entry_type: entry.entry_type,
                 post_hook_needed: self.delete_hook_count.load(Ordering::Relaxed) > 0,
                 path: path.to_string(),
@@ -1711,7 +1749,7 @@ impl Kernel {
         // content by path; their GC handles unreferenced blobs independently.
         //
         // No federation-peer fallback here: the
-        // `is_federation_peer_mount()` short-circuit earlier in this
+        // `via_federation_unlink` short-circuit earlier in this
         // function already deferred the entire unlink to the peer and
         // returned, so any path that reaches step 7 has either a local
         // backend or no peer dispatch is appropriate (e.g. a connector
@@ -1830,8 +1868,8 @@ impl Kernel {
         // a supplement (rename produces routing state the joiner
         // needs LOCAL immediately) rather than the pure-defer pattern
         // sys_write / sys_unlink use.
-        if old_route.mount_point == new_route.mount_point && old_route.is_federation_peer_mount() {
-            let _ = self.federation_peer_rename(&old_route, old_path, new_path);
+        if old_route.mount_point == new_route.mount_point {
+            old_route.supplement_rename(self, old_path, new_path);
         }
 
         // 3. Sorted VFS lock acquire (deadlock-free: min(old,new) first)
@@ -2571,9 +2609,7 @@ impl Kernel {
         // regardless, preserving the legacy "metadata-only mkdir on
         // backend-less mount succeeds" shape.  PR #81-equivalent
         // silent-miss semantics.
-        if route.is_federation_peer_mount() {
-            let _ = self.federation_peer_mkdir(&route, path, parents, exist_ok);
-        }
+        route.supplement_mkdir(self, path, parents, exist_ok);
 
         // 3. Existence check: explicit entry OR implicit directory (children
         //    exist under this prefix). Eliminates Python's router.route() +
@@ -3507,30 +3543,32 @@ impl Kernel {
                 seen.entry(child_path)
                     .or_insert((etype, Some(route.zone_id.clone())));
             }
-        } else if route.is_federation_peer_mount() {
+        } else if let Some(entries) = route.via_federation_readdir(self, parent_path) {
             // Federation peer dispatch: no local backend for this
             // mount, but the routing entry's `target_zone_id` says the
-            // SSOT lives on a peer.  Pick any non-self voter and call
-            // `NexusVFSService.Readdir` against it.  Same dispatch
-            // helper the sys_stat / sys_unlink hooks use — single
-            // SSOT for "iterate non-self voters, break on first hit".
+            // SSOT lives on a peer.  `via_federation_readdir` returns
+            // `Some(entries)` (possibly empty for a real empty dir on
+            // the peer) when this route is a federation-peer-mount,
+            // `None` otherwise — the `else if let` collapses the
+            // is-peer-mount predicate and the dispatch into a single
+            // step.  Same dispatch helper sys_stat / sys_unlink use:
+            // iterate non-self voters, break on first hit.
+            //
             // For cc-tasks-share (Mac=SSOT with LocalConnector,
             // Win=client without) the SSOT side never reaches this
             // branch — backend is Some on Mac — so no loop is
             // possible in the canonical 2-node topology.
-            if let Some(entries) = self.federation_peer_readdir(&route, parent_path) {
-                for (peer_path, etype) in entries {
-                    // Peer returns absolute peer paths; rebase to the
-                    // local global namespace by stripping the peer's
-                    // mount root and re-prepending `parent_for_join`.
-                    let basename = peer_path.rsplit('/').next().unwrap_or(&peer_path);
-                    if basename.is_empty() {
-                        continue;
-                    }
-                    let child_path = format!("{}/{}", parent_for_join, basename);
-                    seen.entry(child_path)
-                        .or_insert((etype, Some(route.zone_id.clone())));
+            for (peer_path, etype) in entries {
+                // Peer returns absolute peer paths; rebase to the
+                // local global namespace by stripping the peer's
+                // mount root and re-prepending `parent_for_join`.
+                let basename = peer_path.rsplit('/').next().unwrap_or(&peer_path);
+                if basename.is_empty() {
+                    continue;
                 }
+                let child_path = format!("{}/{}", parent_for_join, basename);
+                seen.entry(child_path)
+                    .or_insert((etype, Some(route.zone_id.clone())));
             }
         }
 
