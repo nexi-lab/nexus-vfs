@@ -1187,4 +1187,386 @@ mod tests {
         // Unknown key → empty.
         assert!(table.mount_points_for_coherence_key(0xDEAD).is_empty());
     }
+
+    // ── RouteResult federation behavior method pins ─────────────────────
+    //
+    // Two halves of the contract introduced by the FederationPeerClient
+    // HAL collapse:
+    //   * Non-federation routes (no `target_zone_id`, or with a local
+    //     backend) — `via_federation_*` returns `None`, `supplement_*`
+    //     is a no-op.  The coordinator MUST NOT be invoked.
+    //   * Federation-peer-mount routes (no backend, target_zone_id set)
+    //     — methods MUST delegate to the matching
+    //     `DistributedCoordinator::peer_*` with the right (target_zone,
+    //     path, ...) args.  Silent dispatch failure here would surface
+    //     as the Mac↔Win Direction-A wedge.
+    //
+    // The fake coordinator records each call as a single canonical
+    // string — the asserts read like the call site they protect.
+
+    use crate::abc::meta_store::MetaStore;
+    use crate::abc::object_store::{BackendStat, WriteResult};
+    use crate::hal::distributed_coordinator::{
+        ClusterInfo, CoordinatorResult, DistributedCoordinator, ShareInfo,
+    };
+    use contracts::lock_state::Locks;
+    use parking_lot::Mutex;
+
+    #[derive(Default)]
+    struct RecordingCoordinator {
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl RecordingCoordinator {
+        fn record(&self, line: String) {
+            self.calls.lock().push(line);
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().clone()
+        }
+    }
+
+    impl DistributedCoordinator for RecordingCoordinator {
+        // Non-peer-* trait methods are unused by these pins; supply
+        // minimal Ok/empty stubs so the trait is satisfied.
+        fn list_zones(&self, _kernel: &crate::kernel::Kernel) -> Vec<String> {
+            Vec::new()
+        }
+        fn cluster_info(
+            &self,
+            _kernel: &crate::kernel::Kernel,
+            _zone_id: &str,
+        ) -> CoordinatorResult<ClusterInfo> {
+            Err("not used by RouteResult pins".into())
+        }
+        fn create_zone(
+            &self,
+            _kernel: &crate::kernel::Kernel,
+            _zone_id: &str,
+        ) -> CoordinatorResult<()> {
+            Err("not used by RouteResult pins".into())
+        }
+        fn remove_zone(
+            &self,
+            _kernel: &crate::kernel::Kernel,
+            _zone_id: &str,
+            _force: bool,
+        ) -> CoordinatorResult<()> {
+            Err("not used by RouteResult pins".into())
+        }
+        fn join_zone(
+            &self,
+            _kernel: &crate::kernel::Kernel,
+            _zone_id: &str,
+            _as_learner: bool,
+        ) -> CoordinatorResult<()> {
+            Err("not used by RouteResult pins".into())
+        }
+        fn wire_mount(
+            &self,
+            _kernel: &crate::kernel::Kernel,
+            _parent_zone: &str,
+            _mount_path: &str,
+            _target_zone: &str,
+        ) -> CoordinatorResult<()> {
+            Err("not used by RouteResult pins".into())
+        }
+        fn unwire_mount(
+            &self,
+            _kernel: &crate::kernel::Kernel,
+            _parent_zone: &str,
+            _mount_path: &str,
+        ) -> CoordinatorResult<()> {
+            Err("not used by RouteResult pins".into())
+        }
+        fn share_zone(
+            &self,
+            _kernel: &crate::kernel::Kernel,
+            _local_path: &str,
+            _new_zone_id: &str,
+        ) -> CoordinatorResult<ShareInfo> {
+            Err("not used by RouteResult pins".into())
+        }
+        fn lookup_share(
+            &self,
+            _kernel: &crate::kernel::Kernel,
+            _remote_path: &str,
+        ) -> CoordinatorResult<Option<ShareInfo>> {
+            Ok(None)
+        }
+        fn metastore_for_zone(
+            &self,
+            _kernel: &crate::kernel::Kernel,
+            _zone_id: &str,
+        ) -> CoordinatorResult<Arc<dyn MetaStore>> {
+            Err("not used by RouteResult pins".into())
+        }
+        fn locks_for_zone(
+            &self,
+            _kernel: &crate::kernel::Kernel,
+            _zone_id: &str,
+        ) -> CoordinatorResult<Arc<dyn Locks>> {
+            Err("not used by RouteResult pins".into())
+        }
+
+        // Peer-* overrides we DO observe — every call records the
+        // (op, target_zone, key args) so the test asserts read like
+        // the call site they protect.
+        fn peer_stat(
+            &self,
+            _kernel: &crate::kernel::Kernel,
+            target_zone: &str,
+            peer_path: &str,
+        ) -> Option<BackendStat> {
+            self.record(format!("peer_stat(target={target_zone}, path={peer_path})"));
+            Some(BackendStat {
+                size: 42,
+                is_dir: false,
+            })
+        }
+        fn peer_write(
+            &self,
+            _kernel: &crate::kernel::Kernel,
+            target_zone: &str,
+            peer_path: &str,
+            content: &[u8],
+        ) -> Option<WriteResult> {
+            self.record(format!(
+                "peer_write(target={target_zone}, path={peer_path}, len={})",
+                content.len()
+            ));
+            Some(WriteResult {
+                content_id: peer_path.to_string(),
+                version: peer_path.to_string(),
+                size: content.len() as u64,
+            })
+        }
+        fn peer_list_dir(
+            &self,
+            _kernel: &crate::kernel::Kernel,
+            target_zone: &str,
+            peer_path: &str,
+        ) -> Option<Vec<(String, u8)>> {
+            self.record(format!(
+                "peer_list_dir(target={target_zone}, path={peer_path})"
+            ));
+            // Empty Vec is meaningful (real empty dir) — pin that
+            // the Some-vs-None split passes through unchanged.
+            Some(Vec::new())
+        }
+        fn peer_delete_file(
+            &self,
+            _kernel: &crate::kernel::Kernel,
+            target_zone: &str,
+            peer_path: &str,
+        ) -> bool {
+            self.record(format!(
+                "peer_delete_file(target={target_zone}, path={peer_path})"
+            ));
+            true
+        }
+        fn peer_mkdir(
+            &self,
+            _kernel: &crate::kernel::Kernel,
+            target_zone: &str,
+            peer_path: &str,
+            parents: bool,
+            exist_ok: bool,
+        ) -> bool {
+            self.record(format!(
+                "peer_mkdir(target={target_zone}, path={peer_path}, parents={parents}, exist_ok={exist_ok})"
+            ));
+            true
+        }
+        fn peer_rename(
+            &self,
+            _kernel: &crate::kernel::Kernel,
+            target_zone: &str,
+            old_path: &str,
+            new_path: &str,
+        ) -> bool {
+            self.record(format!(
+                "peer_rename(target={target_zone}, old={old_path}, new={new_path})"
+            ));
+            true
+        }
+        fn peer_setattr(
+            &self,
+            _kernel: &crate::kernel::Kernel,
+            target_zone: &str,
+            peer_path: &str,
+            _mime_type: Option<&str>,
+            _content_id: Option<&str>,
+            _modified_at_ms: Option<i64>,
+            _created_at_ms: Option<i64>,
+            size: Option<u64>,
+            _version: Option<u32>,
+        ) -> bool {
+            self.record(format!(
+                "peer_setattr(target={target_zone}, path={peer_path}, size={:?})",
+                size
+            ));
+            true
+        }
+    }
+
+    fn install_recording_coordinator(
+        kernel: &crate::kernel::Kernel,
+    ) -> Arc<RecordingCoordinator> {
+        let fake = Arc::new(RecordingCoordinator::default());
+        kernel.set_distributed_coordinator(fake.clone() as Arc<dyn DistributedCoordinator>);
+        fake
+    }
+
+    fn route_non_federation() -> RouteResult {
+        // No backend + no target_zone_id — plain local mount that
+        // never wired federation.  Both predicates fail.
+        RouteResult {
+            mount_point: "/root".to_string(),
+            backend_path: "x".to_string(),
+            zone_id: "root".to_string(),
+            is_external: false,
+            is_cas: false,
+            metastore: None,
+            backend: None,
+            target_zone_id: None,
+        }
+    }
+
+    fn route_federation_peer() -> RouteResult {
+        // No backend + target_zone_id Some — placeholder MountEntry
+        // shape installed by `wire_mount_core` on non-SSOT voters.
+        RouteResult {
+            mount_point: "/sharedzone".to_string(),
+            backend_path: "x".to_string(),
+            zone_id: "sharedzone".to_string(),
+            is_external: false,
+            is_cas: false,
+            metastore: None,
+            backend: None,
+            target_zone_id: Some("sharedzone".to_string()),
+        }
+    }
+
+    #[test]
+    fn route_via_federation_stat_non_peer_returns_none_without_invoking_coordinator() {
+        let kernel = crate::kernel::Kernel::new();
+        let fake = install_recording_coordinator(&kernel);
+        assert!(route_non_federation()
+            .via_federation_stat(&kernel, "/x")
+            .is_none());
+        assert!(
+            fake.calls().is_empty(),
+            "non-federation route must not reach the coordinator: got {:?}",
+            fake.calls()
+        );
+    }
+
+    #[test]
+    fn route_via_federation_stat_peer_route_calls_coordinator_with_target_zone() {
+        let kernel = crate::kernel::Kernel::new();
+        let fake = install_recording_coordinator(&kernel);
+        let stat = route_federation_peer()
+            .via_federation_stat(&kernel, "/x")
+            .expect("peer dispatch should surface the coordinator hit");
+        assert_eq!(stat.size, 42);
+        assert_eq!(
+            fake.calls(),
+            vec!["peer_stat(target=sharedzone, path=/x)"]
+        );
+    }
+
+    #[test]
+    fn route_via_federation_write_three_state_collapses_correctly() {
+        let kernel = crate::kernel::Kernel::new();
+        let fake = install_recording_coordinator(&kernel);
+        // Non-federation route: outer None (caller falls through to local).
+        assert!(route_non_federation()
+            .via_federation_write(&kernel, "/x", b"abc")
+            .is_none());
+        // Federation route: outer Some, inner Some(wr) from the fake hit.
+        let outcome = route_federation_peer()
+            .via_federation_write(&kernel, "/x", b"abc")
+            .expect("peer route returns Some outer");
+        let wr = outcome.expect("coordinator returned a hit");
+        assert_eq!(wr.size, 3);
+        assert_eq!(
+            fake.calls(),
+            vec!["peer_write(target=sharedzone, path=/x, len=3)"]
+        );
+    }
+
+    #[test]
+    fn route_via_federation_readdir_passes_through_empty_vec_as_some() {
+        // Empty Vec on peer side is "directory exists but is empty"
+        // — distinguish from None ("not a federation route, fall
+        // through to local readdir") via the Some/None split.
+        let kernel = crate::kernel::Kernel::new();
+        let _fake = install_recording_coordinator(&kernel);
+        let entries = route_federation_peer()
+            .via_federation_readdir(&kernel, "/d")
+            .expect("peer dispatch returns Some even for empty dirs");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn route_via_federation_unlink_wraps_dispatch_bool_in_some() {
+        let kernel = crate::kernel::Kernel::new();
+        let _fake = install_recording_coordinator(&kernel);
+        let result = route_federation_peer().via_federation_unlink(&kernel, "/x");
+        assert_eq!(result, Some(true));
+    }
+
+    #[test]
+    fn route_supplement_mkdir_non_peer_route_is_noop() {
+        let kernel = crate::kernel::Kernel::new();
+        let fake = install_recording_coordinator(&kernel);
+        route_non_federation().supplement_mkdir(&kernel, "/d", true, false);
+        assert!(
+            fake.calls().is_empty(),
+            "non-federation supplement_mkdir must not invoke coordinator"
+        );
+    }
+
+    #[test]
+    fn route_supplement_mkdir_peer_route_threads_args_to_coordinator() {
+        let kernel = crate::kernel::Kernel::new();
+        let fake = install_recording_coordinator(&kernel);
+        route_federation_peer().supplement_mkdir(&kernel, "/d", true, false);
+        assert_eq!(
+            fake.calls(),
+            vec!["peer_mkdir(target=sharedzone, path=/d, parents=true, exist_ok=false)"]
+        );
+    }
+
+    #[test]
+    fn route_supplement_rename_peer_route_threads_old_and_new_paths() {
+        let kernel = crate::kernel::Kernel::new();
+        let fake = install_recording_coordinator(&kernel);
+        route_federation_peer().supplement_rename(&kernel, "/a", "/b");
+        assert_eq!(
+            fake.calls(),
+            vec!["peer_rename(target=sharedzone, old=/a, new=/b)"]
+        );
+    }
+
+    #[test]
+    fn route_supplement_setattr_peer_route_threads_size_arg() {
+        let kernel = crate::kernel::Kernel::new();
+        let fake = install_recording_coordinator(&kernel);
+        route_federation_peer().supplement_setattr(
+            &kernel,
+            "/f",
+            None,
+            None,
+            None,
+            None,
+            Some(99),
+            None,
+        );
+        assert_eq!(
+            fake.calls(),
+            vec!["peer_setattr(target=sharedzone, path=/f, size=Some(99))"]
+        );
+    }
 }
