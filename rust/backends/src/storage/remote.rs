@@ -50,13 +50,11 @@ impl RemoteBackend {
 
 /// Reconstruct the absolute server path from mount point + `backend_path`.
 ///
-/// Thin wrapper around the shared
-/// [`super::mount_path::to_mount_path`] helper — both `RemoteBackend`
-/// (this file) and `FederationPeerBackend` (sibling proxy ObjectStore)
-/// apply the SAME boundary rule when reassembling the absolute path
-/// the remote expects.  See `mount_path.rs` for the full Issue #4273
-/// rationale (mount-relative-vs-zone-rooted content id ambiguity,
-/// `/`-boundary check, known self-prefix limitation).
+/// Thin wrapper around the shared [`super::mount_path::to_mount_path`]
+/// helper.  Carries the Issue #4273 boundary rule
+/// (mount-relative-vs-zone-rooted content id ambiguity, `/`-boundary
+/// check, known self-prefix limitation) — see `mount_path.rs` for the
+/// full rationale and the edge-case test suite.
 fn to_server_path(zone_path: &str, backend_path: &str) -> String {
     super::mount_path::to_mount_path(zone_path, backend_path)
 }
@@ -367,10 +365,10 @@ mod tests {
         );
     }
 
-    // Issue #4273 boundary rule unit tests moved to
-    // `super::mount_path::tests` — the rule is shared by the sibling
-    // `FederationPeerBackend`, so the SSOT for the boundary check
-    // lives next to the helper.  One thin sanity test below proves
+    // Issue #4273 boundary rule unit tests live in
+    // `super::mount_path::tests` next to the helper itself — that
+    // module is the SSOT for the rule and any future proxy backend
+    // would reuse it.  One thin sanity test below proves
     // `to_server_path` (the wrapper) delegates with the right
     // `zone_path` argument; the rule's full edge cases live in the
     // shared module.

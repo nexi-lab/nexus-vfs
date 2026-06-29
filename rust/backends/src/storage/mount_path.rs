@@ -1,13 +1,14 @@
 //! Shared mount-path reassembly for proxy ObjectStore impls.
 //!
 //! The kernel hands every `ObjectStore` method a `backend_path` that
-//! has been stripped of the mount-point prefix.  Proxy backends
-//! (`RemoteBackend` → Python hub, `FederationPeerBackend` → peer
-//! nexusd) speak to a remote that expects the *absolute* zone-rooted
-//! path — so they need to re-prepend the mount root before issuing the
-//! RPC.  Two proxy backends, one rule — extracted here so a future
-//! refinement (e.g. the route-vs-content-id signal that #4273's known
-//! limitation tracks) updates both call sites at once.
+//! has been stripped of the mount-point prefix.  `RemoteBackend`
+//! (the Python-hub proxy) speaks to a remote that expects the
+//! *absolute* zone-rooted path — so it re-prepends the mount root
+//! before issuing the RPC.  Extracted as a standalone helper so the
+//! Issue #4273 boundary rule lives in one place; if a future proxy
+//! ObjectStore is wired (federation-over-typed-RPC was a previous
+//! attempt — see `kernel/federation/grpc_ops.rs` for the path that
+//! replaced it), it consumes the same helper.
 //!
 //! Issue #4273 boundary check: the kernel may hand the proxy EITHER a
 //! mount-relative route path (`file.txt`) OR a server content id that
