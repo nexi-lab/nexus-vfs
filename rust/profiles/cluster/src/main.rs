@@ -771,13 +771,31 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     // would carry no `last_writer_address`, and ReadBlob would have
     // nothing to serve.  Held until shutdown so the apply-cb closures +
     // their Arc clones see a stable provider lifetime.
+    // Outbound federation-peer typed-RPC client.  Constructed BEFORE
+    // the coordinator so it can be passed in via `install_with_kernel`
+    // as the grpc_ops arc — single install hook for federation
+    // peer dispatch.  Without this the coordinator's `peer_*` impls
+    // surface every cross-node dispatch as a silent miss via the
+    // PR #94 observability warn-loud path (`grpc_ops not installed`).
+    let federation_client: Arc<dyn kernel::federation::grpc_ops::FederationGrpcOps> =
+        Arc::new(transport::federation::FederationClient::new(
+            Arc::clone(kernel.runtime()),
+            None,
+        ));
+
     // Construct the provider as `Arc<RaftDistributedCoordinator>` so
     // `install_with_kernel` can clone it into the kernel's coordinator
     // slot (the slot type is `Arc<dyn DistributedCoordinator>`).  Once
     // wired, the kernel keeps the provider alive for the lifetime of
     // the kernel — no separate local `_dist_coord` holder needed.
     Arc::new(nexus_raft::distributed_coordinator::RaftDistributedCoordinator::new())
-        .install_with_kernel(zm.clone(), zm.runtime_handle(), &self_address, &kernel);
+        .install_with_kernel(
+            zm.clone(),
+            zm.runtime_handle(),
+            &self_address,
+            &kernel,
+            federation_client,
+        );
 
     // Outbound peer-blob client — installs a `PeerBlobClient` over
     // the kernel-shared tokio runtime, replacing the `NoopPeerBlobClient`
@@ -785,18 +803,6 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     // from origin nodes on local-backend misses.  Sits above raft in
     // the dep graph; kept out of `install_with_kernel` for that reason.
     transport::peer_blob::install(kernel.as_ref());
-
-    // Outbound federation-peer client — installs a `FederationClient`
-    // over the kernel-shared tokio runtime, replacing the
-    // `NoopFederationPeerClient` default so the typed
-    // `NexusVFSService.{Read,Write,Stat,Readdir,Delete,Mkdir}`
-    // dispatch arms in `Kernel::dispatch_federation_peer` (sys_readdir
-    // / sys_stat / sys_unlink / sys_write hooks for backend-less
-    // federation MountEntries) can actually reach peer voters.
-    // Without this hook every cross-node typed dispatch falls back to
-    // the Noop error path — the symptom that surfaced as empty
-    // cross-node readdir listings in the cc-tasks-share E2E.
-    transport::federation::install(kernel.as_ref());
 
     // ── Driver-plugin mounts (§10) ───────────────────────────────────
     // Parse `--mount-driver name:zone:vfs-path:config-json` and mount

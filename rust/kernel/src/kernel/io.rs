@@ -564,15 +564,16 @@ impl Kernel {
         })
     }
 
-    // Federation-peer dispatch helpers (`dispatch_federation_peer` +
-    // 5 per-syscall `federation_peer_X` wrappers) live in
-    // `kernel/federation.rs` next to the `DistributedCoordinator`
-    // slot accessors.  Per `docs/KERNEL-ARCHITECTURE.md` §3, the
-    // kernel-side wiring for §3.B Control-Plane HAL surfaces belongs
-    // in the federation-family submodule — not in syscall-implementation
-    // files like io.rs.  Call sites (`self.federation_peer_X(...)`)
-    // are unchanged because `impl Kernel { ... }` blocks resolve
-    // across submodules of the same crate.
+    // Federation-peer dispatch is encapsulated on `RouteResult` —
+    // syscall sites reach the SSOT peer through `route.supplement_*`
+    // / `via_federation_*` behavior methods (in `core/vfs_router.rs`),
+    // never directly through the coordinator.  The iteration loop +
+    // PR #94 silent-miss observability lives in
+    // `nexus_raft::distributed_coordinator::RaftDistributedCoordinator`
+    // — per `docs/KERNEL-ARCHITECTURE.md` §3, the kernel-side wiring
+    // for §3.B Control-Plane HAL surfaces belongs in the federation-
+    // family submodule (`core/vfs_router.rs` + `federation/`), not in
+    // syscall-implementation files like io.rs.
 }
 
 struct WriteCommitInput<'a> {
@@ -869,14 +870,14 @@ impl Kernel {
         // ONE sys_write runs (the peer's), ONE metastore commit
         // happens, ONE backend write fires.  Joiner sees the row
         // when raft apply lands on its zone metastore; if the read
-        // races the apply, sys_stat's federation_peer_stat fallback
+        // races the apply, sys_stat's `via_federation_stat` fallback
         // covers it.  Same SSOT contract sys_unlink already enforces.
         //
         // Offset > 0 (partial writes) NOT short-circuited here: the
-        // FederationPeerClient.write trait method takes (addr, path,
-        // content) with no offset (HAL doc explicitly says "Partial
-        // writes are not modelled at this layer"), and partial-write
-        // semantics need read-modify-write the caller handles
+        // peer's `Write` RPC takes (addr, path, content) with no
+        // offset (the trait doc explicitly says "Partial writes are
+        // not modelled at this layer"), and partial-write semantics
+        // need read-modify-write the caller handles
         // locally first.  For placeholder mounts the partial-write
         // path returns miss — preserved legacy behaviour.
         //
@@ -1858,9 +1859,9 @@ impl Kernel {
         // at §6 below (no atomic 2PC for moving bytes across backends),
         // so firing the peer for cross-mount paths would waste an RPC.
         //
-        // Best-effort: when `federation_peer_rename` returns false
-        // (no reachable voter / RPC error / Noop client) we DON'T
-        // surface the error — the local-side flow proceeds
+        // Best-effort: `supplement_rename` swallows dispatch failure
+        // (no reachable voter / RPC error / coordinator without an
+        // installed FederationGrpcOps) — the local-side flow proceeds
         // regardless, preserving the legacy "metadata-only rename on
         // backend-less mount succeeds" shape.  PR #81-equivalent
         // silent-miss semantics.  See
@@ -2603,9 +2604,9 @@ impl Kernel {
         // apply.  See `feedback_defer_to_peer_only_for_byte_ops`
         // memory for the full rationale.
         //
-        // Best-effort: when `federation_peer_mkdir` returns false
-        // (no reachable voter / RPC error / Noop client) we DON'T
-        // surface the error — the local-side flow proceeds
+        // Best-effort: `supplement_mkdir` swallows dispatch failure
+        // (no reachable voter / RPC error / coordinator without an
+        // installed FederationGrpcOps) — the local-side flow proceeds
         // regardless, preserving the legacy "metadata-only mkdir on
         // backend-less mount succeeds" shape.  PR #81-equivalent
         // silent-miss semantics.

@@ -260,10 +260,12 @@ impl RouteResult {
         peer_path: &str,
         content: &[u8],
     ) -> Option<Option<crate::abc::object_store::WriteResult>> {
-        if !self.is_federation_peer_mount() {
-            return None;
-        }
-        Some(kernel.federation_peer_write(self, peer_path, content))
+        let target_zone = self.federation_target_zone()?;
+        Some(
+            kernel
+                .distributed_coordinator()
+                .peer_write(kernel, target_zone, peer_path, content),
+        )
     }
 
     /// Pure-defer stat: peer's `NexusVFSService.Stat` is authoritative
@@ -276,10 +278,10 @@ impl RouteResult {
         kernel: &crate::kernel::Kernel,
         peer_path: &str,
     ) -> Option<crate::abc::object_store::BackendStat> {
-        if !self.is_federation_peer_mount() {
-            return None;
-        }
-        kernel.federation_peer_stat(self, peer_path)
+        let target_zone = self.federation_target_zone()?;
+        kernel
+            .distributed_coordinator()
+            .peer_stat(kernel, target_zone, peer_path)
     }
 
     /// Pure-defer readdir: peer's `NexusVFSService.Readdir` enumerates
@@ -293,10 +295,10 @@ impl RouteResult {
         kernel: &crate::kernel::Kernel,
         peer_path: &str,
     ) -> Option<Vec<(String, u8)>> {
-        if !self.is_federation_peer_mount() {
-            return None;
-        }
-        kernel.federation_peer_readdir(self, peer_path)
+        let target_zone = self.federation_target_zone()?;
+        kernel
+            .distributed_coordinator()
+            .peer_list_dir(kernel, target_zone, peer_path)
     }
 
     /// Pure-defer unlink: peer's `NexusVFSService.Delete` runs the
@@ -312,15 +314,17 @@ impl RouteResult {
         kernel: &crate::kernel::Kernel,
         peer_path: &str,
     ) -> Option<bool> {
-        if !self.is_federation_peer_mount() {
-            return None;
-        }
-        Some(kernel.federation_peer_delete_file(self, peer_path))
+        let target_zone = self.federation_target_zone()?;
+        Some(
+            kernel
+                .distributed_coordinator()
+                .peer_delete_file(kernel, target_zone, peer_path),
+        )
     }
 
     /// Supplement mkdir: fires the peer's `NexusVFSService.Mkdir`
     /// alongside the caller's local metastore.put for the DT_DIR row.
-    /// Best-effort — dispatch failure is logged by the kernel-side
+    /// Best-effort — dispatch failure is logged by the coordinator
     /// observability path, not surfaced to the caller, so the local
     /// flow proceeds regardless.  See module-level rationale.
     #[inline]
@@ -331,10 +335,16 @@ impl RouteResult {
         parents: bool,
         exist_ok: bool,
     ) {
-        if !self.is_federation_peer_mount() {
+        let Some(target_zone) = self.federation_target_zone() else {
             return;
-        }
-        let _ = kernel.federation_peer_mkdir(self, peer_path, parents, exist_ok);
+        };
+        let _ = kernel.distributed_coordinator().peer_mkdir(
+            kernel,
+            target_zone,
+            peer_path,
+            parents,
+            exist_ok,
+        );
     }
 
     /// Supplement rename: fires the peer's `NexusVFSService.Rename`
@@ -347,10 +357,15 @@ impl RouteResult {
         old_path: &str,
         new_path: &str,
     ) {
-        if !self.is_federation_peer_mount() {
+        let Some(target_zone) = self.federation_target_zone() else {
             return;
-        }
-        let _ = kernel.federation_peer_rename(self, old_path, new_path);
+        };
+        let _ = kernel.distributed_coordinator().peer_rename(
+            kernel,
+            target_zone,
+            old_path,
+            new_path,
+        );
     }
 
     /// Supplement setattr (DT_REG only): fires the peer's
@@ -369,11 +384,12 @@ impl RouteResult {
         size: Option<u64>,
         version: Option<u32>,
     ) {
-        if !self.is_federation_peer_mount() {
+        let Some(target_zone) = self.federation_target_zone() else {
             return;
-        }
-        let _ = kernel.federation_peer_setattr(
-            self,
+        };
+        let _ = kernel.distributed_coordinator().peer_setattr(
+            kernel,
+            target_zone,
             peer_path,
             mime_type,
             content_id,
@@ -382,6 +398,19 @@ impl RouteResult {
             size,
             version,
         );
+    }
+
+    /// Internal: return the target zone id for a federation-peer-mount
+    /// route, or `None` for plain local routes.  Centralises the
+    /// `backend.is_none() && target_zone_id.is_some()` predicate +
+    /// the `target_zone_id.as_deref()` extraction so every `via_*` /
+    /// `supplement_*` method shares the same gate shape.
+    #[inline]
+    fn federation_target_zone(&self) -> Option<&str> {
+        if self.backend.is_some() {
+            return None;
+        }
+        self.target_zone_id.as_deref()
     }
 }
 

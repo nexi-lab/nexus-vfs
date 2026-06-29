@@ -591,16 +591,6 @@ pub struct Kernel {
     // at boot is `NoopPeerBlobClient`; the binary boot path installs the
     // real transport impl via `Kernel::set_peer_client`.
     pub(crate) peer_client: parking_lot::RwLock<Arc<dyn crate::hal::peer::PeerBlobClient>>,
-    // Cross-node typed VFS client slot. `Arc<dyn FederationPeerClient>`
-    // backing `FederationPeerBackend` (one per peer-owned DT_MOUNT) so
-    // sys_read / sys_readdir / sys_stat / sys_unlink against a mount
-    // owned by another zone resolve through the same backend trait as
-    // local mounts. Default at boot is `NoopFederationPeerClient`; the
-    // transport-tier install hook replaces it with the real client
-    // (transport::federation::FederationClient).  Same DI shape as
-    // `peer_client` above.
-    pub(crate) federation_peer_client:
-        parking_lot::RwLock<Arc<dyn crate::hal::federation_peer::FederationPeerClient>>,
     // Control-Plane HAL §3.B.1 slot. `Arc<dyn DistributedCoordinator>` so
     // the kernel's distributed-namespace surface (zone listing, distributed-
     // lock / WAL-stream / Raft-MetaStore construction, mount wiring,
@@ -732,9 +722,6 @@ impl Kernel {
             self_address: parking_lot::RwLock::new(None),
             runtime: Some(runtime),
             peer_client: parking_lot::RwLock::new(peer_client_dyn),
-            federation_peer_client: parking_lot::RwLock::new(
-                crate::hal::federation_peer::NoopFederationPeerClient::arc(),
-            ),
             distributed_coordinator: parking_lot::RwLock::new(
                 crate::hal::distributed_coordinator::NoopDistributedCoordinator::arc(),
             ),
@@ -1955,9 +1942,9 @@ impl Kernel {
         // waiting for the peer's raft apply to round-trip.  Raft LWW
         // dedupes the two metastore mutations on `modified_at_ms`.
         //
-        // Best-effort: when `federation_peer_setattr` returns false
-        // (no reachable voter / RPC error / Noop client) we DON'T
-        // surface the error — the local-side flow proceeds
+        // Best-effort: `supplement_setattr` swallows dispatch failure
+        // (no reachable voter / RPC error / coordinator without an
+        // installed FederationGrpcOps) — the local-side flow proceeds
         // regardless, preserving the legacy "metadata-only setattr
         // on backend-less mount succeeds" shape.  PR #81-equivalent
         // silent-miss semantics.  See
@@ -2178,12 +2165,14 @@ impl Kernel {
         *self.peer_client.write() = client;
     }
 
-    // `set_federation_peer_client` + `federation_peer_client_arc`
-    // slot accessors live in `kernel/federation.rs` next to the
-    // sister `DistributedCoordinator` slot accessors (per
-    // `docs/KERNEL-ARCHITECTURE.md` §3, kernel-side §3.B
-    // Control-Plane HAL wiring is owned by the federation-family
-    // submodule).
+    // Federation peer dispatch goes through
+    // `kernel.distributed_coordinator().peer_*(...)` — the sister
+    // `DistributedCoordinator` slot accessors live in
+    // `federation/coordinator_wiring.rs`.  An earlier refactor
+    // attempted a separate `FederationPeerClient` HAL slot to model
+    // typed cross-node VFS RPCs; it was collapsed into
+    // `DistributedCoordinator` because federation is one kind of
+    // distributed protocol, not its own pillar.
 
     /// Borrow the current peer-client trait object — read-locked
     /// snapshot.  Internal callers use this to issue federation
