@@ -24,6 +24,12 @@
 //!   because it is an internal DI boundary, not a kernel HAL —
 //!   kernel callers reach federation peers only through
 //!   `kernel.distributed_coordinator().peer_*(...)`.
+//! * **[`route_outcomes`] routing-tier wrappers** —
+//!   [`FederationWriteOutcome`] and friends that add the kernel-
+//!   routing "not a federation route" state on top of the HAL
+//!   trait's two-state per-peer return.  Consumed by
+//!   `RouteResult::via_federation_write` (in `core/vfs_router.rs`)
+//!   and by `sys_write` (in `kernel/io.rs`).
 //! * **Blob-fetcher slot plumbing** ([`blob_fetcher_slot`]) — boot-time
 //!   stash for the raft-tier handler to drain.
 //!
@@ -36,3 +42,6 @@
 mod blob_fetcher_slot;
 mod coordinator_wiring;
 pub mod grpc_ops;
+pub mod route_outcomes;
+
+pub use route_outcomes::FederationWriteOutcome;

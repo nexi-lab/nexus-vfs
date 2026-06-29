@@ -1,0 +1,224 @@
+name: Kernel Architecture
+
+# Enforce the architectural invariants described in
+# docs/KERNEL-ARCHITECTURE.md §3, §4, §6.1.  Past PRs have placed
+# federation-domain types in core/ (kernel primitives), added HAL
+# surfaces without documenting them in §3.B, or added Cargo deps
+# that would defeat the trait-based DI abstraction (e.g. kernel
+# → raft).  This gate catches those at PR time and points the
+# contributor at the architecture doc rather than letting the
+# violation leak into main and get pinned by downstream consumers.
+#
+# Failing here means an architectural boundary was crossed.  The
+# fix is to MOVE the offending file / type / dep to the correct
+# tier, NOT to extend the allow-lists below.  The allow-lists ARE
+# the SSOT for what each tier holds — extending them requires
+# updating docs/KERNEL-ARCHITECTURE.md first so the rule reflects
+# the doc, not the other way around.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  tier-directory-invariants:
+    name: Tier directory invariants (§3 + §4)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: kernel/src/{abc,hal,core,federation} placement
+        run: |
+          set -e
+          FAIL=0
+
+          # ── abc/ — §3.A Storage HAL pillars ─────────────────────
+          # Exactly the 3 ABC pillar trait files + mod.rs.
+          allowed_abc=("mod.rs" "meta_store.rs" "object_store.rs" "cache_store.rs")
+          for f in rust/kernel/src/abc/*.rs; do
+            [ -e "$f" ] || continue
+            base=$(basename "$f")
+            ok=0
+            for a in "${allowed_abc[@]}"; do
+              [ "$base" = "$a" ] && ok=1 && break
+            done
+            if [ $ok -eq 0 ]; then
+              echo "::error file=$f::Unexpected file in kernel/src/abc/."
+              echo "abc/ holds exactly the 3 §3.A ABC pillar trait files (meta_store.rs, object_store.rs, cache_store.rs) plus mod.rs."
+              echo "See docs/KERNEL-ARCHITECTURE.md §3.A."
+              echo "Fix: move concrete-impl types to backends/.  If this is a brand-new pillar, document it in §3.A first."
+              FAIL=1
+            fi
+          done
+
+          # ── hal/ — §3.B Control-Plane HAL traits ────────────────
+          # Exactly the §3.B trait files + the peer re-export shim.
+          allowed_hal=("mod.rs" "distributed_coordinator.rs" "object_store_provider.rs" "peer.rs")
+          for f in rust/kernel/src/hal/*.rs; do
+            [ -e "$f" ] || continue
+            base=$(basename "$f")
+            ok=0
+            for a in "${allowed_hal[@]}"; do
+              [ "$base" = "$a" ] && ok=1 && break
+            done
+            if [ $ok -eq 0 ]; then
+              echo "::error file=$f::Unexpected file in kernel/src/hal/."
+              echo "hal/ holds only §3.B Control-Plane HAL trait files (currently: distributed_coordinator.rs, object_store_provider.rs, plus the peer re-export at peer.rs)."
+              echo "See docs/KERNEL-ARCHITECTURE.md §3.B."
+              echo "Fix: internal DI wiring for an existing HAL goes in kernel/src/federation/ (or the matching domain submodule).  A brand-new HAL surface requires documenting in §3.B first so the table stays the SSOT."
+              FAIL=1
+            fi
+          done
+
+          # ── core/ — §4 kernel primitives ────────────────────────
+          # Forbid pub items whose names start with a domain prefix
+          # that belongs in another tier (federation/, hal/, transport
+          # crate, etc.).  Matches `pub struct|enum|trait|type Foo`
+          # and `pub(crate) struct|enum|trait|type Foo` with leading
+          # whitespace, but ignores `pub use` re-exports (those are
+          # fine — they don't define a new type in core/).
+          #
+          # core/cas/ is exempted: per docs/KERNEL-ARCHITECTURE.md
+          # §3.A.5 the CAS primitives (cas_engine, cas_chunking,
+          # cas_remote — including GrpcChunkFetcher — and cas_transport)
+          # stay in the kernel crate by explicit design.
+          domain_prefixes='Federation|Raft|Grpc|Hal|Tonic'
+          if hits=$(grep -nREH --exclude-dir=cas "^[[:space:]]*pub(\\([^)]+\\))?[[:space:]]+(struct|enum|trait|type)[[:space:]]+($domain_prefixes)" rust/kernel/src/core/ 2>/dev/null); then
+            echo "::error::Domain-prefixed pub items found in kernel/src/core/ (forbidden)."
+            echo "$hits" | while IFS= read -r line; do
+              file=${line%%:*}
+              echo "::error file=$file::$line"
+            done
+            echo ""
+            echo "Per docs/KERNEL-ARCHITECTURE.md §3/§4:"
+            echo "  * core/ is for §4 kernel primitives only (VFSRouter, LockManager, KernelDispatch, PipeManager, StreamManager, FileDescriptorTable, FileWatcher, ServiceRegistry, DriverLifecycleCoordinator, PermissionGate, AgentRegistry, PluginLoader, PermissionLeaseCache; plus the cas/ subfamily per §3.A.5)."
+            echo "  * Federation-domain types belong in kernel/src/federation/ (siblings: coordinator_wiring.rs, grpc_ops.rs, blob_fetcher_slot.rs, route_outcomes.rs)."
+            echo "  * §3.B HAL trait surfaces belong in kernel/src/hal/ (and must be documented in the §3.B table)."
+            echo "  * Transport-tier types (tonic clients, gRPC framing) belong in rust/transport/."
+            echo ""
+            echo "Fix: move the type to the correct tier directory and update consumer imports."
+            FAIL=1
+          fi
+
+          # ── Federation-prefixed kernel types only in federation/ ─
+          # Anywhere inside rust/kernel/src/ (excluding the canonical
+          # homes federation/ + hal/distributed_coordinator.rs), a
+          # `pub Federation*` type definition is a placement error.
+          # The DistributedCoordinator trait file uses Federation* in
+          # doc references but should not DEFINE a type prefixed
+          # Federation; that always belongs in federation/.
+          fed_hits=$(grep -nREH \
+            --include='*.rs' \
+            --exclude-dir=federation \
+            --exclude-dir=cas \
+            "^[[:space:]]*pub(\\([^)]+\\))?[[:space:]]+(struct|enum|trait|type)[[:space:]]+Federation" \
+            rust/kernel/src/ 2>/dev/null || true)
+          if [ -n "$fed_hits" ]; then
+            echo "::error::Federation-prefixed pub items found outside kernel/src/federation/."
+            echo "$fed_hits" | while IFS= read -r line; do
+              file=${line%%:*}
+              echo "::error file=$file::$line"
+            done
+            echo ""
+            echo "Per docs/KERNEL-ARCHITECTURE.md §3.B.1, federation is implemented BELOW the HAL boundary (in the raft crate)."
+            echo "Kernel-side federation-domain types live in kernel/src/federation/ (siblings: coordinator_wiring.rs, grpc_ops.rs, blob_fetcher_slot.rs, route_outcomes.rs)."
+            echo ""
+            echo "Fix: move the type to kernel/src/federation/<appropriate-file>.rs, re-export from federation/mod.rs, update consumer imports."
+            FAIL=1
+          fi
+
+          if [ $FAIL -ne 0 ]; then
+            exit 1
+          fi
+          echo "Tier directory invariants OK — placement matches docs/KERNEL-ARCHITECTURE.md §3/§4."
+
+  crate-dep-edges:
+    name: Crate dependency edges (§6.1)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Enforce intra-workspace Cargo dep invariants
+        run: |
+          set -e
+          FAIL=0
+
+          # The dep-direction diagram and edge-invariants table in
+          # docs/KERNEL-ARCHITECTURE.md §6.1 are load-bearing: they
+          # are what keeps the dep graph acyclic and what lets the
+          # trait-based DI abstractions (DistributedCoordinator,
+          # ObjectStoreProvider) actually work.  A `kernel → raft`
+          # Cargo dep, for instance, would defeat the whole point
+          # of the §3.B.1 HAL trait — kernel would name raft types
+          # directly and the dep cycle would close.
+
+          # Extract only the [dependencies] and [dev-dependencies]
+          # sections from a Cargo.toml so the dep check ignores
+          # feature names declared in [features] (e.g. lib's
+          # `transport = [...]` feature would false-match an unscoped
+          # grep for "^transport[[:space:]]*=").
+          deps_section() {
+            awk '
+              /^\[[^]]+\]/ { section = $0; next }
+              section == "[dependencies]" || section == "[dev-dependencies]" { print }
+            ' "$1"
+          }
+
+          forbid_dep() {
+            local cargo="$1"
+            local forbidden="$2"
+            local reason="$3"
+            [ -f "$cargo" ] || return 0
+            if deps_section "$cargo" | grep -qE "^${forbidden}[[:space:]]*="; then
+              echo "::error file=$cargo::Forbidden workspace dep '$forbidden' in $cargo"
+              echo "  Reason: $reason"
+              echo "  See docs/KERNEL-ARCHITECTURE.md §6.1 (Edge invariants)."
+              FAIL=1
+            fi
+          }
+
+          # ── kernel ⊥ {raft, transport, backends, services} ──────
+          # The single most important architectural invariant.
+          # Kernel reaches raft only through DistributedCoordinator
+          # trait dispatch; reaches backends only through ObjectStore
+          # trait; never reaches transport or services directly.
+          # A Cargo dep here would defeat the entire HAL abstraction.
+          forbid_dep rust/kernel/Cargo.toml raft "kernel reaches raft only through the DistributedCoordinator trait — a Cargo dep would defeat the §3.B.1 HAL abstraction and close the dep cycle."
+          forbid_dep rust/kernel/Cargo.toml transport "kernel is OS proper (§6.1); transport is the network surface tier.  Direction is transport → kernel, never the reverse."
+          forbid_dep rust/kernel/Cargo.toml backends "kernel declares ObjectStore in abc/object_store.rs; backends impl it.  Direction is backends → kernel, never the reverse."
+          forbid_dep rust/kernel/Cargo.toml services "Per §1 'Invariant': kernel operates with zero services loaded.  Services depend on kernel, never the reverse."
+
+          # ── lib ⊥ everything except contracts ───────────────────
+          # lib is tier-neutral (§6).  It must build against
+          # wasm32-unknown-unknown with default features, which
+          # means zero peer-crate footprint.
+          for forbidden in kernel raft transport backends services; do
+            forbid_dep rust/lib/Cargo.toml $forbidden "lib is tier-neutral (§6) and must build against wasm32-unknown-unknown — only depends on contracts and stdlib."
+          done
+
+          # ── contracts ⊥ everything ──────────────────────────────
+          # Per §6, contracts holds types/enums/exceptions/constants
+          # with zero implementation logic.  Workspace deps would
+          # contradict that role.
+          for forbidden in kernel raft transport backends services lib; do
+            forbid_dep rust/contracts/Cargo.toml $forbidden "contracts is types-only (§6); no workspace deps allowed."
+          done
+
+          # ── Peer-crate orthogonality (§6.1 edge invariants) ─────
+          # services ⊥ backends ⊥ raft — these reach each other
+          # through kernel.sys_* syscalls, never via Cargo dep.
+          # The single documented exception is transport → raft
+          # (federation client proto stubs) which is explicitly
+          # allowed by the doc.  backends, raft are checked here;
+          # services is checked in the nexus repo (it lives there).
+          for forbidden in raft transport services; do
+            forbid_dep rust/backends/Cargo.toml $forbidden "backends ⊥ {raft, transport, services} (§6.1) — peer crates orthogonal; they share state via kernel.sys_* syscalls, not via Cargo dep."
+          done
+          # raft → transport / services are forbidden (note: transport → raft IS allowed, the other direction).
+          for forbidden in transport services backends; do
+            forbid_dep rust/raft/Cargo.toml $forbidden "raft ⊥ {transport, backends, services} (§6.1) — peer crates orthogonal."
+          done
+
+          if [ $FAIL -ne 0 ]; then
+            exit 1
+          fi
+          echo "Crate dep edges OK — workspace dep graph matches docs/KERNEL-ARCHITECTURE.md §6.1."

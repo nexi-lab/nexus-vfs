@@ -180,38 +180,6 @@ pub struct RouteResult {
     pub target_zone_id: Option<String>,
 }
 
-/// Outcome of dispatching a write to the federation SSOT peer.
-///
-/// Three states because federation-peer-mounts have no local backend
-/// fallback — the syscall layer cannot transparently treat "dispatch
-/// missed" as "fall through to local write".  Sister read / stat /
-/// list_dir / unlink methods use `Option<T>` because their "miss"
-/// arm IS the same shape as "not a federation route" (both fall
-/// through to local-not-found semantics); only `write` needs the
-/// three-state distinction.
-///
-/// The Hit variant carries the peer's canonical `(content_id, size)`
-/// from `WriteResult` so the caller's OBSERVE event + native POST
-/// hook fire with the SSOT-side authoritative values.
-#[derive(Debug)]
-pub enum FederationWriteOutcome {
-    /// Route is not a federation-peer-mount.  Caller falls through
-    /// to its normal local write path.
-    NotPeer,
-    /// Federation-peer-mount route, but dispatch missed (peer
-    /// unreachable, coordinator without an installed grpc_ops,
-    /// observability warns fire on the coordinator side).
-    /// Caller MUST return a miss-shaped result WITHOUT attempting
-    /// any local fallback — federation-peer-mounts have no local
-    /// backend, and surfacing the failure as `KernelError::IOError`
-    /// breaks the cc-tasks-share retry contract that legitimately
-    /// expects `hit=false` on transient peer unreachability.
-    DispatchMissed,
-    /// Federation-peer-mount route + dispatch hit.  Caller
-    /// short-circuits with `wr`.
-    Hit(crate::abc::object_store::WriteResult),
-}
-
 impl RouteResult {
     /// Resolve the metastore for this mount, falling back to a
     /// kernel-supplied global metastore when the mount has no per-mount
@@ -272,17 +240,18 @@ impl RouteResult {
     /// Pure-defer write: peer's `NexusVFSService.Write` runs the full
     /// write lifecycle authoritatively on the SSOT side.
     ///
-    /// Returns a [`FederationWriteOutcome`] — three named variants
-    /// because sys_write must distinguish "fall through to local"
-    /// from "return miss without local fallback".  See the type's
-    /// docs for the rationale.
+    /// Returns a [`crate::federation::FederationWriteOutcome`] —
+    /// three named variants because sys_write must distinguish
+    /// "fall through to local" from "return miss without local
+    /// fallback".  See the type's docs for the rationale.
     #[inline]
     pub fn via_federation_write(
         &self,
         kernel: &crate::kernel::Kernel,
         peer_path: &str,
         content: &[u8],
-    ) -> FederationWriteOutcome {
+    ) -> crate::federation::FederationWriteOutcome {
+        use crate::federation::FederationWriteOutcome;
         let Some(target_zone) = self.federation_target_zone() else {
             return FederationWriteOutcome::NotPeer;
         };
@@ -1234,6 +1203,7 @@ mod tests {
 
     use crate::abc::meta_store::MetaStore;
     use crate::abc::object_store::{BackendStat, WriteResult};
+    use crate::federation::FederationWriteOutcome;
     use crate::hal::distributed_coordinator::{
         ClusterInfo, CoordinatorResult, DistributedCoordinator, ShareInfo,
     };

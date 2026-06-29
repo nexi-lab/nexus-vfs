@@ -903,7 +903,7 @@ impl Kernel {
         // first.  For placeholder mounts that means the partial-write
         // path returns miss — preserved legacy behaviour.
         if input.offset == 0 {
-            use crate::vfs_router::FederationWriteOutcome;
+            use crate::federation::FederationWriteOutcome;
             match input
                 .route
                 .via_federation_write(self, input.path, input.content)
