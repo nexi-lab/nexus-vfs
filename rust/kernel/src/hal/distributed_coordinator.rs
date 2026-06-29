@@ -38,6 +38,7 @@
 use std::sync::Arc;
 
 use crate::abc::meta_store::MetaStore;
+use crate::abc::object_store::{BackendStat, WriteResult};
 use contracts::lock_state::Locks;
 
 /// Result type used across the Control-Plane HAL. String errors carry
@@ -281,6 +282,160 @@ pub trait DistributedCoordinator: Send + Sync + 'static {
         kernel: &crate::kernel::Kernel,
         zone_id: &str,
     ) -> CoordinatorResult<Arc<dyn Locks>>;
+
+    // ── Cross-node peer dispatch ─────────────────────────────────────
+    //
+    // Federation-peer-mount sites in the syscall layer (sys_read /
+    // sys_stat / sys_readdir / sys_unlink / sys_write / sys_mkdir /
+    // sys_rename / sys_setattr) reach the SSOT peer through these
+    // methods.  Each impl owns the iteration over `zone_peers`, the
+    // self_addr filter, error accumulation, and the operator-visible
+    // warn-loud observability for the three silent-failure paths
+    // (target_zone unknown / zone_peers empty / all-peers RPC failed).
+    // The actual per-peer gRPC call goes through an internal
+    // `FederationGrpcOps` arc the coordinator's constructor receives
+    // (see [`crate::federation::grpc_ops`]); kernel callers never
+    // name that trait.
+    //
+    // `Option<T>` return shapes:
+    //   * `Some(value)` — at least one non-self peer returned `Ok(Some(value))`.
+    //   * `None`        — no peer hit (true miss, silent-failure path
+    //                     surfaced via tracing::warn, or default Noop impl).
+
+    /// Fetch bytes from the SSOT peer for the federation mount whose
+    /// target zone is `target_zone`.  Pure-defer pattern — caller does
+    /// NOT also run a local read, since the local placeholder mount
+    /// has no backend.
+    #[allow(unused_variables)]
+    fn peer_read(
+        &self,
+        kernel: &crate::kernel::Kernel,
+        target_zone: &str,
+        peer_path: &str,
+        offset: u64,
+    ) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Stat a path on the SSOT peer.  Pure-defer pattern.
+    #[allow(unused_variables)]
+    fn peer_stat(
+        &self,
+        kernel: &crate::kernel::Kernel,
+        target_zone: &str,
+        peer_path: &str,
+    ) -> Option<BackendStat> {
+        None
+    }
+
+    /// Enumerate children on the SSOT peer.  Pure-defer pattern.
+    /// Empty Vec is meaningful (real empty dir) — distinguish from
+    /// "not found" by always returning `Some(entries)` on transport
+    /// success.
+    #[allow(unused_variables)]
+    fn peer_list_dir(
+        &self,
+        kernel: &crate::kernel::Kernel,
+        target_zone: &str,
+        peer_path: &str,
+    ) -> Option<Vec<(String, u8)>> {
+        None
+    }
+
+    /// Delete a regular file on the SSOT peer.  Pure-defer pattern.
+    /// Returns `true` when at least one non-self peer's Delete
+    /// succeeded.
+    #[allow(unused_variables)]
+    fn peer_delete_file(
+        &self,
+        kernel: &crate::kernel::Kernel,
+        target_zone: &str,
+        peer_path: &str,
+    ) -> bool {
+        false
+    }
+
+    /// Remove a directory on the SSOT peer (recursive flag honored
+    /// per `DRIVER_RMDIR` ABI).  Pure-defer pattern.
+    #[allow(unused_variables)]
+    fn peer_rmdir(
+        &self,
+        kernel: &crate::kernel::Kernel,
+        target_zone: &str,
+        peer_path: &str,
+        recursive: bool,
+    ) -> bool {
+        false
+    }
+
+    /// Write file bytes to the SSOT peer.  Pure-defer pattern — the
+    /// peer's typed handler runs the full write lifecycle (backend
+    /// write + metastore.put + raft propose) and replicates back to
+    /// every voter.  Returning the peer's `WriteResult` lets the
+    /// caller surface its OBSERVE event + native POST hook with the
+    /// canonical `(content_id, size)` from the SSOT side.
+    #[allow(unused_variables)]
+    fn peer_write(
+        &self,
+        kernel: &crate::kernel::Kernel,
+        target_zone: &str,
+        peer_path: &str,
+        content: &[u8],
+    ) -> Option<WriteResult> {
+        None
+    }
+
+    /// Create a directory on the SSOT peer (parents / exist_ok flags
+    /// honored).  SUPPLEMENT pattern — caller ALSO runs the local
+    /// `metastore.put` for the DT_DIR row so the joiner's VFSRouter
+    /// can route children of the new directory immediately.
+    /// See [[feedback_defer_to_peer_only_for_byte_ops]].
+    #[allow(unused_variables)]
+    fn peer_mkdir(
+        &self,
+        kernel: &crate::kernel::Kernel,
+        target_zone: &str,
+        peer_path: &str,
+        parents: bool,
+        exist_ok: bool,
+    ) -> bool {
+        false
+    }
+
+    /// Rename a file or directory on the SSOT peer.  SUPPLEMENT —
+    /// caller ALSO runs the local `metastore.rename_path` so the
+    /// VFSRouter observes the rename immediately and child ops on
+    /// the new path route correctly.
+    #[allow(unused_variables)]
+    fn peer_rename(
+        &self,
+        kernel: &crate::kernel::Kernel,
+        target_zone: &str,
+        old_path: &str,
+        new_path: &str,
+    ) -> bool {
+        false
+    }
+
+    /// Update DT_REG metadata on the SSOT peer.  SUPPLEMENT — caller
+    /// ALSO runs the local `metastore.put` for the row.  Restricted
+    /// to DT_REG entries; DT_MOUNT / DT_PIPE / DT_STREAM / DT_DIR /
+    /// DT_LINK setattr branches are node-local.
+    #[allow(clippy::too_many_arguments, unused_variables)]
+    fn peer_setattr(
+        &self,
+        kernel: &crate::kernel::Kernel,
+        target_zone: &str,
+        peer_path: &str,
+        mime_type: Option<&str>,
+        content_id: Option<&str>,
+        modified_at_ms: Option<i64>,
+        created_at_ms: Option<i64>,
+        size: Option<u64>,
+        version: Option<u32>,
+    ) -> bool {
+        false
+    }
 }
 
 /// No-op fallback used at `Kernel::new` so the coordinator slot is
