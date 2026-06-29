@@ -302,12 +302,15 @@ impl RouteResult {
     }
 
     /// Pure-defer unlink: peer's `NexusVFSService.Delete` runs the
-    /// full unlink lifecycle (metastore delete + backend delete_file
-    /// + raft replication).  `Some(true)` = peer delete succeeded;
-    /// `Some(false)` = federation route but dispatch missed (peer
-    /// unreachable / Noop client / observability warns fire);
-    /// `None` = not a federation route (caller falls through to
-    /// local unlink).
+    /// full unlink lifecycle (metastore delete plus backend delete
+    /// plus raft replication).
+    ///
+    /// Returns `Some(true)` when the peer delete succeeded,
+    /// `Some(false)` when the route is a federation peer mount but
+    /// dispatch missed (peer unreachable, coordinator without an
+    /// installed grpc_ops, observability warns fire), and `None`
+    /// when this is not a federation route (caller falls through
+    /// to local unlink).
     #[inline]
     pub fn via_federation_unlink(
         &self,
@@ -360,12 +363,10 @@ impl RouteResult {
         let Some(target_zone) = self.federation_target_zone() else {
             return;
         };
-        let _ = kernel.distributed_coordinator().peer_rename(
-            kernel,
-            target_zone,
-            old_path,
-            new_path,
-        );
+        let _ =
+            kernel
+                .distributed_coordinator()
+                .peer_rename(kernel, target_zone, old_path, new_path);
     }
 
     /// Supplement setattr (DT_REG only): fires the peer's
@@ -1410,9 +1411,7 @@ mod tests {
         }
     }
 
-    fn install_recording_coordinator(
-        kernel: &crate::kernel::Kernel,
-    ) -> Arc<RecordingCoordinator> {
+    fn install_recording_coordinator(kernel: &crate::kernel::Kernel) -> Arc<RecordingCoordinator> {
         let fake = Arc::new(RecordingCoordinator::default());
         kernel.set_distributed_coordinator(fake.clone() as Arc<dyn DistributedCoordinator>);
         fake
@@ -1470,10 +1469,7 @@ mod tests {
             .via_federation_stat(&kernel, "/x")
             .expect("peer dispatch should surface the coordinator hit");
         assert_eq!(stat.size, 42);
-        assert_eq!(
-            fake.calls(),
-            vec!["peer_stat(target=sharedzone, path=/x)"]
-        );
+        assert_eq!(fake.calls(), vec!["peer_stat(target=sharedzone, path=/x)"]);
     }
 
     #[test]

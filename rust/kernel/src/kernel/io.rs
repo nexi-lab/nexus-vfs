@@ -936,24 +936,18 @@ impl Kernel {
                 let result_old_etag = old_content_id.clone();
                 let result_old_size = old_entry.as_ref().map(|e| e.size);
                 let result_old_version = old_entry.as_ref().map(|e| e.version);
-                let result_old_modified_at_ms =
-                    old_entry.as_ref().and_then(|e| e.modified_at_ms);
+                let result_old_modified_at_ms = old_entry.as_ref().and_then(|e| e.modified_at_ms);
 
                 let content_id_for_event = wr.content_id.clone();
                 let size_for_event = wr.size;
-                self.dispatch_mutation(
-                    FileEventType::FileWrite,
-                    input.path,
-                    input.ctx,
-                    |ev| {
-                        ev.size = Some(size_for_event);
-                        ev.content_id = Some(content_id_for_event);
-                        ev.version = Some(new_version);
-                        ev.gen = Some(new_gen);
-                        ev.is_new = old_version == 0;
-                        ev.old_content_id = old_content_id;
-                    },
-                );
+                self.dispatch_mutation(FileEventType::FileWrite, input.path, input.ctx, |ev| {
+                    ev.size = Some(size_for_event);
+                    ev.content_id = Some(content_id_for_event);
+                    ev.version = Some(new_version);
+                    ev.gen = Some(new_gen);
+                    ev.is_new = old_version == 0;
+                    ev.old_content_id = old_content_id;
+                });
 
                 self.dispatch_native_post(&HookContext::Write(WriteHookCtx {
                     path: input.path.to_string(),

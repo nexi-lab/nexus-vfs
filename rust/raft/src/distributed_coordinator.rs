@@ -2160,17 +2160,9 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
         peer_path: &str,
         recursive: bool,
     ) -> bool {
-        self.dispatch_to_peers::<(), _>(
-            kernel,
-            "rmdir",
-            target_zone,
-            peer_path,
-            |client, addr| {
-                client
-                    .rmdir(addr, peer_path, recursive)
-                    .map(|()| Some(()))
-            },
-        )
+        self.dispatch_to_peers::<(), _>(kernel, "rmdir", target_zone, peer_path, |client, addr| {
+            client.rmdir(addr, peer_path, recursive).map(|()| Some(()))
+        })
         .is_some()
     }
 
@@ -2182,17 +2174,11 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
         parents: bool,
         exist_ok: bool,
     ) -> bool {
-        self.dispatch_to_peers::<(), _>(
-            kernel,
-            "mkdir",
-            target_zone,
-            peer_path,
-            |client, addr| {
-                client
-                    .mkdir(addr, peer_path, parents, exist_ok)
-                    .map(|()| Some(()))
-            },
-        )
+        self.dispatch_to_peers::<(), _>(kernel, "mkdir", target_zone, peer_path, |client, addr| {
+            client
+                .mkdir(addr, peer_path, parents, exist_ok)
+                .map(|()| Some(()))
+        })
         .is_some()
     }
 
@@ -2203,17 +2189,9 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
         old_path: &str,
         new_path: &str,
     ) -> bool {
-        self.dispatch_to_peers::<(), _>(
-            kernel,
-            "rename",
-            target_zone,
-            old_path,
-            |client, addr| {
-                client
-                    .rename(addr, old_path, new_path)
-                    .map(|()| Some(()))
-            },
-        )
+        self.dispatch_to_peers::<(), _>(kernel, "rename", target_zone, old_path, |client, addr| {
+            client.rename(addr, old_path, new_path).map(|()| Some(()))
+        })
         .is_some()
     }
 
@@ -3081,11 +3059,7 @@ mod tests {
         fn stat(&self, _addr: &str, _path: &str) -> FederationPeerResult<Option<BackendStat>> {
             unreachable!("stat not exercised by these pins");
         }
-        fn list_dir(
-            &self,
-            _addr: &str,
-            _path: &str,
-        ) -> FederationPeerResult<Vec<(String, u8)>> {
+        fn list_dir(&self, _addr: &str, _path: &str) -> FederationPeerResult<Vec<(String, u8)>> {
             unreachable!("list_dir not exercised by these pins");
         }
         fn delete_file(&self, _addr: &str, _path: &str) -> FederationPeerResult<()> {

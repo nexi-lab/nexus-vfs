@@ -370,20 +370,14 @@ mod tests {
     #[test]
     fn unlink_response_hit_false_is_clean_miss() {
         let r = interpret_unlink_response("/m", br#"{"hit":false}"#, false);
-        assert_eq!(r.unwrap(), false);
+        assert!(!r.unwrap());
     }
 
     #[test]
     fn unlink_response_hit_true_and_bare_ack_are_removals() {
-        assert_eq!(
-            interpret_unlink_response("/m", br#"{"hit":true}"#, false).unwrap(),
-            true
-        );
-        assert_eq!(interpret_unlink_response("/m", b"", false).unwrap(), true);
-        assert_eq!(
-            interpret_unlink_response("/m", br#"{"result":{"hit":false}}"#, false).unwrap(),
-            false
-        );
+        assert!(interpret_unlink_response("/m", br#"{"hit":true}"#, false).unwrap());
+        assert!(interpret_unlink_response("/m", b"", false).unwrap());
+        assert!(!interpret_unlink_response("/m", br#"{"result":{"hit":false}}"#, false).unwrap());
     }
 
     #[test]
