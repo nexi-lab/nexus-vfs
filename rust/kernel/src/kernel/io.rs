@@ -885,93 +885,88 @@ impl Kernel {
         // for the canonical 2-node cc-tasks-share topology the SSOT
         // side has `backend = Some` and never enters this arm, so
         // re-entry is structurally impossible.
+        // PR #80 short-circuit for offset==0: pure-defer the write to
+        // the SSOT peer when the routed entry is a federation-peer-
+        // mount placeholder.  The named outcome variants make the
+        // three legitimate states explicit:
+        //   * NotPeer        — fall through to the local write path.
+        //   * DispatchMissed — federation route, but the SSOT peer was
+        //                      unreachable; return miss() WITHOUT any
+        //                      local fallback (placeholder mounts
+        //                      have no local backend).
+        //   * Hit(wr)        — short-circuit with the peer's canonical
+        //                      (content_id, size).
+        //
+        // Offset > 0 (partial writes) are NOT short-circuited: the
+        // wire shape takes (addr, path, content) with no offset, and
+        // partial-write semantics need RMW the caller handles locally
+        // first.  For placeholder mounts that means the partial-write
+        // path returns miss — preserved legacy behaviour.
         if input.offset == 0 {
-            // PR #80 short-circuit: pure-defer the write to the SSOT
-            // peer when the routed entry is a federation-peer-mount
-            // placeholder.  Three-state return from
-            // [`RouteResult::via_federation_write`]:
-            //   * outer `None` — not a federation route; fall through
-            //     to the normal local write path.
-            //   * outer `Some(None)` — federation route + dispatch
-            //     missed; return miss() WITHOUT a local fallback.
-            //     Federation-peer-mounts have no local backend, and
-            //     surfacing the failure as `KernelError::IOError`
-            //     broke kernel-background writes in the first PR #80
-            //     attempt — the legacy retry contract (hit=false →
-            //     caller retries) is what cc-tasks-share E2E pins.
-            //   * outer `Some(Some(wr))` — federation route +
-            //     dispatch hit; short-circuit with `wr` carrying the
-            //     peer's canonical `(content_id, size)`.
-            //
-            // Offset > 0 (partial writes) NOT short-circuited here:
-            // the wire shape takes (addr, path, content) with no
-            // offset, and partial-write semantics need RMW the caller
-            // handles locally first.  For placeholder mounts the
-            // partial-write path returns miss — preserved legacy
-            // behaviour.
-            if let Some(write_outcome) =
-                input
-                    .route
-                    .via_federation_write(self, input.path, input.content)
+            use crate::vfs_router::FederationWriteOutcome;
+            match input
+                .route
+                .via_federation_write(self, input.path, input.content)
             {
-                let wr = match write_outcome {
-                    Some(wr) => wr,
-                    None => return miss(),
-                };
+                FederationWriteOutcome::NotPeer => { /* fall through */ }
+                FederationWriteOutcome::DispatchMissed => return miss(),
+                FederationWriteOutcome::Hit(wr) => {
+                    // Best-effort old-state snapshot for OBSERVE +
+                    // native POST hook.  Joiner's local metastore may
+                    // or may not have a row pre-write; founder's
+                    // post-write metastore.put will eventually
+                    // replicate via raft and supersede.  When local
+                    // has nothing, treat as first-write (is_new=true)
+                    // — consistent with "this voter has never
+                    // observed this path before".
+                    let old_entry = self.commit_old_metadata(&input);
+                    let old_version = old_entry.as_ref().map(|e| e.version).unwrap_or(0);
+                    let old_gen = old_entry.as_ref().map(|e| e.gen).unwrap_or(0);
+                    let old_content_id = old_entry.as_ref().and_then(|e| e.content_id.clone());
+                    let new_version = old_version + 1;
+                    let new_gen = old_gen.saturating_add(1);
+                    let result_is_new = old_entry.is_none();
+                    let result_old_etag = old_content_id.clone();
+                    let result_old_size = old_entry.as_ref().map(|e| e.size);
+                    let result_old_version = old_entry.as_ref().map(|e| e.version);
+                    let result_old_modified_at_ms =
+                        old_entry.as_ref().and_then(|e| e.modified_at_ms);
 
-                // Best-effort old-state snapshot for OBSERVE + native
-                // POST hook.  Joiner's local metastore may or may not
-                // have a row pre-write; founder's post-write metastore.put
-                // will eventually replicate via raft and supersede.  When
-                // local has nothing, treat as first-write (is_new = true)
-                // — consistent with "this voter has never observed this
-                // path before".
-                let old_entry = self.commit_old_metadata(&input);
-                let old_version = old_entry.as_ref().map(|e| e.version).unwrap_or(0);
-                let old_gen = old_entry.as_ref().map(|e| e.gen).unwrap_or(0);
-                let old_content_id = old_entry.as_ref().and_then(|e| e.content_id.clone());
-                let new_version = old_version + 1;
-                let new_gen = old_gen.saturating_add(1);
-                let result_is_new = old_entry.is_none();
-                let result_old_etag = old_content_id.clone();
-                let result_old_size = old_entry.as_ref().map(|e| e.size);
-                let result_old_version = old_entry.as_ref().map(|e| e.version);
-                let result_old_modified_at_ms = old_entry.as_ref().and_then(|e| e.modified_at_ms);
+                    let content_id_for_event = wr.content_id.clone();
+                    let size_for_event = wr.size;
+                    self.dispatch_mutation(FileEventType::FileWrite, input.path, input.ctx, |ev| {
+                        ev.size = Some(size_for_event);
+                        ev.content_id = Some(content_id_for_event);
+                        ev.version = Some(new_version);
+                        ev.gen = Some(new_gen);
+                        ev.is_new = old_version == 0;
+                        ev.old_content_id = old_content_id;
+                    });
 
-                let content_id_for_event = wr.content_id.clone();
-                let size_for_event = wr.size;
-                self.dispatch_mutation(FileEventType::FileWrite, input.path, input.ctx, |ev| {
-                    ev.size = Some(size_for_event);
-                    ev.content_id = Some(content_id_for_event);
-                    ev.version = Some(new_version);
-                    ev.gen = Some(new_gen);
-                    ev.is_new = old_version == 0;
-                    ev.old_content_id = old_content_id;
-                });
+                    self.dispatch_native_post(&HookContext::Write(WriteHookCtx {
+                        path: input.path.to_string(),
+                        identity: HookIdentity::from(input.ctx),
+                        content: vec![],
+                        is_new_file: result_is_new,
+                        content_id: None,
+                        new_version: new_version.into(),
+                        size_bytes: Some(wr.size),
+                    }));
 
-                self.dispatch_native_post(&HookContext::Write(WriteHookCtx {
-                    path: input.path.to_string(),
-                    identity: HookIdentity::from(input.ctx),
-                    content: vec![],
-                    is_new_file: result_is_new,
-                    content_id: None,
-                    new_version: new_version.into(),
-                    size_bytes: Some(wr.size),
-                }));
-
-                return Ok(SysWriteResult {
-                    hit: true,
-                    content_id: Some(wr.content_id),
-                    post_hook_needed: self.write_hook_count.load(Ordering::Relaxed) > 0,
-                    version: new_version,
-                    gen: new_gen,
-                    size: wr.size,
-                    is_new: result_is_new,
-                    old_content_id: result_old_etag,
-                    old_size: result_old_size,
-                    old_version: result_old_version,
-                    old_modified_at_ms: result_old_modified_at_ms,
-                });
+                    return Ok(SysWriteResult {
+                        hit: true,
+                        content_id: Some(wr.content_id),
+                        post_hook_needed: self.write_hook_count.load(Ordering::Relaxed) > 0,
+                        version: new_version,
+                        gen: new_gen,
+                        size: wr.size,
+                        is_new: result_is_new,
+                        old_content_id: result_old_etag,
+                        old_size: result_old_size,
+                        old_version: result_old_version,
+                        old_modified_at_ms: result_old_modified_at_ms,
+                    });
+                }
             }
         }
 

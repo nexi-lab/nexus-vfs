@@ -180,6 +180,38 @@ pub struct RouteResult {
     pub target_zone_id: Option<String>,
 }
 
+/// Outcome of dispatching a write to the federation SSOT peer.
+///
+/// Three states because federation-peer-mounts have no local backend
+/// fallback — the syscall layer cannot transparently treat "dispatch
+/// missed" as "fall through to local write".  Sister read / stat /
+/// list_dir / unlink methods use `Option<T>` because their "miss"
+/// arm IS the same shape as "not a federation route" (both fall
+/// through to local-not-found semantics); only `write` needs the
+/// three-state distinction.
+///
+/// The Hit variant carries the peer's canonical `(content_id, size)`
+/// from `WriteResult` so the caller's OBSERVE event + native POST
+/// hook fire with the SSOT-side authoritative values.
+#[derive(Debug)]
+pub enum FederationWriteOutcome {
+    /// Route is not a federation-peer-mount.  Caller falls through
+    /// to its normal local write path.
+    NotPeer,
+    /// Federation-peer-mount route, but dispatch missed (peer
+    /// unreachable, coordinator without an installed grpc_ops,
+    /// observability warns fire on the coordinator side).
+    /// Caller MUST return a miss-shaped result WITHOUT attempting
+    /// any local fallback — federation-peer-mounts have no local
+    /// backend, and surfacing the failure as `KernelError::IOError`
+    /// breaks the cc-tasks-share retry contract that legitimately
+    /// expects `hit=false` on transient peer unreachability.
+    DispatchMissed,
+    /// Federation-peer-mount route + dispatch hit.  Caller
+    /// short-circuits with `wr`.
+    Hit(crate::abc::object_store::WriteResult),
+}
+
 impl RouteResult {
     /// Resolve the metastore for this mount, falling back to a
     /// kernel-supplied global metastore when the mount has no per-mount
@@ -240,32 +272,27 @@ impl RouteResult {
     /// Pure-defer write: peer's `NexusVFSService.Write` runs the full
     /// write lifecycle authoritatively on the SSOT side.
     ///
-    /// Three-state return — sys_write needs to distinguish
-    /// "fall-through-to-local" from "return-miss-without-local-fallback"
-    /// because federation-peer-mounts have no local backend to fall
-    /// back on:
-    ///   * `None` — not a federation-peer-mount; caller falls through
-    ///     to the normal local write path.
-    ///   * `Some(None)` — federation route, dispatch missed (peer
-    ///     unreachable / Noop / observability warns fire); caller
-    ///     returns a miss-shaped result WITHOUT attempting any local
-    ///     fallback (preserves the PR #80 retry contract).
-    ///   * `Some(Some(wr))` — federation route, dispatch hit; caller
-    ///     short-circuits with `wr` carrying the peer's canonical
-    ///     `(content_id, size)`.
+    /// Returns a [`FederationWriteOutcome`] — three named variants
+    /// because sys_write must distinguish "fall through to local"
+    /// from "return miss without local fallback".  See the type's
+    /// docs for the rationale.
     #[inline]
     pub fn via_federation_write(
         &self,
         kernel: &crate::kernel::Kernel,
         peer_path: &str,
         content: &[u8],
-    ) -> Option<Option<crate::abc::object_store::WriteResult>> {
-        let target_zone = self.federation_target_zone()?;
-        Some(
-            kernel
-                .distributed_coordinator()
-                .peer_write(kernel, target_zone, peer_path, content),
-        )
+    ) -> FederationWriteOutcome {
+        let Some(target_zone) = self.federation_target_zone() else {
+            return FederationWriteOutcome::NotPeer;
+        };
+        match kernel
+            .distributed_coordinator()
+            .peer_write(kernel, target_zone, peer_path, content)
+        {
+            Some(wr) => FederationWriteOutcome::Hit(wr),
+            None => FederationWriteOutcome::DispatchMissed,
+        }
     }
 
     /// Pure-defer stat: peer's `NexusVFSService.Stat` is authoritative
@@ -1473,23 +1500,150 @@ mod tests {
     }
 
     #[test]
-    fn route_via_federation_write_three_state_collapses_correctly() {
+    fn route_via_federation_write_non_peer_route_returns_not_peer() {
         let kernel = crate::kernel::Kernel::new();
         let fake = install_recording_coordinator(&kernel);
-        // Non-federation route: outer None (caller falls through to local).
-        assert!(route_non_federation()
-            .via_federation_write(&kernel, "/x", b"abc")
-            .is_none());
-        // Federation route: outer Some, inner Some(wr) from the fake hit.
-        let outcome = route_federation_peer()
-            .via_federation_write(&kernel, "/x", b"abc")
-            .expect("peer route returns Some outer");
-        let wr = outcome.expect("coordinator returned a hit");
-        assert_eq!(wr.size, 3);
+        match route_non_federation().via_federation_write(&kernel, "/x", b"abc") {
+            FederationWriteOutcome::NotPeer => {}
+            other => panic!("expected NotPeer for local route, got {other:?}"),
+        }
+        assert!(
+            fake.calls().is_empty(),
+            "non-federation route must not invoke the coordinator: {:?}",
+            fake.calls()
+        );
+    }
+
+    #[test]
+    fn route_via_federation_write_peer_route_hit_carries_canonical_write_result() {
+        let kernel = crate::kernel::Kernel::new();
+        let fake = install_recording_coordinator(&kernel);
+        match route_federation_peer().via_federation_write(&kernel, "/x", b"abc") {
+            FederationWriteOutcome::Hit(wr) => {
+                assert_eq!(wr.size, 3);
+                assert_eq!(wr.content_id, "/x");
+            }
+            other => panic!("expected Hit, got {other:?}"),
+        }
         assert_eq!(
             fake.calls(),
             vec!["peer_write(target=sharedzone, path=/x, len=3)"]
         );
+    }
+
+    /// Federation route whose dispatch missed (coordinator's
+    /// `peer_write` returns None — peer unreachable, observability
+    /// warns fire on the coordinator side).  Pinning this separately
+    /// from the Hit case guards the no-local-fallback rule that
+    /// distinguishes federation-peer-mounts from regular mounts.
+    #[test]
+    fn route_via_federation_write_peer_route_dispatch_miss_surfaces_dispatch_missed() {
+        // Use a fake coordinator whose peer_write returns None to
+        // simulate every voter being unreachable.  The dispatch
+        // helper would normally fall back through dispatch_to_peers
+        // and surface None; this fake bypasses that to test the
+        // RouteResult arm directly.
+        struct MissCoordinator;
+        impl DistributedCoordinator for MissCoordinator {
+            fn list_zones(&self, _kernel: &crate::kernel::Kernel) -> Vec<String> {
+                Vec::new()
+            }
+            fn cluster_info(
+                &self,
+                _kernel: &crate::kernel::Kernel,
+                _zone_id: &str,
+            ) -> CoordinatorResult<ClusterInfo> {
+                Err("unused".into())
+            }
+            fn create_zone(
+                &self,
+                _kernel: &crate::kernel::Kernel,
+                _zone_id: &str,
+            ) -> CoordinatorResult<()> {
+                Err("unused".into())
+            }
+            fn remove_zone(
+                &self,
+                _kernel: &crate::kernel::Kernel,
+                _zone_id: &str,
+                _force: bool,
+            ) -> CoordinatorResult<()> {
+                Err("unused".into())
+            }
+            fn join_zone(
+                &self,
+                _kernel: &crate::kernel::Kernel,
+                _zone_id: &str,
+                _as_learner: bool,
+            ) -> CoordinatorResult<()> {
+                Err("unused".into())
+            }
+            fn wire_mount(
+                &self,
+                _kernel: &crate::kernel::Kernel,
+                _parent_zone: &str,
+                _mount_path: &str,
+                _target_zone: &str,
+            ) -> CoordinatorResult<()> {
+                Err("unused".into())
+            }
+            fn unwire_mount(
+                &self,
+                _kernel: &crate::kernel::Kernel,
+                _parent_zone: &str,
+                _mount_path: &str,
+            ) -> CoordinatorResult<()> {
+                Err("unused".into())
+            }
+            fn share_zone(
+                &self,
+                _kernel: &crate::kernel::Kernel,
+                _local_path: &str,
+                _new_zone_id: &str,
+            ) -> CoordinatorResult<ShareInfo> {
+                Err("unused".into())
+            }
+            fn lookup_share(
+                &self,
+                _kernel: &crate::kernel::Kernel,
+                _remote_path: &str,
+            ) -> CoordinatorResult<Option<ShareInfo>> {
+                Ok(None)
+            }
+            fn metastore_for_zone(
+                &self,
+                _kernel: &crate::kernel::Kernel,
+                _zone_id: &str,
+            ) -> CoordinatorResult<Arc<dyn MetaStore>> {
+                Err("unused".into())
+            }
+            fn locks_for_zone(
+                &self,
+                _kernel: &crate::kernel::Kernel,
+                _zone_id: &str,
+            ) -> CoordinatorResult<Arc<dyn Locks>> {
+                Err("unused".into())
+            }
+            // The single override that matters: peer_write returns
+            // None — the simulated all-voters-unreachable path.
+            fn peer_write(
+                &self,
+                _kernel: &crate::kernel::Kernel,
+                _target_zone: &str,
+                _peer_path: &str,
+                _content: &[u8],
+            ) -> Option<WriteResult> {
+                None
+            }
+        }
+        let kernel = crate::kernel::Kernel::new();
+        kernel.set_distributed_coordinator(
+            Arc::new(MissCoordinator) as Arc<dyn DistributedCoordinator>
+        );
+        match route_federation_peer().via_federation_write(&kernel, "/x", b"abc") {
+            FederationWriteOutcome::DispatchMissed => {}
+            other => panic!("expected DispatchMissed when peer_write returns None, got {other:?}"),
+        }
     }
 
     #[test]
