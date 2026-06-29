@@ -8,17 +8,19 @@
 //! * `path_local`        — path addressing + local fs transport
 //! * `local_connector`   — reference-mode local folder mount
 //! * `remote`            — RPC proxy ObjectStore (Python hub — `RemoteBackend`)
-//! * `federation_peer`   — typed RPC proxy ObjectStore (peer nexusd
-//!   cluster — `FederationPeerBackend`).  Sibling of `remote` but
-//!   different wire shape (typed `NexusVFSService` RPCs vs Call).
+//!
+//! Federation across nodes is NOT an ObjectStore concern — it is
+//! routing/coordination and lives behind
+//! `kernel::hal::DistributedCoordinator::peer_*` (impl in the raft
+//! crate).  An earlier `federation_peer` ObjectStore impl tried to
+//! shoehorn cross-node RPC into the storage pillar; it was never
+//! wired in production and has been removed.
 
 #[cfg(feature = "driver-cas-local")]
 pub mod cas_local;
-#[cfg(feature = "driver-federation-peer")]
-pub mod federation_peer;
 #[cfg(feature = "driver-local-connector")]
 pub mod local_connector;
-#[cfg(any(feature = "driver-federation-peer", feature = "driver-remote"))]
+#[cfg(feature = "driver-remote")]
 mod mount_path;
 #[cfg(feature = "driver-path-local")]
 pub mod path_local;

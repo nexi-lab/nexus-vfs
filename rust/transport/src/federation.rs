@@ -28,7 +28,7 @@ use dashmap::DashMap;
 use tonic::transport::Channel;
 
 use kernel::abc::object_store::{BackendStat, WriteResult};
-use kernel::hal::federation_peer::{FederationPeerClient, FederationPeerResult};
+use kernel::federation::grpc_ops::{FederationGrpcOps, FederationPeerResult};
 use kernel::kernel::vfs_proto;
 use lib::transport_primitives::{create_channel, ClientConfig, TlsConfig};
 use nexus_raft::federation::TofuTrustStore;
@@ -225,12 +225,12 @@ impl FederationClient {
 
     // ── Typed NexusVFSService RPC wrappers ───────────────────────────
     //
-    // Used by `FederationPeerBackend` (in the `backends` crate) via the
-    // `kernel::hal::federation_peer::FederationPeerClient` trait below.
-    // Each wrapper acquires a pooled channel, builds the typed
-    // `NexusVFSService` client, fires the RPC, and surfaces the in-band
-    // `is_error` flag as an `Err(String)` so callers see the same error
-    // shape for transport vs application failures.
+    // Used by `RaftDistributedCoordinator::peer_*` (in the `raft`
+    // crate) via the `kernel::federation::grpc_ops::FederationGrpcOps`
+    // trait below.  Each wrapper acquires a pooled channel, builds the
+    // typed `NexusVFSService` client, fires the RPC, and surfaces the
+    // in-band `is_error` flag as an `Err(String)` so callers see the
+    // same error shape for transport vs application failures.
 
     async fn vfs_client(
         &self,
@@ -490,29 +490,15 @@ impl FederationClient {
     }
 }
 
-/// Install hook called during kernel process boot —
-/// constructs a `FederationClient` borrowing the kernel's tokio
-/// runtime and installs it via `Kernel::set_federation_peer_client`,
-/// replacing the `NoopFederationPeerClient` default.  Mirrors
-/// [`super::peer_blob::install`].
-///
-/// Without this hook the kernel's federation-peer slot stays at the
-/// Noop default and every `sys_readdir` / `sys_stat` / `sys_unlink` /
-/// `sys_write` dispatch through `Kernel::dispatch_federation_peer`
-/// returns "federation peer client not installed" — the symptom that
-/// surfaced as empty cross-node listings in the cc-tasks-share E2E
-/// before this hook was wired.
-pub fn install(kernel: &kernel::kernel::Kernel) {
-    let client = Arc::new(FederationClient::new(Arc::clone(kernel.runtime()), None));
-    kernel.set_federation_peer_client(
-        client as Arc<dyn kernel::hal::federation_peer::FederationPeerClient>,
-    );
-}
-
-// ── HAL trait impl ───────────────────────────────────────────────────
+// ── FederationGrpcOps trait impl ─────────────────────────────────────
 //
 // Bridges the async tonic wrappers above to the sync
-// `FederationPeerClient` trait the kernel HAL declares.
+// `FederationGrpcOps` trait declared at
+// `kernel::federation::grpc_ops`.  The cluster-profile binary builds
+// a single `Arc<FederationClient>` at boot and passes it into
+// `RaftDistributedCoordinator::install_with_kernel` as the grpc_ops
+// arc; the coordinator's `peer_*` impls iterate `zone_peers` and
+// dispatch each non-self peer through this trait.
 //
 // CRITICAL: every block_on must go through `block_on_safely` so the
 // call is re-entrancy-safe when the caller already runs on a tokio
@@ -526,7 +512,7 @@ pub fn install(kernel: &kernel::kernel::Kernel) {
 //
 // PR #74 added this after PR #73's correct canonical-key fix
 // exposed the recursion: io.rs sys_stat / sys_readdir hooks call
-// FederationPeerClient methods from the gRPC handler thread (which
+// FederationGrpcOps methods from the gRPC handler thread (which
 // runs on the kernel runtime), which is the same runtime this
 // client's `block_on` would try to enter.
 
@@ -545,7 +531,7 @@ impl FederationClient {
     }
 }
 
-impl FederationPeerClient for FederationClient {
+impl FederationGrpcOps for FederationClient {
     fn read(&self, addr: &str, path: &str, offset: u64) -> FederationPeerResult<Vec<u8>> {
         self.block_on_safely(self.vfs_read(addr, path, offset))
     }

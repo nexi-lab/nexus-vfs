@@ -32,8 +32,8 @@ use tonic::Request;
 use transport::grpc_plugin_proxy::extend_routes_with_plugin_endpoints;
 
 /// Single-field bytes message — the wire shape is one byte tag (0x0a)
-/// + a varint length + payload, so we can also sanity-check that prost
-/// and our `PluginProxyService` framing agree on byte boundaries.
+/// plus a varint length plus payload, so we can also sanity-check that
+/// prost and our `PluginProxyService` framing agree on byte boundaries.
 #[derive(Clone, PartialEq, prost::Message)]
 struct EchoMsg {
     #[prost(bytes = "vec", tag = "1")]

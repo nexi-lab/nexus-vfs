@@ -15,7 +15,13 @@
 //! * [`distributed_coordinator`] — `DistributedCoordinator` trait
 //!   (§3.B.1). Per-node distributed-namespace topology: zones, mounts,
 //!   share registry, leader/voter introspection, per-zone metastore +
-//!   locks. Concrete impl in `nexus_raft::distributed_coordinator`.
+//!   locks, **and** per-syscall cross-node peer dispatch (`peer_read`,
+//!   `peer_stat`, `peer_list_dir`, `peer_delete_file`, `peer_rmdir`,
+//!   `peer_write`, `peer_mkdir`, `peer_rename`, `peer_setattr`).
+//!   Concrete impl in `nexus_raft::distributed_coordinator`; the
+//!   raft-tier impl holds an `Arc<dyn FederationGrpcOps>`
+//!   (`kernel::federation::grpc_ops`) for the actual gRPC plumbing —
+//!   that trait is an internal DI seam, not a kernel HAL.
 //! * [`object_store_provider`] — `ObjectStoreProvider` trait (§3.B.2).
 //!   Constructs `Arc<dyn ObjectStore>` for backend types
 //!   (anthropic / openai / s3 / gcs / …) without the kernel naming
@@ -51,7 +57,6 @@
 //! concrete types.
 
 pub mod distributed_coordinator;
-pub mod federation_peer;
 pub mod object_store_provider;
 
 // `PeerBlobClient` lives in `lib::transport_primitives` — the

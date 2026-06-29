@@ -29,7 +29,9 @@ use std::time::{Duration, Instant};
 use contracts::lock_state::Locks;
 use dashmap::DashMap;
 use kernel::abc::meta_store::MetaStore;
+use kernel::abc::object_store::{BackendStat, WriteResult};
 use kernel::core::vfs_router::canonicalize_mount_path as canonicalize;
+use kernel::federation::grpc_ops::FederationGrpcOps;
 use kernel::hal::distributed_coordinator::{
     ClusterInfo, CoordinatorResult, DistributedCoordinator, ShareInfo,
 };
@@ -91,6 +93,13 @@ pub struct RaftDistributedCoordinator {
     /// Wrapped in `Arc` so the apply-cb closures (one per parent zone)
     /// can capture a cheap clone — they can't borrow from `&self`.
     cross_zone_mounts: Arc<DashMap<String, Vec<CrossZoneMountTuple>>>,
+    /// Per-peer typed-RPC client used by `peer_*` to dispatch
+    /// `NexusVFSService.{Read,Write,Stat,Readdir,Delete,Mkdir,Rename,Setattr}`
+    /// against zone voters.  Set by `install_with_kernel`; unset means
+    /// the coordinator's `peer_*` impls warn-loud and return None
+    /// (every dispatch surfaces as a silent miss via the PR #94
+    /// observability path — caller's empty-result fallback fires).
+    grpc_ops: OnceLock<Arc<dyn FederationGrpcOps>>,
 }
 
 impl RaftDistributedCoordinator {
@@ -100,6 +109,7 @@ impl RaftDistributedCoordinator {
             runtime: OnceLock::new(),
             bootstrap_done: AtomicBool::new(false),
             cross_zone_mounts: Arc::new(DashMap::new()),
+            grpc_ops: OnceLock::new(),
         }
     }
 
@@ -151,12 +161,14 @@ impl RaftDistributedCoordinator {
         runtime: tokio::runtime::Handle,
         self_address: &str,
         kernel: &Arc<Kernel>,
+        grpc_ops: Arc<dyn FederationGrpcOps>,
     ) {
         // Slots are `OnceLock`; second-set silently drops, so calling
         // this twice with the same wiring is a no-op rather than an
         // error.
         let _ = self.zone_manager.set(zm.clone());
         let _ = self.runtime.set(runtime);
+        let _ = self.grpc_ops.set(grpc_ops);
 
         // Federation self-identity — every subsequent write records
         // `last_writer_address`, the origin pointer that powers
@@ -395,6 +407,171 @@ impl Default for RaftDistributedCoordinator {
     fn default() -> Self {
         Self::new()
     }
+}
+
+impl RaftDistributedCoordinator {
+    /// Generic per-syscall federation-peer dispatch.
+    ///
+    /// Iterates non-self voters of `target_zone` (via the trait's own
+    /// `zone_peers` accessor — same SSOT raft uses elsewhere) and runs
+    /// `op` against each one with the installed grpc_ops arc + the
+    /// peer address.  The closure encodes which typed `NexusVFSService`
+    /// method to call.  Returns the first successful hit; transport
+    /// errors are logged at debug and the next peer is tried.
+    ///
+    /// Returns `None` when:
+    ///   * grpc_ops is not installed (coordinator was constructed via
+    ///     `new()` but `install_with_kernel` was never called — caller
+    ///     sees the silent miss with a warn-level log line);
+    ///   * the zone has no peers loaded yet (federation discovery
+    ///     pending — caller falls through to local not-found);
+    ///   * every peer errored or returned `Ok(None)` (no SSOT-side
+    ///     copy of the path under any voter).
+    ///
+    /// PR #94 observability — every silent-failure path emits a
+    /// `tracing::warn!` line that an operator can grep for without
+    /// enabling per-module trace logging.  Three failure shapes are
+    /// distinguished:
+    ///   * `grpc_ops not installed`
+    ///   * `zone_peers returned empty`
+    ///   * `every non-self voter's RPC failed`
+    fn dispatch_to_peers<T, F>(
+        &self,
+        kernel: &Kernel,
+        op_name: &'static str,
+        target_zone: &str,
+        peer_path: &str,
+        op: F,
+    ) -> Option<T>
+    where
+        F: FnMut(&Arc<dyn FederationGrpcOps>, &str) -> Result<Option<T>, String>,
+    {
+        let Some(client) = self.grpc_ops.get() else {
+            tracing::warn!(
+                op = op_name,
+                target_zone = %target_zone,
+                path = %peer_path,
+                "federation peer dispatch: grpc_ops not installed in coordinator — caller \
+                 will see empty result indistinguishable from a real empty dir; check that \
+                 `install_with_kernel` was called with a real FederationGrpcOps impl"
+            );
+            return None;
+        };
+        let peers = self.zone_peers(kernel, target_zone);
+        let self_addr = kernel.self_address_string();
+        dispatch_to_peer_addrs(
+            client,
+            op_name,
+            target_zone,
+            peer_path,
+            &peers,
+            self_addr.as_deref(),
+            op,
+        )
+    }
+}
+
+/// Per-syscall federation-peer iteration loop — pure function over an
+/// already-resolved peer list.
+///
+/// Split out of [`RaftDistributedCoordinator::dispatch_to_peers`] so the
+/// observability surface (the three PR #94 silent-miss `tracing::warn!`
+/// paths) and the first-hit-wins iteration semantics can be pinned
+/// directly in unit tests without standing up a `ZoneManager` /
+/// `Kernel` fixture.  The wrapper on the coordinator handles the slot
+/// + zone_peers lookups; this function handles the loop.
+fn dispatch_to_peer_addrs<T, F>(
+    client: &Arc<dyn FederationGrpcOps>,
+    op_name: &'static str,
+    target_zone: &str,
+    peer_path: &str,
+    peers: &[String],
+    self_addr: Option<&str>,
+    mut op: F,
+) -> Option<T>
+where
+    F: FnMut(&Arc<dyn FederationGrpcOps>, &str) -> Result<Option<T>, String>,
+{
+    if peers.is_empty() {
+        // `zone_peers` returned empty for a zone we believe is
+        // federated.  Three concrete deployment shapes hit this:
+        //   * The joiner hasn't actually joined the target zone yet
+        //     (boot-replay timing, sidecar didn't run, root SOLO
+        //     misconfig — see [[feedback_distributed_ssot]]).
+        //   * `zone_peers` is computed against a stale conf state
+        //     that doesn't yet contain the SSOT peer.
+        //   * The zone exists locally but has 0 voters configured
+        //     (federation never bootstrapped on this side).
+        // All three present to the caller as "directory is empty"
+        // — exactly the Mac↔Win Direction-A wedge signature.
+        // Surface at warn-level so operators can grep this single
+        // line without enabling per-module trace logging.
+        tracing::warn!(
+            op = op_name,
+            target_zone = %target_zone,
+            path = %peer_path,
+            "federation peer dispatch: zone_peers returned empty — caller will \
+             see empty result indistinguishable from a real empty dir; check that \
+             the joiner actually joined this zone (sidecar log + raft conf state)"
+        );
+        return None;
+    }
+    let mut errors: Vec<String> = Vec::new();
+    let mut attempted = 0usize;
+    for peer_addr in peers {
+        if let Some(s) = self_addr {
+            if s == peer_addr {
+                continue;
+            }
+        }
+        attempted += 1;
+        match op(client, peer_addr) {
+            Ok(Some(result)) => return Some(result),
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::debug!(
+                    op = op_name,
+                    peer = %peer_addr,
+                    path = %peer_path,
+                    error = %e,
+                    "federation peer dispatch failed; trying next voter"
+                );
+                errors.push(format!("{peer_addr}: {e}"));
+            }
+        }
+    }
+    // Fell through every voter without a hit.  Distinguish three
+    // sub-cases so operators can act:
+    //   * `attempted == 0` — every voter in `peers` was self_addr
+    //     (single-node federation arrangement; dispatch is
+    //     impossible until a peer actually joins).
+    //   * `errors.len() == attempted` — every non-self voter's
+    //     RPC errored (network / cert / WinFsp-side panic).
+    //     Surface at warn so it isn't lost in debug noise.
+    //   * Otherwise — every non-self voter returned Ok(None),
+    //     i.e., they all legitimately don't have the entry
+    //     (true miss; remain debug-level — high-volume normal case).
+    if attempted == 0 {
+        tracing::warn!(
+            op = op_name,
+            target_zone = %target_zone,
+            path = %peer_path,
+            voters = peers.len(),
+            "federation peer dispatch: all voters resolved to self_addr — no peer \
+             to dispatch to; caller will see empty result"
+        );
+    } else if errors.len() == attempted {
+        tracing::warn!(
+            op = op_name,
+            target_zone = %target_zone,
+            path = %peer_path,
+            attempted,
+            errors = %errors.join(" | "),
+            "federation peer dispatch: every non-self voter's RPC failed; caller \
+             will see empty result indistinguishable from a real empty dir"
+        );
+    }
+    None
 }
 
 /// Bootstrap mode declared by the operator at daemon start.
@@ -1888,6 +2065,170 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
             links_count,
         })
     }
+
+    // ── Cross-node peer dispatch ─────────────────────────────────────
+    //
+    // Each `peer_*` override resolves the SSOT peer via
+    // `dispatch_to_peers` (the generic iteration helper) and runs
+    // the typed `FederationGrpcOps` method against each non-self
+    // voter.  Bool-returning ops (delete_file/rmdir/mkdir/rename/
+    // setattr) collapse the dispatch_to_peers `Option<()>` to a
+    // bool — `Some(())` ⇒ at least one peer's RPC succeeded.
+
+    fn peer_read(
+        &self,
+        kernel: &Kernel,
+        target_zone: &str,
+        peer_path: &str,
+        offset: u64,
+    ) -> Option<Vec<u8>> {
+        self.dispatch_to_peers::<Vec<u8>, _>(
+            kernel,
+            "read",
+            target_zone,
+            peer_path,
+            |client, addr| client.read(addr, peer_path, offset).map(Some),
+        )
+    }
+
+    fn peer_write(
+        &self,
+        kernel: &Kernel,
+        target_zone: &str,
+        peer_path: &str,
+        content: &[u8],
+    ) -> Option<WriteResult> {
+        self.dispatch_to_peers::<WriteResult, _>(
+            kernel,
+            "write",
+            target_zone,
+            peer_path,
+            |client, addr| client.write(addr, peer_path, content).map(Some),
+        )
+    }
+
+    fn peer_stat(
+        &self,
+        kernel: &Kernel,
+        target_zone: &str,
+        peer_path: &str,
+    ) -> Option<BackendStat> {
+        // grpc_ops.stat already returns `Result<Option<BackendStat>, String>`
+        // matching the dispatch_to_peers closure shape — pass through.
+        self.dispatch_to_peers::<BackendStat, _>(
+            kernel,
+            "stat",
+            target_zone,
+            peer_path,
+            |client, addr| client.stat(addr, peer_path),
+        )
+    }
+
+    fn peer_list_dir(
+        &self,
+        kernel: &Kernel,
+        target_zone: &str,
+        peer_path: &str,
+    ) -> Option<Vec<(String, u8)>> {
+        // Empty Vec is meaningful for readdir ("dir exists but
+        // empty") — distinguish from not-found by ALWAYS returning
+        // `Some(entries)` on transport success.
+        self.dispatch_to_peers::<Vec<(String, u8)>, _>(
+            kernel,
+            "list_dir",
+            target_zone,
+            peer_path,
+            |client, addr| client.list_dir(addr, peer_path).map(Some),
+        )
+    }
+
+    fn peer_delete_file(&self, kernel: &Kernel, target_zone: &str, peer_path: &str) -> bool {
+        self.dispatch_to_peers::<(), _>(
+            kernel,
+            "delete_file",
+            target_zone,
+            peer_path,
+            |client, addr| client.delete_file(addr, peer_path).map(|()| Some(())),
+        )
+        .is_some()
+    }
+
+    fn peer_rmdir(
+        &self,
+        kernel: &Kernel,
+        target_zone: &str,
+        peer_path: &str,
+        recursive: bool,
+    ) -> bool {
+        self.dispatch_to_peers::<(), _>(kernel, "rmdir", target_zone, peer_path, |client, addr| {
+            client.rmdir(addr, peer_path, recursive).map(|()| Some(()))
+        })
+        .is_some()
+    }
+
+    fn peer_mkdir(
+        &self,
+        kernel: &Kernel,
+        target_zone: &str,
+        peer_path: &str,
+        parents: bool,
+        exist_ok: bool,
+    ) -> bool {
+        self.dispatch_to_peers::<(), _>(kernel, "mkdir", target_zone, peer_path, |client, addr| {
+            client
+                .mkdir(addr, peer_path, parents, exist_ok)
+                .map(|()| Some(()))
+        })
+        .is_some()
+    }
+
+    fn peer_rename(
+        &self,
+        kernel: &Kernel,
+        target_zone: &str,
+        old_path: &str,
+        new_path: &str,
+    ) -> bool {
+        self.dispatch_to_peers::<(), _>(kernel, "rename", target_zone, old_path, |client, addr| {
+            client.rename(addr, old_path, new_path).map(|()| Some(()))
+        })
+        .is_some()
+    }
+
+    fn peer_setattr(
+        &self,
+        kernel: &Kernel,
+        target_zone: &str,
+        peer_path: &str,
+        mime_type: Option<&str>,
+        content_id: Option<&str>,
+        modified_at_ms: Option<i64>,
+        created_at_ms: Option<i64>,
+        size: Option<u64>,
+        version: Option<u32>,
+    ) -> bool {
+        self.dispatch_to_peers::<(), _>(
+            kernel,
+            "setattr",
+            target_zone,
+            peer_path,
+            |client, addr| {
+                client
+                    .setattr(
+                        addr,
+                        peer_path,
+                        mime_type,
+                        content_id,
+                        modified_at_ms,
+                        created_at_ms,
+                        size,
+                        version,
+                    )
+                    .map(|()| Some(()))
+            },
+        )
+        .is_some()
+    }
 }
 
 /// Reconstruct the global VFS path for a DT_MOUNT entry.  Root-zone parents
@@ -1995,7 +2336,7 @@ fn wire_mount_core(
     // target zone is also sharedzone).  On the SSOT node `kernel.add_mount`
     // already registered its LocalConnector at the global path; on
     // follower nodes we install a backend-less placeholder MountEntry
-    // so the io.rs `FederationPeerClient` dispatch (sys_readdir /
+    // so the io.rs `FederationGrpcOps` dispatch (sys_readdir /
     // sys_stat / sys_unlink / sys_write) can route through to the
     // SSOT peer.
     //
@@ -2655,5 +2996,270 @@ mod tests {
         let err = validate_bootstrap_mode(BootstrapMode::Restart, true, false, true)
             .expect_err("restart + peers must be rejected");
         assert!(err.contains("forbids NEXUS_PEERS"));
+    }
+
+    // ── dispatch_to_peer_addrs behavioral pins ──────────────────────────
+    //
+    // The kernel-side syscall sites (route.via_federation_X /
+    // supplement_X) reach federation peers through
+    // `RaftDistributedCoordinator::peer_*` which delegates the
+    // iteration to `dispatch_to_peer_addrs`.  Three silent-failure
+    // paths and the first-hit-wins iteration semantics together form
+    // the contract every cross-node read / write / stat / unlink /
+    // mkdir / rename / setattr depends on — pinning them here without
+    // standing up a full ZoneManager fixture keeps regressions cheap
+    // to catch.
+
+    use kernel::abc::object_store::{BackendStat, WriteResult};
+    use kernel::federation::grpc_ops::{FederationGrpcOps, FederationPeerResult};
+    use parking_lot::Mutex;
+
+    /// Programmable per-peer fake.  Each method either consults its
+    /// canned reply map or panics — every test wires only the methods
+    /// it exercises so an accidental call to an unrelated method
+    /// trips an obvious failure.
+    #[derive(Default)]
+    struct FakeFederationGrpcOps {
+        /// Recorded `(op, addr)` for every call — pins the iteration
+        /// order without the test poking at internal state.
+        calls: Mutex<Vec<(&'static str, String)>>,
+        /// Per-addr canned reply for `read`.  Returned by value so
+        /// the iteration can race-reload via the Mutex.
+        reads: Mutex<std::collections::HashMap<String, FederationPeerResult<Vec<u8>>>>,
+    }
+
+    impl FakeFederationGrpcOps {
+        fn record(&self, op: &'static str, addr: &str) {
+            self.calls.lock().push((op, addr.to_string()));
+        }
+        fn set_read(&self, addr: &str, reply: FederationPeerResult<Vec<u8>>) {
+            self.reads.lock().insert(addr.to_string(), reply);
+        }
+        fn calls(&self) -> Vec<(&'static str, String)> {
+            self.calls.lock().clone()
+        }
+    }
+
+    impl FederationGrpcOps for FakeFederationGrpcOps {
+        fn read(&self, addr: &str, _path: &str, _offset: u64) -> FederationPeerResult<Vec<u8>> {
+            self.record("read", addr);
+            self.reads
+                .lock()
+                .remove(addr)
+                .unwrap_or_else(|| Err(format!("no canned reply for {addr}")))
+        }
+        fn write(
+            &self,
+            _addr: &str,
+            _path: &str,
+            _content: &[u8],
+        ) -> FederationPeerResult<WriteResult> {
+            unreachable!("write not exercised by these pins");
+        }
+        fn stat(&self, _addr: &str, _path: &str) -> FederationPeerResult<Option<BackendStat>> {
+            unreachable!("stat not exercised by these pins");
+        }
+        fn list_dir(&self, _addr: &str, _path: &str) -> FederationPeerResult<Vec<(String, u8)>> {
+            unreachable!("list_dir not exercised by these pins");
+        }
+        fn delete_file(&self, _addr: &str, _path: &str) -> FederationPeerResult<()> {
+            unreachable!("delete_file not exercised by these pins");
+        }
+        fn rmdir(&self, _addr: &str, _path: &str, _recursive: bool) -> FederationPeerResult<()> {
+            unreachable!("rmdir not exercised by these pins");
+        }
+        fn mkdir(
+            &self,
+            _addr: &str,
+            _path: &str,
+            _parents: bool,
+            _exist_ok: bool,
+        ) -> FederationPeerResult<()> {
+            unreachable!("mkdir not exercised by these pins");
+        }
+        fn rename(
+            &self,
+            _addr: &str,
+            _old_path: &str,
+            _new_path: &str,
+        ) -> FederationPeerResult<()> {
+            unreachable!("rename not exercised by these pins");
+        }
+        fn setattr(
+            &self,
+            _addr: &str,
+            _path: &str,
+            _mime_type: Option<&str>,
+            _content_id: Option<&str>,
+            _modified_at_ms: Option<i64>,
+            _created_at_ms: Option<i64>,
+            _size: Option<u64>,
+            _version: Option<u32>,
+        ) -> FederationPeerResult<()> {
+            unreachable!("setattr not exercised by these pins");
+        }
+    }
+
+    fn fake_arc() -> (Arc<FakeFederationGrpcOps>, Arc<dyn FederationGrpcOps>) {
+        let fake = Arc::new(FakeFederationGrpcOps::default());
+        let dyn_arc: Arc<dyn FederationGrpcOps> = fake.clone();
+        (fake, dyn_arc)
+    }
+
+    /// Read op via the helper.  Threads the closure shape every
+    /// per-syscall coordinator method uses (read returns Vec<u8> on
+    /// hit, `op` wraps it in `Ok(Some(_))`).
+    fn dispatch_read(
+        client: &Arc<dyn FederationGrpcOps>,
+        peers: &[String],
+        self_addr: Option<&str>,
+    ) -> Option<Vec<u8>> {
+        dispatch_to_peer_addrs::<Vec<u8>, _>(
+            client,
+            "read",
+            "sharedzone",
+            "/p",
+            peers,
+            self_addr,
+            |c, addr| c.read(addr, "/p", 0).map(Some),
+        )
+    }
+
+    #[test]
+    fn dispatch_empty_zone_peers_returns_none_without_invoking_op() {
+        let (fake, dyn_arc) = fake_arc();
+        let out = dispatch_read(&dyn_arc, &[], None);
+        assert!(out.is_none(), "empty peers must return None");
+        assert!(
+            fake.calls().is_empty(),
+            "no op invocation expected when peers is empty"
+        );
+    }
+
+    #[test]
+    fn dispatch_all_peers_are_self_addr_skips_all_then_returns_none() {
+        let (fake, dyn_arc) = fake_arc();
+        let peers = vec!["100.64.0.21:2126".to_string()];
+        let out = dispatch_read(&dyn_arc, &peers, Some("100.64.0.21:2126"));
+        assert!(out.is_none(), "all-self peers must return None");
+        assert!(
+            fake.calls().is_empty(),
+            "self-addr peer must be skipped without invoking op"
+        );
+    }
+
+    #[test]
+    fn dispatch_first_peer_hit_short_circuits_with_value() {
+        let (fake, dyn_arc) = fake_arc();
+        fake.set_read("a:2126", Ok(b"hit-a".to_vec()));
+        fake.set_read("b:2126", Ok(b"hit-b".to_vec()));
+        let peers = vec!["a:2126".to_string(), "b:2126".to_string()];
+        let out = dispatch_read(&dyn_arc, &peers, None);
+        assert_eq!(out.as_deref(), Some(&b"hit-a"[..]));
+        // Only the first peer was invoked — the second was never
+        // touched because the loop short-circuited.
+        let calls = fake.calls();
+        assert_eq!(calls, vec![("read", "a:2126".to_string())]);
+    }
+
+    #[test]
+    fn dispatch_all_peers_err_iterates_all_then_returns_none() {
+        let (fake, dyn_arc) = fake_arc();
+        fake.set_read("a:2126", Err("unreachable".into()));
+        fake.set_read("b:2126", Err("unreachable".into()));
+        let peers = vec!["a:2126".to_string(), "b:2126".to_string()];
+        let out = dispatch_read(&dyn_arc, &peers, None);
+        assert!(out.is_none(), "all-error must yield None");
+        // EVERY non-self peer must have been attempted before
+        // giving up — partial iteration would mask a peer that
+        // later recovers.
+        let calls: Vec<String> = fake.calls().into_iter().map(|(_, a)| a).collect();
+        assert_eq!(calls, vec!["a:2126", "b:2126"]);
+    }
+
+    #[test]
+    fn dispatch_ok_none_continues_to_next_peer() {
+        // `Ok(None)` semantically means "this peer answered the RPC
+        // but reports no value" (e.g. stat in-band found=false).
+        // The loop must KEEP TRYING the next peer rather than
+        // treating Ok(None) as a hit — a stale voter that returns
+        // None for a freshly-replicated key must not shadow the
+        // SSOT-side voter that has the value.
+        let (fake, dyn_arc) = fake_arc();
+        let peers = vec!["a:2126".to_string(), "b:2126".to_string()];
+        // Use a custom closure that returns Ok(None) for `a` and
+        // Ok(Some(hit)) for `b`, so we can pin the "skip on None,
+        // surface the next hit" semantics without relying on the
+        // fake having to support per-peer Ok(None)/Ok(Some).
+        let out = dispatch_to_peer_addrs::<Vec<u8>, _>(
+            &dyn_arc,
+            "read",
+            "sharedzone",
+            "/p",
+            &peers,
+            None,
+            |_c, addr| {
+                fake.record("probe", addr);
+                if addr == "a:2126" {
+                    Ok(None)
+                } else {
+                    Ok(Some(b"hit-b".to_vec()))
+                }
+            },
+        );
+        assert_eq!(out.as_deref(), Some(&b"hit-b"[..]));
+        let calls: Vec<String> = fake.calls().into_iter().map(|(_, a)| a).collect();
+        assert_eq!(calls, vec!["a:2126", "b:2126"]);
+    }
+
+    #[test]
+    fn dispatch_mixed_err_then_ok_none_then_hit_surfaces_hit() {
+        // Err -> next; Ok(None) -> next; Ok(Some) -> return.
+        // Combined ordering pin: the loop must navigate all three
+        // outcomes in sequence.
+        let (fake, dyn_arc) = fake_arc();
+        let peers = vec![
+            "a:2126".to_string(),
+            "b:2126".to_string(),
+            "c:2126".to_string(),
+        ];
+        let out = dispatch_to_peer_addrs::<Vec<u8>, _>(
+            &dyn_arc,
+            "read",
+            "sharedzone",
+            "/p",
+            &peers,
+            None,
+            |_c, addr| {
+                fake.record("probe", addr);
+                match addr {
+                    "a:2126" => Err("rpc-down".into()),
+                    "b:2126" => Ok(None),
+                    "c:2126" => Ok(Some(b"hit-c".to_vec())),
+                    _ => unreachable!(),
+                }
+            },
+        );
+        assert_eq!(out.as_deref(), Some(&b"hit-c"[..]));
+        let calls: Vec<String> = fake.calls().into_iter().map(|(_, a)| a).collect();
+        assert_eq!(calls, vec!["a:2126", "b:2126", "c:2126"]);
+    }
+
+    #[test]
+    fn dispatch_self_addr_filter_threads_through_to_non_self_voter() {
+        // Two-voter zone with self_addr == peers[0]; the loop must
+        // skip peers[0] silently and reach peers[1].  Pins the
+        // self-filter integration with the iteration body.
+        let (fake, dyn_arc) = fake_arc();
+        fake.set_read("b:2126", Ok(b"hit-b".to_vec()));
+        let peers = vec!["a:2126".to_string(), "b:2126".to_string()];
+        let out = dispatch_read(&dyn_arc, &peers, Some("a:2126"));
+        assert_eq!(out.as_deref(), Some(&b"hit-b"[..]));
+        let calls: Vec<String> = fake.calls().into_iter().map(|(_, a)| a).collect();
+        assert_eq!(
+            calls,
+            vec!["b:2126"],
+            "self_addr peer 'a' must not be invoked"
+        );
     }
 }

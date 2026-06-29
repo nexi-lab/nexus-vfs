@@ -180,6 +180,38 @@ pub struct RouteResult {
     pub target_zone_id: Option<String>,
 }
 
+/// Outcome of dispatching a write to the federation SSOT peer.
+///
+/// Three states because federation-peer-mounts have no local backend
+/// fallback — the syscall layer cannot transparently treat "dispatch
+/// missed" as "fall through to local write".  Sister read / stat /
+/// list_dir / unlink methods use `Option<T>` because their "miss"
+/// arm IS the same shape as "not a federation route" (both fall
+/// through to local-not-found semantics); only `write` needs the
+/// three-state distinction.
+///
+/// The Hit variant carries the peer's canonical `(content_id, size)`
+/// from `WriteResult` so the caller's OBSERVE event + native POST
+/// hook fire with the SSOT-side authoritative values.
+#[derive(Debug)]
+pub enum FederationWriteOutcome {
+    /// Route is not a federation-peer-mount.  Caller falls through
+    /// to its normal local write path.
+    NotPeer,
+    /// Federation-peer-mount route, but dispatch missed (peer
+    /// unreachable, coordinator without an installed grpc_ops,
+    /// observability warns fire on the coordinator side).
+    /// Caller MUST return a miss-shaped result WITHOUT attempting
+    /// any local fallback — federation-peer-mounts have no local
+    /// backend, and surfacing the failure as `KernelError::IOError`
+    /// breaks the cc-tasks-share retry contract that legitimately
+    /// expects `hit=false` on transient peer unreachability.
+    DispatchMissed,
+    /// Federation-peer-mount route + dispatch hit.  Caller
+    /// short-circuits with `wr`.
+    Hit(crate::abc::object_store::WriteResult),
+}
+
 impl RouteResult {
     /// Resolve the metastore for this mount, falling back to a
     /// kernel-supplied global metastore when the mount has no per-mount
@@ -200,14 +232,213 @@ impl RouteResult {
     /// carries a `target_zone_id` pointing at the peer that owns the
     /// LocalConnector for these bytes.
     ///
-    /// io.rs federation peer dispatch sites (sys_readdir / sys_stat /
-    /// sys_unlink) gate on this exact pair; centralising the predicate
-    /// here keeps the three call sites in sync and documents the
-    /// shape ("placeholder MountEntry with target_zone_id set") as a
-    /// first-class concept rather than an ad-hoc field pair.
+    /// Used internally by the `via_federation_*` / `supplement_*`
+    /// behavior methods below to gate per-route — callers in
+    /// `kernel/io.rs` and `kernel/mod.rs` should reach for those
+    /// methods rather than predicating on this directly, so the
+    /// federation-peer-mount concept stays a one-place check.
     #[inline]
     pub fn is_federation_peer_mount(&self) -> bool {
         self.backend.is_none() && self.target_zone_id.is_some()
+    }
+
+    // ── Federation-peer behavior methods ───────────────────────────────
+    //
+    // Two patterns for federation-peer-mounts (placeholder MountEntry
+    // shape; no local backend; target_zone_id points at the SSOT peer):
+    //
+    // * **PURE-DEFER** (`via_federation_*`) — peer-only dispatch; the
+    //   caller's local-side path runs only when this returns `None`,
+    //   meaning "this route is not a federation-peer-mount; fall
+    //   through to your local handling".  `Some(value)` carries the
+    //   peer dispatch result and the caller short-circuits with it.
+    //
+    // * **SUPPLEMENT** (`supplement_*`) — peer fires ALONGSIDE the
+    //   caller's local-side path; no return value.  For mkdir /
+    //   rename / setattr, the local metastore mutation must happen
+    //   IMMEDIATELY so the joiner's VFSRouter routes children of
+    //   the new entry correctly — raft LWW dedupes the peer's
+    //   eventual replicated mirror against ours.  See
+    //   [[feedback_defer_to_peer_only_for_byte_ops]] for the full
+    //   rationale on which syscalls take which pattern.
+    //
+    // No-op on non-federation-peer-mount routes — the methods become
+    // zero-cost when the routed mount has a local backend (the common
+    // case).  Internally each delegates to the kernel's
+    // `federation_peer_*` dispatch arms; the later HAL collapse
+    // re-points these bodies to `kernel.distributed_coordinator()
+    // .peer_*` without touching call sites.
+
+    /// Pure-defer write: peer's `NexusVFSService.Write` runs the full
+    /// write lifecycle authoritatively on the SSOT side.
+    ///
+    /// Returns a [`FederationWriteOutcome`] — three named variants
+    /// because sys_write must distinguish "fall through to local"
+    /// from "return miss without local fallback".  See the type's
+    /// docs for the rationale.
+    #[inline]
+    pub fn via_federation_write(
+        &self,
+        kernel: &crate::kernel::Kernel,
+        peer_path: &str,
+        content: &[u8],
+    ) -> FederationWriteOutcome {
+        let Some(target_zone) = self.federation_target_zone() else {
+            return FederationWriteOutcome::NotPeer;
+        };
+        match kernel
+            .distributed_coordinator()
+            .peer_write(kernel, target_zone, peer_path, content)
+        {
+            Some(wr) => FederationWriteOutcome::Hit(wr),
+            None => FederationWriteOutcome::DispatchMissed,
+        }
+    }
+
+    /// Pure-defer stat: peer's `NexusVFSService.Stat` is authoritative
+    /// for the placeholder mount.  Returns `Some(BackendStat)` on hit,
+    /// `None` for non-federation routes or no-peer-hit (the latter is
+    /// indistinguishable from "real not found" — same legacy semantics).
+    #[inline]
+    pub fn via_federation_stat(
+        &self,
+        kernel: &crate::kernel::Kernel,
+        peer_path: &str,
+    ) -> Option<crate::abc::object_store::BackendStat> {
+        let target_zone = self.federation_target_zone()?;
+        kernel
+            .distributed_coordinator()
+            .peer_stat(kernel, target_zone, peer_path)
+    }
+
+    /// Pure-defer readdir: peer's `NexusVFSService.Readdir` enumerates
+    /// the placeholder mount's children.  Empty Vec is meaningful
+    /// (real empty dir) — distinguish from "not found" by the
+    /// `Some(entries)` / `None` split: `Some(_)` = peer dispatch hit
+    /// (entries may be empty), `None` = not a federation route.
+    #[inline]
+    pub fn via_federation_readdir(
+        &self,
+        kernel: &crate::kernel::Kernel,
+        peer_path: &str,
+    ) -> Option<Vec<(String, u8)>> {
+        let target_zone = self.federation_target_zone()?;
+        kernel
+            .distributed_coordinator()
+            .peer_list_dir(kernel, target_zone, peer_path)
+    }
+
+    /// Pure-defer unlink: peer's `NexusVFSService.Delete` runs the
+    /// full unlink lifecycle (metastore delete plus backend delete
+    /// plus raft replication).
+    ///
+    /// Returns `Some(true)` when the peer delete succeeded,
+    /// `Some(false)` when the route is a federation peer mount but
+    /// dispatch missed (peer unreachable, coordinator without an
+    /// installed grpc_ops, observability warns fire), and `None`
+    /// when this is not a federation route (caller falls through
+    /// to local unlink).
+    #[inline]
+    pub fn via_federation_unlink(
+        &self,
+        kernel: &crate::kernel::Kernel,
+        peer_path: &str,
+    ) -> Option<bool> {
+        let target_zone = self.federation_target_zone()?;
+        Some(
+            kernel
+                .distributed_coordinator()
+                .peer_delete_file(kernel, target_zone, peer_path),
+        )
+    }
+
+    /// Supplement mkdir: fires the peer's `NexusVFSService.Mkdir`
+    /// alongside the caller's local metastore.put for the DT_DIR row.
+    /// Best-effort — dispatch failure is logged by the coordinator
+    /// observability path, not surfaced to the caller, so the local
+    /// flow proceeds regardless.  See module-level rationale.
+    #[inline]
+    pub fn supplement_mkdir(
+        &self,
+        kernel: &crate::kernel::Kernel,
+        peer_path: &str,
+        parents: bool,
+        exist_ok: bool,
+    ) {
+        let Some(target_zone) = self.federation_target_zone() else {
+            return;
+        };
+        let _ = kernel.distributed_coordinator().peer_mkdir(
+            kernel,
+            target_zone,
+            peer_path,
+            parents,
+            exist_ok,
+        );
+    }
+
+    /// Supplement rename: fires the peer's `NexusVFSService.Rename`
+    /// alongside the caller's local `metastore.rename_path`.
+    /// Best-effort — same silent-miss semantics as `supplement_mkdir`.
+    #[inline]
+    pub fn supplement_rename(
+        &self,
+        kernel: &crate::kernel::Kernel,
+        old_path: &str,
+        new_path: &str,
+    ) {
+        let Some(target_zone) = self.federation_target_zone() else {
+            return;
+        };
+        let _ =
+            kernel
+                .distributed_coordinator()
+                .peer_rename(kernel, target_zone, old_path, new_path);
+    }
+
+    /// Supplement setattr (DT_REG only): fires the peer's
+    /// `NexusVFSService.Setattr` alongside the caller's local
+    /// metastore.put for the DT_REG row.  Best-effort.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    pub fn supplement_setattr(
+        &self,
+        kernel: &crate::kernel::Kernel,
+        peer_path: &str,
+        mime_type: Option<&str>,
+        content_id: Option<&str>,
+        modified_at_ms: Option<i64>,
+        created_at_ms: Option<i64>,
+        size: Option<u64>,
+        version: Option<u32>,
+    ) {
+        let Some(target_zone) = self.federation_target_zone() else {
+            return;
+        };
+        let _ = kernel.distributed_coordinator().peer_setattr(
+            kernel,
+            target_zone,
+            peer_path,
+            mime_type,
+            content_id,
+            modified_at_ms,
+            created_at_ms,
+            size,
+            version,
+        );
+    }
+
+    /// Internal: return the target zone id for a federation-peer-mount
+    /// route, or `None` for plain local routes.  Centralises the
+    /// `backend.is_none() && target_zone_id.is_some()` predicate +
+    /// the `target_zone_id.as_deref()` extraction so every `via_*` /
+    /// `supplement_*` method shares the same gate shape.
+    #[inline]
+    fn federation_target_zone(&self) -> Option<&str> {
+        if self.backend.is_some() {
+            return None;
+        }
+        self.target_zone_id.as_deref()
     }
 }
 
@@ -983,5 +1214,509 @@ mod tests {
 
         // Unknown key → empty.
         assert!(table.mount_points_for_coherence_key(0xDEAD).is_empty());
+    }
+
+    // ── RouteResult federation behavior method pins ─────────────────────
+    //
+    // Two halves of the contract introduced by the FederationPeerClient
+    // HAL collapse:
+    //   * Non-federation routes (no `target_zone_id`, or with a local
+    //     backend) — `via_federation_*` returns `None`, `supplement_*`
+    //     is a no-op.  The coordinator MUST NOT be invoked.
+    //   * Federation-peer-mount routes (no backend, target_zone_id set)
+    //     — methods MUST delegate to the matching
+    //     `DistributedCoordinator::peer_*` with the right (target_zone,
+    //     path, ...) args.  Silent dispatch failure here would surface
+    //     as the Mac↔Win Direction-A wedge.
+    //
+    // The fake coordinator records each call as a single canonical
+    // string — the asserts read like the call site they protect.
+
+    use crate::abc::meta_store::MetaStore;
+    use crate::abc::object_store::{BackendStat, WriteResult};
+    use crate::hal::distributed_coordinator::{
+        ClusterInfo, CoordinatorResult, DistributedCoordinator, ShareInfo,
+    };
+    use contracts::lock_state::Locks;
+    use parking_lot::Mutex;
+
+    #[derive(Default)]
+    struct RecordingCoordinator {
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl RecordingCoordinator {
+        fn record(&self, line: String) {
+            self.calls.lock().push(line);
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().clone()
+        }
+    }
+
+    impl DistributedCoordinator for RecordingCoordinator {
+        // Non-peer-* trait methods are unused by these pins; supply
+        // minimal Ok/empty stubs so the trait is satisfied.
+        fn list_zones(&self, _kernel: &crate::kernel::Kernel) -> Vec<String> {
+            Vec::new()
+        }
+        fn cluster_info(
+            &self,
+            _kernel: &crate::kernel::Kernel,
+            _zone_id: &str,
+        ) -> CoordinatorResult<ClusterInfo> {
+            Err("not used by RouteResult pins".into())
+        }
+        fn create_zone(
+            &self,
+            _kernel: &crate::kernel::Kernel,
+            _zone_id: &str,
+        ) -> CoordinatorResult<()> {
+            Err("not used by RouteResult pins".into())
+        }
+        fn remove_zone(
+            &self,
+            _kernel: &crate::kernel::Kernel,
+            _zone_id: &str,
+            _force: bool,
+        ) -> CoordinatorResult<()> {
+            Err("not used by RouteResult pins".into())
+        }
+        fn join_zone(
+            &self,
+            _kernel: &crate::kernel::Kernel,
+            _zone_id: &str,
+            _as_learner: bool,
+        ) -> CoordinatorResult<()> {
+            Err("not used by RouteResult pins".into())
+        }
+        fn wire_mount(
+            &self,
+            _kernel: &crate::kernel::Kernel,
+            _parent_zone: &str,
+            _mount_path: &str,
+            _target_zone: &str,
+        ) -> CoordinatorResult<()> {
+            Err("not used by RouteResult pins".into())
+        }
+        fn unwire_mount(
+            &self,
+            _kernel: &crate::kernel::Kernel,
+            _parent_zone: &str,
+            _mount_path: &str,
+        ) -> CoordinatorResult<()> {
+            Err("not used by RouteResult pins".into())
+        }
+        fn share_zone(
+            &self,
+            _kernel: &crate::kernel::Kernel,
+            _local_path: &str,
+            _new_zone_id: &str,
+        ) -> CoordinatorResult<ShareInfo> {
+            Err("not used by RouteResult pins".into())
+        }
+        fn lookup_share(
+            &self,
+            _kernel: &crate::kernel::Kernel,
+            _remote_path: &str,
+        ) -> CoordinatorResult<Option<ShareInfo>> {
+            Ok(None)
+        }
+        fn metastore_for_zone(
+            &self,
+            _kernel: &crate::kernel::Kernel,
+            _zone_id: &str,
+        ) -> CoordinatorResult<Arc<dyn MetaStore>> {
+            Err("not used by RouteResult pins".into())
+        }
+        fn locks_for_zone(
+            &self,
+            _kernel: &crate::kernel::Kernel,
+            _zone_id: &str,
+        ) -> CoordinatorResult<Arc<dyn Locks>> {
+            Err("not used by RouteResult pins".into())
+        }
+
+        // Peer-* overrides we DO observe — every call records the
+        // (op, target_zone, key args) so the test asserts read like
+        // the call site they protect.
+        fn peer_stat(
+            &self,
+            _kernel: &crate::kernel::Kernel,
+            target_zone: &str,
+            peer_path: &str,
+        ) -> Option<BackendStat> {
+            self.record(format!("peer_stat(target={target_zone}, path={peer_path})"));
+            Some(BackendStat {
+                size: 42,
+                is_dir: false,
+            })
+        }
+        fn peer_write(
+            &self,
+            _kernel: &crate::kernel::Kernel,
+            target_zone: &str,
+            peer_path: &str,
+            content: &[u8],
+        ) -> Option<WriteResult> {
+            self.record(format!(
+                "peer_write(target={target_zone}, path={peer_path}, len={})",
+                content.len()
+            ));
+            Some(WriteResult {
+                content_id: peer_path.to_string(),
+                version: peer_path.to_string(),
+                size: content.len() as u64,
+            })
+        }
+        fn peer_list_dir(
+            &self,
+            _kernel: &crate::kernel::Kernel,
+            target_zone: &str,
+            peer_path: &str,
+        ) -> Option<Vec<(String, u8)>> {
+            self.record(format!(
+                "peer_list_dir(target={target_zone}, path={peer_path})"
+            ));
+            // Empty Vec is meaningful (real empty dir) — pin that
+            // the Some-vs-None split passes through unchanged.
+            Some(Vec::new())
+        }
+        fn peer_delete_file(
+            &self,
+            _kernel: &crate::kernel::Kernel,
+            target_zone: &str,
+            peer_path: &str,
+        ) -> bool {
+            self.record(format!(
+                "peer_delete_file(target={target_zone}, path={peer_path})"
+            ));
+            true
+        }
+        fn peer_mkdir(
+            &self,
+            _kernel: &crate::kernel::Kernel,
+            target_zone: &str,
+            peer_path: &str,
+            parents: bool,
+            exist_ok: bool,
+        ) -> bool {
+            self.record(format!(
+                "peer_mkdir(target={target_zone}, path={peer_path}, parents={parents}, exist_ok={exist_ok})"
+            ));
+            true
+        }
+        fn peer_rename(
+            &self,
+            _kernel: &crate::kernel::Kernel,
+            target_zone: &str,
+            old_path: &str,
+            new_path: &str,
+        ) -> bool {
+            self.record(format!(
+                "peer_rename(target={target_zone}, old={old_path}, new={new_path})"
+            ));
+            true
+        }
+        fn peer_setattr(
+            &self,
+            _kernel: &crate::kernel::Kernel,
+            target_zone: &str,
+            peer_path: &str,
+            _mime_type: Option<&str>,
+            _content_id: Option<&str>,
+            _modified_at_ms: Option<i64>,
+            _created_at_ms: Option<i64>,
+            size: Option<u64>,
+            _version: Option<u32>,
+        ) -> bool {
+            self.record(format!(
+                "peer_setattr(target={target_zone}, path={peer_path}, size={:?})",
+                size
+            ));
+            true
+        }
+    }
+
+    fn install_recording_coordinator(kernel: &crate::kernel::Kernel) -> Arc<RecordingCoordinator> {
+        let fake = Arc::new(RecordingCoordinator::default());
+        kernel.set_distributed_coordinator(fake.clone() as Arc<dyn DistributedCoordinator>);
+        fake
+    }
+
+    fn route_non_federation() -> RouteResult {
+        // No backend + no target_zone_id — plain local mount that
+        // never wired federation.  Both predicates fail.
+        RouteResult {
+            mount_point: "/root".to_string(),
+            backend_path: "x".to_string(),
+            zone_id: "root".to_string(),
+            is_external: false,
+            is_cas: false,
+            metastore: None,
+            backend: None,
+            target_zone_id: None,
+        }
+    }
+
+    fn route_federation_peer() -> RouteResult {
+        // No backend + target_zone_id Some — placeholder MountEntry
+        // shape installed by `wire_mount_core` on non-SSOT voters.
+        RouteResult {
+            mount_point: "/sharedzone".to_string(),
+            backend_path: "x".to_string(),
+            zone_id: "sharedzone".to_string(),
+            is_external: false,
+            is_cas: false,
+            metastore: None,
+            backend: None,
+            target_zone_id: Some("sharedzone".to_string()),
+        }
+    }
+
+    #[test]
+    fn route_via_federation_stat_non_peer_returns_none_without_invoking_coordinator() {
+        let kernel = crate::kernel::Kernel::new();
+        let fake = install_recording_coordinator(&kernel);
+        assert!(route_non_federation()
+            .via_federation_stat(&kernel, "/x")
+            .is_none());
+        assert!(
+            fake.calls().is_empty(),
+            "non-federation route must not reach the coordinator: got {:?}",
+            fake.calls()
+        );
+    }
+
+    #[test]
+    fn route_via_federation_stat_peer_route_calls_coordinator_with_target_zone() {
+        let kernel = crate::kernel::Kernel::new();
+        let fake = install_recording_coordinator(&kernel);
+        let stat = route_federation_peer()
+            .via_federation_stat(&kernel, "/x")
+            .expect("peer dispatch should surface the coordinator hit");
+        assert_eq!(stat.size, 42);
+        assert_eq!(fake.calls(), vec!["peer_stat(target=sharedzone, path=/x)"]);
+    }
+
+    #[test]
+    fn route_via_federation_write_non_peer_route_returns_not_peer() {
+        let kernel = crate::kernel::Kernel::new();
+        let fake = install_recording_coordinator(&kernel);
+        match route_non_federation().via_federation_write(&kernel, "/x", b"abc") {
+            FederationWriteOutcome::NotPeer => {}
+            other => panic!("expected NotPeer for local route, got {other:?}"),
+        }
+        assert!(
+            fake.calls().is_empty(),
+            "non-federation route must not invoke the coordinator: {:?}",
+            fake.calls()
+        );
+    }
+
+    #[test]
+    fn route_via_federation_write_peer_route_hit_carries_canonical_write_result() {
+        let kernel = crate::kernel::Kernel::new();
+        let fake = install_recording_coordinator(&kernel);
+        match route_federation_peer().via_federation_write(&kernel, "/x", b"abc") {
+            FederationWriteOutcome::Hit(wr) => {
+                assert_eq!(wr.size, 3);
+                assert_eq!(wr.content_id, "/x");
+            }
+            other => panic!("expected Hit, got {other:?}"),
+        }
+        assert_eq!(
+            fake.calls(),
+            vec!["peer_write(target=sharedzone, path=/x, len=3)"]
+        );
+    }
+
+    /// Federation route whose dispatch missed (coordinator's
+    /// `peer_write` returns None — peer unreachable, observability
+    /// warns fire on the coordinator side).  Pinning this separately
+    /// from the Hit case guards the no-local-fallback rule that
+    /// distinguishes federation-peer-mounts from regular mounts.
+    #[test]
+    fn route_via_federation_write_peer_route_dispatch_miss_surfaces_dispatch_missed() {
+        // Use a fake coordinator whose peer_write returns None to
+        // simulate every voter being unreachable.  The dispatch
+        // helper would normally fall back through dispatch_to_peers
+        // and surface None; this fake bypasses that to test the
+        // RouteResult arm directly.
+        struct MissCoordinator;
+        impl DistributedCoordinator for MissCoordinator {
+            fn list_zones(&self, _kernel: &crate::kernel::Kernel) -> Vec<String> {
+                Vec::new()
+            }
+            fn cluster_info(
+                &self,
+                _kernel: &crate::kernel::Kernel,
+                _zone_id: &str,
+            ) -> CoordinatorResult<ClusterInfo> {
+                Err("unused".into())
+            }
+            fn create_zone(
+                &self,
+                _kernel: &crate::kernel::Kernel,
+                _zone_id: &str,
+            ) -> CoordinatorResult<()> {
+                Err("unused".into())
+            }
+            fn remove_zone(
+                &self,
+                _kernel: &crate::kernel::Kernel,
+                _zone_id: &str,
+                _force: bool,
+            ) -> CoordinatorResult<()> {
+                Err("unused".into())
+            }
+            fn join_zone(
+                &self,
+                _kernel: &crate::kernel::Kernel,
+                _zone_id: &str,
+                _as_learner: bool,
+            ) -> CoordinatorResult<()> {
+                Err("unused".into())
+            }
+            fn wire_mount(
+                &self,
+                _kernel: &crate::kernel::Kernel,
+                _parent_zone: &str,
+                _mount_path: &str,
+                _target_zone: &str,
+            ) -> CoordinatorResult<()> {
+                Err("unused".into())
+            }
+            fn unwire_mount(
+                &self,
+                _kernel: &crate::kernel::Kernel,
+                _parent_zone: &str,
+                _mount_path: &str,
+            ) -> CoordinatorResult<()> {
+                Err("unused".into())
+            }
+            fn share_zone(
+                &self,
+                _kernel: &crate::kernel::Kernel,
+                _local_path: &str,
+                _new_zone_id: &str,
+            ) -> CoordinatorResult<ShareInfo> {
+                Err("unused".into())
+            }
+            fn lookup_share(
+                &self,
+                _kernel: &crate::kernel::Kernel,
+                _remote_path: &str,
+            ) -> CoordinatorResult<Option<ShareInfo>> {
+                Ok(None)
+            }
+            fn metastore_for_zone(
+                &self,
+                _kernel: &crate::kernel::Kernel,
+                _zone_id: &str,
+            ) -> CoordinatorResult<Arc<dyn MetaStore>> {
+                Err("unused".into())
+            }
+            fn locks_for_zone(
+                &self,
+                _kernel: &crate::kernel::Kernel,
+                _zone_id: &str,
+            ) -> CoordinatorResult<Arc<dyn Locks>> {
+                Err("unused".into())
+            }
+            // The single override that matters: peer_write returns
+            // None — the simulated all-voters-unreachable path.
+            fn peer_write(
+                &self,
+                _kernel: &crate::kernel::Kernel,
+                _target_zone: &str,
+                _peer_path: &str,
+                _content: &[u8],
+            ) -> Option<WriteResult> {
+                None
+            }
+        }
+        let kernel = crate::kernel::Kernel::new();
+        kernel.set_distributed_coordinator(
+            Arc::new(MissCoordinator) as Arc<dyn DistributedCoordinator>
+        );
+        match route_federation_peer().via_federation_write(&kernel, "/x", b"abc") {
+            FederationWriteOutcome::DispatchMissed => {}
+            other => panic!("expected DispatchMissed when peer_write returns None, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_via_federation_readdir_passes_through_empty_vec_as_some() {
+        // Empty Vec on peer side is "directory exists but is empty"
+        // — distinguish from None ("not a federation route, fall
+        // through to local readdir") via the Some/None split.
+        let kernel = crate::kernel::Kernel::new();
+        let _fake = install_recording_coordinator(&kernel);
+        let entries = route_federation_peer()
+            .via_federation_readdir(&kernel, "/d")
+            .expect("peer dispatch returns Some even for empty dirs");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn route_via_federation_unlink_wraps_dispatch_bool_in_some() {
+        let kernel = crate::kernel::Kernel::new();
+        let _fake = install_recording_coordinator(&kernel);
+        let result = route_federation_peer().via_federation_unlink(&kernel, "/x");
+        assert_eq!(result, Some(true));
+    }
+
+    #[test]
+    fn route_supplement_mkdir_non_peer_route_is_noop() {
+        let kernel = crate::kernel::Kernel::new();
+        let fake = install_recording_coordinator(&kernel);
+        route_non_federation().supplement_mkdir(&kernel, "/d", true, false);
+        assert!(
+            fake.calls().is_empty(),
+            "non-federation supplement_mkdir must not invoke coordinator"
+        );
+    }
+
+    #[test]
+    fn route_supplement_mkdir_peer_route_threads_args_to_coordinator() {
+        let kernel = crate::kernel::Kernel::new();
+        let fake = install_recording_coordinator(&kernel);
+        route_federation_peer().supplement_mkdir(&kernel, "/d", true, false);
+        assert_eq!(
+            fake.calls(),
+            vec!["peer_mkdir(target=sharedzone, path=/d, parents=true, exist_ok=false)"]
+        );
+    }
+
+    #[test]
+    fn route_supplement_rename_peer_route_threads_old_and_new_paths() {
+        let kernel = crate::kernel::Kernel::new();
+        let fake = install_recording_coordinator(&kernel);
+        route_federation_peer().supplement_rename(&kernel, "/a", "/b");
+        assert_eq!(
+            fake.calls(),
+            vec!["peer_rename(target=sharedzone, old=/a, new=/b)"]
+        );
+    }
+
+    #[test]
+    fn route_supplement_setattr_peer_route_threads_size_arg() {
+        let kernel = crate::kernel::Kernel::new();
+        let fake = install_recording_coordinator(&kernel);
+        route_federation_peer().supplement_setattr(
+            &kernel,
+            "/f",
+            None,
+            None,
+            None,
+            None,
+            Some(99),
+            None,
+        );
+        assert_eq!(
+            fake.calls(),
+            vec!["peer_setattr(target=sharedzone, path=/f, size=Some(99))"]
+        );
     }
 }

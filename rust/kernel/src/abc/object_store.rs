@@ -40,6 +40,7 @@ pub enum StorageError {
 ///   PAS: cloud version_id or content hash.
 /// - `size`: Content size in bytes.
 #[allow(dead_code)]
+#[derive(Debug)]
 pub struct WriteResult {
     pub content_id: String,
     pub version: String,
