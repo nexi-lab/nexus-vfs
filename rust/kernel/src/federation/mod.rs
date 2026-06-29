@@ -27,4 +27,5 @@
 
 mod blob_fetcher_slot;
 mod coordinator_wiring;
+pub mod grpc_ops;
 mod peer_dispatch;
