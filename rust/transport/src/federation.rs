@@ -27,7 +27,7 @@ use std::time::Duration;
 use dashmap::DashMap;
 use tonic::transport::Channel;
 
-use kernel::abc::object_store::{BackendStat, WriteResult};
+use kernel::abc::object_store::BackendStat;
 use kernel::federation::grpc_ops::{FederationGrpcOps, FederationPeerResult};
 use kernel::kernel::vfs_proto;
 use lib::transport_primitives::{create_channel, ClientConfig, TlsConfig};
@@ -268,43 +268,6 @@ impl FederationClient {
         Ok(resp.content)
     }
 
-    async fn vfs_write(
-        &self,
-        peer_addr: &str,
-        path: &str,
-        content: &[u8],
-    ) -> Result<WriteResult, String> {
-        let mut client = self.vfs_client(peer_addr).await?;
-        let mut request = tonic::Request::new(vfs_proto::WriteRequest {
-            path: path.to_string(),
-            content: content.to_vec(),
-            auth_token: String::new(),
-            content_id: String::new(),
-        });
-        request.set_timeout(self.timeout);
-        let resp = client
-            .write(request)
-            .await
-            .map_err(|e| format!("federation write {peer_addr} {path}: {e}"))?
-            .into_inner();
-        if resp.is_error {
-            return Err(format!(
-                "federation write {peer_addr} {path}: {}",
-                String::from_utf8_lossy(&resp.error_payload)
-            ));
-        }
-        let content_id = if resp.content_id.is_empty() {
-            path.to_string()
-        } else {
-            resp.content_id
-        };
-        Ok(WriteResult {
-            version: content_id.clone(),
-            content_id,
-            size: resp.size.max(0) as u64,
-        })
-    }
-
     async fn vfs_stat(&self, peer_addr: &str, path: &str) -> Result<Option<BackendStat>, String> {
         let mut client = self.vfs_client(peer_addr).await?;
         let mut request = tonic::Request::new(vfs_proto::StatRequest {
@@ -534,10 +497,6 @@ impl FederationClient {
 impl FederationGrpcOps for FederationClient {
     fn read(&self, addr: &str, path: &str, offset: u64) -> FederationPeerResult<Vec<u8>> {
         self.block_on_safely(self.vfs_read(addr, path, offset))
-    }
-
-    fn write(&self, addr: &str, path: &str, content: &[u8]) -> FederationPeerResult<WriteResult> {
-        self.block_on_safely(self.vfs_write(addr, path, content))
     }
 
     fn stat(&self, addr: &str, path: &str) -> FederationPeerResult<Option<BackendStat>> {

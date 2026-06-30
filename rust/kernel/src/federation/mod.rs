@@ -24,12 +24,13 @@
 //!   because it is an internal DI boundary, not a kernel HAL —
 //!   kernel callers reach federation peers only through
 //!   `kernel.distributed_coordinator().peer_*(...)`.
-//! * **[`route_outcomes`] routing-tier wrappers** —
-//!   [`FederationWriteOutcome`] and friends that add the kernel-
-//!   routing "not a federation route" state on top of the HAL
-//!   trait's two-state per-peer return.  Consumed by
-//!   `RouteResult::via_federation_write` (in `core/vfs_router.rs`)
-//!   and by `sys_write` (in `kernel/io.rs`).
+//!   The same file also hosts the federation-cache slot accessors
+//!   ([`Kernel::set_federation_cache`] / [`Kernel::federation_cache_arc`])
+//!   — single kernel-global `Arc<dyn ObjectStore>` rooted at
+//!   `<data_dir>/federation-cache/` that satisfies the uniform
+//!   local-first sys_write contract for federation-peer-mount
+//!   placeholders.  ONE on-disk root, addressed by canonical path;
+//!   no per-mount cache lifecycle.
 //! * **Blob-fetcher slot plumbing** ([`blob_fetcher_slot`]) — boot-time
 //!   stash for the raft-tier handler to drain.
 //!
@@ -38,10 +39,14 @@
 //! behavior methods (in `core/vfs_router.rs`) rather than naming the
 //! coordinator directly — the `is_federation_peer_mount()` predicate
 //! is encapsulated inside those methods.
+//!
+//! NOTE: those `RouteResult::via_federation_*` / `supplement_*` methods
+//! pre-date this module split — they should eventually move out of
+//! `core/vfs_router.rs` (which is for §4 kernel primitives only) into
+//! `federation/route_helpers.rs` so the federation knowledge fully lives
+//! here.  Deferred to a follow-up PR — see the architecture-lint catch
+//! in [[reference_kernel_architecture_lint]].
 
 mod blob_fetcher_slot;
 mod coordinator_wiring;
 pub mod grpc_ops;
-pub mod route_outcomes;
-
-pub use route_outcomes::FederationWriteOutcome;

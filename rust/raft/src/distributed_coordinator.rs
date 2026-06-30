@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use contracts::lock_state::Locks;
 use dashmap::DashMap;
 use kernel::abc::meta_store::MetaStore;
-use kernel::abc::object_store::{BackendStat, WriteResult};
+use kernel::abc::object_store::BackendStat;
 use kernel::core::vfs_router::canonicalize_mount_path as canonicalize;
 use kernel::federation::grpc_ops::FederationGrpcOps;
 use kernel::hal::distributed_coordinator::{
@@ -2091,22 +2091,6 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
         )
     }
 
-    fn peer_write(
-        &self,
-        kernel: &Kernel,
-        target_zone: &str,
-        peer_path: &str,
-        content: &[u8],
-    ) -> Option<WriteResult> {
-        self.dispatch_to_peers::<WriteResult, _>(
-            kernel,
-            "write",
-            target_zone,
-            peer_path,
-            |client, addr| client.write(addr, peer_path, content).map(Some),
-        )
-    }
-
     fn peer_stat(
         &self,
         kernel: &Kernel,
@@ -3010,7 +2994,7 @@ mod tests {
     // standing up a full ZoneManager fixture keeps regressions cheap
     // to catch.
 
-    use kernel::abc::object_store::{BackendStat, WriteResult};
+    use kernel::abc::object_store::BackendStat;
     use kernel::federation::grpc_ops::{FederationGrpcOps, FederationPeerResult};
     use parking_lot::Mutex;
 
@@ -3047,14 +3031,6 @@ mod tests {
                 .lock()
                 .remove(addr)
                 .unwrap_or_else(|| Err(format!("no canned reply for {addr}")))
-        }
-        fn write(
-            &self,
-            _addr: &str,
-            _path: &str,
-            _content: &[u8],
-        ) -> FederationPeerResult<WriteResult> {
-            unreachable!("write not exercised by these pins");
         }
         fn stat(&self, _addr: &str, _path: &str) -> FederationPeerResult<Option<BackendStat>> {
             unreachable!("stat not exercised by these pins");

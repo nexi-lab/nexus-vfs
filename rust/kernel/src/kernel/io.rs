@@ -10,6 +10,7 @@
 //! the `sys_unlink` DT_DIR branch.
 
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use crate::dispatch::{
     DeleteHookCtx, FileEventType, HookContext, HookIdentity, Permission, ReadHookCtx,
@@ -436,12 +437,34 @@ impl Kernel {
         //    materialised entry, or any future metadata-only record)
         //    short-circuits to `None` so the path immediately falls
         //    through to `try_remote_fetch`.
-        let content = match content_id_opt {
-            Some(cid) => route
-                .backend
-                .as_ref()
-                .and_then(|b| b.read_content(cid, ctx).ok()),
-            None => None,
+        //
+        // Federation-cache substitution under the uniform local-first
+        // sys_write contract (PR #98): when this mount is a federation-
+        // peer-mount placeholder (no local backend, target_zone_id set)
+        // and `last_writer_address == self`, serve from the kernel-
+        // global federation cache (addressed by canonical path).  This
+        // is the writer-side fast path; remote readers route to us via
+        // `try_remote_fetch` (last_writer-aware peer dispatch) further
+        // down and end up here on this voter through the gRPC
+        // sys_read handler.
+        let federation_cache_substitution_read = route.backend.is_none()
+            && route.target_zone_id.is_some()
+            && entry
+                .last_writer_address
+                .as_deref()
+                .zip(self.self_address.read().as_deref())
+                .is_some_and(|(writer, me)| writer == me);
+        let content = if federation_cache_substitution_read {
+            self.federation_cache_arc()
+                .and_then(|b| b.read_content(path, ctx).ok())
+        } else {
+            match content_id_opt {
+                Some(cid) => route
+                    .backend
+                    .as_ref()
+                    .and_then(|b| b.read_content(cid, ctx).ok()),
+                None => None,
+            }
         };
 
         // 6. Release VFS lock (always, even on miss)
@@ -843,132 +866,19 @@ impl Kernel {
             })
         };
 
-        // §5a. Federation-peer mount short-circuit: when this mount
-        // has no local backend (placeholder MountEntry installed by
-        // wire_mount_core on the non-SSOT node) but carries a
-        // `target_zone_id`, the SSOT for these bytes lives on a peer
-        // voter.  Defer the ENTIRE write to that peer's typed
-        // `NexusVFSService.Write` — peer's sys_write runs the full
-        // lifecycle (LocalConnector write_content + the single
-        // authoritative metastore.put + raft replication of that put
-        // back to us via apply).
+        // §5a. PR #80's defer-to-peer short-circuit removed under the
+        // uniform local-first sys_write contract (PR #98): writes on a
+        // federation-peer-mount placeholder route to the kernel-global
+        // federation-cache backend (`kernel.federation_cache_arc()`)
+        // so bytes land on the WRITER's local fs.  The metastore.put
+        // below stamps `last_writer_address = self`; peer reads
+        // resolve back via the last-writer-aware sys_read fallback.
+        // Backend selection happens in step §5 below by substituting
+        // the federation cache when `route.backend` is None.
         //
-        // Mirror of `sys_unlink_single`'s federation-peer short-circuit
-        // (PR #77, commit 7a4fdd8d6).  The shape that arm replaced
-        // had joiner do its own metastore.put AFTER the dispatch RPC
-        // returned — double-propose:
-        //   - founder's sys_write proposes the put, raft replicates;
-        //   - joiner's sys_write proposes ANOTHER put for the same
-        //     (zone, path) key with a later modified_at_ms timestamp;
-        //   - LWW dedupes, but the racing apply order is observable
-        //     through joiner's local metastore view (the joiner-readback
-        //     gap discovered in nexus PR #4433's docker E2E:
-        //     founder host fs received bytes byte-exact, joiner's own
-        //     FUSE lookup for the same path missed for >30s).
-        //
-        // Deferring entirely produces single-proposer semantics —
-        // ONE sys_write runs (the peer's), ONE metastore commit
-        // happens, ONE backend write fires.  Joiner sees the row
-        // when raft apply lands on its zone metastore; if the read
-        // races the apply, sys_stat's `via_federation_stat` fallback
-        // covers it.  Same SSOT contract sys_unlink already enforces.
-        //
-        // Offset > 0 (partial writes) NOT short-circuited here: the
-        // peer's `Write` RPC takes (addr, path, content) with no
-        // offset (the trait doc explicitly says "Partial writes are
-        // not modelled at this layer"), and partial-write semantics
-        // need read-modify-write the caller handles
-        // locally first.  For placeholder mounts the partial-write
-        // path returns miss — preserved legacy behaviour.
-        //
-        // Same loop-avoidance caveat the dispatch helper documents:
-        // for the canonical 2-node cc-tasks-share topology the SSOT
-        // side has `backend = Some` and never enters this arm, so
-        // re-entry is structurally impossible.
-        // PR #80 short-circuit for offset==0: pure-defer the write to
-        // the SSOT peer when the routed entry is a federation-peer-
-        // mount placeholder.  The named outcome variants make the
-        // three legitimate states explicit:
-        //   * NotPeer        — fall through to the local write path.
-        //   * DispatchMissed — federation route, but the SSOT peer was
-        //                      unreachable; return miss() WITHOUT any
-        //                      local fallback (placeholder mounts
-        //                      have no local backend).
-        //   * Hit(wr)        — short-circuit with the peer's canonical
-        //                      (content_id, size).
-        //
-        // Offset > 0 (partial writes) are NOT short-circuited: the
-        // wire shape takes (addr, path, content) with no offset, and
-        // partial-write semantics need RMW the caller handles locally
-        // first.  For placeholder mounts that means the partial-write
-        // path returns miss — preserved legacy behaviour.
-        if input.offset == 0 {
-            use crate::federation::FederationWriteOutcome;
-            match input
-                .route
-                .via_federation_write(self, input.path, input.content)
-            {
-                FederationWriteOutcome::NotPeer => { /* fall through */ }
-                FederationWriteOutcome::DispatchMissed => return miss(),
-                FederationWriteOutcome::Hit(wr) => {
-                    // Best-effort old-state snapshot for OBSERVE +
-                    // native POST hook.  Joiner's local metastore may
-                    // or may not have a row pre-write; founder's
-                    // post-write metastore.put will eventually
-                    // replicate via raft and supersede.  When local
-                    // has nothing, treat as first-write (is_new=true)
-                    // — consistent with "this voter has never
-                    // observed this path before".
-                    let old_entry = self.commit_old_metadata(&input);
-                    let old_version = old_entry.as_ref().map(|e| e.version).unwrap_or(0);
-                    let old_gen = old_entry.as_ref().map(|e| e.gen).unwrap_or(0);
-                    let old_content_id = old_entry.as_ref().and_then(|e| e.content_id.clone());
-                    let new_version = old_version + 1;
-                    let new_gen = old_gen.saturating_add(1);
-                    let result_is_new = old_entry.is_none();
-                    let result_old_etag = old_content_id.clone();
-                    let result_old_size = old_entry.as_ref().map(|e| e.size);
-                    let result_old_version = old_entry.as_ref().map(|e| e.version);
-                    let result_old_modified_at_ms =
-                        old_entry.as_ref().and_then(|e| e.modified_at_ms);
-
-                    let content_id_for_event = wr.content_id.clone();
-                    let size_for_event = wr.size;
-                    self.dispatch_mutation(FileEventType::FileWrite, input.path, input.ctx, |ev| {
-                        ev.size = Some(size_for_event);
-                        ev.content_id = Some(content_id_for_event);
-                        ev.version = Some(new_version);
-                        ev.gen = Some(new_gen);
-                        ev.is_new = old_version == 0;
-                        ev.old_content_id = old_content_id;
-                    });
-
-                    self.dispatch_native_post(&HookContext::Write(WriteHookCtx {
-                        path: input.path.to_string(),
-                        identity: HookIdentity::from(input.ctx),
-                        content: vec![],
-                        is_new_file: result_is_new,
-                        content_id: None,
-                        new_version: new_version.into(),
-                        size_bytes: Some(wr.size),
-                    }));
-
-                    return Ok(SysWriteResult {
-                        hit: true,
-                        content_id: Some(wr.content_id),
-                        post_hook_needed: self.write_hook_count.load(Ordering::Relaxed) > 0,
-                        version: new_version,
-                        gen: new_gen,
-                        size: wr.size,
-                        is_new: result_is_new,
-                        old_content_id: result_old_etag,
-                        old_size: result_old_size,
-                        old_version: result_old_version,
-                        old_modified_at_ms: result_old_modified_at_ms,
-                    });
-                }
-            }
-        }
+        // Partial writes (offset > 0) on a placeholder mount fall
+        // through the same path — the federation cache backend's
+        // CAS / PAS impl handles RMW locally; no cross-peer hop.
 
         // 5. Backend write (Rust-native ObjectStore).
         //    Pass backend_path as content_id for PAS; for CAS at offset=0
@@ -993,7 +903,39 @@ impl Kernel {
                 }
             }
         };
-        let write_result = match input.route.backend.as_ref() {
+        // Backend resolution:
+        //   * `Some(backend)` — regular mount with a local backend.
+        //   * `None` + `target_zone_id = Some(_)` + federation cache
+        //     wired — federation-peer-mount placeholder under the
+        //     local-first sys_write contract (PR #98).  Substitute the
+        //     kernel-global federation cache; bytes land on THIS
+        //     voter's host fs at `<data_dir>/federation-cache/<path>`,
+        //     metastore.put records `last_writer_address = self`, and
+        //     remote readers route to us via the last-writer-aware
+        //     sys_read fallback (§read).  Path-addressed: the canonical
+        //     VFS path doubles as the on-disk relative path inside the
+        //     cache root.
+        //   * `None` + no federation cache wired (Rust unit-test embed,
+        //     or operator did not install the cache slot) — surface
+        //     miss, matching the legacy "Python connector or no backend
+        //     installed" semantics.
+        let federation_cache_substitution =
+            input.route.backend.is_none() && input.route.target_zone_id.is_some();
+        let resolved_backend = match input.route.backend.as_ref() {
+            Some(backend) => Some(Arc::clone(backend)),
+            None if federation_cache_substitution => self.federation_cache_arc(),
+            None => None,
+        };
+        // For the federation cache substitution, override the
+        // backend_path effective content id with the canonical VFS
+        // path — PathLocalBackend addresses by content_id and the
+        // canonical path is the SSOT identifier across voters.
+        let effective_content_id = if federation_cache_substitution {
+            input.path.to_string()
+        } else {
+            effective_content_id
+        };
+        let write_result = match resolved_backend {
             Some(backend) => {
                 match backend.write_content(
                     input.content,
@@ -1012,14 +954,10 @@ impl Kernel {
                     }
                 }
             }
-            // Mount has no Rust backend.  Only sub-case remaining:
-            // Python-side connector — caller treats as a hit=false
-            // miss (the legacy shape, preserved).  The federation-peer
-            // sub-case is handled by the §5a short-circuit at the top
-            // of this method (PR #77-equivalent for sys_write); any
-            // path reaching here that has `target_zone_id` set already
-            // failed the `offset == 0` predicate (partial writes on
-            // placeholder mounts return miss — same as before).
+            // Mount has no backend AND no federation cache substitution
+            // applies — Python-side connector, or operator declined to
+            // install the federation cache slot.  Caller treats as a
+            // hit=false miss (legacy shape, preserved).
             None => None,
         };
 

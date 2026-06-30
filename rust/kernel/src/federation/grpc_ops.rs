@@ -27,7 +27,7 @@
 //! the constraint the user enforced when we collapsed
 //! `FederationPeerClient` into `DistributedCoordinator`.
 
-use crate::abc::object_store::{BackendStat, WriteResult};
+use crate::abc::object_store::BackendStat;
 
 /// Result type for per-peer gRPC RPCs.  String errors carry the
 /// underlying tonic status / timeout message verbatim so the
@@ -49,11 +49,11 @@ pub trait FederationGrpcOps: Send + Sync {
     /// Fetch file bytes via `NexusVFSService.Read`.
     fn read(&self, addr: &str, path: &str, offset: u64) -> FederationPeerResult<Vec<u8>>;
 
-    /// Write file bytes via `NexusVFSService.Write` — peer runs the
-    /// full write lifecycle (backend write + metastore.put + raft
-    /// propose); returned `WriteResult` carries the canonical
-    /// `(content_id, size)` from the SSOT side.
-    fn write(&self, addr: &str, path: &str, content: &[u8]) -> FederationPeerResult<WriteResult>;
+    // `write` removed under the uniform local-first sys_write contract
+    // (PR #98).  Every voter writes through its own kernel-global
+    // federation-cache backend; cross-peer reads use `read` on the
+    // writer's address (resolved via `FileMetadata.last_writer_address`).
+    // No syscall site dispatches a write to a peer anymore.
 
     /// Stat one path via `NexusVFSService.Stat`.  Returns `Ok(None)`
     /// when the peer reports the path is not found (in-band
