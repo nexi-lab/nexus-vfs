@@ -38,7 +38,7 @@
 use std::sync::Arc;
 
 use crate::abc::meta_store::MetaStore;
-use crate::abc::object_store::{BackendStat, WriteResult};
+use crate::abc::object_store::BackendStat;
 use contracts::lock_state::Locks;
 
 /// Result type used across the Control-Plane HAL. String errors carry
@@ -368,22 +368,12 @@ pub trait DistributedCoordinator: Send + Sync + 'static {
         false
     }
 
-    /// Write file bytes to the SSOT peer.  Pure-defer pattern — the
-    /// peer's typed handler runs the full write lifecycle (backend
-    /// write + metastore.put + raft propose) and replicates back to
-    /// every voter.  Returning the peer's `WriteResult` lets the
-    /// caller surface its OBSERVE event + native POST hook with the
-    /// canonical `(content_id, size)` from the SSOT side.
-    #[allow(unused_variables)]
-    fn peer_write(
-        &self,
-        kernel: &crate::kernel::Kernel,
-        target_zone: &str,
-        peer_path: &str,
-        content: &[u8],
-    ) -> Option<WriteResult> {
-        None
-    }
+    // `peer_write` removed under the uniform local-first sys_write
+    // contract (PR #98).  Every voter writes bytes through its own
+    // kernel-global federation-cache backend; cross-peer reads use
+    // `peer_read` on the writer's address (resolved via
+    // `FileMetadata.last_writer_address`).  No syscall site dispatches
+    // a write to a peer anymore.
 
     /// Create a directory on the SSOT peer (parents / exist_ok flags
     /// honored).  SUPPLEMENT pattern — caller ALSO runs the local
