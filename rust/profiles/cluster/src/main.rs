@@ -58,8 +58,36 @@ struct Args {
 #[derive(Debug, clap::Args)]
 struct CommonArgs {
     /// This node's hostname. Falls back to NEXUS_HOSTNAME, then OS hostname.
+    ///
+    /// Display label only — used by ZoneManager for human-readable
+    /// identification in logs and (when TLS bootstraps cert SANs).
+    /// Peers learn this node's REACHABLE endpoint from
+    /// `--advertise-addr` instead.
+    ///
+    /// Past behaviour overloaded hostname as both display label AND
+    /// advertise identity, which silently broke cross-machine
+    /// federation over Tailscale/VPN overlays where the OS hostname
+    /// does not resolve through the overlay (peers would dial
+    /// `http://win:2126` from a Mac and fail at the DNS layer).
     #[arg(long, env = "NEXUS_HOSTNAME", global = true)]
     hostname: Option<String>,
+
+    /// Address this node advertises to peers as its reachable raft
+    /// endpoint, in `host:port` form.
+    ///
+    /// Used as `StepMessage.sender_address` so peer-map runtime SSOT
+    /// learns where to dial this node back. MUST be reachable from
+    /// every peer that needs to talk to this node — for cross-machine
+    /// federation over an overlay network (Tailscale, WireGuard,
+    /// VPN), this MUST be that overlay's IP, not the OS hostname.
+    ///
+    /// Falls back to `{hostname}:{bind_port}` when unset, which is
+    /// fine for single-node tests but breaks cross-machine setups
+    /// where the OS hostname does not resolve through the overlay.
+    /// Boot logs a warning if the fallback looks unreachable
+    /// (`0.0.0.0:*`, loopback, or non-IP host with peers configured).
+    #[arg(long, env = "NEXUS_ADVERTISE_ADDR", global = true)]
+    advertise_addr: Option<String>,
 
     /// Bind address for the federation gRPC server.
     #[arg(long, env = "NEXUS_BIND_ADDR", default_value = DEFAULT_BIND, global = true)]
@@ -496,13 +524,25 @@ fn open_zone_manager(
 
     // Advertise address — used as `StepMessage.sender_address` so the
     // peer-map runtime SSOT can learn this node's reachable endpoint.
-    // Default: `<hostname>:<bind_port>`.
+    //
+    // SSOT precedence:
+    //   1. `--advertise-addr` / NEXUS_ADVERTISE_ADDR (explicit; required
+    //      for cross-machine federation over overlay networks).
+    //   2. Fallback `<hostname>:<bind_port>` (matches pre-PR behaviour;
+    //      fine for single-node tests, breaks cross-machine federation
+    //      whenever the OS hostname does not resolve through the
+    //      overlay — see warn_if_self_address_unreachable below).
     let bind_port = common
         .bind_addr
         .rsplit_once(':')
         .and_then(|(_, p)| p.parse::<u16>().ok())
         .unwrap_or(2126);
-    let self_address = format!("{hostname}:{bind_port}");
+    let self_address = resolve_self_address(
+        common.advertise_addr.as_deref(),
+        &hostname,
+        bind_port,
+        peer_addrs.len(),
+    );
 
     // Reject "self listed in --peers" early — see
     // `validate_peers_excludes_self` for why this is a hard error
@@ -1207,6 +1247,64 @@ async fn run_join(
         .map_err(|e| anyhow::anyhow!("--peer-addr parse '{}': {}", peer_addr, e))?;
     let peer_addrs = vec![peer];
 
+    // Ensure the local parent zone exists BEFORE writing the cross-zone
+    // DT_MOUNT entry into it.  `zm.mount_async(parent_zone, ...)` below
+    // proposes through that zone's metastore; without the zone loaded
+    // the propose has no consensus group to land in and the mount
+    // entry is silently lost — the joiner daemon then comes up with
+    // sharedzone connected but no namespace stitching at /shared, and
+    // wire_mount warns "root zone not loaded — distributed locks NOT
+    // installed".
+    //
+    // `parent_zone` defaults to "root", which `run_daemon` would
+    // bootstrap on every startup via the same helper. The join CLI
+    // sidecar runs BEFORE the daemon ever boots on a fresh joiner, so
+    // the daemon's later bootstrap finds an already-populated data dir
+    // and resumes — but the resume only loads zones that EXIST in the
+    // data dir. If `run_join` writes the sharedzone first and then
+    // tries to mount under root without root having been bootstrapped,
+    // the daemon resume picks up sharedzone only and the operator
+    // sees an empty FUSE mount.
+    //
+    // Bootstrap parent_zone as SOLO (empty peers — root is per-node
+    // by design, see distributed_coordinator.rs:686 contract). Idempotent:
+    // `bootstrap_or_join_zone` Branch 1 resumes when ConfState is
+    // already on disk, so re-running this sidecar against an existing
+    // data dir is a no-op for the parent zone.
+    let parent_zone_dir = parent_zone_storage_path(&common.data_dir, parent_zone);
+    let parent_zone_loaded = parent_zone_dir.exists();
+    if !parent_zone_loaded {
+        tracing::info!(
+            parent_zone = %parent_zone,
+            data_dir = %common.data_dir.display(),
+            "join sidecar: parent zone not in data dir — bootstrapping as SOLO",
+        );
+        let zm_for_parent = zm.clone();
+        let self_addr_for_parent = self_address.clone();
+        let parent_zone_for_bootstrap = parent_zone.to_string();
+        tokio::task::spawn_blocking(move || {
+            nexus_raft::distributed_coordinator::bootstrap_or_join_zone(
+                zm_for_parent.as_ref(),
+                &parent_zone_for_bootstrap,
+                node_id,
+                &self_addr_for_parent,
+                /* peers */ &[],
+                /* bootstrap_new */ false,
+                /* max_attempts  */ None,
+                /* as_learner */ false,
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("join sidecar parent-zone bootstrap task panicked: {}", e))?
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "join sidecar bootstrap_or_join_zone(parent={}): {}",
+                parent_zone,
+                e
+            )
+        })?;
+    }
+
     let zm_for_join = zm.clone();
     let self_addr_for_join = self_address.clone();
     let zone_id_for_join = remote_zone_id.to_string();
@@ -1408,11 +1506,111 @@ fn install_tracing() -> tracing_appender::non_blocking::WorkerGuard {
     guard
 }
 
+/// Filesystem path the daemon (and `bootstrap_or_join_zone`) uses to
+/// detect whether `<zone_id>` has persisted raft state in `data_dir`.
+/// Mirrors the `data_dir_has_root` check in `run_daemon` so the join
+/// sidecar's "should I bootstrap this parent zone?" decision aligns
+/// with the daemon's later "should I resume from disk?" check.
+fn parent_zone_storage_path(data_dir: &std::path::Path, zone_id: &str) -> PathBuf {
+    data_dir.join(zone_id).join("raft")
+}
+
 fn resolve_hostname(cli: Option<&str>) -> String {
     if let Some(h) = cli {
         return h.to_string();
     }
     gethostname::gethostname().to_string_lossy().into_owned()
+}
+
+/// Resolve the address this node advertises to peers as its raft
+/// endpoint.  Decouples advertise identity from the display-only
+/// `hostname` so cross-machine federation over overlay networks
+/// (Tailscale / VPN) can pin the overlay IP independently.
+///
+/// Precedence:
+///   1. `advertise_cli` — explicit `--advertise-addr` / NEXUS_ADVERTISE_ADDR.
+///      Empty string treated as unset (operator templating slip-through).
+///   2. Fallback `<hostname>:<bind_port>` — matches pre-PR behaviour.
+///      Single-node tests work unchanged; cross-machine setups MUST
+///      pin advertise_cli to the overlay IP.
+///
+/// When the resolved address looks unreachable (`0.0.0.0:*`, loopback,
+/// or non-IP host with peers configured), warn-loud so the operator
+/// sees the misconfiguration in boot logs — the Mac↔Win L1 wedge that
+/// motivated this seam manifested as silent "ConfState install timeout
+/// after JoinZone success" hours later.
+fn resolve_self_address(
+    advertise_cli: Option<&str>,
+    hostname: &str,
+    bind_port: u16,
+    peer_count: usize,
+) -> String {
+    let resolved = match advertise_cli {
+        Some(v) if !v.trim().is_empty() => v.trim().to_string(),
+        _ => format!("{hostname}:{bind_port}"),
+    };
+    warn_if_self_address_unreachable(&resolved, peer_count);
+    resolved
+}
+
+/// Warn-loud when the resolved self_address looks unreachable from
+/// peers. Heuristic, not a hard error — single-node tests legitimately
+/// bind 0.0.0.0 with no peers, and operators may name a fully-qualified
+/// hostname their peers can resolve.
+fn warn_if_self_address_unreachable(self_address: &str, peer_count: usize) {
+    let (host, _port) = match self_address.rsplit_once(':') {
+        Some(parts) => parts,
+        None => {
+            tracing::warn!(
+                target: "nexusd_cluster",
+                self_address = %self_address,
+                "advertise self_address has no :port — peers cannot dial it; \
+                 set --advertise-addr <host>:<port>",
+            );
+            return;
+        }
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host == "0.0.0.0" || host == "::" || host.is_empty() {
+        tracing::warn!(
+            target: "nexusd_cluster",
+            self_address = %self_address,
+            "advertise self_address binds wildcard — peers cannot dial it; \
+             set --advertise-addr to a reachable host:port",
+        );
+        return;
+    }
+    if host == "127.0.0.1" || host == "::1" || host == "localhost" {
+        if peer_count > 0 {
+            tracing::warn!(
+                target: "nexusd_cluster",
+                self_address = %self_address,
+                peer_count,
+                "advertise self_address is loopback while peers are configured — \
+                 cross-machine peers cannot reach this node; set --advertise-addr \
+                 to the reachable network IP",
+            );
+        }
+        return;
+    }
+    // Non-IP host with peers configured — likely the OS hostname,
+    // which does not resolve through Tailscale/VPN overlays.
+    let looks_like_ip = host
+        .split('.')
+        .all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_digit()))
+        && host.split('.').count() == 4;
+    let looks_like_ipv6 = host.contains(':');
+    if !looks_like_ip && !looks_like_ipv6 && peer_count > 0 && !host.contains('.') {
+        tracing::warn!(
+            target: "nexusd_cluster",
+            self_address = %self_address,
+            peer_count,
+            "advertise self_address is a bare hostname; if peers are on a \
+             different machine and reach this node via an overlay (Tailscale, \
+             VPN), set --advertise-addr to the overlay IP — bare hostnames \
+             rarely resolve across overlays",
+        );
+    }
 }
 
 /// Metastore mode resolved from the environment (#4343).
@@ -1783,5 +1981,108 @@ mod tests {
         assert!(parse_mount_driver_spec("local-connector").is_err());
         assert!(parse_mount_driver_spec("local-connector:myzone").is_err());
         assert!(parse_mount_driver_spec("local-connector:myzone:/path").is_err());
+    }
+
+    // ── --advertise-addr decoupling tests (symmetric-peer PR) ────────
+
+    #[test]
+    fn advertise_addr_explicit_wins() {
+        // Cross-machine federation: advertise pins Tailscale IP
+        // independently of OS hostname.
+        let resolved =
+            resolve_self_address(Some("100.64.0.27:2126"), "win", 2126, /* peers */ 1);
+        assert_eq!(resolved, "100.64.0.27:2126");
+    }
+
+    #[test]
+    fn advertise_addr_empty_string_falls_back() {
+        // Operator templating slip-through (envsubst with unset variable)
+        // produces empty string — fall back to hostname:port rather than
+        // advertising literal "".
+        let resolved = resolve_self_address(Some("   "), "myhost", 9000, 0);
+        assert_eq!(resolved, "myhost:9000");
+    }
+
+    #[test]
+    fn advertise_addr_unset_falls_back_to_hostname_port() {
+        let resolved = resolve_self_address(None, "single-node", 2126, 0);
+        assert_eq!(resolved, "single-node:2126");
+    }
+
+    #[test]
+    fn advertise_addr_overrides_distinct_port_from_bind() {
+        // operator binds 0.0.0.0:2126 but advertises an externally
+        // reachable port (port-forward / load-balancer scenarios).
+        let resolved = resolve_self_address(Some("public.example.com:443"), "internal", 2126, 1);
+        assert_eq!(resolved, "public.example.com:443");
+    }
+
+    // ── parent_zone_storage_path tests ────────────────────────────────
+
+    #[test]
+    fn parent_zone_storage_path_matches_run_daemon_check() {
+        // The join sidecar's "should I bootstrap parent_zone?" gate
+        // MUST point at the same path run_daemon uses to detect
+        // `data_dir_has_root` — otherwise the two sides of the
+        // contract drift and one re-creates state the other expects
+        // to load.
+        let data_dir = std::path::Path::new("/data");
+        assert_eq!(
+            parent_zone_storage_path(data_dir, "root"),
+            PathBuf::from("/data/root/raft"),
+            "parent zone storage path must match the run_daemon \
+             data_dir_has_root probe (<data_dir>/<zone>/raft)",
+        );
+        assert_eq!(
+            parent_zone_storage_path(data_dir, "sharedzone"),
+            PathBuf::from("/data/sharedzone/raft"),
+        );
+    }
+
+    // ── --advertise-addr CLI surface tests ────────────────────────────
+
+    #[test]
+    fn join_cli_accepts_advertise_addr_flag() {
+        // The cross-machine fix flow: operator passes both --hostname
+        // (display label) and --advertise-addr (network identity).
+        let parsed = Args::try_parse_from([
+            "nexusd-cluster",
+            "--hostname",
+            "macos",
+            "--advertise-addr",
+            "100.64.0.21:2126",
+            "join",
+            "1@host:2126",
+            "sharedzone",
+            "/shared",
+        ])
+        .expect("--advertise-addr must parse on join subcommand");
+        assert_eq!(
+            parsed.common.advertise_addr.as_deref(),
+            Some("100.64.0.21:2126"),
+            "advertise_addr global flag must be visible to join",
+        );
+        assert_eq!(
+            parsed.common.hostname.as_deref(),
+            Some("macos"),
+            "hostname stays a separate field, not overloaded",
+        );
+    }
+
+    #[test]
+    fn daemon_cli_accepts_advertise_addr_flag() {
+        // Daemon mode (no subcommand) also accepts the global flag.
+        let parsed = Args::try_parse_from([
+            "nexusd-cluster",
+            "--advertise-addr",
+            "100.64.0.27:2126",
+            "--bootstrap-mode",
+            "static",
+        ])
+        .expect("--advertise-addr must parse on daemon mode");
+        assert_eq!(
+            parsed.common.advertise_addr.as_deref(),
+            Some("100.64.0.27:2126"),
+        );
     }
 }
