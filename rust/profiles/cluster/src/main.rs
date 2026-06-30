@@ -1982,4 +1982,107 @@ mod tests {
         assert!(parse_mount_driver_spec("local-connector:myzone").is_err());
         assert!(parse_mount_driver_spec("local-connector:myzone:/path").is_err());
     }
+
+    // ── --advertise-addr decoupling tests (symmetric-peer PR) ────────
+
+    #[test]
+    fn advertise_addr_explicit_wins() {
+        // Cross-machine federation: advertise pins Tailscale IP
+        // independently of OS hostname.
+        let resolved =
+            resolve_self_address(Some("100.64.0.27:2126"), "win", 2126, /* peers */ 1);
+        assert_eq!(resolved, "100.64.0.27:2126");
+    }
+
+    #[test]
+    fn advertise_addr_empty_string_falls_back() {
+        // Operator templating slip-through (envsubst with unset variable)
+        // produces empty string — fall back to hostname:port rather than
+        // advertising literal "".
+        let resolved = resolve_self_address(Some("   "), "myhost", 9000, 0);
+        assert_eq!(resolved, "myhost:9000");
+    }
+
+    #[test]
+    fn advertise_addr_unset_falls_back_to_hostname_port() {
+        let resolved = resolve_self_address(None, "single-node", 2126, 0);
+        assert_eq!(resolved, "single-node:2126");
+    }
+
+    #[test]
+    fn advertise_addr_overrides_distinct_port_from_bind() {
+        // operator binds 0.0.0.0:2126 but advertises an externally
+        // reachable port (port-forward / load-balancer scenarios).
+        let resolved = resolve_self_address(Some("public.example.com:443"), "internal", 2126, 1);
+        assert_eq!(resolved, "public.example.com:443");
+    }
+
+    // ── parent_zone_storage_path tests ────────────────────────────────
+
+    #[test]
+    fn parent_zone_storage_path_matches_run_daemon_check() {
+        // The join sidecar's "should I bootstrap parent_zone?" gate
+        // MUST point at the same path run_daemon uses to detect
+        // `data_dir_has_root` — otherwise the two sides of the
+        // contract drift and one re-creates state the other expects
+        // to load.
+        let data_dir = std::path::Path::new("/data");
+        assert_eq!(
+            parent_zone_storage_path(data_dir, "root"),
+            PathBuf::from("/data/root/raft"),
+            "parent zone storage path must match the run_daemon \
+             data_dir_has_root probe (<data_dir>/<zone>/raft)",
+        );
+        assert_eq!(
+            parent_zone_storage_path(data_dir, "sharedzone"),
+            PathBuf::from("/data/sharedzone/raft"),
+        );
+    }
+
+    // ── --advertise-addr CLI surface tests ────────────────────────────
+
+    #[test]
+    fn join_cli_accepts_advertise_addr_flag() {
+        // The cross-machine fix flow: operator passes both --hostname
+        // (display label) and --advertise-addr (network identity).
+        let parsed = Args::try_parse_from([
+            "nexusd-cluster",
+            "--hostname",
+            "macos",
+            "--advertise-addr",
+            "100.64.0.21:2126",
+            "join",
+            "1@host:2126",
+            "sharedzone",
+            "/shared",
+        ])
+        .expect("--advertise-addr must parse on join subcommand");
+        assert_eq!(
+            parsed.common.advertise_addr.as_deref(),
+            Some("100.64.0.21:2126"),
+            "advertise_addr global flag must be visible to join",
+        );
+        assert_eq!(
+            parsed.common.hostname.as_deref(),
+            Some("macos"),
+            "hostname stays a separate field, not overloaded",
+        );
+    }
+
+    #[test]
+    fn daemon_cli_accepts_advertise_addr_flag() {
+        // Daemon mode (no subcommand) also accepts the global flag.
+        let parsed = Args::try_parse_from([
+            "nexusd-cluster",
+            "--advertise-addr",
+            "100.64.0.27:2126",
+            "--bootstrap-mode",
+            "static",
+        ])
+        .expect("--advertise-addr must parse on daemon mode");
+        assert_eq!(
+            parsed.common.advertise_addr.as_deref(),
+            Some("100.64.0.27:2126"),
+        );
+    }
 }
