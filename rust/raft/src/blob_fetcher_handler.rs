@@ -124,6 +124,43 @@ impl BlobFetcher for KernelBlobFetcher {
                 );
                 return Ok(bytes);
             }
+
+            // Step 1.5 (PR #98 / #99): federation-peer-mount placeholder
+            // SSOT-symmetric read.  Under the uniform local-first
+            // sys_write contract, writes through a placeholder mount
+            // (route.backend = None + target_zone_id = Some) land on
+            // this voter's kernel-global federation cache addressed by
+            // canonical VFS path — NOT on any ObjectStore backend
+            // routed by `route.backend` or visible to the fan-out in
+            // Step 2.  `Kernel::sys_read` substitutes the federation
+            // cache in the same shape for the writer's own readback;
+            // this peer-served ReadBlob path is the symmetric SSOT for
+            // remote readers fetching back via
+            // `try_remote_fetch(last_writer = this voter)`.  Without
+            // this, founder's `cat` of a joiner-written file 404s
+            // because Step 1 misses on the placeholder + Step 2
+            // doesn't know to look in the federation cache.
+            //
+            // Predicate: federation-peer mount only (backend.is_none()
+            // && target_zone_id.is_some()).  Non-federation routes
+            // (regular mounts, CAS hashes) fall through to Step 2
+            // unchanged.
+            if route.backend.is_none() && route.target_zone_id.is_some() {
+                if let Some(bytes) = self
+                    .kernel
+                    .federation_cache_arc()
+                    .and_then(|b| b.read_content(content_id, &ctx).ok())
+                {
+                    self.kernel.observe_backend_content(
+                        content_id,
+                        bytes.len() as u64,
+                        None,
+                        &route.zone_id,
+                        &ctx,
+                    );
+                    return Ok(bytes);
+                }
+            }
         }
 
         // Step 2: hash-style fan-out across every local backend. CAS
