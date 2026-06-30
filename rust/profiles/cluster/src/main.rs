@@ -58,8 +58,36 @@ struct Args {
 #[derive(Debug, clap::Args)]
 struct CommonArgs {
     /// This node's hostname. Falls back to NEXUS_HOSTNAME, then OS hostname.
+    ///
+    /// Display label only — used by ZoneManager for human-readable
+    /// identification in logs and (when TLS bootstraps cert SANs).
+    /// Peers learn this node's REACHABLE endpoint from
+    /// `--advertise-addr` instead.
+    ///
+    /// Past behaviour overloaded hostname as both display label AND
+    /// advertise identity, which silently broke cross-machine
+    /// federation over Tailscale/VPN overlays where the OS hostname
+    /// does not resolve through the overlay (peers would dial
+    /// `http://win:2126` from a Mac and fail at the DNS layer).
     #[arg(long, env = "NEXUS_HOSTNAME", global = true)]
     hostname: Option<String>,
+
+    /// Address this node advertises to peers as its reachable raft
+    /// endpoint, in `host:port` form.
+    ///
+    /// Used as `StepMessage.sender_address` so peer-map runtime SSOT
+    /// learns where to dial this node back. MUST be reachable from
+    /// every peer that needs to talk to this node — for cross-machine
+    /// federation over an overlay network (Tailscale, WireGuard,
+    /// VPN), this MUST be that overlay's IP, not the OS hostname.
+    ///
+    /// Falls back to `{hostname}:{bind_port}` when unset, which is
+    /// fine for single-node tests but breaks cross-machine setups
+    /// where the OS hostname does not resolve through the overlay.
+    /// Boot logs a warning if the fallback looks unreachable
+    /// (`0.0.0.0:*`, loopback, or non-IP host with peers configured).
+    #[arg(long, env = "NEXUS_ADVERTISE_ADDR", global = true)]
+    advertise_addr: Option<String>,
 
     /// Bind address for the federation gRPC server.
     #[arg(long, env = "NEXUS_BIND_ADDR", default_value = DEFAULT_BIND, global = true)]
@@ -496,13 +524,25 @@ fn open_zone_manager(
 
     // Advertise address — used as `StepMessage.sender_address` so the
     // peer-map runtime SSOT can learn this node's reachable endpoint.
-    // Default: `<hostname>:<bind_port>`.
+    //
+    // SSOT precedence:
+    //   1. `--advertise-addr` / NEXUS_ADVERTISE_ADDR (explicit; required
+    //      for cross-machine federation over overlay networks).
+    //   2. Fallback `<hostname>:<bind_port>` (matches pre-PR behaviour;
+    //      fine for single-node tests, breaks cross-machine federation
+    //      whenever the OS hostname does not resolve through the
+    //      overlay — see warn_if_self_address_unreachable below).
     let bind_port = common
         .bind_addr
         .rsplit_once(':')
         .and_then(|(_, p)| p.parse::<u16>().ok())
         .unwrap_or(2126);
-    let self_address = format!("{hostname}:{bind_port}");
+    let self_address = resolve_self_address(
+        common.advertise_addr.as_deref(),
+        &hostname,
+        bind_port,
+        peer_addrs.len(),
+    );
 
     // Reject "self listed in --peers" early — see
     // `validate_peers_excludes_self` for why this is a hard error
@@ -1413,6 +1453,97 @@ fn resolve_hostname(cli: Option<&str>) -> String {
         return h.to_string();
     }
     gethostname::gethostname().to_string_lossy().into_owned()
+}
+
+/// Resolve the address this node advertises to peers as its raft
+/// endpoint.  Decouples advertise identity from the display-only
+/// `hostname` so cross-machine federation over overlay networks
+/// (Tailscale / VPN) can pin the overlay IP independently.
+///
+/// Precedence:
+///   1. `advertise_cli` — explicit `--advertise-addr` / NEXUS_ADVERTISE_ADDR.
+///      Empty string treated as unset (operator templating slip-through).
+///   2. Fallback `<hostname>:<bind_port>` — matches pre-PR behaviour.
+///      Single-node tests work unchanged; cross-machine setups MUST
+///      pin advertise_cli to the overlay IP.
+///
+/// When the resolved address looks unreachable (`0.0.0.0:*`, loopback,
+/// or non-IP host with peers configured), warn-loud so the operator
+/// sees the misconfiguration in boot logs — the Mac↔Win L1 wedge that
+/// motivated this seam manifested as silent "ConfState install timeout
+/// after JoinZone success" hours later.
+fn resolve_self_address(
+    advertise_cli: Option<&str>,
+    hostname: &str,
+    bind_port: u16,
+    peer_count: usize,
+) -> String {
+    let resolved = match advertise_cli {
+        Some(v) if !v.trim().is_empty() => v.trim().to_string(),
+        _ => format!("{hostname}:{bind_port}"),
+    };
+    warn_if_self_address_unreachable(&resolved, peer_count);
+    resolved
+}
+
+/// Warn-loud when the resolved self_address looks unreachable from
+/// peers. Heuristic, not a hard error — single-node tests legitimately
+/// bind 0.0.0.0 with no peers, and operators may name a fully-qualified
+/// hostname their peers can resolve.
+fn warn_if_self_address_unreachable(self_address: &str, peer_count: usize) {
+    let (host, _port) = match self_address.rsplit_once(':') {
+        Some(parts) => parts,
+        None => {
+            tracing::warn!(
+                target: "nexusd_cluster",
+                self_address = %self_address,
+                "advertise self_address has no :port — peers cannot dial it; \
+                 set --advertise-addr <host>:<port>",
+            );
+            return;
+        }
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host == "0.0.0.0" || host == "::" || host.is_empty() {
+        tracing::warn!(
+            target: "nexusd_cluster",
+            self_address = %self_address,
+            "advertise self_address binds wildcard — peers cannot dial it; \
+             set --advertise-addr to a reachable host:port",
+        );
+        return;
+    }
+    if host == "127.0.0.1" || host == "::1" || host == "localhost" {
+        if peer_count > 0 {
+            tracing::warn!(
+                target: "nexusd_cluster",
+                self_address = %self_address,
+                peer_count,
+                "advertise self_address is loopback while peers are configured — \
+                 cross-machine peers cannot reach this node; set --advertise-addr \
+                 to the reachable network IP",
+            );
+        }
+        return;
+    }
+    // Non-IP host with peers configured — likely the OS hostname,
+    // which does not resolve through Tailscale/VPN overlays.
+    let looks_like_ip = host
+        .split('.')
+        .all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_digit()))
+        && host.split('.').count() == 4;
+    let looks_like_ipv6 = host.contains(':');
+    if !looks_like_ip && !looks_like_ipv6 && peer_count > 0 && !host.contains('.') {
+        tracing::warn!(
+            target: "nexusd_cluster",
+            self_address = %self_address,
+            peer_count,
+            "advertise self_address is a bare hostname; if peers are on a \
+             different machine and reach this node via an overlay (Tailscale, \
+             VPN), set --advertise-addr to the overlay IP — bare hostnames \
+             rarely resolve across overlays",
+        );
+    }
 }
 
 /// Metastore mode resolved from the environment (#4343).
