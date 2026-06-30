@@ -1,7 +1,28 @@
-//! `DistributedCoordinator` slot + `/__sys__/zones/` procfs synthesisers.
+//! Federation kernel-side slot accessors + `/__sys__/zones/` procfs
+//! synthesisers.
+//!
+//! Two §3.B-style kernel slots live here, each a single `Arc<dyn ...>`
+//! the host binary installs at boot:
+//!
+//! * **DistributedCoordinator** (§3.B.1 HAL trait) — the federation
+//!   control-plane impl from the raft crate.
+//! * **federation cache backend** — single `Arc<dyn ObjectStore>` the
+//!   kernel uses to satisfy sys_write / sys_read on federation-peer-
+//!   mount placeholders under the uniform local-first contract.
+//!   Rooted at `<data_dir>/federation-cache/`; addresses via the
+//!   syscall's canonical path so every placeholder mount on this
+//!   node shares ONE on-disk root.  SSOT for federation-bound bytes;
+//!   `OnceLock` because the cache root is fixed at boot.
+//!
+//! Both slots live on [`Kernel`] proper (mod.rs) so the field
+//! declarations sit next to the other Kernel state; only the
+//! accessor methods live in this federation-domain file so
+//! `MountEntry` / `RouteResult` in `core/` stay pristine kernel
+//! primitives per `docs/KERNEL-ARCHITECTURE.md` §3/§4.
 
 use std::sync::Arc;
 
+use crate::abc::object_store::ObjectStore;
 use crate::kernel::{Kernel, StatResult};
 
 impl Kernel {
@@ -26,6 +47,29 @@ impl Kernel {
         &self,
     ) -> Arc<dyn crate::hal::distributed_coordinator::DistributedCoordinator> {
         Arc::clone(&self.distributed_coordinator.read())
+    }
+
+    /// Bind the federation-cache backend.  Idempotent on second-set
+    /// (the slot is [`std::sync::OnceLock`]; subsequent sets silently
+    /// drop their argument).  Called by the host binary's boot path
+    /// after `set_metastore_path`, with a `PathLocalBackend` rooted
+    /// at `<data_dir>/federation-cache/`.
+    ///
+    /// Without this wiring, [`Self::federation_cache_arc`] returns
+    /// `None` and sys_write on a federation-peer-mount placeholder
+    /// surfaces a miss (the syscall layer treats no-cache as
+    /// "operator declined to enable local-first federation writes
+    /// on this node").
+    pub fn set_federation_cache(&self, backend: Arc<dyn ObjectStore>) {
+        let _ = self.federation_cache.set(backend);
+    }
+
+    /// Borrow the federation-cache backend, if any.  Returns `None`
+    /// before [`Self::set_federation_cache`] runs — Rust unit-test
+    /// embedders that never invoke federation skip wiring and the
+    /// federation paths short-circuit cleanly.
+    pub fn federation_cache_arc(&self) -> Option<Arc<dyn ObjectStore>> {
+        self.federation_cache.get().cloned()
     }
 
     /// Federation procfs: synthesise a `StatResult` for paths under the

@@ -601,6 +601,22 @@ pub struct Kernel {
     // shape as the PeerBlobClient slot above.
     pub(crate) distributed_coordinator:
         parking_lot::RwLock<Arc<dyn crate::hal::distributed_coordinator::DistributedCoordinator>>,
+    /// Federation-cache backend slot — single `Arc<dyn ObjectStore>`
+    /// the kernel uses to satisfy sys_write / sys_read on federation-
+    /// peer-mount placeholders under the uniform local-first contract.
+    /// Wired at boot by the host binary at `<data_dir>/federation-
+    /// cache/`; addressing is via the syscall's canonical path so
+    /// every placeholder mount on this node shares ONE on-disk root
+    /// (no per-mount cache namespace duplication).
+    ///
+    /// `OnceLock` because the cache root is fixed at boot; rebinding
+    /// would orphan accumulated bytes.  Accessors live in
+    /// `kernel/src/federation/cache_wiring.rs` (federation-domain
+    /// file, mirroring `coordinator_wiring.rs`).  `None` until the
+    /// host binary wires it; sys_write on a placeholder mount with
+    /// no cache returns a clean miss rather than panicking.
+    pub(crate) federation_cache:
+        std::sync::OnceLock<Arc<dyn crate::abc::object_store::ObjectStore>>,
     // No `chunk_fetcher` field: `Kernel::peer_client` is the SSOT for
     // the cross-node blob client.  `Kernel::sys_setattr` constructs a
     // fresh `GrpcChunkFetcher` per `DT_MOUNT` against the just-cloned
@@ -725,6 +741,7 @@ impl Kernel {
             distributed_coordinator: parking_lot::RwLock::new(
                 crate::hal::distributed_coordinator::NoopDistributedCoordinator::arc(),
             ),
+            federation_cache: std::sync::OnceLock::new(),
             pending_blob_fetcher_slot: parking_lot::Mutex::new(None),
             permission_lease_cache: PermissionLeaseCache::new(
                 std::time::Duration::from_secs(30),

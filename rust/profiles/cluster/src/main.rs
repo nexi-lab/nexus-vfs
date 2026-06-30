@@ -597,6 +597,39 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     // overrides (see the arg docs for the env-name rationale and the
     // `ephemeral` escape hatch).
     wire_durable_metastore(&kernel, common.metastore_path.as_deref(), &common.data_dir)?;
+
+    // Federation cache: kernel-global PathLocalBackend rooted at
+    // `<data_dir>/federation-cache/`.  Satisfies the uniform local-
+    // first sys_write contract — cross-mount writes to federation-
+    // peer-mount placeholders land on THIS voter's host fs here,
+    // addressed by canonical VFS path.  Path-addressed so every
+    // placeholder mount on this node shares ONE on-disk root; the
+    // metastore.put done by sys_write stamps `last_writer_address =
+    // self`, and remote readers fetch back via the last-writer-aware
+    // sys_read fallback.  Single Arc → kernel slot via
+    // `Kernel::set_federation_cache` (see
+    // `kernel/src/federation/coordinator_wiring.rs`).
+    let federation_cache_root = common.data_dir.join("federation-cache");
+    std::fs::create_dir_all(&federation_cache_root).with_context(|| {
+        format!(
+            "create federation cache dir {}",
+            federation_cache_root.display()
+        )
+    })?;
+    let federation_cache: Arc<dyn ObjectStore> = Arc::new(
+        PathLocalBackend::new(&federation_cache_root, /* fsync */ false).with_context(|| {
+            format!(
+                "PathLocalBackend init at {}",
+                federation_cache_root.display()
+            )
+        })?,
+    );
+    kernel.set_federation_cache(Arc::clone(&federation_cache));
+    tracing::info!(
+        federation_cache_root = %federation_cache_root.display(),
+        "federation cache wired",
+    );
+
     let root_fs = common.root_fs_path();
     std::fs::create_dir_all(&root_fs)
         .with_context(|| format!("create cluster root mount dir {}", root_fs.display()))?;
