@@ -95,12 +95,8 @@ fn compute_trusted_keys(local_dir: Option<&Path>) -> Vec<VerifyingKey> {
         .collect();
 
     if let Some(dir) = local_dir {
-        let extra = load_local_trust_dir(dir).unwrap_or_else(|e| {
-            panic!(
-                "{LOCAL_TRUSTED_KEYS_ENV}={} unusable: {e}",
-                dir.display()
-            )
-        });
+        let extra = load_local_trust_dir(dir)
+            .unwrap_or_else(|e| panic!("{LOCAL_TRUSTED_KEYS_ENV}={} unusable: {e}", dir.display()));
         if extra.is_empty() {
             tracing::warn!(
                 target: "kernel.trust",
@@ -129,8 +125,7 @@ fn compute_trusted_keys(local_dir: Option<&Path>) -> Vec<VerifyingKey> {
 /// Non-`*.pub` entries are ignored. Directory MUST exist (non-existent
 /// dir → `Err`).
 fn load_local_trust_dir(dir: &Path) -> Result<Vec<VerifyingKey>, String> {
-    let entries =
-        std::fs::read_dir(dir).map_err(|e| format!("read_dir {}: {e}", dir.display()))?;
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("read_dir {}: {e}", dir.display()))?;
     let mut paths: Vec<PathBuf> = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|e| format!("read_dir entry: {e}"))?;
@@ -144,10 +139,9 @@ fn load_local_trust_dir(dir: &Path) -> Result<Vec<VerifyingKey>, String> {
     paths.sort();
     let mut keys = Vec::with_capacity(paths.len());
     for path in paths {
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| format!("read {}: {e}", path.display()))?;
-        let key = parse_pubkey_file(&text)
-            .map_err(|e| format!("parse {}: {e}", path.display()))?;
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let key = parse_pubkey_file(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
         keys.push(key);
     }
     Ok(keys)
