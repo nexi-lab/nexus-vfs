@@ -51,19 +51,106 @@ const TRUSTED_KEY_FILES: &[&[u8]] = &[
     )),
 ];
 
+/// Environment variable that, when set, points at a directory of
+/// additional `*.pub` files to extend the runtime trust set with.
+///
+/// DEV ONLY — production daemons MUST NOT set this. The seam exists
+/// so a local dev can sign plugins with their own key without editing
+/// the kernel, bypassing the broken vault-dogfood signing pipeline.
+/// When the env var is unset (the default) `trusted_keys()` returns
+/// only the compile-time embedded set.
+///
+/// Contract: if set, the directory MUST exist and every `*.pub` inside
+/// it MUST parse — the daemon panics at startup on either failure.
+/// Fail-loud is intentional: a typoed path or malformed key file would
+/// otherwise surface minutes later as a mysterious signature-verify
+/// failure.
+const LOCAL_TRUSTED_KEYS_ENV: &str = "NEXUS_LOCAL_TRUSTED_KEYS_DIR";
+
 fn trusted_keys() -> &'static [VerifyingKey] {
     static KEYS: OnceLock<Vec<VerifyingKey>> = OnceLock::new();
-    KEYS.get_or_init(|| {
-        TRUSTED_KEY_FILES
-            .iter()
-            .map(|raw| {
-                let text = std::str::from_utf8(raw)
-                    .expect("trusted_keys/*.pub must be UTF-8 (embedded at compile time)");
-                parse_pubkey_file(text)
-                    .expect("trusted_keys/*.pub must parse (embedded at compile time)")
-            })
-            .collect()
-    })
+    KEYS.get_or_init(|| compute_trusted_keys(local_trust_dir_from_env().as_deref()))
+}
+
+fn local_trust_dir_from_env() -> Option<PathBuf> {
+    std::env::var_os(LOCAL_TRUSTED_KEYS_ENV).map(PathBuf::from)
+}
+
+/// Compose the compile-time trust roots with any runtime ones from
+/// `local_dir`. Pure (no env, no `OnceLock`) so unit tests can drive
+/// it without process-global state.
+///
+/// Panics if any compiled key fails to parse (kernel build is broken)
+/// or if `local_dir` is set but unreadable / contains a malformed
+/// `*.pub`.
+fn compute_trusted_keys(local_dir: Option<&Path>) -> Vec<VerifyingKey> {
+    let mut keys: Vec<VerifyingKey> = TRUSTED_KEY_FILES
+        .iter()
+        .map(|raw| {
+            let text = std::str::from_utf8(raw)
+                .expect("trusted_keys/*.pub must be UTF-8 (embedded at compile time)");
+            parse_pubkey_file(text)
+                .expect("trusted_keys/*.pub must parse (embedded at compile time)")
+        })
+        .collect();
+
+    if let Some(dir) = local_dir {
+        let extra = load_local_trust_dir(dir).unwrap_or_else(|e| {
+            panic!(
+                "{LOCAL_TRUSTED_KEYS_ENV}={} unusable: {e}",
+                dir.display()
+            )
+        });
+        if extra.is_empty() {
+            tracing::warn!(
+                target: "kernel.trust",
+                dir = %dir.display(),
+                "DEV-ONLY: {} set but no *.pub files found in directory",
+                LOCAL_TRUSTED_KEYS_ENV,
+            );
+        } else {
+            tracing::warn!(
+                target: "kernel.trust",
+                count = extra.len(),
+                dir = %dir.display(),
+                "DEV-ONLY: loaded {} additional trust root(s) from {}",
+                extra.len(),
+                LOCAL_TRUSTED_KEYS_ENV,
+            );
+            keys.extend(extra);
+        }
+    }
+
+    keys
+}
+
+/// Read every `*.pub` file in `dir`, parse via `parse_pubkey_file`, and
+/// return the resulting `VerifyingKey`s in lexicographic filename order.
+/// Non-`*.pub` entries are ignored. Directory MUST exist (non-existent
+/// dir → `Err`).
+fn load_local_trust_dir(dir: &Path) -> Result<Vec<VerifyingKey>, String> {
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| format!("read_dir {}: {e}", dir.display()))?;
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read_dir entry: {e}"))?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("pub") {
+            paths.push(path);
+        }
+    }
+    // Stable order across platforms so signature-verify behavior is
+    // reproducible regardless of filesystem listing order.
+    paths.sort();
+    let mut keys = Vec::with_capacity(paths.len());
+    for path in paths {
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        let key = parse_pubkey_file(&text)
+            .map_err(|e| format!("parse {}: {e}", path.display()))?;
+        keys.push(key);
+    }
+    Ok(keys)
 }
 
 /// Parse a `trusted_keys/*.pub` file: skip `#`-prefixed and blank lines,
