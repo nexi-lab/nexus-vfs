@@ -1247,6 +1247,64 @@ async fn run_join(
         .map_err(|e| anyhow::anyhow!("--peer-addr parse '{}': {}", peer_addr, e))?;
     let peer_addrs = vec![peer];
 
+    // Ensure the local parent zone exists BEFORE writing the cross-zone
+    // DT_MOUNT entry into it.  `zm.mount_async(parent_zone, ...)` below
+    // proposes through that zone's metastore; without the zone loaded
+    // the propose has no consensus group to land in and the mount
+    // entry is silently lost — the joiner daemon then comes up with
+    // sharedzone connected but no namespace stitching at /shared, and
+    // wire_mount warns "root zone not loaded — distributed locks NOT
+    // installed".
+    //
+    // `parent_zone` defaults to "root", which `run_daemon` would
+    // bootstrap on every startup via the same helper. The join CLI
+    // sidecar runs BEFORE the daemon ever boots on a fresh joiner, so
+    // the daemon's later bootstrap finds an already-populated data dir
+    // and resumes — but the resume only loads zones that EXIST in the
+    // data dir. If `run_join` writes the sharedzone first and then
+    // tries to mount under root without root having been bootstrapped,
+    // the daemon resume picks up sharedzone only and the operator
+    // sees an empty FUSE mount.
+    //
+    // Bootstrap parent_zone as SOLO (empty peers — root is per-node
+    // by design, see distributed_coordinator.rs:686 contract). Idempotent:
+    // `bootstrap_or_join_zone` Branch 1 resumes when ConfState is
+    // already on disk, so re-running this sidecar against an existing
+    // data dir is a no-op for the parent zone.
+    let parent_zone_dir = parent_zone_storage_path(&common.data_dir, parent_zone);
+    let parent_zone_loaded = parent_zone_dir.exists();
+    if !parent_zone_loaded {
+        tracing::info!(
+            parent_zone = %parent_zone,
+            data_dir = %common.data_dir.display(),
+            "join sidecar: parent zone not in data dir — bootstrapping as SOLO",
+        );
+        let zm_for_parent = zm.clone();
+        let self_addr_for_parent = self_address.clone();
+        let parent_zone_for_bootstrap = parent_zone.to_string();
+        tokio::task::spawn_blocking(move || {
+            nexus_raft::distributed_coordinator::bootstrap_or_join_zone(
+                zm_for_parent.as_ref(),
+                &parent_zone_for_bootstrap,
+                node_id,
+                &self_addr_for_parent,
+                /* peers */ &[],
+                /* bootstrap_new */ false,
+                /* max_attempts  */ None,
+                /* as_learner */ false,
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("join sidecar parent-zone bootstrap task panicked: {}", e))?
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "join sidecar bootstrap_or_join_zone(parent={}): {}",
+                parent_zone,
+                e
+            )
+        })?;
+    }
+
     let zm_for_join = zm.clone();
     let self_addr_for_join = self_address.clone();
     let zone_id_for_join = remote_zone_id.to_string();
@@ -1446,6 +1504,15 @@ fn install_tracing() -> tracing_appender::non_blocking::WorkerGuard {
         .with_writer(non_blocking)
         .init();
     guard
+}
+
+/// Filesystem path the daemon (and `bootstrap_or_join_zone`) uses to
+/// detect whether `<zone_id>` has persisted raft state in `data_dir`.
+/// Mirrors the `data_dir_has_root` check in `run_daemon` so the join
+/// sidecar's "should I bootstrap this parent zone?" decision aligns
+/// with the daemon's later "should I resume from disk?" check.
+fn parent_zone_storage_path(data_dir: &std::path::Path, zone_id: &str) -> PathBuf {
+    data_dir.join(zone_id).join("raft")
 }
 
 fn resolve_hostname(cli: Option<&str>) -> String {
