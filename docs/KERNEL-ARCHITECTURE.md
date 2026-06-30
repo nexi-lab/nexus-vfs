@@ -1303,6 +1303,34 @@ Plugin operations are exposed through the gRPC `Call` RPC:
 The `nexusd-cluster` binary accepts `--plugin-dir` to auto-load all `.so`/`.dylib`
 files from a directory at startup.
 
+### 10.6 Plugin Signing & Trust Roots
+
+Every plugin loaded by the kernel must be signed by a key the kernel
+trusts. The trust set is composed at startup from two layers:
+
+| Layer | Source | Purpose |
+|-------|--------|---------|
+| Compile-time | `rust/kernel/trusted_keys/*.pub` embedded via `include_bytes!` in `kernel/plugins/loader.rs` | Production signing roots shipped with the daemon |
+| Runtime (optional) | `*.pub` files in `$NEXUS_LOCAL_TRUSTED_KEYS_DIR` | Local dev signing — extends the trust set without editing kernel sources |
+
+The compile-time set is pinned by `.github/workflows/trusted-keys-allowlist.yml`:
+the workflow's `EXPECTED` list is the SSOT for which keys ship with
+the kernel. Adding or removing a compile-time trust root requires
+editing all three of `trusted_keys/`, `loader.rs`, and the workflow
+allowlist in the same PR — the divergence-check fails CI otherwise.
+
+`$NEXUS_LOCAL_TRUSTED_KEYS_DIR` is **DEV ONLY** — production daemons
+MUST NOT set it. When set, the directory must exist and every `*.pub`
+inside it must parse, or the daemon panics at startup (fail-loud: a
+typoed path would otherwise surface minutes later as a signature-verify
+failure). Each load emits a `target: kernel.trust` warn line so the
+extended trust set is visible to log scrapers and operators.
+
+The runtime seam replaces the older "edit `loader.rs` to add a local
+key" workaround that bypassed compile-time pinning. The `*.pub`
+directory and `loader.rs` reference set are now `.gitignore` /
+CI-allowlisted, so the workaround can no longer land accidentally.
+
 ---
 
 ## 11. Cross-References

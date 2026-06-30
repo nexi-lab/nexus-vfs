@@ -51,19 +51,100 @@ const TRUSTED_KEY_FILES: &[&[u8]] = &[
     )),
 ];
 
+/// Environment variable that, when set, points at a directory of
+/// additional `*.pub` files to extend the runtime trust set with.
+///
+/// DEV ONLY — production daemons MUST NOT set this. The seam exists
+/// so a local dev can sign plugins with their own key without editing
+/// the kernel, bypassing the broken vault-dogfood signing pipeline.
+/// When the env var is unset (the default) `trusted_keys()` returns
+/// only the compile-time embedded set.
+///
+/// Contract: if set, the directory MUST exist and every `*.pub` inside
+/// it MUST parse — the daemon panics at startup on either failure.
+/// Fail-loud is intentional: a typoed path or malformed key file would
+/// otherwise surface minutes later as a mysterious signature-verify
+/// failure.
+const LOCAL_TRUSTED_KEYS_ENV: &str = "NEXUS_LOCAL_TRUSTED_KEYS_DIR";
+
 fn trusted_keys() -> &'static [VerifyingKey] {
     static KEYS: OnceLock<Vec<VerifyingKey>> = OnceLock::new();
-    KEYS.get_or_init(|| {
-        TRUSTED_KEY_FILES
-            .iter()
-            .map(|raw| {
-                let text = std::str::from_utf8(raw)
-                    .expect("trusted_keys/*.pub must be UTF-8 (embedded at compile time)");
-                parse_pubkey_file(text)
-                    .expect("trusted_keys/*.pub must parse (embedded at compile time)")
-            })
-            .collect()
-    })
+    KEYS.get_or_init(|| compute_trusted_keys(local_trust_dir_from_env().as_deref()))
+}
+
+fn local_trust_dir_from_env() -> Option<PathBuf> {
+    std::env::var_os(LOCAL_TRUSTED_KEYS_ENV).map(PathBuf::from)
+}
+
+/// Compose the compile-time trust roots with any runtime ones from
+/// `local_dir`. Pure (no env, no `OnceLock`) so unit tests can drive
+/// it without process-global state.
+///
+/// Panics if any compiled key fails to parse (kernel build is broken)
+/// or if `local_dir` is set but unreadable / contains a malformed
+/// `*.pub`.
+fn compute_trusted_keys(local_dir: Option<&Path>) -> Vec<VerifyingKey> {
+    let mut keys: Vec<VerifyingKey> = TRUSTED_KEY_FILES
+        .iter()
+        .map(|raw| {
+            let text = std::str::from_utf8(raw)
+                .expect("trusted_keys/*.pub must be UTF-8 (embedded at compile time)");
+            parse_pubkey_file(text)
+                .expect("trusted_keys/*.pub must parse (embedded at compile time)")
+        })
+        .collect();
+
+    if let Some(dir) = local_dir {
+        let extra = load_local_trust_dir(dir)
+            .unwrap_or_else(|e| panic!("{LOCAL_TRUSTED_KEYS_ENV}={} unusable: {e}", dir.display()));
+        if extra.is_empty() {
+            tracing::warn!(
+                target: "kernel.trust",
+                dir = %dir.display(),
+                "DEV-ONLY: {} set but no *.pub files found in directory",
+                LOCAL_TRUSTED_KEYS_ENV,
+            );
+        } else {
+            tracing::warn!(
+                target: "kernel.trust",
+                count = extra.len(),
+                dir = %dir.display(),
+                "DEV-ONLY: loaded {} additional trust root(s) from {}",
+                extra.len(),
+                LOCAL_TRUSTED_KEYS_ENV,
+            );
+            keys.extend(extra);
+        }
+    }
+
+    keys
+}
+
+/// Read every `*.pub` file in `dir`, parse via `parse_pubkey_file`, and
+/// return the resulting `VerifyingKey`s in lexicographic filename order.
+/// Non-`*.pub` entries are ignored. Directory MUST exist (non-existent
+/// dir → `Err`).
+fn load_local_trust_dir(dir: &Path) -> Result<Vec<VerifyingKey>, String> {
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("read_dir {}: {e}", dir.display()))?;
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read_dir entry: {e}"))?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("pub") {
+            paths.push(path);
+        }
+    }
+    // Stable order across platforms so signature-verify behavior is
+    // reproducible regardless of filesystem listing order.
+    paths.sort();
+    let mut keys = Vec::with_capacity(paths.len());
+    for path in paths {
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let key = parse_pubkey_file(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
+        keys.push(key);
+    }
+    Ok(keys)
 }
 
 /// Parse a `trusted_keys/*.pub` file: skip `#`-prefixed and blank lines,
@@ -1166,6 +1247,142 @@ mod tests {
             err.contains("signature missing"),
             "missing-sig error must be loud: {err}"
         );
+    }
+
+    // ── runtime trust dir tests ────────────────────────────────────
+
+    fn write_pubkey_file(dir: &Path, name: &str, seed: u8) -> [u8; 32] {
+        use ed25519_dalek::SigningKey;
+        let pub_bytes = SigningKey::from_bytes(&[seed; 32])
+            .verifying_key()
+            .to_bytes();
+        let b64 = BASE64.encode(pub_bytes);
+        std::fs::write(dir.join(name), format!("{b64}\n")).unwrap();
+        pub_bytes
+    }
+
+    #[test]
+    fn load_local_trust_dir_reads_pub_files_in_sorted_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Write in non-sorted creation order; loader must sort by name.
+        let pub_b = write_pubkey_file(tmp.path(), "b.pub", 9);
+        let pub_a = write_pubkey_file(tmp.path(), "a.pub", 11);
+        let pub_c = write_pubkey_file(tmp.path(), "c.pub", 13);
+
+        let keys = load_local_trust_dir(tmp.path()).expect("must load");
+        assert_eq!(keys.len(), 3);
+        assert_eq!(keys[0].to_bytes(), pub_a);
+        assert_eq!(keys[1].to_bytes(), pub_b);
+        assert_eq!(keys[2].to_bytes(), pub_c);
+    }
+
+    #[test]
+    fn load_local_trust_dir_ignores_non_pub_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pubkey_file(tmp.path(), "real.pub", 5);
+        std::fs::write(tmp.path().join("notes.txt"), b"not a key").unwrap();
+        std::fs::write(tmp.path().join("garbage"), b"no extension at all").unwrap();
+        std::fs::write(tmp.path().join("foo.pubkey"), b"wrong suffix").unwrap();
+
+        let keys = load_local_trust_dir(tmp.path()).expect("must load");
+        assert_eq!(keys.len(), 1, "only real.pub should be loaded");
+    }
+
+    #[test]
+    fn load_local_trust_dir_empty_dir_returns_empty_vec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let keys = load_local_trust_dir(tmp.path()).expect("must load");
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn load_local_trust_dir_nonexistent_returns_err() {
+        let bogus = Path::new("/this/path/should/not/exist/anywhere");
+        let err = load_local_trust_dir(bogus).unwrap_err();
+        assert!(
+            err.contains("read_dir"),
+            "non-existent dir error must mention read_dir: {err}"
+        );
+    }
+
+    #[test]
+    fn load_local_trust_dir_malformed_pub_returns_err() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("broken.pub"), b"not-base64-at-all!@#").unwrap();
+
+        let err = load_local_trust_dir(tmp.path()).unwrap_err();
+        assert!(
+            err.contains("parse") && err.contains("broken.pub"),
+            "malformed pub error must mention parse + filename: {err}"
+        );
+    }
+
+    #[test]
+    fn compute_trusted_keys_none_returns_only_compiled_keys() {
+        let keys = compute_trusted_keys(None);
+        assert_eq!(
+            keys.len(),
+            TRUSTED_KEY_FILES.len(),
+            "no runtime dir means exactly the compiled set"
+        );
+    }
+
+    #[test]
+    fn compute_trusted_keys_some_appends_runtime_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pub_x = write_pubkey_file(tmp.path(), "dev.pub", 19);
+        write_pubkey_file(tmp.path(), "dev2.pub", 21);
+
+        let keys = compute_trusted_keys(Some(tmp.path()));
+        assert_eq!(keys.len(), TRUSTED_KEY_FILES.len() + 2);
+        // The compiled keys come first; the dev keys are appended.
+        let appended: Vec<[u8; 32]> = keys
+            .iter()
+            .skip(TRUSTED_KEY_FILES.len())
+            .map(|k| k.to_bytes())
+            .collect();
+        assert!(
+            appended.contains(&pub_x),
+            "dev.pub must be present in the runtime-appended slice"
+        );
+    }
+
+    #[test]
+    fn compute_trusted_keys_empty_runtime_dir_returns_only_compiled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let keys = compute_trusted_keys(Some(tmp.path()));
+        assert_eq!(
+            keys.len(),
+            TRUSTED_KEY_FILES.len(),
+            "empty runtime dir does not extend the trust set"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "unusable")]
+    fn compute_trusted_keys_panics_on_unreadable_dir() {
+        let bogus = Path::new("/this/runtime/trust/dir/does/not/exist");
+        // Should panic fail-loud — operator set the env to a typoed path.
+        let _ = compute_trusted_keys(Some(bogus));
+    }
+
+    #[test]
+    fn local_trust_dir_from_env_round_trip() {
+        // SAFETY: temporarily setting then unsetting the env var. This is
+        // the only test that touches the real process env var; running
+        // serially under `cargo test` is fine.
+        let saved = std::env::var(LOCAL_TRUSTED_KEYS_ENV).ok();
+        std::env::set_var(LOCAL_TRUSTED_KEYS_ENV, "/some/dev/dir");
+        assert_eq!(
+            local_trust_dir_from_env(),
+            Some(PathBuf::from("/some/dev/dir"))
+        );
+        std::env::remove_var(LOCAL_TRUSTED_KEYS_ENV);
+        assert_eq!(local_trust_dir_from_env(), None);
+        // Restore caller env if it had something set.
+        if let Some(v) = saved {
+            std::env::set_var(LOCAL_TRUSTED_KEYS_ENV, v);
+        }
     }
 
     // ── grpc_services symbol parsing ───────────────────────────────

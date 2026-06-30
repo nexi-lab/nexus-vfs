@@ -1,0 +1,12 @@
+# Untracked *.pub files (e.g. local dev keys) are LOCAL ONLY by convention.
+# This allowlist makes `git add -A` skip untracked .pub files — it does NOT
+# protect already-tracked files. The SSOT for the committed trust roots is
+# pinned by .github/workflows/trusted-keys-allowlist.yml.
+#
+# For local dev signing, drop *.pub files into
+# $NEXUS_LOCAL_TRUSTED_KEYS_DIR (default convention: ~/.nexus/trusted_keys/)
+# and start the daemon with that env var set — see loader.rs for the
+# runtime-trust-dir contract.
+*.pub
+!nexus-team.pub
+!kernel-dogfood-v1.pub
