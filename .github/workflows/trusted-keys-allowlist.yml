@@ -1,0 +1,80 @@
+name: Trusted Keys Allowlist
+
+# Pin the compile-time trust roots so an accidental commit cannot
+# silently add (or remove) a key the kernel will trust. The allowlist
+# below IS the SSOT — adding or removing a trust root requires editing
+# this workflow in the same PR, which makes the change review-visible.
+#
+# Local dev signing keys belong in the runtime trust dir
+# ($NEXUS_LOCAL_TRUSTED_KEYS_DIR) — see
+# rust/kernel/src/kernel/plugins/loader.rs and the trusted_keys/
+# .gitignore allowlist.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  trusted-keys-allowlist:
+    name: Compile-time trust roots match SSOT
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: trusted_keys/ directory matches allowlist
+        run: |
+          set -euo pipefail
+
+          # ── SSOT — editing this list requires updating both the
+          #         trusted_keys/ directory AND loader.rs in the same PR.
+          EXPECTED=$(printf '%s\n' \
+            kernel-dogfood-v1.pub \
+            nexus-team.pub \
+            | sort)
+
+          ACTUAL=$(cd rust/kernel/trusted_keys && ls *.pub 2>/dev/null | sort)
+
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::trusted_keys/ contents diverged from this workflow's allowlist."
+            echo ""
+            echo "Expected (workflow SSOT):"
+            echo "$EXPECTED" | sed 's/^/  /'
+            echo ""
+            echo "Actual (rust/kernel/trusted_keys/):"
+            echo "$ACTUAL" | sed 's/^/  /'
+            echo ""
+            echo "To add or remove a trust root, edit BOTH this workflow's"
+            echo "EXPECTED list AND the trusted_keys/ directory in the same PR."
+            echo "Local dev keys do NOT belong in trusted_keys/ — use the"
+            echo "runtime \$NEXUS_LOCAL_TRUSTED_KEYS_DIR seam in loader.rs."
+            exit 1
+          fi
+
+      - name: loader.rs include_bytes! references match allowlist
+        run: |
+          set -euo pipefail
+
+          EXPECTED=$(printf '%s\n' \
+            trusted_keys/kernel-dogfood-v1.pub \
+            trusted_keys/nexus-team.pub \
+            | sort)
+
+          ACTUAL=$(grep -oE 'trusted_keys/[A-Za-z0-9._-]+\.pub' \
+            rust/kernel/src/kernel/plugins/loader.rs \
+            | sort -u)
+
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::loader.rs trusted_keys/ references diverged from allowlist."
+            echo ""
+            echo "Expected (workflow SSOT):"
+            echo "$EXPECTED" | sed 's/^/  /'
+            echo ""
+            echo "Actual (include_bytes! refs in loader.rs):"
+            echo "$ACTUAL" | sed 's/^/  /'
+            echo ""
+            echo "loader.rs must not include_bytes! a trust root that isn't"
+            echo "in the SSOT. Local dev keys do NOT belong in this list —"
+            echo "use the runtime \$NEXUS_LOCAL_TRUSTED_KEYS_DIR seam instead."
+            exit 1
+          fi
