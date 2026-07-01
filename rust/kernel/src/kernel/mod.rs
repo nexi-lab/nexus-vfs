@@ -1144,15 +1144,19 @@ impl Kernel {
     ///   path's cross-node gate exists to avoid re-proposing metadata
     ///   the local caller already wrote; that concern doesn't apply
     ///   to backend directory entries.
-    /// * **`size = 0` placeholder** — accurate size would require a
-    ///   per-entry `backend.stat`, turning O(n) readdir into O(n) stat
-    ///   calls.  Same trade the read-path helper's doc comment accepts
-    ///   ("stale size acceptable for cc-tasks-share").  `vfs_stat`
-    ///   returns the placeholder size until the first `sys_read` on
-    ///   the path repairs it through the existing peer-fetch → observe
-    ///   cycle.  Byte-exact READ correctness does NOT depend on size —
-    ///   `backend.read_content` returns actual bytes regardless of
-    ///   what metastore says the size is.
+    /// * **`size` MUST reflect the actual file size** — POSIX
+    ///   `read()` / `cat` short-circuit when `stat.st_size == 0`
+    ///   (nothing to read), so stamping `size = 0` on a DT_REG row
+    ///   with real bytes causes the FUSE / gRPC read surface to
+    ///   return empty bytes even though `backend.read_content`
+    ///   would happily serve them.  For DT_REG entries the caller
+    ///   MUST pass the size from `backend.stat` (or an equivalent
+    ///   source); for DT_DIR entries `0` is semantically correct
+    ///   (directories have no byte content to size).  The wire-up
+    ///   in `sys_readdir` calls `backend.stat` on each DT_REG entry
+    ///   before observation and SKIPS observation if the stat fails
+    ///   — leaves the entry to the existing peer-fetch / federation
+    ///   dispatch fallback rather than seeding a bad row.
     /// * **`content_id` MUST come from the caller** — see the parameter
     ///   docs below.  Stamping the wrong content_id turns the observed
     ///   row into a dead-end: writer's own `sys_read` metastore-hit path
@@ -1181,6 +1185,7 @@ impl Kernel {
         path: &str,
         entry_type: u8,
         zone_id: &str,
+        size: u64,
         content_id: Option<String>,
     ) {
         // Idempotency: skip propose if a metadata row already covers
@@ -1208,7 +1213,7 @@ impl Kernel {
             path,
             zone_id,
             entry_type,
-            /* size */ 0,
+            size,
             content_id,
             /* gen */ 0,
             /* version */ 1,
