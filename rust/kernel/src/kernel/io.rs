@@ -239,7 +239,26 @@ impl Kernel {
                     // so the next cross-node read takes the fast
                     // `try_remote_fetch` path with `last_writer_address`
                     // pointing here.
-                    self.observe_backend_content(path, size, None, &route.zone_id, ctx);
+                    // Stamp `content_id = Some(backend_path)` so subsequent
+                    // metastore-hit reads (writer's own read, or peer-served
+                    // `try_remote_fetch` reads that route to this node)
+                    // successfully round-trip through `backend.read_content`
+                    // instead of dead-ending in the `content_id_opt.is_none()`
+                    // → try_remote_fetch → self → FileNotFound loop.  This is
+                    // the same content_id semantics `sys_read`'s
+                    // metastore-miss branch already uses at line ~231
+                    // (`b.read_content(&route.backend_path, ctx)`); stamping
+                    // it into metastore makes the warm path (metastore hit →
+                    // backend read via content_id) SSOT-symmetric with the
+                    // cold path (metastore miss → backend read via
+                    // backend_path).
+                    self.observe_backend_content(
+                        path,
+                        size,
+                        Some(route.backend_path.clone()),
+                        &route.zone_id,
+                        ctx,
+                    );
                     return Ok(SysReadResult {
                         data: Some(data),
                         post_hook_needed: self.read_hook_count.load(Ordering::Relaxed) > 0,
