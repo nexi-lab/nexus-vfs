@@ -102,6 +102,25 @@ struct CommonArgs {
     )]
     data_dir: PathBuf,
 
+    /// Node-bound identity directory holding `identity.json`
+    /// (schema-versioned peer address book).
+    ///
+    /// Unset (default): resolved via
+    /// `nexus_raft::identity::default_identity_dir()` to the
+    /// platform-native user-data location (`%LOCALAPPDATA%\Nexus`,
+    /// `~/Library/Application Support/Nexus`, `$XDG_DATA_HOME/nexus`).
+    /// Set explicitly for Docker E2E tests that need to redirect the
+    /// identity file to a fixture path, or operators who want the
+    /// identity under a specific management scope.  Persists ONLY the
+    /// transport peer list — `node_id` stays at `<data_dir>/.node_id`
+    /// with its rotate-on-wipe lifecycle, per the raft heartbeat
+    /// invariant documented in `docs/federation-architecture.md`
+    /// § 6.3.1.  SHOULD live outside `--data-dir` so cache-loss cleanup
+    /// does not remove it — boot warns if `identity_dir` is a child of
+    /// `data_dir`.
+    #[arg(long, env = "NEXUS_IDENTITY_DIR", global = true)]
+    identity_dir: Option<PathBuf>,
+
     /// Durable global metastore (redb) — the kernel's VFS namespace.
     /// File registrations survive restarts only if this lives on
     /// persistent storage. Defaults to `<data_dir>/metastore.redb`;
@@ -511,12 +530,50 @@ fn open_zone_manager(
         })
     };
 
-    // Parse `--peers` into structured `NodeAddress` entries — address
-    // book only.  ZoneManager seeds its transport peer map from this;
-    // ConfState is independent (mutated only by ConfChange via
-    // JoinZone driven by `bootstrap_or_join_zone`).
-    let peer_addrs: Vec<NodeAddress> = NodeAddress::parse_peer_list(&common.peers, use_tls)
+    // Parse `--peers` into structured `NodeAddress` entries.  Merge
+    // with the node-bound `identity.json` peer list so a cold-boot
+    // after `<data_dir>` cleanup does not need operator re-specifying
+    // `--peers`.  Identity's `peers[]` is a *transport seed*, NOT a
+    // `ConfState` shadow (ConfState is independent, mutated only by
+    // ConfChange via JoinZone in `bootstrap_or_join_zone`).
+    //
+    // See `docs/federation-architecture.md` § 6.3.1 — the split scopes
+    // identity narrowly to the address book; `node_id` intentionally
+    // stays at `<data_dir>/.node_id` under the rotate-on-wipe raft
+    // heartbeat invariant.
+    let cli_peer_addrs: Vec<NodeAddress> = NodeAddress::parse_peer_list(&common.peers, use_tls)
         .map_err(|e| anyhow::anyhow!("--peers/NEXUS_PEERS parse: {}", e))?;
+    let cli_peer_strs: Vec<String> = cli_peer_addrs
+        .iter()
+        .map(NodeAddress::to_raft_peer_str)
+        .collect();
+
+    let identity_dir = common
+        .identity_dir
+        .clone()
+        .unwrap_or_else(nexus_raft::identity::default_identity_dir);
+    if identity_dir.starts_with(&common.data_dir) {
+        tracing::warn!(
+            identity_dir = %identity_dir.display(),
+            data_dir = %common.data_dir.display(),
+            "identity_dir lives under data_dir — cache-loss cleaners \
+             that remove data_dir will also destroy identity; consider \
+             --identity-dir <outside-data-dir>",
+        );
+    }
+    let identity_loaded = nexus_raft::identity::load(&identity_dir)
+        .map_err(|e| anyhow::anyhow!("identity load: {}", e))?;
+    let identity_persisted =
+        nexus_raft::identity::persist_peers(&identity_dir, &identity_loaded, &cli_peer_strs)
+            .map_err(|e| anyhow::anyhow!("identity persist_peers: {}", e))?;
+
+    // Feed the merged (identity ∪ CLI) list through NodeAddress so
+    // self-address validation runs on the full set (an
+    // identity-persisted peer that happens to match self_address must
+    // still be rejected at parse time, not after `Zone registered`).
+    let merged_peers_joined = identity_persisted.peers.join(",");
+    let peer_addrs: Vec<NodeAddress> = NodeAddress::parse_peer_list(&merged_peers_joined, use_tls)
+        .map_err(|e| anyhow::anyhow!("identity peers parse: {}", e))?;
     let peers_str: Vec<String> = peer_addrs
         .iter()
         .map(NodeAddress::to_raft_peer_str)
