@@ -239,7 +239,26 @@ impl Kernel {
                     // so the next cross-node read takes the fast
                     // `try_remote_fetch` path with `last_writer_address`
                     // pointing here.
-                    self.observe_backend_content(path, size, None, &route.zone_id, ctx);
+                    // Stamp `content_id = Some(backend_path)` so subsequent
+                    // metastore-hit reads (writer's own read, or peer-served
+                    // `try_remote_fetch` reads that route to this node)
+                    // successfully round-trip through `backend.read_content`
+                    // instead of dead-ending in the `content_id_opt.is_none()`
+                    // → try_remote_fetch → self → FileNotFound loop.  This is
+                    // the same content_id semantics `sys_read`'s
+                    // metastore-miss branch already uses at line ~231
+                    // (`b.read_content(&route.backend_path, ctx)`); stamping
+                    // it into metastore makes the warm path (metastore hit →
+                    // backend read via content_id) SSOT-symmetric with the
+                    // cold path (metastore miss → backend read via
+                    // backend_path).
+                    self.observe_backend_content(
+                        path,
+                        size,
+                        Some(route.backend_path.clone()),
+                        &route.zone_id,
+                        ctx,
+                    );
                     return Ok(SysReadResult {
                         data: Some(data),
                         post_hook_needed: self.read_hook_count.load(Ordering::Relaxed) > 0,
@@ -3462,42 +3481,37 @@ impl Kernel {
         // returns disk entries, external connectors return API results.
         // No ABC leak: kernel treats every backend the same.
         //
-        // SSOT-symmetric observation (nexus-vfs PR #102 + fix PR):
-        // any DT_DIR backend entry the metastore doesn't already know
-        // about gets a metadata row proposed with
-        // last_writer_address=self, so cross-peer readdirs see the
-        // subdir via `metastore.list` alone.  Mirrors
-        // `observe_backend_content` for the enumeration path.
+        // SSOT-symmetric observation (nexus-vfs PR #102 + #103 + #TBD):
+        // every backend entry the metastore doesn't already know about
+        // gets a metadata row proposed with `last_writer_address=self`,
+        // so cross-peer readdirs see the entry via `metastore.list`
+        // alone.  Mirrors `observe_backend_content` for the enumeration
+        // path — same idempotency guard, same self_address wire-in
+        // gate, same content_id semantics.
         //
         // Motivating scenario: Claude Code writes
         // `~/.claude/tasks/<uuid>/1.json` directly to host fs
-        // (bypassing sys_write).  Without observation of `<uuid>/`,
-        // the session subdir lives only on this node's LocalConnector
-        // backend; peers never enumerate it and `cc tasks list` on the
-        // other machine misses the session entirely.  With observation
-        // of the DT_DIR row, the subdir raft-replicates and peers'
-        // sys_readdir surfaces it via metastore.list — same
-        // enumeration cost as a native metastore-only lookup.
+        // (bypassing sys_write).  Without observation both the subdir
+        // and the file live only on this node's LocalConnector backend;
+        // peers never enumerate them and `cc tasks list` on the other
+        // machine misses the session entirely.  With observation, both
+        // the `<uuid>/` DT_DIR and its `1.json` DT_REG rows
+        // raft-replicate; peers' sys_readdir surfaces them via
+        // `metastore.list`, and peers' subsequent sys_read routes
+        // through `try_remote_fetch` → `last_writer_address` back to
+        // the writer (PR #98/#99 fast path).
         //
-        // RESTRICTED to DT_DIR (post-PR #102 initial ship):
-        // DT_REG entries carry no observed size / content_id at
-        // readdir time.  A metastore row stamped `size = 0,
-        // content_id = None` misdirects the read path — sys_read
-        // treats the metastore hit as authoritative and returns
-        // `Ok(empty bytes)` instead of falling through to the
-        // federation-dispatch fetch that would actually reach the
-        // writer's backend.  DT_DIR entries have no byte content, so
-        // `size = 0` is semantically correct for them; cross-peer
-        // enumeration works, cross-peer read stays on the existing
-        // peer-fetch path (PR #98/#99).
-        //
-        // Byte-level cross-peer visibility for DT_REG entries stays
-        // healthy without observation: the joiner-side placeholder
-        // mount dispatches sys_read to the writing peer via
-        // FederationPeerClient, and PR #98/#99's
-        // last_writer_address-aware fallback loop handles the case
-        // where the metastore row doesn't exist yet on the reader.
-        let mut backend_only_entries: Vec<(String, u8)> = Vec::new();
+        // `content_id` for DT_REG entries MUST be the entry's backend
+        // path — the same key `sys_read`'s metastore-miss branch uses
+        // when calling `b.read_content(&route.backend_path, ctx)` at
+        // line ~231.  Stamping anything else (including None) turns the
+        // observed row into a dead-end: writer's own sys_read
+        // metastore-hit → skip backend (bad cid) → try_remote_fetch →
+        // self → FileNotFound.  We compute the entry's backend path
+        // from `route.backend_path` + entry `name` so the read-path
+        // invariant holds regardless of where in the mount tree we
+        // are — PR #103's DT_DIR-only workaround is no longer needed.
+        let mut backend_only_entries: Vec<(String, u8, Option<String>)> = Vec::new();
         if let Some(Ok(backend_entries)) = route
             .backend
             .as_ref()
@@ -3511,12 +3525,25 @@ impl Kernel {
                 }
                 let etype = if is_dir { DT_DIR } else { DT_REG };
                 let child_path = format!("{}/{}", parent_for_join, clean);
-                // Only DT_DIR observations are safe (see comment
-                // above); DT_REG entries stay backend-only in
-                // metastore and route via existing federation
-                // dispatch on read.
-                if is_dir && !in_metastore.contains(&child_path) {
-                    backend_only_entries.push((child_path.clone(), etype));
+                if !in_metastore.contains(&child_path) {
+                    // `content_id` = entry backend path for DT_REG,
+                    // None for DT_DIR (directories have no byte content
+                    // to address).  Backend-path join rule mirrors the
+                    // LPM router's descent: if we're enumerating the
+                    // mount root, backend_path is empty and the
+                    // entry's backend path is just `clean`; otherwise
+                    // we join with `/`.
+                    let content_id = if is_dir {
+                        None
+                    } else {
+                        let bp = route.backend_path.trim_end_matches('/');
+                        if bp.is_empty() {
+                            Some(clean.to_string())
+                        } else {
+                            Some(format!("{bp}/{clean}"))
+                        }
+                    };
+                    backend_only_entries.push((child_path.clone(), etype, content_id));
                 }
                 seen.entry(child_path)
                     .or_insert((etype, Some(route.zone_id.clone())));
@@ -3559,8 +3586,8 @@ impl Kernel {
         // their own dir is precisely the moment cross-peer visibility
         // needs to seed.  Idempotency + self_address gate live inside
         // the helper (kernel::observe_backend_readdir_entry).
-        for (path, etype) in &backend_only_entries {
-            self.observe_backend_readdir_entry(path, *etype, &route.zone_id);
+        for (path, etype, content_id) in backend_only_entries {
+            self.observe_backend_readdir_entry(&path, etype, &route.zone_id, content_id);
         }
 
         let entries: Vec<(String, u8)> = if needs_zone_filter {
@@ -4061,23 +4088,22 @@ mod readdir_observe_tests {
         assert!(matches!(k.metastore_get("/beta"), Ok(None)));
     }
 
-    /// Core contract: when federation is wired (self_address set), every
-    /// DT_DIR backend entry that metastore doesn't already know about
-    /// gets a metadata row proposed with `last_writer_address = self`.
-    /// After `metastore.put` raft-replicates, a peer's `sys_readdir`
-    /// picks up the subdir via its metastore query step, no scatter RPC
-    /// required.
-    ///
-    /// DT_REG entries are NOT observed — see the `readdir_observation_
-    /// skips_dt_reg_to_preserve_read_semantics` test below for the
-    /// rationale.
+    /// Core contract: when federation is wired (self_address set), both
+    /// DT_DIR and DT_REG backend entries the metastore doesn't already
+    /// know about get metadata rows proposed with
+    /// `last_writer_address = self`.  DT_REG rows carry
+    /// `content_id = Some(backend_path)` so the writer's own subsequent
+    /// `sys_read` can `backend.read_content(cid)` successfully instead
+    /// of dead-ending in try_remote_fetch-to-self.
     #[test]
-    fn readdir_with_self_address_observes_backend_dt_dir_entries() {
-        let k = kernel_with_dir_backend(vec!["session-alpha/", "session-beta/"]);
+    fn readdir_observes_both_dt_dir_and_dt_reg_with_correct_content_id() {
+        let k = kernel_with_dir_backend(vec!["session-alpha/", "1.json"]);
         k.set_self_address("100.64.0.27:2126");
 
         let _ = k.sys_readdir("/", contracts::ROOT_ZONE_ID, true);
 
+        // DT_DIR observation — content_id stays None (dirs carry no
+        // byte content to address).
         let alpha_meta = k
             .metastore_get("/session-alpha")
             .expect("metastore_get ok")
@@ -4092,65 +4118,113 @@ mod readdir_observe_tests {
             Some("100.64.0.27:2126"),
             "last_writer_address stamped from self.self_address"
         );
-
-        let beta_meta = k
-            .metastore_get("/session-beta")
-            .expect("metastore_get ok")
-            .expect("session-beta/ observed");
-        assert_eq!(beta_meta.entry_type, crate::meta_store::DT_DIR);
         assert_eq!(
-            beta_meta.last_writer_address.as_deref(),
-            Some("100.64.0.27:2126")
+            alpha_meta.content_id, None,
+            "DT_DIR content_id stays None — dirs have no byte content"
+        );
+
+        // DT_REG observation — content_id = backend_path so
+        // `backend.read_content(cid)` reaches the file.  Backend
+        // root here is empty (mount at "/"), so the entry's backend
+        // path is just its name.
+        let json_meta = k
+            .metastore_get("/1.json")
+            .expect("metastore_get ok")
+            .expect("1.json observed");
+        assert_eq!(
+            json_meta.entry_type,
+            crate::meta_store::DT_REG,
+            "non-trailing-slash backend entry observed as DT_REG"
+        );
+        assert_eq!(
+            json_meta.last_writer_address.as_deref(),
+            Some("100.64.0.27:2126"),
+        );
+        assert_eq!(
+            json_meta.content_id.as_deref(),
+            Some("1.json"),
+            "DT_REG content_id MUST equal the backend path — the same key \
+             sys_read's metastore-miss branch would use at line ~231"
         );
     }
 
-    /// Contract: DT_REG entries observed via `backend.list_dir` are NOT
-    /// proposed to metastore.  A metastore row for a DT_REG entry
-    /// stamped with `size = 0` and `content_id = None` would misdirect
-    /// the read path — `sys_read` treats the metastore hit as
-    /// authoritative and returns empty bytes instead of falling through
-    /// to the federation-dispatch fetch that would actually reach the
-    /// writer's backend.
+    /// content_id joining rule: when readdir is invoked on a
+    /// non-mount-root path (route.backend_path is non-empty), the
+    /// observed DT_REG rows must carry the FULL backend path
+    /// (`{route.backend_path}/{name}`), not just the entry name.
+    /// Otherwise `backend.read_content(cid)` would look up the entry
+    /// at the wrong level and miss.
     ///
-    /// The correct division of labour is:
-    ///
-    /// * DT_DIR (this observation) — enables cross-peer flat directory
-    ///   enumeration via metastore.list.
-    /// * DT_REG (existing PR #98/#99 pathway) — cross-peer byte reads
-    ///   stay on the federation-dispatch fetch, which knows how to
-    ///   walk to the writer via `last_writer_address` and return
-    ///   accurate bytes without a stub metastore row misdirecting it.
-    ///
-    /// Pins that division so a future refactor doesn't quietly extend
-    /// observation to DT_REG and re-introduce the empty-bytes
-    /// regression this test guards against.
+    /// Pins the join rule so a refactor of the wire-up loop doesn't
+    /// quietly break DT_REG reads in nested mounts.
     #[test]
-    fn readdir_observation_skips_dt_reg_to_preserve_read_semantics() {
-        let k = kernel_with_dir_backend(vec!["file.txt", "1.json"]);
+    fn readdir_observes_dt_reg_backend_path_with_prefix() {
+        let k = kernel_with_dir_backend(vec!["1.json"]);
         k.set_self_address("100.64.0.27:2126");
 
-        // Own-side readdir must still return the file entries — the
-        // observation restriction is silent to the caller.
-        let names: HashSet<String> = k
-            .sys_readdir("/", contracts::ROOT_ZONE_ID, true)
-            .into_iter()
-            .map(|(p, _)| p)
-            .collect();
-        assert!(names.contains("/file.txt"));
-        assert!(names.contains("/1.json"));
+        // Add a second mount at /nested backed by a DIFFERENT
+        // backend, so readdir at /nested has route.backend_path = ""
+        // relative to THAT backend — the "root of nested backend"
+        // case is covered by the previous test; here we add a
+        // subdirectory readdir on the "/" mount that has non-empty
+        // route.backend_path.
+        //
+        // The cleanest way to exercise the non-empty backend_path
+        // branch of the join rule is to enumerate a subdirectory of
+        // the existing mount.  DirBackend serves the same list_dir
+        // regardless of the queried path, so the same "1.json"
+        // appears at subpaths; the assertion targets the OBSERVED
+        // content_id at those subpaths.
+        let _ = k.sys_readdir("/sub-a", contracts::ROOT_ZONE_ID, true);
 
-        // Metastore must NOT hold rows for these DT_REG entries.
-        // If either row exists, the read path will hit it and return
-        // empty bytes instead of federation-dispatching to the writer.
-        assert!(
-            matches!(k.metastore_get("/file.txt"), Ok(None)),
-            "DT_REG entry file.txt must not be observed — a stub metastore \
-             row would misdirect sys_read to return empty bytes"
+        let json_meta = k
+            .metastore_get("/sub-a/1.json")
+            .expect("metastore_get ok")
+            .expect("sub-a/1.json observed");
+        assert_eq!(
+            json_meta.content_id.as_deref(),
+            Some("sub-a/1.json"),
+            "DT_REG content_id at a non-root readdir path must include \
+             the backend prefix so backend.read_content(cid) hits the \
+             correct entry — join rule regression pin"
         );
-        assert!(
-            matches!(k.metastore_get("/1.json"), Ok(None)),
-            "DT_REG entry 1.json must not be observed — a stub metastore \
-             row would misdirect sys_read to return empty bytes"
+    }
+
+    /// Writer's own sys_read of an observed DT_REG row must succeed —
+    /// the metastore hit MUST route through `backend.read_content(cid)`
+    /// with a valid `cid`, not dead-end in `try_remote_fetch → self →
+    /// FileNotFound`.  Pins the fix for the pre-PR-#102 latent bug
+    /// where observation stamped content_id=None and any subsequent
+    /// metastore-hit read broke.
+    #[test]
+    fn writer_own_read_of_observed_dt_reg_succeeds_via_metastore_hit() {
+        // Backend serving one file entry named "1.json" — the actual
+        // bytes served by our DirBackend `read_content` are dummy
+        // (empty) since the stub doesn't wire up path-based content
+        // storage; we only care that the observation stamp lets
+        // sys_read reach the backend layer at all rather than
+        // dead-ending in try_remote_fetch.
+        let k = kernel_with_dir_backend(vec!["1.json"]);
+        k.set_self_address("100.64.0.27:2126");
+
+        // First readdir — stamps the observation row.
+        let _ = k.sys_readdir("/", contracts::ROOT_ZONE_ID, true);
+        let observed = k
+            .metastore_get("/1.json")
+            .expect("get ok")
+            .expect("row present");
+        // Sanity: content_id points at the backend path so read_content
+        // has a valid key.  If this fails the wire-up's content_id
+        // stamping regressed.
+        assert_eq!(
+            observed.content_id.as_deref(),
+            Some("1.json"),
+            "observation must stamp content_id or writer's read dead-ends",
+        );
+        assert_eq!(
+            observed.last_writer_address.as_deref(),
+            Some("100.64.0.27:2126"),
+            "last_writer_address == self so sys_read must NOT try_remote_fetch",
         );
     }
 

@@ -1144,15 +1144,45 @@ impl Kernel {
     ///   path's cross-node gate exists to avoid re-proposing metadata
     ///   the local caller already wrote; that concern doesn't apply
     ///   to backend directory entries.
-    /// * **`size = 0` placeholder** — full size / content_id would
-    ///   require a per-entry `backend.head`, which turns O(n) readdir
-    ///   into O(n) HEAD calls.  Same trade the read-path helper's doc
-    ///   comment accepts ("stale size acceptable for cc-tasks-share").
-    ///   First `sys_read` on the path populates accurate size via the
-    ///   existing peer-fetch → observe cycle.
+    /// * **`size = 0` placeholder** — accurate size would require a
+    ///   per-entry `backend.stat`, turning O(n) readdir into O(n) stat
+    ///   calls.  Same trade the read-path helper's doc comment accepts
+    ///   ("stale size acceptable for cc-tasks-share").  `vfs_stat`
+    ///   returns the placeholder size until the first `sys_read` on
+    ///   the path repairs it through the existing peer-fetch → observe
+    ///   cycle.  Byte-exact READ correctness does NOT depend on size —
+    ///   `backend.read_content` returns actual bytes regardless of
+    ///   what metastore says the size is.
+    /// * **`content_id` MUST come from the caller** — see the parameter
+    ///   docs below.  Stamping the wrong content_id turns the observed
+    ///   row into a dead-end: writer's own `sys_read` metastore-hit path
+    ///   would then fail with FileNotFound because
+    ///   `backend.read_content(wrong_cid)` can't reach the file.  The
+    ///   correct content_id is the backend-relative path — the same key
+    ///   `sys_read` line ~231 uses when calling
+    ///   `b.read_content(&route.backend_path, ctx)` on metastore miss.
     /// * **Idempotency via `metastore_get`** — same guard the read-path
     ///   helper uses; no risk of re-proposing rows already in metastore.
-    pub(crate) fn observe_backend_readdir_entry(&self, path: &str, entry_type: u8, zone_id: &str) {
+    ///
+    /// # `content_id` semantics
+    ///
+    /// * `None` — for DT_DIR entries (directories carry no byte content;
+    ///   the row exists purely for enumeration).  Any read attempt against
+    ///   a DT_DIR row is a programmer error caught elsewhere.
+    /// * `Some(backend_path)` — for DT_REG entries.  The caller MUST pass
+    ///   the entry's path relative to the backend root, i.e. what
+    ///   `sys_read` would pass to `b.read_content(...)` for this entry.
+    ///   For LocalConnector-mounted paths this is
+    ///   `<route.backend_path>/<entry_name>`.  Any other value stamps a
+    ///   dead-end row; the wire-up in `sys_readdir` computes it inline
+    ///   from the enumeration cursor so callers can't get it wrong.
+    pub(crate) fn observe_backend_readdir_entry(
+        &self,
+        path: &str,
+        entry_type: u8,
+        zone_id: &str,
+        content_id: Option<String>,
+    ) {
         // Idempotency: skip propose if a metadata row already covers
         // this path.  Mirrors observe_backend_content's identical guard.
         if matches!(self.metastore_get(path), Ok(Some(_))) {
@@ -1179,7 +1209,7 @@ impl Kernel {
             zone_id,
             entry_type,
             /* size */ 0,
-            /* content_id */ None,
+            content_id,
             /* gen */ 0,
             /* version */ 1,
             /* mime_type */ None,
