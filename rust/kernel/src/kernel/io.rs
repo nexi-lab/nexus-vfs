@@ -3462,16 +3462,41 @@ impl Kernel {
         // returns disk entries, external connectors return API results.
         // No ABC leak: kernel treats every backend the same.
         //
-        // SSOT-symmetric observation (nexus-vfs #TBD):
-        // any entry produced by the backend that metastore doesn't
-        // already know about gets a metastore row proposed with
+        // SSOT-symmetric observation (nexus-vfs PR #102 + fix PR):
+        // any DT_DIR backend entry the metastore doesn't already know
+        // about gets a metadata row proposed with
         // last_writer_address=self, so cross-peer readdirs see the
-        // entry via `metastore.list` alone.  This mirrors
-        // `observe_backend_content` for the read path.  Motivating
-        // scenario: Claude Code writes ~/.claude/tasks/<uuid>/ directly
-        // to host fs bypassing sys_write; without observation, the
-        // entry lives only on this node's LocalConnector backend and
-        // peers never enumerate it.
+        // subdir via `metastore.list` alone.  Mirrors
+        // `observe_backend_content` for the enumeration path.
+        //
+        // Motivating scenario: Claude Code writes
+        // `~/.claude/tasks/<uuid>/1.json` directly to host fs
+        // (bypassing sys_write).  Without observation of `<uuid>/`,
+        // the session subdir lives only on this node's LocalConnector
+        // backend; peers never enumerate it and `cc tasks list` on the
+        // other machine misses the session entirely.  With observation
+        // of the DT_DIR row, the subdir raft-replicates and peers'
+        // sys_readdir surfaces it via metastore.list — same
+        // enumeration cost as a native metastore-only lookup.
+        //
+        // RESTRICTED to DT_DIR (post-PR #102 initial ship):
+        // DT_REG entries carry no observed size / content_id at
+        // readdir time.  A metastore row stamped `size = 0,
+        // content_id = None` misdirects the read path — sys_read
+        // treats the metastore hit as authoritative and returns
+        // `Ok(empty bytes)` instead of falling through to the
+        // federation-dispatch fetch that would actually reach the
+        // writer's backend.  DT_DIR entries have no byte content, so
+        // `size = 0` is semantically correct for them; cross-peer
+        // enumeration works, cross-peer read stays on the existing
+        // peer-fetch path (PR #98/#99).
+        //
+        // Byte-level cross-peer visibility for DT_REG entries stays
+        // healthy without observation: the joiner-side placeholder
+        // mount dispatches sys_read to the writing peer via
+        // FederationPeerClient, and PR #98/#99's
+        // last_writer_address-aware fallback loop handles the case
+        // where the metastore row doesn't exist yet on the reader.
         let mut backend_only_entries: Vec<(String, u8)> = Vec::new();
         if let Some(Ok(backend_entries)) = route
             .backend
@@ -3486,7 +3511,11 @@ impl Kernel {
                 }
                 let etype = if is_dir { DT_DIR } else { DT_REG };
                 let child_path = format!("{}/{}", parent_for_join, clean);
-                if !in_metastore.contains(&child_path) {
+                // Only DT_DIR observations are safe (see comment
+                // above); DT_REG entries stay backend-only in
+                // metastore and route via existing federation
+                // dispatch on read.
+                if is_dir && !in_metastore.contains(&child_path) {
                     backend_only_entries.push((child_path.clone(), etype));
                 }
                 seen.entry(child_path)
@@ -4011,60 +4040,117 @@ mod readdir_observe_tests {
     /// stays empty for these paths.
     ///
     /// Pins the `self_address.is_none()` early-return in
-    /// `observe_backend_readdir_entry`.
+    /// `observe_backend_readdir_entry`.  Uses DT_DIR entries so the
+    /// gate is actually exercised (DT_REG entries are skipped by a
+    /// different check in sys_readdir; see
+    /// `readdir_observation_skips_dt_reg_to_preserve_read_semantics`).
     #[test]
     fn readdir_without_self_address_skips_observation() {
-        let k = kernel_with_dir_backend(vec!["a.json", "b.json"]);
+        let k = kernel_with_dir_backend(vec!["alpha/", "beta/"]);
         let names: HashSet<String> = k
             .sys_readdir("/", contracts::ROOT_ZONE_ID, true)
             .into_iter()
             .map(|(p, _)| p)
             .collect();
-        assert!(names.contains("/a.json"));
-        assert!(names.contains("/b.json"));
+        assert!(names.contains("/alpha"));
+        assert!(names.contains("/beta"));
 
         // Metastore should NOT have picked up either path (no
         // self_address → observation skipped).
-        assert!(matches!(k.metastore_get("/a.json"), Ok(None)));
-        assert!(matches!(k.metastore_get("/b.json"), Ok(None)));
+        assert!(matches!(k.metastore_get("/alpha"), Ok(None)));
+        assert!(matches!(k.metastore_get("/beta"), Ok(None)));
     }
 
     /// Core contract: when federation is wired (self_address set), every
-    /// backend entry that metastore doesn't already know about gets a
-    /// metadata row proposed with `last_writer_address = self`.  This is
-    /// the seed for cross-peer readdir visibility — after `metastore.put`
-    /// raft-replicates, a peer's `sys_readdir` picks up the entry via
-    /// its metastore query step, no scatter RPC required.
+    /// DT_DIR backend entry that metastore doesn't already know about
+    /// gets a metadata row proposed with `last_writer_address = self`.
+    /// After `metastore.put` raft-replicates, a peer's `sys_readdir`
+    /// picks up the subdir via its metastore query step, no scatter RPC
+    /// required.
+    ///
+    /// DT_REG entries are NOT observed — see the `readdir_observation_
+    /// skips_dt_reg_to_preserve_read_semantics` test below for the
+    /// rationale.
     #[test]
-    fn readdir_with_self_address_observes_backend_only_entries() {
-        let k = kernel_with_dir_backend(vec!["a.json", "sub/"]);
+    fn readdir_with_self_address_observes_backend_dt_dir_entries() {
+        let k = kernel_with_dir_backend(vec!["session-alpha/", "session-beta/"]);
         k.set_self_address("100.64.0.27:2126");
 
         let _ = k.sys_readdir("/", contracts::ROOT_ZONE_ID, true);
 
-        let a_meta = k
-            .metastore_get("/a.json")
+        let alpha_meta = k
+            .metastore_get("/session-alpha")
             .expect("metastore_get ok")
-            .expect("a.json observed");
-        assert_eq!(a_meta.entry_type, crate::meta_store::DT_REG);
+            .expect("session-alpha/ observed");
         assert_eq!(
-            a_meta.last_writer_address.as_deref(),
-            Some("100.64.0.27:2126"),
-            "last_writer_address stamped from self.self_address"
-        );
-
-        let sub_meta = k
-            .metastore_get("/sub")
-            .expect("metastore_get ok")
-            .expect("sub/ observed");
-        assert_eq!(
-            sub_meta.entry_type,
+            alpha_meta.entry_type,
             crate::meta_store::DT_DIR,
             "trailing-slash backend entry observed as DT_DIR"
         );
         assert_eq!(
-            sub_meta.last_writer_address.as_deref(),
+            alpha_meta.last_writer_address.as_deref(),
+            Some("100.64.0.27:2126"),
+            "last_writer_address stamped from self.self_address"
+        );
+
+        let beta_meta = k
+            .metastore_get("/session-beta")
+            .expect("metastore_get ok")
+            .expect("session-beta/ observed");
+        assert_eq!(beta_meta.entry_type, crate::meta_store::DT_DIR);
+        assert_eq!(
+            beta_meta.last_writer_address.as_deref(),
             Some("100.64.0.27:2126")
+        );
+    }
+
+    /// Contract: DT_REG entries observed via `backend.list_dir` are NOT
+    /// proposed to metastore.  A metastore row for a DT_REG entry
+    /// stamped with `size = 0` and `content_id = None` would misdirect
+    /// the read path — `sys_read` treats the metastore hit as
+    /// authoritative and returns empty bytes instead of falling through
+    /// to the federation-dispatch fetch that would actually reach the
+    /// writer's backend.
+    ///
+    /// The correct division of labour is:
+    ///
+    /// * DT_DIR (this observation) — enables cross-peer flat directory
+    ///   enumeration via metastore.list.
+    /// * DT_REG (existing PR #98/#99 pathway) — cross-peer byte reads
+    ///   stay on the federation-dispatch fetch, which knows how to
+    ///   walk to the writer via `last_writer_address` and return
+    ///   accurate bytes without a stub metastore row misdirecting it.
+    ///
+    /// Pins that division so a future refactor doesn't quietly extend
+    /// observation to DT_REG and re-introduce the empty-bytes
+    /// regression this test guards against.
+    #[test]
+    fn readdir_observation_skips_dt_reg_to_preserve_read_semantics() {
+        let k = kernel_with_dir_backend(vec!["file.txt", "1.json"]);
+        k.set_self_address("100.64.0.27:2126");
+
+        // Own-side readdir must still return the file entries — the
+        // observation restriction is silent to the caller.
+        let names: HashSet<String> = k
+            .sys_readdir("/", contracts::ROOT_ZONE_ID, true)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        assert!(names.contains("/file.txt"));
+        assert!(names.contains("/1.json"));
+
+        // Metastore must NOT hold rows for these DT_REG entries.
+        // If either row exists, the read path will hit it and return
+        // empty bytes instead of federation-dispatching to the writer.
+        assert!(
+            matches!(k.metastore_get("/file.txt"), Ok(None)),
+            "DT_REG entry file.txt must not be observed — a stub metastore \
+             row would misdirect sys_read to return empty bytes"
+        );
+        assert!(
+            matches!(k.metastore_get("/1.json"), Ok(None)),
+            "DT_REG entry 1.json must not be observed — a stub metastore \
+             row would misdirect sys_read to return empty bytes"
         );
     }
 
@@ -4076,13 +4162,13 @@ mod readdir_observe_tests {
     /// idempotency check.
     #[test]
     fn readdir_observation_is_idempotent() {
-        let k = kernel_with_dir_backend(vec!["a.json"]);
+        let k = kernel_with_dir_backend(vec!["session/"]);
         k.set_self_address("100.64.0.27:2126");
 
         // First readdir: seed the row.
         let _ = k.sys_readdir("/", contracts::ROOT_ZONE_ID, true);
         let first = k
-            .metastore_get("/a.json")
+            .metastore_get("/session")
             .expect("first get ok")
             .expect("row present");
 
@@ -4093,7 +4179,7 @@ mod readdir_observe_tests {
         // idempotency guard would be broken.
         let _ = k.sys_readdir("/", contracts::ROOT_ZONE_ID, true);
         let second = k
-            .metastore_get("/a.json")
+            .metastore_get("/session")
             .expect("second get ok")
             .expect("row still present");
         assert_eq!(first.version, second.version);
@@ -4101,24 +4187,26 @@ mod readdir_observe_tests {
         assert_eq!(first.entry_type, second.entry_type);
     }
 
-    /// Metastore-first: if a row already exists in metastore (e.g. put
-    /// there by a prior `sys_write` on this node or raft-replicated
-    /// from a peer), backend observation must not overwrite it — the
+    /// Metastore-first: if a DT_DIR row already exists in metastore
+    /// (e.g. put there by a peer's prior observation and raft-
+    /// replicated), backend observation must not overwrite it — the
     /// raft-replicated row's `last_writer_address` is the SSOT for
-    /// which peer to route reads to.
+    /// which peer owns the parent context.
     #[test]
     fn readdir_observation_does_not_overwrite_metastore_hit() {
-        let k = kernel_with_dir_backend(vec!["shared.json"]);
+        let k = kernel_with_dir_backend(vec!["shared-session/"]);
         k.set_self_address("100.64.0.27:2126");
 
-        // Simulate a peer's write already replicated into metastore.
+        // Simulate a peer's observation already replicated into
+        // metastore.  Row is a DT_DIR to match the observation
+        // restriction; the last_writer_address points at the peer.
         let peer_meta = crate::meta_store::FileMetadata {
-            path: "/shared.json".into(),
-            size: 42,
-            content_id: Some("peer-content-id".into()),
+            path: "/shared-session".into(),
+            size: 0,
+            content_id: None,
             gen: 0,
             version: 1,
-            entry_type: crate::meta_store::DT_REG,
+            entry_type: crate::meta_store::DT_DIR,
             zone_id: Some(contracts::ROOT_ZONE_ID.into()),
             mime_type: None,
             created_at_ms: Some(100),
@@ -4128,7 +4216,7 @@ mod readdir_observe_tests {
             link_target: None,
             owner_id: None,
         };
-        k.metastore_put("/shared.json", peer_meta)
+        k.metastore_put("/shared-session", peer_meta)
             .expect("seed peer metastore row");
 
         // Backend list_dir also reports this path — observation must
@@ -4136,10 +4224,10 @@ mod readdir_observe_tests {
         let _ = k.sys_readdir("/", contracts::ROOT_ZONE_ID, true);
 
         let m = k
-            .metastore_get("/shared.json")
+            .metastore_get("/shared-session")
             .expect("get ok")
             .expect("row present");
-        assert_eq!(m.size, 42, "peer's size preserved");
+        assert_eq!(m.version, 1, "peer's version preserved");
         assert_eq!(
             m.last_writer_address.as_deref(),
             Some("100.64.0.21:2126"),
