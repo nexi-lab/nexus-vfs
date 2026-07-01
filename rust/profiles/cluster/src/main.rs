@@ -1302,6 +1302,10 @@ async fn run_join(
     let use_tls = !common.no_tls;
     let peer = NodeAddress::parse(peer_addr, use_tls)
         .map_err(|e| anyhow::anyhow!("--peer-addr parse '{}': {}", peer_addr, e))?;
+    // Cache the raft peer string before moving `peer_addrs` into the
+    // spawn_blocking closure below — needed by the post-join identity
+    // persist step.
+    let peer_str_for_identity = peer.to_raft_peer_str();
     let peer_addrs = vec![peer];
 
     // Ensure the local parent zone exists BEFORE writing the cross-zone
@@ -1385,10 +1389,38 @@ async fn run_join(
         .await
         .map_err(|e| anyhow::anyhow!("mount: {}", e))?;
 
+    // Persist the leader address in identity so subsequent daemon
+    // restarts (with `--peers` unset — the routine `restart` container
+    // mode) still have a transport-layer seed to contact this peer.
+    // Without this, every join sidecar would leave identity empty and
+    // the daemon's `open_zone_manager` would lose the peer address as
+    // soon as the entrypoint script unsets `NEXUS_PEERS` on restart.
+    // Merge, not overwrite — identity may already carry other peers
+    // from earlier joins.
+    let identity_dir = common
+        .identity_dir
+        .clone()
+        .unwrap_or_else(nexus_raft::identity::default_identity_dir);
+    let ident = nexus_raft::identity::load(&identity_dir)
+        .map_err(|e| anyhow::anyhow!("identity load: {}", e))?;
+    nexus_raft::identity::persist_peers(
+        &identity_dir,
+        &ident,
+        std::slice::from_ref(&peer_str_for_identity),
+    )
+    .map_err(|e| anyhow::anyhow!("identity persist_peers: {}", e))?;
+
     let role = if as_learner { "learner" } else { "voter" };
     println!(
-        "Joined remote zone '{}' as {} (via {}); mounted at '{}' inside zone '{}'",
-        remote_zone_id, role, peer_addr, local_path, parent_zone
+        "Joined remote zone '{}' as {} (via {}); mounted at '{}' inside zone '{}'; \
+         peer '{}' persisted to identity '{}'",
+        remote_zone_id,
+        role,
+        peer_addr,
+        local_path,
+        parent_zone,
+        peer_str_for_identity,
+        identity_dir.display(),
     );
     Ok(())
 }
