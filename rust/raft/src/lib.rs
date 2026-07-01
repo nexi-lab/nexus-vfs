@@ -114,6 +114,14 @@ pub mod transport;
 pub mod blob_fetcher_handler;
 #[cfg(all(feature = "grpc", has_protos))]
 pub mod distributed_coordinator;
+/// Node-bound peer address book persistence — `identity.json` at a
+/// platform-native user-data location.  Survives `<NEXUS_DATA_DIR>`
+/// wipes so cold-boot does not need operator re-specifying `--peers`.
+/// Deliberately narrow: peer list only, no `node_id` (raft's
+/// per-Progress heartbeat invariant requires wipe = id-rotation; see
+/// `docs/federation-architecture.md` § 6.3.1).
+#[cfg(all(feature = "grpc", has_protos))]
+pub mod identity;
 // WAL stream / pipe backends moved into the kernel crate
 // (`kernel::core::stream::wal`, `kernel::core::pipe::wal`) — they
 // are kernel primitives that compose whatever distributed `MetaStore`
