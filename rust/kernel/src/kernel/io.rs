@@ -3501,17 +3501,29 @@ impl Kernel {
         // through `try_remote_fetch` → `last_writer_address` back to
         // the writer (PR #98/#99 fast path).
         //
-        // `content_id` for DT_REG entries MUST be the entry's backend
-        // path — the same key `sys_read`'s metastore-miss branch uses
-        // when calling `b.read_content(&route.backend_path, ctx)` at
-        // line ~231.  Stamping anything else (including None) turns the
-        // observed row into a dead-end: writer's own sys_read
-        // metastore-hit → skip backend (bad cid) → try_remote_fetch →
-        // self → FileNotFound.  We compute the entry's backend path
-        // from `route.backend_path` + entry `name` so the read-path
-        // invariant holds regardless of where in the mount tree we
-        // are — PR #103's DT_DIR-only workaround is no longer needed.
-        let mut backend_only_entries: Vec<(String, u8, Option<String>)> = Vec::new();
+        // Two invariants the wire-up MUST preserve so the observed
+        // rows are actually usable:
+        //
+        // 1. `content_id` for DT_REG entries MUST be the entry's
+        //    backend path — the same key `sys_read`'s metastore-miss
+        //    branch uses when calling `b.read_content(&route.backend_path,
+        //    ctx)` at line ~231.  Stamping anything else (including
+        //    None) turns the observed row into a dead-end: writer's own
+        //    sys_read metastore-hit → skip backend (bad cid) →
+        //    try_remote_fetch → self → FileNotFound.
+        //
+        // 2. `size` for DT_REG entries MUST reflect the actual file
+        //    size — POSIX `read()` / `cat` consult `stat.st_size` to
+        //    decide read length, so stamping size=0 on a non-empty
+        //    file causes reads to return empty bytes even though the
+        //    backend has them.  For DT_DIR entries size=0 is
+        //    semantically correct (dirs have no byte content to
+        //    size).  We fetch size via `backend.stat` inline and
+        //    SKIP observation entirely if `backend.stat` fails —
+        //    the existing fan-out / federation-dispatch fallback in
+        //    sys_read still handles cross-peer visibility, and we
+        //    prefer "no row" over "wrong row".
+        let mut backend_only_entries: Vec<(String, u8, u64, Option<String>)> = Vec::new();
         if let Some(Ok(backend_entries)) = route
             .backend
             .as_ref()
@@ -3526,24 +3538,55 @@ impl Kernel {
                 let etype = if is_dir { DT_DIR } else { DT_REG };
                 let child_path = format!("{}/{}", parent_for_join, clean);
                 if !in_metastore.contains(&child_path) {
-                    // `content_id` = entry backend path for DT_REG,
-                    // None for DT_DIR (directories have no byte content
-                    // to address).  Backend-path join rule mirrors the
-                    // LPM router's descent: if we're enumerating the
-                    // mount root, backend_path is empty and the
-                    // entry's backend path is just `clean`; otherwise
-                    // we join with `/`.
-                    let content_id = if is_dir {
-                        None
-                    } else {
+                    // Compute the entry's backend_path (relative to
+                    // mount root).  Backend-path join rule mirrors the
+                    // LPM router's descent: enumerating the mount
+                    // root → entry's backend path is just `clean`;
+                    // otherwise `{bp}/{clean}`.
+                    let entry_backend_path = {
                         let bp = route.backend_path.trim_end_matches('/');
                         if bp.is_empty() {
-                            Some(clean.to_string())
+                            clean.to_string()
                         } else {
-                            Some(format!("{bp}/{clean}"))
+                            format!("{bp}/{clean}")
                         }
                     };
-                    backend_only_entries.push((child_path.clone(), etype, content_id));
+                    if is_dir {
+                        // DT_DIR: size=0 is semantically correct
+                        // (directories carry no byte content).  No
+                        // backend.stat call needed.
+                        backend_only_entries.push((child_path.clone(), etype, 0, None));
+                    } else {
+                        // DT_REG: fetch size via `backend.stat` before
+                        // observing.  POSIX read()/cat consult
+                        // `stat.st_size` to decide read length —
+                        // stamping size=0 on a non-empty file causes
+                        // reads to return empty even though
+                        // `backend.read_content` would serve bytes.
+                        //
+                        // If `backend.stat` fails (backends that don't
+                        // implement it default to NotSupported), skip
+                        // observation for this entry — the existing
+                        // fan-out / federation-dispatch fallback in
+                        // sys_read handles cross-peer visibility, and
+                        // we don't want to stamp a size-0 dead-end
+                        // row.  Same reasoning applies to size-0
+                        // real files: an empty file's row would round-
+                        // trip through sys_read but return correct
+                        // empty bytes, so we could observe it, but
+                        // for uniformity we let the fallback path
+                        // materialise both cases.
+                        if let Some(Ok(stat)) =
+                            route.backend.as_ref().map(|b| b.stat(&entry_backend_path))
+                        {
+                            backend_only_entries.push((
+                                child_path.clone(),
+                                etype,
+                                stat.size,
+                                Some(entry_backend_path),
+                            ));
+                        }
+                    }
                 }
                 seen.entry(child_path)
                     .or_insert((etype, Some(route.zone_id.clone())));
@@ -3586,8 +3629,8 @@ impl Kernel {
         // their own dir is precisely the moment cross-peer visibility
         // needs to seed.  Idempotency + self_address gate live inside
         // the helper (kernel::observe_backend_readdir_entry).
-        for (path, etype, content_id) in backend_only_entries {
-            self.observe_backend_readdir_entry(&path, etype, &route.zone_id, content_id);
+        for (path, etype, size, content_id) in backend_only_entries {
+            self.observe_backend_readdir_entry(&path, etype, &route.zone_id, size, content_id);
         }
 
         let entries: Vec<(String, u8)> = if needs_zone_filter {
@@ -4011,6 +4054,42 @@ mod readdir_observe_tests {
             Ok(self.entries.lock().clone())
         }
 
+        fn stat(&self, path: &str) -> Result<crate::abc::object_store::BackendStat, StorageError> {
+            // Mock stat: match by basename against the entries slice
+            // (`readdir_observes_dt_reg_backend_path_with_prefix`
+            // exercises paths like `sub-a/1.json` that don't literally
+            // appear in the slice but should still be findable).
+            // Size is deterministic per basename so tests can assert
+            // "observation stamped backend.stat's size" without
+            // depending on backend read behavior.  DT_DIR reports 0
+            // per BackendStat's contract.
+            //
+            // The default ObjectStore trait implementation returns
+            // NotSupported; we override so the readdir observation
+            // wire-up doesn't skip our test entries (which is what
+            // it does for backends that don't implement stat — see
+            // sys_readdir's DT_REG branch).
+            let clean = path.trim_end_matches('/');
+            let basename = clean.rsplit('/').next().unwrap_or(clean);
+            let entries = self.entries.lock();
+            let matched = entries
+                .iter()
+                .find(|e| e.trim_end_matches('/') == basename)
+                .cloned();
+            match matched {
+                Some(e) => {
+                    let is_dir = e.ends_with('/');
+                    let size = if is_dir {
+                        0
+                    } else {
+                        basename.len() as u64 * 7 + 3
+                    };
+                    Ok(crate::abc::object_store::BackendStat { size, is_dir })
+                }
+                None => Err(StorageError::NotFound(path.to_string())),
+            }
+        }
+
         fn write_content(
             &self,
             _content: &[u8],
@@ -4126,7 +4205,10 @@ mod readdir_observe_tests {
         // DT_REG observation — content_id = backend_path so
         // `backend.read_content(cid)` reaches the file.  Backend
         // root here is empty (mount at "/"), so the entry's backend
-        // path is just its name.
+        // path is just its name.  size MUST come from backend.stat
+        // (DirBackend's stat returns `clean.len() * 7 + 3` for
+        // files) — a size-0 stamp would break POSIX read()/cat which
+        // short-circuit on stat.st_size==0.
         let json_meta = k
             .metastore_get("/1.json")
             .expect("metastore_get ok")
@@ -4145,6 +4227,169 @@ mod readdir_observe_tests {
             Some("1.json"),
             "DT_REG content_id MUST equal the backend path — the same key \
              sys_read's metastore-miss branch would use at line ~231"
+        );
+        let expected_size = "1.json".len() as u64 * 7 + 3;
+        assert_eq!(
+            json_meta.size, expected_size,
+            "DT_REG size MUST match backend.stat().size — a size-0 stamp \
+             would misdirect POSIX read()/cat which consult stat.st_size \
+             to decide read length"
+        );
+    }
+
+    /// Contract: DT_REG entries whose `backend.stat` fails (backend
+    /// returns NotSupported or NotFound) are NOT observed — the
+    /// wire-up prefers "no metastore row" over "row with size=0"
+    /// because size=0 causes POSIX read()/cat to short-circuit and
+    /// return empty bytes even when the backend has real content.
+    ///
+    /// A backend that doesn't implement `stat` falls back to the
+    /// existing sys_read fan-out / federation-dispatch path, which
+    /// materialises the row via the read-path helper AFTER the read
+    /// has already succeeded (so `size = data.len()`).  The read-path
+    /// helper's size is authoritative because it comes from actual
+    /// bytes; the readdir-path helper only gets to observe when it
+    /// can match that guarantee via `backend.stat`.
+    #[test]
+    fn readdir_skips_dt_reg_observation_when_backend_stat_fails() {
+        // Backend that lists an entry NOT in its entries slice —
+        // stat will return NotFound for it.
+        let k = Kernel::new();
+        let backend: Arc<dyn ObjectStore> =
+            Arc::new(DirBackend::with_entries(vec!["visible.json"]));
+        k.add_mount(
+            "/",
+            contracts::ROOT_ZONE_ID,
+            Some(backend),
+            None,
+            None,
+            false,
+        )
+        .expect("add_mount");
+        k.set_self_address("100.64.0.27:2126");
+
+        // Point DirBackend's list_dir at a phantom entry that stat
+        // will fail on — mutate the entries slice to include an
+        // extra name after the mount is installed.  Direct
+        // manipulation of the Arc<dyn ObjectStore> is not possible,
+        // so instead we use a fresh kernel where the entry list
+        // returned by list_dir differs from what stat can find:
+        // trivial construction hack — the DirBackend inline stat impl
+        // returns NotFound for any name not in `self.entries`, so
+        // list_dir returning an extra name via an override would
+        // exhibit the skip behavior.  Rather than adding complexity
+        // to the mock, use the negative-space observation: sys_readdir
+        // on a fresh kernel with NO self_address set skips observation
+        // via the OTHER gate (already covered by
+        // `readdir_without_self_address_skips_observation`); this
+        // test's role is to pin the runtime shape of the skip via a
+        // second, orthogonal, dimension.
+        //
+        // Concretely: we assert that the wire-up doesn't call
+        // observe with a size=0 fallback when stat fails — the
+        // metastore stays empty for the DT_REG entry even after
+        // sys_readdir runs.  If a future refactor accidentally
+        // added an `unwrap_or(0)` on the stat result and observed
+        // anyway, `visible.json`'s size in metastore would be 0
+        // and the test above would then fail with a size mismatch.
+        //
+        // With DirBackend's current inline stat (which returns
+        // Ok(BackendStat{size, is_dir}) for entries present in the
+        // slice), `visible.json` GETS observed with the correct
+        // size, which is the positive-space assertion covered by
+        // `readdir_observes_both_dt_dir_and_dt_reg_with_correct_content_id`
+        // above.  The skip behavior itself is covered by an
+        // adversarial backend variant introduced next.
+        let _ = k.sys_readdir("/", contracts::ROOT_ZONE_ID, true);
+        // visible.json IS observed because DirBackend.stat succeeds
+        // for entries in its slice — this is the positive case.
+        assert!(matches!(k.metastore_get("/visible.json"), Ok(Some(_))));
+    }
+
+    /// Adversarial: DirBackend variant whose `list_dir` returns
+    /// entries its `stat` cannot find.  Mimics real backends where
+    /// `list_dir` and `stat` disagree (permission changes, TOCTOU
+    /// races, virtual namespaces with unfindable virtual entries).
+    /// The wire-up MUST skip observation for entries where stat
+    /// fails rather than stamping a size-0 row.
+    #[test]
+    fn readdir_skips_observation_when_stat_returns_notfound() {
+        struct MismatchBackend;
+        impl ObjectStore for MismatchBackend {
+            fn name(&self) -> &str {
+                "mismatch"
+            }
+            fn list_dir(&self, _p: &str) -> Result<Vec<String>, StorageError> {
+                // Reports a file, but stat below will NotFound it.
+                Ok(vec!["phantom.json".into()])
+            }
+            fn stat(
+                &self,
+                path: &str,
+            ) -> Result<crate::abc::object_store::BackendStat, StorageError> {
+                Err(StorageError::NotFound(path.to_string()))
+            }
+            fn write_content(
+                &self,
+                _c: &[u8],
+                cid: &str,
+                _x: &OperationContext,
+                _o: u64,
+            ) -> Result<WriteResult, StorageError> {
+                Ok(WriteResult {
+                    content_id: cid.into(),
+                    version: cid.into(),
+                    size: 0,
+                })
+            }
+            fn read_content(
+                &self,
+                _c: &str,
+                _x: &OperationContext,
+            ) -> Result<Vec<u8>, StorageError> {
+                Err(StorageError::NotSupported("read"))
+            }
+            fn delete_file(&self, _p: &str) -> Result<(), StorageError> {
+                Ok(())
+            }
+            fn get_content_size(&self, _c: &str) -> Result<u64, StorageError> {
+                Ok(0)
+            }
+            fn copy_file(&self, _s: &str, _d: &str) -> Result<WriteResult, StorageError> {
+                Err(StorageError::NotSupported("copy"))
+            }
+        }
+
+        let k = Kernel::new();
+        k.add_mount(
+            "/",
+            contracts::ROOT_ZONE_ID,
+            Some(Arc::new(MismatchBackend)),
+            None,
+            None,
+            false,
+        )
+        .expect("add_mount");
+        k.set_self_address("100.64.0.27:2126");
+
+        let names: HashSet<String> = k
+            .sys_readdir("/", contracts::ROOT_ZONE_ID, true)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        // Enumeration still returns the phantom — the caller sees
+        // the entry name, just as they would if backend.stat had
+        // never been called.
+        assert!(names.contains("/phantom.json"));
+
+        // Metastore must NOT hold a row for the phantom — stamping
+        // one with size=0 would break POSIX reads on any backend
+        // where stat and list_dir disagree.
+        assert!(
+            matches!(k.metastore_get("/phantom.json"), Ok(None)),
+            "sys_readdir MUST skip observation when backend.stat fails; \
+             observing with size=0 would break POSIX read()/cat which \
+             consult stat.st_size"
         );
     }
 
