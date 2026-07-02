@@ -887,6 +887,25 @@ fn joiner_local_zone_peer_seeds(peer_addrs: &[NodeAddress]) -> Vec<String> {
     seeds
 }
 
+/// Operator-facing projection of [`joiner_local_zone_peer_seeds`] — bare
+/// `host:port` strings, no local `hostname_to_node_id` hash prefix.  Used
+/// ONLY for tracing::info log fields at boot boundary; the actual peer
+/// list passed to `ZoneManager::join_zone` still uses the raft-internal
+/// `id@host:port` form because the address-book key derivation there
+/// needs the authoritative-id round-trip.  Keeping them separate prevents
+/// the leak class where operators / peer AIs read the log line and
+/// mistake local `hostname_to_node_id(peer_addr)` output for a
+/// "transport-auto-resolved remote node_id" — the two concepts share zero
+/// state.
+fn joiner_local_zone_peer_seeds_display(peer_addrs: &[NodeAddress]) -> Vec<String> {
+    let mut seeds: Vec<String> = peer_addrs
+        .iter()
+        .map(NodeAddress::to_operator_str)
+        .collect();
+    seeds.sort();
+    seeds
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EmptyStorageBootstrapPlan {
     FoundImmediately,
@@ -1155,10 +1174,11 @@ fn attempt_join_zone_round(
             // entries from the leader once AddNode commits.
             if zm.get_zone(zone_id).is_none() {
                 let zone_peers = joiner_local_zone_peer_seeds(peer_addrs);
+                let zone_peers_display = joiner_local_zone_peer_seeds_display(peer_addrs);
                 tracing::info!(
                     zone = %zone_id,
-                    seed_count = zone_peers.len(),
-                    seed_peers = ?zone_peers,
+                    seed_count = zone_peers_display.len(),
+                    seed_peers = ?zone_peers_display,
                     "local join_zone seed peers",
                 );
                 if let Err(e) = zm.join_zone(zone_id, zone_peers, /* learner */ as_learner) {
@@ -1813,10 +1833,12 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
                 let peer_seed_addrs: Vec<NodeAddress> = peer_addrs.values().cloned().collect();
                 let local_peer_seeds = joiner_local_zone_peer_seeds(&peer_seed_addrs);
                 if !local_peer_seeds.is_empty() {
+                    let local_peer_seeds_display =
+                        joiner_local_zone_peer_seeds_display(&peer_seed_addrs);
                     tracing::info!(
                         zone = %zone_id,
-                        seed_count = local_peer_seeds.len(),
-                        seed_peers = ?local_peer_seeds,
+                        seed_count = local_peer_seeds_display.len(),
+                        seed_peers = ?local_peer_seeds_display,
                         "local federation zone seed peers",
                     );
                     let _ = zm.join_zone(zone_id, local_peer_seeds, false);
