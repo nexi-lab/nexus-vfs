@@ -471,6 +471,14 @@ fn main() -> Result<()> {
 /// `--bind-addr`/`--hostname`.  `run_daemon` hands the lot to
 /// [`bootstrap_or_join_zone`] which owns the actual root-zone
 /// dispatch.
+///
+/// `peer_addrs` intentionally reflects **CLI `--peers` only** — NOT
+/// the CLI ∪ identity union that seeds `ZoneManager`'s transport
+/// peer map.  Root is per-node SOLO, and `bootstrap_or_join_zone`
+/// hard-rejects non-empty peer lists on root (see the SOLO-invariant
+/// guard in `distributed_coordinator.rs`).  Identity's persisted
+/// peers therefore must NOT flow into root's bootstrap decision;
+/// they're a transport reconnect hint, not a bootstrap seed.
 struct ZoneManagerBundle {
     zm: std::sync::Arc<ZoneManager>,
     node_id: u64,
@@ -571,10 +579,23 @@ fn open_zone_manager(
     // self-address validation runs on the full set (an
     // identity-persisted peer that happens to match self_address must
     // still be rejected at parse time, not after `Zone registered`).
+    //
+    // The MERGED list seeds `ZoneManager`'s transport peer map (i.e.
+    // "who might this node dial for federation") but does NOT
+    // propagate into `bundle.peer_addrs` — which is CLI-only, per the
+    // struct docstring.  Reason: root is per-node SOLO, and
+    // `bootstrap_or_join_zone("root", ..., peers=merged, ...)` would
+    // hit the SOLO-invariant guard as soon as identity persisted a
+    // sharedzone-leader peer.  Post-restart joiners in cc-tasks-share
+    // topology reproduced exactly this cascade — identity carried
+    // founder's address, root bootstrap errored, daemon exited,
+    // sharedzone lost quorum, founder's FUSE writes hung with I/O
+    // error.
     let merged_peers_joined = identity_persisted.peers.join(",");
-    let peer_addrs: Vec<NodeAddress> = NodeAddress::parse_peer_list(&merged_peers_joined, use_tls)
-        .map_err(|e| anyhow::anyhow!("identity peers parse: {}", e))?;
-    let peers_str: Vec<String> = peer_addrs
+    let merged_peer_addrs: Vec<NodeAddress> =
+        NodeAddress::parse_peer_list(&merged_peers_joined, use_tls)
+            .map_err(|e| anyhow::anyhow!("identity peers parse: {}", e))?;
+    let merged_peers_str: Vec<String> = merged_peer_addrs
         .iter()
         .map(NodeAddress::to_raft_peer_str)
         .collect();
@@ -598,20 +619,22 @@ fn open_zone_manager(
         common.advertise_addr.as_deref(),
         &hostname,
         bind_port,
-        peer_addrs.len(),
+        merged_peer_addrs.len(),
     );
 
     // Reject "self listed in --peers" early — see
     // `validate_peers_excludes_self` for why this is a hard error
-    // under the PR #3996 opaque-ID contract.
-    validate_peers_excludes_self(&peer_addrs, &self_address)
+    // under the PR #3996 opaque-ID contract.  Runs on the MERGED set
+    // so an identity-persisted stale self-entry also surfaces here
+    // rather than after `Zone registered`.
+    validate_peers_excludes_self(&merged_peer_addrs, &self_address)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     let zm = ZoneManager::with_node_id(
         &hostname,
         node_id,
         &zones_dir,
-        peers_str,
+        merged_peers_str,
         &common.bind_addr,
         tls,
         Some(self_address.clone()),
@@ -619,11 +642,14 @@ fn open_zone_manager(
     )
     .map_err(|e| anyhow::anyhow!("ZoneManager::with_node_id: {}", e))?;
 
+    // Return CLI-only peer_addrs — see `ZoneManagerBundle` docstring.
+    // Identity's persisted peers reached `ZoneManager`'s transport
+    // seed above; they must not propagate into `bootstrap_or_join_zone`.
     Ok(ZoneManagerBundle {
         zm,
         node_id,
         self_address,
-        peer_addrs,
+        peer_addrs: cli_peer_addrs,
     })
 }
 
