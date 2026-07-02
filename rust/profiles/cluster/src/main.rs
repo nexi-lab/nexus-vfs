@@ -102,6 +102,25 @@ struct CommonArgs {
     )]
     data_dir: PathBuf,
 
+    /// Node-bound identity directory holding `identity.json`
+    /// (schema-versioned peer address book).
+    ///
+    /// Unset (default): resolved via
+    /// `nexus_raft::identity::default_identity_dir()` to the
+    /// platform-native user-data location (`%LOCALAPPDATA%\Nexus`,
+    /// `~/Library/Application Support/Nexus`, `$XDG_DATA_HOME/nexus`).
+    /// Set explicitly for Docker E2E tests that need to redirect the
+    /// identity file to a fixture path, or operators who want the
+    /// identity under a specific management scope.  Persists ONLY the
+    /// transport peer list — `node_id` stays at `<data_dir>/.node_id`
+    /// with its rotate-on-wipe lifecycle, per the raft heartbeat
+    /// invariant documented in `docs/federation-architecture.md`
+    /// § 6.3.1.  SHOULD live outside `--data-dir` so cache-loss cleanup
+    /// does not remove it — boot warns if `identity_dir` is a child of
+    /// `data_dir`.
+    #[arg(long, env = "NEXUS_IDENTITY_DIR", global = true)]
+    identity_dir: Option<PathBuf>,
+
     /// Durable global metastore (redb) — the kernel's VFS namespace.
     /// File registrations survive restarts only if this lives on
     /// persistent storage. Defaults to `<data_dir>/metastore.redb`;
@@ -511,12 +530,50 @@ fn open_zone_manager(
         })
     };
 
-    // Parse `--peers` into structured `NodeAddress` entries — address
-    // book only.  ZoneManager seeds its transport peer map from this;
-    // ConfState is independent (mutated only by ConfChange via
-    // JoinZone driven by `bootstrap_or_join_zone`).
-    let peer_addrs: Vec<NodeAddress> = NodeAddress::parse_peer_list(&common.peers, use_tls)
+    // Parse `--peers` into structured `NodeAddress` entries.  Merge
+    // with the node-bound `identity.json` peer list so a cold-boot
+    // after `<data_dir>` cleanup does not need operator re-specifying
+    // `--peers`.  Identity's `peers[]` is a *transport seed*, NOT a
+    // `ConfState` shadow (ConfState is independent, mutated only by
+    // ConfChange via JoinZone in `bootstrap_or_join_zone`).
+    //
+    // See `docs/federation-architecture.md` § 6.3.1 — the split scopes
+    // identity narrowly to the address book; `node_id` intentionally
+    // stays at `<data_dir>/.node_id` under the rotate-on-wipe raft
+    // heartbeat invariant.
+    let cli_peer_addrs: Vec<NodeAddress> = NodeAddress::parse_peer_list(&common.peers, use_tls)
         .map_err(|e| anyhow::anyhow!("--peers/NEXUS_PEERS parse: {}", e))?;
+    let cli_peer_strs: Vec<String> = cli_peer_addrs
+        .iter()
+        .map(NodeAddress::to_raft_peer_str)
+        .collect();
+
+    let identity_dir = common
+        .identity_dir
+        .clone()
+        .unwrap_or_else(nexus_raft::identity::default_identity_dir);
+    if identity_dir.starts_with(&common.data_dir) {
+        tracing::warn!(
+            identity_dir = %identity_dir.display(),
+            data_dir = %common.data_dir.display(),
+            "identity_dir lives under data_dir — cache-loss cleaners \
+             that remove data_dir will also destroy identity; consider \
+             --identity-dir <outside-data-dir>",
+        );
+    }
+    let identity_loaded = nexus_raft::identity::load(&identity_dir)
+        .map_err(|e| anyhow::anyhow!("identity load: {}", e))?;
+    let identity_persisted =
+        nexus_raft::identity::persist_peers(&identity_dir, &identity_loaded, &cli_peer_strs)
+            .map_err(|e| anyhow::anyhow!("identity persist_peers: {}", e))?;
+
+    // Feed the merged (identity ∪ CLI) list through NodeAddress so
+    // self-address validation runs on the full set (an
+    // identity-persisted peer that happens to match self_address must
+    // still be rejected at parse time, not after `Zone registered`).
+    let merged_peers_joined = identity_persisted.peers.join(",");
+    let peer_addrs: Vec<NodeAddress> = NodeAddress::parse_peer_list(&merged_peers_joined, use_tls)
+        .map_err(|e| anyhow::anyhow!("identity peers parse: {}", e))?;
     let peers_str: Vec<String> = peer_addrs
         .iter()
         .map(NodeAddress::to_raft_peer_str)
@@ -1245,6 +1302,10 @@ async fn run_join(
     let use_tls = !common.no_tls;
     let peer = NodeAddress::parse(peer_addr, use_tls)
         .map_err(|e| anyhow::anyhow!("--peer-addr parse '{}': {}", peer_addr, e))?;
+    // Cache the raft peer string before moving `peer_addrs` into the
+    // spawn_blocking closure below — needed by the post-join identity
+    // persist step.
+    let peer_str_for_identity = peer.to_raft_peer_str();
     let peer_addrs = vec![peer];
 
     // Ensure the local parent zone exists BEFORE writing the cross-zone
@@ -1328,10 +1389,38 @@ async fn run_join(
         .await
         .map_err(|e| anyhow::anyhow!("mount: {}", e))?;
 
+    // Persist the leader address in identity so subsequent daemon
+    // restarts (with `--peers` unset — the routine `restart` container
+    // mode) still have a transport-layer seed to contact this peer.
+    // Without this, every join sidecar would leave identity empty and
+    // the daemon's `open_zone_manager` would lose the peer address as
+    // soon as the entrypoint script unsets `NEXUS_PEERS` on restart.
+    // Merge, not overwrite — identity may already carry other peers
+    // from earlier joins.
+    let identity_dir = common
+        .identity_dir
+        .clone()
+        .unwrap_or_else(nexus_raft::identity::default_identity_dir);
+    let ident = nexus_raft::identity::load(&identity_dir)
+        .map_err(|e| anyhow::anyhow!("identity load: {}", e))?;
+    nexus_raft::identity::persist_peers(
+        &identity_dir,
+        &ident,
+        std::slice::from_ref(&peer_str_for_identity),
+    )
+    .map_err(|e| anyhow::anyhow!("identity persist_peers: {}", e))?;
+
     let role = if as_learner { "learner" } else { "voter" };
     println!(
-        "Joined remote zone '{}' as {} (via {}); mounted at '{}' inside zone '{}'",
-        remote_zone_id, role, peer_addr, local_path, parent_zone
+        "Joined remote zone '{}' as {} (via {}); mounted at '{}' inside zone '{}'; \
+         peer '{}' persisted to identity '{}'",
+        remote_zone_id,
+        role,
+        peer_addr,
+        local_path,
+        parent_zone,
+        peer_str_for_identity,
+        identity_dir.display(),
     );
     Ok(())
 }
