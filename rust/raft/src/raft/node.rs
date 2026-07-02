@@ -827,6 +827,36 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         }
     }
 
+    /// Resolve the current leader ID through the forward-context
+    /// peer_map into an operator-form address hint (`host:port`), or
+    /// `None` if the leader is unknown, its address hasn't been
+    /// learned yet, or there is no forward-context (embedded/single-
+    /// node mode).
+    ///
+    /// Used by every `RaftError::NotLeader { leader_hint }`
+    /// construction site inside `ZoneConsensus` to avoid leaking the
+    /// raw u64 through the error's Display.  See
+    /// [`crate::raft::RaftError::NotLeader`] for the rationale.
+    #[cfg(all(feature = "grpc", has_protos))]
+    fn leader_hint_addr(&self) -> Option<String> {
+        let id = self.leader_id()?;
+        let ctx = self.forward_ctx.as_ref()?;
+        ctx.peers
+            .read()
+            .ok()?
+            .get(&id)
+            .map(|addr| addr.to_operator_str())
+    }
+
+    /// Non-grpc build: no forward-context exists, so we cannot resolve
+    /// the leader id to an address.  Return `None` — the operator sees
+    /// the raw `NotLeader` variant without a hint, which is honest
+    /// (single-node builds never actually forward).
+    #[cfg(not(all(feature = "grpc", has_protos)))]
+    fn leader_hint_addr(&self) -> Option<String> {
+        None
+    }
+
     /// Block until this node becomes leader of the zone, or `timeout`
     /// elapses.  Returns `true` if leader, `false` on timeout.
     ///
@@ -1076,7 +1106,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
     ) -> Result<oneshot::Receiver<Result<CommandResult>>> {
         if !self.is_leader() {
             return Err(RaftError::NotLeader {
-                leader_hint: self.leader_id(),
+                leader_hint: self.leader_hint_addr(),
             });
         }
 
@@ -1215,9 +1245,14 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
 
             let leader_addr = {
                 let peers = ctx.peers.read().unwrap();
-                peers.get(&leader_id).cloned().ok_or(RaftError::NotLeader {
-                    leader_hint: Some(leader_id),
-                })?
+                // peer_map miss here means we know a leader_id but have
+                // no address for it — pass `None` for the hint (loud &
+                // honest) rather than surface the bare id.  See
+                // RaftError::NotLeader docstring.
+                peers
+                    .get(&leader_id)
+                    .cloned()
+                    .ok_or(RaftError::NotLeader { leader_hint: None })?
             };
 
             tracing::debug!(
@@ -1253,7 +1288,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         }
 
         Err(RaftError::NotLeader {
-            leader_hint: self.leader_id(),
+            leader_hint: self.leader_hint_addr(),
         })
     }
 
@@ -1344,7 +1379,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
     ) -> Result<ConfState> {
         if !self.is_leader() {
             return Err(RaftError::NotLeader {
-                leader_hint: self.leader_id(),
+                leader_hint: self.leader_hint_addr(),
             });
         }
 

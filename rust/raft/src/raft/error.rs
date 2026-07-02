@@ -14,10 +14,22 @@ pub enum RaftError {
     Raft(String),
 
     /// Node is not the leader.
+    ///
+    /// `leader_hint` carries the operator-form address (`host:port`) of
+    /// the known leader when the local peer_map has an entry.  It is
+    /// intentionally NOT the raw u64 node_id: operators and peer AIs
+    /// reading the resulting Display line commonly mistake a bare
+    /// node_id (locally derived from `hostname_to_node_id(hostname)`)
+    /// for an authoritative transport-resolved identifier — the two
+    /// concepts share zero state.  Callers that already have the
+    /// address in hand should pass `Some(addr.to_operator_str())`;
+    /// callers where the leader is unknown (no election yet, or
+    /// leader address not learned) MUST pass `None`.
     #[error("not leader, leader hint: {leader_hint:?}")]
     NotLeader {
-        /// Hint about who the leader might be.
-        leader_hint: Option<u64>,
+        /// Operator-form (`host:port`) address of the known leader, or
+        /// `None` if unknown.  See variant docstring for rationale.
+        leader_hint: Option<String>,
     },
 
     /// Proposal was dropped (e.g., leader changed).

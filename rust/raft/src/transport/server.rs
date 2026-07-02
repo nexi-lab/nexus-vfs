@@ -653,7 +653,6 @@ impl ZoneApiService for ZoneApiServiceImpl {
     ) -> std::result::Result<Response<ProposeResponse>, Status> {
         let req = request.into_inner();
         let node = get_zone_node(&self.registry, &req.zone_id)?;
-        let peers = self.registry.get_peers(&req.zone_id).unwrap_or_default();
 
         tracing::debug!(
             "Received propose request: zone={}, id={:?}, forwarded={}",
@@ -736,13 +735,13 @@ impl ZoneApiService for ZoneApiServiceImpl {
                 }))
             }
             Err(RaftError::NotLeader { leader_hint }) => {
-                let addr = leader_hint
-                    .and_then(|id| peers.get(&id))
-                    .map(|a| a.endpoint.clone());
+                // `leader_hint` is already the operator-form host:port
+                // string of the known leader (or None); no peer_map
+                // lookup needed.  See RaftError::NotLeader docstring.
                 Ok(Response::new(ProposeResponse {
                     success: false,
                     error: Some("Not the leader".to_string()),
-                    leader_address: addr,
+                    leader_address: leader_hint,
                     result: None,
                     applied_index: 0,
                 }))
@@ -1038,14 +1037,12 @@ impl ZoneApiService for ZoneApiServiceImpl {
                 }))
             }
             Err(RaftError::NotLeader { leader_hint }) => {
-                let peers = self.registry.get_peers(&req.zone_id).unwrap_or_default();
-                let addr = leader_hint
-                    .and_then(|id| peers.get(&id))
-                    .map(|a| a.endpoint.clone());
+                // `leader_hint` is already operator-form host:port
+                // (or None) — no peer_map lookup needed.
                 Ok(Response::new(JoinZoneResponse {
                     success: false,
                     error: Some("not leader".to_string()),
-                    leader_address: addr,
+                    leader_address: leader_hint,
                     config: None,
                 }))
             }
