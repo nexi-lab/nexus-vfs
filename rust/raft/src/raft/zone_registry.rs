@@ -643,7 +643,7 @@ impl ZoneRaftRegistry {
         // `ZoneConsensus::is_leader` / `leader_id` after returning.
 
         tracing::info!(
-            "Zone '{}' registered (node_id={}, peers={})",
+            "Zone '{}' registered (local_node_id={}, peers={})",
             zone_id,
             self.node_id,
             shared_peers.read().unwrap().len()

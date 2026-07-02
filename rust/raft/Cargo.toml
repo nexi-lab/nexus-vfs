@@ -95,6 +95,7 @@ protoc-bin-vendored = "3"
 
 [dev-dependencies]
 tokio-test = "0.4"
+regex = { workspace = true }
 
 [features]
 default = ["full"]

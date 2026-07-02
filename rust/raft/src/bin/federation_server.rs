@@ -67,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&data_path)?;
 
     tracing::info!(
-        "Nexus Federation Server\n  Hostname: {}\n  Node ID:  {}\n  Bind:     {}\n  Data:     {}",
+        "Nexus Federation Server\n  Hostname:       {}\n  Local node ID:  {}\n  Bind:           {}\n  Data:           {}",
         hostname,
         node_id,
         bind_addr,

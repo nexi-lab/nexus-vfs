@@ -108,7 +108,7 @@ impl ReplicationLog {
             next_seq,
             replicated_watermark,
             earliest_seq,
-            node_id,
+            local_node_id = node_id,
             "ReplicationLog initialized"
         );
 

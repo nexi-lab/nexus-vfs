@@ -68,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
 
     tracing::info!(
-        "Starting Nexus Witness Node\n  Hostname: {}\n  Node ID: {}\n  Bind: {}\n  Data: {}\n  Federation zones: {:?}",
+        "Starting Nexus Witness Node\n  Hostname:         {}\n  Local node ID:    {}\n  Bind:             {}\n  Data:             {}\n  Federation zones: {:?}",
         hostname,
         node_id,
         bind_addr,

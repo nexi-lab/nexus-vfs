@@ -700,7 +700,7 @@ pub fn validate_bootstrap_mode(
                      SOLO by design (each daemon owns its own 1-voter root namespace).  \
                      NEXUS_PEERS would JoinZone(root) into the peer's cluster, which is \
                      misuse for federation.  Fix: leave NEXUS_PEERS empty, then federate via \
-                     a named zone (`nexusd-cluster join <leader_id>@<addr> <named-zone> \
+                     a named zone (`nexusd-cluster join <host:port> <named-zone> \
                      <mount-path>` sidecar).  See docs/federation-architecture.md §6.3.1."
                         .to_string(),
                 );
@@ -801,7 +801,7 @@ pub fn read_or_mint_node_id(zones_dir: &str) -> Result<u64, String> {
                     final_path.display(),
                 ));
             }
-            tracing::info!(node_id = id, "node_id loaded from disk");
+            tracing::info!(local_node_id = id, "local_node_id loaded from disk");
             Ok(id)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -833,7 +833,7 @@ pub fn read_or_mint_node_id(zones_dir: &str) -> Result<u64, String> {
                     final_path.display(),
                 )
             })?;
-            tracing::info!(node_id = id, "node_id minted and persisted");
+            tracing::info!(local_node_id = id, "local_node_id minted and persisted");
             Ok(id)
         }
         Err(e) => Err(format!("read node id '{}': {e}", final_path.display())),
@@ -887,6 +887,25 @@ fn joiner_local_zone_peer_seeds(peer_addrs: &[NodeAddress]) -> Vec<String> {
     seeds
 }
 
+/// Operator-facing projection of [`joiner_local_zone_peer_seeds`] — bare
+/// `host:port` strings, no local `hostname_to_node_id` hash prefix.  Used
+/// ONLY for tracing::info log fields at boot boundary; the actual peer
+/// list passed to `ZoneManager::join_zone` still uses the raft-internal
+/// `id@host:port` form because the address-book key derivation there
+/// needs the authoritative-id round-trip.  Keeping them separate prevents
+/// the leak class where operators / peer AIs read the log line and
+/// mistake local `hostname_to_node_id(peer_addr)` output for a
+/// "transport-auto-resolved remote node_id" — the two concepts share zero
+/// state.
+fn joiner_local_zone_peer_seeds_display(peer_addrs: &[NodeAddress]) -> Vec<String> {
+    let mut seeds: Vec<String> = peer_addrs
+        .iter()
+        .map(NodeAddress::to_operator_str)
+        .collect();
+    seeds.sort();
+    seeds
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EmptyStorageBootstrapPlan {
     FoundImmediately,
@@ -916,7 +935,7 @@ fn create_founder_zone(
     peers_empty: bool,
 ) -> Result<(), String> {
     tracing::info!(
-        node_id,
+        local_node_id = node_id,
         zone = %zone_id,
         self_address = %self_address,
         bootstrap_new,
@@ -1155,10 +1174,11 @@ fn attempt_join_zone_round(
             // entries from the leader once AddNode commits.
             if zm.get_zone(zone_id).is_none() {
                 let zone_peers = joiner_local_zone_peer_seeds(peer_addrs);
+                let zone_peers_display = joiner_local_zone_peer_seeds_display(peer_addrs);
                 tracing::info!(
                     zone = %zone_id,
-                    seed_count = zone_peers.len(),
-                    seed_peers = ?zone_peers,
+                    seed_count = zone_peers_display.len(),
+                    seed_peers = ?zone_peers_display,
                     "local join_zone seed peers",
                 );
                 if let Err(e) = zm.join_zone(zone_id, zone_peers, /* learner */ as_learner) {
@@ -1185,7 +1205,7 @@ fn attempt_join_zone_round(
                     tracing::info!(
                         endpoint = %endpoint,
                         zone = %zone_id,
-                        node_id,
+                        local_node_id = node_id,
                         "joined zone via leader — waiting for ConfState install",
                     );
                     // The leader's `AddNode`/`AddLearnerNode` commit
@@ -1384,7 +1404,7 @@ pub fn bootstrap_or_join_zone(
     if zone_id == contracts::ROOT_ZONE_ID && !peer_addrs.is_empty() {
         let peer_list: Vec<String> = peer_addrs
             .iter()
-            .map(NodeAddress::to_raft_peer_str)
+            .map(NodeAddress::to_operator_str)
             .collect();
         return Err(format!(
             "root zone is per-node SOLO by design (each nexus daemon owns its \
@@ -1392,7 +1412,7 @@ pub fn bootstrap_or_join_zone(
              applied to root, which would JoinZone(root) into the peer's \
              cluster — that's misuse for federation.  Fix: leave NEXUS_PEERS \
              empty on this node, then federate via a named zone \
-             (`nexusd-cluster join <leader_id>@<addr> <named-zone> <mount-path>` \
+             (`nexusd-cluster join <host:port> <named-zone> <mount-path>` \
              sidecar, or `--mount-driver local-connector:<named-zone>:...`).  \
              See docs/federation-architecture.md §6.3.1."
         ));
@@ -1408,7 +1428,7 @@ pub fn bootstrap_or_join_zone(
         match check_zone_resumable(zh.as_ref()) {
             Ok(()) => {
                 tracing::info!(
-                    node_id,
+                    local_node_id = node_id,
                     zone = %zone_id,
                     last_log_index = zh.last_log_index(),
                     "zone loaded from persisted storage; resuming from ConfState",
@@ -1424,14 +1444,14 @@ pub fn bootstrap_or_join_zone(
                          that followed.  Daemon restart cannot self-repair without peer \
                          addresses to re-JoinZone against — to recover, either:\n  \
                          (a) stop the daemon, run `nexusd-cluster join \
-                         <leader_node_id>@<leader_addr> {zone_id} /<mount> \
+                         <leader_host:port> {zone_id} /<mount> \
                          --data-dir <data_dir> --no-tls`, then restart in restart mode; or\n  \
                          (b) `rm -rf <data_dir>/{zone_id}` (this zone's subdirectory only) \
                          and restart in static mode."
                     ));
                 }
                 tracing::warn!(
-                    node_id,
+                    local_node_id = node_id,
                     zone = %zone_id,
                     reason = %reason,
                     "loaded zone state not safely resumable; falling through to JoinZone \
@@ -1478,7 +1498,7 @@ pub fn bootstrap_or_join_zone(
     // Branch 3: peers configured, no flag, storage empty — joiner.
     // Loop on JoinZone RPC until a leader accepts.
     tracing::info!(
-        node_id,
+        local_node_id = node_id,
         zone = %zone_id,
         peer_count = peer_addrs.len(),
         max_attempts = ?max_attempts,
@@ -1500,7 +1520,7 @@ pub fn bootstrap_or_join_zone(
 
     if matches!(plan, EmptyStorageBootstrapPlan::ProbePeersThenFound) {
         tracing::info!(
-            node_id,
+            local_node_id = node_id,
             zone = %zone_id,
             peer_count = peer_addrs.len(),
             attempts = FOUNDER_REJOIN_PROBE_ATTEMPTS,
@@ -1524,7 +1544,7 @@ pub fn bootstrap_or_join_zone(
             std::thread::sleep(Duration::from_millis(500));
         }
         tracing::info!(
-            node_id,
+            local_node_id = node_id,
             zone = %zone_id,
             last_error = %last_err,
             "founder probe found no existing cluster; creating local 1-voter zone",
@@ -1813,10 +1833,12 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
                 let peer_seed_addrs: Vec<NodeAddress> = peer_addrs.values().cloned().collect();
                 let local_peer_seeds = joiner_local_zone_peer_seeds(&peer_seed_addrs);
                 if !local_peer_seeds.is_empty() {
+                    let local_peer_seeds_display =
+                        joiner_local_zone_peer_seeds_display(&peer_seed_addrs);
                     tracing::info!(
                         zone = %zone_id,
-                        seed_count = local_peer_seeds.len(),
-                        seed_peers = ?local_peer_seeds,
+                        seed_count = local_peer_seeds_display.len(),
+                        seed_peers = ?local_peer_seeds_display,
                         "local federation zone seed peers",
                     );
                     let _ = zm.join_zone(zone_id, local_peer_seeds, false);
