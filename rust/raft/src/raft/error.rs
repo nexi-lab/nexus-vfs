@@ -148,4 +148,104 @@ mod tests {
             "regex sanity check failed to detect embedded long integer: {s:?}",
         );
     }
+
+    /// Source-tree regression pin: no tracing macro in this crate may
+    /// introduce a field with the shape `peer = <var>_id` or
+    /// `leader = <var>_id` (or any similar identity-naming field where
+    /// the value is a bare u64-shaped identifier).  Under n>2 topology
+    /// such fields render as `peer=17903...` in the log line, which
+    /// operators and peer AIs invariably mistake for a transport-auto-
+    /// resolved remote node_id — the leak class PR #110 + #111 closed.
+    ///
+    /// Correct shapes are `local_node_id`, `peer_node_id`, or
+    /// `leader_node_id` (or a resolved `_addr` field carrying the
+    /// operator-form `host:port` from [`crate::transport::NodeAddress::to_operator_str`]).
+    ///
+    /// The scan walks `src/` from CARGO_MANIFEST_DIR and rejects any
+    /// occurrence of the retired patterns.  New patterns matching
+    /// `<ambiguous-field> = <var>` where `<var>` ends in `_id` or `id`
+    /// must be renamed to the disambiguated form OR added to the
+    /// allowlist below with justification (e.g. `request_id` in an RPC
+    /// handler is not an identity field for a peer / leader / node).
+    #[test]
+    fn tracing_bans_ambiguous_peer_leader_identity_fields() {
+        use std::fs;
+        use std::path::Path;
+
+        // Retired patterns.  Each is a regex against a single source
+        // line.  The `\b` word boundary + explicit LHS ambiguous name
+        // list (peer|leader|node_id, NOT peer_node_id / local_node_id
+        // / leader_node_id) rejects the retired shape while accepting
+        // the corrected one.  RHS is any bare identifier ending in
+        // `_id`, `.id`, or `.node_id`.  Trailing `[,)]` restricts the
+        // match to tracing-macro argument position (not `let X = Y;`
+        // variable bindings inside `.rs` source, whose terminator is
+        // `;` — those are legitimate).
+        let retired = Regex::new(
+            r"\b(peer|leader|node_id)\s*=\s*[A-Za-z_][A-Za-z0-9_.]*(_id|\.id|\.node_id)\s*[,)]",
+        )
+        .unwrap();
+
+        fn walk(dir: &Path, files: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, files);
+                } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+                    files.push(path);
+                }
+            }
+        }
+
+        let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&src_root, &mut files);
+        assert!(!files.is_empty(), "no .rs files walked under {src_root:?}");
+
+        // This test itself contains the retired patterns as string
+        // literals in `retired[]`.  Skip self-scanning.
+        let self_name = "error.rs";
+
+        let mut violations: Vec<(std::path::PathBuf, usize, String)> = Vec::new();
+        for f in &files {
+            if f.file_name().and_then(|s| s.to_str()) == Some(self_name) {
+                continue;
+            }
+            let Ok(content) = fs::read_to_string(f) else {
+                continue;
+            };
+            for (lineno, line) in content.lines().enumerate() {
+                // Skip commented-out lines (the retired shape may
+                // survive in explanatory comments — those are not
+                // logs).
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                    continue;
+                }
+                if let Some(m) = retired.find(line) {
+                    violations.push((
+                        f.clone(),
+                        lineno + 1,
+                        format!("[matched `{}`] {}", m.as_str(), line.trim()),
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "retired ambiguous identity tracing patterns found — rename \
+             to local_node_id / peer_node_id / leader_node_id (+ paired \
+             _addr field when NodeAddress is in scope) per \
+             `feedback_user_observable_field_naming`:\n{}",
+            violations
+                .iter()
+                .map(|(p, n, l)| format!("  {}:{}  {}", p.display(), n, l))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
 }
