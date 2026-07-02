@@ -1836,7 +1836,7 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                     tracing::info!(
                         index = entry.index,
                         change_type = ?cc.get_change_type(),
-                        node_id = cc.node_id,
+                        peer_node_id = cc.node_id,
                         voters = ?cs.voters,
                         "raft.conf_change.applied",
                     );
