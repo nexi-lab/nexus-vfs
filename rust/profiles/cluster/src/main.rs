@@ -347,7 +347,24 @@ enum Cmd {
     /// then writes a DT_MOUNT entry under `<parent_zone>` so syscalls
     /// at `<local_path>` route into the remote zone.
     Join {
-        /// Remote peer in `id@host:port` form (e.g. `2@nexus-2:2126`).
+        /// Remote peer as `host:port` (e.g. `nexus-2:2126` or
+        /// `100.64.0.27:2126`).
+        ///
+        /// The bare address form is the preferred syntax — operators
+        /// no longer have to look up the peer's opaque `node_id`
+        /// before joining.  The `JoinZone` RPC targets the URL only;
+        /// the peer's real `node_id` is learned automatically from
+        /// the first inbound `MsgSnapshot` via
+        /// `transport::learn_peer_address` (populates the peer_map
+        /// entry the replies route through).
+        ///
+        /// Legacy `<id>@host:port` form (e.g. `2@nexus-2:2126`) also
+        /// parses — kept for backward compat with any scripting that
+        /// still passes an explicit id.  The explicit id becomes the
+        /// initial peer_map seed but is superseded by the real id
+        /// learned from the leader's first reply, so a stale explicit
+        /// id (peer rebuilt / rotated) does NOT block the join — it
+        /// just leaves a harmless dead peer_map entry.
         peer_addr: String,
         /// Zone id to join on the remote side.
         remote_zone_id: String,
@@ -1901,6 +1918,55 @@ mod tests {
         .expect("default (no --as) must parse");
         match parsed_default.cmd.expect("join cmd") {
             Cmd::Join { as_role, .. } => assert!(matches!(as_role, JoinRole::Voter)),
+            other => panic!("expected Join, got {other:?}"),
+        }
+    }
+
+    /// Bare `host:port` is the preferred `peer_addr` form — operators
+    /// no longer sync opaque `node_id` between peers.  Pins the CLI +
+    /// docstring contract that `nexusd-cluster join <addr> <zone>
+    /// <path>` alone is a valid invocation.  Legacy `<id>@<addr>` form
+    /// stays supported (previous test above), so the two forms MUST
+    /// both parse to `Cmd::Join`.
+    #[test]
+    fn join_accepts_bare_host_port_without_explicit_node_id() {
+        // Preferred form — no operator id-lookup ceremony.
+        let bare = Args::try_parse_from([
+            "nexusd-cluster",
+            "join",
+            "100.64.0.27:2126",
+            "sharedzone",
+            "/shared",
+        ])
+        .expect("bare host:port must parse");
+        match bare.cmd.expect("join cmd") {
+            Cmd::Join {
+                peer_addr,
+                remote_zone_id,
+                local_path,
+                as_role,
+                parent_zone,
+            } => {
+                assert_eq!(peer_addr, "100.64.0.27:2126");
+                assert_eq!(remote_zone_id, "sharedzone");
+                assert_eq!(local_path, "/shared");
+                assert_eq!(parent_zone, "root");
+                assert!(matches!(as_role, JoinRole::Voter));
+            }
+            other => panic!("expected Join, got {other:?}"),
+        }
+
+        // Hostname form (Docker-compose network alias) — same shape.
+        let by_name = Args::try_parse_from([
+            "nexusd-cluster",
+            "join",
+            "founder:2126",
+            "sharedzone",
+            "/shared",
+        ])
+        .expect("bare hostname:port must parse");
+        match by_name.cmd.expect("join cmd") {
+            Cmd::Join { peer_addr, .. } => assert_eq!(peer_addr, "founder:2126"),
             other => panic!("expected Join, got {other:?}"),
         }
     }

@@ -122,9 +122,25 @@ impl PeerAddress {
 
     /// Parse from "host:port" or "id@host:port" format.
     ///
-    /// Bare host entries derive the node ID from the hostname. Explicit
-    /// `id@...` entries preserve the supplied ID so callers can carry
-    /// incarnation-based IDs through the same peer-list path.
+    /// **Bare `host:port` is the preferred form** for `nexusd-cluster
+    /// join` and any address-book seed (`--peers`, `NEXUS_PEERS`).  The
+    /// peer's real raft `node_id` is opaque — random per daemon boot
+    /// under the PR #3996 contract — so operators generally do NOT
+    /// have it.  Fallback derives a stable, hostname-hashed id via
+    /// [`hostname_to_node_id`] purely so the resulting `NodeAddress`
+    /// slots into the transport peer-map key type.  The derived id is
+    /// harmless — the peer's real id is learned from the first inbound
+    /// `StepMessageRequest.sender_address` via `learn_peer_address`
+    /// (transport/server.rs), which populates the peer_map entry
+    /// outbound replies actually route through.
+    ///
+    /// Explicit `id@host:port` entries preserve the supplied id so
+    /// callers can carry incarnation-based IDs through the same
+    /// peer-list path (e.g. witness binaries that mint their id
+    /// deterministically from hostname).  A stale explicit id (peer
+    /// rebuilt / rotated its `node_id`) does NOT block a join — the
+    /// stale entry is superseded by the real id learned inbound,
+    /// leaving a harmless dead peer_map slot.
     #[allow(clippy::result_large_err)]
     pub fn parse(s: &str, use_tls: bool) -> Result<Self> {
         let s = s.trim();
