@@ -437,7 +437,7 @@ impl ZoneManager {
         });
 
         tracing::info!(
-            "ZoneManager node {} hostname={} started (bind={}, tls={})",
+            "ZoneManager local_node_id={} hostname={} started (bind={}, tls={})",
             node_id,
             hostname,
             bind_addr,
@@ -1393,7 +1393,7 @@ impl ZoneManager {
         }) {
             let _ = tx.send(true);
         }
-        tracing::info!("ZoneManager node {} shut down", self.node_id);
+        tracing::info!("ZoneManager local_node_id={} shut down", self.node_id);
     }
 }
 

@@ -167,7 +167,7 @@ impl RaftClientPool {
                 }
                 // Stale — fall through to reconnect
                 tracing::debug!(
-                    node_id = addr.id,
+                    peer_node_id = addr.id,
                     age_secs = cached.created_at.elapsed().as_secs(),
                     ttl_secs = self.client_ttl.as_secs(),
                     "evicting stale gRPC client"

@@ -1150,7 +1150,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
             hex
         };
         if candidate_hash != *stored_hash {
-            tracing::warn!(node_id = req.node_id, "JoinCluster: invalid password");
+            tracing::warn!(peer_node_id = req.node_id, "JoinCluster: invalid password");
             return Ok(err_resp("Invalid join token password"));
         }
 

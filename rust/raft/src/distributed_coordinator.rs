@@ -801,7 +801,7 @@ pub fn read_or_mint_node_id(zones_dir: &str) -> Result<u64, String> {
                     final_path.display(),
                 ));
             }
-            tracing::info!(node_id = id, "node_id loaded from disk");
+            tracing::info!(local_node_id = id, "local_node_id loaded from disk");
             Ok(id)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -833,7 +833,7 @@ pub fn read_or_mint_node_id(zones_dir: &str) -> Result<u64, String> {
                     final_path.display(),
                 )
             })?;
-            tracing::info!(node_id = id, "node_id minted and persisted");
+            tracing::info!(local_node_id = id, "local_node_id minted and persisted");
             Ok(id)
         }
         Err(e) => Err(format!("read node id '{}': {e}", final_path.display())),
@@ -935,7 +935,7 @@ fn create_founder_zone(
     peers_empty: bool,
 ) -> Result<(), String> {
     tracing::info!(
-        node_id,
+        local_node_id = node_id,
         zone = %zone_id,
         self_address = %self_address,
         bootstrap_new,
@@ -1205,7 +1205,7 @@ fn attempt_join_zone_round(
                     tracing::info!(
                         endpoint = %endpoint,
                         zone = %zone_id,
-                        node_id,
+                        local_node_id = node_id,
                         "joined zone via leader — waiting for ConfState install",
                     );
                     // The leader's `AddNode`/`AddLearnerNode` commit
@@ -1428,7 +1428,7 @@ pub fn bootstrap_or_join_zone(
         match check_zone_resumable(zh.as_ref()) {
             Ok(()) => {
                 tracing::info!(
-                    node_id,
+                    local_node_id = node_id,
                     zone = %zone_id,
                     last_log_index = zh.last_log_index(),
                     "zone loaded from persisted storage; resuming from ConfState",
@@ -1451,7 +1451,7 @@ pub fn bootstrap_or_join_zone(
                     ));
                 }
                 tracing::warn!(
-                    node_id,
+                    local_node_id = node_id,
                     zone = %zone_id,
                     reason = %reason,
                     "loaded zone state not safely resumable; falling through to JoinZone \
@@ -1498,7 +1498,7 @@ pub fn bootstrap_or_join_zone(
     // Branch 3: peers configured, no flag, storage empty — joiner.
     // Loop on JoinZone RPC until a leader accepts.
     tracing::info!(
-        node_id,
+        local_node_id = node_id,
         zone = %zone_id,
         peer_count = peer_addrs.len(),
         max_attempts = ?max_attempts,
@@ -1520,7 +1520,7 @@ pub fn bootstrap_or_join_zone(
 
     if matches!(plan, EmptyStorageBootstrapPlan::ProbePeersThenFound) {
         tracing::info!(
-            node_id,
+            local_node_id = node_id,
             zone = %zone_id,
             peer_count = peer_addrs.len(),
             attempts = FOUNDER_REJOIN_PROBE_ATTEMPTS,
@@ -1544,7 +1544,7 @@ pub fn bootstrap_or_join_zone(
             std::thread::sleep(Duration::from_millis(500));
         }
         tracing::info!(
-            node_id,
+            local_node_id = node_id,
             zone = %zone_id,
             last_error = %last_err,
             "founder probe found no existing cluster; creating local 1-voter zone",

@@ -1510,7 +1510,7 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                 }
                 RaftMsg::ProposeConfChange { change, tx } => {
                     let target_node_id = change.node_id;
-                    tracing::debug!(node_id = target_node_id, "raft.driver.propose_conf_change");
+                    tracing::debug!(peer_node_id = target_node_id, "raft.driver.propose_conf_change");
                     match self.raw_node.propose_conf_change(vec![], change) {
                         Ok(()) => {
                             // Store tx — will be resolved in apply_entries when committed
@@ -1760,7 +1760,7 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                         Err(e) => {
                             tracing::warn!(
                                 index = entry.index,
-                                node_id = cc.node_id,
+                                peer_node_id = cc.node_id,
                                 error = %e,
                                 "raft.conf_change.rejected — advancing past rejected change",
                             );
