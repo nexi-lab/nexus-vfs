@@ -141,7 +141,11 @@ struct CommonArgs {
     #[arg(long, env = "NEXUS_KERNEL_METASTORE_PATH", global = true)]
     metastore_path: Option<PathBuf>,
 
-    /// Comma-separated raft peers in `id@host:port` form.
+    /// Comma-separated raft peers in `host:port` form (e.g.
+    /// `nexus-2:2126,nexus-3:2126`).  Node IDs are opaque and learned
+    /// from raft messages at runtime — operators never carry them in
+    /// the address book (see `PeerAddress::parse` docstring for the
+    /// `learn_peer_address` contract).
     #[arg(long, env = "NEXUS_PEERS", default_value = "", global = true)]
     peers: String,
 
@@ -347,7 +351,18 @@ enum Cmd {
     /// then writes a DT_MOUNT entry under `<parent_zone>` so syscalls
     /// at `<local_path>` route into the remote zone.
     Join {
-        /// Remote peer in `id@host:port` form (e.g. `2@nexus-2:2126`).
+        /// Remote peer as `host:port` (e.g. `nexus-2:2126` or
+        /// `100.64.0.27:2126`).  This is the ONLY accepted form —
+        /// peer `node_id` is opaque + random per boot and never
+        /// belongs in the address book.  The `JoinZone` RPC targets
+        /// this URL; the peer's real `node_id` is learned
+        /// automatically from the first inbound `MsgSnapshot` via
+        /// `transport::learn_peer_address`, which populates the
+        /// peer_map entry outbound raft replies route through.
+        ///
+        /// Legacy `<id>@host:port` form is hard-rejected at parse
+        /// time with a clear migration message — see
+        /// `PeerAddress::parse` for the retirement rationale.
         peer_addr: String,
         /// Zone id to join on the remote side.
         remote_zone_id: String,
@@ -549,11 +564,17 @@ fn open_zone_manager(
     // identity narrowly to the address book; `node_id` intentionally
     // stays at `<data_dir>/.node_id` under the rotate-on-wipe raft
     // heartbeat invariant.
-    let cli_peer_addrs: Vec<NodeAddress> = NodeAddress::parse_peer_list(&common.peers, use_tls)
-        .map_err(|e| anyhow::anyhow!("--peers/NEXUS_PEERS parse: {}", e))?;
+    // Operator-facing strict parse: rejects `<id>@host:port`, forces
+    // bare `host:port`.  See PeerAddress::parse_operator_addr.
+    let cli_peer_addrs: Vec<NodeAddress> =
+        NodeAddress::parse_peer_list_operator(&common.peers, use_tls)
+            .map_err(|e| anyhow::anyhow!("--peers/NEXUS_PEERS parse: {}", e))?;
+    // Identity persistence uses the operator-facing bare form so a
+    // subsequent cold-boot load through `parse_operator_addr` never
+    // trips the id-prefix rejection.
     let cli_peer_strs: Vec<String> = cli_peer_addrs
         .iter()
-        .map(NodeAddress::to_raft_peer_str)
+        .map(NodeAddress::to_operator_str)
         .collect();
 
     let identity_dir = common
@@ -592,8 +613,10 @@ fn open_zone_manager(
     // sharedzone lost quorum, founder's FUSE writes hung with I/O
     // error.
     let merged_peers_joined = identity_persisted.peers.join(",");
+    // Identity persistence is operator-strict too — see
+    // `parse_operator_addr` docstring.
     let merged_peer_addrs: Vec<NodeAddress> =
-        NodeAddress::parse_peer_list(&merged_peers_joined, use_tls)
+        NodeAddress::parse_peer_list_operator(&merged_peers_joined, use_tls)
             .map_err(|e| anyhow::anyhow!("identity peers parse: {}", e))?;
     let merged_peers_str: Vec<String> = merged_peer_addrs
         .iter()
@@ -1326,12 +1349,16 @@ async fn run_join(
     // a stuck command terminates with a clear error rather than
     // hanging forever like the daemon-boot path does.
     let use_tls = !common.no_tls;
-    let peer = NodeAddress::parse(peer_addr, use_tls)
+    // Operator-facing strict parse: rejects `<id>@host:port`, forces
+    // bare `host:port`.  See PeerAddress::parse_operator_addr for the
+    // retirement rationale.
+    let peer = NodeAddress::parse_operator_addr(peer_addr, use_tls)
         .map_err(|e| anyhow::anyhow!("--peer-addr parse '{}': {}", peer_addr, e))?;
-    // Cache the raft peer string before moving `peer_addrs` into the
-    // spawn_blocking closure below — needed by the post-join identity
-    // persist step.
-    let peer_str_for_identity = peer.to_raft_peer_str();
+    // Cache the operator peer string (bare `host:port`) before moving
+    // `peer_addrs` into the spawn_blocking closure below — identity
+    // persistence must round-trip through `parse_operator_addr` on
+    // next cold-boot, so we serialize in that form.
+    let peer_str_for_identity = peer.to_operator_str();
     let peer_addrs = vec![peer];
 
     // Ensure the local parent zone exists BEFORE writing the cross-zone
@@ -1858,7 +1885,7 @@ mod tests {
         let parsed_voter = Args::try_parse_from([
             "nexusd-cluster",
             "join",
-            "1@host:2126",
+            "host:2126",
             "sharedzone",
             "/shared",
             "--as",
@@ -1873,7 +1900,7 @@ mod tests {
         let parsed_learner = Args::try_parse_from([
             "nexusd-cluster",
             "join",
-            "1@host:2126",
+            "host:2126",
             "sharedzone",
             "/shared",
             "--as",
@@ -1894,13 +1921,62 @@ mod tests {
         let parsed_default = Args::try_parse_from([
             "nexusd-cluster",
             "join",
-            "1@host:2126",
+            "host:2126",
             "sharedzone",
             "/shared",
         ])
         .expect("default (no --as) must parse");
         match parsed_default.cmd.expect("join cmd") {
             Cmd::Join { as_role, .. } => assert!(matches!(as_role, JoinRole::Voter)),
+            other => panic!("expected Join, got {other:?}"),
+        }
+    }
+
+    /// Bare `host:port` is the preferred `peer_addr` form — operators
+    /// no longer sync opaque `node_id` between peers.  Pins the CLI +
+    /// docstring contract that `nexusd-cluster join <addr> <zone>
+    /// <path>` alone is a valid invocation.  Legacy `<id>@<addr>` form
+    /// stays supported (previous test above), so the two forms MUST
+    /// both parse to `Cmd::Join`.
+    #[test]
+    fn join_accepts_bare_host_port_without_explicit_node_id() {
+        // Preferred form — no operator id-lookup ceremony.
+        let bare = Args::try_parse_from([
+            "nexusd-cluster",
+            "join",
+            "100.64.0.27:2126",
+            "sharedzone",
+            "/shared",
+        ])
+        .expect("bare host:port must parse");
+        match bare.cmd.expect("join cmd") {
+            Cmd::Join {
+                peer_addr,
+                remote_zone_id,
+                local_path,
+                as_role,
+                parent_zone,
+            } => {
+                assert_eq!(peer_addr, "100.64.0.27:2126");
+                assert_eq!(remote_zone_id, "sharedzone");
+                assert_eq!(local_path, "/shared");
+                assert_eq!(parent_zone, "root");
+                assert!(matches!(as_role, JoinRole::Voter));
+            }
+            other => panic!("expected Join, got {other:?}"),
+        }
+
+        // Hostname form (Docker-compose network alias) — same shape.
+        let by_name = Args::try_parse_from([
+            "nexusd-cluster",
+            "join",
+            "founder:2126",
+            "sharedzone",
+            "/shared",
+        ])
+        .expect("bare hostname:port must parse");
+        match by_name.cmd.expect("join cmd") {
+            Cmd::Join { peer_addr, .. } => assert_eq!(peer_addr, "founder:2126"),
             other => panic!("expected Join, got {other:?}"),
         }
     }
@@ -2167,7 +2243,7 @@ mod tests {
             "--advertise-addr",
             "100.64.0.21:2126",
             "join",
-            "1@host:2126",
+            "host:2126",
             "sharedzone",
             "/shared",
         ])

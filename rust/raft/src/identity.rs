@@ -44,11 +44,13 @@ pub const SCHEMA_VERSION: u32 = 1;
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Identity {
     pub schema_version: u32,
-    /// Raft peer address book — `"id@host:port"` strings, same schema
-    /// as CLI `--peers` / `NEXUS_PEERS` and hashicorp/raft's
-    /// `peers.json`.  Transport seed only, NOT a `ConfState` shadow.
-    /// Persisted so cold-boot after `<NEXUS_DATA_DIR>` loss can still
-    /// contact known nodes without operator re-specifying.
+    /// Raft peer address book — `"host:port"` strings, same schema
+    /// as CLI `--peers` / `NEXUS_PEERS`.  Transport seed only, NOT a
+    /// `ConfState` shadow.  Persisted so cold-boot after
+    /// `<NEXUS_DATA_DIR>` loss can still contact known nodes without
+    /// operator re-specifying.  Peer node_ids are not encoded — they
+    /// are opaque, learned from the first inbound raft message via
+    /// `learn_peer_address` (transport/server.rs).
     #[serde(default)]
     pub peers: Vec<String>,
 }
@@ -217,7 +219,7 @@ mod tests {
     #[test]
     fn persist_then_load_roundtrips() {
         let dir = tempdir().unwrap();
-        let seed = vec!["1@host-a:2126".to_string(), "2@host-b:2126".to_string()];
+        let seed = vec!["host-a:2126".to_string(), "host-b:2126".to_string()];
         let empty = load(dir.path()).unwrap();
         let persisted = persist_peers(dir.path(), &empty, &seed).unwrap();
         assert_eq!(persisted.peers, seed);
@@ -242,16 +244,16 @@ mod tests {
         let ident = persist_peers(
             dir.path(),
             &load(dir.path()).unwrap(),
-            &["1@a:2126".to_string()],
+            &["a:2126".to_string()],
         )
         .unwrap();
         let widened = persist_peers(
             dir.path(),
             &ident,
-            &["1@a:2126".to_string(), "2@b:2126".to_string()],
+            &["a:2126".to_string(), "b:2126".to_string()],
         )
         .unwrap();
-        assert_eq!(widened.peers, vec!["1@a:2126", "2@b:2126"]);
+        assert_eq!(widened.peers, vec!["a:2126", "b:2126"]);
 
         let reloaded = load(dir.path()).unwrap();
         assert_eq!(reloaded.peers, widened.peers);
@@ -260,7 +262,7 @@ mod tests {
     #[test]
     fn persist_peers_noop_when_set_unchanged() {
         let dir = tempdir().unwrap();
-        let seed = vec!["1@a:2126".to_string()];
+        let seed = vec!["a:2126".to_string()];
         let ident = persist_peers(dir.path(), &load(dir.path()).unwrap(), &seed).unwrap();
         let path = dir.path().join(IDENTITY_FILE);
         let mtime_before = fs::metadata(&path).unwrap().modified().unwrap();
@@ -277,10 +279,10 @@ mod tests {
         let ident = persist_peers(
             dir.path(),
             &load(dir.path()).unwrap(),
-            &["".to_string(), "1@a:2126".to_string(), " ".to_string()],
+            &["".to_string(), "a:2126".to_string(), " ".to_string()],
         )
         .unwrap();
-        assert_eq!(ident.peers, vec!["1@a:2126", " "]);
+        assert_eq!(ident.peers, vec!["a:2126", " "]);
         // Empty string is skipped; whitespace-only is preserved because
         // trimming is a caller-side concern.  Callers today feed peers
         // parsed via `NodeAddress::parse_peer_list` which trims before

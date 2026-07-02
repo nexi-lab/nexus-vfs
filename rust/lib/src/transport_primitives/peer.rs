@@ -95,6 +95,26 @@ fn parse_host_port(addr: &str, original: &str) -> Result<(String, u16)> {
     Ok((hostname.to_string(), port))
 }
 
+/// Infallible companion to [`parse_host_port`] used by
+/// [`PeerAddress::new`] when the caller supplies an already-canonical
+/// endpoint (e.g. from raft `ConfChange` context).  Returns
+/// `(String::new(), 0)` on shapes that don't fit `host:port`, so the
+/// hostname + port fields degrade to defaults while the caller's
+/// authoritative `endpoint` string still drives transport dispatch.
+fn split_host_port(hostport: &str) -> (String, u16) {
+    let Some((host, port_str)) = hostport.rsplit_once(':') else {
+        return (String::new(), 0);
+    };
+    if host.contains(':') {
+        return (String::new(), 0);
+    }
+    let host = host.trim();
+    let Ok(port) = port_str.parse::<u16>() else {
+        return (host.to_string(), 0);
+    };
+    (host.to_string(), port)
+}
+
 /// Address of a network peer (Raft node, gRPC endpoint).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PeerAddress {
@@ -109,24 +129,72 @@ pub struct PeerAddress {
 }
 
 impl PeerAddress {
-    /// Create a new PeerAddress with explicit id and endpoint.
+    /// Create a new PeerAddress with an authoritative id + endpoint —
+    /// used by raft-internal call sites (`node_address_from_conf_context`)
+    /// where the id comes from a `ConfChange` struct and the endpoint
+    /// from its `context` bytes.  Both authoritative inputs are in
+    /// hand, so we bypass [`Self::parse`] (which is CLI-facing and
+    /// hard-rejects any `id@host:port` shape).
+    ///
+    /// Populates `hostname` + `port` by scanning the endpoint's
+    /// `host:port` tail (after any `http[s]://` prefix).  Malformed
+    /// endpoints (missing `:`, unparseable port) leave those fields
+    /// zeroed; transport dispatch consults `endpoint` directly so a
+    /// zero-hostname NodeAddress is still routable.
     pub fn new(id: u64, endpoint: impl Into<String>) -> Self {
         let endpoint = endpoint.into();
+        let stripped = endpoint
+            .strip_prefix("http://")
+            .or_else(|| endpoint.strip_prefix("https://"))
+            .unwrap_or(&endpoint);
+        let (hostname, port) = split_host_port(stripped);
         Self {
-            hostname: String::new(),
-            port: 0,
+            hostname,
+            port,
             id,
             endpoint,
         }
     }
 
-    /// Parse from "host:port" or "id@host:port" format.
+    /// Parse a peer address — raft-internal path.
     ///
-    /// Bare host entries derive the node ID from the hostname. Explicit
-    /// `id@...` entries preserve the supplied ID so callers can carry
-    /// incarnation-based IDs through the same peer-list path.
+    /// Accepts both `host:port` (id derived via
+    /// [`hostname_to_node_id`]) and the legacy `id@host:port` shape
+    /// (id preserved verbatim).  The dual acceptance is required
+    /// by raft-internal round-trips through
+    /// [`Self::to_raft_peer_str`] — founder self-registration,
+    /// ConfChange context reconstruction, `ZoneManager::create_zone`
+    /// address-book keying, and similar sites carry the
+    /// authoritative `node_id` and encode it in the peer string so
+    /// downstream parses recover it exactly.
+    ///
+    /// **CLI + env boundary code MUST NOT call this** — use
+    /// [`Self::parse_operator_addr`] instead, which rejects the
+    /// legacy form so operators are steered to the bare
+    /// `host:port` shape.  Under the PR #3996 opaque-ID contract
+    /// peer node_ids are random per boot, so carrying them across
+    /// an operator-facing seam has no protocol purpose (the real
+    /// id is learned from the first inbound raft message via
+    /// `learn_peer_address` in `transport/server.rs`).
     #[allow(clippy::result_large_err)]
     pub fn parse(s: &str, use_tls: bool) -> Result<Self> {
+        Self::parse_inner(s, use_tls, /* allow_id_prefix */ true)
+    }
+
+    /// Parse a peer address from `host:port` form only.
+    ///
+    /// The operator boundary contract: `NEXUS_PEERS`, `--peers`,
+    /// `nexusd-cluster join <peer_addr>` all go through here.  A
+    /// stray `<id>@host:port` gets a clear migration error naming
+    /// the retired form, so operator scripts and runbooks migrate
+    /// without silent semantic drift.
+    #[allow(clippy::result_large_err)]
+    pub fn parse_operator_addr(s: &str, use_tls: bool) -> Result<Self> {
+        Self::parse_inner(s, use_tls, /* allow_id_prefix */ false)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn parse_inner(s: &str, use_tls: bool, allow_id_prefix: bool) -> Result<Self> {
         let s = s.trim();
         let addr = s
             .strip_prefix("http://")
@@ -135,6 +203,18 @@ impl PeerAddress {
 
         let (explicit_id, addr) = match addr.find('@') {
             Some(pos) => {
+                if !allow_id_prefix {
+                    let prefix = &addr[..pos];
+                    let remainder = &addr[pos + 1..];
+                    return Err(TransportError::InvalidAddress(format!(
+                        "peer address '{s}' uses the legacy 'id@host:port' form \
+                         (id='{prefix}'); pass just 'host:port' (e.g. '{remainder}').  \
+                         Peer node_id is opaque + random per boot — the transport \
+                         layer learns it from the first inbound raft message via \
+                         learn_peer_address; carrying an explicit id in the operator-\
+                         facing address book had no protocol purpose."
+                    )));
+                }
                 let id_str = &addr[..pos];
                 let id = id_str.parse::<u64>().map_err(|_| {
                     TransportError::InvalidAddress(format!(
@@ -176,6 +256,20 @@ impl PeerAddress {
             .collect()
     }
 
+    /// Operator-facing comma-separated list — same as
+    /// [`Self::parse_peer_list`] but every entry goes through
+    /// [`Self::parse_operator_addr`] so a stray `<id>@host:port`
+    /// surfaces as a clear migration error at boot time rather than
+    /// being silently accepted.  Used by CLI (`--peers`, `NEXUS_PEERS`)
+    /// + `identity.json` load.
+    #[allow(clippy::result_large_err)]
+    pub fn parse_peer_list_operator(s: &str, use_tls: bool) -> Result<Vec<Self>> {
+        s.split(',')
+            .filter(|p| !p.trim().is_empty())
+            .map(|p| Self::parse_operator_addr(p.trim(), use_tls))
+            .collect()
+    }
+
     /// Return "host:port" for gRPC connection target.
     pub fn grpc_target(&self) -> String {
         if self.hostname.is_empty() {
@@ -188,9 +282,28 @@ impl PeerAddress {
         }
     }
 
-    /// Return "id@host:port" for Raft peer configuration.
+    /// Return "id@host:port" for raft-internal peer-list serialization.
+    ///
+    /// Used by round-trip sites inside the raft crate
+    /// (`ZoneManager::create_zone` address-book keying, founder
+    /// self-registration, ConfChange context) where the caller has an
+    /// authoritative `id` in hand and needs downstream parses to
+    /// recover it exactly.  Operator-facing round-trips
+    /// (identity.json peer entries) that must survive a subsequent
+    /// [`Self::parse_operator_addr`] load should use
+    /// [`Self::to_operator_str`] instead.
     pub fn to_raft_peer_str(&self) -> String {
         format!("{}@{}", self.id, self.grpc_target())
+    }
+
+    /// Return "host:port" for operator-facing round-trip.
+    ///
+    /// Symmetric with [`Self::parse_operator_addr`] — the strict CLI
+    /// contract that rejects `@`.  Used by `identity.json` peer
+    /// persistence so a later cold-boot loads the file without
+    /// tripping the id-prefix rejection.
+    pub fn to_operator_str(&self) -> String {
+        self.grpc_target()
     }
 }
 
@@ -215,7 +328,11 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_honors_explicit_node_id() {
+    fn test_parse_honors_explicit_node_id_internal_form() {
+        // Raft-internal `parse` accepts `id@host:port` — round-trip
+        // sites (`ZoneManager::create_zone` address book, founder
+        // self-registration) carry the authoritative id in the string
+        // so parses recover it exactly.
         let addr = PeerAddress::parse("42@nexus-2:2126", false).unwrap();
         assert_eq!(addr.id, 42);
         assert_eq!(addr.hostname, "nexus-2");
@@ -224,7 +341,40 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_operator_addr_rejects_id_prefix() {
+        // Operator-facing parse rejects `id@host:port` with a
+        // migration message.  `NEXUS_PEERS`, `--peers`,
+        // `nexusd-cluster join <peer_addr>`, `identity.json` load
+        // all go through this variant so a stray id-prefixed entry
+        // surfaces at boot rather than as silent semantic drift.
+        let err = PeerAddress::parse_operator_addr("42@nexus-2:2126", false)
+            .expect_err("must reject legacy form on operator boundary");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("legacy 'id@host:port' form"),
+            "error must name the retired form: {msg}"
+        );
+        assert!(
+            msg.contains("nexus-2:2126"),
+            "error must suggest the bare form: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_operator_addr_accepts_bare_host_port() {
+        // Positive contract: bare `host:port` parses cleanly through
+        // the operator surface — the shape operators are steered to.
+        let addr =
+            PeerAddress::parse_operator_addr("nexus-2:2126", false).expect("bare form parses");
+        assert_eq!(addr.hostname, "nexus-2");
+        assert_eq!(addr.port, 2126);
+        assert_eq!(addr.id, hostname_to_node_id("nexus-2"));
+    }
+
+    #[test]
     fn test_to_raft_peer_str_round_trips_explicit_node_id() {
+        // Raft-internal round-trip via `to_raft_peer_str` + `parse`
+        // preserves the authoritative id.
         let original = PeerAddress {
             hostname: "nexus-2".to_string(),
             port: 2126,
@@ -236,6 +386,19 @@ mod tests {
         assert_eq!(parsed.id, original.id);
         assert_eq!(parsed.hostname, original.hostname);
         assert_eq!(parsed.port, original.port);
+    }
+
+    #[test]
+    fn test_to_operator_str_round_trips_via_operator_parse() {
+        // Operator-facing round-trip via `to_operator_str` +
+        // `parse_operator_addr` yields the same struct because
+        // `hostname_to_node_id` is deterministic.
+        let original =
+            PeerAddress::parse_operator_addr("nexus-2:2126", false).expect("bare form parses");
+        let serialized = original.to_operator_str();
+        assert_eq!(serialized, "nexus-2:2126");
+        let parsed = PeerAddress::parse_operator_addr(&serialized, false).unwrap();
+        assert_eq!(parsed.id, original.id);
     }
 
     #[test]
