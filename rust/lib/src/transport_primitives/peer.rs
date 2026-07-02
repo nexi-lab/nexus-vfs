@@ -282,7 +282,7 @@ impl PeerAddress {
         }
     }
 
-    /// Return "id@host:port" for raft-internal peer-list serialization.
+    /// Return `id@host:port` for raft-internal peer-list serialization.
     ///
     /// Used by round-trip sites inside the raft crate
     /// (`ZoneManager::create_zone` address-book keying, founder
@@ -292,16 +292,34 @@ impl PeerAddress {
     /// (identity.json peer entries) that must survive a subsequent
     /// [`Self::parse_operator_addr`] load should use
     /// [`Self::to_operator_str`] instead.
+    ///
+    /// **Do NOT use for user-observable tracing fields.**  The `id`
+    /// prefix is computed locally as `hostname_to_node_id(hostname)`;
+    /// operators / peer AIs reading the resulting log line commonly
+    /// mistake it for a transport-auto-resolved remote node_id (a
+    /// distinct concept — authoritative id learned via ConfChange
+    /// context, no relationship to `hostname_to_node_id`).  Operator-
+    /// facing tracing sites (info!/warn!/error! at boot boundary, CLI
+    /// diagnostics, doctor output) MUST route through
+    /// [`Self::to_operator_str`] and pair the local id — if it's
+    /// relevant at all — into an explicit `local_node_id` or
+    /// `peer_node_id` field alongside.  See
+    /// [`joiner_local_zone_peer_seeds_display`] for the canonical
+    /// idiom.
     pub fn to_raft_peer_str(&self) -> String {
         format!("{}@{}", self.id, self.grpc_target())
     }
 
-    /// Return "host:port" for operator-facing round-trip.
+    /// Return `host:port` for operator-facing round-trip.
     ///
     /// Symmetric with [`Self::parse_operator_addr`] — the strict CLI
-    /// contract that rejects `@`.  Used by `identity.json` peer
-    /// persistence so a later cold-boot loads the file without
-    /// tripping the id-prefix rejection.
+    /// contract that rejects `@`.  Used by:
+    ///   * `identity.json` peer persistence so a later cold-boot
+    ///     loads the file without tripping the id-prefix rejection.
+    ///   * All operator-visible tracing (info!/warn!/error! at boot
+    ///     boundary; CLI diagnostics; doctor output) — see the
+    ///     [`Self::to_raft_peer_str`] docstring for the reason the
+    ///     two functions do NOT swap.
     pub fn to_operator_str(&self) -> String {
         self.grpc_target()
     }
@@ -310,6 +328,15 @@ impl PeerAddress {
 /// Backward-compatible type alias.
 pub type NodeAddress = PeerAddress;
 
+/// Debug-only formatter — same shape as [`PeerAddress::to_raft_peer_str`]
+/// (`id@endpoint`), suitable for `Debug` / `?` in raft-internal traces.
+///
+/// Do NOT use `{peer}` / `%peer` in operator-facing tracing formatters:
+/// the embedded local id will read as a remote node_id to operators and
+/// peer AIs (see [`PeerAddress::to_raft_peer_str`] warning).  Instead
+/// route the field through [`PeerAddress::to_operator_str`] and — if
+/// relevant — pair a separate `local_node_id` / `peer_node_id` field
+/// alongside.
 impl std::fmt::Display for PeerAddress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}@{}", self.id, self.endpoint)
