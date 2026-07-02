@@ -980,8 +980,8 @@ impl ZoneApiService for ZoneApiServiceImpl {
 
         tracing::info!(
             zone = req.zone_id,
-            node_id = req.node_id,
-            address = req.node_address,
+            peer_node_id = req.node_id,
+            peer_addr = %req.node_address,
             "JoinZone request received",
         );
 
@@ -1121,8 +1121,8 @@ impl ZoneApiService for ZoneApiServiceImpl {
         };
 
         tracing::info!(
-            node_id = req.node_id,
-            node_address = req.node_address,
+            peer_node_id = req.node_id,
+            peer_addr = %req.node_address,
             zone_id = req.zone_id,
             "JoinCluster request received",
         );
@@ -1183,8 +1183,8 @@ impl ZoneApiService for ZoneApiServiceImpl {
         };
 
         tracing::info!(
-            node_id = req.node_id,
-            node_address = req.node_address,
+            peer_node_id = req.node_id,
+            peer_addr = %req.node_address,
             "JoinCluster: node certificate signed and provisioned successfully",
         );
 

@@ -326,7 +326,7 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
                             state.acked_seq = state.acked_seq.max(applied_up_to);
                             state.reset_backoff();
                             tracing::debug!(
-                                peer = peer_id,
+                                peer_node_id = peer_id,
                                 applied_up_to,
                                 "EC entries replicated to peer"
                             );
@@ -337,7 +337,7 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
                             state.in_flight = false;
                             state.increase_backoff();
                             tracing::debug!(
-                                peer = peer_id,
+                                peer_node_id = peer_id,
                                 backoff_ms = state.backoff.as_millis(),
                                 "EC replication failed: {}",
                                 error
@@ -407,7 +407,10 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
             let addr = match peers_snapshot.get(&target_id) {
                 Some(a) => a.clone(),
                 None => {
-                    tracing::warn!("No address for peer {} — dropping message", target_id);
+                    tracing::warn!(
+                        peer_node_id = target_id,
+                        "No address for peer — dropping message (peer_map has no entry yet)",
+                    );
                     continue;
                 }
             };
@@ -435,13 +438,19 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
                 let send_failed = match result {
                     Ok(Ok(())) => false,
                     Ok(Err(e)) => {
-                        tracing::warn!(peer = target_id, "Raft message send failed: {}", e);
+                        tracing::warn!(
+                            peer_node_id = target_id,
+                            peer_addr = %addr.to_operator_str(),
+                            "Raft message send failed: {}",
+                            e,
+                        );
                         client_pool.remove(target_id).await;
                         true
                     }
                     Err(_elapsed) => {
                         tracing::warn!(
-                            peer = target_id,
+                            peer_node_id = target_id,
+                            peer_addr = %addr.to_operator_str(),
                             "Raft message send timeout after {:?}",
                             RAFT_SEND_TIMEOUT,
                         );
@@ -577,7 +586,7 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
             if state.needs_snapshot {
                 if state.acked_seq >= earliest {
                     tracing::info!(
-                        peer = peer_id,
+                        peer_node_id = peer_id,
                         acked = state.acked_seq,
                         earliest,
                         "Peer caught up — clearing needs_snapshot"
@@ -585,7 +594,7 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
                     state.needs_snapshot = false;
                 } else {
                     tracing::warn!(
-                        peer = peer_id,
+                        peer_node_id = peer_id,
                         acked = state.acked_seq,
                         earliest,
                         "Peer needs snapshot (not yet implemented) — skipping"
@@ -596,7 +605,7 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
 
             if state.acked_seq > 0 && state.acked_seq < earliest {
                 tracing::warn!(
-                    peer = peer_id,
+                    peer_node_id = peer_id,
                     acked = state.acked_seq,
                     earliest,
                     "Peer fell behind compacted WAL — needs snapshot"
