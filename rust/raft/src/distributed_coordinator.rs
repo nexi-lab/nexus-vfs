@@ -700,7 +700,7 @@ pub fn validate_bootstrap_mode(
                      SOLO by design (each daemon owns its own 1-voter root namespace).  \
                      NEXUS_PEERS would JoinZone(root) into the peer's cluster, which is \
                      misuse for federation.  Fix: leave NEXUS_PEERS empty, then federate via \
-                     a named zone (`nexusd-cluster join <leader_id>@<addr> <named-zone> \
+                     a named zone (`nexusd-cluster join <host:port> <named-zone> \
                      <mount-path>` sidecar).  See docs/federation-architecture.md §6.3.1."
                         .to_string(),
                 );
@@ -1404,7 +1404,7 @@ pub fn bootstrap_or_join_zone(
     if zone_id == contracts::ROOT_ZONE_ID && !peer_addrs.is_empty() {
         let peer_list: Vec<String> = peer_addrs
             .iter()
-            .map(NodeAddress::to_raft_peer_str)
+            .map(NodeAddress::to_operator_str)
             .collect();
         return Err(format!(
             "root zone is per-node SOLO by design (each nexus daemon owns its \
@@ -1412,7 +1412,7 @@ pub fn bootstrap_or_join_zone(
              applied to root, which would JoinZone(root) into the peer's \
              cluster — that's misuse for federation.  Fix: leave NEXUS_PEERS \
              empty on this node, then federate via a named zone \
-             (`nexusd-cluster join <leader_id>@<addr> <named-zone> <mount-path>` \
+             (`nexusd-cluster join <host:port> <named-zone> <mount-path>` \
              sidecar, or `--mount-driver local-connector:<named-zone>:...`).  \
              See docs/federation-architecture.md §6.3.1."
         ));
@@ -1444,7 +1444,7 @@ pub fn bootstrap_or_join_zone(
                          that followed.  Daemon restart cannot self-repair without peer \
                          addresses to re-JoinZone against — to recover, either:\n  \
                          (a) stop the daemon, run `nexusd-cluster join \
-                         <leader_node_id>@<leader_addr> {zone_id} /<mount> \
+                         <leader_host:port> {zone_id} /<mount> \
                          --data-dir <data_dir> --no-tls`, then restart in restart mode; or\n  \
                          (b) `rm -rf <data_dir>/{zone_id}` (this zone's subdirectory only) \
                          and restart in static mode."
