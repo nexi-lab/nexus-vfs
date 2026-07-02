@@ -1545,7 +1545,10 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                 }
                 RaftMsg::ProposeConfChange { change, tx } => {
                     let target_node_id = change.node_id;
-                    tracing::debug!(peer_node_id = target_node_id, "raft.driver.propose_conf_change");
+                    tracing::debug!(
+                        peer_node_id = target_node_id,
+                        "raft.driver.propose_conf_change"
+                    );
                     match self.raw_node.propose_conf_change(vec![], change) {
                         Ok(()) => {
                             // Store tx — will be resolved in apply_entries when committed
