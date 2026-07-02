@@ -558,7 +558,19 @@ impl NexusVfsService for VfsServiceImpl {
         };
         // `is_admin` comes from the auth-resolved context, never the
         // request — clients can't spoof admin reads of `/__sys__/zones/`.
-        let entries = self.kernel.sys_readdir(&req.path, zone_id, ctx.is_admin);
+        //
+        // `from_peer`: when set, this request is a fan-out from a peer
+        // whose local `sys_readdir` came up empty.  Route to
+        // `sys_readdir_peer_dispatch` (allow_fanout=false) so we run
+        // only our local scan and do NOT re-dispatch — prevents
+        // ping-pong loops in 3+ node topologies where every hop's
+        // local search misses.
+        let entries = if req.from_peer {
+            self.kernel
+                .sys_readdir_peer_dispatch(&req.path, zone_id, ctx.is_admin)
+        } else {
+            self.kernel.sys_readdir(&req.path, zone_id, ctx.is_admin)
+        };
         let mapped: Vec<ReaddirEntry> = entries
             .into_iter()
             .map(|(name, dt)| ReaddirEntry {

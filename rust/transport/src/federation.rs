@@ -302,6 +302,13 @@ impl FederationClient {
             path: path.to_string(),
             auth_token: String::new(),
             zone_id: String::new(),
+            // Loop-guard: this call IS the fan-out.  Peer's
+            // `Readdir` handler routes to
+            // `sys_readdir_peer_dispatch` so it runs only its local
+            // metastore + backend scan — no re-dispatch.  Keeps
+            // 3+ node topologies from ping-ponging when every hop
+            // misses locally.
+            from_peer: true,
         });
         request.set_timeout(self.timeout);
         let resp = client
