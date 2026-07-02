@@ -3421,6 +3421,43 @@ impl Kernel {
         zone_id: &str,
         is_admin: bool,
     ) -> Vec<(String, u8)> {
+        // Public entry point — default `allow_fanout=true` so
+        // operator-facing calls dispatch to peers when local metastore
+        // + backend produce nothing for a distributed zone.  See
+        // [`sys_readdir_peer_dispatch`] for the fan-out-disabled variant
+        // that peer-side gRPC handlers use to break loops.
+        self.sys_readdir_with_fanout(parent_path, zone_id, is_admin, /* allow_fanout */ true)
+    }
+
+    /// Peer-dispatch variant of [`sys_readdir`] — used by the
+    /// `NexusVFSService.Readdir` handler when `ReaddirRequest.from_peer`
+    /// is set (i.e. this call is a fan-out RPC from another node).
+    /// Runs the local metastore + backend scan exactly like
+    /// `sys_readdir` but SKIPS its own `peer_list_dir` fan-out, so a
+    /// 3+ node topology where every hop's local search misses cannot
+    /// ping-pong forever.  See the module-level rationale on the
+    /// try_remote_fetch pattern extension.
+    pub fn sys_readdir_peer_dispatch(
+        &self,
+        parent_path: &str,
+        zone_id: &str,
+        is_admin: bool,
+    ) -> Vec<(String, u8)> {
+        self.sys_readdir_with_fanout(
+            parent_path,
+            zone_id,
+            is_admin,
+            /* allow_fanout */ false,
+        )
+    }
+
+    fn sys_readdir_with_fanout(
+        &self,
+        parent_path: &str,
+        zone_id: &str,
+        is_admin: bool,
+        allow_fanout: bool,
+    ) -> Vec<(String, u8)> {
         if validate_path_fast(parent_path).is_err() {
             return Vec::new();
         }
@@ -3617,6 +3654,48 @@ impl Kernel {
                 let child_path = format!("{}/{}", parent_for_join, basename);
                 seen.entry(child_path)
                     .or_insert((etype, Some(route.zone_id.clone())));
+            }
+        }
+
+        // Peer-shared fan-out (nexus-vfs #TBD): when this mount HAS a
+        // local backend but the metastore + backend produced NO
+        // entries for `parent_path`, the dir may exist only on a peer
+        // (Direction B: Mac has never `ls`'d Win's session UUID; Mac's
+        // host fs has no `<win-uuid>/`; Mac's metastore has no nested
+        // rows because peer-side observation hasn't propagated yet).
+        // Ask peer voters — same `peer_list_dir` HAL surface the
+        // pre-peer-shared federation-peer-mount branch above uses.
+        //
+        // Peer-side loop guard: `sys_readdir_peer_dispatch` (the
+        // handler when `ReaddirRequest.from_peer = true`) sets
+        // `allow_fanout = false`, so 3+ node topologies where every
+        // hop's local search misses cannot ping-pong forever.
+        //
+        // Dispatch target: `target_zone_id` when set (pre-peer-shared
+        // federation-peer-mount routes) OR `zone_id` fall-back
+        // (peer-shared routes where the mount lives directly in the
+        // federated zone).  `dispatch_to_peers` returns `None` when
+        // the target zone has no other voters (root zone by
+        // convention), so root-scoped readdirs incur no RPC.
+        //
+        // Only fires when `seen` is empty — first-access latency for a
+        // Direction B dir (~one federation-timeout RTT); subsequent
+        // access hits the peer-observed rows via `metastore.list`.
+        if allow_fanout && seen.is_empty() {
+            let target_zone = route.target_zone_id.as_deref().unwrap_or(&route.zone_id);
+            if let Some(entries) =
+                self.distributed_coordinator()
+                    .peer_list_dir(self, target_zone, parent_path)
+            {
+                for (peer_path, etype) in entries {
+                    let basename = peer_path.rsplit('/').next().unwrap_or(&peer_path);
+                    if basename.is_empty() {
+                        continue;
+                    }
+                    let child_path = format!("{}/{}", parent_for_join, basename);
+                    seen.entry(child_path)
+                        .or_insert((etype, Some(route.zone_id.clone())));
+                }
             }
         }
 
@@ -4551,6 +4630,297 @@ mod readdir_observe_tests {
             m.last_writer_address.as_deref(),
             Some("100.64.0.21:2126"),
             "peer's last_writer_address preserved — SSOT for peer routing"
+        );
+    }
+}
+
+#[cfg(test)]
+mod readdir_fanout_tests {
+    //! Pin the peer-shared fan-out extension of `sys_readdir` (#57).
+    //!
+    //! Contract: when the local metastore + backend produce zero
+    //! children for a `parent_path` and fan-out is allowed, the kernel
+    //! MUST dispatch to `peer_list_dir` and merge peer-returned
+    //! entries into the result.  `sys_readdir_peer_dispatch` (invoked
+    //! by peer-facing `NexusVFSService.Readdir` handler when
+    //! `ReaddirRequest.from_peer = true`) MUST NOT dispatch, breaking
+    //! 3+ node ping-pong loops.
+    use crate::abc::object_store::{BackendStat, ObjectStore, StorageError, WriteResult};
+    use crate::hal::distributed_coordinator::{
+        ClusterInfo, CoordinatorResult, DistributedCoordinator, ShareInfo,
+    };
+    use crate::kernel::Kernel;
+    use contracts::OperationContext;
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    #[derive(Default)]
+    struct EmptyBackend;
+
+    impl ObjectStore for EmptyBackend {
+        fn name(&self) -> &str {
+            "empty-mock"
+        }
+        fn list_dir(&self, _path: &str) -> Result<Vec<String>, StorageError> {
+            Ok(Vec::new())
+        }
+        fn stat(&self, path: &str) -> Result<BackendStat, StorageError> {
+            Err(StorageError::NotFound(path.to_string()))
+        }
+        fn write_content(
+            &self,
+            _content: &[u8],
+            _content_id: &str,
+            _ctx: &OperationContext,
+            _offset: u64,
+        ) -> Result<WriteResult, StorageError> {
+            Err(StorageError::NotSupported("write_content"))
+        }
+        fn read_content(
+            &self,
+            _content_id: &str,
+            _ctx: &OperationContext,
+        ) -> Result<Vec<u8>, StorageError> {
+            Err(StorageError::NotSupported("read_content"))
+        }
+        fn delete_file(&self, _path: &str) -> Result<(), StorageError> {
+            Ok(())
+        }
+        fn get_content_size(&self, _content_id: &str) -> Result<u64, StorageError> {
+            Ok(0)
+        }
+        fn copy_file(&self, _src: &str, _dst: &str) -> Result<WriteResult, StorageError> {
+            Err(StorageError::NotSupported("copy_file"))
+        }
+    }
+
+    struct OneEntryBackend;
+
+    impl ObjectStore for OneEntryBackend {
+        fn name(&self) -> &str {
+            "one-mock"
+        }
+        fn list_dir(&self, _path: &str) -> Result<Vec<String>, StorageError> {
+            Ok(vec!["hit".to_string()])
+        }
+        fn stat(&self, _path: &str) -> Result<BackendStat, StorageError> {
+            Ok(BackendStat {
+                size: 3,
+                is_dir: false,
+            })
+        }
+        fn write_content(
+            &self,
+            _content: &[u8],
+            _content_id: &str,
+            _ctx: &OperationContext,
+            _offset: u64,
+        ) -> Result<WriteResult, StorageError> {
+            Err(StorageError::NotSupported("write_content"))
+        }
+        fn read_content(
+            &self,
+            _content_id: &str,
+            _ctx: &OperationContext,
+        ) -> Result<Vec<u8>, StorageError> {
+            Err(StorageError::NotSupported("read_content"))
+        }
+        fn delete_file(&self, _path: &str) -> Result<(), StorageError> {
+            Ok(())
+        }
+        fn get_content_size(&self, _content_id: &str) -> Result<u64, StorageError> {
+            Ok(0)
+        }
+        fn copy_file(&self, _src: &str, _dst: &str) -> Result<WriteResult, StorageError> {
+            Err(StorageError::NotSupported("copy_file"))
+        }
+    }
+
+    struct FakeCoord {
+        calls: Mutex<Vec<(String, String)>>,
+        entries: Vec<(String, u8)>,
+    }
+
+    impl FakeCoord {
+        fn new(entries: Vec<(String, u8)>) -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                entries,
+            })
+        }
+        fn peer_list_dir_calls(&self) -> Vec<(String, String)> {
+            self.calls.lock().clone()
+        }
+    }
+
+    impl DistributedCoordinator for FakeCoord {
+        // Only `peer_list_dir` participates in these pins.  Non-peer
+        // methods return the same Err/empty stubs `NoopDistributedCoordinator`
+        // uses — kept inline so the test module is self-contained.
+        fn list_zones(&self, _kernel: &Kernel) -> Vec<String> {
+            Vec::new()
+        }
+        fn cluster_info(&self, _kernel: &Kernel, _zone_id: &str) -> CoordinatorResult<ClusterInfo> {
+            Err("stub".into())
+        }
+        fn create_zone(&self, _kernel: &Kernel, _zone_id: &str) -> CoordinatorResult<()> {
+            Err("stub".into())
+        }
+        fn remove_zone(
+            &self,
+            _kernel: &Kernel,
+            _zone_id: &str,
+            _force: bool,
+        ) -> CoordinatorResult<()> {
+            Err("stub".into())
+        }
+        fn join_zone(
+            &self,
+            _kernel: &Kernel,
+            _zone_id: &str,
+            _as_learner: bool,
+        ) -> CoordinatorResult<()> {
+            Err("stub".into())
+        }
+        fn wire_mount(
+            &self,
+            _kernel: &Kernel,
+            _parent_zone: &str,
+            _mount_path: &str,
+            _target_zone: &str,
+        ) -> CoordinatorResult<()> {
+            Err("stub".into())
+        }
+        fn unwire_mount(
+            &self,
+            _kernel: &Kernel,
+            _parent_zone: &str,
+            _mount_path: &str,
+        ) -> CoordinatorResult<()> {
+            Err("stub".into())
+        }
+        fn share_zone(
+            &self,
+            _kernel: &Kernel,
+            _local_path: &str,
+            _new_zone_id: &str,
+        ) -> CoordinatorResult<ShareInfo> {
+            Err("stub".into())
+        }
+        fn lookup_share(
+            &self,
+            _kernel: &Kernel,
+            _remote_path: &str,
+        ) -> CoordinatorResult<Option<ShareInfo>> {
+            Ok(None)
+        }
+        fn metastore_for_zone(
+            &self,
+            _kernel: &Kernel,
+            _zone_id: &str,
+        ) -> CoordinatorResult<Arc<dyn crate::abc::meta_store::MetaStore>> {
+            Err("stub".into())
+        }
+        fn locks_for_zone(
+            &self,
+            _kernel: &Kernel,
+            _zone_id: &str,
+        ) -> CoordinatorResult<Arc<dyn contracts::lock_state::Locks>> {
+            Err("stub".into())
+        }
+        fn peer_list_dir(
+            &self,
+            _kernel: &Kernel,
+            target_zone: &str,
+            peer_path: &str,
+        ) -> Option<Vec<(String, u8)>> {
+            self.calls
+                .lock()
+                .push((target_zone.to_string(), peer_path.to_string()));
+            Some(self.entries.clone())
+        }
+    }
+
+    #[test]
+    fn sys_readdir_fans_out_when_local_backend_returns_empty_on_federation_zone() {
+        // Peer-shared topology: this node HAS a local backend but the
+        // backend returns Ok(empty) for the queried subdir. Fan-out
+        // MUST fire and merge peer entries into the result.
+        let k = Kernel::new();
+        let backend: Arc<dyn ObjectStore> = Arc::new(EmptyBackend);
+        k.add_mount("/", "sharedzone", Some(backend), None, None, false)
+            .expect("add_mount");
+        let fake = FakeCoord::new(vec![
+            ("/session-uuid/1.json".to_string(), 8u8),
+            ("/session-uuid/2.json".to_string(), 8u8),
+        ]);
+        k.set_distributed_coordinator(fake.clone() as Arc<dyn DistributedCoordinator>);
+
+        let entries = k.sys_readdir("/session-uuid", "sharedzone", true);
+        let calls = fake.peer_list_dir_calls();
+        assert_eq!(
+            calls.len(),
+            1,
+            "must dispatch once when local is empty on federated zone: {calls:?}"
+        );
+        assert_eq!(calls[0].0, "sharedzone", "target zone from route.zone_id");
+        assert_eq!(calls[0].1, "/session-uuid", "peer_path passed through");
+        let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&"/session-uuid/1.json"),
+            "peer entry merged: {names:?}"
+        );
+        assert!(
+            names.contains(&"/session-uuid/2.json"),
+            "peer entry merged: {names:?}"
+        );
+    }
+
+    #[test]
+    fn sys_readdir_peer_dispatch_never_fans_out_loop_guard() {
+        // Loop-guard: peer-dispatch variant runs local scan only.
+        // Even with empty local backend + metastore, no `peer_list_dir`
+        // call — else 3+ node topologies would ping-pong.
+        let k = Kernel::new();
+        let backend: Arc<dyn ObjectStore> = Arc::new(EmptyBackend);
+        k.add_mount("/", "sharedzone", Some(backend), None, None, false)
+            .expect("add_mount");
+        let fake = FakeCoord::new(vec![("/x/1.json".to_string(), 8u8)]);
+        k.set_distributed_coordinator(fake.clone() as Arc<dyn DistributedCoordinator>);
+
+        let entries = k.sys_readdir_peer_dispatch("/x", "sharedzone", true);
+        assert!(
+            fake.peer_list_dir_calls().is_empty(),
+            "peer_dispatch must NOT call peer_list_dir (loop guard)"
+        );
+        assert!(
+            entries.is_empty(),
+            "no fanout + empty local backend = empty result: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn sys_readdir_skips_fanout_when_backend_returns_entries() {
+        // Perf pin: fan-out fires ONLY when local produces zero
+        // entries.  A backend that returns entries short-circuits
+        // the fan-out — no wasted RPC on a live local dir.
+        let k = Kernel::new();
+        let backend: Arc<dyn ObjectStore> = Arc::new(OneEntryBackend);
+        k.add_mount("/", "sharedzone", Some(backend), None, None, false)
+            .expect("add_mount");
+        let fake = FakeCoord::new(vec![("/should-not-appear".to_string(), 4u8)]);
+        k.set_distributed_coordinator(fake.clone() as Arc<dyn DistributedCoordinator>);
+
+        let entries = k.sys_readdir("/", "sharedzone", true);
+        assert!(
+            fake.peer_list_dir_calls().is_empty(),
+            "fan-out must NOT fire when local backend has entries"
+        );
+        let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"/hit"), "local entry present: {names:?}");
+        assert!(
+            !names.iter().any(|n| n.contains("should-not-appear")),
+            "peer entry NOT merged: {names:?}"
         );
     }
 }
