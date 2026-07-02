@@ -923,6 +923,12 @@ fn create_founder_zone(
         peers_empty,
         "founder path — creating 1-voter zone. Other nodes JoinZone here.",
     );
+    // Founder self-registration: encode `{node_id}@{self_address}` so
+    // `ZoneManager::create_zone`'s round-trip through
+    // `NodeAddress::parse` recovers `node_id` verbatim (raft-internal
+    // parse accepts the id-prefixed shape).  The operator-facing
+    // `parse_operator_addr` rejects `@` — but this is a raft-internal
+    // site with both authoritative inputs in hand.
     let self_peer = format!("{node_id}@{self_address}");
     zm.create_zone(zone_id, vec![self_peer])
         .map_err(|e| format!("create_zone({zone_id}): {e}"))
@@ -1705,6 +1711,8 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
         // Root-leader path: founder creates 1-voter cluster locally.
         let am_root_leader = zm.get_zone("root").map(|h| h.is_leader()).unwrap_or(false);
         if am_root_leader {
+            // Founder self-registration string — see `create_founder_zone`
+            // for the encoding rationale.
             let self_peer = format!("{self_id}@{self_address}");
             zm.create_zone(zone_id, vec![self_peer])
                 .map_err(|e| format!("create_zone({zone_id}): {e}"))?;
@@ -2754,12 +2762,22 @@ mod tests {
     }
 
     #[test]
-    fn validate_peers_excludes_self_handles_explicit_id_prefix() {
-        // `id@host:port` form: same self-detection logic must apply.
-        let peers = vec![parse_peer("9999@100.64.0.26:2126")];
-        let err = validate_peers_excludes_self(&peers, "100.64.0.26:2126")
-            .expect_err("self-in-peers must be rejected even with explicit id prefix");
-        assert!(err.contains("contains self"));
+    fn parse_operator_addr_rejects_legacy_id_at_host_form() {
+        // Operator-facing parse rejects `id@host:port` — operators
+        // never had a reason to sync peer node_ids
+        // (`learn_peer_address` populates the real id from the first
+        // inbound raft message).  Raft-internal `parse` still accepts
+        // the form for authoritative-id round-trips.  Pin at the raft
+        // crate boundary so a regression on the operator-facing
+        // rejection surfaces here.
+        let err =
+            NodeAddress::parse_operator_addr("9999@100.64.0.26:2126", /* use_tls */ false)
+                .expect_err("legacy id@host:port form must be rejected on operator boundary");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("legacy 'id@host:port' form"),
+            "error must name the retired form: {msg}"
+        );
     }
 
     #[test]

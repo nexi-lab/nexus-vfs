@@ -97,25 +97,15 @@ fn node_address_from_conf_context(node_id: u64, context: &[u8]) -> Option<NodeAd
     } else {
         format!("http://{}", address)
     };
-    let use_tls = endpoint.starts_with("https://");
-    let target = endpoint
-        .strip_prefix("http://")
-        .or_else(|| endpoint.strip_prefix("https://"))
-        .unwrap_or(&endpoint)
-        .to_string();
 
-    match NodeAddress::parse(&format!("{node_id}@{target}"), use_tls) {
-        Ok(addr) => Some(addr),
-        Err(e) => {
-            tracing::warn!(
-                node_id,
-                endpoint,
-                error = %e,
-                "failed to parse ConfChange peer address; falling back to endpoint-only address"
-            );
-            Some(NodeAddress::new(node_id, endpoint))
-        }
-    }
+    // ConfChange struct carries `node_id` authoritatively; its
+    // `context` bytes carry the address bytes.  Construct directly
+    // via [`NodeAddress::new`] — both authoritative inputs are in
+    // hand, no need to synthesize a peer string and round-trip
+    // through `parse` (which hard-rejects any `id@host:port` shape,
+    // per the retired legacy form).  Raft-internal counterpart to
+    // the CLI-facing `parse` path.
+    Some(NodeAddress::new(node_id, endpoint))
 }
 
 /// Configuration for a Raft node.

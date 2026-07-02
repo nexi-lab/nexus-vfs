@@ -139,17 +139,20 @@ async fn offline_join_persists_confstate_before_returning() {
     //    spawn_blocking, so mirror that shape here so the test
     //    actually exercises the CLI-side contract.
     //
-    //    Peer-string format mirrors runbook §3b's
-    //    `<A_node_id>@<A_tailscale_ip>:2126` — `NodeAddress::parse`
-    //    will derive the node id from `hostname_to_node_id(host)` if
-    //    no `id@` prefix is given, which on localhost-IP test setups
-    //    produces a node id that does NOT match the founder's actual
-    //    id and breaks transport routing.  Carry the founder's real
-    //    id explicitly.
+    //    CLI wire form is bare `host:port` — the CLI-facing
+    //    `NodeAddress::parse` hard-rejects the legacy `id@host:port`
+    //    encoding.  For localhost-IP test setups where the founder's
+    //    minted node_id must match on both sides for transport
+    //    routing to hit its Progress slot before the leader's first
+    //    heartbeat arrives, construct the `NodeAddress` directly via
+    //    the `new` constructor with the real id in hand — same
+    //    kernel-internal shortcut the `share`/`join` control-plane
+    //    RPC path uses when it knows both the id and the endpoint.
+    //    The CLI-side contract (bare `host:port`) is exercised by
+    //    the CLI test module in `rust/profiles/cluster/src/main.rs`.
     // -------------------------------------------------------------
-    let founder_peer_str = format!("{founder_node_id}@{founder_self_addr}");
-    let peer = NodeAddress::parse(&founder_peer_str, /* use_tls */ false)
-        .expect("parse founder peer addr");
+    let founder_endpoint = format!("http://{founder_self_addr}");
+    let peer = NodeAddress::new(founder_node_id, founder_endpoint);
     let peer_addrs = vec![peer];
     let joiner_zm_for_task = joiner_zm.clone();
     let joiner_self_addr_for_task = joiner_self_addr.clone();

@@ -229,7 +229,7 @@ pub struct ZoneManager {
     node_id: u64,
     use_tls: bool,
     /// Remembered peer list (the `peers` arg from construction), in
-    /// `id@host:port` form. Used when `get_or_create_zone` auto-creates
+    /// `host:port` form. Used when `get_or_create_zone` auto-creates
     /// a zone during `sys_setattr(DT_MOUNT)` — every zone in a
     /// federation shares the same raft peer topology, so the peer
     /// list is cluster-wide, not per-zone.
@@ -464,14 +464,14 @@ impl ZoneManager {
     }
 
     /// Cluster-wide peer list remembered from construction, in
-    /// `id@host:port` form. Used by `sys_setattr(DT_MOUNT)`'s
+    /// `host:port` form. Used by `sys_setattr(DT_MOUNT)`'s
     /// leader-side create-on-mount path so zone auto-creation picks
     /// up the federation's peer topology without re-parsing env vars.
     pub fn default_peers(&self) -> &[String] {
         &self.default_peers
     }
 
-    /// Current cluster-wide peer roster in `id@host:port` form.
+    /// Current cluster-wide peer roster in `host:port` form.
     ///
     /// The env-derived `default_peers` are only the cold-start seed. Once
     /// root membership changes through wipe-rejoin rotation, root's live
