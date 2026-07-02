@@ -1256,8 +1256,8 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             };
 
             tracing::debug!(
-                leader = leader_id,
-                addr = %leader_addr.endpoint,
+                leader_node_id = leader_id,
+                leader_addr = %leader_addr.to_operator_str(),
                 zone = %ctx.zone_id,
                 "Forwarding propose to leader"
             );
@@ -1276,7 +1276,8 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
                 Ok(result) => Ok(result),
                 Err(RaftError::Transport(e)) => {
                     tracing::warn!(
-                        leader = leader_id,
+                        leader_node_id = leader_id,
+                        leader_addr = %leader_addr.to_operator_str(),
                         zone = %ctx.zone_id,
                         "Forward to leader failed (unreachable?): {}",
                         e,
