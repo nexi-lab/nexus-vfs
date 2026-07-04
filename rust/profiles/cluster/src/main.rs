@@ -910,14 +910,6 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
         );
     }
 
-    // `bootstrap_static` — invoked below when federation env vars are
-    // set — is `NEXUS_FEDERATION_ZONES`/`_MOUNTS` driven and only
-    // meaningful on the founder (`bootstrap_new` true).
-    let peers_str: Vec<String> = cli_peer_addrs
-        .iter()
-        .map(NodeAddress::to_raft_peer_str)
-        .collect();
-
     let fed = parse_federation_env();
     // Surface every dropped `NEXUS_FEDERATION_MOUNTS` entry so the
     // operator sees them in boot logs.  When the input was non-empty
@@ -943,33 +935,21 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
             ENV_FEDERATION_MOUNTS,
         ));
     }
-    if !fed.zones.is_empty() || !fed.mounts.mounts.is_empty() {
-        // Split-brain guard: NEXUS_FEDERATION_ZONES auto-creates each
-        // named zone as a SOLO 1-voter cluster with self as the only
-        // member.  If identity.json already knows about peers (either
-        // persisted from a prior sidecar join or seeded via
-        // --peers/NEXUS_PEERS on this boot), auto-create almost
-        // certainly means the operator is accidentally running the
-        // "founder" recipe on a machine that was meant to be a joiner.
-        //
-        // Concretely observed 2026-07-04: both Mac and Win booted with
-        // NEXUS_FEDERATION_ZONES=sharedzone on empty data_dirs.  Each
-        // created its own sharedzone (voter=[self], observations
-        // proposed locally, single-voter quorum → committed).  When
-        // one side ran `nexusd-cluster join <other>`, the two
-        // independent commit histories could not reconcile — raft has
-        // no protocol for merging leader logs across clusters — and
-        // they wedged in a heartbeat-clamping loop.  The 152-commit
-        // side had valid task-list content; the 1-commit side kept
-        // its own SOLO leader claim.
-        //
-        // The correct discipline is: exactly one node auto-creates
-        // (unset identity's peers first if this node is really
-        // starting fresh), every other node runs the sidecar `join`.
-        // Guard here catches both-founder before it wedges.
-        if !identity_persisted_peers.is_empty() {
-            return Err(anyhow::anyhow!(
-                "split-brain guard: {} is set (zones={:?}) but identity.json \
+
+    // Preserved PR #112 split-brain guard — backstops the FailLoud arm
+    // of `plan_boot_action` (row 5) with a longer, operator-actionable
+    // hint so the concrete recovery path is one paragraph rather than
+    // one sentence.  Order matters: this fires BEFORE plan_boot_action
+    // sees the same shape, so the verbose message wins.  Kept even
+    // though row 5 is unreachable from here on because bootstrap.rs
+    // also has it — belt-and-suspenders for one of the most expensive
+    // debugging traps we've hit (152-commit vs 1-commit both-founder
+    // wedge, 2026-07-04).
+    if (!fed.zones.is_empty() || !fed.mounts.mounts.is_empty())
+        && !identity_persisted_peers.is_empty()
+    {
+        return Err(anyhow::anyhow!(
+            "split-brain guard: {} is set (zones={:?}) but identity.json \
                  already lists peers={:?}.  Auto-creating a SOLO zone on a \
                  node that already knows peers is the both-founder misconfig \
                  -- it produces two independent raft clusters sharing the \
@@ -983,27 +963,93 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
                  Unset {} and {} in this launcher, then run: \
                  nexusd-cluster join FOUNDER_HOST:PORT ZONE MOUNT_PATH \
                  --data-dir DATA_DIR  before restarting the daemon.",
-                ENV_FEDERATION_ZONES,
-                fed.zones,
-                identity_persisted_peers,
-                ENV_FEDERATION_ZONES,
-                ENV_FEDERATION_MOUNTS,
-            ));
-        }
-        tracing::info!(
-            zones = ?fed.zones,
-            mount_count = fed.mounts.mounts.len(),
-            "Bootstrapping static topology from {} / {}",
+            ENV_FEDERATION_ZONES,
+            fed.zones,
+            identity_persisted_peers,
             ENV_FEDERATION_ZONES,
             ENV_FEDERATION_MOUNTS,
-        );
-        zm.bootstrap_static_async(
-            fed.zones.clone(),
-            peers_str.clone(),
-            fed.mounts.mounts.clone(),
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("bootstrap_static: {}", e))?;
+        ));
+    }
+
+    // Unified bring-up decision layer (S3 完全体).  Replaces the pre-
+    // refactor unconditional `bootstrap_static_async` call.  See
+    // `nexus_raft::bootstrap` for the full decision matrix; the
+    // dispatch below has one arm per `BootAction` variant.
+    let boot_cfg = nexus_raft::bootstrap::BootConfig {
+        identity_persisted_peers: identity_persisted_peers.clone(),
+        cli_peer_addrs: cli_peer_addrs.clone(),
+        federation_zones: fed.zones.clone(),
+        federation_mounts: fed.mounts.mounts.clone(),
+        bootstrap_new,
+        has_disk_state: data_dir_has_root,
+    };
+    match nexus_raft::bootstrap::plan_boot_action(&boot_cfg) {
+        nexus_raft::bootstrap::BootAction::StaticFounder {
+            zones,
+            mounts,
+            peers_for_ha,
+        } => {
+            // Matrix row 1 — pure founder, auto-create SOLO per zone.
+            tracing::info!(
+                zones = ?zones,
+                mount_count = mounts.len(),
+                ha_seed_count = peers_for_ha.len(),
+                "Bootstrapping static topology from {} / {}",
+                ENV_FEDERATION_ZONES,
+                ENV_FEDERATION_MOUNTS,
+            );
+            zm.bootstrap_static_async(zones, peers_for_ha, mounts)
+                .await
+                .map_err(|e| anyhow::anyhow!("bootstrap_static: {}", e))?;
+        }
+        nexus_raft::bootstrap::BootAction::RootlessDynamic => {
+            // Matrix row 2 — nothing declared, root already handled
+            // upstream; federation branch is a no-op.
+        }
+        nexus_raft::bootstrap::BootAction::JoinFederationZones {
+            peers,
+            zones,
+            mounts,
+        } => {
+            // Matrix rows 3 + 4 — joiner path.  Phase A: `zones` list
+            // is empty (rows 3/4 require NEXUS_FEDERATION_ZONES unset).
+            // Empty case is a log-only no-op — the daemon comes up
+            // with root bootstrapped + transport peer_map seeded (via
+            // open_zone_manager's merged-peers path), and zone-level
+            // joining continues through the offline `nexusd-cluster
+            // join` sidecar.  Phase B populates `zones` from
+            // identity.zones so this branch auto-reconnects.
+            if zones.is_empty() {
+                tracing::info!(
+                    cli_peer_count = peers.len(),
+                    "boot joiner: no federation zones auto-declared; daemon up \
+                     rootless-with-peers. Use `nexusd-cluster join` sidecar for \
+                     zone-specific joining, or wait for Phase B identity.zones.",
+                );
+            } else {
+                join_zones_for_boot(
+                    zm.clone(),
+                    node_id,
+                    self_address.clone(),
+                    peers,
+                    contracts::ROOT_ZONE_ID.to_string(),
+                    common.data_dir.clone(),
+                    zones,
+                    mounts,
+                    /* as_learner */ false,
+                )
+                .await?;
+            }
+        }
+        nexus_raft::bootstrap::BootAction::FailLoud { reason, hint } => {
+            // Matrix rows 5 + 6.  Row 5 is unreachable here because the
+            // preserved PR #112 guard above fires first with a longer
+            // hint; row 6 lands here.  Both cases surface as a single
+            // exit-1 code path.
+            return Err(anyhow::anyhow!(
+                "nexusd-cluster boot refused ({reason}): {hint}"
+            ));
+        }
     }
 
     // Canonical coordinator boot wiring: self-address publish, DT_MOUNT
