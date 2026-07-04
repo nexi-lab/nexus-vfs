@@ -201,6 +201,48 @@ Etcd / TiKV-style opaque IDs + leader-driven `AddNode`.
 
 - **Wipe-rejoin** — wiping `<NEXUS_DATA_DIR>` mints a fresh `node_id` on the next boot; the daemon JoinZones, the leader commits `AddNode(new_id)`.  The persisted peer address book at `identity.json` survives — so `--peers` does not need re-specifying at wipe-rejoin, only `NEXUS_BOOTSTRAP_MODE=static` (or `dynamic`) with the same env otherwise.  Identity-and-data-dir both wiped is equivalent to a first-time install; identity survives and data_dir wiped is the routine cache-loss recovery.
 
+##### S3 完全体 — Unified bring-up decision layer
+
+The daemon reads `(identity.peers, --peers, NEXUS_FEDERATION_ZONES)` at boot and dispatches deterministically via [`nexus_raft::bootstrap::plan_boot_action`](../../rust/raft/src/bootstrap.rs).  Six-row matrix; two rows fail loud (both-founder / ambiguous-fresh-founder), three rows drive the pre-refactor primitives (`bootstrap_static_async` for the founder, `bootstrap_or_join_zone` for the joiner), one row is a no-op.  Replaces three separate operator ceremonies (daemon founder, daemon joiner, offline `join` sidecar) with one command.
+
+| # | `identity.peers` | CLI `--peers` | `NEXUS_FEDERATION_ZONES` | Action |
+|---|---|---|---|---|
+| 1 | empty     | empty     | set     | `StaticFounder` — auto-create SOLO |
+| 2 | empty     | empty     | unset   | `RootlessDynamic` — daemon up, no zone auto-boot |
+| 3 | empty     | non-empty | unset   | `JoinFederationZones` — joiner (fresh) |
+| 4 | non-empty | any       | unset   | `JoinFederationZones` — joiner (return) |
+| 5 | non-empty | any       | set     | `FailLoud` — split-brain trap |
+| 6 | empty     | non-empty | set     | `FailLoud` — ambiguous |
+
+##### S3 Phase B — Identity carries per-zone membership
+
+Every successful ConfChange apply on this node fires an in-driver callback that mirrors the fresh `ConfState` into `identity.json`'s `zones` array (schema v2 — see [`Identity`](../../rust/raft/src/identity.rs)).  Payload per entry:
+
+- `zone_id` — the zone this node participates in
+- `members` — `voters ∪ learners` projected through the peer map to bare `host:port`
+- `as_role` — `voter` if `self_id ∈ voters`, else `learner`
+- `last_confirmed_unix_secs` — coarse mtime, diagnostic only
+
+Boot dispatch consumes this: matrix row 4 (returning joiner) becomes `JoinFederationZones { zones: identity.zones[*].zone_id }` instead of the empty Phase-A no-op.  When neither `--peers` nor `identity.peers` are populated, the JoinZone probe list falls back to `identity.zones[i].members` — so a wipe that took `data_dir` + `--peers` but preserved `identity.json` still has enough seed information to reach a live peer.
+
+Coverage today (S3 Phase A + B):
+- **Learner wipe-rejoin** — auto-heals.  Wiped learner boots with fresh `node_id`, `plan_boot_action` returns `JoinFederationZones{zones=[…]}` from identity, `bootstrap_or_join_zone` sends JoinZone as learner.  Old learner id lingers in `ConfState` as a ghost (learners do not count toward quorum, so no wedge).  Ghost GC deferred to a future PR.
+- **Voter wipe-rejoin** — requires Phase C.  A wiped voter's fresh `node_id` joins as a new voter fine, but the leader's `Progress[old_id].matched > 0` for the ghost still exists.  If the operator's cluster loses a majority to the ghost votes, quorum wedges until a manual `RemoveNode(old_id)` proposal drives them out.
+
+##### S3 Phase C — Voter wipe-rejoin design (follow-up PR)
+
+**Prerequisite**: recon 2026-07-05 verified raft-rs 0.7 supports Progress reset via public API — `Changer::simple` (`raft-0.7.0/src/confchange/changer.rs:135`) treats `RemoveNode` + `AddNode` on the same id as a fresh `Progress::new` insertion (`tracker/progress.rs:60-72`) with `matched=0`, `next_idx=raft_log.last_index()`.  No fork of raft-rs is needed.
+
+Design (three-part protocol):
+
+1. **Move `.node_id` into `identity.json`** — schema v3 adds `pub node_id: Option<u64>`.  Wiped voter reboots with the SAME id it had before (identity survives) and `plan_boot_action` still returns `JoinFederationZones`.
+2. **Inbound quiescence on the wiped follower** — the transport layer holds inbound `MsgHeartbeat` / `MsgAppend` for zones the boot decision marked "wipe-recovering" (identity had the zone but data_dir is empty) until it observes its own `AddNode` entry commit locally via snapshot install.  Without this the leader's first heartbeat with `m.commit > 0` panics `commit_to` on the empty follower.
+3. **Leader-side same-id ConfChange** — the JoinZone RPC handler detects `Progress[joiner_id].matched > 0` (returning wipe rejoin, not fresh join) and proposes `RemoveNode(joiner_id)` first, waits for the commit, then proposes `AddNode(joiner_id)`.  `Changer::simple` rejects two voter changes per proposal, so this must be sequential — or via a single `ConfChangeV2` in joint consensus mode.
+
+Together these three restore commit-log linearity across the wipe boundary without changing raft-rs's `RaftLog::commit_to` safety invariant.  Task #69 test (`test_full_data_dir_wipe_auto_recovers`) becomes unSKIP-able once the three parts land.
+
+Cross-refs: `commit_to` invariant at `raft-0.7.0/src/raft_log.rs:286`; leader-side heartbeat commit computation at `raft-0.7.0/src/raft.rs:868`; existing use of `RemoveNode` + `AddNode` on our side at [`node.rs:1797/1856`](../../rust/raft/src/raft/node.rs).
+
 ##### Witness
 
 The standalone witness binary derives `node_id = hostname_to_node_id(hostname)` (SHA-256 of hostname).  Witnesses live at well-known addresses, so binding identity to hostname is sufficient for them.
