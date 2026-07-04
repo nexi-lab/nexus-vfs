@@ -487,18 +487,34 @@ fn main() -> Result<()> {
 /// [`bootstrap_or_join_zone`] which owns the actual root-zone
 /// dispatch.
 ///
-/// `peer_addrs` intentionally reflects **CLI `--peers` only** — NOT
-/// the CLI ∪ identity union that seeds `ZoneManager`'s transport
-/// peer map.  Root is per-node SOLO, and `bootstrap_or_join_zone`
-/// hard-rejects non-empty peer lists on root (see the SOLO-invariant
-/// guard in `distributed_coordinator.rs`).  Identity's persisted
-/// peers therefore must NOT flow into root's bootstrap decision;
-/// they're a transport reconnect hint, not a bootstrap seed.
+/// Two peer-list fields on purpose — same value shape, different
+/// semantics, different consumers, different downstream contracts.
+/// Do NOT be tempted to merge them; see the trade-off in the peer-
+/// identity + bootstrap-safety PR body for why unifying strictly
+/// weakens either the S3 identity-reconnect contract or the root
+/// SOLO-invariant defense-in-depth.
 struct ZoneManagerBundle {
     zm: std::sync::Arc<ZoneManager>,
     node_id: u64,
     self_address: String,
-    peer_addrs: Vec<NodeAddress>,
+    /// CLI `--peers` / `NEXUS_PEERS` ONLY — this is what
+    /// `bootstrap_or_join_zone("root", ..., peers=)` receives.  Root
+    /// is per-node SOLO by contract (`distributed_coordinator.rs`
+    /// SOLO-invariant guard), and non-empty here on root triggers a
+    /// hard-fail.  Identity-persisted peers MUST NOT flow into this
+    /// field — they're the S3 reconnect hint (survives data_dir wipe),
+    /// not a bootstrap dispatch input.
+    cli_peer_addrs: Vec<NodeAddress>,
+    /// Identity ∪ CLI union re-persisted to `identity.json` at boot.
+    /// Two consumers:
+    ///   (a) `ZoneManager`'s transport peer_map seed — reconnect hint
+    ///       that survives `data_dir` wipe (S3 identity contract).
+    ///   (b) split-brain guard around `bootstrap_static` — non-empty
+    ///       here + `NEXUS_FEDERATION_ZONES` set = both-founder
+    ///       misconfig, fail loud rather than wedge downstream.
+    /// MUST NOT flow into `bootstrap_or_join_zone(peers=)` for root —
+    /// see the `cli_peer_addrs` docstring above.
+    identity_persisted_peers: Vec<String>,
 }
 
 /// Open a `ZoneManager` against the data dir, sharing the daemon's
@@ -603,8 +619,8 @@ fn open_zone_manager(
     //
     // The MERGED list seeds `ZoneManager`'s transport peer map (i.e.
     // "who might this node dial for federation") but does NOT
-    // propagate into `bundle.peer_addrs` — which is CLI-only, per the
-    // struct docstring.  Reason: root is per-node SOLO, and
+    // propagate into `bundle.cli_peer_addrs` — which is CLI-only, per
+    // the struct docstring.  Reason: root is per-node SOLO, and
     // `bootstrap_or_join_zone("root", ..., peers=merged, ...)` would
     // hit the SOLO-invariant guard as soon as identity persisted a
     // sharedzone-leader peer.  Post-restart joiners in cc-tasks-share
@@ -665,14 +681,16 @@ fn open_zone_manager(
     )
     .map_err(|e| anyhow::anyhow!("ZoneManager::with_node_id: {}", e))?;
 
-    // Return CLI-only peer_addrs — see `ZoneManagerBundle` docstring.
-    // Identity's persisted peers reached `ZoneManager`'s transport
-    // seed above; they must not propagate into `bootstrap_or_join_zone`.
+    // Return CLI-only cli_peer_addrs (root bootstrap consumer) +
+    // identity ∪ CLI union (transport seed + split-brain guard
+    // consumer) — see `ZoneManagerBundle` docstring for why they're
+    // distinct fields, not merged.
     Ok(ZoneManagerBundle {
         zm,
         node_id,
         self_address,
-        peer_addrs: cli_peer_addrs,
+        cli_peer_addrs,
+        identity_persisted_peers: identity_persisted.peers,
     })
 }
 
@@ -845,7 +863,8 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
         zm,
         node_id,
         self_address,
-        peer_addrs,
+        cli_peer_addrs,
+        identity_persisted_peers,
     } = open_zone_manager(&common, Some(vfs_routes))?;
 
     // Bring root zone online based on declared mode.
@@ -867,7 +886,7 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     if matches!(mode, BootstrapMode::Static | BootstrapMode::Restart) {
         let zm_for_bootstrap = zm.clone();
         let self_addr_for_bootstrap = self_address.clone();
-        let peer_addrs_for_bootstrap = peer_addrs.clone();
+        let peer_addrs_for_bootstrap = cli_peer_addrs.clone();
         tokio::task::spawn_blocking(move || {
             bootstrap_or_join_zone(
                 zm_for_bootstrap.as_ref(),
@@ -894,7 +913,7 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     // `bootstrap_static` — invoked below when federation env vars are
     // set — is `NEXUS_FEDERATION_ZONES`/`_MOUNTS` driven and only
     // meaningful on the founder (`bootstrap_new` true).
-    let peers_str: Vec<String> = peer_addrs
+    let peers_str: Vec<String> = cli_peer_addrs
         .iter()
         .map(NodeAddress::to_raft_peer_str)
         .collect();
@@ -925,6 +944,52 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
         ));
     }
     if !fed.zones.is_empty() || !fed.mounts.mounts.is_empty() {
+        // Split-brain guard: NEXUS_FEDERATION_ZONES auto-creates each
+        // named zone as a SOLO 1-voter cluster with self as the only
+        // member.  If identity.json already knows about peers (either
+        // persisted from a prior sidecar join or seeded via
+        // --peers/NEXUS_PEERS on this boot), auto-create almost
+        // certainly means the operator is accidentally running the
+        // "founder" recipe on a machine that was meant to be a joiner.
+        //
+        // Concretely observed 2026-07-04: both Mac and Win booted with
+        // NEXUS_FEDERATION_ZONES=sharedzone on empty data_dirs.  Each
+        // created its own sharedzone (voter=[self], observations
+        // proposed locally, single-voter quorum → committed).  When
+        // one side ran `nexusd-cluster join <other>`, the two
+        // independent commit histories could not reconcile — raft has
+        // no protocol for merging leader logs across clusters — and
+        // they wedged in a heartbeat-clamping loop.  The 152-commit
+        // side had valid task-list content; the 1-commit side kept
+        // its own SOLO leader claim.
+        //
+        // The correct discipline is: exactly one node auto-creates
+        // (unset identity's peers first if this node is really
+        // starting fresh), every other node runs the sidecar `join`.
+        // Guard here catches both-founder before it wedges.
+        if !identity_persisted_peers.is_empty() {
+            return Err(anyhow::anyhow!(
+                "split-brain guard: {} is set (zones={:?}) but identity.json \
+                 already lists peers={:?}.  Auto-creating a SOLO zone on a \
+                 node that already knows peers is the both-founder misconfig \
+                 -- it produces two independent raft clusters sharing the \
+                 same zone name whose leader histories cannot merge.  \
+                 Choose one role:\n  \
+                 (a) FOUNDER -- this node is the source of truth.  Remove \
+                 the persisted peers first: rm -f IDENTITY_DIR/identity.json \
+                 (leave data_dir alone if you have prior state to reuse), \
+                 then re-run.\n  \
+                 (b) JOINER -- the persisted peers are the actual founders. \
+                 Unset {} and {} in this launcher, then run: \
+                 nexusd-cluster join FOUNDER_HOST:PORT ZONE MOUNT_PATH \
+                 --data-dir DATA_DIR  before restarting the daemon.",
+                ENV_FEDERATION_ZONES,
+                fed.zones,
+                identity_persisted_peers,
+                ENV_FEDERATION_ZONES,
+                ENV_FEDERATION_MOUNTS,
+            ));
+        }
         tracing::info!(
             zones = ?fed.zones,
             mount_count = fed.mounts.mounts.len(),
@@ -1245,8 +1310,10 @@ async fn run_share(
     new_zone_id: &str,
     mount_at: Option<&str>,
 ) -> Result<()> {
-    let ZoneManagerBundle { zm, peer_addrs, .. } = open_zone_manager(&common, None)?;
-    let peers_str: Vec<String> = peer_addrs
+    let ZoneManagerBundle {
+        zm, cli_peer_addrs, ..
+    } = open_zone_manager(&common, None)?;
+    let peers_str: Vec<String> = cli_peer_addrs
         .iter()
         .map(NodeAddress::to_raft_peer_str)
         .collect();
