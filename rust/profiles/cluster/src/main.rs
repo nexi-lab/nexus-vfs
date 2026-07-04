@@ -1049,20 +1049,28 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
             } else {
                 // Phase B row 4: `zones` came from identity.zones.  When CLI
                 // --peers was not passed on this boot the daemon still needs
-                // *some* addresses to send JoinZone against — parse the
-                // identity-persisted peer list into NodeAddress form and
-                // fall back to it.  Preserves peer separation: CLI peers
-                // take precedence when present (operator override), identity
-                // peers seed the wipe-recovery path.
-                let peers_for_join = if peers.is_empty() {
-                    let use_tls = !common.no_tls;
-                    NodeAddress::parse_peer_list_operator(
-                        &identity_persisted_peers.join(","),
-                        use_tls,
-                    )
-                    .map_err(|e| anyhow::anyhow!("identity peers reparse: {}", e))?
-                } else {
+                // *some* addresses to send JoinZone against.  Precedence:
+                //   1. CLI --peers (operator override).
+                //   2. identity.peers (union widened at prior boot's persist).
+                //   3. identity.zones[i].members (populated by the apply cb;
+                //      the "wipe took data_dir + peers but the apply cb had
+                //      already stamped the members list before" case).
+                let peers_for_join = if !peers.is_empty() {
                     peers
+                } else {
+                    let use_tls = !common.no_tls;
+                    let mut seed = identity_persisted_peers.clone();
+                    if seed.is_empty() {
+                        for z in &identity_zones {
+                            for m in &z.members {
+                                if !seed.iter().any(|s| s == m) {
+                                    seed.push(m.clone());
+                                }
+                            }
+                        }
+                    }
+                    NodeAddress::parse_peer_list_operator(&seed.join(","), use_tls)
+                        .map_err(|e| anyhow::anyhow!("identity peers reparse: {}", e))?
                 };
                 join_zones_for_boot(
                     zm.clone(),

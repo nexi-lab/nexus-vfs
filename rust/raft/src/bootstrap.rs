@@ -272,15 +272,16 @@ pub fn plan_boot_action(cfg: &BootConfig) -> BootAction {
         };
     }
 
-    // Rows 3 + 4: peers known (identity, CLI, or both) + no zones
-    // declared → joiner path.  Phase B: if identity carries a zones
-    // snapshot from a prior ConfChange apply, seed the JoinZone
-    // targets from it — this is the S3 auto-reconnect after
-    // `data_dir` wipe.  When identity_zones is empty (Phase A
-    // behaviour, or a fresh joiner that has never converged), fall
-    // back to the empty-zones no-op — the offline `nexusd-cluster
-    // join` sidecar remains available for the initial join.
-    if identity_has_peers || cli_has_peers {
+    // Rows 3 + 4: peers OR identity.zones known + no zones declared
+    // → joiner path.  Phase B: if identity carries a zones snapshot
+    // from a prior ConfChange apply, seed the JoinZone targets from
+    // it — this is the S3 auto-reconnect after `data_dir` wipe.
+    // identity.zones alone (with peers empty) is enough to enter the
+    // joiner path: the wipe took the peers away too, but the zones
+    // snapshot's members list is a peer seed.  When both peers and
+    // identity_zones are empty, fall through to row 2 (RootlessDynamic).
+    let identity_has_zones = !cfg.identity_zones.is_empty();
+    if identity_has_peers || cli_has_peers || identity_has_zones {
         let zones_from_identity: Vec<String> = cfg
             .identity_zones
             .iter()
