@@ -35,13 +35,28 @@ pub const IDENTITY_FILE: &str = "identity.json";
 /// Current identity schema version.  Bump on any breaking field
 /// rename / removal; add-only field extensions can be handled with
 /// `#[serde(default)]`.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// Version history:
+///   * v1 (PR #106): peers only.
+///   * v2 (S3 完全体 Phase B): adds `zones` — per-zone membership snapshot
+///     for auto-reconnect after `data_dir` wipe.
+///
+/// Load rule: any version `<= SCHEMA_VERSION` is accepted; missing
+/// fields default (e.g. v1 files load with `zones = []`).  Persist
+/// always writes the current version, upgrading files in place on the
+/// next write.  Files with `schema_version > SCHEMA_VERSION` refuse
+/// to load — forward-incompatible schemas are never silently
+/// downgraded.
+pub const SCHEMA_VERSION: u32 = 2;
 
-/// On-disk shape of `identity.json`.  Intentionally narrow: peer
-/// address book only.  Anything derivable from raft state (ConfState,
-/// log, snapshots) belongs in the replicated SSOT.  `node_id` is
-/// deliberately NOT here — see module docs for why.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+/// On-disk shape of `identity.json`.  Narrow by design: peer address
+/// book + per-zone membership snapshot.  Anything derivable from raft
+/// state (ConfState, log, snapshots) still belongs in the replicated
+/// SSOT — `zones` here is a *durable snapshot* driven by the ConfChange
+/// apply callback (Phase B, commit 7), not authoritative membership.
+/// `node_id` is deliberately NOT here — see module docs; Phase C
+/// reconsiders after the raft-rs Progress reset work.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Identity {
     pub schema_version: u32,
     /// Raft peer address book — `"host:port"` strings, same schema
@@ -53,6 +68,58 @@ pub struct Identity {
     /// `learn_peer_address` (transport/server.rs).
     #[serde(default)]
     pub peers: Vec<String>,
+    /// Per-zone membership snapshot.  Written by the ConfChange apply
+    /// callback (Phase B, commit 7) on every voter+learner change so
+    /// that a subsequent boot with a wiped `data_dir` still knows
+    /// which zones this node participated in — and therefore which
+    /// zones' JoinZone to dispatch at boot.  See [`IdentityZone`].
+    ///
+    /// v1 files load with an empty `zones` vec via `#[serde(default)]`;
+    /// the next persist upgrades the file to v2 on disk.
+    #[serde(default)]
+    pub zones: Vec<IdentityZone>,
+}
+
+/// Per-zone entry in [`Identity::zones`].  Populated by the ConfChange
+/// apply callback with the *current* voter+learner list (both count —
+/// wipe-and-rejoin needs to reach the leader regardless of the
+/// rejoiner's own role, and any live member serves that role).
+///
+/// `as_role` records how THIS node participated last time it saw a
+/// ConfState apply for the zone.  Boot uses it to pick voter vs
+/// learner when reissuing JoinZone: staying consistent avoids the
+/// PR #57 wipe-rejoin deadlock (Learner-that-thinks-it's-a-voter
+/// counts toward quorum and cannot serve remote reads until it
+/// finishes catching up).
+///
+/// `last_confirmed_unix_secs` is a coarse mtime (Unix seconds) —
+/// diagnostic only.  Never load-bearing for the ConfState decision.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IdentityZone {
+    pub zone_id: String,
+    /// Voter + learner list in operator-facing bare `"host:port"` form.
+    /// Order is the emit order from the ConfChange apply callback so
+    /// two boots at the same ConfState converge on the same identity
+    /// file — makes `persist_zones_if_changed` a real no-op most of
+    /// the time.
+    pub members: Vec<String>,
+    /// This node's role in the zone at last ConfChange apply.
+    #[serde(default)]
+    pub as_role: IdentityZoneRole,
+    /// Unix seconds of the last apply that touched this zone entry.
+    /// `None` on v1 upgrade path.
+    #[serde(default)]
+    pub last_confirmed_unix_secs: Option<u64>,
+}
+
+/// This node's role in a given zone at the last ConfChange apply.
+/// Wire form is lowercase JSON — `"voter"` / `"learner"`.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum IdentityZoneRole {
+    #[default]
+    Voter,
+    Learner,
 }
 
 /// Default `identity_dir` per platform-native user-data conventions:
@@ -119,17 +186,36 @@ pub fn load(identity_dir: &Path) -> Result<Identity, String> {
         Ok(bytes) => {
             let ident: Identity = serde_json::from_slice(&bytes)
                 .map_err(|e| format!("parse identity file '{}': {e}", path.display()))?;
-            if ident.schema_version != SCHEMA_VERSION {
+            if ident.schema_version > SCHEMA_VERSION {
                 return Err(format!(
-                    "identity file '{}' schema_version={} does not match \
-                     supported version {SCHEMA_VERSION}",
+                    "identity file '{}' schema_version={} is newer than the \
+                     supported version {SCHEMA_VERSION} — refusing to silently \
+                     downgrade (a forward-incompatible schema exists on disk; \
+                     inspect + upgrade the daemon, or remove the file if you \
+                     know what you're doing)",
                     path.display(),
                     ident.schema_version,
                 ));
             }
+            if ident.schema_version < SCHEMA_VERSION {
+                // Leave the returned struct at the on-disk version so
+                // `persist_peers` / `persist_zone_members` see the gap
+                // and force a rewrite even if the peer set is unchanged.
+                // A boot that only reads (`share`/`join` audit paths)
+                // never rewrites the file; a boot that touches identity
+                // upgrades in place.
+                tracing::info!(
+                    identity_path = %path.display(),
+                    from_version = ident.schema_version,
+                    to_version = SCHEMA_VERSION,
+                    "identity schema is older than current — upgrade lands on next persist",
+                );
+            }
             tracing::info!(
                 identity_path = %path.display(),
+                on_disk_version = ident.schema_version,
                 persisted_peers = ident.peers.len(),
+                persisted_zones = ident.zones.len(),
                 "identity loaded from disk",
             );
             Ok(ident)
@@ -137,6 +223,7 @@ pub fn load(identity_dir: &Path) -> Result<Identity, String> {
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(Identity {
             schema_version: SCHEMA_VERSION,
             peers: Vec::new(),
+            zones: Vec::new(),
         }),
         Err(e) => Err(format!("read identity '{}': {e}", path.display())),
     }
@@ -162,19 +249,98 @@ pub fn persist_peers(
             merged.push(peer.clone());
         }
     }
-    if merged == existing.peers && identity_dir.join(IDENTITY_FILE).exists() {
+    // No-op if peer set unchanged AND the on-disk file already carries
+    // the current SCHEMA_VERSION.  A v1 file that survived without
+    // widening still needs a write to upgrade to v2 — otherwise a fresh
+    // `data_dir` wipe would find a v1 file with no zones, take the
+    // JoinFederationZones no-op branch, and never fill zones.
+    let on_disk_matches = merged == existing.peers
+        && identity_dir.join(IDENTITY_FILE).exists()
+        && existing.schema_version == SCHEMA_VERSION;
+    if on_disk_matches {
         return Ok(existing.clone());
     }
     let updated = Identity {
         schema_version: SCHEMA_VERSION,
         peers: merged,
+        zones: existing.zones.clone(),
     };
     let path = identity_dir.join(IDENTITY_FILE);
     atomic_write(&path, &updated)?;
     tracing::info!(
         identity_path = %path.display(),
         peers = updated.peers.len(),
+        zones = updated.zones.len(),
         "identity peers persisted",
+    );
+    Ok(updated)
+}
+
+/// Rewrite `identity.json` with the zone's current member list.
+///
+/// Called from the ConfChange apply callback (Phase B, commit 7) with
+/// the new voter+learner membership for the zone.  Idempotent: when
+/// the persisted entry already matches (same members in the same order,
+/// same role, same schema version), the file is not rewritten — apply
+/// runs on every ConfChange so a naive rewrite would trigger disk I/O
+/// on every leader heartbeat's committed entry.
+///
+/// Members MUST be operator-facing bare `"host:port"` strings.  The
+/// caller (raft apply cb) has NodeAddress in hand; project via
+/// `NodeAddress::to_operator_str` before calling.
+pub fn persist_zone_members(
+    identity_dir: &Path,
+    existing: &Identity,
+    zone_id: &str,
+    members: Vec<String>,
+    as_role: IdentityZoneRole,
+) -> Result<Identity, String> {
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs());
+    let new_entry = IdentityZone {
+        zone_id: zone_id.to_string(),
+        members,
+        as_role,
+        last_confirmed_unix_secs: now_secs,
+    };
+    let mut zones = existing.zones.clone();
+    let changed_material;
+    match zones.iter_mut().find(|z| z.zone_id == zone_id) {
+        Some(slot) => {
+            // Compare only the load-bearing fields: members + role.
+            // `last_confirmed_unix_secs` alone is not a reason to
+            // rewrite the file.
+            let materially_same =
+                slot.members == new_entry.members && slot.as_role == new_entry.as_role;
+            if materially_same && existing.schema_version == SCHEMA_VERSION {
+                return Ok(existing.clone());
+            }
+            *slot = new_entry;
+            changed_material = !materially_same;
+        }
+        None => {
+            zones.push(new_entry);
+            changed_material = true;
+        }
+    }
+
+    let updated = Identity {
+        schema_version: SCHEMA_VERSION,
+        peers: existing.peers.clone(),
+        zones,
+    };
+    let path = identity_dir.join(IDENTITY_FILE);
+    atomic_write(&path, &updated)?;
+    tracing::info!(
+        identity_path = %path.display(),
+        zone = %zone_id,
+        member_count = updated.zones.iter().find(|z| z.zone_id == zone_id)
+            .map(|z| z.members.len()).unwrap_or(0),
+        role = ?as_role,
+        material_change = changed_material,
+        "identity zone membership persisted",
     );
     Ok(updated)
 }
@@ -230,12 +396,194 @@ mod tests {
     }
 
     #[test]
-    fn schema_mismatch_refuses_to_boot() {
+    fn forward_incompatible_schema_refuses_to_boot() {
+        // schema_version > SCHEMA_VERSION means the file was written by
+        // a newer daemon.  Never silently downgrade — the newer daemon
+        // may rely on fields this build cannot serialize back.
         let dir = tempdir().unwrap();
         let path = dir.path().join(IDENTITY_FILE);
         fs::write(&path, br#"{"schema_version":99,"peers":[]}"#).unwrap();
         let err = load(dir.path()).unwrap_err();
         assert!(err.contains("schema_version=99"), "err={err}");
+    }
+
+    #[test]
+    fn v1_file_loads_with_empty_zones_and_reports_on_disk_version() {
+        // Backward-compat: a v1 identity file (schema_version=1, no
+        // zones field) must load cleanly with zones defaulted to [].
+        // The returned struct preserves the on-disk schema_version so
+        // downstream persist calls can detect the gap and force a
+        // rewrite (schema upgrade).  On-disk file is untouched by
+        // load itself.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(IDENTITY_FILE);
+        fs::write(&path, br#"{"schema_version":1,"peers":["a:2126"]}"#).unwrap();
+
+        let ident = load(dir.path()).unwrap();
+        assert_eq!(ident.schema_version, 1, "load reports on-disk version");
+        assert_eq!(ident.peers, vec!["a:2126"]);
+        assert!(ident.zones.is_empty(), "v1 file loads with empty zones");
+
+        // File on disk is unchanged.
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains(r#""schema_version":1"#),
+            "load MUST NOT rewrite; raw={raw}",
+        );
+    }
+
+    #[test]
+    fn v1_file_upgrades_on_disk_on_next_persist() {
+        // Follow-up to the load-only test: persist_peers should upgrade
+        // the on-disk schema_version to SCHEMA_VERSION even if peer set
+        // is unchanged (the v1 -> v2 upgrade IS a material change).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(IDENTITY_FILE);
+        fs::write(&path, br#"{"schema_version":1,"peers":["a:2126"]}"#).unwrap();
+
+        let loaded = load(dir.path()).unwrap();
+        let same_peers = vec!["a:2126".to_string()];
+        let persisted = persist_peers(dir.path(), &loaded, &same_peers).unwrap();
+        assert_eq!(persisted.schema_version, SCHEMA_VERSION);
+        assert!(persisted.zones.is_empty());
+
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains(r#""schema_version": 2"#) || raw.contains(r#""schema_version":2"#),
+            "v1 -> v2 upgrade must land on disk; raw={raw}",
+        );
+        // Round-trip: reload sees v2 with same peers.
+        let reloaded = load(dir.path()).unwrap();
+        assert_eq!(reloaded.schema_version, SCHEMA_VERSION);
+        assert_eq!(reloaded.peers, same_peers);
+        assert!(reloaded.zones.is_empty());
+    }
+
+    #[test]
+    fn persist_zone_members_writes_and_dedupes() {
+        let dir = tempdir().unwrap();
+        let ident = load(dir.path()).unwrap();
+        let members = vec![
+            "100.64.0.21:2126".to_string(),
+            "100.64.0.27:2126".to_string(),
+        ];
+
+        let after = persist_zone_members(
+            dir.path(),
+            &ident,
+            "sharedzone",
+            members.clone(),
+            IdentityZoneRole::Voter,
+        )
+        .unwrap();
+        assert_eq!(after.zones.len(), 1);
+        assert_eq!(after.zones[0].zone_id, "sharedzone");
+        assert_eq!(after.zones[0].members, members);
+        assert_eq!(after.zones[0].as_role, IdentityZoneRole::Voter);
+        assert!(after.zones[0].last_confirmed_unix_secs.is_some());
+
+        // Second call with same members + same role is a no-op (does
+        // not rewrite the file mtime).
+        let path = dir.path().join(IDENTITY_FILE);
+        let mtime_before = fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let noop = persist_zone_members(
+            dir.path(),
+            &after,
+            "sharedzone",
+            members.clone(),
+            IdentityZoneRole::Voter,
+        )
+        .unwrap();
+        assert_eq!(noop, after);
+        let mtime_after = fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(mtime_before, mtime_after, "no-op MUST NOT rewrite file");
+    }
+
+    #[test]
+    fn persist_zone_members_updates_existing_entry_in_place() {
+        // Adding a peer to an already-tracked zone rewrites the entry
+        // and keeps zone ordering stable.  Order matters for the
+        // no-op detection above.
+        let dir = tempdir().unwrap();
+        let ident = load(dir.path()).unwrap();
+        let one = vec!["100.64.0.21:2126".to_string()];
+        let two = vec![
+            "100.64.0.21:2126".to_string(),
+            "100.64.0.27:2126".to_string(),
+        ];
+        let after1 = persist_zone_members(
+            dir.path(),
+            &ident,
+            "sharedzone",
+            one,
+            IdentityZoneRole::Voter,
+        )
+        .unwrap();
+        let after2 = persist_zone_members(
+            dir.path(),
+            &after1,
+            "sharedzone",
+            two.clone(),
+            IdentityZoneRole::Voter,
+        )
+        .unwrap();
+        assert_eq!(after2.zones.len(), 1, "same zone_id must not duplicate");
+        assert_eq!(after2.zones[0].members, two);
+    }
+
+    #[test]
+    fn persist_zone_members_tracks_multiple_zones() {
+        let dir = tempdir().unwrap();
+        let ident = load(dir.path()).unwrap();
+        let a = persist_zone_members(
+            dir.path(),
+            &ident,
+            "sharedzone",
+            vec!["a:2126".to_string()],
+            IdentityZoneRole::Voter,
+        )
+        .unwrap();
+        let b = persist_zone_members(
+            dir.path(),
+            &a,
+            "corp-eng",
+            vec!["b:2126".to_string()],
+            IdentityZoneRole::Learner,
+        )
+        .unwrap();
+        assert_eq!(b.zones.len(), 2);
+        let ids: Vec<&str> = b.zones.iter().map(|z| z.zone_id.as_str()).collect();
+        assert!(ids.contains(&"sharedzone") && ids.contains(&"corp-eng"));
+
+        let reloaded = load(dir.path()).unwrap();
+        assert_eq!(reloaded.zones.len(), 2);
+    }
+
+    #[test]
+    fn persist_zone_members_role_change_triggers_rewrite() {
+        // Same members but role flipped (voter -> learner) is a
+        // material change — must land on disk.
+        let dir = tempdir().unwrap();
+        let ident = load(dir.path()).unwrap();
+        let members = vec!["a:2126".to_string()];
+        let voter = persist_zone_members(
+            dir.path(),
+            &ident,
+            "sharedzone",
+            members.clone(),
+            IdentityZoneRole::Voter,
+        )
+        .unwrap();
+        let learner = persist_zone_members(
+            dir.path(),
+            &voter,
+            "sharedzone",
+            members,
+            IdentityZoneRole::Learner,
+        )
+        .unwrap();
+        assert_eq!(learner.zones[0].as_role, IdentityZoneRole::Learner);
     }
 
     #[test]
