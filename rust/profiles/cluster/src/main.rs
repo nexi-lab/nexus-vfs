@@ -989,7 +989,8 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
             mounts,
             peers_for_ha,
         } => {
-            // Matrix row 1 — pure founder, auto-create SOLO per zone.
+            // Matrix row 1 — see `plan_boot_action` docstring for the
+            // full table.  Pure founder: auto-create SOLO per zone.
             tracing::info!(
                 zones = ?zones,
                 mount_count = mounts.len(),
@@ -1003,15 +1004,17 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("bootstrap_static: {}", e))?;
         }
         nexus_raft::bootstrap::BootAction::RootlessDynamic => {
-            // Matrix row 2 — nothing declared, root already handled
-            // upstream; federation branch is a no-op.
+            // Matrix row 2 — see `plan_boot_action` docstring.  Nothing
+            // declared; root already handled upstream, federation
+            // branch is a no-op.
         }
         nexus_raft::bootstrap::BootAction::JoinFederationZones {
             peers,
             zones,
             mounts,
         } => {
-            // Matrix rows 3 + 4 — joiner path.  Phase A: `zones` list
+            // Matrix rows 3 + 4 — see `plan_boot_action` docstring.
+            // Joiner path.  Phase A: `zones` list
             // is empty (rows 3/4 require NEXUS_FEDERATION_ZONES unset).
             // Empty case is a log-only no-op — the daemon comes up
             // with root bootstrapped + transport peer_map seeded (via
@@ -1042,10 +1045,10 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
             }
         }
         nexus_raft::bootstrap::BootAction::FailLoud { reason, hint } => {
-            // Matrix rows 5 + 6.  Row 5 is unreachable here because the
-            // preserved PR #112 guard above fires first with a longer
-            // hint; row 6 lands here.  Both cases surface as a single
-            // exit-1 code path.
+            // Matrix rows 5 + 6 — see `plan_boot_action` docstring.
+            // Row 5 is unreachable here because the preserved PR #112
+            // guard above fires first with a longer hint; row 6 lands
+            // here.  Both cases surface as a single exit-1 code path.
             return Err(anyhow::anyhow!(
                 "nexusd-cluster boot refused ({reason}): {hint}"
             ));

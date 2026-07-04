@@ -173,9 +173,32 @@ pub const REASON_AMBIGUOUS_FRESH_FOUNDER_WITH_PEERS: &str = "ambiguous_fresh_fou
 
 /// Decide what the daemon should do at the federation branch of boot.
 ///
-/// See module docs for the full matrix.  Total function — no `Result`
-/// return; misconfig is surfaced via [`BootAction::FailLoud`] so
-/// callers uniformly funnel through one exit-code path.
+/// Total function — no `Result` return; misconfig is surfaced via
+/// [`BootAction::FailLoud`] so callers uniformly funnel through one
+/// exit-code path.
+///
+/// ### Decision matrix
+///
+/// | # | identity.peers | CLI --peers | `NEXUS_FEDERATION_ZONES` | Action |
+/// |---|---|---|---|---|
+/// | 1 | empty     | empty     | set     | [`BootAction::StaticFounder`] — auto-create SOLO |
+/// | 2 | empty     | empty     | unset   | [`BootAction::RootlessDynamic`] — daemon up, no zone auto-boot |
+/// | 3 | empty     | non-empty | unset   | [`BootAction::JoinFederationZones`] — joiner (fresh) |
+/// | 4 | non-empty | any       | unset   | [`BootAction::JoinFederationZones`] — joiner (return) |
+/// | 5 | non-empty | any       | set     | [`BootAction::FailLoud`] — split-brain trap (PR #112) |
+/// | 6 | empty     | non-empty | set     | [`BootAction::FailLoud`] — ambiguous (NEW) |
+///
+/// Precedence: rows are evaluated top-to-bottom on the guard clauses,
+/// but the layout above matches how the function reads: rows 5 + 6
+/// fire first (fail-loud), then row 1 (founder), then rows 3/4
+/// (joiner), then row 2 (dynamic fallback).  Row 5 vs row 6: when
+/// both identity peers AND CLI peers exist alongside zones, row 5
+/// wins — see [`row5_precedence_when_both_identity_and_cli_have_peers`]
+/// (in the tests module).
+///
+/// `NEXUS_FEDERATION_MOUNTS` counts as "zones set" for the matrix
+/// (either env var triggers the founder / trap semantics — the
+/// federation branch acts uniformly on the union).
 pub fn plan_boot_action(cfg: &BootConfig) -> BootAction {
     let identity_has_peers = !cfg.identity_persisted_peers.is_empty();
     let cli_has_peers = !cfg.cli_peer_addrs.is_empty();
