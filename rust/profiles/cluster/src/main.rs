@@ -681,6 +681,13 @@ fn open_zone_manager(
     )
     .map_err(|e| anyhow::anyhow!("ZoneManager::with_node_id: {}", e))?;
 
+    // S3 Phase B: hand the identity directory to the zone registry so
+    // every future zone install (both static founder and JoinZone
+    // joiner paths) installs the ConfState apply mirror.  Must happen
+    // BEFORE `bootstrap_or_join_zone` / `bootstrap_static_async` so
+    // the first ConfChange apply is already covered.
+    zm.registry().set_identity_dir(identity_dir.clone());
+
     // Return CLI-only cli_peer_addrs (root bootstrap consumer) +
     // identity ∪ CLI union (transport seed + split-brain guard
     // consumer) — see `ZoneManagerBundle` docstring for why they're

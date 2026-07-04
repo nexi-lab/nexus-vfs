@@ -64,7 +64,7 @@ pub use state_machine::{
 };
 
 #[cfg(feature = "consensus")]
-pub use node::{RaftConfig, RaftMsg, ZoneConsensus, ZoneConsensusDriver};
+pub use node::{ConfStateAppliedCb, RaftConfig, RaftMsg, ZoneConsensus, ZoneConsensusDriver};
 #[cfg(all(feature = "grpc", has_protos))]
 pub use search_caps::{read_search_caps, write_search_caps, SearchCapabilitiesInfo};
 #[cfg(feature = "consensus")]
