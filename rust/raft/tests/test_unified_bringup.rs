@@ -64,6 +64,7 @@ fn cfg(
         federation_mounts: mounts,
         bootstrap_new: false,
         has_disk_state: false,
+        identity_zones: Vec::new(),
     }
 }
 
@@ -210,6 +211,7 @@ async fn scenario2_restart_with_populated_identity_takes_joiner_return_path() {
         federation_mounts: BTreeMap::new(),
         bootstrap_new: false,
         has_disk_state: true,
+        identity_zones: loaded_a.zones,
     };
     let cfg_b = BootConfig {
         identity_persisted_peers: loaded_b.peers,
@@ -218,6 +220,7 @@ async fn scenario2_restart_with_populated_identity_takes_joiner_return_path() {
         federation_mounts: BTreeMap::new(),
         bootstrap_new: false,
         has_disk_state: true,
+        identity_zones: loaded_b.zones,
     };
 
     assert!(matches!(

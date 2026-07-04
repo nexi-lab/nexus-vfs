@@ -515,6 +515,12 @@ struct ZoneManagerBundle {
     /// MUST NOT flow into `bootstrap_or_join_zone(peers=)` for root —
     /// see the `cli_peer_addrs` docstring above.
     identity_persisted_peers: Vec<String>,
+    /// Snapshot of `identity.json`'s per-zone membership at boot.
+    /// Populated by the ConfChange apply callback in prior boots.
+    /// Empty on fresh nodes.  Feeds `BootConfig::identity_zones` so
+    /// the S3 Phase B auto-reconnect path knows which zones to
+    /// JoinZone against.
+    identity_zones: Vec<nexus_raft::identity::IdentityZone>,
 }
 
 /// Open a `ZoneManager` against the data dir, sharing the daemon's
@@ -698,6 +704,7 @@ fn open_zone_manager(
         self_address,
         cli_peer_addrs,
         identity_persisted_peers: identity_persisted.peers,
+        identity_zones: identity_persisted.zones,
     })
 }
 
@@ -872,6 +879,7 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
         self_address,
         cli_peer_addrs,
         identity_persisted_peers,
+        identity_zones,
     } = open_zone_manager(&common, Some(vfs_routes))?;
 
     // Bring root zone online based on declared mode.
@@ -989,6 +997,7 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
         federation_mounts: fed.mounts.mounts.clone(),
         bootstrap_new,
         has_disk_state: data_dir_has_root,
+        identity_zones: identity_zones.clone(),
     };
     match nexus_raft::bootstrap::plan_boot_action(&boot_cfg) {
         nexus_raft::bootstrap::BootAction::StaticFounder {
@@ -1034,14 +1043,32 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
                     cli_peer_count = peers.len(),
                     "boot joiner: no federation zones auto-declared; daemon up \
                      rootless-with-peers. Use `nexusd-cluster join` sidecar for \
-                     zone-specific joining, or wait for Phase B identity.zones.",
+                     zone-specific joining, or wait for a ConfChange apply to \
+                     populate identity.zones.",
                 );
             } else {
+                // Phase B row 4: `zones` came from identity.zones.  When CLI
+                // --peers was not passed on this boot the daemon still needs
+                // *some* addresses to send JoinZone against — parse the
+                // identity-persisted peer list into NodeAddress form and
+                // fall back to it.  Preserves peer separation: CLI peers
+                // take precedence when present (operator override), identity
+                // peers seed the wipe-recovery path.
+                let peers_for_join = if peers.is_empty() {
+                    let use_tls = !common.no_tls;
+                    NodeAddress::parse_peer_list_operator(
+                        &identity_persisted_peers.join(","),
+                        use_tls,
+                    )
+                    .map_err(|e| anyhow::anyhow!("identity peers reparse: {}", e))?
+                } else {
+                    peers
+                };
                 join_zones_for_boot(
                     zm.clone(),
                     node_id,
                     self_address.clone(),
-                    peers,
+                    peers_for_join,
                     contracts::ROOT_ZONE_ID.to_string(),
                     common.data_dir.clone(),
                     zones,

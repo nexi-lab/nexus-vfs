@@ -46,6 +46,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::identity::IdentityZone;
 use crate::transport::NodeAddress;
 
 /// Boot-time configuration the cluster binary hands to
@@ -99,6 +100,14 @@ pub struct BootConfig {
     /// carried for symmetry with `bootstrap_new` and forward
     /// compatibility.
     pub has_disk_state: bool,
+
+    /// Per-zone membership snapshot loaded from `identity.json` (S3
+    /// Phase B).  Populated by the ConfChange apply callback whenever
+    /// this node participates in a ConfState change (`voters ∪
+    /// learners`).  Used by [`plan_boot_action`] to promote row-4
+    /// returning-joiner from a no-op into an auto-JoinZone dispatch
+    /// against each remembered zone.
+    pub identity_zones: Vec<IdentityZone>,
 }
 
 /// What the daemon should do at the federation branch of boot,
@@ -264,14 +273,27 @@ pub fn plan_boot_action(cfg: &BootConfig) -> BootAction {
     }
 
     // Rows 3 + 4: peers known (identity, CLI, or both) + no zones
-    // declared → joiner path.  Phase A: `zones` list is empty; the
-    // dispatcher treats this as "no auto-join at boot" and the offline
-    // `nexusd-cluster join` sidecar remains the mechanism for zone
-    // joining.  Phase B populates `zones` from `identity.zones`.
+    // declared → joiner path.  Phase B: if identity carries a zones
+    // snapshot from a prior ConfChange apply, seed the JoinZone
+    // targets from it — this is the S3 auto-reconnect after
+    // `data_dir` wipe.  When identity_zones is empty (Phase A
+    // behaviour, or a fresh joiner that has never converged), fall
+    // back to the empty-zones no-op — the offline `nexusd-cluster
+    // join` sidecar remains available for the initial join.
     if identity_has_peers || cli_has_peers {
+        let zones_from_identity: Vec<String> = cfg
+            .identity_zones
+            .iter()
+            .map(|z| z.zone_id.clone())
+            .collect();
         return BootAction::JoinFederationZones {
             peers: cfg.cli_peer_addrs.clone(),
-            zones: cfg.federation_zones.clone(),
+            zones: zones_from_identity,
+            // Mounts are NOT re-installed at boot: DT_MOUNT entries
+            // live in raft state, and the leader's snapshot install
+            // + apply-cb replay re-materializes them on the wiped
+            // joiner.  Carrying an empty mounts map here is the
+            // correct shape.
             mounts: cfg.federation_mounts.clone(),
         };
     }
@@ -303,6 +325,16 @@ mod tests {
             federation_mounts: mounts,
             bootstrap_new: false,
             has_disk_state: false,
+            identity_zones: Vec::new(),
+        }
+    }
+
+    fn identity_zone(zone_id: &str, members: Vec<&str>) -> IdentityZone {
+        IdentityZone {
+            zone_id: zone_id.to_string(),
+            members: members.into_iter().map(str::to_string).collect(),
+            as_role: crate::identity::IdentityZoneRole::Voter,
+            last_confirmed_unix_secs: None,
         }
     }
 
@@ -509,4 +541,65 @@ mod tests {
     // pre-refactor `bootstrap_static_async(zones, peers, mounts)` call.
     // Row 1's empty-peers pass-through is pinned by
     // `row1_pure_founder_returns_static_founder`.
+
+    // ── Phase B: identity.zones seeds the joiner path ────────────────
+    #[test]
+    fn row4_identity_zones_populate_join_targets() {
+        // Returning joiner with identity.peers non-empty AND
+        // identity.zones non-empty: JoinFederationZones carries the
+        // remembered zone_ids.  Wipe-recovery path.
+        let mut cfg = cfg_with(vec!["100.64.0.21:2126"], vec![], vec![], BTreeMap::new());
+        cfg.identity_zones = vec![
+            identity_zone("sharedzone", vec!["100.64.0.21:2126"]),
+            identity_zone("corp-eng", vec!["100.64.0.22:2126"]),
+        ];
+        match plan_boot_action(&cfg) {
+            BootAction::JoinFederationZones { zones, mounts, .. } => {
+                assert_eq!(
+                    zones,
+                    vec!["sharedzone".to_string(), "corp-eng".to_string()]
+                );
+                assert!(
+                    mounts.is_empty(),
+                    "DT_MOUNT entries replay via raft state, not boot dispatch"
+                );
+            }
+            other => panic!("expected JoinFederationZones, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn row4_empty_identity_zones_stays_noop_joiner() {
+        // Returning joiner but identity.zones empty (a v1 identity
+        // survived without ever seeing a ConfChange apply, e.g. a
+        // node that never fully joined): dispatch stays a no-op with
+        // empty zones — the operator can still use the offline
+        // `nexusd-cluster join` sidecar.
+        let cfg = cfg_with(vec!["100.64.0.21:2126"], vec![], vec![], BTreeMap::new());
+        // identity_zones intentionally left empty
+        match plan_boot_action(&cfg) {
+            BootAction::JoinFederationZones { zones, .. } => {
+                assert!(zones.is_empty(), "no identity.zones => no auto-join list");
+            }
+            other => panic!("expected JoinFederationZones, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn row5_identity_zones_do_not_override_split_brain_guard() {
+        // A row-5 misconfig (identity.peers non-empty + zones set) MUST
+        // still fail loud even when identity.zones is also populated.
+        // Belt-and-suspenders: split-brain trap dominates.
+        let mut cfg = cfg_with(
+            vec!["100.64.0.21:2126"],
+            vec![],
+            vec!["sharedzone"],
+            mount("/shared", "sharedzone"),
+        );
+        cfg.identity_zones = vec![identity_zone("sharedzone", vec!["100.64.0.21:2126"])];
+        assert!(matches!(
+            plan_boot_action(&cfg),
+            BootAction::FailLoud { .. }
+        ));
+    }
 }
