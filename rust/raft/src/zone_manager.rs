@@ -432,7 +432,28 @@ impl ZoneManager {
                 let _ = rx.changed().await;
             };
             if let Err(e) = server.serve_with_shutdown(shutdown).await {
-                tracing::error!("ZoneManager gRPC server error: {}", e);
+                // gRPC bind failure (port in use, IP not assigned to any
+                // interface — e.g. Tailscale in NoState — TLS cert
+                // mismatch, etc.) leaves the daemon half-alive: raft
+                // driver + FUSE plugin + LocalConnector all up, but no
+                // one can talk to us over the wire.  Operators observed
+                // this as "everything looks fine locally, but peers
+                // never see me" for 30+ minutes before diagnosis.
+                //
+                // Fail loud: log at ERROR (visible in every launcher
+                // stdout) and exit(1) so the process supervisor / CI
+                // gate / operator's `echo $?` sees non-zero.  gRPC
+                // server startup is a strict prerequisite for
+                // federation and there is no recovery from within the
+                // process — bind is either possible or not.
+                tracing::error!(
+                    error = %e,
+                    "ZoneManager gRPC server terminated with error — this is \
+                     unrecoverable (bind failure on gRPC endpoint); exiting \
+                     the daemon so the operator / supervisor sees a hard fail \
+                     instead of a silently-degraded process",
+                );
+                std::process::exit(1);
             }
         });
 
