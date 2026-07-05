@@ -399,6 +399,61 @@ enum Cmd {
         #[arg(long = "as", value_enum, default_value_t = JoinRole::Voter)]
         as_role: JoinRole,
     },
+    /// Remove a node from a zone's ConfState via a `RemoveNode`
+    /// ConfChange.  Mirror of `join` on the wire (which proposes
+    /// `AddNode` / `AddLearnerNode`) for the reverse direction.
+    ///
+    /// The RPC is a straight pass-through to raft-rs's
+    /// `RawNode::propose_conf_change` — no transport bypass, no
+    /// Progress mutation, no state-machine surgery.  Same
+    /// leader-only + follower-redirect pattern JoinZone uses; same
+    /// idempotency behaviour raft-rs `Changer::remove` provides on
+    /// unknown ids.  raft-rs itself rejects the "would remove all
+    /// voters" case at apply time, so the RPC cannot brick the zone.
+    ///
+    /// Primary use case: prune a genuinely-dead voter (host is off
+    /// or has been replaced) so the ConfState reflects reality.
+    /// Cluster hygiene; not required to unblock wipe-rejoin under
+    /// the rotate-on-wipe rule (a wiped node's fresh `node_id` joins
+    /// via `join` without touching the old ghost's `Progress`).
+    ///
+    /// Typical flow:
+    ///
+    /// 1. Voter B is permanently offline (host destroyed, or SSD
+    ///    swap without transfer).
+    /// 2. Operator on any live node runs `nexusd-cluster remove-voter
+    ///    <A_host>:<port> sharedzone --target <B_old_node_id>`.
+    /// 3. B's ghost id is dropped from `ConfState`, and the Phase B
+    ///    apply callback mirrors the new membership into
+    ///    `identity.json` on every live node.
+    ///
+    /// ### Consequences the operator picks up
+    ///
+    /// Neither of these is a raft-protocol violation — both are
+    /// spec-defined ConfChange semantics — but the operator owns the
+    /// call:
+    ///
+    /// * **Quorum shrinks immediately.** A 2-voter cluster becomes
+    ///   SOLO (still committable).  A 3-voter cluster becomes 2-of-2
+    ///   (both remaining voters must be reachable to commit).
+    /// * **Leader-removes-self triggers re-election.** If `--target`
+    ///   is the current leader, raft-rs steps down and holds an
+    ///   election on the remaining voters (spec-mandated behaviour).
+    ///   Prefer to run against a follower node id or wait for
+    ///   leadership to move.
+    RemoveVoter {
+        /// Any live cluster member as `host:port` — bare form only,
+        /// same schema as `join`'s `<peer_addr>`.  Follower redirects
+        /// resolve to the leader automatically.
+        peer_addr: String,
+        /// Zone whose ConfState should be pruned.
+        zone_id: String,
+        /// The stale node id to remove.  Learn it from `nexusd-cluster
+        /// doctor` output, cluster status logs, or `identity.zones`
+        /// members list on a surviving node.
+        #[arg(long)]
+        target: u64,
+    },
 }
 
 /// Membership role a new node takes when joining an existing zone.
@@ -476,8 +531,71 @@ fn main() -> Result<()> {
                     )
                     .await
                 }
+                Some(Cmd::RemoveVoter {
+                    peer_addr,
+                    zone_id,
+                    target,
+                }) => run_remove_voter(&peer_addr, &zone_id, target).await,
             }
         })
+}
+
+/// Operator-facing wrapper around
+/// [`nexus_raft::transport::call_remove_voter_rpc`].  See the
+/// [`Cmd::RemoveVoter`] docstring for the operator flow.  Followers
+/// return a leader_address; we follow the redirect once before failing
+/// loud — matching the pattern in `run_join` / `bootstrap_or_join_zone`.
+async fn run_remove_voter(peer_addr: &str, zone_id: &str, target_node_id: u64) -> Result<()> {
+    // Parse operator-facing bare `host:port` and coerce to the http URL
+    // the tonic Endpoint helper expects.  Reject the legacy `id@host:port`
+    // form the same way `run_join` does.
+    let peer = NodeAddress::parse_operator_addr(peer_addr, /* use_tls */ false)
+        .map_err(|e| anyhow::anyhow!("--peer-addr parse '{}': {}", peer_addr, e))?;
+    let endpoint = peer.endpoint.clone();
+
+    let attempt = |endpoint: String| async move {
+        nexus_raft::transport::call_remove_voter_rpc(
+            &endpoint,
+            zone_id,
+            target_node_id,
+            /* timeout_secs */ 15,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("RemoveVoter RPC: {}", e))
+    };
+
+    let result = attempt(endpoint.clone()).await?;
+    let result = if !result.success {
+        if let Some(leader_addr) = result.leader_address.clone() {
+            tracing::info!(
+                initial_peer = %endpoint,
+                leader = %leader_addr,
+                "RemoveVoter: follower redirect -- retrying on leader",
+            );
+            let leader_endpoint =
+                if leader_addr.starts_with("http://") || leader_addr.starts_with("https://") {
+                    leader_addr
+                } else {
+                    format!("http://{leader_addr}")
+                };
+            attempt(leader_endpoint).await?
+        } else {
+            result
+        }
+    } else {
+        result
+    };
+
+    if !result.success {
+        return Err(anyhow::anyhow!(
+            "RemoveVoter refused: error={:?}, leader_address={:?}",
+            result.error,
+            result.leader_address,
+        ));
+    }
+
+    println!("Removed voter node_id={target_node_id} from zone '{zone_id}' via {peer_addr}",);
+    Ok(())
 }
 
 /// Bundle returned by [`open_zone_manager`].  Carries the opaque

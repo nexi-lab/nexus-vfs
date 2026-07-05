@@ -35,16 +35,13 @@ jobs:
           - os: macos-14
             artifact_name: nexusd-cluster-macos-arm64
             binary: nexusd-cluster
-            max_size_bytes: 13631488  # 13.0 MiB — bumped from 12.5 MiB
-                                      # to absorb PR #85's HAL surface
-                                      # extension (rename + setattr on
-                                      # FederationPeerClient: 2 new trait
-                                      # methods + 2 new Noop impls + 2
-                                      # new async vfs_X wrappers + 2 new
-                                      # sync trait bridges, all using
-                                      # the existing block_on_safely
-                                      # pattern).  ~520 KiB headroom
-                                      # symmetric with the post-#85
+            max_size_bytes: 13893632  # 13.25 MiB — bumped from 13.0 MiB
+                                      # to absorb PR #114's RemoveVoter
+                                      # RPC surface (new proto messages +
+                                      # server handler + client + CLI
+                                      # subcommand, straight mirror of
+                                      # JoinZone).  ~230 KiB headroom
+                                      # symmetric with the post-#114
                                       # actual size.
           - os: macos-14
             artifact_name: nexusd-cluster-macos-x86_64
@@ -55,11 +52,14 @@ jobs:
           - os: windows-latest
             artifact_name: nexusd-cluster-windows-x86_64
             binary: nexusd-cluster.exe
-            max_size_bytes: 14155776  # 13.5 MiB — bumped to absorb #51 substrate
-                                      # code growth (4 root-cause fixes + the
-                                      # debug-level observability traces they
-                                      # carry).  Linux/macOS hold the same %
-                                      # of slack.
+            max_size_bytes: 14680064  # 14.0 MiB — bumped from 13.5 MiB
+                                      # to absorb PR #114's RemoveVoter
+                                      # RPC surface (proto + server +
+                                      # client + CLI, straight mirror of
+                                      # JoinZone).  ~223 KiB headroom
+                                      # symmetric with the post-#114
+                                      # actual size.  Linux/macOS x86_64
+                                      # hold the same % of slack.
 
     steps:
       - name: Checkout code
