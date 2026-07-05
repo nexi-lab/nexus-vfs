@@ -2635,12 +2635,13 @@ mod tests {
     #[test]
     fn daemon_cli_accepts_advertise_addr_flag() {
         // Daemon mode (no subcommand) also accepts the global flag.
+        // Phase G: `--bootstrap-mode` deleted — the daemon now
+        // auto-detects boot semantics from disk / identity / peers /
+        // federation-env inputs via `plan_boot_action`.
         let parsed = Args::try_parse_from([
             "nexusd-cluster",
             "--advertise-addr",
             "100.64.0.27:2126",
-            "--bootstrap-mode",
-            "static",
         ])
         .expect("--advertise-addr must parse on daemon mode");
         assert_eq!(
