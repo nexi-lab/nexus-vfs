@@ -223,12 +223,39 @@ async fn scenario2_restart_with_populated_identity_takes_joiner_return_path() {
         identity_zones: loaded_b.zones,
     };
 
+    // Phase G: `has_disk_state=true` collapses to `Resume` regardless
+    // of identity contents — persisted raft state is authoritative.
+    // Both nodes' restart-from-disk contract is the same on either
+    // side of a live cluster.
+    assert!(matches!(plan_boot_action(&cfg_a), BootAction::Resume));
+    assert!(matches!(plan_boot_action(&cfg_b), BootAction::Resume));
+}
+
+/// Wipe-recovery scenario: identity survives a `data_dir` wipe, so
+/// `has_disk_state=false` but `identity.peers` / `identity.zones`
+/// are populated from a prior boot's persistence.  Row 4 fires with
+/// zones drawn from identity.zones.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scenario2b_data_dir_wipe_with_populated_identity_is_row4_joiner() {
+    let dir = TempDir::new().expect("id");
+    identity::persist_peers(
+        dir.path(),
+        &identity::load(dir.path()).unwrap(),
+        &["100.64.0.27:2126".to_string()],
+    )
+    .expect("persist");
+    let loaded = identity::load(dir.path()).expect("load");
+    let cfg = BootConfig {
+        identity_persisted_peers: loaded.peers,
+        cli_peer_addrs: vec![],
+        federation_zones: vec![],
+        federation_mounts: BTreeMap::new(),
+        bootstrap_new: false,
+        has_disk_state: false, // simulates data_dir wiped
+        identity_zones: loaded.zones,
+    };
     assert!(matches!(
-        plan_boot_action(&cfg_a),
-        BootAction::JoinFederationZones { .. }
-    ));
-    assert!(matches!(
-        plan_boot_action(&cfg_b),
+        plan_boot_action(&cfg),
         BootAction::JoinFederationZones { .. }
     ));
 }

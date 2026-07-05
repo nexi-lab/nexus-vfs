@@ -30,8 +30,7 @@ use kernel::kernel::convenience::{KernelConvenience, MountOptions};
 use kernel::kernel::Kernel;
 
 use nexus_raft::distributed_coordinator::{
-    bootstrap_or_join_zone, read_or_mint_node_id, validate_bootstrap_mode,
-    validate_peers_excludes_self, BootstrapMode,
+    bootstrap_or_join_zone, read_or_mint_node_id, validate_peers_excludes_self,
 };
 use nexus_raft::federation::{parse_federation_env, ENV_FEDERATION_MOUNTS, ENV_FEDERATION_ZONES};
 use nexus_raft::transport::{bootstrap_tls, NodeAddress};
@@ -200,16 +199,6 @@ struct CommonArgs {
         global = true
     )]
     mount_drivers: Vec<String>,
-
-    /// Bootstrap mode declaration — `static`, `dynamic`, or `restart`.
-    ///
-    /// Operator must declare intent at startup so the daemon does not
-    /// silently mix scenarios.  See `BootstrapMode` in `nexus_raft`
-    /// for the full contract.  Required for the daemon mode (no
-    /// subcommand) — share/join/mount/unmount subcommands skip the
-    /// validator since they always operate on existing state.
-    #[arg(long, env = "NEXUS_BOOTSTRAP_MODE", global = true)]
-    bootstrap_mode: Option<String>,
 }
 
 /// Parsed `--mount-driver` argument.
@@ -835,36 +824,18 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
         "nexusd-cluster starting (daemon mode)",
     );
 
-    let bootstrap_new = std::env::var("NEXUS_BOOTSTRAP_NEW")
-        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true"))
-        .unwrap_or(false);
-
-    let peers_non_empty = common.peers.split(',').any(|s| !s.trim().is_empty());
-
-    // `<data_dir>/root/raft/` — caller-side check the validator
-    // uses to detect "this is actually a restart, not a fresh
-    // bootstrap".  Cheap filesystem stat.
+    // S3 Phase G: single boot decision layer.  No more explicit
+    // `--bootstrap-mode` from the operator — the daemon reads the
+    // authoritative signals (`data_dir_has_root`, identity contents,
+    // CLI `--peers`, NEXUS_FEDERATION_* env) and dispatches through
+    // `plan_boot_action`.  See `nexus_raft::bootstrap` for the full
+    // decision matrix.
     let data_dir_has_root = common.data_dir.join("root").join("raft").exists();
-
-    // Operator MUST declare bootstrap intent.  No implicit dispatch:
-    // explicit mode declaration is the SSOT for what kind of boot
-    // this is (static = env-driven cluster formation, dynamic =
-    // rootless + runtime API, restart = resume from disk).
-    let mode_str = common.bootstrap_mode.as_deref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "--bootstrap-mode (or NEXUS_BOOTSTRAP_MODE) is required.  Pass one of: \
-             static, dynamic, restart.  See BootstrapMode docs in nexus_raft.",
-        )
-    })?;
-    let mode = BootstrapMode::parse(mode_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-    validate_bootstrap_mode(mode, data_dir_has_root, bootstrap_new, peers_non_empty)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let peers_non_empty = common.peers.split(',').any(|s| !s.trim().is_empty());
     tracing::info!(
-        mode = mode.as_str(),
-        bootstrap_new,
         peers_non_empty,
         data_dir_has_root,
-        "bootstrap mode validated",
+        "boot inputs — see nexus_raft::bootstrap::plan_boot_action for dispatch",
     );
 
     // ── ObjectStoreProvider ─────────────────────────────────────────
@@ -1016,33 +987,6 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     // runtime" on a worker thread of the outer `#[tokio::main]`.
     // `spawn_blocking` moves it onto the blocking pool where nested
     // runtime creation is allowed.
-    if matches!(mode, BootstrapMode::Static | BootstrapMode::Restart) {
-        let zm_for_bootstrap = zm.clone();
-        let self_addr_for_bootstrap = self_address.clone();
-        let peer_addrs_for_bootstrap = cli_peer_addrs.clone();
-        tokio::task::spawn_blocking(move || {
-            bootstrap_or_join_zone(
-                zm_for_bootstrap.as_ref(),
-                "root",
-                node_id,
-                &self_addr_for_bootstrap,
-                &peer_addrs_for_bootstrap,
-                bootstrap_new,
-                /* max_attempts */ None, // daemon boot — retry forever
-                /* as_learner   */
-                false, // root cluster votes; learners are for share/join
-            )
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("bootstrap join task panicked: {}", e))?
-        .map_err(|e| anyhow::anyhow!("bootstrap_or_join_zone: {}", e))?;
-    } else {
-        tracing::info!(
-            "bootstrap mode = dynamic; daemon up rootless — operator drives \
-             create_zone via runtime API",
-        );
-    }
-
     let fed = parse_federation_env();
     // Surface every dropped `NEXUS_FEDERATION_MOUNTS` entry so the
     // operator sees them in boot logs.  When the input was non-empty
@@ -1072,14 +1016,14 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     // Preserved PR #112 split-brain guard — backstops the FailLoud arm
     // of `plan_boot_action` (row 5) with a longer, operator-actionable
     // hint so the concrete recovery path is one paragraph rather than
-    // one sentence.  Order matters: this fires BEFORE plan_boot_action
-    // sees the same shape, so the verbose message wins.  Kept even
-    // though row 5 is unreachable from here on because bootstrap.rs
-    // also has it — belt-and-suspenders for one of the most expensive
-    // debugging traps we've hit (152-commit vs 1-commit both-founder
-    // wedge, 2026-07-04).
+    // one sentence.
+    //
+    // S3 Phase G: gated on `!data_dir_has_root` because a restart with
+    // authoritative persisted state is not a split-brain — the daemon
+    // resumes from disk and env vars are advisory (row 0 Resume).
     if (!fed.zones.is_empty() || !fed.mounts.mounts.is_empty())
         && !identity_persisted_peers.is_empty()
+        && !data_dir_has_root
     {
         return Err(anyhow::anyhow!(
             "split-brain guard: {} is set (zones={:?}) but identity.json \
@@ -1104,20 +1048,61 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
         ));
     }
 
-    // Unified bring-up decision layer (S3 完全体).  Replaces the pre-
-    // refactor unconditional `bootstrap_static_async` call.  See
-    // `nexus_raft::bootstrap` for the full decision matrix; the
-    // dispatch below has one arm per `BootAction` variant.
+    // S3 Phase G: single boot decision layer.  `plan_boot_action`
+    // is the SSOT for what this daemon does at boot — no more
+    // `--bootstrap-mode` operator declaration, no more
+    // `NEXUS_BOOTSTRAP_NEW`.  See `nexus_raft::bootstrap` for the
+    // decision matrix.
     let boot_cfg = nexus_raft::bootstrap::BootConfig {
         identity_persisted_peers: identity_persisted_peers.clone(),
         cli_peer_addrs: cli_peer_addrs.clone(),
         federation_zones: fed.zones.clone(),
         federation_mounts: fed.mounts.mounts.clone(),
-        bootstrap_new,
+        bootstrap_new: false, // retired knob; kept on struct for backwards struct-literal compat
         has_disk_state: data_dir_has_root,
         identity_zones: identity_zones.clone(),
     };
-    match nexus_raft::bootstrap::plan_boot_action(&boot_cfg) {
+    let boot_action = nexus_raft::bootstrap::plan_boot_action(&boot_cfg);
+
+    // Root zone bootstrap gate.  Every action except `RootlessDynamic`
+    // and `FailLoud` needs root: founders create it as SOLO, joiners
+    // (fresh or returning) use the local root as the parent zone for
+    // federation DT_MOUNT entries, and `Resume` picks up whatever
+    // ConfState is already on disk.  Root is per-node SOLO by design —
+    // peers is always empty here.  `bootstrap_or_join_zone` handles
+    // both branches internally (Branch 1 = resume from disk, Branch 2
+    // = fresh SOLO create).
+    let root_needed = !matches!(
+        &boot_action,
+        nexus_raft::bootstrap::BootAction::RootlessDynamic
+            | nexus_raft::bootstrap::BootAction::FailLoud { .. }
+    );
+    if root_needed {
+        let zm_for_root = zm.clone();
+        let self_addr_for_root = self_address.clone();
+        tokio::task::spawn_blocking(move || {
+            bootstrap_or_join_zone(
+                zm_for_root.as_ref(),
+                "root",
+                node_id,
+                &self_addr_for_root,
+                &[], // root is per-node SOLO — no peers by contract
+                /* bootstrap_new */ false,
+                /* max_attempts  */ None,
+                /* as_learner    */ false,
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("root bootstrap task panicked: {}", e))?
+        .map_err(|e| anyhow::anyhow!("bootstrap_or_join_zone(root): {}", e))?;
+    } else {
+        tracing::info!(
+            "daemon up rootless — no federation zones to auto-boot; \
+             operator drives create_zone via runtime API",
+        );
+    }
+
+    match boot_action {
         nexus_raft::bootstrap::BootAction::StaticFounder {
             zones,
             mounts,
@@ -1257,6 +1242,19 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
                 )
                 .await?;
             }
+        }
+        nexus_raft::bootstrap::BootAction::Resume => {
+            // Row 0 (Phase G) — see `plan_boot_action` docstring.
+            // `data_dir_has_root=true` dominates: root was resumed
+            // above via `bootstrap_or_join_zone` Branch 1, and every
+            // zone with persisted redb state rehydrates on its own.
+            // env-declared federation zones are advisory; ConfState
+            // on disk is authoritative.  Nothing else to do here.
+            tracing::info!(
+                fed_zones_env = ?fed.zones,
+                fed_mounts_env_count = fed.mounts.mounts.len(),
+                "boot resumed from disk — federation env vars advisory only",
+            );
         }
         nexus_raft::bootstrap::BootAction::FailLoud { reason, hint } => {
             // Matrix rows 5 + 6 — see `plan_boot_action` docstring.

@@ -24,14 +24,21 @@
 //!
 //! ### Decision matrix
 //!
-//! | identity.peers | CLI --peers | NEXUS_FEDERATION_ZONES | Action |
-//! |---|---|---|---|
-//! | empty | empty | set | [`BootAction::StaticFounder`] — auto-create SOLO |
-//! | empty | empty | unset | [`BootAction::RootlessDynamic`] — daemon up, no zone auto-boot |
-//! | empty | non-empty | unset | [`BootAction::JoinFederationZones`] — joiner (fresh) |
-//! | non-empty | any | unset | [`BootAction::JoinFederationZones`] — joiner (return) |
-//! | non-empty | any | set | [`BootAction::FailLoud`] — split-brain trap (existing PR #112 guard) |
-//! | empty | non-empty | set | [`BootAction::FailLoud`] — ambiguous (NEW guard) |
+//! `has_disk_state = <data_dir>/root/raft/` — presence of persisted
+//! ConfState.  When true it dominates all operator inputs: the daemon
+//! resumes from disk and env vars are advisory (this is the S3 Phase
+//! G replacement for the deleted `--bootstrap-mode restart`).  When
+//! false the fresh-boot decision matrix runs:
+//!
+//! | has_disk_state | identity.peers | CLI --peers | NEXUS_FEDERATION_ZONES | Action |
+//! |---|---|---|---|---|
+//! | **true** | any | any | any | [`BootAction::Resume`] — restart from disk |
+//! | false | empty | empty | set | [`BootAction::StaticFounder`] — auto-create SOLO |
+//! | false | empty | empty | unset | [`BootAction::RootlessDynamic`] — daemon up, no zone auto-boot |
+//! | false | empty | non-empty | unset | [`BootAction::JoinFederationZones`] — joiner (fresh, DiscoverZones) |
+//! | false | non-empty | any | unset | [`BootAction::JoinFederationZones`] — joiner (return, identity.zones) |
+//! | false | non-empty | any | set | [`BootAction::FailLoud`] — split-brain trap (PR #112) |
+//! | false | empty | non-empty | set | [`BootAction::FailLoud`] — ambiguous (Phase A) |
 //!
 //! ### Symmetric-boot race
 //!
@@ -84,21 +91,18 @@ pub struct BootConfig {
     /// they used pre-refactor.
     pub federation_mounts: BTreeMap<String, String>,
 
-    /// `NEXUS_BOOTSTRAP_NEW` toggle.  Not consumed by the matrix
-    /// directly — it participates in the ROOT-zone bootstrap decision
-    /// (existing `bootstrap_or_join_zone` for zone `"root"`), which
-    /// runs *before* the federation branch this module owns.  Retained
-    /// on `BootConfig` so future revisions of the matrix (e.g. Phase B
-    /// identity.zones) have it in hand.
+    /// Retired knob.  Phase G deleted `NEXUS_BOOTSTRAP_NEW` — matrix
+    /// row 0 (`has_disk_state`) covers restart-from-disk without the
+    /// operator declaring a "this is a fresh bootstrap" flag.  Kept as
+    /// a `bool` field for struct-literal backwards compat with older
+    /// callers; always set to `false` in `run_daemon`.
     pub bootstrap_new: bool,
 
-    /// `<data_dir>/root/raft/` exists on disk — i.e. this is a
-    /// restart, not a fresh bootstrap.  Same signal
-    /// `validate_bootstrap_mode` uses at ROOT bootstrap.  Not consumed
-    /// by the matrix in Phase A (all rows are federation-branch, which
-    /// runs after ROOT bootstrap has already resolved restart vs new);
-    /// carried for symmetry with `bootstrap_new` and forward
-    /// compatibility.
+    /// `<data_dir>/root/raft/` exists on disk — the daemon has
+    /// persisted ConfState from a prior boot.  Phase G row 0: when
+    /// true, `plan_boot_action` returns `Resume` and env-declared
+    /// federation zones are advisory; ConfState + DT_MOUNT entries in
+    /// raft state are the authoritative SSOT.
     pub has_disk_state: bool,
 
     /// Per-zone membership snapshot loaded from `identity.json` (S3
@@ -156,6 +160,23 @@ pub enum BootAction {
         mounts: BTreeMap<String, String>,
     },
 
+    /// Restart from disk — `data_dir_has_root=true` means the raft
+    /// state machines rehydrate from persisted redb state and the
+    /// daemon simply resumes.  `identity.zones` and `identity.peers`
+    /// are consulted for transport peer seeding but do NOT drive
+    /// fresh JoinZone RPCs; the DT_MOUNT + ConfState entries already
+    /// on disk are the authoritative SSOT.  Overrides all other
+    /// operator inputs (`--peers` and `NEXUS_FEDERATION_ZONES` are
+    /// treated as advisory when the daemon has persisted state) —
+    /// stale env vars from a container recipe should not clobber
+    /// authoritative disk state.
+    ///
+    /// S3 Phase G — replaces the deleted `BootstrapMode::Restart`
+    /// concept.  Formerly the operator declared `--bootstrap-mode
+    /// restart` explicitly; now the daemon auto-detects it from
+    /// `<data_dir>/root/raft/` presence.
+    Resume,
+
     /// Boot-time misconfig the daemon refuses to recover from.
     /// Caller surfaces `reason` + `hint` and exits non-zero.
     ///
@@ -188,27 +209,37 @@ pub const REASON_AMBIGUOUS_FRESH_FOUNDER_WITH_PEERS: &str = "ambiguous_fresh_fou
 ///
 /// ### Decision matrix
 ///
-/// | # | identity.peers | CLI --peers | `NEXUS_FEDERATION_ZONES` | Action |
-/// |---|---|---|---|---|
-/// | 1 | empty     | empty     | set     | [`BootAction::StaticFounder`] — auto-create SOLO |
-/// | 2 | empty     | empty     | unset   | [`BootAction::RootlessDynamic`] — daemon up, no zone auto-boot |
-/// | 3 | empty     | non-empty | unset   | [`BootAction::JoinFederationZones`] — joiner (fresh) |
-/// | 4 | non-empty | any       | unset   | [`BootAction::JoinFederationZones`] — joiner (return) |
-/// | 5 | non-empty | any       | set     | [`BootAction::FailLoud`] — split-brain trap (PR #112) |
-/// | 6 | empty     | non-empty | set     | [`BootAction::FailLoud`] — ambiguous (NEW) |
+/// | # | has_disk_state | identity.peers | CLI --peers | `NEXUS_FEDERATION_ZONES` | Action |
+/// |---|---|---|---|---|---|
+/// | 0 | **true**   | any       | any       | any     | [`BootAction::Resume`] — restart from disk (Phase G) |
+/// | 1 | false      | empty     | empty     | set     | [`BootAction::StaticFounder`] — auto-create SOLO |
+/// | 2 | false      | empty     | empty     | unset   | [`BootAction::RootlessDynamic`] — daemon up, no zone auto-boot |
+/// | 3 | false      | empty     | non-empty | unset   | [`BootAction::JoinFederationZones`] — joiner (fresh, DiscoverZones) |
+/// | 4 | false      | non-empty | any       | unset   | [`BootAction::JoinFederationZones`] — joiner (return, identity.zones) |
+/// | 5 | false      | non-empty | any       | set     | [`BootAction::FailLoud`] — split-brain trap (PR #112) |
+/// | 6 | false      | empty     | non-empty | set     | [`BootAction::FailLoud`] — ambiguous (Phase A NEW) |
 ///
-/// Precedence: rows are evaluated top-to-bottom on the guard clauses,
-/// but the layout above matches how the function reads: rows 5 + 6
-/// fire first (fail-loud), then row 1 (founder), then rows 3/4
-/// (joiner), then row 2 (dynamic fallback).  Row 5 vs row 6: when
-/// both identity peers AND CLI peers exist alongside zones, row 5
-/// wins — see [`row5_precedence_when_both_identity_and_cli_have_peers`]
-/// (in the tests module).
+/// Precedence: row 0 (`has_disk_state=true`) dominates unconditionally
+/// — persisted raft state is authoritative, env vars are advisory.
+/// Otherwise rows 5 + 6 fire first (fail-loud), then row 1 (founder),
+/// then rows 3/4 (joiner), then row 2 (dynamic fallback).  Row 5 vs
+/// row 6: when both identity peers AND CLI peers exist alongside
+/// zones, row 5 wins — the identity signal is more persistent.
 ///
 /// `NEXUS_FEDERATION_MOUNTS` counts as "zones set" for the matrix
 /// (either env var triggers the founder / trap semantics — the
 /// federation branch acts uniformly on the union).
 pub fn plan_boot_action(cfg: &BootConfig) -> BootAction {
+    // S3 Phase G — data_dir_has_root wins over every operator input.
+    // Restart-from-disk is authoritative: the persisted ConfState and
+    // DT_MOUNT entries are the SSOT, env vars declared for a fresh
+    // boot must not clobber them.  This absorbs the deleted
+    // `BootstrapMode::Restart` case into the same decision layer
+    // that Phase A introduced for fresh boots.
+    if cfg.has_disk_state {
+        return BootAction::Resume;
+    }
+
     let identity_has_peers = !cfg.identity_persisted_peers.is_empty();
     let cli_has_peers = !cfg.cli_peer_addrs.is_empty();
     let zones_set = !cfg.federation_zones.is_empty() || !cfg.federation_mounts.is_empty();
@@ -343,6 +374,78 @@ mod tests {
         let mut m = BTreeMap::new();
         m.insert(path.to_string(), zone.to_string());
         m
+    }
+
+    // ── Row 0: Phase G — has_disk_state dominates unconditionally ─────
+    #[test]
+    #[allow(
+        clippy::type_complexity,
+        reason = "test fixture tuple — clearer than a helper struct"
+    )]
+    fn row0_disk_state_true_returns_resume_regardless_of_other_inputs() {
+        // Every combination that would otherwise dispatch differently
+        // — founder inputs, joiner inputs, split-brain shape,
+        // ambiguous shape — collapses to Resume when the daemon has
+        // persisted state on disk.  This is the Phase G promise: env
+        // vars are advisory once the daemon has an authoritative
+        // ConfState to resume from.
+        let combinations: Vec<(
+            Vec<&str>,
+            Vec<NodeAddress>,
+            Vec<&str>,
+            BTreeMap<String, String>,
+        )> = vec![
+            // fresh-founder shape
+            (
+                vec![],
+                vec![],
+                vec!["sharedzone"],
+                mount("/shared", "sharedzone"),
+            ),
+            // fresh-joiner shape (row 3)
+            (
+                vec![],
+                vec![cli_peer("100.64.0.21", 2126)],
+                vec![],
+                BTreeMap::new(),
+            ),
+            // returning-joiner shape (row 4)
+            (vec!["100.64.0.21:2126"], vec![], vec![], BTreeMap::new()),
+            // would-be split-brain shape (row 5)
+            (
+                vec!["100.64.0.21:2126"],
+                vec![],
+                vec!["sharedzone"],
+                mount("/shared", "sharedzone"),
+            ),
+            // would-be ambiguous shape (row 6)
+            (
+                vec![],
+                vec![cli_peer("100.64.0.21", 2126)],
+                vec!["sharedzone"],
+                mount("/shared", "sharedzone"),
+            ),
+        ];
+        for (i, (identity, cli, zones, mounts)) in combinations.into_iter().enumerate() {
+            let mut cfg = cfg_with(identity, cli, zones, mounts);
+            cfg.has_disk_state = true;
+            assert!(
+                matches!(plan_boot_action(&cfg), BootAction::Resume),
+                "combination {i} with has_disk_state=true must return Resume",
+            );
+        }
+    }
+
+    #[test]
+    fn row0_disk_state_false_falls_through_to_fresh_matrix() {
+        // Complement of the above: the pre-Phase-G rows still fire
+        // when has_disk_state=false.  Guard against accidentally
+        // making Resume the universal answer.
+        let cfg = cfg_with(vec![], vec![], vec![], BTreeMap::new());
+        assert!(matches!(
+            plan_boot_action(&cfg),
+            BootAction::RootlessDynamic
+        ));
     }
 
     // ── Row 1 ─────────────────────────────────────────────────────────
