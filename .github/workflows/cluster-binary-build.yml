@@ -35,13 +35,13 @@ jobs:
           - os: macos-14
             artifact_name: nexusd-cluster-macos-arm64
             binary: nexusd-cluster
-            max_size_bytes: 13893632  # 13.25 MiB — bumped from 13.0 MiB
-                                      # to absorb PR #114's RemoveVoter
-                                      # RPC surface (new proto messages +
-                                      # server handler + client + CLI
-                                      # subcommand, straight mirror of
-                                      # JoinZone).  ~230 KiB headroom
-                                      # symmetric with the post-#114
+            max_size_bytes: 14155776  # 13.5 MiB — bumped from 13.25 MiB
+                                      # to absorb the S3 Phase D
+                                      # DiscoverZones RPC surface (new
+                                      # proto messages + server handler
+                                      # + client + row-3 dispatch
+                                      # wiring).  ~260 KiB headroom
+                                      # symmetric with the post-#115
                                       # actual size.
           - os: macos-14
             artifact_name: nexusd-cluster-macos-x86_64
@@ -52,14 +52,15 @@ jobs:
           - os: windows-latest
             artifact_name: nexusd-cluster-windows-x86_64
             binary: nexusd-cluster.exe
-            max_size_bytes: 14680064  # 14.0 MiB — bumped from 13.5 MiB
-                                      # to absorb PR #114's RemoveVoter
-                                      # RPC surface (proto + server +
-                                      # client + CLI, straight mirror of
-                                      # JoinZone).  ~223 KiB headroom
-                                      # symmetric with the post-#114
-                                      # actual size.  Linux/macOS x86_64
-                                      # hold the same % of slack.
+            max_size_bytes: 14942208  # 14.25 MiB — bumped from 14.0 MiB
+                                      # to absorb the S3 Phase D
+                                      # DiscoverZones RPC surface
+                                      # (proto + server + client + row-3
+                                      # dispatch wiring).  ~260 KiB
+                                      # headroom symmetric with the
+                                      # post-#115 actual size.
+                                      # Linux/macOS x86_64 hold the same
+                                      # % of slack.
 
     steps:
       - name: Checkout code

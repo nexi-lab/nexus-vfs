@@ -6,10 +6,10 @@ use super::proto::nexus::raft::{
     raft_command::Command as ProtoCommandVariant, raft_query::Query as ProtoQueryVariant,
     zone_api_service_client::ZoneApiServiceClient,
     zone_transport_service_client::ZoneTransportServiceClient, AcquireLock, DeleteMetadata,
-    DeleteZoneRequest, EcReplicationEntry, ExtendLock, GetClusterInfoRequest, GetLockInfo,
-    GetMetadata, JoinClusterRequest, JoinZoneRequest, ListMetadata, ProposeRequest, PutMetadata,
-    QueryRequest, RaftCommand, RaftQuery, ReleaseLock, RemoveVoterRequest, ReplicateEntriesRequest,
-    StepMessageRequest,
+    DeleteZoneRequest, DiscoverZonesRequest, EcReplicationEntry, ExtendLock, GetClusterInfoRequest,
+    GetLockInfo, GetMetadata, JoinClusterRequest, JoinZoneRequest, ListMetadata, ProposeRequest,
+    PutMetadata, QueryRequest, RaftCommand, RaftQuery, ReleaseLock, RemoveVoterRequest,
+    ReplicateEntriesRequest, StepMessageRequest,
 };
 use super::{NodeAddress, Result, TransportError};
 use std::collections::HashMap;
@@ -744,6 +744,53 @@ pub async fn call_join_zone_rpc(
         error: response.error,
         leader_address: response.leader_address,
     })
+}
+
+/// One federation zone reported by [`call_discover_zones_rpc`] —
+/// `zone_id` + the responder's local `mount_path` for it.
+#[derive(Debug, Clone)]
+pub struct DiscoveredZone {
+    pub zone_id: String,
+    pub mount_path: String,
+}
+
+/// Call `ZoneApiService::DiscoverZones` on a single peer.
+///
+/// S3 Phase D fresh-joiner auto-discovery.  No leader requirement —
+/// the RPC is a straight read of the responder's local federation
+/// mount snapshot.  Pure joiners return an empty list; that is
+/// operator-correct: the caller falls through to the RootlessDynamic
+/// branch on the boot decision and waits for the operator's next
+/// step (identity-driven auto-rejoin on a subsequent boot, or an
+/// explicit `nexusd-cluster join` sidecar).
+pub async fn call_discover_zones_rpc(
+    peer_addr: &str,
+    timeout_secs: u64,
+) -> Result<Vec<DiscoveredZone>> {
+    let ep = Endpoint::from_shared(peer_addr.to_string())
+        .map_err(|e| TransportError::InvalidAddress(e.to_string()))?
+        .connect_timeout(Duration::from_secs(timeout_secs))
+        .timeout(Duration::from_secs(timeout_secs));
+
+    let channel = ep.connect().await.map_err(|e| {
+        TransportError::Connection(format!("DiscoverZones connect to {peer_addr} failed: {e}"))
+    })?;
+
+    let mut client = ZoneApiServiceClient::new(channel);
+    let response = client
+        .discover_zones(DiscoverZonesRequest {})
+        .await
+        .map_err(|e| TransportError::Rpc(format!("DiscoverZones RPC failed: {e}")))?
+        .into_inner();
+
+    Ok(response
+        .zones
+        .into_iter()
+        .map(|z| DiscoveredZone {
+            zone_id: z.zone_id,
+            mount_path: z.mount_path,
+        })
+        .collect())
 }
 
 /// Outcome of a [`call_remove_voter_rpc`] invocation.

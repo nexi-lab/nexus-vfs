@@ -1133,6 +1133,11 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
                 ENV_FEDERATION_ZONES,
                 ENV_FEDERATION_MOUNTS,
             );
+            // S3 Phase D: expose the founder's federation mount table
+            // via the `DiscoverZones` RPC so a fresh joiner boot with
+            // only `--peers <founder>` can auto-JoinZone each zone
+            // without an offline `nexusd-cluster join` sidecar.
+            zm.registry().set_federation_mounts(mounts.clone());
             zm.bootstrap_static_async(zones, peers_for_ha, mounts)
                 .await
                 .map_err(|e| anyhow::anyhow!("bootstrap_static: {}", e))?;
@@ -1156,13 +1161,61 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
             // joining continues through the offline `nexusd-cluster
             // join` sidecar.  Phase B populates `zones` from
             // identity.zones so this branch auto-reconnects.
+            let (zones, mounts) = if zones.is_empty() && !peers.is_empty() {
+                // S3 Phase D: fresh joiner with `--peers` but no
+                // identity.zones snapshot yet.  Ask each peer to
+                // report its local federation topology via
+                // `DiscoverZones` and merge into the auto-join set.
+                // First peer to respond with a non-empty list wins —
+                // subsequent peers' responses are unioned so a
+                // partially-configured founder pair (each half
+                // exposing a disjoint zone) still discovers both.
+                let mut discovered_mounts: std::collections::BTreeMap<String, String> =
+                    std::collections::BTreeMap::new();
+                let mut discovered_zone_order: Vec<String> = Vec::new();
+                for peer in &peers {
+                    match nexus_raft::transport::call_discover_zones_rpc(
+                        &peer.endpoint,
+                        /* timeout */ 10,
+                    )
+                    .await
+                    {
+                        Ok(entries) => {
+                            tracing::info!(
+                                peer = %peer.endpoint,
+                                discovered = entries.len(),
+                                "DiscoverZones: peer reported federation zones",
+                            );
+                            for entry in entries {
+                                // Preserve first-response order for
+                                // downstream `join_zones_for_boot`
+                                // (BTreeMap sorts by path anyway, but
+                                // the zones list order matters for
+                                // per-zone JoinZone dispatch).
+                                if !discovered_mounts.contains_key(&entry.mount_path) {
+                                    discovered_zone_order.push(entry.zone_id.clone());
+                                }
+                                discovered_mounts.insert(entry.mount_path, entry.zone_id);
+                            }
+                        }
+                        Err(e) => tracing::warn!(
+                            peer = %peer.endpoint,
+                            error = %e,
+                            "DiscoverZones: peer unreachable — trying next",
+                        ),
+                    }
+                }
+                (discovered_zone_order, discovered_mounts)
+            } else {
+                (zones, mounts)
+            };
             if zones.is_empty() {
                 tracing::info!(
                     cli_peer_count = peers.len(),
-                    "boot joiner: no federation zones auto-declared; daemon up \
-                     rootless-with-peers. Use `nexusd-cluster join` sidecar for \
-                     zone-specific joining, or wait for a ConfChange apply to \
-                     populate identity.zones.",
+                    "boot joiner: no federation zones auto-declared and none \
+                     reported by peers; daemon up rootless-with-peers. Use \
+                     `nexusd-cluster join` sidecar for zone-specific joining, \
+                     or wait for a ConfChange apply to populate identity.zones.",
                 );
             } else {
                 // Phase B row 4: `zones` came from identity.zones.  When CLI
