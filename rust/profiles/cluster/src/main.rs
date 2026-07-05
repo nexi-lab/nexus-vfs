@@ -1133,11 +1133,12 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
                 ENV_FEDERATION_ZONES,
                 ENV_FEDERATION_MOUNTS,
             );
-            // S3 Phase D: expose the founder's federation mount table
-            // via the `DiscoverZones` RPC so a fresh joiner boot with
-            // only `--peers <founder>` can auto-JoinZone each zone
-            // without an offline `nexusd-cluster join` sidecar.
-            zm.registry().set_federation_mounts(mounts.clone());
+            // S3 Phase D + F: the DiscoverZones RPC reads root's
+            // DT_MOUNT entries directly at call time (Phase F SSOT
+            // tightening), so no eager cache set is needed here — the
+            // `mounts` map ends up in raft state via
+            // `bootstrap_static_async` and gets served fresh on every
+            // DiscoverZones call.
             zm.bootstrap_static_async(zones, peers_for_ha, mounts)
                 .await
                 .map_err(|e| anyhow::anyhow!("bootstrap_static: {}", e))?;
@@ -1265,25 +1266,6 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
             return Err(anyhow::anyhow!(
                 "nexusd-cluster boot refused ({reason}): {hint}"
             ));
-        }
-    }
-
-    // S3 Phase E: harvest root's DT_MOUNT entries into the registry's
-    // federation_mounts snapshot so DiscoverZones (Phase D) returns
-    // the correct topology on restart-mode boots too — where
-    // `bootstrap_static` never ran but the DT_MOUNT entries are still
-    // in raft state.  No-op on rootless (dynamic mode) or when root
-    // has no federation mounts yet.
-    if matches!(mode, BootstrapMode::Static | BootstrapMode::Restart) {
-        if let Err(e) = zm
-            .harvest_federation_mounts_from_root_async(contracts::ROOT_ZONE_ID)
-            .await
-        {
-            tracing::warn!(
-                error = %e,
-                "harvest_federation_mounts_from_root failed — DiscoverZones may report \
-                 stale topology until the next boot",
-            );
         }
     }
 

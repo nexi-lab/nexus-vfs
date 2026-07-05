@@ -1058,25 +1058,37 @@ impl ZoneApiService for ZoneApiServiceImpl {
 
     /// Report the responder's local federation mount table.
     ///
-    /// S3 Phase D fresh-joiner auto-discovery.  Served by any node
-    /// (no leader required), no ConfState mutation, no raft-log write
-    /// — a straight read of the in-memory snapshot the founder path
-    /// stored via [`crate::raft::ZoneRaftRegistry::set_federation_mounts`]
-    /// after processing `NEXUS_FEDERATION_MOUNTS`.  Pure joiners
-    /// return an empty list.
+    /// S3 Phase D fresh-joiner auto-discovery, Phase F SSOT
+    /// tightening: read root zone's DT_MOUNT entries directly from
+    /// the state machine at RPC time.  Pure sequential-consistency
+    /// single-node read via
+    /// [`crate::raft::ZoneConsensus::with_state_machine`] — root is
+    /// per-node SOLO, so the local state machine is the authoritative
+    /// SSOT; no leader round-trip needed.  Every call re-reads, so
+    /// runtime `share` operations that add new DT_MOUNT entries are
+    /// picked up automatically without any cache-invalidation
+    /// plumbing.  Pure joiners (no root zone loaded) return an empty
+    /// list.
     async fn discover_zones(
         &self,
         _request: Request<DiscoverZonesRequest>,
     ) -> std::result::Result<Response<DiscoverZonesResponse>, Status> {
-        let mounts = self.registry.federation_mounts();
-        let zones: Vec<FederationZoneInfo> = mounts
+        let root = self.registry.get_node(contracts::ROOT_ZONE_ID);
+        let entries = match root {
+            Some(node) => node
+                .with_state_machine(|sm| sm.iter_dt_mount_entries())
+                .await
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let zones: Vec<FederationZoneInfo> = entries
             .into_iter()
             .map(|(mount_path, zone_id)| FederationZoneInfo {
                 zone_id,
                 mount_path,
             })
             .collect();
-        tracing::debug!(zone_count = zones.len(), "DiscoverZones request served",);
+        tracing::debug!(zone_count = zones.len(), "DiscoverZones request served");
         Ok(Response::new(DiscoverZonesResponse { zones }))
     }
 
