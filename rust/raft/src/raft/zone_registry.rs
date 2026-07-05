@@ -141,21 +141,6 @@ pub struct ZoneRaftRegistry {
     /// and embedded-mode expectations.  Set once at boot via
     /// [`Self::set_identity_dir`].
     identity_dir: Arc<RwLock<Option<PathBuf>>>,
-    /// Federation mount table snapshot for the S3 Phase D
-    /// `DiscoverZones` RPC — `mount_path → zone_id` pairs the operator
-    /// declared at boot via `NEXUS_FEDERATION_MOUNTS`.  Populated by
-    /// the cluster binary's founder path (`bootstrap_static`); left
-    /// empty on pure-joiner nodes.  Read by
-    /// `ZoneApiService::DiscoverZones` on any node; no leader required.
-    ///
-    /// Consciously in-memory only: restart-mode boots do NOT repopulate
-    /// this — a fresh joiner discovers zones from an *alive-since-boot*
-    /// founder, not from a restarting one.  Sufficient MVP for the
-    /// one-command bring-up goal because the founder is always the
-    /// source of truth at initial cluster formation.  A follow-up may
-    /// harvest the mount list from root-zone DT_MOUNT entries so the
-    /// snapshot survives restart.
-    federation_mounts: Arc<RwLock<std::collections::BTreeMap<String, String>>>,
     /// Per-zone concurrent-op guard: tracks zone_ids currently undergoing
     /// setup or removal. Prevents two threads from concurrently opening
     /// the same RedbStore ("Database already open") and from racing a
@@ -181,7 +166,6 @@ impl ZoneRaftRegistry {
             tls: Arc::new(RwLock::new(None)),
             self_address: Arc::new(RwLock::new(String::new())),
             identity_dir: Arc::new(RwLock::new(None)),
-            federation_mounts: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
             creating: DashMap::new(),
             recently_removed: DashMap::new(),
         }
@@ -196,7 +180,6 @@ impl ZoneRaftRegistry {
             tls: Arc::new(RwLock::new(tls)),
             self_address: Arc::new(RwLock::new(String::new())),
             identity_dir: Arc::new(RwLock::new(None)),
-            federation_mounts: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
             creating: DashMap::new(),
             recently_removed: DashMap::new(),
         }
@@ -238,24 +221,6 @@ impl ZoneRaftRegistry {
     /// Current identity directory, if set.
     pub fn identity_dir(&self) -> Option<PathBuf> {
         self.identity_dir.read().unwrap().clone()
-    }
-
-    /// Record the federation mount table for the S3 Phase D
-    /// `DiscoverZones` RPC.  Called by the cluster binary's founder
-    /// path after `NEXUS_FEDERATION_MOUNTS` has been parsed and the
-    /// mounts installed via `bootstrap_static`.  Overwrites any prior
-    /// snapshot; the field is a *cache of operator intent*, not a
-    /// runtime accumulator.
-    pub fn set_federation_mounts(&self, mounts: std::collections::BTreeMap<String, String>) {
-        *self.federation_mounts.write().unwrap() = mounts;
-    }
-
-    /// Snapshot of the federation mount table for the `DiscoverZones`
-    /// RPC.  Empty on nodes that never called
-    /// [`Self::set_federation_mounts`] (pure joiners, restart-mode
-    /// boots that predate a follow-up SSOT harvest).
-    pub fn federation_mounts(&self) -> std::collections::BTreeMap<String, String> {
-        self.federation_mounts.read().unwrap().clone()
     }
 
     /// Get this node's advertise address (empty when unset).
