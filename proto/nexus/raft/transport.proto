@@ -59,6 +59,17 @@ service ZoneApiService {
   // a snapshot from the leader and becomes an equal Voter with a local sled replica.
   rpc JoinZone(JoinZoneRequest) returns (JoinZoneResponse);
 
+  // RemoveVoter proposes a `RemoveNode` ConfChange against a zone —
+  // wire mirror of `JoinZone` for the opposite direction.
+  // Must be sent to the leader; followers return a redirect with
+  // leader_address.  Straight pass-through to raft-rs's
+  // `RawNode::propose_conf_change` — no transport bypass, no
+  // Progress mutation, and no state-machine surgery.  raft-rs
+  // rejects the "removed all voters" case at apply time, so this
+  // RPC cannot brick the zone.  Cluster hygiene for a genuinely
+  // dead node; see the CLI docstring for the operator flow.
+  rpc RemoveVoter(RemoveVoterRequest) returns (RemoveVoterResponse);
+
   // DeleteZone removes this node's local replica for a zone.
   //
   // Internal maintenance RPC used by federation_remove_zone fan-out. This is
@@ -182,6 +193,27 @@ message JoinZoneResponse {
   optional string leader_address = 3;
   // Current cluster config so the joiner knows all peers.
   optional ClusterConfig config = 4;
+}
+
+// RemoveVoterRequest asks the leader to prune a stale voter/learner
+// from a zone's ConfState.  Mirror of JoinZoneRequest for the reverse
+// operation.
+message RemoveVoterRequest {
+  // Zone whose ConfState is being pruned.
+  string zone_id = 1;
+  // The node id to remove.  The RPC does NOT check whether the id
+  // is currently a voter or learner — raft-rs's `Changer::remove`
+  // is idempotent on unknown ids.
+  uint64 target_node_id = 2;
+}
+
+// RemoveVoterResponse is returned after the ConfChange is committed
+// (or rejected).
+message RemoveVoterResponse {
+  bool success = 1;
+  optional string error = 2;
+  // If not leader, redirect to leader.
+  optional string leader_address = 3;
 }
 
 // DeleteZoneRequest asks a peer to remove its local zone replica.

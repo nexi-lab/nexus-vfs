@@ -8,7 +8,8 @@ use super::proto::nexus::raft::{
     zone_transport_service_client::ZoneTransportServiceClient, AcquireLock, DeleteMetadata,
     DeleteZoneRequest, EcReplicationEntry, ExtendLock, GetClusterInfoRequest, GetLockInfo,
     GetMetadata, JoinClusterRequest, JoinZoneRequest, ListMetadata, ProposeRequest, PutMetadata,
-    QueryRequest, RaftCommand, RaftQuery, ReleaseLock, ReplicateEntriesRequest, StepMessageRequest,
+    QueryRequest, RaftCommand, RaftQuery, ReleaseLock, RemoveVoterRequest, ReplicateEntriesRequest,
+    StepMessageRequest,
 };
 use super::{NodeAddress, Result, TransportError};
 use std::collections::HashMap;
@@ -739,6 +740,64 @@ pub async fn call_join_zone_rpc(
         .into_inner();
 
     Ok(JoinZoneResult {
+        success: response.success,
+        error: response.error,
+        leader_address: response.leader_address,
+    })
+}
+
+/// Outcome of a [`call_remove_voter_rpc`] invocation.
+///
+/// Mirror of [`JoinZoneResult`] for the reverse operation — pruning a
+/// stale voter/learner from a zone's ConfState.
+#[derive(Debug, Clone)]
+pub struct RemoveVoterResult {
+    /// Whether the leader committed the `RemoveNode` ConfChange.
+    /// `false` together with a non-empty `leader_address` means we hit
+    /// a follower; the caller should retry against `leader_address`.
+    pub success: bool,
+    /// Server-side error string when `success=false` and the failure
+    /// is not a follower redirect.
+    pub error: Option<String>,
+    /// Leader's advertise address — set on follower redirects.
+    pub leader_address: Option<String>,
+}
+
+/// Call `ZoneApiService::RemoveVoter` on a single peer.
+///
+/// Operator escape hatch for S3 Phase C voter wipe-rejoin.  See the
+/// server-side handler [`crate::transport::server::ZoneApiServiceImpl::remove_voter`]
+/// for the full rationale.  Follower redirects are surfaced back to the
+/// caller via `leader_address`; the CLI does one redirect follow-up
+/// before failing loud.
+pub async fn call_remove_voter_rpc(
+    peer_addr: &str,
+    zone_id: &str,
+    target_node_id: u64,
+    timeout_secs: u64,
+) -> Result<RemoveVoterResult> {
+    let ep = Endpoint::from_shared(peer_addr.to_string())
+        .map_err(|e| TransportError::InvalidAddress(e.to_string()))?
+        .connect_timeout(Duration::from_secs(timeout_secs))
+        .timeout(Duration::from_secs(timeout_secs));
+
+    let channel = ep.connect().await.map_err(|e| {
+        TransportError::Connection(format!("RemoveVoter connect to {peer_addr} failed: {e}"))
+    })?;
+
+    let mut client = ZoneApiServiceClient::new(channel);
+    let request = RemoveVoterRequest {
+        zone_id: zone_id.to_string(),
+        target_node_id,
+    };
+
+    let response = client
+        .remove_voter(request)
+        .await
+        .map_err(|e| TransportError::Rpc(format!("RemoveVoter RPC failed: {e}")))?
+        .into_inner();
+
+    Ok(RemoveVoterResult {
         success: response.success,
         error: response.error,
         leader_address: response.leader_address,

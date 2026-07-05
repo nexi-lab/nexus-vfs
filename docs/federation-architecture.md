@@ -225,23 +225,24 @@ Every successful ConfChange apply on this node fires an in-driver callback that 
 
 Boot dispatch consumes this: matrix row 4 (returning joiner) becomes `JoinFederationZones { zones: identity.zones[*].zone_id }` instead of the empty Phase-A no-op.  When neither `--peers` nor `identity.peers` are populated, the JoinZone probe list falls back to `identity.zones[i].members` — so a wipe that took `data_dir` + `--peers` but preserved `identity.json` still has enough seed information to reach a live peer.
 
-Coverage today (S3 Phase A + B):
-- **Learner wipe-rejoin** — auto-heals.  Wiped learner boots with fresh `node_id`, `plan_boot_action` returns `JoinFederationZones{zones=[…]}` from identity, `bootstrap_or_join_zone` sends JoinZone as learner.  Old learner id lingers in `ConfState` as a ghost (learners do not count toward quorum, so no wedge).  Ghost GC deferred to a future PR.
-- **Voter wipe-rejoin** — requires Phase C.  A wiped voter's fresh `node_id` joins as a new voter fine, but the leader's `Progress[old_id].matched > 0` for the ghost still exists.  If the operator's cluster loses a majority to the ghost votes, quorum wedges until a manual `RemoveNode(old_id)` proposal drives them out.
+Coverage today (S3 Phase A + B + Phase C-lite):
+- **Learner wipe-rejoin** — auto-heals under the existing rotate-on-wipe rule.  Wiped learner boots with fresh `node_id`, `plan_boot_action` returns `JoinFederationZones{zones=[…]}` from identity, `bootstrap_or_join_zone` sends JoinZone as learner.  Old learner id lingers in `ConfState` as a ghost (learners do not count toward quorum, so no wedge).
+- **Voter wipe-rejoin** — same rotate-on-wipe path: the wiped voter's fresh `node_id` joins via `AddNode` with a Progress that starts at `matched=0`, so the leader's next heartbeat carries `commit=0` (safe under `RaftLog::commit_to`).  Cluster expands from `[A, B_old]` to `[A, B_old_ghost, B_new]`; quorum stays 2-of-3 with `A + B_new` sufficient to commit.  No wedge from the ghost as long as the majority of live voters can reach each other.
+- **Ghost cleanup** — the operator prunes `B_old_ghost` (or any genuinely-dead voter) at their convenience via `nexusd-cluster remove-voter <peer> <zone> --target <old_id>`.  Wire mirror of JoinZone; straight `RemoveNode` ConfChange through raft-rs's public API.  Not required to unblock wipe-rejoin, but keeps `ConfState` and `identity.zones` reflecting reality.
 
-##### S3 Phase C — Voter wipe-rejoin design (follow-up PR)
+##### S3 Phase C — Same-id wipe recovery (deferred design)
 
-**Prerequisite**: recon 2026-07-05 verified raft-rs 0.7 supports Progress reset via public API — `Changer::simple` (`raft-0.7.0/src/confchange/changer.rs:135`) treats `RemoveNode` + `AddNode` on the same id as a fresh `Progress::new` insertion (`tracker/progress.rs:60-72`) with `matched=0`, `next_idx=raft_log.last_index()`.  No fork of raft-rs is needed.
+The current implementation (S3 Phase A + B + Phase C-lite) uses **rotate-on-wipe**: every wiped daemon mints a fresh `node_id`.  That preserves the `RaftLog::commit_to` safety invariant (`commit = min(Progress[peer].matched, leader_committed)` starts at 0 for freshly added peers) and allows both learner and voter wipe-rejoin without protocol changes.  Cluster hygiene (dropping the ghost id from `ConfState`) is an operator-triggered `RemoveVoter` RPC.
 
-Design (three-part protocol):
+The one property rotate-on-wipe does NOT deliver is **stable node identity across wipes** — useful for tracing, cross-machine correlation, and Task #69's "same node_id across wipe cycles" property.  Delivering that requires reusing the id after a wipe, which brings back the `commit_to` panic scenario and needs a three-part protocol:
 
-1. **Move `.node_id` into `identity.json`** — schema v3 adds `pub node_id: Option<u64>`.  Wiped voter reboots with the SAME id it had before (identity survives) and `plan_boot_action` still returns `JoinFederationZones`.
-2. **Inbound quiescence on the wiped follower** — the transport layer holds inbound `MsgHeartbeat` / `MsgAppend` for zones the boot decision marked "wipe-recovering" (identity had the zone but data_dir is empty) until it observes its own `AddNode` entry commit locally via snapshot install.  Without this the leader's first heartbeat with `m.commit > 0` panics `commit_to` on the empty follower.
-3. **Leader-side same-id ConfChange** — the JoinZone RPC handler detects `Progress[joiner_id].matched > 0` (returning wipe rejoin, not fresh join) and proposes `RemoveNode(joiner_id)` first, waits for the commit, then proposes `AddNode(joiner_id)`.  `Changer::simple` rejects two voter changes per proposal, so this must be sequential — or via a single `ConfChangeV2` in joint consensus mode.
+1. **Move `.node_id` into `identity.json`** — schema v3 adds `pub node_id: Option<u64>`.  Wiped voter reboots with the SAME id (identity survives).
+2. **Inbound quiescence on the wiped follower** — the transport layer holds inbound `MsgHeartbeat` / `MsgAppend` for the zones the boot decision marks "wipe-recovering" (identity had the zone but data_dir is empty) until it observes its own `AddNode` entry commit locally via snapshot install.  Without this the leader's first heartbeat with `m.commit > 0` panics `commit_to` on the empty follower.
+3. **Leader-side same-id ConfChange** — the JoinZone RPC handler detects `Progress[joiner_id].matched > 0` (returning wipe rejoin, not fresh join) and proposes `RemoveNode(joiner_id)` first, waits for commit, then proposes `AddNode(joiner_id)`.  `Changer::simple` rejects two voter changes per proposal, so this must be sequential — or via a single `ConfChangeV2` in joint consensus mode.
 
-Together these three restore commit-log linearity across the wipe boundary without changing raft-rs's `RaftLog::commit_to` safety invariant.  Task #69 test (`test_full_data_dir_wipe_auto_recovers`) becomes unSKIP-able once the three parts land.
+Together these three restore commit-log linearity across the wipe boundary without changing raft-rs's `RaftLog::commit_to` safety invariant.  Deferred to a dedicated PR because the three parts must ship together to preserve safety, and the design needs review time before code lands.
 
-Cross-refs: `commit_to` invariant at `raft-0.7.0/src/raft_log.rs:286`; leader-side heartbeat commit computation at `raft-0.7.0/src/raft.rs:868`; existing use of `RemoveNode` + `AddNode` on our side at [`node.rs:1797/1856`](../../rust/raft/src/raft/node.rs).
+Cross-refs (raft-rs 0.7 source at `~/.cargo/registry/src/index.crates.io-*/raft-0.7.0/src/`): `commit_to` invariant at `raft_log.rs:286`; leader-side heartbeat commit computation at `raft.rs:868`; `ProgressTracker::apply_conf` drop+insert at `tracker.rs:370` and `Progress::new` matched-zero init at `tracker/progress.rs:60-72`.
 
 ##### Witness
 

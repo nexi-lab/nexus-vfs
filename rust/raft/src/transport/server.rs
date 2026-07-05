@@ -16,8 +16,8 @@ use super::proto::nexus::raft::{
     JoinClusterRequest, JoinClusterResponse, JoinZoneRequest, JoinZoneResponse, ListMetadataResult,
     LockInfoResult, LockResult, NodeInfo as ProtoNodeInfo, ProposeRequest, ProposeResponse,
     QueryRequest, QueryResponse, RaftCommand, RaftQueryResponse, RaftResponse, ReadBlobRequest,
-    ReadBlobResponse, ReplicateEntriesRequest, ReplicateEntriesResponse, SearchCapabilities,
-    StepMessageRequest, StepMessageResponse,
+    ReadBlobResponse, RemoveVoterRequest, RemoveVoterResponse, ReplicateEntriesRequest,
+    ReplicateEntriesResponse, SearchCapabilities, StepMessageRequest, StepMessageResponse,
 };
 use super::{NodeAddress, Result, SharedPeerMap, TransportError};
 use crate::blob_fetcher::BlobFetcherSlot;
@@ -1051,6 +1051,64 @@ impl ZoneApiService for ZoneApiServiceImpl {
                 error: Some(format!("JoinZone failed: {}", e)),
                 leader_address: None,
                 config: None,
+            })),
+        }
+    }
+
+    /// Prune a stale voter/learner from a zone's ConfState.
+    ///
+    /// Operator escape hatch for S3 Phase C voter wipe-rejoin.  After a
+    /// voter's `data_dir` is wiped and the node reboots with a fresh
+    /// `node_id` (rotate-on-wipe rule per PR #3996), the leader's
+    /// `Progress[old_id]` remains a ghost — the next heartbeat carries
+    /// `commit = min(Progress[old_id].matched, leader_committed)`, and
+    /// any downstream heartbeat destined for a truly-fresh follower
+    /// with `last_index = 0` would trip `RaftLog::commit_to`.  Prune
+    /// the ghost with this RPC so operators can complete the wipe-
+    /// rejoin flow without touching raft internals.
+    async fn remove_voter(
+        &self,
+        request: Request<RemoveVoterRequest>,
+    ) -> std::result::Result<Response<RemoveVoterResponse>, Status> {
+        let req = request.into_inner();
+        let node = get_zone_node(&self.registry, &req.zone_id)?;
+
+        if !node.is_leader() {
+            let peers = self.registry.get_peers(&req.zone_id).unwrap_or_default();
+            let leader_id = node.leader_id().unwrap_or(0);
+            let leader_addr = peers.get(&leader_id).map(|a| a.endpoint.clone());
+            return Ok(Response::new(RemoveVoterResponse {
+                success: false,
+                error: Some("not leader".to_string()),
+                leader_address: leader_addr,
+            }));
+        }
+
+        tracing::info!(
+            zone = req.zone_id,
+            target_node_id = req.target_node_id,
+            "RemoveVoter request received",
+        );
+
+        use raft::eraftpb::ConfChangeType;
+        match node
+            .propose_conf_change(ConfChangeType::RemoveNode, req.target_node_id, Vec::new())
+            .await
+        {
+            Ok(_conf_state) => Ok(Response::new(RemoveVoterResponse {
+                success: true,
+                error: None,
+                leader_address: None,
+            })),
+            Err(RaftError::NotLeader { leader_hint }) => Ok(Response::new(RemoveVoterResponse {
+                success: false,
+                error: Some("not leader".to_string()),
+                leader_address: leader_hint,
+            })),
+            Err(e) => Ok(Response::new(RemoveVoterResponse {
+                success: false,
+                error: Some(format!("RemoveVoter failed: {}", e)),
+                leader_address: None,
             })),
         }
     }
