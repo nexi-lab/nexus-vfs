@@ -1268,6 +1268,25 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
         }
     }
 
+    // S3 Phase E: harvest root's DT_MOUNT entries into the registry's
+    // federation_mounts snapshot so DiscoverZones (Phase D) returns
+    // the correct topology on restart-mode boots too — where
+    // `bootstrap_static` never ran but the DT_MOUNT entries are still
+    // in raft state.  No-op on rootless (dynamic mode) or when root
+    // has no federation mounts yet.
+    if matches!(mode, BootstrapMode::Static | BootstrapMode::Restart) {
+        if let Err(e) = zm
+            .harvest_federation_mounts_from_root_async(contracts::ROOT_ZONE_ID)
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                "harvest_federation_mounts_from_root failed — DiscoverZones may report \
+                 stale topology until the next boot",
+            );
+        }
+    }
+
     // Canonical coordinator boot wiring: self-address publish, DT_MOUNT
     // apply-cb install on every loaded zone (root + env-listed federation
     // zones + zones restored from disk), DT_MOUNT replay, blob-fetcher

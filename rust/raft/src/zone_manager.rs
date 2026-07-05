@@ -1509,6 +1509,68 @@ impl ZoneManager {
             })?
     }
 
+    /// Read every DT_MOUNT entry currently persisted in `root_zone_id`
+    /// and mirror the resulting `mount_path → target_zone_id` map into
+    /// the registry via [`ZoneRaftRegistry::set_federation_mounts`].
+    ///
+    /// S3 Phase E — DT_MOUNT SSOT harvest.  Closes the Phase D
+    /// limitation where `federation_mounts` was only populated by the
+    /// founder path's `bootstrap_static` call; a restart-mode boot
+    /// (`--bootstrap-mode restart`) never called `bootstrap_static`,
+    /// so `DiscoverZones` would return empty on the restarted founder
+    /// even though the DT_MOUNT entries are still in raft state.
+    ///
+    /// Contract:
+    ///   * Reads root's state machine synchronously (sequential-
+    ///     consistency single-node read, no leader-round-trip).
+    ///   * Overwrites the registry's snapshot atomically.
+    ///   * Idempotent — safe to call repeatedly.
+    ///   * No-op with a warn-level log if `root_zone_id` is not loaded
+    ///     (typically the dynamic-bootstrap-mode rootless path).
+    pub fn harvest_federation_mounts_from_root(&self, root_zone_id: &str) -> Result<usize> {
+        let root_node = match self.registry.get_node(root_zone_id) {
+            Some(n) => n,
+            None => {
+                tracing::warn!(
+                    zone = %root_zone_id,
+                    "harvest_federation_mounts_from_root: root zone not loaded — skipping",
+                );
+                return Ok(0);
+            }
+        };
+        let handle = self.rt().handle().clone();
+        let entries: Vec<(String, String)> = bridge_block_on(
+            &handle,
+            root_node.with_state_machine(|sm: &FullStateMachine| sm.iter_dt_mount_entries()),
+        )
+        .map_err(|e| RaftError::Raft(format!("iter_dt_mount_entries: {}", e)))?;
+        let count = entries.len();
+        let map: BTreeMap<String, String> = entries.into_iter().collect();
+        self.registry.set_federation_mounts(map);
+        tracing::info!(
+            zone = %root_zone_id,
+            mount_count = count,
+            "harvested federation mounts from root DT_MOUNT entries",
+        );
+        Ok(count)
+    }
+
+    /// Async wrapper for [`Self::harvest_federation_mounts_from_root`].
+    pub async fn harvest_federation_mounts_from_root_async(
+        self: &Arc<Self>,
+        root_zone_id: &str,
+    ) -> Result<usize> {
+        let this = Arc::clone(self);
+        let root = root_zone_id.to_string();
+        tokio::task::spawn_blocking(move || this.harvest_federation_mounts_from_root(&root))
+            .await
+            .map_err(|e| {
+                RaftError::InvalidState(format!(
+                    "harvest_federation_mounts_from_root_async task panicked: {e}"
+                ))
+            })?
+    }
+
     /// Async wrapper for [`Self::apply_topology`].
     pub async fn apply_topology_async(self: &Arc<Self>, root_zone_id: &str) -> Result<bool> {
         let this = Arc::clone(self);
