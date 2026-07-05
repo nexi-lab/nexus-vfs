@@ -12,12 +12,13 @@ use super::proto::nexus::raft::{
     zone_api_service_server::{ZoneApiService, ZoneApiServiceServer},
     zone_transport_service_server::{ZoneTransportService, ZoneTransportServiceServer},
     ClusterConfig as ProtoClusterConfig, DeleteZoneRequest, DeleteZoneResponse,
-    GetClusterInfoRequest, GetClusterInfoResponse, GetMetadataResult, GetSearchCapabilitiesRequest,
-    JoinClusterRequest, JoinClusterResponse, JoinZoneRequest, JoinZoneResponse, ListMetadataResult,
-    LockInfoResult, LockResult, NodeInfo as ProtoNodeInfo, ProposeRequest, ProposeResponse,
-    QueryRequest, QueryResponse, RaftCommand, RaftQueryResponse, RaftResponse, ReadBlobRequest,
-    ReadBlobResponse, RemoveVoterRequest, RemoveVoterResponse, ReplicateEntriesRequest,
-    ReplicateEntriesResponse, SearchCapabilities, StepMessageRequest, StepMessageResponse,
+    DiscoverZonesRequest, DiscoverZonesResponse, FederationZoneInfo, GetClusterInfoRequest,
+    GetClusterInfoResponse, GetMetadataResult, GetSearchCapabilitiesRequest, JoinClusterRequest,
+    JoinClusterResponse, JoinZoneRequest, JoinZoneResponse, ListMetadataResult, LockInfoResult,
+    LockResult, NodeInfo as ProtoNodeInfo, ProposeRequest, ProposeResponse, QueryRequest,
+    QueryResponse, RaftCommand, RaftQueryResponse, RaftResponse, ReadBlobRequest, ReadBlobResponse,
+    RemoveVoterRequest, RemoveVoterResponse, ReplicateEntriesRequest, ReplicateEntriesResponse,
+    SearchCapabilities, StepMessageRequest, StepMessageResponse,
 };
 use super::{NodeAddress, Result, SharedPeerMap, TransportError};
 use crate::blob_fetcher::BlobFetcherSlot;
@@ -1053,6 +1054,30 @@ impl ZoneApiService for ZoneApiServiceImpl {
                 config: None,
             })),
         }
+    }
+
+    /// Report the responder's local federation mount table.
+    ///
+    /// S3 Phase D fresh-joiner auto-discovery.  Served by any node
+    /// (no leader required), no ConfState mutation, no raft-log write
+    /// — a straight read of the in-memory snapshot the founder path
+    /// stored via [`crate::raft::ZoneRaftRegistry::set_federation_mounts`]
+    /// after processing `NEXUS_FEDERATION_MOUNTS`.  Pure joiners
+    /// return an empty list.
+    async fn discover_zones(
+        &self,
+        _request: Request<DiscoverZonesRequest>,
+    ) -> std::result::Result<Response<DiscoverZonesResponse>, Status> {
+        let mounts = self.registry.federation_mounts();
+        let zones: Vec<FederationZoneInfo> = mounts
+            .into_iter()
+            .map(|(mount_path, zone_id)| FederationZoneInfo {
+                zone_id,
+                mount_path,
+            })
+            .collect();
+        tracing::debug!(zone_count = zones.len(), "DiscoverZones request served",);
+        Ok(Response::new(DiscoverZonesResponse { zones }))
     }
 
     /// Prune a stale voter/learner from a zone's ConfState.

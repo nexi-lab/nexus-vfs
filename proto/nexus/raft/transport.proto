@@ -59,6 +59,22 @@ service ZoneApiService {
   // a snapshot from the leader and becomes an equal Voter with a local sled replica.
   rpc JoinZone(JoinZoneRequest) returns (JoinZoneResponse);
 
+  // DiscoverZones reports the responder's federation zone
+  // topology — the `(zone_id, mount_path)` pairs the responder is
+  // configured to expose to peers.  Read-only; no ConfState
+  // mutation.  Used by S3 Phase D fresh-joiner boot to auto-
+  // discover which zones to `JoinZone` against and where to mount
+  // them locally, closing the "one command bring-up" ambition:
+  // a joiner with only `--peers <founder>` no longer needs the
+  // offline `nexusd-cluster join` sidecar for the initial join.
+  //
+  // Contract: served by any node, does not require leader.  The
+  // list reflects the responder's *local* mount configuration —
+  // typically populated at boot from `NEXUS_FEDERATION_MOUNTS` /
+  // `NEXUS_FEDERATION_ZONES` on the founder, and left empty on
+  // pure-joiner nodes.
+  rpc DiscoverZones(DiscoverZonesRequest) returns (DiscoverZonesResponse);
+
   // RemoveVoter proposes a `RemoveNode` ConfChange against a zone —
   // wire mirror of `JoinZone` for the opposite direction.
   // Must be sent to the leader; followers return a redirect with
@@ -193,6 +209,31 @@ message JoinZoneResponse {
   optional string leader_address = 3;
   // Current cluster config so the joiner knows all peers.
   optional ClusterConfig config = 4;
+}
+
+// DiscoverZonesRequest reads the responder's local federation mount
+// configuration.  No fields — the RPC returns whatever mounts the
+// responder was configured with at boot.
+message DiscoverZonesRequest {}
+
+// DiscoverZonesResponse reports the responder's known federation
+// zones with the local mount path each one is exposed at.
+message DiscoverZonesResponse {
+  repeated FederationZoneInfo zones = 1;
+}
+
+// FederationZoneInfo describes one federation zone the responder
+// exposes.  Consumed by the boot decision layer on a fresh joiner:
+// each entry is dispatched to `bootstrap_or_join_zone` (JoinZone
+// RPC + local ConfState install) and the mount path stitches the
+// remote zone into the joiner's local root namespace.
+message FederationZoneInfo {
+  // Zone id — matches the founder's NEXUS_FEDERATION_ZONES entry.
+  string zone_id = 1;
+  // Global path in the joiner's namespace this zone should be
+  // mounted at — matches the founder's NEXUS_FEDERATION_MOUNTS
+  // entry (`<path>=<zone_id>`).
+  string mount_path = 2;
 }
 
 // RemoveVoterRequest asks the leader to prune a stale voter/learner
