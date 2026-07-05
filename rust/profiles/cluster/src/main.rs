@@ -2638,12 +2638,9 @@ mod tests {
         // Phase G: `--bootstrap-mode` deleted — the daemon now
         // auto-detects boot semantics from disk / identity / peers /
         // federation-env inputs via `plan_boot_action`.
-        let parsed = Args::try_parse_from([
-            "nexusd-cluster",
-            "--advertise-addr",
-            "100.64.0.27:2126",
-        ])
-        .expect("--advertise-addr must parse on daemon mode");
+        let parsed =
+            Args::try_parse_from(["nexusd-cluster", "--advertise-addr", "100.64.0.27:2126"])
+                .expect("--advertise-addr must parse on daemon mode");
         assert_eq!(
             parsed.common.advertise_addr.as_deref(),
             Some("100.64.0.27:2126"),
