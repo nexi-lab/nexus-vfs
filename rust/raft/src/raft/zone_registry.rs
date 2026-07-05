@@ -131,6 +131,16 @@ pub struct ZoneRaftRegistry {
     /// transport tasks read it when they spawn.  Empty disables
     /// advertisement.
     self_address: Arc<RwLock<String>>,
+    /// Optional identity directory for the S3 Phase B ConfState apply
+    /// mirror.  When set, every zone the registry creates or joins
+    /// installs a [`crate::raft::ConfStateAppliedCb`] that mirrors the
+    /// fresh ConfState into `identity.json` via
+    /// [`crate::identity::persist_zone_members`] so a subsequent
+    /// `data_dir` wipe can auto-rejoin without operator sidecar.
+    /// Empty (default) disables the mirror — matches test-harness
+    /// and embedded-mode expectations.  Set once at boot via
+    /// [`Self::set_identity_dir`].
+    identity_dir: Arc<RwLock<Option<PathBuf>>>,
     /// Per-zone concurrent-op guard: tracks zone_ids currently undergoing
     /// setup or removal. Prevents two threads from concurrently opening
     /// the same RedbStore ("Database already open") and from racing a
@@ -155,6 +165,7 @@ impl ZoneRaftRegistry {
             node_id,
             tls: Arc::new(RwLock::new(None)),
             self_address: Arc::new(RwLock::new(String::new())),
+            identity_dir: Arc::new(RwLock::new(None)),
             creating: DashMap::new(),
             recently_removed: DashMap::new(),
         }
@@ -168,6 +179,7 @@ impl ZoneRaftRegistry {
             node_id,
             tls: Arc::new(RwLock::new(tls)),
             self_address: Arc::new(RwLock::new(String::new())),
+            identity_dir: Arc::new(RwLock::new(None)),
             creating: DashMap::new(),
             recently_removed: DashMap::new(),
         }
@@ -196,6 +208,19 @@ impl ZoneRaftRegistry {
     /// updates the advertise address at runtime.
     pub fn set_self_address(&self, address: String) {
         *self.self_address.write().unwrap() = address;
+    }
+
+    /// Set the identity directory for the S3 Phase B ConfState apply
+    /// mirror.  Call before any zone is created; already-created zones
+    /// carry a snapshot of the value at their setup time (the callback
+    /// is installed at zone-setup time, not runtime-poked).
+    pub fn set_identity_dir(&self, dir: PathBuf) {
+        *self.identity_dir.write().unwrap() = Some(dir);
+    }
+
+    /// Current identity directory, if set.
+    pub fn identity_dir(&self) -> Option<PathBuf> {
+        self.identity_dir.read().unwrap().clone()
     }
 
     /// Get this node's advertise address (empty when unset).
@@ -604,6 +629,72 @@ impl ZoneRaftRegistry {
         let shared_peers: SharedPeerMap = Arc::new(RwLock::new(peer_map));
 
         driver.set_peer_map(shared_peers.clone());
+
+        // S3 Phase B: install ConfState apply mirror if the coordinator
+        // has an identity_dir in scope.  Callback captures zone_id +
+        // identity_dir + shared_peers (for u64 → NodeAddress lookup) +
+        // self.node_id (for self-address inclusion when peer_map has
+        // not yet learned it).  Emits `persist_zone_members` calls that
+        // survive `data_dir` wipes and drive the joiner auto-reconnect
+        // path in [`crate::bootstrap`].
+        if let Some(id_dir) = self.identity_dir() {
+            let zone_id_owned = zone_id.to_string();
+            let peers_for_cb = shared_peers.clone();
+            let self_addr_for_cb = self.self_address();
+            let self_node_id_for_cb = self.node_id;
+            let cb: crate::raft::ConfStateAppliedCb =
+                Arc::new(move |cs: &raft::eraftpb::ConfState, self_id: u64| {
+                    let all_ids: Vec<u64> = cs
+                        .voters
+                        .iter()
+                        .chain(cs.learners.iter())
+                        .copied()
+                        .collect();
+                    let members: Vec<String> = {
+                        let peers = peers_for_cb.read().unwrap();
+                        all_ids
+                            .iter()
+                            .filter_map(|id| {
+                                if *id == self_node_id_for_cb {
+                                    // peer_map does not carry self —
+                                    // fill in from the registry.
+                                    (!self_addr_for_cb.is_empty()).then(|| self_addr_for_cb.clone())
+                                } else {
+                                    peers.get(id).map(NodeAddress::to_operator_str)
+                                }
+                            })
+                            .collect()
+                    };
+                    let as_role = if cs.voters.contains(&self_id) {
+                        crate::identity::IdentityZoneRole::Voter
+                    } else {
+                        crate::identity::IdentityZoneRole::Learner
+                    };
+                    match crate::identity::load(&id_dir) {
+                        Ok(existing) => {
+                            if let Err(e) = crate::identity::persist_zone_members(
+                                &id_dir,
+                                &existing,
+                                &zone_id_owned,
+                                members,
+                                as_role,
+                            ) {
+                                tracing::warn!(
+                                    zone = %zone_id_owned,
+                                    error = %e,
+                                    "identity persist_zone_members failed — apply continues",
+                                );
+                            }
+                        }
+                        Err(e) => tracing::warn!(
+                            zone = %zone_id_owned,
+                            error = %e,
+                            "identity load failed inside apply callback — apply continues",
+                        ),
+                    }
+                });
+            driver.set_conf_state_applied_cb(cb);
+        }
 
         let client_config = ClientConfig {
             tls: self.tls.clone(),

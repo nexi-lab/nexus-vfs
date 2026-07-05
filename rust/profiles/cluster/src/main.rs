@@ -515,6 +515,12 @@ struct ZoneManagerBundle {
     /// MUST NOT flow into `bootstrap_or_join_zone(peers=)` for root —
     /// see the `cli_peer_addrs` docstring above.
     identity_persisted_peers: Vec<String>,
+    /// Snapshot of `identity.json`'s per-zone membership at boot.
+    /// Populated by the ConfChange apply callback in prior boots.
+    /// Empty on fresh nodes.  Feeds `BootConfig::identity_zones` so
+    /// the S3 Phase B auto-reconnect path knows which zones to
+    /// JoinZone against.
+    identity_zones: Vec<nexus_raft::identity::IdentityZone>,
 }
 
 /// Open a `ZoneManager` against the data dir, sharing the daemon's
@@ -681,6 +687,13 @@ fn open_zone_manager(
     )
     .map_err(|e| anyhow::anyhow!("ZoneManager::with_node_id: {}", e))?;
 
+    // S3 Phase B: hand the identity directory to the zone registry so
+    // every future zone install (both static founder and JoinZone
+    // joiner paths) installs the ConfState apply mirror.  Must happen
+    // BEFORE `bootstrap_or_join_zone` / `bootstrap_static_async` so
+    // the first ConfChange apply is already covered.
+    zm.registry().set_identity_dir(identity_dir.clone());
+
     // Return CLI-only cli_peer_addrs (root bootstrap consumer) +
     // identity ∪ CLI union (transport seed + split-brain guard
     // consumer) — see `ZoneManagerBundle` docstring for why they're
@@ -691,6 +704,7 @@ fn open_zone_manager(
         self_address,
         cli_peer_addrs,
         identity_persisted_peers: identity_persisted.peers,
+        identity_zones: identity_persisted.zones,
     })
 }
 
@@ -865,6 +879,7 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
         self_address,
         cli_peer_addrs,
         identity_persisted_peers,
+        identity_zones,
     } = open_zone_manager(&common, Some(vfs_routes))?;
 
     // Bring root zone online based on declared mode.
@@ -910,14 +925,6 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
         );
     }
 
-    // `bootstrap_static` — invoked below when federation env vars are
-    // set — is `NEXUS_FEDERATION_ZONES`/`_MOUNTS` driven and only
-    // meaningful on the founder (`bootstrap_new` true).
-    let peers_str: Vec<String> = cli_peer_addrs
-        .iter()
-        .map(NodeAddress::to_raft_peer_str)
-        .collect();
-
     let fed = parse_federation_env();
     // Surface every dropped `NEXUS_FEDERATION_MOUNTS` entry so the
     // operator sees them in boot logs.  When the input was non-empty
@@ -943,33 +950,21 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
             ENV_FEDERATION_MOUNTS,
         ));
     }
-    if !fed.zones.is_empty() || !fed.mounts.mounts.is_empty() {
-        // Split-brain guard: NEXUS_FEDERATION_ZONES auto-creates each
-        // named zone as a SOLO 1-voter cluster with self as the only
-        // member.  If identity.json already knows about peers (either
-        // persisted from a prior sidecar join or seeded via
-        // --peers/NEXUS_PEERS on this boot), auto-create almost
-        // certainly means the operator is accidentally running the
-        // "founder" recipe on a machine that was meant to be a joiner.
-        //
-        // Concretely observed 2026-07-04: both Mac and Win booted with
-        // NEXUS_FEDERATION_ZONES=sharedzone on empty data_dirs.  Each
-        // created its own sharedzone (voter=[self], observations
-        // proposed locally, single-voter quorum → committed).  When
-        // one side ran `nexusd-cluster join <other>`, the two
-        // independent commit histories could not reconcile — raft has
-        // no protocol for merging leader logs across clusters — and
-        // they wedged in a heartbeat-clamping loop.  The 152-commit
-        // side had valid task-list content; the 1-commit side kept
-        // its own SOLO leader claim.
-        //
-        // The correct discipline is: exactly one node auto-creates
-        // (unset identity's peers first if this node is really
-        // starting fresh), every other node runs the sidecar `join`.
-        // Guard here catches both-founder before it wedges.
-        if !identity_persisted_peers.is_empty() {
-            return Err(anyhow::anyhow!(
-                "split-brain guard: {} is set (zones={:?}) but identity.json \
+
+    // Preserved PR #112 split-brain guard — backstops the FailLoud arm
+    // of `plan_boot_action` (row 5) with a longer, operator-actionable
+    // hint so the concrete recovery path is one paragraph rather than
+    // one sentence.  Order matters: this fires BEFORE plan_boot_action
+    // sees the same shape, so the verbose message wins.  Kept even
+    // though row 5 is unreachable from here on because bootstrap.rs
+    // also has it — belt-and-suspenders for one of the most expensive
+    // debugging traps we've hit (152-commit vs 1-commit both-founder
+    // wedge, 2026-07-04).
+    if (!fed.zones.is_empty() || !fed.mounts.mounts.is_empty())
+        && !identity_persisted_peers.is_empty()
+    {
+        return Err(anyhow::anyhow!(
+            "split-brain guard: {} is set (zones={:?}) but identity.json \
                  already lists peers={:?}.  Auto-creating a SOLO zone on a \
                  node that already knows peers is the both-founder misconfig \
                  -- it produces two independent raft clusters sharing the \
@@ -983,27 +978,123 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
                  Unset {} and {} in this launcher, then run: \
                  nexusd-cluster join FOUNDER_HOST:PORT ZONE MOUNT_PATH \
                  --data-dir DATA_DIR  before restarting the daemon.",
-                ENV_FEDERATION_ZONES,
-                fed.zones,
-                identity_persisted_peers,
-                ENV_FEDERATION_ZONES,
-                ENV_FEDERATION_MOUNTS,
-            ));
-        }
-        tracing::info!(
-            zones = ?fed.zones,
-            mount_count = fed.mounts.mounts.len(),
-            "Bootstrapping static topology from {} / {}",
+            ENV_FEDERATION_ZONES,
+            fed.zones,
+            identity_persisted_peers,
             ENV_FEDERATION_ZONES,
             ENV_FEDERATION_MOUNTS,
-        );
-        zm.bootstrap_static_async(
-            fed.zones.clone(),
-            peers_str.clone(),
-            fed.mounts.mounts.clone(),
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("bootstrap_static: {}", e))?;
+        ));
+    }
+
+    // Unified bring-up decision layer (S3 完全体).  Replaces the pre-
+    // refactor unconditional `bootstrap_static_async` call.  See
+    // `nexus_raft::bootstrap` for the full decision matrix; the
+    // dispatch below has one arm per `BootAction` variant.
+    let boot_cfg = nexus_raft::bootstrap::BootConfig {
+        identity_persisted_peers: identity_persisted_peers.clone(),
+        cli_peer_addrs: cli_peer_addrs.clone(),
+        federation_zones: fed.zones.clone(),
+        federation_mounts: fed.mounts.mounts.clone(),
+        bootstrap_new,
+        has_disk_state: data_dir_has_root,
+        identity_zones: identity_zones.clone(),
+    };
+    match nexus_raft::bootstrap::plan_boot_action(&boot_cfg) {
+        nexus_raft::bootstrap::BootAction::StaticFounder {
+            zones,
+            mounts,
+            peers_for_ha,
+        } => {
+            // Matrix row 1 — see `plan_boot_action` docstring for the
+            // full table.  Pure founder: auto-create SOLO per zone.
+            tracing::info!(
+                zones = ?zones,
+                mount_count = mounts.len(),
+                ha_seed_count = peers_for_ha.len(),
+                "Bootstrapping static topology from {} / {}",
+                ENV_FEDERATION_ZONES,
+                ENV_FEDERATION_MOUNTS,
+            );
+            zm.bootstrap_static_async(zones, peers_for_ha, mounts)
+                .await
+                .map_err(|e| anyhow::anyhow!("bootstrap_static: {}", e))?;
+        }
+        nexus_raft::bootstrap::BootAction::RootlessDynamic => {
+            // Matrix row 2 — see `plan_boot_action` docstring.  Nothing
+            // declared; root already handled upstream, federation
+            // branch is a no-op.
+        }
+        nexus_raft::bootstrap::BootAction::JoinFederationZones {
+            peers,
+            zones,
+            mounts,
+        } => {
+            // Matrix rows 3 + 4 — see `plan_boot_action` docstring.
+            // Joiner path.  Phase A: `zones` list
+            // is empty (rows 3/4 require NEXUS_FEDERATION_ZONES unset).
+            // Empty case is a log-only no-op — the daemon comes up
+            // with root bootstrapped + transport peer_map seeded (via
+            // open_zone_manager's merged-peers path), and zone-level
+            // joining continues through the offline `nexusd-cluster
+            // join` sidecar.  Phase B populates `zones` from
+            // identity.zones so this branch auto-reconnects.
+            if zones.is_empty() {
+                tracing::info!(
+                    cli_peer_count = peers.len(),
+                    "boot joiner: no federation zones auto-declared; daemon up \
+                     rootless-with-peers. Use `nexusd-cluster join` sidecar for \
+                     zone-specific joining, or wait for a ConfChange apply to \
+                     populate identity.zones.",
+                );
+            } else {
+                // Phase B row 4: `zones` came from identity.zones.  When CLI
+                // --peers was not passed on this boot the daemon still needs
+                // *some* addresses to send JoinZone against.  Precedence:
+                //   1. CLI --peers (operator override).
+                //   2. identity.peers (union widened at prior boot's persist).
+                //   3. identity.zones[i].members (populated by the apply cb;
+                //      the "wipe took data_dir + peers but the apply cb had
+                //      already stamped the members list before" case).
+                let peers_for_join = if !peers.is_empty() {
+                    peers
+                } else {
+                    let use_tls = !common.no_tls;
+                    let mut seed = identity_persisted_peers.clone();
+                    if seed.is_empty() {
+                        for z in &identity_zones {
+                            for m in &z.members {
+                                if !seed.iter().any(|s| s == m) {
+                                    seed.push(m.clone());
+                                }
+                            }
+                        }
+                    }
+                    NodeAddress::parse_peer_list_operator(&seed.join(","), use_tls)
+                        .map_err(|e| anyhow::anyhow!("identity peers reparse: {}", e))?
+                };
+                join_zones_for_boot(
+                    zm.clone(),
+                    node_id,
+                    self_address.clone(),
+                    peers_for_join,
+                    contracts::ROOT_ZONE_ID.to_string(),
+                    common.data_dir.clone(),
+                    zones,
+                    mounts,
+                    /* as_learner */ false,
+                )
+                .await?;
+            }
+        }
+        nexus_raft::bootstrap::BootAction::FailLoud { reason, hint } => {
+            // Matrix rows 5 + 6 — see `plan_boot_action` docstring.
+            // Row 5 is unreachable here because the preserved PR #112
+            // guard above fires first with a longer hint; row 6 lands
+            // here.  Both cases surface as a single exit-1 code path.
+            return Err(anyhow::anyhow!(
+                "nexusd-cluster boot refused ({reason}): {hint}"
+            ));
+        }
     }
 
     // Canonical coordinator boot wiring: self-address publish, DT_MOUNT
@@ -1356,6 +1447,111 @@ async fn run_share(
     Ok(())
 }
 
+/// Boot-time joiner primitive shared by the offline `join` sidecar
+/// (single-zone) and the future daemon federation-branch joiner path
+/// (multi-zone from `NEXUS_FEDERATION_MOUNTS` / identity.zones).
+///
+/// For each zone in `zone_ids`:
+///   1. If `parent_zone` is not on disk, bootstrap it as SOLO (empty
+///      peers — parent is per-node by design; the DT_MOUNT entry lands
+///      in this zone's metastore).  Idempotent: `bootstrap_or_join_zone`
+///      Branch 1 resumes when ConfState is on disk.
+///   2. `bootstrap_or_join_zone(zone, peers, bootstrap_new=false,
+///      max_attempts=Some(15), as_learner)` against the leader.
+///   3. If `mounts` maps a `local_path -> zone`, propose the DT_MOUNT
+///      entry via `zm.mount_async(parent_zone, local_path, zone, true)`.
+///
+/// `max_attempts=Some(15)` × `JOIN_ZONE_RETRY_INTERVAL` matches
+/// `run_join`'s previous behavior — ~30 s upper bound, long enough to
+/// absorb a leader election on the remote, short enough that a stuck
+/// boot terminates with a clear error.
+///
+/// Runs `bootstrap_or_join_zone` inside `tokio::task::spawn_blocking`
+/// because that helper spins a nested tokio runtime for its JoinZone
+/// RPCs; nested runtime creation panics on a worker thread of the outer
+/// `#[tokio::main]` unless we move it onto the blocking pool.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "wraps `bootstrap_or_join_zone` (8 params) plus a data_dir + mounts map \
+     without bundling — a Params struct here just re-shuffles the field \
+     list without adding a semantic grouping."
+)]
+async fn join_zones_for_boot(
+    zm: Arc<ZoneManager>,
+    node_id: u64,
+    self_address: String,
+    peers: Vec<NodeAddress>,
+    parent_zone: String,
+    data_dir: PathBuf,
+    zone_ids: Vec<String>,
+    mounts: std::collections::BTreeMap<String, String>,
+    as_learner: bool,
+) -> Result<()> {
+    let parent_zone_dir = parent_zone_storage_path(&data_dir, &parent_zone);
+    let parent_zone_loaded = parent_zone_dir.exists();
+    if !parent_zone_loaded {
+        tracing::info!(
+            parent_zone = %parent_zone,
+            data_dir = %data_dir.display(),
+            "boot joiner: parent zone not in data dir — bootstrapping as SOLO",
+        );
+        let zm_for_parent = zm.clone();
+        let self_addr_for_parent = self_address.clone();
+        let parent_zone_for_bootstrap = parent_zone.clone();
+        tokio::task::spawn_blocking(move || {
+            nexus_raft::distributed_coordinator::bootstrap_or_join_zone(
+                zm_for_parent.as_ref(),
+                &parent_zone_for_bootstrap,
+                node_id,
+                &self_addr_for_parent,
+                /* peers */ &[],
+                /* bootstrap_new */ false,
+                /* max_attempts  */ None,
+                /* as_learner */ false,
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("boot joiner parent-zone bootstrap task panicked: {}", e))?
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "boot joiner bootstrap_or_join_zone(parent={}): {}",
+                parent_zone,
+                e
+            )
+        })?;
+    }
+
+    for zone_id in &zone_ids {
+        let zm_for_join = zm.clone();
+        let self_addr_for_join = self_address.clone();
+        let zone_id_for_join = zone_id.clone();
+        let peers_for_join = peers.clone();
+        tokio::task::spawn_blocking(move || {
+            nexus_raft::distributed_coordinator::bootstrap_or_join_zone(
+                zm_for_join.as_ref(),
+                &zone_id_for_join,
+                node_id,
+                &self_addr_for_join,
+                &peers_for_join,
+                /* bootstrap_new */ false,
+                /* max_attempts  */ Some(15),
+                as_learner,
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("boot joiner join task panicked ({zone_id}): {}", e))?
+        .map_err(|e| anyhow::anyhow!("bootstrap_or_join_zone({zone_id}): {}", e))?;
+    }
+
+    for (local_path, zone_id) in &mounts {
+        zm.mount_async(&parent_zone, local_path, zone_id, true)
+            .await
+            .map_err(|e| anyhow::anyhow!("mount({local_path} -> {zone_id}): {}", e))?;
+    }
+
+    Ok(())
+}
+
 async fn run_join(
     common: CommonArgs,
     peer_addr: &str,
@@ -1428,86 +1624,25 @@ async fn run_join(
     let peer_str_for_identity = peer.to_operator_str();
     let peer_addrs = vec![peer];
 
-    // Ensure the local parent zone exists BEFORE writing the cross-zone
-    // DT_MOUNT entry into it.  `zm.mount_async(parent_zone, ...)` below
-    // proposes through that zone's metastore; without the zone loaded
-    // the propose has no consensus group to land in and the mount
-    // entry is silently lost — the joiner daemon then comes up with
-    // sharedzone connected but no namespace stitching at /shared, and
-    // wire_mount warns "root zone not loaded — distributed locks NOT
-    // installed".
-    //
-    // `parent_zone` defaults to "root", which `run_daemon` would
-    // bootstrap on every startup via the same helper. The join CLI
-    // sidecar runs BEFORE the daemon ever boots on a fresh joiner, so
-    // the daemon's later bootstrap finds an already-populated data dir
-    // and resumes — but the resume only loads zones that EXIST in the
-    // data dir. If `run_join` writes the sharedzone first and then
-    // tries to mount under root without root having been bootstrapped,
-    // the daemon resume picks up sharedzone only and the operator
-    // sees an empty FUSE mount.
-    //
-    // Bootstrap parent_zone as SOLO (empty peers — root is per-node
-    // by design, see distributed_coordinator.rs:686 contract). Idempotent:
-    // `bootstrap_or_join_zone` Branch 1 resumes when ConfState is
-    // already on disk, so re-running this sidecar against an existing
-    // data dir is a no-op for the parent zone.
-    let parent_zone_dir = parent_zone_storage_path(&common.data_dir, parent_zone);
-    let parent_zone_loaded = parent_zone_dir.exists();
-    if !parent_zone_loaded {
-        tracing::info!(
-            parent_zone = %parent_zone,
-            data_dir = %common.data_dir.display(),
-            "join sidecar: parent zone not in data dir — bootstrapping as SOLO",
-        );
-        let zm_for_parent = zm.clone();
-        let self_addr_for_parent = self_address.clone();
-        let parent_zone_for_bootstrap = parent_zone.to_string();
-        tokio::task::spawn_blocking(move || {
-            nexus_raft::distributed_coordinator::bootstrap_or_join_zone(
-                zm_for_parent.as_ref(),
-                &parent_zone_for_bootstrap,
-                node_id,
-                &self_addr_for_parent,
-                /* peers */ &[],
-                /* bootstrap_new */ false,
-                /* max_attempts  */ None,
-                /* as_learner */ false,
-            )
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("join sidecar parent-zone bootstrap task panicked: {}", e))?
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "join sidecar bootstrap_or_join_zone(parent={}): {}",
-                parent_zone,
-                e
-            )
-        })?;
-    }
-
-    let zm_for_join = zm.clone();
-    let self_addr_for_join = self_address.clone();
-    let zone_id_for_join = remote_zone_id.to_string();
-    tokio::task::spawn_blocking(move || {
-        nexus_raft::distributed_coordinator::bootstrap_or_join_zone(
-            zm_for_join.as_ref(),
-            &zone_id_for_join,
-            node_id,
-            &self_addr_for_join,
-            &peer_addrs,
-            /* bootstrap_new */ false,
-            /* max_attempts  */ Some(15),
-            as_learner,
-        )
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("join task panicked: {}", e))?
-    .map_err(|e| anyhow::anyhow!("bootstrap_or_join_zone({}): {}", remote_zone_id, e))?;
-
-    zm.mount_async(parent_zone, local_path, remote_zone_id, true)
-        .await
-        .map_err(|e| anyhow::anyhow!("mount: {}", e))?;
+    // Delegate to the shared boot-time joiner primitive.  Sidecar
+    // semantics = single zone + single mount + parent bootstrap under
+    // the run_join contract (parent_zone user-configurable).  The
+    // daemon federation-branch will call the same primitive with the
+    // multi-zone federation map in a follow-up commit.
+    let mut mounts = std::collections::BTreeMap::new();
+    mounts.insert(local_path.to_string(), remote_zone_id.to_string());
+    join_zones_for_boot(
+        zm.clone(),
+        node_id,
+        self_address.clone(),
+        peer_addrs.clone(),
+        parent_zone.to_string(),
+        common.data_dir.clone(),
+        vec![remote_zone_id.to_string()],
+        mounts,
+        as_learner,
+    )
+    .await?;
 
     // Persist the leader address in identity so subsequent daemon
     // restarts (with `--peers` unset — the routine `restart` container

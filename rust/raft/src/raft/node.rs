@@ -466,10 +466,33 @@ pub struct ZoneConsensusDriver<S: StateMachine + 'static> {
     /// Set by `set_peer_map()` before the transport loop starts.
     #[cfg(all(feature = "grpc", has_protos))]
     peer_map: Option<SharedPeerMap>,
+    /// Optional apply-callback invoked after every successful
+    /// `set_conf_state` in the ConfChange apply path.  Installed by
+    /// `ZoneRegistry` when the coordinator has an `identity_dir` in
+    /// hand.  Wires the ConfState apply → `identity::persist_zone_members`
+    /// flow that powers S3 完全体 Phase B auto-reconnect after
+    /// `data_dir` wipe.  See `docs/federation-architecture.md` § 6.3.1.
+    ///
+    /// Invoked SYNCHRONOUSLY inside the driver actor.  Kept synchronous
+    /// because ConfChanges are rare (join/leave only) and the disk
+    /// write is a bounded ~1-20 ms fsync — cheap relative to the
+    /// downstream cost of a wipe-rejoin operator escalation.
+    conf_state_applied_cb: Option<ConfStateAppliedCb>,
     /// EC replication WAL (shared with handle via Arc).
     /// Used by the transport loop for EC background replication.
     replication_log: Option<Arc<ReplicationLog>>,
 }
+
+/// Callback fired after every successful ConfState apply.  Installed
+/// by [`ZoneConsensusDriver::set_conf_state_applied_cb`].  The callback
+/// receives a reference to the freshly-committed `ConfState` plus this
+/// node's own id (`self.config.id`) so implementations can determine
+/// this node's role (voter iff `cs.voters.contains(&self_id)`).
+///
+/// `zone_id` is captured by the installing closure (one closure per
+/// zone) — the driver does not need to thread zone identity through
+/// its own state, and a single writeback impl can serve many zones.
+pub type ConfStateAppliedCb = Arc<dyn Fn(&ConfState, u64) + Send + Sync + 'static>;
 
 // ---------------------------------------------------------------------------
 // ZoneConsensus (handle) implementation
@@ -761,6 +784,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             cached_last_index,
             #[cfg(all(feature = "grpc", has_protos))]
             peer_map: None,
+            conf_state_applied_cb: None,
             replication_log: handle.replication_log.clone(),
         };
 
@@ -1443,6 +1467,15 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         self.peer_map = Some(peer_map);
     }
 
+    /// Install a callback to fire after every ConfState apply.  See
+    /// [`ConfStateAppliedCb`] for the signature contract.  Must be
+    /// called before the transport loop starts — mirrors
+    /// [`Self::set_peer_map`].  Optional: driver runs unchanged when
+    /// no callback is set (test harnesses, embedded mode).
+    pub fn set_conf_state_applied_cb(&mut self, cb: ConfStateAppliedCb) {
+        self.conf_state_applied_cb = Some(cb);
+    }
+
     /// Get the EC replication log (if present).
     /// Used by the transport loop for EC background replication.
     pub fn replication_log(&self) -> Option<&Arc<ReplicationLog>> {
@@ -1842,6 +1875,15 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                     );
                     sm.apply(entry.index, &Command::Noop)?;
 
+                    // S3 Phase B: mirror the fresh ConfState into
+                    // `identity.json` so a subsequent `data_dir` wipe
+                    // can auto-rejoin.  Sync inline — see field
+                    // docstring for the latency budget.  `zone_id` is
+                    // captured by the callback closure.
+                    if let Some(ref cb) = self.conf_state_applied_cb {
+                        cb(&cs, self.config.id);
+                    }
+
                     // Notify waiting JoinZone caller (if any)
                     if let Some(tx) = self.pending_conf_changes.remove(&cc.node_id) {
                         let _ = tx.send(Ok(cs));
@@ -1903,6 +1945,11 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                         "raft.conf_change_v2.applied",
                     );
                     sm.apply(entry.index, &Command::Noop)?;
+
+                    // S3 Phase B: same identity mirror as the V1 arm.
+                    if let Some(ref cb) = self.conf_state_applied_cb {
+                        cb(&cs, self.config.id);
+                    }
 
                     // Notify waiting JoinZone callers for each added node
                     for single in &cc.changes {

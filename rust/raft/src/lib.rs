@@ -122,6 +122,14 @@ pub mod distributed_coordinator;
 /// `docs/federation-architecture.md` § 6.3.1).
 #[cfg(all(feature = "grpc", has_protos))]
 pub mod identity;
+
+/// Boot-time federation-branch decision layer for the cluster binary
+/// (S3 完全体 unified bring-up).  Pure decision function on a typed
+/// [`bootstrap::BootConfig`] → [`bootstrap::BootAction`]; no env vars,
+/// no I/O, no ZoneManager coupling.  See module docs for the full
+/// matrix.
+#[cfg(all(feature = "grpc", has_protos))]
+pub mod bootstrap;
 // WAL stream / pipe backends moved into the kernel crate
 // (`kernel::core::stream::wal`, `kernel::core::pipe::wal`) — they
 // are kernel primitives that compose whatever distributed `MetaStore`
