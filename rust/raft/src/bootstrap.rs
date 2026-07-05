@@ -145,8 +145,8 @@ pub enum BootAction {
 
     /// Joiner path — this node dispatches a per-zone
     /// `bootstrap_or_join_zone(..., max_attempts=Some(15),
-    /// as_learner=false)` against `peers` for each zone in `zones`.
-    /// Reuses the same primitive `run_join` calls.
+    /// as_learner=<per-zone>)` against `peers` for each zone in
+    /// `zones`.  Reuses the same primitive `run_join` calls.
     ///
     /// Phase A: `zones` is always empty in practice (matrix rows 3 + 4
     /// have `NEXUS_FEDERATION_ZONES` UNSET).  The dispatcher in
@@ -154,9 +154,24 @@ pub enum BootAction {
     /// stays up, root bootstrapped, operator continues to use the
     /// offline `join` CLI).  Phase B populates `zones` from
     /// `identity.zones` for automatic re-connect.
+    ///
+    /// Phase H (2026-07-05): `as_learner_per_zone` mirrors `zones` by
+    /// index — position `i` says whether the rejoin should present as
+    /// a learner (true) or voter (false) for `zones[i]`.  For row 4
+    /// (returning joiner) it's derived from
+    /// `identity.zones[i].as_role` so a wiped-then-restored learner
+    /// stays a learner (preserves the 1-voter+N-learners topology
+    /// that S3 auto-recovery depends on — see
+    /// `docs/federation-architecture.md § 6.3.1`).  For row 3 (fresh
+    /// joiner via DiscoverZones) every entry is `false` (voter) —
+    /// matches the pre-Phase-H hardcoded default; operators who need
+    /// learner-first fresh joins still use the offline
+    /// `nexusd-cluster join --as learner` sidecar.  Length invariant:
+    /// `as_learner_per_zone.len() == zones.len()`.
     JoinFederationZones {
         peers: Vec<NodeAddress>,
         zones: Vec<String>,
+        as_learner_per_zone: Vec<bool>,
         mounts: BTreeMap<String, String>,
     },
 
@@ -318,9 +333,27 @@ pub fn plan_boot_action(cfg: &BootConfig) -> BootAction {
             .iter()
             .map(|z| z.zone_id.clone())
             .collect();
+        // Phase H: preserve the original join role on rejoin.  A
+        // wiped-then-restored learner must present as learner again
+        // so the leader's ConfChange is `AddLearnerNode` (which does
+        // NOT expand the voter set — quorum stays at the current
+        // voter count).  If we hardcoded voter here, a rejoin of a
+        // learner would upgrade it to voter — for the 1-voter +
+        // N-learners S3 topology that would turn a healthy
+        // `[Win_voter, Mac_new_learner]` into a fragile
+        // `[Win_voter, Mac_new_voter, Mac_old_learner_ghost]` and
+        // eventually wedge on the next wipe (see
+        // `docs/federation-architecture.md § 6.3.1` voter
+        // wipe-rejoin trap).
+        let as_learner_per_zone: Vec<bool> = cfg
+            .identity_zones
+            .iter()
+            .map(|z| matches!(z.as_role, crate::identity::IdentityZoneRole::Learner))
+            .collect();
         return BootAction::JoinFederationZones {
             peers: cfg.cli_peer_addrs.clone(),
             zones: zones_from_identity,
+            as_learner_per_zone,
             // Mounts are NOT re-installed at boot: DT_MOUNT entries
             // live in raft state, and the leader's snapshot install
             // + apply-cb replay re-materializes them on the wiped
@@ -509,6 +542,7 @@ mod tests {
             BootAction::JoinFederationZones {
                 peers,
                 zones,
+                as_learner_per_zone,
                 mounts,
             } => {
                 assert_eq!(peers.len(), 1);
@@ -516,6 +550,10 @@ mod tests {
                 assert!(
                     zones.is_empty(),
                     "phase A joiner path — no zones auto-declared"
+                );
+                assert!(
+                    as_learner_per_zone.is_empty(),
+                    "empty zones ⇒ empty as_learner_per_zone",
                 );
                 assert!(mounts.is_empty());
             }
@@ -658,14 +696,62 @@ mod tests {
             identity_zone("corp-eng", vec!["100.64.0.22:2126"]),
         ];
         match plan_boot_action(&cfg) {
-            BootAction::JoinFederationZones { zones, mounts, .. } => {
+            BootAction::JoinFederationZones {
+                zones,
+                as_learner_per_zone,
+                mounts,
+                ..
+            } => {
                 assert_eq!(
                     zones,
                     vec!["sharedzone".to_string(), "corp-eng".to_string()]
                 );
+                assert_eq!(
+                    as_learner_per_zone.len(),
+                    zones.len(),
+                    "phase H parallel-vec invariant",
+                );
+                assert!(
+                    as_learner_per_zone.iter().all(|b| !b),
+                    "both identity zones default Voter role ⇒ voter rejoin",
+                );
                 assert!(
                     mounts.is_empty(),
                     "DT_MOUNT entries replay via raft state, not boot dispatch"
+                );
+            }
+            other => panic!("expected JoinFederationZones, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn row4_learner_identity_zone_rejoins_as_learner() {
+        // Phase H core promise: a wiped-then-restored learner rejoins
+        // as learner (`AddLearnerNode`), not voter.  This is what
+        // preserves the 1-voter+N-learners topology under wipe —
+        // rejoining as voter would grow the voter set and eventually
+        // wedge on the next wipe cycle.
+        let mut cfg = cfg_with(vec!["100.64.0.27:2126"], vec![], vec![], BTreeMap::new());
+        cfg.identity_zones = vec![IdentityZone {
+            zone_id: "sharedzone".to_string(),
+            members: vec![
+                "100.64.0.27:2126".to_string(),
+                "100.64.0.21:2126".to_string(),
+            ],
+            as_role: crate::identity::IdentityZoneRole::Learner,
+            last_confirmed_unix_secs: None,
+        }];
+        match plan_boot_action(&cfg) {
+            BootAction::JoinFederationZones {
+                zones,
+                as_learner_per_zone,
+                ..
+            } => {
+                assert_eq!(zones, vec!["sharedzone".to_string()]);
+                assert_eq!(
+                    as_learner_per_zone,
+                    vec![true],
+                    "learner role in identity.json must dispatch AddLearnerNode",
                 );
             }
             other => panic!("expected JoinFederationZones, got {other:?}"),
@@ -682,8 +768,13 @@ mod tests {
         let cfg = cfg_with(vec!["100.64.0.21:2126"], vec![], vec![], BTreeMap::new());
         // identity_zones intentionally left empty
         match plan_boot_action(&cfg) {
-            BootAction::JoinFederationZones { zones, .. } => {
+            BootAction::JoinFederationZones {
+                zones,
+                as_learner_per_zone,
+                ..
+            } => {
                 assert!(zones.is_empty(), "no identity.zones => no auto-join list");
+                assert!(as_learner_per_zone.is_empty());
             }
             other => panic!("expected JoinFederationZones, got {other:?}"),
         }
