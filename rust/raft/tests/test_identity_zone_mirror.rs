@@ -194,13 +194,18 @@ async fn conf_state_apply_persists_zone_membership_on_joiner() {
     // no CLI peers and no NEXUS_FEDERATION_ZONES.  Row 4 dispatch
     // must carry sharedzone as an auto-join target — the on-disk
     // durable state now drives the boot decision.
+    //
+    // has_disk_state=false: the scenario this test simulates is
+    // "identity survives, data_dir was wiped" — the exact S3 Phase B
+    // auto-rejoin promise.  Under Phase G, `has_disk_state=true`
+    // would collapse to `Resume` regardless of identity contents.
     let boot_cfg = BootConfig {
         identity_persisted_peers: ident.peers.clone(),
         cli_peer_addrs: vec![],
         federation_zones: vec![],
         federation_mounts: BTreeMap::new(),
         bootstrap_new: false,
-        has_disk_state: true,
+        has_disk_state: false,
         identity_zones: ident.zones.clone(),
     };
     match plan_boot_action(&boot_cfg) {
