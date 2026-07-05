@@ -158,6 +158,7 @@ async fn scenario1_split_roles_fresh_bringup_no_split_brain() {
         BootAction::JoinFederationZones {
             peers,
             zones,
+            as_learner_per_zone,
             mounts,
         } => {
             assert_eq!(peers.len(), 1);
@@ -165,6 +166,11 @@ async fn scenario1_split_roles_fresh_bringup_no_split_brain() {
             assert!(
                 zones.is_empty(),
                 "Phase A joiner has no auto-zone list; Phase B fills from identity.zones",
+            );
+            assert_eq!(
+                as_learner_per_zone.len(),
+                zones.len(),
+                "Phase H parallel-vec invariant",
             );
             assert!(mounts.is_empty());
         }

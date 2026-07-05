@@ -1136,6 +1136,7 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
         nexus_raft::bootstrap::BootAction::JoinFederationZones {
             peers,
             zones,
+            as_learner_per_zone,
             mounts,
         } => {
             // Matrix rows 3 + 4 — see `plan_boot_action` docstring.
@@ -1147,7 +1148,7 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
             // joining continues through the offline `nexusd-cluster
             // join` sidecar.  Phase B populates `zones` from
             // identity.zones so this branch auto-reconnects.
-            let (zones, mounts) = if zones.is_empty() && !peers.is_empty() {
+            let (zones, as_learner_per_zone, mounts) = if zones.is_empty() && !peers.is_empty() {
                 // S3 Phase D: fresh joiner with `--peers` but no
                 // identity.zones snapshot yet.  Ask each peer to
                 // report its local federation topology via
@@ -1191,9 +1192,15 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
                         ),
                     }
                 }
-                (discovered_zone_order, discovered_mounts)
+                // Phase H: fresh joiner via DiscoverZones has no
+                // prior role signal — default all-voter, matching the
+                // pre-Phase-H hardcoded behaviour.  Operators who
+                // need learner-first fresh joins use the offline
+                // `nexusd-cluster join --as learner` sidecar.
+                let learners = vec![false; discovered_zone_order.len()];
+                (discovered_zone_order, learners, discovered_mounts)
             } else {
-                (zones, mounts)
+                (zones, as_learner_per_zone, mounts)
             };
             if zones.is_empty() {
                 tracing::info!(
@@ -1229,6 +1236,11 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
                     NodeAddress::parse_peer_list_operator(&seed.join(","), use_tls)
                         .map_err(|e| anyhow::anyhow!("identity peers reparse: {}", e))?
                 };
+                assert_eq!(
+                    as_learner_per_zone.len(),
+                    zones.len(),
+                    "Phase H parallel-vec invariant broken by BootAction dispatch",
+                );
                 join_zones_for_boot(
                     zm.clone(),
                     node_id,
@@ -1238,7 +1250,7 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
                     common.data_dir.clone(),
                     zones,
                     mounts,
-                    /* as_learner */ false,
+                    as_learner_per_zone,
                 )
                 .await?;
             }
@@ -1655,8 +1667,16 @@ async fn join_zones_for_boot(
     data_dir: PathBuf,
     zone_ids: Vec<String>,
     mounts: std::collections::BTreeMap<String, String>,
-    as_learner: bool,
+    as_learner_per_zone: Vec<bool>,
 ) -> Result<()> {
+    assert_eq!(
+        zone_ids.len(),
+        as_learner_per_zone.len(),
+        "join_zones_for_boot: zone_ids/as_learner_per_zone length mismatch \
+         ({} vs {}) — caller violated Phase H parallel-vec invariant",
+        zone_ids.len(),
+        as_learner_per_zone.len(),
+    );
     let parent_zone_dir = parent_zone_storage_path(&data_dir, &parent_zone);
     let parent_zone_loaded = parent_zone_dir.exists();
     if !parent_zone_loaded {
@@ -1691,11 +1711,16 @@ async fn join_zones_for_boot(
         })?;
     }
 
-    for zone_id in &zone_ids {
+    for (zone_id, &as_learner) in zone_ids.iter().zip(as_learner_per_zone.iter()) {
         let zm_for_join = zm.clone();
         let self_addr_for_join = self_address.clone();
         let zone_id_for_join = zone_id.clone();
         let peers_for_join = peers.clone();
+        tracing::info!(
+            zone = %zone_id,
+            as_learner,
+            "boot joiner: dispatching bootstrap_or_join_zone with per-zone role",
+        );
         tokio::task::spawn_blocking(move || {
             nexus_raft::distributed_coordinator::bootstrap_or_join_zone(
                 zm_for_join.as_ref(),
@@ -1810,7 +1835,7 @@ async fn run_join(
         common.data_dir.clone(),
         vec![remote_zone_id.to_string()],
         mounts,
-        as_learner,
+        vec![as_learner],
     )
     .await?;
 
