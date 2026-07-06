@@ -596,6 +596,20 @@ impl Kernel {
                 .as_ref()
                 .map(|b| b.write_content(&data, cache_key, ctx, 0));
         }
+        // Broadcast a `RemoteFetch` event to any registered
+        // `MutationObserver` filtering that bit.  Kernel names only the
+        // opaque `origin` — substrate semantics (Tailscale direct vs
+        // relay, S3 bucket, IPFS multihash, …) belong to consumer
+        // services (e.g. `services::transport_observer`).  Fire-and-
+        // forget off the sys_read hot path via the observer thread pool.
+        {
+            let mut event =
+                crate::dispatch::FileEvent::new(crate::dispatch::FileEventType::RemoteFetch, path);
+            event.remote_addr = Some(origin.to_string());
+            event.size = Some(data.len() as u64);
+            event.content_id = entry.content_id.clone();
+            self.dispatch_observers(&event);
+        }
         Ok(SysReadResult {
             data: Some(data),
             post_hook_needed: self.read_hook_count.load(Ordering::Relaxed) > 0,
