@@ -95,9 +95,9 @@ pub(crate) const ALL_FILE_EVENTS: u32 = (1 << 11) - 1;
 /// Kernel file-system event — Rust mirror of `nexus.core.file_events.FileEvent`.
 ///
 /// Constructed by sys_* methods after a successful mutation, then passed
-/// to `MutationObserver::on_mutation`. The struct is `Clone` so the OBSERVE
-/// ThreadPool dispatch can hand each observer its own owned copy without
-/// sharing references across threads.
+/// to `MutationObserver::on_mutation`.  The struct is `Clone` so that
+/// callers who need to retain the event past the observer callback (rare)
+/// can own a copy independently of the borrow the dispatcher passes.
 ///
 /// Fields mirror the Python frozen dataclass field-by-field; see
 /// `file_events.py`. Optional Python fields map to `Option<T>`. Strings
@@ -338,13 +338,17 @@ pub trait PathResolver: Send + Sync {
 /// `FileEvent` after every successful mutation. Never aborts: the
 /// dispatcher catches and logs any panic.
 ///
-/// Contract: OBSERVE is fire-and-forget by definition. The dispatch
-/// loop submits each call to the kernel's background `ThreadPool`
-/// (`Kernel::observer_pool`) so `on_mutation` runs **off** the syscall
-/// hot path. Linux's analogous primitive (fsnotify) makes the same
-/// choice: fire-and-forget only. Observers needing causal ordering or
-/// sync blocking on the syscall return path belong in INTERCEPT POST,
-/// not OBSERVE.
+/// Contract: OBSERVE is fire-and-forget in error semantics — a panic
+/// or Err from `on_mutation` is caught + logged by
+/// [`Kernel::dispatch_observers`] and never aborts the caller's
+/// syscall.  **Dispatch is INLINE on the caller thread** (see
+/// `kernel/observability.rs::dispatch_observers` — the historical
+/// ThreadPool has been retired; `flush_observers` is a no-op kept only
+/// for test-side API compat).  Implementations MUST therefore stay
+/// fast (atomic ops, lock-free reads, no I/O) — anything the observer
+/// does adds directly to the syscall hot-path latency.  Observers
+/// needing causal ordering or sync blocking on the syscall return
+/// path belong in INTERCEPT POST, not OBSERVE.
 pub trait MutationObserver: Send + Sync {
     fn on_mutation(&self, event: &FileEvent);
 }
@@ -719,8 +723,8 @@ impl Trie {
 
 /// Observer entry.
 ///
-/// Stores `Arc<dyn MutationObserver>` so the OBSERVE ThreadPool worker
-/// can clone the trait object across threads. `event_mask` bitmask
+/// Stores `Arc<dyn MutationObserver>` so the dispatcher can hand each
+/// matching observer a cheap trait-object clone.  `event_mask` bitmask
 /// matching happens without external dependency.
 struct ObserverEntry {
     observer: Arc<dyn MutationObserver>,
