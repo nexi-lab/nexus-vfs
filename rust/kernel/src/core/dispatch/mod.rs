@@ -45,6 +45,15 @@ pub enum FileEventType {
     FileCopy = 1 << 7,
     Mount = 1 << 8,
     Unmount = 1 << 9,
+    /// Distributed-VFS event: kernel received bytes from a non-local
+    /// origin during `sys_read` (via `try_remote_fetch`).  The event's
+    /// `remote_addr` field carries the opaque origin identifier — kernel
+    /// does not interpret it beyond a stable label.  Consumer services
+    /// (transport observers, audit, forensics) enrich it with substrate
+    /// semantics they own (e.g. Tailscale transport-path, S3 bucket,
+    /// IPFS multihash).  See `docs/README §1` on distributed-VFS remote
+    /// as a first-class kernel concept.
+    RemoteFetch = 1 << 10,
 }
 
 impl FileEventType {
@@ -71,6 +80,7 @@ impl FileEventType {
             FileEventType::FileCopy => "file_copy",
             FileEventType::Mount => "mount",
             FileEventType::Unmount => "unmount",
+            FileEventType::RemoteFetch => "remote_fetch",
         }
     }
 }
@@ -80,7 +90,7 @@ impl FileEventType {
 /// Computed as `(1 << N) - 1` where N is the number of variants. Adding
 /// a new variant requires bumping the shift here and in Python.
 #[allow(dead_code)]
-pub(crate) const ALL_FILE_EVENTS: u32 = (1 << 10) - 1;
+pub(crate) const ALL_FILE_EVENTS: u32 = (1 << 11) - 1;
 
 /// Kernel file-system event — Rust mirror of `nexus.core.file_events.FileEvent`.
 ///
@@ -114,12 +124,12 @@ pub struct FileEvent {
     pub(crate) size: Option<u64>,
     pub(crate) content_id: Option<String>,
     pub(crate) agent_id: Option<String>,
-    #[allow(dead_code)] // forward-declared for federation vector clocks
-    pub(crate) vector_clock: Option<String>,
-    /// Monotonic ordering within a zone (#2755).
-    #[allow(dead_code)] // forward-declared for federation sequence numbers
-    pub(crate) sequence_number: Option<u64>,
     pub(crate) user_id: Option<String>,
+    /// Populated when `event_type == RemoteFetch`: opaque identifier of
+    /// the non-local origin the bytes crossed from.  Kernel does NOT
+    /// interpret this beyond a stable label — remote substrate layers
+    /// (raft peer, S3, IPFS, …) stamp their own address format.
+    pub(crate) remote_addr: Option<String>,
     /// Write-specific: file version counter.
     pub(crate) version: Option<u32>,
     /// Write-specific: content generation counter.
@@ -218,6 +228,12 @@ impl FileEvent {
         if let Some(ref v) = self.new_path {
             map.insert("new_path".to_string(), serde_json::Value::String(v.clone()));
         }
+        if let Some(ref v) = self.remote_addr {
+            map.insert(
+                "remote_addr".to_string(),
+                serde_json::Value::String(v.clone()),
+            );
+        }
         serde_json::to_string(&serde_json::Value::Object(map))
             .unwrap_or_else(|_| String::from("{\"error\":\"serialization failed\"}"))
     }
@@ -236,9 +252,8 @@ impl FileEvent {
             size: None,
             content_id: None,
             agent_id: None,
-            vector_clock: None,
-            sequence_number: None,
             user_id: None,
+            remote_addr: None,
             version: None,
             gen: None,
             is_new: false,
@@ -1028,12 +1043,13 @@ mod tests {
         assert_eq!(FileEventType::FileCopy.bit(), 1 << 7);
         assert_eq!(FileEventType::Mount.bit(), 1 << 8);
         assert_eq!(FileEventType::Unmount.bit(), 1 << 9);
+        assert_eq!(FileEventType::RemoteFetch.bit(), 1 << 10);
     }
 
     #[test]
     fn test_all_file_events_mask() {
-        // Must equal `nexus.core.file_events.ALL_FILE_EVENTS == (1 << 10) - 1`.
-        assert_eq!(ALL_FILE_EVENTS, 0x3FF);
+        // Must equal `nexus.core.file_events.ALL_FILE_EVENTS == (1 << 11) - 1`.
+        assert_eq!(ALL_FILE_EVENTS, 0x7FF);
         // Every variant bit must be present in the all-mask.
         let bits = [
             FileEventType::FileWrite.bit(),
@@ -1046,6 +1062,7 @@ mod tests {
             FileEventType::FileCopy.bit(),
             FileEventType::Mount.bit(),
             FileEventType::Unmount.bit(),
+            FileEventType::RemoteFetch.bit(),
         ];
         let or_all: u32 = bits.iter().fold(0, |acc, b| acc | b);
         assert_eq!(or_all, ALL_FILE_EVENTS);
@@ -1070,6 +1087,34 @@ mod tests {
         assert_eq!(FileEventType::FileCopy.as_str(), "file_copy");
         assert_eq!(FileEventType::Mount.as_str(), "mount");
         assert_eq!(FileEventType::Unmount.as_str(), "unmount");
+        assert_eq!(FileEventType::RemoteFetch.as_str(), "remote_fetch");
+    }
+
+    #[test]
+    fn test_remote_fetch_event_carries_remote_addr_through_to_json() {
+        // RemoteFetch events carry the opaque origin identifier in
+        // `remote_addr`.  Ensure ctor defaults it None and to_json
+        // includes it when populated.  Consumer services filter by
+        // `event_type == RemoteFetch` and read `remote_addr` to
+        // correlate with their own substrate-specific metadata
+        // (e.g. Tailscale transport-path lookup by peer IP).
+        let mut event = FileEvent::new(FileEventType::RemoteFetch, "/shared/x/y.json");
+        assert!(
+            event.remote_addr.is_none(),
+            "ctor defaults remote_addr None"
+        );
+        event.remote_addr = Some("100.64.0.21:2126".to_string());
+        event.size = Some(4096);
+        event.content_id = Some("blake3:abc123".to_string());
+        let json = event.to_json();
+        assert!(
+            json.contains("\"remote_addr\":\"100.64.0.21:2126\""),
+            "remote_addr must serialize: {json}"
+        );
+        assert!(
+            json.contains("\"type\":\"remote_fetch\""),
+            "event_type string must be `remote_fetch`: {json}"
+        );
     }
 
     // ── NativeHookRegistry unregister tests ────────────────────────────
