@@ -114,11 +114,6 @@ pub struct FileEvent {
     pub(crate) size: Option<u64>,
     pub(crate) content_id: Option<String>,
     pub(crate) agent_id: Option<String>,
-    #[allow(dead_code)] // forward-declared for federation vector clocks
-    pub(crate) vector_clock: Option<String>,
-    /// Monotonic ordering within a zone (#2755).
-    #[allow(dead_code)] // forward-declared for federation sequence numbers
-    pub(crate) sequence_number: Option<u64>,
     pub(crate) user_id: Option<String>,
     /// Write-specific: file version counter.
     pub(crate) version: Option<u32>,
@@ -236,8 +231,6 @@ impl FileEvent {
             size: None,
             content_id: None,
             agent_id: None,
-            vector_clock: None,
-            sequence_number: None,
             user_id: None,
             version: None,
             gen: None,
