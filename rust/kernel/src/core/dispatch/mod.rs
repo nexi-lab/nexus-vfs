@@ -158,6 +158,24 @@ impl FileEvent {
         self.zone_id.as_deref()
     }
 
+    /// Opaque remote origin for [`FileEventType::RemoteFetch`] events.
+    /// Public accessor for peer-crate observer services (e.g.
+    /// `services::transport_observer`) that classify substrate-specific
+    /// transport semantics per remote address — same accessor pattern
+    /// as [`path`](Self::path) / [`zone_id`](Self::zone_id).  `None`
+    /// for every other event type.
+    pub fn remote_addr(&self) -> Option<&str> {
+        self.remote_addr.as_deref()
+    }
+
+    /// Byte count for events that carry one (RemoteFetch, FileWrite,
+    /// FileCopy, …).  Public accessor for observer services that need
+    /// to record throughput metrics from RemoteFetch events without
+    /// `crate::` access.
+    pub fn size(&self) -> Option<u64> {
+        self.size
+    }
+
     /// Construct a `FileEvent` carrying a zone id. Public helper for
     /// peer-crate observer tests (services-tier MutationObservers
     /// fire `on_mutation` against a constructed event when exercising
@@ -168,6 +186,23 @@ impl FileEvent {
     pub fn with_zone(event_type: FileEventType, path: impl Into<String>, zone_id: &str) -> Self {
         let mut event = Self::new(event_type, path);
         event.zone_id = Some(zone_id.to_string());
+        event
+    }
+
+    /// Construct a [`FileEventType::RemoteFetch`] event carrying the
+    /// opaque origin identifier + byte count.  Public helper for
+    /// peer-crate observer tests (services-tier MutationObservers like
+    /// `services::transport_observer`) to synthesize events without
+    /// going through the kernel's `try_remote_fetch` code path.  Same
+    /// visibility rationale as [`with_zone`](Self::with_zone).
+    pub fn remote_fetch(
+        path: impl Into<String>,
+        remote_addr: impl Into<String>,
+        size: u64,
+    ) -> Self {
+        let mut event = Self::new(FileEventType::RemoteFetch, path);
+        event.remote_addr = Some(remote_addr.into());
+        event.size = Some(size);
         event
     }
 
