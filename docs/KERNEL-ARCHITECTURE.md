@@ -710,11 +710,53 @@ See `federation-memo.md` §7j for design rationale.
 
 | Property | Value |
 |----------|-------|
-| Event types | `FILE_WRITE`, `FILE_DELETE`, `FILE_RENAME`, `METADATA_CHANGE`, `DIR_CREATE`, `DIR_DELETE`, `CONFLICT_DETECTED`, `FILE_COPY`, `MOUNT`, `UNMOUNT` |
-| FileEvent | Frozen dataclass: path, etag, size, version, zone_id, agent_id, user_id, vector_clock |
+| Event types | `FILE_WRITE`, `FILE_DELETE`, `FILE_RENAME`, `METADATA_CHANGE`, `DIR_CREATE`, `DIR_DELETE`, `CONFLICT_DETECTED`, `FILE_COPY`, `MOUNT`, `UNMOUNT`, `REMOTE_FETCH` |
+| FileEvent | Frozen dataclass: path, etag, size, version, zone_id, agent_id, user_id, vector_clock, `remote_addr` (opaque origin identifier for `REMOTE_FETCH`) |
 | FileWatcher (kernel-owned) | Local OBSERVE waiters — `on_mutation()` resolves in-memory futures (~0µs) |
 | FileWatcher (kernel-knows) | Optional `RemoteWatchProtocol` for distributed watch, set via `set_remote_watcher()` |
 | Emission point | Always AFTER lock release |
+
+`REMOTE_FETCH` fires from `try_remote_fetch` after each successful blob delivery
+from a peer node (distributed-VFS observability primitive). Semantics: kernel
+stamps `remote_addr` as an opaque string; substrate interpretation (Tailscale
+direct vs relay, S3 bucket, IPFS multihash, …) belongs to consumer services
+(e.g. `services::transport_observer`). See §4.3.1 for the observer-owner
+taxonomy.
+
+#### 4.3.1 Event ownership taxonomy
+
+Every kernel-emitted event answers three questions independently:
+
+| Facet | What it names | Example (`REMOTE_FETCH`) |
+|-------|--------------|--------------------------|
+| **Semantic origin** | The kernel subsystem whose mutation fires the event | `kernel::io::try_remote_fetch` — the CAS remote-fetch codepath |
+| **Lifecycle owner** | The composition root that calls the consumer service's `install()` at boot | Cluster main (`profiles/cluster/src/main.rs::run_daemon`) under the consumer's Cargo feature flag |
+| **Interface contract** | The trait the consumer implements to receive events | `MutationObserver::on_mutation(&FileEvent)` filtered by `event_mask` at registration time |
+
+The three facets stay separable — kernel owns semantic origin; boot code owns
+lifecycle; consumers own interface. A service like `services::transport_observer`
+implements the interface, is installed by its lifecycle owner (cluster main),
+and observes events at their semantic origin without either kernel or boot
+code knowing the substrate-specific classification the consumer applies.
+
+#### 4.3.2 Kernel-internal registries
+
+Consumers plug in through one of three kernel-internal registries. The
+registries are pub(crate); consumers reach them through public `Kernel::*`
+methods.
+
+| Registry | Owned by | Registration key | Callers |
+|----------|----------|------------------|---------|
+| `ServiceRegistry` | `Kernel::service_registry` | Service name (string) → `ServiceInstance { Managed | Rust }` | RPC + lifecycle for `RustService` / `ManagedService` entries |
+| `DriverLifecycleCoordinator` | `Kernel::dlc` | Mount path → `Arc<dyn ObjectStore>` + metastore | `sys_setattr(DT_MOUNT)`, driver mount/unmount |
+| `NativeHookRegistry` + `ObserverRegistry` | `Kernel::native_hooks` + `Kernel::observers` | Hook/observer name (string) | `register_native_hook`, `register_observer`, plus service-scoped `register_service_hook` / `register_service_observer` |
+
+Service-scoped registrations record a `service_name → [hook_or_observer_name]`
+mapping in `service_hook_names` / `service_observer_names`, so
+`unregister_service` batch-removes every hook and observer the service
+installed. The mapping is honor-system-by-string today — `service_name` is
+not cross-checked against `ServiceRegistry`. Refactoring toward enforced
+ownership (LSM-style `try_module_get`) is tracked out-of-band.
 
 ### 4.4 DT_LINK — Path-Internal Symlink
 
