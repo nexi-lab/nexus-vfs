@@ -21,17 +21,13 @@ jobs:
           - os: ubuntu-latest
             artifact_name: nexusd-cluster-linux-x86_64
             binary: nexusd-cluster
-            max_size_bytes: 16252928  # 15.5 MiB — bumped to absorb PR #70/71
-                                      # cross-node typed RPC infra
-                                      # (FederationPeerClient HAL trait +
-                                      # FederationPeerBackend + generic
-                                      # dispatch_federation_peer helper +
-                                      # transport-side typed VFS RPC wrappers
-                                      # & install hook).  Genuinely new
-                                      # functionality — closes the cross-node
-                                      # sys_readdir/stat/unlink/write boundary
-                                      # leak that was the cc-tasks-list mega
-                                      # goal blocker.
+            max_size_bytes: 16515072  # 15.75 MiB — bumped from 15.5 MiB
+                                      # (PR #70/71) to absorb PR #126
+                                      # transport_observer: distributed-VFS
+                                      # substrate observability primitive
+                                      # (dual of peer_blob).  ~250 KiB
+                                      # headroom matches the prior
+                                      # bump-per-feature idiom.
           - os: macos-14
             artifact_name: nexusd-cluster-macos-arm64
             binary: nexusd-cluster
@@ -47,8 +43,9 @@ jobs:
             artifact_name: nexusd-cluster-macos-x86_64
             binary: nexusd-cluster
             target: x86_64-apple-darwin
-            max_size_bytes: 16252928  # 15.5 MiB — same bump as linux for
-                                      # PR #70/71.  Holds the same slack %.
+            max_size_bytes: 16515072  # 15.75 MiB — symmetric bump with
+                                      # linux for PR #126 transport_observer.
+                                      # Same slack % as post-#70/71.
           - os: windows-latest
             artifact_name: nexusd-cluster-windows-x86_64
             binary: nexusd-cluster.exe

@@ -316,9 +316,7 @@ impl TransportObserverService {
 /// client is installed, so the observer is armed before the first
 /// cross-node fetch can fire.  Infallible — the underlying kernel
 /// `register_observer` returns `()` and `TailscaleResolver::spawn`
-/// silently no-ops when tailscale is absent.  Discards the observer
-/// `Arc`; use [`install_with`] instead when the caller needs to hold
-/// a reference (tests, custom bootstrappers).
+/// silently no-ops when tailscale is absent.
 pub fn install(kernel: &Arc<Kernel>) {
     let resolver = TailscaleResolver::spawn(TAILSCALE_REFRESH_INTERVAL);
     install_with(
@@ -328,12 +326,16 @@ pub fn install(kernel: &Arc<Kernel>) {
     );
 }
 
-/// DI variant of [`install`] — accepts a pre-built resolver + policy so
-/// tests can drive the observer through kernel dispatch without
-/// spawning the Tailscale poller thread, and custom bootstrappers can
-/// plug in alternate substrate resolvers.  Returns the observer `Arc`
-/// so the caller can read the counters after dispatch.
-pub fn install_with(
+/// Crate-internal DI variant of [`install`] — accepts a pre-built
+/// resolver + policy so tests can drive the observer through kernel
+/// dispatch without spawning the Tailscale poller thread, and
+/// [`install`] can compose over it.  Not part of the public tier
+/// surface today; alternate-substrate bootstrappers would grow a
+/// separate top-level entry once we know the alternate-substrate
+/// contract shape (Nebula / WebRTC / S3 resolver plug-in).  Returns
+/// the observer `Arc` so callers can read the counters after
+/// dispatch.
+pub(crate) fn install_with(
     kernel: &Arc<Kernel>,
     resolver: Arc<dyn TransportPathResolver>,
     policy: TransportPolicy,
