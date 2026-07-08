@@ -174,6 +174,42 @@ pub trait KernelAbi: Send + Sync + 'static {
 
     fn register_native_hook(&self, hook: Box<dyn NativeInterceptHook>);
 
+    /// Enlist a hook-only service and return the handle callers thread
+    /// through `register_service_hook` / `register_service_observer`
+    /// below.  Same semantics as
+    /// [`Kernel::enlist_hook_only_service`](crate::kernel::Kernel::enlist_hook_only_service).
+    fn enlist_hook_only_service(
+        &self,
+        name: &str,
+    ) -> Result<crate::service_registry::ServiceHandle, String>;
+
+    /// Return a handle for an already-registered service, regardless
+    /// of variant.  Same semantics as
+    /// [`Kernel::service_handle`](crate::kernel::Kernel::service_handle).
+    fn service_handle(&self, name: &str) -> Option<crate::service_registry::ServiceHandle>;
+
+    /// Register a native hook, binding its ownership to the
+    /// [`ServiceHandle`](crate::service_registry::ServiceHandle).
+    /// Same semantics as
+    /// [`Kernel::register_service_hook`](crate::kernel::Kernel::register_service_hook).
+    fn register_service_hook(
+        &self,
+        handle: &crate::service_registry::ServiceHandle,
+        hook: Box<dyn NativeInterceptHook>,
+    );
+
+    /// Register an observer, binding its ownership to the
+    /// [`ServiceHandle`](crate::service_registry::ServiceHandle).
+    /// Same semantics as
+    /// [`Kernel::register_service_observer`](crate::kernel::Kernel::register_service_observer).
+    fn register_service_observer(
+        &self,
+        handle: &crate::service_registry::ServiceHandle,
+        observer: Arc<dyn crate::dispatch::MutationObserver>,
+        observer_name: String,
+        event_mask: u32,
+    );
+
     fn register_rust_service(
         &self,
         name: &str,
@@ -324,6 +360,35 @@ impl KernelAbi for crate::kernel::Kernel {
 
     fn register_native_hook(&self, hook: Box<dyn NativeInterceptHook>) {
         Self::register_native_hook(self, hook)
+    }
+
+    fn enlist_hook_only_service(
+        &self,
+        name: &str,
+    ) -> Result<crate::service_registry::ServiceHandle, String> {
+        Self::enlist_hook_only_service(self, name)
+    }
+
+    fn service_handle(&self, name: &str) -> Option<crate::service_registry::ServiceHandle> {
+        Self::service_handle(self, name)
+    }
+
+    fn register_service_hook(
+        &self,
+        handle: &crate::service_registry::ServiceHandle,
+        hook: Box<dyn NativeInterceptHook>,
+    ) {
+        Self::register_service_hook(self, handle, hook)
+    }
+
+    fn register_service_observer(
+        &self,
+        handle: &crate::service_registry::ServiceHandle,
+        observer: Arc<dyn crate::dispatch::MutationObserver>,
+        observer_name: String,
+        event_mask: u32,
+    ) {
+        Self::register_service_observer(self, handle, observer, observer_name, event_mask)
     }
 
     fn register_rust_service(
