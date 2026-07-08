@@ -7,10 +7,13 @@ enforces cleanup on drop.
 
 **Status:** design proposal — awaiting review before implementation.
 
-**Scope:** kernel `NativeHookRegistry` + `ObserverRegistry` registration APIs,
-plus `ServiceRegistry`. Consumer migrations: `services::audit`,
-`services::transport_observer`. Driver-owned hooks (`DriverLifecycleCoordinator`
-extension) is scoped in but tracked as follow-up.
+**Scope:** kernel `NativeHookRegistry` + `ObserverRegistry` registration
+APIs, plus `ServiceRegistry`.  Consumer migration: `services::audit` (the
+only true hook-only service today).  Kernel-adjacent trusted code
+(`PermissionHook`, `BoundaryHook`, `transport::transport_observer`) stays
+on the unscoped surface per an explicit whitelist.  Driver-owned hooks
+(`DriverLifecycleCoordinator` extension) is scoped in but tracked as
+follow-up.
 
 ---
 
@@ -42,12 +45,15 @@ drift.
 - `services::audit::install_root` — `register_native_hook` (unscoped) + `register_observer` (unscoped, tag `"zone_audit_auto_wire"`).
 - `services::managed_agent::install` — two `register_native_hook` calls (unscoped).
 - `services::matrix_adapter::rooms::install` + `sync::install` — `register_native_hook` (unscoped).
-- `services::transport_observer::install` — `register_service_observer` (service-scoped, tag `"transport-observer"`) — the first and only production caller of the service-scoped API.
+- `transport::transport_observer::install` (nexus-vfs #126) — `register_observer` (unscoped, tag `"transport-observer"`).  Kernel-adjacent trusted transport-tier code; not a `ServiceRegistry` entry.
 
-Every hook owner today is a service — but only transport_observer is registered
-through the service-scoped API. Audit + managed_agent + matrix_adapter reach
-directly for the unscoped surface and rely on convention to remember what
-they installed.
+No production caller of `register_service_hook` / `register_service_observer`
+exists.  The service-scoped API is defined and unit-tested but no service
+today uses it — all service-tier hooks reach directly for the unscoped
+surface and rely on convention to remember what they installed.  The
+transport-tier `transport_observer` also uses the unscoped surface, but for
+a different reason: it's kernel-adjacent code and would be whitelisted with
+`PermissionHook` / `BoundaryHook` under the enforced surface below.
 
 **`ServiceRegistry` shape today** (`core/service_registry.rs:80`):
 
@@ -59,9 +65,12 @@ enum ServiceInstance {
 ```
 
 Every entry must implement one of the two lifecycle traits — no "hook-only,
-no RPC" variant. Audit + transport-observer conceptually ARE services (they
-have identity, are boot-installed, own state) but don't expose a `Call()`
-RPC, so they don't fit either variant and are absent from `ServiceRegistry`.
+no RPC" variant. Audit conceptually IS a service (identity, boot-installed,
+owns per-zone state) but doesn't expose a `Call()` RPC, so it doesn't fit
+either variant and is absent from `ServiceRegistry`.  (Transport_observer
+does NOT need a `ServiceRegistry` entry — it's a transport-tier primitive,
+owned by the transport crate itself, with the same lifecycle as
+`transport::peer_blob`; see §5.2.)
 
 **`DriverLifecycleCoordinator`** (`core/dlc.rs:28`) is an empty unit struct
 today, holding mount lifecycle (routing + metastore) only. No hook API,
@@ -77,8 +86,11 @@ no unregister-on-drop path.
    removes every hook and observer the entity installed.
 4. Extends to driver-owned hooks — future capability (Linux drivers install
    netfilter / LSM hooks tied to their module lifetime).
-5. Existing consumers migrate cleanly — audit + transport_observer become
-   proper `ServiceRegistry` entries with legitimate identity.
+5. Existing service-tier consumers migrate cleanly — `services::audit` becomes
+   a proper `ServiceRegistry` entry with legitimate identity.
+   `transport::transport_observer` (nexus-vfs) does NOT migrate — it's a
+   transport-tier primitive whose owner is the crate itself, whitelisted
+   alongside `PermissionHook` / `BoundaryHook`.
 
 ## 3. Design
 
@@ -160,9 +172,9 @@ separately from `ServiceRegistry`. This was rejected:
   hook-only surfaces would move between registries).
 - `unhook_service` already knows how to batch-clean by tag; splitting into two
   registries doubles the batch-clean paths.
-- Conceptually, transport-observer and audit ARE services — they have identity,
-  boot lifecycle, register/unregister semantics — they just don't expose a
-  `Call()` RPC. Modeling them as a `ServiceInstance` variant matches reality.
+- Conceptually, audit IS a service — it has identity, boot lifecycle,
+  register/unregister semantics — it just doesn't expose a `Call()` RPC.
+  Modeling it as a `ServiceInstance` variant matches reality.
 
 `ServiceInstance::HookOnly` is a smaller change with a single registry as the
 lifecycle SSOT.
@@ -178,13 +190,15 @@ lifecycle SSOT.
   installs the root-zone `AuditHook`, then registers the
   `ZoneAuditAutoWire` observer under the same handle.
 
-### 5.2 `services::transport_observer`
+### 5.2 `transport::transport_observer` — no migration
 
-- `install(kernel)` enlists a hook-only service `"transport-observer"`,
-  registers `TransportObserverService` observer via the handle. Replaces
-  the current bare-string `register_service_observer("transport-observer", …)`.
-- `install_with(kernel, resolver, policy)` shares the same enlist step for
-  test drivability.
+`transport::transport_observer` (nexus-vfs #126) is a transport-tier
+primitive owned by the transport crate, not a service in `ServiceRegistry`.
+It's the dual of `transport::peer_blob` (peer_blob fetches, transport_observer
+classifies), installed at the same boot step by cluster main, and shares
+peer_blob's lifecycle.  Uses the unscoped `register_observer` — legitimate
+for kernel-adjacent trusted code, whitelisted alongside `PermissionHook`
+and `BoundaryHook` under the enforced surface below.
 
 ### 5.3 Other current unscoped callers
 
@@ -207,19 +221,22 @@ kernel-built-in tag become compile errors after the migration completes.
 
 ## 7. Rollout
 
-Four PRs, sequential:
+Three PRs, sequential (this design doc already merged as nexus-vfs #125):
 
-1. **This design doc** — nexus-vfs `docs/hook-ownership-refactor.md`. Review
-   and approve before proceeding.
-2. **nexus-vfs** — `ServiceInstance::HookOnly` variant + `ServiceHandle` type
-   + handle-based `register_service_*` APIs. Existing string-based APIs stay
+1. **nexus-vfs** — `ServiceInstance::HookOnly` variant + `ServiceHandle` type
+   + handle-based `register_service_*` APIs.  Existing string-based APIs stay
    temporarily as deprecated aliases forwarding to the new path so nexus can
-   migrate incrementally.
-3. **nexus** — migrate `services::audit` from unscoped registration to
-   handle-based enrollment. Bumps nexus-vfs dep pin.
-4. **nexus** — migrate `services::transport_observer` similarly. Then delete
-   the deprecated string-based `register_service_*` APIs in nexus-vfs; every
-   caller now uses handles.
+   migrate incrementally.  Kernel-adjacent trusted code (`PermissionHook`,
+   `BoundaryHook`, `transport::transport_observer`) keeps calling the
+   unscoped `register_native_hook` / `register_observer` per an explicit
+   compile-time whitelist.
+2. **nexus** — migrate `services::audit` from unscoped registration to
+   handle-based enrollment.  Bumps nexus-vfs dep pin.
+3. **nexus** — migrate remaining service-tier callers
+   (`services::managed_agent`, `services::matrix_adapter`, dylib plugins)
+   to handles.  Then delete the deprecated string-based `register_service_*`
+   APIs in nexus-vfs; every service-tier caller now uses handles, transport
+   tier stays on the whitelisted unscoped surface.
 
 ## 8. Open questions
 
