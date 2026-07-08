@@ -47,6 +47,12 @@ pub mod grpc;
 pub mod grpc_plugin_proxy;
 pub mod ipc;
 pub mod peer_blob;
+/// Post-transport substrate observability.  Dual of
+/// [`peer_blob`]: peer_blob does cross-node blob fetches,
+/// transport_observer classifies which substrate path each fetch
+/// actually took (Tailscale direct vs DERP relay vs unknown) and
+/// warns operators when their bytes traverse a third-party relay.
+pub mod transport_observer;
 
 /// Out-bound VFS gRPC client. Re-exported from `kernel::rpc_transport`
 /// where the type is declared (kernel-internal `RemoteMetaStore`
