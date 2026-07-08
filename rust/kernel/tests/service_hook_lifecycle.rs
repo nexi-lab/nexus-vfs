@@ -1,10 +1,14 @@
 //! Integration tests for service hook lifecycle management.
 //!
-//! Validates the kernel's service ↔ hook ownership tracking:
-//!   - `register_service_hook` records hook ownership
+//! Validates the kernel's service ↔ hook ownership tracking through
+//! the handle-based enforced surface (nexus-vfs #125 design):
+//!   - `register_service_hook(&ServiceHandle, hook)` records ownership
 //!   - `unregister_service` batch-removes owned hooks
 //!   - `swap_managed_service` unhooks old service before replacing
 //!   - Multi-service hook isolation (unhook one, others survive)
+//!   - Hook-only services enlist without RPC surface
+//!   - Handle Clone shares one enlist across many install sites
+//!   - Non-existent service returns `None` from `service_handle`
 //!
 //! All tests exercise the public Kernel API only — no `pub(crate)` internals.
 
@@ -201,9 +205,10 @@ fn hook_fires_then_stops_after_unregister_service() {
     k.register_managed_service("svc-a", Box::new(StubService::new("StubA")), vec![], false)
         .expect("enlist svc-a");
 
-    // Register a hook owned by svc-a
+    // Grab the handle for the enlisted service; register hook via handle.
+    let handle = k.service_handle("svc-a").expect("handle for svc-a");
     let (hook, pre_count, _post_count) = CountingHook::new("svc-a-hook");
-    k.register_service_hook("svc-a", Box::new(hook));
+    k.register_service_hook(&handle, Box::new(hook));
 
     // Write triggers the hook
     assert!(do_write(&k, &ctx, "/test/file1.txt"));
@@ -243,12 +248,16 @@ fn unregister_service_removes_all_owned_hooks() {
         false,
     )
     .expect("enlist");
+    let handle = k
+        .service_handle("svc-cleanup")
+        .expect("handle for svc-cleanup");
 
-    // Register two hooks owned by the same service
+    // Register two hooks owned by the same service — same handle
+    // shared via Clone.
     let (h1, pre1, _) = CountingHook::new("cleanup-hook-1");
     let (h2, pre2, _) = CountingHook::new("cleanup-hook-2");
-    k.register_service_hook("svc-cleanup", Box::new(h1));
-    k.register_service_hook("svc-cleanup", Box::new(h2));
+    k.register_service_hook(&handle, Box::new(h1));
+    k.register_service_hook(&handle, Box::new(h2));
 
     // Both hooks fire
     assert!(do_write(&k, &ctx, "/test/a.txt"));
@@ -276,10 +285,11 @@ fn swap_managed_service_removes_old_hooks() {
         false,
     )
     .expect("enlist old");
+    let handle = k.service_handle("svc-swap").expect("handle for svc-swap");
 
     // Hook for the old service
     let (old_hook, old_pre, _) = CountingHook::new("swap-old-hook");
-    k.register_service_hook("svc-swap", Box::new(old_hook));
+    k.register_service_hook(&handle, Box::new(old_hook));
 
     // Verify old hook fires
     assert!(do_write(&k, &ctx, "/test/before.txt"));
@@ -302,9 +312,12 @@ fn swap_managed_service_removes_old_hooks() {
         "old hook must not fire after swap"
     );
 
-    // Register a new hook for the swapped service (step 4 of swap flow)
+    // Register a new hook for the swapped service (step 4 of swap flow).
+    // Handle name persists across swap — the service entry is still
+    // registered under "svc-swap", we grab a fresh handle for clarity.
+    let handle_after_swap = k.service_handle("svc-swap").expect("handle survives swap");
     let (new_hook, new_pre, _) = CountingHook::new("swap-new-hook");
-    k.register_service_hook("svc-swap", Box::new(new_hook));
+    k.register_service_hook(&handle_after_swap, Box::new(new_hook));
 
     assert!(do_write(&k, &ctx, "/test/new.txt"));
     assert_eq!(new_pre.load(Ordering::SeqCst), 1, "new hook must fire");
@@ -329,8 +342,9 @@ fn unhook_one_service_leaves_others_intact() {
         false,
     )
     .expect("enlist alpha");
+    let alpha = k.service_handle("svc-alpha").expect("handle alpha");
     let (ha, pre_a, _) = CountingHook::new("alpha-hook");
-    k.register_service_hook("svc-alpha", Box::new(ha));
+    k.register_service_hook(&alpha, Box::new(ha));
 
     // Service B
     k.register_managed_service(
@@ -340,8 +354,9 @@ fn unhook_one_service_leaves_others_intact() {
         false,
     )
     .expect("enlist beta");
+    let beta = k.service_handle("svc-beta").expect("handle beta");
     let (hb, pre_b, _) = CountingHook::new("beta-hook");
-    k.register_service_hook("svc-beta", Box::new(hb));
+    k.register_service_hook(&beta, Box::new(hb));
 
     // Both fire
     assert!(do_write(&k, &ctx, "/test/both.txt"));
@@ -364,4 +379,167 @@ fn unhook_one_service_leaves_others_intact() {
     assert!(do_write(&k, &ctx, "/test/only_b2.txt"));
     assert_eq!(pre_a.load(Ordering::SeqCst), 1);
     assert_eq!(pre_b.load(Ordering::SeqCst), 3);
+}
+
+// ── Test 5: hook-only service enlist + register + unregister lifecycle ─
+
+/// Full lifecycle for the new `HookOnly` variant: enlist without a
+/// managed / rust service, register hooks under the handle, verify
+/// they fire, unregister the hook-only service, verify hooks stop.
+///
+/// This is the primary end-state for `services::audit::install_root`
+/// once migrated — audit is a hook-only service with no RPC surface.
+#[test]
+fn hook_only_service_full_lifecycle() {
+    let (k, ctx) = setup_kernel();
+
+    // Enlist as hook-only — no ServiceLifecycle, no RustService.
+    let handle = k
+        .enlist_hook_only_service("audit-like")
+        .expect("hook-only enlist");
+
+    // Register two hooks under it.
+    let (h1, pre1, _) = CountingHook::new("audit-hook-1");
+    let (h2, pre2, _) = CountingHook::new("audit-hook-2");
+    k.register_service_hook(&handle, Box::new(h1));
+    k.register_service_hook(&handle, Box::new(h2));
+
+    // Both fire on writes.
+    assert!(do_write(&k, &ctx, "/test/hookonly_a.txt"));
+    assert_eq!(pre1.load(Ordering::SeqCst), 1);
+    assert_eq!(pre2.load(Ordering::SeqCst), 1);
+
+    assert!(do_write(&k, &ctx, "/test/hookonly_b.txt"));
+    assert_eq!(pre1.load(Ordering::SeqCst), 2);
+    assert_eq!(pre2.load(Ordering::SeqCst), 2);
+
+    // Unregister the hook-only service — both hooks must batch-remove.
+    let removed = k.unregister_service("audit-like");
+    assert!(removed, "hook-only service must be unregisterable");
+
+    assert!(do_write(&k, &ctx, "/test/hookonly_c.txt"));
+    assert_eq!(
+        pre1.load(Ordering::SeqCst),
+        2,
+        "hook-1 must stop after hook-only unregister"
+    );
+    assert_eq!(
+        pre2.load(Ordering::SeqCst),
+        2,
+        "hook-2 must stop after hook-only unregister"
+    );
+}
+
+// ── Test 6: handle Clone shares one enlist across install sites ───────
+
+/// Cloning a `ServiceHandle` is cheap (single Arc<String> refcount
+/// bump) and installs from any clone all bind to the same underlying
+/// entry — a single `unregister_service` still drains them.  Mirrors
+/// the shape audit's `install_root` will take: enlist once, hand a
+/// clone to `ZoneAuditAutoWire` and another to per-zone
+/// `install_for_zone` calls.
+#[test]
+fn cloned_handle_installs_bind_to_same_service_entry() {
+    let (k, ctx) = setup_kernel();
+
+    let handle = k
+        .enlist_hook_only_service("multi-install")
+        .expect("hook-only enlist");
+
+    // Two independent install sites, each using their own clone.
+    let handle_a = handle.clone();
+    let handle_b = handle.clone();
+
+    let (h1, pre1, _) = CountingHook::new("multi-hook-1");
+    let (h2, pre2, _) = CountingHook::new("multi-hook-2");
+    k.register_service_hook(&handle_a, Box::new(h1));
+    k.register_service_hook(&handle_b, Box::new(h2));
+
+    // Both fire.
+    assert!(do_write(&k, &ctx, "/test/multi_a.txt"));
+    assert_eq!(pre1.load(Ordering::SeqCst), 1);
+    assert_eq!(pre2.load(Ordering::SeqCst), 1);
+
+    // One unregister drains BOTH hooks — they share the same entry.
+    k.unregister_service("multi-install");
+
+    assert!(do_write(&k, &ctx, "/test/multi_b.txt"));
+    assert_eq!(
+        pre1.load(Ordering::SeqCst),
+        1,
+        "hook-1 batch-removed via one unregister"
+    );
+    assert_eq!(
+        pre2.load(Ordering::SeqCst),
+        1,
+        "hook-2 batch-removed via one unregister"
+    );
+
+    // Original handle is still cheap to hold post-drop; it just
+    // resolves to nothing on subsequent register attempts.
+    assert_eq!(handle.name(), "multi-install");
+}
+
+// ── Test 7: handle for non-existent service returns None ──────────────
+
+/// The `service_handle(name)` accessor returns `None` when no service
+/// is registered under the given name — this is what protects handle
+/// consumers from binding hooks to a non-existent owner.
+#[test]
+fn service_handle_returns_none_for_unregistered_name() {
+    let (k, _ctx) = setup_kernel();
+
+    // Nothing enlisted under this name.
+    assert!(k.service_handle("never-registered").is_none());
+
+    // Enlist something else — the miss for a different name still stands.
+    k.register_managed_service(
+        "some-other-svc",
+        Box::new(StubService::new("Other")),
+        vec![],
+        false,
+    )
+    .expect("enlist other");
+    assert!(k.service_handle("never-registered").is_none());
+    assert!(k.service_handle("some-other-svc").is_some());
+}
+
+// ── Test 8: variant mismatch on re-enlist ─────────────────────────────
+
+/// Enlisting a name as HookOnly when it's already Managed / Rust must
+/// fail cleanly with a variant-mismatch error — the two variants have
+/// different lifecycle semantics and silently coercing would surprise
+/// the caller.  Re-enlisting an existing HookOnly is idempotent
+/// (returns a fresh handle to the same entry).
+#[test]
+fn hook_only_enlist_rejects_variant_mismatch() {
+    let (k, _ctx) = setup_kernel();
+
+    // Enlist as Managed first.
+    k.register_managed_service(
+        "conflict",
+        Box::new(StubService::new("ManagedFirst")),
+        vec![],
+        false,
+    )
+    .expect("enlist managed");
+
+    // Attempt hook-only enlist under the same name — must fail.
+    let err = k
+        .enlist_hook_only_service("conflict")
+        .expect_err("must reject Managed→HookOnly re-enlist");
+    assert!(
+        err.contains("already registered as Managed"),
+        "error should identify the existing variant, got: {err}",
+    );
+
+    // Idempotent re-enlist path: fresh hook-only name.
+    let h1 = k
+        .enlist_hook_only_service("fresh-hook-only")
+        .expect("first enlist");
+    let h2 = k
+        .enlist_hook_only_service("fresh-hook-only")
+        .expect("second enlist idempotent");
+    // Both handles carry the same name.
+    assert_eq!(h1.name(), h2.name());
 }

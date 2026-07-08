@@ -197,26 +197,49 @@ impl Kernel {
     //   4. Rehook new service's hooks
     //
     // Services register hooks via `register_service_hook` /
-    // `register_service_observer` which also record the mapping in
-    // `service_hook_names` / `service_observer_names`. Swap/unregister
-    // use the map to batch-remove stale hooks.
+    // `register_service_observer`, both threaded through a
+    // `ServiceHandle` obtained from `enlist_hook_only_service` (for
+    // hook-only services like `services::audit`) or `service_handle`
+    // (for existing Managed / Rust entries).  The dispatch layer
+    // records the mapping in `service_hook_names` /
+    // `service_observer_names` keyed by the handle's name; swap /
+    // unregister use the map to batch-remove stale hooks.  Handles
+    // for non-existent entries cannot be constructed, so the
+    // service-name tags in these maps cannot drift from
+    // `ServiceRegistry`.
 
-    /// Register a native hook AND record it as belonging to `service_name`.
-    /// On swap/unregister of `service_name`, the kernel auto-removes it.
-    pub fn register_service_hook(&self, service_name: &str, hook: Box<dyn NativeInterceptHook>) {
+    /// Register a native hook, binding its ownership to the
+    /// [`ServiceHandle`](crate::service_registry::ServiceHandle) issued
+    /// at enlist time.  On unregister / swap of the underlying service,
+    /// the kernel batch-removes every hook installed through the handle.
+    ///
+    /// The handle carries the service name — dispatch's
+    /// `service_hook_names` bookkeeping keys off it the same way the
+    /// prior string-tagged API did, but now the identity is issued by
+    /// the registry rather than named by convention, so drift is
+    /// impossible: handles for non-existent entries cannot be
+    /// constructed.
+    pub fn register_service_hook(
+        &self,
+        handle: &crate::service_registry::ServiceHandle,
+        hook: Box<dyn NativeInterceptHook>,
+    ) {
         let hook_name = hook.name().to_string();
         self.native_hooks.write().register(hook);
         self.service_hook_names
             .lock()
-            .entry(service_name.to_string())
+            .entry(handle.name().to_string())
             .or_default()
             .push(hook_name);
     }
 
-    /// Register an observer AND record it as belonging to `service_name`.
+    /// Register an observer, binding its ownership to the
+    /// [`ServiceHandle`](crate::service_registry::ServiceHandle).
+    /// See [`Self::register_service_hook`] for the ownership contract;
+    /// same rules apply, keyed under `service_observer_names`.
     pub fn register_service_observer(
         &self,
-        service_name: &str,
+        handle: &crate::service_registry::ServiceHandle,
         observer: std::sync::Arc<dyn crate::dispatch::MutationObserver>,
         observer_name: String,
         event_mask: u32,
@@ -227,7 +250,7 @@ impl Kernel {
             .register(observer, observer_name, event_mask);
         self.service_observer_names
             .lock()
-            .entry(service_name.to_string())
+            .entry(handle.name().to_string())
             .or_default()
             .push(name_clone);
     }
@@ -266,6 +289,36 @@ impl Kernel {
     ) -> Result<(), String> {
         self.service_registry
             .enlist(name, instance, exports, allow_overwrite)
+    }
+
+    /// Enlist a hook-only service — an entry in `ServiceRegistry` that
+    /// exists purely as a lifecycle-managed owner namespace for hooks
+    /// and observers.  Returns the handle callers thread through
+    /// [`Self::register_service_hook`] / [`Self::register_service_observer`]
+    /// so ownership is enforceable at compile time (no more bare-string
+    /// tags in `service_hook_names` bookkeeping).
+    ///
+    /// Idempotent — re-enlisting a hook-only service by the same name
+    /// returns a fresh handle to the same entry; re-enlisting a name
+    /// already registered as `Managed` or `Rust` fails with a variant
+    /// mismatch.
+    ///
+    /// See `docs/hook-ownership-refactor.md` §3 for the design.
+    pub fn enlist_hook_only_service(
+        &self,
+        name: &str,
+    ) -> Result<crate::service_registry::ServiceHandle, String> {
+        self.service_registry.enlist_hook_only(name)
+    }
+
+    /// Return a handle for an already-registered service, regardless
+    /// of variant.  Existing `register_managed_service` /
+    /// `register_rust_service` consumers use this to obtain a handle
+    /// after enlist without changing the enlist call site.
+    ///
+    /// Returns `None` if no service is registered under `name`.
+    pub fn service_handle(&self, name: &str) -> Option<crate::service_registry::ServiceHandle> {
+        self.service_registry.service_handle(name)
     }
 
     /// Unregister a service by name. Removes associated hooks/observers

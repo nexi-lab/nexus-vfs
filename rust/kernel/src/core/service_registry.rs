@@ -42,10 +42,19 @@ pub trait ServiceLifecycle: Send + Sync + std::any::Any {
 // ── ServiceInstance + ServiceEntry ──────────────────────────────────────
 
 /// A registered service instance — either a managed (language-agnostic)
-/// or a Rust trait object.
+/// trait object, a Rust trait object, or a hook-only lifecycle anchor.
+///
+/// Hook-only services (e.g. `services::audit`, planned for the enforced
+/// ownership refactor per `docs/hook-ownership-refactor.md`) have no
+/// RPC surface — they exist in the registry purely so hooks and
+/// observers can name a lifecycle-managed owner.
 pub(crate) enum ServiceInstance {
     Managed(Box<dyn ServiceLifecycle>),
     Rust(Arc<dyn RustService>),
+    /// Lifecycle anchor with no RPC surface.  Enlisted via
+    /// [`ServiceRegistry::enlist_hook_only`]; drained by
+    /// [`ServiceRegistry::unregister`] like any other variant.
+    HookOnly,
 }
 
 impl ServiceInstance {
@@ -53,7 +62,58 @@ impl ServiceInstance {
         match self {
             Self::Managed(lc) => ServiceInstance::Managed(lc.clone_box()),
             Self::Rust(svc) => ServiceInstance::Rust(Arc::clone(svc)),
+            Self::HookOnly => ServiceInstance::HookOnly,
         }
+    }
+}
+
+// ── ServiceHandle ───────────────────────────────────────────────────────
+
+/// Opaque handle to a registered service, issued at enlist time.
+///
+/// Handle-holders can register hooks and observers under the service
+/// via [`Kernel::register_service_hook`](crate::kernel::Kernel::register_service_hook)
+/// / [`Kernel::register_service_observer`](crate::kernel::Kernel::register_service_observer),
+/// with kernel enforcing the owner relationship (unregistering the
+/// service batch-removes every hook and observer registered under
+/// the handle).
+///
+/// The name field is `Arc<String>` so `Clone` is cheap — a single
+/// enlist can hand out many handles for zone-mount auto-wire loops
+/// and other multi-installation patterns.  Cloning does NOT extend
+/// the owner's lifetime; the underlying service is dropped when
+/// [`Kernel::unregister_service`](crate::kernel::Kernel::unregister_service)
+/// runs, regardless of how many handle clones exist.
+///
+/// Constructing a handle from outside this crate is impossible — the
+/// only way to obtain one is through
+/// [`Kernel::enlist_hook_only_service`](crate::kernel::Kernel::enlist_hook_only_service)
+/// or [`Kernel::service_handle`](crate::kernel::Kernel::service_handle),
+/// which route through the registry.
+#[derive(Clone)]
+pub struct ServiceHandle {
+    name: Arc<String>,
+}
+
+impl ServiceHandle {
+    pub(crate) fn new(name: String) -> Self {
+        Self {
+            name: Arc::new(name),
+        }
+    }
+
+    /// Service name this handle references.  Used by dispatch's
+    /// `service_hook_names` / `service_observer_names` bookkeeping to
+    /// key the batch-cleanup path — same string the caller passed at
+    /// enlist time.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl std::fmt::Debug for ServiceHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ServiceHandle").field(&*self.name).finish()
     }
 }
 
@@ -179,6 +239,67 @@ impl ServiceRegistry {
         Ok(())
     }
 
+    /// Enlist a hook-only service.
+    ///
+    /// Idempotent by name — a re-enlist of an existing hook-only
+    /// service returns a fresh handle to the same entry.  Fails if
+    /// the name is already registered as a `Managed` or `Rust`
+    /// service (variant mismatch — hook ownership can only be
+    /// established through this method on a fresh name or an
+    /// existing `HookOnly` entry).
+    ///
+    /// Not auto-started post-bootstrap: hook-only services have no
+    /// start semantics.
+    pub(crate) fn enlist_hook_only(&self, name: &str) -> Result<ServiceHandle, String> {
+        if let Some(existing) = self.services.get(name) {
+            match &existing.instance {
+                ServiceInstance::HookOnly => {
+                    return Ok(ServiceHandle::new(name.to_string()));
+                }
+                ServiceInstance::Managed(_) => {
+                    return Err(format!(
+                        "services: {name:?} already registered as Managed \
+                         (cannot re-enlist as hook-only)"
+                    ));
+                }
+                ServiceInstance::Rust(_) => {
+                    return Err(format!(
+                        "services: {name:?} already registered as Rust \
+                         (cannot re-enlist as hook-only)"
+                    ));
+                }
+            }
+        }
+
+        let entry = ServiceEntry {
+            name: name.to_string(),
+            instance: ServiceInstance::HookOnly,
+            exports: Vec::new(),
+        };
+
+        // See `enlist` — atomic is_new via the insert return value.
+        let is_new = self.services.insert(name.to_string(), entry).is_none();
+        if is_new {
+            self.insertion_order.lock().push(name.to_string());
+        }
+
+        Ok(ServiceHandle::new(name.to_string()))
+    }
+
+    /// Return a handle for an already-registered service, regardless
+    /// of variant (Managed / Rust / HookOnly).  Returns `None` if no
+    /// service is registered under that name.
+    ///
+    /// Existing service consumers (services with `enlist_rust` /
+    /// `enlist` calls) reach for this to obtain a handle post-hoc so
+    /// they can install hooks through the enforced surface without
+    /// changing the enlist call site.
+    pub(crate) fn service_handle(&self, name: &str) -> Option<ServiceHandle> {
+        self.services
+            .get(name)
+            .map(|_| ServiceHandle::new(name.to_string()))
+    }
+
     /// Kernel-internal lookup for managed services, returning a fresh
     /// clone of the `ServiceLifecycle` trait object. Hosts that need
     /// the concrete wrapper type downcast through the `Any`
@@ -186,7 +307,7 @@ impl ServiceRegistry {
     pub(crate) fn lookup_managed(&self, name: &str) -> Option<Box<dyn ServiceLifecycle>> {
         self.services.get(name).and_then(|e| match &e.instance {
             ServiceInstance::Managed(lc) => Some(lc.clone_box()),
-            ServiceInstance::Rust(_) => None,
+            ServiceInstance::Rust(_) | ServiceInstance::HookOnly => None,
         })
     }
 
@@ -195,7 +316,7 @@ impl ServiceRegistry {
     pub(crate) fn lookup_rust(&self, name: &str) -> Option<Arc<dyn RustService>> {
         self.services.get(name).and_then(|e| match &e.instance {
             ServiceInstance::Rust(svc) => Some(Arc::clone(svc)),
-            ServiceInstance::Managed(_) => None,
+            ServiceInstance::Managed(_) | ServiceInstance::HookOnly => None,
         })
     }
 
@@ -324,7 +445,10 @@ impl ServiceRegistry {
         }
     }
 
-    /// Start all services (managed + Rust).
+    /// Start all services (managed + Rust).  Hook-only services have
+    /// no start/stop semantics — they exist purely as an owner
+    /// namespace for hooks/observers — so `start_all` skips them and
+    /// they are not reported in `started`.
     pub(crate) fn start_all(&self, timeout_secs: f64) -> Result<Vec<String>, String> {
         let mut started = Vec::new();
         for name in self.names() {
@@ -332,6 +456,7 @@ impl ServiceRegistry {
                 let result = match &entry.instance {
                     ServiceInstance::Managed(lc) => lc.start(timeout_secs),
                     ServiceInstance::Rust(svc) => svc.start(),
+                    ServiceInstance::HookOnly => continue,
                 };
                 match result {
                     Ok(()) => started.push(name),
@@ -344,7 +469,8 @@ impl ServiceRegistry {
         Ok(started)
     }
 
-    /// Stop all services (reverse order).
+    /// Stop all services (reverse order).  Hook-only services are
+    /// skipped for the same reason as [`Self::start_all`].
     pub(crate) fn stop_all(&self, timeout_secs: f64) -> Result<Vec<String>, String> {
         let mut stopped = Vec::new();
         for name in self.names_reversed() {
@@ -352,6 +478,7 @@ impl ServiceRegistry {
                 let result = match &entry.instance {
                     ServiceInstance::Managed(lc) => lc.stop(timeout_secs),
                     ServiceInstance::Rust(svc) => svc.stop(),
+                    ServiceInstance::HookOnly => continue,
                 };
                 match result {
                     Ok(()) => stopped.push(name),
@@ -390,6 +517,7 @@ impl ServiceRegistry {
                 let type_name = match &entry.instance {
                     ServiceInstance::Managed(lc) => lc.type_name(),
                     ServiceInstance::Rust(svc) => format!("rust::{}", svc.name()),
+                    ServiceInstance::HookOnly => "hook-only".to_string(),
                 };
                 result.push((name, type_name, entry.exports.clone()));
             }
