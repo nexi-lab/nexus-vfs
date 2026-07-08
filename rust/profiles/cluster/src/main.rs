@@ -1331,6 +1331,11 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     // when tailscale is absent, so this call is safe on non-federated
     // dev boxes.
     transport::transport_observer::install(&kernel);
+    tracing::info!(
+        target: "nexusd_cluster",
+        "transport_observer armed — distributed-VFS substrate-path warning \
+         (30s Tailscale poll; TransportPolicy::Warn on Relay/Unknown)"
+    );
 
     // ── Driver-plugin mounts (§10) ───────────────────────────────────
     // Parse `--mount-driver name:zone:vfs-path:config-json` and mount
