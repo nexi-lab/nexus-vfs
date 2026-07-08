@@ -268,6 +268,39 @@ impl Kernel {
             .enlist(name, instance, exports, allow_overwrite)
     }
 
+    /// Enlist a hook-only service — an entry in `ServiceRegistry` that
+    /// exists purely as a lifecycle-managed owner namespace for hooks
+    /// and observers.  Returns the handle callers thread through
+    /// [`Self::register_service_hook`] / [`Self::register_service_observer`]
+    /// so ownership is enforceable at compile time (no more bare-string
+    /// tags in `service_hook_names` bookkeeping).
+    ///
+    /// Idempotent — re-enlisting a hook-only service by the same name
+    /// returns a fresh handle to the same entry; re-enlisting a name
+    /// already registered as `Managed` or `Rust` fails with a variant
+    /// mismatch.
+    ///
+    /// See `docs/hook-ownership-refactor.md` §3 for the design.
+    pub fn enlist_hook_only_service(
+        &self,
+        name: &str,
+    ) -> Result<crate::service_registry::ServiceHandle, String> {
+        self.service_registry.enlist_hook_only(name)
+    }
+
+    /// Return a handle for an already-registered service, regardless
+    /// of variant.  Existing `register_managed_service` /
+    /// `register_rust_service` consumers use this to obtain a handle
+    /// after enlist without changing the enlist call site.
+    ///
+    /// Returns `None` if no service is registered under `name`.
+    pub fn service_handle(
+        &self,
+        name: &str,
+    ) -> Option<crate::service_registry::ServiceHandle> {
+        self.service_registry.service_handle(name)
+    }
+
     /// Unregister a service by name. Removes associated hooks/observers
     /// first (Python `swap_service` unhook step). Returns true if found.
     pub fn unregister_service(&self, name: &str) -> bool {
