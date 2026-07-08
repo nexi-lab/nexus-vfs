@@ -1319,6 +1319,19 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     // the dep graph; kept out of `install_with_kernel` for that reason.
     transport::peer_blob::install(kernel.as_ref());
 
+    // Post-transport substrate observability — dual of the peer-blob
+    // installation just above.  peer_blob is what performs cross-node
+    // fetches; transport_observer classifies which substrate path each
+    // fetch actually took (Tailscale direct vs DERP relay vs unknown)
+    // and warns operators when their bytes traverse a third-party
+    // relay.  Both installed as part of the same transport-tier boot
+    // step so the observer is armed before the first cross-node fetch
+    // can fire.  `install` spawns a background thread that polls
+    // `tailscale status --json` every 30s; the poll silently no-ops
+    // when tailscale is absent, so this call is safe on non-federated
+    // dev boxes.
+    transport::transport_observer::install(&kernel);
+
     // ── Driver-plugin mounts (§10) ───────────────────────────────────
     // Parse `--mount-driver name:zone:vfs-path:config-json` and mount
     // each entry through the kernel's normal mount surface.  Order
