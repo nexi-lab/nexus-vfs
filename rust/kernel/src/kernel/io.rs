@@ -307,6 +307,27 @@ impl Kernel {
                                         bytes = data.len(),
                                         "sys_read fan-out: peer hit"
                                     );
+                                    // Broadcast a `RemoteFetch` event on
+                                    // the fan-out path too — same
+                                    // operator-visible semantics as the
+                                    // `try_remote_fetch` metadata-hit
+                                    // path: bytes crossed a peer's
+                                    // network substrate.  Consumer
+                                    // services (`transport_observer`,
+                                    // audit) subscribe to
+                                    // `FileEventType::RemoteFetch` and
+                                    // would silently miss half the
+                                    // remote-fetch traffic without this
+                                    // dispatch — the cold-first-read
+                                    // path for `sys_readdir`-only-seen
+                                    // files (metadata not yet raft-
+                                    // replicated when the read fires).
+                                    self.emit_remote_fetch_event(
+                                        path,
+                                        peer_addr,
+                                        data.len() as u64,
+                                        None,
+                                    );
                                     return Ok(SysReadResult {
                                         data: Some(data),
                                         post_hook_needed: self
@@ -506,6 +527,48 @@ impl Kernel {
         }
     }
 
+    /// Broadcast a [`FileEventType::RemoteFetch`] event to every
+    /// registered [`MutationObserver`](crate::dispatch::MutationObserver)
+    /// filtering that bit.
+    ///
+    /// Kernel names only the opaque `origin` — substrate semantics
+    /// (Tailscale direct vs relay, S3 bucket, IPFS multihash, …)
+    /// belong to consumer services (e.g. `services::transport_observer`
+    /// / `transport::transport_observer`).
+    ///
+    /// Called from BOTH cross-node byte-fetch paths so consumers get a
+    /// uniform view:
+    ///
+    /// 1. `try_remote_fetch` — metastore hit + local backend miss →
+    ///    dispatch via peer at `entry.last_writer_address`.  Fires
+    ///    with the writer address and the metadata's `content_id`.
+    /// 2. Cold-first-read fan-out — metastore MISS + local backend miss →
+    ///    fan-out across zone peers via `PeerBlobClient::fetch`; the
+    ///    first peer that returns bytes wins.  Fires with the peer
+    ///    address and `content_id = None` (metadata not yet
+    ///    replicated at fetch time).
+    ///
+    /// Without both call sites the observer would silently miss the
+    /// cold-first-read half of remote-fetch traffic — a large share of
+    /// cc-tasks-share style workloads where peer_list_dir-merged
+    /// readdir exposes files whose metadata hasn't been raft-replicated
+    /// to the reader's local sharedzone yet.
+    #[inline]
+    fn emit_remote_fetch_event(
+        &self,
+        path: &str,
+        origin: &str,
+        size: u64,
+        content_id: Option<String>,
+    ) {
+        let mut event =
+            crate::dispatch::FileEvent::new(crate::dispatch::FileEventType::RemoteFetch, path);
+        event.remote_addr = Some(origin.to_string());
+        event.size = Some(size);
+        event.content_id = content_id;
+        self.dispatch_observers(&event);
+    }
+
     /// Federation on-demand content fetch (store-and-forward).
     ///
     /// When local read of a Raft-replicated entry misses,
@@ -596,20 +659,12 @@ impl Kernel {
                 .as_ref()
                 .map(|b| b.write_content(&data, cache_key, ctx, 0));
         }
-        // Broadcast a `RemoteFetch` event to any registered
-        // `MutationObserver` filtering that bit.  Kernel names only the
-        // opaque `origin` — substrate semantics (Tailscale direct vs
-        // relay, S3 bucket, IPFS multihash, …) belong to consumer
-        // services (e.g. `services::transport_observer`).  Fire-and-
-        // forget off the sys_read hot path via the observer thread pool.
-        {
-            let mut event =
-                crate::dispatch::FileEvent::new(crate::dispatch::FileEventType::RemoteFetch, path);
-            event.remote_addr = Some(origin.to_string());
-            event.size = Some(data.len() as u64);
-            event.content_id = entry.content_id.clone();
-            self.dispatch_observers(&event);
-        }
+        // Broadcast a `RemoteFetch` event.  See
+        // `Self::emit_remote_fetch_event` for the operator-visible
+        // contract; the same helper fires from the fan-out path so
+        // both cold-first-read (metadata not-yet-replicated) and
+        // metadata-hit-backend-miss paths surface a uniform event.
+        self.emit_remote_fetch_event(path, origin, data.len() as u64, entry.content_id.clone());
         Ok(SysReadResult {
             data: Some(data),
             post_hook_needed: self.read_hook_count.load(Ordering::Relaxed) > 0,
@@ -4935,6 +4990,393 @@ mod readdir_fanout_tests {
         assert!(
             !names.iter().any(|n| n.contains("should-not-appear")),
             "peer entry NOT merged: {names:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod read_fanout_remote_fetch_event_tests {
+    //! Pin: `sys_read` cold-first-read fan-out MUST fire the
+    //! `FileEventType::RemoteFetch` event when a peer's `client.fetch`
+    //! succeeds — the same operator-visible signal `try_remote_fetch`
+    //! already emits.  Without this, `transport_observer` (and any
+    //! future audit observer subscribing to `RemoteFetch`) silently
+    //! misses the cold-first-read half of remote-fetch traffic, which
+    //! is a large share of `peer_list_dir`-merged readdir workloads
+    //! (cc-tasks-share, and any peer-shared LocalConnector setup where
+    //! metadata is not raft-replicated to the reader before the read
+    //! fires).
+    use crate::abc::object_store::{BackendStat, ObjectStore, StorageError, WriteResult};
+    use crate::dispatch::{FileEvent, FileEventType, MutationObserver};
+    use crate::hal::distributed_coordinator::{
+        ClusterInfo, CoordinatorResult, DistributedCoordinator, ShareInfo,
+    };
+    use crate::hal::peer::PeerBlobClient;
+    use crate::kernel::Kernel;
+    use contracts::OperationContext;
+    use lib::transport_primitives::PeerBlobResult;
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    /// Backend that always reports "not found" — mirrors the state where
+    /// a peer wrote a file, its metadata isn't in the reader's local
+    /// metastore yet, and the reader's own local backend hasn't seen it.
+    #[derive(Default)]
+    struct MissBackend;
+
+    impl ObjectStore for MissBackend {
+        fn name(&self) -> &str {
+            "miss-mock"
+        }
+        fn list_dir(&self, _path: &str) -> Result<Vec<String>, StorageError> {
+            Ok(Vec::new())
+        }
+        fn stat(&self, path: &str) -> Result<BackendStat, StorageError> {
+            Err(StorageError::NotFound(path.to_string()))
+        }
+        fn read_content(
+            &self,
+            content_id: &str,
+            _ctx: &OperationContext,
+        ) -> Result<Vec<u8>, StorageError> {
+            Err(StorageError::NotFound(content_id.to_string()))
+        }
+        fn write_content(
+            &self,
+            _content: &[u8],
+            _content_id: &str,
+            _ctx: &OperationContext,
+            _offset: u64,
+        ) -> Result<WriteResult, StorageError> {
+            Err(StorageError::NotSupported("write_content"))
+        }
+        fn delete_file(&self, _path: &str) -> Result<(), StorageError> {
+            Ok(())
+        }
+        fn get_content_size(&self, _content_id: &str) -> Result<u64, StorageError> {
+            Ok(0)
+        }
+        fn copy_file(&self, _src: &str, _dst: &str) -> Result<WriteResult, StorageError> {
+            Err(StorageError::NotSupported("copy_file"))
+        }
+    }
+
+    /// Coordinator that returns a single fake peer for `zone_peers`.
+    /// Every other trait method is a stub — the fan-out path only needs
+    /// `zone_peers`.
+    struct FakePeerCoord {
+        peer_addr: String,
+    }
+
+    impl DistributedCoordinator for FakePeerCoord {
+        fn zone_peers(&self, _kernel: &Kernel, _zone_id: &str) -> Vec<String> {
+            vec![self.peer_addr.clone()]
+        }
+        fn list_zones(&self, _kernel: &Kernel) -> Vec<String> {
+            Vec::new()
+        }
+        fn cluster_info(&self, _kernel: &Kernel, _zone_id: &str) -> CoordinatorResult<ClusterInfo> {
+            Err("stub".into())
+        }
+        fn create_zone(&self, _kernel: &Kernel, _zone_id: &str) -> CoordinatorResult<()> {
+            Err("stub".into())
+        }
+        fn remove_zone(
+            &self,
+            _kernel: &Kernel,
+            _zone_id: &str,
+            _force: bool,
+        ) -> CoordinatorResult<()> {
+            Err("stub".into())
+        }
+        fn join_zone(
+            &self,
+            _kernel: &Kernel,
+            _zone_id: &str,
+            _as_learner: bool,
+        ) -> CoordinatorResult<()> {
+            Err("stub".into())
+        }
+        fn wire_mount(
+            &self,
+            _kernel: &Kernel,
+            _parent_zone: &str,
+            _mount_path: &str,
+            _target_zone: &str,
+        ) -> CoordinatorResult<()> {
+            Err("stub".into())
+        }
+        fn unwire_mount(
+            &self,
+            _kernel: &Kernel,
+            _parent_zone: &str,
+            _mount_path: &str,
+        ) -> CoordinatorResult<()> {
+            Err("stub".into())
+        }
+        fn share_zone(
+            &self,
+            _kernel: &Kernel,
+            _local_path: &str,
+            _new_zone_id: &str,
+        ) -> CoordinatorResult<ShareInfo> {
+            Err("stub".into())
+        }
+        fn lookup_share(
+            &self,
+            _kernel: &Kernel,
+            _remote_path: &str,
+        ) -> CoordinatorResult<Option<ShareInfo>> {
+            Ok(None)
+        }
+        fn metastore_for_zone(
+            &self,
+            _kernel: &Kernel,
+            _zone_id: &str,
+        ) -> CoordinatorResult<Arc<dyn crate::abc::meta_store::MetaStore>> {
+            Err("stub".into())
+        }
+        fn locks_for_zone(
+            &self,
+            _kernel: &Kernel,
+            _zone_id: &str,
+        ) -> CoordinatorResult<Arc<dyn contracts::lock_state::Locks>> {
+            Err("stub".into())
+        }
+        fn peer_list_dir(
+            &self,
+            _kernel: &Kernel,
+            _target_zone: &str,
+            _peer_path: &str,
+        ) -> Option<Vec<(String, u8)>> {
+            None
+        }
+    }
+
+    /// Peer-blob client that returns a fixed payload for any fetch —
+    /// simulates a peer that has the bytes and delivers them.
+    struct RecordingPeerClient {
+        payload: Vec<u8>,
+        calls: Mutex<Vec<(String, String)>>,
+    }
+
+    impl PeerBlobClient for RecordingPeerClient {
+        fn fetch(&self, addr: &str, content_id: &str) -> PeerBlobResult<Vec<u8>> {
+            self.calls
+                .lock()
+                .push((addr.to_string(), content_id.to_string()));
+            Ok(self.payload.clone())
+        }
+    }
+
+    /// Observer that captures every `FileEvent` it receives — the test
+    /// asserts against these captured events.
+    struct CapturingObserver {
+        events: Mutex<Vec<FileEvent>>,
+    }
+
+    impl MutationObserver for CapturingObserver {
+        fn on_mutation(&self, event: &FileEvent) {
+            self.events.lock().push(event.clone());
+        }
+    }
+
+    #[test]
+    fn fan_out_peer_hit_emits_remote_fetch_event() {
+        // Kernel with a `MissBackend` mounted on a federated zone.  Any
+        // read for a path under `/` will backend-miss, then trigger the
+        // fan-out because the ctx defaults to `propagates_cross_node =
+        // false` (`fan_out_allowed()` == true).
+        let k = Kernel::new();
+        let backend: Arc<dyn ObjectStore> = Arc::new(MissBackend);
+        k.add_mount("/", "sharedzone", Some(backend), None, None, false)
+            .expect("add_mount");
+        k.set_distributed_coordinator(Arc::new(FakePeerCoord {
+            peer_addr: "100.64.0.21:2126".to_string(),
+        }) as Arc<dyn DistributedCoordinator>);
+        let peer_client = Arc::new(RecordingPeerClient {
+            payload: b"peer-served-bytes".to_vec(),
+            calls: Mutex::new(Vec::new()),
+        });
+        k.set_peer_client(Arc::clone(&peer_client) as Arc<dyn PeerBlobClient>);
+
+        let observer = Arc::new(CapturingObserver {
+            events: Mutex::new(Vec::new()),
+        });
+        k.register_observer(
+            Arc::clone(&observer) as Arc<dyn MutationObserver>,
+            "capture-remote-fetch".to_string(),
+            FileEventType::RemoteFetch as u32,
+        );
+
+        // Read a path that only exists on the fake peer.  Cold-first-
+        // read fan-out fires: local metastore misses → local backend
+        // misses → fan_out → peer.fetch succeeds → event dispatched.
+        let ctx = OperationContext::new("test", "sharedzone", true, None, true);
+        let result = crate::abi::KernelAbi::sys_read(&k, "/session-x/cold.json", &ctx, 0, 0)
+            .expect("sys_read fan-out path succeeds");
+        assert_eq!(
+            result.data.expect("data present"),
+            b"peer-served-bytes",
+            "fan-out returns peer-served bytes verbatim",
+        );
+
+        // Peer client saw the fetch call keyed by peer address + full
+        // path (not content_id — metadata isn't in metastore yet).
+        let calls = peer_client.calls.lock();
+        assert_eq!(calls.len(), 1, "peer fetch called exactly once");
+        assert_eq!(calls[0].0, "100.64.0.21:2126", "peer address forwarded");
+        assert_eq!(
+            calls[0].1, "/session-x/cold.json",
+            "cold-path fetch keys on full path (no content_id yet)",
+        );
+
+        // The RemoteFetch event fired with the expected shape.
+        let events = observer.events.lock();
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one RemoteFetch event from fan-out peer hit",
+        );
+        let ev = &events[0];
+        assert_eq!(
+            ev.event_type,
+            FileEventType::RemoteFetch,
+            "event type is RemoteFetch",
+        );
+        assert_eq!(ev.path(), "/session-x/cold.json", "event carries read path");
+        assert_eq!(
+            ev.remote_addr(),
+            Some("100.64.0.21:2126"),
+            "event carries peer address (opaque origin identifier)",
+        );
+        assert_eq!(
+            ev.size(),
+            Some(b"peer-served-bytes".len() as u64),
+            "event carries returned byte count",
+        );
+        assert_eq!(
+            ev.content_id, None,
+            "cold-first-read has no content_id — metadata not yet replicated",
+        );
+    }
+
+    #[test]
+    fn fan_out_no_event_when_no_peers_available() {
+        // Coordinator with empty peers list — no fan-out attempt, no
+        // event.  Guards against firing an event when no cross-node
+        // fetch actually happened.
+        let k = Kernel::new();
+        let backend: Arc<dyn ObjectStore> = Arc::new(MissBackend);
+        k.add_mount("/", "sharedzone", Some(backend), None, None, false)
+            .expect("add_mount");
+        struct NoPeers;
+        impl DistributedCoordinator for NoPeers {
+            fn zone_peers(&self, _kernel: &Kernel, _zone_id: &str) -> Vec<String> {
+                Vec::new()
+            }
+            fn list_zones(&self, _kernel: &Kernel) -> Vec<String> {
+                Vec::new()
+            }
+            fn cluster_info(
+                &self,
+                _kernel: &Kernel,
+                _zone_id: &str,
+            ) -> CoordinatorResult<ClusterInfo> {
+                Err("stub".into())
+            }
+            fn create_zone(&self, _kernel: &Kernel, _zone_id: &str) -> CoordinatorResult<()> {
+                Err("stub".into())
+            }
+            fn remove_zone(
+                &self,
+                _kernel: &Kernel,
+                _zone_id: &str,
+                _force: bool,
+            ) -> CoordinatorResult<()> {
+                Err("stub".into())
+            }
+            fn join_zone(
+                &self,
+                _kernel: &Kernel,
+                _zone_id: &str,
+                _as_learner: bool,
+            ) -> CoordinatorResult<()> {
+                Err("stub".into())
+            }
+            fn wire_mount(
+                &self,
+                _kernel: &Kernel,
+                _parent_zone: &str,
+                _mount_path: &str,
+                _target_zone: &str,
+            ) -> CoordinatorResult<()> {
+                Err("stub".into())
+            }
+            fn unwire_mount(
+                &self,
+                _kernel: &Kernel,
+                _parent_zone: &str,
+                _mount_path: &str,
+            ) -> CoordinatorResult<()> {
+                Err("stub".into())
+            }
+            fn share_zone(
+                &self,
+                _kernel: &Kernel,
+                _local_path: &str,
+                _new_zone_id: &str,
+            ) -> CoordinatorResult<ShareInfo> {
+                Err("stub".into())
+            }
+            fn lookup_share(
+                &self,
+                _kernel: &Kernel,
+                _remote_path: &str,
+            ) -> CoordinatorResult<Option<ShareInfo>> {
+                Ok(None)
+            }
+            fn metastore_for_zone(
+                &self,
+                _kernel: &Kernel,
+                _zone_id: &str,
+            ) -> CoordinatorResult<Arc<dyn crate::abc::meta_store::MetaStore>> {
+                Err("stub".into())
+            }
+            fn locks_for_zone(
+                &self,
+                _kernel: &Kernel,
+                _zone_id: &str,
+            ) -> CoordinatorResult<Arc<dyn contracts::lock_state::Locks>> {
+                Err("stub".into())
+            }
+            fn peer_list_dir(
+                &self,
+                _kernel: &Kernel,
+                _target_zone: &str,
+                _peer_path: &str,
+            ) -> Option<Vec<(String, u8)>> {
+                None
+            }
+        }
+        k.set_distributed_coordinator(Arc::new(NoPeers) as Arc<dyn DistributedCoordinator>);
+
+        let observer = Arc::new(CapturingObserver {
+            events: Mutex::new(Vec::new()),
+        });
+        k.register_observer(
+            Arc::clone(&observer) as Arc<dyn MutationObserver>,
+            "capture-remote-fetch-empty-peers".to_string(),
+            FileEventType::RemoteFetch as u32,
+        );
+
+        // Read — no peers, no fan-out fetch → NotFound + no event.
+        let ctx = OperationContext::new("test", "sharedzone", true, None, true);
+        let read = crate::abi::KernelAbi::sys_read(&k, "/never-existed.json", &ctx, 0, 0);
+        assert!(read.is_err(), "read returns NotFound when no peers");
+        assert!(
+            observer.events.lock().is_empty(),
+            "NO RemoteFetch event when no cross-node fetch happened",
         );
     }
 }
