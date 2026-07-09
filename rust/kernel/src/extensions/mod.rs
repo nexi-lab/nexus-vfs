@@ -19,17 +19,16 @@
 //!
 //! Concrete impls never live here — they live in `rust/backends/` next
 //! to the backend that opts in (e.g. `OpenAIBackend` /
-//! `AnthropicBackend` for `LlmStreamingBackend`, `LocalConnectorBackend`
-//! for `ObserverBackend`).
+//! `AnthropicBackend` for `LlmStreamingBackend`).
 //!
 //! Current members:
 //!
 //! * [`llm_streaming`] — `LlmStreamingBackend`, connector-backend SSE
 //!   streaming (reached via `ObjectStore::as_llm_streaming`).
-//! * [`observer_backend`] — `ObserverBackend`, backends that actively
-//!   sync their authoritative file listing into the metastore (reached
-//!   via `ObjectStore::as_observer`).  See
-//!   `docs/observer-backend-contract.md`.
+//!
+//! Not here: metadata-sync for out-of-band backends is a §4 kernel
+//! primitive (a generic reconcile over `list_dir`/`stat`, which must
+//! cross the dylib C-ABI), not an `as_*` extension trait — it lives in
+//! `crate::core::metadata_sync`.
 
 pub mod llm_streaming;
-pub mod observer_backend;

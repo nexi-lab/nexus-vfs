@@ -18,9 +18,11 @@ pub use contracts::ROOT_ZONE_ID;
 //                           MetaStore / CacheStore). Mandatory trait
 //                           declarations, one file each.
 //   * `crate::extensions` — §3.A.2 opt-in ObjectStore extension traits
-//                           (LlmStreamingBackend, ObserverBackend),
-//                           each reached via an ObjectStore::as_*()
-//                           downcast. Declarations only.
+//                           (LlmStreamingBackend), each reached via an
+//                           ObjectStore::as_*() downcast. Declarations
+//                           only. (Note: capabilities that must cross
+//                           the dylib C-ABI cannot be as_*() downcasts —
+//                           e.g. metadata_sync is a core/ primitive.)
 //   * `crate::hal`        — §3.B Control-Plane HAL DI surfaces
 //                           (DistributedCoordinator, ObjectStoreProvider).
 //   * `crate::core`       — §4 kernel primitives (vfs_router, dlc,

@@ -851,13 +851,6 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     // co-hosted on the same port as the raft gRPC server.
     let kernel = Arc::new(Kernel::new());
 
-    // Record the kernel's own Arc as a weak self-reference so
-    // mount-lifecycle-owned background components (an ObserverBackend's
-    // reconcile thread) can call back into the kernel.  Must run before
-    // any observer-backed mount (`--mount-driver local_connector:…`) is
-    // installed below.
-    kernel.install_self_weak();
-
     // ── Durable metastore (#4343) ─────────────────────────────────
     // `Kernel::new()` boots on a tempfile-backed `LocalMetaStore` —
     // fine for tests and benches, fatal for a server: the namespace
@@ -1529,6 +1522,17 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
             vfs_path = %spec.vfs_path,
             "mounted driver plugin",
         );
+
+        // Passthrough connectors reference a host directory that content
+        // reaches out-of-band (e.g. `cc` writing task JSON directly,
+        // bypassing sys_write). Arm kernel-side metadata sync so the
+        // metastore stays authoritative for that content and peers see it
+        // via raft-replicated `metastore.list`. Gated on the connector
+        // driver — content-owning backends (CAS/S3) publish metadata
+        // through sys_write and don't opt in.
+        if matches!(spec.name.as_str(), "local-connector" | "local_connector") {
+            kernel.arm_metadata_sync(&spec.vfs_path, &spec.zone_id);
+        }
     }
 
     let zm_for_loop = zm.clone();

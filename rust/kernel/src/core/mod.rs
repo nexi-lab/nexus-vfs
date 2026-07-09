@@ -24,6 +24,10 @@ pub mod agents;
 
 // VFS routing + DLC mount lifecycle.
 pub mod dlc;
+// Kernel-side metadata reconcile for out-of-band backends (armed by DLC
+// when a mount opts in). Generic over ObjectStore so it works across the
+// dylib C-ABI — see the module docs.
+pub(crate) mod metadata_sync;
 pub mod vfs_router;
 
 // File-watch waiters + kernel-owned service registry.

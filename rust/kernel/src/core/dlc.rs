@@ -17,7 +17,7 @@
 //! `Kernel::has_mount` (which delegates to the router); listing mount
 //! points goes through `Kernel::get_mount_points`.
 
-use crate::extensions::observer_backend::{ObservationHandle, ObservationSink};
+use crate::core::metadata_sync::MetadataSyncHandle;
 use crate::kernel::{Kernel, KernelError};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -26,82 +26,45 @@ use std::sync::Arc;
 ///
 /// `mount()` / `unmount()` thread mutations into the kernel's owned
 /// tables (`VFSRouter`, per-mount metastore).  The one piece of state it
-/// owns is the set of live [`ObservationHandle`]s for observer-backed
-/// mounts (`LocalConnectorBackend` et al.) — each handle's Drop stops the
-/// backend's reconcile thread, so keying them by canonical mount point
-/// and dropping on `unmount()` ties the reconcile lifetime to the mount.
-/// Created once at `Kernel::new()`.
+/// owns is the set of live [`MetadataSyncHandle`]s for mounts that opted
+/// into kernel-side metadata sync (see [`crate::core::metadata_sync`]) —
+/// each handle's Drop stops the reconcile thread, so keying them by
+/// canonical mount point and dropping on `unmount()` ties the reconcile
+/// lifetime to the mount.  Created once at `Kernel::new()`.
 pub(crate) struct DriverLifecycleCoordinator {
-    observation_handles: parking_lot::Mutex<HashMap<String, ObservationHandle>>,
+    sync_handles: parking_lot::Mutex<HashMap<String, MetadataSyncHandle>>,
 }
 
 impl DriverLifecycleCoordinator {
     pub fn new() -> Self {
         Self {
-            observation_handles: parking_lot::Mutex::new(HashMap::new()),
+            sync_handles: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
-    /// Arm an [`crate::extensions::observer_backend::ObserverBackend`]'s
-    /// eager metastore sync for a freshly-installed mount, if the backend
-    /// implements it.  No-op for non-observer backends (CAS / S3 / path).
-    ///
-    /// Skips arming when the kernel's self-weak is unset (a bare
-    /// `Kernel::new()` without `install_self_weak` — the sink's `propose`
-    /// would no-op anyway, so we don't spawn a useless reconcile thread).
-    /// Errors from `install_observer` (unreadable backend root) are logged
-    /// and swallowed: the mount itself already succeeded, and a failed
-    /// initial walk shouldn't tear it down.
-    fn arm_observer(
+    /// Store the [`MetadataSyncHandle`] for a mount, keyed by canonical
+    /// mount point.  Called by `Kernel::arm_metadata_sync` after it spawns
+    /// the reconcile.  Replacing an existing entry drops the old handle
+    /// (stopping its thread) — re-arming a mount is idempotent.
+    pub(crate) fn store_sync_handle(
         &self,
-        kernel: &Kernel,
         mount_point: &str,
         zone_id: &str,
-        backend: &dyn crate::abc::object_store::ObjectStore,
+        handle: MetadataSyncHandle,
     ) {
-        let Some(observer) = backend.as_observer() else {
-            return;
-        };
-        let weak = kernel.self_weak();
-        if weak.upgrade().is_none() {
-            tracing::debug!(
-                target: "kernel::dlc",
-                mount = mount_point,
-                "ObserverBackend not armed: kernel self-weak unset (bare Kernel without install_self_weak)",
-            );
-            return;
-        }
-        let sink = ObservationSink::new(weak, zone_id.to_string(), mount_point.to_string());
-        match observer.install_observer(sink) {
-            Ok(handle) => {
-                let key = Kernel::canonical_mount_key(mount_point, zone_id);
-                self.observation_handles.lock().insert(key, handle);
-                tracing::info!(
-                    target: "kernel::dlc",
-                    mount = mount_point,
-                    zone = zone_id,
-                    "ObserverBackend armed — metastore kept authoritative for this mount's contents via eager sync",
-                );
-            }
-            Err(e) => {
-                tracing::error!(
-                    target: "kernel::dlc",
-                    mount = mount_point,
-                    "ObserverBackend install_observer failed: {e}",
-                );
-            }
-        }
+        let key = Kernel::canonical_mount_key(mount_point, zone_id);
+        self.sync_handles.lock().insert(key, handle);
     }
 
-    /// Drop the [`ObservationHandle`] for a mount (if armed), stopping its
-    /// reconcile thread.  Idempotent.
-    fn disarm_observer(&self, mount_point: &str, zone_id: &str) {
+    /// Drop the [`MetadataSyncHandle`] for a mount (if armed), stopping
+    /// its reconcile thread.  Idempotent.
+    fn disarm_sync(&self, mount_point: &str, zone_id: &str) {
         let key = Kernel::canonical_mount_key(mount_point, zone_id);
-        if self.observation_handles.lock().remove(&key).is_some() {
+        if self.sync_handles.lock().remove(&key).is_some() {
             tracing::debug!(
                 target: "kernel::dlc",
                 mount = mount_point,
-                "ObserverBackend disarmed on unmount",
+                "metadata sync disarmed on unmount",
             );
         }
     }
@@ -253,11 +216,6 @@ impl DriverLifecycleCoordinator {
         // invalidator on its consensus during construction. DLC stays
         // federation-unaware.
         //
-        // Clone the backend Arc before `add_mount` consumes it so we can
-        // arm the ObserverBackend sync AFTER the mount is confirmed
-        // installed — arming before a failed `add_mount` would leak a
-        // reconcile thread for a mount that never landed.
-        let observer_backend = backend.clone();
         kernel.add_mount(
             mount_point,
             zone_id,
@@ -266,9 +224,11 @@ impl DriverLifecycleCoordinator {
             raft_backend,
             is_external,
         )?;
-        if let Some(backend_arc) = observer_backend {
-            self.arm_observer(kernel, mount_point, zone_id, backend_arc.as_ref());
-        }
+        // Metadata sync (for out-of-band backends) is armed separately by
+        // `Kernel::arm_metadata_sync` — it needs the owning `Arc<Kernel>`
+        // for the reconcile thread's callback, which `DLC.mount` (holding
+        // only `&Kernel`) doesn't have. The cluster boot path arms it for
+        // the mounts that opt in, after this returns.
         Ok(())
     }
 
@@ -332,10 +292,10 @@ impl DriverLifecycleCoordinator {
             }
         }
 
-        // 2. Stop the ObserverBackend reconcile thread (if this mount had
+        // 2. Stop the metadata-sync reconcile thread (if this mount had
         // one) before tearing down the route, so it can't propose against
         // a mount that's going away.
-        self.disarm_observer(mount_point, zone_id);
+        self.disarm_sync(mount_point, zone_id);
 
         // 3. Remove from routing table — the per-mount metastore Arc
         // (with its internal cache) drops with the MountEntry. A row
@@ -354,122 +314,113 @@ impl DriverLifecycleCoordinator {
         Ok(row_existed || route_removed)
     }
 
-    /// Test-only: number of live ObserverBackend handles.  Lets the
-    /// wiring integration test assert arm-on-mount / drop-on-unmount.
+    /// Test-only: number of live metadata-sync handles.  Lets the wiring
+    /// integration test assert arm / drop-on-unmount.
     #[cfg(test)]
-    pub(crate) fn armed_observer_count(&self) -> usize {
-        self.observation_handles.lock().len()
+    pub(crate) fn sync_handle_count(&self) -> usize {
+        self.sync_handles.lock().len()
     }
 }
 
 #[cfg(test)]
-mod observer_wiring_tests {
-    //! Integration test for the ObserverBackend mount wiring: a real
+mod metadata_sync_wiring_tests {
+    //! Integration test for the metadata-sync mount wiring: a real
     //! `Arc<Kernel>` + real `DriverLifecycleCoordinator` + real
-    //! `ObservationSink` + real metastore.  A mock `ObserverBackend`
-    //! whose `install_observer` proposes a fixed listing synchronously
-    //! lets us assert the whole arm path deterministically (no reconcile
-    //! thread timing): DLC.mount → arm_observer → self_weak upgrade →
-    //! sink (mount-prefix join) → `observe_backend_entry` → metastore.
+    //! `MetadataSink` + real metastore, driven through a **plain
+    //! `ObjectStore`** (no trait extension — exactly like a dylib backend
+    //! the kernel sees as an opaque `DylibObjectStore`). Exercises
+    //! `Kernel::arm_metadata_sync` → route lookup → generic walk over
+    //! `list_dir`/`stat` → sink (mount-prefix join) →
+    //! `observe_backend_entry` → metastore.
     //!
-    //! Real user problem: after a node mounts a peer-shared LocalConnector
-    //! over a host dir that already holds tasks, those tasks MUST become
+    //! Real user problem: after a node mounts a peer-shared connector over
+    //! a host dir that already holds tasks, those tasks MUST become
     //! visible in the metastore (so peers see them via raft-replicated
     //! `metastore.list`) without any read/readdir-time cold-discovery.
 
-    use crate::abc::object_store::{ObjectStore, StorageError, WriteResult};
-    use crate::extensions::observer_backend::{
-        ObservationHandle, ObservationSink, ObserverBackend,
-    };
+    use crate::abc::object_store::{BackendStat, ObjectStore, StorageError, WriteResult};
     use crate::kernel::{Kernel, OperationContext};
     use crate::meta_store::{DT_DIR, DT_REG};
     use std::sync::Arc;
 
-    /// Backend that, on `install_observer`, synchronously proposes a
-    /// fixed backend-relative listing through the sink, then returns a
-    /// handle with no background thread — deterministic for assertions.
-    struct MockObserverBackend {
-        entries: Vec<(String, u8, u64)>,
-    }
+    /// Plain ObjectStore exposing a fixed tree via `list_dir`/`stat` —
+    /// no `as_observer`, no trait extension. Stands in for any backend
+    /// (dylib or built-in) the generic walk runs over.
+    struct TreeBackend;
 
-    impl ObjectStore for MockObserverBackend {
+    impl ObjectStore for TreeBackend {
         fn name(&self) -> &str {
-            "mock-observer"
+            "tree-mock"
         }
-        fn as_observer(&self) -> Option<&dyn ObserverBackend> {
-            Some(self)
+        fn list_dir(&self, path: &str) -> Result<Vec<String>, StorageError> {
+            match path {
+                "" => Ok(vec!["a.json".to_string(), "sub/".to_string()]),
+                "sub" => Ok(vec!["b.json".to_string()]),
+                other => Err(StorageError::NotFound(other.to_string())),
+            }
+        }
+        fn stat(&self, path: &str) -> Result<BackendStat, StorageError> {
+            match path {
+                "a.json" => Ok(BackendStat {
+                    size: 5,
+                    is_dir: false,
+                }),
+                "sub/b.json" => Ok(BackendStat {
+                    size: 11,
+                    is_dir: false,
+                }),
+                "sub" => Ok(BackendStat {
+                    size: 0,
+                    is_dir: true,
+                }),
+                other => Err(StorageError::NotFound(other.to_string())),
+            }
         }
         fn write_content(
             &self,
-            _content: &[u8],
-            _content_id: &str,
+            _c: &[u8],
+            _id: &str,
             _ctx: &OperationContext,
-            _offset: u64,
+            _o: u64,
         ) -> Result<WriteResult, StorageError> {
             Err(StorageError::NotSupported("write_content"))
         }
         fn read_content(
             &self,
-            _content_id: &str,
+            _id: &str,
             _ctx: &OperationContext,
         ) -> Result<Vec<u8>, StorageError> {
             Err(StorageError::NotSupported("read_content"))
         }
     }
 
-    impl ObserverBackend for MockObserverBackend {
-        fn install_observer(
-            &self,
-            sink: ObservationSink,
-        ) -> Result<ObservationHandle, crate::extensions::observer_backend::ObservationError>
-        {
-            for (rel, etype, size) in &self.entries {
-                let content_id = if *etype == DT_REG {
-                    Some(rel.clone())
-                } else {
-                    None
-                };
-                sink.propose(rel, *etype, *size, content_id);
-            }
-            let (handle, _rx) = ObservationHandle::new();
-            Ok(handle)
-        }
-    }
-
-    /// Full-workflow: mount an observer backend whose host dir already
-    /// holds `a.json` + `sub/` + `sub/b.json`, assert every entry became
-    /// an authoritative metastore row (correct type, size, content_id),
-    /// then unmount and assert the handle was dropped.
+    /// Full-workflow: mount a plain-ObjectStore connector whose host dir
+    /// already holds `a.json` + `sub/` + `sub/b.json`, arm metadata sync,
+    /// assert every entry became an authoritative metastore row (type,
+    /// size, content_id, prefix-join) via the generic walk, then unmount
+    /// and assert the reconcile handle was dropped.
     #[test]
-    fn mount_arms_observer_and_populates_metastore_then_unmount_disarms() {
-        // Real kernel with its Arc-self-weak installed (the boot step
-        // that lets the sink's kernel weak-ref upgrade).
+    fn arm_metadata_sync_populates_metastore_then_unmount_disarms() {
         let kernel = Arc::new(Kernel::new());
-        kernel.install_self_weak();
+        let backend: Arc<dyn ObjectStore> = Arc::new(TreeBackend);
 
-        let backend = Arc::new(MockObserverBackend {
-            entries: vec![
-                ("a.json".to_string(), DT_REG, 5),
-                ("sub".to_string(), DT_DIR, 0),
-                ("sub/b.json".to_string(), DT_REG, 11),
-            ],
-        });
-
-        // Step 1: mount over the (virtual) host dir at /tasks.  DLC arms
-        // the observer, whose synchronous initial sync proposes the rows.
+        // Step 1: mount the connector at /tasks, then arm metadata sync
+        // (the two-step the cluster boot path performs). Arming runs the
+        // synchronous initial walk over list_dir/stat and proposes rows.
         kernel
             .dlc
             .mount(&kernel, "/tasks", "root", Some(backend), None, None, false)
-            .expect("mount observer backend");
+            .expect("mount connector");
+        kernel.arm_metadata_sync("/tasks", "root");
         assert_eq!(
-            kernel.dlc.armed_observer_count(),
+            kernel.dlc.sync_handle_count(),
             1,
-            "observer armed on mount"
+            "sync armed for the mount"
         );
 
         // Step 2: every backend entry is now an authoritative metastore
-        // row under the mount prefix — this is what a peer's
-        // `metastore.list` would replicate and see.
+        // row under the mount prefix — what a peer's `metastore.list`
+        // replicates and sees.
         let file = kernel
             .metastore_get("/tasks/a.json")
             .expect("metastore_get ok")
@@ -495,43 +446,34 @@ mod observer_wiring_tests {
             .expect("nested sub/b.json row proposed");
         assert_eq!(nested.size, 11, "nested file size + prefix-joined path");
 
-        // Step 3: unmount drops the ObservationHandle (its Drop stops the
-        // reconcile thread in a real backend).
+        // Step 3: unmount drops the MetadataSyncHandle (its Drop stops the
+        // reconcile thread).
         kernel
             .dlc
             .unmount(&kernel, "/tasks", "root")
             .expect("unmount");
         assert_eq!(
-            kernel.dlc.armed_observer_count(),
+            kernel.dlc.sync_handle_count(),
             0,
-            "observer disarmed on unmount"
+            "sync disarmed on unmount"
         );
     }
 
-    /// Without `install_self_weak` (bare `Kernel::new()`), arming is
-    /// skipped — the sink's kernel weak-ref could not upgrade, so we
-    /// don't spawn a useless reconcile thread and propose nothing.
+    /// A mount that is never armed proposes nothing — arming is a
+    /// deliberate per-mount opt-in, off by default.
     #[test]
-    fn mount_without_self_weak_skips_arming() {
+    fn mount_without_arm_proposes_nothing() {
         let kernel = Arc::new(Kernel::new());
-        // NOTE: deliberately NOT calling install_self_weak.
-
-        let backend = Arc::new(MockObserverBackend {
-            entries: vec![("x.json".to_string(), DT_REG, 1)],
-        });
+        let backend: Arc<dyn ObjectStore> = Arc::new(TreeBackend);
         kernel
             .dlc
             .mount(&kernel, "/tasks", "root", Some(backend), None, None, false)
             .expect("mount");
-
-        assert_eq!(
-            kernel.dlc.armed_observer_count(),
-            0,
-            "no handle stored when self-weak is unset"
-        );
+        // Deliberately NOT calling arm_metadata_sync.
+        assert_eq!(kernel.dlc.sync_handle_count(), 0, "no handle without arm");
         assert!(
-            matches!(kernel.metastore_get("/tasks/x.json"), Ok(None)),
-            "no row proposed when arming is skipped"
+            matches!(kernel.metastore_get("/tasks/a.json"), Ok(None)),
+            "no row proposed when the mount is not armed"
         );
     }
 }

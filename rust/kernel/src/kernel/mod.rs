@@ -479,13 +479,6 @@ impl ZoneRevisionEntry {
 ///   - `add_mount(...)` — register mount points.
 ///   - `trie_register(...)` — register path resolvers.
 pub struct Kernel {
-    // Self-reference for background components that must call back into
-    // the kernel from a `'static` context (e.g. an ObserverBackend's
-    // reconcile thread proposing metadata via `ObservationSink`).  Set
-    // once at boot by `install_self_weak` from the owning `Arc<Kernel>`;
-    // empty (`Weak::new()`) in tests that construct a bare `Kernel`, in
-    // which case observer arming is skipped.
-    self_weak: parking_lot::RwLock<std::sync::Weak<Kernel>>,
     // DriverLifecycleCoordinator — owns mount lifecycle (routing + metastore).
     pub(crate) dlc: crate::dlc::DriverLifecycleCoordinator,
     // Mount table — owns backend + per-mount metastore + access flags.
@@ -720,7 +713,6 @@ impl Kernel {
         let boot_metastore = crate::core::meta_store::LocalMetaStore::open(&boot_redb)
             .expect("failed to open kernel boot LocalMetaStore");
         let k = Self {
-            self_weak: parking_lot::RwLock::new(std::sync::Weak::new()),
             dlc: crate::dlc::DriverLifecycleCoordinator::new(),
             vfs_router: Arc::new(VFSRouter::new()),
             trie: Trie::new(),
@@ -840,21 +832,49 @@ impl Kernel {
         self.self_address.read().clone()
     }
 
-    /// Record the kernel's own `Arc` as a weak self-reference so
-    /// background components (an `ObserverBackend`'s reconcile thread)
-    /// can call back into the kernel from a `'static` context.  Call
-    /// once at boot from the owning `Arc<Kernel>`, before any
-    /// observer-backed mount is installed.  Idempotent.
-    pub fn install_self_weak(self: &Arc<Kernel>) {
-        *self.self_weak.write() = Arc::downgrade(self);
-    }
-
-    /// A weak handle to the kernel's own `Arc`, or an unupgradeable
-    /// `Weak` when [`Self::install_self_weak`] was never called (bare
-    /// `Kernel::new()` in tests).  Consumed by the DLC when constructing
-    /// an `ObservationSink`.
-    pub(crate) fn self_weak(&self) -> std::sync::Weak<Kernel> {
-        self.self_weak.read().clone()
+    /// Arm kernel-side metadata sync for a mount whose backend receives
+    /// content out-of-band (see [`crate::core::metadata_sync`]). Looks up
+    /// the mount's backend, spawns the reconcile (synchronous initial
+    /// walk + periodic backstop), and hands the handle to the DLC so it
+    /// drops on unmount. Idempotent — re-arming replaces the prior handle.
+    ///
+    /// Called post-mount by the boot path for the mounts that opt in
+    /// (e.g. a `local-connector` over a host directory). No-op if the
+    /// mount has no local backend (nothing to walk).
+    ///
+    /// Takes `self: &Arc<Kernel>` so the reconcile thread gets a weak
+    /// self-reference (`Arc::downgrade`) to call back through — no ambient
+    /// self-weak slot needed.
+    pub fn arm_metadata_sync(self: &Arc<Kernel>, mount_point: &str, zone_id: &str) {
+        let Some(route) = self.vfs_router.route(mount_point, zone_id) else {
+            tracing::warn!(
+                target: "kernel::metadata_sync",
+                mount = mount_point,
+                "arm_metadata_sync: no route for mount",
+            );
+            return;
+        };
+        let Some(backend) = route.backend else {
+            tracing::debug!(
+                target: "kernel::metadata_sync",
+                mount = mount_point,
+                "arm_metadata_sync: mount has no local backend; nothing to sync",
+            );
+            return;
+        };
+        let sink = crate::core::metadata_sync::MetadataSink::new(
+            Arc::downgrade(self),
+            zone_id.to_string(),
+            mount_point.to_string(),
+        );
+        let handle = crate::core::metadata_sync::arm(backend, sink);
+        self.dlc.store_sync_handle(mount_point, zone_id, handle);
+        tracing::info!(
+            target: "kernel::metadata_sync",
+            mount = mount_point,
+            zone = zone_id,
+            "metadata sync armed — metastore kept authoritative for this mount's contents",
+        );
     }
 
     // ── MetaStore wiring ──────────────────────────────────────────────

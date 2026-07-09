@@ -55,43 +55,49 @@ The contract must be robust against:
 
 ## 3. Contract
 
-### 3.1 The `ObserverBackend` trait
+### 3.1 A kernel-side mechanism, NOT a backend trait
 
-Placed alongside `ObjectStore` in `kernel/src/abc/`:
+> **Design correction (learned from a live test).** An earlier draft
+> modelled this as an `ObserverBackend` trait with an
+> `ObjectStore::as_observer()` downcast. That is **wrong for the
+> production deployment**: `local-connector` is loaded as a **dylib
+> plugin**, so the kernel sees it as an opaque `DylibObjectStore`, and a
+> concrete-type downcast (`as_observer`) cannot cross the dylib C-ABI
+> boundary — it returns `None`, and the sync never arms. The mechanism
+> is instead a **kernel-side generic reconcile** that only calls
+> `ObjectStore::list_dir` + `stat` (which DO cross the C-ABI), so it works
+> uniformly for dylib and built-in backends. It lives in
+> `kernel/src/core/metadata_sync.rs` — a §4 kernel primitive, not an
+> `abc/` or `extensions/` trait.
+
+The pieces:
 
 ```rust
-/// A backend that actively syncs its authoritative file listing into
-/// the metastore. Implementors declare responsibility for keeping
-/// metadata rows for every path they own eventually-consistent with
-/// their underlying storage.
-///
-/// Backends that do NOT implement this trait continue to rely on
-/// content-owning writes (sys_write) publishing metadata directly.
-/// The kernel does not apply lazy observation to either kind.
-pub trait ObserverBackend: ObjectStore {
-    /// Called by the mount driver once at mount install. Consumes an
-    /// `ObservationSink` — the kernel-side channel through which the
-    /// backend proposes metadata rows. Returns an `ObservationHandle`
-    /// whose Drop shuts down watcher and reconciler threads.
-    fn install_observer(
-        &self,
-        sink: ObservationSink,
-    ) -> Result<ObservationHandle, ObservationError>;
-}
+// kernel/src/core/metadata_sync.rs
 
-/// Kernel-side sink. Backend calls `propose(path, kind, size, content_id?)`
-/// for each entry it discovers; kernel proposes a metadata row through
-/// the normal SetMetadata command path (raft-replicated). All calls are
-/// idempotent — kernel does the get-check-then-propose dance.
-pub struct ObservationSink { /* opaque */ }
+/// Kernel-side channel a reconcile pass proposes metadata rows through
+/// (idempotent get-check-then-propose via the SetMetadata command path).
+pub struct MetadataSink { /* Weak<Kernel> + zone + mount_prefix */ }
 
-/// RAII guard. Dropping it shuts down the watcher and reconciler.
-pub struct ObservationHandle { /* opaque */ }
+/// RAII guard; Drop stops the reconcile thread (dropped by the DLC on unmount).
+pub(crate) struct MetadataSyncHandle { /* opaque */ }
+
+/// Generic walk over ANY backend — the same code drives a built-in
+/// backend and a C-ABI-forwarded DylibObjectStore.
+fn collect_backend_listing(backend: &dyn ObjectStore) -> Vec<(path, kind, size)>;
+
+/// Run the initial walk synchronously, then spawn the periodic reconcile.
+pub(crate) fn arm(backend: Arc<dyn ObjectStore>, sink: MetadataSink) -> MetadataSyncHandle;
 ```
 
-### 3.2 Backend responsibilities
+Arming is an explicit per-mount opt-in — `Kernel::arm_metadata_sync(mount_point, zone)`
+(takes `&Arc<Kernel>` so the reconcile thread gets a weak self-ref) — called by
+the boot path after mounting a passthrough connector. Every non-armed mount runs
+none of this code.
 
-An `ObserverBackend` implementor MUST provide **three layers**:
+### 3.2 The reconcile's layers
+
+The kernel-side reconcile provides **three layers**:
 
 **Layer 1: Initial walk (correctness on mount)**
 

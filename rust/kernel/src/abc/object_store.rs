@@ -107,18 +107,6 @@ pub trait ObjectStore: Send + Sync {
         None
     }
 
-    /// Downcast to a metastore-syncing observer backend. Default returns
-    /// `None`. Only backends whose storage can receive content
-    /// out-of-band (e.g. `LocalConnectorBackend` over a host fs that CC
-    /// writes directly) override — they own the responsibility to keep
-    /// the metastore authoritative for their contents via the
-    /// [`crate::extensions::observer_backend::ObserverBackend`] contract.
-    /// `DriverLifecycleCoordinator` calls `install_observer` at mount
-    /// time for any backend that returns `Some`.
-    fn as_observer(&self) -> Option<&dyn crate::extensions::observer_backend::ObserverBackend> {
-        None
-    }
-
     /// Write content to storage and return a `WriteResult`.
     ///
     /// - `content_id`: Target address for the content.
