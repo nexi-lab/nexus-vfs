@@ -70,6 +70,27 @@ jobs:
             fi
           done
 
+          # ── extensions/ — §3.A.2 opt-in ObjectStore ext traits ──
+          # Exactly the extension-trait declaration files + mod.rs.
+          # Each member is reached via an ObjectStore::as_*() downcast;
+          # concrete impls live in backends/, never here.
+          allowed_extensions=("mod.rs" "llm_streaming.rs" "observer_backend.rs")
+          for f in rust/kernel/src/extensions/*.rs; do
+            [ -e "$f" ] || continue
+            base=$(basename "$f")
+            ok=0
+            for a in "${allowed_extensions[@]}"; do
+              [ "$base" = "$a" ] && ok=1 && break
+            done
+            if [ $ok -eq 0 ]; then
+              echo "::error file=$f::Unexpected file in kernel/src/extensions/."
+              echo "extensions/ holds only opt-in §3.A.2 ObjectStore extension-trait declarations (currently: llm_streaming.rs, observer_backend.rs) plus mod.rs."
+              echo "See docs/KERNEL-ARCHITECTURE.md §3.A."
+              echo "Fix: concrete impls belong in backends/ next to the backend that opts in.  A brand-new extension trait requires documenting the §3.A layout list first so it stays the SSOT."
+              FAIL=1
+            fi
+          done
+
           # ── core/ — §4 kernel primitives ────────────────────────
           # Forbid pub items whose names start with a domain prefix
           # that belongs in another tier (federation/, hal/, transport
