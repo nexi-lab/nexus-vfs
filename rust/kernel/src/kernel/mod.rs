@@ -479,6 +479,13 @@ impl ZoneRevisionEntry {
 ///   - `add_mount(...)` — register mount points.
 ///   - `trie_register(...)` — register path resolvers.
 pub struct Kernel {
+    // Self-reference for background components that must call back into
+    // the kernel from a `'static` context (e.g. an ObserverBackend's
+    // reconcile thread proposing metadata via `ObservationSink`).  Set
+    // once at boot by `install_self_weak` from the owning `Arc<Kernel>`;
+    // empty (`Weak::new()`) in tests that construct a bare `Kernel`, in
+    // which case observer arming is skipped.
+    self_weak: parking_lot::RwLock<std::sync::Weak<Kernel>>,
     // DriverLifecycleCoordinator — owns mount lifecycle (routing + metastore).
     pub(crate) dlc: crate::dlc::DriverLifecycleCoordinator,
     // Mount table — owns backend + per-mount metastore + access flags.
@@ -713,6 +720,7 @@ impl Kernel {
         let boot_metastore = crate::core::meta_store::LocalMetaStore::open(&boot_redb)
             .expect("failed to open kernel boot LocalMetaStore");
         let k = Self {
+            self_weak: parking_lot::RwLock::new(std::sync::Weak::new()),
             dlc: crate::dlc::DriverLifecycleCoordinator::new(),
             vfs_router: Arc::new(VFSRouter::new()),
             trie: Trie::new(),
@@ -830,6 +838,23 @@ impl Kernel {
     /// init populates it.
     pub fn self_address_string(&self) -> Option<String> {
         self.self_address.read().clone()
+    }
+
+    /// Record the kernel's own `Arc` as a weak self-reference so
+    /// background components (an `ObserverBackend`'s reconcile thread)
+    /// can call back into the kernel from a `'static` context.  Call
+    /// once at boot from the owning `Arc<Kernel>`, before any
+    /// observer-backed mount is installed.  Idempotent.
+    pub fn install_self_weak(self: &Arc<Kernel>) {
+        *self.self_weak.write() = Arc::downgrade(self);
+    }
+
+    /// A weak handle to the kernel's own `Arc`, or an unupgradeable
+    /// `Weak` when [`Self::install_self_weak`] was never called (bare
+    /// `Kernel::new()` in tests).  Consumed by the DLC when constructing
+    /// an `ObservationSink`.
+    pub(crate) fn self_weak(&self) -> std::sync::Weak<Kernel> {
+        self.self_weak.read().clone()
     }
 
     // ── MetaStore wiring ──────────────────────────────────────────────
@@ -1049,159 +1074,71 @@ impl Kernel {
             return;
         }
 
-        // Idempotency check: skip propose if a metadata row already
-        // covers this path.
-        if matches!(self.metastore_get(path), Ok(Some(_))) {
-            return;
-        }
-
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-
-        let meta = self.build_metadata(
-            path,
-            zone_id,
-            crate::meta_store::DT_REG,
-            size,
-            content_id,
-            /* gen */ 0,
-            /* version */ 1,
-            /* mime_type */ None,
-            /* created_at_ms */ Some(now_ms),
-            /* modified_at_ms */ Some(now_ms),
-        );
-
-        if let Err(e) = self.metastore_put(path, meta) {
-            // Best-effort.  Failure means the next read on this node
-            // still benefits from the backend-fallback path, and the
-            // next peer-served call will retry the propose.  The
-            // alternative — surfacing the error to the read path —
-            // would let a transient raft hiccup convert a successful
-            // read into a failure, which is the wrong trade-off.
-            tracing::warn!(
-                target: "kernel::observe",
-                path = %path,
-                error = ?e,
-                "observe_backend_content: metastore_put failed; metadata not materialized this round",
+        // Delegate the idempotent build-and-propose to the shared
+        // primitive (SSOT for the "materialize a backend entry"
+        // mechanics).  Fire the FileWrite observer event only when a NEW
+        // row was actually proposed, so search-index / audit hooks see
+        // the materialization the same way they see an explicit
+        // sys_write — and don't double-fire on an idempotent re-observe.
+        if self.observe_backend_entry(path, crate::meta_store::DT_REG, zone_id, size, content_id) {
+            self.dispatch_mutation(
+                crate::core::dispatch::FileEventType::FileWrite,
+                path,
+                ctx,
+                |ev| {
+                    ev.size = Some(size);
+                },
             );
-            return;
         }
-
-        // Fire a FileWrite observer event so search-index / audit hooks
-        // see the materialization the same way they see an explicit
-        // sys_write.  Same shape, so downstream consumers stay uniform.
-        self.dispatch_mutation(
-            crate::core::dispatch::FileEventType::FileWrite,
-            path,
-            ctx,
-            |ev| {
-                ev.size = Some(size);
-            },
-        );
     }
 
-    /// Materialize a metastore row for a backend entry seen at readdir
-    /// time — the SSOT-symmetric analogue of [`observe_backend_content`]
-    /// for the directory-listing path.
+    /// Idempotent metadata-row proposal — the SSOT primitive behind
+    /// backend observation.  Both the read-path materialization
+    /// ([`Self::observe_backend_content`], after its cross-node gate) and
+    /// the [`crate::extensions::observer_backend::ObserverBackend`] eager
+    /// sync (via `ObservationSink::propose`) route through here so the
+    /// "build a row for a backend entry" mechanics live in one place.
     ///
-    /// # Contract
+    /// Returns `true` iff a NEW row was proposed (the caller may then
+    /// fire a mutation event); `false` on an idempotent skip or a
+    /// best-effort raft failure.
     ///
-    /// Every backend entry observed by `sys_readdir` (via
-    /// `backend.list_dir`) MUST be reflected in metastore so cross-peer
-    /// readdirs on the same VFS path see the entry via `metastore.list`
-    /// alone — no per-readdir RPC scatter required.  The mechanism is
-    /// identical to `observe_backend_content`'s "backend fallback →
-    /// propose metadata" pattern, applied at the enumeration layer
-    /// rather than the byte-read layer.
+    /// # Not gated on `self_address`
     ///
-    /// Motivating scenario (cc-tasks-share Phase γ-A):
+    /// The old readdir-time helper skipped the propose on single-node
+    /// deployments (no federation ⇒ no cross-peer seeding, and the read
+    /// path's backend fallback covered local reads).  Under the
+    /// ObserverBackend contract the metastore is authoritative for
+    /// cross-node existence, so a node MUST propose regardless of
+    /// federation state.  `last_writer_address` is auto-filled from
+    /// `self_address` by `build_metadata` (None on a single node ⇒ local
+    /// reads hit the row + backend directly; no remote routing needed).
     ///
-    /// 1. Claude Code writes `~/.claude/tasks/<uuid>/1.json` **directly
-    ///    to host fs**, bypassing `sys_write`.  Metastore has no row
-    ///    for this path.
-    /// 2. The operator runs `cc tasks list` on that node — `sys_readdir`
-    ///    fires against the LocalConnector mount.  `backend.list_dir`
-    ///    returns the new UUID.
-    /// 3. Without this hook the entry stays "backend-only" — visible on
-    ///    this node's readdir result but never proposed to metastore,
-    ///    so peers never see it via `metastore.list`.
-    /// 4. With this hook, `observe_backend_readdir_entry` proposes a
-    ///    metadata row with `last_writer_address = self`.  Raft
-    ///    replicates it to peers, and their `sys_readdir` (metastore
-    ///    query step) sees the entry naturally — no new mount type, no
-    ///    scatter RPC, no schema change.  The peer's subsequent
-    ///    `sys_read` on that path routes back to the writer via the
-    ///    existing `try_remote_fetch` → `last_writer_address` fast path
-    ///    landed by PR #98/#99.
+    /// # Idempotency
     ///
-    /// # Difference from `observe_backend_content`
+    /// A row already covering `path` is left untouched — the existing
+    /// row is SSOT for `last_writer_address` routing, and re-proposing
+    /// would reset it.  Concurrent proposers race only on the small
+    /// get→put window; raft serialises the double-propose and the second
+    /// apply is a last-writer-wins no-op against a same-shape row.
     ///
-    /// * **Not gated on `propagates_cross_node`** — cross-peer
-    ///   visibility of the entry is precisely the goal, and local-only
-    ///   `sys_readdir` on a peer-shared mount MUST observe.  The write
-    ///   path's cross-node gate exists to avoid re-proposing metadata
-    ///   the local caller already wrote; that concern doesn't apply
-    ///   to backend directory entries.
-    /// * **`size` MUST reflect the actual file size** — POSIX
-    ///   `read()` / `cat` short-circuit when `stat.st_size == 0`
-    ///   (nothing to read), so stamping `size = 0` on a DT_REG row
-    ///   with real bytes causes the FUSE / gRPC read surface to
-    ///   return empty bytes even though `backend.read_content`
-    ///   would happily serve them.  For DT_REG entries the caller
-    ///   MUST pass the size from `backend.stat` (or an equivalent
-    ///   source); for DT_DIR entries `0` is semantically correct
-    ///   (directories have no byte content to size).  The wire-up
-    ///   in `sys_readdir` calls `backend.stat` on each DT_REG entry
-    ///   before observation and SKIPS observation if the stat fails
-    ///   — leaves the entry to the existing peer-fetch / federation
-    ///   dispatch fallback rather than seeding a bad row.
-    /// * **`content_id` MUST come from the caller** — see the parameter
-    ///   docs below.  Stamping the wrong content_id turns the observed
-    ///   row into a dead-end: writer's own `sys_read` metastore-hit path
-    ///   would then fail with FileNotFound because
-    ///   `backend.read_content(wrong_cid)` can't reach the file.  The
-    ///   correct content_id is the backend-relative path — the same key
-    ///   `sys_read` line ~231 uses when calling
-    ///   `b.read_content(&route.backend_path, ctx)` on metastore miss.
-    /// * **Idempotency via `metastore_get`** — same guard the read-path
-    ///   helper uses; no risk of re-proposing rows already in metastore.
+    /// # `size` / `content_id`
     ///
-    /// # `content_id` semantics
-    ///
-    /// * `None` — for DT_DIR entries (directories carry no byte content;
-    ///   the row exists purely for enumeration).  Any read attempt against
-    ///   a DT_DIR row is a programmer error caught elsewhere.
-    /// * `Some(backend_path)` — for DT_REG entries.  The caller MUST pass
-    ///   the entry's path relative to the backend root, i.e. what
-    ///   `sys_read` would pass to `b.read_content(...)` for this entry.
-    ///   For LocalConnector-mounted paths this is
-    ///   `<route.backend_path>/<entry_name>`.  Any other value stamps a
-    ///   dead-end row; the wire-up in `sys_readdir` computes it inline
-    ///   from the enumeration cursor so callers can't get it wrong.
-    pub(crate) fn observe_backend_readdir_entry(
+    /// `size` MUST be the real byte size for DT_REG rows (POSIX `read()`
+    /// short-circuits on `st_size == 0`); `0` is correct for DT_DIR.
+    /// `content_id` is `Some(backend_relative_path)` for DT_REG (what
+    /// `read_content` resolves) and `None` for DT_DIR.
+    pub(crate) fn observe_backend_entry(
         &self,
         path: &str,
         entry_type: u8,
         zone_id: &str,
         size: u64,
         content_id: Option<String>,
-    ) {
-        // Idempotency: skip propose if a metadata row already covers
-        // this path.  Mirrors observe_backend_content's identical guard.
+    ) -> bool {
+        // Idempotency: never clobber an existing row.
         if matches!(self.metastore_get(path), Ok(Some(_))) {
-            return;
-        }
-
-        // Skip if federation is not wired (self_address unset).  On a
-        // pure single-node deployment there is no cross-peer visibility
-        // to seed and the metastore row would carry
-        // `last_writer_address = None`, defeating the routing the
-        // helper exists to enable.  Same self_address wire-in gate
-        // as build_metadata's auto-fill.
-        if self.self_address.read().is_none() {
-            return;
+            return false;
         }
 
         let now_ms = std::time::SystemTime::now()
@@ -1223,18 +1160,18 @@ impl Kernel {
         );
 
         if let Err(e) = self.metastore_put(path, meta) {
-            // Best-effort — identical trade-off documented on
-            // observe_backend_content.  A transient raft hiccup that
-            // fails to propose one entry doesn't fail the readdir
-            // (which still returns the correct enumeration); the next
-            // readdir on any peer will retry.
+            // Best-effort — a transient raft hiccup must not fail the
+            // read/reconcile that triggered the propose; the next
+            // reconcile tick retries.
             tracing::warn!(
                 target: "kernel::observe",
                 path = %path,
                 error = ?e,
-                "observe_backend_readdir_entry: metastore_put failed; entry not materialized this round",
+                "observe_backend_entry: metastore_put failed; entry not materialized this round",
             );
+            return false;
         }
+        true
     }
 
     // ── MetaStore proxy methods (for Python RustMetastoreProxy) ────────

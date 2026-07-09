@@ -8,13 +8,30 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use kernel::abc::object_store::{BackendStat, ObjectStore, StorageError, WriteResult};
+use kernel::extensions::observer_backend::{
+    ObservationError, ObservationHandle, ObservationSink, ObserverBackend,
+};
+use kernel::meta_store::{DT_DIR, DT_REG};
+
+/// Reconcile cadence — the self-verifying backstop re-walks the backend
+/// this often and re-proposes any entries the metastore is missing.
+/// Additive-only (see `docs/observer-backend-contract.md` §3.3); a
+/// watcher latency-optimization layer can be added later without
+/// changing this correctness floor.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
+/// Shutdown responsiveness — the reconcile loop sleeps in slices this
+/// long so `ObservationHandle::drop` joins promptly instead of waiting
+/// out a full `RECONCILE_INTERVAL`.
+const SHUTDOWN_POLL: Duration = Duration::from_millis(200);
 
 ///
 /// Mounts an external local folder into Nexus. Files remain at original
 /// location (Single Source of Truth). Supports symlink following with
 /// escape detection (resolved path must stay within root).
+#[derive(Clone)]
 pub struct LocalConnectorBackend {
     root_path: PathBuf,
     follow_symlinks: bool,
@@ -77,11 +94,127 @@ impl LocalConnectorBackend {
 
         Ok(resolved)
     }
+
+    /// Enumerate every entry under the backend root, returning
+    /// `(backend_relative_path, entry_type, size)` tuples for the
+    /// ObserverBackend sync.  Reuses the existing `list_dir` / `stat`
+    /// surface so the traversal honours the same symlink policy as
+    /// normal reads.  Best-effort: an unreadable subdirectory is skipped
+    /// rather than aborting the whole walk (the reconcile backstop
+    /// re-attempts it next tick).
+    ///
+    /// `entry_type` is `DT_DIR` for directories (size `0`) and `DT_REG`
+    /// for files (size from `stat`, which POSIX `read()` needs non-zero
+    /// to serve bytes).
+    fn collect_listing(&self) -> Vec<(String, u8, u64)> {
+        let mut out = Vec::new();
+        self.walk_dir("", &mut out);
+        out
+    }
+
+    fn walk_dir(&self, rel: &str, out: &mut Vec<(String, u8, u64)>) {
+        let names = match self.list_dir(rel) {
+            Ok(n) => n,
+            Err(_) => return,
+        };
+        for name in names {
+            let is_dir = name.ends_with('/');
+            let clean = name.trim_end_matches('/');
+            if clean.is_empty() {
+                continue;
+            }
+            let child_rel = if rel.is_empty() {
+                clean.to_string()
+            } else {
+                format!("{rel}/{clean}")
+            };
+            if is_dir {
+                out.push((child_rel.clone(), DT_DIR, 0));
+                self.walk_dir(&child_rel, out);
+            } else {
+                let size = self.stat(&child_rel).map(|s| s.size).unwrap_or(0);
+                out.push((child_rel, DT_REG, size));
+            }
+        }
+    }
+
+    /// Push one full backend listing through the sink.  Idempotent at
+    /// the kernel layer (rows already in the metastore are left
+    /// untouched), so the initial walk and every reconcile tick share
+    /// this path.
+    fn sync_once(entries: &[(String, u8, u64)], sink: &ObservationSink) {
+        for (rel, etype, size) in entries {
+            // DT_REG rows carry the backend-relative path as content_id
+            // (what `read_content` resolves); DT_DIR rows carry none.
+            let content_id = if *etype == DT_REG {
+                Some(rel.clone())
+            } else {
+                None
+            };
+            sink.propose(rel, *etype, *size, content_id);
+        }
+    }
+}
+
+impl ObserverBackend for LocalConnectorBackend {
+    fn install_observer(
+        &self,
+        sink: ObservationSink,
+    ) -> Result<ObservationHandle, ObservationError> {
+        // The root must be enumerable before the mount is declared
+        // ready — a walk failure here is fatal (surfaces as a mount
+        // error).  Nested per-directory failures inside `collect_listing`
+        // stay best-effort (reconcile retries).
+        self.list_dir("").map_err(|e| {
+            ObservationError::Walk(io::Error::other(format!(
+                "local_connector initial walk: {e:?}"
+            )))
+        })?;
+
+        // Layer 1: initial walk — synchronous, seeds every pre-existing
+        // entry before the mount serves reads.
+        Self::sync_once(&self.collect_listing(), &sink);
+
+        // Layer 3: periodic reconciler — the self-verifying backstop.
+        // (Layer 2, the sub-second OS watcher, is a latency optimization
+        // deferred per the design doc; correctness rests on this loop.)
+        let (handle, shutdown) = ObservationHandle::new();
+        let backend = self.clone();
+        std::thread::Builder::new()
+            .name("observer-reconcile".to_string())
+            .spawn(move || {
+                let slices =
+                    (RECONCILE_INTERVAL.as_millis() / SHUTDOWN_POLL.as_millis()).max(1) as u64;
+                loop {
+                    for _ in 0..slices {
+                        std::thread::sleep(SHUTDOWN_POLL);
+                        if *shutdown.borrow() {
+                            return;
+                        }
+                    }
+                    Self::sync_once(&backend.collect_listing(), &sink);
+                }
+            })
+            .map_err(|e| {
+                ObservationError::Watcher(format!("spawn observer-reconcile thread: {e}"))
+            })?;
+
+        Ok(handle)
+    }
 }
 
 impl ObjectStore for LocalConnectorBackend {
     fn name(&self) -> &str {
         "local_connector"
+    }
+
+    /// LocalConnector references a host directory that content can reach
+    /// out-of-band (CC writing task JSON directly, `rsync`, another
+    /// process), so it owns the ObserverBackend contract: keep the
+    /// metastore authoritative for its contents. `DriverLifecycleCoordinator`
+    /// calls `install_observer` at mount time.
+    fn as_observer(&self) -> Option<&dyn ObserverBackend> {
+        Some(self)
     }
 
     fn write_content(
@@ -280,5 +413,113 @@ impl ObjectStore for LocalConnectorBackend {
 
     fn resolve_physical_path(&self, content_id: &str) -> Option<std::path::PathBuf> {
         self.resolve_path(content_id).ok()
+    }
+}
+
+#[cfg(test)]
+mod observer_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn backend(root: &Path) -> LocalConnectorBackend {
+        LocalConnectorBackend::new(
+            root, /* follow_symlinks */ false, /* fsync */ false,
+        )
+        .expect("backend")
+    }
+
+    /// `collect_listing` recurses the whole tree, tagging directories
+    /// DT_DIR (size 0) and files DT_REG with their real byte size, and
+    /// returns backend-relative paths. Real user problem: the initial
+    /// walk must see every pre-existing entry so a peer sees them via
+    /// metastore after a cold restart.
+    #[test]
+    fn collect_listing_recurses_and_tags_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Layout: a.json (file), sub/ (dir), sub/b.json (nested file).
+        fs::write(root.join("a.json"), b"hello").unwrap();
+        fs::create_dir(root.join("sub")).unwrap();
+        fs::write(root.join("sub").join("b.json"), b"nested-body").unwrap();
+
+        let listing = backend(root).collect_listing();
+        let by_path: HashMap<&str, (u8, u64)> = listing
+            .iter()
+            .map(|(p, t, s)| (p.as_str(), (*t, *s)))
+            .collect();
+
+        assert_eq!(
+            by_path.get("a.json"),
+            Some(&(DT_REG, 5)),
+            "file size from stat"
+        );
+        assert_eq!(
+            by_path.get("sub"),
+            Some(&(DT_DIR, 0)),
+            "dir tagged DT_DIR size 0"
+        );
+        assert_eq!(
+            by_path.get("sub/b.json"),
+            Some(&(DT_REG, 11)),
+            "nested file discovered with backend-relative path + real size"
+        );
+        assert_eq!(by_path.len(), 3, "exactly the three entries, no extras");
+    }
+
+    /// An empty backend yields an empty listing (initial walk on a fresh
+    /// mount is a no-op, not an error).
+    #[test]
+    fn collect_listing_empty_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(backend(dir.path()).collect_listing().is_empty());
+    }
+
+    /// `install_observer` on a readable root returns a handle whose Drop
+    /// stops the reconcile thread. Real user problem: unmount must not
+    /// leak the background reconciler. We assert the handle is returned
+    /// (initial walk succeeded against a real dir) and that dropping it
+    /// returns promptly (thread observes shutdown within a poll slice).
+    #[test]
+    fn install_observer_returns_handle_and_shuts_down() {
+        use kernel::extensions::observer_backend::ObservationSink;
+        use std::sync::Weak;
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("x.json"), b"x").unwrap();
+
+        // Kernel-less sink: propose no-ops (Weak upgrade fails), so this
+        // exercises the walk + thread lifecycle without a live kernel.
+        let sink = ObservationSink::new(Weak::new(), "root".to_string(), "/mnt".to_string());
+        let handle = backend(dir.path())
+            .install_observer(sink)
+            .expect("install on readable root");
+
+        // Drop joins the reconcile thread via the shutdown broadcast; if
+        // the loop ignored the signal this test would hang the suite.
+        drop(handle);
+    }
+
+    /// `install_observer` surfaces a fatal error when the root cannot be
+    /// enumerated (mount readiness must not be declared over an
+    /// unreadable backend).
+    #[test]
+    fn install_observer_errors_on_unreadable_root() {
+        use kernel::extensions::observer_backend::{ObservationError, ObservationSink};
+        use std::sync::Weak;
+
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        // Construct a backend whose root vanished after construction by
+        // building against the tempdir then removing it.
+        let be = backend(dir.path());
+        drop(std::fs::remove_dir_all(dir.path()));
+        let _ = missing; // silence unused on platforms that keep the dir
+
+        let sink = ObservationSink::new(Weak::new(), "root".to_string(), "/mnt".to_string());
+        match be.install_observer(sink) {
+            Err(ObservationError::Walk(_)) => {}
+            Err(other) => panic!("expected Walk error on unreadable root, got: {other}"),
+            Ok(_) => panic!("expected Walk error on unreadable root, got Ok(handle)"),
+        }
     }
 }

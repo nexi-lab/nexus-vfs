@@ -851,6 +851,13 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     // co-hosted on the same port as the raft gRPC server.
     let kernel = Arc::new(Kernel::new());
 
+    // Record the kernel's own Arc as a weak self-reference so
+    // mount-lifecycle-owned background components (an ObserverBackend's
+    // reconcile thread) can call back into the kernel.  Must run before
+    // any observer-backed mount (`--mount-driver local_connector:…`) is
+    // installed below.
+    kernel.install_self_weak();
+
     // ── Durable metastore (#4343) ─────────────────────────────────
     // `Kernel::new()` boots on a tempfile-backed `LocalMetaStore` —
     // fine for tests and benches, fatal for a server: the namespace

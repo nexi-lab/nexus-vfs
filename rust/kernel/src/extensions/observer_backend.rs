@@ -83,45 +83,74 @@ pub trait ObserverBackend: ObjectStore {
 pub struct ObservationSink {
     kernel: Weak<crate::kernel::Kernel>,
     zone_id: std::sync::Arc<str>,
+    /// Global VFS path the mount is installed at (e.g. `/shared/cc-tasks`).
+    /// Backends propose in their own backend-relative namespace; the sink
+    /// prefixes with this to form the global path the metastore is keyed
+    /// on.  Empty / `"/"` for a root-mounted backend.
+    mount_prefix: std::sync::Arc<str>,
 }
 
 impl ObservationSink {
     /// Constructed by `DriverLifecycleCoordinator` right before it
     /// hands the sink to `ObserverBackend::install_observer`.
-    // Constructed only from DLC in production (wired in commit 4) and
-    // from unit tests here — the allow silences the "no non-test
-    // caller yet" warning during the scaffolding commit.
-    #[allow(dead_code)]
-    pub(crate) fn new(kernel: Weak<crate::kernel::Kernel>, zone_id: String) -> Self {
+    ///
+    /// * `zone_id` — the mount's zone, stamped on every proposed row.
+    /// * `mount_prefix` — the mount's global VFS path; backend-relative
+    ///   paths from `propose` are joined onto it.
+    ///
+    /// Production caller is the DLC mount path (wired alongside the
+    /// `install_observer` call). Public so a backend author can
+    /// construct a sink to unit-test their `ObserverBackend` impl.
+    pub fn new(kernel: Weak<crate::kernel::Kernel>, zone_id: String, mount_prefix: String) -> Self {
         Self {
             kernel,
             zone_id: zone_id.into(),
+            mount_prefix: mount_prefix.into(),
         }
     }
 
-    /// Propose a metadata row for a backend-owned path.
+    /// Join the mount prefix with a backend-relative path to form the
+    /// global VFS path the metastore is keyed on.  `pub(crate)` so unit
+    /// tests can pin the join rule without a live kernel.
+    pub(crate) fn global_path(&self, backend_rel: &str) -> String {
+        let rel = backend_rel.trim_start_matches('/');
+        let prefix = self.mount_prefix.trim_end_matches('/');
+        if prefix.is_empty() {
+            format!("/{rel}")
+        } else if rel.is_empty() {
+            prefix.to_string()
+        } else {
+            format!("{prefix}/{rel}")
+        }
+    }
+
+    /// Propose a metadata row for a backend-owned entry.
     ///
-    /// * `path` — VFS path (already resolved to the backend's mount
-    ///   perspective; the kernel's mount routing is applied by
-    ///   `metastore_put`).
+    /// * `backend_rel_path` — path RELATIVE to the backend root (what the
+    ///   backend's walk/watch enumerates and what `content_id` addresses).
+    ///   The sink joins it onto the mount prefix to form the global path.
     /// * `entry_type` — `DT_REG` or `DT_DIR` from `crate::meta_store`.
     /// * `size` — content size in bytes.  MUST reflect the actual size
     ///   for DT_REG rows (POSIX `read()` short-circuits on
     ///   `st_size == 0`); `0` is correct for DT_DIR.
-    /// * `content_id` — backend addressing key (see
-    ///   `ObserverBackend` contract in the design doc §3.2).  `None`
-    ///   for DT_DIR entries; `Some(backend_path)` for DT_REG on
+    /// * `content_id` — backend addressing key (see the design doc §3.2).
+    ///   `None` for DT_DIR entries; `Some(backend_rel_path)` for DT_REG on
     ///   passthrough backends.
     ///
-    /// Delegates to [`crate::kernel::Kernel::observe_backend_readdir_entry`]
-    /// today; commit 4 of this PR inlines the propose logic here and
-    /// deletes the kernel-side helper along with the lazy-observation
-    /// chain that called it.
-    pub fn propose(&self, path: &str, entry_type: u8, size: u64, content_id: Option<String>) {
+    /// Best-effort + idempotent — a no-op if the kernel weak ref cannot
+    /// upgrade (teardown in progress).
+    pub fn propose(
+        &self,
+        backend_rel_path: &str,
+        entry_type: u8,
+        size: u64,
+        content_id: Option<String>,
+    ) {
         let Some(kernel) = self.kernel.upgrade() else {
             return;
         };
-        kernel.observe_backend_readdir_entry(path, entry_type, &self.zone_id, size, content_id);
+        let global = self.global_path(backend_rel_path);
+        kernel.observe_backend_entry(&global, entry_type, &self.zone_id, size, content_id);
     }
 
     /// Zone the sink is bound to.  Useful for backend logging that
@@ -246,11 +275,11 @@ mod tests {
     /// backend tasks may still call the sink while kernel is unwinding.
     #[test]
     fn sink_propose_noops_when_kernel_dropped() {
-        let sink = ObservationSink::new(Weak::new(), "root".into());
+        let sink = ObservationSink::new(Weak::new(), "root".into(), "/shared".into());
         // Should not panic; propose returns nothing meaningful to
         // assert on the "kernel gone" branch — this is a "does not
         // crash" pin.
-        sink.propose("/dropped", crate::meta_store::DT_REG, 0, None);
+        sink.propose("dropped", crate::meta_store::DT_REG, 0, None);
     }
 
     /// Sink's `Clone` produces an independent sink pointing at the
@@ -258,9 +287,40 @@ mod tests {
     /// walker/watcher/reconciler.
     #[test]
     fn sink_clone_preserves_zone() {
-        let sink = ObservationSink::new(Weak::new(), "corp-eng".into());
+        let sink = ObservationSink::new(Weak::new(), "corp-eng".into(), "/shared".into());
         let cloned = sink.clone();
         assert_eq!(cloned.zone_id(), "corp-eng");
+    }
+
+    /// `global_path` joins the mount prefix with a backend-relative
+    /// path, tolerating leading/trailing slashes on either side and the
+    /// root-mount (empty prefix) case.
+    #[test]
+    fn sink_global_path_join_rules() {
+        let s = |prefix: &str| ObservationSink::new(Weak::new(), "root".into(), prefix.into());
+
+        // Standard federated mount.
+        assert_eq!(
+            s("/shared/cc-tasks").global_path("a.json"),
+            "/shared/cc-tasks/a.json"
+        );
+        // Backend-relative path with a stray leading slash.
+        assert_eq!(
+            s("/shared/cc-tasks").global_path("/a.json"),
+            "/shared/cc-tasks/a.json"
+        );
+        // Trailing slash on the prefix.
+        assert_eq!(
+            s("/shared/cc-tasks/").global_path("a.json"),
+            "/shared/cc-tasks/a.json"
+        );
+        // Nested backend-relative path.
+        assert_eq!(s("/shared").global_path("d/1.json"), "/shared/d/1.json");
+        // Root mount (empty prefix) — global path is just `/<rel>`.
+        assert_eq!(s("").global_path("a.json"), "/a.json");
+        assert_eq!(s("/").global_path("a.json"), "/a.json");
+        // Directory row: the mount root itself.
+        assert_eq!(s("/shared/cc-tasks").global_path(""), "/shared/cc-tasks");
     }
 
     /// A minimal `ObserverBackend` impl compiles and returns a valid
@@ -304,7 +364,7 @@ mod tests {
         }
 
         let backend = Arc::new(StubBackend);
-        let sink = ObservationSink::new(Weak::new(), "root".into());
+        let sink = ObservationSink::new(Weak::new(), "root".into(), "/mnt".into());
         let handle = backend.install_observer(sink).expect("install");
         drop(handle);
     }
