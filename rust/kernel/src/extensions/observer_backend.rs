@@ -35,11 +35,12 @@ use std::sync::Weak;
 
 use crate::abc::object_store::ObjectStore;
 
-// Placement rationale: this module is an ObjectStore extension hook,
-// not a §3.A storage pillar.  Per `crate::abc::mod`'s doc invariant,
-// `abc/` holds only the three co-equal storage pillars
-// (ObjectStore / MetaStore / CacheStore); extensions like this one
-// live at the crate root alongside `crate::llm_streaming`.
+// Placement rationale: this module is an opt-in ObjectStore extension
+// trait, not a §3.A mandatory storage pillar.  Per `crate::abc::mod`'s
+// doc invariant, `abc/` holds only the three co-equal pillars
+// (ObjectStore / MetaStore / CacheStore); extension traits like this
+// one live in `crate::extensions/` alongside
+// `crate::extensions::llm_streaming`.
 
 /// Extension trait for backends that keep the metastore in sync with
 /// their authoritative storage.  Consumed by
@@ -116,13 +117,7 @@ impl ObservationSink {
     /// today; commit 4 of this PR inlines the propose logic here and
     /// deletes the kernel-side helper along with the lazy-observation
     /// chain that called it.
-    pub fn propose(
-        &self,
-        path: &str,
-        entry_type: u8,
-        size: u64,
-        content_id: Option<String>,
-    ) {
+    pub fn propose(&self, path: &str, entry_type: u8, size: u64, content_id: Option<String>) {
         let Some(kernel) = self.kernel.upgrade() else {
             return;
         };
@@ -199,7 +194,10 @@ impl std::fmt::Display for ObservationError {
         match self {
             Self::Walk(e) => write!(f, "observer initial walk failed: {e}"),
             Self::Stat { path, source } => {
-                write!(f, "observer stat({path}) failed during initial walk: {source}")
+                write!(
+                    f,
+                    "observer stat({path}) failed during initial walk: {source}"
+                )
             }
             Self::Watcher(msg) => write!(f, "observer watcher install failed: {msg}"),
         }

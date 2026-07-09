@@ -1,4 +1,4 @@
-//! `LlmStreamingBackend` — object-safe extension hook on §3.A.2
+//! `LlmStreamingBackend` — object-safe §3.A.2 extension trait on
 //! `ObjectStore`. Connector backends opt in so the kernel's
 //! `Kernel::llm_start_streaming` syscall drives any protocol-specific
 //! SSE pipeline (OpenAI, Anthropic, …).
