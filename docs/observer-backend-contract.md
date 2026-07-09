@@ -227,7 +227,7 @@ self-explanatory rollback checkpoint.
   intent before the implementation.
 
 **Commit 3**: `feat(kernel): ObserverBackend trait + ObservationSink/Handle`
-- `kernel/src/abc/observer_backend.rs` — trait + sink + handle + error
+- `kernel/src/observer_backend.rs` — trait + sink + handle + error
   type.
 - `ObservationSink` implementation wraps the kernel's `SetMetadata`
   command dispatch. Idempotency via `metastore_get` before propose.

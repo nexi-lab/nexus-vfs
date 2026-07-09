@@ -34,6 +34,14 @@ pub mod hal;
 // in `backends/src/transports/api/ai/*`.
 pub mod llm_streaming;
 
+// §3.A.2 ObjectStore extension hook — backends that actively sync
+// their authoritative file listing into the metastore (initial walk +
+// OS-native watcher + periodic reconciler).  Sibling to
+// llm_streaming for the same reason: extends the §3.A ObjectStore
+// pillar without declaring a §3.B HAL DI surface.  Concrete impl
+// (`LocalConnectorBackend`) lives in `backends/src/storage/`.
+pub mod observer_backend;
+
 // ── Flat re-exports of `core::*` ─────────────────────────────────────
 pub(crate) use core::dispatch;
 pub(crate) use core::dlc;
