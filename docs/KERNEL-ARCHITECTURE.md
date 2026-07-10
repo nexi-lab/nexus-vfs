@@ -634,7 +634,8 @@ with them indirectly through syscalls. See §2.2 for per-syscall usage.
 | **FileDescriptorTable** | `rust/kernel/src/core/fdt.rs` | fd table (`task_struct.files`) | Pre-opened fd registry for PAS backends. `sys_write` registers via `ObjectStore::resolve_physical_path()`; `sys_read` fast-path via `libc::pread`; `sys_unlink` removes; `sys_rename` re-keys. CAS/remote backends opt out (trait default `None`) |
 | **FileWatcher + FileEvent** | `rust/kernel/src/core/file_watch.rs` + `core.file_events` (Python dataclass mirror) | `inotify(7)` + `fsnotify_event` | File change notification + immutable mutation records. Local OBSERVE waiters + optional RemoteWatchProtocol. Details in §4.3 |
 | **ServiceRegistry** | `rust/kernel/src/core/service_registry.rs` | `init/main.c` + `module.c` | Kernel-owned symbol table + lifecycle orchestration (enlist/swap/shutdown). BackgroundService + duck-typed hook_spec() |
-| **DriverLifecycleCoordinator** | `rust/kernel/src/core/dlc.rs` + `core.driver_lifecycle_coordinator` (Python unmount-event broadcaster) | `register_filesystem` + `kern_mount` | Rust DLC: routing table + metastore + lock manager upgrade. Apply-side cache coherence is metastore-internal (each `ZoneMetaStore` self-registers an invalidator on its consensus during construction; no kernel-level dcache to keep in sync). Python DLC: brick `on_unmount` event dispatch only |
+| **DriverLifecycleCoordinator** | `rust/kernel/src/core/dlc.rs` + `core.driver_lifecycle_coordinator` (Python unmount-event broadcaster) | `register_filesystem` + `kern_mount` | Rust DLC: routing table + metastore + lock manager upgrade. Also owns the live `MetadataSyncHandle` set (armed mounts, keyed by canonical mount point; dropped on unmount to stop the reconcile thread) and answers `is_sync_armed` for the on-access seed gate. Apply-side cache coherence is metastore-internal (each `ZoneMetaStore` self-registers an invalidator on its consensus during construction; no kernel-level dcache to keep in sync). Python DLC: brick `on_unmount` event dispatch only |
+| **MetadataSync** | `rust/kernel/src/core/metadata_sync.rs` + `Kernel::observe_backend_entry` | NFS attribute / dentry revalidation (`->getattr` refresh, `d_revalidate`) | Keeps the metastore authoritative for a mount whose backend receives content **out-of-band** (a LocalConnector over a host dir written directly, bypassing `sys_write`). One idempotent propose atom fed by three triggers (initial walk / periodic reconcile / on-access seed). Generic over `&dyn ObjectStore` (`list_dir`/`stat`), so it works across the dylib C-ABI. Opt-in per mount via `arm_metadata_sync`. Details in §4.5 |
 | **PermissionGate** | `rust/kernel/src/kernel/dispatch.rs` + `rust/kernel/src/core/permission_cache.rs` | LSM `security_inode_permission` | Kernel permission gate called before NativeInterceptHook dispatch on every `sys_*`. Decision cascade with lease cache (~100-200ns). Details in §2.4.1 |
 | **AgentRegistry** | `rust/kernel/src/core/agents/registry.rs` | Linux `task_struct` table + signal queue | Kernel SSOT for agent lifecycle: PID allocation, parent/child tree, signal semantics (SIGTERM/SIGSTOP/SIGCONT/SIGKILL/SIGUSR1), `AgentState::can_transition_to` validation, per-PID condvar wake-ups. Shared `Arc` exposed to procfs view (`AgentStatusResolver`) — no dual-write. Details in §1 Service Lifecycle |
 | **DT_LINK** | `proto/nexus/core/metadata.proto` (`DT_LINK = 6`) + `FileMetadata.link_target` | `symlink(2)` | Path-internal symlink resolved by `VFSRouter::route()` before reaching the backend. Single-hop redirect with `ELOOP` on chained or self-loop links. Details in §4.4 |
@@ -787,6 +788,59 @@ rejected at `sys_setattr` time.
 - `/proc/{pid}/workspace/chat-with-me` → `/proc/{pid}/chat-with-me` (workspace-anchored mailbox shortcut so agents addressing each other don't have to walk the registry)
 
 See the sudowork integration design doc (`sudowork/docs/tech/nexus-integration-architecture.md`) for the A2A messaging conventions that consume DT_LINK.
+
+### 4.5 MetadataSync — Backend↔Metastore Coherence
+
+Some backends own storage the kernel cannot mediate — a LocalConnector over a
+host directory that `cc` (or `rsync`, or any process) writes to directly,
+bypassing `sys_write`. The metastore must still learn about that content so
+peers see it through raft-replicated `metastore.list` and route to it. Linux
+analogue: **network-FS index revalidation** — an NFS client re-deriving its
+attribute/dentry cache from a backing store that changes outside the client's
+own write path (`->getattr` cache refresh, `d_revalidate`).
+
+The mechanism is **entirely generic**: walk the backend's listing, propose a
+metadata row per entry. It needs only `ObjectStore::list_dir` + `stat`, which
+cross the dylib C-ABI — so it runs kernel-side over `&dyn ObjectStore` and
+works uniformly for built-in and dylib-loaded connectors (an `as_*()` downcast
+would not cross that boundary — see §3.A.2). One idempotent propose atom,
+`Kernel::observe_backend_entry` (never clobbers an existing row, which is SSOT
+for `last_writer_address` routing), is fed by three triggers, each enumerating
+the backend the cheapest way for it:
+
+| Trigger | Fires when | Scope | Role |
+|---------|-----------|-------|------|
+| Initial walk | mount arm time | recursive, whole mount, synchronous | Seed every pre-existing entry before the mount serves peers |
+| Periodic reconcile | every `RECONCILE_INTERVAL` (5s) | recursive, whole mount | Completeness backstop — catches content nothing has listed yet |
+| On-access seed | a `sys_readdir` on an armed mount surfaces a backend child absent from the metastore | that directory's new entries, synchronous | Low-latency path — the row (and its `last_writer`) exists in the same call, no reconcile-interval wait |
+
+**Opt-in.** Whether a mount's backend receives out-of-band content is not
+knowable generically, so arming is a deliberate per-mount opt-in via
+`Kernel::arm_metadata_sync` (the boot path arms `--mount-driver local-connector`
+mounts). Handle lifetime is mount lifetime — the DLC holds the
+`MetadataSyncHandle` and drops it on unmount to stop the reconcile thread. A
+non-armed mount runs none of this: no walk, no thread, and `sys_readdir` skips
+the on-access seed (gated on `DriverLifecycleCoordinator::is_sync_armed`).
+
+Contract + full design: `rust/kernel/src/core/metadata_sync.rs` and
+`docs/observer-backend-contract.md`.
+
+#### 4.5.1 Two coherence layers
+
+The metastore sits between a fast cache and a backing store, and Nexus keeps it
+coherent with each side through a **separate** mechanism — because the two flow
+in opposite directions:
+
+| Layer | Keeps coherent | Direction | Trigger | Mechanism / home |
+|-------|----------------|-----------|---------|------------------|
+| metastore-cache ↔ raft SSOT | the per-zone in-memory metastore projection | **downstream** — follows consensus | raft apply of `SetMetadata`/`DeleteMetadata` | each `ZoneMetaStore` self-registers an invalidator on its consensus (`rust/raft`) |
+| metastore ↔ backend | the metastore index itself | **upstream** — feeds consensus | out-of-band backend change | MetadataSync (`core/metadata_sync.rs`) |
+
+They share the *concept* (coherence), not code. The `raft → kernel` dependency
+boundary and the opposite data-flow directions keep them as distinct primitives
+in distinct crates. This is the classic OS split: **cache-invalidation-on-write**
+(dirty dentry/inode eviction, downstream) versus **cache-revalidation-on-read**
+(NFS `d_revalidate` plus a periodic re-walk, upstream).
 
 ---
 
