@@ -612,6 +612,56 @@ mod metadata_sync_wiring_tests {
         );
     }
 
+    /// Gate-key consistency in the production shape: an armed mount in a
+    /// non-root federation zone under a nested path. The on-access seed's
+    /// gate is `is_sync_armed(route.mount_point)`, which must match the
+    /// canonical key `arm` stored the handle under. Canonicalization is not
+    /// idempotent, so a zone/prefix mismatch here would silently disarm the
+    /// seed and re-open the last_writer regression — yet the other tests
+    /// only exercise the `"root"` zone. This proves the key matches for the
+    /// real `cc-tasks-share` shape (`/shared/cc-tasks/founder` @ sharedzone).
+    #[test]
+    fn armed_readdir_seeds_in_federation_zone_nested_mount() {
+        let kernel = Arc::new(Kernel::new());
+        let backend = Arc::new(MutableFlatBackend::new());
+        let dyn_backend: Arc<dyn ObjectStore> = backend.clone();
+        kernel
+            .dlc
+            .mount(
+                &kernel,
+                "/shared/cc-tasks/founder",
+                "sharedzone",
+                Some(dyn_backend),
+                None,
+                None,
+                false,
+            )
+            .expect("mount federation-zone connector");
+        kernel.arm_metadata_sync("/shared/cc-tasks/founder", "sharedzone");
+        assert_eq!(kernel.dlc.sync_handle_count(), 1, "armed in sharedzone");
+
+        // Out-of-band write, then a readdir on the nested federation-zone
+        // mount must seed it — proving the gate key matched.
+        backend.add("task-1.json", 9);
+        let entries = kernel.sys_readdir("/shared/cc-tasks/founder", "sharedzone", true);
+        assert!(
+            entries
+                .iter()
+                .any(|(p, t)| p == "/shared/cc-tasks/founder/task-1.json" && *t == DT_REG),
+            "readdir surfaces the out-of-band file in the federation zone: {entries:?}"
+        );
+        let row = kernel
+            .metastore_get("/shared/cc-tasks/founder/task-1.json")
+            .expect("metastore_get ok")
+            .expect("row seeded synchronously — gate key matched in federation zone");
+        assert_eq!(row.size, 9);
+        assert_eq!(
+            row.content_id.as_deref(),
+            Some("task-1.json"),
+            "backend-relative content_id, mount-prefix stripped"
+        );
+    }
+
     /// The on-access seed is gated on arming: an un-armed mount still unions
     /// backend content into the readdir result (list-your-writes) but
     /// proposes NO metastore row — every other readdir pays zero seed cost.
