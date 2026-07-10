@@ -95,166 +95,113 @@ Arming is an explicit per-mount opt-in — `Kernel::arm_metadata_sync(mount_poin
 the boot path after mounting a passthrough connector. Every non-armed mount runs
 none of this code.
 
-### 3.2 The reconcile's layers
+### 3.2 The reconcile's triggers
 
-The kernel-side reconcile provides **three layers**:
+The kernel-side mechanism keeps the metastore coherent with the backend
+through **three triggers**, all funnelling into the one idempotent
+propose atom (`Kernel::observe_backend_entry`, which never clobbers an
+existing row — the existing row is SSOT for `last_writer_address`
+routing). Each trigger enumerates the backend the cheapest way for it:
 
-**Layer 1: Initial walk (correctness on mount)**
+**Trigger 1: Initial walk (correctness on mount)**
 
-On `install_observer`, synchronously walk the backend's authoritative
-storage and propose a metadata row for every entry. Runs to completion
-before the mount is considered ready. Closes the "pre-existing files"
-gap.
+On `arm`, synchronously walk the backend's authoritative storage and
+propose a metadata row for every entry. Runs to completion before the
+mount serves peers. Closes the "pre-existing files" gap.
 
-**Layer 2: Real-time watcher (latency)**
+**Trigger 2: On-access seed (latency)**
 
-Spawn an OS-native filesystem watcher on the backend root. For each
-watched event (Create / Modify / Remove / Rename), propose the
-corresponding metadata update through the sink. Sub-second propagation
-in steady state.
+When a `sys_readdir` on an armed mount surfaces a backend child the
+metastore does not yet carry, that child is seeded synchronously in the
+same call — so the row (and its `last_writer`) exists at once, with no
+reconcile-interval wait. This is the low-latency path, analogous to an
+NFS client's `d_revalidate` on lookup. It reuses the backend listing
+`sys_readdir` already fetched for the result union, so it adds a `stat`
+only for genuinely-new entries; already-seeded children cost a single
+map lookup.
 
-**Layer 3: Periodic reconciler (robustness — the safety net)**
+**Trigger 3: Periodic reconcile (robustness — the safety net)**
 
-Spawn a background task that, every `reconcile_interval` (default
-5 min), re-runs the walker and proposes any entries the sink hasn't
-already seen. This covers:
+A background thread re-runs the walk every `RECONCILE_INTERVAL` (default
+5s) and proposes any entries not yet seen. This catches content nothing
+has listed yet (which the on-access seed alone would miss until someone
+reads it) and any class of missed out-of-band change. It makes the
+contract **self-verifying**: correctness never depends on a readdir
+happening.
 
-- Watcher event queue overflow (inotify `IN_Q_OVERFLOW`, FSEvents
-  coalescing, RDCW buffer exhaustion under heavy write bursts).
-- Watcher restart gaps (daemon restart, backend re-init).
-- Any class of missed event we don't yet know about.
+> A sub-second OS-native filesystem watcher (inotify / FSEvents /
+> ReadDirectoryChangesW via the `notify` crate) remains a deferred latency
+> optimisation. The on-access seed already covers the common
+> "read-what-just-appeared" path and the periodic reconcile is the
+> correctness floor, so the watcher is not required for the contract to
+> hold.
 
-The reconciler makes the contract **self-verifying**: correctness does
-not depend on OS event delivery. The watcher is a latency optimisation,
-not a correctness mechanism.
+### 3.3 Scope: additive-only reconciliation
 
-### 3.3 MVP scope: additive-only reconciliation
-
-For the initial implementation, both the walker and the reconciler
-**only propose new metadata**. Deletion (files present in metastore but
-absent from backend) is handled purely by the watcher.
+All three triggers **only propose new metadata**. Deletion (files present
+in the metastore but absent from the backend) is out of scope.
 
 Rationale: a transient backend miss (e.g. temporary NFS mount hiccup,
-symlink target unavailable) must not trigger metadata delete. Deletion
+symlink target unavailable) must not trigger a metadata delete. Deletion
 reconciliation requires N-consecutive-miss confirmation semantics that
 add design complexity without any known correctness gap for
 cc-tasks-share. Deferred to a follow-up if a real need surfaces.
 
-Consequence: a watcher-missed DELETE leaves a stale metastore row.
-Subsequent `sys_read` on the stale path returns a natural `ENOENT` from
-the backend — no data loss, only a visible "ghost" entry until the
-watcher catches up.
+Consequence: a file removed out-of-band leaves a stale metastore row.
+A subsequent `sys_read` on the stale path routes to the backend and
+returns a natural `ENOENT` — no data loss, only a visible "ghost" entry
+until the row is cleared through the normal `sys_unlink` path.
 
 ### 3.4 Kernel changes
 
-No branching in the kernel router — the lazy-observation chain is
-deleted outright (commit 4). After the cut over:
+The lazy read-miss `fan_out` and peer-probe chains are deleted outright
+(commit 4). After the cut over:
 
-- `sys_readdir` returns metastore entries directly. No
-  `observe_backend_readdir_entry` side effect.
+- `sys_readdir` serves entries from the metastore, unioned with the local
+  backend listing for read-your-writes. On an armed mount that union also
+  seeds freshly-discovered out-of-band entries (Trigger 2 above) via the
+  shared `observe_backend_entry` atom — a principled, opt-in-gated seed,
+  not the deleted lazy peer-probe.
 - `sys_read` on a metastore miss returns `ENOENT`. No `fan_out` safety
   net.
-- Backends are responsible for keeping the metastore populated. `ObserverBackend`
-  implementors do it via the three-layer sync described in § 3.2; content-owning
-  backends (S3, CAS, PathLocal) do it via the existing `sys_write` path at
-  content-arrival time. Both patterns publish metadata BEFORE the reader
-  arrives, so no lazy fallback is needed.
+- The metastore is kept populated ahead of readers. Out-of-band backends
+  (LocalConnector) are covered by the three triggers in § 3.2; content-owning
+  backends (S3, CAS, PathLocal) publish metadata via the existing `sys_write`
+  path at content-arrival time. Both publish BEFORE the reader arrives, so no
+  lazy fallback is needed.
 
-## 4. LocalConnector implementation sketch
+## 4. Implementation
 
-`local_connector.rs` grows an `ObserverBackend` impl:
+The mechanism is **kernel-side and generic** — not a backend trait. The
+kernel walks any `&dyn ObjectStore` via `list_dir` + `stat` (which cross the
+dylib C-ABI, unlike an `as_*()` downcast) and proposes rows through the one
+idempotent atom `Kernel::observe_backend_entry`. LocalConnector implements no
+observer trait; it is an ordinary `ObjectStore`.
 
-```rust
-impl ObserverBackend for LocalConnectorBackend {
-    fn install_observer(
-        &self,
-        sink: ObservationSink,
-    ) -> Result<ObservationHandle, ObservationError> {
-        // Layer 1: initial walk (blocks until complete)
-        for entry in walkdir::WalkDir::new(&self.root_path) {
-            let entry = entry.map_err(ObservationError::Walk)?;
-            let virt_path = self.physical_to_virtual(entry.path())?;
-            let stat = entry.metadata().map_err(ObservationError::Stat)?;
-            sink.propose(&virt_path, kind_of(&stat), stat.len(), None);
-        }
+- **Primitive (SSOT):** `rust/kernel/src/core/metadata_sync.rs` — the
+  `MetadataSink`, the recursive `collect_backend_listing` walk, `arm` (initial
+  walk + periodic reconcile thread), and the `MetadataSyncHandle` RAII guard.
+- **Atom:** `Kernel::observe_backend_entry` (`rust/kernel/src/kernel/mod.rs`) —
+  builds the row, stamps `last_writer_address`, proposes, idempotent.
+- **On-access seed:** `Kernel::sys_readdir` (`rust/kernel/src/kernel/io.rs`),
+  gated on `DriverLifecycleCoordinator::is_sync_armed`.
+- **Opt-in + lifetime:** `Kernel::arm_metadata_sync` arms a mount; the DLC
+  holds the handle and drops it on unmount.
+- **Architecture context + coherence taxonomy:** `KERNEL-ARCHITECTURE.md` §4.5.
 
-        // Layer 2 + 3: watcher and reconciler on shared shutdown token
-        let shutdown = ShutdownToken::new();
-        let watcher = spawn_watcher(&self.root_path, sink.clone(), shutdown.clone())?;
-        let reconciler = spawn_reconciler(
-            self.clone(),
-            sink,
-            Duration::from_secs(300),
-            shutdown.clone(),
-        );
+Symlink policy honours the backend's own `follow_symlinks` behaviour — the
+walk consults `list_dir`/`stat`, so there is no separate walker to diverge.
 
-        Ok(ObservationHandle::new(shutdown, watcher, reconciler))
-    }
-}
-```
+## 5. Status
 
-Dependencies:
-- `notify` crate (cross-platform inotify / FSEvents / ReadDirectoryChangesW).
-  New dep on `nexus-vfs/rust/backends/`.
-- `walkdir` crate (recursive walk with symlink policy). Already a
-  transitive dep — confirm before writing the PR.
-
-Threading:
-- One dedicated OS thread per mount for the watcher event loop (owned
-  by `notify`).
-- One tokio task per mount for the reconciler loop (interval-driven).
-- `ObservationHandle::drop` sends shutdown, joins both.
-
-Symlink policy: honours the existing `follow_symlinks` field. Walker
-and watcher both respect it uniformly (no divergence between initial
-walk and steady-state watcher).
-
-## 5. Migration plan
-
-**No external users of LocalConnector today** — its only live consumer
-is cc-tasks-share, developed and operated by the same team writing this
-contract. That means we don't owe anyone a gradual migration, a
-deprecation cycle, or dual-path compatibility. We cut over: the new
-contract goes in and the old lazy-observation chain comes out in the
-same PR. Nothing outside this repo depends on the old behaviour.
-
-**One PR, four granular commits**, dependency-ordered. Per
-`feedback_single_pr_many_commits`, big multi-phase efforts stay on one
-PR so the whole contract change lands atomically. Per
-`feedback_small_commits_per_concern`, each commit is a
-self-explanatory rollback checkpoint.
-
-**Commit 1**: `revert(#131): remove fan_out RemoteFetch event dispatch`
-- Small clean checkpoint. The fan-out path itself is removed in
-  commit 4.
-
-**Commit 2**: `docs(architecture): observer-backend-contract design`
-- This document. Merged early in the PR history so reviewers see the
-  intent before the implementation.
-
-**Commit 3**: `feat(kernel): ObserverBackend trait + ObservationSink/Handle`
-- `kernel/src/extensions/observer_backend.rs` — trait + sink + handle + error
-  type.
-- `ObservationSink` implementation wraps the kernel's `SetMetadata`
-  command dispatch. Idempotency via `metastore_get` before propose.
-- Unit tests: sink dedupes duplicate proposes; handle Drop shuts down
-  cleanly.
-- No behavioural change yet — no backend implements the trait.
-
-**Commit 4**: `feat: LocalConnector cut over to ObserverBackend, delete lazy-observation chain`
-- Add `walkdir` (if not already transitive) + `notify` to
-  `backends/Cargo.toml`.
-- `LocalConnectorBackend` implements `ObserverBackend` with initial
-  walk + watcher + reconciler.
-- `DriverLifecycleCoordinator` calls `install_observer` on mount;
-  stores handle for unmount cleanup.
-- Kernel router `sys_readdir` and `sys_read` no longer branch on
-  observation — metastore is trusted as SSOT for existence.
-- Delete `observe_backend_readdir_entry` and its four unit tests.
-- Delete `fan_out` from `sys_read` and any residual dead-code paths.
-- `try_remote_fetch` stays — it's the deterministic
-  last-writer-address routing path, unaffected.
-- Docker-based E2E (§ 6) gates PR merge on this commit's final state.
+Landed. LocalConnector cut over to the kernel-side `metadata_sync` primitive;
+the lazy read-miss `fan_out` and the `observe_backend_readdir_entry`
+peer-probe chains were deleted. `try_remote_fetch` stays — it is the
+deterministic last-writer-address routing path, unaffected. The on-access
+seed (§3.2 Trigger 2) restored synchronous per-readdir materialisation after
+the initial cutover moved it to the async reconcile, so a peer sees
+out-of-band content with `last_writer` stamped in one hop. Docker-based E2E
+(§6) guards the behaviour.
 
 Everything after this commit is the new contract; nothing straddles
 old and new. Reviewers can walk commit-by-commit or read the final

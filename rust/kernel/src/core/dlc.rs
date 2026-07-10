@@ -56,6 +56,23 @@ impl DriverLifecycleCoordinator {
         self.sync_handles.lock().insert(key, handle);
     }
 
+    /// Whether the mount identified by `canonical_mount_key` has metadata
+    /// sync armed.
+    ///
+    /// `sys_readdir` gates its synchronous on-access seeding (the third
+    /// trigger of [`crate::core::metadata_sync`], alongside the initial
+    /// walk and the periodic reconcile) on this, so only opted-in mounts —
+    /// backends that receive content out-of-band — pay the seed cost; every
+    /// other readdir skips it entirely (no stat, no propose).
+    ///
+    /// Takes the already-canonical key (`RouteResult.mount_point`)
+    /// directly. Callers MUST NOT re-run [`Kernel::canonical_mount_key`] on
+    /// it — canonicalization is not idempotent (it would prepend the zone a
+    /// second time), and the handle map is keyed on exactly this form.
+    pub(crate) fn is_sync_armed(&self, canonical_mount_key: &str) -> bool {
+        self.sync_handles.lock().contains_key(canonical_mount_key)
+    }
+
     /// Drop the [`MetadataSyncHandle`] for a mount (if armed), stopping
     /// its reconcile thread.  Idempotent.
     fn disarm_sync(&self, mount_point: &str, zone_id: &str) {
@@ -474,6 +491,208 @@ mod metadata_sync_wiring_tests {
         assert!(
             matches!(kernel.metastore_get("/tasks/a.json"), Ok(None)),
             "no row proposed when the mount is not armed"
+        );
+    }
+
+    /// Flat ObjectStore whose listing can grow AFTER arm — models a
+    /// LocalConnector receiving out-of-band writes while mounted. Lets the
+    /// on-access seed be tested in isolation from the initial walk, which
+    /// sees an empty backend at arm time and seeds nothing.
+    struct MutableFlatBackend {
+        files: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    }
+
+    impl MutableFlatBackend {
+        fn new() -> Self {
+            Self {
+                files: std::sync::Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+        /// Simulate an out-of-band write landing directly in the backend,
+        /// bypassing `sys_write`.
+        fn add(&self, name: &str, size: u64) {
+            self.files.lock().unwrap().insert(name.to_string(), size);
+        }
+    }
+
+    impl ObjectStore for MutableFlatBackend {
+        fn name(&self) -> &str {
+            "mutable-flat-mock"
+        }
+        fn list_dir(&self, path: &str) -> Result<Vec<String>, StorageError> {
+            if path.is_empty() {
+                Ok(self.files.lock().unwrap().keys().cloned().collect())
+            } else {
+                Err(StorageError::NotFound(path.to_string()))
+            }
+        }
+        fn stat(&self, path: &str) -> Result<BackendStat, StorageError> {
+            self.files
+                .lock()
+                .unwrap()
+                .get(path)
+                .map(|&size| BackendStat {
+                    size,
+                    is_dir: false,
+                })
+                .ok_or_else(|| StorageError::NotFound(path.to_string()))
+        }
+        fn write_content(
+            &self,
+            _c: &[u8],
+            _id: &str,
+            _ctx: &OperationContext,
+            _o: u64,
+        ) -> Result<WriteResult, StorageError> {
+            Err(StorageError::NotSupported("write_content"))
+        }
+        fn read_content(
+            &self,
+            _id: &str,
+            _ctx: &OperationContext,
+        ) -> Result<Vec<u8>, StorageError> {
+            Err(StorageError::NotSupported("read_content"))
+        }
+    }
+
+    /// On-access seed (metadata-sync trigger 3): a `sys_readdir` on an armed
+    /// mount that surfaces a backend child the metastore does not yet carry
+    /// materialises its authoritative row synchronously, in the same call —
+    /// no wait for the reconcile interval. This is the regression the
+    /// cc-tasks-share E2E's `last_writer`-at-once assertion depends on.
+    #[test]
+    fn armed_readdir_seeds_out_of_band_entry_synchronously() {
+        let kernel = Arc::new(Kernel::new());
+        let backend = Arc::new(MutableFlatBackend::new());
+        let dyn_backend: Arc<dyn ObjectStore> = backend.clone();
+        kernel
+            .dlc
+            .mount(
+                &kernel,
+                "/tasks",
+                "root",
+                Some(dyn_backend),
+                None,
+                None,
+                false,
+            )
+            .expect("mount");
+        kernel.arm_metadata_sync("/tasks", "root");
+        // Initial walk saw an empty backend — nothing seeded yet.
+        assert!(
+            matches!(kernel.metastore_get("/tasks/a.json"), Ok(None)),
+            "empty at arm time"
+        );
+
+        // Out-of-band write lands directly in the backend after arm.
+        backend.add("a.json", 7);
+
+        // A readdir on the armed mount discovers it and seeds the row in
+        // the same call.
+        let entries = kernel.sys_readdir("/tasks", "root", true);
+        assert!(
+            entries
+                .iter()
+                .any(|(p, t)| p == "/tasks/a.json" && *t == DT_REG),
+            "readdir surfaces the out-of-band file: {entries:?}"
+        );
+        let row = kernel
+            .metastore_get("/tasks/a.json")
+            .expect("metastore_get ok")
+            .expect("row seeded synchronously by readdir");
+        assert_eq!(row.entry_type, DT_REG);
+        assert_eq!(
+            row.size, 7,
+            "real backend size stamped (POSIX read short-circuits on 0)"
+        );
+        assert_eq!(
+            row.content_id.as_deref(),
+            Some("a.json"),
+            "backend-relative content_id, identical to the reconcile walk's row"
+        );
+    }
+
+    /// Gate-key consistency in the production shape: an armed mount in a
+    /// non-root federation zone under a nested path. The on-access seed's
+    /// gate is `is_sync_armed(route.mount_point)`, which must match the
+    /// canonical key `arm` stored the handle under. Canonicalization is not
+    /// idempotent, so a zone/prefix mismatch here would silently disarm the
+    /// seed and re-open the last_writer regression — yet the other tests
+    /// only exercise the `"root"` zone. This proves the key matches for the
+    /// real `cc-tasks-share` shape (`/shared/cc-tasks/founder` @ sharedzone).
+    #[test]
+    fn armed_readdir_seeds_in_federation_zone_nested_mount() {
+        let kernel = Arc::new(Kernel::new());
+        let backend = Arc::new(MutableFlatBackend::new());
+        let dyn_backend: Arc<dyn ObjectStore> = backend.clone();
+        kernel
+            .dlc
+            .mount(
+                &kernel,
+                "/shared/cc-tasks/founder",
+                "sharedzone",
+                Some(dyn_backend),
+                None,
+                None,
+                false,
+            )
+            .expect("mount federation-zone connector");
+        kernel.arm_metadata_sync("/shared/cc-tasks/founder", "sharedzone");
+        assert_eq!(kernel.dlc.sync_handle_count(), 1, "armed in sharedzone");
+
+        // Out-of-band write, then a readdir on the nested federation-zone
+        // mount must seed it — proving the gate key matched.
+        backend.add("task-1.json", 9);
+        let entries = kernel.sys_readdir("/shared/cc-tasks/founder", "sharedzone", true);
+        assert!(
+            entries
+                .iter()
+                .any(|(p, t)| p == "/shared/cc-tasks/founder/task-1.json" && *t == DT_REG),
+            "readdir surfaces the out-of-band file in the federation zone: {entries:?}"
+        );
+        let row = kernel
+            .metastore_get("/shared/cc-tasks/founder/task-1.json")
+            .expect("metastore_get ok")
+            .expect("row seeded synchronously — gate key matched in federation zone");
+        assert_eq!(row.size, 9);
+        assert_eq!(
+            row.content_id.as_deref(),
+            Some("task-1.json"),
+            "backend-relative content_id, mount-prefix stripped"
+        );
+    }
+
+    /// The on-access seed is gated on arming: an un-armed mount still unions
+    /// backend content into the readdir result (list-your-writes) but
+    /// proposes NO metastore row — every other readdir pays zero seed cost.
+    #[test]
+    fn unarmed_readdir_unions_but_does_not_seed() {
+        let kernel = Arc::new(Kernel::new());
+        let backend = Arc::new(MutableFlatBackend::new());
+        let dyn_backend: Arc<dyn ObjectStore> = backend.clone();
+        kernel
+            .dlc
+            .mount(
+                &kernel,
+                "/tasks",
+                "root",
+                Some(dyn_backend),
+                None,
+                None,
+                false,
+            )
+            .expect("mount");
+        // Deliberately NOT armed.
+        backend.add("a.json", 7);
+
+        let entries = kernel.sys_readdir("/tasks", "root", true);
+        assert!(
+            entries.iter().any(|(p, _)| p == "/tasks/a.json"),
+            "readdir still unions backend content for list-your-writes: {entries:?}"
+        );
+        assert!(
+            matches!(kernel.metastore_get("/tasks/a.json"), Ok(None)),
+            "no row seeded when the mount is not armed"
         );
     }
 }
