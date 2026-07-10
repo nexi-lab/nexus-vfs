@@ -121,19 +121,6 @@ impl Kernel {
         if reqs.is_empty() {
             return Vec::new();
         }
-        // TEMP DIAGNOSTIC (remove before merge): confirm whether a joiner's
-        // FUSE read actually enters the kernel read path, and single vs batch.
-        // A cross-node fetch that reaches sys_read MUST flow through
-        // sys_read_after_auth -> try_remote_fetch (the RemoteFetch emitter);
-        // if THIS logs on the joiner but the dispatch log does not, the miss
-        // is inside the kernel; if THIS never logs, the bytes are arriving
-        // without entering the kernel read (NFS/FUSE-T layer or another node).
-        tracing::info!(
-            target: "kernel::observe",
-            n = reqs.len(),
-            first = %reqs[0].path,
-            "sys_read entry (diagnostic)",
-        );
         if reqs.len() == 1 {
             let req = &reqs[0];
             return vec![self.sys_read_single(&req.path, ctx, 1, req.timeout_ms, req.offset)];
@@ -215,6 +202,13 @@ impl Kernel {
         offset: u64,
     ) -> Result<SysReadResult, KernelError> {
         let not_found = || KernelError::FileNotFound(path.to_string());
+
+        // TEMP DIAGNOSTIC (remove before merge): this is the function the FUSE
+        // C-ABI trampoline (`kernel_cb_sys_read` -> `sys_read_single`) actually
+        // reaches. If this logs on the joiner but `read content decision` shows
+        // has_content=true for a file that was NOT on local disk, `read_content`
+        // is succeeding anomalously (the bytes are already local by read time).
+        tracing::info!(target: "kernel::observe", path = %path, "sys_read_after_auth entry (diag)");
 
         // 2. Route (pure Rust LPM)
         let route = match self.vfs_router.route(path, &ctx.zone_id) {
@@ -442,6 +436,19 @@ impl Kernel {
 
         // 6. Release VFS lock (always, even on miss)
         self.lock_manager.do_release(lock_handle);
+
+        // TEMP DIAGNOSTIC (remove before merge): has_content=Some → local hit
+        // (returns now, NO try_remote_fetch, NO RemoteFetch); None → falls to
+        // try_remote_fetch. This is the branch that decides whether the
+        // observer ever sees the fetch.
+        tracing::info!(
+            target: "kernel::observe",
+            path = %path,
+            has_content = content.is_some(),
+            fed_cache_read = federation_cache_substitution_read,
+            backend_some = route.backend.is_some(),
+            "read content decision (diag)",
+        );
 
         // 7. Return result
         match content {
