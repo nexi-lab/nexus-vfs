@@ -99,14 +99,14 @@ fn compute_trusted_keys(local_dir: Option<&Path>) -> Vec<VerifyingKey> {
             .unwrap_or_else(|e| panic!("{LOCAL_TRUSTED_KEYS_ENV}={} unusable: {e}", dir.display()));
         if extra.is_empty() {
             tracing::warn!(
-                target: "kernel.trust",
+                target: "kernel::trust",
                 dir = %dir.display(),
                 "DEV-ONLY: {} set but no *.pub files found in directory",
                 LOCAL_TRUSTED_KEYS_ENV,
             );
         } else {
             tracing::warn!(
-                target: "kernel.trust",
+                target: "kernel::trust",
                 count = extra.len(),
                 dir = %dir.display(),
                 "DEV-ONLY: loaded {} additional trust root(s) from {}",
