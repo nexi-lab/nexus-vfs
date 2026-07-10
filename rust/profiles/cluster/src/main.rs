@@ -2061,22 +2061,38 @@ fn run_doctor(data_dir: &std::path::Path, zone_filter: Option<&str>) -> Result<(
 /// `write()` syscall; at high log frequency that can stall enough workers
 /// to starve the gRPC server's accept/handshake path. Decoupling the I/O
 /// keeps the runtime responsive regardless of log volume.
-/// Tracing filter applied when `RUST_LOG` is unset.
+/// Operational-verbosity base for the tracing filter applied when
+/// `RUST_LOG` is unset. This carries only the daemon's own routine
+/// chatter levels — it deliberately says nothing about *criticality*.
 ///
-/// `transport_observer=warn` is load-bearing, not decoration: the
-/// transport-observer's relay data-privacy caution is a WARN under the
-/// `transport_observer` target. Without this directive the default (targets not
-/// matched → ERROR) drops it, so an operator who never sets RUST_LOG would NEVER
-/// see "your data traversed a relay" — silently defeating the whole privacy
-/// signal. The `default_filter_admits_transport_observer_warn` test guards it.
-const DEFAULT_LOG_FILTER: &str = "nexusd_cluster=info,nexus_raft=info,transport_observer=warn";
+/// Privacy/audit-critical targets (which the default filter would
+/// otherwise drop to ERROR and silently swallow) are declared once in
+/// [`contracts::constants::PRIVACY_CRITICAL_LOG_TARGETS`] and folded on
+/// top by [`default_log_filter`]. Adding another critical target is a
+/// one-line change *there*, not here — the composition root never names
+/// which target is privacy-critical.
+const DEFAULT_LOG_FILTER_BASE: &str = "nexusd_cluster=info,nexus_raft=info";
+
+/// The effective default filter: [`DEFAULT_LOG_FILTER_BASE`] with every
+/// privacy-critical target directive folded on top. Built at startup
+/// assembly time (criticality is compile-time, so perf is irrelevant).
+/// The `default_filter_admits_transport_observer_warn` test guards that
+/// the transport-observer's relay WARN survives the result.
+fn default_log_filter() -> String {
+    let mut filter = String::from(DEFAULT_LOG_FILTER_BASE);
+    for critical in contracts::constants::PRIVACY_CRITICAL_LOG_TARGETS {
+        filter.push(',');
+        filter.push_str(&critical.directive());
+    }
+    filter
+}
 
 fn install_tracing() -> tracing_appender::non_blocking::WorkerGuard {
     let (non_blocking, guard) = tracing_appender::non_blocking(std::io::stdout());
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_LOG_FILTER)),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_log_filter())),
         )
         .with_writer(non_blocking)
         .init();
@@ -2334,15 +2350,24 @@ mod tests {
             }
         }
 
+        // Local copy for the runtime assertion comparisons below. The
+        // `target:` positions in the macros must stay a const path (tracing
+        // builds each callsite's metadata in a `static`), so they reference
+        // the const directly rather than this binding.
+        let target = contracts::constants::TRANSPORT_OBSERVER_LOG_TARGET;
         let seen = Arc::new(Mutex::new(Vec::new()));
         // EnvFilter installed as a layer filters events for the whole registry.
+        // Exercise the *folded* default (base + privacy-critical directives),
+        // proving the fold — not a hardcoded literal — admits the WARN.
         let subscriber = tracing_subscriber::registry()
-            .with(tracing_subscriber::EnvFilter::new(DEFAULT_LOG_FILTER))
+            .with(tracing_subscriber::EnvFilter::new(default_log_filter()))
             .with(Capture(seen.clone()));
 
         tracing::subscriber::with_default(subscriber, || {
-            tracing::warn!(target: "transport_observer", "relay caution"); // must survive
-            tracing::info!(target: "transport_observer", "chatter"); // below warn → dropped
+            // must survive
+            tracing::warn!(target: contracts::constants::TRANSPORT_OBSERVER_LOG_TARGET, "relay caution");
+            // below warn → dropped
+            tracing::info!(target: contracts::constants::TRANSPORT_OBSERVER_LOG_TARGET, "chatter");
             tracing::info!(target: "nexusd_cluster", "boot"); // explicit info → survives
             tracing::info!(target: "some_unlisted_dep", "noise"); // no directive → ERROR default → dropped
         });
@@ -2350,14 +2375,14 @@ mod tests {
         let seen = seen.lock().unwrap();
         assert!(
             seen.iter()
-                .any(|(t, l)| t == "transport_observer" && *l == tracing::Level::WARN),
+                .any(|(t, l)| t == target && *l == tracing::Level::WARN),
             "privacy WARN must clear the default filter, saw: {seen:?}",
         );
         assert!(
             !seen
                 .iter()
-                .any(|(t, l)| t == "transport_observer" && *l == tracing::Level::INFO),
-            "transport_observer INFO is below the warn directive and must stay filtered",
+                .any(|(t, l)| t == target && *l == tracing::Level::INFO),
+            "the privacy target's INFO is below the warn directive and must stay filtered",
         );
         assert!(
             !seen.iter().any(|(t, _)| t == "some_unlisted_dep"),

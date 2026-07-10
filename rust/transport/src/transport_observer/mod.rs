@@ -369,7 +369,7 @@ impl MutationObserver for TransportObserverService {
                 self.warn_count.fetch_add(1, Ordering::Relaxed);
                 if self.policy == TransportPolicy::Warn {
                     tracing::warn!(
-                        target: "transport_observer",
+                        target: contracts::constants::TRANSPORT_OBSERVER_LOG_TARGET,
                         remote_addr = %remote_addr,
                         via = %via,
                         path = %event.path(),
@@ -382,7 +382,7 @@ impl MutationObserver for TransportObserverService {
                 self.unknown_count.fetch_add(1, Ordering::Relaxed);
                 if self.policy == TransportPolicy::Warn {
                     tracing::warn!(
-                        target: "transport_observer",
+                        target: contracts::constants::TRANSPORT_OBSERVER_LOG_TARGET,
                         remote_addr = %remote_addr,
                         path = %event.path(),
                         bytes = event.size().unwrap_or(0),

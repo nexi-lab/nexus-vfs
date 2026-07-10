@@ -44,3 +44,24 @@ jobs:
             exit 1
           fi
           echo "Observability lint OK — all explicit tracing targets are ::-namespaced."
+
+      - name: Forbid hardcoded privacy-critical target in the daemon filter
+        run: |
+          set -e
+          # The composition root must NOT name a privacy-critical logging
+          # target directly — neither as a quoted target literal
+          # ("transport_observer") nor as an EnvFilter directive
+          # (transport_observer=warn). Criticality is declared once in
+          # contracts::constants::PRIVACY_CRITICAL_LOG_TARGETS and folded onto
+          # the operational-verbosity base by default_log_filter(); a raw
+          # string here is the regression this gate blocks. The legitimate
+          # module path `transport::transport_observer::install` and prose
+          # mentions carry neither quote-pair nor `=`, so they are not flagged.
+          file="rust/profiles/cluster/src/main.rs"
+          violations=$(grep -nE '"transport_observer"|transport_observer=' "$file" || true)
+          if [ -n "$violations" ]; then
+            echo "::error::hardcoded privacy-critical target found in $file — fold contracts::constants::PRIVACY_CRITICAL_LOG_TARGETS instead of naming the target inline"
+            echo "$violations" | while IFS= read -r line; do echo "  $line"; done
+            exit 1
+          fi
+          echo "Observability lint OK — no hardcoded privacy-critical target in the daemon filter."
