@@ -1,0 +1,46 @@
+name: Observability Lint
+
+# Enforces the nexus-vfs logging conventions structurally — by CI gate, not
+# by memory or README discipline. Companion to the typed event emitters
+# in-code (e.g. `ClientPoolEvent` in rust/raft/src/transport/client.rs),
+# which pin each event's level + fields at the type level so a phase can't
+# be mislabelled. This gate covers the one convention that is cheaply and
+# reliably greppable across the whole workspace: `tracing` target naming.
+#
+# Convention: prefer omitting `target:` entirely — `tracing` then derives
+# `module_path!()`, which is always `crate::module::...`. When a target IS
+# given explicitly (e.g. a semantic subsystem group such as `kernel::trust`),
+# it MUST use the `::` form. A `.`-separated target (`kernel.trust`) is the
+# drift this gate blocks, so targets stay consistent and machine-filterable.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  tracing-target-namespacing:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Forbid dot-style tracing targets
+        run: |
+          set -e
+          # Match an `ident.ident(.ident)*` target value — the dotted-namespace
+          # shape a tracing target takes when it drifts from the `::` form.
+          # The `[A-Za-z_]` anchor + ident char class deliberately excludes
+          # URLs / paths / version strings (`://`, `/`, etc.), so an unrelated
+          # struct field named `target` carrying such a value is not flagged.
+          violations=$(grep -rnE \
+            'target:[[:space:]]*"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+"' \
+            rust/ --include='*.rs' || true)
+          if [ -n "$violations" ]; then
+            echo "::error::dot-style tracing target(s) found — use the '::' form (crate::module) or omit target: entirely"
+            echo "$violations" | while IFS= read -r line; do echo "  $line"; done
+            echo ""
+            echo "Fix: rename \"a.b\" -> \"a::b\", or drop the explicit target: and let"
+            echo "tracing derive module_path!(). See the observability-conventions"
+            echo "note on ClientPoolEvent in rust/raft/src/transport/client.rs."
+            exit 1
+          fi
+          echo "Observability lint OK — all explicit tracing targets are ::-namespaced."
