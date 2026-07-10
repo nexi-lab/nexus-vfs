@@ -203,13 +203,6 @@ impl Kernel {
     ) -> Result<SysReadResult, KernelError> {
         let not_found = || KernelError::FileNotFound(path.to_string());
 
-        // TEMP DIAGNOSTIC (remove before merge): this is the function the FUSE
-        // C-ABI trampoline (`kernel_cb_sys_read` -> `sys_read_single`) actually
-        // reaches. If this logs on the joiner but `read content decision` shows
-        // has_content=true for a file that was NOT on local disk, `read_content`
-        // is succeeding anomalously (the bytes are already local by read time).
-        tracing::info!(target: "kernel::observe", path = %path, "sys_read_after_auth entry (diag)");
-
         // 2. Route (pure Rust LPM)
         let route = match self.vfs_router.route(path, &ctx.zone_id) {
             Some(r) => r,
@@ -437,19 +430,6 @@ impl Kernel {
         // 6. Release VFS lock (always, even on miss)
         self.lock_manager.do_release(lock_handle);
 
-        // TEMP DIAGNOSTIC (remove before merge): has_content=Some → local hit
-        // (returns now, NO try_remote_fetch, NO RemoteFetch); None → falls to
-        // try_remote_fetch. This is the branch that decides whether the
-        // observer ever sees the fetch.
-        tracing::info!(
-            target: "kernel::observe",
-            path = %path,
-            has_content = content.is_some(),
-            fed_cache_read = federation_cache_substitution_read,
-            backend_some = route.backend.is_some(),
-            "read content decision (diag)",
-        );
-
         // 7. Return result
         match content {
             Some(data) => Ok(SysReadResult {
@@ -571,15 +551,13 @@ impl Kernel {
             event.remote_addr = Some(origin.to_string());
             event.size = Some(data.len() as u64);
             event.content_id = entry.content_id.clone();
-            // Make every cross-node fetch visible (not just relayed ones a
-            // consumer warns on): the fetch physically moved bytes off a peer,
-            // which is operator-relevant regardless of the substrate path. Also
-            // the ground-truth hook for diagnosing observer delivery — logs the
-            // registered-observer count at dispatch time so a "silent joiner"
-            // can be pinned to registration (count=0) vs classification (the
-            // consumer's own path resolver) without guessing from the absence
-            // of a downstream warn.
-            tracing::info!(
+            // DEBUG diagnostic hook: logs the registered-observer count at
+            // dispatch time so a "silent observer" can be pinned to
+            // registration (count=0) vs the consumer's own classification. The
+            // operator-facing signal is the consumer's own WARN (e.g.
+            // `transport_observer` on a relay path), so this stays at DEBUG —
+            // free in production, available under `kernel::observe=debug`.
+            tracing::debug!(
                 target: "kernel::observe",
                 path = %path,
                 origin = %origin,
