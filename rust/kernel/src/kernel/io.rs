@@ -3377,10 +3377,13 @@ impl Kernel {
     /// Behaviourally identical to [`Self::sys_readdir`]. It was a
     /// distinct variant only to disable the `peer_list_dir` readdir
     /// fan-out and break ping-pong; that fan-out was removed with the
-    /// ObserverBackend cutover (metastore is now authoritative for
+    /// metadata-sync cutover (metastore is now authoritative for
     /// cross-node existence, so a backed node never needs to probe
     /// peers on readdir), leaving this as a named alias the gRPC handler
     /// keeps calling to document "this readdir is serving a peer".
+    /// Serving a peer's readdir still runs the on-access seed in
+    /// `sys_readdir`, so a peer that lists us discovers-and-materialises
+    /// our out-of-band content into the replicated metastore in one hop.
     pub fn sys_readdir_peer_dispatch(
         &self,
         parent_path: &str,
@@ -3450,20 +3453,28 @@ impl Kernel {
         // returns disk entries, external connectors return API results.
         // No ABC leak: kernel treats every backend the same.
         //
-        // The merge only unions backend entries INTO the readdir result
-        // (`seen`) — it no longer proposes metadata rows here.  Under the
-        // ObserverBackend contract the owning backend keeps the metastore
-        // authoritative for its own contents via eager sync (initial walk
-        // + reconcile in `ObserverBackend::install_observer`), so a peer's
-        // `sys_readdir` sees the entry through `metastore.list` alone.
-        // The local backend union stays so a node lists its own
-        // out-of-band content immediately, before the next reconcile tick
-        // has proposed the row (read/list-your-writes with no gap).
+        // The union pulls backend entries INTO the readdir result (`seen`)
+        // so a node lists its own out-of-band content immediately, before
+        // the metastore carries a row for it (list-your-writes, no gap).
+        //
+        // For an ARMED mount (a backend that receives content out-of-band,
+        // e.g. a LocalConnector — see `crate::core::metadata_sync`), this is
+        // also the sync's on-access trigger: a child present in the backend
+        // listing but absent from the metastore is freshly-arrived
+        // out-of-band content, so we propose its authoritative row
+        // synchronously here via the same idempotent `observe_backend_entry`
+        // atom the initial walk and the periodic reconcile use. That stamps
+        // `last_writer` and lets a peer see the entry through raft-replicated
+        // `metastore.list` at once, without waiting for the next reconcile
+        // tick. Gated + cheap: entries the metastore pass already carried
+        // cost only the `contains_key` check; a non-armed mount runs none of
+        // this (no `is_sync_armed` follow-through, no stat, no propose).
         if let Some(Ok(backend_entries)) = route
             .backend
             .as_ref()
             .map(|b| b.list_dir(&route.backend_path))
         {
+            let armed = self.dlc.is_sync_armed(&route.mount_point);
             for name in backend_entries {
                 let is_dir = name.ends_with('/');
                 let clean = name.trim_end_matches('/');
@@ -3472,8 +3483,43 @@ impl Kernel {
                 }
                 let etype = if is_dir { DT_DIR } else { DT_REG };
                 let child_path = format!("{}/{}", parent_for_join, clean);
-                seen.entry(child_path)
+                // Was this child already carried by the metastore pass? If
+                // so it is seeded — skip the seed entirely (no stat/propose).
+                let already_in_metastore = seen.contains_key(&child_path);
+                seen.entry(child_path.clone())
                     .or_insert((etype, Some(route.zone_id.clone())));
+                if armed && !already_in_metastore {
+                    // Freshly-discovered out-of-band entry: seed it now,
+                    // keyed on the global path, carrying the backend-relative
+                    // path as `content_id` (what `read_content` resolves) and
+                    // the real byte size for DT_REG (POSIX `read()`
+                    // short-circuits on `st_size == 0`). Identical row shape
+                    // to what the reconcile walk would propose, so the two
+                    // triggers converge idempotently on the same row.
+                    let backend_rel = if route.backend_path.is_empty() {
+                        clean.to_string()
+                    } else {
+                        format!("{}/{}", route.backend_path.trim_end_matches('/'), clean)
+                    };
+                    let (size, content_id) = if is_dir {
+                        (0, None)
+                    } else {
+                        let size = route
+                            .backend
+                            .as_ref()
+                            .and_then(|b| b.stat(&backend_rel).ok())
+                            .map(|s| s.size)
+                            .unwrap_or(0);
+                        (size, Some(backend_rel))
+                    };
+                    self.observe_backend_entry(
+                        &child_path,
+                        etype,
+                        &route.zone_id,
+                        size,
+                        content_id,
+                    );
+                }
             }
         } else if let Some(entries) = route.via_federation_readdir(self, parent_path) {
             // Federation peer dispatch: no local backend for this
@@ -3504,14 +3550,16 @@ impl Kernel {
             }
         }
 
-        // No readdir-time peer fan-out and no readdir-time observation:
-        // the ObserverBackend contract makes each backed node keep the
-        // metastore authoritative for its own contents via eager sync, so
-        // a peer's `metastore.list` already carries every entry the peer
-        // can route to.  The one surviving cross-node readdir mechanism is
-        // `via_federation_readdir` above, for backend-less federation
-        // placeholder mounts (the thin-reader topology), which is a
-        // distinct axis ObserverBackend does not cover.
+        // No readdir-time peer fan-out. The on-access seed above keeps a
+        // backed node's own metastore authoritative for its out-of-band
+        // content (and the periodic reconcile in `crate::core::metadata_sync`
+        // is the backstop for entries no one has listed yet), so a peer's
+        // `metastore.list` already carries every entry the peer can route to
+        // — a backed node never needs to probe peers on readdir. The one
+        // surviving cross-node readdir mechanism is `via_federation_readdir`
+        // above, for backend-less federation placeholder mounts (the
+        // thin-reader topology), a distinct axis metadata sync does not
+        // cover.
 
         let entries: Vec<(String, u8)> = if needs_zone_filter {
             seen.into_iter()

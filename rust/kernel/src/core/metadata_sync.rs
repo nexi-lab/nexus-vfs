@@ -25,6 +25,33 @@
 //! that boundary (they're C-ABI methods), so running the walk kernel-side
 //! over `&dyn ObjectStore` works uniformly for dylib and built-in backends.
 //!
+//! ## Triggers
+//!
+//! Three triggers feed the one idempotent atom
+//! [`crate::kernel::Kernel::observe_backend_entry`]; each enumerates the
+//! backend in whatever way is cheapest for it, then proposes the rows the
+//! metastore is missing:
+//!
+//! 1. **Initial walk** (this module, [`arm`]) — a synchronous recursive
+//!    walk at mount time, so every pre-existing entry is authoritative
+//!    before the mount serves peers.
+//! 2. **Periodic reconcile** (this module, the background thread) — the
+//!    self-verifying backstop that re-walks every [`RECONCILE_INTERVAL`],
+//!    catching content no one has listed yet.
+//! 3. **On-access seed** (`Kernel::sys_readdir`) — when a `readdir` on an
+//!    armed mount surfaces a backend child the metastore does not yet
+//!    carry, that child is seeded synchronously in the same call, so the
+//!    row (and its `last_writer`) exists at once instead of waiting up to a
+//!    full reconcile interval. This is the low-latency path; triggers 1–2
+//!    are the completeness floor.
+//!
+//! The three are the classic network-FS coherence split applied to the
+//! metastore↔backend layer: eager seed + on-access revalidation, with a
+//! periodic re-walk as the correctness backstop. They never conflict — the
+//! atom is idempotent (it never clobbers an existing row, which is SSOT for
+//! `last_writer_address` routing), so whichever trigger reaches a new entry
+//! first wins and the rest are no-ops.
+//!
 //! ## Opt-in
 //!
 //! Whether a mount's backend receives out-of-band content is not knowable
@@ -32,7 +59,9 @@
 //! calls [`crate::kernel::Kernel::arm_metadata_sync`] after mounting a
 //! passthrough connector (e.g. the cluster profile arms it for
 //! `--mount-driver local-connector:…`). Every other mount runs none of
-//! this code — no reconcile thread, no walk, no cost.
+//! this code — no reconcile thread, no walk, and `sys_readdir` skips the
+//! on-access seed too (gated on `DriverLifecycleCoordinator::is_sync_armed`)
+//! — no cost.
 
 use std::sync::{Arc, Weak};
 use std::time::Duration;
