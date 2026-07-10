@@ -2066,7 +2066,16 @@ fn install_tracing() -> tracing_appender::non_blocking::WorkerGuard {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new("nexusd_cluster=info,nexus_raft=info")
+                // `transport_observer=warn` is load-bearing, not decoration:
+                // the transport-observer's relay data-privacy caution is a
+                // WARN under the `transport_observer` target. Without this
+                // directive the default (targets not matched → ERROR) drops
+                // it, so an operator who never sets RUST_LOG would NEVER see
+                // "your data traversed a relay" — silently defeating the
+                // whole privacy signal. Keep it in the default filter.
+                tracing_subscriber::EnvFilter::new(
+                    "nexusd_cluster=info,nexus_raft=info,transport_observer=warn",
+                )
             }),
         )
         .with_writer(non_blocking)

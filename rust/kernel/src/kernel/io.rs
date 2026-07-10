@@ -495,13 +495,15 @@ impl Kernel {
         // dcache or unwritten metadata) — ``BlobFetcher::read`` will
         // path-route it through the peer's VFSRouter.
         //
-        // Caching the fetched blob locally is intentionally NOT done
-        // here: that would require kernel-side knowledge of the local
-        // mount's addressing scheme (CAS hash → write_content; PAS →
-        // which backend_path slot), exactly the thing this refactor
-        // moved out. If a follow-up wants opportunistic local caching
-        // it belongs in the local backend's ``write_content`` callable
-        // from the BlobFetcher impl, not here.
+        // The fetched blob IS cached back into the local backend after the
+        // fetch (see the ``write_content`` call below). The earlier "kernel
+        // can't know the local addressing scheme" objection was resolved by
+        // passing the metastore's opaque ``content_id`` straight through as
+        // the write key — the kernel never needs to distinguish CAS-vs-PAS.
+        // The cache-back is a failover requirement, not an optimization (see
+        // the comment on that call), so it is default for any mount with a
+        // local backend + a content_id (e.g. LocalConnector), gated only on
+        // those two, and swallows write failures.
         //
         // ``peer_client`` is ``RwLock<Arc<dyn PeerBlobClient>>``;
         // ``peer_client_arc()`` clones the Arc out from under the read
@@ -549,6 +551,20 @@ impl Kernel {
             event.remote_addr = Some(origin.to_string());
             event.size = Some(data.len() as u64);
             event.content_id = entry.content_id.clone();
+            // DEBUG diagnostic hook: logs the registered-observer count at
+            // dispatch time so a "silent observer" can be pinned to
+            // registration (count=0) vs the consumer's own classification. The
+            // operator-facing signal is the consumer's own WARN (e.g.
+            // `transport_observer` on a relay path), so this stays at DEBUG —
+            // free in production, available under `kernel::observe=debug`.
+            tracing::debug!(
+                target: "kernel::observe",
+                path = %path,
+                origin = %origin,
+                bytes = data.len(),
+                observers = self.observer_count(),
+                "remote-fetch delivered — dispatching RemoteFetch to observers",
+            );
             self.dispatch_observers(&event);
         }
         Ok(SysReadResult {
