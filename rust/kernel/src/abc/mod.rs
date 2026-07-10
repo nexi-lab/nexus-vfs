@@ -1,12 +1,14 @@
 //! Kernel ABC pillars — the canonical "Linux `struct file_operations`"
 //! analogues from `docs/architecture/KERNEL-ARCHITECTURE.md` §3.
 //!
-//! Strict 3-way split: this directory holds **only** the §3.A pillar
+//! Strict split: this directory holds **only** the §3.A pillar
 //! trait declarations that any compliant driver impl must satisfy.
 //! §3.B Control-Plane HAL DI surfaces (`DistributedCoordinator`,
-//! `ObjectStoreProvider`) live in `crate::hal::*`. ObjectStore
-//! extension hooks (`LlmStreamingBackend`) live at the crate root
-//! (`crate::llm_streaming`). Peer-blob fetch
+//! `ObjectStoreProvider`) live in `crate::hal::*`. Opt-in ObjectStore
+//! extension traits (`LlmStreamingBackend`, `ObserverBackend`) live in
+//! `crate::extensions::*` — they extend a §3.A pillar through an
+//! `ObjectStore::as_*()` downcast rather than being one of the
+//! mandatory pillars every backend implements. Peer-blob fetch
 //! (`crate::hal::peer::PeerBlobClient`) is a transport-layer
 //! abstraction reached through the kernel's peer_client slot. Kernel
 //! primitives (vfs_router, dlc, dcache, locks, dispatch, …) live in
@@ -20,7 +22,8 @@
 //! in-memory reference metastore, …).
 //!
 //! Doc invariant — anything inside `abc/` is one of the three §3
-//! storage pillars; nothing else qualifies.
+//! mandatory storage pillars; nothing else qualifies. Opt-in pillar
+//! extensions belong in `crate::extensions/`.
 
 pub mod cache_store;
 pub mod meta_store;

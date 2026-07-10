@@ -1522,6 +1522,17 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
             vfs_path = %spec.vfs_path,
             "mounted driver plugin",
         );
+
+        // Passthrough connectors reference a host directory that content
+        // reaches out-of-band (e.g. `cc` writing task JSON directly,
+        // bypassing sys_write). Arm kernel-side metadata sync so the
+        // metastore stays authoritative for that content and peers see it
+        // via raft-replicated `metastore.list`. Gated on the connector
+        // driver — content-owning backends (CAS/S3) publish metadata
+        // through sys_write and don't opt in.
+        if matches!(spec.name.as_str(), "local-connector" | "local_connector") {
+            kernel.arm_metadata_sync(&spec.vfs_path, &spec.zone_id);
+        }
     }
 
     let zm_for_loop = zm.clone();

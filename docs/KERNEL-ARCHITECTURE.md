@@ -451,20 +451,24 @@ the Python tier is on a sunset path, so the Rust trait carries the
 forward-looking name.
 
 **Rust-side strict layout:** `kernel/src/abc/` contains exactly the
-3 §3.A ABC pillar trait files. `kernel/src/hal/` contains the §3.B
-Control-Plane HAL trait files (`DistributedCoordinator`,
-`ObjectStoreProvider`). Kernel primitives (§4) live in `kernel/src/core/`
-as concrete types. Connector-backend protocol extensions
-(e.g. `LlmStreamingBackend`) live in `rust/backends/`; the matching
-trait DECLARATION stays at the kernel boundary because
-`ObjectStore::as_llm_streaming()` returns
-`Option<&dyn LlmStreamingBackend>` in the kernel ABC. Concrete impls
-(`OpenAIBackend`, `AnthropicBackend`) live in
-`rust/backends/transports/api/ai/`. Transport-layer abstractions
-(`PeerBlobClient`, TOFU trust store) live in the tier-neutral
-`rust/lib/` crate's `transport_primitives` module. Directory layout
-enforces the three-way split: `abc/` is for §3.A pillars, `hal/` is
-for §3.B DI surfaces, `core/` is for primitives.
+3 §3.A ABC pillar trait files. `kernel/src/extensions/` contains the
+opt-in §3.A.2 ObjectStore extension traits (`LlmStreamingBackend`,
+`ObserverBackend`) — each reached through an `ObjectStore::as_*()`
+downcast rather than being a mandatory pillar. `kernel/src/hal/`
+contains the §3.B Control-Plane HAL trait files
+(`DistributedCoordinator`, `ObjectStoreProvider`). Kernel primitives
+(§4) live in `kernel/src/core/` as concrete types. Extension-trait
+DECLARATIONS stay at the kernel boundary because the
+`ObjectStore::as_*()` method signatures reference them
+(e.g. `as_llm_streaming() -> Option<&dyn LlmStreamingBackend>`); the
+concrete IMPLS live in `rust/backends/` next to the backend that opts
+in (`OpenAIBackend` / `AnthropicBackend` for `LlmStreamingBackend`,
+`LocalConnectorBackend` for `ObserverBackend`). Transport-layer
+abstractions (`PeerBlobClient`, TOFU trust store) live in the
+tier-neutral `rust/lib/` crate's `transport_primitives` module.
+Directory layout enforces the split: `abc/` is for §3.A mandatory
+pillars, `extensions/` is for §3.A.2 opt-in ObjectStore extension
+traits, `hal/` is for §3.B DI surfaces, `core/` is for primitives.
 
 **Orthogonality:** Between pillars = different query patterns. Within pillars =
 interchangeable drivers (deployment-time config). See `data-storage-matrix.md`.

@@ -17,19 +17,56 @@
 //! `Kernel::has_mount` (which delegates to the router); listing mount
 //! points goes through `Kernel::get_mount_points`.
 
+use crate::core::metadata_sync::MetadataSyncHandle;
 use crate::kernel::{Kernel, KernelError};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Kernel primitive: driver mount lifecycle.
 ///
-/// Stateless coordinator — `mount()` / `unmount()` thread mutations into
-/// the kernel's owned tables (`VFSRouter`, per-mount metastore) rather
-/// than caching anything locally.  Created once at `Kernel::new()`.
-pub(crate) struct DriverLifecycleCoordinator;
+/// `mount()` / `unmount()` thread mutations into the kernel's owned
+/// tables (`VFSRouter`, per-mount metastore).  The one piece of state it
+/// owns is the set of live [`MetadataSyncHandle`]s for mounts that opted
+/// into kernel-side metadata sync (see [`crate::core::metadata_sync`]) —
+/// each handle's Drop stops the reconcile thread, so keying them by
+/// canonical mount point and dropping on `unmount()` ties the reconcile
+/// lifetime to the mount.  Created once at `Kernel::new()`.
+pub(crate) struct DriverLifecycleCoordinator {
+    sync_handles: parking_lot::Mutex<HashMap<String, MetadataSyncHandle>>,
+}
 
 impl DriverLifecycleCoordinator {
     pub fn new() -> Self {
-        Self
+        Self {
+            sync_handles: parking_lot::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Store the [`MetadataSyncHandle`] for a mount, keyed by canonical
+    /// mount point.  Called by `Kernel::arm_metadata_sync` after it spawns
+    /// the reconcile.  Replacing an existing entry drops the old handle
+    /// (stopping its thread) — re-arming a mount is idempotent.
+    pub(crate) fn store_sync_handle(
+        &self,
+        mount_point: &str,
+        zone_id: &str,
+        handle: MetadataSyncHandle,
+    ) {
+        let key = Kernel::canonical_mount_key(mount_point, zone_id);
+        self.sync_handles.lock().insert(key, handle);
+    }
+
+    /// Drop the [`MetadataSyncHandle`] for a mount (if armed), stopping
+    /// its reconcile thread.  Idempotent.
+    fn disarm_sync(&self, mount_point: &str, zone_id: &str) {
+        let key = Kernel::canonical_mount_key(mount_point, zone_id);
+        if self.sync_handles.lock().remove(&key).is_some() {
+            tracing::debug!(
+                target: "kernel::dlc",
+                mount = mount_point,
+                "metadata sync disarmed on unmount",
+            );
+        }
     }
 
     /// Mount a backend with full lifecycle: routing + metastore + lock.
@@ -178,6 +215,7 @@ impl DriverLifecycleCoordinator {
         // responsibility now — each ``ZoneMetaStore`` self-registers an
         // invalidator on its consensus during construction. DLC stays
         // federation-unaware.
+        //
         kernel.add_mount(
             mount_point,
             zone_id,
@@ -186,6 +224,11 @@ impl DriverLifecycleCoordinator {
             raft_backend,
             is_external,
         )?;
+        // Metadata sync (for out-of-band backends) is armed separately by
+        // `Kernel::arm_metadata_sync` — it needs the owning `Arc<Kernel>`
+        // for the reconcile thread's callback, which `DLC.mount` (holding
+        // only `&Kernel`) doesn't have. The cluster boot path arms it for
+        // the mounts that opt in, after this returns.
         Ok(())
     }
 
@@ -249,7 +292,12 @@ impl DriverLifecycleCoordinator {
             }
         }
 
-        // 2. Remove from routing table — the per-mount metastore Arc
+        // 2. Stop the metadata-sync reconcile thread (if this mount had
+        // one) before tearing down the route, so it can't propose against
+        // a mount that's going away.
+        self.disarm_sync(mount_point, zone_id);
+
+        // 3. Remove from routing table — the per-mount metastore Arc
         // (with its internal cache) drops with the MountEntry. A row
         // without a live route is a normal post-restart shape (rows
         // survive; routes wait for replay), so this is observational,
@@ -264,5 +312,168 @@ impl DriverLifecycleCoordinator {
             );
         }
         Ok(row_existed || route_removed)
+    }
+
+    /// Test-only: number of live metadata-sync handles.  Lets the wiring
+    /// integration test assert arm / drop-on-unmount.
+    #[cfg(test)]
+    pub(crate) fn sync_handle_count(&self) -> usize {
+        self.sync_handles.lock().len()
+    }
+}
+
+#[cfg(test)]
+mod metadata_sync_wiring_tests {
+    //! Integration test for the metadata-sync mount wiring: a real
+    //! `Arc<Kernel>` + real `DriverLifecycleCoordinator` + real
+    //! `MetadataSink` + real metastore, driven through a **plain
+    //! `ObjectStore`** (no trait extension — exactly like a dylib backend
+    //! the kernel sees as an opaque `DylibObjectStore`). Exercises
+    //! `Kernel::arm_metadata_sync` → route lookup → generic walk over
+    //! `list_dir`/`stat` → sink (mount-prefix join) →
+    //! `observe_backend_entry` → metastore.
+    //!
+    //! Real user problem: after a node mounts a peer-shared connector over
+    //! a host dir that already holds tasks, those tasks MUST become
+    //! visible in the metastore (so peers see them via raft-replicated
+    //! `metastore.list`) without any read/readdir-time cold-discovery.
+
+    use crate::abc::object_store::{BackendStat, ObjectStore, StorageError, WriteResult};
+    use crate::kernel::{Kernel, OperationContext};
+    use crate::meta_store::{DT_DIR, DT_REG};
+    use std::sync::Arc;
+
+    /// Plain ObjectStore exposing a fixed tree via `list_dir`/`stat` —
+    /// no `as_observer`, no trait extension. Stands in for any backend
+    /// (dylib or built-in) the generic walk runs over.
+    struct TreeBackend;
+
+    impl ObjectStore for TreeBackend {
+        fn name(&self) -> &str {
+            "tree-mock"
+        }
+        fn list_dir(&self, path: &str) -> Result<Vec<String>, StorageError> {
+            match path {
+                "" => Ok(vec!["a.json".to_string(), "sub/".to_string()]),
+                "sub" => Ok(vec!["b.json".to_string()]),
+                other => Err(StorageError::NotFound(other.to_string())),
+            }
+        }
+        fn stat(&self, path: &str) -> Result<BackendStat, StorageError> {
+            match path {
+                "a.json" => Ok(BackendStat {
+                    size: 5,
+                    is_dir: false,
+                }),
+                "sub/b.json" => Ok(BackendStat {
+                    size: 11,
+                    is_dir: false,
+                }),
+                "sub" => Ok(BackendStat {
+                    size: 0,
+                    is_dir: true,
+                }),
+                other => Err(StorageError::NotFound(other.to_string())),
+            }
+        }
+        fn write_content(
+            &self,
+            _c: &[u8],
+            _id: &str,
+            _ctx: &OperationContext,
+            _o: u64,
+        ) -> Result<WriteResult, StorageError> {
+            Err(StorageError::NotSupported("write_content"))
+        }
+        fn read_content(
+            &self,
+            _id: &str,
+            _ctx: &OperationContext,
+        ) -> Result<Vec<u8>, StorageError> {
+            Err(StorageError::NotSupported("read_content"))
+        }
+    }
+
+    /// Full-workflow: mount a plain-ObjectStore connector whose host dir
+    /// already holds `a.json` + `sub/` + `sub/b.json`, arm metadata sync,
+    /// assert every entry became an authoritative metastore row (type,
+    /// size, content_id, prefix-join) via the generic walk, then unmount
+    /// and assert the reconcile handle was dropped.
+    #[test]
+    fn arm_metadata_sync_populates_metastore_then_unmount_disarms() {
+        let kernel = Arc::new(Kernel::new());
+        let backend: Arc<dyn ObjectStore> = Arc::new(TreeBackend);
+
+        // Step 1: mount the connector at /tasks, then arm metadata sync
+        // (the two-step the cluster boot path performs). Arming runs the
+        // synchronous initial walk over list_dir/stat and proposes rows.
+        kernel
+            .dlc
+            .mount(&kernel, "/tasks", "root", Some(backend), None, None, false)
+            .expect("mount connector");
+        kernel.arm_metadata_sync("/tasks", "root");
+        assert_eq!(
+            kernel.dlc.sync_handle_count(),
+            1,
+            "sync armed for the mount"
+        );
+
+        // Step 2: every backend entry is now an authoritative metastore
+        // row under the mount prefix — what a peer's `metastore.list`
+        // replicates and sees.
+        let file = kernel
+            .metastore_get("/tasks/a.json")
+            .expect("metastore_get ok")
+            .expect("a.json row proposed");
+        assert_eq!(file.entry_type, DT_REG);
+        assert_eq!(file.size, 5, "DT_REG size carried from backend stat");
+        assert_eq!(
+            file.content_id.as_deref(),
+            Some("a.json"),
+            "DT_REG content_id is the backend-relative path read_content resolves"
+        );
+
+        let dir = kernel
+            .metastore_get("/tasks/sub")
+            .expect("metastore_get ok")
+            .expect("sub row proposed");
+        assert_eq!(dir.entry_type, DT_DIR);
+        assert_eq!(dir.content_id, None, "DT_DIR rows carry no content_id");
+
+        let nested = kernel
+            .metastore_get("/tasks/sub/b.json")
+            .expect("metastore_get ok")
+            .expect("nested sub/b.json row proposed");
+        assert_eq!(nested.size, 11, "nested file size + prefix-joined path");
+
+        // Step 3: unmount drops the MetadataSyncHandle (its Drop stops the
+        // reconcile thread).
+        kernel
+            .dlc
+            .unmount(&kernel, "/tasks", "root")
+            .expect("unmount");
+        assert_eq!(
+            kernel.dlc.sync_handle_count(),
+            0,
+            "sync disarmed on unmount"
+        );
+    }
+
+    /// A mount that is never armed proposes nothing — arming is a
+    /// deliberate per-mount opt-in, off by default.
+    #[test]
+    fn mount_without_arm_proposes_nothing() {
+        let kernel = Arc::new(Kernel::new());
+        let backend: Arc<dyn ObjectStore> = Arc::new(TreeBackend);
+        kernel
+            .dlc
+            .mount(&kernel, "/tasks", "root", Some(backend), None, None, false)
+            .expect("mount");
+        // Deliberately NOT calling arm_metadata_sync.
+        assert_eq!(kernel.dlc.sync_handle_count(), 0, "no handle without arm");
+        assert!(
+            matches!(kernel.metastore_get("/tasks/a.json"), Ok(None)),
+            "no row proposed when the mount is not armed"
+        );
     }
 }

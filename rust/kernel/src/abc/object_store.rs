@@ -97,11 +97,13 @@ pub trait ObjectStore: Send + Sync {
     /// `Some` implements the full SSE → DT_STREAM →
     /// `CASEngine::write_content_tracked` pipeline.
     ///
-    /// Trait declaration lives at `crate::llm_streaming` — an
-    /// ObjectStore extension hook, distinct from §3.B Control-Plane
+    /// Trait declaration lives at `crate::extensions::llm_streaming` —
+    /// an ObjectStore extension trait, distinct from §3.B Control-Plane
     /// HAL traits in `crate::hal/`. Concrete connector impls live in
     /// `backends::transports::api::ai::*`.
-    fn as_llm_streaming(&self) -> Option<&dyn crate::llm_streaming::LlmStreamingBackend> {
+    fn as_llm_streaming(
+        &self,
+    ) -> Option<&dyn crate::extensions::llm_streaming::LlmStreamingBackend> {
         None
     }
 

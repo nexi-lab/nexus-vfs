@@ -12,27 +12,27 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 pub use contracts::ROOT_ZONE_ID;
 
 // ── §3 / §4 / HAL surface ────────────────────────────────────────────
-// Three-way split inside the kernel crate (see
+// Four tier-directories inside the kernel crate (see
 // `docs/architecture/KERNEL-ARCHITECTURE.md` §3 / §4 / §6.1):
-//   * `crate::abc`  — §3.A Storage HAL pillars (ObjectStore / MetaStore
-//                     / CacheStore). Trait declarations only.
-//   * `crate::hal`  — §3.B Control-Plane HAL DI surfaces
-//                     (DistributedCoordinator, ObjectStoreProvider).
-//   * `crate::core` — §4 kernel primitives (vfs_router, dlc, locks,
-//                     dispatch, in-memory reference impls of the §3.A
-//                     pillars).
+//   * `crate::abc`        — §3.A Storage HAL pillars (ObjectStore /
+//                           MetaStore / CacheStore). Mandatory trait
+//                           declarations, one file each.
+//   * `crate::extensions` — §3.A.2 opt-in ObjectStore extension traits
+//                           (LlmStreamingBackend), each reached via an
+//                           ObjectStore::as_*() downcast. Declarations
+//                           only. (Note: capabilities that must cross
+//                           the dylib C-ABI cannot be as_*() downcasts —
+//                           e.g. metadata_sync is a core/ primitive.)
+//   * `crate::hal`        — §3.B Control-Plane HAL DI surfaces
+//                           (DistributedCoordinator, ObjectStoreProvider).
+//   * `crate::core`       — §4 kernel primitives (vfs_router, dlc,
+//                           locks, dispatch, in-memory reference impls
+//                           of the §3.A pillars).
 pub mod abc;
 pub mod core;
+pub mod extensions;
 pub mod federation;
 pub mod hal;
-
-// §3.A.2 ObjectStore extension hook — connector-backend SSE streaming.
-// Lives at crate root (sibling to abc/, hal/, core/) because it
-// extends a §3.A storage pillar through ObjectStore::as_llm_streaming
-// without declaring a §3.B Control-Plane HAL DI surface. Concrete
-// protocol-specific impls (`OpenAIBackend`, `AnthropicBackend`) live
-// in `backends/src/transports/api/ai/*`.
-pub mod llm_streaming;
 
 // ── Flat re-exports of `core::*` ─────────────────────────────────────
 pub(crate) use core::dispatch;

@@ -33,9 +33,10 @@
 //!   transport (client-side fetcher) reach it without depending on
 //!   each other.
 //!
-//! ObjectStore extension hooks like [`crate::llm_streaming::LlmStreamingBackend`]
-//! live at the kernel crate root, not under `hal/` — they extend a
-//! §3.A storage pillar rather than declare a §3.B DI surface.
+//! ObjectStore extension traits like
+//! [`crate::extensions::llm_streaming::LlmStreamingBackend`] live in
+//! `crate::extensions/`, not under `hal/` — they extend a §3.A storage
+//! pillar rather than declare a §3.B DI surface.
 //!
 //! ## What's intentionally **not** here
 //!
