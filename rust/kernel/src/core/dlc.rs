@@ -567,7 +567,15 @@ mod metadata_sync_wiring_tests {
         let dyn_backend: Arc<dyn ObjectStore> = backend.clone();
         kernel
             .dlc
-            .mount(&kernel, "/tasks", "root", Some(dyn_backend), None, None, false)
+            .mount(
+                &kernel,
+                "/tasks",
+                "root",
+                Some(dyn_backend),
+                None,
+                None,
+                false,
+            )
             .expect("mount");
         kernel.arm_metadata_sync("/tasks", "root");
         // Initial walk saw an empty backend — nothing seeded yet.
@@ -614,7 +622,15 @@ mod metadata_sync_wiring_tests {
         let dyn_backend: Arc<dyn ObjectStore> = backend.clone();
         kernel
             .dlc
-            .mount(&kernel, "/tasks", "root", Some(dyn_backend), None, None, false)
+            .mount(
+                &kernel,
+                "/tasks",
+                "root",
+                Some(dyn_backend),
+                None,
+                None,
+                false,
+            )
             .expect("mount");
         // Deliberately NOT armed.
         backend.add("a.json", 7);
