@@ -27,6 +27,48 @@ use tonic::transport::{Channel, Endpoint};
 /// within a minute.
 const DEFAULT_CLIENT_TTL: Duration = Duration::from_secs(60);
 
+/// Connection-lifecycle observability for the raft client pool.
+///
+/// Typed so the level and fields for each phase are fixed at one site. The
+/// distinct phases — first connect, routine TTL-driven pool refresh, and the
+/// reconnect after a send failure — used to emit identical INFO "Connecting /
+/// Connected" lines, so a routine ~60s refresh was indistinguishable from a
+/// real reconnect and spammed INFO. The failure itself is WARNed at the send
+/// site (`transport_loop`); this type owns only the connect side, and its
+/// variants pin the level (Connected → INFO, Refreshed → DEBUG) so a routine
+/// refresh can never be mislabelled as a fresh connection again.
+///
+/// `target` is intentionally omitted so `tracing` derives `module_path!()`
+/// (`nexus_raft::transport::client`) — keeping the target `::`-namespaced by
+/// construction (enforced workspace-wide by the observability lint).
+enum ClientPoolEvent<'a> {
+    /// First connection to a peer, or the reconnect after a failure the
+    /// transport loop already WARNed about. Operator-meaningful → INFO.
+    Connected { peer: u64, endpoint: &'a str },
+    /// Routine refresh of a still-reachable peer whose pooled channel crossed
+    /// the TTL. Housekeeping → DEBUG (must not spam INFO every interval).
+    Refreshed { peer: u64, age_secs: u64 },
+}
+
+impl ClientPoolEvent<'_> {
+    fn emit(&self) {
+        match *self {
+            ClientPoolEvent::Connected { peer, endpoint } => tracing::info!(
+                phase = "connected",
+                peer_node_id = peer,
+                endpoint = endpoint,
+                "raft client connected",
+            ),
+            ClientPoolEvent::Refreshed { peer, age_secs } => tracing::debug!(
+                phase = "refreshed",
+                peer_node_id = peer,
+                age_secs = age_secs,
+                "raft client pool entry refreshed (TTL expired)",
+            ),
+        }
+    }
+}
+
 /// Configuration for Raft transport client.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -159,27 +201,38 @@ impl RaftClientPool {
     ///
     /// Cached clients older than the TTL are evicted and reconnected.
     pub async fn get(&self, addr: &NodeAddress) -> Result<RaftClient> {
-        // Check if we have a non-stale cached client
-        {
+        // Reuse a still-fresh cached client. Otherwise record whether we are
+        // refreshing a stale entry (routine, TTL-driven) or connecting with no
+        // prior entry, so the lifecycle event below logs at the right level
+        // instead of an ambiguous reconnect line.
+        let stale_age_secs: Option<u64> = {
             let clients = self.clients.read().await;
-            if let Some(cached) = clients.get(&addr.id) {
-                if cached.created_at.elapsed() < self.client_ttl {
+            match clients.get(&addr.id) {
+                Some(cached) if cached.created_at.elapsed() < self.client_ttl => {
                     return Ok(cached.client.clone());
                 }
-                // Stale — fall through to reconnect
-                tracing::debug!(
-                    peer_node_id = addr.id,
-                    age_secs = cached.created_at.elapsed().as_secs(),
-                    ttl_secs = self.client_ttl.as_secs(),
-                    "evicting stale gRPC client"
-                );
+                Some(cached) => Some(cached.created_at.elapsed().as_secs()),
+                None => None,
             }
-        }
+        };
 
-        // Create new client (may replace a stale one)
+        // Create new client (may replace a stale one).
         let client = RaftClient::connect(&addr.endpoint, self.config.clone()).await?;
 
-        // Store in pool with current timestamp
+        match stale_age_secs {
+            Some(age_secs) => ClientPoolEvent::Refreshed {
+                peer: addr.id,
+                age_secs,
+            }
+            .emit(),
+            None => ClientPoolEvent::Connected {
+                peer: addr.id,
+                endpoint: &addr.endpoint,
+            }
+            .emit(),
+        }
+
+        // Store in pool with current timestamp.
         {
             let mut clients = self.clients.write().await;
             clients.insert(
@@ -225,10 +278,13 @@ impl RaftClient {
     /// Connect to a Raft node.
     pub async fn connect(endpoint: &str, config: ClientConfig) -> Result<Self> {
         let tls_snapshot = config.tls.read().unwrap().clone();
-        tracing::info!(
-            "Connecting to Raft node at {} (tls={})",
-            endpoint,
-            tls_snapshot.is_some()
+        // Pre-dial diagnostic only (surfaces a hang inside `create_channel`);
+        // the operator-facing lifecycle signal is emitted by the caller
+        // (`RaftClientPool::get`) via `ClientPoolEvent` once the dial succeeds.
+        tracing::debug!(
+            endpoint = endpoint,
+            tls = tls_snapshot.is_some(),
+            "dialing raft node",
         );
 
         let channel = lib::transport_primitives::create_channel(
@@ -237,8 +293,6 @@ impl RaftClient {
         )
         .await?;
         let inner = ZoneTransportServiceClient::new(channel);
-
-        tracing::info!("Connected to Raft node at {}", endpoint);
 
         Ok(Self {
             endpoint: endpoint.to_string(),
