@@ -1191,6 +1191,13 @@ impl Kernel {
             );
             return false;
         }
+        tracing::debug!(
+            target: "kernel::observe",
+            path = %path,
+            entry_type,
+            size,
+            "observe_backend_entry: metadata row proposed (backend content materialized to metastore)",
+        );
         true
     }
 

@@ -113,18 +113,22 @@ impl MetadataSink {
     ///   on `st_size == 0`); `0` for DT_DIR.
     /// * `content_id` — `Some(backend_rel_path)` for DT_REG, `None` for
     ///   DT_DIR.
+    ///
+    /// Returns `true` iff a NEW row was proposed (not an idempotent skip
+    /// or a failed put) — the reconcile aggregates this to report how
+    /// much fresh content each pass materialized.
     fn propose(
         &self,
         backend_rel_path: &str,
         entry_type: u8,
         size: u64,
         content_id: Option<String>,
-    ) {
+    ) -> bool {
         let Some(kernel) = self.kernel.upgrade() else {
-            return;
+            return false;
         };
         let global = self.global_path(backend_rel_path);
-        kernel.observe_backend_entry(&global, entry_type, &self.zone_id, size, content_id);
+        kernel.observe_backend_entry(&global, entry_type, &self.zone_id, size, content_id)
     }
 }
 
@@ -191,15 +195,20 @@ fn walk_dir(backend: &dyn ObjectStore, rel: &str, out: &mut Vec<(String, u8, u64
 
 /// Push one full backend listing through the sink. Idempotent at the
 /// kernel layer, so the initial walk and every reconcile tick share it.
-fn sync_once(entries: &[(String, u8, u64)], sink: &MetadataSink) {
+/// Returns the number of NEW rows proposed (existing rows are skipped).
+fn sync_once(entries: &[(String, u8, u64)], sink: &MetadataSink) -> usize {
+    let mut proposed = 0;
     for (rel, etype, size) in entries {
         let content_id = if *etype == DT_REG {
             Some(rel.clone())
         } else {
             None
         };
-        sink.propose(rel, *etype, *size, content_id);
+        if sink.propose(rel, *etype, *size, content_id) {
+            proposed += 1;
+        }
     }
+    proposed
 }
 
 /// Arm the reconcile for a mount: run the initial walk synchronously
@@ -213,10 +222,19 @@ fn sync_once(entries: &[(String, u8, u64)], sink: &MetadataSink) {
 /// sync runs).
 pub(crate) fn arm(backend: Arc<dyn ObjectStore>, sink: MetadataSink) -> MetadataSyncHandle {
     // Layer 1: initial walk, synchronous.
-    sync_once(&collect_backend_listing(backend.as_ref()), &sink);
+    let initial = collect_backend_listing(backend.as_ref());
+    let proposed = sync_once(&initial, &sink);
+    tracing::info!(
+        target: "kernel::metadata_sync",
+        enumerated = initial.len(),
+        proposed,
+        "metadata sync initial walk",
+    );
 
     // Layer 3: periodic reconciler (the self-verifying backstop; a
-    // sub-second watcher is a deferred latency optimization).
+    // sub-second watcher is a deferred latency optimization). Logs at
+    // INFO only when a tick materialises NEW content (never per-tick
+    // spam), so operators see out-of-band writes land in the metastore.
     let (handle, shutdown) = MetadataSyncHandle::new();
     let spawned = std::thread::Builder::new()
         .name("metadata-sync-reconcile".to_string())
@@ -229,7 +247,14 @@ pub(crate) fn arm(backend: Arc<dyn ObjectStore>, sink: MetadataSink) -> Metadata
                         return;
                     }
                 }
-                sync_once(&collect_backend_listing(backend.as_ref()), &sink);
+                let n = sync_once(&collect_backend_listing(backend.as_ref()), &sink);
+                if n > 0 {
+                    tracing::info!(
+                        target: "kernel::metadata_sync",
+                        proposed = n,
+                        "metadata sync reconcile materialised new backend content to metastore",
+                    );
+                }
             }
         });
     if let Err(e) = spawned {
