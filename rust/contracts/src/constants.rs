@@ -179,3 +179,82 @@ pub fn recommended_worker_threads(min_workers: usize) -> usize {
         .unwrap_or(min_workers)
         .max(min_workers)
 }
+
+// ── Privacy-critical logging targets ───────────────────────────────
+//
+// SSOT for "which `tracing` targets carry a signal the daemon must
+// surface even when the operator never sets `RUST_LOG`". The daemon's
+// default `EnvFilter` (targets with no directive → ERROR) would
+// otherwise silently swallow these. Emit sites reference the target
+// const so the string is declared once; the composition root folds the
+// list below onto its operational-verbosity base instead of hardcoding
+// a privacy directive in the filter literal.
+
+/// `tracing` target for the transport-observer's relay data-privacy
+/// caution. The observer emits a WARN under this target when a
+/// cross-node fetch traverses a third-party relay; both the emit sites
+/// (`transport::transport_observer`) and the daemon's filter assembly
+/// (`profiles/cluster`) reference this const so the target string lives
+/// in exactly one place.
+pub const TRANSPORT_OBSERVER_LOG_TARGET: &str = "transport_observer";
+
+/// A logging target whose events are load-bearing enough that the
+/// daemon must admit them even under the default (no-`RUST_LOG`)
+/// filter. `directive()` renders it as an `EnvFilter` directive the
+/// composition root folds onto its base filter.
+pub struct CriticalLogTarget {
+    /// The `tracing` target string (must match the emit site's `target:`).
+    pub target: &'static str,
+    /// Minimum level to admit, e.g. `"warn"`.
+    pub level: &'static str,
+}
+
+impl CriticalLogTarget {
+    /// Render as an `EnvFilter` directive string (`"{target}={level}"`).
+    #[must_use]
+    pub fn directive(&self) -> String {
+        format!("{}={}", self.target, self.level)
+    }
+}
+
+/// The unified list of privacy-critical logging targets the daemon's
+/// filter assembly folds on top of its operational-verbosity base. A
+/// second critical target (e.g. a future `kernel::trust` audit WARN) is
+/// added here as one entry — the composition root's filter code stays
+/// untouched, so "which target is critical" never leaks back into
+/// `main.rs`.
+pub const PRIVACY_CRITICAL_LOG_TARGETS: &[CriticalLogTarget] = &[CriticalLogTarget {
+    target: TRANSPORT_OBSERVER_LOG_TARGET,
+    level: "warn",
+}];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn critical_log_target_directive_renders_target_equals_level() {
+        let t = CriticalLogTarget {
+            target: "kernel::trust",
+            level: "warn",
+        };
+        assert_eq!(t.directive(), "kernel::trust=warn");
+    }
+
+    #[test]
+    fn privacy_critical_list_admits_transport_observer_warn() {
+        // The transport-observer relay caution must be represented so the
+        // daemon's folded default filter surfaces it.
+        assert!(PRIVACY_CRITICAL_LOG_TARGETS
+            .iter()
+            .any(|c| c.target == TRANSPORT_OBSERVER_LOG_TARGET && c.level == "warn"));
+        assert_eq!(
+            PRIVACY_CRITICAL_LOG_TARGETS
+                .iter()
+                .find(|c| c.target == TRANSPORT_OBSERVER_LOG_TARGET)
+                .map(CriticalLogTarget::directive)
+                .as_deref(),
+            Some("transport_observer=warn"),
+        );
+    }
+}
