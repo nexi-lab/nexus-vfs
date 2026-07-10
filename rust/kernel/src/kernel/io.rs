@@ -121,6 +121,19 @@ impl Kernel {
         if reqs.is_empty() {
             return Vec::new();
         }
+        // TEMP DIAGNOSTIC (remove before merge): confirm whether a joiner's
+        // FUSE read actually enters the kernel read path, and single vs batch.
+        // A cross-node fetch that reaches sys_read MUST flow through
+        // sys_read_after_auth -> try_remote_fetch (the RemoteFetch emitter);
+        // if THIS logs on the joiner but the dispatch log does not, the miss
+        // is inside the kernel; if THIS never logs, the bytes are arriving
+        // without entering the kernel read (NFS/FUSE-T layer or another node).
+        tracing::info!(
+            target: "kernel::observe",
+            n = reqs.len(),
+            first = %reqs[0].path,
+            "sys_read entry (diagnostic)",
+        );
         if reqs.len() == 1 {
             let req = &reqs[0];
             return vec![self.sys_read_single(&req.path, ctx, 1, req.timeout_ms, req.offset)];
