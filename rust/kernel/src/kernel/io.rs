@@ -443,7 +443,7 @@ impl Kernel {
             // Local backend miss + metadata exists → federation path:
             // try the origin encoded in backend_name. Otherwise it's a
             // genuine miss.
-            None => self.try_remote_fetch(path, &entry, &route, ctx),
+            None => self.try_remote_fetch(path, &entry),
         }
     }
 
@@ -460,12 +460,15 @@ impl Kernel {
     ///
     /// Returns ``Err(FileNotFound)`` when ``last_writer_address`` is
     /// unset, equals ``self_address``, or the remote call fails.
+    ///
+    /// This is a pure read: it fetches and returns peer bytes with no
+    /// local cache-back, so it takes neither the ``route`` (no backend
+    /// write) nor the ``ctx`` (no write authorization) the former
+    /// materialization needed.
     fn try_remote_fetch(
         &self,
         path: &str,
         entry: &FileMetadata,
-        route: &crate::vfs_router::RouteResult,
-        ctx: &OperationContext,
     ) -> Result<SysReadResult, KernelError> {
         let not_found = || KernelError::FileNotFound(path.to_string());
 
@@ -495,15 +498,13 @@ impl Kernel {
         // dcache or unwritten metadata) — ``BlobFetcher::read`` will
         // path-route it through the peer's VFSRouter.
         //
-        // The fetched blob IS cached back into the local backend after the
-        // fetch (see the ``write_content`` call below). The earlier "kernel
-        // can't know the local addressing scheme" objection was resolved by
-        // passing the metastore's opaque ``content_id`` straight through as
-        // the write key — the kernel never needs to distinguish CAS-vs-PAS.
-        // The cache-back is a failover requirement, not an optimization (see
-        // the comment on that call), so it is default for any mount with a
-        // local backend + a content_id (e.g. LocalConnector), gated only on
-        // those two, and swallows write failures.
+        // This is a pure read: the fetched bytes are returned to the
+        // caller and NOT written back into the local backend. Reads are
+        // on-demand — under §3g the CC path is a FUSE mount, so every
+        // `ls`/`cat` routes back through `try_remote_fetch` and pulls
+        // fresh peer bytes; there is no raw host-dir a reader bypasses,
+        // hence nothing to materialize. (The metastore rows the merged
+        // view needs are already raft-replicated independent of content.)
         //
         // ``peer_client`` is ``RwLock<Arc<dyn PeerBlobClient>>``;
         // ``peer_client_arc()`` clones the Arc out from under the read
@@ -514,31 +515,33 @@ impl Kernel {
             .filter(|s| !s.is_empty())
             .unwrap_or(path);
         let client = self.peer_client_arc();
-        let data = client
-            .fetch(origin, fetch_key)
-            .map_err(KernelError::IOError)?;
+        let data = client.fetch(origin, fetch_key).map_err(|e| {
+            // Surface cross-node fetch failures — otherwise the error string
+            // is lost at the C-ABI boundary (only an errno reaches the FUSE
+            // plugin, which maps any non-not-found error to an opaque
+            // "Invalid request code"), making a broken read path silent.
+            tracing::warn!(
+                target: "kernel::observe",
+                path = %path,
+                origin = %origin,
+                fetch_key = %fetch_key,
+                "cross-node fetch failed: {e}",
+            );
+            KernelError::IOError(e)
+        })?;
 
-        // Cache the fetched blob locally so subsequent reads don't need to
-        // hit the writer node again. Critical for failover: once the
-        // origin goes down, re-fetch would fail (see
-        // `TestLeaderFailover::test_failover_and_recovery`) but the blob
-        // must still be readable from local storage.
-        //
-        // ``write_content`` is idempotent on the addressing key: CAS
-        // backends compute the same hash for the same bytes; PAS
-        // backends overwrite the file at the same backend_path. We pass
-        // through the writer's ``content_id`` (CAS hash or PAS backend_
-        // path — kernel-opaque) so the local backend stores the bytes
-        // under the same key the metastore points at. Failure is
-        // swallowed: the read still returns the bytes, the next read
-        // will simply remote-fetch again.
-        let cache_key = entry.content_id.as_deref().unwrap_or("");
-        if !cache_key.is_empty() {
-            let _ = route
-                .backend
-                .as_ref()
-                .map(|b| b.write_content(&data, cache_key, ctx, 0));
-        }
+        // NOTE: no local cache-back. This used to write the fetched blob
+        // into the reader's local backend (`route.backend.write_content`),
+        // justified as a "failover requirement" citing a
+        // `TestLeaderFailover::test_failover_and_recovery` that never
+        // existed. Its only real load-bearing role was §3f raw-dir
+        // materialization (CC read the LocalConnector host dir directly,
+        // bypassing FUSE). Under §3g the CC path IS the FUSE mount, so
+        // reads are on-demand and no materialization is needed; cc-tasks
+        // is append-only with raft-replicated metastore rows, so no
+        // failover content cache is semantically required either. See the
+        // read-path decouple change (read ⊥ cache ⊥ materialize).
+
         // Broadcast a `RemoteFetch` event to any registered
         // `MutationObserver` filtering that bit.  Kernel names only the
         // opaque `origin` — substrate semantics (Tailscale direct vs
