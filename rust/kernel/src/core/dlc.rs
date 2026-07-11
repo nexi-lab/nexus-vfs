@@ -176,6 +176,27 @@ impl DriverLifecycleCoordinator {
             }
             // RouteResult.mount_point is already a canonical key (e.g. "/root").
             let persist = kernel.with_metastore(&parent_route.mount_point, |ms| {
+                // Idempotency (raft usage contract): the DT_MOUNT row is
+                // committed, replicated state. On resume it is already
+                // applied to the local state machine (replayed from disk),
+                // so re-proposing it is BOTH redundant AND requires a raft
+                // leader — which, during a multi-node cold restart, is not
+                // yet elected because the peer is still booting. Coupling a
+                // fail-loud `propose` to boot is exactly the 2-voter
+                // `not leader, leader hint: None` deadlock both nodes hit
+                // when restarted together. `get` reads the applied state
+                // machine locally (no `propose`, no leader), so when the
+                // routing pointer already matches we skip the write and let
+                // the resuming node wire its local backend from committed
+                // state without blocking boot on consensus. Only a
+                // genuinely-new or re-pointed mount proposes.
+                if let Ok(Some(existing)) = ms.get(mount_point) {
+                    if existing.entry_type == 2
+                        && existing.target_zone_id.as_deref() == Some(zone_id)
+                    {
+                        return Ok(());
+                    }
+                }
                 let meta = crate::meta_store::FileMetadata {
                     path: mount_point.to_string(),
                     size: 0,
@@ -693,6 +714,173 @@ mod metadata_sync_wiring_tests {
         assert!(
             matches!(kernel.metastore_get("/tasks/a.json"), Ok(None)),
             "no row seeded when the mount is not armed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod dt_mount_idempotency_tests {
+    //! Regression for the 2-voter cold-start deadlock: a DT_MOUNT install
+    //! must NOT re-propose already-committed routing state on resume. A
+    //! raft `ZoneMetaStore::put` is a `propose` (needs a leader); on a
+    //! multi-node cold restart no leader exists yet (each voter waits on
+    //! the other to boot), so re-proposing a replayed DT_MOUNT fail-louds
+    //! and both nodes deadlock. `dlc.mount` must read the applied state
+    //! (leader-free `get`) and skip the write when the row already exists.
+
+    use crate::kernel::Kernel;
+    use crate::meta_store::{FileMetadata, MetaStore, MetaStoreError, DT_MOUNT};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// Models a resumed raft follower with NO leader: `get` serves
+    /// already-applied state (leader-free), every `put` (propose) fails
+    /// `not leader`. Counts puts so the test can assert the idempotent
+    /// path issued zero writes.
+    struct LeaderlessStore {
+        seeded: Mutex<HashMap<String, FileMetadata>>,
+        put_calls: AtomicUsize,
+    }
+    impl LeaderlessStore {
+        fn new() -> Self {
+            Self {
+                seeded: Mutex::new(HashMap::new()),
+                put_calls: AtomicUsize::new(0),
+            }
+        }
+        fn seed(&self, path: &str, meta: FileMetadata) {
+            self.seeded.lock().unwrap().insert(path.to_string(), meta);
+        }
+    }
+    impl MetaStore for LeaderlessStore {
+        fn get(&self, path: &str) -> Result<Option<FileMetadata>, MetaStoreError> {
+            Ok(self.seeded.lock().unwrap().get(path).cloned())
+        }
+        fn put(&self, _path: &str, _m: FileMetadata) -> Result<(), MetaStoreError> {
+            self.put_calls.fetch_add(1, Ordering::SeqCst);
+            Err(MetaStoreError::IOError(
+                "not leader, leader hint: None".into(),
+            ))
+        }
+        fn delete(&self, _p: &str) -> Result<bool, MetaStoreError> {
+            Ok(false)
+        }
+        fn list(&self, _p: &str) -> Result<Vec<FileMetadata>, MetaStoreError> {
+            Ok(vec![])
+        }
+        fn exists(&self, p: &str) -> Result<bool, MetaStoreError> {
+            Ok(self.seeded.lock().unwrap().contains_key(p))
+        }
+    }
+
+    fn dt_mount_row(path: &str, target_zone: &str) -> FileMetadata {
+        FileMetadata {
+            path: path.to_string(),
+            size: 0,
+            content_id: None,
+            gen: 0,
+            version: 1,
+            entry_type: DT_MOUNT,
+            zone_id: Some("root".to_string()),
+            mime_type: None,
+            created_at_ms: None,
+            modified_at_ms: None,
+            last_writer_address: None,
+            target_zone_id: Some(target_zone.to_string()),
+            link_target: None,
+            owner_id: None,
+        }
+    }
+
+    /// Resume path: the child sharedzone DT_MOUNT is already committed
+    /// (seeded as applied state). The install reads it via a leader-free
+    /// `get` and skips the propose → mount succeeds with ZERO puts even
+    /// though every put on this store fails `not leader`. This is exactly
+    /// the boot that used to deadlock a 2-voter cluster.
+    #[test]
+    fn resume_skips_propose_when_dt_mount_already_committed() {
+        let kernel = Arc::new(Kernel::new());
+        let store = Arc::new(LeaderlessStore::new());
+        store.seed(
+            "/shared/tasks-nexus-project",
+            dt_mount_row("/shared/tasks-nexus-project", "sharedzone"),
+        );
+
+        // Parent mount carries the leaderless store; the child's persist
+        // routes here via `with_metastore("/shared")`.
+        kernel
+            .dlc
+            .mount(
+                &kernel,
+                "/shared",
+                "root",
+                None,
+                Some(store.clone() as Arc<dyn MetaStore>),
+                None,
+                false,
+            )
+            .expect("mount parent /shared");
+
+        kernel
+            .dlc
+            .mount(
+                &kernel,
+                "/shared/tasks-nexus-project",
+                "sharedzone",
+                None,
+                None,
+                None,
+                false,
+            )
+            .expect("resume install must not block on a leader");
+
+        assert_eq!(
+            store.put_calls.load(Ordering::SeqCst),
+            0,
+            "already-committed DT_MOUNT must not be re-proposed (leader-free resume)"
+        );
+    }
+
+    /// Control: a genuinely-new mount (no committed row) still proposes,
+    /// so the leaderless store surfaces the `not leader` error. The fix is
+    /// specific to already-committed state — it is NOT a blanket swallow
+    /// of put failures (which would silently install unpersisted routes,
+    /// the #4343 fail-closed hazard).
+    #[test]
+    fn new_mount_still_proposes_and_surfaces_leaderless_error() {
+        let kernel = Arc::new(Kernel::new());
+        let store = Arc::new(LeaderlessStore::new()); // nothing seeded
+        kernel
+            .dlc
+            .mount(
+                &kernel,
+                "/shared",
+                "root",
+                None,
+                Some(store.clone() as Arc<dyn MetaStore>),
+                None,
+                false,
+            )
+            .expect("mount parent /shared");
+
+        let result = kernel.dlc.mount(
+            &kernel,
+            "/shared/tasks-nexus-project",
+            "sharedzone",
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(
+            result.is_err(),
+            "a new mount with no committed row must still require a leader"
+        );
+        assert_eq!(
+            store.put_calls.load(Ordering::SeqCst),
+            1,
+            "new mount attempts exactly one propose"
         );
     }
 }
