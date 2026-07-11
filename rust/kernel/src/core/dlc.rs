@@ -176,6 +176,27 @@ impl DriverLifecycleCoordinator {
             }
             // RouteResult.mount_point is already a canonical key (e.g. "/root").
             let persist = kernel.with_metastore(&parent_route.mount_point, |ms| {
+                // Idempotency (raft usage contract): the DT_MOUNT row is
+                // committed, replicated state. On resume it is already
+                // applied to the local state machine (replayed from disk),
+                // so re-proposing it is BOTH redundant AND requires a raft
+                // leader — which, during a multi-node cold restart, is not
+                // yet elected because the peer is still booting. Coupling a
+                // fail-loud `propose` to boot is exactly the 2-voter
+                // `not leader, leader hint: None` deadlock both nodes hit
+                // when restarted together. `get` reads the applied state
+                // machine locally (no `propose`, no leader), so when the
+                // routing pointer already matches we skip the write and let
+                // the resuming node wire its local backend from committed
+                // state without blocking boot on consensus. Only a
+                // genuinely-new or re-pointed mount proposes.
+                if let Ok(Some(existing)) = ms.get(mount_point) {
+                    if existing.entry_type == 2
+                        && existing.target_zone_id.as_deref() == Some(zone_id)
+                    {
+                        return Ok(());
+                    }
+                }
                 let meta = crate::meta_store::FileMetadata {
                     path: mount_point.to_string(),
                     size: 0,
