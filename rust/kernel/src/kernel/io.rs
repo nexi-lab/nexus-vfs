@@ -515,9 +515,20 @@ impl Kernel {
             .filter(|s| !s.is_empty())
             .unwrap_or(path);
         let client = self.peer_client_arc();
-        let data = client
-            .fetch(origin, fetch_key)
-            .map_err(KernelError::IOError)?;
+        let data = client.fetch(origin, fetch_key).map_err(|e| {
+            // Surface cross-node fetch failures — otherwise the error string
+            // is lost at the C-ABI boundary (only an errno reaches the FUSE
+            // plugin, which maps any non-not-found error to an opaque
+            // "Invalid request code"), making a broken read path silent.
+            tracing::warn!(
+                target: "kernel::observe",
+                path = %path,
+                origin = %origin,
+                fetch_key = %fetch_key,
+                "cross-node fetch failed: {e}",
+            );
+            KernelError::IOError(e)
+        })?;
 
         // NOTE: no local cache-back. This used to write the fetched blob
         // into the reader's local backend (`route.backend.write_content`),
