@@ -156,5 +156,33 @@ fn bench_readdir(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_readdir);
+/// `readdir_paged` on an ORDINARY path — the case that must stay free.
+///
+/// This is the path the procfs registry sits in front of. Every readdir
+/// of a normal directory pays the registry's guard (`is_system_path`)
+/// before falling through to `sys_readdir`, so this is where a
+/// regression would show up. Same directory sizes as the `sys_readdir`
+/// baseline above, so the two are directly comparable: the delta between
+/// them IS the dispatch overhead.
+fn bench_readdir_paged(c: &mut Criterion) {
+    let mut group = c.benchmark_group("readdir_paged_ordinary_path");
+    for &n in SIZES {
+        let tmp = tempfile::tempdir().unwrap();
+        let kernel = setup_kernel(tmp.path());
+        let ctx = admin_ctx();
+        let dir = format!("/dir{n}");
+        populate_dir(&kernel, &ctx, &dir, n);
+
+        group.bench_with_input(BenchmarkId::from_parameter(n), &dir, |b, dir| {
+            b.iter(|| {
+                let page = kernel.readdir_paged(black_box(dir), "root", true, 0, None);
+                black_box(page);
+            })
+        });
+        drop(kernel);
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_readdir, bench_readdir_paged);
 criterion_main!(benches);
