@@ -29,6 +29,7 @@ pub use contracts::ROOT_ZONE_ID;
 //                           locks, dispatch, in-memory reference impls
 //                           of the §3.A pillars).
 pub mod abc;
+pub mod auth;
 pub mod core;
 pub mod extensions;
 pub mod federation;

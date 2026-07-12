@@ -27,6 +27,14 @@
 //!   (anthropic / openai / s3 / gcs / …) without the kernel naming
 //!   `backends::*`. Concrete impl lives in the `backends` crate and
 //!   is registered by the host binary at startup.
+//! * [`auth_key_store`] — `AuthKeyStore` trait (§3.B.3). The replicated
+//!   `key_hash → record` store behind API-key authentication. Records
+//!   are a kernel-internal primitive living in their own raft tree, off
+//!   the file-metadata path (the `locks` model), so the kernel needs
+//!   this surface to synthesise the admin-only `/__sys__/auth/keys/`
+//!   view, while the services-tier auth provider reads through it
+//!   because `services ⊥ raft` bars it from naming the impl. Concrete
+//!   impl in `nexus_raft::auth_key_store`; default `NoopAuthKeyStore`.
 //! * [`peer`] — re-export of `lib::transport_primitives::PeerBlobClient`.
 //!   The trait declaration lives in the tier-neutral `lib` crate's
 //!   `transport_primitives` module so raft (server-side fetcher) and
@@ -57,6 +65,7 @@
 //! traits. Kernel primitives (§4) live in `kernel/src/core/` as
 //! concrete types.
 
+pub mod auth_key_store;
 pub mod distributed_coordinator;
 pub mod object_store_provider;
 

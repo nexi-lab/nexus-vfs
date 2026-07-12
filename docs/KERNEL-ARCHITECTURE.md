@@ -428,7 +428,8 @@ The kernel exposes two HAL flavors:
   composition that decomposes ObjectStore.
 - **§3.B Control-Plane HAL** — runtime DI surfaces. Capabilities the kernel
   needs but does not own: distributed namespace topology
-  (`DistributedCoordinator`) and backend instantiation (`ObjectStoreProvider`).
+  (`DistributedCoordinator`), backend instantiation (`ObjectStoreProvider`),
+  and credential-record storage (`AuthKeyStore`).
 
 Both flavors live under `rust/kernel/src/`: `abc/` for the §3.A pillars,
 `hal/` for §3.B.
@@ -456,7 +457,7 @@ opt-in §3.A.2 ObjectStore extension traits (`LlmStreamingBackend`,
 `ObserverBackend`) — each reached through an `ObjectStore::as_*()`
 downcast rather than being a mandatory pillar. `kernel/src/hal/`
 contains the §3.B Control-Plane HAL trait files
-(`DistributedCoordinator`, `ObjectStoreProvider`). Kernel primitives
+(`DistributedCoordinator`, `ObjectStoreProvider`, `AuthKeyStore`). Kernel primitives
 (§4) live in `kernel/src/core/` as concrete types. Extension-trait
 DECLARATIONS stay at the kernel boundary because the
 `ObjectStore::as_*()` method signatures reference them
@@ -562,6 +563,7 @@ trait declared in `kernel/src/hal/`, concrete impl in the owner crate, an
 |-------|------------|--------------|----------------|
 | `DistributedCoordinator` | Per-node distributed namespace topology — zones, mounts, share registry, leader/voter introspection | `NoopDistributedCoordinator` (errors out) | `RaftDistributedCoordinator` in `rust/raft/` |
 | `ObjectStoreProvider` | Construct `Arc<dyn ObjectStore>` for a given backend type + args | `OnceLock` slot installed at boot | `DefaultObjectStoreProvider` in `rust/backends/` |
+| `AuthKeyStore` | Replicated `key_hash → record` store behind API-key authentication | `NoopAuthKeyStore` (resolves nothing, refuses writes) | `RaftAuthKeyStore` in `rust/raft/` |
 
 #### 3.B.1 `DistributedCoordinator`
 
@@ -616,6 +618,33 @@ the slot.
 The trait name describes the capability ("provides ObjectStore instances"), in
 symmetry with `DistributedCoordinator` and the §3.A pillars.
 
+#### 3.B.3 `AuthKeyStore`
+
+**Linux analogue:** the key retention service (`security/keys/`) — the kernel
+holds credential records, userspace policy (PAM / `sshd`) consults them to turn
+a presented credential into an identity, and `/proc/keys` exposes the table
+read-only.
+
+Four methods over `key_hash → record`: `get`, `put`, `delete`, `list`.
+
+Records are **opaque bytes** — the auth provider owns the schema, the kernel
+never interprets it. Each carries an HMAC of the key plus its grants (subject,
+zones, expiry, revoked, admin), making a record a lookup artifact rather than a
+secret. The HMAC signing key is injected at the composition root and never
+travels this trait.
+
+Records live in the raft state machine's dedicated `TREE_AUTH_KEYS` tree,
+alongside the other kernel-internal primitives carved out of "everything is a
+file" (advisory locks, stream / pipe payloads). Sitting off the `sys_read` /
+`readdir` path is what keeps a path walk from reaching a credential and a
+`sys_write` from forging one. The admin-gated, read-only `/__sys__/auth/keys/`
+view — synthesised over `list`, no write path — gives the introspection surface
+back, the same way `/__sys__/locks` does.
+
+Two consumers: the kernel, for that view; and the services-tier auth provider,
+which the `services ⊥ raft` invariant (§6.1) bars from naming `nexus_raft::*`,
+so it resolves credentials through this seam.
+
 ---
 
 ## 4. Kernel Primitives
@@ -641,6 +670,7 @@ with them indirectly through syscalls. See §2.2 for per-syscall usage.
 | **DT_LINK** | `proto/nexus/core/metadata.proto` (`DT_LINK = 6`) + `FileMetadata.link_target` | `symlink(2)` | Path-internal symlink resolved by `VFSRouter::route()` before reaching the backend. Single-hop redirect with `ELOOP` on chained or self-loop links. Details in §4.4 |
 | **PluginLoader** | `rust/kernel/src/core/plugin_loader.rs` | `module_loader` (`kernel/module/main.c`) | Runtime `dlopen`-based loading of service and driver plugins. C ABI contract for version/kind/lifecycle symbols. Wraps dylib instances as `DylibRustService` (`Arc<dyn RustService>`) or `DylibObjectStore` (`Arc<dyn ObjectStore>`) for uniform kernel dispatch. Details in §10 |
 | **PermissionLeaseCache** | `rust/kernel/src/core/permission_cache.rs` | LSM credential cache | Two-level DashMap of `(path, agent_id) → expiry` short-circuiting the permission gate's full ReBAC walk on a recent hit. Inheritance-aware: a parent-directory lease covers child files. Details in §2.4.1. |
+| **ProcfsRegistry** | `rust/kernel/src/core/procfs.rs` | `proc_create()` / `proc_dir_entry` | Registry of read-only `/__sys__/…` views. A subsystem registers a `ProcfsProvider` for its prefix; `readdir` dispatches through the registry, sorts, and paginates. Details in §4.6 |
 
 ### 4.1 Unified LockManager — I/O Lock + Advisory Lock
 
@@ -841,6 +871,43 @@ boundary and the opposite data-flow directions keep them as distinct primitives
 in distinct crates. This is the classic OS split: **cache-invalidation-on-write**
 (dirty dentry/inode eviction, downstream) versus **cache-revalidation-on-read**
 (NFS `d_revalidate` plus a periodic re-walk, upstream).
+
+### 4.6 ProcfsRegistry — `/__sys__/…` Views
+
+Not everything the kernel owns is a file. An advisory lock is a kernel object;
+a credential record lives in its own raft tree, off the `sys_read` / `readdir`
+path *by design*, so that no path walk reaches one and no `sys_write` forges
+one. Both still need an introspection surface. `ProcfsRegistry` is that
+surface — Linux's `proc_create()`, where the lock subsystem registers
+`/proc/locks` rather than the VFS special-casing it.
+
+A subsystem registers a `ProcfsProvider` for its prefix:
+
+| View | Provider | Owner | Admin-gated |
+|------|----------|-------|-------------|
+| `/__sys__/locks` | `LocksProcfs` | `core/lock/` (LockManager) | yes |
+| `/__sys__/zones` | `ZonesProcfs` | `federation/` (via the §3.B.1 slot) | no — topology the peers already share |
+| `/__sys__/auth/keys` | `AuthKeysProcfs` | `auth/` (via the §3.B.3 slot) | yes |
+
+The registry owns sorting and cursor pagination, so a provider just returns its
+entries and every view pages identically. Three rules hold for all of them:
+
+- **Read-only.** There is no write path through a view. A `sys_write` at a
+  view's path lands (at most) an inert metadata entry in the file tree; it
+  cannot mutate the primitive behind the view. That is what lets these views
+  exist while the general `/__sys__` write gate is still open.
+- **Gated at the view, not at `/__sys__`.** Each provider declares its own
+  `admin_only`, and a refused caller gets an **empty listing, never an error** —
+  an error would answer "does this entry exist?" to someone who may not ask.
+- **A projection, never a second copy.** The SSOT stays where it lives; the view
+  synthesises on read. Materialising entries instead would create a shadow SSOT
+  to keep in sync on every revocation and unlock.
+
+State that *can* be a file should simply be one, and then the kernel needs no
+code at all: `/proc/{pid}` is built by the managed-agent service through ordinary
+syscalls (`create_dt_dir` / `create_dt_stream` / `create_dt_link`), which is why
+no provider exists for it. Reach for a provider only when materialising the
+entries would put the SSOT somewhere it must not be.
 
 ---
 

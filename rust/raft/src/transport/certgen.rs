@@ -30,6 +30,30 @@ const NODE_CERT_VALIDITY_DAYS: i64 = 90;
 /// CA all sit at 10-20y).
 const CA_VALIDITY_DAYS: i64 = 365 * 10;
 
+/// Scheme + authority of the identity URI SAN. Certificates are the
+/// only place a node's identity is stated in a way the far end can
+/// verify, so the format lives here — next to the code that mints it —
+/// and `transport::peer_identity` reads it back through
+/// [`parse_node_identity_uri`] rather than re-spelling it.
+const NODE_IDENTITY_URI_PREFIX: &str = "nexus://zone/";
+
+/// Build the identity URI SAN pinned into a node certificate:
+/// `nexus://zone/{zone_id}/node/{node_id}`.
+pub fn node_identity_uri(zone_id: &str, node_id: u64) -> String {
+    format!("{NODE_IDENTITY_URI_PREFIX}{zone_id}/node/{node_id}")
+}
+
+/// Inverse of [`node_identity_uri`] — `None` for any URI that is not
+/// ours or is malformed (a foreign SAN must never resolve to a peer).
+pub fn parse_node_identity_uri(uri: &str) -> Option<(String, u64)> {
+    let rest = uri.strip_prefix(NODE_IDENTITY_URI_PREFIX)?;
+    let (zone_id, node_id) = rest.split_once("/node/")?;
+    if zone_id.is_empty() {
+        return None;
+    }
+    Some((zone_id.to_string(), node_id.parse().ok()?))
+}
+
 /// Generate a node certificate signed by the cluster CA.
 ///
 /// Returns `(node_cert_pem, node_key_pem)` as PEM-encoded bytes.
@@ -37,9 +61,19 @@ const CA_VALIDITY_DAYS: i64 = 365 * 10;
 /// The certificate matches Python `certgen.py` output:
 /// - Algorithm: EC P-256 (ECDSA with SHA-256)
 /// - CN: `nexus-zone-{zone_id}-node-{node_id}`
-/// - SANs: localhost, 127.0.0.1, ::1
+/// - SANs: localhost, 127.0.0.1, ::1, plus the `nexus://` identity URI
 /// - Extended Key Usage: serverAuth + clientAuth (mTLS)
 /// - Validity: see `NODE_CERT_VALIDITY_DAYS`
+///
+/// ## The identity URI SAN
+///
+/// The CN names the *host* (`hostname` when supplied), which is a
+/// display string, not an identity: two nodes can share a hostname and
+/// a host can be renamed. The `nexus://zone/{zone_id}/node/{node_id}`
+/// URI SAN is the machine-readable identity — it is what
+/// `transport::peer_identity` parses to turn a verified mTLS handshake
+/// into a named cluster peer. Pin it here or the identity is not
+/// recoverable at the far end.
 pub fn generate_node_cert(
     node_id: u64,
     zone_id: &str,
@@ -87,6 +121,16 @@ pub fn generate_node_cert(
         ),
         SanType::IpAddress(Ipv4Addr::LOCALHOST.into()),
         SanType::IpAddress(Ipv6Addr::LOCALHOST.into()),
+        // Machine-readable identity — see the fn docs. Not a
+        // reachability SAN; rustls ignores URI SANs for hostname
+        // verification, so this rides along harmlessly and is read back
+        // by `transport::peer_identity::from_der`.
+        SanType::URI(
+            node_identity_uri(zone_id, node_id)
+                .as_str()
+                .try_into()
+                .map_err(|e| format!("identity SAN error: {e}"))?,
+        ),
     ];
     for hostname in extra_hostnames {
         // Try parsing as IP first, fall back to DNS name
@@ -350,6 +394,71 @@ mod tests {
         assert!(!key_pem.is_empty());
         assert!(String::from_utf8_lossy(&cert_pem).contains("BEGIN CERTIFICATE"));
         assert!(String::from_utf8_lossy(&key_pem).contains("BEGIN PRIVATE KEY"));
+    }
+
+    #[test]
+    fn node_identity_uri_round_trips() {
+        let uri = node_identity_uri("sharedzone", 42);
+        assert_eq!(uri, "nexus://zone/sharedzone/node/42");
+        assert_eq!(
+            parse_node_identity_uri(&uri),
+            Some(("sharedzone".to_string(), 42u64))
+        );
+    }
+
+    #[test]
+    fn parse_node_identity_uri_rejects_foreign_and_malformed() {
+        for uri in [
+            "spiffe://other/node/1",               // foreign scheme
+            "nexus://zone//node/1",                // empty zone
+            "nexus://zone/root/node/not-a-number", // non-numeric id
+            "nexus://zone/root",                   // no node segment
+            "",
+        ] {
+            assert_eq!(parse_node_identity_uri(uri), None, "must reject {uri:?}");
+        }
+    }
+
+    /// The identity SAN is the whole basis of the peer auth plane: if a
+    /// minted cert does not carry it, a verified handshake cannot be
+    /// turned into a named node.
+    #[test]
+    fn node_cert_pins_the_identity_uri_san() {
+        use x509_parser::prelude::*;
+
+        let (ca_cert_pem, ca_key_pem) = generate_test_ca();
+        let (cert_pem, _) = generate_node_cert(
+            7,
+            "sharedzone",
+            ca_cert_pem.as_bytes(),
+            ca_key_pem.as_bytes(),
+            &[],
+            Some("win-box"),
+        )
+        .unwrap();
+
+        // `::pem` — x509_parser's prelude also exports a `pem` module.
+        let pem = ::pem::parse(&cert_pem).unwrap();
+        let (_, cert) = X509Certificate::from_der(pem.contents()).unwrap();
+
+        let uris: Vec<&str> = cert
+            .subject_alternative_name()
+            .unwrap()
+            .unwrap()
+            .value
+            .general_names
+            .iter()
+            .filter_map(|gn| match gn {
+                GeneralName::URI(u) => Some(*u),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(uris, vec!["nexus://zone/sharedzone/node/7"]);
+        assert_eq!(
+            parse_node_identity_uri(uris[0]),
+            Some(("sharedzone".to_string(), 7))
+        );
     }
 
     #[test]

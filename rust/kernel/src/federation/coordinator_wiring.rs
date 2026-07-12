@@ -22,8 +22,12 @@
 
 use std::sync::Arc;
 
+use contracts::ZONES_PATH_PREFIX;
+
 use crate::abc::object_store::ObjectStore;
+use crate::core::procfs::ProcfsProvider;
 use crate::kernel::{Kernel, StatResult};
+use crate::meta_store::DT_DIR;
 
 impl Kernel {
     /// Replace the kernel's coordinator slot with a concrete
@@ -79,7 +83,7 @@ impl Kernel {
     /// marker) and `/__sys__/zones/<id>` (per-zone synthesised entry);
     /// `None` otherwise so the caller falls through to normal routing.
     pub(crate) fn zones_procfs_stat(&self, path: &str) -> Option<StatResult> {
-        let suffix = path.strip_prefix("/__sys__/zones")?;
+        let suffix = path.strip_prefix(ZONES_PATH_PREFIX)?;
         let provider = self.distributed_coordinator();
         // Directory marker.
         if suffix.is_empty() || suffix == "/" {
@@ -129,16 +133,37 @@ impl Kernel {
             owner_id: None,
         })
     }
+}
 
-    /// Federation procfs: list zones for `/__sys__/zones/` directory
-    /// reads.  Returns `None` for paths outside the namespace so the
-    /// caller falls through to normal routing.
-    #[allow(dead_code)] // reserved for readdir `/__sys__/zones/` integration
-    pub(crate) fn zones_procfs_readdir(&self, path: &str) -> Option<Vec<String>> {
-        let suffix = path.strip_prefix("/__sys__/zones")?;
-        if !suffix.is_empty() && suffix != "/" {
-            return None;
+/// `/__sys__/zones` — the federation procfs view.
+///
+/// `zones_procfs_stat` above synthesises a per-zone entry for `sys_stat`;
+/// this is the matching `readdir`, registered into the
+/// [`crate::core::procfs`] registry at kernel boot. Zone membership is
+/// cluster topology the peers already know, so unlike the locks and
+/// credential views this one is not admin-gated.
+pub struct ZonesProcfs;
+
+impl ProcfsProvider for ZonesProcfs {
+    fn prefix(&self) -> &str {
+        ZONES_PATH_PREFIX
+    }
+
+    fn admin_only(&self) -> bool {
+        false
+    }
+
+    fn readdir(&self, kernel: &Kernel, sub_path: &str) -> Vec<(String, u8)> {
+        // The view is flat: zones live directly under it, and a zone id
+        // is not a directory to descend into.
+        if !sub_path.is_empty() {
+            return Vec::new();
         }
-        Some(self.distributed_coordinator().list_zones(self))
+        kernel
+            .distributed_coordinator()
+            .list_zones(kernel)
+            .into_iter()
+            .map(|zone_id| (zone_id, DT_DIR))
+            .collect()
     }
 }

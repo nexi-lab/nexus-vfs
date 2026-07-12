@@ -59,8 +59,9 @@ pub use replication_log::ReplicationLog;
 #[cfg(feature = "grpc")]
 pub use state_machine::MountApplyEvent;
 pub use state_machine::{
-    Command, CommandResult, FullStateMachine, HolderInfo, LockAcquireResult, LockEntry, LockInfo,
-    LockState, StateMachine, WitnessStateMachine, WitnessStateMachineInMemory,
+    AppliedEntry, ApplyObserver, Command, CommandResult, FullStateMachine, HolderInfo,
+    LockAcquireResult, LockEntry, LockInfo, LockState, StateMachine, WitnessStateMachine,
+    WitnessStateMachineInMemory,
 };
 
 #[cfg(feature = "consensus")]

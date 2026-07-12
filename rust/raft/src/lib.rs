@@ -100,6 +100,7 @@ pub mod transport;
 //   distributed_coordinator.rs — `RaftDistributedCoordinator` impl of the
 //                                Control-Plane HAL §3.B.1 trait
 //   zone_meta_store.rs         — Raft-backed `kernel::abc::MetaStore` impl
+//   auth_key_store.rs          — Raft-backed `kernel::hal::AuthKeyStore` impl
 //   blob_fetcher_handler.rs    — `KernelBlobFetcher` server-side handler
 //                                co-located with `ZoneApiService` on the
 //                                raft port; reaches kernel data plane
@@ -111,9 +112,17 @@ pub mod transport;
 // — kernel primitives that compose whatever distributed `MetaStore` impl
 // the coordinator DI's (typically `ZoneMetaStore` below).
 #[cfg(all(feature = "grpc", has_protos))]
+pub mod auth_key_store;
+#[cfg(all(feature = "grpc", has_protos))]
 pub mod blob_fetcher_handler;
 #[cfg(all(feature = "grpc", has_protos))]
 pub mod distributed_coordinator;
+
+/// Sync-façade → async-core bridge shared by every raft-backed store
+/// that exposes a synchronous API over the async consensus core.
+#[cfg(all(feature = "grpc", has_protos))]
+pub(crate) mod runtime_bridge;
+
 /// Node-bound peer address book persistence — `identity.json` at a
 /// platform-native user-data location.  Survives `<NEXUS_DATA_DIR>`
 /// wipes so cold-boot does not need operator re-specifying `--peers`.
@@ -166,8 +175,9 @@ pub mod prelude {
     pub use crate::storage::{RedbBatch, RedbStore, RedbTree, RedbTreeBatch, StorageError};
 
     pub use crate::raft::{
-        Command, CommandResult, FullStateMachine, HolderInfo, LockAcquireResult, LockEntry,
-        LockInfo, LockState, RaftError, StateMachine, WitnessStateMachine,
+        AppliedEntry, ApplyObserver, Command, CommandResult, FullStateMachine, HolderInfo,
+        LockAcquireResult, LockEntry, LockInfo, LockState, RaftError, StateMachine,
+        WitnessStateMachine,
     };
 
     #[cfg(feature = "consensus")]

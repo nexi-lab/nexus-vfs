@@ -16,7 +16,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::auth::AuthProvider;
+use crate::auth::{AuthCredentials, AuthProvider};
+use crate::peer_identity;
 use tokio::sync::oneshot;
 use tonic::{transport::Server, Request, Response, Status};
 
@@ -96,10 +97,72 @@ pub(crate) struct VfsServiceImpl {
     pub(crate) started_secs: Arc<AtomicU64>,
 }
 
+/// Every VFS request message carries its bearer token in an `auth_token`
+/// field. Naming that shape as a trait is what lets [`VfsServiceImpl::authenticate`]
+/// be written once instead of 28 times.
+pub(crate) trait AuthedRequest {
+    fn auth_token(&self) -> &str;
+}
+
+macro_rules! impl_authed_request {
+    ($($t:ty),+ $(,)?) => {
+        $(impl AuthedRequest for $t {
+            #[inline]
+            fn auth_token(&self) -> &str {
+                &self.auth_token
+            }
+        })+
+    };
+}
+
+impl_authed_request!(
+    BatchReadRequest,
+    BatchStatRequest,
+    BatchWriteRequest,
+    CallRequest,
+    CopyRequest,
+    DeleteRequest,
+    GetXattrBulkRequest,
+    GetXattrRequest,
+    IpcEmpty,
+    IpcPathRequest,
+    LockRequest,
+    MkdirRequest,
+    PingRequest,
+    ReadRequest,
+    ReaddirRequest,
+    RenameRequest,
+    SetXattrRequest,
+    SetattrRequest,
+    StatRequest,
+    StreamReadAtRequest,
+    StreamWriteRequest,
+    UnlockRequest,
+    WatchRequest,
+    WriteRequest,
+);
+
 impl VfsServiceImpl {
-    /// Validate the bearer token via the configured `AuthProvider`.
-    pub(crate) fn resolve_context(&self, token: &str) -> Result<OperationContext, Status> {
-        self.auth.resolve(token)
+    /// Authenticate a request and unwrap it.
+    ///
+    /// The peer certificate must be read off the `Request` envelope
+    /// *before* `into_inner()` drops it — that ordering is the whole
+    /// reason this helper exists rather than each handler unwrapping
+    /// first and resolving a bare token. A caller reaching a handler
+    /// over mTLS has already had its chain verified against the cluster
+    /// CA by rustls, and [`AuthCredentials::peer`] is how a provider
+    /// gets to use that fact.
+    pub(crate) fn authenticate<T: AuthedRequest>(
+        &self,
+        req: Request<T>,
+    ) -> Result<(OperationContext, T), Status> {
+        let peer = peer_identity::from_request(&req);
+        let inner = req.into_inner();
+        let ctx = self.auth.resolve(&AuthCredentials {
+            token: inner.auth_token(),
+            peer: peer.as_ref(),
+        })?;
+        Ok((ctx, inner))
     }
 
     pub(crate) fn map_kernel_err(&self, err: KernelError) -> (RpcErrorCode, String) {
@@ -348,9 +411,8 @@ where
 #[tonic::async_trait]
 impl NexusVfsService for VfsServiceImpl {
     async fn read(&self, req: Request<ReadRequest>) -> Result<Response<ReadResponse>, Status> {
-        let req = req.into_inner();
-        let ctx = match self.resolve_context(&req.auth_token) {
-            Ok(c) => c,
+        let (ctx, req) = match self.authenticate(req) {
+            Ok(v) => v,
             Err(s) => return Ok(Response::new(error_read(s))),
         };
         // No federation guard: KernelAbi::sys_read consults ctx.zone_perms via
@@ -402,9 +464,8 @@ impl NexusVfsService for VfsServiceImpl {
     }
 
     async fn write(&self, req: Request<WriteRequest>) -> Result<Response<WriteResponse>, Status> {
-        let req = req.into_inner();
-        let ctx = match self.resolve_context(&req.auth_token) {
-            Ok(c) => c,
+        let (ctx, req) = match self.authenticate(req) {
+            Ok(v) => v,
             Err(s) => return Ok(Response::new(error_write(s))),
         };
         // No federation guard: ctx.zone_perms is enforced inside sys_write's
@@ -440,9 +501,8 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<DeleteRequest>,
     ) -> Result<Response<DeleteResponse>, Status> {
-        let req = req.into_inner();
-        let ctx = match self.resolve_context(&req.auth_token) {
-            Ok(c) => c,
+        let (ctx, req) = match self.authenticate(req) {
+            Ok(v) => v,
             Err(s) => return Ok(Response::new(error_delete(s))),
         };
         // No federation guard: ctx.zone_perms is enforced inside sys_unlink's
@@ -479,9 +539,8 @@ impl NexusVfsService for VfsServiceImpl {
     }
 
     async fn mkdir(&self, req: Request<MkdirRequest>) -> Result<Response<MkdirResponse>, Status> {
-        let req = req.into_inner();
-        let ctx = match self.resolve_context(&req.auth_token) {
-            Ok(c) => c,
+        let (ctx, req) = match self.authenticate(req) {
+            Ok(v) => v,
             Err(s) => return Ok(Response::new(error_mkdir(s))),
         };
         match KernelConvenience::mkdir(&*self.kernel, &req.path, &ctx, req.parents, req.exist_ok) {
@@ -502,9 +561,8 @@ impl NexusVfsService for VfsServiceImpl {
     }
 
     async fn stat(&self, req: Request<StatRequest>) -> Result<Response<StatResponse>, Status> {
-        let req = req.into_inner();
-        let ctx = match self.resolve_context(&req.auth_token) {
-            Ok(c) => c,
+        let (ctx, req) = match self.authenticate(req) {
+            Ok(v) => v,
             Err(s) => return Ok(Response::new(error_stat(s))),
         };
         let zone_id = if req.zone_id.is_empty() {
@@ -546,9 +604,8 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<ReaddirRequest>,
     ) -> Result<Response<ReaddirResponse>, Status> {
-        let req = req.into_inner();
-        let ctx = match self.resolve_context(&req.auth_token) {
-            Ok(c) => c,
+        let (ctx, req) = match self.authenticate(req) {
+            Ok(v) => v,
             Err(s) => return Ok(Response::new(error_readdir(s))),
         };
         let zone_id = if req.zone_id.is_empty() {
@@ -589,9 +646,8 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<SetattrRequest>,
     ) -> Result<Response<SetattrResponse>, Status> {
-        let req = req.into_inner();
-        let ctx = match self.resolve_context(&req.auth_token) {
-            Ok(c) => c,
+        let (ctx, req) = match self.authenticate(req) {
+            Ok(v) => v,
             Err(s) => return Ok(Response::new(error_setattr(s))),
         };
         // DT_MOUNT (entry_type == 2) — bridge-2 (#4262): build a live
@@ -662,9 +718,8 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<RenameRequest>,
     ) -> Result<Response<RenameResponse>, Status> {
-        let req = req.into_inner();
-        let ctx = match self.resolve_context(&req.auth_token) {
-            Ok(c) => c,
+        let (ctx, req) = match self.authenticate(req) {
+            Ok(v) => v,
             Err(s) => return Ok(Response::new(error_rename(s))),
         };
         // Offload: sys_rename waits on VFS write lock
@@ -703,9 +758,8 @@ impl NexusVfsService for VfsServiceImpl {
     }
 
     async fn copy(&self, req: Request<CopyRequest>) -> Result<Response<CopyResponse>, Status> {
-        let req = req.into_inner();
-        let ctx = match self.resolve_context(&req.auth_token) {
-            Ok(c) => c,
+        let (ctx, req) = match self.authenticate(req) {
+            Ok(v) => v,
             Err(s) => return Ok(Response::new(error_copy(s))),
         };
         // Offload: sys_copy waits on VFS write lock
@@ -742,9 +796,8 @@ impl NexusVfsService for VfsServiceImpl {
     }
 
     async fn lock(&self, req: Request<LockRequest>) -> Result<Response<LockResponse>, Status> {
-        let req = req.into_inner();
-        let _ctx = match self.resolve_context(&req.auth_token) {
-            Ok(c) => c,
+        let (_ctx, req) = match self.authenticate(req) {
+            Ok(v) => v,
             Err(s) => return Ok(Response::new(error_lock(s))),
         };
         // Match the Call wire surface (mode / max_holders / ttl_secs are
@@ -786,9 +839,8 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<UnlockRequest>,
     ) -> Result<Response<UnlockResponse>, Status> {
-        let req = req.into_inner();
-        let _ctx = match self.resolve_context(&req.auth_token) {
-            Ok(c) => c,
+        let (_ctx, req) = match self.authenticate(req) {
+            Ok(v) => v,
             Err(s) => return Ok(Response::new(error_unlock(s))),
         };
         match self.kernel.sys_unlock(&req.path, &req.lock_id, req.force) {
@@ -809,9 +861,8 @@ impl NexusVfsService for VfsServiceImpl {
     }
 
     async fn watch(&self, req: Request<WatchRequest>) -> Result<Response<WatchResponse>, Status> {
-        let req = req.into_inner();
-        let _ctx = match self.resolve_context(&req.auth_token) {
-            Ok(c) => c,
+        let (_ctx, req) = match self.authenticate(req) {
+            Ok(v) => v,
             Err(s) => return Ok(Response::new(error_watch(s))),
         };
         // Offload: sys_watch blocks up to 30s waiting for events
@@ -846,9 +897,8 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<GetXattrRequest>,
     ) -> Result<Response<GetXattrResponse>, Status> {
-        let req = req.into_inner();
-        let _ctx = match self.resolve_context(&req.auth_token) {
-            Ok(c) => c,
+        let (_ctx, req) = match self.authenticate(req) {
+            Ok(v) => v,
             Err(s) => return Ok(Response::new(error_get_xattr(s))),
         };
         match KernelConvenience::get_xattr(&*self.kernel, &req.path, &req.key, kernel::ROOT_ZONE_ID)
@@ -881,9 +931,8 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<SetXattrRequest>,
     ) -> Result<Response<SetXattrResponse>, Status> {
-        let req = req.into_inner();
-        let _ctx = match self.resolve_context(&req.auth_token) {
-            Ok(c) => c,
+        let (_ctx, req) = match self.authenticate(req) {
+            Ok(v) => v,
             Err(s) => return Ok(Response::new(error_set_xattr(s))),
         };
         match KernelConvenience::set_xattr(
@@ -911,9 +960,8 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<GetXattrBulkRequest>,
     ) -> Result<Response<GetXattrBulkResponse>, Status> {
-        let req = req.into_inner();
-        let _ctx = match self.resolve_context(&req.auth_token) {
-            Ok(c) => c,
+        let (_ctx, req) = match self.authenticate(req) {
+            Ok(v) => v,
             Err(s) => return Ok(Response::new(error_get_xattr_bulk(s))),
         };
         match KernelConvenience::get_xattr_bulk(
@@ -946,9 +994,8 @@ impl NexusVfsService for VfsServiceImpl {
     }
 
     async fn close_pipe(&self, req: Request<IpcPathRequest>) -> Result<Response<IpcAck>, Status> {
-        let req = req.into_inner();
-        let _ctx = match self.resolve_context(&req.auth_token) {
-            Ok(c) => c,
+        let (_ctx, req) = match self.authenticate(req) {
+            Ok(v) => v,
             Err(s) => return Ok(Response::new(error_ipc_ack(s))),
         };
         match self.kernel.close_pipe(&req.path) {
@@ -970,9 +1017,8 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<IpcPathRequest>,
     ) -> Result<Response<IpcHasResponse>, Status> {
-        let req = req.into_inner();
-        let _ctx = match self.resolve_context(&req.auth_token) {
-            Ok(c) => c,
+        let (_ctx, req) = match self.authenticate(req) {
+            Ok(v) => v,
             Err(s) => return Ok(Response::new(error_ipc_has(s))),
         };
         Ok(Response::new(IpcHasResponse {
@@ -983,9 +1029,8 @@ impl NexusVfsService for VfsServiceImpl {
     }
 
     async fn close_all_pipes(&self, req: Request<IpcEmpty>) -> Result<Response<IpcAck>, Status> {
-        let req = req.into_inner();
-        let _ctx = match self.resolve_context(&req.auth_token) {
-            Ok(c) => c,
+        let (_ctx, _req) = match self.authenticate(req) {
+            Ok(v) => v,
             Err(s) => return Ok(Response::new(error_ipc_ack(s))),
         };
         self.kernel.close_all_pipes();
@@ -996,9 +1041,8 @@ impl NexusVfsService for VfsServiceImpl {
     }
 
     async fn close_stream(&self, req: Request<IpcPathRequest>) -> Result<Response<IpcAck>, Status> {
-        let req = req.into_inner();
-        let _ctx = match self.resolve_context(&req.auth_token) {
-            Ok(c) => c,
+        let (_ctx, req) = match self.authenticate(req) {
+            Ok(v) => v,
             Err(s) => return Ok(Response::new(error_ipc_ack(s))),
         };
         match self.kernel.close_stream(&req.path) {
@@ -1020,9 +1064,8 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<IpcPathRequest>,
     ) -> Result<Response<IpcHasResponse>, Status> {
-        let req = req.into_inner();
-        let _ctx = match self.resolve_context(&req.auth_token) {
-            Ok(c) => c,
+        let (_ctx, req) = match self.authenticate(req) {
+            Ok(v) => v,
             Err(s) => return Ok(Response::new(error_ipc_has(s))),
         };
         Ok(Response::new(IpcHasResponse {
@@ -1036,9 +1079,8 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<StreamWriteRequest>,
     ) -> Result<Response<StreamWriteResponse>, Status> {
-        let req = req.into_inner();
-        let _ctx = match self.resolve_context(&req.auth_token) {
-            Ok(c) => c,
+        let (_ctx, req) = match self.authenticate(req) {
+            Ok(v) => v,
             Err(s) => return Ok(Response::new(error_stream_write(s))),
         };
         match self.kernel.stream_write_nowait(&req.path, &req.data) {
@@ -1062,9 +1104,8 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<StreamReadAtRequest>,
     ) -> Result<Response<StreamReadAtResponse>, Status> {
-        let req = req.into_inner();
-        let _ctx = match self.resolve_context(&req.auth_token) {
-            Ok(c) => c,
+        let (_ctx, req) = match self.authenticate(req) {
+            Ok(v) => v,
             Err(s) => return Ok(Response::new(error_stream_read(s))),
         };
         if req.blocking {
@@ -1129,9 +1170,8 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<IpcPathRequest>,
     ) -> Result<Response<StreamCollectAllResponse>, Status> {
-        let req = req.into_inner();
-        let _ctx = match self.resolve_context(&req.auth_token) {
-            Ok(c) => c,
+        let (_ctx, req) = match self.authenticate(req) {
+            Ok(v) => v,
             Err(s) => return Ok(Response::new(error_stream_collect(s))),
         };
         match self.kernel.stream_collect_all(&req.path) {
@@ -1152,7 +1192,7 @@ impl NexusVfsService for VfsServiceImpl {
     }
 
     async fn ping(&self, req: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
-        let ctx = self.resolve_context(&req.into_inner().auth_token)?;
+        let (ctx, _req) = self.authenticate(req)?;
         let uptime = self.server_started_at.elapsed().as_secs() as i64;
         self.started_secs.store(uptime as u64, Ordering::Relaxed);
         Ok(Response::new(PingResponse {
@@ -1166,9 +1206,8 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<BatchReadRequest>,
     ) -> Result<Response<BatchReadResponse>, Status> {
-        let req = req.into_inner();
-        let ctx = match self.resolve_context(&req.auth_token) {
-            Ok(c) => c,
+        let (ctx, req) = match self.authenticate(req) {
+            Ok(v) => v,
             Err(s) => return Err(s),
         };
         // No federation guard: read_batch composes per-item sys_read on the
@@ -1233,9 +1272,8 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<BatchStatRequest>,
     ) -> Result<Response<BatchStatResponse>, Status> {
-        let req = req.into_inner();
-        let ctx = match self.resolve_context(&req.auth_token) {
-            Ok(c) => c,
+        let (ctx, req) = match self.authenticate(req) {
+            Ok(v) => v,
             Err(s) => return Err(s),
         };
         // No federation guard: stat_batch goes through metastore-direct path
@@ -1285,9 +1323,8 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<BatchWriteRequest>,
     ) -> Result<Response<BatchWriteResponse>, Status> {
-        let req = req.into_inner();
-        let ctx = match self.resolve_context(&req.auth_token) {
-            Ok(c) => c,
+        let (ctx, req) = match self.authenticate(req) {
+            Ok(v) => v,
             Err(s) => return Err(s),
         };
         // No federation guard: write_batch composes per-item KernelConvenience
@@ -1340,8 +1377,7 @@ impl NexusVfsService for VfsServiceImpl {
     }
 
     async fn call(&self, req: Request<CallRequest>) -> Result<Response<CallResponse>, Status> {
-        let req = req.into_inner();
-        let ctx = self.resolve_context(&req.auth_token)?;
+        let (ctx, req) = self.authenticate(req)?;
         // Offload: call dispatch may invoke blocking kernel ops
         let kernel = self.kernel.clone();
         let method = req.method;

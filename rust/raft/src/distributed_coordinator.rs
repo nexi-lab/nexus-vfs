@@ -2389,10 +2389,10 @@ fn install_mount_apply_cb_impl(
     parent_zone_id: &str,
     consensus: &crate::raft::ZoneConsensus<crate::raft::FullStateMachine>,
 ) {
-    let Some(slot) = consensus.mount_apply_cb_slot() else {
-        tracing::warn!(parent_zone_id = %parent_zone_id, "install_mount_apply_cb: slot returned None");
+    if consensus.apply_observers_slot().is_none() {
+        tracing::warn!(parent_zone_id = %parent_zone_id, "install_mount_apply_cb: no observer slot (witness?)");
         return;
-    };
+    }
     let vfs_router = Arc::clone(vfs_router);
     let lock_manager = Arc::clone(lock_manager);
     let registry = Arc::clone(registry);
@@ -2400,9 +2400,24 @@ fn install_mount_apply_cb_impl(
     let cross_zone_mounts = Arc::clone(cross_zone_mounts);
     let parent_zone_owned = parent_zone_id.to_string();
 
-    use crate::raft::MountApplyEvent;
-    let cb: Arc<dyn Fn(&MountApplyEvent) + Send + Sync> =
-        Arc::new(move |event: &MountApplyEvent| match event {
+    use crate::raft::{AppliedEntry, FullStateMachine, MountApplyEvent};
+    // Mount observer: translate the applied command into a
+    // MountApplyEvent (matching only DT_MOUNT set/remove; the pre-image
+    // arrives via entry.removed_mount_key) and wire / unwire. Every other
+    // command variant yields None and is ignored — behavior-preserving
+    // vs. the pre-unification dedicated DT_MOUNT slot.
+    //
+    // Registered under the "federation_mount" dedup key so the 7+
+    // re-installs per zone (boot resume / join / mount / rewire) REPLACE
+    // rather than accumulate — matching the old single-Option slot's
+    // "idempotent replace on same coherence_id" contract.
+    let cb: Arc<dyn Fn(&AppliedEntry) + Send + Sync> = Arc::new(move |entry: &AppliedEntry| {
+        let Some(event) =
+            FullStateMachine::mount_apply_event_from(entry.command, entry.removed_mount_key)
+        else {
+            return;
+        };
+        match event {
             MountApplyEvent::Set {
                 key,
                 target_zone_id,
@@ -2414,16 +2429,17 @@ fn install_mount_apply_cb_impl(
                     &runtime,
                     &cross_zone_mounts,
                     &parent_zone_owned,
-                    key,
-                    target_zone_id,
+                    &key,
+                    &target_zone_id,
                 );
             }
             MountApplyEvent::Delete { key } => {
-                unwire_mount_core(&vfs_router, &cross_zone_mounts, &parent_zone_owned, key);
+                unwire_mount_core(&vfs_router, &cross_zone_mounts, &parent_zone_owned, &key);
             }
-        });
-    *slot.write() = Some(cb);
-    tracing::info!(parent_zone_id = %parent_zone_id, "install_mount_apply_cb: slot set");
+        }
+    });
+    consensus.register_keyed_apply_observer("federation_mount", cb);
+    tracing::info!(parent_zone_id = %parent_zone_id, "install_mount_apply_cb: observer registered");
 }
 
 /// Wire a federation mount synchronously from the leader's

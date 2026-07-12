@@ -2502,6 +2502,7 @@ dependencies = [
  "tonic-prost-build",
  "tracing",
  "tracing-subscriber",
+ "x509-parser",
 ]
 
 [[package]]
@@ -3595,6 +3596,7 @@ dependencies = [
  "kernel",
  "lib",
  "parking_lot",
+ "pem",
  "prost",
  "raft 0.1.0",
  "rcgen",
@@ -3611,6 +3613,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "x509-parser",
 ]
 
 [[package]]

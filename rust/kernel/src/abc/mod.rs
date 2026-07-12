@@ -11,8 +11,10 @@
 //! mandatory pillars every backend implements. Peer-blob fetch
 //! (`crate::hal::peer::PeerBlobClient`) is a transport-layer
 //! abstraction reached through the kernel's peer_client slot. Kernel
-//! primitives (vfs_router, dlc, dcache, locks, dispatch, …) live in
-//! `crate::core::*` and never declare traits.
+//! primitives (vfs_router, dlc, dcache, locks, dispatch, procfs, …) live
+//! in `crate::core::*`; the traits they declare are the registration
+//! interfaces their own registries dispatch through
+//! (`NativeInterceptHook`, `ProcfsProvider`, …), never a §3 HAL surface.
 //!
 //! The three pillars — `ObjectStore`, `MetaStore`, `CacheStore` — are
 //! co-equal: each is its own trait file and travels with its associated

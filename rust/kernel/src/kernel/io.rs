@@ -3600,7 +3600,8 @@ impl Kernel {
     /// pagination. `limit=0` returns all (backward compat). Cursor is
     /// the last path from the previous page.
     ///
-    /// Intercepts `/__sys__/locks` prefix → `lock_manager.list_locks`.
+    /// Dispatches `/__sys__/…` paths to their registered
+    /// [`crate::core::procfs::ProcfsProvider`] (locks, zones, auth keys).
     pub fn readdir_paged(
         &self,
         parent_path: &str,
@@ -3609,34 +3610,41 @@ impl Kernel {
         limit: usize,
         cursor: Option<&str>,
     ) -> super::ReadDirResult {
-        // /__sys__/locks intercept — admin-only lock enumeration.
-        if parent_path == contracts::LOCKS_PATH_PREFIX
-            || parent_path.starts_with(&format!("{}/", contracts::LOCKS_PATH_PREFIX))
+        // Procfs views — one dispatch covering every registered view. A
+        // new view is a `procfs.register(…)`, never another branch here.
+        //
+        // Every view lives under `/__sys__/`, so an ordinary readdir pays
+        // exactly one `starts_with` and never touches the registry.
+        if let Some((provider, sub_path)) = contracts::is_system_path(parent_path)
+            .then(|| self.procfs.resolve(parent_path))
+            .flatten()
         {
-            if !is_admin {
+            // A refused caller gets an empty listing rather than an
+            // error: an error would tell them whether the entry exists.
+            if provider.admin_only() && !is_admin {
                 return super::ReadDirResult {
                     items: Vec::new(),
                     next_cursor: None,
                     has_more: false,
                 };
             }
-            let prefix = if parent_path == contracts::LOCKS_PATH_PREFIX {
-                ""
-            } else {
-                parent_path
-                    .strip_prefix(&format!("{}/", contracts::LOCKS_PATH_PREFIX))
-                    .unwrap_or("")
+            let mut all = provider.readdir(self, &sub_path);
+            // Sorting is what makes the cursor well-defined — a provider
+            // hands back entries in whatever order its SSOT holds them.
+            all.sort_by(|(a, _), (b, _)| a.cmp(b));
+            let start_idx = match cursor {
+                Some(c) => all
+                    .iter()
+                    .position(|(name, _)| name.as_str() > c)
+                    .unwrap_or(all.len()),
+                None => 0,
             };
-            let effective_limit = if limit == 0 { 10000 } else { limit };
-            let locks = self.lock_manager.list_locks(prefix, effective_limit + 1);
-            let has_more = locks.len() > effective_limit;
-            let items: Vec<(String, u8)> = locks
-                .into_iter()
-                .take(effective_limit)
-                .map(|l| (l.path.clone(), DT_REG))
-                .collect();
+            let page = &all[start_idx..];
+            let effective_limit = if limit == 0 { 10_000 } else { limit };
+            let has_more = page.len() > effective_limit;
+            let items: Vec<(String, u8)> = page.iter().take(effective_limit).cloned().collect();
             let next_cursor = if has_more {
-                items.last().map(|(p, _)| p.clone())
+                items.last().map(|(name, _)| name.clone())
             } else {
                 None
             };
