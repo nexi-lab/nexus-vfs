@@ -30,10 +30,9 @@
 //! wrappers wrap it directly — re-exported here under
 //! [`vfs::RpcTransport`] for the canonical out-bound name.
 
-/// `AuthProvider` trait + kernel-default `NoAuth` impl. Consumed by
-/// `transport::grpc::VfsServiceImpl`. Other auth impls (API-key,
-/// JWT, OIDC, …) live in the deployment-tier service that introduces
-/// them, not here.
+/// `AuthProvider` trait, the `AuthCredentials` it resolves (token +
+/// mTLS peer), and the single-node-dev `NoAuth` impl. Consumed by
+/// `transport::grpc::VfsServiceImpl`.
 pub mod auth;
 /// Generic `Call` RPC dispatcher — JSON in, kernel syscall, JSON out.
 pub mod call_dispatch;
@@ -46,6 +45,10 @@ pub mod grpc;
 /// docs for the dispatch contract.
 pub mod grpc_plugin_proxy;
 pub mod peer_blob;
+/// Recover the caller's identity from the mTLS client certificate that
+/// rustls has already verified against the cluster CA. Feeds
+/// `AuthCredentials::peer`.
+pub mod peer_identity;
 /// Post-transport substrate observability.  Dual of
 /// [`peer_blob`]: peer_blob does cross-node blob fetches,
 /// transport_observer classifies which substrate path each fetch

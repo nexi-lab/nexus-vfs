@@ -36,6 +36,10 @@ dashmap = "6.1"
 thiserror = "2"
 tracing = "0.1"
 sha2 = "0.11"
+# Recover the mTLS peer's identity from the client cert tonic already
+# verified (`peer_identity`). Parsing only — cert *minting* stays in
+# `raft::transport::certgen`.
+x509-parser = "0.18"
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
@@ -55,6 +59,8 @@ tower = { version = "0.5", default-features = false }
 [dev-dependencies]
 tempfile = "3"
 rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
+# peer_identity tests re-parse a certgen-minted PEM back to DER.
+pem = "3"
 # E2E: real tonic client round-trips a request through PluginProxyService.
 # tonic-prost provides ProstCodec for the raw unary path; prost emits the
 # Message derive for the inline EchoMsg type the test exchanges.
