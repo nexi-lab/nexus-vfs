@@ -144,6 +144,34 @@ pub enum Command {
 
     /// No-op command (used for leader election confirmation).
     Noop,
+
+    // ── Auth-key store ───────────────────────────────────────────────
+    //
+    // Kept AFTER `Noop` on purpose: bincode encodes an enum variant by
+    // its declaration index, and the raft log is persisted + replicated
+    // with that encoding. Appending here preserves every existing
+    // variant's index, so logs written before these commands existed
+    // still decode. New variants must always be appended, never
+    // inserted mid-enum.
+    /// Upsert an API-key record into the dedicated `TREE_AUTH_KEYS`
+    /// tree (the "locks" pattern — a kernel-internal primitive, not a
+    /// file). `record` is opaque bytes the state machine never
+    /// interprets; the auth provider owns the schema. Kept out of the
+    /// file-metadata tree so `ZoneMetaStore`/snapshot walkers, which
+    /// assume every metadata value is a `FileMetadata` proto, never
+    /// see it. Raft-replicated ⇒ revocation propagates to every replica.
+    PutAuthKey {
+        /// HMAC of the API key (hex). The lookup key, not a secret.
+        key_hash: String,
+        /// Opaque serialized auth record.
+        record: Vec<u8>,
+    },
+
+    /// Remove an API-key record (revocation).
+    DeleteAuthKey {
+        /// HMAC of the API key to remove.
+        key_hash: String,
+    },
 }
 
 /// Result of applying a command.
@@ -511,6 +539,16 @@ const TREE_METADATA: &str = "sm_metadata";
 /// opaque strings (the kernel picks a ``/__wal_stream__/<id>/<seq>``
 /// convention); values are raw bytes.
 const TREE_STREAM_ENTRIES: &str = "sm_stream_entries";
+/// Dedicated redb tree for API-key records (auth-key store).
+///
+/// Holds ``Command::PutAuthKey`` payloads, separate from
+/// ``TREE_METADATA`` for the same reason ``TREE_STREAM_ENTRIES`` is:
+/// the values are opaque bytes, not ``FileMetadata`` protos, so keeping
+/// them out of the metadata tree stops ``ZoneMetaStore``/snapshot
+/// walkers (which assume every value decodes as a proto) from choking.
+/// Keys are ``key_hash`` hex strings; values are the auth provider's
+/// serialized record.
+const TREE_AUTH_KEYS: &str = "sm_auth_keys";
 const KEY_LAST_APPLIED: &[u8] = b"__last_applied__";
 
 // R14: Advisory locks no longer have a redb tree. The BTreeMap in
@@ -602,6 +640,14 @@ pub struct FullStateMachine {
     /// Distinct from ``metadata`` so WAL stream payloads never appear
     /// in file-listing scans / snapshots that walk ``sm_metadata``.
     stream_entries: RedbTree,
+    /// Auth-key records tree — ``key_hash`` -> opaque record bytes.
+    ///
+    /// Distinct from ``metadata`` for the same reason as
+    /// ``stream_entries``: the values are not ``FileMetadata`` protos,
+    /// so they must stay off the file-metadata path. Written by
+    /// ``Command::PutAuthKey`` / ``DeleteAuthKey``; read by
+    /// [`Self::get_auth_key`] / [`Self::list_auth_keys`].
+    auth_keys: RedbTree,
     /// Advisory lock SSOT — shared with the kernel's `LockManager`.
     advisory: Arc<Mutex<LockState>>,
     /// Last applied metadata/Noop log index (persisted to redb).
@@ -678,6 +724,7 @@ impl FullStateMachine {
     pub fn with_advisory(store: &RedbStore, advisory: Arc<Mutex<LockState>>) -> Result<Self> {
         let metadata = store.tree(TREE_METADATA)?;
         let stream_entries = store.tree(TREE_STREAM_ENTRIES)?;
+        let auth_keys = store.tree(TREE_AUTH_KEYS)?;
 
         // Load last_applied from metadata tree.
         let last_applied = match metadata.get(KEY_LAST_APPLIED)? {
@@ -693,6 +740,7 @@ impl FullStateMachine {
         Ok(Self {
             metadata,
             stream_entries,
+            auth_keys,
             advisory,
             last_applied: Arc::new(AtomicU64::new(last_applied)),
             #[cfg(feature = "grpc")]
@@ -1173,6 +1221,32 @@ impl FullStateMachine {
         Ok(self.stream_entries.get(key.as_bytes())?)
     }
 
+    /// Look up an API-key record by its ``key_hash``.
+    ///
+    /// Returns the opaque record bytes stored by
+    /// ``Command::PutAuthKey`` (``Ok(None)`` if absent or revoked). Reads
+    /// the locally-applied state machine — no consensus round-trip — so
+    /// it is cheap enough for the auth provider's per-RPC lookup on a
+    /// cache miss.
+    pub fn get_auth_key(&self, key_hash: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self.auth_keys.get(key_hash.as_bytes())?)
+    }
+
+    /// Enumerate every API-key record as ``(key_hash, record_bytes)``.
+    ///
+    /// Backs the admin-only ``/__sys__/auth/keys/`` procfs view and
+    /// key-management tooling. Not a hot path — a full tree scan.
+    pub fn list_auth_keys(&self) -> Result<Vec<(String, Vec<u8>)>> {
+        let mut out = Vec::new();
+        for item in self.auth_keys.iter() {
+            let (key, value) = item?;
+            if let Ok(hash) = String::from_utf8(key) {
+                out.push((hash, value));
+            }
+        }
+        Ok(out)
+    }
+
     /// Delete every stream entry whose key begins with ``prefix`` (R19.1b').
     ///
     /// Returns the number of rows removed. Used when a WAL stream is
@@ -1251,6 +1325,10 @@ struct Snapshot {
     /// All stream entries (R19.1b').
     #[serde(default)]
     stream_entries: HashMap<String, Vec<u8>>,
+    /// All auth-key records. ``serde(default)`` so snapshots taken
+    /// before the auth-key store existed still restore (empty map).
+    #[serde(default)]
+    auth_keys: HashMap<String, Vec<u8>>,
     /// Advisory lock SSOT at snapshot time (clone of the BTreeMap).
     advisory: LockState,
     /// Last applied index.
@@ -1304,6 +1382,14 @@ impl FullStateMachine {
             }
             Command::DeleteStreamEntry { key } => {
                 self.stream_entries.delete(key.as_bytes())?;
+                Ok(CommandResult::Success)
+            }
+            Command::PutAuthKey { key_hash, record } => {
+                self.auth_keys.set(key_hash.as_bytes(), record)?;
+                Ok(CommandResult::Success)
+            }
+            Command::DeleteAuthKey { key_hash } => {
+                self.auth_keys.delete(key_hash.as_bytes())?;
                 Ok(CommandResult::Success)
             }
             Command::Noop => Ok(CommandResult::Success),
@@ -1419,6 +1505,28 @@ impl FullStateMachine {
                 Ok(CommandResult::Success)
             }
 
+            Command::PutAuthKey { key_hash, record } => {
+                let auth_def = redb::TableDefinition::<&[u8], &[u8]>::new(self.auth_keys.name());
+                let mut table = txn
+                    .open_table(auth_def)
+                    .map_err(|e| super::RaftError::Storage(format!("open auth_keys: {e}")))?;
+                table
+                    .insert(key_hash.as_bytes(), record.as_slice())
+                    .map_err(|e| super::RaftError::Storage(format!("insert auth_key: {e}")))?;
+                Ok(CommandResult::Success)
+            }
+
+            Command::DeleteAuthKey { key_hash } => {
+                let auth_def = redb::TableDefinition::<&[u8], &[u8]>::new(self.auth_keys.name());
+                let mut table = txn
+                    .open_table(auth_def)
+                    .map_err(|e| super::RaftError::Storage(format!("open auth_keys: {e}")))?;
+                table
+                    .remove(key_hash.as_bytes())
+                    .map_err(|e| super::RaftError::Storage(format!("remove auth_key: {e}")))?;
+                Ok(CommandResult::Success)
+            }
+
             Command::Noop => Ok(CommandResult::Success),
 
             // Lock commands never flow here.
@@ -1449,7 +1557,9 @@ impl StateMachine for FullStateMachine {
             | Command::CasSetMetadata { .. }
             | Command::DeleteMetadata { .. }
             | Command::AppendStreamEntry { .. }
-            | Command::DeleteStreamEntry { .. } => self.execute(command),
+            | Command::DeleteStreamEntry { .. }
+            | Command::PutAuthKey { .. }
+            | Command::DeleteAuthKey { .. } => self.execute(command),
             _ => Err(super::RaftError::InvalidState(
                 "Only metadata operations (set/delete) support EC local writes".into(),
             )),
@@ -1702,6 +1812,17 @@ impl StateMachine for FullStateMachine {
             }
         }
 
+        // Auth-key records — same rationale as stream_entries: a
+        // dedicated map so they travel in the snapshot without ever
+        // touching the file-metadata map.
+        let mut auth_keys = HashMap::new();
+        for item in self.auth_keys.iter() {
+            let (key, value) = item?;
+            if let Ok(k) = String::from_utf8(key) {
+                auth_keys.insert(k, value);
+            }
+        }
+
         // Snapshot the advisory map under its own mutex. One clone of
         // the BTreeMap is cheap (shallow tree copy) and lets us drop
         // the mutex before bincoding.
@@ -1710,6 +1831,7 @@ impl StateMachine for FullStateMachine {
         let snapshot = Snapshot {
             metadata,
             stream_entries,
+            auth_keys,
             advisory,
             last_applied: self.last_applied.load(Ordering::Relaxed),
         };
@@ -1731,6 +1853,7 @@ impl StateMachine for FullStateMachine {
         })?;
 
         let stream_def = redb::TableDefinition::<&[u8], &[u8]>::new(self.stream_entries.name());
+        let auth_def = redb::TableDefinition::<&[u8], &[u8]>::new(self.auth_keys.name());
 
         {
             write_txn
@@ -1768,6 +1891,21 @@ impl StateMachine for FullStateMachine {
                 stream_table
                     .insert(key.as_bytes(), value.as_slice())
                     .map_err(|e| super::RaftError::Storage(format!("insert stream_entry: {e}")))?;
+            }
+
+            // Auth-key records — same clear-then-repopulate as
+            // stream_entries. Pre-auth-store snapshots carry an empty
+            // map (serde(default)), so the table ends up empty.
+            write_txn
+                .delete_table(auth_def)
+                .map_err(|e| super::RaftError::Storage(format!("delete auth_keys table: {e}")))?;
+            let mut auth_table = write_txn
+                .open_table(auth_def)
+                .map_err(|e| super::RaftError::Storage(format!("open auth_keys table: {e}")))?;
+            for (key, value) in &snapshot.auth_keys {
+                auth_table
+                    .insert(key.as_bytes(), value.as_slice())
+                    .map_err(|e| super::RaftError::Storage(format!("insert auth_key: {e}")))?;
             }
         }
 
@@ -3480,6 +3618,113 @@ mod tests {
         sm.apply(2, &Command::DeleteStreamEntry { key: "/s/0".into() })
             .unwrap();
         assert!(sm.get_stream_entry("/s/0").unwrap().is_none());
+    }
+
+    /// ``PutAuthKey`` stores opaque record bytes; ``get_auth_key`` reads
+    /// them back untouched — and the record NEVER appears in the
+    /// file-metadata tree (different redb tree), which is the whole
+    /// point of the dedicated store. This is the invariant the "auth
+    /// records are not files" decision rests on.
+    #[test]
+    fn auth_key_roundtrip_and_isolated_from_metadata() {
+        let store = RedbStore::open_temporary().unwrap();
+        let mut sm = FullStateMachine::new(&store).unwrap();
+
+        let hash = "abc123deadbeef";
+        let record: Vec<u8> = (0u8..=255).collect(); // opaque, non-proto bytes
+        sm.apply(
+            1,
+            &Command::PutAuthKey {
+                key_hash: hash.into(),
+                record: record.clone(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(sm.get_auth_key(hash).unwrap(), Some(record));
+        // Not reachable through the file-metadata path: neither a
+        // point read nor a full-tree list surfaces it. If this ever
+        // fails, auth records have leaked into the sys_read/readdir
+        // surface.
+        assert!(sm.get_metadata(hash).unwrap().is_none());
+        assert!(sm.list_metadata("").unwrap().is_empty());
+    }
+
+    /// ``DeleteAuthKey`` (revocation) removes the record.
+    #[test]
+    fn auth_key_delete_revokes() {
+        let store = RedbStore::open_temporary().unwrap();
+        let mut sm = FullStateMachine::new(&store).unwrap();
+        sm.apply(
+            1,
+            &Command::PutAuthKey {
+                key_hash: "h".into(),
+                record: b"rec".to_vec(),
+            },
+        )
+        .unwrap();
+        assert!(sm.get_auth_key("h").unwrap().is_some());
+        sm.apply(
+            2,
+            &Command::DeleteAuthKey {
+                key_hash: "h".into(),
+            },
+        )
+        .unwrap();
+        assert!(sm.get_auth_key("h").unwrap().is_none());
+    }
+
+    /// ``list_auth_keys`` enumerates every stored record — backs the
+    /// admin procfs view.
+    #[test]
+    fn auth_key_list_enumerates_all() {
+        let store = RedbStore::open_temporary().unwrap();
+        let mut sm = FullStateMachine::new(&store).unwrap();
+        for (i, h) in ["h1", "h2", "h3"].iter().enumerate() {
+            sm.apply(
+                (i + 1) as u64,
+                &Command::PutAuthKey {
+                    key_hash: (*h).into(),
+                    record: format!("r{i}").into_bytes(),
+                },
+            )
+            .unwrap();
+        }
+        let mut listed: Vec<String> = sm
+            .list_auth_keys()
+            .unwrap()
+            .into_iter()
+            .map(|(h, _)| h)
+            .collect();
+        listed.sort();
+        assert_eq!(listed, vec!["h1", "h2", "h3"]);
+    }
+
+    /// Auth records travel in the snapshot and restore intact on a
+    /// fresh replica — the mechanism that lets a catching-up node serve
+    /// authentication without replaying the whole log.
+    #[test]
+    fn auth_key_survives_snapshot_restore() {
+        let store = RedbStore::open_temporary().unwrap();
+        let mut sm = FullStateMachine::new(&store).unwrap();
+        sm.apply(
+            1,
+            &Command::PutAuthKey {
+                key_hash: "snap".into(),
+                record: b"survives".to_vec(),
+            },
+        )
+        .unwrap();
+        let bytes = sm.snapshot().unwrap();
+
+        let store2 = RedbStore::open_temporary().unwrap();
+        let mut sm2 = FullStateMachine::new(&store2).unwrap();
+        assert!(sm2.get_auth_key("snap").unwrap().is_none());
+        sm2.restore_snapshot(&bytes).unwrap();
+        assert_eq!(
+            sm2.get_auth_key("snap").unwrap(),
+            Some(b"survives".to_vec())
+        );
     }
 
     /// ``delete_stream_prefix`` drops every row under the prefix and
