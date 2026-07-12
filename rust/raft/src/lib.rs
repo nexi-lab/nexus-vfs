@@ -114,6 +114,12 @@ pub mod transport;
 pub mod blob_fetcher_handler;
 #[cfg(all(feature = "grpc", has_protos))]
 pub mod distributed_coordinator;
+
+/// Sync-façade → async-core bridge shared by every raft-backed store
+/// that exposes a synchronous API over the async consensus core.
+#[cfg(all(feature = "grpc", has_protos))]
+pub(crate) mod runtime_bridge;
+
 /// Node-bound peer address book persistence — `identity.json` at a
 /// platform-native user-data location.  Survives `<NEXUS_DATA_DIR>`
 /// wipes so cold-boot does not need operator re-specifying `--peers`.

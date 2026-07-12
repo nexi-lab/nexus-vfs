@@ -65,22 +65,12 @@
 use std::sync::Arc;
 
 use crate::prelude::{AppliedEntry, Command, FullStateMachine, ZoneConsensus};
+use crate::runtime_bridge::bridge_block_on;
 use crate::transport::proto::nexus::core::FileMetadata as ProtoFileMetadata;
 use contracts::VFS_ROOT;
 use prost::Message;
 
 use kernel::meta_store::{FileMetadata as KernelFileMetadata, MetaStore, MetaStoreError};
-
-fn bridge_block_on<F>(handle: &tokio::runtime::Handle, fut: F) -> F::Output
-where
-    F: std::future::Future,
-{
-    if tokio::runtime::Handle::try_current().is_ok() {
-        tokio::task::block_in_place(|| handle.block_on(fut))
-    } else {
-        handle.block_on(fut)
-    }
-}
 
 /// ``kernel::MetaStore`` impl backed by a single ``ZoneConsensus``.
 ///
