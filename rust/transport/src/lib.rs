@@ -45,7 +45,6 @@ pub mod grpc;
 /// the same tonic `Routes` as the built-in VFS server.  See module
 /// docs for the dispatch contract.
 pub mod grpc_plugin_proxy;
-pub mod ipc;
 pub mod peer_blob;
 /// Post-transport substrate observability.  Dual of
 /// [`peer_blob`]: peer_blob does cross-node blob fetches,
