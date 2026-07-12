@@ -428,7 +428,8 @@ The kernel exposes two HAL flavors:
   composition that decomposes ObjectStore.
 - **§3.B Control-Plane HAL** — runtime DI surfaces. Capabilities the kernel
   needs but does not own: distributed namespace topology
-  (`DistributedCoordinator`) and backend instantiation (`ObjectStoreProvider`).
+  (`DistributedCoordinator`), backend instantiation (`ObjectStoreProvider`),
+  and credential-record storage (`AuthKeyStore`).
 
 Both flavors live under `rust/kernel/src/`: `abc/` for the §3.A pillars,
 `hal/` for §3.B.
@@ -456,7 +457,7 @@ opt-in §3.A.2 ObjectStore extension traits (`LlmStreamingBackend`,
 `ObserverBackend`) — each reached through an `ObjectStore::as_*()`
 downcast rather than being a mandatory pillar. `kernel/src/hal/`
 contains the §3.B Control-Plane HAL trait files
-(`DistributedCoordinator`, `ObjectStoreProvider`). Kernel primitives
+(`DistributedCoordinator`, `ObjectStoreProvider`, `AuthKeyStore`). Kernel primitives
 (§4) live in `kernel/src/core/` as concrete types. Extension-trait
 DECLARATIONS stay at the kernel boundary because the
 `ObjectStore::as_*()` method signatures reference them
@@ -562,6 +563,7 @@ trait declared in `kernel/src/hal/`, concrete impl in the owner crate, an
 |-------|------------|--------------|----------------|
 | `DistributedCoordinator` | Per-node distributed namespace topology — zones, mounts, share registry, leader/voter introspection | `NoopDistributedCoordinator` (errors out) | `RaftDistributedCoordinator` in `rust/raft/` |
 | `ObjectStoreProvider` | Construct `Arc<dyn ObjectStore>` for a given backend type + args | `OnceLock` slot installed at boot | `DefaultObjectStoreProvider` in `rust/backends/` |
+| `AuthKeyStore` | Replicated `key_hash → record` store behind API-key authentication | `NoopAuthKeyStore` (resolves nothing, refuses writes) | `RaftAuthKeyStore` in `rust/raft/` |
 
 #### 3.B.1 `DistributedCoordinator`
 
@@ -615,6 +617,33 @@ the slot.
 
 The trait name describes the capability ("provides ObjectStore instances"), in
 symmetry with `DistributedCoordinator` and the §3.A pillars.
+
+#### 3.B.3 `AuthKeyStore`
+
+**Linux analogue:** the key retention service (`security/keys/`) — the kernel
+holds credential records, userspace policy (PAM / `sshd`) consults them to turn
+a presented credential into an identity, and `/proc/keys` exposes the table
+read-only.
+
+Four methods over `key_hash → record`: `get`, `put`, `delete`, `list`.
+
+Records are **opaque bytes** — the auth provider owns the schema, the kernel
+never interprets it. Each carries an HMAC of the key plus its grants (subject,
+zones, expiry, revoked, admin), making a record a lookup artifact rather than a
+secret. The HMAC signing key is injected at the composition root and never
+travels this trait.
+
+Records live in the raft state machine's dedicated `TREE_AUTH_KEYS` tree,
+alongside the other kernel-internal primitives carved out of "everything is a
+file" (advisory locks, stream / pipe payloads). Sitting off the `sys_read` /
+`readdir` path is what keeps a path walk from reaching a credential and a
+`sys_write` from forging one. The admin-gated, read-only `/__sys__/auth/keys/`
+view — synthesised over `list`, no write path — gives the introspection surface
+back, the same way `/__sys__/locks` does.
+
+Two consumers: the kernel, for that view; and the services-tier auth provider,
+which the `services ⊥ raft` invariant (§6.1) bars from naming `nexus_raft::*`,
+so it resolves credentials through this seam.
 
 ---
 

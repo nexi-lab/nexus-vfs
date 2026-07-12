@@ -601,6 +601,16 @@ pub struct Kernel {
     // shape as the PeerBlobClient slot above.
     pub(crate) distributed_coordinator:
         parking_lot::RwLock<Arc<dyn crate::hal::distributed_coordinator::DistributedCoordinator>>,
+    // Control-Plane HAL §3.B.3 slot. `Arc<dyn AuthKeyStore>` so the
+    // kernel can synthesise the admin-only `/__sys__/auth/keys/` view
+    // over the replicated API-key records without naming `nexus_raft::*`
+    // types, and so the services-tier auth provider — barred from raft
+    // by `services ⊥ raft` — reads the same records through one seam.
+    // Default at boot is `NoopAuthKeyStore` (resolves nothing, refuses
+    // writes); the binary boot path installs `RaftAuthKeyStore` against
+    // the ROOT zone's consensus. Same DI shape as the two slots above.
+    pub(crate) auth_key_store:
+        parking_lot::RwLock<Arc<dyn crate::hal::auth_key_store::AuthKeyStore>>,
     /// Federation-cache backend slot — single `Arc<dyn ObjectStore>`
     /// the kernel uses to satisfy sys_write / sys_read on federation-
     /// peer-mount placeholders under the uniform local-first contract.
@@ -740,6 +750,9 @@ impl Kernel {
             peer_client: parking_lot::RwLock::new(peer_client_dyn),
             distributed_coordinator: parking_lot::RwLock::new(
                 crate::hal::distributed_coordinator::NoopDistributedCoordinator::arc(),
+            ),
+            auth_key_store: parking_lot::RwLock::new(
+                crate::hal::auth_key_store::NoopAuthKeyStore::arc(),
             ),
             federation_cache: std::sync::OnceLock::new(),
             pending_blob_fetcher_slot: parking_lot::Mutex::new(None),
@@ -2279,6 +2292,25 @@ impl Kernel {
     /// `transport::blob::peer_client::PeerBlobClient` once per kernel.
     pub fn set_peer_client(&self, client: Arc<dyn crate::hal::peer::PeerBlobClient>) {
         *self.peer_client.write() = client;
+    }
+
+    /// Replace the kernel's `auth_key_store` slot (Control-Plane HAL
+    /// §3.B.3) with a concrete implementation. Kernel boots with
+    /// `NoopAuthKeyStore`; the host binary calls this with
+    /// `nexus_raft::auth_key_store::RaftAuthKeyStore` bound to the ROOT
+    /// zone's consensus, so the whole cluster shares one credential
+    /// namespace. Same DI shape as `set_peer_client` /
+    /// `set_distributed_coordinator`.
+    pub fn set_auth_key_store(&self, store: Arc<dyn crate::hal::auth_key_store::AuthKeyStore>) {
+        *self.auth_key_store.write() = store;
+    }
+
+    /// Borrow the current auth-key store — read-locked snapshot, so
+    /// callers never hold the lock across a consensus round-trip. Before
+    /// the host binary wires a real store this returns
+    /// `NoopAuthKeyStore`, which resolves no credential and lists no key.
+    pub fn auth_key_store(&self) -> Arc<dyn crate::hal::auth_key_store::AuthKeyStore> {
+        Arc::clone(&self.auth_key_store.read())
     }
 
     // Federation peer dispatch goes through

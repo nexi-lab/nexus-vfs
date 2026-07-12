@@ -53,7 +53,7 @@ jobs:
 
           # ── hal/ — §3.B Control-Plane HAL traits ────────────────
           # Exactly the §3.B trait files + the peer re-export shim.
-          allowed_hal=("mod.rs" "distributed_coordinator.rs" "object_store_provider.rs" "peer.rs")
+          allowed_hal=("mod.rs" "distributed_coordinator.rs" "object_store_provider.rs" "auth_key_store.rs" "peer.rs")
           for f in rust/kernel/src/hal/*.rs; do
             [ -e "$f" ] || continue
             base=$(basename "$f")
@@ -63,7 +63,7 @@ jobs:
             done
             if [ $ok -eq 0 ]; then
               echo "::error file=$f::Unexpected file in kernel/src/hal/."
-              echo "hal/ holds only §3.B Control-Plane HAL trait files (currently: distributed_coordinator.rs, object_store_provider.rs, plus the peer re-export at peer.rs)."
+              echo "hal/ holds only §3.B Control-Plane HAL trait files (currently: distributed_coordinator.rs, object_store_provider.rs, auth_key_store.rs, plus the peer re-export at peer.rs)."
               echo "See docs/KERNEL-ARCHITECTURE.md §3.B."
               echo "Fix: internal DI wiring for an existing HAL goes in kernel/src/federation/ (or the matching domain submodule).  A brand-new HAL surface requires documenting in §3.B first so the table stays the SSOT."
               FAIL=1
