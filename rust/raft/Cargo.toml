@@ -96,6 +96,8 @@ protoc-bin-vendored = "3"
 [dev-dependencies]
 tokio-test = "0.4"
 regex = { workspace = true }
+# Assert the identity URI SAN is really pinned into a minted node cert.
+x509-parser = "0.18"
 
 [features]
 default = ["full"]
