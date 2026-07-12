@@ -8,11 +8,14 @@
 //! * `crate::hal::*` — §3.B Control-Plane HAL DI surfaces
 //!   (`DistributedCoordinator`, `ObjectStoreProvider`,
 //!   `PeerBlobClient`).
-//! * `crate::core::*` — §4 kernel primitives (this module). No traits,
-//!   no extension interfaces — only the runtime mechanisms the syscall
-//!   layer needs (vfs_router, dlc, locks, dispatch, plus the in-memory
-//!   reference impls of the §3.A pillars that are too small to justify
-//!   their own crate).
+//! * `crate::core::*` — §4 kernel primitives (this module): the runtime
+//!   mechanisms the syscall layer needs (vfs_router, dlc, locks,
+//!   dispatch, procfs, plus the in-memory reference impls of the §3.A
+//!   pillars that are too small to justify their own crate). A primitive
+//!   may declare the registration interface its own registry dispatches
+//!   through — `NativeInterceptHook`, `MutationObserver`, `StreamBackend`,
+//!   `ProcfsProvider`. What does NOT belong here is a §3 HAL surface:
+//!   those are declared in `abc/` (§3.A pillars) and `hal/` (§3.B DI).
 //!
 //! The `lib.rs` crate root re-exposes the flat names
 //! (`crate::vfs_router::*`, `crate::pipe::*`, `crate::stream::*`, …)
@@ -32,6 +35,11 @@ pub mod vfs_router;
 
 // File-watch waiters + kernel-owned service registry.
 pub mod file_watch;
+
+/// Procfs registry — read-only `/__sys__/…` views over kernel-internal
+/// primitives that deliberately are not files (locks, zones, credential
+/// hashes). Linux `proc_create()`.
+pub mod procfs;
 pub mod service_registry;
 
 // Unified locking — I/O lock + advisory lock (§4.1).

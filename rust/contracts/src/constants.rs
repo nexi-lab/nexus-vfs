@@ -61,6 +61,24 @@ pub fn is_system_path(path: &str) -> bool {
 /// `LockManager::list_locks` — admin-only, analogous to `/proc/locks`.
 pub const LOCKS_PATH_PREFIX: &str = "/__sys__/locks";
 
+/// Kernel-reserved virtual path prefix for zone enumeration.
+/// `readdir("/__sys__/zones")` lists the zones this node belongs to and
+/// `stat("/__sys__/zones/<id>")` synthesises that zone's raft cluster
+/// status — analogous to a `/proc` topology view. Read-only: a zone is
+/// created and joined through the control plane, never by writing here.
+pub const ZONES_PATH_PREFIX: &str = "/__sys__/zones";
+
+/// Kernel-reserved virtual path prefix for API-key enumeration.
+/// `readdir("/__sys__/auth/keys")` lists the hashes of the replicated
+/// credential records via the §3.B.3 `AuthKeyStore` slot — admin-only,
+/// analogous to `/proc/keys`.
+///
+/// The view is read-only and lists hashes, never record bytes: records
+/// live in their own raft tree, so this is a projection of them, not
+/// their location. Writing a file at this path creates an ordinary
+/// (inert) metadata entry — it cannot mint a credential.
+pub const AUTH_KEYS_PATH_PREFIX: &str = "/__sys__/auth/keys";
+
 /// Path prefix used in the root zone's state machine to hold the
 /// federation share registry (SSOT for `origin_path → zone_id`).
 ///

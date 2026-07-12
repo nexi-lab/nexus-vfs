@@ -611,6 +611,12 @@ pub struct Kernel {
     // the ROOT zone's consensus. Same DI shape as the two slots above.
     pub(crate) auth_key_store:
         parking_lot::RwLock<Arc<dyn crate::hal::auth_key_store::AuthKeyStore>>,
+    /// Registered `/__sys__/…` procfs views (§4 primitive). Each is a
+    /// read-only projection of state the kernel holds but deliberately
+    /// does not keep as files — advisory locks, cluster zones, credential
+    /// hashes. The syscall layer dispatches through the registry, so a
+    /// new view is a registration, never another branch in `io.rs`.
+    pub(crate) procfs: crate::core::procfs::ProcfsRegistry,
     /// Federation-cache backend slot — single `Arc<dyn ObjectStore>`
     /// the kernel uses to satisfy sys_write / sys_read on federation-
     /// peer-mount placeholders under the uniform local-first contract.
@@ -754,6 +760,7 @@ impl Kernel {
             auth_key_store: parking_lot::RwLock::new(
                 crate::hal::auth_key_store::NoopAuthKeyStore::arc(),
             ),
+            procfs: crate::core::procfs::ProcfsRegistry::new(),
             federation_cache: std::sync::OnceLock::new(),
             pending_blob_fetcher_slot: parking_lot::Mutex::new(None),
             permission_lease_cache: PermissionLeaseCache::new(
@@ -766,6 +773,16 @@ impl Kernel {
             service_hook_names: parking_lot::Mutex::new(std::collections::HashMap::new()),
             service_observer_names: parking_lot::Mutex::new(std::collections::HashMap::new()),
         };
+        // Built-in procfs views, registered the way Linux registers
+        // /proc/locks at fs init rather than special-casing it in the
+        // VFS. Each projects a kernel-internal primitive that is
+        // deliberately not a file. All three are safe on a bare kernel:
+        // no locks held, no zones joined, and the auth slot boots as
+        // NoopAuthKeyStore — every one of them simply lists nothing.
+        k.procfs
+            .register(Arc::new(crate::core::lock::procfs::LocksProcfs));
+        k.procfs.register(Arc::new(crate::federation::ZonesProcfs));
+        k.procfs.register(Arc::new(crate::auth::AuthKeysProcfs));
         // Distributed-coordinator bootstrap is driven by
         // `RaftDistributedCoordinator::install_with_kernel`. The host
         // binary constructs `Kernel`, builds a `ZoneManager`, then
@@ -2292,25 +2309,6 @@ impl Kernel {
     /// `transport::blob::peer_client::PeerBlobClient` once per kernel.
     pub fn set_peer_client(&self, client: Arc<dyn crate::hal::peer::PeerBlobClient>) {
         *self.peer_client.write() = client;
-    }
-
-    /// Replace the kernel's `auth_key_store` slot (Control-Plane HAL
-    /// §3.B.3) with a concrete implementation. Kernel boots with
-    /// `NoopAuthKeyStore`; the host binary calls this with
-    /// `nexus_raft::auth_key_store::RaftAuthKeyStore` bound to the ROOT
-    /// zone's consensus, so the whole cluster shares one credential
-    /// namespace. Same DI shape as `set_peer_client` /
-    /// `set_distributed_coordinator`.
-    pub fn set_auth_key_store(&self, store: Arc<dyn crate::hal::auth_key_store::AuthKeyStore>) {
-        *self.auth_key_store.write() = store;
-    }
-
-    /// Borrow the current auth-key store — read-locked snapshot, so
-    /// callers never hold the lock across a consensus round-trip. Before
-    /// the host binary wires a real store this returns
-    /// `NoopAuthKeyStore`, which resolves no credential and lists no key.
-    pub fn auth_key_store(&self) -> Arc<dyn crate::hal::auth_key_store::AuthKeyStore> {
-        Arc::clone(&self.auth_key_store.read())
     }
 
     // Federation peer dispatch goes through

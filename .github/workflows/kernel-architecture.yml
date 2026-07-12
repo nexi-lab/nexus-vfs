@@ -112,7 +112,7 @@ jobs:
             done
             echo ""
             echo "Per docs/KERNEL-ARCHITECTURE.md §3/§4:"
-            echo "  * core/ is for §4 kernel primitives only (VFSRouter, LockManager, KernelDispatch, PipeManager, StreamManager, FileDescriptorTable, FileWatcher, ServiceRegistry, DriverLifecycleCoordinator, PermissionGate, AgentRegistry, PluginLoader, PermissionLeaseCache; plus the cas/ subfamily per §3.A.5)."
+            echo "  * core/ is for §4 kernel primitives only (VFSRouter, LockManager, KernelDispatch, PipeManager, StreamManager, FileDescriptorTable, FileWatcher, ServiceRegistry, DriverLifecycleCoordinator, PermissionGate, AgentRegistry, PluginLoader, PermissionLeaseCache, ProcfsRegistry; plus the cas/ subfamily per §3.A.5)."
             echo "  * Federation-domain types belong in kernel/src/federation/ (siblings: coordinator_wiring.rs, grpc_ops.rs, blob_fetcher_slot.rs, route_outcomes.rs)."
             echo "  * §3.B HAL trait surfaces belong in kernel/src/hal/ (and must be documented in the §3.B table)."
             echo "  * Transport-tier types (tonic clients, gRPC framing) belong in rust/transport/."

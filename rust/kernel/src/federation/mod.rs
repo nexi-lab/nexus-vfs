@@ -50,3 +50,7 @@
 mod blob_fetcher_slot;
 mod coordinator_wiring;
 pub mod grpc_ops;
+
+/// `/__sys__/zones` procfs view — the readdir half of the federation
+/// namespace whose `sys_stat` half lives in `coordinator_wiring`.
+pub use coordinator_wiring::ZonesProcfs;
