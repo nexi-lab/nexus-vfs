@@ -100,6 +100,7 @@ pub mod transport;
 //   distributed_coordinator.rs — `RaftDistributedCoordinator` impl of the
 //                                Control-Plane HAL §3.B.1 trait
 //   zone_meta_store.rs         — Raft-backed `kernel::abc::MetaStore` impl
+//   auth_key_store.rs          — Raft-backed `kernel::hal::AuthKeyStore` impl
 //   blob_fetcher_handler.rs    — `KernelBlobFetcher` server-side handler
 //                                co-located with `ZoneApiService` on the
 //                                raft port; reaches kernel data plane
@@ -110,6 +111,8 @@ pub mod transport;
 // / pipe backends live in `kernel::core::stream::wal` / `kernel::core::pipe::wal`
 // — kernel primitives that compose whatever distributed `MetaStore` impl
 // the coordinator DI's (typically `ZoneMetaStore` below).
+#[cfg(all(feature = "grpc", has_protos))]
+pub mod auth_key_store;
 #[cfg(all(feature = "grpc", has_protos))]
 pub mod blob_fetcher_handler;
 #[cfg(all(feature = "grpc", has_protos))]
