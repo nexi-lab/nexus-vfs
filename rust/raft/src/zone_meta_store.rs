@@ -64,7 +64,7 @@
 
 use std::sync::Arc;
 
-use crate::prelude::{Command, FullStateMachine, ZoneConsensus};
+use crate::prelude::{AppliedEntry, Command, FullStateMachine, ZoneConsensus};
 use crate::transport::proto::nexus::core::FileMetadata as ProtoFileMetadata;
 use contracts::VFS_ROOT;
 use prost::Message;
@@ -110,12 +110,12 @@ pub struct ZoneMetaStore {
     /// Apply-side coherence on follower nodes (and on crosslink
     /// surfaces of the same zone on the leader): every ZoneMetaStore
     /// constructed against a consensus self-registers an apply-side
-    /// invalidator on the consensus's invalidate_cb_slot. When the
-    /// state machine commits a SetMetadata / DeleteMetadata, the slot
-    /// fires every registered cb — each one evicts its own cache row
-    /// for the corresponding global path. Wrapped in ``Arc`` so the
-    /// closure can hold a stable handle that survives the
-    /// ZoneMetaStore's call frames.
+    /// observer on the consensus's apply_observers_slot. When the
+    /// state machine commits a SetMetadata / CasSetMetadata /
+    /// DeleteMetadata, the slot fires every registered observer — each
+    /// one evicts its own cache row for the corresponding global path.
+    /// Wrapped in ``Arc`` so the closure can hold a stable handle that
+    /// survives the ZoneMetaStore's call frames.
     cache: Arc<dashmap::DashMap<String, KernelFileMetadata>>,
 }
 
@@ -139,15 +139,25 @@ impl ZoneMetaStore {
         let coherence_id = node.coherence_id();
         let cache: Arc<dashmap::DashMap<String, KernelFileMetadata>> =
             Arc::new(dashmap::DashMap::new());
-        // Self-register an apply-side invalidator. The closure receives
-        // zone-relative keys from the state machine; translate back to
-        // the caller-facing global path (the form this metastore caches
-        // under) before evicting. Capturing ``Arc`` clones keeps the
-        // closure self-contained — no back-reference to ZoneMetaStore.
+        // Self-register an apply-side observer. Only SetMetadata /
+        // CasSetMetadata / DeleteMetadata mutate a cached row, so the
+        // observer matches exactly those (ignoring every other command
+        // variant — this preserves the pre-unification behavior, where
+        // invalidation fired only for these three). The zone-relative
+        // key is translated back to the caller-facing global path (the
+        // form this metastore caches under) before evicting. Capturing
+        // ``Arc`` clones keeps the observer self-contained — no
+        // back-reference to ZoneMetaStore.
         {
             let cache_for_cb = Arc::clone(&cache);
             let mount_point_for_cb = mount_point.clone();
-            node.register_invalidate_cb(Arc::new(move |zone_key: &str| {
+            node.register_apply_observer(Arc::new(move |entry: &AppliedEntry| {
+                let zone_key = match entry.command {
+                    Command::SetMetadata { key, .. }
+                    | Command::CasSetMetadata { key, .. }
+                    | Command::DeleteMetadata { key } => key.as_str(),
+                    _ => return,
+                };
                 let global = if mount_point_for_cb == VFS_ROOT || mount_point_for_cb.is_empty() {
                     zone_key.to_string()
                 } else if zone_key == VFS_ROOT {

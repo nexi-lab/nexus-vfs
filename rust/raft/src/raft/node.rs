@@ -346,30 +346,17 @@ pub struct ZoneConsensus<S: StateMachine + 'static> {
     /// None in embedded/single-node mode.
     #[cfg(all(feature = "grpc", has_protos))]
     forward_ctx: Option<ForwardContext>,
-    /// Apply-side cache-invalidation slot — cached at construction so
-    /// sync callers (kernel ``DLC``, ``ZoneMetaStore::new``) can
-    /// register callbacks without holding the state-machine's async
-    /// RwLock. The slot itself is
-    /// ``Arc<parking_lot::RwLock<Vec<Arc<Fn>>>>``; only Vec mutations
-    /// serialize through the inner lock. Multiple registrations
-    /// accumulate (one per ``ZoneMetaStore`` surface that wants its
-    /// internal cache invalidated on apply — direct mount + every
-    /// crosslink).
-    #[allow(clippy::type_complexity)]
-    invalidate_cb_slot: Option<Arc<parking_lot::RwLock<Vec<Arc<dyn Fn(&str) + Send + Sync>>>>>,
-    /// Apply-side DT_MOUNT slot — cached at construction so sync
-    /// callers (kernel federation-mount install) can swap the callback
-    /// without holding the state-machine's async RwLock. Same shape as
-    /// ``invalidate_cb_slot``.
-    #[cfg(feature = "grpc")]
-    #[allow(clippy::type_complexity)]
-    mount_apply_cb_slot: Option<
-        Arc<
-            parking_lot::RwLock<
-                Option<Arc<dyn Fn(&super::state_machine::MountApplyEvent) + Send + Sync>>,
-            >,
-        >,
-    >,
+    /// Unified apply-side observer list — cached at construction so sync
+    /// callers (kernel federation-mount install, ``ZoneMetaStore::new``
+    /// DCache coherence) can register observers without holding the
+    /// state-machine's async RwLock. Elements are
+    /// [`super::state_machine::ApplyObserver`] (`(dedup_key, cb)`); only
+    /// Vec mutations serialize through the inner lock. Registrations
+    /// accumulate (keyed ones replace by key) and each fires on every
+    /// committed metadata-path command (mount wiring, DCache
+    /// invalidation, A2A / auth-cache eviction all share this one spine).
+    apply_observers_slot:
+        Option<Arc<parking_lot::RwLock<Vec<super::state_machine::ApplyObserver>>>>,
     /// Shared advisory-lock state, cached at construction so sync
     /// callers (kernel ``DistributedLocks::new`` invoked from inside the
     /// mount-apply callback that fires on a tokio worker thread) can
@@ -400,9 +387,7 @@ impl<S: StateMachine + 'static> Clone for ZoneConsensus<S> {
             replication_log: self.replication_log.clone(),
             #[cfg(all(feature = "grpc", has_protos))]
             forward_ctx: self.forward_ctx.clone(),
-            invalidate_cb_slot: self.invalidate_cb_slot.clone(),
-            #[cfg(feature = "grpc")]
-            mount_apply_cb_slot: self.mount_apply_cb_slot.clone(),
+            apply_observers_slot: self.apply_observers_slot.clone(),
             advisory_handle: self.advisory_handle.clone(),
         }
     }
@@ -689,14 +674,12 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         let raw_node = RawNode::new(&raft_config, storage, &logger)
             .map_err(|e| RaftError::Raft(e.to_string()))?;
 
-        // Capture the apply-side invalidation slot BEFORE moving
-        // state_machine into the async RwLock — once inside, only
-        // async callers can touch it, but ``ZoneConsensus::invalidate_cb_slot``
-        // is called from sync contexts (kernel DLC::mount).
-        let invalidate_cb_slot = state_machine.invalidate_cb_slot();
-        // Same pattern for the DT_MOUNT apply slot.
-        #[cfg(feature = "grpc")]
-        let mount_apply_cb_slot = state_machine.mount_apply_cb_slot();
+        // Capture the apply-side observer slot BEFORE moving
+        // state_machine into the async RwLock — once inside, only async
+        // callers can touch it, but ``ZoneConsensus::apply_observers_slot``
+        // / ``register_apply_observer`` are called from sync contexts
+        // (kernel federation-mount install, DCache coherence).
+        let apply_observers_slot = state_machine.apply_observers_slot();
         // And for the advisory-lock state Arc — captured here so
         // ``advisory_state_blocking`` returns the SSOT Arc directly
         // without ``RwLock::blocking_read`` (which panics from inside
@@ -760,9 +743,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             replication_log,
             #[cfg(all(feature = "grpc", has_protos))]
             forward_ctx: None,
-            invalidate_cb_slot,
-            #[cfg(feature = "grpc")]
-            mount_apply_cb_slot,
+            apply_observers_slot,
             advisory_handle,
         };
 
@@ -983,50 +964,54 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         }
     }
 
-    /// Clone the state-machine's apply-side invalidation slot so a
-    /// downstream consumer can ``push`` a callback that fires on every
-    /// committed metadata mutation. Returns ``None`` for state machines
-    /// that don't expose a slot (e.g. witness) — callers should treat
-    /// ``None`` as "cache coherence is caller's responsibility" and
-    /// skip the install.
+    /// Clone the state-machine's unified apply-side observer slot so a
+    /// downstream consumer can ``push`` an observer that fires on every
+    /// committed metadata-path command. Returns ``None`` for state
+    /// machines that don't expose a slot (e.g. witness) — callers should
+    /// treat ``None`` as "coherence is caller's responsibility" and skip
+    /// the install.
     ///
-    /// Most callers should prefer [`Self::register_invalidate_cb`],
+    /// Most callers should prefer [`Self::register_apply_observer`],
     /// which encapsulates the ``push`` + ``None``-on-witness handling.
-    #[allow(clippy::type_complexity)]
-    pub fn invalidate_cb_slot(
+    pub fn apply_observers_slot(
         &self,
-    ) -> Option<Arc<parking_lot::RwLock<Vec<Arc<dyn Fn(&str) + Send + Sync>>>>> {
-        self.invalidate_cb_slot.clone()
+    ) -> Option<Arc<parking_lot::RwLock<Vec<super::state_machine::ApplyObserver>>>> {
+        self.apply_observers_slot.clone()
     }
 
-    /// Register an apply-side cache-invalidation callback on this
-    /// consensus. Multiple callbacks accumulate — every committed
-    /// metadata mutation fires every registered callback in
-    /// registration order. ``None`` slot (witness state machine) is a
-    /// silent no-op.
-    pub fn register_invalidate_cb(&self, cb: Arc<dyn Fn(&str) + Send + Sync>) {
-        if let Some(slot) = self.invalidate_cb_slot.as_ref() {
-            slot.write().push(cb);
+    /// Register an **anonymous** apply-side observer on this consensus.
+    /// Anonymous observers accumulate — every committed metadata-path
+    /// command fires every registered observer in registration order
+    /// (each matches the variants it cares about). Used by the DCache
+    /// invalidator (one per ``ZoneMetaStore`` surface). ``None`` slot
+    /// (witness state machine) is a silent no-op.
+    pub fn register_apply_observer(
+        &self,
+        cb: Arc<dyn Fn(&super::state_machine::AppliedEntry) + Send + Sync>,
+    ) {
+        if let Some(slot) = self.apply_observers_slot.as_ref() {
+            slot.write().push((None, cb));
         }
     }
 
-    /// Clone the state-machine's apply-side DT_MOUNT slot so the kernel
-    /// (which owns federation mount wiring) can install a callback
-    /// that fires on every committed DT_MOUNT Set / Delete.
-    /// Returns ``None`` for state machines that don't expose a slot
-    /// (e.g. witness) — kernel callers skip the install in that case.
-    #[cfg(feature = "grpc")]
-    #[allow(clippy::type_complexity)]
-    pub fn mount_apply_cb_slot(
+    /// Register a **keyed** apply-side observer: registering again with
+    /// the same `key` replaces the prior one (dropped under the same
+    /// write lock before the push), so the observer stays a singleton
+    /// across re-installs. Used by federation-mount wiring, which is
+    /// re-installed 7+ times per zone (boot resume / join / mount /
+    /// rewire) and must NOT accumulate — the pre-unification code held
+    /// it in a single ``Option`` slot and overwrote. ``None`` slot
+    /// (witness state machine) is a silent no-op.
+    pub fn register_keyed_apply_observer(
         &self,
-    ) -> Option<
-        Arc<
-            parking_lot::RwLock<
-                Option<Arc<dyn Fn(&super::state_machine::MountApplyEvent) + Send + Sync>>,
-            >,
-        >,
-    > {
-        self.mount_apply_cb_slot.clone()
+        key: &'static str,
+        cb: Arc<dyn Fn(&super::state_machine::AppliedEntry) + Send + Sync>,
+    ) {
+        if let Some(slot) = self.apply_observers_slot.as_ref() {
+            let mut guard = slot.write();
+            guard.retain(|(k, _)| *k != Some(key));
+            guard.push((Some(key), cb));
+        }
     }
 
     /// Stable integer identity of the state machine backing this

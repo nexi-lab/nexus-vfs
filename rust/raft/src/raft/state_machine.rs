@@ -296,47 +296,23 @@ pub trait StateMachine: Send + Sync {
         None
     }
 
-    /// Optional apply-side cache-invalidation slot.
+    /// Optional apply-side observer list.
     ///
-    /// State machines that back per-mount metastore caches (notably
+    /// State machines that back apply-side coherence (notably
     /// ``FullStateMachine``) return their shared
-    /// ``Arc<RwLock<Vec<Arc<Fn>>>>`` so multiple downstream consumers
-    /// (one per ``ZoneMetaStore`` surface — direct mount + every
-    /// crosslink) can each ``push`` a callback that fires on every
-    /// committed metadata mutation. State machines that have no such
+    /// ``Arc<RwLock<Vec<Arc<Fn(&AppliedEntry)>>>>`` so multiple
+    /// downstream consumers each ``push`` an observer fired on every
+    /// committed metadata-path command. This is the single spine that
+    /// federation-mount wiring, DCache invalidation, and (future) A2A /
+    /// auth-cache eviction all subscribe to. State machines with no such
     /// coherence concern (witness, direct-drive test harnesses) return
     /// ``None`` via the default impl, and apply stays a pure no-op on
     /// that front.
     ///
-    /// Multiple registrations: every crosslink mount gets its own
-    /// ``ZoneMetaStore`` (with its own internal cache), and each one
-    /// self-registers an invalidator on this slot so apply-side
-    /// invalidation fans out to every surface bound to the zone.
-    #[allow(clippy::type_complexity)]
-    fn invalidate_cb_slot(
-        &self,
-    ) -> Option<Arc<parking_lot::RwLock<Vec<Arc<dyn Fn(&str) + Send + Sync>>>>> {
-        None
-    }
-
-    /// Optional apply-side DT_MOUNT slot.
-    ///
-    /// Symmetric to [`invalidate_cb_slot`] but fires only for DT_MOUNT
-    /// Set / Delete commits — the kernel installs a closure that wires
-    /// / unwires federation mounts synchronously at apply time on every
-    /// replica. The closure captures the parent ``zone_id`` at install
-    /// time (install is per-zone, mirroring
-    /// ``install_federation_dcache_coherence``), so the event payload
-    /// carries only data that varies per-apply: the mount key and, on
-    /// Set, the decoded proto fields needed for wiring.
-    ///
-    /// Only [`FullStateMachine`] exposes a slot; witness / in-memory
-    /// state machines return ``None`` so apply stays a no-op.
-    #[cfg(feature = "grpc")]
-    #[allow(clippy::type_complexity)]
-    fn mount_apply_cb_slot(
-        &self,
-    ) -> Option<Arc<parking_lot::RwLock<Option<Arc<dyn Fn(&MountApplyEvent) + Send + Sync>>>>> {
+    /// Each observer must match the command variants it cares about and
+    /// ignore the rest — every registered observer is invoked for every
+    /// committed metadata-path command (in registration order).
+    fn apply_observers_slot(&self) -> Option<Arc<parking_lot::RwLock<Vec<ApplyObserver>>>> {
         None
     }
 
@@ -362,18 +338,52 @@ pub trait StateMachine: Send + Sync {
     }
 }
 
-/// A DT_MOUNT apply event delivered to [`StateMachine::mount_apply_cb_slot`]
-/// callbacks.
+/// A committed log entry handed to every apply-side observer registered
+/// on [`StateMachine::apply_observers_slot`].
 ///
-/// Fires after the apply write transaction commits. All payload fields
-/// derive from replicated state (raft log `Command` + state-machine
-/// `FileMetadata` proto), so every replica firing this event observes
-/// identical data — no node-local truth is introduced.
+/// Delivered AFTER the entry is durably applied. Observers are
+/// side-effect-only, non-blocking, and must tolerate any command variant
+/// (they match what they care about and ignore the rest). Every observer
+/// sees identical data on every replica — no node-local truth.
+pub struct AppliedEntry<'a> {
+    /// Log index of the applied entry.
+    pub index: u64,
+    /// The committed command.
+    pub command: &'a Command,
+    /// Key whose committed pre-image was a DT_MOUNT that this command
+    /// removes / overwrites — captured before the write txn (the one
+    /// fact not recomputable post-commit). ``None`` for everything else;
+    /// only the mount observer reads it.
+    pub removed_mount_key: Option<&'a str>,
+}
+
+/// A registered apply-side observer.
+///
+/// The optional `&'static str` is a dedup key that controls re-register
+/// semantics on [`ZoneConsensus`]:
+/// * `Some(key)` — **replace-by-key**: registering again with the same
+///   key drops the prior observer. Used by federation-mount wiring,
+///   which re-installs 7+ times per zone (boot resume / join / mount /
+///   rewire) and must stay a singleton — the old code held it in a
+///   single `Option` slot and overwrote.
+/// * `None` — **anonymous accumulate**: every registration adds another
+///   observer. Used by the DCache invalidator, where one observer per
+///   `ZoneMetaStore` surface is correct and stale closures are harmless.
+pub type ApplyObserver = (
+    Option<&'static str>,
+    Arc<dyn Fn(&AppliedEntry) + Send + Sync>,
+);
+
+/// A DT_MOUNT apply event — the mount observer's internal representation,
+/// produced by [`FullStateMachine::mount_apply_event_from`].
+///
+/// All payload fields derive from replicated state (raft log `Command` +
+/// state-machine `FileMetadata` proto), so every replica firing this
+/// event observes identical data — no node-local truth is introduced.
 ///
 /// The callback's parent ``zone_id`` is captured by the install site
 /// (kernel's ``install_federation_mount_coherence(consensus)``) as a
-/// closure binding, not carried on the event. This matches the pattern
-/// used by ``invalidate_cb``.
+/// closure binding, not carried on the event.
 #[cfg(feature = "grpc")]
 #[derive(Debug, Clone)]
 pub enum MountApplyEvent {
@@ -663,47 +673,26 @@ pub struct FullStateMachine {
     /// RwLock. The state machine is the SSOT; the Arc is how we
     /// surface it, not a shadow copy.
     last_applied: Arc<AtomicU64>,
-    /// Apply-side DT_MOUNT slot — shared
-    /// ``Arc<RwLock<Option<Arc<Fn(&MountApplyEvent)>>>>`` so the kernel
-    /// mount-wiring owner can install / replace the callback *after*
-    /// this state machine is moved into ``ZoneConsensus``.
+    /// Unified apply-side observer list — shared ``Arc<RwLock<Vec<..>>>``
+    /// so downstream owners can ``push`` observers *after* this state
+    /// machine is moved into ``ZoneConsensus``.
     ///
-    /// Fires on every committed DT_MOUNT ``SetMetadata`` /
-    /// ``DeleteMetadata`` so the kernel can wire / unwire a federation
-    /// child-zone mount into the local ``VFSRouter`` on every replica
-    /// (including the leader — the leader also goes through apply).
-    /// Set carries the decoded ``FileMetadata`` proto snapshot so the
-    /// callback doesn't race a subsequent apply to the same key; Delete
-    /// carries only the key because the proto was removed in the same
-    /// txn.
+    /// Fires once per committed metadata-path command (after the apply
+    /// txn commits) with an [`AppliedEntry`]. This is the single spine
+    /// that federation-mount wiring, DCache invalidation, and (future)
+    /// A2A / auth-cache eviction all subscribe to — one mechanism
+    /// instead of a bespoke slot per consumer. Each observer matches the
+    /// command variants it cares about and ignores the rest.
     ///
-    /// ``None`` when no federation mount coherence is wired (tests,
-    /// witness nodes). Send-site is gated on ``is_some()`` so apply
-    /// stays a no-op when unset. Callback panics are surfaced via
-    /// ``catch_unwind`` so apply can't be poisoned per raft's "apply
-    /// must not fail" rule.
-    #[cfg(feature = "grpc")]
-    #[allow(clippy::type_complexity)]
-    mount_apply_cb: Arc<parking_lot::RwLock<Option<Arc<dyn Fn(&MountApplyEvent) + Send + Sync>>>>,
-    /// Apply-side dcache invalidation slot — shared ``Arc<RwLock>``
-    /// so the kernel DCache owner can install / replace the callback
-    /// *after* this state machine is moved into ``ZoneConsensus``.
+    /// Empty when nothing is wired (tests, witness nodes) — the send
+    /// site is gated on non-empty so apply stays a no-op. Every observer
+    /// is invoked under ``catch_unwind`` so a panicking one can't poison
+    /// apply per raft's "apply must not fail" rule.
     ///
-    /// Fires on every committed metadata mutation (``SetMetadata`` /
-    /// ``CasSetMetadata`` / ``DeleteMetadata``) so the kernel's
-    /// DCache can evict stale entries on nodes that did not originate
-    /// the write (leader-forwarded writes, catch-up replication).
-    ///
-    /// The callback receives the zone-relative key actually mutated;
-    /// the installer closes over mount-point → global-path translation
-    /// so the state machine stays ignorant of the VFS layout above it.
-    ///
-    /// ``None`` when no kernel DCache is wired (tests, witness nodes).
-    /// Send-site is gated on ``is_some()`` so apply stays a no-op when
-    /// unset. Callback panics are surfaced via ``catch_unwind`` so
-    /// apply can't be poisoned per raft's "apply must not fail" rule.
-    #[allow(clippy::type_complexity)]
-    invalidate_cb: Arc<parking_lot::RwLock<Vec<Arc<dyn Fn(&str) + Send + Sync>>>>,
+    /// Elements are [`ApplyObserver`] — a `(dedup_key, cb)` pair so a
+    /// keyed consumer (federation mount) replaces its prior registration
+    /// on re-install while anonymous ones (DCache) accumulate.
+    apply_observers: Arc<parking_lot::RwLock<Vec<ApplyObserver>>>,
 }
 
 impl FullStateMachine {
@@ -743,9 +732,7 @@ impl FullStateMachine {
             auth_keys,
             advisory,
             last_applied: Arc::new(AtomicU64::new(last_applied)),
-            #[cfg(feature = "grpc")]
-            mount_apply_cb: Arc::new(parking_lot::RwLock::new(None)),
-            invalidate_cb: Arc::new(parking_lot::RwLock::new(Vec::new())),
+            apply_observers: Arc::new(parking_lot::RwLock::new(Vec::new())),
         })
     }
 
@@ -807,38 +794,29 @@ impl FullStateMachine {
         }
     }
 
-    /// Fire the apply-side DT_MOUNT callback for a committed command.
+    /// Translate a committed command into a [`MountApplyEvent`], or
+    /// ``None`` if it isn't a DT_MOUNT set / remove. The mount observer
+    /// calls this; the pre-image (``removed_mount_key``) is captured in
+    /// ``apply`` before the write txn (the one fact not recomputable
+    /// post-commit).
     ///
-    /// Set path: decode the ``SetMetadata`` value; if it's a DT_MOUNT
-    /// with non-empty ``target_zone_id``, build a snapshot event from
-    /// the proto and invoke the callback.
-    ///
-    /// Delete path: the caller has already done the pre-read (inside
-    /// ``apply`` before the write txn) and hands us ``delete_mount_key``
-    /// = ``Some(key)`` iff the deleted entry was DT_MOUNT.
-    ///
-    /// Failure modes never propagate out of ``apply``:
-    /// - no callback installed → no-op
-    /// - non-SetMetadata / non-DeleteMetadata command → no-op
-    /// - proto decode fails on Set → ``warn!`` (upstream writer wrote
-    ///   garbage; apply can't reject committed entries)
-    /// - entry not DT_MOUNT or empty target on Set → no-op (normal)
-    /// - callback panics → ``catch_unwind`` logs ``error!`` and
-    ///   returns; apply proceeds (raft "apply must not fail")
+    /// - Set path: decode the ``SetMetadata`` value; if it's a DT_MOUNT
+    ///   with non-empty ``target_zone_id`` → ``Set``. Otherwise, if this
+    ///   overwrote a prior DT_MOUNT (``removed_mount_key == Some(key)``)
+    ///   → ``Delete`` (e.g. federation_unmount writes DT_DIR at the mount
+    ///   path). Else ``None``.
+    /// - Delete path: ``Delete`` iff ``removed_mount_key == Some(key)``.
+    /// - proto decode failure on Set → ``warn!`` + ``None`` (upstream
+    ///   writer wrote garbage; apply can't reject committed entries).
     #[cfg(feature = "grpc")]
-    fn emit_mount_apply_event(&self, command: &Command, delete_mount_key: Option<&str>) {
+    pub(crate) fn mount_apply_event_from(
+        command: &Command,
+        removed_mount_key: Option<&str>,
+    ) -> Option<MountApplyEvent> {
         use crate::transport::proto::nexus::core::FileMetadata as ProtoFileMetadata;
         use prost::Message as ProstMessage;
 
-        // Snapshot the cb under the read lock, release before invoking
-        // — callback must not reacquire this lock (future installer
-        // would deadlock) and must stay short to not stall apply.
-        let cb_opt = self.mount_apply_cb.read().clone();
-        let Some(cb) = cb_opt else {
-            return;
-        };
-
-        let event = match command {
+        match command {
             Command::SetMetadata { key, value } => {
                 let proto = match ProtoFileMetadata::decode(value.as_slice()) {
                     Ok(p) => p,
@@ -848,81 +826,63 @@ impl FullStateMachine {
                             error = %e,
                             "mount-apply: FileMetadata decode failed on apply (non-FileMetadata SetMetadata?)",
                         );
-                        return;
+                        return None;
                     }
                 };
                 const DT_MOUNT: i32 = 2;
                 if proto.entry_type == DT_MOUNT && !proto.target_zone_id.is_empty() {
-                    MountApplyEvent::Set {
+                    Some(MountApplyEvent::Set {
                         key: key.clone(),
                         target_zone_id: proto.target_zone_id,
-                    }
-                } else if let Some(k) = delete_mount_key {
-                    // Overwrite of prior DT_MOUNT with a non-mount
-                    // entry (e.g. federation_unmount writes DT_DIR at
-                    // the mount path). Fire Delete so
-                    // wire_federation_mount_impl removes this mount
-                    // from the local VFSRouter.
-                    if k == *key {
-                        MountApplyEvent::Delete { key: key.clone() }
-                    } else {
-                        return;
-                    }
+                    })
+                } else if removed_mount_key == Some(key.as_str()) {
+                    // Overwrite of prior DT_MOUNT with a non-mount entry
+                    // (e.g. federation_unmount writes DT_DIR at the mount
+                    // path). Fire Delete so wire_federation_mount_impl
+                    // removes this mount from the local VFSRouter.
+                    Some(MountApplyEvent::Delete { key: key.clone() })
                 } else {
-                    return;
+                    None
                 }
             }
-            Command::DeleteMetadata { key } => match delete_mount_key {
-                Some(k) if k == *key => MountApplyEvent::Delete { key: key.clone() },
-                _ => return,
-            },
-            _ => return,
-        };
-
-        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(&event)))
-        {
-            tracing::error!(
-                payload = ?payload,
-                "mount-apply: callback panicked; continuing apply — mount wiring may be incomplete",
-            );
+            Command::DeleteMetadata { key } if removed_mount_key == Some(key.as_str()) => {
+                Some(MountApplyEvent::Delete { key: key.clone() })
+            }
+            _ => None,
         }
     }
 
-    /// Fire the apply-side dcache invalidation callback for the key
-    /// mutated by this committed command.
+    /// Fire the unified apply-side observers for a committed command.
     ///
-    /// Fires for ``SetMetadata`` / ``CasSetMetadata`` / ``DeleteMetadata``
-    /// (the only variants that change a user-visible metastore key).
-    /// ``AdjustCounter`` mutates internal counters (``__i_links_count__``)
-    /// that the dcache does not cache, so it is intentionally skipped.
-    ///
-    /// The callback is wrapped in ``catch_unwind`` so a panicking
-    /// installer (bad closure capture, dropped dcache) cannot poison
-    /// apply — raft requires apply to be infallible on the happy path.
-    fn emit_invalidate_event(&self, command: &Command) {
-        // Snapshot the cb vec under the read lock, release before
-        // invoking — the callbacks must never acquire this lock back
-        // (would deadlock a future installer) and must not take long
-        // enough to stall the apply loop.
-        let cbs = self.invalidate_cb.read().clone();
-        if cbs.is_empty() {
+    /// Called once per committed metadata-path command, AFTER the apply
+    /// txn commits. Each registered observer is invoked with the same
+    /// [`AppliedEntry`] and must match the variants it cares about
+    /// (mount wiring: DT_MOUNT Set/Delete; DCache: Set/Cas/Delete; etc.)
+    /// — ignoring the rest. Every observer runs under ``catch_unwind`` so
+    /// a panicking one can't poison apply (raft's "apply must not fail").
+    /// The no-observer path returns before building the entry.
+    fn emit_apply_observers(&self, index: u64, command: &Command, removed_mount_key: Option<&str>) {
+        // Snapshot the observer vec under the read lock, release before
+        // invoking — observers must never reacquire this lock (a future
+        // installer would deadlock) and must stay short to not stall the
+        // apply loop.
+        let observers = self.apply_observers.read().clone();
+        if observers.is_empty() {
             return;
         }
-        let key = match command {
-            Command::SetMetadata { key, .. }
-            | Command::CasSetMetadata { key, .. }
-            | Command::DeleteMetadata { key } => key.as_str(),
-            _ => return,
+        let entry = AppliedEntry {
+            index,
+            command,
+            removed_mount_key,
         };
-        let key_owned = key.to_string();
-        for cb in cbs {
+        for (_key, obs) in observers {
             if let Err(payload) =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(&key_owned)))
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| obs(&entry)))
             {
                 tracing::error!(
-                    key = %key_owned,
+                    index,
                     payload = ?payload,
-                    "invalidate-event: callback panicked; continuing apply — metastore cache may be stale for this key"
+                    "apply-observer panicked; continuing apply — coherence may be incomplete for this entry",
                 );
             }
         }
@@ -1672,7 +1632,8 @@ impl StateMachine for FullStateMachine {
         // concurrent writer can slip in between this read and the txn
         // that performs the delete. Only DeleteMetadata needs the
         // pre-capture — for SetMetadata the proto is on the command
-        // itself, accessible from emit_mount_apply_event.
+        // itself, accessible from mount_apply_event_from. Threaded to
+        // observers as AppliedEntry::removed_mount_key.
         //
         // federation_unmount also writes a DT_DIR at the mount path
         // to replace the DT_MOUNT entry — that's a SetMetadata, not a
@@ -1772,19 +1733,19 @@ impl StateMachine for FullStateMachine {
         // value also sees the metadata write that preceded it.
         self.last_applied.store(index, Ordering::Release);
 
-        // Fire the DT_MOUNT apply-side callback *after* commit. Any
-        // failure is caught (catch_unwind on panic; no-op on missing
-        // callback) — returning Err from apply poisons the state
+        // Fire the unified apply-side observers *after* commit — one
+        // spine for federation-mount wiring, DCache invalidation, and
+        // (future) A2A / auth-cache eviction. Every observer runs under
+        // catch_unwind; returning Err from apply would poison the state
         // machine per raft's "apply must not fail" invariant, and the
-        // callback is strictly a side-effect.
+        // observers are strictly side-effects. ``removed_mount_key`` is
+        // the DT_MOUNT pre-image captured before the write txn (grpc
+        // only — the pre-read is behind the same cfg).
         #[cfg(feature = "grpc")]
-        self.emit_mount_apply_event(command, delete_mount_key.as_deref());
-
-        // Cache coherence: notify the kernel DCache that this key's
-        // metadata changed so nodes that didn't originate the write
-        // (leader-forwarded follower writes, catch-up replication)
-        // drop the stale dcache entry on next sys_stat / sys_read.
-        self.emit_invalidate_event(command);
+        let removed_mount_key = delete_mount_key.as_deref();
+        #[cfg(not(feature = "grpc"))]
+        let removed_mount_key: Option<&str> = None;
+        self.emit_apply_observers(index, command, removed_mount_key);
 
         Ok(result)
     }
@@ -1937,28 +1898,15 @@ impl StateMachine for FullStateMachine {
         Some(self.last_applied_shared_arc())
     }
 
-    /// Return the shared apply-side invalidation slot so downstream
-    /// holders (``ZoneConsensus``, kernel ``DLC``) can register
-    /// callbacks that fire on every committed metadata mutation.
-    fn invalidate_cb_slot(
-        &self,
-    ) -> Option<Arc<parking_lot::RwLock<Vec<Arc<dyn Fn(&str) + Send + Sync>>>>> {
-        Some(Arc::clone(&self.invalidate_cb))
+    /// Return the shared apply-side observer list so downstream holders
+    /// (``ZoneConsensus``, kernel federation wiring, DCache) can register
+    /// observers that fire on every committed metadata-path command.
+    fn apply_observers_slot(&self) -> Option<Arc<parking_lot::RwLock<Vec<ApplyObserver>>>> {
+        Some(Arc::clone(&self.apply_observers))
     }
 
     fn advisory_handle(&self) -> Option<Arc<Mutex<LockState>>> {
         Some(Arc::clone(&self.advisory))
-    }
-
-    /// Return the shared apply-side DT_MOUNT slot so downstream
-    /// holders (``ZoneConsensus``, kernel federation wiring) can
-    /// install a callback that fires on every committed DT_MOUNT
-    /// Set / Delete.
-    #[cfg(feature = "grpc")]
-    fn mount_apply_cb_slot(
-        &self,
-    ) -> Option<Arc<parking_lot::RwLock<Option<Arc<dyn Fn(&MountApplyEvent) + Send + Sync>>>>> {
-        Some(Arc::clone(&self.mount_apply_cb))
     }
 }
 
@@ -2052,12 +2000,21 @@ mod tests {
         let sm = FullStateMachine::new(&store).unwrap();
         let events: Arc<StdMutex<Vec<MountApplyEvent>>> = Arc::new(StdMutex::new(Vec::new()));
         let slot = sm
-            .mount_apply_cb_slot()
-            .expect("FullStateMachine exposes a mount-apply slot");
+            .apply_observers_slot()
+            .expect("FullStateMachine exposes an apply-observers slot");
         let events_cb = Arc::clone(&events);
-        *slot.write() = Some(Arc::new(move |e: &MountApplyEvent| {
-            events_cb.lock().unwrap().push(e.clone());
-        }));
+        // Mirror the real mount installer: translate the applied entry
+        // to a MountApplyEvent and record it.
+        slot.write().push((
+            None,
+            Arc::new(move |entry: &AppliedEntry| {
+                if let Some(e) =
+                    FullStateMachine::mount_apply_event_from(entry.command, entry.removed_mount_key)
+                {
+                    events_cb.lock().unwrap().push(e);
+                }
+            }),
+        ));
         let mut sm = sm;
 
         sm.apply(
@@ -2162,10 +2119,20 @@ mod tests {
 
         let store = RedbStore::open_temporary().unwrap();
         let sm = FullStateMachine::new(&store).unwrap();
-        let slot = sm.mount_apply_cb_slot().unwrap();
-        *slot.write() = Some(Arc::new(|_e: &MountApplyEvent| {
-            panic!("intentional test panic");
-        }));
+        let slot = sm.apply_observers_slot().unwrap();
+        slot.write().push((
+            None,
+            Arc::new(|entry: &AppliedEntry| {
+                // Only panic once the entry translates to a real mount
+                // event — mirrors the installer, which does nothing for
+                // non-mount commands.
+                if FullStateMachine::mount_apply_event_from(entry.command, entry.removed_mount_key)
+                    .is_some()
+                {
+                    panic!("intentional test panic");
+                }
+            }),
+        ));
         let mut sm = sm;
 
         let value = ProtoFileMetadata {
@@ -2198,12 +2165,23 @@ mod tests {
         let sm = FullStateMachine::new(&store).unwrap();
         let calls = StdArc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let slot = sm
-            .invalidate_cb_slot()
+            .apply_observers_slot()
             .expect("FullStateMachine exposes a slot");
         let calls_cb = StdArc::clone(&calls);
-        slot.write().push(Arc::new(move |key: &str| {
-            calls_cb.lock().unwrap().push(key.to_string());
-        }));
+        // Mirror the ZoneMetaStore dcache observer: fire only for the
+        // three key-mutating variants, recording the mutated key.
+        slot.write().push((
+            None,
+            Arc::new(move |entry: &AppliedEntry| {
+                let key = match entry.command {
+                    Command::SetMetadata { key, .. }
+                    | Command::CasSetMetadata { key, .. }
+                    | Command::DeleteMetadata { key } => key.as_str(),
+                    _ => return,
+                };
+                calls_cb.lock().unwrap().push(key.to_string());
+            }),
+        ));
         let mut sm = sm;
 
         // SetMetadata → fires with the mutated key.
@@ -2245,10 +2223,13 @@ mod tests {
         let panic_count_cb = StdArc::clone(&panic_count);
         // Replace the existing accumulator-cb with the panicking cb so
         // we exercise the panic-survives path in isolation.
-        *slot.write() = vec![Arc::new(move |_key: &str| {
-            panic_count_cb.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            panic!("intentional callback panic");
-        })];
+        *slot.write() = vec![(
+            None,
+            Arc::new(move |_entry: &AppliedEntry| {
+                panic_count_cb.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                panic!("intentional observer panic");
+            }),
+        )];
         let res = sm.apply(
             5,
             &Command::SetMetadata {
@@ -2278,6 +2259,99 @@ mod tests {
         // the panicking cb was replaced before /d succeeded-without-append,
         // and /e ran with slot = None.
         assert_eq!(calls.lock().unwrap().len(), 3);
+    }
+
+    /// Registration semantics of the unified observer slot:
+    /// - a **keyed** observer re-registered under the same key REPLACES
+    ///   the prior one (federation mount installs 7+ times per zone and
+    ///   must stay a singleton — this is the regression the keyed API
+    ///   fixes);
+    /// - an **anonymous** observer accumulates (DCache: one per surface).
+    #[cfg(feature = "grpc")]
+    #[test]
+    fn keyed_observer_replaces_anonymous_accumulates() {
+        use crate::transport::proto::nexus::core::FileMetadata as ProtoFileMetadata;
+        use prost::Message as ProstMessage;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtOrd};
+        use std::sync::Arc as StdArc;
+
+        // Register the same key twice: only the second survives, so a
+        // single DT_MOUNT apply fires it exactly once.
+        let store = RedbStore::open_temporary().unwrap();
+        let sm = FullStateMachine::new(&store).unwrap();
+        let slot = sm.apply_observers_slot().unwrap();
+        let keyed_fires = StdArc::new(AtomicUsize::new(0));
+        for _ in 0..2 {
+            // Emulate ZoneConsensus::register_keyed_apply_observer's
+            // retain-then-push (the state machine test has no consensus
+            // handle, so exercise the Vec semantics directly).
+            let c = StdArc::clone(&keyed_fires);
+            let mut g = slot.write();
+            g.retain(|(k, _)| *k != Some("federation_mount"));
+            g.push((
+                Some("federation_mount"),
+                Arc::new(move |entry: &AppliedEntry| {
+                    if FullStateMachine::mount_apply_event_from(
+                        entry.command,
+                        entry.removed_mount_key,
+                    )
+                    .is_some()
+                    {
+                        c.fetch_add(1, AtOrd::SeqCst);
+                    }
+                }),
+            ));
+        }
+        assert_eq!(slot.read().len(), 1, "keyed re-register must replace");
+        let mut sm = sm;
+        sm.apply(
+            1,
+            &Command::SetMetadata {
+                key: "/mnt/peer".into(),
+                value: ProtoFileMetadata {
+                    entry_type: 2, // DT_MOUNT
+                    target_zone_id: "zone-b".into(),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            keyed_fires.load(AtOrd::SeqCst),
+            1,
+            "keyed observer must fire exactly once (replace, not accumulate)"
+        );
+
+        // Two anonymous observers both survive and both fire.
+        let store2 = RedbStore::open_temporary().unwrap();
+        let sm2 = FullStateMachine::new(&store2).unwrap();
+        let slot2 = sm2.apply_observers_slot().unwrap();
+        let anon_fires = StdArc::new(AtomicUsize::new(0));
+        for _ in 0..2 {
+            let c = StdArc::clone(&anon_fires);
+            slot2.write().push((
+                None,
+                Arc::new(move |_e: &AppliedEntry| {
+                    c.fetch_add(1, AtOrd::SeqCst);
+                }),
+            ));
+        }
+        assert_eq!(slot2.read().len(), 2, "anonymous must accumulate");
+        let mut sm2 = sm2;
+        sm2.apply(
+            1,
+            &Command::SetMetadata {
+                key: "/a".into(),
+                value: vec![0u8; 4],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            anon_fires.load(AtOrd::SeqCst),
+            2,
+            "both anonymous observers must fire"
+        );
     }
 
     /// Determinism regression test (Issue #3029 / Bug 1):
