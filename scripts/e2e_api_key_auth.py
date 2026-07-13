@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """End-to-end proof that `sk-` API-key authentication actually gates the daemon.
 
-This drives the real thing: a real `nexusd-collaboration` process, real key
+This drives the real thing: a real `nexusd-cluster` process, real key
 minting through raft consensus, and real gRPC calls over the wire. Nothing is
 stubbed — if the provider is not wired, or the store is not bound, or the gate
 does not reject, this fails.
@@ -23,7 +23,7 @@ The journey, each step consuming the previous step's output:
             worked in step 4 is now refused.
 
 Run:
-    python scripts/e2e_api_key_auth.py [--binary target/release/nexusd-collaboration]
+    python scripts/e2e_api_key_auth.py [--binary target/release/nexusd-cluster]
 """
 
 from __future__ import annotations
@@ -179,14 +179,14 @@ def main() -> int:
     ap.add_argument(
         "--binary",
         type=Path,
-        default=Path("target/release/nexusd-collaboration")
+        default=Path("target/release/nexusd-cluster")
         if os.name != "nt"
-        else Path("target/release/nexusd-collaboration.exe"),
+        else Path("target/release/nexusd-cluster.exe"),
     )
     args = ap.parse_args()
     if not args.binary.is_file():
         print(f"binary not found: {args.binary}", file=sys.stderr)
-        print("build it: cargo build --release -p nexus-collaboration", file=sys.stderr)
+        print("build it: cargo build --release -p nexus-cluster", file=sys.stderr)
         return 2
 
     tmp = Path(tempfile.mkdtemp(prefix="nexus-auth-e2e-"))
