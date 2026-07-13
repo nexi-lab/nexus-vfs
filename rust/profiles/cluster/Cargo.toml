@@ -12,13 +12,6 @@ path = "src/main.rs"
 
 [features]
 default = []
-# `auth-api-key` — terminate external `sk-` API-key authentication.
-#
-# OFF here on purpose. `nexusd-cluster` is the federation binary: mTLS is
-# its boundary, it serves no external client, and it keeps `NoAuth`. With
-# the feature off the `auth` crate is not compiled into it at all, so the
-# binary size gate is untouched. `nexusd-collaboration` turns it on.
-auth-api-key = ["dep:auth", "dep:rand"]
 
 [dependencies]
 # raft owns federation orchestration (ZoneManager, bootstrap_tls, etc.).
@@ -37,9 +30,15 @@ backends = { workspace = true, default-features = false, features = ["driver-pat
 # cluster-internal authentication boundary). Cluster binary never pulls
 # the services post-syscall-hooks tier — keep the dep set minimal.
 transport = { workspace = true }
-# The `sk-` credential policy — pulled in only by `auth-api-key`.
-auth = { workspace = true, optional = true }
-rand = { version = "0.10", optional = true }
+
+# The `sk-` credential policy. NOT optional and NOT feature-gated: whether a
+# deployment authenticates its callers is a RUNTIME decision (see
+# `auth_posture.rs`), not a build-time one. Nobody ships a different sshd for a
+# trusted network — they configure it. Costs 134 KiB (0.9%) in the binary and
+# nothing at runtime when the posture is Open.
+auth = { workspace = true }
+# `auth mint` generates the key_id; the daemon carries no uuid dep.
+rand = "0.10"
 
 tonic = { workspace = true }
 anyhow = "1"

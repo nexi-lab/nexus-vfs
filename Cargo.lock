@@ -1918,28 +1918,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nexus-collaboration"
-version = "0.1.1"
-dependencies = [
- "anyhow",
- "auth",
- "backends",
- "clap",
- "contracts",
- "gethostname",
- "kernel",
- "raft 0.1.0",
- "rand 0.10.1",
- "tempfile",
- "tokio",
- "tonic",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "transport",
-]
-
-[[package]]
 name = "nexus-full"
 version = "0.1.1"
 dependencies = [

@@ -23,81 +23,36 @@ jobs:
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
-            max_size_bytes: 16515072  # 15.75 MiB — bumped from 15.5 MiB
-                                      # (PR #70/71) to absorb PR #126
-                                      # transport_observer: distributed-VFS
-                                      # substrate observability primitive
-                                      # (dual of peer_blob).  ~250 KiB
-                                      # headroom matches the prior
-                                      # bump-per-feature idiom.
+            max_size_bytes: 16777216  # 16.0 MiB — bumped from 15.75 MiB to absorb the
+                                      # `auth` crate, now unconditional in this
+                                      # binary (the sk- credential policy is a
+                                      # RUNTIME posture, not a build flag — see
+                                      # auth_posture.rs). Measured delta over the
+                                      # feature-gated build: 134 KiB (0.9%).
           - os: macos-14
             artifact_name: nexusd-cluster-macos-arm64
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
-            max_size_bytes: 14155776  # 13.5 MiB — bumped from 13.25 MiB
-                                      # to absorb the S3 Phase D
-                                      # DiscoverZones RPC surface (new
-                                      # proto messages + server handler
-                                      # + client + row-3 dispatch
-                                      # wiring).  ~260 KiB headroom
-                                      # symmetric with the post-#115
-                                      # actual size.
+            max_size_bytes: 14417920  # 13.75 MiB — same +0.25 MiB headroom for the
+                                      # unconditional `auth` crate.
           - os: macos-14
             artifact_name: nexusd-cluster-macos-x86_64
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
             target: x86_64-apple-darwin
-            max_size_bytes: 16515072  # 15.75 MiB — symmetric bump with
-                                      # linux for PR #126 transport_observer.
-                                      # Same slack % as post-#70/71.
+            max_size_bytes: 16777216  # 16.0 MiB — symmetric with linux for the
+                                      # unconditional `auth` crate.
           - os: windows-latest
             artifact_name: nexusd-cluster-windows-x86_64
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster.exe
-            max_size_bytes: 14942208  # 14.25 MiB — bumped from 14.0 MiB
-                                      # to absorb the S3 Phase D
-                                      # DiscoverZones RPC surface
-                                      # (proto + server + client + row-3
-                                      # dispatch wiring).  ~260 KiB
-                                      # headroom symmetric with the
-                                      # post-#115 actual size.
-                                      # Linux/macOS x86_64 hold the same
-                                      # % of slack.
+            max_size_bytes: 15204352  # 14.5 MiB — same +0.25 MiB headroom for the
+                                      # unconditional `auth` crate. Measured
+                                      # 15,003,648 bytes on this platform.
 
-          # ── nexusd-collaboration = cluster + the sk- credential policy ──
-          # Same entrypoint, one Cargo feature apart. Its own budget rather
-          # than a bump to cluster's: the federation binary must not pay for
-          # a policy it never runs. Measured delta over nexusd-cluster is
-          # 87 KiB (0.6%) — hmac plus two constant-time helpers. Each budget
-          # is the matching cluster budget + 0.25 MiB of headroom.
-          - os: ubuntu-latest
-            artifact_name: nexusd-collaboration-linux-x86_64
-            package: nexus-collaboration
-            bin: nexusd-collaboration
-            binary: nexusd-collaboration
-            max_size_bytes: 16777216  # 16.0 MiB
-          - os: macos-14
-            artifact_name: nexusd-collaboration-macos-arm64
-            package: nexus-collaboration
-            bin: nexusd-collaboration
-            binary: nexusd-collaboration
-            max_size_bytes: 14417920  # 13.75 MiB
-          - os: macos-14
-            artifact_name: nexusd-collaboration-macos-x86_64
-            package: nexus-collaboration
-            bin: nexusd-collaboration
-            binary: nexusd-collaboration
-            target: x86_64-apple-darwin
-            max_size_bytes: 16777216  # 16.0 MiB
-          - os: windows-latest
-            artifact_name: nexusd-collaboration-windows-x86_64
-            package: nexus-collaboration
-            bin: nexusd-collaboration
-            binary: nexusd-collaboration.exe
-            max_size_bytes: 15204352  # 14.5 MiB
 
     steps:
       - name: Checkout code

@@ -24,6 +24,9 @@ use anyhow::{Context, Result};
 use backends::provider::DefaultObjectStoreProvider;
 use backends::storage::path_local::PathLocalBackend;
 use clap::{Parser, Subcommand};
+
+mod auth_posture;
+use auth_posture::{AuthPosture, AuthPostureInputs};
 use kernel::abc::object_store::ObjectStore;
 use kernel::hal::object_store_provider::set_provider;
 use kernel::kernel::convenience::{KernelConvenience, MountOptions};
@@ -152,6 +155,26 @@ struct CommonArgs {
     #[arg(long, env = "NEXUS_NO_TLS", default_value_t = false, global = true)]
     no_tls: bool,
 
+    /// Serve without authenticating anyone: every caller, including one
+    /// presenting no token at all, becomes a system admin on this node's VFS.
+    ///
+    /// You do NOT need this on loopback — a plaintext, tokenless daemon bound
+    /// to 127.0.0.1 is a trusted local backend and starts without any flag.
+    /// This exists for the case that would otherwise refuse to boot: an
+    /// unauthenticated socket on a REACHABLE address. Appropriate for a CI or
+    /// docker-compose cluster that is already wide open; never for anything
+    /// holding real data.
+    ///
+    /// It is a flag rather than a default because "wide open" should be
+    /// something a deployment says out loud, in a place a reader can grep for.
+    #[arg(
+        long,
+        env = "NEXUS_INSECURE_NO_AUTH",
+        default_value_t = false,
+        global = true
+    )]
+    insecure_no_auth: bool,
+
     /// Host filesystem directory exposed as the cluster root mount.
     /// `nexusd-cluster` mounts this path at `/` via `PathLocalBackend`
     /// at boot so gRPC writes through DLC land on the host fs.
@@ -279,7 +302,6 @@ impl CommonArgs {
 
 /// `auth` actions. Split out of [`Cmd`] so the feature gate lands on one
 /// arm rather than three.
-#[cfg(feature = "auth-api-key")]
 #[derive(Debug, Subcommand)]
 enum AuthCmd {
     /// Mint a key and print it. This is the only time it exists in the clear.
@@ -372,7 +394,6 @@ enum Cmd {
     /// lands in the store is its HMAC, so a lost key is reissued, never
     /// recovered. `NEXUS_API_KEY_SECRET` must match the daemon's, or the
     /// hashes will not line up and the key will authenticate as nobody.
-    #[cfg(feature = "auth-api-key")]
     Auth {
         #[command(subcommand)]
         action: AuthCmd,
@@ -569,7 +590,6 @@ fn main() -> Result<()> {
                     )
                     .await
                 }
-                #[cfg(feature = "auth-api-key")]
                 Some(Cmd::Auth { action }) => run_auth(args.common, action).await,
                 Some(Cmd::Doctor { data_dir, zone }) => run_doctor(&data_dir, zone.as_deref()),
                 Some(Cmd::Join {
@@ -1005,39 +1025,28 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     // Build VFS gRPC service as tonic Routes — co-hosted on the raft
     // port via ZoneManager.
     //
-    // The `AuthProvider` slot is where a deployment decides *who* its
-    // callers are. `nexusd-cluster` leaves the `auth-api-key` feature off
-    // and keeps `NoAuth`: mTLS is its boundary and it terminates no external
-    // credential, so the `auth` crate never enters that binary and its size
-    // gate is untouched. A profile that serves external clients
-    // (`nexusd-collaboration`) turns the feature on and installs the `sk-`
-    // policy instead.
-    #[cfg(not(feature = "auth-api-key"))]
-    let vfs_auth: Arc<dyn transport::auth::AuthProvider> = Arc::new(transport::auth::NoAuth);
-
-    #[cfg(feature = "auth-api-key")]
-    let api_key_auth = {
-        // The signing secret is the one real secret in this design. A daemon
-        // that terminates credentials without one would hash every key under
-        // an empty secret, putting every install in a single key space — so
-        // fail the boot rather than degrade into that quietly.
-        let secret = std::env::var("NEXUS_API_KEY_SECRET").map_err(|_| {
-            anyhow::anyhow!(
-                "NEXUS_API_KEY_SECRET must be set: this profile terminates sk- API-key \
-                 authentication and cannot hash a key without a signing secret"
-            )
-        })?;
-        // Reads the kernel's §3.B.3 slot per lookup, so the provider can be
-        // built here — before the zones bootstrap and the root zone's
-        // consensus exists — and starts resolving the moment the boot path
-        // installs `RaftAuthKeyStore` below. Until then the slot holds
-        // `NoopAuthKeyStore`, so an early request authenticates as nobody
-        // rather than as everybody.
-        let store = auth::KernelSlotStore::new_arc(Arc::clone(&kernel));
-        Arc::new(auth::ApiKeyAuthProvider::new(store, secret))
+    // The `AuthProvider` slot is where a deployment decides *who* its callers
+    // are, and it is a RUNTIME decision, not a build-time one: nobody ships a
+    // different `sshd` for a trusted network, they configure it. One binary,
+    // one gate, and the security posture is a property of the deployment.
+    let api_key_auth = match auth_posture(&common)? {
+        AuthPosture::ApiKey(secret) => {
+            // Reads the kernel's §3.B.3 slot per lookup, so the provider can be
+            // built here — before the zones bootstrap and the root zone's
+            // consensus exists — and starts resolving the moment the boot path
+            // installs `RaftAuthKeyStore` below. Until then the slot holds
+            // `NoopAuthKeyStore`, so an early request authenticates as nobody
+            // rather than as everybody.
+            let store = auth::KernelSlotStore::new_arc(Arc::clone(&kernel));
+            Some(Arc::new(auth::ApiKeyAuthProvider::new(store, secret)))
+        }
+        AuthPosture::Open => None,
     };
-    #[cfg(feature = "auth-api-key")]
-    let vfs_auth: Arc<dyn transport::auth::AuthProvider> = Arc::clone(&api_key_auth) as _;
+
+    let vfs_auth: Arc<dyn transport::auth::AuthProvider> = match &api_key_auth {
+        Some(provider) => Arc::clone(provider) as _,
+        None => Arc::new(transport::auth::NoAuth),
+    };
 
     let vfs_routes = transport::grpc::build_vfs_routes(
         Arc::clone(&kernel),
@@ -1421,15 +1430,16 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     // and it is the record's own zone grants — not the zone it happens to
     // be stored in — that decide what it may reach.
     //
-    // Filling this slot is what lights up BOTH consumers: the kernel starts
-    // serving `/__sys__/auth/keys/` over it, and the provider built above
-    // (which reads the slot per lookup) starts resolving credentials.
-    #[cfg(feature = "auth-api-key")]
+    // The store is bound REGARDLESS of the auth posture. It costs one Arc, the
+    // root zone always exists, and it is what lets `/__sys__/auth/keys/` answer
+    // and an operator mint keys on a daemon that is not yet authenticating —
+    // the usual order of operations when turning auth on for the first time.
+    // Only the cache-eviction observer is conditional, because only a provider
+    // has a cache.
     {
         let root_zone = zm.get_zone(contracts::ROOT_ZONE_ID).ok_or_else(|| {
             anyhow::anyhow!(
-                "root zone is not open: the sk- auth provider has no consensus to \
-                 resolve credentials against"
+                "root zone is not open — the credential store has no consensus to                  live in. This should be impossible: the kernel owns root                  unconditionally (see BootAction::needs_root_zone)."
             )
         })?;
         let consensus = root_zone.consensus_node();
@@ -1439,23 +1449,33 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
         );
         kernel.set_auth_key_store(store);
 
-        // Revocation propagates because the command replicates: `DeleteAuthKey`
-        // commits, every replica applies it, and every replica's observer fires
-        // — so a key revoked on one node stops resolving on all of them without
-        // a restart and without waiting for the cache TTL. Keyed on the command
-        // variant rather than a path, since credentials are not files.
-        let provider_for_evict = Arc::clone(&api_key_auth);
-        consensus.register_apply_observer(Arc::new(
-            move |entry: &nexus_raft::prelude::AppliedEntry| {
-                let key_hash = match entry.command {
-                    nexus_raft::prelude::Command::PutAuthKey { key_hash, .. }
-                    | nexus_raft::prelude::Command::DeleteAuthKey { key_hash } => key_hash,
-                    _ => return,
-                };
-                provider_for_evict.invalidate(key_hash);
-            },
-        ));
-        tracing::info!("sk- API-key auth armed (auth key store bound to the root zone)");
+        match &api_key_auth {
+            Some(provider) => {
+                // Revocation propagates because the command replicates:
+                // `DeleteAuthKey` commits, every replica applies it, and every
+                // replica's observer fires — so a key revoked on one node stops
+                // resolving on all of them without a restart and without waiting
+                // out the cache TTL. Keyed on the command variant rather than a
+                // path, since credentials are not files.
+                let provider_for_evict = Arc::clone(provider);
+                consensus.register_apply_observer(Arc::new(
+                    move |entry: &nexus_raft::prelude::AppliedEntry| {
+                        let key_hash = match entry.command {
+                            nexus_raft::prelude::Command::PutAuthKey { key_hash, .. }
+                            | nexus_raft::prelude::Command::DeleteAuthKey { key_hash } => key_hash,
+                            _ => return,
+                        };
+                        provider_for_evict.invalidate(key_hash);
+                    },
+                ));
+                tracing::info!("sk- API-key auth armed (credential store bound to the root zone)");
+            }
+            None => {
+                tracing::info!(
+                    "credential store bound to the root zone; no auth provider is                      installed, so nothing resolves against it yet"
+                );
+            }
+        }
     }
 
     // Post-transport substrate observability — dual of the peer-blob
@@ -2482,7 +2502,6 @@ async fn wait_for_shutdown() {
 /// The root zone always exists (the kernel owns it -- see
 /// `BootAction::needs_root_zone`), but on a fresh data directory it has not
 /// been founded yet, so this founds it the way boot would.
-#[cfg(feature = "auth-api-key")]
 async fn open_auth_store(
     common: &CommonArgs,
 ) -> Result<(
@@ -2526,7 +2545,6 @@ async fn open_auth_store(
 
 /// Parse `--zone sharedzone:rw` into the `(zone_id, perms)` pair the
 /// permission gate reads. A bare `--zone eng` grants read-write.
-#[cfg(feature = "auth-api-key")]
 fn parse_zone_grant(spec: &str) -> Result<(String, String)> {
     match spec.split_once(':') {
         Some((zone, perms)) if !zone.is_empty() && !perms.is_empty() => {
@@ -2540,7 +2558,6 @@ fn parse_zone_grant(spec: &str) -> Result<(String, String)> {
     }
 }
 
-#[cfg(feature = "auth-api-key")]
 async fn run_auth(common: CommonArgs, action: AuthCmd) -> Result<()> {
     let (zm, store, secret) = open_auth_store(&common).await?;
     let result = run_auth_action(&store, &secret, action);
@@ -2550,7 +2567,6 @@ async fn run_auth(common: CommonArgs, action: AuthCmd) -> Result<()> {
     result
 }
 
-#[cfg(feature = "auth-api-key")]
 fn run_auth_action(
     store: &std::sync::Arc<dyn kernel::hal::auth_key_store::AuthKeyStore>,
     secret: &str,
@@ -2666,9 +2682,21 @@ fn run_auth_action(
     }
 }
 
+/// Project the CLI onto the pure decision in [`auth_posture`].
+///
+/// The rule itself lives in that module and is a pure function of these four
+/// inputs, so it is testable without a daemon and cannot drift with boot order.
+fn auth_posture(common: &CommonArgs) -> Result<AuthPosture> {
+    auth_posture::decide(&AuthPostureInputs {
+        bind_addr: common.bind_addr.clone(),
+        api_key_secret: std::env::var("NEXUS_API_KEY_SECRET").ok(),
+        tls_enabled: !common.no_tls,
+        insecure_no_auth: common.insecure_no_auth,
+    })
+}
+
 /// Minimal uuid-v4 for `key_id`. The daemon carries no uuid dep and this is
 /// its only caller; a random 128-bit id in the canonical shape is all it needs.
-#[cfg(feature = "auth-api-key")]
 fn uuid_v4() -> String {
     use rand::Rng;
     let mut b = [0u8; 16];
