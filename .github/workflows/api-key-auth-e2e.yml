@@ -1,7 +1,7 @@
 name: API-key auth E2E
 
 # Proves `sk-` authentication actually gates the daemon, against a real
-# nexusd-collaboration process and real gRPC calls — not a mock. The unit
+# nexusd-cluster process and real gRPC calls — not a mock. The unit
 # tests can all pass while the provider is never wired, the store never
 # bound, or the boot order silently leaves an empty slot; only running the
 # binary catches that. It already has: the first live run died on a rootless
@@ -16,10 +16,12 @@ on:
       - "rust/transport/src/grpc.rs"
       - "rust/raft/src/auth_key_store.rs"
       - "rust/raft/src/bootstrap.rs"
+      - "rust/profiles/cluster/src/auth_posture.rs"
       - "rust/kernel/src/hal/auth_key_store.rs"
       - "rust/kernel/src/auth/**"
       - "proto/nexus/grpc/vfs/vfs.proto"
       - "scripts/e2e_api_key_auth.py"
+      - "scripts/e2e_loopback_invariant.py"
       - ".github/workflows/api-key-auth-e2e.yml"
   push:
     branches: [main]
@@ -58,8 +60,16 @@ jobs:
         # client half can never drift from the server half.
         run: pip install grpcio grpcio-tools
 
-      - name: Build nexusd-collaboration
-        run: cargo build --release -p nexus-collaboration --bin nexusd-collaboration
+      - name: Build nexusd-cluster
+        run: cargo build --release -p nexus-cluster --bin nexusd-cluster
+
+      - name: No auth is legal only on loopback
+        # The daemon must REFUSE an unauthenticated socket on a reachable
+        # address — and must still boot, flagless, on loopback (the shape moss
+        # runs). Both halves matter: a guard that breaks the trusted-local
+        # backend is not shippable, and one that lets 0.0.0.0 through is not a
+        # guard.
+        run: python scripts/e2e_loopback_invariant.py
 
       - name: Mint → authenticate → deny → revoke
         run: python scripts/e2e_api_key_auth.py
