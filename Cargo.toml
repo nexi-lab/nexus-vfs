@@ -13,6 +13,13 @@ members = [
     "rust/kernel",
     "rust/backends",
     "rust/raft",
+    # auth/ — the `sk-` API-key credential POLICY. Not a kernel primitive
+    # and not a RustService: a profile binary links it behind a Cargo
+    # feature and installs it into transport's `Arc<dyn AuthProvider>`
+    # slot, the same shape the coordinator / object-store-provider impls
+    # take. `nexusd-cluster` leaves the feature off and keeps `NoAuth`,
+    # so the crate never enters that binary.
+    "rust/auth",
     # Plugin ABI — stable C ABI contract for dylib plugins.
     "rust/plugin-abi",
     # Deployment binaries.
@@ -22,6 +29,11 @@ members = [
     # under its size gate; third-party blob drivers live here instead. Per
     # nexus-vfs#27 kernel-team review.
     "rust/profiles/full",
+    # `collaboration` = cluster + `sk-` API-key authentication for external
+    # clients. Same separation, same reason: the federation binary terminates
+    # no external credential (mTLS is its boundary), so the credential policy
+    # is weight it would never use.
+    "rust/profiles/collaboration",
 ]
 
 [workspace.dependencies]
@@ -46,6 +58,10 @@ backends = { path = "rust/backends", default-features = false }
 kernel = { path = "rust/kernel", default-features = false }
 # raft is an rlib used by the cluster binary and other crates.
 raft = { path = "rust/raft", default-features = false, features = ["grpc"] }
+# `auth` — the sk- credential policy. Only a profile binary that
+# terminates external client auth pulls this in (behind a Cargo
+# feature); nexusd-cluster does not.
+auth = { path = "rust/auth" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 ahash = { version = "0.8", default-features = false, features = ["compile-time-rng", "std"] }
@@ -85,4 +101,12 @@ strip = "symbols"
 # compress as much as stripped ELF). CI's size gate (Group F) checks
 # the Linux artifact.
 [profile.release.package.nexus-cluster]
+opt-level = "z"
+
+# `collaboration` reuses `cluster`'s entrypoint verbatim, so it must reuse
+# its optimization choice too. Without this override the profile falls back
+# to the workspace `opt-level = 3` and the binary is ~1.7 MiB larger than
+# `nexusd-cluster` — nearly all of it the opt-level, not the `auth` crate it
+# actually adds (that dep delta is hmac + two constant-time helpers).
+[profile.release.package.nexus-collaboration]
 opt-level = "z"

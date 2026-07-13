@@ -813,7 +813,7 @@ pub struct DiscoveredZone {
 /// S3 Phase D fresh-joiner auto-discovery.  No leader requirement —
 /// the RPC is a straight read of the responder's local federation
 /// mount snapshot.  Pure joiners return an empty list; that is
-/// operator-correct: the caller falls through to the RootlessDynamic
+/// operator-correct: the caller falls through to the root-only founder
 /// branch on the boot decision and waits for the operator's next
 /// step (identity-driven auto-rejoin on a subsequent boot, or an
 /// explicit `nexusd-cluster join` sidecar).

@@ -179,6 +179,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
+name = "auth"
+version = "0.1.0"
+dependencies = [
+ "contracts",
+ "dashmap",
+ "hmac",
+ "kernel",
+ "parking_lot",
+ "rand 0.10.1",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tonic",
+ "tracing",
+ "transport",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1882,12 +1900,36 @@ name = "nexus-cluster"
 version = "0.1.1"
 dependencies = [
  "anyhow",
+ "auth",
  "backends",
  "clap",
  "contracts",
  "gethostname",
  "kernel",
  "raft 0.1.0",
+ "rand 0.10.1",
+ "tempfile",
+ "tokio",
+ "tonic",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "transport",
+]
+
+[[package]]
+name = "nexus-collaboration"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "auth",
+ "backends",
+ "clap",
+ "contracts",
+ "gethostname",
+ "kernel",
+ "raft 0.1.0",
+ "rand 0.10.1",
  "tempfile",
  "tokio",
  "tonic",
@@ -1902,12 +1944,14 @@ name = "nexus-full"
 version = "0.1.1"
 dependencies = [
  "anyhow",
+ "auth",
  "backends",
  "clap",
  "contracts",
  "gethostname",
  "kernel",
  "raft 0.1.0",
+ "rand 0.10.1",
  "tempfile",
  "tokio",
  "tonic",

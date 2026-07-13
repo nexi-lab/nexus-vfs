@@ -20,6 +20,8 @@ jobs:
         include:
           - os: ubuntu-latest
             artifact_name: nexusd-cluster-linux-x86_64
+            package: nexus-cluster
+            bin: nexusd-cluster
             binary: nexusd-cluster
             max_size_bytes: 16515072  # 15.75 MiB — bumped from 15.5 MiB
                                       # (PR #70/71) to absorb PR #126
@@ -30,6 +32,8 @@ jobs:
                                       # bump-per-feature idiom.
           - os: macos-14
             artifact_name: nexusd-cluster-macos-arm64
+            package: nexus-cluster
+            bin: nexusd-cluster
             binary: nexusd-cluster
             max_size_bytes: 14155776  # 13.5 MiB — bumped from 13.25 MiB
                                       # to absorb the S3 Phase D
@@ -41,6 +45,8 @@ jobs:
                                       # actual size.
           - os: macos-14
             artifact_name: nexusd-cluster-macos-x86_64
+            package: nexus-cluster
+            bin: nexusd-cluster
             binary: nexusd-cluster
             target: x86_64-apple-darwin
             max_size_bytes: 16515072  # 15.75 MiB — symmetric bump with
@@ -48,6 +54,8 @@ jobs:
                                       # Same slack % as post-#70/71.
           - os: windows-latest
             artifact_name: nexusd-cluster-windows-x86_64
+            package: nexus-cluster
+            bin: nexusd-cluster
             binary: nexusd-cluster.exe
             max_size_bytes: 14942208  # 14.25 MiB — bumped from 14.0 MiB
                                       # to absorb the S3 Phase D
@@ -58,6 +66,38 @@ jobs:
                                       # post-#115 actual size.
                                       # Linux/macOS x86_64 hold the same
                                       # % of slack.
+
+          # ── nexusd-collaboration = cluster + the sk- credential policy ──
+          # Same entrypoint, one Cargo feature apart. Its own budget rather
+          # than a bump to cluster's: the federation binary must not pay for
+          # a policy it never runs. Measured delta over nexusd-cluster is
+          # 87 KiB (0.6%) — hmac plus two constant-time helpers. Each budget
+          # is the matching cluster budget + 0.25 MiB of headroom.
+          - os: ubuntu-latest
+            artifact_name: nexusd-collaboration-linux-x86_64
+            package: nexus-collaboration
+            bin: nexusd-collaboration
+            binary: nexusd-collaboration
+            max_size_bytes: 16777216  # 16.0 MiB
+          - os: macos-14
+            artifact_name: nexusd-collaboration-macos-arm64
+            package: nexus-collaboration
+            bin: nexusd-collaboration
+            binary: nexusd-collaboration
+            max_size_bytes: 14417920  # 13.75 MiB
+          - os: macos-14
+            artifact_name: nexusd-collaboration-macos-x86_64
+            package: nexus-collaboration
+            bin: nexusd-collaboration
+            binary: nexusd-collaboration
+            target: x86_64-apple-darwin
+            max_size_bytes: 16777216  # 16.0 MiB
+          - os: windows-latest
+            artifact_name: nexusd-collaboration-windows-x86_64
+            package: nexus-collaboration
+            bin: nexusd-collaboration
+            binary: nexusd-collaboration.exe
+            max_size_bytes: 15204352  # 14.5 MiB
 
     steps:
       - name: Checkout code
@@ -111,7 +151,7 @@ jobs:
           shared-key: cluster-binary-${{ matrix.os }}-${{ matrix.target || 'native' }}
 
       - name: Build release binary
-        run: cargo build --release -p nexus-cluster --bin nexusd-cluster ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+        run: cargo build --release -p ${{ matrix.package }} --bin ${{ matrix.bin }} ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
 
       - name: Check binary size
         shell: bash
@@ -127,7 +167,7 @@ jobs:
           fi
           echo "Binary size: $actual bytes (max: $MAX_SIZE_BYTES)"
           if [ "$actual" -gt "$MAX_SIZE_BYTES" ]; then
-            echo "::error::nexusd-cluster ${{ matrix.artifact_name }} exceeds size budget ($actual > $MAX_SIZE_BYTES bytes)"
+            echo "::error::${{ matrix.artifact_name }} exceeds its size budget ($actual > $MAX_SIZE_BYTES bytes)"
             exit 1
           fi
 

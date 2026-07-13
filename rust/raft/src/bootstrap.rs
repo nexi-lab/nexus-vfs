@@ -34,7 +34,7 @@
 //! |---|---|---|---|---|
 //! | **true** | any | any | any | [`BootAction::Resume`] — restart from disk |
 //! | false | empty | empty | set | [`BootAction::StaticFounder`] — auto-create SOLO |
-//! | false | empty | empty | unset | [`BootAction::RootlessDynamic`] — daemon up, no zone auto-boot |
+//! | false | empty | empty | unset | [`BootAction::StaticFounder`] (empty) — root only, no federation zones |
 //! | false | empty | non-empty | unset | [`BootAction::JoinFederationZones`] — joiner (fresh, DiscoverZones) |
 //! | false | non-empty | any | unset | [`BootAction::JoinFederationZones`] — joiner (return, identity.zones) |
 //! | false | non-empty | any | set | [`BootAction::FailLoud`] — split-brain trap (PR #112) |
@@ -116,7 +116,7 @@ pub struct BootConfig {
 
 /// What the daemon should do at the federation branch of boot,
 /// given a resolved [`BootConfig`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BootAction {
     /// Founder path — this node auto-creates each declared zone as a
     /// SOLO 1-voter cluster and installs the DT_MOUNT entries.
@@ -135,13 +135,6 @@ pub enum BootAction {
         mounts: BTreeMap<String, String>,
         peers_for_ha: Vec<String>,
     },
-
-    /// Nothing to do at the federation branch.  Daemon comes up with
-    /// ROOT (already bootstrapped in the prior branch), and any zone
-    /// join happens via the offline `nexusd-cluster join` sidecar or a
-    /// runtime API call.  Matches the pre-refactor "federation env
-    /// vars unset → skip bootstrap_static" behaviour.
-    RootlessDynamic,
 
     /// Joiner path — this node dispatches a per-zone
     /// `bootstrap_or_join_zone(..., max_attempts=Some(15),
@@ -228,7 +221,7 @@ pub const REASON_AMBIGUOUS_FRESH_FOUNDER_WITH_PEERS: &str = "ambiguous_fresh_fou
 /// |---|---|---|---|---|---|
 /// | 0 | **true**   | any       | any       | any     | [`BootAction::Resume`] — restart from disk (Phase G) |
 /// | 1 | false      | empty     | empty     | set     | [`BootAction::StaticFounder`] — auto-create SOLO |
-/// | 2 | false      | empty     | empty     | unset   | [`BootAction::RootlessDynamic`] — daemon up, no zone auto-boot |
+/// | 2 | false      | empty     | empty     | unset   | [`BootAction::StaticFounder`] with no zones — root only |
 /// | 3 | false      | empty     | non-empty | unset   | [`BootAction::JoinFederationZones`] — joiner (fresh, DiscoverZones) |
 /// | 4 | false      | non-empty | any       | unset   | [`BootAction::JoinFederationZones`] — joiner (return, identity.zones) |
 /// | 5 | false      | non-empty | any       | set     | [`BootAction::FailLoud`] — split-brain trap (PR #112) |
@@ -244,6 +237,25 @@ pub const REASON_AMBIGUOUS_FRESH_FOUNDER_WITH_PEERS: &str = "ambiguous_fresh_fou
 /// `NEXUS_FEDERATION_MOUNTS` counts as "zones set" for the matrix
 /// (either env var triggers the founder / trap semantics — the
 /// federation branch acts uniformly on the union).
+impl BootAction {
+    /// Does this action need the node's root zone bootstrapped?
+    ///
+    /// Every action except `FailLoud` (the boot is about to abort) does. The
+    /// root zone is not a federation concept — it is the node's own SOLO
+    /// one-voter raft group, and the kernel owns it unconditionally: founders
+    /// create it, joiners use it as the parent zone for federation DT_MOUNT
+    /// entries, `Resume` picks up whatever ConfState is on disk, and a daemon
+    /// with nothing declared still gets one so that anything raft-backed —
+    /// DT_MOUNT, the share registry, WAL streams, credential records — has a
+    /// home.
+    ///
+    /// Lives here rather than in the daemon so there is ONE definition of
+    /// "needs root" instead of one re-derived per call site.
+    pub fn needs_root_zone(&self) -> bool {
+        !matches!(self, Self::FailLoud { .. })
+    }
+}
+
 pub fn plan_boot_action(cfg: &BootConfig) -> BootAction {
     // S3 Phase G — data_dir_has_root wins over every operator input.
     // Restart-from-disk is authoritative: the persisted ConfState and
@@ -325,7 +337,7 @@ pub fn plan_boot_action(cfg: &BootConfig) -> BootAction {
     // identity.zones alone (with peers empty) is enough to enter the
     // joiner path: the wipe took the peers away too, but the zones
     // snapshot's members list is a peer seed.  When both peers and
-    // identity_zones are empty, fall through to row 2 (RootlessDynamic).
+    // identity_zones are empty, fall through to row 2 (root-only founder).
     let identity_has_zones = !cfg.identity_zones.is_empty();
     if identity_has_peers || cli_has_peers || identity_has_zones {
         let zones_from_identity: Vec<String> = cfg
@@ -363,10 +375,21 @@ pub fn plan_boot_action(cfg: &BootConfig) -> BootAction {
         };
     }
 
-    // Row 2: nothing declared at all.  Root already bootstrapped in
-    // the caller's ROOT branch; here we just return the "no extra
-    // federation work" signal.
-    BootAction::RootlessDynamic
+    // Row 2: nothing declared at all. The node founds its root zone and
+    // nothing else — zero federation zones, zero mounts, zero peers.
+    //
+    // Root is not federation. It is the node's own SOLO one-voter raft group,
+    // and the kernel owns it unconditionally, so that everything raft-backed
+    // has a home whether or not the operator ever federates: DT_MOUNT entries,
+    // the share registry, WAL streams and pipes, and credential records. It
+    // costs a local redb and a tick loop; it does NOT put file syscalls
+    // through consensus (`/` keeps its local metastore — the raft group is a
+    // control plane, not the data plane), so the hot path is unaffected.
+    BootAction::StaticFounder {
+        zones: Vec::new(),
+        mounts: BTreeMap::new(),
+        peers_for_ha: Vec::new(),
+    }
 }
 
 #[cfg(test)]
@@ -475,10 +498,14 @@ mod tests {
         // when has_disk_state=false.  Guard against accidentally
         // making Resume the universal answer.
         let cfg = cfg_with(vec![], vec![], vec![], BTreeMap::new());
-        assert!(matches!(
+        assert_eq!(
             plan_boot_action(&cfg),
-            BootAction::RootlessDynamic
-        ));
+            BootAction::StaticFounder {
+                zones: Vec::new(),
+                mounts: BTreeMap::new(),
+                peers_for_ha: Vec::new(),
+            }
+        );
     }
 
     // ── Row 1 ─────────────────────────────────────────────────────────
@@ -520,13 +547,23 @@ mod tests {
     }
 
     // ── Row 2 ─────────────────────────────────────────────────────────
+    /// A daemon with nothing declared still founds its root zone — and ONLY
+    /// root: no federation zones, no mounts, no peers. Root is the node's own
+    /// SOLO raft group, not a federation concept, and the kernel owns it
+    /// unconditionally so everything raft-backed (DT_MOUNT, the share
+    /// registry, WAL streams, credential records) has a home.
     #[test]
-    fn row2_no_peers_no_zones_returns_rootless_dynamic() {
+    fn row2_no_peers_no_zones_founds_root_and_nothing_else() {
         let cfg = cfg_with(vec![], vec![], vec![], BTreeMap::new());
-        assert!(matches!(
+        assert_eq!(
             plan_boot_action(&cfg),
-            BootAction::RootlessDynamic
-        ));
+            BootAction::StaticFounder {
+                zones: Vec::new(),
+                mounts: BTreeMap::new(),
+                peers_for_ha: Vec::new(),
+            }
+        );
+        assert!(plan_boot_action(&cfg).needs_root_zone());
     }
 
     // ── Row 3 ─────────────────────────────────────────────────────────
@@ -796,5 +833,49 @@ mod tests {
             plan_boot_action(&cfg),
             BootAction::FailLoud { .. }
         ));
+    }
+    // ── The root zone is unconditional ───────────────────────────────
+
+    /// Every boot that is not aborting bootstraps root. This is what lets
+    /// anything raft-backed exist without the operator having declared
+    /// federation — credential records above all, since a rootless daemon
+    /// would leave them with nowhere to live and every credential would
+    /// silently resolve to nobody.
+    #[test]
+    fn every_non_aborting_boot_needs_root() {
+        let bare = plan_boot_action(&cfg_with(vec![], vec![], vec![], BTreeMap::new()));
+        assert!(
+            bare.needs_root_zone(),
+            "a bare daemon still owns its root zone"
+        );
+
+        let founder = plan_boot_action(&cfg_with(vec![], vec![], vec!["z"], BTreeMap::new()));
+        assert!(founder.needs_root_zone());
+
+        let joiner = plan_boot_action(&cfg_with(
+            vec!["10.0.0.1:2126"],
+            vec![],
+            vec![],
+            BTreeMap::new(),
+        ));
+        assert!(joiner.needs_root_zone());
+
+        let mut resume_cfg = cfg_with(vec![], vec![], vec![], BTreeMap::new());
+        resume_cfg.has_disk_state = true;
+        assert!(plan_boot_action(&resume_cfg).needs_root_zone());
+    }
+
+    /// An aborting boot bootstraps nothing — a misconfiguration must not be
+    /// papered over by founding a zone on the way out.
+    #[test]
+    fn an_aborting_boot_bootstraps_nothing() {
+        let split_brain = plan_boot_action(&cfg_with(
+            vec!["10.0.0.1:2126"],
+            vec![],
+            vec!["sharedzone"],
+            BTreeMap::new(),
+        ));
+        assert!(matches!(split_brain, BootAction::FailLoud { .. }));
+        assert!(!split_brain.needs_root_zone());
     }
 }
