@@ -1,0 +1,36 @@
+[package]
+name = "auth"
+version = "0.1.0"
+edition = "2021"
+description = "API-key authentication policy — sk- HMAC credentials resolved into an OperationContext"
+
+[lib]
+name = "auth"
+crate-type = ["rlib"]
+
+[dependencies]
+# The `AuthKeyStore` §3.B.3 HAL surface (the replicated record store) and
+# `OperationContext`. The kernel is a dependency for its *declarations* —
+# this crate installs nothing into the kernel and the kernel never calls it.
+kernel = { workspace = true, default-features = false }
+# The `AuthProvider` trait + `AuthCredentials` / `PeerIdentity` this crate
+# implements. The trait lives with its primary consumer (`transport::grpc`),
+# per the convention documented in `transport::auth`.
+transport = { workspace = true }
+contracts = { workspace = true }
+
+# HMAC-SHA256 over the presented key. `sha2` is already in the tree
+# (raft, transport); `hmac` is the one addition, and it is the RustCrypto
+# sibling of the sha2 already vendored.
+hmac = "0.13"
+sha2 = "0.11"
+# Key minting (admin tooling) needs a CSPRNG. Same version raft uses for
+# its join-token generator.
+rand = "0.10"
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+dashmap = "6.1"
+parking_lot = "0.12"
+tracing = "0.1"
+tonic = { workspace = true }
