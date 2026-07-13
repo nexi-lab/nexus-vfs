@@ -12,6 +12,13 @@ path = "src/main.rs"
 
 [features]
 default = []
+# `auth-api-key` — terminate external `sk-` API-key authentication.
+#
+# OFF here on purpose. `nexusd-cluster` is the federation binary: mTLS is
+# its boundary, it serves no external client, and it keeps `NoAuth`. With
+# the feature off the `auth` crate is not compiled into it at all, so the
+# binary size gate is untouched. `nexusd-collaboration` turns it on.
+auth-api-key = ["dep:auth"]
 
 [dependencies]
 # raft owns federation orchestration (ZoneManager, bootstrap_tls, etc.).
@@ -30,6 +37,8 @@ backends = { workspace = true, default-features = false, features = ["driver-pat
 # cluster-internal authentication boundary). Cluster binary never pulls
 # the services post-syscall-hooks tier — keep the dep set minimal.
 transport = { workspace = true }
+# The `sk-` credential policy — pulled in only by `auth-api-key`.
+auth = { workspace = true, optional = true }
 
 tonic = { workspace = true }
 anyhow = "1"

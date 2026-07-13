@@ -1900,6 +1900,28 @@ name = "nexus-cluster"
 version = "0.1.1"
 dependencies = [
  "anyhow",
+ "auth",
+ "backends",
+ "clap",
+ "contracts",
+ "gethostname",
+ "kernel",
+ "raft 0.1.0",
+ "tempfile",
+ "tokio",
+ "tonic",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "transport",
+]
+
+[[package]]
+name = "nexus-collaboration"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "auth",
  "backends",
  "clap",
  "contracts",

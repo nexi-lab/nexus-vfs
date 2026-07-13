@@ -1,0 +1,58 @@
+[package]
+name = "nexus-collaboration"
+version = "0.1.1"
+edition = "2021"
+description = "Nexus collaboration-profile runtime — cluster (Raft + IPC + federation) plus sk- API-key authentication for external clients"
+authors = ["Nexus Team"]
+publish = false
+
+[[bin]]
+name = "nexusd-collaboration"
+# Reuses the cluster binary's entrypoint verbatim, the same way `full` does.
+# `cluster/src/main.rs` carries the `#[cfg(feature = "auth-api-key")]` arms;
+# this profile differs from `nexusd-cluster` ONLY by turning that feature on,
+# so it shares the exact same source instead of duplicating ~800 lines.
+#
+# Why a separate profile rather than a flag on `nexusd-cluster`: the
+# federation binary must stay pure and under its size gate. It terminates no
+# external credential — mTLS is its boundary — so linking a credential policy
+# into it would be weight it never uses. This is the same call the kernel team
+# made for `full` (S3 driver) on nexus-vfs#27.
+path = "../cluster/src/main.rs"
+
+[features]
+default = ["auth-api-key"]
+# Terminate external `sk-` API-key authentication: install
+# `auth::ApiKeyAuthProvider` into transport's `Arc<dyn AuthProvider>` slot,
+# bind `RaftAuthKeyStore` to the root zone's consensus (which also lights up
+# the kernel's admin-only `/__sys__/auth/keys/` view), and evict the auth
+# cache from the raft apply-observer so a revocation propagates without
+# waiting out a TTL.
+#
+# Requires `NEXUS_API_KEY_SECRET` — the HMAC signing secret. The binary fails
+# its boot without one rather than hashing every key under an empty secret.
+auth-api-key = ["dep:auth"]
+
+[dependencies]
+# Mirror of `profiles/cluster` deps, with one delta: `auth` is not optional
+# here, because `default = ["auth-api-key"]`. Keep these in sync with
+# `profiles/cluster/Cargo.toml`.
+raft = { workspace = true, default-features = false, features = ["grpc"] }
+contracts = { workspace = true }
+kernel = { workspace = true }
+backends = { workspace = true, default-features = false, features = ["driver-path-local", "driver-remote"] }
+transport = { workspace = true }
+auth = { workspace = true, optional = true }
+
+tonic = { workspace = true }
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+gethostname = "1.1"
+
+[dev-dependencies]
+# The shared cluster main.rs test module opens real redb files in a temp dir.
+tempfile = "3"

@@ -29,6 +29,11 @@ members = [
     # under its size gate; third-party blob drivers live here instead. Per
     # nexus-vfs#27 kernel-team review.
     "rust/profiles/full",
+    # `collaboration` = cluster + `sk-` API-key authentication for external
+    # clients. Same separation, same reason: the federation binary terminates
+    # no external credential (mTLS is its boundary), so the credential policy
+    # is weight it would never use.
+    "rust/profiles/collaboration",
 ]
 
 [workspace.dependencies]
@@ -96,4 +101,12 @@ strip = "symbols"
 # compress as much as stripped ELF). CI's size gate (Group F) checks
 # the Linux artifact.
 [profile.release.package.nexus-cluster]
+opt-level = "z"
+
+# `collaboration` reuses `cluster`'s entrypoint verbatim, so it must reuse
+# its optimization choice too. Without this override the profile falls back
+# to the workspace `opt-level = 3` and the binary is ~1.7 MiB larger than
+# `nexusd-cluster` — nearly all of it the opt-level, not the `auth` crate it
+# actually adds (that dep delta is hmac + two constant-time helpers).
+[profile.release.package.nexus-collaboration]
 opt-level = "z"

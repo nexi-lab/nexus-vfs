@@ -66,6 +66,7 @@
 pub mod mint;
 pub mod provider;
 pub mod record;
+pub mod slot_store;
 
 pub use mint::{mint_key, revoke_key, revoke_key_hash, MintedKey};
 pub use provider::{
@@ -73,3 +74,4 @@ pub use provider::{
     DEFAULT_CACHE_TTL,
 };
 pub use record::{AuthKeyRecord, SubjectType};
+pub use slot_store::KernelSlotStore;

@@ -934,8 +934,42 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     }
 
     // Build VFS gRPC service as tonic Routes — co-hosted on the raft
-    // port via ZoneManager. Uses NoAuth (mTLS is the boundary).
+    // port via ZoneManager.
+    //
+    // The `AuthProvider` slot is where a deployment decides *who* its
+    // callers are. `nexusd-cluster` leaves the `auth-api-key` feature off
+    // and keeps `NoAuth`: mTLS is its boundary and it terminates no external
+    // credential, so the `auth` crate never enters that binary and its size
+    // gate is untouched. A profile that serves external clients
+    // (`nexusd-collaboration`) turns the feature on and installs the `sk-`
+    // policy instead.
+    #[cfg(not(feature = "auth-api-key"))]
     let vfs_auth: Arc<dyn transport::auth::AuthProvider> = Arc::new(transport::auth::NoAuth);
+
+    #[cfg(feature = "auth-api-key")]
+    let api_key_auth = {
+        // The signing secret is the one real secret in this design. A daemon
+        // that terminates credentials without one would hash every key under
+        // an empty secret, putting every install in a single key space — so
+        // fail the boot rather than degrade into that quietly.
+        let secret = std::env::var("NEXUS_API_KEY_SECRET").map_err(|_| {
+            anyhow::anyhow!(
+                "NEXUS_API_KEY_SECRET must be set: this profile terminates sk- API-key \
+                 authentication and cannot hash a key without a signing secret"
+            )
+        })?;
+        // Reads the kernel's §3.B.3 slot per lookup, so the provider can be
+        // built here — before the zones bootstrap and the root zone's
+        // consensus exists — and starts resolving the moment the boot path
+        // installs `RaftAuthKeyStore` below. Until then the slot holds
+        // `NoopAuthKeyStore`, so an early request authenticates as nobody
+        // rather than as everybody.
+        let store = auth::KernelSlotStore::new_arc(Arc::clone(&kernel));
+        Arc::new(auth::ApiKeyAuthProvider::new(store, secret))
+    };
+    #[cfg(feature = "auth-api-key")]
+    let vfs_auth: Arc<dyn transport::auth::AuthProvider> = Arc::clone(&api_key_auth) as _;
+
     let vfs_routes = transport::grpc::build_vfs_routes(
         Arc::clone(&kernel),
         vfs_auth,
@@ -1318,6 +1352,51 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     // from origin nodes on local-backend misses.  Sits above raft in
     // the dep graph; kept out of `install_with_kernel` for that reason.
     transport::peer_blob::install(kernel.as_ref());
+
+    // Auth-key store (Control-Plane HAL §3.B.3) + the cache eviction that
+    // makes a revocation take effect without waiting out a TTL.
+    //
+    // Bound to the ROOT zone's consensus: credentials are a cluster-wide
+    // namespace, so a key minted on one node has to resolve on every node,
+    // and it is the record's own zone grants — not the zone it happens to
+    // be stored in — that decide what it may reach.
+    //
+    // Filling this slot is what lights up BOTH consumers: the kernel starts
+    // serving `/__sys__/auth/keys/` over it, and the provider built above
+    // (which reads the slot per lookup) starts resolving credentials.
+    #[cfg(feature = "auth-api-key")]
+    {
+        let root_zone = zm.get_zone(contracts::ROOT_ZONE_ID).ok_or_else(|| {
+            anyhow::anyhow!(
+                "root zone is not open: the sk- auth provider has no consensus to \
+                 resolve credentials against"
+            )
+        })?;
+        let consensus = root_zone.consensus_node();
+        let store = nexus_raft::auth_key_store::RaftAuthKeyStore::new_arc(
+            consensus.clone(),
+            root_zone.runtime_handle(),
+        );
+        kernel.set_auth_key_store(store);
+
+        // Revocation propagates because the command replicates: `DeleteAuthKey`
+        // commits, every replica applies it, and every replica's observer fires
+        // — so a key revoked on one node stops resolving on all of them without
+        // a restart and without waiting for the cache TTL. Keyed on the command
+        // variant rather than a path, since credentials are not files.
+        let provider_for_evict = Arc::clone(&api_key_auth);
+        consensus.register_apply_observer(Arc::new(
+            move |entry: &nexus_raft::prelude::AppliedEntry| {
+                let key_hash = match entry.command {
+                    nexus_raft::prelude::Command::PutAuthKey { key_hash, .. }
+                    | nexus_raft::prelude::Command::DeleteAuthKey { key_hash } => key_hash,
+                    _ => return,
+                };
+                provider_for_evict.invalidate(key_hash);
+            },
+        ));
+        tracing::info!("sk- API-key auth armed (auth key store bound to the root zone)");
+    }
 
     // Post-transport substrate observability — dual of the peer-blob
     // installation just above.  peer_blob is what performs cross-node
