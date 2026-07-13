@@ -22,6 +22,7 @@ on:
       - "proto/nexus/grpc/vfs/vfs.proto"
       - "scripts/e2e_api_key_auth.py"
       - "scripts/e2e_loopback_invariant.py"
+      - "tests/docker/**"
       - ".github/workflows/api-key-auth-e2e.yml"
   push:
     branches: [main]
@@ -73,3 +74,30 @@ jobs:
 
       - name: Mint → authenticate → deny → revoke
         run: python scripts/e2e_api_key_auth.py
+
+  moss-shape:
+    name: moss's deployment shape, in a container
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # The shape our enterprise deployment actually runs: nexusd as a child
+      # process on the container's loopback, secrets at
+      # /secrets/org:{orgId}:system/{key}.json. The colon is why this cannot
+      # live on a Windows host — the VFS maps a path onto a host filename and
+      # Windows rejects `:`, so every earlier probe of this layout had to
+      # substitute a colon-free namespace. moss's real path shape had never
+      # been tested until this job.
+      #
+      # It also runs the migration before moss does (their invocation minus the
+      # deleted --bootstrap-mode), and asserts the loopback invariant where it
+      # actually means something: inside a container, 0.0.0.0 is what makes a
+      # socket reachable from the container network — the exact "add nexus to
+      # moss-network" mistake that turns an unauthenticated store into a
+      # cross-tenant breach.
+      - name: Build the image
+        run: docker build -f tests/docker/Dockerfile.moss-shape -t nexus-moss-shape .
+
+      - name: moss's shape works unchanged, and the invariant bites
+        run: docker run --rm nexus-moss-shape
