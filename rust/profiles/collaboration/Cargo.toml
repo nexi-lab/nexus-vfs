@@ -31,7 +31,7 @@ default = ["auth-api-key"]
 #
 # Requires `NEXUS_API_KEY_SECRET` — the HMAC signing secret. The binary fails
 # its boot without one rather than hashing every key under an empty secret.
-auth-api-key = ["dep:auth"]
+auth-api-key = ["dep:auth", "dep:rand"]
 
 [dependencies]
 # Mirror of `profiles/cluster` deps, with one delta: `auth` is not optional
@@ -43,6 +43,8 @@ kernel = { workspace = true }
 backends = { workspace = true, default-features = false, features = ["driver-path-local", "driver-remote"] }
 transport = { workspace = true }
 auth = { workspace = true, optional = true }
+# `auth mint` generates the key_id; the daemon has no uuid dep.
+rand = { version = "0.10", optional = true }
 
 tonic = { workspace = true }
 anyhow = "1"

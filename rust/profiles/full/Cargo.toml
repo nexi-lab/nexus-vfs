@@ -24,7 +24,7 @@ default = []
 # know the feature name or the cfg is "unexpected". `nexusd-full` is
 # cluster + the S3 driver; terminating external credentials is
 # `nexusd-collaboration`'s job.
-auth-api-key = ["dep:auth"]
+auth-api-key = ["dep:auth", "dep:rand"]
 
 [dependencies]
 # Mirror of `profiles/cluster` deps, with one delta: `backends` adds
@@ -35,6 +35,7 @@ kernel = { workspace = true }
 backends = { workspace = true, default-features = false, features = ["driver-path-local", "driver-remote", "driver-s3"] }
 transport = { workspace = true }
 auth = { workspace = true, optional = true }
+rand = { version = "0.10", optional = true }
 
 tonic = { workspace = true }
 anyhow = "1"

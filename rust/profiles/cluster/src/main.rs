@@ -277,6 +277,56 @@ impl CommonArgs {
     }
 }
 
+/// `auth` actions. Split out of [`Cmd`] so the feature gate lands on one
+/// arm rather than three.
+#[cfg(feature = "auth-api-key")]
+#[derive(Debug, Subcommand)]
+enum AuthCmd {
+    /// Mint a key and print it. This is the only time it exists in the clear.
+    Mint {
+        /// What the key authenticates: `user`, `agent`, or `service`.
+        ///
+        /// `agent` is the one that matters for A2A: an agent key's subject
+        /// becomes the context's `agent_id`, which is the identity the mailbox
+        /// hook stamps into an envelope's `from`. Nothing else can author that
+        /// agent's mail.
+        #[arg(long, default_value = "agent")]
+        subject_type: String,
+        /// The principal — an agent name, a user id, a service name.
+        #[arg(long)]
+        subject_id: String,
+        /// Zone grant, repeatable: `--zone sharedzone:rw --zone eng:r`.
+        ///
+        /// A key with no zone grants reaches nothing, and is refused at
+        /// authentication time unless it is `--admin` — otherwise it would
+        /// fall through to the root zone and hold the whole namespace.
+        #[arg(long = "zone", value_name = "ZONE:PERMS")]
+        zones: Vec<String>,
+        /// Global admin. The only principal allowed to hold a zoneless key.
+        #[arg(long)]
+        admin: bool,
+        /// Expire the key this many days from now. Omit for a key that
+        /// never expires.
+        #[arg(long)]
+        expires_in_days: Option<u64>,
+        /// Human label for the audit view ("mac-ai laptop", "ci runner").
+        #[arg(long, default_value = "")]
+        name: String,
+    },
+    /// Revoke a key. Takes the key itself, or its hash from `auth list`.
+    Revoke {
+        /// The `sk-` key, if you hold it.
+        #[arg(long, conflicts_with = "key_hash")]
+        key: Option<String>,
+        /// The key's hash, as shown by `auth list` — the shape an admin uses,
+        /// working from the audit view rather than from a key they do not have.
+        #[arg(long, conflicts_with = "key")]
+        key_hash: Option<String>,
+    },
+    /// List every credential: hash, subject, zones, expiry.
+    List,
+}
+
 #[derive(Debug, Subcommand)]
 enum Cmd {
     /// Detach a local subtree into a new federation zone.
@@ -310,6 +360,22 @@ enum Cmd {
         /// the parent zone. Idempotent.
         #[arg(long)]
         mount_at: Option<String>,
+    },
+    /// Mint, revoke and list `sk-` API keys.
+    ///
+    /// The `useradd` / `passwd` of this system, and offline for the same
+    /// reason: a key is a credential, not a network resource. The daemon must
+    /// be STOPPED — this opens the same data directory it holds an exclusive
+    /// lock on.
+    ///
+    /// A key exists in the clear exactly once, in the output of `mint`. What
+    /// lands in the store is its HMAC, so a lost key is reissued, never
+    /// recovered. `NEXUS_API_KEY_SECRET` must match the daemon's, or the
+    /// hashes will not line up and the key will authenticate as nobody.
+    #[cfg(feature = "auth-api-key")]
+    Auth {
+        #[command(subcommand)]
+        action: AuthCmd,
     },
     /// Per-zone health audit of a stopped daemon's data directory.
     ///
@@ -466,10 +532,11 @@ impl JoinRole {
 }
 
 fn main() -> Result<()> {
-    // Held until `main` returns so the non-blocking log writer thread stays
-    // alive and flushes on shutdown.
-    let _tracing_guard = install_tracing();
     let args = Args::parse();
+    // Held until `main` returns so the non-blocking log writer thread stays
+    // alive and flushes on shutdown. Subcommands log to stderr — their stdout
+    // is data a caller captures.
+    let _tracing_guard = install_tracing(/* logs_to_stderr */ args.cmd.is_some());
     // Size the multi-thread runtime against the host: federation
     // gRPC + raft IO is IO-bound, so the kernel `available_parallelism`
     // estimate (logical cores under cgroup / affinity constraints) is
@@ -502,6 +569,8 @@ fn main() -> Result<()> {
                     )
                     .await
                 }
+                #[cfg(feature = "auth-api-key")]
+                Some(Cmd::Auth { action }) => run_auth(args.common, action).await,
                 Some(Cmd::Doctor { data_dir, zone }) => run_doctor(&data_dir, zone.as_deref()),
                 Some(Cmd::Join {
                     peer_addr,
@@ -2157,8 +2226,22 @@ fn default_log_filter() -> String {
     filter
 }
 
-fn install_tracing() -> tracing_appender::non_blocking::WorkerGuard {
-    let (non_blocking, guard) = tracing_appender::non_blocking(std::io::stdout());
+/// Install the log subscriber.
+///
+/// `logs_to_stderr` for subcommands, whose **stdout is data**: `auth mint`
+/// prints a credential and `auth list` prints records, and both are meant to
+/// be captured (`KEY=$(nexusd-collaboration auth mint …)`). A log line landing
+/// on that stream corrupts the value silently — the caller ends up with a key
+/// that has a WARN glued to the front of it.
+///
+/// The daemon keeps stdout, which is where systemd and Docker look for it.
+fn install_tracing(logs_to_stderr: bool) -> tracing_appender::non_blocking::WorkerGuard {
+    let sink: Box<dyn std::io::Write + Send> = if logs_to_stderr {
+        Box::new(std::io::stderr())
+    } else {
+        Box::new(std::io::stdout())
+    };
+    let (non_blocking, guard) = tracing_appender::non_blocking(sink);
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -2385,6 +2468,222 @@ async fn wait_for_shutdown() {
 async fn wait_for_shutdown() {
     let _ = tokio::signal::ctrl_c().await;
     tracing::info!("Received Ctrl+C");
+}
+
+// -- `auth` subcommand: the useradd / passwd side ---------------------
+//
+// Offline by design. A credential is not a network resource, and minting one
+// over the wire would need an admin credential to authorise it -- the
+// bootstrap problem no system solves that way. `useradd` writes a file; this
+// proposes a raft command against a stopped daemon's data directory.
+
+/// Open the root zone's credential store against a stopped daemon's data dir.
+///
+/// The root zone always exists (the kernel owns it -- see
+/// `BootAction::needs_root_zone`), but on a fresh data directory it has not
+/// been founded yet, so this founds it the way boot would.
+#[cfg(feature = "auth-api-key")]
+async fn open_auth_store(
+    common: &CommonArgs,
+) -> Result<(
+    std::sync::Arc<ZoneManager>,
+    std::sync::Arc<dyn kernel::hal::auth_key_store::AuthKeyStore>,
+    String,
+)> {
+    let secret = std::env::var("NEXUS_API_KEY_SECRET").map_err(|_| {
+        anyhow::anyhow!(
+            "NEXUS_API_KEY_SECRET must be set, and must MATCH the daemon's: a key is \
+             looked up by its HMAC under that secret, so a mismatch mints a key the \
+             daemon will never recognise"
+        )
+    })?;
+
+    let ZoneManagerBundle { zm, .. } = open_zone_manager(common, None)?;
+    if zm.get_zone(contracts::ROOT_ZONE_ID).is_none() {
+        zm.create_zone_async(contracts::ROOT_ZONE_ID, Vec::new())
+            .await
+            .map_err(|e| anyhow::anyhow!("open root zone: {e}"))?;
+    }
+    let root = zm
+        .get_zone(contracts::ROOT_ZONE_ID)
+        .ok_or_else(|| anyhow::anyhow!("root zone did not open"))?;
+
+    // Writes go through consensus, so this node has to be able to commit.
+    // Root is SOLO (one voter), so leadership is immediate -- but wait for it
+    // rather than race the campaign and fail with a confusing `not leader`.
+    if !root.wait_for_leader(std::time::Duration::from_secs(10)) {
+        return Err(anyhow::anyhow!(
+            "root zone has no leader after 10s -- cannot commit a credential"
+        ));
+    }
+
+    let store = nexus_raft::auth_key_store::RaftAuthKeyStore::new_arc(
+        root.consensus_node(),
+        root.runtime_handle(),
+    );
+    Ok((zm, store, secret))
+}
+
+/// Parse `--zone sharedzone:rw` into the `(zone_id, perms)` pair the
+/// permission gate reads. A bare `--zone eng` grants read-write.
+#[cfg(feature = "auth-api-key")]
+fn parse_zone_grant(spec: &str) -> Result<(String, String)> {
+    match spec.split_once(':') {
+        Some((zone, perms)) if !zone.is_empty() && !perms.is_empty() => {
+            Ok((zone.to_string(), perms.to_string()))
+        }
+        Some(_) => Err(anyhow::anyhow!(
+            "--zone {spec}: expected ZONE:PERMS (e.g. sharedzone:rw)"
+        )),
+        None if !spec.is_empty() => Ok((spec.to_string(), "rw".to_string())),
+        None => Err(anyhow::anyhow!("--zone: empty grant")),
+    }
+}
+
+#[cfg(feature = "auth-api-key")]
+async fn run_auth(common: CommonArgs, action: AuthCmd) -> Result<()> {
+    let (zm, store, secret) = open_auth_store(&common).await?;
+    let result = run_auth_action(&store, &secret, action);
+    // Release the data directory's lock before returning, or a daemon started
+    // right after this exits fails to open redb.
+    zm.shutdown();
+    result
+}
+
+#[cfg(feature = "auth-api-key")]
+fn run_auth_action(
+    store: &std::sync::Arc<dyn kernel::hal::auth_key_store::AuthKeyStore>,
+    secret: &str,
+    action: AuthCmd,
+) -> Result<()> {
+    match action {
+        AuthCmd::Mint {
+            subject_type,
+            subject_id,
+            zones,
+            admin,
+            expires_in_days,
+            name,
+        } => {
+            let subject_type = match subject_type.as_str() {
+                "user" => auth::SubjectType::User,
+                "agent" => auth::SubjectType::Agent,
+                "service" => auth::SubjectType::Service,
+                other => {
+                    return Err(anyhow::anyhow!(
+                        "--subject-type {other}: expected user, agent or service"
+                    ))
+                }
+            };
+            let zone_perms = zones
+                .iter()
+                .map(|z| parse_zone_grant(z))
+                .collect::<Result<Vec<_>>>()?;
+            if zone_perms.is_empty() && !admin {
+                return Err(anyhow::anyhow!(
+                    "a key with no zone grants reaches nothing and is refused at \
+                     authentication time. Pass --zone ZONE:PERMS, or --admin for a \
+                     global admin (the only principal allowed a zoneless key)."
+                ));
+            }
+            let expires_at_ms = expires_in_days.map(|days| {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                now_ms + days * 24 * 60 * 60 * 1000
+            });
+            let record = auth::AuthKeyRecord {
+                key_id: uuid_v4(),
+                name,
+                subject_type,
+                subject_id,
+                is_admin: admin,
+                revoked: false,
+                expires_at_ms,
+                zone_perms,
+            };
+            let minted =
+                auth::mint_key(store, secret, record).map_err(|e| anyhow::anyhow!("mint: {e}"))?;
+
+            // The one moment the key exists in the clear. On stdout alone, so
+            // `KEY=$(nexusd-collaboration auth mint ...)` captures the key and
+            // nothing else.
+            println!("{}", minted.key);
+            eprintln!(
+                "minted key_id={} hash={} subject={}:{} zones={:?}",
+                minted.record.key_id,
+                minted.key_hash,
+                minted.record.subject_type.as_str(),
+                minted.record.subject_id,
+                minted.record.zone_perms,
+            );
+            eprintln!("This key will not be shown again - it is stored only as an HMAC.");
+            Ok(())
+        }
+        AuthCmd::Revoke { key, key_hash } => {
+            let removed = match (key, key_hash) {
+                (Some(key), None) => auth::revoke_key(store, secret, &key),
+                (None, Some(hash)) => auth::revoke_key_hash(store, &hash),
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "revoke: pass exactly one of --key or --key-hash"
+                    ))
+                }
+            }
+            .map_err(|e| anyhow::anyhow!("revoke: {e}"))?;
+            if removed {
+                println!("revoked");
+            } else {
+                println!("no such key (already revoked?)");
+            }
+            Ok(())
+        }
+        AuthCmd::List => {
+            let records = store.list().map_err(|e| anyhow::anyhow!("list: {e}"))?;
+            if records.is_empty() {
+                println!("no keys");
+                return Ok(());
+            }
+            for (hash, bytes) in records {
+                match auth::AuthKeyRecord::decode(&bytes) {
+                    Ok(r) => println!(
+                        "{hash}  {}:{}  admin={}  zones={:?}  expires_at_ms={:?}  name={}",
+                        r.subject_type.as_str(),
+                        r.subject_id,
+                        r.is_admin,
+                        r.zone_perms,
+                        r.expires_at_ms,
+                        r.name,
+                    ),
+                    // A record this build cannot parse still exists and still
+                    // authenticates somebody -- say so rather than hide it.
+                    Err(e) => println!("{hash}  <undecodable record: {e}>"),
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Minimal uuid-v4 for `key_id`. The daemon carries no uuid dep and this is
+/// its only caller; a random 128-bit id in the canonical shape is all it needs.
+#[cfg(feature = "auth-api-key")]
+fn uuid_v4() -> String {
+    use rand::Rng;
+    let mut b = [0u8; 16];
+    rand::rng().fill_bytes(&mut b);
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 #[cfg(test)]
