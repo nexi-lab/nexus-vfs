@@ -1098,19 +1098,15 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     };
     let boot_action = nexus_raft::bootstrap::plan_boot_action(&boot_cfg);
 
-    // Root zone bootstrap gate.  Every action except `RootlessDynamic`
-    // and `FailLoud` needs root: founders create it as SOLO, joiners
-    // (fresh or returning) use the local root as the parent zone for
-    // federation DT_MOUNT entries, and `Resume` picks up whatever
-    // ConfState is already on disk.  Root is per-node SOLO by design —
-    // peers is always empty here.  `bootstrap_or_join_zone` handles
-    // both branches internally (Branch 1 = resume from disk, Branch 2
-    // = fresh SOLO create).
-    let root_needed = !matches!(
-        &boot_action,
-        nexus_raft::bootstrap::BootAction::RootlessDynamic
-            | nexus_raft::bootstrap::BootAction::FailLoud { .. }
-    );
+    // Root zone bootstrap gate — the planner already decided this. The kernel
+    // owns root unconditionally: it is the node's own SOLO one-voter raft
+    // group, not a federation concept, so every boot that is not aborting
+    // brings it up. That is what gives everything raft-backed a home whether
+    // or not the operator federates — DT_MOUNT entries, the share registry,
+    // WAL streams and pipes, credential records. `bootstrap_or_join_zone`
+    // handles both branches internally (Branch 1 = resume from disk,
+    // Branch 2 = fresh SOLO create).
+    let root_needed = boot_action.needs_root_zone();
     if root_needed {
         let zm_for_root = zm.clone();
         let self_addr_for_root = self_address.clone();
@@ -1161,11 +1157,6 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
             zm.bootstrap_static_async(zones, peers_for_ha, mounts)
                 .await
                 .map_err(|e| anyhow::anyhow!("bootstrap_static: {}", e))?;
-        }
-        nexus_raft::bootstrap::BootAction::RootlessDynamic => {
-            // Matrix row 2 — see `plan_boot_action` docstring.  Nothing
-            // declared; root already handled upstream, federation
-            // branch is a no-op.
         }
         nexus_raft::bootstrap::BootAction::JoinFederationZones {
             peers,
