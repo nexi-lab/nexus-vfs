@@ -170,7 +170,7 @@ mod tests {
     /// blanket impl compiles and the futures are Send.
     #[allow(dead_code)]
     fn _prove_send_futures(k: &Arc<super::super::Kernel>) {
-        let ctx = OperationContext::internal();
+        let ctx = OperationContext::new("", "root", true, None, true);
         _assert_send(k.sys_read_async("/x".into(), ctx.clone(), 0, 0));
         _assert_send(k.sys_write_async("/x".into(), ctx.clone(), vec![], 0));
         _assert_send(k.sys_stat_async("/x".into(), "root".into()));
