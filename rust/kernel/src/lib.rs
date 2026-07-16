@@ -94,17 +94,7 @@ pub mod kernel;
 // at link time so service code paths inline back to direct inherent
 // calls (no vtable, no perf cost vs holding `Arc<Kernel>` directly).
 //
-// The trait definition lives in `kernel::kernel::syscall` (moved from
-// the old top-level `kernel::abi`). The `abi` module below is a
-// backward-compat re-export so downstream crates that import
-// `kernel::abi::KernelAbi` continue to compile without changes.
-pub mod abi {
-    pub use crate::kernel::syscall::KernelSyscall;
-    /// Backward-compat re-export — downstream code importing
-    /// `kernel::abi::KernelAbi` keeps compiling while migrating to
-    /// `KernelSyscall`.
-    pub use crate::kernel::syscall::KernelSyscall as KernelAbi;
-}
+// The trait definition lives in `kernel::kernel::syscall`.
 
 // kernel↔raft Cargo edge direction: `raft → kernel`. Raft state-machine
 // impls (zone_meta_store) and the

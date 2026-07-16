@@ -96,6 +96,7 @@ mod mount;
 mod observability;
 mod plugins;
 pub mod syscall;
+pub mod syscall_async;
 mod syscall_impl;
 pub use plugins::PluginGrpcEndpoint;
 
