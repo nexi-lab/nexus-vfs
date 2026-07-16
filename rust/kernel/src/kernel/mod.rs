@@ -91,12 +91,12 @@ pub mod vfs_proto {
 pub mod convenience;
 mod dispatch;
 mod ipc;
-pub mod syscall;
-mod syscall_impl;
 mod locks;
 mod mount;
 mod observability;
 mod plugins;
+pub mod syscall;
+mod syscall_impl;
 pub use plugins::PluginGrpcEndpoint;
 
 // ── KernelError ────────────────────────────────────────────────────────────

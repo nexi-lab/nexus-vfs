@@ -22,9 +22,9 @@ use tokio::sync::oneshot;
 use tonic::{transport::Server, Request, Response, Status};
 
 use crate::TlsConfig;
-use kernel::kernel::syscall::KernelSyscall;
 use kernel::hal::object_store_provider::{get_provider, ObjectStoreProviderArgs};
 use kernel::kernel::convenience::KernelConvenience;
+use kernel::kernel::syscall::KernelSyscall;
 use kernel::kernel::vfs_proto::{
     nexus_vfs_service_server::{NexusVfsService, NexusVfsServiceServer},
     BatchReadItemResponse, BatchReadRequest, BatchReadResponse, BatchStatItem, BatchStatRequest,
@@ -428,9 +428,10 @@ impl NexusVfsService for VfsServiceImpl {
         let kernel = self.kernel.clone();
         let path = req.path;
         let offset = req.offset;
-        let read_res =
-            run_blocking(move || KernelSyscall::sys_read(&*kernel, &path, &ctx, timeout_ms, offset))
-                .await?;
+        let read_res = run_blocking(move || {
+            KernelSyscall::sys_read(&*kernel, &path, &ctx, timeout_ms, offset)
+        })
+        .await?;
         match read_res {
             Ok(result) => {
                 let bytes = result.data.unwrap_or_default();
@@ -475,7 +476,8 @@ impl NexusVfsService for VfsServiceImpl {
         let path = req.path;
         let content = req.content;
         let write_res =
-            run_blocking(move || KernelSyscall::sys_write(&*kernel, &path, &ctx, &content, 0)).await?;
+            run_blocking(move || KernelSyscall::sys_write(&*kernel, &path, &ctx, &content, 0))
+                .await?;
         match write_res {
             Ok(result) => Ok(Response::new(WriteResponse {
                 content_id: result.content_id.unwrap_or_default(),
@@ -512,7 +514,8 @@ impl NexusVfsService for VfsServiceImpl {
         let path = req.path;
         let recursive = req.recursive;
         let del_res =
-            run_blocking(move || KernelSyscall::sys_unlink(&*kernel, &path, &ctx, recursive)).await?;
+            run_blocking(move || KernelSyscall::sys_unlink(&*kernel, &path, &ctx, recursive))
+                .await?;
         match del_res {
             Ok(result) => Ok(Response::new(DeleteResponse {
                 success: result.hit,
@@ -727,7 +730,8 @@ impl NexusVfsService for VfsServiceImpl {
         let path = req.path;
         let new_path = req.new_path;
         let rename_res =
-            run_blocking(move || KernelSyscall::sys_rename(&*kernel, &path, &new_path, &ctx)).await?;
+            run_blocking(move || KernelSyscall::sys_rename(&*kernel, &path, &new_path, &ctx))
+                .await?;
         match rename_res {
             Ok(r) => Ok(Response::new(RenameResponse {
                 hit: r.hit,
