@@ -52,9 +52,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 gethostname = "1.1"
 
-# C3 will add a workspace [profile.release.package."nexus-cluster"]
-# entry for size optimization (LTO, panic=abort, strip).
-
 [dev-dependencies]
 # wire_durable_metastore tests open real redb files in a temp data dir.
 tempfile = "3"
