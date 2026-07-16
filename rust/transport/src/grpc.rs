@@ -22,7 +22,7 @@ use tokio::sync::oneshot;
 use tonic::{transport::Server, Request, Response, Status};
 
 use crate::TlsConfig;
-use kernel::abi::KernelAbi;
+use kernel::kernel::syscall::KernelSyscall;
 use kernel::hal::object_store_provider::{get_provider, ObjectStoreProviderArgs};
 use kernel::kernel::convenience::KernelConvenience;
 use kernel::kernel::vfs_proto::{
@@ -415,7 +415,7 @@ impl NexusVfsService for VfsServiceImpl {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_read(s))),
         };
-        // No federation guard: KernelAbi::sys_read consults ctx.zone_perms via
+        // No federation guard: KernelSyscall::sys_read consults ctx.zone_perms via
         // the permission gate (kernel::dispatch.rs:101). The same SSOT runs
         // whether the call entered via typed Read or generic Call.
         //
@@ -429,7 +429,7 @@ impl NexusVfsService for VfsServiceImpl {
         let path = req.path;
         let offset = req.offset;
         let read_res =
-            run_blocking(move || KernelAbi::sys_read(&*kernel, &path, &ctx, timeout_ms, offset))
+            run_blocking(move || KernelSyscall::sys_read(&*kernel, &path, &ctx, timeout_ms, offset))
                 .await?;
         match read_res {
             Ok(result) => {
@@ -475,7 +475,7 @@ impl NexusVfsService for VfsServiceImpl {
         let path = req.path;
         let content = req.content;
         let write_res =
-            run_blocking(move || KernelAbi::sys_write(&*kernel, &path, &ctx, &content, 0)).await?;
+            run_blocking(move || KernelSyscall::sys_write(&*kernel, &path, &ctx, &content, 0)).await?;
         match write_res {
             Ok(result) => Ok(Response::new(WriteResponse {
                 content_id: result.content_id.unwrap_or_default(),
@@ -512,7 +512,7 @@ impl NexusVfsService for VfsServiceImpl {
         let path = req.path;
         let recursive = req.recursive;
         let del_res =
-            run_blocking(move || KernelAbi::sys_unlink(&*kernel, &path, &ctx, recursive)).await?;
+            run_blocking(move || KernelSyscall::sys_unlink(&*kernel, &path, &ctx, recursive)).await?;
         match del_res {
             Ok(result) => Ok(Response::new(DeleteResponse {
                 success: result.hit,
@@ -727,7 +727,7 @@ impl NexusVfsService for VfsServiceImpl {
         let path = req.path;
         let new_path = req.new_path;
         let rename_res =
-            run_blocking(move || KernelAbi::sys_rename(&*kernel, &path, &new_path, &ctx)).await?;
+            run_blocking(move || KernelSyscall::sys_rename(&*kernel, &path, &new_path, &ctx)).await?;
         match rename_res {
             Ok(r) => Ok(Response::new(RenameResponse {
                 hit: r.hit,
@@ -767,7 +767,7 @@ impl NexusVfsService for VfsServiceImpl {
         let src = req.src;
         let dst = req.dst;
         let copy_res =
-            run_blocking(move || KernelAbi::sys_copy(&*kernel, &src, &dst, &ctx)).await?;
+            run_blocking(move || KernelSyscall::sys_copy(&*kernel, &src, &dst, &ctx)).await?;
         match copy_res {
             Ok(r) => Ok(Response::new(CopyResponse {
                 hit: r.hit,
@@ -2301,7 +2301,7 @@ mod tests {
 
         // I/O through the freshly-built mount must round-trip.
         let ctx = OperationContext::new("test", "root", true, None, true);
-        KernelAbi::sys_write(&*kernel, "/r2/hello.txt", &ctx, b"r2 bytes", 0)
+        KernelSyscall::sys_write(&*kernel, "/r2/hello.txt", &ctx, b"r2 bytes", 0)
             .expect("write into s3 mount");
         let read = svc
             .read(tonic::Request::new(ReadRequest {
@@ -2362,7 +2362,7 @@ mod tests {
 
         // Seed a file through the live "/" mount.
         let ctx = OperationContext::new("test", "root", true, None, true);
-        KernelAbi::sys_write(&*kernel, "/seed.txt", &ctx, b"alive", 0).expect("seed write");
+        KernelSyscall::sys_write(&*kernel, "/seed.txt", &ctx, b"alive", 0).expect("seed write");
 
         // Re-emit DT_MOUNT for "/" with a local backend_type (as the Python
         // factory does at boot). Must ack synthetically, not rebuild.
@@ -2609,7 +2609,7 @@ mod tests {
     async fn batch_read_returns_per_item_results_in_order() {
         let kernel = std::sync::Arc::new(kernel_with_mem_backend());
         let ctx = OperationContext::new("test", "root", true, None, true);
-        KernelAbi::sys_write(&*kernel, "/x.txt", &ctx, b"hello", 0).expect("write");
+        KernelSyscall::sys_write(&*kernel, "/x.txt", &ctx, b"hello", 0).expect("write");
 
         let svc = VfsServiceImpl::for_test(kernel.clone());
 
@@ -2727,7 +2727,7 @@ mod tests {
 
         // Tier 2 create-or-overwrite landed the bytes — read /a.txt back.
         let ctx = OperationContext::new("test", "root", true, None, true);
-        let read = KernelAbi::sys_read(&*kernel, "/a.txt", &ctx, 5000, 0).expect("read");
+        let read = KernelSyscall::sys_read(&*kernel, "/a.txt", &ctx, 5000, 0).expect("read");
         assert_eq!(read.data.unwrap_or_default(), b"alpha");
     }
 
