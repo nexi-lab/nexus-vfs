@@ -88,12 +88,23 @@ pub use core::cas::transport as cas_transport;
 // `prepare_audit_stream`, `sys_*`).
 pub mod kernel;
 
-// `KernelAbi` trait — generic-over-K syscall surface that every
-// Rust service uses to reach the kernel. `impl KernelAbi for Kernel`
+// `KernelSyscall` trait — generic-over-K syscall surface that every
+// Rust service uses to reach the kernel. `impl KernelSyscall for Kernel`
 // is a pure forwarder; production binaries monomorphise `K = Kernel`
 // at link time so service code paths inline back to direct inherent
 // calls (no vtable, no perf cost vs holding `Arc<Kernel>` directly).
-pub mod abi;
+//
+// The trait definition lives in `kernel::kernel::syscall` (moved from
+// the old top-level `kernel::abi`). The `abi` module below is a
+// backward-compat re-export so downstream crates that import
+// `kernel::abi::KernelAbi` continue to compile without changes.
+pub mod abi {
+    pub use crate::kernel::syscall::KernelSyscall;
+    /// Backward-compat re-export — downstream code importing
+    /// `kernel::abi::KernelAbi` keeps compiling while migrating to
+    /// `KernelSyscall`.
+    pub use crate::kernel::syscall::KernelSyscall as KernelAbi;
+}
 
 // kernel↔raft Cargo edge direction: `raft → kernel`. Raft state-machine
 // impls (zone_meta_store) and the

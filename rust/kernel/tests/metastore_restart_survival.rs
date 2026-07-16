@@ -22,7 +22,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use kernel::abc::object_store::{ObjectStore, StorageError, WriteResult};
-use kernel::abi::KernelAbi;
+use kernel::kernel::syscall::KernelSyscall;
 use kernel::kernel::{Kernel, OperationContext};
 
 // ── Minimal in-memory backend (mirrors service_hook_lifecycle.rs) ────
@@ -139,9 +139,9 @@ fn namespace_survives_kernel_restart_with_durable_metastore() {
 
     {
         let (k, ctx) = boot(Some(&ms));
-        KernelAbi::sys_write(&k, "/docs/report.md", &ctx, b"v1 bytes", 0).expect("write");
+        KernelSyscall::sys_write(&k, "/docs/report.md", &ctx, b"v1 bytes", 0).expect("write");
         assert!(
-            KernelAbi::sys_stat(&k, "/docs/report.md", kernel::ROOT_ZONE_ID).is_some(),
+            KernelSyscall::sys_stat(&k, "/docs/report.md", kernel::ROOT_ZONE_ID).is_some(),
             "file must be visible immediately after write"
         );
         // Release the redb handle the way a clean shutdown does (#3765),
@@ -151,7 +151,7 @@ fn namespace_survives_kernel_restart_with_durable_metastore() {
 
     let (k2, _ctx) = boot(Some(&ms));
     assert!(
-        KernelAbi::sys_stat(&k2, "/docs/report.md", kernel::ROOT_ZONE_ID).is_some(),
+        KernelSyscall::sys_stat(&k2, "/docs/report.md", kernel::ROOT_ZONE_ID).is_some(),
         "a registered file must survive a kernel restart when the \
          metastore is durable (nexi-lab/nexus#4343)"
     );
@@ -200,7 +200,7 @@ fn non_root_mount_entry_row_survives_kernel_restart() {
         )
         .expect("mount /sub");
         assert!(
-            KernelAbi::sys_stat(&k, "/sub", kernel::ROOT_ZONE_ID).is_some(),
+            KernelSyscall::sys_stat(&k, "/sub", kernel::ROOT_ZONE_ID).is_some(),
             "mount entry visible after mounting"
         );
         k.release_metastores();
@@ -208,7 +208,7 @@ fn non_root_mount_entry_row_survives_kernel_restart() {
 
     // Second boot: only "/" is re-mounted (what the daemon does at boot).
     let (k2, _ctx) = boot(Some(&ms));
-    let stat = KernelAbi::sys_stat(&k2, "/sub", kernel::ROOT_ZONE_ID)
+    let stat = KernelSyscall::sys_stat(&k2, "/sub", kernel::ROOT_ZONE_ID)
         .expect("non-root DT_MOUNT row must survive a kernel restart (nexi-lab/nexus#4343)");
     assert_eq!(
         stat.entry_type,
@@ -381,7 +381,7 @@ fn cross_zone_unmount_removes_durable_row_and_live_route() {
     );
 
     let unlink =
-        KernelAbi::sys_unlink(&k, "/corp", &ctx, false).expect("cross-zone unmount succeeds");
+        KernelSyscall::sys_unlink(&k, "/corp", &ctx, false).expect("cross-zone unmount succeeds");
     assert!(unlink.hit, "unlink reports the mount as removed");
     assert!(
         !k.has_mount("/corp", "zone-corp"),
@@ -392,7 +392,7 @@ fn cross_zone_unmount_removes_durable_row_and_live_route() {
         "no stray route under the parent zone either"
     );
     assert!(
-        KernelAbi::sys_stat(&k, "/corp", kernel::ROOT_ZONE_ID).is_none(),
+        KernelSyscall::sys_stat(&k, "/corp", kernel::ROOT_ZONE_ID).is_none(),
         "durable DT_MOUNT row must be gone after unmount"
     );
 }
@@ -443,15 +443,15 @@ fn orphan_mount_row_unlinks_after_restart_without_live_route() {
         "precondition: no live route after restart (bare kernel does not replay)"
     );
     assert!(
-        KernelAbi::sys_stat(&k2, "/corp", kernel::ROOT_ZONE_ID).is_some(),
+        KernelSyscall::sys_stat(&k2, "/corp", kernel::ROOT_ZONE_ID).is_some(),
         "precondition: durable row survived the restart"
     );
 
-    let unlink = KernelAbi::sys_unlink(&k2, "/corp", &ctx, false)
+    let unlink = KernelSyscall::sys_unlink(&k2, "/corp", &ctx, false)
         .expect("unlinking an orphan mount row must succeed");
     assert!(unlink.hit, "row-only unlink still counts as a removal");
     assert!(
-        KernelAbi::sys_stat(&k2, "/corp", kernel::ROOT_ZONE_ID).is_none(),
+        KernelSyscall::sys_stat(&k2, "/corp", kernel::ROOT_ZONE_ID).is_none(),
         "durable row must be gone after the orphan unlink"
     );
 }
@@ -521,14 +521,14 @@ fn unmount_keeps_route_when_durable_row_delete_fails() {
     mount("/sub", "zone-corp", None).expect("mount /sub (cross-zone)");
 
     let ctx = OperationContext::new("test", "root", true, None, true);
-    let unlink = KernelAbi::sys_unlink(&k, "/sub", &ctx, false);
+    let unlink = KernelSyscall::sys_unlink(&k, "/sub", &ctx, false);
     assert!(
         unlink.is_err(),
         "sys_unlink of a mount must fail when the durable DT_MOUNT row \
          cannot be deleted"
     );
     assert!(
-        KernelAbi::sys_stat(&k, "/sub", kernel::ROOT_ZONE_ID).is_some(),
+        KernelSyscall::sys_stat(&k, "/sub", kernel::ROOT_ZONE_ID).is_some(),
         "the mount must still be present after the failed unmount \
          (fail closed — no silent route removal with a stale durable row)"
     );
@@ -577,7 +577,7 @@ fn unmount_keeps_route_when_durable_row_delete_fails() {
         "a genuinely missing path stays an Ok(hit=false) miss in batch mode"
     );
     assert!(
-        KernelAbi::sys_stat(&k, "/sub", kernel::ROOT_ZONE_ID).is_some(),
+        KernelSyscall::sys_stat(&k, "/sub", kernel::ROOT_ZONE_ID).is_some(),
         "the mount must still be present after failed batch unmounts"
     );
     assert!(
@@ -774,13 +774,13 @@ fn namespace_is_lost_across_restart_without_durable_metastore() {
     // → registrations live in the kernel's boot tempdir and die with it.
     {
         let (k, ctx) = boot(None);
-        KernelAbi::sys_write(&k, "/docs/report.md", &ctx, b"v1 bytes", 0).expect("write");
-        assert!(KernelAbi::sys_stat(&k, "/docs/report.md", kernel::ROOT_ZONE_ID).is_some());
+        KernelSyscall::sys_write(&k, "/docs/report.md", &ctx, b"v1 bytes", 0).expect("write");
+        assert!(KernelSyscall::sys_stat(&k, "/docs/report.md", kernel::ROOT_ZONE_ID).is_some());
     }
 
     let (k2, _ctx) = boot(None);
     assert!(
-        KernelAbi::sys_stat(&k2, "/docs/report.md", kernel::ROOT_ZONE_ID).is_none(),
+        KernelSyscall::sys_stat(&k2, "/docs/report.md", kernel::ROOT_ZONE_ID).is_none(),
         "without a durable metastore the namespace does not survive — \
          production profiles must wire set_metastore_path"
     );
