@@ -13,8 +13,7 @@
 //! Layered against KERNEL-ARCHITECTURE.md §6.1: the analogue of
 //! Linux's `include/linux/` syscall ABI surface, lifted into Rust as
 //! a single trait. The trait declaration lives in
-//! `kernel::kernel::syscall` (re-exported as `kernel::abi` for
-//! backward compatibility) rather than in the `contracts` crate to
+//! `kernel::kernel::syscall` rather than in the `contracts` crate to
 //! keep the kernel-internal result types (`SysReadResult`,
 //! `KernelError`, …) on their existing module path.
 //!
