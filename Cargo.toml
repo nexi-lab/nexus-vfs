@@ -83,17 +83,22 @@ incremental = true
 opt-level = 2
 
 [profile.release]
-lto = "thin"
+# Fat LTO across the whole cluster binary — meaningfully smaller stripped
+# binaries than thin at the cost of longer link times. The cluster binary
+# ships standalone and is size-gated in CI
+# (`.github/workflows/cluster-binary-build.yml`), so trading build time
+# for size is the right lever here.
+lto = "fat"
 codegen-units = 1
 opt-level = 3
 strip = "symbols"
 
 # Cluster binary ships standalone for sudowork; size matters more than
 # raw throughput. opt-level="z" picks the cluster code path that
-# minimizes object size. On Linux x86_64 with workspace-wide
-# strip="symbols", the binary lands around 5-6 MB; on Windows MSVC
-# the .exe is closer to 8 MB (PE headers + import tables don't
-# compress as much as stripped ELF). CI's size gate (Group F) checks
-# the Linux artifact.
+# minimizes object size. Current gate: Linux/macOS-x86_64 16 MiB,
+# macOS-arm64 13.75 MiB, Windows 14.5 MiB
+# (`.github/workflows/cluster-binary-build.yml`). Bringing this down
+# toward a ~5 MB target is a follow-up (cargo bloat pass, potential
+# nightly build-std with panic_immediate_abort — tracked separately).
 [profile.release.package.nexus-cluster]
 opt-level = "z"

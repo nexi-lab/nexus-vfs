@@ -23,35 +23,35 @@ jobs:
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
-            max_size_bytes: 16777216  # 16.0 MiB — bumped from 15.75 MiB to absorb the
-                                      # `auth` crate, now unconditional in this
-                                      # binary (the sk- credential policy is a
-                                      # RUNTIME posture, not a build flag — see
-                                      # auth_posture.rs). Measured delta over the
-                                      # feature-gated build: 134 KiB (0.9%).
+            max_size_bytes: 16252928  # 15.5 MiB — tightened from 16.0 MiB after
+                                      # fat LTO + dead-code drop. Measured
+                                      # 15,190,768 bytes on this platform.
           - os: macos-14
             artifact_name: nexusd-cluster-macos-arm64
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
-            max_size_bytes: 14417920  # 13.75 MiB — same +0.25 MiB headroom for the
-                                      # unconditional `auth` crate.
+            max_size_bytes: 13369344  # 12.75 MiB — tightened from 13.75 MiB after
+                                      # fat LTO. Measured 12,378,928 bytes on
+                                      # this platform.
           - os: macos-14
             artifact_name: nexusd-cluster-macos-x86_64
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
             target: x86_64-apple-darwin
-            max_size_bytes: 16777216  # 16.0 MiB — symmetric with linux for the
-                                      # unconditional `auth` crate.
+            max_size_bytes: 14417920  # 13.75 MiB — tightened from 16.0 MiB after
+                                      # fat LTO. Measured 13,394,440 bytes on
+                                      # this platform.
           - os: windows-latest
             artifact_name: nexusd-cluster-windows-x86_64
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster.exe
-            max_size_bytes: 15204352  # 14.5 MiB — same +0.25 MiB headroom for the
-                                      # unconditional `auth` crate. Measured
-                                      # 15,003,648 bytes on this platform.
+            max_size_bytes: 14942208  # 14.25 MiB — tightened from 14.5 MiB after
+                                      # fat LTO + dead-code drop. Measured
+                                      # 14,026,752 bytes on this platform (down
+                                      # from 15,003,648 pre-refactor, -954 KiB).
 
 
     steps:

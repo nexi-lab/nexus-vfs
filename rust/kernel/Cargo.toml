@@ -40,10 +40,6 @@ tonic-prost = { workspace = true }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "sync", "time", "macros", "process", "io-util"] }
 futures = "0.3"
 tracing = "0.1"
-reqwest = { version = "0.13", features = ["json", "stream", "rustls"], default-features = false, optional = true }
-hmac = { version = "0.13", optional = true }
-sha2 = { version = "0.11", optional = true }
-futures-util = { version = "0.3", default-features = false, features = ["sink"], optional = true }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 base64 = "0.22"
 # Ed25519 signature verification for dlopen'd plugins (PluginLoader::load
@@ -54,9 +50,8 @@ bytes = "1"
 mimalloc = { workspace = true, optional = true }
 
 [features]
-default = ["mimalloc", "connectors"]
+default = ["mimalloc"]
 mimalloc = ["dep:mimalloc"]
-connectors = ["dep:reqwest", "dep:hmac", "dep:sha2", "dep:futures-util"]
 
 [build-dependencies]
 tonic-prost-build = "0.14"
