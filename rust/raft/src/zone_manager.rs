@@ -1386,9 +1386,9 @@ impl ZoneManager {
 // sync), and tests / founder paths that build their runtime around
 // `main()`.
 //
-// `nexusd-cluster`'s `run_daemon` / `run_share` / `run_join` and
-// `nexus-federation-server` are `#[tokio::main]` async, so calling
-// the sync methods from them needs a `spawn_blocking` hop off the
+// `nexusd-cluster`'s `run_daemon` / `run_share` / `run_join` are
+// `#[tokio::main]` async, so calling the sync methods from them
+// needs a `spawn_blocking` hop off the
 // async worker — otherwise the inner runtime's `block_on` from
 // `bridge_block_on` panics if its `block_in_place` releases a worker
 // holding an `Arc<Runtime>` referent (same panic shape PR #4011

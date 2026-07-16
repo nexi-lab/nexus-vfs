@@ -8,35 +8,28 @@ publish = false
 
 [[bin]]
 name = "nexusd-full"
-# Reuses the cluster binary's entrypoint verbatim. `cluster/src/main.rs` is
-# feature-agnostic — Cargo features select which ObjectStore arms compile into
-# `DefaultObjectStoreProvider`; the `main` itself has no per-driver code. This
-# profile differs from `nexusd-cluster` ONLY by enabling `backends/driver-s3`,
-# so it shares the exact same source instead of duplicating ~780 lines. Keeping
-# the federation binary pure (and small, under its size gate) while S3/R2
-# serving lives in this separate profile was the kernel-team ask on nexus-vfs#27.
-path = "../cluster/src/main.rs"
+path = "src/main.rs"
 
 [dependencies]
-# Mirror of `profiles/cluster` deps, with one delta: `backends` adds
-# `driver-s3`. Keep these in sync with `profiles/cluster/Cargo.toml`.
-raft = { workspace = true, default-features = false, features = ["grpc"] }
-contracts = { workspace = true }
-kernel = { workspace = true }
-backends = { workspace = true, default-features = false, features = ["driver-path-local", "driver-remote", "driver-s3"] }
-transport = { workspace = true }
-auth = { workspace = true }
-rand = "0.10"
-
-tonic = { workspace = true }
+# Consume the cluster library entry (`nexus_cluster::run`) as a normal
+# dependency. All the raft / kernel / transport / auth / tonic / tokio /
+# clap / tracing deps flow through transitively — this crate does NOT
+# re-declare them. The only local delta from cluster is the next line:
+# opt `backends` into the S3 driver via Cargo feature unification.
+#
+# Feature unification: cluster's Cargo.toml declares
+#   backends = { workspace = true, default-features = false,
+#                features = ["driver-path-local", "driver-remote"] }
+# This crate declares
+#   backends = { workspace = true, default-features = false,
+#                features = ["driver-s3"] }
+# Cargo activates the UNION for the shared `backends` compilation, so the
+# `nexusd-full` binary gets all three drivers compiled in. `nexusd-cluster`
+# builds in a separate rustc invocation and only sees its own two.
+nexus-cluster = { path = "../cluster" }
+backends = { workspace = true, default-features = false, features = ["driver-s3"] }
 anyhow = "1"
-clap = { version = "4", features = ["derive", "env"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-appender = "0.2"
-gethostname = "1.1"
 
 [dev-dependencies]
-# The shared cluster main.rs test module opens real redb files in a temp dir.
+# The shared cluster main test module opens real redb files in a temp dir.
 tempfile = "3"
