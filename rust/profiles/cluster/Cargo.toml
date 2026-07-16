@@ -6,6 +6,10 @@ description = "Nexus cluster-profile runtime — pure Rust binary for Raft + IPC
 authors = ["Nexus Team"]
 publish = false
 
+[lib]
+name = "nexus_cluster"
+path = "src/lib.rs"
+
 [[bin]]
 name = "nexusd-cluster"
 path = "src/main.rs"
