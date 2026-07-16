@@ -120,6 +120,8 @@ pub struct FileEvent {
     pub(crate) event_id: String,
     /// For renames: the source path is in `path`, destination in `new_path`.
     /// Some test/event consumers also stash a previous path here.
+    /// Wired by StreamEventObserver (not yet registered at boot).
+    #[allow(dead_code)]
     pub(crate) old_path: Option<String>,
     pub(crate) size: Option<u64>,
     pub(crate) content_id: Option<String>,
@@ -212,6 +214,9 @@ impl FileEvent {
     /// (e.g. `\n`, `\0`) produce valid JSON (§ review fix #6). Unset
     /// `Option` fields are omitted to match the previous wire shape; scalar
     /// fields continue to use the compact ordering the Python parsers expect.
+    ///
+    /// Called by StreamEventObserver (not yet registered at boot).
+    #[allow(dead_code)]
     pub(crate) fn to_json(&self) -> String {
         let mut map = serde_json::Map::with_capacity(12);
         map.insert(
