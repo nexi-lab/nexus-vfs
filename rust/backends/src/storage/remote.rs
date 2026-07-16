@@ -296,7 +296,7 @@ impl ObjectStore for RemoteBackend {
     fn delete_file(&self, path: &str) -> Result<(), StorageError> {
         // Same SSOT story as read_content: typed Delete hands the full
         // OperationContext (incl. zone_perms for federation tokens) to
-        // KernelAbi::sys_unlink, so the read-only enforcement path the
+        // KernelSyscall::sys_unlink, so the read-only enforcement path the
         // legacy Issue #3786 comment cared about now fires identically
         // on the typed wire.
         let server_path = to_server_path(&self.zone_path, path);

@@ -1,30 +1,30 @@
 //! Tier 2 CONVENIENCE — composes Tier 1. Tier 2 logic never goes in
-//! `io.rs`.
+//! `syscall_impl.rs`.
 //!
-//! `KernelConvenience` is a supertrait of `KernelAbi` that provides
+//! `KernelConvenience` is a supertrait of `KernelSyscall` that provides
 //! higher-level operations Python callers need (create-or-overwrite
 //! write, xattr access, batch stat). Default implementations compose
-//! `KernelAbi` methods; the `impl KernelConvenience for Kernel`
+//! `KernelSyscall` methods; the `impl KernelConvenience for Kernel`
 //! overrides with optimized direct paths where the composition
 //! overhead matters.
 
 use std::any::Any;
 use std::sync::Arc;
 
+use super::syscall::KernelSyscall;
 use super::{
     Kernel, KernelError, OperationContext, StatResult, SysMkdirResult, SysReadResult,
     SysRmdirResult, SysSetAttrResult, SysUnlinkResult, SysWriteResult,
 };
 use crate::abc::object_store::ObjectStore;
-use crate::abi::KernelAbi;
 use crate::meta_store::{MetaStore, DT_EXTERNAL_STORAGE, DT_MOUNT};
 use crate::ROOT_ZONE_ID;
 
 // ── KernelConvenience trait ──────────────────────────────────────────
 
-/// Tier 2 convenience surface — composed from Tier 1 `KernelAbi`
+/// Tier 2 convenience surface — composed from Tier 1 `KernelSyscall`
 /// syscalls, with optimized overrides on the concrete `Kernel`.
-pub trait KernelConvenience: KernelAbi {
+pub trait KernelConvenience: KernelSyscall {
     /// Fast existence check: validate + route + metastore.exists.
     fn access(&self, path: &str, zone_id: &str) -> bool;
 
@@ -139,7 +139,7 @@ pub trait KernelConvenience: KernelAbi {
     /// Conceptually `sys_setattr(entry_type=DT_DIR)` plus the
     /// `parents` / `exist_ok` directory-tree semantics. No default
     /// body — the composition needs kernel routing internals, so
-    /// `Kernel` supplies the optimized inherent override (`io.rs`).
+    /// `Kernel` supplies the optimized inherent override (`syscall_impl.rs`).
     fn mkdir(
         &self,
         path: &str,
@@ -152,7 +152,7 @@ pub trait KernelConvenience: KernelAbi {
     ///
     /// Conceptually `sys_unlink(recursive=…)` narrowed to directories.
     /// No default body — `Kernel` supplies the optimized inherent
-    /// override (`io.rs`), which the `sys_unlink` DT_DIR branch also
+    /// override (`syscall_impl.rs`), which the `sys_unlink` DT_DIR branch also
     /// calls directly.
     fn rmdir(
         &self,
@@ -340,7 +340,7 @@ impl<'a> MountOptions<'a> {
 
 impl KernelConvenience for Kernel {
     fn access(&self, path: &str, zone_id: &str) -> bool {
-        // Delegate to the inherent method on Kernel (io.rs).
+        // Delegate to the inherent method on Kernel (syscall_impl.rs).
         Kernel::access(self, path, zone_id)
     }
 
@@ -351,7 +351,7 @@ impl KernelConvenience for Kernel {
         parents: bool,
         exist_ok: bool,
     ) -> Result<SysMkdirResult, KernelError> {
-        // Delegate to the optimized inherent method on Kernel (io.rs).
+        // Delegate to the optimized inherent method on Kernel (syscall_impl.rs).
         Kernel::mkdir(self, path, ctx, parents, exist_ok)
     }
 
@@ -361,7 +361,7 @@ impl KernelConvenience for Kernel {
         ctx: &OperationContext,
         recursive: bool,
     ) -> Result<SysRmdirResult, KernelError> {
-        // Delegate to the optimized inherent method on Kernel (io.rs).
+        // Delegate to the optimized inherent method on Kernel (syscall_impl.rs).
         Kernel::rmdir(self, path, ctx, recursive)
     }
 

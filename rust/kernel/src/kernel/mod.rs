@@ -90,12 +90,13 @@ pub mod vfs_proto {
 // way.
 pub mod convenience;
 mod dispatch;
-mod io;
 mod ipc;
 mod locks;
 mod mount;
 mod observability;
 mod plugins;
+pub mod syscall;
+mod syscall_impl;
 pub use plugins::PluginGrpcEndpoint;
 
 // ── KernelError ────────────────────────────────────────────────────────────
@@ -4065,15 +4066,15 @@ mod tests {
             // to `true`, which is what services::managed_agent::
             // proc_entry::register_proc_entry checks before passing
             // io_profile="wal" to sys_setattr.
-            use crate::abi::KernelAbi;
+            use super::syscall::KernelSyscall;
             let bare = Kernel::new();
             assert!(
-                !KernelAbi::is_federation_initialized(&bare),
+                !KernelSyscall::is_federation_initialized(&bare),
                 "bare Kernel::new() must not advertise federation",
             );
             let kernel = fresh_federated_kernel();
             assert!(
-                KernelAbi::is_federation_initialized(kernel.as_ref()),
+                KernelSyscall::is_federation_initialized(kernel.as_ref()),
                 "kernel with test coordinator installed must advertise federation",
             );
         }

@@ -17,7 +17,7 @@ use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use std::hint::black_box;
 
 use kernel::abc::object_store::{ObjectStore, StorageError, WriteResult};
-use kernel::abi::KernelAbi;
+use kernel::kernel::syscall::KernelSyscall;
 use kernel::kernel::{Kernel, OperationContext, ReadRequest};
 
 // ── Latency-simulating in-memory ObjectStore ────────────────────────────────
@@ -175,7 +175,7 @@ fn setup() -> Kernel {
     for i in 0..100u32 {
         let path = format!("/bench/f{i:03}.txt");
         let payload = vec![b'x'; 1024];
-        KernelAbi::sys_write(&k, &path, &ctx, &payload, 0).expect("bench write");
+        KernelSyscall::sys_write(&k, &path, &ctx, &payload, 0).expect("bench write");
     }
 
     // Phase 2: re-mount with the latency-simulating backend.
@@ -226,7 +226,7 @@ fn bench_sequential(c: &mut Criterion) {
             |_| {
                 for i in 0..100u32 {
                     let path = format!("/bench/f{i:03}.txt");
-                    let r = KernelAbi::sys_read(&k, &path, &ctx, 5000, 0).expect("read");
+                    let r = KernelSyscall::sys_read(&k, &path, &ctx, 5000, 0).expect("read");
                     black_box(r);
                 }
             },

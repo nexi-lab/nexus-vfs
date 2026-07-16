@@ -1,21 +1,22 @@
-//! Tier 1 CONTRACTS — implementations in `io.rs`.
+//! Tier 1 CONTRACTS — implementations in `syscall_impl.rs`.
 //!
-//! `KernelAbi` — the canonical Rust syscall surface that every
+//! `KernelSyscall` — the canonical Rust syscall surface that every
 //! in-process Rust service uses to reach the kernel.
 //!
 //! All Rust services (in-tree `services::*` and any future
 //! managed-agent runtime that lives alongside them) reach kernel
-//! syscalls through `K: KernelAbi` instead of holding a concrete
+//! syscalls through `K: KernelSyscall` instead of holding a concrete
 //! `Arc<Kernel>`. The same generic codepath compiles for production
 //! (`K = Kernel`, monomorphised at link time → identical perf to a
 //! direct inherent call) and for unit tests (`K = MockKernel`).
 //!
 //! Layered against KERNEL-ARCHITECTURE.md §6.1: the analogue of
 //! Linux's `include/linux/` syscall ABI surface, lifted into Rust as
-//! a single trait. The trait declaration lives in `kernel::abi`
-//! rather than in the `contracts` crate to keep the
-//! kernel-internal result types (`SysReadResult`, `KernelError`, …)
-//! on their existing module path.
+//! a single trait. The trait declaration lives in
+//! `kernel::kernel::syscall` (re-exported as `kernel::abi` for
+//! backward compatibility) rather than in the `contracts` crate to
+//! keep the kernel-internal result types (`SysReadResult`,
+//! `KernelError`, …) on their existing module path.
 //!
 //! ## Surface scope
 //!
@@ -51,7 +52,7 @@ use crate::kernel::{
 /// Bounds: `Send + Sync + 'static` so consumers can pass `Arc<K>`
 /// across thread boundaries (the managed-agent runtime spawns OS
 /// threads that hold a kernel handle).
-pub trait KernelAbi: Send + Sync + 'static {
+pub trait KernelSyscall: Send + Sync + 'static {
     // ── Syscalls (1:1 with inherent `Kernel::sys_*`) ────────────────
 
     fn sys_read(
@@ -226,14 +227,14 @@ pub trait KernelAbi: Send + Sync + 'static {
     fn is_federation_initialized(&self) -> bool;
 }
 
-// ── `impl KernelAbi for Kernel` ──────────────────────────────────────
+// ── `impl KernelSyscall for Kernel` ──────────────────────────────────────
 //
 // Pure forwarder — every method delegates to the inherent fn of the
 // same name on `Kernel`. Monomorphisation at the binary link site
 // inlines through the trait dispatch back to the inherent call,
 // recovering 100% of the direct-call perf.
 
-impl KernelAbi for crate::kernel::Kernel {
+impl KernelSyscall for crate::kernel::Kernel {
     fn sys_read(
         &self,
         path: &str,

@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use kernel::abc::object_store::{ObjectStore, StorageError, WriteResult};
-use kernel::abi::KernelAbi;
+use kernel::kernel::syscall::KernelSyscall;
 use kernel::kernel::{Kernel, OperationContext};
 use kernel::service_registry::ServiceLifecycle;
 use kernel::{HookContext, HookOutcome, NativeInterceptHook};
@@ -192,7 +192,7 @@ fn setup_kernel() -> (Kernel, OperationContext) {
 
 /// Helper: perform a single sys_write and return whether it succeeded.
 fn do_write(k: &Kernel, ctx: &OperationContext, path: &str) -> bool {
-    KernelAbi::sys_write(k, path, ctx, b"hello", 0).is_ok()
+    KernelSyscall::sys_write(k, path, ctx, b"hello", 0).is_ok()
 }
 
 // ── Test 1: register_service_hook fires, unhook via unregister_service ─

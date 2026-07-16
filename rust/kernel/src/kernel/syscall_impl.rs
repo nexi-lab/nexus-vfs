@@ -1,4 +1,4 @@
-//! Tier 1 syscall IMPLEMENTATIONS — see `abi.rs` for contracts,
+//! Tier 1 syscall IMPLEMENTATIONS — see `syscall.rs` for contracts,
 //! `convenience.rs` for Tier 2.
 //!
 //! File I/O syscalls: `sys_read`, `sys_write`, `sys_stat`,
@@ -589,7 +589,7 @@ impl Kernel {
     // — per `docs/KERNEL-ARCHITECTURE.md` §3, the kernel-side wiring
     // for §3.B Control-Plane HAL surfaces belongs in the federation-
     // family submodule (`core/vfs_router.rs` + `federation/`), not in
-    // syscall-implementation files like io.rs.
+    // syscall-implementation files like syscall_impl.rs.
 }
 
 struct WriteCommitInput<'a> {
@@ -2847,7 +2847,7 @@ impl Kernel {
         }
 
         // 1b. Permission gate + native pre-hooks per item. The previous
-        // Call-RPC write_batch path looped through KernelAbi::sys_write, so
+        // Call-RPC write_batch path looped through KernelSyscall::sys_write, so
         // batch writes must preserve the same per-path authorization and
         // hook replacement semantics while still using the grouped commit.
         let mut pre_errors: Vec<Option<KernelError>> = vec![None; n];
