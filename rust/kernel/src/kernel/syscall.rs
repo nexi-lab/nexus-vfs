@@ -31,15 +31,18 @@
 //! syscalls (a future `/__sys__/agents/{pid}/...` metadata-syscall
 //! migration tracks the AgentRegistry case).
 //!
-//! `is_federation_initialized` is the one high-level probe in the
-//! trait — it wraps `distributed_coordinator().is_initialized(self)`
-//! because services need the boolean, not the coordinator handle.
+//! Non-syscall surfaces live elsewhere: the install-time control
+//! plane (`register_service_hook`, `enlist_hook_only_service`, …) stays
+//! on the inherent `Kernel` impl, and federation-readiness is resolved
+//! by the kernel itself inside `setattr_stream` (the `io_profile`
+//! waterfall) rather than probed by services — neither belongs on this
+//! Tier-1 syscall contract.
 
 use std::sync::Arc;
 
-use contracts::{OperationContext, RustService};
+use contracts::OperationContext;
 
-use crate::core::dispatch::{FileEvent, NativeInterceptHook};
+use crate::core::dispatch::FileEvent;
 use crate::kernel::{
     KernelError, StatResult, SysCopyResult, SysReadResult, SysRenameResult, SysSetAttrResult,
     SysUnlinkResult, SysWriteResult,
@@ -153,12 +156,6 @@ pub trait KernelSyscall: Send + Sync + 'static {
     /// (e.g. `/__sys__/zones/`).
     fn sys_readdir(&self, parent_path: &str, zone_id: &str, is_admin: bool) -> Vec<(String, u8)>;
 
-    /// Compat shim — external deps (sudocode runtime) still call `readdir`.
-    /// Remove once sudocode rev is bumped past the rename.
-    fn readdir(&self, parent_path: &str, zone_id: &str, is_admin: bool) -> Vec<(String, u8)> {
-        self.sys_readdir(parent_path, zone_id, is_admin)
-    }
-
     // ── Event watch (inotify equivalent) ──────────────────────────
 
     /// Block until a file event matching `pattern` fires, or timeout.
@@ -168,62 +165,6 @@ pub trait KernelSyscall: Send + Sync + 'static {
     /// Used by managed-agent runtimes to replace polling with
     /// event-driven blocking on `/proc/{pid}/chat-with-me` mailboxes.
     fn sys_watch(&self, pattern: &str, timeout_ms: u64) -> Option<FileEvent>;
-
-    // ── Install-time control plane (LSM-style hook + Rust service
-    //    registry) ────────────────────────────────────────────────
-
-    fn register_native_hook(&self, hook: Box<dyn NativeInterceptHook>);
-
-    /// Enlist a hook-only service and return the handle callers thread
-    /// through `register_service_hook` / `register_service_observer`
-    /// below.  Same semantics as
-    /// [`Kernel::enlist_hook_only_service`](crate::kernel::Kernel::enlist_hook_only_service).
-    fn enlist_hook_only_service(
-        &self,
-        name: &str,
-    ) -> Result<crate::service_registry::ServiceHandle, String>;
-
-    /// Return a handle for an already-registered service, regardless
-    /// of variant.  Same semantics as
-    /// [`Kernel::service_handle`](crate::kernel::Kernel::service_handle).
-    fn service_handle(&self, name: &str) -> Option<crate::service_registry::ServiceHandle>;
-
-    /// Register a native hook, binding its ownership to the
-    /// [`ServiceHandle`](crate::service_registry::ServiceHandle).
-    /// Same semantics as
-    /// [`Kernel::register_service_hook`](crate::kernel::Kernel::register_service_hook).
-    fn register_service_hook(
-        &self,
-        handle: &crate::service_registry::ServiceHandle,
-        hook: Box<dyn NativeInterceptHook>,
-    );
-
-    /// Register an observer, binding its ownership to the
-    /// [`ServiceHandle`](crate::service_registry::ServiceHandle).
-    /// Same semantics as
-    /// [`Kernel::register_service_observer`](crate::kernel::Kernel::register_service_observer).
-    fn register_service_observer(
-        &self,
-        handle: &crate::service_registry::ServiceHandle,
-        observer: Arc<dyn crate::dispatch::MutationObserver>,
-        observer_name: String,
-        event_mask: u32,
-    );
-
-    fn register_rust_service(
-        &self,
-        name: &str,
-        svc: Arc<dyn RustService>,
-        deps: Vec<String>,
-    ) -> Result<(), String>;
-
-    // ── High-level federation probe ─────────────────────────────────
-
-    /// True once the coordinator's boot wiring has completed — the
-    /// same readiness probe `setattr_mount` uses.  Wraps
-    /// `distributed_coordinator().is_initialized(self)` so service
-    /// callers don't need to reach the coordinator handle.
-    fn is_federation_initialized(&self) -> bool;
 }
 
 // ── `impl KernelSyscall for Kernel` ──────────────────────────────────────
@@ -356,51 +297,5 @@ impl KernelSyscall for crate::kernel::Kernel {
 
     fn sys_watch(&self, pattern: &str, timeout_ms: u64) -> Option<FileEvent> {
         Self::sys_watch(self, pattern, timeout_ms)
-    }
-
-    fn register_native_hook(&self, hook: Box<dyn NativeInterceptHook>) {
-        Self::register_native_hook(self, hook)
-    }
-
-    fn enlist_hook_only_service(
-        &self,
-        name: &str,
-    ) -> Result<crate::service_registry::ServiceHandle, String> {
-        Self::enlist_hook_only_service(self, name)
-    }
-
-    fn service_handle(&self, name: &str) -> Option<crate::service_registry::ServiceHandle> {
-        Self::service_handle(self, name)
-    }
-
-    fn register_service_hook(
-        &self,
-        handle: &crate::service_registry::ServiceHandle,
-        hook: Box<dyn NativeInterceptHook>,
-    ) {
-        Self::register_service_hook(self, handle, hook)
-    }
-
-    fn register_service_observer(
-        &self,
-        handle: &crate::service_registry::ServiceHandle,
-        observer: Arc<dyn crate::dispatch::MutationObserver>,
-        observer_name: String,
-        event_mask: u32,
-    ) {
-        Self::register_service_observer(self, handle, observer, observer_name, event_mask)
-    }
-
-    fn register_rust_service(
-        &self,
-        name: &str,
-        svc: Arc<dyn RustService>,
-        deps: Vec<String>,
-    ) -> Result<(), String> {
-        Self::register_rust_service(self, name, svc, deps)
-    }
-
-    fn is_federation_initialized(&self) -> bool {
-        self.distributed_coordinator().is_initialized(self)
     }
 }
