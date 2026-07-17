@@ -117,6 +117,11 @@ pub mod auth_key_store;
 pub mod blob_fetcher_handler;
 #[cfg(all(feature = "grpc", has_protos))]
 pub mod distributed_coordinator;
+// A2A cross-machine stream-wakeup: the apply-side observer that wakes a
+// replica's parked `sys_watch` when a peer's `AppendStreamEntry` replicates
+// in (§A). Bridges the raft apply spine to the kernel's file-watch wake.
+#[cfg(all(feature = "grpc", has_protos))]
+pub mod stream_wakeup;
 
 /// Sync-façade → async-core bridge shared by every raft-backed store
 /// that exposes a synchronous API over the async consensus core.
