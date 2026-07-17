@@ -2284,6 +2284,106 @@ mod tests {
         assert!(!handle.is_leader());
     }
 
+    /// #7 dynamic-membership regression: `cached_voters` mirror MUST
+    /// update after a ConfChange applies, otherwise the handle-side
+    /// `voters()` reads a stale set and `GetClusterInfo` under-reports
+    /// membership after every join/leave.  Drives the raft loop
+    /// through a real `AddNode` propose-commit-apply cycle and asserts
+    /// (a) the handle-side cache reflects the new voter, and (b) the
+    /// driver-side live read agrees — the SSOT invariant that motivated
+    /// extracting `voter_ids_from_raw_node`.
+    ///
+    /// Uses `AddNode` rather than `AddLearnerNode` so the test
+    /// exercises the actual voter-count path (learners deliberately
+    /// excluded from `voter_ids()`).  Single-node cluster: self is
+    /// majority for the AddNode commit, so the ConfChange lands
+    /// without a live peer 2.
+    #[tokio::test]
+    async fn test_cached_voters_updates_on_conf_change_apply() {
+        let dir = TempDir::new().unwrap();
+        let storage = RaftStorage::open(dir.path()).unwrap();
+        let cs = ConfState {
+            voters: vec![1],
+            ..Default::default()
+        };
+        storage.set_conf_state(&cs).unwrap();
+        let store = RedbStore::open(dir.path().join("sm")).unwrap();
+        let state_machine = FullStateMachine::new(&store).unwrap();
+
+        let config = RaftConfig {
+            id: 1,
+            peers: vec![],
+            skip_bootstrap: true,
+            tick_interval: Duration::from_millis(10),
+            ..Default::default()
+        };
+        let (handle, mut driver) =
+            ZoneConsensus::new(config, storage, state_machine, None).unwrap();
+
+        // Drive to leader.
+        for _ in 0..100 {
+            driver.process_messages();
+            driver
+                .advance()
+                .await
+                .expect("advance during self-election must be Ok");
+            if handle.is_leader() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(handle.is_leader(), "single voter must self-elect");
+        assert_eq!(
+            handle.voters(),
+            vec![1u64],
+            "pre-conf-change baseline: voters() reflects the seeded [1] set"
+        );
+
+        // Propose adding voter 2.  On a 1-voter cluster self is
+        // majority, so the AddNode commits + applies without a live
+        // peer 2 — see the `test_advance_recovers_from_rejected_conf_change`
+        // sibling for the same propose pattern.
+        let mut cc = ConfChange::default();
+        cc.set_change_type(ConfChangeType::AddNode);
+        cc.node_id = 2;
+        driver
+            .raw_node
+            .propose_conf_change(vec![], cc)
+            .expect("propose AddNode(2)");
+
+        // Advance until the cache reflects [1, 2].  Bounded loop so
+        // a hang shows up as a test failure rather than a CI timeout.
+        let mut mirrored = false;
+        for _ in 0..50 {
+            driver.process_messages();
+            driver
+                .advance()
+                .await
+                .expect("advance during AddNode apply must be Ok");
+            if handle.voters() == vec![1u64, 2u64] {
+                mirrored = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            mirrored,
+            "cached_voters must reflect the applied ConfChange within the bounded advance loop; \
+             saw {:?} on last read",
+            handle.voters()
+        );
+
+        // SSOT mirror invariant: handle-side cache and driver-side
+        // live read of raw_node's ProgressTracker must agree, or
+        // `GetClusterInfo` reports a different membership than the
+        // one the driver's replication loop uses for quorum sizing.
+        assert_eq!(
+            handle.voters(),
+            driver.voter_ids(),
+            "handle.voters() (cached) must equal driver.voter_ids() (live) after ConfChange apply"
+        );
+    }
+
     /// #7 regression: `ZoneConsensus::voters` (used by
     /// `ZoneApiService::GetClusterInfo`) reads from raft-rs ConfState,
     /// NOT the transport peer_addrs union that made the leader appear

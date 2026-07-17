@@ -2871,4 +2871,111 @@ mod tests {
             "success must be explicitly present on the wire (Some) so a client can gate on it"
         );
     }
+
+    /// #8 error-case: `DeleteResponse.success` must be `Some(false)`
+    /// even on the failure paths — not `None`.  Two failure sites feed
+    /// this contract; the test walks both.
+    ///
+    /// * The pre-dispatch `error_delete(status)` helper (invoked when
+    ///   `authenticate` rejects the request).
+    /// * The post-kernel `Err(err)` branch inside the handler (invoked
+    ///   when `sys_unlink` returns a real kernel error).
+    ///
+    /// Both must emit `Some(false) + is_error=true` so a client's
+    /// tri-state gate stays correct: `Some(true)` = deleted,
+    /// `Some(false)` = did not delete (idempotent OR failed —
+    /// disambiguate via `is_error`), `None` = server contract
+    /// violation.
+    ///
+    /// Wire-level assertion: a prost round-trip of `success = None`
+    /// vs `success = Some(false)` produces distinct bytes, proving
+    /// the proto3 optional presence bit crosses the wire and a
+    /// downstream client can actually observe the difference.  This
+    /// closes the "did the proto change take effect on the wire" gap
+    /// that a struct-level equality check alone would not catch.
+    #[tokio::test]
+    async fn delete_error_paths_emit_some_false_and_wire_distinguishes_from_none() {
+        use prost::Message;
+
+        // (a) Pre-dispatch auth-failure helper.
+        let auth_fail = error_delete(Status::unauthenticated("no token"));
+        assert_eq!(
+            auth_fail.success,
+            Some(false),
+            "auth-failure delete must serialize Some(false), not None — clients rely on the \
+             presence bit to distinguish 'server rejected the request' from 'server did not \
+             understand the field'"
+        );
+        assert!(
+            auth_fail.is_error,
+            "auth-failure is a real error path — is_error must be set so the client's tri-state \
+             gate disambiguates Some(false)+error from Some(false)+idempotent-no-op"
+        );
+
+        // (b) Post-kernel error branch — exercise via a delete of a
+        // path that trips `sys_unlink` into `Err`.  Deleting a
+        // non-empty directory without `recursive: true` is one of the
+        // stock kernel errors and works through the real handler.
+        let kernel = std::sync::Arc::new(kernel_with_mem_backend());
+        let svc = VfsServiceImpl::for_test(kernel.clone());
+        let ctx = OperationContext::new("test", "root", true, None, true);
+        KernelConvenience::mkdir(&*kernel, "/populated", &ctx, false, false)
+            .expect("mkdir /populated");
+        KernelSyscall::sys_write(&*kernel, "/populated/inside.txt", &ctx, b"x", 0)
+            .expect("seed child so sys_unlink hits ENOTEMPTY");
+        let kernel_fail = svc
+            .delete(tonic::Request::new(DeleteRequest {
+                path: "/populated".into(),
+                auth_token: "test-key".into(),
+                recursive: false,
+            }))
+            .await
+            .expect("rpc call itself must succeed — the failure is in-band")
+            .into_inner();
+        assert!(
+            kernel_fail.is_error,
+            "non-recursive delete of a populated directory must surface is_error=true"
+        );
+        assert_eq!(
+            kernel_fail.success,
+            Some(false),
+            "kernel-error delete must emit Some(false), matching the auth-failure contract"
+        );
+
+        // (c) Wire-level presence: prost round-trip Some(false) vs
+        // None (default-constructed).  The two must produce distinct
+        // encodings, proving the proto3 optional presence bit is what
+        // crosses the wire — the entire justification for the #8
+        // proto change.
+        let with_flag = DeleteResponse {
+            success: Some(false),
+            ..Default::default()
+        };
+        let without_flag = DeleteResponse {
+            success: None,
+            ..Default::default()
+        };
+        let bytes_with = with_flag.encode_to_vec();
+        let bytes_without = without_flag.encode_to_vec();
+        assert_ne!(
+            bytes_with, bytes_without,
+            "Some(false) and None MUST encode to different bytes — otherwise the wire cannot \
+             carry the presence bit and the whole optional-bool change is a no-op"
+        );
+        // Belt-and-suspenders: the decoded value round-trips.
+        let decoded = DeleteResponse::decode(bytes_with.as_slice())
+            .expect("Some(false) round-trip must decode cleanly");
+        assert_eq!(
+            decoded.success,
+            Some(false),
+            "prost must preserve Some(false) across encode → decode — pinning the guarantee \
+             the whole tri-state contract depends on"
+        );
+        let decoded_none = DeleteResponse::decode(bytes_without.as_slice())
+            .expect("None round-trip must decode cleanly");
+        assert_eq!(
+            decoded_none.success, None,
+            "default-constructed DeleteResponse must decode with success = None"
+        );
+    }
 }
