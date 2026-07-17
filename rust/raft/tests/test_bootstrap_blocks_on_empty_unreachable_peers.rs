@@ -64,6 +64,7 @@ async fn test_join_zone_rpc_against_unreachable_peer_returns_connection_error() 
         mint_random_id(),
         &endpoint, // self_address — informational
         false,
+        None,
         2, // short timeout — no point waiting on a closed port
     )
     .await;
@@ -95,7 +96,7 @@ async fn test_late_founder_unblocks_waiting_joiner() {
     let endpoint_a = format!("http://{bind_a}");
 
     // First attempt: A doesn't exist yet — must Err.
-    let early = call_join_zone_rpc(&endpoint_a, "root", id_b, &endpoint_a, false, 1).await;
+    let early = call_join_zone_rpc(&endpoint_a, "root", id_b, &endpoint_a, false, None, 1).await;
     assert!(
         early.is_err(),
         "early JoinZone before founder boot must Err, got {early:?}",
@@ -146,7 +147,7 @@ async fn test_late_founder_unblocks_waiting_joiner() {
     // Retry JoinZone RPC against A every 100ms for up to 5s.
     let mut joined = false;
     for _ in 0..50 {
-        match call_join_zone_rpc(&endpoint_a, "root", id_b, &endpoint_b, false, 5).await {
+        match call_join_zone_rpc(&endpoint_a, "root", id_b, &endpoint_b, false, None, 5).await {
             Ok(result) if result.success => {
                 joined = true;
                 break;

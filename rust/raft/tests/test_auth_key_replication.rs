@@ -144,6 +144,7 @@ async fn revocation_on_the_founder_propagates_to_the_joiner() {
         id_joiner,
         &endpoint_joiner,
         /* as_learner */ true,
+        None,
         30,
     )
     .await

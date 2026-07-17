@@ -113,4 +113,30 @@ impl Kernel {
     pub fn sys_watch(&self, pattern: &str, timeout_ms: u64) -> Option<FileEvent> {
         self.file_watches.wait_for_event(pattern, timeout_ms)
     }
+
+    /// Wake any `sys_watch` parked on `path` — the replica-side (apply)
+    /// wake primitive for cross-machine A2A (§A).
+    ///
+    /// On the node that ran the write syscall, `dispatch_observers` already
+    /// fires `notify_match` inline. But on a **replica** the local syscall
+    /// path never ran for that entry — the mutation arrived over the raft
+    /// log and was materialised by the apply loop. This method lets an
+    /// apply-side observer (registered via
+    /// `nexus_raft::stream_wakeup::install_stream_wakeup_observer`) wake a
+    /// parked watcher when a peer's `AppendStreamEntry` replicates in.
+    ///
+    /// Deliberately narrow — it calls **only** `notify_match`, NOT the full
+    /// `dispatch_observers` chain. `dispatch_observers` also re-runs the
+    /// side-effecting `MutationObserver`s, which already fired on the writer
+    /// node; routing a replica apply through it would double-fire them. The
+    /// condvar wake is the sole correct effect here.
+    ///
+    /// Reuses `FileEventType::FileWrite` so no new event variant (and thus
+    /// no Python-mirror change) is needed; the parked watcher only matches
+    /// on the path. Cheap when no watcher matches (single RwLock read +
+    /// iter filter).
+    pub fn wake_file_watch(&self, path: &str) {
+        self.file_watches
+            .notify_match(&FileEvent::new(FileEventType::FileWrite, path));
+    }
 }

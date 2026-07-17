@@ -1023,6 +1023,7 @@ fn attempt_join_zone_round(
                 node_id,
                 self_address,
                 as_learner,
+                zm.registry().tls_config(),
                 rpc_timeout_secs,
             ));
             match attempt {
@@ -1680,6 +1681,7 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
                     self_id,
                     &self_address,
                     /* as_learner */ false,
+                    zm.registry().tls_config(),
                     5,
                 );
                 let attempt = if tokio::runtime::Handle::try_current().is_ok() {
@@ -1804,6 +1806,7 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
                 self_id,
                 &self_address,
                 as_learner,
+                zm.registry().tls_config(),
                 10,
             ));
             match attempt {

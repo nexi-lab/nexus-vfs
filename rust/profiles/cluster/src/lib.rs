@@ -644,6 +644,10 @@ async fn run_remove_voter(peer_addr: &str, zone_id: &str, target_node_id: u64) -
             &endpoint,
             zone_id,
             target_node_id,
+            // Operator CLI dials plaintext (parsed with use_tls=false above);
+            // mTLS support here would load the node's on-disk TLS bundle from
+            // <data_dir>/tls/ — a separate follow-up, not a boot-path caller.
+            None,
             /* timeout_secs */ 15,
         )
         .await
@@ -1274,6 +1278,7 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
                 for peer in &peers {
                     match nexus_raft::transport::call_discover_zones_rpc(
                         &peer.endpoint,
+                        zm.registry().tls_config(),
                         /* timeout */ 10,
                     )
                     .await

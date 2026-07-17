@@ -108,6 +108,7 @@ async fn remove_voter_prunes_learner_from_conf_state() {
         id_joiner,
         &endpoint_joiner,
         /* as_learner */ true,
+        None,
         30,
     )
     .await
@@ -131,7 +132,7 @@ async fn remove_voter_prunes_learner_from_conf_state() {
     assert!(saw_joiner, "AddLearnerNode did not apply on owner");
 
     // Prune the learner.
-    let result = call_remove_voter_rpc(&endpoint_owner, "sharedzone", id_joiner, 15)
+    let result = call_remove_voter_rpc(&endpoint_owner, "sharedzone", id_joiner, None, 15)
         .await
         .expect("RemoveVoter RPC");
     assert!(
@@ -173,7 +174,7 @@ async fn remove_voter_is_idempotent_on_unknown_id() {
 
     let endpoint = format!("http://{bind_owner}");
     let never_existed_id: u64 = 424242;
-    let result = call_remove_voter_rpc(&endpoint, "sharedzone", never_existed_id, 15)
+    let result = call_remove_voter_rpc(&endpoint, "sharedzone", never_existed_id, None, 15)
         .await
         .expect("RemoveVoter RPC");
     assert!(
@@ -218,6 +219,7 @@ async fn remove_voter_on_follower_returns_leader_address() {
         id_joiner,
         &endpoint_joiner,
         true,
+        None,
         30,
     )
     .await
@@ -238,7 +240,7 @@ async fn remove_voter_on_follower_returns_leader_address() {
     // its peer map — poll briefly to give that a chance.
     let mut redirect_seen = false;
     for _ in 0..40 {
-        let result = call_remove_voter_rpc(&endpoint_joiner, "sharedzone", id_owner, 15)
+        let result = call_remove_voter_rpc(&endpoint_joiner, "sharedzone", id_owner, None, 15)
             .await
             .expect("RemoveVoter RPC");
         if !result.success && result.leader_address.is_some() {

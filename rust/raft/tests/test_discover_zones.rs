@@ -110,7 +110,7 @@ async fn discover_zones_returns_dt_mount_entries_from_root_state_machine() {
 
     tokio::time::sleep(Duration::from_millis(50)).await;
     let endpoint = format!("http://{bind}");
-    let discovered = call_discover_zones_rpc(&endpoint, 5)
+    let discovered = call_discover_zones_rpc(&endpoint, None, 5)
         .await
         .expect("DiscoverZones RPC");
 
@@ -133,7 +133,9 @@ async fn discover_zones_returns_empty_on_pure_joiner() {
 
     tokio::time::sleep(Duration::from_millis(100)).await;
     let endpoint = format!("http://{bind}");
-    let discovered = call_discover_zones_rpc(&endpoint, 5).await.expect("RPC");
+    let discovered = call_discover_zones_rpc(&endpoint, None, 5)
+        .await
+        .expect("RPC");
     assert!(
         discovered.is_empty(),
         "pure joiner must not advertise; got {discovered:?}"
@@ -175,7 +177,7 @@ async fn discover_zones_picks_up_dt_mount_entries_added_at_runtime() {
 
     tokio::time::sleep(Duration::from_millis(50)).await;
     let endpoint = format!("http://{bind}");
-    let first_call = call_discover_zones_rpc(&endpoint, 5)
+    let first_call = call_discover_zones_rpc(&endpoint, None, 5)
         .await
         .expect("RPC call 1");
     let first_map: BTreeMap<String, String> = first_call
@@ -202,7 +204,7 @@ async fn discover_zones_picks_up_dt_mount_entries_added_at_runtime() {
         .expect("mount_async");
 
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let second_call = call_discover_zones_rpc(&endpoint, 5)
+    let second_call = call_discover_zones_rpc(&endpoint, None, 5)
         .await
         .expect("RPC call 2");
     let second_map: BTreeMap<String, String> = second_call

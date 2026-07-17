@@ -151,6 +151,7 @@ async fn conf_state_apply_persists_zone_membership_on_joiner() {
         id_joiner,
         &endpoint_joiner,
         /* as_learner */ true,
+        None,
         30,
     )
     .await
