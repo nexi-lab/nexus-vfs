@@ -517,8 +517,13 @@ impl NexusVfsService for VfsServiceImpl {
             run_blocking(move || KernelSyscall::sys_unlink(&*kernel, &path, &ctx, recursive))
                 .await?;
         match del_res {
+            // `success: Some(result.hit)` — the wire distinguishes
+            // "deleted" (`Some(true)`) from "not-found idempotent
+            // no-op" (`Some(false)`) from "error" (`is_error=true`,
+            // success left unset by proto3 default).  See issue #8
+            // for the ambiguity this optional replaces.
             Ok(result) => Ok(Response::new(DeleteResponse {
-                success: result.hit,
+                success: Some(result.hit),
                 is_error: false,
                 error_payload: Vec::new(),
                 entry_type: result.entry_type as u32,
@@ -529,7 +534,11 @@ impl NexusVfsService for VfsServiceImpl {
             Err(err) => {
                 let (code, msg) = self.map_kernel_err(err);
                 Ok(Response::new(DeleteResponse {
-                    success: false,
+                    // Definite non-success on kernel error: emit
+                    // `Some(false)` so the wire tells the client
+                    // "we tried and it definitely did not succeed"
+                    // — distinct from "field never populated".
+                    success: Some(false),
                     is_error: true,
                     error_payload: encode_rpc_error(code, &msg),
                     entry_type: 0,
@@ -1525,7 +1534,9 @@ fn error_write(status: Status) -> WriteResponse {
 
 fn error_delete(status: Status) -> DeleteResponse {
     DeleteResponse {
-        success: false,
+        // Definite non-success — see delete handler for the tri-state
+        // contract on `optional bool success`.
+        success: Some(false),
         is_error: true,
         error_payload: encode_rpc_error_bytes(status_to_code(&status), status.message()),
         entry_type: 0,
@@ -1920,7 +1931,7 @@ mod tests {
             let path = request.into_inner().path;
             let removed = self.blobs.lock().unwrap().remove(&path).is_some();
             Ok(Response::new(DeleteResponse {
-                success: removed,
+                success: Some(removed),
                 is_error: false,
                 ..Default::default()
             }))
@@ -2792,5 +2803,72 @@ mod tests {
 
         let resp = svc.batch_write(req).await.expect("rpc ok").into_inner();
         assert_eq!(resp.results.len(), 0);
+    }
+
+    /// #8 regression: `DeleteResponse.success` is `optional bool`, so
+    /// the wire distinguishes the three outcomes of Delete:
+    ///   * `Some(true)`  — target existed, was removed
+    ///   * `Some(false)` — target did not exist (idempotent no-op)
+    ///     OR kernel error (differentiated by `is_error`)
+    ///   * `None`        — must never occur post-fix; defensive callers
+    ///     treat as "server does not understand the request"
+    ///
+    /// Prior to #8's `bool → optional bool` change, the not-found and
+    /// server-broken outcomes both serialized as `{}` under proto3's
+    /// default-omit rule — identical wire shape for two very different
+    /// operational states.
+    #[tokio::test]
+    async fn delete_success_optional_disambiguates_hit_from_not_found() {
+        let kernel = std::sync::Arc::new(kernel_with_mem_backend());
+        let svc = VfsServiceImpl::for_test(kernel.clone());
+
+        // Seed a file so the first Delete hits.
+        let ctx = OperationContext::new("test", "root", true, None, true);
+        KernelSyscall::sys_write(&*kernel, "/gone.txt", &ctx, b"bye", 0)
+            .expect("seed write");
+
+        // Delete existing → Some(true) + is_error=false.
+        let hit = svc
+            .delete(tonic::Request::new(DeleteRequest {
+                path: "/gone.txt".into(),
+                auth_token: "test-key".into(),
+                recursive: false,
+            }))
+            .await
+            .expect("delete rpc ok")
+            .into_inner();
+        assert!(!hit.is_error, "existing delete must not error: {hit:?}");
+        assert_eq!(
+            hit.success,
+            Some(true),
+            "existing delete must serialize Some(true), not the ambiguous bare bool"
+        );
+
+        // Second Delete on the same path → Some(false), is_error=false
+        // (idempotent no-op).  Distinguishable from the initial hit
+        // AND from a kernel error via the presence of the field +
+        // is_error flag.
+        let idem = svc
+            .delete(tonic::Request::new(DeleteRequest {
+                path: "/gone.txt".into(),
+                auth_token: "test-key".into(),
+                recursive: false,
+            }))
+            .await
+            .expect("second delete rpc ok")
+            .into_inner();
+        assert!(
+            !idem.is_error,
+            "idempotent no-op delete must not surface as an error: {idem:?}"
+        );
+        assert_eq!(
+            idem.success,
+            Some(false),
+            "not-found delete must serialize Some(false), not None — that's the whole point of #8"
+        );
+        assert!(
+            idem.success.is_some(),
+            "success must be explicitly present on the wire (Some) so a client can gate on it"
+        );
     }
 }

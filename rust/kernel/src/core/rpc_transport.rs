@@ -286,7 +286,15 @@ impl RpcTransport {
             let err = String::from_utf8_lossy(&resp.error_payload);
             return Err(format!("Delete({path}): server error: {err}"));
         }
-        Ok(resp.success)
+        // `DeleteResponse.success` is `optional bool` (issue #8):
+        //   Some(true)  ⇒ target existed and was removed
+        //   Some(false) ⇒ target did not exist (idempotent no-op)
+        //   None        ⇒ contract violation (server should always
+        //                 populate the field on non-error responses);
+        //                 map to `false` here so the caller sees a
+        //                 conservative "not deleted" and can continue
+        //                 without panic.
+        Ok(resp.success.unwrap_or(false))
     }
 
     /// Typed StreamWriteNowait RPC — returns the offset where data landed.
