@@ -1897,47 +1897,77 @@ impl Kernel {
             )));
         }
 
-        let (shm_path, data_rd_fd) = if io_profile == "shared_memory" {
-            #[cfg(unix)]
-            {
-                let (backend, shm, dfd) =
-                    crate::shm_stream::SharedMemoryStreamBackend::create_native(capacity)?;
-                self.stream_manager
-                    .register(path, Arc::new(backend))
-                    .map_err(stream_mgr_err)?;
-                self.write_stream_inode(path, capacity)?;
-                (Some(shm), Some(dfd))
+        // `io_profile` is a WATERFALL: a comma-separated, preference-ordered
+        // list of stream backends. Walk it left-to-right and install the
+        // FIRST backend available in this node's context; an unavailable
+        // entry (e.g. "wal" when federation is not wired) falls through to
+        // the next. A single token is a length-1 waterfall, so the historical
+        // profiles ("wal" / "memory" / "shared_memory" / "") behave exactly as
+        // before — a bare "wal" still errors when federation is down (audit
+        // relies on that fail-loud). Cheap by construction: `split` is
+        // allocation-free, each arm does the same work the old `if/else` chain
+        // did, and it runs once per stream creation (not a per-IO path).
+        let mut selected: Option<(Option<String>, Option<i32>)> = None;
+        for profile in io_profile.split(',') {
+            match profile {
+                "shared_memory" => {
+                    #[cfg(unix)]
+                    {
+                        let (backend, shm, dfd) =
+                            crate::shm_stream::SharedMemoryStreamBackend::create_native(capacity)?;
+                        self.stream_manager
+                            .register(path, Arc::new(backend))
+                            .map_err(stream_mgr_err)?;
+                        self.write_stream_inode(path, capacity)?;
+                        selected = Some((Some(shm), Some(dfd)));
+                        break;
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        return Err(KernelError::IOError(
+                            "shared_memory streams require unix".into(),
+                        ));
+                    }
+                }
+                "wal" => {
+                    // Raft-replicated durable DT_STREAM. Available iff the
+                    // coordinator can hand us a zone metastore (federation
+                    // wired); if not, fall through to the next backend.
+                    // WalStreamCore composes whatever distributed MetaStore the
+                    // coordinator DI'd — layering preserved without a
+                    // per-primitive DI method on the trait.
+                    if let Ok(store) = self
+                        .distributed_coordinator()
+                        .metastore_for_zone(self, "root")
+                    {
+                        let backend =
+                            crate::core::stream::wal::WalStreamCore::new(store, path.to_string());
+                        self.stream_manager
+                            .register(path, Arc::new(backend))
+                            .map_err(stream_mgr_err)?;
+                        self.write_stream_inode(path, capacity)?;
+                        selected = Some((None, None));
+                        break;
+                    }
+                    // wal unavailable here → try the next profile in the waterfall
+                }
+                _ => {
+                    // "memory" (and any other / empty token): the always-
+                    // available, node-local terminal (historical `else`).
+                    self.create_stream(path, capacity)?;
+                    selected = Some((None, None));
+                    break;
+                }
             }
-            #[cfg(not(unix))]
-            {
-                return Err(KernelError::IOError(
-                    "shared_memory streams require unix".into(),
-                ));
-            }
-        } else if io_profile == "wal" {
-            // Raft-replicated durable DT_STREAM.  WalStreamCore is a
-            // kernel primitive (`core/stream/wal.rs`); it composes
-            // whatever distributed `MetaStore` impl the coordinator has
-            // DI'd via `metastore_for_zone`. The coordinator installs
-            // the storage capability and the kernel constructs the
-            // backend itself — layering preserved without a
-            // per-primitive DI method on the trait.
-            let provider = self.distributed_coordinator();
-            let store = provider.metastore_for_zone(self, "root").map_err(|e| {
-                KernelError::IOError(format!(
-                    "io_profile=wal requires federation (set NEXUS_PEERS): {e}"
-                ))
-            })?;
-            let backend = crate::core::stream::wal::WalStreamCore::new(store, path.to_string());
-            self.stream_manager
-                .register(path, Arc::new(backend))
-                .map_err(stream_mgr_err)?;
-            self.write_stream_inode(path, capacity)?;
-            (None, None)
-        } else {
-            self.create_stream(path, capacity)?;
-            (None, None)
-        };
+        }
+        // `None` only when every entry was "wal" and none were available
+        // (e.g. a bare "wal" with federation down) — fail loud.
+        let (shm_path, data_rd_fd) = selected.ok_or_else(|| {
+            KernelError::IOError(format!(
+                "io_profile {io_profile:?} selected no available stream backend \
+                 (\"wal\" requires federation — set NEXUS_PEERS)"
+            ))
+        })?;
 
         Ok(SysSetAttrResult {
             path: path.to_string(),
@@ -3941,8 +3971,9 @@ mod tests {
     // `is_initialized` returns `true` and whose `metastore_for_zone`
     // returns an in-memory `MemoryMetaStore`. With that wired:
     //
-    //   1. `Kernel::is_federation_initialized()` returns `true` (so
-    //      service-tier `chat_stream_profile()` picks `"wal"`).
+    //   1. `metastore_for_zone` succeeds, so the `setattr_stream`
+    //      waterfall resolves a "wal" (or "wal,memory") `io_profile` to
+    //      the wal backend instead of falling through to memory.
     //   2. `kernel.sys_setattr(path, DT_STREAM, …, "wal", "root", …)`
     //      composes a `WalStreamCore` over the test metastore + writes
     //      the inode + registers the stream — same code path
@@ -4060,24 +4091,67 @@ mod tests {
         }
 
         #[test]
-        fn is_federation_initialized_reports_true_with_test_coordinator() {
-            // Probe the readiness signal `chat_stream_profile()` keys
-            // off. `Kernel::new()` alone reports `false` (Noop
-            // coordinator); installing the test coordinator flips it
-            // to `true`, which is what services::managed_agent::
-            // proc_entry::register_proc_entry checks before passing
-            // io_profile="wal" to sys_setattr.
-            use super::syscall::KernelSyscall;
-            let bare = Kernel::new();
+        fn io_profile_waterfall_falls_through_to_memory_without_federation() {
+            // The `io_profile` waterfall: "wal,memory" installs a wal
+            // (raft-replicated) stream when federation is wired and falls
+            // through to an in-memory stream when it is not — the decision
+            // the kernel now owns inside `setattr_stream`, replacing the
+            // service-tier `is_federation_initialized()` pre-check that used
+            // to live in managed_agent::proc_entry.
+            let setattr = |k: &Kernel, path: &str, io_profile: &str| {
+                k.sys_setattr(
+                    path,
+                    DT_STREAM as i32,
+                    "",
+                    None,
+                    None,
+                    None,
+                    io_profile,
+                    "root",
+                    false,
+                    65_536,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            };
+
+            // 1. No federation + "wal,memory" → falls through to memory (no
+            //    error), and the memory stream round-trips bytes.
+            let bare = Arc::new(Kernel::new());
+            bare.vfs_router
+                .add_mount("/proc", contracts::ROOT_ZONE_ID, None, false);
+            setattr(&bare, "/proc/p-wf/chat-with-me", "wal,memory")
+                .expect("wal,memory must fall through to memory without federation");
+            let ctx = OperationContext::new("test", "root", true, None, true);
+            bare.sys_write_with_link_depth("/proc/p-wf/chat-with-me", &ctx, b"hi", 0, 1)
+                .expect("memory stream write");
+            let read = bare
+                .sys_read_single("/proc/p-wf/chat-with-me", &ctx, 1, 0, 0)
+                .expect("memory stream read");
+            assert_eq!(read.data.expect("bytes").as_slice(), b"hi");
+
+            // 2. No federation + bare "wal" → fail loud (audit's contract;
+            //    a length-1 waterfall must NOT silently degrade to memory).
             assert!(
-                !KernelSyscall::is_federation_initialized(&bare),
-                "bare Kernel::new() must not advertise federation",
+                setattr(&bare, "/proc/p-wl/chat-with-me", "wal").is_err(),
+                "bare \"wal\" must error when federation is down",
             );
-            let kernel = fresh_federated_kernel();
-            assert!(
-                KernelSyscall::is_federation_initialized(kernel.as_ref()),
-                "kernel with test coordinator installed must advertise federation",
-            );
+
+            // 3. Federation present + "wal,memory" → installs the wal stream
+            //    (the wal round-trip itself is covered by
+            //    sys_setattr_wal_stream_creates_inode_and_round_trips).
+            let fed = fresh_federated_kernel();
+            setattr(&fed, "/proc/p-wf2/chat-with-me", "wal,memory")
+                .expect("wal,memory must install the wal stream when federation is up");
         }
 
         #[test]
@@ -4090,12 +4164,12 @@ mod tests {
             //
             // This is the path service-tier callers (
             // managed_agent::proc_entry::register_proc_entry,
-            // matrix_adapter::rooms::create_chat_stream) take when
-            // `is_federation_initialized()` returns true. A
-            // memory-vs-wal mistake (e.g. service code accidentally
-            // hardcoding "memory" or kernel taking the wrong branch
-            // of setattr_stream) would surface here as a missing
-            // metastore wire-up or wrong stream-backend type.
+            // matrix_adapter::rooms::create_chat_stream) take when the
+            // `io_profile` waterfall resolves to wal (federation up). A
+            // memory-vs-wal mistake (e.g. the waterfall falling through
+            // when it should not, or the wrong branch of setattr_stream)
+            // would surface here as a missing metastore wire-up or wrong
+            // stream-backend type.
             let kernel = fresh_federated_kernel();
             let path = "/proc/p-fed/chat-with-me";
 
