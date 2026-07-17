@@ -2408,8 +2408,7 @@ mod tests {
             peers: vec![7, 99, 42],
             ..Default::default()
         };
-        let (handle, driver) =
-            ZoneConsensus::new(config, storage, state_machine, None).unwrap();
+        let (handle, driver) = ZoneConsensus::new(config, storage, state_machine, None).unwrap();
 
         let handle_voters = handle.voters();
         assert_eq!(

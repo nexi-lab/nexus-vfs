@@ -2824,8 +2824,7 @@ mod tests {
 
         // Seed a file so the first Delete hits.
         let ctx = OperationContext::new("test", "root", true, None, true);
-        KernelSyscall::sys_write(&*kernel, "/gone.txt", &ctx, b"bye", 0)
-            .expect("seed write");
+        KernelSyscall::sys_write(&*kernel, "/gone.txt", &ctx, b"bye", 0).expect("seed write");
 
         // Delete existing → Some(true) + is_error=false.
         let hit = svc
