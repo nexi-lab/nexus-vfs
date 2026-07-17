@@ -127,7 +127,18 @@ message WriteRequest {
   string path = 1;
   bytes content = 2;       // Raw file bytes — no base64
   string auth_token = 3;
-  string content_id = 4;   // Optional: opaque content identifier for conditional write (If-Match)
+  // Field 4 (`content_id` — documented as "If-Match" conditional
+  // write) removed for issue #5.  The server never enforced it, so
+  // the documented optimistic-concurrency contract was a silent
+  // no-op that would mask concurrent-writer data loss in any
+  // client that trusted it.  Dropped rather than half-implemented
+  // per YAGNI: the `content_id` at rest is a hash (CAS backends)
+  // or a path (PAS backends), neither of which is the right shape
+  // for a versioning token.  If optimistic-write semantics come
+  // back later, key off `WriteResponse.gen` (monotonic version)
+  // via an explicit `expected_gen` field, not `content_id`.
+  reserved 4;
+  reserved "content_id";
 }
 
 message WriteResponse {

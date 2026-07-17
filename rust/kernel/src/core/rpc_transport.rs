@@ -223,21 +223,15 @@ impl RpcTransport {
     }
 
     /// Typed Write RPC — raw bytes, returns (content_id, size).
-    pub fn write(
-        &self,
-        path: &str,
-        content: &[u8],
-        content_id: &str,
-    ) -> Result<WriteRpcResult, String> {
-        self.block_on(self.write_async(path, content, content_id))
+    ///
+    /// The prior `content_id: &str` parameter was dropped alongside
+    /// the `WriteRequest.content_id` proto field (issue #5, YAGNI —
+    /// the server never enforced it as an If-Match token).
+    pub fn write(&self, path: &str, content: &[u8]) -> Result<WriteRpcResult, String> {
+        self.block_on(self.write_async(path, content))
     }
 
-    async fn write_async(
-        &self,
-        path: &str,
-        content: &[u8],
-        content_id: &str,
-    ) -> Result<WriteRpcResult, String> {
+    async fn write_async(&self, path: &str, content: &[u8]) -> Result<WriteRpcResult, String> {
         let mut client = self.client();
         let mut retries = 0u8;
         loop {
@@ -245,7 +239,6 @@ impl RpcTransport {
                 path: path.to_string(),
                 content: content.to_vec(),
                 auth_token: self.auth_token.clone(),
-                content_id: content_id.to_string(),
             });
             match client.write(req).await {
                 Ok(resp) => {
