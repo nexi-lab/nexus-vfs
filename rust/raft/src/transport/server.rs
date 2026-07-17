@@ -937,21 +937,26 @@ impl ZoneApiService for ZoneApiServiceImpl {
         let term = node.term();
         let leader_addr = peers.get(&leader_id).map(|a| a.endpoint.clone());
 
-        let mut voters = vec![ProtoNodeInfo {
-            id: node_id,
-            address: peers
-                .get(&node_id)
-                .map(|a| a.endpoint.clone())
-                .unwrap_or_default(),
-            role: 0,
-        }];
-        for (id, addr) in &peers {
-            voters.push(ProtoNodeInfo {
-                id: *id,
-                address: addr.endpoint.clone(),
+        // SSOT: voters come from raft-rs `ProgressTracker` (mirrored
+        // into `ZoneConsensus::cached_voters` by the driver's
+        // post-advance refresh).  Do NOT union with `peers` — the
+        // peer address book is a superset (learners, witnesses,
+        // ghosts from wipe-rejoins), and unioning with a hand-added
+        // self entry produced the "leader appears twice in voters
+        // list" issue #7.  `peers` is used only to resolve id →
+        // endpoint address for each authoritative voter.
+        let voters: Vec<ProtoNodeInfo> = node
+            .voters()
+            .into_iter()
+            .map(|id| ProtoNodeInfo {
+                id,
+                address: peers
+                    .get(&id)
+                    .map(|a| a.endpoint.clone())
+                    .unwrap_or_default(),
                 role: 0,
-            });
-        }
+            })
+            .collect();
 
         Ok(Response::new(GetClusterInfoResponse {
             node_id,
