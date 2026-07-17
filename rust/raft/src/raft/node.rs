@@ -1511,18 +1511,7 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
     /// beyond a small `Vec`.  Suitable to call once per transport-loop
     /// tick.
     pub fn voter_ids(&self) -> Vec<u64> {
-        let mut ids: Vec<u64> = self
-            .raw_node
-            .raft
-            .prs()
-            .conf()
-            .voters()
-            .ids()
-            .iter()
-            .collect();
-        ids.sort_unstable();
-        ids.dedup();
-        ids
+        voter_ids_from_raw_node(&self.raw_node)
     }
 
     /// Tell raft-rs that a peer became unreachable.
@@ -2088,15 +2077,36 @@ fn refresh_cached_status_from_raw_node(
     term.store(raw_node.raft.term, Ordering::Relaxed);
     commit_index.store(raw_node.raft.raft_log.committed, Ordering::Relaxed);
     last_index.store(raw_node.raft.raft_log.last_index(), Ordering::Relaxed);
-    // Mirror the raft-rs `ProgressTracker` voter set (voters ∪
-    // voters_outgoing during a joint-consensus transition) — matches
-    // [`ZoneConsensusDriver::voter_ids`] so `ZoneConsensus::voters`
-    // sync callers see the same authoritative membership as the
-    // driver's live read.  Learners deliberately excluded.
+    // Mirror the raft-rs `ProgressTracker` voter set via the same
+    // helper `ZoneConsensusDriver::voter_ids` uses, so a future
+    // semantics change (witness filter, joint-config handling, …)
+    // has one place to land and cannot silently drift between the
+    // driver's live read and the handle's cached mirror.
+    *voters.write() = voter_ids_from_raw_node(raw_node);
+}
+
+/// Read the raft-rs `ProgressTracker` voter set from `raw_node` and
+/// return a sorted+deduped `Vec<u64>`.  SSOT for the "how do we ask
+/// raft-rs for its authoritative voter list" question — every reader
+/// (live driver access via [`ZoneConsensusDriver::voter_ids`],
+/// handle-side cache refresh via [`refresh_cached_status_from_raw_node`])
+/// routes through here so a future change to voter-set semantics
+/// (e.g., filtering witnesses, joint-config outgoing-voters handling)
+/// has exactly one place to land.
+///
+/// Returns the union of incoming and outgoing voters in the active
+/// `JointConfig` (raft-rs's `voters().ids()` semantics), so a caller
+/// during a joint-consensus transition sees both configurations —
+/// the safe interpretation for quorum sizing.  Learners are
+/// deliberately excluded: they must never count toward quorum.
+///
+/// Cheap: a raft-rs `ProgressTracker` read; no lock, no copy beyond
+/// a small `Vec`.  Suitable to call once per transport-loop tick.
+fn voter_ids_from_raw_node(raw_node: &RawNode<RaftStorage>) -> Vec<u64> {
     let mut ids: Vec<u64> = raw_node.raft.prs().conf().voters().ids().iter().collect();
     ids.sort_unstable();
     ids.dedup();
-    *voters.write() = ids;
+    ids
 }
 
 #[cfg(feature = "grpc")]
