@@ -1710,7 +1710,7 @@ impl WitnessZoneRegistry {
         // Shared peer map
         let peer_map: HashMap<u64, NodeAddress> = peers.into_iter().map(|p| (p.id, p)).collect();
         let shared_peers: super::SharedPeerMap = Arc::new(RwLock::new(peer_map));
-        driver.set_peer_map(shared_peers.clone());
+        driver.set_peer_map(shared_peers.clone(), self.tls.read().unwrap().is_some());
 
         // Spawn transport loop with zone_id routing
         let client_config = ClientConfig {
