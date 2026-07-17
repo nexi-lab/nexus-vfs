@@ -927,12 +927,13 @@ impl ZoneManager {
 
         let peers = self.registry.get_peers(zone_id).unwrap_or_default();
         let self_id = self.registry.node_id();
+        let tls = self.registry.tls_config();
         bridge_block_on(self.rt().handle(), async {
             for (peer_id, peer) in peers {
                 if peer_id == self_id || peer.hostname.to_ascii_lowercase().starts_with("witness") {
                     continue;
                 }
-                call_delete_zone(&peer.endpoint, zone_id, force, 10)
+                call_delete_zone(&peer.endpoint, zone_id, force, tls.clone(), 10)
                     .await
                     .map_err(|e| {
                         RaftError::Raft(format!(

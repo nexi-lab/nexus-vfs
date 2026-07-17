@@ -118,7 +118,7 @@ async fn test_async_bootstrap_1voter_then_join() {
         .expect("local join_zone on B");
 
     // Step 2: JoinZone RPC against A's leader.
-    let result = call_join_zone_rpc(&endpoint_a, "root", id_b, &endpoint_b, false, 30)
+    let result = call_join_zone_rpc(&endpoint_a, "root", id_b, &endpoint_b, false, None, 30)
         .await
         .expect("JoinZone RPC");
 
@@ -222,6 +222,7 @@ async fn test_share_join_learner_survives_joiner_wipe_rejoin() {
         id_b1,
         &endpoint_b1,
         /* as_learner */ true,
+        None,
         30,
     )
     .await
@@ -270,6 +271,7 @@ async fn test_share_join_learner_survives_joiner_wipe_rejoin() {
         id_b2,
         &endpoint_b2,
         /* as_learner */ true,
+        None,
         30,
     )
     .await

@@ -200,6 +200,7 @@ async fn replicated_stream_append_wakes_a_parked_watch_only_with_the_observer() 
         id_joiner,
         &endpoint_joiner,
         /* as_learner */ true,
+        None,
         30,
     )
     .await

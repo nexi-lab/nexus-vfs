@@ -115,6 +115,7 @@ async fn test_ec_drain_1v1l_learner_receives_propose_ec_local() {
         id_learner,
         &endpoint_learner,
         /* as_learner */ true,
+        None,
         30,
     )
     .await

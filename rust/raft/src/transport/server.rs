@@ -1529,6 +1529,9 @@ impl WitnessZoneRegistry {
 
         let peers = self.peers.clone();
         let self_address = self.self_address.clone();
+        // Snapshot the TLS config once (owned) — a live read guard must not
+        // be held across the `.await` below (RwLockReadGuard is not Send).
+        let tls = self.tls.read().unwrap().clone();
         loop {
             for peer in &peers {
                 if peer.id == self.node_id {
@@ -1543,6 +1546,7 @@ impl WitnessZoneRegistry {
                         self.node_id,
                         &self_address,
                         as_learner,
+                        tls.clone(),
                         timeout_secs,
                     )
                     .await

@@ -687,10 +687,53 @@ pub struct JoinClusterResult {
     pub node_key_pem: Vec<u8>,
 }
 
+/// Dial a one-shot `ZoneApiService` client, honoring mTLS when `tls` is set.
+///
+/// Routes through the shared [`lib::transport_primitives::create_channel`]
+/// primitive — the same Endpoint builder the pooled raft channels use — so
+/// the join / discover / remove / delete RPCs present the node's client
+/// identity + CA under mTLS. The pre-refactor helpers each hand-rolled a
+/// plaintext `Endpoint::from_shared(..).connect()`, which cannot complete a
+/// handshake against an mTLS leader (an `https://` endpoint with no
+/// `ClientTlsConfig` is rejected at connect): the federation dynamic-join
+/// path silently broke the moment TLS was turned on.
+///
+/// `what` labels the RPC in the connect error so a handshake failure names
+/// the operation. SNI note: `apply_tls` sets no `domain_name`, so the
+/// server cert must carry the endpoint host in a SAN — node certs already
+/// include `localhost` / `127.0.0.1` / `::1`, and cross-host reachability
+/// SANs come from `generate_node_cert`'s `extra_hostnames`.
+async fn connect_zone_api(
+    peer_addr: &str,
+    tls: Option<super::TlsConfig>,
+    timeout_secs: u64,
+    what: &str,
+) -> Result<ZoneApiServiceClient<Channel>> {
+    let config = lib::transport_primitives::ClientConfig {
+        connect_timeout: Duration::from_secs(timeout_secs),
+        request_timeout: Duration::from_secs(timeout_secs),
+        tcp_keepalive: None,
+        http2_keepalive_interval: None,
+        http2_keepalive_timeout: None,
+        tls,
+    };
+    let channel = lib::transport_primitives::create_channel(peer_addr, &config)
+        .await
+        .map_err(|e| {
+            TransportError::Connection(format!("{what} connect to {peer_addr} failed: {e}"))
+        })?;
+    Ok(ZoneApiServiceClient::new(channel))
+}
+
 /// Call JoinCluster on a leader to get a signed node certificate.
 ///
 /// K3s-style: authenticates with join token password. The leader signs
 /// the cert server-side — CA key never leaves node-1.
+///
+/// Intentionally plaintext: this is the pre-identity bootstrap RPC a
+/// certless joiner uses to *obtain* its node cert, so it cannot present a
+/// client identity yet. Every other one-shot helper below goes through
+/// [`connect_zone_api`] and is mTLS-aware.
 pub async fn call_join_cluster(
     leader_addr: &str,
     node_id: u64,
@@ -768,18 +811,10 @@ pub async fn call_join_zone_rpc(
     node_id: u64,
     node_address: &str,
     as_learner: bool,
+    tls: Option<super::TlsConfig>,
     timeout_secs: u64,
 ) -> Result<JoinZoneResult> {
-    let ep = Endpoint::from_shared(peer_addr.to_string())
-        .map_err(|e| TransportError::InvalidAddress(e.to_string()))?
-        .connect_timeout(Duration::from_secs(timeout_secs))
-        .timeout(Duration::from_secs(timeout_secs));
-
-    let channel = ep.connect().await.map_err(|e| {
-        TransportError::Connection(format!("JoinZone connect to {peer_addr} failed: {e}"))
-    })?;
-
-    let mut client = ZoneApiServiceClient::new(channel);
+    let mut client = connect_zone_api(peer_addr, tls, timeout_secs, "JoinZone").await?;
     let request = JoinZoneRequest {
         zone_id: zone_id.to_string(),
         node_id,
@@ -819,18 +854,10 @@ pub struct DiscoveredZone {
 /// explicit `nexusd-cluster join` sidecar).
 pub async fn call_discover_zones_rpc(
     peer_addr: &str,
+    tls: Option<super::TlsConfig>,
     timeout_secs: u64,
 ) -> Result<Vec<DiscoveredZone>> {
-    let ep = Endpoint::from_shared(peer_addr.to_string())
-        .map_err(|e| TransportError::InvalidAddress(e.to_string()))?
-        .connect_timeout(Duration::from_secs(timeout_secs))
-        .timeout(Duration::from_secs(timeout_secs));
-
-    let channel = ep.connect().await.map_err(|e| {
-        TransportError::Connection(format!("DiscoverZones connect to {peer_addr} failed: {e}"))
-    })?;
-
-    let mut client = ZoneApiServiceClient::new(channel);
+    let mut client = connect_zone_api(peer_addr, tls, timeout_secs, "DiscoverZones").await?;
     let response = client
         .discover_zones(DiscoverZonesRequest {})
         .await
@@ -875,18 +902,10 @@ pub async fn call_remove_voter_rpc(
     peer_addr: &str,
     zone_id: &str,
     target_node_id: u64,
+    tls: Option<super::TlsConfig>,
     timeout_secs: u64,
 ) -> Result<RemoveVoterResult> {
-    let ep = Endpoint::from_shared(peer_addr.to_string())
-        .map_err(|e| TransportError::InvalidAddress(e.to_string()))?
-        .connect_timeout(Duration::from_secs(timeout_secs))
-        .timeout(Duration::from_secs(timeout_secs));
-
-    let channel = ep.connect().await.map_err(|e| {
-        TransportError::Connection(format!("RemoveVoter connect to {peer_addr} failed: {e}"))
-    })?;
-
-    let mut client = ZoneApiServiceClient::new(channel);
+    let mut client = connect_zone_api(peer_addr, tls, timeout_secs, "RemoveVoter").await?;
     let request = RemoveVoterRequest {
         zone_id: zone_id.to_string(),
         target_node_id,
@@ -914,18 +933,10 @@ pub async fn call_delete_zone(
     peer_addr: &str,
     zone_id: &str,
     force: bool,
+    tls: Option<super::TlsConfig>,
     timeout_secs: u64,
 ) -> Result<()> {
-    let ep = Endpoint::from_shared(peer_addr.to_string())
-        .map_err(|e| TransportError::InvalidAddress(e.to_string()))?
-        .connect_timeout(Duration::from_secs(timeout_secs))
-        .timeout(Duration::from_secs(timeout_secs));
-
-    let channel = ep.connect().await.map_err(|e| {
-        TransportError::Connection(format!("DeleteZone connect to {peer_addr} failed: {e}"))
-    })?;
-
-    let mut client = ZoneApiServiceClient::new(channel);
+    let mut client = connect_zone_api(peer_addr, tls, timeout_secs, "DeleteZone").await?;
     let response = client
         .delete_zone(DeleteZoneRequest {
             zone_id: zone_id.to_string(),
