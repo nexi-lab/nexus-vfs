@@ -167,16 +167,17 @@ impl Kernel {
         registry.dispatch_post(ctx);
     }
 
-    /// Register a native Rust hook (e.g. `services::audit::AuditHook`)
-    /// with the kernel.  The hook receives pre/post callbacks for every
-    /// VFS operation.
+    /// Low-level insertion of a native Rust hook into the dispatch
+    /// registry.  This primitive does NOT bind the hook to a service
+    /// lifecycle, so it is `pub(crate)` — kernel-internal only.
     ///
-    /// Visibility is `pub` (not `pub(crate)`) so peer crates can install
-    /// their own hook impls — services own their hook lifecycle
-    /// (services::audit, services::matrix_adapter,
-    /// services::managed_agent, etc.) and call this directly through
-    /// their `Arc<Kernel>` at install time.
-    pub fn register_native_hook(&self, hook: Box<dyn NativeInterceptHook>) {
+    /// External / service callers MUST go through
+    /// [`Self::register_service_hook`], which binds the hook to a
+    /// [`ServiceHandle`](crate::service_registry::ServiceHandle) so it
+    /// load/unloads with its service (and is batch-removed on
+    /// swap/unregister).  `register_service_hook` composes this method,
+    /// keeping `native_hooks` insertion in one place (single SSOT).
+    pub(crate) fn register_native_hook(&self, hook: Box<dyn NativeInterceptHook>) {
         self.native_hooks.write().register(hook);
     }
 
@@ -225,7 +226,10 @@ impl Kernel {
         hook: Box<dyn NativeInterceptHook>,
     ) {
         let hook_name = hook.name().to_string();
-        self.native_hooks.write().register(hook);
+        // Single insertion SSOT: the raw registry write lives only in
+        // `register_native_hook`; this method adds the service-ownership
+        // bookkeeping on top.
+        self.register_native_hook(hook);
         self.service_hook_names
             .lock()
             .entry(handle.name().to_string())

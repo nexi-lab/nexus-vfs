@@ -28,6 +28,16 @@ pub trait KernelConvenience: KernelSyscall {
     /// Fast existence check: validate + route + metastore.exists.
     fn access(&self, path: &str, zone_id: &str) -> bool;
 
+    /// Compat alias for the pre-rename `readdir` name — the external
+    /// sudocode runtime still calls `.readdir()`. Composes the Tier-1
+    /// `sys_readdir` syscall (never reaches into kernel internals), so
+    /// it belongs here on the Tier-2 surface, not on `KernelSyscall`.
+    /// Remove once sudocode bumps its pin past the `readdir →
+    /// sys_readdir` rename.
+    fn readdir(&self, parent_path: &str, zone_id: &str, is_admin: bool) -> Vec<(String, u8)> {
+        self.sys_readdir(parent_path, zone_id, is_admin)
+    }
+
     /// Batch stat: returns `Vec<Option<StatResult>>` aligned with input.
     /// Default: N × sys_stat. Override: single redb read txn.
     fn stat_batch(&self, paths: &[String], zone_id: &str) -> Vec<Option<StatResult>> {
