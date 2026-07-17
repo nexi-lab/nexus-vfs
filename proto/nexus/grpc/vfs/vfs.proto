@@ -127,7 +127,18 @@ message WriteRequest {
   string path = 1;
   bytes content = 2;       // Raw file bytes — no base64
   string auth_token = 3;
-  string content_id = 4;   // Optional: opaque content identifier for conditional write (If-Match)
+  // Field 4 (`content_id` — documented as "If-Match" conditional
+  // write) removed for issue #5.  The server never enforced it, so
+  // the documented optimistic-concurrency contract was a silent
+  // no-op that would mask concurrent-writer data loss in any
+  // client that trusted it.  Dropped rather than half-implemented
+  // per YAGNI: the `content_id` at rest is a hash (CAS backends)
+  // or a path (PAS backends), neither of which is the right shape
+  // for a versioning token.  If optimistic-write semantics come
+  // back later, key off `WriteResponse.gen` (monotonic version)
+  // via an explicit `expected_gen` field, not `content_id`.
+  reserved 4;
+  reserved "content_id";
 }
 
 message WriteResponse {
@@ -145,7 +156,18 @@ message DeleteRequest {
 }
 
 message DeleteResponse {
-  bool success = 1;
+  // `success` is `optional bool` so the wire distinguishes
+  // "success=false transmitted explicitly" (idempotent no-op —
+  // target did not exist) from "field unset" (issue #8).  Under
+  // proto3's default-omit rule a bare `bool success = 1` on a
+  // not-found delete serialized as `{}`, indistinguishable from
+  // "field never populated" — a footgun for any client that
+  // relies on `success` to gate follow-up work.  With the
+  // optional marker: `Some(true)` = target existed and was
+  // deleted; `Some(false)` = target did not exist (idempotent);
+  // `None` should never occur post-fix, but a defensive client
+  // should treat it as "server does not understand the request".
+  optional bool success = 1;
   bool is_error = 2;
   bytes error_payload = 3;
   // Richer per-result fields — added so the typed Delete subsumes the
