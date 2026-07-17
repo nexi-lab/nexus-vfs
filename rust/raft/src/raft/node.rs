@@ -86,14 +86,26 @@ fn channel_try_send_err<T>(e: mpsc::error::TrySendError<T>) -> RaftError {
 use crate::transport::{NodeAddress, RaftClientPool, SharedPeerMap};
 
 #[cfg(all(feature = "grpc", has_protos))]
-fn node_address_from_conf_context(node_id: u64, context: &[u8]) -> Option<NodeAddress> {
+fn node_address_from_conf_context(
+    node_id: u64,
+    context: &[u8],
+    use_tls: bool,
+) -> Option<NodeAddress> {
     if context.is_empty() {
         return None;
     }
 
     let address = String::from_utf8_lossy(context).to_string();
+    // A peer advertises a bare `host:port` authority; apply the cluster's
+    // transport scheme so the learned dial endpoint matches the peer's
+    // listener. Under mTLS a plaintext `http://` dial cannot complete the
+    // handshake — the leader→joiner replication direction (which dials the
+    // address recovered here from the AddNode ConfChange) depends on this
+    // becoming `https://`. An already-schemed address is used as-is.
     let endpoint = if address.starts_with("http://") || address.starts_with("https://") {
         address
+    } else if use_tls {
+        format!("https://{}", address)
     } else {
         format!("http://{}", address)
     };
@@ -451,6 +463,13 @@ pub struct ZoneConsensusDriver<S: StateMachine + 'static> {
     /// Set by `set_peer_map()` before the transport loop starts.
     #[cfg(all(feature = "grpc", has_protos))]
     peer_map: Option<SharedPeerMap>,
+    /// Whether this node dials peers over TLS (the cluster's SSOT, from the
+    /// registry). Set alongside `peer_map`; used to scheme a peer's bare
+    /// advertised `host:port` into an `https://` dial endpoint when a
+    /// ConfChange learns a new member — under mTLS a plaintext dial cannot
+    /// complete the handshake.
+    #[cfg(all(feature = "grpc", has_protos))]
+    dial_uses_tls: bool,
     /// Optional apply-callback invoked after every successful
     /// `set_conf_state` in the ConfChange apply path.  Installed by
     /// `ZoneRegistry` when the coordinator has an `identity_dir` in
@@ -765,6 +784,8 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             cached_last_index,
             #[cfg(all(feature = "grpc", has_protos))]
             peer_map: None,
+            #[cfg(all(feature = "grpc", has_protos))]
+            dial_uses_tls: false,
             conf_state_applied_cb: None,
             replication_log: handle.replication_log.clone(),
         };
@@ -1445,11 +1466,15 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         &self.config
     }
 
-    /// Set the shared peer map so ConfChange can update peers at runtime.
+    /// Set the shared peer map so ConfChange can update peers at runtime,
+    /// plus this node's dial-TLS posture (the cluster's SSOT via the
+    /// registry) so a ConfChange that learns a new member schemes its bare
+    /// advertised authority into the matching `http`/`https` dial endpoint.
     /// Must be called before the transport loop starts.
     #[cfg(all(feature = "grpc", has_protos))]
-    pub fn set_peer_map(&mut self, peer_map: SharedPeerMap) {
+    pub fn set_peer_map(&mut self, peer_map: SharedPeerMap, dial_uses_tls: bool) {
         self.peer_map = Some(peer_map);
+        self.dial_uses_tls = dial_uses_tls;
     }
 
     /// Install a callback to fire after every ConfState apply.  See
@@ -1839,9 +1864,11 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                     if let Some(ref peer_map) = self.peer_map {
                         match cc.get_change_type() {
                             ConfChangeType::AddNode | ConfChangeType::AddLearnerNode => {
-                                if let Some(address) =
-                                    node_address_from_conf_context(cc.node_id, &cc.context)
-                                {
+                                if let Some(address) = node_address_from_conf_context(
+                                    cc.node_id,
+                                    &cc.context,
+                                    self.dial_uses_tls,
+                                ) {
                                     peer_map.write().unwrap().insert(cc.node_id, address);
                                 }
                             }
@@ -1910,9 +1937,11 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                         for single in &cc.changes {
                             match single.get_change_type() {
                                 ConfChangeType::AddNode | ConfChangeType::AddLearnerNode => {
-                                    if let Some(address) =
-                                        node_address_from_conf_context(single.node_id, &cc.context)
-                                    {
+                                    if let Some(address) = node_address_from_conf_context(
+                                        single.node_id,
+                                        &cc.context,
+                                        self.dial_uses_tls,
+                                    ) {
                                         peer_map.write().unwrap().insert(single.node_id, address);
                                     }
                                 }
@@ -2144,17 +2173,25 @@ mod tests {
     #[cfg(all(feature = "grpc", has_protos))]
     #[test]
     fn conf_context_address_preserves_explicit_node_id_and_hostname() {
-        let addr = node_address_from_conf_context(42, b"nexus-2:2126").expect("address");
+        // Bare authority + no TLS → http:// dial endpoint (unchanged).
+        let addr = node_address_from_conf_context(42, b"nexus-2:2126", false).expect("address");
         assert_eq!(addr.id, 42);
         assert_eq!(addr.hostname, "nexus-2");
         assert_eq!(addr.port, 2126);
         assert_eq!(addr.endpoint, "http://nexus-2:2126");
+        // Bare authority + TLS → https:// dial endpoint. The leader→joiner
+        // replication direction dials the address recovered here; under mTLS
+        // a plaintext dial cannot complete the handshake.
+        let tls = node_address_from_conf_context(42, b"nexus-2:2126", true).expect("address");
+        assert_eq!(tls.endpoint, "https://nexus-2:2126");
     }
 
     #[cfg(all(feature = "grpc", has_protos))]
     #[test]
     fn conf_context_address_accepts_uri_context() {
-        let addr = node_address_from_conf_context(42, b"https://nexus-2:2126").expect("address");
+        // An already-schemed context is used as-is, regardless of use_tls.
+        let addr =
+            node_address_from_conf_context(42, b"https://nexus-2:2126", false).expect("address");
         assert_eq!(addr.id, 42);
         assert_eq!(addr.hostname, "nexus-2");
         assert_eq!(addr.endpoint, "https://nexus-2:2126");

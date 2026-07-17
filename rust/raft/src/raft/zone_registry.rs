@@ -628,7 +628,7 @@ impl ZoneRaftRegistry {
         let peer_map: HashMap<u64, NodeAddress> = peers.into_iter().map(|p| (p.id, p)).collect();
         let shared_peers: SharedPeerMap = Arc::new(RwLock::new(peer_map));
 
-        driver.set_peer_map(shared_peers.clone());
+        driver.set_peer_map(shared_peers.clone(), self.tls_config().is_some());
 
         // S3 Phase B: install ConfState apply mirror if the coordinator
         // has an identity_dir in scope.  Callback captures zone_id +
@@ -827,7 +827,12 @@ impl ZoneRaftRegistry {
                 return false;
             }
         }
-        let use_tls = endpoint.starts_with("https://");
+        // The peer advertises a bare `host:port` authority; scheme it with
+        // THIS node's transport posture (the cluster's SSOT — the registry
+        // TLS config), not by sniffing the string. A scheme-less address
+        // under mTLS must become `https://` or the dial fails the handshake.
+        // An already-qualified `https://` address parses the same either way.
+        let use_tls = self.tls_config().is_some();
         let parsed = match NodeAddress::parse(endpoint, use_tls) {
             Ok(mut p) => {
                 p.id = peer_id;
