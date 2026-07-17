@@ -16,7 +16,7 @@ mod pool;
 mod server_limits;
 mod tofu;
 
-pub use channel::create_channel;
+pub use channel::{create_channel, ensure_crypto_provider};
 pub use config::{ClientConfig, ServerConfig, TlsConfig};
 pub use error::{Result, TransportError};
 pub use peer::{hostname_to_node_id, NodeAddress, PeerAddress};

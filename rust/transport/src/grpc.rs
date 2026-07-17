@@ -1411,6 +1411,10 @@ pub fn spawn(
         .timeout(std::time::Duration::from_secs(60));
 
     if let Some(tls) = cfg.tls {
+        // Pin the rustls provider before tonic builds the VFS server TLS
+        // config (see `ensure_crypto_provider` — rustls 0.23 panics on an
+        // ambiguous provider set, which the Linux graph produces).
+        lib::transport_primitives::ensure_crypto_provider();
         let identity = tonic::transport::Identity::from_pem(&tls.cert_pem, &tls.key_pem);
         let ca = tonic::transport::Certificate::from_pem(&tls.ca_pem);
         let tls_cfg = tonic::transport::ServerTlsConfig::new()

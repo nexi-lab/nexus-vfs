@@ -157,6 +157,10 @@ impl RaftGrpcServer {
         let mut builder =
             lib::transport_primitives::apply_server_limits(tonic::transport::Server::builder());
         if let Some(ref tls) = self.config.tls {
+            // Pin the rustls provider before tonic builds the server TLS
+            // config (see `ensure_crypto_provider` — rustls 0.23 panics on an
+            // ambiguous provider set, which the Linux graph produces).
+            lib::transport_primitives::ensure_crypto_provider();
             let identity = tonic::transport::Identity::from_pem(&tls.cert_pem, &tls.key_pem);
             let client_ca = tonic::transport::Certificate::from_pem(&tls.ca_pem);
             let tls_config = tonic::transport::ServerTlsConfig::new()
@@ -215,6 +219,10 @@ impl RaftGrpcServer {
         let mut builder =
             lib::transport_primitives::apply_server_limits(tonic::transport::Server::builder());
         if let Some(ref tls) = self.config.tls {
+            // Pin the rustls provider before tonic builds the server TLS
+            // config (see `ensure_crypto_provider` — rustls 0.23 panics on an
+            // ambiguous provider set, which the Linux graph produces).
+            lib::transport_primitives::ensure_crypto_provider();
             let identity = tonic::transport::Identity::from_pem(&tls.cert_pem, &tls.key_pem);
             let client_ca = tonic::transport::Certificate::from_pem(&tls.ca_pem);
             let tls_config = tonic::transport::ServerTlsConfig::new()
@@ -1805,6 +1813,10 @@ impl RaftWitnessServer {
         let mut builder =
             lib::transport_primitives::apply_server_limits(tonic::transport::Server::builder());
         if let Some(ref tls) = self.config.tls {
+            // Pin the rustls provider before tonic builds the server TLS
+            // config (see `ensure_crypto_provider` — rustls 0.23 panics on an
+            // ambiguous provider set, which the Linux graph produces).
+            lib::transport_primitives::ensure_crypto_provider();
             let identity = tonic::transport::Identity::from_pem(&tls.cert_pem, &tls.key_pem);
             let client_ca = tonic::transport::Certificate::from_pem(&tls.ca_pem);
             let tls_config = tonic::transport::ServerTlsConfig::new()

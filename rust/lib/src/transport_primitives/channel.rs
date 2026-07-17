@@ -34,12 +34,32 @@ pub async fn create_channel(
     ep.connect().await.map_err(TransportError::Tonic)
 }
 
+/// Install the process-level rustls `CryptoProvider` (ring) exactly once.
+///
+/// rustls 0.23's auto-selecting config builder — which tonic's
+/// `ClientTlsConfig`/`ServerTlsConfig` drive — panics when **zero or
+/// multiple** provider features are compiled in. On Linux the dependency
+/// graph pulls both `ring` (tonic's `tls-ring`) and `aws-lc-rs` (rustls'
+/// default feature), so the process default must be pinned before the first
+/// TLS config is built or the handshake thread panics ("could not
+/// automatically determine the process-level CryptoProvider"). All mTLS
+/// paths were `--no-tls` until now, so nothing exercised this — the server
+/// and client TLS setup both call this first. Idempotent via `Once`;
+/// `install_default` returning `Err` (already set) is intentionally ignored.
+pub fn ensure_crypto_provider() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 /// Apply TLS configuration to a tonic Endpoint.
 #[allow(clippy::result_large_err)]
 fn apply_tls(
     ep: tonic::transport::Endpoint,
     tls: &TlsConfig,
 ) -> Result<tonic::transport::Endpoint, TransportError> {
+    ensure_crypto_provider();
     let ca_cert = tonic::transport::Certificate::from_pem(&tls.ca_pem);
     let identity = tonic::transport::Identity::from_pem(&tls.cert_pem, &tls.key_pem);
 

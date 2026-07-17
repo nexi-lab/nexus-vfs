@@ -1744,6 +1744,7 @@ dependencies = [
  "regex",
  "regex-syntax",
  "roaring",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.11.0",

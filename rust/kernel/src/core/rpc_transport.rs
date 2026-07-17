@@ -99,6 +99,10 @@ impl RpcTransport {
             .timeout(timeout);
 
         if let Some(tls_cfg) = tls {
+            // Pin the rustls provider before tonic builds the client TLS
+            // config (see `ensure_crypto_provider` — rustls 0.23 panics on an
+            // ambiguous provider set, which the Linux graph produces).
+            lib::transport_primitives::ensure_crypto_provider();
             let ca = Certificate::from_pem(&tls_cfg.ca_pem);
             let mut client_tls = ClientTlsConfig::new().ca_certificate(ca);
             if let (Some(cert), Some(key)) = (&tls_cfg.cert_pem, &tls_cfg.key_pem) {
