@@ -1030,7 +1030,20 @@ graph stay acyclic.
 | **Driver layer (kernel-internal)** | `backends/`, `raft/` | `drivers/` | Implement HAL traits; consume kernel's runtime API. `backends` = local storage drivers (ObjectStore impl). `raft` = distributed storage driver (MetaStore impl + DistributedCoordinator impl). |
 | **Network surface (kernel-external)** | `transport/` | `net/` | VFS gRPC server + IPC envelope helpers (in-bound) plus VFS / peer-blob / federation clients (driver-outgoing). One crate covers both directions like Linux's `net/` covers both server sockets and outgoing connections. Depends on `kernel`, `lib`, and `raft` (proto stubs for the federation client). |
 | **Post-syscall services (kernel-internal hooks)** | `services/` | LSM hooks (`security/`) | Audit, agents, permission, tasks. Fired on syscall paths through registered hooks; depends on `kernel`. |
+| **Messaging substrate (kernel-tier)** | `a2a/` | AF_UNIX / kernel messaging facility | The A2A messaging **substrate**: owns the mailbox `from` identity guarantee (stamp hook) and the cross-machine delivery wake (stream-wakeup observer), armed ONCE at the daemon. Core depends on `kernel` + `contracts`; the `install` feature adds `raft` for the observer arming. Consumed by the profile binaries; the stamp hook alone is reused by frontends without pulling raft. |
 | **Tier-neutral lib (§6)** | `lib/` | `lib/` (libc, libm) | Pure utilities depending on `contracts` only. Algorithms (bitmap, bloom, glob, hash, simd, …) plus the `transport_primitives` module (TLS, pool, addressing, TOFU trust store, `PeerBlobClient` trait). The §6 mirror of `src/nexus/lib`. |
+
+**A2A substrate vs. frontends.** `a2a` is the substrate, not a frontend.
+The `from` guarantee (an agent cannot forge who a message is from) must
+hold for EVERY mailbox writer, so it is enforced ONCE at the substrate —
+the stamp hook rewrites the envelope `from` to the caller's `agent_id`
+on every `*/chat-with-me` write. Frontends ride on top of it rather than
+re-implementing it: `matrix_adapter` (Matrix C-S protocol → humans,
+`services/`), `sudocode-host` (agent runtime → AI, sudocode repo), and
+`managed_agent` (spawn/PCB → process, `services/`). A frontend consumes
+`a2a::MailboxStampingHook` (no raft); only the daemon calls
+`a2a::install_a2a` (the `install` feature, which links raft to arm the
+stream-wakeup observer).
 
 The role split makes the orthogonality invariants
 **`services ⊥ backends ⊥ raft`** (services and backends reach raft
@@ -1117,13 +1130,14 @@ each other.
                           │                    behind opt-in features)
                        kernel                 (depends on contracts + lib;
                           ↑                    declares HAL traits)
-              ↑    ↑    ↑    ↑
-              │    │    │    │
-       backends raft transport services       (peer crates — depend on
-              ↑    ↑    ↑    ↑                kernel + lib; transport
-              │    │    │    │                additionally depends on raft
-              │    │    │    │                for federation proto stubs)
-              └────┴────┴────┴── rust/profiles/cluster  (deployment binary sink)
+              ↑    ↑    ↑    ↑    ↑
+              │    │    │    │    │
+       backends raft transport services a2a     (peer crates — depend on
+              ↑    ↑    ↑    ↑    ↑              kernel + lib; transport
+              │    │    │    │    │              additionally depends on raft
+              │    │    │    │    │              for federation proto stubs;
+              │    │    │    │    │              a2a on raft behind `install`)
+              └────┴────┴────┴────┴── rust/profiles/cluster  (deployment binary sink)
 ```
 
 Edge invariants:
@@ -1134,6 +1148,8 @@ Edge invariants:
 | `kernel ↔ lib`                                | one-way: `kernel → lib`                        |
 | `raft ↔ transport`                            | one-way: `transport → raft` for federation client proto stubs (Postgres-client-references-libpq shape) |
 | `kernel → raft`                               | trait-only: kernel reaches raft through `DistributedCoordinator` dispatch |
+| `a2a → kernel`                                | always — the stamp hook is a `NativeInterceptHook`; core footprint is `kernel` + `contracts` + `serde_json` |
+| `a2a → raft`                                  | `install` feature ONLY — arms the stream-wakeup observer (`ZoneConsensus`, `AppendStreamEntry`). Frontends consuming the stamp hook leave the feature off and stay raft-free (`services ⊥ raft`) |
 | `rust/profiles/<name>`                        | sink (deployment binary)                       |
 
 `lib` (default features) keeps a zero peer-crate footprint so it builds
