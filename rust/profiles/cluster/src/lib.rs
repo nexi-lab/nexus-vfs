@@ -8,6 +8,7 @@
 //!
 //! Subcommands:
 //!   * `nexusd-cluster`             — start the daemon (default)
+//!   * `nexusd-cluster serve-local` — start a loopback-only trusted local backend
 //!   * `nexusd-cluster share`       — detach a local subtree into a new zone
 //!   * `nexusd-cluster join`        — mount a remote zone locally
 //!
@@ -530,6 +531,30 @@ enum Cmd {
         #[arg(long)]
         target: u64,
     },
+    /// Run a loopback-only daemon: a trusted local backend.
+    ///
+    /// Shorthand for `--bind-addr 127.0.0.1:<port> --no-tls`. Binding
+    /// loopback and serving plaintext is exactly the posture the boot
+    /// auth gate (`auth_posture.rs`) recognises as a trusted local
+    /// backend, so it starts WITHOUT `--insecure-no-auth`.
+    ///
+    /// This is the ONE mode the embedding products (sudowork / moss /
+    /// sudocode) use to spawn a private per-process nexus backend. It
+    /// exists so the loopback + no-tls invariant lives in the binary
+    /// instead of being hand-written — and drifting — at each spawn
+    /// site (the `--bootstrap-mode` breakage that hit all three at once
+    /// is the failure mode this closes).
+    ///
+    /// Runs the daemon like the default (no-subcommand) invocation —
+    /// same long-running gRPC server, same stdout log routing. The usual
+    /// global flags (`--data-dir`, `--root-fs`, `--metastore-path`, …)
+    /// apply; `--bind-addr` and `--no-tls` are forced here and any
+    /// values passed for them are ignored.
+    ServeLocal {
+        /// Loopback port to bind (`127.0.0.1:<port>`).
+        #[arg(long, default_value_t = 2126)]
+        port: u16,
+    },
 }
 
 /// Membership role a new node takes when joining an existing zone.
@@ -564,8 +589,11 @@ pub fn run() -> Result<()> {
     let args = Args::parse();
     // Held until this function returns so the non-blocking log writer
     // thread stays alive and flushes on shutdown. Subcommands log to
-    // stderr — their stdout is data a caller captures.
-    let _tracing_guard = install_tracing(/* logs_to_stderr */ args.cmd.is_some());
+    // stderr — their stdout is data a caller captures. `serve-local` is
+    // a daemon, not a data-emitting subcommand, so it logs to stdout
+    // like the default (no-subcommand) daemon.
+    let is_daemon = matches!(args.cmd, None | Some(Cmd::ServeLocal { .. }));
+    let _tracing_guard = install_tracing(/* logs_to_stderr */ !is_daemon);
     // Size the multi-thread runtime against the host: federation
     // gRPC + raft IO is IO-bound, so the kernel `available_parallelism`
     // estimate (logical cores under cgroup / affinity constraints) is
@@ -583,6 +611,15 @@ pub fn run() -> Result<()> {
         .block_on(async move {
             match args.cmd {
                 None => run_daemon(args.common).await,
+                Some(Cmd::ServeLocal { port }) => {
+                    // Force the trusted-local-backend posture: loopback
+                    // bind + plaintext. auth_posture then grants the
+                    // no-auth start without `--insecure-no-auth`.
+                    let mut common = args.common;
+                    common.bind_addr = format!("127.0.0.1:{port}");
+                    common.no_tls = true;
+                    run_daemon(common).await
+                }
                 Some(Cmd::Share {
                     path,
                     zone_id,
