@@ -24,6 +24,10 @@ Four paths, four outcomes:
     reachable + no-tls + --insecure  → boots, shouting
     reachable + no-tls + secret      → boots, authenticating
 
+Plus a fifth path pinning the `serve-local` shorthand — the mode the
+embedders spawn — to the first outcome: `serve-local --port P` must be
+exactly `--bind-addr 127.0.0.1:P --no-tls`, booting with no flags.
+
 Run:
     python scripts/e2e_loopback_invariant.py
 """
@@ -83,7 +87,12 @@ def run_daemon(binary: Path, args: list[str], env_extra: dict[str, str], tmp: Pa
     )
     try:
         deadline = time.time() + BOOT_BUDGET_S
-        port = int(args[args.index("--bind-addr") + 1].rsplit(":", 1)[1])
+        # The bind port is either explicit (`--bind-addr host:port`) or,
+        # for the `serve-local` shorthand, the loopback `--port`.
+        if "--bind-addr" in args:
+            port = int(args[args.index("--bind-addr") + 1].rsplit(":", 1)[1])
+        else:
+            port = int(args[args.index("--port") + 1])
         while time.time() < deadline:
             if proc.poll() is not None:
                 return False, proc.stdout.read() if proc.stdout else ""
@@ -189,6 +198,25 @@ def main() -> int:
         else:
             failures.append(f"a secret must permit a reachable bind:\n{out}")
             print("   [FAIL] refused even with a credential policy")
+
+        # ── 5. The serve-local shorthand. Same posture as (1). ───────
+        # `serve-local --port P` must be exactly `--bind-addr
+        # 127.0.0.1:P --no-tls`: the trusted-local-backend shape the
+        # embedders (sudowork / moss / sudocode) spawn, booting with no
+        # `--insecure-no-auth`. This pins the shorthand to outcome (1) so
+        # it can never drift from the hand-written triplet it replaces.
+        print("5. serve-local --port               (the embedders' shorthand)")
+        up, out = run_daemon(
+            args.binary,
+            ["serve-local", "--port", str(free_port())],
+            {},
+            tmp,
+        )
+        if up:
+            print("   [ok] boots — serve-local == loopback + no-tls, no flags")
+        else:
+            failures.append(f"serve-local must boot on loopback with no flags:\n{out}")
+            print("   [FAIL] serve-local refused to boot")
 
         print()
         if failures:
