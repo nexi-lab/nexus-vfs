@@ -20,6 +20,12 @@ members = [
     # take. `nexusd-cluster` leaves the feature off and keeps `NoAuth`,
     # so the crate never enters that binary.
     "rust/auth",
+    # a2a/ — the A2A messaging substrate. Kernel-tier capability that
+    # owns the mailbox `from`-stamp hook and (behind the `install`
+    # feature) the cross-machine stream-wakeup arming. Consumed by the
+    # profile binaries; the stamp hook alone is reused by nexus-side
+    # frontends without pulling raft (see rust/a2a/Cargo.toml).
+    "rust/a2a",
     # Plugin ABI — stable C ABI contract for dylib plugins.
     "rust/plugin-abi",
     # Deployment binaries.
@@ -57,6 +63,11 @@ raft = { path = "rust/raft", default-features = false, features = ["grpc"] }
 # terminates external client auth pulls this in (behind a Cargo
 # feature); nexusd-cluster does not.
 auth = { path = "rust/auth" }
+# `a2a` — the A2A messaging substrate (mailbox stamp hook + `install`
+# feature for the stream-wakeup arming). `default-features = false` so a
+# consumer that needs only the hook does not pull the `install` feature's
+# raft dep; the profile binaries opt into `features = ["install"]`.
+a2a = { path = "rust/a2a", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 ahash = { version = "0.8", default-features = false, features = ["compile-time-rng", "std"] }
