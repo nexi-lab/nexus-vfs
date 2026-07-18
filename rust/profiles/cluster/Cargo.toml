@@ -41,6 +41,11 @@ transport = { workspace = true }
 # trusted network — they configure it. Costs 134 KiB (0.9%) in the binary and
 # nothing at runtime when the posture is Open.
 auth = { workspace = true }
+# A2A messaging substrate, armed at boot by `install_a2a`. The `install`
+# feature pulls the raft-backed stream-wakeup arming; the stamp hook it
+# registers is behaviour-preserving under NoAuth (empty agent_id ⇒ no
+# rewrite). First boot-enlisted service in the daemon.
+a2a = { workspace = true, features = ["install"] }
 # `auth mint` generates the key_id; the daemon carries no uuid dep.
 rand = "0.10"
 

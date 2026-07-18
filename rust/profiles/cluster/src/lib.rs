@@ -1491,6 +1491,32 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
         }
     }
 
+    // ── A2A messaging substrate (§F platform half) ───────────────────
+    // Arm the a2a capability on the root zone: register the mailbox
+    // `from`-stamp hook (rides the "a2a" hook-only service — the first
+    // boot-enlisted service) and the cross-machine stream-wakeup
+    // observer (a replicated `AppendStreamEntry` wakes a `sys_watch`
+    // parked on this replica). Behaviour-preserving under NoAuth: with
+    // an empty `agent_id` the stamp hook returns Pass, so no envelope is
+    // rewritten. Bound to root because the root `/` mount already routes
+    // `/agents/...` and its stream inodes live in the root-zone
+    // replicated metastore. See docs/KERNEL-ARCHITECTURE.md §6.1.
+    {
+        let root_zone = zm.get_zone(contracts::ROOT_ZONE_ID).ok_or_else(|| {
+            anyhow::anyhow!(
+                "root zone is not open — a2a has no consensus to arm the \
+                 stream-wakeup observer on. The kernel owns root \
+                 unconditionally (see BootAction::needs_root_zone)."
+            )
+        })?;
+        a2a::install_a2a(&kernel, &root_zone.consensus_node())
+            .map_err(|e| anyhow::anyhow!("arm a2a messaging substrate: {e}"))?;
+        tracing::info!(
+            "a2a messaging substrate armed — mailbox from-stamp hook + \
+             cross-machine stream-wakeup observer on the root zone"
+        );
+    }
+
     // Post-transport substrate observability — dual of the peer-blob
     // installation just above.  peer_blob is what performs cross-node
     // fetches; transport_observer classifies which substrate path each
