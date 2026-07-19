@@ -32,6 +32,10 @@ output:
   7. READ    the owner reads the envelope back from its own replica — byte-exact.
   8. REVERSE swap roles. Proves symmetry: both nodes arm the wakeup on the
              shared zone AND both can open + send to a peer-owned mailbox.
+  9. HONEST   kill the leader; with no quorum the survivor has no leader, so
+             its next wal-stream write FAILS LOUD rather than silently
+             accepting bytes it can never replicate (the `write_sync`
+             durability contract — the mount does not lie about writability).
 
 Run:
     python scripts/e2e_a2a_wakeup.py [--binary target/release/nexusd-cluster]
@@ -168,6 +172,18 @@ def stream_collect_all(port: int, path: str) -> bytes:
         if r.is_error:
             raise RuntimeError(f"stream_collect_all {path}: {r.error_payload!r}")
         return r.data
+
+
+def expect_write_fails_loud(port: int, path: str) -> str:
+    """A wal-stream write with no reachable leader MUST fail — never silently
+    accept bytes it cannot replicate (that is the mount lying to the user).
+    Returns the error text on the expected failure; raises if the write
+    succeeded. Regression guard for the wal DT_STREAM `write_sync` durability."""
+    try:
+        stream_write(port, path, b'{"from":"probe","body":"must not commit"}')
+    except (RuntimeError, grpc.RpcError) as e:  # noqa: BLE001
+        return str(e).splitlines()[0][:140]
+    raise AssertionError(f"write to {path} SUCCEEDED with no leader — the mount lied")
 
 
 def watch_in_thread(port: int, path: str, timeout_ms: int) -> "list":
@@ -384,7 +400,19 @@ def main() -> int:
         print("8. reverse A2A: founder mailbox; joiner (peer) opens + sends; founder wakes + reads")
         _mailbox_round(owner=founder, sender=joiner, agent="founder-ai")
 
-        print("\nPASS — the A2A mailbox wakes a peer's sys_watch across the federation.")
+        # ── 9. Honest mount — a write with NO leader fails loud ──────────
+        # Kill the founder: a 2-voter zone with one voter down has no majority,
+        # so the survivor has no leader to commit through. A wal DT_STREAM write
+        # must then FAIL rather than silently accept bytes it can never
+        # replicate — the durability contract `write_sync` enforces (the async
+        # `write_nowait` would buffer-and-drop, i.e. the mount lying).
+        print("9. honest mount: kill the leader; a write with no quorum must FAIL, not silently accept")
+        founder.stop()
+        time.sleep(2)  # let the survivor observe the leader is gone
+        err = expect_write_fails_loud(joiner.port, f"{MOUNT}/founder-ai/chat-with-me")
+        print(f"   [ok] leaderless write refused (fail-loud) — {err!r}")
+
+        print("\nPASS — cross-node A2A wakeup works, and a leaderless write fails loud.")
         return 0
     finally:
         joiner.stop()
