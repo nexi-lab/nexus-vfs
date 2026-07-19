@@ -41,11 +41,12 @@ transport = { workspace = true }
 # trusted network — they configure it. Costs 134 KiB (0.9%) in the binary and
 # nothing at runtime when the posture is Open.
 auth = { workspace = true }
-# A2A messaging substrate, armed at boot by `install_a2a`. The `install`
-# feature pulls the raft-backed stream-wakeup arming; the stamp hook it
-# registers is behaviour-preserving under NoAuth (empty agent_id ⇒ no
-# rewrite). First boot-enlisted service in the daemon.
-a2a = { workspace = true, features = ["install"] }
+# A2A messaging substrate — the mailbox `from`-stamp hook, armed at boot
+# by `install_a2a_stamp_hook` (first boot-enlisted service; behaviour-
+# preserving under NoAuth). The cross-machine stream-wakeup observer is a
+# generic raft primitive this binary arms per-zone directly via
+# `nexus_raft::stream_wakeup` — a2a itself carries no raft dep.
+a2a = { workspace = true }
 # `auth mint` generates the key_id; the daemon carries no uuid dep.
 rand = "0.10"
 
