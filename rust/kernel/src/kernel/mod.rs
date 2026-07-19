@@ -1936,9 +1936,23 @@ impl Kernel {
                     // WalStreamCore composes whatever distributed MetaStore the
                     // coordinator DI'd — layering preserved without a
                     // per-primitive DI method on the trait.
+                    //
+                    // The stream MUST live in the PATH's zone, not hardcoded
+                    // root: a chat-with-me under a federation mount
+                    // (`/agents=<zone>`) has to propose its AppendStreamEntry
+                    // to THAT zone's raft so it replicates to peers. Backing
+                    // it with root (node-local) would silently never cross
+                    // machines. `route().zone_id` is the resolved destination
+                    // zone (the routing SSOT) — root for an unmounted path,
+                    // the federation zone for a mount.
+                    let zone_id = self
+                        .vfs_router
+                        .route(path, contracts::ROOT_ZONE_ID)
+                        .map(|r| r.zone_id)
+                        .unwrap_or_else(|| contracts::ROOT_ZONE_ID.to_string());
                     if let Ok(store) = self
                         .distributed_coordinator()
-                        .metastore_for_zone(self, "root")
+                        .metastore_for_zone(self, &zone_id)
                     {
                         let backend =
                             crate::core::stream::wal::WalStreamCore::new(store, path.to_string());
