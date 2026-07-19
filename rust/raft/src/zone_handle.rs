@@ -18,13 +18,12 @@ use crate::raft::{
 use crate::raft::StateMachine;
 
 /// Consistency mode for replicated writes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Consistency {
-    /// Strong consistency — wait for raft commit.
-    Sc,
-    /// Eventual consistency — local write + WAL token.
-    Ec,
-}
+///
+/// SSOT lives at the DC boundary ([`kernel::hal::distributed_coordinator`]);
+/// re-exported here so existing `raft::Consistency` / `zone_handle::Consistency`
+/// paths keep resolving. The raft tier implements the behavior each variant
+/// selects (`Sc` → raft commit, `Ec` → `propose_ec_local`).
+pub use kernel::hal::distributed_coordinator::Consistency;
 
 /// Handle to a single zone's raft node (pure Rust, kernel-internal).
 pub struct ZoneHandle {

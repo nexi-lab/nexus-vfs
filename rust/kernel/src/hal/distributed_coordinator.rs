@@ -86,6 +86,23 @@ pub struct ShareInfo {
     pub copied_entries: u64,
 }
 
+/// Consistency mode for a replicated write — a distributed-coordination
+/// concept: it selects HOW a write is coordinated across nodes.
+///
+/// `Sc` routes through raft consensus (CP — waits for quorum commit); `Ec`
+/// applies locally then replicates asynchronously with last-write-wins (AP —
+/// available under partition, eventually convergent). The kernel names the
+/// mode here (the DC boundary where local-vs-distributed matters); the raft
+/// tier implements the behavior. This is the single SSOT for the mode — the
+/// raft crate re-exports it rather than defining its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Consistency {
+    /// Strong consistency — wait for raft commit.
+    Sc,
+    /// Eventual consistency — local write + async replicate (LWW).
+    Ec,
+}
+
 /// Control-Plane HAL §3.B.1 trait — distributed namespace coordination.
 ///
 /// Implementor: `nexus_raft::distributed_coordinator::RaftDistributedCoordinator`.
