@@ -148,13 +148,7 @@ impl ZoneMetaStore {
                     | Command::DeleteMetadata { key } => key.as_str(),
                     _ => return,
                 };
-                let global = if mount_point_for_cb == VFS_ROOT || mount_point_for_cb.is_empty() {
-                    zone_key.to_string()
-                } else if zone_key == VFS_ROOT {
-                    mount_point_for_cb.clone()
-                } else {
-                    format!("{}{}", mount_point_for_cb, zone_key)
-                };
+                let global = zone_key_to_global(&mount_point_for_cb, zone_key);
                 cache_for_cb.remove(&global);
             }));
         }
@@ -208,15 +202,27 @@ impl ZoneMetaStore {
 
     /// Zone-relative state-machine key → full caller-facing path.
     fn to_global_path(&self, zone_key: &str) -> String {
-        if self.mount_point == VFS_ROOT || self.mount_point.is_empty() {
-            return zone_key.to_string();
-        }
-        if zone_key == VFS_ROOT {
-            return self.mount_point.clone();
-        }
-        // zone_key begins with '/'; avoid double slash.
-        format!("{}{}", self.mount_point, zone_key)
+        zone_key_to_global(&self.mount_point, zone_key)
     }
+}
+
+/// Map a zone-relative state-machine key to its full caller-facing path,
+/// given the zone's mount point — the inverse of `to_zone_key`.
+///
+/// SSOT for the zone-key → global-path mapping: the `ZoneMetaStore` read
+/// path, its DCache-invalidation apply observer, and the composition
+/// root's A2A stream-wakeup arming all call this, so a zone mounted at
+/// `/agents` maps `/win-ai/chat-with-me` → `/agents/win-ai/chat-with-me`
+/// identically everywhere.
+pub fn zone_key_to_global(mount_point: &str, zone_key: &str) -> String {
+    if mount_point == VFS_ROOT || mount_point.is_empty() {
+        return zone_key.to_string();
+    }
+    if zone_key == VFS_ROOT {
+        return mount_point.to_string();
+    }
+    // zone_key begins with '/'; avoid a double slash.
+    format!("{}{}", mount_point, zone_key)
 }
 
 pub(crate) fn proto_to_kernel(bytes: &[u8]) -> Result<KernelFileMetadata, MetaStoreError> {
@@ -441,6 +447,23 @@ mod tests {
     use super::*;
     use crate::raft::ZoneRaftRegistry;
     use tempfile::TempDir;
+
+    #[test]
+    fn zone_key_to_global_maps_by_mount_point() {
+        // Root (or empty) mount ⇒ identity.
+        assert_eq!(
+            zone_key_to_global("/", "/win-ai/chat-with-me"),
+            "/win-ai/chat-with-me"
+        );
+        assert_eq!(zone_key_to_global("", "/x"), "/x");
+        // A mounted zone prepends its mount point (no double slash).
+        assert_eq!(
+            zone_key_to_global("/agents", "/win-ai/chat-with-me"),
+            "/agents/win-ai/chat-with-me"
+        );
+        // The zone's own root key maps to the mount point itself.
+        assert_eq!(zone_key_to_global("/agents", "/"), "/agents");
+    }
 
     /// Proto encode↔decode preserves every field the kernel struct
     /// tracks. ``target_zone_id`` deliberately not asserted here —
