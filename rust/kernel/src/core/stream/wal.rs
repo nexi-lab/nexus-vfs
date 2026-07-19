@@ -285,9 +285,24 @@ impl WalStreamCore {
 
 impl StreamBackend for WalStreamCore {
     fn push(&self, data: &[u8]) -> Result<usize, StreamError> {
-        self.write_nowait(data)
-            .map(|seq| seq as usize)
-            .map_err(|_| StreamError::Closed("wal stream closed"))
+        // Durable + fail-loud. A wal DT_STREAM exists to REPLICATE, so a push
+        // waits for the raft commit and surfaces failure (no reachable leader /
+        // propose rejected) instead of buffering and dropping. A2A messaging —
+        // and any "a sibling replica must see this" contract — needs it: the
+        // async `write_nowait` let a leaderless write look like success while
+        // the entry never left this node, i.e. the mount lying about a durable
+        // write. Same synchronous contract the DT_PIPE (WalPipeCore) backend
+        // uses; the syscall handler already blocks on this same propose for
+        // file writes, so it is no new blocking surface. `write_nowait` remains
+        // for a genuinely fire-and-forget node-local stream.
+        self.write_sync(data).map(|seq| seq as usize).map_err(|e| {
+            tracing::warn!(
+                stream_id = %self.stream_id,
+                error = %e,
+                "wal DT_STREAM push failed to replicate — write rejected (fail-loud)"
+            );
+            StreamError::Closed("wal DT_STREAM push failed to replicate (no reachable leader?)")
+        })
     }
 
     fn read_at(&self, offset: usize) -> Result<(Vec<u8>, usize), StreamError> {

@@ -4195,8 +4195,8 @@ mod tests {
             // End-to-end: sys_setattr DT_STREAM io_profile="wal" goes
             // through the wal branch of `setattr_stream`, composes a
             // `WalStreamCore` over the test coordinator's metastore,
-            // and registers the stream so subsequent sys_write +
-            // sys_read round-trip bytes through it.
+            // and registers the wal stream backend (the write→read
+            // round-trip needs a distributed store — see below).
             //
             // This is the path service-tier callers (
             // managed_agent::proc_entry::register_proc_entry,
@@ -4242,26 +4242,32 @@ mod tests {
                 .expect("sys_stat after sys_setattr DT_STREAM");
             assert_eq!(stat.entry_type, DT_STREAM, "entry must be DT_STREAM");
 
-            // Round-trip a write + read — the stream_manager has the
-            // wal backend registered and the bytes flow through it.
+            // The waterfall installed the WAL backend, not the node-local
+            // memory terminal — proven WITHOUT a real cluster. A wal write is
+            // durable + fail-loud (it waits for the raft commit), and this
+            // test's store is a node-local `LocalMetaStore` that cannot hold
+            // stream entries (`append_stream_entry` is distributed-only by
+            // design), so the write MUST error. A memory backend would have
+            // accepted it silently — so this one assertion proves both
+            // wal-not-memory AND the honest-mount contract (no silent accept
+            // of a write that cannot replicate). The real replicated
+            // write→read round-trip lives where a distributed store exists:
+            // `raft/tests/test_stream_wakeup_replication.rs` and the 2-daemon
+            // `scripts/e2e_a2a_wakeup.py`.
             let ctx = OperationContext::new("test", "root", true, None, true);
-            kernel
-                .sys_write_with_link_depth(path, &ctx, b"federation hello", 0, 1)
-                .expect("sys_write to wal stream");
-            let read = kernel
-                .sys_read_single(path, &ctx, 1, /* timeout_ms */ 0, 0)
-                .expect("sys_read from wal stream");
-            let bytes = read
-                .data
-                .expect("wal stream returns the just-written bytes");
-            assert_eq!(bytes.as_slice(), b"federation hello");
+            let write = kernel.sys_write_with_link_depth(path, &ctx, b"federation hello", 0, 1);
+            assert!(
+                write.is_err(),
+                "a wal DT_STREAM write over a non-distributed store must fail loud, not \
+                 silently accept (would mean a memory fallthrough or fire-and-forget bug)"
+            );
         }
 
         #[test]
         fn sys_setattr_wal_stream_idempotent_reopen() {
             // Repeat sys_setattr on the same path is a no-op reopen
-            // — the wal stream stays registered + bytes from earlier
-            // writes survive the second setattr call. Mirrors the
+            // — the wal backend stays installed (re-materialized via the
+            // io_profile waterfall, not a memory fallthrough). Mirrors the
             // production restart flow where register_proc_entry runs
             // again against an existing pid (our spawn_task tests
             // exercise this on the memory branch; this test covers
@@ -4297,16 +4303,17 @@ mod tests {
                     )
                     .expect("idempotent wal sys_setattr");
             }
-            kernel
-                .sys_write_with_link_depth(path, &ctx, b"survives reopen", 0, 1)
-                .expect("write to reopened wal stream");
-            let read = kernel
-                .sys_read_single(path, &ctx, 1, 0, 0)
-                .expect("read after idempotent reopen");
-            assert_eq!(
-                read.data.unwrap().as_slice(),
-                b"survives reopen",
-                "wal stream contents must survive a no-op reopen",
+            // The reopen re-installed the WAL backend via the io_profile
+            // waterfall — NOT the memory-only `create_stream` the pre-fix
+            // reopen branch called. Prove it the same way: a write over this
+            // node-local test store must fail loud (the wal backend cannot
+            // replicate here); a memory backend would have accepted it. So
+            // this guards the reopen-materializes-wal fix directly.
+            let write = kernel.sys_write_with_link_depth(path, &ctx, b"survives reopen", 0, 1);
+            assert!(
+                write.is_err(),
+                "after a no-op reopen the WAL backend must still be installed (write fails \
+                 loud); a passing write would mean the reopen fell through to a memory backend"
             );
         }
     }
