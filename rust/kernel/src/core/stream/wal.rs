@@ -30,6 +30,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use crate::abc::meta_store::MetaStore;
+use crate::hal::distributed_coordinator::Consistency;
 use crate::stream::{StreamBackend, StreamError};
 
 /// Side-table key prefix for wal-stream entries. Every entry is keyed
@@ -67,6 +68,10 @@ pub struct WalStreamCore {
     /// `read_at` to guarantee read-your-writes without waiting for the
     /// metastore propose / flush.
     inflight: Arc<RwLock<BTreeMap<u64, Vec<u8>>>>,
+    /// Consistency plane every append on this stream is proposed under.
+    /// `Sc` (default) → raft consensus; `Ec` → local-apply + async
+    /// replicate (the AP plane an A2A mailbox stream opens with).
+    consistency: Consistency,
 }
 
 impl WalStreamCore {
@@ -86,6 +91,18 @@ impl WalStreamCore {
     /// the raft serialization point (apply-time) rather than client-side; it
     /// is a tracked follow-up, out of scope for the 2-node A2A milestone.
     pub fn new(store: Arc<dyn MetaStore>, stream_id: String) -> Self {
+        Self::new_with_consistency(store, stream_id, Consistency::Sc)
+    }
+
+    /// Open a wal-stream that proposes every append under `consistency`.
+    /// `Sc` (via [`Self::new`]) preserves historical behavior; `Ec` is the
+    /// AP plane an A2A mailbox stream opens with so writes survive a
+    /// leaderless quorum and replicate eventually.
+    pub fn new_with_consistency(
+        store: Arc<dyn MetaStore>,
+        stream_id: String,
+        consistency: Consistency,
+    ) -> Self {
         let prefix = format!("{WAL_STREAM_KEY_PREFIX}{stream_id}/");
         let (flush_tx, flush_rx) = mpsc::sync_channel::<(u64, Vec<u8>)>(Self::FLUSH_CHANNEL_CAP);
         let inflight: Arc<RwLock<BTreeMap<u64, Vec<u8>>>> = Arc::new(RwLock::new(BTreeMap::new()));
@@ -100,7 +117,7 @@ impl WalStreamCore {
             .spawn(move || {
                 while let Ok((seq, data)) = flush_rx.recv() {
                     let key = format!("{prefix_bg}{seq}");
-                    match store_bg.append_stream_entry(&key, &data) {
+                    match store_bg.append_stream_entry(&key, &data, consistency) {
                         Ok(()) => {
                             inflight_bg.write().remove(&seq);
                         }
@@ -133,6 +150,7 @@ impl WalStreamCore {
             closed: AtomicBool::new(false),
             flush_tx,
             inflight,
+            consistency,
         }
     }
 
@@ -159,7 +177,10 @@ impl WalStreamCore {
                 // Channel saturated (rare): flush synchronously to
                 // avoid unbounded inflight growth.
                 let key = self.key(seq);
-                match self.store.append_stream_entry(&key, &data_vec) {
+                match self
+                    .store
+                    .append_stream_entry(&key, &data_vec, self.consistency)
+                {
                     Ok(()) => {
                         self.inflight.write().remove(&seq);
                     }
@@ -202,7 +223,9 @@ impl WalStreamCore {
         // between here and the store commit still finds the data.
         self.inflight.write().insert(seq, data_vec.clone());
         let key = self.key(seq);
-        let result = self.store.append_stream_entry(&key, &data_vec);
+        let result = self
+            .store
+            .append_stream_entry(&key, &data_vec, self.consistency);
         // Remove from inflight only on success; on failure the entry
         // stays in inflight so reads still return data even though
         // the metastore did not durably accept it (matches the
@@ -401,7 +424,12 @@ mod tests {
         fn exists(&self, _path: &str) -> Result<bool, MetaStoreError> {
             Ok(false)
         }
-        fn append_stream_entry(&self, key: &str, data: &[u8]) -> Result<(), MetaStoreError> {
+        fn append_stream_entry(
+            &self,
+            key: &str,
+            data: &[u8],
+            _consistency: Consistency,
+        ) -> Result<(), MetaStoreError> {
             self.inner
                 .lock()
                 .unwrap()

@@ -86,20 +86,27 @@ pub struct ShareInfo {
     pub copied_entries: u64,
 }
 
-/// Consistency mode for a replicated write — a distributed-coordination
-/// concept: it selects HOW a write is coordinated across nodes.
+/// Consistency mode for a replicated write — a generic CAP-level contract at
+/// the distributed-coordination boundary, deliberately independent of any
+/// consensus mechanism. It names WHAT guarantee the caller wants, not HOW a
+/// particular backend achieves it.
 ///
-/// `Sc` routes through raft consensus (CP — waits for quorum commit); `Ec`
-/// applies locally then replicates asynchronously with last-write-wins (AP —
-/// available under partition, eventually convergent). The kernel names the
-/// mode here (the DC boundary where local-vs-distributed matters); the raft
-/// tier implements the behavior. This is the single SSOT for the mode — the
-/// raft crate re-exports it rather than defining its own.
+/// - `Sc` (strong) — linearizable: the write is not acknowledged until it is
+///   durably accepted by a quorum. CP under CAP — becomes unavailable when a
+///   quorum cannot be formed.
+/// - `Ec` (eventual) — the write is accepted locally and propagated
+///   asynchronously, converging on every replica over time. AP under CAP —
+///   remains available under partition.
+///
+/// How each mode is realized (consensus round, gossip, async fan-out, …) is
+/// entirely the DC implementor's concern; the kernel only names the contract.
+/// Single SSOT — downstream tiers (e.g. the raft crate) re-export this rather
+/// than defining their own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Consistency {
-    /// Strong consistency — wait for raft commit.
+    /// Strong (linearizable) — acknowledged only after quorum-durable accept.
     Sc,
-    /// Eventual consistency — local write + async replicate (LWW).
+    /// Eventual — accepted locally, replicated asynchronously, converges.
     Ec,
 }
 

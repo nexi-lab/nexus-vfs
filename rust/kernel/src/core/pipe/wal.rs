@@ -133,6 +133,7 @@ impl PipeBackend for WalPipeCore {
 mod tests {
     use super::*;
     use crate::abc::meta_store::{FileMetadata, MetaStoreError};
+    use crate::hal::distributed_coordinator::Consistency;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
 
@@ -156,7 +157,12 @@ mod tests {
         fn exists(&self, _path: &str) -> Result<bool, MetaStoreError> {
             Ok(false)
         }
-        fn append_stream_entry(&self, key: &str, data: &[u8]) -> Result<(), MetaStoreError> {
+        fn append_stream_entry(
+            &self,
+            key: &str,
+            data: &[u8],
+            _consistency: Consistency,
+        ) -> Result<(), MetaStoreError> {
             self.inner
                 .lock()
                 .unwrap()

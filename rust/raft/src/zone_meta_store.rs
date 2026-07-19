@@ -8,43 +8,30 @@
 //!
 //! ## Write consistency
 //!
-//! ``put`` / ``delete`` / CAS / WAL stream appends all route through
-//! ``ZoneConsensus::propose`` (SC — Raft consensus, majority ACK).
-//! This is the standard kernel hot path.
+//! ``put`` / ``delete`` / CAS default to ``ZoneConsensus::propose`` (SC —
+//! Raft consensus, majority ACK). This is the standard kernel hot path and
+//! the safe default: it is linearizable and needs no conflict resolution.
 //!
-//! ### Why not EC by default
+//! ``append_stream_entry`` is consistency-aware — it takes a ``Consistency``
+//! and routes ``Ec`` through ``propose_ec_local`` (WAL-first local apply +
+//! async drain-to-peers, LWW convergence). This is the AP plane the A2A
+//! mailbox rides: a mailbox write must succeed even when no raft quorum is
+//! reachable (every node is an equal peer; there is no guaranteed-up leader),
+//! which SC cannot offer. ``zone_handle.rs::set_metadata`` likewise takes a
+//! per-call ``Consistency`` for metadata writes.
 //!
-//! The raft layer exposes a per-call ``propose_ec_local`` (WAL-first +
-//! sync local apply + async drain-to-peers) on every ``ZoneConsensus``,
-//! and the operator-facing ``zone_handle.rs::set_metadata`` already
-//! takes a ``Consistency: Sc | Ec`` parameter.  Routing
-//! ``ZoneMetaStore::put`` through ``propose_ec_local`` was attempted in
-//! nexi-lab/nexus-vfs PR #61 to remove the "Learner cannot write" gate
-//! that blocks the cc-tasks-share Mac↔Win symmetric peer workflow.
+//! ### EC-drain substrate is hardened (do not re-disable)
 //!
-//! The activation broke ``Federation E2E (Docker)`` on the companion
-//! nexus PR (#4411): the EC drain → ``ReplicateEntries`` RPC →
-//! ``apply_ec_from_peer`` path has correctness / liveness issues that
-//! only surface in a 1-voter + 1-learner topology after the first
-//! larger-payload write — subsequent founder→learner sys_setattr
-//! writes stop reaching the learner's local state machine within the
-//! 60 s test budget (per-peer exponential backoff in
-//! ``transport_loop.rs::replicate_ec_entries`` accumulates; tests
-//! that worked pre-#61 — joiner-side-reads of founder writes —
-//! timeout reliably).  Hardening the EC drain is a substrate fix
-//! out of scope here.
-//!
-//! Until then, SC is the safe default for the kernel hot path.  The
-//! ``--as voter`` operator surface (PR #62 finished the CLI rename)
-//! is the recommended path for the cc-tasks-share-style symmetric
-//! peer workflow: both peers join as Voters, both can propose SC
-//! writes, quorum loss is the only failure mode (and the operator
-//! is aware of it).
-//!
-//! Callers that need the EC path explicitly still reach it through
-//! ``zone_handle.rs::set_metadata(..., Consistency::Ec)``.  The
-//! kernel-hot-path activation is tracked separately (see
-//! nexi-lab/nexus-vfs issue for the EC replicate hardening).
+//! An earlier attempt to route ``put`` through ``propose_ec_local`` (PR #61)
+//! broke ``Federation E2E (Docker)`` because the EC drain had real
+//! correctness/liveness defects (compaction deleting entries a lagging peer
+//! still needed; no snapshot catch-up; head-of-line stalls; a watermark that
+//! over-reported durability). Those are now FIXED in the EC-drain hardening
+//! (nexi-lab/nexus-vfs #161 — compaction floor, anti-entropy `SnapshotEcState`,
+//! skip-loud bad entries, and an honest `is_committed`), so ``Ec`` is a sound
+//! choice for the workloads that need it. ``put``/``delete`` stay SC by
+//! default only because the file-metadata hot path wants linearizable
+//! single-writer semantics, not because the AP plane is unsafe.
 //!
 //! ``ZoneMetaStore`` owns the full↔zone-relative path translation.
 //! The trait boundary always sees full global paths; the state
@@ -70,6 +57,7 @@ use crate::transport::proto::nexus::core::FileMetadata as ProtoFileMetadata;
 use contracts::VFS_ROOT;
 use prost::Message;
 
+use kernel::hal::distributed_coordinator::Consistency;
 use kernel::meta_store::{FileMetadata as KernelFileMetadata, MetaStore, MetaStoreError};
 
 /// ``kernel::MetaStore`` impl backed by a single ``ZoneConsensus``.
@@ -410,7 +398,12 @@ impl MetaStore for ZoneMetaStore {
         Some(self.coherence_id)
     }
 
-    fn append_stream_entry(&self, key: &str, data: &[u8]) -> Result<(), MetaStoreError> {
+    fn append_stream_entry(
+        &self,
+        key: &str,
+        data: &[u8],
+        consistency: Consistency,
+    ) -> Result<(), MetaStoreError> {
         // Stream entries skip the zone-key translation `put` does for
         // FileMetadata — `key` is the full WAL identity (`__wal_stream__/…`
         // or `__wal_pipe__/…`) and the side-table is zone-scoped at the
@@ -420,15 +413,34 @@ impl MetaStore for ZoneMetaStore {
             key: key.to_string(),
             data: data.to_vec(),
         };
-        let result = bridge_block_on(&self.runtime, self.node.propose(cmd)).map_err(|e| {
-            MetaStoreError::IOError(format!("ZoneMetaStore.append_stream_entry({key}): {e}"))
-        })?;
-        match result {
-            crate::prelude::CommandResult::Success => Ok(()),
-            crate::prelude::CommandResult::Error(e) => Err(MetaStoreError::IOError(format!(
-                "ZoneMetaStore.append_stream_entry({key}) rejected: {e}"
-            ))),
-            _ => Ok(()),
+        match consistency {
+            Consistency::Sc => {
+                let result =
+                    bridge_block_on(&self.runtime, self.node.propose(cmd)).map_err(|e| {
+                        MetaStoreError::IOError(format!(
+                            "ZoneMetaStore.append_stream_entry({key}): {e}"
+                        ))
+                    })?;
+                match result {
+                    crate::prelude::CommandResult::Success => Ok(()),
+                    crate::prelude::CommandResult::Error(e) => Err(MetaStoreError::IOError(
+                        format!("ZoneMetaStore.append_stream_entry({key}) rejected: {e}"),
+                    )),
+                    _ => Ok(()),
+                }
+            }
+            Consistency::Ec => {
+                // AP plane: local-apply + async replicate. `propose_ec_local`
+                // returns the WAL seq token; a successful local apply IS success
+                // here — cross-node delivery + LWW convergence happen in the
+                // background EC drain, not synchronously.
+                bridge_block_on(&self.runtime, self.node.propose_ec_local(cmd)).map_err(|e| {
+                    MetaStoreError::IOError(format!(
+                        "ZoneMetaStore.append_stream_entry({key}) [ec]: {e}"
+                    ))
+                })?;
+                Ok(())
+            }
         }
     }
 
