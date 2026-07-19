@@ -2,7 +2,7 @@
 name = "a2a"
 version = "0.1.0"
 edition = "2021"
-description = "A2A messaging substrate — mailbox `from`-stamp hook + cross-machine stream-wakeup arming"
+description = "A2A messaging substrate — the mailbox `from`-stamp hook (unforgeable sender)"
 authors = ["Nexus Team"]
 publish = false
 
@@ -11,35 +11,11 @@ name = "a2a"
 path = "src/lib.rs"
 
 [dependencies]
-# The stamp hook is a `NativeInterceptHook`; the policy parses the
-# envelope JSON. `contracts` supplies `is_system_path`. These three are
-# the whole footprint of the messaging substrate's core — see
-# docs/KERNEL-ARCHITECTURE.md §6.1.
+# The whole footprint of the messaging substrate. The stamp hook is a
+# `NativeInterceptHook`; the policy parses the envelope JSON;
+# `contracts` supplies `is_system_path`. No raft: the cross-machine
+# stream-wakeup is a generic raft primitive armed by the composition
+# root, not here (see docs/KERNEL-ARCHITECTURE.md §6.1 + lib.rs docs).
 kernel = { workspace = true }
 contracts = { workspace = true }
 serde_json = { workspace = true }
-
-# `raft` is pulled in ONLY behind the `install` feature. `install_a2a`
-# arms the cross-machine stream-wakeup observer, which names raft's
-# `ZoneConsensus` / `AppendStreamEntry`. Consumers that need only the
-# stamp hook (nexus `services`, matrix frontend fixtures) leave the
-# feature off and never link raft — preserving the `services ⊥ raft`
-# invariant (§6.1): those crates reach raft through `kernel.sys_*`.
-raft = { workspace = true, optional = true }
-
-[features]
-default = []
-# Boot-wiring surface: `install_a2a` + the raft-backed stream-wakeup
-# observer. Turned on by the profile binaries (nexusd-cluster) that arm
-# the substrate at boot.
-install = ["dep:raft"]
-
-[dev-dependencies]
-# The `install_a2a` integration test stands up a real 2-node cluster
-# with a real `kernel::Kernel` on the joiner (same shape as the §A
-# stream-wakeup test in raft/tests). These are test-only, so they never
-# reach a consumer of the crate.
-raft = { workspace = true }
-tempfile = "3"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
-rand = "0.10"

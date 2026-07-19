@@ -1528,30 +1528,56 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
         }
     }
 
-    // ── A2A messaging substrate (§F platform half) ───────────────────
-    // Arm the a2a capability on the root zone: register the mailbox
-    // `from`-stamp hook (rides the "a2a" hook-only service — the first
-    // boot-enlisted service) and the cross-machine stream-wakeup
-    // observer (a replicated `AppendStreamEntry` wakes a `sys_watch`
-    // parked on this replica). Behaviour-preserving under NoAuth: with
-    // an empty `agent_id` the stamp hook returns Pass, so no envelope is
-    // rewritten. Bound to root because the root `/` mount already routes
-    // `/agents/...` and its stream inodes live in the root-zone
-    // replicated metastore. See docs/KERNEL-ARCHITECTURE.md §6.1.
+    // ── A2A messaging substrate (§F) ─────────────────────────────────
+    // (1) Arm the mailbox `from`-stamp hook ONCE (the "a2a" hook-only
+    // service — first boot-enlisted service). Behaviour-preserving under
+    // NoAuth: empty `agent_id` ⇒ the policy returns None ⇒ no rewrite.
+    a2a::install_a2a_stamp_hook(&kernel).map_err(|e| anyhow::anyhow!("arm a2a stamp hook: {e}"))?;
+
+    // (2) Arm the cross-machine stream-wakeup observer PER ZONE: a
+    // replicated `AppendStreamEntry` (a chat-with-me DT_STREAM write on a
+    // peer) wakes a `sys_watch` parked on this replica. The observer is a
+    // generic raft primitive (`nexus_raft::stream_wakeup`), armed here —
+    // NOT in a2a — because it needs a `Weak<Kernel>` (the `Arc` lives
+    // here) and each zone's mount point to map the zone-relative stream
+    // key to the caller-facing path (`zone_key_to_global`, the same SSOT
+    // the ZoneMetaStore read path uses). Root covers node-local
+    // `/agents`; every federation mount (`NEXUS_FEDERATION_MOUNTS=
+    // /agents=<zone>`) is what makes A2A cross-machine, because that
+    // zone's raft replicates the mailbox across members. These zones were
+    // created/joined by the BootAction block above, so they are loaded
+    // now; a zone joined at runtime after boot is a documented follow-up.
     {
-        let root_zone = zm.get_zone(contracts::ROOT_ZONE_ID).ok_or_else(|| {
-            anyhow::anyhow!(
-                "root zone is not open — a2a has no consensus to arm the \
-                 stream-wakeup observer on. The kernel owns root \
-                 unconditionally (see BootAction::needs_root_zone)."
-            )
-        })?;
-        a2a::install_a2a(&kernel, &root_zone.consensus_node())
-            .map_err(|e| anyhow::anyhow!("arm a2a messaging substrate: {e}"))?;
-        tracing::info!(
-            "a2a messaging substrate armed — mailbox from-stamp hook + \
-             cross-machine stream-wakeup observer on the root zone"
-        );
+        let mut wakeup_zones: Vec<(String, String)> = vec![(
+            contracts::VFS_ROOT.to_string(),
+            contracts::ROOT_ZONE_ID.to_string(),
+        )];
+        for (mount_point, zone_id) in &fed.mounts.mounts {
+            wakeup_zones.push((mount_point.clone(), zone_id.clone()));
+        }
+        for (mount_point, zone_id) in wakeup_zones {
+            match zm.get_zone(&zone_id) {
+                Some(zone) => {
+                    let mp = mount_point.clone();
+                    nexus_raft::stream_wakeup::install_stream_wakeup_observer(
+                        &zone.consensus_node(),
+                        Arc::downgrade(&kernel),
+                        move |key: &str| nexus_raft::zone_meta_store::zone_key_to_global(&mp, key),
+                    );
+                    tracing::info!(
+                        zone_id = %zone_id, mount_point = %mount_point,
+                        "a2a stream-wakeup observer armed"
+                    );
+                }
+                None => {
+                    tracing::warn!(
+                        zone_id = %zone_id, mount_point = %mount_point,
+                        "a2a stream-wakeup: zone not loaded at arming time; skipped \
+                         (runtime-join arming is a follow-up)"
+                    );
+                }
+            }
+        }
     }
 
     // Post-transport substrate observability — dual of the peer-blob
