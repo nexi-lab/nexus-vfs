@@ -203,12 +203,28 @@ impl ReplicationLog {
         Ok(())
     }
 
-    /// Check if a write token has been committed (replicated to majority).
+    /// Check whether an EC write token has reached the durable watermark.
     ///
     /// Returns:
-    /// - `Some("committed")` — write has been replicated
-    /// - `Some("pending")` — write is local-only, awaiting replication
-    /// - `None` — invalid token (0, or >= next_seq)
+    /// - `Some("committed")` — token `<= replicated_watermark`
+    /// - `Some("pending")` — written locally, watermark not yet advanced past it
+    /// - `None` — invalid token (0, or `>= next_seq`)
+    ///
+    /// ## What "committed" means for EC (do not over-read it)
+    ///
+    /// The watermark tracks the **voter** quorum only. For `total_voters >= 2`
+    /// it is the majority-acked seq (`compute_ec_watermark`); for a single
+    /// voter the voter *is* the majority, so the drain advances it as soon as
+    /// the entry is locally durable in the WAL — which survives a voter crash
+    /// (redb-persistent WAL, re-applied on restart). So "committed" is an
+    /// honest *durability* signal for the voter quorum.
+    ///
+    /// It says NOTHING about **learners**. Learners are non-voting replicas;
+    /// a learner may lag arbitrarily or be awaiting an anti-entropy snapshot,
+    /// and "committed" will still be reported. Callers wanting "this specific
+    /// replica has it" must query that replica, not this watermark. EC is
+    /// eventually-consistent: cross-replica convergence is a separate, weaker
+    /// guarantee than voter-quorum durability.
     pub fn is_committed(&self, token: u64) -> Option<&str> {
         let max = self.next_seq.load(Ordering::Acquire);
         if token == 0 || token >= max {

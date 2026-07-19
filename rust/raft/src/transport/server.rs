@@ -18,7 +18,8 @@ use super::proto::nexus::raft::{
     LockResult, NodeInfo as ProtoNodeInfo, ProposeRequest, ProposeResponse, QueryRequest,
     QueryResponse, RaftCommand, RaftQueryResponse, RaftResponse, ReadBlobRequest, ReadBlobResponse,
     RemoveVoterRequest, RemoveVoterResponse, ReplicateEntriesRequest, ReplicateEntriesResponse,
-    SearchCapabilities, StepMessageRequest, StepMessageResponse,
+    SearchCapabilities, SnapshotEcStateRequest, SnapshotEcStateResponse, StepMessageRequest,
+    StepMessageResponse,
 };
 use super::{NodeAddress, Result, SharedPeerMap, TransportError};
 use crate::blob_fetcher::BlobFetcherSlot;
@@ -576,32 +577,35 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
             let command: Command = match bincode::deserialize(&entry.command) {
                 Ok(cmd) => cmd,
                 Err(e) => {
-                    // A bincode deserialize failure on an EC entry
-                    // means the wire format itself is wrong — the
-                    // sender shipped bytes this version of the
-                    // server cannot decode (mismatched build /
-                    // schema-drift bug).  Returning success=true and
-                    // skipping the entry let the sender treat the
-                    // gap as "applied" (because `applied_up_to`
-                    // would still cover later entries that DID
-                    // deserialise) and silently desync the
-                    // state machines.  Treat it as a hard failure
-                    // and surface it: stop applying further entries
-                    // in this batch, return `success=false` with the
-                    // last definitely-applied seq, and let the
-                    // sender's per-peer backoff rate-limit the
-                    // retry against the version-skew condition.
+                    // A bincode deserialize failure means the sender shipped
+                    // bytes this build cannot decode (version skew / corruption).
+                    // The entry is UNAPPLIABLE here — no build-local action can
+                    // ever make it decode — so the only choices are (a) halt the
+                    // whole peer's EC stream until the mismatch is fixed, or
+                    // (b) skip THIS entry and keep replicating the rest.
+                    //
+                    // We skip-LOUD (advance past it, warn), because for the EC
+                    // (AP) data plane availability wins: one undecodable entry
+                    // must not head-of-line-block a peer's entire mailbox
+                    // stream, and stalling would not "preserve" the entry — it
+                    // is unappliable regardless.  This is NOT silent: every drop
+                    // is warned with its seq, so a systematic skew shows up as a
+                    // flood of warns.  The SYSTEMATIC fix (make undecodable
+                    // entries impossible — a version-gate at JoinZone rejecting
+                    // mismatched builds, or a forward-compatible command
+                    // encoding) is the tracked follow-up; skip-loud is the
+                    // agreed interim.  Apply failures (below) stay hard-fail —
+                    // those may be transient and are worth a backed-off retry.
                     tracing::warn!(
                         seq = entry.seq,
                         sender = req.sender_node_id,
-                        "EC entry deserialize failed — wire-format mismatch: {}",
-                        e
+                        error = %e,
+                        "EC entry undecodable (version skew / corruption) — \
+                         QUARANTINED (skipped) so the peer's stream keeps flowing; \
+                         a flood here means a build mismatch to fix"
                     );
-                    return Ok(Response::new(ReplicateEntriesResponse {
-                        success: false,
-                        error: Some(format!("deserialize failed at seq {}: {}", entry.seq, e)),
-                        applied_up_to: max_applied,
-                    }));
+                    max_applied = max_applied.max(entry.seq);
+                    continue;
                 }
             };
 
@@ -631,6 +635,56 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
             success: true,
             error: None,
             applied_up_to: max_applied,
+        }))
+    }
+
+    /// Apply an EC state snapshot from a peer (anti-entropy catch-up).
+    ///
+    /// The sender re-materialized its CURRENT EC state as `SetMetadata`
+    /// commands because this receiver fell behind the compacted WAL region.
+    /// Apply each LWW-idempotently (same path as incremental replication) and
+    /// echo `covering_seq` so the sender advances this peer's `acked_seq` past
+    /// the compacted region in one step, then resumes incremental delivery.
+    async fn snapshot_ec_state(
+        &self,
+        request: Request<SnapshotEcStateRequest>,
+    ) -> std::result::Result<Response<SnapshotEcStateResponse>, Status> {
+        let req = request.into_inner();
+        let node = get_zone_node(&self.registry, &req.zone_id)?;
+
+        for entry in &req.entries {
+            let command: Command = match bincode::deserialize(&entry.command) {
+                Ok(cmd) => cmd,
+                Err(e) => {
+                    // Same skip-loud posture as ReplicateEntries: an undecodable
+                    // snapshot entry is unappliable here, so skip it (loud) and
+                    // keep applying the rest rather than fail the whole catch-up.
+                    tracing::warn!(
+                        seq = entry.seq,
+                        sender = req.sender_node_id,
+                        error = %e,
+                        "EC snapshot entry undecodable — QUARANTINED (skipped)"
+                    );
+                    continue;
+                }
+            };
+            if let Err(e) = node.apply_ec_from_peer(command, entry.timestamp).await {
+                // A snapshot apply failure (not a decode/skew issue) is real:
+                // fail the transfer so the sender retries the whole snapshot
+                // rather than leaving the peer half-caught-up.
+                tracing::warn!(seq = entry.seq, "EC snapshot apply failed: {}", e);
+                return Ok(Response::new(SnapshotEcStateResponse {
+                    success: false,
+                    error: Some(format!("snapshot apply failed at seq {}: {}", entry.seq, e)),
+                    acked_up_to: 0,
+                }));
+            }
+        }
+
+        Ok(Response::new(SnapshotEcStateResponse {
+            success: true,
+            error: None,
+            acked_up_to: req.covering_seq,
         }))
     }
 }
@@ -1894,6 +1948,15 @@ impl ZoneTransportService for WitnessServiceImpl {
     ) -> std::result::Result<Response<ReplicateEntriesResponse>, Status> {
         Err(Status::unimplemented(
             "Witness nodes do not support EC replication",
+        ))
+    }
+
+    async fn snapshot_ec_state(
+        &self,
+        _request: Request<SnapshotEcStateRequest>,
+    ) -> std::result::Result<Response<SnapshotEcStateResponse>, Status> {
+        Err(Status::unimplemented(
+            "Witness nodes do not support EC snapshots",
         ))
     }
 }

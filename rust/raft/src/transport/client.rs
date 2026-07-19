@@ -9,7 +9,7 @@ use super::proto::nexus::raft::{
     DeleteZoneRequest, DiscoverZonesRequest, EcReplicationEntry, ExtendLock, GetClusterInfoRequest,
     GetLockInfo, GetMetadata, JoinClusterRequest, JoinZoneRequest, ListMetadata, ProposeRequest,
     PutMetadata, QueryRequest, RaftCommand, RaftQuery, ReleaseLock, RemoveVoterRequest,
-    ReplicateEntriesRequest, StepMessageRequest,
+    ReplicateEntriesRequest, SnapshotEcStateRequest, StepMessageRequest,
 };
 use super::{NodeAddress, Result, TransportError};
 use std::collections::HashMap;
@@ -369,6 +369,38 @@ impl RaftClient {
         }
 
         Ok(resp.applied_up_to)
+    }
+
+    /// Send an EC state snapshot to this peer (anti-entropy catch-up).
+    ///
+    /// `entries` are the sender's CURRENT state re-materialized as SetMetadata
+    /// commands; `covering_seq` is the seq the peer is caught up to once the
+    /// snapshot is applied. Returns `acked_up_to` (= `covering_seq`) on success.
+    pub async fn snapshot_ec_state(
+        &mut self,
+        zone_id: String,
+        entries: Vec<EcReplicationEntry>,
+        covering_seq: u64,
+        sender_node_id: u64,
+    ) -> Result<u64> {
+        let request = tonic::Request::new(SnapshotEcStateRequest {
+            zone_id,
+            entries,
+            covering_seq,
+            sender_node_id,
+        });
+
+        let response = self.inner.snapshot_ec_state(request).await?;
+        let resp = response.into_inner();
+
+        if !resp.success {
+            return Err(TransportError::Rpc(
+                resp.error
+                    .unwrap_or_else(|| "snapshot_ec_state failed".to_string()),
+            ));
+        }
+
+        Ok(resp.acked_up_to)
     }
 }
 
