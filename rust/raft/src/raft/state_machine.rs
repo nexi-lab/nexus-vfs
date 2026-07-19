@@ -1526,6 +1526,38 @@ impl StateMachine for FullStateMachine {
         }
     }
 
+    /// Apply a peer's EC (eventually-consistent) write with Last-Write-Wins
+    /// conflict resolution, keyed per metadata key.
+    ///
+    /// ## Correctness contract — READ BEFORE RELYING ON THIS FOR CONFLICTS
+    ///
+    /// This LWW is only well-defined when writes are **owner-partitioned**:
+    /// each key is written by exactly one node, so two nodes never write the
+    /// SAME key concurrently and the conflict branch below never actually has
+    /// to pick a winner. That invariant holds for every current EC caller —
+    /// A2A owns it structurally (each agent owns `/agents/{name}/…`; mailbox
+    /// entries are keyed per-sender), and cc-tasks-share is likewise
+    /// owner-partitioned. Under it, the merge is trivially convergent.
+    ///
+    /// It is NOT a correct general multi-writer LWW, by design (deferred as
+    /// YAGNI until a real concurrent-same-key workload exists):
+    /// * No deterministic tie-break. `ReplicationEntry.node_id` is documented
+    ///   as the tie-breaker but is not consulted here, and there is no stored
+    ///   per-key writer id to compare against — so two nodes writing the same
+    ///   key with equal timestamps can each accept the other's copy and
+    ///   DIVERGE with no convergence.
+    /// * Mixed clocks. `SetMetadata` compares the payload's `modified_at`
+    ///   (client wall-clock) while `DeleteMetadata` compares `entry_timestamp`
+    ///   (WAL append seconds) — cross-machine skew / precision can flip the
+    ///   winner between a set and a delete.
+    /// * Sentinel coercion. A missing/corrupt `modified_at` decodes to `""`
+    ///   (Set, always loses) or `0` (Delete, always wins), silently forcing an
+    ///   outcome.
+    ///
+    /// The correct fix is a stored per-key LWW version `(timestamp, node_id)`
+    /// compared apples-to-apples — a metadata-format change. Build it when a
+    /// workload writes the same key from two nodes concurrently; until then the
+    /// owner-partition invariant above is the load-bearing guarantee.
     #[cfg(feature = "grpc")]
     fn apply_ec_with_lww(
         &mut self,
