@@ -1539,14 +1539,16 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     // peer) wakes a `sys_watch` parked on this replica. The observer is a
     // generic raft primitive (`nexus_raft::stream_wakeup`), armed here —
     // NOT in a2a — because it needs a `Weak<Kernel>` (the `Arc` lives
-    // here) and each zone's mount point to map the zone-relative stream
-    // key to the caller-facing path (`zone_key_to_global`, the same SSOT
-    // the ZoneMetaStore read path uses). Root covers node-local
+    // here). It self-recovers the watched path from the wal-stream key, so
+    // no per-zone mapping is threaded in. Root covers node-local
     // `/agents`; every federation mount (`NEXUS_FEDERATION_MOUNTS=
-    // /agents=<zone>`) is what makes A2A cross-machine, because that
-    // zone's raft replicates the mailbox across members. These zones were
-    // created/joined by the BootAction block above, so they are loaded
-    // now; a zone joined at runtime after boot is a documented follow-up.
+    // /agents=<zone>`) is what makes A2A cross-machine, because that zone's
+    // raft replicates the mailbox across members — and the wal DT_STREAM
+    // for a mailbox under that mount now proposes to THAT zone (see
+    // `setattr_stream`'s path-zone resolution), so the append actually
+    // reaches peers. These zones were created/joined by the BootAction
+    // block above, so they are loaded now; a zone joined at runtime after
+    // boot is a documented follow-up.
     {
         let mut wakeup_zones: Vec<(String, String)> = vec![(
             contracts::VFS_ROOT.to_string(),
@@ -1558,11 +1560,11 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
         for (mount_point, zone_id) in wakeup_zones {
             match zm.get_zone(&zone_id) {
                 Some(zone) => {
-                    let mp = mount_point.clone();
+                    // The observer self-recovers the watched file path from
+                    // the wal-stream entry key — no per-zone mapping needed.
                     nexus_raft::stream_wakeup::install_stream_wakeup_observer(
                         &zone.consensus_node(),
                         Arc::downgrade(&kernel),
-                        move |key: &str| nexus_raft::zone_meta_store::zone_key_to_global(&mp, key),
                     );
                     tracing::info!(
                         zone_id = %zone_id, mount_point = %mount_point,

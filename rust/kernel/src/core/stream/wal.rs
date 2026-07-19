@@ -32,6 +32,26 @@ use parking_lot::RwLock;
 use crate::abc::meta_store::MetaStore;
 use crate::stream::{StreamBackend, StreamError};
 
+/// Side-table key prefix for wal-stream entries. Every entry is keyed
+/// `{WAL_STREAM_KEY_PREFIX}{stream_id}/{seq}` (see [`WalStreamCore::new`]).
+/// SSOT for the format so [`watch_path_from_wal_stream_key`] can reverse
+/// it — the two are round-trip-tested together.
+pub const WAL_STREAM_KEY_PREFIX: &str = "/__wal_stream__/";
+
+/// Recover the watched file path from a wal-stream entry key.
+///
+/// `stream_id` is the DT_STREAM's path (the path a `sys_watch` is parked
+/// on), so the A2A stream-wakeup observer reverses the key on each
+/// replicated `AppendStreamEntry` apply to wake the right watcher.
+/// Returns `None` for non-stream keys (e.g. `__wal_pipe__/…`) — A2A
+/// mailboxes are DT_STREAMs, so pipe appends do not wake file watchers.
+pub fn watch_path_from_wal_stream_key(key: &str) -> Option<&str> {
+    // key == "{WAL_STREAM_KEY_PREFIX}{stream_id}/{seq}"; recover stream_id.
+    let rest = key.strip_prefix(WAL_STREAM_KEY_PREFIX)?;
+    let (path, _seq) = rest.rsplit_once('/')?;
+    (!path.is_empty()).then_some(path)
+}
+
 /// WAL-backed stream core.  Persists every write through the
 /// distributed `MetaStore`'s stream-entries side table; serves
 /// `read_at` from an inflight cache for read-your-writes before the
@@ -55,7 +75,7 @@ impl WalStreamCore {
     const FLUSH_CHANNEL_CAP: usize = 4096;
 
     pub fn new(store: Arc<dyn MetaStore>, stream_id: String) -> Self {
-        let prefix = format!("/__wal_stream__/{stream_id}/");
+        let prefix = format!("{WAL_STREAM_KEY_PREFIX}{stream_id}/");
         let (flush_tx, flush_rx) = mpsc::sync_channel::<(u64, Vec<u8>)>(Self::FLUSH_CHANNEL_CAP);
         let inflight: Arc<RwLock<BTreeMap<u64, Vec<u8>>>> = Arc::new(RwLock::new(BTreeMap::new()));
 
@@ -304,6 +324,36 @@ mod tests {
     use crate::abc::meta_store::{FileMetadata, MetaStoreError};
     use std::collections::HashSet;
     use std::sync::Mutex;
+
+    #[test]
+    fn wal_stream_key_round_trips_to_watch_path() {
+        // Construct the key EXACTLY as WalStreamCore does (prefix + seq),
+        // then recover the stream_id — the path a sys_watch is parked on.
+        // This pins the observer's parse to the real key format so the two
+        // cannot drift (the bug that let a plain-path test key mask the
+        // real `__wal_stream__/…` shape).
+        for (stream_id, seq) in [
+            ("/agents/win-ai/chat-with-me", 0u64),
+            ("/proc/p1/chat-with-me", 42),
+        ] {
+            let key = format!("{WAL_STREAM_KEY_PREFIX}{stream_id}/{seq}");
+            assert_eq!(
+                watch_path_from_wal_stream_key(&key),
+                Some(stream_id),
+                "observer must recover the watched path from the real wal key"
+            );
+        }
+        // Pipe keys (DT_PIPE) are not A2A mailboxes → no wake.
+        assert_eq!(
+            watch_path_from_wal_stream_key("/__wal_pipe__//proc/p1/notify/0"),
+            None
+        );
+        // A bare path (no prefix/seq) is not a wal key.
+        assert_eq!(
+            watch_path_from_wal_stream_key("/agents/x/chat-with-me"),
+            None
+        );
+    }
 
     struct MemKvStore {
         inner: Mutex<BTreeMap<String, Vec<u8>>>,

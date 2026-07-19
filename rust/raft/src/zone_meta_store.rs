@@ -209,12 +209,13 @@ impl ZoneMetaStore {
 /// Map a zone-relative state-machine key to its full caller-facing path,
 /// given the zone's mount point — the inverse of `to_zone_key`.
 ///
-/// SSOT for the zone-key → global-path mapping: the `ZoneMetaStore` read
-/// path, its DCache-invalidation apply observer, and the composition
-/// root's A2A stream-wakeup arming all call this, so a zone mounted at
-/// `/agents` maps `/win-ai/chat-with-me` → `/agents/win-ai/chat-with-me`
-/// identically everywhere.
-pub fn zone_key_to_global(mount_point: &str, zone_key: &str) -> String {
+/// SSOT for the zone-key → global-path mapping used on the FileMetadata
+/// path: the `ZoneMetaStore` read path (`to_global_path`) and its
+/// DCache-invalidation apply observer both call this, so a zone mounted at
+/// `/agents` maps `/win-ai/notes.md` → `/agents/win-ai/notes.md`
+/// identically. (Stream-wakeup does NOT use this — wal-stream keys carry
+/// the full path already; see `stream_wakeup`.)
+fn zone_key_to_global(mount_point: &str, zone_key: &str) -> String {
     if mount_point == VFS_ROOT || mount_point.is_empty() {
         return zone_key.to_string();
     }
