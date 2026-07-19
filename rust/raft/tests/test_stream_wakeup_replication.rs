@@ -137,6 +137,19 @@ fn park_watch(
     })
 }
 
+/// The side-table key `WalStreamCore` writes for entry `seq` of the
+/// DT_STREAM at `path` (mirrors `kernel::core::stream::wal`'s
+/// `/__wal_stream__/{stream_id}/{seq}` format). The real write path
+/// (`sys_write` → `WalStreamCore`) proposes `AppendStreamEntry` under THIS
+/// key — not the bare path — so the observer's parse
+/// (`watch_path_from_wal_stream_key`) is what recovers the watched path.
+/// Using the real key here is deliberate: a bare-path key would mask a
+/// key-format/parse bug (which is exactly what a prior version of this test
+/// did).
+fn wal_key(path: &str, seq: u64) -> String {
+    format!("/__wal_stream__/{path}/{seq}")
+}
+
 /// Propose an `AppendStreamEntry` on the founder and assert the cluster did
 /// not reject it.
 async fn append_on_founder(founder: &ZoneHandle, key: &str, data: &[u8]) {
@@ -228,11 +241,18 @@ async fn replicated_stream_append_wakes_a_parked_watch_only_with_the_observer() 
     // except through the observer we register in phase 2.
     let kernel_joiner = Arc::new(Kernel::new());
 
+    // Every append uses the REAL wal-stream key (`/__wal_stream__/{path}/{seq}`)
+    // that `WalStreamCore` writes, so the observer's parse is what recovers
+    // the watched file path. The `sys_watch` is parked on the bare path.
+    let watch_path_1 = "/agents/win-ai/chat-with-me";
+    let key_1 = wal_key(watch_path_1, 0);
+    let watch_path_2 = "/agents/mac-ai/chat-with-me";
+    let key_2 = wal_key(watch_path_2, 0);
+
     // ── Phase 1 — negative control: no observer, no wake ─────────────────
     // Park a watcher on the joiner across a replicated apply. The entry
     // must reach the joiner's state machine (proven by `await_stream`), yet
     // the watcher must still time out — apply alone does not wake it.
-    let watch_path_1 = "/agents/win-ai/chat-with-me";
     let data_1 = b"phase-1-no-observer".to_vec();
 
     let watcher_1 = park_watch(Arc::clone(&kernel_joiner), watch_path_1, PHASE1_WATCH_MS);
@@ -241,12 +261,12 @@ async fn replicated_stream_append_wakes_a_parked_watch_only_with_the_observer() 
     // but a notify strictly before registration would be missed.
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    append_on_founder(&zone_founder, watch_path_1, &data_1).await;
+    append_on_founder(&zone_founder, &key_1, &data_1).await;
 
     // The entry really did replicate and apply on the joiner — so a
     // "did not wake" below is about the wake path, not a missing write.
     assert_eq!(
-        await_stream(&zone_joiner, watch_path_1, Some(&data_1)).await,
+        await_stream(&zone_joiner, &key_1, Some(&data_1)).await,
         Some(data_1.clone()),
         "the AppendStreamEntry must apply on the joiner's state machine"
     );
@@ -258,28 +278,25 @@ async fn replicated_stream_append_wakes_a_parked_watch_only_with_the_observer() 
     );
 
     // ── Phase 2 — arm the observer; now the same apply must wake ─────────
-    // §A identity translation: the test controls the stream key, so the
-    // watched path is the key verbatim (§F supplies the real
-    // zone-relative → mailbox-path mapping).
+    // The observer recovers the watched path from the real wal-stream key
+    // (`/__wal_stream__/{path}/{seq}` → `{path}`) — no per-zone mapping.
     install_stream_wakeup_observer(
         &zone_joiner.consensus_node(),
         Arc::downgrade(&kernel_joiner),
-        |key: &str| key.to_string(),
     );
 
-    let watch_path_2 = "/agents/win-ai/inbox";
     let data_2 = b"phase-2-observer-armed".to_vec();
 
     let watcher_2 = park_watch(Arc::clone(&kernel_joiner), watch_path_2, PHASE2_WATCH_MS);
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    append_on_founder(&zone_founder, watch_path_2, &data_2).await;
+    append_on_founder(&zone_founder, &key_2, &data_2).await;
 
     let woke_2 = watcher_2.await.expect("phase-2 watcher task");
     assert_eq!(
         woke_2.as_deref(),
         Some(watch_path_2),
-        "with the observer armed, the replicated AppendStreamEntry must wake the parked sys_watch on the replica"
+        "observer must parse the wal key and wake the sys_watch parked on the stream's file path"
     );
 
     // ── Phase 3 — durability: the payload outlives its sender ────────────
@@ -293,7 +310,7 @@ async fn replicated_stream_append_wakes_a_parked_watch_only_with_the_observer() 
     let reread = zone_joiner
         .consensus_node()
         .with_state_machine({
-            let k = watch_path_2.to_string();
+            let k = key_2.clone();
             move |sm: &FullStateMachine| sm.get_stream_entry(&k)
         })
         .await
