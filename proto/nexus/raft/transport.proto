@@ -27,6 +27,16 @@ service ZoneTransportService {
   // Used by the background replication loop (Phase C) for peer data sync.
   // Entries are idempotent — receivers skip already-applied sequence numbers.
   rpc ReplicateEntries(ReplicateEntriesRequest) returns (ReplicateEntriesResponse);
+
+  // SnapshotEcState transfers the sender's current EC state to a peer that
+  // fell behind the compacted WAL region (`needs_snapshot`). Incremental
+  // ReplicateEntries cannot serve it — the entries the peer missed were
+  // already compacted away — so the sender re-materializes its CURRENT state
+  // (as SetMetadata commands) and ships it. The receiver applies each
+  // LWW-idempotently; after the batch its acked_seq jumps to `covering_seq`
+  // and it resumes incremental replication from there. Still EC (bypasses
+  // Raft consensus).
+  rpc SnapshotEcState(SnapshotEcStateRequest) returns (SnapshotEcStateResponse);
 }
 
 // ZoneApiService provides the client-facing API for zone operations.
@@ -384,6 +394,29 @@ message ReplicateEntriesResponse {
   optional string error = 2;
   // Highest sequence number successfully applied by the receiver.
   uint64 applied_up_to = 3;
+}
+
+// SnapshotEcStateRequest carries the sender's CURRENT EC state to a lagging
+// peer (anti-entropy catch-up). `entries` reuse ECReplicationEntry — each
+// `command` is a re-materialized SetMetadata for a currently-live key; their
+// per-entry `seq` is not meaningful (the originals were compacted). After
+// applying the whole snapshot the receiver sets its acked_seq to
+// `covering_seq` (the sender's max applied at snapshot time) and clears
+// needs_snapshot, then resumes incremental replication past `covering_seq`.
+message SnapshotEcStateRequest {
+  string zone_id = 1;
+  repeated ECReplicationEntry entries = 2;
+  // Seq the receiver is caught up to once this snapshot is applied.
+  uint64 covering_seq = 3;
+  uint64 sender_node_id = 4;
+}
+
+// SnapshotEcStateResponse acknowledges a snapshot transfer.
+message SnapshotEcStateResponse {
+  bool success = 1;
+  optional string error = 2;
+  // Echoes covering_seq on success — the seq the receiver is now caught up to.
+  uint64 acked_up_to = 3;
 }
 
 // === ReadBlob (R20.18.7 — driver-to-driver CAS fetch) ===

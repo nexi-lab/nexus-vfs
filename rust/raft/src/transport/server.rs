@@ -18,7 +18,8 @@ use super::proto::nexus::raft::{
     LockResult, NodeInfo as ProtoNodeInfo, ProposeRequest, ProposeResponse, QueryRequest,
     QueryResponse, RaftCommand, RaftQueryResponse, RaftResponse, ReadBlobRequest, ReadBlobResponse,
     RemoveVoterRequest, RemoveVoterResponse, ReplicateEntriesRequest, ReplicateEntriesResponse,
-    SearchCapabilities, StepMessageRequest, StepMessageResponse,
+    SearchCapabilities, SnapshotEcStateRequest, SnapshotEcStateResponse, StepMessageRequest,
+    StepMessageResponse,
 };
 use super::{NodeAddress, Result, SharedPeerMap, TransportError};
 use crate::blob_fetcher::BlobFetcherSlot;
@@ -634,6 +635,56 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
             success: true,
             error: None,
             applied_up_to: max_applied,
+        }))
+    }
+
+    /// Apply an EC state snapshot from a peer (anti-entropy catch-up).
+    ///
+    /// The sender re-materialized its CURRENT EC state as `SetMetadata`
+    /// commands because this receiver fell behind the compacted WAL region.
+    /// Apply each LWW-idempotently (same path as incremental replication) and
+    /// echo `covering_seq` so the sender advances this peer's `acked_seq` past
+    /// the compacted region in one step, then resumes incremental delivery.
+    async fn snapshot_ec_state(
+        &self,
+        request: Request<SnapshotEcStateRequest>,
+    ) -> std::result::Result<Response<SnapshotEcStateResponse>, Status> {
+        let req = request.into_inner();
+        let node = get_zone_node(&self.registry, &req.zone_id)?;
+
+        for entry in &req.entries {
+            let command: Command = match bincode::deserialize(&entry.command) {
+                Ok(cmd) => cmd,
+                Err(e) => {
+                    // Same skip-loud posture as ReplicateEntries: an undecodable
+                    // snapshot entry is unappliable here, so skip it (loud) and
+                    // keep applying the rest rather than fail the whole catch-up.
+                    tracing::warn!(
+                        seq = entry.seq,
+                        sender = req.sender_node_id,
+                        error = %e,
+                        "EC snapshot entry undecodable — QUARANTINED (skipped)"
+                    );
+                    continue;
+                }
+            };
+            if let Err(e) = node.apply_ec_from_peer(command, entry.timestamp).await {
+                // A snapshot apply failure (not a decode/skew issue) is real:
+                // fail the transfer so the sender retries the whole snapshot
+                // rather than leaving the peer half-caught-up.
+                tracing::warn!(seq = entry.seq, "EC snapshot apply failed: {}", e);
+                return Ok(Response::new(SnapshotEcStateResponse {
+                    success: false,
+                    error: Some(format!("snapshot apply failed at seq {}: {}", entry.seq, e)),
+                    acked_up_to: 0,
+                }));
+            }
+        }
+
+        Ok(Response::new(SnapshotEcStateResponse {
+            success: true,
+            error: None,
+            acked_up_to: req.covering_seq,
         }))
     }
 }
@@ -1897,6 +1948,15 @@ impl ZoneTransportService for WitnessServiceImpl {
     ) -> std::result::Result<Response<ReplicateEntriesResponse>, Status> {
         Err(Status::unimplemented(
             "Witness nodes do not support EC replication",
+        ))
+    }
+
+    async fn snapshot_ec_state(
+        &self,
+        _request: Request<SnapshotEcStateRequest>,
+    ) -> std::result::Result<Response<SnapshotEcStateResponse>, Status> {
+        Err(Status::unimplemented(
+            "Witness nodes do not support EC snapshots",
         ))
     }
 }
