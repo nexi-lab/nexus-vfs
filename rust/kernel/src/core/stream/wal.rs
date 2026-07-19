@@ -74,6 +74,17 @@ impl WalStreamCore {
     /// peak memory before backpressure flips to synchronous write.
     const FLUSH_CHANNEL_CAP: usize = 4096;
 
+    /// `next_seq` starts at 0 and is only advanced by this instance's own
+    /// writes — it is NOT recovered from the store's tail. That is correct
+    /// while one long-lived instance is the sole writer for a `stream_id`
+    /// (the mailbox case in a 2-node federation, where each `chat-with-me`
+    /// has exactly one remote sender). It is NOT collision-safe when several
+    /// instances write the same `stream_id` concurrently (3+ senders, or a
+    /// sender restart that opens a fresh instance over an already-populated
+    /// mailbox): each computes the same `/{seq}` key and the later append
+    /// overwrites the earlier. The collision-free fix is to assign the seq at
+    /// the raft serialization point (apply-time) rather than client-side; it
+    /// is a tracked follow-up, out of scope for the 2-node A2A milestone.
     pub fn new(store: Arc<dyn MetaStore>, stream_id: String) -> Self {
         let prefix = format!("{WAL_STREAM_KEY_PREFIX}{stream_id}/");
         let (flush_tx, flush_rx) = mpsc::sync_channel::<(u64, Vec<u8>)>(Self::FLUSH_CHANNEL_CAP);
