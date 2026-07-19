@@ -470,6 +470,65 @@ Single-node GC is straightforward (scan local ObjectStore vs local Metastore).
 Federation GC requires node-level reconciliation: each node scans its local ObjectStore
 against the Raft-replicated Metastore to find locally-held orphans.
 
+### 7g. Client Boot-Serving Invariant
+
+`nexusd-cluster` opens its co-hosted VFS + raft gRPC port inside
+`ZoneManager::with_node_id` (spawned by `open_zone_manager` in
+`rust/profiles/cluster/src/lib.rs::run_daemon`), which happens BEFORE
+`RaftDistributedCoordinator::install_with_kernel` runs its atomic
+"install + catch up on past DT_MOUNT entries" pass. Concretely:
+
+1. `open_zone_manager` — VFS routes + raft server go live (~seconds into boot)
+2. `plan_boot_action` + `bootstrap_or_join_zone` — root zone reaches quorum
+3. `install_with_kernel` — coordinator wired, DT_MOUNT replay walks every zone,
+   `federation_client` + peer-blob fetcher bound to the kernel
+4. `transport::transport_observer::install(&kernel)` — post-transport observability armed
+
+**The port answers as soon as (1) completes**, so a client that races the
+daemon boot between (1) and (3) can hit VFS handlers before DT_MOUNT
+entries for federation sub-mounts have been re-wired. Read semantics
+during that window are safe by construction (missing sub-mount ⇒ path
+resolves to the parent mount ⇒ `NotFound` for the not-yet-replayed
+sub-path — the correct answer under eventual consistency). **Write
+semantics have a narrow physical-layout race**: a `sys_write` to a
+sub-mount path that has not yet been replayed lands on the parent
+mount's backend (typically `data_dir/root_fs/…`) instead of the
+federation sub-mount's backend (typically `data_dir/<zone>/…`), so a
+subsequent read after replay resolves via the sub-mount route and sees
+`NotFound` even though the bytes exist at the wrong physical location.
+
+**Client contract**: mutating RPCs (`Write`, `Delete`, `Setattr`,
+`Mkdir`, `Rename`, `Copy`, `Lock`, `SetXattr`, `BatchWrite`, `Call`,
+stream/pipe close, `StreamWriteNowait`) must wait for the
+`"transport_observer armed"` info-level log line (or an equivalent
+readiness signal that fires only after step 4) before issuing the
+first write. Read-only RPCs (`Read`, `Stat`, `Readdir`, `BatchRead`,
+`BatchStat`, `GetXattr`, `Watch`, `Ping`, stream/pipe read) can be
+issued as soon as the port is dialable — a boot-window `NotFound` is
+a legitimate eventual-consistency answer that the client should
+tolerate + retry.
+
+Same-machine clients (FUSE mount, `sudocode`, `moss`) already respect
+this by waiting on daemon-side log tails or on named-pipe readiness
+handshakes before issuing writes. Cross-machine clients cannot reach
+us in the (1)→(3) window because their peer address book learns our
+endpoint via post-`install_with_kernel` peer-map propagation, so they
+inherit the invariant for free. `grpcurl` and other ad-hoc clients
+issuing writes during boot are responsible for waiting on the log
+signal themselves — this is the client-side half of the boot-serving
+contract, deliberately kept out of the handler layer to avoid a
+readiness-flag check on every hot-path VFS RPC.
+
+Tracked at [issue #44](https://github.com/nexi-lab/nexus-vfs/issues/44):
+the alternative of gating every mutating handler on an `Arc<AtomicBool>`
+`ready` flag was considered and rejected — the race window is narrow
+(seconds), no production trigger has been observed, and a
+docker-compose-based E2E test tight enough to reproduce the natural
+timing would be flaky by construction (either passes without the fix
+by luck, or requires an artificial boot delay that itself becomes
+test-only code). Documented invariant wins over test-only-observable
+gate.
+
 ### 7j. DT_PIPE / DT_STREAM Federation Design
 
 Both IPC primitives have Raft-replicated metadata but in-process heap data
