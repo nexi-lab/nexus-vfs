@@ -28,7 +28,7 @@
 use super::client::RaftClientPool;
 use super::proto::nexus::raft::EcReplicationEntry;
 use super::{NodeAddress, SharedPeerMap};
-use crate::raft::{StateMachine, ZoneConsensusDriver};
+use crate::raft::{Command, StateMachine, ZoneConsensusDriver};
 use protobuf::Message as ProtobufV2Message;
 use raft::eraftpb::MessageType;
 use std::collections::HashMap;
@@ -130,6 +130,16 @@ const RAFT_SEND_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 /// per-peer backoff still bounds the retry rate.
 const EC_SEND_TIMEOUT: StdDuration = StdDuration::from_secs(2);
 
+/// Timeout for an anti-entropy `SnapshotEcState` transfer.
+///
+/// Unlike an incremental batch (bounded by `EC_MAX_ENTRIES_PER_BATCH`), a
+/// snapshot re-materializes the whole metadata state, so it can be large and
+/// take proportionally longer to serialize and ship.  Reuse the raft snapshot
+/// budget (30 s) rather than the tight 2 s incremental budget; this path is
+/// rare (only a peer lagging past `EC_WAL_RETENTION` triggers it) and the
+/// per-peer backoff still bounds the retry rate on a genuinely dead peer.
+const EC_SNAPSHOT_TIMEOUT: StdDuration = StdDuration::from_secs(30);
+
 /// Maximum entries to send per peer per EC replication cycle.
 /// Caps memory and prevents the tonic request timeout from being exceeded
 /// on large backlogs.
@@ -146,6 +156,11 @@ const EC_MAX_ENTRIES_PER_BATCH: usize = 500;
 /// is compacted past it. 10k bounds WAL growth (~20 `EC_MAX_ENTRIES_PER_BATCH`
 /// batches) while giving a slow peer a wide replay window before it costs
 /// a snapshot.
+///
+/// This is the default; a deployment can override it via the
+/// `NEXUS_EC_WAL_RETENTION` env var (read once into `TransportLoop`), e.g. a
+/// memory-constrained edge node that prefers a tighter WAL and accepts more
+/// anti-entropy snapshots.
 const EC_WAL_RETENTION: u64 = 10_000;
 
 /// Per-peer EC replication state.
@@ -218,6 +233,11 @@ pub struct TransportLoop<S: StateMachine + 'static> {
     self_address: String,
     /// Per-peer EC replication tracking (peer_id → state).
     ec_peer_state: HashMap<u64, PeerReplicationState>,
+    /// EC WAL retention window (entries).  Defaults to [`EC_WAL_RETENTION`];
+    /// overridable via `NEXUS_EC_WAL_RETENTION` for memory-constrained
+    /// deployments (a smaller window bounds the WAL tighter at the cost of
+    /// more anti-entropy snapshots for slow peers).  Read once at construction.
+    ec_wal_retention: u64,
     /// Sender half of the transport-failure channel.  Cloned into each
     /// `send_messages_fire_and_forget` task so a transport-level send
     /// error (network down, HTTP/2 keepalive timeout, tonic transport
@@ -264,6 +284,11 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
             node_id,
             self_address: String::new(),
             ec_peer_state: HashMap::new(),
+            ec_wal_retention: std::env::var("NEXUS_EC_WAL_RETENTION")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|&r| r > 0)
+                .unwrap_or(EC_WAL_RETENTION),
             failure_tx,
             failure_rx,
             ec_completion_tx,
@@ -565,8 +590,22 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
             }
         }
 
-        // Nothing to replicate
-        if entries.is_empty() {
+        // Compaction lower bound.  Fetched once — compaction runs only at the
+        // end of this pass, so `earliest` is stable throughout, and the
+        // per-peer loop reuses it instead of re-reading redb per iteration.
+        let earliest = repl_log.earliest_seq();
+
+        // Skip the pass only when there is genuinely nothing to do: no fresh
+        // entries to replicate AND no peer lagging behind the compacted WAL.
+        // A peer whose next-needed seq (`acked_seq + 1`) was compacted away
+        // still needs an anti-entropy snapshot even when the zone is otherwise
+        // idle — the early return must not starve that path, or a peer that
+        // reconnects to an idle zone would never catch up until the next write.
+        let any_peer_behind = peer_snapshot.iter().any(|(id, _)| {
+            let acked = self.ec_peer_state.get(id).map_or(0, |s| s.acked_seq);
+            acked + 1 < earliest
+        });
+        if entries.is_empty() && !any_peer_behind {
             return;
         }
 
@@ -580,6 +619,9 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
         }
 
         let mut tasks: Vec<EcSendTask> = Vec::new();
+        // Peers that fell behind the compacted WAL and need a full-state
+        // anti-entropy snapshot instead of an incremental batch.
+        let mut snapshot_tasks: Vec<(u64, NodeAddress)> = Vec::new();
 
         for (peer_id, peer_addr) in &peer_snapshot {
             let state = self
@@ -601,8 +643,8 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
                 continue;
             }
 
-            // Anti-entropy: check if peer fell behind compacted WAL region
-            let earliest = repl_log.earliest_seq();
+            // Anti-entropy check reuses the `earliest` hoisted above (stable
+            // for this pass).
 
             // Clear needs_snapshot if peer has caught up (e.g., via external
             // snapshot delivery or WAL re-expansion)
@@ -616,12 +658,18 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
                     );
                     state.needs_snapshot = false;
                 } else {
-                    tracing::warn!(
+                    // Still behind the compacted region: incremental replay
+                    // can't reach this peer, so ship a full-state snapshot.
+                    // The `in_flight`/backoff gates above already bound how
+                    // often this fires; the actual SM read + send happens in a
+                    // fire-and-forget task after the loop.
+                    tracing::info!(
                         peer_node_id = peer_id,
                         acked = state.acked_seq,
                         earliest,
-                        "Peer needs snapshot (not yet implemented) — skipping"
+                        "Peer needs snapshot — dispatching anti-entropy transfer"
                     );
+                    snapshot_tasks.push((*peer_id, peer_addr.clone()));
                     continue;
                 }
             }
@@ -715,6 +763,74 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
             });
         }
 
+        // Fire-and-forget anti-entropy snapshots for peers that fell behind the
+        // compacted WAL.  Same `in_flight` discipline as the incremental sends:
+        // mark before spawning so the next tick skips a duplicate.  The state
+        // read + entry materialization run INSIDE the task because the state
+        // machine's `RwLock` read is async; it is a shared read (the apply loop
+        // takes the write lock) and never touches the driver's exclusive
+        // `RawNode`, so the drain tick stays cheap and lock-free.
+        for (peer_id, peer_addr) in snapshot_tasks {
+            if let Some(state) = self.ec_peer_state.get_mut(&peer_id) {
+                state.in_flight = true;
+            }
+
+            let client_pool = self.client_pool.clone();
+            let zone_id = self.zone_id.clone();
+            let node_id = self.node_id;
+            let completion_tx = self.ec_completion_tx.clone();
+            let sm_arc = self.driver.state_machine_arc();
+            // A lower bound on what the snapshot covers: the SM read below
+            // reflects every write applied so far, so the materialized state is
+            // >= `covering_seq`.  On ack the peer's `acked_seq` jumps here and
+            // incremental replication resumes from `covering_seq + 1` (re-
+            // applying entries already folded into the snapshot is idempotent
+            // under LWW).
+            let covering_seq = repl_log.max_seq().saturating_sub(1);
+
+            tokio::spawn(async move {
+                // Re-materialize the whole metadata state as SetMetadata
+                // commands.  Sc-plane keys the peer already holds via raft are
+                // byte-identical, so LWW no-ops them; only the EC keys the peer
+                // missed actually change.  (A delta/chunked snapshot is a future
+                // optimization — this path is rare, correctness over bytes.)
+                let state_pairs = sm_arc.read().await.ec_state_snapshot();
+                let entries: Vec<EcReplicationEntry> = state_pairs
+                    .into_iter()
+                    .map(|(key, value)| EcReplicationEntry {
+                        seq: covering_seq,
+                        command: bincode::serialize(&Command::SetMetadata { key, value })
+                            .unwrap_or_default(),
+                        // SetMetadata LWW uses the value's own embedded
+                        // modified-at, so this envelope timestamp is unused.
+                        timestamp: 0,
+                        node_id,
+                    })
+                    .collect();
+
+                let send = send_ec_snapshot(
+                    &client_pool,
+                    &peer_addr,
+                    zone_id,
+                    entries,
+                    covering_seq,
+                    node_id,
+                );
+                let completion = match tokio::time::timeout(EC_SNAPSHOT_TIMEOUT, send).await {
+                    Ok(Ok(acked_up_to)) => EcCompletion::Acked {
+                        peer_id,
+                        applied_up_to: acked_up_to,
+                    },
+                    Ok(Err(e)) => EcCompletion::Failed { peer_id, error: e },
+                    Err(_) => EcCompletion::Failed {
+                        peer_id,
+                        error: format!("EC snapshot timed out after {:?}", EC_SNAPSHOT_TIMEOUT),
+                    },
+                };
+                let _ = completion_tx.send(completion);
+            });
+        }
+
         // Compute quorum watermark and advance.  Only voter peers count
         // toward the quorum — learner acks are ignored here even though
         // we still replicate to them above.  The single-voter case is
@@ -740,7 +856,7 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
                 .iter()
                 .filter_map(|(id, _)| self.ec_peer_state.get(id).map(|s| s.acked_seq)),
             repl_log.max_seq(),
-            EC_WAL_RETENTION,
+            self.ec_wal_retention,
         );
 
         if compact_up_to > 0 {
@@ -796,6 +912,36 @@ async fn send_ec_entries(
         .map_err(|e| {
             format!(
                 "replicate to {} ({}): {}",
+                peer_addr.id, peer_addr.endpoint, e
+            )
+        })
+}
+
+/// Ship a full-state anti-entropy snapshot to a peer that fell behind the
+/// compacted WAL (used by the fire-and-forget snapshot tasks).  `covering_seq`
+/// is the lower bound the snapshot covers; the peer advances its `acked_seq` to
+/// it on success and resumes incremental replay from `covering_seq + 1`.
+async fn send_ec_snapshot(
+    client_pool: &RaftClientPool,
+    peer_addr: &NodeAddress,
+    zone_id: String,
+    entries: Vec<EcReplicationEntry>,
+    covering_seq: u64,
+    sender_node_id: u64,
+) -> std::result::Result<u64, String> {
+    let mut client = client_pool.get(peer_addr).await.map_err(|e| {
+        format!(
+            "connect to {} ({}): {}",
+            peer_addr.id, peer_addr.endpoint, e
+        )
+    })?;
+
+    client
+        .snapshot_ec_state(zone_id, entries, covering_seq, sender_node_id)
+        .await
+        .map_err(|e| {
+            format!(
+                "snapshot to {} ({}): {}",
                 peer_addr.id, peer_addr.endpoint, e
             )
         })

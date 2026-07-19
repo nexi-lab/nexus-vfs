@@ -1430,6 +1430,17 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             .and_then(|log| log.is_committed(token))
     }
 
+    /// Current EC WAL bounds `(earliest_seq, max_seq)`, or `None` on a witness
+    /// node with no replication log.  `earliest_seq` rises as compaction
+    /// discards replicated / retention-aged entries; a peer whose next-needed
+    /// seq is below it must catch up via an anti-entropy snapshot rather than
+    /// incremental replay.  Exposed for observability and tests.
+    pub fn ec_wal_bounds(&self) -> Option<(u64, u64)> {
+        self.replication_log
+            .as_ref()
+            .map(|log| (log.earliest_seq(), log.max_seq()))
+    }
+
     /// Propose a configuration change and wait for it to be committed.
     ///
     /// `context` carries the new node's gRPC address (etcd pattern).
@@ -1522,6 +1533,17 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
     /// Used by the transport loop for EC background replication.
     pub fn replication_log(&self) -> Option<&Arc<ReplicationLog>> {
         self.replication_log.as_ref()
+    }
+
+    /// Clone the shared state-machine handle for a concurrent read.
+    ///
+    /// Used by the EC anti-entropy path: the transport loop reads the current
+    /// state (`ec_state_snapshot`) for a `SnapshotEcState` transfer from a
+    /// fire-and-forget task. Safe — this is the shared `Arc<RwLock<S>>` the
+    /// read side already uses (`with_state_machine`); the apply loop takes the
+    /// write lock, and the driver's exclusive `RawNode` is never touched here.
+    pub fn state_machine_arc(&self) -> Arc<RwLock<S>> {
+        self.state_machine.clone()
     }
 
     /// Snapshot of the current voter set (raft-rs SSOT).

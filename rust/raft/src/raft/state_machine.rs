@@ -276,6 +276,19 @@ pub trait StateMachine: Send + Sync {
         self.apply_local(command)
     }
 
+    /// Snapshot the current EC-replicable state as `(key, value)` pairs.
+    ///
+    /// Used by the EC anti-entropy path (`SnapshotEcState`): a peer that fell
+    /// behind the compacted WAL region can't be caught up incrementally, so
+    /// the sender re-materializes THIS state into `SetMetadata` commands and
+    /// ships it. Order is irrelevant — the receiver applies each LWW-idempotently.
+    ///
+    /// Default: empty (a state machine that holds no EC metadata — e.g. a
+    /// witness — has nothing to transfer). Override in [`FullStateMachine`].
+    fn ec_state_snapshot(&self) -> Vec<(String, Vec<u8>)> {
+        Vec::new()
+    }
+
     /// Get the last applied log index.
     ///
     /// Used to determine which log entries need to be applied after restart.
@@ -1602,6 +1615,14 @@ impl StateMachine for FullStateMachine {
                 "Only metadata operations support EC writes".into(),
             )),
         }
+    }
+
+    fn ec_state_snapshot(&self) -> Vec<(String, Vec<u8>)> {
+        // The current metadata key/values ARE the EC-replicable state, and
+        // `list_metadata` already skips internal `__` keys. The anti-entropy
+        // sender re-materializes each into a SetMetadata command for a peer
+        // that fell behind the compacted WAL region.
+        self.list_metadata("").unwrap_or_default()
     }
 
     fn apply(&mut self, index: u64, command: &Command) -> Result<CommandResult> {
