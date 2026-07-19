@@ -1550,14 +1550,21 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     // block above, so they are loaded now; a zone joined at runtime after
     // boot is a documented follow-up.
     {
-        let mut wakeup_zones: Vec<(String, String)> = vec![(
-            contracts::VFS_ROOT.to_string(),
-            contracts::ROOT_ZONE_ID.to_string(),
-        )];
-        for (mount_point, zone_id) in &fed.mounts.mounts {
-            wakeup_zones.push((mount_point.clone(), zone_id.clone()));
-        }
-        for (mount_point, zone_id) in wakeup_zones {
+        // Arm on every zone this node participates in — root plus every
+        // federation zone created or joined by the BootAction block above.
+        // The wakeup is a property of raft-consensus membership, NOT of
+        // `NEXUS_FEDERATION_MOUNTS`: a JOINER reaches its shared zones via
+        // DiscoverZones / identity.zones with the mounts env EMPTY (a
+        // non-empty mounts env alongside `--peers` is a fail-loud ambiguous
+        // boot — see `plan_boot_action` row 6), so keying off the env mounts
+        // would arm root only and silently drop the joiner's shared mailbox
+        // zone. `ZoneManager::list_zones` is the SSOT for loaded zones.
+        // (A zone joined at RUNTIME, after this point — via a `share`/`join`
+        // sidecar — is still a documented follow-up.)
+        let mut wakeup_zone_ids: std::collections::BTreeSet<String> =
+            zm.list_zones().into_iter().collect();
+        wakeup_zone_ids.insert(contracts::ROOT_ZONE_ID.to_string());
+        for zone_id in wakeup_zone_ids {
             match zm.get_zone(&zone_id) {
                 Some(zone) => {
                     // The observer self-recovers the watched file path from
@@ -1566,16 +1573,12 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
                         &zone.consensus_node(),
                         Arc::downgrade(&kernel),
                     );
-                    tracing::info!(
-                        zone_id = %zone_id, mount_point = %mount_point,
-                        "a2a stream-wakeup observer armed"
-                    );
+                    tracing::info!(zone_id = %zone_id, "a2a stream-wakeup observer armed");
                 }
                 None => {
                     tracing::warn!(
-                        zone_id = %zone_id, mount_point = %mount_point,
-                        "a2a stream-wakeup: zone not loaded at arming time; skipped \
-                         (runtime-join arming is a follow-up)"
+                        zone_id = %zone_id,
+                        "a2a stream-wakeup: zone not loaded at arming time; skipped"
                     );
                 }
             }

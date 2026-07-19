@@ -1877,7 +1877,16 @@ impl Kernel {
         if let Some(meta) = self.metastore_get(path).ok().flatten() {
             if meta.entry_type == DT_STREAM {
                 if !self.has_stream(path) {
-                    self.create_stream(path, capacity)?;
+                    // Reconstruct the SAME backend the creator installed — run
+                    // the io_profile waterfall, NOT a memory-only create_stream.
+                    // A wal DT_STREAM whose inode replicated in from a peer (this
+                    // node never ran the local setattr) then gets a WalStreamCore
+                    // over THIS node's zone metastore, so the mailbox is readable
+                    // AND writable on every zone member — not only its creator.
+                    // Without this a peer sending to someone else's chat-with-me,
+                    // or reading a mailbox created on the other machine, hits
+                    // StreamNotFound. The inode already exists, so no re-write.
+                    self.install_stream_backend(path, capacity, io_profile)?;
                 }
                 return Ok(SysSetAttrResult {
                     path: path.to_string(),
@@ -1897,17 +1906,45 @@ impl Kernel {
             )));
         }
 
-        // `io_profile` is a WATERFALL: a comma-separated, preference-ordered
-        // list of stream backends. Walk it left-to-right and install the
-        // FIRST backend available in this node's context; an unavailable
-        // entry (e.g. "wal" when federation is not wired) falls through to
-        // the next. A single token is a length-1 waterfall, so the historical
-        // profiles ("wal" / "memory" / "shared_memory" / "") behave exactly as
-        // before — a bare "wal" still errors when federation is down (audit
-        // relies on that fail-loud). Cheap by construction: `split` is
-        // allocation-free, each arm does the same work the old `if/else` chain
-        // did, and it runs once per stream creation (not a per-IO path).
-        let mut selected: Option<(Option<String>, Option<i32>)> = None;
+        let (shm_path, data_rd_fd) = self.install_stream_backend(path, capacity, io_profile)?;
+        self.write_stream_inode(path, capacity)?;
+
+        Ok(SysSetAttrResult {
+            path: path.to_string(),
+            created: true,
+            entry_type: DT_STREAM as i32,
+            backend_name: None,
+            capacity: Some(capacity),
+            updated: Vec::new(),
+            shm_path,
+            data_rd_fd,
+            space_rd_fd: None,
+        })
+    }
+
+    /// Register the FIRST available stream backend for `path` from the
+    /// `io_profile` waterfall. Does NOT touch the inode — the caller owns that
+    /// (write once on create; a reopen leaves the replicated inode alone).
+    ///
+    /// `io_profile` is a comma-separated, preference-ordered list of backends.
+    /// Walk it left-to-right and install the FIRST available in this node's
+    /// context; an unavailable entry (e.g. "wal" when federation is not wired)
+    /// falls through to the next. A single token is a length-1 waterfall, so
+    /// the historical profiles ("wal" / "memory" / "shared_memory" / "")
+    /// behave exactly as before — a bare "wal" still errors when federation is
+    /// down (audit relies on that fail-loud). Cheap: `split` is
+    /// allocation-free and this runs once per open, not per IO.
+    ///
+    /// Shared by `setattr_stream`'s create branch AND its idempotent-reopen
+    /// branch, so a replica reconstructs the exact backend the creator chose.
+    /// Returns the shared-memory handles (only the `shared_memory` arm yields
+    /// them); errors if no waterfall entry was available on this node.
+    fn install_stream_backend(
+        &self,
+        path: &str,
+        capacity: usize,
+        io_profile: &str,
+    ) -> Result<(Option<String>, Option<i32>), KernelError> {
         for profile in io_profile.split(',') {
             match profile {
                 "shared_memory" => {
@@ -1918,9 +1955,7 @@ impl Kernel {
                         self.stream_manager
                             .register(path, Arc::new(backend))
                             .map_err(stream_mgr_err)?;
-                        self.write_stream_inode(path, capacity)?;
-                        selected = Some((Some(shm), Some(dfd)));
-                        break;
+                        return Ok((Some(shm), Some(dfd)));
                     }
                     #[cfg(not(unix))]
                     {
@@ -1944,7 +1979,9 @@ impl Kernel {
                     // it with root (node-local) would silently never cross
                     // machines. `route().zone_id` is the resolved destination
                     // zone (the routing SSOT) — root for an unmounted path,
-                    // the federation zone for a mount.
+                    // the federation zone for a mount. The SAME resolution runs
+                    // on every member, so a reopen on a replica composes a
+                    // WalStreamCore over that replica's own metastore.
                     let zone_id = self
                         .vfs_router
                         .route(path, contracts::ROOT_ZONE_ID)
@@ -1959,41 +1996,26 @@ impl Kernel {
                         self.stream_manager
                             .register(path, Arc::new(backend))
                             .map_err(stream_mgr_err)?;
-                        self.write_stream_inode(path, capacity)?;
-                        selected = Some((None, None));
-                        break;
+                        return Ok((None, None));
                     }
                     // wal unavailable here → try the next profile in the waterfall
                 }
                 _ => {
                     // "memory" (and any other / empty token): the always-
                     // available, node-local terminal (historical `else`).
-                    self.create_stream(path, capacity)?;
-                    selected = Some((None, None));
-                    break;
+                    self.stream_manager
+                        .create(path, capacity)
+                        .map_err(stream_mgr_err)?;
+                    return Ok((None, None));
                 }
             }
         }
-        // `None` only when every entry was "wal" and none were available
+        // Reached only when every entry was "wal" and none were available
         // (e.g. a bare "wal" with federation down) — fail loud.
-        let (shm_path, data_rd_fd) = selected.ok_or_else(|| {
-            KernelError::IOError(format!(
-                "io_profile {io_profile:?} selected no available stream backend \
-                 (\"wal\" requires federation — set NEXUS_PEERS)"
-            ))
-        })?;
-
-        Ok(SysSetAttrResult {
-            path: path.to_string(),
-            created: true,
-            entry_type: DT_STREAM as i32,
-            backend_name: None,
-            capacity: Some(capacity),
-            updated: Vec::new(),
-            shm_path,
-            data_rd_fd,
-            space_rd_fd: None,
-        })
+        Err(KernelError::IOError(format!(
+            "io_profile {io_profile:?} selected no available stream backend \
+             (\"wal\" requires federation — set NEXUS_PEERS)"
+        )))
     }
 
     /// Write DT_PIPE inode to metastore + dcache (shared by create_pipe and SHM path).
