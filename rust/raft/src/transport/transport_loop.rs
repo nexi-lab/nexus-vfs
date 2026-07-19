@@ -742,24 +742,14 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
                     task.entries,
                     node_id,
                 );
-                let completion = match tokio::time::timeout(EC_SEND_TIMEOUT, send).await {
-                    Ok(Ok(applied_up_to)) => EcCompletion::Acked {
-                        peer_id: task.peer_id,
-                        applied_up_to,
-                    },
-                    Ok(Err(e)) => EcCompletion::Failed {
-                        peer_id: task.peer_id,
-                        error: e,
-                    },
-                    Err(_) => EcCompletion::Failed {
-                        peer_id: task.peer_id,
-                        error: format!("EC replication timed out after {:?}", EC_SEND_TIMEOUT),
-                    },
-                };
-                // Best-effort signal back.  Receiver drop only happens
-                // at shutdown, in which case a missed completion is
-                // harmless.
-                let _ = completion_tx.send(completion);
+                report_ec_completion(
+                    task.peer_id,
+                    EC_SEND_TIMEOUT,
+                    "EC replication",
+                    &completion_tx,
+                    send,
+                )
+                .await;
             });
         }
 
@@ -816,18 +806,14 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
                     covering_seq,
                     node_id,
                 );
-                let completion = match tokio::time::timeout(EC_SNAPSHOT_TIMEOUT, send).await {
-                    Ok(Ok(acked_up_to)) => EcCompletion::Acked {
-                        peer_id,
-                        applied_up_to: acked_up_to,
-                    },
-                    Ok(Err(e)) => EcCompletion::Failed { peer_id, error: e },
-                    Err(_) => EcCompletion::Failed {
-                        peer_id,
-                        error: format!("EC snapshot timed out after {:?}", EC_SNAPSHOT_TIMEOUT),
-                    },
-                };
-                let _ = completion_tx.send(completion);
+                report_ec_completion(
+                    peer_id,
+                    EC_SNAPSHOT_TIMEOUT,
+                    "EC snapshot",
+                    &completion_tx,
+                    send,
+                )
+                .await;
             });
         }
 
@@ -889,6 +875,33 @@ async fn send_raft_message(
         .step_message(bytes, zone_id, self_address)
         .await
         .map_err(|e| format!("send to node {} ({}): {}", target_id, addr.endpoint, e))
+}
+
+/// Await an EC send future under `timeout` and report the outcome back on the
+/// completion channel.  Shared by the incremental-batch and anti-entropy
+/// snapshot sends so the `Acked` / `Failed` / timeout mapping lives in one
+/// place.  `send` resolves to the peer's acked-up-to seq on success.
+async fn report_ec_completion(
+    peer_id: u64,
+    timeout: StdDuration,
+    what: &str,
+    completion_tx: &mpsc::UnboundedSender<EcCompletion>,
+    send: impl std::future::Future<Output = std::result::Result<u64, String>>,
+) {
+    let completion = match tokio::time::timeout(timeout, send).await {
+        Ok(Ok(applied_up_to)) => EcCompletion::Acked {
+            peer_id,
+            applied_up_to,
+        },
+        Ok(Err(error)) => EcCompletion::Failed { peer_id, error },
+        Err(_) => EcCompletion::Failed {
+            peer_id,
+            error: format!("{what} timed out after {timeout:?}"),
+        },
+    };
+    // Best-effort signal back.  Receiver drop only happens at shutdown, in
+    // which case a missed completion is harmless.
+    let _ = completion_tx.send(completion);
 }
 
 /// Send EC replication entries to a peer (used by parallel EC tasks).
