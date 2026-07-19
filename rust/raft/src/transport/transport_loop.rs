@@ -73,10 +73,20 @@ const EC_BACKOFF_BASE: Duration = Duration::from_millis(100);
 /// failure looked like a permanent stall (nexi-lab/nexus-vfs#64).
 /// 10 s bounds the at-cap latency well under those budgets while
 /// still letting genuinely-unreachable peers compress their retry
-/// rate.  Recovery faster than 10 s is handled by the at-cap reset
-/// path in `replicate_ec_entries` — fresh WAL entries arriving past a
-/// stalled peer's `acked_seq` reset `next_attempt` to `now` so the
-/// next tick probes immediately.
+/// rate.  Backoff climbs only on a real send failure and resets to
+/// [`EC_BACKOFF_BASE`] on the first `Acked`, so a peer that was
+/// briefly down reconverges within at most one cap interval once it
+/// is reachable again.
+///
+/// There is deliberately NO "fresh WAL entries reset `next_attempt`"
+/// path: new writes must not override the failure backoff.  A
+/// fast-failing peer (connection refused, sub-millisecond error)
+/// clears `in_flight` immediately, so a per-write reset would re-probe
+/// it every ~10 ms tick — hammering, not recovery.  The `in_flight`
+/// gate only rate-limits *timing-out* peers (held for `EC_SEND_TIMEOUT`),
+/// so backoff is the sole floor for fast-fails and must be respected.
+/// Genuine unreachability is surfaced by tonic H2 keep-alive and
+/// raft-rs `Progress` (`report_unreachable`), not by this cap.
 const EC_BACKOFF_CAP: Duration = Duration::from_secs(10);
 
 /// Timeout for individual Raft consensus message sends.
