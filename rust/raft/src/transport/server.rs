@@ -576,32 +576,35 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
             let command: Command = match bincode::deserialize(&entry.command) {
                 Ok(cmd) => cmd,
                 Err(e) => {
-                    // A bincode deserialize failure on an EC entry
-                    // means the wire format itself is wrong — the
-                    // sender shipped bytes this version of the
-                    // server cannot decode (mismatched build /
-                    // schema-drift bug).  Returning success=true and
-                    // skipping the entry let the sender treat the
-                    // gap as "applied" (because `applied_up_to`
-                    // would still cover later entries that DID
-                    // deserialise) and silently desync the
-                    // state machines.  Treat it as a hard failure
-                    // and surface it: stop applying further entries
-                    // in this batch, return `success=false` with the
-                    // last definitely-applied seq, and let the
-                    // sender's per-peer backoff rate-limit the
-                    // retry against the version-skew condition.
+                    // A bincode deserialize failure means the sender shipped
+                    // bytes this build cannot decode (version skew / corruption).
+                    // The entry is UNAPPLIABLE here — no build-local action can
+                    // ever make it decode — so the only choices are (a) halt the
+                    // whole peer's EC stream until the mismatch is fixed, or
+                    // (b) skip THIS entry and keep replicating the rest.
+                    //
+                    // We skip-LOUD (advance past it, warn), because for the EC
+                    // (AP) data plane availability wins: one undecodable entry
+                    // must not head-of-line-block a peer's entire mailbox
+                    // stream, and stalling would not "preserve" the entry — it
+                    // is unappliable regardless.  This is NOT silent: every drop
+                    // is warned with its seq, so a systematic skew shows up as a
+                    // flood of warns.  The SYSTEMATIC fix (make undecodable
+                    // entries impossible — a version-gate at JoinZone rejecting
+                    // mismatched builds, or a forward-compatible command
+                    // encoding) is the tracked follow-up; skip-loud is the
+                    // agreed interim.  Apply failures (below) stay hard-fail —
+                    // those may be transient and are worth a backed-off retry.
                     tracing::warn!(
                         seq = entry.seq,
                         sender = req.sender_node_id,
-                        "EC entry deserialize failed — wire-format mismatch: {}",
-                        e
+                        error = %e,
+                        "EC entry undecodable (version skew / corruption) — \
+                         QUARANTINED (skipped) so the peer's stream keeps flowing; \
+                         a flood here means a build mismatch to fix"
                     );
-                    return Ok(Response::new(ReplicateEntriesResponse {
-                        success: false,
-                        error: Some(format!("deserialize failed at seq {}: {}", entry.seq, e)),
-                        applied_up_to: max_applied,
-                    }));
+                    max_applied = max_applied.max(entry.seq);
+                    continue;
                 }
             };
 
