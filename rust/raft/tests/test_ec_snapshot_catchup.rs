@@ -154,25 +154,31 @@ async fn test_ec_snapshot_catchup_late_learner_behind_compacted_wal() {
             .unwrap_or_else(|e| panic!("propose_ec_local(/snap/{i}) failed: {e:?}"));
     }
 
-    // Barrier: the founder's WAL must compact past seq 1 (retention=2, floor =
-    // max_seq - 2) BEFORE B joins, so /snap/0 is provably unreachable by
-    // incremental replay.  Compaction is monotonic and retention-floored, so
-    // once earliest > 1 it stays there even as B (acked=0) enters the peer set.
+    // Barrier: wait until the founder's WAL has FULLY compacted (earliest ==
+    // max_seq ⇒ zero unreplicated entries) BEFORE B joins. This makes the test
+    // deterministically exercise BOTH fixes in one shot:
+    //   1. /snap/0 (seq 1) is compacted away ⇒ reachable only via snapshot; and
+    //   2. B joins into an IDLE drain (no fresh entries), so the anti-entropy
+    //      dispatch fires only because the early-return-on-empty guard now
+    //      yields to a lagging peer instead of returning. Without either fix B
+    //      never receives /snap/0.
+    // Compaction is monotonic + retention-floored, so once emptied it stays
+    // emptied even as B (acked=0) enters the peer set.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let mut founder_earliest = 1u64;
+    let (mut earliest, mut max) = (1u64, 0u64);
     while std::time::Instant::now() < deadline {
-        if let Some((earliest, _max)) = founder_consensus.ec_wal_bounds() {
-            founder_earliest = earliest;
-            if earliest > 1 {
+        if let Some((e, m)) = founder_consensus.ec_wal_bounds() {
+            (earliest, max) = (e, m);
+            if earliest >= max && earliest > 1 {
                 break;
             }
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(
-        founder_earliest > 1,
-        "founder WAL must compact past seq 1 so /snap/0 is snapshot-only — \
-         earliest={founder_earliest}"
+        earliest >= max && earliest > 1,
+        "founder WAL must fully compact past seq 1 before B joins (idle drain, \
+         /snap/0 snapshot-only) — earliest={earliest} max={max}"
     );
 
     // Learner B joins LATE — fresh (acked_seq=0), so its next-needed seq (1) is
