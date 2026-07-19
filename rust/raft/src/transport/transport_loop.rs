@@ -135,6 +135,19 @@ const EC_SEND_TIMEOUT: StdDuration = StdDuration::from_secs(2);
 /// on large backlogs.
 const EC_MAX_ENTRIES_PER_BATCH: usize = 500;
 
+/// WAL retention window (entries) for EC compaction.
+///
+/// Compaction normally holds every entry any known peer still needs
+/// (including a peer that has never acked), so a briefly-offline peer
+/// catches up by plain WAL replay on reconnect — no snapshot, no loss.
+/// But a peer that is gone or wedged must not pin the WAL forever, so a
+/// peer lagging more than this many entries behind `max_seq` is
+/// sacrificed to an anti-entropy snapshot (`needs_snapshot`) and the WAL
+/// is compacted past it. 10k bounds WAL growth (~20 `EC_MAX_ENTRIES_PER_BATCH`
+/// batches) while giving a slow peer a wide replay window before it costs
+/// a snapshot.
+const EC_WAL_RETENTION: u64 = 10_000;
+
 /// Per-peer EC replication state.
 struct PeerReplicationState {
     /// Highest sequence number this peer has acknowledged.
@@ -613,7 +626,15 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
                 }
             }
 
-            if state.acked_seq > 0 && state.acked_seq < earliest {
+            // A peer needs a snapshot iff the next entry it needs
+            // (`acked_seq + 1`) has already been compacted away
+            // (`< earliest`).  The old `acked_seq > 0 && acked_seq < earliest`
+            // was wrong twice: it excluded a never-acked peer (`acked_seq==0`),
+            // which is exactly the peer most likely to have been left behind by
+            // compaction, and it false-flagged a peer sitting exactly at the
+            // boundary (`acked_seq == earliest - 1`), whose needed entry
+            // (`earliest`) is still present and replicable incrementally.
+            if state.acked_seq + 1 < earliest {
                 tracing::warn!(
                     peer_node_id = peer_id,
                     acked = state.acked_seq,
@@ -708,16 +729,22 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
             }
         }
 
-        // WAL compaction: remove entries consumed by ALL peers (Kafka pattern)
-        let min_peer_acked = peer_snapshot
-            .iter()
-            .filter_map(|(id, _)| self.ec_peer_state.get(id).map(|s| s.acked_seq))
-            .filter(|&s| s > 0)
-            .min()
-            .unwrap_or(0);
+        // WAL compaction floor: keep every entry any KNOWN peer still needs
+        // (incl. never-acked peers) bounded by `EC_WAL_RETENTION`.  See
+        // `ec_compact_floor` for the full rationale.  A peer lagging past the
+        // retention window is compacted past and flagged `needs_snapshot` on
+        // its next drain pass (per-peer loop above); `compact()` is monotonic
+        // and no-ops when `up_to < earliest`.
+        let compact_up_to = ec_compact_floor(
+            peer_snapshot
+                .iter()
+                .filter_map(|(id, _)| self.ec_peer_state.get(id).map(|s| s.acked_seq)),
+            repl_log.max_seq(),
+            EC_WAL_RETENTION,
+        );
 
-        if min_peer_acked > 0 {
-            if let Err(e) = repl_log.compact(min_peer_acked) {
+        if compact_up_to > 0 {
+            if let Err(e) = repl_log.compact(compact_up_to) {
                 tracing::error!("WAL compaction failed: {}", e);
             }
         }
@@ -814,9 +841,73 @@ fn compute_ec_watermark(
     acks.get(needed_peer_acks - 1).copied().filter(|&wm| wm > 0)
 }
 
+/// Highest WAL seq that is safe to compact up to for EC replication.
+///
+/// Keeps every entry any KNOWN peer still needs: the min over ALL peers'
+/// `acked_seq`, **including a peer that has never acked** (`acked_seq == 0`,
+/// which pins the floor at 0 → nothing compacted).  The prior code filtered
+/// `acked_seq > 0`, so a never-acked peer did not hold the floor and
+/// compaction silently deleted entries it still needed — the peer then hit
+/// the compacted region and lost those writes with no way to catch up.
+///
+/// Bounded by `retention`: a peer that is gone or wedged must not pin the WAL
+/// forever, so the floor is raised to at least `max_seq - retention`.  A peer
+/// lagging past that window is compacted past (and flagged `needs_snapshot`
+/// by the drain) rather than stalling the whole zone's WAL.  With no peers,
+/// the WAL is still bounded to `retention` (the entries are already applied
+/// locally; the WAL is only the replication buffer).  Returns 0 to mean
+/// "compact nothing".
+fn ec_compact_floor(
+    peer_acked_seqs: impl Iterator<Item = u64>,
+    max_seq: u64,
+    retention: u64,
+) -> u64 {
+    let min_peer_acked = peer_acked_seqs.min().unwrap_or(0);
+    let retention_floor = max_seq.saturating_sub(retention);
+    min_peer_acked.max(retention_floor)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_floor_holds_for_never_acked_peer_within_retention() {
+        // A peer at acked_seq==0 (never acked) must pin the floor at 0 so its
+        // still-needed entries are not compacted away — the silent-loss bug.
+        assert_eq!(ec_compact_floor([0u64, 5].into_iter(), 6, 10_000), 0);
+        // Even with only a never-acked peer.
+        assert_eq!(ec_compact_floor([0u64].into_iter(), 100, 10_000), 0);
+    }
+
+    #[test]
+    fn compact_floor_advances_to_min_acked_when_all_caught_up() {
+        // All peers acked past the retention floor → compact up to the min ack
+        // (keep what the laggard among them still needs).
+        assert_eq!(
+            ec_compact_floor([1000u64, 1005].into_iter(), 1006, 10_000),
+            1000
+        );
+    }
+
+    #[test]
+    fn compact_floor_bounds_wal_past_retention_sacrificing_laggard() {
+        // A wedged peer (acked 0) past the retention window no longer pins the
+        // WAL: the floor rises to max_seq - retention (it will be flagged
+        // needs_snapshot by the drain).
+        assert_eq!(
+            ec_compact_floor([0u64, 14_000].into_iter(), 15_000, 10_000),
+            5_000
+        );
+    }
+
+    #[test]
+    fn compact_floor_bounds_wal_with_no_peers() {
+        // No peers: still bound the WAL to retention (entries are applied
+        // locally; the WAL is only the replication buffer).
+        assert_eq!(ec_compact_floor(std::iter::empty(), 500, 10_000), 0);
+        assert_eq!(ec_compact_floor(std::iter::empty(), 15_000, 10_000), 5_000);
+    }
 
     fn mk_peer_state(acked_seq: u64) -> PeerReplicationState {
         PeerReplicationState {
