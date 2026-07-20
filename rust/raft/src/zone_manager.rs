@@ -982,14 +982,25 @@ impl ZoneManager {
                 witness_count: 0,
             };
         };
+        // Membership SSOT is raft's ConfState (the authoritative voter set),
+        // NOT the transport peer address book. Iterate `node.voters()` —
+        // learners are already excluded (they never count toward quorum). The
+        // peer map is consulted only to classify each voter as witness-vs-full
+        // by advertised hostname. Self is a voter but is never in the peer map
+        // (PeerMap invariant — self is a ConfState member, not a transport
+        // peer), and a ZoneManager node is never a witness, so self — and any
+        // voter whose address is not yet learned — counts as a full voter.
         let (mut voter_count, mut witness_count) = (0usize, 0usize);
-        if let Some(peers) = self.registry.get_peers(zone_id) {
-            for (_, p) in peers {
-                if p.hostname.to_ascii_lowercase().starts_with("witness") {
-                    witness_count += 1;
-                } else {
-                    voter_count += 1;
-                }
+        let peers = self.registry.get_peers(zone_id).unwrap_or_default();
+        for id in node.voters() {
+            let is_witness = peers
+                .get(&id)
+                .map(|p| p.hostname.to_ascii_lowercase().starts_with("witness"))
+                .unwrap_or(false);
+            if is_witness {
+                witness_count += 1;
+            } else {
+                voter_count += 1;
             }
         }
         ClusterStatus {
