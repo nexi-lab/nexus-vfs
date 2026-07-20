@@ -665,42 +665,48 @@ pub fn read_or_mint_node_id(zones_dir: &str) -> Result<u64, String> {
     }
 }
 
-/// Validate that the parsed peer address book excludes `self_address`.
+/// Return the peer address book with any entry that resolves to
+/// `self_address` removed, warning once per dropped entry.
 ///
-/// Contract under PR #3996+: `NEXUS_PEERS` (or `--peers` for
-/// `nexusd-cluster`) lists OTHER nodes only.  Self goes in the
-/// ConfState via `create_zone(self)` on the founder or `AddNode(self)`
-/// on a joiner — not via the address book.  Listing self inside the
-/// address book was a vestige of the pre-#3996 contract where
-/// `peer_addrs` doubled as the ConfState voter list, and today it is
-/// a footgun: if `self_address` does not exactly string-match the
-/// self entry (e.g. operator passed an IP for the peer entry but the
-/// hostname-derived `self_address` falls back to the OS hostname),
-/// the JoinZone retry loop tries to RPC self, registers the zone
-/// locally with `skip_bootstrap=true`, and stalls because there is no
-/// real leader to grant `AddNode`.
+/// Contract under PR #3996+: the peer address book lists OTHER nodes only.
+/// Self joins the ConfState via `create_zone(self)` on the founder or
+/// `AddNode(self)` on a joiner — never via the address book. A self-entry can
+/// still appear two ways: an operator lists self in `NEXUS_PEERS`/`--peers`, or
+/// a stale learned entry survives in the persisted identity (e.g. a node that
+/// briefly learned its own advertise address round-trips it through
+/// `persist_peers`). Either way it is a routing no-op at best and a
+/// JoinZone-self stall at worst.
 ///
-/// Fail-loud here so the misconfiguration surfaces at boot rather
-/// than as a silent stall after `Zone 'root' registered (peers=1)`.
-pub fn validate_peers_excludes_self(
-    peer_addrs: &[NodeAddress],
-    self_address: &str,
-) -> Result<(), String> {
-    for peer in peer_addrs {
-        let peer_hostport = peer
-            .endpoint
-            .trim_start_matches("https://")
-            .trim_start_matches("http://");
-        if peer_hostport == self_address {
-            return Err(format!(
-                "peer list contains self ('{self_address}'); under the PR #3996 \
-                 opaque-ID contract NEXUS_PEERS / --peers must list OTHER nodes \
-                 only.  Self joins the cluster via NEXUS_BOOTSTRAP_NEW=1 \
-                 (founder) or AddNode-on-leader (joiner), not the address book.",
-            ));
-        }
-    }
-    Ok(())
+/// This EXCLUDES self and warns rather than refusing to boot. An earlier
+/// version hard-failed to surface operator misconfiguration, but that made a
+/// stale persisted self-entry BRICK a restart (the daemon could never boot
+/// again without a manual identity edit) — a far worse failure than a filtered
+/// warning. Excluding self is always the correct interpretation: self is never
+/// a transport peer. Raft membership (self as a voter) lives in `ConfState` and
+/// is untouched here — this shapes only the transport peer address book.
+pub fn peers_excluding_self(peer_addrs: &[NodeAddress], self_address: &str) -> Vec<NodeAddress> {
+    peer_addrs
+        .iter()
+        .filter(|peer| {
+            let peer_hostport = peer
+                .endpoint
+                .trim_start_matches("https://")
+                .trim_start_matches("http://");
+            if peer_hostport == self_address {
+                tracing::warn!(
+                    self_address,
+                    "peer address book contains self — excluding it; self joins \
+                     via bootstrap / AddNode-on-leader, not the address book \
+                     (PR #3996 opaque-ID contract). A stale self-entry is \
+                     filtered, not fatal."
+                );
+                false
+            } else {
+                true
+            }
+        })
+        .cloned()
+        .collect()
 }
 
 fn joiner_local_zone_peer_seeds(peer_addrs: &[NodeAddress]) -> Vec<String> {
@@ -2602,28 +2608,31 @@ mod tests {
     }
 
     #[test]
-    fn validate_peers_excludes_self_accepts_other_peers_only() {
+    fn peers_excluding_self_keeps_other_peers_only() {
         // Address book lists OTHER nodes — happy path under the
-        // PR #3996 contract.
+        // PR #3996 contract; nothing is filtered.
         let peers = vec![parse_peer("100.64.0.21:2126")];
-        validate_peers_excludes_self(&peers, "100.64.0.26:2126")
-            .expect("other-peers-only must be accepted");
+        let kept = peers_excluding_self(&peers, "100.64.0.26:2126");
+        assert_eq!(kept.len(), 1, "other-peers-only pass through unchanged");
+        assert_eq!(kept[0].endpoint, peers[0].endpoint);
     }
 
     #[test]
-    fn validate_peers_excludes_self_rejects_self_in_list() {
-        // Operator pasted self into NEXUS_PEERS — fail-loud at parse
-        // time rather than letting the JoinZone retry loop stall on
-        // a self-RPC that never gets a leader.
+    fn peers_excluding_self_drops_self_without_bricking() {
+        // A self-entry — operator-listed in NEXUS_PEERS, or a stale learned
+        // entry that survived in the persisted identity — must be FILTERED
+        // (warn), never fatal. A hard-fail here would brick a restart: the
+        // daemon could not boot again until someone hand-edited identity.json.
+        // Self is never a transport peer; it joins via bootstrap / AddNode.
         let peers = vec![
-            parse_peer("100.64.0.26:2126"),
+            parse_peer("100.64.0.26:2126"), // self
             parse_peer("100.64.0.21:2126"),
         ];
-        let err = validate_peers_excludes_self(&peers, "100.64.0.26:2126")
-            .expect_err("self-in-peers must be rejected");
-        assert!(
-            err.contains("contains self"),
-            "error must name the contract violation, got: {err}",
+        let kept = peers_excluding_self(&peers, "100.64.0.26:2126");
+        assert_eq!(kept.len(), 1, "self dropped, the real peer kept");
+        assert_eq!(
+            kept[0].endpoint.trim_start_matches("http://"),
+            "100.64.0.21:2126",
         );
     }
 
@@ -2647,9 +2656,9 @@ mod tests {
     }
 
     #[test]
-    fn validate_peers_excludes_self_empty_list_is_ok() {
+    fn peers_excluding_self_empty_is_empty() {
         // Founder mode with no other peers yet.
-        validate_peers_excludes_self(&[], "100.64.0.26:2126").expect("empty list ok");
+        assert!(peers_excluding_self(&[], "100.64.0.26:2126").is_empty());
     }
 
     #[test]
