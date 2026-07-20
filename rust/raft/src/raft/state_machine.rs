@@ -1577,7 +1577,11 @@ impl StateMachine for FullStateMachine {
         command: &Command,
         entry_timestamp: u64,
     ) -> Result<CommandResult> {
-        match command {
+        // Track whether an LWW check short-circuited as a stale no-op, so the
+        // observer spine below doesn't fire side effects for a write we
+        // deliberately dropped.
+        let mut applied = true;
+        let result = match command {
             Command::SetMetadata { key, value } => {
                 // LWW: compare incoming vs existing modified_at (ISO 8601 lexicographic)
                 if let Some(existing) = self.metadata.get(key.as_bytes())? {
@@ -1590,10 +1594,14 @@ impl StateMachine for FullStateMachine {
                             existing = existing_ts.as_str(),
                             "LWW: skipping stale SetMetadata from peer"
                         );
-                        return Ok(CommandResult::Success);
+                        applied = false;
+                        Ok(CommandResult::Success)
+                    } else {
+                        self.apply_set_metadata(key, value)
                     }
+                } else {
+                    self.apply_set_metadata(key, value)
                 }
-                self.apply_set_metadata(key, value)
             }
             Command::DeleteMetadata { key } => {
                 // LWW: compare entry timestamp (u64) vs existing modified_at (parsed to u64)
@@ -1606,15 +1614,46 @@ impl StateMachine for FullStateMachine {
                             existing_ts = existing_unix,
                             "LWW: skipping stale DeleteMetadata from peer"
                         );
-                        return Ok(CommandResult::Success);
+                        applied = false;
+                        Ok(CommandResult::Success)
+                    } else {
+                        self.apply_delete_metadata(key)
                     }
+                } else {
+                    self.apply_delete_metadata(key)
                 }
-                self.apply_delete_metadata(key)
+            }
+            // Stream entries are union-by-unique-key, NOT an LWW register: each
+            // key (owner-partitioned lane + seq) is written by exactly one
+            // owner, so there is never a conflicting concurrent write to
+            // resolve — re-apply of the same key is an idempotent set/delete.
+            // This is the mailbox's AP write path arriving on a peer.
+            Command::AppendStreamEntry { key, data } => {
+                self.stream_entries.set(key.as_bytes(), data)?;
+                Ok(CommandResult::Success)
+            }
+            Command::DeleteStreamEntry { key } => {
+                self.stream_entries.delete(key.as_bytes())?;
+                Ok(CommandResult::Success)
             }
             _ => Err(super::RaftError::InvalidState(
-                "Only metadata operations support EC writes".into(),
+                "Only metadata + stream operations support EC writes".into(),
             )),
+        };
+
+        // Fire the apply-observer spine on the RECEIVER so an EC-replicated
+        // write triggers the same side effects a raft-committed one does:
+        // DCache invalidation (stale-read safety — the pre-existing gap where
+        // EC applies skipped it) and the A2A stream-wakeup (a parked sys_watch
+        // on this node wakes for a peer's AppendStreamEntry). The origin fired
+        // these via its local write path; this node only ever sees the entry
+        // via EC apply, so this is the sole + correct fire (no double-fire).
+        // Skip on a stale-LWW no-op. EC applies carry no raft index — pass 0;
+        // every registered observer keys on the command, not the index.
+        if applied && result.is_ok() {
+            self.emit_apply_observers(0, command, None);
         }
+        result
     }
 
     fn ec_state_snapshot(&self) -> Vec<(String, Vec<u8>)> {
