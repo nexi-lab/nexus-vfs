@@ -34,7 +34,7 @@ use kernel::kernel::convenience::{KernelConvenience, MountOptions};
 use kernel::kernel::Kernel;
 
 use nexus_raft::distributed_coordinator::{
-    bootstrap_or_join_zone, read_or_mint_node_id, validate_peers_excludes_self,
+    bootstrap_or_join_zone, peers_excluding_self, read_or_mint_node_id,
 };
 use nexus_raft::federation::{parse_federation_env, ENV_FEDERATION_MOUNTS, ENV_FEDERATION_ZONES};
 use nexus_raft::transport::{bootstrap_tls, NodeAddress};
@@ -885,10 +885,6 @@ fn open_zone_manager(
     let merged_peer_addrs: Vec<NodeAddress> =
         NodeAddress::parse_peer_list_operator(&merged_peers_joined, use_tls)
             .map_err(|e| anyhow::anyhow!("identity peers parse: {}", e))?;
-    let merged_peers_str: Vec<String> = merged_peer_addrs
-        .iter()
-        .map(NodeAddress::to_raft_peer_str)
-        .collect();
 
     // Advertise address — used as `StepMessage.sender_address` so the
     // peer-map runtime SSOT can learn this node's reachable endpoint.
@@ -912,13 +908,18 @@ fn open_zone_manager(
         merged_peer_addrs.len(),
     );
 
-    // Reject "self listed in --peers" early — see
-    // `validate_peers_excludes_self` for why this is a hard error
-    // under the PR #3996 opaque-ID contract.  Runs on the MERGED set
-    // so an identity-persisted stale self-entry also surfaces here
-    // rather than after `Zone registered`.
-    validate_peers_excludes_self(&merged_peer_addrs, &self_address)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    // Exclude self from the peer address book — warn, don't crash. Self is
+    // never a transport peer (it joins via bootstrap / AddNode, PR #3996
+    // opaque-ID contract). A self-entry can appear from an operator listing
+    // self OR a stale learned entry that survived in the persisted identity;
+    // hard-failing on it would BRICK a restart (the daemon could never boot
+    // again without hand-editing identity.json). Filter on the MERGED set so
+    // both sources are handled. Raft membership (ConfState) is untouched.
+    let merged_peer_addrs = peers_excluding_self(&merged_peer_addrs, &self_address);
+    let merged_peers_str: Vec<String> = merged_peer_addrs
+        .iter()
+        .map(NodeAddress::to_raft_peer_str)
+        .collect();
 
     let zm = ZoneManager::with_node_id(
         &hostname,

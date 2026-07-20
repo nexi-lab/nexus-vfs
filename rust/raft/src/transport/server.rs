@@ -1517,6 +1517,8 @@ impl WitnessZoneRegistry {
         if endpoint.is_empty() || peer_id == 0 {
             return false;
         }
+        // Self-exclusion is enforced structurally by `PeerMap::insert` (see
+        // `PeerMap`); the insert below returns `false` for a self-entry.
         let Some(entry) = self.zones.get(zone_id) else {
             return false;
         };
@@ -1534,8 +1536,8 @@ impl WitnessZoneRegistry {
             }
             Err(_) => return false,
         };
-        peers.insert(peer_id, parsed);
-        true
+        // `PeerMap::insert` returns `false` iff the entry was self.
+        peers.insert(peer_id, parsed)
     }
 
     /// Create a witness Raft group for a zone (static bootstrap).
@@ -1766,9 +1768,13 @@ impl WitnessZoneRegistry {
                 TransportError::Connection(format!("Failed to create witness ZoneConsensus: {}", e))
             })?;
 
-        // Shared peer map
+        // Shared peer map — `PeerMap::with_peers` drops any self-entry in the
+        // seed (self is a ConfState member, not a transport peer).
         let peer_map: HashMap<u64, NodeAddress> = peers.into_iter().map(|p| (p.id, p)).collect();
-        let shared_peers: super::SharedPeerMap = Arc::new(RwLock::new(peer_map));
+        let shared_peers: super::SharedPeerMap = Arc::new(RwLock::new(super::PeerMap::with_peers(
+            self.node_id,
+            peer_map,
+        )));
         driver.set_peer_map(shared_peers.clone(), self.tls.read().unwrap().is_some());
 
         // Spawn transport loop with zone_id routing

@@ -244,10 +244,14 @@ async fn test_share_join_learner_survives_joiner_wipe_rejoin() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    // cluster_status counts peers from the address book (which
-    // includes the learner address), so the assertion is that
-    // *quorum* is still 1-of-owner — verified below by the propose
-    // path surviving b1 going dark.
+    // cluster_status now reports the authoritative raft voter set
+    // (ConfState), so the learner is correctly excluded — voter_count is 1,
+    // matching the intent above. Quorum staying 1-of-owner is additionally
+    // verified below by the propose path surviving b1 going dark.
+    assert_eq!(
+        owner_voters, 1,
+        "learner must not count toward the voter set (raft ConfState is the SSOT)"
+    );
 
     // Joiner v1 is "gone" (we never start its gRPC accept loop in
     // earnest beyond the registration; the JoinZone RPC has already
@@ -293,7 +297,9 @@ async fn test_share_join_learner_survives_joiner_wipe_rejoin() {
     );
     // owner_voters surfaced from cluster_status — sanity printout
     // for diagnosis if the assertion below ever fires.
-    eprintln!("cluster_status voter_count={owner_voters} (counts peers, not raft voters)");
+    eprintln!(
+        "cluster_status voter_count={owner_voters} (raft ConfState voters, learners excluded)"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -22,7 +22,7 @@ use crate::raft::{
 };
 use crate::storage::RedbStore;
 use crate::transport::{
-    ClientConfig, NodeAddress, RaftClientPool, SharedPeerMap, TlsConfig, TransportError,
+    ClientConfig, NodeAddress, PeerMap, RaftClientPool, SharedPeerMap, TlsConfig, TransportError,
     TransportLoop,
 };
 use dashmap::DashMap;
@@ -625,8 +625,11 @@ impl ZoneRaftRegistry {
             )?;
 
         // Peer map — shared between ZoneEntry, TransportLoop, and ZoneConsensusDriver.
+        // `PeerMap::with_peers` drops any self-entry in the seed (self is a ConfState
+        // member, not a transport peer — see `PeerMap` invariant).
         let peer_map: HashMap<u64, NodeAddress> = peers.into_iter().map(|p| (p.id, p)).collect();
-        let shared_peers: SharedPeerMap = Arc::new(RwLock::new(peer_map));
+        let shared_peers: SharedPeerMap =
+            Arc::new(RwLock::new(PeerMap::with_peers(self.node_id, peer_map)));
 
         driver.set_peer_map(shared_peers.clone(), self.tls_config().is_some());
 
@@ -775,7 +778,7 @@ impl ZoneRaftRegistry {
     pub fn get_peers(&self, zone_id: &str) -> Option<HashMap<u64, NodeAddress>> {
         self.zones
             .get(zone_id)
-            .map(|e| e.peers.read().unwrap().clone())
+            .map(|e| e.peers.read().unwrap().snapshot())
     }
 
     /// Get cluster peer addresses from any existing zone (all zones share the same peers).
@@ -818,6 +821,10 @@ impl ZoneRaftRegistry {
         if endpoint.is_empty() || peer_id == 0 {
             return false;
         }
+        // Self-exclusion is enforced structurally by `PeerMap::insert` (self is a
+        // ConfState member, not a transport peer — PR #3996 opaque-ID contract);
+        // the insert below returns `false` for a self-entry, so this method
+        // reports "no change" without a scattered `== self.node_id` guard.
         let Some(entry) = self.zones.get(zone_id) else {
             return false;
         };
@@ -840,8 +847,9 @@ impl ZoneRaftRegistry {
             }
             Err(_) => return false,
         };
-        peers.insert(peer_id, parsed);
-        true
+        // `PeerMap::insert` returns `false` iff the entry was self — propagate
+        // that as "map unchanged".
+        peers.insert(peer_id, parsed)
     }
 
     /// Get the node_id for a zone (same across all zones on this node).
@@ -923,7 +931,7 @@ impl ZoneRaftRegistry {
                 zone_id.to_string(),
                 ZoneEntry {
                     node,
-                    peers: Arc::new(RwLock::new(HashMap::new())),
+                    peers: Arc::new(RwLock::new(PeerMap::new(self.node_id))),
                     node_id: self.node_id,
                     shutdown_tx,
                     transport_handle,
