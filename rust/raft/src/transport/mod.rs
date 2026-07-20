@@ -204,14 +204,98 @@ pub use lib::transport_primitives::{
 #[cfg(feature = "grpc")]
 pub type Result<T> = lib::transport_primitives::Result<T>;
 
+/// The transport peer address book for one zone — the dial addresses of the
+/// **other** nodes in the cluster.
+///
+/// ## Invariant: self is never a peer (enforced by construction)
+///
+/// Under the opaque-ID contract (PR #3996) a node is a *member* of its own
+/// ConfState, not a *transport peer* of itself — it never dials itself. Several
+/// independent paths write this map: runtime `learn_peer_address` (from an
+/// inbound message's `sender_address`), `add_peer` (post-ConfChange), and the
+/// raft ConfChange-apply loop in `RaftNode` (which shares this very `Arc`). A
+/// stray self-entry from any of them — a self-`from` message under churn, or
+/// self appearing in a ConfChange context — would round-trip through
+/// `persist_peers` into `identity.json`, and a later restart would then trip
+/// the boot-time self-exclusion.
+///
+/// Rather than repeat an `if id == self.node_id` guard at every writer (fragile
+/// — a new writer silently reintroduces the bug), this type owns `self_id` and
+/// drops a self-entry inside [`PeerMap::insert`]. The invariant then holds no
+/// matter which path writes. Mutation is possible ONLY through `insert`/`remove`;
+/// reads go through a read-only [`Deref`](std::ops::Deref) to the inner map (no
+/// `DerefMut`), so the guard cannot be bypassed.
+#[derive(Debug)]
+pub struct PeerMap {
+    self_id: u64,
+    inner: std::collections::HashMap<u64, NodeAddress>,
+}
+
+impl PeerMap {
+    /// Empty book for the node identified by `self_id`.
+    pub fn new(self_id: u64) -> Self {
+        Self {
+            self_id,
+            inner: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Seed the book from an initial peer set. Any self-entry in `peers` is
+    /// dropped, so the invariant holds even for a pre-poisoned seed (e.g. an
+    /// `identity.json` written before this type existed).
+    pub fn with_peers(self_id: u64, peers: std::collections::HashMap<u64, NodeAddress>) -> Self {
+        let mut map = Self::new(self_id);
+        for (id, addr) in peers {
+            map.insert(id, addr);
+        }
+        map
+    }
+
+    /// Insert or update a peer's dial address.
+    ///
+    /// A self-entry (`id == self_id`) is silently dropped — self is not a
+    /// transport peer. Returns `true` if the map changed (a real peer was
+    /// inserted or its address updated), `false` if the entry was self.
+    pub fn insert(&mut self, id: u64, addr: NodeAddress) -> bool {
+        if id == self.self_id {
+            tracing::debug!(
+                self_id = self.self_id,
+                "peer map: dropped self-entry (self is a ConfState member, not a transport peer)"
+            );
+            return false;
+        }
+        self.inner.insert(id, addr);
+        true
+    }
+
+    /// Remove a peer (e.g. on ConfChange `RemoveNode`).
+    pub fn remove(&mut self, id: &u64) -> Option<NodeAddress> {
+        self.inner.remove(id)
+    }
+
+    /// Clone out the inner address book (self already excluded by the invariant).
+    pub fn snapshot(&self) -> std::collections::HashMap<u64, NodeAddress> {
+        self.inner.clone()
+    }
+}
+
+/// Read-only view of the address book. Mutation is intentionally NOT exposed
+/// (no `DerefMut`) so every write funnels through `insert`/`remove` and the
+/// self-exclusion invariant cannot be bypassed.
+impl std::ops::Deref for PeerMap {
+    type Target = std::collections::HashMap<u64, NodeAddress>;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
 /// Shared peer map that can be updated at runtime (e.g., when new nodes join via ConfChange).
 ///
 /// Uses `std::sync::RwLock` (not tokio) because:
 /// - Read/write operations are very fast (HashMap insert/lookup)
 /// - Accessed from both sync (DashMap guard) and async (transport loop) contexts
 /// - Write-rarely, read-often pattern — no contention in practice
-pub type SharedPeerMap =
-    std::sync::Arc<std::sync::RwLock<std::collections::HashMap<u64, NodeAddress>>>;
+pub type SharedPeerMap = std::sync::Arc<std::sync::RwLock<PeerMap>>;
 
 // Re-export generated types when grpc feature is enabled and protos were compiled
 #[cfg(all(feature = "grpc", has_protos))]
@@ -243,3 +327,78 @@ pub mod proto {
 }
 
 // Tests for PeerAddress, NodeAddress, hostname_to_node_id now live in transport.
+
+#[cfg(test)]
+mod peer_map_tests {
+    use super::{NodeAddress, PeerMap};
+
+    const SELF_ID: u64 = 1001;
+
+    fn addr(id: u64) -> NodeAddress {
+        NodeAddress::new(id, format!("http://node-{id}:9000"))
+    }
+
+    #[test]
+    fn insert_keeps_other_peers() {
+        let mut m = PeerMap::new(SELF_ID);
+        assert!(m.insert(2002, addr(2002)), "a real peer is stored");
+        assert!(m.insert(3003, addr(3003)));
+        assert_eq!(m.len(), 2);
+        assert!(m.get(&2002).is_some());
+        assert!(m.get(&3003).is_some());
+    }
+
+    #[test]
+    fn insert_drops_self() {
+        let mut m = PeerMap::new(SELF_ID);
+        // Self is a ConfState member, not a transport peer — dropped on insert,
+        // no matter which caller (learn_peer_address, add_peer, ConfChange apply)
+        // hands it to us.
+        assert!(
+            !m.insert(SELF_ID, addr(SELF_ID)),
+            "self returns 'unchanged'"
+        );
+        assert!(m.is_empty(), "self never enters the book");
+        assert!(m.get(&SELF_ID).is_none());
+    }
+
+    #[test]
+    fn with_peers_filters_a_pre_poisoned_seed() {
+        // A seed built from a stale identity.json that already contains self
+        // (written before this invariant existed) must not brick the node.
+        let seed = std::collections::HashMap::from([
+            (SELF_ID, addr(SELF_ID)),
+            (2002, addr(2002)),
+            (3003, addr(3003)),
+        ]);
+        let m = PeerMap::with_peers(SELF_ID, seed);
+        assert_eq!(m.len(), 2, "self filtered out of the seed");
+        assert!(m.get(&SELF_ID).is_none());
+        assert!(m.get(&2002).is_some());
+    }
+
+    #[test]
+    fn remove_and_snapshot() {
+        let mut m = PeerMap::new(SELF_ID);
+        m.insert(2002, addr(2002));
+        m.insert(3003, addr(3003));
+        assert!(m.remove(&2002).is_some());
+        let snap = m.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert!(snap.contains_key(&3003));
+        assert!(!snap.contains_key(&SELF_ID));
+    }
+
+    #[test]
+    fn conf_change_self_add_is_a_noop() {
+        // Mirrors the raft ConfChange-apply path (node.rs): AddNode for self
+        // must not land self in the transport book. The type enforces it — the
+        // apply loop does `peer_map.write().unwrap().insert(id, addr)` with no
+        // self-guard of its own.
+        let mut m = PeerMap::new(SELF_ID);
+        m.insert(2002, addr(2002));
+        let changed = m.insert(SELF_ID, addr(SELF_ID)); // ConfChange::AddNode(self)
+        assert!(!changed);
+        assert_eq!(m.len(), 1);
+    }
+}
