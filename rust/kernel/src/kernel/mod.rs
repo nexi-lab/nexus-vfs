@@ -22,6 +22,7 @@
 use crate::core::permission_cache::PermissionLeaseCache;
 use crate::dispatch::{NativeHookRegistry, ObserverRegistry, Trie};
 use crate::file_watch::FileWatchRegistry;
+use crate::hal::distributed_coordinator::Consistency;
 use crate::lock_manager::LockManager;
 use crate::meta_store::LocalMetaStore;
 #[cfg(test)]
@@ -1939,6 +1940,50 @@ impl Kernel {
     /// branch, so a replica reconstructs the exact backend the creator chose.
     /// Returns the shared-memory handles (only the `shared_memory` arm yields
     /// them); errors if no waterfall entry was available on this node.
+    /// Install a raft-composed WAL DT_STREAM backend at `path` under
+    /// `consistency`, backed by the metastore of the path's resolved zone.
+    ///
+    /// The stream MUST live in the PATH's zone, not hardcoded root: a
+    /// `chat-with-me` under a federation mount (`/agents=<zone>`) has to propose
+    /// its `AppendStreamEntry` to THAT zone's raft so it replicates to peers.
+    /// Backing it with root (node-local) would silently never cross machines.
+    /// `route().zone_id` is the resolved destination zone (the routing SSOT) —
+    /// root for an unmounted path, the federation zone for a mount. The SAME
+    /// resolution runs on every member, so a reopen on a replica composes a
+    /// `WalStreamCore` over that replica's own metastore.
+    ///
+    /// `WalStreamCore` composes whatever distributed `MetaStore` the coordinator
+    /// DI'd — layering preserved without a per-primitive DI method on the trait.
+    /// Returns `Ok(true)` when installed, `Ok(false)` when no zone metastore is
+    /// available (federation not wired) so the caller falls through the
+    /// io_profile waterfall; a register failure propagates as `Err`.
+    fn install_wal_stream(
+        &self,
+        path: &str,
+        consistency: Consistency,
+    ) -> Result<bool, KernelError> {
+        let zone_id = self
+            .vfs_router
+            .route(path, contracts::ROOT_ZONE_ID)
+            .map(|r| r.zone_id)
+            .unwrap_or_else(|| contracts::ROOT_ZONE_ID.to_string());
+        if let Ok(store) = self
+            .distributed_coordinator()
+            .metastore_for_zone(self, &zone_id)
+        {
+            let backend = crate::core::stream::wal::WalStreamCore::new_with_consistency(
+                store,
+                path.to_string(),
+                consistency,
+            );
+            self.stream_manager
+                .register(path, Arc::new(backend))
+                .map_err(stream_mgr_err)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     fn install_stream_backend(
         &self,
         path: &str,
@@ -1965,40 +2010,25 @@ impl Kernel {
                     }
                 }
                 "wal" => {
-                    // Raft-replicated durable DT_STREAM. Available iff the
-                    // coordinator can hand us a zone metastore (federation
-                    // wired); if not, fall through to the next backend.
-                    // WalStreamCore composes whatever distributed MetaStore the
-                    // coordinator DI'd — layering preserved without a
-                    // per-primitive DI method on the trait.
-                    //
-                    // The stream MUST live in the PATH's zone, not hardcoded
-                    // root: a chat-with-me under a federation mount
-                    // (`/agents=<zone>`) has to propose its AppendStreamEntry
-                    // to THAT zone's raft so it replicates to peers. Backing
-                    // it with root (node-local) would silently never cross
-                    // machines. `route().zone_id` is the resolved destination
-                    // zone (the routing SSOT) — root for an unmounted path,
-                    // the federation zone for a mount. The SAME resolution runs
-                    // on every member, so a reopen on a replica composes a
-                    // WalStreamCore over that replica's own metastore.
-                    let zone_id = self
-                        .vfs_router
-                        .route(path, contracts::ROOT_ZONE_ID)
-                        .map(|r| r.zone_id)
-                        .unwrap_or_else(|| contracts::ROOT_ZONE_ID.to_string());
-                    if let Ok(store) = self
-                        .distributed_coordinator()
-                        .metastore_for_zone(self, &zone_id)
-                    {
-                        let backend =
-                            crate::core::stream::wal::WalStreamCore::new(store, path.to_string());
-                        self.stream_manager
-                            .register(path, Arc::new(backend))
-                            .map_err(stream_mgr_err)?;
+                    // Raft-replicated durable DT_STREAM (strong consistency).
+                    // Available iff the coordinator can hand us a zone metastore
+                    // (federation wired); if not, fall through to the next
+                    // backend in the waterfall.
+                    if self.install_wal_stream(path, Consistency::Sc)? {
                         return Ok((None, None));
                     }
-                    // wal unavailable here → try the next profile in the waterfall
+                }
+                "wal_ec" => {
+                    // Eventually-consistent WAL DT_STREAM — the AP plane the A2A
+                    // mailbox rides. Same distributed backing as `wal`, but
+                    // every append proposes via `propose_ec_local` (local-apply
+                    // + async replicate, LWW), so a send succeeds even when no
+                    // raft quorum is reachable. The creator names this profile
+                    // when it wants an available-under-partition stream; the
+                    // kernel stays generic (no mailbox-path knowledge here).
+                    if self.install_wal_stream(path, Consistency::Ec)? {
+                        return Ok((None, None));
+                    }
                 }
                 _ => {
                     // "memory" (and any other / empty token): the always-
