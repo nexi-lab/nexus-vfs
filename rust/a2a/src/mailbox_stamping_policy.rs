@@ -22,15 +22,52 @@
 
 use std::borrow::Cow;
 
-const CHAT_WITH_ME_SUFFIX: &str = "/chat-with-me";
+/// The mailbox path suffix. SSOT for the `/chat-with-me` convention — the
+/// stamp hook's `mutating_path_suffix()` (which drives the write-content
+/// clone) and these path predicates MUST agree on it, so it is defined once
+/// here and referenced by the hook rather than re-declared.
+pub const CHAT_WITH_ME_SUFFIX: &str = "/chat-with-me";
 
-/// Whether `path` is an A2A mailbox (a `*/chat-with-me` DT_STREAM).
+/// The node-local managed-agent mailbox pipe prefix —
+/// `/proc/{pid}/chat-with-me` (a DT_PIPE, intra-node, NOT replicated). It
+/// shares the `/chat-with-me` suffix with the replicated A2A mailbox but is
+/// exempt from the *cross-machine* fail-closed identity gate. `/proc` is a
+/// stable kernel convention for the process tree, not an operator-set mount.
+const NODE_LOCAL_MAILBOX_PREFIX: &str = "/proc/";
+
+/// Whether `path` ends in the mailbox suffix (`*/chat-with-me`).
 ///
-/// SSOT for the "is this a mailbox write" predicate — used by both the
-/// `from`-stamp ([`maybe_stamp_chat_envelope`]) and the fail-closed gate
-/// (`MailboxStampingHook::on_pre`) so they cannot drift.
+/// This is the **stamp** scope: the `from`-guarantee applies to every
+/// mailbox-shaped write, including the local managed-agent pipe
+/// (`/proc/{pid}/chat-with-me`) it was originally built for. Used by
+/// [`maybe_stamp_chat_envelope`].
 pub fn is_mailbox_path(path: &str) -> bool {
     path.ends_with(CHAT_WITH_ME_SUFFIX)
+}
+
+/// Whether `path` is a *cross-machine* mailbox subject to fail-closed.
+///
+/// The **fail-closed** scope, narrower than [`is_mailbox_path`]: rejecting an
+/// unauthenticated write is a security requirement for a mailbox whose writes
+/// reach other machines (untrusted remote peers). It must NOT catch the local
+/// managed-agent pipe (`/proc/{pid}/chat-with-me`), which legitimately uses a
+/// system/bare ctx and is not replicated. The stamp still runs on the local
+/// pipe via [`is_mailbox_path`] — it is just never *rejected*.
+///
+/// FAIL-SAFE + mount-independent by construction: every `*/chat-with-me`
+/// EXCEPT the node-local `/proc/` pipe. Deliberately NOT keyed off the A2A
+/// mount point (`/agents`, operator-configurable via `NEXUS_FEDERATION_MOUNTS`)
+/// — keying on the mount would fail UNSAFE, silently skipping the gate for a
+/// mailbox under a differently-named mount. Excluding the one stable
+/// node-local convention instead gates a replicated mailbox wherever it is
+/// mounted. (Over-including an oddly-placed non-mailbox file named
+/// `chat-with-me` is the safe direction for a security gate.)
+///
+/// NOTE: the precise mailbox-path structure is finalized by §F (per-sender
+/// lanes vs one shared inbox — see the multi-writer seq contract); this is
+/// the fail-safe interim until then.
+pub fn is_a2a_mailbox_path(path: &str) -> bool {
+    is_mailbox_path(path) && !path.starts_with(NODE_LOCAL_MAILBOX_PREFIX)
 }
 
 /// Rewrite the envelope's `from` field to the caller's `agent_id` when
@@ -160,5 +197,30 @@ mod tests {
         let original = br#"["msg1","msg2"]"#;
         let out = maybe_stamp_chat_envelope("/proc/p1/chat-with-me", Some("agent-a"), original);
         assert!(out.is_none());
+    }
+
+    #[test]
+    fn mailbox_predicate_scopes() {
+        // Stamp scope (broad): any `*/chat-with-me`, incl. the local pipe.
+        assert!(is_mailbox_path("/agents/win-ai/chat-with-me"));
+        assert!(is_mailbox_path("/proc/p1/chat-with-me"));
+        assert!(!is_mailbox_path("/workspace/notes.md"));
+
+        // Fail-closed scope: any mailbox EXCEPT the node-local /proc pipe.
+        assert!(is_a2a_mailbox_path("/agents/win-ai/chat-with-me"));
+        assert!(
+            !is_a2a_mailbox_path("/proc/p1/chat-with-me"),
+            "the node-local managed-agent pipe is exempt from the gate"
+        );
+        assert!(
+            !is_a2a_mailbox_path("/agents/win-ai/notes.txt"),
+            "a non-chat-with-me file is never a mailbox"
+        );
+        // Mount-independent: a mailbox under a DIFFERENTLY-named federation
+        // mount is still gated (keying off `/agents` would fail unsafe).
+        assert!(
+            is_a2a_mailbox_path("/team-mailboxes/win-ai/chat-with-me"),
+            "fail-safe: a mailbox under any mount is gated, not just /agents"
+        );
     }
 }
