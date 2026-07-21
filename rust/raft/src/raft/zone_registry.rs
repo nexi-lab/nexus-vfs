@@ -793,19 +793,6 @@ impl ZoneRaftRegistry {
         Vec::new()
     }
 
-    /// Add a peer to a zone's peer map at runtime (called after ConfChange commit).
-    ///
-    /// The transport loop sees the new peer on its next tick because
-    /// it shares the same `SharedPeerMap` via `Arc`.
-    pub fn add_peer(&self, zone_id: &str, node_id: u64, address: NodeAddress) -> bool {
-        if let Some(entry) = self.zones.get(zone_id) {
-            entry.peers.write().unwrap().insert(node_id, address);
-            true
-        } else {
-            false
-        }
-    }
-
     /// Record a peer's advertise address learned from an inbound
     /// `StepMessage`.  The transport peer-map's runtime SSOT under
     /// the opaque-ID contract: every received raft message proves
