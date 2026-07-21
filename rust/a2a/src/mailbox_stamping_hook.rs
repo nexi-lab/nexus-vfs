@@ -10,20 +10,15 @@
 //! owns "how to be a hook" (dispatch wiring), policy owns "what to
 //! rewrite" (envelope schema, identity guarantee).
 //!
-//! The hook is armed at cluster boot by [`crate::install_a2a`], which
+//! The hook is armed at cluster boot by [`crate::install_a2a_stamp_hook`], which
 //! binds it to the `a2a` hook-only service. It is `pub` so both the
 //! boot wiring and consumer frontends (e.g. the matrix adapter's test
 //! fixtures) that ride the same substrate can register it.
 
 use crate::mailbox_stamping_policy;
+use crate::mailbox_stamping_policy::CHAT_WITH_ME_SUFFIX;
 use contracts::is_system_path;
 use kernel::core::dispatch::{HookContext, HookOutcome, NativeInterceptHook};
-
-/// Path suffix the dispatcher consults to decide when to clone write
-/// content into `WriteHookCtx`. Kept as a constant so the suffix
-/// declared by the trait method matches the one mailbox stamping
-/// itself recognises.
-const CHAT_WITH_ME_SUFFIX: &str = "/chat-with-me";
 
 pub struct MailboxStampingHook {
     /// When true, a mailbox write with no caller `agent_id` is REJECTED
@@ -97,18 +92,25 @@ impl NativeInterceptHook for MailboxStampingHook {
             Some(c.identity.agent_id.as_str())
         };
         // Fail-closed: an unforgeable `from` requires a real agent identity,
-        // so a mailbox write with no caller `agent_id` is rejected rather than
-        // passed through unstamped. Gated on `fail_closed` (set from the auth
-        // posture at install) so a NoAuth bring-up — where every write has an
-        // empty `agent_id` — stays fail-open. A pre-hook `Err` aborts the write
-        // as a permission error (see `HookOutcome` docs). Scoped to genuine
-        // mailbox paths via the policy SSOT predicate so a non-mailbox write
-        // that merely shares a future hook's suffix is never rejected here.
-        if self.fail_closed && caller.is_none() && mailbox_stamping_policy::is_mailbox_path(&c.path)
+        // so an A2A mailbox write with no caller `agent_id` is rejected rather
+        // than passed through unstamped. Gated on `fail_closed` (set from the
+        // auth posture at install) so a NoAuth bring-up — where every write has
+        // an empty `agent_id` — stays fail-open. A pre-hook `Err` aborts the
+        // write as a permission error (see `HookOutcome` docs).
+        //
+        // Scoped to the A2A cross-machine mailbox (`/agents/…/chat-with-me`),
+        // NOT every `*/chat-with-me` write: the local managed-agent pipe
+        // (`/proc/{pid}/chat-with-me`) legitimately uses a system/bare ctx and
+        // must not be rejected, and an ordinary file named `chat-with-me` is
+        // not a mailbox. The stamp below still runs on those (via the broader
+        // `maybe_stamp_chat_envelope`); only the *rejection* is A2A-scoped.
+        if self.fail_closed
+            && caller.is_none()
+            && mailbox_stamping_policy::is_a2a_mailbox_path(&c.path)
         {
             return Err(format!(
-                "fail-closed: mailbox write to {} requires an authenticated agent \
-                 identity (no agent_id on the caller)",
+                "fail-closed: A2A mailbox write to {} requires an authenticated \
+                 agent identity (no agent_id on the caller)",
                 c.path
             ));
         }
@@ -218,40 +220,62 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_rejects_empty_agent_id_mailbox_write() {
-        // Auth-armed posture: a mailbox write with no caller agent_id is
-        // rejected (Err aborts the write) so `from` cannot be forged by an
-        // unauthenticated writer.
+    fn fail_closed_rejects_empty_agent_id_a2a_mailbox_write() {
+        // Auth-armed posture: an A2A mailbox write (`/agents/…/chat-with-me`)
+        // with no caller agent_id is rejected (Err aborts the write) so `from`
+        // cannot be forged by an unauthenticated writer.
         let h = MailboxStampingHook::new_fail_closed(true);
-        let ctx = write_ctx("/proc/p1/chat-with-me", "", br#"{"to":"agent-b"}"#.to_vec());
+        let ctx = write_ctx(
+            "/agents/win-ai/chat-with-me",
+            "",
+            br#"{"to":"mac-ai"}"#.to_vec(),
+        );
         assert!(
             h.on_pre(&ctx).is_err(),
-            "fail-closed must reject an empty-agent_id mailbox write"
+            "fail-closed must reject an empty-agent_id A2A mailbox write"
         );
     }
 
     #[test]
-    fn fail_closed_still_stamps_authenticated_write() {
+    fn fail_closed_still_stamps_authenticated_a2a_write() {
         let h = MailboxStampingHook::new_fail_closed(true);
         let ctx = write_ctx(
-            "/proc/p1/chat-with-me",
-            "agent-real",
-            br#"{"from":"impostor","to":"agent-b"}"#.to_vec(),
+            "/agents/mac-ai/chat-with-me",
+            "win-ai",
+            br#"{"from":"impostor","to":"mac-ai"}"#.to_vec(),
         );
         match h.on_pre(&ctx).expect("authenticated write accepted") {
             HookOutcome::Replace(bytes) => {
                 let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-                assert_eq!(v["from"], "agent-real");
+                assert_eq!(v["from"], "win-ai");
             }
             HookOutcome::Pass => panic!("expected Replace, got Pass"),
         }
     }
 
     #[test]
+    fn fail_closed_does_not_reject_local_proc_pipe() {
+        // Scope boundary: fail-closed is for the A2A CROSS-MACHINE mailbox
+        // (`/agents/…`). The local managed-agent pipe `/proc/{pid}/chat-with-me`
+        // legitimately uses a system/bare ctx (empty agent_id) and must NOT be
+        // rejected — otherwise fail-closed under auth would break the local
+        // managed-agent loop. The stamp still runs on it (via the broad
+        // predicate); only the rejection is A2A-scoped.
+        let h = MailboxStampingHook::new_fail_closed(true);
+        let ctx = write_ctx("/proc/p1/chat-with-me", "", br#"{"to":"agent-b"}"#.to_vec());
+        assert!(
+            matches!(
+                h.on_pre(&ctx).expect("local proc pipe write accepted"),
+                HookOutcome::Pass
+            ),
+            "fail-closed must not reject the local /proc managed-agent pipe"
+        );
+    }
+
+    #[test]
     fn fail_closed_does_not_reject_non_mailbox_write() {
-        // Scoping: fail-closed rejects only genuine mailbox paths. A
-        // non-chat-with-me write with an empty agent_id must pass, never
-        // be caught by the identity gate.
+        // A non-chat-with-me write with an empty agent_id must pass, never be
+        // caught by the identity gate.
         let h = MailboxStampingHook::new_fail_closed(true);
         let ctx = write_ctx("/workspace/notes.md", "", br#"{"to":"agent-b"}"#.to_vec());
         assert!(
