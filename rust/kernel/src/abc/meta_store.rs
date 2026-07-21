@@ -434,6 +434,23 @@ pub trait MetaStore: Send + Sync {
             "get_stream_entry: not supported by this metastore (use a distributed impl, e.g. ZoneMetaStore)".to_string(),
         ))
     }
+
+    /// Enumerate stream-entry keys under ``prefix`` (keys only, no values).
+    ///
+    /// Backs durable client-side seq-resume: a stream backend (e.g.
+    /// ``WalStreamCore``) restores its next-seq cursor from the max existing
+    /// seq on open, so a restart/failover re-opens the lane PAST the last
+    /// entry instead of at 0 (which would overwrite earlier entries = message
+    /// loss). Keys are opaque to the store; the caller owns the seq encoding.
+    ///
+    /// Default: empty — a metastore that holds no stream entries has nothing
+    /// to resume from, so the cursor legitimately starts at 0. (Unlike
+    /// [`Self::get_stream_entry`], this is called speculatively on open, so
+    /// "no entries" is a valid answer, not an error.)
+    fn list_stream_entry_keys(&self, prefix: &str) -> Result<Vec<String>, MetaStoreError> {
+        let _ = prefix;
+        Ok(Vec::new())
+    }
 }
 
 /// Update `content_id` in a PAS `FileMetadata` entry after a rename.

@@ -4,9 +4,16 @@
 //!
 //! This is the drain-trigger half of the EC-drain hardening: `spawn_ec_replications`
 //! detects a peer whose next-needed seq was compacted away (`needs_snapshot`),
-//! re-materializes the full metadata state as `SetMetadata` entries, and ships
-//! it over `SnapshotEcState`.  The receiver applies it via `apply_ec_from_peer`
-//! (LWW) and catches up to keys that no longer exist in any WAL.
+//! re-materializes the full EC state as idempotent commands — metadata as
+//! `SetMetadata`, STREAM entries as `AppendStreamEntry` — and ships it over
+//! `SnapshotEcState`.  The receiver applies each via `apply_ec_from_peer`
+//! (LWW / union) and catches up to state that no longer exists in any WAL.
+//!
+//! Covers BOTH payload types: a metadata key AND a stream entry (an A2A
+//! message) must survive compaction and reach a late learner via the snapshot.
+//! Stream entries live in a separate tree from metadata, so a metadata-only
+//! snapshot (pre-Piece-5a) would silently drop them — breaking the AP delivery
+//! promise for the mailbox payload.
 //!
 //! Topology / method:
 //!   1. Founder bootstraps a 1-voter `sharedzone` and self-elects.
@@ -141,8 +148,21 @@ async fn test_ec_snapshot_catchup_late_learner_behind_compacted_wal() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // Write N EC entries.  /snap/0 lands at seq 1 (the first WAL append).
     let founder_consensus = zone_founder.consensus_node();
+
+    // Append an EC STREAM entry (an A2A message) FIRST, at the earliest seq, so
+    // it is compacted away and reachable ONLY via snapshot. It lives in the
+    // separate stream_entries tree — a metadata-only snapshot would drop it.
+    let stream_key = "__wal_stream__/agents/win-ai/chat-with-me/0";
+    founder_consensus
+        .propose_ec_local(Command::AppendStreamEntry {
+            key: stream_key.to_string(),
+            data: b"ec-msg-0".to_vec(),
+        })
+        .await
+        .expect("propose_ec_local(AppendStreamEntry) failed");
+
+    // Write N EC metadata entries.  /snap/0 lands right after the stream entry.
     const N: usize = 16;
     for i in 0..N {
         founder_consensus
@@ -214,17 +234,20 @@ async fn test_ec_snapshot_catchup_late_learner_behind_compacted_wal() {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let mut have_first = false;
     let mut have_last = false;
+    let mut have_stream = false;
     while std::time::Instant::now() < deadline {
-        let (first, last) = b_consensus
+        let (first, last, stream) = b_consensus
             .with_state_machine(|sm| {
                 let f = sm.get_metadata("/snap/0").ok().flatten();
                 let l = sm.get_metadata(&last_key).ok().flatten();
-                (f, l)
+                let s = sm.get_stream_entry(stream_key).ok().flatten();
+                (f, l, s)
             })
             .await;
         have_first = first.as_deref() == Some(b"v0".as_ref());
         have_last = last.as_deref() == Some(last_val.as_slice());
-        if have_first && have_last {
+        have_stream = stream.as_deref() == Some(b"ec-msg-0".as_ref());
+        if have_first && have_last && have_stream {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -232,11 +255,17 @@ async fn test_ec_snapshot_catchup_late_learner_behind_compacted_wal() {
 
     assert!(
         have_first,
-        "learner B must receive /snap/0 (seq 1, compacted from the founder WAL) \
+        "learner B must receive /snap/0 (compacted from the founder WAL) \
          via an anti-entropy snapshot — this is the L3b drain-trigger under test"
     );
     assert!(
         have_last,
         "learner B must also converge to the newest key {last_key}"
+    );
+    assert!(
+        have_stream,
+        "learner B must receive the compacted STREAM entry {stream_key} via the \
+         snapshot too (Piece 5a) — a metadata-only snapshot drops A2A messages, \
+         breaking the mailbox's AP delivery promise"
     );
 }

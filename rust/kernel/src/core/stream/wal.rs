@@ -79,17 +79,17 @@ impl WalStreamCore {
     /// peak memory before backpressure flips to synchronous write.
     const FLUSH_CHANNEL_CAP: usize = 4096;
 
-    /// `next_seq` starts at 0 and is only advanced by this instance's own
-    /// writes — it is NOT recovered from the store's tail. That is correct
-    /// while one long-lived instance is the sole writer for a `stream_id`
-    /// (the mailbox case in a 2-node federation, where each `chat-with-me`
-    /// has exactly one remote sender). It is NOT collision-safe when several
-    /// instances write the same `stream_id` concurrently (3+ senders, or a
-    /// sender restart that opens a fresh instance over an already-populated
-    /// mailbox): each computes the same `/{seq}` key and the later append
-    /// overwrites the earlier. The collision-free fix is to assign the seq at
-    /// the raft serialization point (apply-time) rather than client-side; it
-    /// is a tracked follow-up, out of scope for the 2-node A2A milestone.
+    /// `next_seq` is RESTORED from the store's max existing seq on open (see
+    /// [`Self::new_with_consistency`]), so a restart/failover re-opens the lane
+    /// PAST the last durable entry instead of at 0 — a fresh instance over an
+    /// already-populated mailbox does NOT overwrite earlier messages. This
+    /// makes a single long-lived-or-restarted writer per `stream_id` fully
+    /// correct (the A2A mailbox case: each `chat-with-me` lane has exactly one
+    /// sender). It is still NOT collision-safe when several LIVE instances
+    /// write the same `stream_id` concurrently (3+ senders sharing one lane):
+    /// they can `fetch_add` the same seq between opens. A2A avoids this by
+    /// per-sender lanes (one writer each); the fully general fix is to assign
+    /// the seq at the raft serialization point (apply-time), a tracked follow-up.
     pub fn new(store: Arc<dyn MetaStore>, stream_id: String) -> Self {
         Self::new_with_consistency(store, stream_id, Consistency::Sc)
     }
@@ -142,11 +142,28 @@ impl WalStreamCore {
             })
             .expect("failed to spawn WAL flush thread");
 
+        // Durable seq-resume: restore the write cursor from the store's max
+        // existing seq for this stream so a restart/failover re-opens the lane
+        // PAST the last durable entry instead of at 0 (which would overwrite
+        // earlier entries = message loss). Keys are `{prefix}{seq}` with a
+        // DECIMAL seq; decimal keys do not sort numerically ("10" < "2"), so
+        // scan + numeric-max rather than take the tail. Stores without stream
+        // entries return empty (default), so the cursor legitimately starts at 0.
+        let resume_seq = store
+            .list_stream_entry_keys(&prefix)
+            .map(|keys| {
+                keys.iter()
+                    .filter_map(|k| k.strip_prefix(&prefix).and_then(|s| s.parse::<u64>().ok()))
+                    .max()
+                    .map_or(0, |max| max + 1)
+            })
+            .unwrap_or(0);
+
         Self {
             store,
             stream_id,
             prefix,
-            next_seq: AtomicU64::new(0),
+            next_seq: AtomicU64::new(resume_seq),
             closed: AtomicBool::new(false),
             flush_tx,
             inflight,
@@ -439,6 +456,16 @@ mod tests {
         fn get_stream_entry(&self, key: &str) -> Result<Option<Vec<u8>>, MetaStoreError> {
             Ok(self.inner.lock().unwrap().get(key).cloned())
         }
+        fn list_stream_entry_keys(&self, prefix: &str) -> Result<Vec<String>, MetaStoreError> {
+            Ok(self
+                .inner
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|k| k.starts_with(prefix))
+                .cloned()
+                .collect())
+        }
     }
 
     fn core() -> WalStreamCore {
@@ -446,6 +473,58 @@ mod tests {
             inner: Mutex::new(BTreeMap::new()),
         });
         WalStreamCore::new(store, "test".into())
+    }
+
+    /// A writer that restarts (drops its instance and re-opens a fresh one over
+    /// the same store) must NOT re-open the lane at seq 0 and overwrite earlier
+    /// entries. `next_seq` is restored from the store's max existing seq, so the
+    /// next write lands past the tail. Revert-guard: without the resume, the
+    /// second instance starts at 0 and `write_sync` overwrites seq 0/1.
+    #[test]
+    fn seq_resumes_from_store_across_restart() {
+        let store: Arc<dyn MetaStore> = Arc::new(MemKvStore {
+            inner: Mutex::new(BTreeMap::new()),
+        });
+
+        // First writer instance: three durable entries at seq 0,1,2.
+        {
+            let c1 = WalStreamCore::new(Arc::clone(&store), "mbox".into());
+            assert_eq!(c1.write_sync(b"m0").unwrap(), 0);
+            assert_eq!(c1.write_sync(b"m1").unwrap(), 1);
+            assert_eq!(c1.write_sync(b"m2").unwrap(), 2);
+        } // c1 dropped — simulates a writer restart / failover.
+
+        // Fresh instance over the SAME store must resume at seq 3, not 0.
+        let c2 = WalStreamCore::new(Arc::clone(&store), "mbox".into());
+        assert_eq!(c2.tail(), 3, "next_seq must resume past the store tail");
+        assert_eq!(
+            c2.write_sync(b"m3").unwrap(),
+            3,
+            "post-restart write must not overwrite an existing seq"
+        );
+
+        // Earlier entries survive; the new one is appended.
+        assert_eq!(c2.read_at(0).unwrap(), Some(b"m0".to_vec()));
+        assert_eq!(c2.read_at(2).unwrap(), Some(b"m2".to_vec()));
+        assert_eq!(c2.read_at(3).unwrap(), Some(b"m3".to_vec()));
+    }
+
+    /// Decimal seqs do not sort lexically ("10" < "2"), so resume must take the
+    /// NUMERIC max across a scan, not the lexicographic tail.
+    #[test]
+    fn seq_resume_is_numeric_not_lexicographic() {
+        let store: Arc<dyn MetaStore> = Arc::new(MemKvStore {
+            inner: Mutex::new(BTreeMap::new()),
+        });
+        {
+            let c1 = WalStreamCore::new(Arc::clone(&store), "mbox".into());
+            for i in 0..=12 {
+                assert_eq!(c1.write_sync(format!("m{i}").as_bytes()).unwrap(), i);
+            }
+        }
+        // Lexicographic max of {"0".."12"} is "9"; numeric max is 12 → resume 13.
+        let c2 = WalStreamCore::new(Arc::clone(&store), "mbox".into());
+        assert_eq!(c2.tail(), 13, "resume must be numeric max + 1, not lexical");
     }
 
     #[test]
