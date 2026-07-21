@@ -24,6 +24,15 @@ use std::borrow::Cow;
 
 const CHAT_WITH_ME_SUFFIX: &str = "/chat-with-me";
 
+/// Whether `path` is an A2A mailbox (a `*/chat-with-me` DT_STREAM).
+///
+/// SSOT for the "is this a mailbox write" predicate — used by both the
+/// `from`-stamp ([`maybe_stamp_chat_envelope`]) and the fail-closed gate
+/// (`MailboxStampingHook::on_pre`) so they cannot drift.
+pub fn is_mailbox_path(path: &str) -> bool {
+    path.ends_with(CHAT_WITH_ME_SUFFIX)
+}
+
 /// Rewrite the envelope's `from` field to the caller's `agent_id` when
 /// the write target is a mailbox path. Returns the rewritten bytes, or
 /// `None` if no rewrite was needed (non-mailbox path, no caller agent,
@@ -38,7 +47,7 @@ pub fn maybe_stamp_chat_envelope<'a>(
     caller_agent_id: Option<&str>,
     content: &'a [u8],
 ) -> Option<Cow<'a, [u8]>> {
-    if !path.ends_with(CHAT_WITH_ME_SUFFIX) {
+    if !is_mailbox_path(path) {
         return None;
     }
     let caller = caller_agent_id?;

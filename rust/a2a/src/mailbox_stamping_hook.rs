@@ -25,11 +25,31 @@ use kernel::core::dispatch::{HookContext, HookOutcome, NativeInterceptHook};
 /// itself recognises.
 const CHAT_WITH_ME_SUFFIX: &str = "/chat-with-me";
 
-pub struct MailboxStampingHook;
+pub struct MailboxStampingHook {
+    /// When true, a mailbox write with no caller `agent_id` is REJECTED
+    /// (the write aborts with a permission error) instead of passing
+    /// through unstamped. Meaningful only when auth is armed — the
+    /// composition root sets it from the auth posture so a NoAuth
+    /// bring-up (every write has an empty `agent_id`) stays fail-open.
+    /// The default constructor keeps fail-open so frontend consumers
+    /// (matrix, managed_agent) are unaffected.
+    fail_closed: bool,
+}
 
 impl MailboxStampingHook {
+    /// Fail-open hook: an empty `agent_id` mailbox write passes through
+    /// unstamped. This is the behaviour every existing consumer relies on
+    /// (NoAuth bring-up, matrix/managed_agent frontends).
     pub fn new() -> Self {
-        Self
+        Self { fail_closed: false }
+    }
+
+    /// Hook with an explicit fail-closed posture. `fail_closed=true` makes
+    /// a mailbox write REQUIRE an authenticated agent identity — an empty
+    /// `agent_id` write is rejected. The daemon arms this from the auth
+    /// posture via [`crate::install_a2a_stamp_hook`].
+    pub fn new_fail_closed(fail_closed: bool) -> Self {
+        Self { fail_closed }
     }
 }
 
@@ -76,6 +96,22 @@ impl NativeInterceptHook for MailboxStampingHook {
         } else {
             Some(c.identity.agent_id.as_str())
         };
+        // Fail-closed: an unforgeable `from` requires a real agent identity,
+        // so a mailbox write with no caller `agent_id` is rejected rather than
+        // passed through unstamped. Gated on `fail_closed` (set from the auth
+        // posture at install) so a NoAuth bring-up — where every write has an
+        // empty `agent_id` — stays fail-open. A pre-hook `Err` aborts the write
+        // as a permission error (see `HookOutcome` docs). Scoped to genuine
+        // mailbox paths via the policy SSOT predicate so a non-mailbox write
+        // that merely shares a future hook's suffix is never rejected here.
+        if self.fail_closed && caller.is_none() && mailbox_stamping_policy::is_mailbox_path(&c.path)
+        {
+            return Err(format!(
+                "fail-closed: mailbox write to {} requires an authenticated agent \
+                 identity (no agent_id on the caller)",
+                c.path
+            ));
+        }
         match mailbox_stamping_policy::maybe_stamp_chat_envelope(&c.path, caller, &c.content) {
             Some(rewritten) => Ok(HookOutcome::Replace(rewritten.into_owned())),
             None => Ok(HookOutcome::Pass),
@@ -179,5 +215,51 @@ mod tests {
         );
         let outcome = h.on_pre(&ctx).unwrap();
         assert!(matches!(outcome, HookOutcome::Pass));
+    }
+
+    #[test]
+    fn fail_closed_rejects_empty_agent_id_mailbox_write() {
+        // Auth-armed posture: a mailbox write with no caller agent_id is
+        // rejected (Err aborts the write) so `from` cannot be forged by an
+        // unauthenticated writer.
+        let h = MailboxStampingHook::new_fail_closed(true);
+        let ctx = write_ctx("/proc/p1/chat-with-me", "", br#"{"to":"agent-b"}"#.to_vec());
+        assert!(
+            h.on_pre(&ctx).is_err(),
+            "fail-closed must reject an empty-agent_id mailbox write"
+        );
+    }
+
+    #[test]
+    fn fail_closed_still_stamps_authenticated_write() {
+        let h = MailboxStampingHook::new_fail_closed(true);
+        let ctx = write_ctx(
+            "/proc/p1/chat-with-me",
+            "agent-real",
+            br#"{"from":"impostor","to":"agent-b"}"#.to_vec(),
+        );
+        match h.on_pre(&ctx).expect("authenticated write accepted") {
+            HookOutcome::Replace(bytes) => {
+                let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(v["from"], "agent-real");
+            }
+            HookOutcome::Pass => panic!("expected Replace, got Pass"),
+        }
+    }
+
+    #[test]
+    fn fail_closed_does_not_reject_non_mailbox_write() {
+        // Scoping: fail-closed rejects only genuine mailbox paths. A
+        // non-chat-with-me write with an empty agent_id must pass, never
+        // be caught by the identity gate.
+        let h = MailboxStampingHook::new_fail_closed(true);
+        let ctx = write_ctx("/workspace/notes.md", "", br#"{"to":"agent-b"}"#.to_vec());
+        assert!(
+            matches!(
+                h.on_pre(&ctx).expect("non-mailbox write accepted"),
+                HookOutcome::Pass
+            ),
+            "fail-closed must not reject a non-mailbox write"
+        );
     }
 }

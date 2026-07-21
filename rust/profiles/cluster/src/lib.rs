@@ -1531,9 +1531,15 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
 
     // ── A2A messaging substrate (§F) ─────────────────────────────────
     // (1) Arm the mailbox `from`-stamp hook ONCE (the "a2a" hook-only
-    // service — first boot-enlisted service). Behaviour-preserving under
-    // NoAuth: empty `agent_id` ⇒ the policy returns None ⇒ no rewrite.
-    a2a::install_a2a_stamp_hook(&kernel).map_err(|e| anyhow::anyhow!("arm a2a stamp hook: {e}"))?;
+    // service — first boot-enlisted service). Fail-closed posture is tied
+    // to auth: only when an auth provider is armed (`api_key_auth`) does a
+    // mailbox write REQUIRE an agent identity. Under NoAuth every write has
+    // an empty `agent_id`, so fail-closed would reject all mailbox writes —
+    // hence gated. Behaviour-preserving under NoAuth: empty `agent_id` ⇒
+    // fail-open ⇒ the policy returns None ⇒ no rewrite.
+    let a2a_fail_closed = api_key_auth.is_some();
+    a2a::install_a2a_stamp_hook(&kernel, a2a_fail_closed)
+        .map_err(|e| anyhow::anyhow!("arm a2a stamp hook: {e}"))?;
 
     // (2) Arm the cross-machine stream-wakeup observer PER ZONE: a
     // replicated `AppendStreamEntry` (a chat-with-me DT_STREAM write on a

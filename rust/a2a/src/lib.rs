@@ -41,13 +41,24 @@ use kernel::kernel::Kernel;
 /// [`MailboxStampingHook`] on it (the ServiceRegistry ownership path, so
 /// the hook load/unloads with the service). Every `*/chat-with-me` write
 /// then passes through it and the envelope `from` is rewritten to the
-/// caller's `agent_id`. Behaviour-preserving under NoAuth: an empty
-/// `agent_id` makes the policy return `None`, so nothing is rewritten.
+/// caller's `agent_id`.
+///
+/// `fail_closed` sets the identity-enforcement posture and MUST be derived
+/// from the auth posture (true iff an auth provider is armed):
+/// - `false` (NoAuth / trusted-local): an empty-`agent_id` write passes
+///   through unstamped — behaviour-preserving for the current bring-up.
+/// - `true` (auth armed): a mailbox write with no caller `agent_id` is
+///   REJECTED, so `from` cannot be forged by an unauthenticated writer.
+///   Meaningful only once auth populates `agent_id` — hence gated here,
+///   not defaulted on.
 ///
 /// Takes `&Kernel` (not `Arc`) because the hook captures no kernel
 /// reference — it operates purely on the `HookContext` handed to it.
-pub fn install_a2a_stamp_hook(kernel: &Kernel) -> Result<(), String> {
+pub fn install_a2a_stamp_hook(kernel: &Kernel, fail_closed: bool) -> Result<(), String> {
     let handle = kernel.enlist_hook_only_service("a2a")?;
-    kernel.register_service_hook(&handle, Box::new(MailboxStampingHook::new()));
+    kernel.register_service_hook(
+        &handle,
+        Box::new(MailboxStampingHook::new_fail_closed(fail_closed)),
+    );
     Ok(())
 }
