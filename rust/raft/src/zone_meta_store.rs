@@ -453,6 +453,18 @@ impl MetaStore for ZoneMetaStore {
             MetaStoreError::IOError(format!("ZoneMetaStore.get_stream_entry({key}): {e}"))
         })
     }
+
+    fn list_stream_entry_keys(&self, prefix: &str) -> Result<Vec<String>, MetaStoreError> {
+        let prefix_owned = prefix.to_string();
+        let fut = self.node.with_state_machine(move |sm: &FullStateMachine| {
+            sm.list_stream_entry_keys(&prefix_owned)
+        });
+        bridge_block_on(&self.runtime, fut).map_err(|e| {
+            MetaStoreError::IOError(format!(
+                "ZoneMetaStore.list_stream_entry_keys({prefix}): {e}"
+            ))
+        })
+    }
 }
 
 #[cfg(test)]
