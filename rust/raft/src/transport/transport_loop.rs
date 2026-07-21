@@ -28,7 +28,7 @@
 use super::client::RaftClientPool;
 use super::proto::nexus::raft::EcReplicationEntry;
 use super::{NodeAddress, SharedPeerMap};
-use crate::raft::{Command, StateMachine, ZoneConsensusDriver};
+use crate::raft::{StateMachine, ZoneConsensusDriver};
 use protobuf::Message as ProtobufV2Message;
 use raft::eraftpb::MessageType;
 use std::collections::HashMap;
@@ -779,20 +779,22 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
             let covering_seq = repl_log.max_seq().saturating_sub(1);
 
             tokio::spawn(async move {
-                // Re-materialize the whole metadata state as SetMetadata
-                // commands.  Sc-plane keys the peer already holds via raft are
-                // byte-identical, so LWW no-ops them; only the EC keys the peer
-                // missed actually change.  (A delta/chunked snapshot is a future
-                // optimization — this path is rare, correctness over bytes.)
-                let state_pairs = sm_arc.read().await.ec_state_snapshot();
-                let entries: Vec<EcReplicationEntry> = state_pairs
+                // Re-materialize the whole EC-replicable state as idempotent
+                // commands — metadata as SetMetadata, stream entries (A2A
+                // messages) as AppendStreamEntry (see `ec_state_snapshot`).
+                // Sc-plane keys the peer already holds via raft are
+                // byte-identical, so LWW no-ops them; only the EC keys/entries
+                // the peer missed actually change.  (A delta/chunked snapshot
+                // is a future optimization — this path is rare, correctness
+                // over bytes.)
+                let cmds = sm_arc.read().await.ec_state_snapshot();
+                let entries: Vec<EcReplicationEntry> = cmds
                     .into_iter()
-                    .map(|(key, value)| EcReplicationEntry {
+                    .map(|command| EcReplicationEntry {
                         seq: covering_seq,
-                        command: bincode::serialize(&Command::SetMetadata { key, value })
-                            .unwrap_or_default(),
-                        // SetMetadata LWW uses the value's own embedded
-                        // modified-at, so this envelope timestamp is unused.
+                        command: bincode::serialize(&command).unwrap_or_default(),
+                        // SetMetadata/AppendStreamEntry LWW uses the value's own
+                        // embedded ordering, so this envelope timestamp is unused.
                         timestamp: 0,
                         node_id,
                     })

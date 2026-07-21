@@ -280,12 +280,17 @@ pub trait StateMachine: Send + Sync {
     ///
     /// Used by the EC anti-entropy path (`SnapshotEcState`): a peer that fell
     /// behind the compacted WAL region can't be caught up incrementally, so
-    /// the sender re-materializes THIS state into `SetMetadata` commands and
-    /// ships it. Order is irrelevant — the receiver applies each LWW-idempotently.
+    /// the sender re-materializes THIS state as idempotent commands and ships
+    /// it — metadata as `SetMetadata`, stream entries as `AppendStreamEntry`.
+    /// Order is irrelevant: the receiver applies each LWW/union-idempotently.
     ///
-    /// Default: empty (a state machine that holds no EC metadata — e.g. a
+    /// Returns `Command`s (not raw `(key,value)`) so the source can mix planes
+    /// — a stream entry MUST re-materialize as `AppendStreamEntry`, not
+    /// `SetMetadata`, or the peer would never catch up on messages.
+    ///
+    /// Default: empty (a state machine that holds no EC state — e.g. a
     /// witness — has nothing to transfer). Override in [`FullStateMachine`].
-    fn ec_state_snapshot(&self) -> Vec<(String, Vec<u8>)> {
+    fn ec_state_snapshot(&self) -> Vec<Command> {
         Vec::new()
     }
 
@@ -1186,6 +1191,43 @@ impl FullStateMachine {
         Ok(result)
     }
 
+    /// Enumerate stream-entry keys under ``prefix`` (keys only, no values).
+    ///
+    /// Backs durable client-side seq-resume ([`WalStreamCore`]): a stream
+    /// backend restores its next-seq cursor from the max existing seq on open,
+    /// so a restart/failover re-opens the lane PAST the last entry instead of
+    /// at 0 (which would overwrite earlier messages). Keys are
+    /// ``{prefix}{seq}`` with a decimal ``seq`` — the caller parses the max
+    /// numerically (decimal keys do not sort numerically).
+    pub fn list_stream_entry_keys(&self, prefix: &str) -> Result<Vec<String>> {
+        let mut keys = Vec::new();
+        for item in self.stream_entries.scan_prefix(prefix.as_bytes()) {
+            let (key, _value) = item?;
+            if let Ok(k) = String::from_utf8(key) {
+                keys.push(k);
+            }
+        }
+        Ok(keys)
+    }
+
+    /// Enumerate stream entries (``key``, ``value``) under ``prefix``.
+    ///
+    /// Backs the EC anti-entropy snapshot ([`StateMachine::ec_state_snapshot`]):
+    /// a peer that fell behind the compacted WAL must catch up on STREAM
+    /// entries (A2A messages), not just metadata — the ``stream_entries`` tree
+    /// is separate from ``TREE_METADATA`` and is not covered by
+    /// [`Self::list_metadata`].
+    pub fn list_stream_entries(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        let mut out = Vec::new();
+        for item in self.stream_entries.scan_prefix(prefix.as_bytes()) {
+            let (key, value) = item?;
+            if let Ok(k) = String::from_utf8(key) {
+                out.push((k, value));
+            }
+        }
+        Ok(out)
+    }
+
     /// Get a stream entry by key (R19.1b').
     ///
     /// Looks up the opaque bytes previously stored by
@@ -1656,12 +1698,29 @@ impl StateMachine for FullStateMachine {
         result
     }
 
-    fn ec_state_snapshot(&self) -> Vec<(String, Vec<u8>)> {
-        // The current metadata key/values ARE the EC-replicable state, and
-        // `list_metadata` already skips internal `__` keys. The anti-entropy
-        // sender re-materializes each into a SetMetadata command for a peer
-        // that fell behind the compacted WAL region.
-        self.list_metadata("").unwrap_or_default()
+    fn ec_state_snapshot(&self) -> Vec<Command> {
+        // Metadata key/values (list_metadata skips internal `__` keys) →
+        // SetMetadata. LWW-idempotent on the receiver; Sc-plane keys are
+        // byte-identical there so they no-op, only missed EC keys change.
+        let mut cmds: Vec<Command> = self
+            .list_metadata("")
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(key, value)| Command::SetMetadata { key, value })
+            .collect();
+        // Stream entries (A2A messages) live in the separate `stream_entries`
+        // tree, NOT covered by list_metadata. A peer past the compacted WAL
+        // must catch up on these too, else the AP delivery promise breaks for
+        // the stream payload — the whole point of the mailbox. Re-materialize
+        // as AppendStreamEntry; union-by-unique-key on the receiver
+        // (`apply_ec_with_lww`) makes replay idempotent.
+        cmds.extend(
+            self.list_stream_entries("")
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(key, data)| Command::AppendStreamEntry { key, data }),
+        );
+        cmds
     }
 
     fn apply(&mut self, index: u64, command: &Command) -> Result<CommandResult> {
