@@ -664,23 +664,10 @@ impl Kernel {
         // 1c. Permission gate (§13) — BEFORE native hooks.
         self.check_permission(path, Permission::Write, ctx)?;
 
-        // 1d. Native INTERCEPT PRE hooks (§11 native hooks).
-        let needs_content_for_hook = self.has_mutating_hook_match(path);
-        let hook_content = if needs_content_for_hook {
-            content.to_vec()
-        } else {
-            Vec::new()
-        };
-        let replacement =
-            self.dispatch_native_pre_with_replacement(&HookContext::Write(WriteHookCtx {
-                path: path.to_string(),
-                identity: HookIdentity::from(ctx),
-                content: hook_content,
-                is_new_file: false,
-                content_id: None,
-                new_version: 0,
-                size_bytes: None,
-            }))?;
+        // 1d. Native INTERCEPT PRE hooks (§11) — via the shared write-hook
+        // seam so every write path (file / stream / pipe) enforces the same
+        // mutating hooks (e.g. the A2A `from` stamp), not just this one.
+        let replacement = self.apply_mutating_write_hooks(path, ctx, content)?;
         let effective_content: &[u8] = replacement.as_deref().unwrap_or(content);
 
         // 2. Route (check write access)
@@ -2859,21 +2846,7 @@ impl Kernel {
                 continue;
             }
 
-            let needs_content_for_hook = self.has_mutating_hook_match(&req.path);
-            let hook_content = if needs_content_for_hook {
-                req.content.clone()
-            } else {
-                Vec::new()
-            };
-            match self.dispatch_native_pre_with_replacement(&HookContext::Write(WriteHookCtx {
-                path: req.path.clone(),
-                identity: HookIdentity::from(ctx),
-                content: hook_content,
-                is_new_file: false,
-                content_id: None,
-                new_version: 0,
-                size_bytes: None,
-            })) {
+            match self.apply_mutating_write_hooks(&req.path, ctx, &req.content) {
                 Ok(replacement) => replacements.push(replacement),
                 Err(e) => {
                     pre_errors[i] = Some(e);
