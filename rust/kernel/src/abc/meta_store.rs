@@ -12,8 +12,6 @@
 //! Naming note: the Rust trait is `MetaStore`, for visual symmetry
 //! with `ObjectStore` / `CacheStore`.
 
-use crate::hal::distributed_coordinator::Consistency;
-
 // ── Dirent-type constants ────────────────────────────────────────────
 //
 // Values for [`FileMetadata::entry_type`] — mirrors the entry_type
@@ -389,35 +387,21 @@ pub trait MetaStore: Send + Sync {
         None
     }
 
-    /// Append a raw byte entry at `key` to the metastore's
-    /// stream-entries side table.  Used by `WalStreamCore` /
-    /// **Optional capability** — only `ZoneMetaStore` implements this.
-    /// Other impls return `Err(NotSupported)` and callers fall back to
-    /// in-memory stream/pipe backends.
+    /// Append `data` to the stream identified by `stream_prefix`, returning the
+    /// offset the entry was assigned.
     ///
-    /// Used by `WalPipeCore` (the durable DT_STREAM / DT_PIPE backends) to
-    /// persist an entry through whatever replication the metastore
-    /// happens to provide — ``ZoneMetaStore`` proposes
-    /// ``Command::AppendStreamEntry`` so peers see the entry via
-    /// raft commit.
+    /// **Optional capability** — only `ZoneMetaStore` implements this; other
+    /// impls return `Err` and callers fall back to in-memory stream/pipe
+    /// backends. Used by `WalStreamCore` / `WalPipeCore` (the durable DT_STREAM
+    /// / DT_PIPE backends).
     ///
-    /// The metastore impl owns the key namespace — kernel-side
-    /// callers prefix with ``__wal_stream__/<id>`` or
-    /// ``__wal_pipe__/<id>`` so stream and pipe entries never collide
-    /// in the shared side table.
-    ///
-    /// `consistency` names the CAP-level guarantee the caller wants (see
-    /// [`Consistency`]): `Sc` = strong / quorum-durable before ack; `Ec` =
-    /// eventual / accepted locally then replicated asynchronously (the AP
-    /// plane an A2A mailbox rides). How a backend realizes each is its own
-    /// concern; a non-distributed metastore ignores it and errors regardless.
-    fn append_stream_entry(
-        &self,
-        key: &str,
-        data: &[u8],
-        consistency: Consistency,
-    ) -> Result<(), MetaStoreError> {
-        let _ = (key, data, consistency);
+    /// The caller passes only the stream PREFIX (``__wal_stream__/<id>/`` or
+    /// ``__wal_pipe__/<id>/``, kept distinct so stream and pipe entries never
+    /// collide). The offset is assigned by the backend at its serialization
+    /// point (``ZoneMetaStore`` → the raft apply), NOT by the caller — so a
+    /// total order holds across concurrent writers and no two writers collide.
+    fn append_stream_entry(&self, stream_prefix: &str, data: &[u8]) -> Result<u64, MetaStoreError> {
+        let _ = (stream_prefix, data);
         Err(MetaStoreError::IOError(
             "append_stream_entry: not supported by this metastore (use a distributed impl, e.g. ZoneMetaStore)".to_string(),
         ))
@@ -435,21 +419,17 @@ pub trait MetaStore: Send + Sync {
         ))
     }
 
-    /// Enumerate stream-entry keys under ``prefix`` (keys only, no values).
+    /// The stream's current next-offset cursor (``0`` if nothing written yet) —
+    /// i.e. how many entries the stream holds.
     ///
-    /// Backs durable client-side seq-resume: a stream backend (e.g.
-    /// ``WalStreamCore``) restores its next-seq cursor from the max existing
-    /// seq on open, so a restart/failover re-opens the lane PAST the last
-    /// entry instead of at 0 (which would overwrite earlier entries = message
-    /// loss). Keys are opaque to the store; the caller owns the seq encoding.
-    ///
-    /// Default: empty — a metastore that holds no stream entries has nothing
-    /// to resume from, so the cursor legitimately starts at 0. (Unlike
-    /// [`Self::get_stream_entry`], this is called speculatively on open, so
-    /// "no entries" is a valid answer, not an error.)
-    fn list_stream_entry_keys(&self, prefix: &str) -> Result<Vec<String>, MetaStoreError> {
-        let _ = prefix;
-        Ok(Vec::new())
+    /// Correct across ALL writers: the backend assigns offsets at its
+    /// serialization point, so the cursor reflects every replicated append, not
+    /// just this node's. Backs `WalStreamCore::tail` (seek-to-end + capacity
+    /// hints). Default ``0`` — a metastore with no stream state has an empty
+    /// stream, which is a valid answer, not an error.
+    fn stream_tail(&self, stream_prefix: &str) -> Result<u64, MetaStoreError> {
+        let _ = stream_prefix;
+        Ok(0)
     }
 }
 

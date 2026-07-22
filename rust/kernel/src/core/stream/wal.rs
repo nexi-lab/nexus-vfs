@@ -16,21 +16,20 @@
 //! alternatives) is the metastore impl's concern, not this struct's.
 //! Federation-tier code never reaches in here directly.
 //!
-//! `write_nowait()` is genuinely non-blocking. Data lands in
-//! an inflight `BTreeMap` (read-your-writes) and is drained to the
-//! metastore by a dedicated background flush thread.  Hot-path cost:
-//! one parking_lot `RwLock` write + channel `try_send` ≈ 50–200 ns.
-//! The metastore propose happens entirely off the critical path.
+//! ## Offsets are assigned by the store, not the caller
+//!
+//! `write_sync` hands the payload to `MetaStore::append_stream_entry` and
+//! gets back the offset the entry was assigned at the store's serialization
+//! point (for `ZoneMetaStore`, the raft apply). The core keeps NO local
+//! sequence counter, so several writers over the same stream — even on
+//! different nodes — can never collide on an offset: the total order is the
+//! raft log's. A write is durable (raft-committed) once `write_sync` returns;
+//! there is no async buffer that could silently drop it.
 
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use parking_lot::RwLock;
-
 use crate::abc::meta_store::MetaStore;
-use crate::hal::distributed_coordinator::Consistency;
 use crate::stream::{StreamBackend, StreamError};
 
 /// Side-table key prefix for wal-stream entries. Every entry is keyed
@@ -39,13 +38,14 @@ use crate::stream::{StreamBackend, StreamError};
 /// it — the two are round-trip-tested together.
 pub const WAL_STREAM_KEY_PREFIX: &str = "/__wal_stream__/";
 
-/// Recover the watched file path from a wal-stream entry key.
+/// Recover the watched file path from a wal-stream entry key OR stream prefix.
 ///
-/// `stream_id` is the DT_STREAM's path (the path a `sys_watch` is parked
-/// on), so the A2A stream-wakeup observer reverses the key on each
-/// replicated `AppendStreamEntry` apply to wake the right watcher.
-/// Returns `None` for non-stream keys (e.g. `__wal_pipe__/…`) — A2A
-/// mailboxes are DT_STREAMs, so pipe appends do not wake file watchers.
+/// `stream_id` is the DT_STREAM's path (the path a `sys_watch` is parked on).
+/// The A2A stream-wakeup observer passes the applied `AppendStreamEntry`'s
+/// stream prefix (`{WAL_STREAM_KEY_PREFIX}{stream_id}/`); the trailing `/`
+/// lets the same parse recover `stream_id` whether the input is the prefix or
+/// a full `{WAL_STREAM_KEY_PREFIX}{stream_id}/{seq}` entry key. Returns `None`
+/// for anything not under `WAL_STREAM_KEY_PREFIX` (e.g. a bare path).
 pub fn watch_path_from_wal_stream_key(key: &str) -> Option<&str> {
     // key == "{WAL_STREAM_KEY_PREFIX}{stream_id}/{seq}"; recover stream_id.
     let rest = key.strip_prefix(WAL_STREAM_KEY_PREFIX)?;
@@ -53,121 +53,26 @@ pub fn watch_path_from_wal_stream_key(key: &str) -> Option<&str> {
     (!path.is_empty()).then_some(path)
 }
 
-/// WAL-backed stream core.  Persists every write through the
-/// distributed `MetaStore`'s stream-entries side table; serves
-/// `read_at` from an inflight cache for read-your-writes before the
-/// background flush confirms.
+/// WAL-backed stream core. Every write is proposed through the distributed
+/// `MetaStore`, which assigns the offset and commits it before `write_sync`
+/// returns; `read_at` reads committed entries back by offset. Holds no local
+/// state beyond the `closed` flag — the entries and their offset cursor live
+/// in the store (the raft state machine), which is the single source of truth.
 pub struct WalStreamCore {
     store: Arc<dyn MetaStore>,
     stream_id: String,
     prefix: String,
-    next_seq: AtomicU64,
     closed: AtomicBool,
-    flush_tx: mpsc::SyncSender<(u64, Vec<u8>)>,
-    /// Written but not-yet-confirmed entries.  Checked first by
-    /// `read_at` to guarantee read-your-writes without waiting for the
-    /// metastore propose / flush.
-    inflight: Arc<RwLock<BTreeMap<u64, Vec<u8>>>>,
-    /// Consistency plane every append on this stream is proposed under.
-    /// `Sc` (default) → raft consensus; `Ec` → local-apply + async
-    /// replicate (the AP plane an A2A mailbox stream opens with).
-    consistency: Consistency,
 }
 
 impl WalStreamCore {
-    /// Bounded flush channel depth.  4096 entries × ~4 KB average ≈ 16 MB
-    /// peak memory before backpressure flips to synchronous write.
-    const FLUSH_CHANNEL_CAP: usize = 4096;
-
-    /// `next_seq` is RESTORED from the store's max existing seq on open (see
-    /// [`Self::new_with_consistency`]), so a restart/failover re-opens the lane
-    /// PAST the last durable entry instead of at 0 — a fresh instance over an
-    /// already-populated mailbox does NOT overwrite earlier messages. This
-    /// makes a single long-lived-or-restarted writer per `stream_id` fully
-    /// correct (the A2A mailbox case: each `chat-with-me` lane has exactly one
-    /// sender). It is still NOT collision-safe when several LIVE instances
-    /// write the same `stream_id` concurrently (3+ senders sharing one lane):
-    /// they can `fetch_add` the same seq between opens. A2A avoids this by
-    /// per-sender lanes (one writer each); the fully general fix is to assign
-    /// the seq at the raft serialization point (apply-time), a tracked follow-up.
     pub fn new(store: Arc<dyn MetaStore>, stream_id: String) -> Self {
-        Self::new_with_consistency(store, stream_id, Consistency::Sc)
-    }
-
-    /// Open a wal-stream that proposes every append under `consistency`.
-    /// `Sc` (via [`Self::new`]) preserves historical behavior; `Ec` is the
-    /// AP plane an A2A mailbox stream opens with so writes survive a
-    /// leaderless quorum and replicate eventually.
-    pub fn new_with_consistency(
-        store: Arc<dyn MetaStore>,
-        stream_id: String,
-        consistency: Consistency,
-    ) -> Self {
         let prefix = format!("{WAL_STREAM_KEY_PREFIX}{stream_id}/");
-        let (flush_tx, flush_rx) = mpsc::sync_channel::<(u64, Vec<u8>)>(Self::FLUSH_CHANNEL_CAP);
-        let inflight: Arc<RwLock<BTreeMap<u64, Vec<u8>>>> = Arc::new(RwLock::new(BTreeMap::new()));
-
-        let inflight_bg = Arc::clone(&inflight);
-        let store_bg = Arc::clone(&store);
-        let prefix_bg = prefix.clone();
-        let stream_id_bg = stream_id.clone();
-
-        std::thread::Builder::new()
-            .name(format!("wal-flush-{stream_id}"))
-            .spawn(move || {
-                while let Ok((seq, data)) = flush_rx.recv() {
-                    let key = format!("{prefix_bg}{seq}");
-                    match store_bg.append_stream_entry(&key, &data, consistency) {
-                        Ok(()) => {
-                            inflight_bg.write().remove(&seq);
-                        }
-                        Err(e) => {
-                            // Entry stays in inflight — `read_at` remains
-                            // available from the local cache; a peer
-                            // catching up loses this entry, but
-                            // surfacing the failure here would force
-                            // every backend wake-up onto the syscall hot
-                            // path.  Best-effort fan-out is the right
-                            // tradeoff for an audit / coordination
-                            // stream.
-                            tracing::warn!(
-                                stream_id = %stream_id_bg,
-                                seq,
-                                error = ?e,
-                                "WAL flush failed; entry remains in inflight"
-                            );
-                        }
-                    }
-                }
-            })
-            .expect("failed to spawn WAL flush thread");
-
-        // Durable seq-resume: restore the write cursor from the store's max
-        // existing seq for this stream so a restart/failover re-opens the lane
-        // PAST the last durable entry instead of at 0 (which would overwrite
-        // earlier entries = message loss). Keys are `{prefix}{seq}` with a
-        // DECIMAL seq; decimal keys do not sort numerically ("10" < "2"), so
-        // scan + numeric-max rather than take the tail. Stores without stream
-        // entries return empty (default), so the cursor legitimately starts at 0.
-        let resume_seq = store
-            .list_stream_entry_keys(&prefix)
-            .map(|keys| {
-                keys.iter()
-                    .filter_map(|k| k.strip_prefix(&prefix).and_then(|s| s.parse::<u64>().ok()))
-                    .max()
-                    .map_or(0, |max| max + 1)
-            })
-            .unwrap_or(0);
-
         Self {
             store,
             stream_id,
             prefix,
-            next_seq: AtomicU64::new(resume_seq),
             closed: AtomicBool::new(false),
-            flush_tx,
-            inflight,
-            consistency,
         }
     }
 
@@ -175,95 +80,27 @@ impl WalStreamCore {
         format!("{}{seq}", self.prefix)
     }
 
-    pub fn write_nowait(&self, data: &[u8]) -> Result<u64, String> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(format!("WAL stream {} is closed", self.stream_id));
-        }
-        // Atomic fetch_add: concurrent writers each get a unique seq;
-        // no overwrite race because seqs differ.
-        let seq = self.next_seq.fetch_add(1, Ordering::AcqRel);
-        let data_vec = data.to_vec();
-
-        // Insert into inflight BEFORE enqueuing for flush so a
-        // concurrent `read_at(seq)` finds the data immediately.
-        self.inflight.write().insert(seq, data_vec.clone());
-
-        match self.flush_tx.try_send((seq, data_vec.clone())) {
-            Ok(()) => {}
-            Err(mpsc::TrySendError::Full(_)) => {
-                // Channel saturated (rare): flush synchronously to
-                // avoid unbounded inflight growth.
-                let key = self.key(seq);
-                match self
-                    .store
-                    .append_stream_entry(&key, &data_vec, self.consistency)
-                {
-                    Ok(()) => {
-                        self.inflight.write().remove(&seq);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            stream_id = %self.stream_id,
-                            seq,
-                            error = ?e,
-                            "WAL sync-fallback flush failed"
-                        );
-                    }
-                }
-            }
-            Err(mpsc::TrySendError::Disconnected(_)) => {
-                // Background thread exited (WalStreamCore is being dropped).
-            }
-        }
-        Ok(seq)
-    }
-
-    /// Append `data` and wait for the metastore commit before
-    /// returning. Same allocation path as `write_nowait`, but bypasses
-    /// the async flush channel so the call returns only after
-    /// `store.append_stream_entry` has confirmed durability —
-    /// i.e. raft has committed the entry on the local node and any
-    /// peer reading the same store sees it immediately.
+    /// Append `data` and return the offset the store assigned it.
     ///
-    /// Use this when the caller's contract is synchronous (e.g.
-    /// `PipeBackend::push`, where pop on a sibling replica is
-    /// expected to see the data). For high-throughput streams where
-    /// the writer can pipeline multiple entries before any consumer
-    /// reads, prefer `write_nowait`.
+    /// Blocks until `store.append_stream_entry` confirms durability — i.e.
+    /// raft has committed the entry, the state machine has assigned its offset
+    /// (in committed order, so concurrent writers never collide), and any peer
+    /// reading the same store sees it. This is the sole write path; a wal
+    /// DT_STREAM exists to REPLICATE, so a write that can't commit fails loud
+    /// rather than buffering and dropping.
     pub fn write_sync(&self, data: &[u8]) -> Result<u64, String> {
         if self.closed.load(Ordering::Acquire) {
             return Err(format!("WAL stream {} is closed", self.stream_id));
         }
-        let seq = self.next_seq.fetch_add(1, Ordering::AcqRel);
-        let data_vec = data.to_vec();
-        // Insert into inflight first so a `read_at(seq)` racing
-        // between here and the store commit still finds the data.
-        self.inflight.write().insert(seq, data_vec.clone());
-        let key = self.key(seq);
-        let result = self
-            .store
-            .append_stream_entry(&key, &data_vec, self.consistency);
-        // Remove from inflight only on success; on failure the entry
-        // stays in inflight so reads still return data even though
-        // the metastore did not durably accept it (matches the
-        // `write_nowait` flush-failure path).
-        if result.is_ok() {
-            self.inflight.write().remove(&seq);
-        }
-        result
-            .map(|_| seq)
-            .map_err(|e| format!("append_stream_entry({key}): {e:?}"))
+        self.store
+            .append_stream_entry(&self.prefix, data)
+            .map_err(|e| format!("append_stream_entry({}): {e:?}", self.prefix))
     }
 
     /// Read the entry at `seq`.  `Ok(Some(bytes))` if present;
     /// `Ok(None)` if not yet written; `Err` if the stream is closed
     /// and no more data will arrive at this offset.
     pub fn read_at(&self, seq: u64) -> Result<Option<Vec<u8>>, String> {
-        // Fast path: written but not yet flushed.
-        if let Some(data) = self.inflight.read().get(&seq).cloned() {
-            return Ok(Some(data));
-        }
-        // Slow path: background thread already confirmed this entry.
         let key = self.key(seq);
         let bytes_opt = self
             .store
@@ -306,8 +143,10 @@ impl WalStreamCore {
         self.closed.load(Ordering::Acquire)
     }
 
+    /// The stream's tail (number of entries written), read from the store — the
+    /// SSOT that reflects EVERY writer's appends, not just this node's.
     pub fn tail(&self) -> u64 {
-        self.next_seq.load(Ordering::Acquire)
+        self.store.stream_tail(&self.prefix).unwrap_or(0)
     }
 
     #[allow(dead_code)]
@@ -328,13 +167,9 @@ impl StreamBackend for WalStreamCore {
         // Durable + fail-loud. A wal DT_STREAM exists to REPLICATE, so a push
         // waits for the raft commit and surfaces failure (no reachable leader /
         // propose rejected) instead of buffering and dropping. A2A messaging —
-        // and any "a sibling replica must see this" contract — needs it: the
-        // async `write_nowait` let a leaderless write look like success while
-        // the entry never left this node, i.e. the mount lying about a durable
-        // write. Same synchronous contract the DT_PIPE (WalPipeCore) backend
-        // uses; the syscall handler already blocks on this same propose for
-        // file writes, so it is no new blocking surface. `write_nowait` remains
-        // for a genuinely fire-and-forget node-local stream.
+        // and any "a sibling replica must see this" contract — needs it. The
+        // syscall handler already blocks on this same propose for file writes,
+        // so it is no new blocking surface.
         self.write_sync(data).map(|seq| seq as usize).map_err(|e| {
             tracing::warn!(
                 stream_id = %self.stream_id,
@@ -382,13 +217,18 @@ impl StreamBackend for WalStreamCore {
 
 // ---------------------------------------------------------------------------
 // Unit tests — in-memory MetaStore mock, no raft runtime needed.
+//
+// The mock mirrors the real store's contract: it — not the caller — assigns
+// each append's offset (here, the current count under the prefix), so the
+// tests exercise the SAME "store assigns the offset" path the raft state
+// machine implements.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::abc::meta_store::{FileMetadata, MetaStoreError};
-    use std::collections::HashSet;
+    use std::collections::{BTreeMap, HashSet};
     use std::sync::Mutex;
 
     #[test]
@@ -441,50 +281,53 @@ mod tests {
         fn exists(&self, _path: &str) -> Result<bool, MetaStoreError> {
             Ok(false)
         }
+        // Mirror the real store: the STORE assigns the offset (here, the count
+        // of existing entries under the prefix) under a lock, so concurrent
+        // writers — one core or several over the same store — never collide.
         fn append_stream_entry(
             &self,
-            key: &str,
+            stream_prefix: &str,
             data: &[u8],
-            _consistency: Consistency,
-        ) -> Result<(), MetaStoreError> {
-            self.inner
-                .lock()
-                .unwrap()
-                .insert(key.to_string(), data.to_vec());
-            Ok(())
+        ) -> Result<u64, MetaStoreError> {
+            let mut inner = self.inner.lock().unwrap();
+            let seq = inner
+                .keys()
+                .filter(|k| k.starts_with(stream_prefix))
+                .count() as u64;
+            inner.insert(format!("{stream_prefix}{seq}"), data.to_vec());
+            Ok(seq)
         }
         fn get_stream_entry(&self, key: &str) -> Result<Option<Vec<u8>>, MetaStoreError> {
             Ok(self.inner.lock().unwrap().get(key).cloned())
         }
-        fn list_stream_entry_keys(&self, prefix: &str) -> Result<Vec<String>, MetaStoreError> {
+        fn stream_tail(&self, stream_prefix: &str) -> Result<u64, MetaStoreError> {
             Ok(self
                 .inner
                 .lock()
                 .unwrap()
                 .keys()
-                .filter(|k| k.starts_with(prefix))
-                .cloned()
-                .collect())
+                .filter(|k| k.starts_with(stream_prefix))
+                .count() as u64)
         }
     }
 
-    fn core() -> WalStreamCore {
-        let store: Arc<dyn MetaStore> = Arc::new(MemKvStore {
+    fn store() -> Arc<dyn MetaStore> {
+        Arc::new(MemKvStore {
             inner: Mutex::new(BTreeMap::new()),
-        });
-        WalStreamCore::new(store, "test".into())
+        })
     }
 
-    /// A writer that restarts (drops its instance and re-opens a fresh one over
-    /// the same store) must NOT re-open the lane at seq 0 and overwrite earlier
-    /// entries. `next_seq` is restored from the store's max existing seq, so the
-    /// next write lands past the tail. Revert-guard: without the resume, the
-    /// second instance starts at 0 and `write_sync` overwrites seq 0/1.
+    fn core() -> WalStreamCore {
+        WalStreamCore::new(store(), "test".into())
+    }
+
+    /// The core keeps NO local cursor — the store owns it. A fresh instance
+    /// over a store that already holds entries (a restart / failover) resumes
+    /// PAST the tail on its very first read of `tail()`, and its next write
+    /// lands past the existing entries instead of overwriting seq 0.
     #[test]
-    fn seq_resumes_from_store_across_restart() {
-        let store: Arc<dyn MetaStore> = Arc::new(MemKvStore {
-            inner: Mutex::new(BTreeMap::new()),
-        });
+    fn cursor_is_store_owned_across_restart() {
+        let store = store();
 
         // First writer instance: three durable entries at seq 0,1,2.
         {
@@ -494,43 +337,46 @@ mod tests {
             assert_eq!(c1.write_sync(b"m2").unwrap(), 2);
         } // c1 dropped — simulates a writer restart / failover.
 
-        // Fresh instance over the SAME store must resume at seq 3, not 0.
+        // Fresh instance over the SAME store sees the tail from the store, not
+        // a local counter, so its next write is seq 3 — no overwrite.
         let c2 = WalStreamCore::new(Arc::clone(&store), "mbox".into());
-        assert_eq!(c2.tail(), 3, "next_seq must resume past the store tail");
+        assert_eq!(c2.tail(), 3, "tail is read from the store");
         assert_eq!(
             c2.write_sync(b"m3").unwrap(),
             3,
             "post-restart write must not overwrite an existing seq"
         );
-
-        // Earlier entries survive; the new one is appended.
         assert_eq!(c2.read_at(0).unwrap(), Some(b"m0".to_vec()));
         assert_eq!(c2.read_at(2).unwrap(), Some(b"m2".to_vec()));
         assert_eq!(c2.read_at(3).unwrap(), Some(b"m3".to_vec()));
     }
 
-    /// Decimal seqs do not sort lexically ("10" < "2"), so resume must take the
-    /// NUMERIC max across a scan, not the lexicographic tail.
+    /// The exact multi-writer case the old client-side `next_seq` lost: TWO
+    /// live cores over the SAME store, interleaved. Each write gets a distinct,
+    /// gap-free offset from the store — nothing is overwritten. With the old
+    /// per-core counter both would have picked seq 0 and clobbered each other.
     #[test]
-    fn seq_resume_is_numeric_not_lexicographic() {
-        let store: Arc<dyn MetaStore> = Arc::new(MemKvStore {
-            inner: Mutex::new(BTreeMap::new()),
-        });
-        {
-            let c1 = WalStreamCore::new(Arc::clone(&store), "mbox".into());
-            for i in 0..=12 {
-                assert_eq!(c1.write_sync(format!("m{i}").as_bytes()).unwrap(), i);
-            }
-        }
-        // Lexicographic max of {"0".."12"} is "9"; numeric max is 12 → resume 13.
-        let c2 = WalStreamCore::new(Arc::clone(&store), "mbox".into());
-        assert_eq!(c2.tail(), 13, "resume must be numeric max + 1, not lexical");
+    fn two_cores_same_store_never_collide() {
+        let store = store();
+        let a = WalStreamCore::new(Arc::clone(&store), "shared".into());
+        let b = WalStreamCore::new(Arc::clone(&store), "shared".into());
+
+        assert_eq!(a.write_sync(b"a0").unwrap(), 0);
+        assert_eq!(b.write_sync(b"b1").unwrap(), 1);
+        assert_eq!(a.write_sync(b"a2").unwrap(), 2);
+
+        // All three survive at distinct offsets, visible through either core.
+        assert_eq!(a.read_at(0).unwrap(), Some(b"a0".to_vec()));
+        assert_eq!(b.read_at(1).unwrap(), Some(b"b1".to_vec()));
+        assert_eq!(a.read_at(2).unwrap(), Some(b"a2".to_vec()));
+        assert_eq!(a.tail(), 3);
+        assert_eq!(b.tail(), 3);
     }
 
     #[test]
     fn write_then_read_single_entry() {
         let c = core();
-        let seq = c.write_nowait(b"hello").unwrap();
+        let seq = c.write_sync(b"hello").unwrap();
         assert_eq!(seq, 0);
         let data = c.read_at(0).unwrap().unwrap();
         assert_eq!(data, b"hello");
@@ -540,7 +386,7 @@ mod tests {
     #[test]
     fn read_past_tail_returns_none_when_open() {
         let c = core();
-        c.write_nowait(b"a").unwrap();
+        c.write_sync(b"a").unwrap();
         assert_eq!(c.read_at(0).unwrap(), Some(b"a".to_vec()));
         assert_eq!(c.read_at(1).unwrap(), None);
     }
@@ -548,7 +394,7 @@ mod tests {
     #[test]
     fn read_past_tail_errors_when_closed() {
         let c = core();
-        c.write_nowait(b"a").unwrap();
+        c.write_sync(b"a").unwrap();
         c.close();
         assert!(c.read_at(1).is_err());
     }
@@ -557,14 +403,14 @@ mod tests {
     fn write_after_close_errors() {
         let c = core();
         c.close();
-        assert!(c.write_nowait(b"x").is_err());
+        assert!(c.write_sync(b"x").is_err());
     }
 
     #[test]
     fn binary_data_full_byte_range() {
         let c = core();
         let payload: Vec<u8> = (0u8..=255).collect();
-        c.write_nowait(&payload).unwrap();
+        c.write_sync(&payload).unwrap();
         assert_eq!(c.read_at(0).unwrap(), Some(payload));
     }
 
@@ -574,11 +420,15 @@ mod tests {
         let handles: Vec<_> = (0u8..8)
             .map(|i| {
                 let c = Arc::clone(&c);
-                std::thread::spawn(move || c.write_nowait(&[i]).unwrap())
+                std::thread::spawn(move || c.write_sync(&[i]).unwrap())
             })
             .collect();
         let seqs: HashSet<u64> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        assert_eq!(seqs.len(), 8);
+        assert_eq!(
+            seqs.len(),
+            8,
+            "every concurrent write gets a distinct offset"
+        );
         assert_eq!(c.tail(), 8);
         for seq in 0..8u64 {
             assert!(c.read_at(seq).unwrap().is_some());

@@ -64,11 +64,11 @@ use crate::prelude::{AppliedEntry, Command, FullStateMachine, ZoneConsensus};
 
 /// Register the A2A stream-wakeup observer on `consensus`.
 ///
-/// For every applied `AppendStreamEntry` whose key is a wal-stream entry,
-/// wakes any `sys_watch` parked on the stream's file path via
-/// `Kernel::wake_file_watch`. Non-stream commands and non-stream keys
-/// (e.g. `__wal_pipe__/…`) are ignored. See the module docs for the key
-/// format, the raft usage contract, and why the kernel is held weakly.
+/// For every applied `AppendStreamEntry`, wakes any `sys_watch` parked on the
+/// stream's file path via `Kernel::wake_file_watch`. The command carries the
+/// stream PREFIX (`/__wal_stream__/<path>/`); `watch_path_from_wal_stream_key`
+/// recovers the watched `<path>`. Non-stream commands are ignored. See the
+/// module docs for the raft usage contract and why the kernel is held weakly.
 ///
 /// Anonymous registration (accumulate): one observer per zone consensus is
 /// correct, matching the DCache-invalidator precedent. A distinct zone has
@@ -79,8 +79,8 @@ pub fn install_stream_wakeup_observer(
     kernel: Weak<Kernel>,
 ) {
     consensus.register_apply_observer(Arc::new(move |entry: &AppliedEntry| {
-        if let Command::AppendStreamEntry { key, .. } = &entry.command {
-            if let Some(path) = watch_path_from_wal_stream_key(key) {
+        if let Command::AppendStreamEntry { stream_prefix, .. } = &entry.command {
+            if let Some(path) = watch_path_from_wal_stream_key(stream_prefix) {
                 if let Some(kernel) = kernel.upgrade() {
                     kernel.wake_file_watch(path);
                 }

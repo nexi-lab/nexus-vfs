@@ -66,6 +66,12 @@ message RaftResponse {
   oneof result {
     LockResult lock_result = 3;
     MetadataResult metadata_result = 4;
+    // Opaque bytes a command's apply returns to the proposer — the offset an
+    // AppendStreamEntry was assigned, or an AdjustCounter's new value. MUST
+    // round-trip so a FOLLOWER that forwards the propose to the leader learns
+    // the same value the leader computed (else `CommandResult::Value` flattens
+    // to `Success` on the forwarded path).
+    bytes value_result = 5;
   }
 }
 

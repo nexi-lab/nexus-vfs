@@ -137,33 +137,37 @@ fn park_watch(
     })
 }
 
-/// The side-table key `WalStreamCore` writes for entry `seq` of the
-/// DT_STREAM at `path` (mirrors `kernel::core::stream::wal`'s
-/// `/__wal_stream__/{stream_id}/{seq}` format). The real write path
-/// (`sys_write` → `WalStreamCore`) proposes `AppendStreamEntry` under THIS
-/// key — not the bare path — so the observer's parse
-/// (`watch_path_from_wal_stream_key`) is what recovers the watched path.
-/// Using the real key here is deliberate: a bare-path key would mask a
-/// key-format/parse bug (which is exactly what a prior version of this test
-/// did).
-fn wal_key(path: &str, seq: u64) -> String {
-    format!("/__wal_stream__/{path}/{seq}")
+/// The stream PREFIX `WalStreamCore` proposes for the DT_STREAM at `path`
+/// (mirrors `kernel::core::stream::wal`'s `/__wal_stream__/{stream_id}/`
+/// format). `AppendStreamEntry` carries THIS prefix — not the bare path — so
+/// the observer's parse (`watch_path_from_wal_stream_key`) is what recovers the
+/// watched path; a bare-path prefix would mask a format/parse bug.
+fn wal_prefix(path: &str) -> String {
+    format!("/__wal_stream__/{path}/")
 }
 
-/// Propose an `AppendStreamEntry` on the founder and assert the cluster did
-/// not reject it.
-async fn append_on_founder(founder: &ZoneHandle, key: &str, data: &[u8]) {
+/// The side-table key the state machine ASSIGNS to entry `seq` of the DT_STREAM
+/// at `path` (the caller no longer picks it). Used to read the entry back at
+/// its assigned offset.
+fn wal_key(path: &str, seq: u64) -> String {
+    format!("{}{seq}", wal_prefix(path))
+}
+
+/// Propose an `AppendStreamEntry` for the DT_STREAM at `path` on the founder
+/// (the state machine assigns the offset) and assert the cluster did not
+/// reject it.
+async fn append_on_founder(founder: &ZoneHandle, path: &str, data: &[u8]) {
     let result = founder
         .consensus_node()
         .propose(Command::AppendStreamEntry {
-            key: key.to_string(),
+            stream_prefix: wal_prefix(path),
             data: data.to_vec(),
         })
         .await
         .expect("founder propose AppendStreamEntry");
     assert!(
         !matches!(result, CommandResult::Error(_)),
-        "founder rejected AppendStreamEntry for {key}"
+        "founder rejected AppendStreamEntry for {path}"
     );
 }
 
@@ -261,7 +265,7 @@ async fn replicated_stream_append_wakes_a_parked_watch_only_with_the_observer() 
     // but a notify strictly before registration would be missed.
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    append_on_founder(&zone_founder, &key_1, &data_1).await;
+    append_on_founder(&zone_founder, watch_path_1, &data_1).await;
 
     // The entry really did replicate and apply on the joiner — so a
     // "did not wake" below is about the wake path, not a missing write.
@@ -290,7 +294,7 @@ async fn replicated_stream_append_wakes_a_parked_watch_only_with_the_observer() 
     let watcher_2 = park_watch(Arc::clone(&kernel_joiner), watch_path_2, PHASE2_WATCH_MS);
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    append_on_founder(&zone_founder, &key_2, &data_2).await;
+    append_on_founder(&zone_founder, watch_path_2, &data_2).await;
 
     let woke_2 = watcher_2.await.expect("phase-2 watcher task");
     assert_eq!(
@@ -319,131 +323,5 @@ async fn replicated_stream_append_wakes_a_parked_watch_only_with_the_observer() 
         reread,
         Some(data_2),
         "the replica must still serve the DT_STREAM payload after the sender is dropped"
-    );
-}
-
-/// Propose an `AppendStreamEntry` on the founder via the EC (eventual) plane —
-/// the AP write path an A2A mailbox rides. Unlike [`append_on_founder`]
-/// (`propose` → raft commit), this is `propose_ec_local`: local-apply + async
-/// EC drain to peers, no quorum wait.
-async fn append_ec_on_founder(founder: &ZoneHandle, key: &str, data: &[u8]) {
-    founder
-        .consensus_node()
-        .propose_ec_local(Command::AppendStreamEntry {
-            key: key.to_string(),
-            data: data.to_vec(),
-        })
-        .await
-        .expect("founder propose_ec_local(AppendStreamEntry)");
-}
-
-/// The EC twin of the wakeup test: a stream entry written under
-/// `Consistency::Ec` (local-apply + async EC drain, NOT raft commit) must
-/// still (a) reach the replica's state machine via `apply_ec_from_peer` and
-/// (b) wake a `sys_watch` parked there, via the same apply-observer spine.
-///
-/// Before the EC-stream wiring the replica's `apply_ec_with_lww` REJECTED
-/// `AppendStreamEntry` ("Only metadata operations support EC writes"), so an
-/// EC mailbox write never arrived on a peer and never woke it. This pins that
-/// the EC receiver now (2) applies the entry and (3) fires the wakeup — the
-/// cross-node delivery the A2A mailbox depends on when there is no leader to
-/// take a raft commit.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ec_stream_append_applies_and_wakes_a_parked_watch_on_the_replica() {
-    let dir_founder = TempDir::new().expect("dir-founder");
-    let dir_joiner = TempDir::new().expect("dir-joiner");
-
-    let id_founder = mint_random_id();
-    let id_joiner = mint_random_id();
-    assert_ne!(id_founder, id_joiner, "two random mints must differ");
-    write_node_id(dir_founder.path(), id_founder);
-    write_node_id(dir_joiner.path(), id_joiner);
-
-    let (zm_founder, bind_founder) = make_node(id_founder, dir_founder.path()).await;
-    let (zm_joiner, bind_joiner) = make_node(id_joiner, dir_joiner.path()).await;
-
-    let zone_founder = zm_founder
-        .create_zone("sharedzone", vec![format!("{id_founder}@{bind_founder}")])
-        .expect("create sharedzone on founder");
-    for _ in 0..100 {
-        if zone_founder.is_leader() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(zone_founder.is_leader(), "founder must self-elect");
-
-    let endpoint_founder = format!("http://{bind_founder}");
-    let endpoint_joiner = format!("http://{bind_joiner}");
-
-    let _zone_joiner_local = zm_joiner
-        .join_zone(
-            "sharedzone",
-            vec![format!("{id_founder}@{bind_founder}")],
-            /* learner */ true,
-        )
-        .expect("local join_zone(learner) on joiner");
-    let join_resp = call_join_zone_rpc(
-        &endpoint_founder,
-        "sharedzone",
-        id_joiner,
-        &endpoint_joiner,
-        /* as_learner */ true,
-        None,
-        30,
-    )
-    .await
-    .expect("JoinZone RPC");
-    assert!(
-        join_resp.success,
-        "JoinZone(learner) must succeed: {:?}",
-        join_resp.error
-    );
-
-    for _ in 0..50 {
-        if zm_founder.cluster_status("sharedzone").applied_index >= 1 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    let zone_joiner = zm_joiner
-        .get_zone("sharedzone")
-        .expect("joiner must hold a ZoneHandle for sharedzone");
-
-    // The replica's standalone kernel + the armed wakeup observer — the same
-    // seam §A validates, here fed from the EC-apply arm instead of raft apply.
-    let kernel_joiner = Arc::new(Kernel::new());
-    install_stream_wakeup_observer(
-        &zone_joiner.consensus_node(),
-        Arc::downgrade(&kernel_joiner),
-    );
-
-    let watch_path = "/agents/mac-ai/chat-with-me";
-    let key = wal_key(watch_path, 0);
-    let data = b"ec-mailbox-message".to_vec();
-
-    let watcher = park_watch(Arc::clone(&kernel_joiner), watch_path, PHASE2_WATCH_MS);
-    // Let the blocking watcher actually park before the write lands.
-    tokio::time::sleep(Duration::from_millis(150)).await;
-
-    // EC write on the founder — local-apply + async drain, no raft commit.
-    append_ec_on_founder(&zone_founder, &key, &data).await;
-
-    // (2) The entry must reach the joiner's state machine via the EC receiver
-    // path (`apply_ec_from_peer` → `apply_ec_with_lww` AppendStreamEntry arm).
-    assert_eq!(
-        await_stream(&zone_joiner, &key, Some(&data)).await,
-        Some(data.clone()),
-        "an EC-replicated AppendStreamEntry must apply on the replica's state machine"
-    );
-
-    // (3) …and the same EC apply must fire the observer spine so the parked
-    // sys_watch wakes on the recovered stream path.
-    let woke = watcher.await.expect("watcher task");
-    assert_eq!(
-        woke.as_deref(),
-        Some(watch_path),
-        "an EC AppendStreamEntry apply on the replica must wake the parked sys_watch"
     );
 }

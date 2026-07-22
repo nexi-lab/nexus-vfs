@@ -130,16 +130,14 @@ pub enum Command {
     /// (distinct from ``TREE_METADATA``) so list scans and snapshot
     /// walkers do not confuse stream payload with file metadata.
     AppendStreamEntry {
-        /// Full stream key (typically ``/__wal_stream__/<id>/<seq>``).
-        key: String,
+        /// Stream key PREFIX (``/__wal_stream__/<id>/`` or
+        /// ``/__wal_pipe__/<id>/``). The caller does NOT choose the offset —
+        /// the state machine assigns it at apply (see `execute_metadata_in_txn`)
+        /// in raft-committed order, so a total order holds even across
+        /// concurrent writers and two writers can never collide on a seq.
+        stream_prefix: String,
         /// Raw payload bytes — no encoding applied.
         data: Vec<u8>,
-    },
-
-    /// Delete a single stream entry by key (R19.1b').
-    DeleteStreamEntry {
-        /// Stream key to remove.
-        key: String,
     },
 
     /// No-op command (used for leader election confirmation).
@@ -276,17 +274,17 @@ pub trait StateMachine: Send + Sync {
         self.apply_local(command)
     }
 
-    /// Snapshot the current EC-replicable state as `(key, value)` pairs.
+    /// Snapshot the current EC-replicable state as idempotent commands.
     ///
     /// Used by the EC anti-entropy path (`SnapshotEcState`): a peer that fell
     /// behind the compacted WAL region can't be caught up incrementally, so
-    /// the sender re-materializes THIS state as idempotent commands and ships
-    /// it — metadata as `SetMetadata`, stream entries as `AppendStreamEntry`.
-    /// Order is irrelevant: the receiver applies each LWW/union-idempotently.
+    /// the sender re-materializes THIS state as idempotent `SetMetadata`
+    /// commands and ships it. Order is irrelevant: the receiver applies each
+    /// LWW-idempotently.
     ///
-    /// Returns `Command`s (not raw `(key,value)`) so the source can mix planes
-    /// — a stream entry MUST re-materialize as `AppendStreamEntry`, not
-    /// `SetMetadata`, or the peer would never catch up on messages.
+    /// EC state is metadata registers only — DT_STREAM entries are strong
+    /// consistency (raft-committed, replicated via the log itself), never the
+    /// EC plane, so they are not part of this snapshot.
     ///
     /// Default: empty (a state machine that holds no EC state — e.g. a
     /// witness — has nothing to transfer). Override in [`FullStateMachine`].
@@ -565,8 +563,21 @@ const TREE_METADATA: &str = "sm_metadata";
 /// ``TREE_METADATA`` so the WAL stream backend does not pollute file
 /// metadata scans / snapshots with hex-encoded payload rows. Keys are
 /// opaque strings (the kernel picks a ``/__wal_stream__/<id>/<seq>``
-/// convention); values are raw bytes.
+/// convention); values are raw bytes. One reserved sidecar key per stream —
+/// [`stream_tail_key`] — holds that stream's next-offset cursor in the SAME
+/// tree, so the cursor is atomic with the entries and rides the snapshot.
 const TREE_STREAM_ENTRIES: &str = "sm_stream_entries";
+
+/// Reserved key holding a stream's next-offset cursor, stored beside its
+/// entries in [`TREE_STREAM_ENTRIES`]. The `__stream_tail__` namespace never
+/// overlaps an entry key (`{stream_prefix}{seq}`, where `stream_prefix` begins
+/// `/__wal_stream__/` or `/__wal_pipe__/`), so read/collect prefix scans skip
+/// it while the state-machine snapshot (which walks the whole tree) carries it
+/// for free. The `AppendStreamEntry` apply is the sole writer; SSOT for "how
+/// many entries has this stream ever had".
+fn stream_tail_key(stream_prefix: &str) -> String {
+    format!("__stream_tail__{stream_prefix}")
+}
 /// Dedicated redb tree for API-key records (auth-key store).
 ///
 /// Holds ``Command::PutAuthKey`` payloads, separate from
@@ -1191,49 +1202,28 @@ impl FullStateMachine {
         Ok(result)
     }
 
-    /// Enumerate stream-entry keys under ``prefix`` (keys only, no values).
-    ///
-    /// Backs durable client-side seq-resume ([`WalStreamCore`]): a stream
-    /// backend restores its next-seq cursor from the max existing seq on open,
-    /// so a restart/failover re-opens the lane PAST the last entry instead of
-    /// at 0 (which would overwrite earlier messages). Keys are
-    /// ``{prefix}{seq}`` with a decimal ``seq`` — the caller parses the max
-    /// numerically (decimal keys do not sort numerically).
-    pub fn list_stream_entry_keys(&self, prefix: &str) -> Result<Vec<String>> {
-        let mut keys = Vec::new();
-        for item in self.stream_entries.scan_prefix(prefix.as_bytes()) {
-            let (key, _value) = item?;
-            if let Ok(k) = String::from_utf8(key) {
-                keys.push(k);
-            }
-        }
-        Ok(keys)
-    }
-
-    /// Enumerate stream entries (``key``, ``value``) under ``prefix``.
-    ///
-    /// Backs the EC anti-entropy snapshot ([`StateMachine::ec_state_snapshot`]):
-    /// a peer that fell behind the compacted WAL must catch up on STREAM
-    /// entries (A2A messages), not just metadata — the ``stream_entries`` tree
-    /// is separate from ``TREE_METADATA`` and is not covered by
-    /// [`Self::list_metadata`].
-    pub fn list_stream_entries(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
-        let mut out = Vec::new();
-        for item in self.stream_entries.scan_prefix(prefix.as_bytes()) {
-            let (key, value) = item?;
-            if let Ok(k) = String::from_utf8(key) {
-                out.push((k, value));
-            }
-        }
-        Ok(out)
-    }
-
     /// Get a stream entry by key (R19.1b').
     ///
     /// Looks up the opaque bytes previously stored by
     /// ``Command::AppendStreamEntry``. Returns ``Ok(None)`` if absent.
     pub fn get_stream_entry(&self, key: &str) -> Result<Option<Vec<u8>>> {
         Ok(self.stream_entries.get(key.as_bytes())?)
+    }
+
+    /// Current next-offset cursor for a stream (``0`` if nothing written yet).
+    ///
+    /// Reads the `__stream_tail__` sidecar the `AppendStreamEntry` apply keeps
+    /// beside the entries — the SSOT for how many entries the stream holds,
+    /// correct across ALL writers because every append replicates + applies on
+    /// every node in the same committed order.
+    pub fn stream_tail(&self, stream_prefix: &str) -> Result<u64> {
+        let key = stream_tail_key(stream_prefix);
+        Ok(self
+            .stream_entries
+            .get(key.as_bytes())?
+            .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
+            .map(u64::from_be_bytes)
+            .unwrap_or(0))
     }
 
     /// Look up an API-key record by its ``key_hash``.
@@ -1260,61 +1250,6 @@ impl FullStateMachine {
             }
         }
         Ok(out)
-    }
-
-    /// Delete every stream entry whose key begins with ``prefix`` (R19.1b').
-    ///
-    /// Returns the number of rows removed. Used when a WAL stream is
-    /// closed-and-dropped en masse — lets the caller avoid issuing
-    /// one ``DeleteStreamEntry`` per seq.
-    ///
-    /// This reads the current keys under the prefix, then deletes
-    /// each one — all inside a single redb write transaction. Not
-    /// routed through raft because callers (snapshot prune, cleanup)
-    /// handle replication separately; for raft-driven deletion use
-    /// ``Command::DeleteStreamEntry`` per key.
-    pub fn delete_stream_prefix(&self, prefix: &str) -> Result<u64> {
-        let db = self.stream_entries.raw_db();
-        let table_def = redb::TableDefinition::<&[u8], &[u8]>::new(self.stream_entries.name());
-        let write_txn = db
-            .begin_write()
-            .map_err(|e| super::RaftError::Storage(e.to_string()))?;
-        let mut removed: u64 = 0;
-        {
-            let mut table = write_txn
-                .open_table(table_def)
-                .map_err(|e| super::RaftError::Storage(e.to_string()))?;
-
-            // Collect matching keys first — redb does not allow
-            // delete-while-iterating on the same table handle.
-            let mut keys: Vec<Vec<u8>> = Vec::new();
-            {
-                let iter = table
-                    .range::<&[u8]>(prefix.as_bytes()..)
-                    .map_err(|e| super::RaftError::Storage(e.to_string()))?;
-                for entry in iter {
-                    let (k, _v) = entry.map_err(|e| super::RaftError::Storage(e.to_string()))?;
-                    let kb = k.value().to_vec();
-                    if !kb.starts_with(prefix.as_bytes()) {
-                        break;
-                    }
-                    keys.push(kb);
-                }
-            }
-            for k in keys {
-                if table
-                    .remove(k.as_slice())
-                    .map_err(|e| super::RaftError::Storage(e.to_string()))?
-                    .is_some()
-                {
-                    removed += 1;
-                }
-            }
-        }
-        write_txn
-            .commit()
-            .map_err(|e| super::RaftError::Storage(e.to_string()))?;
-        Ok(removed)
     }
 
     /// Get lock info by path (reads the shared advisory map).
@@ -1391,14 +1326,11 @@ impl FullStateMachine {
                 now_secs,
             } => self.apply_extend_lock(path, lock_id, *new_ttl_secs, *now_secs),
             Command::AdjustCounter { key, delta } => self.apply_adjust_counter(key, *delta),
-            Command::AppendStreamEntry { key, data } => {
-                self.stream_entries.set(key.as_bytes(), data)?;
-                Ok(CommandResult::Success)
-            }
-            Command::DeleteStreamEntry { key } => {
-                self.stream_entries.delete(key.as_bytes())?;
-                Ok(CommandResult::Success)
-            }
+            Command::AppendStreamEntry { .. } => Err(super::RaftError::InvalidState(
+                "AppendStreamEntry must apply via execute_metadata_in_txn (the offset is \
+                 assigned atomically at raft apply); the non-txn path must never receive it"
+                    .into(),
+            )),
             Command::PutAuthKey { key_hash, record } => {
                 self.auth_keys.set(key_hash.as_bytes(), record)?;
                 Ok(CommandResult::Success)
@@ -1496,28 +1428,37 @@ impl FullStateMachine {
                 Ok(CommandResult::Value(new_val.to_be_bytes().to_vec()))
             }
 
-            Command::AppendStreamEntry { key, data } => {
+            Command::AppendStreamEntry {
+                stream_prefix,
+                data,
+            } => {
+                // Assign the offset HERE, at raft apply, in committed order — so
+                // a total order holds even across concurrent writers (the log
+                // serializes them). The next-offset cursor lives beside the
+                // entries in the SAME tree + txn, so it can never diverge from
+                // them and it rides the state-machine snapshot for free. This is
+                // the linearizable-log contract: the caller never picks a seq,
+                // so two writers cannot collide.
                 let stream_def =
                     redb::TableDefinition::<&[u8], &[u8]>::new(self.stream_entries.name());
                 let mut table = txn
                     .open_table(stream_def)
                     .map_err(|e| super::RaftError::Storage(format!("open stream_entries: {e}")))?;
+                let tail_key = stream_tail_key(stream_prefix);
+                let seq = table
+                    .get(tail_key.as_bytes())
+                    .map_err(|e| super::RaftError::Storage(format!("get stream tail: {e}")))?
+                    .and_then(|v| <[u8; 8]>::try_from(v.value()).ok())
+                    .map(u64::from_be_bytes)
+                    .unwrap_or(0);
+                let entry_key = format!("{stream_prefix}{seq}");
                 table
-                    .insert(key.as_bytes(), data.as_slice())
+                    .insert(entry_key.as_bytes(), data.as_slice())
                     .map_err(|e| super::RaftError::Storage(format!("insert stream_entry: {e}")))?;
-                Ok(CommandResult::Success)
-            }
-
-            Command::DeleteStreamEntry { key } => {
-                let stream_def =
-                    redb::TableDefinition::<&[u8], &[u8]>::new(self.stream_entries.name());
-                let mut table = txn
-                    .open_table(stream_def)
-                    .map_err(|e| super::RaftError::Storage(format!("open stream_entries: {e}")))?;
                 table
-                    .remove(key.as_bytes())
-                    .map_err(|e| super::RaftError::Storage(format!("remove stream_entry: {e}")))?;
-                Ok(CommandResult::Success)
+                    .insert(tail_key.as_bytes(), (seq + 1).to_be_bytes().as_slice())
+                    .map_err(|e| super::RaftError::Storage(format!("bump stream tail: {e}")))?;
+                Ok(CommandResult::Value(seq.to_be_bytes().to_vec()))
             }
 
             Command::PutAuthKey { key_hash, record } => {
@@ -1571,8 +1512,6 @@ impl StateMachine for FullStateMachine {
             Command::SetMetadata { .. }
             | Command::CasSetMetadata { .. }
             | Command::DeleteMetadata { .. }
-            | Command::AppendStreamEntry { .. }
-            | Command::DeleteStreamEntry { .. }
             | Command::PutAuthKey { .. }
             | Command::DeleteAuthKey { .. } => self.execute(command),
             _ => Err(super::RaftError::InvalidState(
@@ -1590,9 +1529,8 @@ impl StateMachine for FullStateMachine {
     /// each key is written by exactly one node, so two nodes never write the
     /// SAME key concurrently and the conflict branch below never actually has
     /// to pick a winner. That invariant holds for every current EC caller —
-    /// A2A owns it structurally (each agent owns `/agents/{name}/…`; mailbox
-    /// entries are keyed per-sender), and cc-tasks-share is likewise
-    /// owner-partitioned. Under it, the merge is trivially convergent.
+    /// cc-tasks-share is owner-partitioned (each node owns its own task-list
+    /// keys). Under it, the merge is trivially convergent.
     ///
     /// It is NOT a correct general multi-writer LWW, by design (deferred as
     /// YAGNI until a real concurrent-same-key workload exists):
@@ -1665,21 +1603,8 @@ impl StateMachine for FullStateMachine {
                     self.apply_delete_metadata(key)
                 }
             }
-            // Stream entries are union-by-unique-key, NOT an LWW register: each
-            // key (owner-partitioned lane + seq) is written by exactly one
-            // owner, so there is never a conflicting concurrent write to
-            // resolve — re-apply of the same key is an idempotent set/delete.
-            // This is the mailbox's AP write path arriving on a peer.
-            Command::AppendStreamEntry { key, data } => {
-                self.stream_entries.set(key.as_bytes(), data)?;
-                Ok(CommandResult::Success)
-            }
-            Command::DeleteStreamEntry { key } => {
-                self.stream_entries.delete(key.as_bytes())?;
-                Ok(CommandResult::Success)
-            }
             _ => Err(super::RaftError::InvalidState(
-                "Only metadata + stream operations support EC writes".into(),
+                "Only metadata operations support EC writes".into(),
             )),
         };
 
@@ -1699,28 +1624,17 @@ impl StateMachine for FullStateMachine {
     }
 
     fn ec_state_snapshot(&self) -> Vec<Command> {
-        // Metadata key/values (list_metadata skips internal `__` keys) →
-        // SetMetadata. LWW-idempotent on the receiver; Sc-plane keys are
-        // byte-identical there so they no-op, only missed EC keys change.
-        let mut cmds: Vec<Command> = self
-            .list_metadata("")
+        // EC anti-entropy snapshot = metadata registers only. `list_metadata`
+        // skips internal `__` keys → SetMetadata. LWW-idempotent on the
+        // receiver; Sc-plane keys are byte-identical there so they no-op, only
+        // missed EC keys change. DT_STREAM entries are NOT here: streams are
+        // strong consistency (raft-committed), replicated via the log itself,
+        // never the EC plane.
+        self.list_metadata("")
             .unwrap_or_default()
             .into_iter()
             .map(|(key, value)| Command::SetMetadata { key, value })
-            .collect();
-        // Stream entries (A2A messages) live in the separate `stream_entries`
-        // tree, NOT covered by list_metadata. A peer past the compacted WAL
-        // must catch up on these too, else the AP delivery promise breaks for
-        // the stream payload — the whole point of the mailbox. Re-materialize
-        // as AppendStreamEntry; union-by-unique-key on the receiver
-        // (`apply_ec_with_lww`) makes replay idempotent.
-        cmds.extend(
-            self.list_stream_entries("")
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(key, data)| Command::AppendStreamEntry { key, data }),
-        );
-        cmds
+            .collect()
     }
 
     fn apply(&mut self, index: u64, command: &Command) -> Result<CommandResult> {
@@ -3798,51 +3712,96 @@ mod tests {
         }
     }
 
-    /// R19.1b' — ``AppendStreamEntry`` stores raw bytes in the
-    /// dedicated ``sm_stream_entries`` tree (not ``sm_metadata``),
-    /// and ``get_stream_entry`` reads them back untouched.
+    /// The state machine assigns each entry's offset at apply (the caller
+    /// passes only the stream PREFIX): the first append lands at seq 0, the
+    /// next at seq 1, `get_stream_entry` reads the raw bytes back at the
+    /// assigned key, and the returned `CommandResult::Value` carries the seq.
     #[test]
-    fn stream_entry_roundtrip_raw_bytes() {
+    fn stream_entry_sm_assigns_offset_at_apply() {
         let store = RedbStore::open_temporary().unwrap();
         let mut sm = FullStateMachine::new(&store).unwrap();
+        let prefix = "/__wal_stream__/s/";
 
         let payload: Vec<u8> = (0u8..=255).collect();
-        sm.apply(
-            1,
-            &Command::AppendStreamEntry {
-                key: "/__wal_stream__/s/0".into(),
-                data: payload.clone(),
-            },
-        )
-        .unwrap();
+        let r0 = sm
+            .apply(
+                1,
+                &Command::AppendStreamEntry {
+                    stream_prefix: prefix.into(),
+                    data: payload.clone(),
+                },
+            )
+            .unwrap();
+        // The apply RETURNS the assigned offset (0) so the writer learns it.
+        assert!(matches!(r0, CommandResult::Value(ref v) if v.as_slice() == 0u64.to_be_bytes()));
 
+        let r1 = sm
+            .apply(
+                2,
+                &Command::AppendStreamEntry {
+                    stream_prefix: prefix.into(),
+                    data: b"second".to_vec(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(r1, CommandResult::Value(ref v) if v.as_slice() == 1u64.to_be_bytes()));
+
+        // Entries land at the SM-assigned keys {prefix}{seq}, read back raw.
         assert_eq!(
             sm.get_stream_entry("/__wal_stream__/s/0").unwrap(),
             Some(payload)
         );
-        // Stream entries do NOT appear in list_metadata — different
-        // redb tree. Confirms no pollution of file-metadata scans.
+        assert_eq!(
+            sm.get_stream_entry("/__wal_stream__/s/1").unwrap(),
+            Some(b"second".to_vec())
+        );
+        // The cursor advanced to 2; the `__stream_tail__` sidecar is the SSOT.
+        assert_eq!(sm.stream_tail(prefix).unwrap(), 2);
+        // Stream entries (and the sidecar) do NOT appear in list_metadata —
+        // different redb tree. Confirms no pollution of file-metadata scans.
         assert!(sm.list_metadata("/__wal_stream__/").unwrap().is_empty());
     }
 
-    /// ``DeleteStreamEntry`` removes the row; subsequent get returns
-    /// ``None``.
+    /// Multi-writer safety: several appends to the SAME stream (as arrive on
+    /// one node from concurrent writers, serialized by the raft log) each get a
+    /// DISTINCT, gap-free offset — none overwrites another. This is the exact
+    /// loss the old client-side `next_seq` produced when two nodes both picked
+    /// the same seq; assigning at apply makes it impossible.
     #[test]
-    fn stream_entry_delete_by_key() {
+    fn stream_entry_concurrent_writers_never_collide() {
         let store = RedbStore::open_temporary().unwrap();
         let mut sm = FullStateMachine::new(&store).unwrap();
-        sm.apply(
-            1,
-            &Command::AppendStreamEntry {
-                key: "/s/0".into(),
-                data: b"hello".to_vec(),
-            },
-        )
-        .unwrap();
-        assert!(sm.get_stream_entry("/s/0").unwrap().is_some());
-        sm.apply(2, &Command::DeleteStreamEntry { key: "/s/0".into() })
-            .unwrap();
-        assert!(sm.get_stream_entry("/s/0").unwrap().is_none());
+        let prefix = "/__wal_stream__/shared/";
+
+        for (i, body) in ["from-a", "from-b", "from-a-again"].iter().enumerate() {
+            let r = sm
+                .apply(
+                    (i + 1) as u64,
+                    &Command::AppendStreamEntry {
+                        stream_prefix: prefix.into(),
+                        data: body.as_bytes().to_vec(),
+                    },
+                )
+                .unwrap();
+            assert!(
+                matches!(r, CommandResult::Value(ref v) if v.as_slice() == (i as u64).to_be_bytes()),
+                "append {i} must be assigned offset {i}"
+            );
+        }
+        // All three survive at distinct offsets — nothing overwritten.
+        assert_eq!(
+            sm.get_stream_entry("/__wal_stream__/shared/0").unwrap(),
+            Some(b"from-a".to_vec())
+        );
+        assert_eq!(
+            sm.get_stream_entry("/__wal_stream__/shared/1").unwrap(),
+            Some(b"from-b".to_vec())
+        );
+        assert_eq!(
+            sm.get_stream_entry("/__wal_stream__/shared/2").unwrap(),
+            Some(b"from-a-again".to_vec())
+        );
+        assert_eq!(sm.stream_tail(prefix).unwrap(), 3);
     }
 
     /// ``PutAuthKey`` stores opaque record bytes; ``get_auth_key`` reads
@@ -3952,52 +3911,21 @@ mod tests {
         );
     }
 
-    /// ``delete_stream_prefix`` drops every row under the prefix and
-    /// leaves others alone.
+    /// Snapshot + restore round-trips stream entries AND their offset cursor.
+    /// The cursor (`__stream_tail__` sidecar) rides the same tree, so a
+    /// snapshot-restored replica keeps counting from where the stream left off:
+    /// a post-restore append lands at the NEXT offset, never overwriting a
+    /// restored entry. (A separate cursor tree that missed the snapshot would
+    /// reset to 0 and clobber — the P7 trap this design avoids.)
     #[test]
-    fn stream_entry_delete_prefix_scopes_correctly() {
+    fn stream_entry_and_cursor_survive_snapshot_restore() {
         let store = RedbStore::open_temporary().unwrap();
         let mut sm = FullStateMachine::new(&store).unwrap();
-        for i in 0..5 {
-            sm.apply(
-                i + 1,
-                &Command::AppendStreamEntry {
-                    key: format!("/__wal_stream__/a/{i}"),
-                    data: vec![i as u8],
-                },
-            )
-            .unwrap();
-        }
-        sm.apply(
-            10,
-            &Command::AppendStreamEntry {
-                key: "/__wal_stream__/b/0".into(),
-                data: b"keep".to_vec(),
-            },
-        )
-        .unwrap();
-
-        let removed = sm.delete_stream_prefix("/__wal_stream__/a/").unwrap();
-        assert_eq!(removed, 5);
-        assert!(sm
-            .get_stream_entry("/__wal_stream__/a/0")
-            .unwrap()
-            .is_none());
-        assert_eq!(
-            sm.get_stream_entry("/__wal_stream__/b/0").unwrap(),
-            Some(b"keep".to_vec())
-        );
-    }
-
-    /// Snapshot + restore round-trips stream entries intact.
-    #[test]
-    fn stream_entry_snapshot_restore_roundtrip() {
-        let store = RedbStore::open_temporary().unwrap();
-        let mut sm = FullStateMachine::new(&store).unwrap();
+        let prefix = "/__wal_stream__/s/";
         sm.apply(
             1,
             &Command::AppendStreamEntry {
-                key: "/s/0".into(),
+                stream_prefix: prefix.into(),
                 data: vec![0xde, 0xad, 0xbe, 0xef],
             },
         )
@@ -4005,7 +3933,7 @@ mod tests {
         sm.apply(
             2,
             &Command::AppendStreamEntry {
-                key: "/s/1".into(),
+                stream_prefix: prefix.into(),
                 data: vec![0x00, 0xff],
             },
         )
@@ -4017,13 +3945,35 @@ mod tests {
         let mut sm2 = FullStateMachine::new(&store2).unwrap();
         sm2.restore_snapshot(&snap_bytes).unwrap();
 
+        // Entries restored intact at their assigned offsets.
         assert_eq!(
-            sm2.get_stream_entry("/s/0").unwrap(),
+            sm2.get_stream_entry("/__wal_stream__/s/0").unwrap(),
             Some(vec![0xde, 0xad, 0xbe, 0xef])
         );
         assert_eq!(
-            sm2.get_stream_entry("/s/1").unwrap(),
+            sm2.get_stream_entry("/__wal_stream__/s/1").unwrap(),
             Some(vec![0x00, 0xff])
+        );
+        // Cursor restored too: the next append lands at seq 2, not 0.
+        assert_eq!(sm2.stream_tail(prefix).unwrap(), 2);
+        let r = sm2
+            .apply(
+                3,
+                &Command::AppendStreamEntry {
+                    stream_prefix: prefix.into(),
+                    data: b"post-restore".to_vec(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(r, CommandResult::Value(ref v) if v.as_slice() == 2u64.to_be_bytes()));
+        assert_eq!(
+            sm2.get_stream_entry("/__wal_stream__/s/2").unwrap(),
+            Some(b"post-restore".to_vec())
+        );
+        // The originals were NOT clobbered.
+        assert_eq!(
+            sm2.get_stream_entry("/__wal_stream__/s/0").unwrap(),
+            Some(vec![0xde, 0xad, 0xbe, 0xef])
         );
     }
 }

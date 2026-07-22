@@ -8,17 +8,19 @@
 //!
 //! ## Write consistency
 //!
-//! ``put`` / ``delete`` / CAS default to ``ZoneConsensus::propose`` (SC —
-//! Raft consensus, majority ACK). This is the standard kernel hot path and
-//! the safe default: it is linearizable and needs no conflict resolution.
+//! ``put`` / ``delete`` / CAS / ``append_stream_entry`` all go through
+//! ``ZoneConsensus::propose`` (SC — Raft consensus, majority ACK): linearizable
+//! and needs no conflict resolution. ``append_stream_entry`` is SC by design —
+//! a DT_STREAM is an ordered log, so its offsets need a single serialization
+//! point; EC cannot give a total order leaderless.
 //!
-//! ``append_stream_entry`` is consistency-aware — it takes a ``Consistency``
-//! and routes ``Ec`` through ``propose_ec_local`` (WAL-first local apply +
-//! async drain-to-peers, LWW convergence). This is the AP plane the A2A
-//! mailbox rides: a mailbox write must succeed even when no raft quorum is
-//! reachable (every node is an equal peer; there is no guaranteed-up leader),
-//! which SC cannot offer. ``zone_handle.rs::set_metadata`` likewise takes a
-//! per-call ``Consistency`` for metadata writes.
+//! The EC (eventually-consistent) plane is a per-call opt-in for *metadata
+//! registers* only: ``zone_handle.rs::set_metadata`` / ``delete_metadata`` take
+//! a ``Consistency`` and route ``Ec`` through ``propose_ec_local`` (WAL-first
+//! local apply + async drain-to-peers, LWW convergence). A register is a
+//! mutable last-writer-wins value (presence / status / a pointer) that
+//! converges without ordering; use it when a write must succeed even with no
+//! raft quorum reachable. Ordered logs (streams) never use it.
 //!
 //! ### EC-drain substrate is hardened (do not re-disable)
 //!
@@ -57,7 +59,6 @@ use crate::transport::proto::nexus::core::FileMetadata as ProtoFileMetadata;
 use contracts::VFS_ROOT;
 use prost::Message;
 
-use kernel::hal::distributed_coordinator::Consistency;
 use kernel::meta_store::{FileMetadata as KernelFileMetadata, MetaStore, MetaStoreError};
 
 /// ``kernel::MetaStore`` impl backed by a single ``ZoneConsensus``.
@@ -398,49 +399,44 @@ impl MetaStore for ZoneMetaStore {
         Some(self.coherence_id)
     }
 
-    fn append_stream_entry(
-        &self,
-        key: &str,
-        data: &[u8],
-        consistency: Consistency,
-    ) -> Result<(), MetaStoreError> {
+    fn append_stream_entry(&self, stream_prefix: &str, data: &[u8]) -> Result<u64, MetaStoreError> {
         // Stream entries skip the zone-key translation `put` does for
-        // FileMetadata — `key` is the full WAL identity (`__wal_stream__/…`
-        // or `__wal_pipe__/…`) and the side-table is zone-scoped at the
-        // raft state-machine layer (this `ZoneMetaStore` is bound to a
-        // single zone via `node`).
+        // FileMetadata — `stream_prefix` is the full WAL identity prefix
+        // (`__wal_stream__/<id>/` or `__wal_pipe__/<id>/`) and the side-table is
+        // zone-scoped at the raft state-machine layer (this `ZoneMetaStore` is
+        // bound to a single zone via `node`).
+        //
+        // Always proposed through raft (strong consistency): a DT_STREAM is an
+        // ordered log, so its offsets need a single serialization point — the
+        // state machine assigns the offset at apply and returns it here. The EC
+        // plane is for LWW metadata registers (`zone_handle::set_metadata`),
+        // never streams.
         let cmd = Command::AppendStreamEntry {
-            key: key.to_string(),
+            stream_prefix: stream_prefix.to_string(),
             data: data.to_vec(),
         };
-        match consistency {
-            Consistency::Sc => {
-                let result =
-                    bridge_block_on(&self.runtime, self.node.propose(cmd)).map_err(|e| {
-                        MetaStoreError::IOError(format!(
-                            "ZoneMetaStore.append_stream_entry({key}): {e}"
-                        ))
-                    })?;
-                match result {
-                    crate::prelude::CommandResult::Success => Ok(()),
-                    crate::prelude::CommandResult::Error(e) => Err(MetaStoreError::IOError(
-                        format!("ZoneMetaStore.append_stream_entry({key}) rejected: {e}"),
-                    )),
-                    _ => Ok(()),
-                }
-            }
-            Consistency::Ec => {
-                // AP plane: local-apply + async replicate. `propose_ec_local`
-                // returns the WAL seq token; a successful local apply IS success
-                // here — cross-node delivery + LWW convergence happen in the
-                // background EC drain, not synchronously.
-                bridge_block_on(&self.runtime, self.node.propose_ec_local(cmd)).map_err(|e| {
+        let result = bridge_block_on(&self.runtime, self.node.propose(cmd)).map_err(|e| {
+            MetaStoreError::IOError(format!(
+                "ZoneMetaStore.append_stream_entry({stream_prefix}): {e}"
+            ))
+        })?;
+        match result {
+            crate::prelude::CommandResult::Value(bytes) => <[u8; 8]>::try_from(bytes.as_slice())
+                .map(u64::from_be_bytes)
+                .map_err(|_| {
                     MetaStoreError::IOError(format!(
-                        "ZoneMetaStore.append_stream_entry({key}) [ec]: {e}"
+                        "ZoneMetaStore.append_stream_entry({stream_prefix}): apply returned a \
+                         non-u64 offset ({} bytes)",
+                        bytes.len()
                     ))
-                })?;
-                Ok(())
-            }
+                }),
+            crate::prelude::CommandResult::Error(e) => Err(MetaStoreError::IOError(format!(
+                "ZoneMetaStore.append_stream_entry({stream_prefix}) rejected: {e}"
+            ))),
+            _ => Err(MetaStoreError::IOError(format!(
+                "ZoneMetaStore.append_stream_entry({stream_prefix}): unexpected apply result \
+                 (expected a Value offset)"
+            ))),
         }
     }
 
@@ -454,15 +450,13 @@ impl MetaStore for ZoneMetaStore {
         })
     }
 
-    fn list_stream_entry_keys(&self, prefix: &str) -> Result<Vec<String>, MetaStoreError> {
-        let prefix_owned = prefix.to_string();
-        let fut = self.node.with_state_machine(move |sm: &FullStateMachine| {
-            sm.list_stream_entry_keys(&prefix_owned)
-        });
+    fn stream_tail(&self, stream_prefix: &str) -> Result<u64, MetaStoreError> {
+        let prefix_owned = stream_prefix.to_string();
+        let fut = self
+            .node
+            .with_state_machine(move |sm: &FullStateMachine| sm.stream_tail(&prefix_owned));
         bridge_block_on(&self.runtime, fut).map_err(|e| {
-            MetaStoreError::IOError(format!(
-                "ZoneMetaStore.list_stream_entry_keys({prefix}): {e}"
-            ))
+            MetaStoreError::IOError(format!("ZoneMetaStore.stream_tail({stream_prefix}): {e}"))
         })
     }
 }

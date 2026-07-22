@@ -133,7 +133,6 @@ impl PipeBackend for WalPipeCore {
 mod tests {
     use super::*;
     use crate::abc::meta_store::{FileMetadata, MetaStoreError};
-    use crate::hal::distributed_coordinator::Consistency;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
 
@@ -159,15 +158,18 @@ mod tests {
         }
         fn append_stream_entry(
             &self,
-            key: &str,
+            stream_prefix: &str,
             data: &[u8],
-            _consistency: Consistency,
-        ) -> Result<(), MetaStoreError> {
-            self.inner
-                .lock()
-                .unwrap()
-                .insert(key.to_string(), data.to_vec());
-            Ok(())
+        ) -> Result<u64, MetaStoreError> {
+            // Mirror the real store: the offset is assigned here (count under
+            // the prefix), not by the caller.
+            let mut inner = self.inner.lock().unwrap();
+            let seq = inner
+                .keys()
+                .filter(|k| k.starts_with(stream_prefix))
+                .count() as u64;
+            inner.insert(format!("{stream_prefix}{seq}"), data.to_vec());
+            Ok(seq)
         }
         fn get_stream_entry(&self, key: &str) -> Result<Option<Vec<u8>>, MetaStoreError> {
             Ok(self.inner.lock().unwrap().get(key).cloned())
