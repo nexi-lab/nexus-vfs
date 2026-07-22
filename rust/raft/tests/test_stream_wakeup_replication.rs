@@ -137,33 +137,37 @@ fn park_watch(
     })
 }
 
-/// The side-table key `WalStreamCore` writes for entry `seq` of the
-/// DT_STREAM at `path` (mirrors `kernel::core::stream::wal`'s
-/// `/__wal_stream__/{stream_id}/{seq}` format). The real write path
-/// (`sys_write` → `WalStreamCore`) proposes `AppendStreamEntry` under THIS
-/// key — not the bare path — so the observer's parse
-/// (`watch_path_from_wal_stream_key`) is what recovers the watched path.
-/// Using the real key here is deliberate: a bare-path key would mask a
-/// key-format/parse bug (which is exactly what a prior version of this test
-/// did).
-fn wal_key(path: &str, seq: u64) -> String {
-    format!("/__wal_stream__/{path}/{seq}")
+/// The stream PREFIX `WalStreamCore` proposes for the DT_STREAM at `path`
+/// (mirrors `kernel::core::stream::wal`'s `/__wal_stream__/{stream_id}/`
+/// format). `AppendStreamEntry` carries THIS prefix — not the bare path — so
+/// the observer's parse (`watch_path_from_wal_stream_key`) is what recovers the
+/// watched path; a bare-path prefix would mask a format/parse bug.
+fn wal_prefix(path: &str) -> String {
+    format!("/__wal_stream__/{path}/")
 }
 
-/// Propose an `AppendStreamEntry` on the founder and assert the cluster did
-/// not reject it.
-async fn append_on_founder(founder: &ZoneHandle, key: &str, data: &[u8]) {
+/// The side-table key the state machine ASSIGNS to entry `seq` of the DT_STREAM
+/// at `path` (the caller no longer picks it). Used to read the entry back at
+/// its assigned offset.
+fn wal_key(path: &str, seq: u64) -> String {
+    format!("{}{seq}", wal_prefix(path))
+}
+
+/// Propose an `AppendStreamEntry` for the DT_STREAM at `path` on the founder
+/// (the state machine assigns the offset) and assert the cluster did not
+/// reject it.
+async fn append_on_founder(founder: &ZoneHandle, path: &str, data: &[u8]) {
     let result = founder
         .consensus_node()
         .propose(Command::AppendStreamEntry {
-            key: key.to_string(),
+            stream_prefix: wal_prefix(path),
             data: data.to_vec(),
         })
         .await
         .expect("founder propose AppendStreamEntry");
     assert!(
         !matches!(result, CommandResult::Error(_)),
-        "founder rejected AppendStreamEntry for {key}"
+        "founder rejected AppendStreamEntry for {path}"
     );
 }
 
@@ -261,7 +265,7 @@ async fn replicated_stream_append_wakes_a_parked_watch_only_with_the_observer() 
     // but a notify strictly before registration would be missed.
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    append_on_founder(&zone_founder, &key_1, &data_1).await;
+    append_on_founder(&zone_founder, watch_path_1, &data_1).await;
 
     // The entry really did replicate and apply on the joiner — so a
     // "did not wake" below is about the wake path, not a missing write.
@@ -290,7 +294,7 @@ async fn replicated_stream_append_wakes_a_parked_watch_only_with_the_observer() 
     let watcher_2 = park_watch(Arc::clone(&kernel_joiner), watch_path_2, PHASE2_WATCH_MS);
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    append_on_founder(&zone_founder, &key_2, &data_2).await;
+    append_on_founder(&zone_founder, watch_path_2, &data_2).await;
 
     let woke_2 = watcher_2.await.expect("phase-2 watcher task");
     assert_eq!(

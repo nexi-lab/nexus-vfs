@@ -156,12 +156,17 @@ mod tests {
         fn exists(&self, _path: &str) -> Result<bool, MetaStoreError> {
             Ok(false)
         }
-        fn append_stream_entry(&self, key: &str, data: &[u8]) -> Result<(), MetaStoreError> {
-            self.inner
-                .lock()
-                .unwrap()
-                .insert(key.to_string(), data.to_vec());
-            Ok(())
+        fn append_stream_entry(
+            &self,
+            stream_prefix: &str,
+            data: &[u8],
+        ) -> Result<u64, MetaStoreError> {
+            // Mirror the real store: the offset is assigned here (count under
+            // the prefix), not by the caller.
+            let mut inner = self.inner.lock().unwrap();
+            let seq = inner.keys().filter(|k| k.starts_with(stream_prefix)).count() as u64;
+            inner.insert(format!("{stream_prefix}{seq}"), data.to_vec());
+            Ok(seq)
         }
         fn get_stream_entry(&self, key: &str) -> Result<Option<Vec<u8>>, MetaStoreError> {
             Ok(self.inner.lock().unwrap().get(key).cloned())

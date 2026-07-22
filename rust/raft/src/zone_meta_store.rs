@@ -399,30 +399,44 @@ impl MetaStore for ZoneMetaStore {
         Some(self.coherence_id)
     }
 
-    fn append_stream_entry(&self, key: &str, data: &[u8]) -> Result<(), MetaStoreError> {
+    fn append_stream_entry(&self, stream_prefix: &str, data: &[u8]) -> Result<u64, MetaStoreError> {
         // Stream entries skip the zone-key translation `put` does for
-        // FileMetadata — `key` is the full WAL identity (`__wal_stream__/…`
-        // or `__wal_pipe__/…`) and the side-table is zone-scoped at the
-        // raft state-machine layer (this `ZoneMetaStore` is bound to a
-        // single zone via `node`).
+        // FileMetadata — `stream_prefix` is the full WAL identity prefix
+        // (`__wal_stream__/<id>/` or `__wal_pipe__/<id>/`) and the side-table is
+        // zone-scoped at the raft state-machine layer (this `ZoneMetaStore` is
+        // bound to a single zone via `node`).
         //
         // Always proposed through raft (strong consistency): a DT_STREAM is an
-        // ordered log, so its offsets need a single serialization point. The EC
+        // ordered log, so its offsets need a single serialization point — the
+        // state machine assigns the offset at apply and returns it here. The EC
         // plane is for LWW metadata registers (`zone_handle::set_metadata`),
         // never streams.
         let cmd = Command::AppendStreamEntry {
-            key: key.to_string(),
+            stream_prefix: stream_prefix.to_string(),
             data: data.to_vec(),
         };
         let result = bridge_block_on(&self.runtime, self.node.propose(cmd)).map_err(|e| {
-            MetaStoreError::IOError(format!("ZoneMetaStore.append_stream_entry({key}): {e}"))
+            MetaStoreError::IOError(format!(
+                "ZoneMetaStore.append_stream_entry({stream_prefix}): {e}"
+            ))
         })?;
         match result {
-            crate::prelude::CommandResult::Success => Ok(()),
+            crate::prelude::CommandResult::Value(bytes) => <[u8; 8]>::try_from(bytes.as_slice())
+                .map(u64::from_be_bytes)
+                .map_err(|_| {
+                    MetaStoreError::IOError(format!(
+                        "ZoneMetaStore.append_stream_entry({stream_prefix}): apply returned a \
+                         non-u64 offset ({} bytes)",
+                        bytes.len()
+                    ))
+                }),
             crate::prelude::CommandResult::Error(e) => Err(MetaStoreError::IOError(format!(
-                "ZoneMetaStore.append_stream_entry({key}) rejected: {e}"
+                "ZoneMetaStore.append_stream_entry({stream_prefix}) rejected: {e}"
             ))),
-            _ => Ok(()),
+            _ => Err(MetaStoreError::IOError(format!(
+                "ZoneMetaStore.append_stream_entry({stream_prefix}): unexpected apply result \
+                 (expected a Value offset)"
+            ))),
         }
     }
 
@@ -436,15 +450,13 @@ impl MetaStore for ZoneMetaStore {
         })
     }
 
-    fn list_stream_entry_keys(&self, prefix: &str) -> Result<Vec<String>, MetaStoreError> {
-        let prefix_owned = prefix.to_string();
-        let fut = self.node.with_state_machine(move |sm: &FullStateMachine| {
-            sm.list_stream_entry_keys(&prefix_owned)
-        });
+    fn stream_tail(&self, stream_prefix: &str) -> Result<u64, MetaStoreError> {
+        let prefix_owned = stream_prefix.to_string();
+        let fut = self
+            .node
+            .with_state_machine(move |sm: &FullStateMachine| sm.stream_tail(&prefix_owned));
         bridge_block_on(&self.runtime, fut).map_err(|e| {
-            MetaStoreError::IOError(format!(
-                "ZoneMetaStore.list_stream_entry_keys({prefix}): {e}"
-            ))
+            MetaStoreError::IOError(format!("ZoneMetaStore.stream_tail({stream_prefix}): {e}"))
         })
     }
 }
