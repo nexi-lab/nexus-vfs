@@ -47,6 +47,17 @@ pub use core::dispatch::{
     DeleteHookCtx, FileEvent, FileEventType, HookContext, HookIdentity, HookOutcome,
     MutationObserver, NativeInterceptHook, ReadHookCtx, RenameHookCtx, WriteHookCtx,
 };
+
+// Authorization-tier surface: `Permission` (what kind of op is
+// being requested) + `PermissionProvider` (the policy trait the kernel
+// gate delegates to).  Both live at `core::dispatch` so the trait can
+// reference `crate::core::vfs_router::RouteResult` without going
+// through this re-export layer, but callers should import them from
+// the crate root (`kernel::Permission`, `kernel::PermissionProvider`)
+// — the intra-crate location is a mechanical detail.  See the
+// `permission` rlib for the trait's canonical impl (`ZonePermsProvider`)
+// and the 1-slot + composition contract.
+pub use core::dispatch::{Permission, PermissionProvider};
 pub use core::lock as lock_manager;
 pub use core::lock::locks;
 pub use core::meta_store;

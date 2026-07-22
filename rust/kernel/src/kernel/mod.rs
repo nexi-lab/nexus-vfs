@@ -19,7 +19,6 @@
 //!
 //! Kernel struct + syscalls — pure Rust kernel boundary.
 
-use crate::core::permission_cache::PermissionLeaseCache;
 use crate::dispatch::{NativeHookRegistry, ObserverRegistry, Trie};
 use crate::file_watch::FileWatchRegistry;
 use crate::lock_manager::LockManager;
@@ -30,7 +29,7 @@ use crate::meta_store::{DT_DIR, DT_LINK, DT_MOUNT, DT_PIPE, DT_STREAM};
 use crate::vfs_router::VFSRouter;
 use dashmap::DashMap;
 use parking_lot::{Condvar, RwLock, RwLockReadGuard};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Extension trait giving parking_lot's two read-lock methods names that
@@ -656,16 +655,25 @@ pub struct Kernel {
 
     // ── §13 Permission gate ───────────────────────────────────────────
     //
-    // When `has_permission_provider` is false, the entire permission
-    // gate is skipped (~1ns AtomicBool load). When true, the gate
-    // runs: lease cache → admin bypass → zone perms.
-    permission_lease_cache: PermissionLeaseCache,
-    /// Admin bypass enabled — Docker default true.
-    permission_admin_bypass: AtomicBool,
-    /// Fast-path flag: skip entire permission gate when no provider is
-    /// registered. AtomicBool so the hot path is a single relaxed load
-    /// (~1ns) — not even a pointer dereference.
-    has_permission_provider: AtomicBool,
+    // The kernel holds only a HOOK POINT (`check_permission` /
+    // `check_permission_with_route` in dispatch.rs) and a slot for
+    // one `Arc<dyn PermissionProvider>`.  Zero authorization logic
+    // lives in the kernel tier itself — the slot is `None` by default,
+    // and every gate call short-circuits to `Ok(())` in ~2ns (an
+    // `ArcSwapOption::load_full` returning None).
+    //
+    // Composition root (a profile binary at boot) installs an impl of
+    // `permission::PermissionProvider` via `set_permission_provider`.
+    // Multi-policy stacks (zone perms + ReBAC + role, ...) are built
+    // as a single composite impl fanning out internally — do NOT
+    // multiplex slots on the kernel side.
+    //
+    // Historical: pre-2026-07-23 the kernel dispatch inlined a
+    // zone-perms iter + lease cache + admin bypass, all gated behind
+    // an `AtomicBool has_permission_provider` that never actually got
+    // set (every real caller went through the Python hook chain).
+    // The bool + inline logic have been replaced with this slot.
+    permission_provider: arc_swap::ArcSwapOption<Box<dyn crate::PermissionProvider>>,
 
     // ── §10 Plugin loader ────────────────────────────────────────────
     //
@@ -765,12 +773,12 @@ impl Kernel {
             procfs: crate::core::procfs::ProcfsRegistry::new(),
             federation_cache: std::sync::OnceLock::new(),
             pending_blob_fetcher_slot: parking_lot::Mutex::new(None),
-            permission_lease_cache: PermissionLeaseCache::new(
-                std::time::Duration::from_secs(30),
-                100_000,
-            ),
-            permission_admin_bypass: AtomicBool::new(true),
-            has_permission_provider: AtomicBool::new(false),
+            // Kernel default: no permission provider installed ⇒
+            // `check_permission` short-circuits to `Ok(())` in ~2ns
+            // (single ArcSwapOption load + None branch).  Composition
+            // root wires a provider via `set_permission_provider` if
+            // the profile terminates external authorization.
+            permission_provider: arc_swap::ArcSwapOption::empty(),
             plugin_loader: plugins::loader::PluginLoader::new(),
             service_hook_names: parking_lot::Mutex::new(std::collections::HashMap::new()),
             service_observer_names: parking_lot::Mutex::new(std::collections::HashMap::new()),

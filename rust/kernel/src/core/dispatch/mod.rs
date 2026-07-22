@@ -360,8 +360,15 @@ pub trait MutationObserver: Send + Sync {
 
 // ── Permission types (§13) ───────────────────────────────────────────
 //
-// Permission enum used by check_permission gate. Actual enforcement
-// runs in the NativeInterceptHook chain (dispatch_native_pre).
+// `Permission` is the enum a `PermissionProvider::check` implementation
+// reads to decide the requested operation kind.  The kernel gate
+// (`Kernel::check_permission` / `check_permission_with_route`) forwards
+// this to whichever provider is installed in the kernel's slot; the
+// kernel itself holds zero authorization logic.
+//
+// Impls of `PermissionProvider` live in the `permission` crate (rlib,
+// composition-root wired).  See the `permission` crate's top-level
+// docstring for the 1-slot + composition contract.
 
 /// Permission type — Read, Write, or Traverse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -380,6 +387,39 @@ impl Permission {
             Self::Traverse => "TRAVERSE",
         }
     }
+}
+
+/// Authorization policy the kernel gate consults on every `sys_*` call.
+///
+/// The kernel holds ONE `Arc<dyn PermissionProvider>` slot (see
+/// `Kernel::set_permission_provider`).  Multi-policy stacks (zone
+/// perms with ReBAC and role added, etc.) are composed as a single
+/// impl that fans out to sub-policies internally — the kernel does not
+/// maintain a multi-provider registry.  See the `permission` crate's
+/// top-level docstring for the composition model.
+///
+/// Contract:
+///
+/// * Return `Ok(())` for allow, `Err(KernelError::PermissionDenied(_))`
+///   for deny.  Any other error is treated as an internal policy
+///   failure and equally denies.
+/// * `route` is `Some` when the syscall body has already resolved the
+///   VFSRouter entry for `path` (the common case for I/O syscalls) and
+///   `None` otherwise.  Impls should prefer `route.zone_id` when
+///   present to avoid a redundant `VFSRouter::route` call — the
+///   `check_permission_with_route` kernel hook wires this per-syscall
+///   so path→zone extraction happens exactly once per request.
+/// * Runs on every syscall on gate-armed profiles, so impls SHOULD
+///   memoise repeat hits (e.g. via `permission::PermissionLeaseCache`)
+///   — the hot-path budget is on the order of hundreds of nanoseconds.
+pub trait PermissionProvider: Send + Sync {
+    fn check(
+        &self,
+        path: &str,
+        route: Option<&crate::core::vfs_router::RouteResult>,
+        permission: Permission,
+        ctx: &crate::kernel::OperationContext,
+    ) -> Result<(), crate::kernel::KernelError>;
 }
 
 // ── INTERCEPT hook context structs (§11) ─────────────────────────────

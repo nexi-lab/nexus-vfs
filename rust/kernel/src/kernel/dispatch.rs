@@ -4,11 +4,14 @@
 //! Every method stays a member of [`Kernel`] via this submodule's
 //! `impl Kernel { ... }` block.
 
-use crate::dispatch::{HookContext, HookIdentity, NativeInterceptHook, Permission, WriteHookCtx};
+use crate::core::vfs_router::RouteResult;
+use crate::dispatch::{
+    HookContext, HookIdentity, NativeInterceptHook, Permission, PermissionProvider, WriteHookCtx,
+};
 
 use super::{Kernel, KernelError, OperationContext, RwLockExt};
 
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 impl Kernel {
     // ── Native INTERCEPT hook dispatch ─────────────────
@@ -107,7 +110,16 @@ impl Kernel {
 
     // ── §13 Permission gate ─────────────────────────────────────────
 
-    /// Kernel permission gate — called BEFORE `dispatch_native_pre`.
+    /// Kernel permission gate — called BEFORE `dispatch_native_pre` on
+    /// every syscall.  Delegates to the installed
+    /// `Arc<dyn PermissionProvider>` slot; when the slot is `None`
+    /// (kernel default) returns `Ok(())` immediately with zero
+    /// authorization logic in the kernel tier.
+    ///
+    /// Use [`Self::check_permission_with_route`] from syscall bodies
+    /// that have already resolved a `RouteResult` — the provider can
+    /// then read the path's owning zone from the route instead of
+    /// running a second `VFSRouter::route()` internally.
     #[inline]
     pub fn check_permission(
         &self,
@@ -115,79 +127,55 @@ impl Kernel {
         permission: Permission,
         ctx: &OperationContext,
     ) -> Result<(), KernelError> {
+        self.check_permission_with_route(path, None, permission, ctx)
+    }
+
+    /// Variant of [`Self::check_permission`] that passes a
+    /// pre-computed `RouteResult` through to the provider.  Callers
+    /// that route for I/O anyway should prefer this to avoid a
+    /// duplicate `VFSRouter::route` inside the provider.
+    #[inline]
+    pub fn check_permission_with_route(
+        &self,
+        path: &str,
+        route: Option<&RouteResult>,
+        permission: Permission,
+        ctx: &OperationContext,
+    ) -> Result<(), KernelError> {
+        // System-level short-circuits stay in the kernel — they are
+        // language-of-the-kernel concepts (procfs, system contexts),
+        // not authorization decisions.
         if path.starts_with("/__sys__/") {
             return Ok(());
         }
         if ctx.is_system {
             return Ok(());
         }
-        if !self.has_permission_provider.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-
-        let agent_id = ctx.agent_id.as_deref().unwrap_or(&ctx.user_id);
-
-        if self.permission_lease_cache.check(path, agent_id) {
-            return Ok(());
-        }
-
-        // 5. Zone perms check (federation tokens)
-        if !ctx.zone_perms.is_empty() {
-            let perm_char = match permission {
-                Permission::Read => "r",
-                Permission::Write => "w",
-                Permission::Traverse => "r",
-            };
-            let has_zone_grant = ctx
-                .zone_perms
-                .iter()
-                .any(|(_zone_id, perm_chars)| perm_chars.contains(perm_char));
-            if has_zone_grant {
-                self.permission_lease_cache.stamp(path, agent_id);
-                return Ok(());
-            }
-            return Err(KernelError::PermissionDenied(format!(
-                "zone permission denied: no {perm_char} grant for '{path}'"
-            )));
-        }
-
-        // Full permission check runs in NativeInterceptHook dispatch
-        // Full permission check (admin bypass, zone boundary,
-        // new-vs-existing file, ReBAC) runs in the NativeInterceptHook
-        // chain (dispatch_native_pre) — the Python PermissionCheckHook
-        // already has the caller's context and metadata access without
-        // additional GIL crossing or OperationContext reconstruction.
-        Ok(())
+        // Default: no provider registered ⇒ Ok.  ArcSwapOption's
+        // `load` returns a Guard<Option<Arc<T>>>; None fast-path is
+        // one atomic load + branch (~2ns).
+        let guard = self.permission_provider.load();
+        let provider = match guard.as_ref() {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        provider.check(path, route, permission, ctx)
     }
 
-    /// Enable the permission gate (zone perms + lease cache).
+    /// Install the kernel's authorization policy.  See the
+    /// `permission` crate's top-level docstring for the 1-slot +
+    /// composition contract and canonical impls.
     ///
-    /// Called once at boot when a permission hook is registered.
-    /// When disabled (default), all permission checks are skipped
-    /// (~1ns AtomicBool load).
-    pub fn enable_permission_gate(&self) {
-        self.has_permission_provider.store(true, Ordering::Relaxed);
-    }
-
-    /// Configure admin bypass (default: true).
-    pub fn set_permission_admin_bypass(&self, enabled: bool) {
-        self.permission_admin_bypass
-            .store(enabled, Ordering::Relaxed);
-    }
-
-    /// Invalidate permission lease for a specific path.
-    pub fn permission_lease_invalidate_path(&self, path: &str) {
-        self.permission_lease_cache.invalidate_path(path);
-    }
-
-    /// Invalidate permission leases for a specific agent.
-    pub fn permission_lease_invalidate_agent(&self, agent_id: &str) {
-        self.permission_lease_cache.invalidate_agent(agent_id);
-    }
-
-    /// Invalidate all permission leases.
-    pub fn permission_lease_invalidate_all(&self) {
-        self.permission_lease_cache.invalidate_all();
+    /// Called at composition-root time by a profile binary that
+    /// terminates external client authorization.  `nexusd-cluster`
+    /// does not call this — the slot stays `None`, gate stays no-op.
+    ///
+    /// Overwriting the slot is safe: an in-flight check that already
+    /// dereferenced the previous provider completes against it
+    /// (ArcSwapOption keeps the old Arc alive until the last Guard
+    /// drops), and every subsequent check sees the new one.
+    pub fn set_permission_provider(&self, provider: Arc<Box<dyn PermissionProvider>>) {
+        self.permission_provider.store(Some(provider));
     }
 
     /// Dispatch POST-INTERCEPT hooks from NativeHookRegistry (fire-and-forget).
@@ -562,5 +550,107 @@ impl Kernel {
             )),
             _ => Err(RustCallError::NotFound),
         }
+    }
+}
+
+#[cfg(test)]
+mod permission_gate_protective_tests {
+    //! These tests pin the invariant that the kernel default has ZERO
+    //! authorization logic: no provider installed ⇒ every
+    //! `check_permission` returns `Ok(())` regardless of ctx.  The
+    //! 2026-07-23 permission-service refactor deliberately removed the
+    //! kernel-tier inline zone_perms + lease-cache pair and replaced
+    //! them with an `Arc<dyn PermissionProvider>` slot; these tests
+    //! prevent a future patch from accidentally re-introducing an
+    //! always-on gate that would break the "kernel clean by default"
+    //! contract documented in KERNEL-ARCHITECTURE.md §13.
+
+    use super::*;
+    use crate::kernel::Kernel;
+    use contracts::ROOT_ZONE_ID;
+
+    #[test]
+    fn kernel_default_permission_provider_is_none_and_gate_is_no_op() {
+        let kernel = Kernel::new();
+        // Deny-shaped context: no agent_id, no zone_perms, non-system.
+        // Under the pre-refactor gate this would still short-circuit
+        // via `has_permission_provider=false`; under the post-refactor
+        // slot it short-circuits via `permission_provider.load() == None`.
+        let ctx = OperationContext::new("anon", ROOT_ZONE_ID, false, None, false);
+        for perm in [Permission::Read, Permission::Write, Permission::Traverse] {
+            for path in ["/", "/anywhere", "/deep/nested/path", "/other/zone/x"] {
+                kernel
+                    .check_permission(path, perm, &ctx)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "kernel default MUST allow {perm:?} on {path:?}; got {e:?} — \
+                         a provider slipped into the default slot, or the fast-path \
+                         early-return in `check_permission` was broken"
+                        )
+                    });
+            }
+        }
+    }
+
+    #[test]
+    fn sys_paths_and_system_context_skip_provider_even_when_installed() {
+        use crate::PermissionProvider;
+        use std::sync::atomic::{AtomicUsize, Ordering as AOrdering};
+
+        // Shared counter Arc — lets the test observe the provider's
+        // call count without downcasting through `Box<dyn Trait>`.
+        struct CountingDeny(std::sync::Arc<AtomicUsize>);
+        impl PermissionProvider for CountingDeny {
+            fn check(
+                &self,
+                _path: &str,
+                _route: Option<&crate::vfs_router::RouteResult>,
+                _permission: Permission,
+                _ctx: &OperationContext,
+            ) -> Result<(), KernelError> {
+                self.0.fetch_add(1, AOrdering::Relaxed);
+                Err(KernelError::PermissionDenied("deny-all provider".into()))
+            }
+        }
+
+        let kernel = Kernel::new();
+        let count = std::sync::Arc::new(AtomicUsize::new(0));
+        let provider: std::sync::Arc<Box<dyn PermissionProvider>> =
+            std::sync::Arc::new(Box::new(CountingDeny(std::sync::Arc::clone(&count)))
+                as Box<dyn PermissionProvider>);
+        kernel.set_permission_provider(provider);
+
+        // /__sys__/ paths short-circuit inside the kernel gate — the
+        // provider MUST NOT be called for them.
+        let ctx = OperationContext::new("alice", ROOT_ZONE_ID, false, None, false);
+        kernel
+            .check_permission("/__sys__/anything", Permission::Read, &ctx)
+            .expect("/__sys__/ must always allow, provider must not fire");
+        assert_eq!(
+            count.load(AOrdering::Relaxed),
+            0,
+            "provider was invoked on /__sys__/ path — short-circuit broken"
+        );
+
+        // `is_system` contexts also short-circuit.
+        let sys_ctx = OperationContext::new("system", ROOT_ZONE_ID, true, None, true);
+        kernel
+            .check_permission("/regular/path", Permission::Write, &sys_ctx)
+            .expect("is_system ctx must always allow, provider must not fire");
+        assert_eq!(
+            count.load(AOrdering::Relaxed),
+            0,
+            "provider was invoked on is_system context — short-circuit broken"
+        );
+
+        // Normal path with normal ctx: provider IS called → deny.
+        kernel
+            .check_permission("/regular/path", Permission::Read, &ctx)
+            .expect_err("normal path should hit provider and get denied");
+        assert_eq!(
+            count.load(AOrdering::Relaxed),
+            1,
+            "provider must fire exactly once for a regular check"
+        );
     }
 }
