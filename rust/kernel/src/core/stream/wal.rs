@@ -30,7 +30,6 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use crate::abc::meta_store::MetaStore;
-use crate::hal::distributed_coordinator::Consistency;
 use crate::stream::{StreamBackend, StreamError};
 
 /// Side-table key prefix for wal-stream entries. Every entry is keyed
@@ -68,10 +67,6 @@ pub struct WalStreamCore {
     /// `read_at` to guarantee read-your-writes without waiting for the
     /// metastore propose / flush.
     inflight: Arc<RwLock<BTreeMap<u64, Vec<u8>>>>,
-    /// Consistency plane every append on this stream is proposed under.
-    /// `Sc` (default) → raft consensus; `Ec` → local-apply + async
-    /// replicate (the AP plane an A2A mailbox stream opens with).
-    consistency: Consistency,
 }
 
 impl WalStreamCore {
@@ -79,30 +74,18 @@ impl WalStreamCore {
     /// peak memory before backpressure flips to synchronous write.
     const FLUSH_CHANNEL_CAP: usize = 4096;
 
-    /// `next_seq` is RESTORED from the store's max existing seq on open (see
-    /// [`Self::new_with_consistency`]), so a restart/failover re-opens the lane
-    /// PAST the last durable entry instead of at 0 — a fresh instance over an
-    /// already-populated mailbox does NOT overwrite earlier messages. This
-    /// makes a single long-lived-or-restarted writer per `stream_id` fully
-    /// correct (the A2A mailbox case: each `chat-with-me` lane has exactly one
-    /// sender). It is still NOT collision-safe when several LIVE instances
-    /// write the same `stream_id` concurrently (3+ senders sharing one lane):
-    /// they can `fetch_add` the same seq between opens. A2A avoids this by
-    /// per-sender lanes (one writer each); the fully general fix is to assign
-    /// the seq at the raft serialization point (apply-time), a tracked follow-up.
+    /// `next_seq` is RESTORED from the store's max existing seq on open, so a
+    /// restart/failover re-opens the lane PAST the last durable entry instead
+    /// of at 0 — a fresh instance over an already-populated mailbox does NOT
+    /// overwrite earlier messages. This makes a single long-lived-or-restarted
+    /// writer per `stream_id` fully correct (the A2A mailbox case: each
+    /// `chat-with-me` lane has exactly one sender). It is still NOT
+    /// collision-safe when several LIVE instances write the same `stream_id`
+    /// concurrently (3+ senders sharing one lane): they can `fetch_add` the
+    /// same seq between opens. A2A avoids this by per-sender lanes (one writer
+    /// each); the fully general fix is to assign the seq at the raft
+    /// serialization point (apply-time), a tracked follow-up.
     pub fn new(store: Arc<dyn MetaStore>, stream_id: String) -> Self {
-        Self::new_with_consistency(store, stream_id, Consistency::Sc)
-    }
-
-    /// Open a wal-stream that proposes every append under `consistency`.
-    /// `Sc` (via [`Self::new`]) preserves historical behavior; `Ec` is the
-    /// AP plane an A2A mailbox stream opens with so writes survive a
-    /// leaderless quorum and replicate eventually.
-    pub fn new_with_consistency(
-        store: Arc<dyn MetaStore>,
-        stream_id: String,
-        consistency: Consistency,
-    ) -> Self {
         let prefix = format!("{WAL_STREAM_KEY_PREFIX}{stream_id}/");
         let (flush_tx, flush_rx) = mpsc::sync_channel::<(u64, Vec<u8>)>(Self::FLUSH_CHANNEL_CAP);
         let inflight: Arc<RwLock<BTreeMap<u64, Vec<u8>>>> = Arc::new(RwLock::new(BTreeMap::new()));
@@ -117,7 +100,7 @@ impl WalStreamCore {
             .spawn(move || {
                 while let Ok((seq, data)) = flush_rx.recv() {
                     let key = format!("{prefix_bg}{seq}");
-                    match store_bg.append_stream_entry(&key, &data, consistency) {
+                    match store_bg.append_stream_entry(&key, &data) {
                         Ok(()) => {
                             inflight_bg.write().remove(&seq);
                         }
@@ -167,7 +150,6 @@ impl WalStreamCore {
             closed: AtomicBool::new(false),
             flush_tx,
             inflight,
-            consistency,
         }
     }
 
@@ -194,10 +176,7 @@ impl WalStreamCore {
                 // Channel saturated (rare): flush synchronously to
                 // avoid unbounded inflight growth.
                 let key = self.key(seq);
-                match self
-                    .store
-                    .append_stream_entry(&key, &data_vec, self.consistency)
-                {
+                match self.store.append_stream_entry(&key, &data_vec) {
                     Ok(()) => {
                         self.inflight.write().remove(&seq);
                     }
@@ -240,9 +219,7 @@ impl WalStreamCore {
         // between here and the store commit still finds the data.
         self.inflight.write().insert(seq, data_vec.clone());
         let key = self.key(seq);
-        let result = self
-            .store
-            .append_stream_entry(&key, &data_vec, self.consistency);
+        let result = self.store.append_stream_entry(&key, &data_vec);
         // Remove from inflight only on success; on failure the entry
         // stays in inflight so reads still return data even though
         // the metastore did not durably accept it (matches the
@@ -441,12 +418,7 @@ mod tests {
         fn exists(&self, _path: &str) -> Result<bool, MetaStoreError> {
             Ok(false)
         }
-        fn append_stream_entry(
-            &self,
-            key: &str,
-            data: &[u8],
-            _consistency: Consistency,
-        ) -> Result<(), MetaStoreError> {
+        fn append_stream_entry(&self, key: &str, data: &[u8]) -> Result<(), MetaStoreError> {
             self.inner
                 .lock()
                 .unwrap()

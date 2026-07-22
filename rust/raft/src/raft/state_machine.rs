@@ -276,17 +276,17 @@ pub trait StateMachine: Send + Sync {
         self.apply_local(command)
     }
 
-    /// Snapshot the current EC-replicable state as `(key, value)` pairs.
+    /// Snapshot the current EC-replicable state as idempotent commands.
     ///
     /// Used by the EC anti-entropy path (`SnapshotEcState`): a peer that fell
     /// behind the compacted WAL region can't be caught up incrementally, so
-    /// the sender re-materializes THIS state as idempotent commands and ships
-    /// it — metadata as `SetMetadata`, stream entries as `AppendStreamEntry`.
-    /// Order is irrelevant: the receiver applies each LWW/union-idempotently.
+    /// the sender re-materializes THIS state as idempotent `SetMetadata`
+    /// commands and ships it. Order is irrelevant: the receiver applies each
+    /// LWW-idempotently.
     ///
-    /// Returns `Command`s (not raw `(key,value)`) so the source can mix planes
-    /// — a stream entry MUST re-materialize as `AppendStreamEntry`, not
-    /// `SetMetadata`, or the peer would never catch up on messages.
+    /// EC state is metadata registers only — DT_STREAM entries are strong
+    /// consistency (raft-committed, replicated via the log itself), never the
+    /// EC plane, so they are not part of this snapshot.
     ///
     /// Default: empty (a state machine that holds no EC state — e.g. a
     /// witness — has nothing to transfer). Override in [`FullStateMachine`].
@@ -1210,24 +1210,6 @@ impl FullStateMachine {
         Ok(keys)
     }
 
-    /// Enumerate stream entries (``key``, ``value``) under ``prefix``.
-    ///
-    /// Backs the EC anti-entropy snapshot ([`StateMachine::ec_state_snapshot`]):
-    /// a peer that fell behind the compacted WAL must catch up on STREAM
-    /// entries (A2A messages), not just metadata — the ``stream_entries`` tree
-    /// is separate from ``TREE_METADATA`` and is not covered by
-    /// [`Self::list_metadata`].
-    pub fn list_stream_entries(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
-        let mut out = Vec::new();
-        for item in self.stream_entries.scan_prefix(prefix.as_bytes()) {
-            let (key, value) = item?;
-            if let Ok(k) = String::from_utf8(key) {
-                out.push((k, value));
-            }
-        }
-        Ok(out)
-    }
-
     /// Get a stream entry by key (R19.1b').
     ///
     /// Looks up the opaque bytes previously stored by
@@ -1571,8 +1553,6 @@ impl StateMachine for FullStateMachine {
             Command::SetMetadata { .. }
             | Command::CasSetMetadata { .. }
             | Command::DeleteMetadata { .. }
-            | Command::AppendStreamEntry { .. }
-            | Command::DeleteStreamEntry { .. }
             | Command::PutAuthKey { .. }
             | Command::DeleteAuthKey { .. } => self.execute(command),
             _ => Err(super::RaftError::InvalidState(
@@ -1590,9 +1570,8 @@ impl StateMachine for FullStateMachine {
     /// each key is written by exactly one node, so two nodes never write the
     /// SAME key concurrently and the conflict branch below never actually has
     /// to pick a winner. That invariant holds for every current EC caller —
-    /// A2A owns it structurally (each agent owns `/agents/{name}/…`; mailbox
-    /// entries are keyed per-sender), and cc-tasks-share is likewise
-    /// owner-partitioned. Under it, the merge is trivially convergent.
+    /// cc-tasks-share is owner-partitioned (each node owns its own task-list
+    /// keys). Under it, the merge is trivially convergent.
     ///
     /// It is NOT a correct general multi-writer LWW, by design (deferred as
     /// YAGNI until a real concurrent-same-key workload exists):
@@ -1665,21 +1644,8 @@ impl StateMachine for FullStateMachine {
                     self.apply_delete_metadata(key)
                 }
             }
-            // Stream entries are union-by-unique-key, NOT an LWW register: each
-            // key (owner-partitioned lane + seq) is written by exactly one
-            // owner, so there is never a conflicting concurrent write to
-            // resolve — re-apply of the same key is an idempotent set/delete.
-            // This is the mailbox's AP write path arriving on a peer.
-            Command::AppendStreamEntry { key, data } => {
-                self.stream_entries.set(key.as_bytes(), data)?;
-                Ok(CommandResult::Success)
-            }
-            Command::DeleteStreamEntry { key } => {
-                self.stream_entries.delete(key.as_bytes())?;
-                Ok(CommandResult::Success)
-            }
             _ => Err(super::RaftError::InvalidState(
-                "Only metadata + stream operations support EC writes".into(),
+                "Only metadata operations support EC writes".into(),
             )),
         };
 
@@ -1699,28 +1665,17 @@ impl StateMachine for FullStateMachine {
     }
 
     fn ec_state_snapshot(&self) -> Vec<Command> {
-        // Metadata key/values (list_metadata skips internal `__` keys) →
-        // SetMetadata. LWW-idempotent on the receiver; Sc-plane keys are
-        // byte-identical there so they no-op, only missed EC keys change.
-        let mut cmds: Vec<Command> = self
-            .list_metadata("")
+        // EC anti-entropy snapshot = metadata registers only. `list_metadata`
+        // skips internal `__` keys → SetMetadata. LWW-idempotent on the
+        // receiver; Sc-plane keys are byte-identical there so they no-op, only
+        // missed EC keys change. DT_STREAM entries are NOT here: streams are
+        // strong consistency (raft-committed), replicated via the log itself,
+        // never the EC plane.
+        self.list_metadata("")
             .unwrap_or_default()
             .into_iter()
             .map(|(key, value)| Command::SetMetadata { key, value })
-            .collect();
-        // Stream entries (A2A messages) live in the separate `stream_entries`
-        // tree, NOT covered by list_metadata. A peer past the compacted WAL
-        // must catch up on these too, else the AP delivery promise breaks for
-        // the stream payload — the whole point of the mailbox. Re-materialize
-        // as AppendStreamEntry; union-by-unique-key on the receiver
-        // (`apply_ec_with_lww`) makes replay idempotent.
-        cmds.extend(
-            self.list_stream_entries("")
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(key, data)| Command::AppendStreamEntry { key, data }),
-        );
-        cmds
+            .collect()
     }
 
     fn apply(&mut self, index: u64, command: &Command) -> Result<CommandResult> {

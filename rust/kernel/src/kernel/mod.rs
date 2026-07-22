@@ -22,7 +22,6 @@
 use crate::core::permission_cache::PermissionLeaseCache;
 use crate::dispatch::{NativeHookRegistry, ObserverRegistry, Trie};
 use crate::file_watch::FileWatchRegistry;
-use crate::hal::distributed_coordinator::Consistency;
 use crate::lock_manager::LockManager;
 use crate::meta_store::LocalMetaStore;
 #[cfg(test)]
@@ -1957,11 +1956,7 @@ impl Kernel {
     /// Returns `Ok(true)` when installed, `Ok(false)` when no zone metastore is
     /// available (federation not wired) so the caller falls through the
     /// io_profile waterfall; a register failure propagates as `Err`.
-    fn install_wal_stream(
-        &self,
-        path: &str,
-        consistency: Consistency,
-    ) -> Result<bool, KernelError> {
+    fn install_wal_stream(&self, path: &str) -> Result<bool, KernelError> {
         let zone_id = self
             .vfs_router
             .route(path, contracts::ROOT_ZONE_ID)
@@ -1971,11 +1966,8 @@ impl Kernel {
             .distributed_coordinator()
             .metastore_for_zone(self, &zone_id)
         {
-            let backend = crate::core::stream::wal::WalStreamCore::new_with_consistency(
-                store,
-                path.to_string(),
-                consistency,
-            );
+            let backend =
+                crate::core::stream::wal::WalStreamCore::new(store, path.to_string());
             self.stream_manager
                 .register(path, Arc::new(backend))
                 .map_err(stream_mgr_err)?;
@@ -2014,19 +2006,7 @@ impl Kernel {
                     // Available iff the coordinator can hand us a zone metastore
                     // (federation wired); if not, fall through to the next
                     // backend in the waterfall.
-                    if self.install_wal_stream(path, Consistency::Sc)? {
-                        return Ok((None, None));
-                    }
-                }
-                "wal_ec" => {
-                    // Eventually-consistent WAL DT_STREAM — the AP plane the A2A
-                    // mailbox rides. Same distributed backing as `wal`, but
-                    // every append proposes via `propose_ec_local` (local-apply
-                    // + async replicate, LWW), so a send succeeds even when no
-                    // raft quorum is reachable. The creator names this profile
-                    // when it wants an available-under-partition stream; the
-                    // kernel stays generic (no mailbox-path knowledge here).
-                    if self.install_wal_stream(path, Consistency::Ec)? {
+                    if self.install_wal_stream(path)? {
                         return Ok((None, None));
                     }
                 }

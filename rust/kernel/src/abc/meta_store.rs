@@ -12,7 +12,6 @@
 //! Naming note: the Rust trait is `MetaStore`, for visual symmetry
 //! with `ObjectStore` / `CacheStore`.
 
-use crate::hal::distributed_coordinator::Consistency;
 
 // ── Dirent-type constants ────────────────────────────────────────────
 //
@@ -405,19 +404,8 @@ pub trait MetaStore: Send + Sync {
     /// callers prefix with ``__wal_stream__/<id>`` or
     /// ``__wal_pipe__/<id>`` so stream and pipe entries never collide
     /// in the shared side table.
-    ///
-    /// `consistency` names the CAP-level guarantee the caller wants (see
-    /// [`Consistency`]): `Sc` = strong / quorum-durable before ack; `Ec` =
-    /// eventual / accepted locally then replicated asynchronously (the AP
-    /// plane an A2A mailbox rides). How a backend realizes each is its own
-    /// concern; a non-distributed metastore ignores it and errors regardless.
-    fn append_stream_entry(
-        &self,
-        key: &str,
-        data: &[u8],
-        consistency: Consistency,
-    ) -> Result<(), MetaStoreError> {
-        let _ = (key, data, consistency);
+    fn append_stream_entry(&self, key: &str, data: &[u8]) -> Result<(), MetaStoreError> {
+        let _ = (key, data);
         Err(MetaStoreError::IOError(
             "append_stream_entry: not supported by this metastore (use a distributed impl, e.g. ZoneMetaStore)".to_string(),
         ))
