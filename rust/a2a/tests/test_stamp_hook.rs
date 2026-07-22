@@ -117,14 +117,20 @@ fn stamps_from_on_the_stream_write_path() {
     install_a2a_stamp_hook(&kernel, /* fail_closed */ true).expect("install a2a stamp hook");
 
     let mbox = "/agents/win-ai/chat-with-me";
-    kernel.create_stream(mbox, 64 * 1024).expect("create the mailbox stream");
+    kernel
+        .create_stream(mbox, 64 * 1024)
+        .expect("create the mailbox stream");
 
     // Authenticated as win-ai but claiming from=impostor → stamped back to
     // win-ai. The guarantee must NOT be bypassable by writing via the stream
     // RPC instead of sys_write.
     let win = OperationContext::new("operator", "root", false, Some("win-ai"), false);
     kernel
-        .stream_write_nowait(mbox, br#"{"from":"impostor","to":"mac-ai","body":"hi"}"#, &win)
+        .stream_write_nowait(
+            mbox,
+            br#"{"from":"impostor","to":"mac-ai","body":"hi"}"#,
+            &win,
+        )
         .expect("authenticated stream mailbox write must be accepted");
 
     let (data, _next) = kernel
