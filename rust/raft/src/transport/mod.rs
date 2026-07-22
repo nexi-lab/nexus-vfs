@@ -187,6 +187,7 @@ fn proto_result_to_command_result(
                 holders,
             })
         }
+        Some(ProtoVariant::ValueResult(bytes)) => CommandResult::Value(bytes),
         Some(ProtoVariant::MetadataResult(_)) | None => CommandResult::Success,
     }
 }

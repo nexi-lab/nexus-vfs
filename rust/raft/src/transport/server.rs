@@ -330,10 +330,10 @@ fn command_result_to_proto(result: &CommandResult) -> RaftResponse {
             error: None,
             result: None,
         },
-        CommandResult::Value(_) => RaftResponse {
+        CommandResult::Value(v) => RaftResponse {
             success: true,
             error: None,
-            result: None,
+            result: Some(ProtoResponseResultVariant::ValueResult(v.clone())),
         },
         CommandResult::LockResult(lock_state) => {
             let first_holder = lock_state.holders.first();
