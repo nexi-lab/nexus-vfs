@@ -493,11 +493,12 @@ fn bench_pipe_roundtrip(c: &mut Criterion) {
         b"bench-payload-80-bytes-long-for-a-typical-audit-event-json-body-padding!!!!!!!!";
 
     let mut group = c.benchmark_group("pipe_roundtrip");
+    let ctx = admin_ctx();
 
     group.bench_function("nexus_DT_PIPE", |b| {
         b.iter(|| {
             kernel
-                .pipe_write_nowait(black_box("/bench/pipe"), black_box(payload))
+                .pipe_write_nowait(black_box("/bench/pipe"), black_box(payload), &ctx)
                 .expect("pipe write");
             let data = kernel
                 .pipe_read_nowait(black_box("/bench/pipe"))

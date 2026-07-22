@@ -5,7 +5,7 @@
 
 use crate::meta_store::{DT_PIPE, DT_STREAM};
 
-use super::{pipe_mgr_err, stream_mgr_err, Kernel, KernelError};
+use super::{pipe_mgr_err, stream_mgr_err, Kernel, KernelError, OperationContext};
 
 impl Kernel {
     // ── IPC Registry — Pipe methods (delegates to PipeManager) ──────────
@@ -67,9 +67,21 @@ impl Kernel {
     }
 
     /// Non-blocking write to a pipe. Returns bytes written.
-    pub fn pipe_write_nowait(&self, path: &str, data: &[u8]) -> Result<usize, KernelError> {
+    ///
+    /// Runs mutating pre-hooks first via the shared
+    /// [`Kernel::apply_mutating_write_hooks`] seam, so a DT_PIPE mailbox
+    /// (`/proc/{pid}/chat-with-me`) gets the same `from`-stamp as every other
+    /// write path.
+    pub fn pipe_write_nowait(
+        &self,
+        path: &str,
+        data: &[u8],
+        ctx: &OperationContext,
+    ) -> Result<usize, KernelError> {
+        let replacement = self.apply_mutating_write_hooks(path, ctx, data)?;
+        let effective: &[u8] = replacement.as_deref().unwrap_or(data);
         self.pipe_manager
-            .write_nowait(path, data)
+            .write_nowait(path, effective)
             .map_err(pipe_mgr_err)
     }
 
@@ -159,9 +171,23 @@ impl Kernel {
     }
 
     /// Non-blocking write to a stream. Returns byte offset.
-    pub fn stream_write_nowait(&self, path: &str, data: &[u8]) -> Result<usize, KernelError> {
+    ///
+    /// Runs mutating pre-hooks first via the shared
+    /// [`Kernel::apply_mutating_write_hooks`] seam, so a DT_STREAM mailbox
+    /// write gets the same `from`-stamp / fail-closed guarantee `sys_write`
+    /// does. The A2A mailbox IS a DT_STREAM, so this is the path its `from`
+    /// unforgeability actually depends on — it must not be bypassable by
+    /// choosing the stream RPC over `sys_write`.
+    pub fn stream_write_nowait(
+        &self,
+        path: &str,
+        data: &[u8],
+        ctx: &OperationContext,
+    ) -> Result<usize, KernelError> {
+        let replacement = self.apply_mutating_write_hooks(path, ctx, data)?;
+        let effective: &[u8] = replacement.as_deref().unwrap_or(data);
         self.stream_manager
-            .write_nowait(path, data)
+            .write_nowait(path, effective)
             .map_err(stream_mgr_err)
     }
 

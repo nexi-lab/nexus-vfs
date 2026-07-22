@@ -4,7 +4,7 @@
 //! Every method stays a member of [`Kernel`] via this submodule's
 //! `impl Kernel { ... }` block.
 
-use crate::dispatch::{HookContext, NativeInterceptHook, Permission};
+use crate::dispatch::{HookContext, HookIdentity, NativeInterceptHook, Permission, WriteHookCtx};
 
 use super::{Kernel, KernelError, OperationContext, RwLockExt};
 
@@ -69,6 +69,40 @@ impl Kernel {
         self.native_hooks
             .read_unconditional()
             .has_mutating_match(path)
+    }
+
+    /// Run mutating native pre-hooks for a write to `path`, returning the
+    /// hook's replacement content (`None` = no rewrite → use the caller's
+    /// bytes). A fail-closed hook returns `Err`, which the caller MUST
+    /// propagate to reject the write.
+    ///
+    /// This is the SINGLE seam every write syscall funnels through —
+    /// `sys_write` / `write_batch` (DT_FILE), `stream_write_nowait`
+    /// (DT_STREAM), `pipe_write_nowait` (DT_PIPE). A content guarantee such as
+    /// the A2A `from` stamp therefore holds on EVERY write path, not just
+    /// `sys_write`: it must not depend on which RPC the caller used. The
+    /// `has_mutating_hook_match` clone gate keeps the no-hook hot path (e.g.
+    /// LLM token streams) allocation-free.
+    pub fn apply_mutating_write_hooks(
+        &self,
+        path: &str,
+        ctx: &OperationContext,
+        content: &[u8],
+    ) -> Result<Option<Vec<u8>>, KernelError> {
+        let hook_content = if self.has_mutating_hook_match(path) {
+            content.to_vec()
+        } else {
+            Vec::new()
+        };
+        self.dispatch_native_pre_with_replacement(&HookContext::Write(WriteHookCtx {
+            path: path.to_string(),
+            identity: HookIdentity::from(ctx),
+            content: hook_content,
+            is_new_file: false,
+            content_id: None,
+            new_version: 0,
+            size_bytes: None,
+        }))
     }
 
     // ── §13 Permission gate ─────────────────────────────────────────

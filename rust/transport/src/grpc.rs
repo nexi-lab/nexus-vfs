@@ -1092,11 +1092,11 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<StreamWriteRequest>,
     ) -> Result<Response<StreamWriteResponse>, Status> {
-        let (_ctx, req) = match self.authenticate(req) {
+        let (ctx, req) = match self.authenticate(req) {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_stream_write(s))),
         };
-        match self.kernel.stream_write_nowait(&req.path, &req.data) {
+        match self.kernel.stream_write_nowait(&req.path, &req.data, &ctx) {
             Ok(offset) => Ok(Response::new(StreamWriteResponse {
                 offset: offset as u64,
                 is_error: false,
