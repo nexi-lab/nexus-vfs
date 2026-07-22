@@ -154,9 +154,16 @@ getter; the kernel boots the same way either path.
 (`None`), factory overrides at link-time. Kernel modules import only from
 `contracts/`, `lib/`, and other kernel-tier packages.
 
-Permission enforcement is a kernel primitive. The permission gate runs
-before NativeInterceptHook dispatch on every `sys_*` call with `OperationContext`.
-Pluggable `PermissionProvider` trait; no provider registered = zero overhead (~1ns AtomicBool).
+The permission gate is the kernel's HOOK POINT for authorization, not
+the authorization LOGIC.  It runs before NativeInterceptHook dispatch on
+every `sys_*` call and delegates to whatever `Arc<dyn PermissionProvider>`
+sits in the kernel's slot; the kernel tier itself contains zero
+authorization logic.  Default: no provider installed ⇒ literal
+`return Ok(())` (single `ArcSwapOption` load + None branch, ~2ns).
+Impls live in the `permission` rlib (composed at boot by a profile
+binary — see `docs/KERNEL-ARCHITECTURE.md §13` for the 1-slot +
+composition model and `rust/permission/src/lib.rs` for the canonical
+`ZonePermsProvider`).
 
 **Zone identity:** `self._zone_id = ROOT_ZONE_ID` — kernel namespace partition
 (analogous to Linux `sb->s_dev`). VFSRouter (Rust kernel primitive) canonicalizes
@@ -350,23 +357,36 @@ These contracts define ordering, error semantics, and performance guarantees.
 OBSERVE always fires after VFS lock release (like Linux inotify after `i_rwsem`).
 
 **Permission Gate** (Linux analogue: `security_inode_permission()`):
-Kernel-level permission check called before INTERCEPT PRE on every `sys_*`
-with `OperationContext`. Decision cascade (short-circuits on first decisive
-step): `/__sys__/` path bypass → `is_system` bypass → no-provider fast-path
-(~1ns `AtomicBool`) → lease cache hit (~100-200ns `DashMap` per depth level) →
-admin bypass → `zone_perms` federation grant → `PermissionProvider.check()`.
-Pluggable `PermissionProvider` trait registered once at boot; implementations
-live in the services tier. `PermissionLeaseCache`: inheritance-aware `(path,
-agent_id) → TTL` DashMap cache; parent directory lease covers child files.
-`Permission` enum: `Read`, `Write`, `Traverse`.
-Source of truth: `rust/kernel/src/kernel/dispatch.rs` (gate),
-`rust/kernel/src/core/permission_cache.rs` (lease cache),
-`rust/kernel/src/core/dispatch/mod.rs` (trait + enums).
+Kernel-level HOOK POINT for authorization, called before INTERCEPT PRE on
+every `sys_*` with `OperationContext`. The kernel itself holds ZERO
+authorization logic — the gate reads its `Arc<dyn PermissionProvider>`
+slot and delegates to whichever impl the profile binary composed at
+boot.  Decision cascade (short-circuits on first decisive step):
+`/__sys__/` path bypass → `is_system` bypass → no-provider fast-path
+(~2ns `ArcSwapOption` load + None branch) → `PermissionProvider::check()`
+if a provider is installed.  Path-to-zone extraction, lease caching,
+zone-perm iteration, ReBAC, and role logic all live inside the
+provider — see the `permission` rlib.
+Composition model: **1 kernel slot, N impls composed inside a single
+provider that fans out** (see `rust/permission/src/lib.rs` for the
+composite pattern) — do NOT extend the kernel with a multi-provider
+registry.
+Canonical impl: `permission::ZonePermsProvider` (path-aware zone-perms
+match + inheritance-aware `PermissionLeaseCache`). `Permission` enum:
+`Read`, `Write`, `Traverse`.
+Source of truth: `rust/kernel/src/kernel/dispatch.rs` (gate + slot),
+`rust/kernel/src/core/dispatch/mod.rs` (trait + enum),
+`rust/permission/src/{zone_perms,lease_cache}.rs` (canonical impl +
+cache).
 
-**Why separate the Permission Gate from INTERCEPT PRE?** The gate runs in
-~100-200ns pure Rust (AtomicBool + DashMap lease cache); full ReBAC evaluation
-in INTERCEPT PRE requires metadata access. Separating them lets cached
-grants bypass INTERCEPT entirely.
+**Why separate the Permission Gate from INTERCEPT PRE?** Three
+orthogonal reasons: (1) ordering — permission MUST run before intercept
+side effects; (2) SRP — authorization is one decision authority, hooks
+are a chain of concerns; (3) perf — the gate is ~2ns when no provider
+is installed and one virtual call otherwise, versus intercept's
+lock + iter + dispatch chain.  Caching lives inside the provider, so
+grants bypass both the gate re-eval AND the intercept chain on a
+lease-cache hit.
 
 **Per-syscall dispatch matrix** (source of truth: `io.rs`):
 
@@ -665,11 +685,11 @@ with them indirectly through syscalls. See §2.2 for per-syscall usage.
 | **ServiceRegistry** | `rust/kernel/src/core/service_registry.rs` | `init/main.c` + `module.c` | Kernel-owned symbol table + lifecycle orchestration (enlist/swap/shutdown). BackgroundService + duck-typed hook_spec() |
 | **DriverLifecycleCoordinator** | `rust/kernel/src/core/dlc.rs` + `core.driver_lifecycle_coordinator` (Python unmount-event broadcaster) | `register_filesystem` + `kern_mount` | Rust DLC: routing table + metastore + lock manager upgrade. Also owns the live `MetadataSyncHandle` set (armed mounts, keyed by canonical mount point; dropped on unmount to stop the reconcile thread) and answers `is_sync_armed` for the on-access seed gate. Apply-side cache coherence is metastore-internal (each `ZoneMetaStore` self-registers an invalidator on its consensus during construction; no kernel-level dcache to keep in sync). Python DLC: brick `on_unmount` event dispatch only |
 | **MetadataSync** | `rust/kernel/src/core/metadata_sync.rs` + `Kernel::observe_backend_entry` | NFS attribute / dentry revalidation (`->getattr` refresh, `d_revalidate`) | Keeps the metastore authoritative for a mount whose backend receives content **out-of-band** (a LocalConnector over a host dir written directly, bypassing `sys_write`). One idempotent propose atom fed by three triggers (initial walk / periodic reconcile / on-access seed). Generic over `&dyn ObjectStore` (`list_dir`/`stat`), so it works across the dylib C-ABI. Opt-in per mount via `arm_metadata_sync`. Details in §4.5 |
-| **PermissionGate** | `rust/kernel/src/kernel/dispatch.rs` + `rust/kernel/src/core/permission_cache.rs` | LSM `security_inode_permission` | Kernel permission gate called before NativeInterceptHook dispatch on every `sys_*`. Decision cascade with lease cache (~100-200ns). Details in §2.4.1 |
+| **PermissionGate** | `rust/kernel/src/kernel/dispatch.rs` (hook + slot) + `rust/kernel/src/core/dispatch/mod.rs` (`PermissionProvider` trait) + `rust/permission/` (canonical impl) | LSM `security_inode_permission` | Kernel HOOK POINT for authorization; delegates to `Arc<dyn PermissionProvider>` slot. Kernel default = no provider ⇒ literal `Ok(())` (~2ns). Impls live in the `permission` rlib. Details in §2.4.1 |
 | **AgentRegistry** | `rust/kernel/src/core/agents/registry.rs` | Linux `task_struct` table + signal queue | Kernel SSOT for agent lifecycle: PID allocation, parent/child tree, signal semantics (SIGTERM/SIGSTOP/SIGCONT/SIGKILL/SIGUSR1), `AgentState::can_transition_to` validation, per-PID condvar wake-ups. Shared `Arc` exposed to procfs view (`AgentStatusResolver`) — no dual-write. Details in §1 Service Lifecycle |
 | **DT_LINK** | `proto/nexus/core/metadata.proto` (`DT_LINK = 6`) + `FileMetadata.link_target` | `symlink(2)` | Path-internal symlink resolved by `VFSRouter::route()` before reaching the backend. Single-hop redirect with `ELOOP` on chained or self-loop links. Details in §4.4 |
 | **PluginLoader** | `rust/kernel/src/core/plugin_loader.rs` | `module_loader` (`kernel/module/main.c`) | Runtime `dlopen`-based loading of service and driver plugins. C ABI contract for version/kind/lifecycle symbols. Wraps dylib instances as `DylibRustService` (`Arc<dyn RustService>`) or `DylibObjectStore` (`Arc<dyn ObjectStore>`) for uniform kernel dispatch. Details in §10 |
-| **PermissionLeaseCache** | `rust/kernel/src/core/permission_cache.rs` | LSM credential cache | Two-level DashMap of `(path, agent_id) → expiry` short-circuiting the permission gate's full ReBAC walk on a recent hit. Inheritance-aware: a parent-directory lease covers child files. Details in §2.4.1. |
+| **PermissionLeaseCache** | `rust/permission/src/lease_cache.rs` | LSM credential cache | Two-level DashMap of `(path, agent_id) → expiry` used by `ZonePermsProvider` to short-circuit repeat hits. Inheritance-aware: a parent-directory lease covers child files. Moved out of the kernel tier at the 2026-07-23 permission-service refactor — a provider implementation detail, not a kernel primitive. Details in §2.4.1. |
 | **ProcfsRegistry** | `rust/kernel/src/core/procfs.rs` | `proc_create()` / `proc_dir_entry` | Registry of read-only `/__sys__/…` views. A subsystem registers a `ProcfsProvider` for its prefix; `readdir` dispatches through the registry, sorts, and paginates. Details in §4.6 |
 
 ### 4.1 Unified LockManager — I/O Lock + Advisory Lock
