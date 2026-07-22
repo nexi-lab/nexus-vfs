@@ -1,0 +1,26 @@
+[package]
+name = "permission"
+version = "0.1.0"
+edition = "2021"
+description = "Authorization policy — provider trait + zone_perms impl, wired into the kernel's PermissionProvider slot at composition root"
+
+[lib]
+name = "permission"
+crate-type = ["rlib"]
+
+[dependencies]
+# The `PermissionProvider` slot lives on the kernel; the kernel calls
+# out to us on every syscall via the trait defined here.  We depend on
+# the kernel for `Permission` / `OperationContext` / `KernelError` /
+# `RouteResult` — the shared vocabulary the trait method takes.  We
+# never call back into the kernel to fetch state (nothing here holds
+# an `Arc<Kernel>`), so there is no cycle risk despite the dep.
+kernel = { workspace = true, default-features = false }
+contracts = { workspace = true }
+# DashMap for the lease-cache's two-level (path → agent_id → Instant)
+# lock-free concurrent reads.  Same version other kernel-tier crates
+# pull in via workspace resolution.
+dashmap = "6.1"
+
+[dev-dependencies]
+tempfile = "3"

@@ -48,8 +48,12 @@ pub mod lock;
 // VFS dispatch + hook/observer registry (§2.4).
 pub mod dispatch;
 
-// Permission lease cache, DashMap-based (§2.4.1 + §4 PermissionGate).
-pub mod permission_cache;
+// Permission lease cache moved to the `permission` rlib at the
+// 2026-07-23 refactor — the cache is a *provider* implementation
+// detail (used inside `permission::ZonePermsProvider`), not a
+// kernel primitive.  The kernel now holds only the
+// `Arc<dyn PermissionProvider>` slot and the two-line gate that
+// delegates to it; see `kernel/dispatch.rs::check_permission`.
 
 // MetaStore primitive impls — LocalMetaStore + remote proxy.
 // The trait declaration lives in `crate::abc::meta_store` (§3.A.1);

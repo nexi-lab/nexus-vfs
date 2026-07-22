@@ -29,6 +29,11 @@ memmap2 = "0.9.9"
 tempfile = "3"
 dashmap = "6.1"
 parking_lot = "0.12"
+# ArcSwapOption backs the kernel's `PermissionProvider` slot — atomic
+# swap so `set_permission_provider` at boot never races the hot-path
+# `check_permission` load.  Fast path (no provider) is one atomic load
+# + branch (~2ns); zero runtime cost when the slot stays `None`.
+arc-swap = "1"
 smallvec = "1.15"
 redb = "4"
 uuid = { version = "1", features = ["v4"] }

@@ -4,13 +4,17 @@
 //! The two-level structure lets `check`'s inheritance walk look up
 //! `(path, agent_id)` with zero String allocations on a hit — both
 //! `outer.get(&str)` and `inner.get(&str)` borrow via
-//! `String: Borrow<str>`. On hit the full ReBAC bitmap check is
-//! skipped entirely (~100-200ns vs ~50-200μs). Same algorithm as the
-//! Python `PermissionLeaseTable` (permission_lease.py).
+//! `String: Borrow<str>`. On hit the full provider check is skipped
+//! entirely (~100-200ns vs ~50-200μs for a full zone-perms walk).
 //!
 //! Inheritance-aware: `check` walks up the path hierarchy
 //! (O(depth) outer lookups) so a parent directory lease covers
 //! child files.
+//!
+//! Moved from `nexus_vfs_kernel::core::permission_cache` at the 2026-07-23
+//! permission-service refactor — the cache is a *provider* implementation
+//! detail (ZonePermsProvider uses it to memoise hits), not a kernel
+//! primitive, so it lives with the provider in the `permission` crate.
 
 use dashmap::DashMap;
 use std::time::{Duration, Instant};
@@ -18,8 +22,8 @@ use std::time::{Duration, Instant};
 /// Permission lease cache — path → (agent_id → granted_at).
 ///
 /// Lock-free concurrent reads on both levels (DashMap sharded
-/// buckets). Writes are infrequent (only on lease miss → ReBAC
-/// check → stamp).
+/// buckets). Writes are infrequent (only on lease miss → full check
+/// → stamp).
 pub struct PermissionLeaseCache {
     leases: DashMap<String, DashMap<String, Instant>>,
     ttl: Duration,
@@ -118,11 +122,13 @@ impl PermissionLeaseCache {
     /// to invalidate a whole subtree must either invalidate each
     /// stamped path explicitly or use [`Self::invalidate_all`]. This
     /// asymmetry mirrors the Python `PermissionLeaseTable`.
+    #[allow(dead_code)]
     pub fn invalidate_path(&self, path: &str) {
         self.leases.remove(path);
     }
 
     /// Invalidate all leases for a specific agent across every path.
+    #[allow(dead_code)]
     pub fn invalidate_agent(&self, agent_id: &str) {
         for entry in self.leases.iter() {
             entry.value().remove(agent_id);
@@ -130,6 +136,7 @@ impl PermissionLeaseCache {
     }
 
     /// Clear all leases.
+    #[allow(dead_code)]
     pub fn invalidate_all(&self) {
         self.leases.clear();
     }
