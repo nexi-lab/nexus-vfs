@@ -164,7 +164,10 @@ mod tests {
             // Mirror the real store: the offset is assigned here (count under
             // the prefix), not by the caller.
             let mut inner = self.inner.lock().unwrap();
-            let seq = inner.keys().filter(|k| k.starts_with(stream_prefix)).count() as u64;
+            let seq = inner
+                .keys()
+                .filter(|k| k.starts_with(stream_prefix))
+                .count() as u64;
             inner.insert(format!("{stream_prefix}{seq}"), data.to_vec());
             Ok(seq)
         }

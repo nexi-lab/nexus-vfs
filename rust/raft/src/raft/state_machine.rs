@@ -1428,7 +1428,10 @@ impl FullStateMachine {
                 Ok(CommandResult::Value(new_val.to_be_bytes().to_vec()))
             }
 
-            Command::AppendStreamEntry { stream_prefix, data } => {
+            Command::AppendStreamEntry {
+                stream_prefix,
+                data,
+            } => {
                 // Assign the offset HERE, at raft apply, in committed order — so
                 // a total order holds even across concurrent writers (the log
                 // serializes them). The next-offset cursor lives beside the

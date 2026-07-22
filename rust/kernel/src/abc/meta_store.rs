@@ -12,7 +12,6 @@
 //! Naming note: the Rust trait is `MetaStore`, for visual symmetry
 //! with `ObjectStore` / `CacheStore`.
 
-
 // ── Dirent-type constants ────────────────────────────────────────────
 //
 // Values for [`FileMetadata::entry_type`] — mirrors the entry_type

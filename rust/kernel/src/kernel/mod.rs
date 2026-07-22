@@ -1966,8 +1966,7 @@ impl Kernel {
             .distributed_coordinator()
             .metastore_for_zone(self, &zone_id)
         {
-            let backend =
-                crate::core::stream::wal::WalStreamCore::new(store, path.to_string());
+            let backend = crate::core::stream::wal::WalStreamCore::new(store, path.to_string());
             self.stream_manager
                 .register(path, Arc::new(backend))
                 .map_err(stream_mgr_err)?;

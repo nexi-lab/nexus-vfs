@@ -290,7 +290,10 @@ mod tests {
             data: &[u8],
         ) -> Result<u64, MetaStoreError> {
             let mut inner = self.inner.lock().unwrap();
-            let seq = inner.keys().filter(|k| k.starts_with(stream_prefix)).count() as u64;
+            let seq = inner
+                .keys()
+                .filter(|k| k.starts_with(stream_prefix))
+                .count() as u64;
             inner.insert(format!("{stream_prefix}{seq}"), data.to_vec());
             Ok(seq)
         }
@@ -421,7 +424,11 @@ mod tests {
             })
             .collect();
         let seqs: HashSet<u64> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        assert_eq!(seqs.len(), 8, "every concurrent write gets a distinct offset");
+        assert_eq!(
+            seqs.len(),
+            8,
+            "every concurrent write gets a distinct offset"
+        );
         assert_eq!(c.tail(), 8);
         for seq in 0..8u64 {
             assert!(c.read_at(seq).unwrap().is_some());
