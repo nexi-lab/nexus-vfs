@@ -26,6 +26,16 @@ members = [
     # profile binaries; the stamp hook alone is reused by nexus-side
     # frontends without pulling raft (see rust/a2a/Cargo.toml).
     "rust/a2a",
+    # permission/ — the AUTHORIZATION policy sibling to `auth`.
+    # `auth` answers "who is calling?"; `permission` answers "what may
+    # they do?".  Not a kernel primitive, not a RustService: a profile
+    # binary links it behind a Cargo feature and installs it into the
+    # kernel's `Arc<dyn PermissionProvider>` slot at boot.  Kernel
+    # default: no provider registered ⇒ every `check_permission` call
+    # returns `Ok(())` immediately (literally 3 lines of hook code, no
+    # authorization logic in the kernel tier).  `nexusd-cluster` leaves
+    # the feature off — the crate never enters that binary.
+    "rust/permission",
     # Plugin ABI — stable C ABI contract for dylib plugins.
     "rust/plugin-abi",
     # Deployment binaries.
@@ -68,6 +78,11 @@ auth = { path = "rust/auth" }
 # consumer that needs only the hook does not pull the `install` feature's
 # raft dep; the profile binaries opt into `features = ["install"]`.
 a2a = { path = "rust/a2a", default-features = false }
+# `permission` — the authorization policy (sibling to auth).  Same
+# feature-gated composition-root wiring pattern as auth; the crate is
+# never compiled into nexusd-cluster's default build.  See its
+# top-level docstring for the trait + provider composition model.
+permission = { path = "rust/permission" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 ahash = { version = "0.8", default-features = false, features = ["compile-time-rng", "std"] }
