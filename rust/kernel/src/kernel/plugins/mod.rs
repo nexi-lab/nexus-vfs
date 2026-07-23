@@ -257,8 +257,17 @@ unsafe extern "C" fn kernel_cb_sys_readdir(
     };
     // System-context readdir: bypass admin gating (the kernel-side
     // permission check is the SSOT for any access policy plugins
-    // care about).
-    let entries = kernel.sys_readdir(parent_path, contracts::ROOT_ZONE_ID, true);
+    // care about). Use the existence-aware variant so this honours the
+    // documented C-ABI contract (NotFound = -1 for a path that does not
+    // exist; an empty directory is still Ok(0) with `[]`) — the FUSE plugin
+    // already codes against that, so this is behaviour it expects, not a
+    // signature change.
+    let entries = match kernel.sys_readdir_checked(parent_path, contracts::ROOT_ZONE_ID, true) {
+        Ok(e) => e,
+        Err(crate::kernel::KernelError::FileNotFound(_)) => return -1, // PluginResult::NotFound
+        Err(crate::kernel::KernelError::InvalidPath(_)) => return -2, // PluginResult::InvalidArgument
+        Err(_) => return -3,                                          // PluginResult::Internal
+    };
     // `kernel.sys_readdir` returns each child's *full* VFS path (e.g.
     // `/alpha-dir`, not `alpha-dir`); the JSON shape this callback
     // exports is documented under key `"name"` and consumers like the
