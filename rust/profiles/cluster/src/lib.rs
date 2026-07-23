@@ -352,6 +352,13 @@ enum AuthCmd {
         /// Human label for the audit view ("mac-ai laptop", "ci runner").
         #[arg(long, default_value = "")]
         name: String,
+        /// Add a second key for a subject that already holds one — key
+        /// rotation, or an extra credential for the same agent. Without it,
+        /// minting a subject that already has an active key is refused: an
+        /// identity is unique cluster-wide, so two holders cannot claim one
+        /// `agent_id` (the `from` guarantee).
+        #[arg(long)]
+        allow_existing: bool,
     },
     /// Revoke a key. Takes the key itself, or its hash from `auth list`.
     Revoke {
@@ -2797,6 +2804,7 @@ fn run_auth_action(
             admin,
             expires_in_days,
             name,
+            allow_existing,
         } => {
             let subject_type = match subject_type.as_str() {
                 "user" => auth::SubjectType::User,
@@ -2836,8 +2844,8 @@ fn run_auth_action(
                 expires_at_ms,
                 zone_perms,
             };
-            let minted =
-                auth::mint_key(store, secret, record).map_err(|e| anyhow::anyhow!("mint: {e}"))?;
+            let minted = auth::mint_key(store, secret, record, allow_existing)
+                .map_err(|e| anyhow::anyhow!("mint: {e}"))?;
 
             // The one moment the key exists in the clear. On stdout alone, so
             // `KEY=$(nexusd-collaboration auth mint ...)` captures the key and
