@@ -47,16 +47,21 @@ fn generate_key() -> String {
 ///
 /// `record.key_id` is the caller's to choose (tooling usually uses a uuid);
 /// everything else about the credential — subject, zones, expiry, admin — is
-/// whatever the caller put in the record. The commit goes through raft, so a
-/// key minted on one node resolves on every node.
+/// whatever the caller put in the record. The commit goes through the node's
+/// root-zone raft, which is **per-node SOLO** (the credential store is
+/// node-local, not federated), so the key resolves on *this* node: each node
+/// mints and validates its own agents, and an agent authenticates against its
+/// local node.
 ///
-/// A subject's identity is unique cluster-wide: `subject_id` becomes the
-/// `agent_id` the mailbox hook stamps into an envelope's `from`, so letting two
-/// credentials claim one `(subject_type, subject_id)` would let either holder
-/// author the other's mail — the exact impersonation the `from` guarantee
-/// exists to prevent. `mint_key` refuses a subject that already holds an active
-/// key unless `allow_existing` is set, which is the deliberate escape for key
-/// rotation (a second live key for the same subject).
+/// A subject's identity must be unique so the `from` guarantee holds:
+/// `subject_id` becomes the `agent_id` the mailbox hook stamps into an
+/// envelope's `from`, so letting two credentials claim one
+/// `(subject_type, subject_id)` would let either holder author the other's
+/// mail. `mint_key` enforces that **within this node's store** — it refuses a
+/// subject that already holds an active key unless `allow_existing` is set (the
+/// deliberate escape for key rotation). Cross-node uniqueness is a naming
+/// concern (agent names are machine-anchored, so they cannot collide across
+/// nodes), the store being per-node.
 pub fn mint_key(
     store: &Arc<dyn AuthKeyStore>,
     secret: &str,

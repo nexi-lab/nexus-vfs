@@ -2726,7 +2726,11 @@ async fn wait_for_shutdown() {
 /// The root zone always exists (the kernel owns it -- see
 /// `BootAction::needs_root_zone`), but on a fresh data directory it has not
 /// been founded yet, so this founds it the way boot would.
-async fn open_auth_store(
+// Synchronous by design: it builds a `ZoneManager` (which owns a nested tokio
+// runtime), so it must run on the blocking pool, never on an async worker of
+// the outer `#[tokio::main]` — see `run_auth`. Callers reach it through
+// `run_auth_blocking`, itself inside `spawn_blocking`.
+fn open_auth_store(
     common: &CommonArgs,
 ) -> Result<(
     std::sync::Arc<ZoneManager>,
@@ -2741,10 +2745,15 @@ async fn open_auth_store(
         )
     })?;
 
-    let ZoneManagerBundle { zm, .. } = open_zone_manager(common, None)?;
+    // Offline tooling cannot open the data dir while the daemon holds its
+    // exclusive redb lock — by far the dominant failure here — so name that
+    // cause up front rather than leaking a raw redb/OS error.
+    let ZoneManagerBundle { zm, .. } = open_zone_manager(common, None).context(
+        "offline `auth` could not open the data dir; if the daemon is running, \
+         stop it first (it holds an exclusive lock)",
+    )?;
     if zm.get_zone(contracts::ROOT_ZONE_ID).is_none() {
-        zm.create_zone_async(contracts::ROOT_ZONE_ID, Vec::new())
-            .await
+        zm.create_zone(contracts::ROOT_ZONE_ID, Vec::new())
             .map_err(|e| anyhow::anyhow!("open root zone: {e}"))?;
     }
     let root = zm
@@ -2783,7 +2792,26 @@ fn parse_zone_grant(spec: &str) -> Result<(String, String)> {
 }
 
 async fn run_auth(common: CommonArgs, action: AuthCmd) -> Result<()> {
-    let (zm, store, secret) = open_auth_store(&common).await?;
+    // The offline `auth` subcommand builds a ZoneManager, which owns a nested
+    // tokio runtime — created, driven, and dropped in this one call. None of
+    // that may happen on an async worker thread of the outer `#[tokio::main]`
+    // runtime: dropping a runtime there panics ("Cannot drop a runtime in a
+    // context where blocking is not allowed"), which is how a still-running
+    // daemon (holding the redb data-dir lock) used to surface — a cryptic
+    // mid-construction panic on the error path instead of a clean "stop the
+    // daemon first". The blocking pool *allows* blocking (and runtime
+    // create/drop), so run the whole thing there. Mirrors the daemon-shutdown
+    // drain (`spawn_blocking(|| zm.shutdown())`) and `join_zones_for_boot`.
+    tokio::task::spawn_blocking(move || run_auth_blocking(common, action))
+        .await
+        .context("auth subcommand task panicked")?
+}
+
+/// Synchronous body of the offline `auth` subcommand — see `run_auth` for why
+/// it runs on the blocking pool. Owns the ZoneManager start to finish so its
+/// nested runtime is created and dropped off the async worker threads.
+fn run_auth_blocking(common: CommonArgs, action: AuthCmd) -> Result<()> {
+    let (zm, store, secret) = open_auth_store(&common)?;
     let result = run_auth_action(&store, &secret, action);
     // Release the data directory's lock before returning, or a daemon started
     // right after this exits fails to open redb.
