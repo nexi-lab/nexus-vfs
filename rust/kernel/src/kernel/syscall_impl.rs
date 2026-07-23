@@ -3569,6 +3569,50 @@ impl Kernel {
         entries
     }
 
+    /// Existence-aware directory listing — the POSIX-correct composition of
+    /// [`Self::sys_readdir`] (pure child enumeration) and [`Self::sys_stat`]
+    /// (the existence+type authority).
+    ///
+    /// `sys_readdir` alone returns an empty `Vec` for a path that does not
+    /// exist, an empty directory, OR one it cannot route — indistinguishable,
+    /// because enumeration has no not-found channel. This wrapper disambiguates
+    /// ONLY the empty case (so the non-empty hot path pays nothing) by asking
+    /// `sys_stat`, the single existence SSOT:
+    ///   * exists + directory/mount  → `Ok(<entries>)` (a real, possibly empty dir);
+    ///   * exists but not a directory → `Err(InvalidPath)` (ENOTDIR);
+    ///   * does not exist anywhere    → `Err(FileNotFound)` (ENOENT).
+    ///
+    /// This keeps `sys_stat` ⊥ `sys_readdir` perfectly orthogonal — point
+    /// metadata vs. pure enumeration, neither re-implements the other — while
+    /// the boundaries that owe callers a POSIX result (the plugin C-ABI's
+    /// documented `NotFound`, the gRPC `Readdir` RPC) get the distinction by
+    /// composing the two. Internal enumerators that only want "the children I
+    /// can see" keep calling `sys_readdir`.
+    #[inline]
+    pub fn sys_readdir_checked(
+        &self,
+        parent_path: &str,
+        zone_id: &str,
+        is_admin: bool,
+    ) -> Result<Vec<(String, u8)>, KernelError> {
+        let entries = self.sys_readdir(parent_path, zone_id, is_admin);
+        if entries.is_empty() {
+            // Empty enumeration is ambiguous — resolve existence via the one
+            // authority. Only reached on an empty result, so the common
+            // non-empty listing keeps its exact cost.
+            match self.sys_stat(parent_path, zone_id) {
+                None => return Err(KernelError::FileNotFound(parent_path.to_string())),
+                Some(s) if !s.is_directory => {
+                    return Err(KernelError::InvalidPath(format!(
+                        "not a directory: {parent_path}"
+                    )))
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(entries)
+    }
+
     /// Paginated readdir: returns a page of children with cursor-based
     /// pagination. `limit=0` returns all (backward compat). Cursor is
     /// the last path from the previous page.

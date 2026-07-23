@@ -635,10 +635,31 @@ impl NexusVfsService for VfsServiceImpl {
         // ping-pong loops in 3+ node topologies where every hop's
         // local search misses.
         let entries = if req.from_peer {
+            // Peer fan-out probe: a pure local scan. An empty result means "I
+            // don't have it" — a valid answer that lets the fanning-out peer
+            // move on — NOT NotFound, so this arm never errors.
             self.kernel
                 .sys_readdir_peer_dispatch(&req.path, zone_id, ctx.is_admin)
         } else {
-            self.kernel.sys_readdir(&req.path, zone_id, ctx.is_admin)
+            // Direct client: existence-aware. `sys_readdir_checked` distinguishes
+            // an empty directory (Ok) from a path that does not exist
+            // (Err(FileNotFound)) / is not a directory (Err(InvalidPath)) via
+            // `sys_stat`, so readdir stops silently reporting "" for a missing
+            // path (the RPC now matches the C-ABI's documented NotFound contract).
+            match self
+                .kernel
+                .sys_readdir_checked(&req.path, zone_id, ctx.is_admin)
+            {
+                Ok(e) => e,
+                Err(err) => {
+                    let (code, msg) = self.map_kernel_err(err);
+                    return Ok(Response::new(ReaddirResponse {
+                        entries: Vec::new(),
+                        is_error: true,
+                        error_payload: encode_rpc_error(code, &msg),
+                    }));
+                }
+            }
         };
         let mapped: Vec<ReaddirEntry> = entries
             .into_iter()
@@ -2789,6 +2810,61 @@ mod tests {
             .into_inner();
         assert!(!missing.found);
         assert!(!missing.is_error);
+    }
+
+    #[tokio::test]
+    async fn readdir_distinguishes_missing_empty_and_file() {
+        let kernel = std::sync::Arc::new(kernel_with_mem_backend());
+        let ctx = OperationContext::new("test", "root", true, None, true);
+        // A non-empty dir (/d holds a child) and an explicitly-created EMPTY dir.
+        let _ = KernelConvenience::write_batch(
+            &*kernel,
+            &[("/d/a.txt".to_string(), b"x".to_vec())],
+            &ctx,
+        );
+        KernelConvenience::mkdir(&*kernel, "/e", &ctx, true, true).expect("mkdir /e");
+
+        let svc = VfsServiceImpl::for_test(kernel);
+        let rd = |path: &str| {
+            tonic::Request::new(ReaddirRequest {
+                path: path.into(),
+                auth_token: "test-key".into(),
+                ..Default::default()
+            })
+        };
+
+        // Non-empty existing dir → ok + lists the child.
+        let d = svc.readdir(rd("/d")).await.expect("rpc ok").into_inner();
+        assert!(!d.is_error);
+        assert!(
+            d.entries.iter().any(|e| e.name.ends_with("a.txt")),
+            "should list a.txt: {:?}",
+            d.entries
+        );
+
+        // EMPTY but existing dir → ok + empty (must NOT regress to NotFound).
+        let e = svc.readdir(rd("/e")).await.expect("rpc ok").into_inner();
+        assert!(
+            !e.is_error,
+            "an empty but existing directory must list as empty, not error"
+        );
+        assert!(e.entries.is_empty());
+
+        // Missing path → error (NotFound), not a silent empty listing — the
+        // whole point: readdir no longer reports "" for a path that isn't there.
+        let missing = svc.readdir(rd("/nope")).await.expect("rpc ok").into_inner();
+        assert!(
+            missing.is_error,
+            "readdir of a missing path must error, not report an empty listing"
+        );
+
+        // A file is not a directory → error (ENOTDIR).
+        let notdir = svc
+            .readdir(rd("/d/a.txt"))
+            .await
+            .expect("rpc ok")
+            .into_inner();
+        assert!(notdir.is_error, "readdir of a file must error");
     }
 
     #[tokio::test]

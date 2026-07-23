@@ -96,6 +96,23 @@ struct CommonArgs {
     #[arg(long, env = "NEXUS_BIND_ADDR", default_value = DEFAULT_BIND, global = true)]
     bind_addr: String,
 
+    /// Additional loopback-only VFS bind for LOCAL agents, in `host:port`
+    /// form (e.g. `127.0.0.1:2130`).
+    ///
+    /// `--bind-addr` serves cluster PEERS over mTLS — the node/peer plane,
+    /// `agent_id = None`. A local agent (sudocode-host or an AI runtime on
+    /// THIS host) instead reaches the same kernel through this loopback
+    /// bind and authenticates with an `sk-` Agent key (the token plane), so
+    /// its mailbox writes carry an unforgeable `agent_id` that the A2A stamp
+    /// hook turns into `from`. mTLS ⊥ token: the two identity planes live on
+    /// separate binds by audience (remote peers vs. local agents).
+    ///
+    /// Requires `NEXUS_API_KEY_SECRET` (the token plane) and refuses a
+    /// non-loopback address — a bearer token over plaintext must never
+    /// leave the host.
+    #[arg(long, env = "NEXUS_AGENT_BIND_ADDR", global = true)]
+    agent_bind_addr: Option<String>,
+
     /// Persistent data directory (TLS bundle + per-zone redb files).
     #[arg(
         long,
@@ -954,6 +971,47 @@ fn open_zone_manager(
     })
 }
 
+/// Resolve `--agent-bind-addr` into a bind address, fail-closed.
+///
+/// The local-agent bind exists to give a local agent an `agent_id` via the
+/// token plane (`sk-` Agent key) — mTLS ⊥ token, the two identity planes on
+/// separate binds by audience (auth-doc §3.1 / §4.1). So it is only legal
+/// when:
+///   * the token plane is on (`NEXUS_API_KEY_SECRET` set) — a NoAuth agent
+///     bind resolves every caller as nobody and could never stamp a `from`;
+///   * the address is loopback — it carries bearer tokens over plaintext, so
+///     a reachable bind would leak them off-host (the exact reachable-plaintext
+///     hole the boot posture forbids, §3).
+///
+/// Returns `Ok(None)` when the flag is unset (no local-agent bind), or the
+/// parsed `SocketAddr` when the posture is legal.
+fn resolve_agent_bind(
+    agent_bind: Option<&str>,
+    token_plane_on: bool,
+) -> Result<Option<std::net::SocketAddr>> {
+    let Some(agent_bind) = agent_bind else {
+        return Ok(None);
+    };
+    if !token_plane_on {
+        return Err(anyhow::anyhow!(
+            "--agent-bind-addr requires NEXUS_API_KEY_SECRET: the local-agent bind \
+             authenticates on the token plane (sk- Agent key → agent_id); without a \
+             secret every caller resolves as nobody and no `from` could be stamped"
+        ));
+    }
+    if !auth_posture::is_loopback_bind(agent_bind) {
+        return Err(anyhow::anyhow!(
+            "--agent-bind-addr must be a loopback address (127.0.0.1:<port>); got \
+             '{agent_bind}'. It carries bearer tokens over plaintext and must never \
+             be reachable off-host"
+        ));
+    }
+    let addr = agent_bind
+        .parse::<std::net::SocketAddr>()
+        .map_err(|e| anyhow::anyhow!("--agent-bind-addr parse '{agent_bind}': {e}"))?;
+    Ok(Some(addr))
+}
+
 async fn run_daemon(common: CommonArgs) -> Result<()> {
     let hostname = resolve_hostname(common.hostname.as_deref());
     tracing::info!(
@@ -1808,6 +1866,46 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
         }
     }
 
+    // Local-agent identity bind (mTLS ⊥ token — auth-doc §3.1 / §4.1).
+    //
+    // `--bind-addr` above serves cluster PEERS over mTLS (the node/peer
+    // plane, `agent_id = None`). A local agent on THIS host reaches the
+    // same kernel through this loopback bind and authenticates on the
+    // token plane (`sk-` Agent key → `agent_id`), so its mailbox writes
+    // carry an unforgeable `from` once the stamp hook rewrites them. The
+    // two identity planes stay on separate binds by audience; `resolve()`
+    // is still the single decision point for both.
+    //
+    // Fail-closed: an agent bind with NoAuth could not produce an
+    // `agent_id` (defeating the purpose), and a token over reachable
+    // plaintext is exactly the hole the boot posture forbids — so require
+    // the token plane and refuse a non-loopback address.
+    let agent_grpc =
+        match resolve_agent_bind(common.agent_bind_addr.as_deref(), api_key_auth.is_some())? {
+            Some(bind_addr) => {
+                let provider = api_key_auth
+                    .clone()
+                    .expect("resolve_agent_bind returns a bind only when the token plane is on");
+                let handle = transport::grpc::spawn(
+                    Arc::clone(&kernel),
+                    transport::grpc::VfsGrpcConfig {
+                        bind_addr,
+                        tls: None,
+                        max_message_bytes: 64 * 1024 * 1024,
+                        server_version: "nexusd-cluster".to_string(),
+                    },
+                    Arc::clone(&provider) as Arc<dyn transport::auth::AuthProvider>,
+                )
+                .map_err(|e| anyhow::anyhow!("spawn local-agent vfs bind: {e}"))?;
+                tracing::info!(
+                    bind = %bind_addr,
+                    "local-agent VFS bind up (loopback, token plane: sk- Agent key → agent_id)"
+                );
+                Some(handle)
+            }
+            None => None,
+        };
+
     let zm_for_loop = zm.clone();
     let topology_handle = tokio::spawn(async move {
         loop {
@@ -1869,6 +1967,11 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     // thread — dropping it inside the current async context panics with
     // "Cannot drop a runtime in a context where blocking is not allowed".
     tokio::task::spawn_blocking(move || {
+        // The local-agent bind owns its own tokio runtime; drop it on this
+        // blocking thread (dropping a runtime in an async context panics).
+        if let Some(handle) = agent_grpc {
+            handle.shutdown_blocking();
+        }
         drop(kernel);
         drop(zm);
     })
@@ -3205,6 +3308,42 @@ mod tests {
     }
 
     // ── --advertise-addr decoupling tests (symmetric-peer PR) ────────
+
+    // ── --agent-bind-addr fail-closed posture (Option X: mTLS ⊥ token) ──
+    #[test]
+    fn agent_bind_unset_is_none() {
+        assert!(resolve_agent_bind(None, true).expect("unset ok").is_none());
+        assert!(resolve_agent_bind(None, false)
+            .expect("unset ok even without a secret")
+            .is_none());
+    }
+
+    #[test]
+    fn agent_bind_requires_token_plane() {
+        // Set but no secret → refuse: a NoAuth agent bind resolves every
+        // caller as nobody and could never stamp a `from`.
+        let err = resolve_agent_bind(Some("127.0.0.1:2130"), false)
+            .expect_err("agent bind without the token plane must fail-closed");
+        assert!(err.to_string().contains("NEXUS_API_KEY_SECRET"));
+    }
+
+    #[test]
+    fn agent_bind_must_be_loopback() {
+        // Token plane on, but a reachable addr → refuse: a bearer token over
+        // plaintext must never leave the host.
+        let err = resolve_agent_bind(Some("0.0.0.0:2130"), true)
+            .expect_err("non-loopback agent bind must fail-closed");
+        assert!(err.to_string().contains("loopback"));
+    }
+
+    #[test]
+    fn agent_bind_loopback_with_token_resolves() {
+        let addr = resolve_agent_bind(Some("127.0.0.1:2130"), true)
+            .expect("loopback + token plane is legal")
+            .expect("returns a bind addr");
+        assert!(addr.ip().is_loopback());
+        assert_eq!(addr.port(), 2130);
+    }
 
     #[test]
     fn advertise_addr_explicit_wins() {
