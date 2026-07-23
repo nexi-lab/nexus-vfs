@@ -11,7 +11,7 @@ use kernel::hal::auth_key_store::{AuthKeyStore, AuthKeyStoreError};
 use rand::Rng; // `rand_core::Rng` — the CSPRNG core trait, `fill_bytes` lives here.
 
 use crate::provider::{hash_key, API_KEY_PREFIX};
-use crate::record::AuthKeyRecord;
+use crate::record::{AuthKeyRecord, SubjectType};
 
 /// Random bytes in the secret half of a key. 32 hex chars ⇒ 128 bits, which
 /// puts the key comfortably over the length floor and far out of reach of a
@@ -49,11 +49,38 @@ fn generate_key() -> String {
 /// everything else about the credential — subject, zones, expiry, admin — is
 /// whatever the caller put in the record. The commit goes through raft, so a
 /// key minted on one node resolves on every node.
+///
+/// A subject's identity is unique cluster-wide: `subject_id` becomes the
+/// `agent_id` the mailbox hook stamps into an envelope's `from`, so letting two
+/// credentials claim one `(subject_type, subject_id)` would let either holder
+/// author the other's mail — the exact impersonation the `from` guarantee
+/// exists to prevent. `mint_key` refuses a subject that already holds an active
+/// key unless `allow_existing` is set, which is the deliberate escape for key
+/// rotation (a second live key for the same subject).
 pub fn mint_key(
     store: &Arc<dyn AuthKeyStore>,
     secret: &str,
     record: AuthKeyRecord,
+    allow_existing: bool,
 ) -> Result<MintedKey, AuthKeyStoreError> {
+    // The store is keyed by key-hash, not by subject, so uniqueness is a
+    // mint-layer policy (this crate owns the record schema; the raft store keeps
+    // records opaque bytes) enforced by scanning the active records. `auth mint`
+    // is offline admin tooling with a single writer, so the list→put window is
+    // not a real race and the raft log stays the SSOT.
+    if !allow_existing {
+        if let Some(clash_id) = find_active_subject(store, record.subject_type, &record.subject_id)?
+        {
+            return Err(AuthKeyStoreError::Backend(format!(
+                "subject {}:{} already has an active key (key_id={clash_id}); \
+                 revoke it, or pass --allow-existing to add another key for the \
+                 same subject (rotation)",
+                record.subject_type.as_str(),
+                record.subject_id,
+            )));
+        }
+    }
+
     let key = generate_key();
     let key_hash = hash_key(secret, &key);
     let bytes = record.encode().map_err(|e| {
@@ -65,6 +92,29 @@ pub fn mint_key(
         key_hash,
         record,
     })
+}
+
+/// The `key_id` of an active (non-revoked) key already bound to
+/// `(subject_type, subject_id)`, if any — the uniqueness guard `mint_key`
+/// consults so one identity cannot be claimed by two credentials.
+fn find_active_subject(
+    store: &Arc<dyn AuthKeyStore>,
+    subject_type: SubjectType,
+    subject_id: &str,
+) -> Result<Option<String>, AuthKeyStoreError> {
+    for (_hash, bytes) in store.list()? {
+        // A record this build cannot decode still binds a subject, but it can
+        // only have been written by a newer schema; skip it (as `auth list`
+        // does) rather than abort every mint on one unreadable row. Worst case
+        // is a missed dedup against that row, never a wrong rejection.
+        let Ok(rec) = AuthKeyRecord::decode(&bytes) else {
+            continue;
+        };
+        if !rec.revoked && rec.subject_type == subject_type && rec.subject_id == subject_id {
+            return Ok(Some(rec.key_id));
+        }
+    }
+    Ok(None)
 }
 
 /// Revoke a key by its clear-text value — the shape a holder uses to retire
@@ -146,7 +196,7 @@ mod tests {
     #[test]
     fn a_minted_key_authenticates_and_a_revoked_one_does_not() {
         let store: Arc<dyn AuthKeyStore> = Arc::new(MemStore::default());
-        let minted = mint_key(&store, SECRET, record()).expect("mint");
+        let minted = mint_key(&store, SECRET, record(), false).expect("mint");
 
         // The key is well-formed by construction — it must clear the very
         // format gate the provider applies.
@@ -190,7 +240,7 @@ mod tests {
     #[test]
     fn an_admin_can_revoke_by_hash_alone() {
         let store: Arc<dyn AuthKeyStore> = Arc::new(MemStore::default());
-        let minted = mint_key(&store, SECRET, record()).expect("mint");
+        let minted = mint_key(&store, SECRET, record(), false).expect("mint");
 
         assert!(revoke_key_hash(&store, &minted.key_hash).expect("revoke by hash"));
         assert!(store.get(&minted.key_hash).unwrap().is_none());
@@ -199,10 +249,65 @@ mod tests {
     #[test]
     fn every_minted_key_is_distinct() {
         let store: Arc<dyn AuthKeyStore> = Arc::new(MemStore::default());
-        let a = mint_key(&store, SECRET, record()).expect("mint a");
-        let b = mint_key(&store, SECRET, record()).expect("mint b");
+        let a = mint_key(&store, SECRET, record(), false).expect("mint a");
+        // Same subject a second time is rotation — `allow_existing` is required.
+        let b = mint_key(&store, SECRET, record(), true).expect("mint b");
         assert_ne!(a.key, b.key);
         assert_ne!(a.key_hash, b.key_hash);
+        assert_eq!(store.list().unwrap().len(), 2);
+    }
+
+    /// An agent's identity is unique cluster-wide: a second key for a subject
+    /// that already holds one is refused, and the refusal names the clash.
+    #[test]
+    fn a_duplicate_subject_is_refused_by_default() {
+        let store: Arc<dyn AuthKeyStore> = Arc::new(MemStore::default());
+        mint_key(&store, SECRET, record(), false).expect("first mint");
+        // `MintedKey` holds the clear-text key and deliberately isn't `Debug`,
+        // so match rather than `expect_err` (which would need `Ok: Debug`).
+        let msg = match mint_key(&store, SECRET, record(), false) {
+            Ok(_) => panic!("a second key for the same subject must be refused"),
+            Err(e) => format!("{e}"),
+        };
+        assert!(
+            msg.contains("already has an active key") && msg.contains("mac-ai"),
+            "the refusal must name the clash: {msg}"
+        );
+        // The rejected mint wrote nothing — only the first key lives.
+        assert_eq!(store.list().unwrap().len(), 1);
+    }
+
+    /// `allow_existing` is the deliberate escape for rotation: a second live
+    /// key for one subject, both resolving as that subject.
+    #[test]
+    fn allow_existing_permits_a_second_key_for_rotation() {
+        let store: Arc<dyn AuthKeyStore> = Arc::new(MemStore::default());
+        let a = mint_key(&store, SECRET, record(), false).expect("first mint");
+        let b = mint_key(&store, SECRET, record(), true).expect("rotation mint");
+        assert_ne!(a.key, b.key, "rotation issues a distinct key");
+        assert_eq!(store.list().unwrap().len(), 2, "both keys stay live");
+    }
+
+    /// Revoking frees the identity: once the record is gone a plain mint (no
+    /// `allow_existing`) succeeds, so a retired agent name can be reissued.
+    #[test]
+    fn a_revoked_subject_no_longer_blocks_reminting() {
+        let store: Arc<dyn AuthKeyStore> = Arc::new(MemStore::default());
+        let a = mint_key(&store, SECRET, record(), false).expect("first mint");
+        assert!(revoke_key_hash(&store, &a.key_hash).expect("revoke"));
+        mint_key(&store, SECRET, record(), false).expect("re-mint after revoke");
+    }
+
+    /// Uniqueness is per `(subject_type, subject_id)`: a user and an agent may
+    /// share an id — they are different principals and only the agent carries
+    /// an `agent_id`.
+    #[test]
+    fn the_same_id_under_a_different_subject_type_coexists() {
+        let store: Arc<dyn AuthKeyStore> = Arc::new(MemStore::default());
+        mint_key(&store, SECRET, record(), false).expect("agent mint");
+        let mut as_user = record();
+        as_user.subject_type = SubjectType::User;
+        mint_key(&store, SECRET, as_user, false).expect("a user with the same id is distinct");
         assert_eq!(store.list().unwrap().len(), 2);
     }
 }
