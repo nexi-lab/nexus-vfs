@@ -70,9 +70,14 @@ async fn from_is_unforgeable_on_the_token_authed_agent_bind() {
 
     let budget = Duration::from_secs(90);
 
-    // ── 3. AUTH: the agent bind is up and resolves the minted key ────────
+    // ── 3. AUTH: the agent bind authenticating the minted key IS the readiness
+    // gate — the daemon spawns the agent bind only after the kernel + root mount
+    // are up. No federation gate here: this is a single node (no peers, so the
+    // shared zone is moot), and the offline `mint` step's data dir makes the
+    // daemon resume (federation env advisory), so `/agents` is served by the
+    // root mount. The from-stamp is path+ctx based, so the guarantee holds
+    // either way; the real federated mailbox path is covered by `a2a_wakeup`.
     let mut c = Vfs::connect_authenticated(agent_port, &key, budget).await;
-    c.await_mounted(MOUNT, &key, budget).await;
 
     // ── 4. CREATE the recipient mailbox as the authenticated sender ──────
     let mailbox = format!("{MOUNT}/{RECIPIENT}/chat-with-me");

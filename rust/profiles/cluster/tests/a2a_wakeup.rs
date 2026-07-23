@@ -22,7 +22,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{await_replicated, free_port, Daemon, Vfs};
+use common::{await_replicated, free_port, Daemon, Vfs, LOG_FILTER};
 
 const ZONE: &str = "sharedzone";
 const MOUNT: &str = "/agents";
@@ -42,6 +42,7 @@ fn founder_env<'a>(
         ("NEXUS_INSECURE_NO_AUTH", "true"),
         ("NEXUS_FEDERATION_ZONES", ZONE),
         ("NEXUS_FEDERATION_MOUNTS", mounts),
+        ("RUST_LOG", LOG_FILTER),
     ]
 }
 
@@ -58,6 +59,7 @@ fn joiner_env<'a>(
         ("NEXUS_NO_TLS", "true"),
         ("NEXUS_INSECURE_NO_AUTH", "true"),
         ("NEXUS_PEERS", peers),
+        ("RUST_LOG", LOG_FILTER),
     ]
 }
 
@@ -154,16 +156,32 @@ async fn mailbox_write_wakes_a_peers_parked_sys_watch_both_directions() {
         .wait_tcp(fport, BUDGET)
         .await
         .expect("founder serves");
+    // Gate the joiner's boot on the founder having REGISTERED sharedzone.
+    // readdir/stat on the /agents mount point don't distinguish a live
+    // federation mount from a root-served empty path (readdir returns non-error
+    // for any path; stat returns not-found for a mount point), so probing them
+    // lets the joiner boot early and its DiscoverZones race — and lose to —
+    // this registration, leaving it rootless (it does not retry) so nothing
+    // ever replicates. The zone-registration log line is the reliable signal.
+    let zone_registered = format!("Zone '{ZONE}' registered");
+    founder
+        .wait_for_log(&zone_registered, BUDGET)
+        .await
+        .expect("founder must register sharedzone");
     let mut fc = Vfs::dial(fport).await.expect("dial founder");
-    fc.await_mounted(MOUNT, "", BUDGET).await;
 
     let mut joiner = Daemon::spawn(
         &["--bind-addr", &jbind],
         &joiner_env(&jdata, &jid, &jadv, &peers),
     );
     joiner.wait_tcp(jport, BUDGET).await.expect("joiner serves");
+    // The joiner joins sharedzone via DiscoverZones; wait until it has actually
+    // registered the zone (joined), not come up rootless.
+    joiner
+        .wait_for_log(&zone_registered, BUDGET)
+        .await
+        .expect("joiner must join sharedzone");
     let mut jc = Vfs::dial(jport).await.expect("dial joiner");
-    jc.await_mounted(MOUNT, "", BUDGET).await;
 
     // ── 2. Federation health — founder writes, joiner reads back ───────
     let health = format!("{MOUNT}/health-founder.txt");

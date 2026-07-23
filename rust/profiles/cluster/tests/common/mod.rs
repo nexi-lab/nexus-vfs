@@ -10,6 +10,7 @@
 #![allow(dead_code)] // each test file uses a different subset
 
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use kernel::kernel::vfs_proto::{
@@ -20,6 +21,12 @@ use kernel::kernel::vfs_proto::{
 use tonic::transport::Channel;
 
 pub const DT_STREAM: i32 = 4;
+
+/// RUST_LOG for daemons whose readiness is gated on a log line (federation
+/// tests): INFO so the `Zone '...' registered` line is emitted, with the noisy
+/// gRPC-stack crates pinned to warn. Pass via the daemon env (overrides the
+/// spawn default). A caller can still override with `NEXUS_E2E_INHERIT_LOGS`.
+pub const LOG_FILTER: &str = "info,h2=warn,hyper=warn,tower=warn,tonic=warn";
 
 /// Path to the built binary — Cargo sets this for the crate's integration tests.
 pub fn bin() -> &'static str {
@@ -34,18 +41,47 @@ pub fn free_port() -> u16 {
         .port()
 }
 
-/// A spawned `nexusd-cluster`, killed on drop. stdout+stderr are piped so a
-/// refusal's prose can be read back after the process exits.
+/// A spawned `nexusd-cluster`, killed on drop. Reader threads capture
+/// stdout+stderr into a shared buffer, so `drain()` can read a refusal's prose
+/// and `wait_for_log()` can gate on a readiness line — the only RELIABLE
+/// "the zone is registered / ready" signal, since `readdir`/`stat` on a mount
+/// point do not distinguish a live federation mount from a root-served empty
+/// path (`readdir` returns non-error for any path; `stat` returns not-found for
+/// a mount point).
 pub struct Daemon {
     child: Child,
+    log: Arc<Mutex<String>>,
+}
+
+/// Drain a child pipe into the shared log buffer on a background thread. The
+/// thread exits when the pipe closes (the child is killed on `Daemon` drop).
+fn pump(pipe: Option<impl std::io::Read + Send + 'static>, log: Arc<Mutex<String>>) {
+    let Some(mut pipe) = pipe else { return };
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match pipe.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => log
+                    .lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&buf[..n])),
+            }
+        }
+    });
 }
 
 impl Daemon {
     /// Spawn the binary with `args` and env overrides. Ambient
-    /// `NEXUS_API_KEY_SECRET` / `NEXUS_INSECURE_NO_AUTH` are cleared so a
-    /// stale value can't silently change the posture under test; callers add
-    /// them back explicitly via `env`.
+    /// `NEXUS_API_KEY_SECRET` / `NEXUS_INSECURE_NO_AUTH` are cleared so a stale
+    /// value can't silently change the posture under test; callers add them
+    /// back explicitly via `env`.
+    ///
+    /// `NEXUS_E2E_INHERIT_LOGS=1` streams the daemon's stdout/stderr to the
+    /// test's own (for `RUST_LOG=info` debugging); nothing is captured then, so
+    /// `drain()` / `wait_for_log()` see nothing.
     pub fn spawn(args: &[&str], env: &[(&str, &str)]) -> Self {
+        let inherit = std::env::var("NEXUS_E2E_INHERIT_LOGS").is_ok();
         let mut cmd = Command::new(bin());
         cmd.args(args)
             .env_remove("NEXUS_API_KEY_SECRET")
@@ -53,20 +89,25 @@ impl Daemon {
             .env(
                 "RUST_LOG",
                 std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".into()),
-            )
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            );
+        if inherit {
+            cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+        } else {
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        }
         for (k, v) in env {
             cmd.env(k, v);
         }
-        Daemon {
-            child: cmd.spawn().expect("spawn nexusd-cluster"),
-        }
+        let mut child = cmd.spawn().expect("spawn nexusd-cluster");
+        let log = Arc::new(Mutex::new(String::new()));
+        pump(child.stdout.take(), Arc::clone(&log));
+        pump(child.stderr.take(), Arc::clone(&log));
+        Daemon { child, log }
     }
 
     /// Poll until the TCP `port` accepts a connection (came up) or the process
     /// exits (refused to boot). `Ok(())` = serving; `Err(output)` = it exited
-    /// (with its captured stdout+stderr) or the budget expired.
+    /// (with its captured logs) or the budget expired.
     pub async fn wait_tcp(&mut self, port: u16, budget: Duration) -> Result<(), String> {
         let deadline = Instant::now() + budget;
         while Instant::now() < deadline {
@@ -84,7 +125,7 @@ impl Daemon {
         Err(format!("timed out without serving:\n{}", self.drain()))
     }
 
-    /// Did the process exit within `budget`? Returns its output if so.
+    /// Did the process exit within `budget`? Returns its captured logs if so.
     pub async fn wait_exit(&mut self, budget: Duration) -> Option<String> {
         let deadline = Instant::now() + budget;
         while Instant::now() < deadline {
@@ -96,18 +137,41 @@ impl Daemon {
         None
     }
 
-    /// Read whatever the child has written to stdout+stderr so far. Only valid
-    /// once the child has exited (the pipes are then EOF-terminated).
-    pub fn drain(&mut self) -> String {
-        use std::io::Read;
-        let mut out = String::new();
-        if let Some(mut so) = self.child.stdout.take() {
-            let _ = so.read_to_string(&mut out);
+    /// True if the captured logs so far contain `pat`.
+    pub fn log_contains(&self, pat: &str) -> bool {
+        self.log.lock().unwrap().contains(pat)
+    }
+
+    /// Poll until the captured logs contain `pat` (a readiness line), or the
+    /// process dies / the budget expires. This is the deterministic gate for
+    /// federation boot ordering: wait for the founder to log its zone
+    /// registration before booting a joiner, so the joiner's DiscoverZones
+    /// cannot race (and lose to) that registration and come up rootless.
+    pub async fn wait_for_log(&mut self, pat: &str, budget: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + budget;
+        loop {
+            if self.log_contains(pat) {
+                return Ok(());
+            }
+            if let Ok(Some(status)) = self.child.try_wait() {
+                return Err(format!(
+                    "exited (status {status}) before logging {pat:?}:\n{}",
+                    self.drain()
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "log never contained {pat:?} within budget:\n{}",
+                    self.drain()
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
-        if let Some(mut se) = self.child.stderr.take() {
-            let _ = se.read_to_string(&mut out);
-        }
-        out
+    }
+
+    /// Snapshot of everything the child has written to stdout+stderr so far.
+    pub fn drain(&self) -> String {
+        self.log.lock().unwrap().clone()
     }
 }
 
@@ -234,30 +298,6 @@ impl Vfs {
             .map(|_| ())
     }
 
-    pub async fn await_mounted(&mut self, path: &str, token: &str, budget: Duration) {
-        let deadline = Instant::now() + budget;
-        loop {
-            let ok = self
-                .c
-                .readdir(ReaddirRequest {
-                    path: path.to_string(),
-                    auth_token: token.to_string(),
-                    ..Default::default()
-                })
-                .await
-                .map(|r| !r.into_inner().is_error)
-                .unwrap_or(false);
-            if ok {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "{path} never mounted within budget"
-            );
-            tokio::time::sleep(Duration::from_millis(300)).await;
-        }
-    }
-
     pub async fn mkdir(&mut self, path: &str, token: &str) -> Result<(), String> {
         let r = self
             .c
@@ -273,16 +313,21 @@ impl Vfs {
         err_if(r.is_error, &r.error_payload, "mkdir")
     }
 
-    pub async fn readdir_ok(&mut self, path: &str, token: &str) -> bool {
-        self.c
+    /// Readdir returning the entry names (which are FULL paths, not bare
+    /// filenames — a known API wart the moss migration must account for).
+    pub async fn readdir_names(&mut self, path: &str, token: &str) -> Result<Vec<String>, String> {
+        let r = self
+            .c
             .readdir(ReaddirRequest {
                 path: path.to_string(),
                 auth_token: token.to_string(),
                 ..Default::default()
             })
             .await
-            .map(|r| !r.into_inner().is_error)
-            .unwrap_or(false)
+            .map_err(|e| format!("readdir rpc: {e}"))?
+            .into_inner();
+        err_if(r.is_error, &r.error_payload, "readdir")?;
+        Ok(r.entries.into_iter().map(|e| e.name).collect())
     }
 
     pub async fn create_stream(&mut self, path: &str, token: &str) -> Result<(), String> {
