@@ -17,8 +17,8 @@ Zero Python dependency. The kernel compiles into `nexusd-cluster`
 | `sys_write` | Write content (CAS dedup, three-phase with hooks) |
 | `sys_unlink` | Delete entry (recursive dir, DT_MOUNT, IPC cleanup) |
 | `sys_setattr` | Create/update metadata, mount backends, register services |
-| `sys_stat` | Stat entry (implicit directory detection) |
-| `sys_readdir` | Directory listing (metastore + backend merge, procfs intercepts) |
+| `sys_stat` | Stat entry (implicit directory detection); the existence+type authority |
+| `sys_readdir` | Directory listing — pure enumeration (metastore + backend merge, procfs intercepts). `sys_readdir_checked` composes it with `sys_stat` for a POSIX not-found result (readdir ⊥ stat) |
 | `sys_rename` | Atomic rename (cross-mount rejected) |
 | `sys_copy` | Copy with CAS dedup (same-hash = metadata-only) |
 | `sys_mkdir` | Create directory (parents, exist_ok) |
