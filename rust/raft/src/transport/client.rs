@@ -3,6 +3,7 @@
 //! Provides a client to communicate with other Raft nodes using tonic gRPC.
 
 use super::proto::nexus::raft::{
+    node_enrollment_service_client::NodeEnrollmentServiceClient,
     raft_command::Command as ProtoCommandVariant, raft_query::Query as ProtoQueryVariant,
     zone_api_service_client::ZoneApiServiceClient,
     zone_transport_service_client::ZoneTransportServiceClient, AcquireLock, DeleteMetadata,
@@ -784,7 +785,7 @@ pub async fn call_join_cluster(
         .await
         .map_err(|e| TransportError::Connection(format!("JoinCluster connect failed: {}", e)))?;
 
-    let mut client = ZoneApiServiceClient::new(channel);
+    let mut client = NodeEnrollmentServiceClient::new(channel);
     let request = JoinClusterRequest {
         password: password.to_string(),
         node_id,

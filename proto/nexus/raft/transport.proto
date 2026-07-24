@@ -104,13 +104,6 @@ service ZoneApiService {
   // replica. It is idempotent so retries and already-cleaned peers are safe.
   rpc DeleteZone(DeleteZoneRequest) returns (DeleteZoneResponse);
 
-  // JoinCluster provisions a new node with cluster TLS certificates.
-  // Called by `nexus join` before `nexus serve`. The caller authenticates
-  // with the join token password; the server signs a node cert and returns
-  // it along with the CA cert. CA key never leaves node-1 (security fix).
-  // K3s-style bootstrap: token = shared secret, TLS encrypts the channel.
-  rpc JoinCluster(JoinClusterRequest) returns (JoinClusterResponse);
-
   // GetSearchCapabilities returns the search modes available on a zone (Issue #3147).
   // Used by FederatedSearchDispatcher to route queries to zones that can handle them.
   rpc GetSearchCapabilities(GetSearchCapabilitiesRequest) returns (SearchCapabilities);
@@ -121,6 +114,23 @@ service ZoneApiService {
   // Used by follower `try_remote_fetch` / scatter-gather chunk fetch when
   // metadata has been replicated ahead of content.
   rpc ReadBlob(ReadBlobRequest) returns (ReadBlobResponse);
+}
+
+// NodeEnrollmentService is the pre-mTLS BOOTSTRAP plane: the one surface a
+// brand-new node reaches BEFORE it owns a cluster cert. It lives apart from
+// ZoneApiService on purpose — the data plane is strict mTLS (client cert
+// required), which a certless joiner cannot satisfy, so enrollment cannot live
+// there. Runs on its own listener; auth is the join token (k3s/kubeadm model),
+// integrity is the CA fingerprint pinned inside the token, and the channel is
+// carried by the encrypted overlay. Keeping it a dedicated single-RPC service
+// is fail-safe: no data-plane method is even registered on the enroll listener,
+// so nothing can be reached there without mTLS.
+service NodeEnrollmentService {
+  // JoinCluster provisions a new node with cluster TLS certificates. The caller
+  // authenticates with the join token password (k3s/kubeadm "join" model); the
+  // server verifies it, signs a node cert, and returns it with the CA cert. The
+  // CA key never leaves the signing node.
+  rpc JoinCluster(JoinClusterRequest) returns (JoinClusterResponse);
 }
 
 // === Search Capability Advertisement (Issue #3147) ===

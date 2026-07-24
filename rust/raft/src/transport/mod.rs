@@ -61,7 +61,9 @@ pub use client::{
     RemoveVoterResult,
 };
 #[cfg(all(feature = "grpc", has_protos))]
-pub use server::{RaftGrpcServer, RaftWitnessServer, ServerConfig, WitnessZoneRegistry};
+pub use server::{
+    serve_node_enrollment, RaftGrpcServer, RaftWitnessServer, ServerConfig, WitnessZoneRegistry,
+};
 #[cfg(all(feature = "grpc", has_protos))]
 pub use transport_loop::TransportLoop;
 

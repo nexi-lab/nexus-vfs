@@ -80,7 +80,9 @@ pub mod blob_fetcher;
 pub use zone_handle::{Consistency, ZoneHandle};
 
 #[cfg(all(feature = "grpc", has_protos))]
-pub use zone_manager::{ClusterStatus, TlsFiles, ZoneLoadPolicy, ZoneManager};
+pub use zone_manager::{
+    join_cluster_and_provision_tls, ClusterStatus, TlsFiles, ZoneLoadPolicy, ZoneManager,
+};
 
 /// gRPC transport layer (requires `grpc` feature).
 ///
