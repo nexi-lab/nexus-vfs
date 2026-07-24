@@ -169,6 +169,20 @@ struct CommonArgs {
     #[arg(long, env = "NEXUS_PEERS", default_value = "", global = true)]
     peers: String,
 
+    /// Founder-side node-enrollment listener bind, in `host:port` form
+    /// (e.g. an overlay IP `100.64.0.27:2130`).
+    ///
+    /// The pre-mTLS BOOTSTRAP plane: a brand-new node has no cluster cert, so
+    /// it cannot reach the strict-mTLS `--bind-addr`. This starts a dedicated
+    /// PLAINTEXT listener serving ONLY `NodeEnrollmentService.JoinCluster` —
+    /// the founder signs a joiner's cert after verifying its join token
+    /// (`enroll-token`). Auth is the token; integrity is the CA fingerprint the
+    /// joiner pins from the token; the channel rides the encrypted overlay
+    /// (k3s/kubeadm model). Requires TLS on (the founder must own a CA). Unset
+    /// ⇒ this node accepts no enrollments.
+    #[arg(long, env = "NEXUS_ENROLL_LISTEN", global = true)]
+    enroll_listen: Option<String>,
+
     /// Disable TLS — plaintext gRPC for local testing only.
     #[arg(long, env = "NEXUS_NO_TLS", default_value_t = false, global = true)]
     no_tls: bool,
@@ -579,6 +593,32 @@ enum Cmd {
         #[arg(long, default_value_t = 2126)]
         port: u16,
     },
+    /// Mint a join token for enrolling new nodes into THIS cluster (founder).
+    ///
+    /// Ensures this data dir has a cluster CA (bootstraps one if absent),
+    /// mints a fresh token bound to that CA's fingerprint, records the token
+    /// hash so the founder's `--enroll-listen` listener will accept it, and
+    /// prints the token to stdout. Hand the token (out of band) to a new
+    /// node's `enroll`. Run this BEFORE starting the founder with
+    /// `--enroll-listen`. k3s/kubeadm model.
+    EnrollToken {},
+    /// Enroll THIS node into a cluster: obtain a signed mTLS node cert from a
+    /// founder using a join token, so it can then boot into mTLS federation.
+    ///
+    /// The one-time bootstrap a brand-new node runs BEFORE `--peers`
+    /// federation: connects (plaintext, over the encrypted overlay) to the
+    /// founder's `--enroll-listen`, presents the join token, verifies the
+    /// returned CA against the fingerprint pinned in the token, and writes
+    /// `ca.pem`/`node.pem`/`node-key.pem` into `<data-dir>/tls/`. Distinct from
+    /// `join` (which joins a specific ZONE over already-established mTLS).
+    Enroll {
+        /// Founder enrollment endpoint as `host:port` — its `--enroll-listen`
+        /// (e.g. an overlay IP `100.64.0.27:2130`).
+        peer_addr: String,
+        /// Join token minted by the founder's `enroll-token`
+        /// (`K10<pw>::server:SHA256:<ca-fp>`).
+        token: String,
+    },
 }
 
 /// Membership role a new node takes when joining an existing zone.
@@ -683,8 +723,77 @@ pub fn run() -> Result<()> {
                     zone_id,
                     target,
                 }) => run_remove_voter(&peer_addr, &zone_id, target).await,
+                Some(Cmd::EnrollToken {}) => run_enroll_token(&args.common),
+                Some(Cmd::Enroll { peer_addr, token }) => {
+                    // `join_cluster_and_provision_tls` spins its own runtime and
+                    // `block_on`s it, so it must run OFF this async worker or it
+                    // panics with the nested-runtime error. Move it to the
+                    // blocking pool (same shape as offline `auth mint`, #176).
+                    tokio::task::spawn_blocking(move || {
+                        run_enroll(&args.common, &peer_addr, &token)
+                    })
+                    .await
+                    .context("enroll task panicked")?
+                }
             }
         })
+}
+
+/// `enroll-token` — mint a CA-fingerprint-pinned join token (founder side).
+///
+/// Bootstraps this data dir's cluster CA if absent (so the token can be minted
+/// before the founder ever boots — the k3s "set the token, then start" order),
+/// mints a fresh token, records its hash where the `--enroll-listen` listener
+/// reads it, and prints the token to stdout (everything else goes to stderr).
+fn run_enroll_token(common: &CommonArgs) -> Result<()> {
+    let tls_dir = common.data_dir.join("tls");
+    std::fs::create_dir_all(&tls_dir)
+        .with_context(|| format!("create tls dir {}", tls_dir.display()))?;
+    let ca_path = tls_dir.join("ca.pem");
+    let ca_key_path = tls_dir.join("ca-key.pem");
+    if !ca_path.exists() {
+        let (ca_pem, ca_key_pem) = nexus_raft::transport::generate_zone_ca(contracts::ROOT_ZONE_ID)
+            .map_err(|e| anyhow::anyhow!("generate cluster CA: {e}"))?;
+        std::fs::write(&ca_path, &ca_pem)
+            .with_context(|| format!("write {}", ca_path.display()))?;
+        std::fs::write(&ca_key_path, &ca_key_pem)
+            .with_context(|| format!("write {}", ca_key_path.display()))?;
+        tracing::info!(ca = %ca_path.display(), "bootstrapped cluster CA for enrollment");
+    }
+    let ca_pem = std::fs::read(&ca_path).with_context(|| format!("read {}", ca_path.display()))?;
+    let (token, hash) = nexus_raft::transport::generate_join_token(&ca_pem)
+        .map_err(|e| anyhow::anyhow!("mint join token: {e}"))?;
+    std::fs::write(tls_dir.join("join-token-hash"), &hash)
+        .with_context(|| "write join-token-hash")?;
+    // Token is DATA → stdout; guidance → stderr, so a caller can capture just
+    // the token.
+    println!("{token}");
+    eprintln!(
+        "join token minted (pinned to this cluster's CA). Start the founder with \
+         `--enroll-listen <overlay:port>`, then on the new node run:\n  \
+         nexusd-cluster enroll <founder-enroll-addr> <token>"
+    );
+    Ok(())
+}
+
+/// `enroll` — obtain a signed mTLS node cert from a founder (joiner side).
+///
+/// Thin CLI over [`nexus_raft::join_cluster_and_provision_tls`]: presents the
+/// join token to the founder's `--enroll-listen`, verifies the returned CA
+/// against the fingerprint pinned in the token, and writes the bundle into
+/// `<data-dir>/tls/`. After this the node can boot into mTLS federation.
+fn run_enroll(common: &CommonArgs, peer_addr: &str, token: &str) -> Result<()> {
+    let hostname = resolve_hostname(common.hostname.as_deref());
+    let tls_dir = common.data_dir.join("tls");
+    let tls_dir_str = tls_dir.to_str().context("tls dir must be UTF-8")?;
+    nexus_raft::join_cluster_and_provision_tls(peer_addr, token, &hostname, tls_dir_str)
+        .map_err(|e| anyhow::anyhow!("enroll against {peer_addr}: {e}"))?;
+    eprintln!(
+        "enrolled: cluster cert written to {}. This node can now boot into the mTLS \
+         federation — set `--peers <cluster-member>` and start it normally.",
+        tls_dir.display()
+    );
+    Ok(())
 }
 
 /// Operator-facing wrapper around
@@ -1199,6 +1308,51 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
         identity_persisted_peers,
         identity_zones,
     } = open_zone_manager(&common, Some(vfs_routes), ZoneLoadPolicy::All)?;
+
+    // Founder node-enrollment listener (pre-mTLS BOOTSTRAP plane). When
+    // `--enroll-listen` is set and TLS is on, serve `NodeEnrollmentService` on a
+    // dedicated PLAINTEXT bind so a certless new node can obtain a signed cert
+    // with a join token (`enroll-token`). It reads the cluster CA + the accepted
+    // token hash from this node's TLS bundle. Kept OFF the strict-mTLS data-plane
+    // bind on purpose (a certless joiner cannot complete that handshake).
+    if let Some(enroll_addr) = common.enroll_listen.clone() {
+        if common.no_tls {
+            tracing::warn!(
+                "--enroll-listen ignored: enrollment signs mTLS certs but --no-tls is set, so \
+                 this node has no CA to sign with"
+            );
+        } else {
+            let tls_dir = common.data_dir.join("tls");
+            let ca_pem = std::fs::read(tls_dir.join("ca.pem"))
+                .with_context(|| format!("enroll-listen: read {}/ca.pem", tls_dir.display()))?;
+            let ca_key_pem = std::fs::read(tls_dir.join("ca-key.pem"))
+                .with_context(|| format!("enroll-listen: read {}/ca-key.pem", tls_dir.display()))?;
+            let hash_path = tls_dir.join("join-token-hash");
+            let join_token_hash = std::fs::read_to_string(&hash_path).with_context(|| {
+                format!(
+                    "enroll-listen: read {} — mint a token first with `nexusd-cluster enroll-token`",
+                    hash_path.display()
+                )
+            })?;
+            let addr: std::net::SocketAddr = enroll_addr
+                .parse()
+                .map_err(|e| anyhow::anyhow!("--enroll-listen '{enroll_addr}': {e}"))?;
+            zm.runtime_handle().spawn(async move {
+                if let Err(e) = nexus_raft::transport::serve_node_enrollment(
+                    addr,
+                    ca_pem,
+                    ca_key_pem,
+                    join_token_hash.trim().to_string(),
+                    std::future::pending::<()>(),
+                )
+                .await
+                {
+                    tracing::error!(error = %e, "node-enrollment listener terminated");
+                }
+            });
+            tracing::info!(%enroll_addr, "node-enrollment listener starting (plaintext, token-gated)");
+        }
+    }
 
     // Bring root zone online based on declared mode.
     //
