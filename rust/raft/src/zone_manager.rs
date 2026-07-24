@@ -437,19 +437,10 @@ impl ZoneManager {
         let blob_fetcher_slot = crate::blob_fetcher::new_blob_fetcher_slot();
         let mut server = RaftGrpcServer::new(registry.clone(), config)
             .with_blob_fetcher_slot(blob_fetcher_slot.clone());
-        // Configure JoinCluster RPC support if join token + CA key
-        // are available — leader-side TLS signing for new joiners.
-        if let (Some(ref t), Some(ref ca_key_path), Some(ref token_hash)) = (
-            tls.as_ref(),
-            tls.as_ref().and_then(|t| t.ca_key_path.as_ref()),
-            tls.as_ref().and_then(|t| t.join_token_hash.as_ref()),
-        ) {
-            let _ = t; // silence unused warning; selective binding above
-            let ca_key_pem = std::fs::read(ca_key_path).map_err(|e| {
-                RaftError::Config(format!("Failed to read CA key for JoinCluster: {}", e))
-            })?;
-            server = server.with_join_config(ca_key_pem, token_hash.to_string());
-        }
+        // Node enrollment (JoinCluster cert provisioning) is NOT served here —
+        // this bind is strict mTLS, which a certless joiner cannot reach. The
+        // cluster daemon runs it on a separate plaintext listener via
+        // `transport::serve_node_enrollment` when `--enroll-listen` is set.
         if let Some(extra) = extra_grpc_services {
             server = server.with_extra_services(extra);
         }

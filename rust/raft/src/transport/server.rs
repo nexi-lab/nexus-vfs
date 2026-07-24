@@ -5,6 +5,7 @@
 //! a single-zone deployment is simply a registry with one zone.
 
 use super::proto::nexus::raft::{
+    node_enrollment_service_server::{NodeEnrollmentService, NodeEnrollmentServiceServer},
     raft_command::Command as ProtoCommandVariant,
     raft_query::Query as ProtoQueryVariant,
     raft_query_response::Result as ProtoQueryResultVariant,
@@ -74,10 +75,6 @@ impl Default for ServerConfig {
 pub struct RaftGrpcServer {
     config: ServerConfig,
     registry: Arc<ZoneRaftRegistry>,
-    /// CA private key bytes — read once at startup, held in memory for JoinCluster cert signing.
-    ca_key_pem: Option<Vec<u8>>,
-    /// SHA-256 hash of the join token password — for JoinCluster verification.
-    join_token_hash: Option<String>,
     /// Slot the kernel binds a `BlobFetcher` into after its root mount
     /// backend is wired. `None` while the slot is empty —
     /// `ReadBlob` returns `NotFound` until the kernel installs one.
@@ -94,18 +91,9 @@ impl RaftGrpcServer {
         Self {
             config,
             registry,
-            ca_key_pem: None,
-            join_token_hash: None,
             blob_fetcher_slot: None,
             extra_services: None,
         }
-    }
-
-    /// Set cluster join parameters for JoinCluster RPC support.
-    pub fn with_join_config(mut self, ca_key_pem: Vec<u8>, join_token_hash: String) -> Self {
-        self.ca_key_pem = Some(ca_key_pem);
-        self.join_token_hash = Some(join_token_hash);
-        self
     }
 
     /// Attach the late-bindable `BlobFetcher` slot so
@@ -149,9 +137,6 @@ impl RaftGrpcServer {
         };
         let client_service = ZoneApiServiceImpl {
             registry: self.registry.clone(),
-            tls: self.config.tls.clone(),
-            ca_key_pem: self.ca_key_pem.clone(),
-            join_token_hash: self.join_token_hash.clone(),
             blob_fetcher_slot: self.blob_fetcher_slot.clone(),
         };
 
@@ -211,9 +196,6 @@ impl RaftGrpcServer {
         };
         let client_service = ZoneApiServiceImpl {
             registry: self.registry.clone(),
-            tls: self.config.tls.clone(),
-            ca_key_pem: self.ca_key_pem.clone(),
-            join_token_hash: self.join_token_hash.clone(),
             blob_fetcher_slot: self.blob_fetcher_slot.clone(),
         };
 
@@ -694,14 +676,13 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
 // =============================================================================
 
 /// Zone-routed implementation of the ZoneApiService gRPC trait.
+///
+/// This is the strict-mTLS DATA plane. Node enrollment (cert provisioning) is
+/// NOT here — it lives in [`NodeEnrollmentServiceImpl`] on its own pre-mTLS
+/// bootstrap listener, because a certless joiner cannot satisfy the client-cert
+/// requirement this service is served behind.
 struct ZoneApiServiceImpl {
     registry: Arc<ZoneRaftRegistry>,
-    /// TLS config (for CA cert access in JoinCluster handler).
-    tls: Option<super::TlsConfig>,
-    /// CA private key bytes — held in memory for server-side cert signing.
-    ca_key_pem: Option<Vec<u8>>,
-    /// SHA-256 hash of the join token password — for JoinCluster verification.
-    join_token_hash: Option<String>,
     /// Optional late-bound `BlobFetcher` for `ReadBlob`. Empty slot
     /// (or `None` here) → `read_blob` returns `NotFound`.
     blob_fetcher_slot: Option<BlobFetcherSlot>,
@@ -1260,105 +1241,6 @@ impl ZoneApiService for ZoneApiServiceImpl {
         }
     }
 
-    /// Handle a JoinCluster request — TLS certificate provisioning.
-    ///
-    /// Two auth modes:
-    /// Authenticates with join token password (K3s-style).
-    ///
-    /// In both modes, the server signs a node certificate and returns CA + cert + key.
-    /// The CA private key never leaves this process.
-    async fn join_cluster(
-        &self,
-        request: Request<JoinClusterRequest>,
-    ) -> std::result::Result<Response<JoinClusterResponse>, Status> {
-        let req = request.into_inner();
-        let err_resp = |msg: &str| {
-            Response::new(JoinClusterResponse {
-                success: false,
-                error: Some(msg.to_string()),
-                ca_pem: Vec::new(),
-                node_cert_pem: Vec::new(),
-                node_key_pem: Vec::new(),
-            })
-        };
-
-        tracing::info!(
-            peer_node_id = req.node_id,
-            peer_addr = %req.node_address,
-            zone_id = req.zone_id,
-            "JoinCluster request received",
-        );
-
-        // --- Token-based authentication (K3s-style) ---
-        let stored_hash = match &self.join_token_hash {
-            Some(h) => h,
-            None => {
-                return Ok(err_resp(
-                    "This node does not accept join requests (no join token configured)",
-                ));
-            }
-        };
-        let candidate_hash = {
-            use sha2::{Digest, Sha256};
-            use std::fmt::Write;
-            let digest = Sha256::digest(req.password.as_bytes());
-            let mut hex = String::with_capacity(64);
-            for byte in &digest[..] {
-                let _ = write!(hex, "{:02x}", byte);
-            }
-            hex
-        };
-        if candidate_hash != *stored_hash {
-            tracing::warn!(peer_node_id = req.node_id, "JoinCluster: invalid password");
-            return Ok(err_resp("Invalid join token password"));
-        }
-
-        // --- Get CA material (static — set at startup) ---
-        let (ca_pem, ca_key_pem) = match (&self.ca_key_pem, &self.tls) {
-            (Some(ca_key), Some(tls)) => (tls.ca_pem.clone(), ca_key.clone()),
-            _ => {
-                return Ok(err_resp("CA material not configured on this node"));
-            }
-        };
-
-        // --- Sign node certificate ---
-        let zone_id = if req.zone_id.is_empty() {
-            contracts::ROOT_ZONE_ID
-        } else {
-            &req.zone_id
-        };
-        let extra_hostnames = extract_hostnames(&req.node_address);
-        let peer_hostname = extra_hostnames.first().map(|s| s.as_str());
-        let (node_cert_pem, node_key_pem) = match super::certgen::generate_node_cert(
-            req.node_id,
-            zone_id,
-            &ca_pem,
-            &ca_key_pem,
-            &extra_hostnames,
-            peer_hostname,
-        ) {
-            Ok(pair) => pair,
-            Err(e) => {
-                tracing::error!("Failed to generate node cert: {}", e);
-                return Ok(err_resp(&format!("Failed to generate node cert: {}", e)));
-            }
-        };
-
-        tracing::info!(
-            peer_node_id = req.node_id,
-            peer_addr = %req.node_address,
-            "JoinCluster: node certificate signed and provisioned successfully",
-        );
-
-        Ok(Response::new(JoinClusterResponse {
-            success: true,
-            error: None,
-            ca_pem,
-            node_cert_pem,
-            node_key_pem,
-        }))
-    }
-
     /// Return search capabilities for a zone.
     ///
     /// Reads `{base_path}/{zone_id}/search_caps.json` on each RPC.
@@ -1427,6 +1309,156 @@ impl ZoneApiService for ZoneApiServiceImpl {
             })),
         }
     }
+}
+
+// =============================================================================
+// NodeEnrollmentService (pre-mTLS BOOTSTRAP plane: cert provisioning)
+// =============================================================================
+
+/// Token-gated cert provisioning for a brand-new node — the ONLY surface a
+/// certless joiner reaches. Served on its own PLAINTEXT listener
+/// ([`serve_node_enrollment`]), NOT on the strict-mTLS `ZoneApiService`: a
+/// joiner has no client cert yet, so enrollment cannot live behind mTLS. The
+/// join token authenticates the caller; the token also carries the CA
+/// fingerprint (the caller pins it — `join_cluster_and_provision_tls`); the
+/// channel is carried by the encrypted overlay.
+struct NodeEnrollmentServiceImpl {
+    /// Cluster CA cert (PEM) — returned to the joiner (pinned by the token's CA
+    /// fingerprint) and used with `ca_key_pem` to sign its node cert.
+    ca_pem: Option<Vec<u8>>,
+    /// CA private key — held in memory to sign joiner certs; never leaves here.
+    ca_key_pem: Option<Vec<u8>>,
+    /// SHA-256 of the join token password — the enrollment credential.
+    join_token_hash: Option<String>,
+}
+
+#[tonic::async_trait]
+impl NodeEnrollmentService for NodeEnrollmentServiceImpl {
+    /// Provision a joining node: verify the join token, sign a node cert with
+    /// the cluster CA, return CA + cert + key. The CA private key never leaves
+    /// this process.
+    async fn join_cluster(
+        &self,
+        request: Request<JoinClusterRequest>,
+    ) -> std::result::Result<Response<JoinClusterResponse>, Status> {
+        let req = request.into_inner();
+        let err_resp = |msg: &str| {
+            Response::new(JoinClusterResponse {
+                success: false,
+                error: Some(msg.to_string()),
+                ca_pem: Vec::new(),
+                node_cert_pem: Vec::new(),
+                node_key_pem: Vec::new(),
+            })
+        };
+
+        tracing::info!(
+            peer_node_id = req.node_id,
+            peer_addr = %req.node_address,
+            zone_id = req.zone_id,
+            "JoinCluster request received",
+        );
+
+        // --- Token-based authentication (K3s-style) ---
+        let stored_hash = match &self.join_token_hash {
+            Some(h) => h,
+            None => {
+                return Ok(err_resp(
+                    "This node does not accept join requests (no join token configured)",
+                ));
+            }
+        };
+        let candidate_hash = {
+            use sha2::{Digest, Sha256};
+            use std::fmt::Write;
+            let digest = Sha256::digest(req.password.as_bytes());
+            let mut hex = String::with_capacity(64);
+            for byte in &digest[..] {
+                let _ = write!(hex, "{:02x}", byte);
+            }
+            hex
+        };
+        if candidate_hash != *stored_hash {
+            tracing::warn!(peer_node_id = req.node_id, "JoinCluster: invalid password");
+            return Ok(err_resp("Invalid join token password"));
+        }
+
+        // --- Get CA material (static — set at startup) ---
+        let (ca_pem, ca_key_pem) = match (&self.ca_key_pem, &self.ca_pem) {
+            (Some(ca_key), Some(ca_pem)) => (ca_pem.clone(), ca_key.clone()),
+            _ => {
+                return Ok(err_resp("CA material not configured on this node"));
+            }
+        };
+
+        // --- Sign node certificate ---
+        let zone_id = if req.zone_id.is_empty() {
+            contracts::ROOT_ZONE_ID
+        } else {
+            &req.zone_id
+        };
+        let extra_hostnames = extract_hostnames(&req.node_address);
+        let peer_hostname = extra_hostnames.first().map(|s| s.as_str());
+        let (node_cert_pem, node_key_pem) = match super::certgen::generate_node_cert(
+            req.node_id,
+            zone_id,
+            &ca_pem,
+            &ca_key_pem,
+            &extra_hostnames,
+            peer_hostname,
+        ) {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::error!("Failed to generate node cert: {}", e);
+                return Ok(err_resp(&format!("Failed to generate node cert: {}", e)));
+            }
+        };
+
+        tracing::info!(
+            peer_node_id = req.node_id,
+            peer_addr = %req.node_address,
+            "JoinCluster: node certificate signed and provisioned successfully",
+        );
+
+        Ok(Response::new(JoinClusterResponse {
+            success: true,
+            error: None,
+            ca_pem,
+            node_cert_pem,
+            node_key_pem,
+        }))
+    }
+}
+
+/// Serve ONLY [`NodeEnrollmentService`] on `addr` over PLAINTEXT h2c (no TLS),
+/// until `shutdown` fires. The pre-cert bootstrap listener: a certless joiner
+/// cannot complete the mTLS handshake the data-plane bind requires, so
+/// enrollment gets a dedicated plaintext listener carried by the encrypted
+/// overlay. Fail-safe: no data-plane service is registered here, so nothing but
+/// enrollment is reachable without mTLS. Auth is the join token; integrity is
+/// the CA fingerprint the joiner pins from the token.
+pub async fn serve_node_enrollment(
+    addr: SocketAddr,
+    ca_pem: Vec<u8>,
+    ca_key_pem: Vec<u8>,
+    join_token_hash: String,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<()> {
+    let svc = NodeEnrollmentServiceImpl {
+        ca_pem: Some(ca_pem),
+        ca_key_pem: Some(ca_key_pem),
+        join_token_hash: Some(join_token_hash),
+    };
+    tracing::info!(
+        %addr,
+        "node-enrollment listener up (plaintext, token-gated, JoinCluster only)"
+    );
+    lib::transport_primitives::apply_server_limits(tonic::transport::Server::builder())
+        .add_service(NodeEnrollmentServiceServer::new(svc))
+        .serve_with_shutdown(addr, shutdown)
+        .await
+        .map_err(TransportError::Tonic)?;
+    Ok(())
 }
 
 // =============================================================================
