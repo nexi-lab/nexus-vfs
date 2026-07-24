@@ -269,50 +269,71 @@ pub fn bootstrap_tls(
     let node_key_path = tls_dir.join("node-key.pem");
     let join_token_hash_path = tls_dir.join("join-token-hash");
 
-    // Reuse path: every artifact present + non-empty.
-    let bundle_present = ca_path.exists()
-        && ca_key_path.exists()
-        && node_cert_path.exists()
-        && node_key_path.exists()
-        && join_token_hash_path.exists();
-    if bundle_present {
-        let join_token_hash = std::fs::read_to_string(&join_token_hash_path)
-            .map_err(|e| format!("Failed to read join-token-hash: {e}"))?
-            .trim()
-            .to_string();
+    let read_hash = || {
+        std::fs::read_to_string(&join_token_hash_path)
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    };
+
+    // Reuse a ready TLS IDENTITY: ca + node cert + node key. `ca-key.pem` and
+    // `join-token-hash` are FOUNDER-only extras — a node ENROLLED via
+    // NodeEnrollmentService.JoinCluster receives only ca + node + node-key (it
+    // holds no CA key), so they must NOT be required here or the enrolled node
+    // would discard its issued cert and self-sign a fresh (unrelated) CA.
+    if ca_path.exists() && node_cert_path.exists() && node_key_path.exists() {
         return Ok(BootstrapTls {
             ca_path,
             ca_key_path,
             node_cert_path,
             node_key_path,
-            join_token_hash,
+            join_token_hash: read_hash(),
         });
     }
 
     std::fs::create_dir_all(&tls_dir)
         .map_err(|e| format!("Failed to mkdir {}: {}", tls_dir.display(), e))?;
 
-    let (ca_pem, ca_key_pem) = generate_zone_ca(zone_id)?;
-    write_pem(&ca_path, &ca_pem, false)?;
-    write_pem(&ca_key_path, &ca_key_pem, true)?;
+    // Reuse an existing cluster CA if present (e.g. minted by `enroll-token`
+    // before first boot) — signing this node's cert with the SAME CA keeps its
+    // identity chained to the CA that outstanding join tokens pin. Otherwise
+    // generate a fresh CA (the very first founder boot).
+    let (ca_pem, ca_key_pem) = if ca_path.exists() && ca_key_path.exists() {
+        let ca_pem =
+            std::fs::read(&ca_path).map_err(|e| format!("Failed to read existing CA: {e}"))?;
+        let ca_key_pem = std::fs::read(&ca_key_path)
+            .map_err(|e| format!("Failed to read existing CA key: {e}"))?;
+        (ca_pem, ca_key_pem)
+    } else {
+        let (ca_pem, ca_key_pem) = generate_zone_ca(zone_id)?;
+        write_pem(&ca_path, &ca_pem, false)?;
+        write_pem(&ca_key_path, &ca_key_pem, true)?;
+        (ca_pem, ca_key_pem)
+    };
 
     let (node_cert_pem, node_key_pem) =
         generate_node_cert(node_id, zone_id, &ca_pem, &ca_key_pem, &[], Some(hostname))?;
     write_pem(&node_cert_path, &node_cert_pem, false)?;
     write_pem(&node_key_path, &node_key_pem, true)?;
 
-    let (token, hash) = generate_join_token(&ca_pem)?;
-    std::fs::write(tls_dir.join("join-token"), &token)
-        .map_err(|e| format!("Failed to write join-token: {e}"))?;
-    std::fs::write(&join_token_hash_path, &hash)
-        .map_err(|e| format!("Failed to write join-token-hash: {e}"))?;
+    // Ensure a join-token-hash exists so this founder can accept enrollments —
+    // reuse an `enroll-token`-minted one if present, else mint the day-1 token.
+    let join_token_hash = if join_token_hash_path.exists() {
+        read_hash()
+    } else {
+        let (token, hash) = generate_join_token(&ca_pem)?;
+        std::fs::write(tls_dir.join("join-token"), &token)
+            .map_err(|e| format!("Failed to write join-token: {e}"))?;
+        std::fs::write(&join_token_hash_path, &hash)
+            .map_err(|e| format!("Failed to write join-token-hash: {e}"))?;
+        hash
+    };
 
     Ok(BootstrapTls {
         ca_path,
         ca_key_path,
         node_cert_path,
         node_key_path,
-        join_token_hash: hash,
+        join_token_hash,
     })
 }
 
