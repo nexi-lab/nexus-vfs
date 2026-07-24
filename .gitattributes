@@ -1,0 +1,6 @@
+# All Rust sources are LF. Without this, a Windows checkout under
+# `core.autocrlf=true` rewrites whole files to CRLF on commit — polluting
+# diffs + blame with thousands of phantom line changes. That is exactly how
+# CRLF slipped into three `raft` sources via PR #178. Enforcing eol=lf here
+# makes it impossible regardless of a contributor's local git config.
+*.rs text eol=lf
