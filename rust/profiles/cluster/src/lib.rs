@@ -1357,78 +1357,35 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
             as_learner_per_zone,
             mounts,
         } => {
-            // Matrix rows 3 + 4 — see `plan_boot_action` docstring.
-            // Joiner path.  Phase A: `zones` list
-            // is empty (rows 3/4 require NEXUS_FEDERATION_ZONES unset).
-            // Empty case is a log-only no-op — the daemon comes up
-            // with root bootstrapped + transport peer_map seeded (via
-            // open_zone_manager's merged-peers path), and zone-level
-            // joining continues through the offline `nexusd-cluster
-            // join` sidecar.  Phase B populates `zones` from
-            // identity.zones so this branch auto-reconnects.
-            let (zones, as_learner_per_zone, mounts) = if zones.is_empty() && !peers.is_empty() {
-                // S3 Phase D: fresh joiner with `--peers` but no
-                // identity.zones snapshot yet.  Ask each peer to
-                // report its local federation topology via
-                // `DiscoverZones` and merge into the auto-join set.
-                // First peer to respond with a non-empty list wins —
-                // subsequent peers' responses are unioned so a
-                // partially-configured founder pair (each half
-                // exposing a disjoint zone) still discovers both.
-                let mut discovered_mounts: std::collections::BTreeMap<String, String> =
-                    std::collections::BTreeMap::new();
-                let mut discovered_zone_order: Vec<String> = Vec::new();
-                for peer in &peers {
-                    match nexus_raft::transport::call_discover_zones_rpc(
-                        &peer.endpoint,
-                        zm.registry().tls_config(),
-                        /* timeout */ 10,
-                    )
-                    .await
-                    {
-                        Ok(entries) => {
-                            tracing::info!(
-                                peer = %peer.endpoint,
-                                discovered = entries.len(),
-                                "DiscoverZones: peer reported federation zones",
-                            );
-                            for entry in entries {
-                                // Preserve first-response order for
-                                // downstream `join_zones_for_boot`
-                                // (BTreeMap sorts by path anyway, but
-                                // the zones list order matters for
-                                // per-zone JoinZone dispatch).
-                                if !discovered_mounts.contains_key(&entry.mount_path) {
-                                    discovered_zone_order.push(entry.zone_id.clone());
-                                }
-                                discovered_mounts.insert(entry.mount_path, entry.zone_id);
-                            }
-                        }
-                        Err(e) => tracing::warn!(
-                            peer = %peer.endpoint,
-                            error = %e,
-                            "DiscoverZones: peer unreachable — trying next",
-                        ),
-                    }
-                }
-                // Phase H: fresh joiner via DiscoverZones has no
-                // prior role signal — default all-voter, matching the
-                // pre-Phase-H hardcoded behaviour.  Operators who
-                // need learner-first fresh joins use the offline
-                // `nexusd-cluster join --as learner` sidecar.
-                let learners = vec![false; discovered_zone_order.len()];
-                (discovered_zone_order, learners, discovered_mounts)
-            } else {
-                (zones, as_learner_per_zone, mounts)
-            };
+            // Matrix rows 3 + 4 — see `plan_boot_action` docstring.  Joiner
+            // path, two sub-cases:
+            //   (A) `zones` empty (no identity.zones snapshot yet) →
+            //       re-derive the topology from `--peers` via
+            //       `reconcile_federation_from_peers` (DiscoverZones).  The
+            //       empty/empty case (no zones, no peers) falls out as a
+            //       reconciled=0 log-only no-op: the daemon comes up
+            //       rootless-with-peers and zone joining continues via the
+            //       offline `nexusd-cluster join` sidecar or a later
+            //       ConfChange apply that populates identity.zones.
+            //   (B) `zones` came from identity.zones (Phase B reconnect) →
+            //       join those directly.
             if zones.is_empty() {
-                tracing::info!(
-                    cli_peer_count = peers.len(),
-                    "boot joiner: no federation zones auto-declared and none \
-                     reported by peers; daemon up rootless-with-peers. Use \
-                     `nexusd-cluster join` sidecar for zone-specific joining, \
-                     or wait for a ConfChange apply to populate identity.zones.",
-                );
+                let reconciled = reconcile_federation_from_peers(
+                    zm.clone(),
+                    node_id,
+                    self_address.clone(),
+                    common.data_dir.clone(),
+                    peers,
+                )
+                .await?;
+                if reconciled == 0 {
+                    tracing::info!(
+                        "boot joiner: no federation zones auto-declared and none \
+                         reported by peers; daemon up rootless-with-peers. Use \
+                         `nexusd-cluster join` sidecar for zone-specific joining, \
+                         or wait for a ConfChange apply to populate identity.zones.",
+                    );
+                }
             } else {
                 // Phase B row 4: `zones` came from identity.zones.  When CLI
                 // --peers was not passed on this boot the daemon still needs
@@ -1476,15 +1433,59 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
         }
         nexus_raft::bootstrap::BootAction::Resume => {
             // Row 0 (Phase G) — see `plan_boot_action` docstring.
-            // `data_dir_has_root=true` dominates: root was resumed
-            // above via `bootstrap_or_join_zone` Branch 1, and every
-            // zone with persisted redb state rehydrates on its own.
-            // env-declared federation zones are advisory; ConfState
-            // on disk is authoritative.  Nothing else to do here.
+            // `data_dir_has_root=true` dominates: root was resumed above via
+            // `bootstrap_or_join_zone` Branch 1, and every zone with persisted
+            // redb state rehydrates on its own.  raft ConfState on disk is
+            // authoritative for zone MEMBERSHIP.
+            //
+            // But a federation MOUNT (`/agents -> sharedzone`) is NOT raft
+            // state — it is LOCAL DERIVED state cached from a peer's
+            // `DiscoverZones` topology (the SSOT).  A joiner dropped mid-join
+            // (after "Zone registered" but before `mount_async` persisted the
+            // DT_MOUNT into its solo root) resumes with the zone fully
+            // replicated yet the mount MISSING → `/agents/*` unroutable.  So
+            // re-derive federation mounts from peers on every boot — the
+            // `mount -a` model — idempotently (see
+            // `reconcile_federation_from_peers`).  Peer precedence mirrors the
+            // Join branch: CLI --peers → identity.peers → identity.zones[].members.
+            let use_tls = !common.no_tls;
+            let mut seed: Vec<String> = if !cli_peer_addrs.is_empty() {
+                cli_peer_addrs
+                    .iter()
+                    .map(NodeAddress::to_operator_str)
+                    .collect()
+            } else {
+                identity_persisted_peers.clone()
+            };
+            if seed.is_empty() {
+                for z in &identity_zones {
+                    for m in &z.members {
+                        if !seed.iter().any(|s| s == m) {
+                            seed.push(m.clone());
+                        }
+                    }
+                }
+            }
+            let resume_peers = if seed.is_empty() {
+                Vec::new()
+            } else {
+                let parsed = NodeAddress::parse_peer_list_operator(&seed.join(","), use_tls)
+                    .map_err(|e| anyhow::anyhow!("resume peers reparse: {}", e))?;
+                peers_excluding_self(&parsed, &self_address)
+            };
+            let reconciled = reconcile_federation_from_peers(
+                zm.clone(),
+                node_id,
+                self_address.clone(),
+                common.data_dir.clone(),
+                resume_peers,
+            )
+            .await?;
             tracing::info!(
                 fed_zones_env = ?fed.zones,
                 fed_mounts_env_count = fed.mounts.mounts.len(),
-                "boot resumed from disk — federation env vars advisory only",
+                reconciled_zones = reconciled,
+                "boot resumed from disk — federation mounts reconciled from peers (mount -a model)",
             );
         }
         nexus_raft::bootstrap::BootAction::FailLoud { reason, hint } => {
@@ -1507,15 +1508,31 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     // would carry no `last_writer_address`, and ReadBlob would have
     // nothing to serve.  Held until shutdown so the apply-cb closures +
     // their Arc clones see a stable provider lifetime.
+    // ONE trust anchor for every outbound cluster-mTLS peer client.
+    //
+    // Both the federation fan-out (`FederationClient`) and the blob fetch
+    // (`PeerBlobClient`) ride the cluster's raft-port mTLS: a fan-out RPC sends
+    // an empty `auth_token`, so the ONLY thing that authenticates it is this
+    // node cert (the peer plane), and `ReadBlob` is co-located on the same
+    // `ZoneApiService`. A client left without this cert material dials the peer
+    // in plaintext and the mTLS server closes the connection. Read the SSOT
+    // (the zone registry's resolved TLS) ONCE here and arm every such client
+    // from it, so a new peer client is wired in one obvious place instead of
+    // each site remembering its own `install_tls`. `None` under `--no-tls`
+    // correctly leaves the clients plaintext.
+    let cluster_tls = zm.registry().tls_config();
+
     // Outbound federation-peer typed-RPC client.  Constructed BEFORE
     // the coordinator so it can be passed in via `install_with_kernel`
     // as the grpc_ops arc — single install hook for federation
     // peer dispatch.  Without this the coordinator's `peer_*` impls
     // surface every cross-node dispatch as a silent miss via the
     // PR #94 observability warn-loud path (`grpc_ops not installed`).
-    let federation_client: Arc<dyn kernel::federation::grpc_ops::FederationGrpcOps> = Arc::new(
-        transport::federation::FederationClient::new(Arc::clone(kernel.runtime()), None),
-    );
+    let federation_client: Arc<dyn kernel::federation::grpc_ops::FederationGrpcOps> =
+        Arc::new(transport::federation::FederationClient::new(
+            Arc::clone(kernel.runtime()),
+            cluster_tls.clone(),
+        ));
 
     // Construct the provider as `Arc<RaftDistributedCoordinator>` so
     // `install_with_kernel` can clone it into the kernel's coordinator
@@ -1537,6 +1554,15 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     // from origin nodes on local-backend misses.  Sits above raft in
     // the dep graph; kept out of `install_with_kernel` for that reason.
     transport::peer_blob::install(kernel.as_ref());
+    // Arm the blob client from the same `cluster_tls` SSOT read above (see the
+    // "ONE trust anchor" note) — `ReadBlob` over mTLS otherwise dials plaintext
+    // and the server closes the connection.
+    if let Some(tls) = &cluster_tls {
+        kernel
+            .peer_client_arc()
+            .install_tls(&tls.ca_pem, Some(&tls.cert_pem), Some(&tls.key_pem));
+        tracing::info!("peer-blob client armed with cluster mTLS (ReadBlob over TLS)");
+    }
 
     // Auth-key store (Control-Plane HAL §3.B.3) + the cache eviction that
     // makes a revocation take effect without waiting out a TTL.
@@ -2039,6 +2065,98 @@ async fn run_share(
         println!("Mounted zone '{new_zone_id}' at '{mount_path}' in parent zone '{parent_zone}'");
     }
     Ok(())
+}
+
+/// Re-derive this joiner's federation topology from its peers and (re)wire it,
+/// idempotently.  Returns the number of zones reconciled (0 when no peer
+/// reported any topology — e.g. all peers unreachable at boot, or `peers`
+/// empty).
+///
+/// A federation mount (`/agents -> sharedzone`) is NOT raft state — it is
+/// LOCAL DERIVED state cached from a peer's `DiscoverZones` topology (the
+/// SSOT), persisted only as a convenience into this node's per-node SOLO root.
+/// So, exactly like `mount -a` re-reading `/etc/fstab` on every boot, it must
+/// be re-established every boot from the SSOT rather than trusted from disk.
+/// A joiner dropped mid-join — after "Zone registered" but before
+/// `join_zones_for_boot`'s `mount_async` persisted the DT_MOUNT — otherwise
+/// resumes with the zone fully replicated yet the mount MISSING, leaving
+/// `/agents/*` permanently unroutable because `BootAction::Resume` treats the
+/// on-disk state as complete.  This is the shared re-derivation the fresh
+/// `Join` branch and `Resume` both call.
+///
+/// Safe to re-run (idempotent): `bootstrap_or_join_zone` short-circuits a
+/// zone already loaded from persisted storage (no ConfChange, no membership
+/// perturbation — raft §4), and `mount_async` is get-before-put idempotent, so
+/// on the happy path re-running is a cheap no-op and on the interrupted-join
+/// path it self-heals.
+async fn reconcile_federation_from_peers(
+    zm: Arc<ZoneManager>,
+    node_id: u64,
+    self_address: String,
+    data_dir: PathBuf,
+    peers: Vec<NodeAddress>,
+) -> Result<usize> {
+    if peers.is_empty() {
+        return Ok(0);
+    }
+    // Ask each peer to report its local federation topology via
+    // `DiscoverZones` and union the results — a partially-configured founder
+    // pair (each half exposing a disjoint zone) still discovers both.  The
+    // BTreeMap sorts by path; `discovered_zone_order` preserves first-response
+    // order for per-zone JoinZone dispatch.
+    let mut discovered_mounts: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    let mut discovered_zone_order: Vec<String> = Vec::new();
+    for peer in &peers {
+        match nexus_raft::transport::call_discover_zones_rpc(
+            &peer.endpoint,
+            zm.registry().tls_config(),
+            /* timeout */ 10,
+        )
+        .await
+        {
+            Ok(entries) => {
+                tracing::info!(
+                    peer = %peer.endpoint,
+                    discovered = entries.len(),
+                    "DiscoverZones: peer reported federation zones",
+                );
+                for entry in entries {
+                    if !discovered_mounts.contains_key(&entry.mount_path) {
+                        discovered_zone_order.push(entry.zone_id.clone());
+                    }
+                    discovered_mounts.insert(entry.mount_path, entry.zone_id);
+                }
+            }
+            Err(e) => tracing::warn!(
+                peer = %peer.endpoint,
+                error = %e,
+                "DiscoverZones: peer unreachable — trying next",
+            ),
+        }
+    }
+    if discovered_zone_order.is_empty() {
+        return Ok(0);
+    }
+    // Phase H: fresh joiner via DiscoverZones has no prior role signal —
+    // default all-voter, matching the pre-Phase-H hardcoded behaviour.
+    // Operators who need learner-first fresh joins use the offline
+    // `nexusd-cluster join --as learner` sidecar.
+    let learners = vec![false; discovered_zone_order.len()];
+    let reconciled = discovered_zone_order.len();
+    join_zones_for_boot(
+        zm,
+        node_id,
+        self_address,
+        peers,
+        contracts::ROOT_ZONE_ID.to_string(),
+        data_dir,
+        discovered_zone_order,
+        discovered_mounts,
+        learners,
+    )
+    .await?;
+    Ok(reconciled)
 }
 
 /// Boot-time joiner primitive shared by the offline `join` sidecar
