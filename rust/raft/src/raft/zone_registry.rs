@@ -392,36 +392,9 @@ impl ZoneRaftRegistry {
                 continue;
             }
             let zone_id = entry.file_name().to_string_lossy().into_owned();
-
-            // A tombstone means the prior run started removing this
-            // zone but died before `destroy()`. Finish the cleanup rather
-            // than resurrecting a zombie zone that would send raft messages
-            // to peers who (correctly) return NotFound.
-            if ZonePersistence::has_tombstone(&self.base_path, &zone_id) {
-                if let Err(e) = ZonePersistence::cleanup_tombstoned(&self.base_path, &zone_id) {
-                    tracing::warn!(
-                        zone = %zone_id,
-                        error = %e,
-                        "Failed to clean up tombstoned zone dir at startup",
-                    );
-                } else {
-                    tracing::info!(
-                        zone = %zone_id,
-                        "Cleaned up tombstoned zone dir at startup",
-                    );
-                }
-                continue;
+            if self.open_persisted_zone_if_present(&zone_id, peers.clone(), runtime_handle)? {
+                count += 1;
             }
-
-            // Existence check: if `{zone}/raft/` doesn't exist, this dir
-            // wasn't a persisted zone — skip. Matches the pattern used by
-            // RaftStorage::open (which creates this subdir).
-            let raft_dir = entry.path().join("raft");
-            if !raft_dir.exists() {
-                continue;
-            }
-            self.open_persisted_zone(&zone_id, peers.clone(), runtime_handle)?;
-            count += 1;
         }
 
         // Invariant: post-enumeration, the in-memory zone count must
@@ -435,6 +408,66 @@ impl ZoneRaftRegistry {
             self.zones.len(),
             count,
         );
+        Ok(count)
+    }
+
+    /// Open a single persisted zone by id IF present + resumable on disk.
+    /// `Ok(true)` = opened, `Ok(false)` = skipped (tombstoned, or no
+    /// `{zone}/raft/` dir). Shared by `open_existing_zones_from_disk`
+    /// (enumerate-all) and `open_persisted_zones_filtered` (offline root-only)
+    /// so both apply the identical tombstone-cleanup + existence checks.
+    fn open_persisted_zone_if_present(
+        &self,
+        zone_id: &str,
+        peers: Vec<NodeAddress>,
+        runtime_handle: &tokio::runtime::Handle,
+    ) -> Result<bool, TransportError> {
+        // A tombstone means the prior run started removing this zone but died
+        // before `destroy()`. Finish the cleanup rather than resurrecting a
+        // zombie zone that would send raft messages to peers who (correctly)
+        // return NotFound.
+        if ZonePersistence::has_tombstone(&self.base_path, zone_id) {
+            if let Err(e) = ZonePersistence::cleanup_tombstoned(&self.base_path, zone_id) {
+                tracing::warn!(
+                    zone = %zone_id,
+                    error = %e,
+                    "Failed to clean up tombstoned zone dir at startup",
+                );
+            } else {
+                tracing::info!(zone = %zone_id, "Cleaned up tombstoned zone dir at startup");
+            }
+            return Ok(false);
+        }
+        // Existence check: if `{zone}/raft/` doesn't exist, this isn't a
+        // persisted zone — skip. Matches the pattern used by RaftStorage::open
+        // (which creates this subdir).
+        if !self.base_path.join(zone_id).join("raft").exists() {
+            return Ok(false);
+        }
+        self.open_persisted_zone(zone_id, peers, runtime_handle)?;
+        Ok(true)
+    }
+
+    /// Rehydrate ONLY the named zones (those present + resumable on disk),
+    /// skipping every other persisted zone. Backs `ZoneLoadPolicy::Only` so
+    /// offline tooling opens just `root` and never spins up a federated zone as
+    /// a lone node (which would campaign and mutate its persisted term/vote).
+    /// Returns the number actually opened.
+    pub fn open_persisted_zones_filtered(
+        &self,
+        zone_ids: &[String],
+        peers: Vec<NodeAddress>,
+        runtime_handle: &tokio::runtime::Handle,
+    ) -> Result<usize, TransportError> {
+        if !self.base_path.exists() {
+            return Ok(0);
+        }
+        let mut count: usize = 0;
+        for zone_id in zone_ids {
+            if self.open_persisted_zone_if_present(zone_id, peers.clone(), runtime_handle)? {
+                count += 1;
+            }
+        }
         Ok(count)
     }
 
@@ -1108,6 +1141,41 @@ mod tests {
         assert_eq!(first, 1);
         assert_eq!(second, 1);
         assert_eq!(reg2.list_zones().len(), 1);
+
+        reg2.shutdown_all();
+        await_shutdown_cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn open_persisted_zones_filtered_opens_only_named() {
+        // ZoneLoadPolicy::Only backing: with two zones persisted, a filtered
+        // open of just "root" must rehydrate root and leave the federated zone
+        // untouched (offline tooling must not spin up federated raft).
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().to_path_buf();
+        let reg = ZoneRaftRegistry::new(base.clone(), 1);
+        reg.create_zone("root", vec![], &tokio::runtime::Handle::current())
+            .unwrap();
+        reg.create_zone("sharedzone", vec![], &tokio::runtime::Handle::current())
+            .unwrap();
+        reg.shutdown_all();
+        drop(reg);
+        await_shutdown_cleanup().await;
+
+        let reg2 = ZoneRaftRegistry::new(base, 1);
+        let n = reg2
+            .open_persisted_zones_filtered(
+                &["root".to_string()],
+                vec![],
+                &tokio::runtime::Handle::current(),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "only root should open");
+        assert_eq!(reg2.list_zones(), vec!["root".to_string()]);
+        assert!(
+            reg2.get_node("sharedzone").is_none(),
+            "the federated zone must NOT be opened by a root-only filter",
+        );
 
         reg2.shutdown_all();
         await_shutdown_cleanup().await;
