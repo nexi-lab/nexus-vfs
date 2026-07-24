@@ -20,10 +20,11 @@ mod common;
 
 use std::time::Duration;
 
-use common::{await_replicated, free_port, Daemon, Vfs, LOG_FILTER};
+use common::{await_replicated, cli, free_port, Daemon, Vfs, LOG_FILTER};
 
 const ZONE: &str = "sharedzone";
 const MOUNT: &str = "/agents";
+const MINT_SECRET: &str = "joiner-restart-probe-secret";
 const BUDGET: Duration = Duration::from_secs(90);
 
 fn founder_env<'a>(
@@ -61,10 +62,14 @@ fn joiner_env<'a>(
     ]
 }
 
-/// Boot a 2-node federation, verify baseline replication, restart the joiner,
+/// Boot a 2-node federation, verify baseline replication, restart the joiner
+/// (optionally running an offline `auth mint` on its data dir while stopped),
 /// and return whether the founder's post-restart write reaches AND resolves on
 /// the joiner (deep read path) — plus read-path evidence for diagnosis.
-async fn replication_survives_restart(confirm_baseline: bool) -> (bool, String) {
+async fn replication_survives_restart(
+    offline_auth_between: bool,
+    confirm_baseline: bool,
+) -> (bool, String) {
     let zone_registered = format!("Zone '{ZONE}' registered");
     let tmp = tempfile::tempdir().expect("tempdir");
     let fport = free_port();
@@ -110,10 +115,40 @@ async fn replication_survives_restart(confirm_baseline: bool) -> (bool, String) 
         await_replicated(&mut jc, &before, "", BUDGET).await;
     }
 
-    // Restart the joiner.
+    // Restart the joiner (optionally with an offline mint between).
     drop(jc);
     drop(joiner);
     tokio::time::sleep(Duration::from_secs(1)).await;
+
+    if offline_auth_between {
+        // Mint an agent key on the STOPPED joiner's data dir — the live
+        // boot->stop->mint->restart dance. The mint must open ONLY root; if it
+        // loaded the federated sharedzone it would campaign as a lone node and
+        // mutate its term/vote, so the restarted joiner would resume diverged
+        // and the founder would lose quorum (`raft: proposal dropped`). This
+        // asserts the mint does NOT perturb federated replication.
+        let mint_env = vec![
+            ("NEXUS_DATA_DIR", jdata.as_str()),
+            ("NEXUS_IDENTITY_DIR", jid.as_str()),
+            ("NEXUS_API_KEY_SECRET", MINT_SECRET),
+        ];
+        let (ok, _o, e) = cli(
+            &mint_env,
+            &[
+                "auth",
+                "mint",
+                "--subject-type",
+                "agent",
+                "--subject-id",
+                "probe",
+                "--zone",
+                "sharedzone:rw",
+                "--name",
+                "probe",
+            ],
+        );
+        assert!(ok, "offline mint failed: {e}");
+    }
 
     let mut joiner = Daemon::spawn(
         &["--bind-addr", &jadv],
@@ -164,10 +199,28 @@ async fn replication_survives_restart(confirm_baseline: bool) -> (bool, String) 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn replication_survives_a_plain_joiner_restart() {
-    let (ok, tail) = replication_survives_restart(true).await;
+    let (ok, tail) = replication_survives_restart(false, true).await;
     assert!(
         ok,
         "plain restart lost replication.\n--- restarted joiner tail ---\n{tail}"
+    );
+}
+
+/// Regression for the offline-mint corruption: an `auth mint` run on the
+/// STOPPED joiner's data dir (the boot->stop->mint->restart dance) must NOT
+/// break federation replication. Before the root-only fix the mint loaded the
+/// full ZoneManager — federated `sharedzone` included — and campaigned as a
+/// lone node, mutating its persisted term/vote; the joiner then resumed
+/// diverged and the founder's post-restart write hit `raft: proposal dropped`
+/// (timing-flaky: surfaced on Linux CI, not Windows). The fix opens root-only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replication_survives_a_joiner_restart_with_offline_auth_between() {
+    let (ok, tail) = replication_survives_restart(true, true).await;
+    assert!(
+        ok,
+        "replication BROKE when the joiner ran an offline `auth mint` between stop and \
+         restart — the mint must open root-only, not spin up the federated zone.\n\
+         --- restarted joiner tail ---\n{tail}"
     );
 }
 
@@ -179,7 +232,7 @@ async fn replication_survives_a_plain_joiner_restart() {
 /// mounts from peers on every Resume (the `mount -a` model).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn replication_survives_a_joiner_dropped_before_the_mount_is_durable() {
-    let (ok, evidence) = replication_survives_restart(false).await;
+    let (ok, evidence) = replication_survives_restart(false, false).await;
     assert!(
         ok,
         "a joiner dropped mid-join (before its `/agents → sharedzone` mount was durable) came \
