@@ -38,7 +38,7 @@ use nexus_raft::distributed_coordinator::{
 };
 use nexus_raft::federation::{parse_federation_env, ENV_FEDERATION_MOUNTS, ENV_FEDERATION_ZONES};
 use nexus_raft::transport::{bootstrap_tls, NodeAddress};
-use nexus_raft::{TlsFiles, ZoneManager};
+use nexus_raft::{TlsFiles, ZoneLoadPolicy, ZoneManager};
 
 const DEFAULT_BIND: &str = "0.0.0.0:2126";
 const TOPOLOGY_TICK: Duration = Duration::from_secs(10);
@@ -806,6 +806,7 @@ struct ZoneManagerBundle {
 fn open_zone_manager(
     common: &CommonArgs,
     extra_grpc_services: Option<tonic::service::Routes>,
+    load_policy: ZoneLoadPolicy,
 ) -> Result<ZoneManagerBundle> {
     std::fs::create_dir_all(&common.data_dir)
         .with_context(|| format!("create data dir {}", common.data_dir.display()))?;
@@ -945,7 +946,7 @@ fn open_zone_manager(
         .map(NodeAddress::to_raft_peer_str)
         .collect();
 
-    let zm = ZoneManager::with_node_id(
+    let zm = ZoneManager::with_node_id_opts(
         &hostname,
         node_id,
         &zones_dir,
@@ -954,6 +955,7 @@ fn open_zone_manager(
         tls,
         Some(self_address.clone()),
         extra_grpc_services,
+        load_policy,
     )
     .map_err(|e| anyhow::anyhow!("ZoneManager::with_node_id: {}", e))?;
 
@@ -1196,7 +1198,7 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
         cli_peer_addrs,
         identity_persisted_peers,
         identity_zones,
-    } = open_zone_manager(&common, Some(vfs_routes))?;
+    } = open_zone_manager(&common, Some(vfs_routes), ZoneLoadPolicy::All)?;
 
     // Bring root zone online based on declared mode.
     //
@@ -2023,7 +2025,7 @@ async fn run_share(
 ) -> Result<()> {
     let ZoneManagerBundle {
         zm, cli_peer_addrs, ..
-    } = open_zone_manager(&common, None)?;
+    } = open_zone_manager(&common, None, ZoneLoadPolicy::All)?;
     let peers_str: Vec<String> = cli_peer_addrs
         .iter()
         .map(NodeAddress::to_raft_peer_str)
@@ -2290,7 +2292,7 @@ async fn run_join(
         node_id,
         self_address,
         ..
-    } = open_zone_manager(&common, None)?;
+    } = open_zone_manager(&common, None, ZoneLoadPolicy::All)?;
 
     // Pre-#3996 (and pre-this commit) ``run_join`` only invoked
     // ``zm.join_zone(remote_zone_id, peers, false)`` — that registers
@@ -2863,10 +2865,23 @@ fn open_auth_store(
         )
     })?;
 
+    // Open ONLY the root zone. The credential store (`TREE_AUTH_KEYS`) lives in
+    // root, and root is SOLO — so loading it is all the mint needs. Loading the
+    // FEDERATED zones here would spin each up as a lone node with no reachable
+    // peers (the daemon is stopped); that node campaigns and mutates the zone's
+    // persisted term/vote, so the real daemon resumes DIVERGED and the founder
+    // loses quorum (`raft: proposal dropped`). Root-only keeps offline tooling
+    // out of federated raft entirely. See `ZoneLoadPolicy`.
+    //
     // Offline tooling cannot open the data dir while the daemon holds its
     // exclusive redb lock — by far the dominant failure here — so name that
     // cause up front rather than leaking a raw redb/OS error.
-    let ZoneManagerBundle { zm, .. } = open_zone_manager(common, None).context(
+    let ZoneManagerBundle { zm, .. } = open_zone_manager(
+        common,
+        None,
+        ZoneLoadPolicy::Only(vec![contracts::ROOT_ZONE_ID.to_string()]),
+    )
+    .context(
         "offline `auth` could not open the data dir; if the daemon is running, \
          stop it first (it holds an exclusive lock)",
     )?;
