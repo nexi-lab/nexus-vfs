@@ -1828,6 +1828,42 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
                     .map_err(|e| anyhow::anyhow!("resume peers reparse: {}", e))?;
                 peers_excluding_self(&parsed, &self_address)
             };
+            // ── Founder's OWN declared topology — re-assert ONLY when peerless ──
+            // `--cluster-init` zones + `--cluster-init-mount` mounts declare a
+            // founder's OWN intent.  Re-asserting them on Resume is load-bearing
+            // because `plan_boot_action` returns `Resume` whenever `root` is
+            // already on disk (e.g. an offline `auth mint` created it before the
+            // first daemon boot), SKIPPING the `StaticFounder` arm — so otherwise
+            // the declared zone is never founded and `/agents/*` silently falls
+            // back to node-local root (an A2A mailbox there binds root and never
+            // replicates cross-machine).
+            //
+            // BUT re-founding must NOT assume "this node is always the founder":
+            // a founder can go offline while its voter joiners keep the zone
+            // alive (normal in a multi-party cluster), and on return it must
+            // REJOIN — never re-found a SOLO zone of the same name, which would
+            // split-brain against the survivors (raft §4).  Two guards keep this
+            // safe: (1) gate on `resume_peers.is_empty()` — if this node knows
+            // ANY peer/member (CLI --peers / identity.peers / identity.zones[]
+            // .members), the zone lives on them, so the
+            // `reconcile_federation_from_peers` call below REJOINS it and we skip
+            // founding here; (2) even when peerless, `bootstrap_static` skips any
+            // zone already on disk, so a normal restart only re-stages the
+            // (idempotent) mount and never re-founds.  Net: a SOLO re-found
+            // happens ONLY for a genuinely peerless founder whose declared zone
+            // was never persisted — exactly the mint-before-boot bug.  Reuses the
+            // SAME `bootstrap_static_async` as the `StaticFounder` arm (DRY: one
+            // founding path, the two boot arms cannot diverge).
+            if founder_declared && resume_peers.is_empty() {
+                zm.bootstrap_static_async(
+                    init_zones.clone(),
+                    Vec::new(),
+                    init_mounts.mounts.clone(),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("resume re-assert founder topology: {}", e))?;
+            }
+
             let reconciled = reconcile_federation_from_peers(
                 zm.clone(),
                 node_id,
@@ -1838,9 +1874,11 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
             .await?;
             tracing::info!(
                 cluster_init_zones = ?init_zones,
-                cluster_init_mount_count = init_mounts.mounts.len(),
+                own_topology_reasserted = founder_declared,
                 reconciled_zones = reconciled,
-                "boot resumed from disk — federation mounts reconciled from peers (mount -a model)",
+                "boot resumed from disk — re-asserted founder's own declared \
+                 topology (fstab model, peer-independent) + reconciled \
+                 peer-reported zones",
             );
         }
         nexus_raft::bootstrap::BootAction::FailLoud { reason, hint } => {
