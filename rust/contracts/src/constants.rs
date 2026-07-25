@@ -36,9 +36,16 @@
 /// **cross-machine A2A mailbox** (`*/chat-with-me` **not** under `/proc/`)
 /// must resolve to a **federation zone** (replicated), never root — a mailbox
 /// on node-local root can never reach a peer. Because wal-over-root is
-/// legitimate for `/proc`, "must be federated" is an **A2A-layer** concern
-/// (`a2a::is_a2a_mailbox_path`), enforced there — it is **not** a generic
-/// kernel/root invariant, and must not be implemented as one.
+/// legitimate for `/proc`, this is **not** a generic kernel/root invariant
+/// (banning wal-over-root would break `/proc`, above), so it is **not**
+/// enforced here. It is upheld one layer up, at **federation boot**: the
+/// founder re-asserts its declared `--cluster-init` zones + mounts on every
+/// boot (see `profiles/cluster`'s `Resume` arm — load-bearing because
+/// `plan_boot_action` returns `Resume` whenever `root` is already on disk,
+/// e.g. an offline `auth mint` created it, SKIPPING the `StaticFounder` arm),
+/// so `/agents` resolves to its replicated zone instead of silently falling
+/// back to root. `a2a`'s `is_a2a_mailbox_path` scopes only `from`-stamping,
+/// NOT mount enforcement.
 ///
 /// ## Deferred design option (note for a future, context-free reader)
 ///
