@@ -26,10 +26,12 @@
 //!      **refused** at the handshake — `client_ca_root` peer auth actually
 //!      rejects an untrusted identity rather than nodding it through.
 //!
-//! SNI note: `apply_tls` sets no `domain_name`, so the endpoint host must
-//! appear in the server cert SANs. `generate_node_cert` always emits
-//! `localhost` / `127.0.0.1` / `::1`, so every endpoint here dials
-//! `https://127.0.0.1:PORT`.
+//! SNI note: `apply_tls` pins `domain_name(TlsConfig::CLUSTER_SERVER_NAME)`,
+//! which every node cert carries as a SAN (`generate_node_cert`), so the client
+//! verifies the fixed cluster name rather than the dialed host. Every endpoint
+//! here dials `https://127.0.0.1:PORT`, which the certs ALSO carry, so this
+//! test does not by itself distinguish name-vs-IP verification — that isolation
+//! is covered by `mtls_client_verifies_cluster_name`.
 
 #![cfg(all(feature = "grpc", has_protos))]
 
