@@ -3,7 +3,7 @@
 //! A self-contained ~5 MB Rust binary that brings up:
 //!   * [`nexus_raft::ZoneManager`] (multi-zone Raft + gRPC server)
 //!   * Day-1 TLS bootstrap (CA + node cert + join token) on first start
-//!   * Static topology (`NEXUS_FEDERATION_ZONES` + `NEXUS_FEDERATION_MOUNTS`)
+//!   * Static topology (founder `--cluster-init` / `--cluster-init-mount`)
 //!   * Health-check loop that drives `apply_topology` to convergence
 //!
 //! Subcommands:
@@ -36,7 +36,8 @@ use kernel::kernel::Kernel;
 use nexus_raft::distributed_coordinator::{
     bootstrap_or_join_zone, peers_excluding_self, read_or_mint_node_id,
 };
-use nexus_raft::federation::{parse_federation_env, ENV_FEDERATION_MOUNTS, ENV_FEDERATION_ZONES};
+// Founder topology is parsed from the `--cluster-init` flags via raft's
+// env-agnostic `parse_zones_str` / `parse_mounts_str` (called fully-qualified).
 use nexus_raft::transport::{bootstrap_tls, NodeAddress};
 use nexus_raft::{TlsFiles, ZoneLoadPolicy, ZoneManager};
 
@@ -92,9 +93,15 @@ struct CommonArgs {
     #[arg(long, env = "NEXUS_ADVERTISE_ADDR", global = true)]
     advertise_addr: Option<String>,
 
-    /// Bind address for the federation gRPC server.
-    #[arg(long, env = "NEXUS_BIND_ADDR", default_value = DEFAULT_BIND, global = true)]
-    bind_addr: String,
+    /// Bind address for the federation gRPC (mTLS data-plane) server.
+    ///
+    /// Usually left unset: it DERIVES from `--advertise-addr`'s port (bind all
+    /// interfaces on the advertised port) so the operator states ONE address
+    /// per node. Set it explicitly only for exotic multi-NIC binds. Falls back
+    /// to `DEFAULT_BIND` when neither is given (single-node/loopback tests).
+    /// See [`CommonArgs::effective_bind_addr`].
+    #[arg(long, env = "NEXUS_BIND_ADDR", global = true)]
+    bind_addr: Option<String>,
 
     /// Additional loopback-only VFS bind for LOCAL agents, in `host:port`
     /// form (e.g. `127.0.0.1:2130`).
@@ -169,19 +176,66 @@ struct CommonArgs {
     #[arg(long, env = "NEXUS_PEERS", default_value = "", global = true)]
     peers: String,
 
-    /// Founder-side node-enrollment listener bind, in `host:port` form
-    /// (e.g. an overlay IP `100.64.0.27:2130`).
+    /// Accept new nodes enrolling into this cluster (founder side).
     ///
     /// The pre-mTLS BOOTSTRAP plane: a brand-new node has no cluster cert, so
-    /// it cannot reach the strict-mTLS `--bind-addr`. This starts a dedicated
+    /// it cannot reach the strict-mTLS data-plane bind. This starts a dedicated
     /// PLAINTEXT listener serving ONLY `NodeEnrollmentService.JoinCluster` —
-    /// the founder signs a joiner's cert after verifying its join token
-    /// (`enroll-token`). Auth is the token; integrity is the CA fingerprint the
-    /// joiner pins from the token; the channel rides the encrypted overlay
-    /// (k3s/kubeadm model). Requires TLS on (the founder must own a CA). Unset
-    /// ⇒ this node accepts no enrollments.
-    #[arg(long, env = "NEXUS_ENROLL_LISTEN", global = true)]
-    enroll_listen: Option<String>,
+    /// the founder signs a joiner's cert after verifying its join token. Auth
+    /// is the token; integrity is the CA fingerprint the joiner pins from the
+    /// token; the channel rides the encrypted overlay (k3s/kubeadm model).
+    ///
+    /// The listener rides a fixed offset above the data-plane port
+    /// ([`CommonArgs::effective_enroll_addr`]) so the operator never types a
+    /// second address — the joiner derives the same port from `--peers`.
+    /// Requires TLS on (the founder must own a CA).
+    #[arg(
+        long,
+        env = "NEXUS_ACCEPT_ENROLLMENTS",
+        default_value_t = false,
+        global = true
+    )]
+    accept_enrollments: bool,
+
+    /// Join token for one-shot self-enrollment at boot (joiner side).
+    ///
+    /// A certless node given a `--token` (from the founder's boot log /
+    /// `tls/join-token`) plus `--peers` auto-enrolls BEFORE it joins: it dials
+    /// the founder's enrollment port (derived from the first peer), obtains a
+    /// CA-signed node cert, then joins over mTLS — the k3s `agent --server
+    /// --token` one-command model. No separate `enroll` step. Ignored once this
+    /// node already holds a cert (`tls/node.pem`).
+    #[arg(long, env = "NEXUS_JOIN_TOKEN", global = true)]
+    token: Option<String>,
+
+    /// Found (initialize) these federation zones as this cluster's first
+    /// member — the FOUNDER declaration. Repeatable; comma-separated via
+    /// `NEXUS_CLUSTER_INIT`.
+    ///
+    /// This is etcd's `--initial-cluster-state new` / k3s's `--cluster-init`:
+    /// it says "I am CREATING this cluster". Mutually exclusive with `--peers`
+    /// (which says "I am JOINING an existing cluster") — passing both is a hard
+    /// boot error, because two nodes each founding the same zone name produce a
+    /// split-brain. A joiner NEVER sets this; it uses `--peers` (+ `--token`).
+    #[arg(
+        long = "cluster-init",
+        env = "NEXUS_CLUSTER_INIT",
+        value_delimiter = ',',
+        global = true
+    )]
+    cluster_init: Vec<String>,
+
+    /// Mount a founded zone into the VFS at boot, as `PATH=ZONE` (e.g.
+    /// `/shared=sharedzone`). Repeatable; comma-separated via
+    /// `NEXUS_CLUSTER_INIT_MOUNTS`. Founder-side, same mutual-exclusion with
+    /// `--peers` as `--cluster-init`.
+    #[arg(
+        long = "cluster-init-mount",
+        env = "NEXUS_CLUSTER_INIT_MOUNTS",
+        value_delimiter = ',',
+        global = true
+    )]
+    cluster_init_mount: Vec<String>,
 
     /// Disable TLS — plaintext gRPC for local testing only.
     #[arg(long, env = "NEXUS_NO_TLS", default_value_t = false, global = true)]
@@ -330,6 +384,51 @@ impl CommonArgs {
             .clone()
             .unwrap_or_else(|| self.data_dir.join("root"))
     }
+
+    /// Effective raft data-plane bind. `--bind-addr` when given; otherwise
+    /// DERIVES from `--advertise-addr`'s port (bind all interfaces on the
+    /// advertised port), so the operator states ONE address per node. Falls
+    /// back to `DEFAULT_BIND` when neither is set (single-node/loopback tests).
+    fn effective_bind_addr(&self) -> String {
+        if let Some(bind) = &self.bind_addr {
+            return bind.clone();
+        }
+        if let Some(port) = self
+            .advertise_addr
+            .as_deref()
+            .and_then(|a| a.rsplit_once(':'))
+            .and_then(|(_, p)| p.parse::<u16>().ok())
+        {
+            return format!("0.0.0.0:{port}");
+        }
+        DEFAULT_BIND.to_string()
+    }
+
+    /// Founder-side node-enrollment listener bind. Convention: the data-plane
+    /// port + 1, bound on all interfaces (plaintext, token-gated). The joiner
+    /// derives the SAME port from `--peers` via [`enroll_port_addr`], so
+    /// neither side ever types a second address.
+    fn effective_enroll_addr(&self) -> Result<String> {
+        enroll_port_addr(&self.effective_bind_addr())
+    }
+}
+
+/// The node-enrollment endpoint for a data-plane `host:port` — the SINGLE
+/// definition of the "enrollment rides one port above the data plane"
+/// convention. The founder binds `enroll_port_addr(<its bind>)`; a joiner dials
+/// `enroll_port_addr(<first --peer>)`. Keeping it one function is what lets the
+/// two sides agree on the port without the operator ever stating it.
+fn enroll_port_addr(host_port: &str) -> Result<String> {
+    let (host, port) = host_port
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("address '{host_port}' is not host:port"))?;
+    let port: u16 = port
+        .parse()
+        .map_err(|e| anyhow::anyhow!("address '{host_port}' has a non-numeric port: {e}"))?;
+    let enroll_port = port.checked_add(1).ok_or_else(|| {
+        anyhow::anyhow!("data-plane port {port} leaves no room for the +1 enrollment port")
+    })?;
+    Ok(format!("{host}:{enroll_port}"))
 }
 
 /// `auth` actions. Split out of [`Cmd`] so the feature gate lands on one
@@ -593,30 +692,33 @@ enum Cmd {
         #[arg(long, default_value_t = 2126)]
         port: u16,
     },
-    /// Mint a join token for enrolling new nodes into THIS cluster (founder).
+    /// Mint an EXTRA join token for THIS cluster (founder), and print it.
     ///
-    /// Ensures this data dir has a cluster CA (bootstraps one if absent),
-    /// mints a fresh token bound to that CA's fingerprint, records the token
-    /// hash so the founder's `--enroll-listen` listener will accept it, and
-    /// prints the token to stdout. Hand the token (out of band) to a new
-    /// node's `enroll`. Run this BEFORE starting the founder with
-    /// `--enroll-listen`. k3s/kubeadm model.
+    /// Usually unnecessary: the day-1 TLS bootstrap already mints a token, and
+    /// a founder started with `--accept-enrollments` prints a ready-to-paste
+    /// join command (token included) at boot. Use this only to ROTATE the token
+    /// or mint an additional one. Ensures this data dir has a cluster CA
+    /// (bootstraps one if absent), mints a fresh token bound to that CA's
+    /// fingerprint, records its hash where `--accept-enrollments` reads it, and
+    /// prints the token to stdout. k3s/kubeadm model.
     EnrollToken {},
-    /// Enroll THIS node into a cluster: obtain a signed mTLS node cert from a
-    /// founder using a join token, so it can then boot into mTLS federation.
+    /// PRE-provision this node's mTLS cert from a founder using a join token.
     ///
-    /// The one-time bootstrap a brand-new node runs BEFORE `--peers`
-    /// federation: connects (plaintext, over the encrypted overlay) to the
-    /// founder's `--enroll-listen`, presents the join token, verifies the
-    /// returned CA against the fingerprint pinned in the token, and writes
-    /// `ca.pem`/`node.pem`/`node-key.pem` into `<data-dir>/tls/`. Distinct from
-    /// `join` (which joins a specific ZONE over already-established mTLS).
+    /// Usually unnecessary: passing `--token` (+ `--peers`) to the daemon
+    /// auto-enrolls at boot in one command. Use this standalone form only to
+    /// provision the cert ahead of time. Connects (plaintext, over the
+    /// encrypted overlay) to the founder's enrollment port, presents the join
+    /// token, verifies the returned CA against the fingerprint pinned in the
+    /// token, and writes `ca.pem`/`node.pem`/`node-key.pem` into
+    /// `<data-dir>/tls/`. Distinct from `join` (which joins a specific ZONE
+    /// over already-established mTLS).
     Enroll {
-        /// Founder enrollment endpoint as `host:port` — its `--enroll-listen`
-        /// (e.g. an overlay IP `100.64.0.27:2130`).
+        /// Founder's DATA-PLANE address as `host:port` (its `--advertise-addr`,
+        /// same value as `--peers`; e.g. an overlay IP `100.64.0.27:2126`). The
+        /// enrollment port is derived from it by convention (`port + 1`).
         peer_addr: String,
-        /// Join token minted by the founder's `enroll-token`
-        /// (`K10<pw>::server:SHA256:<ca-fp>`).
+        /// Join token minted by the founder (`enroll-token`, or from its boot
+        /// log) — `K10<pw>::server:SHA256:<ca-fp>`.
         token: String,
     },
 }
@@ -680,7 +782,7 @@ pub fn run() -> Result<()> {
                     // bind + plaintext. auth_posture then grants the
                     // no-auth start without `--insecure-no-auth`.
                     let mut common = args.common;
-                    common.bind_addr = format!("127.0.0.1:{port}");
+                    common.bind_addr = Some(format!("127.0.0.1:{port}"));
                     common.no_tls = true;
                     run_daemon(common).await
                 }
@@ -739,12 +841,13 @@ pub fn run() -> Result<()> {
         })
 }
 
-/// `enroll-token` — mint a CA-fingerprint-pinned join token (founder side).
+/// `enroll-token` — mint an EXTRA CA-fingerprint-pinned join token (founder).
 ///
-/// Bootstraps this data dir's cluster CA if absent (so the token can be minted
-/// before the founder ever boots — the k3s "set the token, then start" order),
-/// mints a fresh token, records its hash where the `--enroll-listen` listener
-/// reads it, and prints the token to stdout (everything else goes to stderr).
+/// The day-1 TLS bootstrap already mints one and `--accept-enrollments` prints
+/// it at boot, so this is only for rotating / adding a token. Bootstraps this
+/// data dir's cluster CA if absent, mints a fresh token, records its hash where
+/// `--accept-enrollments` reads it, and prints the token to stdout (everything
+/// else goes to stderr).
 fn run_enroll_token(common: &CommonArgs) -> Result<()> {
     let tls_dir = common.data_dir.join("tls");
     std::fs::create_dir_all(&tls_dir)
@@ -769,25 +872,28 @@ fn run_enroll_token(common: &CommonArgs) -> Result<()> {
     // the token.
     println!("{token}");
     eprintln!(
-        "join token minted (pinned to this cluster's CA). Start the founder with \
-         `--enroll-listen <overlay:port>`, then on the new node run:\n  \
-         nexusd-cluster enroll <founder-enroll-addr> <token>"
+        "join token minted (pinned to this cluster's CA). On the new node run one command:\n  \
+         nexusd-cluster --advertise-addr <THAT_NODE_OVERLAY:PORT> \
+         --peers <FOUNDER_OVERLAY:PORT> --token <token>"
     );
     Ok(())
 }
 
-/// `enroll` — obtain a signed mTLS node cert from a founder (joiner side).
+/// `enroll` — PRE-provision a signed mTLS node cert from a founder (joiner).
 ///
-/// Thin CLI over [`nexus_raft::join_cluster_and_provision_tls`]: presents the
-/// join token to the founder's `--enroll-listen`, verifies the returned CA
-/// against the fingerprint pinned in the token, and writes the bundle into
-/// `<data-dir>/tls/`. After this the node can boot into mTLS federation.
+/// Thin CLI over [`nexus_raft::join_cluster_and_provision_tls`]: `peer_addr` is
+/// the founder's DATA-PLANE address (same as `--peers`); the enrollment port is
+/// derived from it ([`enroll_port_addr`], `+1`). Presents the join token,
+/// verifies the returned CA against the fingerprint pinned in the token, and
+/// writes the bundle into `<data-dir>/tls/`. Usually unnecessary — the daemon
+/// auto-enrolls from `--token` at boot; this only pre-provisions the cert.
 fn run_enroll(common: &CommonArgs, peer_addr: &str, token: &str) -> Result<()> {
     let hostname = resolve_hostname(common.hostname.as_deref());
     let tls_dir = common.data_dir.join("tls");
     let tls_dir_str = tls_dir.to_str().context("tls dir must be UTF-8")?;
-    nexus_raft::join_cluster_and_provision_tls(peer_addr, token, &hostname, tls_dir_str)
-        .map_err(|e| anyhow::anyhow!("enroll against {peer_addr}: {e}"))?;
+    let enroll_target = enroll_port_addr(peer_addr)?;
+    nexus_raft::join_cluster_and_provision_tls(&enroll_target, token, &hostname, tls_dir_str)
+        .map_err(|e| anyhow::anyhow!("enroll against {enroll_target}: {e}"))?;
     eprintln!(
         "enrolled: cluster cert written to {}. This node can now boot into the mTLS \
          federation — set `--peers <cluster-member>` and start it normally.",
@@ -888,7 +994,7 @@ struct ZoneManagerBundle {
     ///   (a) `ZoneManager`'s transport peer_map seed — reconnect hint
     ///       that survives `data_dir` wipe (S3 identity contract).
     ///   (b) split-brain guard around `bootstrap_static` — non-empty
-    ///       here + `NEXUS_FEDERATION_ZONES` set = both-founder
+    ///       here + `--cluster-init` set = both-founder
     ///       misconfig, fail loud rather than wedge downstream.
     /// MUST NOT flow into `bootstrap_or_join_zone(peers=)` for root —
     /// see the `cli_peer_addrs` docstring above.
@@ -1030,8 +1136,8 @@ fn open_zone_manager(
     //      fine for single-node tests, breaks cross-machine federation
     //      whenever the OS hostname does not resolve through the
     //      overlay — see warn_if_self_address_unreachable below).
-    let bind_port = common
-        .bind_addr
+    let effective_bind = common.effective_bind_addr();
+    let bind_port = effective_bind
         .rsplit_once(':')
         .and_then(|(_, p)| p.parse::<u16>().ok())
         .unwrap_or(2126);
@@ -1060,7 +1166,7 @@ fn open_zone_manager(
         node_id,
         &zones_dir,
         merged_peers_str,
-        &common.bind_addr,
+        &effective_bind,
         tls,
         Some(self_address.clone()),
         extra_grpc_services,
@@ -1134,7 +1240,7 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     let hostname = resolve_hostname(common.hostname.as_deref());
     tracing::info!(
         hostname = %hostname,
-        bind = %common.bind_addr,
+        bind = %common.effective_bind_addr(),
         data_dir = %common.data_dir.display(),
         "nexusd-cluster starting (daemon mode)",
     );
@@ -1142,7 +1248,7 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     // S3 Phase G: single boot decision layer.  No more explicit
     // `--bootstrap-mode` from the operator — the daemon reads the
     // authoritative signals (`data_dir_has_root`, identity contents,
-    // CLI `--peers`, NEXUS_FEDERATION_* env) and dispatches through
+    // CLI `--peers`, `--cluster-init`) and dispatches through
     // `plan_boot_action`.  See `nexus_raft::bootstrap` for the full
     // decision matrix.
     let data_dir_has_root = common.data_dir.join("root").join("raft").exists();
@@ -1152,6 +1258,52 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
         data_dir_has_root,
         "boot inputs — see nexus_raft::bootstrap::plan_boot_action for dispatch",
     );
+
+    // One-shot self-enrollment at boot (joiner side, k3s `agent --server
+    // --token`). A certless node given `--token` + `--peers` provisions its
+    // mTLS cert BEFORE `open_zone_manager` brings up the data plane: it dials
+    // the founder's enrollment port (derived from the first peer via the same
+    // `+1` convention the founder's listener uses — [`enroll_port_addr`]) and
+    // writes ca/node/node-key into `<data-dir>/tls/`. `bootstrap_tls` then
+    // REUSES that bundle instead of self-signing a fresh (unrelated) CA.
+    // Skipped once a cert already exists, so restarts do not re-enroll.
+    let use_tls = !common.no_tls;
+    if use_tls && common.token.is_some() && peers_non_empty {
+        let tls_dir = common.data_dir.join("tls");
+        let already_enrolled = tls_dir.join("node.pem").exists() && tls_dir.join("ca.pem").exists();
+        if already_enrolled {
+            tracing::info!("--token ignored: this node already holds a cluster cert");
+        } else {
+            let first_peer = NodeAddress::parse_peer_list_operator(&common.peers, use_tls)
+                .map_err(|e| anyhow::anyhow!("--peers parse for auto-enroll: {e}"))?
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("--token given but --peers is empty"))?;
+            let enroll_target = enroll_port_addr(&first_peer.to_operator_str())?;
+            let token = common.token.clone().expect("token present by guard");
+            let tls_dir_str = tls_dir
+                .to_str()
+                .context("tls dir must be UTF-8")?
+                .to_string();
+            let hostname_for_enroll = hostname.clone();
+            tracing::info!(%enroll_target, "no cluster cert on disk — auto-enrolling at boot");
+            // `join_cluster_and_provision_tls` spins its own runtime + block_on,
+            // so it must run OFF this async worker (nested-runtime panic; #176).
+            let target_for_task = enroll_target.clone();
+            tokio::task::spawn_blocking(move || {
+                nexus_raft::join_cluster_and_provision_tls(
+                    &target_for_task,
+                    &token,
+                    &hostname_for_enroll,
+                    &tls_dir_str,
+                )
+            })
+            .await
+            .context("auto-enroll task panicked")?
+            .map_err(|e| anyhow::anyhow!("auto-enroll against {enroll_target}: {e}"))?;
+            tracing::info!("auto-enroll complete — cluster cert provisioned");
+        }
+    }
 
     // ── ObjectStoreProvider ─────────────────────────────────────────
     // Registered before the first DT_MOUNT so that any mount going
@@ -1309,34 +1461,39 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
         identity_zones,
     } = open_zone_manager(&common, Some(vfs_routes), ZoneLoadPolicy::All)?;
 
-    // Founder node-enrollment listener (pre-mTLS BOOTSTRAP plane). When
-    // `--enroll-listen` is set and TLS is on, serve `NodeEnrollmentService` on a
-    // dedicated PLAINTEXT bind so a certless new node can obtain a signed cert
-    // with a join token (`enroll-token`). It reads the cluster CA + the accepted
-    // token hash from this node's TLS bundle. Kept OFF the strict-mTLS data-plane
-    // bind on purpose (a certless joiner cannot complete that handshake).
-    if let Some(enroll_addr) = common.enroll_listen.clone() {
+    // Founder node-enrollment listener (pre-mTLS BOOTSTRAP plane). With
+    // `--accept-enrollments` and TLS on, serve `NodeEnrollmentService` on a
+    // dedicated PLAINTEXT bind (data-plane port + 1, see `effective_enroll_addr`
+    // — the operator never types it) so a certless new node can obtain a signed
+    // cert with a join token. It reads the cluster CA + the accepted token hash
+    // from this node's TLS bundle. Kept OFF the strict-mTLS data-plane bind on
+    // purpose (a certless joiner cannot complete that handshake).
+    if common.accept_enrollments {
         if common.no_tls {
             tracing::warn!(
-                "--enroll-listen ignored: enrollment signs mTLS certs but --no-tls is set, so \
-                 this node has no CA to sign with"
+                "--accept-enrollments ignored: enrollment signs mTLS certs but --no-tls is set, \
+                 so this node has no CA to sign with"
             );
         } else {
             let tls_dir = common.data_dir.join("tls");
-            let ca_pem = std::fs::read(tls_dir.join("ca.pem"))
-                .with_context(|| format!("enroll-listen: read {}/ca.pem", tls_dir.display()))?;
-            let ca_key_pem = std::fs::read(tls_dir.join("ca-key.pem"))
-                .with_context(|| format!("enroll-listen: read {}/ca-key.pem", tls_dir.display()))?;
+            let ca_pem = std::fs::read(tls_dir.join("ca.pem")).with_context(|| {
+                format!("accept-enrollments: read {}/ca.pem", tls_dir.display())
+            })?;
+            let ca_key_pem = std::fs::read(tls_dir.join("ca-key.pem")).with_context(|| {
+                format!("accept-enrollments: read {}/ca-key.pem", tls_dir.display())
+            })?;
             let hash_path = tls_dir.join("join-token-hash");
             let join_token_hash = std::fs::read_to_string(&hash_path).with_context(|| {
                 format!(
-                    "enroll-listen: read {} — mint a token first with `nexusd-cluster enroll-token`",
+                    "accept-enrollments: read {} — the TLS bootstrap mints one on first boot; \
+                     run `nexusd-cluster enroll-token` to (re)mint",
                     hash_path.display()
                 )
             })?;
+            let enroll_addr = common.effective_enroll_addr()?;
             let addr: std::net::SocketAddr = enroll_addr
                 .parse()
-                .map_err(|e| anyhow::anyhow!("--enroll-listen '{enroll_addr}': {e}"))?;
+                .map_err(|e| anyhow::anyhow!("enrollment listener addr '{enroll_addr}': {e}"))?;
             zm.runtime_handle().spawn(async move {
                 if let Err(e) = nexus_raft::transport::serve_node_enrollment(
                     addr,
@@ -1350,7 +1507,34 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
                     tracing::error!(error = %e, "node-enrollment listener terminated");
                 }
             });
-            tracing::info!(%enroll_addr, "node-enrollment listener starting (plaintext, token-gated)");
+            tracing::info!(%enroll_addr, "node-enrollment listener up (plaintext, token-gated)");
+
+            // Surface the join token as a ready-to-paste joiner command, so the
+            // operator never has to know to run `enroll-token` first. The
+            // plaintext token is written by the day-1 TLS bootstrap
+            // (`tls/join-token`); the joiner dials this founder's data-plane
+            // address (`--peers`) and derives the enrollment port itself.
+            let data_port = common
+                .effective_bind_addr()
+                .rsplit_once(':')
+                .and_then(|(_, p)| p.parse::<u16>().ok())
+                .unwrap_or(2126);
+            let peers_hint = common
+                .advertise_addr
+                .clone()
+                .unwrap_or_else(|| format!("<FOUNDER_OVERLAY_IP:{data_port}>"));
+            match std::fs::read_to_string(tls_dir.join("join-token")) {
+                Ok(token) => tracing::info!(
+                    "cluster accepts enrollments. To add a node, run THERE:\n  \
+                     nexusd-cluster --advertise-addr <THAT_NODE_OVERLAY:PORT> \
+                     --peers {peers_hint} --token {}",
+                    token.trim(),
+                ),
+                Err(_) => tracing::info!(
+                    "cluster accepts enrollments, but no join token is stored here — \
+                     mint one with `nexusd-cluster enroll-token` and hand it to the new node."
+                ),
+            }
         }
     }
 
@@ -1370,64 +1554,81 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     // runtime" on a worker thread of the outer `#[tokio::main]`.
     // `spawn_blocking` moves it onto the blocking pool where nested
     // runtime creation is allowed.
-    let fed = parse_federation_env();
-    // Surface every dropped `NEXUS_FEDERATION_MOUNTS` entry so the
-    // operator sees them in boot logs.  When the input was non-empty
-    // but the parser ate everything (the Mac↔Win L1 smoke wedge:
-    // Windows MSYS Git Bash mangling `/shared=sharedzone` into
-    // `C:/Program Files/Git/shared=sharedzone`), refuse to boot —
-    // a silent `mount_count=0` federation leaves the operator
-    // chasing downstream raft-replication symptoms for hours.
-    for d in &fed.mounts.dropped {
-        tracing::error!(
-            raw = %d.raw,
-            reason = d.reason,
-            env_var = ENV_FEDERATION_MOUNTS,
-            "federation mount entry dropped at parse",
-        );
-    }
-    if fed.mounts.is_silent_dropall() {
+    // Founder declaration comes from the `--cluster-init` / `--cluster-init-mount`
+    // flags (clap also honours the matching `NEXUS_CLUSTER_INIT*` envs), parsed
+    // with raft's env-agnostic string parsers so the mount diagnostics below
+    // still apply. This is the FOUNDER intent ("I am creating this cluster");
+    // `--peers` is the JOINER intent — see the mutual-exclusion guard.
+    let init_zones = nexus_raft::federation::parse_zones_str(&common.cluster_init.join(","));
+    let init_mounts =
+        nexus_raft::federation::parse_mounts_str(&common.cluster_init_mount.join(","));
+    let founder_declared = !init_zones.is_empty() || !init_mounts.mounts.is_empty();
+
+    // --cluster-init ⊥ --peers — the found-vs-join hard互斥. `--cluster-init`
+    // says "I am FOUNDING this cluster", `--peers` says "I am JOINING an
+    // existing one"; two nodes each founding the same zone name deterministically
+    // produce two disjoint raft groups that can never merge (split-brain). This
+    // is etcd's `--initial-cluster-state new` vs `existing` / k3s's
+    // `--cluster-init` vs `--server`: the intent is explicit and exclusive.
+    // Refuse at boot rather than roll the dice. `plan_boot_action` rows 5/6 keep
+    // this as defense-in-depth; this is the earliest, clearest surface. Gated on
+    // `!data_dir_has_root` — a restart with persisted state resumes and the
+    // flags are advisory (row 0 Resume).
+    if founder_declared && peers_non_empty && !data_dir_has_root {
         return Err(anyhow::anyhow!(
-            "{} parsed to zero mounts despite non-empty input — refusing to start \
-             with a silently broken federation topology.  Inspect the per-entry \
-             reasons logged above (one common trigger is MSYS path conversion on \
-             Windows Git Bash; export MSYS_NO_PATHCONV=1 or single-quote the value).",
-            ENV_FEDERATION_MOUNTS,
+            "--cluster-init and --peers are mutually exclusive: --cluster-init declares \
+             'I am FOUNDING this cluster', --peers declares 'I am JOINING an existing one'. \
+             Two nodes each founding the same zone name produce a split-brain (two disjoint \
+             raft groups sharing a zone name, whose histories can never merge). Choose one:\n  \
+             (a) FOUNDER — keep --cluster-init (+ --accept-enrollments), drop --peers.\n  \
+             (b) JOINER  — keep --peers (+ --token), drop --cluster-init.",
         ));
     }
 
-    // Preserved PR #112 split-brain guard — backstops the FailLoud arm
-    // of `plan_boot_action` (row 5) with a longer, operator-actionable
-    // hint so the concrete recovery path is one paragraph rather than
-    // one sentence.
-    //
-    // S3 Phase G: gated on `!data_dir_has_root` because a restart with
-    // authoritative persisted state is not a split-brain — the daemon
-    // resumes from disk and env vars are advisory (row 0 Resume).
-    if (!fed.zones.is_empty() || !fed.mounts.mounts.is_empty())
-        && !identity_persisted_peers.is_empty()
-        && !data_dir_has_root
-    {
+    // Surface every dropped `--cluster-init-mount` entry so the operator sees
+    // them in boot logs.  When the input was non-empty but the parser ate
+    // everything (the Mac↔Win L1 smoke wedge: Windows MSYS Git Bash mangling
+    // `/shared=sharedzone` into `C:/Program Files/Git/shared=sharedzone`),
+    // refuse to boot — a silent `mount_count=0` federation leaves the operator
+    // chasing downstream raft-replication symptoms for hours.
+    for d in &init_mounts.dropped {
+        tracing::error!(
+            raw = %d.raw,
+            reason = d.reason,
+            flag = "--cluster-init-mount",
+            "cluster-init mount entry dropped at parse",
+        );
+    }
+    if init_mounts.is_silent_dropall() {
         return Err(anyhow::anyhow!(
-            "split-brain guard: {} is set (zones={:?}) but identity.json \
-                 already lists peers={:?}.  Auto-creating a SOLO zone on a \
-                 node that already knows peers is the both-founder misconfig \
-                 -- it produces two independent raft clusters sharing the \
-                 same zone name whose leader histories cannot merge.  \
-                 Choose one role:\n  \
-                 (a) FOUNDER -- this node is the source of truth.  Remove \
-                 the persisted peers first: rm -f IDENTITY_DIR/identity.json \
-                 (leave data_dir alone if you have prior state to reuse), \
-                 then re-run.\n  \
-                 (b) JOINER -- the persisted peers are the actual founders. \
-                 Unset {} and {} in this launcher, then run: \
-                 nexusd-cluster join FOUNDER_HOST:PORT ZONE MOUNT_PATH \
-                 --data-dir DATA_DIR  before restarting the daemon.",
-            ENV_FEDERATION_ZONES,
-            fed.zones,
+            "--cluster-init-mount parsed to zero mounts despite non-empty input — refusing \
+             to start with a silently broken federation topology.  Inspect the per-entry \
+             reasons logged above (one common trigger is MSYS path conversion on Windows \
+             Git Bash; export MSYS_NO_PATHCONV=1 or single-quote the value).",
+        ));
+    }
+
+    // Preserved PR #112 split-brain guard — backstops the FailLoud arm of
+    // `plan_boot_action` (row 5, identity-peers + founder decl) with a longer,
+    // operator-actionable hint. Distinct from the --peers互斥 above: this fires
+    // when a node that ALREADY knows peers from a prior boot (identity.json) is
+    // (re)started with --cluster-init. Gated on `!data_dir_has_root` — a restart
+    // with authoritative persisted state resumes; flags are advisory (row 0).
+    if founder_declared && !identity_persisted_peers.is_empty() && !data_dir_has_root {
+        return Err(anyhow::anyhow!(
+            "split-brain guard: --cluster-init is set (zones={:?}) but identity.json \
+                 already lists peers={:?}.  Founding a SOLO zone on a node that already \
+                 knows peers is the both-founder misconfig — it produces two independent \
+                 raft clusters sharing the same zone name whose leader histories cannot \
+                 merge.  Choose one role:\n  \
+                 (a) FOUNDER — this node is the source of truth.  Remove the persisted \
+                 peers first: rm -f IDENTITY_DIR/identity.json (leave data_dir alone if you \
+                 have prior state to reuse), then re-run.\n  \
+                 (b) JOINER — the persisted peers are the actual founders. Drop \
+                 --cluster-init and let the daemon rejoin them (add --peers/--token only \
+                 if identity was also wiped).",
+            init_zones,
             identity_persisted_peers,
-            ENV_FEDERATION_ZONES,
-            ENV_FEDERATION_MOUNTS,
         ));
     }
 
@@ -1439,8 +1640,8 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     let boot_cfg = nexus_raft::bootstrap::BootConfig {
         identity_persisted_peers: identity_persisted_peers.clone(),
         cli_peer_addrs: cli_peer_addrs.clone(),
-        federation_zones: fed.zones.clone(),
-        federation_mounts: fed.mounts.mounts.clone(),
+        federation_zones: init_zones.clone(),
+        federation_mounts: init_mounts.mounts.clone(),
         bootstrap_new: false, // retired knob; kept on struct for backwards struct-literal compat
         has_disk_state: data_dir_has_root,
         identity_zones: identity_zones.clone(),
@@ -1493,9 +1694,7 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
                 zones = ?zones,
                 mount_count = mounts.len(),
                 ha_seed_count = peers_for_ha.len(),
-                "Bootstrapping static topology from {} / {}",
-                ENV_FEDERATION_ZONES,
-                ENV_FEDERATION_MOUNTS,
+                "Bootstrapping static topology from --cluster-init / --cluster-init-mount",
             );
             // S3 Phase D + F: the DiscoverZones RPC reads root's
             // DT_MOUNT entries directly at call time (Phase F SSOT
@@ -1638,8 +1837,8 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
             )
             .await?;
             tracing::info!(
-                fed_zones_env = ?fed.zones,
-                fed_mounts_env_count = fed.mounts.mounts.len(),
+                cluster_init_zones = ?init_zones,
+                cluster_init_mount_count = init_mounts.mounts.len(),
                 reconciled_zones = reconciled,
                 "boot resumed from disk — federation mounts reconciled from peers (mount -a model)",
             );
@@ -1795,7 +1994,7 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     // NOT in a2a — because it needs a `Weak<Kernel>` (the `Arc` lives
     // here). It self-recovers the watched path from the wal-stream key, so
     // no per-zone mapping is threaded in. Root covers node-local
-    // `/agents`; every federation mount (`NEXUS_FEDERATION_MOUNTS=
+    // `/agents`; every federation mount (`--cluster-init-mount
     // /agents=<zone>`) is what makes A2A cross-machine, because that zone's
     // raft replicates the mailbox across members — and the wal DT_STREAM
     // for a mailbox under that mount now proposes to THAT zone (see
@@ -1807,10 +2006,10 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
         // Arm on every zone this node participates in — root plus every
         // federation zone created or joined by the BootAction block above.
         // The wakeup is a property of raft-consensus membership, NOT of
-        // `NEXUS_FEDERATION_MOUNTS`: a JOINER reaches its shared zones via
-        // DiscoverZones / identity.zones with the mounts env EMPTY (a
-        // non-empty mounts env alongside `--peers` is a fail-loud ambiguous
-        // boot — see `plan_boot_action` row 6), so keying off the env mounts
+        // `--cluster-init-mount`: a JOINER reaches its shared zones via
+        // DiscoverZones / identity.zones with no `--cluster-init` (a
+        // `--cluster-init` alongside `--peers` is a fail-loud ambiguous
+        // boot — see `plan_boot_action` row 6), so keying off the init mounts
         // would arm root only and silently drop the joiner's shared mailbox
         // zone. `ZoneManager::list_zones` is the SSOT for loaded zones.
         // (A zone joined at RUNTIME, after this point — via a `share`/`join`
@@ -1863,7 +2062,7 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     // contract:
     //   1. `--plugin-dir` scan already loaded the dylibs above.
     //   2. Federation static-topology bootstrap has staged the
-    //      env-listed zones + cross-zone mounts (`NEXUS_FEDERATION_*`)
+    //      declared zones + cross-zone mounts (`--cluster-init*`)
     //      and `RaftDistributedCoordinator::install_with_kernel` has
     //      just flipped `is_initialized` to true.  That gates the
     //      `kernel.mount(..)` zone-create-on-mount path inside
@@ -1930,7 +2129,7 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("--mount-driver parse error: {e}"))?;
 
         // `--mount-driver` installs a backend INSIDE a zone.  The zone
-        // itself is created elsewhere — via `NEXUS_FEDERATION_ZONES`
+        // itself is created elsewhere — via `--cluster-init`
         // bootstrap (founder), or via `nexusd-cluster join` (joiner).
         // If the target zone isn't loaded yet, skipping is the correct
         // semantic: re-running the cluster after the operator-driven
@@ -1953,7 +2152,7 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
                 zone_id = %spec.zone_id,
                 vfs_path = %spec.vfs_path,
                 "skipping --mount-driver: target zone not loaded on this node — \
-                 declare via NEXUS_FEDERATION_ZONES (founder) or run \
+                 declare via --cluster-init (founder) or run \
                  `nexusd-cluster join` (joiner) to bring the zone in first, \
                  then restart; --mount-driver re-applies on restart",
             );
@@ -2317,7 +2516,7 @@ async fn reconcile_federation_from_peers(
 
 /// Boot-time joiner primitive shared by the offline `join` sidecar
 /// (single-zone) and the future daemon federation-branch joiner path
-/// (multi-zone from `NEXUS_FEDERATION_MOUNTS` / identity.zones).
+/// (multi-zone from `--cluster-init-mount` / identity.zones).
 ///
 /// For each zone in `zone_ids`:
 ///   1. If `parent_zone` is not on disk, bootstrap it as SOLO (empty
@@ -3228,7 +3427,7 @@ fn run_auth_action(
 /// inputs, so it is testable without a daemon and cannot drift with boot order.
 fn auth_posture(common: &CommonArgs) -> Result<AuthPosture> {
     auth_posture::decide(&AuthPostureInputs {
-        bind_addr: common.bind_addr.clone(),
+        bind_addr: common.effective_bind_addr(),
         api_key_secret: std::env::var("NEXUS_API_KEY_SECRET").ok(),
         tls_enabled: !common.no_tls,
         insecure_no_auth: common.insecure_no_auth,
@@ -3765,5 +3964,59 @@ mod tests {
             parsed.common.advertise_addr.as_deref(),
             Some("100.64.0.27:2126"),
         );
+    }
+
+    fn common_from(args: &[&str]) -> CommonArgs {
+        let mut full = vec!["nexusd-cluster"];
+        full.extend_from_slice(args);
+        Args::try_parse_from(full).expect("args parse").common
+    }
+
+    /// The one-address contract: `--advertise-addr` alone determines the bind
+    /// (all interfaces on the advertised port), so the operator never states a
+    /// second address. Explicit `--bind-addr` still wins; neither ⇒ the default.
+    #[test]
+    fn effective_bind_derives_from_advertise_then_honours_explicit_then_default() {
+        // Advertise only → bind all interfaces on the advertised port.
+        assert_eq!(
+            common_from(&["--advertise-addr", "100.64.0.27:2200"]).effective_bind_addr(),
+            "0.0.0.0:2200",
+        );
+        // Explicit --bind-addr wins over the derivation (exotic multi-NIC).
+        assert_eq!(
+            common_from(&[
+                "--advertise-addr",
+                "100.64.0.27:2200",
+                "--bind-addr",
+                "10.0.0.5:9999",
+            ])
+            .effective_bind_addr(),
+            "10.0.0.5:9999",
+        );
+        // Neither → historical default.
+        assert_eq!(common_from(&[]).effective_bind_addr(), DEFAULT_BIND);
+    }
+
+    /// The enrollment-port convention is ONE function so both sides agree:
+    /// the founder binds `data + 1`, and a joiner derives the same from its
+    /// first `--peer`. Guards the `+1` offset and the malformed-input errors.
+    #[test]
+    fn enroll_port_is_one_above_the_data_port() {
+        assert_eq!(
+            enroll_port_addr("100.64.0.27:2126").unwrap(),
+            "100.64.0.27:2127"
+        );
+        assert_eq!(enroll_port_addr("0.0.0.0:2200").unwrap(), "0.0.0.0:2201");
+        // Composed accessor uses the same convention on the effective bind.
+        assert_eq!(
+            common_from(&["--advertise-addr", "100.64.0.27:2126"])
+                .effective_enroll_addr()
+                .unwrap(),
+            "0.0.0.0:2127",
+        );
+        // Malformed inputs are rejected, not silently mis-parsed.
+        assert!(enroll_port_addr("no-port").is_err());
+        assert!(enroll_port_addr("host:not-a-number").is_err());
+        assert!(enroll_port_addr("host:65535").is_err(), "no room for +1");
     }
 }
