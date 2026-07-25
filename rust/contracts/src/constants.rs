@@ -6,9 +6,49 @@
 
 /// Canonical root zone identifier.
 ///
-/// Every path routed by the kernel carries an implicit zone; the
-/// default is this value. Mirrors
-/// ``nexus.contracts.constants.ROOT_ZONE_ID``.
+/// Every path routed by the kernel carries an implicit zone; an
+/// unmounted path routes here (it is the fallback of
+/// `VFSRouter::route`). Mirrors ``nexus.contracts.constants.ROOT_ZONE_ID``.
+///
+/// ## What the root zone IS (SSOT — read before reasoning about it)
+///
+/// Root is the node's **own, per-node, node-local** raft group: **SOLO
+/// (1 voter = this node)**, kernel-owned unconditionally. Roots are **not
+/// shared or replicated across machines** — every node has its own. Its raft
+/// is a **control plane** (DT_MOUNT table, advisory locks, the replicated
+/// credential store `TREE_AUTH_KEYS`, the share registry); `/` **file data**
+/// uses the node's local metastore, **not** consensus (see
+/// `raft::bootstrap` — "the raft group is a control plane, not the data
+/// plane"). Invariants already enforced elsewhere: root **cannot be deleted**
+/// (`DeleteZone` refuses it) and is **always SOLO 1-voter** (the
+/// distributed-coordinator SOLO guard).
+///
+/// ## Non-obvious nuance (hard-won — do not "fix" this away)
+///
+/// Root **legitimately hosts node-local durable (`wal`) DT_STREAMs**. The
+/// managed-agent mailbox `/proc/{pid}/chat-with-me` (a2a's
+/// `NODE_LOCAL_MAILBOX_PREFIX`) is a `wal` stream over root **by design**:
+/// durable + node-local, never meant to cross machines. So **"a `wal` stream
+/// must never live on root" is FALSE** — banning wal-over-root breaks `/proc`
+/// (kernel tests `sys_setattr_wal_stream_*` depend on it).
+///
+/// The property that actually matters for cross-machine delivery: a
+/// **cross-machine A2A mailbox** (`*/chat-with-me` **not** under `/proc/`)
+/// must resolve to a **federation zone** (replicated), never root — a mailbox
+/// on node-local root can never reach a peer. Because wal-over-root is
+/// legitimate for `/proc`, "must be federated" is an **A2A-layer** concern
+/// (`a2a::is_a2a_mailbox_path`), enforced there — it is **not** a generic
+/// kernel/root invariant, and must not be implemented as one.
+///
+/// ## Deferred design option (note for a future, context-free reader)
+///
+/// Type-distinguishing zones (e.g. `RootZone` vs `FederationZone` newtypes)
+/// to compile-time-enforce zone rules was considered and **deferred (YAGNI)**:
+/// `zone_id` is stringly-typed across kernel + raft + transport + proto, so
+/// the blast radius is large. If ever revisited: (a) do NOT frame it as "ban
+/// wal-over-root" — that breaks `/proc` node-local mailboxes (see above);
+/// (b) it must be a **zero-cost wrapper** with a hot-path bench, because
+/// `route().zone_id` is on the file read/write path.
 pub const ROOT_ZONE_ID: &str = "root";
 
 /// Canonical VFS root path.
