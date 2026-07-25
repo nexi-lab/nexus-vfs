@@ -63,9 +63,16 @@ fn apply_tls(
     let ca_cert = tonic::transport::Certificate::from_pem(&tls.ca_pem);
     let identity = tonic::transport::Identity::from_pem(&tls.cert_pem, &tls.key_pem);
 
+    // Verify the peer against the fixed cluster server name (present in every
+    // node cert as a SAN) + the cluster CA chain — NOT the dialed IP/hostname.
+    // A node's identity is CA membership + its URI SAN; the network address is
+    // routing. Pinning the dialed IP here would force every cert to enumerate
+    // its addresses and re-enroll on any overlay-IP change. See
+    // `CLUSTER_TLS_SERVER_NAME`.
     let tls_config = tonic::transport::ClientTlsConfig::new()
         .ca_certificate(ca_cert)
-        .identity(identity);
+        .identity(identity)
+        .domain_name(TlsConfig::CLUSTER_SERVER_NAME);
 
     ep.tls_config(tls_config).map_err(TransportError::Tonic)
 }

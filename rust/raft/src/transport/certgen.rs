@@ -114,6 +114,15 @@ pub fn generate_node_cert(
     // SANs: localhost, 127.0.0.1, ::1, plus any extra hostnames from node_address
     // (CockroachDB pattern: cert SANs include all hostnames the node is reachable at)
     let mut sans = vec![
+        // Fixed cluster server name every node presents + the mTLS client
+        // verifies against (instead of the dialed IP) — see
+        // `lib::transport_primitives::CLUSTER_TLS_SERVER_NAME`. Keeps certs free
+        // of any deployment address; identity is the CA chain + the URI SAN.
+        SanType::DnsName(
+            lib::transport_primitives::TlsConfig::CLUSTER_SERVER_NAME
+                .try_into()
+                .map_err(|e| format!("cluster SAN error: {e}"))?,
+        ),
         SanType::DnsName(
             "localhost"
                 .try_into()
@@ -479,6 +488,45 @@ mod tests {
         assert_eq!(
             parse_node_identity_uri(uris[0]),
             Some(("sharedzone".to_string(), 7))
+        );
+    }
+
+    /// Every node cert must carry the fixed cluster server name as a DNS SAN —
+    /// it is what the mTLS client verifies against (instead of the dialed IP),
+    /// so a cross-machine dial to an overlay IP succeeds without that IP being
+    /// in the cert. Guards the SAN half of `TlsConfig::CLUSTER_SERVER_NAME`.
+    #[test]
+    fn node_cert_carries_the_fixed_cluster_server_name_san() {
+        use x509_parser::prelude::*;
+
+        let (ca_cert_pem, ca_key_pem) = generate_test_ca();
+        let (cert_pem, _) = generate_node_cert(
+            7,
+            "sharedzone",
+            ca_cert_pem.as_bytes(),
+            ca_key_pem.as_bytes(),
+            &[],
+            Some("win-box"),
+        )
+        .unwrap();
+
+        let pem = ::pem::parse(&cert_pem).unwrap();
+        let (_, cert) = X509Certificate::from_der(pem.contents()).unwrap();
+        let dns_names: Vec<&str> = cert
+            .subject_alternative_name()
+            .unwrap()
+            .unwrap()
+            .value
+            .general_names
+            .iter()
+            .filter_map(|gn| match gn {
+                GeneralName::DNSName(d) => Some(*d),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            dns_names.contains(&lib::transport_primitives::TlsConfig::CLUSTER_SERVER_NAME),
+            "node cert must carry the fixed cluster server-name SAN; got {dns_names:?}"
         );
     }
 

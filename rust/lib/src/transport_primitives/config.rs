@@ -17,6 +17,21 @@ pub struct TlsConfig {
     pub ca_pem: Vec<u8>,
 }
 
+impl TlsConfig {
+    /// Fixed TLS server name every cluster node cert carries as a SAN, and the
+    /// name the mTLS client verifies against — instead of the peer's
+    /// IP/hostname.
+    ///
+    /// A node's identity is "signed by the cluster CA" (proven by the chain)
+    /// plus its `nexus://…` URI SAN; the network address is pure routing.
+    /// Verifying a fixed cluster name present in every node cert — rather than
+    /// the dialed IP — keeps certs free of any deployment address: a node never
+    /// enumerates its IPs and never re-enrolls when its overlay IP changes. The
+    /// CA chain stays the real trust gate (only cluster-CA-signed certs verify
+    /// at all).
+    pub const CLUSTER_SERVER_NAME: &'static str = "nexus-node";
+}
+
 /// Client-side connection configuration.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
