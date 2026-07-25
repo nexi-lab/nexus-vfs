@@ -192,7 +192,7 @@ async fn conf_state_apply_persists_zone_membership_on_joiner() {
     );
 
     // Round-trip: feed the loaded identity into plan_boot_action with
-    // no CLI peers and no NEXUS_FEDERATION_ZONES.  Row 4 dispatch
+    // no CLI peers and no --cluster-init.  Row 4 dispatch
     // must carry sharedzone as an auto-join target — the on-disk
     // durable state now drives the boot decision.
     //

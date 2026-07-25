@@ -1,30 +1,18 @@
-//! Static Day-1 federation topology — env-var parsers.
+//! Static Day-1 federation topology — pure parsers for the founder's
+//! `--cluster-init` / `--cluster-init-mount` operator inputs.
 //!
-//! The cluster binary (rust/cluster/) reads these at startup and
-//! feeds the result into [`crate::ZoneManager::bootstrap_static`] +
-//! [`crate::ZoneManager::apply_topology`].
-//!
-//! Mirrors the contract Python `nexus.raft.federation` used to expose
-//! before deletion: every node in the federation reads the same
-//! environment and converges on the same topology.
+//! Env-agnostic by design: the cluster binary (rust/profiles/cluster/) reads
+//! the CLI flags (clap, which also honours the matching `NEXUS_CLUSTER_INIT*`
+//! envs) and feeds the raw comma-separated strings here. Keeping this crate
+//! free of env-var knowledge matches `crate::bootstrap`'s contract — the boot
+//! layer parses operator input upstream; this crate only transforms strings
+//! into a topology.
 
 use std::collections::BTreeMap;
 
-/// Variable name carrying the comma-separated list of non-root zone
-/// ids to create (e.g. `"corp,corp-eng,family"`).
-pub const ENV_FEDERATION_ZONES: &str = "NEXUS_FEDERATION_ZONES";
-
-/// Variable name carrying the global path → zone id mount map
-/// (e.g. `"/corp=corp,/corp/eng=corp-eng,/home/family=family"`).
-pub const ENV_FEDERATION_MOUNTS: &str = "NEXUS_FEDERATION_MOUNTS";
-
-/// Parse `NEXUS_FEDERATION_ZONES` into a deduplicated, order-preserving
-/// list of zone ids. Empty / unset → empty list.
-pub fn parse_zones_env() -> Vec<String> {
-    parse_zones_str(&std::env::var(ENV_FEDERATION_ZONES).unwrap_or_default())
-}
-
-fn parse_zones_str(csv: &str) -> Vec<String> {
+/// Parse a comma-separated zone-id list (the `--cluster-init` value) into a
+/// deduplicated, order-preserving `Vec`. Empty input → empty list.
+pub fn parse_zones_str(csv: &str) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     csv.split(',')
         .map(str::trim)
@@ -75,9 +63,9 @@ impl MountsParse {
     }
 }
 
-/// Parse `NEXUS_FEDERATION_MOUNTS` into a [`MountsParse`].
+/// Parse a comma-separated `<global_path>=<zone_id>` list (the
+/// `--cluster-init-mount` value) into a [`MountsParse`].
 ///
-/// Accepted format: comma-separated `<global_path>=<zone_id>` pairs.
 /// Whitespace around segments is trimmed.  Entries are dropped — and
 /// recorded in [`MountsParse::dropped`] — if any of these hold:
 ///
@@ -87,11 +75,7 @@ impl MountsParse {
 /// * the path does not start with `/` (Windows MSYS path conversion
 ///   surfaces here — `/shared` becomes `C:/Program Files/Git/shared`
 ///   silently, and the cluster binary then has nothing to mount)
-pub fn parse_mounts_env() -> MountsParse {
-    parse_mounts_str(&std::env::var(ENV_FEDERATION_MOUNTS).unwrap_or_default())
-}
-
-fn parse_mounts_str(csv: &str) -> MountsParse {
+pub fn parse_mounts_str(csv: &str) -> MountsParse {
     let mut mounts = BTreeMap::new();
     let mut dropped = Vec::new();
     let mut raw_was_nonempty = false;
@@ -136,22 +120,6 @@ fn parse_one_mount(entry: &str) -> Result<(String, String), &'static str> {
         );
     }
     Ok((path.to_string(), zone.to_string()))
-}
-
-/// Full result of [`parse_federation_env`] — pair of the two env
-/// parsers' outputs.
-#[derive(Debug)]
-pub struct FederationParse {
-    pub zones: Vec<String>,
-    pub mounts: MountsParse,
-}
-
-/// Convenience: read both env vars in one call.
-pub fn parse_federation_env() -> FederationParse {
-    FederationParse {
-        zones: parse_zones_env(),
-        mounts: parse_mounts_env(),
-    }
 }
 
 #[cfg(test)]

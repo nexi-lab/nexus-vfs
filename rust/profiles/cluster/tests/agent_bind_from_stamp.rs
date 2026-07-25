@@ -53,8 +53,8 @@ async fn from_is_unforgeable_on_the_token_authed_agent_bind() {
         ("NEXUS_API_KEY_SECRET", SECRET),
         ("NEXUS_ADVERTISE_ADDR", adv.as_str()),
         ("NEXUS_NO_TLS", "true"),
-        ("NEXUS_FEDERATION_ZONES", ZONE),
-        ("NEXUS_FEDERATION_MOUNTS", mounts.as_str()),
+        ("NEXUS_CLUSTER_INIT", ZONE),
+        ("NEXUS_CLUSTER_INIT_MOUNTS", mounts.as_str()),
     ];
 
     // ── 1. MINT the sender's sk- Agent key (offline; into the data dir) ──

@@ -69,8 +69,8 @@ fn founder_env<'a>(
         ("NEXUS_IDENTITY_DIR", id),
         ("NEXUS_API_KEY_SECRET", SECRET),
         ("NEXUS_ADVERTISE_ADDR", adv),
-        ("NEXUS_FEDERATION_ZONES", ZONE),
-        ("NEXUS_FEDERATION_MOUNTS", mounts),
+        ("NEXUS_CLUSTER_INIT", ZONE),
+        ("NEXUS_CLUSTER_INIT_MOUNTS", mounts),
         ("RUST_LOG", LOG_FILTER),
         // NOTE: NEXUS_NO_TLS deliberately UNSET — TLS is on.
     ]
