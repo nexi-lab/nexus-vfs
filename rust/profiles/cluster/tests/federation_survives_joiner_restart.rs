@@ -39,8 +39,8 @@ fn founder_env<'a>(
         ("NEXUS_ADVERTISE_ADDR", adv),
         ("NEXUS_NO_TLS", "true"),
         ("NEXUS_INSECURE_NO_AUTH", "true"),
-        ("NEXUS_FEDERATION_ZONES", ZONE),
-        ("NEXUS_FEDERATION_MOUNTS", mounts),
+        ("NEXUS_CLUSTER_INIT", ZONE),
+        ("NEXUS_CLUSTER_INIT_MOUNTS", mounts),
         ("RUST_LOG", LOG_FILTER),
     ]
 }

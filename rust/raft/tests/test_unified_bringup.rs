@@ -99,7 +99,7 @@ async fn make_node(node_id: u64, dir: &std::path::Path) -> (std::sync::Arc<ZoneM
 
 // ── Scenario 1 ──────────────────────────────────────────────────────
 // Fresh federation, split roles:
-//   * A: NEXUS_FEDERATION_ZONES=sharedzone + empty identity + no CLI
+//   * A: --cluster-init sharedzone + empty identity + no CLI
 //     peers  ⇒ StaticFounder — plumbing pins that the founder side's
 //     advertised primitive (`ZoneManager::create_zone`) actually admits
 //     the values BootAction carries.
@@ -180,7 +180,7 @@ async fn scenario1_split_roles_fresh_bringup_no_split_brain() {
 
 // ── Scenario 2 ──────────────────────────────────────────────────────
 // Restart both nodes after prior convergence: identity.peers non-empty
-// on each side.  Neither declares NEXUS_FEDERATION_ZONES (per PR #4477
+// on each side.  Neither declares --cluster-init (per PR #4477
 // runbook — auto-create only on the initial founder boot, restarts
 // never set it).  Both nodes take the returning-joiner path (row 4);
 // crucially, neither returns `StaticFounder`, so there is no
@@ -268,7 +268,7 @@ async fn scenario2b_data_dir_wipe_with_populated_identity_is_row4_joiner() {
 
 // ── Scenario 3 ──────────────────────────────────────────────────────
 // Ambiguous fresh founder — matrix row 6.  Empty identity, CLI peers
-// non-empty, NEXUS_FEDERATION_ZONES set: the new guard fires.  Pins
+// non-empty, --cluster-init set: the new guard fires.  Pins
 // the reason tag so exit-code grep / telemetry filters remain valid
 // across future refactors.
 #[test]
@@ -294,7 +294,7 @@ fn scenario3_row6_ambiguous_fresh_founder_fails_loud() {
 // ── Scenario 4 ──────────────────────────────────────────────────────
 // Split-brain trap — matrix row 5 (existing PR #112 guard replayed at
 // the decision layer).  Identity already knows peers AND operator set
-// NEXUS_FEDERATION_ZONES.  This is the both-founder misconfig observed
+// --cluster-init.  This is the both-founder misconfig observed
 // twice in a row on 2026-07-05: two fresh nodes both sourcing a
 // founder-style launcher that seeded identity from a prior aborted
 // boot.

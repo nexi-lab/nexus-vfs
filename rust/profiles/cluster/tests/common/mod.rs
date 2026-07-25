@@ -41,6 +41,20 @@ pub fn free_port() -> u16 {
         .port()
 }
 
+/// A data-plane port `p` such that `p + 1` is ALSO free — for the enrollment
+/// convention (the node-enrollment listener rides one port above the data
+/// plane; both sides derive `p + 1`). Returns `p`; probe both, retry on a taken
+/// neighbour so the pair is deterministic under random ephemeral allocation.
+pub fn free_port_pair() -> u16 {
+    for _ in 0..64 {
+        let p = free_port();
+        if p < u16::MAX && std::net::TcpListener::bind(("127.0.0.1", p + 1)).is_ok() {
+            return p;
+        }
+    }
+    panic!("could not find a data/enroll port pair (p, p+1) both free");
+}
+
 /// A spawned `nexusd-cluster`, killed on drop. Reader threads capture
 /// stdout+stderr into a shared buffer, so `drain()` can read a refusal's prose
 /// and `wait_for_log()` can gate on a readiness line — the only RELIABLE
