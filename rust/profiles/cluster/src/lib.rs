@@ -3254,9 +3254,16 @@ fn open_auth_store(
     std::sync::Arc<dyn kernel::hal::auth_key_store::AuthKeyStore>,
     String,
 )> {
-    let secret = std::env::var("NEXUS_API_KEY_SECRET").map_err(|_| {
+    // Resolve the cluster API-key secret from the SAME SSOT the daemon uses
+    // (`effective_api_key_secret`): the persisted `tls/api-key-secret` if present
+    // (written by enrollment on a joiner), else `NEXUS_API_KEY_SECRET`. So a node
+    // that has enrolled can mint with NO env at all — closing the last
+    // secret-coordination gap (the daemon already needs none). The key is looked
+    // up by its HMAC under this secret, so it MUST match the cluster's.
+    let secret = effective_api_key_secret(&common.data_dir.join("tls")).ok_or_else(|| {
         anyhow::anyhow!(
-            "NEXUS_API_KEY_SECRET must be set, and must MATCH the daemon's: a key is \
+            "no cluster API-key secret found: set NEXUS_API_KEY_SECRET, or run this on a \
+             node that has enrolled (enrollment writes tls/api-key-secret). A key is \
              looked up by its HMAC under that secret, so a mismatch mints a key the \
              daemon will never recognise"
         )
@@ -3477,8 +3484,8 @@ fn run_auth_action(
 /// A joiner never sets the env: `join_cluster_and_provision_tls` writes this
 /// file from the founder's enroll response (over the token-gated channel, like
 /// the CA), and this reads it back — so the joiner authenticates cluster-minted
-/// `sk-` keys with zero local auth config. Idempotent: safe to call from the
-/// enrollment-listener setup and from `auth_posture`; the first call persists.
+/// `sk-` keys with zero local auth config. Read-only: safe to call from the
+/// enrollment-listener setup and from `auth_posture` — it never writes.
 fn effective_api_key_secret(tls_dir: &std::path::Path) -> Option<String> {
     resolve_api_key_secret(tls_dir, std::env::var("NEXUS_API_KEY_SECRET").ok())
 }
@@ -3486,6 +3493,15 @@ fn effective_api_key_secret(tls_dir: &std::path::Path) -> Option<String> {
 /// Pure decision behind [`effective_api_key_secret`]: `env_secret` is passed in
 /// (not read here) so the (persisted-file, env) resolution is unit-testable
 /// without mutating process env — mirroring `auth_posture::decide`.
+///
+/// READ-ONLY by contract. A persisted `tls/api-key-secret` (written by the
+/// enrollment client on a joiner — see `join_cluster_and_provision_tls`) wins
+/// for stability, like the persisted CA; else the env. It deliberately does NOT
+/// write: the daemon serves the resolved value directly and the joiner's file is
+/// enrollment-owned, so persisting here is both unneeded and harmful — an offline
+/// `auth mint` passes a throwaway `NEXUS_API_KEY_SECRET`, and stamping that into
+/// the node's SSOT would flip a later daemon boot from auth-off to auth-on under
+/// the wrong secret (regression guarded by `federation_survives_joiner_restart`).
 fn resolve_api_key_secret(tls_dir: &std::path::Path, env_secret: Option<String>) -> Option<String> {
     let path = tls_dir.join("api-key-secret");
     if let Ok(s) = std::fs::read_to_string(&path) {
@@ -3494,35 +3510,7 @@ fn resolve_api_key_secret(tls_dir: &std::path::Path, env_secret: Option<String>)
             return Some(s.to_string());
         }
     }
-    let env = env_secret.filter(|s| !s.is_empty())?;
-    // First-time provisioning: persist so the enroll handler serves it and a
-    // restart is stable. Best-effort; on failure keep the in-memory env value.
-    if let Err(e) = std::fs::create_dir_all(tls_dir) {
-        tracing::warn!(error = %e, "api-key-secret: could not create tls dir to persist");
-        return Some(env);
-    }
-    let write_res: std::io::Result<()> = {
-        #[cfg(unix)]
-        {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&path)
-                .and_then(|mut f| f.write_all(env.as_bytes()))
-        }
-        #[cfg(not(unix))]
-        {
-            std::fs::write(&path, env.as_bytes())
-        }
-    };
-    if let Err(e) = write_res {
-        tracing::warn!(error = %e, "api-key-secret: persist failed; using env value in-memory only");
-    }
-    Some(env)
+    env_secret.filter(|s| !s.is_empty())
 }
 
 /// Project the CLI onto the pure decision in [`auth_posture`].
@@ -3563,9 +3551,9 @@ mod tests {
     use clap::Parser;
 
     /// `resolve_api_key_secret` precedence — the (persisted-file, env) SSOT
-    /// decision. File WINS (stability, like the persisted CA); env bootstraps +
-    /// persists first-time; neither ⇒ auth-off (None). Env passed as a param, so
-    /// no process-env mutation (no parallel-test flakiness).
+    /// decision. File WINS (stability, like the persisted CA); else env, used
+    /// READ-ONLY (never persisted); neither ⇒ auth-off (None). Env passed as a
+    /// param, so no process-env mutation (no parallel-test flakiness).
     #[test]
     fn resolve_api_key_secret_precedence() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3576,23 +3564,25 @@ mod tests {
         assert_eq!(resolve_api_key_secret(p, None), None);
         assert!(!secret_file.exists(), "None case must not create the file");
 
-        // 2. No file + env ⇒ returns env AND persists it (first-time bootstrap,
-        //    so the enroll handler can serve it and a restart stays stable).
+        // 2. No file + env ⇒ returns env, and is READ-ONLY: nothing is written.
+        //    An offline `auth mint` passes a throwaway secret; persisting it would
+        //    flip a later daemon boot's auth posture (the joiner-restart regress).
         assert_eq!(
             resolve_api_key_secret(p, Some("from-env".into())).as_deref(),
             Some("from-env")
         );
-        assert_eq!(
-            std::fs::read_to_string(&secret_file).unwrap().trim(),
-            "from-env",
-            "env value must persist to the tls SSOT"
+        assert!(
+            !secret_file.exists(),
+            "resolve must be read-only — env must not be persisted"
         );
 
         // 3. File present ⇒ file WINS even if env differs — keys minted under the
         //    persisted secret must keep resolving; env cannot silently rotate it.
+        //    In production the file is enrollment-written; seed it directly here.
+        std::fs::write(&secret_file, "from-file\n").expect("seed persisted secret");
         assert_eq!(
             resolve_api_key_secret(p, Some("different-env".into())).as_deref(),
-            Some("from-env")
+            Some("from-file")
         );
 
         // 4. Empty env is treated as unset.
