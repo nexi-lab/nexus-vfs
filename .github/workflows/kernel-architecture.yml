@@ -1,7 +1,7 @@
 name: Kernel Architecture
 
 # Enforce the architectural invariants described in
-# docs/KERNEL-ARCHITECTURE.md §3, §4, §6.1.  Past PRs have placed
+# docs/KERNEL-ARCHITECTURE.html §3, §4, §6.1.  Past PRs have placed
 # federation-domain types in core/ (kernel primitives), added HAL
 # surfaces without documenting them in §3.B, or added Cargo deps
 # that would defeat the trait-based DI abstraction (e.g. kernel
@@ -13,7 +13,7 @@ name: Kernel Architecture
 # fix is to MOVE the offending file / type / dep to the correct
 # tier, NOT to extend the allow-lists below.  The allow-lists ARE
 # the SSOT for what each tier holds — extending them requires
-# updating docs/KERNEL-ARCHITECTURE.md first so the rule reflects
+# updating docs/KERNEL-ARCHITECTURE.html first so the rule reflects
 # the doc, not the other way around.
 
 on:
@@ -45,7 +45,7 @@ jobs:
             if [ $ok -eq 0 ]; then
               echo "::error file=$f::Unexpected file in kernel/src/abc/."
               echo "abc/ holds exactly the 3 §3.A ABC pillar trait files (meta_store.rs, object_store.rs, cache_store.rs) plus mod.rs."
-              echo "See docs/KERNEL-ARCHITECTURE.md §3.A."
+              echo "See docs/KERNEL-ARCHITECTURE.html §3.A."
               echo "Fix: move concrete-impl types to backends/.  If this is a brand-new pillar, document it in §3.A first."
               FAIL=1
             fi
@@ -64,7 +64,7 @@ jobs:
             if [ $ok -eq 0 ]; then
               echo "::error file=$f::Unexpected file in kernel/src/hal/."
               echo "hal/ holds only §3.B Control-Plane HAL trait files (currently: distributed_coordinator.rs, object_store_provider.rs, auth_key_store.rs, plus the peer re-export at peer.rs)."
-              echo "See docs/KERNEL-ARCHITECTURE.md §3.B."
+              echo "See docs/KERNEL-ARCHITECTURE.html §3.B."
               echo "Fix: internal DI wiring for an existing HAL goes in kernel/src/federation/ (or the matching domain submodule).  A brand-new HAL surface requires documenting in §3.B first so the table stays the SSOT."
               FAIL=1
             fi
@@ -85,7 +85,7 @@ jobs:
             if [ $ok -eq 0 ]; then
               echo "::error file=$f::Unexpected file in kernel/src/extensions/."
               echo "extensions/ holds only opt-in §3.A.2 ObjectStore extension-trait declarations (currently: llm_streaming.rs, observer_backend.rs) plus mod.rs."
-              echo "See docs/KERNEL-ARCHITECTURE.md §3.A."
+              echo "See docs/KERNEL-ARCHITECTURE.html §3.A."
               echo "Fix: concrete impls belong in backends/ next to the backend that opts in.  A brand-new extension trait requires documenting the §3.A layout list first so it stays the SSOT."
               FAIL=1
             fi
@@ -99,7 +99,7 @@ jobs:
           # whitespace, but ignores `pub use` re-exports (those are
           # fine — they don't define a new type in core/).
           #
-          # core/cas/ is exempted: per docs/KERNEL-ARCHITECTURE.md
+          # core/cas/ is exempted: per docs/KERNEL-ARCHITECTURE.html
           # §3.A.5 the CAS primitives (cas_engine, cas_chunking,
           # cas_remote — including GrpcChunkFetcher — and cas_transport)
           # stay in the kernel crate by explicit design.
@@ -111,7 +111,7 @@ jobs:
               echo "::error file=$file::$line"
             done
             echo ""
-            echo "Per docs/KERNEL-ARCHITECTURE.md §3/§4:"
+            echo "Per docs/KERNEL-ARCHITECTURE.html §3/§4:"
             echo "  * core/ is for §4 kernel primitives only (VFSRouter, LockManager, KernelDispatch, PipeManager, StreamManager, FileDescriptorTable, FileWatcher, ServiceRegistry, DriverLifecycleCoordinator, PermissionGate, AgentRegistry, PluginLoader, PermissionLeaseCache, ProcfsRegistry; plus the cas/ subfamily per §3.A.5)."
             echo "  * Federation-domain types belong in kernel/src/federation/ (siblings: coordinator_wiring.rs, grpc_ops.rs, blob_fetcher_slot.rs, route_outcomes.rs)."
             echo "  * §3.B HAL trait surfaces belong in kernel/src/hal/ (and must be documented in the §3.B table)."
@@ -141,7 +141,7 @@ jobs:
               echo "::error file=$file::$line"
             done
             echo ""
-            echo "Per docs/KERNEL-ARCHITECTURE.md §3.B.1, federation is implemented BELOW the HAL boundary (in the raft crate)."
+            echo "Per docs/KERNEL-ARCHITECTURE.html §3.B.1, federation is implemented BELOW the HAL boundary (in the raft crate)."
             echo "Kernel-side federation-domain types live in kernel/src/federation/ (siblings: coordinator_wiring.rs, grpc_ops.rs, blob_fetcher_slot.rs, route_outcomes.rs)."
             echo ""
             echo "Fix: move the type to kernel/src/federation/<appropriate-file>.rs, re-export from federation/mod.rs, update consumer imports."
@@ -151,7 +151,7 @@ jobs:
           if [ $FAIL -ne 0 ]; then
             exit 1
           fi
-          echo "Tier directory invariants OK — placement matches docs/KERNEL-ARCHITECTURE.md §3/§4."
+          echo "Tier directory invariants OK — placement matches docs/KERNEL-ARCHITECTURE.html §3/§4."
 
   crate-dep-edges:
     name: Crate dependency edges (§6.1)
@@ -164,7 +164,7 @@ jobs:
           FAIL=0
 
           # The dep-direction diagram and edge-invariants table in
-          # docs/KERNEL-ARCHITECTURE.md §6.1 are load-bearing: they
+          # docs/KERNEL-ARCHITECTURE.html §6.1 are load-bearing: they
           # are what keeps the dep graph acyclic and what lets the
           # trait-based DI abstractions (DistributedCoordinator,
           # ObjectStoreProvider) actually work.  A `kernel → raft`
@@ -192,7 +192,7 @@ jobs:
             if deps_section "$cargo" | grep -qE "^${forbidden}[[:space:]]*="; then
               echo "::error file=$cargo::Forbidden workspace dep '$forbidden' in $cargo"
               echo "  Reason: $reason"
-              echo "  See docs/KERNEL-ARCHITECTURE.md §6.1 (Edge invariants)."
+              echo "  See docs/KERNEL-ARCHITECTURE.html §6.1 (Edge invariants)."
               FAIL=1
             fi
           }
@@ -242,4 +242,4 @@ jobs:
           if [ $FAIL -ne 0 ]; then
             exit 1
           fi
-          echo "Crate dep edges OK — workspace dep graph matches docs/KERNEL-ARCHITECTURE.md §6.1."
+          echo "Crate dep edges OK — workspace dep graph matches docs/KERNEL-ARCHITECTURE.html §6.1."

@@ -1656,7 +1656,7 @@ impl Kernel {
             }
             6 => {
                 // DT_LINK — VFS-internal symlink
-                // (KERNEL-ARCHITECTURE.md "DT_LINK — Path-Internal Symlink").
+                // (KERNEL-ARCHITECTURE.html "DT_LINK — Path-Internal Symlink").
                 let target = link_target.ok_or_else(|| {
                     KernelError::PermissionDenied(
                         "sys_setattr(DT_LINK): link_target is required".to_string(),

@@ -1,5 +1,5 @@
 //! Unified lock manager — kernel primitive
-//! (KERNEL-ARCHITECTURE.md "Unified LockManager — I/O Lock + Advisory Lock").
+//! (KERNEL-ARCHITECTURE.html "Unified LockManager — I/O Lock + Advisory Lock").
 //!
 //! Two orthogonal acquire modes share one struct:
 //!   - **I/O lock** (kernel-internal): blocking, hierarchy-aware, no TTL,

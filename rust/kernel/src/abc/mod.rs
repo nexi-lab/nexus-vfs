@@ -1,5 +1,5 @@
 //! Kernel ABC pillars — the canonical "Linux `struct file_operations`"
-//! analogues from `docs/architecture/KERNEL-ARCHITECTURE.md` §3.
+//! analogues from `docs/KERNEL-ARCHITECTURE.html` §3.
 //!
 //! Strict split: this directory holds **only** the §3.A pillar
 //! trait declarations that any compliant driver impl must satisfy.

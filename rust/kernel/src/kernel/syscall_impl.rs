@@ -282,7 +282,7 @@ impl Kernel {
         };
 
         // 3a. DT_LINK transparent follow
-        // (KERNEL-ARCHITECTURE.md "DT_LINK — Path-Internal Symlink").
+        // (KERNEL-ARCHITECTURE.html "DT_LINK — Path-Internal Symlink").
         // DT_LINK target requires its own §13 permission gate +
         // §11 native PRE-read hook. Always enters via `sys_read_single`
         // so auth fires on the target path.
@@ -586,7 +586,7 @@ impl Kernel {
     // never directly through the coordinator.  The iteration loop +
     // PR #94 silent-miss observability lives in
     // `nexus_raft::distributed_coordinator::RaftDistributedCoordinator`
-    // — per `docs/KERNEL-ARCHITECTURE.md` §3, the kernel-side wiring
+    // — per `docs/KERNEL-ARCHITECTURE.html` §3, the kernel-side wiring
     // for §3.B Control-Plane HAL surfaces belongs in the federation-
     // family submodule (`core/vfs_router.rs` + `federation/`), not in
     // syscall-implementation files like syscall_impl.rs.
@@ -689,7 +689,7 @@ impl Kernel {
             .flatten();
 
         // 3a. DT_LINK transparent follow
-        // (KERNEL-ARCHITECTURE.md "DT_LINK — Path-Internal Symlink").
+        // (KERNEL-ARCHITECTURE.html "DT_LINK — Path-Internal Symlink").
         // Recursive call with `max_link_hops=0` rejects chained links via
         // this same branch.
         if let Some(e) = &entry {

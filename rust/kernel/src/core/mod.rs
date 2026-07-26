@@ -1,5 +1,5 @@
 //! Kernel `core/` — kernel primitives only (§4 of
-//! `docs/architecture/KERNEL-ARCHITECTURE.md`).
+//! `docs/KERNEL-ARCHITECTURE.html`).
 //!
 //! Strict split inside `kernel/src/`:
 //!

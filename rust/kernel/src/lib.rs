@@ -13,7 +13,7 @@ pub use contracts::ROOT_ZONE_ID;
 
 // ── §3 / §4 / HAL surface ────────────────────────────────────────────
 // Four tier-directories inside the kernel crate (see
-// `docs/architecture/KERNEL-ARCHITECTURE.md` §3 / §4 / §6.1):
+// `docs/KERNEL-ARCHITECTURE.html` §3 / §4 / §6.1):
 //   * `crate::abc`        — §3.A Storage HAL pillars (ObjectStore /
 //                           MetaStore / CacheStore). Mandatory trait
 //                           declarations, one file each.
@@ -87,7 +87,7 @@ pub(crate) use core::stream::shm as shm_stream;
 // re-exported under the historical `kernel::cas_*` flat names so
 // `backends::storage::cas_local` (and other external consumers) keep
 // their existing import paths. See
-// `docs/architecture/KERNEL-ARCHITECTURE.md` §4 for the rationale.
+// `docs/KERNEL-ARCHITECTURE.html` §4 for the rationale.
 pub use core::cas::chunking as cas_chunking;
 pub use core::cas::engine as cas_engine;
 pub use core::cas::remote as cas_remote;

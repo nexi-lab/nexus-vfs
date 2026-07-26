@@ -187,7 +187,7 @@ observer trait; it is an ordinary `ObjectStore`.
   gated on `DriverLifecycleCoordinator::is_sync_armed`.
 - **Opt-in + lifetime:** `Kernel::arm_metadata_sync` arms a mount; the DLC
   holds the handle and drops it on unmount.
-- **Architecture context + coherence taxonomy:** `KERNEL-ARCHITECTURE.md` §4.5.
+- **Architecture context + coherence taxonomy:** `KERNEL-ARCHITECTURE.html` §4.5.
 
 Symlink policy honours the backend's own `follow_symlinks` behaviour — the
 walk consults `list_dir`/`stat`, so there is no separate walker to diverge.
