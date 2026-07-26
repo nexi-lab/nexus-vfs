@@ -1495,9 +1495,10 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
                 .parse()
                 .map_err(|e| anyhow::anyhow!("enrollment listener addr '{enroll_addr}': {e}"))?;
             // Serve the cluster API-key secret to enrollees over this same
-            // token-gated channel as the CA (the single SSOT, resolved + persisted
-            // here on first boot). `None` ⇒ auth-off — the response omits it and
-            // joiners stay auth-off too.
+            // token-gated channel as the CA. Resolved read-only (env on a founder,
+            // else this node's own enrolled file) and served verbatim — the
+            // enrollee persists what it receives, so nothing is written here.
+            // `None` ⇒ auth-off: the response omits it and joiners stay auth-off too.
             let api_key_secret = effective_api_key_secret(&tls_dir);
             zm.runtime_handle().spawn(async move {
                 if let Err(e) = nexus_raft::transport::serve_node_enrollment(
