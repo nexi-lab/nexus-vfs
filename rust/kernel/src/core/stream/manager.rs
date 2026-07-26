@@ -10,8 +10,20 @@
 use crate::stream::{MemoryStreamBackend, StreamBackend, StreamError};
 use dashmap::DashMap;
 use parking_lot::{Condvar, Mutex};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+
+/// Builds a backend for a path whose local registration is missing — the seam
+/// the kernel injects (via [`StreamManager::set_materializer`]) so a wal
+/// DT_STREAM created on a PEER, whose entries replicated in but whose local
+/// handle was never built, can be resolved on first read/write instead of
+/// failing `NotFound`. `None` ⇒ not materializable here (not a replicated
+/// stream / federation not wired) ⇒ the caller keeps the genuine miss.
+///
+/// Deliberately opaque: the manager stays a pure registry and never learns
+/// about the metastore / raft / zones — that knowledge lives entirely in the
+/// injected closure, so no upward dependency leaks into `core::stream`.
+type StreamMaterializer = Box<dyn Fn(&str) -> Option<Arc<dyn StreamBackend>> + Send + Sync>;
 
 // ---------------------------------------------------------------------------
 // Per-stream notification
@@ -54,6 +66,11 @@ impl StreamNotify {
 pub struct StreamManager {
     buffers: DashMap<String, Arc<dyn StreamBackend>>,
     notify: DashMap<String, Arc<StreamNotify>>,
+    /// Miss-materializer injected once at federation boot. `None` on a
+    /// non-federated kernel, so [`Self::resolve`] is then behaviourally
+    /// identical to a bare `buffers.get` — the lazy path only ever affects
+    /// federated cold reads.
+    materializer: OnceLock<StreamMaterializer>,
 }
 
 impl Default for StreamManager {
@@ -67,7 +84,49 @@ impl StreamManager {
         Self {
             buffers: DashMap::new(),
             notify: DashMap::new(),
+            materializer: OnceLock::new(),
         }
+    }
+
+    /// Install the miss-materializer (once). The kernel calls this at
+    /// federation boot with a closure that builds a `WalStreamCore` over the
+    /// path's zone metastore. Idempotent — a second set is silently dropped.
+    pub fn set_materializer(&self, f: StreamMaterializer) {
+        let _ = self.materializer.set(f);
+    }
+
+    /// THE single point every data op (read/write/tail) resolves a backend
+    /// through. A registry hit returns the backend; a miss delegates to the
+    /// injected materializer (a peer-created wal DT_STREAM whose entries
+    /// replicated in but whose local handle was never built).
+    ///
+    /// Routing ALL data ops through here is the invariant that makes "a new
+    /// read/write op forgot to materialize" *unrepresentable*: the backend is
+    /// private, so no op can reach it any other way. Lifecycle ops
+    /// (`create`/`register`/`destroy`/`close`/`has`) deliberately do NOT go
+    /// through here — they operate on the local registry as such.
+    ///
+    /// Hot path (hit) is inlined to a single `DashMap` lookup — zero call
+    /// overhead vs. the pre-chokepoint code; the cold miss is out-of-line.
+    #[inline]
+    fn resolve(&self, path: &str) -> Option<Arc<dyn StreamBackend>> {
+        if let Some(b) = self.buffers.get(path) {
+            return Some(Arc::clone(b.value()));
+        }
+        self.materialize_miss(path)
+    }
+
+    /// Cold path of [`Self::resolve`]: ask the injected materializer, register
+    /// what it built (idempotent — another thread may have won the race), and
+    /// return the *canonical* registered backend. Kept `#[cold]` +
+    /// `#[inline(never)]` so its bulk never bloats the inlined hot path.
+    #[cold]
+    #[inline(never)]
+    fn materialize_miss(&self, path: &str) -> Option<Arc<dyn StreamBackend>> {
+        let backend = (self.materializer.get()?)(path)?;
+        // Ignore `Exists`: a concurrent resolve may have registered first.
+        let _ = self.register(path, backend);
+        self.buffers.get(path).map(|r| Arc::clone(r.value()))
     }
 
     /// Create a new in-memory stream backend and register it.
@@ -133,8 +192,7 @@ impl StreamManager {
     /// Non-blocking write. Returns byte offset.
     pub fn write_nowait(&self, path: &str, data: &[u8]) -> Result<usize, StreamManagerError> {
         let buf = self
-            .buffers
-            .get(path)
+            .resolve(path)
             .ok_or_else(|| StreamManagerError::NotFound(path.to_string()))?;
         let offset = buf.push(data).map_err(StreamManagerError::Backend)?;
         // Wake blocked readers — see StreamNotify::wake_all_readers doc.
@@ -151,8 +209,7 @@ impl StreamManager {
         offset: usize,
     ) -> Result<Option<(Vec<u8>, usize)>, StreamManagerError> {
         let buf = self
-            .buffers
-            .get(path)
+            .resolve(path)
             .ok_or_else(|| StreamManagerError::NotFound(path.to_string()))?;
         match buf.read_at(offset) {
             Ok((data, next)) => Ok(Some((data, next))),
@@ -171,12 +228,9 @@ impl StreamManager {
         offset: usize,
         timeout_ms: u64,
     ) -> Result<(Vec<u8>, usize), StreamManagerError> {
-        let buf = Arc::clone(
-            self.buffers
-                .get(path)
-                .ok_or_else(|| StreamManagerError::NotFound(path.to_string()))?
-                .value(),
-        );
+        let buf = self
+            .resolve(path)
+            .ok_or_else(|| StreamManagerError::NotFound(path.to_string()))?;
         let notify = Arc::clone(
             self.notify
                 .get(path)
@@ -239,8 +293,7 @@ impl StreamManager {
         count: usize,
     ) -> Result<(Vec<Vec<u8>>, usize), StreamManagerError> {
         let buf = self
-            .buffers
-            .get(path)
+            .resolve(path)
             .ok_or_else(|| StreamManagerError::NotFound(path.to_string()))?;
         buf.read_batch(offset, count)
             .map_err(StreamManagerError::Backend)
@@ -257,8 +310,7 @@ impl StreamManager {
     /// producer finishes pumping tokens.
     pub fn collect_all_payloads(&self, path: &str) -> Result<Vec<u8>, StreamManagerError> {
         let buf = self
-            .buffers
-            .get(path)
+            .resolve(path)
             .ok_or_else(|| StreamManagerError::NotFound(path.to_string()))?;
         let tail = buf.tail_offset();
         let mut out = Vec::with_capacity(tail);
@@ -276,9 +328,11 @@ impl StreamManager {
         Ok(out)
     }
 
-    /// Get a backend reference (for sys_read/sys_write fast-path).
+    /// Get a backend reference (for sys_read/sys_write fast-path). Resolves
+    /// through the chokepoint, so a cold sys_read/sys_write of a peer-created
+    /// wal stream materializes its local handle instead of missing.
     pub fn get(&self, path: &str) -> Option<Arc<dyn StreamBackend>> {
-        self.buffers.get(path).map(|r| Arc::clone(r.value()))
+        self.resolve(path)
     }
 
     /// Current tail (write offset) of a registered stream.
@@ -287,7 +341,7 @@ impl StreamManager {
     /// this for the seek-to-end pattern: `cursor = tail(path)` then
     /// `read_at(path, cursor)` skips all history and blocks for new data.
     pub fn tail(&self, path: &str) -> Option<usize> {
-        self.buffers.get(path).map(|b| b.tail_offset())
+        self.resolve(path).map(|b| b.tail_offset())
     }
 
     /// Append all entries from `from` (starting at `from_offset`) into `to`.
@@ -306,12 +360,10 @@ impl StreamManager {
         from_offset: usize,
     ) -> Result<(usize, usize), StreamManagerError> {
         let src = self
-            .buffers
-            .get(from)
+            .resolve(from)
             .ok_or_else(|| StreamManagerError::NotFound(from.to_string()))?;
         let dst = self
-            .buffers
-            .get(to)
+            .resolve(to)
             .ok_or_else(|| StreamManagerError::NotFound(to.to_string()))?;
 
         let mut offset = from_offset;

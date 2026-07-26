@@ -125,19 +125,27 @@ async fn mailbox_round(owner_port: u16, sender_port: u16, sender_name: &str, age
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn mailbox_write_wakes_a_peers_parked_sys_watch_both_directions() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+/// Boot a founder (owns `ZONE` at `MOUNT`) + a joiner (DiscoverZones), both
+/// auth-off loopback, blocking until BOTH have REGISTERED `ZONE`. Returns the
+/// live daemons + dialed clients + ports; the caller keeps the daemons alive
+/// (dropping a `Daemon` kills it) and keeps `tmp` alive for the data dirs.
+///
+/// The joiner's boot is gated on the founder's `Zone '…' registered` log:
+/// readdir/stat on the `/agents` mount point don't distinguish a live
+/// federation mount from a root-served empty path, so probing them lets the
+/// joiner's DiscoverZones race — and lose to — the founder's registration,
+/// leaving it rootless (it does not retry) so nothing replicates. The log line
+/// is the reliable signal.
+async fn boot_federation(tmp: &std::path::Path) -> (Daemon, Daemon, Vfs, Vfs, u16, u16) {
     let fport = free_port();
     let jport = free_port();
-
-    let fdata = tmp.path().join("f-data");
+    let fdata = tmp.join("f-data");
     let fdata = fdata.to_string_lossy();
-    let fid = tmp.path().join("f-id");
+    let fid = tmp.join("f-id");
     let fid = fid.to_string_lossy();
-    let jdata = tmp.path().join("j-data");
+    let jdata = tmp.join("j-data");
     let jdata = jdata.to_string_lossy();
-    let jid = tmp.path().join("j-id");
+    let jid = tmp.join("j-id");
     let jid = jid.to_string_lossy();
 
     let fadv = format!("127.0.0.1:{fport}");
@@ -146,8 +154,8 @@ async fn mailbox_write_wakes_a_peers_parked_sys_watch_both_directions() {
     let peers = format!("127.0.0.1:{fport}");
     let fbind = format!("127.0.0.1:{fport}");
     let jbind = format!("127.0.0.1:{jport}");
+    let zone_registered = format!("Zone '{ZONE}' registered");
 
-    // ── 1. Boot founder (owner) then joiner (DiscoverZones) ────────────
     let mut founder = Daemon::spawn(
         &["--bind-addr", &fbind],
         &founder_env(&fdata, &fid, &fadv, &mounts),
@@ -156,32 +164,76 @@ async fn mailbox_write_wakes_a_peers_parked_sys_watch_both_directions() {
         .wait_tcp(fport, BUDGET)
         .await
         .expect("founder serves");
-    // Gate the joiner's boot on the founder having REGISTERED sharedzone.
-    // readdir/stat on the /agents mount point don't distinguish a live
-    // federation mount from a root-served empty path (readdir returns non-error
-    // for any path; stat returns not-found for a mount point), so probing them
-    // lets the joiner boot early and its DiscoverZones race — and lose to —
-    // this registration, leaving it rootless (it does not retry) so nothing
-    // ever replicates. The zone-registration log line is the reliable signal.
-    let zone_registered = format!("Zone '{ZONE}' registered");
     founder
         .wait_for_log(&zone_registered, BUDGET)
         .await
         .expect("founder must register sharedzone");
-    let mut fc = Vfs::dial(fport).await.expect("dial founder");
+    let fc = Vfs::dial(fport).await.expect("dial founder");
 
     let mut joiner = Daemon::spawn(
         &["--bind-addr", &jbind],
         &joiner_env(&jdata, &jid, &jadv, &peers),
     );
     joiner.wait_tcp(jport, BUDGET).await.expect("joiner serves");
-    // The joiner joins sharedzone via DiscoverZones; wait until it has actually
-    // registered the zone (joined), not come up rootless.
     joiner
         .wait_for_log(&zone_registered, BUDGET)
         .await
         .expect("joiner must join sharedzone");
-    let mut jc = Vfs::dial(jport).await.expect("dial joiner");
+    let jc = Vfs::dial(jport).await.expect("dial joiner");
+
+    (founder, joiner, fc, jc, fport, jport)
+}
+
+/// Cross-machine COLD read: a wal DT_STREAM created + written on the founder
+/// must be readable on the joiner with a bare `stream_collect_all` — NO prior
+/// `create_stream`/`setattr` and NO `watch` on the joiner to materialize it.
+///
+/// Regression guard for the A2A mailbox cold-read gap: the DT_STREAM inode +
+/// entries replicate via raft, but a replica's local `StreamManager` handle is
+/// only built on an explicit open. Reads used to miss (`StreamNotFound`) until
+/// something setattr'd/armed a watch first — so "messages are always there,
+/// read them any time" did NOT hold cross-node. `Kernel::arm_stream_materializer`
+/// closes it by resolving-or-materializing through the single `StreamManager`
+/// chokepoint. This mirrors the live Win↔Mac bug exactly (peer wrote, reader
+/// cold-collected). Distinct from `mailbox_round`, whose reader opens/arms first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cold_collect_reads_a_peer_created_wal_stream_without_open_or_watch() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_founder, _joiner, mut fc, mut jc, _fport, _jport) = boot_federation(tmp.path()).await;
+
+    // Founder creates a wal DT_STREAM (NOT a chat-with-me, so no stamp envelope
+    // wraps the payload — a clean exact-bytes assertion) and writes one frame.
+    let probe = format!("{MOUNT}/cold-probe");
+    fc.create_stream(&probe, "")
+        .await
+        .expect("founder creates wal stream");
+    fc.stream_write(&probe, b"hello-cold", "")
+        .await
+        .expect("founder writes frame");
+
+    // Joiner reads it COLD — no create_stream, no watch. Poll only for raft
+    // replication timing (inode + entry apply), never re-opening the stream.
+    let deadline = std::time::Instant::now() + BUDGET;
+    let got = loop {
+        match jc.stream_collect_all(&probe, "").await {
+            Ok(bytes) if bytes == b"hello-cold" => break bytes,
+            _ if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            other => panic!(
+                "cold stream_collect_all never returned the peer's bytes \
+                 (materialize-on-read regressed): last = {other:?}"
+            ),
+        }
+    };
+    assert_eq!(got, b"hello-cold");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mailbox_write_wakes_a_peers_parked_sys_watch_both_directions() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // `founder` is dropped in step 9 (kill-leader); `_joiner` just stays alive.
+    let (founder, _joiner, mut fc, mut jc, fport, jport) = boot_federation(tmp.path()).await;
 
     // ── 2. Federation health — founder writes, joiner reads back ───────
     let health = format!("{MOUNT}/health-founder.txt");

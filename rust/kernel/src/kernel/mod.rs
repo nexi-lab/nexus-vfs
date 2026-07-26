@@ -1965,22 +1965,71 @@ impl Kernel {
     /// available (federation not wired) so the caller falls through the
     /// io_profile waterfall; a register failure propagates as `Err`.
     fn install_wal_stream(&self, path: &str) -> Result<bool, KernelError> {
+        match self.wal_backend_for(path) {
+            Some(backend) => {
+                self.stream_manager
+                    .register(path, backend)
+                    .map_err(stream_mgr_err)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Build (but do NOT register) a WAL DT_STREAM backend for `path`, over the
+    /// metastore of the path's resolved zone. `None` when no zone metastore is
+    /// available (federation not wired) — the caller then keeps a genuine miss.
+    ///
+    /// Read-only + raft-safe: constructs a `WalStreamCore` (a stateless view
+    /// over the replicated store) and proposes NOTHING — no raft command, no
+    /// inode write, no term/vote mutation. Safe on any replica for a stream
+    /// created elsewhere; entries read straight from the committed log. Shared
+    /// by `install_wal_stream` (setattr / reopen) and the StreamManager
+    /// miss-materializer (cold read/write), so both build the identical backend.
+    fn wal_backend_for(&self, path: &str) -> Option<Arc<dyn crate::stream::StreamBackend>> {
         let zone_id = self
             .vfs_router
             .route(path, contracts::ROOT_ZONE_ID)
             .map(|r| r.zone_id)
             .unwrap_or_else(|| contracts::ROOT_ZONE_ID.to_string());
-        if let Ok(store) = self
+        let store = self
             .distributed_coordinator()
             .metastore_for_zone(self, &zone_id)
-        {
-            let backend = crate::core::stream::wal::WalStreamCore::new(store, path.to_string());
-            self.stream_manager
-                .register(path, Arc::new(backend))
-                .map_err(stream_mgr_err)?;
-            return Ok(true);
-        }
-        Ok(false)
+            .ok()?;
+        Some(Arc::new(crate::core::stream::wal::WalStreamCore::new(
+            store,
+            path.to_string(),
+        )))
+    }
+
+    /// Arm the StreamManager's miss-materializer so a COLD read/write of a wal
+    /// DT_STREAM created on a PEER (entries + inode replicated in, but its local
+    /// StreamManager handle never built) resolves the backend on first access
+    /// instead of failing `StreamNotFound`. Without this, only an explicit
+    /// `setattr`-reopen (`setattr_stream`) rebuilt the handle — so a bare
+    /// `sys_read` / `stream_collect_all` / watch on a replica missed, which is
+    /// exactly the A2A mailbox cross-machine cold-read gap.
+    ///
+    /// Called once at federation boot, right after `set_distributed_coordinator`
+    /// (which the sole real coordinator installs via `install_with_kernel`), so
+    /// "coordinator wired ⇔ cold reads materialize" holds by construction — a
+    /// future read op cannot reintroduce the gap because every data op resolves
+    /// through the single `StreamManager::resolve` chokepoint.
+    ///
+    /// Gate + raft-safety: materializes ONLY when the path already has a
+    /// DT_STREAM inode (a real, replicated stream — never fabricated) and
+    /// delegates to `wal_backend_for`, which proposes nothing. The `Weak` self
+    /// reference breaks the cycle (kernel → stream_manager → closure → kernel).
+    pub fn arm_stream_materializer(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        self.stream_manager
+            .set_materializer(Box::new(move |path: &str| {
+                let kernel = weak.upgrade()?;
+                match kernel.metastore_get(path).ok().flatten() {
+                    Some(meta) if meta.entry_type == DT_STREAM => kernel.wal_backend_for(path),
+                    _ => None,
+                }
+            }));
     }
 
     fn install_stream_backend(
