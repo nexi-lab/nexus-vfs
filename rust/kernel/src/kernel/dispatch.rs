@@ -563,7 +563,7 @@ mod permission_gate_protective_tests {
     //! them with an `Arc<dyn PermissionProvider>` slot; these tests
     //! prevent a future patch from accidentally re-introducing an
     //! always-on gate that would break the "kernel clean by default"
-    //! contract documented in KERNEL-ARCHITECTURE.md §13.
+    //! contract documented in KERNEL-ARCHITECTURE.html §13.
 
     use super::*;
     use crate::kernel::Kernel;

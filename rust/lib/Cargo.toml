@@ -2,7 +2,7 @@
 name = "lib"
 version = "0.1.0"
 edition = "2021"
-description = "Shared Rust utilities — bloom, hash, search, trigram, ReBAC, path/prefix/simd/io/glob (WASM/edge compatible by default). Linux libc analogue per KERNEL-ARCHITECTURE.md §6."
+description = "Shared Rust utilities — bloom, hash, search, trigram, ReBAC, path/prefix/simd/io/glob (WASM/edge compatible by default). Linux libc analogue per KERNEL-ARCHITECTURE.html §6."
 
 [lib]
 name = "lib"

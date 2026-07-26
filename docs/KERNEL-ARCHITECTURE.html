@@ -1,0 +1,1935 @@
+<!DOCTYPE html>
+<!--
+  Nexus Kernel Architecture — SSOT for the kernel tier: interface taxonomy,
+  syscall surface, HAL contracts, primitives, dispatch model, plugin ABI.
+
+  Self-contained: no build step, no JS bundler. Renders identically as
+  `file://` open and as a ShareOne-hosted page.
+
+  Published to ShareOne via remote-URL against this repo's `main`. Edits
+  land by merging to `main`; the ShareOne snapshot re-checks on next
+  access. See docs/README of the shareone-skill (`workflows/publish-text-page.md`
+  §GitHub remote-url) for the publish command.
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Nexus Kernel Architecture</title>
+<style>
+  :root {
+    --bg: #0f172a;
+    --surface: #1e293b;
+    --surface-alt: #172033;
+    --fg: #e2e8f0;
+    --muted: #94a3b8;
+    --accent: #60a5fa;
+    --accent-dim: rgba(96, 165, 250, 0.12);
+    --warn: rgba(251, 191, 36, 0.18);
+    --warn-fg: #fcd34d;
+    --code-bg: #1e293b;
+    --border: #334155;
+  }
+  * { box-sizing: border-box; }
+  html, body { background: var(--bg); }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                 "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    color: var(--fg);
+    max-width: 1040px;
+    margin: 0 auto;
+    padding: 60px 28px 100px;
+    line-height: 1.65;
+    font-size: 16px;
+  }
+  h1 { font-size: 28px; margin-bottom: 4px; }
+  h2 {
+    font-size: 22px;
+    margin-top: 56px;
+    padding-top: 24px;
+    border-top: 2px solid var(--border);
+    color: var(--fg);
+  }
+  h3 { font-size: 18px; margin-top: 32px; color: var(--accent); }
+  h4 { font-size: 15px; margin-top: 22px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+  .meta { color: var(--muted); font-size: 14px; margin-bottom: 24px; }
+  .callout {
+    background: var(--accent-dim);
+    border-left: 4px solid var(--accent);
+    padding: 14px 20px;
+    margin: 20px 0;
+    border-radius: 4px;
+  }
+  .callout-warn { background: var(--warn); border-left-color: #f59e0b; color: var(--warn-fg); }
+  .role-badge {
+    display: inline-block;
+    background: var(--surface);
+    color: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 8px;
+    font-size: 12px;
+    margin-right: 6px;
+    text-transform: none;
+    letter-spacing: 0;
+  }
+  code {
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-family: "SF Mono", Consolas, monospace;
+    font-size: 13px;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 14px 16px;
+    border-radius: 6px;
+    overflow-x: auto;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  pre code { background: transparent; padding: 0; font-size: 13px; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 16px 0;
+    font-size: 14px;
+  }
+  th, td {
+    border: 1px solid var(--border);
+    padding: 8px 12px;
+    text-align: left;
+    vertical-align: top;
+  }
+  th { background: var(--surface); font-weight: 600; color: var(--fg); }
+  tbody tr:nth-child(even) td { background: var(--surface-alt); }
+  hr { border: none; border-top: 1px solid var(--border); margin: 36px 0; }
+  ul li, ol li { margin: 4px 0; }
+  blockquote {
+    border-left: 3px solid var(--border);
+    color: var(--muted);
+    padding: 4px 16px;
+    margin: 16px 0;
+  }
+  .toc {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 18px 22px;
+    margin: 24px 0 32px;
+    columns: 2;
+    column-gap: 32px;
+  }
+  .toc ol { margin: 8px 0 0 16px; padding: 0; }
+  .toc li { margin: 4px 0; break-inside: avoid; }
+  a { color: var(--accent); }
+  a:hover { text-decoration: underline; }
+  footer { margin-top: 80px; color: var(--muted); font-size: 13px; text-align: center; }
+  pre.mermaid {
+    background: none;
+    border: none;
+    text-align: center;
+    padding: 20px 0;
+    visibility: hidden;
+  }
+  pre.mermaid[data-processed] { visibility: visible; }
+</style>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+</head>
+<body>
+
+<h1>Nexus Kernel Architecture</h1>
+<p class="meta">
+  Kernel-tier SSOT &mdash; interface taxonomy, syscall surface, HAL contracts, primitives, dispatch model, plugin ABI.
+  Kept small and precise: prefer inplace edits over additions. Detail lives in the linked companion docs (see &sect;11).
+</p>
+
+<div class="callout">
+  <strong>Peer docs</strong> &mdash; SSOT-partitioned; this doc links out rather than duplicating.
+  <ul style="margin:8px 0 0">
+    <li><a href="https://s.shareone.vip/s/nexus-integration-architecture">Nexus Integration Architecture</a> &mdash; sudowork &harr; nexus &harr; sudo-code integration surface (identity, A2A, audit, transport)</li>
+    <li><a href="https://github.com/nexi-lab/nexus-vfs/blob/main/docs/federation-architecture.md">federation-architecture</a> &mdash; Raft, zone topology, gRPC transport</li>
+    <li><a href="https://github.com/nexi-lab/nexus-vfs/blob/main/docs/data-storage-matrix.md">data-storage-matrix</a> &mdash; per-data-type pillar mapping</li>
+    <li><a href="https://github.com/nexi-lab/nexus-vfs/blob/main/docs/observer-backend-contract.md">observer-backend-contract</a> &mdash; MetadataSync design</li>
+    <li><a href="https://github.com/nexi-lab/nexus-vfs/blob/main/docs/syscall-design.md">syscall-design</a> &mdash; per-syscall primitive matrix and design rationale</li>
+  </ul>
+</div>
+
+<nav class="toc">
+  <strong>Contents</strong>
+  <ol>
+    <li><a href="#design-philosophy">Design Philosophy</a></li>
+    <li><a href="#syscalls">User Contract &mdash; Syscall Interface</a></li>
+    <li><a href="#hal">HAL &mdash; Storage HAL &amp; Control-Plane HAL</a></li>
+    <li><a href="#primitives">Kernel Primitives</a></li>
+    <li><a href="#standards">Kernel-Authored Standards</a></li>
+    <li><a href="#tier-neutral">Tier-Neutral Infrastructure &amp; Workspace Composition</a></li>
+    <li><a href="#profiles">Deployment Profiles</a></li>
+    <li><a href="#communication">Communication</a></li>
+    <li><a href="#plugin-architecture">Plugin Architecture &mdash; dylib Hot-Swap</a></li>
+    <li><a href="#dispatch-lifecycle">Appendix A: Dispatch Hook Lifecycle (write path)</a></li>
+    <li><a href="#cross-refs">Appendix B: Cross-References</a></li>
+  </ol>
+</nav>
+
+<!-- ================================================================ -->
+<h2 id="design-philosophy">1. Design Philosophy</h2>
+
+<p>NexusFS follows an OS-inspired layered architecture: services run in user-space over a minimal kernel that talks to swappable drivers through capability-typed HAL traits.</p>
+
+<pre class="mermaid">
+graph TB
+    S["SERVICES &mdash; user space<br/><span style='color:#94a3b8'>Installable/removable: ReBAC, Auth, Agents,<br/>Scheduler, Search, 40+ scenario protocols</span>"]
+    K["KERNEL &mdash; minimal compilable unit<br/><span style='color:#94a3b8'>VFS, syscall dispatch,<br/>MetastoreABC &amp; ObjectStoreABC declarations</span>"]
+    D["DRIVERS &mdash; pluggable at startup<br/><span style='color:#94a3b8'>redb, S3, LocalDisk, gRPC,<br/>Postgres, connectors</span>"]
+
+    S -.->|"protocol interface (sys_*)"| K
+    K -.->|"dependency injection (Arc&lt;dyn Trait&gt;)"| D
+
+    classDef svc fill:#1e293b,stroke:#60a5fa,stroke-width:2px,color:#e2e8f0
+    classDef ker fill:#0f172a,stroke:#fcd34d,stroke-width:3px,color:#e2e8f0
+    classDef drv fill:#1e293b,stroke:#94a3b8,stroke-width:2px,color:#e2e8f0
+    class S svc
+    class K ker
+    class D drv
+</pre>
+
+<h3 id="interface-taxonomy">1.1 Interface Taxonomy</h3>
+
+<p>Every kernel interface belongs to exactly one of four categories. Direction, audience, and the kernel&rsquo;s relationship to the interface all fall out of the category.</p>
+
+<pre class="mermaid">
+graph LR
+    U["Users / AI / agents / services"]
+    S["Services tier"]
+    K[["KERNEL"]]
+    H["Driver implementors"]
+
+    U -->|"&sect;2 &mdash; User Contract (&uarr;)<br/>Tier 1 sys_* &mdash; kernel IMPLEMENTS"| K
+    K ==>|"&sect;5 &mdash; Kernel-Authored Standard (&harr;)<br/>Service protocols, RecordStoreABC &mdash; kernel DEFINES, services own"| S
+    K -->|"&sect;3 &mdash; HAL Driver Contract (&darr;)<br/>MetaStore, ObjectStore, CacheStore &mdash; kernel REQUIRES"| H
+    K -.->|"&sect;4 &mdash; Kernel Primitive (internal)<br/>VFSRouter, LockManager, KernelDispatch &mdash; kernel OWNS"| K
+</pre>
+
+<div class="callout">
+  Tier 1 is the only user-facing interface. Tier 3 primitives are for trusted kernel modules (federation resolvers, ACP) &mdash; analogous to Linux <code>EXPORT_SYMBOL</code>.
+</div>
+
+<h3 id="swap-tiers">1.2 Swap Tiers</h3>
+
+<p>Monolithic kernel model (Linux, not microkernel): swap latency drops as you move down the stack.</p>
+
+<table>
+  <thead><tr><th>Tier</th><th>Swap time</th><th>Nexus examples</th><th>Syscall handle</th><th>Linux analogue</th></tr></thead>
+  <tbody>
+    <tr><td>Static kernel</td><td><em>never</em></td><td>MetastoreABC, VFS <code>route()</code>, syscall dispatch</td><td>&mdash;</td><td><code>vmlinuz</code> core (scheduler, mm, VFS)</td></tr>
+    <tr><td>Drivers</td><td>Runtime mount/unmount</td><td>redb, S3, PostgreSQL, Dragonfly, SearchBrick</td><td><code>sys_setattr(DT_MOUNT)</code> / <code>rmdir</code></td><td><code>mount</code> / <code>umount</code></td></tr>
+    <tr><td>Services</td><td>Runtime register/swap</td><td>40+ protocols (ReBAC, Mount, Auth, Agents, Search, Skills, &hellip;)</td><td><code>sys_setattr("/__sys__/services/X")</code> / <code>sys_unlink</code></td><td><code>insmod</code> / <code>rmmod</code></td></tr>
+  </tbody>
+</table>
+
+<h3 id="deployment-modes">1.3 Deployment Modes</h3>
+
+<p>Services and drivers ride on three deployment substrates. All three surface as <code>Arc&lt;dyn RustService&gt;</code> / <code>Arc&lt;dyn ObjectStore&gt;</code> through <code>ServiceRegistry</code> &amp; <code>VFSRouter</code> &mdash; the kernel dispatches uniformly.</p>
+
+<pre class="mermaid">
+graph TB
+    subgraph C["Compiled-in"]
+        C1["Cargo feature gate<br/>(&sect;7.2)"]
+        C2["Perf: zero-cost trait dispatch<br/>VFS hooks: full (direct trait objects)"]
+        C3["Use: kernel-coupled services<br/>(ReBAC, AuditHook, AgentStatusResolver),<br/>perf-critical drivers"]
+    end
+    subgraph D["dylib"]
+        D1["PluginLoader dlopen<br/>(&sect;9)"]
+        D2["Perf: ~ns C ABI<br/>VFS hooks: RPC dispatch;<br/>C ABI wrapper for hooks"]
+        D3["Use: cross-repo services (vault),<br/>independent storage drivers"]
+    end
+    subgraph G["gRPC sidecar"]
+        G1["Separate process,<br/>ManagedServiceGrpcProxy"]
+        G2["Perf: ~100&micro;s (network RTT)<br/>VFS hooks: out-of-process"]
+        G3["Use: other-language services<br/>(Python, Go), independent microservices"]
+    end
+
+    C -.-> R
+    D -.-> R
+    G -.-> R
+    R[["Kernel:<br/>uniform Arc&lt;dyn RustService&gt; / Arc&lt;dyn ObjectStore&gt;<br/>via ServiceRegistry / VFSRouter"]]
+</pre>
+
+<div class="callout">
+  <strong>Two swap kinds &mdash; instance vs code.</strong>
+  <ul style="margin:6px 0 0">
+    <li><em>Instance swap</em> (kernel primitive, shared by all three modes): <code>swap_managed_service()</code> runs <code>unhook &rarr; drain &rarr; replace &rarr; rehook</code>. Use for config-driven re-init, feature toggling, dylib code reload.</li>
+    <li><em>Code swap</em> (dylib-mode exclusive): loading new compiled code at runtime, via <code>PluginLoader</code>.</li>
+  </ul>
+</div>
+
+<h3 id="direction-invariant">1.4 Dependency Direction Invariant</h3>
+
+<pre class="mermaid">
+graph LR
+    K[["KERNEL"]]
+    S["Services"]
+    D["Drivers"]
+    F["Factory<br/>(init system)"]
+    R["ServiceRegistry<br/>(kernel-owned)"]
+
+    S -->|"depends on"| K
+    D -->|"mounted via sys_setattr(DT_MOUNT)"| K
+    K -->|"never reads<br/>service containers"| S
+    F -->|"boots services via<br/>sys_setattr('/__sys__/services/X')"| R
+    R -->|"nx.service('name') lookup"| K
+
+    classDef k fill:#0f172a,stroke:#fcd34d,stroke-width:3px
+    class K k
+</pre>
+
+<p>The kernel operates with zero services loaded. Kernel code reaches services only via <code>ServiceRegistry</code> lookups or factory-injected closures &mdash; never a direct import.</p>
+
+<h3 id="service-lifecycle">1.5 Service Lifecycle</h3>
+
+<p><code>factory/</code> acts as the init system (like systemd). Boot sequence:</p>
+
+<pre class="mermaid">
+sequenceDiagram
+    participant F as factory<br/>(create_nexus_services)
+    participant K as NexusFS<br/>(kernel constructor)
+    participant W as _wire_services
+    participant I as _initialize_services
+    participant R as ServiceRegistry
+    participant D as KernelDispatch
+
+    F->>F: 1. _boot_pre_kernel_services()<br/>+ _boot_independent_bricks()<br/>+ _boot_dependent_bricks()
+    F->>K: 2. NexusFS() &mdash; instantiate primitives<br/>(no I/O, router passed directly)
+    K-->>W: 3. wire topology,<br/>boot post-kernel services
+    W->>R: enlist services
+    W-->>I: 4. register VFS hooks,<br/>bind IPC adapter
+    I->>D: hook_spec() &rarr; HookRegistry
+    R-->>K: BackgroundService.start()<br/>(dependency order)
+    Note over K,D: Kernel handles start() / stop() /<br/>hook install / hook unregister
+</pre>
+
+<p>Service authors write two things and the kernel handles the rest:</p>
+
+<table>
+  <thead><tr><th>Mechanism</th><th>Methods</th><th>Kernel auto-manages</th></tr></thead>
+  <tbody>
+    <tr><td><code>BackgroundService</code> protocol</td><td><code>start()</code>, <code>stop()</code></td><td><code>start()</code> on bootstrap in dependency order; <code>stop()</code> on shutdown in reverse order</td></tr>
+    <tr><td>Duck-typed <code>hook_spec()</code></td><td><code>hook_spec() &rarr; HookSpec</code></td><td>Hook registration into <code>KernelDispatch</code> at <code>enlist()</code> time; unregister at shutdown</td></tr>
+  </tbody>
+</table>
+
+<h3 id="kernel-di">1.6 Kernel DI Patterns</h3>
+
+<p>Two mechanisms. Kernel reaches services only through <code>ServiceRegistry</code> lookups or factory-injected closures &mdash; nothing else.</p>
+
+<pre class="mermaid">
+graph TB
+    subgraph OwnPattern["Kernel OWNS"]
+        O1["Kernel __init__ creates instance"]
+        O2["Examples:<br/>LockManager, KernelDispatch, PipeManager,<br/>StreamManager, FileWatcher,<br/>ServiceRegistry, DriverLifecycleCoordinator"]
+    end
+    subgraph KnowPattern["Kernel KNOWS (sentinel)"]
+        K1["Kernel __init__ sets self._x = None"]
+        K2["Factory _do_link() injects real value<br/>at link time"]
+        K3["None &rArr; graceful degrade"]
+        K4["Examples:<br/>_token_manager, _sandbox_manager,<br/>_coordination_client, _event_client"]
+    end
+
+    OwnPattern -.->|"kernel is authoritative"| K
+    KnowPattern -.->|"Linux LSM pattern &mdash;<br/>default + factory override"| K
+    K[["Kernel struct"]]
+
+    classDef k fill:#0f172a,stroke:#fcd34d,stroke-width:3px
+    class K k
+</pre>
+
+<h3 id="permission-gate">1.7 Permission Gate &mdash; Hook Point, Not Logic</h3>
+
+<pre class="mermaid">
+graph LR
+    C["Caller (sys_*)"] --> G{{"Permission Gate<br/>(kernel hook point)"}}
+    G -->|"no provider installed<br/>~2ns (ArcSwapOption load + None)"| PASS[["Ok(())"]]
+    G -->|"provider installed"| P["Arc&lt;dyn PermissionProvider&gt;"]
+    P --> IMPL["rust/permission/ &mdash;<br/>ZonePermsProvider<br/>(path-aware + lease cache)"]
+    IMPL -->|"Ok / Err"| DEC["Decision"]
+
+    classDef gate fill:#1e293b,stroke:#f59e0b,stroke-width:2px
+    class G gate
+</pre>
+
+<p>The kernel holds zero authorization logic. Composition model: <strong>1 kernel slot, N impls composed inside a single provider that fans out</strong>. Canonical impl <code>ZonePermsProvider</code> uses inheritance-aware <code>PermissionLeaseCache</code>; a parent-directory lease covers child files. See &sect;2.4.1 for how the gate fits into the dispatch pipeline.</p>
+
+<h3 id="connect-entry">1.8 Entry Point: <code>connect()</code></h3>
+
+<p><code>connect(config=...)</code> is the mode-dispatcher factory function &mdash; the single entry point for all Nexus users. Linux analogue: <code>mount_root()</code> in <code>init/do_mounts.c</code>.</p>
+
+<pre class="mermaid">
+graph TB
+    U["User import:<br/>from nexus.sdk import connect<br/>nx = connect()"]
+    U --> D{{"auto-detect from<br/>env / config"}}
+    D -->|"local disk, no peers"| S["standalone stack"]
+    D -->|"config.profile='remote'"| R["remote proxy stack<br/>(all sys_* over gRPC)"]
+    D -->|"peers present"| F["federation stack<br/>(raft + gRPC)"]
+
+    S --> N[["NexusFilesystem<br/>(same contract, three backings)"]]
+    R --> N
+    F --> N
+
+    classDef n fill:#0f172a,stroke:#fcd34d,stroke-width:3px
+    class N n
+</pre>
+
+<div class="callout">
+  Not DI &mdash; <code>connect()</code> is the user-facing entry point. The factory/DI machinery is internal. Clients never need to know which mode is running; the surface is identical.
+</div>
+
+<!-- ================================================================ -->
+<h2 id="syscalls">2. User Contract &mdash; Syscall Interface</h2>
+
+<p><span class="role-badge">Category: User Contract (&uarr;)</span> <span class="role-badge">Audience: users, AI, agents</span> <span class="role-badge">Package: <code>contracts.filesystem</code>, <code>core.nexus_fs</code></span></p>
+
+<h3 id="published-contract">2.1 <code>NexusFilesystem</code> &mdash; Published Contract</h3>
+
+<pre class="mermaid">
+graph TB
+    subgraph P["NexusFilesystem Protocol"]
+        T1["Tier 1 (abstract) &mdash; sys_* kernel syscalls<br/><span style='color:#94a3b8'>implementors MUST override</span>"]
+        T2["Tier 2 (concrete) &mdash; convenience methods<br/><span style='color:#94a3b8'>mkdir, rmdir, read, write, ... &mdash; inherit, no override</span>"]
+        T2 -->|"compose"| T1
+    end
+
+    NX["NexusFS<br/>(kernel implementation)"] -.->|"implements"| P
+    CLI["Clients (users, services)"] -->|"program against contract"| P
+</pre>
+
+<p>Relationship: POSIX spec (contract) vs Linux kernel (implementation). Clients program against the contract; the kernel implements it.</p>
+
+<h3 id="syscalls-groups">2.2 Kernel Syscalls &mdash; POSIX-Aligned, Path-Addressed</h3>
+
+<p>All kernel methods are synchronous. Blocking waits (advisory locks, stream reads, <code>sys_watch</code>) use Rust <code>Condvar</code>. Async lives at the transport layer only (gRPC, HTTP).</p>
+
+<pre class="mermaid">
+graph TB
+    subgraph META["Metadata plane"]
+        M1["sys_stat"]
+        M2["sys_setattr &mdash; universal creation/management"]
+        M3["sys_rename"]
+        M4["sys_unlink"]
+        M5["sys_readdir"]
+    end
+    subgraph CONTENT["Content plane"]
+        C1["sys_read (pread)"]
+        C2["sys_write (pwrite &mdash; file must exist)"]
+        C3["sys_copy"]
+    end
+    subgraph LOCK["Locking plane"]
+        L1["sys_lock (acquire + extend)"]
+        L2["sys_unlock (release + force)"]
+    end
+    subgraph WATCH["Watch plane"]
+        W1["sys_watch (inotify)"]
+    end
+</pre>
+
+<p><code>sys_setattr</code> is the universal creation/management syscall. One syscall, many entry types:</p>
+
+<pre class="mermaid">
+graph LR
+    SA["sys_setattr(path, entry_type=?)"]
+    SA -->|"DT_DIR"| mkdir["mkdir"]
+    SA -->|"DT_REG"| create["create (upsert &mdash; new file OR metadata update)"]
+    SA -->|"DT_MOUNT + backend=..."| mount["mount driver"]
+    SA -->|"DT_LINK + link_target=..."| symlink["symlink (&sect;4.4)"]
+    SA -->|"DT_PIPE + io_profile=..."| pipe["named pipe (&sect;4.2)"]
+    SA -->|"DT_STREAM + io_profile=..."| stream["named stream (&sect;4.2)"]
+
+    RMDIR["rmdir"] -->|"on DT_MOUNT path"| umount["umount"]
+</pre>
+
+<h4>Vectored syscalls</h4>
+
+<p><code>sys_read</code>, <code>sys_write</code>, <code>sys_unlink</code> accept a slice of request structs and return <code>Vec&lt;Result&lt;Sys*Result, KernelError&gt;&gt;</code> &mdash; one result per request, positionally matched. <code>reqs.len() == 1</code> takes a zero-overhead fast path; batch path uses rayon parallel read, sorted-lock write, sequential unlink. Per-item errors are isolated. The former <code>_read_batch</code> / <code>_write_batch</code> / <code>_delete_batch</code> internal methods and the <code>skip_authz</code> hack are deleted &mdash; vectored signatures subsume all batch functionality with per-item permission enforcement.</p>
+
+<h4>Consolidated lock ops (POSIX <code>fcntl(F_SETLK)</code> pattern)</h4>
+
+<pre class="mermaid">
+graph LR
+    L1["sys_lock(path, lock_id=None)"] -->|"lock_id=None"| ACQ["acquire"]
+    L1 -->|"lock_id=existing"| EXT["extend TTL"]
+    L2["sys_unlock(path, lock_id=None, force=False)"] -->|"lock_id set"| REL["release by lock_id"]
+    L2 -->|"force=True"| FORCE["force-release all holders"]
+    S1["sys_stat(path, include_lock=True)"] -.->|"zero cost when False (default)"| LS["lock state"]
+    R1["sys_readdir('/__sys__/locks/')"] -.->|"virtual namespace<br/>(like /proc/locks)"| LL["lock listing"]
+</pre>
+
+<h4>Primitive usage pattern per syscall class</h4>
+
+<table>
+  <thead><tr><th>Syscall class</th><th>Pipeline</th></tr></thead>
+  <tbody>
+    <tr><td>Mutating (write, unlink, rename, copy)</td><td>VFSRouter &rarr; VFSLock &rarr; KernelDispatch (3-phase) &rarr; Metastore &rarr; FileEvent</td></tr>
+    <tr><td>DT_PIPE / DT_STREAM I/O</td><td>Routed metastore detects entry_type early &rarr; dispatches to PipeManager/StreamManager inline. No VFS lock, no metastore update, no observer dispatch (matches Linux <code>write(2)</code> on a pipe not triggering inotify)</td></tr>
+    <tr><td>DT_LINK</td><td><code>route()</code> follows link target one hop with self-loop rejection (&sect;4.4); hooks fire on the resolved target path</td></tr>
+    <tr><td>Read</td><td>Same pipeline as mutating minus FileEvent (reads are not mutations)</td></tr>
+    <tr><td>Read-only metadata (stat, access, readdir, is_directory)</td><td>Direct Metastore lookup only &mdash; no routing, locking, or dispatch</td></tr>
+    <tr><td><code>setattr</code></td><td>Metastore-only. DT_REG upsert (creates if absent, updates metadata if present). Tier 2 <code>mkdir</code> adds routing + hooks</td></tr>
+  </tbody>
+</table>
+
+<h3 id="tier2-conveniences">2.3 Tier 2 Convenience Methods</h3>
+
+<p>Tier 2 methods compose Tier 1 syscalls. The Protocol has three halves; each half serves a distinct concern.</p>
+
+<pre class="mermaid">
+graph TB
+    subgraph VFS["VFS half &mdash; POSIX-aligned"]
+        V1["mkdir(), rmdir(), read(), write(),<br/>append(), edit(), write_batch(),<br/>access(), is_directory(),<br/>lock(), locked(), glob(), grep(), service()"]
+        V2["Path-addressed &mdash; delegates to sys_*<br/>glob / grep = search-tier convenience<br/>built atop sys_readdir + filter/regex"]
+    end
+    subgraph XATTR["Xattr &mdash; extended attributes"]
+        X1["get_xattr(path, key)<br/>set_xattr(path, key, value)<br/>get_xattr_bulk(paths, key)"]
+        X2["Direct metastore get/set_file_metadata<br/>NO hooks, NO routing,<br/>NO permission gate<br/>(Rust KernelConvenience trait)"]
+    end
+    subgraph HDFS["HDFS half &mdash; driver-level, kernel-internal"]
+        H1["read_content(), write_content(),<br/>stream(), stream_range(),<br/>write_stream()"]
+        H2["Hash-addressed (etag/CAS)<br/>direct to ObjectStoreABC<br/>bypasses path resolution and<br/>metadata lookup"]
+    end
+</pre>
+
+<div class="callout">
+  Analogy: HDFS separates ClientProtocol (NameNode, path-based) from DataTransferProtocol (DataNode, block-based). The HDFS half is <strong>kernel-internal</strong>. Service-tier callers go through <code>sys_read(path)</code> with optional content_hash verification &mdash; features needing stable historical bytes express them as paths (workspace snapshots, version history) and read those paths through the syscall surface. Kernel-managed metadata side effects follow the POSIX <code>generic_write_end</code> pattern: kernel updates mtime, size, version, etag in VFS lock after <code>backend.write_content()</code>. Drivers manage content only. Consistency is zone-level (configured at metastore layer), not per-write.
+</div>
+
+<h3 id="vfs-dispatch">2.4 VFS Dispatch (<code>KernelDispatch</code>)</h3>
+
+<p>Kernel-owned callback lists at 6 VFS operation points (read, write, delete, rename, mkdir, copy) plus driver lifecycle events (mount, unmount). Three phases per VFS operation, plus fire-and-forget driver lifecycle hooks.</p>
+
+<pre class="mermaid">
+graph LR
+    OP["Syscall enters"]
+    OP --> PRE_D{{"PRE-DISPATCH<br/>VFSPathResolver"}}
+    PRE_D -->|"first match"| SHORT[["short-circuit &mdash;<br/>skips pipeline"]]
+    PRE_D -->|"no match"| INT_PRE["INTERCEPT PRE<br/>VFS*Hook (Rust trait)<br/>serial, ordered"]
+    INT_PRE -->|"any Err &rarr; abort"| ABORT[["operation cancelled"]]
+    INT_PRE --> HAL_IO["HAL I/O<br/>(backend read / write)"]
+    HAL_IO --> INT_POST["INTERCEPT POST<br/>serial, fire-and-forget<br/>failures swallowed"]
+    INT_POST --> OBS["OBSERVE<br/>VFSObserver.on_mutation<br/>(after lock release)"]
+    OBS --> RESULT["return to caller"]
+
+    subgraph DRIVER["Driver lifecycle (fire-and-forget)"]
+        M["MOUNT hook &mdash; DLC dispatches at backend mount"]
+        UM["UNMOUNT hook &mdash; DLC dispatches at unmount"]
+    end
+
+    classDef abort fill:#7f1d1d,stroke:#fca5a5,color:#fecaca
+    classDef ok fill:#065f46,stroke:#6ee7b7,color:#d1fae5
+    class ABORT abort
+    class RESULT ok
+</pre>
+
+<h4>2.4.1 The 4 dispatch contracts</h4>
+
+<table>
+  <thead><tr><th>#</th><th>Contract</th><th>Trait / protocol</th><th>Dispatch semantics</th><th>Error handling</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>1</td><td><strong>RESOLVE</strong> (PRE-DISPATCH)</td>
+      <td><code>VFSPathResolver</code> (Rust <code>PathResolver</code> trait)</td>
+      <td>PathTrie <code>O(depth)</code> lookup, fallback linear scan. First resolver whose <code>try_*(path)</code> returns non-None handles the entire operation &mdash; normal VFS pipeline is skipped.</td>
+      <td>Resolver exceptions propagate to caller (resolver owns error semantics).</td>
+    </tr>
+    <tr>
+      <td>2</td><td><strong>INTERCEPT PRE</strong></td>
+      <td><code>InterceptHook.on_pre_*</code> (Rust trait)</td>
+      <td>Serial, ordered. All registered pre-hooks run in registration order.</td>
+      <td>Any hook may abort by returning <code>Err</code> / raising &mdash; exception propagates, operation is cancelled.</td>
+    </tr>
+    <tr>
+      <td>3</td><td><strong>INTERCEPT POST</strong></td>
+      <td><code>InterceptHook.on_post_*</code> (Rust trait)</td>
+      <td>Serial, fire-and-forget via Rust <code>dispatch_post_hooks()</code>.</td>
+      <td>Failures are logged and swallowed &mdash; never affect the caller or the operation result.</td>
+    </tr>
+    <tr>
+      <td>4</td><td><strong>OBSERVE</strong></td>
+      <td><code>VFSObserver.on_mutation</code></td>
+      <td>Inline observers: synchronous on caller thread. Deferred observers: submitted to kernel observer ThreadPoolExecutor (4 threads, <code>observe</code> prefix). Event mask bitmask filtering at registration time.</td>
+      <td>Failures caught and logged &mdash; never abort the syscall. Observers needing causal ordering belong in INTERCEPT POST, not OBSERVE.</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout">
+  <strong>Ordering guarantee:</strong> RESOLVE &gt; Permission Gate &gt; INTERCEPT PRE &gt; HAL I/O &gt; INTERCEPT POST &gt; OBSERVE. OBSERVE always fires after VFS lock release (like Linux inotify after <code>i_rwsem</code>).
+</div>
+
+<h4>Permission gate decision cascade (Linux analogue: <code>security_inode_permission()</code>)</h4>
+
+<pre class="mermaid">
+graph TB
+    S["sys_* enters"]
+    S --> P1{{"path starts with /__sys__/?"}}
+    P1 -->|"yes"| BYPASS1[["bypass"]]
+    P1 -->|"no"| P2{{"ctx.is_system?"}}
+    P2 -->|"yes"| BYPASS2[["bypass"]]
+    P2 -->|"no"| P3{{"provider slot loaded?"}}
+    P3 -->|"None (~2ns)"| PASS[["Ok(())"]]
+    P3 -->|"Some"| CALL["PermissionProvider::check()<br/>(path-to-zone extraction,<br/>lease cache, zone-perm iteration,<br/>ReBAC, role logic &mdash; all inside impl)"]
+    CALL -->|"Ok"| PROCEED[["proceed to INTERCEPT PRE"]]
+    CALL -->|"Err"| DENY[["EACCES"]]
+
+    classDef ok fill:#065f46,stroke:#6ee7b7,color:#d1fae5
+    classDef bad fill:#7f1d1d,stroke:#fca5a5,color:#fecaca
+    class PASS,PROCEED,BYPASS1,BYPASS2 ok
+    class DENY bad
+</pre>
+
+<p><strong>Why separate from INTERCEPT PRE?</strong> Three orthogonal reasons:</p>
+<ul>
+  <li><strong>Ordering</strong> &mdash; permission MUST run before intercept side effects.</li>
+  <li><strong>SRP</strong> &mdash; authorization is one decision authority; hooks are a chain of concerns.</li>
+  <li><strong>Perf</strong> &mdash; the gate is ~2ns when no provider is installed and one virtual call otherwise, versus intercept&rsquo;s lock + iter + dispatch chain. Caching lives inside the provider, so grants bypass both the gate re-eval AND the intercept chain on a lease-cache hit.</li>
+</ul>
+
+<p>Source of truth: <code>rust/kernel/src/kernel/dispatch.rs</code> (gate + slot), <code>rust/kernel/src/core/dispatch/mod.rs</code> (trait + enum), <code>rust/permission/src/{zone_perms,lease_cache}.rs</code> (canonical impl + cache).</p>
+
+<h4>Per-syscall dispatch matrix</h4>
+
+<p>Source of truth: <code>io.rs</code>. &ldquo;&mdash;&rdquo; = phase absent for this syscall.</p>
+
+<table>
+  <thead><tr><th>Syscall</th><th>Permission Gate</th><th>INTERCEPT PRE</th><th>INTERCEPT POST</th><th>OBSERVE</th></tr></thead>
+  <tbody>
+    <tr><td><code>sys_read</code></td><td>Read</td><td>ReadHookCtx</td><td>&mdash;</td><td>&mdash;</td></tr>
+    <tr><td><code>sys_write</code></td><td>Write</td><td>WriteHookCtx</td><td>WriteHookCtx</td><td>FileWrite</td></tr>
+    <tr><td><code>sys_write_batch</code></td><td>Write (per-item)</td><td>&mdash;</td><td>&mdash;</td><td>FileWrite (per-item)</td></tr>
+    <tr><td><code>sys_unlink</code></td><td>Write</td><td>DeleteHookCtx</td><td>DeleteHookCtx</td><td>FileDelete / DirDelete</td></tr>
+    <tr><td><code>sys_rename</code></td><td>Write (both paths)</td><td>RenameHookCtx</td><td>RenameHookCtx</td><td>FileRename</td></tr>
+    <tr><td><code>sys_copy</code></td><td>Read + Write</td><td>&mdash;</td><td>&mdash;</td><td>FileCopy</td></tr>
+    <tr><td><code>mkdir</code> (Tier 2)</td><td>Write</td><td>&mdash;</td><td>&mdash;</td><td>DirCreate</td></tr>
+    <tr><td><code>sys_setattr</code></td><td>Write</td><td>&mdash;</td><td>&mdash;</td><td>MetadataChange</td></tr>
+    <tr><td><code>sys_stat</code></td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td></tr>
+  </tbody>
+</table>
+
+<div class="callout">
+  <strong>Zero-overhead invariant.</strong> Empty callback list = no-op dispatch = zero overhead when no services are registered. Python-to-kernel boundary: Python reaches the Rust kernel via gRPC to the <code>nexus-cluster</code> process. Each <code>sys_*</code> call is one gRPC round-trip. Inside the Rust process, pillar calls, hook dispatch, and service lifecycle are all pure Rust with zero FFI crossings.
+</div>
+
+<p>Registration API: each phase has a symmetric <code>register_*()</code> / <code>unregister_*()</code> pair &mdash; runtime-callable by any authorized caller. Hook protocols and context dataclasses are defined in <code>contracts/vfs_hooks.py</code> (tier-neutral). Concrete implementations live in <code>services/hooks/</code>.</p>
+
+<h3 id="mediation">2.5 Mediation Principle</h3>
+
+<pre class="mermaid">
+graph TB
+    subgraph SVC["Service tier"]
+        S1["rust/services/, rust/raft/,<br/>rust/transport/, rust/backends/,<br/>Python bricks / services / server"]
+    end
+    subgraph KERNEL["Kernel"]
+        K1["&sect;2.2 syscall surface (paths)"]
+        K2["&sect;4 dispatch hook ABI<br/>(observers, resolvers, hooks)"]
+        K3["Tier 2 HDFS half<br/>(kernel-internal only)"]
+    end
+    subgraph HAL["HAL"]
+        H1["MetaStore pillar (&sect;3.A.1)"]
+        H2["ObjectStore pillar (&sect;3.A.2)"]
+    end
+
+    S1 -->|"path-addressed"| K1
+    S1 -->|"hook / observer"| K2
+    K1 --> H1
+    K1 --> H2
+    K3 -->|"kernel-internal only"| H2
+    S1 -.->|"forbidden &mdash; do NOT<br/>reach HAL directly"| H1
+    S1 -.->|"forbidden"| H2
+
+    classDef bad fill:none,stroke:#fca5a5,stroke-dasharray:5 3
+</pre>
+
+<p>The mutating pipeline is: <code>PRE-DISPATCH &rarr; route &rarr; permission gate &rarr; INTERCEPT pre &rarr; lock &rarr; HAL I/O &rarr; unlock &rarr; INTERCEPT post &rarr; OBSERVE</code>. See <code>syscall-design.md</code> for the full per-syscall flow.</p>
+
+<div class="callout">
+  The Tier 2 HDFS half (hash-addressed <code>read_content</code> / <code>write_content</code> / streaming) is a kernel-internal surface &mdash; used by federation cross-node fetch (<code>KernelBlobFetcher</code> in <code>rust/raft/</code>) and other Rust kernel-internal modules that need content-hash addressing for replication, dedup, or storage GC. Service-tier features that want hash-addressed semantics express them as paths and read through <code>sys_read(path)</code>, optionally verifying the served <code>content_hash</code> matches an expected value.
+</div>
+
+<!-- ================================================================ -->
+<h2 id="hal">3. HAL &mdash; Storage HAL &amp; Control-Plane HAL</h2>
+
+<p><span class="role-badge">Category: HAL &mdash; Driver Contract (&darr;)</span> <span class="role-badge">Audience: driver implementors</span></p>
+
+<pre class="mermaid">
+graph TB
+    K[["KERNEL"]]
+
+    subgraph SHAL["&sect;3.A Storage HAL &mdash; persistent data"]
+        SA1["MetastoreABC (MetaStore)"]
+        SA2["ObjectStoreABC (ObjectStore = Backend)"]
+        SA3["CacheStoreABC (CacheStore) &mdash; optional"]
+        SAX["Transport &times; Addressing decomposition (&sect;3.A.5)"]
+    end
+
+    subgraph CHAL["&sect;3.B Control-Plane HAL &mdash; in-memory coordination"]
+        CB1["DistributedCoordinator"]
+        CB2["ObjectStoreProvider"]
+        CB3["AuthKeyStore"]
+    end
+
+    K -->|"rust/kernel/src/abc/"| SHAL
+    K -->|"rust/kernel/src/hal/"| CHAL
+
+    classDef k fill:#0f172a,stroke:#fcd34d,stroke-width:3px
+    class K k
+</pre>
+
+<h3 id="storage-hal">3.A Storage HAL &mdash; ABC pillars</h3>
+
+<p>Abstract by <strong>capability</strong> (access pattern + consistency guarantee), not by domain or implementation.</p>
+
+<table>
+  <thead><tr><th>Pillar</th><th>Rust trait</th><th>Python ABC</th><th>Capability</th><th>Kernel role</th></tr></thead>
+  <tbody>
+    <tr><td>Metastore</td><td><code>MetaStore</code></td><td><code>MetastoreABC</code></td><td>Ordered KV, CAS, prefix scan, optional Raft SC</td><td><strong>Required</strong> &mdash; sole kernel init param</td></tr>
+    <tr><td>ObjectStore</td><td><code>ObjectStore</code></td><td><code>ObjectStoreABC</code></td><td>Streaming I/O, immutable blobs, petabyte scale</td><td><strong>Interface only</strong> &mdash; instances mounted via <code>nx.mount()</code></td></tr>
+    <tr><td>CacheStore</td><td><code>CacheStore</code></td><td><code>CacheStoreABC</code></td><td>Ephemeral KV, Pub/Sub, TTL</td><td><strong>Optional</strong> &mdash; defaults to <code>NullCacheStore</code></td></tr>
+  </tbody>
+</table>
+
+<pre class="mermaid">
+graph LR
+    subgraph KDIR["rust/kernel/src/"]
+        ABC["abc/ &mdash; the 3 &sect;3.A pillars<br/>(meta_store.rs, object_store.rs, cache_store.rs)"]
+        EXT["extensions/ &mdash; opt-in ObjectStore extensions<br/>(LlmStreamingBackend, ObserverBackend)"]
+        HAL["hal/ &mdash; the &sect;3.B DI surfaces<br/>(distributed_coordinator, object_store_provider,<br/>auth_key_store)"]
+        CORE["core/ &mdash; concrete kernel primitives (&sect;4)"]
+    end
+    subgraph IMPL["Impl locations"]
+        BACKENDS["rust/backends/ &mdash; concrete backends<br/>(LlmStreamingBackend impl, ObserverBackend impl)"]
+        LIB["rust/lib/transport_primitives &mdash;<br/>PeerBlobClient, TOFU trust store"]
+    end
+
+    EXT -.->|"trait DECL stays here (as_*() signatures reference it)"| KDIR
+    EXT -->|"trait IMPL lives here (per opting-in backend)"| BACKENDS
+</pre>
+
+<div class="callout">
+  <strong>Kernel self-inclusiveness.</strong> Kernel boots with 1 pillar (MetaStore); ObjectStore mounts post-init. The kernel&rsquo;s own data needs are O(1) KV with ordered prefix scan over zone-tagged <code>FileMetadata</code> rows. Higher shapes (JOINs, FK, vector search, TTL, pub/sub) live in the service layer, mirroring Linux&rsquo;s split: kernel defines VFS + block-device interfaces while filesystems ship as separate modules.
+</div>
+
+<p><strong>Orthogonality.</strong> Between pillars = different query patterns. Within pillars = interchangeable drivers (deployment-time config). See <a href="https://github.com/nexi-lab/nexus-vfs/blob/main/docs/data-storage-matrix.md">data-storage-matrix</a>.</p>
+
+<p><strong>Rust naming note:</strong> <code>MetaStore</code> (two-word PascalCase) matches <code>ObjectStore</code> / <code>CacheStore</code> for visual symmetry. The Python ABC stays <code>MetastoreABC</code> (one word) &mdash; the Python tier is on a sunset path, so the Rust trait carries the forward-looking name.</p>
+
+<h4 id="metastore-abc">3.A.1 <code>MetaStore</code> &mdash; Inode Layer <span class="role-badge">Linux analogue: <code>struct inode_operations</code></span></h4>
+
+<pre class="mermaid">
+graph LR
+    subgraph OPS["Operations"]
+        O1["O(1) KV &mdash; get / put / delete"]
+        O2["Ordered prefix scan &mdash; list()"]
+        O3["Batch ops"]
+        O4["Implicit directory detection"]
+    end
+    subgraph DATA["FileMetadata"]
+        D1["path, backend_name, etag, size,<br/>version, zone_id, owner_id,<br/>timestamps, mime_type"]
+    end
+    subgraph SYS["System namespace"]
+        S1["/__sys__/ prefix &mdash; kernel management surface"]
+    end
+
+    O2 --> DATA
+    O1 --> DATA
+    SYS --> O1
+</pre>
+
+<p><code>zone_id</code> is the kernel namespace partition identifier (Linux <code>sb-&gt;s_dev</code>). Federation extends it with Raft consensus groups; the kernel owns the concept. <code>owner_id</code> is the kernel&rsquo;s posix_uid &mdash; consumed by <code>PermissionEnforcerProtocol.check_owner()</code> for O(1) DAC before service-layer hooks run. Audit trail (who created a file) lives in the service layer (<code>VersionRecorder</code>); the kernel inode keeps steady-state fields only.</p>
+
+<h4 id="object-store-abc">3.A.2 <code>ObjectStore</code> &mdash; Blob I/O <span class="role-badge">Linux analogue: <code>struct file_operations</code></span></h4>
+
+<pre class="mermaid">
+graph TB
+    OS["ObjectStore trait"]
+    OS -->|"CAS-addressed"| CAS["read / write / delete by etag<br/>(content hash)"]
+    OS -->|"streaming variants"| STREAM["stream_read / stream_write<br/>(large blobs)"]
+    OS -->|"backends that support them"| DIR["mkdir / rmdir / list_dir"]
+    OS -->|"optional (capability-dependent)"| REN["rename"]
+    OS -.->|"opt-in via as_*() downcast<br/>(extension trait, NOT mandatory pillar)"| EXT["LlmStreamingBackend<br/>ObserverBackend"]
+
+    classDef opt fill:none,stroke:#94a3b8,stroke-dasharray:4 3
+    class DIR,REN,EXT opt
+</pre>
+
+<h4 id="cache-store-abc">3.A.3 <code>CacheStore</code> &mdash; Ephemeral KV + Pub/Sub (Optional) <span class="role-badge">Linux analogue: <code>/dev/shm</code> + message bus</span></h4>
+
+<p>The only optional HAL pillar. Kernel defines the ABC; services consume it. Drivers: Dragonfly / Redis (production), <code>InMemoryCacheStore</code> (dev).</p>
+
+<pre class="mermaid">
+graph TB
+    C["CacheStore trait"]
+    C -->|"default"| NULL["NullCacheStore &mdash; no-op"]
+    C -->|"prod"| REAL["Dragonfly / Redis"]
+    C -->|"dev"| MEM["InMemoryCacheStore"]
+
+    subgraph DEG["Graceful degradation with NullCacheStore"]
+        D1["EventBus disables"]
+        D2["permission/tiger caches fall back to RecordStore"]
+        D3["sessions stay in RecordStore"]
+        D4["<strong>No kernel functionality is lost</strong>"]
+    end
+    NULL --> DEG
+</pre>
+
+<h4 id="dual-axis">3.A.4 Dual-Axis ABC Architecture</h4>
+
+<pre class="mermaid">
+graph TB
+    subgraph DATA["Data ABCs &mdash; WHERE data lives (this section)"]
+        M["MetaStore"]
+        O["ObjectStore"]
+        C["CacheStore"]
+        R["RecordStoreABC (&sect;5.2)"]
+    end
+    subgraph OPS["Ops ABCs &mdash; WHAT you can DO (&sect;5.3)"]
+        P["PermissionProtocol"]
+        S["SearchProtocol"]
+        MT["MountProtocol"]
+        AG["AgentProtocol"]
+        ETC["... 40+ scenario domains"]
+    end
+    subgraph EX["Concrete example: ReBACManager"]
+        RM["ReBACManager"]
+    end
+
+    RM -.->|"implements (Ops axis)"| P
+    RM -.->|"internally uses (Data axis)"| R
+</pre>
+
+<p>Two independent ABC axes, composed via DI. A concrete class sits at the intersection. See <a href="https://github.com/nexi-lab/nexus-vfs/blob/main/docs/ops-scenario-matrix.md">ops-scenario-matrix</a>.</p>
+
+<h4 id="transport-addressing">3.A.5 Transport &times; Addressing Composition <span class="role-badge">Linux analogue: Block device driver &times; filesystem</span></h4>
+
+<pre class="mermaid">
+graph LR
+    subgraph AXIS["Two orthogonal axes"]
+        T["Transport (WHERE)<br/>raw key &rarr; bytes I/O"]
+        A["Addressing Engine (HOW)<br/>CAS or Path"]
+    end
+    subgraph BACKENDS["Every backend = Transport &otimes; Addressing"]
+        LOCAL["LocalDisk transport &otimes; PathAddressing<br/>= PathLocalBackend"]
+        S3["S3 transport &otimes; CASAddressing<br/>= S3CasBackend"]
+        REST["REST API transport &otimes; PathAddressing<br/>= external connector<br/>(GET=fetch, PUT=store, DELETE=remove)"]
+    end
+
+    AXIS -->|"compose"| BACKENDS
+</pre>
+
+<p><strong>DT_EXTERNAL_STORAGE</strong> (<code>entry_type=5</code>): mount-time detection via <code>ConnectorRegistry.category</code> for OAuth APIs and CLI tools. See <a href="https://github.com/nexi-lab/nexus-vfs/blob/main/docs/backend-architecture.md">backend-architecture</a> &sect;2 for the full composition matrix and Transport protocol; <a href="https://github.com/nexi-lab/nexus-vfs/blob/main/docs/connector-transport-matrix.md">connector-transport-matrix</a> for per-connector details.</p>
+
+<h3 id="control-plane-hal">3.B Control-Plane HAL &mdash; Runtime DI Surfaces</h3>
+
+<p>Storage HAL (&sect;3.A) is the persistent-data flavor; Control-Plane HAL is the in-memory coordination flavor. Same DI shape: trait declared in <code>kernel/src/hal/</code>, concrete impl in the owner crate, an <code>Arc&lt;dyn Trait&gt;</code> slot the process boots before any syscall fires.</p>
+
+<pre class="mermaid">
+graph LR
+    subgraph KTRAIT["Kernel &mdash; trait declaration"]
+        T1["trait DistributedCoordinator"]
+        T2["trait ObjectStoreProvider"]
+        T3["trait AuthKeyStore"]
+    end
+    subgraph SLOT["Kernel &mdash; runtime slot"]
+        S1["ArcSwapOption / OnceLock"]
+        S2["default: Noop* impl (fail-loud or benign)"]
+    end
+    subgraph IMPL["Impl in owner crate"]
+        I1["RaftDistributedCoordinator &mdash; rust/raft/"]
+        I2["DefaultObjectStoreProvider &mdash; rust/backends/"]
+        I3["RaftAuthKeyStore &mdash; rust/raft/"]
+    end
+    subgraph BOOT["Boot wiring"]
+        B["install_with_kernel(...) &mdash;<br/>replaces slot; wires reverse pointers"]
+    end
+
+    KTRAIT --> SLOT
+    IMPL --> BOOT
+    BOOT --> SLOT
+</pre>
+
+<table>
+  <thead><tr><th>Trait</th><th>Capability</th><th>Default impl</th><th>Reference impl</th></tr></thead>
+  <tbody>
+    <tr><td><code>DistributedCoordinator</code></td><td>Per-node distributed namespace topology &mdash; zones, mounts, share registry, leader/voter introspection</td><td><code>NoopDistributedCoordinator</code> (errors out)</td><td><code>RaftDistributedCoordinator</code> in <code>rust/raft/</code></td></tr>
+    <tr><td><code>ObjectStoreProvider</code></td><td>Construct <code>Arc&lt;dyn ObjectStore&gt;</code> for a given backend type + args</td><td><code>OnceLock</code> slot installed at boot</td><td><code>DefaultObjectStoreProvider</code> in <code>rust/backends/</code></td></tr>
+    <tr><td><code>AuthKeyStore</code></td><td>Replicated <code>key_hash &rarr; record</code> store behind API-key authentication</td><td><code>NoopAuthKeyStore</code> (resolves nothing, refuses writes)</td><td><code>RaftAuthKeyStore</code> in <code>rust/raft/</code></td></tr>
+  </tbody>
+</table>
+
+<h4 id="dc">3.B.1 <code>DistributedCoordinator</code> <span class="role-badge">Linux analogue: <code>struct super_operations</code></span></h4>
+
+<p>The abstraction kernel-side syscalls dispatch through to reach any concrete filesystem/topology driver without naming the driver type. Kernel dispatch through <code>kernel.distributed_coordinator()</code> instead of naming <code>nexus_raft::*</code> types directly.</p>
+
+<pre class="mermaid">
+graph LR
+    subgraph INTRO["Introspection (2)"]
+        A1["list_zones()"]
+        A2["cluster_info() &rarr; ClusterInfo<br/>leader_id, term,<br/>voter_count, witness_count,<br/>links_count, commit_index,<br/>applied index"]
+    end
+    subgraph ZLC["Zone lifecycle (3)"]
+        B1["create_zone(zone_id)"]
+        B2["remove_zone &mdash; cascade-unmount,<br/>force=true honors POSIX<br/>unlink-while-i_links&gt;0 bypass"]
+        B3["join_zone(as_learner=true)"]
+    end
+    subgraph MW["Mount wiring (2)"]
+        C1["wire_mount &mdash; leader-side fast path"]
+        C2["unwire_mount"]
+    end
+    subgraph SR["Share registry (2)"]
+        D1["share_zone &mdash; atomic<br/>create-zone + copy-subtree +<br/>register-share"]
+        D2["lookup_share &rarr; ShareInfo<br/>(zone_id + remote-path)"]
+    end
+    subgraph PZD["Per-zone dispatch (2)"]
+        E1["metastore_for_zone &rarr;<br/>Arc&lt;dyn MetaStore&gt;<br/>(raft state machine backed)"]
+        E2["locks_for_zone &rarr;<br/>Arc&lt;dyn Locks&gt;<br/>(replicated via AcquireLock)"]
+    end
+</pre>
+
+<div class="callout">
+  Boot-time setup is a module-level <code>install()</code> function &mdash; a once-per-process hook that wires the slot and folds in DI plumbing (blob-fetcher slot stash). Same shape as <code>transport::python::install_transport_wiring</code>. Mount wiring is the leader-side optimization; the apply-cb on the state machine is the correctness guarantee. Naming follows the &sect;3.A pillars &mdash; trait name = capability (distributed-namespace coordination), not implementation (Raft) or GoF role (Provider / Manager).
+</div>
+
+<h4 id="osp">3.B.2 <code>ObjectStoreProvider</code></h4>
+
+<pre class="mermaid">
+graph LR
+    K["Kernel::sys_setattr(backend=&hellip;)<br/>+ mount path"] --> P["ObjectStoreProvider::build(args)"]
+    P --> R{{"ObjectStoreBuildResult"}}
+    R --> O["Option&lt;Arc&lt;dyn ObjectStore&gt;&gt;<br/>(the backend)"]
+    R --> M["Option&lt;Arc&lt;dyn MetaStore&gt;&gt;<br/>(remote metastore &mdash;<br/>for 'remote' backends)"]
+
+    K -.-|"cycle break: kernel declares trait,<br/>backends crate provides impl,<br/>boot wires slot"|-. P
+</pre>
+
+<p>Trait name describes the capability (&ldquo;provides ObjectStore instances&rdquo;), in symmetry with <code>DistributedCoordinator</code> and the &sect;3.A pillars.</p>
+
+<h4 id="aks">3.B.3 <code>AuthKeyStore</code> <span class="role-badge">Linux analogue: the key retention service (<code>security/keys/</code>)</span></h4>
+
+<pre class="mermaid">
+graph TB
+    subgraph API["4 methods over key_hash &rarr; record"]
+        M1["get"]
+        M2["put"]
+        M3["delete"]
+        M4["list"]
+    end
+    subgraph REC["Record = opaque bytes"]
+        R1["HMAC(key) + grants:<br/>subject, zones, expiry,<br/>revoked, admin"]
+        R2["Schema owned by auth provider;<br/>kernel never interprets"]
+        R3["HMAC signing key injected at<br/>composition root &mdash; never travels this trait"]
+    end
+    subgraph LOC["Raft state machine location"]
+        L1["Dedicated TREE_AUTH_KEYS tree"]
+        L2["Off the sys_read / readdir path<br/>&rArr; no path walk reaches a credential,<br/>no sys_write forges one"]
+    end
+    subgraph VIEW["Introspection surface"]
+        V1["/__sys__/auth/keys/ &mdash;<br/>admin-gated, read-only,<br/>synthesised over list()<br/>(no write path)"]
+    end
+    subgraph CONSUMERS["Two consumers"]
+        C1["Kernel &mdash; for the /__sys__ view"]
+        C2["Services-tier auth provider &mdash;<br/>the `services &perp; raft` invariant (&sect;6.1)<br/>bars it from naming nexus_raft::*"]
+    end
+
+    API --> REC
+    REC --> LOC
+    LOC --> VIEW
+    LOC --> CONSUMERS
+</pre>
+
+<!-- ================================================================ -->
+<h2 id="primitives">4. Kernel Primitives</h2>
+
+<p><span class="role-badge">Category: Kernel Primitive (internal)</span> <span class="role-badge">Audience: kernel-internal</span> <span class="role-badge">Package: <code>rust/kernel/src/core/</code></span></p>
+
+<p>Primitives mediate between user-facing syscalls (&sect;2) and HAL drivers (&sect;3). Users interact indirectly through syscalls. See &sect;2.2 for per-syscall usage.</p>
+
+<pre class="mermaid">
+graph TB
+    subgraph K1["Path &amp; routing"]
+        R["VFSRouter &mdash; core/vfs_router.rs<br/>route(path, zone_id) &rarr; RouteResult<br/>PathTrie LPM ~30ns"]
+        L["DT_LINK (&sect;4.4)<br/>path-internal symlink,<br/>one-hop redirect"]
+    end
+    subgraph K2["Locking"]
+        LM["LockManager &mdash; core/lock/ (&sect;4.1)<br/>I/O lock + advisory lock<br/>in one primitive"]
+    end
+    subgraph K3["Dispatch &amp; observability"]
+        D["KernelDispatch &mdash; kernel/dispatch.rs<br/>+ core/dispatch/<br/>3-phase VFS + driver lifecycle"]
+        PG["PermissionGate &mdash; kernel/dispatch.rs<br/>1-slot Arc&lt;dyn PermissionProvider&gt;<br/>(&sect;2.4.1)"]
+        FW["FileWatcher + FileEvent<br/>core/file_watch.rs (&sect;4.3)"]
+        MS["MetadataSync &mdash; core/metadata_sync.rs (&sect;4.5)<br/>backend &harr; metastore coherence"]
+        PR["ProcfsRegistry &mdash; core/procfs.rs (&sect;4.6)<br/>/__sys__/&hellip; views"]
+    end
+    subgraph K4["IPC (&sect;4.2)"]
+        P["PipeManager &mdash; core/pipe/<br/>DT_PIPE destructive FIFO"]
+        SR["StreamManager &mdash; core/stream/<br/>DT_STREAM offset reads"]
+        FD["FileDescriptorTable &mdash; core/fdt.rs<br/>pre-opened fd for PAS backends"]
+    end
+    subgraph K5["Lifecycle"]
+        SREG["ServiceRegistry &mdash; core/service_registry.rs<br/>enlist / swap / shutdown"]
+        DLC["DriverLifecycleCoordinator &mdash; core/dlc.rs<br/>routing table + metastore +<br/>MetadataSyncHandle set"]
+        AR["AgentRegistry &mdash; core/agents/registry.rs<br/>PID / signal / state machine"]
+        PL["PluginLoader &mdash; core/plugin_loader.rs (&sect;9)<br/>dlopen-based load /<br/>DylibRustService / DylibObjectStore"]
+    end
+</pre>
+
+<h3 id="lock-manager">4.1 Unified LockManager &mdash; I/O Lock + Advisory Lock</h3>
+
+<p>Rust <code>LockManager</code> (<code>rust/kernel/src/core/lock/</code>) unifies the kernel's two locking concerns in one primitive &mdash; shared path-normalisation helper, shared hierarchy-aware conflict logic, shared <code>core/lock/</code> module home. Constructed in <code>Kernel::new()</code> with a default <code>LocalLocks</code> advisory backend; a replicated backend swaps in via <code>install_locks(Arc&lt;dyn Locks&gt;)</code> at federation mount time (first-wins, idempotent).</p>
+
+<pre class="mermaid">
+graph TB
+    K[["LockManager (single primitive)"]]
+
+    subgraph IO["I/O Lock &mdash; implicit inside sys_read / sys_write"]
+        IO1["Modes: read (shared) / write (exclusive)"]
+        IO2["Latency ~200ns (Rust condvar)"]
+        IO3["Scope: process-scoped, crash &rarr; released"]
+        IO4["Holder: implicit handle (u64 from next_handle)"]
+        IO5["Storage: in-memory only"]
+        IO6["Impl: per-path condvar RW"]
+    end
+
+    subgraph ADV["Advisory Lock &mdash; sys_lock / sys_unlock (Tier 1)"]
+        AD1["Counting via max_holders &mdash;<br/>max_holders==1 = mutex,<br/>max_holders&gt;1 = semaphore<br/>(SAME code path)"]
+        AD2["Latency ~5&micro;s local / ~5-10ms Raft"]
+        AD3["Scope: TTL-based, expire &rarr; released"]
+        AD4["Holder: caller-supplied lock_id string"]
+        AD5["Storage: shared Arc&lt;Mutex&lt;LockState&gt;&gt;<br/>(contracts::lock_state = SSOT)"]
+        AD6["Impl: LocalLocks (default) or<br/>replicated `Locks` HAL backend"]
+    end
+
+    K --> IO
+    K --> ADV
+</pre>
+
+<div class="callout">
+  <strong>Distributed advisory:</strong> replicated <code>Locks</code> HAL backend installed via <code>install_locks(Arc&lt;dyn Locks&gt;)</code>. Apply-path mutates the same <code>LockState</code> <code>Arc</code> so reads observe committed state without a quorum round-trip. See <a href="https://github.com/nexi-lab/nexus-vfs/blob/main/docs/lock-architecture.md">lock-architecture</a> for full design; <a href="https://github.com/nexi-lab/nexus-vfs/blob/main/docs/federation-memo.md">federation-memo</a> for the replicated-backend install path.
+</div>
+
+<h3 id="ipc">4.2 IPC Primitives &mdash; Named Pipes &amp; Streams</h3>
+
+<pre class="mermaid">
+graph TB
+    subgraph SHARED["Two-layer architecture for BOTH"]
+        SH1["VFS metadata (inode) in MetastoreABC"]
+        SH2["Data (bytes) in process heap buffer<br/>(like Linux kmalloc'd pipe buffer)"]
+    end
+
+    subgraph PIPE["DT_PIPE &mdash; PipeManager + MemoryPipeBackend"]
+        P1["mkpipe: sys_setattr(DT_PIPE) upsert;<br/>read/write via sys_read/sys_write;<br/>destroy via sys_unlink"]
+        P2["per-pipe lock &rArr; MPMC-safe at manager level"]
+        P3["MemoryPipeBackend = lock-free SPSC<br/>(kfifo analogue), no internal sync"]
+        P4["Reads DESTRUCTIVE (consumed on read)"]
+        P5["Linux analogue: kfifo ring"]
+    end
+
+    subgraph STREAM["DT_STREAM &mdash; StreamManager + pluggable StreamBackend"]
+        S1["mkstream: same syscall surface as mkpipe"]
+        S2["per-stream lock &rArr; concurrent writers"]
+        S3["Reads NON-DESTRUCTIVE &mdash;<br/>multiple readers, independent byte offsets"]
+        S4["Linux analogue: append-only log"]
+    end
+</pre>
+
+<h4>io_profile &mdash; backend selection via <code>sys_setattr</code></h4>
+
+<pre class="mermaid">
+graph LR
+    SA["sys_setattr(path, entry_type=DT_STREAM|DT_PIPE, io_profile=&hellip;)"]
+    SA -->|"'memory' (default)"| MEM["MemoryStreamBackend<br/>in-process ring buffer"]
+    SA -->|"'shared_memory'"| SHM["SharedMemoryStreamBackend<br/>mmap cross-process,<br/>~1-5&micro;s"]
+    SA -->|"'wal'"| WAL["WalStreamCore<br/>Raft-replicated WAL,<br/>durable + distributed"]
+
+    MEM --> R["sys_read / sys_write go through<br/>Rust PipeManager/StreamManager<br/>regardless of io_profile &mdash;<br/>zero Python state"]
+    SHM --> R
+    WAL --> R
+</pre>
+
+<p>Rust kernel creates the backend, registers it in PipeManager/StreamManager, and returns SHM metadata (<code>shm_path</code>, <code>data_rd_fd</code>, <code>space_rd_fd</code>) to Python for asyncio integration. See <a href="https://github.com/nexi-lab/nexus-vfs/blob/main/docs/federation-memo.md">federation-memo</a> &sect;7j for design rationale.</p>
+
+<h3 id="file-watcher">4.3 FileWatcher + FileEvent &mdash; File Change Notification <span class="role-badge">Linux analogue: <code>inotify(7)</code> + <code>fsnotify_event</code></span></h3>
+
+<pre class="mermaid">
+graph LR
+    subgraph EVT["FileEvent (frozen dataclass)"]
+        E1["path, etag, size, version,<br/>zone_id, agent_id, user_id,<br/>vector_clock, remote_addr"]
+    end
+    subgraph ETYPES["Event types"]
+        T1["FILE_WRITE, FILE_DELETE,<br/>FILE_RENAME, METADATA_CHANGE,<br/>DIR_CREATE, DIR_DELETE,<br/>CONFLICT_DETECTED, FILE_COPY,<br/>MOUNT, UNMOUNT, REMOTE_FETCH"]
+    end
+    subgraph EMIT["Emission point"]
+        EM["Always AFTER lock release"]
+    end
+    subgraph FW["FileWatcher"]
+        F1["kernel-owned: local OBSERVE waiters<br/>on_mutation() resolves in-memory futures ~0&micro;s"]
+        F2["kernel-knows: optional RemoteWatchProtocol<br/>set via set_remote_watcher()"]
+    end
+</pre>
+
+<p><code>REMOTE_FETCH</code> fires from <code>try_remote_fetch</code> after each successful blob delivery from a peer node (distributed-VFS observability primitive). The kernel stamps <code>remote_addr</code> as an opaque string; substrate interpretation (Tailscale direct vs relay, S3 bucket, IPFS multihash, &hellip;) belongs to consumer services (e.g. <code>services::transport_observer</code>).</p>
+
+<h4 id="event-ownership">4.3.1 Event ownership taxonomy</h4>
+
+<p>Every kernel-emitted event answers three questions independently. The three facets stay separable &mdash; kernel owns semantic origin, boot code owns lifecycle, consumers own interface.</p>
+
+<pre class="mermaid">
+graph TB
+    subgraph EVENT["Kernel-emitted event (example: REMOTE_FETCH)"]
+        E["FileEvent"]
+    end
+
+    subgraph FACET1["1. Semantic origin"]
+        SO["The kernel subsystem whose mutation fires the event"]
+        SOE["Example: kernel::io::try_remote_fetch<br/>(the CAS remote-fetch codepath)"]
+        SO --> SOE
+    end
+
+    subgraph FACET2["2. Lifecycle owner"]
+        LO["The composition root that calls the consumer<br/>service's install() at boot"]
+        LOE["Example: cluster main<br/>(profiles/cluster/src/main.rs::run_daemon)<br/>under the consumer's Cargo feature flag"]
+        LO --> LOE
+    end
+
+    subgraph FACET3["3. Interface contract"]
+        IC["The trait the consumer implements"]
+        ICE["Example: MutationObserver::on_mutation(&amp;FileEvent)<br/>filtered by event_mask at registration"]
+        IC --> ICE
+    end
+
+    E -.->|"answers"| FACET1
+    E -.->|"answers"| FACET2
+    E -.->|"answers"| FACET3
+</pre>
+
+<h4 id="kernel-registries">4.3.2 Kernel-internal registries</h4>
+
+<p>Consumers plug in through one of three kernel-internal registries. Registries are <code>pub(crate)</code>; consumers reach them through public <code>Kernel::*</code> methods.</p>
+
+<table>
+  <thead><tr><th>Registry</th><th>Owned by</th><th>Registration key</th><th>Callers</th></tr></thead>
+  <tbody>
+    <tr><td><code>ServiceRegistry</code></td><td><code>Kernel::service_registry</code></td><td>Service name (string) &rarr; <code>ServiceInstance { Managed | Rust }</code></td><td>RPC + lifecycle for <code>RustService</code> / <code>ManagedService</code> entries</td></tr>
+    <tr><td><code>DriverLifecycleCoordinator</code></td><td><code>Kernel::dlc</code></td><td>Mount path &rarr; <code>Arc&lt;dyn ObjectStore&gt;</code> + metastore</td><td><code>sys_setattr(DT_MOUNT)</code>, driver mount/unmount</td></tr>
+    <tr><td><code>NativeHookRegistry</code> + <code>ObserverRegistry</code></td><td><code>Kernel::native_hooks</code> + <code>Kernel::observers</code></td><td>Hook/observer name (string)</td><td><code>register_native_hook</code>, <code>register_observer</code>, plus service-scoped <code>register_service_hook</code> / <code>register_service_observer</code></td></tr>
+  </tbody>
+</table>
+
+<div class="callout">
+  Service-scoped registrations record a <code>service_name &rarr; [hook_or_observer_name]</code> mapping in <code>service_hook_names</code> / <code>service_observer_names</code>, so <code>unregister_service</code> batch-removes every hook and observer the service installed. The mapping is honor-system-by-string today &mdash; <code>service_name</code> is not cross-checked against <code>ServiceRegistry</code>. Refactoring toward enforced ownership (LSM-style <code>try_module_get</code>) is tracked out-of-band.
+</div>
+
+<h3 id="dt-link">4.4 DT_LINK &mdash; Path-Internal Symlink <span class="role-badge">Linux analogue: <code>symlink(2)</code></span></h3>
+
+<pre class="mermaid">
+graph LR
+    C["sys_* on path P (P is DT_LINK)"]
+    C --> RT["VFSRouter::route(P)"]
+    RT --> RS{{"Read link_target"}}
+    RS -->|"target is DT_LINK"| ELOOP[["ELOOP"]]
+    RS -->|"target == self"| REJ[["rejected at sys_setattr time"]]
+    RS -->|"regular target"| RESOLVED["operation on resolved target;<br/>hooks fire on target path"]
+
+    U["sys_unlink(P)"] -.->|"removes link only,<br/>does NOT touch target"| P["P"]
+    ST["sys_stat(P)"] -.->|"reports entry as link,<br/>link_target filled in"| P
+
+    classDef bad fill:#7f1d1d,stroke:#fca5a5,color:#fecaca
+    class ELOOP,REJ bad
+</pre>
+
+<p>Storage: <code>FileMetadata.link_target</code> &mdash; absolute or workspace-relative VFS path. Entry type: <code>DT_LINK = 6</code> (<code>proto/nexus/core/metadata.proto</code>).</p>
+
+<p><strong>Use cases:</strong></p>
+<ul>
+  <li><code>/proc/{pid}/agent &rarr; /agents/{name}/</code> &mdash; runtime back-reference to image; mirrors Linux <code>/proc/{pid}/exe</code></li>
+  <li><code>/proc/{pid}/workspace/chat-with-me &rarr; /proc/{pid}/chat-with-me</code> &mdash; workspace-anchored mailbox shortcut so agents addressing each other don't have to walk the registry</li>
+</ul>
+
+<p>See the <a href="https://s.shareone.vip/s/nexus-integration-architecture">Nexus Integration Architecture</a> for the A2A messaging conventions that consume DT_LINK.</p>
+
+<h3 id="metadata-sync">4.5 MetadataSync &mdash; Backend&harr;Metastore Coherence <span class="role-badge">Linux analogue: network-FS index revalidation</span></h3>
+
+<p>Some backends own storage the kernel cannot mediate &mdash; a LocalConnector over a host directory that <code>cc</code> (or <code>rsync</code>, or any process) writes to directly, bypassing <code>sys_write</code>. The metastore must still learn about that content so peers see it through raft-replicated <code>metastore.list</code> and route to it. Analogue: an NFS client re-deriving its attribute/dentry cache from a backing store that changes outside the client's own write path (<code>-&gt;getattr</code> refresh, <code>d_revalidate</code>).</p>
+
+<pre class="mermaid">
+graph TB
+    subgraph ATOM["Idempotent propose atom"]
+        A["Kernel::observe_backend_entry"]
+        A -.->|"never clobbers an existing row"| SSOT["existing row = SSOT<br/>for last_writer_address routing"]
+    end
+
+    subgraph TRIGGERS["Three triggers &mdash; each enumerates the backend the cheapest way"]
+        T1["Initial walk<br/>fires: mount arm time<br/>scope: recursive whole mount, sync<br/>role: seed every pre-existing entry"]
+        T2["Periodic reconcile<br/>fires: every RECONCILE_INTERVAL (5s)<br/>scope: recursive whole mount<br/>role: completeness backstop"]
+        T3["On-access seed<br/>fires: sys_readdir on armed mount surfaces<br/>a backend child absent from metastore<br/>scope: that directory's new entries, sync<br/>role: low-latency path"]
+    end
+
+    T1 --> A
+    T2 --> A
+    T3 --> A
+</pre>
+
+<div class="callout">
+  <strong>Generic mechanism.</strong> Needs only <code>ObjectStore::list_dir</code> + <code>stat</code>, which cross the dylib C-ABI &mdash; so it runs kernel-side over <code>&amp;dyn ObjectStore</code> and works uniformly for built-in and dylib-loaded connectors. An <code>as_*()</code> downcast would not cross that boundary (see &sect;3.A.2).
+  <br><br>
+  <strong>Opt-in per mount.</strong> Whether a mount's backend receives out-of-band content is not knowable generically. Arm via <code>Kernel::arm_metadata_sync</code>; the boot path arms <code>--mount-driver local-connector</code> mounts. Handle lifetime = mount lifetime &mdash; DLC holds the <code>MetadataSyncHandle</code> and drops it on unmount. A non-armed mount runs none of this: no walk, no thread, and <code>sys_readdir</code> skips the on-access seed (gated on <code>DriverLifecycleCoordinator::is_sync_armed</code>).
+</div>
+
+<p>Contract + full design: <code>rust/kernel/src/core/metadata_sync.rs</code> and <a href="https://github.com/nexi-lab/nexus-vfs/blob/main/docs/observer-backend-contract.md">observer-backend-contract</a>.</p>
+
+<h4 id="two-coherence">4.5.1 Two coherence layers</h4>
+
+<p>The metastore sits between a fast cache and a backing store, and Nexus keeps it coherent with each side through a <strong>separate</strong> mechanism &mdash; the two flow in opposite directions.</p>
+
+<pre class="mermaid">
+graph TB
+    subgraph BACKEND["Backend (out-of-band writers)"]
+        BW["cc / rsync / any process writing directly"]
+    end
+    subgraph MS["Metastore &mdash; the authoritative index"]
+        MSI["ZoneMetaStore (in-memory projection)"]
+    end
+    subgraph RAFT["Raft SSOT"]
+        RS["ZoneConsensus + state machine"]
+    end
+
+    BW ==>|"upstream &mdash; feeds consensus<br/><span style='color:#94a3b8'>MetadataSync (core/metadata_sync.rs) &mdash;<br/>cache-REVALIDATION-on-read + periodic re-walk<br/>(NFS d_revalidate analogue)</span>"| MSI
+    RS ==>|"downstream &mdash; follows consensus<br/><span style='color:#94a3b8'>each ZoneMetaStore self-registers an invalidator<br/>on its consensus (rust/raft) &mdash;<br/>cache-INVALIDATION-on-write<br/>(dirty dentry/inode eviction analogue)</span>"| MSI
+</pre>
+
+<p>They share the concept (coherence), not code. The <code>raft &rarr; kernel</code> dependency boundary and opposite data-flow directions keep them as distinct primitives in distinct crates. Classic OS split: cache-invalidation-on-write (downstream) versus cache-revalidation-on-read (upstream).</p>
+
+<h3 id="procfs-registry">4.6 ProcfsRegistry &mdash; <code>/__sys__/&hellip;</code> Views <span class="role-badge">Linux analogue: <code>proc_create()</code></span></h3>
+
+<p>Not everything the kernel owns is a file. An advisory lock is a kernel object; a credential record lives in its own raft tree, off the <code>sys_read</code> / <code>readdir</code> path <em>by design</em>, so no path walk reaches one and no <code>sys_write</code> forges one. Both still need an introspection surface. <code>ProcfsRegistry</code> is that surface &mdash; Linux&rsquo;s <code>proc_create()</code>, where the lock subsystem registers <code>/proc/locks</code> rather than the VFS special-casing it.</p>
+
+<table>
+  <thead><tr><th>View</th><th>Provider</th><th>Owner</th><th>Admin-gated</th></tr></thead>
+  <tbody>
+    <tr><td><code>/__sys__/locks</code></td><td><code>LocksProcfs</code></td><td><code>core/lock/</code> (LockManager)</td><td>yes</td></tr>
+    <tr><td><code>/__sys__/zones</code></td><td><code>ZonesProcfs</code></td><td><code>federation/</code> (via &sect;3.B.1 slot)</td><td>no &mdash; topology the peers already share</td></tr>
+    <tr><td><code>/__sys__/auth/keys</code></td><td><code>AuthKeysProcfs</code></td><td><code>auth/</code> (via &sect;3.B.3 slot)</td><td>yes</td></tr>
+  </tbody>
+</table>
+
+<pre class="mermaid">
+graph TB
+    subgraph REG["ProcfsRegistry (kernel-owned)"]
+        R1["Sorting + cursor pagination"]
+        R2["Every view pages identically"]
+    end
+    subgraph RULES["Three rules hold for all views"]
+        RU1["<strong>Read-only.</strong><br/>No write path through a view.<br/>A sys_write at a view's path lands<br/>(at most) an inert metadata entry &mdash;<br/>cannot mutate the primitive behind the view."]
+        RU2["<strong>Gated at the view, not at /__sys__.</strong><br/>Each provider declares admin_only.<br/>A refused caller gets an EMPTY LISTING,<br/>never an error &mdash;<br/>an error would answer<br/>&quot;does this entry exist?&quot;"]
+        RU3["<strong>A projection, never a second copy.</strong><br/>SSOT stays where it lives;<br/>view synthesises on read.<br/>Materialising entries would create<br/>a shadow SSOT to keep in sync<br/>on every revocation and unlock."]
+    end
+</pre>
+
+<div class="callout">
+  State that <em>can</em> be a file should simply be one, and then the kernel needs no code at all: <code>/proc/{pid}</code> is built by the managed-agent service through ordinary syscalls (<code>create_dt_dir</code> / <code>create_dt_stream</code> / <code>create_dt_link</code>), which is why no provider exists for it. Reach for a provider only when materialising the entries would put the SSOT somewhere it must not be.
+</div>
+
+<!-- ================================================================ -->
+<h2 id="standards">5. Kernel-Authored Standards</h2>
+
+<p><span class="role-badge">Category: Kernel-Authored Standard</span> <span class="role-badge">Audience: services</span></p>
+
+<h3 id="standard-plug">5.1 The &ldquo;Standard Plug&rdquo; Principle</h3>
+
+<p>The kernel defines contracts it doesn&rsquo;t own &mdash; so kernel infrastructure works automatically with any service that conforms.</p>
+
+<pre class="mermaid">
+graph LR
+    subgraph LINUX["Linux analogues"]
+        L1["file_operations struct<br/>(read/write/ioctl fn pointers)"]
+        L2["security_operations struct<br/>(200+ LSM hook pointers)"]
+    end
+    subgraph NEXUS["Nexus equivalents"]
+        N1["RecordStoreABC &mdash;<br/>session factory + read replica"]
+        N2["VFS*Hook protocols &mdash;<br/>hook shapes (context dataclasses)"]
+        N3["Service Protocols &mdash;<br/>@runtime_checkable typed interfaces"]
+    end
+    subgraph BENEFIT["Kernel infrastructure benefit"]
+        B1["VFS calls any filesystem uniformly"]
+        B2["Security framework calls any LSM"]
+        B3["Services get pooling / error translation /<br/>replica routing without opting in per driver"]
+        B4["KernelDispatch calls any conforming hook<br/>uniformly"]
+    end
+
+    L1 -.->|"analogue"| N1
+    L2 -.->|"analogue"| N2
+    L1 --> B1
+    L2 --> B2
+    N1 --> B3
+    N2 --> B4
+</pre>
+
+<p><strong>Integration mechanisms:</strong> Factory auto-discovers bricks via <code>brick_factory.py</code> convention (<code>RESULT_KEY</code> + <code>PROTOCOL</code> + <code>create()</code>), validates protocol conformance at registration, and resolves kernel dependencies via <code>EXPORT_SYMBOL()</code> pattern (see &sect;1.5 Service Lifecycle).</p>
+
+<h3 id="record-store-abc">5.2 <code>RecordStoreABC</code> &mdash; Relational Storage Standard</h3>
+
+<p><span class="role-badge">Package: <code>storage.record_store</code></span> <span class="role-badge">Service-tier interface (consumed by services, defined by kernel)</span></p>
+
+<pre class="mermaid">
+graph LR
+    K[["Kernel: DEFINES ABC<br/>(the standards body)"]]
+    subgraph IF["Interface shape (kernel-defined)"]
+        I1["session_factory (SQLAlchemy ORM)"]
+        I2["read_session_factory (replica routing)"]
+    end
+    subgraph DRV["Drivers &mdash; must provide"]
+        D1["PostgreSQL"]
+        D2["SQLite"]
+    end
+    subgraph FORCE["What the interface shape forces on drivers"]
+        F1["Pooling"]
+        F2["Error translation"]
+        F3["Read replica routing"]
+        F4["WAL mode"]
+        F5["Async lazy init"]
+    end
+    subgraph SVC["Services consume via ABC's factories"]
+        S1["ReBAC, Auth, Agents, Scheduler, &hellip;"]
+    end
+
+    K --> IF
+    IF --> DRV
+    DRV --> FORCE
+    IF --> S1
+</pre>
+
+<div class="callout">
+  Both sides (drivers and services) conform to the same interface; neither needs to know the other. The value comes from bilateral interface conformance, not from kernel providing these features directly.
+</div>
+
+<h3 id="service-protocols">5.3 Service Protocols &mdash; 40+ Scenario Domains</h3>
+
+<p><span class="role-badge">Package: <code>contracts.protocols</code></span> <span class="role-badge">Service-tier standards</span></p>
+
+<pre class="mermaid">
+graph TB
+    P["contracts.protocols<br/>40+ typing.Protocol classes<br/>with @runtime_checkable"]
+
+    subgraph DOMAINS["Organized by domain"]
+        D1["Permission"]
+        D2["Search"]
+        D3["Mount"]
+        D4["Agent"]
+        D5["Events"]
+        D6["Memory"]
+        D7["Domain"]
+        D8["Audit"]
+        D9["Cross-Cutting"]
+    end
+</pre>
+
+<p>See <a href="https://github.com/nexi-lab/nexus-vfs/blob/main/docs/ops-scenario-matrix.md">ops-scenario-matrix</a> &sect;2&ndash;&sect;3 for full enumeration and affinity matching.</p>
+
+<!-- ================================================================ -->
+<h2 id="tier-neutral">6. Tier-Neutral Infrastructure &amp; Workspace Composition</h2>
+
+<p>Two packages sit <strong>outside</strong> the Kernel &rarr; Services &rarr; Drivers stack. Any layer may import from them; their own imports stay within themselves plus the standard library &mdash; keeping them tier-neutral leaves of the dependency graph.</p>
+
+<pre class="mermaid">
+graph TB
+    subgraph TN["Tier-neutral (leaves)"]
+        C["contracts/ &mdash; Types, enums, exceptions, constants<br/>Linux analogue: include/linux/ (headers)<br/><strong>Declarations only</strong>: zero implementation logic, zero I/O"]
+        L["lib/ &mdash; Reusable helpers, pure utilities<br/>Linux analogue: lib/ (libc, libm)<br/><strong>Implementation allowed</strong>; depends on contracts + stdlib only"]
+    end
+
+    subgraph MULTI["Multi-layer callers"]
+        K[["kernel"]]
+        S["services"]
+        D["drivers"]
+    end
+
+    K --> TN
+    S --> TN
+    D --> TN
+
+    C -.->|"depended on by"| L
+</pre>
+
+<p><strong>Core distinction:</strong> <code>contracts/</code> = <strong>what</strong> (shapes of data). <code>lib/</code> = <strong>how</strong> (behavior).</p>
+
+<h3 id="py-rust-mapping">6.1 Python &harr; Rust Crate Mapping</h3>
+
+<table>
+  <thead><tr><th>Tier-neutral package</th><th>Python</th><th>Rust crate</th></tr></thead>
+  <tbody>
+    <tr><td><code>contracts</code></td><td><code>src/nexus/contracts</code></td><td><code>rust/contracts/</code></td></tr>
+    <tr><td><code>lib</code></td><td><code>src/nexus/lib</code></td><td><code>rust/lib/</code></td></tr>
+  </tbody>
+</table>
+
+<p><code>rust/lib/</code> builds against <code>wasm32-unknown-unknown</code> with default features. It also carries the <code>transport_primitives</code> module &mdash; TLS config, peer addressing, connection pooling, channel creation, the TOFU trust store, and the <code>PeerBlobClient</code> trait &mdash; behind the optional <code>transport</code> feature so WASM / pure-algo callers skip the tonic + tokio dep stack. Every peer crate that speaks raft or VFS gRPC (raft, transport, kernel through the peer-client slot) enables <code>lib</code>&rsquo;s <code>transport</code> feature.</p>
+
+<h3 id="workspace-composition">6.2 Workspace composition</h3>
+
+<pre class="mermaid">
+graph LR
+    subgraph CARGO["Cargo artifact roles"]
+        RL["Library crates &mdash; rlib<br/>compose into deployment binaries"]
+        PB["Profile binaries &mdash; binary<br/>rust/profiles/&lt;name&gt;/ &mdash;<br/>standalone deployment binaries (&sect;7.1)"]
+    end
+
+    subgraph LINUX["Linux analogue"]
+        LX["make bzImage &mdash; rlibs compile into<br/>final binary the same way<br/>fs/built-in.a and kernel/built-in.a<br/>link into vmlinuz"]
+    end
+
+    subgraph PY["Python communicates via"]
+        GRPC["gRPC to nexus-cluster process,<br/>NOT FFI"]
+    end
+</pre>
+
+<h4 id="crate-roles">Crate role taxonomy &mdash; every peer crate maps to exactly ONE role</h4>
+
+<p>Role separation is the invariant that keeps the dep graph acyclic.</p>
+
+<pre class="mermaid">
+graph TB
+    subgraph OS["OS proper &mdash; kernel/, contracts/"]
+        OS1["Linux: kernel/ (vmlinux core)<br/>VFS, syscalls, namespace primitives,<br/>HAL trait declarations"]
+    end
+
+    subgraph DRV["Driver layer (kernel-internal) &mdash; backends/, raft/"]
+        DRV1["Linux: drivers/<br/>Implement HAL traits;<br/>consume kernel's runtime API<br/>backends = local storage drivers (ObjectStore)<br/>raft = distributed driver<br/>(MetaStore + DistributedCoordinator)"]
+    end
+
+    subgraph NET["Network surface (kernel-external) &mdash; transport/"]
+        NET1["Linux: net/<br/>VFS gRPC server (inbound) +<br/>VFS/peer-blob/federation clients (outbound)<br/>Same crate covers both directions,<br/>like net/ covers both server sockets<br/>and outgoing connections"]
+    end
+
+    subgraph SVC["Post-syscall services (kernel-internal hooks) &mdash; services/"]
+        SVC1["Linux: LSM hooks (security/)<br/>Audit, agents, permission, tasks &mdash;<br/>fired on syscall paths through registered hooks"]
+    end
+
+    subgraph MSG["Messaging substrate (kernel-tier) &mdash; a2a/"]
+        MSG1["Linux: AF_UNIX / kernel messaging<br/>A2A messaging substrate:<br/>owns mailbox `from` guarantee (stamp hook)<br/>+ cross-machine delivery wake<br/>(stream-wakeup observer);<br/>armed ONCE at the daemon<br/>Core: kernel + contracts;<br/>`install` feature adds raft"]
+    end
+
+    subgraph TN["Tier-neutral lib &mdash; lib/"]
+        TN1["Linux: lib/ (libc, libm)<br/>Pure utilities depending on contracts only<br/>Algorithms + transport_primitives<br/>(TLS, pool, TOFU, PeerBlobClient trait)"]
+    end
+</pre>
+
+<div class="callout">
+  <strong>A2A substrate vs. frontends.</strong> <code>a2a</code> is the substrate, not a frontend. The <code>from</code> guarantee (an agent cannot forge who a message is from) must hold for EVERY mailbox writer, so it is enforced ONCE at the substrate &mdash; the stamp hook rewrites the envelope <code>from</code> to the caller's <code>agent_id</code> on every <code>*/chat-with-me</code> write. Frontends ride on top: <code>matrix_adapter</code> (Matrix C-S protocol &rarr; humans, <code>services/</code>), <code>sudocode-host</code> (agent runtime &rarr; AI, sudocode repo), <code>managed_agent</code> (spawn/PCB &rarr; process, <code>services/</code>). A frontend consumes <code>a2a::MailboxStampingHook</code> (no raft); only the daemon calls <code>a2a::install_a2a</code> (the <code>install</code> feature, which links raft to arm the stream-wakeup observer).
+</div>
+
+<p>The role split makes the orthogonality invariants read directly off the table:</p>
+<ul>
+  <li><strong><code>services &perp; backends &perp; raft</code></strong> &mdash; services and backends reach raft state through <code>kernel.sys_*</code> syscalls, never via Cargo dep</li>
+  <li><strong><code>kernel &perp; raft</code></strong> &mdash; kernel reaches raft only through trait dispatch</li>
+</ul>
+
+<h4 id="kernel-crate-composition">Kernel crate composition &mdash; <code>rust/kernel/src/kernel/</code></h4>
+
+<pre class="mermaid">
+graph TB
+    subgraph KMOD["kernel/mod.rs &mdash; struct + wiring"]
+        KM["Kernel struct, constructor,<br/>MetaStore + Router proxies,<br/>syscall-shaped helpers<br/>(lookup_content_id, with_metastore_route,<br/>commit_metadata, commit_delete)"]
+    end
+
+    subgraph FAMILIES["Per-family syscall submodules"]
+        F1["kernel/io.rs<br/>Tier 1: sys_read/write/stat/unlink/rename/copy<br/>Tier 2 optimized bodies: access/mkdir/rmdir"]
+        F2["kernel/ipc.rs<br/>pipe + stream registries<br/>(create_pipe, pipe_write_nowait,<br/>stream_read_at, &hellip;)"]
+        F3["kernel/locks.rs<br/>Advisory locks: sys_lock, sys_unlock,<br/>metastore_list_locks,<br/>install_federation_locks"]
+        F4["kernel/dispatch.rs<br/>Native INTERCEPT hook dispatch<br/>(dispatch_native_pre / _post,<br/>register_native_hook)"]
+        F5["kernel/observability.rs<br/>Observer registry, file-watch,<br/>sys_watch, dispatch_mutation"]
+        F6["kernel/mount.rs<br/>Mount-table primitives:<br/>add_mount, remove_mount,<br/>install_mount_metastore, route"]
+        F7["kernel/federation.rs<br/>DistributedCoordinator slot accessors,<br/>/__sys__/zones/ procfs synthesisers,<br/>blob-fetcher slot plumbing"]
+        F8["kernel/convenience.rs<br/>Tier 2 KernelConvenience trait:<br/>access, mkdir, rmdir,<br/>stat_batch, exists_batch,<br/>get_content_id, is_directory,<br/>set_xattr / get_xattr / get_xattr_bulk,<br/>Tier 2 write (create-or-overwrite),<br/>single-file read / unlink defaults"]
+    end
+
+    KMOD -->|"impl Kernel { &hellip; }<br/>submodule methods reach<br/>mod.rs methods without<br/>trait dispatch"| FAMILIES
+</pre>
+
+<p>The split between <code>kernel/</code> (syscalls) and <code>core/</code> (primitives) follows the data type: &sect;4 primitives &mdash; concrete data structures like <code>VFSRouter</code>, <code>AgentRegistry</code>, <code>LockManager</code> &mdash; live in <code>core/</code>; the syscall families that operate on them live in <code>kernel/</code>.</p>
+
+<h4 id="cp-hal-di">Control-Plane HAL DI surface &mdash; boot wiring</h4>
+
+<pre class="mermaid">
+sequenceDiagram
+    participant K as Kernel::new
+    participant Slot as distributed_coordinator slot
+    participant RC as RaftDistributedCoordinator::install_with_kernel
+    participant SA as set_self_address
+    participant BF as stash_blob_fetcher_slot
+    participant Apply as DT_MOUNT apply-cb
+    participant Drain as blob_fetcher_handler::install
+    participant Trans as transport::peer_blob::install
+
+    K->>Slot: default = NoopDistributedCoordinator
+    RC->>Slot: replace with RaftDistributedCoordinator
+    RC->>SA: publish federation self-address<br/>(origin pointer for last_writer_address)
+    RC->>BF: hand raft gRPC server's<br/>BlobFetcherSlot up
+    RC->>Apply: install DT_MOUNT apply-cb<br/>on every loaded zone
+    RC->>Apply: replay DT_MOUNT entries<br/>already on disk (after restart)
+    RC->>Drain: drain stashed slot &mdash;<br/>KernelBlobFetcher serves ZoneApi/ReadBlob
+    RC->>RC: bootstrap_done = true<br/>&rArr; is_initialized() reports ready
+    Note over Trans: separate call (transport &gt; raft in dep graph)
+    Trans->>K: wires Kernel::peer_client<br/>(PeerBlobClient impl used by<br/>try_remote_fetch)
+</pre>
+
+<div class="callout">
+  <code>PeerBlobClient</code> borrows the kernel's runtime via <code>Handle</code>, so its drop never triggers a runtime shutdown &mdash; shutdown ordering is the kernel's sole responsibility. The installer is internal wiring, not a public contract. The &sect;3.B.2 <code>ObjectStoreProvider</code> slot uses the same pattern.
+</div>
+
+<h4 id="dep-graph">Dependency direction &mdash; the acyclic graph</h4>
+
+<pre class="mermaid">
+graph TB
+    C["contracts<br/>(zero deps)"]
+    L["lib<br/>(depends on contracts;<br/>algorithms + transport_primitives<br/>behind opt-in features)"]
+    K[["kernel<br/>(depends on contracts + lib;<br/>declares HAL traits)"]]
+
+    B["backends"]
+    R["raft"]
+    T["transport"]
+    S["services"]
+    A["a2a"]
+
+    P["rust/profiles/cluster<br/>(deployment binary sink)"]
+
+    C --> L
+    L --> K
+    K --> B
+    K --> R
+    K --> T
+    K --> S
+    K --> A
+    R -.->|"trait-only: DistributedCoordinator dispatch"| K
+    R -->|"proto stubs"| T
+    A -.->|"install feature ONLY &mdash;<br/>arms stream-wakeup observer<br/>(ZoneConsensus, AppendStreamEntry)"| R
+
+    B --> P
+    R --> P
+    T --> P
+    S --> P
+    A --> P
+
+    classDef k fill:#0f172a,stroke:#fcd34d,stroke-width:3px
+    classDef sink fill:#1e293b,stroke:#94a3b8,stroke-width:2px,stroke-dasharray:3 3
+    class K k
+    class P sink
+</pre>
+
+<table>
+  <thead><tr><th>Edge</th><th>Direction</th></tr></thead>
+  <tbody>
+    <tr><td><code>services</code> / <code>backends</code> / <code>raft</code></td><td>Role peers &mdash; orthogonal; reach each other via <code>kernel.sys_*</code> syscalls</td></tr>
+    <tr><td><code>kernel &harr; lib</code></td><td>One-way: <code>kernel &rarr; lib</code></td></tr>
+    <tr><td><code>raft &harr; transport</code></td><td>One-way: <code>transport &rarr; raft</code> for federation client proto stubs (Postgres-client-references-libpq shape)</td></tr>
+    <tr><td><code>kernel &rarr; raft</code></td><td>Trait-only: kernel reaches raft through <code>DistributedCoordinator</code> dispatch</td></tr>
+    <tr><td><code>a2a &rarr; kernel</code></td><td>Always &mdash; the stamp hook is a <code>NativeInterceptHook</code>; core footprint is <code>kernel + contracts + serde_json</code></td></tr>
+    <tr><td><code>a2a &rarr; raft</code></td><td><code>install</code> feature ONLY &mdash; arms the stream-wakeup observer. Frontends consuming the stamp hook leave the feature off and stay raft-free (<code>services &perp; raft</code>)</td></tr>
+    <tr><td><code>rust/profiles/&lt;name&gt;</code></td><td>Sink (deployment binary)</td></tr>
+  </tbody>
+</table>
+
+<div class="callout">
+  <code>lib</code> (default features) keeps a zero peer-crate footprint so it builds against <code>wasm32-unknown-unknown</code>. The <code>transport_primitives</code> module under lib's <code>transport</code> feature houses TLS / pool / addressing / TOFU trust store / <code>PeerBlobClient</code> trait &mdash; both raft (server-side handler) and transport (client-side fetch) consume it without depending on each other.
+</div>
+
+<h4 id="rpc-split">RPC: client side vs server side</h4>
+
+<table>
+  <thead><tr><th>Side</th><th>Crate</th><th>Module</th><th>Role</th></tr></thead>
+  <tbody>
+    <tr><td>Server</td><td><code>transport</code></td><td><code>grpc</code> / <code>ipc</code></td><td>VFS gRPC server (port 2028) + IPC envelope helpers</td></tr>
+    <tr><td>Server</td><td><code>raft</code></td><td><code>blob_fetcher_handler</code></td><td>Federation peer mesh + per-zone routers + blob-fetcher server handler</td></tr>
+    <tr><td>Client</td><td><code>transport</code></td><td><code>vfs</code> / <code>peer_blob</code> / <code>federation</code></td><td>Driver-outgoing clients: VFS gRPC for <code>RemoteBackend</code>, peer-blob fetch, federation peer client</td></tr>
+    <tr><td>Shared</td><td><code>lib::transport_primitives</code></td><td>(whole module)</td><td>TLS, connection pool, addressing, TOFU trust store, <code>PeerBlobClient</code> trait &mdash; consumed by both sides</td></tr>
+  </tbody>
+</table>
+
+<p><code>transport/</code> covers both directions of the network surface (Linux <code>net/</code> analogue: same crate hosts server sockets and outgoing connection helpers). The <code>RpcTransport</code> type sits in the kernel crate (kernel-internal <code>RemoteMetaStore</code> / <code>RemotePipeBackend</code> / <code>RemoteStreamBackend</code> wrappers also wrap it directly); <code>transport::vfs</code> re-exports it so out-bound callers name a single canonical path.</p>
+
+<h4 id="placement-tree">6.3 Placement Decision Tree &amp; Import Rules</h4>
+
+<pre class="mermaid">
+graph TB
+    Q1{{"Used by a<br/>SINGLE layer?"}}
+    Q1 -->|"yes"| STAY["stays in that layer<br/>(e.g. fuse/filters.py)"]
+    Q1 -->|"no (multi-layer)"| Q2{{"Type / ABC / exception /<br/>enum / constant?"}}
+    Q2 -->|"yes"| C["contracts/"]
+    Q2 -->|"no (function /<br/>helper / I/O logic)"| L["lib/"]
+</pre>
+
+<div class="callout">
+  <strong>Import rules for <code>contracts/</code> and <code>lib/</code>:</strong>
+  <ul style="margin:6px 0 0">
+    <li>May import: each other, stdlib, third-party packages.</li>
+    <li>May NOT import: <code>nexus.core</code>, <code>nexus.services</code>, <code>nexus.server</code>, <code>nexus.cli</code>, <code>nexus.fuse</code>, <code>nexus.bricks</code>, <code>nexus.rebac</code>.</li>
+  </ul>
+</div>
+
+<!-- ================================================================ -->
+<h2 id="profiles">7. Deployment Profiles</h2>
+
+<p>The kernel&rsquo;s layered design (&sect;1) and DI contracts (&sect;3) enable a range of deployment profiles. Not kernel-owned, but kernel-enabled. Like Linux distros select packages from the same kernel, Nexus profiles select which bricks to enable and which drivers to inject.</p>
+
+<pre class="mermaid">
+graph TB
+    subgraph HIER["Profile hierarchy: slim &sub; cluster &sub; embedded &sub; lite &sub; full &sube; cloud"]
+        SL["slim &mdash; bare minimum runnable<br/>redb (embedded) &mdash; Linux: initramfs"]
+        CL["cluster &mdash; minimal multi-node<br/>IPC + federation, no auth<br/>redb (Raft) &mdash; Linux: CoreOS"]
+        EM["embedded &mdash; MCU, WASM (&lt;1 MB)<br/>redb (embedded) &mdash; Linux: BusyBox"]
+        LI["lite &mdash; Pi, Jetson, mobile<br/>redb (embedded) &mdash; Linux: Alpine"]
+        FU["full &mdash; desktop, laptop<br/>redb (embedded) &mdash; Linux: Ubuntu Desktop"]
+        CD["cloud &mdash; k8s, serverless<br/>redb (Raft) &mdash; Linux: Ubuntu Server"]
+    end
+    subgraph ORTH["Orthogonal to hierarchy"]
+        RE["remote &mdash; client-side proxy<br/>zero local bricks<br/>RemoteMetastore &mdash; Linux: NFS client"]
+    end
+
+    SL --> CL --> EM --> LI --> FU --> CD
+</pre>
+
+<p>Same kernel binary, different driver injection. See &sect;1.8 <code>connect()</code>. Source of truth: <code>src/nexus/contracts/deployment_profile.py</code>.</p>
+
+<h3 id="profile-binaries">7.1 Profile binaries &mdash; <code>rust/profiles/</code></h3>
+
+<p>A profile that runs as its own OS process lives under <code>rust/profiles/&lt;name&gt;/</code> and produces a standalone deployment binary <code>nexusd-&lt;name&gt;</code>.</p>
+
+<pre class="mermaid">
+graph TB
+    subgraph CLUSTER["rust/profiles/cluster/ &rArr; nexusd-cluster"]
+        RLIBS["Composed rlibs:<br/>raft + contracts + kernel + backends<br/>(kernel + backends with slimmest features:<br/>no connectors, no Python interpreter)"]
+        BOOT["Boot behavior:<br/>mounts host-fs at / via PathLocalBackend<br/>(--root-path);<br/>runtime `mount` / `unmount` subcommands<br/>drive the same DLC syscalls"]
+    end
+    subgraph BOUNDARY["Kernel boundary &mdash; gRPC"]
+        PY["Python communicates with the kernel<br/>via gRPC to the nexus-cluster process"]
+    end
+</pre>
+
+<h3 id="feature-gates">7.2 Compile-time features vs runtime driver gate</h3>
+
+<p>Driver selection is gated at two layers &mdash; pick which layer is doing the work for any given deployment.</p>
+
+<pre class="mermaid">
+graph TB
+    subgraph CT["Compile-time layer"]
+        C1["Mechanism: backends/services<br/>Cargo features<br/>(driver-path-local, service-audit, &hellip;)"]
+        C2["Decided: cargo build"]
+        C3["Cost: binary size on disk"]
+        C4["Linux analogue: CONFIG_FOO=y in .config"]
+    end
+    subgraph RT["Runtime layer"]
+        R1["Mechanism: kernel::hal::object_store_provider::set_enabled_drivers<br/>(Python nx_set_enabled_drivers)"]
+        R2["Decided: boot,<br/>before first sys_setattr(DT_MOUNT)"]
+        R3["Cost: runtime error if a profile<br/>asks for a missing driver"]
+        R4["Linux analogue: /sys/module/&lt;name&gt;/parameters"]
+    end
+    subgraph SSOT["Runtime gate = SSOT"]
+        S1["Every dispatch goes through<br/>is_driver_enabled &mdash;<br/>no implicit local-default skip-branch"]
+    end
+
+    RT --> SSOT
+</pre>
+
+<div class="callout">
+  <code>nexusd-cluster</code> (slim Rust binary) compiles only the drivers it needs (<code>features = ["driver-path-local"]</code>) and skips the runtime gate entirely &mdash; the compile-time gate is sufficient because dispatch arms for missing drivers don't exist. Attempting to mount a non-compiled driver returns <code>driver `X` not compiled into this binary</code> straight from the factory. A driver name that appears in <code>src/nexus/contracts/deployment_profile.py::ALL_DRIVER_NAMES</code> is canonical in both layers &mdash; Python aliases like the historical <code>"cas"</code> &rarr; <code>"cas-local"</code> mapping live in <code>src/nexus/core/nexus_fs_metadata.py</code>, never in Rust.
+</div>
+
+<!-- ================================================================ -->
+<h2 id="communication">8. Communication</h2>
+
+<p>Kernel-adjacent services built on kernel primitives (&sect;4.2 IPC, &sect;4.3 FileEvent). Not kernel-owned, but bottom-layer infrastructure.</p>
+
+<pre class="mermaid">
+graph TB
+    subgraph K["Kernel tier"]
+        K1["DT_PIPE (&sect;4.2)<br/>MemoryPipeBackend &mdash; destructive FIFO<br/>Local or distributed (transparent)"]
+        K2["DT_STREAM (&sect;4.2)<br/>MemoryStreamBackend &mdash; append-only log<br/>Local or distributed (transparent)"]
+    end
+    subgraph SYS["System tier"]
+        S1["gRPC + IPC<br/>Built on PipeManager/StreamManager,<br/>consensus proto<br/>Topology: point-to-point"]
+    end
+    subgraph USR["User-space tier"]
+        U1["EventBus<br/>Built on CacheStoreABC pub/sub + FileEvent<br/>Topology: fan-out (1:N)"]
+    end
+</pre>
+
+<p>See <a href="https://github.com/nexi-lab/nexus-vfs/blob/main/docs/federation-memo.md">federation-memo</a> &sect;2&ndash;&sect;5 for gRPC/consensus details.</p>
+
+<h3 id="call-rpc-order">8.1 <code>NexusVFSService.Call</code> &mdash; RPC dispatch order</h3>
+
+<pre class="mermaid">
+graph TB
+    IN["Call(method, payload)"]
+    IN --> AUTH{{"Auth check &mdash;<br/>admin-only applies uniformly"}}
+    AUTH -->|"pass"| RUST["1. Kernel::dispatch_rust_call<br/>(service, method, payload)"]
+    RUST -->|"dotted: 'service.method' &mdash; split on first `.`"| RDONE[["Rust service handles"]]
+    RUST -->|"flat backward-compat:<br/>'acp_*' or 'managed_agent_*' prefix<br/>&rarr; full method name preserved"| RDONE
+    RUST -->|"returns None (no Rust service)<br/>or NotFound (method missing)"| PY["2. Python @rpc_expose fallback:<br/>bridge.dispatch_call &rarr;<br/>async dispatch_method on FastAPI loop"]
+
+    RUST -->|"RustCallError::InvalidArgument<br/>or Internal"| SHORT[["short-circuit wire encoder<br/>(no fallback)"]]
+
+    classDef ok fill:#065f46,stroke:#6ee7b7,color:#d1fae5
+    classDef bad fill:#7f1d1d,stroke:#fca5a5,color:#fecaca
+    class RDONE ok
+    class SHORT bad
+</pre>
+
+<div class="callout">
+  dylib-loaded plugins (&sect;9) register as <code>Arc&lt;dyn RustService&gt;</code> via the <code>DylibRustService</code> wrapper, so they dispatch through this same path with zero special-casing in the <code>Call</code> handler.
+</div>
+
+<h3 id="rust-services">8.2 Registered Rust services</h3>
+
+<table>
+  <thead><tr><th>Service name</th><th>Source</th><th>Methods</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>managed_agent</code></td>
+      <td><code>rust/services/src/managed_agent/</code> (feature <code>service-managed-agent</code>)</td>
+      <td><code>start_session_v1</code>, <code>cancel_v1</code>, <code>get_session_v1</code> &mdash; owns the chat-with-me + workspace-boundary hooks plus the session lifecycle for <code>AgentKind::Managed</code>. State writes go to <code>kernel::core::agents::registry::AgentRegistry</code> directly.</td>
+    </tr>
+    <tr>
+      <td><code>acp</code></td>
+      <td><code>rust/services/src/acp/</code> (feature <code>service-acp</code>)</td>
+      <td><code>acp_call</code>, <code>acp_kill</code>, <code>acp_list_agents</code>, <code>acp_list_processes</code>, <code>acp_set_system_prompt</code>, <code>acp_get_system_prompt</code>, <code>acp_set_enabled_skills</code>, <code>acp_get_enabled_skills</code>, <code>acp_history</code> &mdash; stateless coding-agent CLI caller via ACP JSON-RPC. <code>call_agent</code> orchestrates <code>AcpSubprocess</code> (tokio Command + DT_PIPE) + <code>AcpConnection</code> + <code>AcpSubservice</code> lifecycle. The AgentRegistry trait bridge wired by <code>nx_acp_set_agent_registry</code> is satisfied by <code>kernel.agent_registry</code> (the Rust SSOT itself), so spawn / kill / list calls go straight to <code>kernel::core::agents::registry::AgentRegistry</code>.</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>Services compose into a profile binary the same way drivers do (&sect;7.2): each <code>service-*</code> feature gates a <code>pub mod</code> line in <code>rust/services/src/lib.rs</code>, and each profile&rsquo;s <code>Cargo.toml</code> (&sect;7.1) declares the features it enables. Python callers reach a Rust service through the gRPC <code>Call(method, payload)</code> RPC on the profile binary that links it. One dispatch path &mdash; no per-service shortcuts &mdash; so audit / permission hooks added to the dispatch path land in one place.</p>
+
+<!-- ================================================================ -->
+<h2 id="plugin-architecture">9. Plugin Architecture &mdash; dylib Hot-Swap</h2>
+
+<p><span class="role-badge">Category: Kernel Primitive (internal)</span> <span class="role-badge">Linux analogue: Loadable Kernel Modules (<code>.ko</code>)</span></p>
+
+<p><code>PluginLoader</code> (<code>rust/kernel/src/kernel/plugins/loader.rs</code>) enables runtime loading of services and drivers from shared libraries (<code>.so</code> on Linux, <code>.dylib</code> on macOS) via <code>dlopen</code>. Stable C ABI contract lets independently-compiled plugins register into the same <code>ServiceRegistry</code> and <code>VFSRouter</code> primitives that compiled-in code uses.</p>
+
+<h3 id="plugin-abi">9.1 Plugin ABI Contract</h3>
+
+<p>Every plugin dylib exports a set of C ABI symbols. The kernel validates <code>nexus_plugin_api_version()</code> at load time and rejects incompatible plugins.</p>
+
+<pre class="mermaid">
+graph TB
+    subgraph COMMON["All plugins export"]
+        C1["nexus_plugin_api_version() &rarr; u32<br/>ABI version &mdash; kernel rejects mismatches"]
+        C2["nexus_plugin_kind() &rarr; u32<br/>1 = Service, 2 = Driver"]
+        C3["nexus_plugin_name() &rarr; *const c_char<br/>null-terminated UTF-8 plugin name"]
+    end
+    subgraph SVC["Service plugins (kind=1) additionally export"]
+        S1["nexus_service_create(kernel: *const c_void) &rarr; *mut c_void<br/>Construct service instance; receives opaque KernelHandle"]
+        S2["nexus_service_dispatch(svc, method, payload, payload_len,<br/>&nbsp;out_buf, out_len) &rarr; i32<br/>RPC dispatch (0=ok, negative=error)"]
+        S3["nexus_service_destroy(svc: *mut c_void)<br/>Stop + destroy the service instance"]
+    end
+    subgraph DRV["Driver plugins (kind=2) additionally export"]
+        D1["nexus_driver_create(kernel: *const c_void,<br/>&nbsp;config_json: *const c_char) &rarr; *mut c_void<br/>Construct ObjectStore instance for a mount point"]
+        D2["nexus_driver_read(drv, path, out_buf, out_len) &rarr; i32"]
+        D3["nexus_driver_write(drv, path, data, data_len) &rarr; i32"]
+        D4["nexus_driver_destroy(drv: *mut c_void)"]
+    end
+</pre>
+
+<h3 id="kernel-handle">9.2 <code>KernelHandle</code> &mdash; Plugin Callback Surface</h3>
+
+<p>Plugins call back into the kernel through a <code>#[repr(C)]</code> vtable of function pointers. This is the plugin&rsquo;s view of the kernel &mdash; an opaque, ABI-stable surface that decouples plugin compilation from kernel internals.</p>
+
+<pre><code>#[repr(C)]
+pub struct KernelHandle {
+    pub sys_read:  unsafe extern "C" fn(kernel: *const c_void, path: *const c_char,
+                                        out_buf: *mut *mut u8, out_len: *mut usize) -&gt; i32,
+    pub sys_write: unsafe extern "C" fn(kernel: *const c_void, path: *const c_char,
+                                        data: *const u8, data_len: usize) -&gt; i32,
+    pub sys_stat:  unsafe extern "C" fn(kernel: *const c_void, path: *const c_char,
+                                        out_json: *mut *mut c_char) -&gt; i32,
+    pub kernel_ptr: *const c_void,  // opaque pointer to Arc&lt;Kernel&gt;
+}
+</code></pre>
+
+<h3 id="wrapper-types">9.3 Wrapper Types &mdash; C ABI &rarr; Rust Trait</h3>
+
+<pre class="mermaid">
+graph LR
+    subgraph SVC_ABI["Service plugin C ABI"]
+        SA["nexus_service_*"]
+    end
+    subgraph DRV_ABI["Driver plugin C ABI"]
+        DA["nexus_driver_*"]
+    end
+    subgraph WRAP["PluginLoader wrappers"]
+        W1["DylibRustService<br/>owns raw *mut c_void handle;<br/>Send + Sync; calls destroy on Drop"]
+        W2["DylibObjectStore<br/>owns raw *mut c_void handle;<br/>Send + Sync; calls destroy on Drop"]
+    end
+    subgraph TRAIT["Rust trait surface"]
+        T1["Arc&lt;dyn RustService&gt;"]
+        T2["Arc&lt;dyn ObjectStore&gt;"]
+    end
+    subgraph REG["Registration target"]
+        R1["ServiceRegistry.enlist_rust()"]
+        R2["VFSRouter (caller mounts via sys_setattr)"]
+    end
+
+    SA --> W1 --> T1 --> R1
+    DA --> W2 --> T2 --> R2
+</pre>
+
+<p>Both wrappers are <code>Send + Sync</code> (the C ABI contract requires thread-safe plugin implementations).</p>
+
+<h3 id="plugin-loader-lifecycle">9.4 <code>PluginLoader</code> Lifecycle</h3>
+
+<pre class="mermaid">
+stateDiagram-v2
+    [*] --> loaded : load(path, kernel)<br/>1. dlopen(path)<br/>2. validate api_version<br/>3. match kind:<br/> - Service: create(KernelHandle)<br/>&nbsp;&nbsp;&rarr; DylibRustService &rarr; enlist_rust<br/> - Driver: resolve create/read/write/destroy<br/>&nbsp;&nbsp;&rarr; register dylib name<br/>4. store in DashMap&lt;name, LoadedPlugin&gt;
+
+    loaded --> driver_instance : make_driver(name, config_json)<br/>nexus_driver_create(KernelHandle, config)<br/>&rarr; DylibObjectStore<br/>(one fresh instance per call &mdash;<br/>same dylib can back many mounts)
+
+    driver_instance --> loaded : DylibObjectStore drop<br/>&rarr; nexus_driver_destroy
+
+    loaded --> unloaded : unload(name)<br/>1. Service: unregister (drain + stop)<br/>2. nexus_service_destroy()<br/>3. dlclose()
+
+    loaded --> loaded : reload(name, new_path)<br/>1. unload(name)<br/>2. load(new_path, kernel)<br/>&mdash; drain waits for<br/>in-flight refs to reach zero &mdash;<br/>zero-downtime hot-swap
+
+    unloaded --> [*]
+</pre>
+
+<div class="callout">
+  Service plugins get one instance per dylib, minted by <code>load</code>. Driver plugins are minted lazily &mdash; <code>load</code> validates symbols and registers the name; <code>make_driver(name, config_json)</code> constructs each per-mount instance with operator-supplied configuration. Each <code>DylibObjectStore</code> owns its handle and calls <code>nexus_driver_destroy</code> on <code>Drop</code>, so <strong>mount lifecycle = driver-instance lifecycle</strong>.
+</div>
+
+<h3 id="operator-mount">9.4a Operator Mount Surface</h3>
+
+<p>Driver dylibs reach the VFS through <code>nexusd-cluster</code>&rsquo;s two flags:</p>
+
+<pre class="mermaid">
+graph LR
+    subgraph CLI["nexusd-cluster CLI"]
+        F1["--plugin-dir &lt;dir&gt;<br/>load-time scan: every .so / .dylib<br/>is loaded and its plugin name registered"]
+        F2["--mount-driver &lt;name&gt;:&lt;zone&gt;:&lt;vfs-path&gt;:&lt;config-json&gt;<br/>repeatable &mdash; same dylib name can appear<br/>multiple times to project different host paths<br/>into different VFS subtrees"]
+    end
+    subgraph PARSE["splitn(4, ':') keeps embedded : in JSON config intact"]
+        P1["e.g. URLs, key-value pairs<br/>survive the split intact"]
+    end
+    subgraph ZONE["&lt;zone&gt; = operator choice"]
+        Z1["'root' &mdash; node-local: expose host fs subtree<br/>through the VFS so other syscall-tier consumers<br/>(search, audit, agents) can see it<br/>Same-canonical routing = strictly local"]
+        Z2["separate raft zone &mdash; same mount needs<br/>to extend across peers via federation (&sect;3.B.1)"]
+    end
+
+    F2 --> PARSE
+    F2 --> ZONE
+</pre>
+
+<div class="callout">
+  <code>&lt;vfs-path&gt;</code> must be non-<code>/</code>. The boot-time <code>PathLocalBackend</code> already owns that mount point, and <code>Kernel::add_mount</code>&rsquo;s <code>rebind_missing_backends</code> branch keys specifically on <code>(zone="root", mount_point="/")</code> &mdash; overwriting that mount silently re-points every backend-less federation child mount at the operator&rsquo;s driver.
+  <br><br>
+  The flag runs after <code>RaftDistributedCoordinator::install_with_kernel</code> on boot, so the zone-create-on-mount branch inside <code>sys_setattr DT_MOUNT</code> is live; a separate zone the operator names at this point is minted on-demand by the coordinator if it doesn&rsquo;t already exist locally.
+</div>
+
+<h3 id="plugin-mgmt-surface">9.5 Plugin Management Surface</h3>
+
+<p>Plugin operations are exposed through the gRPC <code>Call</code> RPC.</p>
+
+<table>
+  <thead><tr><th>Method</th><th>Payload</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>plugin.load</code></td><td><code>{"path": "/plugins/vault.so"}</code></td><td>Load + register</td></tr>
+    <tr><td><code>plugin.unload</code></td><td><code>{"name": "vault"}</code></td><td>Drain + destroy + dlclose</td></tr>
+    <tr><td><code>plugin.reload</code></td><td><code>{"name": "vault", "path": "/plugins/vault.so"}</code></td><td>Atomic unload + load</td></tr>
+    <tr><td><code>plugin.list</code></td><td><code>{}</code></td><td>List loaded plugins (name, kind, path)</td></tr>
+  </tbody>
+</table>
+
+<h3 id="plugin-signing">9.6 Plugin Signing &amp; Trust Roots</h3>
+
+<p>Every plugin loaded by the kernel must be signed by a key the kernel trusts. The trust set is composed at startup from two layers.</p>
+
+<pre class="mermaid">
+graph TB
+    subgraph COMPILE["Compile-time layer &mdash; production"]
+        C1["Source: rust/kernel/trusted_keys/*.pub<br/>embedded via include_bytes! in<br/>kernel/plugins/loader.rs"]
+        C2["Purpose: production signing roots<br/>shipped with the daemon"]
+        C3["Pinned by:<br/>.github/workflows/trusted-keys-allowlist.yml"]
+        C4["EXPECTED list = SSOT for<br/>which keys ship with the kernel"]
+        C5["Adding/removing a compile-time trust root<br/>requires editing all three in the same PR:<br/>trusted_keys/, loader.rs, workflow allowlist<br/>&mdash; the divergence-check fails CI otherwise"]
+    end
+
+    subgraph RUNTIME["Runtime layer (optional) &mdash; DEV ONLY"]
+        R1["Source: *.pub files in<br/>$NEXUS_LOCAL_TRUSTED_KEYS_DIR"]
+        R2["Purpose: local dev signing &mdash;<br/>extends the trust set without editing kernel sources"]
+        R3["Production daemons MUST NOT set it"]
+        R4["When set: directory must exist,<br/>every *.pub must parse,<br/>or daemon panics at startup (fail-loud)"]
+        R5["Each load emits target: kernel.trust<br/>warn line &rArr; visible to log scrapers"]
+    end
+
+    subgraph HISTORY["Replaces the older workaround"]
+        H1["'edit loader.rs to add a local key'<br/>&mdash; bypassed compile-time pinning"]
+        H2["*.pub directory + loader.rs reference set<br/>are now .gitignore / CI-allowlisted,<br/>so the workaround can no longer land accidentally"]
+    end
+</pre>
+
+<!-- ================================================================ -->
+<h2 id="dispatch-lifecycle">Appendix A. Dispatch Hook Lifecycle (write path)</h2>
+
+<p>Detailed write-path trace through the &sect;2.4 dispatch pipeline &mdash; clone gate, PRE, EXECUTE, POST, OBSERVE. Originally documented in the peer <a href="https://s.shareone.vip/s/nexus-integration-architecture">nexus-integration-architecture</a>; moved here because it is kernel-internal (dispatch is a &sect;4 primitive).</p>
+
+<pre class="mermaid">
+graph TB
+    S["syscall (sys_write, sys_read, ...)"]
+    S --> CG["CLONE GATE (sys_write only)"]
+    CG -->|"has_mutating_hook_match?"| CG_yes["true: clone content"]
+    CG -->|"false"| CG_no["WriteHookCtx.content = vec![]"]
+
+    CG_yes --> PRE
+    CG_no --> PRE
+
+    PRE["PRE: NativeInterceptHook chain"]
+    PRE -->|"Err"| ABORT["abort (PermissionHook, BoundaryHook)"]
+    PRE -->|"Pass"| EXEC
+    PRE -->|"Replace(bytes)"| EXEC["EXECUTE: backend write"]
+
+    EXEC --> POST["POST: NativeInterceptHook chain (AuditHook)"]
+    POST --> OBS["OBSERVE: MutationObserver::on_mutation"]
+    OBS --> W1["StreamEventObserver &rarr; sys_watch wakeup"]
+    OBS --> W2["FileWatcher &rarr; sys_watch subscribers"]
+    OBS --> W3["AuditZoneAutoWire (Mount filter)"]
+
+    classDef bad fill:#7f1d1d,stroke:#fca5a5,color:#fecaca
+    class ABORT bad
+</pre>
+
+<div class="callout">
+  The clone gate keeps the hot path allocation-free for writes that do not need rewriting. Each hook declares a <code>mutating_path_suffix</code>; the dispatcher only clones content into <code>WriteHookCtx</code> when one matches. <code>MailboxStampingHook</code> declares <code>/chat-with-me</code>; accept/reject hooks declare <code>None</code>.
+</div>
+
+<!-- ================================================================ -->
+<h2 id="cross-refs">Appendix B. Cross-References</h2>
+
+<table>
+  <thead><tr><th>Topic</th><th>Document</th></tr></thead>
+  <tbody>
+    <tr><td>Data type &rarr; pillar mapping</td><td><a href="https://github.com/nexi-lab/nexus-vfs/blob/main/docs/data-storage-matrix.md">data-storage-matrix</a></td></tr>
+    <tr><td>Ops ABC &times; scenario affinity</td><td><a href="https://github.com/nexi-lab/nexus-vfs/blob/main/docs/ops-scenario-matrix.md">ops-scenario-matrix</a></td></tr>
+    <tr><td>Syscall table and design rationale</td><td><a href="https://github.com/nexi-lab/nexus-vfs/blob/main/docs/syscall-design.md">syscall-design</a></td></tr>
+    <tr><td>VFS lock design + advisory locks</td><td><a href="https://github.com/nexi-lab/nexus-vfs/blob/main/docs/lock-architecture.md">lock-architecture</a> &sect;4</td></tr>
+    <tr><td>Zone model, DT_MOUNT, federation</td><td><a href="https://github.com/nexi-lab/nexus-vfs/blob/main/docs/federation-memo.md">federation-memo</a> &sect;5&ndash;&sect;6</td></tr>
+    <tr><td>Raft, gRPC, write flows</td><td><a href="https://github.com/nexi-lab/nexus-vfs/blob/main/docs/federation-memo.md">federation-memo</a> &sect;2&ndash;&sect;5</td></tr>
+    <tr><td>Pipe + Stream design rationale</td><td><a href="https://github.com/nexi-lab/nexus-vfs/blob/main/docs/federation-memo.md">federation-memo</a> &sect;7j</td></tr>
+    <tr><td>Backend storage composition (CAS &times; Backend)</td><td><a href="https://github.com/nexi-lab/nexus-vfs/blob/main/docs/backend-architecture.md">backend-architecture</a></td></tr>
+    <tr><td>MetadataSync design</td><td><a href="https://github.com/nexi-lab/nexus-vfs/blob/main/docs/observer-backend-contract.md">observer-backend-contract</a></td></tr>
+    <tr><td>CLI <code>nexus</code>/<code>nexusd</code> split</td><td><a href="https://github.com/nexi-lab/nexus-vfs/blob/main/docs/cli-design.md">cli-design</a></td></tr>
+    <tr><td>Integration surface (sudowork &harr; nexus &harr; sudo-code)</td><td><a href="https://s.shareone.vip/s/nexus-integration-architecture">nexus-integration-architecture</a></td></tr>
+  </tbody>
+</table>
+
+<footer>
+  <p>Nexus Kernel Architecture &mdash; SSOT for the kernel tier. Apache-2.0.</p>
+</footer>
+
+</body></html>
+

@@ -15,7 +15,7 @@ path = "src/lib.rs"
 # `NativeInterceptHook`; the policy parses the envelope JSON;
 # `contracts` supplies `is_system_path`. No raft: the cross-machine
 # stream-wakeup is a generic raft primitive armed by the composition
-# root, not here (see docs/KERNEL-ARCHITECTURE.md §6.1 + lib.rs docs).
+# root, not here (see docs/KERNEL-ARCHITECTURE.html §6.1 + lib.rs docs).
 kernel = { workspace = true }
 contracts = { workspace = true }
 serde_json = { workspace = true }

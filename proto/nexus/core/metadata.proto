@@ -101,7 +101,7 @@ message FileMetadata {
   // DT_LINK target — absolute or workspace-relative VFS path the link
   // resolves to. Empty for any other entry_type. Resolution is one hop
   // with self-loop rejection at sys_setattr time and ELOOP at route()
-  // time when target is itself DT_LINK. See KERNEL-ARCHITECTURE.md §4.5.
+  // time when target is itself DT_LINK. See KERNEL-ARCHITECTURE.html §4.5.
   string link_target = 17;
 
   // Monotonic per-file content generation. Starts at 1 on the first

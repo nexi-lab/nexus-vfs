@@ -10,7 +10,7 @@
 //! (`K = Kernel`, monomorphised at link time → identical perf to a
 //! direct inherent call) and for unit tests (`K = MockKernel`).
 //!
-//! Layered against KERNEL-ARCHITECTURE.md §6.1: the analogue of
+//! Layered against KERNEL-ARCHITECTURE.html §6.1: the analogue of
 //! Linux's `include/linux/` syscall ABI surface, lifted into Rust as
 //! a single trait. The trait declaration lives in
 //! `kernel::kernel::syscall` rather than in the `contracts` crate to

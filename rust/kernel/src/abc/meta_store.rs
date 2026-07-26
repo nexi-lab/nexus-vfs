@@ -1,7 +1,7 @@
 //! `MetaStore` ABC — §3 metadata pillar.
 //!
 //! Rust mirror of Python `MetastoreABC` (one of the Three Storage
-//! Pillars in `KERNEL-ARCHITECTURE.md` §3). Provides ordered key-value
+//! Pillars in `KERNEL-ARCHITECTURE.html` §3). Provides ordered key-value
 //! storage for file metadata (inodes, config, topology).
 //!
 //! The `abc/` directory holds the strict §3 invariant set (3 trait
@@ -82,7 +82,7 @@ pub struct FileMetadata {
     /// VFS path the link resolves to.  `Some` only when entry_type is
     /// DT_LINK.  One-hop resolution at `route()` time with self-loop
     /// rejection at `sys_setattr` write time.  See
-    /// `KERNEL-ARCHITECTURE.md` "DT_LINK — Path-Internal Symlink".
+    /// `KERNEL-ARCHITECTURE.html` "DT_LINK — Path-Internal Symlink".
     pub link_target: Option<String>,
     /// User/agent identity that owns this file. Set by the application
     /// layer via ``sys_setattr``. The kernel stores and forwards but does

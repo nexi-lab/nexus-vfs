@@ -7,7 +7,7 @@
 //! uses. The kernel sees a uniform `Arc<dyn RustService>` or
 //! `Arc<dyn ObjectStore>` regardless of how the code was loaded.
 //!
-//! See KERNEL-ARCHITECTURE.md §10 for the full design.
+//! See KERNEL-ARCHITECTURE.html §10 for the full design.
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, OsString};

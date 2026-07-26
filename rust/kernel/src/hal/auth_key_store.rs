@@ -19,7 +19,7 @@
 //!
 //! The provider is a **services-tier policy** (the PAM / `sshd`
 //! analogue: credential → identity), and `services ⊥ raft` is a hard
-//! invariant (`docs/KERNEL-ARCHITECTURE.md` § 6.1), so it cannot name
+//! invariant (`docs/KERNEL-ARCHITECTURE.html` § 6.1), so it cannot name
 //! the raft impl. It reaches the store through this kernel-tier trait —
 //! the same way every other out-of-kernel caller reaches replicated
 //! state.

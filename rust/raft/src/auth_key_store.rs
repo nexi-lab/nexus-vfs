@@ -7,7 +7,7 @@
 //! replicated records through that one seam without naming a raft type:
 //! the kernel synthesises `/__sys__/auth/keys/` over it, and the
 //! services-tier API-key provider — barred from raft by the
-//! `services ⊥ raft` invariant (`docs/KERNEL-ARCHITECTURE.md` § 6.1) —
+//! `services ⊥ raft` invariant (`docs/KERNEL-ARCHITECTURE.html` § 6.1) —
 //! resolves credentials through it.
 //!
 //! Same shape as [`crate::zone_meta_store::ZoneMetaStore`]: writes go

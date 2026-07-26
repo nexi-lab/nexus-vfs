@@ -1,6 +1,6 @@
 //! `backends` — ObjectStore driver impls (driver-layer crate).
 //!
-//! Per `docs/architecture/KERNEL-ARCHITECTURE.md` §1 / §3 the driver
+//! Per `docs/KERNEL-ARCHITECTURE.html` §1 / §3 the driver
 //! layer sits parallel to the kernel: it implements
 //! `kernel::abc::object_store::ObjectStore` (and where applicable
 //! `kernel::extensions::llm_streaming::LlmStreamingBackend`) without

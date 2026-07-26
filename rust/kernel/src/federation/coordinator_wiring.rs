@@ -18,7 +18,7 @@
 //! declarations sit next to the other Kernel state; only the
 //! accessor methods live in this federation-domain file so
 //! `MountEntry` / `RouteResult` in `core/` stay pristine kernel
-//! primitives per `docs/KERNEL-ARCHITECTURE.md` §3/§4.
+//! primitives per `docs/KERNEL-ARCHITECTURE.html` §3/§4.
 
 use std::sync::Arc;
 

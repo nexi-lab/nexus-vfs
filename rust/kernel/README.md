@@ -96,5 +96,5 @@ cargo build -p nexus-cluster --release
 
 ## Architecture docs
 
-- [`docs/architecture/KERNEL-ARCHITECTURE.md`](../../docs/architecture/KERNEL-ARCHITECTURE.md) — full kernel design (1200+ lines)
+- [`docs/KERNEL-ARCHITECTURE.html`](../../docs/KERNEL-ARCHITECTURE.html) — full kernel design (1200+ lines)
 - [`docs/architecture/syscall-design.md`](../../docs/architecture/syscall-design.md) — syscall contracts and migration history
