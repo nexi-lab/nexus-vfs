@@ -718,6 +718,11 @@ pub struct JoinClusterResult {
     pub ca_pem: Vec<u8>,
     pub node_cert_pem: Vec<u8>,
     pub node_key_pem: Vec<u8>,
+    /// Cluster API-key HMAC secret the founder served (over the same
+    /// token-gated channel as the CA). `None` when the founder is auth-off.
+    /// The caller persists it to `tls/api-key-secret` (the single SSOT) so the
+    /// joiner authenticates cluster-minted `sk-` keys without any local env.
+    pub api_key_secret: Option<String>,
 }
 
 /// Dial a one-shot `ZoneApiService` client, honoring mTLS when `tls` is set.
@@ -810,6 +815,7 @@ pub async fn call_join_cluster(
         ca_pem: response.ca_pem,
         node_cert_pem: response.node_cert_pem,
         node_key_pem: response.node_key_pem,
+        api_key_secret: response.api_key_secret,
     })
 }
 

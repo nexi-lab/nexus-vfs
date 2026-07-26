@@ -1330,6 +1330,13 @@ struct NodeEnrollmentServiceImpl {
     ca_key_pem: Option<Vec<u8>>,
     /// SHA-256 of the join token password — the enrollment credential.
     join_token_hash: Option<String>,
+    /// Cluster API-key HMAC secret, served verbatim to the joiner over this
+    /// same token-gated channel as the CA. Opaque here — the transport applies
+    /// no auth logic to it (it already holds the far-more-sensitive CA private
+    /// key), so this adds no raft↔auth coupling. `None` ⇒ founder is auth-off;
+    /// the response omits it and the joiner stays auth-off. Read once at
+    /// construction from `tls/api-key-secret` (the single SSOT).
+    api_key_secret: Option<String>,
 }
 
 #[tonic::async_trait]
@@ -1349,6 +1356,7 @@ impl NodeEnrollmentService for NodeEnrollmentServiceImpl {
                 ca_pem: Vec::new(),
                 node_cert_pem: Vec::new(),
                 node_key_pem: Vec::new(),
+                api_key_secret: None,
             })
         };
 
@@ -1426,6 +1434,7 @@ impl NodeEnrollmentService for NodeEnrollmentServiceImpl {
             ca_pem,
             node_cert_pem,
             node_key_pem,
+            api_key_secret: self.api_key_secret.clone(),
         }))
     }
 }
@@ -1442,12 +1451,14 @@ pub async fn serve_node_enrollment(
     ca_pem: Vec<u8>,
     ca_key_pem: Vec<u8>,
     join_token_hash: String,
+    api_key_secret: Option<String>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
     let svc = NodeEnrollmentServiceImpl {
         ca_pem: Some(ca_pem),
         ca_key_pem: Some(ca_key_pem),
         join_token_hash: Some(join_token_hash),
+        api_key_secret,
     };
     tracing::info!(
         %addr,

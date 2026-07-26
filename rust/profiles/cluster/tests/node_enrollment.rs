@@ -92,10 +92,12 @@ async fn a_certless_node_auto_enrolls_at_boot_then_federates_over_mtls() {
 
     // ── 3. FEDERATE — joiner boots with ONLY --peers + --token: it auto-enrolls
     //       at boot (derives the founder's enroll port from --peers), then joins.
+    // The joiner sets NO NEXUS_API_KEY_SECRET: an auth-on node inherits the
+    // cluster secret from ENROLLMENT (served over the same token-gated channel
+    // as the CA), so the one-command joiner needs nothing but --peers + --token.
     let joiner_env = vec![
         ("NEXUS_DATA_DIR", jdata.as_str()),
         ("NEXUS_IDENTITY_DIR", jid.as_str()),
-        ("NEXUS_API_KEY_SECRET", SECRET),
         ("NEXUS_ADVERTISE_ADDR", jadv.as_str()),
         ("NEXUS_PEERS", fadv.as_str()),
         ("NEXUS_JOIN_TOKEN", token.as_str()),
@@ -116,6 +118,26 @@ async fn a_certless_node_auto_enrolls_at_boot_then_federates_over_mtls() {
     assert!(
         !jtls.join("ca-key.pem").exists(),
         "an enrolled node must NOT receive the cluster CA private key"
+    );
+    // The delta this feature adds: the joiner set NO NEXUS_API_KEY_SECRET, yet
+    // auto-enroll must have written the cluster's api-key secret into its tls
+    // dir (served by the founder over the same token-gated channel as the CA),
+    // so it can verify a founder-minted `sk-` key with zero local auth config.
+    // Without the fix this file never appears (the founder didn't serve it) and
+    // the joiner would silently come up auth-off.
+    let secret_path = jtls.join("api-key-secret");
+    assert!(
+        secret_path.exists(),
+        "auto-enroll must write the cluster api-key secret to tls/api-key-secret \
+         (the joiner set no NEXUS_API_KEY_SECRET)"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&secret_path)
+            .expect("read joiner api-key-secret")
+            .trim(),
+        SECRET,
+        "the enrolled secret must equal the founder's, so a cluster-minted key \
+         resolves identically on the joiner (hash_key is over the shared secret)"
     );
     let tail = |d: &Daemon| {
         let mut v: Vec<String> = d.drain().lines().rev().take(40).map(String::from).collect();
