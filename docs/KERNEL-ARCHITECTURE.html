@@ -187,7 +187,7 @@ graph TB
     D["DRIVERS &mdash; pluggable at startup<br/><span style='color:#94a3b8'>redb, S3, LocalDisk, gRPC,<br/>Postgres, connectors</span>"]
 
     S -.->|"protocol interface (sys_*)"| K
-    K -.->|"dependency injection (Arc&lt;dyn Trait&gt;)"| D
+    K -.->|"dependency injection (Arc⟨dyn Trait⟩)"| D
 
     classDef svc fill:#1e293b,stroke:#60a5fa,stroke-width:2px,color:#e2e8f0
     classDef ker fill:#0f172a,stroke:#fcd34d,stroke-width:3px,color:#e2e8f0
@@ -256,7 +256,7 @@ graph TB
     C -.-> R
     D -.-> R
     G -.-> R
-    R[["Kernel:<br/>uniform Arc&lt;dyn RustService&gt; / Arc&lt;dyn ObjectStore&gt;<br/>via ServiceRegistry / VFSRouter"]]
+    R[["Kernel:<br/>uniform Arc⟨dyn RustService⟩ / Arc⟨dyn ObjectStore⟩<br/>via ServiceRegistry / VFSRouter"]]
 </pre>
 
 <div class="callout">
@@ -353,7 +353,7 @@ graph TB
 graph LR
     C["Caller (sys_*)"] --> G{{"Permission Gate<br/>(kernel hook point)"}}
     G -->|"no provider installed<br/>~2ns (ArcSwapOption load + None)"| PASS[["Ok(())"]]
-    G -->|"provider installed"| P["Arc&lt;dyn PermissionProvider&gt;"]
+    G -->|"provider installed"| P["Arc⟨dyn PermissionProvider⟩"]
     P --> IMPL["rust/permission/ &mdash;<br/>ZonePermsProvider<br/>(path-aware + lease cache)"]
     IMPL -->|"Ok / Err"| DEC["Decision"]
 
@@ -878,7 +878,7 @@ graph LR
     end
     subgraph ZLC["Zone lifecycle (3)"]
         B1["create_zone(zone_id)"]
-        B2["remove_zone &mdash; cascade-unmount,<br/>force=true honors POSIX<br/>unlink-while-i_links&gt;0 bypass"]
+        B2["remove_zone &mdash; cascade-unmount,<br/>force=true honors POSIX<br/>unlink-while-i_links⟩0 bypass"]
         B3["join_zone(as_learner=true)"]
     end
     subgraph MW["Mount wiring (2)"]
@@ -890,8 +890,8 @@ graph LR
         D2["lookup_share &rarr; ShareInfo<br/>(zone_id + remote-path)"]
     end
     subgraph PZD["Per-zone dispatch (2)"]
-        E1["metastore_for_zone &rarr;<br/>Arc&lt;dyn MetaStore&gt;<br/>(raft state machine backed)"]
-        E2["locks_for_zone &rarr;<br/>Arc&lt;dyn Locks&gt;<br/>(replicated via AcquireLock)"]
+        E1["metastore_for_zone &rarr;<br/>Arc⟨dyn MetaStore⟩<br/>(raft state machine backed)"]
+        E2["locks_for_zone &rarr;<br/>Arc⟨dyn Locks⟩<br/>(replicated via AcquireLock)"]
     end
 </pre>
 
@@ -905,10 +905,10 @@ graph LR
 graph LR
     K["Kernel::sys_setattr(backend=&hellip;)<br/>+ mount path"] --> P["ObjectStoreProvider::build(args)"]
     P --> R{{"ObjectStoreBuildResult"}}
-    R --> O["Option&lt;Arc&lt;dyn ObjectStore&gt;&gt;<br/>(the backend)"]
-    R --> M["Option&lt;Arc&lt;dyn MetaStore&gt;&gt;<br/>(remote metastore &mdash;<br/>for 'remote' backends)"]
+    R --> O["Option⟨Arc⟨dyn ObjectStore⟩⟩<br/>(the backend)"]
+    R --> M["Option⟨Arc⟨dyn MetaStore⟩⟩<br/>(remote metastore &mdash;<br/>for 'remote' backends)"]
 
-    K -.-|"cycle break: kernel declares trait,<br/>backends crate provides impl,<br/>boot wires slot"|-. P
+    K -.->|"cycle break: kernel declares trait,<br/>backends crate provides impl,<br/>boot wires slot"| P
 </pre>
 
 <p>Trait name describes the capability (&ldquo;provides ObjectStore instances&rdquo;), in symmetry with <code>DistributedCoordinator</code> and the &sect;3.A pillars.</p>
@@ -964,7 +964,7 @@ graph TB
     end
     subgraph K3["Dispatch &amp; observability"]
         D["KernelDispatch &mdash; kernel/dispatch.rs<br/>+ core/dispatch/<br/>3-phase VFS + driver lifecycle"]
-        PG["PermissionGate &mdash; kernel/dispatch.rs<br/>1-slot Arc&lt;dyn PermissionProvider&gt;<br/>(&sect;2.4.1)"]
+        PG["PermissionGate &mdash; kernel/dispatch.rs<br/>1-slot Arc⟨dyn PermissionProvider⟩<br/>(&sect;2.4.1)"]
         FW["FileWatcher + FileEvent<br/>core/file_watch.rs (&sect;4.3)"]
         MS["MetadataSync &mdash; core/metadata_sync.rs (&sect;4.5)<br/>backend &harr; metastore coherence"]
         PR["ProcfsRegistry &mdash; core/procfs.rs (&sect;4.6)<br/>/__sys__/&hellip; views"]
@@ -981,6 +981,30 @@ graph TB
         PL["PluginLoader &mdash; core/plugin_loader.rs (&sect;9)<br/>dlopen-based load /<br/>DylibRustService / DylibObjectStore"]
     end
 </pre>
+
+<h4>Primitive &harr; Linux analogue lookup</h4>
+
+<p>The mermaid above groups by concern; the table below is the flat SSOT for finding the Linux analogue and source of any single primitive. Deep-dive subsections follow at &sect;4.1&ndash;&sect;4.6.</p>
+
+<table>
+  <thead><tr><th>Primitive</th><th>Source</th><th>Linux analogue</th></tr></thead>
+  <tbody>
+    <tr><td><code>VFSRouter</code></td><td><code>rust/kernel/src/core/vfs_router.rs</code></td><td>VFS <code>lookup_slow()</code></td></tr>
+    <tr><td><code>LockManager</code> (&sect;4.1)</td><td><code>rust/kernel/src/core/lock/</code></td><td><code>i_rwsem</code> + <code>flock(2)</code> + <code>sem_t</code></td></tr>
+    <tr><td><code>KernelDispatch</code></td><td><code>rust/kernel/src/kernel/dispatch.rs</code> + <code>core/dispatch/</code></td><td><code>security_hook_heads</code> + <code>fsnotify</code></td></tr>
+    <tr><td><code>PipeManager</code> + <code>StreamManager</code> (&sect;4.2)</td><td><code>rust/kernel/src/core/pipe/</code> + <code>core/stream/</code></td><td><code>pipe(2)</code> + append-only log</td></tr>
+    <tr><td><code>FileDescriptorTable</code></td><td><code>rust/kernel/src/core/fdt.rs</code></td><td>fd table (<code>task_struct.files</code>)</td></tr>
+    <tr><td><code>FileWatcher</code> + <code>FileEvent</code> (&sect;4.3)</td><td><code>rust/kernel/src/core/file_watch.rs</code></td><td><code>inotify(7)</code> + <code>fsnotify_event</code></td></tr>
+    <tr><td><code>ServiceRegistry</code></td><td><code>rust/kernel/src/core/service_registry.rs</code></td><td><code>init/main.c</code> + <code>module.c</code></td></tr>
+    <tr><td><code>DriverLifecycleCoordinator</code></td><td><code>rust/kernel/src/core/dlc.rs</code></td><td><code>register_filesystem</code> + <code>kern_mount</code></td></tr>
+    <tr><td><code>MetadataSync</code> (&sect;4.5)</td><td><code>rust/kernel/src/core/metadata_sync.rs</code></td><td>NFS attribute / dentry revalidation (<code>-&gt;getattr</code> refresh, <code>d_revalidate</code>)</td></tr>
+    <tr><td><code>PermissionGate</code> (&sect;2.4.1)</td><td><code>rust/kernel/src/kernel/dispatch.rs</code> + <code>rust/permission/</code></td><td>LSM <code>security_inode_permission</code></td></tr>
+    <tr><td><code>AgentRegistry</code></td><td><code>rust/kernel/src/core/agents/registry.rs</code></td><td>Linux <code>task_struct</code> table + signal queue</td></tr>
+    <tr><td><code>DT_LINK</code> (&sect;4.4)</td><td><code>proto/nexus/core/metadata.proto</code> + <code>FileMetadata.link_target</code></td><td><code>symlink(2)</code></td></tr>
+    <tr><td><code>PluginLoader</code> (&sect;9)</td><td><code>rust/kernel/src/core/plugin_loader.rs</code></td><td><code>module_loader</code> (<code>kernel/module/main.c</code>)</td></tr>
+    <tr><td><code>ProcfsRegistry</code> (&sect;4.6)</td><td><code>rust/kernel/src/core/procfs.rs</code></td><td><code>proc_create()</code> / <code>proc_dir_entry</code></td></tr>
+  </tbody>
+</table>
 
 <h3 id="lock-manager">4.1 Unified LockManager &mdash; I/O Lock + Advisory Lock</h3>
 
@@ -1000,11 +1024,11 @@ graph TB
     end
 
     subgraph ADV["Advisory Lock &mdash; sys_lock / sys_unlock (Tier 1)"]
-        AD1["Counting via max_holders &mdash;<br/>max_holders==1 = mutex,<br/>max_holders&gt;1 = semaphore<br/>(SAME code path)"]
+        AD1["Counting via max_holders &mdash;<br/>max_holders==1 = mutex,<br/>max_holders⟩1 = semaphore<br/>(SAME code path)"]
         AD2["Latency ~5&micro;s local / ~5-10ms Raft"]
         AD3["Scope: TTL-based, expire &rarr; released"]
         AD4["Holder: caller-supplied lock_id string"]
-        AD5["Storage: shared Arc&lt;Mutex&lt;LockState&gt;&gt;<br/>(contracts::lock_state = SSOT)"]
+        AD5["Storage: shared Arc⟨Mutex⟨LockState⟩⟩<br/>(contracts::lock_state = SSOT)"]
         AD6["Impl: LocalLocks (default) or<br/>replicated `Locks` HAL backend"]
     end
 
@@ -1379,7 +1403,7 @@ graph TB
 graph LR
     subgraph CARGO["Cargo artifact roles"]
         RL["Library crates &mdash; rlib<br/>compose into deployment binaries"]
-        PB["Profile binaries &mdash; binary<br/>rust/profiles/&lt;name&gt;/ &mdash;<br/>standalone deployment binaries (&sect;7.1)"]
+        PB["Profile binaries &mdash; binary<br/>rust/profiles/⟨name⟩/ &mdash;<br/>standalone deployment binaries (&sect;7.1)"]
     end
 
     subgraph LINUX["Linux analogue"]
@@ -1477,7 +1501,7 @@ sequenceDiagram
     RC->>Apply: replay DT_MOUNT entries<br/>already on disk (after restart)
     RC->>Drain: drain stashed slot &mdash;<br/>KernelBlobFetcher serves ZoneApi/ReadBlob
     RC->>RC: bootstrap_done = true<br/>&rArr; is_initialized() reports ready
-    Note over Trans: separate call (transport &gt; raft in dep graph)
+    Note over Trans: separate call (transport ⟩ raft in dep graph)
     Trans->>K: wires Kernel::peer_client<br/>(PeerBlobClient impl used by<br/>try_remote_fetch)
 </pre>
 
@@ -1489,9 +1513,9 @@ sequenceDiagram
 
 <pre class="mermaid">
 graph TB
-    C["contracts<br/>(zero deps)"]
-    L["lib<br/>(depends on contracts;<br/>algorithms + transport_primitives<br/>behind opt-in features)"]
-    K[["kernel<br/>(depends on contracts + lib;<br/>declares HAL traits)"]]
+    C["contracts"]
+    L["lib"]
+    K[["kernel"]]
 
     B["backends"]
     R["raft"]
@@ -1499,7 +1523,7 @@ graph TB
     S["services"]
     A["a2a"]
 
-    P["rust/profiles/cluster<br/>(deployment binary sink)"]
+    P["rust/profiles/cluster<br/>(deployment sink)"]
 
     C --> L
     L --> K
@@ -1508,9 +1532,9 @@ graph TB
     K --> T
     K --> S
     K --> A
-    R -.->|"trait-only: DistributedCoordinator dispatch"| K
+    R -.->|"trait dispatch"| K
     R -->|"proto stubs"| T
-    A -.->|"install feature ONLY &mdash;<br/>arms stream-wakeup observer<br/>(ZoneConsensus, AppendStreamEntry)"| R
+    A -.->|"install feature"| R
 
     B --> P
     R --> P
@@ -1584,7 +1608,7 @@ graph TB
     subgraph HIER["Profile hierarchy: slim &sub; cluster &sub; embedded &sub; lite &sub; full &sube; cloud"]
         SL["slim &mdash; bare minimum runnable<br/>redb (embedded) &mdash; Linux: initramfs"]
         CL["cluster &mdash; minimal multi-node<br/>IPC + federation, no auth<br/>redb (Raft) &mdash; Linux: CoreOS"]
-        EM["embedded &mdash; MCU, WASM (&lt;1 MB)<br/>redb (embedded) &mdash; Linux: BusyBox"]
+        EM["embedded &mdash; MCU, WASM (⟨1 MB)<br/>redb (embedded) &mdash; Linux: BusyBox"]
         LI["lite &mdash; Pi, Jetson, mobile<br/>redb (embedded) &mdash; Linux: Alpine"]
         FU["full &mdash; desktop, laptop<br/>redb (embedded) &mdash; Linux: Ubuntu Desktop"]
         CD["cloud &mdash; k8s, serverless<br/>redb (Raft) &mdash; Linux: Ubuntu Server"]
@@ -1629,7 +1653,7 @@ graph TB
         R1["Mechanism: kernel::hal::object_store_provider::set_enabled_drivers<br/>(Python nx_set_enabled_drivers)"]
         R2["Decided: boot,<br/>before first sys_setattr(DT_MOUNT)"]
         R3["Cost: runtime error if a profile<br/>asks for a missing driver"]
-        R4["Linux analogue: /sys/module/&lt;name&gt;/parameters"]
+        R4["Linux analogue: /sys/module/⟨name⟩/parameters"]
     end
     subgraph SSOT["Runtime gate = SSOT"]
         S1["Every dispatch goes through<br/>is_driver_enabled &mdash;<br/>no implicit local-default skip-branch"]
@@ -1768,8 +1792,8 @@ graph LR
         W2["DylibObjectStore<br/>owns raw *mut c_void handle;<br/>Send + Sync; calls destroy on Drop"]
     end
     subgraph TRAIT["Rust trait surface"]
-        T1["Arc&lt;dyn RustService&gt;"]
-        T2["Arc&lt;dyn ObjectStore&gt;"]
+        T1["Arc⟨dyn RustService⟩"]
+        T2["Arc⟨dyn ObjectStore⟩"]
     end
     subgraph REG["Registration target"]
         R1["ServiceRegistry.enlist_rust()"]
@@ -1786,18 +1810,52 @@ graph LR
 
 <pre class="mermaid">
 stateDiagram-v2
-    [*] --> loaded : load(path, kernel)<br/>1. dlopen(path)<br/>2. validate api_version<br/>3. match kind:<br/> - Service: create(KernelHandle)<br/>&nbsp;&nbsp;&rarr; DylibRustService &rarr; enlist_rust<br/> - Driver: resolve create/read/write/destroy<br/>&nbsp;&nbsp;&rarr; register dylib name<br/>4. store in DashMap&lt;name, LoadedPlugin&gt;
-
-    loaded --> driver_instance : make_driver(name, config_json)<br/>nexus_driver_create(KernelHandle, config)<br/>&rarr; DylibObjectStore<br/>(one fresh instance per call &mdash;<br/>same dylib can back many mounts)
-
-    driver_instance --> loaded : DylibObjectStore drop<br/>&rarr; nexus_driver_destroy
-
-    loaded --> unloaded : unload(name)<br/>1. Service: unregister (drain + stop)<br/>2. nexus_service_destroy()<br/>3. dlclose()
-
-    loaded --> loaded : reload(name, new_path)<br/>1. unload(name)<br/>2. load(new_path, kernel)<br/>&mdash; drain waits for<br/>in-flight refs to reach zero &mdash;<br/>zero-downtime hot-swap
-
+    [*] --> loaded : load(path, kernel)
+    loaded --> driver_instance : make_driver(name, config)
+    driver_instance --> loaded : DylibObjectStore drop
+    loaded --> unloaded : unload(name)
+    loaded --> loaded : reload(name, new_path)
     unloaded --> [*]
 </pre>
+
+<table>
+  <thead><tr><th>Transition</th><th>Steps</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>[*] &rarr; loaded</code><br><em>load(path, kernel)</em></td>
+      <td>
+        <ol style="margin:0 0 0 16px">
+          <li><code>dlopen(path)</code></li>
+          <li>validate <code>api_version</code></li>
+          <li>match <code>kind</code>: <em>Service</em> &rarr; <code>create(KernelHandle)</code> &rarr; <code>DylibRustService</code> &rarr; <code>enlist_rust</code>; <em>Driver</em> &rarr; resolve create/read/write/destroy &rarr; register dylib name</li>
+          <li>store in <code>DashMap⟨name, LoadedPlugin⟩</code></li>
+        </ol>
+      </td>
+    </tr>
+    <tr>
+      <td><code>loaded &rarr; driver_instance</code><br><em>make_driver(name, config_json)</em></td>
+      <td><code>nexus_driver_create(KernelHandle, config)</code> &rarr; <code>DylibObjectStore</code>. One fresh instance per call &mdash; same dylib can back many mounts.</td>
+    </tr>
+    <tr>
+      <td><code>driver_instance &rarr; loaded</code></td>
+      <td><code>DylibObjectStore</code> drop calls <code>nexus_driver_destroy</code> automatically.</td>
+    </tr>
+    <tr>
+      <td><code>loaded &rarr; unloaded</code><br><em>unload(name)</em></td>
+      <td>
+        <ol style="margin:0 0 0 16px">
+          <li>Service: unregister (drain + stop)</li>
+          <li><code>nexus_service_destroy()</code></li>
+          <li><code>dlclose()</code></li>
+        </ol>
+      </td>
+    </tr>
+    <tr>
+      <td><code>loaded &rarr; loaded</code><br><em>reload(name, new_path)</em></td>
+      <td><code>unload(name)</code> &rarr; <code>load(new_path, kernel)</code>. Drain waits for in-flight refs to reach zero &rArr; zero-downtime hot-swap.</td>
+    </tr>
+  </tbody>
+</table>
 
 <div class="callout">
   Service plugins get one instance per dylib, minted by <code>load</code>. Driver plugins are minted lazily &mdash; <code>load</code> validates symbols and registers the name; <code>make_driver(name, config_json)</code> constructs each per-mount instance with operator-supplied configuration. Each <code>DylibObjectStore</code> owns its handle and calls <code>nexus_driver_destroy</code> on <code>Drop</code>, so <strong>mount lifecycle = driver-instance lifecycle</strong>.
@@ -1810,13 +1868,13 @@ stateDiagram-v2
 <pre class="mermaid">
 graph LR
     subgraph CLI["nexusd-cluster CLI"]
-        F1["--plugin-dir &lt;dir&gt;<br/>load-time scan: every .so / .dylib<br/>is loaded and its plugin name registered"]
-        F2["--mount-driver &lt;name&gt;:&lt;zone&gt;:&lt;vfs-path&gt;:&lt;config-json&gt;<br/>repeatable &mdash; same dylib name can appear<br/>multiple times to project different host paths<br/>into different VFS subtrees"]
+        F1["--plugin-dir ⟨dir⟩<br/>load-time scan: every .so / .dylib<br/>is loaded and its plugin name registered"]
+        F2["--mount-driver ⟨name⟩:⟨zone⟩:⟨vfs-path⟩:⟨config-json⟩<br/>repeatable &mdash; same dylib name can appear<br/>multiple times to project different host paths<br/>into different VFS subtrees"]
     end
     subgraph PARSE["splitn(4, ':') keeps embedded : in JSON config intact"]
         P1["e.g. URLs, key-value pairs<br/>survive the split intact"]
     end
-    subgraph ZONE["&lt;zone&gt; = operator choice"]
+    subgraph ZONE["⟨zone⟩ = operator choice"]
         Z1["'root' &mdash; node-local: expose host fs subtree<br/>through the VFS so other syscall-tier consumers<br/>(search, audit, agents) can see it<br/>Same-canonical routing = strictly local"]
         Z2["separate raft zone &mdash; same mount needs<br/>to extend across peers via federation (&sect;3.B.1)"]
     end
