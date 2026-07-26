@@ -322,6 +322,14 @@ message JoinClusterResponse {
   bytes node_cert_pem = 5;
   // Node private key (PEM-encoded). Generated server-side for the joiner.
   bytes node_key_pem = 6;
+  // Cluster API-key HMAC secret (the `sk-` token signing key), served so a
+  // joiner inherits it over the SAME token-gated channel as the CA. It must be
+  // byte-identical cluster-wide for a minted key to resolve on any node
+  // (verification hashes the token with the local secret, then looks the hash
+  // up in the replicated store). Absent when the founder runs auth-off — the
+  // joiner then stays auth-off too. Persisted joiner-side to `tls/api-key-secret`
+  // (the single SSOT), alongside `ca.pem`.
+  optional string api_key_secret = 7;
 }
 
 // === Cluster Configuration ===

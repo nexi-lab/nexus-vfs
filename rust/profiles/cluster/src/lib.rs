@@ -1494,12 +1494,18 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
             let addr: std::net::SocketAddr = enroll_addr
                 .parse()
                 .map_err(|e| anyhow::anyhow!("enrollment listener addr '{enroll_addr}': {e}"))?;
+            // Serve the cluster API-key secret to enrollees over this same
+            // token-gated channel as the CA (the single SSOT, resolved + persisted
+            // here on first boot). `None` ⇒ auth-off — the response omits it and
+            // joiners stay auth-off too.
+            let api_key_secret = effective_api_key_secret(&tls_dir);
             zm.runtime_handle().spawn(async move {
                 if let Err(e) = nexus_raft::transport::serve_node_enrollment(
                     addr,
                     ca_pem,
                     ca_key_pem,
                     join_token_hash.trim().to_string(),
+                    api_key_secret,
                     std::future::pending::<()>(),
                 )
                 .await
@@ -3459,6 +3465,66 @@ fn run_auth_action(
     }
 }
 
+/// The effective cluster API-key HMAC secret, from the single SSOT
+/// `<tls_dir>/api-key-secret`.
+///
+/// Precedence: the **persisted file wins** when present — keys minted under it
+/// must keep resolving, exactly as the persisted CA is authoritative over any
+/// env. Otherwise `NEXUS_API_KEY_SECRET` bootstraps it first-time and is
+/// persisted (0600) so the enroll handler can serve it and a restart stays
+/// stable without re-exporting the env. `None` ⇒ auth-off.
+///
+/// A joiner never sets the env: `join_cluster_and_provision_tls` writes this
+/// file from the founder's enroll response (over the token-gated channel, like
+/// the CA), and this reads it back — so the joiner authenticates cluster-minted
+/// `sk-` keys with zero local auth config. Idempotent: safe to call from the
+/// enrollment-listener setup and from `auth_posture`; the first call persists.
+fn effective_api_key_secret(tls_dir: &std::path::Path) -> Option<String> {
+    resolve_api_key_secret(tls_dir, std::env::var("NEXUS_API_KEY_SECRET").ok())
+}
+
+/// Pure decision behind [`effective_api_key_secret`]: `env_secret` is passed in
+/// (not read here) so the (persisted-file, env) resolution is unit-testable
+/// without mutating process env — mirroring `auth_posture::decide`.
+fn resolve_api_key_secret(tls_dir: &std::path::Path, env_secret: Option<String>) -> Option<String> {
+    let path = tls_dir.join("api-key-secret");
+    if let Ok(s) = std::fs::read_to_string(&path) {
+        let s = s.trim();
+        if !s.is_empty() {
+            return Some(s.to_string());
+        }
+    }
+    let env = env_secret.filter(|s| !s.is_empty())?;
+    // First-time provisioning: persist so the enroll handler serves it and a
+    // restart is stable. Best-effort; on failure keep the in-memory env value.
+    if let Err(e) = std::fs::create_dir_all(tls_dir) {
+        tracing::warn!(error = %e, "api-key-secret: could not create tls dir to persist");
+        return Some(env);
+    }
+    let write_res: std::io::Result<()> = {
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&path)
+                .and_then(|mut f| f.write_all(env.as_bytes()))
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&path, env.as_bytes())
+        }
+    };
+    if let Err(e) = write_res {
+        tracing::warn!(error = %e, "api-key-secret: persist failed; using env value in-memory only");
+    }
+    Some(env)
+}
+
 /// Project the CLI onto the pure decision in [`auth_posture`].
 ///
 /// The rule itself lives in that module and is a pure function of these four
@@ -3466,7 +3532,7 @@ fn run_auth_action(
 fn auth_posture(common: &CommonArgs) -> Result<AuthPosture> {
     auth_posture::decide(&AuthPostureInputs {
         bind_addr: common.effective_bind_addr(),
-        api_key_secret: std::env::var("NEXUS_API_KEY_SECRET").ok(),
+        api_key_secret: effective_api_key_secret(&common.data_dir.join("tls")),
         tls_enabled: !common.no_tls,
         insecure_no_auth: common.insecure_no_auth,
     })
@@ -3495,6 +3561,47 @@ fn uuid_v4() -> String {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    /// `resolve_api_key_secret` precedence — the (persisted-file, env) SSOT
+    /// decision. File WINS (stability, like the persisted CA); env bootstraps +
+    /// persists first-time; neither ⇒ auth-off (None). Env passed as a param, so
+    /// no process-env mutation (no parallel-test flakiness).
+    #[test]
+    fn resolve_api_key_secret_precedence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path();
+        let secret_file = p.join("api-key-secret");
+
+        // 1. Neither file nor env ⇒ None (auth-off), and nothing is written.
+        assert_eq!(resolve_api_key_secret(p, None), None);
+        assert!(!secret_file.exists(), "None case must not create the file");
+
+        // 2. No file + env ⇒ returns env AND persists it (first-time bootstrap,
+        //    so the enroll handler can serve it and a restart stays stable).
+        assert_eq!(
+            resolve_api_key_secret(p, Some("from-env".into())).as_deref(),
+            Some("from-env")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&secret_file).unwrap().trim(),
+            "from-env",
+            "env value must persist to the tls SSOT"
+        );
+
+        // 3. File present ⇒ file WINS even if env differs — keys minted under the
+        //    persisted secret must keep resolving; env cannot silently rotate it.
+        assert_eq!(
+            resolve_api_key_secret(p, Some("different-env".into())).as_deref(),
+            Some("from-env")
+        );
+
+        // 4. Empty env is treated as unset.
+        let empty = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            resolve_api_key_secret(empty.path(), Some(String::new())),
+            None
+        );
+    }
 
     /// The transport-observer's relay data-privacy caution is a WARN under the
     /// `transport_observer` target. When `RUST_LOG` is unset the daemon builds
