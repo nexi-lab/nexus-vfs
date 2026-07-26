@@ -230,6 +230,13 @@ impl RaftDistributedCoordinator {
         // cross-node fan-out arm (`sys_read → zone_peers`), surfacing
         // the missing wiring.
         kernel.set_distributed_coordinator(Arc::clone(self) as Arc<dyn DistributedCoordinator>);
+
+        // Coordinator wired ⇒ arm the StreamManager miss-materializer, so a cold
+        // read/write of a wal DT_STREAM created on a peer (entries replicated in,
+        // local handle never built) resolves instead of `StreamNotFound`. Armed
+        // HERE, at the same moment the coordinator becomes real, so the two are
+        // wired together and neither can be forgotten independently.
+        kernel.arm_stream_materializer();
     }
 
     fn zm(&self) -> Option<&Arc<ZoneManager>> {
