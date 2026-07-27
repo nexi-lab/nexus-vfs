@@ -80,6 +80,23 @@ pub fn parse_agent_identity_uri(uri: &str) -> Option<String> {
     Some(name.to_string())
 }
 
+/// Parse a cluster CA (cert + private key, both PEM) into an rcgen `Issuer`
+/// ready to sign leaf certs. Shared by node and agent cert generation so the
+/// CA-loading boilerplate has one home.
+fn ca_issuer_from_pem(
+    ca_cert_pem: &[u8],
+    ca_key_pem: &[u8],
+) -> Result<Issuer<'static, KeyPair>, String> {
+    let ca_key_str =
+        std::str::from_utf8(ca_key_pem).map_err(|e| format!("CA key is not valid UTF-8: {e}"))?;
+    let ca_key_pair =
+        KeyPair::from_pem(ca_key_str).map_err(|e| format!("Failed to parse CA key: {e}"))?;
+    let ca_cert_str =
+        std::str::from_utf8(ca_cert_pem).map_err(|e| format!("CA cert is not valid UTF-8: {e}"))?;
+    Issuer::from_ca_cert_pem(ca_cert_str, ca_key_pair)
+        .map_err(|e| format!("Failed to parse CA cert: {e}"))
+}
+
 /// Generate a node certificate signed by the cluster CA.
 ///
 /// Returns `(node_cert_pem, node_key_pem)` as PEM-encoded bytes.
@@ -108,17 +125,7 @@ pub fn generate_node_cert(
     extra_hostnames: &[String],
     hostname: Option<&str>,
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
-    // Parse CA key pair
-    let ca_key_str =
-        std::str::from_utf8(ca_key_pem).map_err(|e| format!("CA key is not valid UTF-8: {e}"))?;
-    let ca_key_pair =
-        KeyPair::from_pem(ca_key_str).map_err(|e| format!("Failed to parse CA key: {e}"))?;
-
-    // Parse CA certificate
-    let ca_cert_str =
-        std::str::from_utf8(ca_cert_pem).map_err(|e| format!("CA cert is not valid UTF-8: {e}"))?;
-    let ca_issuer = Issuer::from_ca_cert_pem(ca_cert_str, ca_key_pair)
-        .map_err(|e| format!("Failed to parse CA cert: {e}"))?;
+    let ca_issuer = ca_issuer_from_pem(ca_cert_pem, ca_key_pem)?;
 
     // Generate node key pair (EC P-256)
     let node_key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
@@ -233,14 +240,7 @@ pub fn generate_agent_cert(
     ca_cert_pem: &[u8],
     ca_key_pem: &[u8],
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
-    let ca_key_str =
-        std::str::from_utf8(ca_key_pem).map_err(|e| format!("CA key is not valid UTF-8: {e}"))?;
-    let ca_key_pair =
-        KeyPair::from_pem(ca_key_str).map_err(|e| format!("Failed to parse CA key: {e}"))?;
-    let ca_cert_str =
-        std::str::from_utf8(ca_cert_pem).map_err(|e| format!("CA cert is not valid UTF-8: {e}"))?;
-    let ca_issuer = Issuer::from_ca_cert_pem(ca_cert_str, ca_key_pair)
-        .map_err(|e| format!("Failed to parse CA cert: {e}"))?;
+    let ca_issuer = ca_issuer_from_pem(ca_cert_pem, ca_key_pem)?;
 
     // Agent key pair (EC P-256), same algorithm as node certs.
     let agent_key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
