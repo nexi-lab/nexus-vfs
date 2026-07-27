@@ -1809,14 +1809,21 @@ graph LR
 <h3 id="plugin-loader-lifecycle">9.4 <code>PluginLoader</code> Lifecycle</h3>
 
 <pre class="mermaid">
-stateDiagram-v2
-    [*] --> loaded : load(path, kernel)
-    loaded --> driver_instance : make_driver(name, config)
-    driver_instance --> loaded : DylibObjectStore drop
-    loaded --> unloaded : unload(name)
-    loaded --> loaded : reload(name, new_path)
-    unloaded --> [*]
+graph LR
+    S((start)) -->|"load"| L(["loaded"])
+    L -->|"reload"| L
+    L -->|"make_driver"| D(["driver_instance"])
+    D -->|"drop"| L
+    L -->|"unload"| U(["unloaded"])
+    U --> E((end))
+
+    classDef term fill:#0f172a,stroke:#94a3b8,stroke-width:1px
+    classDef state fill:#1e293b,stroke:#60a5fa,stroke-width:2px
+    class S,E term
+    class L,D,U state
 </pre>
+
+<p><em>Transition labels above are keywords &mdash; full method signatures and per-transition steps in the table below.</em></p>
 
 <table>
   <thead><tr><th>Transition</th><th>Steps</th></tr></thead>
