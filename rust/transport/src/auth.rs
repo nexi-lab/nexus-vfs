@@ -48,10 +48,14 @@ use kernel::kernel::OperationContext;
 pub struct PeerIdentity {
     /// Subject CommonName, always present.
     pub common_name: String,
-    /// Node id pinned in the URI SAN.
+    /// Node id pinned in a `nexus://zone/{zone}/node/{id}` URI SAN.
     pub node_id: Option<u64>,
-    /// Zone id pinned in the URI SAN.
+    /// Zone id pinned in the node URI SAN.
     pub zone_id: Option<String>,
+    /// Agent name pinned in a `nexus://agent/{name}` URI SAN. `Some` for an
+    /// agent-identity cert, `None` for a node cert — the two SAN namespaces
+    /// are disjoint. When present the peer is an agent, not a cluster node.
+    pub agent_name: Option<String>,
 }
 
 impl PeerIdentity {
@@ -60,6 +64,9 @@ impl PeerIdentity {
     /// Prefers the self-named `node/{id}` form, falling back to the CN
     /// for certs minted before the URI SAN existed.
     pub fn display_id(&self) -> String {
+        if let Some(name) = &self.agent_name {
+            return format!("agent/{name}");
+        }
         match self.node_id {
             Some(id) => format!("node/{id}"),
             None => self.common_name.clone(),
@@ -149,6 +156,7 @@ mod tests {
             common_name: "nexus-zone-root-node-win".into(),
             node_id: Some(7),
             zone_id: Some("root".into()),
+            agent_name: None,
         };
         assert_eq!(named.display_id(), "node/7");
 
@@ -156,7 +164,16 @@ mod tests {
             common_name: "nexus-zone-root-node-win".into(),
             node_id: None,
             zone_id: None,
+            agent_name: None,
         };
         assert_eq!(legacy.display_id(), "nexus-zone-root-node-win");
+
+        let agent = PeerIdentity {
+            common_name: "nexus-agent-win-ai".into(),
+            node_id: None,
+            zone_id: None,
+            agent_name: Some("win-ai".into()),
+        };
+        assert_eq!(agent.display_id(), "agent/win-ai");
     }
 }

@@ -20,7 +20,7 @@
 //! with `node_id: None`.
 
 use crate::auth::PeerIdentity;
-use nexus_raft::transport::parse_node_identity_uri;
+use nexus_raft::transport::{parse_agent_identity_uri, parse_node_identity_uri};
 use tonic::transport::server::{TcpConnectInfo, TlsConnectInfo};
 use tonic::Request;
 
@@ -58,29 +58,36 @@ pub fn from_der(der: &[u8]) -> Option<PeerIdentity> {
         .unwrap_or_default()
         .to_string();
 
-    let (zone_id, node_id) = cert
-        .subject_alternative_name()
-        .ok()
-        .flatten()
-        .and_then(|san| {
-            san.value.general_names.iter().find_map(|gn| match gn {
-                GeneralName::URI(uri) => parse_node_identity_uri(uri),
-                _ => None,
-            })
-        })
-        .map_or((None, None), |(z, n)| (Some(z), Some(n)));
+    // A cert carries at most one identity URI SAN, and the node / agent
+    // namespaces are disjoint (nexus://zone/ vs nexus://agent/), so at most
+    // one of these ends up set.
+    let mut zone_id = None;
+    let mut node_id = None;
+    let mut agent_name = None;
+    if let Some(san) = cert.subject_alternative_name().ok().flatten() {
+        for gn in san.value.general_names.iter() {
+            let GeneralName::URI(uri) = gn else { continue };
+            if let Some((z, n)) = parse_node_identity_uri(uri) {
+                zone_id = Some(z);
+                node_id = Some(n);
+            } else if let Some(name) = parse_agent_identity_uri(uri) {
+                agent_name = Some(name);
+            }
+        }
+    }
 
     Some(PeerIdentity {
         common_name,
         node_id,
         zone_id,
+        agent_name,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nexus_raft::transport::{generate_node_cert, generate_zone_ca};
+    use nexus_raft::transport::{generate_agent_cert, generate_node_cert, generate_zone_ca};
 
     /// A real cert minted by certgen must round-trip through `from_der`
     /// with both its CN and its pinned node id — this is the contract
@@ -99,6 +106,25 @@ mod tests {
         assert_eq!(id.node_id, Some(7), "node id must be pinned in the URI SAN");
         assert_eq!(id.zone_id, Some("sharedzone".to_string()));
         assert_eq!(id.display_id(), "node/7");
+        assert_eq!(id.agent_name, None, "a node cert is not an agent");
+    }
+
+    /// An agent-identity cert resolves to a peer whose `agent_name` is set and
+    /// whose node fields are `None` — the disjoint half of the round-trip
+    /// above. This is what lets a client-cert handshake on the agent bind
+    /// produce an `agent_id`.
+    #[test]
+    fn from_der_recovers_agent_name_from_an_agent_cert() {
+        let (ca_pem, ca_key_pem) = generate_zone_ca("sharedzone").unwrap();
+        let (cert_pem, _key) = generate_agent_cert("win-ai", &ca_pem, &ca_key_pem).unwrap();
+
+        let pem = pem::parse(&cert_pem).unwrap();
+        let id = from_der(pem.contents()).expect("agent cert must parse");
+
+        assert_eq!(id.agent_name, Some("win-ai".to_string()));
+        assert_eq!(id.node_id, None, "an agent cert has no node id");
+        assert_eq!(id.zone_id, None);
+        assert_eq!(id.display_id(), "agent/win-ai");
     }
 
     /// A cert with no identity SAN (minted before it existed) still

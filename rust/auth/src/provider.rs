@@ -553,6 +553,7 @@ mod tests {
             common_name: "win-node".into(),
             node_id: Some(42),
             zone_id: Some("sharedzone".into()),
+            agent_name: None,
         };
         let ctx = provider(MemStore::arc())
             .resolve(&AuthCredentials {
