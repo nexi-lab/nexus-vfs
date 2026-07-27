@@ -3350,7 +3350,7 @@ async fn run_auth(common: CommonArgs, action: AuthCmd) -> Result<()> {
 /// nested runtime is created and dropped off the async worker threads.
 fn run_auth_blocking(common: CommonArgs, action: AuthCmd) -> Result<()> {
     let (zm, store, secret) = open_auth_store(&common)?;
-    let result = run_auth_action(&store, &secret, action);
+    let result = run_auth_action(&store, &secret, &common.data_dir, action);
     // Release the data directory's lock before returning, or a daemon started
     // right after this exits fails to open redb.
     zm.shutdown();
@@ -3360,6 +3360,7 @@ fn run_auth_blocking(common: CommonArgs, action: AuthCmd) -> Result<()> {
 fn run_auth_action(
     store: &std::sync::Arc<dyn kernel::hal::auth_key_store::AuthKeyStore>,
     secret: &str,
+    data_dir: &std::path::Path,
     action: AuthCmd,
 ) -> Result<()> {
     match action {
@@ -3410,6 +3411,64 @@ fn run_auth_action(
                 expires_at_ms,
                 zone_perms,
             };
+
+            // An agent authenticates by a CA-signed identity cert, not an `sk-`
+            // token (Nexus Auth Architecture §5): its credential IS the cert,
+            // and its record is keyed by name. user / service keep the `sk-`
+            // token plane below. One command, one artifact — no extra flag.
+            //
+            // Placement: the reusable units live in libraries — `generate_agent_cert`
+            // (raft::transport) and `mint_agent_authz` (auth). Only this operator-CLI
+            // glue (on-disk bundle layout + the stdout path contract) is
+            // profile-resident, because it is CLI-specific. A runtime service that
+            // provisions agents programmatically calls those two units directly and
+            // returns the bytes in memory rather than writing a bundle.
+            if subject_type == auth::SubjectType::Agent {
+                let name = record.subject_id.clone();
+                let zones = record.zone_perms.clone();
+                let tls_dir = data_dir.join("tls");
+                let ca_pem = std::fs::read(tls_dir.join("ca.pem")).with_context(|| {
+                    format!(
+                        "agent certs are issued on the founder (it holds the CA): reading {}/ca.pem",
+                        tls_dir.display()
+                    )
+                })?;
+                let ca_key_pem = std::fs::read(tls_dir.join("ca-key.pem")).with_context(|| {
+                    format!(
+                        "agent certs need the CA private key, present only on the founder: reading {}/ca-key.pem",
+                        tls_dir.display()
+                    )
+                })?;
+                let (cert_pem, key_pem) =
+                    nexus_raft::transport::generate_agent_cert(&name, &ca_pem, &ca_key_pem)
+                        .map_err(|e| anyhow::anyhow!("generate agent cert: {e}"))?;
+                auth::mint_agent_authz(store, record, allow_existing)
+                    .map_err(|e| anyhow::anyhow!("mint agent: {e}"))?;
+
+                let out_dir = data_dir.join("agents").join(&name);
+                std::fs::create_dir_all(&out_dir)
+                    .with_context(|| format!("create {}", out_dir.display()))?;
+                std::fs::write(out_dir.join("agent.pem"), &cert_pem)
+                    .with_context(|| format!("write {}/agent.pem", out_dir.display()))?;
+                std::fs::write(out_dir.join("agent-key.pem"), &key_pem)
+                    .with_context(|| format!("write {}/agent-key.pem", out_dir.display()))?;
+                std::fs::write(out_dir.join("ca.pem"), &ca_pem)
+                    .with_context(|| format!("write {}/ca.pem", out_dir.display()))?;
+
+                // The bundle directory on stdout alone, so
+                // `DIR=$(nexusd-cluster auth mint --subject-type agent NAME ...)`
+                // captures it and nothing else.
+                println!("{}", out_dir.display());
+                eprintln!(
+                    "minted agent cert subject=agent:{name} zones={zones:?} -> {}",
+                    out_dir.display()
+                );
+                eprintln!(
+                    "The agent presents agent.pem + agent-key.pem and trusts the server via ca.pem."
+                );
+                return Ok(());
+            }
+
             let minted = auth::mint_key(store, secret, record, allow_existing)
                 .map_err(|e| anyhow::anyhow!("mint: {e}"))?;
 
