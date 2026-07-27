@@ -211,7 +211,8 @@ impl ApiKeyAuthProvider {
         ctx
     }
 
-    /// Resolve an `sk-` token, consulting the cache first.
+    /// Resolve an `sk-` token: gate the format, then resolve its record by
+    /// the HMAC store key.
     fn resolve_token(&self, token: &str) -> Result<OperationContext, Status> {
         if !is_well_formed(token) {
             // Deliberately vague to the caller: a client that learns *why*
@@ -219,21 +220,37 @@ impl ApiKeyAuthProvider {
             tracing::debug!("rejected: malformed API key");
             return Err(unauthenticated());
         }
+        self.resolve_by_store_key(hash_key(&self.secret, token))
+    }
 
-        let hash = hash_key(&self.secret, token);
+    /// Resolve a cert-authenticated agent: its identity is the verified cert
+    /// SAN (`nexus://agent/{name}`), its authorization is the `agent:{name}`
+    /// record minted for it. A valid cert with no record reaches nothing
+    /// (fail-closed) — the cert proves cluster membership, the record grants
+    /// access. Same gates, cache, and revocation path as the token plane.
+    fn resolve_agent_peer(&self, name: &str) -> Result<OperationContext, Status> {
+        self.resolve_by_store_key(crate::mint::agent_store_key(name))
+    }
 
-        if let Some(entry) = self.cache.get(&hash) {
+    /// The shared credential-resolution path for both planes: cache first,
+    /// then the record's fail-closed gates (present, decodable, not revoked,
+    /// not expired, zone-scoped unless admin), then cache the result. The
+    /// `store_key` is the HMAC of an `sk-` token or `agent:{name}` for a cert
+    /// agent; it is also the cache key AND the value the apply-observer hands
+    /// `invalidate`, so a `DeleteAuthKey` evicts here without waiting the TTL.
+    fn resolve_by_store_key(&self, store_key: String) -> Result<OperationContext, Status> {
+        if let Some(entry) = self.cache.get(&store_key) {
             if Instant::now() < entry.expires_at {
                 return Ok(entry.ctx.clone());
             }
         }
         // Expired (or absent) — drop the stale row and go to the store.
-        self.cache.remove(&hash);
+        self.cache.remove(&store_key);
 
-        let bytes = match self.store.get(&hash) {
+        let bytes = match self.store.get(&store_key) {
             Ok(Some(bytes)) => bytes,
             Ok(None) => {
-                tracing::debug!("rejected: no such API key");
+                tracing::debug!("rejected: no such credential");
                 return Err(unauthenticated());
             }
             Err(e) => {
@@ -254,27 +271,27 @@ impl ApiKeyAuthProvider {
         };
 
         if record.revoked {
-            tracing::debug!(key_id = %record.key_id, "rejected: revoked key");
+            tracing::debug!(key_id = %record.key_id, "rejected: revoked credential");
             return Err(unauthenticated());
         }
         if record.is_expired(now_ms()) {
-            tracing::debug!(key_id = %record.key_id, "rejected: expired key");
+            tracing::debug!(key_id = %record.key_id, "rejected: expired credential");
             return Err(unauthenticated());
         }
-        // Zoneless keys are reserved for global admins. Without this, a
-        // non-admin key with no grants would fall through to the root zone
-        // (the `zone_id` default below) and quietly hold the whole namespace.
+        // Zoneless credentials are reserved for global admins. Without this, a
+        // non-admin record with no grants would fall through to the root zone
+        // (the `zone_id` default) and quietly hold the whole namespace.
         if record.zone_perms.is_empty() && !record.is_admin {
             tracing::warn!(
                 key_id = %record.key_id,
-                "rejected: non-admin key has no zone grants"
+                "rejected: non-admin credential has no zone grants"
             );
             return Err(unauthenticated());
         }
 
         let ctx = Self::context_from_record(&record);
         self.cache.insert(
-            hash,
+            store_key,
             CachedContext {
                 ctx: ctx.clone(),
                 expires_at: Instant::now() + self.cache_ttl,
@@ -296,6 +313,12 @@ impl AuthProvider for ApiKeyAuthProvider {
         // Peer plane first: a verified cluster node needs no token, which is
         // exactly why federation survives a strict provider.
         if let Some(peer) = creds.peer {
+            // An agent-identity cert authenticates as its agent — identity from
+            // the verified SAN, authorization from its `agent:{name}` record. A
+            // node cert is a cluster peer, where membership IS the authorization.
+            if let Some(agent) = &peer.agent_name {
+                return self.resolve_agent_peer(agent);
+            }
             return Ok(Self::peer_context(peer));
         }
         if creds.token.is_empty() {
@@ -411,6 +434,58 @@ mod tests {
         // short-circuit the permission gate entirely.
         assert!(!ctx.is_system);
         assert!(!ctx.is_admin);
+    }
+
+    /// A cert-authenticated agent (peer plane, `nexus://agent/{name}` SAN)
+    /// resolves to the same identity a token-plane agent key yields — id and
+    /// grants from its `agent:{name}` record — but via the cert. A verified
+    /// cert with no record reaches nothing (fail-closed).
+    #[test]
+    fn a_cert_agent_resolves_from_its_record() {
+        let store = MemStore::arc();
+        // The authZ record `auth mint --subject-type agent` writes, keyed by name.
+        store
+            .put(
+                &crate::mint::agent_store_key("mac-ai"),
+                &agent_record().encode().unwrap(),
+            )
+            .unwrap();
+
+        let peer = PeerIdentity {
+            common_name: "nexus-agent-mac-ai".into(),
+            node_id: None,
+            zone_id: None,
+            agent_name: Some("mac-ai".into()),
+        };
+        let ctx = provider(Arc::clone(&store))
+            .resolve(&AuthCredentials {
+                token: "",
+                peer: Some(&peer),
+            })
+            .expect("cert agent resolves from its record");
+
+        assert_eq!(ctx.agent_id.as_deref(), Some("mac-ai"));
+        assert_eq!(ctx.subject_type, "agent");
+        assert_eq!(ctx.zone_perms, vec![("sharedzone".into(), "rw".into())]);
+        assert!(!ctx.is_system, "an agent is never a system caller");
+        assert!(!ctx.is_admin);
+
+        // A verified cert with no minted record grants nothing.
+        let ghost = PeerIdentity {
+            common_name: "nexus-agent-ghost".into(),
+            node_id: None,
+            zone_id: None,
+            agent_name: Some("ghost".into()),
+        };
+        assert!(
+            provider(store)
+                .resolve(&AuthCredentials {
+                    token: "",
+                    peer: Some(&ghost),
+                })
+                .is_err(),
+            "a cert with no authZ record reaches nothing"
+        );
     }
 
     /// A user key carries no `agent_id`, so its holder cannot author agent
