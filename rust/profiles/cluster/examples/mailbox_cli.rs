@@ -40,7 +40,7 @@ async fn run() -> Result<(), String> {
     // Two modes by the credential:
     //  * `sk-...`  → token plane, plaintext loopback (the historical form).
     //  * a bundle dir (`.../agents/{name}/` with agent.pem/agent-key.pem/ca.pem,
-    //    as `auth mint --subject-type agent --cert` writes) → cert plane, mTLS.
+    //    as `auth mint --subject-type agent` writes) → cert plane, mTLS.
     //    The agent signs each send and verifies each collect with its cert.
     let cert_mode = !cred.starts_with("sk-");
     let (mut c, auth, agent) = if cert_mode {

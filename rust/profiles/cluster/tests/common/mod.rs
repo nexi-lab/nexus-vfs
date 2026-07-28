@@ -196,15 +196,21 @@ impl Drop for Daemon {
     }
 }
 
-/// Run the offline `auth mint` subcommand and return the minted `sk-` key.
+/// Mint an `sk-` token for a `user` or `service` subject (the token plane).
+/// Agents are cert-only — use [`mint_agent_cert`] for those. Returns the key.
 /// The daemon must NOT be holding the data-dir lock when this runs.
-pub fn mint_agent_key(env: &[(&str, &str)], subject_id: &str, zone_rw: &str) -> String {
+pub fn mint_token_key(
+    env: &[(&str, &str)],
+    subject_type: &str,
+    subject_id: &str,
+    zone_rw: &str,
+) -> String {
     let mut cmd = Command::new(bin());
     cmd.args([
         "auth",
         "mint",
         "--subject-type",
-        "agent",
+        subject_type,
         "--subject-id",
         subject_id,
         "--zone",
@@ -229,6 +235,46 @@ pub fn mint_agent_key(env: &[(&str, &str)], subject_id: &str, zone_rw: &str) -> 
     key
 }
 
+/// Mint a cert-agent (`--subject-type agent`) and return its bundle directory
+/// (holding `agent.pem` / `agent-key.pem` / `ca.pem`). An agent's one credential
+/// is a CA-signed identity cert — [`Vfs::connect_mtls`] presents it. Needs the
+/// founder CA at `<data-dir>/tls`; the daemon must NOT hold the data-dir lock.
+pub fn mint_agent_cert(
+    env: &[(&str, &str)],
+    subject_id: &str,
+    zone_rw: &str,
+) -> std::path::PathBuf {
+    let mut cmd = Command::new(bin());
+    cmd.args([
+        "auth",
+        "mint",
+        "--subject-type",
+        "agent",
+        "--subject-id",
+        subject_id,
+        "--zone",
+        zone_rw,
+        "--name",
+        "e2e",
+    ]);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("run `auth mint` (agent cert)");
+    assert!(
+        out.status.success(),
+        "agent cert mint failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let dir = std::path::PathBuf::from(dir);
+    assert!(
+        dir.join("agent.pem").exists() && dir.join("agent-key.pem").exists(),
+        "mint did not write a cert bundle at {dir:?}"
+    );
+    dir
+}
+
 /// Run any offline subcommand; returns (success, stdout, stderr).
 pub fn cli(env: &[(&str, &str)], args: &[&str]) -> (bool, String, String) {
     let mut cmd = Command::new(bin());
@@ -248,7 +294,7 @@ pub fn cli(env: &[(&str, &str)], args: &[&str]) -> (bool, String, String) {
 /// the persisted `node_id` into `data_dir`, so `bootstrap_tls` finds the bundle
 /// present and reuses it (TLS on, no self-generated CA). One shared CA is what
 /// lets nodes verify each other's client certs — cluster membership — and is
-/// also what an offline `auth mint --cert` reads to sign an agent cert.
+/// also what an offline `auth mint --subject-type agent` reads to sign the cert.
 pub fn write_tls_bundle(
     data_dir: &std::path::Path,
     node_id: u64,
@@ -310,7 +356,7 @@ impl Vfs {
     }
 
     /// Dial the mTLS plane presenting a client identity cert — an agent's
-    /// `agent.pem` / `agent-key.pem` bundle (as `auth mint --cert` writes),
+    /// `agent.pem` / `agent-key.pem` bundle (as `auth mint --subject-type agent` writes),
     /// chaining to `ca_pem`. The daemon authenticates the caller from the
     /// client certificate (the peer plane), so calls carry an EMPTY token.
     /// Polls until the TLS handshake + a bare `Ping` both succeed — the cert

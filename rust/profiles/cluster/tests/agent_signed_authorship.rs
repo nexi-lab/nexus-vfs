@@ -15,8 +15,8 @@
 //! The journey, each step consuming the last:
 //!
 //! 1. CA+TLS — bootstrap a cluster CA + node cert; the founder boots TLS-on.
-//! 2. MINT — offline `auth mint --subject-type agent --cert win-ai` → a
-//!    CA-signed bundle (agent.pem / agent-key.pem / ca.pem).
+//! 2. MINT — offline `auth mint --subject-type agent win-ai` → a CA-signed
+//!    bundle (agent.pem / agent-key.pem / ca.pem); agents are cert-only.
 //! 3. CONNECT — win-ai dials the mTLS plane presenting that cert; its SAN
 //!    `nexus://agent/win-ai` resolves to `agent_id=win-ai`, grants ride in the
 //!    cert (no per-node store lookup).
@@ -89,7 +89,6 @@ async fn from_is_unforgeable_across_trust_domains_via_signed_cert() {
             "mint",
             "--subject-type",
             "agent",
-            "--cert",
             "--subject-id",
             "win-ai",
             "--zone",
@@ -98,7 +97,7 @@ async fn from_is_unforgeable_across_trust_domains_via_signed_cert() {
             "e2e",
         ],
     );
-    assert!(ok, "mint --cert failed: {err}");
+    assert!(ok, "agent mint failed: {err}");
     let bundle = std::path::PathBuf::from(bundle_dir.trim());
     let agent_cert = std::fs::read(bundle.join("agent.pem")).expect("read agent.pem");
     let agent_key = std::fs::read(bundle.join("agent-key.pem")).expect("read agent-key.pem");
@@ -178,6 +177,36 @@ async fn from_is_unforgeable_across_trust_domains_via_signed_cert() {
          the cross-trust-domain guarantee the stamp alone cannot provide"
     );
 
+    // ── 7. STAMP: an UNSIGNED mailbox write still gets a truthful `from` ─────
+    // The same-domain floor, on the cert plane: win-ai authenticated over mTLS,
+    // so the kernel stamps `from` to the authenticated agent_id regardless of
+    // what the (unsigned) envelope claimed. A client that does not seal is still
+    // caught — this is the guarantee `agent_bind_from_stamp` used to cover on the
+    // now-retired sk- agent bind.
+    c.mkdir(&format!("{MOUNT}/stamp"), "")
+        .await
+        .expect("mk stamp dir");
+    let stamp_mbox = format!("{MOUNT}/stamp/chat-with-me");
+    c.create_stream(&stamp_mbox, "")
+        .await
+        .expect("open stamp mailbox");
+    c.stream_write(&stamp_mbox, br#"{"from":"impostor","body":"unsigned"}"#, "")
+        .await
+        .expect("write an unsigned envelope");
+    let stamped = c
+        .stream_collect_all(&stamp_mbox, "")
+        .await
+        .expect("collect stamped");
+    let stamped = String::from_utf8_lossy(&stamped);
+    assert!(
+        stamped.contains(r#""from":"win-ai""#),
+        "an unsigned mailbox write must be stamped to the authenticated agent; got: {stamped}"
+    );
+    assert!(
+        !stamped.contains("impostor"),
+        "the forged `from` must not survive the stamp; got: {stamped}"
+    );
+
     drop(founder);
 }
 
@@ -239,7 +268,7 @@ async fn signed_from_replicates_and_verifies_on_a_peer_node() {
         ("RUST_LOG", LOG_FILTER),
     ];
 
-    // Founder forms the zone (persists the mount) → stop → mint win-ai --cert
+    // Founder forms the zone (persists the mount) → stop → mint win-ai (cert)
     // offline → restart, then the joiner joins over real mTLS.
     {
         let mut f = Daemon::spawn(&["--bind-addr", &fbind], &founder_env);
@@ -254,7 +283,6 @@ async fn signed_from_replicates_and_verifies_on_a_peer_node() {
             "mint",
             "--subject-type",
             "agent",
-            "--cert",
             "--subject-id",
             "win-ai",
             "--zone",
@@ -263,7 +291,7 @@ async fn signed_from_replicates_and_verifies_on_a_peer_node() {
             "e2e",
         ],
     );
-    assert!(ok, "mint --cert failed: {err}");
+    assert!(ok, "agent mint failed: {err}");
     let bundle = std::path::PathBuf::from(bundle_dir.trim());
     let agent_cert = std::fs::read(bundle.join("agent.pem")).expect("read agent.pem");
     let agent_key = std::fs::read(bundle.join("agent-key.pem")).expect("read agent-key.pem");
