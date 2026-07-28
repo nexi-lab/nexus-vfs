@@ -20,7 +20,8 @@
 //! with `node_id: None`.
 
 use crate::auth::PeerIdentity;
-use nexus_raft::transport::{parse_agent_identity_uri, parse_node_identity_uri};
+use lib::transport_primitives::authorship::agent_name_from_x509;
+use nexus_raft::transport::parse_node_identity_uri;
 use tonic::transport::server::{TcpConnectInfo, TlsConnectInfo};
 use tonic::Request;
 
@@ -74,7 +75,9 @@ pub fn from_der(der: &[u8]) -> Option<PeerIdentity> {
             }
         }
     }
-    // The agent-identity SAN is read one way (shared with authorship::verify).
+    // The agent-identity SAN is read one way, via the shared library helper
+    // (the same one `authorship::verify` uses), so a node cert and an agent
+    // cert are told apart identically here and at message-verify time.
     let agent_name = agent_name_from_x509(&cert);
 
     // An agent cert carries its authorization in a capability extension; read
@@ -95,24 +98,6 @@ pub fn from_der(der: &[u8]) -> Option<PeerIdentity> {
         agent_name,
         agent_grants,
     })
-}
-
-/// The `nexus://agent/{name}` SAN of a parsed cert, if any. Shared by
-/// [`from_der`] and `authorship::verify` so the agent-identity SAN is read one
-/// way. `#[inline]` — a thin wrapper over `parse_agent_identity_uri` on the
-/// per-connection auth path, so inline it to keep the shared helper free.
-#[inline]
-pub fn agent_name_from_x509(cert: &x509_parser::certificate::X509Certificate) -> Option<String> {
-    use x509_parser::prelude::*;
-    cert.subject_alternative_name()
-        .ok()
-        .flatten()
-        .and_then(|san| {
-            san.value.general_names.iter().find_map(|gn| match gn {
-                GeneralName::URI(uri) => parse_agent_identity_uri(uri),
-                _ => None,
-            })
-        })
 }
 
 #[cfg(test)]

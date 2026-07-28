@@ -1762,6 +1762,7 @@ dependencies = [
  "rcgen",
  "regex",
  "regex-syntax",
+ "ring",
  "roaring",
  "rustls",
  "serde",
@@ -1774,6 +1775,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
+ "x509-parser",
 ]
 
 [[package]]
@@ -1923,6 +1925,7 @@ dependencies = [
  "contracts",
  "gethostname",
  "kernel",
+ "lib",
  "raft 0.1.0",
  "rand 0.10.1",
  "tempfile",

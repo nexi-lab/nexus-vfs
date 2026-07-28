@@ -7,6 +7,7 @@
 //! Lives under `lib` per §6 — `lib` is the tier-neutral implementation
 //! crate, mirror of `src/nexus/lib/`.
 
+pub mod authorship;
 mod channel;
 mod config;
 mod error;

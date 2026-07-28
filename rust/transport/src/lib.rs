@@ -34,10 +34,6 @@
 /// mTLS peer), and the single-node-dev `NoAuth` impl. Consumed by
 /// `transport::grpc::VfsServiceImpl`.
 pub mod auth;
-/// Agent authorship — EC P-256 signing / CA-verified checking of the
-/// unforgeable `from`, so authorship is provable without trusting the
-/// ingesting node.
-pub mod authorship;
 /// Generic `Call` RPC dispatcher — JSON in, kernel syscall, JSON out.
 pub mod call_dispatch;
 /// Federation peer client — discover/join RPCs for cross-zone membership.

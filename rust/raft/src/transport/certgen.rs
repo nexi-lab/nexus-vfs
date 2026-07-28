@@ -54,32 +54,6 @@ pub fn parse_node_identity_uri(uri: &str) -> Option<(String, u64)> {
     Some((zone_id.to_string(), node_id.parse().ok()?))
 }
 
-/// Scheme + authority of the agent identity URI SAN. Parallel to
-/// [`NODE_IDENTITY_URI_PREFIX`]: a node cert states which *node* it is,
-/// an agent cert states which *agent* it is. Zone-free by design — an
-/// agent is one cluster-wide actor, not scoped to a zone (the zone is an
-/// access scope carried in the credential record, not an identity
-/// namespace). Disjoint from the node prefix, so a node URI never parses
-/// as an agent and vice versa.
-const AGENT_IDENTITY_URI_PREFIX: &str = "nexus://agent/";
-
-/// Build the identity URI SAN pinned into an agent certificate:
-/// `nexus://agent/{name}`.
-pub fn agent_identity_uri(name: &str) -> String {
-    format!("{AGENT_IDENTITY_URI_PREFIX}{name}")
-}
-
-/// Inverse of [`agent_identity_uri`] — `None` for any URI that is not an
-/// agent identity or is malformed (a foreign SAN must never resolve to
-/// an agent).
-pub fn parse_agent_identity_uri(uri: &str) -> Option<String> {
-    let name = uri.strip_prefix(AGENT_IDENTITY_URI_PREFIX)?;
-    if name.is_empty() {
-        return None;
-    }
-    Some(name.to_string())
-}
-
 /// Parse a cluster CA (cert + private key, both PEM) into an rcgen `Issuer`
 /// ready to sign leaf certs. Shared by node and agent cert generation so the
 /// CA-loading boilerplate has one home.
@@ -229,7 +203,7 @@ pub fn generate_node_cert(
 /// warrants: an agent is a *client*, never a server, so the cert carries
 /// only `clientAuth` and no reachability SANs — its sole SAN is the
 /// machine-readable identity `nexus://agent/{name}`, read back by
-/// [`parse_agent_identity_uri`]. The CA chain plus that URI SAN are the
+/// `lib::agent_identity::parse_agent_identity_uri`. The CA chain plus that URI SAN are the
 /// whole identity; the CN (`nexus-agent-{name}`) is a display string.
 ///
 /// The one key both authenticates the agent (mTLS client identity →
@@ -262,7 +236,7 @@ pub fn generate_agent_cert(
     // server-name SANs — an agent never serves TLS, it presents this as a
     // client cert, and rustls ignores URI SANs for hostname verification.
     params.subject_alt_names = vec![SanType::URI(
-        agent_identity_uri(name)
+        lib::agent_identity::agent_identity_uri(name)
             .as_str()
             .try_into()
             .map_err(|e| format!("agent identity SAN error: {e}"))?,
@@ -501,6 +475,7 @@ pub fn ca_fingerprint_from_pem(ca_pem: &[u8]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lib::agent_identity::parse_agent_identity_uri;
 
     fn generate_test_ca() -> (String, String) {
         let ca_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
@@ -642,7 +617,10 @@ mod tests {
 
         // Sole SAN is the identity URI — a client cert carries no reachability SANs.
         assert_eq!(uris, vec!["nexus://agent/win-ai"]);
-        assert_eq!(parse_agent_identity_uri(uris[0]), Some("win-ai".to_string()));
+        assert_eq!(
+            parse_agent_identity_uri(uris[0]),
+            Some("win-ai".to_string())
+        );
 
         // The node and agent identity namespaces are disjoint.
         assert_eq!(parse_node_identity_uri("nexus://agent/win-ai"), None);

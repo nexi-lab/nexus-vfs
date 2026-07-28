@@ -38,12 +38,10 @@ tracing = "0.1"
 sha2 = "0.11"
 # Recover the mTLS peer's identity from the client cert tonic already
 # verified (`peer_identity`). Parsing only — cert *minting* stays in
-# `raft::transport::certgen`.
+# `raft::transport::certgen`, message signing / verifying in
+# `lib::transport_primitives::authorship`.
 x509-parser = "0.18"
-# EC P-256 message signing / verification for agent authorship (the signed
-# `from`). `ring` is already the pinned rustls crypto provider.
-ring = "0.17"
-# PEM <-> DER for the agent key + cert (also used by peer_identity tests).
+# PEM -> DER for the peer cert in `peer_identity` tests.
 pem = "3"
 serde = { workspace = true }
 serde_json = { workspace = true }
