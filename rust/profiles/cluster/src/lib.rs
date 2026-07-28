@@ -472,6 +472,20 @@ enum AuthCmd {
         /// `agent_id` (the `from` guarantee).
         #[arg(long)]
         allow_existing: bool,
+        /// Issue a CA-signed X.509 identity-cert bundle instead of an `sk-`
+        /// token (agents only). The cert is the agent's ONE credential: it
+        /// authenticates the agent over mTLS AND signs its messages, so a
+        /// consumer on another node — a different trust domain — verifies the
+        /// `from` against the cluster CA without trusting whoever ingested it
+        /// (Nexus Auth Architecture §5). Requires the founder's CA
+        /// (`<data-dir>/tls`) and prints the bundle directory rather than a key.
+        ///
+        /// Omit it for the default `sk-` token, which is what the loopback
+        /// token agent bind (`--agent-bind-addr`) authenticates and what
+        /// user / service always get. An agent has exactly one of the two,
+        /// chosen by how it connects — never both.
+        #[arg(long)]
+        cert: bool,
     },
     /// Revoke a key. Takes the key itself, or its hash from `auth list`.
     Revoke {
@@ -3372,6 +3386,7 @@ fn run_auth_action(
             expires_in_days,
             name,
             allow_existing,
+            cert,
         } => {
             let subject_type = match subject_type.as_str() {
                 "user" => auth::SubjectType::User,
@@ -3412,10 +3427,15 @@ fn run_auth_action(
                 zone_perms,
             };
 
-            // An agent authenticates by a CA-signed identity cert, not an `sk-`
-            // token (Nexus Auth Architecture §5): its credential IS the cert,
-            // and its record is keyed by name. user / service keep the `sk-`
-            // token plane below. One command, one artifact — no extra flag.
+            // `--cert` issues a CA-signed identity cert instead of an `sk-`
+            // token: the agent's credential IS the cert (mTLS identity + the
+            // key that signs its messages), so a consumer on another trust
+            // domain verifies the `from` against the cluster CA — the
+            // cross-trust-domain guarantee (Nexus Auth Architecture §5). The
+            // default (no `--cert`) mints an `sk-` token, which is what the
+            // loopback token agent bind authenticates and what user / service
+            // always get; an agent holds exactly one of the two, by how it
+            // connects, never both. `--cert` is agent-only.
             //
             // Placement: the reusable units live in libraries — `generate_agent_cert`
             // (raft::transport) and `mint_agent_authz` (auth). Only this operator-CLI
@@ -3423,7 +3443,13 @@ fn run_auth_action(
             // profile-resident, because it is CLI-specific. A runtime service that
             // provisions agents programmatically calls those two units directly and
             // returns the bytes in memory rather than writing a bundle.
-            if subject_type == auth::SubjectType::Agent {
+            if cert {
+                if subject_type != auth::SubjectType::Agent {
+                    return Err(anyhow::anyhow!(
+                        "--cert issues an agent identity cert and is for --subject-type agent \
+                         only; user / service authenticate with sk- tokens"
+                    ));
+                }
                 let name = record.subject_id.clone();
                 let zones = record.zone_perms.clone();
                 // Grants ride in the cert (capability), read back by any node
@@ -3467,7 +3493,7 @@ fn run_auth_action(
                     .with_context(|| format!("write {}/ca.pem", out_dir.display()))?;
 
                 // The bundle directory on stdout alone, so
-                // `DIR=$(nexusd-cluster auth mint --subject-type agent NAME ...)`
+                // `DIR=$(nexusd-cluster auth mint --subject-type agent --cert NAME ...)`
                 // captures it and nothing else.
                 println!("{}", out_dir.display());
                 eprintln!(
