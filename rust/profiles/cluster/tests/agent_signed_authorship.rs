@@ -2,11 +2,10 @@
 //! CA-signed agent cert — the G1 signed-authorship guarantee, end to end
 //! through the real `nexusd-cluster` binary.
 //!
-//! Distinct from its two siblings, which test the server-side STAMP (the
-//! ingress node rewrites `from`, a same-trust-domain guarantee):
-//! `agent_bind_from_stamp` on the loopback token plane, and
-//! `federation_mtls_from_stamp` across an mTLS federation. HERE the agent
-//! itself SIGNS the message with its identity cert's key, and the consumer
+//! Distinct from its sibling `federation_mtls_from_stamp`, which tests the
+//! server-side STAMP (the ingress node rewrites `from` — a same-trust-domain
+//! guarantee) across an mTLS federation. HERE the agent itself SIGNS the
+//! message with its identity cert's key, and the consumer
 //! VERIFIES the signature against the cluster CA. The proof rides the CA, not
 //! the ingesting node's posture — so a `from` backed by a cert that does not
 //! chain to OUR CA is rejected on read no matter who wrote it. This is the
@@ -178,11 +177,9 @@ async fn from_is_unforgeable_across_trust_domains_via_signed_cert() {
     );
 
     // ── 7. STAMP: an UNSIGNED mailbox write still gets a truthful `from` ─────
-    // The same-domain floor, on the cert plane: win-ai authenticated over mTLS,
-    // so the kernel stamps `from` to the authenticated agent_id regardless of
-    // what the (unsigned) envelope claimed. A client that does not seal is still
-    // caught — this is the guarantee `agent_bind_from_stamp` used to cover on the
-    // now-retired sk- agent bind.
+    // The same-domain floor: win-ai authenticated over mTLS, so the kernel
+    // stamps `from` to the authenticated agent_id regardless of what the
+    // (unsigned) envelope claimed. A client that does not seal is still caught.
     c.mkdir(&format!("{MOUNT}/stamp"), "")
         .await
         .expect("mk stamp dir");

@@ -1,11 +1,11 @@
 //! Shared black-box harness for the `nexus-cluster` e2e integration tests.
 //!
 //! These tests spawn the REAL `nexusd-cluster` binary (via
-//! `CARGO_BIN_EXE_nexusd-cluster`) and drive it over a REAL gRPC channel —
-//! the Rust replacements for the retired `scripts/e2e_*.py`. A black-box
-//! binary+wire test catches what an in-process test structurally can't: clap
-//! arg parsing, the boot posture, and the on-the-wire proto contract a foreign
-//! client (moss/sudocode) sees. The harness keeps each test a short journey.
+//! `CARGO_BIN_EXE_nexusd-cluster`) and drive it over a REAL gRPC channel. A
+//! black-box binary+wire test catches what an in-process test structurally
+//! can't: clap arg parsing, the boot posture, and the on-the-wire proto
+//! contract a foreign client (moss/sudocode) sees. The harness keeps each test
+//! a short journey.
 
 #![allow(dead_code)] // each test file uses a different subset
 

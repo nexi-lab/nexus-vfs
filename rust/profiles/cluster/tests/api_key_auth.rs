@@ -4,8 +4,7 @@
 //! raft, real gRPC — because the unit tests can all pass while the provider is
 //! never wired, the store never bound, or the boot order leaves an empty slot;
 //! only running the binary catches that (the first live run died on a rootless
-//! boot no unit test could have seen). Rust replacement for the retired
-//! `scripts/e2e_api_key_auth.py`. The journey, each step consuming the last:
+//! boot no unit test could have seen). The journey, each step consuming the last:
 //!
 //!   1. MINT   a user key (the token plane is user / service; agents are cert-only).
 //!   2. LIST   read it back from a SEPARATE process — durable state, not memory.

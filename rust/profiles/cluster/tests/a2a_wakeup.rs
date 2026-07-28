@@ -8,8 +8,7 @@
 //! federation env). Nothing is stubbed — real raft JoinZone, real wal
 //! DT_STREAM replication over the raft log, real gRPC. Auth is OFF here
 //! (`--insecure-no-auth`); the auth-ON `from`-stamp is covered by
-//! `agent_bind_from_stamp`. Rust replacement for the retired
-//! `scripts/e2e_a2a_wakeup.py`. The journey, each step consuming the last:
+//! `agent_signed_authorship`. The journey, each step consuming the last:
 //! BOOT founder (owner) + joiner (DiscoverZones); HEALTH founder writes under
 //! `/agents` and the joiner reads it back; A2A the joiner owns a mailbox, the
 //! founder (a peer) opens + sends, the joiner's parked Watch wakes on its own
