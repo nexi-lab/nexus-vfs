@@ -170,7 +170,6 @@ fn agent_descriptor_to_json(desc: &AgentDescriptor) -> serde_json::Value {
     let external_info = desc.external_info.as_ref().map(|info| {
         serde_json::json!({
             "connection_id": &info.connection_id,
-            "host_pid": info.host_pid,
             "remote_addr": &info.remote_addr,
             "protocol": &info.protocol,
             "last_heartbeat_ms": info.last_heartbeat_ms,
@@ -222,6 +221,10 @@ fn do_agent_register(kernel: &Arc<Kernel>, params: &serde_json::Value) -> Result
 
     let desc = if let Some(connection_id) = connection_id {
         let host_pid = params.get("host_pid").and_then(|v| v.as_i64());
+        let local_id = params
+            .get("local_id")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
         let remote_addr = opt_s(params, "remote_addr");
         let protocol = opt_s(params, "protocol").unwrap_or_else(|| "grpc".to_string());
         kernel
@@ -232,6 +235,7 @@ fn do_agent_register(kernel: &Arc<Kernel>, params: &serde_json::Value) -> Result
                 zone_id,
                 connection_id,
                 host_pid,
+                local_id,
                 remote_addr,
                 protocol,
                 parent_pid,
@@ -247,7 +251,6 @@ fn do_agent_register(kernel: &Arc<Kernel>, params: &serde_json::Value) -> Result
         let external_info =
             opt_s(params, "external_connection_id").map(|connection_id| ExternalProcessInfo {
                 connection_id,
-                host_pid: params.get("host_pid").and_then(|v| v.as_i64()),
                 remote_addr: opt_s(params, "remote_addr"),
                 protocol: opt_s(params, "protocol").unwrap_or_else(|| "grpc".to_string()),
                 last_heartbeat_ms: None,
@@ -483,6 +486,60 @@ mod tests {
         .into_inner();
         assert_eq!(result_payload(unregister), serde_json::json!(true));
         assert!(kernel.agent_registry().get("admin,e2e").is_none());
+    }
+
+    #[test]
+    fn agent_register_external_pid_is_the_os_host_pid() {
+        // Black-box over the wire: the run pid IS the OS process id, so
+        // `/proc/{pid}` / ps / kill align and the mapping needs no lookup. There
+        // is NO separate `host_pid` field (SSOT — it lives in the pid). This is
+        // the regression guard for the pid-model change.
+        let kernel = Arc::new(Kernel::new());
+        let ctx = OperationContext::new("admin", kernel::ROOT_ZONE_ID, true, None, true);
+
+        // (a) host_pid only → pid == the OS pid; connection_id stays metadata.
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "name": "os-pid agent",
+            "owner_id": "admin",
+            "zone_id": kernel::ROOT_ZONE_ID,
+            "connection_id": "conn-xyz",
+            "host_pid": 4242,
+        }))
+        .expect("payload");
+        let reg = result_payload(
+            dispatch(&kernel, &ctx, "agent_register_external", &payload)
+                .expect("dispatch")
+                .into_inner(),
+        );
+        assert_eq!(reg["pid"], "4242", "pid must BE the OS host_pid");
+        assert_eq!(
+            reg["external_info"]["connection_id"], "conn-xyz",
+            "connection_id stays as connection metadata, distinct from the pid"
+        );
+        assert!(
+            reg["external_info"].get("host_pid").is_none(),
+            "host_pid must NOT be a separate field — it IS the pid (SSOT)"
+        );
+        assert!(kernel.agent_registry().get("4242").is_some());
+
+        // (b) host_pid + local_id → pid == "{host_pid}.{local_id}" (micro-agents
+        // sharing one process). Cross-platform, runtime-assigned local_id.
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "name": "micro agent",
+            "owner_id": "admin",
+            "zone_id": kernel::ROOT_ZONE_ID,
+            "connection_id": "conn-abc",
+            "host_pid": 4243,
+            "local_id": 5,
+        }))
+        .expect("payload");
+        let reg = result_payload(
+            dispatch(&kernel, &ctx, "agent_register_external", &payload)
+                .expect("dispatch")
+                .into_inner(),
+        );
+        assert_eq!(reg["pid"], "4243.5", "pid must encode host_pid.local_id");
+        assert!(kernel.agent_registry().get("4243.5").is_some());
     }
 
     #[test]
