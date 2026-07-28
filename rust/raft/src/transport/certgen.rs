@@ -235,8 +235,14 @@ pub fn generate_node_cert(
 /// The one key both authenticates the agent (mTLS client identity →
 /// `agent_id`) and signs its messages (the unforgeable `from`): one
 /// credential, one source of identity.
+///
+/// `grants` (zones + admin) ride in a CA-signed extension
+/// ([`contracts::AGENT_GRANTS_OID`]) so any node reads the agent's
+/// authorization straight from the cert via the cluster CA — no per-node
+/// credential store, which is what lets a cert-agent work on any node.
 pub fn generate_agent_cert(
     name: &str,
+    grants: &contracts::AgentGrants,
     ca_cert_pem: &[u8],
     ca_key_pem: &[u8],
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
@@ -267,6 +273,16 @@ pub fn generate_agent_cert(
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
     params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     params.is_ca = IsCa::NoCa;
+
+    // Authorization travels with identity: the agent's grants (zones + admin)
+    // ride in a CA-signed extension, so any node reads them from the cert via
+    // the cluster CA — no per-node credential store lookup.
+    params
+        .custom_extensions
+        .push(rcgen::CustomExtension::from_oid_content(
+            contracts::AGENT_GRANTS_OID,
+            grants.encode(),
+        ));
 
     let now = time::OffsetDateTime::now_utc();
     params.not_before = now;
@@ -595,8 +611,17 @@ mod tests {
         use x509_parser::prelude::*;
 
         let (ca_cert_pem, ca_key_pem) = generate_test_ca();
-        let (cert_pem, key_pem) =
-            generate_agent_cert("win-ai", ca_cert_pem.as_bytes(), ca_key_pem.as_bytes()).unwrap();
+        let grants = contracts::AgentGrants {
+            is_admin: false,
+            zone_perms: vec![("sharedzone".into(), "rw".into())],
+        };
+        let (cert_pem, key_pem) = generate_agent_cert(
+            "win-ai",
+            &grants,
+            ca_cert_pem.as_bytes(),
+            ca_key_pem.as_bytes(),
+        )
+        .unwrap();
         assert!(String::from_utf8_lossy(&key_pem).contains("PRIVATE KEY"));
 
         let pem = ::pem::parse(&cert_pem).unwrap();

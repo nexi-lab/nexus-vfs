@@ -223,13 +223,33 @@ impl ApiKeyAuthProvider {
         self.resolve_by_store_key(hash_key(&self.secret, token))
     }
 
-    /// Resolve a cert-authenticated agent: its identity is the verified cert
-    /// SAN (`nexus://agent/{name}`), its authorization is the `agent:{name}`
-    /// record minted for it. A valid cert with no record reaches nothing
-    /// (fail-closed) — the cert proves cluster membership, the record grants
-    /// access. Same gates, cache, and revocation path as the token plane.
-    fn resolve_agent_peer(&self, name: &str) -> Result<OperationContext, Status> {
-        self.resolve_by_store_key(crate::mint::agent_store_key(name))
+    /// Resolve a cert-authenticated agent from the cert alone: identity from
+    /// the verified SAN, authorization from the cert's grants extension. No
+    /// credential-store lookup — the CA-signed cert is the single source, so
+    /// this resolves the same on any node the CA reaches, which is what makes
+    /// a cert-agent work cross-node. Reuses `context_from_record` by building a
+    /// transient record from the cert's identity + grants.
+    fn agent_context(
+        name: &str,
+        grants: &contracts::AgentGrants,
+    ) -> Result<OperationContext, Status> {
+        // Zoneless non-admin reaches nothing; refuse it here as the token plane
+        // does, rather than mint a context the gate would only deny.
+        if grants.zone_perms.is_empty() && !grants.is_admin {
+            tracing::warn!(agent = %name, "rejected: agent cert grants no zones and is not admin");
+            return Err(unauthenticated());
+        }
+        let record = AuthKeyRecord {
+            key_id: String::new(),
+            name: name.to_string(),
+            subject_type: SubjectType::Agent,
+            subject_id: name.to_string(),
+            is_admin: grants.is_admin,
+            revoked: false,
+            expires_at_ms: None,
+            zone_perms: grants.zone_perms.clone(),
+        };
+        Ok(Self::context_from_record(&record))
     }
 
     /// The shared credential-resolution path for both planes: cache first,
@@ -313,11 +333,13 @@ impl AuthProvider for ApiKeyAuthProvider {
         // Peer plane first: a verified cluster node needs no token, which is
         // exactly why federation survives a strict provider.
         if let Some(peer) = creds.peer {
-            // An agent-identity cert authenticates as its agent — identity from
-            // the verified SAN, authorization from its `agent:{name}` record. A
-            // node cert is a cluster peer, where membership IS the authorization.
+            // An agent cert authenticates as its agent — identity from the SAN,
+            // authorization from the cert's grants extension, both CA-verified.
+            // No store lookup, so it resolves the same on any node the CA
+            // reaches. A node cert is a cluster peer (membership authorizes).
             if let Some(agent) = &peer.agent_name {
-                return self.resolve_agent_peer(agent);
+                let grants = peer.agent_grants.clone().unwrap_or_default();
+                return Self::agent_context(agent, &grants);
             }
             return Ok(Self::peer_context(peer));
         }
@@ -436,33 +458,29 @@ mod tests {
         assert!(!ctx.is_admin);
     }
 
-    /// A cert-authenticated agent (peer plane, `nexus://agent/{name}` SAN)
-    /// resolves to the same identity a token-plane agent key yields — id and
-    /// grants from its `agent:{name}` record — but via the cert. A verified
-    /// cert with no record reaches nothing (fail-closed).
+    /// A cert-authenticated agent resolves to its id + grants FROM THE CERT
+    /// (`peer.agent_grants`) with no store lookup, so it resolves the same on
+    /// any node the CA reaches. An agent cert that grants nothing reaches
+    /// nothing.
     #[test]
-    fn a_cert_agent_resolves_from_its_record() {
-        let store = MemStore::arc();
-        // The authZ record `auth mint --subject-type agent` writes, keyed by name.
-        store
-            .put(
-                &crate::mint::agent_store_key("mac-ai"),
-                &agent_record().encode().unwrap(),
-            )
-            .unwrap();
-
+    fn a_cert_agent_resolves_from_the_cert_grants() {
         let peer = PeerIdentity {
             common_name: "nexus-agent-mac-ai".into(),
             node_id: None,
             zone_id: None,
             agent_name: Some("mac-ai".into()),
+            agent_grants: Some(contracts::AgentGrants {
+                is_admin: false,
+                zone_perms: vec![("sharedzone".into(), "rw".into())],
+            }),
         };
-        let ctx = provider(Arc::clone(&store))
+        // The store is empty on purpose: resolution reads the cert, not a record.
+        let ctx = provider(MemStore::arc())
             .resolve(&AuthCredentials {
                 token: "",
                 peer: Some(&peer),
             })
-            .expect("cert agent resolves from its record");
+            .expect("cert agent resolves from its cert grants");
 
         assert_eq!(ctx.agent_id.as_deref(), Some("mac-ai"));
         assert_eq!(ctx.subject_type, "agent");
@@ -470,21 +488,19 @@ mod tests {
         assert!(!ctx.is_system, "an agent is never a system caller");
         assert!(!ctx.is_admin);
 
-        // A verified cert with no minted record grants nothing.
-        let ghost = PeerIdentity {
-            common_name: "nexus-agent-ghost".into(),
-            node_id: None,
-            zone_id: None,
-            agent_name: Some("ghost".into()),
+        // An agent cert that grants nothing (no zones, not admin) reaches nothing.
+        let powerless = PeerIdentity {
+            agent_grants: Some(contracts::AgentGrants::default()),
+            ..peer.clone()
         };
         assert!(
-            provider(store)
+            provider(MemStore::arc())
                 .resolve(&AuthCredentials {
                     token: "",
-                    peer: Some(&ghost),
+                    peer: Some(&powerless),
                 })
                 .is_err(),
-            "a cert with no authZ record reaches nothing"
+            "an agent cert granting nothing reaches nothing"
         );
     }
 
@@ -629,6 +645,7 @@ mod tests {
             node_id: Some(42),
             zone_id: Some("sharedzone".into()),
             agent_name: None,
+            agent_grants: None,
         };
         let ctx = provider(MemStore::arc())
             .resolve(&AuthCredentials {

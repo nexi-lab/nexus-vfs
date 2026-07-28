@@ -3426,6 +3426,13 @@ fn run_auth_action(
             if subject_type == auth::SubjectType::Agent {
                 let name = record.subject_id.clone();
                 let zones = record.zone_perms.clone();
+                // Grants ride in the cert (capability), read back by any node
+                // via the CA — the record below is founder-local (uniqueness +
+                // audit), not the resolution path.
+                let grants = contracts::AgentGrants {
+                    is_admin: record.is_admin,
+                    zone_perms: zones.clone(),
+                };
                 let tls_dir = data_dir.join("tls");
                 let ca_pem = std::fs::read(tls_dir.join("ca.pem")).with_context(|| {
                     format!(
@@ -3440,7 +3447,7 @@ fn run_auth_action(
                     )
                 })?;
                 let (cert_pem, key_pem) =
-                    nexus_raft::transport::generate_agent_cert(&name, &ca_pem, &ca_key_pem)
+                    nexus_raft::transport::generate_agent_cert(&name, &grants, &ca_pem, &ca_key_pem)
                         .map_err(|e| anyhow::anyhow!("generate agent cert: {e}"))?;
                 auth::mint_agent_authz(store, record, allow_existing)
                     .map_err(|e| anyhow::anyhow!("mint agent: {e}"))?;

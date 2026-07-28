@@ -46,6 +46,7 @@ pub fn from_request<T>(req: &Request<T>) -> Option<PeerIdentity> {
 /// that parses but carries no recognizable SAN still yields an identity
 /// (CN only), because the chain has already been verified by then.
 pub fn from_der(der: &[u8]) -> Option<PeerIdentity> {
+    use x509_parser::asn1_rs::Oid;
     use x509_parser::prelude::*;
 
     let (_, cert) = X509Certificate::from_der(der).ok()?;
@@ -76,11 +77,23 @@ pub fn from_der(der: &[u8]) -> Option<PeerIdentity> {
         }
     }
 
+    // An agent cert carries its authorization in a capability extension; read
+    // it back so any node has the agent's grants from the cert alone — no
+    // per-node credential store. Present only for an agent cert.
+    let agent_grants = agent_name.as_ref().and_then(|_| {
+        let want = Oid::from(contracts::AGENT_GRANTS_OID).ok()?;
+        cert.extensions()
+            .iter()
+            .find(|ext| ext.oid == want)
+            .map(|ext| contracts::AgentGrants::decode(ext.value))
+    });
+
     Some(PeerIdentity {
         common_name,
         node_id,
         zone_id,
         agent_name,
+        agent_grants,
     })
 }
 
@@ -116,7 +129,12 @@ mod tests {
     #[test]
     fn from_der_recovers_agent_name_from_an_agent_cert() {
         let (ca_pem, ca_key_pem) = generate_zone_ca("sharedzone").unwrap();
-        let (cert_pem, _key) = generate_agent_cert("win-ai", &ca_pem, &ca_key_pem).unwrap();
+        let grants = contracts::AgentGrants {
+            is_admin: false,
+            zone_perms: vec![("sharedzone".into(), "rw".into())],
+        };
+        let (cert_pem, _key) =
+            generate_agent_cert("win-ai", &grants, &ca_pem, &ca_key_pem).unwrap();
 
         let pem = pem::parse(&cert_pem).unwrap();
         let id = from_der(pem.contents()).expect("agent cert must parse");
@@ -125,6 +143,13 @@ mod tests {
         assert_eq!(id.node_id, None, "an agent cert has no node id");
         assert_eq!(id.zone_id, None);
         assert_eq!(id.display_id(), "agent/win-ai");
+        // The capability extension round-trips: any node reads the agent's
+        // grants straight from the cert, no credential-store lookup.
+        assert_eq!(
+            id.agent_grants,
+            Some(grants),
+            "the cert carries the agent's grants"
+        );
     }
 
     /// A cert with no identity SAN (minted before it existed) still
