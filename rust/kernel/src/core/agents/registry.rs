@@ -23,7 +23,6 @@ use uuid::Uuid;
 #[derive(Clone, Debug, Default)]
 pub struct ExternalProcessInfo {
     pub connection_id: String,
-    pub host_pid: Option<i64>,
     pub remote_addr: Option<String>,
     pub protocol: String, // "grpc" | "mcp" | "stdio"
     pub last_heartbeat_ms: Option<u64>,
@@ -840,8 +839,11 @@ impl AgentRegistry {
         Ok(updated)
     }
 
-    /// Register an external (gRPC/MCP) process — UNMANAGED kind, the
-    /// connection_id IS the pid. Returns the new descriptor.
+    /// Register an external (gRPC/MCP) process — UNMANAGED kind. The pid IS the
+    /// OS process id (`contracts::encode_agent_pid`), so `/proc/{pid}`, `ps`,
+    /// `kill` align; `local_id` disambiguates micro-agents sharing one process.
+    /// Falls back to `connection_id` as the pid only when no `host_pid` is known
+    /// (legacy / pure-remote). `connection_id` stays as connection metadata.
     #[allow(clippy::too_many_arguments)]
     pub fn register_external(
         &self,
@@ -850,15 +852,19 @@ impl AgentRegistry {
         zone_id: String,
         connection_id: String,
         host_pid: Option<i64>,
+        local_id: Option<u32>,
         remote_addr: Option<String>,
         protocol: String,
         parent_pid: Option<String>,
         labels: HashMap<String, String>,
     ) -> Result<AgentDescriptor, AgentError> {
         let now = now_ms();
+        let pid = match host_pid {
+            Some(hp) => contracts::encode_agent_pid(hp, local_id),
+            None => connection_id.clone(),
+        };
         let info = ExternalProcessInfo {
-            connection_id: connection_id.clone(),
-            host_pid,
+            connection_id,
             remote_addr,
             protocol,
             last_heartbeat_ms: Some(now),
@@ -869,7 +875,7 @@ impl AgentRegistry {
             zone_id,
             AgentKind::Unmanaged,
             parent_pid,
-            Some(connection_id),
+            Some(pid),
             "/".to_string(),
             Some(info),
             labels,
@@ -1206,17 +1212,19 @@ mod tests {
                 "z".to_string(),
                 "conn-123".to_string(),
                 Some(42),
+                None,
                 Some("1.2.3.4:5".to_string()),
                 "grpc".to_string(),
                 None,
                 HashMap::new(),
             )
             .unwrap();
-        assert_eq!(desc.pid, "conn-123");
+        // pid IS the OS host_pid (42), not the connection_id.
+        assert_eq!(desc.pid, "42");
         assert_eq!(desc.kind, AgentKind::Unmanaged);
         assert!(desc.external_info.is_some());
         // heartbeat ok
-        assert_eq!(reg.heartbeat("conn-123"), Ok(true));
+        assert_eq!(reg.heartbeat("42"), Ok(true));
     }
 
     #[test]
@@ -1248,6 +1256,7 @@ mod tests {
                 "u".to_string(),
                 "z".to_string(),
                 "conn-1".to_string(),
+                None,
                 None,
                 None,
                 "grpc".to_string(),
