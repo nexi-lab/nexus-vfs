@@ -151,6 +151,7 @@
   <strong>Peer docs</strong> &mdash; SSOT-partitioned; this doc links out rather than duplicating.
   <ul style="margin:8px 0 0">
     <li><a href="https://s.shareone.vip/s/nexus-integration-architecture">Nexus Integration Architecture</a> &mdash; sudowork &harr; nexus &harr; sudo-code integration surface (identity, A2A, audit, transport)</li>
+    <li><a href="https://s.shareone.vip/s/nexus-auth-architecture">Nexus Auth Architecture</a> &mdash; credential planes (<code>sk-</code> / mTLS), agent identity, and cross-trust-domain signed authorship</li>
     <li><a href="https://github.com/nexi-lab/nexus-vfs/blob/main/docs/federation-architecture.md">federation-architecture</a> &mdash; Raft, zone topology, gRPC transport</li>
     <li><a href="https://github.com/nexi-lab/nexus-vfs/blob/main/docs/data-storage-matrix.md">data-storage-matrix</a> &mdash; per-data-type pillar mapping</li>
     <li><a href="https://github.com/nexi-lab/nexus-vfs/blob/main/docs/observer-backend-contract.md">observer-backend-contract</a> &mdash; MetadataSync design</li>
@@ -945,6 +946,8 @@ graph TB
     LOC --> VIEW
     LOC --> CONSUMERS
 </pre>
+
+<p>This HAL surface is where the kernel reaches credential records without naming a raft type. The record schema, the two identity planes (<code>sk-</code> token and mTLS peer), agent identity, and cross-trust-domain signed authorship (the mailbox <code>from</code>) are specified in <a href="https://s.shareone.vip/s/nexus-auth-architecture">Nexus Auth Architecture</a>.</p>
 
 <!-- ================================================================ -->
 <h2 id="primitives">4. Kernel Primitives</h2>
