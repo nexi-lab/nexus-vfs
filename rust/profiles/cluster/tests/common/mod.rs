@@ -244,6 +244,33 @@ pub fn cli(env: &[(&str, &str)], args: &[&str]) -> (bool, String, String) {
     )
 }
 
+/// Write a TLS bundle (a shared CA + a fresh node cert with loopback SANs) plus
+/// the persisted `node_id` into `data_dir`, so `bootstrap_tls` finds the bundle
+/// present and reuses it (TLS on, no self-generated CA). One shared CA is what
+/// lets nodes verify each other's client certs — cluster membership — and is
+/// also what an offline `auth mint --cert` reads to sign an agent cert.
+pub fn write_tls_bundle(
+    data_dir: &std::path::Path,
+    node_id: u64,
+    ca: &[u8],
+    ca_key: &[u8],
+    token_hash: &str,
+) {
+    use nexus_raft::transport::generate_node_cert;
+    let tls = data_dir.join("tls");
+    std::fs::create_dir_all(&tls).expect("mkdir tls");
+    let (cert, key) =
+        generate_node_cert(node_id, "root", ca, ca_key, &[], Some("localhost")).expect("node cert");
+    std::fs::write(tls.join("ca.pem"), ca).unwrap();
+    std::fs::write(tls.join("ca-key.pem"), ca_key).unwrap();
+    std::fs::write(tls.join("node.pem"), cert).unwrap();
+    std::fs::write(tls.join("node-key.pem"), key).unwrap();
+    std::fs::write(tls.join("join-token-hash"), token_hash).unwrap();
+    // read_or_mint_node_id reads an 8-byte big-endian u64 (matches the cert's
+    // node/{id} identity SAN so the running node and its cert agree).
+    std::fs::write(data_dir.join(".node_id"), node_id.to_be_bytes()).unwrap();
+}
+
 /// Thin typed wrapper over the VFS gRPC client. Every call carries its bearer
 /// token, so a single connection can exercise many identities (the auth test
 /// pings with valid / empty / unknown / revoked tokens over one channel).
@@ -277,6 +304,48 @@ impl Vfs {
             assert!(
                 Instant::now() < deadline,
                 "port :{port} never authenticated the token within budget"
+            );
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    }
+
+    /// Dial the mTLS plane presenting a client identity cert — an agent's
+    /// `agent.pem` / `agent-key.pem` bundle (as `auth mint --cert` writes),
+    /// chaining to `ca_pem`. The daemon authenticates the caller from the
+    /// client certificate (the peer plane), so calls carry an EMPTY token.
+    /// Polls until the TLS handshake + a bare `Ping` both succeed — the cert
+    /// authenticating IS the readiness gate.
+    pub async fn connect_mtls(
+        port: u16,
+        ca_pem: &[u8],
+        client_cert_pem: &[u8],
+        client_key_pem: &[u8],
+        budget: Duration,
+    ) -> Self {
+        use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
+        let tls = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(ca_pem))
+            .identity(Identity::from_pem(client_cert_pem, client_key_pem))
+            .domain_name(lib::transport_primitives::TlsConfig::CLUSTER_SERVER_NAME);
+        let deadline = Instant::now() + budget;
+        loop {
+            let connected = Endpoint::from_shared(format!("https://127.0.0.1:{port}"))
+                .expect("valid uri")
+                .tls_config(tls.clone())
+                .expect("tls config")
+                .connect()
+                .await;
+            if let Ok(ch) = connected {
+                let mut v = Vfs {
+                    c: NexusVfsServiceClient::new(ch),
+                };
+                if v.ping("").await.is_ok() {
+                    return v;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "port :{port} never authenticated the client cert within budget"
             );
             tokio::time::sleep(Duration::from_millis(300)).await;
         }

@@ -28,35 +28,17 @@
 
 mod common;
 
-use std::path::Path;
 use std::time::Duration;
 
-use common::{await_replicated, free_port, mint_agent_key, Daemon, Vfs, LOG_FILTER};
-use nexus_raft::transport::{generate_join_token, generate_node_cert, generate_zone_ca};
+use common::{
+    await_replicated, free_port, mint_agent_key, write_tls_bundle, Daemon, Vfs, LOG_FILTER,
+};
+use nexus_raft::transport::{generate_join_token, generate_zone_ca};
 
 const ZONE: &str = "sharedzone";
 const MOUNT: &str = "/agents";
 const SECRET: &str = "e2e-fed-mtls-secret";
 const BUDGET: Duration = Duration::from_secs(120);
-
-/// Write a TLS bundle (a shared CA + a fresh node cert with loopback SANs) plus
-/// the persisted `node_id` into `data_dir`, so `bootstrap_tls` finds the bundle
-/// present and reuses it (TLS on, no self-generated CA). All nodes share one CA
-/// so their client certs verify against each other — that IS cluster membership.
-fn write_bundle(data_dir: &Path, node_id: u64, ca: &[u8], ca_key: &[u8], token_hash: &str) {
-    let tls = data_dir.join("tls");
-    std::fs::create_dir_all(&tls).expect("mkdir tls");
-    let (cert, key) =
-        generate_node_cert(node_id, "root", ca, ca_key, &[], Some("localhost")).expect("node cert");
-    std::fs::write(tls.join("ca.pem"), ca).unwrap();
-    std::fs::write(tls.join("ca-key.pem"), ca_key).unwrap();
-    std::fs::write(tls.join("node.pem"), cert).unwrap();
-    std::fs::write(tls.join("node-key.pem"), key).unwrap();
-    std::fs::write(tls.join("join-token-hash"), token_hash).unwrap();
-    // read_or_mint_node_id reads an 8-byte big-endian u64 (matches the cert's
-    // node/{id} identity SAN so the running node and its cert agree).
-    std::fs::write(data_dir.join(".node_id"), node_id.to_be_bytes()).unwrap();
-}
 
 fn founder_env<'a>(
     data: &'a str,
@@ -139,8 +121,8 @@ async fn from_is_unforgeable_across_an_mtls_federation_both_directions() {
     let jid = tmp.path().join("j-id");
     std::fs::create_dir_all(&fdata).unwrap();
     std::fs::create_dir_all(&jdata).unwrap();
-    write_bundle(&fdata, 1, &ca, &ca_key, &hash);
-    write_bundle(&jdata, 2, &ca, &ca_key, &hash);
+    write_tls_bundle(&fdata, 1, &ca, &ca_key, &hash);
+    write_tls_bundle(&jdata, 2, &ca, &ca_key, &hash);
 
     let fdata = fdata.to_string_lossy();
     let fid = fid.to_string_lossy();
