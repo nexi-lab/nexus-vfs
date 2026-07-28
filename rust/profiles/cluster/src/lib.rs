@@ -3446,9 +3446,13 @@ fn run_auth_action(
                         tls_dir.display()
                     )
                 })?;
-                let (cert_pem, key_pem) =
-                    nexus_raft::transport::generate_agent_cert(&name, &grants, &ca_pem, &ca_key_pem)
-                        .map_err(|e| anyhow::anyhow!("generate agent cert: {e}"))?;
+                let (cert_pem, key_pem) = nexus_raft::transport::generate_agent_cert(
+                    &name,
+                    &grants,
+                    &ca_pem,
+                    &ca_key_pem,
+                )
+                .map_err(|e| anyhow::anyhow!("generate agent cert: {e}"))?;
                 auth::mint_agent_authz(store, record, allow_existing)
                     .map_err(|e| anyhow::anyhow!("mint agent: {e}"))?;
 

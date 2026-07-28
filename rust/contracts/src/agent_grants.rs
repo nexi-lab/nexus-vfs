@@ -61,7 +61,10 @@ impl AgentGrants {
         let zone_perms = zones
             .split(',')
             .filter(|z| !z.is_empty())
-            .filter_map(|zp| zp.split_once(':').map(|(z, p)| (z.to_string(), p.to_string())))
+            .filter_map(|zp| {
+                zp.split_once(':')
+                    .map(|(z, p)| (z.to_string(), p.to_string()))
+            })
             .collect();
         Self {
             is_admin: admin == "1",

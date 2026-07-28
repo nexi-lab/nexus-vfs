@@ -135,8 +135,7 @@ pub fn mint_agent_authz(
         )));
     }
     if !allow_existing {
-        if let Some(clash_id) =
-            find_active_subject(store, SubjectType::Agent, &record.subject_id)?
+        if let Some(clash_id) = find_active_subject(store, SubjectType::Agent, &record.subject_id)?
         {
             return Err(AuthKeyStoreError::Backend(format!(
                 "agent {} already has an active credential (key_id={clash_id}); \
