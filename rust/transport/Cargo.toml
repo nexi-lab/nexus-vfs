@@ -40,6 +40,11 @@ sha2 = "0.11"
 # verified (`peer_identity`). Parsing only — cert *minting* stays in
 # `raft::transport::certgen`.
 x509-parser = "0.18"
+# EC P-256 message signing / verification for agent authorship (the signed
+# `from`). `ring` is already the pinned rustls crypto provider.
+ring = "0.17"
+# PEM <-> DER for the agent key + cert (also used by peer_identity tests).
+pem = "3"
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
@@ -59,8 +64,6 @@ tower = { version = "0.5", default-features = false }
 [dev-dependencies]
 tempfile = "3"
 rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
-# peer_identity tests re-parse a certgen-minted PEM back to DER.
-pem = "3"
 # E2E: real tonic client round-trips a request through PluginProxyService.
 # tonic-prost provides ProstCodec for the raw unary path; prost emits the
 # Message derive for the inline EchoMsg type the test exchanges.
