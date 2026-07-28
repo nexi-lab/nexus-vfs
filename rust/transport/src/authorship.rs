@@ -60,7 +60,7 @@ pub fn verify(
         .map_err(|_| "agent cert does not chain to the cluster CA".to_string())?;
 
     // 2. It names an agent (a `nexus://agent/{name}` SAN).
-    let name = agent_name_from_cert(&cert)
+    let name = crate::peer_identity::agent_name_from_x509(&cert)
         .ok_or_else(|| "cert carries no agent identity SAN".to_string())?;
 
     // 3. The signature over `message` is valid under the cert's public key.
@@ -70,20 +70,6 @@ pub fn verify(
         .map_err(|_| "signature does not verify under the agent cert".to_string())?;
 
     Ok(name)
-}
-
-/// The `nexus://agent/{name}` SAN of a parsed cert, if any.
-fn agent_name_from_cert(cert: &x509_parser::certificate::X509Certificate) -> Option<String> {
-    use x509_parser::prelude::*;
-    cert.subject_alternative_name()
-        .ok()
-        .flatten()
-        .and_then(|san| {
-            san.value.general_names.iter().find_map(|gn| match gn {
-                GeneralName::URI(uri) => nexus_raft::transport::parse_agent_identity_uri(uri),
-                _ => None,
-            })
-        })
 }
 
 #[cfg(test)]

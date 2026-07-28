@@ -61,21 +61,21 @@ pub fn from_der(der: &[u8]) -> Option<PeerIdentity> {
 
     // A cert carries at most one identity URI SAN, and the node / agent
     // namespaces are disjoint (nexus://zone/ vs nexus://agent/), so at most
-    // one of these ends up set.
+    // one of node vs agent ends up set.
     let mut zone_id = None;
     let mut node_id = None;
-    let mut agent_name = None;
     if let Some(san) = cert.subject_alternative_name().ok().flatten() {
         for gn in san.value.general_names.iter() {
-            let GeneralName::URI(uri) = gn else { continue };
-            if let Some((z, n)) = parse_node_identity_uri(uri) {
-                zone_id = Some(z);
-                node_id = Some(n);
-            } else if let Some(name) = parse_agent_identity_uri(uri) {
-                agent_name = Some(name);
+            if let GeneralName::URI(uri) = gn {
+                if let Some((z, n)) = parse_node_identity_uri(uri) {
+                    zone_id = Some(z);
+                    node_id = Some(n);
+                }
             }
         }
     }
+    // The agent-identity SAN is read one way (shared with authorship::verify).
+    let agent_name = agent_name_from_x509(&cert);
 
     // An agent cert carries its authorization in a capability extension; read
     // it back so any node has the agent's grants from the cert alone — no
@@ -95,6 +95,24 @@ pub fn from_der(der: &[u8]) -> Option<PeerIdentity> {
         agent_name,
         agent_grants,
     })
+}
+
+/// The `nexus://agent/{name}` SAN of a parsed cert, if any. Shared by
+/// [`from_der`] and `authorship::verify` so the agent-identity SAN is read one
+/// way. `#[inline]` — a thin wrapper over `parse_agent_identity_uri` on the
+/// per-connection auth path, so inline it to keep the shared helper free.
+#[inline]
+pub fn agent_name_from_x509(cert: &x509_parser::certificate::X509Certificate) -> Option<String> {
+    use x509_parser::prelude::*;
+    cert.subject_alternative_name()
+        .ok()
+        .flatten()
+        .and_then(|san| {
+            san.value.general_names.iter().find_map(|gn| match gn {
+                GeneralName::URI(uri) => parse_agent_identity_uri(uri),
+                _ => None,
+            })
+        })
 }
 
 #[cfg(test)]
