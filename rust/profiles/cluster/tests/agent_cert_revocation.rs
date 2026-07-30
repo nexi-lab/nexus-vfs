@@ -57,7 +57,12 @@ fn founder_env<'a>(
     ]
 }
 
-fn joiner_env<'a>(data: &'a str, id: &'a str, adv: &'a str, peers: &'a str) -> Vec<(&'a str, &'a str)> {
+fn joiner_env<'a>(
+    data: &'a str,
+    id: &'a str,
+    adv: &'a str,
+    peers: &'a str,
+) -> Vec<(&'a str, &'a str)> {
     vec![
         ("NEXUS_DATA_DIR", data),
         ("NEXUS_IDENTITY_DIR", id),
@@ -178,7 +183,10 @@ async fn a_revoked_agent_cert_is_rejected_on_a_peer_node_after_crl_refresh() {
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
-    assert!(replicated, "health.txt did not replicate to the joiner within budget");
+    assert!(
+        replicated,
+        "health.txt did not replicate to the joiner within budget"
+    );
 
     // ── 4. BEFORE: both agents write on the JOINER — resolved from the cert ──
     let mut wc = Vfs::connect_mtls(jport, &ca, &win_cert, &win_key, BUDGET).await;

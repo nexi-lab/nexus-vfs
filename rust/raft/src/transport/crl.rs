@@ -85,8 +85,8 @@ pub fn crl_revoked_serials(crl_pem: &[u8], ca_cert_pem: &[u8]) -> Result<Vec<Vec
     let (_, ca_cert) =
         X509Certificate::from_der(ca.contents()).map_err(|e| format!("CA DER: {e}"))?;
     let crl = ::pem::parse(crl_pem).map_err(|e| format!("CRL PEM: {e}"))?;
-    let (_, crl) = CertificateRevocationList::from_der(crl.contents())
-        .map_err(|e| format!("CRL DER: {e}"))?;
+    let (_, crl) =
+        CertificateRevocationList::from_der(crl.contents()).map_err(|e| format!("CRL DER: {e}"))?;
     crl.verify_signature(ca_cert.public_key())
         .map_err(|e| format!("CRL not signed by cluster CA: {e}"))?;
     Ok(crl
@@ -136,8 +136,7 @@ pub fn add_revoked_serial(path: &Path, serial: &[u8]) -> Result<(), String> {
         .collect::<Vec<_>>()
         .join("\n");
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("create {}: {e}", parent.display()))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
     std::fs::write(path, format!("{body}\n")).map_err(|e| format!("write {}: {e}", path.display()))
 }
@@ -181,7 +180,10 @@ mod tests {
     fn revoked_serial_file_round_trips_and_dedups() {
         let tmp = tempfile::tempdir().unwrap();
         let path = revoked_serials_path(tmp.path());
-        assert!(read_revoked_serials(&path).is_empty(), "absent file is empty");
+        assert!(
+            read_revoked_serials(&path).is_empty(),
+            "absent file is empty"
+        );
 
         add_revoked_serial(&path, &[1, 2, 3]).unwrap();
         add_revoked_serial(&path, &[4, 5, 6]).unwrap();

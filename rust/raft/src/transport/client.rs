@@ -9,9 +9,8 @@ use super::proto::nexus::raft::{
     zone_transport_service_client::ZoneTransportServiceClient, AcquireLock, DeleteMetadata,
     DeleteZoneRequest, DiscoverZonesRequest, EcReplicationEntry, ExtendLock, GetClusterInfoRequest,
     GetCrlRequest, GetLockInfo, GetMetadata, JoinClusterRequest, JoinZoneRequest, ListMetadata,
-    ProposeRequest,
-    PutMetadata, QueryRequest, RaftCommand, RaftQuery, ReleaseLock, RemoveVoterRequest,
-    ReplicateEntriesRequest, SnapshotEcStateRequest, StepMessageRequest,
+    ProposeRequest, PutMetadata, QueryRequest, RaftCommand, RaftQuery, ReleaseLock,
+    RemoveVoterRequest, ReplicateEntriesRequest, SnapshotEcStateRequest, StepMessageRequest,
 };
 use super::{NodeAddress, Result, TransportError};
 use std::collections::HashMap;

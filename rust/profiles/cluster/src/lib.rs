@@ -3373,7 +3373,10 @@ fn revoke_agent_cert(data_dir: &std::path::Path, name: &str) -> Result<()> {
     nexus_raft::transport::add_revoked_serial(&path, &serial)
         .map_err(|e| anyhow::anyhow!("record revoked serial: {e}"))?;
     let serial_hex: String = serial.iter().map(|b| format!("{b:02x}")).collect();
-    eprintln!("revoked agent cert subject=agent:{name} serial={serial_hex} -> {}", path.display());
+    eprintln!(
+        "revoked agent cert subject=agent:{name} serial={serial_hex} -> {}",
+        path.display()
+    );
     println!("revoked");
     Ok(())
 }

@@ -15,13 +15,12 @@ use super::proto::nexus::raft::{
     ClusterConfig as ProtoClusterConfig, DeleteZoneRequest, DeleteZoneResponse,
     DiscoverZonesRequest, DiscoverZonesResponse, FederationZoneInfo, GetClusterInfoRequest,
     GetClusterInfoResponse, GetCrlRequest, GetCrlResponse, GetMetadataResult,
-    GetSearchCapabilitiesRequest, JoinClusterRequest,
-    JoinClusterResponse, JoinZoneRequest, JoinZoneResponse, ListMetadataResult, LockInfoResult,
-    LockResult, NodeInfo as ProtoNodeInfo, ProposeRequest, ProposeResponse, QueryRequest,
-    QueryResponse, RaftCommand, RaftQueryResponse, RaftResponse, ReadBlobRequest, ReadBlobResponse,
-    RemoveVoterRequest, RemoveVoterResponse, ReplicateEntriesRequest, ReplicateEntriesResponse,
-    SearchCapabilities, SnapshotEcStateRequest, SnapshotEcStateResponse, StepMessageRequest,
-    StepMessageResponse,
+    GetSearchCapabilitiesRequest, JoinClusterRequest, JoinClusterResponse, JoinZoneRequest,
+    JoinZoneResponse, ListMetadataResult, LockInfoResult, LockResult, NodeInfo as ProtoNodeInfo,
+    ProposeRequest, ProposeResponse, QueryRequest, QueryResponse, RaftCommand, RaftQueryResponse,
+    RaftResponse, ReadBlobRequest, ReadBlobResponse, RemoveVoterRequest, RemoveVoterResponse,
+    ReplicateEntriesRequest, ReplicateEntriesResponse, SearchCapabilities, SnapshotEcStateRequest,
+    SnapshotEcStateResponse, StepMessageRequest, StepMessageResponse,
 };
 use super::{NodeAddress, Result, SharedPeerMap, TransportError};
 use crate::blob_fetcher::BlobFetcherSlot;
