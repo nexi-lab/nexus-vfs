@@ -456,15 +456,22 @@ enum AuthCmd {
         #[arg(long)]
         allow_existing: bool,
     },
-    /// Revoke a key. Takes the key itself, or its hash from `auth list`.
+    /// Revoke a credential — an `sk-` key (by key or hash), or an agent cert
+    /// (by name).
     Revoke {
         /// The `sk-` key, if you hold it.
-        #[arg(long, conflicts_with = "key_hash")]
+        #[arg(long, conflicts_with_all = ["key_hash", "agent"])]
         key: Option<String>,
         /// The key's hash, as shown by `auth list` — the shape an admin uses,
         /// working from the audit view rather than from a key they do not have.
-        #[arg(long, conflicts_with = "key")]
+        #[arg(long, conflicts_with_all = ["key", "agent"])]
         key_hash: Option<String>,
+        /// The agent NAME, to revoke its cert instead of an `sk-` key. Reads the
+        /// serial from the minted bundle and adds it to the cluster CRL (the CA
+        /// plane), so it takes effect on every node after a CRL refresh. This
+        /// path is file-based — no store lock — so it works while the daemon runs.
+        #[arg(long, conflicts_with_all = ["key", "key_hash"])]
+        agent: Option<String>,
     },
     /// List every credential: hash, subject, zones, expiry.
     List,
@@ -1442,6 +1449,10 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
             // enrollee persists what it receives, so nothing is written here.
             // `None` ⇒ auth-off: the response omits it and joiners stay auth-off too.
             let api_key_secret = effective_api_key_secret(&tls_dir);
+            // The founder holds the CA, so it also serves the CRL: GetCrl reads
+            // this file live and CA-signs a fresh CRL, so an offline `auth
+            // revoke` takes effect without a restart.
+            let revoked_path = nexus_raft::transport::revoked_serials_path(&common.data_dir);
             zm.runtime_handle().spawn(async move {
                 if let Err(e) = nexus_raft::transport::serve_node_enrollment(
                     addr,
@@ -1449,6 +1460,7 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
                     ca_key_pem,
                     join_token_hash.trim().to_string(),
                     api_key_secret,
+                    Some(revoked_path),
                     std::future::pending::<()>(),
                 )
                 .await
@@ -1485,6 +1497,29 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
                 ),
             }
         }
+    }
+
+    // CRL refresh: keep this node's revoked-serial set current from the CA
+    // plane (not raft). Only when auth is on — auth-off has no cert-agents to
+    // revoke. The founder holds the revoked-serial file and reads it directly;
+    // a joiner fetches the CA-signed CRL from the founder's enroll addr (derived
+    // from the first peer the way boot-time enrollment is) and verifies it.
+    if let Some(provider) = api_key_auth.clone() {
+        let ca_key_holder = common.data_dir.join("tls").join("ca-key.pem").exists();
+        let founder_enroll = if ca_key_holder {
+            None
+        } else {
+            NodeAddress::parse_peer_list_operator(&common.peers, !common.no_tls)
+                .ok()
+                .and_then(|peers| peers.into_iter().next())
+                .and_then(|peer| enroll_port_addr(&peer.to_operator_str()).ok())
+        };
+        zm.runtime_handle().spawn(crl_refresh_loop(
+            provider,
+            common.data_dir.clone(),
+            ca_key_holder,
+            founder_enroll,
+        ));
     }
 
     // Bring root zone online based on declared mode.
@@ -3251,12 +3286,96 @@ async fn run_auth(common: CommonArgs, action: AuthCmd) -> Result<()> {
 /// it runs on the blocking pool. Owns the ZoneManager start to finish so its
 /// nested runtime is created and dropped off the async worker threads.
 fn run_auth_blocking(common: CommonArgs, action: AuthCmd) -> Result<()> {
+    // Agent-cert revocation is file-based (no redb): it appends the cert's
+    // serial to the founder's revoked-serial file, which the running GetCrl
+    // endpoint reads live. So it takes no store lock and works while the daemon
+    // is up — unlike the `sk-` paths below, which open the replicated store.
+    if let AuthCmd::Revoke {
+        agent: Some(name), ..
+    } = &action
+    {
+        return revoke_agent_cert(&common.data_dir, name);
+    }
     let (zm, store, secret) = open_auth_store(&common)?;
     let result = run_auth_action(&store, &secret, &common.data_dir, action);
     // Release the data directory's lock before returning, or a daemon started
     // right after this exits fails to open redb.
     zm.shutdown();
     result
+}
+
+/// Keep the auth provider's revoked-serial set current from the cluster CRL —
+/// the CA's own trust plane, orthogonal to raft. The founder reads its
+/// revoked-serial file directly (it is the SSOT); a joiner fetches the
+/// CA-signed CRL from the founder's enroll addr and verifies it against its own
+/// CA before applying it, so a forged CRL can neither un-revoke nor falsely
+/// revoke. A fetch or verify failure keeps the last known set rather than
+/// clearing it — a transient founder outage must not un-revoke an agent.
+async fn crl_refresh_loop(
+    provider: std::sync::Arc<auth::ApiKeyAuthProvider>,
+    data_dir: std::path::PathBuf,
+    ca_key_holder: bool,
+    founder_enroll: Option<String>,
+) {
+    const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+    let ca_path = data_dir.join("tls").join("ca.pem");
+    loop {
+        let serials: Option<Vec<Vec<u8>>> = if ca_key_holder {
+            let path = nexus_raft::transport::revoked_serials_path(&data_dir);
+            Some(nexus_raft::transport::read_revoked_serials(&path))
+        } else if let Some(addr) = &founder_enroll {
+            match nexus_raft::transport::call_get_crl(addr, 10).await {
+                Ok(crl) => match std::fs::read(&ca_path) {
+                    Ok(ca) => match nexus_raft::transport::crl_revoked_serials(&crl, &ca) {
+                        Ok(s) => Some(s),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "CRL failed CA verification; keeping current set");
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        tracing::debug!(error = %e, "CRL refresh: CA cert unreadable");
+                        None
+                    }
+                },
+                Err(e) => {
+                    tracing::debug!(error = %e, "CRL fetch failed; keeping current set");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(serials) = serials {
+            provider.set_revoked_serials(serials.into_iter().collect());
+        }
+        tokio::time::sleep(REFRESH_INTERVAL).await;
+    }
+}
+
+/// Revoke an agent's cert: read its serial from the minted bundle and append it
+/// to the founder's revoked-serial file (the CA-plane CRL source). File-based,
+/// so it needs no store lock; the founder's GetCrl serves the updated CRL and
+/// every node drops the agent after its next CRL refresh. Runs on the founder,
+/// where the bundle was minted and the CA lives.
+fn revoke_agent_cert(data_dir: &std::path::Path, name: &str) -> Result<()> {
+    let cert_path = data_dir.join("agents").join(name).join("agent.pem");
+    let cert_pem = std::fs::read(&cert_path).with_context(|| {
+        format!(
+            "revoke agent {name}: read {} — revocation runs on the founder, where the cert \
+             bundle was minted",
+            cert_path.display()
+        )
+    })?;
+    let serial = nexus_raft::transport::serial_from_cert_pem(&cert_pem)
+        .map_err(|e| anyhow::anyhow!("read serial from {}: {e}", cert_path.display()))?;
+    let path = nexus_raft::transport::revoked_serials_path(data_dir);
+    nexus_raft::transport::add_revoked_serial(&path, &serial)
+        .map_err(|e| anyhow::anyhow!("record revoked serial: {e}"))?;
+    let serial_hex: String = serial.iter().map(|b| format!("{b:02x}")).collect();
+    eprintln!("revoked agent cert subject=agent:{name} serial={serial_hex} -> {}", path.display());
+    println!("revoked");
+    Ok(())
 }
 
 fn run_auth_action(
@@ -3418,13 +3537,19 @@ fn run_auth_action(
             eprintln!("This key will not be shown again - it is stored only as an HMAC.");
             Ok(())
         }
-        AuthCmd::Revoke { key, key_hash } => {
+        // `agent` is handled file-based in `run_auth_blocking` before the store
+        // opens, so here it is always `None`.
+        AuthCmd::Revoke {
+            key,
+            key_hash,
+            agent: _,
+        } => {
             let removed = match (key, key_hash) {
                 (Some(key), None) => auth::revoke_key(store, secret, &key),
                 (None, Some(hash)) => auth::revoke_key_hash(store, &hash),
                 _ => {
                     return Err(anyhow::anyhow!(
-                        "revoke: pass exactly one of --key or --key-hash"
+                        "revoke: pass exactly one of --key, --key-hash, or --agent"
                     ))
                 }
             }

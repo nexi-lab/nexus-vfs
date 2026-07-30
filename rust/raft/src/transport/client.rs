@@ -8,7 +8,8 @@ use super::proto::nexus::raft::{
     zone_api_service_client::ZoneApiServiceClient,
     zone_transport_service_client::ZoneTransportServiceClient, AcquireLock, DeleteMetadata,
     DeleteZoneRequest, DiscoverZonesRequest, EcReplicationEntry, ExtendLock, GetClusterInfoRequest,
-    GetLockInfo, GetMetadata, JoinClusterRequest, JoinZoneRequest, ListMetadata, ProposeRequest,
+    GetCrlRequest, GetLockInfo, GetMetadata, JoinClusterRequest, JoinZoneRequest, ListMetadata,
+    ProposeRequest,
     PutMetadata, QueryRequest, RaftCommand, RaftQuery, ReleaseLock, RemoveVoterRequest,
     ReplicateEntriesRequest, SnapshotEcStateRequest, StepMessageRequest,
 };
@@ -817,6 +818,39 @@ pub async fn call_join_cluster(
         node_key_pem: response.node_key_pem,
         api_key_secret: response.api_key_secret,
     })
+}
+
+/// Fetch the cluster's current CA-signed CRL from a node's enrollment listener.
+///
+/// Plaintext + tokenless, like [`call_join_cluster`]: the CRL is a public,
+/// CA-signed artifact, so the caller trusts it by verifying the CA signature
+/// (`certgen::crl_revoked_serials`), not by trusting the channel. Returns the
+/// CRL PEM bytes.
+pub async fn call_get_crl(enroll_addr: &str, timeout_secs: u64) -> Result<Vec<u8>> {
+    // The enroll plane is plaintext h2c; callers pass a bare `host:port` (the
+    // `enroll_port_addr` form), so give it a scheme for the URI parse.
+    let uri = if enroll_addr.contains("://") {
+        enroll_addr.to_string()
+    } else {
+        format!("http://{enroll_addr}")
+    };
+    let ep = Endpoint::from_shared(uri)
+        .map_err(|e| TransportError::InvalidAddress(e.to_string()))?
+        .connect_timeout(Duration::from_secs(timeout_secs))
+        .timeout(Duration::from_secs(timeout_secs));
+
+    let channel = ep
+        .connect()
+        .await
+        .map_err(|e| TransportError::Connection(format!("GetCrl connect failed: {e}")))?;
+
+    let response = NodeEnrollmentServiceClient::new(channel)
+        .get_crl(GetCrlRequest {})
+        .await
+        .map_err(|e| TransportError::Rpc(format!("GetCrl RPC failed: {e}")))?
+        .into_inner();
+
+    Ok(response.crl_pem)
 }
 
 /// Outcome of a [`call_join_zone_rpc`] invocation.

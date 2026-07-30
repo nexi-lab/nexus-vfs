@@ -55,9 +55,9 @@ pub fn parse_node_identity_uri(uri: &str) -> Option<(String, u64)> {
 }
 
 /// Parse a cluster CA (cert + private key, both PEM) into an rcgen `Issuer`
-/// ready to sign leaf certs. Shared by node and agent cert generation so the
-/// CA-loading boilerplate has one home.
-fn ca_issuer_from_pem(
+/// ready to sign leaf certs. Shared by node/agent cert generation and CRL
+/// signing (`super::crl`) so the CA-loading boilerplate has one home.
+pub(super) fn ca_issuer_from_pem(
     ca_cert_pem: &[u8],
     ca_key_pem: &[u8],
 ) -> Result<Issuer<'static, KeyPair>, String> {
@@ -260,80 +260,6 @@ pub fn generate_agent_cert(
         agent_cert.pem().into_bytes(),
         agent_key_pair.serialize_pem().into_bytes(),
     ))
-}
-
-/// The raw serial-number bytes of a certificate (PEM in). An agent cert's
-/// serial is what the CRL revokes and what `resolve` matches a presented cert
-/// against, so both the mint side (recording a serial) and the resolve side
-/// read it back the same way here.
-pub fn serial_from_cert_pem(cert_pem: &[u8]) -> Result<Vec<u8>, String> {
-    use x509_parser::prelude::*;
-    let pem = ::pem::parse(cert_pem).map_err(|e| format!("cert PEM: {e}"))?;
-    let (_, cert) =
-        X509Certificate::from_der(pem.contents()).map_err(|e| format!("cert DER: {e}"))?;
-    Ok(cert.raw_serial().to_vec())
-}
-
-/// Build a CA-signed X.509 Certificate Revocation List over `revoked_serials`
-/// (each an agent cert's raw serial bytes, as from [`serial_from_cert_pem`]).
-///
-/// The CRL is the CA's own trust plane: because it is signed by the cluster CA,
-/// any node holding only the CA cert can verify it and read the revoked set
-/// (see [`crl_revoked_serials`]) — so it distributes like the CA itself,
-/// orthogonal to raft. `crl_number` must only grow across successive CRLs so a
-/// stale one is detectable.
-pub fn generate_crl(
-    revoked_serials: &[Vec<u8>],
-    crl_number: u64,
-    ca_cert_pem: &[u8],
-    ca_key_pem: &[u8],
-) -> Result<Vec<u8>, String> {
-    use rcgen::{
-        CertificateRevocationListParams, RevocationReason, RevokedCertParams, SerialNumber,
-    };
-    let ca_issuer = ca_issuer_from_pem(ca_cert_pem, ca_key_pem)?;
-    let now = time::OffsetDateTime::now_utc();
-    let revoked_certs = revoked_serials
-        .iter()
-        .map(|s| RevokedCertParams {
-            serial_number: SerialNumber::from(s.clone()),
-            revocation_time: now,
-            reason_code: Some(RevocationReason::Unspecified),
-            invalidity_date: None,
-        })
-        .collect();
-    let params = CertificateRevocationListParams {
-        this_update: now,
-        next_update: now + time::Duration::days(NODE_CERT_VALIDITY_DAYS),
-        crl_number: SerialNumber::from(crl_number),
-        issuing_distribution_point: None,
-        revoked_certs,
-        key_identifier_method: rcgen::KeyIdMethod::Sha256,
-    };
-    let crl = params
-        .signed_by(&ca_issuer)
-        .map_err(|e| format!("Failed to sign CRL: {e}"))?;
-    Ok(crl.pem().map_err(|e| format!("CRL PEM: {e}"))?.into_bytes())
-}
-
-/// Verify a CRL against the cluster CA and return the revoked serials (raw
-/// bytes). A CRL not signed by the CA is rejected — that signature is exactly
-/// what lets a node trust a CRL fetched over the plaintext CA plane, the same
-/// way it trusts a cert.
-pub fn crl_revoked_serials(crl_pem: &[u8], ca_cert_pem: &[u8]) -> Result<Vec<Vec<u8>>, String> {
-    use x509_parser::prelude::*;
-    let ca = ::pem::parse(ca_cert_pem).map_err(|e| format!("CA PEM: {e}"))?;
-    let (_, ca_cert) =
-        X509Certificate::from_der(ca.contents()).map_err(|e| format!("CA DER: {e}"))?;
-    let crl = ::pem::parse(crl_pem).map_err(|e| format!("CRL PEM: {e}"))?;
-    let (_, crl) = CertificateRevocationList::from_der(crl.contents())
-        .map_err(|e| format!("CRL DER: {e}"))?;
-    crl.verify_signature(ca_cert.public_key())
-        .map_err(|e| format!("CRL not signed by cluster CA: {e}"))?;
-    Ok(crl
-        .iter_revoked_certificates()
-        .map(|rc| rc.raw_serial().to_vec())
-        .collect())
 }
 
 /// Generate a self-signed root CA certificate for a zone.
@@ -680,37 +606,6 @@ mod tests {
         // The node and agent identity namespaces are disjoint.
         assert_eq!(parse_node_identity_uri("nexus://agent/win-ai"), None);
         assert_eq!(parse_agent_identity_uri("nexus://zone/root/node/7"), None);
-    }
-
-    /// The revocation round-trip: an agent cert's serial is recoverable, a
-    /// CA-signed CRL over it verifies against the CA and yields that serial
-    /// back, and a CRL signed by a foreign CA is rejected — the CA signature is
-    /// the whole trust of the CRL, exactly as it is for a cert.
-    #[test]
-    fn crl_over_an_agent_serial_verifies_only_under_its_ca() {
-        let (ca_pem, ca_key_pem) = generate_test_ca();
-        let (cert_pem, _key) =
-            generate_agent_cert("win-ai", ca_pem.as_bytes(), ca_key_pem.as_bytes()).unwrap();
-        let serial = serial_from_cert_pem(&cert_pem).expect("read the cert serial");
-        assert!(!serial.is_empty(), "a cert carries a non-empty serial");
-
-        let crl = generate_crl(&[serial.clone()], 1, ca_pem.as_bytes(), ca_key_pem.as_bytes())
-            .expect("sign the CRL");
-        let revoked = crl_revoked_serials(&crl, ca_pem.as_bytes()).expect("verify under the CA");
-        assert!(
-            revoked.iter().any(|s| s == &serial),
-            "the revoked serial round-trips through the CRL"
-        );
-
-        // A CRL minted by a foreign CA claiming the same serial is rejected —
-        // only the cluster CA can author a CRL a node will honor.
-        let (evil_ca, evil_key) = generate_test_ca();
-        let forged =
-            generate_crl(&[serial], 1, evil_ca.as_bytes(), evil_key.as_bytes()).unwrap();
-        assert!(
-            crl_revoked_serials(&forged, ca_pem.as_bytes()).is_err(),
-            "a foreign-CA CRL fails signature verification against the cluster CA"
-        );
     }
 
     /// Every node cert must carry the fixed cluster server name as a DNS SAN —
