@@ -11,7 +11,7 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```text
 //! use nexus_raft::storage::RedbStore;
 //!
 //! let store = RedbStore::open("/tmp/mydb").unwrap();

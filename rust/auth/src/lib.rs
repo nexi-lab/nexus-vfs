@@ -33,7 +33,7 @@
 //!
 //! ## Wiring it (composition root)
 //!
-//! ```rust,ignore
+//! ```text
 //! let store = RaftAuthKeyStore::new_arc(root_zone_consensus, runtime);
 //! kernel.set_auth_key_store(Arc::clone(&store));   // for /__sys__/auth/keys/
 //!
