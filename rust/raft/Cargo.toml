@@ -74,6 +74,7 @@ dashmap = { version = "6", optional = true }
 time = { version = "0.3", features = ["parsing"], optional = true }
 sha2 = { version = "0.11", optional = true }  # SHA-256 for JoinCluster token verification
 rcgen = { version = "0.14", features = ["pem", "x509-parser"], optional = true }  # Server-side node cert generation for JoinCluster
+x509-parser = { version = "0.18", optional = true }  # Read a cert serial + verify a CA-signed CRL (agent-cert revocation)
 pem = { version = "3", optional = true }  # PEM parsing for CA fingerprint verification
 base64 = { version = "0.22", optional = true }  # Base64 encoding for CA fingerprint
 rand = { version = "0.10", optional = true }  # Random join-token password generation
@@ -91,8 +92,6 @@ protoc-bin-vendored = "3"
 [dev-dependencies]
 tokio-test = "0.4"
 regex = { workspace = true }
-# Assert the identity URI SAN is really pinned into a minted node cert.
-x509-parser = "0.18"
 
 [features]
 default = ["full"]
@@ -110,6 +109,6 @@ consensus = ["raft", "protobuf", "slog", "async"]
 # Enable gRPC transport (tonic + protobuf) — EXPERIMENTAL, default OFF.
 # Requires `consensus` feature. Not used in production.
 # See: docs/rfcs/adr-raft-sled-strategy.md (Decision 4)
-grpc = ["tonic", "prost", "tonic-prost", "lib/transport", "lib", "bytes", "dep:tonic-prost-build", "async", "tracing-subscriber", "consensus", "dashmap", "time", "sha2", "rcgen", "pem", "base64", "gethostname", "rand"]
+grpc = ["tonic", "prost", "tonic-prost", "lib/transport", "lib", "bytes", "dep:tonic-prost-build", "async", "tracing-subscriber", "consensus", "dashmap", "time", "sha2", "rcgen", "x509-parser", "pem", "base64", "gethostname", "rand"]
 
 full = ["grpc", "consensus"]

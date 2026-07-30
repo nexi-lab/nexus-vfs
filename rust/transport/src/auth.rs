@@ -59,6 +59,10 @@ pub struct PeerIdentity {
     /// there is nothing else to read from it — a valid agent is a mailbox
     /// principal, full stop.
     pub agent_name: Option<String>,
+    /// The certificate's raw serial-number bytes. For an agent cert this is
+    /// what revocation names: `resolve` rejects a peer whose serial is in the
+    /// cluster CA's signed CRL. Every X.509 cert carries a serial.
+    pub serial: Vec<u8>,
 }
 
 impl PeerIdentity {
@@ -160,6 +164,7 @@ mod tests {
             node_id: Some(7),
             zone_id: Some("root".into()),
             agent_name: None,
+            serial: vec![],
         };
         assert_eq!(named.display_id(), "node/7");
 
@@ -168,6 +173,7 @@ mod tests {
             node_id: None,
             zone_id: None,
             agent_name: None,
+            serial: vec![],
         };
         assert_eq!(legacy.display_id(), "nexus-zone-root-node-win");
 
@@ -176,6 +182,7 @@ mod tests {
             node_id: None,
             zone_id: None,
             agent_name: Some("win-ai".into()),
+            serial: vec![],
         };
         assert_eq!(agent.display_id(), "agent/win-ai");
     }

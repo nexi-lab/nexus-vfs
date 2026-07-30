@@ -51,7 +51,8 @@
 //! `PutAuthKey` / `DeleteAuthKey` commits — on **every** replica, since the
 //! command replicates. The TTL is the backstop, not the mechanism.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
@@ -117,6 +118,11 @@ pub struct ApiKeyAuthProvider {
     secret: String,
     cache: DashMap<String, CachedContext>,
     cache_ttl: Duration,
+    /// Raw serials of revoked agent certs — the current cluster CRL, projected
+    /// to a lookup set. `resolve` rejects an agent whose cert serial is in here.
+    /// The composition root refreshes it from the CA-signed CRL (the CA's own
+    /// trust plane, orthogonal to raft); empty until the first refresh.
+    revoked_serials: RwLock<HashSet<Vec<u8>>>,
 }
 
 impl ApiKeyAuthProvider {
@@ -134,7 +140,23 @@ impl ApiKeyAuthProvider {
             secret: secret.into(),
             cache: DashMap::new(),
             cache_ttl,
+            revoked_serials: RwLock::new(HashSet::new()),
         }
+    }
+
+    /// Replace the revoked-serial set with the latest CRL projection. Called by
+    /// the composition root's CRL refresh; a swap, so a `resolve` in flight
+    /// sees either the whole old set or the whole new one.
+    pub fn set_revoked_serials(&self, serials: HashSet<Vec<u8>>) {
+        *self.revoked_serials.write().expect("revoked-serials lock") = serials;
+    }
+
+    /// Whether an agent cert with this serial has been revoked (is in the CRL).
+    fn is_revoked(&self, serial: &[u8]) -> bool {
+        self.revoked_serials
+            .read()
+            .expect("revoked-serials lock")
+            .contains(serial)
     }
 
     /// Drop one cached context. Called from the apply-observer when a
@@ -342,6 +364,14 @@ impl AuthProvider for ApiKeyAuthProvider {
             // same on any node the CA reaches. A node cert is a cluster peer
             // (membership authorizes).
             if let Some(agent) = &peer.agent_name {
+                // Revocation is the one thing a valid chain does not settle: a
+                // stolen key still chains to the CA. The CRL closes that — an
+                // agent whose serial the CA revoked is rejected on every node
+                // that has refreshed the list.
+                if self.is_revoked(&peer.serial) {
+                    tracing::warn!(agent = %agent, "rejected: agent cert is revoked (in CRL)");
+                    return Err(unauthenticated());
+                }
                 return Ok(Self::agent_context(agent));
             }
             return Ok(Self::peer_context(peer));
@@ -473,6 +503,7 @@ mod tests {
             node_id: None,
             zone_id: None,
             agent_name: Some("mac-ai".into()),
+            serial: vec![1, 2, 3],
         };
         // The store is empty on purpose: resolution reads the cert, not a record.
         let ctx = provider(MemStore::arc())
@@ -490,6 +521,43 @@ mod tests {
         );
         assert!(!ctx.is_system, "an agent is never a system caller");
         assert!(!ctx.is_admin, "an agent is never an admin");
+    }
+
+    /// A CA-verified agent cert is rejected once its serial is in the CRL —
+    /// a valid chain no longer suffices, which is the whole point of revocation
+    /// (a stolen key still chains to the CA). Un-revoking (a later CRL without
+    /// the serial) lets it back in.
+    #[test]
+    fn a_revoked_agent_cert_is_rejected() {
+        let peer = PeerIdentity {
+            common_name: "nexus-agent-mac-ai".into(),
+            node_id: None,
+            zone_id: None,
+            agent_name: Some("mac-ai".into()),
+            serial: vec![9, 9, 9],
+        };
+        let provider = provider(MemStore::arc());
+        let creds = || AuthCredentials {
+            token: "",
+            peer: Some(&peer),
+        };
+
+        // Before revocation: the cert resolves.
+        assert!(provider.resolve(&creds()).is_ok(), "a fresh cert resolves");
+
+        // The CRL now names this serial → rejected on this node.
+        provider.set_revoked_serials(HashSet::from([vec![9, 9, 9]]));
+        assert!(
+            provider.resolve(&creds()).is_err(),
+            "a revoked serial is rejected even though the chain is valid"
+        );
+
+        // A different revoked serial does not touch this cert.
+        provider.set_revoked_serials(HashSet::from([vec![1, 2, 3]]));
+        assert!(
+            provider.resolve(&creds()).is_ok(),
+            "only the listed serial is revoked"
+        );
     }
 
     /// A user key carries no `agent_id`, so its holder cannot author agent
@@ -633,6 +701,7 @@ mod tests {
             node_id: Some(42),
             zone_id: Some("sharedzone".into()),
             agent_name: None,
+            serial: vec![],
         };
         let ctx = provider(MemStore::arc())
             .resolve(&AuthCredentials {

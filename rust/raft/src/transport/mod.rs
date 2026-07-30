@@ -43,8 +43,9 @@
 pub(crate) mod certgen;
 #[cfg(all(feature = "grpc", has_protos))]
 pub use certgen::{
-    bootstrap_tls, generate_agent_cert, generate_join_token, generate_node_cert, generate_zone_ca,
-    node_identity_uri, parse_node_identity_uri, BootstrapTls,
+    bootstrap_tls, crl_revoked_serials, generate_agent_cert, generate_crl, generate_join_token,
+    generate_node_cert, generate_zone_ca, node_identity_uri, parse_node_identity_uri,
+    serial_from_cert_pem, BootstrapTls,
 };
 #[cfg(all(feature = "grpc", has_protos))]
 mod client;

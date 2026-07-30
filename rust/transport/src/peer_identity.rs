@@ -80,11 +80,16 @@ pub fn from_der(der: &[u8]) -> Option<PeerIdentity> {
     // cert is a pure identity — there is no authorization extension to read.
     let agent_name = agent_name_from_x509(&cert);
 
+    // The serial is what a CRL revokes; carry it so the provider can reject a
+    // revoked agent cert (the raw bytes match `certgen::serial_from_cert_pem`).
+    let serial = cert.raw_serial().to_vec();
+
     Some(PeerIdentity {
         common_name,
         node_id,
         zone_id,
         agent_name,
+        serial,
     })
 }
 
