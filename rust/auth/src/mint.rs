@@ -99,6 +99,57 @@ pub fn mint_key(
     })
 }
 
+/// The store key for an agent's authorization record.
+///
+/// An agent authenticates by its CA-signed identity cert
+/// (`certgen::generate_agent_cert`), not by an `sk-` token, so its record is
+/// keyed by the agent name rather than a key-hash. The `agent:` prefix keeps
+/// this namespace disjoint from the hex `key_hash` keys [`mint_key`] writes,
+/// so the two credential kinds share one store without collision.
+pub fn agent_store_key(name: &str) -> String {
+    format!("agent:{name}")
+}
+
+/// Record the authorization grants for a cert-authenticated agent.
+///
+/// Parallel to [`mint_key`] but for the agent-cert plane: the identity IS the
+/// cert (minted by the caller, who holds the CA), so this records only the
+/// agent's grants — `zone_perms`, expiry, revoked — keyed by [`agent_store_key`].
+/// The provider resolves an agent-cert peer's `agent_id` from the cert SAN and
+/// its authorization from this record; revocation flips the `revoked` flag (or
+/// deletes the record) exactly as for an `sk-` key.
+///
+/// Enforces the same one-active-credential-per-subject uniqueness as
+/// [`mint_key`] (unless `allow_existing`, the rotation escape): two records
+/// must never claim one agent name, or either holder could author the other's
+/// mail behind the unforgeable `from`.
+pub fn mint_agent_authz(
+    store: &Arc<dyn AuthKeyStore>,
+    record: AuthKeyRecord,
+    allow_existing: bool,
+) -> Result<(), AuthKeyStoreError> {
+    if record.subject_type != SubjectType::Agent {
+        return Err(AuthKeyStoreError::Backend(format!(
+            "mint_agent_authz: subject_type must be agent, got {}",
+            record.subject_type.as_str()
+        )));
+    }
+    if !allow_existing {
+        if let Some(clash_id) = find_active_subject(store, SubjectType::Agent, &record.subject_id)?
+        {
+            return Err(AuthKeyStoreError::Backend(format!(
+                "agent {} already has an active credential (key_id={clash_id}); \
+                 revoke it, or pass --allow-existing to rotate",
+                record.subject_id,
+            )));
+        }
+    }
+    let bytes = record.encode().map_err(|e| {
+        AuthKeyStoreError::Backend(format!("encode agent record {}: {e}", record.key_id))
+    })?;
+    store.put(&agent_store_key(&record.subject_id), &bytes)
+}
+
 /// The `key_id` of an active (non-revoked) key already bound to
 /// `(subject_type, subject_id)`, if any — the uniqueness guard `mint_key`
 /// consults so one identity cannot be claimed by two credentials.
@@ -239,6 +290,34 @@ mod tests {
         );
         // Revoking again is idempotent and reports there was nothing left.
         assert!(!revoke_key(&store, SECRET, &minted.key).expect("re-revoke"));
+    }
+
+    /// An agent's authorization record is keyed by name (not a key-hash) and
+    /// stays unique per subject — the same guarantee `mint_key` gives the token
+    /// plane, so one agent name can never be claimed by two credentials.
+    #[test]
+    fn agent_authz_is_keyed_by_name_and_unique_per_subject() {
+        let store: Arc<dyn AuthKeyStore> = Arc::new(MemStore::default());
+
+        mint_agent_authz(&store, record(), false).expect("first mint");
+        // Keyed by name, disjoint from any hex key-hash.
+        assert!(
+            store.get(&agent_store_key("mac-ai")).unwrap().is_some(),
+            "agent record is stored under agent:{{name}}"
+        );
+
+        // A second credential for the same agent is refused.
+        assert!(
+            mint_agent_authz(&store, record(), false).is_err(),
+            "one agent name, one active credential"
+        );
+        // ...unless rotation is made explicit.
+        mint_agent_authz(&store, record(), true).expect("rotation is allowed");
+
+        // This path is agent-only; a non-agent subject is rejected.
+        let mut svc = record();
+        svc.subject_type = SubjectType::Service;
+        assert!(mint_agent_authz(&store, svc, false).is_err());
     }
 
     /// An admin working from the audit view holds a hash, not a key.

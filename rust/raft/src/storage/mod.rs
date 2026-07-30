@@ -14,7 +14,7 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```text
 //! use nexus_raft::storage::RedbStore;
 //!
 //! // Open a database

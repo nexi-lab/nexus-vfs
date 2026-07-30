@@ -20,7 +20,7 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```text
 //! use nexus_raft::transport::{RaftClient, ClientConfig};
 //!
 //! // Create a client to talk to another node
@@ -43,8 +43,15 @@
 pub(crate) mod certgen;
 #[cfg(all(feature = "grpc", has_protos))]
 pub use certgen::{
-    bootstrap_tls, generate_join_token, generate_node_cert, generate_zone_ca, node_identity_uri,
-    parse_node_identity_uri, BootstrapTls,
+    bootstrap_tls, generate_agent_cert, generate_join_token, generate_node_cert, generate_zone_ca,
+    node_identity_uri, parse_node_identity_uri, BootstrapTls,
+};
+#[cfg(all(feature = "grpc", has_protos))]
+pub(crate) mod crl;
+#[cfg(all(feature = "grpc", has_protos))]
+pub use crl::{
+    add_revoked_serial, crl_revoked_serials, generate_crl, read_revoked_serials,
+    revoked_serials_path, serial_from_cert_pem,
 };
 #[cfg(all(feature = "grpc", has_protos))]
 mod client;
@@ -55,7 +62,7 @@ mod transport_loop;
 
 #[cfg(all(feature = "grpc", has_protos))]
 pub use client::{
-    call_delete_zone, call_discover_zones_rpc, call_join_cluster, call_join_zone_rpc,
+    call_delete_zone, call_discover_zones_rpc, call_get_crl, call_join_cluster, call_join_zone_rpc,
     call_remove_voter_rpc, ClientConfig, ClusterInfoResult, DiscoveredZone, JoinClusterResult,
     JoinZoneResult, ProposeResult, QueryResult, RaftApiClient, RaftClient, RaftClientPool,
     RemoveVoterResult,

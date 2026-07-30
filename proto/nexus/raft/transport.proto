@@ -131,6 +131,13 @@ service NodeEnrollmentService {
   // server verifies it, signs a node cert, and returns it with the CA cert. The
   // CA key never leaves the signing node.
   rpc JoinCluster(JoinClusterRequest) returns (JoinClusterResponse);
+
+  // GetCrl returns the cluster's current CA-signed agent-cert revocation list.
+  // Unlike JoinCluster it needs no token: the CRL is a public, CA-signed
+  // artifact — its authenticity is the CA signature, its content (revoked
+  // serials) is not secret — so any node fetches it here to refresh its
+  // revocation view, the same CA plane that hands out the CA itself.
+  rpc GetCrl(GetCrlRequest) returns (GetCrlResponse);
 }
 
 // === Search Capability Advertisement (Issue #3147) ===
@@ -330,6 +337,15 @@ message JoinClusterResponse {
   // joiner then stays auth-off too. Persisted joiner-side to `tls/api-key-secret`
   // (the single SSOT), alongside `ca.pem`.
   optional string api_key_secret = 7;
+}
+
+// GetCrlRequest is empty — one cluster, one CRL.
+message GetCrlRequest {}
+
+// GetCrlResponse carries the current CA-signed CRL (PEM). A node verifies it
+// against the CA cert it already holds, then reads the revoked serials.
+message GetCrlResponse {
+  bytes crl_pem = 1;
 }
 
 // === Cluster Configuration ===

@@ -103,23 +103,6 @@ struct CommonArgs {
     #[arg(long, env = "NEXUS_BIND_ADDR", global = true)]
     bind_addr: Option<String>,
 
-    /// Additional loopback-only VFS bind for LOCAL agents, in `host:port`
-    /// form (e.g. `127.0.0.1:2130`).
-    ///
-    /// `--bind-addr` serves cluster PEERS over mTLS — the node/peer plane,
-    /// `agent_id = None`. A local agent (sudocode-host or an AI runtime on
-    /// THIS host) instead reaches the same kernel through this loopback
-    /// bind and authenticates with an `sk-` Agent key (the token plane), so
-    /// its mailbox writes carry an unforgeable `agent_id` that the A2A stamp
-    /// hook turns into `from`. mTLS ⊥ token: the two identity planes live on
-    /// separate binds by audience (remote peers vs. local agents).
-    ///
-    /// Requires `NEXUS_API_KEY_SECRET` (the token plane) and refuses a
-    /// non-loopback address — a bearer token over plaintext must never
-    /// leave the host.
-    #[arg(long, env = "NEXUS_AGENT_BIND_ADDR", global = true)]
-    agent_bind_addr: Option<String>,
-
     /// Persistent data directory (TLS bundle + per-zone redb files).
     #[arg(
         long,
@@ -473,15 +456,22 @@ enum AuthCmd {
         #[arg(long)]
         allow_existing: bool,
     },
-    /// Revoke a key. Takes the key itself, or its hash from `auth list`.
+    /// Revoke a credential — an `sk-` key (by key or hash), or an agent cert
+    /// (by name).
     Revoke {
         /// The `sk-` key, if you hold it.
-        #[arg(long, conflicts_with = "key_hash")]
+        #[arg(long, conflicts_with_all = ["key_hash", "agent"])]
         key: Option<String>,
         /// The key's hash, as shown by `auth list` — the shape an admin uses,
         /// working from the audit view rather than from a key they do not have.
-        #[arg(long, conflicts_with = "key")]
+        #[arg(long, conflicts_with_all = ["key", "agent"])]
         key_hash: Option<String>,
+        /// The agent NAME, to revoke its cert instead of an `sk-` key. Reads the
+        /// serial from the minted bundle and adds it to the cluster CRL (the CA
+        /// plane), so it takes effect on every node after a CRL refresh. This
+        /// path is file-based — no store lock — so it works while the daemon runs.
+        #[arg(long, conflicts_with_all = ["key", "key_hash"])]
+        agent: Option<String>,
     },
     /// List every credential: hash, subject, zones, expiry.
     List,
@@ -1195,47 +1185,6 @@ fn open_zone_manager(
     })
 }
 
-/// Resolve `--agent-bind-addr` into a bind address, fail-closed.
-///
-/// The local-agent bind exists to give a local agent an `agent_id` via the
-/// token plane (`sk-` Agent key) — mTLS ⊥ token, the two identity planes on
-/// separate binds by audience (auth-doc §3.1 / §4.1). So it is only legal
-/// when:
-///   * the token plane is on (`NEXUS_API_KEY_SECRET` set) — a NoAuth agent
-///     bind resolves every caller as nobody and could never stamp a `from`;
-///   * the address is loopback — it carries bearer tokens over plaintext, so
-///     a reachable bind would leak them off-host (the exact reachable-plaintext
-///     hole the boot posture forbids, §3).
-///
-/// Returns `Ok(None)` when the flag is unset (no local-agent bind), or the
-/// parsed `SocketAddr` when the posture is legal.
-fn resolve_agent_bind(
-    agent_bind: Option<&str>,
-    token_plane_on: bool,
-) -> Result<Option<std::net::SocketAddr>> {
-    let Some(agent_bind) = agent_bind else {
-        return Ok(None);
-    };
-    if !token_plane_on {
-        return Err(anyhow::anyhow!(
-            "--agent-bind-addr requires NEXUS_API_KEY_SECRET: the local-agent bind \
-             authenticates on the token plane (sk- Agent key → agent_id); without a \
-             secret every caller resolves as nobody and no `from` could be stamped"
-        ));
-    }
-    if !auth_posture::is_loopback_bind(agent_bind) {
-        return Err(anyhow::anyhow!(
-            "--agent-bind-addr must be a loopback address (127.0.0.1:<port>); got \
-             '{agent_bind}'. It carries bearer tokens over plaintext and must never \
-             be reachable off-host"
-        ));
-    }
-    let addr = agent_bind
-        .parse::<std::net::SocketAddr>()
-        .map_err(|e| anyhow::anyhow!("--agent-bind-addr parse '{agent_bind}': {e}"))?;
-    Ok(Some(addr))
-}
-
 async fn run_daemon(common: CommonArgs) -> Result<()> {
     let hostname = resolve_hostname(common.hostname.as_deref());
     tracing::info!(
@@ -1500,6 +1449,10 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
             // enrollee persists what it receives, so nothing is written here.
             // `None` ⇒ auth-off: the response omits it and joiners stay auth-off too.
             let api_key_secret = effective_api_key_secret(&tls_dir);
+            // The founder holds the CA, so it also serves the CRL: GetCrl reads
+            // this file live and CA-signs a fresh CRL, so an offline `auth
+            // revoke` takes effect without a restart.
+            let revoked_path = nexus_raft::transport::revoked_serials_path(&common.data_dir);
             zm.runtime_handle().spawn(async move {
                 if let Err(e) = nexus_raft::transport::serve_node_enrollment(
                     addr,
@@ -1507,6 +1460,7 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
                     ca_key_pem,
                     join_token_hash.trim().to_string(),
                     api_key_secret,
+                    Some(revoked_path),
                     std::future::pending::<()>(),
                 )
                 .await
@@ -1543,6 +1497,29 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
                 ),
             }
         }
+    }
+
+    // CRL refresh: keep this node's revoked-serial set current from the CA
+    // plane (not raft). Only when auth is on — auth-off has no cert-agents to
+    // revoke. The founder holds the revoked-serial file and reads it directly;
+    // a joiner fetches the CA-signed CRL from the founder's enroll addr (derived
+    // from the first peer the way boot-time enrollment is) and verifies it.
+    if let Some(provider) = api_key_auth.clone() {
+        let ca_key_holder = common.data_dir.join("tls").join("ca-key.pem").exists();
+        let founder_enroll = if ca_key_holder {
+            None
+        } else {
+            NodeAddress::parse_peer_list_operator(&common.peers, !common.no_tls)
+                .ok()
+                .and_then(|peers| peers.into_iter().next())
+                .and_then(|peer| enroll_port_addr(&peer.to_operator_str()).ok())
+        };
+        zm.runtime_handle().spawn(crl_refresh_loop(
+            provider,
+            common.data_dir.clone(),
+            ca_key_holder,
+            founder_enroll,
+        ));
     }
 
     // Bring root zone online based on declared mode.
@@ -2299,46 +2276,11 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
         }
     }
 
-    // Local-agent identity bind (mTLS ⊥ token — auth-doc §3.1 / §4.1).
-    //
-    // `--bind-addr` above serves cluster PEERS over mTLS (the node/peer
-    // plane, `agent_id = None`). A local agent on THIS host reaches the
-    // same kernel through this loopback bind and authenticates on the
-    // token plane (`sk-` Agent key → `agent_id`), so its mailbox writes
-    // carry an unforgeable `from` once the stamp hook rewrites them. The
-    // two identity planes stay on separate binds by audience; `resolve()`
-    // is still the single decision point for both.
-    //
-    // Fail-closed: an agent bind with NoAuth could not produce an
-    // `agent_id` (defeating the purpose), and a token over reachable
-    // plaintext is exactly the hole the boot posture forbids — so require
-    // the token plane and refuse a non-loopback address.
-    let agent_grpc =
-        match resolve_agent_bind(common.agent_bind_addr.as_deref(), api_key_auth.is_some())? {
-            Some(bind_addr) => {
-                let provider = api_key_auth
-                    .clone()
-                    .expect("resolve_agent_bind returns a bind only when the token plane is on");
-                let handle = transport::grpc::spawn(
-                    Arc::clone(&kernel),
-                    transport::grpc::VfsGrpcConfig {
-                        bind_addr,
-                        tls: None,
-                        max_message_bytes: 64 * 1024 * 1024,
-                        server_version: "nexusd-cluster".to_string(),
-                    },
-                    Arc::clone(&provider) as Arc<dyn transport::auth::AuthProvider>,
-                )
-                .map_err(|e| anyhow::anyhow!("spawn local-agent vfs bind: {e}"))?;
-                tracing::info!(
-                    bind = %bind_addr,
-                    "local-agent VFS bind up (loopback, token plane: sk- Agent key → agent_id)"
-                );
-                Some(handle)
-            }
-            None => None,
-        };
-
+    // An agent reaches the kernel over the same `--bind-addr` mTLS bind as
+    // cluster peers, presenting its identity cert (SAN nexus://agent/{name});
+    // `peer_identity` resolves the SAN to an `agent_id` and its mailbox writes
+    // carry an unforgeable `from`. Nodes and agents share the bind — `resolve()`
+    // tells them apart by SAN type — so there is no separate agent bind.
     let zm_for_loop = zm.clone();
     let topology_handle = tokio::spawn(async move {
         loop {
@@ -2400,11 +2342,6 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     // thread — dropping it inside the current async context panics with
     // "Cannot drop a runtime in a context where blocking is not allowed".
     tokio::task::spawn_blocking(move || {
-        // The local-agent bind owns its own tokio runtime; drop it on this
-        // blocking thread (dropping a runtime in an async context panics).
-        if let Some(handle) = agent_grpc {
-            handle.shutdown_blocking();
-        }
         drop(kernel);
         drop(zm);
     })
@@ -3349,17 +3286,105 @@ async fn run_auth(common: CommonArgs, action: AuthCmd) -> Result<()> {
 /// it runs on the blocking pool. Owns the ZoneManager start to finish so its
 /// nested runtime is created and dropped off the async worker threads.
 fn run_auth_blocking(common: CommonArgs, action: AuthCmd) -> Result<()> {
+    // Agent-cert revocation is file-based (no redb): it appends the cert's
+    // serial to the founder's revoked-serial file, which the running GetCrl
+    // endpoint reads live. So it takes no store lock and works while the daemon
+    // is up — unlike the `sk-` paths below, which open the replicated store.
+    if let AuthCmd::Revoke {
+        agent: Some(name), ..
+    } = &action
+    {
+        return revoke_agent_cert(&common.data_dir, name);
+    }
     let (zm, store, secret) = open_auth_store(&common)?;
-    let result = run_auth_action(&store, &secret, action);
+    let result = run_auth_action(&store, &secret, &common.data_dir, action);
     // Release the data directory's lock before returning, or a daemon started
     // right after this exits fails to open redb.
     zm.shutdown();
     result
 }
 
+/// Keep the auth provider's revoked-serial set current from the cluster CRL —
+/// the CA's own trust plane, orthogonal to raft. The founder reads its
+/// revoked-serial file directly (it is the SSOT); a joiner fetches the
+/// CA-signed CRL from the founder's enroll addr and verifies it against its own
+/// CA before applying it, so a forged CRL can neither un-revoke nor falsely
+/// revoke. A fetch or verify failure keeps the last known set rather than
+/// clearing it — a transient founder outage must not un-revoke an agent.
+async fn crl_refresh_loop(
+    provider: std::sync::Arc<auth::ApiKeyAuthProvider>,
+    data_dir: std::path::PathBuf,
+    ca_key_holder: bool,
+    founder_enroll: Option<String>,
+) {
+    const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+    let ca_path = data_dir.join("tls").join("ca.pem");
+    loop {
+        let serials: Option<Vec<Vec<u8>>> = if ca_key_holder {
+            let path = nexus_raft::transport::revoked_serials_path(&data_dir);
+            Some(nexus_raft::transport::read_revoked_serials(&path))
+        } else if let Some(addr) = &founder_enroll {
+            match nexus_raft::transport::call_get_crl(addr, 10).await {
+                Ok(crl) => match std::fs::read(&ca_path) {
+                    Ok(ca) => match nexus_raft::transport::crl_revoked_serials(&crl, &ca) {
+                        Ok(s) => Some(s),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "CRL failed CA verification; keeping current set");
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        tracing::debug!(error = %e, "CRL refresh: CA cert unreadable");
+                        None
+                    }
+                },
+                Err(e) => {
+                    tracing::debug!(error = %e, "CRL fetch failed; keeping current set");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(serials) = serials {
+            provider.set_revoked_serials(serials.into_iter().collect());
+        }
+        tokio::time::sleep(REFRESH_INTERVAL).await;
+    }
+}
+
+/// Revoke an agent's cert: read its serial from the minted bundle and append it
+/// to the founder's revoked-serial file (the CA-plane CRL source). File-based,
+/// so it needs no store lock; the founder's GetCrl serves the updated CRL and
+/// every node drops the agent after its next CRL refresh. Runs on the founder,
+/// where the bundle was minted and the CA lives.
+fn revoke_agent_cert(data_dir: &std::path::Path, name: &str) -> Result<()> {
+    let cert_path = data_dir.join("agents").join(name).join("agent.pem");
+    let cert_pem = std::fs::read(&cert_path).with_context(|| {
+        format!(
+            "revoke agent {name}: read {} — revocation runs on the founder, where the cert \
+             bundle was minted",
+            cert_path.display()
+        )
+    })?;
+    let serial = nexus_raft::transport::serial_from_cert_pem(&cert_pem)
+        .map_err(|e| anyhow::anyhow!("read serial from {}: {e}", cert_path.display()))?;
+    let path = nexus_raft::transport::revoked_serials_path(data_dir);
+    nexus_raft::transport::add_revoked_serial(&path, &serial)
+        .map_err(|e| anyhow::anyhow!("record revoked serial: {e}"))?;
+    let serial_hex: String = serial.iter().map(|b| format!("{b:02x}")).collect();
+    eprintln!(
+        "revoked agent cert subject=agent:{name} serial={serial_hex} -> {}",
+        path.display()
+    );
+    println!("revoked");
+    Ok(())
+}
+
 fn run_auth_action(
     store: &std::sync::Arc<dyn kernel::hal::auth_key_store::AuthKeyStore>,
     secret: &str,
+    data_dir: &std::path::Path,
     action: AuthCmd,
 ) -> Result<()> {
     match action {
@@ -3382,6 +3407,99 @@ fn run_auth_action(
                     ))
                 }
             };
+            let expires_at_ms = expires_in_days.map(|days| {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                now_ms + days * 24 * 60 * 60 * 1000
+            });
+
+            // An agent's credential IS a CA-signed identity cert, never an
+            // `sk-` token: the cert both authenticates it over mTLS and signs
+            // its messages, so a consumer on another node — a different trust
+            // domain — verifies the `from` against the cluster CA without
+            // trusting whoever ingested it (Nexus Auth Architecture §5). One
+            // subject type, one credential kind: `--subject-type agent` issues a
+            // cert; `user` / `service` keep the `sk-` token plane below.
+            //
+            // The cert is a pure identity (a DID): it carries no authorization,
+            // so a valid agent cert is simply a mailbox principal (rw the A2A
+            // area — the resolver grants that fixed scope). `--zone` / `--admin`
+            // do not apply; a principal that needs zone grants holds a `user` /
+            // `service` key instead. The founder-local record below exists for
+            // cluster-wide name uniqueness + audit, not for resolution.
+            //
+            // Placement: the reusable units live in libraries — `generate_agent_cert`
+            // (raft::transport) and `mint_agent_authz` (auth). Only this operator-CLI
+            // glue (on-disk bundle layout + the stdout path contract) is
+            // profile-resident, because it is CLI-specific. A runtime service that
+            // provisions agents programmatically calls those two units directly and
+            // returns the bytes in memory rather than writing a bundle.
+            if subject_type == auth::SubjectType::Agent {
+                if !zones.is_empty() || admin {
+                    return Err(anyhow::anyhow!(
+                        "an agent cert is a pure identity and carries no authorization; \
+                         --zone / --admin do not apply. Mint a --subject-type user or \
+                         service key for a principal that needs zone grants."
+                    ));
+                }
+                let name_id = subject_id.clone();
+                let record = auth::AuthKeyRecord {
+                    key_id: uuid_v4(),
+                    name,
+                    subject_type,
+                    subject_id,
+                    is_admin: false,
+                    revoked: false,
+                    expires_at_ms,
+                    zone_perms: Vec::new(),
+                };
+                let tls_dir = data_dir.join("tls");
+                let ca_pem = std::fs::read(tls_dir.join("ca.pem")).with_context(|| {
+                    format!(
+                        "agent certs are issued on the founder (it holds the CA): reading {}/ca.pem",
+                        tls_dir.display()
+                    )
+                })?;
+                let ca_key_pem = std::fs::read(tls_dir.join("ca-key.pem")).with_context(|| {
+                    format!(
+                        "agent certs need the CA private key, present only on the founder: reading {}/ca-key.pem",
+                        tls_dir.display()
+                    )
+                })?;
+                let (cert_pem, key_pem) =
+                    nexus_raft::transport::generate_agent_cert(&name_id, &ca_pem, &ca_key_pem)
+                        .map_err(|e| anyhow::anyhow!("generate agent cert: {e}"))?;
+                auth::mint_agent_authz(store, record, allow_existing)
+                    .map_err(|e| anyhow::anyhow!("mint agent: {e}"))?;
+
+                let out_dir = data_dir.join("agents").join(&name_id);
+                std::fs::create_dir_all(&out_dir)
+                    .with_context(|| format!("create {}", out_dir.display()))?;
+                std::fs::write(out_dir.join("agent.pem"), &cert_pem)
+                    .with_context(|| format!("write {}/agent.pem", out_dir.display()))?;
+                std::fs::write(out_dir.join("agent-key.pem"), &key_pem)
+                    .with_context(|| format!("write {}/agent-key.pem", out_dir.display()))?;
+                std::fs::write(out_dir.join("ca.pem"), &ca_pem)
+                    .with_context(|| format!("write {}/ca.pem", out_dir.display()))?;
+
+                // The bundle directory on stdout alone, so
+                // `DIR=$(nexusd-cluster auth mint --subject-type agent NAME ...)`
+                // captures it and nothing else.
+                println!("{}", out_dir.display());
+                eprintln!(
+                    "minted agent cert subject=agent:{name_id} -> {}",
+                    out_dir.display()
+                );
+                eprintln!(
+                    "The agent presents agent.pem + agent-key.pem and trusts the server via ca.pem."
+                );
+                return Ok(());
+            }
+
+            // The `sk-` token plane: user / service keys. A key with no zone
+            // grants reaches nothing, so require at least one (or --admin).
             let zone_perms = zones
                 .iter()
                 .map(|z| parse_zone_grant(z))
@@ -3393,13 +3511,6 @@ fn run_auth_action(
                      global admin (the only principal allowed a zoneless key)."
                 ));
             }
-            let expires_at_ms = expires_in_days.map(|days| {
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                now_ms + days * 24 * 60 * 60 * 1000
-            });
             let record = auth::AuthKeyRecord {
                 key_id: uuid_v4(),
                 name,
@@ -3410,6 +3521,7 @@ fn run_auth_action(
                 expires_at_ms,
                 zone_perms,
             };
+
             let minted = auth::mint_key(store, secret, record, allow_existing)
                 .map_err(|e| anyhow::anyhow!("mint: {e}"))?;
 
@@ -3428,13 +3540,19 @@ fn run_auth_action(
             eprintln!("This key will not be shown again - it is stored only as an HMAC.");
             Ok(())
         }
-        AuthCmd::Revoke { key, key_hash } => {
+        // `agent` is handled file-based in `run_auth_blocking` before the store
+        // opens, so here it is always `None`.
+        AuthCmd::Revoke {
+            key,
+            key_hash,
+            agent: _,
+        } => {
             let removed = match (key, key_hash) {
                 (Some(key), None) => auth::revoke_key(store, secret, &key),
                 (None, Some(hash)) => auth::revoke_key_hash(store, &hash),
                 _ => {
                     return Err(anyhow::anyhow!(
-                        "revoke: pass exactly one of --key or --key-hash"
+                        "revoke: pass exactly one of --key, --key-hash, or --agent"
                     ))
                 }
             }
@@ -3966,42 +4084,6 @@ mod tests {
     }
 
     // ── --advertise-addr decoupling tests (symmetric-peer PR) ────────
-
-    // ── --agent-bind-addr fail-closed posture (Option X: mTLS ⊥ token) ──
-    #[test]
-    fn agent_bind_unset_is_none() {
-        assert!(resolve_agent_bind(None, true).expect("unset ok").is_none());
-        assert!(resolve_agent_bind(None, false)
-            .expect("unset ok even without a secret")
-            .is_none());
-    }
-
-    #[test]
-    fn agent_bind_requires_token_plane() {
-        // Set but no secret → refuse: a NoAuth agent bind resolves every
-        // caller as nobody and could never stamp a `from`.
-        let err = resolve_agent_bind(Some("127.0.0.1:2130"), false)
-            .expect_err("agent bind without the token plane must fail-closed");
-        assert!(err.to_string().contains("NEXUS_API_KEY_SECRET"));
-    }
-
-    #[test]
-    fn agent_bind_must_be_loopback() {
-        // Token plane on, but a reachable addr → refuse: a bearer token over
-        // plaintext must never leave the host.
-        let err = resolve_agent_bind(Some("0.0.0.0:2130"), true)
-            .expect_err("non-loopback agent bind must fail-closed");
-        assert!(err.to_string().contains("loopback"));
-    }
-
-    #[test]
-    fn agent_bind_loopback_with_token_resolves() {
-        let addr = resolve_agent_bind(Some("127.0.0.1:2130"), true)
-            .expect("loopback + token plane is legal")
-            .expect("returns a bind addr");
-        assert!(addr.ip().is_loopback());
-        assert_eq!(addr.port(), 2130);
-    }
 
     #[test]
     fn advertise_addr_explicit_wins() {

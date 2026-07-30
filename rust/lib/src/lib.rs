@@ -16,6 +16,8 @@
 //!   brings tonic + tokio-light deps that pure-algo callers (WASM, edge
 //!   profile) can skip.
 
+/// Agent identity URI SAN helpers (`nexus://agent/{name}`) — pure, dep-free.
+pub mod agent_identity;
 pub mod bitmap;
 pub mod bloom;
 pub mod glob;

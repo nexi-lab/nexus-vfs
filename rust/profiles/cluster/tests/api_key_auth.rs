@@ -4,10 +4,9 @@
 //! raft, real gRPC — because the unit tests can all pass while the provider is
 //! never wired, the store never bound, or the boot order leaves an empty slot;
 //! only running the binary catches that (the first live run died on a rootless
-//! boot no unit test could have seen). Rust replacement for the retired
-//! `scripts/e2e_api_key_auth.py`. The journey, each step consuming the last:
+//! boot no unit test could have seen). The journey, each step consuming the last:
 //!
-//!   1. MINT   an agent key (offline CLI, committed through raft).
+//!   1. MINT   a user key (the token plane is user / service; agents are cert-only).
 //!   2. LIST   read it back from a SEPARATE process — durable state, not memory.
 //!   3. SERVE  boot the daemon against that data dir.
 //!   4. AUTH   Ping with the minted key → authenticated.
@@ -19,11 +18,11 @@ mod common;
 
 use std::time::Duration;
 
-use common::{cli, free_port, mint_agent_key, Daemon, Vfs};
+use common::{cli, free_port, mint_token_key, Daemon, Vfs};
 use tonic::Code;
 
 const SECRET: &str = "e2e-api-key-secret";
-const AGENT: &str = "mac-ai";
+const USER: &str = "mac-user";
 const ZONE: &str = "sharedzone";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -44,13 +43,13 @@ async fn sk_api_key_gates_the_daemon() {
     let budget = Duration::from_secs(90);
 
     // ── 1. MINT ───────────────────────────────────────────────────────
-    let key = mint_agent_key(&env, AGENT, &format!("{ZONE}:rw"));
+    let key = mint_token_key(&env, "user", USER, &format!("{ZONE}:rw"));
 
     // ── 2. LIST from a separate process — the record is durable state ───
     let (ok, stdout, stderr) = cli(&env, &["auth", "list"]);
     assert!(ok, "auth list failed: {stderr}");
     assert!(
-        stdout.contains(&format!("agent:{AGENT}")),
+        stdout.contains(&format!("user:{USER}")),
         "minted key not in the store:\n{stdout}"
     );
     assert!(

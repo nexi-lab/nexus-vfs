@@ -48,10 +48,21 @@ use kernel::kernel::OperationContext;
 pub struct PeerIdentity {
     /// Subject CommonName, always present.
     pub common_name: String,
-    /// Node id pinned in the URI SAN.
+    /// Node id pinned in a `nexus://zone/{zone}/node/{id}` URI SAN.
     pub node_id: Option<u64>,
-    /// Zone id pinned in the URI SAN.
+    /// Zone id pinned in the node URI SAN.
     pub zone_id: Option<String>,
+    /// Agent name pinned in a `nexus://agent/{name}` URI SAN. `Some` for an
+    /// agent-identity cert, `None` for a node cert — the two SAN namespaces
+    /// are disjoint. When present the peer is an agent, not a cluster node.
+    /// The cert is a pure identity (a DID): it carries no authorization, so
+    /// there is nothing else to read from it — a valid agent is a mailbox
+    /// principal, full stop.
+    pub agent_name: Option<String>,
+    /// The certificate's raw serial-number bytes. For an agent cert this is
+    /// what revocation names: `resolve` rejects a peer whose serial is in the
+    /// cluster CA's signed CRL. Every X.509 cert carries a serial.
+    pub serial: Vec<u8>,
 }
 
 impl PeerIdentity {
@@ -60,6 +71,9 @@ impl PeerIdentity {
     /// Prefers the self-named `node/{id}` form, falling back to the CN
     /// for certs minted before the URI SAN existed.
     pub fn display_id(&self) -> String {
+        if let Some(name) = &self.agent_name {
+            return format!("agent/{name}");
+        }
         match self.node_id {
             Some(id) => format!("node/{id}"),
             None => self.common_name.clone(),
@@ -149,6 +163,8 @@ mod tests {
             common_name: "nexus-zone-root-node-win".into(),
             node_id: Some(7),
             zone_id: Some("root".into()),
+            agent_name: None,
+            serial: vec![],
         };
         assert_eq!(named.display_id(), "node/7");
 
@@ -156,7 +172,18 @@ mod tests {
             common_name: "nexus-zone-root-node-win".into(),
             node_id: None,
             zone_id: None,
+            agent_name: None,
+            serial: vec![],
         };
         assert_eq!(legacy.display_id(), "nexus-zone-root-node-win");
+
+        let agent = PeerIdentity {
+            common_name: "nexus-agent-win-ai".into(),
+            node_id: None,
+            zone_id: None,
+            agent_name: Some("win-ai".into()),
+            serial: vec![],
+        };
+        assert_eq!(agent.display_id(), "agent/win-ai");
     }
 }

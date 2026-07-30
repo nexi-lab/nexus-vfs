@@ -54,6 +54,23 @@ pub fn parse_node_identity_uri(uri: &str) -> Option<(String, u64)> {
     Some((zone_id.to_string(), node_id.parse().ok()?))
 }
 
+/// Parse a cluster CA (cert + private key, both PEM) into an rcgen `Issuer`
+/// ready to sign leaf certs. Shared by node/agent cert generation and CRL
+/// signing (`super::crl`) so the CA-loading boilerplate has one home.
+pub(super) fn ca_issuer_from_pem(
+    ca_cert_pem: &[u8],
+    ca_key_pem: &[u8],
+) -> Result<Issuer<'static, KeyPair>, String> {
+    let ca_key_str =
+        std::str::from_utf8(ca_key_pem).map_err(|e| format!("CA key is not valid UTF-8: {e}"))?;
+    let ca_key_pair =
+        KeyPair::from_pem(ca_key_str).map_err(|e| format!("Failed to parse CA key: {e}"))?;
+    let ca_cert_str =
+        std::str::from_utf8(ca_cert_pem).map_err(|e| format!("CA cert is not valid UTF-8: {e}"))?;
+    Issuer::from_ca_cert_pem(ca_cert_str, ca_key_pair)
+        .map_err(|e| format!("Failed to parse CA cert: {e}"))
+}
+
 /// Generate a node certificate signed by the cluster CA.
 ///
 /// Returns `(node_cert_pem, node_key_pem)` as PEM-encoded bytes.
@@ -82,17 +99,7 @@ pub fn generate_node_cert(
     extra_hostnames: &[String],
     hostname: Option<&str>,
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
-    // Parse CA key pair
-    let ca_key_str =
-        std::str::from_utf8(ca_key_pem).map_err(|e| format!("CA key is not valid UTF-8: {e}"))?;
-    let ca_key_pair =
-        KeyPair::from_pem(ca_key_str).map_err(|e| format!("Failed to parse CA key: {e}"))?;
-
-    // Parse CA certificate
-    let ca_cert_str =
-        std::str::from_utf8(ca_cert_pem).map_err(|e| format!("CA cert is not valid UTF-8: {e}"))?;
-    let ca_issuer = Issuer::from_ca_cert_pem(ca_cert_str, ca_key_pair)
-        .map_err(|e| format!("Failed to parse CA cert: {e}"))?;
+    let ca_issuer = ca_issuer_from_pem(ca_cert_pem, ca_key_pem)?;
 
     // Generate node key pair (EC P-256)
     let node_key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
@@ -184,6 +191,75 @@ pub fn generate_node_cert(
     let key_pem = node_key_pair.serialize_pem().into_bytes();
 
     Ok((cert_pem, key_pem))
+}
+
+/// Generate an agent certificate signed by the cluster CA.
+///
+/// Returns `(agent_cert_pem, agent_key_pem)` as PEM-encoded bytes. The
+/// private key stays with the agent; only the certificate (which carries
+/// the public key) is ever presented on the wire or stored in a record.
+///
+/// Parallel to [`generate_node_cert`], with the differences an agent
+/// warrants: an agent is a *client*, never a server, so the cert carries
+/// only `clientAuth` and no reachability SANs — its sole SAN is the
+/// machine-readable identity `nexus://agent/{name}`, read back by
+/// `lib::agent_identity::parse_agent_identity_uri`. The CA chain plus that URI SAN are the
+/// whole identity; the CN (`nexus-agent-{name}`) is a display string.
+///
+/// The one key both authenticates the agent (mTLS client identity →
+/// `agent_id`) and signs its messages (the unforgeable `from`): one
+/// credential, one source of identity.
+///
+/// The cert is a pure identity — a DID. It carries NO authorization: an agent
+/// is a mailbox principal, and "may this agent send/receive A2A mail" is a
+/// fixed yes for every valid agent (the stamp makes each `from` unforgeable).
+/// Fine-grained per-zone perms are not an agent concern; a principal that needs
+/// them holds a `user` / `service` `sk-` key instead.
+pub fn generate_agent_cert(
+    name: &str,
+    ca_cert_pem: &[u8],
+    ca_key_pem: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let ca_issuer = ca_issuer_from_pem(ca_cert_pem, ca_key_pem)?;
+
+    // Agent key pair (EC P-256), same algorithm as node certs.
+    let agent_key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
+        .map_err(|e| format!("Failed to generate agent key: {e}"))?;
+
+    let mut params = CertificateParams::default();
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::OrganizationName, "Nexus");
+    dn.push(DnType::CommonName, format!("nexus-agent-{name}"));
+    params.distinguished_name = dn;
+
+    // Sole SAN: the machine-readable identity. No localhost / IP / cluster
+    // server-name SANs — an agent never serves TLS, it presents this as a
+    // client cert, and rustls ignores URI SANs for hostname verification.
+    params.subject_alt_names = vec![SanType::URI(
+        lib::agent_identity::agent_identity_uri(name)
+            .as_str()
+            .try_into()
+            .map_err(|e| format!("agent identity SAN error: {e}"))?,
+    )];
+
+    // Client only, and a signing key (it signs both the mTLS handshake and
+    // message envelopes).
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    params.is_ca = IsCa::NoCa;
+
+    let now = time::OffsetDateTime::now_utc();
+    params.not_before = now;
+    params.not_after = now + time::Duration::days(NODE_CERT_VALIDITY_DAYS);
+
+    let agent_cert = params
+        .signed_by(&agent_key_pair, &ca_issuer)
+        .map_err(|e| format!("Failed to sign agent cert: {e}"))?;
+
+    Ok((
+        agent_cert.pem().into_bytes(),
+        agent_key_pair.serialize_pem().into_bytes(),
+    ))
 }
 
 /// Generate a self-signed root CA certificate for a zone.
@@ -389,6 +465,7 @@ pub fn ca_fingerprint_from_pem(ca_pem: &[u8]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lib::agent_identity::parse_agent_identity_uri;
 
     fn generate_test_ca() -> (String, String) {
         let ca_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
@@ -489,6 +566,46 @@ mod tests {
             parse_node_identity_uri(uris[0]),
             Some(("sharedzone".to_string(), 7))
         );
+    }
+
+    /// Parallel to the node identity SAN: an agent cert's sole SAN is the
+    /// machine-readable identity, and the two identity namespaces are
+    /// disjoint (a node URI never resolves as an agent, and vice versa).
+    #[test]
+    fn agent_cert_pins_the_identity_uri_san() {
+        use x509_parser::prelude::*;
+
+        let (ca_cert_pem, ca_key_pem) = generate_test_ca();
+        let (cert_pem, key_pem) =
+            generate_agent_cert("win-ai", ca_cert_pem.as_bytes(), ca_key_pem.as_bytes()).unwrap();
+        assert!(String::from_utf8_lossy(&key_pem).contains("PRIVATE KEY"));
+
+        let pem = ::pem::parse(&cert_pem).unwrap();
+        let (_, cert) = X509Certificate::from_der(pem.contents()).unwrap();
+
+        let uris: Vec<&str> = cert
+            .subject_alternative_name()
+            .unwrap()
+            .unwrap()
+            .value
+            .general_names
+            .iter()
+            .filter_map(|gn| match gn {
+                GeneralName::URI(u) => Some(*u),
+                _ => None,
+            })
+            .collect();
+
+        // Sole SAN is the identity URI — a client cert carries no reachability SANs.
+        assert_eq!(uris, vec!["nexus://agent/win-ai"]);
+        assert_eq!(
+            parse_agent_identity_uri(uris[0]),
+            Some("win-ai".to_string())
+        );
+
+        // The node and agent identity namespaces are disjoint.
+        assert_eq!(parse_node_identity_uri("nexus://agent/win-ai"), None);
+        assert_eq!(parse_agent_identity_uri("nexus://zone/root/node/7"), None);
     }
 
     /// Every node cert must carry the fixed cluster server name as a DNS SAN —

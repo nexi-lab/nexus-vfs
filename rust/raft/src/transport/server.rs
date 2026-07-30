@@ -14,13 +14,13 @@ use super::proto::nexus::raft::{
     zone_transport_service_server::{ZoneTransportService, ZoneTransportServiceServer},
     ClusterConfig as ProtoClusterConfig, DeleteZoneRequest, DeleteZoneResponse,
     DiscoverZonesRequest, DiscoverZonesResponse, FederationZoneInfo, GetClusterInfoRequest,
-    GetClusterInfoResponse, GetMetadataResult, GetSearchCapabilitiesRequest, JoinClusterRequest,
-    JoinClusterResponse, JoinZoneRequest, JoinZoneResponse, ListMetadataResult, LockInfoResult,
-    LockResult, NodeInfo as ProtoNodeInfo, ProposeRequest, ProposeResponse, QueryRequest,
-    QueryResponse, RaftCommand, RaftQueryResponse, RaftResponse, ReadBlobRequest, ReadBlobResponse,
-    RemoveVoterRequest, RemoveVoterResponse, ReplicateEntriesRequest, ReplicateEntriesResponse,
-    SearchCapabilities, SnapshotEcStateRequest, SnapshotEcStateResponse, StepMessageRequest,
-    StepMessageResponse,
+    GetClusterInfoResponse, GetCrlRequest, GetCrlResponse, GetMetadataResult,
+    GetSearchCapabilitiesRequest, JoinClusterRequest, JoinClusterResponse, JoinZoneRequest,
+    JoinZoneResponse, ListMetadataResult, LockInfoResult, LockResult, NodeInfo as ProtoNodeInfo,
+    ProposeRequest, ProposeResponse, QueryRequest, QueryResponse, RaftCommand, RaftQueryResponse,
+    RaftResponse, ReadBlobRequest, ReadBlobResponse, RemoveVoterRequest, RemoveVoterResponse,
+    ReplicateEntriesRequest, ReplicateEntriesResponse, SearchCapabilities, SnapshotEcStateRequest,
+    SnapshotEcStateResponse, StepMessageRequest, StepMessageResponse,
 };
 use super::{NodeAddress, Result, SharedPeerMap, TransportError};
 use crate::blob_fetcher::BlobFetcherSlot;
@@ -1337,6 +1337,11 @@ struct NodeEnrollmentServiceImpl {
     /// the response omits it and the joiner stays auth-off. Read once at
     /// construction from `tls/api-key-secret` (the single SSOT).
     api_key_secret: Option<String>,
+    /// Path to the founder's revoked-serial file (`tls/revoked-serials`). The
+    /// `GetCrl` handler reads it live and CA-signs a fresh CRL, so an offline
+    /// `auth revoke` that appended a serial is served without a restart. `None`
+    /// on a node holding no CA key — it never serves a CRL.
+    revoked_serials_path: Option<PathBuf>,
 }
 
 #[tonic::async_trait]
@@ -1437,6 +1442,29 @@ impl NodeEnrollmentService for NodeEnrollmentServiceImpl {
             api_key_secret: self.api_key_secret.clone(),
         }))
     }
+
+    /// Serve the cluster's current CRL: read the revoked-serial file live and
+    /// CA-sign a fresh CRL over it. No token — the CRL is a public, CA-signed
+    /// artifact, so any node may fetch it to refresh its revocation view.
+    async fn get_crl(
+        &self,
+        _request: Request<GetCrlRequest>,
+    ) -> std::result::Result<Response<GetCrlResponse>, Status> {
+        let (Some(ca_pem), Some(ca_key_pem)) = (&self.ca_pem, &self.ca_key_pem) else {
+            return Err(Status::failed_precondition("CA material not configured"));
+        };
+        let serials = self
+            .revoked_serials_path
+            .as_deref()
+            .map(super::crl::read_revoked_serials)
+            .unwrap_or_default();
+        // The count grows monotonically (revocation is append-only), so it is a
+        // fine crl_number: a stale CRL never carries a higher one.
+        let crl_number = serials.len() as u64;
+        let crl_pem = super::crl::generate_crl(&serials, crl_number, ca_pem, ca_key_pem)
+            .map_err(|e| Status::internal(format!("build CRL: {e}")))?;
+        Ok(Response::new(GetCrlResponse { crl_pem }))
+    }
 }
 
 /// Serve ONLY [`NodeEnrollmentService`] on `addr` over PLAINTEXT h2c (no TLS),
@@ -1452,6 +1480,7 @@ pub async fn serve_node_enrollment(
     ca_key_pem: Vec<u8>,
     join_token_hash: String,
     api_key_secret: Option<String>,
+    revoked_serials_path: Option<PathBuf>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
     let svc = NodeEnrollmentServiceImpl {
@@ -1459,6 +1488,7 @@ pub async fn serve_node_enrollment(
         ca_key_pem: Some(ca_key_pem),
         join_token_hash: Some(join_token_hash),
         api_key_secret,
+        revoked_serials_path,
     };
     tracing::info!(
         %addr,

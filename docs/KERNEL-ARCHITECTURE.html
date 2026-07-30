@@ -364,6 +364,13 @@ graph LR
 
 <p>The kernel holds zero authorization logic. Composition model: <strong>1 kernel slot, N impls composed inside a single provider that fans out</strong>. Canonical impl <code>ZonePermsProvider</code> uses inheritance-aware <code>PermissionLeaseCache</code>; a parent-directory lease covers child files. See &sect;2.4.1 for how the gate fits into the dispatch pipeline.</p>
 
+<p><strong>Two policy slots, one shape.</strong> Authentication (<em>who</em>) and authorization (<em>may</em>) are <strong>separate</strong> slots &mdash; each a no-op default swapped for an injected impl, composed independently. A caller never plugs into &ldquo;the auth slot&rdquo;; it plugs into one of these two.</p>
+<table>
+<tr><th>Slot</th><th>Decides</th><th>Tier</th><th>No-op default</th><th>Impls &amp; composition</th></tr>
+<tr><td><code>AuthProvider</code><br>(authN)</td><td>credential &rarr; identity (<code>agent_id</code> + zone grants)</td><td>transport</td><td><code>NoAuth</code> &mdash; caller resolves as admin</td><td>One impl (<code>ApiKeyAuthProvider</code>: sk- token <em>or</em> agent cert). Credential detail lives in the <a href="https://s.shareone.vip/s/nexus-auth-architecture">Auth Architecture</a> doc.</td></tr>
+<tr><td><code>PermissionProvider</code><br>(authZ) &mdash; this gate</td><td>identity + op &rarr; allow / deny</td><td>kernel</td><td>none &rArr; gate returns <code>Ok(())</code> (~2ns)</td><td>1 slot, N impls composed into one provider. <strong>AND</strong>: each may only DENY, any <code>Err</code> &rArr; deny (<code>zone.check()?; rebac.check()?; &hellip;</code>). So plugging in both zone-perms <em>and</em> ReBAC means <strong>both run</strong>, conjunctive &mdash; not one-wins.</td></tr>
+</table>
+
 <h3 id="connect-entry">1.8 Entry Point: <code>connect()</code></h3>
 
 <p><code>connect(config=...)</code> is the mode-dispatcher factory function &mdash; the single entry point for all Nexus users. Linux analogue: <code>mount_root()</code> in <code>init/do_mounts.c</code>.</p>

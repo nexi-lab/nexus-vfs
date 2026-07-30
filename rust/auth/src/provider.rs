@@ -51,7 +51,8 @@
 //! `PutAuthKey` / `DeleteAuthKey` commits — on **every** replica, since the
 //! command replicates. The TTL is the backstop, not the mechanism.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
@@ -117,6 +118,11 @@ pub struct ApiKeyAuthProvider {
     secret: String,
     cache: DashMap<String, CachedContext>,
     cache_ttl: Duration,
+    /// Raw serials of revoked agent certs — the current cluster CRL, projected
+    /// to a lookup set. `resolve` rejects an agent whose cert serial is in here.
+    /// The composition root refreshes it from the CA-signed CRL (the CA's own
+    /// trust plane, orthogonal to raft); empty until the first refresh.
+    revoked_serials: RwLock<HashSet<Vec<u8>>>,
 }
 
 impl ApiKeyAuthProvider {
@@ -134,7 +140,23 @@ impl ApiKeyAuthProvider {
             secret: secret.into(),
             cache: DashMap::new(),
             cache_ttl,
+            revoked_serials: RwLock::new(HashSet::new()),
         }
+    }
+
+    /// Replace the revoked-serial set with the latest CRL projection. Called by
+    /// the composition root's CRL refresh; a swap, so a `resolve` in flight
+    /// sees either the whole old set or the whole new one.
+    pub fn set_revoked_serials(&self, serials: HashSet<Vec<u8>>) {
+        *self.revoked_serials.write().expect("revoked-serials lock") = serials;
+    }
+
+    /// Whether an agent cert with this serial has been revoked (is in the CRL).
+    fn is_revoked(&self, serial: &[u8]) -> bool {
+        self.revoked_serials
+            .read()
+            .expect("revoked-serials lock")
+            .contains(serial)
     }
 
     /// Drop one cached context. Called from the apply-observer when a
@@ -211,7 +233,8 @@ impl ApiKeyAuthProvider {
         ctx
     }
 
-    /// Resolve an `sk-` token, consulting the cache first.
+    /// Resolve an `sk-` token: gate the format, then resolve its record by
+    /// the HMAC store key.
     fn resolve_token(&self, token: &str) -> Result<OperationContext, Status> {
         if !is_well_formed(token) {
             // Deliberately vague to the caller: a client that learns *why*
@@ -219,21 +242,60 @@ impl ApiKeyAuthProvider {
             tracing::debug!("rejected: malformed API key");
             return Err(unauthenticated());
         }
+        self.resolve_by_store_key(hash_key(&self.secret, token))
+    }
 
-        let hash = hash_key(&self.secret, token);
+    /// Resolve a cert-authenticated agent from the cert alone: identity from
+    /// the verified SAN, and that identity IS the whole authorization. No
+    /// credential-store lookup — the CA-signed cert is the single source, so
+    /// this resolves the same on any node the CA reaches, which is what makes a
+    /// cert-agent work cross-node. No cache either: with no store I/O and no
+    /// topology read, building the context is cheaper than a cache round-trip.
+    ///
+    /// The cert is a pure identity (a DID); a valid agent cert carries NO zone
+    /// grant, on purpose. An agent is not a zone tenant — it is a mailbox
+    /// participant — so its authorization to write a mailbox is owned by the
+    /// A2A stamp hook, which fail-closes on a missing `agent_id` and binds
+    /// `from`: the one seam that both authorizes the write and makes authorship
+    /// unforgeable. The zone ACL gate answers an orthogonal question (zone
+    /// tenancy); expressing an agent in `zone_perms` would be shoehorning it
+    /// into the wrong abstraction. So the context stays zoneless rather than
+    /// fabricate a tenancy the agent does not have — if a deployment ever arms
+    /// the zone gate, that gate composes with mailbox paths at its own layer.
+    fn agent_context(name: &str) -> OperationContext {
+        let record = AuthKeyRecord {
+            key_id: String::new(),
+            name: name.to_string(),
+            subject_type: SubjectType::Agent,
+            subject_id: name.to_string(),
+            is_admin: false,
+            revoked: false,
+            expires_at_ms: None,
+            zone_perms: Vec::new(),
+        };
+        Self::context_from_record(&record)
+    }
 
-        if let Some(entry) = self.cache.get(&hash) {
+    /// The `sk-` token resolution path: cache first, then the record's
+    /// fail-closed gates (present, decodable, not revoked, not expired,
+    /// zone-scoped unless admin), then cache the result. The `store_key` is the
+    /// HMAC of the `sk-` token; it is also the cache key AND the value the
+    /// apply-observer hands `invalidate`, so a `DeleteAuthKey` evicts here
+    /// without waiting the TTL. (A cert-agent skips this path entirely — it
+    /// resolves from the cert in `agent_context`, no store, no cache.)
+    fn resolve_by_store_key(&self, store_key: String) -> Result<OperationContext, Status> {
+        if let Some(entry) = self.cache.get(&store_key) {
             if Instant::now() < entry.expires_at {
                 return Ok(entry.ctx.clone());
             }
         }
         // Expired (or absent) — drop the stale row and go to the store.
-        self.cache.remove(&hash);
+        self.cache.remove(&store_key);
 
-        let bytes = match self.store.get(&hash) {
+        let bytes = match self.store.get(&store_key) {
             Ok(Some(bytes)) => bytes,
             Ok(None) => {
-                tracing::debug!("rejected: no such API key");
+                tracing::debug!("rejected: no such credential");
                 return Err(unauthenticated());
             }
             Err(e) => {
@@ -254,27 +316,27 @@ impl ApiKeyAuthProvider {
         };
 
         if record.revoked {
-            tracing::debug!(key_id = %record.key_id, "rejected: revoked key");
+            tracing::debug!(key_id = %record.key_id, "rejected: revoked credential");
             return Err(unauthenticated());
         }
         if record.is_expired(now_ms()) {
-            tracing::debug!(key_id = %record.key_id, "rejected: expired key");
+            tracing::debug!(key_id = %record.key_id, "rejected: expired credential");
             return Err(unauthenticated());
         }
-        // Zoneless keys are reserved for global admins. Without this, a
-        // non-admin key with no grants would fall through to the root zone
-        // (the `zone_id` default below) and quietly hold the whole namespace.
+        // Zoneless credentials are reserved for global admins. Without this, a
+        // non-admin record with no grants would fall through to the root zone
+        // (the `zone_id` default) and quietly hold the whole namespace.
         if record.zone_perms.is_empty() && !record.is_admin {
             tracing::warn!(
                 key_id = %record.key_id,
-                "rejected: non-admin key has no zone grants"
+                "rejected: non-admin credential has no zone grants"
             );
             return Err(unauthenticated());
         }
 
         let ctx = Self::context_from_record(&record);
         self.cache.insert(
-            hash,
+            store_key,
             CachedContext {
                 ctx: ctx.clone(),
                 expires_at: Instant::now() + self.cache_ttl,
@@ -296,6 +358,22 @@ impl AuthProvider for ApiKeyAuthProvider {
         // Peer plane first: a verified cluster node needs no token, which is
         // exactly why federation survives a strict provider.
         if let Some(peer) = creds.peer {
+            // An agent cert authenticates as its agent — identity from the
+            // CA-verified SAN, which is its whole authorization (the stamp hook
+            // gates its mailbox writes). No store lookup, so it resolves the
+            // same on any node the CA reaches. A node cert is a cluster peer
+            // (membership authorizes).
+            if let Some(agent) = &peer.agent_name {
+                // Revocation is the one thing a valid chain does not settle: a
+                // stolen key still chains to the CA. The CRL closes that — an
+                // agent whose serial the CA revoked is rejected on every node
+                // that has refreshed the list.
+                if self.is_revoked(&peer.serial) {
+                    tracing::warn!(agent = %agent, "rejected: agent cert is revoked (in CRL)");
+                    return Err(unauthenticated());
+                }
+                return Ok(Self::agent_context(agent));
+            }
             return Ok(Self::peer_context(peer));
         }
         if creds.token.is_empty() {
@@ -411,6 +489,75 @@ mod tests {
         // short-circuit the permission gate entirely.
         assert!(!ctx.is_system);
         assert!(!ctx.is_admin);
+    }
+
+    /// A cert-authenticated agent resolves to its id FROM THE CERT (identity in
+    /// the SAN) with no store lookup, so it resolves the same on any node the CA
+    /// reaches. The context carries the agent's id and NO zone grant — being a
+    /// valid agent cert is the whole authorization; the stamp hook gates its
+    /// mailbox writes. An agent is not a zone tenant.
+    #[test]
+    fn a_cert_agent_resolves_to_its_identity_with_no_zone_grant() {
+        let peer = PeerIdentity {
+            common_name: "nexus-agent-mac-ai".into(),
+            node_id: None,
+            zone_id: None,
+            agent_name: Some("mac-ai".into()),
+            serial: vec![1, 2, 3],
+        };
+        // The store is empty on purpose: resolution reads the cert, not a record.
+        let ctx = provider(MemStore::arc())
+            .resolve(&AuthCredentials {
+                token: "",
+                peer: Some(&peer),
+            })
+            .expect("cert agent resolves from its cert identity");
+
+        assert_eq!(ctx.agent_id.as_deref(), Some("mac-ai"));
+        assert_eq!(ctx.subject_type, "agent");
+        assert!(
+            ctx.zone_perms.is_empty(),
+            "a cert-agent carries no zone grant — it is a mailbox participant, not a zone tenant"
+        );
+        assert!(!ctx.is_system, "an agent is never a system caller");
+        assert!(!ctx.is_admin, "an agent is never an admin");
+    }
+
+    /// A CA-verified agent cert is rejected once its serial is in the CRL —
+    /// a valid chain no longer suffices, which is the whole point of revocation
+    /// (a stolen key still chains to the CA). Un-revoking (a later CRL without
+    /// the serial) lets it back in.
+    #[test]
+    fn a_revoked_agent_cert_is_rejected() {
+        let peer = PeerIdentity {
+            common_name: "nexus-agent-mac-ai".into(),
+            node_id: None,
+            zone_id: None,
+            agent_name: Some("mac-ai".into()),
+            serial: vec![9, 9, 9],
+        };
+        let provider = provider(MemStore::arc());
+        let creds = || AuthCredentials {
+            token: "",
+            peer: Some(&peer),
+        };
+
+        // Before revocation: the cert resolves.
+        assert!(provider.resolve(&creds()).is_ok(), "a fresh cert resolves");
+
+        // The CRL now names this serial → rejected on this node.
+        provider.set_revoked_serials(HashSet::from([vec![9, 9, 9]]));
+        assert!(
+            provider.resolve(&creds()).is_err(),
+            "a revoked serial is rejected even though the chain is valid"
+        );
+
+        // A different revoked serial does not touch this cert.
+        provider.set_revoked_serials(HashSet::from([vec![1, 2, 3]]));
+        assert!(
+            provider.resolve(&creds()).is_ok(),
+            "only the listed serial is revoked"
+        );
     }
 
     /// A user key carries no `agent_id`, so its holder cannot author agent
@@ -553,6 +700,8 @@ mod tests {
             common_name: "win-node".into(),
             node_id: Some(42),
             zone_id: Some("sharedzone".into()),
+            agent_name: None,
+            serial: vec![],
         };
         let ctx = provider(MemStore::arc())
             .resolve(&AuthCredentials {

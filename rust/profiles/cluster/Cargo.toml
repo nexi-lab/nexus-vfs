@@ -65,3 +65,8 @@ gethostname = "1.1"
 [dev-dependencies]
 # wire_durable_metastore tests open real redb files in a temp data dir.
 tempfile = "3"
+# The `mailbox_cli` example seals / opens signed envelopes and names the
+# cluster server-name — both live in `lib::transport_primitives` behind its
+# `transport` feature. Example-only, so the shipped binary carries no direct
+# lib dep beyond what `transport` already pulls.
+lib = { workspace = true, features = ["transport"] }

@@ -33,7 +33,7 @@
 //!
 //! ## Wiring it (composition root)
 //!
-//! ```rust,ignore
+//! ```text
 //! let store = RaftAuthKeyStore::new_arc(root_zone_consensus, runtime);
 //! kernel.set_auth_key_store(Arc::clone(&store));   // for /__sys__/auth/keys/
 //!
@@ -68,7 +68,9 @@ pub mod provider;
 pub mod record;
 pub mod slot_store;
 
-pub use mint::{mint_key, revoke_key, revoke_key_hash, MintedKey};
+pub use mint::{
+    agent_store_key, mint_agent_authz, mint_key, revoke_key, revoke_key_hash, MintedKey,
+};
 pub use provider::{
     hash_key, is_well_formed, ApiKeyAuthProvider, API_KEY_MIN_LENGTH, API_KEY_PREFIX,
     DEFAULT_CACHE_TTL,

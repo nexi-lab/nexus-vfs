@@ -1,11 +1,11 @@
 //! Shared black-box harness for the `nexus-cluster` e2e integration tests.
 //!
 //! These tests spawn the REAL `nexusd-cluster` binary (via
-//! `CARGO_BIN_EXE_nexusd-cluster`) and drive it over a REAL gRPC channel —
-//! the Rust replacements for the retired `scripts/e2e_*.py`. A black-box
-//! binary+wire test catches what an in-process test structurally can't: clap
-//! arg parsing, the boot posture, and the on-the-wire proto contract a foreign
-//! client (moss/sudocode) sees. The harness keeps each test a short journey.
+//! `CARGO_BIN_EXE_nexusd-cluster`) and drive it over a REAL gRPC channel. A
+//! black-box binary+wire test catches what an in-process test structurally
+//! can't: clap arg parsing, the boot posture, and the on-the-wire proto
+//! contract a foreign client (moss/sudocode) sees. The harness keeps each test
+//! a short journey.
 
 #![allow(dead_code)] // each test file uses a different subset
 
@@ -196,15 +196,21 @@ impl Drop for Daemon {
     }
 }
 
-/// Run the offline `auth mint` subcommand and return the minted `sk-` key.
+/// Mint an `sk-` token for a `user` or `service` subject (the token plane).
+/// Agents are cert-only — use [`mint_agent_cert`] for those. Returns the key.
 /// The daemon must NOT be holding the data-dir lock when this runs.
-pub fn mint_agent_key(env: &[(&str, &str)], subject_id: &str, zone_rw: &str) -> String {
+pub fn mint_token_key(
+    env: &[(&str, &str)],
+    subject_type: &str,
+    subject_id: &str,
+    zone_rw: &str,
+) -> String {
     let mut cmd = Command::new(bin());
     cmd.args([
         "auth",
         "mint",
         "--subject-type",
-        "agent",
+        subject_type,
         "--subject-id",
         subject_id,
         "--zone",
@@ -229,6 +235,40 @@ pub fn mint_agent_key(env: &[(&str, &str)], subject_id: &str, zone_rw: &str) -> 
     key
 }
 
+/// Mint a cert-agent (`--subject-type agent`) and return its bundle directory
+/// (holding `agent.pem` / `agent-key.pem` / `ca.pem`). An agent's one credential
+/// is a CA-signed identity cert — [`Vfs::connect_mtls`] presents it. Needs the
+/// founder CA at `<data-dir>/tls`; the daemon must NOT hold the data-dir lock.
+pub fn mint_agent_cert(env: &[(&str, &str)], subject_id: &str) -> std::path::PathBuf {
+    let mut cmd = Command::new(bin());
+    cmd.args([
+        "auth",
+        "mint",
+        "--subject-type",
+        "agent",
+        "--subject-id",
+        subject_id,
+        "--name",
+        "e2e",
+    ]);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("run `auth mint` (agent cert)");
+    assert!(
+        out.status.success(),
+        "agent cert mint failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let dir = std::path::PathBuf::from(dir);
+    assert!(
+        dir.join("agent.pem").exists() && dir.join("agent-key.pem").exists(),
+        "mint did not write a cert bundle at {dir:?}"
+    );
+    dir
+}
+
 /// Run any offline subcommand; returns (success, stdout, stderr).
 pub fn cli(env: &[(&str, &str)], args: &[&str]) -> (bool, String, String) {
     let mut cmd = Command::new(bin());
@@ -242,6 +282,33 @@ pub fn cli(env: &[(&str, &str)], args: &[&str]) -> (bool, String, String) {
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
+}
+
+/// Write a TLS bundle (a shared CA + a fresh node cert with loopback SANs) plus
+/// the persisted `node_id` into `data_dir`, so `bootstrap_tls` finds the bundle
+/// present and reuses it (TLS on, no self-generated CA). One shared CA is what
+/// lets nodes verify each other's client certs — cluster membership — and is
+/// also what an offline `auth mint --subject-type agent` reads to sign the cert.
+pub fn write_tls_bundle(
+    data_dir: &std::path::Path,
+    node_id: u64,
+    ca: &[u8],
+    ca_key: &[u8],
+    token_hash: &str,
+) {
+    use nexus_raft::transport::generate_node_cert;
+    let tls = data_dir.join("tls");
+    std::fs::create_dir_all(&tls).expect("mkdir tls");
+    let (cert, key) =
+        generate_node_cert(node_id, "root", ca, ca_key, &[], Some("localhost")).expect("node cert");
+    std::fs::write(tls.join("ca.pem"), ca).unwrap();
+    std::fs::write(tls.join("ca-key.pem"), ca_key).unwrap();
+    std::fs::write(tls.join("node.pem"), cert).unwrap();
+    std::fs::write(tls.join("node-key.pem"), key).unwrap();
+    std::fs::write(tls.join("join-token-hash"), token_hash).unwrap();
+    // read_or_mint_node_id reads an 8-byte big-endian u64 (matches the cert's
+    // node/{id} identity SAN so the running node and its cert agree).
+    std::fs::write(data_dir.join(".node_id"), node_id.to_be_bytes()).unwrap();
 }
 
 /// Thin typed wrapper over the VFS gRPC client. Every call carries its bearer
@@ -277,6 +344,48 @@ impl Vfs {
             assert!(
                 Instant::now() < deadline,
                 "port :{port} never authenticated the token within budget"
+            );
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    }
+
+    /// Dial the mTLS plane presenting a client identity cert — an agent's
+    /// `agent.pem` / `agent-key.pem` bundle (as `auth mint --subject-type agent` writes),
+    /// chaining to `ca_pem`. The daemon authenticates the caller from the
+    /// client certificate (the peer plane), so calls carry an EMPTY token.
+    /// Polls until the TLS handshake + a bare `Ping` both succeed — the cert
+    /// authenticating IS the readiness gate.
+    pub async fn connect_mtls(
+        port: u16,
+        ca_pem: &[u8],
+        client_cert_pem: &[u8],
+        client_key_pem: &[u8],
+        budget: Duration,
+    ) -> Self {
+        use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
+        let tls = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(ca_pem))
+            .identity(Identity::from_pem(client_cert_pem, client_key_pem))
+            .domain_name(lib::transport_primitives::TlsConfig::CLUSTER_SERVER_NAME);
+        let deadline = Instant::now() + budget;
+        loop {
+            let connected = Endpoint::from_shared(format!("https://127.0.0.1:{port}"))
+                .expect("valid uri")
+                .tls_config(tls.clone())
+                .expect("tls config")
+                .connect()
+                .await;
+            if let Ok(ch) = connected {
+                let mut v = Vfs {
+                    c: NexusVfsServiceClient::new(ch),
+                };
+                if v.ping("").await.is_ok() {
+                    return v;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "port :{port} never authenticated the client cert within budget"
             );
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
