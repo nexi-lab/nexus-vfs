@@ -55,11 +55,10 @@ pub struct PeerIdentity {
     /// Agent name pinned in a `nexus://agent/{name}` URI SAN. `Some` for an
     /// agent-identity cert, `None` for a node cert — the two SAN namespaces
     /// are disjoint. When present the peer is an agent, not a cluster node.
+    /// The cert is a pure identity (a DID): it carries no authorization, so
+    /// there is nothing else to read from it — a valid agent is a mailbox
+    /// principal, full stop.
     pub agent_name: Option<String>,
-    /// The agent's grants, read from the cert's capability extension. `Some`
-    /// alongside `agent_name` — an agent's authorization travels in its
-    /// CA-signed cert, so any node has it without a credential-store lookup.
-    pub agent_grants: Option<contracts::AgentGrants>,
 }
 
 impl PeerIdentity {
@@ -161,7 +160,6 @@ mod tests {
             node_id: Some(7),
             zone_id: Some("root".into()),
             agent_name: None,
-            agent_grants: None,
         };
         assert_eq!(named.display_id(), "node/7");
 
@@ -170,7 +168,6 @@ mod tests {
             node_id: None,
             zone_id: None,
             agent_name: None,
-            agent_grants: None,
         };
         assert_eq!(legacy.display_id(), "nexus-zone-root-node-win");
 
@@ -179,7 +176,6 @@ mod tests {
             node_id: None,
             zone_id: None,
             agent_name: Some("win-ai".into()),
-            agent_grants: None,
         };
         assert_eq!(agent.display_id(), "agent/win-ai");
     }

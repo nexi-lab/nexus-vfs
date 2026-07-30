@@ -1,7 +1,7 @@
 //! Agent identity URI SAN — the `nexus://agent/{name}` that `certgen` pins into
-//! an agent cert and `peer_identity` / `authorship` read back. Pure string
-//! helpers (implementation), depending on nothing. The OID and `AgentGrants`
-//! *data* live in `contracts`; these *functions* live here per the tier split
+//! an agent cert and `peer_identity` / `authorship` read back. The cert is a
+//! pure identity (a DID); this SAN is all it carries. Pure string helpers
+//! (implementation), depending on nothing — they live here per the tier split
 //! (contracts = types/constants, lib = implementations).
 
 /// Scheme + authority of the agent identity URI SAN. An agent cert states which

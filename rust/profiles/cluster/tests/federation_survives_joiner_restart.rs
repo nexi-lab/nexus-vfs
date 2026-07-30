@@ -141,8 +141,6 @@ async fn replication_survives_restart(
                 "agent",
                 "--subject-id",
                 "probe",
-                "--zone",
-                "sharedzone:rw",
                 "--name",
                 "probe",
             ],

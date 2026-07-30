@@ -25,7 +25,6 @@ use common::{cli, mint_agent_cert, write_tls_bundle};
 use nexus_raft::transport::{generate_join_token, generate_zone_ca};
 
 const SECRET: &str = "e2e-identity-unique-secret";
-const ZONE: &str = "sharedzone:rw";
 
 fn mint_args(subject_id: &str, extra: &[&str]) -> Vec<String> {
     let mut args = vec![
@@ -35,8 +34,6 @@ fn mint_args(subject_id: &str, extra: &[&str]) -> Vec<String> {
         "agent".to_string(),
         "--subject-id".to_string(),
         subject_id.to_string(),
-        "--zone".to_string(),
-        ZONE.to_string(),
         "--name".to_string(),
         "e2e".to_string(),
     ];
@@ -63,7 +60,7 @@ fn agent_identity_is_unique_cluster_wide() {
     ];
 
     // ── 1. MINT ─────────────────────────────────────────────────────────
-    let first = mint_agent_cert(&env, "dup-agent", ZONE);
+    let first = mint_agent_cert(&env, "dup-agent");
 
     // ── 2. LIST — durable, read back from a separate process ────────────
     let (ok, stdout, stderr) = cli(&env, &["auth", "list"]);
@@ -90,6 +87,6 @@ fn agent_identity_is_unique_cluster_wide() {
     assert!(ok, "--allow-existing must permit rotation:\n{err}");
 
     // ── 5. OTHER — a different identity is unaffected ───────────────────
-    let second = mint_agent_cert(&env, "other-agent", ZONE);
+    let second = mint_agent_cert(&env, "other-agent");
     assert_ne!(first, second, "distinct subjects get distinct bundles");
 }

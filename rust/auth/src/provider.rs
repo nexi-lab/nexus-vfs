@@ -224,40 +224,43 @@ impl ApiKeyAuthProvider {
     }
 
     /// Resolve a cert-authenticated agent from the cert alone: identity from
-    /// the verified SAN, authorization from the cert's grants extension. No
+    /// the verified SAN, and that identity IS the whole authorization. No
     /// credential-store lookup — the CA-signed cert is the single source, so
-    /// this resolves the same on any node the CA reaches, which is what makes
-    /// a cert-agent work cross-node. Reuses `context_from_record` by building a
-    /// transient record from the cert's identity + grants.
-    fn agent_context(
-        name: &str,
-        grants: &contracts::AgentGrants,
-    ) -> Result<OperationContext, Status> {
-        // Zoneless non-admin reaches nothing; refuse it here as the token plane
-        // does, rather than mint a context the gate would only deny.
-        if grants.zone_perms.is_empty() && !grants.is_admin {
-            tracing::warn!(agent = %name, "rejected: agent cert grants no zones and is not admin");
-            return Err(unauthenticated());
-        }
+    /// this resolves the same on any node the CA reaches, which is what makes a
+    /// cert-agent work cross-node. No cache either: with no store I/O and no
+    /// topology read, building the context is cheaper than a cache round-trip.
+    ///
+    /// The cert is a pure identity (a DID); a valid agent cert carries NO zone
+    /// grant, on purpose. An agent is not a zone tenant — it is a mailbox
+    /// participant — so its authorization to write a mailbox is owned by the
+    /// A2A stamp hook, which fail-closes on a missing `agent_id` and binds
+    /// `from`: the one seam that both authorizes the write and makes authorship
+    /// unforgeable. The zone ACL gate answers an orthogonal question (zone
+    /// tenancy); expressing an agent in `zone_perms` would be shoehorning it
+    /// into the wrong abstraction. So the context stays zoneless rather than
+    /// fabricate a tenancy the agent does not have — if a deployment ever arms
+    /// the zone gate, that gate composes with mailbox paths at its own layer.
+    fn agent_context(name: &str) -> OperationContext {
         let record = AuthKeyRecord {
             key_id: String::new(),
             name: name.to_string(),
             subject_type: SubjectType::Agent,
             subject_id: name.to_string(),
-            is_admin: grants.is_admin,
+            is_admin: false,
             revoked: false,
             expires_at_ms: None,
-            zone_perms: grants.zone_perms.clone(),
+            zone_perms: Vec::new(),
         };
-        Ok(Self::context_from_record(&record))
+        Self::context_from_record(&record)
     }
 
-    /// The shared credential-resolution path for both planes: cache first,
-    /// then the record's fail-closed gates (present, decodable, not revoked,
-    /// not expired, zone-scoped unless admin), then cache the result. The
-    /// `store_key` is the HMAC of an `sk-` token or `agent:{name}` for a cert
-    /// agent; it is also the cache key AND the value the apply-observer hands
-    /// `invalidate`, so a `DeleteAuthKey` evicts here without waiting the TTL.
+    /// The `sk-` token resolution path: cache first, then the record's
+    /// fail-closed gates (present, decodable, not revoked, not expired,
+    /// zone-scoped unless admin), then cache the result. The `store_key` is the
+    /// HMAC of the `sk-` token; it is also the cache key AND the value the
+    /// apply-observer hands `invalidate`, so a `DeleteAuthKey` evicts here
+    /// without waiting the TTL. (A cert-agent skips this path entirely — it
+    /// resolves from the cert in `agent_context`, no store, no cache.)
     fn resolve_by_store_key(&self, store_key: String) -> Result<OperationContext, Status> {
         if let Some(entry) = self.cache.get(&store_key) {
             if Instant::now() < entry.expires_at {
@@ -333,13 +336,13 @@ impl AuthProvider for ApiKeyAuthProvider {
         // Peer plane first: a verified cluster node needs no token, which is
         // exactly why federation survives a strict provider.
         if let Some(peer) = creds.peer {
-            // An agent cert authenticates as its agent — identity from the SAN,
-            // authorization from the cert's grants extension, both CA-verified.
-            // No store lookup, so it resolves the same on any node the CA
-            // reaches. A node cert is a cluster peer (membership authorizes).
+            // An agent cert authenticates as its agent — identity from the
+            // CA-verified SAN, which is its whole authorization (the stamp hook
+            // gates its mailbox writes). No store lookup, so it resolves the
+            // same on any node the CA reaches. A node cert is a cluster peer
+            // (membership authorizes).
             if let Some(agent) = &peer.agent_name {
-                let grants = peer.agent_grants.clone().unwrap_or_default();
-                return Self::agent_context(agent, &grants);
+                return Ok(Self::agent_context(agent));
             }
             return Ok(Self::peer_context(peer));
         }
@@ -458,21 +461,18 @@ mod tests {
         assert!(!ctx.is_admin);
     }
 
-    /// A cert-authenticated agent resolves to its id + grants FROM THE CERT
-    /// (`peer.agent_grants`) with no store lookup, so it resolves the same on
-    /// any node the CA reaches. An agent cert that grants nothing reaches
-    /// nothing.
+    /// A cert-authenticated agent resolves to its id FROM THE CERT (identity in
+    /// the SAN) with no store lookup, so it resolves the same on any node the CA
+    /// reaches. The context carries the agent's id and NO zone grant — being a
+    /// valid agent cert is the whole authorization; the stamp hook gates its
+    /// mailbox writes. An agent is not a zone tenant.
     #[test]
-    fn a_cert_agent_resolves_from_the_cert_grants() {
+    fn a_cert_agent_resolves_to_its_identity_with_no_zone_grant() {
         let peer = PeerIdentity {
             common_name: "nexus-agent-mac-ai".into(),
             node_id: None,
             zone_id: None,
             agent_name: Some("mac-ai".into()),
-            agent_grants: Some(contracts::AgentGrants {
-                is_admin: false,
-                zone_perms: vec![("sharedzone".into(), "rw".into())],
-            }),
         };
         // The store is empty on purpose: resolution reads the cert, not a record.
         let ctx = provider(MemStore::arc())
@@ -480,28 +480,16 @@ mod tests {
                 token: "",
                 peer: Some(&peer),
             })
-            .expect("cert agent resolves from its cert grants");
+            .expect("cert agent resolves from its cert identity");
 
         assert_eq!(ctx.agent_id.as_deref(), Some("mac-ai"));
         assert_eq!(ctx.subject_type, "agent");
-        assert_eq!(ctx.zone_perms, vec![("sharedzone".into(), "rw".into())]);
-        assert!(!ctx.is_system, "an agent is never a system caller");
-        assert!(!ctx.is_admin);
-
-        // An agent cert that grants nothing (no zones, not admin) reaches nothing.
-        let powerless = PeerIdentity {
-            agent_grants: Some(contracts::AgentGrants::default()),
-            ..peer.clone()
-        };
         assert!(
-            provider(MemStore::arc())
-                .resolve(&AuthCredentials {
-                    token: "",
-                    peer: Some(&powerless),
-                })
-                .is_err(),
-            "an agent cert granting nothing reaches nothing"
+            ctx.zone_perms.is_empty(),
+            "a cert-agent carries no zone grant — it is a mailbox participant, not a zone tenant"
         );
+        assert!(!ctx.is_system, "an agent is never a system caller");
+        assert!(!ctx.is_admin, "an agent is never an admin");
     }
 
     /// A user key carries no `agent_id`, so its holder cannot author agent
@@ -645,7 +633,6 @@ mod tests {
             node_id: Some(42),
             zone_id: Some("sharedzone".into()),
             agent_name: None,
-            agent_grants: None,
         };
         let ctx = provider(MemStore::arc())
             .resolve(&AuthCredentials {

@@ -58,7 +58,6 @@ async fn from_is_unforgeable_across_trust_domains_via_signed_cert() {
     let adv = format!("127.0.0.1:{port}");
     let bind = format!("127.0.0.1:{port}");
     let mounts = format!("{MOUNT}={ZONE}");
-    let zone_rw = format!("{ZONE}:rw");
     // TLS deliberately ON — NEXUS_NO_TLS is unset.
     let env = vec![
         ("NEXUS_DATA_DIR", data_s.as_ref()),
@@ -90,8 +89,6 @@ async fn from_is_unforgeable_across_trust_domains_via_signed_cert() {
             "agent",
             "--subject-id",
             "win-ai",
-            "--zone",
-            &zone_rw,
             "--name",
             "e2e",
         ],
@@ -141,13 +138,8 @@ async fn from_is_unforgeable_across_trust_domains_via_signed_cert() {
     // is authenticated, so the stamp leaves the matching `from` alone), it is
     // caught the moment a consumer opens it against OUR CA.
     let (foreign_ca, foreign_ca_key) = generate_zone_ca("evil").expect("foreign CA");
-    let grants = contracts::AgentGrants {
-        is_admin: false,
-        zone_perms: vec![(ZONE.to_string(), "rw".to_string())],
-    };
     let (foreign_cert, foreign_key) =
-        generate_agent_cert("win-ai", &grants, &foreign_ca, &foreign_ca_key)
-            .expect("foreign agent cert");
+        generate_agent_cert("win-ai", &foreign_ca, &foreign_ca_key).expect("foreign agent cert");
     let forged = seal(
         "win-ai",
         b"i am not really win-ai",
@@ -244,7 +236,6 @@ async fn signed_from_replicates_and_verifies_on_a_peer_node() {
     let fbind = format!("127.0.0.1:{fport}");
     let jbind = format!("127.0.0.1:{jport}");
     let mounts = format!("{MOUNT}={ZONE}");
-    let zone_rw = format!("{ZONE}:rw");
     let zone_registered = format!("Zone '{ZONE}' registered");
 
     let founder_env = vec![
@@ -282,8 +273,6 @@ async fn signed_from_replicates_and_verifies_on_a_peer_node() {
             "agent",
             "--subject-id",
             "win-ai",
-            "--zone",
-            &zone_rw,
             "--name",
             "e2e",
         ],
@@ -372,13 +361,8 @@ async fn signed_from_replicates_and_verifies_on_a_peer_node() {
 
     // ── FORGE: a foreign-CA envelope, ingested + replicated, rejected on the peer ─
     let (foreign_ca, foreign_ca_key) = generate_zone_ca("evil").expect("foreign CA");
-    let grants = contracts::AgentGrants {
-        is_admin: false,
-        zone_perms: vec![(ZONE.to_string(), "rw".to_string())],
-    };
     let (foreign_cert, foreign_key) =
-        generate_agent_cert("win-ai", &grants, &foreign_ca, &foreign_ca_key)
-            .expect("foreign agent cert");
+        generate_agent_cert("win-ai", &foreign_ca, &foreign_ca_key).expect("foreign agent cert");
     let forged = seal(
         "win-ai",
         b"forged across nodes",

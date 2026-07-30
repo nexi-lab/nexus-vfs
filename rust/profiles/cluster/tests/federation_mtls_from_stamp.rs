@@ -139,7 +139,6 @@ async fn from_is_unforgeable_across_an_mtls_federation_both_directions() {
     let jbind = format!("127.0.0.1:{jport}");
     let mounts = format!("{MOUNT}={ZONE}");
     let peers = fadv.clone();
-    let zone_rw = format!("{ZONE}:rw");
 
     // ── 2-3a. FOUNDER: form sharedzone → stop → mint win-ai cert → restart ──
     // A live node's dance: minting is offline (redb lock), and it must NOT run
@@ -160,11 +159,7 @@ async fn from_is_unforgeable_across_an_mtls_federation_both_directions() {
             .expect("founder forms + persists the sharedzone mount");
         // drop → kill → release the data-dir lock for the offline mint.
     }
-    let win_bundle = mint_agent_cert(
-        &founder_env(&fdata, &fid, &fadv, &mounts),
-        "win-ai",
-        &zone_rw,
-    );
+    let win_bundle = mint_agent_cert(&founder_env(&fdata, &fid, &fadv, &mounts), "win-ai");
     let win_cert = std::fs::read(win_bundle.join("agent.pem")).expect("win-ai cert");
     let win_key = std::fs::read(win_bundle.join("agent-key.pem")).expect("win-ai key");
     let mut founder = Daemon::spawn(
@@ -186,7 +181,7 @@ async fn from_is_unforgeable_across_an_mtls_federation_both_directions() {
             .await
             .expect("joiner joins sharedzone over mTLS");
     }
-    let mac_bundle = mint_agent_cert(&joiner_env(&jdata, &jid, &jadv, &peers), "mac-ai", &zone_rw);
+    let mac_bundle = mint_agent_cert(&joiner_env(&jdata, &jid, &jadv, &peers), "mac-ai");
     let mac_cert = std::fs::read(mac_bundle.join("agent.pem")).expect("mac-ai cert");
     let mac_key = std::fs::read(mac_bundle.join("agent-key.pem")).expect("mac-ai key");
     let mut joiner = Daemon::spawn(

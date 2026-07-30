@@ -3285,17 +3285,6 @@ fn run_auth_action(
                     ))
                 }
             };
-            let zone_perms = zones
-                .iter()
-                .map(|z| parse_zone_grant(z))
-                .collect::<Result<Vec<_>>>()?;
-            if zone_perms.is_empty() && !admin {
-                return Err(anyhow::anyhow!(
-                    "a key with no zone grants reaches nothing and is refused at \
-                     authentication time. Pass --zone ZONE:PERMS, or --admin for a \
-                     global admin (the only principal allowed a zoneless key)."
-                ));
-            }
             let expires_at_ms = expires_in_days.map(|days| {
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -3303,16 +3292,6 @@ fn run_auth_action(
                     .unwrap_or(0);
                 now_ms + days * 24 * 60 * 60 * 1000
             });
-            let record = auth::AuthKeyRecord {
-                key_id: uuid_v4(),
-                name,
-                subject_type,
-                subject_id,
-                is_admin: admin,
-                revoked: false,
-                expires_at_ms,
-                zone_perms,
-            };
 
             // An agent's credential IS a CA-signed identity cert, never an
             // `sk-` token: the cert both authenticates it over mTLS and signs
@@ -3322,6 +3301,13 @@ fn run_auth_action(
             // subject type, one credential kind: `--subject-type agent` issues a
             // cert; `user` / `service` keep the `sk-` token plane below.
             //
+            // The cert is a pure identity (a DID): it carries no authorization,
+            // so a valid agent cert is simply a mailbox principal (rw the A2A
+            // area — the resolver grants that fixed scope). `--zone` / `--admin`
+            // do not apply; a principal that needs zone grants holds a `user` /
+            // `service` key instead. The founder-local record below exists for
+            // cluster-wide name uniqueness + audit, not for resolution.
+            //
             // Placement: the reusable units live in libraries — `generate_agent_cert`
             // (raft::transport) and `mint_agent_authz` (auth). Only this operator-CLI
             // glue (on-disk bundle layout + the stdout path contract) is
@@ -3329,14 +3315,23 @@ fn run_auth_action(
             // provisions agents programmatically calls those two units directly and
             // returns the bytes in memory rather than writing a bundle.
             if subject_type == auth::SubjectType::Agent {
-                let name = record.subject_id.clone();
-                let zones = record.zone_perms.clone();
-                // Grants ride in the cert (capability), read back by any node
-                // via the CA — the record below is founder-local (uniqueness +
-                // audit), not the resolution path.
-                let grants = contracts::AgentGrants {
-                    is_admin: record.is_admin,
-                    zone_perms: zones.clone(),
+                if !zones.is_empty() || admin {
+                    return Err(anyhow::anyhow!(
+                        "an agent cert is a pure identity and carries no authorization; \
+                         --zone / --admin do not apply. Mint a --subject-type user or \
+                         service key for a principal that needs zone grants."
+                    ));
+                }
+                let name_id = subject_id.clone();
+                let record = auth::AuthKeyRecord {
+                    key_id: uuid_v4(),
+                    name,
+                    subject_type,
+                    subject_id,
+                    is_admin: false,
+                    revoked: false,
+                    expires_at_ms,
+                    zone_perms: Vec::new(),
                 };
                 let tls_dir = data_dir.join("tls");
                 let ca_pem = std::fs::read(tls_dir.join("ca.pem")).with_context(|| {
@@ -3351,17 +3346,13 @@ fn run_auth_action(
                         tls_dir.display()
                     )
                 })?;
-                let (cert_pem, key_pem) = nexus_raft::transport::generate_agent_cert(
-                    &name,
-                    &grants,
-                    &ca_pem,
-                    &ca_key_pem,
-                )
-                .map_err(|e| anyhow::anyhow!("generate agent cert: {e}"))?;
+                let (cert_pem, key_pem) =
+                    nexus_raft::transport::generate_agent_cert(&name_id, &ca_pem, &ca_key_pem)
+                        .map_err(|e| anyhow::anyhow!("generate agent cert: {e}"))?;
                 auth::mint_agent_authz(store, record, allow_existing)
                     .map_err(|e| anyhow::anyhow!("mint agent: {e}"))?;
 
-                let out_dir = data_dir.join("agents").join(&name);
+                let out_dir = data_dir.join("agents").join(&name_id);
                 std::fs::create_dir_all(&out_dir)
                     .with_context(|| format!("create {}", out_dir.display()))?;
                 std::fs::write(out_dir.join("agent.pem"), &cert_pem)
@@ -3376,7 +3367,7 @@ fn run_auth_action(
                 // captures it and nothing else.
                 println!("{}", out_dir.display());
                 eprintln!(
-                    "minted agent cert subject=agent:{name} zones={zones:?} -> {}",
+                    "minted agent cert subject=agent:{name_id} -> {}",
                     out_dir.display()
                 );
                 eprintln!(
@@ -3384,6 +3375,30 @@ fn run_auth_action(
                 );
                 return Ok(());
             }
+
+            // The `sk-` token plane: user / service keys. A key with no zone
+            // grants reaches nothing, so require at least one (or --admin).
+            let zone_perms = zones
+                .iter()
+                .map(|z| parse_zone_grant(z))
+                .collect::<Result<Vec<_>>>()?;
+            if zone_perms.is_empty() && !admin {
+                return Err(anyhow::anyhow!(
+                    "a key with no zone grants reaches nothing and is refused at \
+                     authentication time. Pass --zone ZONE:PERMS, or --admin for a \
+                     global admin (the only principal allowed a zoneless key)."
+                ));
+            }
+            let record = auth::AuthKeyRecord {
+                key_id: uuid_v4(),
+                name,
+                subject_type,
+                subject_id,
+                is_admin: admin,
+                revoked: false,
+                expires_at_ms,
+                zone_perms,
+            };
 
             let minted = auth::mint_key(store, secret, record, allow_existing)
                 .map_err(|e| anyhow::anyhow!("mint: {e}"))?;

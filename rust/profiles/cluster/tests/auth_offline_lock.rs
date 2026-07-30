@@ -51,8 +51,6 @@ async fn offline_auth_against_a_running_daemon_fails_cleanly_not_panics() {
             "agent",
             "--subject-id",
             "x",
-            "--zone",
-            "sharedzone:rw",
             "--name",
             "e2e",
         ],

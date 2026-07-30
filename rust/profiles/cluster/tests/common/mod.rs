@@ -239,11 +239,7 @@ pub fn mint_token_key(
 /// (holding `agent.pem` / `agent-key.pem` / `ca.pem`). An agent's one credential
 /// is a CA-signed identity cert — [`Vfs::connect_mtls`] presents it. Needs the
 /// founder CA at `<data-dir>/tls`; the daemon must NOT hold the data-dir lock.
-pub fn mint_agent_cert(
-    env: &[(&str, &str)],
-    subject_id: &str,
-    zone_rw: &str,
-) -> std::path::PathBuf {
+pub fn mint_agent_cert(env: &[(&str, &str)], subject_id: &str) -> std::path::PathBuf {
     let mut cmd = Command::new(bin());
     cmd.args([
         "auth",
@@ -252,8 +248,6 @@ pub fn mint_agent_cert(
         "agent",
         "--subject-id",
         subject_id,
-        "--zone",
-        zone_rw,
         "--name",
         "e2e",
     ]);
