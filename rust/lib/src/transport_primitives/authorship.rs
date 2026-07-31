@@ -230,6 +230,30 @@ mod tests {
         assert_eq!(content, b"hello mac");
     }
 
+    /// Cross-organization authorship: an org's agent seals under ITS OWN CA,
+    /// and a consumer in ANOTHER org verifies it by anchoring the sender org's
+    /// CA. The `open` anchor is the whole trust decision, so authorship crosses
+    /// org boundaries with no shared secret — just a shared trust anchor (the
+    /// X.509 way). A consumer that does not anchor the sender's CA rejects it.
+    #[test]
+    fn authorship_crosses_org_boundaries_via_the_senders_ca() {
+        let (org_a_ca, org_a_key) = mint_ca("org-a");
+        let (org_b_ca, _org_b_key) = mint_ca("org-b");
+        let (cert, key) = mint_agent("a-agent", &org_a_ca, &org_a_key);
+        let env = seal("a-agent", b"cross-org hello", &key, &cert).unwrap();
+
+        // Org B anchors org A's CA → it verifies org A's agent (the cross-org case).
+        let (from, content) = open(&env, &org_a_ca).expect("anchoring the sender's CA verifies");
+        assert_eq!(from, "a-agent");
+        assert_eq!(content, b"cross-org hello");
+
+        // A consumer that anchors only its OWN org's CA rejects it — no shared anchor.
+        assert!(
+            open(&env, &org_b_ca).is_err(),
+            "without the sender org's CA as anchor, cross-org authorship does not verify"
+        );
+    }
+
     #[test]
     fn an_envelope_claiming_someone_elses_from_is_rejected() {
         let (ca, ca_key) = mint_ca("z");
