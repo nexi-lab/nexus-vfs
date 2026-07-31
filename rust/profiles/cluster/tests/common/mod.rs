@@ -240,6 +240,24 @@ pub fn mint_token_key(
 /// is a CA-signed identity cert — [`Vfs::connect_mtls`] presents it. Needs the
 /// founder CA at `<data-dir>/tls`; the daemon must NOT hold the data-dir lock.
 pub fn mint_agent_cert(env: &[(&str, &str)], subject_id: &str) -> std::path::PathBuf {
+    mint_agent_cert_args(env, subject_id, &[])
+}
+
+/// Re-mint an EXISTING agent name with `--allow-existing` — the rotation path:
+/// the old cert stays revoked (its serial is in the CRL) while this fresh cert
+/// (a new serial) works. Returns the new bundle dir.
+pub fn mint_agent_cert_allow_existing(
+    env: &[(&str, &str)],
+    subject_id: &str,
+) -> std::path::PathBuf {
+    mint_agent_cert_args(env, subject_id, &["--allow-existing"])
+}
+
+fn mint_agent_cert_args(
+    env: &[(&str, &str)],
+    subject_id: &str,
+    extra: &[&str],
+) -> std::path::PathBuf {
     let mut cmd = Command::new(bin());
     cmd.args([
         "auth",
@@ -251,6 +269,7 @@ pub fn mint_agent_cert(env: &[(&str, &str)], subject_id: &str) -> std::path::Pat
         "--name",
         "e2e",
     ]);
+    cmd.args(extra);
     for (k, v) in env {
         cmd.env(k, v);
     }

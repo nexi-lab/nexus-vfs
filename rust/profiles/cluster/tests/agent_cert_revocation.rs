@@ -28,7 +28,10 @@ mod common;
 
 use std::time::Duration;
 
-use common::{free_port, mint_agent_cert, write_tls_bundle, Daemon, Vfs, LOG_FILTER};
+use common::{
+    free_port, free_port_pair, mint_agent_cert, mint_agent_cert_allow_existing, write_tls_bundle,
+    Daemon, Vfs, LOG_FILTER,
+};
 use nexus_raft::transport::{generate_join_token, generate_zone_ca};
 
 const ZONE: &str = "sharedzone";
@@ -115,11 +118,11 @@ async fn a_revoked_agent_cert_is_rejected_on_a_peer_node_after_crl_refresh() {
     let jdata = jdata.to_string_lossy();
     let jid = jid.to_string_lossy();
 
-    // The founder's enroll listener binds data-port + 1, so keep the two data
-    // ports non-adjacent or that +1 would land on the joiner's bind.
-    let fport = free_port();
+    // The founder accepts enrollments, so its enroll listener binds fport + 1:
+    // reserve a port whose +1 is free, and keep the joiner's data port off it.
+    let fport = free_port_pair();
     let mut jport = free_port();
-    while jport == fport || jport == fport + 1 || jport + 1 == fport {
+    while jport == fport || jport == fport + 1 {
         jport = free_port();
     }
     let fadv = format!("127.0.0.1:{fport}");
@@ -217,6 +220,30 @@ async fn a_revoked_agent_cert_is_rejected_on_a_peer_node_after_crl_refresh() {
     assert!(
         mc.write_file(&mac_probe, b"after", "").await.is_ok(),
         "mac-ai is a different serial and must keep working — only win-ai was revoked"
+    );
+
+    // ── 7. ROTATE win-ai: revocation removed the leaked cert; now issue a fresh
+    // one under the SAME name. This is compromise recovery end-to-end. The
+    // re-mint is offline (it opens the store), so stop the founder, re-mint with
+    // --allow-existing, and restart. The rotated cert has a NEW serial — never
+    // revoked — so it works, while the old cert stays CRL-rejected (§6).
+    drop(founder); // release the data-dir lock for the offline re-mint
+    let win2_bundle =
+        mint_agent_cert_allow_existing(&founder_env(&fdata, &fid, &fadv, &mounts), "win-ai");
+    let win2_cert = std::fs::read(win2_bundle.join("agent.pem")).expect("rotated win-ai cert");
+    let win2_key = std::fs::read(win2_bundle.join("agent-key.pem")).expect("rotated win-ai key");
+    let mut founder = Daemon::spawn(
+        &["--bind-addr", &fbind],
+        &founder_env(&fdata, &fid, &fadv, &mounts),
+    );
+    founder
+        .wait_for_log(&zone_registered, BUDGET)
+        .await
+        .expect("founder resumes after the rotation re-mint");
+    let mut wc2 = Vfs::connect_mtls(jport, &ca, &win2_cert, &win2_key, BUDGET).await;
+    assert!(
+        poll_write(&mut wc2, &win_probe, true).await,
+        "the rotated win-ai cert works on the joiner — its fresh serial was never revoked"
     );
 
     drop(founder);
