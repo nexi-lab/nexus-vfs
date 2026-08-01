@@ -164,7 +164,16 @@ pub struct KernelHandle {
 
     /// `sys_stat(kernel, path, out_json, out_len) -> i32`
     ///
-    /// Returns stat result as JSON. Caller frees with `nexus_free`.
+    /// Returns stat result as JSON with fields
+    /// `{path, entry_type, size, zone_id, modified_at_ms}`.
+    /// `modified_at_ms` is Unix ms since epoch or `null` when the
+    /// underlying `FileMetadata.modified_at_ms` is unset. Additive
+    /// history: the callback shipped with `{path, entry_type, size,
+    /// zone_id}` in v1; `modified_at_ms` was added later so plugins
+    /// that want freshness-aware behavior (recency sort, cache TTL,
+    /// …) don't need a side channel. Existing consumers ignore the
+    /// new field.
+    /// Caller frees with `nexus_free`.
     pub sys_stat: unsafe extern "C" fn(
         kernel: *const c_void,
         path: *const c_char,
