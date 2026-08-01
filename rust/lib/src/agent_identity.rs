@@ -3,6 +3,28 @@
 //! pure identity (a DID); this SAN is all it carries. Pure string helpers
 //! (implementation), depending on nothing — they live here per the tier split
 //! (contracts = types/constants, lib = implementations).
+//!
+//! ## Why the name is flat — and the cross-org headroom that keeps
+//!
+//! The name is flat and zone-free because there is exactly one cluster CA: a
+//! `nexus://agent/{name}` is implicitly scoped to *this* CA's namespace, and
+//! within-CA uniqueness is enforced at mint (`auth::mint`). This is the SPIFFE
+//! shape — `nexus://` + a typed authority segment (`zone/…` for nodes,
+//! `agent/…` here) — and it is deliberately *additively* extensible: a future
+//! cross-org / multi-trust-domain identity (an agent under a foreign trust
+//! root, brokered by the platform as an isolation intermediary) slots in as a
+//! NEW prefix + parse fn, leaving the node and agent parsers untouched.
+//!
+//! So do NOT treat "agent names are globally flat" as a permanent invariant
+//! (e.g. a global flat unique index a qualified name would break): the
+//! org / trust-domain qualifier co-arrives with the multi-CA verification
+//! change — both touch `certgen::generate_agent_cert` and the verifier's single
+//! `client_ca_root` at once — not before. Deferred until a real cross-org
+//! scenario pins the brokering contract; today there is one CA and one trust
+//! root. The human legal signature (the shareone accountability plane) rides ON
+//! TOP of this DID — one key both authenticates the agent and signs its `from`
+//! — so accountability builds on this identity rather than a second signature
+//! mechanism.
 
 /// Scheme + authority of the agent identity URI SAN. An agent cert states which
 /// *agent* it is, parallel to a node cert's `nexus://zone/{z}/node/{n}`.
