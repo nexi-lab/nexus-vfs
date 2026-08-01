@@ -741,7 +741,42 @@ impl JoinRole {
 /// unification — cluster gets `driver-path-local + driver-remote`,
 /// full adds `driver-s3` on top. `DefaultObjectStoreProvider` reads
 /// which arms compiled in and dispatches accordingly.
+/// Boot-derived config the composition's service-decl builder reads to
+/// parameterise each service (e.g. a2a's fail-closed posture). Populated by
+/// [`run_with_services`] at the point services are brought up.
+pub struct ServiceBootCtx {
+    /// True iff an auth provider is armed (sk- API-key auth). a2a uses it
+    /// as its from-stamp fail-closed posture.
+    pub auth_armed: bool,
+}
+
+/// Boxed service-decl builder — threaded from [`run_with_services`] into
+/// `run_daemon` (the daemon path) so the generic bound doesn't ripple
+/// through every async boot fn. Consumed once at bring-up (`FnOnce`).
+type BoxedServiceDeclsBuilder =
+    Box<dyn FnOnce(&ServiceBootCtx) -> Vec<kernel::kernel::ServiceDecl> + Send>;
+
+/// Default cluster daemon entry — supplies the nexus-vfs-native service
+/// set (a2a). A fuller assembly binary (which links additional service
+/// crates) calls [`run_with_services`] with a larger decl list instead.
 pub fn run() -> Result<()> {
+    run_with_services(|ctx| vec![a2a::service_decl(ctx.auth_armed)])
+}
+
+/// Cluster daemon entry, parameterised by the service set. Boots the
+/// kernel + federation, hands the declared services to
+/// `Kernel::bring_up_services` (the ServiceRegistry is the single service
+/// authority — no per-service install code lives in this boot path), then
+/// serves. `build_decls` is invoked once, after the kernel + auth are up,
+/// with a [`ServiceBootCtx`] carrying boot-derived config.
+pub fn run_with_services<F>(build_decls: F) -> Result<()>
+where
+    F: FnOnce(&ServiceBootCtx) -> Vec<kernel::kernel::ServiceDecl> + Send + 'static,
+{
+    // Box the builder so it can be threaded through the async dispatch into
+    // `run_daemon` (the daemon path) without a generic bound rippling
+    // through every async fn.
+    let build_decls: BoxedServiceDeclsBuilder = Box::new(build_decls);
     let args = Args::parse();
     // Held until this function returns so the non-blocking log writer
     // thread stays alive and flushes on shutdown. Subcommands log to
@@ -766,7 +801,7 @@ pub fn run() -> Result<()> {
         .context("build tokio runtime")?
         .block_on(async move {
             match args.cmd {
-                None => run_daemon(args.common).await,
+                None => run_daemon(args.common, build_decls).await,
                 Some(Cmd::ServeLocal { port }) => {
                     // Force the trusted-local-backend posture: loopback
                     // bind + plaintext. auth_posture then grants the
@@ -774,7 +809,7 @@ pub fn run() -> Result<()> {
                     let mut common = args.common;
                     common.bind_addr = Some(format!("127.0.0.1:{port}"));
                     common.no_tls = true;
-                    run_daemon(common).await
+                    run_daemon(common, build_decls).await
                 }
                 Some(Cmd::Share {
                     path,
@@ -1185,7 +1220,7 @@ fn open_zone_manager(
     })
 }
 
-async fn run_daemon(common: CommonArgs) -> Result<()> {
+async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -> Result<()> {
     let hostname = resolve_hostname(common.hostname.as_deref());
     tracing::info!(
         hostname = %hostname,
@@ -2005,9 +2040,19 @@ async fn run_daemon(common: CommonArgs) -> Result<()> {
     // an empty `agent_id`, so fail-closed would reject all mailbox writes —
     // hence gated. Behaviour-preserving under NoAuth: empty `agent_id` ⇒
     // fail-open ⇒ the policy returns None ⇒ no rewrite.
-    let a2a_fail_closed = api_key_auth.is_some();
-    a2a::install_a2a_stamp_hook(&kernel, a2a_fail_closed)
-        .map_err(|e| anyhow::anyhow!("arm a2a stamp hook: {e}"))?;
+    // Bring up the declared services through the ServiceRegistry — the
+    // single authority for services. No per-service install code lives in
+    // this boot path; `build_decls` (supplied by the entry point) hands us
+    // the ordered set, parameterised by boot-derived config. a2a's
+    // fail-closed posture is tied to auth (see the ServiceBootCtx doc): it
+    // stamps `from` only-enforcing under auth, behaviour-preserving under
+    // NoAuth (empty agent_id ⇒ fail-open ⇒ no rewrite).
+    let svc_ctx = ServiceBootCtx {
+        auth_armed: api_key_auth.is_some(),
+    };
+    kernel
+        .bring_up_services(build_decls(&svc_ctx))
+        .map_err(|e| anyhow::anyhow!("bring up services: {e}"))?;
 
     // (2) Arm the cross-machine stream-wakeup observer PER ZONE: a
     // replicated `AppendStreamEntry` (a chat-with-me DT_STREAM write on a

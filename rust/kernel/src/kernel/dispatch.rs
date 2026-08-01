@@ -13,6 +13,33 @@ use super::{Kernel, KernelError, OperationContext, RwLockExt};
 
 use std::sync::Arc;
 
+/// The install closure a [`ServiceDecl`] carries: construct + enlist +
+/// hook-register a service against the live kernel, returning an error
+/// string on failure. `FnOnce` because it runs exactly once at boot;
+/// `Send` so the decl list can cross the boot thread boundary.
+pub type ServiceInstall = Box<dyn FnOnce(&Arc<Kernel>) -> Result<(), String> + Send>;
+
+/// A service's self-declaration for boot, consumed by
+/// [`Kernel::bring_up_services`]. It is the ONE thing a service exposes
+/// for wiring: its canonical `name` plus an `install` closure that
+/// constructs the service, enlists it into the `ServiceRegistry`, and
+/// registers any hooks/observers it owns.
+///
+/// The closure is the only service-specific code; boot iterates decls
+/// opaquely, so kernel boot has no per-service knowledge and the
+/// `ServiceRegistry` remains the single authority for services. The
+/// composition layer (the assembly binary) builds the ordered
+/// `Vec<ServiceDecl>` — one entry per service, across every crate — and
+/// hands it to `bring_up_services`.
+pub struct ServiceDecl {
+    /// Canonical service name (ordering / diagnostics / logging).
+    pub name: String,
+    /// Construct + enlist + hook-register the service. Runs once at boot,
+    /// after the kernel is built, in the list's order. `Err` is logged
+    /// and skipped (see `bring_up_services`).
+    pub install: ServiceInstall,
+}
+
 impl Kernel {
     // ── Native INTERCEPT hook dispatch ─────────────────
 
@@ -457,6 +484,37 @@ impl Kernel {
     ) -> Result<(), String> {
         self.service_registry
             .enlist_rust(name, instance, exports, false)
+    }
+
+    /// Bring up a declared set of services: run each [`ServiceDecl`]'s
+    /// install closure in order (which constructs the service, enlists
+    /// it into the `ServiceRegistry`, and registers its hooks/observers).
+    ///
+    /// This is the SINGLE seam through which boot hands services to the
+    /// kernel — so `run()` (and any other boot code) carries ZERO
+    /// per-service knowledge: every service arrives as a `ServiceDecl` in
+    /// the ordered list the composition layer builds. The
+    /// `ServiceRegistry` stays the sole authority for what services exist
+    /// and their lifecycle (`start_all` / `stop_all`); this method just
+    /// populates it from the declared set.
+    ///
+    /// Order = list order (the composition layer owns ordering — e.g. the
+    /// a2a stamp hook must be installed before agents write mailboxes).
+    /// An install failure is FATAL: it aborts boot (returns `Err`),
+    /// preserving the pre-refactor semantics where each `install_*(&kernel)?`
+    /// call took the daemon down on failure. A service that is genuinely
+    /// optional swallows its own error inside its install closure (logs +
+    /// returns `Ok`), so criticality stays a per-service decision without
+    /// boot needing to know it.
+    pub fn bring_up_services(
+        self: &std::sync::Arc<Self>,
+        decls: Vec<ServiceDecl>,
+    ) -> Result<(), String> {
+        for ServiceDecl { name, install } in decls {
+            install(self).map_err(|e| format!("service {name:?} install failed: {e}"))?;
+            tracing::info!(service = %name, "service brought up");
+        }
+        Ok(())
     }
 
     /// Look up a Rust-flavoured service by canonical name. The
