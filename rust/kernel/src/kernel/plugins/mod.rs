@@ -228,12 +228,21 @@ unsafe extern "C" fn kernel_cb_sys_stat(
     match kernel.sys_stat(path, contracts::ROOT_ZONE_ID) {
         Some(result) => {
             // StatResult fields plugins typically need, serialized as JSON.
+            // `modified_at_ms` (Unix ms, nullable) added so plugins that want
+            // freshness-aware behavior (recency sort in search, cache TTL in
+            // driver plugins, …) don't have to open a side channel — it's
+            // been present on `StatResult` since the kernel introduced the
+            // Tier-2 metadata bag; this callback just now exposes it too.
+            // Additive-only: existing consumers ignore the new field.
             let json = format!(
-                r#"{{"path":"{}","entry_type":{},"size":{},"zone_id":"{}"}}"#,
+                r#"{{"path":"{}","entry_type":{},"size":{},"zone_id":"{}","modified_at_ms":{}}}"#,
                 result.path,
                 result.entry_type,
                 result.size,
                 result.zone_id.as_deref().unwrap_or("root"),
+                result
+                    .modified_at_ms
+                    .map_or_else(|| "null".to_string(), |ms| ms.to_string()),
             );
             let mut json = std::mem::ManuallyDrop::new(json.into_bytes());
             *out_json = json.as_mut_ptr();
