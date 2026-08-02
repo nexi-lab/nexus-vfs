@@ -1617,7 +1617,7 @@ graph TB
 graph TB
     subgraph HIER["Profile hierarchy: slim &sub; cluster &sub; embedded &sub; lite &sub; full &sube; cloud"]
         SL["slim &mdash; bare minimum runnable<br/>redb (embedded) &mdash; Linux: initramfs"]
-        CL["cluster &mdash; minimal multi-node<br/>IPC + federation, no auth<br/>redb (Raft) &mdash; Linux: CoreOS"]
+        CL["cluster &mdash; minimal multi-node<br/>IPC + federation + agent control plane (managed_agent)<br/>minimal auth (sk-, runtime-gated)<br/>redb (Raft) &mdash; Linux: CoreOS"]
         EM["embedded &mdash; MCU, WASM (⟨1 MB)<br/>redb (embedded) &mdash; Linux: BusyBox"]
         LI["lite &mdash; Pi, Jetson, mobile<br/>redb (embedded) &mdash; Linux: Alpine"]
         FU["full &mdash; desktop, laptop<br/>redb (embedded) &mdash; Linux: Ubuntu Desktop"]
