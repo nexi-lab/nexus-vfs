@@ -62,3 +62,17 @@ pub fn install_a2a_stamp_hook(kernel: &Kernel, fail_closed: bool) -> Result<(), 
     );
     Ok(())
 }
+
+/// The `a2a` service as a boot declaration for
+/// [`kernel::kernel::Kernel::bring_up_services`] — the uniform path by
+/// which the composition layer hands services to the kernel (instead of
+/// boot code hand-calling installs). Thin wrapper over
+/// [`install_a2a_stamp_hook`]; `fail_closed` is boot-derived (true iff an
+/// auth provider is armed) and supplied by the composition from the boot
+/// context.
+pub fn service_decl(fail_closed: bool) -> kernel::kernel::ServiceDecl {
+    kernel::kernel::ServiceDecl {
+        name: "a2a".to_string(),
+        install: Box::new(move |kernel| install_a2a_stamp_hook(kernel, fail_closed)),
+    }
+}

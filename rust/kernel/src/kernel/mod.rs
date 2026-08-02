@@ -89,6 +89,10 @@ pub mod vfs_proto {
 // way.
 pub mod convenience;
 mod dispatch;
+// The service-boot declaration type consumed by `Kernel::bring_up_services`.
+// Re-exported so service crates + the composition/assembly binary can build
+// `ServiceDecl`s without reaching into the private `dispatch` submodule.
+pub use dispatch::ServiceDecl;
 mod ipc;
 mod locks;
 mod mount;
