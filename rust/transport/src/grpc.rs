@@ -408,6 +408,25 @@ where
         .map_err(|e| Status::internal(format!("kernel blocking task join error: {e}")))
 }
 
+/// Hold a service `Call` that arrives before `bring_up_services` has
+/// enlisted the services. This gRPC server binds early (the raft transport
+/// needs it up for founder/joiner consensus during zone bootstrap), which
+/// is BEFORE the service set is installed — so a spawn-then-immediately-
+/// connect client can land a dot-notation service call in that window.
+/// Waiting (bounded) lets the daemon distinguish "declared, not yet
+/// installed" (hold) from "genuinely absent" (dispatch answers not-found)
+/// instead of returning a lying terminal error. On timeout we fall through
+/// and let dispatch answer normally.
+async fn wait_services_ready(kernel: &Kernel, timeout: std::time::Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while !kernel.services_ready() {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
 #[tonic::async_trait]
 impl NexusVfsService for VfsServiceImpl {
     async fn read(&self, req: Request<ReadRequest>) -> Result<Response<ReadResponse>, Status> {
@@ -1416,6 +1435,15 @@ impl NexusVfsService for VfsServiceImpl {
         let kernel = self.kernel.clone();
         let method = req.method;
         let payload = req.payload;
+        // A dot-notation service call ("svc.method") routes to a
+        // ServiceRegistry entry. If it arrives before boot has enlisted the
+        // services, hold it until ready (see `wait_services_ready`) rather
+        // than answer a lying "service not found". Kernel built-in Call
+        // methods (agent_*, etc.) contain no '.' and are available at once,
+        // so they never wait.
+        if method.contains('.') && !kernel.services_ready() {
+            wait_services_ready(&kernel, std::time::Duration::from_secs(15)).await;
+        }
         run_blocking(move || crate::call_dispatch::dispatch(&kernel, &ctx, &method, &payload))
             .await?
     }
