@@ -514,7 +514,24 @@ impl Kernel {
             install(self).map_err(|e| format!("service {name:?} install failed: {e}"))?;
             tracing::info!(service = %name, "service brought up");
         }
+        // The declared service set is installed ⇒ the boot's service phase
+        // is complete. Latch it on the `ServiceRegistry` (the single
+        // authority for service state — SSOT, no shadow flag on `Kernel`):
+        // this both makes a post-boot runtime `enlist` auto-start and lets
+        // `services_ready` gate the client `Call` path (see below).
+        self.service_registry.mark_bootstrapped();
         Ok(())
+    }
+
+    /// True once [`Self::bring_up_services`] has installed the declared
+    /// service set (delegates to the `ServiceRegistry` bootstrapped latch —
+    /// the SSOT). The gRPC `Call` handler waits on this so a dot-notation
+    /// service call arriving in the boot window — the client-facing server
+    /// binds early for raft consensus, BEFORE services are enlisted — is
+    /// held rather than answered with a lying terminal "service not found".
+    /// One-way latch, so the worst case is a spurious extra wait.
+    pub fn services_ready(&self) -> bool {
+        self.service_registry.is_bootstrapped()
     }
 
     /// Look up a Rust-flavoured service by canonical name. The

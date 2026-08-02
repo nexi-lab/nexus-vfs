@@ -509,6 +509,13 @@ impl ServiceRegistry {
         self.bootstrapped.store(true, Ordering::Relaxed);
     }
 
+    /// True once bootstrap has completed (see [`Self::mark_bootstrapped`]).
+    /// The SSOT for "the declared service set is installed"; the kernel's
+    /// `services_ready` facade + the gRPC `Call` readiness gate read it.
+    pub(crate) fn is_bootstrapped(&self) -> bool {
+        self.bootstrapped.load(Ordering::Relaxed)
+    }
+
     /// Snapshot: list of (name, type_name, exports) for diagnostics.
     pub(crate) fn snapshot(&self) -> Vec<(String, String, Vec<String>)> {
         let mut result = Vec::new();
