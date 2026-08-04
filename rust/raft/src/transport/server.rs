@@ -1034,73 +1034,197 @@ impl ZoneApiService for ZoneApiServiceImpl {
             "JoinZone request received",
         );
 
-        // Propose ConfChange with address in context (etcd pattern).
-        // This waits for the ConfChange to be committed and applied.
+        // ── Learner-then-promote membership change (raft-canonical) ──
+        //
+        // A JoinZone-as-voter NEVER adds a voter directly.  A direct
+        // `AddNode` grows the voter set — and hence the quorum — the
+        // instant it commits, so if the joiner is unreachable (mis-bound
+        // to loopback, dead, firewalled) the leader is stranded needing
+        // an ack it can never get: the "not leader" deadlock + zombie
+        // voter this path used to produce.  Instead we follow the raft
+        // membership-change discipline:
+        //   1. add the joiner as a LEARNER — quorum unchanged, so the
+        //      leader stays available no matter what;
+        //   2. wait, event-driven, until the leader has replicated up to
+        //      it (`await_peer_caught_up`) — this PROVES the joiner is
+        //      reachable AND caught up;
+        //   3. only then promote it to voter.
+        // If step 2 times out, the joiner stays a healthy learner (a
+        // learner never affects quorum) and we fail loud with an
+        // actionable error naming its advertise address — the joiner (or
+        // operator) re-joins to promote once it is reachable.  An
+        // explicitly-requested learner (`as_learner`) skips 2–3.
+        //
+        // (Historical note: JoinZone used to bump `i_links_count` here
+        // under the old dynamic-bootstrap contract.  Under the opaque-ID
+        // contract it is raft-membership only; the mount-reference count
+        // lives at the DT_MOUNT entry, not here.)
         use raft::eraftpb::ConfChangeType;
-        let change_type = if req.as_learner {
-            ConfChangeType::AddLearnerNode
-        } else {
-            ConfChangeType::AddNode
+
+        // Peer map is stable across this handler; fetch once and build
+        // response configs from it. Closure captures `peers` by ref and
+        // takes id slices, so it needs no `Membership` type in scope and
+        // is safe to reuse across the awaits below.
+        let peers = self.registry.get_peers(&req.zone_id).unwrap_or_default();
+        let make_config = |voters: &[u64], learners: &[u64]| {
+            let info = |id: u64, role: i32| ProtoNodeInfo {
+                id,
+                address: peers
+                    .get(&id)
+                    .map(|a| a.endpoint.clone())
+                    .unwrap_or_default(),
+                role,
+            };
+            ProtoClusterConfig {
+                voters: voters.iter().map(|&id| info(id, 0)).collect(),
+                learners: learners.iter().map(|&id| info(id, 1)).collect(),
+                witnesses: vec![],
+            }
         };
-        match node
-            .propose_conf_change(change_type, req.node_id, req.node_address.into_bytes())
-            .await
-        {
-            Ok(conf_state) => {
-                // Note: under the OLD dynamic-bootstrap contract,
-                // JoinZone was synonymous with "the caller is mounting
-                // this zone", so the handler bumped `i_links_count`
-                // here.  Under the opaque-ID contract JoinZone is
-                // voter-membership only — `bootstrap_or_join_root` and
-                // the root-leader-gated `coordinator.create_zone`
-                // follower path call it for raft membership without a
-                // mount reference.  The mount-reference counter is
-                // maintained at the actual mount-creation site (the
-                // DT_MOUNT entry in the parent zone's metastore), not
-                // here, so JoinZone no longer touches it.
-
-                // Build ClusterConfig from the resulting ConfState + peer map
-                let peers = self.registry.get_peers(&req.zone_id).unwrap_or_default();
-                let voters: Vec<ProtoNodeInfo> = conf_state
-                    .voters
-                    .iter()
-                    .map(|&id| ProtoNodeInfo {
-                        id,
-                        address: peers
-                            .get(&id)
-                            .map(|a| a.endpoint.clone())
-                            .unwrap_or_default(),
-                        role: 0,
-                    })
-                    .collect();
-
-                Ok(Response::new(JoinZoneResponse {
-                    success: true,
-                    error: None,
-                    leader_address: None,
-                    config: Some(ProtoClusterConfig {
-                        voters,
-                        learners: vec![],
-                        witnesses: vec![],
-                    }),
-                }))
-            }
-            Err(RaftError::NotLeader { leader_hint }) => {
-                // `leader_hint` is already operator-form host:port
-                // (or None) — no peer_map lookup needed.
-                Ok(Response::new(JoinZoneResponse {
-                    success: false,
-                    error: Some("not leader".to_string()),
-                    leader_address: leader_hint,
-                    config: None,
-                }))
-            }
-            Err(e) => Ok(Response::new(JoinZoneResponse {
+        // Turn a raft error into the redirect/failure response shape.
+        let fail = |e: RaftError| match e {
+            RaftError::NotLeader { leader_hint } => JoinZoneResponse {
                 success: false,
-                error: Some(format!("JoinZone failed: {}", e)),
+                error: Some("not leader".to_string()),
+                leader_address: leader_hint,
+                config: None,
+            },
+            other => JoinZoneResponse {
+                success: false,
+                error: Some(format!("JoinZone failed: {}", other)),
                 leader_address: None,
                 config: None,
-            })),
+            },
+        };
+
+        let ctx = req.node_address.clone().into_bytes();
+
+        // Classify the join off current membership (get-before-put, #139):
+        // a blind AddLearnerNode on a sitting voter would DEMOTE it.
+        let membership = match node.membership().await {
+            Ok(m) => m,
+            Err(e) => return Ok(Response::new(fail(e))),
+        };
+
+        // Idempotent: already a voter → nothing to change.
+        if membership.is_voter(req.node_id) {
+            return Ok(Response::new(JoinZoneResponse {
+                success: true,
+                error: None,
+                leader_address: None,
+                config: Some(make_config(&membership.voters, &membership.learners)),
+            }));
+        }
+
+        // An explicitly-requested learner (`as_learner`): ensure it is a
+        // learner and stop — the caller wants a read-along replica, never a
+        // voter. Idempotent.
+        if req.as_learner {
+            if !membership.is_learner(req.node_id) {
+                if let Err(e) = node
+                    .propose_conf_change(ConfChangeType::AddLearnerNode, req.node_id, ctx)
+                    .await
+                {
+                    return Ok(Response::new(fail(e)));
+                }
+                tracing::info!(
+                    zone = req.zone_id,
+                    peer_node_id = req.node_id,
+                    "JoinZone: added as learner (explicit)",
+                );
+            }
+            let m = node.membership().await.unwrap_or_default();
+            return Ok(Response::new(JoinZoneResponse {
+                success: true,
+                error: None,
+                leader_address: None,
+                config: Some(make_config(&m.voters, &m.learners)),
+            }));
+        }
+
+        // Voter requested (and not yet a voter). Stateless, retry-driven
+        // learner-then-promote — NO waiting inside this RPC:
+        //   * not yet a learner → add it as a learner (quorum unchanged, so
+        //     the leader stays available regardless of the joiner) and tell
+        //     the joiner to re-join once we have replicated to it;
+        //   * a learner that has CAUGHT UP (reachable AND replicated to our
+        //     commit index) → promote it to voter;
+        //   * a learner still behind → tell it to re-join.
+        // The joiner's join loop re-calls us each round (it is the durable
+        // owner of the "become a voter" intent — its `--as voter`), so an
+        // unreachable joiner is simply never caught up, hence never promoted:
+        // it stays a harmless learner and never strands quorum. No timeout,
+        // no held RPC, no leader-side promotion state.
+        if !membership.is_learner(req.node_id) {
+            if let Err(e) = node
+                .propose_conf_change(ConfChangeType::AddLearnerNode, req.node_id, ctx)
+                .await
+            {
+                return Ok(Response::new(fail(e)));
+            }
+            tracing::info!(
+                zone = req.zone_id,
+                peer_node_id = req.node_id,
+                peer_addr = %req.node_address,
+                "JoinZone: added as learner; re-join to promote once replicated",
+            );
+            let m = node.membership().await.unwrap_or_default();
+            return Ok(Response::new(JoinZoneResponse {
+                success: false,
+                error: Some(format!(
+                    "added as learner in zone '{}' — catching up; re-join to promote to voter \
+                     once the leader has replicated to advertise-addr {}",
+                    req.zone_id, req.node_address
+                )),
+                leader_address: None,
+                config: Some(make_config(&m.voters, &m.learners)),
+            }));
+        }
+
+        // Already a learner: promote to voter iff it has caught up (reachable
+        // + replicated to our commit index). Otherwise ask it to re-join.
+        if membership.is_caught_up_learner(req.node_id) {
+            match node
+                .propose_conf_change(ConfChangeType::AddNode, req.node_id, ctx)
+                .await
+            {
+                Ok(conf_state) => {
+                    tracing::info!(
+                        zone = req.zone_id,
+                        peer_node_id = req.node_id,
+                        "JoinZone: caught-up learner promoted to voter",
+                    );
+                    let learners = node
+                        .membership()
+                        .await
+                        .map(|m| m.learners)
+                        .unwrap_or_default();
+                    Ok(Response::new(JoinZoneResponse {
+                        success: true,
+                        error: None,
+                        leader_address: None,
+                        config: Some(make_config(&conf_state.voters, &learners)),
+                    }))
+                }
+                Err(e) => Ok(Response::new(fail(e))),
+            }
+        } else {
+            tracing::debug!(
+                zone = req.zone_id,
+                peer_node_id = req.node_id,
+                peer_addr = %req.node_address,
+                "JoinZone: learner not yet caught up; re-join to promote",
+            );
+            Ok(Response::new(JoinZoneResponse {
+                success: false,
+                error: Some(format!(
+                    "learner in zone '{}' not yet caught up to the leader; re-join to promote \
+                     (still replicating to advertise-addr {})",
+                    req.zone_id, req.node_address
+                )),
+                leader_address: None,
+                config: Some(make_config(&membership.voters, &membership.learners)),
+            }))
         }
     }
 
