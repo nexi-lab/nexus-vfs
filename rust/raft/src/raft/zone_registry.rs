@@ -285,7 +285,14 @@ impl ZoneRaftRegistry {
             ..Default::default()
         };
 
-        self.setup_zone(zone_id, config, peers, runtime_handle)
+        // Founder authors the zone as a voter.
+        self.setup_zone(
+            zone_id,
+            config,
+            peers,
+            runtime_handle,
+            crate::identity::IdentityZoneRole::Voter,
+        )
     }
 
     /// Join an existing zone as a Voter or Learner.
@@ -303,7 +310,7 @@ impl ZoneRaftRegistry {
         &self,
         zone_id: &str,
         peers: Vec<NodeAddress>,
-        _learner: bool,
+        learner: bool,
         runtime_handle: &tokio::runtime::Handle,
     ) -> Result<ZoneConsensus<FullStateMachine>, TransportError> {
         self.clear_auto_join_suppression(zone_id);
@@ -317,7 +324,17 @@ impl ZoneRaftRegistry {
             ..Default::default()
         };
 
-        self.setup_zone(zone_id, config, peers, runtime_handle)
+        // `learner` is the caller's role INTENT: it's persisted as the
+        // durable desired role (SSOT for rejoin), and the matching JoinZone
+        // RPC carries the same flag so the leader's learner-then-promote
+        // reaches the intended role. The achieved role is ConfState-derived
+        // at runtime and never persisted.
+        let intended_role = if learner {
+            crate::identity::IdentityZoneRole::Learner
+        } else {
+            crate::identity::IdentityZoneRole::Voter
+        };
+        self.setup_zone(zone_id, config, peers, runtime_handle, intended_role)
     }
 
     /// Open a previously-persisted zone from disk WITHOUT bootstrapping.
@@ -345,7 +362,24 @@ impl ZoneRaftRegistry {
             skip_bootstrap: true,
             ..Default::default()
         };
-        self.setup_zone(zone_id, config, peers, runtime_handle)
+        // Restart preserves the persisted role intent (SSOT) — don't re-guess.
+        let intended_role = self.persisted_intent(zone_id);
+        self.setup_zone(zone_id, config, peers, runtime_handle, intended_role)
+    }
+
+    /// The DURABLE role intent persisted for `zone_id` in `identity.json`,
+    /// or Voter if none is recorded.  Used by the restart path so a resumed
+    /// zone keeps its declared role rather than re-deriving one.
+    fn persisted_intent(&self, zone_id: &str) -> crate::identity::IdentityZoneRole {
+        self.identity_dir()
+            .and_then(|dir| crate::identity::load(&dir).ok())
+            .and_then(|id| {
+                id.zones
+                    .into_iter()
+                    .find(|z| z.zone_id == zone_id)
+                    .map(|z| z.as_role)
+            })
+            .unwrap_or_default()
     }
 
     /// Enumerate `base_path/*/raft/` and reopen every previously-persisted zone.
@@ -490,6 +524,11 @@ impl ZoneRaftRegistry {
         config: RaftConfig,
         mut peers: Vec<NodeAddress>,
         runtime_handle: &tokio::runtime::Handle,
+        // This node's DURABLE role intent for the zone (voter/learner as
+        // declared at join). Persisted once here as the SSOT for "what role
+        // do I want"; the apply cb persists only the members list, never the
+        // ephemeral achieved role. See `identity::persist_zone_intent`.
+        intended_role: crate::identity::IdentityZoneRole,
     ) -> Result<ZoneConsensus<FullStateMachine>, TransportError> {
         // Fast path: zone already exists — no work needed.
         if let Some(entry) = self.zones.get(zone_id) {
@@ -674,12 +713,38 @@ impl ZoneRaftRegistry {
         // survive `data_dir` wipes and drive the joiner auto-reconnect
         // path in [`crate::bootstrap`].
         if let Some(id_dir) = self.identity_dir() {
+            // Record the DURABLE role intent ONCE, up front — the SSOT for
+            // "what role do I want" that boot reads to reissue JoinZone.
+            // The apply cb below persists ONLY the members address book and
+            // never the (ephemeral, ConfState-derived) achieved role.
+            match crate::identity::load(&id_dir) {
+                Ok(existing) => {
+                    if let Err(e) = crate::identity::persist_zone_intent(
+                        &id_dir,
+                        &existing,
+                        zone_id,
+                        intended_role,
+                    ) {
+                        tracing::warn!(
+                            zone = %zone_id,
+                            error = %e,
+                            "identity persist_zone_intent failed — setup continues",
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    zone = %zone_id,
+                    error = %e,
+                    "identity load failed before intent persist — setup continues",
+                ),
+            }
+
             let zone_id_owned = zone_id.to_string();
             let peers_for_cb = shared_peers.clone();
             let self_addr_for_cb = self.self_address();
             let self_node_id_for_cb = self.node_id;
             let cb: crate::raft::ConfStateAppliedCb =
-                Arc::new(move |cs: &raft::eraftpb::ConfState, self_id: u64| {
+                Arc::new(move |cs: &raft::eraftpb::ConfState, _self_id: u64| {
                     let all_ids: Vec<u64> = cs
                         .voters
                         .iter()
@@ -701,11 +766,9 @@ impl ZoneRaftRegistry {
                             })
                             .collect()
                     };
-                    let as_role = if cs.voters.contains(&self_id) {
-                        crate::identity::IdentityZoneRole::Voter
-                    } else {
-                        crate::identity::IdentityZoneRole::Learner
-                    };
+                    // Members only — the durable address book. The role
+                    // intent is owned by `persist_zone_intent` above and is
+                    // NOT overwritten with the achieved ConfState role here.
                     match crate::identity::load(&id_dir) {
                         Ok(existing) => {
                             if let Err(e) = crate::identity::persist_zone_members(
@@ -713,7 +776,6 @@ impl ZoneRaftRegistry {
                                 &existing,
                                 &zone_id_owned,
                                 members,
-                                as_role,
                             ) {
                                 tracing::warn!(
                                     zone = %zone_id_owned,

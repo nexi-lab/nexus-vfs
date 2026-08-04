@@ -796,6 +796,45 @@ mod tests {
     }
 
     #[test]
+    fn row4_voter_identity_zone_rejoins_as_voter() {
+        // Auto-recovery regression: a node whose persisted role INTENT for a
+        // zone is Voter re-drives JoinZone AS A VOTER on resume
+        // (as_learner=false). This is what makes a promoted voter self-heal
+        // across reboots — and, because `identity` now persists the durable
+        // intent rather than the ephemeral achieved role, a node interrupted
+        // mid-promote (transiently a learner) still resumes toward voter
+        // instead of being stranded as a permanent learner. The leader's
+        // learner-then-promote makes re-driving as voter safe (adds a
+        // learner, promotes only once caught up). Validated live cross-machine
+        // (Mac reboot → still voter); this pins it in CI.
+        let mut cfg = cfg_with(vec!["100.64.0.27:2126"], vec![], vec![], BTreeMap::new());
+        cfg.identity_zones = vec![IdentityZone {
+            zone_id: "sharedzone".to_string(),
+            members: vec![
+                "100.64.0.27:2126".to_string(),
+                "100.64.0.21:2126".to_string(),
+            ],
+            as_role: crate::identity::IdentityZoneRole::Voter,
+            last_confirmed_unix_secs: None,
+        }];
+        match plan_boot_action(&cfg) {
+            BootAction::JoinFederationZones {
+                zones,
+                as_learner_per_zone,
+                ..
+            } => {
+                assert_eq!(zones, vec!["sharedzone".to_string()]);
+                assert_eq!(
+                    as_learner_per_zone,
+                    vec![false],
+                    "voter role intent in identity.json must re-drive JoinZone as a voter",
+                );
+            }
+            other => panic!("expected JoinFederationZones, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn row4_empty_identity_zones_stays_noop_joiner() {
         // Returning joiner but identity.zones empty (a v1 identity
         // survived without ever seeing a ConfChange apply, e.g. a

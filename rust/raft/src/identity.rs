@@ -85,12 +85,17 @@ pub struct Identity {
 /// wipe-and-rejoin needs to reach the leader regardless of the
 /// rejoiner's own role, and any live member serves that role).
 ///
-/// `as_role` records how THIS node participated last time it saw a
-/// ConfState apply for the zone.  Boot uses it to pick voter vs
-/// learner when reissuing JoinZone: staying consistent avoids the
-/// PR #57 wipe-rejoin deadlock (Learner-that-thinks-it's-a-voter
-/// counts toward quorum and cannot serve remote reads until it
-/// finishes catching up).
+/// `as_role` is this node's DURABLE role INTENT for the zone — the role
+/// it *wants* (voter/learner), as declared at join and written once by
+/// [`persist_zone_intent`].  Boot reads it to reissue JoinZone with the
+/// right role.  It is NOT the achieved role: that is ephemeral,
+/// ConfState-derived runtime state (a would-be-voter is transiently a
+/// learner mid-promote), and is deliberately never persisted — doing so
+/// stranded a mid-promote node as a permanent learner.  The old PR #57
+/// deadlock (a not-caught-up node counting toward quorum) is now
+/// prevented at the source by the learner-then-promote JoinZone (the
+/// leader adds a learner and promotes only once caught up), so recording
+/// intent here is safe.
 ///
 /// `last_confirmed_unix_secs` is a coarse mtime (Unix seconds) —
 /// diagnostic only.  Never load-bearing for the ConfState decision.
@@ -278,12 +283,19 @@ pub fn persist_peers(
 
 /// Rewrite `identity.json` with the zone's current member list.
 ///
-/// Called from the ConfChange apply callback (Phase B, commit 7) with
-/// the new voter+learner membership for the zone.  Idempotent: when
-/// the persisted entry already matches (same members in the same order,
-/// same role, same schema version), the file is not rewritten — apply
-/// runs on every ConfChange so a naive rewrite would trigger disk I/O
-/// on every leader heartbeat's committed entry.
+/// Called from the ConfChange apply callback with the new voter+learner
+/// membership.  Persists ONLY the members address book — the durable
+/// "how do I reach this zone's cluster on rejoin" fact.  It deliberately
+/// does NOT touch `as_role`: the node's role in a zone is the ephemeral,
+/// ConfState-derived achieved state (a would-be-voter is transiently a
+/// learner mid-promote), and persisting that here is what stranded a
+/// mid-promote node as a permanent learner.  The durable INTENT
+/// (voter/learner) is written once at join by [`persist_zone_intent`] and
+/// preserved across every members update here.
+///
+/// Idempotent: when the persisted members already match (same order),
+/// the file is not rewritten — apply runs on every ConfChange, so a naive
+/// rewrite would trigger disk I/O on every committed entry.
 ///
 /// Members MUST be operator-facing bare `"host:port"` strings.  The
 /// caller (raft apply cb) has NodeAddress in hand; project via
@@ -293,35 +305,36 @@ pub fn persist_zone_members(
     existing: &Identity,
     zone_id: &str,
     members: Vec<String>,
-    as_role: IdentityZoneRole,
 ) -> Result<Identity, String> {
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
         .map(|d| d.as_secs());
-    let new_entry = IdentityZone {
-        zone_id: zone_id.to_string(),
-        members,
-        as_role,
-        last_confirmed_unix_secs: now_secs,
-    };
     let mut zones = existing.zones.clone();
     let changed_material;
     match zones.iter_mut().find(|z| z.zone_id == zone_id) {
         Some(slot) => {
-            // Compare only the load-bearing fields: members + role.
-            // `last_confirmed_unix_secs` alone is not a reason to
-            // rewrite the file.
-            let materially_same =
-                slot.members == new_entry.members && slot.as_role == new_entry.as_role;
+            // Load-bearing field is members only; `as_role` (intent) is
+            // preserved (owned by `persist_zone_intent`), and
+            // `last_confirmed_unix_secs` alone is not a reason to rewrite.
+            let materially_same = slot.members == members;
             if materially_same && existing.schema_version == SCHEMA_VERSION {
                 return Ok(existing.clone());
             }
-            *slot = new_entry;
+            slot.members = members;
+            slot.last_confirmed_unix_secs = now_secs;
             changed_material = !materially_same;
         }
         None => {
-            zones.push(new_entry);
+            // No intent recorded yet (members arrived before the join-time
+            // intent write) — default to Voter, the common case; a later
+            // `persist_zone_intent` corrects an explicit learner.
+            zones.push(IdentityZone {
+                zone_id: zone_id.to_string(),
+                members,
+                as_role: IdentityZoneRole::default(),
+                last_confirmed_unix_secs: now_secs,
+            });
             changed_material = true;
         }
     }
@@ -338,9 +351,54 @@ pub fn persist_zone_members(
         zone = %zone_id,
         member_count = updated.zones.iter().find(|z| z.zone_id == zone_id)
             .map(|z| z.members.len()).unwrap_or(0),
-        role = ?as_role,
         material_change = changed_material,
         "identity zone membership persisted",
+    );
+    Ok(updated)
+}
+
+/// Record this node's DURABLE role INTENT for a zone (voter/learner as the
+/// operator declared at join) into `identity.json`.  This is the SSOT for
+/// "what role do I want to be", read at boot to reissue JoinZone with the
+/// right role; the ACHIEVED role is derived at runtime from ConfState and
+/// is never persisted (persisting it strands a mid-promote would-be-voter
+/// as a permanent learner).  Called once at join wiring
+/// ([`crate::raft::ZoneRegistry`] `setup_zone`); the members list is owned
+/// by [`persist_zone_members`] and preserved here.  Idempotent: a no-op
+/// when the recorded intent already matches.
+pub fn persist_zone_intent(
+    identity_dir: &Path,
+    existing: &Identity,
+    zone_id: &str,
+    desired_role: IdentityZoneRole,
+) -> Result<Identity, String> {
+    let mut zones = existing.zones.clone();
+    match zones.iter_mut().find(|z| z.zone_id == zone_id) {
+        Some(slot) => {
+            if slot.as_role == desired_role && existing.schema_version == SCHEMA_VERSION {
+                return Ok(existing.clone());
+            }
+            slot.as_role = desired_role;
+        }
+        None => zones.push(IdentityZone {
+            zone_id: zone_id.to_string(),
+            members: Vec::new(),
+            as_role: desired_role,
+            last_confirmed_unix_secs: None,
+        }),
+    }
+    let updated = Identity {
+        schema_version: SCHEMA_VERSION,
+        peers: existing.peers.clone(),
+        zones,
+    };
+    let path = identity_dir.join(IDENTITY_FILE);
+    atomic_write(&path, &updated)?;
+    tracing::info!(
+        identity_path = %path.display(),
+        zone = %zone_id,
+        desired_role = ?desired_role,
+        "identity zone role intent persisted",
     );
     Ok(updated)
 }
@@ -468,33 +526,21 @@ mod tests {
             "100.64.0.27:2126".to_string(),
         ];
 
-        let after = persist_zone_members(
-            dir.path(),
-            &ident,
-            "sharedzone",
-            members.clone(),
-            IdentityZoneRole::Voter,
-        )
-        .unwrap();
+        let after =
+            persist_zone_members(dir.path(), &ident, "sharedzone", members.clone()).unwrap();
         assert_eq!(after.zones.len(), 1);
         assert_eq!(after.zones[0].zone_id, "sharedzone");
         assert_eq!(after.zones[0].members, members);
+        // No prior intent recorded ⇒ defaults to Voter (the common case).
         assert_eq!(after.zones[0].as_role, IdentityZoneRole::Voter);
         assert!(after.zones[0].last_confirmed_unix_secs.is_some());
 
-        // Second call with same members + same role is a no-op (does
-        // not rewrite the file mtime).
+        // Second call with the same members is a no-op (does not rewrite
+        // the file mtime).
         let path = dir.path().join(IDENTITY_FILE);
         let mtime_before = fs::metadata(&path).unwrap().modified().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
-        let noop = persist_zone_members(
-            dir.path(),
-            &after,
-            "sharedzone",
-            members.clone(),
-            IdentityZoneRole::Voter,
-        )
-        .unwrap();
+        let noop = persist_zone_members(dir.path(), &after, "sharedzone", members.clone()).unwrap();
         assert_eq!(noop, after);
         let mtime_after = fs::metadata(&path).unwrap().modified().unwrap();
         assert_eq!(mtime_before, mtime_after, "no-op MUST NOT rewrite file");
@@ -512,22 +558,8 @@ mod tests {
             "100.64.0.21:2126".to_string(),
             "100.64.0.27:2126".to_string(),
         ];
-        let after1 = persist_zone_members(
-            dir.path(),
-            &ident,
-            "sharedzone",
-            one,
-            IdentityZoneRole::Voter,
-        )
-        .unwrap();
-        let after2 = persist_zone_members(
-            dir.path(),
-            &after1,
-            "sharedzone",
-            two.clone(),
-            IdentityZoneRole::Voter,
-        )
-        .unwrap();
+        let after1 = persist_zone_members(dir.path(), &ident, "sharedzone", one).unwrap();
+        let after2 = persist_zone_members(dir.path(), &after1, "sharedzone", two.clone()).unwrap();
         assert_eq!(after2.zones.len(), 1, "same zone_id must not duplicate");
         assert_eq!(after2.zones[0].members, two);
     }
@@ -536,22 +568,10 @@ mod tests {
     fn persist_zone_members_tracks_multiple_zones() {
         let dir = tempdir().unwrap();
         let ident = load(dir.path()).unwrap();
-        let a = persist_zone_members(
-            dir.path(),
-            &ident,
-            "sharedzone",
-            vec!["a:2126".to_string()],
-            IdentityZoneRole::Voter,
-        )
-        .unwrap();
-        let b = persist_zone_members(
-            dir.path(),
-            &a,
-            "corp-eng",
-            vec!["b:2126".to_string()],
-            IdentityZoneRole::Learner,
-        )
-        .unwrap();
+        let a = persist_zone_members(dir.path(), &ident, "sharedzone", vec!["a:2126".to_string()])
+            .unwrap();
+        let b =
+            persist_zone_members(dir.path(), &a, "corp-eng", vec!["b:2126".to_string()]).unwrap();
         assert_eq!(b.zones.len(), 2);
         let ids: Vec<&str> = b.zones.iter().map(|z| z.zone_id.as_str()).collect();
         assert!(ids.contains(&"sharedzone") && ids.contains(&"corp-eng"));
@@ -561,29 +581,40 @@ mod tests {
     }
 
     #[test]
-    fn persist_zone_members_role_change_triggers_rewrite() {
-        // Same members but role flipped (voter -> learner) is a
-        // material change — must land on disk.
+    fn persist_zone_intent_sets_role_and_members_preserve_it() {
+        // The durable role INTENT is owned by `persist_zone_intent`; a
+        // subsequent members update MUST preserve it (the achieved role is
+        // never persisted — that's what stranded a mid-promote voter as a
+        // learner).
         let dir = tempdir().unwrap();
         let ident = load(dir.path()).unwrap();
-        let members = vec!["a:2126".to_string()];
-        let voter = persist_zone_members(
-            dir.path(),
-            &ident,
-            "sharedzone",
-            members.clone(),
+
+        // Declare voter intent.
+        let a =
+            persist_zone_intent(dir.path(), &ident, "sharedzone", IdentityZoneRole::Voter).unwrap();
+        assert_eq!(a.zones[0].as_role, IdentityZoneRole::Voter);
+
+        // A members update (apply cb) preserves the voter intent — even
+        // though it carries no role at all.
+        let b =
+            persist_zone_members(dir.path(), &a, "sharedzone", vec!["x:2126".to_string()]).unwrap();
+        assert_eq!(
+            b.zones[0].as_role,
             IdentityZoneRole::Voter,
-        )
-        .unwrap();
-        let learner = persist_zone_members(
-            dir.path(),
-            &voter,
-            "sharedzone",
-            members,
-            IdentityZoneRole::Learner,
-        )
-        .unwrap();
-        assert_eq!(learner.zones[0].as_role, IdentityZoneRole::Learner);
+            "members update must not clobber the role intent"
+        );
+        assert_eq!(b.zones[0].members, vec!["x:2126".to_string()]);
+
+        // Flipping the intent (voter -> learner) is a material change.
+        let c =
+            persist_zone_intent(dir.path(), &b, "sharedzone", IdentityZoneRole::Learner).unwrap();
+        assert_eq!(c.zones[0].as_role, IdentityZoneRole::Learner);
+        // Members are preserved across an intent change.
+        assert_eq!(c.zones[0].members, vec!["x:2126".to_string()]);
+        // Idempotent: same intent again is a no-op.
+        let d =
+            persist_zone_intent(dir.path(), &c, "sharedzone", IdentityZoneRole::Learner).unwrap();
+        assert_eq!(d, c);
     }
 
     #[test]
