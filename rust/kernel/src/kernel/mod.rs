@@ -1990,12 +1990,24 @@ impl Kernel {
     /// created elsewhere; entries read straight from the committed log. Shared
     /// by `install_wal_stream` (setattr / reopen) and the StreamManager
     /// miss-materializer (cold read/write), so both build the identical backend.
-    fn wal_backend_for(&self, path: &str) -> Option<Arc<dyn crate::stream::StreamBackend>> {
-        let zone_id = self
-            .vfs_router
+    /// The zone that owns `path`, per the VFS routing SSOT — root for an
+    /// unmounted path (e.g. a node-local `/proc/{id}/fd/N` stream), the
+    /// federation zone under a mount (`/agents=<zone>`). The SINGLE resolver
+    /// for "which zone backs this stream", shared by the inode write
+    /// ([`Self::write_stream_inode`]) and the content backend
+    /// ([`Self::wal_backend_for`]) so the two can NEVER disagree: a divergence
+    /// (inode in root while the backend targeted the mount zone) is exactly
+    /// what silently made A2A mailboxes node-local and un-replicated.
+    #[inline]
+    fn routed_zone_id(&self, path: &str) -> String {
+        self.vfs_router
             .route(path, contracts::ROOT_ZONE_ID)
             .map(|r| r.zone_id)
-            .unwrap_or_else(|| contracts::ROOT_ZONE_ID.to_string());
+            .unwrap_or_else(|| contracts::ROOT_ZONE_ID.to_string())
+    }
+
+    fn wal_backend_for(&self, path: &str) -> Option<Arc<dyn crate::stream::StreamBackend>> {
+        let zone_id = self.routed_zone_id(path);
         let store = self
             .distributed_coordinator()
             .metastore_for_zone(self, &zone_id)
@@ -2109,9 +2121,24 @@ impl Kernel {
     /// Write DT_STREAM inode to metastore (shared by create_stream and SHM path).
     #[allow(dead_code)]
     fn write_stream_inode(&self, path: &str, capacity: usize) -> Result<(), KernelError> {
+        // The DT_STREAM inode MUST live in the PATH's routed zone, not a
+        // hardcoded root: a `chat-with-me` under a federation mount
+        // (`/agents=<zone>`) has to land in THAT zone's metastore so the inode
+        // replicates to peers — the SAME zone `wal_backend_for` resolves for
+        // the stream's content backend. Hardcoding root left the inode
+        // node-local (per-node SOLO) while its parent dir was federated, so the
+        // A2A mailbox silently never crossed machines: the content backend
+        // targeted the mount zone but the inode sat in root, so a peer's cold
+        // read materialized an empty stream (or missed the inode entirely).
+        // Mirror `setattr_create_dir`: `build_metadata` writes `zone_id` and
+        // `metastore_put` derives the routing zone from it, so passing the
+        // routed zone here makes the inode zone-aware. `routed_zone_id` is the
+        // SAME resolver `wal_backend_for` uses for the content backend, so the
+        // inode and the backend land in one zone by construction.
+        let zone_id = self.routed_zone_id(path);
         let meta = self.build_metadata(
             path,
-            contracts::ROOT_ZONE_ID,
+            &zone_id,
             DT_STREAM,
             capacity as u64,
             None,
@@ -3627,6 +3654,42 @@ mod tests {
             "sys_readdir must include '/data/reports': {:?}",
             entries
         );
+    }
+
+    /// Regression: a DT_STREAM's owning zone follows the path's routing SSOT,
+    /// so a `chat-with-me` under a federation mount lands in the mount's TARGET
+    /// zone (replicates to peers), NOT hardcoded root (node-local). The bug this
+    /// guards: `write_stream_inode` hardcoded `ROOT_ZONE_ID` while the parent
+    /// dir + the wal content backend routed to the mount zone, so A2A mailboxes
+    /// silently never crossed machines. Both writers now share `routed_zone_id`.
+    #[test]
+    fn stream_zone_follows_mount_target_not_hardcoded_root() {
+        let k = Kernel::new();
+        // /agents (in root) is a federation mount onto zone "sharedzone".
+        k.vfs_router.add_federation_mount(
+            "/agents",
+            contracts::ROOT_ZONE_ID,
+            None,
+            "sharedzone",
+            false,
+        );
+        // A stream path under the mount resolves to the TARGET zone — the same
+        // resolver `write_stream_inode` (inode) and `wal_backend_for` (content)
+        // both use, so inode and backend can't land in different zones.
+        assert_eq!(
+            k.routed_zone_id("/agents/w2m/chat-with-me"),
+            "sharedzone",
+            "a chat-with-me under a federation mount must own the mount's target zone"
+        );
+        assert_eq!(k.routed_zone_id("/agents"), "sharedzone");
+        // An unmounted path stays node-local root (e.g. a /proc pipe-stream) —
+        // the fix must not federate everything, only mounted paths.
+        assert_eq!(
+            k.routed_zone_id("/proc/p1/fd/1"),
+            contracts::ROOT_ZONE_ID,
+            "an unmounted stream path stays node-local root"
+        );
+        assert_eq!(k.routed_zone_id("/nowhere/x"), contracts::ROOT_ZONE_ID);
     }
 
     #[test]
