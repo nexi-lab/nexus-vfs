@@ -250,6 +250,46 @@ struct PendingProposal {
     tx: oneshot::Sender<Result<CommandResult>>,
 }
 
+/// A point-in-time snapshot of a zone's raft membership, read from the
+/// leader's `ProgressTracker`.  `voters` count toward quorum; `learners`
+/// receive full replication but never vote; `caught_up_learners` are the
+/// learners the leader has replicated up to its commit index (reachable AND
+/// current).  Used by the JoinZone handler's learner-then-promote path to
+/// classify an incoming join and decide, statelessly, whether a learner is
+/// safe to promote — without a blind `AddLearnerNode` that would *demote* a
+/// sitting voter, and without holding the RPC open to wait for catch-up.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Membership {
+    /// Voter node ids (union of joint-config incoming+outgoing, matching
+    /// [`voter_ids_from_raw_node`]).
+    pub voters: Vec<u64>,
+    /// Learner node ids.
+    pub learners: Vec<u64>,
+    /// Learners whose replicated `matched` has reached the leader's commit
+    /// index — i.e. reachable and caught up, so promoting one to voter can't
+    /// strand quorum.  Always a subset of `learners`.
+    pub caught_up_learners: Vec<u64>,
+}
+
+impl Membership {
+    /// Is `node_id` a voter?
+    #[inline]
+    pub fn is_voter(&self, node_id: u64) -> bool {
+        self.voters.contains(&node_id)
+    }
+    /// Is `node_id` a learner (and not a voter)?
+    #[inline]
+    pub fn is_learner(&self, node_id: u64) -> bool {
+        self.learners.contains(&node_id)
+    }
+    /// Is `node_id` a learner that has caught up — reachable and replicated
+    /// to the leader's commit index — hence safe to promote to voter?
+    #[inline]
+    pub fn is_caught_up_learner(&self, node_id: u64) -> bool {
+        self.caught_up_learners.contains(&node_id)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // RaftMsg — the message type for the actor channel
 // ---------------------------------------------------------------------------
@@ -288,6 +328,12 @@ pub enum RaftMsg {
     /// or parks it in `pending_reads_by_index` until a later
     /// `apply_entries` catches up.
     ReadIndex { tx: oneshot::Sender<Result<()>> },
+    /// Read the current raft membership — voters, learners, and which
+    /// learners have caught up ([`Membership`]) — from the
+    /// `ProgressTracker`.  A cheap point read used by the JoinZone handler
+    /// to classify an incoming join and decide promotion statelessly,
+    /// without holding the RPC open to wait for catch-up.
+    Membership { tx: oneshot::Sender<Membership> },
 }
 
 // ---------------------------------------------------------------------------
@@ -1474,6 +1520,17 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         }
     }
 
+    /// Read the current raft membership (voters, learners, caught-up
+    /// learners).  Cheap point read of the `ProgressTracker`; every call
+    /// re-reads.
+    pub async fn membership(&self) -> Result<Membership> {
+        let (tx, rx) = oneshot::channel();
+        self.msg_tx
+            .try_send(RaftMsg::Membership { tx })
+            .map_err(channel_try_send_err)?;
+        rx.await.map_err(|_| RaftError::ProposalDropped)
+    }
+
     /// Process a message from another node (sends through channel to driver).
     ///
     /// Uses `send().await` (blocking until space is available) instead of
@@ -1671,6 +1728,9 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                     tracing::trace!(read_request_id = id, "raft.driver.read_index");
                     self.raw_node.read_index(ctx);
                     self.pending_reads_by_ctx.insert(id, tx);
+                }
+                RaftMsg::Membership { tx } => {
+                    let _ = tx.send(read_membership(&self.raw_node));
                 }
             }
         }
@@ -2160,6 +2220,63 @@ fn voter_ids_from_raw_node(raw_node: &RawNode<RaftStorage>) -> Vec<u64> {
     ids
 }
 
+/// Read the raft-rs `ProgressTracker` learner set from `raw_node`,
+/// sorted+deduped.  Companion to [`voter_ids_from_raw_node`] — learners
+/// receive replication but do not vote, so they are tracked separately
+/// (never folded into the voter set that sizes quorum).
+#[inline]
+fn learner_ids_from_raw_node(raw_node: &RawNode<RaftStorage>) -> Vec<u64> {
+    let mut ids: Vec<u64> = raw_node
+        .raft
+        .prs()
+        .conf()
+        .learners()
+        .iter()
+        .copied()
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// Snapshot voters + learners + caught-up learners into a [`Membership`]
+/// via the SSOT readers, so the JoinZone handler classifies a join and
+/// decides promotion off the same authoritative `ProgressTracker` view the
+/// cached status mirrors.  A learner is "caught up" when the leader has
+/// replicated up to its commit index to it (`matched >= committed`) —
+/// reachable AND current, so promoting it can't strand quorum.
+#[inline]
+fn read_membership(raw_node: &RawNode<RaftStorage>) -> Membership {
+    let committed = raw_node.raft.raft_log.committed;
+    let voters = voter_ids_from_raw_node(raw_node);
+    let learners = learner_ids_from_raw_node(raw_node);
+    let caught_up_learners = learners
+        .iter()
+        .copied()
+        .filter(|&id| progress_matched(raw_node, id) >= committed)
+        .collect();
+    Membership {
+        voters,
+        learners,
+        caught_up_learners,
+    }
+}
+
+/// `matched` index the leader has confirmed replicated to `peer_id`, or
+/// `0` if the peer has no `Progress` entry yet.  Feeds the learner→voter
+/// promotion gate in [`read_membership`]: a learner with `matched >=
+/// committed` is reachable AND caught up, so promoting it cannot strand
+/// quorum.  `#[inline]`: a zero-cost `ProgressTracker` field read.
+#[inline]
+fn progress_matched(raw_node: &RawNode<RaftStorage>, peer_id: u64) -> u64 {
+    raw_node
+        .raft
+        .prs()
+        .get(peer_id)
+        .map(|p| p.matched)
+        .unwrap_or(0)
+}
+
 #[cfg(feature = "grpc")]
 impl ZoneConsensus<super::state_machine::FullStateMachine> {
     /// Sync wrapper around ``FullStateMachine::iter_dt_mount_entries``
@@ -2492,6 +2609,116 @@ mod tests {
         assert_eq!(
             sorted, handle_voters,
             "voters() must not contain duplicates (issue #7)"
+        );
+    }
+
+    // ── learner-then-promote membership change (raft-canonical) ──────
+    //
+    // These cover the JoinZone learner-then-promote gate at the driver
+    // layer (the async `membership()` / `await_peer_caught_up()` handle
+    // methods round-trip through the driver channel, which the manual
+    // pump-in-task test harness would deadlock, so we exercise the
+    // driver-side primitives directly — the actual correctness core).
+
+    /// Build a fresh single-voter node and drive it to leadership — the
+    /// setup shared by the promotion-gate tests.
+    async fn leader_1voter() -> (
+        ZoneConsensus<FullStateMachine>,
+        ZoneConsensusDriver<FullStateMachine>,
+        TempDir,
+    ) {
+        let dir = TempDir::new().unwrap();
+        let storage = RaftStorage::open(dir.path()).unwrap();
+        let cs = ConfState {
+            voters: vec![1],
+            ..Default::default()
+        };
+        storage.set_conf_state(&cs).unwrap();
+        let store = RedbStore::open(dir.path().join("sm")).unwrap();
+        let state_machine = FullStateMachine::new(&store).unwrap();
+        let config = RaftConfig {
+            id: 1,
+            peers: vec![],
+            skip_bootstrap: true,
+            tick_interval: Duration::from_millis(10),
+            ..Default::default()
+        };
+        let (handle, mut driver) =
+            ZoneConsensus::new(config, storage, state_machine, None).unwrap();
+        for _ in 0..100 {
+            driver.process_messages();
+            driver
+                .advance()
+                .await
+                .expect("advance during self-election");
+            if handle.is_leader() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(handle.is_leader(), "single voter must self-elect");
+        (handle, driver, dir)
+    }
+
+    /// The promotion gate: a learner is tracked distinctly from voters, and
+    /// an UNREACHABLE learner (its `matched` stays 0 < the leader's commit
+    /// index) is NOT reported in `caught_up_learners` — so the stateless
+    /// JoinZone handler never promotes it to voter (the guard against
+    /// stranding quorum with an unreachable voter). The positive path (a
+    /// caught-up learner IS promoted) needs a real replicating peer and is
+    /// covered by the live cross-machine acceptance, not a single-node unit.
+    #[tokio::test]
+    async fn test_unreachable_learner_is_not_caught_up_so_not_promotable() {
+        let (_handle, mut driver, _dir) = leader_1voter().await;
+
+        assert_eq!(
+            read_membership(&driver.raw_node),
+            Membership {
+                voters: vec![1],
+                learners: vec![],
+                caught_up_learners: vec![],
+            },
+            "baseline: self is sole voter, no learners"
+        );
+
+        // Add node 2 as a LEARNER — there is no live peer 2 to replicate to.
+        let mut cc = ConfChange::default();
+        cc.set_change_type(ConfChangeType::AddLearnerNode);
+        cc.node_id = 2;
+        driver
+            .raw_node
+            .propose_conf_change(vec![], cc)
+            .expect("propose AddLearnerNode(2)");
+
+        let mut applied = false;
+        for _ in 0..50 {
+            driver.process_messages();
+            driver
+                .advance()
+                .await
+                .expect("advance during AddLearnerNode apply");
+            if read_membership(&driver.raw_node).learners == vec![2] {
+                applied = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            applied,
+            "AddLearnerNode(2) must apply within the bounded loop"
+        );
+
+        let m = read_membership(&driver.raw_node);
+        assert_eq!(m.voters, vec![1], "a learner must NOT enter the voter set");
+        assert_eq!(m.learners, vec![2]);
+        assert!(m.is_voter(1) && !m.is_learner(1));
+        assert!(m.is_learner(2) && !m.is_voter(2));
+        // The unreachable learner's matched stays 0 < committed, so it is
+        // NOT caught up ⇒ the handler will not promote it. The safety gate.
+        assert_eq!(progress_matched(&driver.raw_node, 2), 0);
+        assert!(
+            m.caught_up_learners.is_empty() && !m.is_caught_up_learner(2),
+            "an unreachable learner must not be reported caught-up (never promotable)"
         );
     }
 

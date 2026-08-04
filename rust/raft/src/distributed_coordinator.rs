@@ -1828,7 +1828,13 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
                         zone_id = %zone_id,
                         endpoint = %endpoint,
                         self_id = self_id,
-                        "join_cluster: leader committed ConfChangeV2 AddNode"
+                        as_learner,
+                        "join_cluster: joined zone ({})",
+                        if as_learner {
+                            "as learner"
+                        } else {
+                            "promoted to voter (raft learner-then-promote)"
+                        }
                     );
                     // install_apply_cb_for_zone now atomically pairs
                     // the cb install with a DT_MOUNT replay scan (see
@@ -1849,9 +1855,16 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
                             continue;
                         }
                     }
+                    // Surface the leader's verdict verbatim — for a
+                    // voter join this is the actionable learner-then-
+                    // promote deferral ("could not reach advertise-addr
+                    // … loopback bind?"), which is far more useful than a
+                    // generic "rejected".
                     return Err(format!(
-                        "join_cluster: peer {endpoint} rejected — error={:?}",
-                        result.error
+                        "join_cluster: {}",
+                        result
+                            .error
+                            .unwrap_or_else(|| format!("peer {endpoint} rejected the join"))
                     ));
                 }
                 Err(e) => {

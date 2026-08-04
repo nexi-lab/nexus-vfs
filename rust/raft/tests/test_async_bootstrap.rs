@@ -117,17 +117,31 @@ async fn test_async_bootstrap_1voter_then_join() {
         .join_zone("root", vec![format!("{id_a}@{bind_a}")], false)
         .expect("local join_zone on B");
 
-    // Step 2: JoinZone RPC against A's leader.
-    let result = call_join_zone_rpc(&endpoint_a, "root", id_b, &endpoint_b, false, None, 30)
-        .await
-        .expect("JoinZone RPC");
-
-    if !result.success {
-        panic!(
-            "JoinZone failed: error={:?}, leader_address={:?}",
-            result.error, result.leader_address
-        );
+    // Step 2: JoinZone RPC against A's leader. Learner-then-promote is
+    // retry-driven (the raft-canonical membership change): the first call
+    // adds B as a *learner* (quorum unchanged; returns success=false,
+    // "re-join to promote"), then once B has caught up the leader promotes
+    // it to voter on a subsequent call (success=true). This mirrors the
+    // production join loop, which re-issues JoinZone until it is a voter.
+    // Regression pin for the learner-then-promote JoinZone contract.
+    let mut promoted = false;
+    for _ in 0..80 {
+        let result = call_join_zone_rpc(&endpoint_a, "root", id_b, &endpoint_b, false, None, 30)
+            .await
+            .expect("JoinZone RPC");
+        if result.success {
+            promoted = true;
+            break;
+        }
+        // success=false is the "added as learner, catching up" step —
+        // wait for replication to catch B up, then retry to promote.
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    assert!(
+        promoted,
+        "JoinZone(voter) must promote B to voter within the retry budget \
+         (learner-then-promote: learner add → catch up → promote)",
+    );
 
     // Wait for ConfState [r_a, r_b] to land on A's leader-side view.
     let mut voters_observed = Vec::new();
@@ -142,7 +156,7 @@ async fn test_async_bootstrap_1voter_then_join() {
     assert_eq!(
         voters_observed,
         vec![id_a, id_b],
-        "leader must commit AddNode for joiner",
+        "leader must promote the caught-up learner into the voter set",
     );
 }
 
