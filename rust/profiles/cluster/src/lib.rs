@@ -1467,6 +1467,26 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         identity_zones,
     } = open_zone_manager(&common, Some(vfs_routes), ZoneLoadPolicy::All)?;
 
+    // Remote agent-cert mint (task #40): the CA holder installs an `AgentMinter`
+    // into the raft gRPC server's slot, so `auth mint --subject-type agent` on
+    // ANY node just-works — a node without the CA key forwards to the founder
+    // over mTLS (`mint_agent_via_founder`) and the founder signs + records the
+    // agent here. Gated on holding the CA private key; every other node leaves
+    // the slot empty and its MintAgent RPC replies "does not hold the cluster
+    // CA". Auth-off (`--no-tls`) has no CA at all, so nothing is installed.
+    if !common.no_tls {
+        let tls_dir = common.data_dir.join("tls");
+        if tls_dir.join("ca-key.pem").exists() {
+            let minter: Arc<dyn nexus_raft::agent_minter::AgentMinter> =
+                Arc::new(FounderAgentMinter {
+                    store: auth::KernelSlotStore::new_arc(Arc::clone(&kernel)),
+                    tls_dir,
+                });
+            *zm.agent_minter_slot().write() = Some(minter);
+            tracing::info!("CA holder armed MintAgent RPC (remote agent-cert mint)");
+        }
+    }
+
     // Founder node-enrollment listener (pre-mTLS BOOTSTRAP plane). With
     // `--accept-enrollments` and TLS on, serve `NodeEnrollmentService` on a
     // dedicated PLAINTEXT bind (data-plane port + 1, see `effective_enroll_addr`
@@ -3333,7 +3353,273 @@ fn parse_zone_grant(spec: &str) -> Result<(String, String)> {
     }
 }
 
+/// Write an agent's signed bundle (`agent.pem` / `agent-key.pem` / `ca.pem`)
+/// under `<data_dir>/agents/<subject_id>/` and return the directory. The one
+/// on-disk layout the local mint (`run_auth_action`) and the remote mint
+/// (`mint_agent_via_founder`) share — extracted so the two paths cannot drift.
+fn write_agent_bundle(
+    data_dir: &std::path::Path,
+    subject_id: &str,
+    cert_pem: &[u8],
+    key_pem: &[u8],
+    ca_pem: &[u8],
+) -> Result<std::path::PathBuf> {
+    let out_dir = data_dir.join("agents").join(subject_id);
+    std::fs::create_dir_all(&out_dir).with_context(|| format!("create {}", out_dir.display()))?;
+    std::fs::write(out_dir.join("agent.pem"), cert_pem)
+        .with_context(|| format!("write {}/agent.pem", out_dir.display()))?;
+    std::fs::write(out_dir.join("agent-key.pem"), key_pem)
+        .with_context(|| format!("write {}/agent-key.pem", out_dir.display()))?;
+    std::fs::write(out_dir.join("ca.pem"), ca_pem)
+        .with_context(|| format!("write {}/ca.pem", out_dir.display()))?;
+    Ok(out_dir)
+}
+
+/// Founder-side [`nexus_raft::agent_minter::AgentMinter`]: signs an agent
+/// identity cert with the cluster CA and records it in the replicated auth
+/// store, serving a remote `MintAgent` call from another node. Installed ONLY
+/// on the CA holder (see the founder-install block in `run_daemon`).
+///
+/// This is the SAME two reusable units the local CLI agent-mint path calls
+/// (`generate_agent_cert` + `mint_agent_authz`), so the remote and local paths
+/// stay byte-identical by construction — they differ only in WHERE the CA key
+/// is read and the bundle is written. The caller is gated to a cluster NODE:
+/// mTLS already proved the client leaf chains to the cluster CA; we additionally
+/// require it be a node identity, so an agent cert (a pure identity) can never
+/// be leveraged into minting further agents (privilege confinement).
+struct FounderAgentMinter {
+    store: Arc<dyn kernel::hal::auth_key_store::AuthKeyStore>,
+    tls_dir: PathBuf,
+}
+
+#[tonic::async_trait]
+impl nexus_raft::agent_minter::AgentMinter for FounderAgentMinter {
+    async fn mint(
+        &self,
+        caller_cert_der: Option<Vec<u8>>,
+        subject_id: &str,
+        display_name: &str,
+        allow_existing: bool,
+    ) -> std::result::Result<nexus_raft::agent_minter::AgentBundle, String> {
+        // Gate: node-only. An agent cert carries no authorization, so a valid
+        // agent cert must never be leverageable into minting more agents.
+        let der = caller_cert_der
+            .ok_or_else(|| "MintAgent requires an mTLS client certificate".to_string())?;
+        let peer = transport::peer_identity::from_der(&der)
+            .ok_or_else(|| "MintAgent: client certificate did not parse".to_string())?;
+        if peer.node_id.is_none() {
+            return Err(format!(
+                "MintAgent is a node-only operation; caller {} is not a cluster node \
+                 (an agent cert is a pure identity and cannot mint agents)",
+                peer.display_id(),
+            ));
+        }
+
+        let ca_pem = std::fs::read(self.tls_dir.join("ca.pem"))
+            .map_err(|e| format!("read {}/ca.pem: {e}", self.tls_dir.display()))?;
+        let ca_key_pem = std::fs::read(self.tls_dir.join("ca-key.pem"))
+            .map_err(|e| format!("read {}/ca-key.pem: {e}", self.tls_dir.display()))?;
+        let (cert_pem, key_pem) =
+            nexus_raft::transport::generate_agent_cert(subject_id, &ca_pem, &ca_key_pem)
+                .map_err(|e| format!("generate agent cert: {e}"))?;
+
+        // The record is uniqueness + audit only for agents (the cert itself
+        // governs authentication and its own lifetime), so the remote path
+        // carries no expiry — matching the local mint, whose `--expires-in-days`
+        // sets only this audit field and never the cert validity.
+        let record = auth::AuthKeyRecord {
+            key_id: uuid_v4(),
+            name: display_name.to_string(),
+            subject_type: auth::SubjectType::Agent,
+            subject_id: subject_id.to_string(),
+            is_admin: false,
+            revoked: false,
+            expires_at_ms: None,
+            zone_perms: Vec::new(),
+        };
+        auth::mint_agent_authz(&self.store, record, allow_existing)
+            .map_err(|e| format!("record agent: {e}"))?;
+
+        Ok(nexus_raft::agent_minter::AgentBundle {
+            cert_pem,
+            key_pem,
+            ca_pem,
+        })
+    }
+}
+
+/// mTLS endpoint URLs to try for a remote agent mint: the union of `--peers`
+/// and the persisted `identity.json` peer address book, parsed the same way the
+/// daemon seeds its transport peer map. The founder is whichever one holds the
+/// CA (its `MintAgent` slot is armed); the rest reply "does not hold the cluster
+/// CA" and the caller moves on.
+fn founder_candidate_endpoints(common: &CommonArgs) -> Result<Vec<String>> {
+    let mut seed: Vec<String> = common
+        .peers
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+    let identity_dir = common
+        .identity_dir
+        .clone()
+        .unwrap_or_else(nexus_raft::identity::default_identity_dir);
+    if let Ok(ident) = nexus_raft::identity::load(&identity_dir) {
+        for p in ident.peers {
+            if !seed.iter().any(|s| s == &p) {
+                seed.push(p);
+            }
+        }
+    }
+    if seed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let parsed = NodeAddress::parse_peer_list_operator(&seed.join(","), /* use_tls */ true)
+        .map_err(|e| anyhow::anyhow!("parse peers for remote agent mint: {e}"))?;
+    Ok(parsed.into_iter().map(|p| p.endpoint).collect())
+}
+
+/// Forward an agent-cert mint to the founder (CA holder) over mTLS, for a node
+/// that does not hold the CA private key. The founder signs + records the agent
+/// (cluster-wide name uniqueness + audit live there); this node writes the
+/// returned bundle to `<data_dir>/agents/<subject_id>/`, byte-identical to a
+/// local mint. The joiner half of the just-works contract (task #40).
+async fn mint_agent_via_founder(common: &CommonArgs, action: &AuthCmd) -> Result<()> {
+    let AuthCmd::Mint {
+        subject_id,
+        zones,
+        admin,
+        name,
+        allow_existing,
+        ..
+    } = action
+    else {
+        unreachable!("mint_agent_via_founder called with a non-Mint action");
+    };
+    // Same pure-identity refusal as the local agent-mint path — surfaced here so
+    // a joiner gets it too, before any RPC.
+    if !zones.is_empty() || *admin {
+        return Err(anyhow::anyhow!(
+            "an agent cert is a pure identity and carries no authorization; \
+             --zone / --admin do not apply. Mint a --subject-type user or service \
+             key for a principal that needs zone grants."
+        ));
+    }
+    let display_name = if name.is_empty() {
+        subject_id.as_str()
+    } else {
+        name.as_str()
+    };
+
+    // The client identity is this node's cluster node cert; the founder's
+    // MintAgent gate requires a NODE caller.
+    let tls_dir = common.data_dir.join("tls");
+    let node_cert = tls_dir.join("node.pem");
+    if !node_cert.exists() {
+        return Err(anyhow::anyhow!(
+            "remote agent mint dials the founder over mTLS, but this node has no \
+             cluster cert yet ({} missing). Enroll this node first \
+             (`--token <join-token> --peers <founder>`).",
+            node_cert.display()
+        ));
+    }
+    let tls = nexus_raft::transport::TlsConfig {
+        cert_pem: std::fs::read(&node_cert)
+            .with_context(|| format!("read {}", node_cert.display()))?,
+        key_pem: std::fs::read(tls_dir.join("node-key.pem"))
+            .with_context(|| format!("read {}/node-key.pem", tls_dir.display()))?,
+        ca_pem: std::fs::read(tls_dir.join("ca.pem"))
+            .with_context(|| format!("read {}/ca.pem", tls_dir.display()))?,
+    };
+
+    let endpoints = founder_candidate_endpoints(common)?;
+    if endpoints.is_empty() {
+        return Err(anyhow::anyhow!(
+            "no peers known to forward the agent mint to — pass --peers <founder> \
+             (this node holds no CA key, so it cannot sign agent certs itself)."
+        ));
+    }
+
+    let mut last_err = String::new();
+    for endpoint in &endpoints {
+        match nexus_raft::transport::call_mint_agent_rpc(
+            endpoint,
+            subject_id,
+            display_name,
+            *allow_existing,
+            Some(tls.clone()),
+            /* timeout_secs */ 15,
+        )
+        .await
+        {
+            Ok(result) if result.success => {
+                let out_dir = write_agent_bundle(
+                    &common.data_dir,
+                    subject_id,
+                    &result.agent_cert_pem,
+                    &result.agent_key_pem,
+                    &result.ca_pem,
+                )?;
+
+                // The bundle directory on stdout alone, identical to the local
+                // path so `DIR=$(nexusd-cluster auth mint --subject-type agent
+                // NAME ...)` captures it on any node.
+                println!("{}", out_dir.display());
+                eprintln!(
+                    "minted agent cert subject=agent:{subject_id} via founder {endpoint} -> {}",
+                    out_dir.display()
+                );
+                eprintln!(
+                    "The agent presents agent.pem + agent-key.pem and trusts the server via ca.pem."
+                );
+                return Ok(());
+            }
+            Ok(result) => {
+                // Reached a peer, but it refused. "does not hold the cluster CA"
+                // ⇒ not the founder, try the next; any other refusal (name taken,
+                // caller not a node, …) is authoritative — it came from the
+                // founder, so stop and surface it.
+                let msg = result.error.unwrap_or_default();
+                if msg.contains("does not hold the cluster CA") {
+                    last_err = format!("{endpoint}: {msg}");
+                    continue;
+                }
+                return Err(anyhow::anyhow!(
+                    "founder {endpoint} refused agent mint: {msg}"
+                ));
+            }
+            Err(e) => {
+                last_err = format!("{endpoint}: {e}");
+                continue;
+            }
+        }
+    }
+    Err(anyhow::anyhow!(
+        "could not mint agent via any known peer (last: {last_err}). The founder \
+         (CA holder) must be running and reachable at one of: {}",
+        endpoints.join(", ")
+    ))
+}
+
 async fn run_auth(common: CommonArgs, action: AuthCmd) -> Result<()> {
+    // Remote agent-cert mint (task #40): a node that does NOT hold the CA key
+    // forwards the mint to the founder over mTLS instead of failing, so
+    // `auth mint --subject-type agent NAME` just-works on ANY node — not only
+    // the founder. This dials a single RPC (no local store / ZoneManager), so it
+    // runs HERE in the async context (not the blocking pool) and works even
+    // while the local daemon holds the redb data-dir lock. A CA holder — or an
+    // auth-off (`--no-tls`) node, which has no CA anywhere — falls through to the
+    // local store path below (auth-off → a clear "reading ca.pem" error).
+    if let AuthCmd::Mint { subject_type, .. } = &action {
+        if subject_type == "agent"
+            && !common.no_tls
+            && !common.data_dir.join("tls").join("ca-key.pem").exists()
+        {
+            return mint_agent_via_founder(&common, &action).await;
+        }
+    }
+
     // The offline `auth` subcommand builds a ZoneManager, which owns a nested
     // tokio runtime — created, driven, and dropped in this one call. None of
     // that may happen on an async worker thread of the outer `#[tokio::main]`
@@ -3541,15 +3827,7 @@ fn run_auth_action(
                 auth::mint_agent_authz(store, record, allow_existing)
                     .map_err(|e| anyhow::anyhow!("mint agent: {e}"))?;
 
-                let out_dir = data_dir.join("agents").join(&name_id);
-                std::fs::create_dir_all(&out_dir)
-                    .with_context(|| format!("create {}", out_dir.display()))?;
-                std::fs::write(out_dir.join("agent.pem"), &cert_pem)
-                    .with_context(|| format!("write {}/agent.pem", out_dir.display()))?;
-                std::fs::write(out_dir.join("agent-key.pem"), &key_pem)
-                    .with_context(|| format!("write {}/agent-key.pem", out_dir.display()))?;
-                std::fs::write(out_dir.join("ca.pem"), &ca_pem)
-                    .with_context(|| format!("write {}/ca.pem", out_dir.display()))?;
+                let out_dir = write_agent_bundle(data_dir, &name_id, &cert_pem, &key_pem, &ca_pem)?;
 
                 // The bundle directory on stdout alone, so
                 // `DIR=$(nexusd-cluster auth mint --subject-type agent NAME ...)`
@@ -3834,6 +4112,99 @@ mod tests {
         assert_eq!(
             resolve_api_key_secret(empty.path(), Some(String::new())),
             None
+        );
+    }
+
+    /// The founder-side agent minter: the node-only gate refuses a caller that
+    /// is not a cluster node (no cert, or an agent cert — an agent is a pure
+    /// identity and must never mint agents), and the happy path signs a real
+    /// cluster-CA agent cert and records the agent with cluster-wide uniqueness.
+    /// Exercises the SAME units the offline CLI and the remote MintAgent RPC
+    /// drive, without a live daemon.
+    #[tokio::test]
+    async fn founder_agent_minter_gates_to_nodes_and_signs() {
+        use kernel::hal::auth_key_store::{AuthKeyStore, AuthKeyStoreError};
+        use nexus_raft::agent_minter::AgentMinter;
+        use nexus_raft::transport::{generate_agent_cert, generate_node_cert, generate_zone_ca};
+
+        #[derive(Default)]
+        struct MemStore {
+            records: std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
+        }
+        impl AuthKeyStore for MemStore {
+            fn get(&self, k: &str) -> Result<Option<Vec<u8>>, AuthKeyStoreError> {
+                Ok(self.records.lock().unwrap().get(k).cloned())
+            }
+            fn put(&self, k: &str, r: &[u8]) -> Result<(), AuthKeyStoreError> {
+                self.records
+                    .lock()
+                    .unwrap()
+                    .insert(k.to_string(), r.to_vec());
+                Ok(())
+            }
+            fn delete(&self, k: &str) -> Result<bool, AuthKeyStoreError> {
+                Ok(self.records.lock().unwrap().remove(k).is_some())
+            }
+            fn list(&self) -> Result<Vec<(String, Vec<u8>)>, AuthKeyStoreError> {
+                Ok(self
+                    .records
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(h, r)| (h.clone(), r.clone()))
+                    .collect())
+            }
+        }
+
+        // A real cluster CA on disk — the minter reads ca.pem + ca-key.pem.
+        let (ca_pem, ca_key_pem) = generate_zone_ca("root").expect("ca");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tls_dir = dir.path().join("tls");
+        std::fs::create_dir_all(&tls_dir).unwrap();
+        std::fs::write(tls_dir.join("ca.pem"), &ca_pem).unwrap();
+        std::fs::write(tls_dir.join("ca-key.pem"), &ca_key_pem).unwrap();
+
+        let store: Arc<dyn AuthKeyStore> = Arc::new(MemStore::default());
+        let minter = FounderAgentMinter { store, tls_dir };
+
+        let der = |p: &[u8]| ::pem::parse(p).unwrap().contents().to_vec();
+        let (node_cert, _k) =
+            generate_node_cert(7, "root", &ca_pem, &ca_key_pem, &[], Some("box")).unwrap();
+        let (agent_cert, _k2) = generate_agent_cert("intruder", &ca_pem, &ca_key_pem).unwrap();
+
+        // No client cert ⇒ refused.
+        assert!(minter.mint(None, "w1", "w1", false).await.is_err());
+
+        // An agent cert ⇒ refused: an agent cannot mint further agents.
+        // (Match rather than `expect_err`: `AgentBundle` holds a private key, so
+        // it deliberately derives no `Debug` that could `{:?}`-leak the key.)
+        let e = match minter.mint(Some(der(&agent_cert)), "w1", "w1", false).await {
+            Err(e) => e,
+            Ok(_) => panic!("an agent cert must not mint agents"),
+        };
+        assert!(e.contains("node-only"), "unexpected gate error: {e}");
+
+        // A node cert ⇒ signs a bundle and records the agent.
+        let bundle = minter
+            .mint(Some(der(&node_cert)), "w1", "w1", false)
+            .await
+            .expect("a node caller mints");
+        assert!(!bundle.cert_pem.is_empty() && !bundle.key_pem.is_empty());
+        assert_eq!(bundle.ca_pem, ca_pem, "the bundle ships the cluster CA");
+        // The minted cert is a real agent identity chaining to the cluster CA.
+        let id =
+            transport::peer_identity::from_der(&der(&bundle.cert_pem)).expect("minted cert parses");
+        assert_eq!(id.agent_name.as_deref(), Some("w1"));
+
+        // Cluster-wide uniqueness is enforced through the record: a second mint
+        // of the same name without --allow-existing is refused.
+        let dup = match minter.mint(Some(der(&node_cert)), "w1", "w1", false).await {
+            Err(e) => e,
+            Ok(_) => panic!("duplicate agent name must be refused"),
+        };
+        assert!(
+            dup.contains("already has an active credential"),
+            "unexpected dup error: {dup}"
         );
     }
 
