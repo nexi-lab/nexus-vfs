@@ -114,6 +114,14 @@ service ZoneApiService {
   // Used by follower `try_remote_fetch` / scatter-gather chunk fetch when
   // metadata has been replicated ahead of content.
   rpc ReadBlob(ReadBlobRequest) returns (ReadBlobResponse);
+
+  // MintAgent signs an agent identity cert (`nexus://agent/{subject_id}`) on the
+  // CA holder (founder) for a caller on any cluster node — so an agent on a
+  // joiner is provisioned without hand-carrying a private key. mTLS-gated to a
+  // NODE peer (agents may not mint agents); a node that does not hold the CA
+  // key returns success=false. Reuses the same generate + authz units as the
+  // local `auth mint`, run against the founder's live CA + auth store.
+  rpc MintAgent(MintAgentRequest) returns (MintAgentResponse);
 }
 
 // NodeEnrollmentService is the pre-mTLS BOOTSTRAP plane: the one surface a
@@ -282,6 +290,26 @@ message RemoveVoterResponse {
   optional string error = 2;
   // If not leader, redirect to leader.
   optional string leader_address = 3;
+}
+
+// MintAgentRequest asks the CA holder to sign an agent identity cert.
+message MintAgentRequest {
+  // Agent name → the cert subject `nexus://agent/{subject_id}`.
+  string subject_id = 1;
+  // Human-friendly display label (optional).
+  string display_name = 2;
+  // Rotation escape: re-mint a subject that already holds an active credential.
+  bool allow_existing = 3;
+}
+
+// MintAgentResponse carries the signed bundle (cert + key + cluster CA), or an
+// error (e.g. this node does not hold the CA key, or the name clashes).
+message MintAgentResponse {
+  bool success = 1;
+  optional string error = 2;
+  bytes agent_cert_pem = 3;
+  bytes agent_key_pem = 4;
+  bytes ca_pem = 5;
 }
 
 // DeleteZoneRequest asks a peer to remove its local zone replica.

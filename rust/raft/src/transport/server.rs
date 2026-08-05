@@ -16,13 +16,15 @@ use super::proto::nexus::raft::{
     DiscoverZonesRequest, DiscoverZonesResponse, FederationZoneInfo, GetClusterInfoRequest,
     GetClusterInfoResponse, GetCrlRequest, GetCrlResponse, GetMetadataResult,
     GetSearchCapabilitiesRequest, JoinClusterRequest, JoinClusterResponse, JoinZoneRequest,
-    JoinZoneResponse, ListMetadataResult, LockInfoResult, LockResult, NodeInfo as ProtoNodeInfo,
-    ProposeRequest, ProposeResponse, QueryRequest, QueryResponse, RaftCommand, RaftQueryResponse,
-    RaftResponse, ReadBlobRequest, ReadBlobResponse, RemoveVoterRequest, RemoveVoterResponse,
-    ReplicateEntriesRequest, ReplicateEntriesResponse, SearchCapabilities, SnapshotEcStateRequest,
-    SnapshotEcStateResponse, StepMessageRequest, StepMessageResponse,
+    JoinZoneResponse, ListMetadataResult, LockInfoResult, LockResult, MintAgentRequest,
+    MintAgentResponse, NodeInfo as ProtoNodeInfo, ProposeRequest, ProposeResponse, QueryRequest,
+    QueryResponse, RaftCommand, RaftQueryResponse, RaftResponse, ReadBlobRequest, ReadBlobResponse,
+    RemoveVoterRequest, RemoveVoterResponse, ReplicateEntriesRequest, ReplicateEntriesResponse,
+    SearchCapabilities, SnapshotEcStateRequest, SnapshotEcStateResponse, StepMessageRequest,
+    StepMessageResponse,
 };
 use super::{NodeAddress, Result, SharedPeerMap, TransportError};
+use crate::agent_minter::AgentMinterSlot;
 use crate::blob_fetcher::BlobFetcherSlot;
 use crate::raft::{
     reconcile_peers_with_conf_state, Command, CommandResult, FullStateMachine, RaftError,
@@ -79,6 +81,10 @@ pub struct RaftGrpcServer {
     /// backend is wired. `None` while the slot is empty —
     /// `ReadBlob` returns `NotFound` until the kernel installs one.
     blob_fetcher_slot: Option<BlobFetcherSlot>,
+    /// Slot the cluster profile binds an `AgentMinter` into on the founder
+    /// (CA holder) at boot. `None` on a joiner — `MintAgent` returns
+    /// success=false there ("not the CA holder").
+    agent_minter_slot: Option<AgentMinterSlot>,
     /// Additional gRPC services co-hosted on the same port.
     /// Constructed externally (e.g. VFS gRPC by the cluster binary)
     /// and passed in as type-erased `tonic::service::Routes` so this
@@ -92,6 +98,7 @@ impl RaftGrpcServer {
             config,
             registry,
             blob_fetcher_slot: None,
+            agent_minter_slot: None,
             extra_services: None,
         }
     }
@@ -102,6 +109,14 @@ impl RaftGrpcServer {
     /// owning `ZoneManager` so both halves reach the same `Arc`.
     pub fn with_blob_fetcher_slot(mut self, slot: BlobFetcherSlot) -> Self {
         self.blob_fetcher_slot = Some(slot);
+        self
+    }
+
+    /// Attach the late-bindable `AgentMinter` slot so `ZoneApiService::mint_agent`
+    /// can sign agent certs once the founder installs an impl. Installed only on
+    /// the CA holder; a joiner leaves it empty and rejects `MintAgent`.
+    pub fn with_agent_minter_slot(mut self, slot: AgentMinterSlot) -> Self {
+        self.agent_minter_slot = Some(slot);
         self
     }
 
@@ -138,6 +153,7 @@ impl RaftGrpcServer {
         let client_service = ZoneApiServiceImpl {
             registry: self.registry.clone(),
             blob_fetcher_slot: self.blob_fetcher_slot.clone(),
+            agent_minter_slot: self.agent_minter_slot.clone(),
         };
 
         let mut builder =
@@ -197,6 +213,7 @@ impl RaftGrpcServer {
         let client_service = ZoneApiServiceImpl {
             registry: self.registry.clone(),
             blob_fetcher_slot: self.blob_fetcher_slot.clone(),
+            agent_minter_slot: self.agent_minter_slot.clone(),
         };
 
         let mut builder =
@@ -686,6 +703,9 @@ struct ZoneApiServiceImpl {
     /// Optional late-bound `BlobFetcher` for `ReadBlob`. Empty slot
     /// (or `None` here) → `read_blob` returns `NotFound`.
     blob_fetcher_slot: Option<BlobFetcherSlot>,
+    /// Optional late-bound `AgentMinter` for `MintAgent`. Present only on the
+    /// CA holder (founder); `None` → `mint_agent` returns success=false.
+    agent_minter_slot: Option<AgentMinterSlot>,
 }
 
 #[tonic::async_trait]
@@ -1431,6 +1451,64 @@ impl ZoneApiService for ZoneApiServiceImpl {
                 content: Vec::new(),
                 error: e,
             })),
+        }
+    }
+
+    /// Sign an agent identity cert on the CA holder (founder) for a remote
+    /// caller — the server half of a joiner's `auth mint --subject-type agent`
+    /// routing to the founder. The verified mTLS client leaf cert is forwarded
+    /// to the injected `AgentMinter`, which gates it to a NODE peer (an agent
+    /// may not mint agents) before signing; raft applies no auth logic. A node
+    /// with no minter installed (a joiner — not the CA holder) returns
+    /// success=false so the caller can try the founder.
+    async fn mint_agent(
+        &self,
+        request: Request<MintAgentRequest>,
+    ) -> std::result::Result<Response<MintAgentResponse>, Status> {
+        let caller_cert_der = request
+            .extensions()
+            .get::<tonic::transport::server::TlsConnectInfo<
+                tonic::transport::server::TcpConnectInfo,
+            >>()
+            .and_then(|tls| tls.peer_certs())
+            .and_then(|certs| certs.first().map(|c| c.as_ref().to_vec()));
+        let req = request.into_inner();
+        let err_resp = |msg: String| {
+            Response::new(MintAgentResponse {
+                success: false,
+                error: Some(msg),
+                agent_cert_pem: Vec::new(),
+                agent_key_pem: Vec::new(),
+                ca_pem: Vec::new(),
+            })
+        };
+        let minter = self
+            .agent_minter_slot
+            .as_ref()
+            .and_then(|slot| slot.read().as_ref().cloned());
+        let Some(minter) = minter else {
+            return Ok(err_resp(
+                "this node does not hold the cluster CA; mint agents against the founder"
+                    .to_string(),
+            ));
+        };
+        match minter
+            .mint(
+                caller_cert_der,
+                &req.subject_id,
+                &req.display_name,
+                req.allow_existing,
+            )
+            .await
+        {
+            Ok(bundle) => Ok(Response::new(MintAgentResponse {
+                success: true,
+                error: None,
+                agent_cert_pem: bundle.cert_pem,
+                agent_key_pem: bundle.key_pem,
+                ca_pem: bundle.ca_pem,
+            })),
+            Err(e) => Ok(err_resp(e)),
         }
     }
 }
