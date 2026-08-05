@@ -3513,17 +3513,10 @@ async fn mint_agent_via_founder(common: &CommonArgs, action: &AuthCmd) -> Result
     };
 
     // The client identity is this node's cluster node cert; the founder's
-    // MintAgent gate requires a NODE caller.
+    // MintAgent gate requires a NODE caller. The caller (`run_auth`) only routes
+    // here from an ENROLLED joiner, so `node.pem` is present by construction.
     let tls_dir = common.data_dir.join("tls");
     let node_cert = tls_dir.join("node.pem");
-    if !node_cert.exists() {
-        return Err(anyhow::anyhow!(
-            "remote agent mint dials the founder over mTLS, but this node has no \
-             cluster cert yet ({} missing). Enroll this node first \
-             (`--token <join-token> --peers <founder>`).",
-            node_cert.display()
-        ));
-    }
     let tls = nexus_raft::transport::TlsConfig {
         cert_pem: std::fs::read(&node_cert)
             .with_context(|| format!("read {}", node_cert.display()))?,
@@ -3603,18 +3596,28 @@ async fn mint_agent_via_founder(common: &CommonArgs, action: &AuthCmd) -> Result
 }
 
 async fn run_auth(common: CommonArgs, action: AuthCmd) -> Result<()> {
-    // Remote agent-cert mint (task #40): a node that does NOT hold the CA key
-    // forwards the mint to the founder over mTLS instead of failing, so
-    // `auth mint --subject-type agent NAME` just-works on ANY node — not only
-    // the founder. This dials a single RPC (no local store / ZoneManager), so it
-    // runs HERE in the async context (not the blocking pool) and works even
-    // while the local daemon holds the redb data-dir lock. A CA holder — or an
-    // auth-off (`--no-tls`) node, which has no CA anywhere — falls through to the
-    // local store path below (auth-off → a clear "reading ca.pem" error).
+    // Remote agent-cert mint (task #40): an ENROLLED joiner cannot sign an agent
+    // cert locally (it holds a cluster-issued `node.pem` but not the CA key), so
+    // it forwards the mint to the founder over mTLS instead of failing — making
+    // `auth mint --subject-type agent NAME` just-work on ANY node, not only the
+    // founder. This dials a single RPC (no local store / ZoneManager), so it runs
+    // HERE in the async context (not the blocking pool) and works even while the
+    // node's own daemon holds the redb data-dir lock.
+    //
+    // The enrolled-joiner signal is precise — `node.pem` present, `ca-key.pem`
+    // absent — so it forwards ONLY when a founder must be consulted:
+    //   - CA holder (`ca-key.pem` present) → local sign (falls through below).
+    //   - Fresh/unenrolled dir (neither file) → falls through to the local path,
+    //     where `open_zone_manager` bootstraps this node's own CA as a
+    //     founder-to-be. Routing that to a founder would be wrong (there isn't
+    //     one), so it must NOT be captured here.
+    //   - Auth-off (`--no-tls`) → no mTLS to dial → falls through.
     if let AuthCmd::Mint { subject_type, .. } = &action {
+        let tls_dir = common.data_dir.join("tls");
         if subject_type == "agent"
             && !common.no_tls
-            && !common.data_dir.join("tls").join("ca-key.pem").exists()
+            && tls_dir.join("node.pem").exists()
+            && !tls_dir.join("ca-key.pem").exists()
         {
             return mint_agent_via_founder(&common, &action).await;
         }
