@@ -1926,6 +1926,7 @@ dependencies = [
  "gethostname",
  "kernel",
  "lib",
+ "pem",
  "raft 0.1.0",
  "rand 0.10.1",
  "tempfile",

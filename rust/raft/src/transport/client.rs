@@ -9,8 +9,9 @@ use super::proto::nexus::raft::{
     zone_transport_service_client::ZoneTransportServiceClient, AcquireLock, DeleteMetadata,
     DeleteZoneRequest, DiscoverZonesRequest, EcReplicationEntry, ExtendLock, GetClusterInfoRequest,
     GetCrlRequest, GetLockInfo, GetMetadata, JoinClusterRequest, JoinZoneRequest, ListMetadata,
-    ProposeRequest, PutMetadata, QueryRequest, RaftCommand, RaftQuery, ReleaseLock,
-    RemoveVoterRequest, ReplicateEntriesRequest, SnapshotEcStateRequest, StepMessageRequest,
+    MintAgentRequest, ProposeRequest, PutMetadata, QueryRequest, RaftCommand, RaftQuery,
+    ReleaseLock, RemoveVoterRequest, ReplicateEntriesRequest, SnapshotEcStateRequest,
+    StepMessageRequest,
 };
 use super::{NodeAddress, Result, TransportError};
 use std::collections::HashMap;
@@ -1035,6 +1036,60 @@ pub async fn call_delete_zone(
             response.error.unwrap_or_default()
         )))
     }
+}
+
+/// Bundle returned by a successful [`call_mint_agent_rpc`] — the same three
+/// artifacts a local `auth mint --subject-type agent` writes.
+#[derive(Debug, Clone)]
+pub struct MintAgentResult {
+    /// Whether the CA holder signed + recorded the agent.
+    pub success: bool,
+    /// Server-side refusal when `success=false`: either "not the CA holder"
+    /// (try another peer) or an authoritative rejection (e.g. name taken).
+    pub error: Option<String>,
+    /// The agent's signed identity cert (PEM). Empty on failure.
+    pub agent_cert_pem: Vec<u8>,
+    /// The agent's private key (PEM). Empty on failure.
+    pub agent_key_pem: Vec<u8>,
+    /// The cluster CA cert (PEM) the agent trusts its server with. Empty on
+    /// failure.
+    pub ca_pem: Vec<u8>,
+}
+
+/// Call `ZoneApiService::MintAgent` on a peer (the founder / CA holder).
+///
+/// Lets an agent on ANY node obtain a CA-signed identity cert without the CA
+/// private key locally: the founder signs + records it (cluster-wide name
+/// uniqueness + audit live there) and returns the bundle. A peer that does not
+/// hold the CA returns `success=false` with "does not hold the cluster CA", so
+/// the caller tries the next peer. mTLS-only — the caller presents its NODE
+/// cert, which the founder's `AgentMinter` gate requires (an agent cert is a
+/// pure identity and must not be able to mint further agents).
+pub async fn call_mint_agent_rpc(
+    peer_addr: &str,
+    subject_id: &str,
+    display_name: &str,
+    allow_existing: bool,
+    tls: Option<super::TlsConfig>,
+    timeout_secs: u64,
+) -> Result<MintAgentResult> {
+    let mut client = connect_zone_api(peer_addr, tls, timeout_secs, "MintAgent").await?;
+    let response = client
+        .mint_agent(MintAgentRequest {
+            subject_id: subject_id.to_string(),
+            display_name: display_name.to_string(),
+            allow_existing,
+        })
+        .await
+        .map_err(|e| TransportError::Rpc(format!("MintAgent RPC failed: {e}")))?
+        .into_inner();
+    Ok(MintAgentResult {
+        success: response.success,
+        error: response.error,
+        agent_cert_pem: response.agent_cert_pem,
+        agent_key_pem: response.agent_key_pem,
+        ca_pem: response.ca_pem,
+    })
 }
 
 #[cfg(test)]

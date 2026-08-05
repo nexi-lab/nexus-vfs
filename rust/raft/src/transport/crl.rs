@@ -157,7 +157,8 @@ mod tests {
         let serial = serial_from_cert_pem(&cert_pem).expect("read the cert serial");
         assert!(!serial.is_empty(), "a cert carries a non-empty serial");
 
-        let crl = generate_crl(&[serial.clone()], 1, &ca, &ca_key).expect("sign the CRL");
+        let crl =
+            generate_crl(std::slice::from_ref(&serial), 1, &ca, &ca_key).expect("sign the CRL");
         let revoked = crl_revoked_serials(&crl, &ca).expect("verify under the CA");
         assert!(
             revoked.iter().any(|s| s == &serial),

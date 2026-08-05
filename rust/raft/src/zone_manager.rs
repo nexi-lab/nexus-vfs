@@ -200,6 +200,10 @@ pub struct ZoneManager {
     /// installs an impl. Stays empty on slim / no-federation runtimes
     /// (the RPC is still advertised but returns `NotFound`).
     blob_fetcher_slot: crate::blob_fetcher::BlobFetcherSlot,
+    /// Shared with the gRPC server so `ZoneApiService::mint_agent` can sign
+    /// agent certs once the founder installs an `AgentMinter`. Empty on a
+    /// joiner (not the CA holder) — the RPC returns success=false there.
+    agent_minter_slot: crate::agent_minter::AgentMinterSlot,
     /// Static topology mounts staged by `bootstrap_static`, drained
     /// incrementally by `apply_topology` as parent + target zones'
     /// leaders settle. BTreeMap so parent paths process before children.
@@ -435,8 +439,10 @@ impl ZoneManager {
         }
 
         let blob_fetcher_slot = crate::blob_fetcher::new_blob_fetcher_slot();
+        let agent_minter_slot = crate::agent_minter::new_agent_minter_slot();
         let mut server = RaftGrpcServer::new(registry.clone(), config)
-            .with_blob_fetcher_slot(blob_fetcher_slot.clone());
+            .with_blob_fetcher_slot(blob_fetcher_slot.clone())
+            .with_agent_minter_slot(agent_minter_slot.clone());
         // Node enrollment (JoinCluster cert provisioning) is NOT served here —
         // this bind is strict mTLS, which a certless joiner cannot reach. The
         // cluster daemon runs it on a separate plaintext listener via
@@ -492,6 +498,7 @@ impl ZoneManager {
             use_tls,
             default_peers: peers,
             blob_fetcher_slot,
+            agent_minter_slot,
             pending_mounts: parking_lot::Mutex::new(BTreeMap::new()),
         }))
     }
@@ -501,6 +508,12 @@ impl ZoneManager {
     /// wired. Clone-cheap (just an `Arc`).
     pub fn blob_fetcher_slot(&self) -> crate::blob_fetcher::BlobFetcherSlot {
         self.blob_fetcher_slot.clone()
+    }
+
+    /// Hand the shared `AgentMinter` slot back so the cluster profile can
+    /// install a concrete minter on the founder (CA holder). Clone-cheap.
+    pub fn agent_minter_slot(&self) -> crate::agent_minter::AgentMinterSlot {
+        self.agent_minter_slot.clone()
     }
 
     /// Cluster-wide peer list remembered from construction, in
