@@ -1085,6 +1085,27 @@ fn open_zone_manager(
         })
     };
 
+    // The founder self-provisions the cluster api-key HMAC secret the same way
+    // `bootstrap_tls` self-provisions the CA above: a durable founding credential,
+    // written once and served to joiners verbatim over the token-gated enroll
+    // plane (`NodeEnrollmentService`). A joiner never generates one — enrollment
+    // writes its own `tls/api-key-secret`. Gated to the CA holder: only a founder
+    // holds `ca-key.pem` (an enrolled node receives ca/node/node-key but never the
+    // CA key), so this is the order-independent founder marker. Skipped when a
+    // secret already exists, so resume is a no-op. `NEXUS_API_KEY_SECRET` wins when
+    // set (BYO / vault); otherwise a random 128-bit secret is minted. This
+    // founder-boot write is deliberately distinct from `resolve_api_key_secret`,
+    // which stays read-only so an offline `auth mint`'s throwaway env is never
+    // stamped into the node SSOT (the regression #186 guarded).
+    if use_tls {
+        let tls_dir = common.data_dir.join("tls");
+        if provision_api_key_secret(&tls_dir, std::env::var("NEXUS_API_KEY_SECRET").ok())
+            .with_context(|| format!("persist {}", tls_dir.join("api-key-secret").display()))?
+        {
+            tracing::info!(dir = %tls_dir.display(), "founder provisioned cluster api-key secret");
+        }
+    }
+
     // Parse `--peers` into structured `NodeAddress` entries.  Merge
     // with the node-bound `identity.json` peer list so a cold-boot
     // after `<data_dir>` cleanup does not need operator re-specifying
@@ -3709,6 +3730,61 @@ fn uuid_v4() -> String {
     )
 }
 
+/// A random 128-bit cluster api-key HMAC secret as 32 lowercase hex chars.
+/// The founder mints one at bootstrap when the operator supplies no
+/// `NEXUS_API_KEY_SECRET`; it is distributed to joiners verbatim over the
+/// enroll plane and powers sk- token HMACs. Agents never see it (cert-only).
+fn generate_api_key_secret() -> String {
+    use rand::Rng;
+    let mut b = [0u8; 16];
+    rand::rng().fill_bytes(&mut b);
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Persist a secret file with owner-only perms (0600 on unix), mirroring the
+/// enrollment joiner's `tls/api-key-secret` write in `zone_manager`.
+fn write_secret_file(path: &std::path::Path, secret: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(secret.as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, secret.as_bytes())
+    }
+}
+
+/// Founder-only, idempotent: persist the durable cluster api-key HMAC secret at
+/// bootstrap. The founder is the CA holder (`ca-key.pem` present — an enrolled
+/// joiner never receives the CA key, so it skips here and inherits the secret
+/// over the enroll plane instead). A no-op when a secret already exists (resume)
+/// or on a non-founder. `env_secret` wins (BYO / vault); else a random 128-bit
+/// secret is minted. Returns whether a new secret was written (for boot logging).
+/// Deliberately distinct from `resolve_api_key_secret`, which stays read-only.
+fn provision_api_key_secret(
+    tls_dir: &std::path::Path,
+    env_secret: Option<String>,
+) -> std::io::Result<bool> {
+    let secret_path = tls_dir.join("api-key-secret");
+    let is_founder = tls_dir.join("ca-key.pem").exists();
+    if !is_founder || secret_path.exists() {
+        return Ok(false);
+    }
+    let secret = env_secret
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(generate_api_key_secret);
+    write_secret_file(&secret_path, &secret)?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3754,6 +3830,53 @@ mod tests {
         assert_eq!(
             resolve_api_key_secret(empty.path(), Some(String::new())),
             None
+        );
+    }
+
+    /// The founder self-provisions the durable api-key secret at bootstrap; a
+    /// joiner (no CA key) does not, resume is a no-op, and an operator-supplied
+    /// env is persisted verbatim. Mirrors the runtime gate in the daemon boot.
+    #[test]
+    fn provision_api_key_secret_founder_only() {
+        // Non-founder (no ca-key.pem) ⇒ skip; nothing written.
+        let joiner = tempfile::tempdir().expect("tempdir");
+        assert!(
+            !provision_api_key_secret(joiner.path(), None).expect("provision"),
+            "a node without the CA key must not self-generate"
+        );
+        assert!(!joiner.path().join("api-key-secret").exists());
+
+        // Founder (ca-key.pem present) + no env ⇒ mint a random 128-bit secret.
+        let founder = tempfile::tempdir().expect("tempdir");
+        std::fs::write(founder.path().join("ca-key.pem"), b"ca-key").expect("seed CA key");
+        assert!(
+            provision_api_key_secret(founder.path(), None).expect("provision"),
+            "founder with no secret must mint one"
+        );
+        let minted = std::fs::read_to_string(founder.path().join("api-key-secret")).expect("read");
+        assert_eq!(minted.len(), 32, "random secret is 32 hex chars (128 bits)");
+        assert!(minted.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Resume: a secret already exists ⇒ no-op; value preserved, env ignored.
+        assert!(
+            !provision_api_key_secret(founder.path(), Some("different".into())).expect("provision"),
+            "existing secret must be preserved on resume"
+        );
+        assert_eq!(
+            std::fs::read_to_string(founder.path().join("api-key-secret")).expect("read"),
+            minted
+        );
+
+        // BYO: founder + env, no prior secret ⇒ env value persisted verbatim.
+        let byo = tempfile::tempdir().expect("tempdir");
+        std::fs::write(byo.path().join("ca-key.pem"), b"ca-key").expect("seed CA key");
+        assert!(
+            provision_api_key_secret(byo.path(), Some("operator-secret".into()))
+                .expect("provision")
+        );
+        assert_eq!(
+            std::fs::read_to_string(byo.path().join("api-key-secret")).expect("read"),
+            "operator-secret"
         );
     }
 
