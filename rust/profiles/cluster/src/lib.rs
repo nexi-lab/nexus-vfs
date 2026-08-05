@@ -1391,6 +1391,28 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     // are, and it is a RUNTIME decision, not a build-time one: nobody ships a
     // different `sshd` for a trusted network, they configure it. One binary,
     // one gate, and the security posture is a property of the deployment.
+    // Self-provision the cluster api-key secret BEFORE reading the auth posture,
+    // so an auth-on founder arms `sk-` auth on its own and the enrollment
+    // listener (below) has a secret to distribute — the minimal-info contract
+    // (#185). This lives ONLY here on the daemon boot, never in the shared
+    // `open_zone_manager`, so an offline `auth mint` / `share` / `join` can't
+    // persist a throwaway env (the #186 guarantee). Auth-off (`--no-tls`) needs
+    // no secret. Founder = the CA holder: `--cluster-init` on first boot, or a
+    // persisted `ca-key.pem` on resume; `NEXUS_API_KEY_SECRET` wins else random.
+    if !common.no_tls {
+        let tls_dir = common.data_dir.join("tls");
+        let is_founder = !common.cluster_init.is_empty() || tls_dir.join("ca-key.pem").exists();
+        if provision_api_key_secret(
+            &tls_dir,
+            is_founder,
+            std::env::var("NEXUS_API_KEY_SECRET").ok(),
+        )
+        .with_context(|| format!("persist {}", tls_dir.join("api-key-secret").display()))?
+        {
+            tracing::info!(dir = %tls_dir.display(), "founder provisioned cluster api-key secret");
+        }
+    }
+
     let api_key_auth = match auth_posture(&common)? {
         AuthPosture::ApiKey(secret) => {
             // Reads the kernel's §3.B.3 slot per lookup, so the provider can be
@@ -3709,6 +3731,64 @@ fn uuid_v4() -> String {
     )
 }
 
+/// A random 128-bit cluster api-key HMAC secret as 32 lowercase hex chars.
+/// The founder mints one at bootstrap when the operator supplies no
+/// `NEXUS_API_KEY_SECRET`; it is distributed to joiners verbatim over the
+/// enroll plane and powers sk- token HMACs. Agents never see it (cert-only).
+fn generate_api_key_secret() -> String {
+    use rand::Rng;
+    let mut b = [0u8; 16];
+    rand::rng().fill_bytes(&mut b);
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Persist a secret file with owner-only perms (0600 on unix), mirroring the
+/// enrollment joiner's `tls/api-key-secret` write in `zone_manager`.
+fn write_secret_file(path: &std::path::Path, secret: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(secret.as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, secret.as_bytes())
+    }
+}
+
+/// Idempotent: persist the durable cluster api-key HMAC secret. Called ONLY on
+/// the daemon boot path (never the shared `open_zone_manager`, so an offline
+/// `auth mint` / `share` / `join` cannot trigger it and stamp a throwaway env
+/// into the node SSOT — the regression #186 guarded). `is_founder` (the CA
+/// holder: `--cluster-init` on first boot or a persisted `ca-key.pem` on resume)
+/// gates it; a joiner inherits the secret over the enroll plane instead. A no-op
+/// when a secret already exists (resume) or on a non-founder. `env_secret` wins
+/// (BYO / vault); else a random 128-bit secret is minted. Returns whether it
+/// wrote one. Distinct from `resolve_api_key_secret`, which stays read-only.
+fn provision_api_key_secret(
+    tls_dir: &std::path::Path,
+    is_founder: bool,
+    env_secret: Option<String>,
+) -> std::io::Result<bool> {
+    let secret_path = tls_dir.join("api-key-secret");
+    if !is_founder || secret_path.exists() {
+        return Ok(false);
+    }
+    std::fs::create_dir_all(tls_dir)?;
+    let secret = env_secret
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(generate_api_key_secret);
+    write_secret_file(&secret_path, &secret)?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3754,6 +3834,53 @@ mod tests {
         assert_eq!(
             resolve_api_key_secret(empty.path(), Some(String::new())),
             None
+        );
+    }
+
+    /// The founder self-provisions the durable api-key secret on the daemon boot;
+    /// a non-founder does not, resume is a no-op, an operator env is persisted
+    /// verbatim, and the tls dir is created if absent. Mirrors the daemon gate.
+    #[test]
+    fn provision_api_key_secret_founder_only() {
+        // Non-founder ⇒ skip; nothing written.
+        let joiner = tempfile::tempdir().expect("tempdir");
+        assert!(
+            !provision_api_key_secret(joiner.path(), false, None).expect("provision"),
+            "a non-founder must not self-generate"
+        );
+        assert!(!joiner.path().join("api-key-secret").exists());
+
+        // Founder + no env ⇒ mint a random 128-bit secret, creating the tls dir.
+        let fdir = tempfile::tempdir().expect("tempdir");
+        let ftls = fdir.path().join("tls");
+        assert!(
+            provision_api_key_secret(&ftls, true, None).expect("provision"),
+            "founder with no secret must mint one"
+        );
+        let minted = std::fs::read_to_string(ftls.join("api-key-secret")).expect("read");
+        assert_eq!(minted.len(), 32, "random secret is 32 hex chars (128 bits)");
+        assert!(minted.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Resume: a secret already exists ⇒ no-op; value preserved, env ignored.
+        assert!(
+            !provision_api_key_secret(&ftls, true, Some("different".into())).expect("provision"),
+            "existing secret must be preserved on resume"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ftls.join("api-key-secret")).expect("read"),
+            minted
+        );
+
+        // BYO: founder + env, no prior secret ⇒ env value persisted verbatim.
+        let bdir = tempfile::tempdir().expect("tempdir");
+        let btls = bdir.path().join("tls");
+        assert!(
+            provision_api_key_secret(&btls, true, Some("operator-secret".into()))
+                .expect("provision")
+        );
+        assert_eq!(
+            std::fs::read_to_string(btls.join("api-key-secret")).expect("read"),
+            "operator-secret"
         );
     }
 

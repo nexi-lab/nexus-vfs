@@ -29,7 +29,6 @@ use common::{cli, free_port, free_port_pair, Daemon, LOG_FILTER};
 
 const ZONE: &str = "sharedzone";
 const MOUNT: &str = "/agents";
-const SECRET: &str = "e2e-enroll-secret";
 const BUDGET: Duration = Duration::from_secs(120);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -76,19 +75,46 @@ async fn a_certless_node_auto_enrolls_at_boot_then_federates_over_mtls() {
     let founder_env = vec![
         ("NEXUS_DATA_DIR", fdata.as_str()),
         ("NEXUS_IDENTITY_DIR", fid.as_str()),
-        ("NEXUS_API_KEY_SECRET", SECRET),
         ("NEXUS_ADVERTISE_ADDR", fadv.as_str()),
         ("NEXUS_ACCEPT_ENROLLMENTS", "true"),
         ("NEXUS_CLUSTER_INIT", ZONE),
         ("NEXUS_CLUSTER_INIT_MOUNTS", mounts.as_str()),
         ("RUST_LOG", LOG_FILTER),
         // NEXUS_NO_TLS deliberately UNSET — TLS is ON (the founder owns the CA).
+        // NEXUS_API_KEY_SECRET deliberately UNSET — an auth-on founder
+        // SELF-GENERATES the durable cluster secret at bootstrap (like the CA),
+        // so the minimal-info contract is "founder states neither secret nor peers".
     ];
     let mut founder = Daemon::spawn(&["--bind-addr", &fadv], &founder_env);
     founder
         .wait_for_log("Static topology applied", BUDGET)
         .await
         .expect("founder forms + persists sharedzone over mTLS");
+
+    // The founder set NO NEXUS_API_KEY_SECRET, yet an auth-on founder must
+    // SELF-PROVISION a durable cluster secret at bootstrap (the same way it
+    // self-provisions the CA) — else it comes up with no api-key auth and
+    // enrollment distributes nothing. Capture the generated value to prove the
+    // joiner inherits THIS exact secret below.
+    let founder_secret = {
+        let p = std::path::Path::new(&fdata)
+            .join("tls")
+            .join("api-key-secret");
+        let s = std::fs::read_to_string(&p)
+            .unwrap_or_else(|e| panic!("founder must self-generate tls/api-key-secret: {e}"))
+            .trim()
+            .to_string();
+        assert_eq!(
+            s.len(),
+            32,
+            "self-generated secret is 32 hex chars (128 bits)"
+        );
+        assert!(
+            s.chars().all(|c| c.is_ascii_hexdigit()),
+            "secret must be hex"
+        );
+        s
+    };
 
     // ── 3. FEDERATE — joiner boots with ONLY --peers + --token: it auto-enrolls
     //       at boot (derives the founder's enroll port from --peers), then joins.
@@ -135,9 +161,10 @@ async fn a_certless_node_auto_enrolls_at_boot_then_federates_over_mtls() {
         std::fs::read_to_string(&secret_path)
             .expect("read joiner api-key-secret")
             .trim(),
-        SECRET,
-        "the enrolled secret must equal the founder's, so a cluster-minted key \
-         resolves identically on the joiner (hash_key is over the shared secret)"
+        founder_secret,
+        "the enrolled secret must equal the founder's SELF-GENERATED one, so a \
+         cluster-minted key resolves identically on the joiner (hash_key is over \
+         the shared secret)"
     );
     let tail = |d: &Daemon| {
         let mut v: Vec<String> = d.drain().lines().rev().take(40).map(String::from).collect();
