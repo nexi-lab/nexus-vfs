@@ -88,5 +88,52 @@ async fn auth_mint_agent_on_the_founder_while_its_daemon_is_up() {
         );
     }
 
+    // B1: an `sk-` user key ALSO mints while the daemon is up — via the local
+    // daemon's MintKey RPC (the store write forwards to the control-zone
+    // leader). Pre-B1 this was the offline store-open path, which fails on the
+    // running daemon's redb lock ("stop the daemon first"). The founder set no
+    // NEXUS_API_KEY_SECRET (self-provisioned at boot); the CLI never needs it —
+    // the daemon HMACs server-side.
+    let (sk_ok, sk_out, sk_err) = cli(
+        &mint_env,
+        &[
+            "auth",
+            "mint",
+            "--subject-type",
+            "user",
+            "--subject-id",
+            "admin",
+            "--admin",
+            "--name",
+            "e2e",
+        ],
+    );
+    assert!(
+        sk_ok,
+        "an sk- user key must mint WHILE the daemon is up (no redb-lock error).\n\
+         stdout: {sk_out}\nstderr: {sk_err}"
+    );
+    let key = sk_out.trim().to_string();
+    assert!(
+        key.starts_with("sk-") && key.len() >= 32,
+        "MintKey must return a well-formed sk- key, got: {key:?}"
+    );
+    assert!(
+        sk_err.contains("via the local daemon"),
+        "the sk- mint must go the daemon RPC path, not offline — got stderr: {sk_err}"
+    );
+
+    // And revoke it while the daemon is up (RevokeKey RPC — the delete forwards
+    // to the leader).
+    let (rv_ok, rv_out, rv_err) = cli(&mint_env, &["auth", "revoke", "--key", &key]);
+    assert!(
+        rv_ok,
+        "revoke must succeed WHILE the daemon is up.\nstdout: {rv_out}\nstderr: {rv_err}"
+    );
+    assert!(
+        rv_out.trim() == "revoked",
+        "revoke of a just-minted key should report 'revoked', got: {rv_out:?}"
+    );
+
     drop(founder);
 }

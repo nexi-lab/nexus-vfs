@@ -2091,7 +2091,24 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
             consensus.clone(),
             cred_zone.runtime_handle(),
         );
-        kernel.set_auth_key_store(store);
+        kernel.set_auth_key_store(Arc::clone(&store));
+
+        // Arm the sk- MintKey/RevokeKey RPC on every auth-on node: the CLI dials
+        // the LOCAL daemon and the store write forwards to the control-zone
+        // leader, so `auth mint --subject-type user|service` / `revoke` work
+        // WITHOUT stopping the daemon (matching the agent path). Auth-off has no
+        // sk- plane — the slot stays empty and both RPCs return success=false.
+        if !common.no_tls {
+            if let Some(secret) = effective_api_key_secret(&common.data_dir.join("tls")) {
+                let minter: Arc<dyn nexus_raft::key_minter::KeyMinter> =
+                    Arc::new(DaemonKeyMinter {
+                        store: Arc::clone(&store),
+                        secret,
+                    });
+                *zm.key_minter_slot().write() = Some(minter);
+                tracing::info!("sk- MintKey/RevokeKey RPC armed (mint while the daemon is up)");
+            }
+        }
 
         match &api_key_auth {
             Some(provider) => {
@@ -3488,17 +3505,7 @@ impl nexus_raft::agent_minter::AgentMinter for FounderAgentMinter {
     ) -> std::result::Result<nexus_raft::agent_minter::AgentBundle, String> {
         // Gate: node-only. An agent cert carries no authorization, so a valid
         // agent cert must never be leverageable into minting more agents.
-        let der = caller_cert_der
-            .ok_or_else(|| "MintAgent requires an mTLS client certificate".to_string())?;
-        let peer = transport::peer_identity::from_der(&der)
-            .ok_or_else(|| "MintAgent: client certificate did not parse".to_string())?;
-        if peer.node_id.is_none() {
-            return Err(format!(
-                "MintAgent is a node-only operation; caller {} is not a cluster node \
-                 (an agent cert is a pure identity and cannot mint agents)",
-                peer.display_id(),
-            ));
-        }
+        gate_node_caller(caller_cert_der, "MintAgent")?;
 
         let ca_pem = std::fs::read(self.tls_dir.join("ca.pem"))
             .map_err(|e| format!("read {}/ca.pem: {e}", self.tls_dir.display()))?;
@@ -3530,6 +3537,130 @@ impl nexus_raft::agent_minter::AgentMinter for FounderAgentMinter {
             key_pem,
             ca_pem,
         })
+    }
+}
+
+/// Gate a control-plane mint RPC to a cluster NODE caller: the mTLS client leaf
+/// must parse to a node identity. Minting a credential (agent cert or sk- key)
+/// is a node/admin operation, so a bare agent cert — a pure identity — must
+/// never be leverageable into it. Shared by `FounderAgentMinter` and
+/// `DaemonKeyMinter` so both gates read identically.
+fn gate_node_caller(caller_cert_der: Option<Vec<u8>>, op: &str) -> std::result::Result<(), String> {
+    let der = caller_cert_der.ok_or_else(|| format!("{op} requires an mTLS client certificate"))?;
+    let peer = transport::peer_identity::from_der(&der)
+        .ok_or_else(|| format!("{op}: client certificate did not parse"))?;
+    if peer.node_id.is_none() {
+        return Err(format!(
+            "{op} is a node-only operation; caller {} is not a cluster node",
+            peer.display_id(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate + build an `sk-` (user/service) auth record from the raw mint
+/// params. The ONE place the subject-type parse, zone-grant parse, and the
+/// "no grants ⇒ refused" rule live — shared by the offline path
+/// (`run_auth_action`) and the live-daemon [`DaemonKeyMinter`], so they cannot
+/// drift. Rejects `agent` (cert-only, minted via [`FounderAgentMinter`]).
+fn build_sk_record(
+    subject_type: &str,
+    subject_id: String,
+    zones: &[String],
+    admin: bool,
+    expires_at_ms: Option<u64>,
+    name: String,
+) -> Result<auth::AuthKeyRecord> {
+    let subject_type = match subject_type {
+        "user" => auth::SubjectType::User,
+        "service" => auth::SubjectType::Service,
+        "agent" => {
+            return Err(anyhow::anyhow!(
+                "an agent's credential is a CA-signed cert, not an sk- key — mint it with \
+                 `--subject-type agent` (handled on the cert plane), not here"
+            ))
+        }
+        other => {
+            return Err(anyhow::anyhow!(
+                "--subject-type {other}: expected user, agent or service"
+            ))
+        }
+    };
+    let zone_perms = zones
+        .iter()
+        .map(|z| parse_zone_grant(z))
+        .collect::<Result<Vec<_>>>()?;
+    if zone_perms.is_empty() && !admin {
+        return Err(anyhow::anyhow!(
+            "a key with no zone grants reaches nothing and is refused at authentication \
+             time. Pass --zone ZONE:PERMS, or --admin for a global admin (the only \
+             principal allowed a zoneless key)."
+        ));
+    }
+    Ok(auth::AuthKeyRecord {
+        key_id: uuid_v4(),
+        name,
+        subject_type,
+        subject_id,
+        is_admin: admin,
+        revoked: false,
+        expires_at_ms,
+        zone_perms,
+    })
+}
+
+/// Live-daemon [`nexus_raft::key_minter::KeyMinter`]: mints / revokes `sk-`
+/// credentials against the running daemon's control-zone auth store, so
+/// `auth mint --subject-type user|service` and `auth revoke` work WITHOUT
+/// stopping the daemon. The write goes through consensus (the store's `put` /
+/// `delete` forwards to the control-zone leader), so an install on ANY auth-on
+/// node serves it. Node-cert gated (an admin op). Installed on every auth-on
+/// daemon (see the install block in `run_daemon`).
+struct DaemonKeyMinter {
+    store: Arc<dyn kernel::hal::auth_key_store::AuthKeyStore>,
+    secret: String,
+}
+
+#[tonic::async_trait]
+impl nexus_raft::key_minter::KeyMinter for DaemonKeyMinter {
+    async fn mint_key(
+        &self,
+        caller_cert_der: Option<Vec<u8>>,
+        params: nexus_raft::key_minter::MintKeyParams,
+    ) -> std::result::Result<String, String> {
+        gate_node_caller(caller_cert_der, "MintKey")?;
+        let expires_at_ms = if params.expires_at_ms == 0 {
+            None
+        } else {
+            Some(params.expires_at_ms)
+        };
+        let record = build_sk_record(
+            &params.subject_type,
+            params.subject_id,
+            &params.zones,
+            params.admin,
+            expires_at_ms,
+            params.name,
+        )
+        .map_err(|e| e.to_string())?;
+        let minted = auth::mint_key(&self.store, &self.secret, record, params.allow_existing)
+            .map_err(|e| e.to_string())?;
+        Ok(minted.key)
+    }
+
+    async fn revoke_key(
+        &self,
+        caller_cert_der: Option<Vec<u8>>,
+        key: Option<String>,
+        key_hash: Option<String>,
+    ) -> std::result::Result<bool, String> {
+        gate_node_caller(caller_cert_der, "RevokeKey")?;
+        match (key, key_hash) {
+            (Some(key), None) => auth::revoke_key(&self.store, &self.secret, &key),
+            (None, Some(hash)) => auth::revoke_key_hash(&self.store, &hash),
+            _ => return Err("revoke: pass exactly one of --key or --key-hash".to_string()),
+        }
+        .map_err(|e| e.to_string())
     }
 }
 
@@ -3644,16 +3775,8 @@ async fn mint_agent_via_founder(
     // The client identity is this node's cluster node cert; the daemon's
     // MintAgent gate requires a NODE caller. A read failure here is local
     // misconfiguration, not "unreachable" — surface it (no offline fallback).
-    let tls_dir = common.data_dir.join("tls");
-    let read = |p: std::path::PathBuf| {
-        std::fs::read(&p)
-            .map_err(|e| MintForwardError::Refused(format!("read {}: {e}", p.display())))
-    };
-    let tls = nexus_raft::transport::TlsConfig {
-        cert_pem: read(tls_dir.join("node.pem"))?,
-        key_pem: read(tls_dir.join("node-key.pem"))?,
-        ca_pem: read(tls_dir.join("ca.pem"))?,
-    };
+    let tls =
+        load_node_tls(&common.data_dir).map_err(|e| MintForwardError::Refused(e.to_string()))?;
 
     // Candidates: this node's own daemon first (loopback), then --peers ∪
     // identity. A malformed --peers is a user error → Refused.
@@ -3734,6 +3857,111 @@ async fn mint_agent_via_founder(
     )))
 }
 
+/// Load this node's cluster node-cert TLS bundle (`node.pem` / `node-key.pem` /
+/// `ca.pem`) — the mTLS client identity the CLI presents when dialing a live
+/// daemon's node-cert-gated admin RPCs (`MintAgent` / `MintKey` / `RevokeKey`).
+/// Shared by every daemon-routed `auth` path.
+fn load_node_tls(data_dir: &std::path::Path) -> Result<nexus_raft::transport::TlsConfig> {
+    let tls_dir = data_dir.join("tls");
+    let read =
+        |p: std::path::PathBuf| std::fs::read(&p).with_context(|| format!("read {}", p.display()));
+    Ok(nexus_raft::transport::TlsConfig {
+        cert_pem: read(tls_dir.join("node.pem"))?,
+        key_pem: read(tls_dir.join("node-key.pem"))?,
+        ca_pem: read(tls_dir.join("ca.pem"))?,
+    })
+}
+
+/// Outcome of trying an `sk-` mint/revoke against the LOCAL live daemon.
+enum DaemonOutcome {
+    /// The daemon handled it (success already printed).
+    Handled,
+    /// The local daemon was unreachable — the caller may fall back to the
+    /// offline path (founder cold-start). Carries context for logging.
+    Unreachable(String),
+}
+
+/// Route an `sk-` mint / revoke through this node's LIVE daemon over loopback
+/// mTLS (`MintKey` / `RevokeKey`). The daemon HMACs + writes through consensus
+/// (the write forwards to the control-zone leader), so it works on any auth-on
+/// node without stopping the daemon. `Err` = the daemon reached us and refused
+/// authoritatively (never fall back); `Ok(Unreachable)` = no daemon (fall back
+/// to offline). Dials the local daemon only — propose-forwarding reaches the
+/// leader, so no founder discovery is needed for the sk- plane.
+async fn sk_via_daemon(common: &CommonArgs, action: &AuthCmd) -> Result<DaemonOutcome> {
+    let tls = load_node_tls(&common.data_dir)?;
+    let endpoint = self_daemon_endpoint(common)
+        .ok_or_else(|| anyhow::anyhow!("cannot derive the local daemon endpoint from bind addr"))?;
+    match action {
+        AuthCmd::Mint {
+            subject_type,
+            subject_id,
+            zones,
+            admin,
+            expires_in_days,
+            name,
+            allow_existing,
+        } => {
+            let expires_at_ms = expires_in_days
+                .map(|days| {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    now_ms + days * 24 * 60 * 60 * 1000
+                })
+                .unwrap_or(0);
+            let args = nexus_raft::transport::MintKeyArgs {
+                subject_type,
+                subject_id,
+                zones: zones.clone(),
+                admin: *admin,
+                expires_at_ms,
+                name,
+                allow_existing: *allow_existing,
+            };
+            match nexus_raft::transport::call_mint_key_rpc(&endpoint, args, Some(tls), 15).await {
+                Ok(Ok(key)) => {
+                    // The one moment the key exists in the clear — stdout alone,
+                    // so `KEY=$(nexusd-cluster auth mint ...)` captures it.
+                    println!("{key}");
+                    eprintln!("minted sk- key via the local daemon {endpoint} (replicated to the cluster control zone)");
+                    eprintln!("This key will not be shown again - it is stored only as an HMAC.");
+                    Ok(DaemonOutcome::Handled)
+                }
+                Ok(Err(msg)) => Err(anyhow::anyhow!("{endpoint} refused mint: {msg}")),
+                Err(e) => Ok(DaemonOutcome::Unreachable(format!("{endpoint}: {e}"))),
+            }
+        }
+        AuthCmd::Revoke { key, key_hash, .. } => {
+            match nexus_raft::transport::call_revoke_key_rpc(
+                &endpoint,
+                key.clone(),
+                key_hash.clone(),
+                Some(tls),
+                15,
+            )
+            .await
+            {
+                Ok(Ok(removed)) => {
+                    println!(
+                        "{}",
+                        if removed {
+                            "revoked"
+                        } else {
+                            "no such key (already revoked?)"
+                        }
+                    );
+                    Ok(DaemonOutcome::Handled)
+                }
+                Ok(Err(msg)) => Err(anyhow::anyhow!("{endpoint} refused revoke: {msg}")),
+                Err(e) => Ok(DaemonOutcome::Unreachable(format!("{endpoint}: {e}"))),
+            }
+        }
+        _ => unreachable!("sk_via_daemon called with a non-Mint/Revoke action"),
+    }
+}
+
 async fn run_auth(common: CommonArgs, action: AuthCmd) -> Result<()> {
     // Agent-cert mint (task #40): route through a LIVE cluster daemon whenever
     // one is reachable, so `auth mint --subject-type agent NAME` just-works on
@@ -3751,17 +3979,17 @@ async fn run_auth(common: CommonArgs, action: AuthCmd) -> Result<()> {
     // founder-to-be. `ca-key.pem` is no longer a routing input — it only decides
     // whether an UNREACHABLE forward may fall back to an offline cold-start sign
     // (legal solely for the CA holder, and only while no daemon is up).
-    if let AuthCmd::Mint { subject_type, .. } = &action {
-        let tls_dir = common.data_dir.join("tls");
-        if subject_type == "agent" && !common.no_tls && tls_dir.join("node.pem").exists() {
+    let enrolled = !common.no_tls && common.data_dir.join("tls").join("node.pem").exists();
+    let has_ca_key = common.data_dir.join("tls").join("ca-key.pem").exists();
+    match &action {
+        // Agent-cert mint: try the daemon (self → founder peers), else offline
+        // cold-start sign (CA holder only).
+        AuthCmd::Mint { subject_type, .. } if subject_type == "agent" && enrolled => {
             match mint_agent_via_founder(&common, &action).await {
                 Ok(()) => return Ok(()),
                 Err(MintForwardError::Refused(msg)) => return Err(anyhow::anyhow!("{msg}")),
                 Err(MintForwardError::Unreachable(ctx)) => {
-                    if tls_dir.join("ca-key.pem").exists() {
-                        // CA holder + no reachable daemon ⇒ cold-start: sign
-                        // offline below (safe only because no daemon owns the
-                        // store right now).
+                    if has_ca_key {
                         tracing::info!(
                             reason = %ctx,
                             "no reachable cluster daemon; signing the agent offline as the CA holder (cold-start)"
@@ -3775,6 +4003,28 @@ async fn run_auth(common: CommonArgs, action: AuthCmd) -> Result<()> {
                 }
             }
         }
+        // sk- (user/service) mint + sk- revoke: route through the LOCAL daemon
+        // (the write forwards to the control-zone leader), so it works without
+        // stopping the daemon. Unreachable ⇒ fall back to the offline path
+        // (founder cold-start; a joiner is refused there). Agent revoke
+        // (`--agent`) is CRL-file-based and handled offline below.
+        AuthCmd::Mint { subject_type, .. } if subject_type != "agent" && enrolled => {
+            match sk_via_daemon(&common, &action).await? {
+                DaemonOutcome::Handled => return Ok(()),
+                DaemonOutcome::Unreachable(ctx) => {
+                    tracing::info!(reason = %ctx, "no reachable local daemon; minting sk- key offline");
+                }
+            }
+        }
+        AuthCmd::Revoke { agent: None, .. } if enrolled => {
+            match sk_via_daemon(&common, &action).await? {
+                DaemonOutcome::Handled => return Ok(()),
+                DaemonOutcome::Unreachable(ctx) => {
+                    tracing::info!(reason = %ctx, "no reachable local daemon; revoking sk- key offline");
+                }
+            }
+        }
+        _ => {}
     }
 
     // The offline `auth` subcommand builds a ZoneManager, which owns a nested
@@ -4000,29 +4250,17 @@ fn run_auth_action(
                 return Ok(());
             }
 
-            // The `sk-` token plane: user / service keys. A key with no zone
-            // grants reaches nothing, so require at least one (or --admin).
-            let zone_perms = zones
-                .iter()
-                .map(|z| parse_zone_grant(z))
-                .collect::<Result<Vec<_>>>()?;
-            if zone_perms.is_empty() && !admin {
-                return Err(anyhow::anyhow!(
-                    "a key with no zone grants reaches nothing and is refused at \
-                     authentication time. Pass --zone ZONE:PERMS, or --admin for a \
-                     global admin (the only principal allowed a zoneless key)."
-                ));
-            }
-            let record = auth::AuthKeyRecord {
-                key_id: uuid_v4(),
-                name,
-                subject_type,
+            // The `sk-` token plane: user / service keys. Built through the same
+            // `build_sk_record` the live-daemon `DaemonKeyMinter` uses, so the
+            // offline and daemon-up paths validate + shape the record identically.
+            let record = build_sk_record(
+                subject_type.as_str(),
                 subject_id,
-                is_admin: admin,
-                revoked: false,
+                &zones,
+                admin,
                 expires_at_ms,
-                zone_perms,
-            };
+                name,
+            )?;
 
             let minted = auth::mint_key(store, secret, record, allow_existing)
                 .map_err(|e| anyhow::anyhow!("mint: {e}"))?;
