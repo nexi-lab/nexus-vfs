@@ -95,9 +95,14 @@ impl AuthKeyStore for RaftAuthKeyStore {
     fn put(&self, key_hash: &str, record: &[u8]) -> Result<(), AuthKeyStoreError> {
         let expected = record.to_vec();
         self.propose(
-            Command::PutAuthKey {
-                key_hash: key_hash.to_string(),
-                record: expected.clone(),
+            Command::PutControlState {
+                namespace: contracts::CONTROL_NS_AUTH.to_string(),
+                key: key_hash.to_string(),
+                value: expected.clone(),
+                // AuthKeyStore::put is an upsert (rotation replaces a record in
+                // place); the CAS put-if-absent path is reserved for callers that
+                // enforce name uniqueness (agent mint) via a dedicated method.
+                if_absent: false,
             },
             &format!("put({key_hash})"),
         )?;
@@ -136,8 +141,9 @@ impl AuthKeyStore for RaftAuthKeyStore {
     fn delete(&self, key_hash: &str) -> Result<bool, AuthKeyStoreError> {
         let existed = self.read(key_hash)?.is_some();
         self.propose(
-            Command::DeleteAuthKey {
-                key_hash: key_hash.to_string(),
+            Command::DeleteControlState {
+                namespace: contracts::CONTROL_NS_AUTH.to_string(),
+                key: key_hash.to_string(),
             },
             &format!("delete({key_hash})"),
         )?;

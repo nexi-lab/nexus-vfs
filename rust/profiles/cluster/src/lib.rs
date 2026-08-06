@@ -2056,9 +2056,20 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
                 let provider_for_evict = Arc::clone(provider);
                 consensus.register_apply_observer(Arc::new(
                     move |entry: &nexus_raft::prelude::AppliedEntry| {
-                        let key_hash = match entry.command {
-                            nexus_raft::prelude::Command::PutAuthKey { key_hash, .. }
-                            | nexus_raft::prelude::Command::DeleteAuthKey { key_hash } => key_hash,
+                        // Evict the auth provider's cache only for AUTH-namespace
+                        // control records; a foreign-ca anchor put/delete on the
+                        // same command pair is not this provider's concern.
+                        let key_hash = match &entry.command {
+                            nexus_raft::prelude::Command::PutControlState {
+                                namespace,
+                                key,
+                                ..
+                            }
+                            | nexus_raft::prelude::Command::DeleteControlState { namespace, key }
+                                if namespace.as_str() == contracts::CONTROL_NS_AUTH =>
+                            {
+                                key
+                            }
                             _ => return,
                         };
                         provider_for_evict.invalidate(key_hash);
