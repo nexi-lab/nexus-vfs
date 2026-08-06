@@ -78,6 +78,16 @@ impl AuthKeyStore for RaftAuthKeyStore {
     }
 
     #[inline]
+    fn put_if_absent(&self, key_hash: &str, record: &[u8]) -> Result<bool, AuthKeyStoreError> {
+        // The real, log-ordered CAS (overrides the trait's get-then-put default):
+        // the state machine rejects a duplicate at apply, so two nodes minting
+        // one agent name can never both win.
+        self.inner
+            .put_if_absent(key_hash, record)
+            .map_err(AuthKeyStoreError::Backend)
+    }
+
+    #[inline]
     fn delete(&self, key_hash: &str) -> Result<bool, AuthKeyStoreError> {
         self.inner
             .delete(key_hash)

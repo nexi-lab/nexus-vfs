@@ -101,6 +101,22 @@ pub trait AuthKeyStore: Send + Sync {
     /// authentication hot path.
     fn put(&self, key_hash: &str, record: &[u8]) -> Result<(), AuthKeyStoreError>;
 
+    /// Insert a record only if `key_hash` is absent — a CAS put-if-absent.
+    /// `Ok(true)` = inserted; `Ok(false)` = a record already existed (NOT an
+    /// error — the caller decides, e.g. refuse a duplicate agent name).
+    ///
+    /// The default is a best-effort get-then-put, which is a TOCTOU under
+    /// concurrent writers. A replicated impl (`RaftAuthKeyStore`) OVERRIDES it
+    /// with a log-ordered apply-time CAS so uniqueness holds even when two nodes
+    /// mint the same name at once — the guarantee `mint_agent_authz` relies on.
+    fn put_if_absent(&self, key_hash: &str, record: &[u8]) -> Result<bool, AuthKeyStoreError> {
+        if self.get(key_hash)?.is_some() {
+            return Ok(false);
+        }
+        self.put(key_hash, record)?;
+        Ok(true)
+    }
+
     /// Remove a record (revocation). Returns whether a record was
     /// present to remove.
     fn delete(&self, key_hash: &str) -> Result<bool, AuthKeyStoreError>;
