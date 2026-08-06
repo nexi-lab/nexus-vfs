@@ -3354,46 +3354,71 @@ fn open_auth_store(
         )
     })?;
 
-    // Open ONLY the root zone. The credential store (`TREE_AUTH_KEYS`) lives in
-    // root, and root is SOLO — so loading it is all the mint needs. Loading the
-    // FEDERATED zones here would spin each up as a lone node with no reachable
-    // peers (the daemon is stopped); that node campaigns and mutates the zone's
-    // persisted term/vote, so the real daemon resumes DIVERGED and the founder
-    // loses quorum (`raft: proposal dropped`). Root-only keeps offline tooling
-    // out of federated raft entirely. See `ZoneLoadPolicy`.
-    //
+    // Which zone holds the credential store depends on the posture, and it must
+    // match what the daemon binds (B2):
+    //   * auth-on  → the replicated CONTROL zone, founder-founded sole-voter. An
+    //     offline mint here is the FOUNDER cold-start / DR path — safe because
+    //     the founder is the zone's only voter (no concurrent voter to diverge
+    //     against). A joiner (no CA key) has no business founding a control zone
+    //     offline (that would split-brain the cluster's auth state), so it is
+    //     refused and pointed at the daemon.
+    //   * auth-off → per-node `root` (no cluster, nothing to replicate); the
+    //     daemon binds root too under `--no-tls`.
+    // We open ONLY that one zone: loading the federated shares would spin each up
+    // as a lone node and mutate its term/vote so the real daemon resumes DIVERGED
+    // (the #24 hazard). See `ZoneLoadPolicy`.
+    let (auth_zone, is_founder) = if common.no_tls {
+        (contracts::ROOT_ZONE_ID, true)
+    } else {
+        let founder = common.data_dir.join("tls").join("ca-key.pem").exists();
+        if !founder {
+            return Err(anyhow::anyhow!(
+                "offline `auth` needs the cluster CA key, present only on the founder. \
+                 On a joiner, run the mint against the live daemon (start it) — the write \
+                 forwards to the founder over consensus — or run it on the founder."
+            ));
+        }
+        (contracts::CONTROL_ZONE_ID, founder)
+    };
+    let _ = is_founder; // documents the gate above; founding below is founder-only by construction
+
     // Offline tooling cannot open the data dir while the daemon holds its
     // exclusive redb lock — by far the dominant failure here — so name that
     // cause up front rather than leaking a raw redb/OS error.
     let ZoneManagerBundle { zm, .. } = open_zone_manager(
         common,
         None,
-        ZoneLoadPolicy::Only(vec![contracts::ROOT_ZONE_ID.to_string()]),
+        ZoneLoadPolicy::Only(vec![auth_zone.to_string()]),
     )
     .context(
         "offline `auth` could not open the data dir; if the daemon is running, \
          stop it first (it holds an exclusive lock)",
     )?;
-    if zm.get_zone(contracts::ROOT_ZONE_ID).is_none() {
-        zm.create_zone(contracts::ROOT_ZONE_ID, Vec::new())
-            .map_err(|e| anyhow::anyhow!("open root zone: {e}"))?;
+    // Found-on-demand as a SOLO voter: correct for both `root` (per-node, always
+    // solo) and the founder's control zone (founder = sole voter). Idempotent
+    // with a later daemon boot, which resumes the on-disk zone rather than
+    // re-founding it.
+    if zm.get_zone(auth_zone).is_none() {
+        zm.create_zone(auth_zone, Vec::new())
+            .map_err(|e| anyhow::anyhow!("open {auth_zone} zone: {e}"))?;
     }
-    let root = zm
-        .get_zone(contracts::ROOT_ZONE_ID)
-        .ok_or_else(|| anyhow::anyhow!("root zone did not open"))?;
+    let cred_zone = zm
+        .get_zone(auth_zone)
+        .ok_or_else(|| anyhow::anyhow!("{auth_zone} zone did not open"))?;
 
-    // Writes go through consensus, so this node has to be able to commit.
-    // Root is SOLO (one voter), so leadership is immediate -- but wait for it
-    // rather than race the campaign and fail with a confusing `not leader`.
-    if !root.wait_for_leader(std::time::Duration::from_secs(10)) {
+    // Writes go through consensus, so this node has to be able to commit. The
+    // zone is SOLO here (root per-node, or the founder's sole-voter control
+    // zone), so leadership is immediate -- but wait for it rather than race the
+    // campaign and fail with a confusing `not leader`.
+    if !cred_zone.wait_for_leader(std::time::Duration::from_secs(10)) {
         return Err(anyhow::anyhow!(
-            "root zone has no leader after 10s -- cannot commit a credential"
+            "{auth_zone} zone has no leader after 10s -- cannot commit a credential"
         ));
     }
 
     let store = nexus_raft::auth_key_store::RaftAuthKeyStore::new_arc(
-        root.consensus_node(),
-        root.runtime_handle(),
+        cred_zone.consensus_node(),
+        cred_zone.runtime_handle(),
     );
     Ok((zm, store, secret))
 }
