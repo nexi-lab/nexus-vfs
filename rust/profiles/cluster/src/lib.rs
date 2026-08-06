@@ -3480,12 +3480,44 @@ fn founder_candidate_endpoints(common: &CommonArgs) -> Result<Vec<String>> {
     Ok(parsed.into_iter().map(|p| p.endpoint).collect())
 }
 
-/// Forward an agent-cert mint to the founder (CA holder) over mTLS, for a node
-/// that does not hold the CA private key. The founder signs + records the agent
-/// (cluster-wide name uniqueness + audit live there); this node writes the
-/// returned bundle to `<data_dir>/agents/<subject_id>/`, byte-identical to a
-/// local mint. The joiner half of the just-works contract (task #40).
-async fn mint_agent_via_founder(common: &CommonArgs, action: &AuthCmd) -> Result<()> {
+/// This node's OWN daemon data-plane endpoint on loopback. Prepended to the mint
+/// candidates so an agent mint reaches the local daemon's `MintAgent` first — it
+/// is armed on a founder (so the founder mints via its own running daemon, no
+/// store lock) and declines on a joiner (falls through to a founder peer). The
+/// discriminator is thus daemon-reachability, not "do I hold the CA key".
+fn self_daemon_endpoint(common: &CommonArgs) -> Option<String> {
+    let bind = common.effective_bind_addr();
+    let port = bind
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())?;
+    Some(format!("https://127.0.0.1:{port}"))
+}
+
+/// How a forwarded agent mint ended, so `run_auth` can decide between surfacing
+/// the error and falling back to an offline cold-start sign.
+enum MintForwardError {
+    /// A CA-holder daemon was reached and authoritatively refused (name already
+    /// taken, caller not a node, `--zone`/`--admin` misuse). Never retried, never
+    /// fallen back — the answer is final.
+    Refused(String),
+    /// No CA-holder daemon was reachable (every candidate was unreachable or
+    /// replied "not the CA holder"). The caller MAY fall back to an offline sign
+    /// — but only if it holds the CA key itself (a founder at cold-start, daemon
+    /// down); otherwise this is terminal.
+    Unreachable(String),
+}
+
+/// Mint an agent cert through a live cluster daemon over mTLS: the local daemon
+/// first (armed on a founder → mints via itself, no store lock; declines on a
+/// joiner), then founder peers. The CA holder signs + records the agent through
+/// its running raft (cluster-wide name uniqueness + audit live there); this node
+/// writes the returned bundle to `<data_dir>/agents/<subject_id>/`, byte-
+/// identical to an offline local mint. Works whether or not THIS node's own
+/// daemon is up. See [`MintForwardError`] for how the outcome is classified.
+async fn mint_agent_via_founder(
+    common: &CommonArgs,
+    action: &AuthCmd,
+) -> std::result::Result<(), MintForwardError> {
     let AuthCmd::Mint {
         subject_id,
         zones,
@@ -3497,13 +3529,14 @@ async fn mint_agent_via_founder(common: &CommonArgs, action: &AuthCmd) -> Result
     else {
         unreachable!("mint_agent_via_founder called with a non-Mint action");
     };
-    // Same pure-identity refusal as the local agent-mint path — surfaced here so
-    // a joiner gets it too, before any RPC.
+    // Same pure-identity refusal as the local agent-mint path — an authoritative
+    // user error, surfaced before any RPC (never a fallback).
     if !zones.is_empty() || *admin {
-        return Err(anyhow::anyhow!(
+        return Err(MintForwardError::Refused(
             "an agent cert is a pure identity and carries no authorization; \
              --zone / --admin do not apply. Mint a --subject-type user or service \
              key for a principal that needs zone grants."
+                .to_string(),
         ));
     }
     let display_name = if name.is_empty() {
@@ -3512,30 +3545,41 @@ async fn mint_agent_via_founder(common: &CommonArgs, action: &AuthCmd) -> Result
         name.as_str()
     };
 
-    // The client identity is this node's cluster node cert; the founder's
-    // MintAgent gate requires a NODE caller. The caller (`run_auth`) only routes
-    // here from an ENROLLED joiner, so `node.pem` is present by construction.
+    // The client identity is this node's cluster node cert; the daemon's
+    // MintAgent gate requires a NODE caller. A read failure here is local
+    // misconfiguration, not "unreachable" — surface it (no offline fallback).
     let tls_dir = common.data_dir.join("tls");
-    let node_cert = tls_dir.join("node.pem");
+    let read = |p: std::path::PathBuf| {
+        std::fs::read(&p)
+            .map_err(|e| MintForwardError::Refused(format!("read {}: {e}", p.display())))
+    };
     let tls = nexus_raft::transport::TlsConfig {
-        cert_pem: std::fs::read(&node_cert)
-            .with_context(|| format!("read {}", node_cert.display()))?,
-        key_pem: std::fs::read(tls_dir.join("node-key.pem"))
-            .with_context(|| format!("read {}/node-key.pem", tls_dir.display()))?,
-        ca_pem: std::fs::read(tls_dir.join("ca.pem"))
-            .with_context(|| format!("read {}/ca.pem", tls_dir.display()))?,
+        cert_pem: read(tls_dir.join("node.pem"))?,
+        key_pem: read(tls_dir.join("node-key.pem"))?,
+        ca_pem: read(tls_dir.join("ca.pem"))?,
     };
 
-    let endpoints = founder_candidate_endpoints(common)?;
-    if endpoints.is_empty() {
-        return Err(anyhow::anyhow!(
-            "no peers known to forward the agent mint to — pass --peers <founder> \
-             (this node holds no CA key, so it cannot sign agent certs itself)."
+    // Candidates: this node's own daemon first (loopback), then --peers ∪
+    // identity. A malformed --peers is a user error → Refused.
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(s) = self_daemon_endpoint(common) {
+        candidates.push(s);
+    }
+    for e in
+        founder_candidate_endpoints(common).map_err(|e| MintForwardError::Refused(e.to_string()))?
+    {
+        if !candidates.contains(&e) {
+            candidates.push(e);
+        }
+    }
+    if candidates.is_empty() {
+        return Err(MintForwardError::Unreachable(
+            "no local daemon or peer known to mint the agent through".to_string(),
         ));
     }
 
     let mut last_err = String::new();
-    for endpoint in &endpoints {
+    for endpoint in &candidates {
         match nexus_raft::transport::call_mint_agent_rpc(
             endpoint,
             subject_id,
@@ -3553,14 +3597,15 @@ async fn mint_agent_via_founder(common: &CommonArgs, action: &AuthCmd) -> Result
                     &result.agent_cert_pem,
                     &result.agent_key_pem,
                     &result.ca_pem,
-                )?;
+                )
+                .map_err(|e| MintForwardError::Refused(e.to_string()))?;
 
                 // The bundle directory on stdout alone, identical to the local
                 // path so `DIR=$(nexusd-cluster auth mint --subject-type agent
                 // NAME ...)` captures it on any node.
                 println!("{}", out_dir.display());
                 eprintln!(
-                    "minted agent cert subject=agent:{subject_id} via founder {endpoint} -> {}",
+                    "minted agent cert subject=agent:{subject_id} via {endpoint} -> {}",
                     out_dir.display()
                 );
                 eprintln!(
@@ -3569,18 +3614,17 @@ async fn mint_agent_via_founder(common: &CommonArgs, action: &AuthCmd) -> Result
                 return Ok(());
             }
             Ok(result) => {
-                // Reached a peer, but it refused. "does not hold the cluster CA"
-                // ⇒ not the founder, try the next; any other refusal (name taken,
-                // caller not a node, …) is authoritative — it came from the
-                // founder, so stop and surface it.
+                // Reached a daemon, but it refused. "does not hold the cluster CA"
+                // ⇒ not the CA holder, try the next; any other refusal (name
+                // taken, caller not a node, …) is authoritative — surface it.
                 let msg = result.error.unwrap_or_default();
                 if msg.contains("does not hold the cluster CA") {
                     last_err = format!("{endpoint}: {msg}");
                     continue;
                 }
-                return Err(anyhow::anyhow!(
-                    "founder {endpoint} refused agent mint: {msg}"
-                ));
+                return Err(MintForwardError::Refused(format!(
+                    "{endpoint} refused agent mint: {msg}"
+                )));
             }
             Err(e) => {
                 last_err = format!("{endpoint}: {e}");
@@ -3588,38 +3632,52 @@ async fn mint_agent_via_founder(common: &CommonArgs, action: &AuthCmd) -> Result
             }
         }
     }
-    Err(anyhow::anyhow!(
-        "could not mint agent via any known peer (last: {last_err}). The founder \
-         (CA holder) must be running and reachable at one of: {}",
-        endpoints.join(", ")
-    ))
+    Err(MintForwardError::Unreachable(format!(
+        "no reachable CA-holder daemon (last: {last_err}); tried: {}",
+        candidates.join(", ")
+    )))
 }
 
 async fn run_auth(common: CommonArgs, action: AuthCmd) -> Result<()> {
-    // Remote agent-cert mint (task #40): an ENROLLED joiner cannot sign an agent
-    // cert locally (it holds a cluster-issued `node.pem` but not the CA key), so
-    // it forwards the mint to the founder over mTLS instead of failing — making
-    // `auth mint --subject-type agent NAME` just-work on ANY node, not only the
-    // founder. This dials a single RPC (no local store / ZoneManager), so it runs
-    // HERE in the async context (not the blocking pool) and works even while the
-    // node's own daemon holds the redb data-dir lock.
+    // Agent-cert mint (task #40): route through a LIVE cluster daemon whenever
+    // one is reachable, so `auth mint --subject-type agent NAME` just-works on
+    // ANY enrolled node — founder or joiner — regardless of whether the local
+    // daemon is up. The discriminator is daemon-reachability, NOT "do I hold the
+    // CA key": `mint_agent_via_founder` tries this node's own daemon first (armed
+    // on a founder → mints via itself with no store lock; declines on a joiner)
+    // then founder peers. It dials RPCs only (no local store / ZoneManager), so
+    // it runs HERE in the async context and never contends the redb lock.
     //
-    // The enrolled-joiner signal is precise — `node.pem` present, `ca-key.pem`
-    // absent — so it forwards ONLY when a founder must be consulted:
-    //   - CA holder (`ca-key.pem` present) → local sign (falls through below).
-    //   - Fresh/unenrolled dir (neither file) → falls through to the local path,
-    //     where `open_zone_manager` bootstraps this node's own CA as a
-    //     founder-to-be. Routing that to a founder would be wrong (there isn't
-    //     one), so it must NOT be captured here.
-    //   - Auth-off (`--no-tls`) → no mTLS to dial → falls through.
+    // Only an ENROLLED node (has a cluster-issued `node.pem`) can present the
+    // node identity the mint gate requires, so a fresh/unenrolled dir (no
+    // node.pem) and an auth-off (`--no-tls`) node fall through to the offline
+    // path, where `open_zone_manager` bootstraps this node's own CA as a
+    // founder-to-be. `ca-key.pem` is no longer a routing input — it only decides
+    // whether an UNREACHABLE forward may fall back to an offline cold-start sign
+    // (legal solely for the CA holder, and only while no daemon is up).
     if let AuthCmd::Mint { subject_type, .. } = &action {
         let tls_dir = common.data_dir.join("tls");
-        if subject_type == "agent"
-            && !common.no_tls
-            && tls_dir.join("node.pem").exists()
-            && !tls_dir.join("ca-key.pem").exists()
-        {
-            return mint_agent_via_founder(&common, &action).await;
+        if subject_type == "agent" && !common.no_tls && tls_dir.join("node.pem").exists() {
+            match mint_agent_via_founder(&common, &action).await {
+                Ok(()) => return Ok(()),
+                Err(MintForwardError::Refused(msg)) => return Err(anyhow::anyhow!("{msg}")),
+                Err(MintForwardError::Unreachable(ctx)) => {
+                    if tls_dir.join("ca-key.pem").exists() {
+                        // CA holder + no reachable daemon ⇒ cold-start: sign
+                        // offline below (safe only because no daemon owns the
+                        // store right now).
+                        tracing::info!(
+                            reason = %ctx,
+                            "no reachable cluster daemon; signing the agent offline as the CA holder (cold-start)"
+                        );
+                        // fall through to the offline path
+                    } else {
+                        return Err(anyhow::anyhow!(
+                            "{ctx}; and this node holds no CA key to sign the agent offline"
+                        ));
+                    }
+                }
+            }
         }
     }
 
