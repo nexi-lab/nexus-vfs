@@ -58,6 +58,18 @@
 /// `route().zone_id` is on the file read/write path.
 pub const ROOT_ZONE_ID: &str = "root";
 
+/// The cluster-control raft zone: the single REPLICATED home for the
+/// cluster-control store (the `CONTROL_NS_*` namespaces). Distinct from
+/// [`ROOT_ZONE_ID`] on purpose — `root` is each node's LOCAL VFS namespace
+/// (per-node SOLO in a federation), so binding cluster-wide auth to it silently
+/// gives every node its own key space. The control zone is founder-founded with
+/// the founder as sole voter (auth is founder-centric: the CA + api-key secret
+/// originate there); every other member joins as a LEARNER, so a key minted on
+/// the founder resolves on every node via that node's local replica, while auth
+/// availability tracks the founder (which you need anyway to sign agent certs).
+/// Headless — it carries no VFS mount, only the control store.
+pub const CONTROL_ZONE_ID: &str = "__control__";
+
 /// Namespaces of the replicated cluster-control store — the one raft-backed
 /// key space that carries ALL cluster-control state as opaque values behind a
 /// single generic `PutControlState`/`DeleteControlState` command pair. Each

@@ -2018,30 +2018,78 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         tracing::info!("peer-blob client armed with cluster mTLS (ReadBlob over TLS)");
     }
 
+    // Control zone (B2): the single REPLICATED home for the cluster-control
+    // store (auth records + cross-org anchors), bound just below. The founder
+    // founds it sole-voter; a joiner joins as a LEARNER (auth is founder-centric
+    // — writes go to the founder, reads hit each node's local replica); a lone
+    // founder founds it solo. Headless — no VFS mount. Must be OPEN before the
+    // auth-store bind. Only with TLS (auth needs a CA); an auth-off node has no
+    // control zone and binds the store to per-node `root` exactly as before
+    // (no cluster, nothing to replicate). `ca-key.pem` is the founder signal
+    // (same as the mint path): present ⇒ found sole-voter, absent ⇒ enrolled
+    // joiner ⇒ learn. The learner join retries (`max_attempts`) so it self-heals
+    // the boot race where a joiner starts before the founder's control zone is up.
+    if !common.no_tls {
+        let is_founder = common.data_dir.join("tls").join("ca-key.pem").exists();
+        let zm_cz = zm.clone();
+        let self_addr_cz = self_address.clone();
+        let peers_cz = cli_peer_addrs.clone();
+        let control_zone = contracts::CONTROL_ZONE_ID.to_string();
+        tokio::task::spawn_blocking(move || {
+            let peers: &[NodeAddress] = if is_founder { &[] } else { &peers_cz };
+            nexus_raft::distributed_coordinator::bootstrap_or_join_zone(
+                zm_cz.as_ref(),
+                &control_zone,
+                node_id,
+                &self_addr_cz,
+                peers,
+                /* bootstrap_new */ is_founder,
+                /* max_attempts  */ if is_founder { None } else { Some(15) },
+                /* as_learner    */ !is_founder,
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("control-zone bring-up task panicked: {e}"))?
+        .map_err(|e| anyhow::anyhow!("bring up control zone: {e}"))?;
+        tracing::info!(
+            zone = %contracts::CONTROL_ZONE_ID,
+            founder = is_founder,
+            "control zone up — cluster-control store home (auth records + anchors)"
+        );
+    }
+
     // Auth-key store (Control-Plane HAL §3.B.3) + the cache eviction that
     // makes a revocation take effect without waiting out a TTL.
     //
-    // Bound to the ROOT zone's consensus: credentials are a cluster-wide
-    // namespace, so a key minted on one node has to resolve on every node,
-    // and it is the record's own zone grants — not the zone it happens to
-    // be stored in — that decide what it may reach.
+    // Bound to the CONTROL zone's consensus: credentials are a cluster-wide
+    // namespace, so a key minted on the founder must resolve on every node —
+    // the control zone is replicated to every member (founder voter + learners),
+    // whereas per-node `root` would silently give each node its own key space.
+    // Auth-off has no control zone, so it falls back to `root` (no cluster,
+    // nothing to replicate; `root` is always open, kernel-owned).
     //
-    // The store is bound REGARDLESS of the auth posture. It costs one Arc, the
-    // root zone always exists, and it is what lets `/__sys__/auth/keys/` answer
-    // and an operator mint keys on a daemon that is not yet authenticating —
-    // the usual order of operations when turning auth on for the first time.
-    // Only the cache-eviction observer is conditional, because only a provider
-    // has a cache.
+    // The store is bound REGARDLESS of the auth posture. It costs one Arc and is
+    // what lets `/__sys__/auth/keys/` answer and an operator mint keys on a
+    // daemon that is not yet authenticating — the usual order of operations when
+    // turning auth on for the first time. Only the cache-eviction observer is
+    // conditional, because only a provider has a cache.
     {
-        let root_zone = zm.get_zone(contracts::ROOT_ZONE_ID).ok_or_else(|| {
+        let auth_zone = if common.no_tls {
+            contracts::ROOT_ZONE_ID
+        } else {
+            contracts::CONTROL_ZONE_ID
+        };
+        let cred_zone = zm.get_zone(auth_zone).ok_or_else(|| {
             anyhow::anyhow!(
-                "root zone is not open — the credential store has no consensus to                  live in. This should be impossible: the kernel owns root                  unconditionally (see BootAction::needs_root_zone)."
+                "credential-store zone '{auth_zone}' is not open — cannot bind the auth key \
+                 store. The control zone is brought up just above (or `root`, kernel-owned, \
+                 under --no-tls)."
             )
         })?;
-        let consensus = root_zone.consensus_node();
+        let consensus = cred_zone.consensus_node();
         let store = nexus_raft::auth_key_store::RaftAuthKeyStore::new_arc(
             consensus.clone(),
-            root_zone.runtime_handle(),
+            cred_zone.runtime_handle(),
         );
         kernel.set_auth_key_store(store);
 
@@ -2075,11 +2123,12 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
                         provider_for_evict.invalidate(key_hash);
                     },
                 ));
-                tracing::info!("sk- API-key auth armed (credential store bound to the root zone)");
+                tracing::info!(zone = %auth_zone, "sk- API-key auth armed (credential store bound)");
             }
             None => {
                 tracing::info!(
-                    "credential store bound to the root zone; no auth provider is                      installed, so nothing resolves against it yet"
+                    zone = %auth_zone,
+                    "credential store bound; no auth provider installed, nothing resolves yet"
                 );
             }
         }
@@ -3496,6 +3545,17 @@ fn founder_candidate_endpoints(common: &CommonArgs) -> Result<Vec<String>> {
 /// is armed on a founder (so the founder mints via its own running daemon, no
 /// store lock) and declines on a joiner (falls through to a founder peer). The
 /// discriminator is thus daemon-reachability, not "do I hold the CA key".
+///
+/// The port is resolved from `effective_bind_addr` — the daemon's env or the
+/// `2126` default — a kubectl-style ops contract: run `auth` in the same
+/// environment the daemon booted with (`NEXUS_ADVERTISE_ADDR`/`NEXUS_BIND_ADDR`),
+/// or on the default port. If the daemon runs on a NON-default port and the CLI's
+/// env omits it, the self-dial misses and (for a CA holder) falls back to an
+/// offline sign, which then fails loud on the daemon's redb lock — never a silent
+/// wrong result. A runtime addr sidecar would drop even that env dependency, but
+/// the daemon's live listen addr is ephemeral runtime state that has no business
+/// in the persistent data dir (principle 5); the env contract is the deliberate
+/// trade.
 fn self_daemon_endpoint(common: &CommonArgs) -> Option<String> {
     let bind = common.effective_bind_addr();
     let port = bind
