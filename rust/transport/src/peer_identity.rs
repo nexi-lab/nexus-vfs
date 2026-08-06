@@ -89,6 +89,11 @@ pub fn from_der(der: &[u8]) -> Option<PeerIdentity> {
         node_id,
         zone_id,
         agent_name,
+        // A bare parse is a LOCAL identity. The cross-org classifier
+        // (`classify_peer_cert`) is the only thing that sets a foreign domain,
+        // because that decision needs the CA the cert chained to — which the
+        // parse alone cannot see.
+        trust_domain: None,
         serial,
     })
 }

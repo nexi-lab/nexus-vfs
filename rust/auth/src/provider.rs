@@ -503,6 +503,7 @@ mod tests {
             node_id: None,
             zone_id: None,
             agent_name: Some("mac-ai".into()),
+            trust_domain: None,
             serial: vec![1, 2, 3],
         };
         // The store is empty on purpose: resolution reads the cert, not a record.
@@ -534,6 +535,7 @@ mod tests {
             node_id: None,
             zone_id: None,
             agent_name: Some("mac-ai".into()),
+            trust_domain: None,
             serial: vec![9, 9, 9],
         };
         let provider = provider(MemStore::arc());
@@ -701,6 +703,7 @@ mod tests {
             node_id: Some(42),
             zone_id: Some("sharedzone".into()),
             agent_name: None,
+            trust_domain: None,
             serial: vec![],
         };
         let ctx = provider(MemStore::arc())

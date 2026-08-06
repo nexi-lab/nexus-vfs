@@ -59,6 +59,14 @@ pub struct PeerIdentity {
     /// there is nothing else to read from it — a valid agent is a mailbox
     /// principal, full stop.
     pub agent_name: Option<String>,
+    /// The foreign trust domain this agent belongs to, when its cert chains to a
+    /// registered foreign CA rather than the cluster CA. `None` = a local
+    /// (cluster-CA) identity; `Some(td)` = a cross-org agent of trust domain
+    /// `td`. A foreign identity is ALWAYS agent-only — `peer_identity`'s
+    /// classifier never populates `node_id` from a foreign-CA cert, so a
+    /// customer's CA can mint no cluster member — and it renders the qualified
+    /// `td/agent/{name}` id.
+    pub trust_domain: Option<String>,
     /// The certificate's raw serial-number bytes. For an agent cert this is
     /// what revocation names: `resolve` rejects a peer whose serial is in the
     /// cluster CA's signed CRL. Every X.509 cert carries a serial.
@@ -72,7 +80,13 @@ impl PeerIdentity {
     /// for certs minted before the URI SAN existed.
     pub fn display_id(&self) -> String {
         if let Some(name) = &self.agent_name {
-            return format!("agent/{name}");
+            // A foreign agent ALWAYS renders qualified — never a bare `agent/x`
+            // that could be mistaken for a local agent of the same name (the
+            // id-leak guard: accountability must name the org).
+            return match &self.trust_domain {
+                Some(td) => format!("{td}/agent/{name}"),
+                None => format!("agent/{name}"),
+            };
         }
         match self.node_id {
             Some(id) => format!("node/{id}"),
@@ -164,6 +178,7 @@ mod tests {
             node_id: Some(7),
             zone_id: Some("root".into()),
             agent_name: None,
+            trust_domain: None,
             serial: vec![],
         };
         assert_eq!(named.display_id(), "node/7");
@@ -173,6 +188,7 @@ mod tests {
             node_id: None,
             zone_id: None,
             agent_name: None,
+            trust_domain: None,
             serial: vec![],
         };
         assert_eq!(legacy.display_id(), "nexus-zone-root-node-win");
@@ -182,8 +198,17 @@ mod tests {
             node_id: None,
             zone_id: None,
             agent_name: Some("win-ai".into()),
+            trust_domain: None,
             serial: vec![],
         };
         assert_eq!(agent.display_id(), "agent/win-ai");
+
+        // A foreign agent renders QUALIFIED by its trust domain — never the bare
+        // `agent/win-ai` above, which a local agent of the same name would use.
+        let foreign = PeerIdentity {
+            trust_domain: Some("hospital-a".into()),
+            ..agent.clone()
+        };
+        assert_eq!(foreign.display_id(), "hospital-a/agent/win-ai");
     }
 }
