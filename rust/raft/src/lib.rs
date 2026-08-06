@@ -83,6 +83,13 @@ pub mod blob_fetcher;
 #[cfg(all(feature = "grpc", has_protos))]
 pub mod agent_minter;
 
+/// KeyMinter trait — lets the raft gRPC server serve `MintKey`/`RevokeKey`
+/// (`sk-` credential mint/revoke against a live daemon) without depending on
+/// `auth` or the api-key secret. The cluster profile installs the impl at boot.
+/// See [`key_minter`] module.
+#[cfg(all(feature = "grpc", has_protos))]
+pub mod key_minter;
+
 #[cfg(all(feature = "grpc", has_protos))]
 pub use zone_handle::{Consistency, ZoneHandle};
 

@@ -204,6 +204,10 @@ pub struct ZoneManager {
     /// agent certs once the founder installs an `AgentMinter`. Empty on a
     /// joiner (not the CA holder) — the RPC returns success=false there.
     agent_minter_slot: crate::agent_minter::AgentMinterSlot,
+    /// Shared with the gRPC server so `ZoneApiService::mint_key`/`revoke_key`
+    /// can mint/revoke sk- credentials once the daemon installs a `KeyMinter`.
+    /// Empty under `--no-tls` (no sk- plane).
+    key_minter_slot: crate::key_minter::KeyMinterSlot,
     /// Static topology mounts staged by `bootstrap_static`, drained
     /// incrementally by `apply_topology` as parent + target zones'
     /// leaders settle. BTreeMap so parent paths process before children.
@@ -440,9 +444,11 @@ impl ZoneManager {
 
         let blob_fetcher_slot = crate::blob_fetcher::new_blob_fetcher_slot();
         let agent_minter_slot = crate::agent_minter::new_agent_minter_slot();
+        let key_minter_slot = crate::key_minter::new_key_minter_slot();
         let mut server = RaftGrpcServer::new(registry.clone(), config)
             .with_blob_fetcher_slot(blob_fetcher_slot.clone())
-            .with_agent_minter_slot(agent_minter_slot.clone());
+            .with_agent_minter_slot(agent_minter_slot.clone())
+            .with_key_minter_slot(key_minter_slot.clone());
         // Node enrollment (JoinCluster cert provisioning) is NOT served here —
         // this bind is strict mTLS, which a certless joiner cannot reach. The
         // cluster daemon runs it on a separate plaintext listener via
@@ -499,6 +505,7 @@ impl ZoneManager {
             default_peers: peers,
             blob_fetcher_slot,
             agent_minter_slot,
+            key_minter_slot,
             pending_mounts: parking_lot::Mutex::new(BTreeMap::new()),
         }))
     }
@@ -514,6 +521,12 @@ impl ZoneManager {
     /// install a concrete minter on the founder (CA holder). Clone-cheap.
     pub fn agent_minter_slot(&self) -> crate::agent_minter::AgentMinterSlot {
         self.agent_minter_slot.clone()
+    }
+
+    /// Hand the shared `KeyMinter` slot back so the cluster profile can install a
+    /// concrete minter on every auth-on daemon. Clone-cheap.
+    pub fn key_minter_slot(&self) -> crate::key_minter::KeyMinterSlot {
+        self.key_minter_slot.clone()
     }
 
     /// Cluster-wide peer list remembered from construction, in

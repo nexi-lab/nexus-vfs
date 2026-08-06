@@ -63,9 +63,10 @@ mod transport_loop;
 #[cfg(all(feature = "grpc", has_protos))]
 pub use client::{
     call_delete_zone, call_discover_zones_rpc, call_get_crl, call_join_cluster, call_join_zone_rpc,
-    call_mint_agent_rpc, call_remove_voter_rpc, ClientConfig, ClusterInfoResult, DiscoveredZone,
-    JoinClusterResult, JoinZoneResult, MintAgentResult, ProposeResult, QueryResult, RaftApiClient,
-    RaftClient, RaftClientPool, RemoveVoterResult,
+    call_mint_agent_rpc, call_mint_key_rpc, call_remove_voter_rpc, call_revoke_key_rpc,
+    ClientConfig, ClusterInfoResult, DiscoveredZone, JoinClusterResult, JoinZoneResult,
+    MintAgentResult, MintKeyArgs, ProposeResult, QueryResult, RaftApiClient, RaftClient,
+    RaftClientPool, RemoveVoterResult,
 };
 #[cfg(all(feature = "grpc", has_protos))]
 pub use server::{
