@@ -124,6 +124,10 @@ pub mod transport;
 pub mod auth_key_store;
 #[cfg(all(feature = "grpc", has_protos))]
 pub mod blob_fetcher_handler;
+/// Generic replicated cluster-control store (`PutControlState` namespaces).
+/// Shared DRY layer under `auth_key_store` and the cross-org foreign-CA registry.
+#[cfg(all(feature = "grpc", has_protos))]
+pub mod control_state_store;
 #[cfg(all(feature = "grpc", has_protos))]
 pub mod distributed_coordinator;
 // A2A cross-machine stream-wakeup: the apply-side observer that wakes a
