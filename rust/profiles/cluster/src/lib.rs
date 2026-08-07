@@ -3671,6 +3671,16 @@ impl nexus_raft::key_minter::KeyMinter for DaemonKeyMinter {
         }
         .map_err(|e| e.to_string())
     }
+
+    async fn list_keys(
+        &self,
+        caller_cert_der: Option<Vec<u8>>,
+    ) -> std::result::Result<Vec<(String, Vec<u8>)>, String> {
+        gate_node_caller(caller_cert_der, "ListKeys")?;
+        // A read of the local applied replica (no leader round-trip); on a
+        // learner it returns that node's replicated records.
+        self.store.list().map_err(|e| e.to_string())
+    }
 }
 
 /// mTLS endpoint URLs to try for a remote agent mint: the union of `--peers`
@@ -3967,7 +3977,16 @@ async fn sk_via_daemon(common: &CommonArgs, action: &AuthCmd) -> Result<DaemonOu
                 Err(e) => Ok(DaemonOutcome::Unreachable(format!("{endpoint}: {e}"))),
             }
         }
-        _ => unreachable!("sk_via_daemon called with a non-Mint/Revoke action"),
+        AuthCmd::List => {
+            match nexus_raft::transport::call_list_keys_rpc(&endpoint, Some(tls), 15).await {
+                Ok(Ok(records)) => {
+                    print_key_records(records);
+                    Ok(DaemonOutcome::Handled)
+                }
+                Ok(Err(msg)) => Err(anyhow::anyhow!("{endpoint} refused list: {msg}")),
+                Err(e) => Ok(DaemonOutcome::Unreachable(format!("{endpoint}: {e}"))),
+            }
+        }
     }
 }
 
@@ -4033,6 +4052,16 @@ async fn run_auth(common: CommonArgs, action: AuthCmd) -> Result<()> {
                 }
             }
         }
+        // list reads the LOCAL daemon's replica (no leader round-trip), so an
+        // enrolled joiner can inspect its own replicated records without opening
+        // the store offline (which its gate refuses). Unreachable ⇒ offline
+        // (works on a founder; a joiner is refused there, pointing at the daemon).
+        AuthCmd::List if enrolled => match sk_via_daemon(&common, &action).await? {
+            DaemonOutcome::Handled => return Ok(()),
+            DaemonOutcome::Unreachable(ctx) => {
+                tracing::info!(reason = %ctx, "no reachable local daemon; listing keys offline");
+            }
+        },
         _ => {}
     }
 
@@ -4315,27 +4344,34 @@ fn run_auth_action(
         }
         AuthCmd::List => {
             let records = store.list().map_err(|e| anyhow::anyhow!("list: {e}"))?;
-            if records.is_empty() {
-                println!("no keys");
-                return Ok(());
-            }
-            for (hash, bytes) in records {
-                match auth::AuthKeyRecord::decode(&bytes) {
-                    Ok(r) => println!(
-                        "{hash}  {}:{}  admin={}  zones={:?}  expires_at_ms={:?}  name={}",
-                        r.subject_type.as_str(),
-                        r.subject_id,
-                        r.is_admin,
-                        r.zone_perms,
-                        r.expires_at_ms,
-                        r.name,
-                    ),
-                    // A record this build cannot parse still exists and still
-                    // authenticates somebody -- say so rather than hide it.
-                    Err(e) => println!("{hash}  <undecodable record: {e}>"),
-                }
-            }
+            print_key_records(records);
             Ok(())
+        }
+    }
+}
+
+/// Render `(key_hash, record_bytes)` pairs to stdout — the one `auth list`
+/// output format, shared by the offline store path (`run_auth_action`) and the
+/// live-daemon `ListKeys` path so the two cannot drift.
+fn print_key_records(records: Vec<(String, Vec<u8>)>) {
+    if records.is_empty() {
+        println!("no keys");
+        return;
+    }
+    for (hash, bytes) in records {
+        match auth::AuthKeyRecord::decode(&bytes) {
+            Ok(r) => println!(
+                "{hash}  {}:{}  admin={}  zones={:?}  expires_at_ms={:?}  name={}",
+                r.subject_type.as_str(),
+                r.subject_id,
+                r.is_admin,
+                r.zone_perms,
+                r.expires_at_ms,
+                r.name,
+            ),
+            // A record this build cannot parse still exists and still
+            // authenticates somebody -- say so rather than hide it.
+            Err(e) => println!("{hash}  <undecodable record: {e}>"),
         }
     }
 }

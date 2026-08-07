@@ -123,6 +123,18 @@ async fn auth_mint_agent_on_the_founder_while_its_daemon_is_up() {
         "the sk- mint must go the daemon RPC path, not offline — got stderr: {sk_err}"
     );
 
+    // List WHILE the daemon is up (ListKeys RPC — reads the local replica): the
+    // just-minted key must show. Offline list would fail here on the redb lock.
+    let (ls_ok, ls_out, ls_err) = cli(&mint_env, &["auth", "list"]);
+    assert!(
+        ls_ok,
+        "auth list must succeed WHILE the daemon is up.\nstdout: {ls_out}\nstderr: {ls_err}"
+    );
+    assert!(
+        ls_out.contains("user:admin") && ls_out.contains("admin=true"),
+        "list must show the just-minted admin key, got:\n{ls_out}"
+    );
+
     // And revoke it while the daemon is up (RevokeKey RPC — the delete forwards
     // to the leader).
     let (rv_ok, rv_out, rv_err) = cli(&mint_env, &["auth", "revoke", "--key", &key]);
@@ -133,6 +145,15 @@ async fn auth_mint_agent_on_the_founder_while_its_daemon_is_up() {
     assert!(
         rv_out.trim() == "revoked",
         "revoke of a just-minted key should report 'revoked', got: {rv_out:?}"
+    );
+
+    // After revoke, the daemon-up list no longer shows it (the DeleteControlState
+    // replicated + applied). Proves list reflects live state, not a stale read.
+    let (ls2_ok, ls2_out, _) = cli(&mint_env, &["auth", "list"]);
+    assert!(ls2_ok, "second list must succeed");
+    assert!(
+        !ls2_out.contains("user:admin"),
+        "the revoked key must be gone from list, got:\n{ls2_out}"
     );
 
     drop(founder);
