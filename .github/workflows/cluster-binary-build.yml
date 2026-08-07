@@ -40,9 +40,10 @@ jobs:
             bin: nexusd-cluster
             binary: nexusd-cluster
             target: x86_64-apple-darwin
-            max_size_bytes: 14680064  # 14.0 MiB — raised from 13.75 for the
-                                      # cross-org mTLS trust plane (PR #209).
-                                      # Measured 14,484,584 bytes on this platform.
+            max_size_bytes: 14942208  # 14.25 MiB — raised from 14.0 after #211
+                                      # (RegisterForeignCa) + the classify-wiring
+                                      # verifier half. Measured 14,683,456 bytes
+                                      # here (the tightest-headroom platform).
           - os: windows-latest
             artifact_name: nexusd-cluster-windows-x86_64
             package: nexus-cluster

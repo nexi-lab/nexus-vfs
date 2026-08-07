@@ -312,6 +312,41 @@ mod tests {
         assert_eq!(id.display_id(), "hospital-a/agent/cardio");
     }
 
+    /// The wiring data path: a foreign agent registered on the VERIFIER (via
+    /// `set_foreign_cas`, as the apply observer does) is classified foreign using
+    /// the verifier's own accessors — exactly the call the request path makes:
+    /// `classify_peer_cert(der, verifier.cluster_ca_der(), &verifier.foreign_anchors())`.
+    /// Proves the admission verifier and the authoritative classifier read the
+    /// SAME live foreign set, so an admitted foreign agent is never mis-identified.
+    #[test]
+    fn verifier_accessors_drive_classification() {
+        use lib::transport_primitives::FederatedClientCertVerifier;
+
+        let (cluster_pem, _ck) = generate_zone_ca("root").unwrap();
+        let (foreign_pem, foreign_key) = generate_zone_ca("hospital").unwrap();
+        let (agent_pem, _) = generate_agent_cert("cardio", &foreign_pem, &foreign_key).unwrap();
+        let agent_der = der(&agent_pem);
+        let verifier = FederatedClientCertVerifier::new(&cluster_pem).unwrap();
+
+        // Before register: the classifier fed by the verifier sees no anchors, so
+        // the foreign agent is untrusted — matching what the verifier would reject.
+        let anchors = verifier.foreign_anchors();
+        assert_eq!(
+            classify_peer_cert(&agent_der, verifier.cluster_ca_der(), &anchors),
+            Err(ClassifyError::UntrustedIssuer)
+        );
+
+        // Register → the same accessors now classify it foreign, org-qualified.
+        verifier
+            .set_foreign_cas(&[anchor("hospital-a", &foreign_pem)])
+            .unwrap();
+        let anchors = verifier.foreign_anchors();
+        let id = classify_peer_cert(&agent_der, verifier.cluster_ca_der(), &anchors)
+            .expect("registered → classified foreign");
+        assert_eq!(id.trust_domain.as_deref(), Some("hospital-a"));
+        assert_eq!(id.display_id(), "hospital-a/agent/cardio");
+    }
+
     /// THE load-bearing invariant: a foreign CA's NODE cert is REJECTED. A
     /// customer's CA must never be able to mint a cluster member (a raft voter),
     /// even though the CA is registered for its agents.
