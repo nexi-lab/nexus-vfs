@@ -90,6 +90,13 @@ pub mod agent_minter;
 #[cfg(all(feature = "grpc", has_protos))]
 pub mod key_minter;
 
+/// ForeignCaRegistrar trait — lets the raft gRPC server serve `RegisterForeignCa`
+/// (cross-org CA anchor register/unregister/list against a live daemon) without
+/// depending on `transport` (the node-cert gate) or naming the anchor schema.
+/// The cluster profile installs the impl at boot. See [`foreign_ca_registrar`].
+#[cfg(all(feature = "grpc", has_protos))]
+pub mod foreign_ca_registrar;
+
 #[cfg(all(feature = "grpc", has_protos))]
 pub use zone_handle::{Consistency, ZoneHandle};
 

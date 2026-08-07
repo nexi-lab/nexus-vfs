@@ -208,6 +208,10 @@ pub struct ZoneManager {
     /// can mint/revoke sk- credentials once the daemon installs a `KeyMinter`.
     /// Empty under `--no-tls` (no sk- plane).
     key_minter_slot: crate::key_minter::KeyMinterSlot,
+    /// Shared with the gRPC server so `ZoneApiService::register_foreign_ca` (+
+    /// siblings) can record cross-org CA anchors once the daemon installs a
+    /// `ForeignCaRegistrar`. Empty under `--no-tls`.
+    foreign_ca_registrar_slot: crate::foreign_ca_registrar::ForeignCaRegistrarSlot,
     /// The federated mTLS client-cert verifier — the client-auth trust roots,
     /// hot-swappable so a foreign CA registered at runtime is trusted without a
     /// restart. Built eagerly from the cluster CA (the only root until the
@@ -451,6 +455,8 @@ impl ZoneManager {
         let blob_fetcher_slot = crate::blob_fetcher::new_blob_fetcher_slot();
         let agent_minter_slot = crate::agent_minter::new_agent_minter_slot();
         let key_minter_slot = crate::key_minter::new_key_minter_slot();
+        let foreign_ca_registrar_slot =
+            crate::foreign_ca_registrar::new_foreign_ca_registrar_slot();
         // Build the federated client-cert verifier eagerly from the cluster CA
         // when TLS is on, so the serve path (below) and the cross-org
         // apply-observer (cluster profile, via `foreign_ca_verifier()`) share ONE
@@ -468,6 +474,7 @@ impl ZoneManager {
             .with_blob_fetcher_slot(blob_fetcher_slot.clone())
             .with_agent_minter_slot(agent_minter_slot.clone())
             .with_key_minter_slot(key_minter_slot.clone())
+            .with_foreign_ca_registrar_slot(foreign_ca_registrar_slot.clone())
             .with_foreign_ca_verifier(foreign_ca_verifier.clone());
         // Node enrollment (JoinCluster cert provisioning) is NOT served here —
         // this bind is strict mTLS, which a certless joiner cannot reach. The
@@ -526,6 +533,7 @@ impl ZoneManager {
             blob_fetcher_slot,
             agent_minter_slot,
             key_minter_slot,
+            foreign_ca_registrar_slot,
             foreign_ca_verifier,
             pending_mounts: parking_lot::Mutex::new(BTreeMap::new()),
         }))
@@ -548,6 +556,12 @@ impl ZoneManager {
     /// concrete minter on every auth-on daemon. Clone-cheap.
     pub fn key_minter_slot(&self) -> crate::key_minter::KeyMinterSlot {
         self.key_minter_slot.clone()
+    }
+
+    /// Hand the shared `ForeignCaRegistrar` slot back so the cluster profile can
+    /// install a concrete registrar on every auth-on daemon. Clone-cheap.
+    pub fn foreign_ca_registrar_slot(&self) -> crate::foreign_ca_registrar::ForeignCaRegistrarSlot {
+        self.foreign_ca_registrar_slot.clone()
     }
 
     /// Hand back the shared federated client-cert verifier so the cluster profile

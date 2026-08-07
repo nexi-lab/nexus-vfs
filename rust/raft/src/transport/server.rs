@@ -13,20 +13,23 @@ use super::proto::nexus::raft::{
     zone_api_service_server::{ZoneApiService, ZoneApiServiceServer},
     zone_transport_service_server::{ZoneTransportService, ZoneTransportServiceServer},
     ClusterConfig as ProtoClusterConfig, DeleteZoneRequest, DeleteZoneResponse,
-    DiscoverZonesRequest, DiscoverZonesResponse, FederationZoneInfo, GetClusterInfoRequest,
-    GetClusterInfoResponse, GetCrlRequest, GetCrlResponse, GetMetadataResult,
-    GetSearchCapabilitiesRequest, JoinClusterRequest, JoinClusterResponse, JoinZoneRequest,
-    JoinZoneResponse, ListKeysRequest, ListKeysResponse, ListMetadataResult, ListedKey,
-    LockInfoResult, LockResult, MintAgentRequest, MintAgentResponse, MintKeyRequest,
-    MintKeyResponse, NodeInfo as ProtoNodeInfo, ProposeRequest, ProposeResponse, QueryRequest,
-    QueryResponse, RaftCommand, RaftQueryResponse, RaftResponse, ReadBlobRequest, ReadBlobResponse,
-    RemoveVoterRequest, RemoveVoterResponse, ReplicateEntriesRequest, ReplicateEntriesResponse,
-    RevokeKeyRequest, RevokeKeyResponse, SearchCapabilities, SnapshotEcStateRequest,
-    SnapshotEcStateResponse, StepMessageRequest, StepMessageResponse,
+    DiscoverZonesRequest, DiscoverZonesResponse, FederationZoneInfo, ForeignCaEntry,
+    GetClusterInfoRequest, GetClusterInfoResponse, GetCrlRequest, GetCrlResponse,
+    GetMetadataResult, GetSearchCapabilitiesRequest, JoinClusterRequest, JoinClusterResponse,
+    JoinZoneRequest, JoinZoneResponse, ListForeignCasRequest, ListForeignCasResponse,
+    ListKeysRequest, ListKeysResponse, ListMetadataResult, ListedKey, LockInfoResult, LockResult,
+    MintAgentRequest, MintAgentResponse, MintKeyRequest, MintKeyResponse,
+    NodeInfo as ProtoNodeInfo, ProposeRequest, ProposeResponse, QueryRequest, QueryResponse,
+    RaftCommand, RaftQueryResponse, RaftResponse, ReadBlobRequest, ReadBlobResponse,
+    RegisterForeignCaRequest, RegisterForeignCaResponse, RemoveVoterRequest, RemoveVoterResponse,
+    ReplicateEntriesRequest, ReplicateEntriesResponse, RevokeKeyRequest, RevokeKeyResponse,
+    SearchCapabilities, SnapshotEcStateRequest, SnapshotEcStateResponse, StepMessageRequest,
+    StepMessageResponse, UnregisterForeignCaRequest, UnregisterForeignCaResponse,
 };
 use super::{NodeAddress, Result, SharedPeerMap, TransportError};
 use crate::agent_minter::AgentMinterSlot;
 use crate::blob_fetcher::BlobFetcherSlot;
+use crate::foreign_ca_registrar::ForeignCaRegistrarSlot;
 use crate::key_minter::{KeyMinterSlot, MintKeyParams};
 use crate::raft::{
     reconcile_peers_with_conf_state, Command, CommandResult, FullStateMachine, RaftError,
@@ -91,6 +94,10 @@ pub struct RaftGrpcServer {
     /// daemon at boot. `None` under `--no-tls` — `MintKey`/`RevokeKey` return
     /// success=false there (auth-off has no sk- plane).
     key_minter_slot: Option<KeyMinterSlot>,
+    /// Slot the cluster profile binds a `ForeignCaRegistrar` into on every
+    /// auth-on daemon. `None` under `--no-tls` — the RegisterForeignCa RPCs
+    /// return success=false there (no cross-org trust plane).
+    foreign_ca_registrar_slot: Option<ForeignCaRegistrarSlot>,
     /// Federated mTLS client-cert verifier — the client-auth trust roots as a
     /// hot-swappable set (cluster CA + any runtime-registered foreign CAs), so a
     /// cross-org CA registered live is trusted without a restart. Shared with the
@@ -113,6 +120,7 @@ impl RaftGrpcServer {
             blob_fetcher_slot: None,
             agent_minter_slot: None,
             key_minter_slot: None,
+            foreign_ca_registrar_slot: None,
             foreign_ca_verifier: None,
             extra_services: None,
         }
@@ -140,6 +148,15 @@ impl RaftGrpcServer {
     /// impl. Installed on every auth-on node; left empty under `--no-tls`.
     pub fn with_key_minter_slot(mut self, slot: KeyMinterSlot) -> Self {
         self.key_minter_slot = Some(slot);
+        self
+    }
+
+    /// Attach the late-bindable `ForeignCaRegistrar` slot so
+    /// `ZoneApiService::register_foreign_ca` (+ siblings) can record cross-org CA
+    /// anchors once the daemon installs an impl. Installed on every auth-on node;
+    /// empty under `--no-tls`.
+    pub fn with_foreign_ca_registrar_slot(mut self, slot: ForeignCaRegistrarSlot) -> Self {
+        self.foreign_ca_registrar_slot = Some(slot);
         self
     }
 
@@ -190,6 +207,7 @@ impl RaftGrpcServer {
             blob_fetcher_slot: self.blob_fetcher_slot.clone(),
             agent_minter_slot: self.agent_minter_slot.clone(),
             key_minter_slot: self.key_minter_slot.clone(),
+            foreign_ca_registrar_slot: self.foreign_ca_registrar_slot.clone(),
         };
 
         let mut builder =
@@ -259,6 +277,7 @@ impl RaftGrpcServer {
             blob_fetcher_slot: self.blob_fetcher_slot.clone(),
             agent_minter_slot: self.agent_minter_slot.clone(),
             key_minter_slot: self.key_minter_slot.clone(),
+            foreign_ca_registrar_slot: self.foreign_ca_registrar_slot.clone(),
         };
 
         let mut builder =
@@ -770,6 +789,10 @@ struct ZoneApiServiceImpl {
     /// Optional late-bound `KeyMinter` for `MintKey`/`RevokeKey`. Present on
     /// every auth-on daemon; `None` (auth-off) → both return success=false.
     key_minter_slot: Option<KeyMinterSlot>,
+    /// Optional late-bound `ForeignCaRegistrar` for `RegisterForeignCa` (+
+    /// siblings). Present on every auth-on daemon; `None` (auth-off) → the RPCs
+    /// return success=false.
+    foreign_ca_registrar_slot: Option<ForeignCaRegistrarSlot>,
 }
 
 #[tonic::async_trait]
@@ -1675,6 +1698,118 @@ impl ZoneApiService for ZoneApiServiceImpl {
                 keys: records
                     .into_iter()
                     .map(|(key_hash, record)| ListedKey { key_hash, record })
+                    .collect(),
+            })),
+            Err(e) => Ok(err_resp(e)),
+        }
+    }
+
+    async fn register_foreign_ca(
+        &self,
+        request: Request<RegisterForeignCaRequest>,
+    ) -> std::result::Result<Response<RegisterForeignCaResponse>, Status> {
+        let caller_cert_der = peer_cert_der(&request);
+        let req = request.into_inner();
+        let err_resp = |msg: String| {
+            Response::new(RegisterForeignCaResponse {
+                success: false,
+                error: Some(msg),
+                fingerprint: String::new(),
+            })
+        };
+        let Some(registrar) = self
+            .foreign_ca_registrar_slot
+            .as_ref()
+            .and_then(|slot| slot.read().as_ref().cloned())
+        else {
+            return Ok(err_resp(
+                "this node has no cross-org trust plane (auth-off)".to_string(),
+            ));
+        };
+        match registrar
+            .register(
+                caller_cert_der,
+                &req.trust_domain_id,
+                &req.ca_cert_pem,
+                &req.expected_fingerprint,
+            )
+            .await
+        {
+            Ok(fingerprint) => Ok(Response::new(RegisterForeignCaResponse {
+                success: true,
+                error: None,
+                fingerprint,
+            })),
+            Err(e) => Ok(err_resp(e)),
+        }
+    }
+
+    async fn unregister_foreign_ca(
+        &self,
+        request: Request<UnregisterForeignCaRequest>,
+    ) -> std::result::Result<Response<UnregisterForeignCaResponse>, Status> {
+        let caller_cert_der = peer_cert_der(&request);
+        let req = request.into_inner();
+        let err_resp = |msg: String| {
+            Response::new(UnregisterForeignCaResponse {
+                success: false,
+                error: Some(msg),
+                removed: false,
+            })
+        };
+        let Some(registrar) = self
+            .foreign_ca_registrar_slot
+            .as_ref()
+            .and_then(|slot| slot.read().as_ref().cloned())
+        else {
+            return Ok(err_resp(
+                "this node has no cross-org trust plane (auth-off)".to_string(),
+            ));
+        };
+        match registrar
+            .unregister(caller_cert_der, &req.fingerprint)
+            .await
+        {
+            Ok(removed) => Ok(Response::new(UnregisterForeignCaResponse {
+                success: true,
+                error: None,
+                removed,
+            })),
+            Err(e) => Ok(err_resp(e)),
+        }
+    }
+
+    async fn list_foreign_cas(
+        &self,
+        request: Request<ListForeignCasRequest>,
+    ) -> std::result::Result<Response<ListForeignCasResponse>, Status> {
+        let caller_cert_der = peer_cert_der(&request);
+        let err_resp = |msg: String| {
+            Response::new(ListForeignCasResponse {
+                success: false,
+                error: Some(msg),
+                anchors: Vec::new(),
+            })
+        };
+        let Some(registrar) = self
+            .foreign_ca_registrar_slot
+            .as_ref()
+            .and_then(|slot| slot.read().as_ref().cloned())
+        else {
+            return Ok(err_resp(
+                "this node has no cross-org trust plane (auth-off)".to_string(),
+            ));
+        };
+        match registrar.list(caller_cert_der).await {
+            Ok(anchors) => Ok(Response::new(ListForeignCasResponse {
+                success: true,
+                error: None,
+                anchors: anchors
+                    .into_iter()
+                    .map(|(trust_domain_id, fingerprint)| ForeignCaEntry {
+                        trust_domain_id,
+                        fingerprint,
+                    })
                     .collect(),
             })),
             Err(e) => Ok(err_resp(e)),

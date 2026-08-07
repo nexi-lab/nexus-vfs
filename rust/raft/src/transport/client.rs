@@ -8,10 +8,11 @@ use super::proto::nexus::raft::{
     zone_api_service_client::ZoneApiServiceClient,
     zone_transport_service_client::ZoneTransportServiceClient, AcquireLock, DeleteMetadata,
     DeleteZoneRequest, DiscoverZonesRequest, EcReplicationEntry, ExtendLock, GetClusterInfoRequest,
-    GetCrlRequest, GetLockInfo, GetMetadata, JoinClusterRequest, JoinZoneRequest, ListKeysRequest,
-    ListMetadata, MintAgentRequest, MintKeyRequest, ProposeRequest, PutMetadata, QueryRequest,
-    RaftCommand, RaftQuery, ReleaseLock, RemoveVoterRequest, ReplicateEntriesRequest,
-    RevokeKeyRequest, SnapshotEcStateRequest, StepMessageRequest,
+    GetCrlRequest, GetLockInfo, GetMetadata, JoinClusterRequest, JoinZoneRequest,
+    ListForeignCasRequest, ListKeysRequest, ListMetadata, MintAgentRequest, MintKeyRequest,
+    ProposeRequest, PutMetadata, QueryRequest, RaftCommand, RaftQuery, RegisterForeignCaRequest,
+    ReleaseLock, RemoveVoterRequest, ReplicateEntriesRequest, RevokeKeyRequest,
+    SnapshotEcStateRequest, StepMessageRequest, UnregisterForeignCaRequest,
 };
 use super::{NodeAddress, Result, TransportError};
 use std::collections::HashMap;
@@ -1179,6 +1180,82 @@ pub async fn call_list_keys_rpc(
             .keys
             .into_iter()
             .map(|k| (k.key_hash, k.record))
+            .collect()))
+    } else {
+        Ok(Err(response.error.unwrap_or_default()))
+    }
+}
+
+/// Register a cross-org CA anchor through a peer's live daemon (`RegisterForeignCa`);
+/// the write forwards to the control-zone leader. `Ok(Ok(fingerprint))` on
+/// success; `Ok(Err(msg))` on a server refusal (bad PEM, fingerprint mismatch,
+/// already registered, not a node). mTLS presents this node's cert.
+pub async fn call_register_foreign_ca_rpc(
+    peer_addr: &str,
+    trust_domain_id: &str,
+    ca_cert_pem: &[u8],
+    expected_fingerprint: &str,
+    tls: Option<super::TlsConfig>,
+    timeout_secs: u64,
+) -> Result<std::result::Result<String, String>> {
+    let mut client = connect_zone_api(peer_addr, tls, timeout_secs, "RegisterForeignCa").await?;
+    let response = client
+        .register_foreign_ca(RegisterForeignCaRequest {
+            trust_domain_id: trust_domain_id.to_string(),
+            ca_cert_pem: ca_cert_pem.to_vec(),
+            expected_fingerprint: expected_fingerprint.to_string(),
+        })
+        .await
+        .map_err(|e| TransportError::Rpc(format!("RegisterForeignCa RPC failed: {e}")))?
+        .into_inner();
+    if response.success {
+        Ok(Ok(response.fingerprint))
+    } else {
+        Ok(Err(response.error.unwrap_or_default()))
+    }
+}
+
+/// Unregister a foreign CA anchor by fingerprint (`UnregisterForeignCa`).
+/// `Ok(Ok(removed))` on success; `Ok(Err(msg))` on a server refusal.
+pub async fn call_unregister_foreign_ca_rpc(
+    peer_addr: &str,
+    fingerprint: &str,
+    tls: Option<super::TlsConfig>,
+    timeout_secs: u64,
+) -> Result<std::result::Result<bool, String>> {
+    let mut client = connect_zone_api(peer_addr, tls, timeout_secs, "UnregisterForeignCa").await?;
+    let response = client
+        .unregister_foreign_ca(UnregisterForeignCaRequest {
+            fingerprint: fingerprint.to_string(),
+        })
+        .await
+        .map_err(|e| TransportError::Rpc(format!("UnregisterForeignCa RPC failed: {e}")))?
+        .into_inner();
+    if response.success {
+        Ok(Ok(response.removed))
+    } else {
+        Ok(Err(response.error.unwrap_or_default()))
+    }
+}
+
+/// List registered foreign-CA anchors from a peer's local replica
+/// (`ListForeignCas`). `Ok(Ok(vec[(trust_domain_id, fingerprint)]))` on success.
+pub async fn call_list_foreign_cas_rpc(
+    peer_addr: &str,
+    tls: Option<super::TlsConfig>,
+    timeout_secs: u64,
+) -> Result<std::result::Result<Vec<(String, String)>, String>> {
+    let mut client = connect_zone_api(peer_addr, tls, timeout_secs, "ListForeignCas").await?;
+    let response = client
+        .list_foreign_cas(ListForeignCasRequest {})
+        .await
+        .map_err(|e| TransportError::Rpc(format!("ListForeignCas RPC failed: {e}")))?
+        .into_inner();
+    if response.success {
+        Ok(Ok(response
+            .anchors
+            .into_iter()
+            .map(|a| (a.trust_domain_id, a.fingerprint))
             .collect()))
     } else {
         Ok(Err(response.error.unwrap_or_default()))

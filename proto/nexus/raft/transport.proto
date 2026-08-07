@@ -142,6 +142,24 @@ service ZoneApiService {
   // enrolled joiner). Same node-cert gate as MintKey. Returns hashes + opaque
   // records (hashes are not secrets); the CLI decodes + renders.
   rpc ListKeys(ListKeysRequest) returns (ListKeysResponse);
+
+  // RegisterForeignCa records a cross-org CA anchor (trust_domain + CA cert) in
+  // the control zone through the live daemon, so a foreign org's agents become
+  // trusted at the mTLS handshake WITHOUT a restart (the apply observer hot-swaps
+  // the client-cert verifier). The write forwards to the control-zone leader, so
+  // any node serves it. Node-cert gated (a cross-org trust decision is an admin
+  // op). `ca_cert_pem` is the org's CA (PEM); `expected_fingerprint` is verified
+  // out-of-band against the computed one (anti-swap at the trust-bootstrap
+  // moment). CAS: re-registering the same fingerprint is refused.
+  rpc RegisterForeignCa(RegisterForeignCaRequest) returns (RegisterForeignCaResponse);
+
+  // UnregisterForeignCa drops a foreign CA anchor by fingerprint (the coarse
+  // cross-org revocation: removes trust for the whole org). Same node-cert gate.
+  rpc UnregisterForeignCa(UnregisterForeignCaRequest) returns (UnregisterForeignCaResponse);
+
+  // ListForeignCas enumerates registered foreign-CA anchors from this daemon's
+  // LOCAL control-zone replica (a read). Same node-cert gate.
+  rpc ListForeignCas(ListForeignCasRequest) returns (ListForeignCasResponse);
 }
 
 // NodeEnrollmentService is the pre-mTLS BOOTSTRAP plane: the one surface a
@@ -391,6 +409,55 @@ message ListKeysResponse {
   bool success = 1;
   optional string error = 2;
   repeated ListedKey keys = 3;
+}
+
+// RegisterForeignCaRequest records a cross-org CA anchor.
+message RegisterForeignCaRequest {
+  // The foreign org's trust-domain id (e.g. "hospital-a"); the `{td}` in a
+  // foreign agent's `from` = `{td}/agent/{name}`.
+  string trust_domain_id = 1;
+  // The org's CA certificate (PEM).
+  bytes ca_cert_pem = 2;
+  // The expected `sha256:<hex>` fingerprint, verified out-of-band against the
+  // computed one before the anchor is trusted (anti-swap at bootstrap).
+  string expected_fingerprint = 3;
+}
+
+// RegisterForeignCaResponse reports success or the refusal (bad PEM, fingerprint
+// mismatch, already registered).
+message RegisterForeignCaResponse {
+  bool success = 1;
+  optional string error = 2;
+  // The computed `sha256:<hex>` fingerprint of the registered anchor.
+  string fingerprint = 3;
+}
+
+// UnregisterForeignCaRequest drops an anchor by its fingerprint.
+message UnregisterForeignCaRequest {
+  string fingerprint = 1;
+}
+
+// UnregisterForeignCaResponse reports whether an anchor was present + removed.
+message UnregisterForeignCaResponse {
+  bool success = 1;
+  optional string error = 2;
+  bool removed = 3;
+}
+
+// One registered foreign-CA anchor (fingerprint + trust domain). The CA bytes
+// are not returned — the fingerprint identifies it and is safe to display.
+message ForeignCaEntry {
+  string trust_domain_id = 1;
+  string fingerprint = 2;
+}
+
+message ListForeignCasRequest {}
+
+// ListForeignCasResponse carries the registered anchors from the local replica.
+message ListForeignCasResponse {
+  bool success = 1;
+  optional string error = 2;
+  repeated ForeignCaEntry anchors = 3;
 }
 
 // DeleteZoneRequest asks a peer to remove its local zone replica.
