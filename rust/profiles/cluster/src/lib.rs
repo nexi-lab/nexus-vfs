@@ -477,6 +477,37 @@ enum AuthCmd {
     List,
 }
 
+/// `foreign-ca` subcommand — cross-org CA-anchor administration. Registering a
+/// foreign org's CA lets that org's agents authenticate over this cluster's mTLS
+/// (their cert chains to the org CA, not the cluster CA). Routes through the live
+/// daemon: the anchor is written to the control zone, replicates, and hot-swaps
+/// the client-cert verifier on every node with no restart. Node-cert gated.
+#[derive(Debug, Subcommand)]
+enum ForeignCaCmd {
+    /// Register a foreign org's CA anchor (the sudoedge triple: domain + CA PEM +
+    /// fingerprint). The fingerprint is verified out-of-band against the CA bytes.
+    Register {
+        /// The foreign org's trust-domain id (the `{td}` in `{td}/agent/{name}`).
+        #[arg(long)]
+        domain: String,
+        /// Path to the org's CA certificate (PEM).
+        #[arg(long)]
+        ca_pem: PathBuf,
+        /// Expected `sha256:<hex>` fingerprint from the triple (anti-swap check).
+        #[arg(long)]
+        fingerprint: String,
+    },
+    /// Unregister a foreign CA anchor by fingerprint — the coarse per-org
+    /// revocation (drops trust for every agent of that org).
+    Unregister {
+        /// The `sha256:<hex>` fingerprint of the anchor to drop.
+        #[arg(long)]
+        fingerprint: String,
+    },
+    /// List registered foreign-CA anchors (domain + fingerprint).
+    List,
+}
+
 #[derive(Debug, Subcommand)]
 enum Cmd {
     /// Detach a local subtree into a new federation zone.
@@ -525,6 +556,15 @@ enum Cmd {
     Auth {
         #[command(subcommand)]
         action: AuthCmd,
+    },
+    /// Manage cross-org trust — register/unregister/list foreign-org CA anchors.
+    ///
+    /// Routes through the live daemon (run in its environment); the anchor
+    /// replicates and hot-swaps the mTLS client-cert verifier on every node with
+    /// no restart. See [`ForeignCaCmd`].
+    ForeignCa {
+        #[command(subcommand)]
+        action: ForeignCaCmd,
     },
     /// Per-zone health audit of a stopped daemon's data directory.
     ///
@@ -827,6 +867,7 @@ where
                     .await
                 }
                 Some(Cmd::Auth { action }) => run_auth(args.common, action).await,
+                Some(Cmd::ForeignCa { action }) => run_foreign_ca(args.common, action).await,
                 Some(Cmd::Doctor { data_dir, zone }) => run_doctor(&data_dir, zone.as_deref()),
                 Some(Cmd::Join {
                     peer_addr,
@@ -2163,6 +2204,13 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
                 consensus.clone(),
                 cred_zone.runtime_handle(),
             ));
+            // Arm the RegisterForeignCa RPC (register/unregister/list) on this
+            // daemon, sharing the SAME store the observer reads below.
+            let registrar: Arc<dyn nexus_raft::foreign_ca_registrar::ForeignCaRegistrar> =
+                Arc::new(DaemonForeignCaRegistrar {
+                    store: Arc::clone(&fca_store),
+                });
+            *zm.foreign_ca_registrar_slot().write() = Some(registrar);
             match fca_store.list() {
                 Ok(anchors) => {
                     if let Err(e) = verifier.set_foreign_cas(&anchors) {
@@ -2178,6 +2226,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
             }
             let verifier_for_obs = verifier.clone();
             let store_for_obs = Arc::clone(&fca_store);
+            let obs_runtime = cred_zone.runtime_handle();
             consensus.register_apply_observer(Arc::new(
                 move |entry: &nexus_raft::prelude::AppliedEntry| {
                     let is_foreign_ca = matches!(
@@ -2189,14 +2238,24 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
                     if !is_foreign_ca {
                         return;
                     }
-                    // Full re-list → set_foreign_cas is idempotent across
-                    // register (put) and unregister (delete).
-                    match store_for_obs.list() {
+                    // Re-list + hot-swap OFF the apply thread. Observers fire
+                    // synchronously inside the raft apply loop, and `list()`
+                    // reads the state machine THROUGH that same driver — doing
+                    // it inline re-enters the driver and deadlocks the apply, so
+                    // the triggering propose never returns (a 10s `RegisterForeignCa`
+                    // timeout). Defer to a blocking task; by the time it runs the
+                    // driver has moved on. A brief window where the verifier lags
+                    // the commit is fine — a foreign agent connecting in it just
+                    // retries (the trust set is eventually consistent, and a full
+                    // re-list makes set_foreign_cas idempotent across put/delete).
+                    let verifier = verifier_for_obs.clone();
+                    let store = Arc::clone(&store_for_obs);
+                    obs_runtime.spawn_blocking(move || match store.list() {
                         Ok(anchors) => {
-                            let _ = verifier_for_obs.set_foreign_cas(&anchors);
+                            let _ = verifier.set_foreign_cas(&anchors);
                         }
                         Err(e) => tracing::warn!(error = %e, "foreign-CA refresh: list failed"),
-                    }
+                    });
                 },
             ));
             tracing::info!(
@@ -3737,6 +3796,72 @@ impl nexus_raft::key_minter::KeyMinter for DaemonKeyMinter {
     }
 }
 
+/// Live-daemon [`nexus_raft::foreign_ca_registrar::ForeignCaRegistrar`]:
+/// register / unregister / list cross-org CA anchors against the running
+/// daemon's control-zone store, so `foreign-ca register` works WITHOUT stopping
+/// the daemon and the anchor replicates + hot-swaps the client-cert verifier on
+/// every node. Holds the SAME `Arc<RaftForeignCaStore>` the apply-observer reads
+/// (one store view). Node-cert gated (a cross-org trust decision is an admin op).
+struct DaemonForeignCaRegistrar {
+    store: Arc<nexus_raft::foreign_ca_store::RaftForeignCaStore>,
+}
+
+#[tonic::async_trait]
+impl nexus_raft::foreign_ca_registrar::ForeignCaRegistrar for DaemonForeignCaRegistrar {
+    async fn register(
+        &self,
+        caller_cert_der: Option<Vec<u8>>,
+        trust_domain_id: &str,
+        ca_cert_pem: &[u8],
+        expected_fingerprint: &str,
+    ) -> std::result::Result<String, String> {
+        gate_node_caller(caller_cert_der, "RegisterForeignCa")?;
+        let anchor =
+            nexus_raft::transport::ForeignCaAnchor::from_pem(trust_domain_id, ca_cert_pem)?;
+        // Out-of-band anti-swap: registering an anchor IS the trust-bootstrap
+        // moment, so the operator-supplied fingerprint (from the sudoedge triple)
+        // must equal the one computed from the CA bytes — else a swapped CA would
+        // be silently trusted.
+        let fingerprint = anchor.fingerprint_hex();
+        if fingerprint != expected_fingerprint {
+            return Err(format!(
+                "foreign CA fingerprint mismatch — computed {fingerprint}, operator supplied \
+                 {expected_fingerprint}; refusing to register"
+            ));
+        }
+        self.store.register(&anchor).map_err(|e| e.to_string())?;
+        Ok(fingerprint)
+    }
+
+    async fn unregister(
+        &self,
+        caller_cert_der: Option<Vec<u8>>,
+        fingerprint: &str,
+    ) -> std::result::Result<bool, String> {
+        gate_node_caller(caller_cert_der, "UnregisterForeignCa")?;
+        self.store
+            .unregister(fingerprint)
+            .map_err(|e| e.to_string())
+    }
+
+    async fn list(
+        &self,
+        caller_cert_der: Option<Vec<u8>>,
+    ) -> std::result::Result<Vec<(String, String)>, String> {
+        gate_node_caller(caller_cert_der, "ListForeignCas")?;
+        let anchors = self.store.list().map_err(|e| e.to_string())?;
+        Ok(anchors
+            .into_iter()
+            .map(|a| {
+                // fingerprint_hex() borrows `a`, so compute it BEFORE moving
+                // `trust_domain_id` out.
+                let fingerprint = a.fingerprint_hex();
+                (a.trust_domain_id, fingerprint)
+            })
+            .collect())
+    }
+}
+
 /// mTLS endpoint URLs to try for a remote agent mint: the union of `--peers`
 /// and the persisted `identity.json` peer address book, parsed the same way the
 /// daemon seeds its transport peer map. The founder is whichever one holds the
@@ -3945,6 +4070,106 @@ fn load_node_tls(data_dir: &std::path::Path) -> Result<nexus_raft::transport::Tl
     })
 }
 
+/// This node's own daemon loopback endpoint + its node-cert mTLS identity — the
+/// target for a CLI that drives the live daemon's node-cert-gated admin RPCs
+/// (sk- `MintKey`/`RevokeKey`/`ListKeys`, `RegisterForeignCa` + siblings). One
+/// place for the "dial my own daemon as a node" setup, shared by `sk_via_daemon`
+/// and `run_foreign_ca`.
+fn local_daemon_target(common: &CommonArgs) -> Result<(String, nexus_raft::transport::TlsConfig)> {
+    let endpoint = self_daemon_endpoint(common)
+        .ok_or_else(|| anyhow::anyhow!("cannot derive the local daemon endpoint from bind addr"))?;
+    let tls = load_node_tls(&common.data_dir)?;
+    Ok((endpoint, tls))
+}
+
+/// `foreign-ca` subcommand: register / unregister / list cross-org CA anchors
+/// against the LIVE local daemon (the anchor replicates + hot-swaps the verifier;
+/// there is no offline path — registering a foreign CA is a live-cluster admin
+/// op that must go through the control-zone leader). Node-cert gated at the
+/// daemon.
+async fn run_foreign_ca(common: CommonArgs, action: ForeignCaCmd) -> Result<()> {
+    if common.no_tls {
+        return Err(anyhow::anyhow!(
+            "cross-org trust needs mTLS; a --no-tls cluster has no foreign-CA plane"
+        ));
+    }
+    let (endpoint, tls) = local_daemon_target(&common)?;
+    match action {
+        ForeignCaCmd::Register {
+            domain,
+            ca_pem,
+            fingerprint,
+        } => {
+            let pem = std::fs::read(&ca_pem)
+                .with_context(|| format!("read CA PEM {}", ca_pem.display()))?;
+            match nexus_raft::transport::call_register_foreign_ca_rpc(
+                &endpoint,
+                &domain,
+                &pem,
+                &fingerprint,
+                Some(tls),
+                15,
+            )
+            .await
+            .with_context(|| format!("RegisterForeignCa: could not reach the local daemon at {endpoint} — is it running?"))?
+            {
+                Ok(fp) => {
+                    // The fingerprint on stdout alone (scriptable); prose to stderr.
+                    println!("{fp}");
+                    eprintln!("registered foreign CA domain={domain} fingerprint={fp} via {endpoint}");
+                    Ok(())
+                }
+                Err(msg) => Err(anyhow::anyhow!("{endpoint} refused RegisterForeignCa: {msg}")),
+            }
+        }
+        ForeignCaCmd::Unregister { fingerprint } => {
+            match nexus_raft::transport::call_unregister_foreign_ca_rpc(
+                &endpoint,
+                &fingerprint,
+                Some(tls),
+                15,
+            )
+            .await
+            .with_context(|| {
+                format!("UnregisterForeignCa: could not reach the local daemon at {endpoint}")
+            })? {
+                Ok(removed) => {
+                    println!(
+                        "{}",
+                        if removed {
+                            "unregistered"
+                        } else {
+                            "no such anchor (already gone?)"
+                        }
+                    );
+                    Ok(())
+                }
+                Err(msg) => Err(anyhow::anyhow!(
+                    "{endpoint} refused UnregisterForeignCa: {msg}"
+                )),
+            }
+        }
+        ForeignCaCmd::List => {
+            match nexus_raft::transport::call_list_foreign_cas_rpc(&endpoint, Some(tls), 15)
+                .await
+                .with_context(|| {
+                    format!("ListForeignCas: could not reach the local daemon at {endpoint}")
+                })? {
+                Ok(anchors) => {
+                    if anchors.is_empty() {
+                        println!("no foreign CAs registered");
+                    }
+                    for (domain, fp) in anchors {
+                        println!("{domain}  {fp}");
+                    }
+                    Ok(())
+                }
+                Err(msg) => Err(anyhow::anyhow!("{endpoint} refused ListForeignCas: {msg}")),
+            }
+        }
+    }
+}
+
 /// Outcome of trying an `sk-` mint/revoke against the LOCAL live daemon.
 enum DaemonOutcome {
     /// The daemon handled it (success already printed).
@@ -3962,9 +4187,7 @@ enum DaemonOutcome {
 /// to offline). Dials the local daemon only — propose-forwarding reaches the
 /// leader, so no founder discovery is needed for the sk- plane.
 async fn sk_via_daemon(common: &CommonArgs, action: &AuthCmd) -> Result<DaemonOutcome> {
-    let tls = load_node_tls(&common.data_dir)?;
-    let endpoint = self_daemon_endpoint(common)
-        .ok_or_else(|| anyhow::anyhow!("cannot derive the local daemon endpoint from bind addr"))?;
+    let (endpoint, tls) = local_daemon_target(common)?;
     match action {
         AuthCmd::Mint {
             subject_type,
