@@ -9,7 +9,7 @@
 //!   * **registration is put-if-absent** — an anchor binds a foreign CA (a
 //!     customer cluster's CA_B) to a trust domain, so re-pinning the same CA
 //!     fingerprint under ANY domain is REJECTED ([`ForeignCaStoreError::AlreadyRegistered`]),
-//!     never a silent relabel. To re-pin, an operator `remove`s first.
+//!     never a silent relabel. To re-pin, an operator `unregister`s first.
 
 use lib::transport_primitives::ForeignCaAnchor;
 
@@ -22,7 +22,7 @@ pub enum ForeignCaStoreError {
     /// The underlying control-state store failed (consensus or read error).
     Backend(String),
     /// `register` hit an already-pinned fingerprint — the put-if-absent CAS
-    /// refused the overwrite. The operator must `remove` the existing anchor
+    /// refused the overwrite. The operator must `unregister` the existing anchor
     /// before re-pinning it under a different trust domain.
     AlreadyRegistered { fingerprint: String },
     /// A stored record failed to decode (schema drift / corruption).
@@ -34,7 +34,10 @@ impl std::fmt::Display for ForeignCaStoreError {
         match self {
             Self::Backend(e) => write!(f, "foreign-ca store backend: {e}"),
             Self::AlreadyRegistered { fingerprint } => {
-                write!(f, "foreign CA {fingerprint} is already registered (remove it to re-pin)")
+                write!(
+                    f,
+                    "foreign CA {fingerprint} is already registered (unregister it to re-pin)"
+                )
             }
             Self::Corrupt(e) => write!(f, "foreign-ca anchor did not decode: {e}"),
         }
@@ -76,10 +79,11 @@ impl RaftForeignCaStore {
         Ok(())
     }
 
-    /// Remove a registered anchor by its `sha256:…` fingerprint. Idempotent; the
-    /// bool reports whether one was present (advisory, for operator messages).
+    /// Unregister an anchor by its `sha256:…` fingerprint (the inverse of
+    /// [`Self::register`]). Idempotent; the bool reports whether one was present
+    /// (advisory, for operator messages).
     #[inline]
-    pub fn remove(&self, fingerprint_hex: &str) -> Result<bool, ForeignCaStoreError> {
+    pub fn unregister(&self, fingerprint_hex: &str) -> Result<bool, ForeignCaStoreError> {
         self.inner
             .delete(fingerprint_hex)
             .map_err(ForeignCaStoreError::Backend)
@@ -172,9 +176,9 @@ mod tests {
 
         // Remove reports it removed one; the anchor stops listing; re-remove is
         // idempotent and reports nothing was there.
-        assert!(store.remove(&fp).expect("remove a"));
+        assert!(store.unregister(&fp).expect("remove a"));
         assert!(find(&fp).is_none(), "gone after remove");
-        assert!(!store.remove(&fp).expect("re-remove a"));
+        assert!(!store.unregister(&fp).expect("re-remove a"));
         assert_eq!(store.list().expect("list after remove").len(), 1);
 
         registry.shutdown_all();
