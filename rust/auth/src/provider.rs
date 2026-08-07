@@ -376,6 +376,12 @@ impl AuthProvider for ApiKeyAuthProvider {
                 // whole-org removal (drop the foreign-CA anchor) blocks it.
                 // Follow-up: an our-side, control-zone-backed per-serial denylist
                 // (no foreign-CRL fetch dependency).
+                //
+                // KNOWN GAP (G4): revocation is not immediate for a LIVE foreign
+                // connection. `classify_peer_cert` runs per-request, but neither a
+                // dropped anchor nor a (future G2) denylist is re-checked here
+                // mid-connection, so the interim whole-CA drop stops only NEW
+                // connections. Same app-layer per-request-revocation bucket as G2.
                 if self.is_revoked(&peer.serial) {
                     tracing::warn!(agent = %agent, "rejected: agent cert is revoked (in CRL)");
                     return Err(unauthenticated());
