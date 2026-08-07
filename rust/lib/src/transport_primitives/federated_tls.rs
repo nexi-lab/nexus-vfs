@@ -266,7 +266,15 @@ pub fn federated_tls_incoming(
     let (tx, rx) = tokio::sync::mpsc::channel(ACCEPT_BUFFER);
     tokio::spawn(async move {
         loop {
-            let tcp = match listener.accept().await {
+            let accepted = tokio::select! {
+                biased;
+                // Consumer (tonic) dropped the stream → stop accepting, so the
+                // task and the listener fd are released rather than looping
+                // forever. Checked first so shutdown wins a ready accept.
+                _ = tx.closed() => break,
+                r = listener.accept() => r,
+            };
+            let tcp = match accepted {
                 Ok((stream, _peer)) => stream,
                 // A listener-level error (fd exhaustion, etc.) is surfaced to the
                 // consumer; keep accepting — a transient error must not kill serve.
