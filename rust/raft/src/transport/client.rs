@@ -8,10 +8,10 @@ use super::proto::nexus::raft::{
     zone_api_service_client::ZoneApiServiceClient,
     zone_transport_service_client::ZoneTransportServiceClient, AcquireLock, DeleteMetadata,
     DeleteZoneRequest, DiscoverZonesRequest, EcReplicationEntry, ExtendLock, GetClusterInfoRequest,
-    GetCrlRequest, GetLockInfo, GetMetadata, JoinClusterRequest, JoinZoneRequest, ListMetadata,
-    MintAgentRequest, MintKeyRequest, ProposeRequest, PutMetadata, QueryRequest, RaftCommand,
-    RaftQuery, ReleaseLock, RemoveVoterRequest, ReplicateEntriesRequest, RevokeKeyRequest,
-    SnapshotEcStateRequest, StepMessageRequest,
+    GetCrlRequest, GetLockInfo, GetMetadata, JoinClusterRequest, JoinZoneRequest, ListKeysRequest,
+    ListMetadata, MintAgentRequest, MintKeyRequest, ProposeRequest, PutMetadata, QueryRequest,
+    RaftCommand, RaftQuery, ReleaseLock, RemoveVoterRequest, ReplicateEntriesRequest,
+    RevokeKeyRequest, SnapshotEcStateRequest, StepMessageRequest,
 };
 use super::{NodeAddress, Result, TransportError};
 use std::collections::HashMap;
@@ -1154,6 +1154,32 @@ pub async fn call_revoke_key_rpc(
         .into_inner();
     if response.success {
         Ok(Ok(response.removed))
+    } else {
+        Ok(Err(response.error.unwrap_or_default()))
+    }
+}
+
+/// List `sk-` credential records `(key_hash, opaque_record)` from a peer's live
+/// daemon (`ListKeys`) — a read of that node's LOCAL control-zone replica.
+/// `Ok(Ok(records))` on success; `Ok(Err(msg))` on a server refusal (e.g.
+/// auth-off, or the caller is not a node). The CLI decodes + renders the records.
+pub async fn call_list_keys_rpc(
+    peer_addr: &str,
+    tls: Option<super::TlsConfig>,
+    timeout_secs: u64,
+) -> Result<std::result::Result<Vec<(String, Vec<u8>)>, String>> {
+    let mut client = connect_zone_api(peer_addr, tls, timeout_secs, "ListKeys").await?;
+    let response = client
+        .list_keys(ListKeysRequest {})
+        .await
+        .map_err(|e| TransportError::Rpc(format!("ListKeys RPC failed: {e}")))?
+        .into_inner();
+    if response.success {
+        Ok(Ok(response
+            .keys
+            .into_iter()
+            .map(|k| (k.key_hash, k.record))
+            .collect()))
     } else {
         Ok(Err(response.error.unwrap_or_default()))
     }

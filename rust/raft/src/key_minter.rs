@@ -52,6 +52,16 @@ pub trait KeyMinter: Send + Sync {
         key: Option<String>,
         key_hash: Option<String>,
     ) -> Result<bool, String>;
+
+    /// Enumerate credential records `(key_hash, opaque_record)` from this
+    /// daemon's LOCAL replica — a read, no leader round-trip, so it works on a
+    /// learner. Backs `auth list` against a running daemon (offline list is
+    /// refused on an enrolled joiner). Hashes are not secrets; the caller
+    /// decodes + renders the records.
+    async fn list_keys(
+        &self,
+        caller_cert_der: Option<Vec<u8>>,
+    ) -> Result<Vec<(String, Vec<u8>)>, String>;
 }
 
 /// Late-bindable slot. Installed on every auth-on node's daemon (any node can
