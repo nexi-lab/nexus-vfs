@@ -20,7 +20,7 @@
 //! with `node_id: None`.
 
 use crate::auth::PeerIdentity;
-use lib::transport_primitives::authorship::agent_name_from_x509;
+use lib::transport_primitives::authorship::{agent_name_from_x509, cert_signed_by};
 use lib::transport_primitives::ForeignCaAnchor;
 use nexus_raft::transport::parse_node_identity_uri;
 use tonic::transport::server::{TcpConnectInfo, TlsConnectInfo};
@@ -178,12 +178,13 @@ pub fn classify_peer_cert(
 
 /// Does `cert`'s signature verify under the public key in `ca_der`? nexus certs
 /// are signed directly by the zone CA (one hop, no intermediates), so this
-/// single check is the whole chain — the same primitive `authorship::verify`
-/// relies on. `false` if the CA DER does not parse.
+/// single check is the whole chain. Delegates to [`authorship::cert_signed_by`]
+/// — the one definition `authorship::verify` also uses — so message-verify and
+/// TLS-classify agree on "chains to CA". `false` if the CA DER does not parse.
 fn chains_to(cert: &x509_parser::certificate::X509Certificate, ca_der: &[u8]) -> bool {
     use x509_parser::prelude::*;
     match X509Certificate::from_der(ca_der) {
-        Ok((_, ca)) => cert.verify_signature(Some(ca.public_key())).is_ok(),
+        Ok((_, ca)) => cert_signed_by(cert, &ca),
         Err(_) => false,
     }
 }

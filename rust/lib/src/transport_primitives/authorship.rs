@@ -60,8 +60,9 @@ pub fn verify(
         X509Certificate::from_der(&ca_der).map_err(|e| format!("CA cert does not parse: {e}"))?;
 
     // 1. The cert is a genuine agent cert issued by this cluster CA.
-    cert.verify_signature(Some(ca.public_key()))
-        .map_err(|_| "agent cert does not chain to the cluster CA".to_string())?;
+    if !cert_signed_by(&cert, &ca) {
+        return Err("agent cert does not chain to the cluster CA".to_string());
+    }
 
     // 2. It names an agent (a `nexus://agent/{name}` SAN).
     let name = agent_name_from_x509(&cert)
@@ -92,6 +93,20 @@ pub fn agent_name_from_x509(cert: &x509_parser::certificate::X509Certificate) ->
                 _ => None,
             })
         })
+}
+
+/// Whether `cert`'s signature verifies under `ca`'s public key — the single-hop
+/// chain check (a nexus cert is signed directly by its zone CA, no
+/// intermediates). The one definition of "does this cert chain to this CA",
+/// shared by [`verify`] and `transport::peer_identity::classify_peer_cert`, so
+/// the two cannot drift. Does NOT check validity period or revocation — those are
+/// separate gates.
+#[inline]
+pub fn cert_signed_by(
+    cert: &x509_parser::certificate::X509Certificate,
+    ca: &x509_parser::certificate::X509Certificate,
+) -> bool {
+    cert.verify_signature(Some(ca.public_key())).is_ok()
 }
 
 /// Build a signed mailbox envelope: sign `content` with the agent's key and
