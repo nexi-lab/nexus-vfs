@@ -9,14 +9,24 @@
 //!   mailbox_cli <port> <sk-token> stat      <path>
 //!   mailbox_cli <port> <sk-token> read      <path>
 //!   mailbox_cli <port> <sk-token> mkstream  <path>            # DT_STREAM (wal,memory)
-//!   mailbox_cli <port> <sk-token> send      <path> <message>  # stream append
-//!   mailbox_cli <port> <sk-token> collect   <path>            # stream read-all
+//!   mailbox_cli <port> <sk-token> send      <path> <message>  # sealed append (signed envelope)
+//!   mailbox_cli <port> <sk-token> collect   <path>            # read-all + verify seal
+//!   mailbox_cli <port> <sk-token> send-raw  <path> <message>  # UNSIGNED plain-JSON append
+//!   mailbox_cli <port> <sk-token> collect-raw <path>          # read-all, raw bytes (no open)
+//!
+//! `send-raw` + `collect-raw` are the cross-org path: an agent writes a plain
+//! JSON envelope and the daemon's A2A stamp hook rewrites `from` to the
+//! authenticated (possibly cross-trust-domain) `agent_id` — e.g. a foreign
+//! agent whose CA was `foreign-ca register`ed reads back
+//! `"from":"{trust_domain}/agent/{name}"`. In cert mode point `ca.pem` at the
+//! BROKER's cluster CA (to verify the server); the agent leaf may be signed by
+//! a different (foreign) CA.
 
 use kernel::kernel::vfs_proto::{
     nexus_vfs_service_client::NexusVfsServiceClient, IpcPathRequest, ReadRequest, ReaddirRequest,
     SetattrRequest, StatRequest, StreamWriteRequest,
 };
-use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
 const DT_STREAM: i32 = 4;
 
@@ -146,36 +156,31 @@ async fn run() -> Result<(), String> {
                 }
                 None => msg.as_bytes().to_vec(),
             };
-            let r = c
-                .stream_write_nowait(StreamWriteRequest {
-                    path: path.clone(),
-                    data,
-                    auth_token: auth.clone(),
-                })
-                .await
-                .map_err(|e| format!("stream_write rpc: {e}"))?
-                .into_inner();
-            err_if(r.is_error, &r.error_payload)?;
-            println!("sent offset={}", r.offset);
+            stream_append(&mut c, path, data, &auth).await?;
+        }
+        "send-raw" => {
+            // Unsigned append: plain bytes, no seal. On a `*/chat-with-me`
+            // mailbox the daemon's stamp hook rewrites `from` to the
+            // authenticated agent_id — the path that surfaces classify's
+            // qualified `{trust_domain}/agent/{name}` for a foreign agent.
+            let msg = a.get(5).ok_or("send-raw needs a <message> arg")?;
+            stream_append(&mut c, path, msg.as_bytes().to_vec(), &auth).await?;
+        }
+        "collect-raw" => {
+            // Raw stream bytes, no envelope open — shows the stamped `from`.
+            let data = stream_read_all(&mut c, path, &auth).await?;
+            print!("{}", String::from_utf8_lossy(&data));
         }
         "collect" => {
-            let r = c
-                .stream_collect_all(IpcPathRequest {
-                    path: path.clone(),
-                    auth_token: auth.clone(),
-                })
-                .await
-                .map_err(|e| format!("stream_collect_all rpc: {e}"))?
-                .into_inner();
-            err_if(r.is_error, &r.error_payload)?;
+            let data = stream_read_all(&mut c, path, &auth).await?;
             match &agent {
                 // Verify the sealed envelope against the CA and print who really
                 // wrote it — the cross-trust-domain check, on the reader's side.
                 Some((_name, _cert, _key, ca)) => {
-                    let (from, content) = lib::transport_primitives::authorship::open(&r.data, ca)?;
+                    let (from, content) = lib::transport_primitives::authorship::open(&data, ca)?;
                     println!("from={from} content={}", String::from_utf8_lossy(&content));
                 }
-                None => print!("{}", String::from_utf8_lossy(&r.data)),
+                None => print!("{}", String::from_utf8_lossy(&data)),
             }
         }
         other => return Err(format!("unknown op '{other}'")),
@@ -189,4 +194,46 @@ fn err_if(is_error: bool, payload: &[u8]) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+/// Append `data` to a DT_STREAM and print the assigned offset. Shared by the
+/// sealed (`send`) and unsigned (`send-raw`) ops — they differ only in whether
+/// `data` is a signed envelope or plain bytes.
+async fn stream_append(
+    c: &mut NexusVfsServiceClient<Channel>,
+    path: &str,
+    data: Vec<u8>,
+    auth: &str,
+) -> Result<(), String> {
+    let r = c
+        .stream_write_nowait(StreamWriteRequest {
+            path: path.to_string(),
+            data,
+            auth_token: auth.to_string(),
+        })
+        .await
+        .map_err(|e| format!("stream_write rpc: {e}"))?
+        .into_inner();
+    err_if(r.is_error, &r.error_payload)?;
+    println!("sent offset={}", r.offset);
+    Ok(())
+}
+
+/// Read a whole DT_STREAM's bytes. Shared by `collect` (which then opens the
+/// sealed envelope against the CA) and `collect-raw` (which prints them as-is).
+async fn stream_read_all(
+    c: &mut NexusVfsServiceClient<Channel>,
+    path: &str,
+    auth: &str,
+) -> Result<Vec<u8>, String> {
+    let r = c
+        .stream_collect_all(IpcPathRequest {
+            path: path.to_string(),
+            auth_token: auth.to_string(),
+        })
+        .await
+        .map_err(|e| format!("stream_collect_all rpc: {e}"))?
+        .into_inner();
+    err_if(r.is_error, &r.error_payload)?;
+    Ok(r.data)
 }
