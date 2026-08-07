@@ -3376,28 +3376,37 @@ fn open_auth_store(
     //   * auth-on  → the replicated CONTROL zone, founder-founded sole-voter. An
     //     offline mint here is the FOUNDER cold-start / DR path — safe because
     //     the founder is the zone's only voter (no concurrent voter to diverge
-    //     against). A joiner (no CA key) has no business founding a control zone
-    //     offline (that would split-brain the cluster's auth state), so it is
-    //     refused and pointed at the daemon.
+    //     against).
     //   * auth-off → per-node `root` (no cluster, nothing to replicate); the
     //     daemon binds root too under `--no-tls`.
     // We open ONLY that one zone: loading the federated shares would spin each up
     // as a lone node and mutate its term/vote so the real daemon resumes DIVERGED
     // (the #24 hazard). See `ZoneLoadPolicy`.
-    let (auth_zone, is_founder) = if common.no_tls {
-        (contracts::ROOT_ZONE_ID, true)
+    //
+    // Refuse offline auth on an ENROLLED JOINER — precisely `node.pem` present
+    // (a cluster-issued cert) AND `ca-key.pem` absent (not the CA holder). Such a
+    // node founding a control zone offline would split-brain the cluster's auth
+    // state, so it must forward to the live daemon instead. This is the SAME
+    // signal the `run_auth` intercept uses. A CA holder (`ca-key.pem` present)
+    // AND a fresh founder-to-be dir (neither file — `open_zone_manager`
+    // bootstraps its CA below) are BOTH allowed: the latter is a founder's
+    // legitimate cold-start (`auth mint` before the first daemon boot).
+    let auth_zone = if common.no_tls {
+        contracts::ROOT_ZONE_ID
     } else {
-        let founder = common.data_dir.join("tls").join("ca-key.pem").exists();
-        if !founder {
+        let tls_dir = common.data_dir.join("tls");
+        let enrolled_joiner =
+            tls_dir.join("node.pem").exists() && !tls_dir.join("ca-key.pem").exists();
+        if enrolled_joiner {
             return Err(anyhow::anyhow!(
-                "offline `auth` needs the cluster CA key, present only on the founder. \
-                 On a joiner, run the mint against the live daemon (start it) — the write \
-                 forwards to the founder over consensus — or run it on the founder."
+                "this node is an enrolled joiner (holds a node cert but not the cluster CA \
+                 key); offline `auth` cannot write cluster auth state here. Run the mint \
+                 against the live daemon (start it — the write forwards to the founder over \
+                 consensus), or run it on the founder."
             ));
         }
-        (contracts::CONTROL_ZONE_ID, founder)
+        contracts::CONTROL_ZONE_ID
     };
-    let _ = is_founder; // documents the gate above; founding below is founder-only by construction
 
     // Offline tooling cannot open the data dir while the daemon holds its
     // exclusive redb lock — by far the dominant failure here — so name that

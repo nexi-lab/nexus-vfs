@@ -121,26 +121,37 @@ async fn replication_survives_restart(
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     if offline_auth_between {
-        // Mint an agent key on the STOPPED joiner's data dir — the live
-        // boot->stop->mint->restart dance. The mint must open ONLY root; if it
-        // loaded the federated sharedzone it would campaign as a lone node and
-        // mutate its term/vote, so the restarted joiner would resume diverged
-        // and the founder would lose quorum (`raft: proposal dropped`). This
-        // asserts the mint does NOT perturb federated replication.
+        // Mint an sk- key on the STOPPED joiner's data dir — the live
+        // boot->stop->mint->restart dance. The mint must open ONLY the auth zone
+        // (`root` here, since this cluster is `--no-tls`/auth-off); if it loaded
+        // the federated sharedzone it would campaign as a lone node and mutate
+        // its term/vote, so the restarted joiner would resume diverged and the
+        // founder would lose quorum (`raft: proposal dropped`). This asserts the
+        // mint does NOT perturb federated replication.
+        //
+        // The mint matches the cluster's posture: `--no-tls` (auth-off) + a
+        // `user` key. An auth-ON agent mint against an auth-off node is
+        // incoherent — an agent cert needs a CA this cluster does not have — and
+        // an offline mint on a stopped ENROLLED joiner is exactly what the
+        // control-zone contract forbids (it must forward to the live daemon).
         let mint_env = vec![
             ("NEXUS_DATA_DIR", jdata.as_str()),
             ("NEXUS_IDENTITY_DIR", jid.as_str()),
             ("NEXUS_API_KEY_SECRET", MINT_SECRET),
+            ("NEXUS_NO_TLS", "true"),
         ];
         let (ok, _o, e) = cli(
             &mint_env,
             &[
                 "auth",
                 "mint",
+                "--no-tls",
                 "--subject-type",
-                "agent",
+                "user",
                 "--subject-id",
                 "probe",
+                "--zone",
+                "sharedzone:rw",
                 "--name",
                 "probe",
             ],
