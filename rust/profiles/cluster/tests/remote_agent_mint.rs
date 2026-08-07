@@ -136,9 +136,9 @@ async fn auth_mint_agent_just_works_on_a_joiner_via_the_founder() {
          stdout: {out}\nstderr: {err}"
     );
     assert!(
-        err.contains("via founder"),
-        "the joiner mint must go the REMOTE path (forwarded to the founder), \
-         got stderr: {err}"
+        err.contains(&format!("via https://127.0.0.1:{fport}")),
+        "the joiner mint must go the REMOTE path — forwarded to the founder's \
+         daemon at :{fport}, not signed offline — got stderr: {err}"
     );
     let bundle_dir = std::path::PathBuf::from(out.trim());
     assert_eq!(

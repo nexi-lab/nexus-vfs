@@ -134,20 +134,28 @@ pub fn mint_agent_authz(
             record.subject_type.as_str()
         )));
     }
-    if !allow_existing {
-        if let Some(clash_id) = find_active_subject(store, SubjectType::Agent, &record.subject_id)?
-        {
-            return Err(AuthKeyStoreError::Backend(format!(
-                "agent {} already has an active credential (key_id={clash_id}); \
-                 revoke it, or pass --allow-existing to rotate",
-                record.subject_id,
-            )));
-        }
-    }
     let bytes = record.encode().map_err(|e| {
         AuthKeyStoreError::Backend(format!("encode agent record {}: {e}", record.key_id))
     })?;
-    store.put(&agent_store_key(&record.subject_id), &bytes)
+    let key = agent_store_key(&record.subject_id);
+    if allow_existing {
+        // Rotation: overwrite the name's record in place.
+        return store.put(&key, &bytes);
+    }
+    // Uniqueness is enforced at raft APPLY via the store's CAS put-if-absent
+    // (keyed by `agent:<name>`), not a client-side read-then-write: two nodes
+    // minting the same name concurrently can never both win. (Agent records are
+    // never deleted — revocation is CRL-based — and there is one record per
+    // name, so "key present" IS "name taken".)
+    if store.put_if_absent(&key, &bytes)? {
+        Ok(())
+    } else {
+        Err(AuthKeyStoreError::Backend(format!(
+            "agent {} already has an active credential; revoke it, or pass \
+             --allow-existing to rotate",
+            record.subject_id,
+        )))
+    }
 }
 
 /// The `key_id` of an active (non-revoked) key already bound to

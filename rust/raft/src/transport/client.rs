@@ -9,9 +9,9 @@ use super::proto::nexus::raft::{
     zone_transport_service_client::ZoneTransportServiceClient, AcquireLock, DeleteMetadata,
     DeleteZoneRequest, DiscoverZonesRequest, EcReplicationEntry, ExtendLock, GetClusterInfoRequest,
     GetCrlRequest, GetLockInfo, GetMetadata, JoinClusterRequest, JoinZoneRequest, ListMetadata,
-    MintAgentRequest, ProposeRequest, PutMetadata, QueryRequest, RaftCommand, RaftQuery,
-    ReleaseLock, RemoveVoterRequest, ReplicateEntriesRequest, SnapshotEcStateRequest,
-    StepMessageRequest,
+    MintAgentRequest, MintKeyRequest, ProposeRequest, PutMetadata, QueryRequest, RaftCommand,
+    RaftQuery, ReleaseLock, RemoveVoterRequest, ReplicateEntriesRequest, RevokeKeyRequest,
+    SnapshotEcStateRequest, StepMessageRequest,
 };
 use super::{NodeAddress, Result, TransportError};
 use std::collections::HashMap;
@@ -1090,6 +1090,73 @@ pub async fn call_mint_agent_rpc(
         agent_key_pem: response.agent_key_pem,
         ca_pem: response.ca_pem,
     })
+}
+
+/// Params for [`call_mint_key_rpc`] — mirrors the CLI's `auth mint` sk- flags.
+pub struct MintKeyArgs<'a> {
+    pub subject_type: &'a str,
+    pub subject_id: &'a str,
+    pub zones: Vec<String>,
+    pub admin: bool,
+    pub expires_at_ms: u64,
+    pub name: &'a str,
+    pub allow_existing: bool,
+}
+
+/// Mint an `sk-` credential through a peer's live daemon (`MintKey`).
+///
+/// The daemon HMACs + writes the record via consensus (forwards to the
+/// control-zone leader), so any auth-on node serves it. Returns the one-time
+/// plaintext key on success, or the server's refusal (`Ok(Err(msg))` — e.g.
+/// auth-off, or the subject already has a key). mTLS presents this node's cert.
+pub async fn call_mint_key_rpc(
+    peer_addr: &str,
+    args: MintKeyArgs<'_>,
+    tls: Option<super::TlsConfig>,
+    timeout_secs: u64,
+) -> Result<std::result::Result<String, String>> {
+    let mut client = connect_zone_api(peer_addr, tls, timeout_secs, "MintKey").await?;
+    let response = client
+        .mint_key(MintKeyRequest {
+            subject_type: args.subject_type.to_string(),
+            subject_id: args.subject_id.to_string(),
+            zones: args.zones,
+            admin: args.admin,
+            expires_at_ms: args.expires_at_ms,
+            name: args.name.to_string(),
+            allow_existing: args.allow_existing,
+        })
+        .await
+        .map_err(|e| TransportError::Rpc(format!("MintKey RPC failed: {e}")))?
+        .into_inner();
+    if response.success {
+        Ok(Ok(response.key))
+    } else {
+        Ok(Err(response.error.unwrap_or_default()))
+    }
+}
+
+/// Revoke an `sk-` credential through a peer's live daemon (`RevokeKey`), by key
+/// OR key-hash (exactly one `Some`). `Ok(Ok(removed))` on success, `Ok(Err(msg))`
+/// on a server refusal.
+pub async fn call_revoke_key_rpc(
+    peer_addr: &str,
+    key: Option<String>,
+    key_hash: Option<String>,
+    tls: Option<super::TlsConfig>,
+    timeout_secs: u64,
+) -> Result<std::result::Result<bool, String>> {
+    let mut client = connect_zone_api(peer_addr, tls, timeout_secs, "RevokeKey").await?;
+    let response = client
+        .revoke_key(RevokeKeyRequest { key, key_hash })
+        .await
+        .map_err(|e| TransportError::Rpc(format!("RevokeKey RPC failed: {e}")))?
+        .into_inner();
+    if response.success {
+        Ok(Ok(response.removed))
+    } else {
+        Ok(Err(response.error.unwrap_or_default()))
+    }
 }
 
 #[cfg(test)]

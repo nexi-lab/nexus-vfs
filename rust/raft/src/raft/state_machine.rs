@@ -151,24 +151,45 @@ pub enum Command {
     // variant's index, so logs written before these commands existed
     // still decode. New variants must always be appended, never
     // inserted mid-enum.
-    /// Upsert an API-key record into the dedicated `TREE_AUTH_KEYS`
-    /// tree (the "locks" pattern — a kernel-internal primitive, not a
-    /// file). `record` is opaque bytes the state machine never
-    /// interprets; the auth provider owns the schema. Kept out of the
-    /// file-metadata tree so `ZoneMetaStore`/snapshot walkers, which
-    /// assume every metadata value is a `FileMetadata` proto, never
-    /// see it. Raft-replicated ⇒ revocation propagates to every replica.
-    PutAuthKey {
-        /// HMAC of the API key (hex). The lookup key, not a secret.
-        key_hash: String,
-        /// Opaque serialized auth record.
-        record: Vec<u8>,
+    /// Upsert an opaque value into the replicated cluster-control store under
+    /// `(namespace, key)` — the ONE key space carrying all cluster-control state
+    /// (auth-key/agent records under [`contracts::CONTROL_NS_AUTH`], cross-org
+    /// trust anchors under [`contracts::CONTROL_NS_FOREIGN_CA`], …). The "locks"
+    /// pattern: a kernel-internal primitive, not a file. `value` is opaque bytes
+    /// the state machine never interprets; each namespace owner owns its schema.
+    /// Kept in a dedicated tree so `ZoneMetaStore`/snapshot walkers (which assume
+    /// every metadata value is a `FileMetadata` proto) never see it. Raft-
+    /// replicated ⇒ writes + revocations propagate to every replica.
+    ///
+    /// `if_absent` makes this a CAS put-if-absent: apply returns
+    /// [`CommandResult::Error`] if `(namespace, key)` already exists, giving a
+    /// log-ordered uniqueness gate (agent-name dedup, foreign-CA anchor re-pin
+    /// rejection) that a client read-then-write cannot (TOCTOU). `false` = plain
+    /// upsert (rotation).
+    ///
+    /// Replaces the former `PutAuthKey`/`DeleteAuthKey` (generalised, not kept as
+    /// a compat shim). The `Command` wire encoding is bincode-by-index and this
+    /// occupies the same tail index; a pre-existing log with the old variant is
+    /// not decoded across this change — the cluster is wiped on version bump (no
+    /// backward compat), so no in-place old log is ever read by this build.
+    PutControlState {
+        /// Owner namespace (`contracts::CONTROL_NS_*`).
+        namespace: String,
+        /// Lookup key within the namespace (not a secret).
+        key: String,
+        /// Opaque serialized value; the state machine never parses it.
+        value: Vec<u8>,
+        /// CAS: reject if `(namespace, key)` already exists.
+        if_absent: bool,
     },
 
-    /// Remove an API-key record (revocation).
-    DeleteAuthKey {
-        /// HMAC of the API key to remove.
-        key_hash: String,
+    /// Remove `(namespace, key)` from the cluster-control store (revocation /
+    /// un-pin). Idempotent.
+    DeleteControlState {
+        /// Owner namespace (`contracts::CONTROL_NS_*`).
+        namespace: String,
+        /// Lookup key within the namespace.
+        key: String,
     },
 }
 
@@ -578,17 +599,30 @@ const TREE_STREAM_ENTRIES: &str = "sm_stream_entries";
 fn stream_tail_key(stream_prefix: &str) -> String {
     format!("__stream_tail__{stream_prefix}")
 }
-/// Dedicated redb tree for API-key records (auth-key store).
+/// Dedicated redb tree for the cluster-control store (auth records, cross-org
+/// anchors, …).
 ///
-/// Holds ``Command::PutAuthKey`` payloads, separate from
-/// ``TREE_METADATA`` for the same reason ``TREE_STREAM_ENTRIES`` is:
-/// the values are opaque bytes, not ``FileMetadata`` protos, so keeping
-/// them out of the metadata tree stops ``ZoneMetaStore``/snapshot
-/// walkers (which assume every value decodes as a proto) from choking.
-/// Keys are ``key_hash`` hex strings; values are the auth provider's
-/// serialized record.
-const TREE_AUTH_KEYS: &str = "sm_auth_keys";
+/// Holds ``Command::PutControlState`` payloads, separate from ``TREE_METADATA``
+/// for the same reason ``TREE_STREAM_ENTRIES`` is: the values are opaque bytes,
+/// not ``FileMetadata`` protos, so keeping them out of the metadata tree stops
+/// ``ZoneMetaStore``/snapshot walkers (which assume every value decodes as a
+/// proto) from choking. Keys are ``namespace\0key`` (both NUL-free ASCII), so a
+/// ``namespace\0`` prefix scan enumerates exactly one namespace; values are the
+/// namespace owner's serialized record.
+const TREE_CONTROL_STATE: &str = "sm_control_state";
 const KEY_LAST_APPLIED: &[u8] = b"__last_applied__";
+
+/// Composite storage key for [`TREE_CONTROL_STATE`]: ``namespace \0 key``.
+/// Namespaces (`contracts::CONTROL_NS_*`) and keys (hex hashes, `agent:<name>`,
+/// anchor hashes) are NUL-free ASCII, so the separator is unambiguous and a
+/// ``namespace\0`` prefix scan enumerates exactly one namespace.
+fn control_key(namespace: &str, key: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(namespace.len() + 1 + key.len());
+    k.extend_from_slice(namespace.as_bytes());
+    k.push(0);
+    k.extend_from_slice(key.as_bytes());
+    k
+}
 
 // R14: Advisory locks no longer have a redb tree. The BTreeMap in
 // `Arc<Mutex<LockState>>` is the single source of truth; persistence
@@ -684,9 +718,10 @@ pub struct FullStateMachine {
     /// Distinct from ``metadata`` for the same reason as
     /// ``stream_entries``: the values are not ``FileMetadata`` protos,
     /// so they must stay off the file-metadata path. Written by
-    /// ``Command::PutAuthKey`` / ``DeleteAuthKey``; read by
-    /// [`Self::get_auth_key`] / [`Self::list_auth_keys`].
-    auth_keys: RedbTree,
+    /// ``Command::PutControlState`` / ``DeleteControlState``; read by
+    /// [`Self::get_control_state`] / [`Self::list_control_state`]. Keyed by
+    /// ``namespace\0key``.
+    control_state: RedbTree,
     /// Advisory lock SSOT — shared with the kernel's `LockManager`.
     advisory: Arc<Mutex<LockState>>,
     /// Last applied metadata/Noop log index (persisted to redb).
@@ -742,7 +777,7 @@ impl FullStateMachine {
     pub fn with_advisory(store: &RedbStore, advisory: Arc<Mutex<LockState>>) -> Result<Self> {
         let metadata = store.tree(TREE_METADATA)?;
         let stream_entries = store.tree(TREE_STREAM_ENTRIES)?;
-        let auth_keys = store.tree(TREE_AUTH_KEYS)?;
+        let control_state = store.tree(TREE_CONTROL_STATE)?;
 
         // Load last_applied from metadata tree.
         let last_applied = match metadata.get(KEY_LAST_APPLIED)? {
@@ -758,7 +793,7 @@ impl FullStateMachine {
         Ok(Self {
             metadata,
             stream_entries,
-            auth_keys,
+            control_state,
             advisory,
             last_applied: Arc::new(AtomicU64::new(last_applied)),
             apply_observers: Arc::new(parking_lot::RwLock::new(Vec::new())),
@@ -1226,30 +1261,47 @@ impl FullStateMachine {
             .unwrap_or(0))
     }
 
-    /// Look up an API-key record by its ``key_hash``.
+    /// Look up a cluster-control value by ``(namespace, key)``.
     ///
-    /// Returns the opaque record bytes stored by
-    /// ``Command::PutAuthKey`` (``Ok(None)`` if absent or revoked). Reads
-    /// the locally-applied state machine — no consensus round-trip — so
-    /// it is cheap enough for the auth provider's per-RPC lookup on a
-    /// cache miss.
-    pub fn get_auth_key(&self, key_hash: &str) -> Result<Option<Vec<u8>>> {
-        Ok(self.auth_keys.get(key_hash.as_bytes())?)
+    /// Returns the opaque bytes stored by ``Command::PutControlState``
+    /// (``Ok(None)`` if absent or revoked). Reads the locally-applied state
+    /// machine — no consensus round-trip — so it is cheap enough for the auth
+    /// provider's (and the cross-org verifier's) per-RPC lookup on a cache miss.
+    pub fn get_control_state(&self, namespace: &str, key: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self.control_state.get(&control_key(namespace, key))?)
     }
 
-    /// Enumerate every API-key record as ``(key_hash, record_bytes)``.
+    /// Enumerate every value in one namespace as ``(key, value_bytes)``.
     ///
-    /// Backs the admin-only ``/__sys__/auth/keys/`` procfs view and
-    /// key-management tooling. Not a hot path — a full tree scan.
-    pub fn list_auth_keys(&self) -> Result<Vec<(String, Vec<u8>)>> {
+    /// A ``namespace\0`` prefix scan. Backs the admin-only
+    /// ``/__sys__/auth/keys/`` procfs view + key-management tooling (via
+    /// [`Self::list_auth_keys`]) and the cross-org anchor registry. Not a hot
+    /// path — a full-tree scan filtered by prefix.
+    pub fn list_control_state(&self, namespace: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        let mut prefix = namespace.as_bytes().to_vec();
+        prefix.push(0);
         let mut out = Vec::new();
-        for item in self.auth_keys.iter() {
-            let (key, value) = item?;
-            if let Ok(hash) = String::from_utf8(key) {
-                out.push((hash, value));
+        for item in self.control_state.iter() {
+            let (k, value) = item?;
+            if k.len() > prefix.len() && k[..prefix.len()] == prefix[..] {
+                if let Ok(key) = String::from_utf8(k[prefix.len()..].to_vec()) {
+                    out.push((key, value));
+                }
             }
         }
         Ok(out)
+    }
+
+    /// Look up an API-key/agent record by its ``key_hash`` — the
+    /// [`contracts::CONTROL_NS_AUTH`] view of [`Self::get_control_state`].
+    pub fn get_auth_key(&self, key_hash: &str) -> Result<Option<Vec<u8>>> {
+        self.get_control_state(contracts::CONTROL_NS_AUTH, key_hash)
+    }
+
+    /// Enumerate every auth record as ``(key_hash, record_bytes)`` — the
+    /// [`contracts::CONTROL_NS_AUTH`] view of [`Self::list_control_state`].
+    pub fn list_auth_keys(&self) -> Result<Vec<(String, Vec<u8>)>> {
+        self.list_control_state(contracts::CONTROL_NS_AUTH)
     }
 
     /// Get lock info by path (reads the shared advisory map).
@@ -1275,10 +1327,11 @@ struct Snapshot {
     /// All stream entries (R19.1b').
     #[serde(default)]
     stream_entries: HashMap<String, Vec<u8>>,
-    /// All auth-key records. ``serde(default)`` so snapshots taken
-    /// before the auth-key store existed still restore (empty map).
+    /// All cluster-control records, keyed by the composite ``namespace\0key``
+    /// (NUL is valid UTF-8, so it round-trips through the `String` map).
+    /// ``serde(default)`` so pre-control-store snapshots still restore (empty).
     #[serde(default)]
-    auth_keys: HashMap<String, Vec<u8>>,
+    control_state: HashMap<String, Vec<u8>>,
     /// Advisory lock SSOT at snapshot time (clone of the BTreeMap).
     advisory: LockState,
     /// Last applied index.
@@ -1331,12 +1384,25 @@ impl FullStateMachine {
                  assigned atomically at raft apply); the non-txn path must never receive it"
                     .into(),
             )),
-            Command::PutAuthKey { key_hash, record } => {
-                self.auth_keys.set(key_hash.as_bytes(), record)?;
+            Command::PutControlState {
+                namespace,
+                key,
+                value,
+                if_absent,
+            } => {
+                let ckey = control_key(namespace, key);
+                if *if_absent && self.control_state.get(&ckey)?.is_some() {
+                    // CAS reject — applied (log entry consumed) but the write is
+                    // refused; propose() surfaces this as an error.
+                    return Ok(CommandResult::Error(format!(
+                        "control state {namespace}/{key} already exists"
+                    )));
+                }
+                self.control_state.set(&ckey, value)?;
                 Ok(CommandResult::Success)
             }
-            Command::DeleteAuthKey { key_hash } => {
-                self.auth_keys.delete(key_hash.as_bytes())?;
+            Command::DeleteControlState { namespace, key } => {
+                self.control_state.delete(&control_key(namespace, key))?;
                 Ok(CommandResult::Success)
             }
             Command::Noop => Ok(CommandResult::Success),
@@ -1461,25 +1527,46 @@ impl FullStateMachine {
                 Ok(CommandResult::Value(seq.to_be_bytes().to_vec()))
             }
 
-            Command::PutAuthKey { key_hash, record } => {
-                let auth_def = redb::TableDefinition::<&[u8], &[u8]>::new(self.auth_keys.name());
+            Command::PutControlState {
+                namespace,
+                key,
+                value,
+                if_absent,
+            } => {
+                let def = redb::TableDefinition::<&[u8], &[u8]>::new(self.control_state.name());
                 let mut table = txn
-                    .open_table(auth_def)
-                    .map_err(|e| super::RaftError::Storage(format!("open auth_keys: {e}")))?;
+                    .open_table(def)
+                    .map_err(|e| super::RaftError::Storage(format!("open control_state: {e}")))?;
+                let ckey = control_key(namespace, key);
+                if *if_absent {
+                    let exists = table
+                        .get(ckey.as_slice())
+                        .map_err(|e| super::RaftError::Storage(format!("get control_state: {e}")))?
+                        .is_some();
+                    if exists {
+                        // CAS reject — log-ordered uniqueness gate. The entry is
+                        // applied (consumed) but the write is refused; the txn
+                        // commits with nothing written for it and propose() maps
+                        // CommandResult::Error to an error.
+                        return Ok(CommandResult::Error(format!(
+                            "control state {namespace}/{key} already exists"
+                        )));
+                    }
+                }
                 table
-                    .insert(key_hash.as_bytes(), record.as_slice())
-                    .map_err(|e| super::RaftError::Storage(format!("insert auth_key: {e}")))?;
+                    .insert(ckey.as_slice(), value.as_slice())
+                    .map_err(|e| super::RaftError::Storage(format!("insert control_state: {e}")))?;
                 Ok(CommandResult::Success)
             }
 
-            Command::DeleteAuthKey { key_hash } => {
-                let auth_def = redb::TableDefinition::<&[u8], &[u8]>::new(self.auth_keys.name());
+            Command::DeleteControlState { namespace, key } => {
+                let def = redb::TableDefinition::<&[u8], &[u8]>::new(self.control_state.name());
                 let mut table = txn
-                    .open_table(auth_def)
-                    .map_err(|e| super::RaftError::Storage(format!("open auth_keys: {e}")))?;
+                    .open_table(def)
+                    .map_err(|e| super::RaftError::Storage(format!("open control_state: {e}")))?;
                 table
-                    .remove(key_hash.as_bytes())
-                    .map_err(|e| super::RaftError::Storage(format!("remove auth_key: {e}")))?;
+                    .remove(control_key(namespace, key).as_slice())
+                    .map_err(|e| super::RaftError::Storage(format!("remove control_state: {e}")))?;
                 Ok(CommandResult::Success)
             }
 
@@ -1512,8 +1599,8 @@ impl StateMachine for FullStateMachine {
             Command::SetMetadata { .. }
             | Command::CasSetMetadata { .. }
             | Command::DeleteMetadata { .. }
-            | Command::PutAuthKey { .. }
-            | Command::DeleteAuthKey { .. } => self.execute(command),
+            | Command::PutControlState { .. }
+            | Command::DeleteControlState { .. } => self.execute(command),
             _ => Err(super::RaftError::InvalidState(
                 "Only metadata operations (set/delete) support EC local writes".into(),
             )),
@@ -1838,14 +1925,15 @@ impl StateMachine for FullStateMachine {
             }
         }
 
-        // Auth-key records — same rationale as stream_entries: a
+        // Cluster-control records — same rationale as stream_entries: a
         // dedicated map so they travel in the snapshot without ever
-        // touching the file-metadata map.
-        let mut auth_keys = HashMap::new();
-        for item in self.auth_keys.iter() {
+        // touching the file-metadata map. Keys are the composite
+        // ``namespace\0key`` verbatim.
+        let mut control_state = HashMap::new();
+        for item in self.control_state.iter() {
             let (key, value) = item?;
             if let Ok(k) = String::from_utf8(key) {
-                auth_keys.insert(k, value);
+                control_state.insert(k, value);
             }
         }
 
@@ -1857,7 +1945,7 @@ impl StateMachine for FullStateMachine {
         let snapshot = Snapshot {
             metadata,
             stream_entries,
-            auth_keys,
+            control_state,
             advisory,
             last_applied: self.last_applied.load(Ordering::Relaxed),
         };
@@ -1879,7 +1967,7 @@ impl StateMachine for FullStateMachine {
         })?;
 
         let stream_def = redb::TableDefinition::<&[u8], &[u8]>::new(self.stream_entries.name());
-        let auth_def = redb::TableDefinition::<&[u8], &[u8]>::new(self.auth_keys.name());
+        let control_def = redb::TableDefinition::<&[u8], &[u8]>::new(self.control_state.name());
 
         {
             write_txn
@@ -1919,19 +2007,19 @@ impl StateMachine for FullStateMachine {
                     .map_err(|e| super::RaftError::Storage(format!("insert stream_entry: {e}")))?;
             }
 
-            // Auth-key records — same clear-then-repopulate as
-            // stream_entries. Pre-auth-store snapshots carry an empty
+            // Cluster-control records — same clear-then-repopulate as
+            // stream_entries. Pre-control-store snapshots carry an empty
             // map (serde(default)), so the table ends up empty.
-            write_txn
-                .delete_table(auth_def)
-                .map_err(|e| super::RaftError::Storage(format!("delete auth_keys table: {e}")))?;
-            let mut auth_table = write_txn
-                .open_table(auth_def)
-                .map_err(|e| super::RaftError::Storage(format!("open auth_keys table: {e}")))?;
-            for (key, value) in &snapshot.auth_keys {
-                auth_table
+            write_txn.delete_table(control_def).map_err(|e| {
+                super::RaftError::Storage(format!("delete control_state table: {e}"))
+            })?;
+            let mut control_table = write_txn
+                .open_table(control_def)
+                .map_err(|e| super::RaftError::Storage(format!("open control_state table: {e}")))?;
+            for (key, value) in &snapshot.control_state {
+                control_table
                     .insert(key.as_bytes(), value.as_slice())
-                    .map_err(|e| super::RaftError::Storage(format!("insert auth_key: {e}")))?;
+                    .map_err(|e| super::RaftError::Storage(format!("insert control_state: {e}")))?;
             }
         }
 
@@ -3804,7 +3892,19 @@ mod tests {
         assert_eq!(sm.stream_tail(prefix).unwrap(), 3);
     }
 
-    /// ``PutAuthKey`` stores opaque record bytes; ``get_auth_key`` reads
+    /// Build a `PutControlState` for the `auth` namespace (an upsert), the shape
+    /// the auth store emits. Keeps the auth tests reading through the
+    /// `get_auth_key`/`list_auth_keys` (namespace `auth`) wrappers.
+    fn put_auth(key_hash: &str, record: Vec<u8>) -> Command {
+        Command::PutControlState {
+            namespace: contracts::CONTROL_NS_AUTH.to_string(),
+            key: key_hash.to_string(),
+            value: record,
+            if_absent: false,
+        }
+    }
+
+    /// ``PutControlState`` stores opaque record bytes; ``get_auth_key`` reads
     /// them back untouched — and the record NEVER appears in the
     /// file-metadata tree (different redb tree), which is the whole
     /// point of the dedicated store. This is the invariant the "auth
@@ -3816,14 +3916,7 @@ mod tests {
 
         let hash = "abc123deadbeef";
         let record: Vec<u8> = (0u8..=255).collect(); // opaque, non-proto bytes
-        sm.apply(
-            1,
-            &Command::PutAuthKey {
-                key_hash: hash.into(),
-                record: record.clone(),
-            },
-        )
-        .unwrap();
+        sm.apply(1, &put_auth(hash, record.clone())).unwrap();
 
         assert_eq!(sm.get_auth_key(hash).unwrap(), Some(record));
         // Not reachable through the file-metadata path: neither a
@@ -3834,28 +3927,71 @@ mod tests {
         assert!(sm.list_metadata("").unwrap().is_empty());
     }
 
-    /// ``DeleteAuthKey`` (revocation) removes the record.
+    /// ``DeleteControlState`` (revocation) removes the record.
     #[test]
     fn auth_key_delete_revokes() {
         let store = RedbStore::open_temporary().unwrap();
         let mut sm = FullStateMachine::new(&store).unwrap();
-        sm.apply(
-            1,
-            &Command::PutAuthKey {
-                key_hash: "h".into(),
-                record: b"rec".to_vec(),
-            },
-        )
-        .unwrap();
+        sm.apply(1, &put_auth("h", b"rec".to_vec())).unwrap();
         assert!(sm.get_auth_key("h").unwrap().is_some());
         sm.apply(
             2,
-            &Command::DeleteAuthKey {
-                key_hash: "h".into(),
+            &Command::DeleteControlState {
+                namespace: contracts::CONTROL_NS_AUTH.to_string(),
+                key: "h".to_string(),
             },
         )
         .unwrap();
         assert!(sm.get_auth_key("h").unwrap().is_none());
+    }
+
+    /// A CAS `PutControlState { if_absent: true }` is a log-ordered uniqueness
+    /// gate: the first write wins, a second under the same `(namespace, key)` is
+    /// refused (`CommandResult::Error`) without clobbering, while `if_absent:
+    /// false` upserts. Backs agent-name dedup + foreign-CA anchor re-pin
+    /// rejection.
+    #[test]
+    fn control_state_cas_put_if_absent_rejects_duplicate() {
+        let store = RedbStore::open_temporary().unwrap();
+        let mut sm = FullStateMachine::new(&store).unwrap();
+        let cas = |k: &str, v: &[u8]| Command::PutControlState {
+            namespace: contracts::CONTROL_NS_FOREIGN_CA.to_string(),
+            key: k.to_string(),
+            value: v.to_vec(),
+            if_absent: true,
+        };
+
+        // First pin wins.
+        assert!(matches!(
+            sm.apply(1, &cas("anchor-a", b"v1")).unwrap(),
+            CommandResult::Success
+        ));
+        // Re-pin of the same key is refused, and the stored value is untouched.
+        assert!(matches!(
+            sm.apply(2, &cas("anchor-a", b"v2")).unwrap(),
+            CommandResult::Error(_)
+        ));
+        assert_eq!(
+            sm.get_control_state(contracts::CONTROL_NS_FOREIGN_CA, "anchor-a")
+                .unwrap(),
+            Some(b"v1".to_vec())
+        );
+        // A non-CAS upsert overwrites.
+        sm.apply(
+            3,
+            &Command::PutControlState {
+                namespace: contracts::CONTROL_NS_FOREIGN_CA.to_string(),
+                key: "anchor-a".to_string(),
+                value: b"v3".to_vec(),
+                if_absent: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            sm.get_control_state(contracts::CONTROL_NS_FOREIGN_CA, "anchor-a")
+                .unwrap(),
+            Some(b"v3".to_vec())
+        );
     }
 
     /// ``list_auth_keys`` enumerates every stored record — backs the
@@ -3865,14 +4001,8 @@ mod tests {
         let store = RedbStore::open_temporary().unwrap();
         let mut sm = FullStateMachine::new(&store).unwrap();
         for (i, h) in ["h1", "h2", "h3"].iter().enumerate() {
-            sm.apply(
-                (i + 1) as u64,
-                &Command::PutAuthKey {
-                    key_hash: (*h).into(),
-                    record: format!("r{i}").into_bytes(),
-                },
-            )
-            .unwrap();
+            sm.apply((i + 1) as u64, &put_auth(h, format!("r{i}").into_bytes()))
+                .unwrap();
         }
         let mut listed: Vec<String> = sm
             .list_auth_keys()
@@ -3891,14 +4021,8 @@ mod tests {
     fn auth_key_survives_snapshot_restore() {
         let store = RedbStore::open_temporary().unwrap();
         let mut sm = FullStateMachine::new(&store).unwrap();
-        sm.apply(
-            1,
-            &Command::PutAuthKey {
-                key_hash: "snap".into(),
-                record: b"survives".to_vec(),
-            },
-        )
-        .unwrap();
+        sm.apply(1, &put_auth("snap", b"survives".to_vec()))
+            .unwrap();
         let bytes = sm.snapshot().unwrap();
 
         let store2 = RedbStore::open_temporary().unwrap();

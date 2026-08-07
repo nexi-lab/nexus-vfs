@@ -2018,32 +2018,97 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         tracing::info!("peer-blob client armed with cluster mTLS (ReadBlob over TLS)");
     }
 
+    // Control zone (B2): the single REPLICATED home for the cluster-control
+    // store (auth records + cross-org anchors), bound just below. The founder
+    // founds it sole-voter; a joiner joins as a LEARNER (auth is founder-centric
+    // — writes go to the founder, reads hit each node's local replica); a lone
+    // founder founds it solo. Headless — no VFS mount. Must be OPEN before the
+    // auth-store bind. Only with TLS (auth needs a CA); an auth-off node has no
+    // control zone and binds the store to per-node `root` exactly as before
+    // (no cluster, nothing to replicate). `ca-key.pem` is the founder signal
+    // (same as the mint path): present ⇒ found sole-voter, absent ⇒ enrolled
+    // joiner ⇒ learn. The learner join retries (`max_attempts`) so it self-heals
+    // the boot race where a joiner starts before the founder's control zone is up.
+    if !common.no_tls {
+        let is_founder = common.data_dir.join("tls").join("ca-key.pem").exists();
+        let zm_cz = zm.clone();
+        let self_addr_cz = self_address.clone();
+        let peers_cz = cli_peer_addrs.clone();
+        let control_zone = contracts::CONTROL_ZONE_ID.to_string();
+        tokio::task::spawn_blocking(move || {
+            let peers: &[NodeAddress] = if is_founder { &[] } else { &peers_cz };
+            nexus_raft::distributed_coordinator::bootstrap_or_join_zone(
+                zm_cz.as_ref(),
+                &control_zone,
+                node_id,
+                &self_addr_cz,
+                peers,
+                /* bootstrap_new */ is_founder,
+                /* max_attempts  */ if is_founder { None } else { Some(15) },
+                /* as_learner    */ !is_founder,
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("control-zone bring-up task panicked: {e}"))?
+        .map_err(|e| anyhow::anyhow!("bring up control zone: {e}"))?;
+        tracing::info!(
+            zone = %contracts::CONTROL_ZONE_ID,
+            founder = is_founder,
+            "control zone up — cluster-control store home (auth records + anchors)"
+        );
+    }
+
     // Auth-key store (Control-Plane HAL §3.B.3) + the cache eviction that
     // makes a revocation take effect without waiting out a TTL.
     //
-    // Bound to the ROOT zone's consensus: credentials are a cluster-wide
-    // namespace, so a key minted on one node has to resolve on every node,
-    // and it is the record's own zone grants — not the zone it happens to
-    // be stored in — that decide what it may reach.
+    // Bound to the CONTROL zone's consensus: credentials are a cluster-wide
+    // namespace, so a key minted on the founder must resolve on every node —
+    // the control zone is replicated to every member (founder voter + learners),
+    // whereas per-node `root` would silently give each node its own key space.
+    // Auth-off has no control zone, so it falls back to `root` (no cluster,
+    // nothing to replicate; `root` is always open, kernel-owned).
     //
-    // The store is bound REGARDLESS of the auth posture. It costs one Arc, the
-    // root zone always exists, and it is what lets `/__sys__/auth/keys/` answer
-    // and an operator mint keys on a daemon that is not yet authenticating —
-    // the usual order of operations when turning auth on for the first time.
-    // Only the cache-eviction observer is conditional, because only a provider
-    // has a cache.
+    // The store is bound REGARDLESS of the auth posture. It costs one Arc and is
+    // what lets `/__sys__/auth/keys/` answer and an operator mint keys on a
+    // daemon that is not yet authenticating — the usual order of operations when
+    // turning auth on for the first time. Only the cache-eviction observer is
+    // conditional, because only a provider has a cache.
     {
-        let root_zone = zm.get_zone(contracts::ROOT_ZONE_ID).ok_or_else(|| {
+        let auth_zone = if common.no_tls {
+            contracts::ROOT_ZONE_ID
+        } else {
+            contracts::CONTROL_ZONE_ID
+        };
+        let cred_zone = zm.get_zone(auth_zone).ok_or_else(|| {
             anyhow::anyhow!(
-                "root zone is not open — the credential store has no consensus to                  live in. This should be impossible: the kernel owns root                  unconditionally (see BootAction::needs_root_zone)."
+                "credential-store zone '{auth_zone}' is not open — cannot bind the auth key \
+                 store. The control zone is brought up just above (or `root`, kernel-owned, \
+                 under --no-tls)."
             )
         })?;
-        let consensus = root_zone.consensus_node();
+        let consensus = cred_zone.consensus_node();
         let store = nexus_raft::auth_key_store::RaftAuthKeyStore::new_arc(
             consensus.clone(),
-            root_zone.runtime_handle(),
+            cred_zone.runtime_handle(),
         );
-        kernel.set_auth_key_store(store);
+        kernel.set_auth_key_store(Arc::clone(&store));
+
+        // Arm the sk- MintKey/RevokeKey RPC on every auth-on node: the CLI dials
+        // the LOCAL daemon and the store write forwards to the control-zone
+        // leader, so `auth mint --subject-type user|service` / `revoke` work
+        // WITHOUT stopping the daemon (matching the agent path). Auth-off has no
+        // sk- plane — the slot stays empty and both RPCs return success=false.
+        if !common.no_tls {
+            if let Some(secret) = effective_api_key_secret(&common.data_dir.join("tls")) {
+                let minter: Arc<dyn nexus_raft::key_minter::KeyMinter> =
+                    Arc::new(DaemonKeyMinter {
+                        store: Arc::clone(&store),
+                        secret,
+                    });
+                *zm.key_minter_slot().write() = Some(minter);
+                tracing::info!("sk- MintKey/RevokeKey RPC armed (mint while the daemon is up)");
+            }
+        }
 
         match &api_key_auth {
             Some(provider) => {
@@ -2056,19 +2121,31 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
                 let provider_for_evict = Arc::clone(provider);
                 consensus.register_apply_observer(Arc::new(
                     move |entry: &nexus_raft::prelude::AppliedEntry| {
-                        let key_hash = match entry.command {
-                            nexus_raft::prelude::Command::PutAuthKey { key_hash, .. }
-                            | nexus_raft::prelude::Command::DeleteAuthKey { key_hash } => key_hash,
+                        // Evict the auth provider's cache only for AUTH-namespace
+                        // control records; a foreign-ca anchor put/delete on the
+                        // same command pair is not this provider's concern.
+                        let key_hash = match &entry.command {
+                            nexus_raft::prelude::Command::PutControlState {
+                                namespace,
+                                key,
+                                ..
+                            }
+                            | nexus_raft::prelude::Command::DeleteControlState { namespace, key }
+                                if namespace.as_str() == contracts::CONTROL_NS_AUTH =>
+                            {
+                                key
+                            }
                             _ => return,
                         };
                         provider_for_evict.invalidate(key_hash);
                     },
                 ));
-                tracing::info!("sk- API-key auth armed (credential store bound to the root zone)");
+                tracing::info!(zone = %auth_zone, "sk- API-key auth armed (credential store bound)");
             }
             None => {
                 tracing::info!(
-                    "credential store bound to the root zone; no auth provider is                      installed, so nothing resolves against it yet"
+                    zone = %auth_zone,
+                    "credential store bound; no auth provider installed, nothing resolves yet"
                 );
             }
         }
@@ -3294,46 +3371,80 @@ fn open_auth_store(
         )
     })?;
 
-    // Open ONLY the root zone. The credential store (`TREE_AUTH_KEYS`) lives in
-    // root, and root is SOLO — so loading it is all the mint needs. Loading the
-    // FEDERATED zones here would spin each up as a lone node with no reachable
-    // peers (the daemon is stopped); that node campaigns and mutates the zone's
-    // persisted term/vote, so the real daemon resumes DIVERGED and the founder
-    // loses quorum (`raft: proposal dropped`). Root-only keeps offline tooling
-    // out of federated raft entirely. See `ZoneLoadPolicy`.
+    // Which zone holds the credential store depends on the posture, and it must
+    // match what the daemon binds (B2):
+    //   * auth-on  → the replicated CONTROL zone, founder-founded sole-voter. An
+    //     offline mint here is the FOUNDER cold-start / DR path — safe because
+    //     the founder is the zone's only voter (no concurrent voter to diverge
+    //     against).
+    //   * auth-off → per-node `root` (no cluster, nothing to replicate); the
+    //     daemon binds root too under `--no-tls`.
+    // We open ONLY that one zone: loading the federated shares would spin each up
+    // as a lone node and mutate its term/vote so the real daemon resumes DIVERGED
+    // (the #24 hazard). See `ZoneLoadPolicy`.
     //
+    // Refuse offline auth on an ENROLLED JOINER — precisely `node.pem` present
+    // (a cluster-issued cert) AND `ca-key.pem` absent (not the CA holder). Such a
+    // node founding a control zone offline would split-brain the cluster's auth
+    // state, so it must forward to the live daemon instead. This is the SAME
+    // signal the `run_auth` intercept uses. A CA holder (`ca-key.pem` present)
+    // AND a fresh founder-to-be dir (neither file — `open_zone_manager`
+    // bootstraps its CA below) are BOTH allowed: the latter is a founder's
+    // legitimate cold-start (`auth mint` before the first daemon boot).
+    let auth_zone = if common.no_tls {
+        contracts::ROOT_ZONE_ID
+    } else {
+        let tls_dir = common.data_dir.join("tls");
+        let enrolled_joiner =
+            tls_dir.join("node.pem").exists() && !tls_dir.join("ca-key.pem").exists();
+        if enrolled_joiner {
+            return Err(anyhow::anyhow!(
+                "this node is an enrolled joiner (holds a node cert but not the cluster CA \
+                 key); offline `auth` cannot write cluster auth state here. Run the mint \
+                 against the live daemon (start it — the write forwards to the founder over \
+                 consensus), or run it on the founder."
+            ));
+        }
+        contracts::CONTROL_ZONE_ID
+    };
+
     // Offline tooling cannot open the data dir while the daemon holds its
     // exclusive redb lock — by far the dominant failure here — so name that
     // cause up front rather than leaking a raw redb/OS error.
     let ZoneManagerBundle { zm, .. } = open_zone_manager(
         common,
         None,
-        ZoneLoadPolicy::Only(vec![contracts::ROOT_ZONE_ID.to_string()]),
+        ZoneLoadPolicy::Only(vec![auth_zone.to_string()]),
     )
     .context(
         "offline `auth` could not open the data dir; if the daemon is running, \
          stop it first (it holds an exclusive lock)",
     )?;
-    if zm.get_zone(contracts::ROOT_ZONE_ID).is_none() {
-        zm.create_zone(contracts::ROOT_ZONE_ID, Vec::new())
-            .map_err(|e| anyhow::anyhow!("open root zone: {e}"))?;
+    // Found-on-demand as a SOLO voter: correct for both `root` (per-node, always
+    // solo) and the founder's control zone (founder = sole voter). Idempotent
+    // with a later daemon boot, which resumes the on-disk zone rather than
+    // re-founding it.
+    if zm.get_zone(auth_zone).is_none() {
+        zm.create_zone(auth_zone, Vec::new())
+            .map_err(|e| anyhow::anyhow!("open {auth_zone} zone: {e}"))?;
     }
-    let root = zm
-        .get_zone(contracts::ROOT_ZONE_ID)
-        .ok_or_else(|| anyhow::anyhow!("root zone did not open"))?;
+    let cred_zone = zm
+        .get_zone(auth_zone)
+        .ok_or_else(|| anyhow::anyhow!("{auth_zone} zone did not open"))?;
 
-    // Writes go through consensus, so this node has to be able to commit.
-    // Root is SOLO (one voter), so leadership is immediate -- but wait for it
-    // rather than race the campaign and fail with a confusing `not leader`.
-    if !root.wait_for_leader(std::time::Duration::from_secs(10)) {
+    // Writes go through consensus, so this node has to be able to commit. The
+    // zone is SOLO here (root per-node, or the founder's sole-voter control
+    // zone), so leadership is immediate -- but wait for it rather than race the
+    // campaign and fail with a confusing `not leader`.
+    if !cred_zone.wait_for_leader(std::time::Duration::from_secs(10)) {
         return Err(anyhow::anyhow!(
-            "root zone has no leader after 10s -- cannot commit a credential"
+            "{auth_zone} zone has no leader after 10s -- cannot commit a credential"
         ));
     }
 
     let store = nexus_raft::auth_key_store::RaftAuthKeyStore::new_arc(
-        root.consensus_node(),
-        root.runtime_handle(),
+        cred_zone.consensus_node(),
+        cred_zone.runtime_handle(),
     );
     Ok((zm, store, secret))
 }
@@ -3403,17 +3514,7 @@ impl nexus_raft::agent_minter::AgentMinter for FounderAgentMinter {
     ) -> std::result::Result<nexus_raft::agent_minter::AgentBundle, String> {
         // Gate: node-only. An agent cert carries no authorization, so a valid
         // agent cert must never be leverageable into minting more agents.
-        let der = caller_cert_der
-            .ok_or_else(|| "MintAgent requires an mTLS client certificate".to_string())?;
-        let peer = transport::peer_identity::from_der(&der)
-            .ok_or_else(|| "MintAgent: client certificate did not parse".to_string())?;
-        if peer.node_id.is_none() {
-            return Err(format!(
-                "MintAgent is a node-only operation; caller {} is not a cluster node \
-                 (an agent cert is a pure identity and cannot mint agents)",
-                peer.display_id(),
-            ));
-        }
+        gate_node_caller(caller_cert_der, "MintAgent")?;
 
         let ca_pem = std::fs::read(self.tls_dir.join("ca.pem"))
             .map_err(|e| format!("read {}/ca.pem: {e}", self.tls_dir.display()))?;
@@ -3445,6 +3546,130 @@ impl nexus_raft::agent_minter::AgentMinter for FounderAgentMinter {
             key_pem,
             ca_pem,
         })
+    }
+}
+
+/// Gate a control-plane mint RPC to a cluster NODE caller: the mTLS client leaf
+/// must parse to a node identity. Minting a credential (agent cert or sk- key)
+/// is a node/admin operation, so a bare agent cert — a pure identity — must
+/// never be leverageable into it. Shared by `FounderAgentMinter` and
+/// `DaemonKeyMinter` so both gates read identically.
+fn gate_node_caller(caller_cert_der: Option<Vec<u8>>, op: &str) -> std::result::Result<(), String> {
+    let der = caller_cert_der.ok_or_else(|| format!("{op} requires an mTLS client certificate"))?;
+    let peer = transport::peer_identity::from_der(&der)
+        .ok_or_else(|| format!("{op}: client certificate did not parse"))?;
+    if peer.node_id.is_none() {
+        return Err(format!(
+            "{op} is a node-only operation; caller {} is not a cluster node",
+            peer.display_id(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate + build an `sk-` (user/service) auth record from the raw mint
+/// params. The ONE place the subject-type parse, zone-grant parse, and the
+/// "no grants ⇒ refused" rule live — shared by the offline path
+/// (`run_auth_action`) and the live-daemon [`DaemonKeyMinter`], so they cannot
+/// drift. Rejects `agent` (cert-only, minted via [`FounderAgentMinter`]).
+fn build_sk_record(
+    subject_type: &str,
+    subject_id: String,
+    zones: &[String],
+    admin: bool,
+    expires_at_ms: Option<u64>,
+    name: String,
+) -> Result<auth::AuthKeyRecord> {
+    let subject_type = match subject_type {
+        "user" => auth::SubjectType::User,
+        "service" => auth::SubjectType::Service,
+        "agent" => {
+            return Err(anyhow::anyhow!(
+                "an agent's credential is a CA-signed cert, not an sk- key — mint it with \
+                 `--subject-type agent` (handled on the cert plane), not here"
+            ))
+        }
+        other => {
+            return Err(anyhow::anyhow!(
+                "--subject-type {other}: expected user, agent or service"
+            ))
+        }
+    };
+    let zone_perms = zones
+        .iter()
+        .map(|z| parse_zone_grant(z))
+        .collect::<Result<Vec<_>>>()?;
+    if zone_perms.is_empty() && !admin {
+        return Err(anyhow::anyhow!(
+            "a key with no zone grants reaches nothing and is refused at authentication \
+             time. Pass --zone ZONE:PERMS, or --admin for a global admin (the only \
+             principal allowed a zoneless key)."
+        ));
+    }
+    Ok(auth::AuthKeyRecord {
+        key_id: uuid_v4(),
+        name,
+        subject_type,
+        subject_id,
+        is_admin: admin,
+        revoked: false,
+        expires_at_ms,
+        zone_perms,
+    })
+}
+
+/// Live-daemon [`nexus_raft::key_minter::KeyMinter`]: mints / revokes `sk-`
+/// credentials against the running daemon's control-zone auth store, so
+/// `auth mint --subject-type user|service` and `auth revoke` work WITHOUT
+/// stopping the daemon. The write goes through consensus (the store's `put` /
+/// `delete` forwards to the control-zone leader), so an install on ANY auth-on
+/// node serves it. Node-cert gated (an admin op). Installed on every auth-on
+/// daemon (see the install block in `run_daemon`).
+struct DaemonKeyMinter {
+    store: Arc<dyn kernel::hal::auth_key_store::AuthKeyStore>,
+    secret: String,
+}
+
+#[tonic::async_trait]
+impl nexus_raft::key_minter::KeyMinter for DaemonKeyMinter {
+    async fn mint_key(
+        &self,
+        caller_cert_der: Option<Vec<u8>>,
+        params: nexus_raft::key_minter::MintKeyParams,
+    ) -> std::result::Result<String, String> {
+        gate_node_caller(caller_cert_der, "MintKey")?;
+        let expires_at_ms = if params.expires_at_ms == 0 {
+            None
+        } else {
+            Some(params.expires_at_ms)
+        };
+        let record = build_sk_record(
+            &params.subject_type,
+            params.subject_id,
+            &params.zones,
+            params.admin,
+            expires_at_ms,
+            params.name,
+        )
+        .map_err(|e| e.to_string())?;
+        let minted = auth::mint_key(&self.store, &self.secret, record, params.allow_existing)
+            .map_err(|e| e.to_string())?;
+        Ok(minted.key)
+    }
+
+    async fn revoke_key(
+        &self,
+        caller_cert_der: Option<Vec<u8>>,
+        key: Option<String>,
+        key_hash: Option<String>,
+    ) -> std::result::Result<bool, String> {
+        gate_node_caller(caller_cert_der, "RevokeKey")?;
+        match (key, key_hash) {
+            (Some(key), None) => auth::revoke_key(&self.store, &self.secret, &key),
+            (None, Some(hash)) => auth::revoke_key_hash(&self.store, &hash),
+            _ => return Err("revoke: pass exactly one of --key or --key-hash".to_string()),
+        }
+        .map_err(|e| e.to_string())
     }
 }
 
@@ -3480,12 +3705,55 @@ fn founder_candidate_endpoints(common: &CommonArgs) -> Result<Vec<String>> {
     Ok(parsed.into_iter().map(|p| p.endpoint).collect())
 }
 
-/// Forward an agent-cert mint to the founder (CA holder) over mTLS, for a node
-/// that does not hold the CA private key. The founder signs + records the agent
-/// (cluster-wide name uniqueness + audit live there); this node writes the
-/// returned bundle to `<data_dir>/agents/<subject_id>/`, byte-identical to a
-/// local mint. The joiner half of the just-works contract (task #40).
-async fn mint_agent_via_founder(common: &CommonArgs, action: &AuthCmd) -> Result<()> {
+/// This node's OWN daemon data-plane endpoint on loopback. Prepended to the mint
+/// candidates so an agent mint reaches the local daemon's `MintAgent` first — it
+/// is armed on a founder (so the founder mints via its own running daemon, no
+/// store lock) and declines on a joiner (falls through to a founder peer). The
+/// discriminator is thus daemon-reachability, not "do I hold the CA key".
+///
+/// The port is resolved from `effective_bind_addr` — the daemon's env or the
+/// `2126` default — a kubectl-style ops contract: run `auth` in the same
+/// environment the daemon booted with (`NEXUS_ADVERTISE_ADDR`/`NEXUS_BIND_ADDR`),
+/// or on the default port. If the daemon runs on a NON-default port and the CLI's
+/// env omits it, the self-dial misses and (for a CA holder) falls back to an
+/// offline sign, which then fails loud on the daemon's redb lock — never a silent
+/// wrong result. A runtime addr sidecar would drop even that env dependency, but
+/// the daemon's live listen addr is ephemeral runtime state that has no business
+/// in the persistent data dir (principle 5); the env contract is the deliberate
+/// trade.
+fn self_daemon_endpoint(common: &CommonArgs) -> Option<String> {
+    let bind = common.effective_bind_addr();
+    let port = bind
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())?;
+    Some(format!("https://127.0.0.1:{port}"))
+}
+
+/// How a forwarded agent mint ended, so `run_auth` can decide between surfacing
+/// the error and falling back to an offline cold-start sign.
+enum MintForwardError {
+    /// A CA-holder daemon was reached and authoritatively refused (name already
+    /// taken, caller not a node, `--zone`/`--admin` misuse). Never retried, never
+    /// fallen back — the answer is final.
+    Refused(String),
+    /// No CA-holder daemon was reachable (every candidate was unreachable or
+    /// replied "not the CA holder"). The caller MAY fall back to an offline sign
+    /// — but only if it holds the CA key itself (a founder at cold-start, daemon
+    /// down); otherwise this is terminal.
+    Unreachable(String),
+}
+
+/// Mint an agent cert through a live cluster daemon over mTLS: the local daemon
+/// first (armed on a founder → mints via itself, no store lock; declines on a
+/// joiner), then founder peers. The CA holder signs + records the agent through
+/// its running raft (cluster-wide name uniqueness + audit live there); this node
+/// writes the returned bundle to `<data_dir>/agents/<subject_id>/`, byte-
+/// identical to an offline local mint. Works whether or not THIS node's own
+/// daemon is up. See [`MintForwardError`] for how the outcome is classified.
+async fn mint_agent_via_founder(
+    common: &CommonArgs,
+    action: &AuthCmd,
+) -> std::result::Result<(), MintForwardError> {
     let AuthCmd::Mint {
         subject_id,
         zones,
@@ -3497,13 +3765,14 @@ async fn mint_agent_via_founder(common: &CommonArgs, action: &AuthCmd) -> Result
     else {
         unreachable!("mint_agent_via_founder called with a non-Mint action");
     };
-    // Same pure-identity refusal as the local agent-mint path — surfaced here so
-    // a joiner gets it too, before any RPC.
+    // Same pure-identity refusal as the local agent-mint path — an authoritative
+    // user error, surfaced before any RPC (never a fallback).
     if !zones.is_empty() || *admin {
-        return Err(anyhow::anyhow!(
+        return Err(MintForwardError::Refused(
             "an agent cert is a pure identity and carries no authorization; \
              --zone / --admin do not apply. Mint a --subject-type user or service \
              key for a principal that needs zone grants."
+                .to_string(),
         ));
     }
     let display_name = if name.is_empty() {
@@ -3512,30 +3781,33 @@ async fn mint_agent_via_founder(common: &CommonArgs, action: &AuthCmd) -> Result
         name.as_str()
     };
 
-    // The client identity is this node's cluster node cert; the founder's
-    // MintAgent gate requires a NODE caller. The caller (`run_auth`) only routes
-    // here from an ENROLLED joiner, so `node.pem` is present by construction.
-    let tls_dir = common.data_dir.join("tls");
-    let node_cert = tls_dir.join("node.pem");
-    let tls = nexus_raft::transport::TlsConfig {
-        cert_pem: std::fs::read(&node_cert)
-            .with_context(|| format!("read {}", node_cert.display()))?,
-        key_pem: std::fs::read(tls_dir.join("node-key.pem"))
-            .with_context(|| format!("read {}/node-key.pem", tls_dir.display()))?,
-        ca_pem: std::fs::read(tls_dir.join("ca.pem"))
-            .with_context(|| format!("read {}/ca.pem", tls_dir.display()))?,
-    };
+    // The client identity is this node's cluster node cert; the daemon's
+    // MintAgent gate requires a NODE caller. A read failure here is local
+    // misconfiguration, not "unreachable" — surface it (no offline fallback).
+    let tls =
+        load_node_tls(&common.data_dir).map_err(|e| MintForwardError::Refused(e.to_string()))?;
 
-    let endpoints = founder_candidate_endpoints(common)?;
-    if endpoints.is_empty() {
-        return Err(anyhow::anyhow!(
-            "no peers known to forward the agent mint to — pass --peers <founder> \
-             (this node holds no CA key, so it cannot sign agent certs itself)."
+    // Candidates: this node's own daemon first (loopback), then --peers ∪
+    // identity. A malformed --peers is a user error → Refused.
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(s) = self_daemon_endpoint(common) {
+        candidates.push(s);
+    }
+    for e in
+        founder_candidate_endpoints(common).map_err(|e| MintForwardError::Refused(e.to_string()))?
+    {
+        if !candidates.contains(&e) {
+            candidates.push(e);
+        }
+    }
+    if candidates.is_empty() {
+        return Err(MintForwardError::Unreachable(
+            "no local daemon or peer known to mint the agent through".to_string(),
         ));
     }
 
     let mut last_err = String::new();
-    for endpoint in &endpoints {
+    for endpoint in &candidates {
         match nexus_raft::transport::call_mint_agent_rpc(
             endpoint,
             subject_id,
@@ -3553,14 +3825,15 @@ async fn mint_agent_via_founder(common: &CommonArgs, action: &AuthCmd) -> Result
                     &result.agent_cert_pem,
                     &result.agent_key_pem,
                     &result.ca_pem,
-                )?;
+                )
+                .map_err(|e| MintForwardError::Refused(e.to_string()))?;
 
                 // The bundle directory on stdout alone, identical to the local
                 // path so `DIR=$(nexusd-cluster auth mint --subject-type agent
                 // NAME ...)` captures it on any node.
                 println!("{}", out_dir.display());
                 eprintln!(
-                    "minted agent cert subject=agent:{subject_id} via founder {endpoint} -> {}",
+                    "minted agent cert subject=agent:{subject_id} via {endpoint} -> {}",
                     out_dir.display()
                 );
                 eprintln!(
@@ -3569,18 +3842,17 @@ async fn mint_agent_via_founder(common: &CommonArgs, action: &AuthCmd) -> Result
                 return Ok(());
             }
             Ok(result) => {
-                // Reached a peer, but it refused. "does not hold the cluster CA"
-                // ⇒ not the founder, try the next; any other refusal (name taken,
-                // caller not a node, …) is authoritative — it came from the
-                // founder, so stop and surface it.
+                // Reached a daemon, but it refused. "does not hold the cluster CA"
+                // ⇒ not the CA holder, try the next; any other refusal (name
+                // taken, caller not a node, …) is authoritative — surface it.
                 let msg = result.error.unwrap_or_default();
                 if msg.contains("does not hold the cluster CA") {
                     last_err = format!("{endpoint}: {msg}");
                     continue;
                 }
-                return Err(anyhow::anyhow!(
-                    "founder {endpoint} refused agent mint: {msg}"
-                ));
+                return Err(MintForwardError::Refused(format!(
+                    "{endpoint} refused agent mint: {msg}"
+                )));
             }
             Err(e) => {
                 last_err = format!("{endpoint}: {e}");
@@ -3588,39 +3860,180 @@ async fn mint_agent_via_founder(common: &CommonArgs, action: &AuthCmd) -> Result
             }
         }
     }
-    Err(anyhow::anyhow!(
-        "could not mint agent via any known peer (last: {last_err}). The founder \
-         (CA holder) must be running and reachable at one of: {}",
-        endpoints.join(", ")
-    ))
+    Err(MintForwardError::Unreachable(format!(
+        "no reachable CA-holder daemon (last: {last_err}); tried: {}",
+        candidates.join(", ")
+    )))
+}
+
+/// Load this node's cluster node-cert TLS bundle (`node.pem` / `node-key.pem` /
+/// `ca.pem`) — the mTLS client identity the CLI presents when dialing a live
+/// daemon's node-cert-gated admin RPCs (`MintAgent` / `MintKey` / `RevokeKey`).
+/// Shared by every daemon-routed `auth` path.
+fn load_node_tls(data_dir: &std::path::Path) -> Result<nexus_raft::transport::TlsConfig> {
+    let tls_dir = data_dir.join("tls");
+    let read =
+        |p: std::path::PathBuf| std::fs::read(&p).with_context(|| format!("read {}", p.display()));
+    Ok(nexus_raft::transport::TlsConfig {
+        cert_pem: read(tls_dir.join("node.pem"))?,
+        key_pem: read(tls_dir.join("node-key.pem"))?,
+        ca_pem: read(tls_dir.join("ca.pem"))?,
+    })
+}
+
+/// Outcome of trying an `sk-` mint/revoke against the LOCAL live daemon.
+enum DaemonOutcome {
+    /// The daemon handled it (success already printed).
+    Handled,
+    /// The local daemon was unreachable — the caller may fall back to the
+    /// offline path (founder cold-start). Carries context for logging.
+    Unreachable(String),
+}
+
+/// Route an `sk-` mint / revoke through this node's LIVE daemon over loopback
+/// mTLS (`MintKey` / `RevokeKey`). The daemon HMACs + writes through consensus
+/// (the write forwards to the control-zone leader), so it works on any auth-on
+/// node without stopping the daemon. `Err` = the daemon reached us and refused
+/// authoritatively (never fall back); `Ok(Unreachable)` = no daemon (fall back
+/// to offline). Dials the local daemon only — propose-forwarding reaches the
+/// leader, so no founder discovery is needed for the sk- plane.
+async fn sk_via_daemon(common: &CommonArgs, action: &AuthCmd) -> Result<DaemonOutcome> {
+    let tls = load_node_tls(&common.data_dir)?;
+    let endpoint = self_daemon_endpoint(common)
+        .ok_or_else(|| anyhow::anyhow!("cannot derive the local daemon endpoint from bind addr"))?;
+    match action {
+        AuthCmd::Mint {
+            subject_type,
+            subject_id,
+            zones,
+            admin,
+            expires_in_days,
+            name,
+            allow_existing,
+        } => {
+            let expires_at_ms = expires_in_days
+                .map(|days| {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    now_ms + days * 24 * 60 * 60 * 1000
+                })
+                .unwrap_or(0);
+            let args = nexus_raft::transport::MintKeyArgs {
+                subject_type,
+                subject_id,
+                zones: zones.clone(),
+                admin: *admin,
+                expires_at_ms,
+                name,
+                allow_existing: *allow_existing,
+            };
+            match nexus_raft::transport::call_mint_key_rpc(&endpoint, args, Some(tls), 15).await {
+                Ok(Ok(key)) => {
+                    // The one moment the key exists in the clear — stdout alone,
+                    // so `KEY=$(nexusd-cluster auth mint ...)` captures it.
+                    println!("{key}");
+                    eprintln!("minted sk- key via the local daemon {endpoint} (replicated to the cluster control zone)");
+                    eprintln!("This key will not be shown again - it is stored only as an HMAC.");
+                    Ok(DaemonOutcome::Handled)
+                }
+                Ok(Err(msg)) => Err(anyhow::anyhow!("{endpoint} refused mint: {msg}")),
+                Err(e) => Ok(DaemonOutcome::Unreachable(format!("{endpoint}: {e}"))),
+            }
+        }
+        AuthCmd::Revoke { key, key_hash, .. } => {
+            match nexus_raft::transport::call_revoke_key_rpc(
+                &endpoint,
+                key.clone(),
+                key_hash.clone(),
+                Some(tls),
+                15,
+            )
+            .await
+            {
+                Ok(Ok(removed)) => {
+                    println!(
+                        "{}",
+                        if removed {
+                            "revoked"
+                        } else {
+                            "no such key (already revoked?)"
+                        }
+                    );
+                    Ok(DaemonOutcome::Handled)
+                }
+                Ok(Err(msg)) => Err(anyhow::anyhow!("{endpoint} refused revoke: {msg}")),
+                Err(e) => Ok(DaemonOutcome::Unreachable(format!("{endpoint}: {e}"))),
+            }
+        }
+        _ => unreachable!("sk_via_daemon called with a non-Mint/Revoke action"),
+    }
 }
 
 async fn run_auth(common: CommonArgs, action: AuthCmd) -> Result<()> {
-    // Remote agent-cert mint (task #40): an ENROLLED joiner cannot sign an agent
-    // cert locally (it holds a cluster-issued `node.pem` but not the CA key), so
-    // it forwards the mint to the founder over mTLS instead of failing — making
-    // `auth mint --subject-type agent NAME` just-work on ANY node, not only the
-    // founder. This dials a single RPC (no local store / ZoneManager), so it runs
-    // HERE in the async context (not the blocking pool) and works even while the
-    // node's own daemon holds the redb data-dir lock.
+    // Agent-cert mint (task #40): route through a LIVE cluster daemon whenever
+    // one is reachable, so `auth mint --subject-type agent NAME` just-works on
+    // ANY enrolled node — founder or joiner — regardless of whether the local
+    // daemon is up. The discriminator is daemon-reachability, NOT "do I hold the
+    // CA key": `mint_agent_via_founder` tries this node's own daemon first (armed
+    // on a founder → mints via itself with no store lock; declines on a joiner)
+    // then founder peers. It dials RPCs only (no local store / ZoneManager), so
+    // it runs HERE in the async context and never contends the redb lock.
     //
-    // The enrolled-joiner signal is precise — `node.pem` present, `ca-key.pem`
-    // absent — so it forwards ONLY when a founder must be consulted:
-    //   - CA holder (`ca-key.pem` present) → local sign (falls through below).
-    //   - Fresh/unenrolled dir (neither file) → falls through to the local path,
-    //     where `open_zone_manager` bootstraps this node's own CA as a
-    //     founder-to-be. Routing that to a founder would be wrong (there isn't
-    //     one), so it must NOT be captured here.
-    //   - Auth-off (`--no-tls`) → no mTLS to dial → falls through.
-    if let AuthCmd::Mint { subject_type, .. } = &action {
-        let tls_dir = common.data_dir.join("tls");
-        if subject_type == "agent"
-            && !common.no_tls
-            && tls_dir.join("node.pem").exists()
-            && !tls_dir.join("ca-key.pem").exists()
-        {
-            return mint_agent_via_founder(&common, &action).await;
+    // Only an ENROLLED node (has a cluster-issued `node.pem`) can present the
+    // node identity the mint gate requires, so a fresh/unenrolled dir (no
+    // node.pem) and an auth-off (`--no-tls`) node fall through to the offline
+    // path, where `open_zone_manager` bootstraps this node's own CA as a
+    // founder-to-be. `ca-key.pem` is no longer a routing input — it only decides
+    // whether an UNREACHABLE forward may fall back to an offline cold-start sign
+    // (legal solely for the CA holder, and only while no daemon is up).
+    let enrolled = !common.no_tls && common.data_dir.join("tls").join("node.pem").exists();
+    let has_ca_key = common.data_dir.join("tls").join("ca-key.pem").exists();
+    match &action {
+        // Agent-cert mint: try the daemon (self → founder peers), else offline
+        // cold-start sign (CA holder only).
+        AuthCmd::Mint { subject_type, .. } if subject_type == "agent" && enrolled => {
+            match mint_agent_via_founder(&common, &action).await {
+                Ok(()) => return Ok(()),
+                Err(MintForwardError::Refused(msg)) => return Err(anyhow::anyhow!("{msg}")),
+                Err(MintForwardError::Unreachable(ctx)) => {
+                    if has_ca_key {
+                        tracing::info!(
+                            reason = %ctx,
+                            "no reachable cluster daemon; signing the agent offline as the CA holder (cold-start)"
+                        );
+                        // fall through to the offline path
+                    } else {
+                        return Err(anyhow::anyhow!(
+                            "{ctx}; and this node holds no CA key to sign the agent offline"
+                        ));
+                    }
+                }
+            }
         }
+        // sk- (user/service) mint + sk- revoke: route through the LOCAL daemon
+        // (the write forwards to the control-zone leader), so it works without
+        // stopping the daemon. Unreachable ⇒ fall back to the offline path
+        // (founder cold-start; a joiner is refused there). Agent revoke
+        // (`--agent`) is CRL-file-based and handled offline below.
+        AuthCmd::Mint { subject_type, .. } if subject_type != "agent" && enrolled => {
+            match sk_via_daemon(&common, &action).await? {
+                DaemonOutcome::Handled => return Ok(()),
+                DaemonOutcome::Unreachable(ctx) => {
+                    tracing::info!(reason = %ctx, "no reachable local daemon; minting sk- key offline");
+                }
+            }
+        }
+        AuthCmd::Revoke { agent: None, .. } if enrolled => {
+            match sk_via_daemon(&common, &action).await? {
+                DaemonOutcome::Handled => return Ok(()),
+                DaemonOutcome::Unreachable(ctx) => {
+                    tracing::info!(reason = %ctx, "no reachable local daemon; revoking sk- key offline");
+                }
+            }
+        }
+        _ => {}
     }
 
     // The offline `auth` subcommand builds a ZoneManager, which owns a nested
@@ -3846,29 +4259,17 @@ fn run_auth_action(
                 return Ok(());
             }
 
-            // The `sk-` token plane: user / service keys. A key with no zone
-            // grants reaches nothing, so require at least one (or --admin).
-            let zone_perms = zones
-                .iter()
-                .map(|z| parse_zone_grant(z))
-                .collect::<Result<Vec<_>>>()?;
-            if zone_perms.is_empty() && !admin {
-                return Err(anyhow::anyhow!(
-                    "a key with no zone grants reaches nothing and is refused at \
-                     authentication time. Pass --zone ZONE:PERMS, or --admin for a \
-                     global admin (the only principal allowed a zoneless key)."
-                ));
-            }
-            let record = auth::AuthKeyRecord {
-                key_id: uuid_v4(),
-                name,
-                subject_type,
+            // The `sk-` token plane: user / service keys. Built through the same
+            // `build_sk_record` the live-daemon `DaemonKeyMinter` uses, so the
+            // offline and daemon-up paths validate + shape the record identically.
+            let record = build_sk_record(
+                subject_type.as_str(),
                 subject_id,
-                is_admin: admin,
-                revoked: false,
+                &zones,
+                admin,
                 expires_at_ms,
-                zone_perms,
-            };
+                name,
+            )?;
 
             let minted = auth::mint_key(store, secret, record, allow_existing)
                 .map_err(|e| anyhow::anyhow!("mint: {e}"))?;

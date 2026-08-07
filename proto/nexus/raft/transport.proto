@@ -122,6 +122,19 @@ service ZoneApiService {
   // key returns success=false. Reuses the same generate + authz units as the
   // local `auth mint`, run against the founder's live CA + auth store.
   rpc MintAgent(MintAgentRequest) returns (MintAgentResponse);
+
+  // MintKey mints an `sk-` user/service credential through the live daemon, so
+  // `auth mint --subject-type user|service` just-works while the daemon holds
+  // the store lock (no "stop the daemon first"). The daemon HMACs the key with
+  // its cluster secret and writes the record via consensus (propose forwards to
+  // the control-zone leader), so it works on any node. mTLS-gated to a NODE peer
+  // (an admin op, never an agent). Returns the one-time plaintext key.
+  rpc MintKey(MintKeyRequest) returns (MintKeyResponse);
+
+  // RevokeKey removes an `sk-` credential (by key or key-hash) through the live
+  // daemon — the delete forwards to the control-zone leader. Same node-cert gate
+  // as MintKey.
+  rpc RevokeKey(RevokeKeyRequest) returns (RevokeKeyResponse);
 }
 
 // NodeEnrollmentService is the pre-mTLS BOOTSTRAP plane: the one surface a
@@ -310,6 +323,48 @@ message MintAgentResponse {
   bytes agent_cert_pem = 3;
   bytes agent_key_pem = 4;
   bytes ca_pem = 5;
+}
+
+// MintKeyRequest asks the daemon to mint an `sk-` user/service credential.
+message MintKeyRequest {
+  // "user" or "service" — the sk- token plane (agents use MintAgent instead).
+  string subject_type = 1;
+  // The principal id bound into the record.
+  string subject_id = 2;
+  // Zone grants as `zone:perms` (e.g. `sharedzone:rw`); may be empty if admin.
+  repeated string zones = 3;
+  // Global admin (the only principal allowed a zoneless key).
+  bool admin = 4;
+  // Optional expiry, milliseconds since epoch (0 = never).
+  uint64 expires_at_ms = 5;
+  // Human-friendly display label.
+  string name = 6;
+  // Rotation escape: mint even if the subject already holds an active key.
+  bool allow_existing = 7;
+}
+
+// MintKeyResponse carries the one-time plaintext key, or an error.
+message MintKeyResponse {
+  bool success = 1;
+  optional string error = 2;
+  // The `sk-...` key, shown once. Empty on failure.
+  string key = 3;
+}
+
+// RevokeKeyRequest removes an sk- credential by its key or key-hash (exactly
+// one set).
+message RevokeKeyRequest {
+  optional string key = 1;
+  optional string key_hash = 2;
+}
+
+// RevokeKeyResponse reports whether a record was removed.
+message RevokeKeyResponse {
+  bool success = 1;
+  optional string error = 2;
+  // True if a record was present and removed; false if there was nothing to
+  // revoke (already gone).
+  bool removed = 3;
 }
 
 // DeleteZoneRequest asks a peer to remove its local zone replica.

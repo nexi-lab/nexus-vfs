@@ -19,39 +19,34 @@
 //!
 //! Unlike `ZoneMetaStore` there is **no path translation and no zone
 //! scoping of the key space**: a `key_hash` is a global identity, not a
-//! VFS path. Construct this against the **root zone's** consensus so the
-//! whole cluster shares one auth namespace — see [`RaftAuthKeyStore::new`].
+//! VFS path.
+//!
+//! This is a typed thin wrapper over [`crate::control_state_store::ControlStateStore`]
+//! (namespace [`contracts::CONTROL_NS_AUTH`]) — the propose + read-your-writes +
+//! read boilerplate lives there once, shared with the cross-org foreign-CA anchor
+//! registry (`CONTROL_NS_FOREIGN_CA`). Construct against the **control zone's**
+//! consensus so the whole cluster shares one auth namespace (the control zone is
+//! replicated to every member; per-node `root` would give each node its own key
+//! space).
 
 use std::sync::Arc;
 
 use kernel::hal::auth_key_store::{AuthKeyStore, AuthKeyStoreError};
 
-use crate::prelude::{Command, CommandResult, FullStateMachine, ZoneConsensus};
-use crate::runtime_bridge::bridge_block_on;
+use crate::control_state_store::ControlStateStore;
+use crate::prelude::{FullStateMachine, ZoneConsensus};
 
-/// How long `put` waits for its own write to become visible in the
-/// local state machine before returning (read-your-writes). Matches the
-/// budget `ZoneMetaStore::put` uses. Key minting is admin tooling, never
-/// a hot path, so paying this is free in practice.
-const READ_YOUR_WRITES_POLL_MS: u64 = 500;
-
-/// Raft-backed store for the API-key records in `TREE_AUTH_KEYS`.
+/// Raft-backed `AuthKeyStore` — the `CONTROL_NS_AUTH` view of the control store.
 pub struct RaftAuthKeyStore {
-    node: ZoneConsensus<FullStateMachine>,
-    runtime: tokio::runtime::Handle,
+    inner: ControlStateStore,
 }
 
 impl RaftAuthKeyStore {
-    /// Construct from a running `ZoneConsensus` + its tokio runtime.
-    ///
-    /// `node` must be the **root zone's** consensus. Credentials are a
-    /// cluster-wide namespace: a key minted on one node has to resolve
-    /// on every node, and the record's own `zones` grants — not the zone
-    /// the record happens to be stored in — decide what it may reach.
-    /// Binding this to a per-share zone instead would silently give each
-    /// zone its own key namespace.
+    /// Construct from the control zone's running `ZoneConsensus` + its runtime.
     pub fn new(node: ZoneConsensus<FullStateMachine>, runtime: tokio::runtime::Handle) -> Self {
-        Self { node, runtime }
+        Self {
+            inner: ControlStateStore::new(node, runtime, contracts::CONTROL_NS_AUTH),
+        }
     }
 
     /// Return an `Arc<dyn AuthKeyStore>` ready to inject into the auth
@@ -62,94 +57,46 @@ impl RaftAuthKeyStore {
     ) -> Arc<dyn AuthKeyStore> {
         Arc::new(Self::new(node, runtime))
     }
-
-    /// Read one record straight off the locally-applied state machine.
-    fn read(&self, key_hash: &str) -> Result<Option<Vec<u8>>, AuthKeyStoreError> {
-        let key = key_hash.to_string();
-        let fut = self
-            .node
-            .with_state_machine(move |sm: &FullStateMachine| sm.get_auth_key(&key));
-        bridge_block_on(&self.runtime, fut)
-            .map_err(|e| AuthKeyStoreError::Backend(format!("get_auth_key({key_hash}): {e}")))
-    }
-
-    /// Propose `command` and surface a state-machine rejection as an
-    /// error — a write the cluster refused must never read as success.
-    fn propose(&self, command: Command, what: &str) -> Result<(), AuthKeyStoreError> {
-        let result = bridge_block_on(&self.runtime, self.node.propose(command))
-            .map_err(|e| AuthKeyStoreError::Backend(format!("{what}: {e}")))?;
-        match result {
-            CommandResult::Error(e) => {
-                Err(AuthKeyStoreError::Backend(format!("{what} rejected: {e}")))
-            }
-            _ => Ok(()),
-        }
-    }
 }
 
+// Pure delegation to the shared layer, `#[inline]` so the wrapper is zero-cost;
+// the only work here is mapping the store's `String` error into the HAL type.
 impl AuthKeyStore for RaftAuthKeyStore {
+    #[inline]
     fn get(&self, key_hash: &str) -> Result<Option<Vec<u8>>, AuthKeyStoreError> {
-        self.read(key_hash)
+        self.inner.get(key_hash).map_err(AuthKeyStoreError::Backend)
     }
 
+    #[inline]
     fn put(&self, key_hash: &str, record: &[u8]) -> Result<(), AuthKeyStoreError> {
-        let expected = record.to_vec();
-        self.propose(
-            Command::PutAuthKey {
-                key_hash: key_hash.to_string(),
-                record: expected.clone(),
-            },
-            &format!("put({key_hash})"),
-        )?;
-        // Read-your-writes: `propose` returns on commit, but the local
-        // apply can lag it by up to a raft tick (always on a follower,
-        // whose proposal was forwarded). Admin tooling that mints a key
-        // and immediately lists must not see its own write missing.
-        // SSOT stays the raft state machine — we only wait for it.
-        let runtime = self.runtime.clone();
-        let node = self.node.clone();
-        let key = key_hash.to_string();
-        let _ = self.node.wait_until(
-            || {
-                let poll_key = key.clone();
-                let observed = bridge_block_on(
-                    &runtime,
-                    node.with_state_machine(move |sm: &FullStateMachine| {
-                        sm.get_auth_key(&poll_key)
-                    }),
-                );
-                matches!(&observed, Ok(Some(bytes)) if *bytes == expected)
-            },
-            READ_YOUR_WRITES_POLL_MS,
-        );
-        Ok(())
+        // AuthKeyStore::put is an upsert (rotation replaces a record in place);
+        // the CAS `put_if_absent` is reserved for callers enforcing name
+        // uniqueness (agent mint).
+        self.inner
+            .put(key_hash, record)
+            .map_err(AuthKeyStoreError::Backend)
     }
 
-    /// Revoke a record.
-    ///
-    /// The bool reports whether a record was present **at propose time**,
-    /// read off this node's state machine. It is advisory: the delete
-    /// itself is idempotent and the raft log is authoritative, so a
-    /// concurrent revocation elsewhere can make a `true` racy. Callers
-    /// use it to tell "revoked something" from "there was nothing to
-    /// revoke" in an operator message, never to gate a security decision.
+    #[inline]
+    fn put_if_absent(&self, key_hash: &str, record: &[u8]) -> Result<bool, AuthKeyStoreError> {
+        // The real, log-ordered CAS (overrides the trait's get-then-put default):
+        // the state machine rejects a duplicate at apply, so two nodes minting
+        // one agent name can never both win.
+        self.inner
+            .put_if_absent(key_hash, record)
+            .map_err(AuthKeyStoreError::Backend)
+    }
+
+    #[inline]
     fn delete(&self, key_hash: &str) -> Result<bool, AuthKeyStoreError> {
-        let existed = self.read(key_hash)?.is_some();
-        self.propose(
-            Command::DeleteAuthKey {
-                key_hash: key_hash.to_string(),
-            },
-            &format!("delete({key_hash})"),
-        )?;
-        Ok(existed)
+        self.inner
+            .delete(key_hash)
+            .map_err(AuthKeyStoreError::Backend)
     }
 
+    #[inline]
     fn list(&self) -> Result<Vec<(String, Vec<u8>)>, AuthKeyStoreError> {
-        let fut = self
-            .node
-            .with_state_machine(|sm: &FullStateMachine| sm.list_auth_keys());
-        bridge_block_on(&self.runtime, fut)
-            .map_err(|e| AuthKeyStoreError::Backend(format!("list_auth_keys: {e}")))
+        self.inner.list().map_err(AuthKeyStoreError::Backend)
     }
 }
 
@@ -245,7 +192,7 @@ mod tests {
             "hash-a",
             "/hash-a",
             "/__sys__/auth/keys/hash-a",
-            "/sm_auth_keys/hash-a",
+            "/sm_control_state/hash-a",
         ] {
             assert!(
                 files.get(spelling).expect("metastore get").is_none(),

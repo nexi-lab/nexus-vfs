@@ -17,15 +17,17 @@ use super::proto::nexus::raft::{
     GetClusterInfoResponse, GetCrlRequest, GetCrlResponse, GetMetadataResult,
     GetSearchCapabilitiesRequest, JoinClusterRequest, JoinClusterResponse, JoinZoneRequest,
     JoinZoneResponse, ListMetadataResult, LockInfoResult, LockResult, MintAgentRequest,
-    MintAgentResponse, NodeInfo as ProtoNodeInfo, ProposeRequest, ProposeResponse, QueryRequest,
-    QueryResponse, RaftCommand, RaftQueryResponse, RaftResponse, ReadBlobRequest, ReadBlobResponse,
-    RemoveVoterRequest, RemoveVoterResponse, ReplicateEntriesRequest, ReplicateEntriesResponse,
+    MintAgentResponse, MintKeyRequest, MintKeyResponse, NodeInfo as ProtoNodeInfo, ProposeRequest,
+    ProposeResponse, QueryRequest, QueryResponse, RaftCommand, RaftQueryResponse, RaftResponse,
+    ReadBlobRequest, ReadBlobResponse, RemoveVoterRequest, RemoveVoterResponse,
+    ReplicateEntriesRequest, ReplicateEntriesResponse, RevokeKeyRequest, RevokeKeyResponse,
     SearchCapabilities, SnapshotEcStateRequest, SnapshotEcStateResponse, StepMessageRequest,
     StepMessageResponse,
 };
 use super::{NodeAddress, Result, SharedPeerMap, TransportError};
 use crate::agent_minter::AgentMinterSlot;
 use crate::blob_fetcher::BlobFetcherSlot;
+use crate::key_minter::{KeyMinterSlot, MintKeyParams};
 use crate::raft::{
     reconcile_peers_with_conf_state, Command, CommandResult, FullStateMachine, RaftError,
     WitnessStateMachine, ZoneConsensus, ZoneRaftRegistry,
@@ -85,6 +87,10 @@ pub struct RaftGrpcServer {
     /// (CA holder) at boot. `None` on a joiner — `MintAgent` returns
     /// success=false there ("not the CA holder").
     agent_minter_slot: Option<AgentMinterSlot>,
+    /// Slot the cluster profile binds a `KeyMinter` into on every auth-on
+    /// daemon at boot. `None` under `--no-tls` — `MintKey`/`RevokeKey` return
+    /// success=false there (auth-off has no sk- plane).
+    key_minter_slot: Option<KeyMinterSlot>,
     /// Additional gRPC services co-hosted on the same port.
     /// Constructed externally (e.g. VFS gRPC by the cluster binary)
     /// and passed in as type-erased `tonic::service::Routes` so this
@@ -99,6 +105,7 @@ impl RaftGrpcServer {
             registry,
             blob_fetcher_slot: None,
             agent_minter_slot: None,
+            key_minter_slot: None,
             extra_services: None,
         }
     }
@@ -117,6 +124,14 @@ impl RaftGrpcServer {
     /// the CA holder; a joiner leaves it empty and rejects `MintAgent`.
     pub fn with_agent_minter_slot(mut self, slot: AgentMinterSlot) -> Self {
         self.agent_minter_slot = Some(slot);
+        self
+    }
+
+    /// Attach the late-bindable `KeyMinter` slot so `ZoneApiService::mint_key` /
+    /// `revoke_key` can mint/revoke sk- credentials once the daemon installs an
+    /// impl. Installed on every auth-on node; left empty under `--no-tls`.
+    pub fn with_key_minter_slot(mut self, slot: KeyMinterSlot) -> Self {
+        self.key_minter_slot = Some(slot);
         self
     }
 
@@ -154,6 +169,7 @@ impl RaftGrpcServer {
             registry: self.registry.clone(),
             blob_fetcher_slot: self.blob_fetcher_slot.clone(),
             agent_minter_slot: self.agent_minter_slot.clone(),
+            key_minter_slot: self.key_minter_slot.clone(),
         };
 
         let mut builder =
@@ -214,6 +230,7 @@ impl RaftGrpcServer {
             registry: self.registry.clone(),
             blob_fetcher_slot: self.blob_fetcher_slot.clone(),
             agent_minter_slot: self.agent_minter_slot.clone(),
+            key_minter_slot: self.key_minter_slot.clone(),
         };
 
         let mut builder =
@@ -692,6 +709,18 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
 // ZoneApiService (client-facing: Propose/Query/GetClusterInfo)
 // =============================================================================
 
+/// The caller's verified mTLS client leaf cert (DER), or `None` for a plaintext
+/// connection / no client cert. Forwarded opaquely to the mint impls, which gate
+/// on it (a NODE peer). Shared by `mint_agent` / `mint_key` / `revoke_key` so the
+/// extraction lives once.
+fn peer_cert_der<T>(request: &Request<T>) -> Option<Vec<u8>> {
+    request
+        .extensions()
+        .get::<tonic::transport::server::TlsConnectInfo<tonic::transport::server::TcpConnectInfo>>()
+        .and_then(|tls| tls.peer_certs())
+        .and_then(|certs| certs.first().map(|c| c.as_ref().to_vec()))
+}
+
 /// Zone-routed implementation of the ZoneApiService gRPC trait.
 ///
 /// This is the strict-mTLS DATA plane. Node enrollment (cert provisioning) is
@@ -706,6 +735,9 @@ struct ZoneApiServiceImpl {
     /// Optional late-bound `AgentMinter` for `MintAgent`. Present only on the
     /// CA holder (founder); `None` → `mint_agent` returns success=false.
     agent_minter_slot: Option<AgentMinterSlot>,
+    /// Optional late-bound `KeyMinter` for `MintKey`/`RevokeKey`. Present on
+    /// every auth-on daemon; `None` (auth-off) → both return success=false.
+    key_minter_slot: Option<KeyMinterSlot>,
 }
 
 #[tonic::async_trait]
@@ -1465,13 +1497,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
         &self,
         request: Request<MintAgentRequest>,
     ) -> std::result::Result<Response<MintAgentResponse>, Status> {
-        let caller_cert_der = request
-            .extensions()
-            .get::<tonic::transport::server::TlsConnectInfo<
-                tonic::transport::server::TcpConnectInfo,
-            >>()
-            .and_then(|tls| tls.peer_certs())
-            .and_then(|certs| certs.first().map(|c| c.as_ref().to_vec()));
+        let caller_cert_der = peer_cert_der(&request);
         let req = request.into_inner();
         let err_resp = |msg: String| {
             Response::new(MintAgentResponse {
@@ -1507,6 +1533,83 @@ impl ZoneApiService for ZoneApiServiceImpl {
                 agent_cert_pem: bundle.cert_pem,
                 agent_key_pem: bundle.key_pem,
                 ca_pem: bundle.ca_pem,
+            })),
+            Err(e) => Ok(err_resp(e)),
+        }
+    }
+
+    async fn mint_key(
+        &self,
+        request: Request<MintKeyRequest>,
+    ) -> std::result::Result<Response<MintKeyResponse>, Status> {
+        let caller_cert_der = peer_cert_der(&request);
+        let req = request.into_inner();
+        let err_resp = |msg: String| {
+            Response::new(MintKeyResponse {
+                success: false,
+                error: Some(msg),
+                key: String::new(),
+            })
+        };
+        let minter = self
+            .key_minter_slot
+            .as_ref()
+            .and_then(|slot| slot.read().as_ref().cloned());
+        let Some(minter) = minter else {
+            return Ok(err_resp(
+                "this node has no sk- key plane (auth-off); mint against an auth-on cluster"
+                    .to_string(),
+            ));
+        };
+        let params = MintKeyParams {
+            subject_type: req.subject_type,
+            subject_id: req.subject_id,
+            zones: req.zones,
+            admin: req.admin,
+            expires_at_ms: req.expires_at_ms,
+            name: req.name,
+            allow_existing: req.allow_existing,
+        };
+        match minter.mint_key(caller_cert_der, params).await {
+            Ok(key) => Ok(Response::new(MintKeyResponse {
+                success: true,
+                error: None,
+                key,
+            })),
+            Err(e) => Ok(err_resp(e)),
+        }
+    }
+
+    async fn revoke_key(
+        &self,
+        request: Request<RevokeKeyRequest>,
+    ) -> std::result::Result<Response<RevokeKeyResponse>, Status> {
+        let caller_cert_der = peer_cert_der(&request);
+        let req = request.into_inner();
+        let err_resp = |msg: String| {
+            Response::new(RevokeKeyResponse {
+                success: false,
+                error: Some(msg),
+                removed: false,
+            })
+        };
+        let minter = self
+            .key_minter_slot
+            .as_ref()
+            .and_then(|slot| slot.read().as_ref().cloned());
+        let Some(minter) = minter else {
+            return Ok(err_resp(
+                "this node has no sk- key plane (auth-off)".to_string(),
+            ));
+        };
+        match minter
+            .revoke_key(caller_cert_der, req.key, req.key_hash)
+            .await
+        {
+            Ok(removed) => Ok(Response::new(RevokeKeyResponse {
+                success: true,
+                error: None,
+                removed,
             })),
             Err(e) => Ok(err_resp(e)),
         }
