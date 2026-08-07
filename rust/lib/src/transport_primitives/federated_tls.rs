@@ -62,6 +62,13 @@ fn build_webpki(
     cluster_ca_der: &[u8],
     foreign_cas: &[Vec<u8>],
 ) -> Result<Arc<dyn ClientCertVerifier>, String> {
+    // `WebPkiClientVerifier::builder().build()` enumerates the process-default
+    // crypto provider's schemes, so it must be installed first — else it panics
+    // ("no process-level CryptoProvider"). new()/set_foreign_cas both route here,
+    // so installing it once at this chokepoint makes the verifier self-sufficient
+    // (a caller that builds a verifier without server_config still works).
+    super::ensure_crypto_provider();
+
     let mut roots = RootCertStore::empty();
     roots
         .add(CertificateDer::from(cluster_ca_der.to_vec()))
