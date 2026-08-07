@@ -48,6 +48,27 @@ use super::cert_fingerprint;
 /// presented agent cert's issuer is matched against.
 pub type CaFingerprint = [u8; 32];
 
+/// The DER of every `CERTIFICATE` block in `pem` (one cert, or a chain). `what`
+/// names the input in errors. The one PEM→DER cert-block decode for the
+/// cross-org TLS primitives — used by [`first_certificate_der`],
+/// [`ForeignCaAnchor::from_pem`], and `federated_tls::server_config` (the chain).
+pub(crate) fn certificate_ders(pem: &[u8], what: &str) -> Result<Vec<Vec<u8>>, String> {
+    Ok(::pem::parse_many(pem)
+        .map_err(|e| format!("{what} PEM: {e}"))?
+        .into_iter()
+        .filter(|p| p.tag() == "CERTIFICATE")
+        .map(|p| p.into_contents())
+        .collect())
+}
+
+/// The DER of the FIRST `CERTIFICATE` block — a single CA cert. Errors if none.
+pub(crate) fn first_certificate_der(pem: &[u8], what: &str) -> Result<Vec<u8>, String> {
+    certificate_ders(pem, what)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("{what} PEM has no CERTIFICATE block"))
+}
+
 /// One registered foreign certificate authority: the root of another trust
 /// domain whose agent certs the broker recognizes for cross-org authorship.
 ///
@@ -71,6 +92,21 @@ impl ForeignCaAnchor {
             trust_domain_id: trust_domain_id.into(),
             ca_cert_der,
         }
+    }
+
+    /// Build from the **PEM** form sudoedge exports in the onboarding triple
+    /// (`ca_cert_pem`). Decodes the first `CERTIFICATE` block to DER — the form
+    /// the anchor stores and fingerprints. The `RegisterForeignCa` handler uses
+    /// this, then verifies [`Self::fingerprint_hex`] against the triple's
+    /// `fingerprint` for the out-of-band bootstrap check.
+    pub fn from_pem(
+        trust_domain_id: impl Into<String>,
+        ca_cert_pem: &[u8],
+    ) -> Result<Self, String> {
+        Ok(Self::new(
+            trust_domain_id,
+            first_certificate_der(ca_cert_pem, "foreign CA")?,
+        ))
     }
 
     /// The registry key: SHA-256 over the CA cert's DER, via the shared
@@ -166,5 +202,32 @@ mod tests {
         // The trust domain is the registered label, not anything in the cert —
         // its CN is the generic `nexus-zone-root-ca`, which names no org.
         assert_eq!(a.trust_domain_id, "sudoedge-dgx-dev");
+    }
+
+    /// `from_pem` (the RegisterForeignCa path) yields the SAME anchor as `new`
+    /// with the DER — i.e. the PEM→DER decode is inverse to the real DGX export,
+    /// so the fingerprint the handler verifies against the triple matches. PEM is
+    /// the form sudoedge actually ships in `ca_cert_pem`.
+    #[test]
+    fn from_pem_matches_the_der_anchor() {
+        let der = include_bytes!("testdata/dgx_dev_ca_b.der");
+        let pem = ::pem::encode(&::pem::Pem::new("CERTIFICATE", der.to_vec()));
+        let from_pem = ForeignCaAnchor::from_pem("sudoedge-dgx-dev", pem.as_bytes())
+            .expect("valid CA PEM decodes");
+        assert_eq!(
+            from_pem,
+            ForeignCaAnchor::new("sudoedge-dgx-dev", der.to_vec())
+        );
+        assert_eq!(
+            from_pem.fingerprint_hex(),
+            "sha256:b2582dd5216bffd46cd423d18a831913f9bfe514ce99590e106713a0b6b61672"
+        );
+    }
+
+    /// PEM with no CERTIFICATE block is a clear error, not a silent empty anchor.
+    #[test]
+    fn from_pem_rejects_non_certificate_pem() {
+        let junk = ::pem::encode(&::pem::Pem::new("PRIVATE KEY", vec![1, 2, 3]));
+        assert!(ForeignCaAnchor::from_pem("x", junk.as_bytes()).is_err());
     }
 }

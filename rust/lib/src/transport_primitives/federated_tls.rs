@@ -52,19 +52,8 @@ use tokio_rustls::TlsAcceptor;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
 
+use super::foreign_ca::{certificate_ders, first_certificate_der};
 use super::ForeignCaAnchor;
-
-/// The DER of the first `CERTIFICATE` block in `pem`. `what` names the input in
-/// the error. Shared by [`FederatedClientCertVerifier::new`] and [`server_config`]
-/// so PEM→DER decoding is spelled one way.
-fn first_certificate_der(pem: &[u8], what: &str) -> Result<Vec<u8>, String> {
-    ::pem::parse_many(pem)
-        .map_err(|e| format!("{what} PEM: {e}"))?
-        .into_iter()
-        .find(|p| p.tag() == "CERTIFICATE")
-        .map(|p| p.into_contents())
-        .ok_or_else(|| format!("{what} PEM has no CERTIFICATE block"))
-}
 
 /// Build a `WebPkiClientVerifier` over `cluster_ca_der` plus every foreign CA in
 /// `foreign_cas`. Mandatory client auth (the default) — a caller must present a
@@ -220,11 +209,9 @@ pub fn server_config(
 ) -> Result<ServerConfig, String> {
     super::ensure_crypto_provider();
 
-    let certs: Vec<CertificateDer<'static>> = ::pem::parse_many(cert_pem)
-        .map_err(|e| format!("server cert PEM: {e}"))?
+    let certs: Vec<CertificateDer<'static>> = certificate_ders(cert_pem, "server cert")?
         .into_iter()
-        .filter(|p| p.tag() == "CERTIFICATE")
-        .map(|p| CertificateDer::from(p.into_contents()))
+        .map(CertificateDer::from)
         .collect();
     if certs.is_empty() {
         return Err("server cert PEM has no CERTIFICATE block".into());
