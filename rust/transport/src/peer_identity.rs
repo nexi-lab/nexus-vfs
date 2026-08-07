@@ -36,9 +36,61 @@ use tonic::Request;
 /// Must be called *before* `Request::into_inner()`, which drops the
 /// extensions along with the rest of the envelope.
 pub fn from_request<T>(req: &Request<T>) -> Option<PeerIdentity> {
-    let tls = req.extensions().get::<TlsConnectInfo<TcpConnectInfo>>()?;
+    from_extensions(req.extensions())
+}
+
+/// Peer identity for a request that is **foreign-CA aware**: like [`from_request`]
+/// it reads the TLS-verified leaf cert, but resolves it via [`classify_peer_cert`]
+/// so a cert signed by a registered foreign CA yields a qualified
+/// `{trust_domain}/agent/{name}` identity instead of a bare local name. Falls back
+/// to `None` on any [`ClassifyError`] — same "no proven membership → token plane"
+/// contract as [`from_request`], failing closed (rustls already admitted the chain,
+/// so a classify miss here is defense in depth).
+///
+/// `cluster_ca_der` / `foreign_anchors` come from the live
+/// [`lib::transport_primitives::FederatedClientCertVerifier`] the same handshake
+/// admitted against, so classification and admission never disagree.
+pub fn classify_from_request<T>(
+    req: &Request<T>,
+    cluster_ca_der: &[u8],
+    foreign_anchors: &[ForeignCaAnchor],
+) -> Option<PeerIdentity> {
+    classify_from_extensions(req.extensions(), cluster_ca_der, foreign_anchors)
+}
+
+// The real resolution is keyed on the request's `Extensions`, NOT its type `T`:
+// `from_request` / `classify_from_request` are thin generic forwarders (one per
+// request type, since `authenticate<T>` covers ~28 of them), so keeping the
+// cert-parse / signature-verify code here means it is compiled ONCE instead of
+// monomorphized across every request type (that duplication is real binary size).
+
+fn from_extensions(ext: &tonic::Extensions) -> Option<PeerIdentity> {
+    with_leaf_der(ext, from_der).flatten()
+}
+
+fn classify_from_extensions(
+    ext: &tonic::Extensions,
+    cluster_ca_der: &[u8],
+    foreign_anchors: &[ForeignCaAnchor],
+) -> Option<PeerIdentity> {
+    with_leaf_der(ext, |der| {
+        classify_peer_cert(der, cluster_ca_der, foreign_anchors).ok()
+    })
+    .flatten()
+}
+
+/// Run `f` with the TLS-verified leaf cert DER borrowed in place off the request
+/// extensions, or `None` for a plaintext / no-client-cert connection.
+///
+/// A closure rather than a returned `Vec` so this stays ZERO-COPY on the auth hot
+/// path (every VFS RPC calls it) — the DER is borrowed, never cloned. Keyed on
+/// `Extensions` (not the request type) and generic only in the closure result, so
+/// the extraction is not monomorphized per request type either.
+fn with_leaf_der<R>(ext: &tonic::Extensions, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+    let tls = ext.get::<TlsConnectInfo<TcpConnectInfo>>()?;
     let certs = tls.peer_certs()?;
-    from_der(certs.first()?.as_ref())
+    let leaf = certs.first()?;
+    Some(f(leaf.as_ref()))
 }
 
 /// Parse a DER-encoded leaf certificate into a [`PeerIdentity`].

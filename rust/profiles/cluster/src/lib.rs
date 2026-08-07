@@ -1473,9 +1473,18 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         None => Arc::new(transport::auth::NoAuth),
     };
 
+    // Late-bound verifier slot: the VFS routes are built here, BEFORE the
+    // ZoneManager that owns the verifier exists (they're handed into
+    // `open_zone_manager` below). We fill the slot the instant the manager is up
+    // (just after the bundle destructure) with the SAME verifier the mTLS
+    // handshake admits against, so a registered foreign CA's agent resolves
+    // qualified in the request path. Auth-off leaves it empty ⇒ local-only.
+    let fca_verifier_slot: transport::grpc::ForeignCaVerifierSlot =
+        Arc::new(std::sync::OnceLock::new());
     let vfs_routes = transport::grpc::build_vfs_routes(
         Arc::clone(&kernel),
         vfs_auth,
+        Arc::clone(&fca_verifier_slot),
         64 * 1024 * 1024,
         "nexusd-cluster",
     );
@@ -1507,6 +1516,15 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         identity_persisted_peers,
         identity_zones,
     } = open_zone_manager(&common, Some(vfs_routes), ZoneLoadPolicy::All)?;
+
+    // Fill the VFS service's verifier slot now that the ZoneManager (and its
+    // eagerly-built verifier) exists. Auth-on ⇒ the VFS request path classifies
+    // peer certs against the same verifier the handshake + apply observer use, so
+    // a foreign agent resolves qualified. Auth-off ⇒ getter returns None, slot
+    // stays empty, request path stays local-only.
+    if let Some(verifier) = zm.foreign_ca_verifier() {
+        let _ = fca_verifier_slot.set(verifier);
+    }
 
     // Remote agent-cert mint (task #40): the CA holder installs an `AgentMinter`
     // into the raft gRPC server's slot, so `auth mint --subject-type agent` on

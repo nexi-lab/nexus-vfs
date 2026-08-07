@@ -88,10 +88,26 @@ impl Drop for VfsGrpcHandle {
 ///
 /// Auth is delegated to `Arc<dyn AuthProvider>`.  `Call` RPC returns
 /// `Unimplemented`.
+/// Set-once slot sharing the live client-cert verifier from the daemon into the
+/// VFS service. A slot (not a plain handle) because the VFS routes are built
+/// BEFORE the `ZoneManager` that owns the verifier exists — the routes are handed
+/// INTO `open_zone_manager` — so the daemon fills this the instant the manager is
+/// up. `Arc<OnceLock<..>>` = lock-free reads on the auth path, shared with the
+/// filler. Empty forever on an auth-off node (no cross-org trust plane).
+pub type ForeignCaVerifierSlot =
+    Arc<std::sync::OnceLock<Arc<lib::transport_primitives::FederatedClientCertVerifier>>>;
+
 #[derive(Clone)]
 pub(crate) struct VfsServiceImpl {
     pub(crate) kernel: Arc<Kernel>,
     pub(crate) auth: Arc<dyn AuthProvider>,
+    /// Late-bound verifier (see [`ForeignCaVerifierSlot`]). Filled ⇒ `authenticate`
+    /// classifies the peer cert against it so a registered foreign CA's agent
+    /// resolves qualified (`{trust_domain}/agent/{name}`) rather than a bare local
+    /// name; empty ⇒ plain local-only resolution. The filled Arc is the SAME one
+    /// the mTLS handshake admits against AND the apply observer refreshes, so
+    /// classification, admission, and the live foreign-anchor set never disagree.
+    pub(crate) foreign_ca_verifier: ForeignCaVerifierSlot,
     pub(crate) server_started_at: Instant,
     pub(crate) server_version: Arc<str>,
     pub(crate) started_secs: Arc<AtomicU64>,
@@ -156,7 +172,24 @@ impl VfsServiceImpl {
         &self,
         req: Request<T>,
     ) -> Result<(OperationContext, T), Status> {
-        let peer = peer_identity::from_request(&req);
+        // Resolve the peer identity, foreign-CA aware only when it can matter.
+        // `foreign_anchors()` is an O(1) ArcSwap read the apply observer keeps
+        // fresh. When it is empty — the common case, and always so on an auth-off
+        // node — every rustls-admitted cert is cluster-CA, so classification would
+        // just re-derive "local"; take the plain parse path and skip the per-request
+        // signature verify. Only once a foreign CA is registered do we classify (to
+        // resolve its agents qualified, `{trust_domain}/agent/{name}`).
+        let peer = match self.foreign_ca_verifier.get() {
+            Some(v) => {
+                let anchors = v.foreign_anchors();
+                if anchors.is_empty() {
+                    peer_identity::from_request(&req)
+                } else {
+                    peer_identity::classify_from_request(&req, v.cluster_ca_der(), &anchors)
+                }
+            }
+            None => peer_identity::from_request(&req),
+        };
         let inner = req.into_inner();
         let ctx = self.auth.resolve(&AuthCredentials {
             token: inner.auth_token(),
@@ -384,6 +417,7 @@ impl VfsServiceImpl {
         Self {
             kernel,
             auth: Arc::new(crate::auth::NoAuth),
+            foreign_ca_verifier: Arc::new(std::sync::OnceLock::new()),
             server_started_at: Instant::now(),
             server_version: Arc::from("test"),
             started_secs: Arc::new(AtomicU64::new(0)),
@@ -1463,7 +1497,15 @@ pub fn spawn(
         .build()
         .map_err(|e| format!("vfs-grpc runtime: {e}"))?;
 
-    let routes = build_vfs_routes(kernel, auth, cfg.max_message_bytes, &cfg.server_version);
+    // The standalone spawn() path has no cross-org trust plane (it's the
+    // single-node/dev server); an empty slot ⇒ local-only resolution.
+    let routes = build_vfs_routes(
+        kernel,
+        auth,
+        Arc::new(std::sync::OnceLock::new()),
+        cfg.max_message_bytes,
+        &cfg.server_version,
+    );
 
     let mut server_builder = lib::transport_primitives::apply_server_limits(Server::builder())
         .timeout(std::time::Duration::from_secs(60));
@@ -1515,12 +1557,14 @@ pub fn spawn(
 pub fn build_vfs_routes(
     kernel: Arc<Kernel>,
     auth: Arc<dyn AuthProvider>,
+    foreign_ca_verifier: ForeignCaVerifierSlot,
     max_message_bytes: usize,
     server_version: &str,
 ) -> tonic::service::Routes {
     let svc = VfsServiceImpl {
         kernel,
         auth,
+        foreign_ca_verifier,
         server_started_at: Instant::now(),
         server_version: Arc::from(server_version),
         started_secs: Arc::new(AtomicU64::new(0)),
