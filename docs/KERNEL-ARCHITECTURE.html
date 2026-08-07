@@ -1615,20 +1615,79 @@ graph TB
 
 <pre class="mermaid">
 graph TB
-    subgraph HIER["Profile hierarchy: slim &sub; cluster &sub; embedded &sub; lite &sub; full &sube; cloud"]
-        SL["slim &mdash; bare minimum runnable<br/>redb (embedded) &mdash; Linux: initramfs"]
-        CL["cluster &mdash; minimal multi-node<br/>IPC + federation + agent control plane (managed_agent)<br/>minimal auth (sk-, runtime-gated)<br/>redb (Raft) &mdash; Linux: CoreOS"]
-        EM["embedded &mdash; MCU, WASM (⟨1 MB)<br/>redb (embedded) &mdash; Linux: BusyBox"]
-        LI["lite &mdash; Pi, Jetson, mobile<br/>redb (embedded) &mdash; Linux: Alpine"]
-        FU["full &mdash; desktop, laptop<br/>redb (embedded) &mdash; Linux: Ubuntu Desktop"]
-        CD["cloud &mdash; k8s, serverless<br/>redb (Raft) &mdash; Linux: Ubuntu Server"]
+    subgraph HIER["Profile hierarchy: embedded &sub; lite &sub; sandbox &sub; full &sube; cloud"]
+        EM["embedded &mdash; MCU, WASM (&lt;1 MB)<br/>eventlog only &mdash; Linux: BusyBox"]
+        LI["lite &mdash; Pi, Jetson, mobile (512 MB&ndash;4 GB)<br/>+namespace, permissions, cache, ipc, scheduler<br/>RecordStore (SQLite) &mdash; Linux: Alpine"]
+        SB["sandbox &mdash; agent sandbox runtime<br/>+search, mcp, parsers<br/>zero external services &mdash; Linux: container"]
+        FU["full &mdash; desktop, laptop (4&ndash;32 GB)<br/>+pay, llm, skills, workflows, memory,<br/>identity, versioning, workspace, &hellip; (24 bricks)<br/>RecordStore (PostgreSQL) &mdash; Linux: Ubuntu Desktop"]
+        CD["cloud &mdash; k8s, serverless<br/>full + federation<br/>multi-tenant &mdash; Linux: Ubuntu Server"]
     end
     subgraph ORTH["Orthogonal to hierarchy"]
-        RE["remote &mdash; client-side proxy<br/>zero local bricks<br/>RemoteMetastore &mdash; Linux: NFS client"]
+        CL["cluster &mdash; minimal multi-node<br/>Rust-only (~5 MB), ipc + federation<br/>redb (Raft) &mdash; Linux: CoreOS"]
+        RE["remote &mdash; client-side proxy<br/>zero local bricks, remote driver only<br/>NFS-client model &mdash; Linux: NFS client"]
     end
 
-    SL --> CL --> EM --> LI --> FU --> CD
+    EM --> LI --> SB --> FU --> CD
 </pre>
+
+<h4>Per-profile brick and driver summary</h4>
+
+<table>
+<thead>
+<tr><th>Profile</th><th>Bricks</th><th>Unique additions</th><th>Drivers</th><th>Target</th></tr>
+</thead>
+<tbody>
+<tr>
+  <td><strong>cluster</strong></td>
+  <td>2</td>
+  <td>ipc, federation</td>
+  <td>(none &mdash; operator adds via env)</td>
+  <td>Multi-node Raft federation; Rust-only, zero Python</td>
+</tr>
+<tr>
+  <td><strong>embedded</strong></td>
+  <td>1</td>
+  <td>eventlog</td>
+  <td>path_local, cas-local, local_connector</td>
+  <td>MCU, WASM (&lt;1 MB)</td>
+</tr>
+<tr>
+  <td><strong>lite</strong></td>
+  <td>6</td>
+  <td>+namespace, permissions, cache, ipc, scheduler</td>
+  <td>path_local, cas-local, local_connector</td>
+  <td>Pi, Jetson, mobile (512 MB&ndash;4 GB)</td>
+</tr>
+<tr>
+  <td><strong>sandbox</strong></td>
+  <td>9</td>
+  <td>+search, mcp, parsers</td>
+  <td>+openai, anthropic, nostr, cli</td>
+  <td>Agent sandbox; zero external services (SQLite + BM25S)</td>
+</tr>
+<tr>
+  <td><strong>full</strong></td>
+  <td>24</td>
+  <td>+pay, llm, skills, sandbox, workflows, discovery, memory, task_manager, observability, uploads, resiliency, access_manifest, catalog, delegation, identity, share_link, versioning, workspace, portability, snapshot</td>
+  <td>+s3, gcs, gdrive, gmail, slack, x, hn, remote</td>
+  <td>Desktop/laptop hub (4&ndash;32 GB); PostgreSQL + Dragonfly</td>
+</tr>
+<tr>
+  <td><strong>cloud</strong></td>
+  <td>25</td>
+  <td>+federation</td>
+  <td>(same as full)</td>
+  <td>k8s/serverless; multi-tenant, cross-zone coordination</td>
+</tr>
+<tr>
+  <td><strong>remote</strong></td>
+  <td>0</td>
+  <td>(no local bricks)</td>
+  <td>remote only</td>
+  <td>Client-side proxy; all ops via gRPC to a peer</td>
+</tr>
+</tbody>
+</table>
 
 <p>Same kernel binary, different driver injection. See &sect;1.8 <code>connect()</code>. Source of truth: <code>src/nexus/contracts/deployment_profile.py</code>.</p>
 
