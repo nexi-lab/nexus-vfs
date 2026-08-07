@@ -63,10 +63,11 @@ mod transport_loop;
 #[cfg(all(feature = "grpc", has_protos))]
 pub use client::{
     call_delete_zone, call_discover_zones_rpc, call_get_crl, call_join_cluster, call_join_zone_rpc,
-    call_list_keys_rpc, call_mint_agent_rpc, call_mint_key_rpc, call_remove_voter_rpc,
-    call_revoke_key_rpc, ClientConfig, ClusterInfoResult, DiscoveredZone, JoinClusterResult,
-    JoinZoneResult, MintAgentResult, MintKeyArgs, ProposeResult, QueryResult, RaftApiClient,
-    RaftClient, RaftClientPool, RemoveVoterResult,
+    call_list_foreign_cas_rpc, call_list_keys_rpc, call_mint_agent_rpc, call_mint_key_rpc,
+    call_register_foreign_ca_rpc, call_remove_voter_rpc, call_revoke_key_rpc,
+    call_unregister_foreign_ca_rpc, ClientConfig, ClusterInfoResult, DiscoveredZone,
+    JoinClusterResult, JoinZoneResult, MintAgentResult, MintKeyArgs, ProposeResult, QueryResult,
+    RaftApiClient, RaftClient, RaftClientPool, RemoveVoterResult,
 };
 #[cfg(all(feature = "grpc", has_protos))]
 pub use server::{
@@ -210,7 +211,7 @@ fn proto_result_to_command_result(
 // ---------------------------------------------------------------------------
 #[cfg(feature = "grpc")]
 pub use lib::transport_primitives::{
-    hostname_to_node_id, NodeAddress, PeerAddress, TlsConfig, TransportError,
+    hostname_to_node_id, ForeignCaAnchor, NodeAddress, PeerAddress, TlsConfig, TransportError,
 };
 #[cfg(feature = "grpc")]
 pub type Result<T> = lib::transport_primitives::Result<T>;
