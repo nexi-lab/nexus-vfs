@@ -2149,6 +2149,60 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
                 );
             }
         }
+
+        // Cross-org foreign-CA trust: the same control-zone consensus that homes
+        // auth records also homes the foreign-CA anchors (CONTROL_NS_FOREIGN_CA).
+        // Wire the shared client-cert verifier so a `RegisterForeignCa` /
+        // unregister replicates and HOT-SWAPS the trusted client-auth set on
+        // every node with no restart. Only auth-on (the verifier exists only
+        // under TLS). Load already-registered anchors once at boot (a restart
+        // re-derives the live set from the replicated store), then refresh on
+        // each foreign-ca apply — mirroring the auth eviction observer above.
+        if let Some(verifier) = zm.foreign_ca_verifier() {
+            let fca_store = Arc::new(nexus_raft::foreign_ca_store::RaftForeignCaStore::new(
+                consensus.clone(),
+                cred_zone.runtime_handle(),
+            ));
+            match fca_store.list() {
+                Ok(anchors) => {
+                    if let Err(e) = verifier.set_foreign_cas(&anchors) {
+                        tracing::warn!(error = %e, "initial foreign-CA trust load failed");
+                    } else if !anchors.is_empty() {
+                        tracing::info!(
+                            count = anchors.len(),
+                            "loaded registered foreign-CA anchors into the client-cert verifier"
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "could not list foreign-CA anchors at boot"),
+            }
+            let verifier_for_obs = verifier.clone();
+            let store_for_obs = Arc::clone(&fca_store);
+            consensus.register_apply_observer(Arc::new(
+                move |entry: &nexus_raft::prelude::AppliedEntry| {
+                    let is_foreign_ca = matches!(
+                        &entry.command,
+                        nexus_raft::prelude::Command::PutControlState { namespace, .. }
+                            | nexus_raft::prelude::Command::DeleteControlState { namespace, .. }
+                            if namespace.as_str() == contracts::CONTROL_NS_FOREIGN_CA
+                    );
+                    if !is_foreign_ca {
+                        return;
+                    }
+                    // Full re-list → set_foreign_cas is idempotent across
+                    // register (put) and unregister (delete).
+                    match store_for_obs.list() {
+                        Ok(anchors) => {
+                            let _ = verifier_for_obs.set_foreign_cas(&anchors);
+                        }
+                        Err(e) => tracing::warn!(error = %e, "foreign-CA refresh: list failed"),
+                    }
+                },
+            ));
+            tracing::info!(
+                "cross-org foreign-CA trust wired (hot-swap client-cert verifier on register/unregister)"
+            );
+        }
     }
 
     // ── A2A messaging substrate (§F) ─────────────────────────────────

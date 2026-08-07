@@ -91,6 +91,13 @@ pub struct RaftGrpcServer {
     /// daemon at boot. `None` under `--no-tls` — `MintKey`/`RevokeKey` return
     /// success=false there (auth-off has no sk- plane).
     key_minter_slot: Option<KeyMinterSlot>,
+    /// Federated mTLS client-cert verifier — the client-auth trust roots as a
+    /// hot-swappable set (cluster CA + any runtime-registered foreign CAs), so a
+    /// cross-org CA registered live is trusted without a restart. Shared with the
+    /// cross-org apply-observer, which calls `set_foreign_cas` on it. `None` (or
+    /// `--no-tls`) → the serve path builds a cluster-only verifier from the CA in
+    /// `config.tls` (base mTLS, no foreign hot-swap).
+    foreign_ca_verifier: Option<Arc<lib::transport_primitives::FederatedClientCertVerifier>>,
     /// Additional gRPC services co-hosted on the same port.
     /// Constructed externally (e.g. VFS gRPC by the cluster binary)
     /// and passed in as type-erased `tonic::service::Routes` so this
@@ -106,6 +113,7 @@ impl RaftGrpcServer {
             blob_fetcher_slot: None,
             agent_minter_slot: None,
             key_minter_slot: None,
+            foreign_ca_verifier: None,
             extra_services: None,
         }
     }
@@ -132,6 +140,18 @@ impl RaftGrpcServer {
     /// impl. Installed on every auth-on node; left empty under `--no-tls`.
     pub fn with_key_minter_slot(mut self, slot: KeyMinterSlot) -> Self {
         self.key_minter_slot = Some(slot);
+        self
+    }
+
+    /// Attach the shared federated client-cert verifier (from `ZoneManager`), so
+    /// the serve path's mTLS client-auth roots are the same `Arc` the cross-org
+    /// apply-observer hot-swaps. `None` → the serve path builds a cluster-only
+    /// verifier from the configured CA.
+    pub fn with_foreign_ca_verifier(
+        mut self,
+        verifier: Option<Arc<lib::transport_primitives::FederatedClientCertVerifier>>,
+    ) -> Self {
+        self.foreign_ca_verifier = verifier;
         self
     }
 
@@ -174,21 +194,6 @@ impl RaftGrpcServer {
 
         let mut builder =
             lib::transport_primitives::apply_server_limits(tonic::transport::Server::builder());
-        if let Some(ref tls) = self.config.tls {
-            // Pin the rustls provider before tonic builds the server TLS
-            // config (see `ensure_crypto_provider` — rustls 0.23 panics on an
-            // ambiguous provider set, which the Linux graph produces).
-            lib::transport_primitives::ensure_crypto_provider();
-            let identity = tonic::transport::Identity::from_pem(&tls.cert_pem, &tls.key_pem);
-            let client_ca = tonic::transport::Certificate::from_pem(&tls.ca_pem);
-            let tls_config = tonic::transport::ServerTlsConfig::new()
-                .identity(identity)
-                .client_ca_root(client_ca);
-            builder = builder
-                .tls_config(tls_config)
-                .map_err(|e| TransportError::Connection(format!("TLS config error: {}", e)))?;
-            tracing::info!("TLS mode: mTLS (client auth required)");
-        }
 
         // If extra services are provided, add them first via add_routes
         // (which returns a Router), then add the raft services.
@@ -204,7 +209,30 @@ impl RaftGrpcServer {
                 .add_service(ZoneApiServiceServer::new(client_service))
         };
 
-        router.serve(addr).await.map_err(TransportError::Tonic)?;
+        // mTLS via a custom acceptor whose client-cert verifier is HOT-SWAPPABLE
+        // (cluster CA + runtime-registered foreign CAs), so a cross-org CA
+        // registered live is trusted without a restart — the SAME Arc the
+        // cross-org apply-observer swaps via `set_foreign_cas`. All rustls /
+        // tokio-rustls / bind assembly lives in `transport_primitives`
+        // (`federated_mtls_incoming`), so server.rs names no TLS types. With no
+        // foreign CAs registered it is byte-equivalent to the prior
+        // `client_ca_root(cluster_ca)` mandatory-client-auth config.
+        match &self.config.tls {
+            Some(tls) => {
+                let incoming = lib::transport_primitives::federated_mtls_incoming(
+                    addr,
+                    tls,
+                    self.foreign_ca_verifier.clone(),
+                )
+                .await
+                .map_err(TransportError::Connection)?;
+                router
+                    .serve_with_incoming(incoming)
+                    .await
+                    .map_err(TransportError::Tonic)?;
+            }
+            None => router.serve(addr).await.map_err(TransportError::Tonic)?,
+        }
 
         Ok(())
     }
@@ -235,21 +263,6 @@ impl RaftGrpcServer {
 
         let mut builder =
             lib::transport_primitives::apply_server_limits(tonic::transport::Server::builder());
-        if let Some(ref tls) = self.config.tls {
-            // Pin the rustls provider before tonic builds the server TLS
-            // config (see `ensure_crypto_provider` — rustls 0.23 panics on an
-            // ambiguous provider set, which the Linux graph produces).
-            lib::transport_primitives::ensure_crypto_provider();
-            let identity = tonic::transport::Identity::from_pem(&tls.cert_pem, &tls.key_pem);
-            let client_ca = tonic::transport::Certificate::from_pem(&tls.ca_pem);
-            let tls_config = tonic::transport::ServerTlsConfig::new()
-                .identity(identity)
-                .client_ca_root(client_ca);
-            builder = builder
-                .tls_config(tls_config)
-                .map_err(|e| TransportError::Connection(format!("TLS config error: {}", e)))?;
-            tracing::info!("TLS mode: mTLS (client auth required)");
-        }
 
         let router = if let Some(extra) = self.extra_services {
             builder
@@ -262,10 +275,29 @@ impl RaftGrpcServer {
                 .add_service(ZoneApiServiceServer::new(client_service))
         };
 
-        router
-            .serve_with_shutdown(addr, shutdown)
-            .await
-            .map_err(TransportError::Tonic)?;
+        // Hot-swappable federated mTLS acceptor — see `serve` for the rationale
+        // (client-auth roots = cluster CA + runtime-registered foreign CAs, the
+        // shared verifier the cross-org observer swaps; assembly lives in
+        // `transport_primitives::federated_mtls_incoming`).
+        match &self.config.tls {
+            Some(tls) => {
+                let incoming = lib::transport_primitives::federated_mtls_incoming(
+                    addr,
+                    tls,
+                    self.foreign_ca_verifier.clone(),
+                )
+                .await
+                .map_err(TransportError::Connection)?;
+                router
+                    .serve_with_incoming_shutdown(incoming, shutdown)
+                    .await
+                    .map_err(TransportError::Tonic)?;
+            }
+            None => router
+                .serve_with_shutdown(addr, shutdown)
+                .await
+                .map_err(TransportError::Tonic)?,
+        }
 
         Ok(())
     }
@@ -2289,26 +2321,27 @@ impl RaftWitnessServer {
 
         let mut builder =
             lib::transport_primitives::apply_server_limits(tonic::transport::Server::builder());
-        if let Some(ref tls) = self.config.tls {
-            // Pin the rustls provider before tonic builds the server TLS
-            // config (see `ensure_crypto_provider` — rustls 0.23 panics on an
-            // ambiguous provider set, which the Linux graph produces).
-            lib::transport_primitives::ensure_crypto_provider();
-            let identity = tonic::transport::Identity::from_pem(&tls.cert_pem, &tls.key_pem);
-            let client_ca = tonic::transport::Certificate::from_pem(&tls.ca_pem);
-            let tls_config = tonic::transport::ServerTlsConfig::new()
-                .identity(identity)
-                .client_ca_root(client_ca);
-            builder = builder
-                .tls_config(tls_config)
-                .map_err(|e| TransportError::Connection(format!("TLS config error: {}", e)))?;
-        }
+        let router = builder.add_service(ZoneTransportServiceServer::new(service));
 
-        builder
-            .add_service(ZoneTransportServiceServer::new(service))
-            .serve_with_shutdown(addr, shutdown)
-            .await
-            .map_err(TransportError::Tonic)?;
+        // The witness mTLS bind is CLUSTER-ONLY: it is a raft tie-breaker, never
+        // a target for foreign agents (those write mailboxes on the broker), so
+        // it passes `None` and `federated_mtls_incoming` builds a verifier with
+        // just the cluster CA — byte-equivalent to the prior client_ca_root.
+        match &self.config.tls {
+            Some(tls) => {
+                let incoming = lib::transport_primitives::federated_mtls_incoming(addr, tls, None)
+                    .await
+                    .map_err(TransportError::Connection)?;
+                router
+                    .serve_with_incoming_shutdown(incoming, shutdown)
+                    .await
+                    .map_err(TransportError::Tonic)?;
+            }
+            None => router
+                .serve_with_shutdown(addr, shutdown)
+                .await
+                .map_err(TransportError::Tonic)?,
+        }
 
         Ok(())
     }

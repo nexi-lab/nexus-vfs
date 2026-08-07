@@ -23,35 +23,34 @@ jobs:
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
-            max_size_bytes: 16252928  # 15.5 MiB — tightened from 16.0 MiB after
-                                      # fat LTO + dead-code drop. Measured
-                                      # 15,190,768 bytes on this platform.
+            max_size_bytes: 16777216  # 16.0 MiB — raised from 15.5 for the
+                                      # cross-org mTLS trust plane (PR #209).
+                                      # Measured 16,515,480 bytes on this platform.
           - os: macos-14
             artifact_name: nexusd-cluster-macos-arm64
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
-            max_size_bytes: 13369344  # 12.75 MiB — tightened from 13.75 MiB after
-                                      # fat LTO. Measured 12,378,928 bytes on
-                                      # this platform.
+            max_size_bytes: 13631488  # 13.0 MiB — raised from 12.75 for the
+                                      # cross-org mTLS trust plane (PR #209).
+                                      # Measured 13,404,432 bytes on this platform.
           - os: macos-14
             artifact_name: nexusd-cluster-macos-x86_64
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
             target: x86_64-apple-darwin
-            max_size_bytes: 14417920  # 13.75 MiB — tightened from 16.0 MiB after
-                                      # fat LTO. Measured 13,394,440 bytes on
-                                      # this platform.
+            max_size_bytes: 14680064  # 14.0 MiB — raised from 13.75 for the
+                                      # cross-org mTLS trust plane (PR #209).
+                                      # Measured 14,484,584 bytes on this platform.
           - os: windows-latest
             artifact_name: nexusd-cluster-windows-x86_64
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster.exe
-            max_size_bytes: 14942208  # 14.25 MiB — tightened from 14.5 MiB after
-                                      # fat LTO + dead-code drop. Measured
-                                      # 14,026,752 bytes on this platform (down
-                                      # from 15,003,648 pre-refactor, -954 KiB).
+            max_size_bytes: 15466496  # 14.75 MiB — raised from 14.25 for the
+                                      # cross-org mTLS trust plane (PR #209).
+                                      # Measured 15,201,792 bytes on this platform.
 
 
     steps:

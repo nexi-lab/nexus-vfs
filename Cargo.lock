@@ -1748,6 +1748,7 @@ name = "lib"
 version = "0.1.0"
 dependencies = [
  "ahash",
+ "arc-swap",
  "base64",
  "blake3",
  "contracts",
@@ -1773,6 +1774,8 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "tokio",
+ "tokio-rustls",
+ "tokio-stream",
  "tonic",
  "tracing",
  "x509-parser",

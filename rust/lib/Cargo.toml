@@ -26,6 +26,9 @@ transport = [
     "dep:rustls",
     "dep:ring",
     "dep:x509-parser",
+    "dep:tokio-rustls",
+    "dep:tokio-stream",
+    "dep:arc-swap",
 ]
 
 [dependencies]
@@ -55,6 +58,16 @@ tonic = { workspace = true, optional = true }
 # only for `install_default`; see `transport_primitives::ensure_crypto_provider`.
 rustls = { version = "0.23", default-features = false, features = ["ring"], optional = true }
 tokio = { version = "1", features = ["rt", "net", "sync", "time"], optional = true }
+# The mTLS acceptor for the federated cross-org trust plane (matches tonic's own
+# `tls-ring` tokio-rustls so its `Connected for TlsStream` bridge — which
+# populates `TlsConnectInfo::peer_certs()` — applies to our accepted streams).
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"], optional = true }
+# `ReceiverStream` adapts the accept loop into the `impl Stream` tonic's
+# `serve_with_incoming` consumes.
+tokio-stream = { version = "0.1", optional = true }
+# Atomic hot-swap of the client-cert trust roots when a foreign CA is
+# registered / revoked, with no rebuild of the running server.
+arc-swap = { version = "1.9", optional = true }
 dashmap = { version = "6.1", optional = true }
 parking_lot = { version = "0.12", optional = true }
 thiserror = { version = "2", optional = true }

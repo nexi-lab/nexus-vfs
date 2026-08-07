@@ -117,6 +117,7 @@ pub mod transport;
 //                                Control-Plane HAL §3.B.1 trait
 //   zone_meta_store.rs         — Raft-backed `kernel::abc::MetaStore` impl
 //   auth_key_store.rs          — Raft-backed `kernel::hal::AuthKeyStore` impl
+//   foreign_ca_store.rs        — Raft-backed cross-org authorship trust anchors
 //   blob_fetcher_handler.rs    — `KernelBlobFetcher` server-side handler
 //                                co-located with `ZoneApiService` on the
 //                                raft port; reaches kernel data plane
@@ -137,6 +138,8 @@ pub mod blob_fetcher_handler;
 pub mod control_state_store;
 #[cfg(all(feature = "grpc", has_protos))]
 pub mod distributed_coordinator;
+#[cfg(all(feature = "grpc", has_protos))]
+pub mod foreign_ca_store;
 // A2A cross-machine stream-wakeup: the apply-side observer that wakes a
 // replica's parked `sys_watch` when a peer's `AppendStreamEntry` replicates
 // in (§A). Bridges the raft apply spine to the kernel's file-watch wake.

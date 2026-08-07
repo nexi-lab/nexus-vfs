@@ -208,6 +208,12 @@ pub struct ZoneManager {
     /// can mint/revoke sk- credentials once the daemon installs a `KeyMinter`.
     /// Empty under `--no-tls` (no sk- plane).
     key_minter_slot: crate::key_minter::KeyMinterSlot,
+    /// The federated mTLS client-cert verifier — the client-auth trust roots,
+    /// hot-swappable so a foreign CA registered at runtime is trusted without a
+    /// restart. Built eagerly from the cluster CA (the only root until the
+    /// cross-org apply-observer calls `set_foreign_cas`); the SAME `Arc` is
+    /// shared with the gRPC serve path and that observer. `None` under `--no-tls`.
+    foreign_ca_verifier: Option<Arc<lib::transport_primitives::FederatedClientCertVerifier>>,
     /// Static topology mounts staged by `bootstrap_static`, drained
     /// incrementally by `apply_topology` as parent + target zones'
     /// leaders settle. BTreeMap so parent paths process before children.
@@ -445,10 +451,24 @@ impl ZoneManager {
         let blob_fetcher_slot = crate::blob_fetcher::new_blob_fetcher_slot();
         let agent_minter_slot = crate::agent_minter::new_agent_minter_slot();
         let key_minter_slot = crate::key_minter::new_key_minter_slot();
+        // Build the federated client-cert verifier eagerly from the cluster CA
+        // when TLS is on, so the serve path (below) and the cross-org
+        // apply-observer (cluster profile, via `foreign_ca_verifier()`) share ONE
+        // Arc — the observer's `set_foreign_cas` then reaches the live serving
+        // verifier with no restart. Empty roots beyond the cluster CA until then,
+        // so this is byte-equivalent to the old `client_ca_root(cluster_ca)`.
+        let foreign_ca_verifier = match &tls_config {
+            Some(t) => Some(
+                lib::transport_primitives::FederatedClientCertVerifier::new(&t.ca_pem)
+                    .map_err(|e| RaftError::Config(format!("build client-cert verifier: {e}")))?,
+            ),
+            None => None,
+        };
         let mut server = RaftGrpcServer::new(registry.clone(), config)
             .with_blob_fetcher_slot(blob_fetcher_slot.clone())
             .with_agent_minter_slot(agent_minter_slot.clone())
-            .with_key_minter_slot(key_minter_slot.clone());
+            .with_key_minter_slot(key_minter_slot.clone())
+            .with_foreign_ca_verifier(foreign_ca_verifier.clone());
         // Node enrollment (JoinCluster cert provisioning) is NOT served here —
         // this bind is strict mTLS, which a certless joiner cannot reach. The
         // cluster daemon runs it on a separate plaintext listener via
@@ -506,6 +526,7 @@ impl ZoneManager {
             blob_fetcher_slot,
             agent_minter_slot,
             key_minter_slot,
+            foreign_ca_verifier,
             pending_mounts: parking_lot::Mutex::new(BTreeMap::new()),
         }))
     }
@@ -527,6 +548,16 @@ impl ZoneManager {
     /// concrete minter on every auth-on daemon. Clone-cheap.
     pub fn key_minter_slot(&self) -> crate::key_minter::KeyMinterSlot {
         self.key_minter_slot.clone()
+    }
+
+    /// Hand back the shared federated client-cert verifier so the cluster profile
+    /// can wire the `CONTROL_NS_FOREIGN_CA` apply-observer to `set_foreign_cas`
+    /// (hot-swap the trusted foreign-CA set on register/unregister). `None` under
+    /// `--no-tls`. Clone-cheap (`Arc`).
+    pub fn foreign_ca_verifier(
+        &self,
+    ) -> Option<Arc<lib::transport_primitives::FederatedClientCertVerifier>> {
+        self.foreign_ca_verifier.clone()
     }
 
     /// Cluster-wide peer list remembered from construction, in

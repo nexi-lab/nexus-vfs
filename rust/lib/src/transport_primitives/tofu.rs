@@ -108,6 +108,14 @@ impl From<serde_json::Error> for TofuError {
     }
 }
 
+/// SHA-256 over a DER-encoded certificate — the raw digest a CA is identified
+/// by. The one definition of "a cert's fingerprint" for the transport layer:
+/// [`TofuTrustStore::fingerprint_der`] formats it as `SHA256:{base64}` for its
+/// pin file, and `foreign_ca` keys cross-org anchors on the raw bytes.
+pub fn cert_fingerprint(der: &[u8]) -> [u8; 32] {
+    Sha256::digest(der).into()
+}
+
 /// A pinned zone entry. Field names / order are the on-disk JSONL
 /// schema — preserve them when adding fields (prepend with
 /// ``#[serde(default)]`` so old stores keep loading).
@@ -188,8 +196,7 @@ impl TofuTrustStore {
     /// Fingerprint a DER-encoded certificate (used internally and by
     /// callers who already have DER bytes).
     pub fn fingerprint_der(der: &[u8]) -> String {
-        let digest = Sha256::digest(der);
-        let b64 = base64::engine::general_purpose::STANDARD_NO_PAD.encode(digest);
+        let b64 = base64::engine::general_purpose::STANDARD_NO_PAD.encode(cert_fingerprint(der));
         format!("SHA256:{b64}")
     }
 
