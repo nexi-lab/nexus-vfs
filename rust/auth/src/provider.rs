@@ -368,11 +368,32 @@ impl AuthProvider for ApiKeyAuthProvider {
                 // stolen key still chains to the CA. The CRL closes that — an
                 // agent whose serial the CA revoked is rejected on every node
                 // that has refreshed the list.
+                //
+                // KNOWN GAP (G2): `is_revoked` checks THIS cluster's CRL, which
+                // covers only cluster-CA agents. A foreign agent's cert is signed
+                // by its org CA (CA_B), whose serials are not in our CRL, so a
+                // single foreign agent cannot be revoked here — only coarse
+                // whole-org removal (drop the foreign-CA anchor) blocks it.
+                // Follow-up: an our-side, control-zone-backed per-serial denylist
+                // (no foreign-CRL fetch dependency).
                 if self.is_revoked(&peer.serial) {
                     tracing::warn!(agent = %agent, "rejected: agent cert is revoked (in CRL)");
                     return Err(unauthenticated());
                 }
-                return Ok(Self::agent_context(agent));
+                // A foreign agent (cert chained to a registered foreign CA, so
+                // `classify_peer_cert` set `trust_domain`) authors under its
+                // ORG-QUALIFIED id `{trust_domain}/agent/{name}` (= `display_id`),
+                // so two orgs' same-named agents never collide in the mailbox
+                // `from`. A local (cluster-CA) agent keeps its BARE name — the
+                // cluster is one trust domain with mint-time-unique names, and
+                // existing consumers parse bare local `from`s. A foreign cert can
+                // never resolve to a bare local name (classify always sets its
+                // `trust_domain`), so it cannot impersonate a local agent.
+                let agent_id = match peer.trust_domain {
+                    Some(_) => peer.display_id(),
+                    None => agent.clone(),
+                };
+                return Ok(Self::agent_context(&agent_id));
             }
             return Ok(Self::peer_context(peer));
         }
@@ -522,6 +543,39 @@ mod tests {
         );
         assert!(!ctx.is_system, "an agent is never a system caller");
         assert!(!ctx.is_admin, "an agent is never an admin");
+    }
+
+    /// A FOREIGN agent (its cert chained to a registered foreign CA, so
+    /// `classify_peer_cert` set `trust_domain`) authors under its org-QUALIFIED
+    /// id `{trust_domain}/agent/{name}` — never the bare name a local agent of
+    /// the same name uses. This is what stops two orgs' `cardio` agents from
+    /// colliding in the mailbox `from`, and stops a foreign cert from
+    /// impersonating a local agent (G1).
+    #[test]
+    fn a_foreign_cert_agent_resolves_to_an_org_qualified_id() {
+        let peer = PeerIdentity {
+            common_name: "nexus-agent-cardio".into(),
+            node_id: None,
+            zone_id: None,
+            agent_name: Some("cardio".into()),
+            trust_domain: Some("hospital-a".into()),
+            serial: vec![7, 7, 7],
+        };
+        let ctx = provider(MemStore::arc())
+            .resolve(&AuthCredentials {
+                token: "",
+                peer: Some(&peer),
+            })
+            .expect("a foreign cert agent resolves");
+
+        assert_eq!(
+            ctx.agent_id.as_deref(),
+            Some("hospital-a/agent/cardio"),
+            "a foreign agent's from is org-qualified, not the bare `cardio`"
+        );
+        assert_eq!(ctx.subject_id.as_deref(), Some("hospital-a/agent/cardio"));
+        assert!(!ctx.is_system);
+        assert!(!ctx.is_admin);
     }
 
     /// A CA-verified agent cert is rejected once its serial is in the CRL —
