@@ -102,6 +102,14 @@ pub struct FederatedClientCertVerifier {
     /// leaking the onboarded-org set into every handshake.
     base_hints: Vec<DistinguishedName>,
     inner: ArcSwap<VerifierCell>,
+    /// The live foreign-anchor set, cached so the app-layer classifier
+    /// (`transport::peer_identity::classify_peer_cert`) can name a foreign agent's
+    /// trust domain without a store read per request. Kept in lock-step with
+    /// `inner` by [`Self::set_foreign_cas`]: the WebPki verifier holds the parsed
+    /// CA roots (admission), this holds the raw anchors WebPki does not expose
+    /// (`trust_domain_id` + DER, for classification). Both derive from the same
+    /// `set_foreign_cas` input, so this is a cache, not a second source of truth.
+    anchors: ArcSwap<Vec<ForeignCaAnchor>>,
 }
 
 /// Sized wrapper so [`ArcSwap`] can atomically swap the trait-object verifier
@@ -125,7 +133,24 @@ impl FederatedClientCertVerifier {
             cluster_ca_der,
             base_hints,
             inner: ArcSwap::from_pointee(VerifierCell(inner)),
+            anchors: ArcSwap::from_pointee(Vec::new()),
         }))
+    }
+
+    /// The cluster CA (DER) — one input `classify_peer_cert` needs. `TlsConfig`
+    /// holds PEM; the verifier already decoded it once at [`Self::new`], so this
+    /// hands back the DER without re-decoding.
+    #[inline]
+    pub fn cluster_ca_der(&self) -> &[u8] {
+        &self.cluster_ca_der
+    }
+
+    /// The live foreign-anchor set — the other input `classify_peer_cert` needs.
+    /// O(1) `ArcSwap` read (an `Arc` clone); refreshed by [`Self::set_foreign_cas`].
+    /// Bind the returned `Arc`, then pass `&arc` (deref-coerces to `&[ForeignCaAnchor]`).
+    #[inline]
+    pub fn foreign_anchors(&self) -> Arc<Vec<ForeignCaAnchor>> {
+        self.anchors.load_full()
     }
 
     /// Atomically replace the trusted foreign CAs with `anchors` (cluster CA is
@@ -135,7 +160,10 @@ impl FederatedClientCertVerifier {
     pub fn set_foreign_cas(&self, anchors: &[ForeignCaAnchor]) -> Result<(), String> {
         let ders: Vec<Vec<u8>> = anchors.iter().map(|a| a.ca_cert_der.clone()).collect();
         let rebuilt = build_webpki(&self.cluster_ca_der, &ders)?;
+        // Build WebPki first; only swap in the new admission roots + the classifier
+        // cache once it succeeds, so a bad anchor never leaves the two out of sync.
         self.inner.store(Arc::new(VerifierCell(rebuilt)));
+        self.anchors.store(Arc::new(anchors.to_vec()));
         Ok(())
     }
 }
@@ -420,6 +448,34 @@ mod tests {
         assert!(
             v.verify_client_cert(&der(), &[], now).is_err(),
             "admission withdrawn after the CA is cleared"
+        );
+    }
+
+    /// The accessors expose exactly what `classify_peer_cert` consumes:
+    /// `cluster_ca_der()` is the CA `new` decoded, and `foreign_anchors()` tracks
+    /// `set_foreign_cas` in lock-step with admission — so the classifier and the
+    /// TLS trust root can never disagree on the foreign set.
+    #[test]
+    fn accessors_expose_the_classifier_inputs() {
+        let (cluster_der, _k) = mint_ca("cluster");
+        let (foreign_der, _fk) = mint_ca("hospital");
+        let v = FederatedClientCertVerifier::new(&pem_of(&cluster_der)).unwrap();
+
+        assert_eq!(v.cluster_ca_der(), cluster_der.as_slice());
+        assert!(v.foreign_anchors().is_empty(), "no anchors before register");
+
+        let a = anchor("hospital-a", &foreign_der);
+        v.set_foreign_cas(std::slice::from_ref(&a)).unwrap();
+        assert_eq!(
+            &*v.foreign_anchors(),
+            &[a],
+            "anchor set cached for the classifier"
+        );
+
+        v.set_foreign_cas(&[]).unwrap();
+        assert!(
+            v.foreign_anchors().is_empty(),
+            "cache cleared with admission"
         );
     }
 
