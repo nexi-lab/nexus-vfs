@@ -36,9 +36,43 @@ use tonic::Request;
 /// Must be called *before* `Request::into_inner()`, which drops the
 /// extensions along with the rest of the envelope.
 pub fn from_request<T>(req: &Request<T>) -> Option<PeerIdentity> {
+    with_leaf_der(req, from_der).flatten()
+}
+
+/// Peer identity for a request that is **foreign-CA aware**: like [`from_request`]
+/// it reads the TLS-verified leaf cert, but resolves it via [`classify_peer_cert`]
+/// so a cert signed by a registered foreign CA yields a qualified
+/// `{trust_domain}/agent/{name}` identity instead of a bare local name. Falls back
+/// to `None` on any [`ClassifyError`] — same "no proven membership → token plane"
+/// contract as [`from_request`], failing closed (rustls already admitted the chain,
+/// so a classify miss here is defense in depth).
+///
+/// `cluster_ca_der` / `foreign_anchors` come from the live
+/// [`lib::transport_primitives::FederatedClientCertVerifier`] the same handshake
+/// admitted against, so classification and admission never disagree.
+pub fn classify_from_request<T>(
+    req: &Request<T>,
+    cluster_ca_der: &[u8],
+    foreign_anchors: &[ForeignCaAnchor],
+) -> Option<PeerIdentity> {
+    with_leaf_der(req, |der| {
+        classify_peer_cert(der, cluster_ca_der, foreign_anchors).ok()
+    })
+    .flatten()
+}
+
+/// Run `f` with the TLS-verified leaf cert DER borrowed in place off the request
+/// envelope, or `None` for a plaintext / no-client-cert connection.
+///
+/// A closure rather than a returned `Vec` so this stays ZERO-COPY on the auth hot
+/// path (every VFS RPC calls it) — the DER is borrowed, never cloned — while the
+/// "read `peer_certs` before `into_inner()`" extraction lives in exactly one place
+/// for both [`from_request`] and [`classify_from_request`].
+fn with_leaf_der<T, R>(req: &Request<T>, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
     let tls = req.extensions().get::<TlsConnectInfo<TcpConnectInfo>>()?;
     let certs = tls.peer_certs()?;
-    from_der(certs.first()?.as_ref())
+    let leaf = certs.first()?;
+    Some(f(leaf.as_ref()))
 }
 
 /// Parse a DER-encoded leaf certificate into a [`PeerIdentity`].
