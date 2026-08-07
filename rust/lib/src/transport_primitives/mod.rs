@@ -22,7 +22,9 @@ mod tofu;
 pub use channel::{create_channel, ensure_crypto_provider};
 pub use config::{ClientConfig, ServerConfig, TlsConfig};
 pub use error::{Result, TransportError};
-pub use federated_tls::{federated_tls_incoming, server_config, FederatedClientCertVerifier};
+pub use federated_tls::{
+    federated_mtls_incoming, federated_tls_incoming, server_config, FederatedClientCertVerifier,
+};
 pub use foreign_ca::{CaFingerprint, ForeignCaAnchor};
 pub use peer::{hostname_to_node_id, NodeAddress, PeerAddress};
 pub use peer_blob_client::{NoopPeerBlobClient, PeerBlobClient, PeerBlobResult};

@@ -227,10 +227,17 @@ pub fn server_config(
     }
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pem.into_contents()));
 
-    ServerConfig::builder()
+    let mut cfg = ServerConfig::builder()
         .with_client_cert_verifier(verifier)
         .with_single_cert(certs, key)
-        .map_err(|e| format!("server config: {e}"))
+        .map_err(|e| format!("server config: {e}"))?;
+    // Advertise HTTP/2 in ALPN. tonic's built-in `ServerTlsConfig` sets this
+    // automatically; a hand-built rustls `ServerConfig` does NOT, so without it
+    // ALPN negotiation yields no `h2` and tonic's HTTP/2 client fails EVERY mTLS
+    // dial (the whole cluster data plane goes dark). Caught only by a real tonic
+    // handshake — the live federation e2e, not the verifier unit tests.
+    cfg.alpn_protocols = vec![b"h2".to_vec()];
+    Ok(cfg)
 }
 
 /// Backpressure bound for accepted-but-not-yet-consumed connections. Small: tonic
@@ -282,6 +289,33 @@ pub fn federated_tls_incoming(
         }
     });
     ReceiverStream::new(rx)
+}
+
+/// One-shot: bind `addr` and produce the federated-mTLS accept stream that
+/// `tonic::Server::serve_with_incoming` consumes — the whole mTLS server side
+/// assembled HERE so callers (raft `server.rs`) name no rustls / tokio-rustls
+/// types and every serve site is one line.
+///
+/// `verifier` is the shared hot-swappable client-cert verifier when the caller
+/// owns one (so a runtime `set_foreign_cas` reaches this live socket); `None`
+/// builds a cluster-only verifier from `tls.ca_pem` (base mTLS — e.g. the
+/// witness bind, which never trusts foreign CAs). Mandatory client-auth, same
+/// as the prior `client_ca_root(cluster_ca)`. `server_config` pins the crypto
+/// provider internally, so no separate `ensure_crypto_provider` call is needed.
+pub async fn federated_mtls_incoming(
+    addr: std::net::SocketAddr,
+    tls: &super::TlsConfig,
+    verifier: Option<std::sync::Arc<FederatedClientCertVerifier>>,
+) -> Result<impl Stream<Item = std::io::Result<TlsStream<TcpStream>>>, String> {
+    let verifier = match verifier {
+        Some(v) => v,
+        None => FederatedClientCertVerifier::new(&tls.ca_pem)?,
+    };
+    let cfg = server_config(verifier, &tls.cert_pem, &tls.key_pem)?;
+    let listener = TcpListener::bind(addr)
+        .await
+        .map_err(|e| format!("bind {addr}: {e}"))?;
+    Ok(federated_tls_incoming(listener, std::sync::Arc::new(cfg)))
 }
 
 #[cfg(test)]
