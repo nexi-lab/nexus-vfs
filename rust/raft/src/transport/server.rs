@@ -16,13 +16,13 @@ use super::proto::nexus::raft::{
     DiscoverZonesRequest, DiscoverZonesResponse, FederationZoneInfo, GetClusterInfoRequest,
     GetClusterInfoResponse, GetCrlRequest, GetCrlResponse, GetMetadataResult,
     GetSearchCapabilitiesRequest, JoinClusterRequest, JoinClusterResponse, JoinZoneRequest,
-    JoinZoneResponse, ListMetadataResult, LockInfoResult, LockResult, MintAgentRequest,
-    MintAgentResponse, MintKeyRequest, MintKeyResponse, NodeInfo as ProtoNodeInfo, ProposeRequest,
-    ProposeResponse, QueryRequest, QueryResponse, RaftCommand, RaftQueryResponse, RaftResponse,
-    ReadBlobRequest, ReadBlobResponse, RemoveVoterRequest, RemoveVoterResponse,
-    ReplicateEntriesRequest, ReplicateEntriesResponse, RevokeKeyRequest, RevokeKeyResponse,
-    SearchCapabilities, SnapshotEcStateRequest, SnapshotEcStateResponse, StepMessageRequest,
-    StepMessageResponse,
+    JoinZoneResponse, ListKeysRequest, ListKeysResponse, ListMetadataResult, ListedKey,
+    LockInfoResult, LockResult, MintAgentRequest, MintAgentResponse, MintKeyRequest,
+    MintKeyResponse, NodeInfo as ProtoNodeInfo, ProposeRequest, ProposeResponse, QueryRequest,
+    QueryResponse, RaftCommand, RaftQueryResponse, RaftResponse, ReadBlobRequest, ReadBlobResponse,
+    RemoveVoterRequest, RemoveVoterResponse, ReplicateEntriesRequest, ReplicateEntriesResponse,
+    RevokeKeyRequest, RevokeKeyResponse, SearchCapabilities, SnapshotEcStateRequest,
+    SnapshotEcStateResponse, StepMessageRequest, StepMessageResponse,
 };
 use super::{NodeAddress, Result, SharedPeerMap, TransportError};
 use crate::agent_minter::AgentMinterSlot;
@@ -1610,6 +1610,40 @@ impl ZoneApiService for ZoneApiServiceImpl {
                 success: true,
                 error: None,
                 removed,
+            })),
+            Err(e) => Ok(err_resp(e)),
+        }
+    }
+
+    async fn list_keys(
+        &self,
+        request: Request<ListKeysRequest>,
+    ) -> std::result::Result<Response<ListKeysResponse>, Status> {
+        let caller_cert_der = peer_cert_der(&request);
+        let err_resp = |msg: String| {
+            Response::new(ListKeysResponse {
+                success: false,
+                error: Some(msg),
+                keys: Vec::new(),
+            })
+        };
+        let minter = self
+            .key_minter_slot
+            .as_ref()
+            .and_then(|slot| slot.read().as_ref().cloned());
+        let Some(minter) = minter else {
+            return Ok(err_resp(
+                "this node has no sk- key plane (auth-off)".to_string(),
+            ));
+        };
+        match minter.list_keys(caller_cert_der).await {
+            Ok(records) => Ok(Response::new(ListKeysResponse {
+                success: true,
+                error: None,
+                keys: records
+                    .into_iter()
+                    .map(|(key_hash, record)| ListedKey { key_hash, record })
+                    .collect(),
             })),
             Err(e) => Ok(err_resp(e)),
         }

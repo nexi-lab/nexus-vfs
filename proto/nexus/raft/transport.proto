@@ -135,6 +135,13 @@ service ZoneApiService {
   // daemon — the delete forwards to the control-zone leader. Same node-cert gate
   // as MintKey.
   rpc RevokeKey(RevokeKeyRequest) returns (RevokeKeyResponse);
+
+  // ListKeys enumerates the credential records from this daemon's LOCAL
+  // control-zone replica (a read — no leader round-trip), so `auth list` works
+  // on any node without stopping the daemon (offline list is refused on an
+  // enrolled joiner). Same node-cert gate as MintKey. Returns hashes + opaque
+  // records (hashes are not secrets); the CLI decodes + renders.
+  rpc ListKeys(ListKeysRequest) returns (ListKeysResponse);
 }
 
 // NodeEnrollmentService is the pre-mTLS BOOTSTRAP plane: the one surface a
@@ -365,6 +372,25 @@ message RevokeKeyResponse {
   // True if a record was present and removed; false if there was nothing to
   // revoke (already gone).
   bool removed = 3;
+}
+
+// ListKeysRequest enumerates all credential records (no filter). Empty by
+// design; a namespace filter can be added later without breaking the wire.
+message ListKeysRequest {}
+
+// One credential record: its lookup hash + the opaque serialized record the
+// CLI decodes. The hash is not a secret.
+message ListedKey {
+  string key_hash = 1;
+  bytes record = 2;
+}
+
+// ListKeysResponse carries the records from the daemon's local replica, or an
+// error.
+message ListKeysResponse {
+  bool success = 1;
+  optional string error = 2;
+  repeated ListedKey keys = 3;
 }
 
 // DeleteZoneRequest asks a peer to remove its local zone replica.
