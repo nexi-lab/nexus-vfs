@@ -72,6 +72,27 @@ async fn wait_leader(zm: &std::sync::Arc<ZoneManager>, zone_id: &str) {
     panic!("zone {zone_id} did not elect within timeout");
 }
 
+/// Is `id` a current member (voter or learner) of `zone_id`, per the raft
+/// ConfState — the membership SSOT.
+///
+/// Deliberately NOT `registry().get_peers()`.  That map is the transport
+/// *address book*: `server.rs::step_message` re-populates it on every
+/// inbound `StepMessage`, with no membership check by design (so a fresh
+/// joiner whose address isn't known yet is not rejected).  A just-removed
+/// peer that is still running keeps sending raft traffic, so it re-appears
+/// in `get_peers` moments after `RemoveNode` prunes it — that race is what
+/// made this test flaky.  `membership()` reads the `ProgressTracker`, which
+/// only a committed ConfChange mutates, so the assertion is race-free.
+async fn is_member(zm: &std::sync::Arc<ZoneManager>, zone_id: &str, id: u64) -> bool {
+    let zone = zm.get_zone(zone_id).expect("zone loaded");
+    let m = zone
+        .consensus_node()
+        .membership()
+        .await
+        .expect("membership read");
+    m.voters.contains(&id) || m.learners.contains(&id)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn remove_voter_prunes_learner_from_conf_state() {
     // Owner (voter) + joiner (learner) — RemoveVoter against the
@@ -115,15 +136,11 @@ async fn remove_voter_prunes_learner_from_conf_state() {
     .expect("JoinZone");
     assert!(r.success, "JoinZone must succeed: {:?}", r.error);
 
-    // Wait for the joiner to appear in the owner's peer set (an
-    // upper bound on the AddLearnerNode apply).
+    // Wait for the joiner to enter the owner's ConfState as a learner
+    // (an upper bound on the AddLearnerNode apply).
     let mut saw_joiner = false;
     for _ in 0..50 {
-        let peers = zm_owner
-            .registry()
-            .get_peers("sharedzone")
-            .unwrap_or_default();
-        if peers.contains_key(&id_joiner) {
+        if is_member(&zm_owner, "sharedzone", id_joiner).await {
             saw_joiner = true;
             break;
         }
@@ -141,20 +158,19 @@ async fn remove_voter_prunes_learner_from_conf_state() {
         result.error,
     );
 
-    // Wait for the learner to disappear from the owner's peer set.
+    // Wait for the learner to leave the owner's ConfState.
     let mut pruned = false;
     for _ in 0..50 {
-        let peers = zm_owner
-            .registry()
-            .get_peers("sharedzone")
-            .unwrap_or_default();
-        if !peers.contains_key(&id_joiner) {
+        if !is_member(&zm_owner, "sharedzone", id_joiner).await {
             pruned = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(pruned, "RemoveNode did not apply on owner");
+    assert!(
+        pruned,
+        "RemoveNode did not apply on owner (ConfState still lists the learner)"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
