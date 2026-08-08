@@ -189,6 +189,41 @@ impl Kernel {
         self.sys_read_after_auth(path, ctx, 1, 5000, 0)
     }
 
+    /// Gated DT_STREAM offset read (blocking when `timeout_ms > 0`).
+    ///
+    /// The §13 gate + delegation to the pure `ipc` mechanism, so the external
+    /// stream-read RPC funnels through the kernel gate the same way `sys_read`
+    /// does — `Kernel::stream_read_at` stays authz-free mechanism. Semantics
+    /// match the pre-gate handler exactly: a non-blocking miss is `Ok(None)`
+    /// (eof/empty); a blocking timeout is the `stream_read_at_blocking` error.
+    pub fn sys_stream_read_at(
+        &self,
+        path: &str,
+        offset: usize,
+        timeout_ms: u64,
+        ctx: &OperationContext,
+    ) -> Result<Option<(Vec<u8>, usize)>, KernelError> {
+        self.check_permission(path, Permission::Read, ctx)?;
+        if timeout_ms == 0 {
+            self.stream_read_at(path, offset)
+        } else {
+            self.stream_read_at_blocking(path, offset, timeout_ms)
+                .map(Some)
+        }
+    }
+
+    /// Gated whole-stream drain — the §13 gate + delegation to the pure `ipc`
+    /// `stream_collect_all`. Same layering as `sys_stream_read_at`: the
+    /// external RPC goes through the kernel gate, `ipc` stays pure mechanism.
+    pub fn sys_stream_collect_all(
+        &self,
+        path: &str,
+        ctx: &OperationContext,
+    ) -> Result<Vec<u8>, KernelError> {
+        self.check_permission(path, Permission::Read, ctx)?;
+        self.stream_collect_all(path)
+    }
+
     /// Shared read logic: route → metastore → DT_LINK follow → backend.
     ///
     /// Must be called after auth/hooks are resolved. DT_LINK targets
@@ -661,12 +696,11 @@ impl Kernel {
             return miss();
         }
 
-        // 1c. Permission gate (§13) — BEFORE native hooks.
-        self.check_permission(path, Permission::Write, ctx)?;
-
-        // 1d. Native INTERCEPT PRE hooks (§11) — via the shared write-hook
-        // seam so every write path (file / stream / pipe) enforces the same
-        // mutating hooks (e.g. the A2A `from` stamp), not just this one.
+        // 1c. Permission gate (§13) + native INTERCEPT PRE hooks (§11) — via
+        // the shared write seam, so every write path (file / stream / pipe)
+        // enforces the SAME gate + mutating hooks (e.g. the A2A `from` stamp),
+        // not just this one. SSOT: `apply_mutating_write_hooks` runs
+        // `check_permission(Write)` first, then the hooks.
         let replacement = self.apply_mutating_write_hooks(path, ctx, content)?;
         let effective_content: &[u8] = replacement.as_deref().unwrap_or(content);
 
@@ -2840,12 +2874,9 @@ impl Kernel {
         let mut pre_errors: Vec<Option<KernelError>> = vec![None; n];
         let mut replacements: Vec<Option<Vec<u8>>> = Vec::with_capacity(n);
         for (i, req) in reqs.iter().enumerate() {
-            if let Err(e) = self.check_permission(&req.path, Permission::Write, ctx) {
-                pre_errors[i] = Some(e);
-                replacements.push(None);
-                continue;
-            }
-
+            // The shared write seam runs the §13 gate (`check_permission`)
+            // then the mutating hooks; a denial OR a fail-closed hook both
+            // surface as `Err` here, same per-path authorization as before.
             match self.apply_mutating_write_hooks(&req.path, ctx, &req.content) {
                 Ok(replacement) => replacements.push(replacement),
                 Err(e) => {

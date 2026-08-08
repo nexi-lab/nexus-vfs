@@ -108,17 +108,28 @@ impl Kernel {
     ///
     /// This is the SINGLE seam every write syscall funnels through —
     /// `sys_write` / `write_batch` (DT_FILE), `stream_write_nowait`
-    /// (DT_STREAM), `pipe_write_nowait` (DT_PIPE). A content guarantee such as
-    /// the A2A `from` stamp therefore holds on EVERY write path, not just
-    /// `sys_write`: it must not depend on which RPC the caller used. The
-    /// `has_mutating_hook_match` clone gate keeps the no-hook hot path (e.g.
-    /// LLM token streams) allocation-free.
+    /// (DT_STREAM), `pipe_write_nowait` (DT_PIPE). Two guarantees therefore
+    /// hold on EVERY write path, not just `sys_write`, and cannot depend on
+    /// which RPC the caller picked: (1) the §13 **permission gate**
+    /// (`check_permission(Write)`, enforced first), and (2) content hooks such
+    /// as the A2A `from` stamp. The `has_mutating_hook_match` clone gate keeps
+    /// the no-hook hot path (e.g. LLM token streams) allocation-free.
     pub fn apply_mutating_write_hooks(
         &self,
         path: &str,
         ctx: &OperationContext,
         content: &[u8],
     ) -> Result<Option<Vec<u8>>, KernelError> {
+        // §13 permission gate — enforced HERE, in the single write seam, so
+        // EVERY write path is gated identically: sys_write / write_batch
+        // (DT_FILE), stream_write_nowait (DT_STREAM), pipe_write_nowait
+        // (DT_PIPE). SSOT — a provider (e.g. foreign-agent containment)
+        // applies to streams and pipes for free, not only sys_write. The
+        // file syscalls that used to gate separately (sys_write, write_batch)
+        // no longer do; the check is not bypassable by choosing the stream /
+        // pipe RPC over sys_write.
+        self.check_permission(path, Permission::Write, ctx)?;
+
         let hook_content = if self.has_mutating_hook_match(path) {
             content.to_vec()
         } else {
