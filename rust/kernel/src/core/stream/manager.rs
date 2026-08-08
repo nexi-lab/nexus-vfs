@@ -202,6 +202,34 @@ impl StreamManager {
         Ok(offset)
     }
 
+    /// Wake every blocking reader parked on `path` WITHOUT appending — the
+    /// cross-machine apply-observer hook.
+    ///
+    /// A `read_at_blocking` reader parks on the per-path condvar, which is
+    /// signalled only by the node-local write path ([`Self::write_nowait`]).
+    /// On a **replica** a peer's `AppendStreamEntry` is materialised into the
+    /// durable WAL by the raft apply loop — never `write_nowait` — so the
+    /// parked reader is never signalled by the write itself. The stream-wakeup
+    /// apply-observer calls this AFTER the entry is durably applied; the woken
+    /// reader re-checks its offset against the now-committed WAL (through
+    /// [`Self::resolve`]) and returns the new frame. This is the DT_STREAM twin
+    /// of `Kernel::wake_file_watch` (which wakes the *other* cross-machine wait
+    /// primitive, `sys_watch`); the A2A mailbox tail uses THIS one.
+    ///
+    /// Returns `false` (no-op) when no reader has ever registered `path` — the
+    /// notify slot is created lazily by `create`/`register`/`resolve`, so an
+    /// absent slot means nothing is parked to wake, and a later reader takes
+    /// the fast path over the already-committed data.
+    pub fn wake_waiters(&self, path: &str) -> bool {
+        match self.notify.get(path) {
+            Some(n) => {
+                n.wake_all_readers();
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Read one message at byte offset. Returns (data, next_offset) or None if empty.
     pub fn read_at(
         &self,
@@ -581,5 +609,56 @@ mod tests {
             Err(StreamManagerError::Closed(_)) => {}
             other => panic!("expected Closed, got {other:?}"),
         }
+    }
+
+    /// Regression for the cross-machine A2A tail wake.
+    ///
+    /// On a **replica**, a peer's `AppendStreamEntry` is materialised into the
+    /// backend by the raft apply loop — NOT [`StreamManager::write_nowait`] —
+    /// so the backend gains a frame WITHOUT the condvar signal a local write
+    /// carries. A `read_at_blocking` tail parked there is therefore never woken
+    /// by the write itself; the stream-wakeup apply-observer must signal it via
+    /// [`StreamManager::wake_waiters`]. This test reproduces that exact
+    /// decoupling: it pushes straight into the backend (the out-of-band apply
+    /// path) and then relies SOLELY on `wake_waiters` to wake the reader —
+    /// `write_nowait` is never called, so a no-op `wake_waiters` would leave
+    /// the reader parked until its timeout and fail the test.
+    #[test]
+    fn wake_waiters_wakes_a_reader_over_an_out_of_band_backend_push() {
+        let path = "/agents/peer/chat-with-me";
+        let backend = Arc::new(MemoryStreamBackend::new(4096));
+        let sm = Arc::new(StreamManager::new());
+        // `register` keeps the notify slot the reader parks on; we retain the
+        // backend Arc to push into it out-of-band (the raft apply loop's role).
+        sm.register(path, backend.clone())
+            .expect("register backend");
+
+        let reader_sm = Arc::clone(&sm);
+        let reader = thread::spawn(move || {
+            // Empty at offset 0 → the reader parks on the condvar. Timeout is
+            // the failure backstop: a broken `wake_waiters` surfaces as
+            // `WouldBlock` here rather than hanging the suite.
+            reader_sm.read_at_blocking(path, 0, 3_000)
+        });
+        // Let the reader actually reach the condvar wait before the frame lands.
+        thread::sleep(Duration::from_millis(100));
+
+        // Out-of-band materialisation: the frame is now readable, but nothing
+        // signalled the condvar (this is the replica apply path, not a write).
+        backend.push(b"from-a-peer").expect("apply-side push");
+
+        // The observer's wake is the SOLE waker — proves the fix end to end.
+        assert!(
+            sm.wake_waiters(path),
+            "wake_waiters must find the registered notify slot"
+        );
+        let (data, _next) = reader
+            .join()
+            .expect("reader thread")
+            .expect("reader must wake via wake_waiters and read the out-of-band frame");
+        assert_eq!(data, b"from-a-peer");
+
+        // No slot for an unknown path → no-op, reported as false.
+        assert!(!sm.wake_waiters("/agents/nobody/chat-with-me"));
     }
 }

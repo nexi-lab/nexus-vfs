@@ -1,19 +1,30 @@
 //! A2A cross-machine stream-wakeup — the apply-side observer that lets a
-//! replicated `AppendStreamEntry` wake a `sys_watch` parked on a replica.
+//! replicated `AppendStreamEntry` wake a reader parked on a replica.
 //!
 //! ## Why this exists
 //!
-//! A2A's cross-machine interrupt primitive is `sys_watch` /
-//! `FileWatchRegistry`, not the node-local `StreamManager` condvar. On the
-//! node that runs the write, `Kernel::dispatch_observers` already fires the
-//! watcher inline. On a **replica** the local syscall path never ran for
-//! that entry — the mutation arrived over the raft log and was materialised
-//! by the apply loop — so nothing wakes a parked watcher. This observer is
-//! the missing subscriber that closes that gap: it rides the unified
-//! apply-observer spine (the same seam DCache invalidation, federation-mount
-//! wiring, and auth-cache eviction subscribe to) and, for every applied
-//! `AppendStreamEntry`, wakes the `sys_watch` parked on the entry's file
-//! path via `Kernel::wake_file_watch`.
+//! A2A has TWO cross-machine wait primitives, and a parked reader on a
+//! replica is woken by neither on its own:
+//!
+//! * **DT_STREAM tail (PRIMARY)** — `stream_read_at_blocking` →
+//!   `StreamManager::read_at_blocking`, the primitive the A2A mailbox tail
+//!   and hydra's `watch` use. It parks on the StreamManager per-path condvar,
+//!   signalled only by the node-local write path (`write_nowait`).
+//! * **`sys_watch` file-watch** — `FileWatchRegistry`, an inotify-style
+//!   watcher that may be parked on the same mailbox path.
+//!
+//! On the node that runs the write, the local syscall path signals both
+//! inline (the StreamManager condvar via `write_nowait`; the file-watch via
+//! `dispatch_observers`). On a **replica** the local syscall path never ran
+//! for that entry — the mutation arrived over the raft log and was
+//! materialised by the apply loop into the durable WAL — so neither condvar
+//! is signalled and a parked reader hangs until its long-poll times out.
+//! This observer is the missing subscriber that closes that gap: it rides the
+//! unified apply-observer spine (the same seam DCache invalidation,
+//! federation-mount wiring, and auth-cache eviction subscribe to) and, for
+//! every applied `AppendStreamEntry`, wakes BOTH primitives parked on the
+//! entry's file path — `Kernel::wake_stream_waiters` (the DT_STREAM tail) and
+//! `Kernel::wake_file_watch` (the `sys_watch` file-watch).
 //!
 //! ## Key format — why no per-zone `to_global`
 //!
@@ -33,11 +44,11 @@
 //! applied, under `catch_unwind`. This observer honours the contract:
 //! * **side-effect only** — never mutates state-machine state, so apply
 //!   stays deterministic across replicas;
-//! * **non-blocking** — `wake_file_watch` is a single `condvar.notify_one`
-//!   behind an RwLock read;
+//! * **non-blocking** — each wake is a single `condvar.notify` behind a
+//!   `DashMap`/RwLock read;
 //! * **cheap when idle** — a non-`AppendStreamEntry` command returns
 //!   immediately; a non-stream (pipe) key parses to `None`; a wake with no
-//!   matching watcher is one RwLock read plus an iterator filter.
+//!   parked reader is one lookup that finds nothing.
 //!
 //! ## Ownership
 //!
@@ -51,9 +62,9 @@
 //! ## Scope
 //!
 //! The composition root arms this on every zone whose DT_STREAMs must wake
-//! watchers cross-machine — root plus each federation mount (a chat-with-me
+//! readers cross-machine — root plus each federation mount (a chat-with-me
 //! in a shared `/agents` zone replicates across members, and this observer
-//! wakes the peer's parked `sys_watch` on apply).
+//! wakes the peer's parked mailbox tail on apply).
 
 use std::sync::{Arc, Weak};
 
@@ -64,11 +75,14 @@ use crate::prelude::{AppliedEntry, Command, FullStateMachine, ZoneConsensus};
 
 /// Register the A2A stream-wakeup observer on `consensus`.
 ///
-/// For every applied `AppendStreamEntry`, wakes any `sys_watch` parked on the
-/// stream's file path via `Kernel::wake_file_watch`. The command carries the
-/// stream PREFIX (`/__wal_stream__/<path>/`); `watch_path_from_wal_stream_key`
-/// recovers the watched `<path>`. Non-stream commands are ignored. See the
-/// module docs for the raft usage contract and why the kernel is held weakly.
+/// For every applied `AppendStreamEntry`, wakes BOTH cross-machine wait
+/// primitives parked on the stream's file path — the DT_STREAM tail
+/// (`Kernel::wake_stream_waiters`, the primitive the A2A mailbox tail uses)
+/// and any `sys_watch` file-watcher (`Kernel::wake_file_watch`). The command
+/// carries the stream PREFIX (`/__wal_stream__/<path>/`);
+/// `watch_path_from_wal_stream_key` recovers the watched `<path>`. Non-stream
+/// commands are ignored. See the module docs for the raft usage contract and
+/// why the kernel is held weakly.
 ///
 /// Anonymous registration (accumulate): one observer per zone consensus is
 /// correct, matching the DCache-invalidator precedent. A distinct zone has
@@ -82,6 +96,15 @@ pub fn install_stream_wakeup_observer(
         if let Command::AppendStreamEntry { stream_prefix, .. } = &entry.command {
             if let Some(path) = watch_path_from_wal_stream_key(stream_prefix) {
                 if let Some(kernel) = kernel.upgrade() {
+                    // Wake BOTH cross-machine wait primitives parked on this
+                    // path. The A2A mailbox tail (`stream_read_at_blocking`,
+                    // used by hydra `watch` and every DT_STREAM follower) parks
+                    // on the StreamManager per-path condvar — the PRIMARY
+                    // primitive, and the one a replica apply otherwise never
+                    // signals. A `sys_watch` file-watcher on the same path
+                    // parks on the `FileWatchRegistry` instead; wake it too so
+                    // an inotify-style watcher on the mailbox path also fires.
+                    kernel.wake_stream_waiters(path);
                     kernel.wake_file_watch(path);
                 }
             }
