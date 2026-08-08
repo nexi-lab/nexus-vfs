@@ -218,7 +218,9 @@ impl Kernel {
     ///
     /// One kernel call returns the whole stream, so LLM-backend
     /// callers can replace a per-frame `read_at` loop with a single
-    /// drain.
+    /// drain. Pure mechanism — the §13 read gate is the dispatch layer's
+    /// job (`sys_read` for offset reads; the external RPC handler invokes
+    /// `check_permission(Read)` for this whole-stream variant), never here.
     pub fn stream_collect_all(&self, path: &str) -> Result<Vec<u8>, KernelError> {
         self.stream_manager
             .collect_all_payloads(path)
