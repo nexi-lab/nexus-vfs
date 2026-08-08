@@ -1,4 +1,4 @@
-//! Black-box E2E for the cross-org (cross-CA) plane, two halves:
+//! Black-box E2E for the cross-org (cross-CA) plane, three properties:
 //!
 //! * ADMISSION — `foreign-ca register` makes a foreign CA trusted at the mTLS
 //!   handshake, LIVE without a restart, via the daemon → control zone → apply
@@ -8,6 +8,10 @@
 //! * ATTRIBUTION — a foreign agent's mailbox write is stamped with its QUALIFIED
 //!   cross-org id `{trust_domain}/agent/{name}`, so a receiver sees which ORG
 //!   actually wrote it, not a spoofable claim in the envelope.
+//! * CONTAINMENT — that same foreign agent, though authenticated, is confined
+//!   to its `*/chat-with-me` mailbox: a read/write of any other SaaS path is
+//!   denied, so a tampered on-prem box can't exfiltrate. A domestic agent is
+//!   unaffected.
 //!
 //! No second machine + no real customer CA needed (`CA_B` is generated here);
 //! the cross-MACHINE run with a real DGX CA_B is the same flow over Tailscale.
@@ -250,15 +254,14 @@ async fn foreign_agent_mailbox_write_is_stamped_with_qualified_id() {
     .await;
 
     // It writes a PLAIN-JSON envelope that LIES about `from`. The mailbox stamp
-    // must overwrite it with the qualified cross-org id — never the spoof.
-    let mbox_dir = format!("{MOUNT}/xorg");
-    wc.mkdir(&mbox_dir, "")
-        .await
-        .expect("foreign agent makes a dir");
-    let mailbox = format!("{mbox_dir}/chat-with-me");
+    // must overwrite it with the qualified cross-org id — never the spoof. The
+    // mailbox sits directly under the mount: a foreign agent is confined to
+    // `*/chat-with-me` (see `foreign_agent_is_confined_to_its_mailbox`), so it
+    // cannot mkdir a parent dir — the SaaS side owns any deeper provisioning.
+    let mailbox = format!("{MOUNT}/chat-with-me");
     wc.create_stream(&mailbox, "")
         .await
-        .expect("foreign agent opens a mailbox");
+        .expect("foreign agent opens its mailbox");
     wc.stream_write(
         &mailbox,
         br#"{"from":"i-am-whoever-i-say","to":"broker","body":"hi from a foreign agent"}"#,
@@ -281,6 +284,52 @@ async fn foreign_agent_mailbox_write_is_stamped_with_qualified_id() {
     assert!(
         !got.contains("i-am-whoever-i-say"),
         "the spoofed `from` must not survive the stamp; got: {got}"
+    );
+
+    drop(fx.founder);
+}
+
+/// A foreign agent is authenticated but SEMI-TRUSTED (e.g. an on-prem DGX an
+/// FDE delivers to a customer site): it authors its mailbox, but must not read
+/// or write the rest of the SaaS. The permission gate armed on the cross-org
+/// plane confines it to `*/chat-with-me` — so a tampered box can't exfiltrate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn foreign_agent_is_confined_to_its_mailbox() {
+    let fx = boot_founder_with_ca_b().await;
+    fx.register_ca_b();
+    let mut wc = Vfs::connect_mtls(
+        fx.fport,
+        &fx.cluster_ca,
+        &fx.foreign_cert,
+        &fx.foreign_key,
+        BUDGET,
+    )
+    .await;
+
+    // Positive control: its OWN mailbox is fully usable.
+    let mailbox = format!("{MOUNT}/chat-with-me");
+    wc.create_stream(&mailbox, "")
+        .await
+        .expect("foreign agent opens its mailbox");
+    wc.stream_write(&mailbox, br#"{"body":"hi"}"#, "")
+        .await
+        .expect("foreign agent writes its own mailbox");
+
+    // Confinement: a WRITE outside the mailbox is denied. This is the
+    // unambiguous proof the gate fires live — without it the write would
+    // SUCCEED (the cluster gate is otherwise a no-op). The provider is
+    // permission-agnostic, so reads of non-mailbox paths are denied by the
+    // very same branch (unit-tested in `a2a::foreign_containment`).
+    let off_limits = format!("{MOUNT}/secret.txt");
+    let write = wc.write_file(&off_limits, b"exfil", "").await;
+    assert!(
+        write.is_err(),
+        "a foreign agent MUST NOT write outside its mailbox; got Ok"
+    );
+    let err = write.err().unwrap();
+    assert!(
+        err.contains("confined") || err.to_lowercase().contains("permission"),
+        "the denial must be the containment gate (not some other error); got: {err}"
     );
 
     drop(fx.founder);

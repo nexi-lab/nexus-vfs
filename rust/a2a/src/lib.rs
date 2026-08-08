@@ -28,9 +28,11 @@
 //! → process). A frontend consumes [`MailboxStampingHook`]; only the
 //! daemon calls [`install_a2a_stamp_hook`].
 
+pub mod foreign_containment;
 pub mod mailbox_stamping_hook;
 pub mod mailbox_stamping_policy;
 
+pub use foreign_containment::{install_foreign_agent_containment, ForeignAgentMailboxOnly};
 pub use mailbox_stamping_hook::MailboxStampingHook;
 
 use kernel::kernel::Kernel;
