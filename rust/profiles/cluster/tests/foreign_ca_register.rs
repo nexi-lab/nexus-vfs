@@ -332,5 +332,29 @@ async fn foreign_agent_is_confined_to_its_mailbox() {
         "the denial must be the containment gate (not some other error); got: {err}"
     );
 
+    // Positive: reading its OWN mailbox stream works.
+    assert!(
+        !wc.stream_collect_all(&mailbox, "")
+            .await
+            .expect("foreign agent reads its own mailbox")
+            .is_empty(),
+        "own-mailbox read returns the message it wrote"
+    );
+
+    // Confinement extends to STREAM ops — append + read — not just files. The
+    // mailbox IS a DT_STREAM, so without gating streams a tampered box could
+    // write rogue streams and read OTHER agents' mailbox streams. (Create via
+    // `setattr` isn't gated yet — `sys_setattr` takes no ctx; harmless while
+    // the write is gated, so it stays a create-only, unwritable node.)
+    let evil = format!("{MOUNT}/evil-inbox");
+    assert!(
+        wc.stream_write(&evil, br#"{"x":1}"#, "").await.is_err(),
+        "a foreign agent MUST NOT append to a non-mailbox stream"
+    );
+    assert!(
+        wc.stream_collect_all(&evil, "").await.is_err(),
+        "a foreign agent MUST NOT read a non-mailbox stream"
+    );
+
     drop(fx.founder);
 }
