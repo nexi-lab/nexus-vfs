@@ -12,8 +12,9 @@
 //!
 //! The **cross-machine delivery wake** is a separate, generic raft
 //! primitive (`nexus_raft::stream_wakeup::install_stream_wakeup_observer`:
-//! a replicated `AppendStreamEntry` wakes a `sys_watch` parked on a
-//! replica). It is NOT a2a-specific — A2A's `chat-with-me` DT_STREAM
+//! a replicated `AppendStreamEntry` wakes a reader parked on a replica —
+//! both the DT_STREAM blocking tail and any `sys_watch` file-watcher on the
+//! path). It is NOT a2a-specific — A2A's `chat-with-me` DT_STREAM
 //! merely rides it — so it is armed per-zone by the composition root
 //! (which holds the `Arc<Kernel>` the observer needs a `Weak` of, and the
 //! federation-mount config that maps each zone's key to its caller-facing

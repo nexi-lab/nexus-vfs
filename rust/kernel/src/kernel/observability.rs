@@ -114,8 +114,10 @@ impl Kernel {
         self.file_watches.wait_for_event(pattern, timeout_ms)
     }
 
-    /// Wake any `sys_watch` parked on `path` — the replica-side (apply)
-    /// wake primitive for cross-machine A2A (§A).
+    /// Wake any `sys_watch` parked on `path` — one of the two replica-side
+    /// (apply) wake primitives for cross-machine A2A (§A); its twin,
+    /// [`Self::wake_stream_waiters`], wakes the DT_STREAM blocking tail that
+    /// the A2A mailbox actually uses.
     ///
     /// On the node that ran the write syscall, `dispatch_observers` already
     /// fires `notify_match` inline. But on a **replica** the local syscall
@@ -138,5 +140,22 @@ impl Kernel {
     pub fn wake_file_watch(&self, path: &str) {
         self.file_watches
             .notify_match(&FileEvent::new(FileEventType::FileWrite, path));
+    }
+
+    /// Wake any `StreamReadAt`-blocking reader parked on the DT_STREAM at
+    /// `path` — the replica-side (apply) wake for the OTHER cross-machine
+    /// wait primitive.
+    ///
+    /// Twin of [`Self::wake_file_watch`]. A DT_STREAM mailbox tail
+    /// (`stream_read_at_blocking` → `StreamManager::read_at_blocking` — the
+    /// primitive the A2A mailbox tail and hydra's `watch` use) parks on the
+    /// StreamManager per-path condvar, NOT the `FileWatchRegistry`. On the
+    /// writer node the local write path signals that condvar inline; on a
+    /// **replica** the entry lands via the raft apply loop, so the
+    /// stream-wakeup observer must signal it here after the entry is durably
+    /// applied. Cheap + non-blocking (one `DashMap` get + a condvar notify);
+    /// a no-op when no reader is parked on `path`.
+    pub fn wake_stream_waiters(&self, path: &str) {
+        self.stream_manager.wake_waiters(path);
     }
 }
