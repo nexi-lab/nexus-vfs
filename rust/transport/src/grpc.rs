@@ -1230,6 +1230,24 @@ impl NexusVfsService for VfsServiceImpl {
                 is_error: false,
                 error_payload: Vec::new(),
             })),
+            // A BLOCKING read that reaches its timeout with no frame is NOT a wire
+            // error — it is a normal long-poll expiry, semantically identical to the
+            // non-blocking `Ok(None)` "nothing ready" case above. Collapse it to the
+            // same `eof` (same cursor) so a tail-follow client (`watch`) re-polls
+            // instead of tearing the tail down; without this, a mailbox tail idle
+            // longer than one timeout window dies on its first quiet period. The
+            // kernel syscall deliberately keeps returning `Err(WouldBlock)` (its Rust
+            // contract is unchanged); only this wire boundary unifies timeout+empty
+            // into one "no frame yet" signal. `WouldBlock` can only arise from the
+            // blocking path here; a closed stream is a distinct `Closed` error and
+            // still surfaces as `is_error`.
+            Err(KernelError::WouldBlock(_)) => Ok(Response::new(StreamReadAtResponse {
+                data: Vec::new(),
+                next_offset: req.offset,
+                eof: true,
+                is_error: false,
+                error_payload: Vec::new(),
+            })),
             Err(err) => {
                 let (code, msg) = self.map_kernel_err(err);
                 Ok(Response::new(StreamReadAtResponse {
@@ -2800,6 +2818,58 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(2),
             "timeout_ms=0 pipe read must be non-blocking; took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn blocking_stream_read_timeout_is_eof_not_wire_error() {
+        // A tail-follow (`watch`) blocks on an empty DT_STREAM. When the timeout
+        // expires with no frame it must come back as `eof` (retry from the same
+        // cursor), NOT a wire error — otherwise a mailbox tail idle past one window
+        // tears itself down and misses every later message. The kernel syscall
+        // still returns `Err(WouldBlock)`; this asserts the transport collapses that
+        // into the same "no frame yet" signal as the non-blocking empty read.
+        let kernel = std::sync::Arc::new(kernel_with_mem_backend());
+        let svc = VfsServiceImpl::for_test(kernel);
+
+        // Create an empty DT_STREAM (entry_type 4).
+        let created = svc
+            .setattr(tonic::Request::new(SetattrRequest {
+                path: "/nexus/streams/idle-tail".into(),
+                auth_token: "test-key".into(),
+                entry_type: 4,
+                capacity: 65_536,
+                ..Default::default()
+            }))
+            .await
+            .expect("setattr rpc ok")
+            .into_inner();
+        assert!(!created.is_error, "stream create failed: {created:?}");
+
+        let resp = svc
+            .stream_read_at(tonic::Request::new(StreamReadAtRequest {
+                path: "/nexus/streams/idle-tail".into(),
+                auth_token: "test-key".into(),
+                offset: 0,
+                blocking: true,
+                timeout_ms: 300,
+            }))
+            .await
+            .expect("stream_read_at rpc ok")
+            .into_inner();
+
+        assert!(
+            !resp.is_error,
+            "a blocking-read timeout must NOT be a wire error"
+        );
+        assert!(
+            resp.eof,
+            "a blocking-read timeout must surface as eof (no frame yet)"
+        );
+        assert!(resp.data.is_empty(), "a timeout yields no bytes");
+        assert_eq!(
+            resp.next_offset, 0,
+            "cursor unchanged so the client re-polls from the same offset"
         );
     }
 
