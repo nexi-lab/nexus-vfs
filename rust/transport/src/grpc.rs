@@ -748,7 +748,14 @@ impl NexusVfsService for VfsServiceImpl {
         if req.entry_type == 2 {
             return Ok(Response::new(self.setattr_mount(req, &ctx)));
         }
-        let _ = ctx; // non-mount typed setattr does not gate on ctx today
+        // Non-mount typed setattr (create dir/stream/pipe, or a metadata
+        // update) is not gated yet: `sys_setattr` takes no `ctx`, so the §13
+        // gate can't run in-kernel where it belongs. Follow-up: thread `ctx`
+        // through `sys_setattr` (a codegen-ABI change across its callers).
+        // Create-only is low-harm — the write seam already denies WRITING a
+        // rogue stream, so a foreign agent can at most create an empty,
+        // unwritable node.
+        let _ = ctx;
 
         let zone_id_str = req.zone_id;
         let zone_id = if zone_id_str.is_empty() {
@@ -1191,64 +1198,47 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<StreamReadAtRequest>,
     ) -> Result<Response<StreamReadAtResponse>, Status> {
-        let (_ctx, req) = match self.authenticate(req) {
+        let (ctx, req) = match self.authenticate(req) {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_stream_read(s))),
         };
-        if req.blocking {
-            // Offload: blocking stream read waits up to timeout_ms
+        // The kernel wrapper `sys_stream_read_at` runs the §13 gate then
+        // delegates to the pure ipc read; the transport only marshals + (for
+        // blocking) offloads to a blocking thread. Authz stays in the kernel.
+        let offset = req.offset as usize;
+        let result = if req.blocking {
             let kernel = self.kernel.clone();
-            let path = req.path;
-            let offset = req.offset as usize;
+            let path = req.path.clone();
             let timeout_ms = req.timeout_ms;
-            let blk_res =
-                run_blocking(move || kernel.stream_read_at_blocking(&path, offset, timeout_ms))
-                    .await?;
-            match blk_res {
-                Ok((data, next)) => Ok(Response::new(StreamReadAtResponse {
-                    data,
-                    next_offset: next as u64,
-                    eof: false,
-                    is_error: false,
-                    error_payload: Vec::new(),
-                })),
-                Err(err) => {
-                    let (code, msg) = self.map_kernel_err(err);
-                    Ok(Response::new(StreamReadAtResponse {
-                        data: Vec::new(),
-                        next_offset: 0,
-                        eof: false,
-                        is_error: true,
-                        error_payload: encode_rpc_error(code, &msg),
-                    }))
-                }
-            }
+            let ctx = ctx.clone();
+            run_blocking(move || kernel.sys_stream_read_at(&path, offset, timeout_ms, &ctx)).await?
         } else {
-            match self.kernel.stream_read_at(&req.path, req.offset as usize) {
-                Ok(Some((data, next))) => Ok(Response::new(StreamReadAtResponse {
-                    data,
-                    next_offset: next as u64,
-                    eof: false,
-                    is_error: false,
-                    error_payload: Vec::new(),
-                })),
-                Ok(None) => Ok(Response::new(StreamReadAtResponse {
+            self.kernel.sys_stream_read_at(&req.path, offset, 0, &ctx)
+        };
+        match result {
+            Ok(Some((data, next))) => Ok(Response::new(StreamReadAtResponse {
+                data,
+                next_offset: next as u64,
+                eof: false,
+                is_error: false,
+                error_payload: Vec::new(),
+            })),
+            Ok(None) => Ok(Response::new(StreamReadAtResponse {
+                data: Vec::new(),
+                next_offset: req.offset,
+                eof: true,
+                is_error: false,
+                error_payload: Vec::new(),
+            })),
+            Err(err) => {
+                let (code, msg) = self.map_kernel_err(err);
+                Ok(Response::new(StreamReadAtResponse {
                     data: Vec::new(),
-                    next_offset: req.offset,
-                    eof: true,
-                    is_error: false,
-                    error_payload: Vec::new(),
-                })),
-                Err(err) => {
-                    let (code, msg) = self.map_kernel_err(err);
-                    Ok(Response::new(StreamReadAtResponse {
-                        data: Vec::new(),
-                        next_offset: 0,
-                        eof: false,
-                        is_error: true,
-                        error_payload: encode_rpc_error(code, &msg),
-                    }))
-                }
+                    next_offset: 0,
+                    eof: false,
+                    is_error: true,
+                    error_payload: encode_rpc_error(code, &msg),
+                }))
             }
         }
     }
@@ -1257,11 +1247,13 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<IpcPathRequest>,
     ) -> Result<Response<StreamCollectAllResponse>, Status> {
-        let (_ctx, req) = match self.authenticate(req) {
+        let (ctx, req) = match self.authenticate(req) {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_stream_collect(s))),
         };
-        match self.kernel.stream_collect_all(&req.path) {
+        // The kernel wrapper `sys_stream_collect_all` runs the §13 gate then
+        // delegates to the pure ipc drain; authz stays in the kernel.
+        match self.kernel.sys_stream_collect_all(&req.path, &ctx) {
             Ok(data) => Ok(Response::new(StreamCollectAllResponse {
                 data,
                 is_error: false,
