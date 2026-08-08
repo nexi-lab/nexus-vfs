@@ -399,7 +399,14 @@ impl AuthProvider for ApiKeyAuthProvider {
                     Some(_) => peer.display_id(),
                     None => agent.clone(),
                 };
-                return Ok(Self::agent_context(&agent_id));
+                // Carry the trust domain into the context so the permission
+                // gate can contain a FOREIGN agent to its mailbox. A local
+                // agent keeps `None` and is unaffected. SSOT: the value comes
+                // from the classified `PeerIdentity`, never re-parsed from the
+                // qualified `agent_id` string.
+                let mut ctx = Self::agent_context(&agent_id);
+                ctx.trust_domain = peer.trust_domain.clone();
+                return Ok(ctx);
             }
             return Ok(Self::peer_context(peer));
         }

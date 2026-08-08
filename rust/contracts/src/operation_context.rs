@@ -23,6 +23,12 @@ pub struct OperationContext {
     pub is_admin: bool,
     /// Agent identity (optional, for agent-initiated operations).
     pub agent_id: Option<String>,
+    /// Cross-org trust domain for a FOREIGN agent, set by
+    /// `classify_peer_cert`: `None` = domestic (a cluster-CA identity),
+    /// `Some(td)` = an external org whose CA was `foreign-ca register`ed.
+    /// The permission gate reads this to contain a foreign agent to its
+    /// mailbox; a domestic caller (`None`) is never restricted by it.
+    pub trust_domain: Option<String>,
     /// System operation flag (bypasses all checks).
     pub is_system: bool,
     /// Group memberships for ReBAC.
@@ -86,6 +92,7 @@ impl OperationContext {
             zone_id: zone_id.to_string(),
             is_admin,
             agent_id: agent_id.map(|s| s.to_string()),
+            trust_domain: None,
             is_system,
             groups: Vec::new(),
             admin_capabilities: Vec::new(),
