@@ -1524,6 +1524,12 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     // stays empty, request path stays local-only.
     if let Some(verifier) = zm.foreign_ca_verifier() {
         let _ = fca_verifier_slot.set(verifier);
+        // A foreign agent this verifier admits is authenticated but
+        // semi-trusted (e.g. an on-prem DGX delivered to a customer site):
+        // it authors its mailbox, but must not read/write the rest of the
+        // SaaS. Arm the least-privilege gate whenever the foreign-CA plane
+        // is live; a domestic caller (`trust_domain = None`) is unaffected.
+        a2a::install_foreign_agent_containment(&kernel);
     }
 
     // Remote agent-cert mint (task #40): the CA holder installs an `AgentMinter`
