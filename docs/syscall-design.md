@@ -39,7 +39,7 @@ All path-addressed. No hash-addressing (CAS is driver detail, not kernel concern
 | 5 | Namespace | `sys_unlink` | `(path, recursive=False) → dict` | `unlink(2)` |
 | 6 | Namespace | `sys_rename` | `(old, new) → dict` | `rename(2)` |
 | 7 | Namespace | `sys_copy` | `(src, dst) → dict` | — (server-side copy, Issue #3329) |
-| 8 | Directory | `sys_readdir` | `(path, recursive=True, limit=None) → list` | `readdir(3)` — `/__sys__/locks/` returns active locks (like `/proc/locks`) |
+| 8 | Directory | `sys_readdir` | `(path, recursive=False, limit=None) → list` | `readdir(3)` — `recursive`/`limit` (ReaddirOpts) are real in Rust: recursive lists the whole subtree in ONE kernel-side call (the metastore's native `list(prefix)` scan), default single-level; `/__sys__/locks/` returns active locks (like `/proc/locks`) |
 | 9 | Locking | `sys_lock` | `(path, mode, ttl, max_holders, lock_id=None) → str \| None` | `fcntl(F_SETLK)` — acquire (lock_id=None) or extend TTL (lock_id=existing) |
 | 10 | Locking | `sys_unlock` | `(path, lock_id=None, force=False) → bool` | `flock(LOCK_UN)` — release by lock_id, or force-release all holders |
 | 11 | Watch | `sys_watch` | `(path, timeout, recursive) → dict \| None` | `inotify(7)` |
@@ -60,8 +60,20 @@ All path-addressed. No hash-addressing (CAS is driver detail, not kernel concern
 | `rmdir` | 2 | `sys_unlink(recursive=)` | Recursive directory delete; optimized inherent override on `KernelConvenience` |
 | `access` | 2 | `sys_stat` | Returns `True` if stat succeeds |
 | `is_directory` | 2 | `sys_stat` | Checks `is_directory` field |
-| `glob` | 2 | `sys_readdir` + `fnmatch` | Pattern matching over directory listing. Python-side composition. |
-| `grep` | 2 | `sys_readdir` + `sys_read` + `re` | Content search across files. Python-side composition. |
+| `glob` | 2 | `sys_readdir(recursive)` + `fnmatch` | Namespace scan: ONE kernel-side recursive listing, then an O(1) `fnmatch` filter per returned path. The filter may run anywhere (it is local work over an already-fetched result), because the traversal itself is one server-side call — not N single-level reads across the boundary. |
+| `grep` | 2 | `KernelConvenience::grep_subtree` | Content scan: one recursive `sys_readdir` + `sys_read` + `lib::search` match, run entirely kernel-side. Rides the search subsystem (the sole search backend), not a client tree-walk. Also the in-process API a co-hosted agent calls through `K: KernelConvenience`. |
+
+> **Principle — a traversal/scan is a server-side one-call op, never
+> client-side composition.** A tree walk composed on the client (N single-level
+> reads) costs O(directories) round-trips across the syscall/RPC boundary and
+> tempts a caller to bypass the VFS entirely with a host `WalkDir`. So the walk
+> executes kernel-side and returns in ONE call: recursion is a *mode* of
+> `sys_readdir` (a separate `sys_glob` would overlap its "enumerate namespace"
+> axis), and grep is a Tier-2 *composition* over it, not a new syscall. glob and
+> grep are orthogonal reflections of this: glob is the namespace half
+> (`sys_readdir(recursive)` + `fnmatch`), grep is the content half
+> (`sys_readdir(recursive)` + `sys_read` + match). grep needs to read content,
+> so it can never be a mode/alias of readdir — that is glob.
 
 `sys_setattr` is the universal creation/management syscall:
 - `create(path)` = `sys_setattr(path, entry_type=DT_REG)` — upsert: creates regular file if absent, updates metadata if present. Accepts `content_id`, `size`, `version`, `created_at_ms`, `owner_id`.
@@ -227,8 +239,8 @@ Tier 2 convenience (not kernel syscalls):
 - `mkdir` → Tier 2 (`sys_setattr(entry_type=DT_DIR)`; optimized override on `KernelConvenience`)
 - `rmdir` → Tier 2 (`sys_unlink(recursive=)`; optimized override on `KernelConvenience`)
 - `get_xattr(path, key)` / `set_xattr(path, key, value)` / `get_xattr_bulk(paths, key)` → Tier 2 (Rust `KernelConvenience` trait, direct metastore — no hooks, no permission gate)
-- `glob` → Tier 2 Python (composes `sys_readdir` + `fnmatch`)
-- `grep` → Tier 2 Python (composes `sys_readdir` + `sys_read` + `re`)
+- `glob` → Tier 2 (one `sys_readdir(recursive)` scan + local `fnmatch` filter)
+- `grep` → Tier 2 (`KernelConvenience::grep_subtree`: recursive `sys_readdir` + `sys_read` + `lib::search`, kernel-side)
 
 ---
 
@@ -439,3 +451,4 @@ collapse is a **refactoring** that changes the boundary, not the logic.
 | §5 | 2026-05-15 | Delete `/__xattr__/` path intercept from sys_read/sys_write — redundant with Tier 2 `get_xattr`/`set_xattr` (KernelConvenience). Document xattr as Tier 2 convenience. |
 | §2, §5 | 2026-05-15 | glob/grep: Python Tier 2 (compose readdir + sys_read). Single-path convenience: Tier 2 `read()`/`unlink()` in KernelConvenience; internal callers use `sys_read_single`/`sys_write_with_link_depth`/`sys_unlink_single`. |
 | §2, §4 | 2026-05-20 | mkdir/rmdir reclassified as Tier 2 `KernelConvenience` (removed from the Tier 1 `KernelAbi` surface — both express in terms of existing Tier 1s). `setattr_pipe` folded into `sys_setattr(DT_PIPE)`: DT_PIPE creation now has a single entry point. |
+| §2, §5 | 2026-08-10 | glob/grep repositioned under "a traversal/scan is a server-side one-call op, never client-side composition". `sys_readdir` gains real `recursive`+`limit` (ReaddirOpts, default single-level) — the whole subtree lists in ONE kernel-side call — exposed over the gRPC Readdir RPC (direct-client arm only; the federation `from_peer` probe stays single-level by construction). glob = that recursive scan + a local `fnmatch`; grep = `KernelConvenience::grep_subtree` (recursive readdir + `sys_read` + `lib::search`, kernel-side, also the in-process API for co-hosted agents). No new syscall. (Rust search plugin is the sole search backend since the Python SearchDaemon retired, nexus#4598.) |
