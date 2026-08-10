@@ -309,6 +309,12 @@ impl FederationClient {
             // 3+ node topologies from ping-ponging when every hop
             // misses locally.
             from_peer: true,
+            // Federation fan-out is single-level: the caller
+            // (`via_federation_readdir`) merges one directory level per hop
+            // and rebases peer paths. Cross-mount recursive descent is a
+            // separate axis (see `ReaddirOpts` scope note) — not this probe.
+            recursive: false,
+            limit: 0,
         });
         request.set_timeout(self.timeout);
         let resp = client

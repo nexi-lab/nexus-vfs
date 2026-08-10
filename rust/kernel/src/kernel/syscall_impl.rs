@@ -3407,6 +3407,14 @@ impl Kernel {
     /// Serving a peer's readdir still runs the on-access seed in
     /// `sys_readdir`, so a peer that lists us discovers-and-materialises
     /// our out-of-band content into the replicated metastore in one hop.
+    ///
+    /// Single-level by construction: a federation fan-out (`from_peer`)
+    /// rebases exactly one directory level per hop in
+    /// `via_federation_readdir`, so recursive/limit — a direct-client
+    /// `ReaddirOpts` feature — has no valid meaning on this path and is
+    /// deliberately not plumbed through (a recursive peer result would be
+    /// mis-rebased). Cross-mount recursive descent is a separate axis (see
+    /// [`crate::kernel::syscall::ReaddirOpts`]).
     pub fn sys_readdir_peer_dispatch(
         &self,
         parent_path: &str,
@@ -3635,19 +3643,21 @@ impl Kernel {
     /// documented `NotFound`, the gRPC `Readdir` RPC) get the distinction by
     /// composing the two. Internal enumerators that only want "the children I
     /// can see" keep calling `sys_readdir`.
+    ///
+    /// `opts` carries straight through to `sys_readdir` (recursive /
+    /// limit — see [`crate::kernel::syscall::ReaddirOpts`]); the
+    /// existence disambiguation is orthogonal to enumeration mode
+    /// (`sys_stat` of the parent is the same regardless), so a recursive
+    /// or capped listing gets the identical POSIX not-found semantics.
     #[inline]
     pub fn sys_readdir_checked(
         &self,
         parent_path: &str,
         zone_id: &str,
         is_admin: bool,
+        opts: crate::kernel::syscall::ReaddirOpts,
     ) -> Result<Vec<(String, u8)>, KernelError> {
-        let entries = self.sys_readdir(
-            parent_path,
-            zone_id,
-            is_admin,
-            crate::kernel::syscall::ReaddirOpts::default(),
-        );
+        let entries = self.sys_readdir(parent_path, zone_id, is_admin, opts);
         if entries.is_empty() {
             // Empty enumeration is ambiguous — resolve existence via the one
             // authority. Only reached on an empty result, so the common
