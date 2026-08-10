@@ -3429,47 +3429,35 @@ impl Kernel {
         )
     }
 
-    pub fn sys_readdir(
+    /// Merge ONE mount's listing into `seen` — the metastore prefix scan plus
+    /// the backend `list_dir` / federation `via_federation_readdir` union.
+    /// Factored out of [`Self::sys_readdir`] so a recursive scan can call it
+    /// once per mount it descends into (the covering mount, then each nested
+    /// local mount — see `child_mounts_under`).
+    ///
+    /// `scan_root` is the global path being enumerated (the readdir root, or a
+    /// nested mount point). `recursive` keeps the whole subtree from the ONE
+    /// metastore prefix scan instead of just direct children.
+    fn scan_mount_into(
         &self,
-        parent_path: &str,
-        zone_id: &str,
-        is_admin: bool,
-        opts: crate::kernel::syscall::ReaddirOpts,
-    ) -> Vec<(String, u8)> {
-        if validate_path_fast(parent_path).is_err() {
-            return Vec::new();
-        }
-        // Callers pass either "/local" or "/local/" — normalize the trailing
-        // slash off before routing so prefix comparisons below don't produce
-        // double slashes (which silently return no children).
-        let normalized = if parent_path != "/" && parent_path.ends_with('/') {
-            parent_path.trim_end_matches('/')
-        } else {
-            parent_path
-        };
-        let route = match self.vfs_router.route(normalized, zone_id) {
-            Some(r) => r,
-            None => return Vec::new(),
-        };
-        let global_prefix = if normalized == contracts::VFS_ROOT {
+        route: &crate::vfs_router::RouteResult,
+        scan_root: &str,
+        recursive: bool,
+        seen: &mut std::collections::BTreeMap<String, (u8, Option<String>)>,
+    ) {
+        let global_prefix = if scan_root == contracts::VFS_ROOT {
             contracts::VFS_ROOT.to_string()
         } else {
-            format!("{}/", normalized)
+            format!("{}/", scan_root)
         };
-
-        let needs_zone_filter = !is_admin && zone_id != contracts::ROOT_ZONE_ID;
-
-        // Track (entry_type, zone_id) so we can zone-filter at the end.
-        let mut seen: std::collections::BTreeMap<String, (u8, Option<String>)> =
-            std::collections::BTreeMap::new();
-        let parent_for_join = if parent_path == contracts::VFS_ROOT {
+        let parent_for_join = if scan_root == contracts::VFS_ROOT {
             ""
         } else {
-            parent_path.trim_end_matches('/')
+            scan_root.trim_end_matches('/')
         };
 
         if let Some(ms_children) =
-            self.with_metastore_route(&route, |ms| ms.list(&global_prefix).ok())
+            self.with_metastore_route(route, |ms| ms.list(&global_prefix).ok())
         {
             let parent_depth = global_prefix.matches('/').count();
             for meta in ms_children.into_iter().flatten() {
@@ -3477,7 +3465,7 @@ impl Kernel {
                 // prefix + 1 segment); recursive keeps the whole subtree the
                 // one prefix scan already returned — that is the round-trip
                 // collapse (one server-side scan vs O(dirs) client calls).
-                if !opts.recursive && meta.path.matches('/').count() != parent_depth {
+                if !recursive && meta.path.matches('/').count() != parent_depth {
                     continue;
                 }
                 if !meta.path.starts_with(&global_prefix) {
@@ -3561,7 +3549,7 @@ impl Kernel {
                     );
                 }
             }
-        } else if let Some(entries) = route.via_federation_readdir(self, parent_path) {
+        } else if let Some(entries) = route.via_federation_readdir(self, scan_root) {
             // Federation peer dispatch: no local backend for this
             // mount, but the routing entry's `target_zone_id` says the
             // SSOT lives on a peer.  `via_federation_readdir` returns
@@ -3572,10 +3560,15 @@ impl Kernel {
             // step.  Same dispatch helper sys_stat / sys_unlink use:
             // iterate non-self voters, break on first hit.
             //
-            // For cc-tasks-share (Mac=SSOT with LocalConnector,
-            // Win=client without) the SSOT side never reaches this
-            // branch — backend is Some on Mac — so no loop is
-            // possible in the canonical 2-node topology.
+            // Single-level: the peer probe (`from_peer`) is single-level by
+            // construction, so a recursive readdir descends into a federation
+            // mount only to its own top level here (a recursive peer result
+            // would be mis-rebased one directory level per hop). No
+            // readdir-time peer fan-out otherwise — a backed node's own
+            // metastore is authoritative for its content (on-access seed +
+            // periodic reconcile in `crate::core::metadata_sync`), so its
+            // raft-replicated `metastore.list` already carries every entry it
+            // can route to.
             for (peer_path, etype) in entries {
                 // Peer returns absolute peer paths; rebase to the
                 // local global namespace by stripping the peer's
@@ -3589,17 +3582,59 @@ impl Kernel {
                     .or_insert((etype, Some(route.zone_id.clone())));
             }
         }
+    }
 
-        // No readdir-time peer fan-out. The on-access seed above keeps a
-        // backed node's own metastore authoritative for its out-of-band
-        // content (and the periodic reconcile in `crate::core::metadata_sync`
-        // is the backstop for entries no one has listed yet), so a peer's
-        // `metastore.list` already carries every entry the peer can route to
-        // — a backed node never needs to probe peers on readdir. The one
-        // surviving cross-node readdir mechanism is `via_federation_readdir`
-        // above, for backend-less federation placeholder mounts (the
-        // thin-reader topology), a distinct axis metadata sync does not
-        // cover.
+    pub fn sys_readdir(
+        &self,
+        parent_path: &str,
+        zone_id: &str,
+        is_admin: bool,
+        opts: crate::kernel::syscall::ReaddirOpts,
+    ) -> Vec<(String, u8)> {
+        if validate_path_fast(parent_path).is_err() {
+            return Vec::new();
+        }
+        // Callers pass either "/local" or "/local/" — normalize the trailing
+        // slash off before routing so prefix comparisons don't produce double
+        // slashes (which silently return no children).
+        let normalized = if parent_path != "/" && parent_path.ends_with('/') {
+            parent_path.trim_end_matches('/')
+        } else {
+            parent_path
+        };
+        let route = match self.vfs_router.route(normalized, zone_id) {
+            Some(r) => r,
+            None => return Vec::new(),
+        };
+
+        let needs_zone_filter = !is_admin && zone_id != contracts::ROOT_ZONE_ID;
+
+        // Track (entry_type, zone_id) so we can zone-filter at the end.
+        let mut seen: std::collections::BTreeMap<String, (u8, Option<String>)> =
+            std::collections::BTreeMap::new();
+
+        // 1. The mount covering `parent_path`.
+        self.scan_mount_into(&route, normalized, opts.recursive, &mut seen);
+
+        // 2. Recursive cross-mount descent. A mount's metastore holds only its
+        //    OWN entries, so the covering scan stops at a nested mount's root;
+        //    the nested subtree is reached by scanning each LOCAL child mount
+        //    too (visible in this zone), exactly once, with recursive=true —
+        //    one scan per mount, so no double-count. `child_mounts_under` only
+        //    returns strict descendants, and each nested mount's own nested
+        //    mounts appear in this same flat list, so a single pass covers
+        //    arbitrary nesting without re-entrancy.
+        //
+        //    Boundary (follow-up): recursive descent INTO a federation PEER
+        //    mount stays single-level (see `scan_mount_into`'s federation
+        //    branch); the peer mount's own top level is still surfaced.
+        if opts.recursive {
+            for child in self.vfs_router.child_mounts_under(normalized, zone_id) {
+                if let Some(child_route) = self.vfs_router.route(&child, zone_id) {
+                    self.scan_mount_into(&child_route, &child, true, &mut seen);
+                }
+            }
+        }
 
         let mut entries: Vec<(String, u8)> = if needs_zone_filter {
             seen.into_iter()
@@ -3616,8 +3651,9 @@ impl Kernel {
         };
         // `seen` is a BTreeMap, so entries are path-sorted; a limit takes the
         // lexicographically-first N deterministically. (True streaming/cursor
-        // pagination that also bounds the underlying scan is a follow-up; today
-        // the prefix scan already materialises the subtree either way.)
+        // pagination that also bounds the underlying scan — including the
+        // cross-mount descent — is a follow-up; today each scanned mount
+        // materialises its subtree either way.)
         if let Some(limit) = opts.limit {
             entries.truncate(limit);
         }

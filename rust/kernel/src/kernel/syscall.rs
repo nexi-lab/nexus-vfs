@@ -61,11 +61,15 @@ use crate::kernel::{
 /// A separate `sys_glob` would overlap this same "enumerate namespace" axis,
 /// so recursion is a mode of `sys_readdir`, not a new syscall.
 ///
-/// NOTE (scope): recursion currently spans the routed zone's metastore
-/// namespace. Descending across a child MOUNT into another zone, and deep
-/// enumeration of connector-backed / federation mounts, are tracked follow-ups
-/// (the single-level backend/federation merge below still applies at the top
-/// level only).
+/// NOTE (scope): recursion spans the routed zone's metastore namespace AND
+/// descends across nested LOCAL mount boundaries (`sys_readdir` scans each
+/// visible child mount too — a mount's metastore holds only its own entries).
+/// Remaining follow-ups: recursive descent INTO a federation PEER mount stays
+/// single-level (the peer probe is single-level by construction; a recursive
+/// peer result would be mis-rebased one directory level per hop), deep
+/// enumeration of connector-backed content is bounded by what the metastore has
+/// seeded on-access, and `limit` truncates post-scan rather than bounding the
+/// underlying scan.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ReaddirOpts {
     /// List the whole subtree under `parent_path`, not just direct children.

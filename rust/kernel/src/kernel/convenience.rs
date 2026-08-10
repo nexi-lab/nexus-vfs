@@ -234,12 +234,14 @@ pub trait KernelConvenience: KernelSyscall {
     /// possibly-changing tree. Results are path-sorted (recursive readdir is
     /// BTree-ordered) and capped at `opts.max_results`.
     ///
-    /// Scope: recursion spans the routed zone's metastore namespace, exactly
-    /// as `sys_readdir(recursive)` does — descent across a child MOUNT into
-    /// another zone is the same follow-up tracked on [`ReaddirOpts`], so grep
-    /// inherits it. Perf: files are read sequentially and whole (no streaming
-    /// / no rayon fan-out yet) — a parallel/batched read and large-file
-    /// streaming are the natural next optimizations once this is a hot path.
+    /// Scope: recursion follows `sys_readdir(recursive)` — the routed zone plus
+    /// nested LOCAL mounts — so grep spans local mount boundaries; the same
+    /// follow-ups apply (recursive descent into a federation PEER mount stays
+    /// single-level, connector-backed depth is bounded by seeded rows — see
+    /// [`ReaddirOpts`]). Perf: files are read sequentially and whole (no
+    /// streaming / no rayon fan-out yet) — a parallel/batched read and
+    /// large-file streaming are the natural next optimizations once this is a
+    /// hot path.
     fn grep_subtree(
         &self,
         root: &str,

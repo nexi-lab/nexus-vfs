@@ -646,6 +646,48 @@ impl VFSRouter {
         points
     }
 
+    /// User-facing mount points STRICTLY nested under `parent_path`, visible
+    /// from `zone_id` — the zone's own mounts plus root-zone mounts, matching
+    /// [`Self::route`]'s zone-then-root fallback. Sorted + deduped; never
+    /// includes `parent_path` itself or the root mount `/`.
+    ///
+    /// Recursive `sys_readdir` descends into each so a whole-subtree scan
+    /// crosses local mount boundaries: a mount's metastore holds only its own
+    /// entries, so the covering mount's prefix scan stops at a nested mount's
+    /// root — the nested subtree is reached by scanning that mount too.
+    pub fn child_mounts_under(&self, parent_path: &str, zone_id: &str) -> Vec<String> {
+        let parent = parent_path.trim_end_matches('/');
+        let is_root = parent.is_empty();
+        let needle = if is_root {
+            String::from("/")
+        } else {
+            format!("{parent}/")
+        };
+        let mut out: Vec<String> = self
+            .entries
+            .iter()
+            .filter_map(|e| {
+                let (mz, mp) = extract_zone_from_canonical(e.key());
+                if mz != zone_id && mz != contracts::ROOT_ZONE_ID {
+                    return None;
+                }
+                // Strict descendant of `parent` (never `parent` itself, never
+                // the root mount "/"). `starts_with(needle)` where needle ends
+                // in '/' enforces strictness.
+                if mp == "/" {
+                    None
+                } else if is_root || mp.starts_with(&needle) {
+                    Some(mp)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
     /// User-facing mount points whose per-mount metastore reports the
     /// given ``coherence_key``.
     ///
@@ -1167,6 +1209,56 @@ mod tests {
 
         // Unknown key → empty.
         assert!(table.mount_points_for_coherence_key(0xDEAD).is_empty());
+    }
+
+    #[test]
+    fn child_mounts_under_returns_strict_visible_descendants() {
+        let table = VFSRouter::new();
+        table.add_mount("/", "root", None, false);
+        table.add_mount("/repo", "root", None, false);
+        table.add_mount("/repo/sub", "root", None, false);
+        table.add_mount("/repo/rooted", "root", None, false);
+        table.add_mount("/other", "root", None, false);
+        // A mount registered ONLY in zone-beta.
+        table.add_mount("/repo/zoned", "zone-beta", None, false);
+
+        // Root readdir: every mount except "/" itself, root-zone only.
+        let under_root = table.child_mounts_under("/", "root");
+        assert!(under_root.contains(&"/repo".to_string()));
+        assert!(under_root.contains(&"/repo/sub".to_string()));
+        assert!(under_root.contains(&"/other".to_string()));
+        assert!(
+            !under_root.iter().any(|m| m == "/"),
+            "never the root mount itself: {under_root:?}"
+        );
+        assert!(
+            !under_root.contains(&"/repo/zoned".to_string()),
+            "a zone-beta mount is invisible to a root-zone caller: {under_root:?}"
+        );
+
+        // Nested readdir: strict descendants of /repo only.
+        let under_repo = table.child_mounts_under("/repo", "root");
+        assert!(under_repo.contains(&"/repo/sub".to_string()));
+        assert!(under_repo.contains(&"/repo/rooted".to_string()));
+        assert!(
+            !under_repo.contains(&"/repo".to_string()),
+            "never the parent itself: {under_repo:?}"
+        );
+        assert!(
+            !under_repo.contains(&"/other".to_string()),
+            "not a descendant: {under_repo:?}"
+        );
+
+        // A zone-beta caller sees root-zone mounts (fallback) PLUS its own.
+        let under_repo_beta = table.child_mounts_under("/repo", "zone-beta");
+        assert!(
+            under_repo_beta.contains(&"/repo/zoned".to_string()),
+            "own-zone mount visible: {under_repo_beta:?}"
+        );
+        assert!(
+            under_repo_beta.contains(&"/repo/sub".to_string()),
+            "root-zone mount visible via fallback: {under_repo_beta:?}"
+        );
     }
 
     // ── RouteResult federation behavior method pins ─────────────────────
