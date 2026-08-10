@@ -3996,6 +3996,107 @@ mod read_batch_tests {
     }
 
     #[test]
+    fn grep_subtree_walks_and_matches_in_one_scan() {
+        use crate::kernel::convenience::{GrepOptions, KernelConvenience};
+        let k = kernel_with_backend();
+        let c = ctx();
+        let z = contracts::ROOT_ZONE_ID;
+        k.mkdir("/src", &c, true, true).expect("mkdir /src");
+        k.mkdir("/src/inner", &c, true, true)
+            .expect("mkdir /src/inner");
+        k.write("/src/a.rs", &c, b"fn alpha() {}\nlet x = 1;\n", 0)
+            .expect("write a");
+        k.write("/src/inner/b.rs", &c, b"fn beta() {}\nfn gamma() {}\n", 0)
+            .expect("write b");
+        k.write("/src/notes.txt", &c, b"no functions here\n", 0)
+            .expect("write notes");
+        // Case-insensitivity fixture (literal-ignore-case path).
+        k.write("/src/greet.txt", &c, b"Say HELLO There\n", 0)
+            .expect("write greet");
+        // Binary fixture: invalid UTF-8 whose *bytes* spell "fn zeta" — a
+        // correct grep must SKIP it (a text grep skips binaries), so it must
+        // never appear in results even though the pattern is present bytewise.
+        k.write("/src/bin.dat", &c, b"\xff\xfefn zeta() {}\n", 0)
+            .expect("write bin");
+
+        // Regex over the whole subtree in ONE recursive scan (incl grandchild).
+        let hits = k
+            .grep_subtree("/src", z, true, &c, r"fn\s+\w+", GrepOptions::default())
+            .expect("grep ok");
+        let files: Vec<&str> = hits.iter().map(|m| m.file.as_str()).collect();
+        assert!(
+            files.contains(&"/src/a.rs"),
+            "matched top-level file: {files:?}"
+        );
+        assert!(
+            files.contains(&"/src/inner/b.rs"),
+            "matched grandchild file: {files:?}"
+        );
+        assert!(
+            !files.contains(&"/src/notes.txt"),
+            "no fn in notes.txt: {files:?}"
+        );
+        assert!(
+            !files.contains(&"/src/bin.dat"),
+            "binary (non-UTF-8) file must be skipped, not matched: {files:?}"
+        );
+        assert_eq!(
+            hits.iter().filter(|m| m.file == "/src/inner/b.rs").count(),
+            2,
+            "b.rs has two fn lines: {hits:?}"
+        );
+
+        // A bad regex is a validation error, not a panic.
+        assert!(matches!(
+            k.grep_subtree("/src", z, true, &c, r"(", GrepOptions::default()),
+            Err(KernelError::InvalidPath(_))
+        ));
+
+        // max_results caps total matches deterministically (path-sorted scan).
+        let capped = k
+            .grep_subtree(
+                "/src",
+                z,
+                true,
+                &c,
+                r"fn\s+\w+",
+                GrepOptions {
+                    max_results: 1,
+                    ..GrepOptions::default()
+                },
+            )
+            .expect("grep ok");
+        assert_eq!(capped.len(), 1, "max_results caps total: {capped:?}");
+
+        // ignore_case toggles the literal-ignore-case path: "hello" misses the
+        // "HELLO" line case-sensitively, matches it case-insensitively.
+        let sensitive = k
+            .grep_subtree("/src", z, true, &c, "hello", GrepOptions::default())
+            .expect("grep ok");
+        assert!(
+            sensitive.iter().all(|m| m.file != "/src/greet.txt"),
+            "case-sensitive 'hello' must not match 'HELLO': {sensitive:?}"
+        );
+        let insensitive = k
+            .grep_subtree(
+                "/src",
+                z,
+                true,
+                &c,
+                "hello",
+                GrepOptions {
+                    ignore_case: true,
+                    ..GrepOptions::default()
+                },
+            )
+            .expect("grep ok");
+        assert!(
+            insensitive.iter().any(|m| m.file == "/src/greet.txt"),
+            "case-insensitive 'hello' must match 'HELLO': {insensitive:?}"
+        );
+    }
+
+    #[test]
     fn read_batch_coalesces_same_content_id() {
         let k = kernel_with_backend();
         let c = ctx();
