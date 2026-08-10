@@ -3646,7 +3646,12 @@ mod tests {
         );
 
         // sys_readdir should list the child we just created under /data
-        let entries = k.sys_readdir("/data", "root", true);
+        let entries = k.sys_readdir(
+            "/data",
+            "root",
+            true,
+            crate::kernel::syscall::ReaddirOpts::default(),
+        );
         assert!(
             !entries.is_empty(),
             "sys_readdir must return the created child"

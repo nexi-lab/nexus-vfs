@@ -311,6 +311,20 @@ message ReaddirRequest {
   // empty.  Kernel-level: routes to `sys_readdir_peer_dispatch`
   // instead of `sys_readdir`.
   bool from_peer = 4;
+
+  // Recursive whole-subtree enumeration (default `false` = classic
+  // single-level `readdir(3)`). When set, the handler asks the kernel for
+  // the entire subtree under `path` in ONE call (the metastore's native
+  // `list(prefix)` range-scan) instead of forcing the client to compose N
+  // single-level reads — the round-trip collapse that lets a remote
+  // client's glob/grep ride this RPC rather than walk the tree client-side.
+  // Maps to `ReaddirOpts::recursive`.
+  bool recursive = 5;
+
+  // Cap the number of returned entries (`0` = unbounded). Entries are
+  // path-sorted, so a limit takes the lexicographically-first N
+  // deterministically. Maps to `ReaddirOpts::limit`.
+  uint32 limit = 6;
 }
 
 message ReaddirEntry {

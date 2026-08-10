@@ -3407,60 +3407,65 @@ impl Kernel {
     /// Serving a peer's readdir still runs the on-access seed in
     /// `sys_readdir`, so a peer that lists us discovers-and-materialises
     /// our out-of-band content into the replicated metastore in one hop.
+    ///
+    /// Single-level by construction: a federation fan-out (`from_peer`)
+    /// rebases exactly one directory level per hop in
+    /// `via_federation_readdir`, so recursive/limit — a direct-client
+    /// `ReaddirOpts` feature — has no valid meaning on this path and is
+    /// deliberately not plumbed through (a recursive peer result would be
+    /// mis-rebased). Cross-mount recursive descent is a separate axis (see
+    /// [`crate::kernel::syscall::ReaddirOpts`]).
     pub fn sys_readdir_peer_dispatch(
         &self,
         parent_path: &str,
         zone_id: &str,
         is_admin: bool,
     ) -> Vec<(String, u8)> {
-        self.sys_readdir(parent_path, zone_id, is_admin)
+        self.sys_readdir(
+            parent_path,
+            zone_id,
+            is_admin,
+            crate::kernel::syscall::ReaddirOpts::default(),
+        )
     }
 
-    pub fn sys_readdir(
+    /// Merge ONE mount's listing into `seen` — the metastore prefix scan plus
+    /// the backend `list_dir` / federation `via_federation_readdir` union.
+    /// Factored out of [`Self::sys_readdir`] so a recursive scan can call it
+    /// once per mount it descends into (the covering mount, then each nested
+    /// local mount — see `child_mounts_under`).
+    ///
+    /// `scan_root` is the global path being enumerated (the readdir root, or a
+    /// nested mount point). `recursive` keeps the whole subtree from the ONE
+    /// metastore prefix scan instead of just direct children.
+    fn scan_mount_into(
         &self,
-        parent_path: &str,
-        zone_id: &str,
-        is_admin: bool,
-    ) -> Vec<(String, u8)> {
-        if validate_path_fast(parent_path).is_err() {
-            return Vec::new();
-        }
-        // Callers pass either "/local" or "/local/" — normalize the trailing
-        // slash off before routing so prefix comparisons below don't produce
-        // double slashes (which silently return no children).
-        let normalized = if parent_path != "/" && parent_path.ends_with('/') {
-            parent_path.trim_end_matches('/')
-        } else {
-            parent_path
-        };
-        let route = match self.vfs_router.route(normalized, zone_id) {
-            Some(r) => r,
-            None => return Vec::new(),
-        };
-        let global_prefix = if normalized == contracts::VFS_ROOT {
+        route: &crate::vfs_router::RouteResult,
+        scan_root: &str,
+        recursive: bool,
+        seen: &mut std::collections::BTreeMap<String, (u8, Option<String>)>,
+    ) {
+        let global_prefix = if scan_root == contracts::VFS_ROOT {
             contracts::VFS_ROOT.to_string()
         } else {
-            format!("{}/", normalized)
+            format!("{}/", scan_root)
         };
-
-        let needs_zone_filter = !is_admin && zone_id != contracts::ROOT_ZONE_ID;
-
-        // Track (entry_type, zone_id) so we can zone-filter at the end.
-        let mut seen: std::collections::BTreeMap<String, (u8, Option<String>)> =
-            std::collections::BTreeMap::new();
-        let parent_for_join = if parent_path == contracts::VFS_ROOT {
+        let parent_for_join = if scan_root == contracts::VFS_ROOT {
             ""
         } else {
-            parent_path.trim_end_matches('/')
+            scan_root.trim_end_matches('/')
         };
 
         if let Some(ms_children) =
-            self.with_metastore_route(&route, |ms| ms.list(&global_prefix).ok())
+            self.with_metastore_route(route, |ms| ms.list(&global_prefix).ok())
         {
             let parent_depth = global_prefix.matches('/').count();
             for meta in ms_children.into_iter().flatten() {
-                // Direct children only: same depth as prefix + 1 segment.
-                if meta.path.matches('/').count() != parent_depth {
+                // Single-level keeps direct children only (same depth as the
+                // prefix + 1 segment); recursive keeps the whole subtree the
+                // one prefix scan already returned — that is the round-trip
+                // collapse (one server-side scan vs O(dirs) client calls).
+                if !recursive && meta.path.matches('/').count() != parent_depth {
                     continue;
                 }
                 if !meta.path.starts_with(&global_prefix) {
@@ -3544,7 +3549,7 @@ impl Kernel {
                     );
                 }
             }
-        } else if let Some(entries) = route.via_federation_readdir(self, parent_path) {
+        } else if let Some(entries) = route.via_federation_readdir(self, scan_root) {
             // Federation peer dispatch: no local backend for this
             // mount, but the routing entry's `target_zone_id` says the
             // SSOT lives on a peer.  `via_federation_readdir` returns
@@ -3555,10 +3560,15 @@ impl Kernel {
             // step.  Same dispatch helper sys_stat / sys_unlink use:
             // iterate non-self voters, break on first hit.
             //
-            // For cc-tasks-share (Mac=SSOT with LocalConnector,
-            // Win=client without) the SSOT side never reaches this
-            // branch — backend is Some on Mac — so no loop is
-            // possible in the canonical 2-node topology.
+            // Single-level: the peer probe (`from_peer`) is single-level by
+            // construction, so a recursive readdir descends into a federation
+            // mount only to its own top level here (a recursive peer result
+            // would be mis-rebased one directory level per hop). No
+            // readdir-time peer fan-out otherwise — a backed node's own
+            // metastore is authoritative for its content (on-access seed +
+            // periodic reconcile in `crate::core::metadata_sync`), so its
+            // raft-replicated `metastore.list` already carries every entry it
+            // can route to.
             for (peer_path, etype) in entries {
                 // Peer returns absolute peer paths; rebase to the
                 // local global namespace by stripping the peer's
@@ -3572,19 +3582,61 @@ impl Kernel {
                     .or_insert((etype, Some(route.zone_id.clone())));
             }
         }
+    }
 
-        // No readdir-time peer fan-out. The on-access seed above keeps a
-        // backed node's own metastore authoritative for its out-of-band
-        // content (and the periodic reconcile in `crate::core::metadata_sync`
-        // is the backstop for entries no one has listed yet), so a peer's
-        // `metastore.list` already carries every entry the peer can route to
-        // — a backed node never needs to probe peers on readdir. The one
-        // surviving cross-node readdir mechanism is `via_federation_readdir`
-        // above, for backend-less federation placeholder mounts (the
-        // thin-reader topology), a distinct axis metadata sync does not
-        // cover.
+    pub fn sys_readdir(
+        &self,
+        parent_path: &str,
+        zone_id: &str,
+        is_admin: bool,
+        opts: crate::kernel::syscall::ReaddirOpts,
+    ) -> Vec<(String, u8)> {
+        if validate_path_fast(parent_path).is_err() {
+            return Vec::new();
+        }
+        // Callers pass either "/local" or "/local/" — normalize the trailing
+        // slash off before routing so prefix comparisons don't produce double
+        // slashes (which silently return no children).
+        let normalized = if parent_path != "/" && parent_path.ends_with('/') {
+            parent_path.trim_end_matches('/')
+        } else {
+            parent_path
+        };
+        let route = match self.vfs_router.route(normalized, zone_id) {
+            Some(r) => r,
+            None => return Vec::new(),
+        };
 
-        let entries: Vec<(String, u8)> = if needs_zone_filter {
+        let needs_zone_filter = !is_admin && zone_id != contracts::ROOT_ZONE_ID;
+
+        // Track (entry_type, zone_id) so we can zone-filter at the end.
+        let mut seen: std::collections::BTreeMap<String, (u8, Option<String>)> =
+            std::collections::BTreeMap::new();
+
+        // 1. The mount covering `parent_path`.
+        self.scan_mount_into(&route, normalized, opts.recursive, &mut seen);
+
+        // 2. Recursive cross-mount descent. A mount's metastore holds only its
+        //    OWN entries, so the covering scan stops at a nested mount's root;
+        //    the nested subtree is reached by scanning each LOCAL child mount
+        //    too (visible in this zone), exactly once, with recursive=true —
+        //    one scan per mount, so no double-count. `child_mounts_under` only
+        //    returns strict descendants, and each nested mount's own nested
+        //    mounts appear in this same flat list, so a single pass covers
+        //    arbitrary nesting without re-entrancy.
+        //
+        //    Boundary (follow-up): recursive descent INTO a federation PEER
+        //    mount stays single-level (see `scan_mount_into`'s federation
+        //    branch); the peer mount's own top level is still surfaced.
+        if opts.recursive {
+            for child in self.vfs_router.child_mounts_under(normalized, zone_id) {
+                if let Some(child_route) = self.vfs_router.route(&child, zone_id) {
+                    self.scan_mount_into(&child_route, &child, true, &mut seen);
+                }
+            }
+        }
+
+        let mut entries: Vec<(String, u8)> = if needs_zone_filter {
             seen.into_iter()
                 .filter(|(_, (_, entry_zone))| {
                     let ez = entry_zone.as_deref().unwrap_or(contracts::ROOT_ZONE_ID);
@@ -3597,6 +3649,14 @@ impl Kernel {
                 .map(|(path, (etype, _))| (path, etype))
                 .collect()
         };
+        // `seen` is a BTreeMap, so entries are path-sorted; a limit takes the
+        // lexicographically-first N deterministically. (True streaming/cursor
+        // pagination that also bounds the underlying scan — including the
+        // cross-mount descent — is a follow-up; today each scanned mount
+        // materialises its subtree either way.)
+        if let Some(limit) = opts.limit {
+            entries.truncate(limit);
+        }
         entries
     }
 
@@ -3619,14 +3679,21 @@ impl Kernel {
     /// documented `NotFound`, the gRPC `Readdir` RPC) get the distinction by
     /// composing the two. Internal enumerators that only want "the children I
     /// can see" keep calling `sys_readdir`.
+    ///
+    /// `opts` carries straight through to `sys_readdir` (recursive /
+    /// limit — see [`crate::kernel::syscall::ReaddirOpts`]); the
+    /// existence disambiguation is orthogonal to enumeration mode
+    /// (`sys_stat` of the parent is the same regardless), so a recursive
+    /// or capped listing gets the identical POSIX not-found semantics.
     #[inline]
     pub fn sys_readdir_checked(
         &self,
         parent_path: &str,
         zone_id: &str,
         is_admin: bool,
+        opts: crate::kernel::syscall::ReaddirOpts,
     ) -> Result<Vec<(String, u8)>, KernelError> {
-        let entries = self.sys_readdir(parent_path, zone_id, is_admin);
+        let entries = self.sys_readdir(parent_path, zone_id, is_admin, opts);
         if entries.is_empty() {
             // Empty enumeration is ambiguous — resolve existence via the one
             // authority. Only reached on an empty result, so the common
@@ -3704,7 +3771,12 @@ impl Kernel {
         }
 
         // Normal readdir with optional pagination.
-        let all = self.sys_readdir(parent_path, zone_id, is_admin);
+        let all = self.sys_readdir(
+            parent_path,
+            zone_id,
+            is_admin,
+            crate::kernel::syscall::ReaddirOpts::default(),
+        );
 
         if limit == 0 {
             return super::ReadDirResult {
@@ -3889,6 +3961,175 @@ mod read_batch_tests {
         assert_eq!(out.len(), 1);
         let r = out[0].as_ref().expect("inner ok");
         assert_eq!(r.data.as_deref().unwrap(), b"hi there");
+    }
+
+    #[test]
+    fn readdir_recursive_returns_whole_subtree_single_level_stays_shallow() {
+        use crate::kernel::syscall::ReaddirOpts;
+        let k = kernel_with_backend();
+        let c = ctx();
+        let z = contracts::ROOT_ZONE_ID;
+        k.mkdir("/d", &c, true, true).expect("mkdir /d");
+        k.mkdir("/d/sub", &c, true, true).expect("mkdir /d/sub");
+        k.sys_write_with_link_depth("/d/a.txt", &c, b"a", 0, 1)
+            .expect("write a");
+        k.sys_write_with_link_depth("/d/sub/b.txt", &c, b"b", 0, 1)
+            .expect("write b");
+        k.sys_write_with_link_depth("/d/sub/c.txt", &c, b"c", 0, 1)
+            .expect("write c");
+
+        // Single-level (default): direct children of /d only — grandchildren absent.
+        let shallow = k.sys_readdir("/d", z, true, ReaddirOpts::default());
+        let shallow_paths: Vec<&str> = shallow.iter().map(|(p, _)| p.as_str()).collect();
+        assert!(
+            shallow_paths.contains(&"/d/a.txt"),
+            "direct child: {shallow_paths:?}"
+        );
+        assert!(
+            shallow_paths.contains(&"/d/sub"),
+            "direct child dir: {shallow_paths:?}"
+        );
+        assert!(
+            !shallow_paths.iter().any(|p| p.starts_with("/d/sub/")),
+            "single-level must NOT include grandchildren: {shallow_paths:?}"
+        );
+
+        // Recursive: the whole subtree in ONE call — grandchildren present.
+        let deep = k.sys_readdir(
+            "/d",
+            z,
+            true,
+            ReaddirOpts {
+                recursive: true,
+                limit: None,
+            },
+        );
+        let deep_paths: Vec<&str> = deep.iter().map(|(p, _)| p.as_str()).collect();
+        assert!(
+            deep_paths.contains(&"/d/sub/b.txt"),
+            "recursive incl grandchild: {deep_paths:?}"
+        );
+        assert!(
+            deep_paths.contains(&"/d/sub/c.txt"),
+            "recursive incl grandchild: {deep_paths:?}"
+        );
+        assert!(
+            deep.len() > shallow.len(),
+            "recursive returns more than single-level"
+        );
+
+        // Limit caps the recursive result (path-sorted, deterministic).
+        let capped = k.sys_readdir(
+            "/d",
+            z,
+            true,
+            ReaddirOpts {
+                recursive: true,
+                limit: Some(2),
+            },
+        );
+        assert_eq!(capped.len(), 2, "limit caps entry count: {capped:?}");
+    }
+
+    #[test]
+    fn grep_subtree_walks_and_matches_in_one_scan() {
+        use crate::kernel::convenience::{GrepOptions, KernelConvenience};
+        let k = kernel_with_backend();
+        let c = ctx();
+        let z = contracts::ROOT_ZONE_ID;
+        k.mkdir("/src", &c, true, true).expect("mkdir /src");
+        k.mkdir("/src/inner", &c, true, true)
+            .expect("mkdir /src/inner");
+        k.write("/src/a.rs", &c, b"fn alpha() {}\nlet x = 1;\n", 0)
+            .expect("write a");
+        k.write("/src/inner/b.rs", &c, b"fn beta() {}\nfn gamma() {}\n", 0)
+            .expect("write b");
+        k.write("/src/notes.txt", &c, b"no functions here\n", 0)
+            .expect("write notes");
+        // Case-insensitivity fixture (literal-ignore-case path).
+        k.write("/src/greet.txt", &c, b"Say HELLO There\n", 0)
+            .expect("write greet");
+        // Binary fixture: invalid UTF-8 whose *bytes* spell "fn zeta" — a
+        // correct grep must SKIP it (a text grep skips binaries), so it must
+        // never appear in results even though the pattern is present bytewise.
+        k.write("/src/bin.dat", &c, b"\xff\xfefn zeta() {}\n", 0)
+            .expect("write bin");
+
+        // Regex over the whole subtree in ONE recursive scan (incl grandchild).
+        let hits = k
+            .grep_subtree("/src", z, true, &c, r"fn\s+\w+", GrepOptions::default())
+            .expect("grep ok");
+        let files: Vec<&str> = hits.iter().map(|m| m.file.as_str()).collect();
+        assert!(
+            files.contains(&"/src/a.rs"),
+            "matched top-level file: {files:?}"
+        );
+        assert!(
+            files.contains(&"/src/inner/b.rs"),
+            "matched grandchild file: {files:?}"
+        );
+        assert!(
+            !files.contains(&"/src/notes.txt"),
+            "no fn in notes.txt: {files:?}"
+        );
+        assert!(
+            !files.contains(&"/src/bin.dat"),
+            "binary (non-UTF-8) file must be skipped, not matched: {files:?}"
+        );
+        assert_eq!(
+            hits.iter().filter(|m| m.file == "/src/inner/b.rs").count(),
+            2,
+            "b.rs has two fn lines: {hits:?}"
+        );
+
+        // A bad regex is a validation error, not a panic.
+        assert!(matches!(
+            k.grep_subtree("/src", z, true, &c, r"(", GrepOptions::default()),
+            Err(KernelError::InvalidPath(_))
+        ));
+
+        // max_results caps total matches deterministically (path-sorted scan).
+        let capped = k
+            .grep_subtree(
+                "/src",
+                z,
+                true,
+                &c,
+                r"fn\s+\w+",
+                GrepOptions {
+                    max_results: 1,
+                    ..GrepOptions::default()
+                },
+            )
+            .expect("grep ok");
+        assert_eq!(capped.len(), 1, "max_results caps total: {capped:?}");
+
+        // ignore_case toggles the literal-ignore-case path: "hello" misses the
+        // "HELLO" line case-sensitively, matches it case-insensitively.
+        let sensitive = k
+            .grep_subtree("/src", z, true, &c, "hello", GrepOptions::default())
+            .expect("grep ok");
+        assert!(
+            sensitive.iter().all(|m| m.file != "/src/greet.txt"),
+            "case-sensitive 'hello' must not match 'HELLO': {sensitive:?}"
+        );
+        let insensitive = k
+            .grep_subtree(
+                "/src",
+                z,
+                true,
+                &c,
+                "hello",
+                GrepOptions {
+                    ignore_case: true,
+                    ..GrepOptions::default()
+                },
+            )
+            .expect("grep ok");
+        assert!(
+            insensitive.iter().any(|m| m.file == "/src/greet.txt"),
+            "case-insensitive 'hello' must match 'HELLO': {insensitive:?}"
+        );
     }
 
     #[test]

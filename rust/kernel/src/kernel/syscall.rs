@@ -48,6 +48,36 @@ use crate::kernel::{
     SysUnlinkResult, SysWriteResult,
 };
 
+/// Options for [`KernelSyscall::sys_readdir`]. `Default` = single-level,
+/// unbounded — the classic `readdir(3)` behaviour, so an unchanged caller
+/// reads exactly as before.
+///
+/// `recursive` makes the ONE enumeration primitive list the whole subtree in
+/// a single call (the metastore's native `list(prefix)` range-scan — one
+/// ordered pass) instead of forcing a caller to compose N single-level calls
+/// across the boundary. For a tree walk that is the difference between one
+/// round-trip and O(directories); it is why `glob`/`grep` must ride this
+/// syscall rather than client-side composition (see `docs/syscall-design.md`).
+/// A separate `sys_glob` would overlap this same "enumerate namespace" axis,
+/// so recursion is a mode of `sys_readdir`, not a new syscall.
+///
+/// NOTE (scope): recursion spans the routed zone's metastore namespace AND
+/// descends across nested LOCAL mount boundaries (`sys_readdir` scans each
+/// visible child mount too — a mount's metastore holds only its own entries).
+/// Remaining follow-ups: recursive descent INTO a federation PEER mount stays
+/// single-level (the peer probe is single-level by construction; a recursive
+/// peer result would be mis-rebased one directory level per hop), deep
+/// enumeration of connector-backed content is bounded by what the metastore has
+/// seeded on-access, and `limit` truncates post-scan rather than bounding the
+/// underlying scan.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReaddirOpts {
+    /// List the whole subtree under `parent_path`, not just direct children.
+    pub recursive: bool,
+    /// Cap the number of returned entries (`None` = unbounded).
+    pub limit: Option<usize>,
+}
+
 /// Canonical syscall surface that every Rust service uses to reach
 /// the kernel.
 ///
@@ -153,8 +183,17 @@ pub trait KernelSyscall: Send + Sync + 'static {
 
     /// Directory listing with metastore + backend merge. Returns
     /// Vec<(child_path, entry_type)>. Handles procfs intercepts
-    /// (e.g. `/__sys__/zones/`).
-    fn sys_readdir(&self, parent_path: &str, zone_id: &str, is_admin: bool) -> Vec<(String, u8)>;
+    /// (e.g. `/__sys__/zones/`). `opts` selects single-level (default) vs a
+    /// recursive whole-subtree scan and an optional entry cap — see
+    /// [`ReaddirOpts`]; a traversal is one server-side call, never client-side
+    /// composition of N single-level reads.
+    fn sys_readdir(
+        &self,
+        parent_path: &str,
+        zone_id: &str,
+        is_admin: bool,
+        opts: ReaddirOpts,
+    ) -> Vec<(String, u8)>;
 
     // ── Event watch (inotify equivalent) ──────────────────────────
 
@@ -291,8 +330,14 @@ impl KernelSyscall for crate::kernel::Kernel {
         Self::sys_unlock(self, path, lock_id, force)
     }
 
-    fn sys_readdir(&self, parent_path: &str, zone_id: &str, is_admin: bool) -> Vec<(String, u8)> {
-        Self::sys_readdir(self, parent_path, zone_id, is_admin)
+    fn sys_readdir(
+        &self,
+        parent_path: &str,
+        zone_id: &str,
+        is_admin: bool,
+        opts: ReaddirOpts,
+    ) -> Vec<(String, u8)> {
+        Self::sys_readdir(self, parent_path, zone_id, is_admin, opts)
     }
 
     fn sys_watch(&self, pattern: &str, timeout_ms: u64) -> Option<FileEvent> {

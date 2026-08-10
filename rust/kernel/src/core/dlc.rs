@@ -610,7 +610,12 @@ mod metadata_sync_wiring_tests {
 
         // A readdir on the armed mount discovers it and seeds the row in
         // the same call.
-        let entries = kernel.sys_readdir("/tasks", "root", true);
+        let entries = kernel.sys_readdir(
+            "/tasks",
+            "root",
+            true,
+            crate::kernel::syscall::ReaddirOpts::default(),
+        );
         assert!(
             entries
                 .iter()
@@ -664,7 +669,12 @@ mod metadata_sync_wiring_tests {
         // Out-of-band write, then a readdir on the nested federation-zone
         // mount must seed it — proving the gate key matched.
         backend.add("task-1.json", 9);
-        let entries = kernel.sys_readdir("/shared/cc-tasks/founder", "sharedzone", true);
+        let entries = kernel.sys_readdir(
+            "/shared/cc-tasks/founder",
+            "sharedzone",
+            true,
+            crate::kernel::syscall::ReaddirOpts::default(),
+        );
         assert!(
             entries
                 .iter()
@@ -706,7 +716,12 @@ mod metadata_sync_wiring_tests {
         // Deliberately NOT armed.
         backend.add("a.json", 7);
 
-        let entries = kernel.sys_readdir("/tasks", "root", true);
+        let entries = kernel.sys_readdir(
+            "/tasks",
+            "root",
+            true,
+            crate::kernel::syscall::ReaddirOpts::default(),
+        );
         assert!(
             entries.iter().any(|(p, _)| p == "/tasks/a.json"),
             "readdir still unions backend content for list-your-writes: {entries:?}"
@@ -714,6 +729,74 @@ mod metadata_sync_wiring_tests {
         assert!(
             matches!(kernel.metastore_get("/tasks/a.json"), Ok(None)),
             "no row seeded when the mount is not armed"
+        );
+    }
+
+    /// Recursive `sys_readdir` descends across a nested LOCAL mount boundary: a
+    /// mount's namespace holds only its OWN entries, so the covering scan stops
+    /// at a nested mount's root — the nested subtree is reached by scanning that
+    /// mount too (`child_mounts_under` + `scan_mount_into`). Single-level
+    /// readdir must NOT cross the boundary.
+    #[test]
+    fn recursive_readdir_descends_into_nested_local_mount() {
+        use crate::kernel::syscall::ReaddirOpts;
+        let kernel = Arc::new(Kernel::new());
+
+        // Root mount with one top-level file; a nested mount at /repo whose
+        // files live ONLY in its own backend (never in the root scan's
+        // namespace), so reaching them REQUIRES the cross-mount descent.
+        let root_backend = Arc::new(MutableFlatBackend::new());
+        root_backend.add("top.txt", 3);
+        kernel
+            .add_mount(
+                "/",
+                "root",
+                Some(root_backend.clone() as Arc<dyn ObjectStore>),
+                None,
+                None,
+                false,
+            )
+            .expect("mount /");
+        let repo_backend = Arc::new(MutableFlatBackend::new());
+        repo_backend.add("a.txt", 1);
+        repo_backend.add("b.txt", 2);
+        kernel
+            .add_mount(
+                "/repo",
+                "root",
+                Some(repo_backend.clone() as Arc<dyn ObjectStore>),
+                None,
+                None,
+                false,
+            )
+            .expect("mount /repo");
+
+        // Recursive: crosses into /repo and lists its files.
+        let deep = kernel.sys_readdir(
+            "/",
+            "root",
+            true,
+            ReaddirOpts {
+                recursive: true,
+                limit: None,
+            },
+        );
+        let deep_paths: Vec<&str> = deep.iter().map(|(p, _)| p.as_str()).collect();
+        assert!(
+            deep_paths.contains(&"/top.txt"),
+            "covering mount still listed: {deep_paths:?}"
+        );
+        assert!(
+            deep_paths.contains(&"/repo/a.txt") && deep_paths.contains(&"/repo/b.txt"),
+            "recursive crosses into the nested mount: {deep_paths:?}"
+        );
+
+        // Single-level: must NOT cross the mount boundary.
+        let shallow = kernel.sys_readdir("/", "root", true, ReaddirOpts::default());
+        let shallow_paths: Vec<&str> = shallow.iter().map(|(p, _)| p.as_str()).collect();
+        assert!(
+            !shallow_paths.iter().any(|p| p.starts_with("/repo/")),
+            "single-level must not cross into /repo: {shallow_paths:?}"
         );
     }
 }

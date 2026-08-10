@@ -690,7 +690,10 @@ impl NexusVfsService for VfsServiceImpl {
         let entries = if req.from_peer {
             // Peer fan-out probe: a pure local scan. An empty result means "I
             // don't have it" — a valid answer that lets the fanning-out peer
-            // move on — NOT NotFound, so this arm never errors.
+            // move on — NOT NotFound, so this arm never errors. Single-level
+            // by construction: `recursive`/`limit` are a direct-client feature
+            // (a recursive peer result would be mis-rebased one level per hop),
+            // so they are intentionally NOT forwarded here.
             self.kernel
                 .sys_readdir_peer_dispatch(&req.path, zone_id, ctx.is_admin)
         } else {
@@ -699,9 +702,18 @@ impl NexusVfsService for VfsServiceImpl {
             // (Err(FileNotFound)) / is not a directory (Err(InvalidPath)) via
             // `sys_stat`, so readdir stops silently reporting "" for a missing
             // path (the RPC now matches the C-ABI's documented NotFound contract).
+            //
+            // `recursive` / `limit`: a remote client gets the same one-call
+            // whole-subtree scan an in-process co-hosted agent gets via
+            // `KernelSyscall::sys_readdir` — the round-trip collapse that keeps
+            // a client's glob/grep off tree-walking. `limit == 0` is unbounded.
+            let opts = kernel::kernel::syscall::ReaddirOpts {
+                recursive: req.recursive,
+                limit: (req.limit != 0).then_some(req.limit as usize),
+            };
             match self
                 .kernel
-                .sys_readdir_checked(&req.path, zone_id, ctx.is_admin)
+                .sys_readdir_checked(&req.path, zone_id, ctx.is_admin, opts)
             {
                 Ok(e) => e,
                 Err(err) => {
@@ -2999,6 +3011,79 @@ mod tests {
             .expect("rpc ok")
             .into_inner();
         assert!(notdir.is_error, "readdir of a file must error");
+    }
+
+    #[tokio::test]
+    async fn readdir_recursive_and_limit_over_grpc() {
+        // The wire counterpart of the kernel's
+        // `readdir_recursive_returns_whole_subtree_single_level_stays_shallow`:
+        // a REMOTE client gets the same one-call whole-subtree scan an
+        // in-process co-hosted agent gets via `KernelSyscall::sys_readdir`.
+        let kernel = std::sync::Arc::new(kernel_with_mem_backend());
+        let ctx = OperationContext::new("test", "root", true, None, true);
+        // Explicit dirs (so `/d/sub` has its own row) + a grandchild file.
+        KernelConvenience::mkdir(&*kernel, "/d", &ctx, true, true).expect("mkdir /d");
+        KernelConvenience::mkdir(&*kernel, "/d/sub", &ctx, true, true).expect("mkdir /d/sub");
+        let _ = KernelConvenience::write_batch(
+            &*kernel,
+            &[
+                ("/d/a.txt".to_string(), b"a".to_vec()),
+                ("/d/sub/b.txt".to_string(), b"b".to_vec()),
+                ("/d/sub/c.txt".to_string(), b"c".to_vec()),
+            ],
+            &ctx,
+        );
+
+        let svc = VfsServiceImpl::for_test(kernel);
+        let rd = |recursive: bool, limit: u32| {
+            tonic::Request::new(ReaddirRequest {
+                path: "/d".into(),
+                auth_token: "test-key".into(),
+                recursive,
+                limit,
+                ..Default::default()
+            })
+        };
+
+        // Single-level (default): direct children of /d only.
+        let shallow = svc
+            .readdir(rd(false, 0))
+            .await
+            .expect("rpc ok")
+            .into_inner();
+        assert!(!shallow.is_error);
+        let shallow_names: Vec<&str> = shallow.entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            shallow_names.contains(&"/d/a.txt") && shallow_names.contains(&"/d/sub"),
+            "single-level lists direct children: {shallow_names:?}"
+        );
+        assert!(
+            !shallow_names.iter().any(|n| n.starts_with("/d/sub/")),
+            "single-level must NOT descend into /d/sub: {shallow_names:?}"
+        );
+
+        // Recursive: the whole subtree in ONE call — grandchildren present.
+        let deep = svc.readdir(rd(true, 0)).await.expect("rpc ok").into_inner();
+        assert!(!deep.is_error);
+        let deep_names: Vec<&str> = deep.entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            deep_names.contains(&"/d/sub/b.txt") && deep_names.contains(&"/d/sub/c.txt"),
+            "recursive includes grandchildren: {deep_names:?}"
+        );
+        assert!(
+            deep.entries.len() > shallow.entries.len(),
+            "recursive returns more than single-level"
+        );
+
+        // Limit caps the (path-sorted) recursive result deterministically.
+        let capped = svc.readdir(rd(true, 2)).await.expect("rpc ok").into_inner();
+        assert!(!capped.is_error);
+        assert_eq!(
+            capped.entries.len(),
+            2,
+            "limit caps entry count: {:?}",
+            capped.entries
+        );
     }
 
     #[tokio::test]

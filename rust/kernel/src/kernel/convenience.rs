@@ -17,8 +17,9 @@ use super::{
     SysRmdirResult, SysSetAttrResult, SysUnlinkResult, SysWriteResult,
 };
 use crate::abc::object_store::ObjectStore;
-use crate::meta_store::{MetaStore, DT_EXTERNAL_STORAGE, DT_MOUNT};
+use crate::meta_store::{MetaStore, DT_EXTERNAL_STORAGE, DT_MOUNT, DT_REG};
 use crate::ROOT_ZONE_ID;
+use lib::search::{build_search_mode, grep::GrepMatch, search_lines};
 
 // ── KernelConvenience trait ──────────────────────────────────────────
 
@@ -35,7 +36,12 @@ pub trait KernelConvenience: KernelSyscall {
     /// Remove once sudocode bumps its pin past the `readdir →
     /// sys_readdir` rename.
     fn readdir(&self, parent_path: &str, zone_id: &str, is_admin: bool) -> Vec<(String, u8)> {
-        self.sys_readdir(parent_path, zone_id, is_admin)
+        self.sys_readdir(
+            parent_path,
+            zone_id,
+            is_admin,
+            crate::kernel::syscall::ReaddirOpts::default(),
+        )
     }
 
     /// Batch stat: returns `Vec<Option<StatResult>>` aligned with input.
@@ -185,7 +191,12 @@ pub trait KernelConvenience: KernelSyscall {
 
     /// Top-level mount names: `sys_readdir("/")` filtered to DT_MOUNT / DT_EXTERNAL_STORAGE.
     fn get_top_level_mounts(&self, zone_id: &str) -> Vec<String> {
-        let entries = self.sys_readdir("/", zone_id, true);
+        let entries = self.sys_readdir(
+            "/",
+            zone_id,
+            true,
+            crate::kernel::syscall::ReaddirOpts::default(),
+        );
         let mut names: Vec<String> = entries
             .into_iter()
             .filter(|(_, et)| *et == DT_MOUNT || *et == DT_EXTERNAL_STORAGE)
@@ -202,6 +213,85 @@ pub trait KernelConvenience: KernelSyscall {
             .collect();
         names.sort();
         names
+    }
+
+    /// Server-side "grep over a subtree" — the scan-is-one-call twin of
+    /// glob. Composes ONE recursive `sys_readdir` (the whole file list in a
+    /// single ordered scan) + `sys_read` + `lib::search::search_lines` per
+    /// regular file, entirely kernel-side, so a caller never round-trips
+    /// per-directory or per-file across the syscall boundary. A traversal is
+    /// a server-side one-call op, never client-side composition of N reads —
+    /// see `docs/syscall-design.md`. It is also the in-process API a co-hosted
+    /// agent calls through `K: KernelConvenience` (monomorphised, zero
+    /// dispatch overhead).
+    ///
+    /// `pattern` is a literal (SIMD `memmem`) or a regex, auto-selected by
+    /// `build_search_mode`; an invalid regex is `Err(InvalidPath)`. Only
+    /// `DT_REG` entries are read — directories/mounts/streams/pipes are
+    /// skipped — and a file whose bytes are not valid UTF-8 is skipped the
+    /// way a text grep skips a binary file. A path that vanished or is
+    /// denied mid-walk is skipped, not fatal: the scan is best-effort over a
+    /// possibly-changing tree. Results are path-sorted (recursive readdir is
+    /// BTree-ordered) and capped at `opts.max_results`.
+    ///
+    /// Scope: recursion follows `sys_readdir(recursive)` — the routed zone plus
+    /// nested LOCAL mounts — so grep spans local mount boundaries; the same
+    /// follow-ups apply (recursive descent into a federation PEER mount stays
+    /// single-level, connector-backed depth is bounded by seeded rows — see
+    /// [`ReaddirOpts`]). Perf: files are read sequentially and whole (no
+    /// streaming / no rayon fan-out yet) — a parallel/batched read and
+    /// large-file streaming are the natural next optimizations once this is a
+    /// hot path.
+    fn grep_subtree(
+        &self,
+        root: &str,
+        zone_id: &str,
+        is_admin: bool,
+        ctx: &OperationContext,
+        pattern: &str,
+        opts: GrepOptions,
+    ) -> Result<Vec<GrepMatch>, KernelError> {
+        let mode = build_search_mode(pattern, opts.ignore_case).map_err(|e| {
+            KernelError::InvalidPath(format!("invalid grep pattern {pattern:?}: {e}"))
+        })?;
+        let cap = if opts.max_results == 0 {
+            GrepOptions::DEFAULT_MAX_RESULTS
+        } else {
+            opts.max_results
+        };
+
+        // ONE recursive enumeration of the whole subtree — the round-trip
+        // collapse. Everything below runs on this single scan's output.
+        let entries = self.sys_readdir(
+            root,
+            zone_id,
+            is_admin,
+            crate::kernel::syscall::ReaddirOpts {
+                recursive: true,
+                limit: None,
+            },
+        );
+
+        let mut out: Vec<GrepMatch> = Vec::new();
+        for (path, entry_type) in entries {
+            if out.len() >= cap {
+                break;
+            }
+            if entry_type != DT_REG {
+                continue;
+            }
+            let bytes = match self.sys_read(&path, ctx, opts.read_timeout_ms, 0) {
+                Ok(r) => r.data.unwrap_or_default(),
+                Err(_) => continue,
+            };
+            let text = match std::str::from_utf8(&bytes) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let remaining = cap - out.len();
+            out.extend(search_lines(&path, text, &mode, remaining));
+        }
+        Ok(out)
     }
 
     /// Tier 2 batch write: composes `write()` per-item.
@@ -227,6 +317,39 @@ pub trait KernelConvenience: KernelSyscall {
             .into_iter()
             .map(|opt| opt.is_some())
             .collect()
+    }
+}
+
+// ── GrepOptions ──────────────────────────────────────────────────────
+
+/// Options for [`KernelConvenience::grep_subtree`].
+///
+/// `Default` = case-sensitive, the built-in [`Self::DEFAULT_MAX_RESULTS`]
+/// safety ceiling, a 5 s per-file read timeout.
+#[derive(Debug, Clone, Copy)]
+pub struct GrepOptions {
+    /// Case-insensitive matching (`build_search_mode(ignore_case=true)`).
+    pub ignore_case: bool,
+    /// Cap on total matches returned across the whole subtree
+    /// (`0` → [`Self::DEFAULT_MAX_RESULTS`]).
+    pub max_results: usize,
+    /// Per-file `sys_read` timeout in ms.
+    pub read_timeout_ms: u64,
+}
+
+impl GrepOptions {
+    /// Safety ceiling applied when `max_results == 0`, so an unbounded grep
+    /// over a huge tree cannot balloon the result set without an explicit ask.
+    pub const DEFAULT_MAX_RESULTS: usize = 10_000;
+}
+
+impl Default for GrepOptions {
+    fn default() -> Self {
+        Self {
+            ignore_case: false,
+            max_results: Self::DEFAULT_MAX_RESULTS,
+            read_timeout_ms: 5_000,
+        }
     }
 }
 

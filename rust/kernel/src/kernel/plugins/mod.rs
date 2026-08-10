@@ -271,7 +271,12 @@ unsafe extern "C" fn kernel_cb_sys_readdir(
     // exist; an empty directory is still Ok(0) with `[]`) — the FUSE plugin
     // already codes against that, so this is behaviour it expects, not a
     // signature change.
-    let entries = match kernel.sys_readdir_checked(parent_path, contracts::ROOT_ZONE_ID, true) {
+    let entries = match kernel.sys_readdir_checked(
+        parent_path,
+        contracts::ROOT_ZONE_ID,
+        true,
+        crate::kernel::syscall::ReaddirOpts::default(),
+    ) {
         Ok(e) => e,
         Err(crate::kernel::KernelError::FileNotFound(_)) => return -1, // PluginResult::NotFound
         Err(crate::kernel::KernelError::InvalidPath(_)) => return -2, // PluginResult::InvalidArgument
