@@ -20,7 +20,7 @@ jobs:
           cache: false
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ci-check
+          shared-key: ci-check-ubuntu-22.04
       - run: cargo check --workspace
 
   test:
@@ -34,7 +34,7 @@ jobs:
           cache: false
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ci-test
+          shared-key: ci-test-ubuntu-22.04
       - run: cargo test --workspace
 
   clippy:
@@ -48,7 +48,7 @@ jobs:
           cache: false
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ci-clippy
+          shared-key: ci-clippy-ubuntu-22.04
       - run: cargo clippy --workspace -- -D warnings
 
   fmt:
