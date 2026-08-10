@@ -48,6 +48,32 @@ use crate::kernel::{
     SysUnlinkResult, SysWriteResult,
 };
 
+/// Options for [`KernelSyscall::sys_readdir`]. `Default` = single-level,
+/// unbounded — the classic `readdir(3)` behaviour, so an unchanged caller
+/// reads exactly as before.
+///
+/// `recursive` makes the ONE enumeration primitive list the whole subtree in
+/// a single call (the metastore's native `list(prefix)` range-scan — one
+/// ordered pass) instead of forcing a caller to compose N single-level calls
+/// across the boundary. For a tree walk that is the difference between one
+/// round-trip and O(directories); it is why `glob`/`grep` must ride this
+/// syscall rather than client-side composition (see `docs/syscall-design.md`).
+/// A separate `sys_glob` would overlap this same "enumerate namespace" axis,
+/// so recursion is a mode of `sys_readdir`, not a new syscall.
+///
+/// NOTE (scope): recursion currently spans the routed zone's metastore
+/// namespace. Descending across a child MOUNT into another zone, and deep
+/// enumeration of connector-backed / federation mounts, are tracked follow-ups
+/// (the single-level backend/federation merge below still applies at the top
+/// level only).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReaddirOpts {
+    /// List the whole subtree under `parent_path`, not just direct children.
+    pub recursive: bool,
+    /// Cap the number of returned entries (`None` = unbounded).
+    pub limit: Option<usize>,
+}
+
 /// Canonical syscall surface that every Rust service uses to reach
 /// the kernel.
 ///
@@ -153,8 +179,17 @@ pub trait KernelSyscall: Send + Sync + 'static {
 
     /// Directory listing with metastore + backend merge. Returns
     /// Vec<(child_path, entry_type)>. Handles procfs intercepts
-    /// (e.g. `/__sys__/zones/`).
-    fn sys_readdir(&self, parent_path: &str, zone_id: &str, is_admin: bool) -> Vec<(String, u8)>;
+    /// (e.g. `/__sys__/zones/`). `opts` selects single-level (default) vs a
+    /// recursive whole-subtree scan and an optional entry cap — see
+    /// [`ReaddirOpts`]; a traversal is one server-side call, never client-side
+    /// composition of N single-level reads.
+    fn sys_readdir(
+        &self,
+        parent_path: &str,
+        zone_id: &str,
+        is_admin: bool,
+        opts: ReaddirOpts,
+    ) -> Vec<(String, u8)>;
 
     // ── Event watch (inotify equivalent) ──────────────────────────
 
@@ -291,8 +326,14 @@ impl KernelSyscall for crate::kernel::Kernel {
         Self::sys_unlock(self, path, lock_id, force)
     }
 
-    fn sys_readdir(&self, parent_path: &str, zone_id: &str, is_admin: bool) -> Vec<(String, u8)> {
-        Self::sys_readdir(self, parent_path, zone_id, is_admin)
+    fn sys_readdir(
+        &self,
+        parent_path: &str,
+        zone_id: &str,
+        is_admin: bool,
+        opts: ReaddirOpts,
+    ) -> Vec<(String, u8)> {
+        Self::sys_readdir(self, parent_path, zone_id, is_admin, opts)
     }
 
     fn sys_watch(&self, pattern: &str, timeout_ms: u64) -> Option<FileEvent> {

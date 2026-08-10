@@ -610,7 +610,12 @@ mod metadata_sync_wiring_tests {
 
         // A readdir on the armed mount discovers it and seeds the row in
         // the same call.
-        let entries = kernel.sys_readdir("/tasks", "root", true);
+        let entries = kernel.sys_readdir(
+            "/tasks",
+            "root",
+            true,
+            crate::kernel::syscall::ReaddirOpts::default(),
+        );
         assert!(
             entries
                 .iter()
@@ -664,7 +669,12 @@ mod metadata_sync_wiring_tests {
         // Out-of-band write, then a readdir on the nested federation-zone
         // mount must seed it — proving the gate key matched.
         backend.add("task-1.json", 9);
-        let entries = kernel.sys_readdir("/shared/cc-tasks/founder", "sharedzone", true);
+        let entries = kernel.sys_readdir(
+            "/shared/cc-tasks/founder",
+            "sharedzone",
+            true,
+            crate::kernel::syscall::ReaddirOpts::default(),
+        );
         assert!(
             entries
                 .iter()
@@ -706,7 +716,12 @@ mod metadata_sync_wiring_tests {
         // Deliberately NOT armed.
         backend.add("a.json", 7);
 
-        let entries = kernel.sys_readdir("/tasks", "root", true);
+        let entries = kernel.sys_readdir(
+            "/tasks",
+            "root",
+            true,
+            crate::kernel::syscall::ReaddirOpts::default(),
+        );
         assert!(
             entries.iter().any(|(p, _)| p == "/tasks/a.json"),
             "readdir still unions backend content for list-your-writes: {entries:?}"

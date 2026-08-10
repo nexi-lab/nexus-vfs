@@ -3413,7 +3413,12 @@ impl Kernel {
         zone_id: &str,
         is_admin: bool,
     ) -> Vec<(String, u8)> {
-        self.sys_readdir(parent_path, zone_id, is_admin)
+        self.sys_readdir(
+            parent_path,
+            zone_id,
+            is_admin,
+            crate::kernel::syscall::ReaddirOpts::default(),
+        )
     }
 
     pub fn sys_readdir(
@@ -3421,6 +3426,7 @@ impl Kernel {
         parent_path: &str,
         zone_id: &str,
         is_admin: bool,
+        opts: crate::kernel::syscall::ReaddirOpts,
     ) -> Vec<(String, u8)> {
         if validate_path_fast(parent_path).is_err() {
             return Vec::new();
@@ -3459,8 +3465,11 @@ impl Kernel {
         {
             let parent_depth = global_prefix.matches('/').count();
             for meta in ms_children.into_iter().flatten() {
-                // Direct children only: same depth as prefix + 1 segment.
-                if meta.path.matches('/').count() != parent_depth {
+                // Single-level keeps direct children only (same depth as the
+                // prefix + 1 segment); recursive keeps the whole subtree the
+                // one prefix scan already returned — that is the round-trip
+                // collapse (one server-side scan vs O(dirs) client calls).
+                if !opts.recursive && meta.path.matches('/').count() != parent_depth {
                     continue;
                 }
                 if !meta.path.starts_with(&global_prefix) {
@@ -3584,7 +3593,7 @@ impl Kernel {
         // thin-reader topology), a distinct axis metadata sync does not
         // cover.
 
-        let entries: Vec<(String, u8)> = if needs_zone_filter {
+        let mut entries: Vec<(String, u8)> = if needs_zone_filter {
             seen.into_iter()
                 .filter(|(_, (_, entry_zone))| {
                     let ez = entry_zone.as_deref().unwrap_or(contracts::ROOT_ZONE_ID);
@@ -3597,6 +3606,13 @@ impl Kernel {
                 .map(|(path, (etype, _))| (path, etype))
                 .collect()
         };
+        // `seen` is a BTreeMap, so entries are path-sorted; a limit takes the
+        // lexicographically-first N deterministically. (True streaming/cursor
+        // pagination that also bounds the underlying scan is a follow-up; today
+        // the prefix scan already materialises the subtree either way.)
+        if let Some(limit) = opts.limit {
+            entries.truncate(limit);
+        }
         entries
     }
 
@@ -3626,7 +3642,12 @@ impl Kernel {
         zone_id: &str,
         is_admin: bool,
     ) -> Result<Vec<(String, u8)>, KernelError> {
-        let entries = self.sys_readdir(parent_path, zone_id, is_admin);
+        let entries = self.sys_readdir(
+            parent_path,
+            zone_id,
+            is_admin,
+            crate::kernel::syscall::ReaddirOpts::default(),
+        );
         if entries.is_empty() {
             // Empty enumeration is ambiguous — resolve existence via the one
             // authority. Only reached on an empty result, so the common
@@ -3704,7 +3725,12 @@ impl Kernel {
         }
 
         // Normal readdir with optional pagination.
-        let all = self.sys_readdir(parent_path, zone_id, is_admin);
+        let all = self.sys_readdir(
+            parent_path,
+            zone_id,
+            is_admin,
+            crate::kernel::syscall::ReaddirOpts::default(),
+        );
 
         if limit == 0 {
             return super::ReadDirResult {
@@ -3889,6 +3915,74 @@ mod read_batch_tests {
         assert_eq!(out.len(), 1);
         let r = out[0].as_ref().expect("inner ok");
         assert_eq!(r.data.as_deref().unwrap(), b"hi there");
+    }
+
+    #[test]
+    fn readdir_recursive_returns_whole_subtree_single_level_stays_shallow() {
+        use crate::kernel::syscall::ReaddirOpts;
+        let k = kernel_with_backend();
+        let c = ctx();
+        let z = contracts::ROOT_ZONE_ID;
+        k.mkdir("/d", &c, true, true).expect("mkdir /d");
+        k.mkdir("/d/sub", &c, true, true).expect("mkdir /d/sub");
+        k.sys_write_with_link_depth("/d/a.txt", &c, b"a", 0, 1)
+            .expect("write a");
+        k.sys_write_with_link_depth("/d/sub/b.txt", &c, b"b", 0, 1)
+            .expect("write b");
+        k.sys_write_with_link_depth("/d/sub/c.txt", &c, b"c", 0, 1)
+            .expect("write c");
+
+        // Single-level (default): direct children of /d only — grandchildren absent.
+        let shallow = k.sys_readdir("/d", z, true, ReaddirOpts::default());
+        let shallow_paths: Vec<&str> = shallow.iter().map(|(p, _)| p.as_str()).collect();
+        assert!(
+            shallow_paths.contains(&"/d/a.txt"),
+            "direct child: {shallow_paths:?}"
+        );
+        assert!(
+            shallow_paths.contains(&"/d/sub"),
+            "direct child dir: {shallow_paths:?}"
+        );
+        assert!(
+            !shallow_paths.iter().any(|p| p.starts_with("/d/sub/")),
+            "single-level must NOT include grandchildren: {shallow_paths:?}"
+        );
+
+        // Recursive: the whole subtree in ONE call — grandchildren present.
+        let deep = k.sys_readdir(
+            "/d",
+            z,
+            true,
+            ReaddirOpts {
+                recursive: true,
+                limit: None,
+            },
+        );
+        let deep_paths: Vec<&str> = deep.iter().map(|(p, _)| p.as_str()).collect();
+        assert!(
+            deep_paths.contains(&"/d/sub/b.txt"),
+            "recursive incl grandchild: {deep_paths:?}"
+        );
+        assert!(
+            deep_paths.contains(&"/d/sub/c.txt"),
+            "recursive incl grandchild: {deep_paths:?}"
+        );
+        assert!(
+            deep.len() > shallow.len(),
+            "recursive returns more than single-level"
+        );
+
+        // Limit caps the recursive result (path-sorted, deterministic).
+        let capped = k.sys_readdir(
+            "/d",
+            z,
+            true,
+            ReaddirOpts {
+                recursive: true,
+                limit: Some(2),
+            },
+        );
+        assert_eq!(capped.len(), 2, "limit caps entry count: {capped:?}");
     }
 
     #[test]

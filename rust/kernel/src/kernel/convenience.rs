@@ -35,7 +35,12 @@ pub trait KernelConvenience: KernelSyscall {
     /// Remove once sudocode bumps its pin past the `readdir →
     /// sys_readdir` rename.
     fn readdir(&self, parent_path: &str, zone_id: &str, is_admin: bool) -> Vec<(String, u8)> {
-        self.sys_readdir(parent_path, zone_id, is_admin)
+        self.sys_readdir(
+            parent_path,
+            zone_id,
+            is_admin,
+            crate::kernel::syscall::ReaddirOpts::default(),
+        )
     }
 
     /// Batch stat: returns `Vec<Option<StatResult>>` aligned with input.
@@ -185,7 +190,12 @@ pub trait KernelConvenience: KernelSyscall {
 
     /// Top-level mount names: `sys_readdir("/")` filtered to DT_MOUNT / DT_EXTERNAL_STORAGE.
     fn get_top_level_mounts(&self, zone_id: &str) -> Vec<String> {
-        let entries = self.sys_readdir("/", zone_id, true);
+        let entries = self.sys_readdir(
+            "/",
+            zone_id,
+            true,
+            crate::kernel::syscall::ReaddirOpts::default(),
+        );
         let mut names: Vec<String> = entries
             .into_iter()
             .filter(|(_, et)| *et == DT_MOUNT || *et == DT_EXTERNAL_STORAGE)

@@ -87,12 +87,15 @@ pub trait KernelSyscallAsync: KernelSyscall {
         parent_path: String,
         zone_id: String,
         is_admin: bool,
+        opts: crate::kernel::syscall::ReaddirOpts,
     ) -> impl Future<Output = Vec<(String, u8)>> + Send {
         let k = Arc::clone(self);
         async move {
-            tokio::task::spawn_blocking(move || k.sys_readdir(&parent_path, &zone_id, is_admin))
-                .await
-                .unwrap_or_default()
+            tokio::task::spawn_blocking(move || {
+                k.sys_readdir(&parent_path, &zone_id, is_admin, opts)
+            })
+            .await
+            .unwrap_or_default()
         }
     }
 
@@ -174,7 +177,12 @@ mod tests {
         _assert_send(k.sys_read_async("/x".into(), ctx.clone(), 0, 0));
         _assert_send(k.sys_write_async("/x".into(), ctx.clone(), vec![], 0));
         _assert_send(k.sys_stat_async("/x".into(), "root".into()));
-        _assert_send(k.sys_readdir_async("/".into(), "root".into(), false));
+        _assert_send(k.sys_readdir_async(
+            "/".into(),
+            "root".into(),
+            false,
+            crate::kernel::syscall::ReaddirOpts::default(),
+        ));
         _assert_send(k.sys_unlink_async("/x".into(), ctx.clone(), false));
         _assert_send(k.sys_rename_async("/a".into(), "/b".into(), ctx.clone()));
         _assert_send(k.sys_copy_async("/a".into(), "/b".into(), ctx));
