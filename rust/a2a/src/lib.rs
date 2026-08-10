@@ -24,10 +24,10 @@
 //! # Frontends / consumers
 //!
 //! Frontends ride on the substrate rather than re-implementing it:
-//! `matrix_adapter` (Matrix C-S → humans, nexus services tier),
-//! `sudocode-host` (agent runtime → AI), and `managed_agent` (spawn/PCB
-//! → process). A frontend consumes [`MailboxStampingHook`]; only the
-//! daemon calls [`install_a2a_stamp_hook`].
+//! `matrix_adapter` (Matrix C-S → humans, nexus services tier), the
+//! `sudocode` runtime (agent runtime → AI), and `managed_agent`
+//! (spawn/PCB → process). A frontend consumes [`MailboxStampingHook`];
+//! only the daemon calls [`install_a2a_stamp_hook`].
 
 pub mod foreign_containment;
 pub mod mailbox_stamping_hook;
