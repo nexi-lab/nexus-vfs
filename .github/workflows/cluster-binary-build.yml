@@ -18,7 +18,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             artifact_name: nexusd-cluster-linux-x86_64
             package: nexus-cluster
             bin: nexusd-cluster

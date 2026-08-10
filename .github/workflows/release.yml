@@ -26,12 +26,12 @@ jobs:
       matrix:
         include:
           - name: linux-x86_64
-            os: ubuntu-latest
+            os: ubuntu-22.04
             bin: nexusd-cluster
             package_dir: nexusd-cluster-linux-x86_64
             archive_name: nexusd-cluster-linux-x86_64.tar.gz
           - name: linux-aarch64
-            os: ubuntu-24.04-arm
+            os: ubuntu-22.04-arm
             bin: nexusd-cluster
             package_dir: nexusd-cluster-linux-aarch64
             archive_name: nexusd-cluster-linux-aarch64.tar.gz
