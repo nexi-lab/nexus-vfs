@@ -589,6 +589,28 @@ enum Cmd {
         #[arg(long)]
         zone: Option<String>,
     },
+    /// Reset this node to a truly-fresh state: remove BOTH the data-dir and the
+    /// identity file. A `rm -rf <data-dir>` alone is NOT a fresh node —
+    /// `identity.json` (at the platform user-data path unless `--identity-dir`
+    /// overrides) survives a data-dir wipe by design (it carries the peer
+    /// address book + per-zone membership for auto-rejoin), so a data-only wipe
+    /// leaves the node rejoining its OLD cluster with stale identity. Offline:
+    /// run with the daemon stopped. Prints what it would remove unless `--yes`.
+    Reset {
+        /// The daemon's data directory (same value passed to `--data-dir`).
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Identity directory holding `identity.json`. Defaults to the platform
+        /// user-data path (`%LOCALAPPDATA%\Nexus` / `~/Library/Application
+        /// Support/Nexus` / `$XDG_DATA_HOME/nexus`) — the same location the
+        /// daemon uses when `--identity-dir` is unset at boot.
+        #[arg(long)]
+        identity_dir: Option<PathBuf>,
+        /// Actually delete. Without it, `reset` only prints what it would
+        /// remove (destructive-op guard).
+        #[arg(long)]
+        yes: bool,
+    },
     /// Mount a remote zone at a local path.
     ///
     /// Joins `<remote_zone_id>` (must already exist on `<peer_addr>`),
@@ -869,6 +891,11 @@ where
                 Some(Cmd::Auth { action }) => run_auth(args.common, action).await,
                 Some(Cmd::ForeignCa { action }) => run_foreign_ca(args.common, action).await,
                 Some(Cmd::Doctor { data_dir, zone }) => run_doctor(&data_dir, zone.as_deref()),
+                Some(Cmd::Reset {
+                    data_dir,
+                    identity_dir,
+                    yes,
+                }) => run_reset(&data_dir, identity_dir.as_deref(), yes),
                 Some(Cmd::Join {
                     peer_addr,
                     remote_zone_id,
@@ -3069,6 +3096,100 @@ async fn run_join(
 /// are treated as zones; others are skipped.  redb's exclusive lock
 /// means the daemon must be stopped first — the failure mode
 /// otherwise is a clear "could not open zone storage" error per zone.
+/// Handler for `nexusd-cluster reset` — make a truly-fresh node by clearing
+/// BOTH the data-dir and the identity file. The data-dir holds regenerable
+/// raft/metastore state; `identity.json` (at the platform path unless
+/// overridden) carries the peer address book + per-zone membership and SURVIVES
+/// a data-dir wipe by design — so `rm -rf <data-dir>` alone leaves a node that
+/// auto-rejoins its OLD cluster with stale identity (the phantom-voter deadlock
+/// this change set addresses). Destructive → requires `--yes`.
+fn run_reset(
+    data_dir: &std::path::Path,
+    identity_dir: Option<&std::path::Path>,
+    yes: bool,
+) -> Result<()> {
+    let identity_dir = identity_dir
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(nexus_raft::identity::default_identity_dir);
+    let identity_file = identity_dir.join(nexus_raft::identity::IDENTITY_FILE);
+
+    let data_exists = data_dir.exists();
+    let identity_exists = identity_file.exists();
+    if !data_exists && !identity_exists {
+        println!(
+            "Nothing to reset — neither {} nor {} exists.",
+            data_dir.display(),
+            identity_file.display()
+        );
+        return Ok(());
+    }
+    if !yes {
+        println!("`reset` would REMOVE (re-run with --yes to proceed):");
+        if data_exists {
+            println!("  data-dir : {}", data_dir.display());
+        }
+        if identity_exists {
+            println!("  identity : {}", identity_file.display());
+        }
+        println!(
+            "\nidentity.json survives a data-dir wipe by design, so clearing it too is what a\n\
+             re-found actually needs — otherwise this node auto-rejoins its old cluster stale."
+        );
+        return Ok(());
+    }
+    if data_exists {
+        std::fs::remove_dir_all(data_dir)
+            .with_context(|| format!("removing data-dir {}", data_dir.display()))?;
+        println!("removed data-dir : {}", data_dir.display());
+    }
+    if identity_exists {
+        std::fs::remove_file(&identity_file)
+            .with_context(|| format!("removing identity {}", identity_file.display()))?;
+        println!("removed identity : {}", identity_file.display());
+    }
+    println!("reset complete — this node is now fresh.");
+    Ok(())
+}
+
+#[cfg(test)]
+mod reset_tests {
+    use super::run_reset;
+    use std::fs;
+
+    #[test]
+    fn dry_run_keeps_files_then_yes_removes_both() {
+        // Unique scratch dir; ALWAYS pass an explicit identity_dir so the test
+        // never touches the real platform identity.json.
+        let salt = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let base =
+            std::env::temp_dir().join(format!("nexus-reset-test-{}-{salt}", std::process::id()));
+        let data_dir = base.join("data");
+        let identity_dir = base.join("identity");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::create_dir_all(&identity_dir).unwrap();
+        let identity_file = identity_dir.join("identity.json");
+        fs::write(&identity_file, b"{}").unwrap();
+
+        // Dry-run (no --yes): nothing removed.
+        run_reset(&data_dir, Some(&identity_dir), false).unwrap();
+        assert!(data_dir.exists(), "dry-run must NOT remove the data-dir");
+        assert!(
+            identity_file.exists(),
+            "dry-run must NOT remove identity.json"
+        );
+
+        // --yes: both gone (a truly-fresh node).
+        run_reset(&data_dir, Some(&identity_dir), true).unwrap();
+        assert!(!data_dir.exists(), "--yes removes the data-dir");
+        assert!(!identity_file.exists(), "--yes removes identity.json");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+}
+
 fn run_doctor(data_dir: &std::path::Path, zone_filter: Option<&str>) -> Result<()> {
     use nexus_raft::raft::RaftStorage;
 
