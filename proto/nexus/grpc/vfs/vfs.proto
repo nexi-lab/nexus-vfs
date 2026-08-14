@@ -606,6 +606,12 @@ message StreamReadAtResponse {
   bool eof = 3;               // non-blocking: true → no data available
   bool is_error = 4;
   bytes error_payload = 5;
+  // Set true ONLY when a blocking read (blocking=true) reaches timeout_ms with
+  // no frame — a normal long-poll expiry. `eof` also stays true (backward-compat:
+  // a follower that only checks `eof` still re-polls) and `is_error` stays false.
+  // Lets a blocking long-poll reader tell "idle timeout → re-read same offset"
+  // apart from a real disconnect (`is_error=true`) without overloading `eof`.
+  bool timed_out = 6;
 }
 
 message StreamCollectAllResponse {

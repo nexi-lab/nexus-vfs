@@ -1234,6 +1234,7 @@ impl NexusVfsService for VfsServiceImpl {
                 eof: false,
                 is_error: false,
                 error_payload: Vec::new(),
+                timed_out: false,
             })),
             Ok(None) => Ok(Response::new(StreamReadAtResponse {
                 data: Vec::new(),
@@ -1241,6 +1242,7 @@ impl NexusVfsService for VfsServiceImpl {
                 eof: true,
                 is_error: false,
                 error_payload: Vec::new(),
+                timed_out: false,
             })),
             // A BLOCKING read that reaches its timeout with no frame is NOT a wire
             // error — it is a normal long-poll expiry, semantically identical to the
@@ -1259,6 +1261,7 @@ impl NexusVfsService for VfsServiceImpl {
                 eof: true,
                 is_error: false,
                 error_payload: Vec::new(),
+                timed_out: true,
             })),
             Err(err) => {
                 let (code, msg) = self.map_kernel_err(err);
@@ -1268,6 +1271,7 @@ impl NexusVfsService for VfsServiceImpl {
                     eof: false,
                     is_error: true,
                     error_payload: encode_rpc_error(code, &msg),
+                    timed_out: false,
                 }))
             }
         }
@@ -1707,6 +1711,7 @@ fn error_stream_read(status: Status) -> StreamReadAtResponse {
         eof: false,
         is_error: true,
         error_payload: encode_rpc_error_bytes(status_to_code(&status), status.message()),
+        timed_out: false,
     }
 }
 
@@ -2882,6 +2887,33 @@ mod tests {
         assert_eq!(
             resp.next_offset, 0,
             "cursor unchanged so the client re-polls from the same offset"
+        );
+        assert!(
+            resp.timed_out,
+            "a blocking-read timeout sets timed_out (distinct from a non-blocking empty read)"
+        );
+
+        // Contrast: a NON-blocking empty read on the same idle stream is also eof
+        // (no frame) but must NOT set timed_out — that bit is reserved for a
+        // blocking long-poll expiry, so a blocking reader tells the two apart.
+        let nb = svc
+            .stream_read_at(tonic::Request::new(StreamReadAtRequest {
+                path: "/nexus/streams/idle-tail".into(),
+                auth_token: "test-key".into(),
+                offset: 0,
+                blocking: false,
+                timeout_ms: 0,
+            }))
+            .await
+            .expect("stream_read_at rpc ok")
+            .into_inner();
+        assert!(
+            nb.eof && !nb.is_error,
+            "non-blocking empty read is eof, not error"
+        );
+        assert!(
+            !nb.timed_out,
+            "a non-blocking empty read must NOT set timed_out"
         );
     }
 
