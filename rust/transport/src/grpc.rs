@@ -39,6 +39,7 @@ use kernel::kernel::vfs_proto::{
     UnlockRequest, UnlockResponse, WatchRequest, WatchResponse, WriteRequest, WriteResponse,
 };
 use kernel::kernel::{Kernel, KernelError, OperationContext};
+use kernel::Permission;
 
 /// Configuration for the VFS gRPC server.
 #[derive(Clone)]
@@ -411,6 +412,71 @@ impl VfsServiceImpl {
         }
     }
 
+    /// Non-mount typed setattr — create a dir / stream / pipe / link, or apply
+    /// a metadata update. Sibling of [`Self::setattr_mount`]: both run a gRPC
+    /// setattr through the §13 permission gate before mutating kernel state.
+    /// A namespace-mutating create/update is gated exactly like a write
+    /// (`Permission::Write`), so a foreign agent confined by
+    /// `ForeignAgentMailboxOnly` can create only inside its mailbox — the same
+    /// boundary the write seam enforces on stream/pipe appends.
+    fn setattr_typed(&self, req: SetattrRequest, ctx: &OperationContext) -> SetattrResponse {
+        let zone_id_str = req.zone_id;
+        let zone_id = if zone_id_str.is_empty() {
+            kernel::ROOT_ZONE_ID
+        } else {
+            &zone_id_str
+        };
+
+        let result = self
+            .kernel
+            .check_permission(&req.path, Permission::Write, ctx)
+            .and_then(|()| {
+                self.kernel.sys_setattr(
+                    &req.path,
+                    req.entry_type,
+                    &req.backend_name,
+                    None, // backend (non-mount entry types don't need one)
+                    None, // metastore
+                    None, // raft_backend
+                    &req.io_profile,
+                    zone_id,
+                    req.is_external,
+                    req.capacity as usize,
+                    None, // read_fd  — DT_PIPE stdio uses the in-process AcpSubprocess path
+                    None, // write_fd
+                    req.mime_type.as_deref(),
+                    req.modified_at_ms,
+                    req.content_id.as_deref(),
+                    req.size,
+                    req.version,
+                    req.created_at_ms,
+                    None, // link_target — DT_LINK creation isn't on the JSON-wire today
+                    None, // source
+                    None, // remote_metastore
+                )
+            });
+
+        match result {
+            Ok(r) => SetattrResponse {
+                path: r.path,
+                created: r.created,
+                entry_type: r.entry_type,
+                is_error: false,
+                error_payload: Vec::new(),
+            },
+            Err(err) => {
+                let (code, msg) = self.map_kernel_err(err);
+                SetattrResponse {
+                    path: String::new(),
+                    created: false,
+                    entry_type: 0,
+                    is_error: true,
+                    error_payload: encode_rpc_error(code, &msg),
+                }
+            }
+        }
+    }
+
     /// Test-only constructor.
     #[cfg(test)]
     pub(crate) fn for_test(kernel: Arc<Kernel>) -> Self {
@@ -760,63 +826,7 @@ impl NexusVfsService for VfsServiceImpl {
         if req.entry_type == 2 {
             return Ok(Response::new(self.setattr_mount(req, &ctx)));
         }
-        // Non-mount typed setattr (create dir/stream/pipe, or a metadata
-        // update) is not gated yet: `sys_setattr` takes no `ctx`, so the §13
-        // gate can't run in-kernel where it belongs. Follow-up: thread `ctx`
-        // through `sys_setattr` (a codegen-ABI change across its callers).
-        // Create-only is low-harm — the write seam already denies WRITING a
-        // rogue stream, so a foreign agent can at most create an empty,
-        // unwritable node.
-        let _ = ctx;
-
-        let zone_id_str = req.zone_id;
-        let zone_id = if zone_id_str.is_empty() {
-            kernel::ROOT_ZONE_ID
-        } else {
-            &zone_id_str
-        };
-
-        match self.kernel.sys_setattr(
-            &req.path,
-            req.entry_type,
-            &req.backend_name,
-            None, // backend (non-mount entry types don't need one)
-            None, // metastore
-            None, // raft_backend
-            &req.io_profile,
-            zone_id,
-            req.is_external,
-            req.capacity as usize,
-            None, // read_fd  — DT_PIPE stdio uses the in-process AcpSubprocess path
-            None, // write_fd
-            req.mime_type.as_deref(),
-            req.modified_at_ms,
-            req.content_id.as_deref(),
-            req.size,
-            req.version,
-            req.created_at_ms,
-            None, // link_target — DT_LINK creation isn't on the JSON-wire today
-            None, // source
-            None, // remote_metastore
-        ) {
-            Ok(r) => Ok(Response::new(SetattrResponse {
-                path: r.path,
-                created: r.created,
-                entry_type: r.entry_type,
-                is_error: false,
-                error_payload: Vec::new(),
-            })),
-            Err(err) => {
-                let (code, msg) = self.map_kernel_err(err);
-                Ok(Response::new(SetattrResponse {
-                    path: String::new(),
-                    created: false,
-                    entry_type: 0,
-                    is_error: true,
-                    error_payload: encode_rpc_error(code, &msg),
-                }))
-            }
-        }
+        Ok(Response::new(self.setattr_typed(req, &ctx)))
     }
 
     async fn rename(
@@ -2742,6 +2752,71 @@ mod tests {
         );
         assert!(resp.is_error, "non-admin DT_MOUNT must be rejected");
         assert!(!resp.created);
+    }
+
+    #[test]
+    fn setattr_typed_create_is_permission_gated() {
+        use kernel::PermissionProvider;
+
+        // Mailbox-only stub: deny every mutating op (Write) outside a
+        // chat-with-me mailbox — the boundary ForeignAgentMailboxOnly enforces,
+        // reproduced here so the gate is exercised without pulling the a2a
+        // provider into a transport-tier test.
+        struct MailboxOnlyStub;
+        impl PermissionProvider for MailboxOnlyStub {
+            fn check(
+                &self,
+                path: &str,
+                _route: Option<&kernel::vfs_router::RouteResult>,
+                permission: Permission,
+                _ctx: &OperationContext,
+            ) -> Result<(), KernelError> {
+                if matches!(permission, Permission::Write) && !path.contains("chat-with-me") {
+                    return Err(KernelError::PermissionDenied(format!("contained: {path}")));
+                }
+                Ok(())
+            }
+        }
+
+        let kernel = std::sync::Arc::new(kernel_with_mem_backend());
+        kernel.set_permission_provider(std::sync::Arc::new(
+            Box::new(MailboxOnlyStub) as Box<dyn PermissionProvider>
+        ));
+        let svc = VfsServiceImpl::for_test(kernel);
+        // Non-admin, non-system context (an admin/system ctx short-circuits the gate).
+        let ctx = OperationContext::new("foreign", "root", false, None, false);
+
+        // Create a DT_STREAM OUTSIDE the mailbox → the gate denies it.
+        let denied = svc.setattr_typed(
+            SetattrRequest {
+                path: "/evil-inbox".into(),
+                entry_type: 4,
+                capacity: 16,
+                ..Default::default()
+            },
+            &ctx,
+        );
+        assert!(
+            denied.is_error,
+            "foreign create outside mailbox must be denied"
+        );
+        assert!(!denied.created);
+
+        // Create a DT_STREAM INSIDE the mailbox → the gate lets it through.
+        let allowed = svc.setattr_typed(
+            SetattrRequest {
+                path: "/chat-with-me".into(),
+                entry_type: 4,
+                capacity: 16,
+                ..Default::default()
+            },
+            &ctx,
+        );
+        assert!(
+            !allowed.is_error,
+            "create inside mailbox must pass the gate: {allowed:?}"
+        );
+        assert!(allowed.created);
     }
 
     #[tokio::test]
