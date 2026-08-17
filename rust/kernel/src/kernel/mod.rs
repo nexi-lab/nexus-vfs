@@ -3415,6 +3415,39 @@ mod tests {
         assert!(!r2.created);
     }
 
+    /// `sys_stat` reports a DT_STREAM's live append tail as `size` (#80).
+    /// The metastore entry's `size` is not maintained for streams, so without
+    /// the DT_STREAM branch in `sys_stat` a stream stats as size 0 forever —
+    /// which broke cold-start "seek to the current end" (a co-hosted agent
+    /// reads `stat.size` to skip its mailbox backlog before processing new
+    /// messages). Verifies fresh == 0, and that after framed appends
+    /// `stat.size` equals the stream manager's live tail.
+    #[test]
+    fn sys_stat_reports_stream_tail_as_size() {
+        let k = kernel_with_root_backend();
+        let path = "/mailbox-stream";
+        setattr(&k, path, DT_STREAM as i32).unwrap();
+
+        // Fresh stream: tail == 0 → stat.size == 0 (not a stale metastore value).
+        let fresh = k.sys_stat(path, "root").expect("stat fresh stream");
+        assert_eq!(fresh.entry_type, DT_STREAM);
+        assert_eq!(fresh.size, 0, "fresh stream stats as size 0 (== tail)");
+
+        // Append two framed messages; each advances the tail by
+        // HEADER_SIZE(4) + payload. (4+5) + (4+6) = 19.
+        let ctx = OperationContext::new("test", "root", true, None, true);
+        k.stream_write_nowait(path, b"hello", &ctx).unwrap();
+        k.stream_write_nowait(path, b"world!", &ctx).unwrap();
+
+        let tail = k.stream_manager.tail(path).expect("stream has a live tail");
+        let stat = k.sys_stat(path, "root").expect("stat after writes");
+        assert_eq!(
+            stat.size, tail as u64,
+            "sys_stat.size must track the live stream tail, not the stale metastore size"
+        );
+        assert_eq!(stat.size, 19, "tail = (4+5) + (4+6) = 19 framed bytes");
+    }
+
     /// `sys_setattr DT_MOUNT` dispatches a `FileEventType::Mount`
     /// event through `MutationObserver`. Wired for services-tier
     /// consumers (e.g. `services::audit::ZoneAuditAutoWire`) to

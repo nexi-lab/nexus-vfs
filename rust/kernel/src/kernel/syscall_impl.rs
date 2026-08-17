@@ -1314,13 +1314,27 @@ impl Kernel {
 
         let lock = self.lock_manager.get_lock_info(path);
 
+        // A DT_STREAM's byte length is its live append tail, tracked in the
+        // stream subsystem — the metastore `entry.size` is not maintained for
+        // streams (it stays at the create-time value). Report the tail so a
+        // caller (e.g. a co-hosted agent seeking its mailbox to the current
+        // end on cold start) gets the correct length through the standard
+        // metadata syscall, no separate stream-only accessor needed. Falls
+        // back to `entry.size` when the buffer isn't locally resolvable (e.g.
+        // a not-yet-materialised remote stream).
+        let size = if entry.entry_type == DT_STREAM {
+            self.stream_manager
+                .tail(path)
+                .map_or(entry.size, |tail| tail as u64)
+        } else if is_dir && entry.size == 0 {
+            4096
+        } else {
+            entry.size
+        };
+
         Some(StatResult {
             path: path.to_string(),
-            size: if is_dir && entry.size == 0 {
-                4096
-            } else {
-                entry.size
-            },
+            size,
             content_id: entry.content_id,
             mime_type: mime,
             is_directory: is_dir,
