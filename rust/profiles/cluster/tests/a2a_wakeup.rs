@@ -129,12 +129,14 @@ async fn mailbox_round(owner_port: u16, sender_port: u16, sender_name: &str, age
 /// live daemons + dialed clients + ports; the caller keeps the daemons alive
 /// (dropping a `Daemon` kills it) and keeps `tmp` alive for the data dirs.
 ///
-/// The joiner's boot is gated on the founder's `Zone '…' registered` log:
-/// readdir/stat on the `/agents` mount point don't distinguish a live
-/// federation mount from a root-served empty path, so probing them lets the
-/// joiner's DiscoverZones race — and lose to — the founder's registration,
-/// leaving it rootless (it does not retry) so nothing replicates. The log line
-/// is the reliable signal.
+/// The joiner's boot-time DiscoverZones reads the founder's DT_MOUNT entries
+/// from the ROOT state machine, so it must not spawn until those entries have
+/// committed there. The founder's `Zone '…' registered` log fires earlier — at
+/// zone-node registration, before the mount's raft apply into root — so gating
+/// the joiner on it alone races the root apply: the joiner's one-shot
+/// DiscoverZones reads 0 entries and stays rootless (it does not retry) and
+/// nothing replicates. The reliable discoverable signal is the founder's
+/// `Static topology applied` log, which fires once every mount has committed.
 async fn boot_federation(tmp: &std::path::Path) -> (Daemon, Daemon, Vfs, Vfs, u16, u16) {
     let fport = free_port();
     let jport = free_port();
@@ -167,6 +169,17 @@ async fn boot_federation(tmp: &std::path::Path) -> (Daemon, Daemon, Vfs, Vfs, u1
         .wait_for_log(&zone_registered, BUDGET)
         .await
         .expect("founder must register sharedzone");
+    // A federation mount is discoverable (visible to a joiner's DiscoverZones)
+    // only once its DT_MOUNT entry commits into the ROOT state machine — a raft
+    // apply that lags the zone-registry "registered" log above. Gating the
+    // joiner on that log alone races the root apply: the joiner boots one-shot
+    // rootless, its DiscoverZones reads 0 DT_MOUNT entries, and it never
+    // retries. Wait for the topology-applied signal, which fires once every
+    // mount has committed into root.
+    founder
+        .wait_for_log("Static topology applied", BUDGET)
+        .await
+        .expect("founder must apply federation topology (zone discoverable)");
     let fc = Vfs::dial(fport).await.expect("dial founder");
 
     let mut joiner = Daemon::spawn(
