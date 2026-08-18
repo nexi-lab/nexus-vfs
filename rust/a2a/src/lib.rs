@@ -35,6 +35,7 @@ pub mod mailbox_stamping_policy;
 
 pub use foreign_containment::{install_foreign_agent_containment, ForeignAgentMailboxOnly};
 pub use mailbox_stamping_hook::MailboxStampingHook;
+pub use mailbox_stamping_policy::{MailboxEnvelope, CHAT_WITH_ME_SUFFIX};
 
 use kernel::kernel::Kernel;
 
