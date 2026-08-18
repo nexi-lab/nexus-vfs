@@ -22,11 +22,58 @@
 
 use std::borrow::Cow;
 
+use serde::{Deserialize, Serialize};
+
 /// The mailbox path suffix. SSOT for the `/chat-with-me` convention — the
 /// stamp hook's `mutating_path_suffix()` (which drives the write-content
 /// clone) and these path predicates MUST agree on it, so it is defined once
 /// here and referenced by the hook rather than re-declared.
 pub const CHAT_WITH_ME_SUFFIX: &str = "/chat-with-me";
+
+/// The canonical A2A mailbox message schema — the content format written to
+/// (and read from) any `*/chat-with-me` mailbox. This is the SSOT for the
+/// envelope shape; every consumer (co-hosted sudocode agents, hydra, the
+/// kickoff client) serialises/parses through this one definition rather than
+/// hand-rolling the field names.
+///
+/// **Only `from` is enforced by the substrate.** [`maybe_stamp_chat_envelope`]
+/// overwrites `from` with the authenticated caller's `agent_id` at the kernel
+/// write hook, so a receiver sees who actually wrote the message, not who
+/// claimed to. `to` and `body` are the application convention (documented
+/// here) and are deliberately NOT policed by the kernel — a malformed or
+/// partial payload is forwarded untouched and the receiver decides. Parsing
+/// is therefore lenient (missing fields default to empty), and an empty
+/// `from` is omitted on the wire so a writer may send `{to, body}` and let
+/// the substrate stamp the sender.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct MailboxEnvelope {
+    /// Sender agent id. Authored by the writer but authoritatively stamped by
+    /// the substrate — never trust a peer's self-claimed `from`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub from: String,
+    /// Recipient agent id (the mailbox owner this envelope is addressed to).
+    #[serde(default)]
+    pub to: String,
+    /// The message text.
+    #[serde(default)]
+    pub body: String,
+}
+
+impl MailboxEnvelope {
+    /// Serialise to the mailbox wire bytes (JSON).
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).unwrap_or_default()
+    }
+
+    /// Parse mailbox wire bytes into an envelope. Returns `None` on non-JSON
+    /// content — matching the substrate's "don't police the schema" stance,
+    /// the caller decides how to treat a payload that isn't an envelope.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        serde_json::from_slice(bytes).ok()
+    }
+}
 
 /// The node-local managed-agent mailbox pipe prefix —
 /// `/proc/{pid}/chat-with-me` (a DT_PIPE, intra-node, NOT replicated). It
@@ -118,6 +165,56 @@ mod tests {
 
     fn parse(bytes: &[u8]) -> serde_json::Value {
         serde_json::from_slice(bytes).expect("rewritten content must be valid JSON")
+    }
+
+    #[test]
+    fn mailbox_envelope_round_trips_and_omits_empty_from() {
+        // A writer sends {to, body} and lets the substrate stamp `from`:
+        // empty `from` is omitted on the wire.
+        let out = MailboxEnvelope {
+            from: String::new(),
+            to: "agent-b".into(),
+            body: "hi".into(),
+        };
+        assert_eq!(
+            parse(&out.to_bytes()),
+            serde_json::json!({"to":"agent-b","body":"hi"})
+        );
+
+        // Round-trip with a stamped `from`.
+        let stamped = MailboxEnvelope {
+            from: "agent-a".into(),
+            to: "agent-b".into(),
+            body: "hi".into(),
+        };
+        assert_eq!(
+            MailboxEnvelope::from_bytes(&stamped.to_bytes()),
+            Some(stamped)
+        );
+    }
+
+    #[test]
+    fn mailbox_envelope_parses_leniently_and_rejects_non_json() {
+        // Missing fields default to empty (don't police the schema).
+        assert_eq!(
+            MailboxEnvelope::from_bytes(br#"{"to":"agent-b"}"#),
+            Some(MailboxEnvelope {
+                from: String::new(),
+                to: "agent-b".into(),
+                body: String::new()
+            })
+        );
+        // Extra fields the substrate forwarded are ignored by the typed view.
+        assert_eq!(
+            MailboxEnvelope::from_bytes(br#"{"from":"a","to":"b","body":"x","error":true}"#),
+            Some(MailboxEnvelope {
+                from: "a".into(),
+                to: "b".into(),
+                body: "x".into()
+            })
+        );
+        // Non-JSON is `None` — the caller decides.
+        assert_eq!(MailboxEnvelope::from_bytes(b"not json"), None);
     }
 
     #[test]

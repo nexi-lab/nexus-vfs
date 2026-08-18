@@ -18,4 +18,5 @@ path = "src/lib.rs"
 # root, not here (see docs/KERNEL-ARCHITECTURE.html §6.1 + lib.rs docs).
 kernel = { workspace = true }
 contracts = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
