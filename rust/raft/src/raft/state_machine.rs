@@ -4398,6 +4398,73 @@ mod tests {
         );
     }
 
+    /// The bounded post-seal SM state — the hot tail + the segment index + the
+    /// floor — rides the SM snapshot, and the sealed rows do NOT. This is the P1
+    /// boundedness claim at the snapshot boundary: a joiner that installs the
+    /// snapshot gets the small index, not every historical entry.
+    #[test]
+    fn sealed_segments_survive_snapshot_restore() {
+        let prefix = "/__wal_stream__/snap/";
+        let src = RedbStore::open_temporary().unwrap();
+        let mut sm = FullStateMachine::new(&src).unwrap();
+        for i in 0..6u64 {
+            sm.apply(
+                i + 1,
+                &Command::AppendStreamEntry {
+                    stream_prefix: prefix.into(),
+                    data: format!("m{i}").into_bytes(),
+                },
+            )
+            .unwrap();
+        }
+        sm.apply(
+            7,
+            &Command::SealStreamSegment {
+                stream_prefix: prefix.into(),
+                base: 0,
+                end: 4,
+                content_id: "snap-seg".into(),
+                origin: "node-x".into(),
+                size: 42,
+            },
+        )
+        .unwrap();
+        let snap = sm.snapshot().unwrap();
+
+        // Restore into a FRESH state machine — the joiner's install path.
+        let dst = RedbStore::open_temporary().unwrap();
+        let mut restored = FullStateMachine::new(&dst).unwrap();
+        restored.restore_snapshot(&snap).unwrap();
+
+        // Bounded state survived: floor, tail, the segment index, and the hot
+        // rows — but NOT the sealed rows.
+        assert_eq!(restored.stream_floor(prefix).unwrap(), 4);
+        assert_eq!(restored.stream_tail(prefix).unwrap(), 6);
+        let (base, seg) = restored
+            .find_segment(prefix, 0)
+            .unwrap()
+            .expect("segment rides snapshot");
+        assert_eq!(base, 0);
+        assert_eq!(seg.end, 4);
+        assert_eq!(seg.content_id, "snap-seg");
+        assert_eq!(seg.origin, "node-x");
+        for seq in 0..4u64 {
+            assert_eq!(
+                restored
+                    .get_stream_entry(&format!("{prefix}{seq}"))
+                    .unwrap(),
+                None,
+                "sealed row {seq} must NOT be in the snapshot"
+            );
+        }
+        for seq in 4..6u64 {
+            assert!(restored
+                .get_stream_entry(&format!("{prefix}{seq}"))
+                .unwrap()
+                .is_some());
+        }
+    }
+
     /// Build a `PutControlState` for the `auth` namespace (an upsert), the shape
     /// the auth store emits. Keeps the auth tests reading through the
     /// `get_auth_key`/`list_auth_keys` (namespace `auth`) wrappers.
