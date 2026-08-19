@@ -48,6 +48,7 @@
 //! in [[reference_kernel_architecture_lint]].
 
 mod blob_fetcher_slot;
+mod cold_segment;
 mod coordinator_wiring;
 pub mod grpc_ops;
 
