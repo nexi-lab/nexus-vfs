@@ -638,6 +638,15 @@ pub struct Kernel {
     /// no cache returns a clean miss rather than panicking.
     pub(crate) federation_cache:
         std::sync::OnceLock<Arc<dyn crate::abc::object_store::ObjectStore>>,
+    /// Cold-tier segment store for WAL DT_STREAMs — a `Weak<Kernel>`-backed
+    /// `ColdSegmentStore` armed at federation boot (alongside the stream
+    /// materializer) so `wal_backend_for` composes tiered-storage streams.
+    /// `None` until armed ⇒ streams are hot-only (unbounded-in-raft), so a
+    /// non-federated kernel behaves exactly as before. Accessors +
+    /// `write_cold_segment` / `read_cold_segment` live in
+    /// `federation/cold_segment.rs` (federation-domain file, like the cache).
+    pub(crate) cold_segment_store:
+        std::sync::OnceLock<Arc<dyn crate::core::stream::wal::ColdSegmentStore>>,
     // No `chunk_fetcher` field: `Kernel::peer_client` is the SSOT for
     // the cross-node blob client.  `Kernel::sys_setattr` constructs a
     // fresh `GrpcChunkFetcher` per `DT_MOUNT` against the just-cloned
@@ -776,6 +785,7 @@ impl Kernel {
             ),
             procfs: crate::core::procfs::ProcfsRegistry::new(),
             federation_cache: std::sync::OnceLock::new(),
+            cold_segment_store: std::sync::OnceLock::new(),
             pending_blob_fetcher_slot: parking_lot::Mutex::new(None),
             // Kernel default: no permission provider installed ⇒
             // `check_permission` short-circuits to `Ok(())` in ~2ns
@@ -1999,7 +2009,7 @@ impl Kernel {
     /// (inode in root while the backend targeted the mount zone) is exactly
     /// what silently made A2A mailboxes node-local and un-replicated.
     #[inline]
-    fn routed_zone_id(&self, path: &str) -> String {
+    pub(crate) fn routed_zone_id(&self, path: &str) -> String {
         self.vfs_router
             .route(path, contracts::ROOT_ZONE_ID)
             .map(|r| r.zone_id)
@@ -2012,10 +2022,19 @@ impl Kernel {
             .distributed_coordinator()
             .metastore_for_zone(self, &zone_id)
             .ok()?;
-        Some(Arc::new(crate::core::stream::wal::WalStreamCore::new(
-            store,
-            path.to_string(),
-        )))
+        // Tiered storage when the cold tier is armed (federation boot): appends
+        // past the hot window roll off into cold segments, bounding the raft SM.
+        // Unarmed (non-federated) ⇒ hot-only, the pre-P1 behaviour.
+        let core = match self.cold_segment_store_arc() {
+            Some(cold) => crate::core::stream::wal::WalStreamCore::with_cold_tier(
+                store,
+                path.to_string(),
+                cold,
+                self.seal_policy(),
+            ),
+            None => crate::core::stream::wal::WalStreamCore::new(store, path.to_string()),
+        };
+        Some(Arc::new(core))
     }
 
     /// Arm the StreamManager's miss-materializer so a COLD read/write of a wal
@@ -2037,6 +2056,10 @@ impl Kernel {
     /// delegates to `wal_backend_for`, which proposes nothing. The `Weak` self
     /// reference breaks the cycle (kernel → stream_manager → closure → kernel).
     pub fn arm_stream_materializer(self: &Arc<Self>) {
+        // Same boot moment arms the cold tier, so a materialized wal backend and
+        // its seal+spill are wired together — "coordinator up ⇔ streams
+        // cross-node ⇔ streams bounded".
+        self.arm_stream_cold_tier();
         let weak = Arc::downgrade(self);
         self.stream_manager
             .set_materializer(Box::new(move |path: &str| {
