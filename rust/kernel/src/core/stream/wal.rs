@@ -470,6 +470,13 @@ fn seal_loop(
         let origin = cold.self_origin().unwrap_or_default();
         match store.seal_stream_segment(prefix, base, end, &content_id, &origin, blob.len() as u64) {
             Ok(()) => {
+                tracing::info!(
+                    stream_id,
+                    base,
+                    end,
+                    bytes = blob.len(),
+                    "wal DT_STREAM sealed cold segment"
+                );
                 known_floor.store(end, Ordering::Relaxed);
                 // Loop: seal the next batch if the tail is still past the window.
             }
