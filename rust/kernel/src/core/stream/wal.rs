@@ -165,8 +165,11 @@ fn extract_frame(blob: &[u8], base: u64, seq: u64) -> Result<Vec<u8>, String> {
     let mut offset = payloads_start;
     let mut this_len = 0usize;
     for i in 0..=idx {
-        let l = u32::from_be_bytes(blob[lens_start + i * 4..lens_start + i * 4 + 4].try_into().unwrap())
-            as usize;
+        let l = u32::from_be_bytes(
+            blob[lens_start + i * 4..lens_start + i * 4 + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
         if i == idx {
             this_len = l;
         } else {
@@ -209,9 +212,12 @@ pub struct WalStreamCore {
     known_floor: Arc<AtomicU64>,
     /// Last cold segment fetched, cached so a scan across cold data (e.g.
     /// `collect_all`) fetches+parses each segment once, not once per frame.
-    /// `(base, end, blob)`.
-    seg_cache: Arc<Mutex<Option<(u64, u64, Arc<Vec<u8>>)>>>,
+    seg_cache: Arc<Mutex<Option<CachedSegment>>>,
 }
+
+/// One cached cold segment: `(base, end, blob)`. The `blob` is shared so the
+/// cache and an in-flight extract can hold it without a copy.
+type CachedSegment = (u64, u64, Arc<Vec<u8>>);
 
 impl WalStreamCore {
     /// Hot-only WAL core — no cold tier, so it never seals (the pre-P1
@@ -368,7 +374,14 @@ impl WalStreamCore {
         let in_flight = Arc::clone(&self.seal_in_flight);
         let known_floor = Arc::clone(&self.known_floor);
         std::thread::spawn(move || {
-            seal_loop(&store, cold.as_ref(), &prefix, &stream_id, policy, &known_floor);
+            seal_loop(
+                &store,
+                cold.as_ref(),
+                &prefix,
+                &stream_id,
+                policy,
+                &known_floor,
+            );
             in_flight.store(false, Ordering::Release);
         });
     }
@@ -468,7 +481,8 @@ fn seal_loop(
             }
         };
         let origin = cold.self_origin().unwrap_or_default();
-        match store.seal_stream_segment(prefix, base, end, &content_id, &origin, blob.len() as u64) {
+        match store.seal_stream_segment(prefix, base, end, &content_id, &origin, blob.len() as u64)
+        {
             Ok(()) => {
                 tracing::info!(
                     stream_id,
@@ -655,7 +669,8 @@ mod tests {
         ) -> Result<u64, MetaStoreError> {
             let mut i = self.inner.lock().unwrap();
             let seq = *i.tails.get(stream_prefix).unwrap_or(&0);
-            i.entries.insert(format!("{stream_prefix}{seq}"), data.to_vec());
+            i.entries
+                .insert(format!("{stream_prefix}{seq}"), data.to_vec());
             i.tails.insert(stream_prefix.to_string(), seq + 1);
             Ok(seq)
         }
@@ -663,10 +678,22 @@ mod tests {
             Ok(self.inner.lock().unwrap().entries.get(key).cloned())
         }
         fn stream_tail(&self, stream_prefix: &str) -> Result<u64, MetaStoreError> {
-            Ok(*self.inner.lock().unwrap().tails.get(stream_prefix).unwrap_or(&0))
+            Ok(*self
+                .inner
+                .lock()
+                .unwrap()
+                .tails
+                .get(stream_prefix)
+                .unwrap_or(&0))
         }
         fn stream_floor(&self, stream_prefix: &str) -> Result<u64, MetaStoreError> {
-            Ok(*self.inner.lock().unwrap().floors.get(stream_prefix).unwrap_or(&0))
+            Ok(*self
+                .inner
+                .lock()
+                .unwrap()
+                .floors
+                .get(stream_prefix)
+                .unwrap_or(&0))
         }
         fn seal_stream_segment(
             &self,
@@ -707,8 +734,7 @@ mod tests {
             seq: u64,
         ) -> Result<Option<StreamSegment>, MetaStoreError> {
             let i = self.inner.lock().unwrap();
-            Ok(i
-                .segments
+            Ok(i.segments
                 .iter()
                 .filter(|((p, _), _)| p == stream_prefix)
                 .map(|(_, seg)| seg)
@@ -741,9 +767,17 @@ mod tests {
         fn self_origin(&self) -> Option<String> {
             self.origin.clone()
         }
-        fn write_segment(&self, _stream_id: &str, _base: u64, bytes: &[u8]) -> Result<String, String> {
+        fn write_segment(
+            &self,
+            _stream_id: &str,
+            _base: u64,
+            bytes: &[u8],
+        ) -> Result<String, String> {
             let id = content_id_of(bytes);
-            self.blobs.lock().unwrap().insert(id.clone(), bytes.to_vec());
+            self.blobs
+                .lock()
+                .unwrap()
+                .insert(id.clone(), bytes.to_vec());
             Ok(id)
         }
         fn read_segment(
@@ -956,7 +990,10 @@ mod tests {
             );
         }
         for seq in 6..10u64 {
-            assert!(store.get_stream_entry(&format!("{prefix}{seq}")).unwrap().is_some());
+            assert!(store
+                .get_stream_entry(&format!("{prefix}{seq}"))
+                .unwrap()
+                .is_some());
         }
 
         // The full logical log reads back byte-exact through the core — cold
@@ -988,7 +1025,12 @@ mod tests {
             hot_window: 1,
             seal_batch: 2,
         };
-        let c = WalStreamCore::with_cold_tier(Arc::clone(&store), "corrupt".into(), Arc::clone(&cold), policy);
+        let c = WalStreamCore::with_cold_tier(
+            Arc::clone(&store),
+            "corrupt".into(),
+            Arc::clone(&cold),
+            policy,
+        );
         let prefix = format!("{WAL_STREAM_KEY_PREFIX}corrupt/");
         for i in 0..4u64 {
             c.write_sync(format!("v{i}").as_bytes()).unwrap();
@@ -1037,10 +1079,16 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(floor, 16, "push-triggered seal must drain to the hot window");
+        assert_eq!(
+            floor, 16,
+            "push-triggered seal must drain to the hot window"
+        );
         // Hot rows bounded to the window (seqs 16..20).
         for seq in 0..16u64 {
-            assert_eq!(store.get_stream_entry(&format!("{prefix}{seq}")).unwrap(), None);
+            assert_eq!(
+                store.get_stream_entry(&format!("{prefix}{seq}")).unwrap(),
+                None
+            );
         }
         // The full log is still readable end-to-end.
         for i in 0..20u64 {
@@ -1061,7 +1109,10 @@ mod tests {
         // No seal ever happens: floor stays 0 and every row is still hot.
         assert_eq!(store.stream_floor(&prefix).unwrap(), 0);
         for i in 0..50u64 {
-            assert!(store.get_stream_entry(&format!("{prefix}{i}")).unwrap().is_some());
+            assert!(store
+                .get_stream_entry(&format!("{prefix}{i}"))
+                .unwrap()
+                .is_some());
         }
     }
 }

@@ -56,8 +56,14 @@ impl Kernel {
                 .unwrap_or(default)
         };
         SealPolicy {
-            hot_window: parse("NEXUS_STREAM_HOT_WINDOW", SealPolicy::KEEP_FOREVER.hot_window),
-            seal_batch: parse("NEXUS_STREAM_SEAL_BATCH", SealPolicy::KEEP_FOREVER.seal_batch),
+            hot_window: parse(
+                "NEXUS_STREAM_HOT_WINDOW",
+                SealPolicy::KEEP_FOREVER.hot_window,
+            ),
+            seal_batch: parse(
+                "NEXUS_STREAM_SEAL_BATCH",
+                SealPolicy::KEEP_FOREVER.seal_batch,
+            ),
         }
     }
 
@@ -85,7 +91,9 @@ impl Kernel {
         let backend = self
             .stream_content_backend(stream_path)
             .ok_or_else(|| format!("no content backend for stream {stream_path}"))?;
-        let ctx = OperationContext::new("system", &zone_id, /* is_admin */ true, None, /* is_system */ true);
+        let ctx = OperationContext::new(
+            "system", &zone_id, /* is_admin */ true, None, /* is_system */ true,
+        );
         // A unique per-segment key: ignored by a content-addressed backend
         // (id = hash of the bytes), the storage/fetch path for a path-addressed
         // one. Under the stream so a placeholder-mount route lands it in the
@@ -108,7 +116,9 @@ impl Kernel {
         origin: &str,
     ) -> Result<Vec<u8>, String> {
         let zone_id = self.routed_zone_id(stream_path);
-        let ctx = OperationContext::new("system", &zone_id, /* is_admin */ true, None, /* is_system */ true);
+        let ctx = OperationContext::new(
+            "system", &zone_id, /* is_admin */ true, None, /* is_system */ true,
+        );
 
         // Local content store first (the writer node, or any node that has
         // fetched it before under a shared/replicated backend).
@@ -131,7 +141,9 @@ impl Kernel {
                 return self
                     .peer_client_arc()
                     .fetch(origin, content_id)
-                    .map_err(|e| format!("peer fetch cold segment {content_id} from {origin}: {e}"));
+                    .map_err(|e| {
+                        format!("peer fetch cold segment {content_id} from {origin}: {e}")
+                    });
             }
         }
         Err(format!(

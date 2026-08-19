@@ -71,7 +71,12 @@ fn founder_env<'a>(
     env
 }
 
-fn joiner_env<'a>(data: &'a str, id: &'a str, adv: &'a str, peers: &'a str) -> Vec<(&'a str, &'a str)> {
+fn joiner_env<'a>(
+    data: &'a str,
+    id: &'a str,
+    adv: &'a str,
+    peers: &'a str,
+) -> Vec<(&'a str, &'a str)> {
     let mut env = vec![
         ("NEXUS_DATA_DIR", data),
         ("NEXUS_IDENTITY_DIR", id),
@@ -104,7 +109,10 @@ async fn boot_founder(tmp: &std::path::Path) -> (Daemon, u16) {
             &mounts,
         ),
     );
-    founder.wait_tcp(fport, BUDGET).await.expect("founder serves");
+    founder
+        .wait_tcp(fport, BUDGET)
+        .await
+        .expect("founder serves");
     founder
         .wait_for_log("Static topology applied", BUDGET)
         .await

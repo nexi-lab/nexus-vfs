@@ -1777,7 +1777,9 @@ impl FullStateMachine {
                 let rec = encode_segment_record(*end, *size, origin, content_id);
                 table
                     .insert(seg_key.as_bytes(), rec.as_slice())
-                    .map_err(|e| super::RaftError::Storage(format!("insert stream segment: {e}")))?;
+                    .map_err(|e| {
+                        super::RaftError::Storage(format!("insert stream segment: {e}"))
+                    })?;
 
                 // 2. Delete the sealed hot rows [base, end) — this is what bounds
                 //    the SM state + snapshot content.
@@ -4183,7 +4185,11 @@ mod tests {
             .unwrap();
         }
         assert_eq!(sm.stream_tail(prefix).unwrap(), 6);
-        assert_eq!(sm.stream_floor(prefix).unwrap(), 0, "no floor before any seal");
+        assert_eq!(
+            sm.stream_floor(prefix).unwrap(),
+            0,
+            "no floor before any seal"
+        );
 
         // Seal [0,4) — the first four rows spill to a cold segment.
         let r = sm
@@ -4225,14 +4231,20 @@ mod tests {
 
         // Cold seqs resolve through the segment index; hot/unwritten seqs do not.
         for seq in 0..4u64 {
-            let (base, seg) = sm.find_segment(prefix, seq).unwrap().expect("cold seq resolves");
+            let (base, seg) = sm
+                .find_segment(prefix, seq)
+                .unwrap()
+                .expect("cold seq resolves");
             assert_eq!(base, 0);
             assert_eq!(seg.end, 4);
             assert_eq!(seg.content_id, "blake3-abc");
             assert_eq!(seg.origin, "127.0.0.1:9000");
             assert_eq!(seg.size, 1234);
         }
-        assert!(sm.find_segment(prefix, 4).unwrap().is_none(), "hot seq not in a segment");
+        assert!(
+            sm.find_segment(prefix, 4).unwrap().is_none(),
+            "hot seq not in a segment"
+        );
         assert!(sm.find_segment(prefix, 5).unwrap().is_none());
 
         // Segment index/floor/tail sidecars never leak into file-metadata scans.
@@ -4285,8 +4297,15 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(matches!(dup, CommandResult::Error(_)), "stale seal must be a no-op error");
-        assert_eq!(sm.stream_floor(prefix).unwrap(), 4, "floor unchanged after stale seal");
+        assert!(
+            matches!(dup, CommandResult::Error(_)),
+            "stale seal must be a no-op error"
+        );
+        assert_eq!(
+            sm.stream_floor(prefix).unwrap(),
+            4,
+            "floor unchanged after stale seal"
+        );
 
         // Over-reach (end past tail) → Error no-op.
         let over = sm
@@ -4320,8 +4339,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sm.stream_floor(prefix).unwrap(), 6);
-        assert_eq!(sm.find_segment(prefix, 1).unwrap().unwrap().1.content_id, "seg0");
-        assert_eq!(sm.find_segment(prefix, 5).unwrap().unwrap().1.content_id, "seg1");
+        assert_eq!(
+            sm.find_segment(prefix, 1).unwrap().unwrap().1.content_id,
+            "seg0"
+        );
+        assert_eq!(
+            sm.find_segment(prefix, 5).unwrap().unwrap().1.content_id,
+            "seg1"
+        );
         assert!(sm.find_segment(prefix, 6).unwrap().is_none());
     }
 
@@ -4331,7 +4356,7 @@ mod tests {
     /// rests on — every replica applies the deterministic command and converges.
     #[test]
     fn seal_is_deterministic_across_replicas() {
-        let cmds = vec![
+        let cmds = [
             Command::AppendStreamEntry {
                 stream_prefix: "/__wal_stream__/d/".into(),
                 data: b"a".to_vec(),
@@ -4366,7 +4391,11 @@ mod tests {
                 sm.get_stream_entry("/__wal_stream__/d/2").unwrap(),
             )
         };
-        assert_eq!(build(), build(), "two replicas must converge to identical state");
+        assert_eq!(
+            build(),
+            build(),
+            "two replicas must converge to identical state"
+        );
     }
 
     /// Build a `PutControlState` for the `auth` namespace (an upsert), the shape

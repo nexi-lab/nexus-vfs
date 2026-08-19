@@ -517,8 +517,9 @@ impl MetaStore for ZoneMetaStore {
         let prefix_owned = stream_prefix.to_string();
         let found = bridge_block_on(
             &self.runtime,
-            self.node
-                .with_state_machine(move |sm: &FullStateMachine| sm.find_segment(&prefix_owned, seq)),
+            self.node.with_state_machine(move |sm: &FullStateMachine| {
+                sm.find_segment(&prefix_owned, seq)
+            }),
         )
         .map_err(|e| {
             MetaStoreError::IOError(format!(
