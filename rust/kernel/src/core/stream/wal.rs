@@ -26,8 +26,10 @@
 //! raft log's. A write is durable (raft-committed) once `write_sync` returns;
 //! there is no async buffer that could silently drop it.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use crate::abc::meta_store::MetaStore;
 use crate::stream::{StreamBackend, StreamError};
@@ -53,19 +55,168 @@ pub fn watch_path_from_wal_stream_key(key: &str) -> Option<&str> {
     (!path.is_empty()).then_some(path)
 }
 
+/// Cold-tier blob store for sealed WAL DT_STREAM segments — the content half of
+/// tiered storage, injected by the kernel so `WalStreamCore` never reaches up
+/// into the VFS router / CAS engine / peer client. It only knows "write these
+/// bytes, get back an id" and "read the blob for this id (local content store,
+/// else a whole-blob fetch from the seal node)". The kernel impl composes the
+/// SAME path a DT_REG file's content takes: local `ObjectStore::write_content` /
+/// `read_content`, and a `ReadBlob` peer fetch from `origin` on a local miss.
+pub trait ColdSegmentStore: Send + Sync {
+    /// This node's advertise address — recorded as a sealed segment's fetch
+    /// `origin`. `None` on a node without a published address (single-node).
+    fn self_origin(&self) -> Option<String>;
+
+    /// Write a sealed segment blob for `stream_id` and return the content-store
+    /// id to record in the segment index. `base` disambiguates path-addressed
+    /// backends (content-addressed ones derive the id from the bytes and ignore
+    /// it).
+    fn write_segment(&self, stream_id: &str, base: u64, bytes: &[u8]) -> Result<String, String>;
+
+    /// Read a sealed segment blob by `content_id`: local content store first,
+    /// else a whole-blob peer fetch from `origin` (the node that sealed it).
+    fn read_segment(
+        &self,
+        stream_id: &str,
+        content_id: &str,
+        origin: &str,
+    ) -> Result<Vec<u8>, String>;
+}
+
+/// When to roll the hot tail into a cold segment. Mirrors Kafka's active-segment
+/// sizing: keep the most-recent `hot_window` seqs hot (local, wakeup-driving),
+/// and once the tail runs `seal_batch` past that, seal a `seal_batch`-sized
+/// range off the front.
+#[derive(Clone, Copy, Debug)]
+pub struct SealPolicy {
+    /// Seqs kept hot (never sealed) — the tail-follow + wakeup window.
+    pub hot_window: u64,
+    /// Seqs sealed per roll, once `tail >= floor + hot_window + seal_batch`.
+    pub seal_batch: u64,
+}
+
+impl SealPolicy {
+    /// Production keep-forever default: a 1024-seq hot window, 512-seq rolls.
+    /// Overridable via `NEXUS_STREAM_HOT_WINDOW` / `NEXUS_STREAM_SEAL_BATCH`.
+    pub const KEEP_FOREVER: SealPolicy = SealPolicy {
+        hot_window: 1024,
+        seal_batch: 512,
+    };
+
+    /// Whether sealing is enabled at all (a zero batch = never seal).
+    fn seals(&self) -> bool {
+        self.seal_batch > 0
+    }
+}
+
+/// 4-byte magic prefixing every segment blob, so a corrupt / wrong blob fails
+/// loud on extract instead of returning garbage bytes.
+const SEGMENT_MAGIC: &[u8; 4] = b"NXS1";
+
+/// Serialize frames `[base, base+frames.len())` into one immutable segment blob.
+///
+/// Layout (all big-endian): `[magic 4][base u64][count u32][len u32 × count]
+/// [payloads…]`. The per-frame length table makes `extract_frame` O(1) in
+/// position (`seq - base`) instead of walking length-prefixed frames.
+fn encode_segment(base: u64, frames: &[Vec<u8>]) -> Vec<u8> {
+    let payload_bytes: usize = frames.iter().map(|f| f.len()).sum();
+    let mut out = Vec::with_capacity(4 + 8 + 4 + frames.len() * 4 + payload_bytes);
+    out.extend_from_slice(SEGMENT_MAGIC);
+    out.extend_from_slice(&base.to_be_bytes());
+    out.extend_from_slice(&(frames.len() as u32).to_be_bytes());
+    for f in frames {
+        out.extend_from_slice(&(f.len() as u32).to_be_bytes());
+    }
+    for f in frames {
+        out.extend_from_slice(f);
+    }
+    out
+}
+
+/// Extract the frame at absolute `seq` from a segment blob whose declared base
+/// is `base`. Fails loud on a bad magic, a base mismatch (wrong blob for this
+/// index entry), an out-of-range seq, or a truncated body — a cold read must
+/// never silently return the wrong bytes.
+fn extract_frame(blob: &[u8], base: u64, seq: u64) -> Result<Vec<u8>, String> {
+    if blob.len() < 16 || &blob[0..4] != SEGMENT_MAGIC {
+        return Err("segment blob: bad magic / too short".to_string());
+    }
+    let blob_base = u64::from_be_bytes(blob[4..12].try_into().unwrap());
+    if blob_base != base {
+        return Err(format!(
+            "segment blob base {blob_base} != index base {base} (wrong blob)"
+        ));
+    }
+    let count = u32::from_be_bytes(blob[12..16].try_into().unwrap()) as u64;
+    if seq < base || seq >= base + count {
+        return Err(format!(
+            "seq {seq} out of segment range [{base}, {})",
+            base + count
+        ));
+    }
+    let idx = (seq - base) as usize;
+    let count = count as usize;
+    let lens_start = 16usize;
+    let payloads_start = lens_start + count * 4;
+    if blob.len() < payloads_start {
+        return Err("segment blob: truncated length table".to_string());
+    }
+    // Sum lengths before idx to find this frame's offset; read idx's length.
+    let mut offset = payloads_start;
+    let mut this_len = 0usize;
+    for i in 0..=idx {
+        let l = u32::from_be_bytes(blob[lens_start + i * 4..lens_start + i * 4 + 4].try_into().unwrap())
+            as usize;
+        if i == idx {
+            this_len = l;
+        } else {
+            offset += l;
+        }
+    }
+    let end = offset
+        .checked_add(this_len)
+        .ok_or("segment blob: length overflow")?;
+    if blob.len() < end {
+        return Err("segment blob: truncated payload".to_string());
+    }
+    Ok(blob[offset..end].to_vec())
+}
+
 /// WAL-backed stream core. Every write is proposed through the distributed
 /// `MetaStore`, which assigns the offset and commits it before `write_sync`
-/// returns; `read_at` reads committed entries back by offset. Holds no local
-/// state beyond the `closed` flag — the entries and their offset cursor live
-/// in the store (the raft state machine), which is the single source of truth.
+/// returns; `read_at` reads committed entries back by offset — transparently
+/// from the hot side-table or, for seqs below the seal floor, from a cold
+/// segment. Holds no durable local state beyond the `closed` flag — entries,
+/// their cursor, the floor, and the segment index all live in the store (the
+/// raft state machine), the single source of truth. The cold-tier fields are
+/// pure runtime accelerators (a seal guard + a one-segment read cache).
 pub struct WalStreamCore {
     store: Arc<dyn MetaStore>,
     stream_id: String,
     prefix: String,
     closed: AtomicBool,
+    /// Cold tier. `None` ⇒ hot-only (pre-P1 behaviour, unbounded-in-raft);
+    /// `Some` ⇒ seal+spill enabled. The kernel injects it for wal streams.
+    cold: Option<Arc<dyn ColdSegmentStore>>,
+    /// Roll thresholds (only consulted when `cold` is `Some`).
+    policy: SealPolicy,
+    /// At-most-one-seal-in-flight guard per stream — a push spawns a background
+    /// seal only when this flips false→true, and the seal thread clears it.
+    seal_in_flight: Arc<AtomicBool>,
+    /// Last floor this node observed, so the push-side seal gate is a cheap
+    /// atomic compare — no metastore round-trip per append. Advisory: the
+    /// authoritative floor is re-read inside the seal thread.
+    known_floor: Arc<AtomicU64>,
+    /// Last cold segment fetched, cached so a scan across cold data (e.g.
+    /// `collect_all`) fetches+parses each segment once, not once per frame.
+    /// `(base, end, blob)`.
+    seg_cache: Arc<Mutex<Option<(u64, u64, Arc<Vec<u8>>)>>>,
 }
 
 impl WalStreamCore {
+    /// Hot-only WAL core — no cold tier, so it never seals (the pre-P1
+    /// unbounded-in-raft behaviour). Used by non-federated callers and by every
+    /// existing unit test.
     pub fn new(store: Arc<dyn MetaStore>, stream_id: String) -> Self {
         let prefix = format!("{WAL_STREAM_KEY_PREFIX}{stream_id}/");
         Self {
@@ -73,6 +224,35 @@ impl WalStreamCore {
             stream_id,
             prefix,
             closed: AtomicBool::new(false),
+            cold: None,
+            policy: SealPolicy::KEEP_FOREVER,
+            seal_in_flight: Arc::new(AtomicBool::new(false)),
+            known_floor: Arc::new(AtomicU64::new(0)),
+            seg_cache: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// WAL core with tiered storage: appends past `policy.hot_window +
+    /// seal_batch` roll off the front into cold segments stored via `cold`,
+    /// bounding the raft state machine. The kernel injects this for federated
+    /// wal streams.
+    pub fn with_cold_tier(
+        store: Arc<dyn MetaStore>,
+        stream_id: String,
+        cold: Arc<dyn ColdSegmentStore>,
+        policy: SealPolicy,
+    ) -> Self {
+        let prefix = format!("{WAL_STREAM_KEY_PREFIX}{stream_id}/");
+        Self {
+            store,
+            stream_id,
+            prefix,
+            closed: AtomicBool::new(false),
+            cold: Some(cold),
+            policy,
+            seal_in_flight: Arc::new(AtomicBool::new(false)),
+            known_floor: Arc::new(AtomicU64::new(0)),
+            seg_cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -102,20 +282,95 @@ impl WalStreamCore {
     /// and no more data will arrive at this offset.
     pub fn read_at(&self, seq: u64) -> Result<Option<Vec<u8>>, String> {
         let key = self.key(seq);
-        let bytes_opt = self
+        // Hot path unchanged: try the entry row first (local, O(1), drives
+        // wakeup). A hit returns immediately — no floor/segment lookup.
+        if let Some(bytes) = self
             .store
             .get_stream_entry(&key)
-            .map_err(|e| format!("get_stream_entry({key}): {e:?}"))?;
-        match bytes_opt {
-            Some(bytes) => Ok(Some(bytes)),
-            None => {
-                if self.closed.load(Ordering::Acquire) {
-                    Err(format!("WAL stream {} closed at seq {seq}", self.stream_id))
-                } else {
-                    Ok(None)
+            .map_err(|e| format!("get_stream_entry({key}): {e:?}"))?
+        {
+            return Ok(Some(bytes));
+        }
+        // Hot miss. With a cold tier wired, a seq below the seal floor was
+        // spilled to a segment — resolve it transparently (ABI unchanged).
+        if let Some(cold) = &self.cold {
+            let floor = self
+                .store
+                .stream_floor(&self.prefix)
+                .map_err(|e| format!("stream_floor({}): {e:?}", self.prefix))?;
+            if seq < floor {
+                return self.read_cold(seq, cold.as_ref()).map(Some);
+            }
+        }
+        // Genuinely absent: not yet written (open) or closed for good.
+        if self.closed.load(Ordering::Acquire) {
+            Err(format!("WAL stream {} closed at seq {seq}", self.stream_id))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Resolve a spilled seq from the cold tier: the one-segment cache, else look
+    /// up the segment index, fetch the blob (local content store, else a peer
+    /// fetch from its seal origin), extract the frame, and cache the blob for the
+    /// next consecutive cold read.
+    fn read_cold(&self, seq: u64, cold: &dyn ColdSegmentStore) -> Result<Vec<u8>, String> {
+        {
+            let guard = self.seg_cache.lock();
+            if let Some((base, end, blob)) = guard.as_ref() {
+                if *base <= seq && seq < *end {
+                    return extract_frame(blob.as_slice(), *base, seq);
                 }
             }
         }
+        let seg = self
+            .store
+            .find_stream_segment(&self.prefix, seq)
+            .map_err(|e| format!("find_stream_segment({}, {seq}): {e:?}", self.prefix))?
+            .ok_or_else(|| {
+                format!(
+                    "WAL stream {} seq {seq} is below the floor but no cold segment indexes it",
+                    self.stream_id
+                )
+            })?;
+        let blob = Arc::new(cold.read_segment(&self.stream_id, &seg.content_id, &seg.origin)?);
+        let out = extract_frame(blob.as_slice(), seg.base, seq)?;
+        *self.seg_cache.lock() = Some((seg.base, seg.end, blob));
+        Ok(out)
+    }
+
+    /// Push-side seal gate. A cheap atomic check (`tail` vs. the last-known
+    /// floor + window), then — at most one at a time — spawn a background thread
+    /// to roll the hot tail into cold segments. Off the append hot path: the
+    /// caller does not wait for the seal.
+    fn maybe_trigger_seal(&self, tail: u64) {
+        let Some(cold) = self.cold.as_ref() else {
+            return;
+        };
+        if !self.policy.seals() {
+            return;
+        }
+        let floor = self.known_floor.load(Ordering::Relaxed);
+        let threshold = floor
+            .saturating_add(self.policy.hot_window)
+            .saturating_add(self.policy.seal_batch);
+        if tail < threshold {
+            return;
+        }
+        if self.seal_in_flight.swap(true, Ordering::AcqRel) {
+            return; // a seal is already running for this stream
+        }
+        let store = Arc::clone(&self.store);
+        let cold = Arc::clone(cold);
+        let prefix = self.prefix.clone();
+        let stream_id = self.stream_id.clone();
+        let policy = self.policy;
+        let in_flight = Arc::clone(&self.seal_in_flight);
+        let known_floor = Arc::clone(&self.known_floor);
+        std::thread::spawn(move || {
+            seal_loop(&store, cold.as_ref(), &prefix, &stream_id, policy, &known_floor);
+            in_flight.store(false, Ordering::Release);
+        });
     }
 
     pub fn read_batch(&self, start_seq: u64, count: usize) -> Result<(Vec<Vec<u8>>, u64), String> {
@@ -155,6 +410,83 @@ impl WalStreamCore {
     }
 }
 
+/// Drain the hot tail down to the hot window, one contiguous `seal_batch` at a
+/// time, on a background thread. Each pass reads the AUTHORITATIVE floor + tail
+/// (never a stale local guess), stops once within the window, else serializes
+/// `[base, base+seal_batch)` → writes the blob to the cold store → proposes
+/// `SealStreamSegment`. Stops on the first non-progress — nothing to seal, a
+/// racing peer seal (a read gap or a gate-rejected propose), or a cold-store /
+/// leader error — so it can never spin, and the next append re-triggers it.
+fn seal_loop(
+    store: &Arc<dyn MetaStore>,
+    cold: &dyn ColdSegmentStore,
+    prefix: &str,
+    stream_id: &str,
+    policy: SealPolicy,
+    known_floor: &AtomicU64,
+) {
+    loop {
+        let floor = match store.stream_floor(prefix) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        known_floor.store(floor, Ordering::Relaxed);
+        let tail = match store.stream_tail(prefix) {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        let threshold = floor
+            .saturating_add(policy.hot_window)
+            .saturating_add(policy.seal_batch);
+        if tail < threshold {
+            return; // caught up to within the hot window
+        }
+        let base = floor;
+        let end = base + policy.seal_batch;
+
+        // Collect the frames to seal. A `None`/`Err` means a race (a peer sealed
+        // this range, or the row isn't materialized here) — abort; re-triggered
+        // on the next append.
+        let mut frames = Vec::with_capacity(policy.seal_batch as usize);
+        for seq in base..end {
+            match store.get_stream_entry(&format!("{prefix}{seq}")) {
+                Ok(Some(bytes)) => frames.push(bytes),
+                _ => return,
+            }
+        }
+
+        let blob = encode_segment(base, &frames);
+        let content_id = match cold.write_segment(stream_id, base, &blob) {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!(
+                    stream_id,
+                    error = %e,
+                    "wal DT_STREAM cold segment write failed; retrying on next append"
+                );
+                return;
+            }
+        };
+        let origin = cold.self_origin().unwrap_or_default();
+        match store.seal_stream_segment(prefix, base, end, &content_id, &origin, blob.len() as u64) {
+            Ok(()) => {
+                known_floor.store(end, Ordering::Relaxed);
+                // Loop: seal the next batch if the tail is still past the window.
+            }
+            Err(e) => {
+                // Gate rejection (a peer already sealed) or no reachable leader —
+                // stop; the re-read floor next pass reflects reality.
+                tracing::debug!(
+                    stream_id,
+                    error = ?e,
+                    "wal DT_STREAM seal not applied; ending this pass"
+                );
+                return;
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // StreamBackend impl — `setattr_stream(io_profile="wal")` registers a
 // WalStreamCore alongside MemoryStreamBackend and SharedMemoryStreamBackend.
@@ -170,14 +502,25 @@ impl StreamBackend for WalStreamCore {
         // and any "a sibling replica must see this" contract — needs it. The
         // syscall handler already blocks on this same propose for file writes,
         // so it is no new blocking surface.
-        self.write_sync(data).map(|seq| seq as usize).map_err(|e| {
-            tracing::warn!(
-                stream_id = %self.stream_id,
-                error = %e,
-                "wal DT_STREAM push failed to replicate — write rejected (fail-loud)"
-            );
-            StreamError::Closed("wal DT_STREAM push failed to replicate (no reachable leader?)")
-        })
+        match self.write_sync(data) {
+            Ok(seq) => {
+                // The tail is now `seq + 1`. Consider rolling the hot tail into a
+                // cold segment — off the hot path (this returns immediately; the
+                // seal, if any, runs on a background thread).
+                self.maybe_trigger_seal(seq + 1);
+                Ok(seq as usize)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    stream_id = %self.stream_id,
+                    error = %e,
+                    "wal DT_STREAM push failed to replicate — write rejected (fail-loud)"
+                );
+                Err(StreamError::Closed(
+                    "wal DT_STREAM push failed to replicate (no reachable leader?)",
+                ))
+            }
+        }
     }
 
     fn read_at(&self, offset: usize) -> Result<(Vec<u8>, usize), StreamError> {
@@ -227,9 +570,10 @@ impl StreamBackend for WalStreamCore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::abc::meta_store::{FileMetadata, MetaStoreError};
+    use crate::abc::meta_store::{FileMetadata, MetaStoreError, StreamSegment};
     use std::collections::{BTreeMap, HashSet};
     use std::sync::Mutex;
+    use std::time::Duration;
 
     #[test]
     fn wal_stream_key_round_trips_to_watch_path() {
@@ -261,8 +605,21 @@ mod tests {
         );
     }
 
+    /// Faithful in-memory mirror of the raft SM's stream side-table: a flat
+    /// entry map (key `{prefix}{seq}`) plus per-prefix tail / floor cursors and a
+    /// segment index — so append assigns the offset, seal deletes the sealed
+    /// rows + advances the floor under the same base==floor gate, and cold reads
+    /// resolve through `find_stream_segment`, exactly as `FullStateMachine` does.
+    #[derive(Default)]
+    struct StreamKv {
+        entries: BTreeMap<String, Vec<u8>>,
+        tails: BTreeMap<String, u64>,
+        floors: BTreeMap<String, u64>,
+        segments: BTreeMap<(String, u64), StreamSegment>,
+    }
+
     struct MemKvStore {
-        inner: Mutex<BTreeMap<String, Vec<u8>>>,
+        inner: Mutex<StreamKv>,
     }
 
     impl MetaStore for MemKvStore {
@@ -281,39 +638,125 @@ mod tests {
         fn exists(&self, _path: &str) -> Result<bool, MetaStoreError> {
             Ok(false)
         }
-        // Mirror the real store: the STORE assigns the offset (here, the count
-        // of existing entries under the prefix) under a lock, so concurrent
-        // writers — one core or several over the same store — never collide.
+        // The STORE assigns the offset from the tail cursor under a lock, so
+        // concurrent writers — one core or several over the same store — never
+        // collide.
         fn append_stream_entry(
             &self,
             stream_prefix: &str,
             data: &[u8],
         ) -> Result<u64, MetaStoreError> {
-            let mut inner = self.inner.lock().unwrap();
-            let seq = inner
-                .keys()
-                .filter(|k| k.starts_with(stream_prefix))
-                .count() as u64;
-            inner.insert(format!("{stream_prefix}{seq}"), data.to_vec());
+            let mut i = self.inner.lock().unwrap();
+            let seq = *i.tails.get(stream_prefix).unwrap_or(&0);
+            i.entries.insert(format!("{stream_prefix}{seq}"), data.to_vec());
+            i.tails.insert(stream_prefix.to_string(), seq + 1);
             Ok(seq)
         }
         fn get_stream_entry(&self, key: &str) -> Result<Option<Vec<u8>>, MetaStoreError> {
-            Ok(self.inner.lock().unwrap().get(key).cloned())
+            Ok(self.inner.lock().unwrap().entries.get(key).cloned())
         }
         fn stream_tail(&self, stream_prefix: &str) -> Result<u64, MetaStoreError> {
-            Ok(self
-                .inner
+            Ok(*self.inner.lock().unwrap().tails.get(stream_prefix).unwrap_or(&0))
+        }
+        fn stream_floor(&self, stream_prefix: &str) -> Result<u64, MetaStoreError> {
+            Ok(*self.inner.lock().unwrap().floors.get(stream_prefix).unwrap_or(&0))
+        }
+        fn seal_stream_segment(
+            &self,
+            stream_prefix: &str,
+            base: u64,
+            end: u64,
+            content_id: &str,
+            origin: &str,
+            size: u64,
+        ) -> Result<(), MetaStoreError> {
+            let mut i = self.inner.lock().unwrap();
+            let floor = *i.floors.get(stream_prefix).unwrap_or(&0);
+            let tail = *i.tails.get(stream_prefix).unwrap_or(&0);
+            if base != floor || end <= base || end > tail {
+                return Err(MetaStoreError::IOError(format!(
+                    "stale/invalid seal [{base},{end}) floor={floor} tail={tail}"
+                )));
+            }
+            i.segments.insert(
+                (stream_prefix.to_string(), base),
+                StreamSegment {
+                    base,
+                    end,
+                    content_id: content_id.to_string(),
+                    origin: origin.to_string(),
+                    size,
+                },
+            );
+            for seq in base..end {
+                i.entries.remove(&format!("{stream_prefix}{seq}"));
+            }
+            i.floors.insert(stream_prefix.to_string(), end);
+            Ok(())
+        }
+        fn find_stream_segment(
+            &self,
+            stream_prefix: &str,
+            seq: u64,
+        ) -> Result<Option<StreamSegment>, MetaStoreError> {
+            let i = self.inner.lock().unwrap();
+            Ok(i
+                .segments
+                .iter()
+                .filter(|((p, _), _)| p == stream_prefix)
+                .map(|(_, seg)| seg)
+                .find(|seg| seg.base <= seq && seq < seg.end)
+                .cloned())
+        }
+    }
+
+    /// Content-addressed in-memory cold store: `write_segment` hashes the bytes
+    /// (so identical blobs dedup), `read_segment` returns them; `origin` is fixed
+    /// so tests can assert it round-trips. Local-only (no peer leg needed for
+    /// unit tests — the cross-node fetch is covered by the live e2e).
+    #[derive(Default)]
+    struct MockCold {
+        blobs: Mutex<std::collections::HashMap<String, Vec<u8>>>,
+        origin: Option<String>,
+    }
+
+    fn content_id_of(bytes: &[u8]) -> String {
+        // Small FNV-1a — deterministic + content-derived, enough for test dedup.
+        let mut h: u64 = 0xcbf29ce484222325;
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        format!("seg-{h:016x}")
+    }
+
+    impl ColdSegmentStore for MockCold {
+        fn self_origin(&self) -> Option<String> {
+            self.origin.clone()
+        }
+        fn write_segment(&self, _stream_id: &str, _base: u64, bytes: &[u8]) -> Result<String, String> {
+            let id = content_id_of(bytes);
+            self.blobs.lock().unwrap().insert(id.clone(), bytes.to_vec());
+            Ok(id)
+        }
+        fn read_segment(
+            &self,
+            _stream_id: &str,
+            content_id: &str,
+            _origin: &str,
+        ) -> Result<Vec<u8>, String> {
+            self.blobs
                 .lock()
                 .unwrap()
-                .keys()
-                .filter(|k| k.starts_with(stream_prefix))
-                .count() as u64)
+                .get(content_id)
+                .cloned()
+                .ok_or_else(|| format!("mock cold: no blob {content_id}"))
         }
     }
 
     fn store() -> Arc<dyn MetaStore> {
         Arc::new(MemKvStore {
-            inner: Mutex::new(BTreeMap::new()),
+            inner: Mutex::new(StreamKv::default()),
         })
     }
 
@@ -432,6 +875,186 @@ mod tests {
         assert_eq!(c.tail(), 8);
         for seq in 0..8u64 {
             assert!(c.read_at(seq).unwrap().is_some());
+        }
+    }
+
+    // ── Cold tier (tiered storage) ──────────────────────────────────────
+
+    /// Segment framing round-trips every frame by absolute seq, and fails LOUD
+    /// (never returns wrong bytes) on a bad magic, a base mismatch, or an
+    /// out-of-range seq.
+    #[test]
+    fn segment_encode_extract_roundtrip_and_fails_loud() {
+        let frames = vec![
+            b"a".to_vec(),
+            b"bb".to_vec(),
+            Vec::new(), // empty payload is a valid frame
+            b"cccc".to_vec(),
+        ];
+        let blob = encode_segment(10, &frames);
+        for (i, f) in frames.iter().enumerate() {
+            assert_eq!(extract_frame(&blob, 10, 10 + i as u64).unwrap(), *f);
+        }
+        // Fail-loud: below base, past the range, wrong base, corrupt magic.
+        assert!(extract_frame(&blob, 10, 9).is_err());
+        assert!(extract_frame(&blob, 10, 14).is_err());
+        assert!(extract_frame(&blob, 11, 11).is_err());
+        let mut bad = blob.clone();
+        bad[0] = b'X';
+        assert!(extract_frame(&bad, 10, 10).is_err());
+    }
+
+    /// The whole P1 contract through the WAL core: append past the window, seal
+    /// (deterministically via `seal_loop`), and read the ENTIRE log back
+    /// byte-exact — early seqs transparently from cold segments, recent ones
+    /// hot — while the hot side-table is bounded to the window.
+    #[test]
+    fn seal_spills_and_cold_read_reconstructs_the_full_log() {
+        let store = store();
+        let cold: Arc<dyn ColdSegmentStore> = Arc::new(MockCold {
+            origin: Some("node-a".into()),
+            ..Default::default()
+        });
+        let policy = SealPolicy {
+            hot_window: 3,
+            seal_batch: 3,
+        };
+        let c = WalStreamCore::with_cold_tier(
+            Arc::clone(&store),
+            "coldtest".into(),
+            Arc::clone(&cold),
+            policy,
+        );
+        let prefix = format!("{WAL_STREAM_KEY_PREFIX}coldtest/");
+
+        // 10 durable appends (via write_sync — no background trigger, so the
+        // seal below is deterministic).
+        for i in 0..10u64 {
+            assert_eq!(c.write_sync(format!("m{i}").as_bytes()).unwrap(), i);
+        }
+
+        // Seal synchronously: drains [0,3) then [3,6); [6,10) stays hot
+        // (10 - 6 = 4 < hot_window + seal_batch = 6).
+        let kf = AtomicU64::new(0);
+        seal_loop(&store, cold.as_ref(), &prefix, "coldtest", policy, &kf);
+        assert_eq!(store.stream_floor(&prefix).unwrap(), 6, "floor after seal");
+        assert_eq!(kf.load(Ordering::Relaxed), 6);
+
+        // SM state is bounded: sealed rows are gone, hot rows remain.
+        for seq in 0..6u64 {
+            assert_eq!(
+                store.get_stream_entry(&format!("{prefix}{seq}")).unwrap(),
+                None,
+                "sealed row {seq} must be deleted"
+            );
+        }
+        for seq in 6..10u64 {
+            assert!(store.get_stream_entry(&format!("{prefix}{seq}")).unwrap().is_some());
+        }
+
+        // The full logical log reads back byte-exact through the core — cold
+        // seqs resolve via the segment index + blob, hot seqs from the rows.
+        for i in 0..10u64 {
+            assert_eq!(
+                c.read_at(i).unwrap(),
+                Some(format!("m{i}").into_bytes()),
+                "seq {i} must round-trip (cold or hot)"
+            );
+        }
+        // Global tail (sys_stat.size SSOT) is the full length, not the hot count.
+        assert_eq!(c.tail(), 10);
+        // seq 0 is specifically cold (below floor) and exact.
+        assert_eq!(c.read_at(0).unwrap(), Some(b"m0".to_vec()));
+    }
+
+    /// Integrity: if a cold blob is corrupted, the cold read fails LOUD rather
+    /// than returning garbage — the segment magic/base guard catches it.
+    #[test]
+    fn corrupt_cold_blob_fails_loud() {
+        let store = store();
+        let cold_impl = Arc::new(MockCold {
+            origin: Some("n".into()),
+            ..Default::default()
+        });
+        let cold: Arc<dyn ColdSegmentStore> = cold_impl.clone();
+        let policy = SealPolicy {
+            hot_window: 1,
+            seal_batch: 2,
+        };
+        let c = WalStreamCore::with_cold_tier(Arc::clone(&store), "corrupt".into(), Arc::clone(&cold), policy);
+        let prefix = format!("{WAL_STREAM_KEY_PREFIX}corrupt/");
+        for i in 0..4u64 {
+            c.write_sync(format!("v{i}").as_bytes()).unwrap();
+        }
+        let kf = AtomicU64::new(0);
+        seal_loop(&store, cold.as_ref(), &prefix, "corrupt", policy, &kf);
+        assert!(store.stream_floor(&prefix).unwrap() >= 2);
+        // Corrupt every stored blob.
+        for v in cold_impl.blobs.lock().unwrap().values_mut() {
+            v[0] ^= 0xff;
+        }
+        assert!(c.read_at(0).is_err(), "a corrupt cold blob must fail loud");
+    }
+
+    /// The push path itself triggers the background seal (proving the trigger is
+    /// wired, not just `seal_loop` in isolation): after enough pushes the floor
+    /// advances to the expected steady state and the whole log stays readable.
+    #[test]
+    fn push_triggers_background_seal_and_bounds_hot_rows() {
+        let store = store();
+        let cold: Arc<dyn ColdSegmentStore> = Arc::new(MockCold {
+            origin: Some("n".into()),
+            ..Default::default()
+        });
+        let c = Arc::new(WalStreamCore::with_cold_tier(
+            Arc::clone(&store),
+            "trig".into(),
+            Arc::clone(&cold),
+            SealPolicy {
+                hot_window: 4,
+                seal_batch: 4,
+            },
+        ));
+        let prefix = format!("{WAL_STREAM_KEY_PREFIX}trig/");
+        for i in 0..20u64 {
+            StreamBackend::push(&*c, format!("m{i}").as_bytes()).unwrap();
+        }
+        // Background seal drains until tail - floor < hot_window + seal_batch (8):
+        // 20 → floor converges to 16 (16 sealed, 4 hot). Poll (in-memory mock is
+        // sub-ms; the bound is a generous backstop, never the expected wait).
+        let mut floor = 0;
+        for _ in 0..400 {
+            floor = store.stream_floor(&prefix).unwrap();
+            if floor == 16 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(floor, 16, "push-triggered seal must drain to the hot window");
+        // Hot rows bounded to the window (seqs 16..20).
+        for seq in 0..16u64 {
+            assert_eq!(store.get_stream_entry(&format!("{prefix}{seq}")).unwrap(), None);
+        }
+        // The full log is still readable end-to-end.
+        for i in 0..20u64 {
+            assert_eq!(c.read_at(i).unwrap(), Some(format!("m{i}").into_bytes()));
+        }
+    }
+
+    /// A hot-only core (no cold tier) never seals and never consults the cold
+    /// path — the pre-P1 behaviour is preserved exactly.
+    #[test]
+    fn hot_only_core_never_seals() {
+        let store = store();
+        let c = WalStreamCore::new(Arc::clone(&store), "hotonly".into());
+        let prefix = format!("{WAL_STREAM_KEY_PREFIX}hotonly/");
+        for i in 0..50u64 {
+            StreamBackend::push(&c, format!("m{i}").as_bytes()).unwrap();
+        }
+        // No seal ever happens: floor stays 0 and every row is still hot.
+        assert_eq!(store.stream_floor(&prefix).unwrap(), 0);
+        for i in 0..50u64 {
+            assert!(store.get_stream_entry(&format!("{prefix}{i}")).unwrap().is_some());
         }
     }
 }
