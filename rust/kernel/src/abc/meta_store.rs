@@ -431,6 +431,74 @@ pub trait MetaStore: Send + Sync {
         let _ = stream_prefix;
         Ok(0)
     }
+
+    /// Seal a contiguous ``[base, end)`` seq range of the stream into an
+    /// immutable cold segment (Kafka tiered-storage roll). The segment BYTES
+    /// must already be in the content pillar — `content_id` is the id that store
+    /// returned and `origin` the writer's advertise address (the `ReadBlob`
+    /// fetch hint for replicas that lack it locally). This call records the
+    /// segment index entry, deletes the sealed hot entries, and advances the
+    /// stream's cold-tier floor, atomically at the store's serialization point.
+    ///
+    /// **Optional capability** — SC by design (an ordered log needs one
+    /// sequencer; ``ZoneMetaStore`` → the raft apply). Other impls return `Err`
+    /// and the WAL backend simply never seals (bounded-in-raft, as before).
+    fn seal_stream_segment(
+        &self,
+        stream_prefix: &str,
+        base: u64,
+        end: u64,
+        content_id: &str,
+        origin: &str,
+        size: u64,
+    ) -> Result<(), MetaStoreError> {
+        let _ = (stream_prefix, base, end, content_id, origin, size);
+        Err(MetaStoreError::IOError(
+            "seal_stream_segment: not supported by this metastore (use a distributed impl, e.g. ZoneMetaStore)".to_string(),
+        ))
+    }
+
+    /// The stream's cold-tier floor (`earliest_hot`) — the lowest seq still in
+    /// the hot side-table. ``0`` until the first seal. A reader that misses
+    /// [`Self::get_stream_entry`] and finds ``seq < floor`` knows the seq was
+    /// spilled to a cold segment (vs. not written yet) and resolves it through
+    /// [`Self::find_stream_segment`]. Default ``0`` — a store with no cold tier
+    /// keeps every entry hot.
+    fn stream_floor(&self, stream_prefix: &str) -> Result<u64, MetaStoreError> {
+        let _ = stream_prefix;
+        Ok(0)
+    }
+
+    /// Find the sealed cold segment covering `seq` (``base <= seq < end``), or
+    /// ``None`` if no segment holds it. Backs the WAL backend's transparent
+    /// cold read. Default ``None`` — no cold tier.
+    fn find_stream_segment(
+        &self,
+        stream_prefix: &str,
+        seq: u64,
+    ) -> Result<Option<StreamSegment>, MetaStoreError> {
+        let _ = (stream_prefix, seq);
+        Ok(None)
+    }
+}
+
+/// One cold-segment index record surfaced to the WAL backend: a contiguous
+/// ``[base, end)`` seq range whose bytes live in the content pillar under
+/// `content_id`, written by the node at `origin`. `base` (needed to locate a
+/// frame inside the blob as ``seq - base``) comes from the index key; the rest
+/// from its value. Kernel-tier mirror of the raft SM's on-disk segment record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamSegment {
+    /// First seq in the segment.
+    pub base: u64,
+    /// One past the last seq in the segment.
+    pub end: u64,
+    /// Content-store id of the sealed blob.
+    pub content_id: String,
+    /// Advertise address of the node that wrote the blob (`ReadBlob` origin).
+    pub origin: String,
+    /// Segment blob size in bytes.
+    pub size: u64,
 }
 
 /// Update `content_id` in a PAS `FileMetadata` entry after a rename.

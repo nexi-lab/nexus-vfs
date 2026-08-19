@@ -59,7 +59,9 @@ use crate::transport::proto::nexus::core::FileMetadata as ProtoFileMetadata;
 use contracts::VFS_ROOT;
 use prost::Message;
 
-use kernel::meta_store::{FileMetadata as KernelFileMetadata, MetaStore, MetaStoreError};
+use kernel::meta_store::{
+    FileMetadata as KernelFileMetadata, MetaStore, MetaStoreError, StreamSegment,
+};
 
 /// ``kernel::MetaStore`` impl backed by a single ``ZoneConsensus``.
 ///
@@ -458,6 +460,78 @@ impl MetaStore for ZoneMetaStore {
         bridge_block_on(&self.runtime, fut).map_err(|e| {
             MetaStoreError::IOError(format!("ZoneMetaStore.stream_tail({stream_prefix}): {e}"))
         })
+    }
+
+    fn seal_stream_segment(
+        &self,
+        stream_prefix: &str,
+        base: u64,
+        end: u64,
+        content_id: &str,
+        origin: &str,
+        size: u64,
+    ) -> Result<(), MetaStoreError> {
+        // SC, exactly like `append_stream_entry`: the seal must be totally
+        // ordered wrt appends (the offset sequencer is the raft log), so it goes
+        // through `propose`. The apply's base==floor gate + content-addressing
+        // make racing proposals from different nodes converge.
+        let cmd = Command::SealStreamSegment {
+            stream_prefix: stream_prefix.to_string(),
+            base,
+            end,
+            content_id: content_id.to_string(),
+            origin: origin.to_string(),
+            size,
+        };
+        let result = bridge_block_on(&self.runtime, self.node.propose(cmd)).map_err(|e| {
+            MetaStoreError::IOError(format!(
+                "ZoneMetaStore.seal_stream_segment({stream_prefix}): {e}"
+            ))
+        })?;
+        match result {
+            crate::prelude::CommandResult::Success => Ok(()),
+            crate::prelude::CommandResult::Error(e) => Err(MetaStoreError::IOError(format!(
+                "ZoneMetaStore.seal_stream_segment({stream_prefix}) rejected: {e}"
+            ))),
+            _ => Err(MetaStoreError::IOError(format!(
+                "ZoneMetaStore.seal_stream_segment({stream_prefix}): unexpected apply result"
+            ))),
+        }
+    }
+
+    fn stream_floor(&self, stream_prefix: &str) -> Result<u64, MetaStoreError> {
+        let prefix_owned = stream_prefix.to_string();
+        let fut = self
+            .node
+            .with_state_machine(move |sm: &FullStateMachine| sm.stream_floor(&prefix_owned));
+        bridge_block_on(&self.runtime, fut).map_err(|e| {
+            MetaStoreError::IOError(format!("ZoneMetaStore.stream_floor({stream_prefix}): {e}"))
+        })
+    }
+
+    fn find_stream_segment(
+        &self,
+        stream_prefix: &str,
+        seq: u64,
+    ) -> Result<Option<StreamSegment>, MetaStoreError> {
+        let prefix_owned = stream_prefix.to_string();
+        let found = bridge_block_on(
+            &self.runtime,
+            self.node
+                .with_state_machine(move |sm: &FullStateMachine| sm.find_segment(&prefix_owned, seq)),
+        )
+        .map_err(|e| {
+            MetaStoreError::IOError(format!(
+                "ZoneMetaStore.find_stream_segment({stream_prefix}): {e}"
+            ))
+        })?;
+        Ok(found.map(|(base, rec)| StreamSegment {
+            base,
+            end: rec.end,
+            content_id: rec.content_id,
+            origin: rec.origin,
+            size: rec.size,
+        }))
     }
 }
 

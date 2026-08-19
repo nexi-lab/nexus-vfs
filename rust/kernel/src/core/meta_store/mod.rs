@@ -21,8 +21,8 @@ pub mod remote;
 // alias, not a parallel declaration.
 pub use crate::abc::meta_store::{
     pas_update_content_id, FileMetadata, MetaStore, MetaStoreError, PaginatedList, PathEtag,
-    PathValueStr, PutIfVersionResult, DT_DIR, DT_EXTERNAL_STORAGE, DT_LINK, DT_MOUNT, DT_PIPE,
-    DT_REG, DT_STREAM,
+    PathValueStr, PutIfVersionResult, StreamSegment, DT_DIR, DT_EXTERNAL_STORAGE, DT_LINK,
+    DT_MOUNT, DT_PIPE, DT_REG, DT_STREAM,
 };
 
 use dashmap::DashMap;
