@@ -23,17 +23,19 @@ jobs:
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
-            max_size_bytes: 16777216  # 16.0 MiB — raised from 15.5 for the
-                                      # cross-org mTLS trust plane (PR #209).
-                                      # Measured 16,515,480 bytes on this platform.
+            max_size_bytes: 17039360  # 16.25 MiB — raised from 16.0 for the
+                                      # DT_STREAM tiered-storage cold tier
+                                      # (#229, PR #230). Measured 16,809,344 bytes
+                                      # on this platform.
           - os: macos-14
             artifact_name: nexusd-cluster-macos-arm64
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
-            max_size_bytes: 13631488  # 13.0 MiB — raised from 12.75 for the
-                                      # cross-org mTLS trust plane (PR #209).
-                                      # Measured 13,404,432 bytes on this platform.
+            max_size_bytes: 13893632  # 13.25 MiB — raised from 13.0 for the
+                                      # DT_STREAM tiered-storage cold tier
+                                      # (#229, PR #230). Measured 13,654,992 bytes
+                                      # on this platform.
           - os: macos-14
             artifact_name: nexusd-cluster-macos-x86_64
             package: nexus-cluster
@@ -49,9 +51,10 @@ jobs:
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster.exe
-            max_size_bytes: 15466496  # 14.75 MiB — raised from 14.25 for the
-                                      # cross-org mTLS trust plane (PR #209).
-                                      # Measured 15,201,792 bytes on this platform.
+            max_size_bytes: 15728640  # 15.0 MiB — raised from 14.75 for the
+                                      # DT_STREAM tiered-storage cold tier
+                                      # (#229, PR #230). Measured 15,524,864 bytes
+                                      # on this platform.
 
 
     steps:
