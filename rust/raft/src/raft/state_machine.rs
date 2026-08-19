@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
-use redb::ReadableTable;
+use redb::{ReadableDatabase, ReadableTable};
 use serde::{Deserialize, Serialize};
 
 use crate::storage::{RedbStore, RedbTree};
@@ -190,6 +190,47 @@ pub enum Command {
         namespace: String,
         /// Lookup key within the namespace.
         key: String,
+    },
+
+    /// Seal a contiguous `[base, end)` seq range of a WAL DT_STREAM into an
+    /// immutable cold segment (Kafka tiered-storage roll → upload → delete).
+    ///
+    /// Kept AFTER `DeleteControlState` for the same bincode-index reason those
+    /// variants document: a new variant is appended, never inserted mid-enum,
+    /// so every existing variant keeps its encoded index.
+    ///
+    /// The segment BYTES were already written to the content pillar (CAS /
+    /// federation cache) by the proposer BEFORE this command — `content_id` is
+    /// the id that store returned and `origin` is the proposer's advertise
+    /// address, so a cold read on any node resolves the blob (local content
+    /// store, else a `ReadBlob` peer fetch from `origin`) exactly the way a
+    /// DT_REG file's federated content read does. This command is the METADATA
+    /// half: it is deterministic and redb-only (no CAS I/O at apply), so every
+    /// replica converges. Applied via `execute_metadata_in_txn` so the index
+    /// mutation and `last_applied` land in one txn.
+    ///
+    /// Apply gates on `base == floor` (seal contiguously from the front) so a
+    /// duplicate or racing proposal for an already-sealed range is a no-op
+    /// error, and content-addressing dedups the blob — the pair makes concurrent
+    /// proposers on different nodes converge without gap, dup, or offset skew.
+    SealStreamSegment {
+        /// Stream key PREFIX (`/__wal_stream__/<id>/`), same identity the
+        /// matching `AppendStreamEntry` uses.
+        stream_prefix: String,
+        /// First seq in the sealed range (must equal the stream's current
+        /// cold-tier floor at apply, else the seal is rejected as stale).
+        base: u64,
+        /// One past the last sealed seq. Rows `[base, end)` are deleted from
+        /// the hot tree and the floor advances to `end`.
+        end: u64,
+        /// Content-store id of the sealed segment blob (BLAKE3 for a CAS
+        /// backend; the storage path for the path-addressed federation cache).
+        content_id: String,
+        /// Advertise address of the node that wrote the segment blob — the
+        /// `ReadBlob` fetch origin for replicas that lack it locally.
+        origin: String,
+        /// Segment blob size in bytes (observability + future trim accounting).
+        size: u64,
     },
 }
 
@@ -598,6 +639,85 @@ const TREE_STREAM_ENTRIES: &str = "sm_stream_entries";
 /// many entries has this stream ever had".
 fn stream_tail_key(stream_prefix: &str) -> String {
     format!("__stream_tail__{stream_prefix}")
+}
+
+/// Reserved key holding a stream's cold-tier FLOOR — the lowest seq still in the
+/// hot tree (`earliest_hot`). `0` (absent) until the first seal. A cold read
+/// (`get_stream_entry` miss with `seq < floor`) resolves through the segment
+/// index; `SealStreamSegment` apply is the sole writer. Lives in the SAME tree
+/// as the entries so it is atomic with them and rides the snapshot, exactly like
+/// [`stream_tail_key`]. Its `__stream_floor__` namespace never overlaps an entry
+/// key (`{stream_prefix}{seq}`) nor a segment key, so prefix scans skip it.
+fn stream_floor_key(stream_prefix: &str) -> String {
+    format!("__stream_floor__{stream_prefix}")
+}
+
+/// Key prefix under which a stream's cold-segment index records live, one per
+/// sealed range. Full key = `{prefix}{base:020}` (zero-padded so lexicographic
+/// order == numeric base order, enabling the `find_segment` reverse-range
+/// lookup). Distinct `__stream_seg__` namespace, so — like the tail/floor
+/// sidecars — it never collides with an entry key and rides the snapshot with
+/// the rest of the tree.
+fn stream_segment_key_prefix(stream_prefix: &str) -> String {
+    format!("__stream_seg__{stream_prefix}")
+}
+
+/// Full segment-index key for the segment based at `base`.
+fn stream_segment_key(stream_prefix: &str, base: u64) -> String {
+    format!("{}{base:020}", stream_segment_key_prefix(stream_prefix))
+}
+
+/// One decoded cold-segment index record (the `SealStreamSegment` payload minus
+/// `base`, which the key carries). SSOT for the on-disk record layout, paired
+/// with [`encode_segment_record`] / [`decode_segment_record`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentRecord {
+    /// One past the last seq in the segment.
+    pub end: u64,
+    /// Segment blob size in bytes.
+    pub size: u64,
+    /// Advertise address of the node that wrote the blob (`ReadBlob` origin).
+    pub origin: String,
+    /// Content-store id of the sealed blob.
+    pub content_id: String,
+}
+
+/// Serialize a segment-index record to opaque redb bytes. Explicit fixed-layout
+/// framing (not serde) so the format is stable across builds — these bytes ride
+/// SM snapshots to every joining node. Layout (all big-endian):
+/// `[end u64][size u64][origin_len u32][origin bytes][content_id bytes…]`.
+fn encode_segment_record(end: u64, size: u64, origin: &str, content_id: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(20 + origin.len() + content_id.len());
+    out.extend_from_slice(&end.to_be_bytes());
+    out.extend_from_slice(&size.to_be_bytes());
+    out.extend_from_slice(&(origin.len() as u32).to_be_bytes());
+    out.extend_from_slice(origin.as_bytes());
+    out.extend_from_slice(content_id.as_bytes());
+    out
+}
+
+/// Inverse of [`encode_segment_record`]. Returns `None` on a truncated / corrupt
+/// record (treated as "no segment" by the caller — fail closed, never panic in
+/// a state-machine read).
+fn decode_segment_record(bytes: &[u8]) -> Option<SegmentRecord> {
+    if bytes.len() < 20 {
+        return None;
+    }
+    let end = u64::from_be_bytes(bytes[0..8].try_into().ok()?);
+    let size = u64::from_be_bytes(bytes[8..16].try_into().ok()?);
+    let origin_len = u32::from_be_bytes(bytes[16..20].try_into().ok()?) as usize;
+    let origin_end = 20usize.checked_add(origin_len)?;
+    if bytes.len() < origin_end {
+        return None;
+    }
+    let origin = String::from_utf8(bytes[20..origin_end].to_vec()).ok()?;
+    let content_id = String::from_utf8(bytes[origin_end..].to_vec()).ok()?;
+    Some(SegmentRecord {
+        end,
+        size,
+        origin,
+        content_id,
+    })
 }
 /// Dedicated redb tree for the cluster-control store (auth records, cross-org
 /// anchors, …).
@@ -1261,6 +1381,80 @@ impl FullStateMachine {
             .unwrap_or(0))
     }
 
+    /// Current cold-tier floor (`earliest_hot`) for a stream — the lowest seq
+    /// still in the hot tree. `0` until the first seal. A reader that misses a
+    /// `get_stream_entry` and finds `seq < floor` knows the seq was spilled to a
+    /// cold segment (vs. simply not written yet), and resolves it via
+    /// [`Self::find_segment`].
+    pub fn stream_floor(&self, stream_prefix: &str) -> Result<u64> {
+        let key = stream_floor_key(stream_prefix);
+        Ok(self
+            .stream_entries
+            .get(key.as_bytes())?
+            .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
+            .map(u64::from_be_bytes)
+            .unwrap_or(0))
+    }
+
+    /// Find the sealed cold segment covering `seq` (`base <= seq < end`),
+    /// returning `(base, record)`, or `None` if no segment holds it. Segments
+    /// are contiguous and non-overlapping, so at most one matches. `base` (the
+    /// key, not the value) is returned so a reader can compute the frame's
+    /// position within the segment blob (`seq - base`).
+    ///
+    /// Uses a bounded reverse-range scan over this stream's `__stream_seg__`
+    /// records (keys are zero-padded so lexicographic order == base order): the
+    /// greatest `base <= seq`, then a `seq < end` check. O(log n) in the segment
+    /// count — never a full-tree walk — so cold reads stay cheap.
+    pub fn find_segment(
+        &self,
+        stream_prefix: &str,
+        seq: u64,
+    ) -> Result<Option<(u64, SegmentRecord)>> {
+        let seg_prefix = stream_segment_key_prefix(stream_prefix);
+        // Upper bound: the key a segment based exactly at `seq` would have. The
+        // greatest key <= this whose base <= seq is the candidate.
+        let upper = stream_segment_key(stream_prefix, seq);
+
+        let db = self.stream_entries.raw_db();
+        let read_txn = db
+            .begin_read()
+            .map_err(|e| super::RaftError::Storage(format!("find_segment begin_read: {e}")))?;
+        let table_def = redb::TableDefinition::<&[u8], &[u8]>::new(self.stream_entries.name());
+        let table = match read_txn.open_table(table_def) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => {
+                return Err(super::RaftError::Storage(format!(
+                    "find_segment open_table: {e}"
+                )))
+            }
+        };
+        // Inclusive range over THIS stream's segment keyspace, upper-bounded by
+        // the `seq`-based key; `next_back()` = greatest base <= seq.
+        let mut range = table
+            .range(seg_prefix.as_bytes()..=upper.as_bytes())
+            .map_err(|e| super::RaftError::Storage(format!("find_segment range: {e}")))?;
+        match range.next_back() {
+            Some(entry) => {
+                let (k, v) = entry
+                    .map_err(|e| super::RaftError::Storage(format!("find_segment iter: {e}")))?;
+                // Recover base from the key suffix ({seg_prefix}{base:020}).
+                let base = std::str::from_utf8(k.value())
+                    .ok()
+                    .and_then(|ks| ks.strip_prefix(seg_prefix.as_str()))
+                    .and_then(|b| b.parse::<u64>().ok());
+                match (base, decode_segment_record(v.value())) {
+                    (Some(base), Some(rec)) if base <= seq && seq < rec.end => {
+                        Ok(Some((base, rec)))
+                    }
+                    _ => Ok(None),
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Look up a cluster-control value by ``(namespace, key)``.
     ///
     /// Returns the opaque bytes stored by ``Command::PutControlState``
@@ -1382,6 +1576,11 @@ impl FullStateMachine {
             Command::AppendStreamEntry { .. } => Err(super::RaftError::InvalidState(
                 "AppendStreamEntry must apply via execute_metadata_in_txn (the offset is \
                  assigned atomically at raft apply); the non-txn path must never receive it"
+                    .into(),
+            )),
+            Command::SealStreamSegment { .. } => Err(super::RaftError::InvalidState(
+                "SealStreamSegment must apply via execute_metadata_in_txn (index write + hot-row \
+                 delete + floor advance are one atomic txn); the non-txn path must never receive it"
                     .into(),
             )),
             Command::PutControlState {
@@ -1525,6 +1724,76 @@ impl FullStateMachine {
                     .insert(tail_key.as_bytes(), (seq + 1).to_be_bytes().as_slice())
                     .map_err(|e| super::RaftError::Storage(format!("bump stream tail: {e}")))?;
                 Ok(CommandResult::Value(seq.to_be_bytes().to_vec()))
+            }
+
+            Command::SealStreamSegment {
+                stream_prefix,
+                base,
+                end,
+                content_id,
+                origin,
+                size,
+            } => {
+                // Deterministic, redb-only tiered-storage roll: write the cold
+                // segment index record, delete the sealed hot rows, advance the
+                // floor — all in this one apply txn, in committed order, so every
+                // replica converges. The blob itself is NOT touched here (it was
+                // written to the content pillar before this command); apply must
+                // stay a pure, non-blocking redb mutation.
+                let stream_def =
+                    redb::TableDefinition::<&[u8], &[u8]>::new(self.stream_entries.name());
+                let mut table = txn
+                    .open_table(stream_def)
+                    .map_err(|e| super::RaftError::Storage(format!("open stream_entries: {e}")))?;
+
+                // Gate: seal contiguously from the current floor, within the
+                // written range. A stale/racing proposal (base != floor) or an
+                // over-reach (end > tail) is refused as a no-op error — the log
+                // entry is consumed but nothing is mutated, and propose() surfaces
+                // the error so the proposer retries next cycle with a fresh floor.
+                let floor_key = stream_floor_key(stream_prefix);
+                let floor = table
+                    .get(floor_key.as_bytes())
+                    .map_err(|e| super::RaftError::Storage(format!("get stream floor: {e}")))?
+                    .and_then(|v| <[u8; 8]>::try_from(v.value()).ok())
+                    .map(u64::from_be_bytes)
+                    .unwrap_or(0);
+                let tail_key = stream_tail_key(stream_prefix);
+                let tail = table
+                    .get(tail_key.as_bytes())
+                    .map_err(|e| super::RaftError::Storage(format!("get stream tail: {e}")))?
+                    .and_then(|v| <[u8; 8]>::try_from(v.value()).ok())
+                    .map(u64::from_be_bytes)
+                    .unwrap_or(0);
+                if *base != floor || *end <= *base || *end > tail {
+                    return Ok(CommandResult::Error(format!(
+                        "stale/invalid seal {stream_prefix} [{base},{end}) \
+                         (floor={floor}, tail={tail})"
+                    )));
+                }
+
+                // 1. Segment index record.
+                let seg_key = stream_segment_key(stream_prefix, *base);
+                let rec = encode_segment_record(*end, *size, origin, content_id);
+                table
+                    .insert(seg_key.as_bytes(), rec.as_slice())
+                    .map_err(|e| super::RaftError::Storage(format!("insert stream segment: {e}")))?;
+
+                // 2. Delete the sealed hot rows [base, end) — this is what bounds
+                //    the SM state + snapshot content.
+                for seq in *base..*end {
+                    let entry_key = format!("{stream_prefix}{seq}");
+                    table.remove(entry_key.as_bytes()).map_err(|e| {
+                        super::RaftError::Storage(format!("remove sealed stream_entry: {e}"))
+                    })?;
+                }
+
+                // 3. Advance the floor.
+                table
+                    .insert(floor_key.as_bytes(), end.to_be_bytes().as_slice())
+                    .map_err(|e| super::RaftError::Storage(format!("advance stream floor: {e}")))?;
+
+                Ok(CommandResult::Success)
             }
 
             Command::PutControlState {
@@ -3890,6 +4159,214 @@ mod tests {
             Some(b"from-a-again".to_vec())
         );
         assert_eq!(sm.stream_tail(prefix).unwrap(), 3);
+    }
+
+    /// Seal a range: the index record is written, the hot rows are deleted
+    /// (bounding SM state), the floor advances, the global tail is unchanged, and
+    /// cold reads resolve through `find_segment` while hot reads still hit the
+    /// entry rows. This is the whole P1 tiered-storage contract in one apply.
+    #[test]
+    fn seal_spills_hot_rows_to_the_segment_index() {
+        let store = RedbStore::open_temporary().unwrap();
+        let mut sm = FullStateMachine::new(&store).unwrap();
+        let prefix = "/__wal_stream__/seal/";
+
+        // Six entries, seq 0..6.
+        for i in 0..6u64 {
+            sm.apply(
+                i + 1,
+                &Command::AppendStreamEntry {
+                    stream_prefix: prefix.into(),
+                    data: format!("m{i}").into_bytes(),
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(sm.stream_tail(prefix).unwrap(), 6);
+        assert_eq!(sm.stream_floor(prefix).unwrap(), 0, "no floor before any seal");
+
+        // Seal [0,4) — the first four rows spill to a cold segment.
+        let r = sm
+            .apply(
+                7,
+                &Command::SealStreamSegment {
+                    stream_prefix: prefix.into(),
+                    base: 0,
+                    end: 4,
+                    content_id: "blake3-abc".into(),
+                    origin: "127.0.0.1:9000".into(),
+                    size: 1234,
+                },
+            )
+            .unwrap();
+        assert!(matches!(r, CommandResult::Success));
+
+        // Hot rows [0,4) are gone; [4,6) remain — SM state is bounded to the hot
+        // window.
+        for seq in 0..4u64 {
+            assert_eq!(
+                sm.get_stream_entry(&format!("{prefix}{seq}")).unwrap(),
+                None,
+                "sealed row {seq} must be deleted from the hot tree"
+            );
+        }
+        assert_eq!(
+            sm.get_stream_entry(&format!("{prefix}4")).unwrap(),
+            Some(b"m4".to_vec())
+        );
+        assert_eq!(
+            sm.get_stream_entry(&format!("{prefix}5")).unwrap(),
+            Some(b"m5".to_vec())
+        );
+
+        // Floor advanced; global tail (sys_stat.size SSOT) unchanged.
+        assert_eq!(sm.stream_floor(prefix).unwrap(), 4);
+        assert_eq!(sm.stream_tail(prefix).unwrap(), 6);
+
+        // Cold seqs resolve through the segment index; hot/unwritten seqs do not.
+        for seq in 0..4u64 {
+            let (base, seg) = sm.find_segment(prefix, seq).unwrap().expect("cold seq resolves");
+            assert_eq!(base, 0);
+            assert_eq!(seg.end, 4);
+            assert_eq!(seg.content_id, "blake3-abc");
+            assert_eq!(seg.origin, "127.0.0.1:9000");
+            assert_eq!(seg.size, 1234);
+        }
+        assert!(sm.find_segment(prefix, 4).unwrap().is_none(), "hot seq not in a segment");
+        assert!(sm.find_segment(prefix, 5).unwrap().is_none());
+
+        // Segment index/floor/tail sidecars never leak into file-metadata scans.
+        assert!(sm.list_metadata("/__wal_stream__/").unwrap().is_empty());
+    }
+
+    /// The `base == floor` gate makes a stale/duplicate/over-reaching seal a
+    /// no-op error, and a second contiguous seal advances further — the pair that
+    /// keeps concurrent proposers convergent (no gap, no dup, no offset skew).
+    #[test]
+    fn seal_gate_rejects_stale_and_chains_contiguously() {
+        let store = RedbStore::open_temporary().unwrap();
+        let mut sm = FullStateMachine::new(&store).unwrap();
+        let prefix = "/__wal_stream__/gate/";
+        for i in 0..6u64 {
+            sm.apply(
+                i + 1,
+                &Command::AppendStreamEntry {
+                    stream_prefix: prefix.into(),
+                    data: format!("m{i}").into_bytes(),
+                },
+            )
+            .unwrap();
+        }
+        // Seal [0,4).
+        sm.apply(
+            7,
+            &Command::SealStreamSegment {
+                stream_prefix: prefix.into(),
+                base: 0,
+                end: 4,
+                content_id: "seg0".into(),
+                origin: "a".into(),
+                size: 4,
+            },
+        )
+        .unwrap();
+
+        // Stale duplicate (base=0, floor=4) → Error no-op.
+        let dup = sm
+            .apply(
+                8,
+                &Command::SealStreamSegment {
+                    stream_prefix: prefix.into(),
+                    base: 0,
+                    end: 4,
+                    content_id: "seg0".into(),
+                    origin: "a".into(),
+                    size: 4,
+                },
+            )
+            .unwrap();
+        assert!(matches!(dup, CommandResult::Error(_)), "stale seal must be a no-op error");
+        assert_eq!(sm.stream_floor(prefix).unwrap(), 4, "floor unchanged after stale seal");
+
+        // Over-reach (end past tail) → Error no-op.
+        let over = sm
+            .apply(
+                9,
+                &Command::SealStreamSegment {
+                    stream_prefix: prefix.into(),
+                    base: 4,
+                    end: 99,
+                    content_id: "x".into(),
+                    origin: "a".into(),
+                    size: 1,
+                },
+            )
+            .unwrap();
+        assert!(matches!(over, CommandResult::Error(_)));
+        assert_eq!(sm.stream_floor(prefix).unwrap(), 4);
+
+        // Contiguous next seal [4,6) → Success, floor advances, second segment
+        // resolves independently of the first.
+        sm.apply(
+            10,
+            &Command::SealStreamSegment {
+                stream_prefix: prefix.into(),
+                base: 4,
+                end: 6,
+                content_id: "seg1".into(),
+                origin: "b".into(),
+                size: 2,
+            },
+        )
+        .unwrap();
+        assert_eq!(sm.stream_floor(prefix).unwrap(), 6);
+        assert_eq!(sm.find_segment(prefix, 1).unwrap().unwrap().1.content_id, "seg0");
+        assert_eq!(sm.find_segment(prefix, 5).unwrap().unwrap().1.content_id, "seg1");
+        assert!(sm.find_segment(prefix, 6).unwrap().is_none());
+    }
+
+    /// Determinism / convergence: the SAME append+seal command sequence applied
+    /// to two independent state machines yields byte-identical observable state
+    /// (floor, tail, segment records). This is the raft invariant the seal design
+    /// rests on — every replica applies the deterministic command and converges.
+    #[test]
+    fn seal_is_deterministic_across_replicas() {
+        let cmds = vec![
+            Command::AppendStreamEntry {
+                stream_prefix: "/__wal_stream__/d/".into(),
+                data: b"a".to_vec(),
+            },
+            Command::AppendStreamEntry {
+                stream_prefix: "/__wal_stream__/d/".into(),
+                data: b"b".to_vec(),
+            },
+            Command::AppendStreamEntry {
+                stream_prefix: "/__wal_stream__/d/".into(),
+                data: b"c".to_vec(),
+            },
+            Command::SealStreamSegment {
+                stream_prefix: "/__wal_stream__/d/".into(),
+                base: 0,
+                end: 2,
+                content_id: "seg".into(),
+                origin: "node-a".into(),
+                size: 2,
+            },
+        ];
+        let build = || {
+            let store = RedbStore::open_temporary().unwrap();
+            let mut sm = FullStateMachine::new(&store).unwrap();
+            for (i, c) in cmds.iter().enumerate() {
+                sm.apply((i + 1) as u64, c).unwrap();
+            }
+            (
+                sm.stream_floor("/__wal_stream__/d/").unwrap(),
+                sm.stream_tail("/__wal_stream__/d/").unwrap(),
+                sm.find_segment("/__wal_stream__/d/", 0).unwrap(),
+                sm.get_stream_entry("/__wal_stream__/d/2").unwrap(),
+            )
+        };
+        assert_eq!(build(), build(), "two replicas must converge to identical state");
     }
 
     /// Build a `PutControlState` for the `auth` namespace (an upsert), the shape
