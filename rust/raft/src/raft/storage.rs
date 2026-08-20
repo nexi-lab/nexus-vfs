@@ -169,6 +169,19 @@ impl RaftStorage {
         Ok(())
     }
 
+    /// Read the persisted `ConfState` — the membership SSOT `set_conf_state`
+    /// maintains and `initial_state` returns. Every applied `ConfChange` writes
+    /// it, so at snapshot-create time (right after applying up to the applied
+    /// index) it reflects the membership as of that index — exactly what a
+    /// snapshot's `metadata.conf_state` must carry.
+    pub fn conf_state(&self) -> Result<ConfState> {
+        match self.state.get(KEY_CONF_STATE)? {
+            Some(bytes) => protobuf::Message::parse_from_bytes(&bytes)
+                .map_err(|e| RaftError::Serialization(e.to_string())),
+            None => Ok(ConfState::default()),
+        }
+    }
+
     /// Store a snapshot without clearing existing entries.
     ///
     /// Used by the leader after ConfChange(AddNode/AddLearnerNode) to
@@ -472,14 +485,38 @@ impl Storage for RaftStorage {
         self.last_index_impl().map_err(to_raft_error)
     }
 
-    fn snapshot(&self, _request_index: u64, _to: u64) -> raft::Result<Snapshot> {
+    fn snapshot(&self, request_index: u64, _to: u64) -> raft::Result<Snapshot> {
         match self.state.get(KEY_SNAPSHOT).map_err(to_raft_error)? {
             Some(bytes) => {
                 let snapshot: Snapshot = protobuf::Message::parse_from_bytes(&bytes)
                     .map_err(|e| RaftCoreError::Store(RaftStorageError::Other(Box::new(e))))?;
+                // raft-rs contract: the returned snapshot MUST cover at least
+                // `request_index` (the leader is catching a follower up to it).
+                // A stored snapshot that under-covers is not usable yet — report
+                // it temporarily unavailable so raft-rs retries after we've
+                // snapshotted far enough, rather than shipping a snapshot that
+                // leaves the follower short. Before P2 nothing stored a snapshot,
+                // so this path never fired; once the ready loop snapshots+compacts
+                // it is the leader's catch-up path for a lagging / joining peer.
+                if snapshot.get_metadata().index < request_index {
+                    return Err(RaftCoreError::Store(
+                        RaftStorageError::SnapshotTemporarilyUnavailable,
+                    ));
+                }
                 Ok(snapshot)
             }
-            None => Ok(Snapshot::default()),
+            // No snapshot stored yet: an empty (index 0) snapshot satisfies only a
+            // request for index 0 (e.g. `term`'s `snapshot(0, 0)` probe); a higher
+            // request is temporarily unavailable.
+            None => {
+                if request_index == 0 {
+                    Ok(Snapshot::default())
+                } else {
+                    Err(RaftCoreError::Store(
+                        RaftStorageError::SnapshotTemporarilyUnavailable,
+                    ))
+                }
+            }
         }
     }
 }
@@ -602,6 +639,94 @@ mod tests {
             .entries(5, 11, None, raft::GetEntriesContext::empty(false))
             .unwrap();
         assert_eq!(entries.len(), 6);
+    }
+
+    // ---------------------------------------------------------------
+    // P2: snapshot() contract + snapshot-then-compact log bounding
+    // ---------------------------------------------------------------
+
+    /// `Storage::snapshot(request_index, _)` must return the stored snapshot
+    /// only when it covers `request_index`, else `SnapshotTemporarilyUnavailable`
+    /// — so the leader never ships an under-covering snapshot to a lagging peer.
+    #[test]
+    fn snapshot_contract_honors_request_index() {
+        let (storage, _dir) = create_test_storage();
+        // Nothing stored: index-0 probe (used by `term`) → empty; higher → unavailable.
+        assert_eq!(storage.snapshot(0, 0).unwrap().get_metadata().index, 0);
+        assert!(matches!(
+            storage.snapshot(5, 0),
+            Err(RaftCoreError::Store(
+                RaftStorageError::SnapshotTemporarilyUnavailable
+            ))
+        ));
+        // Store a snapshot at index 10.
+        storage
+            .store_snapshot(&make_snapshot(10, 3, &[1, 2, 3]))
+            .unwrap();
+        assert_eq!(storage.snapshot(0, 0).unwrap().get_metadata().index, 10);
+        assert_eq!(storage.snapshot(10, 0).unwrap().get_metadata().index, 10);
+        // Under-covered request → temporarily unavailable (raft-rs retries later).
+        assert!(matches!(
+            storage.snapshot(11, 0),
+            Err(RaftCoreError::Store(
+                RaftStorageError::SnapshotTemporarilyUnavailable
+            ))
+        ));
+    }
+
+    /// The exact P2 ready-loop sequence — snapshot at N, then `compact(N+1)` —
+    /// bounds the log AND preserves `term(N)` via the snapshot, the invariant
+    /// raft-rs needs (`term(first_index-1)`) to keep appending after compaction.
+    #[test]
+    fn snapshot_then_compact_bounds_log_and_preserves_boundary_term() {
+        let (storage, _dir) = create_test_storage();
+        let entries: Vec<Entry> = (1..=20)
+            .map(|i| Entry {
+                index: i,
+                term: 4,
+                ..Default::default()
+            })
+            .collect();
+        storage.append(&entries).unwrap();
+
+        storage.store_snapshot(&make_snapshot(15, 4, &[1])).unwrap();
+        storage.compact(16).unwrap();
+
+        // Log bounded: first advanced, pre-16 entries gone, 16..=20 kept.
+        assert_eq!(storage.first_index().unwrap(), 16);
+        assert_eq!(storage.last_index().unwrap(), 20);
+        assert!(matches!(
+            storage.entries(10, 16, None, raft::GetEntriesContext::empty(false)),
+            Err(RaftCoreError::Store(RaftStorageError::Compacted))
+        ));
+        assert_eq!(
+            storage
+                .entries(16, 21, None, raft::GetEntriesContext::empty(false))
+                .unwrap()
+                .len(),
+            5
+        );
+        // term(first-1) resolves via the snapshot even though the entry is gone.
+        assert_eq!(storage.term(15).unwrap(), 4);
+        // Anything older than the snapshot is genuinely compacted.
+        assert!(matches!(
+            storage.term(14),
+            Err(RaftCoreError::Store(RaftStorageError::Compacted))
+        ));
+    }
+
+    /// `conf_state()` round-trips the persisted membership.
+    #[test]
+    fn conf_state_getter_roundtrips() {
+        let (storage, _dir) = create_test_storage();
+        assert_eq!(storage.conf_state().unwrap(), ConfState::default());
+        let cs = ConfState {
+            voters: vec![1, 2, 3],
+            learners: vec![4],
+            ..Default::default()
+        };
+        storage.set_conf_state(&cs).unwrap();
+        assert_eq!(storage.conf_state().unwrap(), cs);
     }
 
     // ---------------------------------------------------------------
