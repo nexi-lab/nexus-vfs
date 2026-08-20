@@ -567,6 +567,14 @@ pub struct ZoneConsensusDriver<S: StateMachine + 'static> {
     /// `Snapshot` state forever. The stored snapshot's membership must never lag
     /// the log's.
     membership_changed_since_snapshot: bool,
+    /// Last log index at the most recent snapshot (0 = none yet). A cheap,
+    /// in-memory trigger gate: the common no-compaction ready pays only an
+    /// atomic `cached_last_index` load + a subtraction here, never a redb read
+    /// or state-machine lock — so the compaction machinery adds no measurable
+    /// latency to the ready loop. Advisory (over-triggers, since `last_index >=
+    /// applied`); the authoritative `applied - first_index` check runs only past
+    /// this gate. Updated on snapshot create AND on inbound snapshot install.
+    last_index_at_snapshot: u64,
 }
 
 /// Callback fired after every successful ConfState apply.  Installed
@@ -851,6 +859,14 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             advisory_handle,
         };
 
+        // Seed the compaction gate from any persisted snapshot so a restarted,
+        // previously-compacted node's gate is correct with no warm-up window.
+        let init_snap_index = raw_node
+            .store()
+            .first_index_impl()
+            .map(|f| f.saturating_sub(1))
+            .unwrap_or(0);
+
         let driver = ZoneConsensusDriver {
             raw_node,
             state_machine,
@@ -879,6 +895,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
                 .and_then(|v| v.trim().parse::<u64>().ok())
                 .unwrap_or(DEFAULT_SC_SNAPSHOT_THRESHOLD),
             membership_changed_since_snapshot: false,
+            last_index_at_snapshot: init_snap_index,
         };
 
         Ok((handle, driver))
@@ -1837,6 +1854,10 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                 sm.restore_snapshot(&snapshot.data)
                     .map_err(|e| RaftError::Storage(format!("restore snapshot: {e}")))?;
             }
+            // Reset the cheap compaction gate: the log now starts at the
+            // snapshot index, so a freshly-installed follower does not re-open
+            // the gate every ready.
+            self.last_index_at_snapshot = snapshot.get_metadata().index;
         }
 
         // 2. Persist entries and hard state
@@ -1955,6 +1976,15 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         if threshold == 0 {
             return Ok(()); // compaction disabled
         }
+        // Cheap in-memory gate — no redb read, no SM lock — so a ready that
+        // won't compact adds nothing measurable to the loop. `cached_last_index`
+        // is a plain atomic refreshed by `update_cached_status` just above.
+        let last_index = self.cached_last_index.load(Ordering::Acquire);
+        let grew = last_index.saturating_sub(self.last_index_at_snapshot);
+        if grew < threshold && !self.membership_changed_since_snapshot {
+            return Ok(());
+        }
+
         let first = self
             .raw_node
             .store()
@@ -2017,8 +2047,10 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
             .mut_store()
             .compact(applied + 1)
             .map_err(|e| RaftError::Storage(format!("compact: {e}")))?;
-        // The fresh snapshot now reflects the current membership.
+        // The fresh snapshot now reflects the current membership; reset the
+        // cheap gate to measure the next window from here.
         self.membership_changed_since_snapshot = false;
+        self.last_index_at_snapshot = applied;
 
         tracing::info!(
             index = applied,
