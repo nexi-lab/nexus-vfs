@@ -2350,6 +2350,16 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
                         Arc::downgrade(&kernel),
                     );
                     tracing::info!(zone_id = %zone_id, "a2a stream-wakeup observer armed");
+                    // Same per-zone spine, sibling concern: a replicated
+                    // `TrimStreamSegment` (a wal DT_STREAM over its retention
+                    // budget) reclaims this node's own-origin cold blobs. Off
+                    // the apply thread (disk I/O), so pass the zone runtime.
+                    nexus_raft::stream_retention_gc::install_stream_trim_gc_observer(
+                        &zone.consensus_node(),
+                        Arc::downgrade(&kernel),
+                        zone.runtime_handle(),
+                    );
+                    tracing::info!(zone_id = %zone_id, "dt-stream retention-GC observer armed");
                 }
                 None => {
                     tracing::warn!(

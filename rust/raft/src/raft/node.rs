@@ -2004,7 +2004,24 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         let (applied, data) = {
             let sm = self.state_machine.read().await;
             let applied = sm.last_applied_index();
-            if applied <= first || (applied - first < threshold && !membership_refresh) {
+            // A membership refresh must re-stamp the snapshot's conf_state to
+            // include a just-joined member even when the log did NOT grow a full
+            // threshold — AND even when compaction has advanced `first` right up
+            // to `applied` (`applied == first`), the common case when the
+            // AddLearner entry is applied into an otherwise-quiescent, already
+            // compacted log. Requiring `applied > first` there strands the
+            // learner: the only stored snapshot predates it, so raft-rs discards
+            // it (recipient absent from conf_state) and the learner never catches
+            // up. So a refresh needs only `applied >= first` — snapshot AT the
+            // applied entry, which is still in the log (`first <= applied`), with
+            // the current conf_state. The growth path is unchanged: a full
+            // threshold of genuinely new applied entries past `first`.
+            let enough = if membership_refresh {
+                applied >= first
+            } else {
+                applied > first && applied - first >= threshold
+            };
+            if !enough {
                 return Ok(());
             }
             let data = sm

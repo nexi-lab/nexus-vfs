@@ -218,6 +218,10 @@ impl VfsServiceImpl {
             KernelError::PipeClosed(m) | KernelError::StreamClosed(m) => {
                 (RpcErrorCode::InternalError, m)
             }
+            KernelError::StreamTruncated(earliest, req) => (
+                RpcErrorCode::OffsetOutOfRange,
+                format!("offset {req} trimmed; earliest {earliest}"),
+            ),
             other => (RpcErrorCode::InternalError, format!("{:?}", other)),
         }
     }
@@ -1622,6 +1626,10 @@ pub(crate) enum RpcErrorCode {
     FileNotFound = -32007,
     ValidationError = -32005,
     Conflict = -32006,
+    /// Stream read below the retention floor (Kafka OffsetOutOfRange): the
+    /// requested offset was trimmed. Distinct from `InternalError` so a reader
+    /// can catch it and reset to the stream's `earliest_offset`.
+    OffsetOutOfRange = -32019,
     InternalError = -32603,
 }
 

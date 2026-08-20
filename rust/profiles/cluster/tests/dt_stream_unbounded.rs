@@ -28,8 +28,21 @@ const ZONE: &str = "sharedzone";
 const MOUNT: &str = "/agents";
 const BUDGET: Duration = Duration::from_secs(90);
 const SEAL_LOG: &str = "wal DT_STREAM sealed cold segment";
+const TRIM_LOG: &str = "wal DT_STREAM trimmed cold segments";
 const COMPACT_LOG: &str = "raft SC log snapshot+compact";
 const SNAPSHOT_INSTALL_LOG: &str = "Applying snapshot from leader";
+
+/// The distinct `OffsetOutOfRange` wire code (grpc `RpcErrorCode`), as it
+/// appears in the JSON error payload. A read below the retention floor must
+/// carry THIS, not a generic `InternalError` (-32603).
+const OFFSET_OUT_OF_RANGE_CODE: &str = "-32019";
+
+/// Retention budget for the trim test: a few sealed segments' worth of headroom
+/// is far larger than this, so appending `N_FRAMES` forces the oldest cold
+/// segments to drop. Small enough to trim, non-zero so the stream is bounded
+/// (not keep-forever). The test asserts the RESULT generically (`0 < earliest <
+/// N_FRAMES`), never a size-derived exact floor.
+const RETENTION_BYTES: u64 = 100;
 
 /// 40 fixed-width 6-byte frames (`f00000`..`f00039`). Fixed width makes the
 /// `stream_collect_all` concatenation (no separators) a deterministic expected
@@ -310,6 +323,203 @@ async fn joiner_installs_snapshot_after_compaction_then_cold_reads() {
     let want = expected_upto(total);
     await_collect(&mut fc, &log, &want).await;
     await_collect(&mut jc, &log, &want).await;
+    drop(joiner);
+    drop(founder);
+}
+
+/// Parse the retention floor out of a Truncated error payload
+/// (`…"message":"offset 0 trimmed; earliest 24"…`). `None` if the payload is
+/// not a floor message (e.g. the offset is not trimmed yet).
+fn parse_earliest(payload: &str) -> Option<u64> {
+    let after = payload.split("earliest ").nth(1)?;
+    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+/// Poll a non-blocking read of offset 0 until it becomes Truncated (trimming is
+/// async, behind the background seal), returning the parsed retention floor.
+async fn await_truncated_earliest(v: &mut Vfs, path: &str) -> u64 {
+    let deadline = std::time::Instant::now() + BUDGET;
+    loop {
+        let r = v
+            .stream_read_at(path, 0, "")
+            .await
+            .expect("stream_read_at rpc");
+        if r.is_error {
+            if let Some(e) = parse_earliest(&r.error_payload) {
+                return e;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "offset 0 never became Truncated (last: is_error={}, payload={:?})",
+                r.is_error, r.error_payload
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// P3 (retention trim + Truncated / OffsetOutOfRange): a wal stream created with
+/// a small cold-storage budget trims its oldest sealed segments as the log grows
+/// — storage stays bounded — and a read below the retention floor returns a
+/// DISTINCT `OffsetOutOfRange`, while reads at/above the floor still resolve
+/// byte-exact and `collect_all` returns exactly the surviving suffix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retention_trims_old_segments_and_reads_below_earliest_are_truncated() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (mut founder, fport) = boot_founder(tmp.path()).await;
+    let mut fc = Vfs::dial(fport).await.expect("dial founder");
+
+    // A wal stream with a TINY cold budget, so appending well past it forces
+    // real trims — the oldest sealed segments drop and `earliest` advances.
+    let log = format!("{MOUNT}/trimlog");
+    fc.create_stream_cap(&log, RETENTION_BYTES, "")
+        .await
+        .expect("create bounded wal stream");
+    for i in 0..N_FRAMES {
+        fc.stream_write(&log, &frame(i), "")
+            .await
+            .unwrap_or_else(|e| panic!("write frame {i}: {e}"));
+    }
+
+    // Both a seal AND a trim must fire (log-gated): the cold tier spilled, then
+    // was bounded back under budget.
+    founder
+        .wait_for_log(SEAL_LOG, BUDGET)
+        .await
+        .expect("a seal fires once the log passes the hot window");
+    founder
+        .wait_for_log(TRIM_LOG, BUDGET)
+        .await
+        .expect("a trim fires once cold storage exceeds the retention budget");
+
+    // Offset 0 is now below the retention floor — read it as Truncated and
+    // recover the floor `earliest`.
+    let earliest = await_truncated_earliest(&mut fc, &log).await;
+    assert!(
+        earliest > 0 && (earliest as usize) < N_FRAMES,
+        "earliest {earliest} must be a proper interior floor (0 < e < {N_FRAMES})"
+    );
+
+    // The wire error is the DISTINCT OffsetOutOfRange, not a generic internal
+    // error, and its message names the trim + the floor.
+    let below = fc.stream_read_at(&log, 0, "").await.expect("read rpc");
+    assert!(below.is_error, "offset 0 is trimmed → error");
+    assert!(
+        below.error_payload.contains(OFFSET_OUT_OF_RANGE_CODE),
+        "wire code must be OffsetOutOfRange ({OFFSET_OUT_OF_RANGE_CODE}): {}",
+        below.error_payload
+    );
+    assert!(
+        below.error_payload.contains("trimmed") && below.error_payload.contains("earliest"),
+        "message names the trim + floor: {}",
+        below.error_payload
+    );
+
+    // Just below the floor is still Truncated; AT the floor resolves byte-exact.
+    let below_floor = fc
+        .stream_read_at(&log, earliest - 1, "")
+        .await
+        .expect("rpc");
+    assert!(
+        below_floor.is_error,
+        "earliest-1 is below the floor → Truncated"
+    );
+    let at_floor = fc.stream_read_at(&log, earliest, "").await.expect("rpc");
+    assert!(
+        !at_floor.is_error,
+        "the earliest surviving offset resolves: {}",
+        at_floor.error_payload
+    );
+    assert_eq!(
+        at_floor.data,
+        frame(earliest as usize),
+        "earliest frame byte-exact"
+    );
+    assert_eq!(
+        at_floor.next_offset,
+        earliest + 1,
+        "next offset advances by one"
+    );
+
+    // `collect_all` returns EXACTLY the surviving suffix [earliest, N): old data
+    // is gone (bounded) and the rest is byte-exact.
+    let want_suffix: Vec<u8> = (earliest as usize..N_FRAMES).flat_map(frame).collect();
+    await_collect(&mut fc, &log, &want_suffix).await;
+
+    drop(founder);
+}
+
+/// P3 cross-node: the retention floor is REPLICATED. The founder trims a bounded
+/// stream; a joiner that boots afterwards honours the SAME floor — a read below
+/// `earliest` is Truncated on the joiner too, and its `collect_all` returns the
+/// identical surviving suffix, pulling the kept cold segment from the founder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn joiner_honours_the_replicated_retention_floor() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (mut founder, fport) = boot_founder(tmp.path()).await;
+    let mut fc = Vfs::dial(fport).await.expect("dial founder");
+
+    // Founder writes + trims BEFORE the joiner exists, so the joiner learns the
+    // floor purely from replicated raft state, never from the hot rows.
+    let log = format!("{MOUNT}/trimx");
+    fc.create_stream_cap(&log, RETENTION_BYTES, "")
+        .await
+        .expect("create bounded wal stream");
+    for i in 0..N_FRAMES {
+        fc.stream_write(&log, &frame(i), "")
+            .await
+            .unwrap_or_else(|e| panic!("write frame {i}: {e}"));
+    }
+    founder
+        .wait_for_log(TRIM_LOG, BUDGET)
+        .await
+        .expect("founder trims before the joiner joins");
+
+    // Boot a joiner that reaches the zone via DiscoverZones.
+    let jport = free_port();
+    let jdata = tmp.path().join("tj-data");
+    let jid = tmp.path().join("tj-id");
+    let jadv = format!("127.0.0.1:{jport}");
+    let peers = format!("127.0.0.1:{fport}");
+    let jbind = format!("127.0.0.1:{jport}");
+    let mut joiner = Daemon::spawn(
+        &["--bind-addr", &jbind],
+        &joiner_env(
+            &jdata.to_string_lossy(),
+            &jid.to_string_lossy(),
+            &jadv,
+            &peers,
+        ),
+    );
+    joiner.wait_tcp(jport, BUDGET).await.expect("joiner serves");
+    joiner
+        .wait_for_log(&format!("Zone '{ZONE}' registered"), BUDGET)
+        .await
+        .expect("joiner joins the zone");
+    let mut jc = Vfs::dial(jport).await.expect("dial joiner");
+
+    // Read the founder's STABLE floor: all writes/trims have long settled by
+    // here, so offset 0's Truncated `earliest` is the final floor (the value the
+    // joiner must converge on). Reading it now — rather than mid-trim, when the
+    // floor is still advancing 8→16→24 — is what makes the cross-node compare
+    // deterministic.
+    let f_earliest = await_truncated_earliest(&mut fc, &log).await;
+
+    // The joiner honours the SAME replicated floor: offset 0 is Truncated with
+    // the identical `earliest`, no create_stream / watch — pure replicated read.
+    let j_earliest = await_truncated_earliest(&mut jc, &log).await;
+    assert_eq!(
+        j_earliest, f_earliest,
+        "the retention floor must replicate to the joiner"
+    );
+
+    // And the joiner reconstructs the identical surviving suffix, pulling the
+    // kept cold segment from the founder over ReadBlob.
+    let want_suffix: Vec<u8> = (f_earliest as usize..N_FRAMES).flat_map(frame).collect();
+    await_collect(&mut jc, &log, &want_suffix).await;
+
     drop(joiner);
     drop(founder);
 }

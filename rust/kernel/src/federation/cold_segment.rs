@@ -150,6 +150,35 @@ impl Kernel {
             "cold segment {content_id} unavailable (local miss; origin {origin:?})"
         ))
     }
+
+    /// Delete the LOCAL blob for a trimmed segment (retention GC). Best-effort:
+    /// a path-addressed backend (federation cache) deletes by the path
+    /// `content_id`; a content-addressed one by hash. The wrong call returns
+    /// NotSupported/NotFound and is ignored — a miss means the blob is already
+    /// gone or was never local (only own-origin blobs are deleted by the caller).
+    pub(crate) fn delete_cold_segment(&self, stream_path: &str, content_id: &str) {
+        if let Some(backend) = self.stream_content_backend(stream_path) {
+            let _ = backend.delete_content(content_id);
+            let _ = backend.delete_file(content_id);
+        }
+    }
+
+    /// Retention GC for a trimmed range: delete the LOCAL cold-segment blobs
+    /// this node sealed (`origin == self`). The trim-GC apply-observer calls
+    /// this on EVERY node for the same `TrimStreamSegment` command; each
+    /// reclaims only its own-origin blobs, so a multi-origin stream is cleaned
+    /// exactly once per blob with no cross-node delete race. A seal records
+    /// `origin = self_origin().unwrap_or_default()` (the seal path above), so an
+    /// un-federated single node (empty `self_address`) matches the empty origin
+    /// it stamped and still reclaims its own blobs.
+    pub fn gc_trimmed_cold_segments(&self, stream_path: &str, trimmed: &[(String, String)]) {
+        let me = self.self_address.read().clone().unwrap_or_default();
+        for (origin, content_id) in trimmed {
+            if origin.as_str() == me.as_str() {
+                self.delete_cold_segment(stream_path, content_id);
+            }
+        }
+    }
 }
 
 /// `ColdSegmentStore` bridge: a `Weak<Kernel>` so an in-flight seal thread that
@@ -178,5 +207,12 @@ impl ColdSegmentStore for KernelColdSegmentStore {
     ) -> Result<Vec<u8>, String> {
         let k = self.kernel.upgrade().ok_or("kernel dropped")?;
         k.read_cold_segment(stream_id, content_id, origin)
+    }
+
+    fn delete_segment(&self, stream_id: &str, content_id: &str) -> Result<(), String> {
+        if let Some(k) = self.kernel.upgrade() {
+            k.delete_cold_segment(stream_id, content_id);
+        }
+        Ok(())
     }
 }

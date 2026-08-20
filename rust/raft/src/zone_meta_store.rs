@@ -534,6 +534,74 @@ impl MetaStore for ZoneMetaStore {
             size: rec.size,
         }))
     }
+
+    fn stream_earliest(&self, stream_prefix: &str) -> Result<u64, MetaStoreError> {
+        let prefix_owned = stream_prefix.to_string();
+        let fut = self
+            .node
+            .with_state_machine(move |sm: &FullStateMachine| sm.stream_earliest(&prefix_owned));
+        bridge_block_on(&self.runtime, fut).map_err(|e| {
+            MetaStoreError::IOError(format!(
+                "ZoneMetaStore.stream_earliest({stream_prefix}): {e}"
+            ))
+        })
+    }
+
+    fn list_stream_segments(
+        &self,
+        stream_prefix: &str,
+    ) -> Result<Vec<StreamSegment>, MetaStoreError> {
+        let prefix_owned = stream_prefix.to_string();
+        let segs = bridge_block_on(
+            &self.runtime,
+            self.node
+                .with_state_machine(move |sm: &FullStateMachine| sm.list_segments(&prefix_owned)),
+        )
+        .map_err(|e| {
+            MetaStoreError::IOError(format!(
+                "ZoneMetaStore.list_stream_segments({stream_prefix}): {e}"
+            ))
+        })?;
+        Ok(segs
+            .into_iter()
+            .map(|(base, rec)| StreamSegment {
+                base,
+                end: rec.end,
+                content_id: rec.content_id,
+                origin: rec.origin,
+                size: rec.size,
+            })
+            .collect())
+    }
+
+    fn trim_stream_segments(
+        &self,
+        stream_prefix: &str,
+        up_to_seq: u64,
+        trimmed: Vec<(String, String)>,
+    ) -> Result<(), MetaStoreError> {
+        // SC, like `seal_stream_segment`: a total order wrt appends/seals — the
+        // apply's earliest<up_to<=floor gate makes racing trims converge.
+        let cmd = Command::TrimStreamSegment {
+            stream_prefix: stream_prefix.to_string(),
+            up_to_seq,
+            trimmed,
+        };
+        let result = bridge_block_on(&self.runtime, self.node.propose(cmd)).map_err(|e| {
+            MetaStoreError::IOError(format!(
+                "ZoneMetaStore.trim_stream_segments({stream_prefix}): {e}"
+            ))
+        })?;
+        match result {
+            crate::prelude::CommandResult::Success => Ok(()),
+            crate::prelude::CommandResult::Error(e) => Err(MetaStoreError::IOError(format!(
+                "ZoneMetaStore.trim_stream_segments({stream_prefix}) rejected: {e}"
+            ))),
+            _ => Err(MetaStoreError::IOError(format!(
+                "ZoneMetaStore.trim_stream_segments({stream_prefix}): unexpected apply result"
+            ))),
+        }
+    }
 }
 
 #[cfg(test)]

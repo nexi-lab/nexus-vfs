@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 
 use kernel::kernel::vfs_proto::{
     nexus_vfs_service_client::NexusVfsServiceClient, IpcPathRequest, MkdirRequest, PingRequest,
-    ReadRequest, ReaddirRequest, SetattrRequest, StatRequest, StreamWriteRequest, WatchRequest,
-    WriteRequest,
+    ReadRequest, ReaddirRequest, SetattrRequest, StatRequest, StreamReadAtRequest,
+    StreamWriteRequest, WatchRequest, WriteRequest,
 };
 use tonic::transport::Channel;
 
@@ -330,6 +330,18 @@ pub fn write_tls_bundle(
     std::fs::write(data_dir.join(".node_id"), node_id.to_be_bytes()).unwrap();
 }
 
+/// Decoded `StreamReadAt` outcome — success bytes plus the raw error surface so
+/// a caller can assert on the wire error (e.g. the `OffsetOutOfRange` message
+/// for a retention-trimmed offset), not just on `data`.
+pub struct StreamReadOutcome {
+    pub data: Vec<u8>,
+    pub next_offset: u64,
+    pub eof: bool,
+    pub is_error: bool,
+    /// `error_payload` decoded as UTF-8 (the JSON `{"code":…,"message":…}`).
+    pub error_payload: String,
+}
+
 /// Thin typed wrapper over the VFS gRPC client. Every call carries its bearer
 /// token, so a single connection can exercise many identities (the auth test
 /// pings with valid / empty / unknown / revoked tokens over one channel).
@@ -473,6 +485,19 @@ impl Vfs {
     }
 
     pub async fn create_stream(&mut self, path: &str, token: &str) -> Result<(), String> {
+        self.create_stream_cap(path, 0, token).await
+    }
+
+    /// Create a wal DT_STREAM with a retention budget: `capacity` bytes of cold
+    /// storage (`0` = keep-forever, as `create_stream`). Once sealed cold storage
+    /// exceeds the budget the oldest segments are trimmed and `earliest` advances
+    /// (Kafka retention). Same `wal,memory` io_profile as `create_stream`.
+    pub async fn create_stream_cap(
+        &mut self,
+        path: &str,
+        capacity: u64,
+        token: &str,
+    ) -> Result<(), String> {
         let r = self
             .c
             .setattr(SetattrRequest {
@@ -480,12 +505,44 @@ impl Vfs {
                 auth_token: token.to_string(),
                 entry_type: DT_STREAM,
                 io_profile: "wal,memory".into(),
+                capacity,
                 ..Default::default()
             })
             .await
             .map_err(|e| format!("setattr rpc: {e}"))?
             .into_inner();
-        err_if(r.is_error, &r.error_payload, "create_stream")
+        err_if(r.is_error, &r.error_payload, "create_stream_cap")
+    }
+
+    /// Non-blocking `StreamReadAt`, returning the decoded outcome (data /
+    /// next_offset / eof / error) so a caller can assert on the error CODE —
+    /// e.g. `OffsetOutOfRange` for an offset trimmed by retention — not just on
+    /// success bytes. Transport failures surface as `Err`.
+    pub async fn stream_read_at(
+        &mut self,
+        path: &str,
+        offset: u64,
+        token: &str,
+    ) -> Result<StreamReadOutcome, String> {
+        let r = self
+            .c
+            .stream_read_at(StreamReadAtRequest {
+                path: path.to_string(),
+                offset,
+                blocking: false,
+                timeout_ms: 0,
+                auth_token: token.to_string(),
+            })
+            .await
+            .map_err(|e| format!("stream_read_at rpc: {e}"))?
+            .into_inner();
+        Ok(StreamReadOutcome {
+            data: r.data,
+            next_offset: r.next_offset,
+            eof: r.eof,
+            is_error: r.is_error,
+            error_payload: String::from_utf8_lossy(&r.error_payload).into_owned(),
+        })
     }
 
     pub async fn stream_write(

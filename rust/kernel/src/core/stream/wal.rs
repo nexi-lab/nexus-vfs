@@ -81,6 +81,11 @@ pub trait ColdSegmentStore: Send + Sync {
         content_id: &str,
         origin: &str,
     ) -> Result<Vec<u8>, String>;
+
+    /// Delete the LOCAL blob for a trimmed segment (retention GC). Called only
+    /// for blobs this node owns (`origin == self`); best-effort — a miss is not
+    /// an error (already gone / never local).
+    fn delete_segment(&self, stream_id: &str, content_id: &str) -> Result<(), String>;
 }
 
 /// When to roll the hot tail into a cold segment. Mirrors Kafka's active-segment
@@ -213,6 +218,11 @@ pub struct WalStreamCore {
     /// Last cold segment fetched, cached so a scan across cold data (e.g.
     /// `collect_all`) fetches+parses each segment once, not once per frame.
     seg_cache: Arc<Mutex<Option<CachedSegment>>>,
+    /// Cold-storage retention in bytes. `0` ⇒ keep-forever (the default, and
+    /// what audit/transcript use). `>0` ⇒ trim: once sealed cold storage exceeds
+    /// this, the seal thread drops the oldest segments and advances `earliest`.
+    /// From the stream's inode capacity.
+    retention: u64,
 }
 
 /// One cached cold segment: `(base, end, blob)`. The `blob` is shared so the
@@ -235,18 +245,20 @@ impl WalStreamCore {
             seal_in_flight: Arc::new(AtomicBool::new(false)),
             known_floor: Arc::new(AtomicU64::new(0)),
             seg_cache: Arc::new(Mutex::new(None)),
+            retention: 0,
         }
     }
 
     /// WAL core with tiered storage: appends past `policy.hot_window +
     /// seal_batch` roll off the front into cold segments stored via `cold`,
-    /// bounding the raft state machine. The kernel injects this for federated
-    /// wal streams.
+    /// bounding the raft state machine. `retention` bytes bound the cold storage
+    /// (`0` = keep-forever). The kernel injects this for federated wal streams.
     pub fn with_cold_tier(
         store: Arc<dyn MetaStore>,
         stream_id: String,
         cold: Arc<dyn ColdSegmentStore>,
         policy: SealPolicy,
+        retention: u64,
     ) -> Self {
         let prefix = format!("{WAL_STREAM_KEY_PREFIX}{stream_id}/");
         Self {
@@ -259,6 +271,7 @@ impl WalStreamCore {
             seal_in_flight: Arc::new(AtomicBool::new(false)),
             known_floor: Arc::new(AtomicU64::new(0)),
             seg_cache: Arc::new(Mutex::new(None)),
+            retention,
         }
     }
 
@@ -298,14 +311,17 @@ impl WalStreamCore {
             return Ok(Some(bytes));
         }
         // Hot miss. With a cold tier wired, a seq below the seal floor was
-        // spilled to a segment — resolve it transparently (ABI unchanged).
+        // spilled to a segment — resolve it transparently (ABI unchanged). A
+        // seq whose segment was trimmed by retention has no index entry, so
+        // `read_cold` returns `Ok(None)`; the StreamBackend wrapper reports it as
+        // `Truncated` (it can tell trimmed from not-yet-written via `earliest`).
         if let Some(cold) = &self.cold {
             let floor = self
                 .store
                 .stream_floor(&self.prefix)
                 .map_err(|e| format!("stream_floor({}): {e:?}", self.prefix))?;
             if seq < floor {
-                return self.read_cold(seq, cold.as_ref()).map(Some);
+                return self.read_cold(seq, cold.as_ref());
             }
         }
         // Genuinely absent: not yet written (open) or closed for good.
@@ -319,30 +335,29 @@ impl WalStreamCore {
     /// Resolve a spilled seq from the cold tier: the one-segment cache, else look
     /// up the segment index, fetch the blob (local content store, else a peer
     /// fetch from its seal origin), extract the frame, and cache the blob for the
-    /// next consecutive cold read.
-    fn read_cold(&self, seq: u64, cold: &dyn ColdSegmentStore) -> Result<Vec<u8>, String> {
+    /// next consecutive cold read. `Ok(None)` when no segment indexes the seq —
+    /// it was trimmed by retention (the caller surfaces `Truncated`).
+    fn read_cold(&self, seq: u64, cold: &dyn ColdSegmentStore) -> Result<Option<Vec<u8>>, String> {
         {
             let guard = self.seg_cache.lock();
             if let Some((base, end, blob)) = guard.as_ref() {
                 if *base <= seq && seq < *end {
-                    return extract_frame(blob.as_slice(), *base, seq);
+                    return extract_frame(blob.as_slice(), *base, seq).map(Some);
                 }
             }
         }
-        let seg = self
+        let seg = match self
             .store
             .find_stream_segment(&self.prefix, seq)
             .map_err(|e| format!("find_stream_segment({}, {seq}): {e:?}", self.prefix))?
-            .ok_or_else(|| {
-                format!(
-                    "WAL stream {} seq {seq} is below the floor but no cold segment indexes it",
-                    self.stream_id
-                )
-            })?;
+        {
+            Some(seg) => seg,
+            None => return Ok(None), // trimmed by retention
+        };
         let blob = Arc::new(cold.read_segment(&self.stream_id, &seg.content_id, &seg.origin)?);
         let out = extract_frame(blob.as_slice(), seg.base, seq)?;
         *self.seg_cache.lock() = Some((seg.base, seg.end, blob));
-        Ok(out)
+        Ok(Some(out))
     }
 
     /// Push-side seal gate. A cheap atomic check (`tail` vs. the last-known
@@ -373,6 +388,7 @@ impl WalStreamCore {
         let policy = self.policy;
         let in_flight = Arc::clone(&self.seal_in_flight);
         let known_floor = Arc::clone(&self.known_floor);
+        let retention = self.retention;
         std::thread::spawn(move || {
             seal_loop(
                 &store,
@@ -381,6 +397,7 @@ impl WalStreamCore {
                 &stream_id,
                 policy,
                 &known_floor,
+                retention,
             );
             in_flight.store(false, Ordering::Release);
         });
@@ -437,6 +454,7 @@ fn seal_loop(
     stream_id: &str,
     policy: SealPolicy,
     known_floor: &AtomicU64,
+    retention: u64,
 ) {
     loop {
         let floor = match store.stream_floor(prefix) {
@@ -492,6 +510,11 @@ fn seal_loop(
                     "wal DT_STREAM sealed cold segment"
                 );
                 known_floor.store(end, Ordering::Relaxed);
+                // Retention: after adding cold bytes, drop the oldest segments
+                // if the stream is over its cold-storage budget.
+                if retention > 0 {
+                    maybe_trim(store, prefix, stream_id, retention);
+                }
                 // Loop: seal the next batch if the tail is still past the window.
             }
             Err(e) => {
@@ -505,6 +528,53 @@ fn seal_loop(
                 return;
             }
         }
+    }
+}
+
+/// Retention trim: if the stream's total cold-segment bytes exceed `retention`,
+/// drop the oldest whole segments until it fits, then propose
+/// `trim_stream_segments` (advances `earliest`, deletes the index entries, and
+/// carries the dropped blobs' refs so each node's trim-GC observer reclaims the
+/// blobs it owns). The trimmer only proposes — it does NOT delete blobs itself,
+/// so single- and multi-origin streams reclaim uniformly via the observers.
+fn maybe_trim(store: &Arc<dyn MetaStore>, prefix: &str, stream_id: &str, retention: u64) {
+    let segs = match store.list_stream_segments(prefix) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let total: u64 = segs.iter().map(|s| s.size).sum();
+    if total <= retention {
+        return;
+    }
+    // Drop oldest-first until the remaining cold bytes fit the budget.
+    let mut remaining = total;
+    let mut up_to = 0u64;
+    let mut trimmed: Vec<(String, String)> = Vec::new();
+    for seg in &segs {
+        if remaining <= retention {
+            break;
+        }
+        remaining -= seg.size;
+        up_to = seg.end;
+        trimmed.push((seg.origin.clone(), seg.content_id.clone()));
+    }
+    if up_to == 0 {
+        return; // nothing whole to drop
+    }
+    let dropped = trimmed.len();
+    match store.trim_stream_segments(prefix, up_to, trimmed) {
+        Ok(()) => tracing::info!(
+            stream_id,
+            up_to,
+            dropped,
+            kept_bytes = remaining,
+            "wal DT_STREAM trimmed cold segments"
+        ),
+        Err(e) => tracing::debug!(
+            stream_id,
+            error = ?e,
+            "wal DT_STREAM trim not applied (racing trim / no leader)"
+        ),
     }
 }
 
@@ -547,7 +617,18 @@ impl StreamBackend for WalStreamCore {
     fn read_at(&self, offset: usize) -> Result<(Vec<u8>, usize), StreamError> {
         match WalStreamCore::read_at(self, offset as u64) {
             Ok(Some(data)) => Ok((data, offset + 1)),
-            Ok(None) => Err(StreamError::Empty),
+            // A miss is either "not written yet" (park a tail reader) or
+            // "retention-trimmed" (below `earliest`). Only a trimming cold tier
+            // can produce the latter, so consult `earliest` to distinguish and
+            // surface a clean Truncated (OffsetOutOfRange) instead of Empty.
+            Ok(None) => {
+                let earliest = self.earliest_offset();
+                if self.cold.is_some() && offset < earliest {
+                    Err(StreamError::Truncated(earliest, offset))
+                } else {
+                    Err(StreamError::Empty)
+                }
+            }
             Err(_) => Err(StreamError::ClosedEmpty),
         }
     }
@@ -576,6 +657,14 @@ impl StreamBackend for WalStreamCore {
 
     fn msg_count(&self) -> usize {
         WalStreamCore::tail(self) as usize
+    }
+
+    fn earliest_offset(&self) -> usize {
+        // Only a trimming cold tier has an earliest > 0; otherwise 0 (unchanged).
+        if self.cold.is_none() {
+            return 0;
+        }
+        self.store.stream_earliest(&self.prefix).unwrap_or(0) as usize
     }
 }
 
@@ -636,6 +725,7 @@ mod tests {
         entries: BTreeMap<String, Vec<u8>>,
         tails: BTreeMap<String, u64>,
         floors: BTreeMap<String, u64>,
+        earliests: BTreeMap<String, u64>,
         segments: BTreeMap<(String, u64), StreamSegment>,
     }
 
@@ -741,6 +831,45 @@ mod tests {
                 .find(|seg| seg.base <= seq && seq < seg.end)
                 .cloned())
         }
+        fn stream_earliest(&self, stream_prefix: &str) -> Result<u64, MetaStoreError> {
+            Ok(*self
+                .inner
+                .lock()
+                .unwrap()
+                .earliests
+                .get(stream_prefix)
+                .unwrap_or(&0))
+        }
+        fn list_stream_segments(
+            &self,
+            stream_prefix: &str,
+        ) -> Result<Vec<StreamSegment>, MetaStoreError> {
+            let i = self.inner.lock().unwrap();
+            Ok(i.segments
+                .iter()
+                .filter(|((p, _), _)| p == stream_prefix)
+                .map(|(_, seg)| seg.clone())
+                .collect())
+        }
+        fn trim_stream_segments(
+            &self,
+            stream_prefix: &str,
+            up_to_seq: u64,
+            _trimmed: Vec<(String, String)>,
+        ) -> Result<(), MetaStoreError> {
+            let mut i = self.inner.lock().unwrap();
+            let earliest = *i.earliests.get(stream_prefix).unwrap_or(&0);
+            let floor = *i.floors.get(stream_prefix).unwrap_or(&0);
+            if up_to_seq <= earliest || up_to_seq > floor {
+                return Err(MetaStoreError::IOError(format!(
+                    "stale/invalid trim up_to={up_to_seq} earliest={earliest} floor={floor}"
+                )));
+            }
+            i.segments
+                .retain(|(p, _), seg| p != stream_prefix || seg.end > up_to_seq);
+            i.earliests.insert(stream_prefix.to_string(), up_to_seq);
+            Ok(())
+        }
     }
 
     /// Content-addressed in-memory cold store: `write_segment` hashes the bytes
@@ -792,6 +921,10 @@ mod tests {
                 .get(content_id)
                 .cloned()
                 .ok_or_else(|| format!("mock cold: no blob {content_id}"))
+        }
+        fn delete_segment(&self, _stream_id: &str, content_id: &str) -> Result<(), String> {
+            self.blobs.lock().unwrap().remove(content_id);
+            Ok(())
         }
     }
 
@@ -965,6 +1098,7 @@ mod tests {
             "coldtest".into(),
             Arc::clone(&cold),
             policy,
+            0, // keep-forever (no trim)
         );
         let prefix = format!("{WAL_STREAM_KEY_PREFIX}coldtest/");
 
@@ -977,7 +1111,7 @@ mod tests {
         // Seal synchronously: drains [0,3) then [3,6); [6,10) stays hot
         // (10 - 6 = 4 < hot_window + seal_batch = 6).
         let kf = AtomicU64::new(0);
-        seal_loop(&store, cold.as_ref(), &prefix, "coldtest", policy, &kf);
+        seal_loop(&store, cold.as_ref(), &prefix, "coldtest", policy, &kf, 0);
         assert_eq!(store.stream_floor(&prefix).unwrap(), 6, "floor after seal");
         assert_eq!(kf.load(Ordering::Relaxed), 6);
 
@@ -1030,13 +1164,14 @@ mod tests {
             "corrupt".into(),
             Arc::clone(&cold),
             policy,
+            0, // keep-forever (no trim)
         );
         let prefix = format!("{WAL_STREAM_KEY_PREFIX}corrupt/");
         for i in 0..4u64 {
             c.write_sync(format!("v{i}").as_bytes()).unwrap();
         }
         let kf = AtomicU64::new(0);
-        seal_loop(&store, cold.as_ref(), &prefix, "corrupt", policy, &kf);
+        seal_loop(&store, cold.as_ref(), &prefix, "corrupt", policy, &kf, 0);
         assert!(store.stream_floor(&prefix).unwrap() >= 2);
         // Corrupt every stored blob.
         for v in cold_impl.blobs.lock().unwrap().values_mut() {
@@ -1063,6 +1198,7 @@ mod tests {
                 hot_window: 4,
                 seal_batch: 4,
             },
+            0, // keep-forever (no trim)
         ));
         let prefix = format!("{WAL_STREAM_KEY_PREFIX}trig/");
         for i in 0..20u64 {
@@ -1114,5 +1250,82 @@ mod tests {
                 .unwrap()
                 .is_some());
         }
+    }
+
+    /// Retention trim: once sealed cold storage exceeds the byte budget, the
+    /// oldest segments are dropped and `earliest` advances. A read below
+    /// `earliest` is `Truncated` (OffsetOutOfRange); reads at/above it still
+    /// resolve; `earliest_offset` and the kept cold-byte budget hold.
+    #[test]
+    fn trim_advances_earliest_and_reads_below_are_truncated() {
+        let store = store();
+        let cold: Arc<dyn ColdSegmentStore> = Arc::new(MockCold {
+            origin: Some("n".into()),
+            ..Default::default()
+        });
+        let policy = SealPolicy {
+            hot_window: 2,
+            seal_batch: 2,
+        };
+        let retention = 40u64; // ~one two-frame segment
+        let c = WalStreamCore::with_cold_tier(
+            Arc::clone(&store),
+            "trim".into(),
+            Arc::clone(&cold),
+            policy,
+            retention,
+        );
+        let prefix = format!("{WAL_STREAM_KEY_PREFIX}trim/");
+        for i in 0..10u64 {
+            c.write_sync(format!("v{i:03}").as_bytes()).unwrap();
+        }
+        // Seal (+trim) synchronously for determinism.
+        let kf = AtomicU64::new(0);
+        seal_loop(
+            &store,
+            cold.as_ref(),
+            &prefix,
+            "trim",
+            policy,
+            &kf,
+            retention,
+        );
+
+        let earliest = store.stream_earliest(&prefix).unwrap();
+        assert!(
+            earliest > 0,
+            "retention must have trimmed the oldest cold segments"
+        );
+        let tail = c.tail();
+
+        // Below earliest → Truncated at the backend (Kafka OffsetOutOfRange).
+        for seq in 0..earliest {
+            match StreamBackend::read_at(&c, seq as usize) {
+                Err(StreamError::Truncated(e, req)) => {
+                    assert_eq!(e, earliest as usize);
+                    assert_eq!(req, seq as usize);
+                }
+                other => panic!("seq {seq} below earliest must be Truncated, got {other:?}"),
+            }
+        }
+        // At/above earliest → still resolves (cold or hot), byte-exact next offset.
+        for seq in earliest..tail {
+            assert!(c.read_at(seq).unwrap().is_some(), "seq {seq} must resolve");
+            match StreamBackend::read_at(&c, seq as usize) {
+                Ok((_, next)) => assert_eq!(next, seq as usize + 1),
+                other => panic!("seq {seq} must read, got {other:?}"),
+            }
+        }
+        assert_eq!(c.earliest_offset(), earliest as usize);
+        let cold_bytes: u64 = store
+            .list_stream_segments(&prefix)
+            .unwrap()
+            .iter()
+            .map(|s| s.size)
+            .sum();
+        assert!(
+            cold_bytes <= retention,
+            "kept cold storage {cold_bytes} must fit retention {retention}"
+        );
     }
 }

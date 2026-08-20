@@ -327,11 +327,14 @@ impl StreamManager {
             .map_err(StreamManagerError::Backend)
     }
 
-    /// Collect all message payloads from offset 0, concatenated into one Vec.
+    /// Collect all message payloads from the earliest surviving offset,
+    /// concatenated into one Vec.
     ///
-    /// Walks the entire stream from the beginning, joining payload bytes
-    /// (without the per-frame length prefix). One kernel call replaces
-    /// a per-frame `read_at` loop.
+    /// Walks the whole readable stream, joining payload bytes (without the
+    /// per-frame length prefix). One kernel call replaces a per-frame `read_at`
+    /// loop. Starts at `earliest_offset()` (0 for every backend except a trimmed
+    /// WAL stream, whose earliest frames were dropped by retention) so a full
+    /// read never begins below the retention floor and never sees `Truncated`.
     ///
     /// Returns empty Vec if the stream has no data. Used by LLM
     /// backends for the `collect_all + CAS persist` pattern after the
@@ -342,7 +345,7 @@ impl StreamManager {
             .ok_or_else(|| StreamManagerError::NotFound(path.to_string()))?;
         let tail = buf.tail_offset();
         let mut out = Vec::with_capacity(tail);
-        let mut offset = 0usize;
+        let mut offset = buf.earliest_offset();
         loop {
             match buf.read_at(offset) {
                 Ok((data, next)) => {

@@ -232,6 +232,28 @@ pub enum Command {
         /// Segment blob size in bytes (observability + future trim accounting).
         size: u64,
     },
+
+    /// Trim a WAL DT_STREAM's cold tier: drop every sealed segment fully below
+    /// `up_to_seq` and advance the stream's `earliest` seq to it — Kafka log
+    /// retention. A read below `earliest` is `Truncated` (OffsetOutOfRange).
+    ///
+    /// Appended at the enum tail for the same bincode-index reason the other
+    /// variants document. Deterministic + redb-only at apply (index delete +
+    /// `earliest` bump in one txn) — the blob GC is a side effect the kernel's
+    /// trim-GC apply-observer performs on each blob's origin node, driven by the
+    /// `trimmed` list carried here (the index entries are gone by observer time,
+    /// so the refs must travel with the command). Gated `earliest < up_to <=
+    /// floor` so it only ever drops sealed data and only advances.
+    TrimStreamSegment {
+        /// Stream key PREFIX (`/__wal_stream__/<id>/`).
+        stream_prefix: String,
+        /// New `earliest` seq — one past the last trimmed seq. Every segment
+        /// whose `end <= up_to_seq` is dropped from the index.
+        up_to_seq: u64,
+        /// `(origin, content_id)` of each dropped segment's blob, so the trim-GC
+        /// observer on each node can delete the blobs it owns (`origin == self`).
+        trimmed: Vec<(String, String)>,
+    },
 }
 
 /// Result of applying a command.
@@ -650,6 +672,15 @@ fn stream_tail_key(stream_prefix: &str) -> String {
 /// key (`{stream_prefix}{seq}`) nor a segment key, so prefix scans skip it.
 fn stream_floor_key(stream_prefix: &str) -> String {
     format!("__stream_floor__{stream_prefix}")
+}
+
+/// Reserved key holding a stream's `earliest` readable seq — the retention floor
+/// advanced by `TrimStreamSegment`. `0` (absent) until the first trim. A read
+/// below it is `Truncated` (Kafka OffsetOutOfRange). Same tree / snapshot
+/// treatment and non-overlapping `__stream_earliest__` namespace as the tail /
+/// floor sidecars.
+fn stream_earliest_key(stream_prefix: &str) -> String {
+    format!("__stream_earliest__{stream_prefix}")
 }
 
 /// Key prefix under which a stream's cold-segment index records live, one per
@@ -1455,6 +1486,60 @@ impl FullStateMachine {
         }
     }
 
+    /// Current `earliest` readable seq (retention floor) — `0` until the first
+    /// trim. A read below it is truncated (dropped by retention).
+    pub fn stream_earliest(&self, stream_prefix: &str) -> Result<u64> {
+        let key = stream_earliest_key(stream_prefix);
+        Ok(self
+            .stream_entries
+            .get(key.as_bytes())?
+            .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
+            .map(u64::from_be_bytes)
+            .unwrap_or(0))
+    }
+
+    /// Every cold segment of a stream, as `(base, record)` ordered by base — the
+    /// trimmer's view for summing cold bytes, choosing a trim boundary, and
+    /// collecting the dropped blobs' refs. Segments are bounded metadata, so a
+    /// forward range scan over this stream's `__stream_seg__` keyspace is cheap.
+    pub fn list_segments(&self, stream_prefix: &str) -> Result<Vec<(u64, SegmentRecord)>> {
+        let seg_prefix = stream_segment_key_prefix(stream_prefix);
+        let mut upper = seg_prefix.clone().into_bytes();
+        // Exclusive-ish upper bound covering all `{seg_prefix}{base:020}` keys.
+        upper.push(0xff);
+
+        let db = self.stream_entries.raw_db();
+        let read_txn = db
+            .begin_read()
+            .map_err(|e| super::RaftError::Storage(format!("list_segments begin_read: {e}")))?;
+        let table_def = redb::TableDefinition::<&[u8], &[u8]>::new(self.stream_entries.name());
+        let table = match read_txn.open_table(table_def) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(super::RaftError::Storage(format!(
+                    "list_segments open_table: {e}"
+                )))
+            }
+        };
+        let range = table
+            .range(seg_prefix.as_bytes()..=upper.as_slice())
+            .map_err(|e| super::RaftError::Storage(format!("list_segments range: {e}")))?;
+        let mut out = Vec::new();
+        for entry in range {
+            let (k, v) =
+                entry.map_err(|e| super::RaftError::Storage(format!("list_segments iter: {e}")))?;
+            let base = std::str::from_utf8(k.value())
+                .ok()
+                .and_then(|ks| ks.strip_prefix(seg_prefix.as_str()))
+                .and_then(|b| b.parse::<u64>().ok());
+            if let (Some(base), Some(rec)) = (base, decode_segment_record(v.value())) {
+                out.push((base, rec));
+            }
+        }
+        Ok(out)
+    }
+
     /// Look up a cluster-control value by ``(namespace, key)``.
     ///
     /// Returns the opaque bytes stored by ``Command::PutControlState``
@@ -1581,6 +1666,11 @@ impl FullStateMachine {
             Command::SealStreamSegment { .. } => Err(super::RaftError::InvalidState(
                 "SealStreamSegment must apply via execute_metadata_in_txn (index write + hot-row \
                  delete + floor advance are one atomic txn); the non-txn path must never receive it"
+                    .into(),
+            )),
+            Command::TrimStreamSegment { .. } => Err(super::RaftError::InvalidState(
+                "TrimStreamSegment must apply via execute_metadata_in_txn (index delete + earliest \
+                 advance are one atomic txn); the non-txn path must never receive it"
                     .into(),
             )),
             Command::PutControlState {
@@ -1794,6 +1884,77 @@ impl FullStateMachine {
                 table
                     .insert(floor_key.as_bytes(), end.to_be_bytes().as_slice())
                     .map_err(|e| super::RaftError::Storage(format!("advance stream floor: {e}")))?;
+
+                Ok(CommandResult::Success)
+            }
+
+            Command::TrimStreamSegment {
+                stream_prefix,
+                up_to_seq,
+                ..
+            } => {
+                // Deterministic, redb-only retention trim: drop the cold segment
+                // index entries fully below up_to_seq and advance `earliest`. The
+                // blob bytes are GC'd off-band by the kernel trim-GC observer
+                // (driven by the command's `trimmed` list); apply stays pure redb.
+                let stream_def =
+                    redb::TableDefinition::<&[u8], &[u8]>::new(self.stream_entries.name());
+                let mut table = txn
+                    .open_table(stream_def)
+                    .map_err(|e| super::RaftError::Storage(format!("open stream_entries: {e}")))?;
+
+                let earliest_key = stream_earliest_key(stream_prefix);
+                let earliest = table
+                    .get(earliest_key.as_bytes())
+                    .map_err(|e| super::RaftError::Storage(format!("get stream earliest: {e}")))?
+                    .and_then(|v| <[u8; 8]>::try_from(v.value()).ok())
+                    .map(u64::from_be_bytes)
+                    .unwrap_or(0);
+                let floor = table
+                    .get(stream_floor_key(stream_prefix).as_bytes())
+                    .map_err(|e| super::RaftError::Storage(format!("get stream floor: {e}")))?
+                    .and_then(|v| <[u8; 8]>::try_from(v.value()).ok())
+                    .map(u64::from_be_bytes)
+                    .unwrap_or(0);
+                // Gate: only advance, and only over sealed (cold) seqs — never
+                // trim the hot tail. A stale / over-reaching trim is a no-op error.
+                if *up_to_seq <= earliest || *up_to_seq > floor {
+                    return Ok(CommandResult::Error(format!(
+                        "stale/invalid trim {stream_prefix} up_to={up_to_seq} \
+                         (earliest={earliest}, floor={floor})"
+                    )));
+                }
+
+                // Collect the segment keys fully below up_to_seq (end <= up_to).
+                // Collect first (owned) so the range borrow ends before we remove.
+                let seg_prefix = stream_segment_key_prefix(stream_prefix);
+                let mut upper = seg_prefix.clone().into_bytes();
+                upper.push(0xff);
+                let mut to_delete: Vec<Vec<u8>> = Vec::new();
+                {
+                    let range = table
+                        .range(seg_prefix.as_bytes()..=upper.as_slice())
+                        .map_err(|e| super::RaftError::Storage(format!("trim range: {e}")))?;
+                    for entry in range {
+                        let (k, v) = entry
+                            .map_err(|e| super::RaftError::Storage(format!("trim iter: {e}")))?;
+                        if let Some(rec) = decode_segment_record(v.value()) {
+                            if rec.end <= *up_to_seq {
+                                to_delete.push(k.value().to_vec());
+                            }
+                        }
+                    }
+                }
+                for k in &to_delete {
+                    table.remove(k.as_slice()).map_err(|e| {
+                        super::RaftError::Storage(format!("trim remove segment: {e}"))
+                    })?;
+                }
+                table
+                    .insert(earliest_key.as_bytes(), up_to_seq.to_be_bytes().as_slice())
+                    .map_err(|e| {
+                        super::RaftError::Storage(format!("advance stream earliest: {e}"))
+                    })?;
 
                 Ok(CommandResult::Success)
             }
@@ -4463,6 +4624,95 @@ mod tests {
                 .unwrap()
                 .is_some());
         }
+    }
+
+    /// Trim drops the cold segments fully below `up_to`, advances `earliest`, and
+    /// gates against stale / over-reaching (into the hot tail) requests. The
+    /// remaining segments still resolve; the trimmed seqs no longer do.
+    #[test]
+    fn trim_drops_cold_segments_and_advances_earliest() {
+        let store = RedbStore::open_temporary().unwrap();
+        let mut sm = FullStateMachine::new(&store).unwrap();
+        let prefix = "/__wal_stream__/trim/";
+        for i in 0..12u64 {
+            sm.apply(
+                i + 1,
+                &Command::AppendStreamEntry {
+                    stream_prefix: prefix.into(),
+                    data: format!("m{i}").into_bytes(),
+                },
+            )
+            .unwrap();
+        }
+        for (idx, (base, end, cid)) in [(0u64, 4u64, "c0"), (4, 8, "c1")].iter().enumerate() {
+            sm.apply(
+                13 + idx as u64,
+                &Command::SealStreamSegment {
+                    stream_prefix: prefix.into(),
+                    base: *base,
+                    end: *end,
+                    content_id: (*cid).into(),
+                    origin: "a".into(),
+                    size: 10,
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(sm.list_segments(prefix).unwrap().len(), 2);
+        assert_eq!(sm.stream_earliest(prefix).unwrap(), 0);
+
+        // Trim up_to=4 → drops segment [0,4), earliest=4.
+        let r = sm
+            .apply(
+                15,
+                &Command::TrimStreamSegment {
+                    stream_prefix: prefix.into(),
+                    up_to_seq: 4,
+                    trimmed: vec![("a".into(), "c0".into())],
+                },
+            )
+            .unwrap();
+        assert!(matches!(r, CommandResult::Success));
+        assert_eq!(sm.stream_earliest(prefix).unwrap(), 4);
+        let segs = sm.list_segments(prefix).unwrap();
+        assert_eq!(segs.len(), 1, "only the [4,8) segment remains");
+        assert_eq!(segs[0].0, 4);
+        assert!(
+            sm.find_segment(prefix, 0).unwrap().is_none(),
+            "trimmed seq gone"
+        );
+        assert!(
+            sm.find_segment(prefix, 5).unwrap().is_some(),
+            "kept seq resolves"
+        );
+
+        // Gate: stale (up_to <= earliest) and over-reach (up_to > floor=8) are
+        // no-op errors; earliest is unchanged.
+        assert!(matches!(
+            sm.apply(
+                16,
+                &Command::TrimStreamSegment {
+                    stream_prefix: prefix.into(),
+                    up_to_seq: 4,
+                    trimmed: vec![],
+                },
+            )
+            .unwrap(),
+            CommandResult::Error(_)
+        ));
+        assert!(matches!(
+            sm.apply(
+                17,
+                &Command::TrimStreamSegment {
+                    stream_prefix: prefix.into(),
+                    up_to_seq: 99,
+                    trimmed: vec![],
+                },
+            )
+            .unwrap(),
+            CommandResult::Error(_)
+        ));
+        assert_eq!(sm.stream_earliest(prefix).unwrap(), 4);
     }
 
     /// Build a `PutControlState` for the `auth` namespace (an upsert), the shape
