@@ -153,6 +153,13 @@ pub mod foreign_ca_store;
 #[cfg(all(feature = "grpc", has_protos))]
 pub mod stream_wakeup;
 
+// DT_STREAM retention GC: the apply-side observer that reclaims a trimmed
+// stream's cold-segment blobs (P3). Fires only on `TrimStreamSegment` (rare)
+// and offloads the local blob delete off the apply thread — distinct in both
+// concern and cadence from the per-append `stream_wakeup` notify.
+#[cfg(all(feature = "grpc", has_protos))]
+pub mod stream_retention_gc;
+
 /// Sync-façade → async-core bridge shared by every raft-backed store
 /// that exposes a synchronous API over the async consensus core.
 #[cfg(all(feature = "grpc", has_protos))]

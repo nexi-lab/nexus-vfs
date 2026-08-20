@@ -162,6 +162,23 @@ impl Kernel {
             let _ = backend.delete_file(content_id);
         }
     }
+
+    /// Retention GC for a trimmed range: delete the LOCAL cold-segment blobs
+    /// this node sealed (`origin == self`). The trim-GC apply-observer calls
+    /// this on EVERY node for the same `TrimStreamSegment` command; each
+    /// reclaims only its own-origin blobs, so a multi-origin stream is cleaned
+    /// exactly once per blob with no cross-node delete race. A seal records
+    /// `origin = self_origin().unwrap_or_default()` (the seal path above), so an
+    /// un-federated single node (empty `self_address`) matches the empty origin
+    /// it stamped and still reclaims its own blobs.
+    pub fn gc_trimmed_cold_segments(&self, stream_path: &str, trimmed: &[(String, String)]) {
+        let me = self.self_address.read().clone().unwrap_or_default();
+        for (origin, content_id) in trimmed {
+            if origin.as_str() == me.as_str() {
+                self.delete_cold_segment(stream_path, content_id);
+            }
+        }
+    }
 }
 
 /// `ColdSegmentStore` bridge: a `Weak<Kernel>` so an in-flight seal thread that
