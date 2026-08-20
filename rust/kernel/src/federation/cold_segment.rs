@@ -151,16 +151,19 @@ impl Kernel {
         ))
     }
 
-    /// Delete the LOCAL blob for a trimmed segment (retention GC). Best-effort:
-    /// a path-addressed backend (federation cache) deletes by the path
-    /// `content_id`; a content-addressed one by hash. The wrong call returns
-    /// NotSupported/NotFound and is ignored — a miss means the blob is already
-    /// gone or was never local (only own-origin blobs are deleted by the caller).
-    pub(crate) fn delete_cold_segment(&self, stream_path: &str, content_id: &str) {
-        if let Some(backend) = self.stream_content_backend(stream_path) {
-            let _ = backend.delete_content(content_id);
-            let _ = backend.delete_file(content_id);
-        }
+    /// Delete the LOCAL blob for a trimmed segment (retention GC). A path-
+    /// addressed backend (federation cache) deletes by the path `content_id`; a
+    /// content-addressed one by hash — the other call returns NotSupported and is
+    /// ignored. Returns `true` if a backend accepted the delete; `false` when
+    /// neither did (no local backend, or the blob was already gone — the caller
+    /// logs that, so a genuine reclaim failure is not silent).
+    pub(crate) fn delete_cold_segment(&self, stream_path: &str, content_id: &str) -> bool {
+        let Some(backend) = self.stream_content_backend(stream_path) else {
+            return false;
+        };
+        // Either arm succeeding is a reclaim; NotSupported from the wrong arm for
+        // this backend kind is expected and not a failure.
+        backend.delete_content(content_id).is_ok() | backend.delete_file(content_id).is_ok()
     }
 
     /// Retention GC for a trimmed range: delete the LOCAL cold-segment blobs
@@ -171,12 +174,39 @@ impl Kernel {
     /// `origin = self_origin().unwrap_or_default()` (the seal path above), so an
     /// un-federated single node (empty `self_address`) matches the empty origin
     /// it stamped and still reclaims its own blobs.
+    ///
+    /// Logs the reclaim outcome: without it a no-op GC (or a backend that
+    /// silently refuses deletes) would leave the retention budget unbounded on
+    /// disk with no signal — the log is the operator-visible proof the cold tier
+    /// is actually reclaimed, and the hook the live e2e gates on.
     pub fn gc_trimmed_cold_segments(&self, stream_path: &str, trimmed: &[(String, String)]) {
         let me = self.self_address.read().clone().unwrap_or_default();
+        let mut owned = 0usize;
+        let mut reclaimed = 0usize;
         for (origin, content_id) in trimmed {
             if origin.as_str() == me.as_str() {
-                self.delete_cold_segment(stream_path, content_id);
+                owned += 1;
+                if self.delete_cold_segment(stream_path, content_id) {
+                    reclaimed += 1;
+                }
             }
+        }
+        if owned == 0 {
+            return; // none of the trimmed blobs are this node's to reclaim
+        }
+        if reclaimed == owned {
+            tracing::info!(
+                stream_id = %stream_path,
+                reclaimed,
+                "wal DT_STREAM trim-GC reclaimed cold segment blobs"
+            );
+        } else {
+            tracing::warn!(
+                stream_id = %stream_path,
+                reclaimed,
+                owned,
+                "wal DT_STREAM trim-GC: some own-origin cold blobs not reclaimed (already gone / delete refused)"
+            );
         }
     }
 }
@@ -207,12 +237,5 @@ impl ColdSegmentStore for KernelColdSegmentStore {
     ) -> Result<Vec<u8>, String> {
         let k = self.kernel.upgrade().ok_or("kernel dropped")?;
         k.read_cold_segment(stream_id, content_id, origin)
-    }
-
-    fn delete_segment(&self, stream_id: &str, content_id: &str) -> Result<(), String> {
-        if let Some(k) = self.kernel.upgrade() {
-            k.delete_cold_segment(stream_id, content_id);
-        }
-        Ok(())
     }
 }
