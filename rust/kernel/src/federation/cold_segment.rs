@@ -150,6 +150,18 @@ impl Kernel {
             "cold segment {content_id} unavailable (local miss; origin {origin:?})"
         ))
     }
+
+    /// Delete the LOCAL blob for a trimmed segment (retention GC). Best-effort:
+    /// a path-addressed backend (federation cache) deletes by the path
+    /// `content_id`; a content-addressed one by hash. The wrong call returns
+    /// NotSupported/NotFound and is ignored — a miss means the blob is already
+    /// gone or was never local (only own-origin blobs are deleted by the caller).
+    pub(crate) fn delete_cold_segment(&self, stream_path: &str, content_id: &str) {
+        if let Some(backend) = self.stream_content_backend(stream_path) {
+            let _ = backend.delete_content(content_id);
+            let _ = backend.delete_file(content_id);
+        }
+    }
 }
 
 /// `ColdSegmentStore` bridge: a `Weak<Kernel>` so an in-flight seal thread that
@@ -178,5 +190,12 @@ impl ColdSegmentStore for KernelColdSegmentStore {
     ) -> Result<Vec<u8>, String> {
         let k = self.kernel.upgrade().ok_or("kernel dropped")?;
         k.read_cold_segment(stream_id, content_id, origin)
+    }
+
+    fn delete_segment(&self, stream_id: &str, content_id: &str) -> Result<(), String> {
+        if let Some(k) = self.kernel.upgrade() {
+            k.delete_cold_segment(stream_id, content_id);
+        }
+        Ok(())
     }
 }

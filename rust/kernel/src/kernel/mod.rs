@@ -124,6 +124,10 @@ pub enum KernelError {
     StreamClosed(String),
     StreamExists(String),
     StreamNotFound(String),
+    /// Read below the retention floor: the offset was trimmed. `(earliest,
+    /// requested)` — Kafka OffsetOutOfRange. The reader should reset to
+    /// `earliest`. Distinct from `StreamEmpty` (offset not yet written).
+    StreamTruncated(usize, usize),
     WouldBlock(String),
     PermissionDenied(String),
     /// Backend operation failed (``Backend.write_content`` / ``read_content``
@@ -1978,8 +1982,8 @@ impl Kernel {
     /// Returns `Ok(true)` when installed, `Ok(false)` when no zone metastore is
     /// available (federation not wired) so the caller falls through the
     /// io_profile waterfall; a register failure propagates as `Err`.
-    fn install_wal_stream(&self, path: &str) -> Result<bool, KernelError> {
-        match self.wal_backend_for(path) {
+    fn install_wal_stream(&self, path: &str, retention: u64) -> Result<bool, KernelError> {
+        match self.wal_backend_for(path, retention) {
             Some(backend) => {
                 self.stream_manager
                     .register(path, backend)
@@ -2016,7 +2020,15 @@ impl Kernel {
             .unwrap_or_else(|| contracts::ROOT_ZONE_ID.to_string())
     }
 
-    fn wal_backend_for(&self, path: &str) -> Option<Arc<dyn crate::stream::StreamBackend>> {
+    /// `retention` is the stream's cold-storage byte budget (its inode
+    /// capacity): `0` = keep-forever (audit/transcript), `>0` = trim (Kafka
+    /// retention). Threaded from the creator's capacity (the inode is not yet
+    /// written at create time) and from `meta.size` on the miss-materializer.
+    fn wal_backend_for(
+        &self,
+        path: &str,
+        retention: u64,
+    ) -> Option<Arc<dyn crate::stream::StreamBackend>> {
         let zone_id = self.routed_zone_id(path);
         let store = self
             .distributed_coordinator()
@@ -2031,6 +2043,7 @@ impl Kernel {
                 path.to_string(),
                 cold,
                 self.seal_policy(),
+                retention,
             ),
             None => crate::core::stream::wal::WalStreamCore::new(store, path.to_string()),
         };
@@ -2065,7 +2078,10 @@ impl Kernel {
             .set_materializer(Box::new(move |path: &str| {
                 let kernel = weak.upgrade()?;
                 match kernel.metastore_get(path).ok().flatten() {
-                    Some(meta) if meta.entry_type == DT_STREAM => kernel.wal_backend_for(path),
+                    // `meta.size` is the stream's inode capacity == retention.
+                    Some(meta) if meta.entry_type == DT_STREAM => {
+                        kernel.wal_backend_for(path, meta.size)
+                    }
                     _ => None,
                 }
             }));
@@ -2100,8 +2116,9 @@ impl Kernel {
                     // Raft-replicated durable DT_STREAM (strong consistency).
                     // Available iff the coordinator can hand us a zone metastore
                     // (federation wired); if not, fall through to the next
-                    // backend in the waterfall.
-                    if self.install_wal_stream(path)? {
+                    // backend in the waterfall. `capacity` is the stream's
+                    // cold-storage retention budget (0 = keep-forever).
+                    if self.install_wal_stream(path, capacity as u64)? {
                         return Ok((None, None));
                     }
                 }
@@ -2766,6 +2783,9 @@ fn stream_mgr_err(e: crate::stream_manager::StreamManagerError) -> KernelError {
                 StreamError::Closed(msg) => KernelError::StreamClosed(msg.to_string()),
                 StreamError::Oversized(s, c) => {
                     KernelError::StreamFull(format!("msg {s} > capacity {c}"))
+                }
+                StreamError::Truncated(earliest, req) => {
+                    KernelError::StreamTruncated(earliest, req)
                 }
                 other => KernelError::IOError(format!("stream: {other:?}")),
             }

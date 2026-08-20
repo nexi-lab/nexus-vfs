@@ -12,6 +12,10 @@ pub enum StreamError {
     ClosedEmpty,
     Oversized(usize, usize),
     InvalidOffset(usize, usize),
+    /// Read below the retention floor: the requested offset was dropped by
+    /// trimming. `(earliest, requested)` — Kafka OffsetOutOfRange. The reader
+    /// should reset to `earliest`.
+    Truncated(usize, usize),
 }
 
 /// Uniform interface for stream backends (memory, shared memory, future gRPC).
@@ -27,4 +31,12 @@ pub trait StreamBackend: Send + Sync {
     fn is_closed(&self) -> bool;
     fn tail_offset(&self) -> usize;
     fn msg_count(&self) -> usize;
+
+    /// Lowest offset still readable — the retention floor. `0` for backends
+    /// without retention (the default). A full scan (`collect_all`) starts here
+    /// so a trimmed stream is read from its earliest surviving frame rather than
+    /// from a dropped offset. Only the WAL backend with a cold tier overrides it.
+    fn earliest_offset(&self) -> usize {
+        0
+    }
 }
