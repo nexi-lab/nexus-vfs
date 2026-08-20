@@ -81,11 +81,6 @@ pub trait ColdSegmentStore: Send + Sync {
         content_id: &str,
         origin: &str,
     ) -> Result<Vec<u8>, String>;
-
-    /// Delete the LOCAL blob for a trimmed segment (retention GC). Called only
-    /// for blobs this node owns (`origin == self`); best-effort — a miss is not
-    /// an error (already gone / never local).
-    fn delete_segment(&self, stream_id: &str, content_id: &str) -> Result<(), String>;
 }
 
 /// When to roll the hot tail into a cold segment. Mirrors Kafka's active-segment
@@ -921,10 +916,6 @@ mod tests {
                 .get(content_id)
                 .cloned()
                 .ok_or_else(|| format!("mock cold: no blob {content_id}"))
-        }
-        fn delete_segment(&self, _stream_id: &str, content_id: &str) -> Result<(), String> {
-            self.blobs.lock().unwrap().remove(content_id);
-            Ok(())
         }
     }
 
