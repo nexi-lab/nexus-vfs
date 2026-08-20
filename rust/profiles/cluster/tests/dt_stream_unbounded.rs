@@ -29,6 +29,10 @@ const MOUNT: &str = "/agents";
 const BUDGET: Duration = Duration::from_secs(90);
 const SEAL_LOG: &str = "wal DT_STREAM sealed cold segment";
 const TRIM_LOG: &str = "wal DT_STREAM trimmed cold segments";
+/// The trim-GC observer's reclaim line — proof the trimmed segment BLOBS were
+/// physically deleted (not just dropped from the index), on the node that owns
+/// them. Distinct from `TRIM_LOG` (the index-side trim).
+const TRIM_GC_LOG: &str = "wal DT_STREAM trim-GC reclaimed cold segment blobs";
 const COMPACT_LOG: &str = "raft SC log snapshot+compact";
 const SNAPSHOT_INSTALL_LOG: &str = "Applying snapshot from leader";
 
@@ -448,7 +452,43 @@ async fn retention_trims_old_segments_and_reads_below_earliest_are_truncated() {
     let want_suffix: Vec<u8> = (earliest as usize..N_FRAMES).flat_map(frame).collect();
     await_collect(&mut fc, &log, &want_suffix).await;
 
+    // PHYSICAL reclaim (the actual point of retention): the trim-GC observer must
+    // delete the trimmed segments' BLOBS, not only drop their index entries —
+    // otherwise storage grows unbounded on disk while the logical floor advances.
+    // Gate on the reclaim log, then assert the on-disk cold blobs are bounded to
+    // ~the budget, far fewer than the ~N/seal_batch segments sealed. (A no-op GC
+    // would pass every assertion above; only this catches it.)
+    founder
+        .wait_for_log(TRIM_GC_LOG, BUDGET)
+        .await
+        .expect("trim-GC physically reclaims the trimmed cold blobs");
+    let seg_blobs = count_seg_blobs(tmp.path());
+    assert!(
+        (1..=2).contains(&seg_blobs),
+        "cold segment blobs on disk must be bounded by retention after trim-GC \
+         (kept ~1 segment, dropped the rest), found {seg_blobs}"
+    );
+
     drop(founder);
+}
+
+/// Count sealed cold-segment blobs on disk: files under a `__seg__` directory
+/// (the `{stream}/__seg__/{base}` seal layout, the SSOT in `cold_segment.rs`).
+/// The physical-storage proof for retention — a trimmed segment's blob is gone
+/// from here once the trim-GC observer reclaims it.
+fn count_seg_blobs(dir: &std::path::Path) -> usize {
+    let mut n = 0;
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                n += count_seg_blobs(&p);
+            } else if p.to_string_lossy().contains("__seg__") {
+                n += 1;
+            }
+        }
+    }
+    n
 }
 
 /// P3 cross-node: the retention floor is REPLICATED. The founder trims a bounded
