@@ -52,6 +52,7 @@ use std::time::{Duration, Instant};
 
 use raft::eraftpb::{
     ConfChange, ConfChangeType, ConfChangeV2, ConfState, Entry, EntryType, HardState, Message,
+    Snapshot,
 };
 use raft::{Config, RawNode, Storage};
 use slog::{o, Logger};
@@ -67,6 +68,13 @@ use super::{Command, CommandResult, RaftError, Result};
 /// overload or network partitions, preventing unbounded memory growth.
 /// 256 aligns with tokio's internal 32-message block allocation.
 const DRIVER_CHANNEL_CAPACITY: usize = 256;
+
+/// Default SC raft-log compaction trigger (entries of `applied - first_index`).
+/// High on purpose: only high-append zones (streams) accumulate this many
+/// uncompacted entries between snapshots, so low-churn metadata/lock/control
+/// zones effectively never compact and keep their exact pre-P2 behaviour.
+/// Overridable via `NEXUS_SC_SNAPSHOT_THRESHOLD` (`0` disables compaction).
+const DEFAULT_SC_SNAPSHOT_THRESHOLD: u64 = 8192;
 
 /// Convert a bounded channel `TrySendError` to a `RaftError`.
 fn channel_try_send_err<T>(e: mpsc::error::TrySendError<T>) -> RaftError {
@@ -542,6 +550,23 @@ pub struct ZoneConsensusDriver<S: StateMachine + 'static> {
     /// EC replication WAL (shared with handle via Arc).
     /// Used by the transport loop for EC background replication.
     replication_log: Option<Arc<ReplicationLog>>,
+    /// SC raft-log compaction trigger: once `applied - first_index` exceeds this
+    /// many entries, the ready loop snapshots the (bounded, post-P1) state
+    /// machine at the applied index and compacts the log up to it — bounding the
+    /// log + join transfer. `0` disables it (unbounded log, the pre-P2
+    /// behaviour). High default so only high-append zones (streams) ever cross
+    /// it; low-churn metadata/lock zones never compact. From
+    /// `NEXUS_SC_SNAPSHOT_THRESHOLD`.
+    snapshot_threshold: u64,
+    /// Set when a `ConfChange` applies, cleared when a snapshot is created.
+    /// Forces a snapshot refresh (independent of the size threshold) on the next
+    /// ready after a membership change, so a freshly-joined member always
+    /// receives a snapshot whose `conf_state` INCLUDES it. raft-rs
+    /// (`Raft::restore`) discards a snapshot that omits the recipient — a stale
+    /// snapshot from before the join would be ignored and strand the joiner in
+    /// `Snapshot` state forever. The stored snapshot's membership must never lag
+    /// the log's.
+    membership_changed_since_snapshot: bool,
 }
 
 /// Callback fired after every successful ConfState apply.  Installed
@@ -849,6 +874,11 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             dial_uses_tls: false,
             conf_state_applied_cb: None,
             replication_log: handle.replication_log.clone(),
+            snapshot_threshold: std::env::var("NEXUS_SC_SNAPSHOT_THRESHOLD")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(DEFAULT_SC_SNAPSHOT_THRESHOLD),
+            membership_changed_since_snapshot: false,
         };
 
         Ok((handle, driver))
@@ -1867,6 +1897,20 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         // Update cached status for handle reads
         self.update_cached_status();
 
+        // P2: bound the SC raft log — snapshot the applied state + compact the
+        // log up to it. Only when this ready advanced apply cleanly (a failed
+        // apply leaves the applied index / SM in an uncertain cut). Non-fatal:
+        // a failure leaves the log uncompacted and the next ready retries, so it
+        // never wedges the ready lifecycle.
+        if apply_err.is_none() {
+            if let Err(e) = self.maybe_snapshot_and_compact().await {
+                tracing::warn!(
+                    error = %e,
+                    "raft SC snapshot+compact failed; log stays, retried next ready"
+                );
+            }
+        }
+
         // Surface any apply error now that the ready lifecycle is closed.
         if let Some(e) = apply_err {
             return Err(e);
@@ -1893,6 +1937,96 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         }
 
         Ok(messages)
+    }
+
+    /// P2: bound the SC raft LOG. Once the log has grown a full threshold of
+    /// entries past the last compaction, snapshot the (bounded, post-P1) state
+    /// machine at the applied index and compact the log up to it. A lagging or
+    /// joining follower then catches up via an InstallSnapshot of the small
+    /// snapshot (hot tail + segment index, not every historical entry) and
+    /// cold-reads spilled data from CAS.
+    ///
+    /// Consistent cut: runs on the single ready-loop thread right after
+    /// `advance_apply`, so the applied index, the SM state, and the conf_state
+    /// all reflect exactly the same point. Non-fatal on failure — the log simply
+    /// stays uncompacted and the next ready retries.
+    async fn maybe_snapshot_and_compact(&mut self) -> Result<()> {
+        let threshold = self.snapshot_threshold;
+        if threshold == 0 {
+            return Ok(()); // compaction disabled
+        }
+        let first = self
+            .raw_node
+            .store()
+            .first_index_impl()
+            .map_err(|e| RaftError::Storage(format!("first_index: {e}")))?;
+
+        // Read the applied index AND snapshot the state machine under ONE read
+        // lock — a consistent cut. `applied` == the SM's last_applied because
+        // apply runs only on this ready-loop thread and no apply happens between
+        // here and the snapshot; the snapshot's data therefore matches its index
+        // exactly (no data/index skew to reason about).
+        // Refresh either when the log grew past the threshold OR when membership
+        // changed since the last snapshot AND the log is already compacted — a
+        // just-joined member needs a snapshot whose conf_state includes it, and
+        // the compacted log means it can't replay from the front.
+        let membership_refresh = self.membership_changed_since_snapshot && first > 1;
+        let (applied, data) = {
+            let sm = self.state_machine.read().await;
+            let applied = sm.last_applied_index();
+            if applied <= first || (applied - first < threshold && !membership_refresh) {
+                return Ok(());
+            }
+            let data = sm
+                .snapshot()
+                .map_err(|e| RaftError::Storage(format!("sm snapshot: {e}")))?;
+            (applied, data)
+        };
+
+        // Term of the applied index — still answerable (the entry is in the log:
+        // first <= applied, nothing has compacted it). If not, skip rather than
+        // stamp a snapshot with a wrong term.
+        let term = match self.raw_node.store().term(applied) {
+            Ok(t) => t,
+            Err(_) => return Ok(()),
+        };
+        let conf_state = self
+            .raw_node
+            .store()
+            .conf_state()
+            .map_err(|e| RaftError::Storage(format!("conf_state: {e}")))?;
+
+        let mut snapshot = Snapshot::default();
+        {
+            let meta = snapshot.mut_metadata();
+            meta.index = applied;
+            meta.term = term;
+            *meta.mut_conf_state() = conf_state;
+        }
+        snapshot.data = data.into();
+
+        // Persist the snapshot (advances HardState.commit/term to cover it) THEN
+        // compact up to it. store-before-compact so `term(applied)` keeps
+        // resolving via the snapshot once `first_index` passes it — the raft-rs
+        // `term(first_index - 1)` invariant that keeps the leader appendable.
+        self.raw_node
+            .mut_store()
+            .store_snapshot(&snapshot)
+            .map_err(|e| RaftError::Storage(format!("store_snapshot: {e}")))?;
+        self.raw_node
+            .mut_store()
+            .compact(applied + 1)
+            .map_err(|e| RaftError::Storage(format!("compact: {e}")))?;
+        // The fresh snapshot now reflects the current membership.
+        self.membership_changed_since_snapshot = false;
+
+        tracing::info!(
+            index = applied,
+            first_before = first,
+            entries_compacted = applied + 1 - first,
+            "raft SC log snapshot+compact"
+        );
+        Ok(())
     }
 
     /// Apply committed entries to the state machine.
@@ -1961,6 +2095,10 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                         .mut_store()
                         .set_conf_state(&cs)
                         .map_err(|e| RaftError::Storage(e.to_string()))?;
+                    // Membership changed → the stored snapshot must be refreshed
+                    // to include the new/removed member before it is used to
+                    // catch anyone up (see the field docstring).
+                    self.membership_changed_since_snapshot = true;
 
                     // Update peer map from ConfChange context (etcd pattern)
                     #[cfg(all(feature = "grpc", has_protos))]
@@ -2034,6 +2172,8 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                         .mut_store()
                         .set_conf_state(&cs)
                         .map_err(|e| RaftError::Storage(e.to_string()))?;
+                    // Membership changed → refresh the stored snapshot (see V1 arm).
+                    self.membership_changed_since_snapshot = true;
 
                     #[cfg(all(feature = "grpc", has_protos))]
                     if let Some(ref peer_map) = self.peer_map {

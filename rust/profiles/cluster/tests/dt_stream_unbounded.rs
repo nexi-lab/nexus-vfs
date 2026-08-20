@@ -28,6 +28,8 @@ const ZONE: &str = "sharedzone";
 const MOUNT: &str = "/agents";
 const BUDGET: Duration = Duration::from_secs(90);
 const SEAL_LOG: &str = "wal DT_STREAM sealed cold segment";
+const COMPACT_LOG: &str = "raft SC log snapshot+compact";
+const SNAPSHOT_INSTALL_LOG: &str = "Applying snapshot from leader";
 
 /// 40 fixed-width 6-byte frames (`f00000`..`f00039`). Fixed width makes the
 /// `stream_collect_all` concatenation (no separators) a deterministic expected
@@ -39,15 +41,23 @@ fn frame(i: usize) -> Vec<u8> {
 }
 
 fn expected_log() -> Vec<u8> {
-    (0..N_FRAMES).flat_map(frame).collect()
+    expected_upto(N_FRAMES)
 }
 
-/// Env shrinking the seal thresholds so the test forces real seals: keep 8 seqs
-/// hot, roll 8 at a time (threshold 16). Keep-forever retention (no trim).
+/// The concatenation of frames `0..n` — the deterministic `collect_all` result.
+fn expected_upto(n: usize) -> Vec<u8> {
+    (0..n).flat_map(frame).collect()
+}
+
+/// Env shrinking the seal + raft-compaction thresholds so a modest write count
+/// forces real seals (keep 8 seqs hot, roll 8 at a time) AND real SC raft-log
+/// snapshot+compaction (once the log runs 16 entries past the last snapshot).
+/// Production runs both together, so the tests do too.
 fn seal_env() -> Vec<(&'static str, &'static str)> {
     vec![
         ("NEXUS_STREAM_HOT_WINDOW", "8"),
         ("NEXUS_STREAM_SEAL_BATCH", "8"),
+        ("NEXUS_SC_SNAPSHOT_THRESHOLD", "16"),
     ]
 }
 
@@ -219,6 +229,87 @@ async fn joiner_cold_reads_a_sealed_log_pulling_segments_from_the_founder() {
     // the founder's cache, so the joiner pulls them over ReadBlob. Bytes must be
     // byte-exact vs. what the founder wrote.
     await_collect(&mut jc, &log, &expected_log()).await;
+    drop(joiner);
+    drop(founder);
+}
+
+/// P2 (bounds the raft LOG + join transfer): the founder's SC raft log is
+/// bounded by snapshot+compaction, and a joiner that boots AFTER compaction
+/// catches up by INSTALLING the snapshot (not replaying the full log), then
+/// cold-reads the whole logical log from the bounded snapshot + CAS.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn joiner_installs_snapshot_after_compaction_then_cold_reads() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (mut founder, fport) = boot_founder(tmp.path()).await;
+    let mut fc = Vfs::dial(fport).await.expect("dial founder");
+
+    // Founder writes a long log — forcing seals (spill to CAS) AND SC raft-log
+    // snapshot+compaction — all BEFORE the joiner exists, so the joiner cannot
+    // replay from index 1: the early log is compacted away.
+    let log = format!("{MOUNT}/plog");
+    fc.create_stream(&log, "").await.expect("create wal stream");
+    for i in 0..N_FRAMES {
+        fc.stream_write(&log, &frame(i), "")
+            .await
+            .unwrap_or_else(|e| panic!("write frame {i}: {e}"));
+    }
+    founder
+        .wait_for_log(SEAL_LOG, BUDGET)
+        .await
+        .expect("founder seals to CAS");
+    founder
+        .wait_for_log(COMPACT_LOG, BUDGET)
+        .await
+        .expect("founder snapshots + compacts its SC raft log (log bounded)");
+
+    // Boot a joiner. Its log starts empty and the founder's is compacted, so the
+    // founder MUST send it an InstallSnapshot instead of replaying every entry.
+    let jport = free_port();
+    let jdata = tmp.path().join("pj-data");
+    let jid = tmp.path().join("pj-id");
+    let jadv = format!("127.0.0.1:{jport}");
+    let peers = format!("127.0.0.1:{fport}");
+    let jbind = format!("127.0.0.1:{jport}");
+    let mut joiner = Daemon::spawn(
+        &["--bind-addr", &jbind],
+        &joiner_env(
+            &jdata.to_string_lossy(),
+            &jid.to_string_lossy(),
+            &jadv,
+            &peers,
+        ),
+    );
+    joiner.wait_tcp(jport, BUDGET).await.expect("joiner serves");
+    joiner
+        .wait_for_log(&format!("Zone '{ZONE}' registered"), BUDGET)
+        .await
+        .expect("joiner joins the zone");
+    // The definitive P2 assertion: the joiner caught up via an INSTALLED
+    // snapshot, not a full-log replay (the compacted log made replay impossible).
+    joiner
+        .wait_for_log(SNAPSHOT_INSTALL_LOG, BUDGET)
+        .await
+        .expect("joiner must install the founder's snapshot (compacted log ⇒ no full replay)");
+
+    // With only the bounded snapshot (hot tail + segment index) + cold CAS
+    // fetches, the joiner reconstructs the ENTIRE logical log byte-exact.
+    let mut jc = Vfs::dial(jport).await.expect("dial joiner");
+    await_collect(&mut jc, &log, &expected_log()).await;
+
+    // STEADY STATE: the joiner is now a promoted voter. Keep appending past
+    // ANOTHER compaction — the caught-up follower stays in sync via ordinary
+    // replication (no snapshot needed), both logs stay bounded, and BOTH nodes
+    // read the full extended log byte-exact. This guards the common post-join
+    // path (2-voter compaction), not just the one-shot catch-up.
+    let total = N_FRAMES + 40;
+    for i in N_FRAMES..total {
+        fc.stream_write(&log, &frame(i), "")
+            .await
+            .unwrap_or_else(|e| panic!("write frame {i}: {e}"));
+    }
+    let want = expected_upto(total);
+    await_collect(&mut fc, &log, &want).await;
+    await_collect(&mut jc, &log, &want).await;
     drop(joiner);
     drop(founder);
 }
