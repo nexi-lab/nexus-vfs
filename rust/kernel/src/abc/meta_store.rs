@@ -480,6 +480,43 @@ pub trait MetaStore: Send + Sync {
         let _ = (stream_prefix, seq);
         Ok(None)
     }
+
+    /// The stream's `earliest` readable seq — the retention floor advanced by
+    /// [`Self::trim_stream_segments`]. ``0`` (default) until the first trim. A
+    /// WAL read below it is truncated (Kafka OffsetOutOfRange).
+    fn stream_earliest(&self, stream_prefix: &str) -> Result<u64, MetaStoreError> {
+        let _ = stream_prefix;
+        Ok(0)
+    }
+
+    /// Every cold segment of a stream, ordered by base — the trimmer's view for
+    /// summing cold bytes, choosing a trim boundary, and collecting dropped
+    /// blobs' refs. Default empty — no cold tier.
+    fn list_stream_segments(
+        &self,
+        stream_prefix: &str,
+    ) -> Result<Vec<StreamSegment>, MetaStoreError> {
+        let _ = stream_prefix;
+        Ok(Vec::new())
+    }
+
+    /// Trim the cold tier: drop every sealed segment fully below `up_to_seq` and
+    /// advance `earliest` to it (Kafka log retention). `trimmed` carries each
+    /// dropped segment's ``(origin, content_id)`` so the trim-GC observer can
+    /// delete the blobs on their origin nodes. SC (proposed), like the seal;
+    /// other impls return not-supported so a non-federated WAL backend never
+    /// trims (keep-forever, as before).
+    fn trim_stream_segments(
+        &self,
+        stream_prefix: &str,
+        up_to_seq: u64,
+        trimmed: Vec<(String, String)>,
+    ) -> Result<(), MetaStoreError> {
+        let _ = (stream_prefix, up_to_seq, trimmed);
+        Err(MetaStoreError::IOError(
+            "trim_stream_segments: not supported by this metastore (use a distributed impl, e.g. ZoneMetaStore)".to_string(),
+        ))
+    }
 }
 
 /// One cold-segment index record surfaced to the WAL backend: a contiguous
