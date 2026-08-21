@@ -128,6 +128,18 @@ impl Kernel {
     /// vault plugin silently not loading). Sibling `.sig` files are
     /// consumed by [`PluginLoader::load`] for signature verification and
     /// are not iterated here.
+    ///
+    /// FAIL LOUD on any load failure: a file with a plugin extension inside a
+    /// `--plugin-dir` is an INTENDED, TRUSTED plugin, so a failure to load one
+    /// is a boot-blocking error, not a skippable warning. This matters most for
+    /// a signature failure — [`PluginLoader::load`] verifies the `.sig` BEFORE
+    /// `dlopen` (so unverified code never runs), which means a real plugin with
+    /// a missing/stale/tampered signature is indistinguishable here from a stray
+    /// non-plugin `.dll`; both must fail loud, because either one in a trusted
+    /// plugin dir is a real problem the operator has to see. Silently skipping
+    /// would boot a daemon MISSING a plugin the operator asked for, and the
+    /// failure would resurface far downstream as a mystery "service not found"
+    /// on the first request that needed it.
     pub fn load_plugin_dir(self: &Arc<Self>, dir: &Path) -> Result<Vec<String>, String> {
         let entries =
             std::fs::read_dir(dir).map_err(|e| format!("read_dir({}): {e}", dir.display()))?;
@@ -137,10 +149,10 @@ impl Kernel {
             let path = entry.path();
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             if matches!(ext, "so" | "dylib" | "dll") {
-                match self.load_plugin(&path) {
-                    Ok(name) => loaded.push(name),
-                    Err(e) => tracing::warn!(path = %path.display(), err = %e, "skip plugin"),
-                }
+                let name = self
+                    .load_plugin(&path)
+                    .map_err(|e| format!("plugin '{}' failed to load: {e}", path.display()))?;
+                loaded.push(name);
             }
         }
         Ok(loaded)
@@ -175,7 +187,24 @@ unsafe extern "C" fn kernel_cb_sys_read(
     let ctx = system_ctx();
     match kernel.sys_read_single(path, &ctx, 1, 5000, 0) {
         Ok(result) => {
-            let data = result.data.unwrap_or_default();
+            // The C-ABI `sys_read` is a bulk "content at this path" read — it has
+            // NO offset parameter. For a DT_STREAM the content is the WHOLE log,
+            // not the single frame `sys_read_single` returns at offset 0: a
+            // plugin walking the VFS for search (grep / index) wants the full
+            // log, exactly as it gets a file's full bytes. Re-read a stream via
+            // `stream_collect_all` (which starts at the retention floor, so a
+            // trimmed log yields its surviving content, never a Truncated error).
+            // Files — the common case — are unaffected; only a stream pays the
+            // extra cheap one-frame probe above. No ABI change: the plugin keeps
+            // calling `sys_read` and simply stops skipping stream entries.
+            let data = if result.entry_type == crate::meta_store::DT_STREAM {
+                match kernel.stream_collect_all(path) {
+                    Ok(bytes) => bytes,
+                    Err(_) => return -3, // Internal
+                }
+            } else {
+                result.data.unwrap_or_default()
+            };
             let mut data = std::mem::ManuallyDrop::new(data);
             *out_buf = data.as_mut_ptr();
             *out_len = data.len();

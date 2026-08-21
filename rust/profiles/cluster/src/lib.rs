@@ -1408,20 +1408,19 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     // Auto-load all .so/.dylib files from --plugin-dir (if specified).
     // Runs after kernel + root mount so plugins can use sys_read/sys_write.
     if let Some(ref plugin_dir) = common.plugin_dir {
-        match kernel.load_plugin_dir(plugin_dir) {
-            Ok(names) => {
-                if !names.is_empty() {
-                    tracing::info!(
-                        count = names.len(),
-                        names = ?names,
-                        dir = %plugin_dir.display(),
-                        "plugins loaded from --plugin-dir",
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::warn!(err = %e, dir = %plugin_dir.display(), "plugin dir scan failed")
-            }
+        // Fail loud: an operator who passes --plugin-dir REQUIRES those plugins.
+        // A load failure (signature/ABI/symbol) is boot-blocking — never a warn
+        // that leaves the daemon running short a plugin (see load_plugin_dir).
+        let names = kernel.load_plugin_dir(plugin_dir).map_err(|e| {
+            anyhow::anyhow!("--plugin-dir {} load failed: {e}", plugin_dir.display())
+        })?;
+        if !names.is_empty() {
+            tracing::info!(
+                count = names.len(),
+                names = ?names,
+                dir = %plugin_dir.display(),
+                "plugins loaded from --plugin-dir",
+            );
         }
     }
 
