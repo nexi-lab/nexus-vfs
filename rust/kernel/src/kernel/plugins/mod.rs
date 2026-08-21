@@ -38,6 +38,7 @@ impl Kernel {
             sys_rmdir: kernel_cb_sys_rmdir,
             sys_rename: kernel_cb_sys_rename,
             sys_stat_batch: kernel_cb_sys_stat_batch,
+            free_buf: kernel_cb_free_buf,
             kernel_ptr: Arc::as_ptr(self) as *const std::os::raw::c_void,
         }
     }
@@ -173,6 +174,33 @@ fn system_ctx() -> OperationContext {
 // KernelHandle vtable. They cast the opaque `kernel` pointer back to
 // `&Kernel` and delegate to the syscall surface.
 
+/// Hand a host-allocated byte buffer to a plugin through the
+/// `(out_buf, out_len)` out-params, transferring ownership.
+///
+/// The buffer is shrunk to an exact-capacity boxed slice so the matching
+/// free — [`kernel_cb_free_buf`], wired into every `KernelHandle` as
+/// `free_buf` — reconstructs `Vec::from_raw_parts(ptr, len, len)` with
+/// the identical layout on the SAME (host) allocator. Plugins MUST
+/// return these buffers via `handle.free_buf`, never their own
+/// `nexus_free`: the kernel links mimalloc and a plugin links the system
+/// allocator, and a cross-heap free corrupts memory (a hard segfault on
+/// Windows, where mimalloc and the CRT heap are separate arenas).
+unsafe fn yield_host_buf(bytes: Vec<u8>, out_buf: *mut *mut u8, out_len: *mut usize) {
+    let boxed = bytes.into_boxed_slice();
+    *out_len = boxed.len();
+    *out_buf = Box::into_raw(boxed) as *mut u8;
+}
+
+/// Free a buffer produced by one of the `sys_*` callbacks (see
+/// [`yield_host_buf`]). Runs in host code so the free binds the host
+/// allocator that produced it — the mirror of the plugin's own
+/// `nexus_free` for plugin-allocated buffers.
+unsafe extern "C" fn kernel_cb_free_buf(ptr: *mut u8, len: usize) {
+    if !ptr.is_null() && len > 0 {
+        drop(Vec::from_raw_parts(ptr, len, len));
+    }
+}
+
 unsafe extern "C" fn kernel_cb_sys_read(
     kernel: *const std::os::raw::c_void,
     path: *const std::ffi::c_char,
@@ -205,9 +233,7 @@ unsafe extern "C" fn kernel_cb_sys_read(
             } else {
                 result.data.unwrap_or_default()
             };
-            let mut data = std::mem::ManuallyDrop::new(data);
-            *out_buf = data.as_mut_ptr();
-            *out_len = data.len();
+            yield_host_buf(data, out_buf, out_len);
             0
         }
         Err(_) => -3, // Internal
@@ -273,9 +299,7 @@ unsafe extern "C" fn kernel_cb_sys_stat(
                     .modified_at_ms
                     .map_or_else(|| "null".to_string(), |ms| ms.to_string()),
             );
-            let mut json = std::mem::ManuallyDrop::new(json.into_bytes());
-            *out_json = json.as_mut_ptr();
-            *out_len = json.len();
+            yield_host_buf(json.into_bytes(), out_json, out_len);
             0
         }
         None => -1, // NotFound
@@ -358,9 +382,7 @@ unsafe extern "C" fn kernel_cb_sys_readdir(
         json.push('}');
     }
     json.push(']');
-    let mut bytes = std::mem::ManuallyDrop::new(json.into_bytes());
-    *out_json = bytes.as_mut_ptr();
-    *out_len = bytes.len();
+    yield_host_buf(json.into_bytes(), out_json, out_len);
     0
 }
 
@@ -490,9 +512,7 @@ unsafe extern "C" fn kernel_cb_sys_stat_batch(
         }
     }
     json.push(']');
-    let mut bytes = std::mem::ManuallyDrop::new(json.into_bytes());
-    *out_json = bytes.as_mut_ptr();
-    *out_len = bytes.len();
+    yield_host_buf(json.into_bytes(), out_json, out_len);
     0
 }
 
