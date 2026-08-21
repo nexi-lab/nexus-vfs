@@ -1368,15 +1368,19 @@ mod tests {
 
     #[test]
     fn local_trust_dir_from_env_round_trip() {
-        // SAFETY: temporarily setting then unsetting the env var. This is
-        // the only test that touches the real process env var; running
-        // serially under `cargo test` is fine.
+        // Touches the PROCESS-GLOBAL env var, which is read lazily by the
+        // `trusted_keys()` OnceLock in whatever parallel test first calls it —
+        // `cargo test` is multi-threaded, NOT serial. So the value set here MUST
+        // be a valid, readable directory: a non-existent path made
+        // `compute_trusted_keys` panic (fail-loud on a bad dir) in a concurrent
+        // `trusted_keys()` init, flaking `embedded_trusted_keys_parse_at_runtime`.
+        // An empty tempdir keeps the round-trip assertion while adding zero trust
+        // roots, so a concurrent init just caches the embedded set. Kept alive to
+        // the end of the test so the dir still exists if read concurrently.
+        let dir = tempfile::tempdir().expect("tempdir");
         let saved = std::env::var(LOCAL_TRUSTED_KEYS_ENV).ok();
-        std::env::set_var(LOCAL_TRUSTED_KEYS_ENV, "/some/dev/dir");
-        assert_eq!(
-            local_trust_dir_from_env(),
-            Some(PathBuf::from("/some/dev/dir"))
-        );
+        std::env::set_var(LOCAL_TRUSTED_KEYS_ENV, dir.path());
+        assert_eq!(local_trust_dir_from_env(), Some(dir.path().to_path_buf()));
         std::env::remove_var(LOCAL_TRUSTED_KEYS_ENV);
         assert_eq!(local_trust_dir_from_env(), None);
         // Restore caller env if it had something set.
