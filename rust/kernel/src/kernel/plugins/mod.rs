@@ -175,7 +175,24 @@ unsafe extern "C" fn kernel_cb_sys_read(
     let ctx = system_ctx();
     match kernel.sys_read_single(path, &ctx, 1, 5000, 0) {
         Ok(result) => {
-            let data = result.data.unwrap_or_default();
+            // The C-ABI `sys_read` is a bulk "content at this path" read — it has
+            // NO offset parameter. For a DT_STREAM the content is the WHOLE log,
+            // not the single frame `sys_read_single` returns at offset 0: a
+            // plugin walking the VFS for search (grep / index) wants the full
+            // log, exactly as it gets a file's full bytes. Re-read a stream via
+            // `stream_collect_all` (which starts at the retention floor, so a
+            // trimmed log yields its surviving content, never a Truncated error).
+            // Files — the common case — are unaffected; only a stream pays the
+            // extra cheap one-frame probe above. No ABI change: the plugin keeps
+            // calling `sys_read` and simply stops skipping stream entries.
+            let data = if result.entry_type == crate::meta_store::DT_STREAM {
+                match kernel.stream_collect_all(path) {
+                    Ok(bytes) => bytes,
+                    Err(_) => return -3, // Internal
+                }
+            } else {
+                result.data.unwrap_or_default()
+            };
             let mut data = std::mem::ManuallyDrop::new(data);
             *out_buf = data.as_mut_ptr();
             *out_len = data.len();
