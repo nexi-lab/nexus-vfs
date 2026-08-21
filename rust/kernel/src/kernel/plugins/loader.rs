@@ -21,8 +21,9 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use nexus_plugin_abi::{
     signing::{PUBKEY_LENGTH, SIGNATURE_FILE_SUFFIX, SIGNATURE_LENGTH},
     DriverCreateFn, DriverDeleteFileFn, DriverDestroyFn, DriverReadFn, DriverReaddirFn,
-    DriverRmdirFn, DriverStatFn, DriverWriteFn, KernelHandle, PluginGrpcServicesFn, PluginKind,
-    PluginResult, ServiceCreateFn, ServiceDestroyFn, ServiceDispatchFn, PLUGIN_API_VERSION,
+    DriverRmdirFn, DriverStatFn, DriverWriteFn, KernelHandle, NexusFreeFn, PluginGrpcServicesFn,
+    PluginKind, PluginResult, ServiceCreateFn, ServiceDestroyFn, ServiceDispatchFn,
+    PLUGIN_API_VERSION,
 };
 
 use crate::abc::object_store::{BackendStat, ObjectStore, StorageError, WriteResult};
@@ -315,6 +316,44 @@ pub struct PluginGrpcEndpoint {
     pub service: Arc<dyn RustService>,
 }
 
+// ── Cross-allocator buffer hand-back ────────────────────────────────
+
+/// Take ownership of a buffer the PLUGIN allocated and returned through
+/// `(out_buf, out_len)`, copying it into a host-owned `Vec` and then
+/// freeing the plugin buffer on the plugin's OWN allocator via `free_fn`
+/// (its exported `nexus_free`).
+///
+/// The copy is mandatory, not wasteful: the host hands owned `Vec`s back
+/// to its callers, and a `Vec` always drops on the host (mimalloc)
+/// allocator — so we cannot adopt the plugin's buffer directly without
+/// re-introducing the very cross-allocator free this fixes (the plugin
+/// links the system allocator). Freeing through the plugin's own
+/// `nexus_free` keeps the free on the allocator that produced the
+/// buffer; the one memcpy is the inherent cost of the allocator boundary.
+unsafe fn take_plugin_buf(out_buf: *mut u8, out_len: usize, free_fn: NexusFreeFn) -> Vec<u8> {
+    if out_buf.is_null() || out_len == 0 {
+        return Vec::new();
+    }
+    let data = std::slice::from_raw_parts(out_buf, out_len).to_vec();
+    free_fn(out_buf, out_len);
+    data
+}
+
+/// Resolve a loaded plugin's exported `nexus_free` symbol so the host
+/// can release buffers the plugin allocated on the plugin's allocator.
+/// Every plugin links `nexus-plugin-abi`, which exports `nexus_free`, so
+/// a missing symbol is a hard load error (fail loud).
+fn resolve_plugin_free(lib: &libloading::Library) -> Result<NexusFreeFn, String> {
+    // SAFETY: `nexus_free` has the `NexusFreeFn` signature by the ABI
+    // contract; the library outlives every buffer freed through it (the
+    // PluginLoader keeps it loaded).
+    unsafe {
+        lib.get::<NexusFreeFn>(b"nexus_free")
+            .map(|sym| *sym)
+            .map_err(|e| format!("symbol nexus_free: {e}"))
+    }
+}
+
 // ── DylibRustService ────────────────────────────────────────────────
 
 /// Wraps a service plugin's C ABI function pointers as an
@@ -325,6 +364,9 @@ pub(crate) struct DylibRustService {
     svc_name: String,
     handle: *mut c_void,
     dispatch_fn: ServiceDispatchFn,
+    /// The plugin's own `nexus_free` — frees dispatch-output buffers on
+    /// the plugin's allocator (never the host's). See `take_plugin_buf`.
+    free_fn: NexusFreeFn,
 }
 
 // SAFETY: Plugin C ABI contract requires thread-safe instances.
@@ -355,13 +397,9 @@ impl RustService for DylibRustService {
 
         match rc {
             0 => {
-                let data = if out_buf.is_null() || out_len == 0 {
-                    Vec::new()
-                } else {
-                    // SAFETY: the plugin allocated this via Vec and handed
-                    // ownership to us through ManuallyDrop.
-                    unsafe { Vec::from_raw_parts(out_buf, out_len, out_len) }
-                };
+                // The plugin allocated this buffer — copy it out and free it
+                // on the plugin's allocator, never the host's mimalloc.
+                let data = unsafe { take_plugin_buf(out_buf, out_len, self.free_fn) };
                 Ok(data)
             }
             rc if rc == PluginResult::NotFound as i32 => Err(RustCallError::NotFound),
@@ -437,6 +475,10 @@ pub(crate) struct DylibObjectStore {
     /// virtual-namespace drivers may legitimately not.
     stat_fn: Option<DriverStatFn>,
     destroy_fn: DriverDestroyFn,
+    /// The plugin's own `nexus_free` — frees read/readdir/stat output
+    /// buffers on the plugin's allocator (never the host's). See
+    /// `take_plugin_buf`.
+    free_fn: NexusFreeFn,
 }
 
 impl Drop for DylibObjectStore {
@@ -540,13 +582,8 @@ impl ObjectStore for DylibObjectStore {
 
         match rc {
             0 => {
-                let data = if out_buf.is_null() || out_len == 0 {
-                    Vec::new()
-                } else {
-                    // SAFETY: the plugin allocated this Vec and handed
-                    // ownership to us via ManuallyDrop in declare_driver_plugin!.
-                    unsafe { Vec::from_raw_parts(out_buf, out_len, out_len) }
-                };
+                // Plugin-allocated — copy out, free on the plugin's allocator.
+                let data = unsafe { take_plugin_buf(out_buf, out_len, self.free_fn) };
                 Ok(data)
             }
             rc if rc == PluginResult::NotFound as i32 => {
@@ -574,14 +611,8 @@ impl ObjectStore for DylibObjectStore {
 
         match rc {
             0 => {
-                let json = if out_buf.is_null() || out_len == 0 {
-                    Vec::new()
-                } else {
-                    // SAFETY: plugin allocated this Vec and handed
-                    // ownership over via ManuallyDrop in the
-                    // `declare_driver_plugin!` readdir arm.
-                    unsafe { Vec::from_raw_parts(out_buf, out_len, out_len) }
-                };
+                // Plugin-allocated — copy out, free on the plugin's allocator.
+                let json = unsafe { take_plugin_buf(out_buf, out_len, self.free_fn) };
                 if json.is_empty() {
                     return Ok(Vec::new());
                 }
@@ -682,14 +713,8 @@ impl ObjectStore for DylibObjectStore {
         let rc = unsafe { stat_fn(self.handle, path_c.as_ptr(), &mut out_buf, &mut out_len) };
         match rc {
             0 => {
-                let json = if out_buf.is_null() || out_len == 0 {
-                    Vec::new()
-                } else {
-                    // SAFETY: plugin allocated this Vec and handed
-                    // ownership over via ManuallyDrop in the
-                    // `declare_driver_plugin!` stat arm.
-                    unsafe { Vec::from_raw_parts(out_buf, out_len, out_len) }
-                };
+                // Plugin-allocated — copy out, free on the plugin's allocator.
+                let json = unsafe { take_plugin_buf(out_buf, out_len, self.free_fn) };
                 #[derive(serde::Deserialize)]
                 struct StatWire {
                     size: u64,
@@ -987,6 +1012,7 @@ impl PluginLoader {
                 .get(nexus_plugin_abi::symbols::DRIVER_DESTROY.as_bytes())
                 .map_err(|e| format!("symbol {}: {e}", nexus_plugin_abi::symbols::DRIVER_DESTROY))?
         };
+        let free_fn = resolve_plugin_free(&plugin._lib)?;
 
         let config_c =
             CString::new(config_json).map_err(|_| "config_json contains null byte".to_string())?;
@@ -1009,6 +1035,7 @@ impl PluginLoader {
             rmdir_fn,
             stat_fn,
             destroy_fn,
+            free_fn,
         })
     }
 
@@ -1047,10 +1074,22 @@ impl PluginLoader {
                     continue;
                 }
             };
+            let free_fn = match resolve_plugin_free(&plugin._lib) {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = plugin_name,
+                        err = %e,
+                        "skip plugin gRPC endpoints — nexus_free symbol missing",
+                    );
+                    continue;
+                }
+            };
             let svc: Arc<dyn RustService> = Arc::new(DylibRustService {
                 svc_name: plugin_name.clone(),
                 handle: plugin.handle,
                 dispatch_fn,
+                free_fn,
             });
             for service_name in &plugin.grpc_services {
                 out.push(PluginGrpcEndpoint {
@@ -1081,11 +1120,13 @@ impl PluginLoader {
                 .get(nexus_plugin_abi::symbols::SERVICE_DISPATCH.as_bytes())
                 .ok()?
         };
+        let free_fn = resolve_plugin_free(&plugin._lib).ok()?;
 
         Some(DylibRustService {
             svc_name: name.to_string(),
             handle: plugin.handle,
             dispatch_fn,
+            free_fn,
         })
     }
 
@@ -1489,6 +1530,9 @@ mod tests {
         -3
     }
     unsafe extern "C" fn stub_destroy_noop(_drv: *mut std::os::raw::c_void) {}
+    // Stubs never yield a buffer (all return -3), so the free is never
+    // reached — a no-op keeps the struct well-formed for the rmdir tests.
+    unsafe extern "C" fn stub_free_noop(_ptr: *mut u8, _len: usize) {}
 
     fn build_stub_store_with_rmdir(rmdir_fn: Option<DriverRmdirFn>) -> DylibObjectStore {
         DylibObjectStore {
@@ -1503,6 +1547,7 @@ mod tests {
             rmdir_fn,
             stat_fn: None,
             destroy_fn: stub_destroy_noop,
+            free_fn: stub_free_noop,
         }
     }
 

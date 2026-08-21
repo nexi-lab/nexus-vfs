@@ -86,7 +86,23 @@ use std::os::raw::c_void;
 ///     and the macro arm's closure now takes
 ///     `(&Drv, &str, bool) -> Result<(), i32>`.  Service plugins
 ///     are unaffected.
-pub const PLUGIN_API_VERSION: u32 = 5;
+///   * v6 — [`KernelHandle`] grows a `free_buf` callback and the
+///     buffer-ownership contract is made allocator-correct.  Buffers
+///     the HOST returns (`sys_read`/`sys_stat`/`sys_readdir`/
+///     `sys_stat_batch`) MUST now be freed with `handle.free_buf`, not
+///     [`nexus_free`]; buffers the PLUGIN returns
+///     (`nexus_service_dispatch`/`nexus_driver_*`) are freed by the
+///     host through the plugin's own [`nexus_free`].  The old code
+///     freed every cross-boundary buffer on whichever side consumed
+///     it, which corrupts the heap whenever the two sides link
+///     different global allocators (kernel = mimalloc, plugin =
+///     system) — a hard segfault on Windows.  **Breaking** for every
+///     plugin: the vtable layout changed (new fn-ptr before
+///     `kernel_ptr`) and consumers of host buffers must switch to
+///     `free_buf`.  All in-tree buffer hand-offs also shrink to an
+///     exact-capacity boxed slice so the `from_raw_parts(ptr, len,
+///     len)` free is layout-correct regardless of allocator.
+pub const PLUGIN_API_VERSION: u32 = 6;
 
 // ── Plugin kind ─────────────────────────────────────────────────────
 
@@ -146,7 +162,8 @@ pub struct KernelHandle {
     ///
     /// Reads the content of a regular file. On success (0), `*out_buf`
     /// points to a heap-allocated buffer and `*out_len` is its length.
-    /// The plugin must call `nexus_free(out_buf, out_len)` when done.
+    /// The plugin must call `free_buf(out_buf, out_len)` when done
+    /// (NOT `nexus_free` — the buffer is host-allocated; see `free_buf`).
     pub sys_read: unsafe extern "C" fn(
         kernel: *const c_void,
         path: *const c_char,
@@ -173,7 +190,7 @@ pub struct KernelHandle {
     /// that want freshness-aware behavior (recency sort, cache TTL,
     /// …) don't need a side channel. Existing consumers ignore the
     /// new field.
-    /// Caller frees with `nexus_free`.
+    /// Caller frees with `free_buf` (host-allocated buffer).
     pub sys_stat: unsafe extern "C" fn(
         kernel: *const c_void,
         path: *const c_char,
@@ -186,8 +203,8 @@ pub struct KernelHandle {
     /// Lists directory entries.  On success (0), `*out_json` points to
     /// a heap-allocated UTF-8 JSON array of `{"name":<str>,"entry_type":<u8>}`
     /// objects (one per child).  The plugin must call
-    /// `nexus_free(out_json, out_len)` when done.  Returns
-    /// `PluginResult::NotFound` (-1) when the directory does not
+    /// `free_buf(out_json, out_len)` when done (host-allocated buffer).
+    /// Returns `PluginResult::NotFound` (-1) when the directory does not
     /// exist; an empty directory is `Ok(0)` with `[]` payload.
     ///
     /// `entry_type` values match `kernel::meta_store::DT_*`
@@ -242,7 +259,7 @@ pub struct KernelHandle {
     /// stat (the per-path `Option<StatResult>` in the underlying
     /// `kernel::stat_batch` Tier 2 convenience).  Same allocation
     /// contract as the other JSON-returning callbacks: caller frees
-    /// `*out_json` with [`nexus_free`].
+    /// `*out_json` with `free_buf` (host-allocated buffer).
     ///
     /// Added in v3 for the WinFsp adapter's `read_directory` which
     /// must populate `FileInfo.file_size` for every entry — without
@@ -255,6 +272,26 @@ pub struct KernelHandle {
         out_json: *mut *mut u8,
         out_len: *mut usize,
     ) -> i32,
+
+    /// `free_buf(ptr, len)` — free a buffer returned by one of the
+    /// host callbacks above (`sys_read`, `sys_stat`, `sys_readdir`,
+    /// `sys_stat_batch`).
+    ///
+    /// **Plugins MUST use this — never [`nexus_free`] — for buffers the
+    /// host handed them.** The host and a plugin cdylib can link
+    /// DIFFERENT global allocators (the kernel uses mimalloc; a plugin
+    /// links the system allocator), and each allocator owns a distinct
+    /// heap. Freeing a host-allocated buffer with the plugin's allocator
+    /// corrupts the heap — a hard segfault on Windows, where mimalloc and
+    /// the CRT heap are entirely separate arenas (masked on Linux only
+    /// because a foreign `free` there often defers the corruption). This
+    /// callback runs in host code, so the free binds the host allocator
+    /// that produced the buffer. The mirror image — buffers the PLUGIN
+    /// allocates and returns to the host (`nexus_service_dispatch`,
+    /// `nexus_driver_*`) — is freed by the host through the plugin's own
+    /// exported [`nexus_free`]. Ownership rule: the side that allocated a
+    /// buffer is the side that frees it.
+    pub free_buf: unsafe extern "C" fn(ptr: *mut u8, len: usize),
 
     /// Opaque kernel pointer — passed back as first arg to every callback.
     pub kernel_ptr: *const c_void,
@@ -410,22 +447,43 @@ pub mod symbols {
     pub const DRIVER_DESTROY: &str = "nexus_driver_destroy";
 }
 
-// ── Free function for plugin-allocated buffers ──────────────────────
+// ── Free function for PLUGIN-allocated buffers ──────────────────────
 
-/// Free a buffer allocated by the kernel's callback functions
-/// (`sys_read`, `sys_stat`). Plugins must call this instead of
-/// `libc::free` because the kernel may use a custom allocator.
+/// Free a buffer the PLUGIN allocated and returned to the host
+/// (`nexus_service_dispatch` / `nexus_driver_read` / `_readdir` /
+/// `_stat` outputs). The host resolves this symbol *from the plugin's
+/// own cdylib* and calls it, so the free binds the plugin's global
+/// allocator — the one that produced the buffer.
+///
+/// This is the mirror image of [`KernelHandle::free_buf`], which frees
+/// buffers the HOST returns to the plugin. Buffers must never be freed
+/// on the opposite side: the kernel links mimalloc and a plugin links
+/// the system allocator, and the two heaps are disjoint (a foreign
+/// free is a hard segfault on Windows). Ownership rule: the side that
+/// allocated a buffer is the side that frees it.
+///
+/// The buffer must have been produced with `len == capacity` (the
+/// `declare_*_plugin!` macros shrink to an exact-capacity boxed slice
+/// before yielding) so this `from_raw_parts(ptr, len, len)`
+/// reconstruction deallocates with the identical layout.
 ///
 /// # Safety
 ///
-/// `ptr` must have been returned by a KernelHandle callback, and
-/// `len` must match the `out_len` value set by that callback.
+/// `ptr`/`len` must be a buffer this plugin returned through one of the
+/// symbols above, not yet freed, with `len` equal to that call's
+/// `out_len`.
 #[no_mangle]
 pub unsafe extern "C" fn nexus_free(ptr: *mut u8, len: usize) {
     if !ptr.is_null() && len > 0 {
         drop(Vec::from_raw_parts(ptr, len, len));
     }
 }
+
+/// Type of the exported `nexus_free` symbol — used by the host to
+/// resolve a loaded plugin's own free function and release buffers the
+/// plugin allocated (dispatch / driver outputs) on the plugin's
+/// allocator.
+pub type NexusFreeFn = unsafe extern "C" fn(ptr: *mut u8, len: usize);
 
 // ── Service plugin type aliases ─────────────────────────────────────
 
@@ -583,9 +641,13 @@ macro_rules! declare_service_plugin {
             let dispatch_fn: fn(&$ty, &str, &[u8]) -> Result<Vec<u8>, i32> = $dispatch;
             match dispatch_fn(svc, method, payload) {
                 Ok(data) => {
-                    let mut data = std::mem::ManuallyDrop::new(data);
-                    *out_buf = data.as_mut_ptr();
+                    // Yield an exact-capacity boxed slice (cap == len) so the
+                    // host frees it with THIS plugin's own `nexus_free` on the
+                    // identical layout — the buffer-ownership rule documented
+                    // on `KernelHandle::free_buf`: the allocating side frees.
+                    let data = data.into_boxed_slice();
                     *out_len = data.len();
+                    *out_buf = std::boxed::Box::into_raw(data) as *mut u8;
                     0
                 }
                 Err(code) => code,
@@ -713,9 +775,11 @@ macro_rules! declare_driver_plugin {
             let read_fn: fn(&$ty, &str) -> Result<Vec<u8>, i32> = $read;
             match read_fn(drv, path) {
                 Ok(data) => {
-                    let mut data = std::mem::ManuallyDrop::new(data);
-                    *out_buf = data.as_mut_ptr();
+                    // Exact-capacity boxed slice — freed by the host through
+                    // this plugin's `nexus_free`; see `KernelHandle::free_buf`.
+                    let data = data.into_boxed_slice();
                     *out_len = data.len();
+                    *out_buf = std::boxed::Box::into_raw(data) as *mut u8;
                     0
                 }
                 Err(code) => code,
@@ -770,9 +834,11 @@ macro_rules! declare_driver_plugin {
                         Ok(v) => v,
                         Err(_) => return -3,
                     };
-                    let mut data = std::mem::ManuallyDrop::new(json);
-                    *out_buf = data.as_mut_ptr();
+                    // Exact-capacity boxed slice — freed by the host through
+                    // this plugin's `nexus_free`; see `KernelHandle::free_buf`.
+                    let data = json.into_boxed_slice();
                     *out_len = data.len();
+                    *out_buf = std::boxed::Box::into_raw(data) as *mut u8;
                     0
                 }
                 Err(code) => code,
@@ -839,10 +905,11 @@ macro_rules! declare_driver_plugin {
                         // `DylibObjectStore::stat` parses this back into a
                         // `BackendStat { size, is_dir }`.
                         let json = format!("{{\"size\":{},\"is_dir\":{}}}", size, is_dir);
-                        let bytes = json.into_bytes();
-                        let mut data = std::mem::ManuallyDrop::new(bytes);
-                        *out_buf = data.as_mut_ptr();
+                        // Exact-capacity boxed slice — freed by the host through
+                        // this plugin's `nexus_free`; see `KernelHandle::free_buf`.
+                        let data = json.into_bytes().into_boxed_slice();
                         *out_len = data.len();
+                        *out_buf = std::boxed::Box::into_raw(data) as *mut u8;
                         0
                     }
                     Err(code) => code,
