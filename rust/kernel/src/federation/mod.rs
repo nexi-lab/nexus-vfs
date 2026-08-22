@@ -12,7 +12,7 @@
 //! `rust/transport/` (`FederationClient`).  This module owns:
 //!
 //! * **§3.B.1 `DistributedCoordinator` wiring** ([`coordinator_wiring`]) —
-//!   slot accessors plus `/__sys__/zones/` procfs synthesisers.
+//!   slot accessors plus `/__sys__/zones/` synthetic-view synthesisers.
 //!   Cross-node typed-RPC dispatch (`peer_read` / `peer_stat` /
 //!   `peer_list_dir` / `peer_delete_file` / `peer_rmdir` /
 //!   `peer_write` / `peer_mkdir` / `peer_rename` / `peer_setattr`)
@@ -52,6 +52,6 @@ mod cold_segment;
 mod coordinator_wiring;
 pub mod grpc_ops;
 
-/// `/__sys__/zones` procfs view — the readdir half of the federation
+/// `/__sys__/zones` synthetic view — the readdir half of the federation
 /// namespace whose `sys_stat` half lives in `coordinator_wiring`.
-pub use coordinator_wiring::ZonesProcfs;
+pub use coordinator_wiring::ZonesView;

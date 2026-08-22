@@ -158,7 +158,7 @@ fn bench_readdir(c: &mut Criterion) {
 
 /// `readdir_paged` on an ORDINARY path — the case that must stay free.
 ///
-/// This is the path the procfs registry sits in front of. Every readdir
+/// This is the path the synthetic-view registry sits in front of. Every readdir
 /// of a normal directory pays the registry's guard (`is_system_path`)
 /// before falling through to `sys_readdir`, so this is where a
 /// regression would show up. Same directory sizes as the `sys_readdir`

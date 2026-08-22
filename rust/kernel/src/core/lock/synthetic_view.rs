@@ -1,11 +1,11 @@
-//! `/__sys__/locks` — the advisory-lock procfs view.
+//! `/__sys__/locks` — the advisory-lock synthetic view.
 //!
 //! Linux `/proc/locks`. An advisory lock is a kernel object, not a file,
 //! so enumeration needs a projection rather than a directory. Lives with
-//! `LockManager` (its owner), registered into the [`crate::core::procfs`]
+//! `LockManager` (its owner), registered into the [`crate::core::synthetic_view`]
 //! registry at kernel boot.
 
-use crate::core::procfs::ProcfsProvider;
+use crate::core::synthetic_view::SyntheticViewProvider;
 use crate::kernel::Kernel;
 
 /// Upper bound on one enumeration. Matches the page ceiling the readdir
@@ -16,9 +16,9 @@ const MAX_LOCKS: usize = 10_000;
 /// leaf, the way `/proc/locks` presents one line per lock.
 const DT_REG: u8 = 0;
 
-pub struct LocksProcfs;
+pub struct LocksView;
 
-impl ProcfsProvider for LocksProcfs {
+impl SyntheticViewProvider for LocksView {
     fn prefix(&self) -> &str {
         contracts::LOCKS_PATH_PREFIX
     }

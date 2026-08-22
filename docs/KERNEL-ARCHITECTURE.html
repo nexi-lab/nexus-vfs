@@ -977,7 +977,7 @@ graph TB
         PG["PermissionGate &mdash; kernel/dispatch.rs<br/>1-slot Arc⟨dyn PermissionProvider⟩<br/>(&sect;2.4.1)"]
         FW["FileWatcher + FileEvent<br/>core/file_watch.rs (&sect;4.3)"]
         MS["MetadataSync &mdash; core/metadata_sync.rs (&sect;4.5)<br/>backend &harr; metastore coherence"]
-        PR["ProcfsRegistry &mdash; core/procfs.rs (&sect;4.6)<br/>/__sys__/&hellip; views"]
+        PR["SyntheticViewRegistry &mdash; core/synthetic_view.rs (&sect;4.6)<br/>/__sys__/&hellip; views"]
     end
     subgraph K4["IPC (&sect;4.2)"]
         P["PipeManager &mdash; core/pipe/<br/>DT_PIPE destructive FIFO"]
@@ -1012,7 +1012,7 @@ graph TB
     <tr><td><code>AgentRegistry</code></td><td><code>rust/kernel/src/core/agents/registry.rs</code></td><td>Linux <code>task_struct</code> table + signal queue</td></tr>
     <tr><td><code>DT_LINK</code> (&sect;4.4)</td><td><code>proto/nexus/core/metadata.proto</code> + <code>FileMetadata.link_target</code></td><td><code>symlink(2)</code></td></tr>
     <tr><td><code>PluginLoader</code> (&sect;9)</td><td><code>rust/kernel/src/core/plugin_loader.rs</code></td><td><code>module_loader</code> (<code>kernel/module/main.c</code>)</td></tr>
-    <tr><td><code>ProcfsRegistry</code> (&sect;4.6)</td><td><code>rust/kernel/src/core/procfs.rs</code></td><td><code>proc_create()</code> / <code>proc_dir_entry</code></td></tr>
+    <tr><td><code>SyntheticViewRegistry</code> (&sect;4.6)</td><td><code>rust/kernel/src/core/synthetic_view.rs</code></td><td><code>proc_create()</code> / <code>proc_dir_entry</code></td></tr>
   </tbody>
 </table>
 
@@ -1242,22 +1242,22 @@ graph TB
 
 <p>They share the concept (coherence), not code. The <code>raft &rarr; kernel</code> dependency boundary and opposite data-flow directions keep them as distinct primitives in distinct crates. Classic OS split: cache-invalidation-on-write (downstream) versus cache-revalidation-on-read (upstream).</p>
 
-<h3 id="procfs-registry">4.6 ProcfsRegistry &mdash; <code>/__sys__/&hellip;</code> Views <span class="role-badge">Linux analogue: <code>proc_create()</code></span></h3>
+<h3 id="synthetic-view-registry">4.6 SyntheticViewRegistry &mdash; <code>/__sys__/&hellip;</code> Views <span class="role-badge">Linux analogue: <code>proc_create()</code></span></h3>
 
-<p>Not everything the kernel owns is a file. An advisory lock is a kernel object; a credential record lives in its own raft tree, off the <code>sys_read</code> / <code>readdir</code> path <em>by design</em>, so no path walk reaches one and no <code>sys_write</code> forges one. Both still need an introspection surface. <code>ProcfsRegistry</code> is that surface &mdash; Linux&rsquo;s <code>proc_create()</code>, where the lock subsystem registers <code>/proc/locks</code> rather than the VFS special-casing it.</p>
+<p>Not everything the kernel owns is a file. An advisory lock is a kernel object; a credential record lives in its own raft tree, off the <code>sys_read</code> / <code>readdir</code> path <em>by design</em>, so no path walk reaches one and no <code>sys_write</code> forges one. Both still need an introspection surface. <code>SyntheticViewRegistry</code> is that surface &mdash; Linux&rsquo;s <code>proc_create()</code>, where the lock subsystem registers <code>/proc/locks</code> rather than the VFS special-casing it.</p>
 
 <table>
   <thead><tr><th>View</th><th>Provider</th><th>Owner</th><th>Admin-gated</th></tr></thead>
   <tbody>
-    <tr><td><code>/__sys__/locks</code></td><td><code>LocksProcfs</code></td><td><code>core/lock/</code> (LockManager)</td><td>yes</td></tr>
-    <tr><td><code>/__sys__/zones</code></td><td><code>ZonesProcfs</code></td><td><code>federation/</code> (via &sect;3.B.1 slot)</td><td>no &mdash; topology the peers already share</td></tr>
-    <tr><td><code>/__sys__/auth/keys</code></td><td><code>AuthKeysProcfs</code></td><td><code>auth/</code> (via &sect;3.B.3 slot)</td><td>yes</td></tr>
+    <tr><td><code>/__sys__/locks</code></td><td><code>LocksView</code></td><td><code>core/lock/</code> (LockManager)</td><td>yes</td></tr>
+    <tr><td><code>/__sys__/zones</code></td><td><code>ZonesView</code></td><td><code>federation/</code> (via &sect;3.B.1 slot)</td><td>no &mdash; topology the peers already share</td></tr>
+    <tr><td><code>/__sys__/auth/keys</code></td><td><code>AuthKeysView</code></td><td><code>auth/</code> (via &sect;3.B.3 slot)</td><td>yes</td></tr>
   </tbody>
 </table>
 
 <pre class="mermaid">
 graph TB
-    subgraph REG["ProcfsRegistry (kernel-owned)"]
+    subgraph REG["SyntheticViewRegistry (kernel-owned)"]
         R1["Sorting + cursor pagination"]
         R2["Every view pages identically"]
     end
@@ -1481,7 +1481,7 @@ graph TB
         F4["kernel/dispatch.rs<br/>Native INTERCEPT hook dispatch<br/>(dispatch_native_pre / _post,<br/>register_native_hook)"]
         F5["kernel/observability.rs<br/>Observer registry, file-watch,<br/>sys_watch, dispatch_mutation"]
         F6["kernel/mount.rs<br/>Mount-table primitives:<br/>add_mount, remove_mount,<br/>install_mount_metastore, route"]
-        F7["kernel/federation.rs<br/>DistributedCoordinator slot accessors,<br/>/__sys__/zones/ procfs synthesisers,<br/>blob-fetcher slot plumbing"]
+        F7["kernel/federation.rs<br/>DistributedCoordinator slot accessors,<br/>/__sys__/zones/ synthetic-view synthesisers,<br/>blob-fetcher slot plumbing"]
         F8["kernel/convenience.rs<br/>Tier 2 KernelConvenience trait:<br/>access, mkdir, rmdir,<br/>stat_batch, exists_batch,<br/>get_content_id, is_directory,<br/>set_xattr / get_xattr / get_xattr_bulk,<br/>Tier 2 write (create-or-overwrite),<br/>single-file read / unlink defaults"]
     end
 

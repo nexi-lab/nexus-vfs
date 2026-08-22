@@ -131,7 +131,7 @@ pub trait AuthKeyStore: Send + Sync {
 ///
 /// A kernel booted without federation (or before the host binary wires
 /// the raft impl) still has to answer. Reads resolve nothing and the
-/// procfs view lists nothing, so a provider running against it
+/// synthetic view lists nothing, so a provider running against it
 /// authenticates no one — fail-closed by construction. Writes, by
 /// contrast, **fail loud**: a minted key that silently went nowhere is
 /// far worse than a visible error, because the operator would hand out a

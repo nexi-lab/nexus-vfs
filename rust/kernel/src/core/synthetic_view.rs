@@ -1,15 +1,15 @@
-//! Procfs registry — §4 kernel primitive.
+//! Synthetic-view registry — §4 kernel primitive.
 //!
 //! **Linux analogue:** `proc_create()` / `struct proc_dir_entry`. The VFS
 //! does not special-case `/proc/locks` in its readdir path; the lock
 //! subsystem *registers* a proc entry and procfs dispatches to it. Same
 //! here: a subsystem that wants a read-only `/__sys__/<name>` view
-//! registers a [`ProcfsProvider`], and the syscall spine keeps **one**
+//! registers a [`SyntheticViewProvider`], and the syscall spine keeps **one**
 //! dispatch instead of growing a branch per view.
 //!
 //! ## What belongs behind this, and what does not
 //!
-//! A procfs view is a **projection of state the kernel already holds**,
+//! A synthetic view is a **projection of state the kernel already holds**,
 //! synthesised on read — advisory locks, cluster zones, credential
 //! hashes. It exists because that state is a kernel-internal primitive
 //! that deliberately is *not* a file (a lock is not a file; a credential
@@ -27,7 +27,7 @@
 //!   at a view's path lands (at most) an inert metadata entry in the file
 //!   tree; it cannot mutate the primitive behind the view.
 //! * **Gated at the view, not at `/__sys__`.** Each provider declares its
-//!   own [`ProcfsProvider::admin_only`]. A refused caller gets an **empty
+//!   own [`SyntheticViewProvider::admin_only`]. A refused caller gets an **empty
 //!   listing, never an error** — an error would answer "does this entry
 //!   exist?" to someone who may not ask.
 //! * **Providers take `&Kernel`** so they stay unit structs with no
@@ -40,7 +40,7 @@ use parking_lot::RwLock;
 use crate::kernel::Kernel;
 
 /// A read-only synthesised view rooted at a `/__sys__/<name>` prefix.
-pub trait ProcfsProvider: Send + Sync {
+pub trait SyntheticViewProvider: Send + Sync {
     /// Virtual path this provider owns, e.g. `/__sys__/locks`. The
     /// registry routes `<prefix>` and `<prefix>/<sub_path>` to it.
     fn prefix(&self) -> &str;
@@ -60,11 +60,11 @@ pub trait ProcfsProvider: Send + Sync {
 
 /// The registered views. One per prefix.
 #[derive(Default)]
-pub struct ProcfsRegistry {
-    providers: RwLock<Vec<Arc<dyn ProcfsProvider>>>,
+pub struct SyntheticViewRegistry {
+    providers: RwLock<Vec<Arc<dyn SyntheticViewProvider>>>,
 }
 
-impl ProcfsRegistry {
+impl SyntheticViewRegistry {
     pub fn new() -> Self {
         Self::default()
     }
@@ -74,7 +74,7 @@ impl ProcfsRegistry {
     /// Replace-by-prefix, not accumulate: boot paths that run more than
     /// once must not stack duplicate providers behind one path, which
     /// would double every entry in the listing.
-    pub fn register(&self, provider: Arc<dyn ProcfsProvider>) {
+    pub fn register(&self, provider: Arc<dyn SyntheticViewProvider>) {
         let mut providers = self.providers.write();
         let prefix = provider.prefix().to_string();
         providers.retain(|p| p.prefix() != prefix);
@@ -87,7 +87,7 @@ impl ProcfsRegistry {
     /// Matches `<prefix>` exactly, or `<prefix>/…` at a `/` boundary — so
     /// a `/__sys__/locksmith` path never lands in the `/__sys__/locks`
     /// view.
-    pub fn resolve(&self, path: &str) -> Option<(Arc<dyn ProcfsProvider>, String)> {
+    pub fn resolve(&self, path: &str) -> Option<(Arc<dyn SyntheticViewProvider>, String)> {
         let providers = self.providers.read();
         for provider in providers.iter() {
             let prefix = provider.prefix();
@@ -110,7 +110,7 @@ mod tests {
 
     struct Fake(&'static str, bool);
 
-    impl ProcfsProvider for Fake {
+    impl SyntheticViewProvider for Fake {
         fn prefix(&self) -> &str {
             self.0
         }
@@ -124,7 +124,7 @@ mod tests {
 
     #[test]
     fn resolves_the_view_root_and_sub_paths() {
-        let reg = ProcfsRegistry::new();
+        let reg = SyntheticViewRegistry::new();
         reg.register(Arc::new(Fake("/__sys__/locks", true)));
 
         let (p, sub) = reg.resolve("/__sys__/locks").expect("view root");
@@ -137,7 +137,7 @@ mod tests {
 
     #[test]
     fn a_prefix_only_matches_at_a_path_boundary() {
-        let reg = ProcfsRegistry::new();
+        let reg = SyntheticViewRegistry::new();
         reg.register(Arc::new(Fake("/__sys__/locks", true)));
         // Neighbouring name that merely shares a string prefix.
         assert!(reg.resolve("/__sys__/locksmith").is_none());
@@ -147,7 +147,7 @@ mod tests {
 
     #[test]
     fn re_registering_a_prefix_replaces_rather_than_stacks() {
-        let reg = ProcfsRegistry::new();
+        let reg = SyntheticViewRegistry::new();
         reg.register(Arc::new(Fake("/__sys__/locks", true)));
         reg.register(Arc::new(Fake("/__sys__/locks", false)));
         assert_eq!(reg.providers.read().len(), 1);

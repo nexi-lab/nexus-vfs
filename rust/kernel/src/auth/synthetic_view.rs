@@ -1,4 +1,4 @@
-//! `/__sys__/auth/keys` — the credential procfs view.
+//! `/__sys__/auth/keys` — the credential synthetic view.
 //!
 //! Linux `/proc/keys`. Credential records are a kernel-internal primitive
 //! living in their own raft tree (§3.B.3), deliberately off the
@@ -7,15 +7,15 @@
 //! records would otherwise have had as files — read-only, admin-gated,
 //! and with no way through it to the store.
 
-use crate::core::procfs::ProcfsProvider;
+use crate::core::synthetic_view::SyntheticViewProvider;
 use crate::kernel::Kernel;
 
 /// Entry type reported per key. `DT_REG` — a hash projects as a leaf.
 const DT_REG: u8 = 0;
 
-pub struct AuthKeysProcfs;
+pub struct AuthKeysView;
 
-impl ProcfsProvider for AuthKeysProcfs {
+impl SyntheticViewProvider for AuthKeysView {
     fn prefix(&self) -> &str {
         contracts::AUTH_KEYS_PATH_PREFIX
     }

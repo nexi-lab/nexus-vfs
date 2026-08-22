@@ -1,7 +1,7 @@
 //! KernelDispatch — pure Rust dispatch traits + PathTrie.
 //!
 //! Contains:
-//!   - PathResolver: virtual path short-circuit (PRE-DISPATCH phase, procfs-style)
+//!   - PathResolver: virtual path short-circuit (PRE-DISPATCH phase)
 //!   - MutationObserver: fire-and-forget event notification (OBSERVE phase, fsnotify-style)
 //!   - FileEvent / FileEventType: kernel I/O event types
 //!   - NativeInterceptHook: INTERCEPT hook trait (pre/post syscall interception)

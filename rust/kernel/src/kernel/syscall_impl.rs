@@ -1108,13 +1108,13 @@ impl Kernel {
             return None;
         }
 
-        // 2.5 Federation procfs: /__sys__/zones/<id> exposes raft cluster
+        // 2.5 Federation synthetic_views: /__sys__/zones/<id> exposes raft cluster
         // status as a synthesised file entry; /__sys__/zones/ exposes the
         // zone-id directory.  This is the read side of the kernel's
         // virtual federation namespace — service-tier callers read zone
         // state through `sys_stat` instead of a direct kernel
         // accessor on the coordinator.
-        if let Some(stat) = self.zones_procfs_stat(path) {
+        if let Some(stat) = self.zones_view_stat(path) {
             return Some(stat);
         }
 
@@ -3747,7 +3747,7 @@ impl Kernel {
     /// the last path from the previous page.
     ///
     /// Dispatches `/__sys__/…` paths to their registered
-    /// [`crate::core::procfs::ProcfsProvider`] (locks, zones, auth keys).
+    /// [`crate::core::synthetic_view::SyntheticViewProvider`] (locks, zones, auth keys).
     pub fn readdir_paged(
         &self,
         parent_path: &str,
@@ -3756,13 +3756,13 @@ impl Kernel {
         limit: usize,
         cursor: Option<&str>,
     ) -> super::ReadDirResult {
-        // Procfs views — one dispatch covering every registered view. A
-        // new view is a `procfs.register(…)`, never another branch here.
+        // Synthetic views — one dispatch covering every registered view. A
+        // new view is a `synthetic_views.register(…)`, never another branch here.
         //
         // Every view lives under `/__sys__/`, so an ordinary readdir pays
         // exactly one `starts_with` and never touches the registry.
         if let Some((provider, sub_path)) = contracts::is_system_path(parent_path)
-            .then(|| self.procfs.resolve(parent_path))
+            .then(|| self.synthetic_views.resolve(parent_path))
             .flatten()
         {
             // A refused caller gets an empty listing rather than an
