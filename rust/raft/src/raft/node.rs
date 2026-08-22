@@ -1665,6 +1665,13 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         voter_ids_from_raw_node(&self.raw_node)
     }
 
+    /// Whether this node is the leader of its zone — a cheap `RawNode` state
+    /// read. Gates the transport loop's leader-only quorum-at-risk WARN so a
+    /// follower never false-alarms on a transient vote-send failure.
+    pub fn is_leader(&self) -> bool {
+        self.raw_node.raft.state == raft::StateRole::Leader
+    }
+
     /// Tell raft-rs that a peer became unreachable.
     ///
     /// Required by raft-rs's driver contract — when the transport

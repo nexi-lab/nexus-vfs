@@ -31,7 +31,7 @@ use super::{NodeAddress, SharedPeerMap};
 use crate::raft::{StateMachine, ZoneConsensusDriver};
 use protobuf::Message as ProtobufV2Message;
 use raft::eraftpb::MessageType;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
@@ -50,6 +50,97 @@ use std::time::Duration as StdDuration;
 struct TransportFailure {
     peer_id: u64,
     is_snapshot: bool,
+}
+
+/// How long a voter must be continuously unreachable before the quorum-at-risk
+/// WARN fires — short enough to catch a stuck bring-up fast, long enough to
+/// ignore a transient blip or normal election churn.
+const VOTER_UNREACHABLE_WARN_AFTER: StdDuration = StdDuration::from_secs(5);
+/// A voter with no send failure for this long is treated as recovered: its
+/// episode state is dropped so a later failure re-arms a fresh WARN. Kept well
+/// above the raft-rs probe interval so a still-dead voter (which keeps
+/// generating probe-send failures) is never prematurely reset to "healthy".
+const VOTER_RECOVERED_AFTER: StdDuration = StdDuration::from_secs(10);
+
+/// Fail-loud on a persistently-unreachable VOTER that blocks quorum.
+///
+/// Diagnostic only — it changes NO raft behavior. It exists because a voter the
+/// leader admitted but cannot reach silently stalls commit (`safe_commit` never
+/// advances); the operator otherwise has to reverse-engineer node IDs from
+/// send-failure spam. State is in-memory only (never persisted), and the voter
+/// set is read from the raft-rs `ProgressTracker` SSOT on each check — no shadow
+/// membership list.
+#[derive(Default)]
+struct QuorumHealth {
+    /// peer_id → (episode start, last failure seen). An "episode" is a run of
+    /// send failures with no ≥ [`VOTER_RECOVERED_AFTER`] gap.
+    failing: HashMap<u64, (Instant, Instant)>,
+    /// Peers already WARNed this episode — the WARN fires ONCE per episode, not
+    /// every tick, so it never spams the hot loop.
+    warned: HashSet<u64>,
+}
+
+impl QuorumHealth {
+    /// Record a transport send failure for `peer_id`.
+    fn note_failure(&mut self, peer_id: u64, now: Instant) {
+        self.failing
+            .entry(peer_id)
+            .and_modify(|(_, last)| *last = now)
+            .or_insert((now, now));
+    }
+
+    /// Voters that just crossed into "unreachable long enough that quorum is
+    /// actually at risk" and haven't been WARNed yet this episode. GCs
+    /// recovered peers. Only the leader evaluates — it owns commit progress.
+    fn newly_at_risk(
+        &mut self,
+        voters: &[u64],
+        is_leader: bool,
+        now: Instant,
+    ) -> Vec<(u64, StdDuration)> {
+        // Drop recovered peers (no recent failure) so a fresh failure re-arms.
+        let recovered: Vec<u64> = self
+            .failing
+            .iter()
+            .filter_map(|(peer, (_, last))| {
+                (now.duration_since(*last) > VOTER_RECOVERED_AFTER).then_some(*peer)
+            })
+            .collect();
+        for peer in recovered {
+            self.failing.remove(&peer);
+            self.warned.remove(&peer);
+        }
+        if !is_leader {
+            return Vec::new();
+        }
+        let unreachable: Vec<u64> = voters
+            .iter()
+            .copied()
+            .filter(|peer| {
+                self.failing.get(peer).is_some_and(|(first, _)| {
+                    now.duration_since(*first) >= VOTER_UNREACHABLE_WARN_AFTER
+                })
+            })
+            .collect();
+        // Only shout when quorum is ACTUALLY threatened (reachable < majority) —
+        // a single dead voter in a healthy 3-voter zone is not a deadlock.
+        let quorum = voters.len() / 2 + 1;
+        if voters.len().saturating_sub(unreachable.len()) >= quorum {
+            return Vec::new();
+        }
+        unreachable
+            .into_iter()
+            .filter(|peer| self.warned.insert(*peer))
+            .map(|peer| {
+                let since = self
+                    .failing
+                    .get(&peer)
+                    .map(|(first, _)| now.duration_since(*first))
+                    .unwrap_or_default();
+                (peer, since)
+            })
+            .collect()
+    }
 }
 
 /// Outcome of an EC replication attempt — surfaced back from a spawned
@@ -259,6 +350,9 @@ pub struct TransportLoop<S: StateMachine + 'static> {
     /// of each [`Self::run`] iteration; ack updates land before the
     /// next round of `spawn_ec_replications` consults `ec_peer_state`.
     ec_completion_rx: mpsc::UnboundedReceiver<EcCompletion>,
+    /// Per-peer send-failure tracking behind the quorum-at-risk WARN.
+    /// Ephemeral diagnostic state — never persisted, never feeds raft.
+    quorum_health: QuorumHealth,
 }
 
 impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
@@ -293,6 +387,7 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
             failure_rx,
             ec_completion_tx,
             ec_completion_rx,
+            quorum_health: QuorumHealth::default(),
         }
     }
 
@@ -349,11 +444,52 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
             //     Replicate / Snapshot).  Cheap: non-blocking try_recv
             //     drain, returns immediately when the channel is empty
             //     (the steady-state happy path).
+            let failure_scan_now = Instant::now();
             while let Ok(failure) = self.failure_rx.try_recv() {
                 self.driver.report_unreachable(failure.peer_id);
                 if failure.is_snapshot {
                     self.driver
                         .report_snapshot(failure.peer_id, raft::SnapshotStatus::Failure);
+                }
+                // Track the failure episode so a voter that stays unreachable
+                // long enough to block quorum surfaces ONE loud, actionable
+                // WARN instead of a silent commit stall.
+                self.quorum_health
+                    .note_failure(failure.peer_id, failure_scan_now);
+            }
+            // Fail-loud when a VOTER (read from `driver.voter_ids()` — the
+            // ProgressTracker SSOT) has been unreachable past the threshold and
+            // that costs us quorum. Once per episode; diagnostic only, no raft
+            // behavior change.
+            {
+                let voters = self.driver.voter_ids();
+                let is_leader = self.driver.is_leader();
+                for (peer_id, since) in
+                    self.quorum_health
+                        .newly_at_risk(&voters, is_leader, failure_scan_now)
+                {
+                    let voter_addr = self
+                        .peers
+                        .read()
+                        .unwrap()
+                        .get(&peer_id)
+                        .map(|a| a.to_operator_str())
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    let quorum = voters.len() / 2 + 1;
+                    tracing::warn!(
+                        zone = %self.zone_id,
+                        voter = peer_id,
+                        %voter_addr,
+                        unreachable_secs = since.as_secs(),
+                        voters = voters.len(),
+                        quorum,
+                        "voter unreachable long enough to BLOCK QUORUM — this zone cannot commit \
+                         (safe_commit stalls). Most common cause: a stale-identity join (a node that \
+                         changed its node_id after joining, or rejoined a re-founded zone — \
+                         identity.json survives data-dir wipes). Fix: `nexusd-cluster remove-voter \
+                         <peer_addr> <zone>` to drop the dead voter, or re-found with a fresh \
+                         --identity-dir on EVERY node."
+                    );
                 }
             }
 
@@ -1204,5 +1340,77 @@ mod tests {
         // Verify timeout is reasonable
         assert!(RAFT_SEND_TIMEOUT.as_secs() >= 1);
         assert!(RAFT_SEND_TIMEOUT.as_secs() <= 30);
+    }
+}
+
+#[cfg(test)]
+mod quorum_health_tests {
+    use super::{QuorumHealth, VOTER_RECOVERED_AFTER, VOTER_UNREACHABLE_WARN_AFTER};
+    use std::time::{Duration, Instant};
+
+    /// Drive `QuorumHealth` the way the transport loop does — a dead voter
+    /// generates a send failure every second — and count total WARNs emitted
+    /// over `secs`. Synthetic `now` values, so no real sleeps.
+    fn run(voters: &[u64], failing_peer: u64, is_leader: bool, secs: u64) -> usize {
+        let t0 = Instant::now();
+        let mut qh = QuorumHealth::default();
+        let mut warns = 0;
+        for s in 0..=secs {
+            let now = t0 + Duration::from_secs(s);
+            qh.note_failure(failing_peer, now);
+            warns += qh.newly_at_risk(voters, is_leader, now).len();
+        }
+        warns
+    }
+
+    #[test]
+    fn warns_once_when_a_dead_voter_blocks_quorum() {
+        // 2-voter zone, peer 2 dead → reachable {1} < quorum 2 → exactly ONE
+        // WARN once it has been failing past the threshold (not per tick).
+        assert_eq!(run(&[1, 2], 2, true, 8), 1);
+    }
+
+    #[test]
+    fn silent_below_the_threshold() {
+        let secs = VOTER_UNREACHABLE_WARN_AFTER.as_secs().saturating_sub(1);
+        assert_eq!(run(&[1, 2], 2, true, secs), 0);
+    }
+
+    #[test]
+    fn silent_when_quorum_still_holds() {
+        // 3-voter zone, one dead → reachable {1,2} == quorum 2 → not a deadlock.
+        assert_eq!(run(&[1, 2, 3], 3, true, 8), 0);
+    }
+
+    #[test]
+    fn silent_on_a_follower() {
+        assert_eq!(run(&[1, 2], 2, false, 8), 0);
+    }
+
+    #[test]
+    fn re_arms_after_recovery() {
+        let t0 = Instant::now();
+        let mut qh = QuorumHealth::default();
+        let voters = [1u64, 2u64];
+        let mut warns = 0;
+        for s in 0..=6 {
+            let now = t0 + Duration::from_secs(s);
+            qh.note_failure(2, now);
+            warns += qh.newly_at_risk(&voters, true, now).len();
+        }
+        assert_eq!(warns, 1, "episode 1: one WARN");
+        // No failures for > RECOVERED_AFTER → episode state GC'd (voter recovered).
+        let recovered_at =
+            t0 + Duration::from_secs(6) + VOTER_RECOVERED_AFTER + Duration::from_secs(1);
+        assert!(qh.newly_at_risk(&voters, true, recovered_at).is_empty());
+        // A fresh failure episode re-arms a new WARN.
+        let t1 = recovered_at + Duration::from_secs(1);
+        let mut warns2 = 0;
+        for s in 0..=6 {
+            let now = t1 + Duration::from_secs(s);
+            qh.note_failure(2, now);
+            warns2 += qh.newly_at_risk(&voters, true, now).len();
+        }
+        assert_eq!(warns2, 1, "a new episode after recovery re-arms the WARN");
     }
 }
