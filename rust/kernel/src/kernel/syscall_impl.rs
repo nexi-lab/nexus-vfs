@@ -1332,6 +1332,23 @@ impl Kernel {
             entry.size
         };
 
+        // Same seam as `size` — a DT_STREAM's live modified_at_ms is
+        // the stream subsystem's last-append wall-clock, not the
+        // metastore row (which never updates on stream push since
+        // writes short-circuit into the stream buffer).  Search
+        // recency, audit staleness gates, and cross-agent mailbox
+        // catch-up all depend on this.  Falls back to
+        // `entry.modified_at_ms` when the buffer isn't locally
+        // resolvable (remote-only streams) or when the stream has
+        // never been appended to on this replica.
+        let modified_at_ms = if entry.entry_type == DT_STREAM {
+            self.stream_manager
+                .last_append_ms(path)
+                .or(entry.modified_at_ms)
+        } else {
+            entry.modified_at_ms
+        };
+
         Some(StatResult {
             path: path.to_string(),
             size,
@@ -1344,7 +1361,7 @@ impl Kernel {
             gen: entry.gen,
             zone_id: entry.zone_id,
             created_at_ms: entry.created_at_ms,
-            modified_at_ms: entry.modified_at_ms,
+            modified_at_ms,
             last_writer_address: entry.last_writer_address,
             lock,
             link_target: entry.link_target,

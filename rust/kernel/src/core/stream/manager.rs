@@ -375,6 +375,15 @@ impl StreamManager {
         self.resolve(path).map(|b| b.tail_offset())
     }
 
+    /// Unix-ms of the last successful append to the stream at `path`.
+    /// `None` when the stream is not registered, or when the backend
+    /// has not been appended to yet (or the backend does not track
+    /// wall-clock time — see [`StreamBackend::last_append_ms`]).
+    /// Surfaced by `sys_stat` as the stream's `modified_at_ms`.
+    pub fn last_append_ms(&self, path: &str) -> Option<i64> {
+        self.resolve(path).and_then(|b| b.last_append_ms())
+    }
+
     /// Append all entries from `from` (starting at `from_offset`) into `to`.
     ///
     /// Analogous to a read-then-write splice between two DT_STREAMs. `to` must
