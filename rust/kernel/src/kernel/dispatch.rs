@@ -181,7 +181,7 @@ impl Kernel {
         ctx: &OperationContext,
     ) -> Result<(), KernelError> {
         // System-level short-circuits stay in the kernel — they are
-        // language-of-the-kernel concepts (procfs, system contexts),
+        // language-of-the-kernel concepts (synthetic views, system contexts),
         // not authorization decisions.
         if path.starts_with("/__sys__/") {
             return Ok(());

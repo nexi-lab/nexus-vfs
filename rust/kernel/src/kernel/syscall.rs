@@ -182,7 +182,7 @@ pub trait KernelSyscall: Send + Sync + 'static {
     fn sys_unlock(&self, path: &str, lock_id: &str, force: bool) -> Result<bool, KernelError>;
 
     /// Directory listing with metastore + backend merge. Returns
-    /// Vec<(child_path, entry_type)>. Handles procfs intercepts
+    /// Vec<(child_path, entry_type)>. Handles synthetic-view intercepts
     /// (e.g. `/__sys__/zones/`). `opts` selects single-level (default) vs a
     /// recursive whole-subtree scan and an optional entry cap — see
     /// [`ReaddirOpts`]; a traversal is one server-side call, never client-side

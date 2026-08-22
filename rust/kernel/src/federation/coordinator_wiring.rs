@@ -1,4 +1,4 @@
-//! Federation kernel-side slot accessors + `/__sys__/zones/` procfs
+//! Federation kernel-side slot accessors + `/__sys__/zones/` synthetic-view
 //! synthesisers.
 //!
 //! Two §3.B-style kernel slots live here, each a single `Arc<dyn ...>`
@@ -25,7 +25,7 @@ use std::sync::Arc;
 use contracts::ZONES_PATH_PREFIX;
 
 use crate::abc::object_store::ObjectStore;
-use crate::core::procfs::ProcfsProvider;
+use crate::core::synthetic_view::SyntheticViewProvider;
 use crate::kernel::{Kernel, StatResult};
 use crate::meta_store::DT_DIR;
 
@@ -76,13 +76,13 @@ impl Kernel {
         self.federation_cache.get().cloned()
     }
 
-    /// Federation procfs: synthesise a `StatResult` for paths under the
+    /// Federation synthetic view: synthesise a `StatResult` for paths under the
     /// `/__sys__/zones/` virtual namespace.  Read-only — like Linux
     /// `/proc`, callers cannot create / remove a zone by writing to
     /// this path.  Returns `Some` for `/__sys__/zones/` (directory
     /// marker) and `/__sys__/zones/<id>` (per-zone synthesised entry);
     /// `None` otherwise so the caller falls through to normal routing.
-    pub(crate) fn zones_procfs_stat(&self, path: &str) -> Option<StatResult> {
+    pub(crate) fn zones_view_stat(&self, path: &str) -> Option<StatResult> {
         let suffix = path.strip_prefix(ZONES_PATH_PREFIX)?;
         let provider = self.distributed_coordinator();
         // Directory marker.
@@ -135,16 +135,16 @@ impl Kernel {
     }
 }
 
-/// `/__sys__/zones` — the federation procfs view.
+/// `/__sys__/zones` — the federation synthetic view.
 ///
-/// `zones_procfs_stat` above synthesises a per-zone entry for `sys_stat`;
+/// `zones_view_stat` above synthesises a per-zone entry for `sys_stat`;
 /// this is the matching `readdir`, registered into the
-/// [`crate::core::procfs`] registry at kernel boot. Zone membership is
+/// [`crate::core::synthetic_view`] registry at kernel boot. Zone membership is
 /// cluster topology the peers already know, so unlike the locks and
 /// credential views this one is not admin-gated.
-pub struct ZonesProcfs;
+pub struct ZonesView;
 
-impl ProcfsProvider for ZonesProcfs {
+impl SyntheticViewProvider for ZonesView {
     fn prefix(&self) -> &str {
         ZONES_PATH_PREFIX
     }

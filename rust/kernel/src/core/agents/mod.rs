@@ -8,7 +8,7 @@
 //!
 //! Linux analogue: this is the kernel-owned `task_struct` ↔ pid_hash
 //! pairing.  Kernel constructs + mutates the registry; service-tier
-//! procfs views (`fs/proc/`) read it through shared references.
+//! synthetic views (`fs/proc/`) read it through shared references.
 //!
 //! Kernel owns the data; services owns the views (preserves the
 //! one-way `services -> kernel` dependency).

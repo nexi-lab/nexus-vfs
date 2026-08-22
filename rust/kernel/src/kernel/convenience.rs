@@ -501,7 +501,7 @@ impl KernelConvenience for Kernel {
     fn stat_batch(&self, paths: &[String], zone_id: &str) -> Vec<Option<StatResult>> {
         // Optimized: use metastore.get_batch in a single redb read txn,
         // then convert to StatResult. Falls back to per-path sys_stat
-        // for paths that need special handling (procfs, implicit dirs).
+        // for paths that need special handling (synthetic views, implicit dirs).
         let mount_point = if let Some(first) = paths.first() {
             self.resolve_mount_point(first, zone_id)
         } else {
@@ -517,7 +517,7 @@ impl KernelConvenience for Kernel {
                     match opt {
                         Some(entry) => Some(StatResult::from(entry)),
                         None => {
-                            // Fallback to sys_stat for implicit dirs, procfs, etc.
+                            // Fallback to sys_stat for implicit dirs, synthetic views, etc.
                             self.sys_stat(&paths[i], zone_id)
                         }
                     }

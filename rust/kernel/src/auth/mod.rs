@@ -7,10 +7,10 @@
 //!   installs at boot. The field itself sits on [`crate::kernel::Kernel`]
 //!   next to the other slot declarations; only the accessors live here,
 //!   the same split `federation/coordinator_wiring.rs` uses.
-//! * [`procfs`] — the read-only `/__sys__/auth/keys/` view over that
+//! * [`synthetic_view`] — the read-only `/__sys__/auth/keys/` view over that
 //!   slot.
 
-pub mod procfs;
+pub mod synthetic_view;
 pub mod wiring;
 
-pub use procfs::AuthKeysProcfs;
+pub use synthetic_view::AuthKeysView;
