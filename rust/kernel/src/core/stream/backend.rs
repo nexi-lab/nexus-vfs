@@ -39,4 +39,17 @@ pub trait StreamBackend: Send + Sync {
     fn earliest_offset(&self) -> usize {
         0
     }
+
+    /// Unix-ms timestamp of the most recent successful append; `None` when
+    /// the stream has never been appended to, or when the backend does not
+    /// track wall-clock time on push (some read-only or forwarding backends).
+    /// Used by `sys_stat` to surface a stream's `modified_at_ms` field —
+    /// same POSIX `st_mtime` semantic as regular files, since the metastore
+    /// entry's `modified_at_ms` is not maintained for streams (writes short-
+    /// circuit into the stream buffer and never touch the metastore row).
+    /// Consumers include search-plugin recency scoring, audit-tier
+    /// staleness checks, and cross-agent mailbox catch-up freshness gates.
+    fn last_append_ms(&self) -> Option<i64> {
+        None
+    }
 }

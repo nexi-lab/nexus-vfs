@@ -25,7 +25,7 @@
 //!
 //! No `head` field — DT_STREAM readers maintain independent cursors externally.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
 
@@ -103,6 +103,15 @@ pub struct SharedMemoryStreamBackend {
     /// peer process's responsibility under the single-writer
     /// contract.
     writer: Mutex<()>,
+    /// Unix-ms of the last successful in-process push, stamped in
+    /// [`Self::push`].  Per-process (Rust-level) rather than
+    /// mmap-embedded: the kernel that owns this backend instance is
+    /// the same process that calls `sys_stat`, so a
+    /// per-process AtomicI64 gives sys_stat its live
+    /// `modified_at_ms`.  Cross-process consumers reading the mmap
+    /// directly do not see this; they were already outside the
+    /// single-writer contract.  `0` sentinel = never appended.
+    last_append_ms: AtomicI64,
 }
 
 // SAFETY: The `writer` mutex makes the `&mut [u8]` borrow into the
@@ -260,6 +269,15 @@ impl crate::stream::StreamBackend for SharedMemoryStreamBackend {
     fn push(&self, data: &[u8]) -> Result<usize, StreamError> {
         let offset = self.push_inner(data)?;
         self.notify_data();
+        // Stamp last-append wall-clock so sys_stat surfaces a live
+        // modified_at_ms.  Same posture as MemoryStreamBackend +
+        // WalStreamCore; see the field doc for the per-process
+        // caveat under cross-process SHM readers.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        self.last_append_ms.store(now_ms, Ordering::Relaxed);
         Ok(offset)
     }
     fn read_at(&self, offset: usize) -> Result<(Vec<u8>, usize), StreamError> {
@@ -300,6 +318,12 @@ impl crate::stream::StreamBackend for SharedMemoryStreamBackend {
     }
     fn msg_count(&self) -> usize {
         self.msg_count().load(Ordering::Relaxed)
+    }
+    fn last_append_ms(&self) -> Option<i64> {
+        match self.last_append_ms.load(Ordering::Relaxed) {
+            0 => None,
+            ms => Some(ms),
+        }
     }
 }
 
@@ -359,6 +383,7 @@ impl SharedMemoryStreamBackend {
             is_creator: true,
             shm_path: shm_path.clone(),
             writer: Mutex::new(()),
+            last_append_ms: AtomicI64::new(0),
         };
 
         Ok((core, shm_path, data_fds[0]))
@@ -399,6 +424,7 @@ impl SharedMemoryStreamBackend {
             is_creator: false,
             shm_path: shm_path.to_string(),
             writer: Mutex::new(()),
+            last_append_ms: AtomicI64::new(0),
         })
     }
 

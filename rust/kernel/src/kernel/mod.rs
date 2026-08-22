@@ -3491,6 +3491,64 @@ mod tests {
         assert_eq!(stat.size, 19, "tail = (4+5) + (4+6) = 19 framed bytes");
     }
 
+    /// `sys_stat` reports a DT_STREAM's last-append wall-clock as
+    /// `modified_at_ms` (same seam as tail-as-size above).  The
+    /// metastore entry's `modified_at_ms` is not touched by stream
+    /// pushes (writes short-circuit into the stream buffer), so
+    /// without this branch a stream always stats with the create-
+    /// time mtime — breaks search recency scoring, audit staleness
+    /// gates, and any consumer treating the field as "when did this
+    /// inode last get written."  Verifies:
+    ///   * fresh stream → `modified_at_ms` == entry.modified_at_ms
+    ///     (falls back cleanly, no NULL surprise);
+    ///   * after a push → `modified_at_ms` is a real unix-ms and
+    ///     >= the pre-push wall-clock (monotonic-ish);
+    ///   * a second push moves the timestamp forward (or keeps it
+    ///     equal on very fast clocks — the test tolerates equality).
+    #[test]
+    fn sys_stat_reports_stream_last_append_as_modified_at_ms() {
+        let k = kernel_with_root_backend();
+        let path = "/audit-stream";
+        setattr(&k, path, DT_STREAM as i32).unwrap();
+
+        // Fresh: last_append_ms sentinel `0` → falls back to metastore mtime.
+        let fresh = k.sys_stat(path, "root").expect("stat fresh stream");
+        assert_eq!(fresh.entry_type, DT_STREAM);
+        let create_mtime = fresh.modified_at_ms;
+
+        // Push and read wall-clock BEFORE the read, so `after >= before`
+        // is safe under clock skew tolerance.
+        let ctx = OperationContext::new("test", "root", true, None, true);
+        let before_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        k.stream_write_nowait(path, b"line-1", &ctx).unwrap();
+
+        let stat1 = k.sys_stat(path, "root").expect("stat after first push");
+        let m1 = stat1
+            .modified_at_ms
+            .expect("modified_at_ms must be Some after a push");
+        assert!(
+            m1 >= before_ms,
+            "modified_at_ms ({m1}) must be >= pre-push wall-clock ({before_ms})",
+        );
+        assert!(
+            create_mtime.is_none() || m1 >= create_mtime.unwrap_or(0),
+            "modified_at_ms must not go backwards from create time",
+        );
+
+        // Second push: `m2 >= m1` (equal is fine — clock resolution).
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        k.stream_write_nowait(path, b"line-2", &ctx).unwrap();
+        let stat2 = k.sys_stat(path, "root").expect("stat after second push");
+        let m2 = stat2.modified_at_ms.unwrap();
+        assert!(
+            m2 >= m1,
+            "second push's modified_at_ms ({m2}) must be >= first ({m1})",
+        );
+    }
+
     /// `sys_setattr DT_MOUNT` dispatches a `FileEventType::Mount`
     /// event through `MutationObserver`. Wired for services-tier
     /// consumers (e.g. `services::audit::ZoneAuditAutoWire`) to

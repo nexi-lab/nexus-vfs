@@ -26,7 +26,7 @@
 //! raft log's. A write is durable (raft-committed) once `write_sync` returns;
 //! there is no async buffer that could silently drop it.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -218,6 +218,18 @@ pub struct WalStreamCore {
     /// this, the seal thread drops the oldest segments and advances `earliest`.
     /// From the stream's inode capacity.
     retention: u64,
+    /// Unix-ms of the last successful push, stamped locally on each
+    /// commit.  `0` sentinel = never appended locally (this replica
+    /// may have received frames via raft replay before ever taking a
+    /// leader-side write; consumers should treat `None` as "unknown"
+    /// and fall back to the metastore's `modified_at_ms` if any).
+    /// Read via [`StreamBackend::last_append_ms`] — surfaced through
+    /// `sys_stat` for search recency / audit staleness / mailbox
+    /// catch-up freshness gates.  Wall-clock, not raft-committed,
+    /// because it is a per-replica cache; a global "when did any
+    /// replica last accept a push" would need a raft-replicated
+    /// field on the WAL frame itself (out of scope here).
+    last_append_ms: AtomicI64,
 }
 
 /// One cached cold segment: `(base, end, blob)`. The `blob` is shared so the
@@ -241,6 +253,7 @@ impl WalStreamCore {
             known_floor: Arc::new(AtomicU64::new(0)),
             seg_cache: Arc::new(Mutex::new(None)),
             retention: 0,
+            last_append_ms: AtomicI64::new(0),
         }
     }
 
@@ -267,6 +280,7 @@ impl WalStreamCore {
             known_floor: Arc::new(AtomicU64::new(0)),
             seg_cache: Arc::new(Mutex::new(None)),
             retention,
+            last_append_ms: AtomicI64::new(0),
         }
     }
 
@@ -594,6 +608,14 @@ impl StreamBackend for WalStreamCore {
                 // cold segment — off the hot path (this returns immediately; the
                 // seal, if any, runs on a background thread).
                 self.maybe_trigger_seal(seq + 1);
+                // Stamp local wall-clock so sys_stat surfaces a live
+                // last-append time; see the field doc for the
+                // per-replica vs global caveat.
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                self.last_append_ms.store(now_ms, Ordering::Relaxed);
                 Ok(seq as usize)
             }
             Err(e) => {
@@ -652,6 +674,16 @@ impl StreamBackend for WalStreamCore {
 
     fn msg_count(&self) -> usize {
         WalStreamCore::tail(self) as usize
+    }
+
+    fn last_append_ms(&self) -> Option<i64> {
+        // `0` sentinel = never appended on this replica.  A follower
+        // replaying raft-committed frames does NOT bump this — the
+        // stamp reflects a locally-accepted push, per the field doc.
+        match self.last_append_ms.load(Ordering::Relaxed) {
+            0 => None,
+            ms => Some(ms),
+        }
     }
 
     fn earliest_offset(&self) -> usize {

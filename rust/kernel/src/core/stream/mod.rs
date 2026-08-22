@@ -33,7 +33,7 @@ pub mod stdio;
 pub mod wal;
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
 
@@ -64,6 +64,14 @@ pub struct MemoryStreamBackend {
     closed: AtomicBool,
     push_count: AtomicU64,
     msg_count: AtomicUsize,
+    /// Unix-ms timestamp of the most recent successful `push()`; `0`
+    /// sentinel for "never appended" (unix-ms is always > 0 for any
+    /// real system clock post-1970, so `0` is unambiguous).  Read
+    /// through [`StreamBackend::last_append_ms`] which converts the
+    /// sentinel to `None`.  Relaxed ordering is fine — the timestamp
+    /// is a monotonic-ish hint for consumers (search recency,
+    /// staleness gates), not a happens-before ordering for readers.
+    last_append_ms: AtomicI64,
     /// Serializes writers so the exclusive `&mut [u8]` borrow inside
     /// `push()` is the only one alive for that frame. Readers do not
     /// take this lock — they only Acquire-load `tail` and read
@@ -124,6 +132,13 @@ impl StreamBackend for MemoryStreamBackend {
     fn msg_count(&self) -> usize {
         self.msg_count.load(Ordering::Relaxed)
     }
+    fn last_append_ms(&self) -> Option<i64> {
+        // `0` sentinel = never appended; any real unix-ms is > 0.
+        match self.last_append_ms.load(Ordering::Relaxed) {
+            0 => None,
+            ms => Some(ms),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -172,6 +187,9 @@ impl MemoryStreamBackend {
         // Update counters
         self.msg_count.fetch_add(1, Ordering::Relaxed);
         self.push_count.fetch_add(1, Ordering::Relaxed);
+        // Stamp last-append wall-clock so `sys_stat.modified_at_ms`
+        // reflects the live tail update — same seam as tail-as-size.
+        self.stamp_append_now();
 
         Ok(msg_offset)
     }
@@ -257,8 +275,25 @@ impl MemoryStreamBackend {
             closed: AtomicBool::new(false),
             push_count: AtomicU64::new(0),
             msg_count: AtomicUsize::new(0),
+            last_append_ms: AtomicI64::new(0),
             writer: Mutex::new(()),
         }
+    }
+
+    /// Stamp the current wall-clock as the last-append time.  Called
+    /// at the tail of every successful `push()`.  Kept as a small
+    /// helper so any future backend that wants to stamp identical
+    /// semantics can share the clock source.
+    fn stamp_append_now(&self) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        // Relaxed — the timestamp is a hint, not a happens-before
+        // ordering.  Concurrent stamps race harmlessly (all values
+        // are close to `now_ms`); the winner is whichever thread
+        // stores last.
+        self.last_append_ms.store(now_ms, Ordering::Relaxed);
     }
 
     /// Signal close.
