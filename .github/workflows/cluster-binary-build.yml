@@ -23,18 +23,18 @@ jobs:
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
-            max_size_bytes: 17039360  # 16.25 MiB — raised from 16.0 for the
-                                      # DT_STREAM tiered-storage cold tier
-                                      # (#229, PR #230). Measured 16,809,344 bytes
+            max_size_bytes: 17563648  # 16.75 MiB — raised from 16.25 for the
+                                      # managed-agent control plane relocated into
+                                      # nexusd-cluster (#241). Measured 17,130,264 bytes
                                       # on this platform.
           - os: macos-14
             artifact_name: nexusd-cluster-macos-arm64
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
-            max_size_bytes: 13893632  # 13.25 MiB — raised from 13.0 for the
-                                      # DT_STREAM tiered-storage cold tier
-                                      # (#229, PR #230). Measured 13,654,992 bytes
+            max_size_bytes: 14417920  # 13.75 MiB — raised from 13.25 for the
+                                      # managed-agent control plane relocated into
+                                      # nexusd-cluster (#241). Measured 13,912,000 bytes
                                       # on this platform.
           - os: macos-14
             artifact_name: nexusd-cluster-macos-x86_64
@@ -42,18 +42,18 @@ jobs:
             bin: nexusd-cluster
             binary: nexusd-cluster
             target: x86_64-apple-darwin
-            max_size_bytes: 14942208  # 14.25 MiB — raised from 14.0 after #211
-                                      # (RegisterForeignCa) + the classify-wiring
-                                      # verifier half. Measured 14,683,456 bytes
+            max_size_bytes: 15466496  # 14.75 MiB — raised from 14.25 for the
+                                      # managed-agent control plane relocated into
+                                      # nexusd-cluster (#241). Measured 15,028,512 bytes
                                       # here (the tightest-headroom platform).
           - os: windows-latest
             artifact_name: nexusd-cluster-windows-x86_64
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster.exe
-            max_size_bytes: 15728640  # 15.0 MiB — raised from 14.75 for the
-                                      # DT_STREAM tiered-storage cold tier
-                                      # (#229, PR #230). Measured 15,524,864 bytes
+            max_size_bytes: 16252928  # 15.5 MiB — raised from 15.0 for the
+                                      # managed-agent control plane relocated into
+                                      # nexusd-cluster (#241). Measured 15,738,880 bytes
                                       # on this platform.
 
 

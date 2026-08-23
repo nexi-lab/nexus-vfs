@@ -1,0 +1,40 @@
+[package]
+name = "managed-agent"
+version = "0.1.0"
+edition = "2021"
+description = "Managed-agent control plane — ManagedAgentService (spawn/get/cancel), the SpawnTask DI seam, proc_entry + workspace-boundary hooks. Kernel-tier: knows only the SpawnTask trait, never an agent runtime."
+authors = ["Nexus Team"]
+publish = false
+
+[lib]
+name = "managed_agent"
+path = "src/lib.rs"
+
+[features]
+default = []
+# The raw ACP-subprocess control-plane spawner (raw_spawn.rs) — spawn an
+# external agent binary (scode / claude / codex) and tunnel its stdio over
+# node-local DT_STREAMs. Unix-only at the mod gate; pulls the shared
+# `subprocess` substrate. In-process co-host (SpawnTask<Kernel>) is a
+# separate DI seam wired at the binary edge, NOT a feature here.
+subprocess-host = ["dep:subprocess"]
+
+[dependencies]
+kernel = { workspace = true }
+contracts = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+dashmap = "6.1"
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+# raw_spawn's SpawnHandle holds a parking_lot::Mutex over the cancel channel
+# (sync lock in an async supervisor). Unix-only path (subprocess-host).
+parking_lot = "0.12"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+subprocess = { path = "../subprocess", optional = true }
+
+[dev-dependencies]
+# The from-stamp e2e companion test enlists the a2a MailboxStampingHook to
+# assert managed-agent's chat-with-me writes get rewritten. a2a is a sibling
+# kernel-tier crate (no cycle: a2a never depends on managed-agent).
+a2a = { workspace = true }

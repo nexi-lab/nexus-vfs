@@ -819,10 +819,20 @@ type BoxedServiceDeclsBuilder =
     Box<dyn FnOnce(&ServiceBootCtx) -> Vec<kernel::kernel::ServiceDecl> + Send>;
 
 /// Default cluster daemon entry — supplies the nexus-vfs-native service
-/// set (a2a). A fuller assembly binary (which links additional service
-/// crates) calls [`run_with_services`] with a larger decl list instead.
+/// set: the A2A messaging substrate plus the managed-agent control plane
+/// (spawn/get/cancel + procfs/workspace hooks + the raw ACP-subprocess
+/// spawner). This is what makes the production `nexusd-cluster` a complete
+/// agent host on its own — no separate assembly binary. A co-host build that
+/// additionally links an in-process runtime (sudocode) calls
+/// [`run_with_services`] with a `managed_agent` decl carrying a `SpawnTask`
+/// provider instead (that link lives at the nexus binary edge).
 pub fn run() -> Result<()> {
-    run_with_services(|ctx| vec![a2a::service_decl(ctx.auth_armed)])
+    run_with_services(|ctx| {
+        vec![
+            a2a::service_decl(ctx.auth_armed),
+            managed_agent::service_decl(),
+        ]
+    })
 }
 
 /// Cluster daemon entry, parameterised by the service set. Boots the

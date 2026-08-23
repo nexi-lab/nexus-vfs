@@ -26,6 +26,19 @@ members = [
     # profile binaries; the stamp hook alone is reused by nexus-side
     # frontends without pulling raft (see rust/a2a/Cargo.toml).
     "rust/a2a",
+    # subprocess/ — the hosted-subprocess substrate (spawn an argv child +
+    # surface its stdio to the VFS). Shared by the managed-agent raw
+    # control-plane spawner and the nexus-side ACP one-shot path. Kernel-tier:
+    # deps only kernel + tokio.
+    "rust/subprocess",
+    # managed_agent/ — the agent control plane (ManagedAgentService: spawn/
+    # get/cancel + proc_entry/workspace hooks + the SpawnTask DI seam).
+    # RELOCATED here from the nexus `services` crate so the production
+    # nexusd-cluster (built in THIS repo) carries the agent control plane
+    # directly — one production binary, no separate assembly. It knows only
+    # the SpawnTask trait (agent-runtime-free); the in-process co-host adapter
+    # that links sudocode stays at the nexus binary edge (a cycle otherwise).
+    "rust/managed_agent",
     # permission/ — the AUTHORIZATION policy sibling to `auth`.
     # `auth` answers "who is calling?"; `permission` answers "what may
     # they do?".  Not a kernel primitive, not a RustService: a profile
@@ -78,6 +91,15 @@ auth = { path = "rust/auth" }
 # consumer that needs only the hook does not pull the `install` feature's
 # raft dep; the profile binaries opt into `features = ["install"]`.
 a2a = { path = "rust/a2a", default-features = false }
+# `subprocess` — hosted-subprocess substrate (kernel + tokio). Shared by
+# managed-agent's raw ACP-subprocess spawner and the nexus-side ACP path.
+subprocess = { path = "rust/subprocess" }
+# `managed-agent` — the agent control plane, relocated from nexus `services`
+# so the production `nexusd-cluster` (built here) carries it. The cluster
+# profile brings it up via `service_decl`; `subprocess-host` enables the raw
+# ACP-subprocess spawner. The in-process co-host SpawnTask adapter (links
+# sudocode) is wired at the nexus binary edge, never here (dependency cycle).
+managed-agent = { path = "rust/managed_agent", default-features = false }
 # `permission` — the authorization policy (sibling to auth).  Same
 # feature-gated composition-root wiring pattern as auth; the crate is
 # never compiled into nexusd-cluster's default build.  See its
