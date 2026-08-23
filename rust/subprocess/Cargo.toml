@@ -1,0 +1,18 @@
+[package]
+name = "subprocess"
+version = "0.1.0"
+edition = "2021"
+description = "Hosted-subprocess substrate — spawn an argv child and surface its stdio to the VFS. The ACP one-shot path and the managed-agent raw control-plane path both build on it."
+authors = ["Nexus Team"]
+publish = false
+
+[lib]
+name = "subprocess"
+path = "src/lib.rs"
+
+[dependencies]
+# Unix-only subprocess host: tokio drives the child + async stdio; libc::dup
+# duplicates kernel-side OwnedFds alongside the ones tokio::process::Child owns.
+kernel = { workspace = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "process", "io-util", "time", "sync", "macros"] }
+libc = "0.2"
