@@ -225,6 +225,16 @@ impl SharedMemoryStreamBackend {
         self.msg_count().fetch_add(1, Ordering::Relaxed);
         self.push_count().fetch_add(1, Ordering::Relaxed);
 
+        // Stamp INSIDE the writer_guard so the timestamp orders with
+        // the tail commit — two concurrent producers whose push_inner
+        // calls interleave cannot then interleave in stamping such
+        // that the earlier-committed writer's timestamp is stored
+        // AFTER the later-committed writer's.  Pre-fix the stamp
+        // lived in `push()` OUTSIDE the lock and could regress the
+        // stored value under racing producers (see
+        // `stream::stamp_now_monotonic` for the invariant).
+        crate::stream::stamp_now_monotonic(&self.last_append_ms);
+
         Ok(msg_offset)
     }
 
@@ -267,17 +277,12 @@ impl SharedMemoryStreamBackend {
 
 impl crate::stream::StreamBackend for SharedMemoryStreamBackend {
     fn push(&self, data: &[u8]) -> Result<usize, StreamError> {
+        // Stamping lives INSIDE `push_inner` (guarded by the same
+        // writer lock as the tail commit) — see the block there for
+        // the racing-producers rationale.  This wrapper is now
+        // pure dispatch: push, notify, return.
         let offset = self.push_inner(data)?;
         self.notify_data();
-        // Stamp last-append wall-clock so sys_stat surfaces a live
-        // modified_at_ms.  Same posture as MemoryStreamBackend +
-        // WalStreamCore; see the field doc for the per-process
-        // caveat under cross-process SHM readers.
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        self.last_append_ms.store(now_ms, Ordering::Relaxed);
         Ok(offset)
     }
     fn read_at(&self, offset: usize) -> Result<(Vec<u8>, usize), StreamError> {

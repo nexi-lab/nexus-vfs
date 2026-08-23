@@ -38,6 +38,40 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering}
 use parking_lot::Mutex;
 
 // ---------------------------------------------------------------------------
+// Shared "stamp last-append wall-clock" helper.
+//
+// All three DT_STREAM backends (`MemoryStreamBackend`,
+// `SharedMemoryStreamBackend` in `shm.rs`, `WalStreamCore` in
+// `wal.rs`) surface a `last_append_ms()` for `sys_stat.modified_at_ms`.
+// The stamp is a `Relaxed` atomic i64 = unix-ms; `0` sentinel = never
+// appended (see `StreamBackend::last_append_ms` doc).
+//
+// # Monotonic contract
+//
+// `fetch_max` is deliberate — two concurrent producers can race the
+// wall-clock read + store; without a monotonic guarantee an
+// unlucky-preempted producer whose write committed EARLIER can stamp
+// AFTER a producer whose write committed LATER, silently regressing
+// the stored value below "the latest append we know about".  With
+// `fetch_max` the stored value is always >= every timestamp any
+// producer measured, so the invariant "if any push happened at wall-
+// clock t, `last_append_ms() >= t`" holds under arbitrary racing.
+// Wall-clock is not strictly monotonic between threads (NTP slew /
+// per-CPU TSC drift) so the max-of-measurements is the strongest
+// property we can offer.
+//
+// Relaxed matches the read-side (also relaxed): the timestamp is a
+// hint for staleness gates + search recency, not a happens-before
+// ordering for the payload bytes.
+pub(super) fn stamp_now_monotonic(target: &AtomicI64) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    target.fetch_max(now_ms, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
@@ -189,7 +223,10 @@ impl MemoryStreamBackend {
         self.push_count.fetch_add(1, Ordering::Relaxed);
         // Stamp last-append wall-clock so `sys_stat.modified_at_ms`
         // reflects the live tail update — same seam as tail-as-size.
-        self.stamp_append_now();
+        // Called INSIDE the writer_guard so the stamp orders with the
+        // frame commit; see `stamp_now_monotonic` for the fetch_max
+        // rationale.
+        stamp_now_monotonic(&self.last_append_ms);
 
         Ok(msg_offset)
     }
@@ -278,22 +315,6 @@ impl MemoryStreamBackend {
             last_append_ms: AtomicI64::new(0),
             writer: Mutex::new(()),
         }
-    }
-
-    /// Stamp the current wall-clock as the last-append time.  Called
-    /// at the tail of every successful `push()`.  Kept as a small
-    /// helper so any future backend that wants to stamp identical
-    /// semantics can share the clock source.
-    fn stamp_append_now(&self) {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        // Relaxed — the timestamp is a hint, not a happens-before
-        // ordering.  Concurrent stamps race harmlessly (all values
-        // are close to `now_ms`); the winner is whichever thread
-        // stores last.
-        self.last_append_ms.store(now_ms, Ordering::Relaxed);
     }
 
     /// Signal close.
@@ -571,5 +592,67 @@ mod tests {
             offset = next;
         }
         assert_eq!(walked, WRITERS * PER_WRITER);
+    }
+
+    /// The shared last-append stamp helper MUST be monotonic — a
+    /// stale-stamp store from a preempted producer cannot regress
+    /// the stored value below what a later producer already wrote.
+    ///
+    /// Regression pin for the pre-fix SHM race: SHM's `push` used a
+    /// plain `store()` OUTSIDE the writer lock, so under two racing
+    /// pushes, whichever thread was preempted longer between "read
+    /// clock" and "store timestamp" could overwrite the other
+    /// thread's freshly-stamped (larger) value with its own (older)
+    /// value.  Switching to fetch_max makes such an overwrite
+    /// impossible by construction.
+    #[test]
+    fn stamp_now_monotonic_never_regresses_the_stored_value() {
+        let atom = AtomicI64::new(0);
+        // Simulate "some thread has already stamped a very-recent
+        // wall-clock" (a future timestamp beats any real now).
+        let future_ms = 9_999_999_999_999i64;
+        atom.fetch_max(future_ms, Ordering::Relaxed);
+        // Now a producer whose clock read completed EARLIER stamps —
+        // MUST NOT regress the stored value.
+        stamp_now_monotonic(&atom);
+        assert_eq!(
+            atom.load(Ordering::Relaxed),
+            future_ms,
+            "fetch_max invariant broken — stale stamp regressed the value",
+        );
+    }
+
+    /// Two producers racing `stamp_now_monotonic()` in parallel must
+    /// always leave the stored value >= every thread's observed
+    /// wall-clock — pins the "if any push happened at wall-clock t,
+    /// last_append_ms() >= t" invariant from the docstring.
+    #[test]
+    fn stamp_now_monotonic_under_concurrent_stampers_never_shrinks() {
+        use std::sync::atomic::AtomicI64 as A;
+        use std::sync::Arc;
+        use std::thread;
+
+        let atom = Arc::new(A::new(0));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let a = Arc::clone(&atom);
+                thread::spawn(move || {
+                    let mut prev = 0i64;
+                    for _ in 0..2000 {
+                        stamp_now_monotonic(&a);
+                        let now = a.load(Ordering::Relaxed);
+                        assert!(
+                            now >= prev,
+                            "concurrent stamp regressed the stored value: {now} < {prev}",
+                        );
+                        prev = now;
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("stamper thread panicked");
+        }
+        assert!(atom.load(Ordering::Relaxed) > 0);
     }
 }

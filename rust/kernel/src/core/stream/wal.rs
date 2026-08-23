@@ -610,12 +610,13 @@ impl StreamBackend for WalStreamCore {
                 self.maybe_trigger_seal(seq + 1);
                 // Stamp local wall-clock so sys_stat surfaces a live
                 // last-append time; see the field doc for the
-                // per-replica vs global caveat.
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0);
-                self.last_append_ms.store(now_ms, Ordering::Relaxed);
+                // per-replica vs global caveat.  Uses the shared
+                // fetch_max helper — write_sync is serialised at the
+                // metastore layer per stream, but two write_syncs on
+                // DIFFERENT streams could still race in stamping if
+                // they hit the same `AtomicI64`; fetch_max keeps the
+                // monotonic contract identical to shm/mem.
+                crate::stream::stamp_now_monotonic(&self.last_append_ms);
                 Ok(seq as usize)
             }
             Err(e) => {
@@ -1021,6 +1022,78 @@ mod tests {
         let data = c.read_at(0).unwrap().unwrap();
         assert_eq!(data, b"hello");
         assert_eq!(c.tail(), 1);
+    }
+
+    /// WAL push via the `StreamBackend` trait MUST stamp
+    /// `last_append_ms` so `sys_stat.modified_at_ms` surfaces a
+    /// live per-replica wall-clock — the parity contract the mem +
+    /// shm backends implement.  Pre-fix the trait's `push` inlined
+    /// its own clock-fetch (DRY debt); the shared
+    /// `stream::stamp_now_monotonic` now provides the fetch_max
+    /// monotonic guarantee for all three backends.
+    #[test]
+    fn push_via_streambackend_stamps_last_append_ms() {
+        use crate::stream::StreamBackend;
+        let c = core();
+        let backend: &dyn StreamBackend = &c;
+        assert_eq!(
+            backend.last_append_ms(),
+            None,
+            "never-appended WAL stream must surface None",
+        );
+
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        backend.push(b"hello").expect("push via trait");
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        let stamped = backend.last_append_ms().expect("stamp must be Some");
+        assert!(
+            before <= stamped && stamped <= after,
+            "stamp {stamped} must lie in [{before}, {after}]",
+        );
+    }
+
+    /// Pin the intentional "per-replica, non-durable" contract of
+    /// WAL `last_append_ms`.  A fresh core over the SAME store (=
+    /// simulated restart) sees no stamp — the wall-clock stamp is
+    /// per-instance in-memory, so post-restart `sys_stat` surfaces
+    /// `None` for `modified_at_ms` until the next local push
+    /// stamps it again.  Persisting the stamp would require a WAL
+    /// schema field (rejected — the same "last append" wall-clock
+    /// diverges across replicas anyway, so a durable value would
+    /// be misleading).
+    #[test]
+    fn last_append_ms_is_per_replica_and_does_not_survive_restart() {
+        use crate::stream::StreamBackend;
+        let store = store();
+        {
+            let c1 = WalStreamCore::new(Arc::clone(&store), "restart-test".into());
+            let backend: &dyn StreamBackend = &c1;
+            backend.push(b"first").expect("push");
+            assert!(
+                backend.last_append_ms().is_some(),
+                "post-push stamp must be Some on the writing instance",
+            );
+        }
+        // Fresh instance over the SAME durable store.
+        let c2 = WalStreamCore::new(Arc::clone(&store), "restart-test".into());
+        assert_eq!(
+            c2.tail(),
+            1,
+            "durable entries survive restart (contract from cursor_is_store_owned_across_restart)",
+        );
+        let backend2: &dyn StreamBackend = &c2;
+        assert_eq!(
+            backend2.last_append_ms(),
+            None,
+            "wall-clock stamp is per-replica in-memory; must reset to None on fresh instance",
+        );
     }
 
     #[test]
