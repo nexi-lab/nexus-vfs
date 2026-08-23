@@ -160,7 +160,7 @@ pub const AUTH_KEYS_PATH_PREFIX: &str = "/__sys__/auth/keys";
 /// the up-to-date mapping — no separate peer-discovery RPC needed.
 ///
 /// Double-underscore convention matches the existing `/__sys__/`
-/// procfs-style reserved prefix.
+/// synthetic-view reserved prefix.
 pub const SHARE_REGISTRY_PREFIX: &str = "/__shares__";
 
 /// Environment variable names — SSOT for env lookups crossing crate

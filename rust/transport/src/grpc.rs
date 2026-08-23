@@ -1414,7 +1414,7 @@ impl NexusVfsService for VfsServiceImpl {
 
         // KernelConvenience::stat_batch picks the optimized path on
         // Kernel — single redb read txn via `with_metastore::get_batch`,
-        // falling back to per-path sys_stat for implicit dirs / procfs.
+        // falling back to per-path sys_stat for implicit dirs / synthetic views.
         let results = KernelConvenience::stat_batch(&*self.kernel, &req.paths, zone_id);
         let mapped: Vec<BatchStatItem> = results
             .into_iter()

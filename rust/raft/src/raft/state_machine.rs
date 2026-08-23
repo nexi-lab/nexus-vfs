@@ -1553,7 +1553,7 @@ impl FullStateMachine {
     /// Enumerate every value in one namespace as ``(key, value_bytes)``.
     ///
     /// A ``namespace\0`` prefix scan. Backs the admin-only
-    /// ``/__sys__/auth/keys/`` procfs view + key-management tooling (via
+    /// ``/__sys__/auth/keys/`` synthetic view + key-management tooling (via
     /// [`Self::list_auth_keys`]) and the cross-org anchor registry. Not a hot
     /// path — a full-tree scan filtered by prefix.
     pub fn list_control_state(&self, namespace: &str) -> Result<Vec<(String, Vec<u8>)>> {
@@ -4818,7 +4818,7 @@ mod tests {
     }
 
     /// ``list_auth_keys`` enumerates every stored record — backs the
-    /// admin procfs view.
+    /// admin synthetic view.
     #[test]
     fn auth_key_list_enumerates_all() {
         let store = RedbStore::open_temporary().unwrap();

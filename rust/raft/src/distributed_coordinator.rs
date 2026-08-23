@@ -210,7 +210,7 @@ impl RaftDistributedCoordinator {
         // provider — every accessor `kernel.distributed_coordinator()`
         // (sys_setattr DT_MOUNT's `federation_active`, the WAL stream
         // metastore lookup, `sys_read`'s cold cross-node fan-out via
-        // `zone_peers`, the procfs `/__sys__/zones` synthesiser, …)
+        // `zone_peers`, the synthetic-view `/__sys__/zones` synthesiser, …)
         // resolves through this slot.  Mirrors `set_peer_client`
         // (wired separately by `transport::peer_blob::install`); both
         // are required for the kernel's federation surface to behave.
