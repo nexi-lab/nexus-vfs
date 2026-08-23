@@ -63,7 +63,7 @@ const PIPE_CAPACITY: usize = 1 << 20;
 /// [`Self::take_stdio_for_connection`] can drive them through
 /// `AsyncRead` / `AsyncWrite` directly. Drop closes everything still
 /// open; tokio's `kill_on_drop(true)` reaps the child process itself.
-pub(crate) struct HostedSubprocess {
+pub struct HostedSubprocess {
     child: Child,
     /// Parent-side write end of the subprocess stdin pipe. `Some` until
     /// `take_stdio_for_connection` hands it off (or `unregister_pipes`
@@ -80,7 +80,7 @@ pub(crate) struct HostedSubprocess {
 }
 
 #[derive(Debug)]
-pub(crate) enum SubprocessError {
+pub enum SubprocessError {
     Spawn(String),
     Register(String),
     Io(String),
@@ -115,7 +115,7 @@ impl HostedSubprocess {
     ///   * spawn fails — `SubprocessError::Spawn`. No `DT_PIPE`s created.
     ///   * register fails partway — already-registered pipes are unlinked
     ///     before returning so we don't leak `DT_PIPE` entries.
-    pub(crate) async fn spawn_from_argv<K: KernelSyscall>(
+    pub async fn spawn_from_argv<K: KernelSyscall>(
         argv: Vec<String>,
         env: HashMap<String, String>,
         cwd: &Path,
@@ -179,7 +179,7 @@ impl HostedSubprocess {
     ///
     /// `env` is used VERBATIM under `env_clear()` (see
     /// [`Self::spawn_from_argv`]).
-    pub(crate) async fn spawn_no_pipes(
+    pub async fn spawn_no_pipes(
         argv: Vec<String>,
         env: HashMap<String, String>,
         cwd: &Path,
@@ -203,7 +203,7 @@ impl HostedSubprocess {
     /// identities are deliberately separate (#195 aligned the *agent*
     /// pid with the OS host_pid, but the managed *session* id is its
     /// own thing).
-    pub(crate) fn os_pid(&self) -> Option<u32> {
+    pub fn os_pid(&self) -> Option<u32> {
         self.child.id()
     }
 
@@ -211,7 +211,7 @@ impl HostedSubprocess {
     /// as `AsyncRead` / `AsyncWrite`. After this call the kernel-side
     /// `DT_PIPE`s (created in `spawn_from_argv`) remain registered;
     /// `unregister_pipes` is still required for teardown.
-    pub(crate) fn take_stdio_for_connection(
+    pub fn take_stdio_for_connection(
         &mut self,
     ) -> Result<(ChildStdin, ChildStdout, ChildStderr), SubprocessError> {
         let stdin = self
@@ -235,7 +235,7 @@ impl HostedSubprocess {
     /// stdin / read returns 0 on stdout / stderr — provided any driver
     /// that took ownership via `take_stdio_for_connection` has also
     /// dropped. Idempotent: subsequent calls are no-ops.
-    pub(crate) fn unregister_pipes<K: KernelSyscall>(&mut self, kernel: &K) {
+    pub fn unregister_pipes<K: KernelSyscall>(&mut self, kernel: &K) {
         let _ = unlink_quiet(kernel, &self.stdin_path);
         let _ = unlink_quiet(kernel, &self.stdout_path);
         let _ = unlink_quiet(kernel, &self.stderr_path);
@@ -248,7 +248,7 @@ impl HostedSubprocess {
 
     /// Best-effort SIGKILL on the child. Safe to call even if the child
     /// has already exited.
-    pub(crate) async fn kill(&mut self) {
+    pub async fn kill(&mut self) {
         let _ = self.child.kill().await;
     }
 
@@ -257,7 +257,7 @@ impl HostedSubprocess {
     /// if it was killed by a signal. The frozen-contract ③ exit event
     /// needs BOTH: a signal death (`code == None`) must not be flattened
     /// to a fake `0`, or the client can't tell a clean exit from a crash.
-    pub(crate) async fn wait(&mut self) -> ProcessExit {
+    pub async fn wait(&mut self) -> ProcessExit {
         match self.child.wait().await {
             Ok(status) => ProcessExit {
                 code: status.code(),
@@ -272,7 +272,7 @@ impl HostedSubprocess {
 /// `code` / `signal` is `Some` for a real exit; both `None` means the
 /// wait itself failed (status indeterminable).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct ProcessExit {
+pub struct ProcessExit {
     pub code: Option<i32>,
     pub signal: Option<i32>,
 }
@@ -281,7 +281,7 @@ impl ProcessExit {
     /// Collapse to the shell single-integer convention for the callers
     /// that need one `i32` (AgentRegistry reap code, logs): the exit code,
     /// else `128 + signal` for a signal death, else `-1` when unknown.
-    pub(crate) fn as_reap_code(&self) -> i32 {
+    pub fn as_reap_code(&self) -> i32 {
         match (self.code, self.signal) {
             (Some(c), _) => c,
             (None, Some(s)) => 128 + s,

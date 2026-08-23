@@ -27,5 +27,8 @@ serde_json = { workspace = true }
 dashmap = "6.1"
 uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
+# raw_spawn's SpawnHandle holds a parking_lot::Mutex over the cancel channel
+# (sync lock in an async supervisor). Unix-only path (subprocess-host).
+parking_lot = "0.12"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 subprocess = { path = "../subprocess", optional = true }
