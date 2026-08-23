@@ -32,3 +32,9 @@ tracing = "0.1"
 parking_lot = "0.12"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 subprocess = { path = "../subprocess", optional = true }
+
+[dev-dependencies]
+# The from-stamp e2e companion test enlists the a2a MailboxStampingHook to
+# assert managed-agent's chat-with-me writes get rewritten. a2a is a sibling
+# kernel-tier crate (no cycle: a2a never depends on managed-agent).
+a2a = { workspace = true }
