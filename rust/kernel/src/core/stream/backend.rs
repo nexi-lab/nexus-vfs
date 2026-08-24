@@ -49,6 +49,15 @@ pub trait StreamBackend: Send + Sync {
     /// circuit into the stream buffer and never touch the metastore row).
     /// Consumers include search-plugin recency scoring, audit-tier
     /// staleness checks, and cross-agent mailbox catch-up freshness gates.
+    ///
+    /// # Empty-append semantics
+    ///
+    /// `push(&[])` is a no-op — the tail does not advance, no bytes commit,
+    /// and `last_append_ms` does NOT update.  Matches POSIX `st_mtime`:
+    /// `write(fd, "", 0)` does not modify a file.  A caller that wants the
+    /// stamp to move on every push regardless of payload can wrap the call
+    /// in `if !data.is_empty()` at their layer + stamp their own clock;
+    /// nothing in this trait forces the semantic.
     fn last_append_ms(&self) -> Option<i64> {
         None
     }
