@@ -60,6 +60,21 @@ use parking_lot::Mutex;
 // per-CPU TSC drift) so the max-of-measurements is the strongest
 // property we can offer.
 //
+// # Known trade-off — future-skewed clock reads latch
+//
+// A transient system-clock jump to a future value (NTP step-forward,
+// operator setting the clock) latches into `last_append_ms` as the
+// stored value.  When wall-clock catches back up, subsequent stamps
+// keep the earlier future value (fetch_max) until real time crosses
+// it — could be seconds to hours depending on the jump.
+//
+// This is ACCEPTABLE for the current consumers (search recency +
+// staleness gates): both interpret the stamp as "at least this
+// recent", so a future-latched value degrades cache freshness (an
+// item looks fresher than it is) but never surfaces STALE-looking
+// data.  A future consumer that needs strict wall-clock accuracy
+// should use `SystemTime::now()` directly, not this cache.
+//
 // Relaxed matches the read-side (also relaxed): the timestamp is a
 // hint for staleness gates + search recency, not a happens-before
 // ordering for the payload bytes.

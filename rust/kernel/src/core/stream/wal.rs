@@ -611,11 +611,15 @@ impl StreamBackend for WalStreamCore {
                 // Stamp local wall-clock so sys_stat surfaces a live
                 // last-append time; see the field doc for the
                 // per-replica vs global caveat.  Uses the shared
-                // fetch_max helper — write_sync is serialised at the
-                // metastore layer per stream, but two write_syncs on
-                // DIFFERENT streams could still race in stamping if
-                // they hit the same `AtomicI64`; fetch_max keeps the
-                // monotonic contract identical to shm/mem.
+                // fetch_max helper — each `WalStreamCore` owns its
+                // own `last_append_ms`, so different streams cannot
+                // share the atomic (audit: prior comment misstated
+                // the race scenario).  The real race is WITHIN a
+                // stream: `write_sync` is serialised at the metastore
+                // layer, but the clock-read + stamp happen OUTSIDE
+                // that window — a sequential producer preempted
+                // between clock-read and stamp can otherwise commit a
+                // stale value.  `fetch_max` closes it.
                 crate::stream::stamp_now_monotonic(&self.last_append_ms);
                 Ok(seq as usize)
             }
