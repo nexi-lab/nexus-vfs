@@ -596,6 +596,17 @@ fn maybe_trim(store: &Arc<dyn MetaStore>, prefix: &str, stream_id: &str, retenti
 
 impl StreamBackend for WalStreamCore {
     fn push(&self, data: &[u8]) -> Result<usize, StreamError> {
+        // Universal empty-push no-op — mirrors the `MemoryStreamBackend` /
+        // `SharedMemoryStreamBackend` short-circuit and matches the
+        // `StreamBackend::last_append_ms` trait contract (POSIX `st_mtime`:
+        // `write(fd, "", 0)` does not modify a file, so the mtime stamp
+        // does not advance).  Before this guard, an empty push here
+        // replicated a zero-length frame through raft (seq++) AND stamped
+        // `last_append_ms`, silently violating the trait doc every other
+        // impl honours.
+        if data.is_empty() {
+            return Ok(self.tail() as usize);
+        }
         // Durable + fail-loud. A wal DT_STREAM exists to REPLICATE, so a push
         // waits for the raft commit and surfaces failure (no reachable leader /
         // propose rejected) instead of buffering and dropping. A2A messaging —
@@ -610,11 +621,9 @@ impl StreamBackend for WalStreamCore {
                 self.maybe_trigger_seal(seq + 1);
                 // Stamp local wall-clock so sys_stat surfaces a live
                 // last-append time; see the field doc for the
-                // per-replica vs global caveat.  Uses the shared
-                // fetch_max helper — each `WalStreamCore` owns its
-                // own `last_append_ms`, so different streams cannot
-                // share the atomic (audit: prior comment misstated
-                // the race scenario).  The real race is WITHIN a
+                // per-replica vs global caveat.  Each `WalStreamCore`
+                // owns its own `last_append_ms`, so different streams
+                // cannot share the atomic.  The real race is WITHIN a
                 // stream: `write_sync` is serialised at the metastore
                 // layer, but the clock-read + stamp happen OUTSIDE
                 // that window — a sequential producer preempted
@@ -1097,6 +1106,52 @@ mod tests {
             backend2.last_append_ms(),
             None,
             "wall-clock stamp is per-replica in-memory; must reset to None on fresh instance",
+        );
+    }
+
+    /// Trait-doc contract: `push(&[])` MUST NOT stamp
+    /// `last_append_ms` — matches POSIX `st_mtime` (empty write does
+    /// not modify).  Pre-fix, WAL `push` handed the empty payload to
+    /// `write_sync`, which appended a zero-length frame through raft
+    /// AND advanced the tail seq AND stamped `last_append_ms` —
+    /// silently violating the trait contract every other impl
+    /// honours.  Post-fix: universal empty-push no-op in
+    /// `WalStreamCore::push`.
+    #[test]
+    fn empty_push_is_noop_and_does_not_stamp_or_advance_tail() {
+        use crate::stream::StreamBackend;
+        let c = core();
+        let backend: &dyn StreamBackend = &c;
+
+        // Precondition.
+        assert_eq!(backend.last_append_ms(), None);
+        assert_eq!(backend.tail_offset(), 0);
+
+        // Empty push returns Ok with the current tail unchanged.
+        let ret = backend.push(b"").expect("empty push must succeed");
+        assert_eq!(ret, 0, "returns current tail (0) on no-op");
+
+        // No side effects.
+        assert_eq!(
+            backend.last_append_ms(),
+            None,
+            "empty push must NOT stamp — POSIX st_mtime parity",
+        );
+        assert_eq!(
+            backend.tail_offset(),
+            0,
+            "empty push must NOT advance tail (no raft frame appended)",
+        );
+
+        // A subsequent non-empty push DOES stamp + advance.
+        backend.push(b"real payload").expect("non-empty push");
+        assert!(
+            backend.last_append_ms().is_some(),
+            "non-empty push stamps normally",
+        );
+        assert!(
+            backend.tail_offset() > 0,
+            "non-empty push advances tail normally",
         );
     }
 
