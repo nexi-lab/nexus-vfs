@@ -91,7 +91,7 @@ async fn replication_survives_restart(
         .wait_for_log("Static topology applied", BUDGET)
         .await
         .expect("founder forms + persists sharedzone mount");
-    let mut fc = Vfs::dial(fport).await.expect("dial founder");
+    let mut fc = Vfs::dial_ready(fport, BUDGET).await;
 
     let mut joiner = Daemon::spawn(
         &["--bind-addr", &jadv],
@@ -101,7 +101,7 @@ async fn replication_survives_restart(
         .wait_for_log(&zone_registered, BUDGET)
         .await
         .expect("joiner joins sharedzone");
-    let mut jc = Vfs::dial(jport).await.expect("dial joiner");
+    let mut jc = Vfs::dial_ready(jport, BUDGET).await;
 
     // Baseline: replication works. Skipping this (confirm_baseline=false) drops
     // the joiner right after it *registered* the zone locally — possibly BEFORE
@@ -167,7 +167,7 @@ async fn replication_survives_restart(
         .wait_for_log(&zone_registered, BUDGET)
         .await
         .expect("restarted joiner re-registers sharedzone");
-    let mut jc = Vfs::dial(jport).await.expect("re-dial joiner");
+    let mut jc = Vfs::dial_ready(jport, BUDGET).await;
 
     // After: does the founder's write reach the joiner AND resolve through the
     // `/agents` mount? Deep read-path — stat (mount routes + entry visible) THEN

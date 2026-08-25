@@ -121,8 +121,8 @@ async fn founder_resume_founds_its_declared_topology_then_replicates() {
     // ── 4. End-to-end: founder writes under /agents, joiner reads it back —
     //       proves /agents routes to the REPLICATED sharedzone, not node-local
     //       root (a root-bound mount would never reach the joiner). ──
-    let mut fc = Vfs::dial(fport).await.expect("dial founder");
-    let mut jc = Vfs::dial(jport).await.expect("dial joiner");
+    let mut fc = Vfs::dial_ready(fport, BUDGET).await;
+    let mut jc = Vfs::dial_ready(jport, BUDGET).await;
     let probe = format!("{MOUNT}/health.txt");
     let payload = b"resume-founds-topology-v1";
     fc.write_file(&probe, payload, "")

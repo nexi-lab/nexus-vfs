@@ -175,7 +175,7 @@ async fn await_collect(v: &mut Vfs, path: &str, want: &[u8]) {
 async fn single_node_append_past_window_seals_and_cold_reads_whole_log() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (mut founder, fport) = boot_founder(tmp.path()).await;
-    let mut fc = Vfs::dial(fport).await.expect("dial founder");
+    let mut fc = Vfs::dial_ready(fport, BUDGET).await;
 
     let log = format!("{MOUNT}/logp");
     fc.create_stream(&log, "").await.expect("create wal stream");
@@ -202,7 +202,7 @@ async fn single_node_append_past_window_seals_and_cold_reads_whole_log() {
 async fn joiner_cold_reads_a_sealed_log_pulling_segments_from_the_founder() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (mut founder, fport) = boot_founder(tmp.path()).await;
-    let mut fc = Vfs::dial(fport).await.expect("dial founder");
+    let mut fc = Vfs::dial_ready(fport, BUDGET).await;
 
     // Founder writes the long log FIRST, forcing several seals before the joiner
     // exists — so the joiner never sees the hot rows for the early seqs.
@@ -239,7 +239,7 @@ async fn joiner_cold_reads_a_sealed_log_pulling_segments_from_the_founder() {
         .wait_for_log(&format!("Zone '{ZONE}' registered"), BUDGET)
         .await
         .expect("joiner joins the zone");
-    let mut jc = Vfs::dial(jport).await.expect("dial joiner");
+    let mut jc = Vfs::dial_ready(jport, BUDGET).await;
 
     // Joiner cold-reads the ENTIRE log — no create_stream, no watch. Early seqs
     // are cold: their segment index replicated via raft, but the blobs live in
@@ -258,7 +258,7 @@ async fn joiner_cold_reads_a_sealed_log_pulling_segments_from_the_founder() {
 async fn joiner_installs_snapshot_after_compaction_then_cold_reads() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (mut founder, fport) = boot_founder(tmp.path()).await;
-    let mut fc = Vfs::dial(fport).await.expect("dial founder");
+    let mut fc = Vfs::dial_ready(fport, BUDGET).await;
 
     // Founder writes a long log — forcing seals (spill to CAS) AND SC raft-log
     // snapshot+compaction — all BEFORE the joiner exists, so the joiner cannot
@@ -310,7 +310,7 @@ async fn joiner_installs_snapshot_after_compaction_then_cold_reads() {
 
     // With only the bounded snapshot (hot tail + segment index) + cold CAS
     // fetches, the joiner reconstructs the ENTIRE logical log byte-exact.
-    let mut jc = Vfs::dial(jport).await.expect("dial joiner");
+    let mut jc = Vfs::dial_ready(jport, BUDGET).await;
     await_collect(&mut jc, &log, &expected_log()).await;
 
     // STEADY STATE (2-voter post-join replication). The joiner joined as a
@@ -387,7 +387,7 @@ async fn await_truncated_earliest(v: &mut Vfs, path: &str) -> u64 {
 async fn retention_trims_old_segments_and_reads_below_earliest_are_truncated() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (mut founder, fport) = boot_founder(tmp.path()).await;
-    let mut fc = Vfs::dial(fport).await.expect("dial founder");
+    let mut fc = Vfs::dial_ready(fport, BUDGET).await;
 
     // A wal stream with a TINY cold budget, so appending well past it forces
     // real trims — the oldest sealed segments drop and `earliest` advances.
@@ -513,7 +513,7 @@ fn count_seg_blobs(dir: &std::path::Path) -> usize {
 async fn joiner_honours_the_replicated_retention_floor() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (mut founder, fport) = boot_founder(tmp.path()).await;
-    let mut fc = Vfs::dial(fport).await.expect("dial founder");
+    let mut fc = Vfs::dial_ready(fport, BUDGET).await;
 
     // Founder writes + trims BEFORE the joiner exists, so the joiner learns the
     // floor purely from replicated raft state, never from the hot rows.
@@ -552,7 +552,7 @@ async fn joiner_honours_the_replicated_retention_floor() {
         .wait_for_log(&format!("Zone '{ZONE}' registered"), BUDGET)
         .await
         .expect("joiner joins the zone");
-    let mut jc = Vfs::dial(jport).await.expect("dial joiner");
+    let mut jc = Vfs::dial_ready(jport, BUDGET).await;
 
     // Read the founder's STABLE floor: all writes/trims have long settled by
     // here, so offset 0's Truncated `earliest` is the final floor (the value the
