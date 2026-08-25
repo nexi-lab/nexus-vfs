@@ -30,6 +30,39 @@ use serde::{Deserialize, Serialize};
 /// here and referenced by the hook rather than re-declared.
 pub const CHAT_WITH_ME_SUFFIX: &str = "/chat-with-me";
 
+/// io_profile waterfall for a `chat-with-me` mailbox DT_STREAM: `wal`
+/// (raft-replicated, so a message survives its sender and reaches other
+/// machines) when federation is up, else the node-local `memory` terminal.
+/// SSOT for the mailbox backing — a2a owns "what a mailbox *is*"; the kernel
+/// resolves the concrete backend from this preference order (see
+/// `Kernel::install_stream_backend`). Every mailbox provisioner
+/// ([`crate::ensure_mailbox_stream`], and via it the per-pid
+/// `/proc/{pid}/chat-with-me` and the persistent `/agents/{name}/chat-with-me`)
+/// goes through this one string rather than re-declaring `"wal,memory"`.
+pub const MAILBOX_IO_PROFILE: &str = "wal,memory";
+
+/// Capacity (cold-storage retention budget, in bytes) of a `chat-with-me`
+/// mailbox DT_STREAM — the inode capacity threaded to
+/// `Kernel::install_stream_backend`. Sized for the per-conversation message
+/// flow (integration doc §3). SSOT shared by every mailbox provisioner.
+pub const MAILBOX_STREAM_CAPACITY: usize = 65_536;
+
+/// Mount base for persistent, per-identity A2A inboxes. An agent `name`'s
+/// cross-machine inbox is `{A2A_INBOX_BASE}/{name}/chat-with-me`. SSOT for the
+/// `/agents` convention the sudocode `Mailbox::A2aInbox` base and the
+/// federation-mount default (`--cluster-init-mount /agents=<zone>`) must agree
+/// on — kept next to [`CHAT_WITH_ME_SUFFIX`] so the whole A2A *address* lives
+/// in one place, not hardcoded at each host call site.
+pub const A2A_INBOX_BASE: &str = "/agents";
+
+/// The persistent A2A inbox path for `agent_name`
+/// (`/agents/{agent_name}/chat-with-me`), composed from the two address SSOTs
+/// ([`A2A_INBOX_BASE`] + [`CHAT_WITH_ME_SUFFIX`]) — a host never hand-builds it.
+#[must_use]
+pub fn agent_inbox_path(agent_name: &str) -> String {
+    format!("{A2A_INBOX_BASE}/{agent_name}{CHAT_WITH_ME_SUFFIX}")
+}
+
 /// The canonical A2A mailbox message schema — the content format written to
 /// (and read from) any `*/chat-with-me` mailbox. This is the SSOT for the
 /// envelope shape; every consumer (co-hosted sudocode agents, hydra, the
@@ -75,11 +108,12 @@ impl MailboxEnvelope {
     }
 }
 
-/// The node-local managed-agent mailbox pipe prefix —
-/// `/proc/{pid}/chat-with-me` (a DT_PIPE, intra-node, NOT replicated). It
-/// shares the `/chat-with-me` suffix with the replicated A2A mailbox but is
-/// exempt from the *cross-machine* fail-closed identity gate. `/proc` is a
-/// stable kernel convention for the process tree, not an operator-set mount.
+/// The node-local managed-agent mailbox prefix — `/proc/{pid}/chat-with-me` (a
+/// DT_STREAM provisioned by `managed_agent::proc_entry` via
+/// [`crate::ensure_mailbox_stream`], scoped to the pid's own node). It shares
+/// the `/chat-with-me` suffix with the persistent A2A inbox but is exempt from
+/// the *cross-machine* fail-closed identity gate. `/proc` is a stable kernel
+/// convention for the process tree, not an operator-set mount.
 const NODE_LOCAL_MAILBOX_PREFIX: &str = "/proc/";
 
 /// Whether `path` ends in the mailbox suffix (`*/chat-with-me`).
@@ -319,5 +353,19 @@ mod tests {
             is_a2a_mailbox_path("/team-mailboxes/win-ai/chat-with-me"),
             "fail-safe: a mailbox under any mount is gated, not just /agents"
         );
+    }
+
+    #[test]
+    fn agent_inbox_path_is_the_a2a_convention() {
+        assert_eq!(agent_inbox_path("mac-ai"), "/agents/mac-ai/chat-with-me");
+        assert_eq!(agent_inbox_path("win-ai"), "/agents/win-ai/chat-with-me");
+        // Composed from the two address SSOTs, not string literals.
+        let p = agent_inbox_path("x");
+        assert!(p.starts_with(A2A_INBOX_BASE));
+        assert!(p.ends_with(CHAT_WITH_ME_SUFFIX));
+        // Integration invariant: an inbox we provision MUST be recognized as a
+        // cross-machine A2A mailbox by the fail-closed predicate — else the
+        // `from`-guarantee would silently skip the very inboxes we create.
+        assert!(is_a2a_mailbox_path(&p));
     }
 }

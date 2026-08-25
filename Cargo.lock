@@ -1850,6 +1850,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
+name = "managed-agent"
+version = "0.1.0"
+dependencies = [
+ "a2a",
+ "contracts",
+ "dashmap",
+ "kernel",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "subprocess",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1930,6 +1947,7 @@ dependencies = [
  "gethostname",
  "kernel",
  "lib",
+ "managed-agent",
  "pem",
  "raft 0.1.0",
  "rand 0.10.1",
@@ -3178,6 +3196,15 @@ name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
+
+[[package]]
+name = "subprocess"
+version = "0.1.0"
+dependencies = [
+ "kernel",
+ "libc",
+ "tokio",
+]
 
 [[package]]
 name = "subtle"

@@ -35,9 +35,82 @@ pub mod mailbox_stamping_policy;
 
 pub use foreign_containment::{install_foreign_agent_containment, ForeignAgentMailboxOnly};
 pub use mailbox_stamping_hook::MailboxStampingHook;
-pub use mailbox_stamping_policy::{MailboxEnvelope, CHAT_WITH_ME_SUFFIX};
+pub use mailbox_stamping_policy::{
+    agent_inbox_path, MailboxEnvelope, A2A_INBOX_BASE, CHAT_WITH_ME_SUFFIX, MAILBOX_IO_PROFILE,
+    MAILBOX_STREAM_CAPACITY,
+};
 
+use kernel::kernel::syscall::KernelSyscall;
 use kernel::kernel::Kernel;
+
+/// DT_STREAM entry-type discriminant for `sys_setattr` (mirrors
+/// `kernel::meta_store::DT_STREAM`, which is `u8`; the setattr arg is `i32`).
+const DT_STREAM: i32 = 4;
+
+/// Provision `agent_name`'s persistent A2A inbox as a DT_STREAM, idempotently.
+///
+/// The A2A analogue of the per-pid `/proc/{pid}/chat-with-me` pipe: a2a owns
+/// BOTH the address ([`agent_inbox_path`]) AND the stream contract
+/// ([`ensure_mailbox_stream`]). A2A is host-agnostic — this is called by
+/// whatever brings an agent online locally (today `managed_agent`, the sole
+/// agent host; any future unmanaged host calls the same function). A REMOTE
+/// agent's inbox is provisioned on its own host and replicated in, so a node
+/// only ever provisions the inboxes of agents IT hosts.
+pub fn ensure_agent_inbox<K: KernelSyscall>(kernel: &K, agent_name: &str) -> Result<(), String> {
+    ensure_mailbox_stream(kernel, &agent_inbox_path(agent_name))
+}
+
+/// Provision the `chat-with-me` mailbox at `path` as a DT_STREAM, idempotently.
+///
+/// This is the ONE place that turns the a2a mailbox contract
+/// ([`MAILBOX_IO_PROFILE`] + [`MAILBOX_STREAM_CAPACITY`]) into a real inode, so
+/// every mailbox — the node-local `/proc/{pid}/chat-with-me` pipe AND the
+/// persistent, replicated `/agents/{name}/chat-with-me` inbox — is the SAME
+/// kind of stream. Provisioning is a2a's job because a2a owns "what a mailbox
+/// is"; the *lifecycle* owner (`managed_agent`) decides *when* and *for whom*
+/// to call this.
+///
+/// The `io_profile` waterfall lets the KERNEL pick the backing — `wal`
+/// (raft-replicated) when the path routes into a federated zone, else
+/// node-local `memory` — so the caller never has to read federation state.
+/// Idempotent: `sys_setattr` treats a matching existing DT_STREAM as a
+/// successful no-op, so re-spawns / restarts are safe. The provisioning ctx is
+/// the root zone; routing resolves the mount's real zone for the wal backend
+/// (the `routed_zone_id` SSOT), so a `/agents=<zone>` federation mount lands
+/// the stream in `<zone>` without the caller naming it.
+///
+/// Generic over [`KernelSyscall`] (not `&Kernel`) so the services rlib can call
+/// it without monomorphising against a concrete kernel.
+pub fn ensure_mailbox_stream<K: KernelSyscall>(kernel: &K, path: &str) -> Result<(), String> {
+    kernel
+        .sys_setattr(
+            path,
+            DT_STREAM,
+            /* backend_name */ "",
+            /* backend */ None,
+            /* metastore */ None,
+            /* raft_backend */ None,
+            MAILBOX_IO_PROFILE,
+            /* zone_id */ contracts::ROOT_ZONE_ID,
+            /* is_external */ false,
+            MAILBOX_STREAM_CAPACITY,
+            /* read_fd */ None,
+            /* write_fd */ None,
+            /* mime_type */ None,
+            /* modified_at_ms */ None,
+            /* content_id */ None,
+            /* size */ None,
+            /* version */ None,
+            /* created_at_ms */ None,
+            /* link_target */ None,
+            /* source */ None,
+            /* remote_metastore */ None,
+        )
+        .map(|_| ())
+        .map_err(|e| {
+            format!("ensure_mailbox_stream({path}) io_profile={MAILBOX_IO_PROFILE:?}: {e:?}")
+        })
+}
 
 /// Arm the A2A `from`-stamp hook. Call once at daemon boot.
 ///

@@ -32,12 +32,7 @@ use kernel::core::agents::registry::AgentDescriptor;
 use kernel::kernel::syscall::KernelSyscall;
 
 const DT_DIR: i32 = 1;
-const DT_STREAM: i32 = 4;
 const DT_LINK: i32 = 6;
-
-/// chat-with-me DT_STREAM capacity — sized for the per-pid conversation
-/// flow described in integration doc §3.
-const CHAT_STREAM_CAPACITY: usize = 65_536;
 
 /// `OperationContext` proc_entry uses for its teardown `sys_unlink`
 /// calls. `is_system = true` + `is_admin = true` so the unlink
@@ -82,12 +77,13 @@ pub(crate) fn register_proc_entry<K: KernelSyscall>(
         create_dt_dir(kernel, dir)?;
     }
 
-    // Canonical chat-with-me stream. The `io_profile` waterfall lets the
-    // KERNEL pick the backing — wal (raft-replicated) when federation is up,
-    // in-memory otherwise. The service no longer reads federation state; it
-    // just expresses the preference order and `setattr_stream` resolves it.
+    // Canonical chat-with-me stream — provisioned through the a2a mailbox
+    // contract (the SSOT for the mailbox io_profile + capacity), so this
+    // node-local pipe and the persistent `/agents/{name}/chat-with-me` inbox
+    // are the SAME kind of DT_STREAM. a2a owns "what a mailbox is"; this
+    // lifecycle owner just says "make this pid's mailbox".
     let cwm_canonical = format!("/proc/{pid}/chat-with-me");
-    create_dt_stream(kernel, &cwm_canonical, CHAT_STREAM_CAPACITY, "wal,memory")?;
+    a2a::ensure_mailbox_stream(kernel, &cwm_canonical)?;
 
     // /proc/{pid}/agent → /agents/{desc.name} (Linux /proc/{pid}/exe
     // analogue). Target may not exist yet; DT_LINK rows are not
@@ -187,32 +183,16 @@ fn create_dt_link<K: KernelSyscall>(kernel: &K, path: &str, target: &str) -> Res
         .map_err(|e| format!("sys_setattr(DT_LINK at {path:?} → {target:?}): {e:?}"))
 }
 
-fn create_dt_stream<K: KernelSyscall>(
-    kernel: &K,
-    path: &str,
-    capacity: usize,
-    io_profile: &str,
-) -> Result<(), String> {
-    kernel
-        .sys_setattr(
-            path, DT_STREAM, /* backend_name */ "", /* backend */ None,
-            /* metastore */ None, /* raft_backend */ None, io_profile,
-            /* zone_id */ "root", /* is_external */ false, capacity,
-            /* read_fd */ None, /* write_fd */ None, /* mime_type */ None,
-            /* modified_at_ms */ None, /* content_id */ None, /* size */ None,
-            /* version */ None, /* created_at_ms */ None, /* link_target */ None,
-            /* source */ None, /* remote_metastore */ None,
-        )
-        .map(|_| ())
-        .map_err(|e| format!("sys_setattr(DT_STREAM at {path:?} io_profile={io_profile:?}): {e:?}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use kernel::core::agents::registry::{AgentKind, AgentState, RepoMount};
     use kernel::kernel::Kernel;
     use kernel::ROOT_ZONE_ID;
+
+    // DT_STREAM discriminant (u8) for stat assertions — the module no longer
+    // needs the i32 setattr form now that a2a owns stream provisioning.
+    const DT_STREAM: u8 = 4;
 
     fn dir_exists(kernel: &Kernel, path: &str) -> bool {
         kernel
