@@ -183,6 +183,38 @@ impl Daemon {
         }
     }
 
+    /// Like [`wait_for_log`], but wait until `pat` has appeared at least `count`
+    /// times — the readiness gate for an N-voter group, where a per-node event
+    /// (e.g. "learner promoted to voter") must fire once per joiner before the
+    /// cluster is quorum-stable. `wait_for_log` re-scans the whole buffer, so it
+    /// cannot distinguish the k-th occurrence on its own.
+    pub async fn wait_for_log_count(
+        &mut self,
+        pat: &str,
+        count: usize,
+        budget: Duration,
+    ) -> Result<(), String> {
+        let deadline = Instant::now() + budget;
+        loop {
+            if self.log.lock().unwrap().matches(pat).count() >= count {
+                return Ok(());
+            }
+            if let Ok(Some(status)) = self.child.try_wait() {
+                return Err(format!(
+                    "exited (status {status}) before logging {pat:?} ×{count}:\n{}",
+                    self.drain()
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "log never contained {pat:?} ×{count} within budget:\n{}",
+                    self.drain()
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
     /// Snapshot of everything the child has written to stdout+stderr so far.
     pub fn drain(&self) -> String {
         self.log.lock().unwrap().clone()
@@ -360,6 +392,24 @@ impl Vfs {
         Some(Vfs {
             c: NexusVfsServiceClient::new(ch),
         })
+    }
+
+    /// [`dial`], but poll until the gRPC connect succeeds or `budget` expires.
+    /// A one-shot [`dial`] right after a raft membership change (e.g. dialing a
+    /// freshly-promoted voter mid-formation) can lose the HTTP/2 handshake to
+    /// transient CPU contention even though the port already accepts TCP — this
+    /// is the connect-side analogue of [`connect_authenticated`]'s poll.
+    pub async fn dial_ready(port: u16, budget: Duration) -> Self {
+        let deadline = Instant::now() + budget;
+        loop {
+            if let Some(v) = Self::dial(port).await {
+                return v;
+            }
+            if Instant::now() >= deadline {
+                panic!("dial(127.0.0.1:{port}) never connected within budget");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     /// Poll until the port accepts a connection AND `Ping(token)` succeeds

@@ -44,7 +44,7 @@ async fn moss_deployment_shape_roundtrips_colon_paths() {
     d.wait_tcp(port, BUDGET)
         .await
         .expect("moss's invocation must boot on the current binary, with no auth flags");
-    let mut c = Vfs::dial(port).await.expect("dial");
+    let mut c = Vfs::dial_ready(port, BUDGET).await;
 
     // ── 2. moss's real path shape round-trips — note the colons ─────────
     let secrets = [

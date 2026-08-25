@@ -70,8 +70,8 @@ async fn mailbox_round(owner_port: u16, sender_port: u16, sender_name: &str, age
     let envelope =
         format!(r#"{{"from":"{sender_name}","to":"{agent}","body":"ping from {sender_name}"}}"#);
 
-    let mut owner = Vfs::dial(owner_port).await.expect("dial owner");
-    let mut sender = Vfs::dial(sender_port).await.expect("dial sender");
+    let mut owner = Vfs::dial_ready(owner_port, BUDGET).await;
+    let mut sender = Vfs::dial_ready(sender_port, BUDGET).await;
 
     // Owner plants the mailbox (wal DT_STREAM), sender waits for it to replicate.
     owner
@@ -93,7 +93,7 @@ async fn mailbox_round(owner_port: u16, sender_port: u16, sender_name: &str, age
     // Owner parks a Watch in the background; give it a beat to actually park.
     let watch_mbox = mailbox.clone();
     let watch = tokio::spawn(async move {
-        let mut w = Vfs::dial(owner_port).await.expect("dial owner (watch)");
+        let mut w = Vfs::dial_ready(owner_port, BUDGET).await;
         w.watch(&watch_mbox, 20_000, "").await
     });
     tokio::time::sleep(Duration::from_millis(1500)).await;
@@ -180,7 +180,7 @@ async fn boot_federation(tmp: &std::path::Path) -> (Daemon, Daemon, Vfs, Vfs, u1
         .wait_for_log("Static topology applied", BUDGET)
         .await
         .expect("founder must apply federation topology (zone discoverable)");
-    let fc = Vfs::dial(fport).await.expect("dial founder");
+    let fc = Vfs::dial_ready(fport, BUDGET).await;
 
     let mut joiner = Daemon::spawn(
         &["--bind-addr", &jbind],
@@ -191,7 +191,7 @@ async fn boot_federation(tmp: &std::path::Path) -> (Daemon, Daemon, Vfs, Vfs, u1
         .wait_for_log(&zone_registered, BUDGET)
         .await
         .expect("joiner must join sharedzone");
-    let jc = Vfs::dial(jport).await.expect("dial joiner");
+    let jc = Vfs::dial_ready(jport, BUDGET).await;
 
     (founder, joiner, fc, jc, fport, jport)
 }

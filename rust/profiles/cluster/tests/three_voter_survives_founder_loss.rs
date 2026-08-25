@@ -99,6 +99,15 @@ async fn three_voter_zone_survives_founder_loss_via_new_leader() {
         .wait_for_log(&zone_registered, BUDGET)
         .await
         .expect("founder registers sharedzone");
+    // Joiners discover `sharedzone` via a one-shot DiscoverZones read of the
+    // founder's ROOT DT_MOUNT entries, which commit via `apply_topology` AFTER
+    // the "registered" log. Gate on "Static topology applied" so the mount is
+    // discoverable before booting the joiners — otherwise a joiner reads 0
+    // entries and stays rootless (the same race fixed in `founder_resume`).
+    founder
+        .wait_for_log("Static topology applied", BUDGET)
+        .await
+        .expect("founder MUST commit its declared mount into root (zone discoverable)");
 
     let mut j1 = Daemon::spawn(
         &["--bind-addr", &j1bind],
@@ -118,10 +127,20 @@ async fn three_voter_zone_survives_founder_loss_via_new_leader() {
         .await
         .expect("joiner2 joins sharedzone");
 
+    // Both joiners register the zone before their all-voter promotion COMMITS on
+    // the founder. Writing while a 1→2 or 2→3 AddNode ConfChange is still pending
+    // makes raft drop the proposal (`raft: proposal dropped`). Gate on the
+    // founder promoting BOTH learners to voters — one log per joiner — so the
+    // 3-voter config is committed and no ConfChange is in flight before we write.
+    founder
+        .wait_for_log_count("caught-up learner promoted to voter", 2, BUDGET)
+        .await
+        .expect("founder MUST promote both joiners to voters (3-voter quorum stable)");
+
     // ── 2. Health + plant a mailbox while all three are up (founder leads). ─
-    let mut fc = Vfs::dial(fport).await.expect("dial founder");
-    let mut j1c = Vfs::dial(j1port).await.expect("dial joiner1");
-    let mut j2c = Vfs::dial(j2port).await.expect("dial joiner2");
+    let mut fc = Vfs::dial_ready(fport, BUDGET).await;
+    let mut j1c = Vfs::dial_ready(j1port, BUDGET).await;
+    let mut j2c = Vfs::dial_ready(j2port, BUDGET).await;
 
     let health = format!("{MOUNT}/health.txt");
     fc.write_file(&health, b"3voter-health", "")
