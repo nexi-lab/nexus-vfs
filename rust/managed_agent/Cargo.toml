@@ -32,9 +32,8 @@ tracing = "0.1"
 parking_lot = "0.12"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 subprocess = { path = "../subprocess", optional = true }
-
-[dev-dependencies]
-# The from-stamp e2e companion test enlists the a2a MailboxStampingHook to
-# assert managed-agent's chat-with-me writes get rewritten. a2a is a sibling
-# kernel-tier crate (no cycle: a2a never depends on managed-agent).
+# a2a owns the mailbox contract (envelope schema + `ensure_mailbox_stream`, the
+# SSOT for provisioning a `chat-with-me` DT_STREAM). managed_agent is the
+# lifecycle owner that CALLS it to provision the per-pid pipe and the persistent
+# `/agents/{name}` inbox. No cycle: a2a depends only on kernel + contracts.
 a2a = { workspace = true }
