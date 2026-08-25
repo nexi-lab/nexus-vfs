@@ -95,6 +95,18 @@ async fn founder_resume_founds_its_declared_topology_then_replicates() {
         "founder MUST found+register `sharedzone` on Resume from its own \
              --cluster-init SSOT (root pre-existed, so StaticFounder was skipped)",
     );
+    // The joiner discovers `sharedzone` via a ONE-SHOT DiscoverZones read of the
+    // founder's ROOT DT_MOUNT entries (it stays rootless by design if it reads
+    // 0 — it does NOT retry; see `a2a_wakeup`). Those entries are committed by
+    // `apply_topology` AFTER the zone-registry "registered" log above, so gating
+    // the joiner on "registered" alone races the root apply. Wait for "Static
+    // topology applied" — the signal that every declared mount has committed
+    // into root — exactly as the other federation e2e tests do (a2a_wakeup,
+    // federation_mtls_from_stamp, dt_stream_unbounded, …).
+    founder
+        .wait_for_log("Static topology applied", BUDGET)
+        .await
+        .expect("founder MUST commit its declared mount into root (zone discoverable)");
 
     // ── 3. Boot the joiner; it reaches `sharedzone` purely via DiscoverZones. ─
     let mut joiner_env = base_env(&jdata, &jid, &jadv);
