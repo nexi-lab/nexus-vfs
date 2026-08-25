@@ -313,11 +313,25 @@ async fn joiner_installs_snapshot_after_compaction_then_cold_reads() {
     let mut jc = Vfs::dial(jport).await.expect("dial joiner");
     await_collect(&mut jc, &log, &expected_log()).await;
 
-    // STEADY STATE: the joiner is now a promoted voter. Keep appending past
-    // ANOTHER compaction — the caught-up follower stays in sync via ordinary
-    // replication (no snapshot needed), both logs stay bounded, and BOTH nodes
-    // read the full extended log byte-exact. This guards the common post-join
-    // path (2-voter compaction), not just the one-shot catch-up.
+    // STEADY STATE (2-voter post-join replication). The joiner joined as a
+    // learner and caught up via the snapshot above; the founder promotes it to a
+    // voter only once its log has caught up. Writing before that promotion
+    // commits races the 1→2-voter ConfChange — the enlarged quorum is briefly
+    // unreachable and the fail-loud wal push errors. Gate on the founder's
+    // "learner promoted to voter" log so the 2-voter quorum is live before we
+    // append: deterministic, and no client-side write retry (a retry could
+    // double-append a frame whose commit merely TIMED OUT — `WalStreamCore::push`
+    // reports a post-append commit timeout with the same "no reachable leader"
+    // text as a pre-commit rejection, so the client can't tell them apart).
+    founder
+        .wait_for_log("caught-up learner promoted to voter", BUDGET)
+        .await
+        .expect("founder MUST promote the caught-up joiner to voter (2-voter quorum live)");
+
+    // Keep appending past ANOTHER compaction — the caught-up follower stays in
+    // sync via ordinary replication (no snapshot needed), both logs stay bounded,
+    // and BOTH nodes read the full extended log byte-exact. Guards the common
+    // post-join path (2-voter compaction), not just the one-shot catch-up.
     let total = N_FRAMES + 40;
     for i in N_FRAMES..total {
         fc.stream_write(&log, &frame(i), "")
