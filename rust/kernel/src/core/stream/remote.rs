@@ -51,6 +51,15 @@ impl StreamBackend for RemoteStreamBackend {
         if self.closed.load(Ordering::Acquire) {
             return Err(StreamError::Closed("write to closed remote stream"));
         }
+        // Universal empty-push no-op — mirrors the mem / shm / wal
+        // backends and matches the `StreamBackend::last_append_ms`
+        // trait POSIX-`st_mtime` contract (empty write does not
+        // modify).  Pre-fix, an empty push here dialed the transport
+        // for a `stream_write_nowait` round-trip AND advanced local
+        // `tail` by `HEADER_SIZE`, silently violating the trait doc.
+        if data.is_empty() {
+            return Ok(self.tail.load(Ordering::Acquire));
+        }
 
         let offset = match self.transport.stream_write_nowait(&self.path, data) {
             Ok(offset) => offset as usize,

@@ -68,12 +68,14 @@ use parking_lot::Mutex;
 // keep the earlier future value (fetch_max) until real time crosses
 // it — could be seconds to hours depending on the jump.
 //
-// This is ACCEPTABLE for the current consumers (search recency +
-// staleness gates): both interpret the stamp as "at least this
-// recent", so a future-latched value degrades cache freshness (an
-// item looks fresher than it is) but never surfaces STALE-looking
-// data.  A future consumer that needs strict wall-clock accuracy
-// should use `SystemTime::now()` directly, not this cache.
+// This is ACCEPTABLE for the three known consumers — search-plugin
+// recency scoring, audit-tier staleness checks, and cross-agent
+// mailbox catch-up freshness gates — all of which interpret the
+// stamp as "at least this recent", so a future-latched value
+// degrades cache freshness (an item looks fresher than it is) but
+// never surfaces STALE-looking data.  A future consumer that needs
+// strict wall-clock accuracy should use `SystemTime::now()` directly,
+// not this cache.
 //
 // Relaxed matches the read-side (also relaxed): the timestamp is a
 // hint for staleness gates + search recency, not a happens-before
@@ -484,10 +486,24 @@ mod tests {
 
     #[test]
     fn test_empty_push_is_noop() {
+        // Pin the trait `last_append_ms` doc contract: `push(&[])`
+        // MUST NOT bump mtime (matches POSIX `st_mtime`, universal
+        // across mem / shm / wal / remote — see the WAL + Remote
+        // empty-push short-circuits added in the same series).
         let core = make(1024);
+        assert_eq!(
+            <MemoryStreamBackend as StreamBackend>::last_append_ms(&core),
+            None,
+            "pre-condition: never-appended stamp is None",
+        );
         let offset = push(&core, b"");
         assert_eq!(offset, 0);
         assert_eq!(core.msg_count(), 0);
+        assert_eq!(
+            <MemoryStreamBackend as StreamBackend>::last_append_ms(&core),
+            None,
+            "empty push must NOT stamp last_append_ms — POSIX st_mtime parity",
+        );
     }
 
     #[test]
