@@ -12,7 +12,7 @@
 //! hit the locally-applied state machine directly, no consensus round-trip.
 
 use crate::prelude::{Command, CommandResult, FullStateMachine, ZoneConsensus};
-use crate::runtime_bridge::bridge_block_on;
+use lib::rt::block_on_via as bridge_block_on;
 
 /// How long a write waits for its own effect to become visible in the local
 /// state machine before returning (read-your-writes). Admin tooling that writes

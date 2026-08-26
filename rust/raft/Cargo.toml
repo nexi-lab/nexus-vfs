@@ -109,6 +109,6 @@ consensus = ["raft", "protobuf", "slog", "async"]
 # Enable gRPC transport (tonic + protobuf) — EXPERIMENTAL, default OFF.
 # Requires `consensus` feature. Not used in production.
 # See: docs/rfcs/adr-raft-sled-strategy.md (Decision 4)
-grpc = ["tonic", "prost", "tonic-prost", "lib/transport", "lib", "bytes", "dep:tonic-prost-build", "async", "tracing-subscriber", "consensus", "dashmap", "time", "sha2", "rcgen", "x509-parser", "pem", "base64", "gethostname", "rand"]
+grpc = ["tonic", "prost", "tonic-prost", "lib/transport", "lib/runtime-bridge", "lib", "bytes", "dep:tonic-prost-build", "async", "tracing-subscriber", "consensus", "dashmap", "time", "sha2", "rcgen", "x509-parser", "pem", "base64", "gethostname", "rand"]
 
 full = ["grpc", "consensus"]

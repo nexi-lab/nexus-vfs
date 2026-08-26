@@ -73,12 +73,16 @@ impl RpcTransport {
         &self.runtime
     }
 
-    fn block_on<F: Future>(&self, future: F) -> F::Output {
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| self.runtime.handle().block_on(future))
-        } else {
-            self.runtime.block_on(future)
-        }
+    /// Bridge this sync method onto the inner runtime via the SSOT
+    /// [`lib::rt::block_on_via`] — correct for any ambient runtime flavor
+    /// (a current-thread co-host managed-agent reaching a cross-node peer fetch
+    /// is offloaded to a scratch thread, honoring the any-thread KernelSyscall
+    /// contract). One home for the "block_in_place needs multi-thread" hazard.
+    fn block_on<F: Future + Send>(&self, future: F) -> F::Output
+    where
+        F::Output: Send,
+    {
+        lib::rt::block_on_via(self.runtime.handle(), future)
     }
 
     fn build_channel(
