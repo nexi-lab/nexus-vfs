@@ -54,9 +54,9 @@
 use std::sync::Arc;
 
 use crate::prelude::{AppliedEntry, Command, FullStateMachine, ZoneConsensus};
-use crate::runtime_bridge::bridge_block_on;
 use crate::transport::proto::nexus::core::FileMetadata as ProtoFileMetadata;
 use contracts::VFS_ROOT;
+use lib::rt::block_on_via as bridge_block_on;
 use prost::Message;
 
 use kernel::meta_store::{

@@ -15,12 +15,12 @@ use crate::raft::StateMachine;
 use crate::raft::{
     Command, CommandResult, FullStateMachine, RaftError, Result, ZoneConsensus, ZoneRaftRegistry,
 };
-use crate::runtime_bridge::bridge_block_on;
 use crate::transport::{
     call_delete_zone, call_join_cluster, hostname_to_node_id, NodeAddress, RaftGrpcServer,
     ServerConfig, TlsConfig,
 };
 use crate::zone_handle::ZoneHandle;
+use lib::rt::block_on_via as bridge_block_on;
 
 // ── Federation mount helpers ─────────────────────────────────────────
 
