@@ -311,8 +311,7 @@ pub fn persist_zone_members(
         .ok()
         .map(|d| d.as_secs());
     let mut zones = existing.zones.clone();
-    let changed_material;
-    match zones.iter_mut().find(|z| z.zone_id == zone_id) {
+    let changed_material = match zones.iter_mut().find(|z| z.zone_id == zone_id) {
         Some(slot) => {
             // Load-bearing field is members only; `as_role` (intent) is
             // preserved (owned by `persist_zone_intent`), and
@@ -323,7 +322,7 @@ pub fn persist_zone_members(
             }
             slot.members = members;
             slot.last_confirmed_unix_secs = now_secs;
-            changed_material = !materially_same;
+            !materially_same
         }
         None => {
             // No intent recorded yet (members arrived before the join-time
@@ -335,9 +334,9 @@ pub fn persist_zone_members(
                 as_role: IdentityZoneRole::default(),
                 last_confirmed_unix_secs: now_secs,
             });
-            changed_material = true;
+            true
         }
-    }
+    };
 
     let updated = Identity {
         schema_version: SCHEMA_VERSION,

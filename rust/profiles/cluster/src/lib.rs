@@ -1286,12 +1286,21 @@ fn open_zone_manager(
         .rsplit_once(':')
         .and_then(|(_, p)| p.parse::<u16>().ok())
         .unwrap_or(2126);
+    // A remote peer (any peer NOT on loopback) means this is a cross-machine
+    // cluster: a loopback / wildcard / bare-hostname advertise is then
+    // unreachable and must fail loud rather than silently wedge the zone.
+    let has_remote_peer = merged_peer_addrs.iter().any(|p| {
+        peer_host(&p.to_raft_peer_str())
+            .map(|h| !host_is_loopback(h))
+            .unwrap_or(false)
+    });
     let self_address = resolve_self_address(
         common.advertise_addr.as_deref(),
         &hostname,
         bind_port,
+        has_remote_peer,
         merged_peer_addrs.len(),
-    );
+    )?;
 
     // Exclude self from the peer address book — warn, don't crash. Self is
     // never a transport peer (it joins via bootstrap / AddNode, PR #3996
@@ -3516,81 +3525,272 @@ fn resolve_hostname(cli: Option<&str>) -> String {
 ///      Single-node tests work unchanged; cross-machine setups MUST
 ///      pin advertise_cli to the overlay IP.
 ///
-/// When the resolved address looks unreachable (`0.0.0.0:*`, loopback,
-/// or non-IP host with peers configured), warn-loud so the operator
-/// sees the misconfiguration in boot logs — the Mac↔Win L1 wedge that
-/// motivated this seam manifested as silent "ConfState install timeout
-/// after JoinZone success" hours later.
+/// When the resolved address is one a remote peer cannot dial (`0.0.0.0:*`,
+/// loopback, bare hostname, or missing `:port`) **and** a peer is on another
+/// machine, boot is refused — see [`validate_self_address`]. The Mac↔Win duet
+/// wedge (`duetrt826` recorded a voter at `localhost:12022`, lost quorum hours
+/// later with only a buried `not leader`) is exactly what warning-not-failing
+/// let through, so a joiner must fail loud at boot instead.
 fn resolve_self_address(
     advertise_cli: Option<&str>,
     hostname: &str,
     bind_port: u16,
+    has_remote_peer: bool,
     peer_count: usize,
-) -> String {
+) -> anyhow::Result<String> {
     let resolved = match advertise_cli {
         Some(v) if !v.trim().is_empty() => v.trim().to_string(),
         _ => format!("{hostname}:{bind_port}"),
     };
-    warn_if_self_address_unreachable(&resolved, peer_count);
-    resolved
+    validate_self_address(&resolved, has_remote_peer, peer_count)?;
+    Ok(resolved)
 }
 
-/// Warn-loud when the resolved self_address looks unreachable from
-/// peers. Heuristic, not a hard error — single-node tests legitimately
-/// bind 0.0.0.0 with no peers, and operators may name a fully-qualified
-/// hostname their peers can resolve.
-fn warn_if_self_address_unreachable(self_address: &str, peer_count: usize) {
-    let (host, _port) = match self_address.rsplit_once(':') {
-        Some(parts) => parts,
+/// A remote peer must be able to DIAL this node's advertised `self_address`.
+/// When it demonstrably cannot — loopback / wildcard / bare-hostname / no
+/// `:port` while a peer is on another machine — boot is refused with a hard
+/// error, **not** a warning: otherwise the joiner forms a zone membership at an
+/// unreachable address and the zone silently wedges (loses quorum) hours later
+/// with only a buried `not leader`. (Mac↔Win duet post-mortem: `duetrt826`
+/// recorded a voter at `localhost:12022`.) Cases that are only *probably* wrong
+/// — a dotted FQDN that might resolve — stay a warning.
+///
+/// Same-machine multi-node tests are unaffected: with every peer on loopback
+/// (`has_remote_peer == false`) a loopback advertise is genuinely reachable, so
+/// it is allowed.
+fn validate_self_address(
+    self_address: &str,
+    has_remote_peer: bool,
+    peer_count: usize,
+) -> anyhow::Result<()> {
+    match classify_self_address(self_address, has_remote_peer, peer_count) {
+        SelfAddrVerdict::Ok => Ok(()),
+        SelfAddrVerdict::Warn(why) => {
+            tracing::warn!(target: "nexusd_cluster", self_address = %self_address, "{why}");
+            Ok(())
+        }
+        SelfAddrVerdict::Refuse(why) => Err(anyhow::anyhow!(
+            "refusing to boot: advertise self_address `{self_address}` {why} Set \
+             --advertise-addr to this machine's overlay/network IP (e.g. its \
+             Tailscale 100.x address) with an explicit :port.",
+        )),
+    }
+}
+
+/// Verdict for an advertised `self_address` given the peer set. Pure + total so
+/// the reachability contract is unit-tested without a running daemon.
+#[derive(Debug, PartialEq, Eq)]
+enum SelfAddrVerdict {
+    Ok,
+    /// Probably-wrong but not provably unreachable (e.g. a dotted FQDN that may
+    /// resolve on the operator's network).
+    Warn(&'static str),
+    /// Provably undialable by a remote peer — fail loud.
+    Refuse(&'static str),
+}
+
+fn classify_self_address(
+    self_address: &str,
+    has_remote_peer: bool,
+    peer_count: usize,
+) -> SelfAddrVerdict {
+    let host = match self_address.rsplit_once(':') {
+        Some((h, _port)) => h,
+        // No `:port` — nobody can dial it once peers exist.
         None => {
-            tracing::warn!(
-                target: "nexusd_cluster",
-                self_address = %self_address,
-                "advertise self_address has no :port — peers cannot dial it; \
-                 set --advertise-addr <host>:<port>",
-            );
-            return;
+            return if peer_count > 0 {
+                SelfAddrVerdict::Refuse("has no :port — peers cannot dial it.")
+            } else {
+                SelfAddrVerdict::Ok
+            };
         }
     };
     let host = host.trim_start_matches('[').trim_end_matches(']');
+    // Wildcard is a BIND address, never a dialable advertise — wrong for ANY peer.
     if host == "0.0.0.0" || host == "::" || host.is_empty() {
-        tracing::warn!(
-            target: "nexusd_cluster",
-            self_address = %self_address,
-            "advertise self_address binds wildcard — peers cannot dial it; \
-             set --advertise-addr to a reachable host:port",
+        return if peer_count > 0 {
+            SelfAddrVerdict::Refuse("binds a wildcard address peers cannot dial.")
+        } else {
+            SelfAddrVerdict::Ok
+        };
+    }
+    // Loopback is reachable only from the same machine — fatal iff a peer is remote.
+    if host_is_loopback(host) {
+        return if has_remote_peer {
+            SelfAddrVerdict::Refuse("is a loopback address a peer on another machine cannot reach.")
+        } else {
+            SelfAddrVerdict::Ok
+        };
+    }
+    // Classify the remaining host shape.
+    let looks_like_ipv4 = host.split('.').count() == 4
+        && host
+            .split('.')
+            .all(|seg| !seg.is_empty() && seg.bytes().all(|b| b.is_ascii_digit()));
+    let dotted_or_ip = host.contains('.') || host.contains(':') || looks_like_ipv4;
+    // Bare (non-dotted) OS hostname — does not resolve across an overlay.
+    if !dotted_or_ip && has_remote_peer {
+        return SelfAddrVerdict::Refuse(
+            "is a bare hostname that does not resolve across an overlay (Tailscale/VPN).",
         );
-        return;
     }
-    if host == "127.0.0.1" || host == "::1" || host == "localhost" {
-        if peer_count > 0 {
-            tracing::warn!(
-                target: "nexusd_cluster",
-                self_address = %self_address,
-                peer_count,
-                "advertise self_address is loopback while peers are configured — \
-                 cross-machine peers cannot reach this node; set --advertise-addr \
-                 to the reachable network IP",
-            );
-        }
-        return;
+    // A dotted FQDN (not an IP) with a remote peer *might* resolve — warn only.
+    if host.contains('.') && !looks_like_ipv4 && has_remote_peer {
+        return SelfAddrVerdict::Warn(
+            "advertise self_address is a hostname; if peers reach this node via an \
+             overlay (Tailscale/VPN), set --advertise-addr to the overlay IP — \
+             hostnames rarely resolve across overlays",
+        );
     }
-    // Non-IP host with peers configured — likely the OS hostname,
-    // which does not resolve through Tailscale/VPN overlays.
-    let looks_like_ip = host
-        .split('.')
-        .all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_digit()))
-        && host.split('.').count() == 4;
-    let looks_like_ipv6 = host.contains(':');
-    if !looks_like_ip && !looks_like_ipv6 && peer_count > 0 && !host.contains('.') {
-        tracing::warn!(
-            target: "nexusd_cluster",
-            self_address = %self_address,
-            peer_count,
-            "advertise self_address is a bare hostname; if peers are on a \
-             different machine and reach this node via an overlay (Tailscale, \
-             VPN), set --advertise-addr to the overlay IP — bare hostnames \
-             rarely resolve across overlays",
+    SelfAddrVerdict::Ok
+}
+
+/// True for the literal `localhost` or any IP whose address is loopback.
+/// `auth_posture::is_loopback_bind` only recognises numeric IPs; the federation
+/// contract must also catch `localhost` (the Mac wedge advertised exactly
+/// `localhost:12022`).
+fn host_is_loopback(host: &str) -> bool {
+    let h = host.trim_start_matches('[').trim_end_matches(']');
+    h.eq_ignore_ascii_case("localhost")
+        || h.parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
+/// Host portion of a peer address, accepting BOTH the raft
+/// `<node_id>@host:port` form (what `NodeAddress::to_raft_peer_str` emits) and a
+/// plain `host:port` (IPv6-bracket aware). Skipping the `@`-strip is what made
+/// the first cut read same-machine `<id>@127.0.0.1` peers as "remote" and wrongly
+/// refuse a loopback advertise — breaking every same-machine federation test.
+fn peer_host(addr: &str) -> Option<&str> {
+    let hostport = addr.rsplit_once('@').map(|(_, a)| a).unwrap_or(addr);
+    hostport
+        .rsplit_once(':')
+        .map(|(h, _)| h.trim_start_matches('[').trim_end_matches(']'))
+}
+
+#[cfg(test)]
+mod self_address_tests {
+    use super::{classify_self_address, host_is_loopback, peer_host, SelfAddrVerdict};
+
+    #[test]
+    fn loopback_advertise_with_remote_peer_refuses() {
+        // THE Mac↔Win wedge: `localhost:12022` advertised into a cross-machine zone.
+        assert!(matches!(
+            classify_self_address("localhost:12022", /* has_remote_peer */ true, 1),
+            SelfAddrVerdict::Refuse(_)
+        ));
+        assert!(matches!(
+            classify_self_address("127.0.0.1:2126", true, 1),
+            SelfAddrVerdict::Refuse(_)
+        ));
+        assert!(matches!(
+            classify_self_address("[::1]:2126", true, 1),
+            SelfAddrVerdict::Refuse(_)
+        ));
+    }
+
+    #[test]
+    fn loopback_advertise_same_machine_is_allowed() {
+        // All peers on loopback (same-machine multi-node test) → reachable, OK.
+        assert_eq!(
+            classify_self_address("127.0.0.1:2126", false, 2),
+            SelfAddrVerdict::Ok
+        );
+        // Single node / founder (no peers) → OK regardless.
+        assert_eq!(
+            classify_self_address("127.0.0.1:2126", false, 0),
+            SelfAddrVerdict::Ok
+        );
+    }
+
+    #[test]
+    fn wildcard_and_missing_port_refuse_once_peers_exist() {
+        assert!(matches!(
+            classify_self_address("0.0.0.0:2126", false, 1),
+            SelfAddrVerdict::Refuse(_)
+        ));
+        assert!(matches!(
+            classify_self_address("[::]:2126", true, 1),
+            SelfAddrVerdict::Refuse(_)
+        ));
+        assert!(matches!(
+            classify_self_address("host-no-port", false, 1),
+            SelfAddrVerdict::Refuse(_)
+        ));
+        // No peers → wildcard / no-port are harmless single-node binds.
+        assert_eq!(
+            classify_self_address("0.0.0.0:2126", false, 0),
+            SelfAddrVerdict::Ok
+        );
+    }
+
+    #[test]
+    fn bare_hostname_refuses_only_with_a_remote_peer() {
+        assert!(matches!(
+            classify_self_address("DESKTOP-K2PHFNR:2126", true, 1),
+            SelfAddrVerdict::Refuse(_)
+        ));
+        // Same-machine: the OS hostname resolves locally, allow.
+        assert_eq!(
+            classify_self_address("DESKTOP-K2PHFNR:2126", false, 1),
+            SelfAddrVerdict::Ok
+        );
+    }
+
+    #[test]
+    fn routable_ip_is_ok_and_fqdn_only_warns() {
+        assert_eq!(
+            classify_self_address("100.64.0.21:2126", true, 1),
+            SelfAddrVerdict::Ok
+        );
+        assert!(matches!(
+            classify_self_address("node.example.com:2126", true, 1),
+            SelfAddrVerdict::Warn(_)
+        ));
+    }
+
+    #[test]
+    fn host_is_loopback_covers_localhost_and_ip_literals() {
+        assert!(host_is_loopback("localhost"));
+        assert!(host_is_loopback("127.0.0.1"));
+        assert!(host_is_loopback("127.1.2.3"));
+        assert!(host_is_loopback("::1"));
+        assert!(!host_is_loopback("100.64.0.21"));
+        assert!(!host_is_loopback("example.com"));
+    }
+
+    #[test]
+    fn peer_host_extracts_host_from_both_forms() {
+        // Plain operator form.
+        assert_eq!(peer_host("100.64.0.27:2126"), Some("100.64.0.27"));
+        assert_eq!(peer_host("[::1]:2126"), Some("::1"));
+        assert_eq!(peer_host("no-port"), None);
+        // Raft `<node_id>@host:port` form — the one `to_raft_peer_str` emits.
+        assert_eq!(peer_host("12345@127.0.0.1:2126"), Some("127.0.0.1"));
+        assert_eq!(peer_host("9988@[::1]:2126"), Some("::1"));
+        assert_eq!(peer_host("42@100.64.0.21:2126"), Some("100.64.0.21"));
+    }
+
+    #[test]
+    fn same_machine_raft_peer_strings_are_not_remote() {
+        // Regression for the CI break: real raft peer strings carry a
+        // `<node_id>@` prefix, and the same-machine federation tests dial
+        // `<id>@127.0.0.1:<port>`. `has_remote_peer` must read that as LOCAL,
+        // else a loopback advertise is wrongly refused and every same-machine
+        // federation test fails to boot.
+        let peers = ["9988@127.0.0.1:2126", "7766@127.0.0.1:2200"];
+        let has_remote_peer = peers
+            .iter()
+            .any(|s| peer_host(s).map(|h| !host_is_loopback(h)).unwrap_or(false));
+        assert!(
+            !has_remote_peer,
+            "same-machine loopback peers must not be 'remote'"
+        );
+        // And the loopback advertise they pair with is then allowed.
+        assert_eq!(
+            classify_self_address("127.0.0.1:2126", has_remote_peer, peers.len()),
+            SelfAddrVerdict::Ok
         );
     }
 }
@@ -5609,8 +5809,14 @@ mod tests {
     fn advertise_addr_explicit_wins() {
         // Cross-machine federation: advertise pins Tailscale IP
         // independently of OS hostname.
-        let resolved =
-            resolve_self_address(Some("100.64.0.27:2126"), "win", 2126, /* peers */ 1);
+        let resolved = resolve_self_address(
+            Some("100.64.0.27:2126"),
+            "win",
+            2126,
+            /* has_remote_peer */ true,
+            /* peers */ 1,
+        )
+        .expect("routable IP advertise is valid");
         assert_eq!(resolved, "100.64.0.27:2126");
     }
 
@@ -5619,13 +5825,15 @@ mod tests {
         // Operator templating slip-through (envsubst with unset variable)
         // produces empty string — fall back to hostname:port rather than
         // advertising literal "".
-        let resolved = resolve_self_address(Some("   "), "myhost", 9000, 0);
+        let resolved = resolve_self_address(Some("   "), "myhost", 9000, false, 0)
+            .expect("no peers → any fallback is valid");
         assert_eq!(resolved, "myhost:9000");
     }
 
     #[test]
     fn advertise_addr_unset_falls_back_to_hostname_port() {
-        let resolved = resolve_self_address(None, "single-node", 2126, 0);
+        let resolved = resolve_self_address(None, "single-node", 2126, false, 0)
+            .expect("no peers → hostname fallback is valid");
         assert_eq!(resolved, "single-node:2126");
     }
 
@@ -5633,7 +5841,14 @@ mod tests {
     fn advertise_addr_overrides_distinct_port_from_bind() {
         // operator binds 0.0.0.0:2126 but advertises an externally
         // reachable port (port-forward / load-balancer scenarios).
-        let resolved = resolve_self_address(Some("public.example.com:443"), "internal", 2126, 1);
+        let resolved = resolve_self_address(
+            Some("public.example.com:443"),
+            "internal",
+            2126,
+            /* has_remote_peer */ true,
+            /* peers */ 1,
+        )
+        .expect("a dotted FQDN warns but is allowed (may resolve on the operator's net)");
         assert_eq!(resolved, "public.example.com:443");
     }
 
