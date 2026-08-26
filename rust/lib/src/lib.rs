@@ -29,3 +29,9 @@ pub mod types;
 
 #[cfg(feature = "transport")]
 pub mod transport_primitives;
+
+/// Sync→async runtime bridge — `block_on_via` / `block_on_portable`, correct for
+/// any ambient tokio runtime flavor. The single home for the "block_in_place
+/// requires a multi-thread runtime" hazard (retired the per-site copies).
+#[cfg(feature = "runtime-bridge")]
+pub mod rt;

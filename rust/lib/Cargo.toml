@@ -31,6 +31,11 @@ transport = [
     "dep:arc-swap",
 ]
 
+# `lib::rt` — the sync→async runtime bridge (block_on_via / block_on_portable),
+# the ONE home for the "block_in_place needs a multi-thread runtime" hazard.
+# Lighter than `transport`: only tokio's rt + rt-multi-thread, no tonic/rustls.
+runtime-bridge = ["dep:tokio", "tokio/rt", "tokio/rt-multi-thread"]
+
 [dependencies]
 # Constants SSOT — pulled unconditionally because the crate is
 # zero-dep-cost (only `pub const` definitions). transport_primitives
