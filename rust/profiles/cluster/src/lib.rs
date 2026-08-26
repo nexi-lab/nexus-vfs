@@ -3657,8 +3657,13 @@ fn host_is_loopback(host: &str) -> bool {
             .unwrap_or(false)
 }
 
-/// Host portion of a `host:port` peer string (IPv6-bracket aware).
-fn peer_host(hostport: &str) -> Option<&str> {
+/// Host portion of a peer address, accepting BOTH the raft
+/// `<node_id>@host:port` form (what `NodeAddress::to_raft_peer_str` emits) and a
+/// plain `host:port` (IPv6-bracket aware). Skipping the `@`-strip is what made
+/// the first cut read same-machine `<id>@127.0.0.1` peers as "remote" and wrongly
+/// refuse a loopback advertise — breaking every same-machine federation test.
+fn peer_host(addr: &str) -> Option<&str> {
+    let hostport = addr.rsplit_once('@').map(|(_, a)| a).unwrap_or(addr);
     hostport
         .rsplit_once(':')
         .map(|(h, _)| h.trim_start_matches('[').trim_end_matches(']'))
@@ -3756,10 +3761,37 @@ mod self_address_tests {
     }
 
     #[test]
-    fn peer_host_extracts_host() {
+    fn peer_host_extracts_host_from_both_forms() {
+        // Plain operator form.
         assert_eq!(peer_host("100.64.0.27:2126"), Some("100.64.0.27"));
         assert_eq!(peer_host("[::1]:2126"), Some("::1"));
         assert_eq!(peer_host("no-port"), None);
+        // Raft `<node_id>@host:port` form — the one `to_raft_peer_str` emits.
+        assert_eq!(peer_host("12345@127.0.0.1:2126"), Some("127.0.0.1"));
+        assert_eq!(peer_host("9988@[::1]:2126"), Some("::1"));
+        assert_eq!(peer_host("42@100.64.0.21:2126"), Some("100.64.0.21"));
+    }
+
+    #[test]
+    fn same_machine_raft_peer_strings_are_not_remote() {
+        // Regression for the CI break: real raft peer strings carry a
+        // `<node_id>@` prefix, and the same-machine federation tests dial
+        // `<id>@127.0.0.1:<port>`. `has_remote_peer` must read that as LOCAL,
+        // else a loopback advertise is wrongly refused and every same-machine
+        // federation test fails to boot.
+        let peers = ["9988@127.0.0.1:2126", "7766@127.0.0.1:2200"];
+        let has_remote_peer = peers
+            .iter()
+            .any(|s| peer_host(s).map(|h| !host_is_loopback(h)).unwrap_or(false));
+        assert!(
+            !has_remote_peer,
+            "same-machine loopback peers must not be 'remote'"
+        );
+        // And the loopback advertise they pair with is then allowed.
+        assert_eq!(
+            classify_self_address("127.0.0.1:2126", has_remote_peer, peers.len()),
+            SelfAddrVerdict::Ok
+        );
     }
 }
 
