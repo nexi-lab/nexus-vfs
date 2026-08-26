@@ -2783,45 +2783,70 @@ async fn reconcile_federation_from_peers(
     if peers.is_empty() {
         return Ok(0);
     }
+    // Boot discovery is PULL-based and races the founder's ASYNC topology
+    // publish: a peer can be TCP-up (so this joiner has already booted, possibly
+    // gated on the peer's `Zone registered` log) while its DT_MOUNT entries are
+    // still being applied into ROOT, or be momentarily busy inside a raft tick —
+    // so a single `DiscoverZones` read can legitimately come back empty. A
+    // joiner has NO periodic re-discovery, so a one-shot empty read strands it
+    // rootless-with-peers forever (until an offline `join` sidecar or a
+    // ConfChange apply). Poll until a peer reports a zone or a bounded deadline
+    // elapses. This is discovery polling of a peer's async-published state (no
+    // push channel exists), NOT a raft-convergence wait; a genuinely zoneless
+    // federation still falls through to rootless after the deadline, preserving
+    // the sidecar/ConfChange fallback (see `plan_boot_action` matrix rows 3/4).
+    const BOOT_DISCOVER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+    const BOOT_DISCOVER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+    let deadline = tokio::time::Instant::now() + BOOT_DISCOVER_DEADLINE;
     // Ask each peer to report its local federation topology via
     // `DiscoverZones` and union the results — a partially-configured founder
     // pair (each half exposing a disjoint zone) still discovers both.  The
     // BTreeMap sorts by path; `discovered_zone_order` preserves first-response
     // order for per-zone JoinZone dispatch.
-    let mut discovered_mounts: std::collections::BTreeMap<String, String> =
-        std::collections::BTreeMap::new();
-    let mut discovered_zone_order: Vec<String> = Vec::new();
-    for peer in &peers {
-        match nexus_raft::transport::call_discover_zones_rpc(
-            &peer.endpoint,
-            zm.registry().tls_config(),
-            /* timeout */ 10,
-        )
-        .await
-        {
-            Ok(entries) => {
-                tracing::info!(
-                    peer = %peer.endpoint,
-                    discovered = entries.len(),
-                    "DiscoverZones: peer reported federation zones",
-                );
-                for entry in entries {
-                    if !discovered_mounts.contains_key(&entry.mount_path) {
-                        discovered_zone_order.push(entry.zone_id.clone());
+    let (discovered_zone_order, discovered_mounts) = loop {
+        let mut discovered_mounts: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        let mut discovered_zone_order: Vec<String> = Vec::new();
+        for peer in &peers {
+            match nexus_raft::transport::call_discover_zones_rpc(
+                &peer.endpoint,
+                zm.registry().tls_config(),
+                /* timeout */ 10,
+            )
+            .await
+            {
+                Ok(entries) => {
+                    tracing::info!(
+                        peer = %peer.endpoint,
+                        discovered = entries.len(),
+                        "DiscoverZones: peer reported federation zones",
+                    );
+                    for entry in entries {
+                        if !discovered_mounts.contains_key(&entry.mount_path) {
+                            discovered_zone_order.push(entry.zone_id.clone());
+                        }
+                        discovered_mounts.insert(entry.mount_path, entry.zone_id);
                     }
-                    discovered_mounts.insert(entry.mount_path, entry.zone_id);
                 }
+                Err(e) => tracing::warn!(
+                    peer = %peer.endpoint,
+                    error = %e,
+                    "DiscoverZones: peer unreachable — trying next",
+                ),
             }
-            Err(e) => tracing::warn!(
-                peer = %peer.endpoint,
-                error = %e,
-                "DiscoverZones: peer unreachable — trying next",
-            ),
         }
-    }
-    if discovered_zone_order.is_empty() {
-        return Ok(0);
-    }
+        if !discovered_zone_order.is_empty() {
+            break (discovered_zone_order, discovered_mounts);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(0);
+        }
+        tracing::debug!(
+            "DiscoverZones: peers reported no federation zones yet — retrying \
+             (a peer's topology publish can lag its TCP bind)",
+        );
+        tokio::time::sleep(BOOT_DISCOVER_INTERVAL).await;
+    };
     // Phase H: fresh joiner via DiscoverZones has no prior role signal —
     // default all-voter, matching the pre-Phase-H hardcoded behaviour.
     // Operators who need learner-first fresh joins use the offline
