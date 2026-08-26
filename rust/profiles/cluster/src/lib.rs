@@ -803,13 +803,55 @@ impl JoinRole {
 /// unification — cluster gets `driver-path-local + driver-remote`,
 /// full adds `driver-s3` on top. `DefaultObjectStoreProvider` reads
 /// which arms compiled in and dispatches accordingly.
-/// Boot-derived config the composition's service-decl builder reads to
-/// parameterise each service (e.g. a2a's fail-closed posture). Populated by
+/// Boot-derived resources the composition's service-decl builder reads to
+/// parameterise + wire each service (e.g. a2a's fail-closed posture, an
+/// HTTP shim's live auth resolver + async runtime handle).  Populated by
 /// [`run_with_services`] at the point services are brought up.
+///
+/// # SRP
+///
+/// Every field here is BOTH boot-derived (only available AFTER the
+/// daemon's initial init step) AND cross-cutting (multiple services
+/// plausibly need it).  Service-specific config (an HTTP bind address,
+/// per-service env) belongs in the service's own layer, NOT here — the
+/// ctx is a live-handles bag, not a config kitchen sink.
 pub struct ServiceBootCtx {
     /// True iff an auth provider is armed (sk- API-key auth). a2a uses it
     /// as its from-stamp fail-closed posture.
+    ///
+    /// Kept as an orthogonal facet alongside [`Self::auth`] — a service
+    /// that only needs a posture bit (a2a) reads this; a service that
+    /// needs the resolver (an HTTP bearer middleware) reads
+    /// [`Self::auth`].  Materialised here so consumers do not each need
+    /// to downcast `Arc<dyn AuthProvider>` to check for `NoAuth`.
     pub auth_armed: bool,
+
+    /// Live auth provider — the SAME `Arc<dyn AuthProvider>` the
+    /// kernel's gRPC interceptor consumes (via
+    /// `transport::grpc::VfsServiceImpl::authenticate`).  A service that
+    /// authenticates callers (e.g. an HTTP bearer middleware, a future
+    /// SOCKS proxy) injects this into its request path so both surfaces
+    /// speak the same auth plane — no fork, no re-implementation.
+    /// Always `Arc<NoAuth>` when the daemon booted without an ApiKey
+    /// posture — never absent at this seam — so consumers can call
+    /// `.resolve(...)` unconditionally.
+    pub auth: std::sync::Arc<dyn transport::auth::AuthProvider>,
+
+    /// Handle to the tokio runtime `run_daemon` is executing under.
+    /// Services that need to spawn background tasks (long-running
+    /// listeners, workers, per-connection loops) go through this so
+    /// they inherit the daemon's runtime instead of spinning their own.
+    /// One runtime per process is a strict invariant — a service that
+    /// creates a fresh runtime here would fragment `tokio::spawn`
+    /// scoping and break the daemon's graceful-shutdown contract.
+    pub runtime: tokio::runtime::Handle,
+
+    /// The `--data-dir` the daemon persists state under (raft store,
+    /// TLS material, key store).  Services that need on-disk config
+    /// files (e.g. an HTTP shim reading a per-node TLS cert) read them
+    /// relative to here — no service should re-parse the CLI to find
+    /// it.
+    pub data_dir: std::path::PathBuf,
 }
 
 /// Boxed service-decl builder — threaded from [`run_with_services`] into
@@ -1519,7 +1561,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         Arc::new(std::sync::OnceLock::new());
     let vfs_routes = transport::grpc::build_vfs_routes(
         Arc::clone(&kernel),
-        vfs_auth,
+        Arc::clone(&vfs_auth),
         Arc::clone(&fca_verifier_slot),
         64 * 1024 * 1024,
         "nexusd-cluster",
@@ -1887,20 +1929,47 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
             //   (B) `zones` came from identity.zones (Phase B reconnect) →
             //       join those directly.
             if zones.is_empty() {
-                let reconciled = reconcile_federation_from_peers(
-                    zm.clone(),
-                    node_id,
-                    self_address.clone(),
-                    common.data_dir.clone(),
-                    peers,
-                )
-                .await?;
+                // Order-independent retry-join (the etcd / k3s / consul model a
+                // first-timer expects): a joiner started BEFORE its founder must
+                // still auto-discover + join the federation zones once the
+                // founder is reachable — not one-shot to rootless and need the
+                // manual `nexusd-cluster join` sidecar. Retry DiscoverZones with
+                // a bounded budget until a peer reports zones. Retrying on
+                // `reconciled == 0` (not on a raw "unreachable") also rides out
+                // the "founder up but --cluster-init topology not yet applied"
+                // race (the Static-topology-applied gate). The per-zone JoinZone
+                // reconcile hands off to already retries indefinitely; this makes
+                // the discovery STAGE equally resilient — the two stages are
+                // sequential, not competing.
+                let deadline = tokio::time::Instant::now() + JOINER_DISCOVERY_BUDGET;
+                let reconciled = loop {
+                    let n = reconcile_federation_from_peers(
+                        zm.clone(),
+                        node_id,
+                        self_address.clone(),
+                        common.data_dir.clone(),
+                        peers.clone(),
+                    )
+                    .await?;
+                    if n > 0 || peers.is_empty() || tokio::time::Instant::now() >= deadline {
+                        break n;
+                    }
+                    tracing::info!(
+                        peers = ?peers.iter().map(|p| p.endpoint.as_str()).collect::<Vec<_>>(),
+                        "waiting for a founder to become reachable to discover its \
+                         zones (retrying) — is a --cluster-init founder started and \
+                         past its \"Static topology applied\" log on one of these \
+                         addresses? A joiner auto-joins once it is.",
+                    );
+                    tokio::time::sleep(JOINER_DISCOVERY_RETRY_INTERVAL).await;
+                };
                 if reconciled == 0 {
                     tracing::info!(
                         "boot joiner: no federation zones auto-declared and none \
-                         reported by peers; daemon up rootless-with-peers. Use \
-                         `nexusd-cluster join` sidecar for zone-specific joining, \
-                         or wait for a ConfChange apply to populate identity.zones.",
+                         reported by peers within the discovery budget; daemon up \
+                         rootless-with-peers. Use `nexusd-cluster join` sidecar for \
+                         zone-specific joining, or wait for a ConfChange apply to \
+                         populate identity.zones.",
                     );
                 }
             } else {
@@ -2341,6 +2410,16 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     // NoAuth (empty agent_id ⇒ fail-open ⇒ no rewrite).
     let svc_ctx = ServiceBootCtx {
         auth_armed: api_key_auth.is_some(),
+        // `vfs_auth` is the trait-object the kernel gRPC interceptor
+        // consumes — reuse it so every authenticated surface (kernel
+        // gRPC, http-api middleware, any future service) speaks the
+        // same auth plane.
+        auth: Arc::clone(&vfs_auth),
+        // `Handle::current()` is safe here — `run_daemon` runs INSIDE
+        // the tokio runtime that `run_with_services` spun up (single
+        // runtime invariant).
+        runtime: tokio::runtime::Handle::current(),
+        data_dir: common.data_dir.clone(),
     };
     kernel
         .bring_up_services(build_decls(&svc_ctx))
@@ -2751,6 +2830,18 @@ async fn run_share(
     Ok(())
 }
 
+/// How long a fresh joiner keeps retrying `DiscoverZones` for its founder to
+/// become reachable (and past its `Static topology applied` gate) before giving
+/// up and coming up rootless-with-peers. Bounded so a founder that never
+/// appears still yields an observable daemon; generous enough that the common
+/// "both started within a minute, either order" case always auto-joins.
+const JOINER_DISCOVERY_BUDGET: Duration = Duration::from_secs(60);
+
+/// Cadence between `DiscoverZones` retries while a fresh joiner waits for its
+/// founder. Matches the calm poll interval a first-timer expects from `mount -a`
+/// / an etcd-style client — not a busy spin.
+const JOINER_DISCOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Re-derive this joiner's federation topology from its peers and (re)wire it,
 /// idempotently.  Returns the number of zones reconciled (0 when no peer
 /// reported any topology — e.g. all peers unreachable at boot, or `peers`
@@ -2812,10 +2903,15 @@ async fn reconcile_federation_from_peers(
                     discovered_mounts.insert(entry.mount_path, entry.zone_id);
                 }
             }
-            Err(e) => tracing::warn!(
+            // Per-peer reachability detail (debug). A boot-time joiner whose
+            // founder isn't up yet retries at the STAGE level (see the
+            // `JOINER_DISCOVERY_BUDGET` loop at the fresh-`Join` call site),
+            // which emits the single user-facing "waiting for a founder…"
+            // guidance — so a transient miss here is expected, not a warning.
+            Err(e) => tracing::debug!(
                 peer = %peer.endpoint,
                 error = %e,
-                "DiscoverZones: peer unreachable — trying next",
+                "DiscoverZones: peer not reachable this attempt",
             ),
         }
     }
