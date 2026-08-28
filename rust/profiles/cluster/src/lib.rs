@@ -845,13 +845,6 @@ pub struct ServiceBootCtx {
     /// creates a fresh runtime here would fragment `tokio::spawn`
     /// scoping and break the daemon's graceful-shutdown contract.
     pub runtime: tokio::runtime::Handle,
-
-    /// The `--data-dir` the daemon persists state under (raft store,
-    /// TLS material, key store).  Services that need on-disk config
-    /// files (e.g. an HTTP shim reading a per-node TLS cert) read them
-    /// relative to here — no service should re-parse the CLI to find
-    /// it.
-    pub data_dir: std::path::PathBuf,
 }
 
 /// Boxed service-decl builder — threaded from [`run_with_services`] into
@@ -2428,7 +2421,6 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         // the tokio runtime that `run_with_services` spun up (single
         // runtime invariant).
         runtime: tokio::runtime::Handle::current(),
-        data_dir: common.data_dir.clone(),
     };
     kernel
         .bring_up_services(build_decls(&svc_ctx))
