@@ -36,17 +36,25 @@
 //! pipe only collapses when both are gone, which is how we deliver EOF
 //! to the subprocess.
 //!
-//! Unix-only (the whole crate is `#![cfg(unix)]`): it `dup(2)`s raw fds
-//! and depends on `#[cfg(unix)]` stdio-pipe kernel support. On non-unix
-//! targets the crate compiles to an empty rlib, and its only callers
-//! (`managed_agent::raw_spawn`, nexus `acp`) are themselves `cfg(unix)`.
+//! Portability: the spawn + parent-handle path ([`spawn_no_pipes`],
+//! [`take_stdio_for_connection`], [`wait`], [`kill`]) is cross-platform
+//! tokio. Only the raw-fd DT_PIPE path ([`spawn_from_argv`], which
+//! `dup(2)`s fds into the kernel's `#[cfg(unix)]` stdio-pipe backend) is
+//! unix-only and gated as such. The managed-agent raw control plane uses
+//! only the portable path (it pumps the parent-side handles into node-local
+//! memory `DT_STREAM`s), so it — and this crate — build on Windows.
+//!
+//! [`spawn_no_pipes`]: HostedSubprocess::spawn_no_pipes
+//! [`take_stdio_for_connection`]: HostedSubprocess::take_stdio_for_connection
+//! [`wait`]: HostedSubprocess::wait
+//! [`kill`]: HostedSubprocess::kill
+//! [`spawn_from_argv`]: HostedSubprocess::spawn_from_argv
 
-#![cfg(unix)]
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
-use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::Stdio;
 
@@ -115,6 +123,10 @@ impl HostedSubprocess {
     ///   * spawn fails — `SubprocessError::Spawn`. No `DT_PIPE`s created.
     ///   * register fails partway — already-registered pipes are unlinked
     ///     before returning so we don't leak `DT_PIPE` entries.
+    ///
+    /// Unix-only: it dups raw fds into the kernel's `#[cfg(unix)]` stdio-pipe
+    /// backend. Non-unix callers use [`Self::spawn_no_pipes`] + a pump.
+    #[cfg(unix)]
     pub async fn spawn_from_argv<K: KernelSyscall>(
         argv: Vec<String>,
         env: HashMap<String, String>,
@@ -261,11 +273,25 @@ impl HostedSubprocess {
         match self.child.wait().await {
             Ok(status) => ProcessExit {
                 code: status.code(),
-                signal: status.signal(),
+                signal: exit_signal(&status),
             },
             Err(_) => ProcessExit::default(),
         }
     }
+}
+
+/// Terminating signal for a finished child — unix only. Windows has no
+/// signal concept, so a signal death can't occur there; `code` carries the
+/// full terminal status. Keeps `wait()` cross-platform without leaking the
+/// unix `ExitStatusExt` into the portable path.
+#[cfg(unix)]
+fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal()
+}
+#[cfg(not(unix))]
+fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
+    None
 }
 
 /// Terminal status of a hosted child (frozen-contract ③). Exactly one of
@@ -340,6 +366,7 @@ fn spawn_child_piped(
 /// `dup(2)` the raw fd so the kernel-side StdioPipeBackend holds an
 /// independently-closable handle. Original tokio handle keeps its own
 /// fd number; both close on Drop without colliding.
+#[cfg(unix)]
 fn dup_raw(raw: i32) -> Result<i32, SubprocessError> {
     // SAFETY: libc::dup is the canonical way to duplicate a file
     // descriptor; the returned fd is independently closable.
@@ -353,6 +380,7 @@ fn dup_raw(raw: i32) -> Result<i32, SubprocessError> {
     Ok(dup)
 }
 
+#[cfg(unix)]
 fn register_stdio_pipe<K: KernelSyscall>(
     kernel: &K,
     path: &str,
@@ -406,7 +434,69 @@ fn unlink_quiet<K: KernelSyscall>(kernel: &K, path: &str) -> Result<(), KernelEr
 // the DT_PIPE entry leaks into the metastore. tokio Command's
 // `kill_on_drop(true)` ensures the child process itself is reaped.
 
+// Portable (all-platform) smoke of the pump path the managed-agent tunnel
+// uses: spawn a child with no VFS pipes, take its stdio handles, read what
+// it prints. Needs no kernel/metastore mount, so it is not `#[ignore]`.
 #[cfg(test)]
+mod portable_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+
+    /// A cross-platform `echo`-style argv that writes a known line to stdout.
+    fn echo_argv(line: &str) -> Vec<String> {
+        if cfg!(windows) {
+            vec!["cmd".into(), "/C".into(), format!("echo {line}")]
+        } else {
+            vec!["sh".into(), "-c".into(), format!("printf '{line}\\n'")]
+        }
+    }
+
+    fn path_env() -> HashMap<String, String> {
+        let mut env = HashMap::new();
+        if let Ok(p) = std::env::var("PATH") {
+            env.insert("PATH".into(), p);
+        }
+        // cmd.exe resolves via these on Windows under env_clear().
+        #[cfg(windows)]
+        {
+            if let Ok(v) = std::env::var("SystemRoot") {
+                env.insert("SystemRoot".into(), v);
+            }
+            if let Ok(v) = std::env::var("ComSpec") {
+                env.insert("ComSpec".into(), v);
+            }
+        }
+        env
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_no_pipes_stdout_roundtrip() {
+        let mut sub = HostedSubprocess::spawn_no_pipes(
+            echo_argv("hello acp"),
+            path_env(),
+            &std::env::temp_dir(),
+        )
+        .await
+        .expect("spawn echo");
+        assert!(sub.os_pid().is_some(), "child should report an os pid");
+        let (_stdin, mut stdout, _stderr) = sub.take_stdio_for_connection().expect("take stdio");
+        let mut buf = vec![0u8; 64];
+        let n = tokio::time::timeout(Duration::from_secs(5), stdout.read(&mut buf))
+            .await
+            .expect("stdout read timed out")
+            .expect("stdout read");
+        let echoed = String::from_utf8_lossy(&buf[..n]);
+        assert!(echoed.contains("hello acp"), "got {echoed:?}");
+        let exit = tokio::time::timeout(Duration::from_secs(5), sub.wait())
+            .await
+            .expect("wait timed out");
+        assert_eq!(exit.code, Some(0), "echo should exit 0");
+        assert_eq!(exit.signal, None, "no signal death on a clean exit");
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use kernel::kernel::Kernel;

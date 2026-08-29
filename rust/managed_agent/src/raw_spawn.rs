@@ -32,8 +32,9 @@
 //! into `ManagedAgentService` at install (Kernel-specific) and called by
 //! the generic `start_session` through `dyn RawSpawn` — mirroring the
 //! `SpawnTask` DI. No syscall-ABI change.
-
-#![cfg(all(unix, feature = "subprocess-host"))]
+//!
+//! Gated at its `mod` declaration in `lib.rs` (`#[cfg(feature =
+//! "subprocess-host")]`), so no file-level `#![cfg]` here.
 
 use std::path::PathBuf;
 use std::sync::Arc;
