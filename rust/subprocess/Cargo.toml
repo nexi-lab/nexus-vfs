@@ -11,8 +11,13 @@ name = "subprocess"
 path = "src/lib.rs"
 
 [dependencies]
-# Unix-only subprocess host: tokio drives the child + async stdio; libc::dup
-# duplicates kernel-side OwnedFds alongside the ones tokio::process::Child owns.
+# tokio drives the child + its async stdio. The portable path (spawn_no_pipes
+# + take_stdio_for_connection) is what the managed-agent tunnel pumps into
+# memory DT_STREAMs; cross-platform.
 kernel = { workspace = true }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "process", "io-util", "time", "sync", "macros"] }
+
+# libc::dup is used ONLY by the unix raw-fd DT_PIPE path (spawn_from_argv →
+# the kernel's #[cfg(unix)] stdio-pipe backend). Not needed on Windows.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"

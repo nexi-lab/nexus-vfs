@@ -55,10 +55,11 @@ use kernel::service_registry::{RustCallError, RustService};
 
 // The raw ACP-subprocess control-plane spawner (spawn + memory-DT_STREAM
 // byte tunnel). Kernel-concrete (drives Kernel-inherent stream ops), so
-// it's injected at install and reached through `dyn RawSpawn`; unix +
-// `subprocess-host` only. Slim / non-unix builds leave `raw_spawn = None`
-// and reject `spawn_spec` at runtime with InvalidArgument.
-#[cfg(all(unix, feature = "subprocess-host"))]
+// it's injected at install and reached through `dyn RawSpawn`. Cross-platform
+// (tokio Command + fd-less memory DT_STREAMs + pumps) — `subprocess-host`
+// only. Slim builds (no feature) leave `raw_spawn = None` and reject
+// `spawn_spec` at runtime with InvalidArgument.
+#[cfg(feature = "subprocess-host")]
 pub(crate) mod raw_spawn;
 
 pub(crate) mod proc_entry;
@@ -706,15 +707,16 @@ impl ManagedAgentService<kernel::kernel::Kernel> {
 
         // Raw ACP subprocess control-plane spawner (memory-DT_STREAM byte
         // tunnel). Kernel-concrete — built here because it drives
-        // Kernel-inherent stream ops off the service surface. Unix +
-        // `subprocess-host` only; `None` elsewhere ⇒ `spawn_spec` rejected.
-        #[cfg(all(unix, feature = "subprocess-host"))]
+        // Kernel-inherent stream ops off the service surface. Cross-platform;
+        // `subprocess-host` only. `None` in a slim build ⇒ `spawn_spec`
+        // rejected.
+        #[cfg(feature = "subprocess-host")]
         let raw_spawn: Option<Arc<dyn RawSpawn>> = Some(Arc::new(raw_spawn::KernelRawSpawn::new(
             Arc::clone(kernel),
             Arc::clone(&agent_registry),
             Arc::clone(&spawn_handles),
         )));
-        #[cfg(not(all(unix, feature = "subprocess-host")))]
+        #[cfg(not(feature = "subprocess-host"))]
         let raw_spawn: Option<Arc<dyn RawSpawn>> = None;
 
         let svc = Arc::new(ManagedAgentService {
@@ -1594,10 +1596,110 @@ mod tests {
         }
     }
 
+    /// Cross-platform proof that `start_session(spawn_spec)` spawns the
+    /// child and tunnels its stdout through `/proc/{pid}/fd/1` — the exact
+    /// path that returned "requires a unix build" before raw_spawn went
+    /// portable. Uses an OS-appropriate one-shot `echo` so it runs on
+    /// Windows too (where the bidirectional `cat` echo test can't).
+    #[cfg(feature = "subprocess-host")]
+    mod raw_spawn_portable {
+        use super::*;
+        use kernel::kernel::Kernel;
+
+        fn echo_spec(line: &str) -> SpawnSpec {
+            let (cmd, args): (&str, Vec<String>) = if cfg!(windows) {
+                ("cmd", vec!["/C".to_string(), format!("echo {line}")])
+            } else {
+                ("sh", vec!["-c".to_string(), format!("printf '{line}\\n'")])
+            };
+            let mut env = std::collections::HashMap::new();
+            if let Ok(p) = std::env::var("PATH") {
+                env.insert("PATH".to_string(), p);
+            }
+            // cmd.exe resolves via these under env_clear() on Windows.
+            #[cfg(windows)]
+            for k in ["SystemRoot", "ComSpec"] {
+                if let Ok(v) = std::env::var(k) {
+                    env.insert(k.to_string(), v);
+                }
+            }
+            SpawnSpec {
+                cmd: cmd.to_string(),
+                args,
+                env,
+                cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+            }
+        }
+
+        // Not #[ignore]: unlike the raw `subprocess` cat tests, start_session
+        // sets up the /proc/{pid} subtree itself (register_proc_entry), so a
+        // bare Kernel::new() suffices — this runs in CI on every platform.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn start_session_spawn_spec_tunnels_stdout() {
+            let kernel = Arc::new(Kernel::new());
+            let svc =
+                ManagedAgentService::install_returning(&kernel, None).expect("install service");
+
+            let start_req = StartSessionRequest {
+                agent_id: "acp-echo".to_string(),
+                spawn_spec: Some(echo_spec("hello tunnel")),
+                ..Default::default()
+            };
+            let svc_for_start = Arc::clone(&svc);
+            let resp = tokio::task::spawn_blocking(move || svc_for_start.start_session(start_req))
+                .await
+                .expect("join start_session")
+                .expect("start_session ok"); // <- this errored "requires a unix build" pre-fix
+            assert!(
+                resp.os_pid.is_some(),
+                "raw spawn must surface the real OS pid (contract ④)",
+            );
+
+            let pid = resp.session_id.clone();
+            let fd1 = format!("/proc/{pid}/fd/1");
+            let read_kernel = Arc::clone(&kernel);
+            let echoed = tokio::task::spawn_blocking(move || {
+                let mut acc = Vec::new();
+                let mut offset = 0usize;
+                for _ in 0..100 {
+                    if let Ok((data, next)) = read_kernel.stream_read_at_blocking(&fd1, offset, 100)
+                    {
+                        acc.extend_from_slice(&data);
+                        offset = next;
+                        if acc
+                            .windows(b"hello tunnel".len())
+                            .any(|w| w == b"hello tunnel")
+                        {
+                            break;
+                        }
+                    }
+                }
+                acc
+            })
+            .await
+            .expect("join tunnel read");
+
+            let text = String::from_utf8_lossy(&echoed);
+            assert!(
+                text.contains("hello tunnel"),
+                "stdout must tunnel through /proc/{{pid}}/fd/1; got {text:?}",
+            );
+
+            let svc_for_cancel = Arc::clone(&svc);
+            let pid_for_cancel = pid.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                svc_for_cancel.cancel(&pid_for_cancel, CancelMode::Session)
+            })
+            .await;
+        }
+    }
+
     /// Raw ACP-subprocess control-plane path (#36 slice 1, frozen
     /// contract 2026-08-01). Proves the raw-byte tunnel end-to-end and
-    /// the ③ exit / reap semantics. Unix + subprocess-host only, because
-    /// `HostedSubprocess` is unix-only.
+    /// the ③ exit / reap semantics. Gated unix here only because the test
+    /// drives the POSIX `cat` echo-back; the code under test is
+    /// cross-platform (`subprocess-host`). Windows coverage comes from the
+    /// live daemon start_session test.
     #[cfg(all(unix, feature = "subprocess-host"))]
     mod raw_spawn {
         use super::*;
