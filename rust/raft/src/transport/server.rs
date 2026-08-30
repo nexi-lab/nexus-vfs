@@ -507,8 +507,6 @@ async fn parse_and_step_message<S: crate::raft::StateMachine + Send + Sync + 'st
     }))
 }
 
-/// Check that a sender node is a known member of a zone.
-///
 // =============================================================================
 // ZoneTransportService (internal node-to-node transport)
 // =============================================================================
