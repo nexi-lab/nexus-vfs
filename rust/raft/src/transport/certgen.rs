@@ -346,6 +346,7 @@ pub fn bootstrap_tls(
     zone_id: &str,
     hostname: &str,
     node_id: u64,
+    advertise_addr: Option<&str>,
 ) -> Result<BootstrapTls, String> {
     let tls_dir = base_path.join("tls");
     let ca_path = tls_dir.join("ca.pem");
@@ -395,8 +396,22 @@ pub fn bootstrap_tls(
         (ca_pem, ca_key_pem)
     };
 
-    let (node_cert_pem, node_key_pem) =
-        generate_node_cert(node_id, zone_id, &ca_pem, &ca_key_pem, &[], Some(hostname))?;
+    // A founder self-signs its node cert here, so it must add its OWN reachable
+    // address (`--advertise-addr`) to the SAN — otherwise a cross-machine peer
+    // dialing that overlay IP (e.g. `100.64.0.27:2126`) cannot validate the
+    // founder's server cert and the mTLS handshake fails (auth-on federation
+    // over Tailscale/VPN). Mirrors the joiner path, where `join_cluster` already
+    // folds `extract_hostnames(node_address)` into the signed cert. Base SANs
+    // still cover loopback; `extract_hostnames` drops non-routable placeholders.
+    let advertise_sans = advertise_addr.map(extract_hostnames).unwrap_or_default();
+    let (node_cert_pem, node_key_pem) = generate_node_cert(
+        node_id,
+        zone_id,
+        &ca_pem,
+        &ca_key_pem,
+        &advertise_sans,
+        Some(hostname),
+    )?;
     write_pem(&node_cert_path, &node_cert_pem, false)?;
     write_pem(&node_key_path, &node_key_pem, true)?;
 
@@ -420,6 +435,64 @@ pub fn bootstrap_tls(
         node_key_path,
         join_token_hash,
     })
+}
+
+/// Extract the reachable hostname/IP from a node address, for cert SAN
+/// inclusion (CockroachDB pattern: a node's cert SANs list every address peers
+/// dial it at). Parses `http://nexus-1:2126` / `0.0.0.0:2126` / `100.64.0.27:2126`
+/// → the host portion. Drops non-routable placeholders (empty / `0.0.0.0` /
+/// `localhost` / `127.0.0.1`) since the base SAN already covers loopback.
+pub(crate) fn extract_hostnames(node_address: &str) -> Vec<String> {
+    let addr = node_address
+        .trim_start_matches("http://")
+        .trim_start_matches("https://");
+    let host = if let Some((h, _)) = addr.rsplit_once(':') {
+        h
+    } else {
+        addr
+    };
+    if host.is_empty() || host == "0.0.0.0" || host == "localhost" || host == "127.0.0.1" {
+        return vec![];
+    }
+    vec![host.to_string()]
+}
+
+/// Path to a founder's accepted join-token hash set (`<data-dir>/tls/join-token-hash`).
+/// Sibling of [`crl::revoked_serials_path`]. The file is the SSOT for "which join
+/// tokens this founder accepts"; the enrollment service reads it LIVE per join.
+pub fn join_token_hash_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("tls").join("join-token-hash")
+}
+
+/// Read the accepted join-token hash SET (one SHA-256 hex per line) from disk.
+///
+/// Mirrors [`crl::read_revoked_serials`]: the enrollment service reads this LIVE
+/// per `JoinCluster` (not a boot-time snapshot), so an offline `enroll-token`
+/// that appended a hash is accepted WITHOUT a founder restart. Tolerates the
+/// legacy single-hash (no trailing newline) layout. Missing/unreadable ⇒ empty.
+pub fn read_join_token_hashes(path: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Append a join-token hash to the accepted set (dedup), creating the file if
+/// absent. Appending — not overwriting — keeps the boot token and any prior
+/// mints valid, so a new token ADDS to the set (safe rotation); the founder
+/// reads the set live, so it takes effect without a restart.
+pub fn append_join_token_hash(path: &Path, hash: &str) -> std::io::Result<()> {
+    let mut hashes = read_join_token_hashes(path);
+    if !hashes.iter().any(|h| h == hash) {
+        hashes.push(hash.to_string());
+    }
+    let mut body = hashes.join("\n");
+    body.push('\n');
+    std::fs::write(path, body)
 }
 
 fn write_pem(path: &Path, pem: &[u8], private: bool) -> Result<(), String> {
@@ -688,7 +761,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path();
 
-        let first = bootstrap_tls(base, "root", "host-1", 42).unwrap();
+        // Founder advertises an overlay IP — it MUST land in the self-signed
+        // cert's SAN so cross-machine peers dialing it can validate mTLS.
+        let first = bootstrap_tls(base, "root", "host-1", 42, Some("100.64.0.27:2126")).unwrap();
         for p in [
             &first.ca_path,
             &first.ca_key_path,
@@ -698,14 +773,64 @@ mod tests {
             assert!(p.exists(), "{} missing after first bootstrap", p.display());
         }
         assert_eq!(first.join_token_hash.len(), 64);
+        // The advertise IP is in the node cert SAN (the auth-on cross-machine
+        // federation fix): absent it, a raft peer dialing `100.64.0.27:2126`
+        // (connect_zone_api sets no domain_name, so it validates the dialed
+        // host) cannot validate the founder's server cert.
+        {
+            use x509_parser::prelude::*;
+            let cert_pem = std::fs::read(&first.node_cert_path).unwrap();
+            let pem = ::pem::parse(&cert_pem).unwrap();
+            let (_, cert) = X509Certificate::from_der(pem.contents()).unwrap();
+            let has_advertise_ip = cert
+                .subject_alternative_name()
+                .unwrap()
+                .unwrap()
+                .value
+                .general_names
+                .iter()
+                .any(|gn| matches!(gn, GeneralName::IPAddress(ip) if *ip == [100u8, 64, 0, 27]));
+            assert!(
+                has_advertise_ip,
+                "advertise IP 100.64.0.27 must be in the node cert SAN"
+            );
+        }
 
         // Reuse path: hashes/paths must be identical and file mtime stable.
-        let second = bootstrap_tls(base, "root", "host-1", 42).unwrap();
+        let second = bootstrap_tls(base, "root", "host-1", 42, Some("100.64.0.27:2126")).unwrap();
         assert_eq!(first.ca_path, second.ca_path);
         assert_eq!(first.join_token_hash, second.join_token_hash);
         // CA cert bytes unchanged (proves we did not regenerate)
         let ca_first = std::fs::read(&first.ca_path).unwrap();
         let ca_second = std::fs::read(&second.ca_path).unwrap();
         assert_eq!(ca_first, ca_second);
+    }
+
+    #[test]
+    fn join_token_hash_set_appends_dedups_and_tolerates_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("join-token-hash");
+
+        // Empty/missing ⇒ empty set (never panics).
+        assert!(read_join_token_hashes(&path).is_empty());
+
+        // Legacy single-hash layout (no trailing newline) reads as one entry —
+        // a founder booted before this change keeps its boot token valid.
+        std::fs::write(&path, "a".repeat(64)).unwrap();
+        assert_eq!(read_join_token_hashes(&path), vec!["a".repeat(64)]);
+
+        // enroll-token APPENDS: the boot token stays, the new one joins the set.
+        append_join_token_hash(&path, &"b".repeat(64)).unwrap();
+        assert_eq!(
+            read_join_token_hashes(&path),
+            vec!["a".repeat(64), "b".repeat(64)]
+        );
+
+        // Re-minting the same hash is idempotent (dedup) — no duplicate lines.
+        append_join_token_hash(&path, &"b".repeat(64)).unwrap();
+        assert_eq!(
+            read_join_token_hashes(&path),
+            vec!["a".repeat(64), "b".repeat(64)]
+        );
     }
 }

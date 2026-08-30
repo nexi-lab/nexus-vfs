@@ -43,8 +43,9 @@
 pub(crate) mod certgen;
 #[cfg(all(feature = "grpc", has_protos))]
 pub use certgen::{
-    bootstrap_tls, generate_agent_cert, generate_join_token, generate_node_cert, generate_zone_ca,
-    node_identity_uri, parse_node_identity_uri, BootstrapTls,
+    append_join_token_hash, bootstrap_tls, generate_agent_cert, generate_join_token,
+    generate_node_cert, generate_zone_ca, join_token_hash_path, node_identity_uri,
+    parse_node_identity_uri, read_join_token_hashes, BootstrapTls,
 };
 #[cfg(all(feature = "grpc", has_protos))]
 pub(crate) mod crl;
