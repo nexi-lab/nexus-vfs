@@ -509,29 +509,6 @@ async fn parse_and_step_message<S: crate::raft::StateMachine + Send + Sync + 'st
 
 /// Check that a sender node is a known member of a zone.
 ///
-/// Extract hostnames from a node_address for cert SAN inclusion.
-///
-/// Parses addresses like "http://nexus-1:2126" or "0.0.0.0:2126" and returns
-/// the hostname/IP portion. Multiple formats are handled gracefully.
-fn extract_hostnames(node_address: &str) -> Vec<String> {
-    let addr = node_address
-        .trim_start_matches("http://")
-        .trim_start_matches("https://");
-
-    // Split off port
-    let host = if let Some((h, _)) = addr.rsplit_once(':') {
-        h
-    } else {
-        addr
-    };
-
-    if host.is_empty() || host == "0.0.0.0" || host == "localhost" || host == "127.0.0.1" {
-        return vec![];
-    }
-
-    vec![host.to_string()]
-}
-
 // =============================================================================
 // ZoneTransportService (internal node-to-node transport)
 // =============================================================================
@@ -1834,8 +1811,12 @@ struct NodeEnrollmentServiceImpl {
     ca_pem: Option<Vec<u8>>,
     /// CA private key — held in memory to sign joiner certs; never leaves here.
     ca_key_pem: Option<Vec<u8>>,
-    /// SHA-256 of the join token password — the enrollment credential.
-    join_token_hash: Option<String>,
+    /// Path to the accepted join-token hash SET (`tls/join-token-hash`, one
+    /// SHA-256 hex per line). Read LIVE per `JoinCluster` (like
+    /// `revoked_serials_path` below is for `GetCrl`), so an offline
+    /// `enroll-token` that appended a hash is accepted WITHOUT a founder
+    /// restart. `None` ⇒ this node accepts no join requests.
+    join_token_hash_path: Option<PathBuf>,
     /// Cluster API-key HMAC secret, served verbatim to the joiner over this
     /// same token-gated channel as the CA. Opaque here — the transport applies
     /// no auth logic to it (it already holds the far-more-sensitive CA private
@@ -1879,14 +1860,24 @@ impl NodeEnrollmentService for NodeEnrollmentServiceImpl {
         );
 
         // --- Token-based authentication (K3s-style) ---
-        let stored_hash = match &self.join_token_hash {
-            Some(h) => h,
+        // Read the accepted-hash SET LIVE from disk (mirrors `get_crl` reading
+        // `revoked_serials_path`), so an offline `enroll-token` that appended a
+        // hash is accepted WITHOUT a founder restart. The file is the SSOT —
+        // one SHA-256 hex per line; the boot token is line 1 (day-1 TLS
+        // bootstrap). A live-read miss ⇒ no accepted tokens ⇒ reject.
+        let accepted = match &self.join_token_hash_path {
+            Some(p) => super::certgen::read_join_token_hashes(p),
             None => {
                 return Ok(err_resp(
                     "This node does not accept join requests (no join token configured)",
                 ));
             }
         };
+        if accepted.is_empty() {
+            return Ok(err_resp(
+                "This node does not accept join requests (no join token configured)",
+            ));
+        }
         let candidate_hash = {
             use sha2::{Digest, Sha256};
             use std::fmt::Write;
@@ -1897,7 +1888,7 @@ impl NodeEnrollmentService for NodeEnrollmentServiceImpl {
             }
             hex
         };
-        if candidate_hash != *stored_hash {
+        if !accepted.iter().any(|h| h == &candidate_hash) {
             tracing::warn!(peer_node_id = req.node_id, "JoinCluster: invalid password");
             return Ok(err_resp("Invalid join token password"));
         }
@@ -1916,7 +1907,7 @@ impl NodeEnrollmentService for NodeEnrollmentServiceImpl {
         } else {
             &req.zone_id
         };
-        let extra_hostnames = extract_hostnames(&req.node_address);
+        let extra_hostnames = super::certgen::extract_hostnames(&req.node_address);
         let peer_hostname = extra_hostnames.first().map(|s| s.as_str());
         let (node_cert_pem, node_key_pem) = match super::certgen::generate_node_cert(
             req.node_id,
@@ -1984,7 +1975,7 @@ pub async fn serve_node_enrollment(
     addr: SocketAddr,
     ca_pem: Vec<u8>,
     ca_key_pem: Vec<u8>,
-    join_token_hash: String,
+    join_token_hash_path: PathBuf,
     api_key_secret: Option<String>,
     revoked_serials_path: Option<PathBuf>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
@@ -1992,7 +1983,7 @@ pub async fn serve_node_enrollment(
     let svc = NodeEnrollmentServiceImpl {
         ca_pem: Some(ca_pem),
         ca_key_pem: Some(ca_key_pem),
-        join_token_hash: Some(join_token_hash),
+        join_token_hash_path: Some(join_token_hash_path),
         api_key_secret,
         revoked_serials_path,
     };

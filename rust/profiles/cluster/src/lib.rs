@@ -983,9 +983,11 @@ where
 ///
 /// The day-1 TLS bootstrap already mints one and `--accept-enrollments` prints
 /// it at boot, so this is only for rotating / adding a token. Bootstraps this
-/// data dir's cluster CA if absent, mints a fresh token, records its hash where
-/// `--accept-enrollments` reads it, and prints the token to stdout (everything
-/// else goes to stderr).
+/// data dir's cluster CA if absent, mints a fresh token, APPENDS its hash to the
+/// accepted set (`tls/join-token-hash`) — the boot token and prior mints stay
+/// valid — and prints the token to stdout (everything else goes to stderr). A
+/// running founder reads that set LIVE per enrollment, so a token minted here
+/// is accepted WITHOUT a restart.
 fn run_enroll_token(common: &CommonArgs) -> Result<()> {
     let tls_dir = common.data_dir.join("tls");
     std::fs::create_dir_all(&tls_dir)
@@ -1004,13 +1006,18 @@ fn run_enroll_token(common: &CommonArgs) -> Result<()> {
     let ca_pem = std::fs::read(&ca_path).with_context(|| format!("read {}", ca_path.display()))?;
     let (token, hash) = nexus_raft::transport::generate_join_token(&ca_pem)
         .map_err(|e| anyhow::anyhow!("mint join token: {e}"))?;
-    std::fs::write(tls_dir.join("join-token-hash"), &hash)
-        .with_context(|| "write join-token-hash")?;
+    // APPEND (not overwrite) so the new token JOINS the accepted set — the boot
+    // token and any prior mints stay valid (safe rotation). A running founder
+    // reads this file live per enrollment, so the token works WITHOUT a restart.
+    nexus_raft::transport::append_join_token_hash(&tls_dir.join("join-token-hash"), &hash)
+        .with_context(|| "append join-token-hash")?;
     // Token is DATA → stdout; guidance → stderr, so a caller can capture just
     // the token.
     println!("{token}");
     eprintln!(
-        "join token minted (pinned to this cluster's CA). On the new node run one command:\n  \
+        "join token minted (pinned to this cluster's CA; appended to the accepted \
+         set — a running founder honors it live, no restart). On the new node run \
+         one command:\n  \
          nexusd-cluster --advertise-addr <THAT_NODE_OVERLAY:PORT> \
          --peers <FOUNDER_OVERLAY:PORT> --token <token>"
     );
@@ -1187,6 +1194,10 @@ fn open_zone_manager(
             contracts::ROOT_ZONE_ID,
             &hostname,
             node_id,
+            // Fold `--advertise-addr` into the self-signed cert's SAN so
+            // cross-machine peers dialing this node's overlay IP can validate
+            // its server cert (auth-on federation over Tailscale/VPN).
+            common.advertise_addr.as_deref(),
         )
         .map_err(|e| anyhow::anyhow!("TLS bootstrap failed: {}", e))?;
         Some(TlsFiles {
@@ -1654,7 +1665,12 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
                 format!("accept-enrollments: read {}/ca-key.pem", tls_dir.display())
             })?;
             let hash_path = tls_dir.join("join-token-hash");
-            let join_token_hash = std::fs::read_to_string(&hash_path).with_context(|| {
+            // Boot gate: a founder must have a token file to accept enrollments.
+            // The service reads it LIVE per join (so an offline `enroll-token`
+            // append lands without a restart — see `serve_node_enrollment`), but
+            // verify up-front it exists + is readable so a misconfigured founder
+            // fails loud at boot, not silently at the first join attempt.
+            std::fs::read_to_string(&hash_path).with_context(|| {
                 format!(
                     "accept-enrollments: read {} — the TLS bootstrap mints one on first boot; \
                      run `nexusd-cluster enroll-token` to (re)mint",
@@ -1680,7 +1696,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
                     addr,
                     ca_pem,
                     ca_key_pem,
-                    join_token_hash.trim().to_string(),
+                    hash_path,
                     api_key_secret,
                     Some(revoked_path),
                     std::future::pending::<()>(),
