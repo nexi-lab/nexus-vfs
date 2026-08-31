@@ -845,6 +845,37 @@ pub struct ServiceBootCtx {
     /// creates a fresh runtime here would fragment `tokio::spawn`
     /// scoping and break the daemon's graceful-shutdown contract.
     pub runtime: tokio::runtime::Handle,
+
+    /// The **credential-store `ZoneConsensus`** — same `ZoneConsensus`
+    /// the `RaftAuthKeyStore` above is bound to (control zone under
+    /// auth-on, `root` under `--no-tls`).  Exposed so downstream
+    /// service crates can wire their OWN typed `ControlStateStore`
+    /// views over the same consensus without re-plumbing zone lookup.
+    ///
+    /// Precedent: `RaftAuthKeyStore` (`CONTROL_NS_AUTH`) + the
+    /// foreign-CA anchor store (`CONTROL_NS_FOREIGN_CA`) already share
+    /// this consensus.  A new caller — the downstream `nexus-rebac`
+    /// crate's `RaftReBACTupleStore` (`CONTROL_NS_REBAC`) — needs the
+    /// same handle at composition-root time, and the assembly binary
+    /// lives outside this crate (so it cannot reach `zm` directly).
+    ///
+    /// Cloneable — `ZoneConsensus` is Arc-inside; downstream construct
+    /// their store via `Store::new(consensus.clone(),
+    /// credential_zone_runtime.clone())`.
+    pub credential_consensus:
+        nexus_raft::prelude::ZoneConsensus<nexus_raft::prelude::FullStateMachine>,
+
+    /// The runtime handle bound to [`Self::credential_consensus`].
+    /// Distinct from [`Self::runtime`] (the daemon runtime) because
+    /// the zone consensus was constructed with its own runtime handle
+    /// via `Zone::runtime_handle()` — a downstream store must bridge
+    /// its async `propose` on THAT handle for read-your-writes to
+    /// observe the committed value on the same runtime workers.
+    /// (In practice both handles refer to the same runtime since
+    /// `ZoneManager` receives `Handle::current()` at boot — but the
+    /// pairing is explicit here so a future runtime-per-zone change
+    /// stays sound at this seam.)
+    pub credential_zone_runtime: tokio::runtime::Handle,
 }
 
 /// Boxed service-decl builder — threaded from [`run_with_services`] into
@@ -2426,6 +2457,30 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     // fail-closed posture is tied to auth (see the ServiceBootCtx doc): it
     // stamps `from` only-enforcing under auth, behaviour-preserving under
     // NoAuth (empty agent_id ⇒ fail-open ⇒ no rewrite).
+    // Re-resolve the credential zone at ctx-build time — the block
+    // that wires `RaftAuthKeyStore` above binds `cred_zone` locally
+    // (Rust scoping), and `zm.get_zone(...)` is a cheap Arc::clone
+    // over the already-loaded zone.  Same `auth_zone` selection rule
+    // as the auth-store block: `CONTROL_ZONE_ID` under auth-on,
+    // `ROOT_ZONE_ID` under `--no-tls` (root is kernel-owned + always
+    // up, so both branches yield a valid zone; the `.expect` is a
+    // pinned-invariant, not a runtime error).
+    let (credential_consensus, credential_zone_runtime) = {
+        let auth_zone = if common.no_tls {
+            contracts::ROOT_ZONE_ID
+        } else {
+            contracts::CONTROL_ZONE_ID
+        };
+        let cred_zone = zm.get_zone(auth_zone).ok_or_else(|| {
+            anyhow::anyhow!(
+                "credential zone '{auth_zone}' vanished between auth-store bind and \
+                 ServiceBootCtx construction — invariant violation (ZoneManager holds \
+                 zones for the daemon's lifetime)"
+            )
+        })?;
+        (cred_zone.consensus_node(), cred_zone.runtime_handle())
+    };
+
     let svc_ctx = ServiceBootCtx {
         auth_armed: api_key_auth.is_some(),
         // `vfs_auth` is the trait-object the kernel gRPC interceptor
@@ -2437,6 +2492,12 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         // the tokio runtime that `run_with_services` spun up (single
         // runtime invariant).
         runtime: tokio::runtime::Handle::current(),
+        // Exposed so downstream service crates (nexus-rebac at the
+        // nexus assembly binary) can bind their own typed
+        // `ControlStateStore` view on the same consensus that
+        // already backs `RaftAuthKeyStore` — one namespace over.
+        credential_consensus,
+        credential_zone_runtime,
     };
     kernel
         .bring_up_services(build_decls(&svc_ctx))
