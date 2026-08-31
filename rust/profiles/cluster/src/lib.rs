@@ -3582,6 +3582,22 @@ fn validate_self_address(
              --advertise-addr to this machine's overlay/network IP (e.g. its \
              Tailscale 100.x address) with an explicit :port.",
         )),
+        SelfAddrVerdict::RefuseHostnameUnlessAsserted(why) if hostname_advertise_asserted() => {
+            tracing::warn!(
+                target: "nexusd_cluster",
+                self_address = %self_address,
+                "{why} — allowed by NEXUS_ALLOW_HOSTNAME_ADVERTISE=1; it MUST resolve \
+                 for EVERY peer (e.g. Docker/k8s service DNS), else the zone silently \
+                 wedges at an unreachable address"
+            );
+            Ok(())
+        }
+        SelfAddrVerdict::RefuseHostnameUnlessAsserted(why) => Err(anyhow::anyhow!(
+            "refusing to boot: advertise self_address `{self_address}` {why} Set \
+             --advertise-addr to this machine's overlay/network IP (e.g. its \
+             Tailscale 100.x address) with an explicit :port — or, if it DOES resolve \
+             for every peer (Docker/k8s private DNS), set NEXUS_ALLOW_HOSTNAME_ADVERTISE=1.",
+        )),
     }
 }
 
@@ -3593,8 +3609,27 @@ enum SelfAddrVerdict {
     /// Probably-wrong but not provably unreachable (e.g. a dotted FQDN that may
     /// resolve on the operator's network).
     Warn(&'static str),
-    /// Provably undialable by a remote peer — fail loud.
+    /// Provably undialable by a remote peer — fail loud. Wrong in EVERY
+    /// environment (wildcard / loopback-to-remote / no `:port`); can never be
+    /// asserted away.
     Refuse(&'static str),
+    /// A bare (non-dotted) hostname: refused by default because it does not
+    /// resolve across an overlay (Tailscale/VPN) — the common misconfig. But it
+    /// DOES resolve in some environments (Docker/k8s service DNS, private LAN),
+    /// so the operator can assert "this resolves for every peer" via
+    /// `NEXUS_ALLOW_HOSTNAME_ADVERTISE=1`, downgrading it to a warning.
+    RefuseHostnameUnlessAsserted(&'static str),
+}
+
+/// Whether the operator asserted (via `NEXUS_ALLOW_HOSTNAME_ADVERTISE=1`) that a
+/// bare-hostname advertise DOES resolve for every peer — the sanctioned escape
+/// for Docker/k8s/private-DNS clusters. Read here at the boot-policy boundary so
+/// [`classify_self_address`] stays pure + unit-testable.
+fn hostname_advertise_asserted() -> bool {
+    matches!(
+        std::env::var("NEXUS_ALLOW_HOSTNAME_ADVERTISE").as_deref(),
+        Ok("1") | Ok("true")
+    )
 }
 
 fn classify_self_address(
@@ -3636,9 +3671,11 @@ fn classify_self_address(
             .split('.')
             .all(|seg| !seg.is_empty() && seg.bytes().all(|b| b.is_ascii_digit()));
     let dotted_or_ip = host.contains('.') || host.contains(':') || looks_like_ipv4;
-    // Bare (non-dotted) OS hostname — does not resolve across an overlay.
+    // Bare (non-dotted) OS hostname — does not resolve across an overlay by
+    // default, but MAY resolve via Docker/k8s/private DNS, so it is refused
+    // unless the operator asserts it (see `hostname_advertise_asserted`).
     if !dotted_or_ip && has_remote_peer {
-        return SelfAddrVerdict::Refuse(
+        return SelfAddrVerdict::RefuseHostnameUnlessAsserted(
             "is a bare hostname that does not resolve across an overlay (Tailscale/VPN).",
         );
     }
@@ -3734,16 +3771,38 @@ mod self_address_tests {
     }
 
     #[test]
-    fn bare_hostname_refuses_only_with_a_remote_peer() {
+    fn bare_hostname_is_refusable_but_assertable_with_a_remote_peer() {
+        // A bare hostname is refused by default (won't resolve over an overlay),
+        // but is the assertable variant — the operator can opt in for Docker/k8s.
         assert!(matches!(
             classify_self_address("DESKTOP-K2PHFNR:2126", true, 1),
-            SelfAddrVerdict::Refuse(_)
+            SelfAddrVerdict::RefuseHostnameUnlessAsserted(_)
         ));
         // Same-machine: the OS hostname resolves locally, allow.
         assert_eq!(
             classify_self_address("DESKTOP-K2PHFNR:2126", false, 1),
             SelfAddrVerdict::Ok
         );
+    }
+
+    #[test]
+    fn bare_hostname_opt_out_allows_boot_only_when_asserted() {
+        use super::{hostname_advertise_asserted, validate_self_address};
+        // Self-contained env toggle (no other test touches this var).
+        std::env::remove_var("NEXUS_ALLOW_HOSTNAME_ADVERTISE");
+        assert!(!hostname_advertise_asserted());
+        // Default: a bare hostname with a remote peer refuses boot (fail-loud kept).
+        assert!(validate_self_address("founder:2126", true, 1).is_err());
+
+        std::env::set_var("NEXUS_ALLOW_HOSTNAME_ADVERTISE", "1");
+        assert!(hostname_advertise_asserted());
+        // Asserted: same address now boots (Docker/k8s DNS resolves it).
+        assert!(validate_self_address("founder:2126", true, 1).is_ok());
+        // But the opt-out NEVER rescues a genuinely-undialable address.
+        assert!(validate_self_address("0.0.0.0:2126", true, 1).is_err());
+        assert!(validate_self_address("127.0.0.1:2126", true, 1).is_err());
+
+        std::env::remove_var("NEXUS_ALLOW_HOSTNAME_ADVERTISE");
     }
 
     #[test]
