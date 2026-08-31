@@ -3551,6 +3551,53 @@ mod tests {
         );
     }
 
+    /// `sys_write` to a DT_STREAM must WAKE a reader parked on the tail — the
+    /// SSOT append (`StreamManager::write_nowait`) fires the wake, so the
+    /// co-host's send path (`sys_write`) no longer silently skips it. Guards the
+    /// fix that this path used to inline a bare `push` without the wake, so a
+    /// blocking `read_at_blocking` missed a same-node write until its timeout.
+    #[test]
+    fn sys_write_wakes_a_parked_stream_reader() {
+        use std::time::{Duration, Instant};
+        let k = Arc::new(Kernel::new());
+        // `sys_write` needs a VFS route — mount the parent so it is not a no-op.
+        k.add_mount("/s", "root", None, None, None, false)
+            .expect("mount /s");
+        let path = "/s/wake-probe";
+        k.create_stream(path, 64 * 1024).unwrap();
+
+        // Park a blocking tail read at offset 0 (empty stream → parks on the
+        // per-path condvar).
+        let reader = {
+            let k = Arc::clone(&k);
+            std::thread::spawn(move || {
+                let t = Instant::now();
+                let r = k.stream_read_at_blocking(path, 0, 5_000);
+                (r, t.elapsed())
+            })
+        };
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Fully-qualified single-arg syscall (the concrete `Kernel`'s inherent
+        // `sys_write` is the batch variant): the same path the gRPC handler +
+        // co-host use.
+        let ctx = OperationContext::new("test", "root", true, None, true);
+        crate::kernel::syscall::KernelSyscall::sys_write(k.as_ref(), path, &ctx, b"wake", 0)
+            .unwrap();
+
+        let (r, woke) = reader.join().unwrap();
+        let (data, _next) = r.expect("blocking read must wake on the sys_write, not time out");
+        assert_eq!(data, b"wake", "the woken read returns the written frame");
+        assert!(
+            woke < Duration::from_millis(4_000),
+            "woke on the write, not the 5s timeout ({woke:?})"
+        );
+        assert!(
+            woke >= Duration::from_millis(150),
+            "woke before the write was issued ({woke:?})"
+        );
+    }
+
     /// `sys_setattr DT_MOUNT` dispatches a `FileEventType::Mount`
     /// event through `MutationObserver`. Wired for services-tier
     /// consumers (e.g. `services::audit::ZoneAuditAutoWire`) to

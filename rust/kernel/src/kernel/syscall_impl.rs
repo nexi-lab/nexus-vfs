@@ -790,45 +790,49 @@ impl Kernel {
                 return miss();
             }
             if entry.entry_type == DT_STREAM {
-                if let Some(buf) = self.stream_manager.get(path) {
-                    match buf.push(effective_content) {
-                        Ok(offset) => {
-                            // POST hooks fire on the IPC short-circuit
-                            // path the same as for DT_REG. Hook
-                            // self-exclusion (e.g. AuditHook on
-                            // /__sys__/) prevents recursion when an
-                            // observer's own sys_write would re-enter.
-                            self.dispatch_native_post(&HookContext::Write(WriteHookCtx {
-                                path: path.to_string(),
-                                identity: HookIdentity::from(ctx),
-                                content: effective_content.to_vec(),
-                                is_new_file: false,
-                                content_id: None,
-                                new_version: 0,
-                                size_bytes: Some(offset as u64),
-                            }));
-                            return Ok(SysWriteResult {
-                                hit: true,
-                                content_id: None,
-                                post_hook_needed: self.write_hook_count.load(Ordering::Relaxed) > 0,
-                                version: 0,
-                                gen: 0,
-                                size: offset as u64,
-                                is_new: false,
-                                old_content_id: None,
-                                old_size: None,
-                                old_version: None,
-                                old_modified_at_ms: None,
-                            });
-                        }
-                        Err(crate::stream::StreamError::Full(_, _)) => return miss(),
-                        Err(crate::stream::StreamError::Closed(msg)) => {
-                            return Err(KernelError::StreamClosed(msg.to_string()));
-                        }
-                        Err(_) => {}
+                // Append through `StreamManager::write_nowait` — the SSOT for
+                // "push a frame AND wake parked tail readers". A bare `buf.push`
+                // here (as this path used to do) silently skipped the wake, so a
+                // blocking `read_at_blocking` / `sys_read(timeout>0)` on the same
+                // node missed a local write until its timeout — the mailbox
+                // append RPC (`stream_write_nowait`) already went through here.
+                match self.stream_manager.write_nowait(path, effective_content) {
+                    Ok(offset) => {
+                        // POST hooks fire on the IPC short-circuit
+                        // path the same as for DT_REG. Hook
+                        // self-exclusion (e.g. AuditHook on
+                        // /__sys__/) prevents recursion when an
+                        // observer's own sys_write would re-enter.
+                        self.dispatch_native_post(&HookContext::Write(WriteHookCtx {
+                            path: path.to_string(),
+                            identity: HookIdentity::from(ctx),
+                            content: effective_content.to_vec(),
+                            is_new_file: false,
+                            content_id: None,
+                            new_version: 0,
+                            size_bytes: Some(offset as u64),
+                        }));
+                        return Ok(SysWriteResult {
+                            hit: true,
+                            content_id: None,
+                            post_hook_needed: self.write_hook_count.load(Ordering::Relaxed) > 0,
+                            version: 0,
+                            gen: 0,
+                            size: offset as u64,
+                            is_new: false,
+                            old_content_id: None,
+                            old_size: None,
+                            old_version: None,
+                            old_modified_at_ms: None,
+                        });
                     }
+                    Err(crate::stream_manager::StreamManagerError::Backend(
+                        crate::stream::StreamError::Closed(msg),
+                    )) => return Err(KernelError::StreamClosed(msg.to_string())),
+                    // Full / NotFound / any other → a miss (retry / no-op),
+                    // preserving the prior fall-through behaviour.
+                    Err(_) => return miss(),
                 }
-                return miss();
             }
         }
 

@@ -1203,9 +1203,22 @@ impl NexusVfsService for VfsServiceImpl {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_stream_write(s))),
         };
-        match self.kernel.stream_write_nowait(&req.path, &req.data, &ctx) {
-            Ok(offset) => Ok(Response::new(StreamWriteResponse {
-                offset: offset as u64,
+        // Go through the `sys_write` SYSCALL — a service must not reach past it
+        // into a lower-level kernel method (`stream_write_nowait`). `sys_write`
+        // runs the SAME §13 write gate + from-stamp hooks and, on the DT_STREAM
+        // branch, appends via `StreamManager::write_nowait` (push + wake tail
+        // readers); `size` is the offset the frame landed at. Offload like the
+        // Write RPC — `sys_write` may block on a lock. (Mailbox paths are
+        // mounted, so the route resolves; an append to an unmounted stream is a
+        // no-op miss — no production mailbox is unmounted.)
+        let kernel = self.kernel.clone();
+        let path = req.path;
+        let data = req.data;
+        let write_res =
+            run_blocking(move || KernelSyscall::sys_write(&*kernel, &path, &ctx, &data, 0)).await?;
+        match write_res {
+            Ok(result) => Ok(Response::new(StreamWriteResponse {
+                offset: result.size,
                 is_error: false,
                 error_payload: Vec::new(),
             })),
