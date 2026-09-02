@@ -185,6 +185,9 @@ pub(crate) struct GetSessionResponse {
     pub workspace_path: String,
     pub model: String,
     pub state: String,
+    /// Agent-reported reason the session is in `awaiting_input` (opaque,
+    /// e.g. "permission"); `None` in every other state.
+    pub reason: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -273,19 +276,20 @@ pub trait SpawnTask<K: KernelSyscall>: Send + Sync + 'static {
     /// `ManagedAgentService::start_session` — it captures the
     /// service's `Arc<AgentRegistry>` and the session's pid and
     /// forwards each reported [`AgentState`] through
-    /// `AgentRegistry::update_state`. The spawn body reports only the
+    /// `AgentRegistry::update_state`. The spawn body reports the
     /// running-state subset ([`AgentState::WarmingUp`] /
-    /// [`AgentState::Ready`] / [`AgentState::Busy`]); the lifecycle
-    /// bookends ([`AgentState::Registered`] at plant,
-    /// [`AgentState::Suspended`] / [`AgentState::Terminated`] at
-    /// teardown) are service-set. The spawn body's only role w.r.t.
+    /// [`AgentState::Ready`] / [`AgentState::Busy`] /
+    /// [`AgentState::AwaitingInput`] — the runtime is first-hand aware
+    /// it has blocked on a requested reply); the lifecycle bookends
+    /// ([`AgentState::Registered`] at plant, [`AgentState::Terminated`]
+    /// at teardown) are service-set. The spawn body's only role w.r.t.
     /// state is to invoke the observer on each transition; it MUST
     /// NOT write to AgentRegistry through any other path.
     fn spawn(
         &self,
         kernel: Arc<K>,
         desc: AgentDescriptor,
-        state_observer: Arc<dyn Fn(AgentState) + Send + Sync>,
+        state_observer: Arc<dyn Fn(AgentState, Option<String>) + Send + Sync>,
     ) -> Box<dyn SpawnHandle>;
 }
 
@@ -509,6 +513,14 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
             if let Err(e) = a2a::ensure_agent_inbox(self.kernel.as_ref(), &desc.name) {
                 tracing::warn!(pid=%pid, error=%e, "ensure_agent_inbox failed");
             }
+            // Sibling attention-state stream (same replicated `/agents/{name}`
+            // presence). The observer below publishes `AwaitingInput` enter/exit
+            // here so any node can answer the cross-machine "which agents are
+            // waiting on me?" with a plain read. Best-effort: a std / non-stream
+            // deployment simply has no reader and the agent runs unaffected.
+            if let Err(e) = a2a::ensure_agent_state_stream(self.kernel.as_ref(), &desc.name) {
+                tracing::warn!(pid=%pid, error=%e, "ensure_agent_state_stream failed");
+            }
             if let Some(spec) = spawn_spec {
                 match self.raw_spawn.as_ref() {
                     Some(rs) => {
@@ -540,15 +552,59 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                 // instead of taking down the worker thread.
                 let registry = Arc::clone(&self.agent_registry);
                 let pid_for_observer = pid.clone();
-                let observer: Arc<dyn Fn(AgentState) + Send + Sync> =
-                    Arc::new(move |state: AgentState| {
-                        if let Err(e) = registry.update_state(&pid_for_observer, state) {
+                let kernel_for_observer = Arc::clone(&self.kernel);
+                let agent_name = desc.name.clone();
+                let observer: Arc<dyn Fn(AgentState, Option<String>) + Send + Sync> =
+                    Arc::new(move |state: AgentState, reason: Option<String>| {
+                        // Note the pre-update AwaitingInput status so we publish
+                        // only the attention enter/exit edges (bounded), not
+                        // every Ready↔Busy flip.
+                        let was_awaiting = registry
+                            .get(&pid_for_observer)
+                            .map(|d| d.state == AgentState::AwaitingInput)
+                            .unwrap_or(false);
+                        if let Err(e) = registry.update_state_with_reason(
+                            &pid_for_observer,
+                            state,
+                            reason.clone(),
+                        ) {
                             tracing::warn!(
                                 pid = %pid_for_observer,
                                 state = ?state,
                                 error = %e,
                                 "AgentRegistry.update_state rejected runtime-side transition",
                             );
+                        }
+                        // Publish the AwaitingInput enter/exit edge to the
+                        // agent's replicated state stream — best-effort, so a
+                        // non-stream / std deployment (no reader) never disturbs
+                        // the agent.
+                        let is_awaiting = state == AgentState::AwaitingInput;
+                        if was_awaiting != is_awaiting {
+                            let event = serde_json::json!({
+                                "state": state.as_str(),
+                                "reason": reason,
+                            })
+                            .to_string();
+                            let ctx = kernel::kernel::OperationContext::new(
+                                "managed_agent",
+                                "root",
+                                true,
+                                None,
+                                true,
+                            );
+                            if let Err(e) = kernel_for_observer.sys_write(
+                                &a2a::agent_state_path(&agent_name),
+                                &ctx,
+                                event.as_bytes(),
+                                0,
+                            ) {
+                                tracing::warn!(
+                                    agent = %agent_name,
+                                    error = ?e,
+                                    "publish agent attention state failed (best-effort)",
+                                );
+                            }
                         }
                     });
                 let handle = provider.spawn(Arc::clone(&self.kernel), desc, observer);
@@ -630,6 +686,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
             workspace_path,
             model,
             state: desc.state.as_str().to_lowercase(),
+            reason: desc.reason.clone(),
         })
     }
 }
@@ -889,11 +946,13 @@ mod tests {
             &self,
             _kernel: Arc<Kernel>,
             _desc: AgentDescriptor,
-            state_observer: Arc<dyn Fn(AgentState) + Send + Sync>,
+            state_observer: Arc<dyn Fn(AgentState, Option<String>) + Send + Sync>,
         ) -> Box<dyn SpawnHandle> {
-            state_observer(AgentState::WarmingUp);
-            state_observer(AgentState::Ready);
-            state_observer(AgentState::Busy);
+            state_observer(AgentState::WarmingUp, None);
+            state_observer(AgentState::Ready, None);
+            state_observer(AgentState::Busy, None);
+            // Blocked on a reply it requested — carries an opaque reason.
+            state_observer(AgentState::AwaitingInput, Some("permission".to_string()));
             Box::new(NoopHandle)
         }
     }
@@ -919,12 +978,41 @@ mod tests {
         let desc = registry
             .get(&resp.session_id)
             .expect("AgentRegistry record present");
-        // The scripted observer fired WARMING_UP → READY → BUSY; final
-        // state in the SSOT is BUSY. (start_session already moves
-        // REGISTERED → WARMING_UP before spawn, so a re-fired
-        // WARMING_UP from the observer is a no-op via the from==new
-        // shortcut in update_state.)
-        assert_eq!(desc.state, AgentState::Busy);
+        // The scripted observer fired WARMING_UP → READY → BUSY →
+        // AwaitingInput("permission"); the SSOT reflects the last transition
+        // AND the agent-reported reason. (start_session already moves
+        // REGISTERED → WARMING_UP before spawn, so a re-fired WARMING_UP from
+        // the observer is a no-op via the from==new shortcut.)
+        assert_eq!(desc.state, AgentState::AwaitingInput);
+        assert_eq!(desc.reason.as_deref(), Some("permission"));
+    }
+
+    #[test]
+    fn awaiting_input_publishes_to_agent_state_stream() {
+        let kernel = Arc::new(Kernel::new());
+        // Route `/agents/*` so the state stream provisions + the publish lands
+        // (a fresh Kernel mounts nothing; a real host has the `/agents` mount).
+        kernel
+            .vfs_router_arc()
+            .add_mount("/agents", "root", None, false);
+        let registry = Arc::clone(kernel.agent_registry());
+        let svc = ManagedAgentService::<Kernel>::with_spawn(
+            Arc::clone(&kernel),
+            Arc::clone(&registry),
+            Arc::new(ScriptedSpawn),
+        );
+        let resp = svc.start_session(req("state-probe")).unwrap();
+        let name = registry.get(&resp.session_id).unwrap().name;
+        // The scripted spawn entered AwaitingInput("permission"); the host
+        // published that enter-edge to the agent's replicated state stream.
+        let (data, _next) = kernel
+            .stream_read_at_blocking(&format!("/agents/{name}/state"), 0, 1_000)
+            .expect("agent state stream readable");
+        let text = String::from_utf8_lossy(&data);
+        assert!(
+            text.contains("AWAITING_INPUT") && text.contains("permission"),
+            "AwaitingInput enter-edge published with its reason: {text}"
+        );
     }
 
     #[test]
@@ -951,9 +1039,9 @@ mod tests {
             &self,
             kernel: Arc<Kernel>,
             desc: AgentDescriptor,
-            state_observer: Arc<dyn Fn(AgentState) + Send + Sync>,
+            state_observer: Arc<dyn Fn(AgentState, Option<String>) + Send + Sync>,
         ) -> Box<dyn SpawnHandle> {
-            state_observer(AgentState::WarmingUp);
+            state_observer(AgentState::WarmingUp, None);
             let ptr = Arc::as_ptr(&kernel) as usize;
             // Real in-process KernelSyscall on the SHARED kernel: stat the
             // procfs workspace `start_session` stamped for THIS pid (procfs
@@ -962,7 +1050,7 @@ mod tests {
             let ws = format!("/proc/{}/workspace", desc.pid);
             let hit = kernel.sys_stat(&ws, &desc.zone_id).is_some();
             self.seen.lock().unwrap().push((ptr, desc.pid.clone(), hit));
-            state_observer(AgentState::Ready);
+            state_observer(AgentState::Ready, None);
             Box::new(NoopHandle)
         }
     }
