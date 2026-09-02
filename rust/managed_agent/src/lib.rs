@@ -185,6 +185,9 @@ pub(crate) struct GetSessionResponse {
     pub workspace_path: String,
     pub model: String,
     pub state: String,
+    /// Agent-reported reason the session is in `awaiting_input` (opaque,
+    /// e.g. "permission"); `None` in every other state.
+    pub reason: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -635,6 +638,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
             workspace_path,
             model,
             state: desc.state.as_str().to_lowercase(),
+            reason: desc.reason.clone(),
         })
     }
 }

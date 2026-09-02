@@ -194,6 +194,7 @@ fn agent_descriptor_to_json(desc: &AgentDescriptor) -> serde_json::Value {
         "zone_id": &desc.zone_id,
         "parent_pid": &desc.parent_pid,
         "state": desc.state.as_str(),
+        "reason": &desc.reason,
         "exit_code": desc.exit_code,
         "generation": desc.generation,
         "cwd": &desc.cwd,
