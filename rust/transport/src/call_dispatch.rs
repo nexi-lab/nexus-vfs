@@ -626,10 +626,14 @@ mod tests {
             "state": "ready",
         }))
         .expect("payload");
-        let invalid_transition =
-            dispatch(&kernel, &ctx, "agent_update_state", &invalid_transition_payload)
-                .expect("dispatch")
-                .into_inner();
+        let invalid_transition = dispatch(
+            &kernel,
+            &ctx,
+            "agent_update_state",
+            &invalid_transition_payload,
+        )
+        .expect("dispatch")
+        .into_inner();
         let invalid_transition = error_payload(invalid_transition);
         assert_eq!(invalid_transition["code"], serde_json::json!(-32006));
     }

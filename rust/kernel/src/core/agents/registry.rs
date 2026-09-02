@@ -137,17 +137,15 @@ pub enum AgentKind {
 ///                            (idle)  (working) (blocked on a reply)
 ///
 /// The activity values while alive:
-///   - `Ready`         — no in-flight turn (idle, available for work).
-///   - `Busy`          — in-flight turn, progressing (consuming compute).
-///   - `AwaitingInput` — in-flight turn, BLOCKED awaiting a reply the agent
-///                       itself requested (permission / question / plan
-///                       approval). Reachable only from `Busy`; resumes to
-///                       `Busy` when answered, or `Ready` if the turn is
-///                       abandoned. The agent RUNTIME reports this first-hand
-///                       (it knows why + which turn); the kernel only records
-///                       and exposes it, so any node — and, via the replicated
-///                       `/agents/{name}/state` projection, any machine — can
-///                       answer "which agents are waiting on me?".
+/// - `Ready` — no in-flight turn (idle, available for work).
+/// - `Busy` — in-flight turn, progressing (consuming compute).
+/// - `AwaitingInput` — in-flight turn, BLOCKED awaiting a reply the agent itself
+///   requested (permission / question / plan approval). Reachable only from
+///   `Busy`; resumes to `Busy` when answered, or `Ready` if the turn is
+///   abandoned. The agent RUNTIME reports this first-hand (it knows why + which
+///   turn); the kernel only records and exposes it, so any node — and, via the
+///   replicated `/agents/{name}/state` projection, any machine — can answer
+///   "which agents are waiting on me?".
 ///
 /// DESIGN NOTE (removed `Suspended`): the former `Suspended` (`SIGSTOP` →
 /// `SUSPENDED`) is gone — no product feature ever paused an agent, and
@@ -213,7 +211,10 @@ impl AgentState {
             // Reachable only from Busy (must be mid-turn to block): resume to
             // Busy when answered, drop to Ready if the turn is abandoned.
             AgentState::AwaitingInput => {
-                matches!(next, AgentState::Busy | AgentState::Ready | AgentState::Terminated)
+                matches!(
+                    next,
+                    AgentState::Busy | AgentState::Ready | AgentState::Terminated
+                )
             }
             AgentState::Terminated => false,
         }
@@ -1144,10 +1145,7 @@ mod tests {
         // Busy → AwaitingInput: the agent blocked on a reply it requested.
         reg.update_state(&desc.pid, AgentState::AwaitingInput)
             .unwrap();
-        assert_eq!(
-            reg.get(&desc.pid).unwrap().state,
-            AgentState::AwaitingInput
-        );
+        assert_eq!(reg.get(&desc.pid).unwrap().state, AgentState::AwaitingInput);
         // Answered → resume the turn (AwaitingInput → Busy).
         reg.update_state(&desc.pid, AgentState::Busy).unwrap();
         assert_eq!(reg.get(&desc.pid).unwrap().state, AgentState::Busy);

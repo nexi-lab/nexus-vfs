@@ -36,7 +36,7 @@ pub mod mailbox_stamping_policy;
 pub use foreign_containment::{install_foreign_agent_containment, ForeignAgentMailboxOnly};
 pub use mailbox_stamping_hook::MailboxStampingHook;
 pub use mailbox_stamping_policy::{
-    agent_inbox_path, agent_state_path, MailboxEnvelope, AGENT_STATE_SUFFIX, A2A_INBOX_BASE,
+    agent_inbox_path, agent_state_path, MailboxEnvelope, A2A_INBOX_BASE, AGENT_STATE_SUFFIX,
     CHAT_WITH_ME_SUFFIX, MAILBOX_IO_PROFILE, MAILBOX_STREAM_CAPACITY,
 };
 
