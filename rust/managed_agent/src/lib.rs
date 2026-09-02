@@ -286,7 +286,7 @@ pub trait SpawnTask<K: KernelSyscall>: Send + Sync + 'static {
         &self,
         kernel: Arc<K>,
         desc: AgentDescriptor,
-        state_observer: Arc<dyn Fn(AgentState) + Send + Sync>,
+        state_observer: Arc<dyn Fn(AgentState, Option<String>) + Send + Sync>,
     ) -> Box<dyn SpawnHandle>;
 }
 
@@ -541,9 +541,13 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                 // instead of taking down the worker thread.
                 let registry = Arc::clone(&self.agent_registry);
                 let pid_for_observer = pid.clone();
-                let observer: Arc<dyn Fn(AgentState) + Send + Sync> =
-                    Arc::new(move |state: AgentState| {
-                        if let Err(e) = registry.update_state(&pid_for_observer, state) {
+                let observer: Arc<dyn Fn(AgentState, Option<String>) + Send + Sync> =
+                    Arc::new(move |state: AgentState, reason: Option<String>| {
+                        if let Err(e) = registry.update_state_with_reason(
+                            &pid_for_observer,
+                            state,
+                            reason,
+                        ) {
                             tracing::warn!(
                                 pid = %pid_for_observer,
                                 state = ?state,
@@ -890,11 +894,13 @@ mod tests {
             &self,
             _kernel: Arc<Kernel>,
             _desc: AgentDescriptor,
-            state_observer: Arc<dyn Fn(AgentState) + Send + Sync>,
+            state_observer: Arc<dyn Fn(AgentState, Option<String>) + Send + Sync>,
         ) -> Box<dyn SpawnHandle> {
-            state_observer(AgentState::WarmingUp);
-            state_observer(AgentState::Ready);
-            state_observer(AgentState::Busy);
+            state_observer(AgentState::WarmingUp, None);
+            state_observer(AgentState::Ready, None);
+            state_observer(AgentState::Busy, None);
+            // Blocked on a reply it requested — carries an opaque reason.
+            state_observer(AgentState::AwaitingInput, Some("permission".to_string()));
             Box::new(NoopHandle)
         }
     }
@@ -920,12 +926,13 @@ mod tests {
         let desc = registry
             .get(&resp.session_id)
             .expect("AgentRegistry record present");
-        // The scripted observer fired WARMING_UP → READY → BUSY; final
-        // state in the SSOT is BUSY. (start_session already moves
-        // REGISTERED → WARMING_UP before spawn, so a re-fired
-        // WARMING_UP from the observer is a no-op via the from==new
-        // shortcut in update_state.)
-        assert_eq!(desc.state, AgentState::Busy);
+        // The scripted observer fired WARMING_UP → READY → BUSY →
+        // AwaitingInput("permission"); the SSOT reflects the last transition
+        // AND the agent-reported reason. (start_session already moves
+        // REGISTERED → WARMING_UP before spawn, so a re-fired WARMING_UP from
+        // the observer is a no-op via the from==new shortcut.)
+        assert_eq!(desc.state, AgentState::AwaitingInput);
+        assert_eq!(desc.reason.as_deref(), Some("permission"));
     }
 
     #[test]
@@ -952,9 +959,9 @@ mod tests {
             &self,
             kernel: Arc<Kernel>,
             desc: AgentDescriptor,
-            state_observer: Arc<dyn Fn(AgentState) + Send + Sync>,
+            state_observer: Arc<dyn Fn(AgentState, Option<String>) + Send + Sync>,
         ) -> Box<dyn SpawnHandle> {
-            state_observer(AgentState::WarmingUp);
+            state_observer(AgentState::WarmingUp, None);
             let ptr = Arc::as_ptr(&kernel) as usize;
             // Real in-process KernelSyscall on the SHARED kernel: stat the
             // procfs workspace `start_session` stamped for THIS pid (procfs
@@ -963,7 +970,7 @@ mod tests {
             let ws = format!("/proc/{}/workspace", desc.pid);
             let hit = kernel.sys_stat(&ws, &desc.zone_id).is_some();
             self.seen.lock().unwrap().push((ptr, desc.pid.clone(), hit));
-            state_observer(AgentState::Ready);
+            state_observer(AgentState::Ready, None);
             Box::new(NoopHandle)
         }
     }

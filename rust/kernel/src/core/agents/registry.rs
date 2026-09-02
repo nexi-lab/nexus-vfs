@@ -84,6 +84,11 @@ pub struct AgentDescriptor {
     // DT_LINK row stamped at start_session time. Useful PCB metadata for
     // inspection; the metastore DT_LINK rows are the routing SSOT.
     pub repos: Vec<RepoMount>,
+
+    // Why the agent is in `AwaitingInput` — agent-reported, opaque to the
+    // kernel (e.g. "permission" / "question" / "plan-approval"). `None` in
+    // every other state; cleared on any transition out of `AwaitingInput`.
+    pub reason: Option<String>,
 }
 
 impl Default for AgentDescriptor {
@@ -108,6 +113,7 @@ impl Default for AgentDescriptor {
             external_info: None,
             labels: HashMap::new(),
             repos: Vec::new(),
+            reason: None,
         }
     }
 }
@@ -470,6 +476,7 @@ impl AgentRegistry {
             external_info,
             labels,
             repos: Vec::new(),
+            reason: None,
         };
 
         // Atomic pid allocation + insert. Entry::Vacant guarantees no two
@@ -557,16 +564,32 @@ impl AgentRegistry {
         self.agents.get(pid).map(|r| r.clone())
     }
 
-    /// Update state with VALID_AGENT_TRANSITIONS validation.
-    /// Returns Ok(true) on success, Ok(false) if pid not found.
-    /// Returns Err(InvalidTransition) when the transition is rejected.
-    pub fn update_state(&self, pid: &str, new_state: AgentState) -> Result<bool, AgentError> {
+    /// Update state with VALID_AGENT_TRANSITIONS validation, also setting the
+    /// `AwaitingInput` reason (agent-reported, opaque). `reason` is stored only
+    /// when `new_state == AwaitingInput`; every other transition clears it, so
+    /// the reason invariant (`Some` iff `AwaitingInput`) holds for all callers.
+    /// Returns Ok(true) on success, Ok(false) if pid not found, and
+    /// Err(InvalidTransition) when the transition is rejected.
+    pub fn update_state_with_reason(
+        &self,
+        pid: &str,
+        new_state: AgentState,
+        reason: Option<String>,
+    ) -> Result<bool, AgentError> {
         let mut entry = match self.agents.get_mut(pid) {
             Some(e) => e,
             None => return Ok(false),
         };
         let from = entry.state;
+        let effective_reason = if new_state == AgentState::AwaitingInput {
+            reason
+        } else {
+            None
+        };
         if from == new_state {
+            // Same state: refresh the reason (e.g. a new AwaitingInput reason
+            // while already waiting) without a transition/observer fire.
+            entry.reason = effective_reason;
             return Ok(true);
         }
         if !from.can_transition_to(new_state) {
@@ -577,6 +600,7 @@ impl AgentRegistry {
             });
         }
         entry.state = new_state;
+        entry.reason = effective_reason;
         entry.updated_at_ms = now_ms();
         drop(entry);
         self.wake(pid);
@@ -584,6 +608,13 @@ impl AgentRegistry {
             self.fire_on_terminate(pid);
         }
         Ok(true)
+    }
+
+    /// Update state with VALID_AGENT_TRANSITIONS validation; clears any
+    /// `AwaitingInput` reason (use [`Self::update_state_with_reason`] to set
+    /// one). Returns Ok(true) on success, Ok(false) if pid not found.
+    pub fn update_state(&self, pid: &str, new_state: AgentState) -> Result<bool, AgentError> {
+        self.update_state_with_reason(pid, new_state, None)
     }
 
     /// Update state + exit code with validation.
@@ -607,6 +638,7 @@ impl AgentRegistry {
         }
         entry.state = new_state;
         entry.exit_code = Some(exit_code);
+        entry.reason = None;
         entry.updated_at_ms = now_ms();
         drop(entry);
         self.wake(pid);
