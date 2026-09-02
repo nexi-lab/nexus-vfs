@@ -7,8 +7,9 @@
 //! shared references.
 //!
 //! AgentState mirrors `contracts/process_types.py` exactly:
-//!   REGISTERED → WARMING_UP → READY ↔ BUSY → TERMINATED
-//!   READY/BUSY → SUSPENDED → READY
+//!   Registered → WarmingUp → Ready ⇄ Busy ⇄ AwaitingInput → Terminated
+//! (see the `AgentState` docstring for the per-state semantics + the design
+//! note on why the former `Suspended` state was removed.)
 
 use dashmap::DashMap;
 use parking_lot::{Condvar, Mutex, RwLock};
@@ -120,18 +121,42 @@ pub enum AgentKind {
     Managed,
 }
 
-/// Agent process state — mirrors contracts/process_types.py AgentState (SSOT).
+/// Agent process state — the per-PID runtime SSOT (mirrored in
+/// contracts/process_types.py for the Python client).
 ///
-/// Lifecycle:
-///   REGISTERED → WARMING_UP → READY ↔ BUSY → TERMINATED
-///   READY/BUSY → SUSPENDED → READY
+/// Single axis: lifecycle head/tail plus three mutually-exclusive "alive
+/// activity" values.
+///
+///   Registered → WarmingUp → Ready ⇄ Busy ⇄ AwaitingInput → Terminated
+///                            (idle)  (working) (blocked on a reply)
+///
+/// The activity values while alive:
+///   - `Ready`         — no in-flight turn (idle, available for work).
+///   - `Busy`          — in-flight turn, progressing (consuming compute).
+///   - `AwaitingInput` — in-flight turn, BLOCKED awaiting a reply the agent
+///                       itself requested (permission / question / plan
+///                       approval). Reachable only from `Busy`; resumes to
+///                       `Busy` when answered, or `Ready` if the turn is
+///                       abandoned. The agent RUNTIME reports this first-hand
+///                       (it knows why + which turn); the kernel only records
+///                       and exposes it, so any node — and, via the replicated
+///                       `/agents/{name}/state` projection, any machine — can
+///                       answer "which agents are waiting on me?".
+///
+/// DESIGN NOTE (removed `Suspended`): the former `Suspended` (`SIGSTOP` →
+/// `SUSPENDED`) is gone — no product feature ever paused an agent, and
+/// `SIGSTOP` is meaningless for an in-process co-host loop (there is no OS
+/// process to freeze). It was also the one off-axis state (an external freeze
+/// overlaying any activity), which broke the single-axis model. If cooperative
+/// pause/resume is ever needed, model it as an orthogonal `paused` flag — not a
+/// lifecycle state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AgentState {
     Registered,
     WarmingUp,
     Ready,
     Busy,
-    Suspended,
+    AwaitingInput,
     Terminated,
 }
 
@@ -142,7 +167,7 @@ impl AgentState {
             AgentState::WarmingUp => "WARMING_UP",
             AgentState::Ready => "READY",
             AgentState::Busy => "BUSY",
-            AgentState::Suspended => "SUSPENDED",
+            AgentState::AwaitingInput => "AWAITING_INPUT",
             AgentState::Terminated => "TERMINATED",
         }
     }
@@ -154,7 +179,7 @@ impl AgentState {
             "WARMING_UP" | "warming_up" => Some(AgentState::WarmingUp),
             "READY" | "ready" => Some(AgentState::Ready),
             "BUSY" | "busy" => Some(AgentState::Busy),
-            "SUSPENDED" | "suspended" => Some(AgentState::Suspended),
+            "AWAITING_INPUT" | "awaiting_input" => Some(AgentState::AwaitingInput),
             "TERMINATED" | "terminated" => Some(AgentState::Terminated),
             _ => None,
         }
@@ -174,16 +199,15 @@ impl AgentState {
             AgentState::WarmingUp => {
                 matches!(next, AgentState::Ready | AgentState::Terminated)
             }
-            AgentState::Ready => matches!(
-                next,
-                AgentState::Busy | AgentState::Suspended | AgentState::Terminated
-            ),
+            AgentState::Ready => matches!(next, AgentState::Busy | AgentState::Terminated),
             AgentState::Busy => matches!(
                 next,
-                AgentState::Ready | AgentState::Suspended | AgentState::Terminated
+                AgentState::Ready | AgentState::AwaitingInput | AgentState::Terminated
             ),
-            AgentState::Suspended => {
-                matches!(next, AgentState::Ready | AgentState::Terminated)
+            // Reachable only from Busy (must be mid-turn to block): resume to
+            // Busy when answered, drop to Ready if the turn is abandoned.
+            AgentState::AwaitingInput => {
+                matches!(next, AgentState::Busy | AgentState::Ready | AgentState::Terminated)
             }
             AgentState::Terminated => false,
         }
@@ -213,14 +237,14 @@ impl AgentKind {
 }
 
 /// POSIX-like agent signals. Mirrors contracts/process_types.py AgentSignal.
+///
+/// `SIGSTOP`/`SIGCONT` were removed alongside the `Suspended` state — see the
+/// `AgentState` design note: no feature paused agents and suspend is meaningless
+/// for an in-process co-host loop.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentSignal {
     /// Graceful shutdown → TERMINATED.
     Sigterm,
-    /// Suspend → SUSPENDED.
-    Sigstop,
-    /// Resume/connect → READY (bumps generation).
-    Sigcont,
     /// Immediate kill + reap (exit_code=-9).
     Sigkill,
     /// User-defined steering (label merge — no state change).
@@ -232,8 +256,6 @@ impl AgentSignal {
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "SIGTERM" => Some(AgentSignal::Sigterm),
-            "SIGSTOP" => Some(AgentSignal::Sigstop),
-            "SIGCONT" => Some(AgentSignal::Sigcont),
             "SIGKILL" => Some(AgentSignal::Sigkill),
             "SIGUSR1" => Some(AgentSignal::Sigusr1),
             _ => None,
@@ -767,31 +789,6 @@ impl AgentRegistry {
         payload: Option<HashMap<String, String>>,
     ) -> Result<AgentDescriptor, AgentError> {
         match sig {
-            AgentSignal::Sigstop => {
-                self.update_state(pid, AgentState::Suspended)?;
-                self.get(pid)
-                    .ok_or_else(|| AgentError::NotFound(pid.to_string()))
-            }
-            AgentSignal::Sigcont => {
-                let mut entry = self
-                    .agents
-                    .get_mut(pid)
-                    .ok_or_else(|| AgentError::NotFound(pid.to_string()))?;
-                let from = entry.state;
-                if !from.can_transition_to(AgentState::Ready) {
-                    return Err(AgentError::InvalidTransition {
-                        pid: pid.to_string(),
-                        from,
-                        to: AgentState::Ready,
-                    });
-                }
-                entry.state = AgentState::Ready;
-                entry.generation += 1;
-                entry.updated_at_ms = now_ms();
-                drop(entry);
-                self.wake(pid);
-                Ok(self.get(pid).unwrap())
-            }
             AgentSignal::Sigterm => self.kill(pid, 0),
             AgentSignal::Sigkill => {
                 let desc = self
@@ -1094,7 +1091,7 @@ mod tests {
     }
 
     #[test]
-    fn test_signal_sigstop_sigcont() {
+    fn test_awaiting_input_transitions() {
         let reg = AgentRegistry::new();
         let desc = reg
             .spawn(
@@ -1111,11 +1108,27 @@ mod tests {
             .unwrap();
         reg.update_state(&desc.pid, AgentState::WarmingUp).unwrap();
         reg.update_state(&desc.pid, AgentState::Ready).unwrap();
-        let after_stop = reg.signal(&desc.pid, AgentSignal::Sigstop, None).unwrap();
-        assert_eq!(after_stop.state, AgentState::Suspended);
-        let after_cont = reg.signal(&desc.pid, AgentSignal::Sigcont, None).unwrap();
-        assert_eq!(after_cont.state, AgentState::Ready);
-        assert_eq!(after_cont.generation, desc.generation + 1);
+        reg.update_state(&desc.pid, AgentState::Busy).unwrap();
+        // Busy → AwaitingInput: the agent blocked on a reply it requested.
+        reg.update_state(&desc.pid, AgentState::AwaitingInput)
+            .unwrap();
+        assert_eq!(
+            reg.get(&desc.pid).unwrap().state,
+            AgentState::AwaitingInput
+        );
+        // Answered → resume the turn (AwaitingInput → Busy).
+        reg.update_state(&desc.pid, AgentState::Busy).unwrap();
+        assert_eq!(reg.get(&desc.pid).unwrap().state, AgentState::Busy);
+        // Abandoned → drop to idle (Busy → AwaitingInput → Ready).
+        reg.update_state(&desc.pid, AgentState::AwaitingInput)
+            .unwrap();
+        reg.update_state(&desc.pid, AgentState::Ready).unwrap();
+        assert_eq!(reg.get(&desc.pid).unwrap().state, AgentState::Ready);
+        // AwaitingInput is reachable ONLY from Busy — Ready → AwaitingInput rejected.
+        let err = reg
+            .update_state(&desc.pid, AgentState::AwaitingInput)
+            .unwrap_err();
+        assert!(matches!(err, AgentError::InvalidTransition { .. }));
     }
 
     #[test]
@@ -1349,7 +1362,7 @@ mod tests {
             ("WARMING_UP", AgentState::WarmingUp),
             ("READY", AgentState::Ready),
             ("BUSY", AgentState::Busy),
-            ("SUSPENDED", AgentState::Suspended),
+            ("AWAITING_INPUT", AgentState::AwaitingInput),
             ("TERMINATED", AgentState::Terminated),
         ] {
             assert_eq!(AgentState::from_str(s).unwrap(), expected);

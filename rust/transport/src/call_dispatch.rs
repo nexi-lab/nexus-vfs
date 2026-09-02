@@ -454,17 +454,16 @@ mod tests {
             .into_inner();
         assert_eq!(result_payload(warming)["state"], "WARMING_UP");
 
-        let signal_payload = serde_json::to_vec(&serde_json::json!({
+        let ready_payload = serde_json::to_vec(&serde_json::json!({
             "pid": "admin,e2e",
-            "sig": "SIGCONT",
+            "state": "ready",
         }))
         .expect("payload");
-        let ready = dispatch(&kernel, &ctx, "agent_signal", &signal_payload)
+        let ready = dispatch(&kernel, &ctx, "agent_update_state", &ready_payload)
             .expect("dispatch")
             .into_inner();
         let ready = result_payload(ready);
         assert_eq!(ready["state"], "READY");
-        assert_eq!(ready["generation"], 2);
 
         let heartbeat_payload = serde_json::to_vec(&serde_json::json!({
             "pid": "admin,e2e",
@@ -619,13 +618,15 @@ mod tests {
         let invalid_signal = error_payload(invalid_signal);
         assert_eq!(invalid_signal["code"], serde_json::json!(-32005));
 
+        // The agent is REGISTERED; `Registered → ready` is illegal (it must
+        // warm up first) → maps to the invalid-transition client code.
         let invalid_transition_payload = serde_json::to_vec(&serde_json::json!({
             "pid": "admin,e2e",
-            "sig": "SIGSTOP",
+            "state": "ready",
         }))
         .expect("payload");
         let invalid_transition =
-            dispatch(&kernel, &ctx, "agent_signal", &invalid_transition_payload)
+            dispatch(&kernel, &ctx, "agent_update_state", &invalid_transition_payload)
                 .expect("dispatch")
                 .into_inner();
         let invalid_transition = error_payload(invalid_transition);

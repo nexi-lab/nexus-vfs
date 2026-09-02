@@ -273,12 +273,13 @@ pub trait SpawnTask<K: KernelSyscall>: Send + Sync + 'static {
     /// `ManagedAgentService::start_session` — it captures the
     /// service's `Arc<AgentRegistry>` and the session's pid and
     /// forwards each reported [`AgentState`] through
-    /// `AgentRegistry::update_state`. The spawn body reports only the
+    /// `AgentRegistry::update_state`. The spawn body reports the
     /// running-state subset ([`AgentState::WarmingUp`] /
-    /// [`AgentState::Ready`] / [`AgentState::Busy`]); the lifecycle
-    /// bookends ([`AgentState::Registered`] at plant,
-    /// [`AgentState::Suspended`] / [`AgentState::Terminated`] at
-    /// teardown) are service-set. The spawn body's only role w.r.t.
+    /// [`AgentState::Ready`] / [`AgentState::Busy`] /
+    /// [`AgentState::AwaitingInput`] — the runtime is first-hand aware
+    /// it has blocked on a requested reply); the lifecycle bookends
+    /// ([`AgentState::Registered`] at plant, [`AgentState::Terminated`]
+    /// at teardown) are service-set. The spawn body's only role w.r.t.
     /// state is to invoke the observer on each transition; it MUST
     /// NOT write to AgentRegistry through any other path.
     fn spawn(
