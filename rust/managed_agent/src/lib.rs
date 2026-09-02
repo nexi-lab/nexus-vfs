@@ -513,6 +513,14 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
             if let Err(e) = a2a::ensure_agent_inbox(self.kernel.as_ref(), &desc.name) {
                 tracing::warn!(pid=%pid, error=%e, "ensure_agent_inbox failed");
             }
+            // Sibling attention-state stream (same replicated `/agents/{name}`
+            // presence). The observer below publishes `AwaitingInput` enter/exit
+            // here so any node can answer the cross-machine "which agents are
+            // waiting on me?" with a plain read. Best-effort: a std / non-stream
+            // deployment simply has no reader and the agent runs unaffected.
+            if let Err(e) = a2a::ensure_agent_state_stream(self.kernel.as_ref(), &desc.name) {
+                tracing::warn!(pid=%pid, error=%e, "ensure_agent_state_stream failed");
+            }
             if let Some(spec) = spawn_spec {
                 match self.raw_spawn.as_ref() {
                     Some(rs) => {
@@ -544,12 +552,21 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                 // instead of taking down the worker thread.
                 let registry = Arc::clone(&self.agent_registry);
                 let pid_for_observer = pid.clone();
+                let kernel_for_observer = Arc::clone(&self.kernel);
+                let agent_name = desc.name.clone();
                 let observer: Arc<dyn Fn(AgentState, Option<String>) + Send + Sync> =
                     Arc::new(move |state: AgentState, reason: Option<String>| {
+                        // Note the pre-update AwaitingInput status so we publish
+                        // only the attention enter/exit edges (bounded), not
+                        // every Ready↔Busy flip.
+                        let was_awaiting = registry
+                            .get(&pid_for_observer)
+                            .map(|d| d.state == AgentState::AwaitingInput)
+                            .unwrap_or(false);
                         if let Err(e) = registry.update_state_with_reason(
                             &pid_for_observer,
                             state,
-                            reason,
+                            reason.clone(),
                         ) {
                             tracing::warn!(
                                 pid = %pid_for_observer,
@@ -557,6 +574,37 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                                 error = %e,
                                 "AgentRegistry.update_state rejected runtime-side transition",
                             );
+                        }
+                        // Publish the AwaitingInput enter/exit edge to the
+                        // agent's replicated state stream — best-effort, so a
+                        // non-stream / std deployment (no reader) never disturbs
+                        // the agent.
+                        let is_awaiting = state == AgentState::AwaitingInput;
+                        if was_awaiting != is_awaiting {
+                            let event = serde_json::json!({
+                                "state": state.as_str(),
+                                "reason": reason,
+                            })
+                            .to_string();
+                            let ctx = kernel::kernel::OperationContext::new(
+                                "managed_agent",
+                                "root",
+                                true,
+                                None,
+                                true,
+                            );
+                            if let Err(e) = kernel_for_observer.sys_write(
+                                &a2a::agent_state_path(&agent_name),
+                                &ctx,
+                                event.as_bytes(),
+                                0,
+                            ) {
+                                tracing::warn!(
+                                    agent = %agent_name,
+                                    error = ?e,
+                                    "publish agent attention state failed (best-effort)",
+                                );
+                            }
                         }
                     });
                 let handle = provider.spawn(Arc::clone(&self.kernel), desc, observer);
@@ -937,6 +985,34 @@ mod tests {
         // the observer is a no-op via the from==new shortcut.)
         assert_eq!(desc.state, AgentState::AwaitingInput);
         assert_eq!(desc.reason.as_deref(), Some("permission"));
+    }
+
+    #[test]
+    fn awaiting_input_publishes_to_agent_state_stream() {
+        let kernel = Arc::new(Kernel::new());
+        // Route `/agents/*` so the state stream provisions + the publish lands
+        // (a fresh Kernel mounts nothing; a real host has the `/agents` mount).
+        kernel
+            .vfs_router_arc()
+            .add_mount("/agents", "root", None, false);
+        let registry = Arc::clone(kernel.agent_registry());
+        let svc = ManagedAgentService::<Kernel>::with_spawn(
+            Arc::clone(&kernel),
+            Arc::clone(&registry),
+            Arc::new(ScriptedSpawn),
+        );
+        let resp = svc.start_session(req("state-probe")).unwrap();
+        let name = registry.get(&resp.session_id).unwrap().name;
+        // The scripted spawn entered AwaitingInput("permission"); the host
+        // published that enter-edge to the agent's replicated state stream.
+        let (data, _next) = kernel
+            .stream_read_at_blocking(&format!("/agents/{name}/state"), 0, 1_000)
+            .expect("agent state stream readable");
+        let text = String::from_utf8_lossy(&data);
+        assert!(
+            text.contains("AWAITING_INPUT") && text.contains("permission"),
+            "AwaitingInput enter-edge published with its reason: {text}"
+        );
     }
 
     #[test]

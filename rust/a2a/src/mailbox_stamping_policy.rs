@@ -63,6 +63,22 @@ pub fn agent_inbox_path(agent_name: &str) -> String {
     format!("{A2A_INBOX_BASE}/{agent_name}{CHAT_WITH_ME_SUFFIX}")
 }
 
+/// Suffix of an agent's replicated attention-state stream — sibling to
+/// [`CHAT_WITH_ME_SUFFIX`] under the same `{A2A_INBOX_BASE}/{name}` presence.
+pub const AGENT_STATE_SUFFIX: &str = "/state";
+
+/// Address of `agent_name`'s attention-state stream
+/// (`/agents/{agent_name}/state`) — sibling to [`agent_inbox_path`]. The host
+/// publishes `AwaitingInput` enter/exit here; because it routes into the same
+/// replicated `/agents/{name}` presence, any node reads "is this agent waiting?"
+/// with a plain `sys_read` (and, riding the same stream-wakeup primitive as the
+/// inbox, is woken the instant it changes). NOT a `*/chat-with-me` path, so it
+/// carries no `from`-stamping.
+#[must_use]
+pub fn agent_state_path(agent_name: &str) -> String {
+    format!("{A2A_INBOX_BASE}/{agent_name}{AGENT_STATE_SUFFIX}")
+}
+
 /// The canonical A2A mailbox message schema — the content format written to
 /// (and read from) any `*/chat-with-me` mailbox. This is the SSOT for the
 /// envelope shape; every consumer (co-hosted sudocode agents, hydra, the

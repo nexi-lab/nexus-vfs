@@ -36,8 +36,8 @@ pub mod mailbox_stamping_policy;
 pub use foreign_containment::{install_foreign_agent_containment, ForeignAgentMailboxOnly};
 pub use mailbox_stamping_hook::MailboxStampingHook;
 pub use mailbox_stamping_policy::{
-    agent_inbox_path, MailboxEnvelope, A2A_INBOX_BASE, CHAT_WITH_ME_SUFFIX, MAILBOX_IO_PROFILE,
-    MAILBOX_STREAM_CAPACITY,
+    agent_inbox_path, agent_state_path, MailboxEnvelope, AGENT_STATE_SUFFIX, A2A_INBOX_BASE,
+    CHAT_WITH_ME_SUFFIX, MAILBOX_IO_PROFILE, MAILBOX_STREAM_CAPACITY,
 };
 
 use kernel::kernel::syscall::KernelSyscall;
@@ -58,6 +58,19 @@ const DT_STREAM: i32 = 4;
 /// only ever provisions the inboxes of agents IT hosts.
 pub fn ensure_agent_inbox<K: KernelSyscall>(kernel: &K, agent_name: &str) -> Result<(), String> {
     ensure_mailbox_stream(kernel, &agent_inbox_path(agent_name))
+}
+
+/// Provision `agent_name`'s attention-state stream as a DT_STREAM, idempotently
+/// — the sibling of its inbox under the same replicated `/agents/{name}`
+/// presence (see [`agent_state_path`]). Same host rule as the inbox: a node only
+/// provisions the state streams of the agents IT hosts. Best-effort at the call
+/// site — a std / non-stream deployment simply has no reader, and the agent runs
+/// unaffected.
+pub fn ensure_agent_state_stream<K: KernelSyscall>(
+    kernel: &K,
+    agent_name: &str,
+) -> Result<(), String> {
+    ensure_mailbox_stream(kernel, &agent_state_path(agent_name))
 }
 
 /// Provision the `chat-with-me` mailbox at `path` as a DT_STREAM, idempotently.
