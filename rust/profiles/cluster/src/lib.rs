@@ -876,6 +876,26 @@ pub struct ServiceBootCtx {
     /// pairing is explicit here so a future runtime-per-zone change
     /// stays sound at this seam.)
     pub credential_zone_runtime: tokio::runtime::Handle,
+
+    /// The daemon's HMAC secret for sk- key material — `Some(_)` when
+    /// the daemon booted with API-key auth (a persisted or env-supplied
+    /// secret was resolved via `effective_api_key_secret`), `None`
+    /// under `--no-tls` (no auth plane; sk- credentials can't be
+    /// minted).
+    ///
+    /// Exposed so downstream service crates can call `auth::mint_key
+    /// (&store, secret, record, allow_existing)` directly — same shape
+    /// the internal `DaemonKeyMinter` uses one layer over.  Precedent
+    /// caller: the nexus assembly's `/v2/auth/keys` POST handler
+    /// (HTTP-side mint parity with the Python nexus-server).
+    ///
+    /// **Not for logging or side-channel disclosure** — the secret is
+    /// the HMAC key that anchors every sk- token; leaking it invites
+    /// key forgery.  Store it once in the composition-root builder's
+    /// closure state, never through a Debug impl.  Wrapped in `Arc<str>`
+    /// so a downstream that captures it into a `'static` closure pays
+    /// only a pointer bump per clone.
+    pub api_key_secret: Option<std::sync::Arc<str>>,
 }
 
 /// Boxed service-decl builder — threaded from [`run_with_services`] into
@@ -2481,6 +2501,19 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         (cred_zone.consensus_node(), cred_zone.runtime_handle())
     };
 
+    // Resolve the HMAC secret ONCE at ctx-build time — same helper the
+    // auth-store block above uses to arm the sk- `KeyMinter` slot.
+    // `--no-tls` has no auth plane and no persisted secret, so this
+    // stays `None`; every downstream mint path must gate on `.is_some()`
+    // and return the appropriate "no auth plane" error (503 / 400 /
+    // "MintKey unavailable under NoAuth").
+    let api_key_secret = if common.no_tls {
+        None
+    } else {
+        effective_api_key_secret(&common.data_dir.join("tls"))
+            .map(|s| std::sync::Arc::<str>::from(s.into_boxed_str()))
+    };
+
     let svc_ctx = ServiceBootCtx {
         auth_armed: api_key_auth.is_some(),
         // `vfs_auth` is the trait-object the kernel gRPC interceptor
@@ -2498,6 +2531,11 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         // already backs `RaftAuthKeyStore` — one namespace over.
         credential_consensus,
         credential_zone_runtime,
+        // `Some(secret)` iff API-key auth is armed (a persisted or
+        // env-supplied HMAC secret was resolved).  Downstream /v2/auth
+        // HTTP mint gates on `.is_some()` and returns 503 under NoAuth
+        // — the sk- plane simply does not exist there.
+        api_key_secret,
     };
     kernel
         .bring_up_services(build_decls(&svc_ctx))
