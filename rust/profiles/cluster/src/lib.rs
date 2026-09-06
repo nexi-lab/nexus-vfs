@@ -891,11 +891,13 @@ pub struct ServiceBootCtx {
     ///
     /// **Not for logging or side-channel disclosure** — the secret is
     /// the HMAC key that anchors every sk- token; leaking it invites
-    /// key forgery.  Store it once in the composition-root builder's
-    /// closure state, never through a Debug impl.  Wrapped in `Arc<str>`
-    /// so a downstream that captures it into a `'static` closure pays
-    /// only a pointer bump per clone.
-    pub api_key_secret: Option<std::sync::Arc<str>>,
+    /// key forgery.  Consumer clones once at capture-into-closure time
+    /// (same shape the internal `DaemonKeyMinter { secret: String }`
+    /// already uses).  Kept as `String` (not `Arc<str>`) so the widen
+    /// stays byte-for-byte within the slim cluster binary's size
+    /// budget — a fresh `Arc<str>` monomorphisation was measured at
+    /// ~430 KB over the §7 macos-x86_64 budget.
+    pub api_key_secret: Option<String>,
 }
 
 /// Boxed service-decl builder — threaded from [`run_with_services`] into
@@ -2511,7 +2513,6 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         None
     } else {
         effective_api_key_secret(&common.data_dir.join("tls"))
-            .map(|s| std::sync::Arc::<str>::from(s.into_boxed_str()))
     };
 
     let svc_ctx = ServiceBootCtx {
