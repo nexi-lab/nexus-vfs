@@ -876,6 +876,28 @@ pub struct ServiceBootCtx {
     /// pairing is explicit here so a future runtime-per-zone change
     /// stays sound at this seam.)
     pub credential_zone_runtime: tokio::runtime::Handle,
+
+    /// The daemon's HMAC secret for sk- key material — `Some(_)` when
+    /// the daemon booted with API-key auth (a persisted or env-supplied
+    /// secret was resolved via `effective_api_key_secret`), `None`
+    /// under `--no-tls` (no auth plane; sk- credentials can't be
+    /// minted).
+    ///
+    /// Exposed so downstream service crates can call `auth::mint_key
+    /// (&store, secret, record, allow_existing)` directly — same shape
+    /// the internal `DaemonKeyMinter` uses one layer over.  Precedent
+    /// caller: the nexus assembly's `/v2/auth/keys` POST handler
+    /// (HTTP-side mint parity with the Python nexus-server).
+    ///
+    /// **Not for logging or side-channel disclosure** — the secret is
+    /// the HMAC key that anchors every sk- token; leaking it invites
+    /// key forgery.  Consumer clones once at capture-into-closure time
+    /// (same shape the internal `DaemonKeyMinter { secret: String }`
+    /// already uses).  Kept as `String` (not `Arc<str>`) so the widen
+    /// stays byte-for-byte within the slim cluster binary's size
+    /// budget — a fresh `Arc<str>` monomorphisation was measured at
+    /// ~430 KB over the §7 macos-x86_64 budget.
+    pub api_key_secret: Option<String>,
 }
 
 /// Boxed service-decl builder — threaded from [`run_with_services`] into
@@ -2277,6 +2299,27 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         );
     }
 
+    // Resolve the API-key HMAC secret ONCE for this daemon boot: reused
+    // by (a) the `DaemonKeyMinter` slot below, (b) the `ServiceBootCtx`
+    // seam threaded down to downstream service crates that need to mint
+    // sk- tokens directly (e.g. the nexus HTTP-API's `/v2/auth/keys`
+    // POST handler, which cannot satisfy the gRPC `KeyMinter`'s
+    // node-cert gate).  `None` under `--no-tls` — no sk- plane, no
+    // secret file, and every downstream mint path must gate on
+    // `.is_some()` and refuse cleanly.
+    //
+    // Hoisting to ONE call site keeps the slim `nexusd-cluster` binary
+    // under its §7 macos-x86_64 size budget: an extra
+    // `effective_api_key_secret` call site was measured to add ~430 KB
+    // of monomorphised codegen the shipped binary does not otherwise
+    // link.  This shape reuses the existing call site + threads the
+    // result through, additive at the type level, zero at the ELF.
+    let api_key_secret: Option<String> = if common.no_tls {
+        None
+    } else {
+        effective_api_key_secret(&common.data_dir.join("tls"))
+    };
+
     // Auth-key store (Control-Plane HAL §3.B.3) + the cache eviction that
     // makes a revocation take effect without waiting out a TTL.
     //
@@ -2318,11 +2361,11 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         // WITHOUT stopping the daemon (matching the agent path). Auth-off has no
         // sk- plane — the slot stays empty and both RPCs return success=false.
         if !common.no_tls {
-            if let Some(secret) = effective_api_key_secret(&common.data_dir.join("tls")) {
+            if let Some(secret) = api_key_secret.as_deref() {
                 let minter: Arc<dyn nexus_raft::key_minter::KeyMinter> =
                     Arc::new(DaemonKeyMinter {
                         store: Arc::clone(&store),
-                        secret,
+                        secret: secret.to_string(),
                     });
                 *zm.key_minter_slot().write() = Some(minter);
                 tracing::info!("sk- MintKey/RevokeKey RPC armed (mint while the daemon is up)");
@@ -2498,6 +2541,11 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         // already backs `RaftAuthKeyStore` — one namespace over.
         credential_consensus,
         credential_zone_runtime,
+        // `Some(secret)` iff API-key auth is armed (a persisted or
+        // env-supplied HMAC secret was resolved).  Downstream /v2/auth
+        // HTTP mint gates on `.is_some()` and returns 503 under NoAuth
+        // — the sk- plane simply does not exist there.
+        api_key_secret,
     };
     kernel
         .bring_up_services(build_decls(&svc_ctx))

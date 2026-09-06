@@ -32,20 +32,24 @@ jobs:
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
-            max_size_bytes: 14417920  # 13.75 MiB — raised from 13.25 for the
-                                      # managed-agent control plane relocated into
-                                      # nexusd-cluster (#241). Measured 13,912,000 bytes
-                                      # on this platform.
+            max_size_bytes: 15466496  # 14.75 MiB — raised from 13.75 for the
+                                      # ServiceBootCtx `api_key_secret` widen (#261;
+                                      # downstream HTTP mint plumbing for nexus
+                                      # `/v2/auth/keys` POST).  Measured 14,794,160
+                                      # bytes here after the widen; leaves ~650 KB
+                                      # headroom.
           - os: macos-14
             artifact_name: nexusd-cluster-macos-x86_64
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
             target: x86_64-apple-darwin
-            max_size_bytes: 15466496  # 14.75 MiB — raised from 14.25 for the
-                                      # managed-agent control plane relocated into
-                                      # nexusd-cluster (#241). Measured 15,028,512 bytes
-                                      # here (the tightest-headroom platform).
+            max_size_bytes: 16515072  # 15.75 MiB — raised from 14.75 for the
+                                      # ServiceBootCtx `api_key_secret` widen (#261;
+                                      # downstream HTTP mint plumbing for nexus
+                                      # `/v2/auth/keys` POST).  Measured 15,896,728
+                                      # bytes here (the tightest-headroom platform);
+                                      # leaves ~600 KB headroom.
           - os: windows-latest
             artifact_name: nexusd-cluster-windows-x86_64
             package: nexus-cluster
