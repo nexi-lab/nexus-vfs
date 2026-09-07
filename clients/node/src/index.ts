@@ -1,10 +1,12 @@
 /**
  * Official Node client for the Nexus VFS gRPC service.
  *
- * The service definition is loaded from this repository's own
- * `proto/nexus/grpc/vfs/vfs.proto` (copied into the package by
- * `scripts/sync-proto.mjs` at build time), so a Node consumer and the
- * server are wire-compatible by construction rather than by convention.
+ * The service definition comes from this repository's own
+ * `proto/nexus/grpc/vfs/vfs.proto`, which `scripts/sync-proto.mjs` compiles
+ * into a module at build time, so a Node consumer and the server are
+ * wire-compatible by construction rather than by convention. It is parsed from
+ * memory rather than read at runtime: protobufjs resolves `fs` dynamically and
+ * a bundler leaves that null, which is how a bundled consumer used to fail.
  *
  * Pure JavaScript over `@grpc/grpc-js` — no native addon, so consumers
  * need neither a Rust toolchain to install nor an ABI rebuild per Electron
@@ -12,20 +14,12 @@
  */
 
 import { readFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
 
 import * as grpc from '@grpc/grpc-js'
 import * as protoLoader from '@grpc/proto-loader'
+import protobuf from 'protobufjs'
 
-const PROTO_PATH = join(
-  dirname(dirname(fileURLToPath(import.meta.url))),
-  'proto',
-  'nexus',
-  'grpc',
-  'vfs',
-  'vfs.proto',
-)
+import { VFS_PROTO } from './generated/proto.js'
 
 /**
  * The DNS SAN every `nexusd-cluster` node certificate carries. An mTLS
@@ -172,7 +166,8 @@ let cachedServiceConstructor: grpc.ServiceClientConstructor | null = null
 
 function serviceConstructor(): grpc.ServiceClientConstructor {
   if (!cachedServiceConstructor) {
-    const definition = protoLoader.loadSync(PROTO_PATH, PROTO_LOADER_OPTIONS)
+    const root = protobuf.parse(VFS_PROTO, { keepCase: true }).root
+    const definition = protoLoader.fromJSON(root.toJSON(), PROTO_LOADER_OPTIONS)
     const loaded = grpc.loadPackageDefinition(definition) as unknown as {
       nexus: { grpc: { vfs: { NexusVFSService: grpc.ServiceClientConstructor } } }
     }
