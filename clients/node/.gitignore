@@ -5,3 +5,4 @@ dist/
 # commit it: an editable second copy is exactly the drift this package exists
 # to prevent.
 proto/
+src/generated/
