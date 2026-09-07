@@ -70,6 +70,8 @@ interface UnaryClient {
   Write: GrpcMethod<WriteRequest, WriteResponse>
   Delete: GrpcMethod<DeleteRequest, DeleteResponse>
   Ping: GrpcMethod<PingRequest, PingResponse>
+  StreamReadAt: GrpcMethod<StreamReadAtRequest, StreamReadAtResponse>
+  StreamWriteNowait: GrpcMethod<StreamWriteRequest, StreamWriteResponse>
   close(): void
 }
 
@@ -116,6 +118,47 @@ interface DeleteResponse {
 }
 interface PingRequest {
   auth_token: string
+}
+interface StreamReadAtRequest {
+  path: string
+  offset: string
+  blocking: boolean
+  timeout_ms: string
+  auth_token: string
+}
+interface StreamReadAtResponse {
+  data: Buffer
+  next_offset: string
+  eof: boolean
+  is_error: boolean
+  error_payload: Buffer
+  timed_out: boolean
+}
+interface StreamWriteRequest {
+  path: string
+  data: Buffer
+  auth_token: string
+}
+interface StreamWriteResponse {
+  offset: string
+  is_error: boolean
+  error_payload: Buffer
+}
+
+/** One non-blocking read from an IPC stream. */
+export interface StreamReadResult {
+  data: Buffer
+  /** Where the next read should pick up. */
+  nextOffset: string
+  /** No data available right now. Not end of stream. */
+  eof: boolean
+  /**
+   * A blocking read reached its timeout with no frame -- a normal long-poll
+   * expiry, so re-read from the same offset. `eof` is also true for older
+   * servers, which is why a reader that only checks `eof` still re-polls;
+   * a real disconnect raises instead.
+   */
+  timedOut: boolean
 }
 /** Server identity and liveness, from the typed `Ping` RPC. */
 export interface NexusServerInfo {
@@ -257,6 +300,49 @@ export class NexusVfsClient {
    */
   async ping(authToken: string): Promise<string> {
     return this.call('ping', '{}', authToken)
+  }
+
+  /**
+   * Append bytes to an IPC stream. Does not wait for a reader.
+   */
+  async streamWrite(path: string, data: Buffer, authToken: string): Promise<void> {
+    const response = await this.unary<StreamWriteRequest, StreamWriteResponse>(
+      'StreamWriteNowait',
+      'stream write',
+      { path, data, auth_token: authToken },
+    )
+    if (response.is_error) throw vfsError(response.error_payload, 'stream write')
+  }
+
+  /**
+   * Read from an IPC stream at `offset`. Non-blocking by default; pass
+   * `blocking` with a `timeoutMs` to long-poll. A closed stream or an exited
+   * writer raises -- that is the disconnect signal, distinct from `eof`.
+   */
+  async streamReadAt(
+    path: string,
+    offset: string,
+    authToken: string,
+    options: { blocking?: boolean; timeoutMs?: number } = {},
+  ): Promise<StreamReadResult> {
+    const response = await this.unary<StreamReadAtRequest, StreamReadAtResponse>(
+      'StreamReadAt',
+      'stream read',
+      {
+        path,
+        offset,
+        blocking: options.blocking ?? false,
+        timeout_ms: String(options.timeoutMs ?? 0),
+        auth_token: authToken,
+      },
+    )
+    if (response.is_error) throw vfsError(response.error_payload, 'stream read')
+    return {
+      data: response.data?.length ? response.data : Buffer.alloc(0),
+      nextOffset: response.next_offset ?? offset,
+      eof: response.eof ?? false,
+      timedOut: response.timed_out ?? false,
+    }
   }
 
   /** Server version, zone and uptime, from the typed `Ping` RPC. */
