@@ -45,9 +45,24 @@ test('exports the cluster server name the certs carry', () => {
 })
 
 test('names the gRPC status in a transport failure', async () => {
-  // Callers match on the status name to tell a missing plugin method from a
-  // real failure, so it has to survive into the message.
-  const client = new NexusVfsClient('127.0.0.1:1', {})
-  await assert.rejects(client.read('/nope', ''), /gRPC read failed: UNAVAILABLE: /)
+  // Calls queue while the channel comes up, so an unreachable server surfaces
+  // when the bounded wait expires rather than immediately. Callers match on the
+  // status name to tell a missing plugin method from a real failure, so it has
+  // to survive into the message.
+  const client = new NexusVfsClient('127.0.0.1:1', { connectTimeoutMs: 250 })
+  await assert.rejects(client.read('/nope', ''), /gRPC read failed: DEADLINE_EXCEEDED: /)
+  client.close()
+})
+
+test('queues a call while the channel is still connecting', async () => {
+  // The Rust client this replaces dialed lazily and queued; grpc-js fails fast
+  // by default, which broke callers that dial a daemon they just spawned.
+  const client = new NexusVfsClient('127.0.0.1:1', { connectTimeoutMs: 400 })
+  const startedAt = Date.now()
+  await assert.rejects(client.read('/nope', ''))
+  assert.ok(
+    Date.now() - startedAt >= 300,
+    'the call returned before the connect wait elapsed, so it failed fast',
+  )
   client.close()
 })

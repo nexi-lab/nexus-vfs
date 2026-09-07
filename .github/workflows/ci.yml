@@ -61,3 +61,82 @@ jobs:
         with:
           cache: false
       - run: cargo fmt --all -- --check
+
+  node-client:
+    name: node client
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install
+        working-directory: clients/node
+        run: npm ci
+      - name: Guard the packaged proto against drift
+        working-directory: clients/node
+        # Fails when the copy shipped in the package is not byte-identical to
+        # proto/nexus/grpc/vfs/vfs.proto, which is the whole point of the package.
+        run: npm run build && npm run check-proto
+      - name: Test
+        working-directory: clients/node
+        # Includes no-disk-proto.test.mjs, which catches the client reaching for
+        # the filesystem — a break that only shows up in a consumer's bundle.
+        run: npm test
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Fetch a released nexusd
+        shell: bash
+        # The client's hardest failures only appear against a real server:
+        # a definition can be well formed, round-trip offline, and still move
+        # nothing on the wire. nexusd needs no credentials — serve-local binds
+        # loopback with TLS off — so CI can run one.
+        run: |
+          set -euo pipefail
+          base='https://sudowork-runtime-1309794936.cos.accelerate.myqcloud.com/nexus-vfs/release/latest'
+          tarball='nexusd-cluster-linux-x86_64.tar.gz'
+          curl -fsSL --retry 3 "$base/$tarball" -o "$tarball"
+          curl -fsSL --retry 3 "$base/SHA256SUMS.txt" -o SHA256SUMS.txt
+          grep " $tarball\$" SHA256SUMS.txt | sha256sum -c -
+          tar xzf "$tarball"
+          install -m 0755 nexusd-cluster-linux-x86_64/nexusd-cluster ./nexusd
+          ./nexusd --version
+
+      - name: Start nexusd
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./nexusd serve-local --port 22126 --data-dir "$RUNNER_TEMP/nexus-data" --no-tls > nexusd.log 2>&1 &
+          for _ in $(seq 1 60); do
+            if node -e "require('net').connect(22126,'127.0.0.1').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"; then
+              echo "nexusd is listening"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo '::error::nexusd did not start'; cat nexusd.log; exit 1
+
+      - name: Live round-trip
+        working-directory: clients/node
+        env:
+          NEXUS_VFS_ENDPOINT: 127.0.0.1:22126
+        run: npm run test:live
+
+      - name: Live round-trip, bundled
+        working-directory: clients/node
+        env:
+          NEXUS_VFS_ENDPOINT: 127.0.0.1:22126
+        # Bundled with bun, the way a consumer ships: a bundler can break what
+        # a plain `node` run resolves fine, and that has happened here before.
+        run: |
+          set -euo pipefail
+          bun build ./test/live-entry.mjs --outfile="$RUNNER_TEMP/live-bundled.mjs" --target=node --format=esm
+          node "$RUNNER_TEMP/live-bundled.mjs"
+
+      - name: nexusd log on failure
+        if: failure()
+        run: tail -50 nexusd.log || true
