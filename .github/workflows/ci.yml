@@ -61,3 +61,26 @@ jobs:
         with:
           cache: false
       - run: cargo fmt --all -- --check
+
+  node-client:
+    name: node client
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install
+        working-directory: clients/node
+        run: npm ci
+      - name: Guard the packaged proto against drift
+        working-directory: clients/node
+        # Fails when the copy shipped in the package is not byte-identical to
+        # proto/nexus/grpc/vfs/vfs.proto, which is the whole point of the package.
+        run: npm run build && npm run check-proto
+      - name: Test
+        working-directory: clients/node
+        # Includes no-disk-proto.test.mjs, which catches the client reaching for
+        # the filesystem — a break that only shows up in a consumer's bundle.
+        run: npm test
