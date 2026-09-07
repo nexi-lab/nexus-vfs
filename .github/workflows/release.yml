@@ -288,3 +288,118 @@ jobs:
             coscmd upload "$file" "$PATH_LATEST/$filename"
           done
           echo "::notice::Latest artifacts: https://${COS_BUCKET}.cos.${COS_REGION}.myqcloud.com/${PATH_LATEST}/"
+
+  publish-node-client:
+    name: Publish the Node client to npm
+    # Also runnable on demand: the client version is its own, so shipping it
+    # need not wait for a cluster binary release.
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Skip when the npm token is not configured
+        if: ${{ env.NODE_AUTH_TOKEN == '' }}
+        run: echo "::warning::NPM_TOKEN is not configured; @nexus-ai-fs/vfs-client was not published."
+
+      - name: Set up Node
+        if: ${{ env.NODE_AUTH_TOKEN != '' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Publish
+        if: ${{ env.NODE_AUTH_TOKEN != '' }}
+        working-directory: clients/node
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The tag names the release; the package carries its own version, and
+          # republishing an existing one is a no-op rather than a failure.
+          VERSION="$(node -p 'require("./package.json").version')"
+          npm ci
+          npm run build
+          npm test
+          if npm view "@nexus-ai-fs/vfs-client@${VERSION}" version >/dev/null 2>&1; then
+            echo "@nexus-ai-fs/vfs-client@${VERSION} is already published"
+          else
+            npm publish --access public
+          fi
+
+  publish-node-client-cos:
+    name: Publish the Node client tarball to COS
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      TENCENT_SECRET_ID: ${{ secrets.TENCENT_SECRET_ID }}
+      TENCENT_SECRET_KEY: ${{ secrets.TENCENT_SECRET_KEY }}
+      COS_BUCKET: sudowork-runtime-1309794936
+      COS_REGION: ap-beijing
+
+    steps:
+      - name: Check secrets
+        id: check
+        shell: bash
+        run: |
+          if [ -z "$TENCENT_SECRET_ID" ] || [ -z "$TENCENT_SECRET_KEY" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Tencent COS secrets not configured - skipping client upload"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout code
+        if: steps.check.outputs.skip == 'false'
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        if: steps.check.outputs.skip == 'false'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Build, test and pack
+        if: steps.check.outputs.skip == 'false'
+        id: pack
+        working-directory: clients/node
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build
+          npm test
+          VERSION="$(node -p 'require("./package.json").version')"
+          npm pack --pack-destination .
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tarball=nexus-ai-fs-vfs-client-$VERSION.tgz" >> "$GITHUB_OUTPUT"
+
+      - name: Install coscmd
+        if: steps.check.outputs.skip == 'false'
+        run: pip install --quiet coscmd
+
+      - name: Configure coscmd
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          coscmd config -a "$TENCENT_SECRET_ID" -s "$TENCENT_SECRET_KEY"             -b "$COS_BUCKET" -r "$COS_REGION"
+
+      - name: Upload
+        if: steps.check.outputs.skip == 'false'
+        working-directory: clients/node
+        shell: bash
+        env:
+          VERSION: ${{ steps.pack.outputs.version }}
+          TARBALL: ${{ steps.pack.outputs.tarball }}
+        run: |
+          set -euo pipefail
+          BASE="nexus-vfs/clients/node"
+          # Immutable per-version path consumers pin, plus a moving `latest`
+          # for humans checking what the newest build is.
+          coscmd upload "$TARBALL" "$BASE/$VERSION/$TARBALL"
+          coscmd upload "$TARBALL" "$BASE/latest/$TARBALL"
+          URL="https://${COS_BUCKET}.cos.${COS_REGION}.myqcloud.com/$BASE/$VERSION/$TARBALL"
+          echo "::notice::Node client published: $URL"
