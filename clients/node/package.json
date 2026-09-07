@@ -1,0 +1,41 @@
+{
+  "name": "@nexus-ai-fs/vfs-client",
+  "version": "0.1.0",
+  "description": "Official Node client for the Nexus VFS gRPC service, generated from this repository's proto",
+  "license": "UNLICENSED",
+  "private": false,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "proto",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "sync-proto": "node scripts/sync-proto.mjs",
+    "check-proto": "node scripts/sync-proto.mjs --check",
+    "build": "node scripts/sync-proto.mjs && tsc -p tsconfig.json",
+    "prepare": "npm run build",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test \"test/*.test.mjs\"",
+    "test:live": "npm run build && node --test test/live.test.mjs"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.14.4",
+    "@grpc/proto-loader": "^0.7.13"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}
