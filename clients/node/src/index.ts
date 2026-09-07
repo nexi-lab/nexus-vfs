@@ -28,6 +28,9 @@ import { VFS_PROTO } from './generated/proto.js'
  */
 export const DEFAULT_CLUSTER_SERVER_NAME = 'nexus-node'
 
+/** Default bound on how long a call waits for the channel to come up. */
+export const DEFAULT_CONNECT_TIMEOUT_MS = 30_000
+
 const PROTO_LOADER_OPTIONS: protoLoader.Options = {
   keepCase: true,
   longs: String,
@@ -56,6 +59,15 @@ export interface NexusVfsClientOptions {
   maxReceiveMessageBytes?: number
   /** When set, connect with mutual TLS instead of plaintext. */
   tls?: NexusVfsTlsConfig
+  /**
+   * How long a call may wait for the channel to come up, in milliseconds.
+   * Calls queue rather than fail while the connection is being established --
+   * the Rust client this replaces did the same, and callers dial a daemon they
+   * have just spawned. Defaults to
+   * {@link DEFAULT_CONNECT_TIMEOUT_MS}; the wait is bounded so an unreachable
+   * server surfaces as DEADLINE_EXCEEDED instead of hanging.
+   */
+  connectTimeoutMs?: number
 }
 
 interface UnaryClient {
@@ -71,6 +83,8 @@ interface UnaryClient {
 
 type GrpcMethod<Req, Res> = (
   request: Req,
+  metadata: grpc.Metadata,
+  options: grpc.CallOptions,
   callback: (error: grpc.ServiceError | null, response: Res) => void,
 ) => void
 
@@ -195,6 +209,7 @@ export class NexusVfsClient {
   readonly target: string
 
   private readonly client: UnaryClient
+  private readonly connectTimeoutMs: number
 
   /**
    * Connect to `endpoint`, plaintext by default — that is what the
@@ -221,6 +236,7 @@ export class NexusVfsClient {
       channelOptions['grpc.max_receive_message_length'] = options.maxReceiveMessageBytes
     }
 
+    this.connectTimeoutMs = options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS
     this.target = toGrpcTarget(endpoint)
     this.client = new Service(this.target, credentials, channelOptions) as unknown as UnaryClient
   }
@@ -352,8 +368,14 @@ export class NexusVfsClient {
 
   private unary<Req, Res>(rpc: keyof UnaryClient, operation: string, request: Req): Promise<Res> {
     return new Promise((resolve, reject) => {
+      // Queue the call while the channel connects instead of failing fast:
+      // callers dial a daemon they have just spawned, and grpc-js otherwise
+      // rejects with an empty status before the first connection lands. In
+      // grpc-js this is a Metadata flag, not a CallOption.
+      const metadata = new grpc.Metadata({ waitForReady: true })
+      const callOptions: grpc.CallOptions = { deadline: Date.now() + this.connectTimeoutMs }
       const method = this.client[rpc] as unknown as GrpcMethod<Req, Res>
-      method.call(this.client, request, (error, response) => {
+      method.call(this.client, request, metadata, callOptions, (error, response) => {
         if (error) {
           // Name the status, not just the detail text. Callers distinguish a
           // missing plugin method (UNIMPLEMENTED) from a real failure by
