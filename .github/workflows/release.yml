@@ -401,5 +401,6 @@ jobs:
           # for humans checking what the newest build is.
           coscmd upload "$TARBALL" "$BASE/$VERSION/$TARBALL"
           coscmd upload "$TARBALL" "$BASE/latest/$TARBALL"
-          URL="https://${COS_BUCKET}.cos.${COS_REGION}.myqcloud.com/$BASE/$VERSION/$TARBALL"
+          # Global acceleration: the regional endpoint 404s for consumers outside China.
+          URL="https://${COS_BUCKET}.cos.accelerate.myqcloud.com/$BASE/$VERSION/$TARBALL"
           echo "::notice::Node client published: $URL"
