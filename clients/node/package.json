@@ -1,6 +1,6 @@
 {
   "name": "@nexus-ai-fs/vfs-client",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Official Node client for the Nexus VFS gRPC service, generated from this repository's proto",
   "license": "MIT",
   "publishConfig": {
