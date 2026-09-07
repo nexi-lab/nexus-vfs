@@ -44,8 +44,10 @@ test('exports the cluster server name the certs carry', () => {
   assert.equal(DEFAULT_CLUSTER_SERVER_NAME, 'nexus-node')
 })
 
-test('surfaces a transport failure as a labelled error', async () => {
+test('names the gRPC status in a transport failure', async () => {
+  // Callers match on the status name to tell a missing plugin method from a
+  // real failure, so it has to survive into the message.
   const client = new NexusVfsClient('127.0.0.1:1', {})
-  await assert.rejects(client.read('/nope', ''), /gRPC read failed:/)
+  await assert.rejects(client.read('/nope', ''), /gRPC read failed: UNAVAILABLE: /)
   client.close()
 })

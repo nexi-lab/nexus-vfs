@@ -274,7 +274,11 @@ export class NexusVfsClient {
       const method = this.client[rpc] as unknown as GrpcMethod<Req, Res>
       method.call(this.client, request, (error, response) => {
         if (error) {
-          reject(new Error(`gRPC ${operation} failed: ${error.details || error.message}`))
+          // Name the status, not just the detail text. Callers distinguish a
+          // missing plugin method (UNIMPLEMENTED) from a real failure by
+          // matching on the message, and the detail alone need not say which.
+          const status = grpc.status[error.code] ?? error.code
+          reject(new Error(`gRPC ${operation} failed: ${status}: ${error.details || error.message}`))
           return
         }
         resolve(response)
