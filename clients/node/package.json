@@ -2,8 +2,15 @@
   "name": "@nexus-ai-fs/vfs-client",
   "version": "0.1.0",
   "description": "Official Node client for the Nexus VFS gRPC service, generated from this repository's proto",
-  "license": "UNLICENSED",
-  "private": false,
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nexi-lab/nexus-vfs.git",
+    "directory": "clients/node"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
