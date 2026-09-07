@@ -20,12 +20,12 @@ Published two ways by `.github/workflows/release.yml`:
   `@nexus-ai-fs/api-client`. Requires `NPM_TOKEN` on this repository; the job
   skips with a warning when it is absent.
 - **Tencent COS** — a tarball at
-  `https://sudowork-runtime-1309794936.cos.ap-beijing.myqcloud.com/nexus-vfs/clients/node/<version>/nexus-ai-fs-vfs-client-<version>.tgz`,
+  `https://sudowork-runtime-1309794936.cos.accelerate.myqcloud.com/nexus-vfs/clients/node/<version>/nexus-ai-fs-vfs-client-<version>.tgz`,
   the same bucket that already carries `nexusd-cluster` and the vault plugin.
   Needs no registry credentials, so a consumer can pin the URL directly:
 
   ```json
-  "@nexus-ai-fs/vfs-client": "https://sudowork-runtime-1309794936.cos.ap-beijing.myqcloud.com/nexus-vfs/clients/node/0.1.0/nexus-ai-fs-vfs-client-0.1.0.tgz"
+  "@nexus-ai-fs/vfs-client": "https://sudowork-runtime-1309794936.cos.accelerate.myqcloud.com/nexus-vfs/clients/node/0.1.0/nexus-ai-fs-vfs-client-0.1.0.tgz"
   ```
 
 Both run on a tag and on `workflow_dispatch`.
