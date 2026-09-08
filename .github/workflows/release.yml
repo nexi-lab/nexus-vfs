@@ -400,7 +400,10 @@ jobs:
           # Immutable per-version path consumers pin, plus a moving `latest`
           # for humans checking what the newest build is.
           coscmd upload "$TARBALL" "$BASE/$VERSION/$TARBALL"
-          coscmd upload "$TARBALL" "$BASE/latest/$TARBALL"
+          # Stable name under latest/ as well: a consumer that wants "whatever
+          # is current" (a drift check, a smoke test) needs a URL that does not
+          # move with the version.
+          coscmd upload "$TARBALL" "$BASE/latest/nexus-ai-fs-vfs-client.tgz"
           # Global acceleration: the regional endpoint 404s for consumers outside China.
           URL="https://${COS_BUCKET}.cos.accelerate.myqcloud.com/$BASE/$VERSION/$TARBALL"
           echo "::notice::Node client published: $URL"

@@ -25,8 +25,12 @@ Published two ways by `.github/workflows/release.yml`:
   Needs no registry credentials, so a consumer can pin the URL directly:
 
   ```json
-  "@nexus-ai-fs/vfs-client": "https://sudowork-runtime-1309794936.cos.accelerate.myqcloud.com/nexus-vfs/clients/node/0.1.0/nexus-ai-fs-vfs-client-0.1.0.tgz"
+  "@nexus-ai-fs/vfs-client": "https://sudowork-runtime-1309794936.cos.accelerate.myqcloud.com/nexus-vfs/clients/node/0.2.4/nexus-ai-fs-vfs-client-0.2.4.tgz"
   ```
+
+  Pin a version for a dependency. `.../clients/node/latest/nexus-ai-fs-vfs-client.tgz`
+  is a stable name for whatever is current — for a drift check or a smoke test,
+  not for a lockfile.
 
 Both run on a tag and on `workflow_dispatch`.
 
