@@ -254,6 +254,36 @@ const EC_MAX_ENTRIES_PER_BATCH: usize = 500;
 /// anti-entropy snapshots.
 const EC_WAL_RETENTION: u64 = 10_000;
 
+/// What ended a [`TransportLoop::run`] wait.
+///
+/// Named rather than inlined so the `select!` stays a pure "what happened"
+/// decision and every consequence is handled in one `match` outside the
+/// borrow scope the arms need.
+enum Woken {
+    /// The zone is shutting down.
+    Shutdown,
+    /// A [`RaftMsg`] arrived and was handled by the driver.
+    Message,
+    /// Every handle for this zone is gone; the message channel is closed.
+    MessageChannelClosed,
+    /// Raft's next tick came due.
+    Deadline,
+}
+
+/// Sleep until `deadline`, or forever when there is none.
+///
+/// `None` is the parked case: raft has no timed work and there is no peer, so
+/// the only thing that can matter is an arriving message, which the sibling
+/// `select!` arm covers.  Returning a never-completing future — rather than a
+/// long sleep — is what makes an idle zone cost literally zero wakeups instead
+/// of merely fewer.
+async fn sleep_until_opt(deadline: Option<Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
 /// Per-peer EC replication state.
 struct PeerReplicationState {
     /// Highest sequence number this peer has acknowledged.
@@ -309,8 +339,6 @@ pub struct TransportLoop<S: StateMachine + 'static> {
     peers: SharedPeerMap,
     /// Connection pool for sending messages to peers.
     client_pool: RaftClientPool,
-    /// How often to call advance() (default: 10ms).
-    tick_interval: Duration,
     /// Zone ID for multi-zone message routing.
     zone_id: String,
     /// This node's ID (for EC replication sender identification).
@@ -365,7 +393,6 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
         peers: SharedPeerMap,
         client_pool: RaftClientPool,
     ) -> Self {
-        let tick_interval = driver.config().tick_interval;
         let node_id = driver.config().id;
         let (failure_tx, failure_rx) = mpsc::unbounded_channel();
         let (ec_completion_tx, ec_completion_rx) = mpsc::unbounded_channel();
@@ -373,7 +400,6 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
             driver,
             peers,
             client_pool,
-            tick_interval,
             zone_id: String::new(),
             node_id,
             self_address: String::new(),
@@ -403,17 +429,40 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
         self
     }
 
-    /// Set the tick interval (default: 10ms).
-    pub fn with_tick_interval(mut self, interval: Duration) -> Self {
-        self.tick_interval = interval;
-        self
-    }
-
     /// Run the transport loop until shutdown is signaled.
     ///
     /// Each iteration: drain channel messages → advance raft → send outgoing → EC replicate.
+    ///
+    /// # Waking
+    ///
+    /// The loop is **event-driven with a raft deadline**, not a fixed-rate
+    /// poller.  It wakes on whichever comes first: a message for this zone (a
+    /// proposal, a peer's step, a campaign — every [`RaftMsg`] variant), the
+    /// instant raft next needs a `tick()`, or shutdown.
+    ///
+    /// Two consequences, both intended:
+    ///
+    /// * A write no longer waits out a timer.  Previously a proposal that
+    ///   landed just after a tick sat in the channel for up to
+    ///   `tick_interval` before anyone looked at it; that latency is gone from
+    ///   every zone, busy or idle.  Batching is preserved where it matters:
+    ///   [`ZoneConsensusDriver::process_messages`] still drains the whole
+    ///   queue before `advance`, so proposals that arrive while we are
+    ///   fsyncing coalesce into the next append exactly as group commit
+    ///   intends — the batch size now follows the offered load instead of a
+    ///   fixed window.
+    /// * A zone with nothing to do sleeps with **no timer at all**.  See
+    ///   [`ZoneConsensusDriver::tick_is_noop`] for the raft-rs argument that
+    ///   its ticks are unobservable; combined with an empty peer map (nothing
+    ///   to replicate to, so [`Self::spawn_ec_replications`] has no deadline
+    ///   of its own) the correct wait is "until someone calls", which is what
+    ///   parking expresses.  Idle zone count stops being a CPU variable.
+    ///
+    /// The loop does NOT select on the transport-failure or EC-completion
+    /// channels: both are fed only by sends to peers, and a zone with any peer
+    /// never parks — it keeps the `tick_interval` cadence, which drains those
+    /// channels at least as promptly as before.
     pub async fn run(mut self, mut shutdown: watch::Receiver<bool>) {
-        let mut interval = tokio::time::interval(self.tick_interval);
         tracing::info!(
             "Transport loop started (zone={}, tick_interval={}ms, peers={})",
             if self.zone_id.is_empty() {
@@ -421,19 +470,55 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
             } else {
                 &self.zone_id
             },
-            self.tick_interval.as_millis(),
+            self.driver.config().tick_interval.as_millis(),
             self.peers.read().unwrap().len()
         );
 
+        // Cleared once every `ZoneConsensus` handle for this zone is gone and
+        // the driver's channel closes.  A closed channel resolves instantly and
+        // forever, so its arm must leave the `select!` or the loop spins.
+        let mut msg_channel_open = true;
+
         loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    // Periodic tick — drives heartbeat and election timeouts
+            // Decide how to wait, then wait.  Scoped so the disjoint field
+            // borrows the `select!` needs end before the body takes `&mut self`.
+            let woken_by = {
+                let Self {
+                    driver,
+                    peers,
+                    zone_id,
+                    ..
+                } = &mut self;
+
+                // Park only when nothing can need us on a timer: raft has no
+                // observable tick (`tick_is_noop`), no `Ready` is outstanding,
+                // and there is no peer to replicate to.  Any of those turning
+                // true again arrives as a message (ConfChange, inbound step,
+                // local propose), which wakes us.
+                let park = driver.tick_is_noop()
+                    && !driver.has_ready()
+                    && peers.read().unwrap().is_empty();
+                let deadline = (!park).then(|| driver.next_tick_at());
+                if park {
+                    tracing::trace!(zone = %zone_id, "transport loop parked (no timed work)");
                 }
-                _ = shutdown.changed() => {
+
+                tokio::select! {
+                    biased;
+                    _ = shutdown.changed() => Woken::Shutdown,
+                    still_open = driver.recv_and_handle(), if msg_channel_open => {
+                        if still_open { Woken::Message } else { Woken::MessageChannelClosed }
+                    }
+                    _ = sleep_until_opt(deadline) => Woken::Deadline,
+                }
+            };
+            match woken_by {
+                Woken::Shutdown => {
                     tracing::info!("Transport loop shutting down");
                     break;
                 }
+                Woken::MessageChannelClosed => msg_channel_open = false,
+                Woken::Message | Woken::Deadline => {}
             }
 
             // 0a. Drain any transport send failures reported by previously
@@ -688,15 +773,6 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
             None => return, // No replication log (witness node)
         };
 
-        // Drain unreplicated entries
-        let entries = match repl_log.drain_unreplicated() {
-            Ok(entries) => entries,
-            Err(e) => {
-                tracing::error!("Failed to drain unreplicated entries: {}", e);
-                return;
-            }
-        };
-
         // Get current peer snapshot (read lock, released immediately).
         // Peer-map carries voters AND learners; we replicate to both
         // but quorum sizing must be voter-only (see `voter_ids` below).
@@ -716,6 +792,15 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
         // unilaterally.  Do NOT return early when learner peers exist:
         // they still need EC replication so they can serve reads of
         // already-watermarked metadata.
+        //
+        // The peerless return happens BEFORE the WAL drain below, and that
+        // ordering is load-bearing, not incidental: `drain_unreplicated` is a
+        // redb range scan + a bincode deserialize of every entry still in the
+        // WAL, and a single-voter zone with no peers never compacts (nothing
+        // pins a floor, so the entries stay).  Draining first meant such a zone
+        // re-materialized its whole, monotonically growing WAL on every tick —
+        // 100 times a second, to then throw the result away here.  A zone with
+        // EC traffic (the A2A mailbox plane writes EC) paid that unboundedly.
         if total_voters <= 1 {
             let max_seq = repl_log.max_seq();
             if max_seq > 1 {
@@ -725,6 +810,16 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
                 return;
             }
         }
+
+        // Drain unreplicated entries — only now that we know some peer could
+        // actually receive them.
+        let entries = match repl_log.drain_unreplicated() {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::error!("Failed to drain unreplicated entries: {}", e);
+                return;
+            }
+        };
 
         // Compaction lower bound.  Fetched once — compaction runs only at the
         // end of this pass, so `earliest` is stable throughout, and the
