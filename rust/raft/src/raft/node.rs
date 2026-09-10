@@ -1672,6 +1672,62 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         self.raw_node.raft.state == raft::StateRole::Leader
     }
 
+    /// Whether raft-rs currently has work waiting in a `Ready`.
+    ///
+    /// Cheap `RawNode` state read.  The transport loop consults it before it
+    /// decides to sleep, so a zone that still owes an append / apply / send
+    /// never parks on it.
+    pub fn has_ready(&self) -> bool {
+        self.raw_node.has_ready()
+    }
+
+    /// Whether ticking this zone right now is **provably unobservable**, so the
+    /// transport loop may sleep with no timer at all until real work arrives.
+    ///
+    /// # Why this is safe (raft-rs 0.7 semantics, verified in `raft::Raft`)
+    ///
+    /// `RawNode::tick` dispatches on role:
+    ///
+    /// * `Follower` / `PreCandidate` / `Candidate` → `tick_election`, which
+    ///   drives the election timeout.  A zone in any of these roles has
+    ///   time-based work by definition, so this returns `false` for them and
+    ///   the loop keeps its normal cadence.
+    /// * `Leader` → `tick_heartbeat`, whose ONLY two effects are (a) at
+    ///   `election_timeout`, step `MsgCheckQuorum` **iff `check_quorum` is on**
+    ///   and abort a leader transfer if one is in flight, and (b) at
+    ///   `heartbeat_timeout`, step `MsgBeat`, which `bcast_heartbeat`s to every
+    ///   entry of the `ProgressTracker` **other than self**.
+    ///
+    /// We never enable `check_quorum` (`RaftConfig::to_raft_config` leaves the
+    /// raft-rs default `false`) and never initiate a leader transfer, so (a) is
+    /// inert.  When the tracker holds exactly one progress — this node — (b)
+    /// broadcasts to nobody.  A leader in that configuration therefore produces
+    /// no message, no state change and no `Ready` no matter how many ticks it
+    /// takes, and skipping those ticks changes nothing: raft time is logical
+    /// (counted ticks), not wall-clock, and no timeout in this state can change
+    /// the role.  Linearizable reads do not depend on ticking either — raft-rs
+    /// answers `MsgReadIndex` inline for a singleton (`Raft::step`, the
+    /// `prs().is_singleton()` branch) instead of waiting for a heartbeat round.
+    ///
+    /// The predicate reads the `ProgressTracker` — the same set `bcast_heartbeat`
+    /// iterates — rather than a shadow peer count, so "nobody to talk to" cannot
+    /// drift from raft-rs's own view.  Note it counts learners too: a lone voter
+    /// with a learner attached still has to heartbeat that learner.
+    ///
+    /// This is deliberately the narrowest predicate that covers the case that
+    /// matters (a single-tenant zone nobody is using).  Multi-member zones —
+    /// and any follower — keep exactly their previous tick cadence.
+    pub fn tick_is_noop(&self) -> bool {
+        self.raw_node.raft.state == raft::StateRole::Leader
+            && self.raw_node.raft.prs().iter().len() == 1
+    }
+
+    /// The instant this zone next needs a `tick()`, given the tick pacing in
+    /// [`Self::advance`] (which is the SSOT for when a tick actually fires).
+    pub fn next_tick_at(&self) -> Instant {
+        self.last_tick + self.config.tick_interval
+    }
+
     /// Tell raft-rs that a peer became unreachable.
     ///
     /// Required by raft-rs's driver contract — when the transport
@@ -1709,83 +1765,116 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
     /// entire point of this architecture — no concurrent access.
     pub fn process_messages(&mut self) {
         while let Ok(msg) = self.msg_rx.try_recv() {
-            match msg {
-                RaftMsg::Step { msg } => {
-                    tracing::trace!(
-                        from = msg.from,
-                        to = msg.to,
-                        msg_type = ?msg.get_msg_type(),
-                        "raft.driver.step"
-                    );
-                    if let Err(e) = self.raw_node.step(msg) {
-                        tracing::warn!("raft step error: {}", e);
-                    }
-                }
-                RaftMsg::Propose { data, tx, .. } => {
-                    // Generate the real proposal ID here in the driver
-                    let id = self.proposal_id.fetch_add(1, Ordering::SeqCst);
+            self.handle_msg(msg);
+        }
+    }
 
-                    // Prepend proposal ID to the data
-                    let mut proposal_data = Vec::with_capacity(8 + data.len());
-                    proposal_data.extend_from_slice(&id.to_be_bytes());
-                    proposal_data.extend_from_slice(&data);
+    /// Await the next inbound [`RaftMsg`] and handle it.
+    ///
+    /// The transport loop selects on this so a proposal, a peer's step, or a
+    /// campaign wakes the driver **immediately** instead of waiting out a timer
+    /// tick.  Returns `false` once every [`ZoneConsensus`] handle for this zone
+    /// has been dropped and the channel is closed — the caller must then stop
+    /// selecting on it (a closed channel resolves instantly, forever).
+    ///
+    /// Cancel-safe by construction: the only `.await` is
+    /// [`mpsc::Receiver::recv`], which loses no message when its future is
+    /// dropped, and the handling that follows is synchronous — once `recv`
+    /// resolves, this future runs to completion without another yield point, so
+    /// a `select!` that picks another branch can never drop a received message
+    /// on the floor.
+    pub async fn recv_and_handle(&mut self) -> bool {
+        match self.msg_rx.recv().await {
+            Some(msg) => {
+                self.handle_msg(msg);
+                true
+            }
+            None => false,
+        }
+    }
 
-                    tracing::debug!(proposal_id = id, "raft.driver.propose");
-                    match self.raw_node.propose(vec![], proposal_data) {
-                        Ok(()) => {
-                            // Store pending — tx will be resolved in apply_entries
-                            self.pending.insert(id, PendingProposal { tx });
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(RaftError::Raft(e.to_string())));
-                        }
+    /// Execute one [`RaftMsg`] against `raw_node`.
+    ///
+    /// The single place messages are interpreted — shared by the drain
+    /// ([`Self::process_messages`]) and the await ([`Self::recv_and_handle`]),
+    /// so the two entry points can never drift in what a message means.
+    fn handle_msg(&mut self, msg: RaftMsg) {
+        match msg {
+            RaftMsg::Step { msg } => {
+                tracing::trace!(
+                    from = msg.from,
+                    to = msg.to,
+                    msg_type = ?msg.get_msg_type(),
+                    "raft.driver.step"
+                );
+                if let Err(e) = self.raw_node.step(msg) {
+                    tracing::warn!("raft step error: {}", e);
+                }
+            }
+            RaftMsg::Propose { data, tx, .. } => {
+                // Generate the real proposal ID here in the driver
+                let id = self.proposal_id.fetch_add(1, Ordering::SeqCst);
+
+                // Prepend proposal ID to the data
+                let mut proposal_data = Vec::with_capacity(8 + data.len());
+                proposal_data.extend_from_slice(&id.to_be_bytes());
+                proposal_data.extend_from_slice(&data);
+
+                tracing::debug!(proposal_id = id, "raft.driver.propose");
+                match self.raw_node.propose(vec![], proposal_data) {
+                    Ok(()) => {
+                        // Store pending — tx will be resolved in apply_entries
+                        self.pending.insert(id, PendingProposal { tx });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(RaftError::Raft(e.to_string())));
                     }
                 }
-                RaftMsg::ProposeConfChange { change, tx } => {
-                    let target_node_id = change.node_id;
-                    tracing::debug!(
-                        peer_node_id = target_node_id,
-                        "raft.driver.propose_conf_change"
-                    );
-                    match self.raw_node.propose_conf_change(vec![], change) {
-                        Ok(()) => {
-                            // Store tx — will be resolved in apply_entries when committed
-                            self.pending_conf_changes.insert(target_node_id, tx);
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(RaftError::Raft(e.to_string())));
-                        }
+            }
+            RaftMsg::ProposeConfChange { change, tx } => {
+                let target_node_id = change.node_id;
+                tracing::debug!(
+                    peer_node_id = target_node_id,
+                    "raft.driver.propose_conf_change"
+                );
+                match self.raw_node.propose_conf_change(vec![], change) {
+                    Ok(()) => {
+                        // Store tx — will be resolved in apply_entries when committed
+                        self.pending_conf_changes.insert(target_node_id, tx);
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(RaftError::Raft(e.to_string())));
                     }
                 }
-                RaftMsg::Campaign { tx } => {
-                    tracing::debug!("raft.driver.campaign");
-                    let result = self
-                        .raw_node
-                        .campaign()
-                        .map_err(|e| RaftError::Raft(e.to_string()));
-                    // Sync cached role so handle.is_leader() reflects the
-                    // post-campaign state before the next advance() cycle.
-                    // For single-node: campaign() grants self-vote → Leader.
-                    self.update_cached_status();
-                    let _ = tx.send(result);
-                }
-                RaftMsg::ReadIndex { tx } => {
-                    // Post a ReadIndex request to raft-rs and stash
-                    // the oneshot by request context. The
-                    // `ReadState` will appear in a later `advance()`
-                    // ready, at which point we move it to
-                    // `pending_reads_by_index` (or resolve
-                    // immediately if apply already caught up).
-                    let id = self.read_request_counter;
-                    self.read_request_counter = self.read_request_counter.wrapping_add(1);
-                    let ctx = id.to_be_bytes().to_vec();
-                    tracing::trace!(read_request_id = id, "raft.driver.read_index");
-                    self.raw_node.read_index(ctx);
-                    self.pending_reads_by_ctx.insert(id, tx);
-                }
-                RaftMsg::Membership { tx } => {
-                    let _ = tx.send(read_membership(&self.raw_node));
-                }
+            }
+            RaftMsg::Campaign { tx } => {
+                tracing::debug!("raft.driver.campaign");
+                let result = self
+                    .raw_node
+                    .campaign()
+                    .map_err(|e| RaftError::Raft(e.to_string()));
+                // Sync cached role so handle.is_leader() reflects the
+                // post-campaign state before the next advance() cycle.
+                // For single-node: campaign() grants self-vote → Leader.
+                self.update_cached_status();
+                let _ = tx.send(result);
+            }
+            RaftMsg::ReadIndex { tx } => {
+                // Post a ReadIndex request to raft-rs and stash
+                // the oneshot by request context. The
+                // `ReadState` will appear in a later `advance()`
+                // ready, at which point we move it to
+                // `pending_reads_by_index` (or resolve
+                // immediately if apply already caught up).
+                let id = self.read_request_counter;
+                self.read_request_counter = self.read_request_counter.wrapping_add(1);
+                let ctx = id.to_be_bytes().to_vec();
+                tracing::trace!(read_request_id = id, "raft.driver.read_index");
+                self.raw_node.read_index(ctx);
+                self.pending_reads_by_ctx.insert(id, tx);
+            }
+            RaftMsg::Membership { tx } => {
+                let _ = tx.send(read_membership(&self.raw_node));
             }
         }
     }
@@ -2753,6 +2842,176 @@ mod tests {
             handle.voters(),
             driver.voter_ids(),
             "handle.voters() (cached) must equal driver.voter_ids() (live) after ConfChange apply"
+        );
+    }
+
+    /// `tick_is_noop` gates whether the transport loop may sleep with no timer
+    /// at all, so it has to be exactly right about which raft states have
+    /// time-based work.  Walks the real transitions a tenant zone goes through:
+    /// fresh follower (owes an election) → self-elected lone leader (owes
+    /// nothing) → leader with a learner attached (owes that learner a
+    /// heartbeat) → leader with a second voter (owes heartbeats + quorum).
+    #[tokio::test]
+    async fn tick_is_noop_only_while_a_lone_leader_has_nobody_to_talk_to() {
+        let dir = TempDir::new().unwrap();
+        let storage = RaftStorage::open(dir.path()).unwrap();
+        let store = RedbStore::open(dir.path().join("sm")).unwrap();
+        let state_machine = FullStateMachine::new(&store).unwrap();
+        let config = RaftConfig {
+            id: 1,
+            peers: vec![],
+            ..Default::default()
+        };
+        let (handle, mut driver) =
+            ZoneConsensus::new(config, storage, state_machine, None).unwrap();
+
+        // A fresh zone is a follower: its election timer is real work, and
+        // skipping it would mean the zone never elects itself and never serves.
+        assert!(
+            !driver.tick_is_noop(),
+            "a follower must keep ticking — the election timeout is its only path to leadership"
+        );
+
+        // Drive the self-election the way the transport loop does.
+        for _ in 0..100 {
+            driver.process_messages();
+            driver
+                .advance()
+                .await
+                .expect("advance during self-election");
+            if handle.is_leader() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(handle.is_leader(), "single voter must self-elect");
+        assert!(
+            driver.tick_is_noop(),
+            "a lone leader broadcasts to nobody, so its ticks are unobservable — this is the \
+             state an idle single-tenant zone parks in"
+        );
+
+        // A learner joins: it is not a voter, but the leader still has to
+        // heartbeat it, so ticking is observable again.
+        let mut cc = ConfChange::default();
+        cc.set_change_type(ConfChangeType::AddLearnerNode);
+        cc.node_id = 2;
+        driver
+            .raw_node
+            .propose_conf_change(vec![], cc)
+            .expect("propose AddLearnerNode(2)");
+        let mut applied = false;
+        for _ in 0..50 {
+            driver.process_messages();
+            driver
+                .advance()
+                .await
+                .expect("advance during AddLearnerNode");
+            if !driver.tick_is_noop() {
+                applied = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            applied,
+            "a lone voter with a learner attached must keep ticking — bcast_heartbeat iterates \
+             learners too, so parking would starve the learner of heartbeats"
+        );
+
+        // And with a real second voter, plainly not a no-op.
+        let mut cc = ConfChange::default();
+        cc.set_change_type(ConfChangeType::AddNode);
+        cc.node_id = 3;
+        driver
+            .raw_node
+            .propose_conf_change(vec![], cc)
+            .expect("propose AddNode(3)");
+        for _ in 0..50 {
+            driver.process_messages();
+            driver.advance().await.expect("advance during AddNode");
+            if driver.voter_ids().len() > 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            driver.voter_ids().len() > 1 && !driver.tick_is_noop(),
+            "a multi-voter zone keeps exactly its previous tick cadence"
+        );
+    }
+
+    /// The message path the parked loop depends on: a proposal submitted on the
+    /// handle must be observable through `recv_and_handle`, which is what wakes
+    /// a parked zone.  Also pins its closed-channel signal, without which the
+    /// loop would spin on a dropped zone.
+    #[tokio::test]
+    async fn recv_and_handle_delivers_a_proposal_and_reports_channel_close() {
+        let dir = TempDir::new().unwrap();
+        let storage = RaftStorage::open(dir.path()).unwrap();
+        let store = RedbStore::open(dir.path().join("sm")).unwrap();
+        let state_machine = FullStateMachine::new(&store).unwrap();
+        let config = RaftConfig {
+            id: 1,
+            peers: vec![],
+            ..Default::default()
+        };
+        let (handle, mut driver) =
+            ZoneConsensus::new(config, storage, state_machine, None).unwrap();
+
+        // Elect first: `propose` only enqueues on the leader.
+        for _ in 0..100 {
+            driver.process_messages();
+            driver
+                .advance()
+                .await
+                .expect("advance during self-election");
+            if handle.is_leader() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(handle.is_leader());
+
+        let proposer = handle.clone();
+        let proposal = tokio::spawn(async move {
+            proposer
+                .propose(Command::SetMetadata {
+                    key: "wake".to_string(),
+                    value: b"me".to_vec(),
+                })
+                .await
+        });
+
+        // The await that replaces the timer: it must resolve once the proposal
+        // lands, with no tick in between.
+        tokio::time::timeout(Duration::from_secs(5), driver.recv_and_handle())
+            .await
+            .expect("recv_and_handle must wake on a proposal, not wait for a tick")
+            .then_some(())
+            .expect("channel must still be open while a handle is alive");
+
+        for _ in 0..50 {
+            driver
+                .advance()
+                .await
+                .expect("advance to commit the proposal");
+            if proposal.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        proposal
+            .await
+            .expect("proposal task")
+            .expect("proposal must commit");
+
+        // Every handle gone → the channel closes and the loop must stop
+        // selecting on it (a closed channel resolves instantly, forever).
+        drop(handle);
+        assert!(
+            !driver.recv_and_handle().await,
+            "recv_and_handle must report a closed channel so the loop can drop that arm"
         );
     }
 

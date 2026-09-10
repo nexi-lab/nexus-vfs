@@ -354,10 +354,24 @@ fn parse_earliest(payload: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
+/// How long the retention floor must hold still before the test trusts it.
+/// Trims land through raft behind the seal thread, so "the floor stopped
+/// moving" needs a window wider than one poll, not just two equal samples.
+const FLOOR_SETTLE: Duration = Duration::from_secs(1);
+
 /// Poll a non-blocking read of offset 0 until it becomes Truncated (trimming is
-/// async, behind the background seal), returning the parsed retention floor.
+/// async, behind the background seal), returning the retention floor once it has
+/// SETTLED — held the same value for [`FLOOR_SETTLE`].
+///
+/// The floor only ever advances, and trimming runs behind the appends rather
+/// than with them, so a floor sampled while the trimmer is still catching up
+/// goes stale: every assertion below that reads "at the floor" would then be
+/// reading below it (`offset 16 trimmed; earliest 24`). Waiting for the floor to
+/// hold still is how the test says "retention has caught up with the writes",
+/// which is the state its remaining assertions are actually about.
 async fn await_truncated_earliest(v: &mut Vfs, path: &str) -> u64 {
     let deadline = std::time::Instant::now() + BUDGET;
+    let mut settling: Option<(u64, std::time::Instant)> = None;
     loop {
         let r = v
             .stream_read_at(path, 0, "")
@@ -365,13 +379,23 @@ async fn await_truncated_earliest(v: &mut Vfs, path: &str) -> u64 {
             .expect("stream_read_at rpc");
         if r.is_error {
             if let Some(e) = parse_earliest(&r.error_payload) {
-                return e;
+                match settling {
+                    Some((prev, since)) if prev == e => {
+                        if since.elapsed() >= FLOOR_SETTLE {
+                            return e;
+                        }
+                    }
+                    _ => settling = Some((e, std::time::Instant::now())),
+                }
             }
         }
         if std::time::Instant::now() >= deadline {
             panic!(
-                "offset 0 never became Truncated (last: is_error={}, payload={:?})",
-                r.is_error, r.error_payload
+                "offset 0 never became Truncated at a settled floor (last: is_error={}, \
+                 payload={:?}, last floor seen={:?})",
+                r.is_error,
+                r.error_payload,
+                settling.map(|(e, _)| e),
             );
         }
         tokio::time::sleep(Duration::from_millis(200)).await;

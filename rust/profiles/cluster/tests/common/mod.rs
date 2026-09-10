@@ -219,6 +219,32 @@ impl Daemon {
     pub fn drain(&self) -> String {
         self.log.lock().unwrap().clone()
     }
+
+    /// The daemon's OS process id — for tests that measure the process itself
+    /// (e.g. how much CPU it burns while idle) rather than its wire behaviour.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// CPU seconds (user + system) this daemon has consumed since it started.
+    ///
+    /// Read from `/proc/<pid>/stat` fields 14/15, which are in clock ticks;
+    /// `sysconf(_SC_CLK_TCK)` is 100 on every Linux target we build for, and a
+    /// wrong constant would only scale the ratio a test compares against its
+    /// own budget.  Linux-only: it backs the idle-cost gate, which runs on the
+    /// Linux CI (and in the Docker bench) where the daemon actually ships.
+    #[cfg(target_os = "linux")]
+    pub fn cpu_seconds(&self) -> f64 {
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", self.pid()))
+            .expect("read /proc/<pid>/stat");
+        // The comm field can contain spaces and parens; everything after the
+        // final ')' is fixed-width, so index from there.
+        let tail = &stat[stat.rfind(')').expect("stat comm field") + 2..];
+        let fields: Vec<&str> = tail.split_whitespace().collect();
+        let utime: u64 = fields[11].parse().expect("utime");
+        let stime: u64 = fields[12].parse().expect("stime");
+        (utime + stime) as f64 / 100.0
+    }
 }
 
 impl Drop for Daemon {
