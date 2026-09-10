@@ -13,7 +13,8 @@ use std::sync::Arc;
 #[allow(unused_imports)]
 use crate::raft::StateMachine;
 use crate::raft::{
-    Command, CommandResult, FullStateMachine, RaftError, Result, ZoneConsensus, ZoneRaftRegistry,
+    Command, CommandResult, FullStateMachine, RaftError, Result, ZoneConsensus, ZoneLoadPolicy,
+    ZoneRaftRegistry,
 };
 use crate::transport::{
     call_delete_zone, call_join_cluster, hostname_to_node_id, NodeAddress, RaftGrpcServer,
@@ -225,30 +226,12 @@ pub struct ZoneManager {
     pending_mounts: parking_lot::Mutex<BTreeMap<String, String>>,
 }
 
-/// Which persisted zones a [`ZoneManager`] rehydrates from disk at construction.
-///
-/// The daemon uses [`ZoneLoadPolicy::All`] — every node must resume every zone
-/// it is a member of. Offline tooling (e.g. `nexusd-cluster auth mint`, which
-/// only needs the SOLO `root` zone's credential store) uses
-/// [`ZoneLoadPolicy::Only`]: loading a FEDERATED zone offline would spin up its
-/// raft group as a lone node with no reachable peers, which then campaigns and
-/// mutates that zone's persisted `HardState` (term/vote) — corrupting a zone
-/// the offline process has no business driving, so the real daemon resumes
-/// diverged. Loading only `root` keeps offline tooling out of federated raft.
-#[derive(Debug, Clone)]
-pub enum ZoneLoadPolicy {
-    /// Rehydrate every persisted zone found on disk (daemon boot).
-    All,
-    /// Rehydrate only these zone ids if present on disk; skip all others.
-    Only(Vec<String>),
-}
-
 impl ZoneManager {
     /// Create a new `ZoneManager`.
     ///
-    /// Starts a tokio runtime + gRPC server. Enumerates + reopens every
-    /// previously-persisted zone from disk before the gRPC server
-    /// accepts traffic (R15.e).
+    /// Starts a tokio runtime + gRPC server. Indexes every previously-persisted
+    /// zone from disk before the gRPC server accepts traffic (R15.e), and
+    /// materializes each on first access.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         hostname: &str,
@@ -299,7 +282,8 @@ impl ZoneManager {
         self_address: Option<String>,
         extra_grpc_services: Option<tonic::service::Routes>,
     ) -> Result<Arc<Self>> {
-        // Default: resume every persisted zone (the daemon contract).
+        // Default: the daemon contract — every hosted zone is reachable, and
+        // becomes resident when something asks for it.
         Self::with_node_id_opts(
             hostname,
             node_id,
@@ -309,13 +293,14 @@ impl ZoneManager {
             tls,
             self_address,
             extra_grpc_services,
-            ZoneLoadPolicy::All,
+            ZoneLoadPolicy::OnDemand,
         )
     }
 
     /// [`Self::with_node_id`] plus an explicit [`ZoneLoadPolicy`] — lets offline
-    /// tooling rehydrate only the zones it needs (e.g. `Only(["root"])`) instead
-    /// of spinning up federated zones as lone nodes. See [`ZoneLoadPolicy`].
+    /// tooling open only the zones it needs (e.g. `Only(["root"])`) and be
+    /// structurally unable to reach any other, instead of spinning up federated
+    /// zones as lone nodes. See [`ZoneLoadPolicy`].
     #[allow(clippy::too_many_arguments)]
     pub fn with_node_id_opts(
         hostname: &str,
@@ -421,36 +406,42 @@ impl ZoneManager {
                     .map_err(|e| RaftError::Config(format!("Invalid peer '{}': {}", s, e)))
             })
             .collect::<Result<Vec<_>>>()?;
-        // Disk → in-memory zone re-hydration is sync now (no campaign,
-        // no nested runtime). Calling it directly avoids the
-        // `Handle::block_on` panic that hit `nexusd-cluster`'s
-        // `#[tokio::main]` async path — the worker thread driving
-        // `ZoneManager::new` would otherwise be parked on the inner
-        // runtime's block_on, which tokio rejects to prevent deadlock.
+        // Index what this node hosts BEFORE the gRPC server accepts traffic,
+        // so an arriving vote / append / VFS call can never be told "no such
+        // zone" about a zone that is sitting right there on disk. Opening it
+        // is a separate question, answered on first access — see
+        // `ZoneRaftRegistry::index_persisted_zones`. Boot therefore costs one
+        // readdir instead of one raft-group opening per persisted zone, which
+        // is what decouples restart time from zones-accumulated-over-a-year.
         //
-        // The load policy scopes WHICH zones rehydrate: `All` for the daemon;
-        // `Only([root])` for offline tooling that must not open — and so must
-        // not let campaign, mutating persisted term/vote — a federated zone it
-        // has no peers for. See `ZoneLoadPolicy`.
-        match &load_policy {
-            ZoneLoadPolicy::All => {
-                registry
-                    .open_existing_zones_from_disk(peer_addrs.clone(), runtime.handle())
-                    .map_err(|e| {
-                        RaftError::Raft(format!("Failed to enumerate zones on startup: {}", e))
-                    })?;
-            }
-            ZoneLoadPolicy::Only(zone_ids) => {
-                registry
-                    .open_persisted_zones_filtered(zone_ids, peer_addrs.clone(), runtime.handle())
-                    .map_err(|e| {
-                        RaftError::Raft(format!(
-                            "Failed to open zones {:?} on startup: {}",
-                            zone_ids, e
-                        ))
-                    })?;
-            }
-        }
+        // Sync (no campaign, no nested runtime): calling it directly avoids the
+        // `Handle::block_on` panic that hit `nexusd-cluster`'s `#[tokio::main]`
+        // async path — the worker thread driving `ZoneManager::new` would
+        // otherwise be parked on the inner runtime's block_on, which tokio
+        // rejects to prevent deadlock.
+        registry
+            .index_persisted_zones()
+            .map_err(|e| RaftError::Raft(format!("Failed to enumerate zones on startup: {}", e)))?;
+        registry.arm_materialization(
+            peer_addrs.clone(),
+            runtime.handle().clone(),
+            load_policy.clone(),
+        );
+        // The zones that must be resident before anything can be served at
+        // all: `root`, whose DT_MOUNT entries define the namespace, and — for
+        // offline tooling — exactly the zone it was told to touch.
+        let eager: Vec<String> = match &load_policy {
+            ZoneLoadPolicy::OnDemand => vec![contracts::ROOT_ZONE_ID.to_string()],
+            ZoneLoadPolicy::Only(zone_ids) => zone_ids.clone(),
+        };
+        registry
+            .materialize_now(&eager, peer_addrs.clone(), runtime.handle())
+            .map_err(|e| {
+                RaftError::Raft(format!(
+                    "Failed to open zones {:?} on startup: {}",
+                    eager, e
+                ))
+            })?;
 
         let blob_fetcher_slot = crate::blob_fetcher::new_blob_fetcher_slot();
         let agent_minter_slot = crate::agent_minter::new_agent_minter_slot();

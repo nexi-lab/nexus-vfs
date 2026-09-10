@@ -101,9 +101,9 @@ pub mod foreign_ca_registrar;
 pub use zone_handle::{Consistency, ZoneHandle};
 
 #[cfg(all(feature = "grpc", has_protos))]
-pub use zone_manager::{
-    join_cluster_and_provision_tls, ClusterStatus, TlsFiles, ZoneLoadPolicy, ZoneManager,
-};
+pub use raft::ZoneLoadPolicy;
+#[cfg(all(feature = "grpc", has_protos))]
+pub use zone_manager::{join_cluster_and_provision_tls, ClusterStatus, TlsFiles, ZoneManager};
 
 /// gRPC transport layer (requires `grpc` feature).
 ///

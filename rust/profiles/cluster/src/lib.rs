@@ -1659,7 +1659,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         cli_peer_addrs,
         identity_persisted_peers,
         identity_zones,
-    } = open_zone_manager(&common, Some(vfs_routes), ZoneLoadPolicy::All)?;
+    } = open_zone_manager(&common, Some(vfs_routes), ZoneLoadPolicy::OnDemand)?;
 
     // Fill the VFS service's verifier slot now that the ZoneManager (and its
     // eagerly-built verifier) exists. Auth-on ⇒ the VFS request path classifies
@@ -2653,7 +2653,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     //      so the DT_MOUNT entry lands in root's metastore (non-
     //      federated, never replicated) instead of the operator-
     //      specified target zone's state machine, and peers joining
-    //      later see `count=1` from `replay_existing_mounts` — only
+    //      later see `count=1` from `replay_mounts_for_zone` — only
     //      the `/shared` mount itself, not the nested driver mount
     //      operators installed under it.  The single sync drain
     //      collapses the race deterministically.
@@ -2912,7 +2912,7 @@ async fn run_share(
 ) -> Result<()> {
     let ZoneManagerBundle {
         zm, cli_peer_addrs, ..
-    } = open_zone_manager(&common, None, ZoneLoadPolicy::All)?;
+    } = open_zone_manager(&common, None, ZoneLoadPolicy::OnDemand)?;
     let peers_str: Vec<String> = cli_peer_addrs
         .iter()
         .map(NodeAddress::to_raft_peer_str)
@@ -3196,7 +3196,7 @@ async fn run_join(
         node_id,
         self_address,
         ..
-    } = open_zone_manager(&common, None, ZoneLoadPolicy::All)?;
+    } = open_zone_manager(&common, None, ZoneLoadPolicy::OnDemand)?;
 
     // Pre-#3996 (and pre-this commit) ``run_join`` only invoked
     // ``zm.join_zone(remote_zone_id, peers, false)`` — that registers
