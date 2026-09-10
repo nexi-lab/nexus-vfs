@@ -130,4 +130,16 @@ async fn restart_does_not_open_every_persisted_zone_yet_serves_all_of_them() {
         vfs.read_file(&second, "").await.expect("read back"),
         b"still writable",
     );
+
+    // The count above was a snapshot taken the moment the port opened; a sweep
+    // that ran a beat later would have slipped past it. Re-count after the
+    // traffic, with a settle, so the assertion is about the steady state:
+    // resident zones are the ones someone actually asked for.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let registered_after_traffic = d.drain().matches("' registered").count();
+    assert!(
+        registered_after_traffic <= registered_at_boot + 1,
+        "after serving one zone's traffic, {registered_after_traffic} zones are open (boot \
+         opened {registered_at_boot}) — only the zone that was touched should have been added"
+    );
 }
