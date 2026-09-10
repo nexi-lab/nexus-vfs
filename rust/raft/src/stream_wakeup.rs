@@ -92,22 +92,28 @@ pub fn install_stream_wakeup_observer(
     consensus: &ZoneConsensus<FullStateMachine>,
     kernel: Weak<Kernel>,
 ) {
-    consensus.register_apply_observer(Arc::new(move |entry: &AppliedEntry| {
-        if let Command::AppendStreamEntry { stream_prefix, .. } = &entry.command {
-            if let Some(path) = watch_path_from_wal_stream_key(stream_prefix) {
-                if let Some(kernel) = kernel.upgrade() {
-                    // Wake BOTH cross-machine wait primitives parked on this
-                    // path. The A2A mailbox tail (`stream_read_at_blocking`,
-                    // used by hydra `watch` and every DT_STREAM follower) parks
-                    // on the StreamManager per-path condvar — the PRIMARY
-                    // primitive, and the one a replica apply otherwise never
-                    // signals. A `sys_watch` file-watcher on the same path
-                    // parks on the `FileWatchRegistry` instead; wake it too so
-                    // an inotify-style watcher on the mailbox path also fires.
-                    kernel.wake_stream_waiters(path);
-                    kernel.wake_file_watch(path);
+    // Keyed: arming is now driven by zone materialization, which can also
+    // re-fire for a zone that boot already armed, and an accumulating observer
+    // would notify the same waiter once per install.
+    consensus.register_keyed_apply_observer(
+        "a2a_stream_wakeup",
+        Arc::new(move |entry: &AppliedEntry| {
+            if let Command::AppendStreamEntry { stream_prefix, .. } = &entry.command {
+                if let Some(path) = watch_path_from_wal_stream_key(stream_prefix) {
+                    if let Some(kernel) = kernel.upgrade() {
+                        // Wake BOTH cross-machine wait primitives parked on this
+                        // path. The A2A mailbox tail (`stream_read_at_blocking`,
+                        // used by hydra `watch` and every DT_STREAM follower) parks
+                        // on the StreamManager per-path condvar — the PRIMARY
+                        // primitive, and the one a replica apply otherwise never
+                        // signals. A `sys_watch` file-watcher on the same path
+                        // parks on the `FileWatchRegistry` instead; wake it too so
+                        // an inotify-style watcher on the mailbox path also fires.
+                        kernel.wake_stream_waiters(path);
+                        kernel.wake_file_watch(path);
+                    }
                 }
             }
-        }
-    }));
+        }),
+    );
 }

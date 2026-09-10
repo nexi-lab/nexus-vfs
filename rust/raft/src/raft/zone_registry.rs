@@ -90,6 +90,55 @@ enum ZoneOp {
 
 const AUTO_JOIN_REMOVAL_SUPPRESSION: Duration = Duration::from_secs(60);
 
+/// How long resuming a persisted zone waits for its state machine to apply
+/// what its log already says is committed.
+///
+/// Opening a zone from disk is not the same as the zone being READY: raft-rs
+/// re-emits the committed-but-unapplied tail on the first ready, and until the
+/// state machine has chewed through it, reads see a partial zone. Boot used to
+/// hide this — every zone opened long before any request arrived — but a zone
+/// that materializes ON a request has no such grace, and would answer that
+/// very request out of an empty state machine.
+///
+/// The wait is local work (replaying this node's own log), so it is short in
+/// practice; the cap exists so a wedged apply loop surfaces as a warning
+/// rather than an unbounded hang on the caller's thread.
+const RESUME_CATCHUP_BUDGET: Duration = Duration::from_secs(10);
+
+/// Block until `consensus` has applied everything its log says is committed,
+/// or `timeout` expires (warning loudly if so).
+///
+/// Shared by zone resume and by federation mount replay: both need the same
+/// "this zone's state machine is caught up with its own log" guarantee before
+/// they read it, and neither can get it from `applied_index` alone at a single
+/// instant.
+pub(crate) fn wait_until_caught_up(
+    consensus: &ZoneConsensus<FullStateMachine>,
+    zone_id: &str,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let commit = consensus.commit_index();
+        let applied = consensus.applied_index();
+        if applied >= commit {
+            return;
+        }
+        if Instant::now() >= deadline {
+            tracing::warn!(
+                zone = %zone_id,
+                commit_index = commit,
+                applied_index = applied,
+                "zone did not catch up with its own log within {timeout:?}; reads may \
+                 observe partial state. Investigate the driver loop / state-machine \
+                 apply backpressure for this zone."
+            );
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// Which hosted zones this process is allowed to materialize.
 ///
 /// The daemon uses [`ZoneLoadPolicy::OnDemand`]: any zone on disk becomes
@@ -220,20 +269,26 @@ pub struct ZoneRaftRegistry {
     /// Fired once per zone, right after its runtime is published.
     ///
     /// The hook exists because "a zone became resident" is now an event that
-    /// happens at any time, not a boot-time list to walk: whatever has to be
-    /// wired per zone (the coordinator's DT_MOUNT apply observer and mount
-    /// replay) rides the zone's own lifecycle instead of a sweep over all of
-    /// them. Set once, by the layer that owns that wiring.
-    on_materialized: RwLock<Option<ZoneMaterializedCb>>,
+    /// happens at any time, not a boot-time list to walk: everything that has
+    /// to be wired per zone — the coordinator's DT_MOUNT apply observer and
+    /// mount replay, the A2A stream-wakeup and retention-GC observers — rides
+    /// the zone's own lifecycle instead of a sweep over all of them. That also
+    /// closes a gap the sweep had: a zone that arrived AFTER boot (joined at
+    /// runtime, or reached for the first time) was never wired at all.
+    ///
+    /// A list, because those subscribers live in different layers and each
+    /// owns its own wiring.
+    on_materialized: RwLock<Vec<ZoneMaterializedCb>>,
 }
 
 /// Callback fired when a zone's runtime becomes resident — see
-/// [`ZoneRaftRegistry::set_on_materialized`].
+/// [`ZoneRaftRegistry::add_on_materialized`].
 ///
-/// Invoked AFTER the zone is published, so a callback that looks the zone up
-/// (the common case: it needs the consensus handle) hits the fast path instead
-/// of recursing into materialization.
-pub type ZoneMaterializedCb = Arc<dyn Fn(&str) + Send + Sync + 'static>;
+/// Receives the zone id and the freshly-published handle, so a subscriber
+/// never has to look the zone back up (which, mid-materialization, would be
+/// the one lookup that could recurse).
+pub type ZoneMaterializedCb =
+    Arc<dyn Fn(&str, &ZoneConsensus<FullStateMachine>) + Send + Sync + 'static>;
 
 impl ZoneRaftRegistry {
     /// Create a new empty registry.
@@ -253,7 +308,7 @@ impl ZoneRaftRegistry {
             creating: DashMap::new(),
             recently_removed: DashMap::new(),
             materialization: RwLock::new(None),
-            on_materialized: RwLock::new(None),
+            on_materialized: RwLock::new(Vec::new()),
         }
     }
 
@@ -270,7 +325,7 @@ impl ZoneRaftRegistry {
             creating: DashMap::new(),
             recently_removed: DashMap::new(),
             materialization: RwLock::new(None),
-            on_materialized: RwLock::new(None),
+            on_materialized: RwLock::new(Vec::new()),
         }
     }
 
@@ -331,9 +386,14 @@ impl ZoneRaftRegistry {
         });
     }
 
-    /// Install the per-zone wiring hook — see [`ZoneMaterializedCb`].
-    pub fn set_on_materialized(&self, cb: ZoneMaterializedCb) {
-        *self.on_materialized.write().unwrap() = Some(cb);
+    /// Subscribe to per-zone materialization — see [`ZoneMaterializedCb`].
+    ///
+    /// Subscribers must be idempotent per zone: boot arms what is already
+    /// resident and then subscribes, so a zone can legitimately be wired
+    /// twice. (Both in-tree subscribers register KEYED apply observers, which
+    /// replace rather than accumulate.)
+    pub fn add_on_materialized(&self, cb: ZoneMaterializedCb) {
+        self.on_materialized.write().unwrap().push(cb);
     }
 
     /// Get this node's advertise address (empty when unset).
@@ -477,7 +537,9 @@ impl ZoneRaftRegistry {
         };
         // Restart preserves the persisted role intent (SSOT) — don't re-guess.
         let intended_role = self.persisted_intent(zone_id);
-        self.setup_zone(zone_id, config, peers, runtime_handle, intended_role)
+        let node = self.setup_zone(zone_id, config, peers, runtime_handle, intended_role)?;
+        wait_until_caught_up(&node, zone_id, RESUME_CATCHUP_BUDGET);
+        Ok(node)
     }
 
     /// The DURABLE role intent persisted for `zone_id` in `identity.json`,
@@ -954,10 +1016,12 @@ impl ZoneRaftRegistry {
         self.hosted.insert(zone_id.to_string());
 
         // Per-zone wiring rides the zone's own lifecycle. Fired after the
-        // insert above so a hook that looks the zone up hits the fast path.
-        let hook = self.on_materialized.read().unwrap().clone();
-        if let Some(cb) = hook {
-            cb(zone_id);
+        // insert above, and with the lock released, because a subscriber can
+        // legitimately reach back into the registry (wiring a mount can
+        // materialize its target zone).
+        let hooks: Vec<ZoneMaterializedCb> = self.on_materialized.read().unwrap().clone();
+        for cb in hooks {
+            cb(zone_id, &handle);
         }
 
         Ok(handle)
@@ -1241,6 +1305,16 @@ impl ZoneRaftRegistry {
     /// shutdown and diagnostics only.
     pub fn resident_zones(&self) -> Vec<String> {
         self.zones.iter().map(|e| e.key().clone()).collect()
+    }
+
+    /// Does this node host `zone_id`? Answers from the catalog WITHOUT
+    /// materializing it.
+    ///
+    /// For callers whose question is existence rather than access — "is there
+    /// anything to found here?" — which must not drag a zone into residency
+    /// just to learn that it is already there.
+    pub fn hosts(&self, zone_id: &str) -> bool {
+        self.hosted.contains(zone_id)
     }
 
     /// Shutdown all zones.

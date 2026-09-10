@@ -630,9 +630,14 @@ impl ZoneManager {
         self.registry.clone()
     }
 
-    /// List all zone IDs loaded on this node.
+    /// Every zone this node hosts, materialized or not.
     pub fn list_zones(&self) -> Vec<String> {
         self.registry.list_zones()
+    }
+
+    /// Does this node host `zone_id`? Catalog-only — never materializes.
+    pub fn hosts_zone(&self, zone_id: &str) -> bool {
+        self.registry.hosts(zone_id)
     }
 
     /// Create a new zone (raft group) on this node.
@@ -765,8 +770,14 @@ impl ZoneManager {
         mounts: &BTreeMap<String, String>,
     ) -> Result<()> {
         for zone_id in zones {
-            if self.get_zone(zone_id).is_some() {
-                tracing::debug!("Zone '{}' already exists, skipping", zone_id);
+            // Founding asks about EXISTENCE, not residency. A zone this node
+            // already hosts needs nothing done to it, and materializing every
+            // declared zone just to discover that would put the whole declared
+            // topology back on the boot path — which is exactly the cost
+            // on-demand materialization removes. A restart re-runs this with
+            // the same `--cluster-init` list, so it is the hot case.
+            if self.hosts_zone(zone_id) {
+                tracing::debug!("Zone '{}' already hosted, skipping", zone_id);
                 continue;
             }
             self.create_zone(zone_id, peers.clone())?;

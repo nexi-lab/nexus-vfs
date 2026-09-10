@@ -65,30 +65,35 @@ pub fn install_stream_trim_gc_observer(
     kernel: Weak<Kernel>,
     runtime: tokio::runtime::Handle,
 ) {
-    consensus.register_apply_observer(Arc::new(move |entry: &AppliedEntry| {
-        let Command::TrimStreamSegment {
-            stream_prefix,
-            trimmed,
-            ..
-        } = &entry.command
-        else {
-            return;
-        };
-        let Some(path) = watch_path_from_wal_stream_key(stream_prefix) else {
-            return;
-        };
-        let Some(kernel) = kernel.upgrade() else {
-            return;
-        };
-        // Blob deletion is disk I/O — offload it so the apply thread (which
-        // drives this observer synchronously) never blocks on a filesystem
-        // unlink. A brief lag between the index trim and the blob reclaim is
-        // fine: the index no longer references the blob, so a reader can never
-        // reach it — this only reclaims the space.
-        let path = path.to_string();
-        let trimmed = trimmed.clone();
-        runtime.spawn_blocking(move || {
-            kernel.gc_trimmed_cold_segments(&path, &trimmed);
-        });
-    }));
+    // Keyed for the same reason as the stream-wakeup sibling: one observer
+    // per zone no matter how many times arming runs.
+    consensus.register_keyed_apply_observer(
+        "dt_stream_retention_gc",
+        Arc::new(move |entry: &AppliedEntry| {
+            let Command::TrimStreamSegment {
+                stream_prefix,
+                trimmed,
+                ..
+            } = &entry.command
+            else {
+                return;
+            };
+            let Some(path) = watch_path_from_wal_stream_key(stream_prefix) else {
+                return;
+            };
+            let Some(kernel) = kernel.upgrade() else {
+                return;
+            };
+            // Blob deletion is disk I/O — offload it so the apply thread (which
+            // drives this observer synchronously) never blocks on a filesystem
+            // unlink. A brief lag between the index trim and the blob reclaim is
+            // fine: the index no longer references the blob, so a reader can never
+            // reach it — this only reclaims the space.
+            let path = path.to_string();
+            let trimmed = trimmed.clone();
+            runtime.spawn_blocking(move || {
+                kernel.gc_trimmed_cold_segments(&path, &trimmed);
+            });
+        }),
+    );
 }

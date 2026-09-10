@@ -74,6 +74,7 @@ pub use storage::RaftStorage;
 pub use zone_persistence::ZonePersistence;
 #[cfg(all(feature = "grpc", has_protos))]
 pub(crate) use zone_registry::reconcile_peers_with_conf_state;
+pub(crate) use zone_registry::wait_until_caught_up;
 #[cfg(all(feature = "grpc", has_protos))]
 pub use zone_registry::{ZoneLoadPolicy, ZoneMaterializedCb, ZoneRaftRegistry};
 

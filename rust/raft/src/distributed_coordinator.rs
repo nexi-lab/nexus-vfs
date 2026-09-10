@@ -208,8 +208,8 @@ impl RaftDistributedCoordinator {
         {
             let me = Arc::downgrade(self);
             let kernel_weak = Arc::downgrade(kernel);
-            zm.registry()
-                .set_on_materialized(Arc::new(move |zone_id: &str| {
+            zm.registry().add_on_materialized(Arc::new(
+                move |zone_id: &str, _consensus: &ZoneConsensus<FullStateMachine>| {
                     // Weak both ways: production holds kernel → coordinator →
                     // zone manager → registry → this closure, so an Arc here
                     // would be a cycle that leaks both for the process's life.
@@ -217,7 +217,8 @@ impl RaftDistributedCoordinator {
                         return;
                     };
                     me.install_apply_cb_for_zone(&kernel, zone_id);
-                }));
+                },
+            ));
         }
         for zone_id in zm.registry().resident_zones() {
             self.install_apply_cb_for_zone(kernel, &zone_id);
@@ -352,7 +353,7 @@ impl RaftDistributedCoordinator {
         // and the mount stays unwired until an operator notices. Wait for
         // `applied_index >= commit_index` first; capped so a genuinely stuck
         // zone warns instead of blocking.
-        wait_for_state_machine_caught_up(consensus, zone_id, std::time::Duration::from_secs(10));
+        crate::raft::wait_until_caught_up(consensus, zone_id, std::time::Duration::from_secs(10));
         let entries = consensus.iter_dt_mount_entries(runtime).unwrap_or_default();
         if !entries.is_empty() {
             let mut deferred = self.deferred_mounts.lock();
@@ -931,56 +932,6 @@ pub fn check_zone_resumable_from_indices(last_log_index: u64) -> Result<(), Stri
         );
     }
     Ok(())
-}
-
-/// Block until the zone's state machine has applied every entry the
-/// storage marked committed (i.e. `applied_index >= commit_index`), or
-/// the timeout elapses.
-///
-/// SSOT precondition for sync readers of the state machine.  At boot,
-/// the driver loop is asynchronously replaying restored log entries
-/// into the state machine; any reader that takes `try_read` on the
-/// state-machine RwLock during that window loses to the driver's
-/// write lock and silently observes a partial state (the empty Vec
-/// from `ZoneConsensus::iter_dt_mount_entries`).  `replay_mounts_for_zone`
-/// is the canonical victim — it scans every zone's DT_MOUNT set once at
-/// boot, with no retry above it, and a partial read leaves cross-zone
-/// routing missing for the rest of the daemon's life.
-///
-/// Polling intentional: `applied_index` is the state machine's own
-/// `last_applied` atomic, `commit_index` reads `cached_commit_index`
-/// seeded from `RawNode::raft_log.committed` at construction (#40), so
-/// both reflect durable storage truth from t=0 and the loop converges
-/// the moment the driver finishes its catchup pass.  Timeout-then-warn
-/// instead of timeout-then-error: a genuinely stuck zone shouldn't
-/// block boot entirely — the partial-replay symptom is less bad than a
-/// daemon that refuses to come up.
-fn wait_for_state_machine_caught_up(
-    consensus: &crate::raft::ZoneConsensus<crate::raft::FullStateMachine>,
-    zone_id: &str,
-    timeout: Duration,
-) {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        let commit = consensus.commit_index();
-        let applied = consensus.applied_index();
-        if applied >= commit {
-            return;
-        }
-        if std::time::Instant::now() >= deadline {
-            tracing::warn!(
-                zone = %zone_id,
-                commit_index = commit,
-                applied_index = applied,
-                "replay_mounts_for_zone: state machine did not catch up within \
-                 {timeout:?}; DT_MOUNT scan may observe partial state and leave \
-                 cross-zone routes unwired.  Investigate driver loop / state \
-                 machine apply backpressure for this zone."
-            );
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
 }
 
 fn wait_for_join_to_apply(zh: &ZoneHandle, zone_id: &str, timeout: Duration) -> Result<(), String> {
