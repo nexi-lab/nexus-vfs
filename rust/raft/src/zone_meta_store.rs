@@ -77,10 +77,9 @@ use kernel::meta_store::{
 /// ``VFSRouter::mount_points_for_coherence_key`` fans out apply-side
 /// dcache invalidation across all surfaces of the zone.
 pub struct ZoneMetaStore {
-    node: ZoneConsensus<FullStateMachine>,
+    binding: ZoneBinding,
     runtime: tokio::runtime::Handle,
     mount_point: String,
-    coherence_id: usize,
     /// Internal cache projection — same shape as `LocalMetaStore` /
     /// `RemoteMetaStore`.  Each zone metastore caches its own hot
     /// entries (keyed by the caller-facing GLOBAL path, mirroring the
@@ -100,6 +99,56 @@ pub struct ZoneMetaStore {
     cache: Arc<dashmap::DashMap<String, KernelFileMetadata>>,
 }
 
+/// Register the apply-side cache invalidator for one zone metastore.
+///
+/// Only `SetMetadata` / `CasSetMetadata` / `DeleteMetadata` mutate a cached
+/// row, so the observer matches exactly those. The zone-relative key is
+/// translated back to the caller-facing global path (the form this metastore
+/// caches under) before evicting. Capturing `Arc` clones keeps the observer
+/// self-contained — no back-reference to the `ZoneMetaStore`.
+///
+/// Called at construction for an already-bound zone, and at resolve time for a
+/// deferred one, so both bindings get the same coherence guarantee.
+fn register_cache_invalidator(
+    node: &ZoneConsensus<FullStateMachine>,
+    cache: &Arc<dashmap::DashMap<String, KernelFileMetadata>>,
+    mount_point: &str,
+) {
+    let cache_for_cb = Arc::clone(cache);
+    let mount_point_for_cb = mount_point.to_string();
+    node.register_apply_observer(Arc::new(move |entry: &AppliedEntry| {
+        let zone_key = match entry.command {
+            Command::SetMetadata { key, .. }
+            | Command::CasSetMetadata { key, .. }
+            | Command::DeleteMetadata { key } => key.as_str(),
+            _ => return,
+        };
+        let global = zone_key_to_global(&mount_point_for_cb, zone_key);
+        cache_for_cb.remove(&global);
+    }));
+}
+
+/// How a [`ZoneMetaStore`] reaches its zone's consensus handle.
+///
+/// A federation mount is a ROUTE; a route does not need the target zone's
+/// runtime until traffic actually flows through it.  Binding eagerly would
+/// materialize every mounted zone the moment its mount is wired — with one
+/// zone per tenant, that is every tenant on every boot — so a mount installed
+/// from a DT_MOUNT entry binds `Deferred` and resolves on its first operation.
+/// Callers that already hold a handle (the credential store, the root zone)
+/// bind `Ready` and never take the resolve path.
+enum ZoneBinding {
+    /// Already materialized.
+    Ready(ZoneConsensus<FullStateMachine>),
+    /// Resolve through the registry on first use — which materializes the
+    /// zone if this is its first access since boot.
+    Deferred {
+        registry: Arc<crate::raft::ZoneRaftRegistry>,
+        zone_id: String,
+        resolved: std::sync::OnceLock<ZoneConsensus<FullStateMachine>>,
+    },
+}
+
 impl ZoneMetaStore {
     /// Construct from a running ``ZoneConsensus`` + its tokio runtime
     /// + the VFS mount point this zone surfaces under.
@@ -117,7 +166,6 @@ impl ZoneMetaStore {
         runtime: tokio::runtime::Handle,
         mount_point: String,
     ) -> Self {
-        let coherence_id = node.coherence_id();
         let cache: Arc<dashmap::DashMap<String, KernelFileMetadata>> =
             Arc::new(dashmap::DashMap::new());
         // Self-register an apply-side observer. Only SetMetadata /
@@ -129,26 +177,75 @@ impl ZoneMetaStore {
         // form this metastore caches under) before evicting. Capturing
         // ``Arc`` clones keeps the observer self-contained — no
         // back-reference to ZoneMetaStore.
-        {
-            let cache_for_cb = Arc::clone(&cache);
-            let mount_point_for_cb = mount_point.clone();
-            node.register_apply_observer(Arc::new(move |entry: &AppliedEntry| {
-                let zone_key = match entry.command {
-                    Command::SetMetadata { key, .. }
-                    | Command::CasSetMetadata { key, .. }
-                    | Command::DeleteMetadata { key } => key.as_str(),
-                    _ => return,
-                };
-                let global = zone_key_to_global(&mount_point_for_cb, zone_key);
-                cache_for_cb.remove(&global);
-            }));
-        }
+        register_cache_invalidator(&node, &cache, &mount_point);
         Self {
-            node,
+            binding: ZoneBinding::Ready(node),
             runtime,
             mount_point,
-            coherence_id,
             cache,
+        }
+    }
+
+    /// Like [`Self::new_arc`], but bound to a zone id instead of a live
+    /// handle: the zone is looked up — and materialized, if this is its first
+    /// access since boot — on the first operation that actually needs it.
+    ///
+    /// This is what federation-mount wiring installs. Wiring a mount is
+    /// cheap and happens for every DT_MOUNT entry a zone holds; paying a raft
+    /// group's open cost per wired mount would put every mounted zone back on
+    /// the boot path, which is exactly what on-demand materialization exists
+    /// to avoid.
+    pub fn deferred_arc(
+        registry: Arc<crate::raft::ZoneRaftRegistry>,
+        zone_id: &str,
+        runtime: tokio::runtime::Handle,
+        mount_point: String,
+    ) -> Arc<dyn MetaStore> {
+        Arc::new(Self {
+            binding: ZoneBinding::Deferred {
+                registry,
+                zone_id: zone_id.to_string(),
+                resolved: std::sync::OnceLock::new(),
+            },
+            runtime,
+            mount_point,
+            cache: Arc::new(dashmap::DashMap::new()),
+        })
+    }
+
+    /// The zone's consensus handle, resolving a deferred binding on first use.
+    ///
+    /// Resolution registers the cache invalidator at the same moment, so the
+    /// coherence contract is identical either way: a metastore that can serve
+    /// a read is a metastore whose cache raft can evict. An unresolvable zone
+    /// is an I/O error rather than a silent empty read — the mount points at a
+    /// zone this node cannot open.
+    fn node(&self) -> Result<&ZoneConsensus<FullStateMachine>, MetaStoreError> {
+        match &self.binding {
+            ZoneBinding::Ready(node) => Ok(node),
+            ZoneBinding::Deferred {
+                registry,
+                zone_id,
+                resolved,
+            } => {
+                if let Some(node) = resolved.get() {
+                    return Ok(node);
+                }
+                let node = registry.get_node(zone_id).ok_or_else(|| {
+                    MetaStoreError::IOError(format!(
+                        "ZoneMetaStore: zone '{zone_id}' is not available on this node"
+                    ))
+                })?;
+                register_cache_invalidator(&node, &self.cache, &self.mount_point);
+                // A concurrent resolve may win; both handles are equivalent
+                // clones of the same consensus, so either is correct.
+                let _ = resolved.set(node);
+                resolved.get().ok_or_else(|| {
+                    MetaStoreError::IOError(format!(
+                        "ZoneMetaStore: zone '{zone_id}' resolve raced to nothing"
+                    ))
+                })
+            }
         }
     }
 
@@ -294,7 +391,7 @@ impl MetaStore for ZoneMetaStore {
         let zone_key = self.to_zone_key(path);
         let key = zone_key.clone();
         let fut = self
-            .node
+            .node()?
             .with_state_machine(move |sm: &FullStateMachine| sm.get_metadata(&key));
         let bytes_opt = bridge_block_on(&self.runtime, fut)
             .map_err(|e| MetaStoreError::IOError(format!("ZoneMetaStore.get({path}): {e}")))?;
@@ -325,7 +422,7 @@ impl MetaStore for ZoneMetaStore {
             key: zone_key.clone(),
             value,
         };
-        let result = bridge_block_on(&self.runtime, self.node.propose(cmd))
+        let result = bridge_block_on(&self.runtime, self.node()?.propose(cmd))
             .map_err(|e| MetaStoreError::IOError(format!("ZoneMetaStore.put({path}): {e}")))?;
         match result {
             crate::prelude::CommandResult::Success => {}
@@ -341,9 +438,9 @@ impl MetaStore for ZoneMetaStore {
         // on a follower, local apply lags by up to one raft tick.
         // SSOT = raft state machine.
         let runtime = self.runtime.clone();
-        let node = self.node.clone();
+        let node = self.node()?.clone();
         let key = zone_key.clone();
-        let _ = self.node.wait_until(
+        let _ = self.node()?.wait_until(
             || {
                 let poll_key = key.clone();
                 let observed = bridge_block_on(
@@ -370,7 +467,7 @@ impl MetaStore for ZoneMetaStore {
         self.cache.remove(path);
         let zone_key = self.to_zone_key(path);
         let cmd = Command::DeleteMetadata { key: zone_key };
-        let result = bridge_block_on(&self.runtime, self.node.propose(cmd))
+        let result = bridge_block_on(&self.runtime, self.node()?.propose(cmd))
             .map_err(|e| MetaStoreError::IOError(format!("ZoneMetaStore.delete({path}): {e}")))?;
         Ok(matches!(result, crate::prelude::CommandResult::Success))
     }
@@ -379,7 +476,7 @@ impl MetaStore for ZoneMetaStore {
         let zone_prefix = self.to_zone_key(prefix);
         let key = zone_prefix.clone();
         let fut = self
-            .node
+            .node()?
             .with_state_machine(move |sm: &FullStateMachine| sm.list_metadata(&key));
         let entries = bridge_block_on(&self.runtime, fut)
             .map_err(|e| MetaStoreError::IOError(format!("ZoneMetaStore.list({prefix}): {e}")))?;
@@ -398,7 +495,14 @@ impl MetaStore for ZoneMetaStore {
     }
 
     fn coherence_key(&self) -> Option<usize> {
-        Some(self.coherence_id)
+        // Deliberately does NOT resolve: this is asked on the apply path to
+        // fan out dcache invalidation, and a metastore that has never served
+        // an operation has nothing cached to invalidate. Once it has, it is
+        // resolved, and this reports the real identity.
+        match &self.binding {
+            ZoneBinding::Ready(node) => Some(node.coherence_id()),
+            ZoneBinding::Deferred { resolved, .. } => resolved.get().map(|n| n.coherence_id()),
+        }
     }
 
     fn append_stream_entry(&self, stream_prefix: &str, data: &[u8]) -> Result<u64, MetaStoreError> {
@@ -417,7 +521,7 @@ impl MetaStore for ZoneMetaStore {
             stream_prefix: stream_prefix.to_string(),
             data: data.to_vec(),
         };
-        let result = bridge_block_on(&self.runtime, self.node.propose(cmd)).map_err(|e| {
+        let result = bridge_block_on(&self.runtime, self.node()?.propose(cmd)).map_err(|e| {
             MetaStoreError::IOError(format!(
                 "ZoneMetaStore.append_stream_entry({stream_prefix}): {e}"
             ))
@@ -445,7 +549,7 @@ impl MetaStore for ZoneMetaStore {
     fn get_stream_entry(&self, key: &str) -> Result<Option<Vec<u8>>, MetaStoreError> {
         let key_owned = key.to_string();
         let fut = self
-            .node
+            .node()?
             .with_state_machine(move |sm: &FullStateMachine| sm.get_stream_entry(&key_owned));
         bridge_block_on(&self.runtime, fut).map_err(|e| {
             MetaStoreError::IOError(format!("ZoneMetaStore.get_stream_entry({key}): {e}"))
@@ -455,7 +559,7 @@ impl MetaStore for ZoneMetaStore {
     fn stream_tail(&self, stream_prefix: &str) -> Result<u64, MetaStoreError> {
         let prefix_owned = stream_prefix.to_string();
         let fut = self
-            .node
+            .node()?
             .with_state_machine(move |sm: &FullStateMachine| sm.stream_tail(&prefix_owned));
         bridge_block_on(&self.runtime, fut).map_err(|e| {
             MetaStoreError::IOError(format!("ZoneMetaStore.stream_tail({stream_prefix}): {e}"))
@@ -483,7 +587,7 @@ impl MetaStore for ZoneMetaStore {
             origin: origin.to_string(),
             size,
         };
-        let result = bridge_block_on(&self.runtime, self.node.propose(cmd)).map_err(|e| {
+        let result = bridge_block_on(&self.runtime, self.node()?.propose(cmd)).map_err(|e| {
             MetaStoreError::IOError(format!(
                 "ZoneMetaStore.seal_stream_segment({stream_prefix}): {e}"
             ))
@@ -502,7 +606,7 @@ impl MetaStore for ZoneMetaStore {
     fn stream_floor(&self, stream_prefix: &str) -> Result<u64, MetaStoreError> {
         let prefix_owned = stream_prefix.to_string();
         let fut = self
-            .node
+            .node()?
             .with_state_machine(move |sm: &FullStateMachine| sm.stream_floor(&prefix_owned));
         bridge_block_on(&self.runtime, fut).map_err(|e| {
             MetaStoreError::IOError(format!("ZoneMetaStore.stream_floor({stream_prefix}): {e}"))
@@ -517,9 +621,10 @@ impl MetaStore for ZoneMetaStore {
         let prefix_owned = stream_prefix.to_string();
         let found = bridge_block_on(
             &self.runtime,
-            self.node.with_state_machine(move |sm: &FullStateMachine| {
-                sm.find_segment(&prefix_owned, seq)
-            }),
+            self.node()?
+                .with_state_machine(move |sm: &FullStateMachine| {
+                    sm.find_segment(&prefix_owned, seq)
+                }),
         )
         .map_err(|e| {
             MetaStoreError::IOError(format!(
@@ -538,7 +643,7 @@ impl MetaStore for ZoneMetaStore {
     fn stream_earliest(&self, stream_prefix: &str) -> Result<u64, MetaStoreError> {
         let prefix_owned = stream_prefix.to_string();
         let fut = self
-            .node
+            .node()?
             .with_state_machine(move |sm: &FullStateMachine| sm.stream_earliest(&prefix_owned));
         bridge_block_on(&self.runtime, fut).map_err(|e| {
             MetaStoreError::IOError(format!(
@@ -554,7 +659,7 @@ impl MetaStore for ZoneMetaStore {
         let prefix_owned = stream_prefix.to_string();
         let segs = bridge_block_on(
             &self.runtime,
-            self.node
+            self.node()?
                 .with_state_machine(move |sm: &FullStateMachine| sm.list_segments(&prefix_owned)),
         )
         .map_err(|e| {
@@ -587,7 +692,7 @@ impl MetaStore for ZoneMetaStore {
             up_to_seq,
             trimmed,
         };
-        let result = bridge_block_on(&self.runtime, self.node.propose(cmd)).map_err(|e| {
+        let result = bridge_block_on(&self.runtime, self.node()?.propose(cmd)).map_err(|e| {
             MetaStoreError::IOError(format!(
                 "ZoneMetaStore.trim_stream_segments({stream_prefix}): {e}"
             ))
