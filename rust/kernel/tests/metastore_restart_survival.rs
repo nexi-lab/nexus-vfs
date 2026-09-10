@@ -167,7 +167,7 @@ fn non_root_mount_entry_row_survives_kernel_restart() {
     // kernel restart (visible via sys_stat with only the root mount
     // re-established). Replaying the row back into the VFSRouter as a
     // live route is the daemon/raft layer's job
-    // (`replay_existing_mounts`, see nexus-vfs#41) and is covered by
+    // (`replay_mounts_for_zone`, see nexus-vfs#41) and is covered by
     // the raft-side tests — a bare kernel does not replay routes.
     let td = tempfile::tempdir().expect("tempdir");
     let ms = td.path().join("metastore.redb");

@@ -37,6 +37,7 @@ use kernel::hal::distributed_coordinator::{
 };
 use kernel::kernel::Kernel;
 
+use crate::prelude::{FullStateMachine, ZoneConsensus};
 use crate::transport::NodeAddress;
 use crate::zone_meta_store::ZoneMetaStore;
 use crate::{ZoneHandle, ZoneManager};
@@ -93,6 +94,16 @@ pub struct RaftDistributedCoordinator {
     /// Wrapped in `Arc` so the apply-cb closures (one per parent zone)
     /// can capture a cheap clone — they can't borrow from `&self`.
     cross_zone_mounts: Arc<DashMap<String, Vec<CrossZoneMountTuple>>>,
+    /// DT_MOUNT entries seen but not yet wireable, as
+    /// `(parent_zone, zone_relative_mount_path, target_zone)`.
+    ///
+    /// A nested mount cannot be wired before its parent's mount is in
+    /// `cross_zone_mounts` (that is what reconstructs its global path), and
+    /// zones now become resident in whatever order they are touched — so
+    /// "wire what you can, keep what you can't, retry on the next zone" is the
+    /// ordering mechanism. It replaces a rescan of every zone per newly wired
+    /// zone, which was quadratic in zone count.
+    deferred_mounts: Arc<parking_lot::Mutex<Vec<(String, String, String)>>>,
     /// Per-peer typed-RPC client used by `peer_*` to dispatch
     /// `NexusVFSService.{Read,Write,Stat,Readdir,Delete,Mkdir,Rename,Setattr}`
     /// against zone voters.  Set by `install_with_kernel`; unset means
@@ -109,6 +120,7 @@ impl RaftDistributedCoordinator {
             runtime: OnceLock::new(),
             bootstrap_done: AtomicBool::new(false),
             cross_zone_mounts: Arc::new(DashMap::new()),
+            deferred_mounts: Arc::new(parking_lot::Mutex::new(Vec::new())),
             grpc_ops: OnceLock::new(),
         }
     }
@@ -181,13 +193,33 @@ impl RaftDistributedCoordinator {
         // ZoneApi/ReadBlob.
         kernel.stash_blob_fetcher_slot(Box::new(zm.blob_fetcher_slot()));
 
-        // Apply-cb install on every loaded zone — root, federation
-        // zones from `NEXUS_FEDERATION_ZONES`, zones restored from
-        // disk after restart.  `install_apply_cb_for_zone` bakes the
-        // DT_MOUNT replay scan into the install (atomic "install +
-        // catch up" semantics — see its docstring) so we don't need
-        // a separate `replay_existing_mounts` call after the loop.
-        for zone_id in zm.list_zones() {
+        // Per-zone wiring rides each zone's own materialization from here on:
+        // a zone becomes resident whenever something first touches it, so
+        // "walk the zones and wire each" is no longer a thing boot can do
+        // once and be done with. Registering the hook FIRST, then wiring the
+        // zones that are already resident (root, plus anything an eager boot
+        // opened), covers both halves with no window in between — a zone
+        // materialized by an inbound raft message a microsecond later gets
+        // wired by the hook.
+        //
+        // `install_apply_cb_for_zone` bakes the DT_MOUNT replay into the
+        // install (atomic "install + catch up" — see its docstring), so
+        // nothing has to remember to replay afterwards.
+        {
+            let me = Arc::downgrade(self);
+            let kernel_weak = Arc::downgrade(kernel);
+            zm.registry()
+                .set_on_materialized(Arc::new(move |zone_id: &str| {
+                    // Weak both ways: production holds kernel → coordinator →
+                    // zone manager → registry → this closure, so an Arc here
+                    // would be a cycle that leaks both for the process's life.
+                    let (Some(me), Some(kernel)) = (me.upgrade(), kernel_weak.upgrade()) else {
+                        return;
+                    };
+                    me.install_apply_cb_for_zone(&kernel, zone_id);
+                }));
+        }
+        for zone_id in zm.registry().resident_zones() {
             self.install_apply_cb_for_zone(kernel, &zone_id);
         }
 
@@ -256,7 +288,7 @@ impl RaftDistributedCoordinator {
     /// snapshot-delivered federation mount silently fell through to
     /// root.  This was the cc-tasks-share Docker E2E regression
     /// fixed in PR #72 — originally as explicit
-    /// `replay_existing_mounts` calls in each caller, then DRY'd
+    /// per-caller mount-replay calls, then DRY'd
     /// into the install function so the bug is impossible to
     /// reintroduce.
     ///
@@ -286,49 +318,61 @@ impl RaftDistributedCoordinator {
             zone_id,
             &consensus,
         );
-        // Catch up on past-applied DT_MOUNT entries.  `replay_existing_mounts`
-        // scans every loaded zone (necessary for nested federation mounts
-        // where a child needs its parent wired first — the function's
-        // topological retry loop handles that ordering).  Calling it
-        // per-zone here is redundant at boot when the loop calls us many
-        // times, but the redundancy is bounded (M zones × N entries, each
-        // wire_mount_core call is an O(1) DashMap lookup + early-out via
-        // `vfs_router.has`) and the alternative — a non-atomic
-        // "install + remember to replay" contract that join_cluster
-        // forgot — is what shipped the original regression.  SSOT
-        // alternative was rejected because per-zone replay can't
-        // satisfy the cross-zone topological retry requirement.
-        self.replay_existing_mounts(kernel);
+        // Catch up on this zone's past-applied DT_MOUNT entries. The apply-cb
+        // only fires on FUTURE applies, but a snapshot from a leader
+        // (`join_cluster`) and a disk restore both deliver entries that
+        // applied before the cb existed; without this catch-up every
+        // cross-node sys_readdir / sys_stat / sys_unlink / sys_write against
+        // such a mount silently falls through to root (the cc-tasks-share
+        // Docker E2E regression fixed in PR #72).
+        self.replay_mounts_for_zone(kernel, zone_id, &consensus);
     }
 
-    /// Re-wire every DT_MOUNT entry already applied in any zone's state
-    /// machine.  The apply-cb only fires on NEW raft applies, so without
-    /// this replay a restart leaves restored mounts unwired in VFSRouter
-    /// / DCache — followers fail every cross-zone read until the next
-    /// fresh DT_MOUNT lands.  Topological retry handles parent→child
-    /// ordering (a nested mount can't wire until its parent's mount is
-    /// in `cross_zone_mounts`).
+    /// Re-wire the DT_MOUNT entries already applied in ONE zone's state
+    /// machine, then try everything that was waiting on a parent.
     ///
-    /// State-machine catchup contract: `ZoneConsensus::iter_dt_mount_entries`
-    /// uses `try_read` on the async state-machine RwLock, returning an
-    /// empty Vec on contention — indistinguishable from "no DT_MOUNTs
-    /// exist".  At boot on a restart, the driver loop is actively
-    /// applying the entries restored from storage; if we scan during
-    /// that window every try_read loses and `pending` ends up empty
-    /// against a zone whose state machine actually holds DT_MOUNTs.  No
-    /// retry mechanism above this catches it — `apply_topology` only
-    /// processes the `pending_mounts` set populated from
-    /// `NEXUS_FEDERATION_MOUNTS`, not restored entries.  So a restart
-    /// silently boots a daemon whose `/shared` route is missing and
-    /// every cross-zone read returns "found=false" until the operator
-    /// notices and triggers a fresh mount.
+    /// Called as each zone materializes. Scanning only the zone that just
+    /// arrived — instead of re-scanning every resident zone each time, which
+    /// made boot quadratic in zone count — is possible because the entries
+    /// that cannot be wired yet are kept in [`Self::deferred_mounts`] and
+    /// retried whenever a later zone supplies the parent they were missing.
+    fn replay_mounts_for_zone(
+        &self,
+        kernel: &Kernel,
+        zone_id: &str,
+        consensus: &ZoneConsensus<FullStateMachine>,
+    ) {
+        let Some(runtime) = self.runtime.get() else {
+            return;
+        };
+        // `iter_dt_mount_entries` uses `try_read` on the async state-machine
+        // lock and returns empty on contention — indistinguishable from "no
+        // DT_MOUNTs". At boot the driver is actively applying entries restored
+        // from storage, so scanning inside that window silently yields nothing
+        // and the mount stays unwired until an operator notices. Wait for
+        // `applied_index >= commit_index` first; capped so a genuinely stuck
+        // zone warns instead of blocking.
+        wait_for_state_machine_caught_up(consensus, zone_id, std::time::Duration::from_secs(10));
+        let entries = consensus.iter_dt_mount_entries(runtime).unwrap_or_default();
+        if !entries.is_empty() {
+            let mut deferred = self.deferred_mounts.lock();
+            for (key, target_zone_id) in entries {
+                deferred.push((zone_id.to_string(), key, target_zone_id));
+            }
+        }
+        self.drain_deferred_mounts(kernel);
+    }
+
+    /// Wire everything wireable in [`Self::deferred_mounts`], repeating while a
+    /// pass makes progress (each wired parent can unblock its children).
     ///
-    /// Wait for `applied_index >= commit_index` (state machine has
-    /// applied everything the storage marked committed) before scanning.
-    /// At that point the apply pass is done, no write lock is held by
-    /// the driver, and the entry set is the truth.  Capped at 10s so a
-    /// genuinely-stuck zone surfaces a warning rather than blocking boot.
-    fn replay_existing_mounts(&self, kernel: &Kernel) {
+    /// The list is taken out of the lock for the duration of a pass, and never
+    /// held across `wire_mount_core`: wiring a mount can materialize its target
+    /// zone, whose materialization hook re-enters this function, and holding
+    /// the lock across that would deadlock. A re-entrant pass simply works on
+    /// whatever it added; the outer pass merges its own leftovers back and
+    /// retries.
+    fn drain_deferred_mounts(&self, kernel: &Kernel) {
         let Some(zm) = self.zm() else {
             return;
         };
@@ -339,73 +383,62 @@ impl RaftDistributedCoordinator {
         let vfs_router = kernel.vfs_router_arc();
         let lock_manager = kernel.lock_manager_arc();
 
-        let mut pending: Vec<(String, String, String)> = Vec::new();
-        for zone_id in zm.list_zones() {
-            let Some(consensus) = registry.get_node(&zone_id) else {
-                continue;
+        loop {
+            let batch: Vec<(String, String, String)> = {
+                let mut guard = self.deferred_mounts.lock();
+                std::mem::take(&mut *guard)
             };
-            wait_for_state_machine_caught_up(
-                &consensus,
-                &zone_id,
-                std::time::Duration::from_secs(10),
-            );
-            let entries = consensus.iter_dt_mount_entries(runtime).unwrap_or_default();
-            for (key, target_zone_id) in entries {
-                pending.push((zone_id.clone(), key, target_zone_id));
-            }
-        }
-
-        if pending.is_empty() {
-            return;
-        }
-        tracing::info!(
-            count = pending.len(),
-            "replay_existing_mounts: scanning DT_MOUNT entries"
-        );
-
-        // Topological retry: a nested mount needs its parent's
-        // cross_zone_mounts entry to reconstruct the global path.  Cap
-        // rounds at pending.len()+1 so a misconfigured cycle errors
-        // instead of looping forever.
-        let max_rounds = pending.len() + 1;
-        for _ in 0..max_rounds {
-            if pending.is_empty() {
-                break;
+            if batch.is_empty() {
+                return;
             }
             let mut progressed = false;
-            pending.retain(|(parent_zone_id, mount_path, target_zone_id)| {
-                let r = wire_mount_core(
+            let mut still_deferred: Vec<(String, String, String)> = Vec::new();
+            for (parent_zone_id, mount_path, target_zone_id) in batch {
+                match wire_mount_core(
                     &vfs_router,
                     &lock_manager,
                     &registry,
                     runtime,
                     &self.cross_zone_mounts,
-                    parent_zone_id,
-                    mount_path,
-                    target_zone_id,
-                );
-                match r {
+                    &parent_zone_id,
+                    &mount_path,
+                    &target_zone_id,
+                ) {
                     Ok(()) => {
-                        if self.cross_zone_mounts.contains_key(target_zone_id) {
+                        if self.cross_zone_mounts.contains_key(&target_zone_id) {
                             progressed = true;
-                            false // wired — drop from pending
                         } else {
-                            true // wire_mount_core deferred (parent not ready) — retry
+                            // Deferred inside `wire_mount_core` — its parent
+                            // mount is not in `cross_zone_mounts` yet, so the
+                            // global path cannot be reconstructed.
+                            still_deferred.push((parent_zone_id, mount_path, target_zone_id));
                         }
                     }
-                    Err(_) => false, // permanent failure — give up
+                    // Permanent failure: dropping it matches the previous
+                    // behaviour — a retry would fail identically.
+                    Err(e) => tracing::warn!(
+                        parent_zone = %parent_zone_id,
+                        mount_path = %mount_path,
+                        target_zone = %target_zone_id,
+                        error = %e,
+                        "mount replay: permanent wire failure, dropping the entry",
+                    ),
                 }
-            });
-            if !progressed {
-                break;
             }
-        }
-        if !pending.is_empty() {
-            tracing::warn!(
-                pending = pending.len(),
-                "replay_existing_mounts: {} entries left unwired (likely missing parent zone)",
-                pending.len(),
-            );
+            if !still_deferred.is_empty() {
+                self.deferred_mounts.lock().extend(still_deferred);
+            }
+            if !progressed {
+                let left = self.deferred_mounts.lock().len();
+                if left > 0 {
+                    tracing::warn!(
+                        pending = left,
+                        "mount replay: {left} entries left unwired (likely a parent zone this \
+                         node does not host yet); they retry as zones materialize",
+                    );
+                }
+                return;
+            }
         }
     }
 }
@@ -909,7 +942,7 @@ pub fn check_zone_resumable_from_indices(last_log_index: u64) -> Result<(), Stri
 /// into the state machine; any reader that takes `try_read` on the
 /// state-machine RwLock during that window loses to the driver's
 /// write lock and silently observes a partial state (the empty Vec
-/// from `ZoneConsensus::iter_dt_mount_entries`).  `replay_existing_mounts`
+/// from `ZoneConsensus::iter_dt_mount_entries`).  `replay_mounts_for_zone`
 /// is the canonical victim — it scans every zone's DT_MOUNT set once at
 /// boot, with no retry above it, and a partial read leaves cross-zone
 /// routing missing for the rest of the daemon's life.
@@ -939,7 +972,7 @@ fn wait_for_state_machine_caught_up(
                 zone = %zone_id,
                 commit_index = commit,
                 applied_index = applied,
-                "replay_existing_mounts: state machine did not catch up within \
+                "replay_mounts_for_zone: state machine did not catch up within \
                  {timeout:?}; DT_MOUNT scan may observe partial state and leave \
                  cross-zone routes unwired.  Investigate driver loop / state \
                  machine apply backpressure for this zone."
@@ -2279,19 +2312,16 @@ fn wire_mount_core(
         return Ok(());
     }
 
-    // 1. Look up target zone.
-    let Some(target_consensus) = registry.get_node(target_zone_id) else {
-        tracing::warn!(
-            target_zone_id = %target_zone_id,
-            "wire_mount: target zone not loaded locally — deferring"
-        );
-        return Ok(());
-    };
-
-    // 3. Build a ZoneMetaStore rooted at global_path against the target's
-    //    state machine — reuses the root mount's CAS backend.
-    let metastore: Arc<dyn MetaStore> = ZoneMetaStore::new_arc(
-        target_consensus.clone(),
+    // 1. Build a ZoneMetaStore rooted at global_path against the target zone
+    //    — bound by id, not by handle. Wiring a mount must not materialize its
+    //    target: one zone per tenant means root carries one DT_MOUNT per
+    //    tenant, and opening each at wire time would put every tenant's raft
+    //    group back on the boot path. The binding resolves on the first
+    //    operation that routes through this mount. Reuses the root mount's CAS
+    //    backend.
+    let metastore: Arc<dyn MetaStore> = ZoneMetaStore::deferred_arc(
+        Arc::clone(registry),
+        target_zone_id,
         runtime.clone(),
         global_path.clone(),
     );

@@ -53,7 +53,7 @@ impl Kernel {
             self.vfs_router.install_metastore(&canonical, ms);
         }
         // Boot-order fix: on restart,
-        // `RaftDistributedCoordinator::replay_existing_mounts` runs
+        // `RaftDistributedCoordinator::replay_mounts_for_zone` runs
         // before Python mounts root, so every federation mount it
         // replays gets `backend=None`. Once root lands with its CAS
         // backend, propagate it back into those stranded federation
