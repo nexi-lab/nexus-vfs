@@ -1659,7 +1659,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         cli_peer_addrs,
         identity_persisted_peers,
         identity_zones,
-    } = open_zone_manager(&common, Some(vfs_routes), ZoneLoadPolicy::All)?;
+    } = open_zone_manager(&common, Some(vfs_routes), ZoneLoadPolicy::OnDemand)?;
 
     // Fill the VFS service's verifier slot now that the ZoneManager (and its
     // eagerly-built verifier) exists. Auth-on ⇒ the VFS request path classifies
@@ -2567,47 +2567,56 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     // block above, so they are loaded now; a zone joined at runtime after
     // boot is a documented follow-up.
     {
-        // Arm on every zone this node participates in — root plus every
-        // federation zone created or joined by the BootAction block above.
-        // The wakeup is a property of raft-consensus membership, NOT of
-        // `--cluster-init-mount`: a JOINER reaches its shared zones via
-        // DiscoverZones / identity.zones with no `--cluster-init` (a
-        // `--cluster-init` alongside `--peers` is a fail-loud ambiguous
-        // boot — see `plan_boot_action` row 6), so keying off the init mounts
-        // would arm root only and silently drop the joiner's shared mailbox
-        // zone. `ZoneManager::list_zones` is the SSOT for loaded zones.
-        // (A zone joined at RUNTIME, after this point — via a `share`/`join`
-        // sidecar — is still a documented follow-up.)
-        let mut wakeup_zone_ids: std::collections::BTreeSet<String> =
-            zm.list_zones().into_iter().collect();
-        wakeup_zone_ids.insert(contracts::ROOT_ZONE_ID.to_string());
-        for zone_id in wakeup_zone_ids {
-            match zm.get_zone(&zone_id) {
-                Some(zone) => {
-                    // The observer self-recovers the watched file path from
-                    // the wal-stream entry key — no per-zone mapping needed.
-                    nexus_raft::stream_wakeup::install_stream_wakeup_observer(
-                        &zone.consensus_node(),
-                        Arc::downgrade(&kernel),
-                    );
-                    tracing::info!(zone_id = %zone_id, "a2a stream-wakeup observer armed");
-                    // Same per-zone spine, sibling concern: a replicated
-                    // `TrimStreamSegment` (a wal DT_STREAM over its retention
-                    // budget) reclaims this node's own-origin cold blobs. Off
-                    // the apply thread (disk I/O), so pass the zone runtime.
-                    nexus_raft::stream_retention_gc::install_stream_trim_gc_observer(
-                        &zone.consensus_node(),
-                        Arc::downgrade(&kernel),
-                        zone.runtime_handle(),
-                    );
-                    tracing::info!(zone_id = %zone_id, "dt-stream retention-GC observer armed");
-                }
-                None => {
-                    tracing::warn!(
-                        zone_id = %zone_id,
-                        "a2a stream-wakeup: zone not loaded at arming time; skipped"
-                    );
-                }
+        // Arm on every zone this node participates in. The wakeup is a
+        // property of raft-consensus membership, NOT of `--cluster-init-mount`:
+        // a JOINER reaches its shared zones via DiscoverZones /
+        // identity.zones with no `--cluster-init` (a `--cluster-init`
+        // alongside `--peers` is a fail-loud ambiguous boot — see
+        // `plan_boot_action` row 6), so keying off the init mounts would arm
+        // root only and silently drop the joiner's shared mailbox zone.
+        //
+        // Arming rides zone materialization rather than a boot-time sweep,
+        // which is both cheaper and more complete: a sweep would have to open
+        // every hosted zone to arm it (putting the whole catalog back on the
+        // boot path), and it could only ever cover the zones that existed at
+        // boot — a zone joined at runtime, or a hosted zone touched for the
+        // first time hours later, was silently left unarmed. Both observers
+        // register KEYED, so arming a zone twice replaces rather than
+        // accumulates.
+        let kernel_for_hook = Arc::downgrade(&kernel);
+        let runtime_for_hook = zm.runtime_handle();
+        let arm = move |zone_id: &str,
+                        consensus: &nexus_raft::prelude::ZoneConsensus<
+            nexus_raft::prelude::FullStateMachine,
+        >| {
+            // The observer self-recovers the watched file path from the
+            // wal-stream entry key — no per-zone mapping needed.
+            nexus_raft::stream_wakeup::install_stream_wakeup_observer(
+                consensus,
+                kernel_for_hook.clone(),
+            );
+            // Same per-zone spine, sibling concern: a replicated
+            // `TrimStreamSegment` (a wal DT_STREAM over its retention budget)
+            // reclaims this node's own-origin cold blobs. Off the apply thread
+            // (disk I/O), so pass the runtime.
+            nexus_raft::stream_retention_gc::install_stream_trim_gc_observer(
+                consensus,
+                kernel_for_hook.clone(),
+                runtime_for_hook.clone(),
+            );
+            tracing::info!(zone_id = %zone_id, "a2a stream-wakeup + retention-GC observers armed");
+        };
+        let arm = Arc::new(arm);
+        let arm_for_hook = arm.clone();
+        zm.registry()
+            .add_on_materialized(Arc::new(move |zone_id, consensus| {
+                arm_for_hook(zone_id, consensus)
+            }));
+        // ...and whatever boot already made resident (root, and the credential
+        // zone when it differs), which materialized before the hook existed.
+        for zone_id in zm.registry().resident_zones() {
+            if let Some(zone) = zm.get_zone(&zone_id) {
+                arm(&zone_id, &zone.consensus_node());
             }
         }
     }
@@ -2653,7 +2662,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     //      so the DT_MOUNT entry lands in root's metastore (non-
     //      federated, never replicated) instead of the operator-
     //      specified target zone's state machine, and peers joining
-    //      later see `count=1` from `replay_existing_mounts` — only
+    //      later see `count=1` from `replay_mounts_for_zone` — only
     //      the `/shared` mount itself, not the nested driver mount
     //      operators installed under it.  The single sync drain
     //      collapses the race deterministically.
@@ -2912,7 +2921,7 @@ async fn run_share(
 ) -> Result<()> {
     let ZoneManagerBundle {
         zm, cli_peer_addrs, ..
-    } = open_zone_manager(&common, None, ZoneLoadPolicy::All)?;
+    } = open_zone_manager(&common, None, ZoneLoadPolicy::OnDemand)?;
     let peers_str: Vec<String> = cli_peer_addrs
         .iter()
         .map(NodeAddress::to_raft_peer_str)
@@ -3196,7 +3205,7 @@ async fn run_join(
         node_id,
         self_address,
         ..
-    } = open_zone_manager(&common, None, ZoneLoadPolicy::All)?;
+    } = open_zone_manager(&common, None, ZoneLoadPolicy::OnDemand)?;
 
     // Pre-#3996 (and pre-this commit) ``run_join`` only invoked
     // ``zm.join_zone(remote_zone_id, peers, false)`` — that registers

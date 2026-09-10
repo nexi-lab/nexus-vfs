@@ -2573,7 +2573,7 @@ impl ZoneConsensus<super::state_machine::FullStateMachine> {
     /// — indistinguishable from "no DT_MOUNTs exist" — and at boot on
     /// restart the raft driver is actively applying entries restored
     /// from storage, so every try_read lost the race and
-    /// ``replay_existing_mounts`` silently saw 0 entries against a zone
+    /// ``replay_mounts_for_zone`` silently saw 0 entries against a zone
     /// whose state machine actually held DT_MOUNTs (the ``/shared``
     /// gateway).  The cross-zone mount install in ``dlc.mount`` then
     /// fell back to the node-local store under the ``#44`` warning,
@@ -2585,7 +2585,7 @@ impl ZoneConsensus<super::state_machine::FullStateMachine> {
     /// ``block_in_place`` requires a multi-threaded outer runtime,
     /// which every async caller of ``ZoneManager`` already uses
     /// (``#[tokio::main(flavor = "multi_thread")]``).  Sound because
-    /// ``replay_existing_mounts`` first waits for
+    /// ``replay_mounts_for_zone`` first waits for
     /// ``applied_index >= commit_index`` via
     /// ``wait_for_state_machine_caught_up`` — by the time we reach
     /// here the apply pass has released its write lock and the

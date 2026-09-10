@@ -147,7 +147,12 @@ fn bench_readdir(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::from_parameter(n), &dir, |b, dir| {
             b.iter(|| {
-                let entries = kernel.sys_readdir(black_box(dir), "root", true);
+                let entries = kernel.sys_readdir(
+                    black_box(dir),
+                    "root",
+                    true,
+                    kernel::kernel::syscall::ReaddirOpts::default(),
+                );
                 black_box(entries);
             })
         });

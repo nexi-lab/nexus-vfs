@@ -610,7 +610,7 @@ impl VFSRouter {
     /// the new backend.
     ///
     /// Typical caller use: fix a boot-order bug where
-    /// `RaftDistributedCoordinator::replay_existing_mounts` replays
+    /// `RaftDistributedCoordinator::replay_mounts_for_zone` replays
     /// federation DT_MOUNT entries before Python installs the root
     /// mount that carries this node's CAS backend, leaving those
     /// entries with `backend=None`. The caller predicate

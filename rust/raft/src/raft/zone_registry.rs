@@ -90,6 +90,98 @@ enum ZoneOp {
 
 const AUTO_JOIN_REMOVAL_SUPPRESSION: Duration = Duration::from_secs(60);
 
+/// How long resuming a persisted zone waits for its state machine to apply
+/// what its log already says is committed.
+///
+/// Opening a zone from disk is not the same as the zone being READY: raft-rs
+/// re-emits the committed-but-unapplied tail on the first ready, and until the
+/// state machine has chewed through it, reads see a partial zone. Boot used to
+/// hide this — every zone opened long before any request arrived — but a zone
+/// that materializes ON a request has no such grace, and would answer that
+/// very request out of an empty state machine.
+///
+/// The wait is local work (replaying this node's own log), so it is short in
+/// practice; the cap exists so a wedged apply loop surfaces as a warning
+/// rather than an unbounded hang on the caller's thread.
+const RESUME_CATCHUP_BUDGET: Duration = Duration::from_secs(10);
+
+/// Block until `consensus` has applied everything its log says is committed,
+/// or `timeout` expires (warning loudly if so).
+///
+/// Shared by zone resume and by federation mount replay: both need the same
+/// "this zone's state machine is caught up with its own log" guarantee before
+/// they read it, and neither can get it from `applied_index` alone at a single
+/// instant.
+pub(crate) fn wait_until_caught_up(
+    consensus: &ZoneConsensus<FullStateMachine>,
+    zone_id: &str,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let commit = consensus.commit_index();
+        let applied = consensus.applied_index();
+        if applied >= commit {
+            return;
+        }
+        if Instant::now() >= deadline {
+            tracing::warn!(
+                zone = %zone_id,
+                commit_index = commit,
+                applied_index = applied,
+                "zone did not catch up with its own log within {timeout:?}; reads may \
+                 observe partial state. Investigate the driver loop / state-machine \
+                 apply backpressure for this zone."
+            );
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Which hosted zones this process is allowed to materialize.
+///
+/// The daemon uses [`ZoneLoadPolicy::OnDemand`]: any zone on disk becomes
+/// resident the first time something asks for it. Offline tooling (e.g.
+/// `nexusd-cluster auth mint`, which only needs the SOLO `root` zone's
+/// credential store) uses [`ZoneLoadPolicy::Only`]: opening a FEDERATED zone
+/// offline would spin up its raft group as a lone node with no reachable
+/// peers, which then campaigns and mutates that zone's persisted `HardState`
+/// (term/vote) — corrupting a zone the offline process has no business
+/// driving, so the real daemon resumes diverged.
+///
+/// `Only` is enforced at every lookup rather than only at boot, so an offline
+/// tool cannot reach a federated zone through some later call path either.
+#[derive(Debug, Clone)]
+pub enum ZoneLoadPolicy {
+    /// Materialize any hosted zone on first access (the daemon).
+    OnDemand,
+    /// Materialize only these zone ids, ever; every other lookup reports the
+    /// zone as absent.
+    Only(Vec<String>),
+}
+
+impl ZoneLoadPolicy {
+    fn may_materialize(&self, zone_id: &str) -> bool {
+        match self {
+            ZoneLoadPolicy::OnDemand => true,
+            ZoneLoadPolicy::Only(ids) => ids.iter().any(|id| id == zone_id),
+        }
+    }
+}
+
+/// What a hosted zone needs to become resident, captured once at boot.
+///
+/// The peer address book is cluster-wide, not per-zone (every zone in a
+/// federation shares the same raft topology), which is why one snapshot taken
+/// at boot serves every later materialization — it is the same list the old
+/// open-everything boot passed to each zone.
+struct Materialization {
+    peers: Vec<NodeAddress>,
+    runtime: tokio::runtime::Handle,
+    policy: ZoneLoadPolicy,
+}
+
 /// A single zone entry in the registry.
 struct ZoneEntry {
     /// ZoneConsensus handle (Clone + Send + Sync).
@@ -116,8 +208,27 @@ struct ZoneEntry {
 ///
 /// Thread-safe: all operations are safe to call from multiple threads concurrently.
 pub struct ZoneRaftRegistry {
-    /// zone_id → ZoneEntry
+    /// zone_id → ZoneEntry — the zones whose runtime is MATERIALIZED: redb
+    /// handles open, state machine in memory, transport loop running.
+    ///
+    /// A subset of [`Self::hosted`]. Membership here is a runtime fact, not a
+    /// durable one: a zone is materialized on first access and stays until
+    /// shutdown.
     zones: DashMap<String, ZoneEntry>,
+    /// Every zone id this node HOSTS on disk, materialized or not.
+    ///
+    /// Disk stays the source of truth for "which zones does this node host?"
+    /// (the etcd / CockroachDB / TiKV rule); this is its in-memory index,
+    /// built once by [`Self::index_persisted_zones`] and maintained by the two
+    /// places that create and destroy zone directories ([`Self::setup_zone`]
+    /// and [`Self::remove_zone`]), which already serialize on `creating`.
+    ///
+    /// Splitting the catalog from the runtimes above is what decouples boot
+    /// cost from zone count: enumerating 10k zone directories is one readdir,
+    /// while opening 10k raft groups is 10k × (two redb opens + several
+    /// fsyncs). A zone nobody has touched since the last restart is not doing
+    /// anything that needs to be resident.
+    hosted: dashmap::DashSet<String>,
     /// Base path for sled databases. Each zone gets `{base_path}/{zone_id}/`.
     base_path: PathBuf,
     /// This node's global ID (same across all zones on this node).
@@ -150,7 +261,34 @@ pub struct ZoneRaftRegistry {
     /// Recently removed zone IDs. Transport-side auto-join consults this
     /// guard so stale Raft messages cannot resurrect a deleted dynamic zone.
     recently_removed: DashMap<String, Instant>,
+    /// Set at boot by [`Self::arm_materialization`] — what a hosted zone needs
+    /// to become resident on first access. `None` (the default) means this
+    /// registry never materializes anything on its own: an embedded or test
+    /// registry only ever holds the zones it was explicitly given.
+    materialization: RwLock<Option<Materialization>>,
+    /// Fired once per zone, right after its runtime is published.
+    ///
+    /// The hook exists because "a zone became resident" is now an event that
+    /// happens at any time, not a boot-time list to walk: everything that has
+    /// to be wired per zone — the coordinator's DT_MOUNT apply observer and
+    /// mount replay, the A2A stream-wakeup and retention-GC observers — rides
+    /// the zone's own lifecycle instead of a sweep over all of them. That also
+    /// closes a gap the sweep had: a zone that arrived AFTER boot (joined at
+    /// runtime, or reached for the first time) was never wired at all.
+    ///
+    /// A list, because those subscribers live in different layers and each
+    /// owns its own wiring.
+    on_materialized: RwLock<Vec<ZoneMaterializedCb>>,
 }
+
+/// Callback fired when a zone's runtime becomes resident — see
+/// [`ZoneRaftRegistry::add_on_materialized`].
+///
+/// Receives the zone id and the freshly-published handle, so a subscriber
+/// never has to look the zone back up (which, mid-materialization, would be
+/// the one lookup that could recurse).
+pub type ZoneMaterializedCb =
+    Arc<dyn Fn(&str, &ZoneConsensus<FullStateMachine>) + Send + Sync + 'static>;
 
 impl ZoneRaftRegistry {
     /// Create a new empty registry.
@@ -161,6 +299,7 @@ impl ZoneRaftRegistry {
     pub fn new(base_path: PathBuf, node_id: u64) -> Self {
         Self {
             zones: DashMap::new(),
+            hosted: dashmap::DashSet::new(),
             base_path,
             node_id,
             tls: Arc::new(RwLock::new(None)),
@@ -168,6 +307,8 @@ impl ZoneRaftRegistry {
             identity_dir: Arc::new(RwLock::new(None)),
             creating: DashMap::new(),
             recently_removed: DashMap::new(),
+            materialization: RwLock::new(None),
+            on_materialized: RwLock::new(Vec::new()),
         }
     }
 
@@ -175,6 +316,7 @@ impl ZoneRaftRegistry {
     pub fn with_tls(base_path: PathBuf, node_id: u64, tls: Option<TlsConfig>) -> Self {
         Self {
             zones: DashMap::new(),
+            hosted: dashmap::DashSet::new(),
             base_path,
             node_id,
             tls: Arc::new(RwLock::new(tls)),
@@ -182,6 +324,8 @@ impl ZoneRaftRegistry {
             identity_dir: Arc::new(RwLock::new(None)),
             creating: DashMap::new(),
             recently_removed: DashMap::new(),
+            materialization: RwLock::new(None),
+            on_materialized: RwLock::new(Vec::new()),
         }
     }
 
@@ -221,6 +365,35 @@ impl ZoneRaftRegistry {
     /// Current identity directory, if set.
     pub fn identity_dir(&self) -> Option<PathBuf> {
         self.identity_dir.read().unwrap().clone()
+    }
+
+    /// Allow this registry to materialize a hosted zone on first access.
+    ///
+    /// Call once at boot, with the same peer address book and runtime the old
+    /// open-everything path handed to each zone, plus the policy that says
+    /// which zones this process may open at all. Until it is called (embedded
+    /// and test registries), a lookup only ever finds an already-resident zone.
+    pub fn arm_materialization(
+        &self,
+        peers: Vec<NodeAddress>,
+        runtime: tokio::runtime::Handle,
+        policy: ZoneLoadPolicy,
+    ) {
+        *self.materialization.write().unwrap() = Some(Materialization {
+            peers,
+            runtime,
+            policy,
+        });
+    }
+
+    /// Subscribe to per-zone materialization — see [`ZoneMaterializedCb`].
+    ///
+    /// Subscribers must be idempotent per zone: boot arms what is already
+    /// resident and then subscribes, so a zone can legitimately be wired
+    /// twice. (Both in-tree subscribers register KEYED apply observers, which
+    /// replace rather than accumulate.)
+    pub fn add_on_materialized(&self, cb: ZoneMaterializedCb) {
+        self.on_materialized.write().unwrap().push(cb);
     }
 
     /// Get this node's advertise address (empty when unset).
@@ -339,7 +512,7 @@ impl ZoneRaftRegistry {
 
     /// Open a previously-persisted zone from disk WITHOUT bootstrapping.
     ///
-    /// Used by `open_existing_zones_from_disk` at startup. Unlike
+    /// Used by boot (eager set) and by on-demand materialization. Unlike
     /// `create_zone`, this uses `skip_bootstrap=true` so the ConfState
     /// restored from `RaftStorage::initial_state()` is the authority —
     /// no new voters are written.
@@ -364,7 +537,9 @@ impl ZoneRaftRegistry {
         };
         // Restart preserves the persisted role intent (SSOT) — don't re-guess.
         let intended_role = self.persisted_intent(zone_id);
-        self.setup_zone(zone_id, config, peers, runtime_handle, intended_role)
+        let node = self.setup_zone(zone_id, config, peers, runtime_handle, intended_role)?;
+        wait_until_caught_up(&node, zone_id, RESUME_CATCHUP_BUDGET);
+        Ok(node)
     }
 
     /// The DURABLE role intent persisted for `zone_id` in `identity.json`,
@@ -382,29 +557,29 @@ impl ZoneRaftRegistry {
             .unwrap_or_default()
     }
 
-    /// Enumerate `base_path/*/raft/` and reopen every previously-persisted zone.
+    /// Enumerate `base_path/*/raft/` into the catalog, materializing nothing.
     ///
-    /// Called once from `PyZoneManager::new` before the gRPC server starts
-    /// accepting RPCs. Subsequent step_message traffic for unknown zones
-    /// returns `NotFound` — dynamic zones arrive via `federation_create_zone`
-    /// or the leader's snapshot delivery, never via a side-effectful
-    /// step_message branch.
+    /// Called once at boot, before the gRPC server accepts RPCs, so that by
+    /// the time a vote / append / VFS call arrives this node already KNOWS
+    /// which zones it hosts — it just has not opened them yet. Local storage
+    /// stays the source of truth for "which groups does this node host?" (the
+    /// etcd / CockroachDB / TiKV pattern); this reads that truth into
+    /// [`Self::hosted`] so every later lookup is an in-memory hit.
     ///
-    /// This is the etcd / CockroachDB / TiKV pattern: local storage is the
-    /// source of truth for "which groups does this node host?".
+    /// The R15.e invariant — a persisted zone must never be invisible to a
+    /// request — is upheld more strongly than by the old open-everything boot:
+    /// an unknown zone id used to mean "not on this node" only because boot had
+    /// already opened every directory, whereas now [`Self::get_node`]
+    /// materializes anything in the catalog on demand. What boot no longer does
+    /// is pay for zones nobody asks about: 10k persisted zones cost one readdir
+    /// instead of 10k raft-group openings.
     ///
-    /// Idempotent — re-enumeration fast-paths zones already in `self.zones`.
+    /// Finishes any interrupted removal it finds (a tombstoned dir from a crash
+    /// mid-`remove_zone`), which is where that cleanup has always happened.
     ///
-    /// Sync — see [`create_zone`] for the rationale. `nexusd-cluster`
-    /// calls this from inside its `#[tokio::main]` async runtime via
-    /// `ZoneManager::new`; an `async fn` here would force a nested
-    /// `block_on` on the outer runtime's worker thread and panic.
+    /// Idempotent. Returns the number of hosted zones now indexed.
     #[allow(clippy::result_large_err)]
-    pub fn open_existing_zones_from_disk(
-        &self,
-        peers: Vec<NodeAddress>,
-        runtime_handle: &tokio::runtime::Handle,
-    ) -> Result<usize, TransportError> {
+    pub fn index_persisted_zones(&self) -> Result<usize, TransportError> {
         if !self.base_path.exists() {
             return Ok(0);
         }
@@ -415,7 +590,6 @@ impl ZoneRaftRegistry {
                 e
             ))
         })?;
-        let mut count: usize = 0;
         for entry in entries {
             let entry = entry.map_err(|e| {
                 TransportError::Connection(format!("Failed to read dir entry: {}", e))
@@ -426,81 +600,62 @@ impl ZoneRaftRegistry {
                 continue;
             }
             let zone_id = entry.file_name().to_string_lossy().into_owned();
-            if self.open_persisted_zone_if_present(&zone_id, peers.clone(), runtime_handle)? {
-                count += 1;
+            if self.index_persisted_zone_if_present(&zone_id) {
+                self.hosted.insert(zone_id);
             }
         }
-
-        // Invariant: post-enumeration, the in-memory zone count must
-        // match the on-disk zone count. Violation means we failed to
-        // open something that should have been opened — a regression
-        // of the "disk is SSOT for zone membership" rule.
-        debug_assert_eq!(
-            self.zones.len(),
-            count,
-            "zones DashMap length ({}) != on-disk zone count ({}) after enumeration",
-            self.zones.len(),
-            count,
+        tracing::info!(
+            hosted_zones = self.hosted.len(),
+            base_path = %self.base_path.display(),
+            "Indexed persisted zones (materialized on first access)",
         );
-        Ok(count)
+        Ok(self.hosted.len())
     }
 
-    /// Open a single persisted zone by id IF present + resumable on disk.
-    /// `Ok(true)` = opened, `Ok(false)` = skipped (tombstoned, or no
-    /// `{zone}/raft/` dir). Shared by `open_existing_zones_from_disk`
-    /// (enumerate-all) and `open_persisted_zones_filtered` (offline root-only)
-    /// so both apply the identical tombstone-cleanup + existence checks.
-    fn open_persisted_zone_if_present(
-        &self,
-        zone_id: &str,
-        peers: Vec<NodeAddress>,
-        runtime_handle: &tokio::runtime::Handle,
-    ) -> Result<bool, TransportError> {
-        // A tombstone means the prior run started removing this zone but died
-        // before `destroy()`. Finish the cleanup rather than resurrecting a
-        // zombie zone that would send raft messages to peers who (correctly)
-        // return NotFound.
+    /// Is `zone_id` present + resumable on disk? Finishes an interrupted
+    /// removal (tombstone) rather than resurrecting a zombie zone that would
+    /// send raft messages to peers who — correctly — return NotFound.
+    fn index_persisted_zone_if_present(&self, zone_id: &str) -> bool {
         if ZonePersistence::has_tombstone(&self.base_path, zone_id) {
-            if let Err(e) = ZonePersistence::cleanup_tombstoned(&self.base_path, zone_id) {
-                tracing::warn!(
+            match ZonePersistence::cleanup_tombstoned(&self.base_path, zone_id) {
+                Ok(()) => {
+                    tracing::info!(zone = %zone_id, "Cleaned up tombstoned zone dir at startup")
+                }
+                Err(e) => tracing::warn!(
                     zone = %zone_id,
                     error = %e,
                     "Failed to clean up tombstoned zone dir at startup",
-                );
-            } else {
-                tracing::info!(zone = %zone_id, "Cleaned up tombstoned zone dir at startup");
+                ),
             }
-            return Ok(false);
+            return false;
         }
-        // Existence check: if `{zone}/raft/` doesn't exist, this isn't a
-        // persisted zone — skip. Matches the pattern used by RaftStorage::open
-        // (which creates this subdir).
-        if !self.base_path.join(zone_id).join("raft").exists() {
-            return Ok(false);
-        }
-        self.open_persisted_zone(zone_id, peers, runtime_handle)?;
-        Ok(true)
+        // If `{zone}/raft/` doesn't exist, this isn't a persisted zone — skip.
+        // Matches `RaftStorage::open`, which is what creates that subdir.
+        self.base_path.join(zone_id).join("raft").exists()
     }
 
-    /// Rehydrate ONLY the named zones (those present + resumable on disk),
-    /// skipping every other persisted zone. Backs `ZoneLoadPolicy::Only` so
-    /// offline tooling opens just `root` and never spins up a federated zone as
-    /// a lone node (which would campaign and mutate its persisted term/vote).
-    /// Returns the number actually opened.
-    pub fn open_persisted_zones_filtered(
+    /// Materialize the named zones NOW, if they are present on disk.
+    ///
+    /// Everything else waits for its first access. Boot uses this for the zones
+    /// that must be resident before the daemon can serve anything at all — the
+    /// root zone, whose DT_MOUNT entries define the federation namespace, and
+    /// the credential zone that authenticates the very requests that would
+    /// otherwise trigger materialization. Returns the number actually opened.
+    #[allow(clippy::result_large_err)]
+    pub fn materialize_now(
         &self,
         zone_ids: &[String],
         peers: Vec<NodeAddress>,
         runtime_handle: &tokio::runtime::Handle,
     ) -> Result<usize, TransportError> {
-        if !self.base_path.exists() {
-            return Ok(0);
-        }
         let mut count: usize = 0;
         for zone_id in zone_ids {
-            if self.open_persisted_zone_if_present(zone_id, peers.clone(), runtime_handle)? {
-                count += 1;
+            if !self.index_persisted_zone_if_present(zone_id) {
+                continue;
             }
+            self.hosted.insert(zone_id.clone());
+            self.open_persisted_zone(zone_id, peers.clone(), runtime_handle)?;
+            count += 1;
         }
         Ok(count)
     }
@@ -604,7 +759,7 @@ impl ZoneRaftRegistry {
         // Open the zone dir via ZonePersistence. Existing dir →
         // `open()` (not armed). Fresh zone → `create()` (armed; rolled back
         // on any `?` return between here and the DashMap insert). Tombstone
-        // check is redundant in practice — `open_existing_zones_from_disk`
+        // check is redundant in practice — `index_persisted_zones`
         // cleans these up at startup before setup_zone is called for them
         // — but the guard below means a crash mid-remove produces a clean
         // error on the next create attempt.
@@ -855,13 +1010,78 @@ impl ZoneRaftRegistry {
                 persistence,
             },
         );
+        // The dir is committed and the runtime is published, so this node
+        // hosts the zone whichever way we got here — created, joined, or
+        // materialized from disk.
+        self.hosted.insert(zone_id.to_string());
+
+        // Per-zone wiring rides the zone's own lifecycle. Fired after the
+        // insert above, and with the lock released, because a subscriber can
+        // legitimately reach back into the registry (wiring a mount can
+        // materialize its target zone).
+        let hooks: Vec<ZoneMaterializedCb> = self.on_materialized.read().unwrap().clone();
+        for cb in hooks {
+            cb(zone_id, &handle);
+        }
 
         Ok(handle)
     }
 
-    /// Get the ZoneConsensus handle for a zone.
+    /// The ZoneConsensus handle for a zone this node hosts, materializing it
+    /// first if this is its first access since boot.
+    ///
+    /// This is the ONE place a zone id becomes a runtime, which is what lets
+    /// every caller — the VFS data path, the raft server's `step_message`
+    /// dispatch, federation bookkeeping — stay written as "do I host this
+    /// zone?" without any of them knowing about residency. `None` still means
+    /// exactly what it always meant: not this node's zone.
+    ///
+    /// Hot path unchanged: a resident zone is one `DashMap` hit. The slow path
+    /// runs once per zone per process and does the same synchronous open the
+    /// old boot loop did (two redb opens and a few fsyncs, single-digit ms on
+    /// an SSD), so a caller on an async worker blocks for that first touch.
     pub fn get_node(&self, zone_id: &str) -> Option<ZoneConsensus<FullStateMachine>> {
-        self.zones.get(zone_id).map(|e| e.node.clone())
+        if let Some(entry) = self.zones.get(zone_id) {
+            return Some(entry.node.clone());
+        }
+        self.materialize(zone_id)
+    }
+
+    /// Slow path of [`Self::get_node`]: open a hosted-but-not-resident zone.
+    fn materialize(&self, zone_id: &str) -> Option<ZoneConsensus<FullStateMachine>> {
+        if !self.hosted.contains(zone_id) {
+            return None;
+        }
+        let (peers, runtime) = {
+            let guard = self.materialization.read().unwrap();
+            let m = guard.as_ref()?;
+            if !m.policy.may_materialize(zone_id) {
+                tracing::debug!(
+                    zone = %zone_id,
+                    "zone is hosted but this process may not materialize it (load policy)",
+                );
+                return None;
+            }
+            (m.peers.clone(), m.runtime.clone())
+        };
+        match self.open_persisted_zone(zone_id, peers, &runtime) {
+            Ok(node) => {
+                tracing::info!(zone = %zone_id, "Zone materialized on first access");
+                Some(node)
+            }
+            Err(e) => {
+                // Loud: a hosted zone that cannot be opened is a broken data
+                // dir, and the caller can only report it as absent. Boot used
+                // to fail hard on this; keep it visible now that it surfaces
+                // at first touch instead.
+                tracing::error!(
+                    zone = %zone_id,
+                    error = %e,
+                    "Failed to materialize a hosted zone — it will read as absent",
+                );
+                None
+            }
+        }
     }
 
     /// Get a snapshot of the peers map for a zone.
@@ -946,7 +1166,7 @@ impl ZoneRaftRegistry {
     /// 1. Take the entry out of the DashMap (further `get_node` returns None).
     /// 2. Write the tombstone file — the durable commit point of "this zone
     ///    is being torn down". A crash after this leaves a tombstoned dir;
-    ///    next startup's `open_existing_zones_from_disk` completes cleanup.
+    ///    next startup's `index_persisted_zones` completes cleanup.
     /// 3. Signal shutdown to the transport loop, await its JoinHandle so
     ///    the spawned task has fully exited before we drop `ZoneConsensus`.
     /// 4. Drop `ZoneConsensus` (entry goes out of scope). Driver task
@@ -1000,12 +1220,16 @@ impl ZoneRaftRegistry {
         } = entry;
         self.recently_removed
             .insert(zone_id.to_string(), Instant::now());
+        // Out of the catalog too — the dir is about to go. A crash between
+        // here and `destroy()` leaves a tombstone that the next boot's
+        // `index_persisted_zones` finishes cleaning up.
+        self.hosted.remove(zone_id);
 
         // Commit point: the tombstone is what makes teardown crash-safe.
         // If this write fails, the caller sees the error and the zone is
         // re-registered (we already did `zones.remove`). Accept this edge
         // case: the zone is gone from memory, dir is still on disk; on
-        // next restart `open_existing_zones_from_disk` reopens it. No
+        // next restart re-indexes it. No
         // zombie — no remote peers were told this zone is dying.
         if let Err(e) = persistence.write_tombstone() {
             // Best-effort: put the zone back so state isn't lost from memory.
@@ -1021,6 +1245,7 @@ impl ZoneRaftRegistry {
                 },
             );
             self.recently_removed.remove(zone_id);
+            self.hosted.insert(zone_id.to_string());
             return Err(TransportError::Connection(format!(
                 "Failed to write tombstone for zone '{}': {}",
                 zone_id, e
@@ -1064,9 +1289,32 @@ impl ZoneRaftRegistry {
         Ok(())
     }
 
-    /// List all zone IDs.
+    /// Every zone this node hosts, materialized or not.
+    ///
+    /// The catalog, not the resident set: "which zones does this node host?"
+    /// is a durable question, and answering it with whatever happens to be
+    /// open would make the answer depend on who has been asked for what since
+    /// boot. Callers that need to act ON each zone should go through
+    /// [`Self::get_node`], which materializes — and should think about whether
+    /// they want to, since that is exactly the sweep this design removes.
     pub fn list_zones(&self) -> Vec<String> {
+        self.hosted.iter().map(|e| e.key().clone()).collect()
+    }
+
+    /// The zones whose runtime is currently resident — a runtime fact, for
+    /// shutdown and diagnostics only.
+    pub fn resident_zones(&self) -> Vec<String> {
         self.zones.iter().map(|e| e.key().clone()).collect()
+    }
+
+    /// Does this node host `zone_id`? Answers from the catalog WITHOUT
+    /// materializing it.
+    ///
+    /// For callers whose question is existence rather than access — "is there
+    /// anything to found here?" — which must not drag a zone into residency
+    /// just to learn that it is already there.
+    pub fn hosts(&self, zone_id: &str) -> bool {
+        self.hosted.contains(zone_id)
     }
 
     /// Shutdown all zones.
@@ -1085,15 +1333,12 @@ mod tests {
     use tempfile::TempDir;
 
     #[tokio::test]
-    async fn test_open_existing_zones_empty_base_path() {
-        // Empty (nonexistent) base_path returns Ok(0) — no zones to open.
+    async fn index_persisted_zones_on_empty_base_path() {
+        // Empty (nonexistent) base_path returns Ok(0) — nothing hosted.
         let tmp = TempDir::new().unwrap();
         let missing = tmp.path().join("does-not-exist");
         let reg = ZoneRaftRegistry::new(missing, 1);
-        let n = reg
-            .open_existing_zones_from_disk(vec![], &tokio::runtime::Handle::current())
-            .unwrap();
-        assert_eq!(n, 0);
+        assert_eq!(reg.index_persisted_zones().unwrap(), 0);
         assert!(reg.list_zones().is_empty());
     }
 
@@ -1149,11 +1394,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_open_existing_zones_from_disk_restores_confstate() {
-        // Create a single-voter zone, confirm it's registered, drop the
-        // registry, reopen via open_existing_zones_from_disk, assert the
-        // zone is restored (skip_bootstrap=true) — the ConfState from
-        // RaftStorage::initial_state() is authoritative.
+    async fn a_persisted_zone_is_hosted_at_boot_and_materializes_on_first_access() {
+        // The restart contract, in the two halves the split makes distinct:
+        // indexing makes the zone HOSTED (cheap, no raft group opened), and
+        // the first access makes it RESIDENT with its persisted ConfState
+        // (skip_bootstrap=true — `RaftStorage::initial_state()` is
+        // authoritative, no new voters written).
         let tmp = TempDir::new().unwrap();
         let base = tmp.path().to_path_buf();
 
@@ -1166,24 +1412,32 @@ mod tests {
         drop(reg);
         await_shutdown_cleanup().await;
 
-        // New registry, same base_path — enumerate from disk.
+        // New registry, same base_path — index from disk.
         let reg2 = ZoneRaftRegistry::new(base, 1);
-        let n = reg2
-            .open_existing_zones_from_disk(vec![], &tokio::runtime::Handle::current())
-            .unwrap();
-        assert_eq!(n, 1);
-        let zones = reg2.list_zones();
-        assert_eq!(zones, vec!["corp-eng".to_string()]);
-        assert!(reg2.get_node("corp-eng").is_some());
+        assert_eq!(reg2.index_persisted_zones().unwrap(), 1);
+        assert_eq!(reg2.list_zones(), vec!["corp-eng".to_string()]);
+        assert!(
+            reg2.resident_zones().is_empty(),
+            "indexing must not open anything — that is the whole point",
+        );
+
+        reg2.arm_materialization(
+            vec![],
+            tokio::runtime::Handle::current(),
+            ZoneLoadPolicy::OnDemand,
+        );
+        assert!(
+            reg2.get_node("corp-eng").is_some(),
+            "a hosted zone materializes on first access",
+        );
+        assert_eq!(reg2.resident_zones(), vec!["corp-eng".to_string()]);
 
         reg2.shutdown_all();
         await_shutdown_cleanup().await;
     }
 
     #[tokio::test]
-    async fn test_open_existing_zones_idempotent() {
-        // Second enumeration is a no-op: setup_zone fast-paths zones
-        // already registered in self.zones.
+    async fn index_persisted_zones_is_idempotent() {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path().to_path_buf();
         let reg = ZoneRaftRegistry::new(base.clone(), 1);
@@ -1194,25 +1448,17 @@ mod tests {
         await_shutdown_cleanup().await;
 
         let reg2 = ZoneRaftRegistry::new(base, 1);
-        let first = reg2
-            .open_existing_zones_from_disk(vec![], &tokio::runtime::Handle::current())
-            .unwrap();
-        let second = reg2
-            .open_existing_zones_from_disk(vec![], &tokio::runtime::Handle::current())
-            .unwrap();
-        assert_eq!(first, 1);
-        assert_eq!(second, 1);
+        assert_eq!(reg2.index_persisted_zones().unwrap(), 1);
+        assert_eq!(reg2.index_persisted_zones().unwrap(), 1);
         assert_eq!(reg2.list_zones().len(), 1);
-
-        reg2.shutdown_all();
-        await_shutdown_cleanup().await;
     }
 
     #[tokio::test]
-    async fn open_persisted_zones_filtered_opens_only_named() {
-        // ZoneLoadPolicy::Only backing: with two zones persisted, a filtered
-        // open of just "root" must rehydrate root and leave the federated zone
-        // untouched (offline tooling must not spin up federated raft).
+    async fn only_policy_keeps_offline_tooling_out_of_federated_raft() {
+        // With two zones persisted, an offline tool scoped to "root" must open
+        // root and be UNABLE to open the federated zone — not just at boot but
+        // through any later lookup, because opening it would campaign and
+        // mutate a term/vote the real daemon then resumes against.
         let tmp = TempDir::new().unwrap();
         let base = tmp.path().to_path_buf();
         let reg = ZoneRaftRegistry::new(base.clone(), 1);
@@ -1225,18 +1471,29 @@ mod tests {
         await_shutdown_cleanup().await;
 
         let reg2 = ZoneRaftRegistry::new(base, 1);
+        assert_eq!(reg2.index_persisted_zones().unwrap(), 2, "both are hosted");
+        reg2.arm_materialization(
+            vec![],
+            tokio::runtime::Handle::current(),
+            ZoneLoadPolicy::Only(vec!["root".to_string()]),
+        );
         let n = reg2
-            .open_persisted_zones_filtered(
+            .materialize_now(
                 &["root".to_string()],
                 vec![],
                 &tokio::runtime::Handle::current(),
             )
             .unwrap();
         assert_eq!(n, 1, "only root should open");
-        assert_eq!(reg2.list_zones(), vec!["root".to_string()]);
+        assert_eq!(reg2.resident_zones(), vec!["root".to_string()]);
         assert!(
             reg2.get_node("sharedzone").is_none(),
-            "the federated zone must NOT be opened by a root-only filter",
+            "a root-scoped process must not reach the federated zone, even on demand",
+        );
+        assert_eq!(
+            reg2.resident_zones(),
+            vec!["root".to_string()],
+            "and the refused lookup must not have opened it either",
         );
 
         reg2.shutdown_all();
@@ -1250,7 +1507,7 @@ mod tests {
     #[tokio::test]
     async fn test_remove_zone_deletes_disk_dir() {
         // remove_zone() must delete {base}/{zone_id}/ so the next
-        // open_existing_zones_from_disk doesn't resurrect it as a zombie.
+        // index_persisted_zones doesn't resurrect it as a zombie.
         let tmp = TempDir::new().unwrap();
         let base = tmp.path().to_path_buf();
         let reg = ZoneRaftRegistry::new(base.clone(), 1);
@@ -1320,9 +1577,7 @@ mod tests {
         await_shutdown_cleanup().await;
 
         let reg2 = ZoneRaftRegistry::new(base.clone(), 1);
-        let n = reg2
-            .open_existing_zones_from_disk(vec![], &tokio::runtime::Handle::current())
-            .unwrap();
+        let n = reg2.index_persisted_zones().unwrap();
         assert_eq!(n, 1);
         assert_eq!(reg2.list_zones(), vec!["keep".to_string()]);
         assert!(!base.join("gone").exists());
@@ -1350,9 +1605,7 @@ mod tests {
         assert!(base.join("crash-zone").exists());
 
         let reg2 = ZoneRaftRegistry::new(base.clone(), 1);
-        let n = reg2
-            .open_existing_zones_from_disk(vec![], &tokio::runtime::Handle::current())
-            .unwrap();
+        let n = reg2.index_persisted_zones().unwrap();
         assert_eq!(n, 0, "tombstoned zone must not be reopened");
         assert!(
             !base.join("crash-zone").exists(),
