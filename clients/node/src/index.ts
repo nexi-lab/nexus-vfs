@@ -76,6 +76,9 @@ interface UnaryClient {
   Write: GrpcMethod<WriteRequest, WriteResponse>
   Delete: GrpcMethod<DeleteRequest, DeleteResponse>
   Ping: GrpcMethod<PingRequest, PingResponse>
+  Stat: GrpcMethod<StatRequest, StatResponse>
+  Readdir: GrpcMethod<ReaddirRequest, ReaddirResponse>
+  Mkdir: GrpcMethod<MkdirRequest, MkdirResponse>
   StreamReadAt: GrpcMethod<StreamReadAtRequest, StreamReadAtResponse>
   StreamWriteNowait: GrpcMethod<StreamWriteRequest, StreamWriteResponse>
   close(): void
@@ -127,6 +130,55 @@ interface DeleteResponse {
 interface PingRequest {
   auth_token: string
 }
+interface StatRequest {
+  path: string
+  auth_token: string
+  zone_id: string
+}
+interface StatResponse {
+  found: boolean
+  path: string
+  size: string
+  content_id: string
+  mime_type: string
+  is_directory: boolean
+  entry_type: number
+  mode: number
+  version: number
+  zone_id: string
+  created_at_ms?: string
+  modified_at_ms?: string
+  last_writer_address: string
+  link_target: string
+  owner_id: string
+  is_error: boolean
+  error_payload: Buffer
+}
+interface ReaddirRequest {
+  path: string
+  auth_token: string
+  zone_id: string
+}
+interface ReaddirEntry {
+  name: string
+  entry_type: number
+}
+interface ReaddirResponse {
+  entries: ReaddirEntry[]
+  is_error: boolean
+  error_payload: Buffer
+}
+interface MkdirRequest {
+  path: string
+  auth_token: string
+  parents: boolean
+  exist_ok: boolean
+}
+interface MkdirResponse {
+  hit: boolean
+  is_error: boolean
+  error_payload: Buffer
+}
 interface StreamReadAtRequest {
   path: string
   offset: string
@@ -169,6 +221,33 @@ export interface StreamReadResult {
   timedOut: boolean
 }
 /** Server identity and liveness, from the typed `Ping` RPC. */
+/** One entry from {@link NexusVfsClient.readdir}. */
+export interface NexusDirEntry {
+  /** Child path, as the daemon reports it. */
+  name: string
+  /** `DT_*` code: 0 file, 1 dir, 2 mount, 4 stream. */
+  entryType: number
+}
+
+/** Metadata from {@link NexusVfsClient.stat}. */
+export interface NexusStat {
+  path: string
+  size: number
+  contentId?: string
+  mimeType?: string
+  isDirectory: boolean
+  entryType: number
+  mode: number
+  version: number
+  zoneId?: string
+  createdAtMs?: number
+  modifiedAtMs?: number
+  /** Origin node for federated content; powers cross-node fetch. */
+  lastWriterAddress?: string
+  linkTarget?: string
+  ownerId?: string
+}
+
 export interface NexusServerInfo {
   version: string
   zone_id: string
@@ -303,6 +382,77 @@ export class NexusVfsClient {
       recursive: false,
     })
     if (response.is_error) throw vfsError(response.error_payload, 'delete')
+  }
+
+  /**
+   * Metadata for a VFS path, or `null` when the path does not exist.
+   *
+   * `null` means the daemon answered and said "no such path" — every other
+   * failure throws. Callers that collapse both into a boolean lose the
+   * distinction that matters: a probe which cannot tell "absent" from
+   * "the call failed" reports a healthy-looking `false` forever.
+   */
+  async stat(path: string, authToken: string): Promise<NexusStat | null> {
+    const response = await this.unary<StatRequest, StatResponse>('Stat', 'stat', {
+      path,
+      auth_token: authToken,
+      zone_id: '',
+    })
+    if (response.is_error) throw vfsError(response.error_payload, 'stat')
+    if (!response.found) return null
+    return {
+      path: response.path,
+      size: Number(response.size ?? 0),
+      contentId: response.content_id || undefined,
+      mimeType: response.mime_type || undefined,
+      isDirectory: response.is_directory,
+      entryType: response.entry_type,
+      mode: response.mode,
+      version: response.version,
+      zoneId: response.zone_id || undefined,
+      createdAtMs: response.created_at_ms ? Number(response.created_at_ms) : undefined,
+      modifiedAtMs: response.modified_at_ms ? Number(response.modified_at_ms) : undefined,
+      lastWriterAddress: response.last_writer_address || undefined,
+      linkTarget: response.link_target || undefined,
+      ownerId: response.owner_id || undefined,
+    }
+  }
+
+  /**
+   * Does the path exist? Throws on any failure that is not a clean
+   * "not found" — see {@link stat}.
+   */
+  async exists(path: string, authToken: string): Promise<boolean> {
+    return (await this.stat(path, authToken)) !== null
+  }
+
+  /** List a directory's immediate children. */
+  async readdir(path: string, authToken: string): Promise<NexusDirEntry[]> {
+    const response = await this.unary<ReaddirRequest, ReaddirResponse>('Readdir', 'readdir', {
+      path,
+      auth_token: authToken,
+      zone_id: '',
+    })
+    if (response.is_error) throw vfsError(response.error_payload, 'readdir')
+    return (response.entries ?? []).map((e) => ({ name: e.name, entryType: e.entry_type }))
+  }
+
+  /**
+   * Create a directory. `parents` creates missing ancestors; `existOk`
+   * makes an already-present directory a success rather than an error.
+   */
+  async mkdir(
+    path: string,
+    authToken: string,
+    options: { parents?: boolean; existOk?: boolean } = {},
+  ): Promise<void> {
+    const response = await this.unary<MkdirRequest, MkdirResponse>('Mkdir', 'mkdir', {
+      path,
+      auth_token: authToken,
+      parents: options.parents ?? false,
+      exist_ok: options.existOk ?? false,
+    })
+    if (response.is_error) throw vfsError(response.error_payload, 'mkdir')
   }
 
   /**
