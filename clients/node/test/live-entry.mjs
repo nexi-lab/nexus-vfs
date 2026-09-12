@@ -49,6 +49,24 @@ try {
   const read = await client.read(path, '')
   check(read.equals(content), 'non-UTF-8 bytes survived a write/read round-trip')
 
+  // The typed filesystem ops. These exist because both we and a downstream
+  // hand-rolled them over the generic `call()` surface — which carries no
+  // mkdir/readdir/stat — and neither noticed, because `exists`-style wrappers
+  // returned false on error. Assert them against the real daemon.
+  const dir = `/live-typed-${process.pid}`
+  await client.mkdir(dir, '', { parents: true, existOk: true })
+  check((await client.stat(dir, ''))?.isDirectory === true, 'mkdir created a directory stat reports')
+  check(await client.exists(dir, ''), 'exists is true for a path that is there')
+  check(!(await client.exists(`${dir}/nope.bin`, '')), 'exists is false for a clean not-found')
+
+  await client.write(`${dir}/child.bin`, Buffer.from([1, 2, 3]), '')
+  const names = (await client.readdir(dir, '')).map((e) => e.name)
+  check(
+    names.some((n) => n.endsWith('child.bin')),
+    `readdir enumerated the child (${names.join(', ') || 'empty'})`,
+  )
+  await client.delete(`${dir}/child.bin`, '')
+
   await client.delete(path, '')
   let deleted = false
   try {
