@@ -1630,7 +1630,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         Arc::clone(&vfs_auth),
         Arc::clone(&fca_verifier_slot),
         64 * 1024 * 1024,
-        "nexusd-cluster",
+        &daemon_version_string(),
     );
 
     // Merge plugin-exposed gRPC services onto the same Routes.  Each
@@ -3581,6 +3581,25 @@ fn run_doctor(data_dir: &std::path::Path, zone_filter: Option<&str>) -> Result<(
 /// top by [`default_log_filter`]. Adding another critical target is a
 /// one-line change *there*, not here — the composition root never names
 /// which target is privacy-critical.
+/// What `Ping` reports as the running build.
+///
+/// The field is named `version` and used to be the literal string
+/// `"nexusd-cluster"` — the binary's NAME. A consumer asking "did my upgrade
+/// land?" got the same answer before and after, which is worse than no field:
+/// it reads as an answer.
+///
+/// Report the crate version plus the plugin ABI version, because the ABI is
+/// the number that actually decides whether a given plugin dylib can be
+/// loaded by this daemon at all — a deployment pairing pinned plugins with a
+/// pinned daemon needs to read it off the wire, not infer it from a filename.
+fn daemon_version_string() -> String {
+    format!(
+        "nexus-cluster {} (plugin-abi {})",
+        env!("CARGO_PKG_VERSION"),
+        kernel::kernel::PLUGIN_API_VERSION,
+    )
+}
+
 const DEFAULT_LOG_FILTER_BASE: &str = "nexusd_cluster=info,nexus_raft=info";
 
 /// The effective default filter: [`DEFAULT_LOG_FILTER_BASE`] with every

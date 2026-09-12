@@ -101,6 +101,11 @@ mod plugins;
 pub mod syscall;
 pub mod syscall_async;
 mod syscall_impl;
+/// The plugin C-ABI version this kernel loads against — re-exported because
+/// the loader enforcing it lives here, and a daemon has to be able to report
+/// which ABI it speaks (a pinned plugin set is only loadable against a
+/// matching one).
+pub use nexus_plugin_abi::PLUGIN_API_VERSION;
 pub use plugins::PluginGrpcEndpoint;
 
 // ── KernelError ────────────────────────────────────────────────────────────
