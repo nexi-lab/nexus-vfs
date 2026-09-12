@@ -19,6 +19,22 @@ use tonic::{Response, Status};
 
 use crate::grpc::{encode_rpc_error, RpcErrorCode};
 
+/// What to tell a caller that asked `Call` for something it does not carry.
+///
+/// The generic surface is an escape hatch for registry-shaped operations and
+/// `service.method` plugin dispatch — it is NOT the VFS. Every file operation
+/// is a typed RPC, and a client that reaches for `call("mkdir")` gets a bare
+/// "unknown" today and concludes the daemon is broken or the method
+/// unimplemented. One downstream shipped `exists` / `mkdir` / `list` /
+/// `delete` wrappers over this path and none had ever worked; `exists`
+/// swallowed the error as `false`, so it took months to notice. Say where the
+/// method actually lives.
+fn unknown_method_message(method: &str) -> String {
+    format!(
+        "unknown Call method: {method} — the generic Call surface carries          registry ops (agent_*, get_mount_points, service_*) and          `<service>.<method>` plugin dispatch only. File operations are typed          RPCs on NexusVfsService (Read/Write/Stat/Readdir/Mkdir/Delete/Rename/         Setattr/Ping); call those instead."
+    )
+}
+
 /// Dispatch a generic Call RPC. After the typed-RPC migration only the
 /// non-syscall control plane stays here.
 pub fn dispatch(
@@ -89,14 +105,14 @@ pub fn dispatch(
             } else {
                 Err(call_err(
                     RpcErrorCode::InternalError,
-                    &format!("unknown Call method: {method}"),
+                    &unknown_method_message(method),
                 ))
             }
         }
 
         _ => Err(call_err(
             RpcErrorCode::InternalError,
-            &format!("unknown Call method: {method}"),
+            &unknown_method_message(method),
         )),
     };
 
