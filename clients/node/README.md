@@ -25,7 +25,7 @@ Published two ways by `.github/workflows/release.yml`:
   Needs no registry credentials, so a consumer can pin the URL directly:
 
   ```json
-  "@nexus-ai-fs/vfs-client": "https://sudowork-runtime-1309794936.cos.accelerate.myqcloud.com/nexus-vfs/clients/node/0.2.4/nexus-ai-fs-vfs-client-0.2.4.tgz"
+  "@nexus-ai-fs/vfs-client": "https://sudowork-runtime-1309794936.cos.accelerate.myqcloud.com/nexus-vfs/clients/node/0.3.0/nexus-ai-fs-vfs-client-0.3.0.tgz"
   ```
 
   Pin a version for a dependency. `.../clients/node/latest/nexus-ai-fs-vfs-client.tgz`
@@ -74,11 +74,21 @@ per-request auth token, so every method takes one.
 | `read(path, authToken)` | Read a VFS path; returns raw bytes. |
 | `write(path, content, authToken)` | Write raw bytes to a VFS path. |
 | `delete(path, authToken)` | Delete a VFS path. |
-| `ping(authToken)` | Liveness through the generic dispatch path. |
+| `stat(path, authToken)` | Metadata for a path, or `null` when it does not exist. |
+| `exists(path, authToken)` | Whether a path exists. Throws on any failure that is not a clean not-found. |
+| `readdir(path, authToken)` | A directory's immediate children as `{ name, entryType }`. |
+| `mkdir(path, authToken, { parents?, existOk? })` | Create a directory. |
+| `ping(authToken)` | Liveness; resolves to the server's version string. |
 | `serverInfo(authToken)` | Version, zone and uptime, from the typed `Ping` RPC. |
 | `close()` | Close the channel. |
 
 `endpoint` accepts `host:port` or a `http(s)://` URL.
+
+Filesystem operations are typed RPCs of their own — `Read`, `Write`, `Delete`,
+`Stat`, `Readdir`, `Mkdir`, `Rename`, `Setattr`, `Ping` — not names you pass to
+`call()`. `call()` reaches the registry operations (`get_mount_points`,
+`add_mount`, …) and `<service>.<method>` plugin dispatch; asking it for `mkdir`
+or `readdir` answers `unknown Call method`. Use the methods above.
 
 An RPC that fails in transport rejects with `gRPC <op> failed: <details>`. An
 RPC that reaches the server but fails there rejects with the server's error
