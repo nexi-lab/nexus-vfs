@@ -32,6 +32,13 @@ try {
   const info = await client.serverInfo('')
   check(Boolean(info.version), `typed RPC: server reported version ${info.version}`)
 
+  // `ping` shipped for months routed through the generic `Call` surface,
+  // which carries no `ping` method — every call answered `unknown Call
+  // method: ping`. Offline tests could not see it (they mock the channel),
+  // so assert it against the real daemon.
+  const pong = await client.ping('')
+  check(pong === info.version, `ping answers from the live daemon (${pong})`)
+
   // The generic dispatch path, which is what the empty-status failure hit.
   const mounts = JSON.parse(await client.call('get_mount_points', '{}', ''))
   check(Array.isArray(mounts.result), 'generic Call returned a result array')

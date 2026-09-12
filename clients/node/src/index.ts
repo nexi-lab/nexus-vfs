@@ -306,11 +306,18 @@ export class NexusVfsClient {
   }
 
   /**
-   * Liveness check through the generic dispatch path, so it exercises the
-   * same route as real traffic. Returns the raw JSON response.
+   * Liveness check: the typed `Ping` RPC, which answers with the zone that
+   * served the call — so a success names a live zone rather than proving a
+   * socket accepted.
+   *
+   * This used to go through the generic `Call` surface, which does not carry
+   * a `ping` method and never has: every call came back `unknown Call
+   * method: ping`. Reach for `serverInfo` when you want the fields; this
+   * returns the version string for callers that just want a heartbeat.
    */
   async ping(authToken: string): Promise<string> {
-    return this.call('ping', '{}', authToken)
+    const info = await this.serverInfo(authToken)
+    return info.version
   }
 
   /**
