@@ -1600,7 +1600,8 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         }
     }
 
-    let api_key_auth = match auth_posture(&common)? {
+    let posture = auth_posture(&common)?;
+    let api_key_auth = match &posture {
         AuthPosture::ApiKey(secret) => {
             // Reads the kernel's §3.B.3 slot per lookup, so the provider can be
             // built here — before the zones bootstrap and the root zone's
@@ -1609,15 +1610,44 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
             // `NoopAuthKeyStore`, so an early request authenticates as nobody
             // rather than as everybody.
             let store = auth::KernelSlotStore::new_arc(Arc::clone(&kernel));
-            Some(Arc::new(auth::ApiKeyAuthProvider::new(store, secret)))
+            Some(Arc::new(auth::ApiKeyAuthProvider::new(
+                store,
+                secret.clone(),
+            )))
         }
-        AuthPosture::Open => None,
+        AuthPosture::Open | AuthPosture::CertIdentity => None,
     };
 
-    let vfs_auth: Arc<dyn transport::auth::AuthProvider> = match &api_key_auth {
-        Some(provider) => Arc::clone(provider) as _,
-        None => Arc::new(transport::auth::NoAuth),
+    // mTLS with no `sk-` policy: certificates ARE the credential plane, so
+    // install the provider that READS them. Without this the daemon admits
+    // only CA-verified peers and then resolves each one as
+    // nobody-in-particular — identity unarmed, A2A stamping fail-open, `from`
+    // forgeable on the deployment that demanded certificates (see
+    // `auth_posture`).
+    let cert_identity_auth = match &posture {
+        AuthPosture::CertIdentity => {
+            // Say it out loud, the way the `sk-` plane does: an operator
+            // reading the boot log can tell "callers are identified" from
+            // "callers merely got in".
+            tracing::info!(
+                "certificate identity plane armed (mTLS is the credential plane; no sk- policy) \
+                 — a verified peer authenticates as its cert's SAN, a caller without one is rejected"
+            );
+            Some(Arc::new(auth::CertIdentityProvider::new()))
+        }
+        AuthPosture::ApiKey(_) | AuthPosture::Open => None,
     };
+
+    // Is an identity plane armed? This — not "was a secret set" — is what
+    // fail-closed postures downstream key off (A2A stamping above all).
+    let identity_armed = api_key_auth.is_some() || cert_identity_auth.is_some();
+
+    let vfs_auth: Arc<dyn transport::auth::AuthProvider> =
+        match (&api_key_auth, &cert_identity_auth) {
+            (Some(provider), _) => Arc::clone(provider) as _,
+            (None, Some(provider)) => Arc::clone(provider) as _,
+            (None, None) => Arc::new(transport::auth::NoAuth),
+        };
 
     // Late-bound verifier slot: the VFS routes are built here, BEFORE the
     // ZoneManager that owns the verifier exists (they're handed into
@@ -1797,7 +1827,13 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     // revoke. The founder holds the revoked-serial file and reads it directly;
     // a joiner fetches the CA-signed CRL from the founder's enroll addr (derived
     // from the first peer the way boot-time enrollment is) and verifies it.
-    if let Some(provider) = api_key_auth.clone() {
+    let revocation_sink: Option<Arc<dyn auth::RevocationSink>> =
+        match (api_key_auth.clone(), cert_identity_auth.clone()) {
+            (Some(p), _) => Some(p as _),
+            (None, Some(p)) => Some(p as _),
+            (None, None) => None,
+        };
+    if let Some(provider) = revocation_sink {
         let ca_key_holder = common.data_dir.join("tls").join("ca-key.pem").exists();
         let founder_enroll = if ca_key_holder {
             None
@@ -2490,8 +2526,9 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     // ── A2A messaging substrate (§F) ─────────────────────────────────
     // (1) Arm the mailbox `from`-stamp hook ONCE (the "a2a" hook-only
     // service — first boot-enlisted service). Fail-closed posture is tied
-    // to auth: only when an auth provider is armed (`api_key_auth`) does a
-    // mailbox write REQUIRE an agent identity. Under NoAuth every write has
+    // to auth: only when an IDENTITY plane is armed (`identity_armed` — an
+    // `sk-` policy or the certificate plane) does a mailbox write REQUIRE an
+    // agent identity. Under NoAuth every write has
     // an empty `agent_id`, so fail-closed would reject all mailbox writes —
     // hence gated. Behaviour-preserving under NoAuth: empty `agent_id` ⇒
     // fail-open ⇒ the policy returns None ⇒ no rewrite.
@@ -2527,7 +2564,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     };
 
     let svc_ctx = ServiceBootCtx {
-        auth_armed: api_key_auth.is_some(),
+        auth_armed: identity_armed,
         // `vfs_auth` is the trait-object the kernel gRPC interceptor
         // consumes — reuse it so every authenticated surface (kernel
         // gRPC, http-api middleware, any future service) speaks the
@@ -5070,7 +5107,7 @@ fn run_auth_blocking(common: CommonArgs, action: AuthCmd) -> Result<()> {
 /// revoke. A fetch or verify failure keeps the last known set rather than
 /// clearing it — a transient founder outage must not un-revoke an agent.
 async fn crl_refresh_loop(
-    provider: std::sync::Arc<auth::ApiKeyAuthProvider>,
+    provider: std::sync::Arc<dyn auth::RevocationSink>,
     data_dir: std::path::PathBuf,
     ca_key_holder: bool,
     founder_enroll: Option<String>,

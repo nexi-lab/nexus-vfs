@@ -58,23 +58,40 @@ async fn mailbox_roundtrip(vfs: &mut Vfs, inbox: &str) -> Result<Vec<u8>, String
     vfs.stream_write(inbox, ENVELOPE, token)
         .await
         .map_err(|e| format!("stream_write({inbox}): {e}"))?;
-    let out = vfs
-        .stream_read_at(inbox, 0, token)
-        .await
-        .map_err(|e| format!("stream_read_at({inbox}) transport: {e}"))?;
-    if out.is_error {
-        return Err(format!(
-            "stream_read_at({inbox}) kernel error: {}",
-            out.error_payload
-        ));
-    }
-    if out.data.is_empty() {
-        return Err(format!(
+    // Poll the read rather than read once: `stream_write` returns when the
+    // append is ACCEPTED, while this asserts on the entry as APPLIED, and the
+    // two are not the same instant.
+    //
+    // HONEST LIMIT: polling does NOT make this test reliable on CI. The
+    // root-zone control path (`/rootlocal/...`) still comes back
+    // `EMPTY (eof=true, next_offset=0)` after the full 20s budget on a Linux
+    // runner — 3 failures in 4 runs, one of which passed on a plain re-run —
+    // while the same binary is green locally. An entry that never appears in
+    // 20s is LOST, not late, so the wait is not the fix; see the tracking
+    // issue. The poll stays because accepted-is-not-applied is true anyway.
+    const READ_ATTEMPTS: u32 = 200;
+    let mut last = String::new();
+    for _ in 0..READ_ATTEMPTS {
+        let out = vfs
+            .stream_read_at(inbox, 0, token)
+            .await
+            .map_err(|e| format!("stream_read_at({inbox}) transport: {e}"))?;
+        if out.is_error {
+            return Err(format!(
+                "stream_read_at({inbox}) kernel error: {}",
+                out.error_payload
+            ));
+        }
+        if !out.data.is_empty() {
+            return Ok(out.data);
+        }
+        last = format!(
             "stream_read_at({inbox}) returned EMPTY (eof={}, next_offset={})",
             out.eof, out.next_offset
-        ));
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    Ok(out.data)
+    Err(last)
 }
 
 /// The ACTUAL co-host flow: the inbox is NOT provisioned as a DT_STREAM, and

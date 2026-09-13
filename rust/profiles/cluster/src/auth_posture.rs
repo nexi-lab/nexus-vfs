@@ -4,7 +4,23 @@
 //! ## The invariant
 //!
 //! > **Serving without authentication is legal only on loopback. Binding a
-//! > reachable address requires either an `sk-` credential policy or mTLS.**
+//! > reachable address requires either an `sk-` credential policy or mTLS —
+//! > and whichever answers, the caller ends up with an IDENTITY, not just a
+//! > way in.**
+//!
+//! The second half is not decoration. Admission and identity are different
+//! things: mTLS decides *who may connect*, a provider that reads the
+//! certificate decides *who they are*. A daemon that did the first without the
+//! second resolved every caller as nobody-in-particular, which left the A2A
+//! stamp hook fail-open — an envelope's `from` passed through unstamped, i.e.
+//! forgeable, on the very deployment that demanded certificates. So mTLS gets
+//! its own posture ([`AuthPosture::CertIdentity`]) instead of collapsing into
+//! [`AuthPosture::Open`].
+//!
+//! A loopback bind with no credential policy stays [`AuthPosture::Open`] even
+//! when TLS happens to be on: that is the declared trusted-local plane (one
+//! trust domain, the Unix-socket shape), and callers there are not required to
+//! hold a certificate at all.
 //!
 //! A daemon on `127.0.0.1` with no auth is the standard trusted-local-backend
 //! pattern — a plaintext socket inside one trust domain, the same shape as a
@@ -46,6 +62,19 @@ pub enum AuthPosture {
     /// all, is a system admin. Legal only where [`is_loopback_bind`] holds, or
     /// where the operator said `--insecure-no-auth` out loud.
     Open,
+    /// Authenticate by client certificate alone: mTLS is the whole credential
+    /// plane, and a CA-verified peer resolves to the identity its SAN carries.
+    /// No `sk-` policy, so there are no tokens to present — and a caller
+    /// without a certificate is *nobody*, not everybody.
+    ///
+    /// This is a distinct posture rather than [`Open`](AuthPosture::Open)
+    /// because the two differ in the thing that matters downstream: an
+    /// identity. `Open` resolves every caller as nobody-in-particular, which
+    /// leaves `ServiceBootCtx::auth_armed` false and the A2A stamp hook
+    /// fail-open, so an envelope's `from` passes through unstamped. A daemon
+    /// that asked every caller for a certificate and then forgot to read it
+    /// was the worst of both.
+    CertIdentity,
 }
 
 /// Everything the decision reads. Kept as a plain struct so the rule is a pure
@@ -114,9 +143,15 @@ pub fn decide(inputs: &AuthPostureInputs) -> Result<AuthPosture> {
     }
 
     // Reachable bind. A verified client certificate is an authentication, so
-    // mTLS carries the daemon on its own.
+    // mTLS carries the daemon on its own — but only if something READS the
+    // certificate. Admission is not identity: resolving every mTLS caller as
+    // nobody-in-particular leaves the identity plane unarmed, and the A2A
+    // stamp hook then runs fail-open, so an envelope's `from` survives
+    // unstamped on a daemon whose entire premise is that callers prove who
+    // they are. Naming the certificate plane here is what makes the
+    // composition root install a provider that reads it.
     if inputs.tls_enabled {
-        return Ok(AuthPosture::Open);
+        return Ok(AuthPosture::CertIdentity);
     }
 
     // Reachable, plaintext, and nobody is asked who they are.
@@ -248,6 +283,44 @@ mod tests {
     #[test]
     fn mtls_carries_a_reachable_bind_on_its_own() {
         let mut i = inputs("0.0.0.0:2126");
+        i.tls_enabled = true;
+        assert_eq!(decide(&i).unwrap(), AuthPosture::CertIdentity);
+    }
+
+    /// The distinction that made `CertIdentity` a posture of its own: an mTLS
+    /// daemon must not land in the same bucket as a wide-open one. `Open`
+    /// means "nobody is identified"; every fail-closed gate downstream (A2A
+    /// `from`-stamping above all) reads that bucket, so collapsing the two
+    /// silently disarms stamping on a deployment that demanded certificates.
+    #[test]
+    fn mtls_is_not_the_same_posture_as_authenticating_nobody() {
+        let mut mtls = inputs("0.0.0.0:2126");
+        mtls.tls_enabled = true;
+        let mut wide_open = inputs("0.0.0.0:2126");
+        wide_open.insecure_no_auth = true;
+
+        assert_eq!(decide(&mtls).unwrap(), AuthPosture::CertIdentity);
+        assert_eq!(decide(&wide_open).unwrap(), AuthPosture::Open);
+        assert_ne!(decide(&mtls).unwrap(), decide(&wide_open).unwrap());
+    }
+
+    /// A credential policy wins over the certificate plane: with a secret set,
+    /// the daemon resolves `sk-` keys AND peer certs (one provider does both),
+    /// so the posture stays `ApiKey` rather than narrowing to certs only.
+    #[test]
+    fn a_secret_still_wins_when_tls_is_also_on() {
+        let mut i = inputs("0.0.0.0:2126");
+        i.tls_enabled = true;
+        i.api_key_secret = Some("s3cret".into());
+        assert_eq!(decide(&i).unwrap(), AuthPosture::ApiKey("s3cret".into()));
+    }
+
+    /// Loopback keeps the trusted-local shape even with TLS on: callers there
+    /// are inside one trust domain and are not required to hold a certificate,
+    /// so the posture stays `Open` rather than demanding one.
+    #[test]
+    fn loopback_with_tls_stays_the_trusted_local_plane() {
+        let mut i = inputs("127.0.0.1:2126");
         i.tls_enabled = true;
         assert_eq!(decide(&i).unwrap(), AuthPosture::Open);
     }
