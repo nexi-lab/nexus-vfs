@@ -58,14 +58,17 @@ async fn mailbox_roundtrip(vfs: &mut Vfs, inbox: &str) -> Result<Vec<u8>, String
     vfs.stream_write(inbox, ENVELOPE, token)
         .await
         .map_err(|e| format!("stream_write({inbox}): {e}"))?;
-    // Poll the read: `stream_write` returns when the append is ACCEPTED, while
-    // this asserts on the entry as APPLIED. Reading once raced that — green on
-    // a dev box, red on a loaded CI runner, where it presented as "a root-zone
-    // stream does not round-trip" rather than "the reader looked too early".
-    // Bounded (20s) so a genuinely broken path still fails in seconds, not
-    // minutes. NOT root-caused: why the apply can exceed several seconds on a
-    // contended runner is unexplained — this bounds the wait rather than
-    // claiming to have fixed the cause, and says so on purpose.
+    // Poll the read rather than read once: `stream_write` returns when the
+    // append is ACCEPTED, while this asserts on the entry as APPLIED, and the
+    // two are not the same instant.
+    //
+    // HONEST LIMIT: polling does NOT make this test reliable on CI. The
+    // root-zone control path (`/rootlocal/...`) still comes back
+    // `EMPTY (eof=true, next_offset=0)` after the full 20s budget on a Linux
+    // runner — 3 failures in 4 runs, one of which passed on a plain re-run —
+    // while the same binary is green locally. An entry that never appears in
+    // 20s is LOST, not late, so the wait is not the fix; see the tracking
+    // issue. The poll stays because accepted-is-not-applied is true anyway.
     const READ_ATTEMPTS: u32 = 200;
     let mut last = String::new();
     for _ in 0..READ_ATTEMPTS {
