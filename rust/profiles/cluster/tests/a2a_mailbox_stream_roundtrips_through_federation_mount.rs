@@ -62,13 +62,17 @@ async fn mailbox_roundtrip(vfs: &mut Vfs, inbox: &str) -> Result<Vec<u8>, String
     // append is ACCEPTED, while this asserts on the entry as APPLIED, and the
     // two are not the same instant.
     //
-    // HONEST LIMIT: polling does NOT make this test reliable on CI. The
-    // root-zone control path (`/rootlocal/...`) still comes back
-    // `EMPTY (eof=true, next_offset=0)` after the full 20s budget on a Linux
-    // runner — 3 failures in 4 runs, one of which passed on a plain re-run —
-    // while the same binary is green locally. An entry that never appears in
-    // 20s is LOST, not late, so the wait is not the fix; see the tracking
-    // issue. The poll stays because accepted-is-not-applied is true anyway.
+    // The poll is NOT what makes this test reliable, and for a long time it
+    // wasn't reliable at all: the root-zone control path came back
+    // `EMPTY (eof=true, next_offset=0)` after the full 20s budget on loaded
+    // runners (#276). An entry absent after 20s is LOST, not late. The cause
+    // was the boot window — the daemon binds its port for raft before the
+    // DistributedCoordinator exists, so an early `wal,memory` mailbox found no
+    // zone metastore, fell through to a capacity-0 memory ring, and swallowed
+    // the frame behind two successful RPCs. Fixed at the door
+    // (`DataPlaneReady` holds requests until the kernel is wired) and at both
+    // silent-failure links (capacity-0 memory is refused; a rejected append is
+    // an error, not a 0-offset success).
     const READ_ATTEMPTS: u32 = 200;
     let mut last = String::new();
     for _ in 0..READ_ATTEMPTS {
@@ -190,6 +194,18 @@ async fn a2a_mailbox_stream_roundtrips_through_federation_mount() {
     eprintln!("REPRO96 plain  control  (/rootlocal/plain/…)     => {plain_control:?}");
     eprintln!("REPRO96 plain  subject  (/agents/plain/…)        => {plain_subject:?}");
     eprintln!("REPRO96 fixed  subject  (/agents/fixed/… prov)   => {fixed_subject:?}");
+
+    // A failing cell is worth the daemon's own account of it — on CI there is
+    // no second chance to reproduce, and every cell here failed at some point
+    // for a reason only the server log showed.
+    if stream_control.is_err()
+        || stream_subject.is_err()
+        || plain_control.is_err()
+        || plain_subject.is_err()
+        || fixed_subject.is_err()
+    {
+        eprintln!("=== DAEMON LOG ===\n{}", founder.drain());
+    }
 
     // Provisioned DT_STREAM round-trips (proved passing already) — kept as the
     // harness-soundness anchor.
