@@ -72,8 +72,8 @@ pub use mint::{
     agent_store_key, mint_agent_authz, mint_key, revoke_key, revoke_key_hash, MintedKey,
 };
 pub use provider::{
-    hash_key, is_well_formed, ApiKeyAuthProvider, CertIdentityProvider, RevocationSink,
-    API_KEY_MIN_LENGTH, API_KEY_PREFIX, DEFAULT_CACHE_TTL,
+    hash_key, is_well_formed, ApiKeyAuthProvider, API_KEY_MIN_LENGTH, API_KEY_PREFIX,
+    DEFAULT_CACHE_TTL,
 };
 pub use record::{AuthKeyRecord, SubjectType};
 pub use slot_store::KernelSlotStore;
