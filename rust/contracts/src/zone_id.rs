@@ -177,6 +177,47 @@ mod tests {
     }
 
     #[test]
+    fn agrees_with_the_vectors_every_consumer_checks_against() {
+        // The cross-language contract, asserted on this side.
+        //
+        // Sharing one spec makes the rule DATA impossible to drift. It does not
+        // make the LOGIC impossible to drift — sudostack's TypeScript validator
+        // is a second implementation, and it could forget a case while reading
+        // the same constants. Both sides check the same derived vectors, so a
+        // divergence fails somebody's build instead of waiting to be noticed by
+        // whichever consumer hits it first in production.
+        let mut disagreed = Vec::new();
+        for (id, should_accept) in ZONE_ID_VECTORS {
+            let accepted = validate_zone_id(id).is_ok();
+            if accepted != *should_accept {
+                disagreed.push(format!(
+                    "{id:?}: spec says accepted={should_accept}, validator said {accepted}"
+                ));
+            }
+        }
+        assert!(
+            disagreed.is_empty(),
+            "validator disagrees with the spec:
+  {}",
+            disagreed.join(
+                "
+  "
+            )
+        );
+
+        // A vector set that were all-accepting would be satisfied by a validator
+        // that never refuses, and all-refusing by one that always does.
+        assert!(
+            ZONE_ID_VECTORS.iter().any(|(_, ok)| *ok),
+            "no accepting vectors"
+        );
+        assert!(
+            ZONE_ID_VECTORS.iter().any(|(_, ok)| !*ok),
+            "no refusing vectors"
+        );
+    }
+
+    #[test]
     fn the_error_says_what_to_change() {
         let msg = validate_zone_id("Has-Upper").unwrap_err().to_string();
         assert!(msg.contains("'H'"), "{msg}");

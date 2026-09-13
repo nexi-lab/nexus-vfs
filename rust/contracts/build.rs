@@ -80,6 +80,50 @@ fn main() {
         reserved_refs = reserved_refs,
     );
 
+    // Conformance vectors, derived from the same spec rather than written out.
+    //
+    // The rule DATA cannot drift — every consumer reads this one file. The
+    // checking LOGIC can: another language is another implementation, and it can
+    // forget the leading-separator case while reading identical constants. These
+    // vectors are what catch that, and sudostack derives an identical set from
+    // the same fields for its TypeScript side.
+    //
+    // Derived, not listed, for the same reason the rules are: a hand-written
+    // case list only covers the rules its author remembered, and it goes stale
+    // the moment a bound moves. Change `max` and the long case follows.
+    let bad_char = if charset.contains('_') { '!' } else { '_' };
+    let vectors = format!(
+        "/// Cases derived from the spec: `(id, should_be_accepted)`.
+         pub const ZONE_ID_VECTORS: &[(&str, bool)] = &[
+             ({shortest:?}, true),
+             ({longest:?}, true),
+             (\"cloud-user-1001\", true),
+             (\"550e8400-e29b-41d4-a716-446655440000\", true),
+             ({too_short:?}, false),
+             ({too_long:?}, false),
+             ({leading:?}, false),
+             ({trailing:?}, false),
+             (\"Has-Upper\", false),
+             ({bad_char_case:?}, false),
+             (\"org:550e8400-e29b-41d4-a716-446655440000\", false),
+         ];
+",
+        shortest = "a".repeat(min as usize),
+        longest = "a".repeat(max as usize),
+        too_short = "a".repeat((min - 1) as usize),
+        too_long = "a".repeat((max + 1) as usize),
+        leading = format!("{no_leading}leading"),
+        trailing = format!("trailing{no_trailing}"),
+        bad_char_case = format!("has{bad_char}char"),
+    );
+
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR")).join("zone_id_rules.rs");
-    std::fs::write(&out, generated).expect("failed to write generated zone-id rules");
+    std::fs::write(
+        &out,
+        format!(
+            "{generated}
+{vectors}"
+        ),
+    )
+    .expect("failed to write generated zone-id rules");
 }
