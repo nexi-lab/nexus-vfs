@@ -1898,6 +1898,40 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         ));
     }
 
+    // Zone ids the operator declared must satisfy the format before anything is
+    // created from them. The rule and its constants live in
+    // `contracts/zone-id/spec.json`; see `contracts::zone_id`.
+    //
+    // Split on `data_dir_has_root`, and the split is the whole point:
+    //
+    //   * FIRST boot — nothing exists yet, so refusing costs nothing and stops a
+    //     malformed id from ever reaching disk, where it becomes the first path
+    //     segment of everything in that zone and is no longer renameable.
+    //   * RESTART — the zone is already there. A deployment that has been running
+    //     for months must not fail to boot because an upgrade introduced a rule
+    //     its id predates. Warn loudly and carry on; the operator decides when to
+    //     migrate, and a zone id cannot be migrated in place anyway.
+    //
+    // Refusing on restart would turn a new lint into an outage, which is a worse
+    // failure than the one being prevented.
+    for zone in &init_zones {
+        if let Err(err) = contracts::zone_id::validate_zone_id(zone) {
+            if data_dir_has_root {
+                tracing::warn!(
+                    zone = %zone,
+                    reason = %err,
+                    flag = "--cluster-init",
+                    "declared zone id does not satisfy the zone-id format; kept because this                      node already has persisted state. A zone id is the first path segment of                      everything in the zone, so it cannot be renamed — migrating means creating                      a conforming zone and moving the data.",
+                );
+            } else {
+                return Err(anyhow::anyhow!(
+                    "--cluster-init zone id {zone:?} is not valid: {err}.
+                       The id becomes the first path segment of everything in the zone and cannot                      be changed afterwards — pointing --cluster-init at a different id later                      creates a NEW empty zone and abandons the old one, with no error at any                      layer. Choose a conforming id now.",
+                ));
+            }
+        }
+    }
+
     // Surface every dropped `--cluster-init-mount` entry so the operator sees
     // them in boot logs.  When the input was non-empty but the parser ate
     // everything (the Mac↔Win L1 smoke wedge: Windows MSYS Git Bash mangling
