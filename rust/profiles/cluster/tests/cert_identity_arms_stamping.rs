@@ -17,6 +17,13 @@
 //! requires the read-back to name the certificate's identity instead. It fails
 //! on the old behaviour (the forged value survives) and passes on the new one.
 //!
+//! Then it does the same across an organisation boundary, because a customer-PKI
+//! box exists in order to talk to another org: register `CA_B` through the live
+//! daemon, and a `CA_B`-signed agent writing under the LOCAL agent's bare name
+//! must come back qualified as `{org}/agent/{name}`. Containment is pinned on
+//! the way past — the foreign agent may create its own mailbox and nothing
+//! else, so our side provisions the directory that holds it.
+//!
 //! Distinct from its siblings: `federation_mtls_from_stamp` proves the stamp
 //! across a two-node federation, and `agent_signed_authorship` proves the
 //! CA-signed authorship guarantee — both with an `sk-` secret set, i.e. the
@@ -39,13 +46,17 @@ mod common;
 use std::time::Duration;
 
 use common::{cli, free_port, write_tls_bundle, Daemon, Vfs, LOG_FILTER};
-use nexus_raft::transport::{generate_join_token, generate_zone_ca};
+use nexus_raft::transport::{generate_agent_cert, generate_join_token, generate_zone_ca};
 
 const ZONE: &str = "sharedzone";
 const MOUNT: &str = "/agents";
 const BUDGET: Duration = Duration::from_secs(120);
 const AGENT: &str = "cert-only-ai";
 const FORGED: &str = "impostor";
+/// The other org in the cross-org half: its CA is `CA_B`, and the qualified
+/// identity the plane must attribute is `{FOREIGN_ORG}/agent/{FOREIGN_AGENT}`.
+const FOREIGN_ORG: &str = "customer-pki";
+const FOREIGN_AGENT: &str = "site-worker";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_daemon_whose_only_credential_plane_is_mtls_still_stamps_from() {
@@ -188,5 +199,96 @@ async fn a_daemon_whose_only_credential_plane_is_mtls_still_stamps_from() {
     assert!(
         !got.contains(FORGED),
         "the forged `from` {FORGED:?} must not survive anywhere; got: {got}"
+    );
+
+    // ── 8. Cross-org on the SAME posture ────────────────────────────────────
+    // The deployment this posture exists for is a customer-PKI box, and what
+    // such a box does is talk to another organisation. So the certificate plane
+    // has to attribute a FOREIGN agent the way an `sk-` daemon would: qualified
+    // by its trust domain, so two orgs' same-named agents cannot collide in a
+    // mailbox `from`. Registering CA_B goes through the LIVE daemon (node-cert
+    // gated over loopback), which this node can still do — it kept its node
+    // cert, it only gave up the CA key and the cluster secret.
+    let (ca_b, ca_b_key) = generate_zone_ca(FOREIGN_ORG).expect("gen CA_B");
+    let (foreign_cert, foreign_key) =
+        generate_agent_cert(FOREIGN_AGENT, &ca_b, &ca_b_key).expect("gen CA_B-signed agent cert");
+    let fingerprint = lib::transport_primitives::ForeignCaAnchor::from_pem(FOREIGN_ORG, &ca_b)
+        .expect("anchor from CA_B pem")
+        .fingerprint_hex();
+    let ca_b_path = tmp.path().join("ca_b.pem");
+    std::fs::write(&ca_b_path, &ca_b).expect("write CA_B pem");
+    let ca_b_path = ca_b_path.to_string_lossy().into_owned();
+
+    let (ok, out, err) = cli(
+        &daemon_env,
+        &[
+            "foreign-ca",
+            "register",
+            "--domain",
+            FOREIGN_ORG,
+            "--ca-pem",
+            &ca_b_path,
+            "--fingerprint",
+            &fingerprint,
+        ],
+    );
+    assert!(
+        ok && out.trim() == fingerprint,
+        "registering CA_B must succeed on a certificate-only daemon.
+stdout: {out}
+stderr: {err}"
+    );
+
+    let mut f = Vfs::connect_mtls(port, &ca, &foreign_cert, &foreign_key, BUDGET).await;
+    let foreign_box = format!("{MOUNT}/{FOREIGN_AGENT}/chat-with-me");
+
+    // Containment still applies on this posture, and is worth pinning here
+    // rather than assumed: the foreign agent may create its own mailbox and
+    // nothing else, so it cannot even make the directory that holds it.
+    let denied = f
+        .mkdir(&format!("{MOUNT}/{FOREIGN_AGENT}"), "")
+        .await
+        .expect_err("a foreign agent must not create directories outside its mailbox");
+    assert!(
+        denied.contains("confined to its") && denied.contains(FOREIGN_ORG),
+        "the denial must name the trust domain and the confinement; got: {denied}"
+    );
+
+    // So OUR side provisions the peer's inbox — which is also how a real
+    // cross-org bring-up goes: the host org makes a place for the guest.
+    c.mkdir(&format!("{MOUNT}/{FOREIGN_AGENT}"), "")
+        .await
+        .expect("the local agent provisions the peer's directory");
+    f.create_stream(&foreign_box, "")
+        .await
+        .expect("the foreign agent opens its own mailbox — the one path it may create");
+    let foreign_envelope =
+        format!(r#"{{"from":"{AGENT}","to":"{FOREIGN_AGENT}","body":"cross-org stamping"}}"#);
+    f.stream_write(&foreign_box, foreign_envelope.as_bytes(), "")
+        .await
+        .expect("write an envelope claiming to be the LOCAL agent");
+
+    // It claimed the local agent's bare name; it must come back as its own org.
+    let want_foreign = format!(r#""from":"{FOREIGN_ORG}/agent/{FOREIGN_AGENT}""#);
+    let deadline = std::time::Instant::now() + BUDGET;
+    let mut got_foreign = String::new();
+    while std::time::Instant::now() < deadline {
+        let raw = f
+            .stream_collect_all(&foreign_box, "")
+            .await
+            .expect("collect the foreign mailbox");
+        got_foreign = String::from_utf8_lossy(&raw).into_owned();
+        if got_foreign.contains(&want_foreign) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        got_foreign.contains(&want_foreign),
+        "a foreign agent must be attributed to its ORG on a cert-only daemon; got: {got_foreign:?}"
+    );
+    assert!(
+        !got_foreign.contains(&format!(r#""from":"{AGENT}""#)),
+        "and must NOT be able to claim the local agent's bare name; got: {got_foreign:?}"
     );
 }
