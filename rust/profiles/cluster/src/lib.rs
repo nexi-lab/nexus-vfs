@@ -1450,18 +1450,41 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     //     predates. A zone id cannot be migrated in place, so refusing would
     //     offer no way out either; turning a new lint into an outage is worse
     //     than the thing being prevented.
-    for zone in &nexus_raft::federation::parse_zones_str(&common.cluster_init.join(",")) {
+    // Both doors the operator can name a NEW zone through at boot: the zone
+    // list, and the TARGET of a mount. The second was the gap — a mount names a
+    // zone that gets created at boot just as surely as `--cluster-init` does,
+    // and it went through unchecked while the flag beside it was validated.
+    let declared_zones: Vec<String> =
+        nexus_raft::federation::parse_zones_str(&common.cluster_init.join(","))
+            .into_iter()
+            .chain(
+                nexus_raft::federation::parse_mounts_str(&common.cluster_init_mount.join(","))
+                    .mounts
+                    .into_values()
+                    // A mount TARGET may legitimately name a zone the kernel
+                    // owns: `/agents=root` mounts into the root zone, which
+                    // always exists and is not being created here. The format
+                    // rule is the tenant-facing one and refuses reserved ids, so
+                    // applying it to a target would refuse a mount that creates
+                    // nothing. Naming one in `--cluster-init` is the different
+                    // claim — "found this zone" — and stays refused.
+                    .filter(|zone| {
+                        zone != contracts::ROOT_ZONE_ID && zone != contracts::CONTROL_ZONE_ID
+                    }),
+            )
+            .collect();
+    for zone in &declared_zones {
         if let Err(err) = contracts::zone_id::validate_zone_id(zone) {
             if data_dir_has_root {
                 tracing::warn!(
                     zone = %zone,
                     reason = %err,
-                    flag = "--cluster-init",
+                    flag = "--cluster-init / --cluster-init-mount",
                     "declared zone id does not satisfy the zone-id format; kept because this                      node already has persisted state. The id is the first path segment of                      everything in the zone, so migrating means creating a conforming zone and                      moving the data — it cannot be renamed.",
                 );
             } else {
                 return Err(anyhow::anyhow!(
-                    "--cluster-init zone id {zone:?} is not valid: {err}.
+                    "declared zone id {zone:?} (--cluster-init / --cluster-init-mount) is not valid: {err}.
                        The id becomes the first path segment of everything in the zone and cannot                      be changed afterwards — pointing --cluster-init at a different id later                      creates a NEW empty zone and abandons the old one, with no error at any                      layer. Choose a conforming id now.",
                 ));
             }

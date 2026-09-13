@@ -1559,7 +1559,16 @@ impl Kernel {
                         // contributes a fresh 1-voter zone (creator
                         // semantics).  Subsequent peers join via the
                         // explicit-source path above.
-                        let _ = coordinator.create_zone(self, zone_id);
+                        // Propagated, not discarded: this arm asked the
+                        // coordinator to CREATE the zone this mount is about,
+                        // so a failure means the mount would point at a zone
+                        // that does not exist — and the mount would then
+                        // succeed anyway, which is a broken federation topology
+                        // reported as success. The sibling arm above already
+                        // propagates `join_cluster` for the same reason.
+                        coordinator
+                            .create_zone(self, zone_id)
+                            .map_err(KernelError::Federation)?;
                         coordinator.metastore_for_zone(self, zone_id).ok()
                     }
                     (None, _) => None,
