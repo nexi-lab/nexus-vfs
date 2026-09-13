@@ -1539,26 +1539,26 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
     #[allow(clippy::result_large_err)]
     fn create_zone(&self, kernel: &Kernel, zone_id: &str) -> CoordinatorResult<()> {
         let zm = self.zm().ok_or("federation not active")?;
-        // A caller arriving here is CHOOSING an id — so this is where the
-        // format is refused. The boot flag is checked earlier for a better
-        // message, but an operator flag is not the only way a zone gets made:
-        // a service can ask for one at runtime, and that id becomes the first
-        // path segment of everything in the zone, permanently (a zone cannot be
-        // renamed; pointing at a different id later creates a NEW empty zone and
-        // abandons the old one silently).
+        if zm.get_zone(zone_id).is_some() {
+            self.install_apply_cb_for_zone(kernel, zone_id);
+            return Ok(());
+        }
+        // ONLY past that gate is an id being CHOSEN, so this is where the format
+        // is refused. Ahead of it the call is idempotent re-entry for a zone
+        // that already exists — including ids this rule refuses: `root` and
+        // `__control__` are reserved (the kernel makes them by other paths), and
+        // a deployment predating the rule can hold a non-conforming id whose
+        // only migration is a copy. Refusing those here would turn a lint into
+        // an outage and contradict the rule the check serves: refuse where an id
+        // is chosen, warn where an id is learned.
         //
         // Deliberately NOT in `ZoneRegistry::create_zone`, which is also how a
         // zone that ALREADY exists elsewhere gets materialised locally
         // (`wire_mount` auto-join). Refusing there would make one malformed id
         // somewhere in the cluster stop THIS node replicating a zone everyone
-        // else has — a partition wearing a validation's clothes. Refuse where an
-        // id is chosen; warn where an id is learned.
+        // else has — a partition wearing a validation's clothes.
         contracts::zone_id::validate_zone_id(zone_id)
             .map_err(|e| format!("create_zone({zone_id}): {e}"))?;
-        if zm.get_zone(zone_id).is_some() {
-            self.install_apply_cb_for_zone(kernel, zone_id);
-            return Ok(());
-        }
         let runtime = self
             .runtime
             .get()

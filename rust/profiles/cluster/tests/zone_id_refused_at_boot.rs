@@ -135,3 +135,74 @@ stderr: {err}"
         );
     }
 }
+
+/// The third door, and the one that failed SILENTLY before this: a mount whose
+/// target zone does not exist yet asks the coordinator to create it, and the
+/// kernel used to discard the result (`let _ = ...`). A malformed id therefore
+/// produced no zone, no error, and a mount that "succeeded" pointing at
+/// nothing — a broken federation topology reported as success.
+#[tokio::test]
+async fn a_mount_naming_a_malformed_zone_refuses_to_boot() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let port = common::free_port();
+    let mut daemon = Daemon::spawn(
+        &[
+            "serve-local",
+            "--port",
+            &port.to_string(),
+            "--data-dir",
+            dir.path().to_str().expect("utf-8 tempdir"),
+            "--cluster-init",
+            "sharedzone",
+            // The zone named by the MOUNT, not by --cluster-init: #277's check
+            // covers the flag, and a mount target is a different door.
+            "--cluster-init-mount",
+            "/agents=Has-Upper",
+        ],
+        &[],
+    );
+
+    let logs = match daemon.wait_tcp(port, Duration::from_secs(25)).await {
+        Ok(()) => panic!("daemon served with a mount naming a malformed zone id"),
+        Err(output) => output,
+    };
+    assert!(
+        logs.contains("Has-Upper"),
+        "the refusal must name the offending zone id:
+{logs}"
+    );
+}
+
+/// The other half, and the regression this pair exists for: a mount naming a
+/// zone that ALREADY exists must still boot — including `root`, which the
+/// format deliberately refuses as reserved.
+///
+/// Validating before the "already loaded" gate looked equivalent and was not:
+/// it turned every re-entry for an existing zone into a refusal, which would
+/// have broken this config and, worse, any deployment holding an id created
+/// before the rule existed. Refuse where an id is chosen; a zone that is
+/// already there is not being chosen.
+#[tokio::test]
+async fn a_mount_naming_an_existing_reserved_zone_still_boots() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let port = common::free_port();
+    let mut daemon = Daemon::spawn(
+        &[
+            "serve-local",
+            "--port",
+            &port.to_string(),
+            "--data-dir",
+            dir.path().to_str().expect("utf-8 tempdir"),
+            "--cluster-init",
+            "sharedzone",
+            "--cluster-init-mount",
+            "/agents=root",
+        ],
+        &[],
+    );
+
+    daemon
+        .wait_tcp(port, Duration::from_secs(30))
+        .await
+        .expect("a mount onto the existing root zone must still serve");
+}
