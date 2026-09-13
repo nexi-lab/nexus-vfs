@@ -10,6 +10,7 @@ pub mod constants;
 pub mod lock_state;
 pub mod operation_context;
 pub mod rust_service;
+pub mod zone_id;
 pub use agent_pid::{decode_agent_pid, encode_agent_pid};
 pub use constants::{
     env, is_system_path, recommended_worker_threads, AUTH_KEYS_PATH_PREFIX, BLAKE3_EMPTY,

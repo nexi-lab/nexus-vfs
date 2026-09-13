@@ -19,3 +19,9 @@ serde = { version = "1.0", features = ["derive"] }
 # wiring type-safe (no caller-side mismatch between backend Arc and
 # state Arc).
 parking_lot = "0.12"
+
+[build-dependencies]
+# Reads contracts/zone-id/spec.json at build time. A build dependency, so it
+# never enters the dependency graph of anything that links this crate — the
+# "zero deps" property of the library is unchanged.
+serde_json = "1.0"
