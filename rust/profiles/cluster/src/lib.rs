@@ -2989,6 +2989,15 @@ async fn run_share(
         .map(NodeAddress::to_raft_peer_str)
         .collect();
 
+    // `share` names a brand-new zone, so the id is being chosen here and the
+    // format is refused rather than warned about: unlike a resumed node, there
+    // is no existing data whose only migration path is a copy.
+    contracts::zone_id::validate_zone_id(new_zone_id).map_err(|e| {
+        anyhow::anyhow!(
+            "--new-zone {new_zone_id:?} is not a valid zone id: {e}.              The id becomes the first path segment of everything under it and              cannot be changed afterwards."
+        )
+    })?;
+
     if zm.get_zone(new_zone_id).is_none() {
         zm.create_zone_async(new_zone_id, peers_str)
             .await

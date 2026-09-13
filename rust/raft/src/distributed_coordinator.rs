@@ -1539,6 +1539,22 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
     #[allow(clippy::result_large_err)]
     fn create_zone(&self, kernel: &Kernel, zone_id: &str) -> CoordinatorResult<()> {
         let zm = self.zm().ok_or("federation not active")?;
+        // A caller arriving here is CHOOSING an id — so this is where the
+        // format is refused. The boot flag is checked earlier for a better
+        // message, but an operator flag is not the only way a zone gets made:
+        // a service can ask for one at runtime, and that id becomes the first
+        // path segment of everything in the zone, permanently (a zone cannot be
+        // renamed; pointing at a different id later creates a NEW empty zone and
+        // abandons the old one silently).
+        //
+        // Deliberately NOT in `ZoneRegistry::create_zone`, which is also how a
+        // zone that ALREADY exists elsewhere gets materialised locally
+        // (`wire_mount` auto-join). Refusing there would make one malformed id
+        // somewhere in the cluster stop THIS node replicating a zone everyone
+        // else has — a partition wearing a validation's clothes. Refuse where an
+        // id is chosen; warn where an id is learned.
+        contracts::zone_id::validate_zone_id(zone_id)
+            .map_err(|e| format!("create_zone({zone_id}): {e}"))?;
         if zm.get_zone(zone_id).is_some() {
             self.install_apply_cb_for_zone(kernel, zone_id);
             return Ok(());

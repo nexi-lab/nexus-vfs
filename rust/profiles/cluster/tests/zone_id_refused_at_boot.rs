@@ -18,7 +18,7 @@
 
 mod common;
 
-use common::Daemon;
+use common::{cli, Daemon};
 use std::time::Duration;
 
 /// Ids covering one violation each, so a failure names which rule broke rather
@@ -95,4 +95,43 @@ async fn a_conforming_zone_id_still_boots() {
         .wait_tcp(port, Duration::from_secs(30))
         .await
         .expect("a conforming zone id must still found a cluster");
+}
+
+/// `share` is the other way an operator NAMES a new zone, and it was the gap
+/// the boot check left: a flag refused at startup says nothing about an id
+/// chosen later from the command line.
+///
+/// Same rule, same reason, different door — and the refusal has to carry the
+/// "cannot be changed afterwards" part here too, because that is what makes a
+/// wrong id expensive rather than annoying.
+#[tokio::test]
+async fn share_refuses_a_malformed_new_zone_id() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data = dir.path().to_str().expect("utf-8 tempdir").to_string();
+
+    for (zone, why) in MALFORMED {
+        // `--zone-id=<id>`, not `--zone-id <id>`: an id starting with a hyphen
+        // is otherwise eaten by clap as a short flag and the CLI refuses for the
+        // wrong reason — green test, nothing proven. Same trap the boot case
+        // above documents.
+        let (ok, out, err) = cli(
+            &[("NEXUS_DATA_DIR", data.as_str())],
+            &["share", &format!("--zone-id={zone}"), "/some/subtree"],
+        );
+        assert!(
+            !ok,
+            "share must refuse a {why} zone id ({zone:?}).
+stdout: {out}
+stderr: {err}"
+        );
+        let said = format!("{out}{err}");
+        assert!(
+            said.contains(zone),
+            "the refusal for {why} must name the offending id {zone:?}: {said}"
+        );
+        assert!(
+            said.contains("cannot be changed"),
+            "the refusal for {why} must say the id is permanent, or it reads as              a style complaint: {said}"
+        );
+    }
 }
