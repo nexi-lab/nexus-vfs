@@ -58,23 +58,34 @@ async fn mailbox_roundtrip(vfs: &mut Vfs, inbox: &str) -> Result<Vec<u8>, String
     vfs.stream_write(inbox, ENVELOPE, token)
         .await
         .map_err(|e| format!("stream_write({inbox}): {e}"))?;
-    let out = vfs
-        .stream_read_at(inbox, 0, token)
-        .await
-        .map_err(|e| format!("stream_read_at({inbox}) transport: {e}"))?;
-    if out.is_error {
-        return Err(format!(
-            "stream_read_at({inbox}) kernel error: {}",
-            out.error_payload
-        ));
-    }
-    if out.data.is_empty() {
-        return Err(format!(
+    // Poll the read: `stream_write` returns when the append is ACCEPTED, while
+    // this asserts on the entry as APPLIED. Reading once raced that — green on
+    // a dev box, red on a loaded CI runner, where it presented as "a root-zone
+    // stream does not round-trip" rather than "the reader looked too early".
+    // Bounded so a genuinely broken path still fails in seconds, not minutes.
+    const READ_ATTEMPTS: u32 = 50;
+    let mut last = String::new();
+    for _ in 0..READ_ATTEMPTS {
+        let out = vfs
+            .stream_read_at(inbox, 0, token)
+            .await
+            .map_err(|e| format!("stream_read_at({inbox}) transport: {e}"))?;
+        if out.is_error {
+            return Err(format!(
+                "stream_read_at({inbox}) kernel error: {}",
+                out.error_payload
+            ));
+        }
+        if !out.data.is_empty() {
+            return Ok(out.data);
+        }
+        last = format!(
             "stream_read_at({inbox}) returned EMPTY (eof={}, next_offset={})",
             out.eof, out.next_offset
-        ));
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    Ok(out.data)
+    Err(last)
 }
 
 /// The ACTUAL co-host flow: the inbox is NOT provisioned as a DT_STREAM, and
