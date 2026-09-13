@@ -95,6 +95,26 @@ impl Daemon {
     /// test's own (for `RUST_LOG=info` debugging); nothing is captured then, so
     /// `drain()` / `wait_for_log()` see nothing.
     pub fn spawn(args: &[&str], env: &[(&str, &str)]) -> Self {
+        // A daemon with no identity dir falls back to the USER-GLOBAL one
+        // (`~/.local/share/nexus/identity.json`). Every test in a binary then
+        // shares it, they run concurrently, and the loser of the atomic-rename
+        // race dies with `identity persist_peers: ... No such file or
+        // directory` — reported as whatever that test was actually asserting.
+        // It cost a red CI run diagnosed as a flake before anyone looked at the
+        // path in the error. Refusing here makes the whole class impossible
+        // rather than remembered, which is the same reason the daemon itself
+        // refuses an unauthenticated reachable bind instead of warning about it.
+        let has_identity_dir = args
+            .iter()
+            .any(|a| *a == "--identity-dir" || a.starts_with("--identity-dir="))
+            || env.iter().any(|(k, _)| *k == "NEXUS_IDENTITY_DIR");
+        assert!(
+            has_identity_dir,
+            "test daemons must be given their own identity dir (--identity-dir \
+             or NEXUS_IDENTITY_DIR). Without one this daemon writes the \
+             user-global identity.json that every concurrent test shares, and \
+             the failure surfaces as an unrelated assertion. args: {args:?}"
+        );
         let inherit = std::env::var("NEXUS_E2E_INHERIT_LOGS").is_ok();
         let mut cmd = Command::new(bin());
         cmd.args(args)

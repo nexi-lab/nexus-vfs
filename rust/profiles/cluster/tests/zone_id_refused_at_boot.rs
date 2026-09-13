@@ -31,10 +31,31 @@ const MALFORMED: &[(&str, &str)] = &[
     ("has_underscore", "character outside the set"),
 ];
 
+/// Per-test data AND identity directories.
+///
+/// The identity dir is the point. Without `--identity-dir` a daemon falls back
+/// to the user-global `~/.local/share/nexus/identity.json`, which every test in
+/// this binary would then share — and they run concurrently, so the loser of the
+/// atomic-rename race dies with `identity persist_peers: ... No such file or
+/// directory`. It surfaced as a flaky `a conforming zone id must still found a
+/// cluster`: a verdict about the ZONE RULE, reported by a test whose daemon had
+/// actually lost a fight over a file in someone's home directory. Every other
+/// suite here already isolates it; this one did not, and adding two more daemons
+/// tipped it over.
+fn dirs(tmp: &std::path::Path) -> (String, String) {
+    let data = tmp.join("data");
+    let ident = tmp.join("identity");
+    (
+        data.to_str().expect("utf-8 tempdir").to_string(),
+        ident.to_str().expect("utf-8 tempdir").to_string(),
+    )
+}
+
 #[tokio::test]
 async fn malformed_cluster_init_zone_id_refuses_to_boot() {
     for (zone, why) in MALFORMED {
         let dir = tempfile::tempdir().expect("tempdir");
+        let (data, ident) = dirs(dir.path());
         let port = common::free_port();
         let mut daemon = Daemon::spawn(
             &[
@@ -42,7 +63,9 @@ async fn malformed_cluster_init_zone_id_refuses_to_boot() {
                 "--port",
                 &port.to_string(),
                 "--data-dir",
-                dir.path().to_str().expect("utf-8 tempdir"),
+                &data,
+                "--identity-dir",
+                &ident,
                 // `--cluster-init=<id>`, not `--cluster-init <id>`: an id starting
                 // with a hyphen is otherwise eaten by clap as a short flag, and
                 // the daemon refuses for the wrong reason — which would leave
@@ -77,6 +100,7 @@ async fn a_conforming_zone_id_still_boots() {
     // The half that keeps the test above honest: "refuses everything" would
     // satisfy it just as well as "refuses the malformed ones".
     let dir = tempfile::tempdir().expect("tempdir");
+    let (data, ident) = dirs(dir.path());
     let port = common::free_port();
     let mut daemon = Daemon::spawn(
         &[
@@ -84,7 +108,9 @@ async fn a_conforming_zone_id_still_boots() {
             "--port",
             &port.to_string(),
             "--data-dir",
-            dir.path().to_str().expect("utf-8 tempdir"),
+            &data,
+            "--identity-dir",
+            &ident,
             "--cluster-init",
             "cloud-user-1001",
         ],
@@ -107,7 +133,7 @@ async fn a_conforming_zone_id_still_boots() {
 #[tokio::test]
 async fn share_refuses_a_malformed_new_zone_id() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let data = dir.path().to_str().expect("utf-8 tempdir").to_string();
+    let (data, _ident) = dirs(dir.path());
 
     for (zone, why) in MALFORMED {
         // `--zone-id=<id>`, not `--zone-id <id>`: an id starting with a hyphen
@@ -144,6 +170,7 @@ stderr: {err}"
 #[tokio::test]
 async fn a_mount_naming_a_malformed_zone_refuses_to_boot() {
     let dir = tempfile::tempdir().expect("tempdir");
+    let (data, ident) = dirs(dir.path());
     let port = common::free_port();
     let mut daemon = Daemon::spawn(
         &[
@@ -151,7 +178,9 @@ async fn a_mount_naming_a_malformed_zone_refuses_to_boot() {
             "--port",
             &port.to_string(),
             "--data-dir",
-            dir.path().to_str().expect("utf-8 tempdir"),
+            &data,
+            "--identity-dir",
+            &ident,
             "--cluster-init",
             "sharedzone",
             // The zone named by the MOUNT, not by --cluster-init: #277's check
@@ -185,6 +214,7 @@ async fn a_mount_naming_a_malformed_zone_refuses_to_boot() {
 #[tokio::test]
 async fn a_mount_naming_an_existing_reserved_zone_still_boots() {
     let dir = tempfile::tempdir().expect("tempdir");
+    let (data, ident) = dirs(dir.path());
     let port = common::free_port();
     let mut daemon = Daemon::spawn(
         &[
@@ -192,7 +222,9 @@ async fn a_mount_naming_an_existing_reserved_zone_still_boots() {
             "--port",
             &port.to_string(),
             "--data-dir",
-            dir.path().to_str().expect("utf-8 tempdir"),
+            &data,
+            "--identity-dir",
+            &ident,
             "--cluster-init",
             "sharedzone",
             "--cluster-init-mount",
