@@ -62,8 +62,11 @@ async fn mailbox_roundtrip(vfs: &mut Vfs, inbox: &str) -> Result<Vec<u8>, String
     // this asserts on the entry as APPLIED. Reading once raced that — green on
     // a dev box, red on a loaded CI runner, where it presented as "a root-zone
     // stream does not round-trip" rather than "the reader looked too early".
-    // Bounded so a genuinely broken path still fails in seconds, not minutes.
-    const READ_ATTEMPTS: u32 = 50;
+    // Bounded (20s) so a genuinely broken path still fails in seconds, not
+    // minutes. NOT root-caused: why the apply can exceed several seconds on a
+    // contended runner is unexplained — this bounds the wait rather than
+    // claiming to have fixed the cause, and says so on purpose.
+    const READ_ATTEMPTS: u32 = 200;
     let mut last = String::new();
     for _ in 0..READ_ATTEMPTS {
         let out = vfs
