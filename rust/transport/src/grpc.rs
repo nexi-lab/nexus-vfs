@@ -12,7 +12,7 @@
 //! | `Call`                           | Stubbed (`Unimplemented`)                |
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -109,10 +109,104 @@ pub(crate) struct VfsServiceImpl {
     /// the mTLS handshake admits against AND the apply observer refreshes, so
     /// classification, admission, and the live foreign-anchor set never disagree.
     pub(crate) foreign_ca_verifier: ForeignCaVerifierSlot,
+    /// Boot-window gate — see [`DataPlaneReady`]. Held closed until the owning
+    /// server says the kernel behind this service is fully wired.
+    pub(crate) ready: Arc<DataPlaneReady>,
     pub(crate) server_started_at: Instant,
     pub(crate) server_version: Arc<str>,
     pub(crate) started_secs: Arc<AtomicU64>,
 }
+
+/// "Is the kernel behind the VFS service fully wired?" — the gate every VFS
+/// request passes through before it may touch the kernel.
+///
+/// A cluster daemon MUST bind its gRPC port early: the port is the raft
+/// data plane, and peers have to reach it to form the cluster at all. The VFS
+/// service is co-hosted on that same port, so it starts accepting client
+/// requests long before boot has installed the DistributedCoordinator, wired
+/// the mounts, and enlisted the services. A request served in that window is
+/// not merely early — it is answered by a DIFFERENT kernel: no coordinator
+/// means no zone metastore, so a `wal` DT_STREAM (an A2A mailbox) silently
+/// resolved to a node-local backend and the message was written into a buffer
+/// nothing replicates and nothing reads back. That is the #276 failure: two
+/// successful RPCs and an empty mailbox.
+///
+/// So the gate WAITS rather than refusing on sight: the condition is transient
+/// by construction (boot always finishes or the process dies), and holding a
+/// request for the tail of boot is strictly better for every caller than
+/// either a lie or a retry loop each client would have to write. It refuses
+/// only when the wait itself times out, and refuses with `Unavailable` — a
+/// retryable code that can never be mistaken for "your write landed".
+///
+/// The `false → true` edge is one-way and event-driven (a `watch` channel, not
+/// a poll loop): the boot thread marks ready, and every held request wakes.
+/// Steady state — the whole life of the process after boot — costs one relaxed
+/// atomic load per request; the `watch` is touched only while still closed.
+///
+/// This also subsumes the older per-RPC wait on the SERVICE set: a gate is
+/// opened by a boot that has already enlisted its services, so a `Call` that
+/// gets through can trust "service not found" to mean exactly that.
+pub struct DataPlaneReady {
+    /// Hot-path mirror of the `watch` value. One-way `false → true`.
+    ready: AtomicBool,
+    tx: tokio::sync::watch::Sender<bool>,
+}
+
+impl DataPlaneReady {
+    /// A gate that starts CLOSED — for a server whose kernel is still being
+    /// wired while the port is already accepting (the cluster daemon).
+    /// The owner must call [`Self::mark_ready`] when boot completes; until it
+    /// does, every VFS request is held and then refused, which is loud and
+    /// immediate rather than silently wrong.
+    pub fn pending() -> Arc<Self> {
+        Arc::new(Self {
+            ready: AtomicBool::new(false),
+            tx: tokio::sync::watch::channel(false).0,
+        })
+    }
+
+    /// A gate that is OPEN from the start — for a server handed a kernel that
+    /// is already fully wired (coordinator, mounts, services) before it ever
+    /// serves: the standalone [`spawn`] path, and tests.
+    pub fn open() -> Arc<Self> {
+        Arc::new(Self {
+            ready: AtomicBool::new(true),
+            tx: tokio::sync::watch::channel(true).0,
+        })
+    }
+
+    /// Open the gate, waking every held request. Idempotent; callable from
+    /// sync boot code.
+    pub fn mark_ready(&self) {
+        // Publish through the watch FIRST, then the hot-path mirror: a waiter
+        // woken by the watch must never find the mirror still false.
+        self.tx.send_replace(true);
+        self.ready.store(true, Ordering::Release);
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
+
+    /// Wait (event-driven) for the gate to open, up to `budget`. `false` ⇒ it
+    /// never opened and the caller must refuse.
+    async fn wait(&self, budget: std::time::Duration) -> bool {
+        if self.is_ready() {
+            return true; // hot path: one atomic read, no subscription
+        }
+        let mut rx = self.tx.subscribe();
+        let waited = tokio::time::timeout(budget, rx.wait_for(|ready| *ready)).await;
+        matches!(waited, Ok(Ok(_)))
+    }
+}
+
+/// How long a request will wait out the boot window before being refused.
+///
+/// Generous on purpose: the alternative to waiting is failing a caller that
+/// did nothing wrong. Boot reaches ready in well under a second on an idle
+/// machine; the observed worst case is a heavily loaded CI runner forming raft
+/// zones, which took tens of seconds.
+const DATA_PLANE_READY_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Every VFS request message carries its bearer token in an `auth_token`
 /// field. Naming that shape as a trait is what lets [`VfsServiceImpl::authenticate`]
@@ -169,10 +263,21 @@ impl VfsServiceImpl {
     /// over mTLS has already had its chain verified against the cluster
     /// CA by rustls, and [`AuthCredentials::peer`] is how a provider
     /// gets to use that fact.
-    pub(crate) fn authenticate<T: AuthedRequest>(
+    ///
+    /// This is also where the boot-window gate lives ([`DataPlaneReady`]):
+    /// EVERY handler's first act is `authenticate`, so gating here makes "a
+    /// request reached the kernel before the kernel was wired" unrepresentable
+    /// — a new RPC cannot reintroduce the hole by forgetting a check.
+    pub(crate) async fn authenticate<T: AuthedRequest>(
         &self,
         req: Request<T>,
     ) -> Result<(OperationContext, T), Status> {
+        if !self.ready.wait(DATA_PLANE_READY_BUDGET).await {
+            return Err(Status::unavailable(
+                "nexusd is still booting: the VFS data plane is not wired yet \
+                 (no distributed coordinator) — retry",
+            ));
+        }
         // Resolve the peer identity, foreign-CA aware only when it can matter.
         // `foreign_anchors()` is an O(1) ArcSwap read the apply observer keeps
         // fresh. When it is empty — the common case, and always so on an auth-off
@@ -481,13 +586,22 @@ impl VfsServiceImpl {
         }
     }
 
-    /// Test-only constructor.
+    /// Test-only constructor. The gate is OPEN — a test kernel is wired before
+    /// the test calls anything. [`Self::for_test_pending`] is the variant that
+    /// exercises the boot window itself.
     #[cfg(test)]
     pub(crate) fn for_test(kernel: Arc<Kernel>) -> Self {
+        Self::for_test_gated(kernel, DataPlaneReady::open())
+    }
+
+    /// Test-only: a service whose data-plane gate is still CLOSED.
+    #[cfg(test)]
+    pub(crate) fn for_test_gated(kernel: Arc<Kernel>, ready: Arc<DataPlaneReady>) -> Self {
         Self {
             kernel,
             auth: Arc::new(crate::auth::NoAuth),
             foreign_ca_verifier: Arc::new(std::sync::OnceLock::new()),
+            ready,
             server_started_at: Instant::now(),
             server_version: Arc::from("test"),
             started_secs: Arc::new(AtomicU64::new(0)),
@@ -512,29 +626,10 @@ where
         .map_err(|e| Status::internal(format!("kernel blocking task join error: {e}")))
 }
 
-/// Hold a service `Call` that arrives before `bring_up_services` has
-/// enlisted the services. This gRPC server binds early (the raft transport
-/// needs it up for founder/joiner consensus during zone bootstrap), which
-/// is BEFORE the service set is installed — so a spawn-then-immediately-
-/// connect client can land a dot-notation service call in that window.
-/// Waiting (bounded) lets the daemon distinguish "declared, not yet
-/// installed" (hold) from "genuinely absent" (dispatch answers not-found)
-/// instead of returning a lying terminal error. On timeout we fall through
-/// and let dispatch answer normally.
-async fn wait_services_ready(kernel: &Kernel, timeout: std::time::Duration) {
-    let deadline = tokio::time::Instant::now() + timeout;
-    while !kernel.services_ready() {
-        if tokio::time::Instant::now() >= deadline {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-}
-
 #[tonic::async_trait]
 impl NexusVfsService for VfsServiceImpl {
     async fn read(&self, req: Request<ReadRequest>) -> Result<Response<ReadResponse>, Status> {
-        let (ctx, req) = match self.authenticate(req) {
+        let (ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_read(s))),
         };
@@ -588,7 +683,7 @@ impl NexusVfsService for VfsServiceImpl {
     }
 
     async fn write(&self, req: Request<WriteRequest>) -> Result<Response<WriteResponse>, Status> {
-        let (ctx, req) = match self.authenticate(req) {
+        let (ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_write(s))),
         };
@@ -626,7 +721,7 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<DeleteRequest>,
     ) -> Result<Response<DeleteResponse>, Status> {
-        let (ctx, req) = match self.authenticate(req) {
+        let (ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_delete(s))),
         };
@@ -674,7 +769,7 @@ impl NexusVfsService for VfsServiceImpl {
     }
 
     async fn mkdir(&self, req: Request<MkdirRequest>) -> Result<Response<MkdirResponse>, Status> {
-        let (ctx, req) = match self.authenticate(req) {
+        let (ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_mkdir(s))),
         };
@@ -696,7 +791,7 @@ impl NexusVfsService for VfsServiceImpl {
     }
 
     async fn stat(&self, req: Request<StatRequest>) -> Result<Response<StatResponse>, Status> {
-        let (ctx, req) = match self.authenticate(req) {
+        let (ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_stat(s))),
         };
@@ -739,7 +834,7 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<ReaddirRequest>,
     ) -> Result<Response<ReaddirResponse>, Status> {
-        let (ctx, req) = match self.authenticate(req) {
+        let (ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_readdir(s))),
         };
@@ -814,7 +909,7 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<SetattrRequest>,
     ) -> Result<Response<SetattrResponse>, Status> {
-        let (ctx, req) = match self.authenticate(req) {
+        let (ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_setattr(s))),
         };
@@ -837,7 +932,7 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<RenameRequest>,
     ) -> Result<Response<RenameResponse>, Status> {
-        let (ctx, req) = match self.authenticate(req) {
+        let (ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_rename(s))),
         };
@@ -878,7 +973,7 @@ impl NexusVfsService for VfsServiceImpl {
     }
 
     async fn copy(&self, req: Request<CopyRequest>) -> Result<Response<CopyResponse>, Status> {
-        let (ctx, req) = match self.authenticate(req) {
+        let (ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_copy(s))),
         };
@@ -916,7 +1011,7 @@ impl NexusVfsService for VfsServiceImpl {
     }
 
     async fn lock(&self, req: Request<LockRequest>) -> Result<Response<LockResponse>, Status> {
-        let (_ctx, req) = match self.authenticate(req) {
+        let (_ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_lock(s))),
         };
@@ -959,7 +1054,7 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<UnlockRequest>,
     ) -> Result<Response<UnlockResponse>, Status> {
-        let (_ctx, req) = match self.authenticate(req) {
+        let (_ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_unlock(s))),
         };
@@ -981,7 +1076,7 @@ impl NexusVfsService for VfsServiceImpl {
     }
 
     async fn watch(&self, req: Request<WatchRequest>) -> Result<Response<WatchResponse>, Status> {
-        let (_ctx, req) = match self.authenticate(req) {
+        let (_ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_watch(s))),
         };
@@ -1017,7 +1112,7 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<GetXattrRequest>,
     ) -> Result<Response<GetXattrResponse>, Status> {
-        let (_ctx, req) = match self.authenticate(req) {
+        let (_ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_get_xattr(s))),
         };
@@ -1051,7 +1146,7 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<SetXattrRequest>,
     ) -> Result<Response<SetXattrResponse>, Status> {
-        let (_ctx, req) = match self.authenticate(req) {
+        let (_ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_set_xattr(s))),
         };
@@ -1080,7 +1175,7 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<GetXattrBulkRequest>,
     ) -> Result<Response<GetXattrBulkResponse>, Status> {
-        let (_ctx, req) = match self.authenticate(req) {
+        let (_ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_get_xattr_bulk(s))),
         };
@@ -1114,7 +1209,7 @@ impl NexusVfsService for VfsServiceImpl {
     }
 
     async fn close_pipe(&self, req: Request<IpcPathRequest>) -> Result<Response<IpcAck>, Status> {
-        let (_ctx, req) = match self.authenticate(req) {
+        let (_ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_ipc_ack(s))),
         };
@@ -1137,7 +1232,7 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<IpcPathRequest>,
     ) -> Result<Response<IpcHasResponse>, Status> {
-        let (_ctx, req) = match self.authenticate(req) {
+        let (_ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_ipc_has(s))),
         };
@@ -1149,7 +1244,7 @@ impl NexusVfsService for VfsServiceImpl {
     }
 
     async fn close_all_pipes(&self, req: Request<IpcEmpty>) -> Result<Response<IpcAck>, Status> {
-        let (_ctx, _req) = match self.authenticate(req) {
+        let (_ctx, _req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_ipc_ack(s))),
         };
@@ -1161,7 +1256,7 @@ impl NexusVfsService for VfsServiceImpl {
     }
 
     async fn close_stream(&self, req: Request<IpcPathRequest>) -> Result<Response<IpcAck>, Status> {
-        let (_ctx, req) = match self.authenticate(req) {
+        let (_ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_ipc_ack(s))),
         };
@@ -1184,7 +1279,7 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<IpcPathRequest>,
     ) -> Result<Response<IpcHasResponse>, Status> {
-        let (_ctx, req) = match self.authenticate(req) {
+        let (_ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_ipc_has(s))),
         };
@@ -1199,7 +1294,7 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<StreamWriteRequest>,
     ) -> Result<Response<StreamWriteResponse>, Status> {
-        let (ctx, req) = match self.authenticate(req) {
+        let (ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_stream_write(s))),
         };
@@ -1213,10 +1308,25 @@ impl NexusVfsService for VfsServiceImpl {
         // no-op miss — no production mailbox is unmounted.)
         let kernel = self.kernel.clone();
         let path = req.path;
+        let path_for_err = path.clone();
         let data = req.data;
         let write_res =
             run_blocking(move || KernelSyscall::sys_write(&*kernel, &path, &ctx, &data, 0)).await?;
         match write_res {
+            // `hit == false` means sys_write did NOT append (an unmounted /
+            // non-stream path, or backpressure). Its `size` is then 0 — which
+            // as an `offset` reads exactly like "your frame landed first in the
+            // stream". Reporting that as success is how #276 turned a dropped
+            // mailbox message into two green RPCs; an append that did not
+            // happen is an error.
+            Ok(result) if !result.hit => Ok(Response::new(StreamWriteResponse {
+                offset: 0,
+                is_error: true,
+                error_payload: encode_rpc_error(
+                    RpcErrorCode::InternalError,
+                    &format!("stream append at {path_for_err} did not land (no DT_STREAM backend accepted the frame)"),
+                ),
+            })),
             Ok(result) => Ok(Response::new(StreamWriteResponse {
                 offset: result.size,
                 is_error: false,
@@ -1237,7 +1347,7 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<StreamReadAtRequest>,
     ) -> Result<Response<StreamReadAtResponse>, Status> {
-        let (ctx, req) = match self.authenticate(req) {
+        let (ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_stream_read(s))),
         };
@@ -1308,7 +1418,7 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<IpcPathRequest>,
     ) -> Result<Response<StreamCollectAllResponse>, Status> {
-        let (ctx, req) = match self.authenticate(req) {
+        let (ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_stream_collect(s))),
         };
@@ -1332,7 +1442,7 @@ impl NexusVfsService for VfsServiceImpl {
     }
 
     async fn ping(&self, req: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
-        let (ctx, _req) = self.authenticate(req)?;
+        let (ctx, _req) = self.authenticate(req).await?;
         let uptime = self.server_started_at.elapsed().as_secs() as i64;
         self.started_secs.store(uptime as u64, Ordering::Relaxed);
         Ok(Response::new(PingResponse {
@@ -1346,7 +1456,7 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<BatchReadRequest>,
     ) -> Result<Response<BatchReadResponse>, Status> {
-        let (ctx, req) = match self.authenticate(req) {
+        let (ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Err(s),
         };
@@ -1412,7 +1522,7 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<BatchStatRequest>,
     ) -> Result<Response<BatchStatResponse>, Status> {
-        let (ctx, req) = match self.authenticate(req) {
+        let (ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Err(s),
         };
@@ -1463,7 +1573,7 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<BatchWriteRequest>,
     ) -> Result<Response<BatchWriteResponse>, Status> {
-        let (ctx, req) = match self.authenticate(req) {
+        let (ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Err(s),
         };
@@ -1517,20 +1627,17 @@ impl NexusVfsService for VfsServiceImpl {
     }
 
     async fn call(&self, req: Request<CallRequest>) -> Result<Response<CallResponse>, Status> {
-        let (ctx, req) = self.authenticate(req)?;
+        let (ctx, req) = self.authenticate(req).await?;
         // Offload: call dispatch may invoke blocking kernel ops
         let kernel = self.kernel.clone();
         let method = req.method;
         let payload = req.payload;
-        // A dot-notation service call ("svc.method") routes to a
-        // ServiceRegistry entry. If it arrives before boot has enlisted the
-        // services, hold it until ready (see `wait_services_ready`) rather
-        // than answer a lying "service not found". Kernel built-in Call
-        // methods (agent_*, etc.) contain no '.' and are available at once,
-        // so they never wait.
-        if method.contains('.') && !kernel.services_ready() {
-            wait_services_ready(&kernel, std::time::Duration::from_secs(15)).await;
-        }
+        // A dot-notation service call ("svc.method") arriving before boot
+        // enlisted the services used to get a lying terminal "service not
+        // found", and was held here by a private wait. That wait is gone:
+        // `authenticate` above now holds EVERY request until the data plane is
+        // open, and a gate is only opened by a boot that has already enlisted
+        // its services — so by the time dispatch runs, "not found" means it.
         run_blocking(move || crate::call_dispatch::dispatch(&kernel, &ctx, &method, &payload))
             .await?
     }
@@ -1552,10 +1659,15 @@ pub fn spawn(
 
     // The standalone spawn() path has no cross-org trust plane (it's the
     // single-node/dev server); an empty slot ⇒ local-only resolution.
+    // Standalone server: the caller wired the kernel it hands us BEFORE
+    // calling `spawn`, so there is no boot window to gate — the gate opens
+    // immediately. (The cluster daemon is the opposite case; see
+    // `DataPlaneReady`.)
     let routes = build_vfs_routes(
         kernel,
         auth,
         Arc::new(std::sync::OnceLock::new()),
+        DataPlaneReady::open(),
         cfg.max_message_bytes,
         &cfg.server_version,
     );
@@ -1611,6 +1723,7 @@ pub fn build_vfs_routes(
     kernel: Arc<Kernel>,
     auth: Arc<dyn AuthProvider>,
     foreign_ca_verifier: ForeignCaVerifierSlot,
+    ready: Arc<DataPlaneReady>,
     max_message_bytes: usize,
     server_version: &str,
 ) -> tonic::service::Routes {
@@ -1618,6 +1731,7 @@ pub fn build_vfs_routes(
         kernel,
         auth,
         foreign_ca_verifier,
+        ready,
         server_started_at: Instant::now(),
         server_version: Arc::from(server_version),
         started_secs: Arc::new(AtomicU64::new(0)),
@@ -2428,6 +2542,75 @@ mod tests {
                 other => Err(format!("fake provider: unsupported backend_type '{other}'")),
             }
         }
+    }
+
+    /// The boot-window gate ([`DataPlaneReady`], #276), as a contract: a
+    /// pending gate does NOT open on its own, an open one never blocks, and
+    /// `mark_ready` is what opens it.
+    #[tokio::test]
+    async fn data_plane_gate_opens_only_on_mark_ready() {
+        let gate = DataPlaneReady::pending();
+        assert!(!gate.is_ready());
+        assert!(
+            !gate.wait(std::time::Duration::from_millis(50)).await,
+            "a pending gate must not open by itself"
+        );
+
+        gate.mark_ready();
+        assert!(gate.is_ready());
+        assert!(
+            gate.wait(std::time::Duration::from_millis(50)).await,
+            "mark_ready opens the gate"
+        );
+        // Idempotent — boot may mark ready more than once.
+        gate.mark_ready();
+        assert!(gate.is_ready());
+
+        assert!(
+            DataPlaneReady::open()
+                .wait(std::time::Duration::from_millis(0))
+                .await,
+            "an open gate never waits"
+        );
+    }
+
+    /// THE #276 invariant, deterministically: a VFS request issued while the
+    /// kernel is still being wired is HELD at the door — it does not reach the
+    /// kernel — and completes only once boot marks the data plane ready.
+    ///
+    /// Before the gate, this same request was served by a kernel with no
+    /// distributed coordinator: a `wal` mailbox fell through to a node-local
+    /// capacity-0 memory ring and the message was lost behind two successful
+    /// RPCs. Held-then-served is the only answer that cannot lie.
+    #[tokio::test]
+    async fn a_request_in_the_boot_window_is_held_until_the_kernel_is_wired() {
+        use kernel::kernel::vfs_proto::PingRequest;
+
+        let kernel = std::sync::Arc::new(kernel_with_mem_backend());
+        let gate = DataPlaneReady::pending();
+        let svc = VfsServiceImpl::for_test_gated(kernel, Arc::clone(&gate));
+
+        let call = tokio::spawn({
+            let svc = svc.clone();
+            async move { svc.ping(tonic::Request::new(PingRequest::default())).await }
+        });
+
+        // Give it every chance to be served early. It must not be.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            !call.is_finished(),
+            "a request must NOT be served while the data plane is unwired"
+        );
+
+        gate.mark_ready();
+        let served = tokio::time::timeout(std::time::Duration::from_secs(5), call)
+            .await
+            .expect("the held request must be released by mark_ready")
+            .expect("ping task");
+        assert!(
+            served.is_ok(),
+            "once ready, the held request is served normally: {served:?}"
+        );
     }
 
     /// S3 DT_MOUNT over the wire builds a live backend via the provider and a

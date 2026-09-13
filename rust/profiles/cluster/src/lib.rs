@@ -1709,10 +1709,18 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     // qualified in the request path. Auth-off leaves it empty ⇒ local-only.
     let fca_verifier_slot: transport::grpc::ForeignCaVerifierSlot =
         Arc::new(std::sync::OnceLock::new());
+    // Boot-window gate. The bind below is the RAFT data plane — peers must
+    // reach it to form the cluster — and the VFS service is co-hosted on it,
+    // so client requests start arriving long before the coordinator, the
+    // mounts and the services exist. Requests are held at the service door
+    // until `mark_ready()` at the end of boot; see `DataPlaneReady` for why
+    // answering them early is not "early" but WRONG.
+    let data_plane_ready = transport::grpc::DataPlaneReady::pending();
     let vfs_routes = transport::grpc::build_vfs_routes(
         Arc::clone(&kernel),
         Arc::clone(&vfs_auth),
         Arc::clone(&fca_verifier_slot),
+        Arc::clone(&data_plane_ready),
         64 * 1024 * 1024,
         daemon_version_string(),
     );
@@ -2928,6 +2936,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     // carry an unforgeable `from`. Nodes and agents share the bind — `resolve()`
     // tells them apart by SAN type — so there is no separate agent bind.
     let zm_for_loop = zm.clone();
+    let ready_for_loop = Arc::clone(&data_plane_ready);
     let topology_handle = tokio::spawn(async move {
         loop {
             match zm_for_loop
@@ -2938,6 +2947,22 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
                     if !zm_for_loop.pending_mounts().is_empty() {
                         tokio::time::sleep(TOPOLOGY_TICK).await;
                         continue;
+                    }
+                    // Convergence: root "/" exists and every DECLARED mount is
+                    // applied, so `/agents=<zone>` (et al) now RESOLVES. This —
+                    // not the end of the synchronous boot — is when the data
+                    // plane may open. The mounts land through raft, tens of ms
+                    // after the last synchronous wiring step, and a write
+                    // admitted in between silently lands in the ROOT zone while
+                    // the later read routes to the mount zone and finds nothing
+                    // (the federation-mount half of #276). Gate opens once; the
+                    // loop keeps reconciling forever after.
+                    if !ready_for_loop.is_ready() {
+                        ready_for_loop.mark_ready();
+                        tracing::info!(
+                            "VFS data plane ready — kernel wired and declared topology applied, \
+                             serving client requests"
+                        );
                     }
                     tokio::time::sleep(TOPOLOGY_TICK * 6).await;
                 }
