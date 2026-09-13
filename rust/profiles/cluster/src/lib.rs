@@ -3601,6 +3601,13 @@ fn daemon_version_string() -> &'static str {
     // nexus-vfs daemon and the nexus assembly that composes it, so the same
     // number came out of two different binaries and did not move when either
     // was re-tagged. A consumer confirming an upgrade got a false negative.
+    //
+    // Stamp the VERSION, not the ref name. Whatever lands here is what clap
+    // prints *after* the binary name it prefixes on its own, so a tag that
+    // carries the binary's name prints it twice — the nexus assembly, whose
+    // tags are `nexusd-cluster-v*`, shipped
+    // `nexusd-cluster nexusd-cluster-v0.1.3 (…)` until its workflow stripped
+    // the prefix. A releaser whose tag is bare (`v0.7.4`) can pass it through.
     static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     VERSION.get_or_init(|| {
         let build = option_env!("NEXUSD_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"));
