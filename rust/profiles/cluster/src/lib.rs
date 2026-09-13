@@ -1431,6 +1431,43 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         "boot inputs — see nexus_raft::bootstrap::plan_boot_action for dispatch",
     );
 
+    // Zone ids the operator declared must satisfy the format BEFORE anything is
+    // opened or created from them. Placed here, ahead of `open_zone_manager`,
+    // because "refuse before creating" is the entire value: once an id is on
+    // disk it is the first path segment of everything in that zone and can no
+    // longer be changed.
+    //
+    // `parse_zones_str` is pure (split, trim, dedupe) and is called again later
+    // where `init_zones` is bound for the boot plan. Parsing twice costs nothing
+    // on a flag-sized input and is preferable to moving that binding several
+    // hundred lines for the sake of this check.
+    //
+    // Split on `data_dir_has_root`:
+    //
+    //   * FIRST boot — refuse. Nothing exists yet, so refusing costs nothing.
+    //   * RESTART — warn and continue. A node that has been serving for months
+    //     must not fail to boot because an upgrade introduced a rule its id
+    //     predates. A zone id cannot be migrated in place, so refusing would
+    //     offer no way out either; turning a new lint into an outage is worse
+    //     than the thing being prevented.
+    for zone in &nexus_raft::federation::parse_zones_str(&common.cluster_init.join(",")) {
+        if let Err(err) = contracts::zone_id::validate_zone_id(zone) {
+            if data_dir_has_root {
+                tracing::warn!(
+                    zone = %zone,
+                    reason = %err,
+                    flag = "--cluster-init",
+                    "declared zone id does not satisfy the zone-id format; kept because this                      node already has persisted state. The id is the first path segment of                      everything in the zone, so migrating means creating a conforming zone and                      moving the data — it cannot be renamed.",
+                );
+            } else {
+                return Err(anyhow::anyhow!(
+                    "--cluster-init zone id {zone:?} is not valid: {err}.
+                       The id becomes the first path segment of everything in the zone and cannot                      be changed afterwards — pointing --cluster-init at a different id later                      creates a NEW empty zone and abandons the old one, with no error at any                      layer. Choose a conforming id now.",
+                ));
+            }
+        }
+    }
+
     // One-shot self-enrollment at boot (joiner side, k3s `agent --server
     // --token`). A certless node given `--token` + `--peers` provisions its
     // mTLS cert BEFORE `open_zone_manager` brings up the data plane: it dials
@@ -1882,40 +1919,6 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
              (a) FOUNDER — keep --cluster-init (+ --accept-enrollments), drop --peers.\n  \
              (b) JOINER  — keep --peers (+ --token), drop --cluster-init.",
         ));
-    }
-
-    // Zone ids the operator declared must satisfy the format before anything is
-    // created from them. The rule and its constants live in
-    // `contracts/zone-id/spec.json`; see `contracts::zone_id`.
-    //
-    // Split on `data_dir_has_root`, and the split is the whole point:
-    //
-    //   * FIRST boot — nothing exists yet, so refusing costs nothing and stops a
-    //     malformed id from ever reaching disk, where it becomes the first path
-    //     segment of everything in that zone and is no longer renameable.
-    //   * RESTART — the zone is already there. A deployment that has been running
-    //     for months must not fail to boot because an upgrade introduced a rule
-    //     its id predates. Warn loudly and carry on; the operator decides when to
-    //     migrate, and a zone id cannot be migrated in place anyway.
-    //
-    // Refusing on restart would turn a new lint into an outage, which is a worse
-    // failure than the one being prevented.
-    for zone in &init_zones {
-        if let Err(err) = contracts::zone_id::validate_zone_id(zone) {
-            if data_dir_has_root {
-                tracing::warn!(
-                    zone = %zone,
-                    reason = %err,
-                    flag = "--cluster-init",
-                    "declared zone id does not satisfy the zone-id format; kept because this                      node already has persisted state. A zone id is the first path segment of                      everything in the zone, so it cannot be renamed — migrating means creating                      a conforming zone and moving the data.",
-                );
-            } else {
-                return Err(anyhow::anyhow!(
-                    "--cluster-init zone id {zone:?} is not valid: {err}.
-                       The id becomes the first path segment of everything in the zone and cannot                      be changed afterwards — pointing --cluster-init at a different id later                      creates a NEW empty zone and abandons the old one, with no error at any                      layer. Choose a conforming id now.",
-                ));
-            }
-        }
     }
 
     // Surface every dropped `--cluster-init-mount` entry so the operator sees
