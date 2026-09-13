@@ -16,6 +16,17 @@
 //!
 //! A caller with neither is rejected.
 //!
+//! The peer plane does not depend on the token plane — a certificate carries
+//! its identity whether or not this daemon has a signing secret. That is why
+//! it lives in one shared function ([`resolve_verified_peer`]) rather than
+//! inside this provider, and why a daemon whose ONLY credential plane is mTLS
+//! installs [`CertIdentityProvider`] instead of falling back to "authenticate
+//! nobody". Admission is not identity: before that split, an mTLS daemon with
+//! no `NEXUS_API_KEY_SECRET` resolved every verified caller as
+//! nobody-in-particular, which left `auth_armed` false, the A2A stamp hook
+//! fail-open, and an envelope's `from` forgeable on the one deployment shape
+//! that had demanded certificates from everybody.
+//!
 //! ## The gates, all fail-closed
 //!
 //! Ported from `nexus/src/nexus/bricks/auth/providers/database_key.py`,
@@ -149,14 +160,6 @@ impl ApiKeyAuthProvider {
     /// sees either the whole old set or the whole new one.
     pub fn set_revoked_serials(&self, serials: HashSet<Vec<u8>>) {
         *self.revoked_serials.write().expect("revoked-serials lock") = serials;
-    }
-
-    /// Whether an agent cert with this serial has been revoked (is in the CRL).
-    fn is_revoked(&self, serial: &[u8]) -> bool {
-        self.revoked_serials
-            .read()
-            .expect("revoked-serials lock")
-            .contains(serial)
     }
 
     /// Drop one cached context. Called from the apply-observer when a
@@ -353,62 +356,150 @@ fn unauthenticated() -> Status {
     Status::unauthenticated("invalid credentials")
 }
 
+/// The peer-certificate plane: what a CA-verified client certificate, on its
+/// own, authenticates as.
+///
+/// Shared by every provider, because a certificate carries the same identity
+/// whether or not the daemon also runs an `sk-` credential policy — the two
+/// planes were bundled together by implementation, never by contract. One copy
+/// is what lets a cert-only daemon ([`CertIdentityProvider`]) resolve exactly
+/// the identities an `sk-` daemon would, so the A2A stamp hook behaves the same
+/// under either posture.
+fn resolve_verified_peer(
+    peer: &PeerIdentity,
+    revoked: &RwLock<HashSet<Vec<u8>>>,
+) -> Result<OperationContext, Status> {
+    // An agent cert authenticates as its agent — identity from the
+    // CA-verified SAN, which is its whole authorization (the stamp hook
+    // gates its mailbox writes). No store lookup, so it resolves the
+    // same on any node the CA reaches. A node cert is a cluster peer
+    // (membership authorizes).
+    if let Some(agent) = &peer.agent_name {
+        // Revocation is the one thing a valid chain does not settle: a
+        // stolen key still chains to the CA. The CRL closes that — an
+        // agent whose serial the CA revoked is rejected on every node
+        // that has refreshed the list.
+        //
+        // KNOWN GAP (G2): `is_revoked` checks THIS cluster's CRL, which
+        // covers only cluster-CA agents. A foreign agent's cert is signed
+        // by its org CA (CA_B), whose serials are not in our CRL, so a
+        // single foreign agent cannot be revoked here — only coarse
+        // whole-org removal (drop the foreign-CA anchor) blocks it.
+        // Follow-up: an our-side, control-zone-backed per-serial denylist
+        // (no foreign-CRL fetch dependency).
+        //
+        // KNOWN GAP (G4): revocation is not immediate for a LIVE foreign
+        // connection. `classify_peer_cert` runs per-request, but neither a
+        // dropped anchor nor a (future G2) denylist is re-checked here
+        // mid-connection, so the interim whole-CA drop stops only NEW
+        // connections. Same app-layer per-request-revocation bucket as G2.
+        if serial_revoked(revoked, &peer.serial) {
+            tracing::warn!(agent = %agent, "rejected: agent cert is revoked (in CRL)");
+            return Err(unauthenticated());
+        }
+        // A foreign agent (cert chained to a registered foreign CA, so
+        // `classify_peer_cert` set `trust_domain`) authors under its
+        // ORG-QUALIFIED id `{trust_domain}/agent/{name}` (= `display_id`),
+        // so two orgs' same-named agents never collide in the mailbox
+        // `from`. A local (cluster-CA) agent keeps its BARE name — the
+        // cluster is one trust domain with mint-time-unique names, and
+        // existing consumers parse bare local `from`s. A foreign cert can
+        // never resolve to a bare local name (classify always sets its
+        // `trust_domain`), so it cannot impersonate a local agent.
+        let agent_id = match peer.trust_domain {
+            Some(_) => peer.display_id(),
+            None => agent.clone(),
+        };
+        // Carry the trust domain into the context so the permission
+        // gate can contain a FOREIGN agent to its mailbox. A local
+        // agent keeps `None` and is unaffected. SSOT: the value comes
+        // from the classified `PeerIdentity`, never re-parsed from the
+        // qualified `agent_id` string.
+        let mut ctx = ApiKeyAuthProvider::agent_context(&agent_id);
+        ctx.trust_domain = peer.trust_domain.clone();
+        return Ok(ctx);
+    }
+    Ok(ApiKeyAuthProvider::peer_context(peer))
+}
+
+/// Whether an agent cert with this serial has been revoked (is in the CRL).
+fn serial_revoked(revoked: &RwLock<HashSet<Vec<u8>>>, serial: &[u8]) -> bool {
+    revoked
+        .read()
+        .expect("revoked-serials lock")
+        .contains(serial)
+}
+
+/// The CRL projection sink. Implemented by every provider that resolves agent
+/// certs, so the composition root's refresh loop does not care which posture
+/// installed which provider.
+pub trait RevocationSink: Send + Sync {
+    /// Replace the revoked-serial set with the latest CRL projection.
+    fn set_revoked_serials(&self, serials: HashSet<Vec<u8>>);
+}
+
+impl RevocationSink for ApiKeyAuthProvider {
+    fn set_revoked_serials(&self, serials: HashSet<Vec<u8>>) {
+        ApiKeyAuthProvider::set_revoked_serials(self, serials);
+    }
+}
+
+/// Authenticates by client certificate alone — the provider a daemon installs
+/// when mTLS is its only credential plane (no `NEXUS_API_KEY_SECRET`).
+///
+/// **Why this exists.** mTLS admits only CA-verified peers, but *admission is
+/// not identity*. With no provider reading the certificate, every request
+/// resolved as nobody-in-particular: `ServiceBootCtx::auth_armed` was false, so
+/// the A2A stamp hook ran fail-open and an envelope's `from` passed through
+/// unstamped — forgeable on a daemon whose whole point was that callers prove
+/// who they are. This closes that hole with the same certificate plane
+/// `ApiKeyAuthProvider` uses, minus the `sk-` store.
+///
+/// A caller presenting no certificate is rejected: there is no token plane to
+/// fall back to, and "authenticate nobody" is a posture only a loopback bind
+/// may take (see `nexusd_cluster::auth_posture`).
+#[derive(Default)]
+pub struct CertIdentityProvider {
+    revoked_serials: RwLock<HashSet<Vec<u8>>>,
+}
+
+impl CertIdentityProvider {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replace the revoked-serial set with the latest CRL projection. Same
+    /// contract as the `sk-` provider's: a swap, so a `resolve` in flight sees
+    /// either the whole old set or the whole new one.
+    pub fn set_revoked_serials(&self, serials: HashSet<Vec<u8>>) {
+        *self.revoked_serials.write().expect("revoked-serials lock") = serials;
+    }
+}
+
+impl RevocationSink for CertIdentityProvider {
+    fn set_revoked_serials(&self, serials: HashSet<Vec<u8>>) {
+        CertIdentityProvider::set_revoked_serials(self, serials);
+    }
+}
+
+impl AuthProvider for CertIdentityProvider {
+    fn resolve(&self, creds: &AuthCredentials<'_>) -> Result<OperationContext, Status> {
+        match creds.peer {
+            Some(peer) => resolve_verified_peer(peer, &self.revoked_serials),
+            None => {
+                tracing::debug!("rejected: no client certificate (cert-identity daemon)");
+                Err(unauthenticated())
+            }
+        }
+    }
+}
+
 impl AuthProvider for ApiKeyAuthProvider {
     fn resolve(&self, creds: &AuthCredentials<'_>) -> Result<OperationContext, Status> {
         // Peer plane first: a verified cluster node needs no token, which is
         // exactly why federation survives a strict provider.
         if let Some(peer) = creds.peer {
-            // An agent cert authenticates as its agent — identity from the
-            // CA-verified SAN, which is its whole authorization (the stamp hook
-            // gates its mailbox writes). No store lookup, so it resolves the
-            // same on any node the CA reaches. A node cert is a cluster peer
-            // (membership authorizes).
-            if let Some(agent) = &peer.agent_name {
-                // Revocation is the one thing a valid chain does not settle: a
-                // stolen key still chains to the CA. The CRL closes that — an
-                // agent whose serial the CA revoked is rejected on every node
-                // that has refreshed the list.
-                //
-                // KNOWN GAP (G2): `is_revoked` checks THIS cluster's CRL, which
-                // covers only cluster-CA agents. A foreign agent's cert is signed
-                // by its org CA (CA_B), whose serials are not in our CRL, so a
-                // single foreign agent cannot be revoked here — only coarse
-                // whole-org removal (drop the foreign-CA anchor) blocks it.
-                // Follow-up: an our-side, control-zone-backed per-serial denylist
-                // (no foreign-CRL fetch dependency).
-                //
-                // KNOWN GAP (G4): revocation is not immediate for a LIVE foreign
-                // connection. `classify_peer_cert` runs per-request, but neither a
-                // dropped anchor nor a (future G2) denylist is re-checked here
-                // mid-connection, so the interim whole-CA drop stops only NEW
-                // connections. Same app-layer per-request-revocation bucket as G2.
-                if self.is_revoked(&peer.serial) {
-                    tracing::warn!(agent = %agent, "rejected: agent cert is revoked (in CRL)");
-                    return Err(unauthenticated());
-                }
-                // A foreign agent (cert chained to a registered foreign CA, so
-                // `classify_peer_cert` set `trust_domain`) authors under its
-                // ORG-QUALIFIED id `{trust_domain}/agent/{name}` (= `display_id`),
-                // so two orgs' same-named agents never collide in the mailbox
-                // `from`. A local (cluster-CA) agent keeps its BARE name — the
-                // cluster is one trust domain with mint-time-unique names, and
-                // existing consumers parse bare local `from`s. A foreign cert can
-                // never resolve to a bare local name (classify always sets its
-                // `trust_domain`), so it cannot impersonate a local agent.
-                let agent_id = match peer.trust_domain {
-                    Some(_) => peer.display_id(),
-                    None => agent.clone(),
-                };
-                // Carry the trust domain into the context so the permission
-                // gate can contain a FOREIGN agent to its mailbox. A local
-                // agent keeps `None` and is unaffected. SSOT: the value comes
-                // from the classified `PeerIdentity`, never re-parsed from the
-                // qualified `agent_id` string.
-                let mut ctx = Self::agent_context(&agent_id);
-                ctx.trust_domain = peer.trust_domain.clone();
-                return Ok(ctx);
-            }
-            return Ok(Self::peer_context(peer));
+            return resolve_verified_peer(peer, &self.revoked_serials);
         }
         if creds.token.is_empty() {
             tracing::debug!("rejected: no credentials (no token, no peer cert)");
@@ -791,6 +882,98 @@ mod tests {
     fn an_empty_token_without_a_peer_cert_is_rejected() {
         assert!(provider(MemStore::arc())
             .resolve(&AuthCredentials::from_token(""))
+            .is_err());
+    }
+
+    // ── Certificate-only daemon (no `sk-` policy) ────────────────────
+
+    /// The point of the cert-only provider: an mTLS daemon with no credential
+    /// policy still resolves a caller to a real identity, so the A2A stamp
+    /// hook has an `agent_id` to stamp and cannot be handed a forged `from`.
+    /// Same answer the `sk-` provider gives for the same certificate — the
+    /// certificate plane is one implementation, shared.
+    #[test]
+    fn a_cert_only_daemon_resolves_the_same_identity_as_an_sk_daemon() {
+        let peer = PeerIdentity {
+            common_name: "nexus-agent-mac-ai".into(),
+            node_id: None,
+            zone_id: None,
+            agent_name: Some("mac-ai".into()),
+            trust_domain: None,
+            serial: vec![1, 2, 3],
+        };
+        let creds = AuthCredentials {
+            token: "",
+            peer: Some(&peer),
+        };
+
+        let cert_only = CertIdentityProvider::new()
+            .resolve(&creds)
+            .expect("resolves");
+        let with_keys = provider(MemStore::arc()).resolve(&creds).expect("resolves");
+
+        assert_eq!(cert_only.agent_id.as_deref(), Some("mac-ai"));
+        assert_eq!(cert_only.agent_id, with_keys.agent_id);
+        assert_eq!(cert_only.user_id, with_keys.user_id);
+        assert_eq!(cert_only.is_admin, with_keys.is_admin);
+    }
+
+    /// A foreign agent stays org-qualified on a cert-only daemon too, so two
+    /// orgs' same-named agents cannot collide in a mailbox `from`.
+    #[test]
+    fn a_cert_only_daemon_keeps_a_foreign_agent_org_qualified() {
+        let peer = PeerIdentity {
+            common_name: "nexus-agent-cardio".into(),
+            node_id: None,
+            zone_id: None,
+            agent_name: Some("cardio".into()),
+            trust_domain: Some("hospital-a".into()),
+            serial: vec![7, 7, 7],
+        };
+        let ctx = CertIdentityProvider::new()
+            .resolve(&AuthCredentials {
+                token: "",
+                peer: Some(&peer),
+            })
+            .expect("a foreign cert agent resolves");
+        assert_eq!(ctx.agent_id.as_deref(), Some("hospital-a/agent/cardio"));
+        assert_eq!(ctx.trust_domain.as_deref(), Some("hospital-a"));
+    }
+
+    /// Revocation is honoured on the cert-only plane as well — it is the one
+    /// thing a valid chain does not settle.
+    #[test]
+    fn a_cert_only_daemon_rejects_a_revoked_agent_cert() {
+        let peer = PeerIdentity {
+            common_name: "nexus-agent-mac-ai".into(),
+            node_id: None,
+            zone_id: None,
+            agent_name: Some("mac-ai".into()),
+            trust_domain: None,
+            serial: vec![9, 9, 9],
+        };
+        let p = CertIdentityProvider::new();
+        p.set_revoked_serials(HashSet::from([vec![9, 9, 9]]));
+        assert!(p
+            .resolve(&AuthCredentials {
+                token: "",
+                peer: Some(&peer),
+            })
+            .is_err());
+    }
+
+    /// Without a certificate there is nothing to authenticate: a cert-only
+    /// daemon has no token plane to fall back to, and MUST NOT fall back to
+    /// "everybody is an admin" — that fallback is exactly the hole this
+    /// provider exists to close.
+    #[test]
+    fn a_cert_only_daemon_rejects_a_caller_with_no_certificate() {
+        let p = CertIdentityProvider::new();
+        assert!(p.resolve(&AuthCredentials::from_token("")).is_err());
+        assert!(p
+            .resolve(&AuthCredentials::from_token(
+                "sk-anything-0123456789abcdef0123456789"
+            ))
             .is_err());
     }
 
