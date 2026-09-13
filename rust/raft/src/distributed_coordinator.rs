@@ -20,6 +20,11 @@
 //! Trait methods receive `kernel: &Kernel` so they can reach kernel-side
 //! primitives (vfs_router, dcache, peer_client, set_self_address) without
 //! holding back-references; the provider only owns the raft-side state.
+// A discarded `Result` on this surface is how federation fails silently: the
+// mount is committed but not wired, the zone is joined remotely but not
+// locally, the trust set is refreshed into the void. Denying the discard here
+// forces every site to say which it is — handled, or deliberately idempotent.
+#![deny(clippy::let_underscore_must_use)]
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -175,12 +180,25 @@ impl RaftDistributedCoordinator {
         kernel: &Arc<Kernel>,
         grpc_ops: Arc<dyn FederationGrpcOps>,
     ) {
-        // Slots are `OnceLock`; second-set silently drops, so calling
-        // this twice with the same wiring is a no-op rather than an
-        // error.
-        let _ = self.zone_manager.set(zm.clone());
-        let _ = self.runtime.set(runtime);
-        let _ = self.grpc_ops.set(grpc_ops);
+        // Slots are `OnceLock`: the first wiring wins, so installing twice
+        // with the same wiring is a no-op rather than an error. Every set is
+        // attempted (no short-circuit) — a partially-armed coordinator would
+        // be far worse than a re-armed one — and a second install is reported,
+        // because "who installed the coordinator twice?" is a real question
+        // when federation behaves as if it were wired to something else.
+        let already_armed = [
+            self.zone_manager.set(zm.clone()).is_err(),
+            self.runtime.set(runtime).is_err(),
+            self.grpc_ops.set(grpc_ops).is_err(),
+        ];
+        if already_armed.iter().any(|armed| *armed) {
+            tracing::debug!(
+                zone_manager = already_armed[0],
+                runtime = already_armed[1],
+                grpc_ops = already_armed[2],
+                "coordinator re-installed; these slots kept their first wiring",
+            );
+        }
 
         // Federation self-identity — every subsequent write records
         // `last_writer_address`, the origin pointer that powers
@@ -1680,7 +1698,19 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
                         seed_peers = ?local_peer_seeds_display,
                         "local federation zone seed peers",
                     );
-                    let _ = zm.join_zone(zone_id, local_peer_seeds, false);
+                    if let Err(e) = zm.join_zone(zone_id, local_peer_seeds, false) {
+                        // Not fatal — the JoinZone RPCs below still run and the
+                        // outer loop retries until the deadline — but it MUST
+                        // be visible: without the local registration the
+                        // leader's snapshot has nowhere to install the
+                        // authoritative ConfState, so the join "succeeds"
+                        // remotely while this node holds no zone.
+                        tracing::warn!(
+                            zone = %zone_id,
+                            error = %e,
+                            "local zone pre-registration failed; join will retry",
+                        );
+                    }
                 }
             }
 
@@ -2448,7 +2478,7 @@ fn install_mount_apply_cb_impl(
                 key,
                 target_zone_id,
             } => {
-                let _ = wire_mount_core(
+                if let Err(e) = wire_mount_core(
                     &vfs_router,
                     &lock_manager,
                     &registry,
@@ -2457,7 +2487,25 @@ fn install_mount_apply_cb_impl(
                     &parent_zone_owned,
                     &key,
                     &target_zone_id,
-                );
+                ) {
+                    // The DT_MOUNT is COMMITTED — replicated state says this
+                    // path is mounted — and the router on this node does not
+                    // know it. Every read and write under `key` then resolves
+                    // to the parent zone instead of the target: not an error
+                    // anywhere, just the wrong zone, which is how a mounted
+                    // mailbox silently becomes node-local. An apply observer
+                    // cannot propagate (and must not propose from the apply
+                    // thread), so the loudest honest thing is an error log
+                    // carrying everything needed to place it.
+                    tracing::error!(
+                        parent_zone_id = %parent_zone_owned,
+                        mount_key = %key,
+                        target_zone_id = %target_zone_id,
+                        error = ?e,
+                        "DT_MOUNT applied but NOT wired into the router — paths under \
+                         this mount will resolve to the parent zone on this node",
+                    );
+                }
             }
             MountApplyEvent::Delete { key } => {
                 unwire_mount_core(&vfs_router, &cross_zone_mounts, &parent_zone_owned, &key);
