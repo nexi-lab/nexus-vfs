@@ -2141,6 +2141,24 @@ impl Kernel {
                 _ => {
                     // "memory" (and any other / empty token): the always-
                     // available, node-local terminal (historical `else`).
+                    //
+                    // Except at capacity 0, where it is not available at all: a
+                    // memory stream is a fixed ring, so a 0-byte ring rejects
+                    // every frame as `Oversized`. Installing one produces a
+                    // stream that exists, accepts a create, and can never hold
+                    // a message. That is exactly how #276 lost mail — a
+                    // `wal,memory` mailbox created with capacity 0 (a legal
+                    // "keep forever" retention FOR WAL) fell through to memory
+                    // during the boot window and became a black hole. Refuse
+                    // here, where the capacity is still just a number in a
+                    // request and nothing has been created yet.
+                    if capacity == 0 {
+                        return Err(KernelError::IOError(format!(
+                            "io_profile {io_profile:?} fell through to the \"memory\" backend, \
+                             but capacity 0 cannot hold a frame — give a byte capacity, or use \
+                             a bare \"wal\" profile (where 0 means keep-forever retention)"
+                        )));
+                    }
                     self.stream_manager
                         .create(path, capacity)
                         .map_err(stream_mgr_err)?;
@@ -3609,6 +3627,127 @@ mod tests {
         assert!(
             woke >= Duration::from_millis(150),
             "woke before the write was issued ({woke:?})"
+        );
+    }
+
+    /// Regression, #276 link 2/3: a `wal,memory` DT_STREAM created with
+    /// capacity 0 on a kernel with NO coordinator (the boot window, or any
+    /// non-federated kernel) must be REFUSED, not silently downgraded to a
+    /// memory ring that cannot hold one byte.
+    ///
+    /// The old waterfall installed `MemoryStreamBackend::new(0)` here: create
+    /// succeeded, the stream existed, `has_stream` was true — and every append
+    /// bounced off `Oversized` forever. Capacity 0 is meaningful for "wal"
+    /// (keep-forever retention) and meaningless for "memory", so the fall-
+    /// through is where the two meanings have to be told apart.
+    #[test]
+    fn capacity_zero_wal_memory_stream_is_refused_not_silently_memory_backed() {
+        let k = Kernel::new(); // no DistributedCoordinator ⇒ "wal" unavailable
+        let path = "/mailbox-cap0";
+        let err = k
+            .sys_setattr(
+                path,
+                4, // DT_STREAM
+                "",
+                None,
+                None,
+                None,
+                "wal,memory",
+                "root",
+                false,
+                /* capacity */ 0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect_err("capacity-0 memory fall-through must fail loud");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("capacity 0"),
+            "the error must name the reason, got: {msg}"
+        );
+        assert!(
+            !k.has_stream(path),
+            "a refused create must leave NO stream registered at {path}"
+        );
+
+        // The same profile with a real capacity still installs the memory
+        // terminal — the waterfall itself is unchanged.
+        k.sys_setattr(
+            path,
+            4,
+            "",
+            None,
+            None,
+            None,
+            "wal,memory",
+            "root",
+            false,
+            4096,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("capacity>0 memory fall-through still installs");
+        assert!(k.has_stream(path));
+    }
+
+    /// Regression, #276 link 3/3: a DT_STREAM append that the backend REJECTS
+    /// must surface as an error from `sys_write` — never as a miss.
+    ///
+    /// `SysWriteResult { hit: false, size: 0 }` is byte-identical to "the frame
+    /// landed at offset 0", so the stream-append RPC reported success for a
+    /// message that was dropped. Backpressure (`Full`) is the one legitimate
+    /// miss; a rejected frame is not backpressure.
+    #[test]
+    fn rejected_stream_append_is_an_error_not_a_zero_offset_success() {
+        let k = Arc::new(Kernel::new());
+        k.add_mount("/s", "root", None, None, None, false)
+            .expect("mount /s");
+        let path = "/s/tiny";
+        k.create_stream(path, 16).expect("create 16-byte stream");
+
+        let ctx = OperationContext::new("test", "root", true, None, true);
+        let oversized = vec![b'x'; 64];
+        let err = match crate::kernel::syscall::KernelSyscall::sys_write(
+            k.as_ref(),
+            path,
+            &ctx,
+            &oversized,
+            0,
+        ) {
+            Err(e) => e,
+            Ok(r) => panic!(
+                "an append the backend rejects must be an error, got hit={} size={}",
+                r.hit, r.size
+            ),
+        };
+        assert!(
+            format!("{err:?}").contains("append"),
+            "the error must say the append failed, got: {err:?}"
+        );
+
+        // And the stream really is empty — nothing was written under the
+        // reported failure.
+        assert!(
+            k.stream_read_at(path, 0).expect("read").is_none(),
+            "a rejected append must leave the stream empty"
         );
     }
 

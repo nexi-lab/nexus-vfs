@@ -829,9 +829,24 @@ impl Kernel {
                     Err(crate::stream_manager::StreamManagerError::Backend(
                         crate::stream::StreamError::Closed(msg),
                     )) => return Err(KernelError::StreamClosed(msg.to_string())),
-                    // Full / NotFound / any other → a miss (retry / no-op),
-                    // preserving the prior fall-through behaviour.
-                    Err(_) => return miss(),
+                    // `Full` is BACKPRESSURE, not failure: the frame did not
+                    // land, the ring is momentarily full, and the caller is
+                    // expected to retry — that is what a miss means here.
+                    Err(crate::stream_manager::StreamManagerError::Backend(
+                        crate::stream::StreamError::Full(_, _),
+                    )) => return miss(),
+                    // Everything else is a genuine append failure (an
+                    // `Oversized` frame, a backend that isn't there). It MUST
+                    // NOT become a miss: `SysWriteResult { hit: false, size: 0 }`
+                    // is indistinguishable from "appended at offset 0", so a
+                    // caller — the stream-append RPC above all — reported
+                    // success for a message that was dropped on the floor
+                    // (#276). Fail loud instead.
+                    Err(e) => {
+                        return Err(KernelError::IOError(format!(
+                            "DT_STREAM append at {path} failed: {e:?}"
+                        )))
+                    }
                 }
             }
         }
