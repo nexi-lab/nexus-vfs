@@ -37,7 +37,13 @@ impl Kernel {
         let store: Arc<dyn ColdSegmentStore> = Arc::new(KernelColdSegmentStore {
             kernel: Arc::downgrade(self),
         });
-        let _ = self.cold_segment_store.set(store);
+        if self.cold_segment_store.set(store).is_err() {
+            // Already armed: boot arms this alongside the stream materializer
+            // and both are idempotent. Nothing is lost — the first store wins
+            // and is equivalent — but a SECOND arm means boot ran twice, which
+            // is worth a line when chasing a double-wiring bug.
+            tracing::debug!("cold-tier segment store already armed; keeping the first");
+        }
     }
 
     /// The armed cold-tier store, if any. `None` ⇒ hot-only WAL streams.

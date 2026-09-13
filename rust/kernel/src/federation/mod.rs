@@ -46,6 +46,11 @@
 //! `federation/route_helpers.rs` so the federation knowledge fully lives
 //! here.  Deferred to a follow-up PR — see the architecture-lint catch
 //! in [[reference_kernel_architecture_lint]].
+// A discarded `Result` on this surface is how federation fails silently: the
+// mount is committed but not wired, the zone is joined remotely but not
+// locally, the trust set is refreshed into the void. Denying the discard here
+// forces every site to say which it is — handled, or deliberately idempotent.
+#![deny(clippy::let_underscore_must_use)]
 
 mod blob_fetcher_slot;
 mod cold_segment;

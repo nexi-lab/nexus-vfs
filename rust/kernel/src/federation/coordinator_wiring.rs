@@ -65,7 +65,12 @@ impl Kernel {
     /// "operator declined to enable local-first federation writes
     /// on this node").
     pub fn set_federation_cache(&self, backend: Arc<dyn ObjectStore>) {
-        let _ = self.federation_cache.set(backend);
+        if self.federation_cache.set(backend).is_err() {
+            // `OnceLock`: the first cache wins. A second call means two boot
+            // paths each think they own the federation cache root — harmless
+            // here (the first backend stays authoritative) but never silent.
+            tracing::debug!("federation cache already wired; keeping the first backend");
+        }
     }
 
     /// Borrow the federation-cache backend, if any.  Returns `None`

@@ -16,6 +16,11 @@
 //! while the daemon is stopped (redb holds an exclusive file lock).
 //! Sudowork's primary deployment path is the static topology env vars
 //! consumed at daemon startup; share/join are operator escape hatches.
+// A discarded `Result` on this surface is how federation fails silently: the
+// mount is committed but not wired, the zone is joined remotely but not
+// locally, the trust set is refreshed into the void. Denying the discard here
+// forces every site to say which it is — handled, or deliberately idempotent.
+#![deny(clippy::let_underscore_must_use)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1759,7 +1764,13 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     // a foreign agent resolves qualified. Auth-off ⇒ getter returns None, slot
     // stays empty, request path stays local-only.
     if let Some(verifier) = zm.foreign_ca_verifier() {
-        let _ = fca_verifier_slot.set(verifier);
+        if fca_verifier_slot.set(verifier).is_err() {
+            // `OnceLock`: the slot is filled exactly once per boot. A second
+            // fill would mean two verifiers exist for one service — the
+            // request path would classify against one while the handshake
+            // admits against the other.
+            tracing::warn!("foreign-CA verifier slot was already filled; keeping the first");
+        }
         // A foreign agent this verifier admits is authenticated but
         // semi-trusted (e.g. an on-prem DGX delivered to a customer site):
         // it authors its mailbox, but must not read/write the rest of the
@@ -2565,7 +2576,18 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
                     let store = Arc::clone(&store_for_obs);
                     obs_runtime.spawn_blocking(move || match store.list() {
                         Ok(anchors) => {
-                            let _ = verifier.set_foreign_cas(&anchors);
+                            if let Err(e) = verifier.set_foreign_cas(&anchors) {
+                                // The anchor set changed in raft and the live
+                                // verifier did NOT follow: a just-registered
+                                // org still cannot connect, or — worse — a
+                                // just-revoked one still can. Eventual
+                                // consistency is the design; silence is not.
+                                tracing::error!(
+                                    error = %e,
+                                    anchors = anchors.len(),
+                                    "foreign-CA refresh: live verifier NOT updated — admission                                      is running on the previous trust set",
+                                );
+                            }
                         }
                         Err(e) => tracing::warn!(error = %e, "foreign-CA refresh: list failed"),
                     });
@@ -3546,7 +3568,10 @@ mod reset_tests {
         assert!(!data_dir.exists(), "--yes removes the data-dir");
         assert!(!identity_file.exists(), "--yes removes identity.json");
 
-        let _ = fs::remove_dir_all(&base);
+        // Best-effort temp cleanup at the end of a test that has already
+        // asserted everything it cares about; a leftover temp dir is not a
+        // test failure.
+        drop(fs::remove_dir_all(&base));
     }
 }
 
@@ -4242,7 +4267,13 @@ async fn wait_for_shutdown() {
 
 #[cfg(not(unix))]
 async fn wait_for_shutdown() {
-    let _ = tokio::signal::ctrl_c().await;
+    // An Err here means the Ctrl+C handler could not be installed — and this
+    // future is what holds the daemon open, so returning would shut a healthy
+    // node down for no reason anyone could see. Say why it is going down.
+    if let Err(e) = tokio::signal::ctrl_c().await {
+        tracing::error!(error = %e, "Ctrl+C handler failed; shutting down");
+        return;
+    }
     tracing::info!("Received Ctrl+C");
 }
 

@@ -504,16 +504,13 @@ impl ServiceRegistry {
         }
     }
 
-    /// Mark bootstrap complete — future enlist() auto-starts.
+    /// Mark bootstrap complete — future `enlist()` auto-starts.
+    ///
+    /// The latch has exactly ONE consumer now: auto-start. Client readiness is
+    /// no longer asked of it — the gRPC server holds every request until the
+    /// whole data plane is open, which is strictly later than this.
     pub(crate) fn mark_bootstrapped(&self) {
         self.bootstrapped.store(true, Ordering::Relaxed);
-    }
-
-    /// True once bootstrap has completed (see [`Self::mark_bootstrapped`]).
-    /// The SSOT for "the declared service set is installed"; the kernel's
-    /// `services_ready` facade + the gRPC `Call` readiness gate read it.
-    pub(crate) fn is_bootstrapped(&self) -> bool {
-        self.bootstrapped.load(Ordering::Relaxed)
     }
 
     /// Snapshot: list of (name, type_name, exports) for diagnostics.
