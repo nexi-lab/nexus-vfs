@@ -1600,8 +1600,13 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         }
     }
 
+    // One provider, two composable planes: the certificate plane is always
+    // there (a CA-verified cert carries its identity regardless of posture),
+    // the `sk-` plane only where a credential policy exists. `Open` is the one
+    // posture with no identity plane at all — legal on loopback, where the
+    // caller is already inside the trust domain.
     let posture = auth_posture(&common)?;
-    let api_key_auth = match &posture {
+    let auth_provider = match &posture {
         AuthPosture::ApiKey(secret) => {
             // Reads the kernel's §3.B.3 slot per lookup, so the provider can be
             // built here — before the zones bootstrap and the root zone's
@@ -1615,39 +1620,26 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
                 secret.clone(),
             )))
         }
-        AuthPosture::Open | AuthPosture::CertIdentity => None,
-    };
-
-    // mTLS with no `sk-` policy: certificates ARE the credential plane, so
-    // install the provider that READS them. Without this the daemon admits
-    // only CA-verified peers and then resolves each one as
-    // nobody-in-particular — identity unarmed, A2A stamping fail-open, `from`
-    // forgeable on the deployment that demanded certificates (see
-    // `auth_posture`).
-    let cert_identity_auth = match &posture {
         AuthPosture::CertIdentity => {
             // Say it out loud, the way the `sk-` plane does: an operator
             // reading the boot log can tell "callers are identified" from
             // "callers merely got in".
             tracing::info!(
-                "certificate identity plane armed (mTLS is the credential plane; no sk- policy) \
-                 — a verified peer authenticates as its cert's SAN, a caller without one is rejected"
+                "certificate identity plane armed (mTLS is the credential plane; no sk- policy)                  — a verified peer authenticates as its cert's SAN"
             );
-            Some(Arc::new(auth::CertIdentityProvider::new()))
+            Some(Arc::new(auth::ApiKeyAuthProvider::cert_identity_only()))
         }
-        AuthPosture::ApiKey(_) | AuthPosture::Open => None,
+        AuthPosture::Open => None,
     };
 
     // Is an identity plane armed? This — not "was a secret set" — is what
     // fail-closed postures downstream key off (A2A stamping above all).
-    let identity_armed = api_key_auth.is_some() || cert_identity_auth.is_some();
+    let identity_armed = auth_provider.is_some();
 
-    let vfs_auth: Arc<dyn transport::auth::AuthProvider> =
-        match (&api_key_auth, &cert_identity_auth) {
-            (Some(provider), _) => Arc::clone(provider) as _,
-            (None, Some(provider)) => Arc::clone(provider) as _,
-            (None, None) => Arc::new(transport::auth::NoAuth),
-        };
+    let vfs_auth: Arc<dyn transport::auth::AuthProvider> = match &auth_provider {
+        Some(provider) => Arc::clone(provider) as _,
+        None => Arc::new(transport::auth::NoAuth),
+    };
 
     // Late-bound verifier slot: the VFS routes are built here, BEFORE the
     // ZoneManager that owns the verifier exists (they're handed into
@@ -1827,13 +1819,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     // revoke. The founder holds the revoked-serial file and reads it directly;
     // a joiner fetches the CA-signed CRL from the founder's enroll addr (derived
     // from the first peer the way boot-time enrollment is) and verifies it.
-    let revocation_sink: Option<Arc<dyn auth::RevocationSink>> =
-        match (api_key_auth.clone(), cert_identity_auth.clone()) {
-            (Some(p), _) => Some(p as _),
-            (None, Some(p)) => Some(p as _),
-            (None, None) => None,
-        };
-    if let Some(provider) = revocation_sink {
+    if let Some(provider) = auth_provider.clone() {
         let ca_key_holder = common.data_dir.join("tls").join("ca-key.pem").exists();
         let founder_enroll = if ca_key_holder {
             None
@@ -2410,7 +2396,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
             }
         }
 
-        match &api_key_auth {
+        match &auth_provider {
             Some(provider) => {
                 // Revocation propagates because the command replicates:
                 // `DeleteAuthKey` commits, every replica applies it, and every
@@ -5107,7 +5093,7 @@ fn run_auth_blocking(common: CommonArgs, action: AuthCmd) -> Result<()> {
 /// revoke. A fetch or verify failure keeps the last known set rather than
 /// clearing it — a transient founder outage must not un-revoke an agent.
 async fn crl_refresh_loop(
-    provider: std::sync::Arc<dyn auth::RevocationSink>,
+    provider: std::sync::Arc<auth::ApiKeyAuthProvider>,
     data_dir: std::path::PathBuf,
     ca_key_holder: bool,
     founder_enroll: Option<String>,

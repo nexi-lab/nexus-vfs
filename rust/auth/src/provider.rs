@@ -18,10 +18,11 @@
 //!
 //! The peer plane does not depend on the token plane — a certificate carries
 //! its identity whether or not this daemon has a signing secret. That is why
-//! it lives in one shared function ([`resolve_verified_peer`]) rather than
-//! inside this provider, and why a daemon whose ONLY credential plane is mTLS
-//! installs [`CertIdentityProvider`] instead of falling back to "authenticate
-//! nobody". Admission is not identity: before that split, an mTLS daemon with
+//! it lives in one shared function ([`resolve_verified_peer`]) and the `sk-`
+//! side is an optional plane, so a daemon whose ONLY credential plane is mTLS
+//! ([`ApiKeyAuthProvider::cert_identity_only`]) still resolves callers instead
+//! of falling back to "authenticate nobody". Admission is not identity: before
+//! the planes were split, an mTLS daemon with
 //! no `NEXUS_API_KEY_SECRET` resolved every verified caller as
 //! nobody-in-particular, which left `auth_armed` false, the A2A stamp hook
 //! fail-open, and an envelope's `from` forgeable on the one deployment shape
@@ -123,12 +124,29 @@ struct CachedContext {
     expires_at: Instant,
 }
 
-/// Resolves `sk-` API keys and mTLS peers into an `OperationContext`.
-pub struct ApiKeyAuthProvider {
+/// The `sk-` credential policy: the signing secret that turns a presented key
+/// into a store lookup, the store it looks up in, and the cache in front of
+/// both. Absent on a daemon that authenticates by certificate alone.
+struct KeyPlane {
     store: Arc<dyn AuthKeyStore>,
     secret: String,
     cache: DashMap<String, CachedContext>,
     cache_ttl: Duration,
+}
+
+/// Resolves mTLS peers and (when the daemon holds a credential policy) `sk-`
+/// API keys into an `OperationContext`.
+///
+/// The two planes are composed, not subclassed: the certificate plane is
+/// always present because a CA-verified certificate carries its identity
+/// regardless of this daemon's posture, while [`KeyPlane`] exists only where
+/// `NEXUS_API_KEY_SECRET` gave the daemon a credential policy. Modelling it the
+/// other way — a second provider type for the certificate-only case — made two
+/// types share one responsibility and made the composition root choose a
+/// provider twice.
+pub struct ApiKeyAuthProvider {
+    /// `None` = certificate-only: mTLS is the whole credential plane.
+    keys: Option<KeyPlane>,
     /// Raw serials of revoked agent certs — the current cluster CRL, projected
     /// to a lookup set. `resolve` rejects an agent whose cert serial is in here.
     /// The composition root refreshes it from the CA-signed CRL (the CA's own
@@ -147,12 +165,38 @@ impl ApiKeyAuthProvider {
         cache_ttl: Duration,
     ) -> Self {
         Self {
-            store,
-            secret: secret.into(),
-            cache: DashMap::new(),
-            cache_ttl,
+            keys: Some(KeyPlane {
+                store,
+                secret: secret.into(),
+                cache: DashMap::new(),
+                cache_ttl,
+            }),
             revoked_serials: RwLock::new(HashSet::new()),
         }
+    }
+
+    /// A daemon whose ONLY credential plane is mTLS: certificates resolve, and
+    /// there are no tokens to present.
+    ///
+    /// Why this exists at all: mTLS admits only CA-verified peers, but
+    /// *admission is not identity*. With nothing reading the certificate every
+    /// request resolved as nobody-in-particular, which left
+    /// `ServiceBootCtx::auth_armed` false and the A2A stamp hook fail-open — an
+    /// envelope's `from` passing through unstamped on the deployment shape that
+    /// demanded a certificate from everybody.
+    pub fn cert_identity_only() -> Self {
+        Self {
+            keys: None,
+            revoked_serials: RwLock::new(HashSet::new()),
+        }
+    }
+
+    /// Whether this daemon resolves `sk-` keys at all. The composition root
+    /// uses it to skip wiring that only a credential policy needs (the
+    /// cache-eviction apply-observer), rather than registering a no-op on the
+    /// apply thread.
+    pub fn resolves_api_keys(&self) -> bool {
+        self.keys.is_some()
     }
 
     /// Replace the revoked-serial set with the latest CRL projection. Called by
@@ -166,19 +210,16 @@ impl ApiKeyAuthProvider {
     /// `PutAuthKey` / `DeleteAuthKey` commits, so a revocation takes effect
     /// on every replica without waiting out the TTL.
     pub fn invalidate(&self, key_hash: &str) {
-        self.cache.remove(key_hash);
+        if let Some(keys) = &self.keys {
+            keys.cache.remove(key_hash);
+        }
     }
 
     /// Drop every cached context — for a store swap or a mass revocation.
     pub fn invalidate_all(&self) {
-        self.cache.clear();
-    }
-
-    /// The hash a caller would need in order to invalidate `key`'s cache
-    /// entry. Exposed so minting tooling can hand the observer a hash
-    /// without re-deriving the HMAC scheme.
-    pub fn key_hash(&self, key: &str) -> String {
-        hash_key(&self.secret, key)
+        if let Some(keys) = &self.keys {
+            keys.cache.clear();
+        }
     }
 
     /// System context for a cryptographically verified cluster node.
@@ -245,7 +286,13 @@ impl ApiKeyAuthProvider {
             tracing::debug!("rejected: malformed API key");
             return Err(unauthenticated());
         }
-        self.resolve_by_store_key(hash_key(&self.secret, token))
+        let Some(keys) = &self.keys else {
+            // No credential policy: there is no key space to look this up in,
+            // and "cannot tell" is the same answer as "no" to a credential.
+            tracing::debug!("rejected: a token was presented to a certificate-only daemon");
+            return Err(unauthenticated());
+        };
+        self.resolve_by_store_key(keys, hash_key(&keys.secret, token))
     }
 
     /// Resolve a cert-authenticated agent from the cert alone: identity from
@@ -286,16 +333,20 @@ impl ApiKeyAuthProvider {
     /// apply-observer hands `invalidate`, so a `DeleteAuthKey` evicts here
     /// without waiting the TTL. (A cert-agent skips this path entirely — it
     /// resolves from the cert in `agent_context`, no store, no cache.)
-    fn resolve_by_store_key(&self, store_key: String) -> Result<OperationContext, Status> {
-        if let Some(entry) = self.cache.get(&store_key) {
+    fn resolve_by_store_key(
+        &self,
+        keys: &KeyPlane,
+        store_key: String,
+    ) -> Result<OperationContext, Status> {
+        if let Some(entry) = keys.cache.get(&store_key) {
             if Instant::now() < entry.expires_at {
                 return Ok(entry.ctx.clone());
             }
         }
         // Expired (or absent) — drop the stale row and go to the store.
-        self.cache.remove(&store_key);
+        keys.cache.remove(&store_key);
 
-        let bytes = match self.store.get(&store_key) {
+        let bytes = match keys.store.get(&store_key) {
             Ok(Some(bytes)) => bytes,
             Ok(None) => {
                 tracing::debug!("rejected: no such credential");
@@ -338,11 +389,11 @@ impl ApiKeyAuthProvider {
         }
 
         let ctx = Self::context_from_record(&record);
-        self.cache.insert(
+        keys.cache.insert(
             store_key,
             CachedContext {
                 ctx: ctx.clone(),
-                expires_at: Instant::now() + self.cache_ttl,
+                expires_at: Instant::now() + keys.cache_ttl,
             },
         );
         Ok(ctx)
@@ -359,12 +410,12 @@ fn unauthenticated() -> Status {
 /// The peer-certificate plane: what a CA-verified client certificate, on its
 /// own, authenticates as.
 ///
-/// Shared by every provider, because a certificate carries the same identity
-/// whether or not the daemon also runs an `sk-` credential policy — the two
-/// planes were bundled together by implementation, never by contract. One copy
-/// is what lets a cert-only daemon ([`CertIdentityProvider`]) resolve exactly
-/// the identities an `sk-` daemon would, so the A2A stamp hook behaves the same
-/// under either posture.
+/// Independent of the `sk-` plane, because a certificate carries the same
+/// identity whether or not the daemon also runs a credential policy — the two
+/// were bundled together by implementation, never by contract. That is what
+/// lets a certificate-only daemon resolve exactly the identities an `sk-`
+/// daemon would, so the A2A stamp hook behaves the same under either posture.
+#[inline]
 fn resolve_verified_peer(
     peer: &PeerIdentity,
     revoked: &RwLock<HashSet<Vec<u8>>>,
@@ -423,75 +474,12 @@ fn resolve_verified_peer(
 }
 
 /// Whether an agent cert with this serial has been revoked (is in the CRL).
+#[inline]
 fn serial_revoked(revoked: &RwLock<HashSet<Vec<u8>>>, serial: &[u8]) -> bool {
     revoked
         .read()
         .expect("revoked-serials lock")
         .contains(serial)
-}
-
-/// The CRL projection sink. Implemented by every provider that resolves agent
-/// certs, so the composition root's refresh loop does not care which posture
-/// installed which provider.
-pub trait RevocationSink: Send + Sync {
-    /// Replace the revoked-serial set with the latest CRL projection.
-    fn set_revoked_serials(&self, serials: HashSet<Vec<u8>>);
-}
-
-impl RevocationSink for ApiKeyAuthProvider {
-    fn set_revoked_serials(&self, serials: HashSet<Vec<u8>>) {
-        ApiKeyAuthProvider::set_revoked_serials(self, serials);
-    }
-}
-
-/// Authenticates by client certificate alone — the provider a daemon installs
-/// when mTLS is its only credential plane (no `NEXUS_API_KEY_SECRET`).
-///
-/// **Why this exists.** mTLS admits only CA-verified peers, but *admission is
-/// not identity*. With no provider reading the certificate, every request
-/// resolved as nobody-in-particular: `ServiceBootCtx::auth_armed` was false, so
-/// the A2A stamp hook ran fail-open and an envelope's `from` passed through
-/// unstamped — forgeable on a daemon whose whole point was that callers prove
-/// who they are. This closes that hole with the same certificate plane
-/// `ApiKeyAuthProvider` uses, minus the `sk-` store.
-///
-/// A caller presenting no certificate is rejected: there is no token plane to
-/// fall back to, and "authenticate nobody" is a posture only a loopback bind
-/// may take (see `nexusd_cluster::auth_posture`).
-#[derive(Default)]
-pub struct CertIdentityProvider {
-    revoked_serials: RwLock<HashSet<Vec<u8>>>,
-}
-
-impl CertIdentityProvider {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Replace the revoked-serial set with the latest CRL projection. Same
-    /// contract as the `sk-` provider's: a swap, so a `resolve` in flight sees
-    /// either the whole old set or the whole new one.
-    pub fn set_revoked_serials(&self, serials: HashSet<Vec<u8>>) {
-        *self.revoked_serials.write().expect("revoked-serials lock") = serials;
-    }
-}
-
-impl RevocationSink for CertIdentityProvider {
-    fn set_revoked_serials(&self, serials: HashSet<Vec<u8>>) {
-        CertIdentityProvider::set_revoked_serials(self, serials);
-    }
-}
-
-impl AuthProvider for CertIdentityProvider {
-    fn resolve(&self, creds: &AuthCredentials<'_>) -> Result<OperationContext, Status> {
-        match creds.peer {
-            Some(peer) => resolve_verified_peer(peer, &self.revoked_serials),
-            None => {
-                tracing::debug!("rejected: no client certificate (cert-identity daemon)");
-                Err(unauthenticated())
-            }
-        }
-    }
 }
 
 impl AuthProvider for ApiKeyAuthProvider {
@@ -907,7 +895,7 @@ mod tests {
             peer: Some(&peer),
         };
 
-        let cert_only = CertIdentityProvider::new()
+        let cert_only = ApiKeyAuthProvider::cert_identity_only()
             .resolve(&creds)
             .expect("resolves");
         let with_keys = provider(MemStore::arc()).resolve(&creds).expect("resolves");
@@ -930,7 +918,7 @@ mod tests {
             trust_domain: Some("hospital-a".into()),
             serial: vec![7, 7, 7],
         };
-        let ctx = CertIdentityProvider::new()
+        let ctx = ApiKeyAuthProvider::cert_identity_only()
             .resolve(&AuthCredentials {
                 token: "",
                 peer: Some(&peer),
@@ -952,7 +940,7 @@ mod tests {
             trust_domain: None,
             serial: vec![9, 9, 9],
         };
-        let p = CertIdentityProvider::new();
+        let p = ApiKeyAuthProvider::cert_identity_only();
         p.set_revoked_serials(HashSet::from([vec![9, 9, 9]]));
         assert!(p
             .resolve(&AuthCredentials {
@@ -964,11 +952,19 @@ mod tests {
 
     /// Without a certificate there is nothing to authenticate: a cert-only
     /// daemon has no token plane to fall back to, and MUST NOT fall back to
-    /// "everybody is an admin" — that fallback is exactly the hole this
-    /// provider exists to close.
+    /// "everybody is an admin" — that fallback is exactly the hole this mode
+    /// exists to close.
+    ///
+    /// Stated precisely, because the wire does not exercise this today: the
+    /// mTLS listener builds its client verifier WITHOUT `allow_unauthenticated`,
+    /// so a peer presenting no certificate never completes the handshake and
+    /// never reaches `resolve`. This branch guards a caller arriving by some
+    /// other route on the same provider (a future non-TLS surface), not a live
+    /// hole — it is a floor, not the thing standing between us and anonymous
+    /// admins.
     #[test]
     fn a_cert_only_daemon_rejects_a_caller_with_no_certificate() {
-        let p = CertIdentityProvider::new();
+        let p = ApiKeyAuthProvider::cert_identity_only();
         assert!(p.resolve(&AuthCredentials::from_token("")).is_err());
         assert!(p
             .resolve(&AuthCredentials::from_token(
