@@ -4371,6 +4371,142 @@ mod tests {
         /// against a tempfile redb — every lookup hits the underlying
         /// store, exercising the same path a cold cache hit would.
         #[test]
+        /// Following a DT_LINK must re-run the §13 permission gate against the
+        /// TARGET, not just the link.
+        ///
+        /// Today this holds by CONSTRUCTION rather than by a check: neither
+        /// syscall resolves a link inline — each re-enters itself with the
+        /// target path (`sys_read_single` / `sys_write_with_link_depth`), so the
+        /// gate at the top of the syscall simply runs a second time. That is a
+        /// lovely property and an invisible one: a refactor that resolved the
+        /// target inline and read it directly would keep every existing test
+        /// green while silently turning a link into a way around authorization.
+        ///
+        /// So this pins the observable consequence — a principal denied on the
+        /// target is denied through the link — AND that the gate was actually
+        /// asked about the target path, which is the part an inlining refactor
+        /// would drop.
+        fn following_a_link_re_authorizes_the_target() {
+            use crate::{Permission, PermissionProvider};
+            use parking_lot::Mutex as PlMutex;
+
+            /// Denies exactly one path; records every path it is asked about.
+            struct DenyOne {
+                denied: String,
+                seen: Arc<PlMutex<Vec<String>>>,
+            }
+            impl PermissionProvider for DenyOne {
+                fn check(
+                    &self,
+                    path: &str,
+                    _route: Option<&crate::vfs_router::RouteResult>,
+                    _permission: Permission,
+                    _ctx: &OperationContext,
+                ) -> Result<(), KernelError> {
+                    self.seen.lock().push(path.to_string());
+                    if path == self.denied {
+                        return Err(KernelError::PermissionDenied(format!(
+                            "denied by policy: {path}"
+                        )));
+                    }
+                    Ok(())
+                }
+            }
+
+            let k = Arc::new(Kernel::new());
+            let td = tempfile::tempdir().unwrap();
+            let ms: Arc<dyn crate::meta_store::MetaStore> =
+                Arc::new(LocalMetaStore::open(&td.path().join("meta.redb")).unwrap());
+            k.add_mount("/data", "root", None, Some(ms), None, false)
+                .unwrap();
+
+            // Seed the target through a system context, so the only thing that
+            // can deny the link traversal below is the gate under test.
+            let sys_ctx = OperationContext::new("system", "root", true, None, true);
+            crate::kernel::syscall::KernelSyscall::sys_write(
+                k.as_ref(),
+                "/data/secret",
+                &sys_ctx,
+                b"classified",
+                0,
+            )
+            .expect("seed the target");
+
+            // /data/link -> /data/secret
+            k.sys_setattr(
+                "/data/link",
+                6, // DT_LINK
+                "",
+                None,
+                None,
+                None,
+                "memory",
+                "root",
+                false,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("/data/secret"),
+                None,
+                None,
+            )
+            .unwrap();
+
+            let seen = Arc::new(PlMutex::new(Vec::new()));
+            let provider: Arc<Box<dyn PermissionProvider>> = Arc::new(Box::new(DenyOne {
+                denied: "/data/secret".to_string(),
+                seen: Arc::clone(&seen),
+            })
+                as Box<dyn PermissionProvider>);
+            k.set_permission_provider(provider);
+
+            // A principal that may touch the link but NOT its target.
+            let ctx = OperationContext::new("mallory", "root", false, None, false);
+
+            match k.sys_read_single("/data/link", &ctx, 1, 0, 0) {
+                Err(KernelError::PermissionDenied(_)) => {}
+                Err(other) => {
+                    panic!("expected PermissionDenied reading through the link, got {other:?}")
+                }
+                Ok(r) => panic!(
+                    "READ through a DT_LINK reached a target the caller is denied on: {:?}",
+                    r.data
+                ),
+            }
+            assert!(
+                seen.lock().iter().any(|p| p == "/data/secret"),
+                "the gate was never asked about the TARGET — the link was resolved                  without re-authorizing it; saw {:?}",
+                seen.lock()
+            );
+
+            seen.lock().clear();
+            match crate::kernel::syscall::KernelSyscall::sys_write(
+                k.as_ref(),
+                "/data/link",
+                &ctx,
+                b"overwrite",
+                0,
+            ) {
+                Err(KernelError::PermissionDenied(_)) => {}
+                Err(other) => {
+                    panic!("expected PermissionDenied writing through the link, got {other:?}")
+                }
+                Ok(_) => panic!("WRITE through a DT_LINK reached a target the caller is denied on"),
+            }
+            assert!(
+                seen.lock().iter().any(|p| p == "/data/secret"),
+                "the gate was never asked about the TARGET on the write path; saw {:?}",
+                seen.lock()
+            );
+        }
+
+        #[test]
         fn sys_read_rejects_chained_link_through_metastore_only() {
             let k = Kernel::new();
             let _td = tempfile::tempdir().unwrap();
