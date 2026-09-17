@@ -31,6 +31,14 @@ export const DEFAULT_CLUSTER_SERVER_NAME = 'nexus-node'
 /** Default bound on how long a call waits for the channel to come up. */
 export const DEFAULT_CONNECT_TIMEOUT_MS = 30_000
 
+/**
+ * Head-room added to a blocking read's own timeout when setting its RPC
+ * deadline. The daemon answers a long poll with `timed_out` at `timeoutMs`;
+ * the deadline only needs to outlast that answer's trip back, so this covers
+ * scheduling and network jitter rather than the wait itself.
+ */
+export const BLOCKING_READ_DEADLINE_MARGIN_MS = 15_000
+
 const PROTO_LOADER_OPTIONS: protoLoader.Options = {
   keepCase: true,
   longs: String,
@@ -66,8 +74,18 @@ export interface NexusVfsClientOptions {
    * have just spawned. Defaults to
    * {@link DEFAULT_CONNECT_TIMEOUT_MS}; the wait is bounded so an unreachable
    * server surfaces as DEADLINE_EXCEEDED instead of hanging.
+   *
+   * This bounds the wait for the channel, NOT the server's own processing: a
+   * blocking `streamReadAt` sets its deadline from the poll it asked for. See
+   * {@link blockingReadMarginMs}.
    */
   connectTimeoutMs?: number
+  /**
+   * Head-room added to a blocking read's `timeoutMs` when setting that call's
+   * deadline. Defaults to {@link BLOCKING_READ_DEADLINE_MARGIN_MS}; lower it
+   * in tests that need the deadline to expire quickly.
+   */
+  blockingReadMarginMs?: number
 }
 
 interface UnaryClient {
@@ -289,6 +307,7 @@ export class NexusVfsClient {
 
   private readonly client: UnaryClient
   private readonly connectTimeoutMs: number
+  private readonly blockingReadMarginMs: number
 
   /**
    * Connect to `endpoint`, plaintext by default — that is what the
@@ -316,6 +335,8 @@ export class NexusVfsClient {
     }
 
     this.connectTimeoutMs = options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS
+    this.blockingReadMarginMs =
+      options.blockingReadMarginMs ?? BLOCKING_READ_DEADLINE_MARGIN_MS
     this.target = toGrpcTarget(endpoint)
     this.client = new Service(this.target, credentials, channelOptions) as unknown as UnaryClient
   }
@@ -493,6 +514,16 @@ export class NexusVfsClient {
     authToken: string,
     options: { blocking?: boolean; timeoutMs?: number } = {},
   ): Promise<StreamReadResult> {
+    // A blocking read asks the daemon to hold the response for up to
+    // `timeoutMs`, so the RPC must outlive the poll it just requested. Bounding
+    // it by `connectTimeoutMs` instead made every long poll at or above that
+    // value expire on the client first: the caller saw DEADLINE_EXCEEDED rather
+    // than the daemon's own `timed_out` answer, and — because a throw from this
+    // method is the stream-closed signal — reported a live writer as exited.
+    const deadlineMs =
+      options.blocking && options.timeoutMs
+        ? options.timeoutMs + this.blockingReadMarginMs
+        : undefined
     const response = await this.unary<StreamReadAtRequest, StreamReadAtResponse>(
       'StreamReadAt',
       'stream read',
@@ -503,6 +534,7 @@ export class NexusVfsClient {
         timeout_ms: String(options.timeoutMs ?? 0),
         auth_token: authToken,
       },
+      deadlineMs,
     )
     if (response.is_error) throw vfsError(response.error_payload, 'stream read')
     return {
@@ -523,14 +555,25 @@ export class NexusVfsClient {
     this.client.close()
   }
 
-  private unary<Req, Res>(rpc: keyof UnaryClient, operation: string, request: Req): Promise<Res> {
+  private unary<Req, Res>(
+    rpc: keyof UnaryClient,
+    operation: string,
+    request: Req,
+    deadlineMs?: number,
+  ): Promise<Res> {
     return new Promise((resolve, reject) => {
       // Queue the call while the channel connects instead of failing fast:
       // callers dial a daemon they have just spawned, and grpc-js otherwise
       // rejects with an empty status before the first connection lands. In
       // grpc-js this is a Metadata flag, not a CallOption.
       const metadata = new grpc.Metadata({ waitForReady: true })
-      const callOptions: grpc.CallOptions = { deadline: Date.now() + this.connectTimeoutMs }
+      // `connectTimeoutMs` bounds how long a call waits for the channel, which
+      // is the right bound for an RPC the server answers immediately. A call
+      // that asks the server to hold the response needs its own, longer bound —
+      // see the blocking branch of `streamReadAt`.
+      const callOptions: grpc.CallOptions = {
+        deadline: Date.now() + (deadlineMs ?? this.connectTimeoutMs),
+      }
       const method = this.client[rpc] as unknown as GrpcMethod<Req, Res>
       method.call(this.client, request, metadata, callOptions, (error, response) => {
         if (error) {
