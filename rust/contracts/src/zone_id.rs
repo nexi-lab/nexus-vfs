@@ -170,10 +170,30 @@ mod tests {
         // If someone edits the generated file in OUT_DIR these still pass, which
         // is fine: that copy is rebuilt from the spec on the next build. What
         // this pins is that the constants are wired to the generator at all.
+        assert_eq!(ZONE_ID_CONTRACT_ID, "urn:sudo:nexus-vfs:zone-id:v1");
         assert_eq!(ZONE_ID_MIN_LEN, 3);
         assert_eq!(ZONE_ID_MAX_LEN, 63);
         assert!(ZONE_ID_CHARSET.contains('-'));
         assert!(!ZONE_ID_CHARSET.contains('_'));
+    }
+
+    #[test]
+    fn generated_projections_match_the_pinned_owner_files() {
+        let committed = include_str!("../../../contracts/zone-id/schema.json");
+        assert_eq!(
+            ZONE_ID_SCHEMA_JSON, committed,
+            "contracts/zone-id/schema.json drifted; regenerate it with \
+             `cargo run -p contracts --example zone_id_projection > \
+             contracts/zone-id/schema.json`"
+        );
+
+        let committed_vectors = include_str!("../../../contracts/zone-id/vectors.json");
+        assert_eq!(
+            ZONE_ID_VECTORS_JSON, committed_vectors,
+            "contracts/zone-id/vectors.json drifted; regenerate it with \
+             `cargo run -p contracts --example zone_id_vectors > \
+             contracts/zone-id/vectors.json`"
+        );
     }
 
     #[test]

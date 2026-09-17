@@ -1,0 +1,14 @@
+{
+  "name": "@nexus-vfs/zone-path-contract-check",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node check-schema.mjs"
+  },
+  "devDependencies": {
+    "ajv": "8.20.0"
+  }
+}
