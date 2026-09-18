@@ -170,6 +170,15 @@ pub trait AuthProvider: Send + Sync + 'static {
             "this authentication provider does not support runtime delegation",
         ))
     }
+
+    /// The provider's own declaration of what auth plane it is (R13) —
+    /// surfaced verbatim by `GetRuntimeCapabilities` so Nexus production
+    /// assembly can gate on "callers are identified" vs "loopback open".
+    /// Default `"no-auth"` (the [`NoAuth`] single-trust-domain posture
+    /// inherits it unchanged); real providers override.
+    fn mode(&self) -> &'static str {
+        "no-auth"
+    }
 }
 
 /// Single-node-dev all-pass policy. Every request becomes a
