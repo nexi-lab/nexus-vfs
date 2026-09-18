@@ -40,6 +40,7 @@ pub use mailbox_stamping_policy::{
     CHAT_WITH_ME_SUFFIX, MAILBOX_IO_PROFILE, MAILBOX_STREAM_CAPACITY,
 };
 
+use contracts::OperationContext;
 use kernel::kernel::syscall::KernelSyscall;
 use kernel::kernel::Kernel;
 
@@ -56,8 +57,12 @@ const DT_STREAM: i32 = 4;
 /// agent host; any future unmanaged host calls the same function). A REMOTE
 /// agent's inbox is provisioned on its own host and replicated in, so a node
 /// only ever provisions the inboxes of agents IT hosts.
-pub fn ensure_agent_inbox<K: KernelSyscall>(kernel: &K, agent_name: &str) -> Result<(), String> {
-    ensure_mailbox_stream(kernel, &agent_inbox_path(agent_name))
+pub fn ensure_agent_inbox<K: KernelSyscall>(
+    kernel: &K,
+    ctx: &OperationContext,
+    agent_name: &str,
+) -> Result<(), String> {
+    ensure_mailbox_stream(kernel, ctx, &agent_inbox_path(agent_name))
 }
 
 /// Provision `agent_name`'s attention-state stream as a DT_STREAM, idempotently
@@ -68,9 +73,10 @@ pub fn ensure_agent_inbox<K: KernelSyscall>(kernel: &K, agent_name: &str) -> Res
 /// unaffected.
 pub fn ensure_agent_state_stream<K: KernelSyscall>(
     kernel: &K,
+    ctx: &OperationContext,
     agent_name: &str,
 ) -> Result<(), String> {
-    ensure_mailbox_stream(kernel, &agent_state_path(agent_name))
+    ensure_mailbox_stream(kernel, ctx, &agent_state_path(agent_name))
 }
 
 /// Provision the `chat-with-me` mailbox at `path` as a DT_STREAM, idempotently.
@@ -94,10 +100,15 @@ pub fn ensure_agent_state_stream<K: KernelSyscall>(
 ///
 /// Generic over [`KernelSyscall`] (not `&Kernel`) so the services rlib can call
 /// it without monomorphising against a concrete kernel.
-pub fn ensure_mailbox_stream<K: KernelSyscall>(kernel: &K, path: &str) -> Result<(), String> {
+pub fn ensure_mailbox_stream<K: KernelSyscall>(
+    kernel: &K,
+    ctx: &OperationContext,
+    path: &str,
+) -> Result<(), String> {
     kernel
         .sys_setattr(
             path,
+            ctx,
             DT_STREAM,
             /* backend_name */ "",
             /* backend */ None,

@@ -101,6 +101,7 @@ pub trait KernelConvenience: KernelSyscall {
     fn mount(&self, path: &str, opts: MountOptions<'_>) -> Result<SysSetAttrResult, KernelError> {
         self.sys_setattr(
             path,
+            opts.ctx,
             DT_MOUNT as i32,
             opts.backend_name,
             opts.backend,
@@ -371,12 +372,14 @@ impl Default for GrepOptions {
 /// ```ignore
 /// use std::sync::Arc;
 /// use kernel::kernel::convenience::{KernelConvenience, MountOptions};
+/// let ctx = OperationContext::new("system", "root", true, None, true);
 /// kernel.mount(
 ///     "/scratch",
-///     MountOptions::new("local").with_backend(backend),
+///     MountOptions::new(&ctx, "local").with_backend(backend),
 /// )?;
 /// ```
 pub struct MountOptions<'a> {
+    ctx: &'a OperationContext,
     backend_name: &'a str,
     backend: Option<Arc<dyn ObjectStore>>,
     metastore: Option<Arc<dyn MetaStore>>,
@@ -396,8 +399,9 @@ impl<'a> MountOptions<'a> {
     /// backend, `"memory"` io_profile, root zone, not external,
     /// no federation source, no remote metastore. Override the
     /// fields that differ via the chainable `with_*` setters.
-    pub fn new(backend_name: &'a str) -> Self {
+    pub fn new(ctx: &'a OperationContext, backend_name: &'a str) -> Self {
         Self {
+            ctx,
             backend_name,
             backend: None,
             metastore: None,

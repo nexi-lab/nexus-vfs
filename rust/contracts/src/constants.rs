@@ -78,9 +78,22 @@ pub const CONTROL_ZONE_ID: &str = "__control__";
 ///
 /// `auth`       — API-key + agent-identity records (`raft::auth_key_store`).
 /// `foreign-ca` — cross-org trust anchors (cross-org substrate).
+/// `zone-ops`   — zone-mutation operation journal (`raft::zone_op_journal`).
+/// `zone-registry` — zone deletion epochs/tombstone registry (`raft::zone_deletion_registry`).
 pub const CONTROL_NS_AUTH: &str = "auth";
 /// See [`CONTROL_NS_AUTH`].
 pub const CONTROL_NS_FOREIGN_CA: &str = "foreign-ca";
+/// See [`CONTROL_NS_AUTH`].
+pub const CONTROL_NS_ZONE_OPS: &str = "zone-ops";
+/// See [`CONTROL_NS_AUTH`].
+pub const CONTROL_NS_ZONE_REGISTRY: &str = "zone-registry";
+
+/// Zone IDs that can never be deleted — the replicated-control substrate
+/// itself. Deletion guards (`ZoneManager::remove_zone`, the registry's
+/// bottom-layer guard, and the `delete_zone` RPC) all share this list so a
+/// reserved zone is refused at every layer, not just the outermost.
+/// Values reference [`ROOT_ZONE_ID`] / [`CONTROL_ZONE_ID`] — one SSOT.
+pub const RESERVED_ZONE_IDS: &[&str] = &[ROOT_ZONE_ID, CONTROL_ZONE_ID];
 
 /// Canonical VFS root path.
 ///

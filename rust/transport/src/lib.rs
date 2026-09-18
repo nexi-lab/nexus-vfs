@@ -55,6 +55,7 @@ pub mod peer_identity;
 /// actually took (Tailscale direct vs DERP relay vs unknown) and
 /// warns operators when their bytes traverse a third-party relay.
 pub mod transport_observer;
+pub mod zone_runtime;
 
 /// Out-bound VFS gRPC client. Re-exported from `kernel::rpc_transport`
 /// where the type is declared (kernel-internal `RemoteMetaStore`

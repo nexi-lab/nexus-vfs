@@ -71,7 +71,7 @@ pub use search_caps::{read_search_caps, write_search_caps, SearchCapabilitiesInf
 #[cfg(feature = "consensus")]
 pub use storage::RaftStorage;
 #[cfg(all(feature = "grpc", has_protos))]
-pub use zone_persistence::ZonePersistence;
+pub use zone_persistence::{DeletionRecord, ZonePersistence};
 #[cfg(all(feature = "grpc", has_protos))]
 pub(crate) use zone_registry::reconcile_peers_with_conf_state;
 pub(crate) use zone_registry::wait_until_caught_up;

@@ -11,6 +11,8 @@
 use std::error::Error;
 use std::fmt;
 
+use crate::OperationContext;
+
 /// Error returned by `RustService::dispatch` and surfaced through
 /// `Kernel::dispatch_rust_call`. Maps onto JSON-RPC-shaped wire error
 /// codes by the gRPC `Call` handler.
@@ -80,6 +82,20 @@ pub trait RustService: Send + Sync {
     /// expose any RPCs continue to compile.
     fn dispatch(&self, _method: &str, _payload: &[u8]) -> Result<Vec<u8>, RustCallError> {
         Err(RustCallError::NotFound)
+    }
+
+    /// Dispatch a JSON-encoded RPC with the authenticated caller context.
+    ///
+    /// Existing in-process services keep their v1 behavior through this adapter;
+    /// external entry points call this method so context-aware implementations
+    /// can make authorization decisions without trusting their payload.
+    fn dispatch_with_context(
+        &self,
+        _ctx: &OperationContext,
+        method: &str,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, RustCallError> {
+        self.dispatch(method, payload)
     }
 
     /// Declared RPC method names this service exports. Used by

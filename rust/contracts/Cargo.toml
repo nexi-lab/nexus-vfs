@@ -10,9 +10,12 @@ crate-type = ["rlib"]
 
 [dependencies]
 # Serialization for shared state types (lock_state snapshots travel through
-# raft-rs's bincode pipeline). Kept behind a dep on a tiny subset of serde
-# to avoid pulling the full macro crate into every dependent.
+# raft-rs's bincode pipeline).
 serde = { version = "1.0", features = ["derive"] }
+# Used by the owner-side contractgen binary and fixture-backed contract tests.
+# Keeping contractgen in this crate deliberately means this is now also a
+# normal dependency; the principal consumers already depend on serde_json.
+serde_json = "1.0"
 # Mutex type used in the ``Locks::shared_state_arc`` trait method. Both
 # kernel and raft already use ``parking_lot::Mutex<LockState>`` to wrap
 # the SSOT; expressing that in the trait signature keeps install-time
@@ -21,7 +24,8 @@ serde = { version = "1.0", features = ["derive"] }
 parking_lot = "0.12"
 
 [build-dependencies]
-# Reads contracts/zone-id/spec.json at build time. A build dependency, so it
-# never enters the dependency graph of anything that links this crate — the
-# "zero deps" property of the library is unchanged.
 serde_json = "1.0"
+
+[[bin]]
+name = "contractgen"
+path = "src/bin/contractgen.rs"

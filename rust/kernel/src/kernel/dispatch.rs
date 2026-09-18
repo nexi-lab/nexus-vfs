@@ -216,6 +216,14 @@ impl Kernel {
         self.permission_provider.store(Some(provider));
     }
 
+    /// Is a permission provider armed (R13)? — what
+    /// `GetRuntimeCapabilities.permission.provider_armed` answers. A
+    /// `false` here means `check_permission` is a no-op gate and callers
+    /// must not read a pass as an authorization decision.
+    pub fn permission_provider_armed(&self) -> bool {
+        !self.permission_provider.load().is_none()
+    }
+
     /// Dispatch POST-INTERCEPT hooks from NativeHookRegistry (fire-and-forget).
     /// No-op when registry is empty (zero-cost lock check).
     /// Uses ``read_unconditional`` for the same recursion reason as the pre dispatch.
@@ -585,6 +593,21 @@ impl Kernel {
         }
         let svc = self.service_registry.lookup_rust(name)?;
         Some(svc.dispatch(method, payload))
+    }
+
+    /// Dispatch a JSON-encoded RPC to a Rust service with caller credentials.
+    pub fn dispatch_rust_call_ctx(
+        &self,
+        ctx: &OperationContext,
+        name: &str,
+        method: &str,
+        payload: &[u8],
+    ) -> Option<Result<Vec<u8>, crate::service_registry::RustCallError>> {
+        if name == "plugin" {
+            return Some(self.dispatch_plugin_call(method, payload));
+        }
+        let svc = self.service_registry.lookup_rust(name)?;
+        Some(svc.dispatch_with_context(ctx, method, payload))
     }
 
     /// Handle `plugin.*` RPC methods — kernel-built-in, not a registered

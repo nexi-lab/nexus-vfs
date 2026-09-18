@@ -163,6 +163,7 @@ fn setup_kernel() -> (Kernel, OperationContext) {
 
     k.sys_setattr(
         "/",
+        &OperationContext::new("test", "root", true, None, true),
         2, // DT_MOUNT
         "mem",
         Some(backend as Arc<dyn ObjectStore>),

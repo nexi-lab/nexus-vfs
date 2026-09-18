@@ -17,13 +17,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use contracts::rust_service::{RustCallError, RustService};
+use contracts::OperationContext;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use nexus_plugin_abi::{
     signing::{PUBKEY_LENGTH, SIGNATURE_FILE_SUFFIX, SIGNATURE_LENGTH},
     DriverCreateFn, DriverDeleteFileFn, DriverDestroyFn, DriverReadFn, DriverReaddirFn,
-    DriverRmdirFn, DriverStatFn, DriverWriteFn, KernelHandle, NexusFreeFn, PluginGrpcServicesFn,
-    PluginKind, PluginResult, ServiceCreateFn, ServiceDestroyFn, ServiceDispatchFn,
-    PLUGIN_API_VERSION,
+    DriverRmdirFn, DriverStatFn, DriverWriteFn, KernelHandle, NexusFreeFn,
+    NexusPluginDispatchContext, PluginGrpcServicesFn, PluginKind, PluginResult, ServiceCreateFn,
+    ServiceDestroyFn, ServiceDispatchFn, ServiceDispatchV2Fn, PLUGIN_API_VERSION,
 };
 
 use crate::abc::object_store::{BackendStat, ObjectStore, StorageError, WriteResult};
@@ -364,6 +365,7 @@ pub(crate) struct DylibRustService {
     svc_name: String,
     handle: *mut c_void,
     dispatch_fn: ServiceDispatchFn,
+    dispatch_v2_fn: Option<ServiceDispatchV2Fn>,
     /// The plugin's own `nexus_free` — frees dispatch-output buffers on
     /// the plugin's allocator (never the host's). See `take_plugin_buf`.
     free_fn: NexusFreeFn,
@@ -372,6 +374,29 @@ pub(crate) struct DylibRustService {
 // SAFETY: Plugin C ABI contract requires thread-safe instances.
 unsafe impl Send for DylibRustService {}
 unsafe impl Sync for DylibRustService {}
+
+impl DylibRustService {
+    fn finish_dispatch(
+        &self,
+        rc: i32,
+        out_buf: *mut u8,
+        out_len: usize,
+    ) -> Result<Vec<u8>, RustCallError> {
+        match rc {
+            0 => {
+                // The plugin allocated this buffer — copy it out and free it
+                // on the plugin's allocator, never the host's mimalloc.
+                let data = unsafe { take_plugin_buf(out_buf, out_len, self.free_fn) };
+                Ok(data)
+            }
+            rc if rc == PluginResult::NotFound as i32 => Err(RustCallError::NotFound),
+            rc if rc == PluginResult::InvalidArgument as i32 => Err(
+                RustCallError::InvalidArgument("plugin rejected argument".into()),
+            ),
+            rc => Err(RustCallError::Internal(format!("plugin error code {rc}"))),
+        }
+    }
+}
 
 impl RustService for DylibRustService {
     fn name(&self) -> &str {
@@ -394,20 +419,64 @@ impl RustService for DylibRustService {
                 &mut out_len,
             )
         };
+        self.finish_dispatch(rc, out_buf, out_len)
+    }
 
-        match rc {
-            0 => {
-                // The plugin allocated this buffer — copy it out and free it
-                // on the plugin's allocator, never the host's mimalloc.
-                let data = unsafe { take_plugin_buf(out_buf, out_len, self.free_fn) };
-                Ok(data)
-            }
-            rc if rc == PluginResult::NotFound as i32 => Err(RustCallError::NotFound),
-            rc if rc == PluginResult::InvalidArgument as i32 => Err(
-                RustCallError::InvalidArgument("plugin rejected argument".into()),
-            ),
-            rc => Err(RustCallError::Internal(format!("plugin error code {rc}"))),
-        }
+    fn dispatch_with_context(
+        &self,
+        ctx: &OperationContext,
+        method: &str,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, RustCallError> {
+        let Some(dispatch_v2_fn) = self.dispatch_v2_fn else {
+            return self.dispatch(method, payload);
+        };
+        let to_cstring = |value: &str, field: &str| {
+            CString::new(value)
+                .map_err(|_| RustCallError::InvalidArgument(format!("{field} contains null byte")))
+        };
+        let method_c = to_cstring(method, "method")?;
+        let user_id = to_cstring(&ctx.user_id, "user_id")?;
+        let zone_id = to_cstring(&ctx.zone_id, "zone_id")?;
+        let trust_domain = ctx
+            .trust_domain
+            .as_deref()
+            .map(|value| to_cstring(value, "trust_domain"))
+            .transpose()?;
+        let agent_id = ctx
+            .agent_id
+            .as_deref()
+            .map(|value| to_cstring(value, "agent_id"))
+            .transpose()?;
+        let request_id = to_cstring(&ctx.request_id, "request_id")?;
+        let ffi_ctx = NexusPluginDispatchContext {
+            struct_version: 1,
+            user_id: user_id.as_ptr(),
+            zone_id: zone_id.as_ptr(),
+            is_admin: ctx.is_admin,
+            is_system: ctx.is_system,
+            trust_domain: trust_domain
+                .as_ref()
+                .map_or(std::ptr::null(), |value| value.as_ptr()),
+            agent_id: agent_id
+                .as_ref()
+                .map_or(std::ptr::null(), |value| value.as_ptr()),
+            request_id: request_id.as_ptr(),
+        };
+        let mut out_buf: *mut u8 = std::ptr::null_mut();
+        let mut out_len: usize = 0;
+        let rc = unsafe {
+            dispatch_v2_fn(
+                self.handle,
+                &ffi_ctx,
+                method_c.as_ptr(),
+                payload.as_ptr(),
+                payload.len(),
+                &mut out_buf,
+                &mut out_len,
+            )
+        };
+        self.finish_dispatch(rc, out_buf, out_len)
     }
 }
 
@@ -793,9 +862,9 @@ impl PluginLoader {
                 .map_err(|e| format!("symbol {}: {e}", nexus_plugin_abi::symbols::API_VERSION))?;
             sym()
         };
-        if api_version != PLUGIN_API_VERSION {
+        if !matches!(api_version, 6 | PLUGIN_API_VERSION) {
             return Err(format!(
-                "plugin API version mismatch: plugin={api_version}, kernel={PLUGIN_API_VERSION}"
+                "plugin API version mismatch: plugin={api_version}, kernel accepts 6 or {PLUGIN_API_VERSION}"
             ));
         }
 
@@ -1074,6 +1143,15 @@ impl PluginLoader {
                     continue;
                 }
             };
+            let dispatch_v2_fn = unsafe {
+                plugin
+                    ._lib
+                    .get::<ServiceDispatchV2Fn>(
+                        nexus_plugin_abi::symbols::SERVICE_DISPATCH_V2.as_bytes(),
+                    )
+                    .ok()
+                    .map(|symbol| *symbol)
+            };
             let free_fn = match resolve_plugin_free(&plugin._lib) {
                 Ok(f) => f,
                 Err(e) => {
@@ -1089,6 +1167,7 @@ impl PluginLoader {
                 svc_name: plugin_name.clone(),
                 handle: plugin.handle,
                 dispatch_fn,
+                dispatch_v2_fn,
                 free_fn,
             });
             for service_name in &plugin.grpc_services {
@@ -1120,12 +1199,22 @@ impl PluginLoader {
                 .get(nexus_plugin_abi::symbols::SERVICE_DISPATCH.as_bytes())
                 .ok()?
         };
+        let dispatch_v2_fn = unsafe {
+            plugin
+                ._lib
+                .get::<ServiceDispatchV2Fn>(
+                    nexus_plugin_abi::symbols::SERVICE_DISPATCH_V2.as_bytes(),
+                )
+                .ok()
+                .map(|symbol| *symbol)
+        };
         let free_fn = resolve_plugin_free(&plugin._lib).ok()?;
 
         Some(DylibRustService {
             svc_name: name.to_string(),
             handle: plugin.handle,
             dispatch_fn,
+            dispatch_v2_fn,
             free_fn,
         })
     }

@@ -110,7 +110,7 @@ pub trait KernelSyscall: Send + Sync + 'static {
         recursive: bool,
     ) -> Result<SysUnlinkResult, KernelError>;
 
-    /// Full inherent `sys_setattr` signature (21 params). Kernel-internal
+    /// Full inherent `sys_setattr` signature (22 params). Kernel-internal
     /// types (`Arc<dyn ObjectStore>`, `Arc<dyn MetaStore>`, `Box<dyn
     /// Any + Send + Sync>`) appear here because the trait lives in
     /// the kernel crate. Service callers that don't touch DT_MOUNT
@@ -121,6 +121,7 @@ pub trait KernelSyscall: Send + Sync + 'static {
     fn sys_setattr(
         &self,
         path: &str,
+        ctx: &OperationContext,
         entry_type: i32,
         backend_name: &str,
         backend: Option<Arc<dyn crate::abc::object_store::ObjectStore>>,
@@ -246,6 +247,7 @@ impl KernelSyscall for crate::kernel::Kernel {
     fn sys_setattr(
         &self,
         path: &str,
+        ctx: &OperationContext,
         entry_type: i32,
         backend_name: &str,
         backend: Option<Arc<dyn crate::abc::object_store::ObjectStore>>,
@@ -270,6 +272,7 @@ impl KernelSyscall for crate::kernel::Kernel {
         Self::sys_setattr(
             self,
             path,
+            ctx,
             entry_type,
             backend_name,
             backend,

@@ -162,6 +162,20 @@ pub struct ClusterStatus {
     pub witness_count: usize,
 }
 
+/// Local presence ladder for a zone — see [`ZoneManager::zone_presence`].
+/// The proto-side enum (`ZoneStatusResponse::Presence`) adds `DELETED` on
+/// top of this via the deletion registry; the raft layer answers local
+/// facts only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZonePresence {
+    /// Hosted in the catalog AND the raft runtime is live here.
+    Resident,
+    /// Catalogued as hosted, runtime not currently materialized (cold).
+    HostedNotResident,
+    /// This node has no knowledge of the zone at all.
+    LocalNotFound,
+}
+
 /// TLS configuration for a `ZoneManager` (all three fields required together).
 #[derive(Debug, Clone)]
 pub struct TlsFiles {
@@ -640,6 +654,34 @@ impl ZoneManager {
         self.registry.hosts(zone_id)
     }
 
+    /// The replicated deletion epoch for `zone_id` (R12), via the
+    /// registry's injected [`crate::zone_deletion_registry::DeletionEpochSource`].
+    /// `None` = not deleted / source not wired — pre-R12 behavior.
+    pub fn deletion_epoch(&self, zone_id: &str) -> Option<u64> {
+        self.registry.deletion_epoch(zone_id)
+    }
+
+    /// Presence ladder for the typed ZoneStatus surface (R10): the registry
+    /// distinguishes the durable catalog ("this node hosts the zone") from
+    /// the runtime fact ("its raft group is currently resident"), and callers
+    /// need both — `HOSTED_NOT_RESIDENT` is a healthy cold zone, not a
+    /// missing one. DELETED is layered on by the deletion registry at the
+    /// ZoneRuntimeBackend level; this method answers the local ladder only.
+    pub fn zone_presence(&self, zone_id: &str) -> ZonePresence {
+        if !self.registry.hosts(zone_id) {
+            return ZonePresence::LocalNotFound;
+        }
+        if self
+            .registry
+            .resident_zones()
+            .contains(&zone_id.to_string())
+        {
+            ZonePresence::Resident
+        } else {
+            ZonePresence::HostedNotResident
+        }
+    }
+
     /// Create a new zone (raft group) on this node.
     ///
     /// Idempotent — calling `create_zone` for an existing zone with
@@ -720,6 +762,18 @@ impl ZoneManager {
         peers: Vec<String>,
         learner: bool,
     ) -> Result<Arc<ZoneHandle>> {
+        // R12: the join path can never resurrect a deprovisioned zone —
+        // a recorded deletion epoch refuses the join outright (auto-rejoin
+        // against a stale identity entry dies here, loudly). Escape hatch:
+        // NEXUS_FORCE_DELETED_ZONE_RECREATE.
+        if std::env::var_os("NEXUS_FORCE_DELETED_ZONE_RECREATE").is_none() {
+            if let Some(epoch) = self.deletion_epoch(zone_id) {
+                return Err(RaftError::InvalidState(format!(
+                    "Zone '{zone_id}' was deprovisioned (deletion epoch {epoch}); refusing to \
+                     join. Set NEXUS_FORCE_DELETED_ZONE_RECREATE=1 to override."
+                )));
+            }
+        }
         let peer_addrs: Vec<NodeAddress> = peers
             .iter()
             .map(|s| {
@@ -779,6 +833,21 @@ impl ZoneManager {
             if self.hosts_zone(zone_id) {
                 tracing::debug!("Zone '{}' already hosted, skipping", zone_id);
                 continue;
+            }
+            // D9 (R12): a zone the replicated registry records as deleted is
+            // NOT re-founded from a stale topology declaration — skip it
+            // (fail-open, the rest of the topology proceeds). Escape hatch:
+            // NEXUS_FORCE_DELETED_ZONE_RECREATE=1.
+            if std::env::var_os("NEXUS_FORCE_DELETED_ZONE_RECREATE").is_none() {
+                if let Some(epoch) = self.deletion_epoch(zone_id) {
+                    tracing::error!(
+                        zone = %zone_id,
+                        deletion_epoch = epoch,
+                        "refusing to re-found a deprovisioned zone (fail-open: skipping this \
+                         zone; set NEXUS_FORCE_DELETED_ZONE_RECREATE=1 to override)"
+                    );
+                    continue;
+                }
             }
             self.create_zone(zone_id, peers.clone())?;
         }
@@ -1045,6 +1114,14 @@ impl ZoneManager {
     /// `i_links_count > 0` (i.e. the zone is still mounted somewhere).
     /// Mirrors Python `ZoneManager.remove_zone(force=...)`.
     pub fn remove_zone(&self, zone_id: &str, force: bool) -> Result<()> {
+        // R12 entry guard — the registry's `remove_zone` re-checks this
+        // (defense in depth), but refusing HERE keeps the reserved zone's
+        // peer fan-out from ever starting.
+        if contracts::RESERVED_ZONE_IDS.contains(&zone_id) {
+            return Err(RaftError::InvalidState(format!(
+                "Zone '{zone_id}' is reserved and cannot be removed"
+            )));
+        }
         if !force {
             if let Some(count) = self.get_links_count(zone_id)? {
                 if count > 0 {
@@ -1077,6 +1154,49 @@ impl ZoneManager {
             Ok::<(), RaftError>(())
         })?;
 
+        bridge_block_on(self.rt().handle(), self.registry.remove_zone(zone_id))
+            .map_err(|e| RaftError::Raft(format!("Failed to remove zone: {}", e)))
+    }
+
+    /// R12 deprovision leg 1: best-effort peer fan-out of the local-destroy
+    /// `DeleteZone` RPC. Unlike [`Self::remove_zone`]'s fail-hard fan-out,
+    /// an unreachable peer is EXPECTED — a replica that was down when the
+    /// zone was deprovisioned self-cleans at boot from the deletion epoch
+    /// (the epoch is the authority; this call is only the fast path).
+    pub(crate) fn fan_out_delete_best_effort(&self, zone_id: &str, force: bool) {
+        let peers = self.registry.get_peers(zone_id).unwrap_or_default();
+        let self_id = self.registry.node_id();
+        let tls = self.registry.tls_config();
+        let zid = zone_id.to_string();
+        let handle = self.rt().handle().clone();
+        bridge_block_on(&handle, async move {
+            for (peer_id, peer) in peers {
+                if peer_id == self_id || peer.hostname.to_ascii_lowercase().starts_with("witness") {
+                    continue;
+                }
+                if let Err(e) = call_delete_zone(&peer.endpoint, &zid, force, tls.clone(), 10).await
+                {
+                    tracing::warn!(
+                        zone = %zid,
+                        peer = %peer.endpoint,
+                        error = %e,
+                        "deprovision fan-out missed a peer (it self-cleans from the \
+                         deletion epoch at next boot)",
+                    );
+                }
+            }
+        });
+    }
+
+    /// R12 deprovision leg 2: LOCAL teardown only — no peer fan-out (the
+    /// deprovision path fans out separately and best-effort, so an offline
+    /// peer can never block the founder's own teardown).
+    pub fn remove_local_zone(&self, zone_id: &str) -> Result<()> {
+        if contracts::RESERVED_ZONE_IDS.contains(&zone_id) {
+            return Err(RaftError::InvalidState(format!(
+                "Zone '{zone_id}' is reserved and cannot be removed"
+            )));
+        }
         bridge_block_on(self.rt().handle(), self.registry.remove_zone(zone_id))
             .map_err(|e| RaftError::Raft(format!("Failed to remove zone: {}", e)))
     }

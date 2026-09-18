@@ -160,6 +160,7 @@ fn populate(kernel: &Kernel, ctx: &OperationContext) {
     kernel
         .sys_setattr(
             "/many_files",
+            &OperationContext::new("test", "root", true, None, true),
             DT_DIR as i32,
             "",
             None,
@@ -466,6 +467,7 @@ fn bench_pipe_roundtrip(c: &mut Criterion) {
     kernel
         .sys_setattr(
             "/bench/pipe",
+            &OperationContext::new("test", "root", true, None, true),
             DT_PIPE as i32,
             "",
             None,

@@ -22,7 +22,29 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 const TOMBSTONE_NAME: &str = ".removed";
+/// In-dir marker of when this zone's LOCAL replica was created — the
+/// wall-clock the boot resurrection check compares the replicated
+/// deletion epoch against ("deleted after this copy was made ⇒ stale
+/// copy, do not materialize").
+const CREATION_EPOCH_NAME: &str = ".creation-epoch";
+
+/// Tombstone payload (R12). Historically the tombstone was a zero-byte
+/// marker; a zero-byte or unparsable file is read back as `deletion_epoch
+/// == 0` (legacy), which suppresses nothing extra — the file's mere
+/// existence still triggers the existing tombstone cleanup.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DeletionRecord {
+    pub version: u32,
+    pub zone_id: String,
+    /// Strictly increasing per zone; the boot check is
+    /// `deletion_epoch > local creation epoch`.
+    pub deletion_epoch: u64,
+    pub deleted_at_ms: u64,
+    pub initiated_by_node: u64,
+}
 
 /// Owns the on-disk dir for a single zone. See module doc.
 #[derive(Debug)]
@@ -116,6 +138,60 @@ impl ZonePersistence {
     pub fn write_tombstone(&self) -> io::Result<()> {
         std::fs::write(&self.tombstone_path, b"")?;
         Ok(())
+    }
+
+    /// Write the tombstone with a deletion epoch (R12) — the deprovision
+    /// path. A replica that missed the peer fan-out compares this epoch
+    /// against its own `.creation-epoch` at boot and destroys itself
+    /// instead of resurrecting the deleted zone.
+    pub fn write_tombstone_with_epoch(&self, record: &DeletionRecord) -> io::Result<()> {
+        let bytes = serde_json::to_vec(record).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("deletion record encode: {e}"),
+            )
+        })?;
+        std::fs::write(&self.tombstone_path, bytes)?;
+        Ok(())
+    }
+
+    /// Read a zone's tombstone record, if a tombstone exists. Zero-byte
+    /// (legacy) or unparsable files read back as `deletion_epoch == 0` —
+    /// never an error: cleanup decisions key off the tombstone's
+    /// EXISTENCE; the epoch only refines "was this replica stale?".
+    pub fn read_tombstone(base: &Path, zone_id: &str) -> Option<DeletionRecord> {
+        let path = base.join(zone_id).join(TOMBSTONE_NAME);
+        let bytes = std::fs::read(path).ok()?;
+        Some(serde_json::from_slice(&bytes).unwrap_or(DeletionRecord {
+            version: 0,
+            zone_id: zone_id.to_string(),
+            deletion_epoch: 0,
+            deleted_at_ms: 0,
+            initiated_by_node: 0,
+        }))
+    }
+
+    /// Record when this local replica was created (wall-clock ms) — the
+    /// boot resurrection check's comparison point. Best-effort by design:
+    /// an unreadable/missing epoch reads as 0, which makes the check
+    /// conservative (a stale copy with epoch 0 is cleaned only by the
+    /// tombstone/60s-window paths, never resurrected as authoritative).
+    pub fn write_creation_epoch(&self, epoch_ms: u64) -> io::Result<()> {
+        std::fs::write(
+            self.zone_path.join(CREATION_EPOCH_NAME),
+            epoch_ms.to_string(),
+        )?;
+        Ok(())
+    }
+
+    /// Read a zone dir's creation epoch, if present. `None` = no marker
+    /// (pre-R12 dir or write failed) — callers treat it as epoch 0.
+    pub fn read_creation_epoch(base: &Path, zone_id: &str) -> Option<u64> {
+        std::fs::read_to_string(base.join(zone_id).join(CREATION_EPOCH_NAME))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
     }
 
     /// Delete the zone dir. Caller MUST have released all handles to
@@ -222,6 +298,44 @@ mod tests {
         std::fs::write(zone_path.join("some-data"), b"x").unwrap();
         ZonePersistence::cleanup_tombstoned(tmp.path(), "z1").unwrap();
         assert!(!zone_path.exists());
+    }
+
+    #[test]
+    fn test_epoch_tombstone_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let mut p = ZonePersistence::create(tmp.path(), "z1").unwrap();
+        p.commit();
+        p.write_creation_epoch(1_700_000_000_000).unwrap();
+        assert_eq!(
+            ZonePersistence::read_creation_epoch(tmp.path(), "z1"),
+            Some(1_700_000_000_000)
+        );
+        let rec = DeletionRecord {
+            version: 1,
+            zone_id: "z1".into(),
+            deletion_epoch: 1_700_000_000_001,
+            deleted_at_ms: 1_700_000_000_001,
+            initiated_by_node: 7,
+        };
+        p.write_tombstone_with_epoch(&rec).unwrap();
+        assert_eq!(ZonePersistence::read_tombstone(tmp.path(), "z1"), Some(rec));
+    }
+
+    #[test]
+    fn test_legacy_empty_tombstone_reads_as_epoch_zero() {
+        let tmp = TempDir::new().unwrap();
+        let mut p = ZonePersistence::create(tmp.path(), "z1").unwrap();
+        p.commit();
+        p.write_tombstone().unwrap(); // legacy zero-byte
+        let rec = ZonePersistence::read_tombstone(tmp.path(), "z1").expect("tombstone exists");
+        assert_eq!(rec.deletion_epoch, 0);
+    }
+
+    #[test]
+    fn test_missing_tombstone_and_epoch_read_none() {
+        let tmp = TempDir::new().unwrap();
+        assert!(ZonePersistence::read_tombstone(tmp.path(), "z1").is_none());
+        assert_eq!(ZonePersistence::read_creation_epoch(tmp.path(), "z1"), None);
     }
 
     #[test]

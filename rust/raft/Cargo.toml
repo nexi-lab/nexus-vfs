@@ -55,6 +55,9 @@ thiserror = "2.0"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+# ZoneRuntime request_hash — canonical blake3 over the mutation's business
+# fields (zone-level idempotency, SW-20260915-002 R8). Workspace-pinned.
+blake3 = { workspace = true }
 
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net", "macros", "signal"], optional = true }

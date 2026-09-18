@@ -148,6 +148,7 @@ fn setup() -> Kernel {
     let mutable = Arc::new(MutableMemBackend::default());
     k.sys_setattr(
         "/",
+        &OperationContext::new("test", "root", true, None, true),
         2, // DT_MOUNT
         "mutable-mem",
         Some(mutable.clone() as Arc<dyn ObjectStore>),
@@ -184,6 +185,7 @@ fn setup() -> Kernel {
 
     k.sys_setattr(
         "/",
+        &OperationContext::new("test", "root", true, None, true),
         2, // DT_MOUNT — replaces existing root mount
         "latency-mem",
         Some(latency_backend),

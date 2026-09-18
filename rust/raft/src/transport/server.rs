@@ -1421,10 +1421,12 @@ impl ZoneApiService for ZoneApiServiceImpl {
                 error: Some("zone_id must not be empty".to_string()),
             }));
         }
-        if zone_id == contracts::ROOT_ZONE_ID {
+        if contracts::RESERVED_ZONE_IDS.contains(&zone_id) {
             return Ok(Response::new(DeleteZoneResponse {
                 success: false,
-                error: Some("root zone cannot be deleted by DeleteZone".to_string()),
+                error: Some(format!(
+                    "reserved zone '{zone_id}' cannot be deleted by DeleteZone"
+                )),
             }));
         }
 

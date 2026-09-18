@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use contracts::{validate_zone_id_for, ZoneIdUse};
 use kernel::core::agents::registry::{
     AgentDescriptor, AgentError, AgentKind, AgentSignal, AgentState, ExternalProcessInfo,
 };
@@ -39,7 +40,7 @@ fn unknown_method_message(method: &str) -> String {
 /// non-syscall control plane stays here.
 pub fn dispatch(
     kernel: &Arc<Kernel>,
-    _ctx: &OperationContext,
+    ctx: &OperationContext,
     method: &str,
     payload: &[u8],
 ) -> Result<Response<CallResponse>, Status> {
@@ -69,14 +70,14 @@ pub fn dispatch(
         )),
 
         // Agent registry
-        "agent_register" | "agent_register_external" => do_agent_register(kernel, &params),
-        "agent_unregister" => do_agent_unregister(kernel, &params),
-        "agent_unregister_external" => do_agent_unregister_external(kernel, &params),
+        "agent_register" | "agent_register_external" => do_agent_register(kernel, ctx, &params),
+        "agent_unregister" => do_agent_unregister(kernel, ctx, &params),
+        "agent_unregister_external" => do_agent_unregister_external(kernel, ctx, &params),
         "agent_get" => do_agent_get(kernel, &params),
-        "agent_list" => do_agent_list(kernel, &params),
-        "agent_update_state" => do_agent_update_state(kernel, &params),
-        "agent_signal" => do_agent_signal(kernel, &params),
-        "agent_heartbeat" => do_agent_heartbeat(kernel, &params),
+        "agent_list" => do_agent_list(kernel, ctx, &params),
+        "agent_update_state" => do_agent_update_state(kernel, ctx, &params),
+        "agent_signal" => do_agent_signal(kernel, ctx, &params),
+        "agent_heartbeat" => do_agent_heartbeat(kernel, ctx, &params),
 
         // Dot-notation: "service_name.method" → dispatch to registered
         // RustService or dylib plugin via Kernel::dispatch_rust_call.
@@ -84,7 +85,7 @@ pub fn dispatch(
         // future service plugins.
         _ if method.contains('.') => {
             if let Some((svc_name, svc_method)) = method.split_once('.') {
-                match kernel.dispatch_rust_call(svc_name, svc_method, payload) {
+                match kernel.dispatch_rust_call_ctx(ctx, svc_name, svc_method, payload) {
                     Some(Ok(raw_bytes)) => {
                         // Plugin dispatch returns raw protobuf bytes — pass
                         // through without JSON wrapping.
@@ -182,6 +183,74 @@ fn agent_err_to_payload(err: AgentError) -> Vec<u8> {
     encode_rpc_error(code, &err.to_string())
 }
 
+fn permission_err(message: &str) -> Vec<u8> {
+    call_err(RpcErrorCode::PermissionError, message)
+}
+
+fn effective_agent_owner(
+    ctx: &OperationContext,
+    params: &serde_json::Value,
+) -> Result<String, Vec<u8>> {
+    let requested = opt_s(params, "owner_id");
+    if !ctx.is_system
+        && requested
+            .as_deref()
+            .is_some_and(|owner| owner != ctx.user_id)
+    {
+        return Err(permission_err(
+            "agent owner_id must match the authenticated caller",
+        ));
+    }
+    Ok(if ctx.is_system {
+        requested.unwrap_or_else(|| ctx.user_id.clone())
+    } else {
+        ctx.user_id.clone()
+    })
+}
+
+fn effective_agent_zone(
+    ctx: &OperationContext,
+    params: &serde_json::Value,
+) -> Result<String, Vec<u8>> {
+    let requested = opt_s(params, "zone_id");
+    let zone_id = requested.unwrap_or_else(|| ctx.zone_id.clone());
+    let allowed = ctx.is_system
+        || zone_id == ctx.zone_id
+        || ctx.context_zone_id.as_deref() == Some(zone_id.as_str())
+        || ctx.zone_perms.iter().any(|(zone, _)| zone == &zone_id);
+    if !allowed {
+        return Err(permission_err(
+            "agent zone_id is not granted to the authenticated caller",
+        ));
+    }
+    validate_zone_id_for(ZoneIdUse::ExistingRef, &zone_id).map_err(|error| {
+        call_err(
+            RpcErrorCode::ValidationError,
+            &format!("invalid agent zone_id: {error}"),
+        )
+    })?;
+    Ok(zone_id)
+}
+
+fn authorize_agent_owner(
+    kernel: &Arc<Kernel>,
+    ctx: &OperationContext,
+    pid: &str,
+) -> Result<(), Vec<u8>> {
+    let descriptor = kernel.agent_registry().get(pid).ok_or_else(|| {
+        call_err(
+            RpcErrorCode::FileNotFound,
+            &format!("process not found: {pid}"),
+        )
+    })?;
+    if descriptor.owner_id != ctx.user_id && !ctx.is_admin && !ctx.is_system {
+        return Err(permission_err(
+            "agent operation requires ownership or administrator privileges",
+        ));
+    }
+    Ok(())
+}
+
 fn agent_descriptor_to_json(desc: &AgentDescriptor) -> serde_json::Value {
     let external_info = desc.external_info.as_ref().map(|info| {
         serde_json::json!({
@@ -228,10 +297,14 @@ fn agent_descriptor_to_json(desc: &AgentDescriptor) -> serde_json::Value {
 
 // ── Agent registry handlers ─────────────────────────────────────────
 
-fn do_agent_register(kernel: &Arc<Kernel>, params: &serde_json::Value) -> Result<Vec<u8>, Vec<u8>> {
+fn do_agent_register(
+    kernel: &Arc<Kernel>,
+    ctx: &OperationContext,
+    params: &serde_json::Value,
+) -> Result<Vec<u8>, Vec<u8>> {
     let name = s(params, "name");
-    let owner_id = s(params, "owner_id");
-    let zone_id = s(params, "zone_id");
+    let owner_id = effective_agent_owner(ctx, params)?;
+    let zone_id = effective_agent_zone(ctx, params)?;
     let connection_id = opt_s(params, "connection_id");
     let parent_pid = opt_s(params, "parent_pid");
     let labels = labels_map(params, "labels");
@@ -292,18 +365,22 @@ fn do_agent_register(kernel: &Arc<Kernel>, params: &serde_json::Value) -> Result
 
 fn do_agent_unregister(
     kernel: &Arc<Kernel>,
+    ctx: &OperationContext,
     params: &serde_json::Value,
 ) -> Result<Vec<u8>, Vec<u8>> {
     let pid = s(params, "pid");
+    authorize_agent_owner(kernel, ctx, &pid)?;
     let removed = kernel.agent_registry().unregister(&pid).is_some();
     ok_json(serde_json::json!(removed))
 }
 
 fn do_agent_unregister_external(
     kernel: &Arc<Kernel>,
+    ctx: &OperationContext,
     params: &serde_json::Value,
 ) -> Result<Vec<u8>, Vec<u8>> {
     let pid = s(params, "pid");
+    authorize_agent_owner(kernel, ctx, &pid)?;
     kernel
         .agent_registry()
         .unregister_external(&pid)
@@ -319,9 +396,18 @@ fn do_agent_get(kernel: &Arc<Kernel>, params: &serde_json::Value) -> Result<Vec<
     }
 }
 
-fn do_agent_list(kernel: &Arc<Kernel>, params: &serde_json::Value) -> Result<Vec<u8>, Vec<u8>> {
+fn do_agent_list(
+    kernel: &Arc<Kernel>,
+    ctx: &OperationContext,
+    params: &serde_json::Value,
+) -> Result<Vec<u8>, Vec<u8>> {
     let zone_id = opt_s(params, "zone_id");
-    let owner_id = opt_s(params, "owner_id");
+    let requested_owner = opt_s(params, "owner_id");
+    let owner_id = if ctx.is_admin || ctx.is_system {
+        requested_owner
+    } else {
+        Some(ctx.user_id.clone())
+    };
     let kind = opt_s(params, "kind").and_then(|k| AgentKind::from_str(&k));
     let state = opt_s(params, "state").and_then(|s| AgentState::from_str(&s));
     let records = kernel.agent_registry().list(
@@ -336,9 +422,11 @@ fn do_agent_list(kernel: &Arc<Kernel>, params: &serde_json::Value) -> Result<Vec
 
 fn do_agent_update_state(
     kernel: &Arc<Kernel>,
+    ctx: &OperationContext,
     params: &serde_json::Value,
 ) -> Result<Vec<u8>, Vec<u8>> {
     let pid = s(params, "pid");
+    authorize_agent_owner(kernel, ctx, &pid)?;
     let state = opt_s(params, "state")
         .or_else(|| opt_s(params, "new_state"))
         .and_then(|s| AgentState::from_str(&s))
@@ -364,8 +452,13 @@ fn do_agent_update_state(
     }
 }
 
-fn do_agent_signal(kernel: &Arc<Kernel>, params: &serde_json::Value) -> Result<Vec<u8>, Vec<u8>> {
+fn do_agent_signal(
+    kernel: &Arc<Kernel>,
+    ctx: &OperationContext,
+    params: &serde_json::Value,
+) -> Result<Vec<u8>, Vec<u8>> {
     let pid = s(params, "pid");
+    authorize_agent_owner(kernel, ctx, &pid)?;
     let sig = opt_s(params, "sig")
         .or_else(|| opt_s(params, "signal"))
         .and_then(|s| AgentSignal::from_str(&s))
@@ -399,9 +492,11 @@ fn do_agent_signal(kernel: &Arc<Kernel>, params: &serde_json::Value) -> Result<V
 
 fn do_agent_heartbeat(
     kernel: &Arc<Kernel>,
+    ctx: &OperationContext,
     params: &serde_json::Value,
 ) -> Result<Vec<u8>, Vec<u8>> {
     let pid = s(params, "pid");
+    authorize_agent_owner(kernel, ctx, &pid)?;
     kernel
         .agent_registry()
         .heartbeat(&pid)

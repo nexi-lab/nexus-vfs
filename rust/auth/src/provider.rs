@@ -495,6 +495,13 @@ impl AuthProvider for ApiKeyAuthProvider {
         }
         self.resolve_token(creds.token)
     }
+
+    /// R13: this provider IS the identity plane (sk- keys and/or verified
+    /// peer certs) — declare itself so `GetRuntimeCapabilities` reports an
+    /// armed surface instead of the NoAuth loopback default.
+    fn mode(&self) -> &'static str {
+        "api-key"
+    }
 }
 
 #[cfg(test)]

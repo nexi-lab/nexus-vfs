@@ -102,7 +102,11 @@ use std::os::raw::c_void;
 ///     `free_buf`.  All in-tree buffer hand-offs also shrink to an
 ///     exact-capacity boxed slice so the `from_raw_parts(ptr, len,
 ///     len)` free is layout-correct regardless of allocator.
-pub const PLUGIN_API_VERSION: u32 = 6;
+///   * v7 — service plugins may receive authenticated caller credentials
+///     through the optional `nexus_service_dispatch_v2` symbol. The kernel
+///     continues to accept v6 plugins and falls back to the contextless v1
+///     dispatch symbol when v2 is absent.
+pub const PLUGIN_API_VERSION: u32 = 7;
 
 // ── Plugin kind ─────────────────────────────────────────────────────
 
@@ -353,6 +357,8 @@ pub mod symbols {
     pub const SERVICE_CREATE: &str = "nexus_service_create";
     /// `fn(svc, method, payload, len, out_buf, out_len) -> i32`
     pub const SERVICE_DISPATCH: &str = "nexus_service_dispatch";
+    /// `fn(svc, ctx, method, payload, len, out_buf, out_len) -> i32` — OPTIONAL.
+    pub const SERVICE_DISPATCH_V2: &str = "nexus_service_dispatch_v2";
     /// `fn(svc: *mut c_void)`
     pub const SERVICE_DESTROY: &str = "nexus_service_destroy";
     /// `fn() -> *const c_char` — OPTIONAL.
@@ -490,9 +496,37 @@ pub type NexusFreeFn = unsafe extern "C" fn(ptr: *mut u8, len: usize);
 /// Type of the `nexus_service_create` symbol.
 pub type ServiceCreateFn = unsafe extern "C" fn(kernel: *const KernelHandle) -> *mut c_void;
 
+/// Authenticated caller credentials passed to `nexus_service_dispatch_v2`.
+///
+/// String pointers are nullable and remain valid only for the duration of the
+/// dispatch call. Plugins must copy values they retain.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct NexusPluginDispatchContext {
+    pub struct_version: u32,
+    pub user_id: *const c_char,
+    pub zone_id: *const c_char,
+    pub is_admin: bool,
+    pub is_system: bool,
+    pub trust_domain: *const c_char,
+    pub agent_id: *const c_char,
+    pub request_id: *const c_char,
+}
+
 /// Type of the `nexus_service_dispatch` symbol.
 pub type ServiceDispatchFn = unsafe extern "C" fn(
     svc: *mut c_void,
+    method: *const c_char,
+    payload: *const u8,
+    payload_len: usize,
+    out_buf: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32;
+
+/// Type of the optional `nexus_service_dispatch_v2` symbol.
+pub type ServiceDispatchV2Fn = unsafe extern "C" fn(
+    svc: *mut c_void,
+    ctx: *const NexusPluginDispatchContext,
     method: *const c_char,
     payload: *const u8,
     payload_len: usize,
@@ -652,6 +686,19 @@ macro_rules! declare_service_plugin {
                 }
                 Err(code) => code,
             }
+        }
+
+        #[no_mangle]
+        pub unsafe extern "C" fn nexus_service_dispatch_v2(
+            svc: *mut std::os::raw::c_void,
+            _ctx: *const $crate::NexusPluginDispatchContext,
+            method: *const std::ffi::c_char,
+            payload: *const u8,
+            payload_len: usize,
+            out_buf: *mut *mut u8,
+            out_len: *mut usize,
+        ) -> i32 {
+            nexus_service_dispatch(svc, method, payload, payload_len, out_buf, out_len)
         }
 
         #[no_mangle]

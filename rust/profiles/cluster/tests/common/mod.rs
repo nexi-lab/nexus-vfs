@@ -14,9 +14,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use kernel::kernel::vfs_proto::{
-    nexus_vfs_service_client::NexusVfsServiceClient, IpcPathRequest, MkdirRequest, PingRequest,
-    ReadRequest, ReaddirRequest, SetattrRequest, StatRequest, StreamReadAtRequest,
-    StreamWriteRequest, WatchRequest, WriteRequest,
+    nexus_vfs_service_client::NexusVfsServiceClient,
+    zone_runtime_service_client::ZoneRuntimeServiceClient, GetRuntimeCapabilitiesRequest,
+    GetZoneOperationRequest, IpcPathRequest, MkdirRequest, PingRequest, ReadRequest,
+    ReaddirRequest, SetattrRequest, SetattrResponse, StatRequest, StreamReadAtRequest,
+    StreamWriteRequest, WatchRequest, WriteRequest, ZoneCreateRequest, ZoneDeprovisionRequest,
+    ZoneJoinRequest, ZoneMountRequest, ZoneMutationHeader, ZoneRemoveReplicaRequest,
+    ZoneStatusRequest, ZoneUnmountRequest,
 };
 use tonic::transport::Channel;
 
@@ -548,6 +552,35 @@ impl Vfs {
             .map(|_| ())
     }
 
+    /// Generic `Call` — method + JSON params, the surface the agent-trust
+    /// boundary tests drive (`agent_register` payload forgery, R5).
+    /// Returns the in-band outcome so callers assert on `is_error`.
+    pub async fn call(
+        &mut self,
+        method: &str,
+        params: &serde_json::Value,
+        token: &str,
+    ) -> kernel::kernel::vfs_proto::CallResponse {
+        self.c
+            .call(kernel::kernel::vfs_proto::CallRequest {
+                method: method.to_string(),
+                payload: serde_json::to_vec(params).expect("params"),
+                auth_token: token.to_string(),
+            })
+            .await
+            .expect("call rpc transport")
+            .into_inner()
+    }
+
+    /// Raw `Setattr` — the DT_MOUNT admin-gate tests drive this entrance
+    /// directly so the refusal observed is the entrance's own gate.
+    pub async fn setattr_raw(
+        &mut self,
+        req: SetattrRequest,
+    ) -> Result<SetattrResponse, tonic::Status> {
+        self.c.setattr(req).await.map(|r| r.into_inner())
+    }
+
     pub async fn mkdir(&mut self, path: &str, token: &str) -> Result<(), String> {
         let r = self
             .c
@@ -757,4 +790,260 @@ pub async fn await_replicated(v: &mut Vfs, path: &str, token: &str, budget: Dura
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
     panic!("{path} never replicated within budget");
+}
+
+/// Thin typed wrapper over the `ZoneRuntimeService` gRPC client — the
+/// typed zone-lifecycle surface (create/join/status/mount/... with
+/// receipts + idempotency). Same dial semantics as [`Vfs`]: one channel,
+/// every call carries its bearer token.
+#[derive(Clone)]
+pub struct ZoneRuntime {
+    c: ZoneRuntimeServiceClient<Channel>,
+}
+
+impl ZoneRuntime {
+    pub async fn dial(port: u16) -> Option<Self> {
+        let ch = Channel::from_shared(format!("http://127.0.0.1:{port}"))
+            .expect("valid uri")
+            .connect()
+            .await
+            .ok()?;
+        Some(ZoneRuntime {
+            c: ZoneRuntimeServiceClient::new(ch),
+        })
+    }
+
+    /// [`dial`], but poll until the connect succeeds (the co-hosted VFS
+    /// service shares the port, so once it accepts, this does too).
+    pub async fn dial_ready(port: u16, budget: Duration) -> Self {
+        let deadline = Instant::now() + budget;
+        loop {
+            if let Some(z) = Self::dial(port).await {
+                return z;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "ZoneRuntime dial(127.0.0.1:{port}) never connected within budget"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    pub async fn zone_create(
+        &mut self,
+        zone_id: &str,
+        peers: &[String],
+        operation_id: &str,
+        token: &str,
+    ) -> Result<kernel::kernel::vfs_proto::ZoneReceipt, tonic::Status> {
+        Ok(self
+            .c
+            .zone_create(ZoneCreateRequest {
+                auth_token: token.to_string(),
+                mutation: Some(ZoneMutationHeader {
+                    operation_id: operation_id.to_string(),
+                    request_hash: 0,
+                }),
+                zone_id: zone_id.to_string(),
+                peers: peers.to_vec(),
+            })
+            .await?
+            .into_inner())
+    }
+
+    pub async fn zone_join(
+        &mut self,
+        zone_id: &str,
+        peers: &[String],
+        learner: bool,
+        operation_id: &str,
+        token: &str,
+    ) -> Result<kernel::kernel::vfs_proto::ZoneReceipt, tonic::Status> {
+        Ok(self
+            .c
+            .zone_join(ZoneJoinRequest {
+                auth_token: token.to_string(),
+                mutation: Some(ZoneMutationHeader {
+                    operation_id: operation_id.to_string(),
+                    request_hash: 0,
+                }),
+                zone_id: zone_id.to_string(),
+                peers: peers.to_vec(),
+                learner,
+            })
+            .await?
+            .into_inner())
+    }
+
+    pub async fn zone_status(
+        &mut self,
+        zone_id: &str,
+        token: &str,
+    ) -> Result<kernel::kernel::vfs_proto::ZoneStatusResponse, tonic::Status> {
+        Ok(self
+            .c
+            .zone_status(ZoneStatusRequest {
+                auth_token: token.to_string(),
+                zone_id: zone_id.to_string(),
+            })
+            .await?
+            .into_inner())
+    }
+
+    pub async fn zone_mount(
+        &mut self,
+        parent_zone_id: &str,
+        mount_path: &str,
+        target_zone_id: &str,
+        operation_id: &str,
+        token: &str,
+    ) -> Result<kernel::kernel::vfs_proto::ZoneReceipt, tonic::Status> {
+        Ok(self
+            .c
+            .zone_mount(ZoneMountRequest {
+                auth_token: token.to_string(),
+                mutation: Some(ZoneMutationHeader {
+                    operation_id: operation_id.to_string(),
+                    request_hash: 0,
+                }),
+                parent_zone_id: parent_zone_id.to_string(),
+                mount_path: mount_path.to_string(),
+                target_zone_id: target_zone_id.to_string(),
+            })
+            .await?
+            .into_inner())
+    }
+
+    pub async fn zone_deprovision(
+        &mut self,
+        zone_id: &str,
+        operation_id: &str,
+        token: &str,
+    ) -> Result<kernel::kernel::vfs_proto::ZoneReceipt, tonic::Status> {
+        Ok(self
+            .c
+            .zone_deprovision(ZoneDeprovisionRequest {
+                auth_token: token.to_string(),
+                mutation: Some(ZoneMutationHeader {
+                    operation_id: operation_id.to_string(),
+                    request_hash: 0,
+                }),
+                zone_id: zone_id.to_string(),
+            })
+            .await?
+            .into_inner())
+    }
+
+    pub async fn zone_remove_replica(
+        &mut self,
+        zone_id: &str,
+        force: bool,
+        operation_id: &str,
+        token: &str,
+    ) -> Result<kernel::kernel::vfs_proto::ZoneReceipt, tonic::Status> {
+        Ok(self
+            .c
+            .zone_remove_replica(ZoneRemoveReplicaRequest {
+                auth_token: token.to_string(),
+                mutation: Some(ZoneMutationHeader {
+                    operation_id: operation_id.to_string(),
+                    request_hash: 0,
+                }),
+                zone_id: zone_id.to_string(),
+                force,
+            })
+            .await?
+            .into_inner())
+    }
+
+    pub async fn zone_unmount(
+        &mut self,
+        parent_zone_id: &str,
+        mount_path: &str,
+        operation_id: &str,
+        token: &str,
+    ) -> Result<kernel::kernel::vfs_proto::ZoneReceipt, tonic::Status> {
+        Ok(self
+            .c
+            .zone_unmount(ZoneUnmountRequest {
+                auth_token: token.to_string(),
+                mutation: Some(ZoneMutationHeader {
+                    operation_id: operation_id.to_string(),
+                    request_hash: 0,
+                }),
+                parent_zone_id: parent_zone_id.to_string(),
+                mount_path: mount_path.to_string(),
+            })
+            .await?
+            .into_inner())
+    }
+
+    pub async fn get_zone_operation(
+        &mut self,
+        operation_id: &str,
+        token: &str,
+    ) -> Result<kernel::kernel::vfs_proto::ZoneOperationRecord, tonic::Status> {
+        Ok(self
+            .c
+            .get_zone_operation(GetZoneOperationRequest {
+                auth_token: token.to_string(),
+                operation_id: operation_id.to_string(),
+            })
+            .await?
+            .into_inner())
+    }
+
+    pub async fn get_runtime_capabilities(
+        &mut self,
+        token: &str,
+    ) -> Result<kernel::kernel::vfs_proto::GetRuntimeCapabilitiesResponse, tonic::Status> {
+        Ok(self
+            .c
+            .get_runtime_capabilities(GetRuntimeCapabilitiesRequest {
+                auth_token: token.to_string(),
+            })
+            .await?
+            .into_inner())
+    }
+
+    /// mTLS dial (TLS-on daemons) presenting a node/agent identity cert —
+    /// the same shape as [`Vfs::connect_mtls`]: a node cert authenticates
+    /// as an admin+system peer context.
+    pub async fn dial_tls(
+        port: u16,
+        ca_pem: &[u8],
+        client_cert_pem: &[u8],
+        client_key_pem: &[u8],
+        budget: Duration,
+    ) -> Self {
+        use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
+        let tls = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(ca_pem))
+            .identity(Identity::from_pem(client_cert_pem, client_key_pem))
+            .domain_name(lib::transport_primitives::TlsConfig::CLUSTER_SERVER_NAME);
+        let deadline = Instant::now() + budget;
+        loop {
+            let connected = Endpoint::from_shared(format!("https://127.0.0.1:{port}"))
+                .expect("valid uri")
+                .tls_config(tls.clone())
+                .expect("tls config")
+                .connect()
+                .await;
+            if let Ok(ch) = connected {
+                // A gRPC response OR a gRPC status both prove the server
+                // surface is up (mirrors `connect_serving`).
+                let mut z = ZoneRuntime {
+                    c: ZoneRuntimeServiceClient::new(ch),
+                };
+                if z.get_runtime_capabilities("").await.is_ok() {
+                    return z;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "ZoneRuntime TLS dial(127.0.0.1:{port}) never succeeded within budget"
+            );
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    }
 }

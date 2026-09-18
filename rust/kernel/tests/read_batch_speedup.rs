@@ -135,6 +135,7 @@ fn setup_kernel_with_100_files() -> Kernel {
 
     k.sys_setattr(
         "/",
+        &OperationContext::new("test", "root", true, None, true),
         2, // DT_MOUNT
         "mutable-mem",
         Some(mutable.clone() as Arc<dyn ObjectStore>),
@@ -170,6 +171,7 @@ fn setup_kernel_with_100_files() -> Kernel {
 
     k.sys_setattr(
         "/",
+        &OperationContext::new("test", "root", true, None, true),
         2,
         "latency-mem",
         Some(latency_backend),

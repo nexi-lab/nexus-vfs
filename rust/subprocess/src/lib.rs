@@ -394,6 +394,7 @@ fn register_stdio_pipe<K: KernelSyscall>(
     kernel
         .sys_setattr(
             path,
+            &OperationContext::new("system", "root", true, None, true),
             /* entry_type   */ 3, // DT_PIPE
             /* backend_name */ "",
             /* backend      */ None,

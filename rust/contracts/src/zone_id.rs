@@ -64,15 +64,29 @@ impl std::fmt::Display for ZoneIdError {
 
 impl std::error::Error for ZoneIdError {}
 
-/// Checks a zone id against the format.
+/// The boundary at which a zone id is being accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZoneIdUse {
+    /// Creation of a tenant or data zone.
+    TenantCreate,
+    /// Trusted boot or control-plane use of a kernel-owned zone.
+    System,
+    /// Reference to an existing or historical identity.
+    ExistingRef,
+    /// Identity learned from an independently verified remote peer.
+    RemoteLearned,
+}
+
+/// Checks a zone id under the rules for `use_`.
 ///
-/// Returns the first violation rather than a list: an operator fixes one thing
-/// and re-runs, and a partial id is not worth describing exhaustively.
-///
-/// Reserved ids are refused here because this is the tenant-facing check. The
-/// kernel creates its own reserved zones by other paths and does not come
-/// through this function.
-pub fn validate_zone_id(id: &str) -> Result<(), ZoneIdError> {
+/// The non-tenant projections admit reserved ids so trusted system paths and
+/// references can name them. This function only checks shape; callers of
+/// [`ZoneIdUse::RemoteLearned`] must still verify remote incarnation and trust.
+pub fn validate_zone_id_for(use_: ZoneIdUse, id: &str) -> Result<(), ZoneIdError> {
+    if use_ != ZoneIdUse::TenantCreate && ZONE_ID_RESERVED.contains(&id) {
+        return Ok(());
+    }
+
     let len = id.chars().count();
     if !(ZONE_ID_MIN_LEN..=ZONE_ID_MAX_LEN).contains(&len) {
         return Err(ZoneIdError::Length { got: len });
@@ -93,11 +107,19 @@ pub fn validate_zone_id(id: &str) -> Result<(), ZoneIdError> {
         }
     }
 
-    if ZONE_ID_RESERVED.contains(&id) {
+    if use_ == ZoneIdUse::TenantCreate && ZONE_ID_RESERVED.contains(&id) {
         return Err(ZoneIdError::Reserved);
     }
 
     Ok(())
+}
+
+/// Checks a zone id admitted for tenant or data-zone creation.
+///
+/// This remains the tenant-create projection for compatibility with existing
+/// admission call sites.
+pub fn validate_zone_id(id: &str) -> Result<(), ZoneIdError> {
+    validate_zone_id_for(ZoneIdUse::TenantCreate, id)
 }
 
 #[cfg(test)]
@@ -215,6 +237,33 @@ mod tests {
             ZONE_ID_VECTORS.iter().any(|(_, ok)| !*ok),
             "no refusing vectors"
         );
+    }
+
+    #[test]
+    fn agrees_with_owner_purpose_fixtures() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../contracts/zone-id/fixtures/purposes.json"
+        )))
+        .expect("zone-id purpose fixture must be valid JSON");
+        let uses = [
+            ("tenant_create", ZoneIdUse::TenantCreate),
+            ("system", ZoneIdUse::System),
+            ("existing_ref", ZoneIdUse::ExistingRef),
+            ("remote_learned", ZoneIdUse::RemoteLearned),
+        ];
+
+        for case in fixture["cases"].as_array().expect("cases must be an array") {
+            let id = case["id"].as_str().expect("id must be a string");
+            for (field, use_) in uses {
+                let expected = case[field].as_bool().expect("projection must be a boolean");
+                assert_eq!(
+                    validate_zone_id_for(use_, id).is_ok(),
+                    expected,
+                    "fixture projection {field} disagrees for {id:?}"
+                );
+            }
+        }
     }
 
     #[test]

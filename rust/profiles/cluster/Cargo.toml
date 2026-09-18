@@ -73,6 +73,8 @@ gethostname = "1.1"
 [dev-dependencies]
 # wire_durable_metastore tests open real redb files in a temp data dir.
 tempfile = "3"
+# The e2e harness encodes generic-`Call` JSON params (agent-trust tests).
+serde_json = { workspace = true }
 # The remote agent-mint gate test parses minted cert PEM to DER to feed
 # `peer_identity::from_der`. Test-only, so the shipped binary carries no pem dep.
 pem = "3"

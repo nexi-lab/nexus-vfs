@@ -12,7 +12,7 @@
     "Reserved ids are listed by the constant that owns them, not by value:",
     "rust/contracts/src/constants.rs is the SSOT for what those strings are."
   ],
-  "version": 1,
+  "version": 2,
   "length": {
     "min": 3,
     "max": 63,
@@ -33,6 +33,24 @@
       "CONTROL_ZONE_ID"
     ],
     "why": "Tenant-creatable ids must not collide with zones the kernel owns. CONTROL_ZONE_ID is additionally unspellable under the charset rule above, which is deliberate; ROOT_ZONE_ID is not, so it needs this list."
+  },
+  "purposes": {
+    "tenant_create": {
+      "rules": "format_and_reserved",
+      "why": "Admission for new tenant/data zones applies every format rule and rejects kernel-owned ids."
+    },
+    "system": {
+      "rules": "format_or_reserved",
+      "why": "Trusted boot/control paths may use kernel-owned ids; the caller is responsible for enforcing that trust boundary."
+    },
+    "existing_ref": {
+      "rules": "format_or_reserved",
+      "why": "References to existing or historical identities accept kernel-owned ids but do not grant create authority."
+    },
+    "remote_learned": {
+      "rules": "format_or_reserved_and_verified_remote",
+      "why": "Join/discovery identities must additionally match a verified remote incarnation and trust relationship at the call site; validation never turns them into local create authority."
+    }
   },
   "mutability": {
     "immutable_after_create": true,

@@ -510,7 +510,9 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
             // an agent restart — so it is provisioned here and never torn down.
             // a2a owns the A2A address + the stream contract; this lifecycle
             // owner (the agent's host) just says "bring this agent's inbox up".
-            if let Err(e) = a2a::ensure_agent_inbox(self.kernel.as_ref(), &desc.name) {
+            let system_ctx =
+                kernel::kernel::OperationContext::new("managed_agent", "root", true, None, true);
+            if let Err(e) = a2a::ensure_agent_inbox(self.kernel.as_ref(), &system_ctx, &desc.name) {
                 tracing::warn!(pid=%pid, error=%e, "ensure_agent_inbox failed");
             }
             // Sibling attention-state stream (same replicated `/agents/{name}`
@@ -518,7 +520,9 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
             // here so any node can answer the cross-machine "which agents are
             // waiting on me?" with a plain read. Best-effort: a std / non-stream
             // deployment simply has no reader and the agent runs unaffected.
-            if let Err(e) = a2a::ensure_agent_state_stream(self.kernel.as_ref(), &desc.name) {
+            if let Err(e) =
+                a2a::ensure_agent_state_stream(self.kernel.as_ref(), &system_ctx, &desc.name)
+            {
                 tracing::warn!(pid=%pid, error=%e, "ensure_agent_state_stream failed");
             }
             if let Some(spec) = spawn_spec {

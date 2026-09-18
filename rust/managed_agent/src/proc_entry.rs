@@ -60,6 +60,7 @@ pub(crate) fn register_proc_entry<K: KernelSyscall>(
     kernel: &K,
     desc: &AgentDescriptor,
 ) -> Result<(), String> {
+    let ctx = sys_ctx();
     let pid = desc.pid.as_str();
     let pid_root = format!("/proc/{pid}");
     let workspace_root = format!("/proc/{pid}/workspace");
@@ -74,7 +75,7 @@ pub(crate) fn register_proc_entry<K: KernelSyscall>(
         sessions_root.as_str(),
         tasks_root.as_str(),
     ] {
-        create_dt_dir(kernel, dir)?;
+        create_dt_dir(kernel, &ctx, dir)?;
     }
 
     // Canonical chat-with-me stream — provisioned through the a2a mailbox
@@ -83,23 +84,23 @@ pub(crate) fn register_proc_entry<K: KernelSyscall>(
     // are the SAME kind of DT_STREAM. a2a owns "what a mailbox is"; this
     // lifecycle owner just says "make this pid's mailbox".
     let cwm_canonical = format!("/proc/{pid}/chat-with-me");
-    a2a::ensure_mailbox_stream(kernel, &cwm_canonical)?;
+    a2a::ensure_mailbox_stream(kernel, &ctx, &cwm_canonical)?;
 
     // /proc/{pid}/agent → /agents/{desc.name} (Linux /proc/{pid}/exe
     // analogue). Target may not exist yet; DT_LINK rows are not
     // validated against entry presence.
     let agent_link = format!("{pid_root}/agent");
     let agent_target = format!("/agents/{}", desc.name);
-    create_dt_link(kernel, &agent_link, &agent_target)?;
+    create_dt_link(kernel, &ctx, &agent_link, &agent_target)?;
 
     // Workspace `chat-with-me` shortcut → canonical pid-level stream.
     let cwm_shortcut = format!("{workspace_root}/chat-with-me");
-    create_dt_link(kernel, &cwm_shortcut, &cwm_canonical)?;
+    create_dt_link(kernel, &ctx, &cwm_shortcut, &cwm_canonical)?;
 
     // One DT_LINK per repo mount carried in the descriptor.
     for repo in &desc.repos {
         let alias_link = format!("{workspace_root}/{}", repo.alias);
-        create_dt_link(kernel, &alias_link, &repo.mount_path)?;
+        create_dt_link(kernel, &ctx, &alias_link, &repo.mount_path)?;
     }
 
     Ok(())
@@ -138,10 +139,14 @@ pub(crate) fn unregister_proc_entry<K: KernelSyscall>(kernel: &K, desc: &AgentDe
     let _ = kernel.sys_unlink(&pid_root, &ctx, false);
 }
 
-fn create_dt_dir<K: KernelSyscall>(kernel: &K, path: &str) -> Result<(), String> {
+fn create_dt_dir<K: KernelSyscall>(
+    kernel: &K,
+    ctx: &OperationContext,
+    path: &str,
+) -> Result<(), String> {
     kernel
         .sys_setattr(
-            path, DT_DIR, /* backend_name */ "", /* backend */ None,
+            path, ctx, DT_DIR, /* backend_name */ "", /* backend */ None,
             /* metastore */ None, /* raft_backend */ None,
             /* io_profile */ "memory", /* zone_id */ "root",
             /* is_external */ false, /* capacity */ 0, /* read_fd */ None,
@@ -154,10 +159,16 @@ fn create_dt_dir<K: KernelSyscall>(kernel: &K, path: &str) -> Result<(), String>
         .map_err(|e| format!("sys_setattr(DT_DIR at {path:?}): {e:?}"))
 }
 
-fn create_dt_link<K: KernelSyscall>(kernel: &K, path: &str, target: &str) -> Result<(), String> {
+fn create_dt_link<K: KernelSyscall>(
+    kernel: &K,
+    ctx: &OperationContext,
+    path: &str,
+    target: &str,
+) -> Result<(), String> {
     kernel
         .sys_setattr(
             path,
+            ctx,
             DT_LINK,
             /* backend_name */ "",
             /* backend */ None,

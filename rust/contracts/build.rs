@@ -1,33 +1,36 @@
-//! Generates the zone-id rules from `contracts/zone-id/spec.json`.
+//! Generates primitive contract rules from their canonical JSON specs.
 //!
-//! The generated file goes to `OUT_DIR` and is `include!`d by `src/zone_id.rs`.
-//! It is deliberately never written into the tree: a generated artifact that
-//! exists as a file is a generated artifact someone can hand-edit, and the edit
-//! survives review by looking like ordinary source. Here there is nothing to
-//! edit — the rules are recomputed on every build, so the only way to change
-//! them is to change the spec.
-//!
-//! Only the rule *data* is generated. The checking logic is written once, in
-//! `zone_id.rs`, in Rust. That split is on purpose: data is what drifts between
-//! consumers (one place says 63, another says 64), and logic in two languages is
-//! never the same text anyway. What keeps the logic honest across languages is
-//! the conformance vectors this script also emits, which every consumer's tests
-//! must agree with.
+//! Generated Rust files go to `OUT_DIR` and are `include!`d by the owning
+//! modules. They are deliberately never written into the tree: the only way to
+//! change the validator data is to change its spec.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+fn read_spec(path: &Path) -> serde_json::Value {
+    let raw = std::fs::read_to_string(path).expect("contract spec is unreadable");
+    serde_json::from_str(&raw).expect("contract spec is not valid JSON")
+}
 
 fn main() {
-    let spec_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let zone_id_spec_path = manifest_dir
         .join("../../contracts/zone-id/spec.json")
         .canonicalize()
         .expect("contracts/zone-id/spec.json must exist — it is the SSOT for this crate's zone-id rules");
+    let zone_path_spec_path = manifest_dir
+        .join("../../contracts/zone-path/spec.json")
+        .canonicalize()
+        .expect("contracts/zone-path/spec.json must exist — it is the SSOT for this crate's zone-path rules");
 
-    // Re-run when the spec changes, and only then.
-    println!("cargo:rerun-if-changed={}", spec_path.display());
+    println!("cargo:rerun-if-changed={}", zone_id_spec_path.display());
+    println!("cargo:rerun-if-changed={}", zone_path_spec_path.display());
 
-    let raw = std::fs::read_to_string(&spec_path).expect("spec.json is unreadable");
-    let spec: serde_json::Value = serde_json::from_str(&raw).expect("spec.json is not valid JSON");
+    generate_zone_id_rules(&zone_id_spec_path);
+    generate_zone_path_rules(&zone_path_spec_path);
+}
 
+fn generate_zone_id_rules(spec_path: &Path) {
+    let spec = read_spec(spec_path);
     let min = spec["length"]["min"].as_u64().expect("length.min");
     let max = spec["length"]["max"].as_u64().expect("length.max");
     let charset = spec["charset"]["allowed"]
@@ -40,16 +43,12 @@ fn main() {
         .as_str()
         .expect("edges.no_trailing");
 
-    // Reserved ids are named by constant, not by value: constants.rs owns the
-    // strings. Restating them here would be the duplication this file exists to
-    // remove.
     let reserved: Vec<String> = spec["reserved"]["constants"]
         .as_array()
         .expect("reserved.constants")
         .iter()
         .map(|v| v.as_str().expect("reserved constant name").to_string())
         .collect();
-
     let reserved_refs = reserved
         .iter()
         .map(|name| format!("        crate::constants::{name},"))
@@ -72,42 +71,26 @@ fn main() {
          pub const ZONE_ID_NO_TRAILING: char = {no_trailing:?};\n\
          /// Ids the kernel owns; tenants may not create them.\n\
          pub const ZONE_ID_RESERVED: &[&str] = &[\n{reserved_refs}\n    ];\n",
-        min = min,
-        max = max,
-        charset = charset,
         no_leading = no_leading.chars().next().expect("no_leading is one char"),
         no_trailing = no_trailing.chars().next().expect("no_trailing is one char"),
-        reserved_refs = reserved_refs,
     );
 
-    // Conformance vectors, derived from the same spec rather than written out.
-    //
-    // The rule DATA cannot drift — every consumer reads this one file. The
-    // checking LOGIC can: another language is another implementation, and it can
-    // forget the leading-separator case while reading identical constants. These
-    // vectors are what catch that, and sudostack derives an identical set from
-    // the same fields for its TypeScript side.
-    //
-    // Derived, not listed, for the same reason the rules are: a hand-written
-    // case list only covers the rules its author remembered, and it goes stale
-    // the moment a bound moves. Change `max` and the long case follows.
     let bad_char = if charset.contains('_') { '!' } else { '_' };
     let vectors = format!(
-        "/// Cases derived from the spec: `(id, should_be_accepted)`.
-         pub const ZONE_ID_VECTORS: &[(&str, bool)] = &[
-             ({shortest:?}, true),
-             ({longest:?}, true),
-             (\"cloud-user-1001\", true),
-             (\"550e8400-e29b-41d4-a716-446655440000\", true),
-             ({too_short:?}, false),
-             ({too_long:?}, false),
-             ({leading:?}, false),
-             ({trailing:?}, false),
-             (\"Has-Upper\", false),
-             ({bad_char_case:?}, false),
-             (\"org:550e8400-e29b-41d4-a716-446655440000\", false),
-         ];
-",
+        "/// Cases derived from the spec: `(id, should_be_accepted)`.\n\
+         pub const ZONE_ID_VECTORS: &[(&str, bool)] = &[\n\
+             ({shortest:?}, true),\n\
+             ({longest:?}, true),\n\
+             (\"cloud-user-1001\", true),\n\
+             (\"550e8400-e29b-41d4-a716-446655440000\", true),\n\
+             ({too_short:?}, false),\n\
+             ({too_long:?}, false),\n\
+             ({leading:?}, false),\n\
+             ({trailing:?}, false),\n\
+             (\"Has-Upper\", false),\n\
+             ({bad_char_case:?}, false),\n\
+             (\"org:550e8400-e29b-41d4-a716-446655440000\", false),\n\
+         ];\n",
         shortest = "a".repeat(min as usize),
         longest = "a".repeat(max as usize),
         too_short = "a".repeat((min - 1) as usize),
@@ -118,12 +101,65 @@ fn main() {
     );
 
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR")).join("zone_id_rules.rs");
-    std::fs::write(
-        &out,
-        format!(
-            "{generated}
-{vectors}"
-        ),
-    )
-    .expect("failed to write generated zone-id rules");
+    std::fs::write(out, format!("{generated}\n{vectors}"))
+        .expect("failed to write generated zone-id rules");
+}
+
+fn generate_zone_path_rules(spec_path: &Path) {
+    let spec = read_spec(spec_path);
+    let root = spec["root"].as_str().expect("root");
+    let must_start_with = spec["must_start_with"].as_str().expect("must_start_with");
+    let charset = spec["component"]["allowed"]
+        .as_str()
+        .expect("component.allowed");
+    let component_max = spec["component"]["max_length"]
+        .as_u64()
+        .expect("component.max_length");
+    let forbidden = spec["component"]["forbidden"]
+        .as_array()
+        .expect("component.forbidden")
+        .iter()
+        .map(|value| value.as_str().expect("forbidden component"))
+        .collect::<Vec<_>>();
+    let depth_max = spec["depth"]["max"].as_u64().expect("depth.max");
+    let length_max = spec["length"]["max"].as_u64().expect("length.max");
+    let empty_components = spec["empty_components"]
+        .as_bool()
+        .expect("empty_components");
+    let trailing_slash = spec["trailing_slash"].as_bool().expect("trailing_slash");
+    let reserved = spec["reserved_prefix_constants"]
+        .as_array()
+        .expect("reserved_prefix_constants")
+        .iter()
+        .map(|value| value.as_str().expect("reserved prefix constant"))
+        .collect::<Vec<_>>();
+
+    let forbidden_values = forbidden
+        .iter()
+        .map(|value| format!("    {value:?},"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let reserved_refs = reserved
+        .iter()
+        .map(|name| format!("    crate::constants::{name},"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let generated = format!(
+        "// @generated from contracts/zone-path/spec.json — do not edit.\n\
+         // Regenerated on every build; this file lives in OUT_DIR, not the tree.\n\
+         pub const ZONE_PATH_ROOT: &str = {root:?};\n\
+         pub const ZONE_PATH_START: &str = {must_start_with:?};\n\
+         pub const ZONE_PATH_COMPONENT_CHARSET: &str = {charset:?};\n\
+         pub const ZONE_PATH_COMPONENT_MAX_LEN: usize = {component_max};\n\
+         pub const ZONE_PATH_FORBIDDEN_COMPONENTS: &[&str] = &[\n{forbidden_values}\n];\n\
+         pub const ZONE_PATH_MAX_DEPTH: usize = {depth_max};\n\
+         pub const ZONE_PATH_MAX_LEN: usize = {length_max};\n\
+         pub const ZONE_PATH_ALLOW_EMPTY_COMPONENTS: bool = {empty_components};\n\
+         pub const ZONE_PATH_ALLOW_TRAILING_SLASH: bool = {trailing_slash};\n\
+         pub const ZONE_PATH_RESERVED_PREFIXES: &[&str] = &[\n{reserved_refs}\n];\n"
+    );
+
+    let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR")).join("zone_path_rules.rs");
+    std::fs::write(out, generated).expect("failed to write generated zone-path rules");
 }

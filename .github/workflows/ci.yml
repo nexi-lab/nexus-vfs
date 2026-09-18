@@ -22,6 +22,8 @@ jobs:
         with:
           shared-key: ci-check-ubuntu-22.04
       - run: cargo check --workspace
+      - name: Check generated contracts
+        run: cargo run -p contracts --bin contractgen -- --check
 
   test:
     name: cargo test
