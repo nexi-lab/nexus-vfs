@@ -3001,6 +3001,25 @@ mod tests {
     }
 
     #[test]
+    fn strict_zone_path_does_not_reinterpret_legacy_vfs_spellings() {
+        for path in ["//alias", "/a//b", "/a/", "/a/./b", "/a\\b"] {
+            assert!(validate_path_fast(path).is_ok(), "legacy path {path:?}");
+            assert!(
+                contracts::zone_path::validate_zone_path(path).is_err(),
+                "strict ZonePath unexpectedly accepted {path:?}"
+            );
+        }
+
+        for path in ["/", "/资料/café", "/literal/%2e%2e"] {
+            assert!(validate_path_fast(path).is_ok(), "legacy path {path:?}");
+            assert!(
+                contracts::zone_path::validate_zone_path(path).is_ok(),
+                "strict ZonePath unexpectedly rejected {path:?}"
+            );
+        }
+    }
+
+    #[test]
     fn sys_write_increments_content_generation() {
         let k = kernel_with_root_backend();
         let ctx = OperationContext::new("test", "root", true, None, true);

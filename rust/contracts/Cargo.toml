@@ -21,7 +21,6 @@ serde = { version = "1.0", features = ["derive"] }
 parking_lot = "0.12"
 
 [build-dependencies]
-# Reads contracts/zone-id/spec.json at build time. A build dependency, so it
-# never enters the dependency graph of anything that links this crate — the
-# "zero deps" property of the library is unchanged.
+# Reads owner specs/fixtures and emits Rust rule data plus portable projections
+# into OUT_DIR. This never enters the dependency graph of linked consumers.
 serde_json = "1.0"

@@ -71,6 +71,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - name: Check owner schema projections
+        working-directory: contracts/zone-path
+        run: npm ci --ignore-scripts && npm test
       - name: Install
         working-directory: clients/node
         run: npm ci

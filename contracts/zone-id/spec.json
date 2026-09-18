@@ -12,6 +12,7 @@
     "Reserved ids are listed by the constant that owns them, not by value:",
     "rust/contracts/src/constants.rs is the SSOT for what those strings are."
   ],
+  "$id": "urn:sudo:nexus-vfs:zone-id:v1",
   "version": 1,
   "length": {
     "min": 3,
@@ -37,5 +38,11 @@
   "mutability": {
     "immutable_after_create": true,
     "why": "The id is the first path segment of everything in the zone, so renaming is not renaming. Changing --cluster-init from one id to another on a live deployment created a fresh empty zone and abandoned the old one, with no error at any layer (observed 2026-09-09)."
+  },
+  "projection": {
+    "json_schema": "schema.json",
+    "fixtures": "vectors.json",
+    "scope": "lexical",
+    "reserved_values": "owner-runtime-constants"
   }
 }
