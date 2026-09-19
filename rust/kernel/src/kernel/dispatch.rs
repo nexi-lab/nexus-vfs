@@ -90,7 +90,7 @@ impl Kernel {
     }
 
     /// Returns true when at least one registered hook declared a
-    /// `mutating_path_suffix` that matches `path`. `sys_write` uses
+    /// `mutating_path_suffixes` that matches `path`. `sys_write` uses
     /// this as a clone gate: only when a mutating hook matches does the
     /// dispatcher clone the write content into `WriteHookCtx`. The
     /// steady-state path (no mutating hooks) returns false on the

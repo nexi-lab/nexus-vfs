@@ -324,6 +324,71 @@ struct MountDriverSpec {
     config_json: String,
 }
 
+/// Prefixes a subsystem has declared it needs raft-replicated.
+///
+/// Each subsystem owns its own list; this is the composition root's union of
+/// them. `a2a` declares its addresses ([`a2a::REPLICATED_PREFIXES`]).
+/// [`contracts::SESSIONS_BASE`] is carried here rather than by a crate because
+/// it genuinely has no owner in this repo: the bytes are written by the
+/// sudocode runtime in the OTHER repo, while the mount has to happen here at
+/// boot. `managed_agent` is not its owner either — it has no session-id concept
+/// at all (its AgentRegistry pid IS the session handle), so parking the prefix
+/// there would be inventing an ownership that does not exist.
+fn default_replicated_prefixes() -> impl Iterator<Item = &'static str> {
+    a2a::REPLICATED_PREFIXES
+        .iter()
+        .copied()
+        .chain(std::iter::once(contracts::SESSIONS_BASE))
+}
+
+/// Mount the subsystem-declared replicated prefixes onto the founder's zone,
+/// unless the operator already said where they go.
+///
+/// # Why this exists
+///
+/// An unmounted prefix routes to this node's own SOLO `root` zone (the fallback
+/// in `VFSRouter::route`), which is not replicated. A write there succeeds, a
+/// local read returns it, and the peer never sees it — no error at any layer.
+/// So "the operator forgot a `--cluster-init-mount` line" and "A2A is broken
+/// cross-machine" are the same event, and it is silent. Requiring every
+/// deployment to restate a list that belongs to the subsystems is how that
+/// happens; deriving it is how it stops.
+///
+/// # The three arms, and why the first one is load-bearing
+///
+/// * **No declared zones ⇒ return unchanged.** This is the JOINER (`--peers`
+///   only), and it is not merely "nothing to mount": injecting here would make
+///   `federation_mounts` non-empty, which flips `zones_set` in
+///   `plan_boot_action`, which trips its row-6 split-brain arm ("both `--peers`
+///   AND founder intent") — every joiner would refuse to boot. A joiner must
+///   not need this anyway: it re-derives the whole mount topology from its
+///   peers' `DiscoverZones` on every boot (`reconcile_federation_from_peers`),
+///   so a prefix the founder declares arrives on its own.
+/// * **Exactly one declared zone ⇒ mount the missing prefixes there.** The
+///   unambiguous and overwhelmingly common case: `--cluster-init sharedzone`
+///   alone yields a working A2A.
+/// * **Several declared zones ⇒ return unchanged.** There is no principled way
+///   to pick, and guessing would silently put agent traffic in the wrong
+///   tenant's zone — strictly worse than the operator writing it out.
+///
+/// An operator's explicit entry always wins: this only fills gaps, so
+/// `--cluster-init-mount /agents=other` keeps `/agents` on `other`.
+fn with_default_replicated_mounts(
+    declared: &std::collections::BTreeMap<String, String>,
+    init_zones: &[String],
+) -> std::collections::BTreeMap<String, String> {
+    let mut resolved = declared.clone();
+    let [zone] = init_zones else {
+        return resolved;
+    };
+    for prefix in default_replicated_prefixes() {
+        resolved
+            .entry(prefix.to_string())
+            .or_insert_with(|| zone.clone());
+    }
+    resolved
+}
+
 fn parse_mount_driver_spec(raw: &str) -> Result<MountDriverSpec, String> {
     let mut parts = raw.splitn(4, ':');
     let name = parts
@@ -2010,6 +2075,14 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         ));
     }
 
+    // Subsystems that need their prefixes replicated get them mounted without
+    // the operator having to know the list. Placed HERE — after every check
+    // that reads operator intent (`is_silent_dropall`, the split-brain guard,
+    // and `founder_declared`, which was bound long before this line) — so an
+    // auto-mount can never make a malformed or contradictory operator input
+    // look valid. See `with_default_replicated_mounts`.
+    let federation_mounts = with_default_replicated_mounts(&init_mounts.mounts, &init_zones);
+
     // S3 Phase G: single boot decision layer.  `plan_boot_action`
     // is the SSOT for what this daemon does at boot — no more
     // `--bootstrap-mode` operator declaration, no more
@@ -2019,7 +2092,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         identity_persisted_peers: identity_persisted_peers.clone(),
         cli_peer_addrs: cli_peer_addrs.clone(),
         federation_zones: init_zones.clone(),
-        federation_mounts: init_mounts.mounts.clone(),
+        federation_mounts: federation_mounts.clone(),
         bootstrap_new: false, // retired knob; kept on struct for backwards struct-literal compat
         has_disk_state: data_dir_has_root,
         identity_zones: identity_zones.clone(),
@@ -5619,6 +5692,87 @@ fn provision_api_key_secret(
 mod tests {
     use super::*;
     use clap::Parser;
+
+    fn mounts(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(p, z)| ((*p).to_string(), (*z).to_string()))
+            .collect()
+    }
+
+    /// A joiner must come back UNCHANGED, and this is not a "nothing to do".
+    ///
+    /// Injecting for a joiner would make `federation_mounts` non-empty, which
+    /// flips `zones_set` inside `plan_boot_action` and trips its row-6
+    /// split-brain arm ("both `--peers` AND founder intent") — turning an
+    /// operator-transparent convenience into "every joiner refuses to boot".
+    /// A joiner does not need it regardless: it re-derives the whole topology
+    /// from its peers' `DiscoverZones` on each boot.
+    #[test]
+    fn a_joiner_gets_no_injected_mounts() {
+        assert!(
+            with_default_replicated_mounts(&mounts(&[]), &[]).is_empty(),
+            "a node with no declared zones is a joiner — injecting would trip \
+             plan_boot_action's row-6 split-brain guard"
+        );
+    }
+
+    /// The common case: declare a zone, get a working A2A without knowing the
+    /// prefix list.
+    ///
+    /// Asserted by ITERATING `default_replicated_prefixes()` rather than
+    /// spelling the paths out, so a prefix added to a subsystem's declaration
+    /// is covered here the moment it is added — a hardcoded pair would keep
+    /// passing while the new prefix silently went unmounted.
+    #[test]
+    fn a_single_declared_zone_mounts_every_declared_prefix() {
+        let resolved = with_default_replicated_mounts(&mounts(&[]), &["sharedzone".to_string()]);
+        for prefix in default_replicated_prefixes() {
+            assert_eq!(
+                resolved.get(prefix).map(String::as_str),
+                Some("sharedzone"),
+                "{prefix} must be mounted on the declared zone automatically"
+            );
+        }
+        // The A2A addresses and the session store are all covered by that loop;
+        // name one of each so a reader sees what the list actually contains.
+        assert!(resolved.contains_key(a2a::A2A_INBOX_BASE));
+        assert!(resolved.contains_key(a2a::CONVERSATIONS_BASE));
+        assert!(resolved.contains_key(contracts::SESSIONS_BASE));
+    }
+
+    /// Several zones ⇒ unchanged. Guessing would silently route agent traffic
+    /// into the wrong tenant's zone, which is worse than making the operator
+    /// write it out.
+    #[test]
+    fn several_declared_zones_are_left_alone() {
+        let declared = mounts(&[]);
+        let resolved = with_default_replicated_mounts(
+            &declared,
+            &["tenant-a".to_string(), "tenant-b".to_string()],
+        );
+        assert!(
+            resolved.is_empty(),
+            "with two candidate zones there is no principled choice: {resolved:?}"
+        );
+    }
+
+    /// An explicit operator entry wins; injection only fills gaps.
+    #[test]
+    fn an_explicit_operator_mount_is_never_overridden() {
+        let declared = mounts(&[(a2a::A2A_INBOX_BASE, "other-zone")]);
+        let resolved = with_default_replicated_mounts(&declared, &["sharedzone".to_string()]);
+        assert_eq!(
+            resolved.get(a2a::A2A_INBOX_BASE).map(String::as_str),
+            Some("other-zone"),
+            "the operator said where /agents goes; injection must not move it"
+        );
+        // …while the prefixes they did NOT mention are still filled in.
+        assert_eq!(
+            resolved.get(a2a::CONVERSATIONS_BASE).map(String::as_str),
+            Some("sharedzone"),
+        );
+    }
 
     /// `resolve_api_key_secret` precedence — the (persisted-file, env) SSOT
     /// decision. File WINS (stability, like the persisted CA); else env, used

@@ -102,6 +102,23 @@ pub const VFS_ROOT: &str = "/";
 /// ``nexus.core.hash_utils.BLAKE3_EMPTY`` constant.
 pub const BLAKE3_EMPTY: &str = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
 
+/// Root of the flat, session-id-keyed session store (`/sessions/<sid>/`).
+///
+/// A session directory holds the transcript bytes and is keyed by session-id
+/// ALONE — no workspace hash, no nesting under the owning agent. The per-agent
+/// and per-repo ties are DT_LINK indexes plus an `owner` field, so isolation is
+/// policy rather than path (the agent-context storage matrix records this as
+/// the target shape, with `vfs_paths.py`'s agent-nested layout as the gap to
+/// migrate off).
+///
+/// Lives in `contracts` because it genuinely has no single owner crate: the
+/// bytes are written by the sudocode runtime (through its `FsBackend`'s
+/// `managed_sessions_root()`), while the prefix must be MOUNTED by the
+/// composition root at daemon boot for those bytes to replicate. Neither side
+/// owns the other, and `managed_agent` is not the owner either — it has no
+/// session-id concept at all (its AgentRegistry pid IS the session handle).
+pub const SESSIONS_BASE: &str = "/sessions";
+
 /// Kernel-reserved path prefix for internal system entries
 /// (mount table, ReBAC namespace store, ReBAC version store, zone
 /// revisions, …).
