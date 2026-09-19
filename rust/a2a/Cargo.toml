@@ -20,3 +20,8 @@ kernel = { workspace = true }
 contracts = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+# Conversation ids: `conversation_id(a, b)` is a deterministic BLAKE3 over the
+# sorted name pair. Both sides of a conversation — and the sudocode writer in
+# the other repo, which re-exports this function rather than reimplementing it —
+# must derive byte-identical ids, so the hash lives here with the address SSOT.
+blake3 = { workspace = true }

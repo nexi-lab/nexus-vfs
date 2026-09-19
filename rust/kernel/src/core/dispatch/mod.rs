@@ -594,15 +594,25 @@ pub trait NativeInterceptHook: Send + Sync {
     /// Post-intercept: fire-and-forget after operation completes.
     fn on_post(&self, _ctx: &HookContext) {}
 
-    /// Path-suffix this hook rewrites write content for. `None`
+    /// Path-suffixes this hook rewrites write content for. Empty
     /// (default) means the hook is accept/reject only — the
     /// dispatcher will pass `WriteHookCtx::content = vec![]` and
-    /// never honour `Replace`. `Some` opts the hook in to content
-    /// rewriting; the dispatcher clones the real bytes into the
-    /// context only when at least one registered hook declares a
+    /// never honour `Replace`. A non-empty slice opts the hook in to
+    /// content rewriting; the dispatcher clones the real bytes into
+    /// the context only when at least one registered hook declares a
     /// suffix that matches the write path.
-    fn mutating_path_suffix(&self) -> Option<&'static str> {
-        None
+    ///
+    /// A SLICE rather than one suffix because a rename of a hooked
+    /// path is necessarily a migration window, not an instant: the
+    /// writers live in another repo and pin this one by revision, so
+    /// the old and the new leaf must both be honoured until the
+    /// release chain has carried the new one everywhere. With a
+    /// single suffix that window is inexpressible, and the tempting
+    /// workarounds are both wrong — registering the same hook twice
+    /// runs its body twice per write, and reaching for a shorter
+    /// common suffix widens the clone gate to unrelated paths.
+    fn mutating_path_suffixes(&self) -> &'static [&'static str] {
+        &[]
     }
 }
 
@@ -851,7 +861,7 @@ struct NativeHookEntry {
 pub(crate) struct NativeHookRegistry {
     hooks: Vec<NativeHookEntry>,
     /// Suffixes declared by registered mutating hooks (via
-    /// `NativeInterceptHook::mutating_path_suffix`). Populated on
+    /// `NativeInterceptHook::mutating_path_suffixes`). Populated on
     /// register; consulted by `has_mutating_match` so the kernel can
     /// decide whether to clone write content into `WriteHookCtx`. An
     /// empty Vec is the steady state today (no mutating hooks
@@ -869,9 +879,8 @@ impl NativeHookRegistry {
     }
 
     pub(crate) fn register(&mut self, hook: Box<dyn NativeInterceptHook>) {
-        if let Some(suffix) = hook.mutating_path_suffix() {
-            self.mutating_suffixes.push(suffix);
-        }
+        self.mutating_suffixes
+            .extend_from_slice(hook.mutating_path_suffixes());
         self.hooks.push(NativeHookEntry { hook });
     }
 
@@ -884,7 +893,8 @@ impl NativeHookRegistry {
             self.mutating_suffixes = self
                 .hooks
                 .iter()
-                .filter_map(|e| e.hook.mutating_path_suffix())
+                .flat_map(|e| e.hook.mutating_path_suffixes())
+                .copied()
                 .collect();
             return true;
         }
@@ -1205,15 +1215,15 @@ mod tests {
 
     struct DummyHook {
         hook_name: &'static str,
-        suffix: Option<&'static str>,
+        suffixes: &'static [&'static str],
     }
 
     impl NativeInterceptHook for DummyHook {
         fn name(&self) -> &str {
             self.hook_name
         }
-        fn mutating_path_suffix(&self) -> Option<&'static str> {
-            self.suffix
+        fn mutating_path_suffixes(&self) -> &'static [&'static str] {
+            self.suffixes
         }
     }
 
@@ -1222,11 +1232,11 @@ mod tests {
         let mut reg = NativeHookRegistry::new();
         reg.register(Box::new(DummyHook {
             hook_name: "audit",
-            suffix: None,
+            suffixes: &[],
         }));
         reg.register(Box::new(DummyHook {
             hook_name: "rebac",
-            suffix: None,
+            suffixes: &[],
         }));
         assert_eq!(reg.count(), 2);
         assert!(reg.unregister("audit"));
@@ -1241,11 +1251,11 @@ mod tests {
         let mut reg = NativeHookRegistry::new();
         reg.register(Box::new(DummyHook {
             hook_name: "stamper",
-            suffix: Some("/chat-with-me"),
+            suffixes: &["/chat-with-me"],
         }));
         reg.register(Box::new(DummyHook {
             hook_name: "audit",
-            suffix: None,
+            suffixes: &[],
         }));
         assert!(reg.has_mutating_match("/zone/chat-with-me"));
         reg.unregister("stamper");
