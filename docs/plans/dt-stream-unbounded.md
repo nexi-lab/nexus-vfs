@@ -14,7 +14,7 @@ DT_STREAM claims Kafka/Redis-Streams/NATS log semantics but only implements the 
 - The WHOLE `sm_stream_entries` tree is serialized verbatim into every SM snapshot; replayed in full to every joining SC node. → unbounded raft log + unbounded SM + unbounded join transfer.
 - SC log `RaftStorage::compact` / `store_snapshot` are **implemented but DORMANT** (only test callers).
 
-Consumers that NEED unbounded-durable: **audit** (wal, cap 0) and **A2A mailbox / chat-with-me** (wal when federated; else falls to bounded 64 KiB volatile — the gap). memory/shm consumers (LLM SSE, event bus, cross-proc wakeup) are correctly bounded — DO NOT touch them. No session-transcript consumer exists yet (nexus-2's #84, blocked on this).
+Consumers that NEED unbounded-durable: **audit** (wal, cap 0) and the **A2A message log** (the conversation transcript `…/conversations/<cid>/transcript`, and the node-local `/proc/{pid}/chat-with-me` pipe) — wal when federated; else falls to bounded 64 KiB volatile — the gap. memory/shm consumers (LLM SSE, event bus, cross-proc wakeup) are correctly bounded — DO NOT touch them. No session-transcript consumer exists yet (nexus-2's #84, blocked on this).
 
 ## 2. Design — tiered storage mapped to nexus two-pillar + WAL-seq
 
