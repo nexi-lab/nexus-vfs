@@ -29,25 +29,33 @@
 //! (spawn/PCB → process). A frontend consumes [`MailboxStampingHook`];
 //! only the daemon calls [`install_a2a_stamp_hook`].
 
+pub mod addresses;
 pub mod foreign_containment;
 pub mod mailbox_stamping_hook;
 pub mod mailbox_stamping_policy;
 
 pub use foreign_containment::{install_foreign_agent_containment, ForeignAgentMailboxOnly};
 pub use mailbox_stamping_hook::MailboxStampingHook;
-// `is_mailbox_path` / `is_a2a_mailbox_path` are re-exported alongside the
-// address builders because they ARE the public contract, not internals: the
-// first is the stamp scope, the second is the entire allow-list a cross-org
-// caller is confined to (`foreign_containment`). A consumer deciding whether a
-// path is an A2A log must reach the same answer this crate does — re-exporting
-// them is what keeps a second, drifting copy from being written elsewhere.
-pub use mailbox_stamping_policy::{
+
+// The crate root is the stable surface: consumers spell `a2a::X` and never name
+// the module, so splitting addressing out of the stamping policy is invisible
+// to them. Keep it that way — moving a symbol between these two lists is free,
+// dropping one from the root is a breaking change for the other repo.
+pub use addresses::{
     agent_conversation_link_path, agent_inbox_path, agent_state_path, conversation_id,
-    conversation_reader_path, conversation_transcript_path, is_a2a_mailbox_path,
-    is_conversation_reader_path, is_conversation_transcript_path, is_mailbox_path, MailboxEnvelope,
-    A2A_INBOX_BASE, AGENT_CONVERSATIONS_SEGMENT, AGENT_STATE_SUFFIX, CHAT_WITH_ME_SUFFIX,
-    CONVERSATIONS_BASE, MAILBOX_IO_PROFILE, MAILBOX_STREAM_CAPACITY, MAILBOX_WRITE_SUFFIXES,
-    REPLICATED_PREFIXES, TRANSCRIPT_LEAF,
+    conversation_reader_path, conversation_transcript_path, is_conversation_reader_path,
+    is_conversation_transcript_path, A2A_INBOX_BASE, AGENT_CONVERSATIONS_SEGMENT,
+    AGENT_STATE_SUFFIX, CHAT_WITH_ME_SUFFIX, CONVERSATIONS_BASE, MAILBOX_IO_PROFILE,
+    MAILBOX_STREAM_CAPACITY, REPLICATED_PREFIXES, TRANSCRIPT_LEAF,
+};
+// `is_mailbox_path` / `is_a2a_mailbox_path` are re-exported because they ARE
+// the public contract, not internals: the first is the stamp scope, the second
+// is the entire allow-list a cross-org caller is confined to
+// (`foreign_containment`). A consumer deciding whether a path is an A2A log
+// must reach the same answer this crate does — re-exporting them is what keeps
+// a second, drifting copy from being written elsewhere.
+pub use mailbox_stamping_policy::{
+    is_a2a_mailbox_path, is_mailbox_path, MailboxEnvelope, MAILBOX_WRITE_SUFFIXES,
 };
 
 use kernel::kernel::syscall::KernelSyscall;
