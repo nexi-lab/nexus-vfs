@@ -608,9 +608,11 @@ pub trait NativeInterceptHook: Send + Sync {
     /// the old and the new leaf must both be honoured until the
     /// release chain has carried the new one everywhere. With a
     /// single suffix that window is inexpressible, and the tempting
-    /// workarounds are both wrong — registering the same hook twice
-    /// runs its body twice per write, and reaching for a shorter
-    /// common suffix widens the clone gate to unrelated paths.
+    /// workarounds are both wrong: registering the same hook twice
+    /// gives two entries the same `name()`, so `unregister` removes
+    /// only one and silently leaves the other armed, while reaching
+    /// for a shorter common suffix widens the clone gate to
+    /// unrelated paths.
     fn mutating_path_suffixes(&self) -> &'static [&'static str] {
         &[]
     }

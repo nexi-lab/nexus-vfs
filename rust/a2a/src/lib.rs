@@ -53,9 +53,7 @@ pub use mailbox_stamping_policy::{
 use kernel::kernel::syscall::KernelSyscall;
 use kernel::kernel::Kernel;
 
-/// DT_STREAM entry-type discriminant for `sys_setattr` (mirrors
-/// `kernel::meta_store::DT_STREAM`, which is `u8`; the setattr arg is `i32`).
-const DT_STREAM: i32 = 4;
+use kernel::meta_store::{DT_DIR, DT_LINK, DT_STREAM};
 
 /// Provision `agent_name`'s persistent A2A inbox as a DT_STREAM, idempotently.
 ///
@@ -122,6 +120,26 @@ pub fn ensure_conversation<K: KernelSyscall>(
 ) -> Result<(), String> {
     let cid = conversation_id(agent_name, peer_name);
     let conversation_root = format!("{CONVERSATIONS_BASE}/{cid}");
+    let transcript = conversation_transcript_path(&cid);
+
+    // Steady-state exit: ONE `sys_stat` instead of the eleven `sys_setattr`
+    // round trips below. A sender calls this on every send, and every call
+    // below is individually idempotent — so without this check the hot path
+    // pays eleven syscalls per message to re-establish what the first send
+    // already built.
+    //
+    // The transcript is created LAST on purpose, which is what makes it a
+    // sound completion sentinel: if it exists, every directory and both
+    // chat-list links exist too. Creating it earlier (the obvious order, since
+    // it is the point of the conversation) would let a run interrupted between
+    // the stream and the links leave a transcript with no index, and this
+    // early return would then skip repairing it forever.
+    if kernel
+        .sys_stat(&transcript, contracts::ROOT_ZONE_ID)
+        .is_some()
+    {
+        return Ok(());
+    }
 
     // Dirent layer first — children attach below it. `setattr_create_link`
     // validates the target and puts the row; it does NOT materialise parents.
@@ -130,13 +148,12 @@ pub fn ensure_conversation<K: KernelSyscall>(
     // ordering `managed_agent::proc_entry` uses when it stamps `/proc`.
     ensure_dir(kernel, CONVERSATIONS_BASE)?;
     ensure_dir(kernel, &conversation_root)?;
-    ensure_mailbox_stream(kernel, &conversation_transcript_path(&cid))?;
+    ensure_dir(kernel, A2A_INBOX_BASE)?;
 
     // Both participants get a chat-list entry. A conversation is not owned by
     // whoever provisioned it, so indexing only the local agent would leave the
     // peer unable to find it by listing.
     for name in [agent_name, peer_name] {
-        ensure_dir(kernel, A2A_INBOX_BASE)?;
         ensure_dir(kernel, &format!("{A2A_INBOX_BASE}/{name}"))?;
         ensure_dir(
             kernel,
@@ -149,22 +166,10 @@ pub fn ensure_conversation<K: KernelSyscall>(
         )
         .map_err(|e| format!("index conversation {cid} for {name}: {e}"))?;
     }
-    Ok(())
-}
 
-/// `sys_setattr` entry-type discriminants for a2a's metadata-only entries.
-///
-/// These MIRROR `kernel::abc::meta_store::{DT_DIR, DT_LINK}` (both `u8` there;
-/// the setattr arg is `i32`) — the same local-const shape `DT_STREAM` above and
-/// `managed_agent::proc_entry` use, because a2a depends on the kernel's syscall
-/// surface rather than its metastore internals.
-///
-/// Get these WRONG and there is no compile error and no runtime error: the
-/// syscall dispatches on the integer, so `DT_LINK = 3` quietly creates a
-/// DT_PIPE at the chat-list path instead of a link. Cross-check against
-/// `sys_setattr`'s match arms before touching them.
-const DT_DIR: i32 = 1;
-const DT_LINK: i32 = 6;
+    // Last — see the completion-sentinel note above.
+    ensure_mailbox_stream(kernel, &transcript)
+}
 
 /// Create `path` as a DT_DIR, idempotently.
 ///
@@ -190,13 +195,17 @@ fn link_conversation<K: KernelSyscall>(
 fn metadata_setattr<K: KernelSyscall>(
     kernel: &K,
     path: &str,
-    entry_type: i32,
+    entry_type: u8,
     link_target: Option<&str>,
 ) -> Result<(), String> {
     kernel
         .sys_setattr(
             path,
-            entry_type,
+            // `kernel::meta_store` types these as `u8`; the syscall arg is
+            // `i32`. Widening HERE keeps every call site spelling the named
+            // constant instead of an integer literal — which is exactly what
+            // those constants are `pub` for.
+            i32::from(entry_type),
             /* backend_name */ "",
             /* backend */ None,
             /* metastore */ None,
@@ -246,7 +255,7 @@ pub fn ensure_mailbox_stream<K: KernelSyscall>(kernel: &K, path: &str) -> Result
     kernel
         .sys_setattr(
             path,
-            DT_STREAM,
+            i32::from(DT_STREAM),
             /* backend_name */ "",
             /* backend */ None,
             /* metastore */ None,

@@ -12,7 +12,15 @@ use a2a::{
     agent_conversation_link_path, conversation_id, conversation_reader_path,
     conversation_transcript_path, ensure_conversation, is_a2a_mailbox_path, CONVERSATIONS_BASE,
 };
-use kernel::kernel::{Kernel, StatResult};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use kernel::core::dispatch::FileEvent;
+use kernel::kernel::syscall::{KernelSyscall, ReaddirOpts};
+use kernel::kernel::{
+    Kernel, KernelError, OperationContext, StatResult, SysCopyResult, SysReadResult,
+    SysRenameResult, SysSetAttrResult, SysUnlinkResult, SysWriteResult,
+};
 
 /// Entry-type discriminants, mirroring `kernel::abc::meta_store`.
 ///
@@ -27,6 +35,166 @@ fn stat(kernel: &Kernel, path: &str) -> StatResult {
     kernel
         .sys_stat(path, contracts::ROOT_ZONE_ID)
         .unwrap_or_else(|| panic!("{path} must exist after ensure_conversation"))
+}
+
+/// A real kernel that counts the `sys_setattr` calls made through it.
+///
+/// Provisioning is idempotent at every step, so "the second call still returns
+/// Ok" is true whether or not the early return exists — the only thing that
+/// distinguishes them is how many syscalls the second call MAKES. Counting is
+/// the direct observation; everything else is a proxy.
+struct CountingKernel {
+    inner: Kernel,
+    setattrs: AtomicUsize,
+}
+
+impl CountingKernel {
+    fn new() -> Self {
+        Self {
+            inner: Kernel::new(),
+            setattrs: AtomicUsize::new(0),
+        }
+    }
+
+    fn setattrs(&self) -> usize {
+        self.setattrs.load(Ordering::Relaxed)
+    }
+
+    fn reset(&self) {
+        self.setattrs.store(0, Ordering::Relaxed);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+impl KernelSyscall for CountingKernel {
+    fn sys_setattr(
+        &self,
+        path: &str,
+        entry_type: i32,
+        backend_name: &str,
+        backend: Option<Arc<dyn kernel::abc::object_store::ObjectStore>>,
+        metastore: Option<Arc<dyn kernel::meta_store::MetaStore>>,
+        raft_backend: Option<Box<dyn std::any::Any + Send + Sync>>,
+        io_profile: &str,
+        zone_id: &str,
+        is_external: bool,
+        capacity: usize,
+        read_fd: Option<i32>,
+        write_fd: Option<i32>,
+        mime_type: Option<&str>,
+        modified_at_ms: Option<i64>,
+        content_id: Option<&str>,
+        size: Option<u64>,
+        version: Option<u32>,
+        created_at_ms: Option<i64>,
+        link_target: Option<&str>,
+        source: Option<&str>,
+        remote_metastore: Option<Arc<dyn kernel::meta_store::MetaStore>>,
+    ) -> Result<SysSetAttrResult, KernelError> {
+        self.setattrs.fetch_add(1, Ordering::Relaxed);
+        self.inner.sys_setattr(
+            path,
+            entry_type,
+            backend_name,
+            backend,
+            metastore,
+            raft_backend,
+            io_profile,
+            zone_id,
+            is_external,
+            capacity,
+            read_fd,
+            write_fd,
+            mime_type,
+            modified_at_ms,
+            content_id,
+            size,
+            version,
+            created_at_ms,
+            link_target,
+            source,
+            remote_metastore,
+        )
+    }
+
+    // Everything else forwards untouched — only the write-shaped call is counted.
+    fn sys_read(
+        &self,
+        path: &str,
+        ctx: &OperationContext,
+        timeout_ms: u64,
+        offset: u64,
+    ) -> Result<SysReadResult, KernelError> {
+        KernelSyscall::sys_read(&self.inner, path, ctx, timeout_ms, offset)
+    }
+    fn sys_write(
+        &self,
+        path: &str,
+        ctx: &OperationContext,
+        content: &[u8],
+        offset: u64,
+    ) -> Result<SysWriteResult, KernelError> {
+        KernelSyscall::sys_write(&self.inner, path, ctx, content, offset)
+    }
+    fn sys_unlink(
+        &self,
+        path: &str,
+        ctx: &OperationContext,
+        recursive: bool,
+    ) -> Result<SysUnlinkResult, KernelError> {
+        KernelSyscall::sys_unlink(&self.inner, path, ctx, recursive)
+    }
+    fn sys_stat(&self, path: &str, zone_id: &str) -> Option<StatResult> {
+        KernelSyscall::sys_stat(&self.inner, path, zone_id)
+    }
+    fn sys_rename(
+        &self,
+        old_path: &str,
+        new_path: &str,
+        ctx: &OperationContext,
+    ) -> Result<SysRenameResult, KernelError> {
+        KernelSyscall::sys_rename(&self.inner, old_path, new_path, ctx)
+    }
+    fn sys_copy(
+        &self,
+        src_path: &str,
+        dst_path: &str,
+        ctx: &OperationContext,
+    ) -> Result<SysCopyResult, KernelError> {
+        KernelSyscall::sys_copy(&self.inner, src_path, dst_path, ctx)
+    }
+    fn sys_lock(
+        &self,
+        path: &str,
+        lock_id: &str,
+        max_holders: u32,
+        ttl_secs: u64,
+        holder_info: &str,
+    ) -> Result<Option<String>, KernelError> {
+        KernelSyscall::sys_lock(
+            &self.inner,
+            path,
+            lock_id,
+            max_holders,
+            ttl_secs,
+            holder_info,
+        )
+    }
+    fn sys_unlock(&self, path: &str, lock_id: &str, force: bool) -> Result<bool, KernelError> {
+        KernelSyscall::sys_unlock(&self.inner, path, lock_id, force)
+    }
+    fn sys_readdir(
+        &self,
+        parent_path: &str,
+        zone_id: &str,
+        is_admin: bool,
+        opts: ReaddirOpts,
+    ) -> Vec<(String, u8)> {
+        KernelSyscall::sys_readdir(&self.inner, parent_path, zone_id, is_admin, opts)
+    }
+    fn sys_watch(&self, pattern: &str, timeout_ms: u64) -> Option<FileEvent> {
+        KernelSyscall::sys_watch(&self.inner, pattern, timeout_ms)
+    }
 }
 
 /// The chat-list entry must be a DT_LINK pointing at the shared conversation.
@@ -156,6 +324,46 @@ fn provisioning_is_idempotent_and_order_free() {
         stat(&kernel, &conversation_transcript_path(&cid)).entry_type,
         DT_STREAM,
         "the transcript must survive re-provisioning unchanged"
+    );
+}
+
+/// An existing conversation must SHORT-CIRCUIT, not re-walk the tree.
+///
+/// A sender calls this on every send, and each step inside is individually
+/// idempotent — so "it still returns Ok" holds with or without the early
+/// return and proves nothing about it. What the early return actually changes
+/// IS observable: once the transcript exists, the function stops looking at
+/// anything else. Deleting a chat-list link and watching it stay deleted is
+/// exactly that difference, and it is the only cheap way to assert the hot
+/// path does not pay eleven `sys_setattr` round trips per message.
+///
+/// It also pins the trade-off honestly rather than leaving it in a comment.
+/// The early return is sound against an INTERRUPTED create — the transcript is
+/// written last, so its presence implies the directories and both links — but
+/// it does NOT repair a structure damaged afterwards. Nothing deletes these
+/// entries in practice; if something ever starts to, this test is where that
+/// assumption is written down and will fail.
+#[test]
+fn an_existing_conversation_short_circuits_instead_of_rewalking() {
+    let kernel = CountingKernel::new();
+
+    ensure_conversation(&kernel, "win-ai", "mac-ai").expect("first provision");
+    let building = kernel.setattrs();
+    assert!(
+        building > 1,
+        "the first call must actually build the structure, got {building} setattr(s)"
+    );
+
+    kernel.reset();
+    ensure_conversation(&kernel, "win-ai", "mac-ai").expect("second provision");
+
+    assert_eq!(
+        kernel.setattrs(),
+        0,
+        "a conversation that already exists must cost ZERO setattr — one sys_stat \
+         and out. A sender calls this on every send, so without the early return \
+         each message re-walks the whole structure ({building} syscalls) to \
+         re-establish what the first send already built."
     );
 }
 
