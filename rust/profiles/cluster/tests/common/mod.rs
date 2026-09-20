@@ -745,6 +745,27 @@ impl Vfs {
         Ok(r.content)
     }
 
+    /// The zone `path` ROUTED to, as the server resolved it — `None` if the
+    /// path does not exist.
+    ///
+    /// `stat_found` answers "is it there", which cannot distinguish a
+    /// replicated federation mount from the node-local `root` fallback: both
+    /// answer yes. Only the resolved zone separates them, and that difference
+    /// is the whole of "does this path replicate cross-machine".
+    pub async fn stat_zone(&mut self, path: &str, token: &str) -> Option<String> {
+        let r = self
+            .c
+            .stat(StatRequest {
+                path: path.to_string(),
+                auth_token: token.to_string(),
+                ..Default::default()
+            })
+            .await
+            .ok()?
+            .into_inner();
+        r.found.then_some(r.zone_id)
+    }
+
     pub async fn stat_found(&mut self, path: &str, token: &str) -> bool {
         self.c
             .stat(StatRequest {
