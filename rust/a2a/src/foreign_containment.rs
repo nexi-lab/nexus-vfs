@@ -26,9 +26,10 @@ use kernel::kernel::{Kernel, KernelError, OperationContext};
 use kernel::vfs_router::RouteResult;
 use kernel::{Permission, PermissionProvider};
 
-use crate::mailbox_stamping_policy::is_a2a_mailbox_path;
+use crate::mailbox_stamping_policy::{is_a2a_mailbox_path, is_conversation_reader_path};
 
-/// Confines a foreign (cross-org) agent to `*/chat-with-me` mailboxes.
+/// Confines a foreign (cross-org) agent to the A2A message logs it
+/// participates in.
 pub struct ForeignAgentMailboxOnly;
 
 impl PermissionProvider for ForeignAgentMailboxOnly {
@@ -37,7 +38,7 @@ impl PermissionProvider for ForeignAgentMailboxOnly {
         &self,
         path: &str,
         _route: Option<&RouteResult>,
-        _permission: Permission,
+        permission: Permission,
         ctx: &OperationContext,
     ) -> Result<(), KernelError> {
         // Only a foreign agent is bounded; a domestic caller (the common
@@ -49,9 +50,21 @@ impl PermissionProvider for ForeignAgentMailboxOnly {
         if is_a2a_mailbox_path(path) {
             return Ok(());
         }
+        // A conversation's reader registers are READABLE by a participant —
+        // that is how a peer observes "has the other side read this" without a
+        // human relaying offsets — but never WRITABLE by a foreign one.
+        // Moving someone else's read position skips their inbound messages
+        // silently: no error is raised, the sender is still told the message
+        // was delivered, and nothing in the log records that it was stepped
+        // over. That is a denial of delivery with no trace, so the write side
+        // stays closed even though the read side is open.
+        if is_conversation_reader_path(path) && matches!(permission, Permission::Read) {
+            return Ok(());
+        }
         Err(KernelError::PermissionDenied(format!(
             "foreign agent (trust domain '{trust_domain}') is confined to its \
-             '*/chat-with-me' mailbox; '{path}' is out of scope"
+             A2A conversation transcripts (read-only on reader registers); \
+             '{path}' is out of scope for {permission:?}"
         )))
     }
 }

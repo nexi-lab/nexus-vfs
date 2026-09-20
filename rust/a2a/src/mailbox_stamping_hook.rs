@@ -3,7 +3,7 @@
 //!
 //! The kernel side is intentionally thin: this struct exists so the
 //! dispatch system has a registered `NativeInterceptHook`, and its
-//! `mutating_path_suffix` declaration drives the content-clone bypass
+//! `mutating_path_suffixes` declaration drives the content-clone bypass
 //! at the sys_write call site (only `*/chat-with-me` writes pay the
 //! clone). The actual rewriting policy lives in the sibling
 //! [`crate::mailbox_stamping_policy::maybe_stamp_chat_envelope`] — kernel
@@ -16,7 +16,6 @@
 //! fixtures) that ride the same substrate can register it.
 
 use crate::mailbox_stamping_policy;
-use crate::mailbox_stamping_policy::CHAT_WITH_ME_SUFFIX;
 use contracts::is_system_path;
 use kernel::core::dispatch::{HookContext, HookOutcome, NativeInterceptHook};
 
@@ -59,8 +58,8 @@ impl NativeInterceptHook for MailboxStampingHook {
         "mailbox_stamping"
     }
 
-    fn mutating_path_suffix(&self) -> Option<&'static str> {
-        Some(CHAT_WITH_ME_SUFFIX)
+    fn mutating_path_suffixes(&self) -> &'static [&'static str] {
+        mailbox_stamping_policy::MAILBOX_WRITE_SUFFIXES
     }
 
     fn on_pre(&self, ctx: &HookContext) -> Result<HookOutcome, String> {
@@ -143,10 +142,18 @@ mod tests {
         })
     }
 
+    /// The hook must claim BOTH leaves for the duration of the rename.
+    ///
+    /// A path the hook does not claim is never cloned into `WriteHookCtx`, so
+    /// the stamp never runs on it and `from` is whatever the writer typed —
+    /// with no compile error and no runtime error to notice. Dropping the
+    /// legacy leaf before every writer has moved is therefore a silent loss of
+    /// the identity guarantee, which is why this is pinned rather than left to
+    /// the suffix constant alone.
     #[test]
-    fn declares_chat_with_me_suffix() {
+    fn declares_both_leaves_for_the_rename_window() {
         let h = MailboxStampingHook::new();
-        assert_eq!(h.mutating_path_suffix(), Some("/chat-with-me"));
+        assert_eq!(h.mutating_path_suffixes(), ["/transcript", "/chat-with-me"]);
     }
 
     #[test]

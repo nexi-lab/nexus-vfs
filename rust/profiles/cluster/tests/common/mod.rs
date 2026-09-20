@@ -65,13 +65,20 @@ pub fn free_port_pair() -> u16 {
 pub struct Daemon {
     child: Child,
     log: Arc<Mutex<String>>,
+    /// Handles of the two pipe-reader threads, so a caller that has seen the
+    /// child exit can wait for them to finish draining — see [`Daemon::drain_settled`].
+    pumps: Vec<std::thread::JoinHandle<()>>,
 }
 
 /// Drain a child pipe into the shared log buffer on a background thread. The
 /// thread exits when the pipe closes (the child is killed on `Daemon` drop).
-fn pump(pipe: Option<impl std::io::Read + Send + 'static>, log: Arc<Mutex<String>>) {
-    let Some(mut pipe) = pipe else { return };
-    std::thread::spawn(move || {
+fn pump(
+    pipe: Option<impl std::io::Read + Send + 'static>,
+    log: Arc<Mutex<String>>,
+) -> Option<std::thread::JoinHandle<()>> {
+    let pipe = pipe?;
+    let mut pipe = pipe;
+    Some(std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
             match pipe.read(&mut buf) {
@@ -82,7 +89,7 @@ fn pump(pipe: Option<impl std::io::Read + Send + 'static>, log: Arc<Mutex<String
                     .push_str(&String::from_utf8_lossy(&buf[..n])),
             }
         }
-    });
+    }))
 }
 
 impl Daemon {
@@ -134,9 +141,14 @@ impl Daemon {
         }
         let mut child = cmd.spawn().expect("spawn nexusd-cluster");
         let log = Arc::new(Mutex::new(String::new()));
-        pump(child.stdout.take(), Arc::clone(&log));
-        pump(child.stderr.take(), Arc::clone(&log));
-        Daemon { child, log }
+        let pumps = [
+            pump(child.stdout.take(), Arc::clone(&log)),
+            pump(child.stderr.take(), Arc::clone(&log)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        Daemon { child, log, pumps }
     }
 
     /// Poll until the TCP `port` accepts a connection (came up) or the process
@@ -146,7 +158,10 @@ impl Daemon {
         let deadline = Instant::now() + budget;
         while Instant::now() < deadline {
             if let Ok(Some(status)) = self.child.try_wait() {
-                return Err(format!("exited (status {status}):\n{}", self.drain()));
+                return Err(format!(
+                    "exited (status {status}):\n{}",
+                    self.drain_settled()
+                ));
             }
             if tokio::net::TcpStream::connect(("127.0.0.1", port))
                 .await
@@ -164,7 +179,7 @@ impl Daemon {
         let deadline = Instant::now() + budget;
         while Instant::now() < deadline {
             if let Ok(Some(_)) = self.child.try_wait() {
-                return Some(self.drain());
+                return Some(self.drain_settled());
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
@@ -190,7 +205,7 @@ impl Daemon {
             if let Ok(Some(status)) = self.child.try_wait() {
                 return Err(format!(
                     "exited (status {status}) before logging {pat:?}:\n{}",
-                    self.drain()
+                    self.drain_settled()
                 ));
             }
             if Instant::now() >= deadline {
@@ -222,7 +237,7 @@ impl Daemon {
             if let Ok(Some(status)) = self.child.try_wait() {
                 return Err(format!(
                     "exited (status {status}) before logging {pat:?} ×{count}:\n{}",
-                    self.drain()
+                    self.drain_settled()
                 ));
             }
             if Instant::now() >= deadline {
@@ -238,6 +253,31 @@ impl Daemon {
     /// Snapshot of everything the child has written to stdout+stderr so far.
     pub fn drain(&self) -> String {
         self.log.lock().unwrap().clone()
+    }
+
+    /// Everything the child wrote, after its pipes have been fully drained.
+    ///
+    /// Call this INSTEAD of [`Daemon::drain`] once `try_wait` has reported the
+    /// child exited. `try_wait` observes process death, which says nothing
+    /// about the reader threads: the pipes still hold whatever the child wrote
+    /// on its way out, and `drain` would snapshot a buffer those threads have
+    /// not finished filling. The faster the child dies, the emptier the
+    /// snapshot — so the tests most likely to lose their output are exactly
+    /// the ones asserting on a refusal, which is the earliest exit there is.
+    ///
+    /// That is not theoretical: `zone_id_refused_at_boot` failed twice on main
+    /// this way, reporting `exited (status 1):` with nothing after the colon
+    /// and an assertion complaining the id was missing from the logs.
+    ///
+    /// Only safe once the child is gone. While it lives its pipes never reach
+    /// EOF, so the reader threads never return and this would block until the
+    /// test's own timeout — which is why the budget-expired paths keep using
+    /// plain `drain`.
+    pub fn drain_settled(&mut self) -> String {
+        for pump in std::mem::take(&mut self.pumps) {
+            let _ = pump.join();
+        }
+        self.drain()
     }
 
     /// The daemon's OS process id — for tests that measure the process itself

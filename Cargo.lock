@@ -6,6 +6,7 @@ version = 4
 name = "a2a"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "contracts",
  "kernel",
  "serde",

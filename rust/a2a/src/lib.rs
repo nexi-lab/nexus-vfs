@@ -35,17 +35,25 @@ pub mod mailbox_stamping_policy;
 
 pub use foreign_containment::{install_foreign_agent_containment, ForeignAgentMailboxOnly};
 pub use mailbox_stamping_hook::MailboxStampingHook;
+// `is_mailbox_path` / `is_a2a_mailbox_path` are re-exported alongside the
+// address builders because they ARE the public contract, not internals: the
+// first is the stamp scope, the second is the entire allow-list a cross-org
+// caller is confined to (`foreign_containment`). A consumer deciding whether a
+// path is an A2A log must reach the same answer this crate does — re-exporting
+// them is what keeps a second, drifting copy from being written elsewhere.
 pub use mailbox_stamping_policy::{
-    agent_inbox_path, agent_state_path, MailboxEnvelope, A2A_INBOX_BASE, AGENT_STATE_SUFFIX,
-    CHAT_WITH_ME_SUFFIX, MAILBOX_IO_PROFILE, MAILBOX_STREAM_CAPACITY,
+    agent_conversation_link_path, agent_inbox_path, agent_state_path, conversation_id,
+    conversation_reader_path, conversation_transcript_path, is_a2a_mailbox_path,
+    is_conversation_reader_path, is_conversation_transcript_path, is_mailbox_path, MailboxEnvelope,
+    A2A_INBOX_BASE, AGENT_CONVERSATIONS_SEGMENT, AGENT_STATE_SUFFIX, CHAT_WITH_ME_SUFFIX,
+    CONVERSATIONS_BASE, MAILBOX_IO_PROFILE, MAILBOX_STREAM_CAPACITY, MAILBOX_WRITE_SUFFIXES,
+    REPLICATED_PREFIXES, TRANSCRIPT_LEAF,
 };
 
 use kernel::kernel::syscall::KernelSyscall;
 use kernel::kernel::Kernel;
 
-/// DT_STREAM entry-type discriminant for `sys_setattr` (mirrors
-/// `kernel::meta_store::DT_STREAM`, which is `u8`; the setattr arg is `i32`).
-const DT_STREAM: i32 = 4;
+use kernel::meta_store::{DT_DIR, DT_LINK, DT_STREAM};
 
 /// Provision `agent_name`'s persistent A2A inbox as a DT_STREAM, idempotently.
 ///
@@ -73,6 +81,155 @@ pub fn ensure_agent_state_stream<K: KernelSyscall>(
     ensure_mailbox_stream(kernel, &agent_state_path(agent_name))
 }
 
+/// Provision the 1:1 conversation between `agent_name` and `peer_name`,
+/// idempotently, and index it from BOTH participants' presences.
+///
+/// Creates the conversation's directory layer, its append-only transcript
+/// DT_STREAM, and a DT_LINK under each agent's `/agents/{name}/conversations/`
+/// chat list.
+///
+/// It deliberately does NOT create either side's reader register. A register
+/// carries the holder and lease of whoever is actually consuming, which only
+/// that process can fill in, so the consumer writes it on its first poll.
+/// Nothing is lost by the absence: "no register" reads as offset 0, which is
+/// exactly where a brand-new participant should start.
+///
+/// # Who calls this, and when
+///
+/// The SENDER, on send — NOT the agent host at mint. A cid is derived from a
+/// PAIR ([`conversation_id`]), and at mint an agent knows only its own name, so
+/// there is no conversation to provision yet. The sender knows both names,
+/// which is the part that matters: it materialises the conversation itself
+/// rather than depending on the recipient having run first.
+///
+/// That dependency is the defect this removes. A send to an agent that had
+/// never run used to fail `StreamNotFound`, which made "the receiver must be up
+/// BEFORE the peer sends" an operational rule that bit every cross-machine
+/// round; a receiver starting late then seeked to the tail and stepped over
+/// whatever had landed meanwhile. Now the first send materialises the
+/// conversation, and a late receiver still reads it from 0.
+///
+/// Idempotent throughout and safe to race: the cid is derived rather than
+/// allocated, so both hosts converge on the SAME conversation with no
+/// coordination — whichever arrives first creates it, and the other's
+/// `sys_setattr` is a matching no-op.
+pub fn ensure_conversation<K: KernelSyscall>(
+    kernel: &K,
+    agent_name: &str,
+    peer_name: &str,
+) -> Result<(), String> {
+    let cid = conversation_id(agent_name, peer_name);
+    let conversation_root = format!("{CONVERSATIONS_BASE}/{cid}");
+    let transcript = conversation_transcript_path(&cid);
+
+    // Steady-state exit: ONE `sys_stat` instead of the eleven `sys_setattr`
+    // round trips below. A sender calls this on every send, and every call
+    // below is individually idempotent — so without this check the hot path
+    // pays eleven syscalls per message to re-establish what the first send
+    // already built.
+    //
+    // The transcript is created LAST on purpose, which is what makes it a
+    // sound completion sentinel: if it exists, every directory and both
+    // chat-list links exist too. Creating it earlier (the obvious order, since
+    // it is the point of the conversation) would let a run interrupted between
+    // the stream and the links leave a transcript with no index, and this
+    // early return would then skip repairing it forever.
+    if kernel
+        .sys_stat(&transcript, contracts::ROOT_ZONE_ID)
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    // Dirent layer first — children attach below it. `setattr_create_link`
+    // validates the target and puts the row; it does NOT materialise parents.
+    // Without this the chat-list DT_LINK lands under a directory nothing can
+    // `readdir`, and the chat list is the entire point of the index. Same
+    // ordering `managed_agent::proc_entry` uses when it stamps `/proc`.
+    ensure_dir(kernel, CONVERSATIONS_BASE)?;
+    ensure_dir(kernel, &conversation_root)?;
+    ensure_dir(kernel, A2A_INBOX_BASE)?;
+
+    // Both participants get a chat-list entry. A conversation is not owned by
+    // whoever provisioned it, so indexing only the local agent would leave the
+    // peer unable to find it by listing.
+    for name in [agent_name, peer_name] {
+        ensure_dir(kernel, &format!("{A2A_INBOX_BASE}/{name}"))?;
+        ensure_dir(
+            kernel,
+            &format!("{A2A_INBOX_BASE}/{name}{AGENT_CONVERSATIONS_SEGMENT}"),
+        )?;
+        link_conversation(
+            kernel,
+            &agent_conversation_link_path(name, &cid),
+            &conversation_root,
+        )
+        .map_err(|e| format!("index conversation {cid} for {name}: {e}"))?;
+    }
+
+    // Last — see the completion-sentinel note above.
+    ensure_mailbox_stream(kernel, &transcript)
+}
+
+/// Create `path` as a DT_DIR, idempotently.
+///
+/// `setattr_create_dir` treats an existing DT_DIR — or a DT_MOUNT, which is
+/// directory-like — as a no-op, so this is safe to call on a federation mount
+/// point such as `/agents`.
+fn ensure_dir<K: KernelSyscall>(kernel: &K, path: &str) -> Result<(), String> {
+    metadata_setattr(kernel, path, DT_DIR, None).map_err(|e| format!("ensure dir {path}: {e}"))
+}
+
+/// Point `alias` at `target` as a DT_LINK (the chat-list index entry).
+fn link_conversation<K: KernelSyscall>(
+    kernel: &K,
+    alias: &str,
+    target: &str,
+) -> Result<(), String> {
+    metadata_setattr(kernel, alias, DT_LINK, Some(target))
+}
+
+/// The shared `sys_setattr` shape for a2a's metadata-only entries — 21
+/// positional arguments are worth naming once rather than at each call site,
+/// where a misplaced `None` is invisible.
+fn metadata_setattr<K: KernelSyscall>(
+    kernel: &K,
+    path: &str,
+    entry_type: u8,
+    link_target: Option<&str>,
+) -> Result<(), String> {
+    kernel
+        .sys_setattr(
+            path,
+            // `kernel::meta_store` types these as `u8`; the syscall arg is
+            // `i32`. Widening HERE keeps every call site spelling the named
+            // constant instead of an integer literal — which is exactly what
+            // those constants are `pub` for.
+            i32::from(entry_type),
+            /* backend_name */ "",
+            /* backend */ None,
+            /* metastore */ None,
+            /* raft_backend */ None,
+            /* io_profile */ "",
+            /* zone_id */ contracts::ROOT_ZONE_ID,
+            /* is_external */ false,
+            /* capacity */ 0,
+            /* read_fd */ None,
+            /* write_fd */ None,
+            /* mime_type */ None,
+            /* modified_at_ms */ None,
+            /* content_id */ None,
+            /* size */ None,
+            /* version */ None,
+            /* created_at_ms */ None,
+            link_target,
+            /* source */ None,
+            /* remote_metastore */ None,
+        )
+        .map(|_| ())
+        .map_err(|e| format!("{e:?}"))
+}
+
 /// Provision the `chat-with-me` mailbox at `path` as a DT_STREAM, idempotently.
 ///
 /// This is the ONE place that turns the a2a mailbox contract
@@ -98,7 +255,7 @@ pub fn ensure_mailbox_stream<K: KernelSyscall>(kernel: &K, path: &str) -> Result
     kernel
         .sys_setattr(
             path,
-            DT_STREAM,
+            i32::from(DT_STREAM),
             /* backend_name */ "",
             /* backend */ None,
             /* metastore */ None,
