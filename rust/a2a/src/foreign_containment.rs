@@ -26,7 +26,8 @@ use kernel::kernel::{Kernel, KernelError, OperationContext};
 use kernel::vfs_router::RouteResult;
 use kernel::{Permission, PermissionProvider};
 
-use crate::mailbox_stamping_policy::{is_a2a_mailbox_path, is_conversation_reader_path};
+use crate::addresses::is_conversation_reader_path;
+use crate::mailbox_stamping_policy::is_a2a_mailbox_path;
 
 /// Confines a foreign (cross-org) agent to the A2A message logs it
 /// participates in.
