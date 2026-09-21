@@ -47,3 +47,21 @@ test('the default margin is exported so callers need not guess it', () => {
   assert.equal(typeof BLOCKING_READ_DEADLINE_MARGIN_MS, 'number')
   assert.ok(BLOCKING_READ_DEADLINE_MARGIN_MS > 0)
 })
+
+test('a watch outlives connectTimeoutMs by its own timeout', async () => {
+  // `watch` is the same shape as a blocking read: it asks the daemon to hold
+  // the response until an event matches or the wait expires. Bounding it by
+  // the connect timeout would expire on the client first, and a caller that
+  // reads a throw as "the stream is gone" would tear down a healthy follower.
+  const client = new NexusVfsClient(UNREACHABLE, {
+    connectTimeoutMs: 100,
+    blockingReadMarginMs: 50,
+  })
+  const started = Date.now()
+  await assert.rejects(
+    client.watch('/agents/demo', '', { timeoutMs: 400 }),
+    /gRPC watch failed: DEADLINE_EXCEEDED: /,
+  )
+  const elapsed = Date.now() - started
+  assert.ok(elapsed > 300, `expired after ${elapsed}ms, expected the watch's own deadline`)
+})

@@ -99,6 +99,9 @@ interface UnaryClient {
   Mkdir: GrpcMethod<MkdirRequest, MkdirResponse>
   StreamReadAt: GrpcMethod<StreamReadAtRequest, StreamReadAtResponse>
   StreamWriteNowait: GrpcMethod<StreamWriteRequest, StreamWriteResponse>
+  Lock: GrpcMethod<LockRequest, LockResponse>
+  Unlock: GrpcMethod<UnlockRequest, UnlockResponse>
+  Watch: GrpcMethod<WatchRequest, WatchResponse>
   close(): void
 }
 
@@ -211,6 +214,41 @@ interface StreamReadAtResponse {
   is_error: boolean
   error_payload: Buffer
   timed_out: boolean
+}
+interface LockRequest {
+  path: string
+  auth_token: string
+  lock_id: string
+  timeout_ms: string
+}
+interface LockResponse {
+  acquired: boolean
+  lock_id: string
+  is_error: boolean
+  error_payload: Buffer
+}
+interface UnlockRequest {
+  path: string
+  auth_token: string
+  lock_id: string
+  force: boolean
+}
+interface UnlockResponse {
+  released: boolean
+  is_error: boolean
+  error_payload: Buffer
+}
+interface WatchRequest {
+  path: string
+  auth_token: string
+  timeout_ms: string
+}
+interface WatchResponse {
+  matched: boolean
+  path: string
+  event_type: string
+  is_error: boolean
+  error_payload: Buffer
 }
 interface StreamWriteRequest {
   path: string
@@ -542,6 +580,76 @@ export class NexusVfsClient {
       nextOffset: response.next_offset ?? offset,
       eof: response.eof ?? false,
       timedOut: response.timed_out ?? false,
+    }
+  }
+
+  /**
+   * Take the advisory lock on `path`. The kernel holds this path's lock as
+   * Exclusive with a single holder, and leases it for `timeoutMs`, so a holder
+   * that dies releases it without operator action.
+   *
+   * `acquired: false` is contention, not failure -- the caller backs off. Only
+   * a throw means the call itself failed.
+   */
+  async lock(
+    path: string,
+    authToken: string,
+    options: { lockId?: string; timeoutMs?: number } = {},
+  ): Promise<{ acquired: boolean; lockId: string }> {
+    const response = await this.unary<LockRequest, LockResponse>('Lock', 'lock', {
+      path,
+      auth_token: authToken,
+      lock_id: options.lockId ?? '',
+      timeout_ms: String(options.timeoutMs ?? 0),
+    })
+    if (response.is_error) throw vfsError(response.error_payload, 'lock')
+    return { acquired: response.acquired ?? false, lockId: response.lock_id ?? '' }
+  }
+
+  /** Release a lock taken by `lock`. `force` drops it without owning `lockId`. */
+  async unlock(
+    path: string,
+    authToken: string,
+    options: { lockId?: string; force?: boolean } = {},
+  ): Promise<boolean> {
+    const response = await this.unary<UnlockRequest, UnlockResponse>('Unlock', 'unlock', {
+      path,
+      auth_token: authToken,
+      lock_id: options.lockId ?? '',
+      force: options.force ?? false,
+    })
+    if (response.is_error) throw vfsError(response.error_payload, 'unlock')
+    return response.released ?? false
+  }
+
+  /**
+   * Block until a file event matches `path`, inotify-shaped.
+   *
+   * `matched: false` means the wait expired with no event -- re-issue at the
+   * same path to keep following. As with the blocking branch of
+   * `streamReadAt`, the RPC deadline must outlive the wait the daemon was just
+   * asked to hold, or the client expires first and a quiet-but-healthy watch
+   * reads as a failure.
+   */
+  async watch(
+    path: string,
+    authToken: string,
+    options: { timeoutMs?: number } = {},
+  ): Promise<{ matched: boolean; path: string; eventType: string }> {
+    const deadlineMs = options.timeoutMs
+      ? options.timeoutMs + this.blockingReadMarginMs
+      : undefined
+    const response = await this.unary<WatchRequest, WatchResponse>(
+      'Watch',
+      'watch',
+      { path, auth_token: authToken, timeout_ms: String(options.timeoutMs ?? 0) },
+      deadlineMs,
+    )
+    if (response.is_error) throw vfsError(response.error_payload, 'watch')
+    return {
+      matched: response.matched ?? false,
+      path: response.path ?? path,
+      eventType: response.event_type ?? '',
     }
   }
 
