@@ -200,16 +200,35 @@ pub fn conversation_reader_path(cid: &str, agent_name: &str) -> String {
     format!("{CONVERSATIONS_BASE}/{cid}{READERS_SEGMENT}{agent_name}")
 }
 
-/// `agent`'s DT_LINK to conversation `cid`
-/// (`/agents/{agent}/conversations/{cid}`) — the chat-list index entry.
+/// `agent`'s DT_LINK to its conversation with `peer`
+/// (`/agents/{agent}/conversations/{peer}`) — the chat-list index entry.
 ///
 /// A pointer, not the bytes: `readdir("/agents/{name}")` still lists that
 /// agent's presence, and `readdir("/agents/{name}/conversations")` is its chat
 /// list, while the conversation itself stays single-instance under
 /// [`CONVERSATIONS_BASE`] so both participants read and write the same log.
+///
+/// # Why the leaf is the PEER, not the cid
+///
+/// The cid is a BLAKE3 digest and therefore one-way: given
+/// `/agents/win-ai/conversations/<32 hex>` there is no way back to "this is my
+/// conversation with mac-ai". That breaks the index's whole purpose twice
+/// over. A receiver discovers which transcripts to tail by listing this
+/// directory, and with cid leaves it learns only that N conversations exist,
+/// not who they are with — so it cannot derive a single transcript path.
+/// And a human running `ls` sees a wall of hashes.
+///
+/// Keying by peer keeps the directory both machine- and human-readable, and
+/// costs nothing: the cid is recomputed from the pair on demand
+/// ([`conversation_id`]), which is exactly what makes it derivable rather than
+/// allocated.
+///
+/// Group conversations, when they arrive, key by their minted cid instead —
+/// unambiguous against this, since a 32-hex-char id cannot collide with an
+/// agent name.
 #[must_use]
-pub fn agent_conversation_link_path(agent_name: &str, cid: &str) -> String {
-    format!("{A2A_INBOX_BASE}/{agent_name}{AGENT_CONVERSATIONS_SEGMENT}/{cid}")
+pub fn agent_conversation_link_path(agent_name: &str, peer_name: &str) -> String {
+    format!("{A2A_INBOX_BASE}/{agent_name}{AGENT_CONVERSATIONS_SEGMENT}/{peer_name}")
 }
 
 /// Whether `path` is a conversation transcript
@@ -290,9 +309,19 @@ mod tests {
         );
         // The chat-list index lives under the agent's presence and points AT
         // the shared conversation — `readdir` on it is that agent's chat list.
+        //
+        // Keyed by the PEER, not the cid: a BLAKE3 digest is one-way, so a
+        // cid-named entry would tell a receiver that a conversation exists
+        // without telling it with whom — and it could then derive no transcript
+        // path at all. The cid is recomputed from the pair on demand.
         assert_eq!(
-            agent_conversation_link_path("win-ai", &cid),
-            format!("/agents/win-ai/conversations/{cid}")
+            agent_conversation_link_path("win-ai", "mac-ai"),
+            "/agents/win-ai/conversations/mac-ai"
+        );
+        assert_eq!(
+            agent_conversation_link_path("mac-ai", "win-ai"),
+            "/agents/mac-ai/conversations/win-ai",
+            "each side's entry names the other participant"
         );
         // Integration invariant, mirroring `agent_inbox_path_is_the_a2a_convention`:
         // what we provision MUST be what the gate recognises, or the

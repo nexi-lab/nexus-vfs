@@ -161,7 +161,12 @@ pub fn ensure_conversation<K: KernelSyscall>(
     // Both participants get a chat-list entry. A conversation is not owned by
     // whoever provisioned it, so indexing only the local agent would leave the
     // peer unable to find it by listing.
-    for name in [agent_name, peer_name] {
+    // PAIRED, not a single name: each side's chat-list entry is named after the
+    // OTHER participant. Iterating one name and reusing it for the leaf would
+    // file both links under their own owner's name, so every entry would read
+    // "my conversation with myself" and a receiver listing the directory would
+    // derive the wrong transcript.
+    for (name, peer) in [(agent_name, peer_name), (peer_name, agent_name)] {
         ensure_dir(kernel, &format!("{A2A_INBOX_BASE}/{name}"))?;
         ensure_dir(
             kernel,
@@ -169,7 +174,7 @@ pub fn ensure_conversation<K: KernelSyscall>(
         )?;
         link_conversation(
             kernel,
-            &agent_conversation_link_path(name, &cid),
+            &agent_conversation_link_path(name, peer),
             &conversation_root,
         )
         .map_err(|e| format!("index conversation {cid} for {name}: {e}"))?;

@@ -210,8 +210,15 @@ fn chat_list_entry_is_a_link_to_the_shared_conversation() {
     let cid = conversation_id("win-ai", "mac-ai");
     let expected_target = format!("{CONVERSATIONS_BASE}/{cid}");
 
-    for name in ["win-ai", "mac-ai"] {
-        let alias = agent_conversation_link_path(name, &cid);
+    // Each side's entry is named after the OTHER participant — that is what
+    // makes the directory listable into peers rather than into hashes.
+    for (name, peer) in [("win-ai", "mac-ai"), ("mac-ai", "win-ai")] {
+        let alias = agent_conversation_link_path(name, peer);
+        assert_eq!(
+            alias,
+            format!("/agents/{name}/conversations/{peer}"),
+            "the chat-list leaf must be the peer's name, not the cid"
+        );
         let meta = stat(&kernel, &alias);
         assert_eq!(
             meta.entry_type, DT_LINK,
@@ -231,18 +238,18 @@ fn chat_list_entry_is_a_link_to_the_shared_conversation() {
 /// find it by listing its own chat list.
 #[test]
 fn both_participants_are_indexed_whichever_side_provisions() {
-    let cid = conversation_id("win-ai", "mac-ai");
-
     // Provision from each side in turn; the peer's index must appear either way.
     for (caller, peer) in [("win-ai", "mac-ai"), ("mac-ai", "win-ai")] {
         let kernel = Kernel::new();
         ensure_conversation(&kernel, caller, peer).expect("provision conversation");
-        for name in [caller, peer] {
-            let alias = agent_conversation_link_path(name, &cid);
+        // Each participant's entry is named after the OTHER one, so the pair is
+        // walked in both directions rather than reusing a single name.
+        for (owner, other) in [(caller, peer), (peer, caller)] {
+            let alias = agent_conversation_link_path(owner, other);
             assert_eq!(
                 stat(&kernel, &alias).entry_type,
                 DT_LINK,
-                "provisioning from {caller} must still index {name}"
+                "provisioning from {caller} must still index {owner}'s conversation with {other}"
             );
         }
     }
