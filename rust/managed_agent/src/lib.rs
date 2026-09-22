@@ -387,7 +387,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
     /// Allocate a managed-agent session. Plants a fresh AgentRegistry
     /// record (`AgentRegistry::register` directly — no Python boundary)
     /// and returns the session identity tuple sudowork uses for
-    /// follow-up cancel / get_session calls and chat-with-me writes.
+    /// follow-up cancel / get_session calls.
     ///
     /// `session_id` and `agent_id` are the same value: the AgentRegistry
     /// pid.  No second identifier is allocated — the descriptor is the
@@ -476,7 +476,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
         // Two mutually-exclusive spawn strategies select on the request
         // shape (a session is one or the other), both fired right after
         // procfs is stamped so the first sys_read on
-        // `/proc/{pid}/chat-with-me` (or `/proc/{pid}/fd/*`) routes:
+        // `/proc/{pid}/transcript` (or `/proc/{pid}/fd/*`) routes:
         //
         //   * `spawn_spec` present → the RAW ACP subprocess control-plane
         //     path (frozen contract 2026-08-01). The injected `raw_spawn`
@@ -656,7 +656,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
     }
 
     /// Read-through liveness snapshot. Cheap by design; the live
-    /// message flow uses `sys_watch` over `/proc/{pid}/chat-with-me`,
+    /// message flow uses `sys_watch` over `/proc/{pid}/transcript`,
     /// not this RPC.
     pub(crate) fn get_session(
         &self,
@@ -691,7 +691,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
 impl ManagedAgentService<kernel::kernel::Kernel> {
     /// Install the service into a freshly-constructed kernel:
     ///
-    ///   1. Register the chat-with-me + workspace-boundary hooks into
+    ///   1. Register the workspace-boundary hook into
     ///      the kernel's `KernelDispatch`.
     ///   2. Enlist the service into `ServiceRegistry` so future tonic
     ///      gRPC handlers + Python factory wiring can resolve it via
@@ -788,7 +788,7 @@ impl ManagedAgentService<kernel::kernel::Kernel> {
         // the observer captures `Arc::clone(&svc.spawn_handles)`.
         // Removing the handle and aborting it is best-effort — the
         // worker thread also exits naturally when its sys_read on
-        // the now-missing chat-with-me path returns FileNotFound,
+        // the now-missing procfs path returns FileNotFound,
         // but the explicit abort gives a clean exit without an
         // error-path walk.
         let kernel_for_cb = Arc::clone(kernel);
@@ -828,7 +828,9 @@ impl ManagedAgentService<kernel::kernel::Kernel> {
             .expect("just enlisted managed_agent above; handle must exist");
         kernel.register_service_hook(
             &handle,
-            Box::new(workspace_boundary_hook::WorkspaceBoundaryHook::new()),
+            Box::new(workspace_boundary_hook::WorkspaceBoundaryHook::new(
+                Arc::clone(kernel.agent_registry()),
+            )),
         );
 
         Ok(svc_for_return)
