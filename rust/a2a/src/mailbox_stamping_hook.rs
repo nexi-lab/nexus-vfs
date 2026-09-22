@@ -103,9 +103,7 @@ impl NativeInterceptHook for MailboxStampingHook {
         // must not be rejected, and an ordinary file named `chat-with-me` is
         // not a mailbox. The stamp below still runs on those (via the broader
         // `maybe_stamp_chat_envelope`); only the *rejection* is A2A-scoped.
-        if self.fail_closed
-            && caller.is_none()
-            && mailbox_stamping_policy::is_a2a_mailbox_path(&c.path)
+        if self.fail_closed && caller.is_none() && mailbox_stamping_policy::is_mailbox_path(&c.path)
         {
             return Err(format!(
                 "fail-closed: A2A mailbox write to {} requires an authenticated \
@@ -142,25 +140,31 @@ mod tests {
         })
     }
 
-    /// The hook must claim BOTH leaves for the duration of the rename.
+    /// The hook must claim the leaf every writer uses.
     ///
     /// A path the hook does not claim is never cloned into `WriteHookCtx`, so
     /// the stamp never runs on it and `from` is whatever the writer typed —
-    /// with no compile error and no runtime error to notice. Dropping the
-    /// legacy leaf before every writer has moved is therefore a silent loss of
-    /// the identity guarantee, which is why this is pinned rather than left to
-    /// the suffix constant alone.
+    /// with no compile error and no runtime error to notice. Dropping a leaf
+    /// before every writer has moved off it is therefore a silent loss of the
+    /// identity guarantee, which is why this is pinned rather than left to the
+    /// suffix constant alone.
+    /// A transcript path to write to. Built through the address SSOT rather
+    /// than spelled out, so a change to the layout reaches these tests.
+    fn transcript(a: &str, b: &str) -> String {
+        crate::addresses::conversation_transcript_path(&crate::addresses::conversation_id(a, b))
+    }
+
     #[test]
-    fn declares_both_leaves_for_the_rename_window() {
+    fn declares_the_transcript_leaf() {
         let h = MailboxStampingHook::new();
-        assert_eq!(h.mutating_path_suffixes(), ["/transcript", "/chat-with-me"]);
+        assert_eq!(h.mutating_path_suffixes(), ["/transcript"]);
     }
 
     #[test]
     fn replaces_envelope_when_chat_path_with_real_content() {
         let h = MailboxStampingHook::new();
         let ctx = write_ctx(
-            "/proc/p1/chat-with-me",
+            &transcript("agent-real", "agent-b"),
             "agent-real",
             br#"{"to":"agent-b","body":"hi"}"#.to_vec(),
         );
@@ -180,7 +184,7 @@ mod tests {
         // mutating hook's suffix and skip cloning for ours. We must
         // not blow up — empty content means "not for us".
         let h = MailboxStampingHook::new();
-        let ctx = write_ctx("/proc/p1/chat-with-me", "agent-a", Vec::new());
+        let ctx = write_ctx(&transcript("agent-a", "agent-b"), "agent-a", Vec::new());
         let outcome = h.on_pre(&ctx).unwrap();
         assert!(matches!(outcome, HookOutcome::Pass));
     }
@@ -188,7 +192,11 @@ mod tests {
     #[test]
     fn passes_when_caller_agent_id_empty() {
         let h = MailboxStampingHook::new();
-        let ctx = write_ctx("/proc/p1/chat-with-me", "", br#"{"to":"agent-b"}"#.to_vec());
+        let ctx = write_ctx(
+            &transcript("agent-a", "agent-b"),
+            "",
+            br#"{"to":"agent-b"}"#.to_vec(),
+        );
         let outcome = h.on_pre(&ctx).unwrap();
         assert!(matches!(outcome, HookOutcome::Pass));
     }
@@ -197,7 +205,7 @@ mod tests {
     fn passes_for_non_write_contexts() {
         let h = MailboxStampingHook::new();
         let ctx = HookContext::Read(ReadHookCtx {
-            path: "/proc/p1/chat-with-me".to_string(),
+            path: transcript("agent-a", "agent-b"),
             identity: HookIdentity {
                 user_id: "user".to_string(),
                 zone_id: "root".to_string(),
@@ -228,12 +236,12 @@ mod tests {
 
     #[test]
     fn fail_closed_rejects_empty_agent_id_a2a_mailbox_write() {
-        // Auth-armed posture: an A2A mailbox write (`/agents/…/chat-with-me`)
-        // with no caller agent_id is rejected (Err aborts the write) so `from`
-        // cannot be forged by an unauthenticated writer.
+        // Auth-armed posture: a message-log write with no caller agent_id is
+        // rejected (Err aborts the write) so `from` cannot be forged by an
+        // unauthenticated writer.
         let h = MailboxStampingHook::new_fail_closed(true);
         let ctx = write_ctx(
-            "/agents/win-ai/chat-with-me",
+            &transcript("win-ai", "mac-ai"),
             "",
             br#"{"to":"mac-ai"}"#.to_vec(),
         );
@@ -247,7 +255,7 @@ mod tests {
     fn fail_closed_still_stamps_authenticated_a2a_write() {
         let h = MailboxStampingHook::new_fail_closed(true);
         let ctx = write_ctx(
-            "/agents/mac-ai/chat-with-me",
+            &transcript("win-ai", "mac-ai"),
             "win-ai",
             br#"{"from":"impostor","to":"mac-ai"}"#.to_vec(),
         );
@@ -261,28 +269,9 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_does_not_reject_local_proc_pipe() {
-        // Scope boundary: fail-closed is for the A2A CROSS-MACHINE mailbox
-        // (`/agents/…`). The local managed-agent pipe `/proc/{pid}/chat-with-me`
-        // legitimately uses a system/bare ctx (empty agent_id) and must NOT be
-        // rejected — otherwise fail-closed under auth would break the local
-        // managed-agent loop. The stamp still runs on it (via the broad
-        // predicate); only the rejection is A2A-scoped.
-        let h = MailboxStampingHook::new_fail_closed(true);
-        let ctx = write_ctx("/proc/p1/chat-with-me", "", br#"{"to":"agent-b"}"#.to_vec());
-        assert!(
-            matches!(
-                h.on_pre(&ctx).expect("local proc pipe write accepted"),
-                HookOutcome::Pass
-            ),
-            "fail-closed must not reject the local /proc managed-agent pipe"
-        );
-    }
-
-    #[test]
     fn fail_closed_does_not_reject_non_mailbox_write() {
-        // A non-chat-with-me write with an empty agent_id must pass, never be
-        // caught by the identity gate.
+        // A write that is not a message log, with an empty agent_id, must
+        // pass — never be caught by the identity gate.
         let h = MailboxStampingHook::new_fail_closed(true);
         let ctx = write_ctx("/workspace/notes.md", "", br#"{"to":"agent-b"}"#.to_vec());
         assert!(

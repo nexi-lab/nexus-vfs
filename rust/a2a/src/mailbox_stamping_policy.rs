@@ -27,21 +27,19 @@ use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
 
-use crate::addresses::{is_conversation_transcript_path, CHAT_WITH_ME_SUFFIX, TRANSCRIPT_LEAF};
+use crate::addresses::{is_conversation_transcript_path, TRANSCRIPT_LEAF};
 
-/// Write-content suffixes the A2A stamp hook claims, newest first.
+/// Write-content suffixes the A2A stamp hook claims.
 ///
-/// TWO entries for the duration of the rename, and that is the whole reason
-/// `NativeInterceptHook::mutating_path_suffixes` returns a slice. The writers
-/// live in the sudocode repo, which pins THIS repo by revision, so the new leaf
-/// cannot appear on both sides at once: this repo must honour the new path
-/// BEFORE sudocode may write it, and must keep honouring the old one until the
-/// release chain (nexus-vfs tag → sudocode pin → nexus assembly tag) has
-/// carried the change to every writer. Dropping `CHAT_WITH_ME_SUFFIX` early
-/// un-stamps every in-flight writer SILENTLY — no compile error, no runtime
-/// error, just a forgeable `from`. Delete it only once no supported consumer
-/// writes the old path.
-pub const MAILBOX_WRITE_SUFFIXES: &[&str] = &[TRANSCRIPT_LEAF, CHAT_WITH_ME_SUFFIX];
+/// A slice, not a single value, because a rename here spans repos: the writers
+/// live in sudocode, which pins THIS repo by revision, so a new leaf must be
+/// honoured here BEFORE sudocode may write it and the old one must keep being
+/// honoured until the release chain (nexus-vfs tag → sudocode pin → nexus
+/// assembly tag) has carried the change to every writer. Dropping a suffix
+/// early un-stamps its writers SILENTLY — no compile error, no runtime error,
+/// just a forgeable `from` — so a suffix leaves this list only once no
+/// supported consumer writes it.
+pub const MAILBOX_WRITE_SUFFIXES: &[&str] = &[TRANSCRIPT_LEAF];
 
 /// The canonical A2A mailbox message schema — the content format written to
 /// (and read from) any A2A message log. This is the SSOT for the
@@ -88,56 +86,34 @@ impl MailboxEnvelope {
     }
 }
 
-/// The node-local managed-agent mailbox prefix — `/proc/{pid}/chat-with-me` (a
-/// DT_STREAM provisioned by `managed_agent::proc_entry` via
-/// [`crate::ensure_mailbox_stream`], scoped to the pid's own node). It shares
-/// the `/chat-with-me` suffix with the persistent A2A inbox but is exempt from
-/// the *cross-machine* fail-closed identity gate. `/proc` is a stable kernel
-/// convention for the process tree, not an operator-set mount.
-const NODE_LOCAL_MAILBOX_PREFIX: &str = "/proc/";
-
 /// Whether `path` is an A2A message log — a conversation transcript
-/// (`…/conversations/<cid>/transcript`) or, for the duration of the rename, a
-/// legacy `*/chat-with-me` mailbox.
+/// (`…/conversations/<cid>/transcript`).
 ///
-/// This is the **stamp** scope: the `from`-guarantee applies to every
-/// mailbox-shaped write, including the local managed-agent pipe
-/// (`/proc/{pid}/chat-with-me`) it was originally built for. Used by
-/// [`maybe_stamp_chat_envelope`].
+/// ONE predicate, for both the stamp and the fail-closed gate. There used to be
+/// two: the node-local `/proc/{pid}/chat-with-me` pipe was stamped but never
+/// *rejected*, because an unauthenticated write to it could not reach another
+/// machine. That pipe is gone, every message log is replicated, and a
+/// distinction with nothing left on one side of it is a trap — the next reader
+/// has to work out that the two are coextensive before trusting either.
 ///
-/// Both shapes are accepted because the rename spans repos — see
-/// [`MAILBOX_WRITE_SUFFIXES`] for why the window exists and when the legacy arm
-/// may be deleted. The two predicates and the hook's declared suffixes MUST
-/// stay in agreement: a path the hook does not claim is never cloned, so the
-/// stamp never runs on it and `from` becomes whatever the writer typed.
-pub fn is_mailbox_path(path: &str) -> bool {
-    is_conversation_transcript_path(path) || path.ends_with(CHAT_WITH_ME_SUFFIX)
-}
-
-/// Whether `path` is a *cross-machine* mailbox subject to fail-closed.
+/// It MUST stay in agreement with the hook's declared suffixes
+/// ([`MAILBOX_WRITE_SUFFIXES`]): a path the hook does not claim is never
+/// cloned, so the stamp never runs on it and `from` becomes whatever the writer
+/// typed.
 ///
-/// The **fail-closed** scope, narrower than [`is_mailbox_path`]: rejecting an
-/// unauthenticated write is a security requirement for a mailbox whose writes
-/// reach other machines (untrusted remote peers). It must NOT catch the local
-/// managed-agent pipe (`/proc/{pid}/chat-with-me`), which legitimately uses a
-/// system/bare ctx and is not replicated. The stamp still runs on the local
-/// pipe via [`is_mailbox_path`] — it is just never *rejected*.
+/// FAIL-SAFE and mount-independent by construction. Deliberately NOT keyed off
+/// the A2A mount point (`/agents`, operator-configurable via
+/// `NEXUS_FEDERATION_MOUNTS`) — keying on the mount would fail UNSAFE, silently
+/// skipping the gate for a log under a differently-named mount. Over-including
+/// an oddly-placed non-mailbox file is the safe direction for a security gate.
 ///
-/// FAIL-SAFE + mount-independent by construction: every A2A message log EXCEPT
-/// the node-local `/proc/` pipe. Deliberately NOT keyed off the A2A mount point
-/// (`/agents`, operator-configurable via `NEXUS_FEDERATION_MOUNTS`) — keying on
-/// the mount would fail UNSAFE, silently skipping the gate for a log under a
-/// differently-named mount. Excluding the one stable node-local convention
-/// instead gates a replicated log wherever it is mounted. (Over-including an
-/// oddly-placed non-mailbox file is the safe direction for a security gate.)
-///
-/// This is ALSO the entire allow-list `crate::foreign_containment` confines a
+/// This is ALSO the entire allow-list [`crate::foreign_containment`] confines a
 /// cross-org caller to, which is why [`is_conversation_transcript_path`] tests
 /// for the `/conversations/` segment rather than the `/transcript` leaf alone:
 /// a bare leaf test would hand a foreign agent every path in the tree that
 /// happens to end that way.
-pub fn is_a2a_mailbox_path(path: &str) -> bool {
-    is_mailbox_path(path) && !path.starts_with(NODE_LOCAL_MAILBOX_PREFIX)
+pub fn is_mailbox_path(path: &str) -> bool {
+    is_conversation_transcript_path(path)
 }
 
 /// Rewrite the envelope's `from` field to the caller's `agent_id` when
@@ -245,10 +221,10 @@ mod tests {
     }
 
     #[test]
-    fn stamps_from_field_on_chat_with_me_write() {
+    fn stamps_from_field_on_transcript_write() {
         let original = br#"{"to":"agent-b","body":"hi"}"#;
-        let out =
-            maybe_stamp_chat_envelope("/proc/p1/chat-with-me", Some("agent-a"), original).unwrap();
+        let path = conversation_transcript_path(&conversation_id("agent-a", "agent-b"));
+        let out = maybe_stamp_chat_envelope(&path, Some("agent-a"), original).unwrap();
         let v = parse(&out);
         assert_eq!(v["from"], "agent-a");
         assert_eq!(v["to"], "agent-b");
@@ -259,12 +235,8 @@ mod tests {
     fn overwrites_caller_supplied_from_field() {
         // LLM tries to spoof a from field; the kernel overwrites it.
         let original = br#"{"from":"agent-fake","to":"agent-b","body":"x"}"#;
-        let out = maybe_stamp_chat_envelope(
-            "/proc/p1/workspace/chat-with-me",
-            Some("agent-real"),
-            original,
-        )
-        .unwrap();
+        let path = conversation_transcript_path(&conversation_id("agent-real", "agent-b"));
+        let out = maybe_stamp_chat_envelope(&path, Some("agent-real"), original).unwrap();
         let v = parse(&out);
         assert_eq!(v["from"], "agent-real");
     }
@@ -323,53 +295,40 @@ mod tests {
         assert!(out.is_none());
     }
 
+    /// What the predicate admits, and what it must refuse.
+    ///
+    /// One predicate now drives both the stamp and the fail-closed gate, so
+    /// every path it admits is one an unauthenticated write is REJECTED on.
+    /// Widening it is therefore not a cosmetic change.
     #[test]
-    fn mailbox_predicate_scopes() {
-        // Stamp scope (broad): any `*/chat-with-me`, incl. the local pipe.
-        assert!(is_mailbox_path("/agents/win-ai/chat-with-me"));
-        assert!(is_mailbox_path("/proc/p1/chat-with-me"));
-        assert!(!is_mailbox_path("/workspace/notes.md"));
-
-        // Fail-closed scope: any mailbox EXCEPT the node-local /proc pipe.
-        assert!(is_a2a_mailbox_path("/agents/win-ai/chat-with-me"));
-        assert!(
-            !is_a2a_mailbox_path("/proc/p1/chat-with-me"),
-            "the node-local managed-agent pipe is exempt from the gate"
-        );
-        assert!(
-            !is_a2a_mailbox_path("/agents/win-ai/notes.txt"),
-            "a non-chat-with-me file is never a mailbox"
-        );
-        // Mount-independent: a mailbox under a DIFFERENTLY-named federation
-        // mount is still gated (keying off `/agents` would fail unsafe).
-        assert!(
-            is_a2a_mailbox_path("/team-mailboxes/win-ai/chat-with-me"),
-            "fail-safe: a mailbox under any mount is gated, not just /agents"
-        );
-    }
-
-    /// A conversation transcript is a mailbox on both scopes, wherever mounted.
-    #[test]
-    fn conversation_transcript_is_a_mailbox_on_both_scopes() {
+    fn mailbox_predicate_scope() {
         let cid = conversation_id("win-ai", "mac-ai");
         let transcript = conversation_transcript_path(&cid);
-
         assert!(is_mailbox_path(&transcript), "{transcript}");
-        assert!(is_a2a_mailbox_path(&transcript), "{transcript}");
-        // Mount-independent, same as the legacy shape.
-        assert!(is_a2a_mailbox_path(&format!(
-            "/zone-x/conversations/{cid}/transcript"
-        )));
+
+        // Mount-independent: the A2A mount point is operator-configurable, so
+        // keying on `/agents` would fail UNSAFE — a log under a differently
+        // named mount would silently skip the gate.
+        assert!(
+            is_mailbox_path(&format!("/zone-x/conversations/{cid}/transcript")),
+            "a transcript under any mount is gated, not just the default one"
+        );
+
+        assert!(!is_mailbox_path("/workspace/notes.md"));
+        assert!(
+            !is_mailbox_path("/agents/win-ai/notes.txt"),
+            "an ordinary file under the agent presence is not a message log"
+        );
     }
 
     /// The `/conversations/` segment is load-bearing, not decoration.
     ///
-    /// `is_a2a_mailbox_path` is the ENTIRE allow-list a cross-org caller is
-    /// confined to (`crate::foreign_containment`). The legacy `/chat-with-me`
-    /// leaf was safe as a bare suffix because nothing else in the tree is named
-    /// that; `/transcript` is not — a session transcript, an audit transcript,
-    /// anything a user names that way would land inside a foreign agent's
-    /// reach. So the predicate is structural, and this pins it.
+    /// [`is_mailbox_path`] is the ENTIRE allow-list a cross-org caller is
+    /// confined to (`crate::foreign_containment`), and `/transcript` is not a
+    /// leaf that is safe to test for on its own — a session transcript, an
+    /// audit transcript, anything a user names that way would land inside a
+    /// foreign agent's reach. So the predicate is structural, and this pins
+    /// it.
     #[test]
     fn a_bare_transcript_leaf_is_not_a_mailbox() {
         for path in [
@@ -381,14 +340,13 @@ mod tests {
                 !is_mailbox_path(path),
                 "{path} must NOT be a mailbox — it carries no /conversations/ segment"
             );
-            assert!(!is_a2a_mailbox_path(path), "{path}");
         }
     }
 
     /// A reader register is readable by a peer but must never be WRITABLE by a
     /// foreign one, so it must fall OUTSIDE the mailbox predicates.
     ///
-    /// `is_a2a_mailbox_path` grants a cross-org caller read AND write. Moving
+    /// [`is_mailbox_path`] grants a cross-org caller read AND write. Moving
     /// someone else's read position steps over their inbound messages with no
     /// error, no trace, and the sender still told "delivered" — so the register
     /// gets its own predicate, admitted for reads only.
@@ -399,10 +357,9 @@ mod tests {
 
         assert!(is_conversation_reader_path(&reader), "{reader}");
         assert!(
-            !is_a2a_mailbox_path(&reader),
+            !is_mailbox_path(&reader),
             "a reader register must not be inside the foreign agent's write scope: {reader}"
         );
-        assert!(!is_mailbox_path(&reader), "{reader}");
         // And a transcript is not a reader register.
         assert!(!is_conversation_reader_path(&conversation_transcript_path(
             &cid

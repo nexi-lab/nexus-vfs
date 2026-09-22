@@ -44,9 +44,8 @@ pub use mailbox_stamping_hook::MailboxStampingHook;
 pub use addresses::{
     agent_conversation_link_path, agent_state_path, conversation_id, conversation_reader_path,
     conversation_transcript_path, is_conversation_reader_path, is_conversation_transcript_path,
-    A2A_INBOX_BASE, AGENT_CONVERSATIONS_SEGMENT, AGENT_STATE_SUFFIX, CHAT_WITH_ME_SUFFIX,
-    CONVERSATIONS_BASE, MAILBOX_IO_PROFILE, MAILBOX_STREAM_CAPACITY, REPLICATED_PREFIXES,
-    TRANSCRIPT_LEAF,
+    A2A_INBOX_BASE, AGENT_CONVERSATIONS_SEGMENT, AGENT_STATE_SUFFIX, CONVERSATIONS_BASE,
+    MAILBOX_IO_PROFILE, MAILBOX_STREAM_CAPACITY, REPLICATED_PREFIXES, TRANSCRIPT_LEAF,
 };
 // `is_mailbox_path` / `is_a2a_mailbox_path` are re-exported because they ARE
 // the public contract, not internals: the first is the stamp scope, the second
@@ -54,9 +53,7 @@ pub use addresses::{
 // (`foreign_containment`). A consumer deciding whether a path is an A2A log
 // must reach the same answer this crate does — re-exporting them is what keeps
 // a second, drifting copy from being written elsewhere.
-pub use mailbox_stamping_policy::{
-    is_a2a_mailbox_path, is_mailbox_path, MailboxEnvelope, MAILBOX_WRITE_SUFFIXES,
-};
+pub use mailbox_stamping_policy::{is_mailbox_path, MailboxEnvelope, MAILBOX_WRITE_SUFFIXES};
 
 use kernel::kernel::syscall::KernelSyscall;
 use kernel::kernel::{Kernel, OperationContext};

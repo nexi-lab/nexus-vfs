@@ -10,7 +10,7 @@
 
 use a2a::{
     agent_conversation_link_path, conversation_id, conversation_reader_path,
-    conversation_transcript_path, ensure_conversation, is_a2a_mailbox_path, CONVERSATIONS_BASE,
+    conversation_transcript_path, ensure_conversation, is_mailbox_path, CONVERSATIONS_BASE,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -294,7 +294,7 @@ fn transcript_is_a_stream_the_gate_recognises() {
         "{transcript} must be a DT_STREAM — an append-only log, not a plain file"
     );
     assert!(
-        is_a2a_mailbox_path(&transcript),
+        is_mailbox_path(&transcript),
         "the path we provision must be admitted by the fail-closed gate: {transcript}"
     );
 }

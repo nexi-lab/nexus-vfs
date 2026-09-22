@@ -1,5 +1,5 @@
 //! `ManagedAgentService` — Rust-flavoured service that owns the
-//! managed-agent surface: the chat-with-me + workspace hooks plus the
+//! managed-agent surface: the stamping + workspace hooks plus the
 //! session lifecycle behind the `proto/nexus/grpc/managed_agent` gRPC
 //! contract.
 //!
@@ -17,7 +17,7 @@
 //!     `KernelDispatch` so every cross-owner `/proc/{pid}/workspace/`
 //!     write is rejected. The mailbox `from`-stamp hook now lives in the
 //!     `a2a` messaging substrate (nexus-vfs), armed once at cluster boot
-//!     — every `*/chat-with-me` write is stamped there, for all writers.
+//!     — every message-log write is stamped there, for all writers.
 //!   * On `enlist_rust`, take the place in the registry that
 //!     `nx.service("managed_agent")` resolves to (Python lookup
 //!     returns None — this service is reachable from Rust callers via
@@ -1350,16 +1350,11 @@ mod tests {
         }
 
         #[test]
-        fn start_session_stamps_workspace_dirent_and_chat_with_me_link() {
+        fn start_session_stamps_the_workspace_dirent() {
             let (kernel, svc) = svc_with_kernel();
             let resp = svc.start_session(req("scode-standard")).unwrap();
 
             assert!(dir_exists(&kernel, &resp.workspace_path));
-            let cwm = format!("{}chat-with-me", resp.workspace_path);
-            assert_eq!(
-                link_target_at(&kernel, &cwm).as_deref(),
-                Some(format!("/proc/{}/chat-with-me", resp.session_id).as_str()),
-            );
         }
 
         #[test]
@@ -1428,11 +1423,9 @@ mod tests {
             let (kernel, svc) = svc_with_kernel();
             let resp = svc.start_session(req("scode-standard")).unwrap();
             svc.cancel(&resp.session_id, CancelMode::Turn).unwrap();
-            assert!(dir_exists(&kernel, &resp.workspace_path));
-            let cwm = format!("{}chat-with-me", resp.workspace_path);
             assert!(
-                link_target_at(&kernel, &cwm).is_some(),
-                "chat-with-me DT_LINK should survive turn cancel",
+                dir_exists(&kernel, &resp.workspace_path),
+                "the workspace subtree should survive turn cancel",
             );
         }
 
@@ -1477,176 +1470,6 @@ mod tests {
                 .signal(&resp.session_id, AgentSignal::Sigterm, None)
                 .expect("SIGTERM");
             assert!(!dir_exists(&kernel, &resp.workspace_path));
-            let cwm = format!("{}chat-with-me", resp.workspace_path);
-            assert!(!entry_exists(&kernel, &cwm));
-        }
-
-        /// Register `/proc` as a route entry on the kernel's
-        /// VFSRouter. The mount carries no per-mount backend or
-        /// metastore — `Kernel::with_metastore` falls back to the
-        /// global metastore on miss, which is where sys_setattr's
-        /// DT_DIR / DT_STREAM / DT_LINK writes land for these paths.
-        /// Without this, `sys_read` / `sys_write` against any
-        /// `/proc/*` path errors at `vfs_router.route()` before ever
-        /// consulting the metastore.
-        fn mount_proc(kernel: &Kernel) {
-            kernel
-                .vfs_router_arc()
-                .add_mount("/proc", "root", None, false);
-        }
-
-        /// End-to-end cross-link: write through the workspace shortcut
-        /// DT_LINK lands in the canonical chat-with-me DT_STREAM;
-        /// reading the canonical path returns the bytes. Validates
-        /// VFSRouter follows DT_LINK transparently for sys_write +
-        /// sys_read — the load-bearing assumption behind dropping
-        /// ProcWorkspaceResolver in favour of plain metastore DT_LINK
-        /// rows.
-        #[test]
-        fn workspace_shortcut_write_lands_in_canonical_chat_with_me_stream() {
-            use kernel::kernel::OperationContext;
-
-            let kernel = Arc::new(Kernel::new());
-            mount_proc(&kernel);
-            let svc = install_managed_agent(&kernel);
-            let resp = svc.start_session(req("scode-standard")).unwrap();
-
-            let shortcut = format!("{}chat-with-me", resp.workspace_path);
-            let canonical = format!("/proc/{}/chat-with-me", resp.session_id);
-            // Pre-stamp the envelope's `from` field with the caller's
-            // agent_id so MailboxStampingHook's rewrite is a no-op for
-            // this test — keeps the assertion focused on "bytes
-            // followed the DT_LINK to the canonical stream" without
-            // coupling to the stamping policy.  The MailboxStamping
-            // e2e companion exercises the rewrite path explicitly.
-            let payload = br#"{"from":"scode-standard","to":"human-ethan","body":"ping"}"#;
-
-            let ctx = OperationContext {
-                user_id: "ethan".into(),
-                zone_id: "root".into(),
-                is_admin: false,
-                agent_id: Some("scode-standard".into()),
-                is_system: false,
-                groups: vec![],
-                admin_capabilities: vec![],
-                subject_type: "user".into(),
-                subject_id: None,
-                request_id: "req-cross-link".into(),
-                trust_domain: None,
-                context_zone_id: None,
-                zone_perms: vec![],
-                propagates_cross_node: false,
-            };
-
-            // Use UFCS through KernelSyscall so we get the single-path
-            // trait wrappers (sys_read_single / sys_write_with_link_depth)
-            // — the inherent Kernel::sys_read/sys_write are now batch-shaped
-            // (&[ReadRequest] / &[WriteRequest]).
-            KernelSyscall::sys_write(kernel.as_ref(), &shortcut, &ctx, payload, 0)
-                .expect("sys_write through workspace shortcut DT_LINK");
-
-            let read = KernelSyscall::sys_read(
-                kernel.as_ref(),
-                &canonical,
-                &ctx,
-                /* timeout_ms */ 0,
-                0,
-            )
-            .expect("sys_read on canonical chat-with-me");
-            let bytes = read.data.expect("stream data present after write");
-            assert_eq!(bytes.as_slice(), payload);
-        }
-
-        /// MailboxStampingHook end-to-end: a sys_write through the
-        /// workspace shortcut DT_LINK runs through the registered hook,
-        /// which rewrites the envelope's `from` field to match
-        /// `OperationContext.agent_id`. Reading the canonical stream
-        /// returns the stamped envelope, not the LLM-authored one.
-        /// Validates dispatch_native_pre_with_replacement is wired
-        /// through sys_write_with_link_depth's EXECUTE phase.
-        #[test]
-        fn mailbox_stamping_hook_rewrites_envelope_through_link_path() {
-            use kernel::kernel::OperationContext;
-
-            let kernel = Arc::new(Kernel::new());
-            mount_proc(&kernel);
-            let svc = install_managed_agent(&kernel);
-            // The stamp hook now lives in the a2a substrate (armed at
-            // cluster boot in production). Arm it here so this test still
-            // exercises managed_agent's DT_LINK shortcut routing THROUGH
-            // the stamp hook end-to-end.
-            let a2a_handle = kernel
-                .enlist_hook_only_service("a2a")
-                .expect("enlist a2a hook-only service");
-            kernel.register_service_hook(&a2a_handle, Box::new(a2a::MailboxStampingHook::new()));
-            let resp = svc.start_session(req("scode-standard")).unwrap();
-
-            let shortcut = format!("{}chat-with-me", resp.workspace_path);
-            let canonical = format!("/proc/{}/chat-with-me", resp.session_id);
-            // LLM-authored envelope claims to be from "scode-standard"
-            // but the real caller is human-ethan; the hook should
-            // rewrite the `from` field.
-            let llm_authored =
-                br#"{"from":"scode-standard","to":"human-ethan","body":"hi"}"#.to_vec();
-
-            let ctx = OperationContext {
-                user_id: "ethan".into(),
-                zone_id: "root".into(),
-                is_admin: false,
-                agent_id: Some("human-ethan".into()),
-                is_system: false,
-                groups: vec![],
-                admin_capabilities: vec![],
-                subject_type: "user".into(),
-                subject_id: None,
-                request_id: "req-stamp".into(),
-                trust_domain: None,
-                context_zone_id: None,
-                zone_perms: vec![],
-                propagates_cross_node: false,
-            };
-
-            KernelSyscall::sys_write(kernel.as_ref(), &shortcut, &ctx, &llm_authored, 0)
-                .expect("sys_write through workspace shortcut DT_LINK");
-
-            let read = KernelSyscall::sys_read(kernel.as_ref(), &canonical, &ctx, 0, 0)
-                .expect("sys_read on canonical chat-with-me");
-            let bytes = read.data.expect("stream data present");
-            let json: serde_json::Value =
-                serde_json::from_slice(&bytes).expect("envelope is valid JSON");
-            assert_eq!(
-                json.get("from").and_then(|v| v.as_str()),
-                Some("human-ethan"),
-                "MailboxStampingHook should overwrite from-field with caller agent_id",
-            );
-        }
-
-        /// Companion structural assertion — keeps the metastore-level
-        /// invariant explicit even if the e2e write/read above is ever
-        /// skipped on a CI matrix that can't satisfy the route().
-        #[test]
-        fn workspace_shortcut_link_targets_canonical_chat_with_me_stream() {
-            let (kernel, svc) = svc_with_kernel();
-            let resp = svc.start_session(req("scode-standard")).unwrap();
-            let shortcut = format!("{}chat-with-me", resp.workspace_path);
-            let canonical = format!("/proc/{}/chat-with-me", resp.session_id);
-
-            // Workspace shortcut is a DT_LINK whose target is the
-            // canonical path.
-            let shortcut_meta = kernel
-                .sys_stat(&shortcut, ROOT_ZONE_ID)
-                .expect("workspace shortcut entry present");
-            assert_eq!(shortcut_meta.entry_type, DT_LINK);
-            assert_eq!(
-                shortcut_meta.link_target.as_deref(),
-                Some(canonical.as_str())
-            );
-
-            // Canonical path holds the DT_STREAM the link points at.
-            let canonical_meta = kernel
-                .sys_stat(&canonical, ROOT_ZONE_ID)
-                .expect("canonical chat-with-me entry present");
-            assert_eq!(canonical_meta.entry_type, DT_STREAM);
         }
 
         #[test]

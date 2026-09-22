@@ -1,5 +1,5 @@
 //! `install_a2a_stamp_hook` registers the `from`-stamp hook so a
-//! `chat-with-me` write is rewritten through the exact
+//! transcript write is rewritten through the exact
 //! `dispatch_native_pre_with_replacement` seam `sys_write` uses.
 //!
 //! The cross-machine stream-wakeup (a replicated `AppendStreamEntry`
@@ -9,13 +9,13 @@
 
 use std::sync::Arc;
 
-use a2a::install_a2a_stamp_hook;
+use a2a::{conversation_id, conversation_transcript_path, install_a2a_stamp_hook};
 use kernel::core::dispatch::{HookContext, HookIdentity, WriteHookCtx};
 use kernel::kernel::{Kernel, OperationContext};
 
 fn write_ctx(agent_id: &str, content: &[u8]) -> HookContext {
     HookContext::Write(WriteHookCtx {
-        path: "/agents/win-ai/chat-with-me".to_string(),
+        path: conversation_transcript_path(&conversation_id("win-ai", "mac-ai")),
         identity: HookIdentity {
             user_id: "operator".to_string(),
             zone_id: "root".to_string(),
@@ -35,7 +35,7 @@ fn stamps_from_through_dispatch_after_install() {
     let kernel = Arc::new(Kernel::new());
     install_a2a_stamp_hook(&kernel, /* fail_closed */ false).expect("install a2a stamp hook");
 
-    // A forged `from` on a chat-with-me write must be rewritten to the
+    // A forged `from` on a transcript write must be rewritten to the
     // real caller `agent_id` by the registered hook.
     let ctx = write_ctx(
         "win-ai",
@@ -116,9 +116,9 @@ fn stamps_from_on_the_stream_write_path() {
     let kernel = Arc::new(Kernel::new());
     install_a2a_stamp_hook(&kernel, /* fail_closed */ true).expect("install a2a stamp hook");
 
-    let mbox = "/agents/win-ai/chat-with-me";
+    let mbox = conversation_transcript_path(&conversation_id("win-ai", "mac-ai"));
     kernel
-        .create_stream(mbox, 64 * 1024)
+        .create_stream(&mbox, 64 * 1024)
         .expect("create the mailbox stream");
 
     // Authenticated as win-ai but claiming from=impostor → stamped back to
@@ -127,14 +127,14 @@ fn stamps_from_on_the_stream_write_path() {
     let win = OperationContext::new("operator", "root", false, Some("win-ai"), false);
     kernel
         .stream_write_nowait(
-            mbox,
+            &mbox,
             br#"{"from":"impostor","to":"mac-ai","body":"hi"}"#,
             &win,
         )
         .expect("authenticated stream mailbox write must be accepted");
 
     let (data, _next) = kernel
-        .stream_read_at(mbox, 0)
+        .stream_read_at(&mbox, 0)
         .expect("read")
         .expect("one entry present");
     let envelope: serde_json::Value =
@@ -150,7 +150,7 @@ fn stamps_from_on_the_stream_write_path() {
     let anon = OperationContext::new("operator", "root", false, None, false);
     assert!(
         kernel
-            .stream_write_nowait(mbox, br#"{"to":"mac-ai","body":"x"}"#, &anon)
+            .stream_write_nowait(&mbox, br#"{"to":"mac-ai","body":"x"}"#, &anon)
             .is_err(),
         "fail-closed: a mailbox stream write with no agent_id must be rejected"
     );
