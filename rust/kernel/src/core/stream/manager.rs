@@ -637,7 +637,7 @@ mod tests {
     /// the reader parked until its timeout and fail the test.
     #[test]
     fn wake_waiters_wakes_a_reader_over_an_out_of_band_backend_push() {
-        let path = "/agents/peer/chat-with-me";
+        let path = "/agents/peer/transcript";
         let backend = Arc::new(MemoryStreamBackend::new(4096));
         let sm = Arc::new(StreamManager::new());
         // `register` keeps the notify slot the reader parks on; we retain the
@@ -671,6 +671,6 @@ mod tests {
         assert_eq!(data, b"from-a-peer");
 
         // No slot for an unknown path → no-op, reported as false.
-        assert!(!sm.wake_waiters("/agents/nobody/chat-with-me"));
+        assert!(!sm.wake_waiters("/agents/nobody/transcript"));
     }
 }

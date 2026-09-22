@@ -2963,9 +2963,16 @@ mod tests {
         use kernel::PermissionProvider;
 
         // Mailbox-only stub: deny every mutating op (Write) outside a
-        // chat-with-me mailbox — the boundary ForeignAgentMailboxOnly enforces,
-        // reproduced here so the gate is exercised without pulling the a2a
-        // provider into a transport-tier test.
+        // conversation transcript — the boundary `ForeignAgentMailboxOnly`
+        // enforces, mirrored here so the gate is exercised without pulling the
+        // a2a provider across the crate-dependency boundary into a
+        // transport-tier test.
+        //
+        // Mirrored, so it must stay a mirror: `a2a::is_conversation_transcript_path`
+        // tests for the `/conversations/` SEGMENT and not the `/transcript`
+        // leaf alone, because a bare leaf would admit a session transcript or
+        // anything else a user names that way. A stub looser than the real gate
+        // would let this test pass on a path production refuses.
         struct MailboxOnlyStub;
         impl PermissionProvider for MailboxOnlyStub {
             fn check(
@@ -2975,7 +2982,9 @@ mod tests {
                 permission: Permission,
                 _ctx: &OperationContext,
             ) -> Result<(), KernelError> {
-                if matches!(permission, Permission::Write) && !path.contains("chat-with-me") {
+                let is_transcript =
+                    path.contains("/conversations/") && path.ends_with("/transcript");
+                if matches!(permission, Permission::Write) && !is_transcript {
                     return Err(KernelError::PermissionDenied(format!("contained: {path}")));
                 }
                 Ok(())
@@ -3009,7 +3018,7 @@ mod tests {
         // Create a DT_STREAM INSIDE the mailbox → the gate lets it through.
         let allowed = svc.setattr_typed(
             SetattrRequest {
-                path: "/chat-with-me".into(),
+                path: "/conversations/deadbeef/transcript".into(),
                 entry_type: 4,
                 capacity: 16,
                 ..Default::default()

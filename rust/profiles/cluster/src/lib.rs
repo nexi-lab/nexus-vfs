@@ -2773,7 +2773,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         .map_err(|e| anyhow::anyhow!("bring up services: {e}"))?;
 
     // (2) Arm the cross-machine stream-wakeup observer PER ZONE: a
-    // replicated `AppendStreamEntry` (a chat-with-me DT_STREAM write on a
+    // replicated `AppendStreamEntry` (a transcript write on a
     // peer) wakes a `sys_watch` parked on this replica. The observer is a
     // generic raft primitive (`nexus_raft::stream_wakeup`), armed here —
     // NOT in a2a — because it needs a `Weak<Kernel>` (the `Arc` lives

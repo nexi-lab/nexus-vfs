@@ -159,7 +159,7 @@ async fn run() -> Result<(), String> {
             stream_append(&mut c, path, data, &auth).await?;
         }
         "send-raw" => {
-            // Unsigned append: plain bytes, no seal. On a `*/chat-with-me`
+            // Unsigned append: plain bytes, no seal. On a `*/transcript`
             // mailbox the daemon's stamp hook rewrites `from` to the
             // authenticated agent_id — the path that surfaces classify's
             // qualified `{trust_domain}/agent/{name}` for a foreign agent.

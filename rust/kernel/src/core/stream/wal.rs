@@ -734,8 +734,8 @@ mod tests {
         // cannot drift (the bug that let a plain-path test key mask the
         // real `__wal_stream__/…` shape).
         for (stream_id, seq) in [
-            ("/agents/win-ai/chat-with-me", 0u64),
-            ("/proc/p1/chat-with-me", 42),
+            ("/agents/win-ai/transcript", 0u64),
+            ("/proc/p1/transcript", 42),
         ] {
             let key = format!("{WAL_STREAM_KEY_PREFIX}{stream_id}/{seq}");
             assert_eq!(
@@ -750,10 +750,7 @@ mod tests {
             None
         );
         // A bare path (no prefix/seq) is not a wal key.
-        assert_eq!(
-            watch_path_from_wal_stream_key("/agents/x/chat-with-me"),
-            None
-        );
+        assert_eq!(watch_path_from_wal_stream_key("/agents/x/transcript"), None);
     }
 
     /// Faithful in-memory mirror of the raft SM's stream side-table: a flat

@@ -248,9 +248,9 @@ async fn replicated_stream_append_wakes_a_parked_watch_only_with_the_observer() 
     // Every append uses the REAL wal-stream key (`/__wal_stream__/{path}/{seq}`)
     // that `WalStreamCore` writes, so the observer's parse is what recovers
     // the watched file path. The `sys_watch` is parked on the bare path.
-    let watch_path_1 = "/agents/win-ai/chat-with-me";
+    let watch_path_1 = "/agents/win-ai/transcript";
     let key_1 = wal_key(watch_path_1, 0);
-    let watch_path_2 = "/agents/mac-ai/chat-with-me";
+    let watch_path_2 = "/agents/mac-ai/transcript";
     let key_2 = wal_key(watch_path_2, 0);
 
     // ── Phase 1 — negative control: no observer, no wake ─────────────────

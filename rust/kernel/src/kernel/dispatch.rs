@@ -71,7 +71,7 @@ impl Kernel {
     /// Like [`Self::dispatch_native_pre`] but returns the
     /// `HookOutcome::Replace` payload so callers can substitute write
     /// content at the EXECUTE phase. `sys_write` is the only consumer
-    /// today — `MailboxStampingHook` (registered for `*/chat-with-me`)
+    /// today — `MailboxStampingHook` (registered for `*/transcript`)
     /// rewrites the envelope's `from` field through this path, and the
     /// caller passes `replacement.unwrap_or(content)` into DT_STREAM
     /// push / DT_FILE backend write. Empty registry returns
