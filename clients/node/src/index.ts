@@ -19,7 +19,12 @@ import * as grpc from '@grpc/grpc-js'
 import * as protoLoader from '@grpc/proto-loader'
 import protobuf from 'protobufjs'
 
-import { VFS_PROTO } from './generated/proto.js'
+import {
+  CORE_METADATA_PROTO,
+  RAFT_COMMANDS_PROTO,
+  RAFT_TRANSPORT_PROTO,
+  VFS_PROTO,
+} from './generated/proto.js'
 
 /**
  * The DNS SAN every `nexusd-cluster` node certificate carries. An mTLS
@@ -325,6 +330,118 @@ function serviceConstructor(): grpc.ServiceClientConstructor {
   return cachedServiceConstructor
 }
 
+let cachedZoneApiConstructor: grpc.ServiceClientConstructor | null = null
+
+/**
+ * The zone-api plane's service constructor.
+ *
+ * Unlike the VFS proto this one is a closure: `transport.proto` imports
+ * `commands.proto`, which imports `core/metadata.proto`. protobufjs resolves
+ * an import against what is already in the root, so all three parse into one
+ * root, leaf first — parsing only the file that declares the service would
+ * leave `RaftCommand` and its neighbours unresolvable.
+ */
+function zoneApiConstructor(): grpc.ServiceClientConstructor {
+  if (!cachedZoneApiConstructor) {
+    const root = new protobuf.Root()
+    for (const source of [CORE_METADATA_PROTO, RAFT_COMMANDS_PROTO, RAFT_TRANSPORT_PROTO]) {
+      protobuf.parse(source, root, { keepCase: true })
+    }
+    root.resolveAll()
+    const definition = protoLoader.fromJSON(root.toJSON(), PROTO_LOADER_OPTIONS)
+    const loaded = grpc.loadPackageDefinition(definition) as unknown as {
+      nexus: { raft: { ZoneApiService: grpc.ServiceClientConstructor } }
+    }
+    cachedZoneApiConstructor = loaded.nexus.raft.ZoneApiService
+  }
+  return cachedZoneApiConstructor
+}
+
+/**
+ * A failed RPC, carrying the gRPC status as data.
+ *
+ * The status name is in the message for a human, but a caller deciding what
+ * to do next reads {@link status}: matching the text means a server-supplied
+ * detail that happens to contain a status name is misread as that status.
+ */
+export class NexusRpcError extends Error {
+  /** Numeric gRPC status code. */
+  readonly code: number
+  /** Status name, e.g. `DEADLINE_EXCEEDED`. */
+  readonly status: string
+  /** The operation label this client used, e.g. `stream read`. */
+  readonly operation: string
+
+  constructor(code: number, status: string, operation: string, detail: string) {
+    super(`gRPC ${operation} failed: ${status}: ${detail}`)
+    this.name = 'NexusRpcError'
+    this.code = code
+    this.status = status
+    this.operation = operation
+  }
+}
+
+/** Channel terms shared by every plane this package dials. */
+interface Dialled {
+  target: string
+  credentials: grpc.ChannelCredentials
+  channelOptions: grpc.ChannelOptions
+}
+
+/**
+ * Resolve the endpoint and TLS material once, so both planes dial a daemon on
+ * identical terms and neither grows its own copy of the credential rules.
+ */
+function dial(endpoint: string, options: NexusVfsClientOptions): Dialled {
+  const channelOptions: grpc.ChannelOptions = {}
+  let credentials = grpc.credentials.createInsecure()
+
+  if (options.tls) {
+    const serverName = options.tls.serverName ?? DEFAULT_CLUSTER_SERVER_NAME
+    credentials = grpc.credentials.createSsl(
+      readPem(options.tls.caPath, 'CA certificate'),
+      readPem(options.tls.keyPath, 'client key'),
+      readPem(options.tls.certPath, 'client certificate'),
+    )
+    channelOptions['grpc.ssl_target_name_override'] = serverName
+    channelOptions['grpc.default_authority'] = serverName
+  }
+  if (options.maxReceiveMessageBytes !== undefined) {
+    channelOptions['grpc.max_receive_message_length'] = options.maxReceiveMessageBytes
+  }
+
+  return { target: toGrpcTarget(endpoint), credentials, channelOptions }
+}
+
+/**
+ * One unary call. Shared by every plane: the queue-while-connecting and
+ * deadline rules are channel behaviour, not VFS behaviour.
+ */
+function invoke<Req, Res>(
+  owner: object,
+  method: GrpcMethod<Req, Res>,
+  operation: string,
+  request: Req,
+  deadlineMs: number,
+): Promise<Res> {
+  return new Promise((resolve, reject) => {
+    // Queue the call while the channel connects instead of failing fast:
+    // callers dial a daemon they have just spawned, and grpc-js otherwise
+    // rejects with an empty status before the first connection lands. In
+    // grpc-js this is a Metadata flag, not a CallOption.
+    const metadata = new grpc.Metadata({ waitForReady: true })
+    const callOptions: grpc.CallOptions = { deadline: Date.now() + deadlineMs }
+    method.call(owner, request, metadata, callOptions, (error, response) => {
+      if (error) {
+        const status = String(grpc.status[error.code] ?? error.code)
+        reject(new NexusRpcError(error.code, status, operation, error.details || error.message))
+        return
+      }
+      resolve(response)
+    })
+  })
+}
+
 /**
  * gRPC targets are `host:port`. Callers historically passed a URL because
  * the Rust client took a tonic endpoint, so accept both spellings.
@@ -355,28 +472,13 @@ export class NexusVfsClient {
    */
   constructor(endpoint: string, options: NexusVfsClientOptions = {}) {
     const Service = serviceConstructor()
-    const channelOptions: grpc.ChannelOptions = {}
-    let credentials = grpc.credentials.createInsecure()
-
-    if (options.tls) {
-      const serverName = options.tls.serverName ?? DEFAULT_CLUSTER_SERVER_NAME
-      credentials = grpc.credentials.createSsl(
-        readPem(options.tls.caPath, 'CA certificate'),
-        readPem(options.tls.keyPath, 'client key'),
-        readPem(options.tls.certPath, 'client certificate'),
-      )
-      channelOptions['grpc.ssl_target_name_override'] = serverName
-      channelOptions['grpc.default_authority'] = serverName
-    }
-    if (options.maxReceiveMessageBytes !== undefined) {
-      channelOptions['grpc.max_receive_message_length'] = options.maxReceiveMessageBytes
-    }
+    const { target, credentials, channelOptions } = dial(endpoint, options)
 
     this.connectTimeoutMs = options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS
     this.blockingReadMarginMs =
       options.blockingReadMarginMs ?? BLOCKING_READ_DEADLINE_MARGIN_MS
-    this.target = toGrpcTarget(endpoint)
-    this.client = new Service(this.target, credentials, channelOptions) as unknown as UnaryClient
+    this.target = target
+    this.client = new Service(target, credentials, channelOptions) as unknown as UnaryClient
   }
 
   /**
@@ -669,32 +771,156 @@ export class NexusVfsClient {
     request: Req,
     deadlineMs?: number,
   ): Promise<Res> {
-    return new Promise((resolve, reject) => {
-      // Queue the call while the channel connects instead of failing fast:
-      // callers dial a daemon they have just spawned, and grpc-js otherwise
-      // rejects with an empty status before the first connection lands. In
-      // grpc-js this is a Metadata flag, not a CallOption.
-      const metadata = new grpc.Metadata({ waitForReady: true })
-      // `connectTimeoutMs` bounds how long a call waits for the channel, which
-      // is the right bound for an RPC the server answers immediately. A call
-      // that asks the server to hold the response needs its own, longer bound —
-      // see the blocking branch of `streamReadAt`.
-      const callOptions: grpc.CallOptions = {
-        deadline: Date.now() + (deadlineMs ?? this.connectTimeoutMs),
-      }
-      const method = this.client[rpc] as unknown as GrpcMethod<Req, Res>
-      method.call(this.client, request, metadata, callOptions, (error, response) => {
-        if (error) {
-          // Name the status, not just the detail text. Callers distinguish a
-          // missing plugin method (UNIMPLEMENTED) from a real failure by
-          // matching on the message, and the detail alone need not say which.
-          const status = grpc.status[error.code] ?? error.code
-          reject(new Error(`gRPC ${operation} failed: ${status}: ${error.details || error.message}`))
-          return
-        }
-        resolve(response)
-      })
-    })
+    // `connectTimeoutMs` bounds how long a call waits for the channel, which is
+    // the right bound for an RPC the server answers immediately. A call that
+    // asks the server to hold the response needs its own, longer bound — see
+    // the blocking branch of `streamReadAt`.
+    return invoke(
+      this.client,
+      this.client[rpc] as unknown as GrpcMethod<Req, Res>,
+      operation,
+      request,
+      deadlineMs ?? this.connectTimeoutMs,
+    )
+  }
+}
+
+/** A freshly minted session credential. This client never persists it. */
+export interface SessionCredential {
+  certPem: Buffer
+  keyPem: Buffer
+  caPem: Buffer
+  /** The minted subject (`session-<uuid>`), so a holder can log what it has. */
+  subjectId: string
+}
+
+interface MintSessionAgentRequest {
+  owner_id: string
+  validity_secs: string
+}
+interface MintSessionAgentResponse {
+  success: boolean
+  error?: string
+  agent_cert_pem: Buffer
+  agent_key_pem: Buffer
+  ca_pem: Buffer
+  subject_id: string
+}
+interface RevokeAgentCertRequest {
+  agent_cert_pem: Buffer
+}
+interface RevokeAgentCertResponse {
+  success: boolean
+  error?: string
+}
+
+interface ZoneApiMethods {
+  MintSessionAgent: GrpcMethod<MintSessionAgentRequest, MintSessionAgentResponse>
+  RevokeAgentCert: GrpcMethod<RevokeAgentCertRequest, RevokeAgentCertResponse>
+  close(): void
+}
+
+/**
+ * The zone-api plane: session credentials and their revocation.
+ *
+ * Separate from the VFS client because it is a separate service with its own
+ * authentication rule — these RPCs authenticate the caller by its mTLS
+ * certificate and take no auth token, where every VFS call carries one. The
+ * two planes share how they dial, not what they expose.
+ *
+ * The allow-list administration RPCs beside these are node-gated by design, so
+ * they are deliberately absent: a client holding an agent certificate could
+ * never call them.
+ */
+export class NexusZoneApiClient {
+  /** The resolved `host:port` this client dials. */
+  readonly target: string
+
+  private readonly client: ZoneApiMethods
+  private readonly connectTimeoutMs: number
+
+  constructor(endpoint: string, options: NexusVfsClientOptions = {}) {
+    const Service = zoneApiConstructor()
+    const { target, credentials, channelOptions } = dial(endpoint, options)
+    this.connectTimeoutMs = options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS
+    this.target = target
+    this.client = new Service(target, credentials, channelOptions) as unknown as ZoneApiMethods
+  }
+
+  /** Connect with mutual TLS, which an auth-on cluster requires. */
+  static withMtls(
+    endpoint: string,
+    tls: NexusVfsTlsConfig,
+    options: Omit<NexusVfsClientOptions, 'tls'> = {},
+  ): NexusZoneApiClient {
+    return new NexusZoneApiClient(endpoint, { ...options, tls })
+  }
+
+  /**
+   * Mint a session credential bound to `ownerId`.
+   *
+   * The subject is not the caller's to choose: the daemon mints a fresh
+   * `session-<uuid>` per call, so nobody can ask for a stable or a colliding
+   * identity. The owner is signed in as a `nexus://owner/` SAN and read back
+   * kernel-side as the operation's principal.
+   *
+   * Reachable with an agent certificate — that is the point: a front door
+   * obtains an identity for a person without ever holding a node certificate,
+   * which would carry admin and system privilege it has no use for. The caller
+   * must be on the daemon's replicated allow-list, and a refusal is terse by
+   * design, because a caller that learns why it was refused learns about the
+   * list.
+   *
+   * The owner's truthfulness stays the caller's responsibility: this stops an
+   * agent forging its OWN identity, it does not make the cluster an authority
+   * on who a person is.
+   */
+  async mintSessionAgent(
+    ownerId: string,
+    options: { validitySecs: number },
+  ): Promise<SessionCredential> {
+    const response = await invoke<MintSessionAgentRequest, MintSessionAgentResponse>(
+      this.client,
+      this.client.MintSessionAgent,
+      'mint session agent',
+      { owner_id: ownerId, validity_secs: String(options.validitySecs) },
+      this.connectTimeoutMs,
+    )
+    if (!response.success) {
+      throw new Error(`mint session agent refused: ${response.error || 'no reason given'}`)
+    }
+    return {
+      certPem: response.agent_cert_pem,
+      keyPem: response.agent_key_pem,
+      caPem: response.ca_pem,
+      subjectId: response.subject_id,
+    }
+  }
+
+  /**
+   * Revoke a credential by handing back the certificate itself.
+   *
+   * A session credential is never written to disk, so there is no bundle to
+   * read a serial out of — the holder is the one party that has it. The daemon
+   * verifies the certificate chains to its own CA before recording anything.
+   * Revocation lands on a CRL refresh, so it is eventually consistent.
+   */
+  async revokeAgentCert(certPem: Buffer): Promise<void> {
+    const response = await invoke<RevokeAgentCertRequest, RevokeAgentCertResponse>(
+      this.client,
+      this.client.RevokeAgentCert,
+      'revoke agent cert',
+      { agent_cert_pem: certPem },
+      this.connectTimeoutMs,
+    )
+    if (!response.success) {
+      throw new Error(`revoke agent cert failed: ${response.error || 'no reason given'}`)
+    }
+  }
+
+  /** Close the underlying channel. */
+  close(): void {
+    this.client.close()
   }
 }
 
