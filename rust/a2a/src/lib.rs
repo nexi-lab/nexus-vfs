@@ -59,9 +59,9 @@ pub use mailbox_stamping_policy::{
 };
 
 use kernel::kernel::syscall::KernelSyscall;
-use kernel::kernel::Kernel;
+use kernel::kernel::{Kernel, OperationContext};
 
-use kernel::meta_store::{DT_DIR, DT_LINK, DT_STREAM};
+use kernel::meta_store::{DT_DIR, DT_REG, DT_STREAM};
 
 /// Provision `agent_name`'s persistent A2A inbox as a DT_STREAM, idempotently.
 ///
@@ -93,7 +93,7 @@ pub fn ensure_agent_state_stream<K: KernelSyscall>(
 /// idempotently, and index it from BOTH participants' presences.
 ///
 /// Creates the conversation's directory layer, its append-only transcript
-/// DT_STREAM, and a DT_LINK under each agent's `/agents/{name}/conversations/`
+/// DT_STREAM, and an entry under each agent's `/agents/{name}/conversations/`
 /// chat list.
 ///
 /// It deliberately does NOT create either side's reader register. A register
@@ -123,6 +123,7 @@ pub fn ensure_agent_state_stream<K: KernelSyscall>(
 /// `sys_setattr` is a matching no-op.
 pub fn ensure_conversation<K: KernelSyscall>(
     kernel: &K,
+    ctx: &OperationContext,
     agent_name: &str,
     peer_name: &str,
 ) -> Result<(), String> {
@@ -151,7 +152,7 @@ pub fn ensure_conversation<K: KernelSyscall>(
 
     // Dirent layer first — children attach below it. `setattr_create_link`
     // validates the target and puts the row; it does NOT materialise parents.
-    // Without this the chat-list DT_LINK lands under a directory nothing can
+    // Without this the chat-list entry lands under a directory nothing can
     // `readdir`, and the chat list is the entire point of the index. Same
     // ordering `managed_agent::proc_entry` uses when it stamps `/proc`.
     ensure_dir(kernel, CONVERSATIONS_BASE)?;
@@ -172,8 +173,9 @@ pub fn ensure_conversation<K: KernelSyscall>(
             kernel,
             &format!("{A2A_INBOX_BASE}/{name}{AGENT_CONVERSATIONS_SEGMENT}"),
         )?;
-        link_conversation(
+        index_conversation(
             kernel,
+            ctx,
             &agent_conversation_link_path(name, peer),
             &conversation_root,
         )
@@ -193,13 +195,35 @@ fn ensure_dir<K: KernelSyscall>(kernel: &K, path: &str) -> Result<(), String> {
     metadata_setattr(kernel, path, DT_DIR, None).map_err(|e| format!("ensure dir {path}: {e}"))
 }
 
-/// Point `alias` at `target` as a DT_LINK (the chat-list index entry).
-fn link_conversation<K: KernelSyscall>(
+/// File `alias` in the chat list, holding the conversation root it stands for.
+///
+/// A plain entry, NOT a DT_LINK — which is what this is, and what it used to
+/// be. Only the in-process caller can make a link: the gRPC `Setattr` carries
+/// no link target, so a standalone agent provisioning over that transport
+/// silently produced no entry at all, and its recipient never learned the
+/// conversation existed. An entry type is immutable once set, so two
+/// provisioners disagreeing about it is not a cosmetic difference: whichever
+/// ran second would fail forever on a conversation the first had already
+/// indexed.
+///
+/// Every transport can write bytes. `readdir` needs only the NAME, and the
+/// body keeps `cat` able to answer "pointing at which conversation?" — the
+/// one thing the link gave that a bare directory entry would not.
+fn index_conversation<K: KernelSyscall>(
     kernel: &K,
+    ctx: &OperationContext,
     alias: &str,
     target: &str,
 ) -> Result<(), String> {
-    metadata_setattr(kernel, alias, DT_LINK, Some(target))
+    // Declare the entry, then fill it. The NAME is the contract — `readdir`
+    // needs nothing else — while the body is a convenience, and the two have
+    // different requirements: a mount with no content store keeps metadata and
+    // drops bytes, so an entry created by `sys_write` alone would not exist at
+    // all there. Declaring it first means the index survives anywhere the
+    // metastore does, and `cat` answers wherever content is stored.
+    metadata_setattr(kernel, alias, DT_REG, None)?;
+    let _ = kernel.sys_write(alias, ctx, target.as_bytes(), 0);
+    Ok(())
 }
 
 /// The shared `sys_setattr` shape for a2a's metadata-only entries — 21

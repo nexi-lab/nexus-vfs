@@ -26,7 +26,7 @@ use kernel::kernel::{Kernel, KernelError, OperationContext};
 use kernel::vfs_router::RouteResult;
 use kernel::{Permission, PermissionProvider};
 
-use crate::addresses::is_conversation_reader_path;
+use crate::addresses::{is_conversation_index_path, is_conversation_reader_path};
 use crate::mailbox_stamping_policy::is_a2a_mailbox_path;
 
 /// Confines a foreign (cross-org) agent to the A2A message logs it
@@ -62,10 +62,26 @@ impl PermissionProvider for ForeignAgentMailboxOnly {
         if is_conversation_reader_path(path) && matches!(permission, Permission::Read) {
             return Ok(());
         }
+        // The chat-list index, writable. A conversation is provisioned by
+        // whichever side SENDS first, and the side that has to discover it is
+        // the other one — so a cross-org peer must be able to file the entry
+        // under its recipient, or the recipient never learns the conversation
+        // exists and the message waits in a transcript nobody tails.
+        //
+        // This does not widen what a foreign caller can reach. It can already
+        // write any transcript (the allow-list above is by shape, not by
+        // participant), and the stamping hook decides `from`, so it cannot
+        // forge who spoke. What an entry adds is discoverability: the receiver
+        // derives the conversation id from the PAIR and ignores the entry's
+        // body, so a forged entry buys an idle tail on a conversation the
+        // caller could already write to — not access to anyone else's.
+        if is_conversation_index_path(path) {
+            return Ok(());
+        }
         Err(KernelError::PermissionDenied(format!(
             "foreign agent (trust domain '{trust_domain}') is confined to its \
-             A2A conversation transcripts (read-only on reader registers); \
-             '{path}' is out of scope for {permission:?}"
+             A2A conversation transcripts and chat-list entries (read-only on \
+             reader registers); '{path}' is out of scope for {permission:?}"
         )))
     }
 }
@@ -100,9 +116,40 @@ mod tests {
         assert!(p
             .check("/agents/w/chat-with-me", None, Permission::Read, &foreign)
             .is_ok());
+        // Its chat-list entry: allowed. Without it a cross-org sender cannot
+        // make the conversation discoverable, and the message waits in a
+        // transcript nobody tails.
+        assert!(p
+            .check(
+                "/agents/w/conversations/foreign-peer",
+                None,
+                Permission::Write,
+                &foreign
+            )
+            .is_ok());
+        assert!(p
+            .check("/agents/w/conversations", None, Permission::Read, &foreign)
+            .is_ok());
+        // The rest of the agent namespace stays closed, INCLUDING the depths
+        // that look like the chat list. `/agents/w/state` is as deep as
+        // `/agents/w/conversations`, so the shape is what separates them.
+        assert!(p
+            .check("/agents/w/state", None, Permission::Write, &foreign)
+            .is_err());
+        assert!(p
+            .check(
+                "/agents/w/conversations/a/deeper",
+                None,
+                Permission::Write,
+                &foreign
+            )
+            .is_err());
         // Anything else: denied.
         assert!(p
             .check("/agents/secrets.txt", None, Permission::Read, &foreign)
+            .is_err());
+        assert!(p
+            .check("/agents/secrets.txt", None, Permission::Write, &foreign)
             .is_err());
         assert!(p
             .check("/other/zone/file", None, Permission::Write, &foreign)
