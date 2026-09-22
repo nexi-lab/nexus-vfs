@@ -50,6 +50,20 @@ use nexus_raft::transport::{generate_agent_cert, generate_join_token, generate_z
 
 const ZONE: &str = "sharedzone";
 const MOUNT: &str = "/agents";
+
+/// The transcript of the conversation between `a` and `b`, under this
+/// test's mount, and the directory that holds it.
+///
+/// Built through the a2a address SSOT: the stamp hook decides what it
+/// claims from the same constants, so a layout change that would un-stamp
+/// these writes breaks the test rather than leaving it green and empty.
+fn conversation(a: &str, b: &str) -> (String, String) {
+    let cid = a2a::conversation_id(a, b);
+    (
+        format!("{MOUNT}{}/{cid}", a2a::CONVERSATIONS_BASE),
+        format!("{MOUNT}{}", a2a::conversation_transcript_path(&cid)),
+    )
+}
 const BUDGET: Duration = Duration::from_secs(120);
 const AGENT: &str = "cert-only-ai";
 const FORGED: &str = "impostor";
@@ -155,10 +169,13 @@ async fn a_daemon_whose_only_credential_plane_is_mtls_still_stamps_from() {
 
     // ── 6. The agent writes a FORGED `from` over its genuine cert ───────────
     let mut c = Vfs::connect_mtls(port, &ca, &agent_cert, &agent_key, BUDGET).await;
-    c.mkdir(&format!("{MOUNT}/{AGENT}"), "")
+    let (conv_dir, mailbox) = conversation(AGENT, "peer");
+    c.mkdir(&format!("{MOUNT}{}", a2a::CONVERSATIONS_BASE), "")
         .await
-        .expect("the agent makes its own dir");
-    let mailbox = format!("{MOUNT}/{AGENT}/chat-with-me");
+        .ok();
+    c.mkdir(&conv_dir, "")
+        .await
+        .expect("the agent opens its conversation");
     c.create_stream(&mailbox, "")
         .await
         .expect("the agent opens its mailbox");
@@ -240,13 +257,13 @@ stderr: {err}"
     );
 
     let mut f = Vfs::connect_mtls(port, &ca, &foreign_cert, &foreign_key, BUDGET).await;
-    let foreign_box = format!("{MOUNT}/{FOREIGN_AGENT}/chat-with-me");
+    let (foreign_dir, foreign_box) = conversation(FOREIGN_AGENT, AGENT);
 
     // Containment still applies on this posture, and is worth pinning here
     // rather than assumed: the foreign agent may create its own mailbox and
     // nothing else, so it cannot even make the directory that holds it.
     let denied = f
-        .mkdir(&format!("{MOUNT}/{FOREIGN_AGENT}"), "")
+        .mkdir(&foreign_dir, "")
         .await
         .expect_err("a foreign agent must not create directories outside its mailbox");
     assert!(
@@ -256,9 +273,9 @@ stderr: {err}"
 
     // So OUR side provisions the peer's inbox — which is also how a real
     // cross-org bring-up goes: the host org makes a place for the guest.
-    c.mkdir(&format!("{MOUNT}/{FOREIGN_AGENT}"), "")
+    c.mkdir(&foreign_dir, "")
         .await
-        .expect("the local agent provisions the peer's directory");
+        .expect("the local agent provisions the peer's conversation");
     f.create_stream(&foreign_box, "")
         .await
         .expect("the foreign agent opens its own mailbox — the one path it may create");

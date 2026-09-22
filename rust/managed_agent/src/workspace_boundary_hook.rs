@@ -10,14 +10,13 @@
 //! When a write target falls under that prefix, the hook compares the
 //! workspace owner pid (extracted from the path) against the caller's
 //! `agent_id`. On mismatch the hook returns `Err` with a structured
-//! teaching payload pointing at the canonical mailbox path so the caller
-//! (an LLM) learns the convention from the error itself rather than from
-//! its system prompt or memory.
+//! teaching payload pointing at where messages DO go, so the caller (an
+//! LLM) learns the convention from the error itself rather than from its
+//! system prompt or memory.
 //!
-//! Writes whose target is the workspace owner's *own* `chat-with-me`
-//! stream are allowed regardless of identity — that path is the
-//! advertised mailbox and exists precisely so other agents can write to
-//! it without being inside the workspace.
+//! There is no longer a mailbox inside a workspace to carve an exception
+//! for: messages are addressed by agent name, in the conversation the two
+//! participants share, which lives outside every workspace.
 
 use contracts::is_system_path;
 use kernel::core::dispatch::{HookContext, HookOutcome, NativeInterceptHook};
@@ -56,23 +55,19 @@ impl WorkspaceBoundaryHook {
         Some(pid)
     }
 
-    /// True when the path is the workspace owner's own `chat-with-me`
-    /// (or its DT_LINK shortcut). These are the advertised entry points
-    /// for outside agents and must remain writable to non-owners.
-    fn is_chat_with_me(path: &str, owner_pid: &str) -> bool {
-        let canonical = format!("{WORKSPACE_PREFIX}{owner_pid}/chat-with-me");
-        let workspace = format!("{WORKSPACE_PREFIX}{owner_pid}{WORKSPACE_SEGMENT}chat-with-me");
-        path == canonical || path == workspace
-    }
-
     /// Build the structured teaching error the hook returns on cross-owner
-    /// writes. The format mirrors the doc so reviewers can grep for it.
+    /// writes.
+    ///
+    /// It names the caller's own chat list rather than a message path,
+    /// because the path depends on WHO the owner is and this hook only
+    /// knows its pid. A `readdir` there answers the question the caller
+    /// actually has, in one step it can take from inside the error.
     fn teaching_error(path: &str, owner_pid: &str, caller_agent_id: &str) -> String {
         format!(
-            "EPERM at {path}: This workspace is owned by pid '{owner_pid}'. \
-             You are '{caller_agent_id}'. To send a message about this workspace, \
-             write to: {WORKSPACE_PREFIX}{owner_pid}{WORKSPACE_SEGMENT}chat-with-me \
-             (or address the owner directly at {WORKSPACE_PREFIX}{owner_pid}/chat-with-me).",
+            "EPERM at {path}: this workspace belongs to pid '{owner_pid}' and is private. \
+             You are '{caller_agent_id}'. Messages are not written into a workspace — they go \
+             to the conversation you share with the other agent. List your conversations at \
+             /agents/{caller_agent_id}/conversations/ and append to that peer's transcript.",
         )
     }
 }
@@ -104,10 +99,6 @@ impl NativeInterceptHook for WorkspaceBoundaryHook {
             Some(p) => p,
             None => return Ok(HookOutcome::Pass),
         };
-
-        if Self::is_chat_with_me(path, owner_pid) {
-            return Ok(HookOutcome::Pass);
-        }
 
         let caller = &ctx.identity().agent_id;
         if caller == owner_pid || caller.is_empty() {
@@ -147,21 +138,24 @@ mod tests {
         assert!(hook.on_pre(&c).is_ok());
     }
 
+    /// A stranger gets no write into someone else's workspace, with no
+    /// carve-out. There used to be one: the per-pid mailbox and its
+    /// in-workspace link were the advertised way to reach an agent, so the
+    /// hook had to let a non-owner write them. Messages are addressed by name
+    /// now, in a conversation that lives outside every workspace, so the
+    /// boundary has no exception left to make.
     #[test]
-    fn passes_for_chat_with_me_link_target_in_workspace() {
+    fn rejects_a_stranger_everywhere_inside_the_workspace() {
         let hook = WorkspaceBoundaryHook::new();
-        // chat-with-me inside the workspace is the DT_LINK shortcut and
-        // is the advertised entry point — non-owners must be able to
-        // write to it.
-        let c = ctx("/proc/p1/workspace/chat-with-me", "stranger");
-        assert!(hook.on_pre(&c).is_ok());
-    }
-
-    #[test]
-    fn passes_for_canonical_chat_with_me() {
-        let hook = WorkspaceBoundaryHook::new();
-        let c = ctx("/proc/p1/chat-with-me", "stranger");
-        assert!(hook.on_pre(&c).is_ok());
+        for path in [
+            "/proc/p1/workspace/notes.md",
+            "/proc/p1/workspace/chat-with-me",
+        ] {
+            assert!(
+                hook.on_pre(&ctx(path, "stranger")).is_err(),
+                "{path} must not be writable by a non-owner"
+            );
+        }
     }
 
     #[test]
@@ -189,7 +183,10 @@ mod tests {
         assert!(err.contains("EPERM"));
         assert!(err.contains("p1"));
         assert!(err.contains("p_other"));
-        assert!(err.contains("chat-with-me"));
+        assert!(
+            err.contains("/agents/p_other/conversations/"),
+            "the error must point the caller at its own chat list: {err}"
+        );
     }
 
     #[test]

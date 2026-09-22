@@ -221,14 +221,14 @@ mod tests {
             // before `wait_for_event` registers its temporary
             // watch, leaving the waiter to time out.
             thread::sleep(Duration::from_millis(20));
-            let event = FileEvent::new(FileEventType::FileWrite, "/proc/p1/chat-with-me");
+            let event = FileEvent::new(FileEventType::FileWrite, "/proc/p1/status");
             notifier.notify_match(&event);
         });
 
         let event = registry
-            .wait_for_event("/proc/p1/chat-with-me", 1_000)
+            .wait_for_event("/proc/p1/status", 1_000)
             .expect("notify should have woken the waiter");
-        assert_eq!(event.path(), "/proc/p1/chat-with-me");
+        assert_eq!(event.path(), "/proc/p1/status");
         waker.join().unwrap();
 
         // Watch entry was unregistered on return — registry is empty.
@@ -238,7 +238,7 @@ mod tests {
     #[test]
     fn wait_for_event_returns_none_on_timeout() {
         let registry = FileWatchRegistry::new();
-        let result = registry.wait_for_event("/proc/p1/chat-with-me", 50);
+        let result = registry.wait_for_event("/proc/p1/status", 50);
         assert!(result.is_none());
         // Cleanup: temporary watch dropped on return.
         assert_eq!(registry.len(), 0);
@@ -248,7 +248,7 @@ mod tests {
     fn wait_for_event_zero_timeout_is_non_blocking() {
         let registry = FileWatchRegistry::new();
         let started = Instant::now();
-        let result = registry.wait_for_event("/proc/p1/chat-with-me", 0);
+        let result = registry.wait_for_event("/proc/p1/status", 0);
         // Should return immediately (well under the 50ms a real
         // condvar wait would take). Allow generous slack for slow
         // CI runners.
@@ -268,14 +268,14 @@ mod tests {
             notifier.notify_match(&other);
             // Right path — must wake.
             thread::sleep(Duration::from_millis(20));
-            let target = FileEvent::new(FileEventType::FileWrite, "/proc/p1/chat-with-me");
+            let target = FileEvent::new(FileEventType::FileWrite, "/proc/p1/status");
             notifier.notify_match(&target);
         });
 
         let event = registry
-            .wait_for_event("/proc/p1/chat-with-me", 500)
+            .wait_for_event("/proc/p1/status", 500)
             .expect("only the matching path should wake the waiter");
-        assert_eq!(event.path(), "/proc/p1/chat-with-me");
+        assert_eq!(event.path(), "/proc/p1/status");
         waker.join().unwrap();
     }
 }

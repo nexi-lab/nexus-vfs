@@ -9,22 +9,18 @@
 //!     profile dir).  May dangle until `/agents/{name}/` is materialised
 //!     by upstream profile-management code — kernel does not validate
 //!     link target existence.
-//!   * `/proc/{pid}/chat-with-me` — DT_STREAM (capacity 65_536), the
-//!     canonical mailbox.  io_profile is `wal` when federation is up
-//!     (writes raft-replicate across voters per integration doc §6) and
-//!     `memory` otherwise (test mode).
-//!   * `/proc/{pid}/workspace/chat-with-me` — DT_LINK to
-//!     `/proc/{pid}/chat-with-me` (workspace shortcut so agents can
-//!     address `chat-with-me` relative to their cwd)
 //!   * `/proc/{pid}/workspace/{alias}` — one DT_LINK per
 //!     `RepoMount` in the descriptor, target is `mount_path`
 //!
+//! There is no per-pid mailbox here. Messaging is addressed by agent NAME
+//! — a conversation is derived from the pair of names (`a2a::conversation_id`)
+//! — so a pid, which is one run of one identity, has no message surface of
+//! its own.
+//!
 //! VFSRouter follows DT_LINK rows transparently on `sys_read` / `sys_write`
-//! (single-hop, ELOOP-detected), so the existing kernel hooks
-//! (`MailboxStampingHook`, `WorkspaceBoundaryHook`, `AuditHook`) match
-//! on the link path's suffix and behave identically whether the caller
-//! writes to the canonical pid-level path or through the workspace
-//! shortcut.
+//! (single-hop, ELOOP-detected), so the kernel hooks
+//! (`WorkspaceBoundaryHook`, `AuditHook`) behave identically whether the
+//! caller reaches an entry directly or through a link.
 
 use contracts::OperationContext;
 
@@ -77,24 +73,12 @@ pub(crate) fn register_proc_entry<K: KernelSyscall>(
         create_dt_dir(kernel, dir)?;
     }
 
-    // Canonical chat-with-me stream — provisioned through the a2a mailbox
-    // contract (the SSOT for the mailbox io_profile + capacity), so this
-    // node-local pipe and the persistent `/agents/{name}/chat-with-me` inbox
-    // are the SAME kind of DT_STREAM. a2a owns "what a mailbox is"; this
-    // lifecycle owner just says "make this pid's mailbox".
-    let cwm_canonical = format!("/proc/{pid}/chat-with-me");
-    a2a::ensure_mailbox_stream(kernel, &cwm_canonical)?;
-
     // /proc/{pid}/agent → /agents/{desc.name} (Linux /proc/{pid}/exe
     // analogue). Target may not exist yet; DT_LINK rows are not
     // validated against entry presence.
     let agent_link = format!("{pid_root}/agent");
     let agent_target = format!("/agents/{}", desc.name);
     create_dt_link(kernel, &agent_link, &agent_target)?;
-
-    // Workspace `chat-with-me` shortcut → canonical pid-level stream.
-    let cwm_shortcut = format!("{workspace_root}/chat-with-me");
-    create_dt_link(kernel, &cwm_shortcut, &cwm_canonical)?;
 
     // One DT_LINK per repo mount carried in the descriptor.
     for repo in &desc.repos {
@@ -107,10 +91,9 @@ pub(crate) fn register_proc_entry<K: KernelSyscall>(
 
 /// Reverse of [`register_proc_entry`]. Best-effort: missing entries
 /// (e.g. partial registration that failed) are not an error. Children
-/// drop before parents so directory removal sees an empty parent. The
-/// canonical chat-with-me DT_STREAM also goes here — its lifetime is
-/// the pid's; any persistent inbox lives at `/agents/{name}/chat-with-me`
-/// instead.
+/// drop before parents so directory removal sees an empty parent.
+/// Nothing here outlives the pid: an agent's durable state hangs off its
+/// name, under `/agents/{name}/`.
 pub(crate) fn unregister_proc_entry<K: KernelSyscall>(kernel: &K, desc: &AgentDescriptor) {
     let pid = desc.pid.as_str();
     let pid_root = format!("/proc/{pid}");
@@ -119,8 +102,7 @@ pub(crate) fn unregister_proc_entry<K: KernelSyscall>(kernel: &K, desc: &AgentDe
     let tasks_root = format!("/proc/{pid}/tasks");
     let ctx = sys_ctx();
 
-    // Workspace shortcut + alias links first, then the workspace dir.
-    let _ = kernel.sys_unlink(&format!("{workspace_root}/chat-with-me"), &ctx, false);
+    // Alias links first, then the workspace dir.
     for repo in &desc.repos {
         let _ = kernel.sys_unlink(&format!("{workspace_root}/{}", repo.alias), &ctx, false);
     }
@@ -132,8 +114,7 @@ pub(crate) fn unregister_proc_entry<K: KernelSyscall>(kernel: &K, desc: &AgentDe
     let _ = kernel.sys_unlink(&sessions_root, &ctx, false);
     let _ = kernel.sys_unlink(&tasks_root, &ctx, false);
 
-    // Canonical chat-with-me stream + agent link, then pid root itself.
-    let _ = kernel.sys_unlink(&format!("{pid_root}/chat-with-me"), &ctx, false);
+    // Agent link, then the pid root itself.
     let _ = kernel.sys_unlink(&format!("{pid_root}/agent"), &ctx, false);
     let _ = kernel.sys_unlink(&pid_root, &ctx, false);
 }
@@ -210,7 +191,7 @@ mod tests {
     fn stream_exists(kernel: &Kernel, path: &str) -> bool {
         kernel
             .sys_stat(path, ROOT_ZONE_ID)
-            .is_some_and(|e| e.entry_type == DT_STREAM as u8)
+            .is_some_and(|e| e.entry_type == DT_STREAM)
     }
 
     fn entry_present(kernel: &Kernel, path: &str) -> bool {
@@ -240,14 +221,10 @@ mod tests {
         ] {
             assert!(dir_exists(&kernel, dir), "dirent missing: {dir}");
         }
-        assert!(stream_exists(&kernel, "/proc/p1/chat-with-me"));
+
         assert_eq!(
             link_target(&kernel, "/proc/p1/agent").as_deref(),
             Some("/agents/managed-claude"),
-        );
-        assert_eq!(
-            link_target(&kernel, "/proc/p1/workspace/chat-with-me").as_deref(),
-            Some("/proc/p1/chat-with-me"),
         );
     }
 
@@ -332,11 +309,9 @@ mod tests {
             "/proc/p4",
             "/proc/p4/workspace",
             "/proc/p4/workspace/main",
-            "/proc/p4/workspace/chat-with-me",
             "/proc/p4/sessions",
             "/proc/p4/tasks",
             "/proc/p4/agent",
-            "/proc/p4/chat-with-me",
         ] {
             assert!(
                 !entry_present(&kernel, path),

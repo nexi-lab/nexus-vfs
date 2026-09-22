@@ -27,7 +27,7 @@ use kernel::vfs_router::RouteResult;
 use kernel::{Permission, PermissionProvider};
 
 use crate::addresses::{is_conversation_index_path, is_conversation_reader_path};
-use crate::mailbox_stamping_policy::is_a2a_mailbox_path;
+use crate::mailbox_stamping_policy::is_mailbox_path;
 
 /// Confines a foreign (cross-org) agent to the A2A message logs it
 /// participates in.
@@ -48,7 +48,7 @@ impl PermissionProvider for ForeignAgentMailboxOnly {
         let Some(trust_domain) = ctx.trust_domain.as_deref() else {
             return Ok(());
         };
-        if is_a2a_mailbox_path(path) {
+        if is_mailbox_path(path) {
             return Ok(());
         }
         // A conversation's reader registers are READABLE by a participant —
@@ -109,12 +109,15 @@ mod tests {
     fn foreign_agent_allowed_only_on_mailbox_paths() {
         let p = ForeignAgentMailboxOnly;
         let foreign = ctx_with(Some("hospital-a"));
-        // Its mailbox: allowed (read + write).
+        // The conversation it shares with a local agent: allowed (read + write).
+        let transcript = crate::addresses::conversation_transcript_path(
+            &crate::addresses::conversation_id("w", "foreign-peer"),
+        );
         assert!(p
-            .check("/agents/w/chat-with-me", None, Permission::Write, &foreign)
+            .check(&transcript, None, Permission::Write, &foreign)
             .is_ok());
         assert!(p
-            .check("/agents/w/chat-with-me", None, Permission::Read, &foreign)
+            .check(&transcript, None, Permission::Read, &foreign)
             .is_ok());
         // Its chat-list entry: allowed. Without it a cross-org sender cannot
         // make the conversation discoverable, and the message waits in a
@@ -154,9 +157,9 @@ mod tests {
         assert!(p
             .check("/other/zone/file", None, Permission::Write, &foreign)
             .is_err());
-        // The node-local pipe is NOT a foreign agent's mailbox.
+        // The process tree is not reachable at all.
         assert!(p
-            .check("/proc/1/chat-with-me", None, Permission::Write, &foreign)
+            .check("/proc/1/status", None, Permission::Write, &foreign)
             .is_err());
     }
 

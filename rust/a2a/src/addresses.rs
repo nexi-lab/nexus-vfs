@@ -19,12 +19,6 @@
 //! writes. Naming it for one endpoint would reinstate the two-inbox model that
 //! conversations replace.
 
-/// The legacy mailbox path suffix. SSOT for the `/chat-with-me` convention —
-/// the stamp hook's `mutating_path_suffixes()` (which drives the write-content
-/// clone) and the path predicates MUST agree on it, so it is defined once here
-/// and referenced rather than re-declared.
-pub const CHAT_WITH_ME_SUFFIX: &str = "/chat-with-me";
-
 /// io_profile waterfall for an A2A message-log DT_STREAM: `wal`
 /// (raft-replicated, so a message survives its sender and reaches other
 /// machines) when federation is up, else the node-local `memory` terminal.
@@ -284,7 +278,7 @@ pub fn is_conversation_reader_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mailbox_stamping_policy::is_a2a_mailbox_path;
+    use crate::mailbox_stamping_policy::is_mailbox_path;
 
     /// One conversation per unordered pair, derivable by either side alone.
     #[test]
@@ -351,6 +345,6 @@ mod tests {
         // Integration invariant: what we provision MUST be what the gate
         // recognises, or the `from`-guarantee silently skips the very logs we
         // create.
-        assert!(is_a2a_mailbox_path(&transcript));
+        assert!(is_mailbox_path(&transcript));
     }
 }

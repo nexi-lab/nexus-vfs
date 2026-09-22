@@ -37,6 +37,29 @@ use nexus_raft::transport::{generate_agent_cert, generate_join_token, generate_z
 
 const ZONE: &str = "sharedzone";
 const MOUNT: &str = "/agents";
+
+/// The transcript of the conversation between `a` and `b`, under this
+/// test's mount.
+///
+/// Built through the a2a address SSOT rather than spelled out: the stamp
+/// hook decides what it claims from the same constants, so a layout change
+/// that would un-stamp these writes breaks the test instead of silently
+/// making it prove nothing.
+fn transcript(a: &str, b: &str) -> String {
+    format!(
+        "{MOUNT}{}",
+        a2a::conversation_transcript_path(&a2a::conversation_id(a, b))
+    )
+}
+
+/// The directory holding that conversation, which the transcript hangs off.
+fn conversation_dir(a: &str, b: &str) -> String {
+    format!(
+        "{MOUNT}{}/{}",
+        a2a::CONVERSATIONS_BASE,
+        a2a::conversation_id(a, b)
+    )
+}
 const SECRET: &str = "e2e-signed-authorship-secret";
 const BUDGET: Duration = Duration::from_secs(120);
 
@@ -111,10 +134,13 @@ async fn from_is_unforgeable_across_trust_domains_via_signed_cert() {
     let mut c = Vfs::connect_mtls(port, &ca, &agent_cert, &agent_key, BUDGET).await;
 
     // ── 4-5. SEAL → write → read → OPEN: `from` is a VERIFIED win-ai ────────
-    c.mkdir(&format!("{MOUNT}/win-ai"), "")
+    c.mkdir(&format!("{MOUNT}{}", a2a::CONVERSATIONS_BASE), "")
         .await
-        .expect("win-ai makes its own dir");
-    let mailbox = format!("{MOUNT}/win-ai/chat-with-me");
+        .ok();
+    c.mkdir(&conversation_dir("win-ai", "peer"), "")
+        .await
+        .expect("win-ai opens its conversation");
+    let mailbox = transcript("win-ai", "peer");
     c.create_stream(&mailbox, "")
         .await
         .expect("win-ai opens its mailbox");
@@ -148,10 +174,13 @@ async fn from_is_unforgeable_across_trust_domains_via_signed_cert() {
     )
     .expect("seal forged");
 
-    c.mkdir(&format!("{MOUNT}/forge"), "")
+    c.mkdir(&format!("{MOUNT}{}", a2a::CONVERSATIONS_BASE), "")
+        .await
+        .ok();
+    c.mkdir(&conversation_dir("forge", "peer"), "")
         .await
         .expect("mk forge dir");
-    let forge_mbox = format!("{MOUNT}/forge/chat-with-me");
+    let forge_mbox = transcript("forge", "peer");
     c.create_stream(&forge_mbox, "")
         .await
         .expect("open forge mailbox");
@@ -172,10 +201,13 @@ async fn from_is_unforgeable_across_trust_domains_via_signed_cert() {
     // The same-domain floor: win-ai authenticated over mTLS, so the kernel
     // stamps `from` to the authenticated agent_id regardless of what the
     // (unsigned) envelope claimed. A client that does not seal is still caught.
-    c.mkdir(&format!("{MOUNT}/stamp"), "")
+    c.mkdir(&format!("{MOUNT}{}", a2a::CONVERSATIONS_BASE), "")
+        .await
+        .ok();
+    c.mkdir(&conversation_dir("stamp", "peer"), "")
         .await
         .expect("mk stamp dir");
-    let stamp_mbox = format!("{MOUNT}/stamp/chat-with-me");
+    let stamp_mbox = transcript("stamp", "peer");
     c.create_stream(&stamp_mbox, "")
         .await
         .expect("open stamp mailbox");
@@ -343,7 +375,7 @@ async fn signed_from_replicates_and_verifies_on_a_peer_node() {
     let replicated = round_trip(
         &mut wc,
         &mut rc,
-        &format!("{MOUNT}/win-ai/chat-with-me"),
+        &transcript("win-ai", "peer"),
         &sealed,
         BUDGET,
     )
@@ -373,7 +405,7 @@ async fn signed_from_replicates_and_verifies_on_a_peer_node() {
     let forged_replicated = round_trip(
         &mut wc,
         &mut rc,
-        &format!("{MOUNT}/forge/chat-with-me"),
+        &transcript("forge", "peer"),
         &forged,
         BUDGET,
     )

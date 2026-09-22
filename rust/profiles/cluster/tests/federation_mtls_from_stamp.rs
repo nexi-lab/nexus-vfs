@@ -37,6 +37,18 @@ use nexus_raft::transport::{generate_join_token, generate_zone_ca};
 
 const ZONE: &str = "sharedzone";
 const MOUNT: &str = "/agents";
+
+/// The transcript `a` and `b` share, under this test's mount.
+///
+/// Built through the a2a address SSOT, because the stamp hook decides what
+/// it claims from the same constants: a layout change that would un-stamp
+/// these writes must break this test rather than leave it green.
+fn transcript(a: &str, b: &str) -> String {
+    format!(
+        "{MOUNT}{}",
+        a2a::conversation_transcript_path(&a2a::conversation_id(a, b))
+    )
+}
 const SECRET: &str = "e2e-fed-mtls-secret";
 const BUDGET: Duration = Duration::from_secs(120);
 
@@ -248,7 +260,7 @@ async fn from_is_unforgeable_across_an_mtls_federation_both_directions() {
     // backend — the entries replicate over raft, the local stream handle does
     // not. So mac-ai (the owner) materializes its OWN mailbox before reading,
     // and win-ai (the peer sender) opens the same path before writing.
-    let mac_mbox = format!("{MOUNT}/mac-ai/chat-with-me");
+    let mac_mbox = transcript("mac-ai", "mac-peer");
     mc.create_stream(&mac_mbox, "")
         .await
         .expect("mac-ai opens its OWN mailbox");
@@ -267,7 +279,7 @@ async fn from_is_unforgeable_across_an_mtls_federation_both_directions() {
     assert_stamped(&mut mc, &mac_mbox, "win-ai", forged).await;
 
     // ── 6. FWD← : mac-ai writes win-ai's mailbox forged; win-ai reads stamped ─
-    let win_mbox = format!("{MOUNT}/win-ai/chat-with-me");
+    let win_mbox = transcript("win-ai", "win-peer");
     wc.create_stream(&win_mbox, "")
         .await
         .expect("win-ai opens its OWN mailbox");
