@@ -104,11 +104,29 @@ pub fn revoked_serials_path(data_dir: &Path) -> PathBuf {
     data_dir.join("tls").join("revoked-serials")
 }
 
-/// Read the revoked serials (raw bytes) from the founder's revoked-serial file.
+/// One line of the revoked-serial file: a serial, and when the certificate it
+/// names stops being able to authenticate anything.
+///
+/// `not_after_unix` is `None` for a line written before this field existed, and
+/// for one recorded from a source that does not carry it (an X.509 CRL entry
+/// has a revocation date, not the certificate's expiry). Unknown is never
+/// treated as expired — see [`prune_expired_serials`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RevokedEntry {
+    pub serial: Vec<u8>,
+    pub not_after_unix: Option<i64>,
+}
+
+/// Read the revoked entries from the founder's revoked-serial file.
+///
 /// A missing file is an empty list, and an unparseable line is skipped rather
-/// than fatal — an unreadable line must not crash the CRL endpoint (revocation
-/// is append-only, so serving what parses never un-revokes a written serial).
-pub fn read_revoked_serials(path: &Path) -> Vec<Vec<u8>> {
+/// than fatal — an unreadable line must not crash the CRL endpoint.
+///
+/// Line format is `<base64 serial>` optionally followed by a space and the
+/// certificate's `notAfter` as a unix timestamp. A line without the timestamp
+/// is a pre-existing entry and reads back with `not_after_unix: None`, which is
+/// what makes adding the field a format extension rather than a migration.
+pub fn read_revoked_entries(path: &Path) -> Vec<RevokedEntry> {
     use base64::Engine;
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
@@ -116,35 +134,222 @@ pub fn read_revoked_serials(path: &Path) -> Vec<Vec<u8>> {
     text.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
-        .filter_map(|l| base64::engine::general_purpose::STANDARD.decode(l).ok())
+        .filter_map(|l| {
+            let (b64, rest) = match l.split_once(' ') {
+                Some((b64, rest)) => (b64, Some(rest.trim())),
+                None => (l, None),
+            };
+            let serial = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+            Some(RevokedEntry {
+                serial,
+                // A malformed timestamp reads as unknown rather than dropping
+                // the line: losing the expiry costs a prune, losing the line
+                // un-revokes a certificate.
+                not_after_unix: rest.and_then(|r| r.parse::<i64>().ok()),
+            })
+        })
         .collect()
 }
 
-/// Append one revoked serial (raw bytes) to the founder's revoked-serial file,
-/// creating it if absent and skipping a serial already present (idempotent).
-/// This is the offline `auth revoke` write.
-pub fn add_revoked_serial(path: &Path, serial: &[u8]) -> Result<(), String> {
+/// The revoked serials (raw bytes) — what the CRL is built from. Thin view over
+/// [`read_revoked_entries`] so the file is parsed in one place.
+pub fn read_revoked_serials(path: &Path) -> Vec<Vec<u8>> {
+    read_revoked_entries(path)
+        .into_iter()
+        .map(|e| e.serial)
+        .collect()
+}
+
+/// Serialise entries and replace the file atomically.
+///
+/// Write-temp-then-rename, because the previous `fs::write` truncated the live
+/// revocation list before writing it: a crash in that window left an empty
+/// file, which does not fail closed — it silently un-revokes every certificate
+/// on it. A rename either happens or does not.
+fn write_revoked_entries(path: &Path, entries: &[RevokedEntry]) -> Result<(), String> {
     use base64::Engine;
-    let mut serials = read_revoked_serials(path);
-    if serials.iter().any(|s| s == serial) {
-        return Ok(());
-    }
-    serials.push(serial.to_vec());
-    let body = serials
+    let body = entries
         .iter()
-        .map(|s| base64::engine::general_purpose::STANDARD.encode(s))
+        .map(|e| {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&e.serial);
+            match e.not_after_unix {
+                Some(ts) => format!("{b64} {ts}"),
+                None => b64,
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n");
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
-    std::fs::write(path, format!("{body}\n")).map_err(|e| format!("write {}: {e}", path.display()))
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, format!("{body}\n"))
+        .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("replace {}: {e}", path.display()))
+}
+
+/// Record one revoked serial, with the certificate's `notAfter` when the caller
+/// knows it. Idempotent on the serial; creates the file if absent.
+///
+/// Passing the expiry is what later lets the entry be pruned once it can no
+/// longer authenticate anything — see [`prune_expired_serials`]. `None` is
+/// honest when the source does not carry it, and costs only that the entry
+/// stays forever.
+pub fn add_revoked_serial_with_expiry(
+    path: &Path,
+    serial: &[u8],
+    not_after_unix: Option<i64>,
+) -> Result<(), String> {
+    let mut entries = read_revoked_entries(path);
+    if let Some(existing) = entries.iter_mut().find(|e| e.serial == serial) {
+        // Re-revoking is a no-op except that a caller who knows the expiry
+        // teaches it to an entry that did not have one.
+        if existing.not_after_unix.is_none() && not_after_unix.is_some() {
+            existing.not_after_unix = not_after_unix;
+            return write_revoked_entries(path, &entries);
+        }
+        return Ok(());
+    }
+    entries.push(RevokedEntry {
+        serial: serial.to_vec(),
+        not_after_unix,
+    });
+    write_revoked_entries(path, &entries)
+}
+
+/// Record one revoked serial with no known expiry — the offline `auth revoke`
+/// write, which reads a serial off a cert bundle on disk.
+pub fn add_revoked_serial(path: &Path, serial: &[u8]) -> Result<(), String> {
+    add_revoked_serial_with_expiry(path, serial, None)
+}
+
+/// Drop entries for certificates that expired more than `skew_margin_secs` ago.
+///
+/// A revocation entry answers "should this certificate be refused while it is
+/// still otherwise valid". Once the certificate is past its own `notAfter`
+/// every verifier refuses it anyway, so the entry has stopped deciding
+/// anything — and keeping it means a list that grows without bound for
+/// credentials that live minutes.
+///
+/// Three rules, each of which exists to avoid un-revoking something real:
+///
+/// * Prune by the certificate's own `notAfter`, never by when the entry was
+///   written or by a store-level TTL. Those would drop serials for
+///   certificates still inside their validity window, which is precisely the
+///   case revocation exists for.
+/// * Require `now > not_after + skew_margin_secs`. A verifier with a slow
+///   clock may still be inside the window after we think it closed.
+/// * An entry whose expiry is unknown is never pruned. Unknown is not expired.
+///
+/// Returns how many were dropped. Writes only when something was.
+pub fn prune_expired_serials(
+    path: &Path,
+    now_unix: i64,
+    skew_margin_secs: i64,
+) -> Result<usize, String> {
+    let entries = read_revoked_entries(path);
+    let before = entries.len();
+    let kept: Vec<RevokedEntry> = entries
+        .into_iter()
+        .filter(|e| match e.not_after_unix {
+            Some(exp) => now_unix <= exp.saturating_add(skew_margin_secs),
+            None => true,
+        })
+        .collect();
+    let dropped = before - kept.len();
+    if dropped > 0 {
+        write_revoked_entries(path, &kept)?;
+    }
+    Ok(dropped)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::transport::certgen::{generate_agent_cert, generate_zone_ca};
+
+    /// Pruning drops only what can no longer decide anything, and the three
+    /// rules that keep it from un-revoking something real are asserted one by
+    /// one: expiry comes from the certificate, the skew margin is honoured, and
+    /// an unknown expiry survives forever.
+    #[test]
+    fn pruning_drops_expired_entries_and_never_the_unknown_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tls").join("revoked-serials");
+        let now = 1_000_000i64;
+        let margin = 300i64;
+
+        // Long expired; inside the margin; not yet expired; expiry unknown.
+        add_revoked_serial_with_expiry(&path, b"old", Some(now - 10_000)).unwrap();
+        add_revoked_serial_with_expiry(&path, b"recent", Some(now - 100)).unwrap();
+        add_revoked_serial_with_expiry(&path, b"live", Some(now + 10_000)).unwrap();
+        add_revoked_serial(&path, b"legacy").unwrap();
+
+        let dropped = prune_expired_serials(&path, now, margin).unwrap();
+        assert_eq!(dropped, 1, "only the long-expired entry is prunable");
+
+        let kept: Vec<Vec<u8>> = read_revoked_serials(&path);
+        assert!(
+            !kept.contains(&b"old".to_vec()),
+            "expired past the margin is dropped"
+        );
+        assert!(
+            kept.contains(&b"recent".to_vec()),
+            "inside the skew margin a slow clock may still be in the window"
+        );
+        assert!(
+            kept.contains(&b"live".to_vec()),
+            "still valid, still revoked"
+        );
+        assert!(
+            kept.contains(&b"legacy".to_vec()),
+            "unknown expiry is not expired — a pre-existing line must survive"
+        );
+
+        // Idempotent: nothing left to drop, and the file is untouched.
+        assert_eq!(prune_expired_serials(&path, now, margin).unwrap(), 0);
+        assert_eq!(read_revoked_serials(&path).len(), 3);
+    }
+
+    /// The file gained an optional field, so lines written before it must keep
+    /// reading as revocations — losing one would silently un-revoke a cert.
+    #[test]
+    fn a_line_without_an_expiry_still_reads_as_revoked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("revoked-serials");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Exactly what the previous format wrote: base64, one per line.
+        std::fs::write(&path, "b2xk\nbmV3IA==\n").unwrap();
+
+        let entries = read_revoked_entries(&path);
+        assert_eq!(entries.len(), 2, "both legacy lines parse");
+        assert!(
+            entries.iter().all(|e| e.not_after_unix.is_none()),
+            "a legacy line has no expiry, so it is never prunable"
+        );
+        assert_eq!(prune_expired_serials(&path, i64::MAX / 2, 0).unwrap(), 0);
+    }
+
+    /// Re-revoking a serial is a no-op, except that a caller who knows the
+    /// expiry teaches it to an entry recorded without one — which is how a
+    /// legacy entry becomes prunable instead of staying forever.
+    #[test]
+    fn re_revoking_with_an_expiry_fills_in_an_unknown_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("revoked-serials");
+
+        add_revoked_serial(&path, b"s").unwrap();
+        assert_eq!(read_revoked_entries(&path)[0].not_after_unix, None);
+
+        add_revoked_serial_with_expiry(&path, b"s", Some(42)).unwrap();
+        let entries = read_revoked_entries(&path);
+        assert_eq!(entries.len(), 1, "still one entry, not a duplicate");
+        assert_eq!(entries[0].not_after_unix, Some(42));
+
+        // And a later write with no expiry does not erase what we learned.
+        add_revoked_serial(&path, b"s").unwrap();
+        assert_eq!(read_revoked_entries(&path)[0].not_after_unix, Some(42));
+    }
 
     /// The revocation round-trip: an agent cert's serial is recoverable, a
     /// CA-signed CRL over it verifies against the CA and yields that serial

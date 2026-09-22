@@ -58,8 +58,9 @@ pub use lib::agent_identity::session_agent_name;
 pub(crate) mod crl;
 #[cfg(all(feature = "grpc", has_protos))]
 pub use crl::{
-    add_revoked_serial, crl_revoked_serials, generate_crl, read_revoked_serials,
-    revoked_serials_path, serial_from_cert_pem,
+    add_revoked_serial, add_revoked_serial_with_expiry, crl_revoked_serials, generate_crl,
+    prune_expired_serials, read_revoked_entries, read_revoked_serials, revoked_serials_path,
+    serial_from_cert_pem, RevokedEntry,
 };
 #[cfg(all(feature = "grpc", has_protos))]
 mod client;

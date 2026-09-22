@@ -5439,10 +5439,43 @@ async fn crl_refresh_loop(
     founder_enroll: Option<String>,
 ) {
     const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+    /// How far past a certificate's `notAfter` its revocation entry is kept.
+    ///
+    /// A verifier with a slow clock can still be inside the validity window
+    /// after this node thinks it closed; dropping the entry at exactly
+    /// `notAfter` would un-revoke the certificate for that verifier. An hour is
+    /// far beyond any plausible skew between nodes that are already running
+    /// mTLS against a shared CA, and the cost of being generous is one stale
+    /// line.
+    const REVOCATION_PRUNE_SKEW_MARGIN_SECS: i64 = 60 * 60;
     let ca_path = data_dir.join("tls").join("ca.pem");
     loop {
         let serials: Option<Vec<Vec<u8>>> = if ca_key_holder {
             let path = nexus_raft::transport::revoked_serials_path(&data_dir);
+            // Prune before reading: an entry for a certificate that expired long
+            // ago decides nothing — every verifier already refuses it on
+            // validity — so keeping it grows this list without bound for
+            // credentials that live minutes. Here, on the refresh timer, rather
+            // than at revoke time: it is periodic housekeeping, and it must stay
+            // off the per-request path that `serial_revoked` sits on.
+            //
+            // Only the CA holder prunes. A follower reconstructs its set from a
+            // fetched X.509 CRL, whose entries carry a revocation date and not
+            // the certificate's expiry, so it has nothing to prune by.
+            match nexus_raft::transport::prune_expired_serials(
+                &path,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0),
+                REVOCATION_PRUNE_SKEW_MARGIN_SECS,
+            ) {
+                Ok(0) => {}
+                Ok(n) => tracing::debug!(dropped = n, "pruned expired revocation entries"),
+                // Never fatal: failing to prune costs disk, failing to serve the
+                // CRL costs revocation.
+                Err(e) => tracing::warn!(error = %e, "could not prune the revocation list"),
+            }
             Some(nexus_raft::transport::read_revoked_serials(&path))
         } else if let Some(addr) = &founder_enroll {
             match nexus_raft::transport::call_get_crl(addr, 10).await {
