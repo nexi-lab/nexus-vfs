@@ -298,6 +298,23 @@ mod tests {
     use super::*;
 
     /// One conversation per unordered pair, derivable by either side alone.
+    /// A cross-language pin.
+    ///
+    /// The Docker co-host duet E2E derives this same id in Python
+    /// (`nexus/tests/e2e/docker/test_cohost_duet_e2e.py`) to address the
+    /// conversation it seeds before a live agent replies into it. Two
+    /// implementations of one derivation drift silently: the test would
+    /// provision a conversation the agent never looks at and fail as "no
+    /// reply", pointing at the LLM or the poller rather than at the id. The
+    /// literal is what makes the two provably agree.
+    #[test]
+    fn conversation_id_matches_the_cross_language_literal() {
+        assert_eq!(
+            conversation_id("mac-ai", "win-ai"),
+            "211de372cab12e723fee2c1426ca0651"
+        );
+    }
+
     #[test]
     fn conversation_id_is_deterministic_and_order_free() {
         assert_eq!(
