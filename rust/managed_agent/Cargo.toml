@@ -33,7 +33,7 @@ parking_lot = "0.12"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 subprocess = { path = "../subprocess", optional = true }
 # a2a owns the mailbox contract (envelope schema + `ensure_mailbox_stream`, the
-# SSOT for provisioning a `chat-with-me` DT_STREAM). managed_agent is the
-# lifecycle owner that CALLS it to provision the per-pid pipe and the persistent
-# `/agents/{name}` inbox. No cycle: a2a depends only on kernel + contracts.
+# SSOT for provisioning a message DT_STREAM). managed_agent is the lifecycle
+# owner that CALLS it to provision the per-pid pipe and the agent's presence
+# streams. No cycle: a2a depends only on kernel + contracts.
 a2a = { workspace = true }

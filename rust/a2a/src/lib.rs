@@ -42,11 +42,11 @@ pub use mailbox_stamping_hook::MailboxStampingHook;
 // to them. Keep it that way — moving a symbol between these two lists is free,
 // dropping one from the root is a breaking change for the other repo.
 pub use addresses::{
-    agent_conversation_link_path, agent_inbox_path, agent_state_path, conversation_id,
-    conversation_reader_path, conversation_transcript_path, is_conversation_reader_path,
-    is_conversation_transcript_path, A2A_INBOX_BASE, AGENT_CONVERSATIONS_SEGMENT,
-    AGENT_STATE_SUFFIX, CHAT_WITH_ME_SUFFIX, CONVERSATIONS_BASE, MAILBOX_IO_PROFILE,
-    MAILBOX_STREAM_CAPACITY, REPLICATED_PREFIXES, TRANSCRIPT_LEAF,
+    agent_conversation_link_path, agent_state_path, conversation_id, conversation_reader_path,
+    conversation_transcript_path, is_conversation_reader_path, is_conversation_transcript_path,
+    A2A_INBOX_BASE, AGENT_CONVERSATIONS_SEGMENT, AGENT_STATE_SUFFIX, CHAT_WITH_ME_SUFFIX,
+    CONVERSATIONS_BASE, MAILBOX_IO_PROFILE, MAILBOX_STREAM_CAPACITY, REPLICATED_PREFIXES,
+    TRANSCRIPT_LEAF,
 };
 // `is_mailbox_path` / `is_a2a_mailbox_path` are re-exported because they ARE
 // the public contract, not internals: the first is the stamp scope, the second
@@ -62,19 +62,6 @@ use kernel::kernel::syscall::KernelSyscall;
 use kernel::kernel::{Kernel, OperationContext};
 
 use kernel::meta_store::{DT_DIR, DT_REG, DT_STREAM};
-
-/// Provision `agent_name`'s persistent A2A inbox as a DT_STREAM, idempotently.
-///
-/// The A2A analogue of the per-pid `/proc/{pid}/chat-with-me` pipe: a2a owns
-/// BOTH the address ([`agent_inbox_path`]) AND the stream contract
-/// ([`ensure_mailbox_stream`]). A2A is host-agnostic — this is called by
-/// whatever brings an agent online locally (today `managed_agent`, the sole
-/// agent host; any future unmanaged host calls the same function). A REMOTE
-/// agent's inbox is provisioned on its own host and replicated in, so a node
-/// only ever provisions the inboxes of agents IT hosts.
-pub fn ensure_agent_inbox<K: KernelSyscall>(kernel: &K, agent_name: &str) -> Result<(), String> {
-    ensure_mailbox_stream(kernel, &agent_inbox_path(agent_name))
-}
 
 /// Provision `agent_name`'s attention-state stream as a DT_STREAM, idempotently
 /// — the sibling of its inbox under the same replicated `/agents/{name}`
