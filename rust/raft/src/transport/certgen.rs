@@ -238,6 +238,10 @@ pub fn generate_agent_cert(
 /// wire: a `nexus://owner/{owner}` SAN, and a validity measured in the length
 /// of a session.
 ///
+/// Validity is plain seconds rather than a `time::Duration` so that calling
+/// this does not oblige a caller to depend on the `time` crate — the type
+/// would be the only reason they had to.
+///
 /// The owner is signed into the credential rather than recorded next to it, so
 /// "who is this agent acting for" needs no store lookup and cannot drift from
 /// the cert it describes. Nothing is written at mint: a uuid subject is unique
@@ -246,14 +250,23 @@ pub fn generate_agent_cert(
 pub fn generate_session_agent_cert(
     name: &str,
     owner_id: &str,
-    validity: time::Duration,
+    validity_secs: u64,
     ca_cert_pem: &[u8],
     ca_key_pem: &[u8],
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
     if owner_id.is_empty() {
         return Err("session agent cert requires a non-empty owner".to_string());
     }
-    sign_agent_cert(name, Some(owner_id), validity, ca_cert_pem, ca_key_pem)
+    if validity_secs == 0 {
+        return Err("session agent cert requires a non-zero validity".to_string());
+    }
+    sign_agent_cert(
+        name,
+        Some(owner_id),
+        time::Duration::seconds(validity_secs as i64),
+        ca_cert_pem,
+        ca_key_pem,
+    )
 }
 
 /// The one place an agent cert is built. Both public entry points differ only
@@ -749,7 +762,7 @@ mod tests {
         let (cert_pem, _key_pem) = generate_session_agent_cert(
             "session-3f2a",
             "alice",
-            ::time::Duration::hours(2),
+            2 * 60 * 60,
             ca_cert_pem.as_bytes(),
             ca_key_pem.as_bytes(),
         )
@@ -801,7 +814,7 @@ mod tests {
         let err = generate_session_agent_cert(
             "session-3f2a",
             "",
-            ::time::Duration::hours(2),
+            2 * 60 * 60,
             ca_cert_pem.as_bytes(),
             ca_key_pem.as_bytes(),
         )

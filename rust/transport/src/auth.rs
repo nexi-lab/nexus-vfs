@@ -67,6 +67,15 @@ pub struct PeerIdentity {
     /// customer's CA can mint no cluster member — and it renders the qualified
     /// `td/agent/{name}` id.
     pub trust_domain: Option<String>,
+    /// Who this agent acts for, from a `nexus://owner/{owner}` SAN. `Some`
+    /// only on a session credential; an ordinary agent cert carries no owner
+    /// and acts for itself.
+    ///
+    /// Read from the certificate, so it is settled when the CA signs and needs
+    /// no store lookup — the same property that lets `agent_name` authenticate
+    /// on any node the CA reaches. This is what lets the kernel attribute a
+    /// session agent's actions to a person.
+    pub owner: Option<String>,
     /// The certificate's raw serial-number bytes. For an agent cert this is
     /// what revocation names: `resolve` rejects a peer whose serial is in the
     /// cluster CA's signed CRL. Every X.509 cert carries a serial.
@@ -178,6 +187,7 @@ mod tests {
             node_id: Some(7),
             zone_id: Some("root".into()),
             agent_name: None,
+            owner: None,
             trust_domain: None,
             serial: vec![],
         };
@@ -188,6 +198,7 @@ mod tests {
             node_id: None,
             zone_id: None,
             agent_name: None,
+            owner: None,
             trust_domain: None,
             serial: vec![],
         };
@@ -198,6 +209,7 @@ mod tests {
             node_id: None,
             zone_id: None,
             agent_name: Some("win-ai".into()),
+            owner: None,
             trust_domain: None,
             serial: vec![],
         };

@@ -616,6 +616,7 @@ mod tests {
             node_id: None,
             zone_id: None,
             agent_name: Some("mac-ai".into()),
+            owner: None,
             trust_domain: None,
             serial: vec![1, 2, 3],
         };
@@ -650,6 +651,7 @@ mod tests {
             node_id: None,
             zone_id: None,
             agent_name: Some("cardio".into()),
+            owner: None,
             trust_domain: Some("hospital-a".into()),
             serial: vec![7, 7, 7],
         };
@@ -681,6 +683,7 @@ mod tests {
             node_id: None,
             zone_id: None,
             agent_name: Some("mac-ai".into()),
+            owner: None,
             trust_domain: None,
             serial: vec![9, 9, 9],
         };
@@ -849,6 +852,7 @@ mod tests {
             node_id: Some(42),
             zone_id: Some("sharedzone".into()),
             agent_name: None,
+            owner: None,
             trust_domain: None,
             serial: vec![],
         };
@@ -887,6 +891,7 @@ mod tests {
             node_id: None,
             zone_id: None,
             agent_name: Some("mac-ai".into()),
+            owner: None,
             trust_domain: None,
             serial: vec![1, 2, 3],
         };
@@ -915,6 +920,7 @@ mod tests {
             node_id: None,
             zone_id: None,
             agent_name: Some("cardio".into()),
+            owner: None,
             trust_domain: Some("hospital-a".into()),
             serial: vec![7, 7, 7],
         };
@@ -937,6 +943,7 @@ mod tests {
             node_id: None,
             zone_id: None,
             agent_name: Some("mac-ai".into()),
+            owner: None,
             trust_domain: None,
             serial: vec![9, 9, 9],
         };
