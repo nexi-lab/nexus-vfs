@@ -87,12 +87,13 @@ pub const CONVERSATIONS_BASE: &str = "/conversations";
 /// there would read as a directory you could list.
 pub const TRANSCRIPT_LEAF: &str = "/transcript";
 
-/// Path segment introducing a conversation id. Used by the STRUCTURAL
-/// predicates: a bare `ends_with("/transcript")` would be a far weaker test
-/// than the old `/transcript` (which nothing else in the tree is named), and
-/// `crate::is_a2a_mailbox_path` is the ENTIRE allow-list a cross-org caller is
-/// confined to — see `crate::foreign_containment`. Requiring the
-/// `/conversations/` segment keeps that gate exactly as narrow as it was.
+/// Path segment introducing a conversation id. Load-bearing for the
+/// STRUCTURAL predicates: `/transcript` is a leaf a session transcript, an
+/// audit transcript, or any user-named file could also carry, so a bare
+/// `ends_with` would admit them all — and
+/// [`is_conversation_transcript_path`] is the ENTIRE allow-list a cross-org
+/// caller is confined to (see `crate::foreign_containment`). Requiring this
+/// segment is what keeps that gate narrow.
 const CONVERSATIONS_SEGMENT: &str = "/conversations/";
 
 /// Path segment introducing a conversation's per-participant reader registers.
@@ -281,7 +282,7 @@ pub fn is_conversation_transcript_path(path: &str) -> bool {
 /// Whether `path` is a conversation reader register
 /// (`…/conversations/<cid>/readers/<agent>`).
 ///
-/// Separate from `crate::is_a2a_mailbox_path` ON PURPOSE. A reader register is
+/// Separate from [`is_conversation_transcript_path`] ON PURPOSE. A reader register is
 /// readable by a peer — that is how readiness is observed without a relay — but
 /// it must never fall inside a foreign agent's WRITE scope: moving someone
 /// else's read position silently skips their inbound messages, which is a

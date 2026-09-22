@@ -44,8 +44,8 @@
 /// `plan_boot_action` returns `Resume` whenever `root` is already on disk,
 /// e.g. an offline `auth mint` created it, SKIPPING the `StaticFounder` arm),
 /// so `/agents` resolves to its replicated zone instead of silently falling
-/// back to root. `a2a`'s `is_a2a_mailbox_path` scopes only `from`-stamping,
-/// NOT mount enforcement.
+/// back to root. `a2a`'s `is_conversation_transcript_path` scopes only
+/// `from`-stamping and the cross-org allow-list, NOT mount enforcement.
 ///
 /// ## Deferred design option (note for a future, context-free reader)
 ///
