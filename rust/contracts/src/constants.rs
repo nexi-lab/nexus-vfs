@@ -76,11 +76,15 @@ pub const CONTROL_ZONE_ID: &str = "__control__";
 /// owner writes only under its own namespace; the state machine never parses
 /// the values. Registry here is the SSOT so two owners can never collide.
 ///
-/// `auth`       — API-key + agent-identity records (`raft::auth_key_store`).
-/// `foreign-ca` — cross-org trust anchors (cross-org substrate).
+/// `auth`               — API-key + agent-identity records (`raft::auth_key_store`).
+/// `foreign-ca`         — cross-org trust anchors (cross-org substrate).
+/// `session-mint-allow` — agents permitted to mint session credentials for an
+///                        owner (`raft::session_mint_allow_store`).
 pub const CONTROL_NS_AUTH: &str = "auth";
 /// See [`CONTROL_NS_AUTH`].
 pub const CONTROL_NS_FOREIGN_CA: &str = "foreign-ca";
+/// See [`CONTROL_NS_AUTH`].
+pub const CONTROL_NS_SESSION_MINT_ALLOW: &str = "session-mint-allow";
 
 /// Canonical VFS root path.
 ///

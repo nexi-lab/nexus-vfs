@@ -147,6 +147,7 @@ pub mod control_state_store;
 pub mod distributed_coordinator;
 #[cfg(all(feature = "grpc", has_protos))]
 pub mod foreign_ca_store;
+pub mod session_mint_allow_store;
 // A2A cross-machine stream-wakeup: the apply-side observer that wakes a
 // replica's parked `sys_watch` when a peer's `AppendStreamEntry` replicates
 // in (§A). Bridges the raft apply spine to the kernel's file-watch wake.
