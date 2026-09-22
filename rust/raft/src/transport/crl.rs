@@ -160,6 +160,21 @@ pub fn read_revoked_serials(path: &Path) -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// Serialises the read-modify-write cycles on the revoked-serial file.
+///
+/// Both writers — recording a revocation and pruning expired entries — read the
+/// whole file, change it, and write it back. Interleave two of those and one
+/// disappears: a prune that read before a revocation landed will write the set
+/// it read, and the revocation is gone. A lost revocation is not a lost write,
+/// it is a certificate that stays valid after someone revoked it.
+///
+/// In-process is the whole surface. The other writer is the offline `auth
+/// revoke` CLI, which cannot run while the daemon is up: it opens the data
+/// dir's redb, the daemon holds that exclusively, and `auth_offline_lock.rs`
+/// pins that it fails loud rather than proceeding. So the concurrent writers
+/// are the revoke RPC and the prune timer, both here.
+static SERIALS_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Serialise entries and replace the file atomically.
 ///
 /// Write-temp-then-rename, because the previous `fs::write` truncated the live
@@ -200,6 +215,11 @@ pub fn add_revoked_serial_with_expiry(
     serial: &[u8],
     not_after_unix: Option<i64>,
 ) -> Result<(), String> {
+    // Held across the read AND the write: see `SERIALS_WRITE_LOCK`. A poisoned
+    // lock still guards — the data is a file, not the mutex's payload — so take
+    // the guard either way rather than failing a revocation on someone else's
+    // panic.
+    let _guard = SERIALS_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut entries = read_revoked_entries(path);
     if let Some(existing) = entries.iter_mut().find(|e| e.serial == serial) {
         // Re-revoking is a no-op except that a caller who knows the expiry
@@ -247,6 +267,7 @@ pub fn prune_expired_serials(
     now_unix: i64,
     skew_margin_secs: i64,
 ) -> Result<usize, String> {
+    let _guard = SERIALS_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let entries = read_revoked_entries(path);
     let before = entries.len();
     let kept: Vec<RevokedEntry> = entries
@@ -349,6 +370,76 @@ mod tests {
         // And a later write with no expiry does not erase what we learned.
         add_revoked_serial(&path, b"s").unwrap();
         assert_eq!(read_revoked_entries(&path)[0].not_after_unix, Some(42));
+    }
+
+    /// A revocation landing while a prune is in flight must not disappear.
+    ///
+    /// Both writers rewrite the whole file, so without serialisation a prune
+    /// that read before the revocation arrived writes back the set it read and
+    /// the revocation is gone — leaving a certificate someone revoked still
+    /// able to authenticate.
+    ///
+    /// Contention is deliberately heavy: several writers against several
+    /// pruners, over a file pre-loaded with enough entries that one
+    /// read-modify-write is slow enough to overlap another. A gentler version
+    /// of this test passed with the lock removed, which is a test that proves
+    /// nothing — the shape below was checked to FAIL without it.
+    #[test]
+    fn a_revocation_is_never_lost_to_a_concurrent_prune() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("revoked-serials");
+        const WRITERS: usize = 4;
+        const PER_WRITER: usize = 40;
+        const PRUNERS: usize = 3;
+        // Far-future expiry: nothing here is prunable, so anything missing at
+        // the end was lost to the race rather than legitimately dropped.
+        let not_after = 4_000_000_000i64;
+
+        // Pre-load so each rewrite has real work to do, widening the window
+        // between a reader's snapshot and its write-back.
+        for i in 0..400u32 {
+            add_revoked_serial_with_expiry(&path, &i.to_be_bytes(), Some(not_after)).expect("seed");
+        }
+
+        std::thread::scope(|scope| {
+            for w in 0..WRITERS {
+                let p = path.clone();
+                scope.spawn(move || {
+                    for i in 0..PER_WRITER {
+                        add_revoked_serial_with_expiry(
+                            &p,
+                            &[b'x', w as u8, i as u8],
+                            Some(not_after),
+                        )
+                        .expect("record revocation");
+                    }
+                });
+            }
+            for _ in 0..PRUNERS {
+                let p = path.clone();
+                scope.spawn(move || {
+                    for _ in 0..(WRITERS * PER_WRITER) {
+                        prune_expired_serials(&p, 1_000_000, 300).expect("prune");
+                    }
+                });
+            }
+        });
+
+        let kept = read_revoked_serials(&path);
+        let mut lost = Vec::new();
+        for w in 0..WRITERS {
+            for i in 0..PER_WRITER {
+                if !kept.contains(&vec![b'x', w as u8, i as u8]) {
+                    lost.push((w, i));
+                }
+            }
+        }
+        assert!(
+            lost.is_empty(),
+            "{} revocation(s) lost to a concurrent prune: {:?}",
+            lost.len(),
+            &lost[..lost.len().min(5)]
+        );
     }
 
     /// The revocation round-trip: an agent cert's serial is recoverable, a
