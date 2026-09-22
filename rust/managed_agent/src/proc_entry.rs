@@ -191,7 +191,7 @@ mod tests {
     fn stream_exists(kernel: &Kernel, path: &str) -> bool {
         kernel
             .sys_stat(path, ROOT_ZONE_ID)
-            .is_some_and(|e| e.entry_type == DT_STREAM as u8)
+            .is_some_and(|e| e.entry_type == DT_STREAM)
     }
 
     fn entry_present(kernel: &Kernel, path: &str) -> bool {

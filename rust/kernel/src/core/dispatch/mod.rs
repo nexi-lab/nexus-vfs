@@ -1253,15 +1253,15 @@ mod tests {
         let mut reg = NativeHookRegistry::new();
         reg.register(Box::new(DummyHook {
             hook_name: "stamper",
-            suffixes: &["/chat-with-me"],
+            suffixes: &["/transcript"],
         }));
         reg.register(Box::new(DummyHook {
             hook_name: "audit",
             suffixes: &[],
         }));
-        assert!(reg.has_mutating_match("/zone/chat-with-me"));
+        assert!(reg.has_mutating_match("/zone/transcript"));
         reg.unregister("stamper");
-        assert!(!reg.has_mutating_match("/zone/chat-with-me"));
+        assert!(!reg.has_mutating_match("/zone/transcript"));
         assert_eq!(reg.count(), 1); // audit remains
     }
 

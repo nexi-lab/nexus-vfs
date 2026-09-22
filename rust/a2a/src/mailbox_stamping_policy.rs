@@ -241,10 +241,16 @@ mod tests {
         assert_eq!(v["from"], "agent-real");
     }
 
+    /// A transcript path, so the `None` results below come from the reason
+    /// each test names and not from the path simply not being a mailbox.
+    fn mbox() -> String {
+        conversation_transcript_path(&conversation_id("agent-a", "agent-b"))
+    }
+
     #[test]
     fn passes_through_when_caller_already_correct() {
         let original = br#"{"from":"agent-a","to":"agent-b"}"#;
-        let out = maybe_stamp_chat_envelope("/proc/p1/chat-with-me", Some("agent-a"), original);
+        let out = maybe_stamp_chat_envelope(&mbox(), Some("agent-a"), original);
         assert!(out.is_none(), "no rewrite when from field already matches");
     }
 
@@ -261,7 +267,7 @@ mod tests {
     #[test]
     fn ignores_when_caller_unset() {
         let original = br#"{"to":"agent-b"}"#;
-        let out = maybe_stamp_chat_envelope("/proc/p1/chat-with-me", None, original);
+        let out = maybe_stamp_chat_envelope(&mbox(), None, original);
         assert!(
             out.is_none(),
             "kernel-internal writes (no agent_id) walk through unmodified"
@@ -271,14 +277,14 @@ mod tests {
     #[test]
     fn ignores_when_caller_empty_string() {
         let original = br#"{"to":"agent-b"}"#;
-        let out = maybe_stamp_chat_envelope("/proc/p1/chat-with-me", Some(""), original);
+        let out = maybe_stamp_chat_envelope(&mbox(), Some(""), original);
         assert!(out.is_none());
     }
 
     #[test]
     fn ignores_non_json_content() {
         let original = b"plain text body, not an envelope";
-        let out = maybe_stamp_chat_envelope("/proc/p1/chat-with-me", Some("agent-a"), original);
+        let out = maybe_stamp_chat_envelope(&mbox(), Some("agent-a"), original);
         assert!(
             out.is_none(),
             "non-JSON content is forwarded untouched — receiver decides"
@@ -291,7 +297,7 @@ mod tests {
         // alone so the kernel doesn't accidentally corrupt valid wire
         // formats it doesn't know about.
         let original = br#"["msg1","msg2"]"#;
-        let out = maybe_stamp_chat_envelope("/proc/p1/chat-with-me", Some("agent-a"), original);
+        let out = maybe_stamp_chat_envelope(&mbox(), Some("agent-a"), original);
         assert!(out.is_none());
     }
 
