@@ -55,10 +55,17 @@ jobs:
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster.exe
-            max_size_bytes: 16252928  # 15.5 MiB — raised from 15.0 for the
-                                      # managed-agent control plane relocated into
-                                      # nexusd-cluster (#241). Measured 15,738,880 bytes
-                                      # on this platform.
+            max_size_bytes: 16777216  # 16.0 MiB — raised from 15.5 for the
+                                      # session-identity plane: five RPCs
+                                      # (MintSessionAgent, RevokeAgentCert, and the
+                                      # three allow-list admin calls) plus the
+                                      # replicated allow-list store. Measured
+                                      # 16,264,704 bytes here against 16,114,688 on
+                                      # the parent commit — ~146 KB, most of it the
+                                      # tonic client+server code generated per RPC.
+                                      # This is the tightest-headroom platform; the
+                                      # other three absorbed the same change inside
+                                      # their existing budgets.
 
 
     steps:
