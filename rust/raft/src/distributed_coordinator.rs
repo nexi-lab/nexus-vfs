@@ -2153,9 +2153,22 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
     }
 }
 
-/// Reconstruct the global VFS path for a DT_MOUNT entry.  Root-zone parents
-/// already publish a global path; nested mounts pre-pend the parent's own
-/// global path looked up via `cross_zone_mounts`.
+/// Where a DT_MOUNT has to be wired, and under which key to remember it.
+///
+/// Both fields are paths, and before this was a struct they were a bare
+/// `(Vec<String>, String)` — two path-typed values with opposite meanings,
+/// which is the same confusion [`MountPath`] exists to end. Naming them
+/// makes a caller that reaches for the wrong one fail to compile.
+struct ReconstructedMount {
+    /// Every global VFS path the mount is reachable at — one per place the
+    /// parent zone is mounted. Empty means the parent zone has no mount
+    /// point yet, which is "defer", not "nowhere".
+    globals: Vec<String>,
+    /// The zone-relative form, which is the key `cross_zone_mounts` is
+    /// indexed by, so `unwire_mount_core` can find this tuple again.
+    zone_relative: String,
+}
+
 /// Every global path a zone-relative mount is reachable at — one per place
 /// the parent zone is mounted.
 ///
@@ -2175,21 +2188,27 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
 /// Returning every path keeps the caller in step with the SSOT: a mount
 /// visible at N places needs N routing entries, not one chosen by sort
 /// order.
-fn reconstruct_global_paths(
+fn reconstruct_mount(
     cross_zone_mounts: &DashMap<String, Vec<CrossZoneMountTuple>>,
     parent_zone_id: &str,
     mount_path: MountPath<'_>,
-) -> (Vec<String>, String) {
+) -> ReconstructedMount {
     // The root zone is not mounted anywhere, so its paths are already global
     // and there is no prefix to add or strip.
     if parent_zone_id == contracts::ROOT_ZONE_ID || parent_zone_id.is_empty() {
         let raw = match mount_path {
             MountPath::Global(p) | MountPath::ZoneRelative(p) => p,
         };
-        return (vec![raw.to_string()], raw.to_string());
+        return ReconstructedMount {
+            globals: vec![raw.to_string()],
+            zone_relative: raw.to_string(),
+        };
     }
     let Some(parents) = cross_zone_mounts.get(parent_zone_id) else {
-        return (Vec::new(), String::new());
+        return ReconstructedMount {
+            globals: Vec::new(),
+            zone_relative: String::new(),
+        };
     };
 
     match mount_path {
@@ -2212,7 +2231,10 @@ fn reconstruct_global_paths(
                         }
                     },
                 );
-            (vec![global.to_string()], relative)
+            ReconstructedMount {
+                globals: vec![global.to_string()],
+                zone_relative: relative,
+            }
         }
         // Zone-relative: reachable under EVERY mount point the zone has, so it
         // reconstructs to one global path per mount point.
@@ -2231,7 +2253,10 @@ fn reconstruct_global_paths(
             // the same path twice, which is not idempotent downstream.
             globals.sort();
             globals.dedup();
-            (globals, relative.to_string())
+            ReconstructedMount {
+                globals,
+                zone_relative: relative.to_string(),
+            }
         }
     }
 }
@@ -2294,8 +2319,10 @@ fn wire_mount_core(
     // the code casually: the un-translated parameter spells its
     // zone-relative-ness in the name; the safe form is named
     // `global_path`.
-    let (global_paths, zone_relative_mount_path) =
-        reconstruct_global_paths(cross_zone_mounts, parent_zone_id, mount_path);
+    let ReconstructedMount {
+        globals: global_paths,
+        zone_relative: zone_relative_mount_path,
+    } = reconstruct_mount(cross_zone_mounts, parent_zone_id, mount_path);
     if global_paths.is_empty() {
         tracing::warn!(
             parent_zone_id = %parent_zone_id,
@@ -2714,7 +2741,10 @@ mod tests {
     fn a_zone_mounted_at_several_paths_wires_every_one() {
         let mounts = doubly_mounted_sharedzone();
 
-        let (globals, relative) = reconstruct_global_paths(
+        let ReconstructedMount {
+            globals,
+            zone_relative,
+        } = reconstruct_mount(
             &mounts,
             "sharedzone",
             MountPath::ZoneRelative("/cc-tasks/founder"),
@@ -2726,7 +2756,7 @@ mod tests {
             "a mount inside a doubly-mounted zone is reachable at BOTH paths; wiring one leaves the other unrouted"
         );
         assert_eq!(
-            relative, "/cc-tasks/founder",
+            zone_relative, "/cc-tasks/founder",
             "the reverse-index key is the form it was given"
         );
     }
@@ -2742,7 +2772,10 @@ mod tests {
     fn a_global_path_names_one_place_and_recovers_its_relative_form() {
         let mounts = doubly_mounted_sharedzone();
 
-        let (globals, relative) = reconstruct_global_paths(
+        let ReconstructedMount {
+            globals,
+            zone_relative,
+        } = reconstruct_mount(
             &mounts,
             "sharedzone",
             MountPath::Global("/shared/cc-tasks/founder"),
@@ -2754,7 +2787,7 @@ mod tests {
             "a path that is already global must not be re-prefixed under every mount point"
         );
         assert_eq!(
-            relative, "/cc-tasks/founder",
+            zone_relative, "/cc-tasks/founder",
             "the reverse index is keyed by the zone-relative form, so unwire can find this tuple later"
         );
     }
@@ -2769,7 +2802,7 @@ mod tests {
             vec![("root".into(), "/shared".into(), "/shared".into())],
         );
 
-        let (globals, _) = reconstruct_global_paths(
+        let ReconstructedMount { globals, .. } = reconstruct_mount(
             &mounts,
             "sharedzone",
             MountPath::ZoneRelative("/cc-tasks/founder"),
@@ -2783,9 +2816,115 @@ mod tests {
     #[test]
     fn an_unmounted_parent_zone_wires_nothing() {
         let mounts: DashMap<String, Vec<CrossZoneMountTuple>> = DashMap::new();
-        let (globals, _) =
-            reconstruct_global_paths(&mounts, "sharedzone", MountPath::ZoneRelative("/cc-tasks"));
+        let ReconstructedMount { globals, .. } =
+            reconstruct_mount(&mounts, "sharedzone", MountPath::ZoneRelative("/cc-tasks"));
         assert!(globals.is_empty());
+    }
+
+    /// A mount inside a doubly-mounted zone is wired at EVERY path it is
+    /// reachable at.
+    ///
+    /// The reconstruction tests above cover the arithmetic; this covers the
+    /// behaviour that regressed. `wire_mount_core` used to wire the single path
+    /// the collapse returned, so on a joiner only `/agents/cc-tasks/founder`
+    /// got a routing entry and reads under `/shared/cc-tasks/founder` kept
+    /// resolving to the parent zone — no error anywhere, just the wrong zone,
+    /// which is how a cross-node `sys_unlink` reached a federation peer instead
+    /// of the local disk.
+    ///
+    /// The router starts EMPTY deliberately. Pre-installing a mount at either
+    /// path would let the `has` probe skip it, and the assertion below would
+    /// then hold under the collapsing version too, proving nothing.
+    #[test]
+    fn wiring_a_doubly_mounted_zone_routes_every_path() {
+        let (_tmp, vfs_router, lock_manager, registry, rt) = wiring_fixture();
+        let mounts = doubly_mounted_sharedzone();
+
+        wire_mount_core(
+            &vfs_router,
+            &lock_manager,
+            &registry,
+            rt.handle(),
+            &mounts,
+            "sharedzone",
+            // A driver-mount inside an already-routed zone, delivered by a raft
+            // apply — so it arrives zone-relative.
+            MountPath::ZoneRelative("/cc-tasks/founder"),
+            "sharedzone",
+        )
+        .expect("wiring a same-zone driver mount should succeed");
+
+        for path in ["/agents/cc-tasks/founder", "/shared/cc-tasks/founder"] {
+            assert_eq!(
+                vfs_router
+                    .get(path, "sharedzone")
+                    .map(|e| e.target_zone_id.clone()),
+                Some(Some("sharedzone".to_string())),
+                "{path} was left unrouted, so reads under it resolve to the parent zone instead of the mount"
+            );
+        }
+    }
+
+    /// Wiring never replaces a mount that is already live.
+    ///
+    /// On the SSOT node `kernel.add_mount` has already registered the
+    /// driver-mount's LocalConnector at its global path. A federation
+    /// placeholder carries no backend, so installing one over that entry sends
+    /// `sys_read` and `sys_unlink` to a peer instead of to the local disk. The
+    /// `vfs_router.has` probe is what prevents it; only a placeholder carries a
+    /// `target_zone_id`, which is how the two are told apart here.
+    #[test]
+    fn wiring_leaves_a_live_mount_in_place() {
+        let (_tmp, vfs_router, lock_manager, registry, rt) = wiring_fixture();
+        let mounts = doubly_mounted_sharedzone();
+        vfs_router.add_mount("/shared/cc-tasks/founder", "sharedzone", None, false);
+
+        wire_mount_core(
+            &vfs_router,
+            &lock_manager,
+            &registry,
+            rt.handle(),
+            &mounts,
+            "sharedzone",
+            MountPath::ZoneRelative("/cc-tasks/founder"),
+            "sharedzone",
+        )
+        .expect("wiring a same-zone driver mount should succeed");
+
+        assert_eq!(
+            vfs_router
+                .get("/shared/cc-tasks/founder", "sharedzone")
+                .map(|e| e.target_zone_id.clone()),
+            Some(None),
+            "the live mount was replaced by a backend-less placeholder"
+        );
+        assert!(
+            vfs_router.has("/agents/cc-tasks/founder", "sharedzone"),
+            "the zone's other mount point still needs its own entry"
+        );
+    }
+
+    /// The dependencies `wire_mount_core` takes. The `TempDir` is handed back
+    /// because dropping it would delete the registry's base path.
+    fn wiring_fixture() -> (
+        TempDir,
+        Arc<kernel::core::vfs_router::VFSRouter>,
+        Arc<kernel::core::lock::LockManager>,
+        Arc<crate::raft::ZoneRaftRegistry>,
+        tokio::runtime::Runtime,
+    ) {
+        let tmp = TempDir::new().unwrap();
+        let registry = Arc::new(crate::raft::ZoneRaftRegistry::new(
+            tmp.path().to_path_buf(),
+            1,
+        ));
+        (
+            tmp,
+            Arc::new(kernel::core::vfs_router::VFSRouter::new()),
+            Arc::new(kernel::core::lock::LockManager::new()),
+            registry,
+            tokio::runtime::Runtime::new().unwrap(),
+        )
     }
 
     /// `sharedzone` mounted at both `/shared` and `/agents` — the shape the
