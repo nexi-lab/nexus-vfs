@@ -1844,6 +1844,13 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         a2a::install_foreign_agent_containment(&kernel);
     }
 
+    // The session-mint allow-list handle, created here and bound when the
+    // control zone comes up. The minter below needs it at construction, but the
+    // consensus it reads through does not exist yet — so the slot travels, and
+    // an unbound slot denies.
+    let session_mint_allow_slot =
+        nexus_raft::session_mint_allow_store::new_session_mint_allow_slot();
+
     // Remote agent-cert mint (task #40): the CA holder installs an `AgentMinter`
     // into the raft gRPC server's slot, so `auth mint --subject-type agent` on
     // ANY node just-works — a node without the CA key forwards to the founder
@@ -1858,6 +1865,10 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
                 Arc::new(FounderAgentMinter {
                     store: auth::KernelSlotStore::new_arc(Arc::clone(&kernel)),
                     tls_dir,
+                    // Bound once the control zone is up (below); until then
+                    // session minting is closed, which is the safe default for
+                    // a gate that cannot read its policy.
+                    session_allow: Arc::clone(&session_mint_allow_slot),
                 });
             *zm.agent_minter_slot().write() = Some(minter);
             tracing::info!("CA holder armed MintAgent RPC (remote agent-cert mint)");
@@ -2596,6 +2607,20 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         // under TLS). Load already-registered anchors once at boot (a restart
         // re-derives the live set from the replicated store), then refresh on
         // each foreign-ca apply — mirroring the auth eviction observer above.
+        // The session-mint allow-list rides the same control-zone consensus as
+        // the auth records and the foreign-CA anchors. Binding it here is what
+        // opens session minting at all: until this runs, the gate denies.
+        {
+            let allow = Arc::new(
+                nexus_raft::session_mint_allow_store::RaftSessionMintAllowStore::new(
+                    consensus.clone(),
+                    cred_zone.runtime_handle(),
+                ),
+            );
+            *session_mint_allow_slot.write() = Some(allow);
+            tracing::info!("session-mint allow-list bound (MintSessionAgent gate is live)");
+        }
+
         if let Some(verifier) = zm.foreign_ca_verifier() {
             let fca_store = Arc::new(nexus_raft::foreign_ca_store::RaftForeignCaStore::new(
                 consensus.clone(),
@@ -4518,6 +4543,16 @@ fn write_agent_bundle(
 struct FounderAgentMinter {
     store: Arc<dyn kernel::hal::auth_key_store::AuthKeyStore>,
     tls_dir: PathBuf,
+    /// The session-mint allow-list, bound after the control zone comes up.
+    ///
+    /// Late-bound because the CA key — which is what decides whether this node
+    /// mints at all — is known at boot, while the control-zone consensus the
+    /// list is replicated through is not ready until later. Same late-binding
+    /// idiom as the minter slot this struct is installed into.
+    ///
+    /// Unbound means session minting is CLOSED, not open: a gate that cannot
+    /// read its policy denies.
+    session_allow: nexus_raft::session_mint_allow_store::SessionMintAllowSlot,
 }
 
 #[tonic::async_trait]
@@ -4563,6 +4598,113 @@ impl nexus_raft::agent_minter::AgentMinter for FounderAgentMinter {
             key_pem,
             ca_pem,
         })
+    }
+
+    async fn mint_session(
+        &self,
+        caller_cert_der: Option<Vec<u8>>,
+        owner_id: &str,
+        validity_secs: u64,
+    ) -> std::result::Result<nexus_raft::agent_minter::AgentBundle, String> {
+        // Gate: an allow-listed AGENT, not a node. This is the one mint an
+        // agent cert may reach, so the allow-list is the whole thing standing
+        // between it and "any agent may mint an identity for anyone".
+        let caller = gate_allowlisted_session_minter(caller_cert_der, &self.session_allow)?;
+
+        // A fresh subject per call: a session credential names one session, so
+        // a leaked one authorises exactly that session and revoking it cannot
+        // touch another.
+        let subject_id = nexus_raft::transport::session_agent_name(&uuid_v4());
+
+        let ca_pem = std::fs::read(self.tls_dir.join("ca.pem"))
+            .map_err(|e| format!("read {}/ca.pem: {e}", self.tls_dir.display()))?;
+        let ca_key_pem = std::fs::read(self.tls_dir.join("ca-key.pem"))
+            .map_err(|e| format!("read {}/ca-key.pem: {e}", self.tls_dir.display()))?;
+        let (cert_pem, key_pem) = nexus_raft::transport::generate_session_agent_cert(
+            &subject_id,
+            owner_id,
+            validity_secs,
+            &ca_pem,
+            &ca_key_pem,
+        )
+        .map_err(|e| format!("generate session agent cert: {e}"))?;
+
+        // Nothing is written to the auth store. A uuid subject is unique
+        // without a uniqueness record, the cert carries its own expiry, and the
+        // owner rides in the cert — so there is no durable fact here to record,
+        // only a credential that expires on its own. Revocation writes the one
+        // fact that IS durable, and only if it ever happens.
+        tracing::info!(
+            caller = %caller,
+            owner = %owner_id,
+            subject = %subject_id,
+            validity_secs,
+            "minted a session credential"
+        );
+
+        Ok(nexus_raft::agent_minter::AgentBundle {
+            cert_pem,
+            key_pem,
+            ca_pem,
+        })
+    }
+}
+
+/// Gate a session mint to an allow-listed AGENT caller, returning its resolved
+/// display id for the audit line.
+///
+/// Fails closed at every step that cannot produce a definite "yes": no client
+/// cert, a cert that does not parse, a caller that is not an agent, an unarmed
+/// allow-list, an allow-list that cannot be read, or an id that is not on it.
+/// Only the last of those is an ordinary refusal; the rest are logged at warn
+/// because they mean the gate could not do its job, which an operator needs to
+/// see rather than read as a quiet denial.
+fn gate_allowlisted_session_minter(
+    caller_cert_der: Option<Vec<u8>>,
+    slot: &nexus_raft::session_mint_allow_store::SessionMintAllowSlot,
+) -> std::result::Result<String, String> {
+    const OP: &str = "MintSessionAgent";
+    let der = caller_cert_der.ok_or_else(|| format!("{OP} requires an mTLS client certificate"))?;
+    let peer = transport::peer_identity::from_der(&der)
+        .ok_or_else(|| format!("{OP}: client certificate did not parse"))?;
+    // An agent identity, not a node: a node holds the CA and mints directly.
+    if peer.agent_name.is_none() {
+        return Err(format!(
+            "{OP} is for agent callers; {} presented a non-agent certificate",
+            peer.display_id(),
+        ));
+    }
+    // The id this agent is known by everywhere else — bare for a local agent,
+    // org-qualified for a foreign one — so an operator can allow-list the id
+    // they read in a log, and allow-listing a local `moss` can never admit
+    // another org's `moss`.
+    let caller = peer
+        .resolved_agent_id()
+        .ok_or_else(|| format!("{OP}: caller presented no agent identity"))?;
+
+    let store = slot.read().as_ref().cloned();
+    let Some(store) = store else {
+        tracing::warn!(
+            caller = %caller,
+            "{OP} refused: the session-mint allow-list is not armed on this node"
+        );
+        return Err(format!("{OP} is not available on this node"));
+    };
+    match store.is_allowed(&caller) {
+        Ok(true) => Ok(caller),
+        Ok(false) => Err(format!(
+            "{OP}: {caller} is not permitted to mint session credentials"
+        )),
+        Err(e) => {
+            // Unreadable policy is not permission. Loud, because a denial that
+            // comes from a broken store looks exactly like a correct refusal.
+            tracing::warn!(
+                caller = %caller,
+                error = %e,
+                "{OP} refused: the allow-list could not be read"
+            );
+            Err(format!("{OP}: allow-list unavailable"))
+        }
     }
 }
 
@@ -5825,38 +5967,8 @@ mod tests {
     /// drive, without a live daemon.
     #[tokio::test]
     async fn founder_agent_minter_gates_to_nodes_and_signs() {
-        use kernel::hal::auth_key_store::{AuthKeyStore, AuthKeyStoreError};
         use nexus_raft::agent_minter::AgentMinter;
         use nexus_raft::transport::{generate_agent_cert, generate_node_cert, generate_zone_ca};
-
-        #[derive(Default)]
-        struct MemStore {
-            records: std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
-        }
-        impl AuthKeyStore for MemStore {
-            fn get(&self, k: &str) -> Result<Option<Vec<u8>>, AuthKeyStoreError> {
-                Ok(self.records.lock().unwrap().get(k).cloned())
-            }
-            fn put(&self, k: &str, r: &[u8]) -> Result<(), AuthKeyStoreError> {
-                self.records
-                    .lock()
-                    .unwrap()
-                    .insert(k.to_string(), r.to_vec());
-                Ok(())
-            }
-            fn delete(&self, k: &str) -> Result<bool, AuthKeyStoreError> {
-                Ok(self.records.lock().unwrap().remove(k).is_some())
-            }
-            fn list(&self) -> Result<Vec<(String, Vec<u8>)>, AuthKeyStoreError> {
-                Ok(self
-                    .records
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .map(|(h, r)| (h.clone(), r.clone()))
-                    .collect())
-            }
-        }
 
         // A real cluster CA on disk — the minter reads ca.pem + ca-key.pem.
         let (ca_pem, ca_key_pem) = generate_zone_ca("root").expect("ca");
@@ -5867,7 +5979,13 @@ mod tests {
         std::fs::write(tls_dir.join("ca-key.pem"), &ca_key_pem).unwrap();
 
         let store: Arc<dyn AuthKeyStore> = Arc::new(MemStore::default());
-        let minter = FounderAgentMinter { store, tls_dir };
+        let minter = FounderAgentMinter {
+            store,
+            tls_dir,
+            // This test exercises the node gate on `mint`; session minting is
+            // unbound, which is exactly the closed default.
+            session_allow: nexus_raft::session_mint_allow_store::new_session_mint_allow_slot(),
+        };
 
         let der = |p: &[u8]| ::pem::parse(p).unwrap().contents().to_vec();
         let (node_cert, _k) =
@@ -5907,6 +6025,162 @@ mod tests {
         assert!(
             dup.contains("already has an active credential"),
             "unexpected dup error: {dup}"
+        );
+    }
+
+    use kernel::hal::auth_key_store::{AuthKeyStore, AuthKeyStoreError};
+
+    /// In-memory `AuthKeyStore` for the minter tests — shared by both so the
+    /// "session minting writes nothing" assertion and the agent-mint record
+    /// assertions are made against the same store behaviour.
+    #[derive(Default)]
+    struct MemStore {
+        records: std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
+    }
+    impl AuthKeyStore for MemStore {
+        fn get(&self, k: &str) -> Result<Option<Vec<u8>>, AuthKeyStoreError> {
+            Ok(self.records.lock().unwrap().get(k).cloned())
+        }
+        fn put(&self, k: &str, r: &[u8]) -> Result<(), AuthKeyStoreError> {
+            self.records
+                .lock()
+                .unwrap()
+                .insert(k.to_string(), r.to_vec());
+            Ok(())
+        }
+        fn delete(&self, k: &str) -> Result<bool, AuthKeyStoreError> {
+            Ok(self.records.lock().unwrap().remove(k).is_some())
+        }
+        fn list(&self) -> Result<Vec<(String, Vec<u8>)>, AuthKeyStoreError> {
+            Ok(self
+                .records
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(h, r)| (h.clone(), r.clone()))
+                .collect())
+        }
+    }
+
+    /// The session-mint gate: who may ask, and what happens when it cannot tell.
+    ///
+    /// Runs against a real CA and a live control zone, because the interesting
+    /// cases are the refusals and a mocked allow-list would prove nothing about
+    /// them. Covers: closed when unarmed, closed for a caller not on the list,
+    /// open for one that is, and — the case a naming shortcut would get wrong —
+    /// closed for a foreign namesake of an allow-listed local agent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_mint_is_gated_to_the_allow_list_and_fails_closed() {
+        use nexus_raft::agent_minter::AgentMinter;
+        use nexus_raft::session_mint_allow_store::{
+            new_session_mint_allow_slot, RaftSessionMintAllowStore,
+        };
+        use nexus_raft::transport::{generate_agent_cert, generate_node_cert, generate_zone_ca};
+
+        let (ca_pem, ca_key_pem) = generate_zone_ca("root").expect("ca");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tls_dir = dir.path().join("tls");
+        std::fs::create_dir_all(&tls_dir).unwrap();
+        std::fs::write(tls_dir.join("ca.pem"), &ca_pem).unwrap();
+        std::fs::write(tls_dir.join("ca-key.pem"), &ca_key_pem).unwrap();
+
+        let slot = new_session_mint_allow_slot();
+        let minter = FounderAgentMinter {
+            store: Arc::new(MemStore::default()) as Arc<dyn AuthKeyStore>,
+            tls_dir,
+            session_allow: Arc::clone(&slot),
+        };
+        let der = |p: &[u8]| ::pem::parse(p).unwrap().contents().to_vec();
+        let (moss_cert, _k) = generate_agent_cert("moss", &ca_pem, &ca_key_pem).unwrap();
+        let (other_cert, _k) = generate_agent_cert("stranger", &ca_pem, &ca_key_pem).unwrap();
+        let (node_cert, _k) =
+            generate_node_cert(7, "root", &ca_pem, &ca_key_pem, &[], Some("box")).unwrap();
+
+        // Unarmed: closed, not open. This is the state during boot.
+        let e = match minter
+            .mint_session(Some(der(&moss_cert)), "alice", 3600)
+            .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("an unarmed allow-list must not mint"),
+        };
+        assert!(e.contains("not available"), "unexpected unarmed error: {e}");
+
+        // Arm it against a live control zone.
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = nexus_raft::raft::ZoneRaftRegistry::new(tmp.path().to_path_buf(), 1);
+        let runtime = tokio::runtime::Handle::current();
+        let node = registry
+            .create_zone("root", vec![], &runtime)
+            .expect("zone");
+        node.campaign().await.expect("campaign");
+        let allow = Arc::new(RaftSessionMintAllowStore::new(node, runtime));
+        *slot.write() = Some(Arc::clone(&allow));
+
+        // Armed but empty: still closed.
+        assert!(
+            minter
+                .mint_session(Some(der(&moss_cert)), "alice", 3600)
+                .await
+                .is_err(),
+            "an empty allow-list permits nobody"
+        );
+
+        allow.allow("moss").expect("allow moss");
+
+        // Not on the list ⇒ refused, and the message names the caller.
+        let e = match minter
+            .mint_session(Some(der(&other_cert)), "alice", 3600)
+            .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("a caller off the list must not mint"),
+        };
+        assert!(e.contains("stranger"), "unexpected refusal: {e}");
+
+        // A node cert is not an agent caller — this door is for agents; a node
+        // holds the CA and mints directly.
+        assert!(
+            minter
+                .mint_session(Some(der(&node_cert)), "alice", 3600)
+                .await
+                .is_err(),
+            "a node presents no agent identity to match against the list"
+        );
+
+        // No client cert at all ⇒ refused.
+        assert!(minter.mint_session(None, "alice", 3600).await.is_err());
+
+        // On the list ⇒ a session credential for the named owner.
+        let bundle = minter
+            .mint_session(Some(der(&moss_cert)), "alice", 3600)
+            .await
+            .expect("an allow-listed caller mints");
+        let id = transport::peer_identity::from_der(&der(&bundle.cert_pem))
+            .expect("the minted cert parses");
+        assert_eq!(id.owner.as_deref(), Some("alice"), "bound to its owner");
+        assert!(
+            id.agent_name
+                .as_deref()
+                .is_some_and(|n| n.starts_with("session-")),
+            "a session subject, got {:?}",
+            id.agent_name
+        );
+        assert_eq!(id.node_id, None, "a session credential is never a node");
+
+        // Two mints never share a subject: one session, one identity.
+        let second = minter
+            .mint_session(Some(der(&moss_cert)), "alice", 3600)
+            .await
+            .expect("mints again");
+        let id2 = transport::peer_identity::from_der(&der(&second.cert_pem)).unwrap();
+        assert_ne!(id.agent_name, id2.agent_name, "subjects must not repeat");
+
+        // Minting wrote nothing to the auth store: a uuid subject needs no
+        // uniqueness record and an expiring credential is not a durable fact.
+        assert!(
+            minter.store.list().expect("list").is_empty(),
+            "session minting must not persist per-session state"
         );
     }
 

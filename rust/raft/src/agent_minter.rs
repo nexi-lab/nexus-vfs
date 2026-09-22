@@ -36,6 +36,29 @@ pub trait AgentMinter: Send + Sync {
         display_name: &str,
         allow_existing: bool,
     ) -> Result<AgentBundle, String>;
+
+    /// Sign a SESSION credential: an agent identity bound to `owner_id`, valid
+    /// for `validity_secs`, with a subject minted fresh per call and never
+    /// reused.
+    ///
+    /// Gated differently from [`Self::mint`], and that difference is the point.
+    /// `mint` is node-only — an agent may not mint agents. This one is reachable
+    /// by an AGENT, so that a front door holding only an agent cert can obtain a
+    /// per-session identity for a person without ever holding a node cert.
+    /// What keeps that from being "any agent may forge any identity" is that the
+    /// caller must be on the replicated allow-list, matched on its resolved
+    /// display id; the impl fails closed when that list cannot be read.
+    ///
+    /// The owner's truthfulness is the caller's responsibility: it is the
+    /// authenticated front door for people, and this seam exists so an agent
+    /// cannot forge its OWN identity and so its actions can be attributed —
+    /// not so the cluster can independently verify who a person is.
+    async fn mint_session(
+        &self,
+        caller_cert_der: Option<Vec<u8>>,
+        owner_id: &str,
+        validity_secs: u64,
+    ) -> Result<AgentBundle, String>;
 }
 
 /// Late-bindable slot. Installed ONLY on the CA holder (founder); left empty on

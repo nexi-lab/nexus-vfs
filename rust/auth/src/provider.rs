@@ -475,10 +475,10 @@ fn resolve_verified_peer(
         // existing consumers parse bare local `from`s. A foreign cert can
         // never resolve to a bare local name (classify always sets its
         // `trust_domain`), so it cannot impersonate a local agent.
-        let agent_id = match peer.trust_domain {
-            Some(_) => peer.display_id(),
-            None => agent.clone(),
-        };
+        // One definition of "the id this agent is known by", shared with
+        // anything matching an agent against policy — see
+        // `PeerIdentity::resolved_agent_id`.
+        let agent_id = peer.resolved_agent_id().unwrap_or_else(|| agent.clone());
         // Carry the trust domain into the context so the permission
         // gate can contain a FOREIGN agent to its mailbox. A local
         // agent keeps `None` and is unaffected. SSOT: the value comes
