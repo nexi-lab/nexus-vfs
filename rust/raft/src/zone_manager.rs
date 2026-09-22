@@ -213,6 +213,7 @@ pub struct ZoneManager {
     /// siblings) can record cross-org CA anchors once the daemon installs a
     /// `ForeignCaRegistrar`. Empty under `--no-tls`.
     foreign_ca_registrar_slot: crate::foreign_ca_registrar::ForeignCaRegistrarSlot,
+    session_mint_admin_slot: crate::session_mint_admin::SessionMintAdminSlot,
     /// The federated mTLS client-cert verifier — the client-auth trust roots,
     /// hot-swappable so a foreign CA registered at runtime is trusted without a
     /// restart. Built eagerly from the cluster CA (the only root until the
@@ -448,6 +449,7 @@ impl ZoneManager {
         let key_minter_slot = crate::key_minter::new_key_minter_slot();
         let foreign_ca_registrar_slot =
             crate::foreign_ca_registrar::new_foreign_ca_registrar_slot();
+        let session_mint_admin_slot = crate::session_mint_admin::new_session_mint_admin_slot();
         // Build the federated client-cert verifier eagerly from the cluster CA
         // when TLS is on, so the serve path (below) and the cross-org
         // apply-observer (cluster profile, via `foreign_ca_verifier()`) share ONE
@@ -466,6 +468,7 @@ impl ZoneManager {
             .with_agent_minter_slot(agent_minter_slot.clone())
             .with_key_minter_slot(key_minter_slot.clone())
             .with_foreign_ca_registrar_slot(foreign_ca_registrar_slot.clone())
+            .with_session_mint_admin_slot(session_mint_admin_slot.clone())
             .with_foreign_ca_verifier(foreign_ca_verifier.clone());
         // Node enrollment (JoinCluster cert provisioning) is NOT served here —
         // this bind is strict mTLS, which a certless joiner cannot reach. The
@@ -525,6 +528,7 @@ impl ZoneManager {
             agent_minter_slot,
             key_minter_slot,
             foreign_ca_registrar_slot,
+            session_mint_admin_slot,
             foreign_ca_verifier,
             pending_mounts: parking_lot::Mutex::new(BTreeMap::new()),
         }))
@@ -553,6 +557,14 @@ impl ZoneManager {
     /// install a concrete registrar on every auth-on daemon. Clone-cheap.
     pub fn foreign_ca_registrar_slot(&self) -> crate::foreign_ca_registrar::ForeignCaRegistrarSlot {
         self.foreign_ca_registrar_slot.clone()
+    }
+
+    /// Hand back the session-mint admin slot so the cluster profile can install
+    /// the impl once the control zone is up. Same late-binding shape as the
+    /// foreign-CA registrar above, for the same reason: the store it administers
+    /// rides the control-zone consensus, which is not ready at construction.
+    pub fn session_mint_admin_slot(&self) -> crate::session_mint_admin::SessionMintAdminSlot {
+        self.session_mint_admin_slot.clone()
     }
 
     /// Hand back the shared federated client-cert verifier so the cluster profile

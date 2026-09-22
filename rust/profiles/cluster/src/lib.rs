@@ -2618,8 +2618,15 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
                     cred_zone.runtime_handle(),
                 ),
             );
-            *session_mint_allow_slot.write() = Some(allow);
-            tracing::info!("session-mint allow-list bound (MintSessionAgent gate is live)");
+            *session_mint_allow_slot.write() = Some(Arc::clone(&allow));
+            // The same store behind the operator-facing RPCs. One store, two
+            // faces: the gate reads it per mint, the admin RPCs change it.
+            let admin: Arc<dyn nexus_raft::session_mint_admin::SessionMintAdmin> =
+                Arc::new(DaemonSessionMintAdmin { store: allow });
+            *zm.session_mint_admin_slot().write() = Some(admin);
+            tracing::info!(
+                "session-mint allow-list bound (MintSessionAgent gate + admin RPCs live)"
+            );
         }
 
         if let Some(verifier) = zm.foreign_ca_verifier() {
@@ -4759,6 +4766,56 @@ fn gate_allowlisted_session_minter(
             );
             Err(format!("{OP}: allow-list unavailable"))
         }
+    }
+}
+
+/// Daemon-side [`nexus_raft::session_mint_admin::SessionMintAdmin`]: administers
+/// the replicated session-mint allow-list for a remote CLI caller.
+///
+/// Node-gated on every operation, including `list`. Reading the policy is not
+/// the same as reading data: it names which identities hold a delegated
+/// authority, which is reconnaissance for anyone deciding what to steal.
+struct DaemonSessionMintAdmin {
+    store: Arc<nexus_raft::session_mint_allow_store::RaftSessionMintAllowStore>,
+}
+
+#[tonic::async_trait]
+impl nexus_raft::session_mint_admin::SessionMintAdmin for DaemonSessionMintAdmin {
+    async fn allow(
+        &self,
+        caller_cert_der: Option<Vec<u8>>,
+        agent_id: &str,
+    ) -> std::result::Result<(), String> {
+        gate_node_caller(caller_cert_der, "AllowSessionMinter")?;
+        if agent_id.is_empty() {
+            return Err("AllowSessionMinter: agent_id must not be empty".to_string());
+        }
+        self.store.allow(agent_id).map_err(|e| e.to_string())?;
+        tracing::info!(agent_id, "allowed an agent to mint session credentials");
+        Ok(())
+    }
+
+    async fn deny(
+        &self,
+        caller_cert_der: Option<Vec<u8>>,
+        agent_id: &str,
+    ) -> std::result::Result<bool, String> {
+        gate_node_caller(caller_cert_der, "DenySessionMinter")?;
+        let was_present = self.store.deny(agent_id).map_err(|e| e.to_string())?;
+        tracing::info!(
+            agent_id,
+            was_present,
+            "withdrew an agent's session-mint permission"
+        );
+        Ok(was_present)
+    }
+
+    async fn list(
+        &self,
+        caller_cert_der: Option<Vec<u8>>,
+    ) -> std::result::Result<Vec<String>, String> {
+        gate_node_caller(caller_cert_der, "ListSessionMinters")?;
+        self.store.list().map_err(|e| e.to_string())
     }
 }
 

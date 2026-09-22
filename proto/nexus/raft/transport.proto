@@ -151,6 +151,18 @@ service ZoneApiService {
   // longer decide anything.
   rpc RevokeAgentCert(RevokeAgentCertRequest) returns (RevokeAgentCertResponse);
 
+  // AllowSessionMinter / DenySessionMinter / ListSessionMinters administer the
+  // replicated session-mint allow-list on a live daemon. NODE-gated: an agent
+  // that could edit this list could grant itself the right to mint identities
+  // for anyone, which is the forgery MintSessionAgent's gate exists to prevent.
+  //
+  // The write forwards to the control-zone leader and replicates, so the policy
+  // is one value cluster-wide instead of a per-broker copy that nothing
+  // reconciles.
+  rpc AllowSessionMinter(AllowSessionMinterRequest) returns (AllowSessionMinterResponse);
+  rpc DenySessionMinter(DenySessionMinterRequest) returns (DenySessionMinterResponse);
+  rpc ListSessionMinters(ListSessionMintersRequest) returns (ListSessionMintersResponse);
+
   // MintKey mints an `sk-` user/service credential through the live daemon, so
   // `auth mint --subject-type user|service` just-works while the daemon holds
   // the store lock (no "stop the daemon first"). The daemon HMACs the key with
@@ -383,6 +395,39 @@ message MintSessionAgentResponse {
   // The minted subject (`session-<uuid>`), so a caller can log what it holds
   // without parsing its own certificate.
   string subject_id = 6;
+}
+
+// AllowSessionMinterRequest permits one agent to mint session credentials.
+message AllowSessionMinterRequest {
+  // The id the agent is known by: bare for a local agent, org-qualified
+  // `{trust_domain}/agent/{name}` for a foreign one. A bare name is unique only
+  // within one CA's namespace, so the qualified form is what makes an entry
+  // name one identity rather than every namesake.
+  string agent_id = 1;
+}
+
+message AllowSessionMinterResponse {
+  bool success = 1;
+  optional string error = 2;
+}
+
+message DenySessionMinterRequest {
+  string agent_id = 1;
+}
+
+message DenySessionMinterResponse {
+  bool success = 1;
+  optional string error = 2;
+  // Whether an entry was actually present (advisory, for operator output).
+  bool was_present = 3;
+}
+
+message ListSessionMintersRequest {}
+
+message ListSessionMintersResponse {
+  bool success = 1;
+  optional string error = 2;
+  repeated string agent_ids = 3;
 }
 
 // RevokeAgentCertRequest hands over the certificate to revoke, PEM-encoded.

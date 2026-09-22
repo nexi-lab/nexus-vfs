@@ -6,10 +6,11 @@ use super::proto::nexus::raft::{
     node_enrollment_service_client::NodeEnrollmentServiceClient,
     raft_command::Command as ProtoCommandVariant, raft_query::Query as ProtoQueryVariant,
     zone_api_service_client::ZoneApiServiceClient,
-    zone_transport_service_client::ZoneTransportServiceClient, AcquireLock, DeleteMetadata,
-    DeleteZoneRequest, DiscoverZonesRequest, EcReplicationEntry, ExtendLock, GetClusterInfoRequest,
-    GetCrlRequest, GetLockInfo, GetMetadata, JoinClusterRequest, JoinZoneRequest,
-    ListForeignCasRequest, ListKeysRequest, ListMetadata, MintAgentRequest, MintKeyRequest,
+    zone_transport_service_client::ZoneTransportServiceClient, AcquireLock,
+    AllowSessionMinterRequest, DeleteMetadata, DeleteZoneRequest, DenySessionMinterRequest,
+    DiscoverZonesRequest, EcReplicationEntry, ExtendLock, GetClusterInfoRequest, GetCrlRequest,
+    GetLockInfo, GetMetadata, JoinClusterRequest, JoinZoneRequest, ListForeignCasRequest,
+    ListKeysRequest, ListMetadata, ListSessionMintersRequest, MintAgentRequest, MintKeyRequest,
     MintSessionAgentRequest, ProposeRequest, PutMetadata, QueryRequest, RaftCommand, RaftQuery,
     RegisterForeignCaRequest, ReleaseLock, RemoveVoterRequest, ReplicateEntriesRequest,
     RevokeAgentCertRequest, RevokeKeyRequest, SnapshotEcStateRequest, StepMessageRequest,
@@ -1067,6 +1068,73 @@ pub struct MintAgentResult {
 /// the caller tries the next peer. mTLS-only — the caller presents its NODE
 /// cert, which the founder's `AgentMinter` gate requires (an agent cert is a
 /// pure identity and must not be able to mint further agents).
+/// Permit `agent_id` to mint session credentials, against a live daemon.
+///
+/// Node-gated server-side: `tls` must carry a cluster node's client
+/// certificate. Idempotent.
+pub async fn call_allow_session_minter_rpc(
+    peer_addr: &str,
+    agent_id: &str,
+    tls: Option<super::TlsConfig>,
+    timeout_secs: u64,
+) -> Result<std::result::Result<(), String>> {
+    let mut client = connect_zone_api(peer_addr, tls, timeout_secs, "AllowSessionMinter").await?;
+    let response = client
+        .allow_session_minter(AllowSessionMinterRequest {
+            agent_id: agent_id.to_string(),
+        })
+        .await
+        .map_err(|e| TransportError::Rpc(format!("AllowSessionMinter RPC failed: {e}")))?
+        .into_inner();
+    Ok(if response.success {
+        Ok(())
+    } else {
+        Err(response.error.unwrap_or_else(|| "refused".to_string()))
+    })
+}
+
+/// Withdraw an agent's session-mint permission. `Ok(true)` if an entry was
+/// present.
+pub async fn call_deny_session_minter_rpc(
+    peer_addr: &str,
+    agent_id: &str,
+    tls: Option<super::TlsConfig>,
+    timeout_secs: u64,
+) -> Result<std::result::Result<bool, String>> {
+    let mut client = connect_zone_api(peer_addr, tls, timeout_secs, "DenySessionMinter").await?;
+    let response = client
+        .deny_session_minter(DenySessionMinterRequest {
+            agent_id: agent_id.to_string(),
+        })
+        .await
+        .map_err(|e| TransportError::Rpc(format!("DenySessionMinter RPC failed: {e}")))?
+        .into_inner();
+    Ok(if response.success {
+        Ok(response.was_present)
+    } else {
+        Err(response.error.unwrap_or_else(|| "refused".to_string()))
+    })
+}
+
+/// Enumerate the agents permitted to mint session credentials.
+pub async fn call_list_session_minters_rpc(
+    peer_addr: &str,
+    tls: Option<super::TlsConfig>,
+    timeout_secs: u64,
+) -> Result<std::result::Result<Vec<String>, String>> {
+    let mut client = connect_zone_api(peer_addr, tls, timeout_secs, "ListSessionMinters").await?;
+    let response = client
+        .list_session_minters(ListSessionMintersRequest {})
+        .await
+        .map_err(|e| TransportError::Rpc(format!("ListSessionMinters RPC failed: {e}")))?
+        .into_inner();
+    Ok(if response.success {
+        Ok(response.agent_ids)
+    } else {
+        Err(response.error.unwrap_or_else(|| "refused".to_string()))
+    })
+}
+
 /// What a session mint returned: the bundle, plus the subject the server chose.
 pub struct MintSessionAgentResult {
     pub success: bool,
