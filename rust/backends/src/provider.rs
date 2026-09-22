@@ -4,6 +4,11 @@
 //! constructor.  Registered by the host binary at startup via
 //! `kernel::hal::object_store_provider::set_provider`.
 //!
+//! The `anthropic` / `openai` arms make a model call a VFS write, so the
+//! prompt crosses `Kernel::apply_mutating_write_hooks` — the one seam every
+//! write syscall funnels through — instead of leaving the process as an
+//! outbound HTTP request no hook can see.
+//!
 //! Dispatch arms are `#[cfg]`-gated on the same per-driver Cargo
 //! features the rest of the crate uses, so a slim binary (e.g.
 //! `nexus-cluster`, which compiles only `driver-path-local` +
@@ -43,6 +48,32 @@ fn required_param<'a>(
     backend: &str,
 ) -> Result<&'a str, String> {
     param(params, key).ok_or_else(|| format!("{backend} requires {key}"))
+}
+
+/// Default endpoints for the LLM connectors. Overridden per mount via
+/// `base_url` — for a proxy such as SudoRouter, or a local fixture in a test.
+#[cfg(feature = "driver-anthropic")]
+const ANTHROPIC_DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
+#[cfg(feature = "driver-anthropic")]
+const ANTHROPIC_DEFAULT_MODEL: &str = "claude-sonnet-4-5";
+#[cfg(feature = "driver-openai")]
+const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com";
+#[cfg(feature = "driver-openai")]
+const OPENAI_DEFAULT_MODEL: &str = "gpt-4o";
+
+/// An LLM connector's API key: the mount param if present, else the named
+/// environment variable, else empty.
+///
+/// Empty is allowed on purpose. A mount against a local fixture or a proxy
+/// that authenticates by other means needs no key, and refusing to build the
+/// mount would make those untestable; the call itself fails later, where the
+/// error names the provider's own rejection rather than our guess about it.
+#[cfg(any(feature = "driver-anthropic", feature = "driver-openai"))]
+fn ai_api_key(params: &HashMap<String, String>, env_var: &str) -> String {
+    param(params, "api_key")
+        .map(str::to_string)
+        .or_else(|| std::env::var(env_var).ok().filter(|v| !v.is_empty()))
+        .unwrap_or_default()
 }
 
 /// Parse a bool param, defaulting to `false`.
@@ -208,6 +239,69 @@ impl ObjectStoreProvider for DefaultObjectStoreProvider {
                     access_token,
                 )
                 .map_err(|e| format!("gcs init: {e}"))?;
+                Ok(backend_only(Arc::new(backend)))
+            }
+
+            // ── LLM connectors ──────────────────────────────────────────
+            //
+            // A model call becomes a VFS write, which is the entire point: the
+            // write lands on `Kernel::apply_mutating_write_hooks`, the single
+            // seam every write syscall funnels through, so a mutating or
+            // fail-closed hook sees the prompt exactly as it sees a file write.
+            // Storage is the backend's own `CASEngine` with
+            // `MessageBoundaryStrategy`, so the conversation is chunked per
+            // message and deduplicated across sessions.
+            //
+            //   add_mount(backend_type="anthropic", blob_root=…,
+            //             base_url=…, api_key=…, default_model=…)
+            //
+            // `api_key` is OPTIONAL and falls back to `ANTHROPIC_API_KEY` in
+            // the daemon's environment — the same shape the `s3` arm uses for
+            // AWS creds, and for the same reason: mount params are replicated
+            // cluster state, and a credential does not belong there. An
+            // explicit param still wins, for a deployment that has somewhere
+            // better to keep it.
+            #[cfg(feature = "driver-anthropic")]
+            "anthropic" => {
+                let blob_root = required_param(p, "blob_root", "anthropic")?;
+                let base_url = param(p, "base_url").unwrap_or(ANTHROPIC_DEFAULT_BASE_URL);
+                let api_key = ai_api_key(p, "ANTHROPIC_API_KEY");
+                let default_model = param(p, "default_model").unwrap_or(ANTHROPIC_DEFAULT_MODEL);
+                let backend = crate::transports::api::ai::anthropic::AnthropicBackend::new(
+                    args.backend_name,
+                    base_url,
+                    &api_key,
+                    default_model,
+                    Path::new(blob_root),
+                    Arc::clone(args.runtime),
+                )
+                .map_err(|e| format!("anthropic init: {e}"))?;
+                Ok(backend_only(Arc::new(backend)))
+            }
+
+            //   add_mount(backend_type="openai", blob_root=…,
+            //             base_url=…, api_key=…, default_model=…)
+            //
+            // `api_key` falls back to `OPENAI_API_KEY`. Kept as its own arm
+            // rather than folded together with `anthropic`: they are gated on
+            // separate features, so a slim build may compile one and not the
+            // other, and the `s3` / `gcs` pair next door is parallel for the
+            // same reason.
+            #[cfg(feature = "driver-openai")]
+            "openai" => {
+                let blob_root = required_param(p, "blob_root", "openai")?;
+                let base_url = param(p, "base_url").unwrap_or(OPENAI_DEFAULT_BASE_URL);
+                let api_key = ai_api_key(p, "OPENAI_API_KEY");
+                let default_model = param(p, "default_model").unwrap_or(OPENAI_DEFAULT_MODEL);
+                let backend = crate::transports::api::ai::openai::OpenAIBackend::new(
+                    args.backend_name,
+                    base_url,
+                    &api_key,
+                    default_model,
+                    Path::new(blob_root),
+                    Arc::clone(args.runtime),
+                )
+                .map_err(|e| format!("openai init: {e}"))?;
                 Ok(backend_only(Arc::new(backend)))
             }
 
@@ -548,6 +642,100 @@ mod tests {
                 "mount_path {mp:?} err was: {err}"
             );
         }
+    }
+
+    /// The LLM arms are reachable by `backend_type` at all — the thing that
+    /// was missing: the drivers existed and compiled, but `build` had no arm
+    /// for them, so `add_mount(backend_type="anthropic", …)` answered
+    /// "unknown backend_type" and the only construction sites in the tree were
+    /// their own unit tests.
+    #[cfg(feature = "driver-anthropic")]
+    #[test]
+    fn anthropic_mounts_and_defaults_its_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let p = params(&[("blob_root", &root)]);
+        let pc = noop_peer_client();
+        let rt = noop_runtime();
+        let args = mk_args("anthropic", &p, &pc, &rt);
+        // base_url / default_model / api_key all default; only the spool dir
+        // is required, so a mount against the public API is one param.
+        assert!(
+            DefaultObjectStoreProvider.build(&args).is_ok(),
+            "anthropic must be mountable with just blob_root"
+        );
+    }
+
+    /// `base_url` is what points the mount at SudoRouter instead of the public
+    /// API, so it has to be honoured rather than silently defaulted.
+    #[cfg(feature = "driver-anthropic")]
+    #[test]
+    fn anthropic_accepts_a_proxy_base_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let p = params(&[
+            ("blob_root", &root),
+            ("base_url", "https://router.internal/v1"),
+            ("default_model", "claude-sonnet-4-5"),
+        ]);
+        let pc = noop_peer_client();
+        let rt = noop_runtime();
+        let args = mk_args("anthropic", &p, &pc, &rt);
+        assert!(DefaultObjectStoreProvider.build(&args).is_ok());
+    }
+
+    /// The spool dir has no sensible default — it is per-mount state on the
+    /// host — so its absence must be a loud refusal, not a guess.
+    #[cfg(feature = "driver-anthropic")]
+    #[test]
+    fn anthropic_without_blob_root_errors() {
+        let p = params(&[("base_url", "https://router.internal")]);
+        let pc = noop_peer_client();
+        let rt = noop_runtime();
+        let args = mk_args("anthropic", &p, &pc, &rt);
+        let err = expect_err(DefaultObjectStoreProvider.build(&args));
+        assert!(err.contains("blob_root"), "err was: {err}");
+    }
+
+    /// An API key is NOT required at mount time: it falls back to the
+    /// environment, so a credential need not be written into mount params —
+    /// which are replicated cluster state. Same shape as the `s3` arm's AWS
+    /// creds, and the reason is the same.
+    #[cfg(feature = "driver-anthropic")]
+    #[test]
+    fn anthropic_does_not_require_a_key_in_mount_params() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let p = params(&[("blob_root", &root)]);
+        assert!(
+            param(&p, "api_key").is_none(),
+            "this test is about the absent-key case"
+        );
+        let pc = noop_peer_client();
+        let rt = noop_runtime();
+        let args = mk_args("anthropic", &p, &pc, &rt);
+        assert!(
+            DefaultObjectStoreProvider.build(&args).is_ok(),
+            "a keyless mount must build — the key comes from the environment"
+        );
+    }
+
+    #[cfg(feature = "driver-openai")]
+    #[test]
+    fn openai_mounts_and_requires_a_blob_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let pc = noop_peer_client();
+        let rt = noop_runtime();
+
+        let ok = params(&[("blob_root", &root)]);
+        let args = mk_args("openai", &ok, &pc, &rt);
+        assert!(DefaultObjectStoreProvider.build(&args).is_ok());
+
+        let missing = params(&[]);
+        let args = mk_args("openai", &missing, &pc, &rt);
+        let err = expect_err(DefaultObjectStoreProvider.build(&args));
+        assert!(err.contains("blob_root"), "err was: {err}");
     }
 
     #[cfg(feature = "driver-remote")]
