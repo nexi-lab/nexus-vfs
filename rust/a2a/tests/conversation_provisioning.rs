@@ -29,7 +29,14 @@ use kernel::kernel::{
 /// same const would make a wrong value agree with itself.
 const DT_DIR: u8 = 1;
 const DT_STREAM: u8 = 4;
-const DT_LINK: u8 = 6;
+const DT_REG: u8 = 0;
+
+/// The identity provisioning runs as. `ensure_conversation` writes the
+/// chat-list entry, and a write carries a caller — the entry types alone no
+/// longer tell the whole story now that one of them holds bytes.
+fn provisioning_ctx() -> OperationContext {
+    OperationContext::new("test-owner", contracts::ROOT_ZONE_ID, false, None, true)
+}
 
 fn stat(kernel: &Kernel, path: &str) -> StatResult {
     kernel
@@ -197,15 +204,23 @@ impl KernelSyscall for CountingKernel {
     }
 }
 
-/// The chat-list entry must be a DT_LINK pointing at the shared conversation.
+/// The chat-list entry must be a PLAIN entry naming the shared conversation.
 ///
-/// This is the assertion that would have caught `DT_LINK = 3`: a DT_PIPE at
-/// this path satisfies "the path exists" and every path-composition test, but
-/// carries no `link_target` and is not a pointer to anything.
+/// Plain, not a link. A link is what this is, and what it used to be — but
+/// only the in-process caller can create one: the gRPC `Setattr` carries no
+/// link target, so a standalone agent provisioning over that transport
+/// produced no entry at all and its recipient never learned the conversation
+/// existed. An entry type is immutable, so two provisioners disagreeing about
+/// it is permanent: whichever ran second would fail forever.
+///
+/// Asserting the TYPE and not just the path is what caught `DT_LINK = 3`
+/// (DT_PIPE's discriminant) — a wrong type still satisfies "the path exists"
+/// and every path-composition test.
 #[test]
-fn chat_list_entry_is_a_link_to_the_shared_conversation() {
+fn chat_list_entry_names_the_shared_conversation() {
     let kernel = Kernel::new();
-    ensure_conversation(&kernel, "win-ai", "mac-ai").expect("provision conversation");
+    ensure_conversation(&kernel, &provisioning_ctx(), "win-ai", "mac-ai")
+        .expect("provision conversation");
 
     let cid = conversation_id("win-ai", "mac-ai");
     let expected_target = format!("{CONVERSATIONS_BASE}/{cid}");
@@ -221,15 +236,18 @@ fn chat_list_entry_is_a_link_to_the_shared_conversation() {
         );
         let meta = stat(&kernel, &alias);
         assert_eq!(
-            meta.entry_type, DT_LINK,
-            "{alias} must be a DT_LINK (got entry_type={}), not a pipe or a plain entry",
+            meta.entry_type, DT_REG,
+            "{alias} must be a plain entry (got entry_type={}) — a type no \
+             transport can produce is a conversation one side cannot index",
             meta.entry_type
         );
-        assert_eq!(
-            meta.link_target.as_deref(),
-            Some(expected_target.as_str()),
-            "{alias} must point at the shared conversation"
-        );
+        // The BODY (the conversation root) is deliberately not asserted here.
+        // A bare kernel has no content store, so bytes written to a DT_REG do
+        // not come back — and that is fine, because the name is what carries
+        // the contract: a receiver lists this directory and reads the entry
+        // NAMES. The body is a convenience for whoever runs `cat`, and it
+        // survives wherever content does.
+        let _ = &expected_target;
     }
 }
 
@@ -241,14 +259,15 @@ fn both_participants_are_indexed_whichever_side_provisions() {
     // Provision from each side in turn; the peer's index must appear either way.
     for (caller, peer) in [("win-ai", "mac-ai"), ("mac-ai", "win-ai")] {
         let kernel = Kernel::new();
-        ensure_conversation(&kernel, caller, peer).expect("provision conversation");
+        ensure_conversation(&kernel, &provisioning_ctx(), caller, peer)
+            .expect("provision conversation");
         // Each participant's entry is named after the OTHER one, so the pair is
         // walked in both directions rather than reusing a single name.
         for (owner, other) in [(caller, peer), (peer, caller)] {
             let alias = agent_conversation_link_path(owner, other);
             assert_eq!(
                 stat(&kernel, &alias).entry_type,
-                DT_LINK,
+                DT_REG,
                 "provisioning from {caller} must still index {owner}'s conversation with {other}"
             );
         }
@@ -263,7 +282,8 @@ fn both_participants_are_indexed_whichever_side_provisions() {
 #[test]
 fn transcript_is_a_stream_the_gate_recognises() {
     let kernel = Kernel::new();
-    ensure_conversation(&kernel, "win-ai", "mac-ai").expect("provision conversation");
+    ensure_conversation(&kernel, &provisioning_ctx(), "win-ai", "mac-ai")
+        .expect("provision conversation");
 
     let cid = conversation_id("win-ai", "mac-ai");
     let transcript = conversation_transcript_path(&cid);
@@ -289,7 +309,8 @@ fn transcript_is_a_stream_the_gate_recognises() {
 #[test]
 fn the_directory_layer_is_materialised() {
     let kernel = Kernel::new();
-    ensure_conversation(&kernel, "win-ai", "mac-ai").expect("provision conversation");
+    ensure_conversation(&kernel, &provisioning_ctx(), "win-ai", "mac-ai")
+        .expect("provision conversation");
 
     let cid = conversation_id("win-ai", "mac-ai");
     for dir in [
@@ -317,9 +338,11 @@ fn the_directory_layer_is_materialised() {
 #[test]
 fn provisioning_is_idempotent_and_order_free() {
     let kernel = Kernel::new();
-    ensure_conversation(&kernel, "win-ai", "mac-ai").expect("first provision");
-    ensure_conversation(&kernel, "mac-ai", "win-ai").expect("reversed order must be a no-op");
-    ensure_conversation(&kernel, "win-ai", "mac-ai").expect("repeat must be a no-op");
+    ensure_conversation(&kernel, &provisioning_ctx(), "win-ai", "mac-ai").expect("first provision");
+    ensure_conversation(&kernel, &provisioning_ctx(), "mac-ai", "win-ai")
+        .expect("reversed order must be a no-op");
+    ensure_conversation(&kernel, &provisioning_ctx(), "win-ai", "mac-ai")
+        .expect("repeat must be a no-op");
 
     let cid = conversation_id("win-ai", "mac-ai");
     assert_eq!(
@@ -354,7 +377,7 @@ fn provisioning_is_idempotent_and_order_free() {
 fn an_existing_conversation_short_circuits_instead_of_rewalking() {
     let kernel = CountingKernel::new();
 
-    ensure_conversation(&kernel, "win-ai", "mac-ai").expect("first provision");
+    ensure_conversation(&kernel, &provisioning_ctx(), "win-ai", "mac-ai").expect("first provision");
     let building = kernel.setattrs();
     assert!(
         building > 1,
@@ -362,7 +385,8 @@ fn an_existing_conversation_short_circuits_instead_of_rewalking() {
     );
 
     kernel.reset();
-    ensure_conversation(&kernel, "win-ai", "mac-ai").expect("second provision");
+    ensure_conversation(&kernel, &provisioning_ctx(), "win-ai", "mac-ai")
+        .expect("second provision");
 
     assert_eq!(
         kernel.setattrs(),
@@ -385,7 +409,8 @@ fn an_existing_conversation_short_circuits_instead_of_rewalking() {
 #[test]
 fn the_reader_register_is_left_to_the_consumer() {
     let kernel = Kernel::new();
-    ensure_conversation(&kernel, "win-ai", "mac-ai").expect("provision conversation");
+    ensure_conversation(&kernel, &provisioning_ctx(), "win-ai", "mac-ai")
+        .expect("provision conversation");
 
     let cid = conversation_id("win-ai", "mac-ai");
     let reader = conversation_reader_path(&cid, "win-ai");

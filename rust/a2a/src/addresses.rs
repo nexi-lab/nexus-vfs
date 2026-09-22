@@ -231,6 +231,43 @@ pub fn agent_conversation_link_path(agent_name: &str, peer_name: &str) -> String
     format!("{A2A_INBOX_BASE}/{agent_name}{AGENT_CONVERSATIONS_SEGMENT}/{peer_name}")
 }
 
+/// Whether `path` is an agent's chat list (`/agents/<name>/conversations`) or
+/// one entry inside it.
+///
+/// Shape-checked rather than prefix-checked, because
+/// [`crate::foreign_containment`] opens these to a foreign caller. A prefix
+/// test would hand it the whole `/agents` subtree, and the shallower shapes
+/// are indistinguishable from things that must stay closed: `/agents/<name>`
+/// and `/agents/secrets.txt` are both two segments, so admitting the depth
+/// admits the file.
+///
+/// A recipient's chat list already exists by the time anyone writes to it —
+/// an agent announces itself by creating it before it starts listening — so
+/// the entry is the only thing a sender needs to add.
+#[must_use]
+pub fn is_conversation_index_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix(A2A_INBOX_BASE) else {
+        return false;
+    };
+    // `/agentsfoo` strips to `foo`, which is not under `/agents` at all.
+    if !(rest.is_empty() || rest.starts_with('/')) {
+        return false;
+    }
+    let segments: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+    // `AGENT_CONVERSATIONS_SEGMENT` is `/conversations`; the leading slash is
+    // gone once split, so compare against its trimmed form rather than
+    // re-spelling the word.
+    let index_dir = AGENT_CONVERSATIONS_SEGMENT.trim_start_matches('/');
+    // Segments after `/agents`: [agent, "conversations"] is the chat list and
+    // one more is an entry in it. Nothing shallower — see the note above on
+    // why depth alone cannot tell a presence directory from a stray file.
+    match segments.as_slice() {
+        [_, dir] => *dir == index_dir,
+        [_, dir, peer] => *dir == index_dir && !peer.is_empty(),
+        _ => false,
+    }
+}
+
 /// Whether `path` is a conversation transcript
 /// (`…/conversations/<cid>/transcript`).
 ///
