@@ -17,6 +17,23 @@ path = "src/main.rs"
 [features]
 default = []
 
+# Model egress through the VFS: mount an LLM connector, and a model call
+# becomes a write that crosses `Kernel::apply_mutating_write_hooks` — the one
+# seam every write syscall funnels through — instead of leaving the process as
+# outbound HTTP no hook can see.
+#
+# OFF by default, and the reason is measured rather than assumed. These
+# connectors speak HTTP, so they pull reqwest + rustls: the slim binary goes
+# from 16,480,768 to 19,367,936 bytes on the size-gated Windows build, +2.75
+# MiB. That is the same "connector HTTP stack" the backends dep above drops on
+# purpose to hold the sudowork target size, so switching it on for every
+# deployment to serve the ones that mount a model would be the wrong default.
+#
+# A tier that wants model calls inside the hook seam builds
+# `--features driver-ai`, exactly as an S3-serving tier builds
+# `--features driver-s3`.
+driver-ai = ["backends/driver-anthropic", "backends/driver-openai"]
+
 [dependencies]
 # raft owns federation orchestration (ZoneManager, bootstrap_tls, etc.).
 # Only the grpc feature — that is all this binary needs and dropping the
