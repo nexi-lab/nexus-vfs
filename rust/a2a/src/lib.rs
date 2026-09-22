@@ -5,7 +5,7 @@
 //!
 //! `a2a` is the messaging **substrate**, not a frontend. It owns the
 //! **`from` identity guarantee**: [`MailboxStampingHook`] rewrites the
-//! envelope `from` to the caller's `agent_id` on every `*/chat-with-me`
+//! envelope `from` to the caller's `agent_id` on every `*/transcript`
 //! write, so a frontend cannot forge a sender. The hook is armed ONCE at
 //! the daemon by [`install_a2a_stamp_hook`], bound to the `a2a` hook-only
 //! service.
@@ -14,7 +14,7 @@
 //! primitive (`nexus_raft::stream_wakeup::install_stream_wakeup_observer`:
 //! a replicated `AppendStreamEntry` wakes a reader parked on a replica —
 //! both the DT_STREAM blocking tail and any `sys_watch` file-watcher on the
-//! path). It is NOT a2a-specific — A2A's `chat-with-me` DT_STREAM
+//! path). It is NOT a2a-specific — an A2A transcript
 //! merely rides it — so it is armed per-zone by the composition root
 //! (which holds the `Arc<Kernel>` the observer needs a `Weak` of, and the
 //! federation-mount config that maps each zone's key to its caller-facing
@@ -47,13 +47,13 @@ pub use addresses::{
     A2A_INBOX_BASE, AGENT_CONVERSATIONS_SEGMENT, AGENT_STATE_SUFFIX, CONVERSATIONS_BASE,
     MAILBOX_IO_PROFILE, MAILBOX_STREAM_CAPACITY, REPLICATED_PREFIXES, TRANSCRIPT_LEAF,
 };
-// `is_mailbox_path` / `is_a2a_mailbox_path` are re-exported because they ARE
-// the public contract, not internals: the first is the stamp scope, the second
-// is the entire allow-list a cross-org caller is confined to
-// (`foreign_containment`). A consumer deciding whether a path is an A2A log
-// must reach the same answer this crate does — re-exporting them is what keeps
-// a second, drifting copy from being written elsewhere.
-pub use mailbox_stamping_policy::{is_mailbox_path, MailboxEnvelope, MAILBOX_WRITE_SUFFIXES};
+// The envelope and the claimed suffixes ARE the public contract, not
+// internals: a consumer deciding whether a path is an A2A log, or what an
+// envelope looks like, must reach the same answer this crate does. Re-exporting
+// is what keeps a second, drifting copy from being written elsewhere. The
+// predicate itself is [`addresses::is_conversation_transcript_path`], exported
+// above with the other address questions.
+pub use mailbox_stamping_policy::{MailboxEnvelope, MAILBOX_WRITE_SUFFIXES};
 
 use kernel::kernel::syscall::KernelSyscall;
 use kernel::kernel::{Kernel, OperationContext};
@@ -251,12 +251,12 @@ fn metadata_setattr<K: KernelSyscall>(
         .map_err(|e| format!("{e:?}"))
 }
 
-/// Provision the `chat-with-me` mailbox at `path` as a DT_STREAM, idempotently.
+/// Provision the message stream at `path` as a DT_STREAM, idempotently.
 ///
 /// This is the ONE place that turns the a2a mailbox contract
 /// ([`MAILBOX_IO_PROFILE`] + [`MAILBOX_STREAM_CAPACITY`]) into a real inode, so
-/// every mailbox — the node-local `/proc/{pid}/chat-with-me` pipe AND the
-/// persistent, replicated `/agents/{name}/chat-with-me` inbox — is the SAME
+/// every mailbox — the node-local `/proc/{pid}/transcript` pipe AND the
+/// persistent, replicated `/agents/{name}/transcript` inbox — is the SAME
 /// kind of stream. Provisioning is a2a's job because a2a owns "what a mailbox
 /// is"; the *lifecycle* owner (`managed_agent`) decides *when* and *for whom*
 /// to call this.
@@ -307,7 +307,7 @@ pub fn ensure_mailbox_stream<K: KernelSyscall>(kernel: &K, path: &str) -> Result
 ///
 /// Enlists the `a2a` hook-only service and registers
 /// [`MailboxStampingHook`] on it (the ServiceRegistry ownership path, so
-/// the hook load/unloads with the service). Every `*/chat-with-me` write
+/// the hook load/unloads with the service). Every `*/transcript` write
 /// then passes through it and the envelope `from` is rewritten to the
 /// caller's `agent_id`.
 ///

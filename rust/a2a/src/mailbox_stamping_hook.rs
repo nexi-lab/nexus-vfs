@@ -1,10 +1,10 @@
 //! `MailboxStampingHook` — INTERCEPT pre-write hook that rewrites the
-//! envelope's `from` field on chat-with-me writes.
+//! envelope's `from` field on message-log writes.
 //!
 //! The kernel side is intentionally thin: this struct exists so the
 //! dispatch system has a registered `NativeInterceptHook`, and its
 //! `mutating_path_suffixes` declaration drives the content-clone bypass
-//! at the sys_write call site (only `*/chat-with-me` writes pay the
+//! at the sys_write call site (only `*/transcript` writes pay the
 //! clone). The actual rewriting policy lives in the sibling
 //! [`crate::mailbox_stamping_policy::maybe_stamp_chat_envelope`] — kernel
 //! owns "how to be a hook" (dispatch wiring), policy owns "what to
@@ -97,13 +97,15 @@ impl NativeInterceptHook for MailboxStampingHook {
         // an empty `agent_id` — stays fail-open. A pre-hook `Err` aborts the
         // write as a permission error (see `HookOutcome` docs).
         //
-        // Scoped to the A2A cross-machine mailbox (`/agents/…/chat-with-me`),
-        // NOT every `*/chat-with-me` write: the local managed-agent pipe
-        // (`/proc/{pid}/chat-with-me`) legitimately uses a system/bare ctx and
-        // must not be rejected, and an ordinary file named `chat-with-me` is
-        // not a mailbox. The stamp below still runs on those (via the broader
-        // `maybe_stamp_chat_envelope`); only the *rejection* is A2A-scoped.
-        if self.fail_closed && caller.is_none() && mailbox_stamping_policy::is_mailbox_path(&c.path)
+        // Scoped by the SAME predicate that decides whether to stamp. There
+        // were once two: a per-pid pipe was stamped but never rejected,
+        // because an unauthenticated write to a node-local stream could not
+        // reach another machine. Every message log is replicated now, so a
+        // write this hook would stamp is a write it must also be willing to
+        // refuse.
+        if self.fail_closed
+            && caller.is_none()
+            && crate::addresses::is_conversation_transcript_path(&c.path)
         {
             return Err(format!(
                 "fail-closed: A2A mailbox write to {} requires an authenticated \

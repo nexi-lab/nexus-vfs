@@ -5,16 +5,16 @@
 //! authors mailbox messages under its qualified id — but nothing else on
 //! the platform is its business. This permission provider is the
 //! enforcement: on a gate-armed profile, a caller carrying
-//! `trust_domain = Some` may touch ONLY `*/chat-with-me` mailbox paths;
+//! `trust_domain = Some` may touch ONLY `*/transcript` mailbox paths;
 //! every other path is denied on read AND write. A DOMESTIC caller
 //! (`trust_domain = None`) is never restricted here — this gate exists
 //! solely to bound the blast radius of a semi-trusted foreign agent (e.g.
 //! an on-prem DGX an FDE delivers to a customer site: authenticated to the
 //! SaaS, but it must not read the SaaS's other data if tampered with).
 //!
-//! Scope note: `is_a2a_mailbox_path` (not `is_mailbox_path`) — a foreign
-//! agent gets the REPLICATED cross-machine mailbox, never the node-local
-//! `/proc/{pid}/chat-with-me` pipe.
+//! Scope note: the allow-list is exactly
+//! [`crate::is_conversation_transcript_path`] — a foreign agent reaches the
+//! conversation it participates in, and nothing else.
 //!
 //! Composition: this is the sole provider `nexusd-cluster` installs. If a
 //! second policy (e.g. zone-perms) is ever added to that profile, wrap
@@ -26,8 +26,8 @@ use kernel::kernel::{Kernel, KernelError, OperationContext};
 use kernel::vfs_router::RouteResult;
 use kernel::{Permission, PermissionProvider};
 
+use crate::addresses::is_conversation_transcript_path;
 use crate::addresses::{is_conversation_index_path, is_conversation_reader_path};
-use crate::mailbox_stamping_policy::is_mailbox_path;
 
 /// Confines a foreign (cross-org) agent to the A2A message logs it
 /// participates in.
@@ -48,7 +48,7 @@ impl PermissionProvider for ForeignAgentMailboxOnly {
         let Some(trust_domain) = ctx.trust_domain.as_deref() else {
             return Ok(());
         };
-        if is_mailbox_path(path) {
+        if is_conversation_transcript_path(path) {
             return Ok(());
         }
         // A conversation's reader registers are READABLE by a participant —
