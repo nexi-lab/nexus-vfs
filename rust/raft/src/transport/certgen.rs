@@ -220,6 +220,65 @@ pub fn generate_agent_cert(
     ca_cert_pem: &[u8],
     ca_key_pem: &[u8],
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
+    sign_agent_cert(
+        name,
+        None,
+        time::Duration::days(NODE_CERT_VALIDITY_DAYS),
+        ca_cert_pem,
+        ca_key_pem,
+    )
+}
+
+/// Sign a SESSION agent cert: an agent identity bound to an owner, valid for
+/// `validity` rather than the 90-day agent default.
+///
+/// Same shape as [`generate_agent_cert`] — it is an agent cert, so it resolves
+/// through the same agent path with no change to any parser — plus the two
+/// things that make it a session credential and are both checkable off the
+/// wire: a `nexus://owner/{owner}` SAN, and a validity measured in the length
+/// of a session.
+///
+/// Validity is plain seconds rather than a `time::Duration` so that calling
+/// this does not oblige a caller to depend on the `time` crate — the type
+/// would be the only reason they had to.
+///
+/// The owner is signed into the credential rather than recorded next to it, so
+/// "who is this agent acting for" needs no store lookup and cannot drift from
+/// the cert it describes. Nothing is written at mint: a uuid subject is unique
+/// without a uniqueness record, and a credential that expires on its own is
+/// not a durable fact.
+pub fn generate_session_agent_cert(
+    name: &str,
+    owner_id: &str,
+    validity_secs: u64,
+    ca_cert_pem: &[u8],
+    ca_key_pem: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    if owner_id.is_empty() {
+        return Err("session agent cert requires a non-empty owner".to_string());
+    }
+    if validity_secs == 0 {
+        return Err("session agent cert requires a non-zero validity".to_string());
+    }
+    sign_agent_cert(
+        name,
+        Some(owner_id),
+        time::Duration::seconds(validity_secs as i64),
+        ca_cert_pem,
+        ca_key_pem,
+    )
+}
+
+/// The one place an agent cert is built. Both public entry points differ only
+/// in their owner SAN and validity, so they share this rather than two copies
+/// of the key type, DN, EKU and signing that must not drift apart.
+fn sign_agent_cert(
+    name: &str,
+    owner_id: Option<&str>,
+    validity: time::Duration,
+    ca_cert_pem: &[u8],
+    ca_key_pem: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>), String> {
     let ca_issuer = ca_issuer_from_pem(ca_cert_pem, ca_key_pem)?;
 
     // Agent key pair (EC P-256), same algorithm as node certs.
@@ -232,15 +291,26 @@ pub fn generate_agent_cert(
     dn.push(DnType::CommonName, format!("nexus-agent-{name}"));
     params.distinguished_name = dn;
 
-    // Sole SAN: the machine-readable identity. No localhost / IP / cluster
-    // server-name SANs — an agent never serves TLS, it presents this as a
-    // client cert, and rustls ignores URI SANs for hostname verification.
-    params.subject_alt_names = vec![SanType::URI(
+    // The machine-readable identity. No localhost / IP / cluster server-name
+    // SANs — an agent never serves TLS, it presents this as a client cert, and
+    // rustls ignores URI SANs for hostname verification. A session cert adds an
+    // owner SAN beside it; the two authorities are disjoint, so neither parser
+    // can read the other's URI.
+    let mut sans = vec![SanType::URI(
         lib::agent_identity::agent_identity_uri(name)
             .as_str()
             .try_into()
             .map_err(|e| format!("agent identity SAN error: {e}"))?,
     )];
+    if let Some(owner) = owner_id {
+        sans.push(SanType::URI(
+            lib::agent_identity::owner_uri(owner)
+                .as_str()
+                .try_into()
+                .map_err(|e| format!("owner SAN error: {e}"))?,
+        ));
+    }
+    params.subject_alt_names = sans;
 
     // Client only, and a signing key (it signs both the mTLS handshake and
     // message envelopes).
@@ -250,7 +320,7 @@ pub fn generate_agent_cert(
 
     let now = time::OffsetDateTime::now_utc();
     params.not_before = now;
-    params.not_after = now + time::Duration::days(NODE_CERT_VALIDITY_DAYS);
+    params.not_after = now + validity;
 
     let agent_cert = params
         .signed_by(&agent_key_pair, &ca_issuer)
@@ -679,6 +749,77 @@ mod tests {
         // The node and agent identity namespaces are disjoint.
         assert_eq!(parse_node_identity_uri("nexus://agent/win-ai"), None);
         assert_eq!(parse_agent_identity_uri("nexus://zone/root/node/7"), None);
+    }
+
+    /// A session cert is an ordinary agent cert plus the two things that make
+    /// it session-scoped and are checkable off the wire: the owner SAN and a
+    /// validity measured in the length of a session, not 90 days.
+    #[test]
+    fn session_agent_cert_pins_owner_and_a_short_validity() {
+        use x509_parser::prelude::*;
+
+        let (ca_cert_pem, ca_key_pem) = generate_test_ca();
+        let (cert_pem, _key_pem) = generate_session_agent_cert(
+            "session-3f2a",
+            "alice",
+            2 * 60 * 60,
+            ca_cert_pem.as_bytes(),
+            ca_key_pem.as_bytes(),
+        )
+        .unwrap();
+
+        let pem = ::pem::parse(&cert_pem).unwrap();
+        let (_, cert) = X509Certificate::from_der(pem.contents()).unwrap();
+        let uris: Vec<&str> = cert
+            .subject_alternative_name()
+            .unwrap()
+            .unwrap()
+            .value
+            .general_names
+            .iter()
+            .filter_map(|gn| match gn {
+                GeneralName::URI(u) => Some(*u),
+                _ => None,
+            })
+            .collect();
+
+        // Identity first, owner beside it — and each parser reads only its own.
+        assert_eq!(
+            uris,
+            vec!["nexus://agent/session-3f2a", "nexus://owner/alice"]
+        );
+        assert_eq!(
+            parse_agent_identity_uri(uris[0]),
+            Some("session-3f2a".to_string())
+        );
+        assert_eq!(
+            lib::agent_identity::parse_owner_uri(uris[1]),
+            Some("alice".to_string())
+        );
+        assert_eq!(parse_agent_identity_uri(uris[1]), None);
+
+        // Hours, not the 90-day agent default: a session credential that
+        // outlives its session is the thing the short TTL exists to prevent.
+        let validity = cert.validity();
+        let span = validity.not_after.timestamp() - validity.not_before.timestamp();
+        assert_eq!(span, 2 * 60 * 60);
+    }
+
+    /// An owner is what distinguishes a session credential, so minting one
+    /// without an owner must fail rather than quietly produce a cert that
+    /// attributes to nobody.
+    #[test]
+    fn session_agent_cert_refuses_an_empty_owner() {
+        let (ca_cert_pem, ca_key_pem) = generate_test_ca();
+        let err = generate_session_agent_cert(
+            "session-3f2a",
+            "",
+            2 * 60 * 60,
+            ca_cert_pem.as_bytes(),
+            ca_key_pem.as_bytes(),
+        )
+        .unwrap_err();
+        assert!(err.contains("owner"), "{err}");
     }
 
     /// Every node cert must carry the fixed cluster server name as a DNS SAN —

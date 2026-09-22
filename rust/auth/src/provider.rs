@@ -302,6 +302,13 @@ impl ApiKeyAuthProvider {
     /// cert-agent work cross-node. No cache either: with no store I/O and no
     /// topology read, building the context is cheaper than a cache round-trip.
     ///
+    /// `owner` comes from the cert's `nexus://owner/` SAN — present only on a
+    /// session credential. It sets `user_id` (the principal) while `agent_id`
+    /// stays the acting session identity, so the kernel can attribute the
+    /// session's actions to a person. It grants nothing: the owner is an
+    /// attribution, not an authorization, and the zone-grant rule below is
+    /// unchanged by it.
+    ///
     /// The cert is a pure identity (a DID); a valid agent cert carries NO zone
     /// grant, on purpose. An agent is not a zone tenant — it is a mailbox
     /// participant — so its authorization to write a mailbox is owned by the
@@ -312,7 +319,7 @@ impl ApiKeyAuthProvider {
     /// into the wrong abstraction. So the context stays zoneless rather than
     /// fabricate a tenancy the agent does not have — if a deployment ever arms
     /// the zone gate, that gate composes with mailbox paths at its own layer.
-    fn agent_context(name: &str) -> OperationContext {
+    fn agent_context(name: &str, owner: Option<&str>) -> OperationContext {
         let record = AuthKeyRecord {
             key_id: String::new(),
             name: name.to_string(),
@@ -323,7 +330,18 @@ impl ApiKeyAuthProvider {
             expires_at_ms: None,
             zone_perms: Vec::new(),
         };
-        Self::context_from_record(&record)
+        let mut ctx = Self::context_from_record(&record);
+        // `OperationContext`: `user_id` is the principal, `agent_id` the actor.
+        // `context_from_record` set both to the agent, which is right for an
+        // agent acting for itself. A session credential names an owner in its
+        // cert, so the principal is that owner while the actor stays the
+        // session identity — and `agent_id != user_id` becomes the test for
+        // delegated action. Nothing else in the context moves: the owner grants
+        // no zone tenancy and no admin, exactly as for any agent cert.
+        if let Some(owner) = owner {
+            ctx.user_id = owner.to_string();
+        }
+        ctx
     }
 
     /// The `sk-` token resolution path: cache first, then the record's
@@ -457,16 +475,16 @@ fn resolve_verified_peer(
         // existing consumers parse bare local `from`s. A foreign cert can
         // never resolve to a bare local name (classify always sets its
         // `trust_domain`), so it cannot impersonate a local agent.
-        let agent_id = match peer.trust_domain {
-            Some(_) => peer.display_id(),
-            None => agent.clone(),
-        };
+        // One definition of "the id this agent is known by", shared with
+        // anything matching an agent against policy — see
+        // `PeerIdentity::resolved_agent_id`.
+        let agent_id = peer.resolved_agent_id().unwrap_or_else(|| agent.clone());
         // Carry the trust domain into the context so the permission
         // gate can contain a FOREIGN agent to its mailbox. A local
         // agent keeps `None` and is unaffected. SSOT: the value comes
         // from the classified `PeerIdentity`, never re-parsed from the
         // qualified `agent_id` string.
-        let mut ctx = ApiKeyAuthProvider::agent_context(&agent_id);
+        let mut ctx = ApiKeyAuthProvider::agent_context(&agent_id, peer.owner.as_deref());
         ctx.trust_domain = peer.trust_domain.clone();
         return Ok(ctx);
     }
@@ -616,6 +634,7 @@ mod tests {
             node_id: None,
             zone_id: None,
             agent_name: Some("mac-ai".into()),
+            owner: None,
             trust_domain: None,
             serial: vec![1, 2, 3],
         };
@@ -637,6 +656,78 @@ mod tests {
         assert!(!ctx.is_admin, "an agent is never an admin");
     }
 
+    /// A session credential resolves as its session identity AND attributes to
+    /// its owner: `agent_id` is who acted, `user_id` is who it acted for. That
+    /// inequality is the delegated-action signal the kernel audits on, and it
+    /// is the entire point of binding an owner into the cert.
+    ///
+    /// It must buy nothing else. An owner is an attribution, not a grant.
+    #[test]
+    fn a_session_cert_acts_as_itself_and_attributes_to_its_owner() {
+        let peer = PeerIdentity {
+            common_name: "nexus-agent-session-3f2a".into(),
+            node_id: None,
+            zone_id: None,
+            agent_name: Some("session-3f2a".into()),
+            owner: Some("alice".into()),
+            trust_domain: None,
+            serial: vec![4, 2],
+        };
+        let ctx = provider(MemStore::arc())
+            .resolve(&AuthCredentials {
+                token: "",
+                peer: Some(&peer),
+            })
+            .expect("a session cert resolves from its cert identity");
+
+        assert_eq!(
+            ctx.agent_id.as_deref(),
+            Some("session-3f2a"),
+            "the actor is the session, so `from` stamps the session identity"
+        );
+        assert_eq!(
+            ctx.user_id, "alice",
+            "the principal is the owner — this is what an audit trail attributes to"
+        );
+        assert_ne!(
+            ctx.agent_id.as_deref(),
+            Some(ctx.user_id.as_str()),
+            "actor != principal is the delegated-action test"
+        );
+
+        // An owner grants nothing beyond attribution.
+        assert!(
+            ctx.zone_perms.is_empty(),
+            "no zone tenancy comes with an owner"
+        );
+        assert!(!ctx.is_admin, "an owner is not an admin grant");
+        assert!(!ctx.is_system, "an owner is not a system grant");
+    }
+
+    /// The ordinary agent cert is unchanged: with no owner SAN, the agent is
+    /// its own principal, so `agent_id == user_id` and nothing about existing
+    /// attribution moves.
+    #[test]
+    fn an_agent_without_an_owner_is_its_own_principal() {
+        let peer = PeerIdentity {
+            common_name: "nexus-agent-mac-ai".into(),
+            node_id: None,
+            zone_id: None,
+            agent_name: Some("mac-ai".into()),
+            owner: None,
+            trust_domain: None,
+            serial: vec![1],
+        };
+        let ctx = provider(MemStore::arc())
+            .resolve(&AuthCredentials {
+                token: "",
+                peer: Some(&peer),
+            })
+            .expect("an agent cert resolves");
+        assert_eq!(ctx.agent_id.as_deref(), Some("mac-ai"));
+        assert_eq!(ctx.user_id, "mac-ai");
+    }
+
     /// A FOREIGN agent (its cert chained to a registered foreign CA, so
     /// `classify_peer_cert` set `trust_domain`) authors under its org-QUALIFIED
     /// id `{trust_domain}/agent/{name}` — never the bare name a local agent of
@@ -650,6 +741,7 @@ mod tests {
             node_id: None,
             zone_id: None,
             agent_name: Some("cardio".into()),
+            owner: None,
             trust_domain: Some("hospital-a".into()),
             serial: vec![7, 7, 7],
         };
@@ -681,6 +773,7 @@ mod tests {
             node_id: None,
             zone_id: None,
             agent_name: Some("mac-ai".into()),
+            owner: None,
             trust_domain: None,
             serial: vec![9, 9, 9],
         };
@@ -849,6 +942,7 @@ mod tests {
             node_id: Some(42),
             zone_id: Some("sharedzone".into()),
             agent_name: None,
+            owner: None,
             trust_domain: None,
             serial: vec![],
         };
@@ -887,6 +981,7 @@ mod tests {
             node_id: None,
             zone_id: None,
             agent_name: Some("mac-ai".into()),
+            owner: None,
             trust_domain: None,
             serial: vec![1, 2, 3],
         };
@@ -915,6 +1010,7 @@ mod tests {
             node_id: None,
             zone_id: None,
             agent_name: Some("cardio".into()),
+            owner: None,
             trust_domain: Some("hospital-a".into()),
             serial: vec![7, 7, 7],
         };
@@ -937,6 +1033,7 @@ mod tests {
             node_id: None,
             zone_id: None,
             agent_name: Some("mac-ai".into()),
+            owner: None,
             trust_domain: None,
             serial: vec![9, 9, 9],
         };

@@ -12,19 +12,22 @@ use super::proto::nexus::raft::{
     raft_response::Result as ProtoResponseResultVariant,
     zone_api_service_server::{ZoneApiService, ZoneApiServiceServer},
     zone_transport_service_server::{ZoneTransportService, ZoneTransportServiceServer},
-    ClusterConfig as ProtoClusterConfig, DeleteZoneRequest, DeleteZoneResponse,
+    AllowSessionMinterRequest, AllowSessionMinterResponse, ClusterConfig as ProtoClusterConfig,
+    DeleteZoneRequest, DeleteZoneResponse, DenySessionMinterRequest, DenySessionMinterResponse,
     DiscoverZonesRequest, DiscoverZonesResponse, FederationZoneInfo, ForeignCaEntry,
     GetClusterInfoRequest, GetClusterInfoResponse, GetCrlRequest, GetCrlResponse,
     GetMetadataResult, GetSearchCapabilitiesRequest, JoinClusterRequest, JoinClusterResponse,
     JoinZoneRequest, JoinZoneResponse, ListForeignCasRequest, ListForeignCasResponse,
-    ListKeysRequest, ListKeysResponse, ListMetadataResult, ListedKey, LockInfoResult, LockResult,
-    MintAgentRequest, MintAgentResponse, MintKeyRequest, MintKeyResponse,
-    NodeInfo as ProtoNodeInfo, ProposeRequest, ProposeResponse, QueryRequest, QueryResponse,
-    RaftCommand, RaftQueryResponse, RaftResponse, ReadBlobRequest, ReadBlobResponse,
-    RegisterForeignCaRequest, RegisterForeignCaResponse, RemoveVoterRequest, RemoveVoterResponse,
-    ReplicateEntriesRequest, ReplicateEntriesResponse, RevokeKeyRequest, RevokeKeyResponse,
-    SearchCapabilities, SnapshotEcStateRequest, SnapshotEcStateResponse, StepMessageRequest,
-    StepMessageResponse, UnregisterForeignCaRequest, UnregisterForeignCaResponse,
+    ListKeysRequest, ListKeysResponse, ListMetadataResult, ListSessionMintersRequest,
+    ListSessionMintersResponse, ListedKey, LockInfoResult, LockResult, MintAgentRequest,
+    MintAgentResponse, MintKeyRequest, MintKeyResponse, MintSessionAgentRequest,
+    MintSessionAgentResponse, NodeInfo as ProtoNodeInfo, ProposeRequest, ProposeResponse,
+    QueryRequest, QueryResponse, RaftCommand, RaftQueryResponse, RaftResponse, ReadBlobRequest,
+    ReadBlobResponse, RegisterForeignCaRequest, RegisterForeignCaResponse, RemoveVoterRequest,
+    RemoveVoterResponse, ReplicateEntriesRequest, ReplicateEntriesResponse, RevokeAgentCertRequest,
+    RevokeAgentCertResponse, RevokeKeyRequest, RevokeKeyResponse, SearchCapabilities,
+    SnapshotEcStateRequest, SnapshotEcStateResponse, StepMessageRequest, StepMessageResponse,
+    UnregisterForeignCaRequest, UnregisterForeignCaResponse,
 };
 use super::{NodeAddress, Result, SharedPeerMap, TransportError};
 use crate::agent_minter::AgentMinterSlot;
@@ -98,6 +101,7 @@ pub struct RaftGrpcServer {
     /// auth-on daemon. `None` under `--no-tls` — the RegisterForeignCa RPCs
     /// return success=false there (no cross-org trust plane).
     foreign_ca_registrar_slot: Option<ForeignCaRegistrarSlot>,
+    session_mint_admin_slot: Option<crate::session_mint_admin::SessionMintAdminSlot>,
     /// Federated mTLS client-cert verifier — the client-auth trust roots as a
     /// hot-swappable set (cluster CA + any runtime-registered foreign CAs), so a
     /// cross-org CA registered live is trusted without a restart. Shared with the
@@ -121,6 +125,7 @@ impl RaftGrpcServer {
             agent_minter_slot: None,
             key_minter_slot: None,
             foreign_ca_registrar_slot: None,
+            session_mint_admin_slot: None,
             foreign_ca_verifier: None,
             extra_services: None,
         }
@@ -157,6 +162,18 @@ impl RaftGrpcServer {
     /// empty under `--no-tls`.
     pub fn with_foreign_ca_registrar_slot(mut self, slot: ForeignCaRegistrarSlot) -> Self {
         self.foreign_ca_registrar_slot = Some(slot);
+        self
+    }
+
+    /// Attach the late-bindable `SessionMintAdmin` slot so the allow-list RPCs
+    /// can serve once the daemon installs an impl. Installed on every auth-on
+    /// node; empty under `--no-tls`, where there is no agent-cert plane to
+    /// allow-list.
+    pub fn with_session_mint_admin_slot(
+        mut self,
+        slot: crate::session_mint_admin::SessionMintAdminSlot,
+    ) -> Self {
+        self.session_mint_admin_slot = Some(slot);
         self
     }
 
@@ -208,6 +225,7 @@ impl RaftGrpcServer {
             agent_minter_slot: self.agent_minter_slot.clone(),
             key_minter_slot: self.key_minter_slot.clone(),
             foreign_ca_registrar_slot: self.foreign_ca_registrar_slot.clone(),
+            session_mint_admin_slot: self.session_mint_admin_slot.clone(),
         };
 
         let mut builder =
@@ -278,6 +296,7 @@ impl RaftGrpcServer {
             agent_minter_slot: self.agent_minter_slot.clone(),
             key_minter_slot: self.key_minter_slot.clone(),
             foreign_ca_registrar_slot: self.foreign_ca_registrar_slot.clone(),
+            session_mint_admin_slot: self.session_mint_admin_slot.clone(),
         };
 
         let mut builder =
@@ -768,6 +787,7 @@ struct ZoneApiServiceImpl {
     /// siblings). Present on every auth-on daemon; `None` (auth-off) → the RPCs
     /// return success=false.
     foreign_ca_registrar_slot: Option<ForeignCaRegistrarSlot>,
+    session_mint_admin_slot: Option<crate::session_mint_admin::SessionMintAdminSlot>,
 }
 
 #[tonic::async_trait]
@@ -1563,6 +1583,183 @@ impl ZoneApiService for ZoneApiServiceImpl {
                 agent_cert_pem: bundle.cert_pem,
                 agent_key_pem: bundle.key_pem,
                 ca_pem: bundle.ca_pem,
+            })),
+            Err(e) => Ok(err_resp(e)),
+        }
+    }
+
+    /// Sign a session credential for an allow-listed agent caller — the server
+    /// half of a front door obtaining a per-session identity for a person.
+    ///
+    /// Same shape as `mint_agent`: the verified mTLS leaf is forwarded to the
+    /// injected minter, which owns the gate, the CA and the allow-list. Raft
+    /// applies no auth logic. A node with no minter is not the CA holder and
+    /// says so.
+    async fn mint_session_agent(
+        &self,
+        request: Request<MintSessionAgentRequest>,
+    ) -> std::result::Result<Response<MintSessionAgentResponse>, Status> {
+        let caller_cert_der = peer_cert_der(&request);
+        let req = request.into_inner();
+        let err_resp = |msg: String| {
+            Response::new(MintSessionAgentResponse {
+                success: false,
+                error: Some(msg),
+                agent_cert_pem: Vec::new(),
+                agent_key_pem: Vec::new(),
+                ca_pem: Vec::new(),
+                subject_id: String::new(),
+            })
+        };
+        let minter = self
+            .agent_minter_slot
+            .as_ref()
+            .and_then(|slot| slot.read().as_ref().cloned());
+        let Some(minter) = minter else {
+            return Ok(err_resp(
+                "this node does not hold the cluster CA; mint against the founder".to_string(),
+            ));
+        };
+        match minter
+            .mint_session(caller_cert_der, &req.owner_id, req.validity_secs)
+            .await
+        {
+            // The subject comes from the bundle, not from anything the caller
+            // sent: the caller does not choose it.
+            Ok(bundle) => Ok(Response::new(MintSessionAgentResponse {
+                success: true,
+                error: None,
+                agent_cert_pem: bundle.cert_pem,
+                agent_key_pem: bundle.key_pem,
+                ca_pem: bundle.ca_pem,
+                subject_id: bundle.subject_id,
+            })),
+            Err(e) => Ok(err_resp(e)),
+        }
+    }
+
+    /// Record a certificate's serial in the CA-plane CRL.
+    async fn revoke_agent_cert(
+        &self,
+        request: Request<RevokeAgentCertRequest>,
+    ) -> std::result::Result<Response<RevokeAgentCertResponse>, Status> {
+        let caller_cert_der = peer_cert_der(&request);
+        let req = request.into_inner();
+        let err_resp = |msg: String| {
+            Response::new(RevokeAgentCertResponse {
+                success: false,
+                error: Some(msg),
+            })
+        };
+        let minter = self
+            .agent_minter_slot
+            .as_ref()
+            .and_then(|slot| slot.read().as_ref().cloned());
+        let Some(minter) = minter else {
+            return Ok(err_resp(
+                "this node does not hold the cluster CA; revoke against the founder".to_string(),
+            ));
+        };
+        match minter
+            .revoke_cert(caller_cert_der, &req.agent_cert_pem)
+            .await
+        {
+            Ok(()) => Ok(Response::new(RevokeAgentCertResponse {
+                success: true,
+                error: None,
+            })),
+            Err(e) => Ok(err_resp(e)),
+        }
+    }
+
+    async fn allow_session_minter(
+        &self,
+        request: Request<AllowSessionMinterRequest>,
+    ) -> std::result::Result<Response<AllowSessionMinterResponse>, Status> {
+        let caller_cert_der = peer_cert_der(&request);
+        let req = request.into_inner();
+        let err_resp = |msg: String| {
+            Response::new(AllowSessionMinterResponse {
+                success: false,
+                error: Some(msg),
+            })
+        };
+        let Some(admin) = self
+            .session_mint_admin_slot
+            .as_ref()
+            .and_then(|slot| slot.read().as_ref().cloned())
+        else {
+            return Ok(err_resp(
+                "this node has no session-mint plane (auth-off)".to_string(),
+            ));
+        };
+        match admin.allow(caller_cert_der, &req.agent_id).await {
+            Ok(()) => Ok(Response::new(AllowSessionMinterResponse {
+                success: true,
+                error: None,
+            })),
+            Err(e) => Ok(err_resp(e)),
+        }
+    }
+
+    async fn deny_session_minter(
+        &self,
+        request: Request<DenySessionMinterRequest>,
+    ) -> std::result::Result<Response<DenySessionMinterResponse>, Status> {
+        let caller_cert_der = peer_cert_der(&request);
+        let req = request.into_inner();
+        let err_resp = |msg: String| {
+            Response::new(DenySessionMinterResponse {
+                success: false,
+                error: Some(msg),
+                was_present: false,
+            })
+        };
+        let Some(admin) = self
+            .session_mint_admin_slot
+            .as_ref()
+            .and_then(|slot| slot.read().as_ref().cloned())
+        else {
+            return Ok(err_resp(
+                "this node has no session-mint plane (auth-off)".to_string(),
+            ));
+        };
+        match admin.deny(caller_cert_der, &req.agent_id).await {
+            Ok(was_present) => Ok(Response::new(DenySessionMinterResponse {
+                success: true,
+                error: None,
+                was_present,
+            })),
+            Err(e) => Ok(err_resp(e)),
+        }
+    }
+
+    async fn list_session_minters(
+        &self,
+        request: Request<ListSessionMintersRequest>,
+    ) -> std::result::Result<Response<ListSessionMintersResponse>, Status> {
+        let caller_cert_der = peer_cert_der(&request);
+        let err_resp = |msg: String| {
+            Response::new(ListSessionMintersResponse {
+                success: false,
+                error: Some(msg),
+                agent_ids: Vec::new(),
+            })
+        };
+        let Some(admin) = self
+            .session_mint_admin_slot
+            .as_ref()
+            .and_then(|slot| slot.read().as_ref().cloned())
+        else {
+            return Ok(err_resp(
+                "this node has no session-mint plane (auth-off)".to_string(),
+            ));
+        };
+        match admin.list(caller_cert_der).await {
+            Ok(agent_ids) => Ok(Response::new(ListSessionMintersResponse {
+                success: true,
+                error: None,
+                agent_ids,
             })),
             Err(e) => Ok(err_resp(e)),
         }

@@ -1844,6 +1844,13 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         a2a::install_foreign_agent_containment(&kernel);
     }
 
+    // The session-mint allow-list handle, created here and bound when the
+    // control zone comes up. The minter below needs it at construction, but the
+    // consensus it reads through does not exist yet — so the slot travels, and
+    // an unbound slot denies.
+    let session_mint_allow_slot =
+        nexus_raft::session_mint_allow_store::new_session_mint_allow_slot();
+
     // Remote agent-cert mint (task #40): the CA holder installs an `AgentMinter`
     // into the raft gRPC server's slot, so `auth mint --subject-type agent` on
     // ANY node just-works — a node without the CA key forwards to the founder
@@ -1858,6 +1865,11 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
                 Arc::new(FounderAgentMinter {
                     store: auth::KernelSlotStore::new_arc(Arc::clone(&kernel)),
                     tls_dir,
+                    data_dir: common.data_dir.clone(),
+                    // Bound once the control zone is up (below); until then
+                    // session minting is closed, which is the safe default for
+                    // a gate that cannot read its policy.
+                    session_allow: Arc::clone(&session_mint_allow_slot),
                 });
             *zm.agent_minter_slot().write() = Some(minter);
             tracing::info!("CA holder armed MintAgent RPC (remote agent-cert mint)");
@@ -2596,6 +2608,27 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         // under TLS). Load already-registered anchors once at boot (a restart
         // re-derives the live set from the replicated store), then refresh on
         // each foreign-ca apply — mirroring the auth eviction observer above.
+        // The session-mint allow-list rides the same control-zone consensus as
+        // the auth records and the foreign-CA anchors. Binding it here is what
+        // opens session minting at all: until this runs, the gate denies.
+        {
+            let allow = Arc::new(
+                nexus_raft::session_mint_allow_store::RaftSessionMintAllowStore::new(
+                    consensus.clone(),
+                    cred_zone.runtime_handle(),
+                ),
+            );
+            *session_mint_allow_slot.write() = Some(Arc::clone(&allow));
+            // The same store behind the operator-facing RPCs. One store, two
+            // faces: the gate reads it per mint, the admin RPCs change it.
+            let admin: Arc<dyn nexus_raft::session_mint_admin::SessionMintAdmin> =
+                Arc::new(DaemonSessionMintAdmin { store: allow });
+            *zm.session_mint_admin_slot().write() = Some(admin);
+            tracing::info!(
+                "session-mint allow-list bound (MintSessionAgent gate + admin RPCs live)"
+            );
+        }
+
         if let Some(verifier) = zm.foreign_ca_verifier() {
             let fca_store = Arc::new(nexus_raft::foreign_ca_store::RaftForeignCaStore::new(
                 consensus.clone(),
@@ -4518,6 +4551,20 @@ fn write_agent_bundle(
 struct FounderAgentMinter {
     store: Arc<dyn kernel::hal::auth_key_store::AuthKeyStore>,
     tls_dir: PathBuf,
+    /// Where the CA-plane revocation list lives. `tls_dir`'s parent in
+    /// practice, carried explicitly rather than derived so the one place that
+    /// knows the layout stays `revoked_serials_path`.
+    data_dir: PathBuf,
+    /// The session-mint allow-list, bound after the control zone comes up.
+    ///
+    /// Late-bound because the CA key — which is what decides whether this node
+    /// mints at all — is known at boot, while the control-zone consensus the
+    /// list is replicated through is not ready until later. Same late-binding
+    /// idiom as the minter slot this struct is installed into.
+    ///
+    /// Unbound means session minting is CLOSED, not open: a gate that cannot
+    /// read its policy denies.
+    session_allow: nexus_raft::session_mint_allow_store::SessionMintAllowSlot,
 }
 
 #[tonic::async_trait]
@@ -4562,7 +4609,213 @@ impl nexus_raft::agent_minter::AgentMinter for FounderAgentMinter {
             cert_pem,
             key_pem,
             ca_pem,
+            subject_id: subject_id.to_string(),
         })
+    }
+
+    async fn mint_session(
+        &self,
+        caller_cert_der: Option<Vec<u8>>,
+        owner_id: &str,
+        validity_secs: u64,
+    ) -> std::result::Result<nexus_raft::agent_minter::AgentBundle, String> {
+        // Gate: an allow-listed AGENT, not a node. This is the one mint an
+        // agent cert may reach, so the allow-list is the whole thing standing
+        // between it and "any agent may mint an identity for anyone".
+        let caller = gate_allowlisted_session_minter(caller_cert_der, &self.session_allow)?;
+
+        // A fresh subject per call: a session credential names one session, so
+        // a leaked one authorises exactly that session and revoking it cannot
+        // touch another.
+        let subject_id = nexus_raft::transport::session_agent_name(&uuid_v4());
+
+        let ca_pem = std::fs::read(self.tls_dir.join("ca.pem"))
+            .map_err(|e| format!("read {}/ca.pem: {e}", self.tls_dir.display()))?;
+        let ca_key_pem = std::fs::read(self.tls_dir.join("ca-key.pem"))
+            .map_err(|e| format!("read {}/ca-key.pem: {e}", self.tls_dir.display()))?;
+        let (cert_pem, key_pem) = nexus_raft::transport::generate_session_agent_cert(
+            &subject_id,
+            owner_id,
+            validity_secs,
+            &ca_pem,
+            &ca_key_pem,
+        )
+        .map_err(|e| format!("generate session agent cert: {e}"))?;
+
+        // Nothing is written to the auth store. A uuid subject is unique
+        // without a uniqueness record, the cert carries its own expiry, and the
+        // owner rides in the cert — so there is no durable fact here to record,
+        // only a credential that expires on its own. Revocation writes the one
+        // fact that IS durable, and only if it ever happens.
+        tracing::info!(
+            caller = %caller,
+            owner = %owner_id,
+            subject = %subject_id,
+            validity_secs,
+            "minted a session credential"
+        );
+
+        Ok(nexus_raft::agent_minter::AgentBundle {
+            cert_pem,
+            key_pem,
+            ca_pem,
+            subject_id,
+        })
+    }
+
+    async fn revoke_cert(
+        &self,
+        caller_cert_der: Option<Vec<u8>>,
+        agent_cert_pem: &[u8],
+    ) -> std::result::Result<(), String> {
+        const OP: &str = "RevokeAgentCert";
+
+        // Who may revoke: a cluster node, or an allow-listed session minter.
+        //
+        // The second is what makes a session credential revocable at all — the
+        // front door that minted it is the party that knows when the session
+        // ended, and it holds only an agent cert. A node caller covers the
+        // operator path.
+        let caller = match gate_node_caller(caller_cert_der.clone(), OP) {
+            Ok(()) => "node".to_string(),
+            Err(node_err) => gate_allowlisted_session_minter(caller_cert_der, &self.session_allow)
+                .map_err(|agent_err| format!("{node_err}; {agent_err}"))?,
+        };
+
+        // The certificate must chain to THIS cluster's CA before anything is
+        // recorded. Without this check the CRL is a list anyone can write to:
+        // flooding it with unrelated serials costs every legitimate credential
+        // the cost of being checked against them.
+        let ca_pem = std::fs::read(self.tls_dir.join("ca.pem"))
+            .map_err(|e| format!("read {}/ca.pem: {e}", self.tls_dir.display()))?;
+        let peer = transport::peer_identity::classify_peer_cert_pem(agent_cert_pem, &ca_pem, &[])
+            .map_err(|_| format!("{OP}: certificate does not chain to this cluster's CA"))?;
+
+        // Record the serial WITH the certificate's expiry, so the entry can be
+        // dropped once it stops deciding anything. Both come from the verified
+        // certificate, never from the request.
+        let serial = nexus_raft::transport::serial_from_cert_pem(agent_cert_pem)
+            .map_err(|e| format!("{OP}: read serial: {e}"))?;
+        let not_after = transport::peer_identity::not_after_unix_from_pem(agent_cert_pem);
+        let path = nexus_raft::transport::revoked_serials_path(&self.data_dir);
+        nexus_raft::transport::add_revoked_serial_with_expiry(&path, &serial, not_after)
+            .map_err(|e| format!("{OP}: record revoked serial: {e}"))?;
+
+        tracing::info!(
+            caller = %caller,
+            subject = %peer.display_id(),
+            not_after,
+            "revoked a certificate (recorded in the CA-plane CRL)"
+        );
+        Ok(())
+    }
+}
+
+/// Gate a session mint to an allow-listed AGENT caller, returning its resolved
+/// display id for the audit line.
+///
+/// Fails closed at every step that cannot produce a definite "yes": no client
+/// cert, a cert that does not parse, a caller that is not an agent, an unarmed
+/// allow-list, an allow-list that cannot be read, or an id that is not on it.
+/// Only the last of those is an ordinary refusal; the rest are logged at warn
+/// because they mean the gate could not do its job, which an operator needs to
+/// see rather than read as a quiet denial.
+fn gate_allowlisted_session_minter(
+    caller_cert_der: Option<Vec<u8>>,
+    slot: &nexus_raft::session_mint_allow_store::SessionMintAllowSlot,
+) -> std::result::Result<String, String> {
+    const OP: &str = "MintSessionAgent";
+    let der = caller_cert_der.ok_or_else(|| format!("{OP} requires an mTLS client certificate"))?;
+    let peer = transport::peer_identity::from_der(&der)
+        .ok_or_else(|| format!("{OP}: client certificate did not parse"))?;
+    // An agent identity, not a node: a node holds the CA and mints directly.
+    if peer.agent_name.is_none() {
+        return Err(format!(
+            "{OP} is for agent callers; {} presented a non-agent certificate",
+            peer.display_id(),
+        ));
+    }
+    // The id this agent is known by everywhere else — bare for a local agent,
+    // org-qualified for a foreign one — so an operator can allow-list the id
+    // they read in a log, and allow-listing a local `moss` can never admit
+    // another org's `moss`.
+    let caller = peer
+        .resolved_agent_id()
+        .ok_or_else(|| format!("{OP}: caller presented no agent identity"))?;
+
+    let store = slot.read().as_ref().cloned();
+    let Some(store) = store else {
+        tracing::warn!(
+            caller = %caller,
+            "{OP} refused: the session-mint allow-list is not armed on this node"
+        );
+        return Err(format!("{OP} is not available on this node"));
+    };
+    match store.is_allowed(&caller) {
+        Ok(true) => Ok(caller),
+        Ok(false) => Err(format!(
+            "{OP}: {caller} is not permitted to mint session credentials"
+        )),
+        Err(e) => {
+            // Unreadable policy is not permission. Loud, because a denial that
+            // comes from a broken store looks exactly like a correct refusal.
+            tracing::warn!(
+                caller = %caller,
+                error = %e,
+                "{OP} refused: the allow-list could not be read"
+            );
+            Err(format!("{OP}: allow-list unavailable"))
+        }
+    }
+}
+
+/// Daemon-side [`nexus_raft::session_mint_admin::SessionMintAdmin`]: administers
+/// the replicated session-mint allow-list for a remote CLI caller.
+///
+/// Node-gated on every operation, including `list`. Reading the policy is not
+/// the same as reading data: it names which identities hold a delegated
+/// authority, which is reconnaissance for anyone deciding what to steal.
+struct DaemonSessionMintAdmin {
+    store: Arc<nexus_raft::session_mint_allow_store::RaftSessionMintAllowStore>,
+}
+
+#[tonic::async_trait]
+impl nexus_raft::session_mint_admin::SessionMintAdmin for DaemonSessionMintAdmin {
+    async fn allow(
+        &self,
+        caller_cert_der: Option<Vec<u8>>,
+        agent_id: &str,
+    ) -> std::result::Result<(), String> {
+        gate_node_caller(caller_cert_der, "AllowSessionMinter")?;
+        if agent_id.is_empty() {
+            return Err("AllowSessionMinter: agent_id must not be empty".to_string());
+        }
+        self.store.allow(agent_id).map_err(|e| e.to_string())?;
+        tracing::info!(agent_id, "allowed an agent to mint session credentials");
+        Ok(())
+    }
+
+    async fn deny(
+        &self,
+        caller_cert_der: Option<Vec<u8>>,
+        agent_id: &str,
+    ) -> std::result::Result<bool, String> {
+        gate_node_caller(caller_cert_der, "DenySessionMinter")?;
+        let was_present = self.store.deny(agent_id).map_err(|e| e.to_string())?;
+        tracing::info!(
+            agent_id,
+            was_present,
+            "withdrew an agent's session-mint permission"
+        );
+        Ok(was_present)
+    }
+
+    async fn list(
+        &self,
+        caller_cert_der: Option<Vec<u8>>,
+    ) -> std::result::Result<Vec<String>, String> {
+        gate_node_caller(caller_cert_der, "ListSessionMinters")?;
+        self.store.list().map_err(|e| e.to_string())
     }
 }
 
@@ -5297,10 +5550,43 @@ async fn crl_refresh_loop(
     founder_enroll: Option<String>,
 ) {
     const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+    /// How far past a certificate's `notAfter` its revocation entry is kept.
+    ///
+    /// A verifier with a slow clock can still be inside the validity window
+    /// after this node thinks it closed; dropping the entry at exactly
+    /// `notAfter` would un-revoke the certificate for that verifier. An hour is
+    /// far beyond any plausible skew between nodes that are already running
+    /// mTLS against a shared CA, and the cost of being generous is one stale
+    /// line.
+    const REVOCATION_PRUNE_SKEW_MARGIN_SECS: i64 = 60 * 60;
     let ca_path = data_dir.join("tls").join("ca.pem");
     loop {
         let serials: Option<Vec<Vec<u8>>> = if ca_key_holder {
             let path = nexus_raft::transport::revoked_serials_path(&data_dir);
+            // Prune before reading: an entry for a certificate that expired long
+            // ago decides nothing — every verifier already refuses it on
+            // validity — so keeping it grows this list without bound for
+            // credentials that live minutes. Here, on the refresh timer, rather
+            // than at revoke time: it is periodic housekeeping, and it must stay
+            // off the per-request path that `serial_revoked` sits on.
+            //
+            // Only the CA holder prunes. A follower reconstructs its set from a
+            // fetched X.509 CRL, whose entries carry a revocation date and not
+            // the certificate's expiry, so it has nothing to prune by.
+            match nexus_raft::transport::prune_expired_serials(
+                &path,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0),
+                REVOCATION_PRUNE_SKEW_MARGIN_SECS,
+            ) {
+                Ok(0) => {}
+                Ok(n) => tracing::debug!(dropped = n, "pruned expired revocation entries"),
+                // Never fatal: failing to prune costs disk, failing to serve the
+                // CRL costs revocation.
+                Err(e) => tracing::warn!(error = %e, "could not prune the revocation list"),
+            }
             Some(nexus_raft::transport::read_revoked_serials(&path))
         } else if let Some(addr) = &founder_enroll {
             match nexus_raft::transport::call_get_crl(addr, 10).await {
@@ -5825,38 +6111,8 @@ mod tests {
     /// drive, without a live daemon.
     #[tokio::test]
     async fn founder_agent_minter_gates_to_nodes_and_signs() {
-        use kernel::hal::auth_key_store::{AuthKeyStore, AuthKeyStoreError};
         use nexus_raft::agent_minter::AgentMinter;
         use nexus_raft::transport::{generate_agent_cert, generate_node_cert, generate_zone_ca};
-
-        #[derive(Default)]
-        struct MemStore {
-            records: std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
-        }
-        impl AuthKeyStore for MemStore {
-            fn get(&self, k: &str) -> Result<Option<Vec<u8>>, AuthKeyStoreError> {
-                Ok(self.records.lock().unwrap().get(k).cloned())
-            }
-            fn put(&self, k: &str, r: &[u8]) -> Result<(), AuthKeyStoreError> {
-                self.records
-                    .lock()
-                    .unwrap()
-                    .insert(k.to_string(), r.to_vec());
-                Ok(())
-            }
-            fn delete(&self, k: &str) -> Result<bool, AuthKeyStoreError> {
-                Ok(self.records.lock().unwrap().remove(k).is_some())
-            }
-            fn list(&self) -> Result<Vec<(String, Vec<u8>)>, AuthKeyStoreError> {
-                Ok(self
-                    .records
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .map(|(h, r)| (h.clone(), r.clone()))
-                    .collect())
-            }
-        }
 
         // A real cluster CA on disk — the minter reads ca.pem + ca-key.pem.
         let (ca_pem, ca_key_pem) = generate_zone_ca("root").expect("ca");
@@ -5867,7 +6123,14 @@ mod tests {
         std::fs::write(tls_dir.join("ca-key.pem"), &ca_key_pem).unwrap();
 
         let store: Arc<dyn AuthKeyStore> = Arc::new(MemStore::default());
-        let minter = FounderAgentMinter { store, tls_dir };
+        let minter = FounderAgentMinter {
+            store,
+            tls_dir,
+            data_dir: dir.path().to_path_buf(),
+            // This test exercises the node gate on `mint`; session minting is
+            // unbound, which is exactly the closed default.
+            session_allow: nexus_raft::session_mint_allow_store::new_session_mint_allow_slot(),
+        };
 
         let der = |p: &[u8]| ::pem::parse(p).unwrap().contents().to_vec();
         let (node_cert, _k) =
@@ -5908,6 +6171,241 @@ mod tests {
             dup.contains("already has an active credential"),
             "unexpected dup error: {dup}"
         );
+    }
+
+    use kernel::hal::auth_key_store::{AuthKeyStore, AuthKeyStoreError};
+
+    /// In-memory `AuthKeyStore` for the minter tests — shared by both so the
+    /// "session minting writes nothing" assertion and the agent-mint record
+    /// assertions are made against the same store behaviour.
+    #[derive(Default)]
+    struct MemStore {
+        records: std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
+    }
+    impl AuthKeyStore for MemStore {
+        fn get(&self, k: &str) -> Result<Option<Vec<u8>>, AuthKeyStoreError> {
+            Ok(self.records.lock().unwrap().get(k).cloned())
+        }
+        fn put(&self, k: &str, r: &[u8]) -> Result<(), AuthKeyStoreError> {
+            self.records
+                .lock()
+                .unwrap()
+                .insert(k.to_string(), r.to_vec());
+            Ok(())
+        }
+        fn delete(&self, k: &str) -> Result<bool, AuthKeyStoreError> {
+            Ok(self.records.lock().unwrap().remove(k).is_some())
+        }
+        fn list(&self) -> Result<Vec<(String, Vec<u8>)>, AuthKeyStoreError> {
+            Ok(self
+                .records
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(h, r)| (h.clone(), r.clone()))
+                .collect())
+        }
+    }
+
+    /// The session-mint gate: who may ask, and what happens when it cannot tell.
+    ///
+    /// Runs against a real CA and a live control zone, because the interesting
+    /// cases are the refusals and a mocked allow-list would prove nothing about
+    /// them. Covers: closed when unarmed, closed for a caller not on the list,
+    /// open for one that is, and — the case a naming shortcut would get wrong —
+    /// closed for a foreign namesake of an allow-listed local agent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_mint_is_gated_to_the_allow_list_and_fails_closed() {
+        use nexus_raft::agent_minter::AgentMinter;
+        use nexus_raft::session_mint_allow_store::{
+            new_session_mint_allow_slot, RaftSessionMintAllowStore,
+        };
+        use nexus_raft::transport::{generate_agent_cert, generate_node_cert, generate_zone_ca};
+
+        let (ca_pem, ca_key_pem) = generate_zone_ca("root").expect("ca");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tls_dir = dir.path().join("tls");
+        std::fs::create_dir_all(&tls_dir).unwrap();
+        std::fs::write(tls_dir.join("ca.pem"), &ca_pem).unwrap();
+        std::fs::write(tls_dir.join("ca-key.pem"), &ca_key_pem).unwrap();
+
+        let slot = new_session_mint_allow_slot();
+        let minter = FounderAgentMinter {
+            store: Arc::new(MemStore::default()) as Arc<dyn AuthKeyStore>,
+            tls_dir,
+            data_dir: dir.path().to_path_buf(),
+            session_allow: Arc::clone(&slot),
+        };
+        let der = |p: &[u8]| ::pem::parse(p).unwrap().contents().to_vec();
+        let (moss_cert, _k) = generate_agent_cert("moss", &ca_pem, &ca_key_pem).unwrap();
+        let (other_cert, _k) = generate_agent_cert("stranger", &ca_pem, &ca_key_pem).unwrap();
+        let (node_cert, _k) =
+            generate_node_cert(7, "root", &ca_pem, &ca_key_pem, &[], Some("box")).unwrap();
+
+        // Unarmed: closed, not open. This is the state during boot.
+        let e = match minter
+            .mint_session(Some(der(&moss_cert)), "alice", 3600)
+            .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("an unarmed allow-list must not mint"),
+        };
+        assert!(e.contains("not available"), "unexpected unarmed error: {e}");
+
+        // Arm it against a live control zone.
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = nexus_raft::raft::ZoneRaftRegistry::new(tmp.path().to_path_buf(), 1);
+        let runtime = tokio::runtime::Handle::current();
+        let node = registry
+            .create_zone("root", vec![], &runtime)
+            .expect("zone");
+        node.campaign().await.expect("campaign");
+        let allow = Arc::new(RaftSessionMintAllowStore::new(node, runtime));
+        *slot.write() = Some(Arc::clone(&allow));
+
+        // Armed but empty: still closed.
+        assert!(
+            minter
+                .mint_session(Some(der(&moss_cert)), "alice", 3600)
+                .await
+                .is_err(),
+            "an empty allow-list permits nobody"
+        );
+
+        allow.allow("moss").expect("allow moss");
+
+        // Not on the list ⇒ refused, and the message names the caller.
+        let e = match minter
+            .mint_session(Some(der(&other_cert)), "alice", 3600)
+            .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("a caller off the list must not mint"),
+        };
+        assert!(e.contains("stranger"), "unexpected refusal: {e}");
+
+        // A node cert is not an agent caller — this door is for agents; a node
+        // holds the CA and mints directly.
+        assert!(
+            minter
+                .mint_session(Some(der(&node_cert)), "alice", 3600)
+                .await
+                .is_err(),
+            "a node presents no agent identity to match against the list"
+        );
+
+        // No client cert at all ⇒ refused.
+        assert!(minter.mint_session(None, "alice", 3600).await.is_err());
+
+        // On the list ⇒ a session credential for the named owner.
+        let bundle = minter
+            .mint_session(Some(der(&moss_cert)), "alice", 3600)
+            .await
+            .expect("an allow-listed caller mints");
+        let id = transport::peer_identity::from_der(&der(&bundle.cert_pem))
+            .expect("the minted cert parses");
+        assert_eq!(id.owner.as_deref(), Some("alice"), "bound to its owner");
+        assert!(
+            id.agent_name
+                .as_deref()
+                .is_some_and(|n| n.starts_with("session-")),
+            "a session subject, got {:?}",
+            id.agent_name
+        );
+        assert_eq!(id.node_id, None, "a session credential is never a node");
+
+        // Two mints never share a subject: one session, one identity.
+        let second = minter
+            .mint_session(Some(der(&moss_cert)), "alice", 3600)
+            .await
+            .expect("mints again");
+        let id2 = transport::peer_identity::from_der(&der(&second.cert_pem)).unwrap();
+        assert_ne!(id.agent_name, id2.agent_name, "subjects must not repeat");
+
+        // Minting wrote nothing to the auth store: a uuid subject needs no
+        // uniqueness record and an expiring credential is not a durable fact.
+        assert!(
+            minter.store.list().expect("list").is_empty(),
+            "session minting must not persist per-session state"
+        );
+    }
+
+    /// Revoking takes the certificate, because a session credential is never
+    /// written to disk and its holder is the only party with the serial.
+    ///
+    /// The case worth the test is the refusal: a certificate from a CA we do
+    /// not trust must not be recordable. Without that check this RPC is an
+    /// unauthenticated way to fill the CRL, and a CRL anyone can flood is a
+    /// denial of service against every credential checked against it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revoking_records_serial_and_expiry_but_only_for_our_own_ca() {
+        use nexus_raft::agent_minter::AgentMinter;
+        use nexus_raft::session_mint_allow_store::new_session_mint_allow_slot;
+        use nexus_raft::transport::{generate_agent_cert, generate_node_cert, generate_zone_ca};
+
+        let (ca_pem, ca_key_pem) = generate_zone_ca("root").expect("ca");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tls_dir = dir.path().join("tls");
+        std::fs::create_dir_all(&tls_dir).unwrap();
+        std::fs::write(tls_dir.join("ca.pem"), &ca_pem).unwrap();
+        std::fs::write(tls_dir.join("ca-key.pem"), &ca_key_pem).unwrap();
+
+        let minter = FounderAgentMinter {
+            store: Arc::new(MemStore::default()) as Arc<dyn AuthKeyStore>,
+            tls_dir,
+            data_dir: dir.path().to_path_buf(),
+            session_allow: new_session_mint_allow_slot(),
+        };
+        let der = |p: &[u8]| ::pem::parse(p).unwrap().contents().to_vec();
+        let (node_cert, _k) =
+            generate_node_cert(7, "root", &ca_pem, &ca_key_pem, &[], Some("box")).unwrap();
+        let (victim_pem, _k) = generate_agent_cert("doomed", &ca_pem, &ca_key_pem).unwrap();
+
+        // A certificate signed by a CA that is not ours: refused, and nothing
+        // is written.
+        let (other_ca, other_key) = generate_zone_ca("elsewhere").unwrap();
+        let (foreign_pem, _k) = generate_agent_cert("outsider", &other_ca, &other_key).unwrap();
+        let e = minter
+            .revoke_cert(Some(der(&node_cert)), &foreign_pem)
+            .await
+            .expect_err("a foreign certificate must not be recordable");
+        assert!(e.contains("does not chain"), "unexpected error: {e}");
+
+        let path = nexus_raft::transport::revoked_serials_path(dir.path());
+        assert!(
+            nexus_raft::transport::read_revoked_entries(&path).is_empty(),
+            "a refused revocation must write nothing"
+        );
+
+        // Ours: recorded, with the expiry read off the certificate.
+        minter
+            .revoke_cert(Some(der(&node_cert)), &victim_pem)
+            .await
+            .expect("a node caller revokes one of our certificates");
+
+        let entries = nexus_raft::transport::read_revoked_entries(&path);
+        assert_eq!(entries.len(), 1, "exactly one entry");
+        let expected_serial = nexus_raft::transport::serial_from_cert_pem(&victim_pem).unwrap();
+        assert_eq!(entries[0].serial, expected_serial);
+        assert_eq!(
+            entries[0].not_after_unix,
+            transport::peer_identity::not_after_unix_from_pem(&victim_pem),
+            "the expiry recorded is the one the CA signed"
+        );
+
+        // Revoking again is a success: the end state is what was asked for.
+        minter
+            .revoke_cert(Some(der(&node_cert)), &victim_pem)
+            .await
+            .expect("revoking twice is not an error");
+        assert_eq!(
+            nexus_raft::transport::read_revoked_entries(&path).len(),
+            1,
+            "and does not duplicate the entry"
+        );
+
+        // No client certificate ⇒ refused by both gates.
+        assert!(minter.revoke_cert(None, &victim_pem).await.is_err());
     }
 
     /// The founder self-provisions the durable api-key secret on the daemon boot;

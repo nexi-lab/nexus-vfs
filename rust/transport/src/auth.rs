@@ -67,6 +67,15 @@ pub struct PeerIdentity {
     /// customer's CA can mint no cluster member — and it renders the qualified
     /// `td/agent/{name}` id.
     pub trust_domain: Option<String>,
+    /// Who this agent acts for, from a `nexus://owner/{owner}` SAN. `Some`
+    /// only on a session credential; an ordinary agent cert carries no owner
+    /// and acts for itself.
+    ///
+    /// Read from the certificate, so it is settled when the CA signs and needs
+    /// no store lookup — the same property that lets `agent_name` authenticate
+    /// on any node the CA reaches. This is what lets the kernel attribute a
+    /// session agent's actions to a person.
+    pub owner: Option<String>,
     /// The certificate's raw serial-number bytes. For an agent cert this is
     /// what revocation names: `resolve` rejects a peer whose serial is in the
     /// cluster CA's signed CRL. Every X.509 cert carries a serial.
@@ -78,6 +87,26 @@ impl PeerIdentity {
     ///
     /// Prefers the self-named `node/{id}` form, falling back to the CN
     /// for certs minted before the URI SAN existed.
+    /// The id this agent is known by everywhere else: its mailbox `from`, its
+    /// `ctx.agent_id`, its audit lines. `None` for a node cert.
+    ///
+    /// A LOCAL agent is its bare name; a FOREIGN one is org-qualified
+    /// `{trust_domain}/agent/{name}`. Both are unambiguous — a foreign cert can
+    /// never render bare, because `classify_peer_cert` always sets its trust
+    /// domain — which is what stops two orgs' same-named agents from colliding.
+    ///
+    /// Distinct from [`Self::display_id`], which renders a local agent as
+    /// `agent/{name}` for operator output. This is the identity string, that is
+    /// the label; anything matching an agent against a policy wants this one, so
+    /// that an id copied out of a log matches the entry an operator wrote.
+    pub fn resolved_agent_id(&self) -> Option<String> {
+        let name = self.agent_name.as_ref()?;
+        Some(match &self.trust_domain {
+            Some(td) => format!("{td}/agent/{name}"),
+            None => name.clone(),
+        })
+    }
+
     pub fn display_id(&self) -> String {
         if let Some(name) = &self.agent_name {
             // A foreign agent ALWAYS renders qualified — never a bare `agent/x`
@@ -178,6 +207,7 @@ mod tests {
             node_id: Some(7),
             zone_id: Some("root".into()),
             agent_name: None,
+            owner: None,
             trust_domain: None,
             serial: vec![],
         };
@@ -188,6 +218,7 @@ mod tests {
             node_id: None,
             zone_id: None,
             agent_name: None,
+            owner: None,
             trust_domain: None,
             serial: vec![],
         };
@@ -198,6 +229,7 @@ mod tests {
             node_id: None,
             zone_id: None,
             agent_name: Some("win-ai".into()),
+            owner: None,
             trust_domain: None,
             serial: vec![],
         };
