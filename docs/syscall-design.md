@@ -198,7 +198,7 @@ matching watchers. Cost when no watches registered: single `RwLock` read (~50ns)
 Available on all kernel surfaces:
 - **Rust in-process**: `KernelAbi::sys_watch(pattern, timeout_ms)` — managed-agent
   runtimes use this to replace polling with event-driven blocking on
-  `/proc/{pid}/chat-with-me` mailboxes
+  a conversation transcript
 - **Python**: `KernelClient.sys_watch(pattern, timeout_ms)` — gRPC Call RPC
   to kernel subprocess
 - **gRPC/RPC**: `WatchMixin.sys_watch` → `sys_watch` Call RPC
