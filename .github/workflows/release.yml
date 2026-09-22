@@ -405,8 +405,16 @@ jobs:
         run: |
           set -euo pipefail
           BASE="nexus-vfs/clients/node"
-          # Immutable per-version path consumers pin, plus a moving `latest`
-          # for humans checking what the newest build is.
+          ACCEL="https://${COS_BUCKET}.cos.accelerate.myqcloud.com/$BASE"
+          # The per-version path is what consumers pin, so it has to be
+          # immutable in fact and not only by intent. Uploading over it swaps
+          # the bytes under every lockfile that recorded the old ones, and the
+          # break is silent until someone runs a clean install. Refuse, and say
+          # what to do instead.
+          if curl -fsS -o /dev/null -r 0-0 "$ACCEL/$VERSION/$TARBALL" 2>/dev/null; then
+            echo "::error::$VERSION is already published. Bump clients/node/package.json; do not overwrite a version consumers pin."
+            exit 1
+          fi
           coscmd upload "$TARBALL" "$BASE/$VERSION/$TARBALL"
           # Stable name under latest/ as well: a consumer that wants "whatever
           # is current" (a drift check, a smoke test) needs a URL that does not
