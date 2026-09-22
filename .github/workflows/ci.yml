@@ -140,6 +140,39 @@ jobs:
           bun build ./test/live-entry.mjs --outfile="$RUNNER_TEMP/live-bundled.mjs" --target=node --format=esm
           node "$RUNNER_TEMP/live-bundled.mjs"
 
+      - name: Start an auth-on cluster
+        shell: bash
+        # `serve-local --no-tls` cannot reach the zone-api plane: those RPCs
+        # authenticate the caller by its certificate, so without mTLS there is
+        # no caller to gate. A founder cluster issues its own CA and node cert
+        # on first boot, which is all the gate test needs.
+        run: |
+          set -euo pipefail
+          ./nexusd --cluster-init citest \
+            --hostname ci-founder \
+            --advertise-addr 127.0.0.1:22127 \
+            --data-dir "$RUNNER_TEMP/zone-data" \
+            --identity-dir "$RUNNER_TEMP/zone-identity" > zoned.log 2>&1 &
+          for _ in $(seq 1 60); do
+            if [ -s "$RUNNER_TEMP/zone-data/tls/node.pem" ] && [ -s "$RUNNER_TEMP/zone-data/tls/ca.pem" ] \
+              && node -e "require('net').connect(22127,'127.0.0.1').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"; then
+              echo "cluster issued its own credentials and is listening"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo '::error::the founder cluster never issued credentials'; cat zoned.log; exit 1
+
+      - name: Session-mint gate
+        working-directory: clients/node
+        env:
+          NEXUS_ZONE_API_ENDPOINT: 127.0.0.1:22127
+        run: |
+          set -euo pipefail
+          NEXUS_ZONE_API_TLS_DIR="$RUNNER_TEMP/zone-data/tls" npm run test:zone-api-live
+
       - name: nexusd log on failure
         if: failure()
-        run: tail -50 nexusd.log || true
+        run: |
+          tail -50 nexusd.log || true
+          tail -50 zoned.log || true
