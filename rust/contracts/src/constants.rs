@@ -26,14 +26,14 @@
 /// ## Non-obvious nuance (hard-won — do not "fix" this away)
 ///
 /// Root **legitimately hosts node-local durable (`wal`) DT_STREAMs**. The
-/// managed-agent mailbox `/proc/{pid}/chat-with-me` (a2a's
+/// managed-agent mailbox `/proc/{pid}/transcript` (a2a's
 /// `NODE_LOCAL_MAILBOX_PREFIX`) is a `wal` stream over root **by design**:
 /// durable + node-local, never meant to cross machines. So **"a `wal` stream
 /// must never live on root" is FALSE** — banning wal-over-root breaks `/proc`
 /// (kernel tests `sys_setattr_wal_stream_*` depend on it).
 ///
 /// The property that actually matters for cross-machine delivery: a
-/// **cross-machine A2A mailbox** (`*/chat-with-me` **not** under `/proc/`)
+/// **cross-machine A2A mailbox** (`*/transcript` **not** under `/proc/`)
 /// must resolve to a **federation zone** (replicated), never root — a mailbox
 /// on node-local root can never reach a peer. Because wal-over-root is
 /// legitimate for `/proc`, this is **not** a generic kernel/root invariant

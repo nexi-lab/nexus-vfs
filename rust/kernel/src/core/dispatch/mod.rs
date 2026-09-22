@@ -577,7 +577,7 @@ pub enum HookOutcome {
 ///
 /// Path-pattern-bound hooks that don't touch `/__sys__/` paths
 /// logic-wise (e.g. `MailboxStampingHook` keying off
-/// `/chat-with-me`, `WorkspaceBoundaryHook` keying off
+/// `/transcript`, `WorkspaceBoundaryHook` keying off
 /// `/proc/{pid}/workspace/`) still add the explicit check —
 /// defense-in-depth and uniform contract enforcement.
 pub trait NativeInterceptHook: Send + Sync {

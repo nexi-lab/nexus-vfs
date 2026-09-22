@@ -7,18 +7,22 @@
 //! /proc/{owner_pid}/workspace/...   ← owned by the pid named in the path
 //! ```
 //!
-//! When a write target falls under that prefix, the hook compares the
-//! workspace owner pid (extracted from the path) against the caller's
-//! `agent_id`. On mismatch the hook returns `Err` with a structured
+//! When a write target falls under that prefix, the hook resolves the owner
+//! pid (extracted from the path) to its agent through the `AgentRegistry` and
+//! compares that against the caller's `agent_id`. On mismatch the hook returns `Err` with a structured
 //! teaching payload pointing at where messages DO go, so the caller (an
 //! LLM) learns the convention from the error itself rather than from its
 //! system prompt or memory.
 //!
-//! There is no longer a mailbox inside a workspace to carve an exception
-//! for: messages are addressed by agent name, in the conversation the two
-//! participants share, which lives outside every workspace.
+//! The boundary admits nobody but the owner. Messages are addressed by agent
+//! name, in the conversation the two participants share, and a conversation
+//! lives outside every workspace — so there is nothing inside one that a
+//! non-owner needs to write.
+
+use std::sync::Arc;
 
 use contracts::is_system_path;
+use kernel::core::agents::registry::AgentRegistry;
 use kernel::core::dispatch::{HookContext, HookOutcome, NativeInterceptHook};
 
 /// Path prefix that scopes this hook. Anything under `/proc/{pid}/workspace/`
@@ -29,14 +33,18 @@ const WORKSPACE_SEGMENT: &str = "/workspace/";
 
 /// INTERCEPT pre-write hook scoped to `/proc/{pid}/workspace/`.
 ///
-/// Stateless — the hook reads the workspace owner from the path and the
-/// caller from the dispatch context, so a single instance covers every
-/// workspace in the kernel.
-pub(crate) struct WorkspaceBoundaryHook;
+/// One instance covers every workspace in the kernel: the owner comes from the
+/// path and the caller from the dispatch context. It holds the registry
+/// because those two are not the same kind of name — the path carries a PID,
+/// the context carries an agent NAME — and only the registry maps one to the
+/// other.
+pub(crate) struct WorkspaceBoundaryHook {
+    agents: Arc<AgentRegistry>,
+}
 
 impl WorkspaceBoundaryHook {
-    pub(crate) fn new() -> Self {
-        Self
+    pub(crate) fn new(agents: Arc<AgentRegistry>) -> Self {
+        Self { agents }
     }
 
     /// Extract the workspace owner pid from a path. Returns `Some(pid)`
@@ -58,13 +66,13 @@ impl WorkspaceBoundaryHook {
     /// Build the structured teaching error the hook returns on cross-owner
     /// writes.
     ///
-    /// It names the caller's own chat list rather than a message path,
-    /// because the path depends on WHO the owner is and this hook only
-    /// knows its pid. A `readdir` there answers the question the caller
-    /// actually has, in one step it can take from inside the error.
-    fn teaching_error(path: &str, owner_pid: &str, caller_agent_id: &str) -> String {
+    /// It names the caller's own chat list rather than a message path: the
+    /// message path depends on both participants, and a `readdir` there
+    /// answers the question the caller actually has in one step it can take
+    /// from inside the error.
+    fn teaching_error(path: &str, owner: &str, caller_agent_id: &str) -> String {
         format!(
-            "EPERM at {path}: this workspace belongs to pid '{owner_pid}' and is private. \
+            "EPERM at {path}: this workspace belongs to '{owner}' and is private. \
              You are '{caller_agent_id}'. Messages are not written into a workspace — they go \
              to the conversation you share with the other agent. List your conversations at \
              /agents/{caller_agent_id}/conversations/ and append to that peer's transcript.",
@@ -100,19 +108,50 @@ impl NativeInterceptHook for WorkspaceBoundaryHook {
             None => return Ok(HookOutcome::Pass),
         };
 
+        // A bare/system context (kernel-internal provisioning, including
+        // `proc_entry` stamping this very subtree) carries no agent and is not
+        // subject to the boundary.
         let caller = &ctx.identity().agent_id;
-        if caller == owner_pid || caller.is_empty() {
+        if caller.is_empty() {
             return Ok(HookOutcome::Pass);
         }
 
-        Err(Self::teaching_error(path, owner_pid, caller))
+        // The path names a PID; the caller names an AGENT. They are different
+        // namespaces, so they are compared through the registry rather than
+        // directly — and the lookup reads the name alone, because this runs
+        // before every write under a workspace.
+        //
+        // Fails CLOSED on an unknown pid: a workspace whose owner has no
+        // descriptor is nobody's to write.
+        match self.agents.name_of(owner_pid) {
+            Some(owner) if owner == *caller => Ok(HookOutcome::Pass),
+            Some(owner) => Err(Self::teaching_error(path, &owner, caller)),
+            None => Err(Self::teaching_error(path, owner_pid, caller)),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kernel::core::agents::registry::AgentDescriptor;
     use kernel::core::dispatch::{HookIdentity, ReadHookCtx, WriteHookCtx};
+
+    /// A hook over a registry where pid `p1` belongs to agent `owner-agent`.
+    ///
+    /// The pid and the name are deliberately DIFFERENT strings. They are in
+    /// production too — a pid is uuid-allocated and a name is the profile id —
+    /// and a fixture that let them coincide is what allowed a hook comparing
+    /// one to the other to look correct.
+    fn hook_with_p1() -> WorkspaceBoundaryHook {
+        let agents = Arc::new(AgentRegistry::new());
+        agents.register(AgentDescriptor {
+            pid: "p1".to_string(),
+            name: "owner-agent".to_string(),
+            ..Default::default()
+        });
+        WorkspaceBoundaryHook::new(agents)
+    }
 
     fn ctx(path: &str, caller: &str) -> HookContext {
         HookContext::Write(WriteHookCtx {
@@ -131,25 +170,69 @@ mod tests {
         })
     }
 
+    /// The owner may write its own workspace.
+    ///
+    /// This is the case that was broken: the hook compared the caller's agent
+    /// NAME to the PID in the path, so the owner never matched and was refused
+    /// from its own workspace. Nothing noticed because no production code
+    /// writes these VFS paths — agents work against a host cwd — but a gate
+    /// that refuses the one party it must admit is wrong whether or not it is
+    /// currently reached.
     #[test]
     fn passes_when_caller_owns_workspace() {
-        let hook = WorkspaceBoundaryHook::new();
-        let c = ctx("/proc/p1/workspace/notes.md", "p1");
-        assert!(hook.on_pre(&c).is_ok());
+        let hook = hook_with_p1();
+        let c = ctx("/proc/p1/workspace/notes.md", "owner-agent");
+        assert!(
+            hook.on_pre(&c).is_ok(),
+            "the workspace owner must be able to write its own workspace"
+        );
     }
 
-    /// A stranger gets no write into someone else's workspace, with no
-    /// carve-out. There used to be one: the per-pid mailbox and its
-    /// in-workspace link were the advertised way to reach an agent, so the
-    /// hook had to let a non-owner write them. Messages are addressed by name
-    /// now, in a conversation that lives outside every workspace, so the
-    /// boundary has no exception left to make.
+    /// A second session of the same agent reaches the same workspace.
+    ///
+    /// Two pids under one name are one actor: identity is minted per name, so
+    /// they authenticate identically and share one conversation. A workspace
+    /// they could not both write would be the only place that treated them as
+    /// two.
+    #[test]
+    fn passes_for_another_session_of_the_same_agent() {
+        let agents = Arc::new(AgentRegistry::new());
+        for pid in ["p1", "p2"] {
+            agents.register(AgentDescriptor {
+                pid: pid.to_string(),
+                name: "owner-agent".to_string(),
+                ..Default::default()
+            });
+        }
+        let hook = WorkspaceBoundaryHook::new(agents);
+        assert!(hook
+            .on_pre(&ctx("/proc/p1/workspace/notes.md", "owner-agent"))
+            .is_ok());
+    }
+
+    /// A pid with no descriptor fails CLOSED.
+    ///
+    /// The workspace of a reaped or never-registered pid is nobody's to write,
+    /// and a permission gate that opened on a missing record would be widest
+    /// exactly when it knows least.
+    #[test]
+    fn rejects_when_the_owner_pid_is_unknown() {
+        let hook = WorkspaceBoundaryHook::new(Arc::new(AgentRegistry::new()));
+        assert!(hook
+            .on_pre(&ctx("/proc/ghost/workspace/notes.md", "owner-agent"))
+            .is_err());
+    }
+
+    /// A stranger gets no write into someone else's workspace, anywhere —
+    /// including at a path shaped like a message leaf, because a conversation
+    /// lives outside every workspace and a workspace holds no message surface
+    /// a non-owner could need.
     #[test]
     fn rejects_a_stranger_everywhere_inside_the_workspace() {
-        let hook = WorkspaceBoundaryHook::new();
+        let hook = hook_with_p1();
         for path in [
             "/proc/p1/workspace/notes.md",
-            "/proc/p1/workspace/chat-with-me",
+            "/proc/p1/workspace/transcript",
         ] {
             assert!(
                 hook.on_pre(&ctx(path, "stranger")).is_err(),
@@ -160,7 +243,7 @@ mod tests {
 
     #[test]
     fn passes_for_paths_outside_workspace_namespace() {
-        let hook = WorkspaceBoundaryHook::new();
+        let hook = hook_with_p1();
         let c = ctx("/agents/scode-standard/config.toml", "stranger");
         assert!(hook.on_pre(&c).is_ok());
     }
@@ -170,18 +253,21 @@ mod tests {
         // /proc/{pid}/agent and /proc/{pid}/sessions/ are runtime metadata
         // paths owned by their pid but not workspace files; the hook only
         // governs the workspace segment.
-        let hook = WorkspaceBoundaryHook::new();
+        let hook = hook_with_p1();
         let c = ctx("/proc/p1/sessions/foo.jsonl", "stranger");
         assert!(hook.on_pre(&c).is_ok());
     }
 
     #[test]
     fn rejects_cross_owner_write_with_teaching_payload() {
-        let hook = WorkspaceBoundaryHook::new();
+        let hook = hook_with_p1();
         let c = ctx("/proc/p1/workspace/projects/nexus/src/main.rs", "p_other");
         let err = hook.on_pre(&c).unwrap_err();
         assert!(err.contains("EPERM"));
-        assert!(err.contains("p1"));
+        assert!(
+            err.contains("owner-agent"),
+            "the error must name the OWNER, not the pid the caller cannot act on: {err}"
+        );
         assert!(err.contains("p_other"));
         assert!(
             err.contains("/agents/p_other/conversations/"),
@@ -191,7 +277,7 @@ mod tests {
 
     #[test]
     fn read_path_does_not_trigger_boundary() {
-        let hook = WorkspaceBoundaryHook::new();
+        let hook = hook_with_p1();
         let read = HookContext::Read(ReadHookCtx {
             path: "/proc/p1/workspace/notes.md".to_string(),
             identity: HookIdentity {
@@ -210,7 +296,7 @@ mod tests {
     fn empty_caller_passes_through() {
         // Internal dispatchers without an authenticated caller must not
         // be blocked by the boundary check (kernel writes, recovery, …).
-        let hook = WorkspaceBoundaryHook::new();
+        let hook = hook_with_p1();
         let c = ctx("/proc/p1/workspace/notes.md", "");
         assert!(hook.on_pre(&c).is_ok());
     }

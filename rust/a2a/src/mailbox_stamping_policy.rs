@@ -10,7 +10,7 @@
 //! awareness of mailbox semantics.
 //!
 //! Path policy: any `sys_write` whose target is an A2A message log — a
-//! conversation transcript, or a legacy `*/chat-with-me` mailbox during the
+//! conversation transcript, or a legacy `*/transcript` mailbox during the
 //! rename window — is parsed as a JSON envelope and its `from` field stamped
 //! with `caller_agent_id` regardless of what the LLM authored. Receivers see
 //! who actually wrote the message, not who claimed to.
@@ -86,36 +86,6 @@ impl MailboxEnvelope {
     }
 }
 
-/// Whether `path` is an A2A message log — a conversation transcript
-/// (`…/conversations/<cid>/transcript`).
-///
-/// ONE predicate, for both the stamp and the fail-closed gate. There used to be
-/// two: the node-local `/proc/{pid}/chat-with-me` pipe was stamped but never
-/// *rejected*, because an unauthenticated write to it could not reach another
-/// machine. That pipe is gone, every message log is replicated, and a
-/// distinction with nothing left on one side of it is a trap — the next reader
-/// has to work out that the two are coextensive before trusting either.
-///
-/// It MUST stay in agreement with the hook's declared suffixes
-/// ([`MAILBOX_WRITE_SUFFIXES`]): a path the hook does not claim is never
-/// cloned, so the stamp never runs on it and `from` becomes whatever the writer
-/// typed.
-///
-/// FAIL-SAFE and mount-independent by construction. Deliberately NOT keyed off
-/// the A2A mount point (`/agents`, operator-configurable via
-/// `NEXUS_FEDERATION_MOUNTS`) — keying on the mount would fail UNSAFE, silently
-/// skipping the gate for a log under a differently-named mount. Over-including
-/// an oddly-placed non-mailbox file is the safe direction for a security gate.
-///
-/// This is ALSO the entire allow-list [`crate::foreign_containment`] confines a
-/// cross-org caller to, which is why [`is_conversation_transcript_path`] tests
-/// for the `/conversations/` segment rather than the `/transcript` leaf alone:
-/// a bare leaf test would hand a foreign agent every path in the tree that
-/// happens to end that way.
-pub fn is_mailbox_path(path: &str) -> bool {
-    is_conversation_transcript_path(path)
-}
-
 /// Rewrite the envelope's `from` field to the caller's `agent_id` when
 /// the write target is a mailbox path. Returns the rewritten bytes, or
 /// `None` if no rewrite was needed (non-mailbox path, no caller agent,
@@ -130,7 +100,7 @@ pub fn maybe_stamp_chat_envelope<'a>(
     caller_agent_id: Option<&str>,
     content: &'a [u8],
 ) -> Option<Cow<'a, [u8]>> {
-    if !is_mailbox_path(path) {
+    if !is_conversation_transcript_path(path) {
         return None;
     }
     let caller = caller_agent_id?;
@@ -310,26 +280,26 @@ mod tests {
     fn mailbox_predicate_scope() {
         let cid = conversation_id("win-ai", "mac-ai");
         let transcript = conversation_transcript_path(&cid);
-        assert!(is_mailbox_path(&transcript), "{transcript}");
+        assert!(is_conversation_transcript_path(&transcript), "{transcript}");
 
         // Mount-independent: the A2A mount point is operator-configurable, so
         // keying on `/agents` would fail UNSAFE — a log under a differently
         // named mount would silently skip the gate.
         assert!(
-            is_mailbox_path(&format!("/zone-x/conversations/{cid}/transcript")),
+            is_conversation_transcript_path(&format!("/zone-x/conversations/{cid}/transcript")),
             "a transcript under any mount is gated, not just the default one"
         );
 
-        assert!(!is_mailbox_path("/workspace/notes.md"));
+        assert!(!is_conversation_transcript_path("/workspace/notes.md"));
         assert!(
-            !is_mailbox_path("/agents/win-ai/notes.txt"),
+            !is_conversation_transcript_path("/agents/win-ai/notes.txt"),
             "an ordinary file under the agent presence is not a message log"
         );
     }
 
     /// The `/conversations/` segment is load-bearing, not decoration.
     ///
-    /// [`is_mailbox_path`] is the ENTIRE allow-list a cross-org caller is
+    /// [`is_conversation_transcript_path`] is the ENTIRE allow-list a cross-org caller is
     /// confined to (`crate::foreign_containment`), and `/transcript` is not a
     /// leaf that is safe to test for on its own — a session transcript, an
     /// audit transcript, anything a user names that way would land inside a
@@ -343,7 +313,7 @@ mod tests {
             "/agents/win-ai/transcript",
         ] {
             assert!(
-                !is_mailbox_path(path),
+                !is_conversation_transcript_path(path),
                 "{path} must NOT be a mailbox — it carries no /conversations/ segment"
             );
         }
@@ -352,7 +322,7 @@ mod tests {
     /// A reader register is readable by a peer but must never be WRITABLE by a
     /// foreign one, so it must fall OUTSIDE the mailbox predicates.
     ///
-    /// [`is_mailbox_path`] grants a cross-org caller read AND write. Moving
+    /// [`is_conversation_transcript_path`] grants a cross-org caller read AND write. Moving
     /// someone else's read position steps over their inbound messages with no
     /// error, no trace, and the sender still told "delivered" — so the register
     /// gets its own predicate, admitted for reads only.
@@ -363,7 +333,7 @@ mod tests {
 
         assert!(is_conversation_reader_path(&reader), "{reader}");
         assert!(
-            !is_mailbox_path(&reader),
+            !is_conversation_transcript_path(&reader),
             "a reader register must not be inside the foreign agent's write scope: {reader}"
         );
         // And a transcript is not a reader register.

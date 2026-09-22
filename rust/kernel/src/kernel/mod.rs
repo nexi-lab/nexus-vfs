@@ -1925,7 +1925,7 @@ impl Kernel {
                     // node never ran the local setattr) then gets a WalStreamCore
                     // over THIS node's zone metastore, so the mailbox is readable
                     // AND writable on every zone member — not only its creator.
-                    // Without this a peer sending to someone else's chat-with-me,
+                    // Without this a peer sending to someone else's message stream,
                     // or reading a mailbox created on the other machine, hits
                     // StreamNotFound. The inode already exists, so no re-write.
                     self.install_stream_backend(path, capacity, io_profile)?;
@@ -1985,7 +1985,7 @@ impl Kernel {
     /// `consistency`, backed by the metastore of the path's resolved zone.
     ///
     /// The stream MUST live in the PATH's zone, not hardcoded root: a
-    /// `chat-with-me` under a federation mount (`/agents=<zone>`) has to propose
+    /// `message stream` under a federation mount (`/agents=<zone>`) has to propose
     /// its `AppendStreamEntry` to THAT zone's raft so it replicates to peers.
     /// Backing it with root (node-local) would silently never cross machines.
     /// `route().zone_id` is the resolved destination zone (the routing SSOT) —
@@ -2196,7 +2196,7 @@ impl Kernel {
     #[allow(dead_code)]
     fn write_stream_inode(&self, path: &str, capacity: usize) -> Result<(), KernelError> {
         // The DT_STREAM inode MUST live in the PATH's routed zone, not a
-        // hardcoded root: a `chat-with-me` under a federation mount
+        // hardcoded root: a `message stream` under a federation mount
         // (`/agents=<zone>`) has to land in THAT zone's metastore so the inode
         // replicates to peers — the SAME zone `wal_backend_for` resolves for
         // the stream's content backend. Hardcoding root left the inode
@@ -4019,7 +4019,7 @@ mod tests {
     }
 
     /// Regression: a DT_STREAM's owning zone follows the path's routing SSOT,
-    /// so a `chat-with-me` under a federation mount lands in the mount's TARGET
+    /// so a `message stream` under a federation mount lands in the mount's TARGET
     /// zone (replicates to peers), NOT hardcoded root (node-local). The bug this
     /// guards: `write_stream_inode` hardcoded `ROOT_ZONE_ID` while the parent
     /// dir + the wal content backend routed to the mount zone, so A2A mailboxes
@@ -4039,9 +4039,9 @@ mod tests {
         // resolver `write_stream_inode` (inode) and `wal_backend_for` (content)
         // both use, so inode and backend can't land in different zones.
         assert_eq!(
-            k.routed_zone_id("/agents/w2m/chat-with-me"),
+            k.routed_zone_id("/agents/w2m/transcript"),
             "sharedzone",
-            "a chat-with-me under a federation mount must own the mount's target zone"
+            "an A2A stream under a federation mount must own the mount's target zone"
         );
         assert_eq!(k.routed_zone_id("/agents"), "sharedzone");
         // An unmounted path stays node-local root (e.g. a /proc pipe-stream) —
@@ -4747,7 +4747,7 @@ mod tests {
                 Arc::new(TestFederationCoordinator::new()) as Arc<dyn DistributedCoordinator>
             );
             // Mount /proc so sys_stat / sys_read / sys_write can
-            // route to /proc/{pid}/chat-with-me. Production
+            // route to /proc/{pid}/transcript. Production
             // services::managed_agent::install_returning does the
             // same; the e2e test mirrors that fixture so the wal
             // stream the test writes to is reachable by readers.
@@ -4796,20 +4796,20 @@ mod tests {
             let bare = Arc::new(Kernel::new());
             bare.vfs_router
                 .add_mount("/proc", contracts::ROOT_ZONE_ID, None, false);
-            setattr(&bare, "/proc/p-wf/chat-with-me", "wal,memory")
+            setattr(&bare, "/proc/p-wf/transcript", "wal,memory")
                 .expect("wal,memory must fall through to memory without federation");
             let ctx = OperationContext::new("test", "root", true, None, true);
-            bare.sys_write_with_link_depth("/proc/p-wf/chat-with-me", &ctx, b"hi", 0, 1)
+            bare.sys_write_with_link_depth("/proc/p-wf/transcript", &ctx, b"hi", 0, 1)
                 .expect("memory stream write");
             let read = bare
-                .sys_read_single("/proc/p-wf/chat-with-me", &ctx, 1, 0, 0)
+                .sys_read_single("/proc/p-wf/transcript", &ctx, 1, 0, 0)
                 .expect("memory stream read");
             assert_eq!(read.data.expect("bytes").as_slice(), b"hi");
 
             // 2. No federation + bare "wal" → fail loud (audit's contract;
             //    a length-1 waterfall must NOT silently degrade to memory).
             assert!(
-                setattr(&bare, "/proc/p-wl/chat-with-me", "wal").is_err(),
+                setattr(&bare, "/proc/p-wl/transcript", "wal").is_err(),
                 "bare \"wal\" must error when federation is down",
             );
 
@@ -4817,7 +4817,7 @@ mod tests {
             //    (the wal round-trip itself is covered by
             //    sys_setattr_wal_stream_creates_inode_and_round_trips).
             let fed = fresh_federated_kernel();
-            setattr(&fed, "/proc/p-wf2/chat-with-me", "wal,memory")
+            setattr(&fed, "/proc/p-wf2/transcript", "wal,memory")
                 .expect("wal,memory must install the wal stream when federation is up");
         }
 
@@ -4838,7 +4838,7 @@ mod tests {
             // would surface here as a missing metastore wire-up or wrong
             // stream-backend type.
             let kernel = fresh_federated_kernel();
-            let path = "/proc/p-fed/chat-with-me";
+            let path = "/proc/p-fed/transcript";
 
             kernel
                 .sys_setattr(
@@ -4904,7 +4904,7 @@ mod tests {
             // exercise this on the memory branch; this test covers
             // the wal branch).
             let kernel = fresh_federated_kernel();
-            let path = "/proc/p-fed-2/chat-with-me";
+            let path = "/proc/p-fed-2/transcript";
             let ctx = OperationContext::new("test", "root", true, None, true);
 
             for _ in 0..2 {

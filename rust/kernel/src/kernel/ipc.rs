@@ -70,7 +70,7 @@ impl Kernel {
     ///
     /// Runs mutating pre-hooks first via the shared
     /// [`Kernel::apply_mutating_write_hooks`] seam, so a DT_PIPE mailbox
-    /// (`/proc/{pid}/chat-with-me`) gets the same `from`-stamp as every other
+    /// (`/proc/{pid}/transcript`) gets the same `from`-stamp as every other
     /// write path.
     pub fn pipe_write_nowait(
         &self,

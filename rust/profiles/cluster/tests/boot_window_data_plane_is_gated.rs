@@ -89,8 +89,8 @@ async fn a_mailbox_written_the_instant_the_port_opens_reads_back() {
 
     // Root zone (the #276 control) and the federation mount, both from inside
     // the boot window.
-    mailbox_roundtrip(&mut vfs, "/rootlocal/mac-ai/chat-with-me").await;
-    mailbox_roundtrip(&mut vfs, "/agents/mac-ai/chat-with-me").await;
+    mailbox_roundtrip(&mut vfs, "/rootlocal/mac-ai/transcript").await;
+    mailbox_roundtrip(&mut vfs, "/agents/mac-ai/transcript").await;
 
     assert!(
         founder.log_contains("VFS data plane ready"),

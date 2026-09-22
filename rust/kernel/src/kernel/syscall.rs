@@ -202,7 +202,7 @@ pub trait KernelSyscall: Send + Sync + 'static {
     /// try). Callers re-arm by calling again with a new `sys_watch`.
     ///
     /// Used by managed-agent runtimes to replace polling with
-    /// event-driven blocking on `/proc/{pid}/chat-with-me` mailboxes.
+    /// event-driven blocking on `/proc/{pid}/transcript` mailboxes.
     fn sys_watch(&self, pattern: &str, timeout_ms: u64) -> Option<FileEvent>;
 }
 

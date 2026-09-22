@@ -1,26 +1,25 @@
-//! Root-cause repro (task #96): the co-host A2A mailbox
-//! `/agents/<name>/chat-with-me` read returns FileNotFound on the co-host
-//! path, while a plain gRPC read of the same path works.
+//! An A2A message stream under a FEDERATION MOUNT must round-trip.
 //!
-//! Hypothesis under test — it is NOT the OS, it is the **federation mount**.
-//! The one confirmed difference between the Docker duet (PONG) and the native
-//! Windows founder (FileNotFound) is that Docker was single-node with `/agents`
-//! in the plain root zone, whereas the Windows founder mounted
-//! `/agents=<zone>` as a federation mount. The A2A inbox is a DT_STREAM (the
-//! co-host loop consumes `stream_next_offset`), and NOBODY provisions
-//! `/agents/<name>/chat-with-me` — unlike `/proc/{pid}/chat-with-me`, which
-//! `managed_agent::proc_entry` creates with io_profile `wal,memory`. So the
-//! stream's write-side backend and the read-side `wal_backend_for` /
-//! `routed_zone_id` materializer can resolve to different zones under a mount.
+//! Originally the root-cause repro for task #96, where a co-host read returned
+//! FileNotFound while a plain gRPC read of the same path worked. It was not the
+//! OS: the Docker duet was single-node with `/agents` in the plain root zone,
+//! while the native founder mounted `/agents=<zone>` as a federation mount. An
+//! A2A message log is a DT_STREAM, and under a mount its write-side backend and
+//! the read-side `wal_backend_for` / `routed_zone_id` materializer can resolve
+//! to DIFFERENT zones — so the bytes go one place and the read looks in
+//! another.
+//!
+//! The bug is fixed; the property is not self-evident, so the gate stays. It
+//! applies to every replicated A2A prefix (`REPLICATED_PREFIXES`), which is why
+//! the subject path sits under the mounted one.
 //!
 //! This is a BLACK-BOX, cross-platform gate: it stands up the real
 //! `nexusd-cluster` founder with the exact failing topology
 //! (`--cluster-init <zone> --cluster-init-mount /agents=<zone>`), provisions
-//! the inbox as a DT_STREAM the way the fix will, and round-trips one envelope
-//! BOTH under the federation mount AND at a plain root path (the control). If
-//! the control round-trips but the federation-mounted inbox does not, the
-//! federation mount is the root cause — reproduced on Linux CI and Windows
-//! alike, with no OS-specific reasoning.
+//! the stream, and round-trips one envelope BOTH under the federation mount AND
+//! at a plain root path (the control). If the control round-trips but the
+//! federation-mounted stream does not, the mount is the cause — on Linux CI and
+//! Windows alike, with no OS-specific reasoning.
 
 mod common;
 
@@ -47,7 +46,7 @@ const ENVELOPE: &[u8] = br#"{"from":"win-ai","to":"mac-ai","body":"PING"}"#;
 
 /// One mailbox envelope round-trip on `inbox` via the STREAM RPCs: provision it
 /// as a DT_STREAM (`wal,memory` — the same io_profile `proc_entry` uses for the
-/// canonical `/proc/{pid}/chat-with-me` mailbox), append one message, then read
+/// canonical `/proc/{pid}/transcript` mailbox), append one message, then read
 /// it back from offset 0. Returns `Ok(bytes)` on a successful read, `Err(reason)`
 /// at the first failing step so the caller can pinpoint which op broke.
 async fn mailbox_roundtrip(vfs: &mut Vfs, inbox: &str) -> Result<Vec<u8>, String> {
@@ -98,7 +97,7 @@ async fn mailbox_roundtrip(vfs: &mut Vfs, inbox: &str) -> Result<Vec<u8>, String
     Err(last)
 }
 
-/// The ACTUAL co-host flow: the inbox is NOT provisioned as a DT_STREAM, and
+/// The ACTUAL co-host flow: the stream is NOT provisioned as a DT_STREAM, and
 /// both sides use PLAIN `sys_write` / `sys_read` (what the sudocode co-host
 /// loop and the gRPC seed do), NOT the stream RPCs. This is the exact op pair
 /// that FileNotFounds on the native founder. `write_file` → `sys_write`,
@@ -118,7 +117,7 @@ async fn mailbox_roundtrip_plain(vfs: &mut Vfs, inbox: &str) -> Result<Vec<u8>, 
     Ok(got)
 }
 
-/// The POST-FIX co-host pattern: the inbox is PROVISIONED as a DT_STREAM (what
+/// The POST-FIX co-host pattern: the stream is PROVISIONED as a DT_STREAM (what
 /// the a2a-owned provisioning will do), but the writer/reader still use the
 /// PLAIN `sys_write` / `sys_read` the co-host loop uses (not the stream RPCs).
 /// `sys_write` to a DT_STREAM appends; `sys_read` tails from offset 0. Proves
@@ -176,18 +175,18 @@ async fn a2a_mailbox_stream_roundtrips_through_federation_mount() {
 
     let mut vfs = Vfs::dial(fport).await.expect("dial founder");
 
-    let control = "/rootlocal/mac-ai/chat-with-me";
-    let subject = "/agents/mac-ai/chat-with-me";
+    let control = "/rootlocal/mac-ai/transcript";
+    let subject = "/agents/mac-ai/transcript";
 
     // Matrix — isolate (federation mount?) × (provisioned DT_STREAM vs the real
-    // plain-op flow). Each cell is independent (distinct inbox paths).
+    // plain-op flow). Each cell is independent (distinct stream paths).
     let stream_control = mailbox_roundtrip(&mut vfs, control).await;
     let stream_subject = mailbox_roundtrip(&mut vfs, subject).await;
-    let plain_control = mailbox_roundtrip_plain(&mut vfs, "/rootlocal/plain/chat-with-me").await;
-    let plain_subject = mailbox_roundtrip_plain(&mut vfs, "/agents/plain/chat-with-me").await;
+    let plain_control = mailbox_roundtrip_plain(&mut vfs, "/rootlocal/plain/transcript").await;
+    let plain_subject = mailbox_roundtrip_plain(&mut vfs, "/agents/plain/transcript").await;
     // The post-fix shape: provisioned DT_STREAM + the co-host's plain ops.
     let fixed_subject =
-        mailbox_roundtrip_provisioned_plain(&mut vfs, "/agents/fixed/chat-with-me").await;
+        mailbox_roundtrip_provisioned_plain(&mut vfs, "/agents/fixed/transcript").await;
 
     eprintln!("REPRO96 stream control  ({control})              => {stream_control:?}");
     eprintln!("REPRO96 stream subject  ({subject})              => {stream_subject:?}");
@@ -233,7 +232,7 @@ const SECRET: &str = "e2e-a2a-mailbox-secret";
 
 /// The last uncovered cell — the EXACT co-host read: a non-admin CERT-AGENT
 /// doing a PLAIN `sys_read` (`read_file`) of an UNPROVISIONED
-/// `/agents/<name>/chat-with-me` under a federation mount, after the envelope
+/// `/agents/<name>/transcript` under a federation mount, after the envelope
 /// was seeded by a DIFFERENT (admin) identity — the sudocode co-host loop's
 /// `kernel.sys_read(inbox, ctx{is_admin:false, agent_id:Some}, …)`.
 ///
@@ -309,7 +308,7 @@ async fn cert_agent_plain_read_of_unprovisioned_inbox_through_federation_mount()
         .await
         .expect("founder resumes sharedzone");
 
-    let inbox = "/agents/mac-ai/chat-with-me";
+    let inbox = "/agents/mac-ai/transcript";
 
     // win-ai (non-admin cert) seeds mac-ai's inbox with a PLAIN write — the
     // inbox is NOT provisioned as a stream (nobody provisions it in prod).

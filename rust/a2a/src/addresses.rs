@@ -13,8 +13,8 @@
 //! needs to know a stamp exists.
 //!
 //! Naming, decided with the kernel lead: a conversation's log is a
-//! `transcript`, not an `inbox` or a `chat-with-me`. The latter two name a
-//! per-recipient, receive-only mailbox, while this log is bidirectional — A's
+//! `transcript`, not an `inbox`. An inbox names a per-recipient,
+//! receive-only mailbox, while this log is bidirectional — A's
 //! message and B's reply are the same stream, each side filtering its own
 //! writes. Naming it for one endpoint would reinstate the two-inbox model that
 //! conversations replace.
@@ -26,7 +26,7 @@
 /// resolves the concrete backend from this preference order (see
 /// `Kernel::install_stream_backend`). Every provisioner
 /// ([`crate::ensure_mailbox_stream`], and via it the per-pid
-/// `/proc/{pid}/chat-with-me` pipe and the conversation transcript) goes
+/// `/proc/{pid}/transcript` pipe and the conversation transcript) goes
 /// through this one string rather than re-declaring `"wal,memory"`.
 pub const MAILBOX_IO_PROFILE: &str = "wal,memory";
 
@@ -65,7 +65,7 @@ pub fn agent_state_path(agent_name: &str) -> String {
 
 // ── Conversations ──────────────────────────────────────────────────────
 //
-// A conversation, not a pair of inboxes. `/agents/{name}/chat-with-me` made
+// A conversation, not a pair of inboxes. `/agents/{name}/transcript` made
 // "where has this agent read to" a property of whichever machine ran it, and
 // two inboxes that never merge cannot express "has my peer read this" — there
 // is no shared offset space to point at. One append-only transcript both
@@ -89,7 +89,7 @@ pub const TRANSCRIPT_LEAF: &str = "/transcript";
 
 /// Path segment introducing a conversation id. Used by the STRUCTURAL
 /// predicates: a bare `ends_with("/transcript")` would be a far weaker test
-/// than the old `/chat-with-me` (which nothing else in the tree is named), and
+/// than the old `/transcript` (which nothing else in the tree is named), and
 /// `crate::is_a2a_mailbox_path` is the ENTIRE allow-list a cross-org caller is
 /// confined to — see `crate::foreign_containment`. Requiring the
 /// `/conversations/` segment keeps that gate exactly as narrow as it was.
@@ -251,11 +251,28 @@ pub fn is_conversation_index_path(path: &str) -> bool {
 }
 
 /// Whether `path` is a conversation transcript
-/// (`…/conversations/<cid>/transcript`).
+/// (`…/conversations/<cid>/transcript`) — the one message-log shape.
 ///
-/// Structural rather than a bare suffix test, because `crate::is_a2a_mailbox_path`
-/// builds on it and doubles as a cross-org allow-list — see the
-/// `/conversations/` segment note above.
+/// This single predicate drives the `from` stamp, the fail-closed rejection of
+/// an unauthenticated write, and the entire allow-list
+/// [`crate::foreign_containment`] confines a cross-org caller to. Whatever it
+/// admits is stamped, refused when unauthenticated, and reachable by a guest,
+/// so widening it is never cosmetic.
+///
+/// Structural rather than a bare suffix test: `/transcript` alone would admit
+/// a session transcript, an audit transcript, or anything a user happens to
+/// name that way, handing a foreign agent every such path in the tree.
+///
+/// FAIL-SAFE and mount-independent by construction. Deliberately NOT keyed off
+/// the A2A mount point (`/agents`, operator-configurable via
+/// `NEXUS_FEDERATION_MOUNTS`): keying on the mount would fail UNSAFE, silently
+/// skipping the gate for a log under a differently-named mount. Over-including
+/// an oddly-placed file is the safe direction for a security gate.
+///
+/// It MUST stay in agreement with the hook's declared suffixes
+/// ([`crate::MAILBOX_WRITE_SUFFIXES`]): a path the hook does not claim is never
+/// cloned into the write context, so the stamp never runs and `from` becomes
+/// whatever the writer typed.
 #[must_use]
 pub fn is_conversation_transcript_path(path: &str) -> bool {
     path.ends_with(TRANSCRIPT_LEAF) && path.contains(CONVERSATIONS_SEGMENT)
@@ -278,7 +295,6 @@ pub fn is_conversation_reader_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mailbox_stamping_policy::is_mailbox_path;
 
     /// One conversation per unordered pair, derivable by either side alone.
     #[test]
@@ -345,6 +361,6 @@ mod tests {
         // Integration invariant: what we provision MUST be what the gate
         // recognises, or the `from`-guarantee silently skips the very logs we
         // create.
-        assert!(is_mailbox_path(&transcript));
+        assert!(is_conversation_transcript_path(&transcript));
     }
 }

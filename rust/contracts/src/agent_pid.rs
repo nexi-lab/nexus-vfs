@@ -3,7 +3,7 @@
 //! # Design (decided 2026-07-28 with the kernel lead)
 //!
 //! An agent has TWO identity layers:
-//!   * **persistent identity = the agent NAME** (`/agents/{name}/chat-with-me`,
+//!   * **persistent identity = the agent NAME** (`/agents/{name}/transcript`,
 //!     cluster-unique, cross-machine, survives restart). This is what other
 //!     agents address; the pid is never the external address.
 //!   * **per-run handle = the pid** — ephemeral, one per process start.
