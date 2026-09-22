@@ -10,9 +10,10 @@ use super::proto::nexus::raft::{
     DeleteZoneRequest, DiscoverZonesRequest, EcReplicationEntry, ExtendLock, GetClusterInfoRequest,
     GetCrlRequest, GetLockInfo, GetMetadata, JoinClusterRequest, JoinZoneRequest,
     ListForeignCasRequest, ListKeysRequest, ListMetadata, MintAgentRequest, MintKeyRequest,
-    ProposeRequest, PutMetadata, QueryRequest, RaftCommand, RaftQuery, RegisterForeignCaRequest,
-    ReleaseLock, RemoveVoterRequest, ReplicateEntriesRequest, RevokeKeyRequest,
-    SnapshotEcStateRequest, StepMessageRequest, UnregisterForeignCaRequest,
+    MintSessionAgentRequest, ProposeRequest, PutMetadata, QueryRequest, RaftCommand, RaftQuery,
+    RegisterForeignCaRequest, ReleaseLock, RemoveVoterRequest, ReplicateEntriesRequest,
+    RevokeAgentCertRequest, RevokeKeyRequest, SnapshotEcStateRequest, StepMessageRequest,
+    UnregisterForeignCaRequest,
 };
 use super::{NodeAddress, Result, TransportError};
 use std::collections::HashMap;
@@ -1066,6 +1067,74 @@ pub struct MintAgentResult {
 /// the caller tries the next peer. mTLS-only — the caller presents its NODE
 /// cert, which the founder's `AgentMinter` gate requires (an agent cert is a
 /// pure identity and must not be able to mint further agents).
+/// What a session mint returned: the bundle, plus the subject the server chose.
+pub struct MintSessionAgentResult {
+    pub success: bool,
+    pub error: Option<String>,
+    pub agent_cert_pem: Vec<u8>,
+    pub agent_key_pem: Vec<u8>,
+    pub ca_pem: Vec<u8>,
+    pub subject_id: String,
+}
+
+/// Ask the CA holder for a session credential bound to `owner_id`.
+///
+/// The caller must present an mTLS client certificate that is on the cluster's
+/// session-mint allow-list; `tls` carries it. The subject is not an input — the
+/// server mints one per call and reports it back.
+pub async fn call_mint_session_agent_rpc(
+    peer_addr: &str,
+    owner_id: &str,
+    validity_secs: u64,
+    tls: Option<super::TlsConfig>,
+    timeout_secs: u64,
+) -> Result<MintSessionAgentResult> {
+    let mut client = connect_zone_api(peer_addr, tls, timeout_secs, "MintSessionAgent").await?;
+    let response = client
+        .mint_session_agent(MintSessionAgentRequest {
+            owner_id: owner_id.to_string(),
+            validity_secs,
+        })
+        .await
+        .map_err(|e| TransportError::Rpc(format!("MintSessionAgent RPC failed: {e}")))?
+        .into_inner();
+    Ok(MintSessionAgentResult {
+        success: response.success,
+        error: response.error,
+        agent_cert_pem: response.agent_cert_pem,
+        agent_key_pem: response.agent_key_pem,
+        ca_pem: response.ca_pem,
+        subject_id: response.subject_id,
+    })
+}
+
+/// Revoke a certificate by handing it over — the holder is the party that has
+/// it, and a session credential exists nowhere else.
+///
+/// Succeeds if the serial is recorded, including when it already was.
+pub async fn call_revoke_agent_cert_rpc(
+    peer_addr: &str,
+    agent_cert_pem: &[u8],
+    tls: Option<super::TlsConfig>,
+    timeout_secs: u64,
+) -> Result<std::result::Result<(), String>> {
+    let mut client = connect_zone_api(peer_addr, tls, timeout_secs, "RevokeAgentCert").await?;
+    let response = client
+        .revoke_agent_cert(RevokeAgentCertRequest {
+            agent_cert_pem: agent_cert_pem.to_vec(),
+        })
+        .await
+        .map_err(|e| TransportError::Rpc(format!("RevokeAgentCert RPC failed: {e}")))?
+        .into_inner();
+    Ok(if response.success {
+        Ok(())
+    } else {
+        Err(response
+            .error
+            .unwrap_or_else(|| "revocation refused".to_string()))
+    })
+}
+
 pub async fn call_mint_agent_rpc(
     peer_addr: &str,
     subject_id: &str,

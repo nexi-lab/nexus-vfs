@@ -247,6 +247,42 @@ fn chains_to(cert: &x509_parser::certificate::X509Certificate, ca_der: &[u8]) ->
     }
 }
 
+/// Classify a PEM-encoded certificate against a PEM-encoded cluster CA.
+///
+/// The PEM-taking face of [`classify_peer_cert`], for a caller that holds
+/// certificates as PEM — the wire and disk form — and would otherwise have to
+/// take a `pem` dependency to reach the DER one. The cluster profile keeps
+/// `pem` test-only so its shipped binary does not carry it.
+pub fn classify_peer_cert_pem(
+    cert_pem: &[u8],
+    ca_pem: &[u8],
+    foreign: &[ForeignCaAnchor],
+) -> Result<PeerIdentity, ClassifyError> {
+    let cert = ::pem::parse(cert_pem).map_err(|_| ClassifyError::Unparseable)?;
+    let ca = ::pem::parse(ca_pem).map_err(|_| ClassifyError::Unparseable)?;
+    classify_peer_cert(cert.contents(), ca.contents(), foreign)
+}
+
+/// The certificate's `notAfter` as a unix timestamp, or `None` if it does not
+/// parse. PEM in, for the same reason as [`classify_peer_cert_pem`].
+pub fn not_after_unix_from_pem(cert_pem: &[u8]) -> Option<i64> {
+    let pem = ::pem::parse(cert_pem).ok()?;
+    not_after_unix(pem.contents())
+}
+
+/// The certificate's `notAfter` as a unix timestamp, or `None` if it does not
+/// parse.
+///
+/// Recorded beside a revoked serial so the entry can be dropped once the
+/// certificate expires on its own — see `crl::prune_expired_serials`. Read from
+/// the certificate rather than taken from a request: the expiry that decides
+/// when revocation stops mattering must be the one the CA signed.
+pub fn not_after_unix(cert_der: &[u8]) -> Option<i64> {
+    use x509_parser::prelude::*;
+    let (_, cert) = X509Certificate::from_der(cert_der).ok()?;
+    Some(cert.validity().not_after.timestamp())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

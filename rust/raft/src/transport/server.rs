@@ -18,13 +18,14 @@ use super::proto::nexus::raft::{
     GetMetadataResult, GetSearchCapabilitiesRequest, JoinClusterRequest, JoinClusterResponse,
     JoinZoneRequest, JoinZoneResponse, ListForeignCasRequest, ListForeignCasResponse,
     ListKeysRequest, ListKeysResponse, ListMetadataResult, ListedKey, LockInfoResult, LockResult,
-    MintAgentRequest, MintAgentResponse, MintKeyRequest, MintKeyResponse,
-    NodeInfo as ProtoNodeInfo, ProposeRequest, ProposeResponse, QueryRequest, QueryResponse,
-    RaftCommand, RaftQueryResponse, RaftResponse, ReadBlobRequest, ReadBlobResponse,
-    RegisterForeignCaRequest, RegisterForeignCaResponse, RemoveVoterRequest, RemoveVoterResponse,
-    ReplicateEntriesRequest, ReplicateEntriesResponse, RevokeKeyRequest, RevokeKeyResponse,
-    SearchCapabilities, SnapshotEcStateRequest, SnapshotEcStateResponse, StepMessageRequest,
-    StepMessageResponse, UnregisterForeignCaRequest, UnregisterForeignCaResponse,
+    MintAgentRequest, MintAgentResponse, MintKeyRequest, MintKeyResponse, MintSessionAgentRequest,
+    MintSessionAgentResponse, NodeInfo as ProtoNodeInfo, ProposeRequest, ProposeResponse,
+    QueryRequest, QueryResponse, RaftCommand, RaftQueryResponse, RaftResponse, ReadBlobRequest,
+    ReadBlobResponse, RegisterForeignCaRequest, RegisterForeignCaResponse, RemoveVoterRequest,
+    RemoveVoterResponse, ReplicateEntriesRequest, ReplicateEntriesResponse, RevokeAgentCertRequest,
+    RevokeAgentCertResponse, RevokeKeyRequest, RevokeKeyResponse, SearchCapabilities,
+    SnapshotEcStateRequest, SnapshotEcStateResponse, StepMessageRequest, StepMessageResponse,
+    UnregisterForeignCaRequest, UnregisterForeignCaResponse,
 };
 use super::{NodeAddress, Result, SharedPeerMap, TransportError};
 use crate::agent_minter::AgentMinterSlot;
@@ -1563,6 +1564,90 @@ impl ZoneApiService for ZoneApiServiceImpl {
                 agent_cert_pem: bundle.cert_pem,
                 agent_key_pem: bundle.key_pem,
                 ca_pem: bundle.ca_pem,
+            })),
+            Err(e) => Ok(err_resp(e)),
+        }
+    }
+
+    /// Sign a session credential for an allow-listed agent caller — the server
+    /// half of a front door obtaining a per-session identity for a person.
+    ///
+    /// Same shape as `mint_agent`: the verified mTLS leaf is forwarded to the
+    /// injected minter, which owns the gate, the CA and the allow-list. Raft
+    /// applies no auth logic. A node with no minter is not the CA holder and
+    /// says so.
+    async fn mint_session_agent(
+        &self,
+        request: Request<MintSessionAgentRequest>,
+    ) -> std::result::Result<Response<MintSessionAgentResponse>, Status> {
+        let caller_cert_der = peer_cert_der(&request);
+        let req = request.into_inner();
+        let err_resp = |msg: String| {
+            Response::new(MintSessionAgentResponse {
+                success: false,
+                error: Some(msg),
+                agent_cert_pem: Vec::new(),
+                agent_key_pem: Vec::new(),
+                ca_pem: Vec::new(),
+                subject_id: String::new(),
+            })
+        };
+        let minter = self
+            .agent_minter_slot
+            .as_ref()
+            .and_then(|slot| slot.read().as_ref().cloned());
+        let Some(minter) = minter else {
+            return Ok(err_resp(
+                "this node does not hold the cluster CA; mint against the founder".to_string(),
+            ));
+        };
+        match minter
+            .mint_session(caller_cert_der, &req.owner_id, req.validity_secs)
+            .await
+        {
+            // The subject comes from the bundle, not from anything the caller
+            // sent: the caller does not choose it.
+            Ok(bundle) => Ok(Response::new(MintSessionAgentResponse {
+                success: true,
+                error: None,
+                agent_cert_pem: bundle.cert_pem,
+                agent_key_pem: bundle.key_pem,
+                ca_pem: bundle.ca_pem,
+                subject_id: bundle.subject_id,
+            })),
+            Err(e) => Ok(err_resp(e)),
+        }
+    }
+
+    /// Record a certificate's serial in the CA-plane CRL.
+    async fn revoke_agent_cert(
+        &self,
+        request: Request<RevokeAgentCertRequest>,
+    ) -> std::result::Result<Response<RevokeAgentCertResponse>, Status> {
+        let caller_cert_der = peer_cert_der(&request);
+        let req = request.into_inner();
+        let err_resp = |msg: String| {
+            Response::new(RevokeAgentCertResponse {
+                success: false,
+                error: Some(msg),
+            })
+        };
+        let minter = self
+            .agent_minter_slot
+            .as_ref()
+            .and_then(|slot| slot.read().as_ref().cloned());
+        let Some(minter) = minter else {
+            return Ok(err_resp(
+                "this node does not hold the cluster CA; revoke against the founder".to_string(),
+            ));
+        };
+        match minter
+            .revoke_cert(caller_cert_der, &req.agent_cert_pem)
+            .await
+        {
+            Ok(()) => Ok(Response::new(RevokeAgentCertResponse {
+                success: true,
+                error: None,
             })),
             Err(e) => Ok(err_resp(e)),
         }

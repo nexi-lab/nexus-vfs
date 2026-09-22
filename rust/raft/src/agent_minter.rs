@@ -19,8 +19,21 @@ pub struct AgentBundle {
     pub cert_pem: Vec<u8>,
     pub key_pem: Vec<u8>,
     pub ca_pem: Vec<u8>,
+    /// The identity this bundle carries. Stated rather than left to be
+    /// re-parsed out of `cert_pem`: for a session credential the minter CHOOSES
+    /// the subject, so the signer is the one party that knows it without
+    /// inspecting its own output.
+    pub subject_id: String,
 }
 
+/// The CA holder's credential operations for remote callers: issue, and
+/// withdraw.
+///
+/// Revocation lives here rather than in a second trait behind a second slot
+/// because it needs exactly what minting needs — the CA, the data dir, and the
+/// same "only the CA holder is armed" install gate. A parallel slot would
+/// duplicate that whole install path to express the same precondition.
+///
 /// Signs an agent identity cert on the CA holder for a remote caller.
 ///
 /// `caller_cert_der` is the requester's verified mTLS client leaf cert (DER),
@@ -59,6 +72,23 @@ pub trait AgentMinter: Send + Sync {
         owner_id: &str,
         validity_secs: u64,
     ) -> Result<AgentBundle, String>;
+
+    /// Record `agent_cert_pem`'s serial in the CA-plane CRL, with its expiry.
+    ///
+    /// Takes the certificate, not a name: a session credential is never written
+    /// to disk, so there is no bundle to read a serial from, and its holder is
+    /// the one party that has it.
+    ///
+    /// The impl MUST verify the certificate chains to this cluster's CA before
+    /// recording anything. Without that this is an unauthenticated way to fill
+    /// the CRL with arbitrary serials — and a CRL that can be flooded is a
+    /// denial-of-service against every legitimate credential that has to be
+    /// checked against it.
+    async fn revoke_cert(
+        &self,
+        caller_cert_der: Option<Vec<u8>>,
+        agent_cert_pem: &[u8],
+    ) -> Result<(), String>;
 }
 
 /// Late-bindable slot. Installed ONLY on the CA holder (founder); left empty on
