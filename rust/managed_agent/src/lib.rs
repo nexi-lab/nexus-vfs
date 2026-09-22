@@ -500,23 +500,12 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
             if let Err(e) = register_proc_entry(self.kernel.as_ref(), &desc) {
                 tracing::warn!(pid=%pid, error=%e, "register_proc_entry failed");
             }
-            // Provision the PERSISTENT per-identity A2A inbox
-            // (`/agents/{name}/chat-with-me`) — the cross-machine mailbox a peer
-            // writes to and this agent reads (via `Mailbox::A2aInbox`). It must
-            // exist as a proper replicated DT_STREAM regardless of who writes
-            // first, never left to be created implicitly as a DT_REG. Unlike the
-            // per-pid procfs subtree above (dropped by `unregister_proc_entry`
-            // on pid death), this inbox OUTLIVES the pid — a message must survive
-            // an agent restart — so it is provisioned here and never torn down.
-            // a2a owns the A2A address + the stream contract; this lifecycle
-            // owner (the agent's host) just says "bring this agent's inbox up".
-            if let Err(e) = a2a::ensure_agent_inbox(self.kernel.as_ref(), &desc.name) {
-                tracing::warn!(pid=%pid, error=%e, "ensure_agent_inbox failed");
-            }
-            // Sibling attention-state stream (same replicated `/agents/{name}`
-            // presence). The observer below publishes `AwaitingInput` enter/exit
-            // here so any node can answer the cross-machine "which agents are
-            // waiting on me?" with a plain read. Best-effort: a std / non-stream
+            // The agent's replicated attention-state stream, under its
+            // `/agents/{name}` presence. Creating it is also what brings that
+            // presence directory into being, which the conversation chat list
+            // (`/agents/{name}/conversations/{peer}`) hangs off. The observer below publishes
+            // `AwaitingInput` enter/exit here so any node can answer the
+            // cross-machine "which agents are waiting on me?" with a plain read. Best-effort: a std / non-stream
             // deployment simply has no reader and the agent runs unaffected.
             if let Err(e) = a2a::ensure_agent_state_stream(self.kernel.as_ref(), &desc.name) {
                 tracing::warn!(pid=%pid, error=%e, "ensure_agent_state_stream failed");

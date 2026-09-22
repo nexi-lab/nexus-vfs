@@ -53,18 +53,6 @@ pub const MAILBOX_STREAM_CAPACITY: usize = 65_536;
 /// (`--cluster-init-mount /agents=<zone>`) must agree on.
 pub const A2A_INBOX_BASE: &str = "/agents";
 
-/// The legacy per-agent inbox path for `agent_name`
-/// (`/agents/{agent_name}/chat-with-me`), composed from the two address SSOTs
-/// ([`A2A_INBOX_BASE`] + [`CHAT_WITH_ME_SUFFIX`]) — a host never hand-builds it.
-///
-/// Superseded by conversations ([`conversation_transcript_path`]); retained for
-/// the duration of the cross-repo rename window, and deleted with the legacy
-/// arm of [`crate::MAILBOX_WRITE_SUFFIXES`].
-#[must_use]
-pub fn agent_inbox_path(agent_name: &str) -> String {
-    format!("{A2A_INBOX_BASE}/{agent_name}{CHAT_WITH_ME_SUFFIX}")
-}
-
 /// Suffix of an agent's replicated attention-state stream — sibling to the
 /// agent's other entries under the same `{A2A_INBOX_BASE}/{name}` presence.
 pub const AGENT_STATE_SUFFIX: &str = "/state";
@@ -360,23 +348,9 @@ mod tests {
             "/agents/mac-ai/conversations/win-ai",
             "each side's entry names the other participant"
         );
-        // Integration invariant, mirroring `agent_inbox_path_is_the_a2a_convention`:
-        // what we provision MUST be what the gate recognises, or the
-        // `from`-guarantee silently skips the very logs we create.
+        // Integration invariant: what we provision MUST be what the gate
+        // recognises, or the `from`-guarantee silently skips the very logs we
+        // create.
         assert!(is_a2a_mailbox_path(&transcript));
-    }
-
-    #[test]
-    fn agent_inbox_path_is_the_a2a_convention() {
-        assert_eq!(agent_inbox_path("mac-ai"), "/agents/mac-ai/chat-with-me");
-        assert_eq!(agent_inbox_path("win-ai"), "/agents/win-ai/chat-with-me");
-        // Composed from the two address SSOTs, not string literals.
-        let p = agent_inbox_path("x");
-        assert!(p.starts_with(A2A_INBOX_BASE));
-        assert!(p.ends_with(CHAT_WITH_ME_SUFFIX));
-        // Integration invariant: an inbox we provision MUST be recognized as a
-        // cross-machine A2A mailbox by the fail-closed predicate — else the
-        // `from`-guarantee would silently skip the very inboxes we create.
-        assert!(is_a2a_mailbox_path(&p));
     }
 }
