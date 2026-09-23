@@ -20,6 +20,10 @@
 //! 6. OWNER    the returned cert reads back through `classify_peer_cert_pem` —
 //!    the kernel's own classifier — as that session, owned by `alice`.
 //! 7. USE      the session credential authenticates to the daemon and writes.
+//! 7b. BIND    the owner REACHES a service and outranks the request body:
+//!    `start_session_v1` records `alice` for a caller that named nobody, and
+//!    refuses one that names `bob`. The control is `moss`, whose ordinary
+//!    agent cert has no owner SAN and whose body is still honoured.
 //! 8. REVOKE   `moss` revokes it by handing back the certificate; after the CRL
 //!    refresh the daemon rejects it, while `moss` keeps working.
 //! 9. INTACT   `MintAgent`'s node-only gate is untouched: `moss` still cannot
@@ -233,6 +237,96 @@ async fn a_front_door_agent_mints_a_session_identity_for_a_person_and_can_revoke
         .write_file(&probe, b"before", "")
         .await
         .expect("the session credential authenticates and writes");
+
+    // ── 7b. The owner binding REACHES a service, and outranks the body ──────
+    //
+    // Minting a cert that names an owner is worth nothing if the owner never
+    // arrives anywhere. `start_session_v1` used to take `owner_id` from its
+    // request body with no way to check it — an agent could open a session
+    // attributed to anyone. These two calls are the whole consumption half:
+    // who the daemon records, and what it does when the body disagrees.
+    //
+    // Note both go over the same mTLS connection as the write above, so the
+    // identity under test is the real one the daemon resolved from the
+    // certificate — nothing here constructs a context.
+    let started = session
+        .call(
+            "managed_agent.start_session_v1",
+            r#"{"agent_id":"scode-standard"}"#,
+            "",
+        )
+        .await
+        .expect("a session credential may start a session");
+    let session_id = started
+        .split("\"session_id\":\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .expect("response carries a session_id")
+        .to_string();
+
+    // Read the owner back from the daemon rather than trusting the response:
+    // `/proc/<pid>` is what an operator and an audit trail actually see.
+    let recorded = session
+        .call(
+            "managed_agent.get_session_v1",
+            &format!(r#"{{"session_id":"{session_id}"}}"#),
+            "",
+        )
+        .await
+        .expect("the session it just started is readable");
+    assert!(
+        recorded.contains("\"owner_id\":\"alice\""),
+        "the recorded owner must come from the certificate, not the body's \
+         default of `system`; got {recorded}"
+    );
+
+    // The decision this FR left to us: a body that disagrees with the
+    // credential is REFUSED, not silently overwritten. Overwriting would
+    // leave the caller believing it opened a session for `bob` while the
+    // system recorded `alice`, with nothing said.
+    let forged = session
+        .call(
+            "managed_agent.start_session_v1",
+            r#"{"agent_id":"scode-standard","owner_id":"bob"}"#,
+            "",
+        )
+        .await;
+    let err = forged.expect_err("a session cert must not open a session for someone else");
+    assert!(
+        err.contains("bob") && err.contains("alice"),
+        "the refusal must name both what was asked and what was proven; got {err}"
+    );
+
+    // The control: `moss`, holding an ORDINARY agent cert with no owner SAN,
+    // is unaffected — its body still stands. This is what makes the rule
+    // arrive with the credential instead of on a flag day.
+    let mut front_door = Vfs::connect_mtls(fport, &ca, &moss_cert, &moss_key, BUDGET).await;
+    let as_moss = front_door
+        .call(
+            "managed_agent.start_session_v1",
+            r#"{"agent_id":"scode-standard","owner_id":"bob"}"#,
+            "",
+        )
+        .await
+        .expect("an ordinary agent cert keeps naming its own owner");
+    let moss_sid = as_moss
+        .split("\"session_id\":\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .expect("response carries a session_id")
+        .to_string();
+    let moss_recorded = front_door
+        .call(
+            "managed_agent.get_session_v1",
+            &format!(r#"{{"session_id":"{moss_sid}"}}"#),
+            "",
+        )
+        .await
+        .expect("readable");
+    assert!(
+        moss_recorded.contains("\"owner_id\":\"bob\""),
+        "a caller with no owner SAN is unchanged; got {moss_recorded}"
+    );
 
     // ── 8. REVOKE by handing back the certificate ───────────────────────────
     call_revoke_agent_cert_rpc(&rpc, &minted.agent_cert_pem, moss_tls(), 10)

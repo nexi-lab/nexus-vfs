@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use kernel::kernel::vfs_proto::{
-    nexus_vfs_service_client::NexusVfsServiceClient, IpcPathRequest, MkdirRequest, PingRequest,
-    ReadRequest, ReaddirRequest, SetattrRequest, StatRequest, StreamReadAtRequest,
+    nexus_vfs_service_client::NexusVfsServiceClient, CallRequest, IpcPathRequest, MkdirRequest,
+    PingRequest, ReadRequest, ReaddirRequest, SetattrRequest, StatRequest, StreamReadAtRequest,
     StreamWriteRequest, WatchRequest, WriteRequest,
 };
 use tonic::transport::Channel;
@@ -586,6 +586,34 @@ impl Vfs {
             })
             .await
             .map(|_| ())
+    }
+
+    /// The generic service RPC: `Call("<service>.<method>", json)`.
+    ///
+    /// This is the path a registered Rust service is reached on, and the one
+    /// that carries the caller's resolved identity — so it is how a test drives
+    /// a service *as somebody*, with the daemon deciding who that is from the
+    /// credential this connection presented.
+    ///
+    /// Returns the response payload as a UTF-8 string, or the error payload as
+    /// `Err` — the daemon reports service-level refusals in-band (`is_error`),
+    /// not as a gRPC status.
+    pub async fn call(&mut self, method: &str, json: &str, token: &str) -> Result<String, String> {
+        let r = self
+            .c
+            .call(CallRequest {
+                method: method.to_string(),
+                payload: json.as_bytes().to_vec(),
+                auth_token: token.to_string(),
+            })
+            .await
+            .map_err(|e| format!("call rpc: {e}"))?
+            .into_inner();
+        let payload = String::from_utf8_lossy(&r.payload).to_string();
+        if r.is_error {
+            return Err(payload);
+        }
+        Ok(payload)
     }
 
     pub async fn mkdir(&mut self, path: &str, token: &str) -> Result<(), String> {
