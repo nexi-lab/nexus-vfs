@@ -182,6 +182,15 @@ pub(crate) struct GetSessionResponse {
     pub session_id: String,
     /// Static agent profile id (mirrors `StartSessionRequest.agent_id`).
     pub agent_id: String,
+    /// Whose session this is, as recorded on the descriptor.
+    ///
+    /// Reported because the caller can no longer infer it. `start_session_v1`
+    /// takes the owner from a delegated credential in preference to the
+    /// request body (see `authenticated_owner`), so a front door that sends no
+    /// `owner_id` has no other way to learn what the daemon attributed the
+    /// session to — and attribution nobody can read back is attribution
+    /// nobody can check.
+    pub owner_id: String,
     pub workspace_path: String,
     pub model: String,
     pub state: String,
@@ -672,6 +681,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
         Ok(GetSessionResponse {
             session_id: desc.pid.clone(),
             agent_id: desc.name.clone(),
+            owner_id: desc.owner_id.clone(),
             workspace_path,
             model,
             state: desc.state.as_str().to_lowercase(),
@@ -1342,6 +1352,37 @@ mod tests {
             assert_eq!(
                 desc.owner_id, "alice",
                 "the owner is the credential's, not the body's default"
+            );
+        }
+
+        /// `get_session_v1` reports the owner, so a caller that sent none can
+        /// read back what the daemon attributed the session to. Without this
+        /// the attribution exists only on the descriptor, where the caller
+        /// cannot see it.
+        #[test]
+        fn get_session_v1_reports_the_owner_that_was_recorded() {
+            let (_kernel, _table, svc) = fresh_service();
+            let started = svc
+                .dispatch(
+                    "start_session_v1",
+                    json!({"agent_id": "scode-standard"}).to_string().as_bytes(),
+                    &session_caller("alice"),
+                )
+                .unwrap();
+            let started: StartSessionResponse = serde_json::from_slice(&started).unwrap();
+
+            let payload = json!({"session_id": started.session_id}).to_string();
+            let bytes = svc
+                .dispatch(
+                    "get_session_v1",
+                    payload.as_bytes(),
+                    &session_caller("alice"),
+                )
+                .unwrap();
+            let snap: GetSessionResponse = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                snap.owner_id, "alice",
+                "the caller sent no owner_id; the credential's owner is what it reads back"
             );
         }
 
