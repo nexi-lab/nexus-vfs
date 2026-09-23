@@ -2264,11 +2264,22 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                         }
                     }
 
+                    // Emitted on EVERY node that applies the entry, not only the
+                    // proposer — a membership change is in force where it has been
+                    // applied. The leader returning from `propose_conf_change` says
+                    // the change COMMITTED; it says nothing about whether a new
+                    // voter is counting toward quorum on its own node yet.
+                    //
+                    // `voter_count` carries the part `voters` makes a reader count
+                    // by hand, and it is what distinguishes the two changes a join
+                    // performs: adding a learner leaves the voter count alone,
+                    // promoting one raises it, and only the second moves quorum.
                     tracing::info!(
                         index = entry.index,
                         change_type = ?cc.get_change_type(),
                         peer_node_id = cc.node_id,
                         voters = ?cs.voters,
+                        voter_count = cs.voters.len(),
                         "raft.conf_change.applied",
                     );
                     sm.apply(entry.index, &Command::Noop)?;
@@ -2317,6 +2328,15 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                         .mut_store()
                         .set_conf_state(&cs)
                         .map_err(|e| RaftError::Storage(e.to_string()))?;
+                    // Same signal as the V1 arm — see its comment. The V2 arm
+                    // had none, so a joint change applied silently.
+                    tracing::info!(
+                        index = entry.index,
+                        num_changes = cc.changes.len(),
+                        voters = ?cs.voters,
+                        voter_count = cs.voters.len(),
+                        "raft.conf_change.applied",
+                    );
                     // Membership changed → refresh the stored snapshot (see V1 arm).
                     self.membership_changed_since_snapshot = true;
 
