@@ -70,6 +70,39 @@ pub struct Daemon {
     pumps: Vec<std::thread::JoinHandle<()>>,
 }
 
+/// Strip ANSI SGR sequences (`ESC [ ... m`) from captured daemon output.
+///
+/// The daemon writes COLOURED logs, and the colouring lands INSIDE a structured
+/// line: `tracing`'s formatter wraps a field name, its `=` and its value in
+/// separate escapes, so the bytes between `voter_count` and `2` are not `=`.
+/// A gate like `wait_for_log("voter_count=2")` then never matches a line the
+/// eye can plainly read in the failure dump -- the most expensive kind of
+/// mismatch, because the dump looks like it proves the gate wrong.
+///
+/// Stripping once, here, is what lets a gate name a FIELD rather than only a
+/// prose message. Only SGR is removed; nothing else in the stream moves.
+fn strip_ansi(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        // ESC '[' ... 'm' -- consume through the terminator. A truncated tail
+        // (the pipe split mid-sequence) simply ends the scan.
+        if chars.next() != Some('[') {
+            continue;
+        }
+        for p in chars.by_ref() {
+            if p == 'm' {
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// Drain a child pipe into the shared log buffer on a background thread. The
 /// thread exits when the pipe closes (the child is killed on `Daemon` drop).
 fn pump(
@@ -86,10 +119,33 @@ fn pump(
                 Ok(n) => log
                     .lock()
                     .unwrap()
-                    .push_str(&String::from_utf8_lossy(&buf[..n])),
+                    .push_str(&strip_ansi(&String::from_utf8_lossy(&buf[..n]))),
             }
         }
     }))
+}
+
+#[cfg(test)]
+mod strip_ansi_tests {
+    use super::strip_ansi;
+
+    /// A coloured structured line reads as plain `field=value` afterwards.
+    #[test]
+    fn sgr_between_a_field_and_its_value_is_removed() {
+        let coloured = "\u{1b}[2mvoter_count\u{1b}[0m\u{1b}[2m=\u{1b}[0m2";
+        assert_eq!(strip_ansi(coloured), "voter_count=2");
+    }
+
+    /// Uncoloured input survives, and a sequence split across a pipe read does
+    /// not eat the rest of the buffer.
+    #[test]
+    fn plain_text_survives_and_a_truncated_sequence_terminates() {
+        assert_eq!(
+            strip_ansi("raft.conf_change.applied"),
+            "raft.conf_change.applied"
+        );
+        assert_eq!(strip_ansi("a\u{1b}"), "a");
+    }
 }
 
 impl Daemon {
