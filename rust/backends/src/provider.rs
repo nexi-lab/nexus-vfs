@@ -84,7 +84,38 @@ fn bool_param(params: &HashMap<String, String>, key: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Every `backend_type` this binary can build.
+///
+/// The same `cfg` gates as the dispatch arms in [`DefaultObjectStoreProvider::build`],
+/// so the two move together: a driver compiled out disappears from both. A
+/// test asserts they agree, because "two lists that must match" is otherwise
+/// exactly the thing that drifts.
+pub fn supported_backend_types() -> &'static [&'static str] {
+    &[
+        #[cfg(feature = "driver-path-local")]
+        "path_local",
+        #[cfg(feature = "driver-cas-local")]
+        "cas-local",
+        #[cfg(feature = "driver-local-connector")]
+        "local_connector",
+        #[cfg(feature = "driver-remote")]
+        "remote",
+        #[cfg(feature = "driver-s3")]
+        "s3",
+        #[cfg(feature = "driver-gcs")]
+        "gcs",
+        #[cfg(feature = "driver-anthropic")]
+        "anthropic",
+        #[cfg(feature = "driver-openai")]
+        "openai",
+    ]
+}
+
 impl ObjectStoreProvider for DefaultObjectStoreProvider {
+    fn can_build(&self, backend_type: &str) -> bool {
+        supported_backend_types().contains(&backend_type)
+    }
+
     fn build(&self, args: &ObjectStoreProviderArgs<'_>) -> Result<ObjectStoreBuildResult, String> {
         let p = args.backend_params;
         match args.backend_type {
@@ -736,6 +767,43 @@ mod tests {
         let args = mk_args("openai", &missing, &pc, &rt);
         let err = expect_err(DefaultObjectStoreProvider.build(&args));
         assert!(err.contains("blob_root"), "err was: {err}");
+    }
+
+    /// `supported_backend_types()` and `build`'s dispatch arms are two lists
+    /// that must agree, and this is what stops them drifting.
+    ///
+    /// Every advertised type must get PAST dispatch — it may still fail on
+    /// missing params, which is a different error and fine. What must never
+    /// happen is a type this binary advertises falling through to "unknown
+    /// backend_type", because the gRPC DT_MOUNT handler now trusts the
+    /// advertisement: it refuses anything `can_build` denies and attempts
+    /// everything it allows.
+    #[test]
+    fn every_advertised_backend_type_is_actually_dispatched() {
+        let pc = noop_peer_client();
+        let rt = noop_runtime();
+        let empty = params(&[]);
+        for ty in supported_backend_types() {
+            let args = mk_args(ty, &empty, &pc, &rt);
+            if let Err(e) = DefaultObjectStoreProvider.build(&args) {
+                assert!(
+                    !e.contains("unknown backend_type"),
+                    "{ty:?} is advertised by supported_backend_types() but                      build() does not dispatch it: {e}"
+                );
+            }
+        }
+    }
+
+    /// And the converse: nothing outside the list is buildable, so the
+    /// handler's refusal cannot be a false negative.
+    #[test]
+    fn can_build_agrees_with_the_advertised_list() {
+        for ty in supported_backend_types() {
+            assert!(DefaultObjectStoreProvider.can_build(ty), "{ty:?}");
+        }
+        for ty in ["definitely-not-a-driver", "", "S3", "openai "] {
+            assert!(!DefaultObjectStoreProvider.can_build(ty), "{ty:?}");
+        }
     }
 
     #[cfg(feature = "driver-remote")]

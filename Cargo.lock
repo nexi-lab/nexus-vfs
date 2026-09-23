@@ -1898,6 +1898,7 @@ dependencies = [
  "pem",
  "raft 0.1.0",
  "rand 0.10.1",
+ "serde_json",
  "tempfile",
  "tokio",
  "tonic",

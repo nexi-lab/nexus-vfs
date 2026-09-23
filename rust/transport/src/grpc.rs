@@ -371,9 +371,11 @@ impl VfsServiceImpl {
             ));
         }
 
-        // Networked object-store drivers the provider builds from the wire
-        // params, and the local-host drivers the host binary owns.
-        const PROVIDER_BUILT: [&str; 3] = ["s3", "gcs", "remote"];
+        // The local-host drivers the host binary owns. Which types the
+        // PROVIDER can build is deliberately NOT listed here — that answer is
+        // feature-dependent and belongs to the provider, which is asked below.
+        // A literal here said `["s3", "gcs", "remote"]`, so an LLM mount was
+        // refused in every build, including ones compiled to serve them.
         const LOCAL_HOST: [&str; 3] = ["path_local", "cas-local", "local_connector"];
 
         // Local-host backends (path_local / cas-local / local_connector) keep
@@ -416,21 +418,22 @@ impl VfsServiceImpl {
             }
             return synthetic_setattr_ack(&req);
         }
-        // Anything else that isn't a provider-built networked driver fails
-        // closed (connector / LLM / typo / version-skewed / future driver).
-        if !PROVIDER_BUILT.contains(&req.backend_type.as_str()) {
-            return error_setattr(Status::unimplemented(format!(
-                "DT_MOUNT backend_type {:?} is not supported by this server; \
-                 no mount was installed",
-                req.backend_type
-            )));
-        }
-
         let Some(provider) = get_provider() else {
             return error_setattr(Status::failed_precondition(
                 "no ObjectStoreProvider registered; cannot build DT_MOUNT backend",
             ));
         };
+
+        // Anything this build cannot construct fails closed (typo /
+        // version-skewed / a driver compiled out of this binary). Asked of the
+        // provider, so a slim build refuses `s3` and a `driver-ai` build
+        // accepts `openai`, with no list here to keep in step.
+        if !provider.can_build(&req.backend_type) {
+            return error_setattr(Status::unimplemented(format!(
+                "DT_MOUNT backend_type {:?} is not supported by this server;                  no mount was installed",
+                req.backend_type
+            )));
+        }
 
         // Build the opaque params map from the proto's `backend_params`.
         // The proto map is already `HashMap<String, String>` — pass
@@ -2517,6 +2520,13 @@ mod tests {
     struct FakeS3Provider;
 
     impl kernel::hal::object_store_provider::ObjectStoreProvider for FakeS3Provider {
+        /// Refuses exactly what `build` refuses. A double that claimed to
+        /// build everything would let the handler's gate pass anything and
+        /// these tests would stop proving the gate exists.
+        fn can_build(&self, backend_type: &str) -> bool {
+            backend_type == "s3"
+        }
+
         fn build(
             &self,
             args: &ObjectStoreProviderArgs<'_>,
