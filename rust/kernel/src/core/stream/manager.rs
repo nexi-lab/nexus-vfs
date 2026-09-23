@@ -190,7 +190,21 @@ impl StreamManager {
     }
 
     /// Non-blocking write. Returns byte offset.
-    pub fn write_nowait(&self, path: &str, data: &[u8]) -> Result<usize, StreamManagerError> {
+    ///
+    /// `pub(crate)` on purpose, matching `PipeManager::write_nowait`. This
+    /// writes straight into the buffer, so it runs no write hooks — which
+    /// makes it a way around every guarantee those hooks carry (the A2A
+    /// mailbox `from`-stamp, and anything a deployment adds). Reaching it
+    /// from outside the kernel was not hypothetical: the LLM connectors did
+    /// exactly that, and their output was the one write nothing could see.
+    ///
+    /// Out-of-crate producers go through [`crate::kernel::Kernel::stream_write_nowait`]
+    /// or the [`crate::extensions::llm_streaming::StreamSink`] it backs.
+    pub(crate) fn write_nowait(
+        &self,
+        path: &str,
+        data: &[u8],
+    ) -> Result<usize, StreamManagerError> {
         let buf = self
             .resolve(path)
             .ok_or_else(|| StreamManagerError::NotFound(path.to_string()))?;

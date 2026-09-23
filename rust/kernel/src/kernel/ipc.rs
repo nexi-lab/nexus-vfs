@@ -3,6 +3,9 @@
 //! Every method stays a member of [`Kernel`] via this submodule's
 //! `impl Kernel { ... }` block.
 
+use std::sync::Arc;
+
+use crate::extensions::llm_streaming::StreamSink;
 use crate::meta_store::{DT_PIPE, DT_STREAM};
 
 use super::{pipe_mgr_err, stream_mgr_err, Kernel, KernelError, OperationContext};
@@ -147,7 +150,15 @@ impl Kernel {
         Ok(())
     }
 
-    /// Close a stream (signal close, keep in registry for drain).
+    /// Close a stream (signal close, keep in registry for drain), waking
+    /// every blocked reader.
+    ///
+    /// The producer's half of the DT_STREAM lifecycle, and the reason a
+    /// producer outside this crate needs nothing from `StreamManager`: with
+    /// [`Self::create_stream`], [`Self::stream_write_nowait`] and this, the
+    /// whole producer path is Kernel surface, so the hook-bearing write is
+    /// the only write there is. Closing carries no content, so no hook runs —
+    /// unlike the write, there is nothing here to inspect or rewrite.
     pub fn close_stream(&self, path: &str) -> Result<(), KernelError> {
         self.stream_manager.close(path).map_err(stream_mgr_err)
     }
@@ -189,6 +200,21 @@ impl Kernel {
         self.stream_manager
             .write_nowait(path, effective)
             .map_err(stream_mgr_err)
+    }
+
+    /// A [`StreamSink`] that appends as `ctx`, for a producer outside this
+    /// crate.
+    ///
+    /// Binding the identity here rather than passing it per-append is
+    /// deliberate: a producer that could choose an identity per frame could
+    /// choose the wrong one, and a streaming backend pumps frames from a
+    /// spawned task where the ambient caller is long gone. One handle, one
+    /// principal, decided where the handle is made.
+    pub fn stream_sink(self: &Arc<Self>, ctx: OperationContext) -> Arc<dyn StreamSink> {
+        Arc::new(KernelStreamSink {
+            kernel: Arc::clone(self),
+            ctx,
+        })
     }
 
     /// Read one message at byte offset. Returns (data, next_offset) or None if empty.
@@ -254,5 +280,157 @@ impl Kernel {
     /// Close all streams (shutdown).
     pub fn close_all_streams(&self) {
         self.stream_manager.close_all();
+    }
+}
+
+/// The only [`StreamSink`] there is: every append goes through
+/// [`Kernel::stream_write_nowait`], so every append runs the write hooks.
+///
+/// Holding the `Arc<Kernel>` is what lets a backend outlive the call that
+/// made it — a streaming pump appends from a spawned task, long after the
+/// request that started it returned.
+struct KernelStreamSink {
+    kernel: Arc<Kernel>,
+    ctx: OperationContext,
+}
+
+impl StreamSink for KernelStreamSink {
+    fn append(&self, path: &str, data: &[u8]) -> Result<usize, String> {
+        self.kernel
+            .stream_write_nowait(path, data, &self.ctx)
+            .map_err(|e| format!("{e:?}"))
+    }
+
+    fn close(&self, path: &str) -> Result<(), String> {
+        self.kernel.close_stream(path).map_err(|e| format!("{e:?}"))
+    }
+}
+
+#[cfg(test)]
+mod stream_sink_tests {
+    use super::*;
+    use crate::core::dispatch::{HookContext, HookOutcome, NativeInterceptHook};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const STREAM: &str = "/llm/reply.stream";
+
+    /// Counts what it saw and refuses anything containing `veto`.
+    ///
+    /// Both halves matter: a hook that only counts proves the seam is reached,
+    /// and a hook that refuses proves the write actually depends on the
+    /// answer — a seam that is consulted and ignored is not a seam.
+    struct Watcher {
+        seen: Arc<AtomicUsize>,
+    }
+
+    impl NativeInterceptHook for Watcher {
+        fn name(&self) -> &str {
+            "watcher"
+        }
+        fn mutating_path_suffixes(&self) -> &'static [&'static str] {
+            &[".stream"]
+        }
+        fn on_pre(&self, ctx: &HookContext) -> Result<HookOutcome, String> {
+            if let HookContext::Write(w) = ctx {
+                self.seen.fetch_add(1, Ordering::SeqCst);
+                if w.content.windows(4).any(|c| c == b"veto") {
+                    return Err("refused by watcher".to_string());
+                }
+            }
+            Ok(HookOutcome::Pass)
+        }
+    }
+
+    fn kernel_with_watcher() -> (Arc<Kernel>, Arc<AtomicUsize>) {
+        let k = Arc::new(Kernel::new());
+        let seen = Arc::new(AtomicUsize::new(0));
+        k.register_native_hook(Box::new(Watcher {
+            seen: Arc::clone(&seen),
+        }));
+        k.create_stream(STREAM, 64 * 1024).unwrap();
+        (k, seen)
+    }
+
+    fn ctx() -> OperationContext {
+        OperationContext::new("test", "root", false, None, false)
+    }
+
+    /// The whole point of the change. A producer outside this crate used to
+    /// hold a `StreamManager` and append straight into the buffer, so its
+    /// output was the one write no hook could see. Going through the sink,
+    /// the hook sees it.
+    #[test]
+    fn a_sink_append_is_seen_by_write_hooks() {
+        let (k, seen) = kernel_with_watcher();
+        let sink = k.stream_sink(ctx());
+
+        sink.append(STREAM, b"hello from the model").unwrap();
+
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "the hook must see a sink append; if this is 0 the write went \
+             around the seam"
+        );
+    }
+
+    /// And the hook's answer is binding: a refusal means the bytes are not in
+    /// the stream, not merely that something was logged.
+    #[test]
+    fn a_hook_can_refuse_a_sink_append() {
+        let (k, _seen) = kernel_with_watcher();
+        let sink = k.stream_sink(ctx());
+
+        sink.append(STREAM, b"fine").unwrap();
+        let err = sink
+            .append(STREAM, b"please veto this")
+            .expect_err("a refusing hook must fail the append");
+        assert!(err.contains("refused"), "err was: {err}");
+
+        let landed = k.stream_collect_all(STREAM).unwrap();
+        assert_eq!(
+            landed, b"fine",
+            "the refused bytes must not be in the stream"
+        );
+    }
+
+    /// The sink appends as the principal it was built with, so a hook is
+    /// deciding about a caller rather than about an anonymous write. This is
+    /// what makes the identity binding at `stream_sink` load-bearing.
+    #[test]
+    fn a_sink_appends_as_the_identity_it_was_built_with() {
+        struct Recorder {
+            who: Arc<std::sync::Mutex<Vec<String>>>,
+        }
+        impl NativeInterceptHook for Recorder {
+            fn name(&self) -> &str {
+                "recorder"
+            }
+            fn mutating_path_suffixes(&self) -> &'static [&'static str] {
+                &[".stream"]
+            }
+            fn on_pre(&self, ctx: &HookContext) -> Result<HookOutcome, String> {
+                if let HookContext::Write(w) = ctx {
+                    self.who.lock().unwrap().push(w.identity.user_id.clone());
+                }
+                Ok(HookOutcome::Pass)
+            }
+        }
+
+        let k = Arc::new(Kernel::new());
+        let who = Arc::new(std::sync::Mutex::new(Vec::new()));
+        k.register_native_hook(Box::new(Recorder {
+            who: Arc::clone(&who),
+        }));
+        k.create_stream(STREAM, 64 * 1024).unwrap();
+
+        let sink = k.stream_sink(OperationContext::new("alice", "root", false, None, false));
+        sink.append(STREAM, b"x").unwrap();
+
+        assert_eq!(
+            who.lock().unwrap().as_slice(),
+            &["alice".to_string()],
+            "the hook must see the sink's bound principal"
+        );
     }
 }

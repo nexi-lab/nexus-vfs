@@ -20,14 +20,14 @@
 //! 6. OWNER    the returned cert reads back through `classify_peer_cert_pem` —
 //!    the kernel's own classifier — as that session, owned by `alice`.
 //! 7. USE      the session credential authenticates to the daemon and writes.
-//! 7b. BIND    the owner REACHES a service and outranks the request body:
+//! 8. BIND     the owner REACHES a service and outranks the request body:
 //!    `start_session_v1` records `alice` for a caller that named nobody, and
 //!    refuses one that names `bob`. The control is `moss`, whose ordinary
 //!    agent cert has no owner SAN and whose body is still honoured.
-//! 8. REVOKE   `moss` revokes it by handing back the certificate; after the CRL
+//! 9. REVOKE   `moss` revokes it by handing back the certificate; after the CRL
 //!    refresh the daemon rejects it, while `moss` keeps working.
-//! 9. INTACT   `MintAgent`'s node-only gate is untouched: `moss` still cannot
-//!    mint an ordinary agent.
+//! 10. INTACT  `MintAgent`'s node-only gate is untouched: `moss` still cannot
+//!     mint an ordinary agent.
 
 mod common;
 
@@ -238,7 +238,7 @@ async fn a_front_door_agent_mints_a_session_identity_for_a_person_and_can_revoke
         .await
         .expect("the session credential authenticates and writes");
 
-    // ── 7b. The owner binding REACHES a service, and outranks the body ──────
+    // ── 8. The owner binding REACHES a service, and outranks the body ───────
     //
     // Minting a cert that names an owner is worth nothing if the owner never
     // arrives anywhere. `start_session_v1` used to take `owner_id` from its
@@ -328,7 +328,7 @@ async fn a_front_door_agent_mints_a_session_identity_for_a_person_and_can_revoke
         "a caller with no owner SAN is unchanged; got {moss_recorded}"
     );
 
-    // ── 8. REVOKE by handing back the certificate ───────────────────────────
+    // ── 9. REVOKE by handing back the certificate ───────────────────────────
     call_revoke_agent_cert_rpc(&rpc, &minted.agent_cert_pem, moss_tls(), 10)
         .await
         .expect("rpc reaches the daemon")

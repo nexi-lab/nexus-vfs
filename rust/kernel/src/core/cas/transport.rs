@@ -478,7 +478,7 @@ mod tests {
         let path_str = path.to_string_lossy();
 
         // Verify 2-level directory structure: root/cas/XX/YY/hash
-        assert!(path_str.contains(&format!("cas/{}/{}/{}", &hash[..2], &hash[2..4], &hash)));
+        assert!(path_str.contains(&format!("cas/{}/{}/{}", &hash[..2], &hash[2..4], hash)));
         assert!(path.is_file());
     }
 
