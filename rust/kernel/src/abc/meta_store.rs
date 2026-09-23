@@ -524,6 +524,22 @@ pub trait MetaStore: Send + Sync {
 /// `content_id`, written by the node at `origin`. `base` (needed to locate a
 /// frame inside the blob as ``seq - base``) comes from the index key; the rest
 /// from its value. Kernel-tier mirror of the raft SM's on-disk segment record.
+///
+/// # Why the index is METADATA and not a manifest object
+///
+/// The obvious alternative is a manifest blob in the ObjectStore listing a
+/// stream's segments, the way some log stores publish one. It was rejected on
+/// two counts. It puts metadata into the CONTENT pillar, which is the boundary
+/// leak the two-pillar split exists to prevent; and it creates a second SSOT
+/// for stream metadata, when the metastore already holds the inodes, the CAS
+/// index and the hot entries.
+///
+/// A segment index is structurally the same thing as the CAS index
+/// (`content_id` → location) that already lives there, so it belongs beside it
+/// as a side-table. The boundedness worry that motivates a manifest does not
+/// apply here: large segments mean the index grows slowly, trimming drops index
+/// entries together with their segments, and a small metadata table is exactly
+/// what a raft snapshot can carry bounded.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamSegment {
     /// First seq in the segment.
