@@ -23,10 +23,20 @@ default = []
 # outbound HTTP no hook can see.
 #
 # OFF by default, and the reason is measured rather than assumed. These
-# connectors speak HTTP, so they pull reqwest + rustls: the slim binary goes
-# from 16,480,768 to 19,367,936 bytes on the size-gated Windows build, +2.75
-# MiB. That is the same "connector HTTP stack" the backends dep above drops on
-# purpose to hold the sudowork target size, so switching it on for every
+# connectors speak HTTP, so they pull reqwest and the client side of hyper:
+# the slim binary goes from 16,474,112 to 17,897,984 bytes on the size-gated
+# Windows build, **+1.36 MiB** (both measured at this commit — main moves, so
+# a pair from two different commits is not a delta). Roughly 700 KiB of that is existing crates
+# (hyper, h2, hyper-util) growing as reqwest instantiates client paths that
+# were never compiled before, ~280 KiB is genuinely new code, and ~380 KiB is
+# the Unicode tables `url` -> `idna` -> ICU4X brings for hostname parsing.
+#
+# It was +2.75 MiB until reqwest stopped bundling its own crypto provider
+# beside the `ring` this binary already links; that half is gone and is not
+# coming back, so do not re-measure it from the old figure.
+#
+# What remains is the same "connector HTTP stack" the backends dep above drops
+# on purpose to hold the sudowork target size, so switching it on for every
 # deployment to serve the ones that mount a model would be the wrong default.
 #
 # A tier that wants model calls inside the hook seam builds
