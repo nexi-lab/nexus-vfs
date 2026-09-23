@@ -409,13 +409,30 @@ jobs:
           # The per-version path is what consumers pin, so it has to be
           # immutable in fact and not only by intent. Uploading over it swaps
           # the bytes under every lockfile that recorded the old ones, and the
-          # break is silent until someone runs a clean install. Refuse, and say
-          # what to do instead.
-          if curl -fsS -o /dev/null -r 0-0 "$ACCEL/$VERSION/$TARBALL" 2>/dev/null; then
-            echo "::error::$VERSION is already published. Bump clients/node/package.json; do not overwrite a version consumers pin."
-            exit 1
+          # break is silent until someone runs a clean install.
+          #
+          # Existence alone is not the question. Most releases here are cut for
+          # the Rust daemon and leave the client untouched, which republishes
+          # the same package — refusing that would tie every daemon release to
+          # a client version bump. What must never happen is one version
+          # resolving to DIFFERENT content, so that is what gets compared.
+          # The comparison is on the extracted trees rather than the archive
+          # bytes: gzip output moves with the toolchain, and a release that
+          # failed because zlib changed would teach people to ignore this.
+          if curl -fsS -o published.tgz "$ACCEL/$VERSION/$TARBALL" 2>/dev/null; then
+            mkdir -p published-tree repacked-tree
+            tar -xzf published.tgz -C published-tree
+            tar -xzf "$TARBALL" -C repacked-tree
+            if diff -r published-tree repacked-tree > /dev/null 2>&1; then
+              echo "::notice::$VERSION is already published with this exact content; left untouched."
+            else
+              echo "::error::$VERSION is already published with DIFFERENT content. Bump clients/node/package.json; do not overwrite a version consumers pin."
+              diff -r published-tree repacked-tree | head -40 || true
+              exit 1
+            fi
+          else
+            coscmd upload "$TARBALL" "$BASE/$VERSION/$TARBALL"
           fi
-          coscmd upload "$TARBALL" "$BASE/$VERSION/$TARBALL"
           # Stable name under latest/ as well: a consumer that wants "whatever
           # is current" (a drift check, a smoke test) needs a URL that does not
           # move with the version.
