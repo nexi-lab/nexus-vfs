@@ -1,0 +1,22 @@
+[package]
+name = "llm-mount"
+version = "0.1.0"
+edition = "2021"
+description = "Drives an LLM mount: a write under the mount is a completion request, and the reply streams to a sibling DT_STREAM. Kernel-tier service; knows the ObjectStore extension trait, never a provider's wire format."
+authors = ["Nexus Team"]
+publish = false
+
+[lib]
+name = "llm_mount"
+path = "src/lib.rs"
+
+[dependencies]
+kernel = { workspace = true }
+contracts = { workspace = true }
+tracing = "0.1"
+
+[dev-dependencies]
+backends = { workspace = true, features = ["driver-openai"] }
+serde_json = { workspace = true }
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }

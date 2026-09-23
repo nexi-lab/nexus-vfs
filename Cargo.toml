@@ -39,6 +39,12 @@ members = [
     # the SpawnTask trait (agent-runtime-free); the in-process co-host adapter
     # that links sudocode stays at the nexus binary edge (a cycle otherwise).
     "rust/managed_agent",
+    # llm_mount/ — drives an LLM mount. A write under the mount is a chat
+    # completion request; the reply streams to a sibling DT_STREAM. Its own
+    # crate for the same reason managed_agent is: it owns a hook's lifecycle,
+    # so the hook code lives with the service that registers it, and the
+    # kernel keeps knowing nothing about model providers.
+    "rust/llm_mount",
     # permission/ — the AUTHORIZATION policy sibling to `auth`.
     # `auth` answers "who is calling?"; `permission` answers "what may
     # they do?".  Not a kernel primitive, not a RustService: a profile
@@ -100,6 +106,8 @@ subprocess = { path = "rust/subprocess" }
 # ACP-subprocess spawner. The in-process co-host SpawnTask adapter (links
 # sudocode) is wired at the nexus binary edge, never here (dependency cycle).
 managed-agent = { path = "rust/managed_agent", default-features = false }
+# `llm-mount` — the write-triggered LLM completion driver (see members list).
+llm-mount = { path = "rust/llm_mount" }
 # `permission` — the authorization policy (sibling to auth).  Same
 # feature-gated composition-root wiring pattern as auth; the crate is
 # never compiled into nexusd-cluster's default build.  See its
