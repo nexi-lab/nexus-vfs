@@ -81,7 +81,7 @@ impl ObjectStore for SlackBackend {
         let size = content.len() as u64;
 
         self.runtime.block_on(async {
-            let client = reqwest::Client::new();
+            let client = crate::http::http_client();
             let resp = client
                 .post(&url)
                 .header("Authorization", format!("Bearer {token}"))
@@ -143,7 +143,7 @@ impl ObjectStore for SlackBackend {
         };
 
         self.runtime.block_on(async {
-            let client = reqwest::Client::new();
+            let client = crate::http::http_client();
             let resp = client
                 .get(&url)
                 .header("Authorization", format!("Bearer {token}"))
@@ -178,7 +178,7 @@ impl ObjectStore for SlackBackend {
         });
 
         self.runtime.block_on(async {
-            let client = reqwest::Client::new();
+            let client = crate::http::http_client();
             let resp = client
                 .post(&url)
                 .header("Authorization", format!("Bearer {token}"))

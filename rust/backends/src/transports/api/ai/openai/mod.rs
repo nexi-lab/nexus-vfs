@@ -56,7 +56,7 @@ impl OpenAIBackend {
     ) -> std::io::Result<Self> {
         let transport = LocalCASTransport::new(blob_root, false)?;
         let engine = CASEngine::with_strategy(transport, Arc::new(MessageBoundaryStrategy));
-        let http = reqwest::Client::builder()
+        let http = crate::http::http_client_builder()
             .pool_idle_timeout(std::time::Duration::from_secs(60))
             .build()
             .map_err(|e| std::io::Error::other(format!("reqwest build: {e}")))?;

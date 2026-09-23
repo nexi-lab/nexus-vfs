@@ -50,20 +50,27 @@ connectors = [
 
 # Per-connector features.  Selectable individually for downstream
 # binaries that want, say, only `driver-cli` without the full HTTP stack.
+# Internal: "this build contains an HTTP connector". Every driver that speaks
+# HTTP enables it, and it is what gates `src/http.rs` — the single place a
+# `reqwest::Client` is built. Named with a leading underscore because it is
+# not meant to be selected directly (the same convention reqwest itself uses
+# for `__rustls`).
+_http = ["dep:reqwest"]
+
 # The LLM connectors speak HTTP, so they pull the HTTP stack themselves —
 # same reason `driver-s3` below does. Declaring `[]` here was wrong: they
 # compiled only because the `connectors` umbrella happens to add
 # `dep:reqwest`, so selecting either one on its own (a slim binary enabling
 # just the model egress) failed to build. No hmac/sha2: there is no request
 # signing here, only a bearer header.
-driver-openai = ["dep:reqwest"]
-driver-anthropic = ["dep:reqwest"]
+driver-openai = ["_http"]
+driver-anthropic = ["_http"]
 # S3 / S3-compatible (Cloudflare R2, MinIO) speaks HTTP + AWS SigV4, so it
 # pulls the HTTP/crypto stack itself. This lets a slim binary enable just
 # `driver-s3` (bridge-2 #4262 — `nexus-cluster --features driver-s3`)
 # without the whole `connectors` umbrella; the umbrella still re-lists these
 # deps, which is a harmless no-op once driver-s3 owns them.
-driver-s3 = ["dep:reqwest", "dep:hmac", "dep:sha2"]
+driver-s3 = ["_http", "dep:hmac", "dep:sha2"]
 driver-gcs = []
 driver-gdrive = []
 driver-gmail = []
@@ -107,7 +114,12 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 base64 = "0.22"
 # Connector / cloud HTTP stack — feature-gated so non-connector builds
 # stay slim.
-reqwest = { version = "0.13", features = ["json", "stream", "rustls"], default-features = false, optional = true }
+# `rustls-no-provider`, NOT `rustls`: the latter is defined as
+# `["__rustls-aws-lc-rs", …]`, which hardcodes aws-lc-rs as the crypto
+# provider and links a second C crypto library beside the `ring` this binary
+# already uses for mTLS — 1.40 MiB of duplicate. `-no-provider` takes the
+# process default instead, which `backends::http` guarantees is installed.
+reqwest = { version = "0.13", features = ["json", "stream", "rustls-no-provider"], default-features = false, optional = true }
 hmac = { version = "0.13", optional = true }
 sha2 = { version = "0.11", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["sink"], optional = true }

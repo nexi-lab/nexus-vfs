@@ -70,7 +70,7 @@ impl ObjectStore for GmailBackend {
         let body = serde_json::json!({ "raw": encoded });
 
         self.runtime.block_on(async {
-            let client = reqwest::Client::new();
+            let client = crate::http::http_client();
             let resp = client
                 .post(&url)
                 .header("Authorization", format!("Bearer {token}"))
@@ -112,7 +112,7 @@ impl ObjectStore for GmailBackend {
         let url = format!("{}/messages/{}?format=full", GMAIL_API, content_id);
 
         self.runtime.block_on(async {
-            let client = reqwest::Client::new();
+            let client = crate::http::http_client();
             let resp = client
                 .get(&url)
                 .header("Authorization", format!("Bearer {token}"))
@@ -142,7 +142,7 @@ impl ObjectStore for GmailBackend {
         let url = format!("{}/messages/{}/trash", GMAIL_API, content_id);
 
         self.runtime.block_on(async {
-            let client = reqwest::Client::new();
+            let client = crate::http::http_client();
             let resp = client
                 .post(&url)
                 .header("Authorization", format!("Bearer {token}"))
