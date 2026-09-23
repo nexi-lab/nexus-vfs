@@ -42,7 +42,16 @@ default = []
 # A tier that wants model calls inside the hook seam builds
 # `--features driver-ai`, exactly as an S3-serving tier builds
 # `--features driver-s3`.
-driver-ai = ["backends/driver-anthropic", "backends/driver-openai"]
+# `llm-mount` comes with it, not separately: the connectors are what a model
+# call goes THROUGH, and this is what makes one happen. Compiling the drivers
+# without the driver would leave a mount that accepts a request and never
+# answers — the state this tree was already in, and the one the feature exists
+# to end.
+driver-ai = [
+    "backends/driver-anthropic",
+    "backends/driver-openai",
+    "dep:llm-mount",
+]
 
 [dependencies]
 # raft owns federation orchestration (ZoneManager, bootstrap_tls, etc.).
@@ -57,6 +66,9 @@ contracts = { workspace = true }
 # HTTP stack so the binary stays at the sudowork target size.
 kernel = { workspace = true }
 backends = { workspace = true, default-features = false, features = ["driver-path-local", "driver-remote"] }
+# Drives an LLM mount (see `driver-ai`). Optional so a default build neither
+# compiles it nor registers its hook.
+llm-mount = { workspace = true, optional = true }
 # VFS gRPC server (port 2028) + auth provider (NoAuth — mTLS is the
 # cluster-internal authentication boundary). Cluster binary never pulls
 # the services post-syscall-hooks tier — keep the dep set minimal.

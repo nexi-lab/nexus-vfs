@@ -988,10 +988,22 @@ type BoxedServiceDeclsBuilder =
 /// provider instead (that link lives at the nexus binary edge).
 pub fn run() -> Result<()> {
     run_with_services(|ctx| {
-        vec![
+        let services = vec![
             a2a::service_decl(ctx.auth_armed),
             managed_agent::service_decl(),
-        ]
+        ];
+        // Present only in a `driver-ai` build. Without it an LLM mount can be
+        // created and will store a request, but nothing turns that write into
+        // a completion — so the driver ships with the connectors it drives,
+        // never separately. Shadowed rather than built `mut`, so the default
+        // build has no unused-mut to silence.
+        #[cfg(feature = "driver-ai")]
+        let services = {
+            let mut services = services;
+            services.push(llm_mount::service_decl());
+            services
+        };
+        services
     })
 }
 
