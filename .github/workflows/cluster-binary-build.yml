@@ -119,8 +119,29 @@ jobs:
         with:
           shared-key: cluster-binary-${{ matrix.os }}-${{ matrix.target || 'native' }}
 
+      # A build that enables extra Cargo features produces a DIFFERENT binary,
+      # and consumers pin these by version. Two binaries carrying one version
+      # and one name is a mis-deploy that surfaces downstream as "mount driver
+      # not found" — a symptom that points nowhere near the version. So the
+      # feature set has to be visible in the artifact name, and this refuses
+      # the build rather than trusting whoever adds the next matrix row to
+      # remember.
+      - name: Feature-carrying builds must say so in their name
+        if: matrix.features != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in $(echo "${{ matrix.features }}" | tr ',' ' '); do
+            if [[ "${{ matrix.artifact_name }}" != *"$f"* ]]; then
+              echo "::error::artifact_name '${{ matrix.artifact_name }}' does not name the feature '$f' it is built with."
+              echo "A feature build is a different binary. Name it so, e.g. nexusd-cluster-<platform>-$f."
+              exit 1
+            fi
+          done
+          echo "artifact name carries its features: ${{ matrix.features }}"
+
       - name: Build release binary
-        run: cargo build --release -p ${{ matrix.package }} --bin ${{ matrix.bin }} ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+        run: cargo build --release -p ${{ matrix.package }} --bin ${{ matrix.bin }} ${{ matrix.features && format('--features {0}', matrix.features) || '' }} ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
 
       - name: Check binary size
         shell: bash
