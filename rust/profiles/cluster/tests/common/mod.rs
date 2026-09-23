@@ -712,6 +712,37 @@ impl Vfs {
     /// storage (`0` = keep-forever, as `create_stream`). Once sealed cold storage
     /// exceeds the budget the oldest segments are trimmed and `earliest` advances
     /// (Kafka retention). Same `wal,memory` io_profile as `create_stream`.
+    /// Create a DT_MOUNT with a constructed backend — the production path an
+    /// operator takes to mount a connector, `backend_type` + `backend_params`
+    /// straight through to the `ObjectStoreProvider` arm.
+    pub async fn mount_backend(
+        &mut self,
+        path: &str,
+        backend_type: &str,
+        params: &[(&str, &str)],
+        token: &str,
+    ) -> Result<(), String> {
+        const DT_MOUNT: i32 = 2;
+        let r = self
+            .c
+            .setattr(SetattrRequest {
+                path: path.to_string(),
+                auth_token: token.to_string(),
+                entry_type: DT_MOUNT,
+                backend_type: backend_type.to_string(),
+                backend_name: backend_type.to_string(),
+                backend_params: params
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| format!("setattr rpc: {e}"))?
+            .into_inner();
+        err_if(r.is_error, &r.error_payload, "mount_backend")
+    }
+
     pub async fn create_stream_cap(
         &mut self,
         path: &str,
