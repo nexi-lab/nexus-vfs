@@ -849,6 +849,59 @@ impl From<ManagedAgentError> for RustCallError {
     }
 }
 
+/// Whose session this is, deciding between what the caller *said* and what its
+/// credential *proves*.
+///
+/// The credential wins. `start_session_v1` used to take `owner_id` from the
+/// request body and had no way to check it, so an agent could open a session
+/// attributed to anyone; that is the hole this closes. Per `OperationContext`,
+/// `user_id` is the principal and `agent_id` the actor, and they differ
+/// exactly when the caller holds a delegated credential — a session cert
+/// carrying a `nexus://owner/` SAN, which the auth layer has already resolved
+/// into `user_id`. This never parses a certificate; it reads the context the
+/// auth layer built.
+///
+/// Three cases, and the middle one is the decision worth stating:
+///
+/// * **No delegated credential** — the caller presented an ordinary agent
+///   cert, an `sk-` key, or nothing. Behaviour is unchanged: the body's
+///   `owner_id` stands, empty defaulting to `system` downstream. This is what
+///   makes the enforcement arrive *with the credential* instead of on a flag
+///   day: a caller that starts presenting a session cert starts being held to
+///   it, and everything else keeps working.
+///
+/// * **Delegated, and the body disagrees** — refused, not overwritten.
+///   Overwriting is quieter and that is exactly what is wrong with it: the
+///   caller believes it opened a session for one person while the system
+///   recorded another, with nothing said. A mismatch is a bug in the caller or
+///   a credential being used for someone it was not issued for, and both want
+///   to be loud. For the caller this FR is about, the two agree, so this never
+///   fires in the correct case.
+///
+/// * **Delegated, body empty or already matching** — the credential's owner
+///   is used. An empty body is not a disagreement, so an existing caller that
+///   sends no `owner_id` needs no change.
+fn authenticated_owner(
+    requested: &str,
+    ctx: &contracts::OperationContext,
+) -> Result<String, String> {
+    let delegated = ctx
+        .agent_id
+        .as_deref()
+        .is_some_and(|actor| actor != ctx.user_id);
+    if !delegated {
+        return Ok(requested.to_string());
+    }
+    let proven = ctx.user_id.as_str();
+    if !requested.is_empty() && requested != proven {
+        return Err(format!(
+            "owner_id {requested:?} does not match the caller's credential, which is \
+             issued for {proven:?}; omit owner_id to use the credential's owner"
+        ));
+    }
+    Ok(proven.to_string())
+}
+
 impl<K: KernelSyscall> RustService for ManagedAgentService<K> {
     fn name(&self) -> &str {
         Self::NAME
@@ -872,12 +925,14 @@ impl<K: KernelSyscall> RustService for ManagedAgentService<K> {
         &self,
         method: &str,
         payload: &[u8],
-        _ctx: &contracts::OperationContext,
+        ctx: &contracts::OperationContext,
     ) -> Result<Vec<u8>, RustCallError> {
         match method {
             "start_session_v1" => {
-                let req: StartSessionRequest = serde_json::from_slice(payload)
+                let mut req: StartSessionRequest = serde_json::from_slice(payload)
                     .map_err(|e| RustCallError::InvalidArgument(e.to_string()))?;
+                req.owner_id = authenticated_owner(&req.owner_id, ctx)
+                    .map_err(RustCallError::InvalidArgument)?;
                 let resp = self.start_session(req)?;
                 serde_json::to_vec(&resp).map_err(|e| RustCallError::Internal(e.to_string()))
             }
@@ -1225,6 +1280,89 @@ mod tests {
         /// session certs looks like.
         fn plain_caller() -> contracts::OperationContext {
             contracts::OperationContext::new("moss", "root", false, Some("moss"), false)
+        }
+
+        /// A caller holding a session cert: the actor is the session identity,
+        /// the principal is the owner its `nexus://owner/` SAN names. This is
+        /// the shape `ApiKeyAuthProvider::agent_context` produces when a cert
+        /// carries an owner, and the only shape that reads as delegated.
+        fn session_caller(owner: &str) -> contracts::OperationContext {
+            contracts::OperationContext::new(owner, "root", false, Some("session-7f3a1c20"), false)
+        }
+
+        /// Decision 2 for the requester: a caller with no delegated credential
+        /// is unaffected. The body's `owner_id` stands, so every caller that
+        /// exists today keeps working and the enforcement arrives *with* the
+        /// credential rather than on a flag day.
+        #[test]
+        fn an_ordinary_caller_still_names_its_own_owner() {
+            let ctx = plain_caller();
+            assert_eq!(authenticated_owner("ethan", &ctx).unwrap(), "ethan");
+            assert_eq!(authenticated_owner("", &ctx).unwrap(), "");
+        }
+
+        /// The point of the whole change: a session cert's owner is used, and
+        /// the caller need not repeat it.
+        #[test]
+        fn a_session_cert_supplies_the_owner() {
+            let ctx = session_caller("alice");
+            assert_eq!(authenticated_owner("", &ctx).unwrap(), "alice");
+            assert_eq!(authenticated_owner("alice", &ctx).unwrap(), "alice");
+        }
+
+        /// Decision 1: a body that disagrees with the credential is refused,
+        /// not quietly overwritten. Overwriting would leave the caller
+        /// believing it opened a session for one person while the system
+        /// recorded another — and a mismatch is either a caller bug or a
+        /// credential being used for someone it was not issued for.
+        #[test]
+        fn a_session_cert_refuses_an_owner_it_does_not_prove() {
+            let ctx = session_caller("alice");
+            let err = authenticated_owner("bob", &ctx).unwrap_err();
+            assert!(err.contains("bob"), "err names what was asked: {err}");
+            assert!(err.contains("alice"), "err names what was proven: {err}");
+        }
+
+        /// End to end through `dispatch`: the recorded owner comes from the
+        /// credential, not the body. Asserted on the session the table holds,
+        /// because that — not the response — is what an audit trail reads.
+        #[test]
+        fn start_session_v1_records_the_credentials_owner() {
+            let (_kernel, table, svc) = fresh_service();
+            let payload = json!({"agent_id": "scode-standard"}).to_string();
+            let bytes = svc
+                .dispatch(
+                    "start_session_v1",
+                    payload.as_bytes(),
+                    &session_caller("alice"),
+                )
+                .unwrap();
+            let resp: StartSessionResponse = serde_json::from_slice(&bytes).unwrap();
+            let desc = table.get(&resp.session_id).expect("session registered");
+            assert_eq!(
+                desc.owner_id, "alice",
+                "the owner is the credential's, not the body's default"
+            );
+        }
+
+        /// The refusal reaches the wire as `InvalidArgument`, not a panic and
+        /// not a session started under the wrong name.
+        #[test]
+        fn start_session_v1_rejects_a_body_the_credential_does_not_prove() {
+            let (_kernel, table, svc) = fresh_service();
+            let payload = json!({"agent_id": "scode-standard", "owner_id": "bob"}).to_string();
+            let err = svc
+                .dispatch(
+                    "start_session_v1",
+                    payload.as_bytes(),
+                    &session_caller("alice"),
+                )
+                .unwrap_err();
+            assert!(matches!(err, RustCallError::InvalidArgument(_)));
+            assert!(
+                table.list(None, None, None, None).is_empty(),
+                "a refused call must not leave a session behind"
+            );
         }
 
         #[test]
