@@ -589,10 +589,18 @@ pub struct Kernel {
     /// directly so kernel-internal callers keep the same shared runtime
     /// regardless of whether the host binary has installed the real
     /// peer client yet.
-    // `Option` so `Drop` can `take()` the Arc and hand it to an
-    // off-context thread — see the `Drop for Kernel` impl. `Some` for
-    // the entire observable lifetime of the kernel.
-    pub(crate) runtime: Option<Arc<tokio::runtime::Runtime>>,
+    // Built on FIRST USE, not at construction. The runtime serves peer
+    // RPCs and API-connector streaming; a kernel embedded over local
+    // storage alone performs neither, and paying two worker threads for
+    // it is what makes embedding a kernel in a short-lived process
+    // (a CLI invocation) cost more than it returns.
+    //
+    // `OnceLock` rather than an injected handle: it leaves the accessor's
+    // signature and every downstream type alone, so `RpcTransport`, the AI
+    // backends and `ObjectStoreProviderArgs` keep taking `Arc<Runtime>`.
+    // `take()` in `Drop` still moves the Arc to an off-context thread —
+    // see the `Drop for Kernel` impl.
+    pub(crate) runtime: std::sync::OnceLock<Arc<tokio::runtime::Runtime>>,
     // Shared tokio runtime — constructed once at Kernel::new and used by
     // every peer RPC (scatter-gather chunk fetch + federation remote
     // reads). Replaces the one-shot `Builder::new_current_thread()` inside
@@ -729,16 +737,6 @@ impl Kernel {
     #[allow(clippy::new_without_default)]
     #[allow(clippy::let_and_return)]
     pub fn new() -> Self {
-        // Kernel owns its tokio runtime — multi-thread, two workers
-        // sized for IO-bound peer RPCs.
-        let runtime = Arc::new(
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .thread_name("nexus-kernel-peer")
-                .enable_all()
-                .build()
-                .expect("failed to build kernel tokio runtime"),
-        );
         // The real peer_blob_client lives in
         // `transport::blob::peer_client`. Kernel boots with the no-op
         // fallback; the host binary wires the real impl via
@@ -784,7 +782,7 @@ impl Kernel {
             fdt: crate::fdt::FileDescriptorTable::new(),
             native_hooks: RwLock::new(NativeHookRegistry::new()),
             self_address: parking_lot::RwLock::new(None),
-            runtime: Some(runtime),
+            runtime: std::sync::OnceLock::new(),
             peer_client: parking_lot::RwLock::new(peer_client_dyn),
             distributed_coordinator: parking_lot::RwLock::new(
                 crate::hal::distributed_coordinator::NoopDistributedCoordinator::arc(),
@@ -2533,13 +2531,39 @@ impl Kernel {
     // ── Native INTERCEPT hook dispatch ────────────────────────────────
     // (Moved to `kernel::dispatch` submodule.)
 
-    /// Borrow the kernel's shared tokio runtime — kernel owns this Arc
-    /// directly; peer crates (backends LLM connectors, transport gRPC
-    /// server) clone it for their async work.
+    /// Borrow the kernel's shared tokio runtime, building it on first call.
+    ///
+    /// Kernel owns this Arc directly; peer crates (backends, LLM connectors,
+    /// the transport gRPC server) clone it for their async work.
+    ///
+    /// Deferred because the runtime is only needed once something async
+    /// actually happens — a federation read, a blob fetch, an API-connector
+    /// stream. A kernel embedded over local storage alone never reaches any
+    /// of those, and the two worker threads it would otherwise start at
+    /// construction are pure cost in a short-lived process.
+    ///
+    /// Multi-thread with two workers, sized for IO-bound peer RPCs.
     pub fn runtime(&self) -> &Arc<tokio::runtime::Runtime> {
-        self.runtime
-            .as_ref()
-            .expect("kernel runtime present for the Kernel's lifetime")
+        self.runtime.get_or_init(|| {
+            Arc::new(
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .thread_name("nexus-kernel-peer")
+                    .enable_all()
+                    .build()
+                    .expect("failed to build kernel tokio runtime"),
+            )
+        })
+    }
+
+    /// Whether the peer runtime has been built.
+    ///
+    /// Exists so a test can assert the deferral actually holds: a kernel that
+    /// only touched local storage must not have started worker threads, and
+    /// an assertion that cannot observe that would pass either way.
+    #[must_use]
+    pub fn peer_runtime_started(&self) -> bool {
+        self.runtime.get().is_some()
     }
 
     /// Replace the kernel's `peer_client` slot with a concrete
@@ -2865,11 +2889,13 @@ impl Drop for Kernel {
         // (it panics: "Cannot drop a runtime in a context where blocking
         // is not allowed"). A `Kernel` can legitimately be dropped from
         // such a context — e.g. an `Arc<Kernel>` going out of scope at
-        // the end of a `#[tokio::test]` body. `runtime` is therefore an
-        // `Option`: `take()` it (leaving `None`, whose field-drop is a
-        // no-op) and drop the Arc on a dedicated OS thread, where the
-        // join is allowed. When it is the last ref, tokio shuts the
-        // workers down there.
+        // the end of a `#[tokio::test]` body. `take()` the Arc (leaving
+        // the cell empty, whose field-drop is a no-op) and drop it on a
+        // dedicated OS thread, where the join is allowed. When it is the
+        // last ref, tokio shuts the workers down there.
+        //
+        // `None` here is the ordinary case for a kernel that never went
+        // async: nothing was built, so there is nothing to wind down.
         if let Some(old) = self.runtime.take() {
             let _ = std::thread::Builder::new()
                 .name("nexus-kernel-rt-drop".into())
@@ -3017,6 +3043,33 @@ mod tests {
                 "strict ZonePath unexpectedly rejected {path:?}"
             );
         }
+    }
+
+    /// A kernel that only touches local storage never starts the peer runtime.
+    ///
+    /// The runtime is two worker threads serving peer RPCs and API-connector
+    /// streams. Building it at construction charged every embedder for
+    /// federation they may never do — which is what makes putting a kernel
+    /// inside a short-lived process (a CLI invocation) cost more than it
+    /// returns. A full local write/read must therefore leave it unbuilt.
+    #[test]
+    fn local_only_work_does_not_start_the_peer_runtime() {
+        let k = kernel_with_root_backend();
+        let ctx = OperationContext::new("test", "root", true, None, true);
+        setattr(&k, "/local.txt", DT_REG as i32).unwrap();
+        k.sys_write_with_link_depth("/local.txt", &ctx, b"bytes", 0, 1)
+            .unwrap();
+        k.sys_read_single("/local.txt", &ctx, 1, 0, 0).unwrap();
+
+        assert!(
+            !k.peer_runtime_started(),
+            "a local write + read must not start the peer runtime"
+        );
+
+        // And it is still there when something actually needs it — deferred,
+        // not removed.
+        let _ = k.runtime();
+        assert!(k.peer_runtime_started());
     }
 
     #[test]
