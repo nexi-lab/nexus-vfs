@@ -182,6 +182,15 @@ pub(crate) struct GetSessionResponse {
     pub session_id: String,
     /// Static agent profile id (mirrors `StartSessionRequest.agent_id`).
     pub agent_id: String,
+    /// Whose session this is, as recorded on the descriptor.
+    ///
+    /// Reported because the caller can no longer infer it. `start_session_v1`
+    /// takes the owner from a delegated credential in preference to the
+    /// request body (see `authenticated_owner`), so a front door that sends no
+    /// `owner_id` has no other way to learn what the daemon attributed the
+    /// session to — and attribution nobody can read back is attribution
+    /// nobody can check.
+    pub owner_id: String,
     pub workspace_path: String,
     pub model: String,
     pub state: String,
@@ -672,6 +681,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
         Ok(GetSessionResponse {
             session_id: desc.pid.clone(),
             agent_id: desc.name.clone(),
+            owner_id: desc.owner_id.clone(),
             workspace_path,
             model,
             state: desc.state.as_str().to_lowercase(),
@@ -849,6 +859,59 @@ impl From<ManagedAgentError> for RustCallError {
     }
 }
 
+/// Whose session this is, deciding between what the caller *said* and what its
+/// credential *proves*.
+///
+/// The credential wins. `start_session_v1` used to take `owner_id` from the
+/// request body and had no way to check it, so an agent could open a session
+/// attributed to anyone; that is the hole this closes. Per `OperationContext`,
+/// `user_id` is the principal and `agent_id` the actor, and they differ
+/// exactly when the caller holds a delegated credential — a session cert
+/// carrying a `nexus://owner/` SAN, which the auth layer has already resolved
+/// into `user_id`. This never parses a certificate; it reads the context the
+/// auth layer built.
+///
+/// Three cases, and the middle one is the decision worth stating:
+///
+/// * **No delegated credential** — the caller presented an ordinary agent
+///   cert, an `sk-` key, or nothing. Behaviour is unchanged: the body's
+///   `owner_id` stands, empty defaulting to `system` downstream. This is what
+///   makes the enforcement arrive *with the credential* instead of on a flag
+///   day: a caller that starts presenting a session cert starts being held to
+///   it, and everything else keeps working.
+///
+/// * **Delegated, and the body disagrees** — refused, not overwritten.
+///   Overwriting is quieter and that is exactly what is wrong with it: the
+///   caller believes it opened a session for one person while the system
+///   recorded another, with nothing said. A mismatch is a bug in the caller or
+///   a credential being used for someone it was not issued for, and both want
+///   to be loud. For the caller this FR is about, the two agree, so this never
+///   fires in the correct case.
+///
+/// * **Delegated, body empty or already matching** — the credential's owner
+///   is used. An empty body is not a disagreement, so an existing caller that
+///   sends no `owner_id` needs no change.
+fn authenticated_owner(
+    requested: &str,
+    ctx: &contracts::OperationContext,
+) -> Result<String, String> {
+    let delegated = ctx
+        .agent_id
+        .as_deref()
+        .is_some_and(|actor| actor != ctx.user_id);
+    if !delegated {
+        return Ok(requested.to_string());
+    }
+    let proven = ctx.user_id.as_str();
+    if !requested.is_empty() && requested != proven {
+        return Err(format!(
+            "owner_id {requested:?} does not match the caller's credential, which is \
+             issued for {proven:?}; omit owner_id to use the credential's owner"
+        ));
+    }
+    Ok(proven.to_string())
+}
+
 impl<K: KernelSyscall> RustService for ManagedAgentService<K> {
     fn name(&self) -> &str {
         Self::NAME
@@ -868,11 +931,18 @@ impl<K: KernelSyscall> RustService for ManagedAgentService<K> {
     /// Route the three session-lifecycle methods exposed over
     /// `NexusVFSService.Call`. Method names are versioned so the wire
     /// contract can evolve without breaking older sudowork clients.
-    fn dispatch(&self, method: &str, payload: &[u8]) -> Result<Vec<u8>, RustCallError> {
+    fn dispatch(
+        &self,
+        method: &str,
+        payload: &[u8],
+        ctx: &contracts::OperationContext,
+    ) -> Result<Vec<u8>, RustCallError> {
         match method {
             "start_session_v1" => {
-                let req: StartSessionRequest = serde_json::from_slice(payload)
+                let mut req: StartSessionRequest = serde_json::from_slice(payload)
                     .map_err(|e| RustCallError::InvalidArgument(e.to_string()))?;
+                req.owner_id = authenticated_owner(&req.owner_id, ctx)
+                    .map_err(RustCallError::InvalidArgument)?;
                 let resp = self.start_session(req)?;
                 serde_json::to_vec(&resp).map_err(|e| RustCallError::Internal(e.to_string()))
             }
@@ -1213,6 +1283,129 @@ mod tests {
         use super::*;
         use serde_json::json;
 
+        /// A caller holding an ordinary credential: an agent cert with no
+        /// owner SAN, or an `sk-` key. The auth layer sets `agent_id` to the
+        /// same subject as `user_id` for an agent acting for itself (and
+        /// `None` for a person), so this is what every caller that predates
+        /// session certs looks like.
+        fn plain_caller() -> contracts::OperationContext {
+            contracts::OperationContext::new("moss", "root", false, Some("moss"), false)
+        }
+
+        /// A caller holding a session cert: the actor is the session identity,
+        /// the principal is the owner its `nexus://owner/` SAN names. This is
+        /// the shape `ApiKeyAuthProvider::agent_context` produces when a cert
+        /// carries an owner, and the only shape that reads as delegated.
+        fn session_caller(owner: &str) -> contracts::OperationContext {
+            contracts::OperationContext::new(owner, "root", false, Some("session-7f3a1c20"), false)
+        }
+
+        /// Decision 2 for the requester: a caller with no delegated credential
+        /// is unaffected. The body's `owner_id` stands, so every caller that
+        /// exists today keeps working and the enforcement arrives *with* the
+        /// credential rather than on a flag day.
+        #[test]
+        fn an_ordinary_caller_still_names_its_own_owner() {
+            let ctx = plain_caller();
+            assert_eq!(authenticated_owner("ethan", &ctx).unwrap(), "ethan");
+            assert_eq!(authenticated_owner("", &ctx).unwrap(), "");
+        }
+
+        /// The point of the whole change: a session cert's owner is used, and
+        /// the caller need not repeat it.
+        #[test]
+        fn a_session_cert_supplies_the_owner() {
+            let ctx = session_caller("alice");
+            assert_eq!(authenticated_owner("", &ctx).unwrap(), "alice");
+            assert_eq!(authenticated_owner("alice", &ctx).unwrap(), "alice");
+        }
+
+        /// Decision 1: a body that disagrees with the credential is refused,
+        /// not quietly overwritten. Overwriting would leave the caller
+        /// believing it opened a session for one person while the system
+        /// recorded another — and a mismatch is either a caller bug or a
+        /// credential being used for someone it was not issued for.
+        #[test]
+        fn a_session_cert_refuses_an_owner_it_does_not_prove() {
+            let ctx = session_caller("alice");
+            let err = authenticated_owner("bob", &ctx).unwrap_err();
+            assert!(err.contains("bob"), "err names what was asked: {err}");
+            assert!(err.contains("alice"), "err names what was proven: {err}");
+        }
+
+        /// End to end through `dispatch`: the recorded owner comes from the
+        /// credential, not the body. Asserted on the session the table holds,
+        /// because that — not the response — is what an audit trail reads.
+        #[test]
+        fn start_session_v1_records_the_credentials_owner() {
+            let (_kernel, table, svc) = fresh_service();
+            let payload = json!({"agent_id": "scode-standard"}).to_string();
+            let bytes = svc
+                .dispatch(
+                    "start_session_v1",
+                    payload.as_bytes(),
+                    &session_caller("alice"),
+                )
+                .unwrap();
+            let resp: StartSessionResponse = serde_json::from_slice(&bytes).unwrap();
+            let desc = table.get(&resp.session_id).expect("session registered");
+            assert_eq!(
+                desc.owner_id, "alice",
+                "the owner is the credential's, not the body's default"
+            );
+        }
+
+        /// `get_session_v1` reports the owner, so a caller that sent none can
+        /// read back what the daemon attributed the session to. Without this
+        /// the attribution exists only on the descriptor, where the caller
+        /// cannot see it.
+        #[test]
+        fn get_session_v1_reports_the_owner_that_was_recorded() {
+            let (_kernel, _table, svc) = fresh_service();
+            let started = svc
+                .dispatch(
+                    "start_session_v1",
+                    json!({"agent_id": "scode-standard"}).to_string().as_bytes(),
+                    &session_caller("alice"),
+                )
+                .unwrap();
+            let started: StartSessionResponse = serde_json::from_slice(&started).unwrap();
+
+            let payload = json!({"session_id": started.session_id}).to_string();
+            let bytes = svc
+                .dispatch(
+                    "get_session_v1",
+                    payload.as_bytes(),
+                    &session_caller("alice"),
+                )
+                .unwrap();
+            let snap: GetSessionResponse = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                snap.owner_id, "alice",
+                "the caller sent no owner_id; the credential's owner is what it reads back"
+            );
+        }
+
+        /// The refusal reaches the wire as `InvalidArgument`, not a panic and
+        /// not a session started under the wrong name.
+        #[test]
+        fn start_session_v1_rejects_a_body_the_credential_does_not_prove() {
+            let (_kernel, table, svc) = fresh_service();
+            let payload = json!({"agent_id": "scode-standard", "owner_id": "bob"}).to_string();
+            let err = svc
+                .dispatch(
+                    "start_session_v1",
+                    payload.as_bytes(),
+                    &session_caller("alice"),
+                )
+                .unwrap_err();
+            assert!(matches!(err, RustCallError::InvalidArgument(_)));
+            assert!(
+                table.list(None, None, None, None).is_empty(),
+                "a refused call must not leave a session behind"
+            );
+        }
+
         #[test]
         fn start_session_v1_round_trip() {
             let (_kernel, _table, svc) = fresh_service();
@@ -1225,7 +1418,7 @@ mod tests {
             })
             .to_string();
             let bytes = svc
-                .dispatch("start_session_v1", payload.as_bytes())
+                .dispatch("start_session_v1", payload.as_bytes(), &plain_caller())
                 .unwrap();
             let resp: StartSessionResponse = serde_json::from_slice(&bytes).unwrap();
             assert!(resp.session_id.starts_with("pid-"));
@@ -1240,7 +1433,7 @@ mod tests {
             let (_kernel, _table, svc) = fresh_service();
             let payload = json!({"agent_id": "scode-standard"}).to_string();
             let bytes = svc
-                .dispatch("start_session_v1", payload.as_bytes())
+                .dispatch("start_session_v1", payload.as_bytes(), &plain_caller())
                 .unwrap();
             let resp: StartSessionResponse = serde_json::from_slice(&bytes).unwrap();
             assert!(resp.session_id.starts_with("pid-"));
@@ -1251,7 +1444,9 @@ mod tests {
             let (_kernel, _table, svc) = fresh_service();
             let resp = svc.start_session(req("scode-standard")).unwrap();
             let payload = json!({"session_id": resp.session_id, "mode": "session"}).to_string();
-            let bytes = svc.dispatch("cancel_v1", payload.as_bytes()).unwrap();
+            let bytes = svc
+                .dispatch("cancel_v1", payload.as_bytes(), &plain_caller())
+                .unwrap();
             let cancel: CancelResponse = serde_json::from_slice(&bytes).unwrap();
             assert!(cancel.cancelled);
         }
@@ -1261,7 +1456,9 @@ mod tests {
             let (_kernel, _table, svc) = fresh_service();
             let resp = svc.start_session(req("scode-standard")).unwrap();
             let payload = json!({"session_id": resp.session_id, "mode": "turn"}).to_string();
-            let bytes = svc.dispatch("cancel_v1", payload.as_bytes()).unwrap();
+            let bytes = svc
+                .dispatch("cancel_v1", payload.as_bytes(), &plain_caller())
+                .unwrap();
             let cancel: CancelResponse = serde_json::from_slice(&bytes).unwrap();
             assert!(cancel.cancelled);
         }
@@ -1270,7 +1467,9 @@ mod tests {
         fn cancel_v1_unknown_session_surfaces_invalid_argument() {
             let (_kernel, _table, svc) = fresh_service();
             let payload = json!({"session_id": "pid-bogus", "mode": "session"}).to_string();
-            let err = svc.dispatch("cancel_v1", payload.as_bytes()).unwrap_err();
+            let err = svc
+                .dispatch("cancel_v1", payload.as_bytes(), &plain_caller())
+                .unwrap_err();
             assert!(matches!(err, RustCallError::InvalidArgument(_)));
         }
 
@@ -1279,7 +1478,9 @@ mod tests {
             let (_kernel, _table, svc) = fresh_service();
             let resp = svc.start_session(req("scode-standard")).unwrap();
             let payload = json!({"session_id": resp.session_id}).to_string();
-            let bytes = svc.dispatch("get_session_v1", payload.as_bytes()).unwrap();
+            let bytes = svc
+                .dispatch("get_session_v1", payload.as_bytes(), &plain_caller())
+                .unwrap();
             let snap: GetSessionResponse = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(snap.session_id, resp.session_id);
             assert_eq!(snap.state, "warming_up");
@@ -1288,7 +1489,9 @@ mod tests {
         #[test]
         fn unknown_method_returns_not_found() {
             let (_kernel, _table, svc) = fresh_service();
-            let err = svc.dispatch("does_not_exist", b"{}").unwrap_err();
+            let err = svc
+                .dispatch("does_not_exist", b"{}", &plain_caller())
+                .unwrap_err();
             assert!(matches!(err, RustCallError::NotFound));
         }
 
@@ -1296,7 +1499,7 @@ mod tests {
         fn malformed_payload_surfaces_invalid_argument() {
             let (_kernel, _table, svc) = fresh_service();
             let err = svc
-                .dispatch("start_session_v1", b"this is not json")
+                .dispatch("start_session_v1", b"this is not json", &plain_caller())
                 .unwrap_err();
             assert!(matches!(err, RustCallError::InvalidArgument(_)));
         }

@@ -47,6 +47,39 @@ use http_body_util::{BodyExt, StreamBody};
 use kernel::kernel::PluginGrpcEndpoint;
 use tower::Service;
 
+/// The caller identity this plane can honestly claim: none.
+///
+/// Unlike the `Call` handler — which runs an [`AuthProvider`] and hands
+/// `dispatch` the resolved principal — these routes are registered straight
+/// onto `tonic::service::Routes` and never resolve a per-request identity. The
+/// *connection* is mTLS-terminated, so the peer is a cert the cluster CA
+/// signed; which agent or person is behind this particular request is simply
+/// not determined here.
+///
+/// So this fabricates nothing. `agent_id` is `None`, which reads as "not a
+/// delegated call" to anything checking (see `managed_agent::authenticated_owner`);
+/// `is_admin` and `is_system` are false, so it can never be mistaken for a
+/// grant. The `user_id` names the plane rather than a principal, so a plugin
+/// that logs it records where the call came from and not a person it could
+/// attribute the action to.
+///
+/// Note that today this reaches only `DylibRustService`, which drops the
+/// context at the dlopen boundary (the v6 plugin ABI passes bytes, not
+/// identity). Resolving a real principal here would mean running the auth
+/// provider on this plane *and* widening the plugin ABI — a separate change,
+/// and one that would alter what plugins are allowed to do.
+///
+/// [`AuthProvider`]: crate::auth::AuthProvider
+fn unauthenticated_caller() -> contracts::OperationContext {
+    contracts::OperationContext::new(
+        "plugin-grpc-proxy",
+        contracts::ROOT_ZONE_ID,
+        /* is_admin */ false,
+        /* agent_id */ None,
+        /* is_system */ false,
+    )
+}
+
 /// A tower `Service` that proxies one fully-qualified gRPC service
 /// name through a plugin's bytes-level dispatcher.
 ///
@@ -101,7 +134,9 @@ impl Service<http::Request<axum::body::Body>> for PluginProxyService {
             // libsodium, etc.).  Move it off the tokio reactor.
             let dispatch_path = path.clone();
             let result = tokio::task::spawn_blocking(move || {
-                endpoint.service.dispatch(&dispatch_path, &payload)
+                endpoint
+                    .service
+                    .dispatch(&dispatch_path, &payload, &unauthenticated_caller())
             })
             .await;
 
