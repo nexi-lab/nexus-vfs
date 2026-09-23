@@ -35,7 +35,7 @@ use serde_json::{json, Map, Value};
 
 use crate::transports::api::ai::anthropic::AnthropicBackend;
 use crate::transports::api::ai::openai::streaming::LlmStreamingBackend;
-use kernel::stream_manager::StreamManager;
+use kernel::extensions::llm_streaming::StreamSink;
 
 impl LlmStreamingBackend for AnthropicBackend {
     #[allow(private_interfaces)]
@@ -43,9 +43,9 @@ impl LlmStreamingBackend for AnthropicBackend {
         &self,
         request_bytes: &[u8],
         stream_path: &str,
-        stream_manager: &Arc<StreamManager>,
+        sink: &Arc<dyn StreamSink>,
     ) -> Result<(), String> {
-        match self.run_streaming_inner(request_bytes, stream_path, stream_manager) {
+        match self.run_streaming_inner(request_bytes, stream_path, sink) {
             Ok(()) => Ok(()),
             Err(err) => {
                 let payload = json!({
@@ -53,8 +53,8 @@ impl LlmStreamingBackend for AnthropicBackend {
                     "message": err,
                 });
                 let msg = serde_json::to_vec(&payload).unwrap_or_default();
-                let _ = stream_manager.write_nowait(stream_path, &msg);
-                let _ = stream_manager.close(stream_path);
+                let _ = sink.append(stream_path, &msg);
+                let _ = sink.close(stream_path);
                 Err(err)
             }
         }
@@ -66,7 +66,7 @@ impl AnthropicBackend {
         &self,
         request_bytes: &[u8],
         stream_path: &str,
-        stream_manager: &Arc<StreamManager>,
+        sink: &Arc<dyn StreamSink>,
     ) -> Result<(), String> {
         let request: Value = serde_json::from_slice(request_bytes)
             .map_err(|e| format!("request JSON parse: {e}"))?;
@@ -134,7 +134,7 @@ impl AnthropicBackend {
         let api_key = self.api_key.clone();
 
         let start = std::time::Instant::now();
-        let stream_manager_clone = Arc::clone(stream_manager);
+        let sink_clone = Arc::clone(sink);
         let stream_path_owned = stream_path.to_string();
 
         let mut collected_text = String::new();
@@ -264,8 +264,8 @@ impl AnthropicBackend {
                                     if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
                                         if !text.is_empty() {
                                             collected_text.push_str(text);
-                                            if let Err(e) = stream_manager_clone
-                                                .write_nowait(&stream_path_owned, text.as_bytes())
+                                            if let Err(e) = sink_clone
+                                                .append(&stream_path_owned, text.as_bytes())
                                             {
                                                 return Err(format!("stream write: {e:?}"));
                                             }
@@ -282,7 +282,7 @@ impl AnthropicBackend {
                                                 "type": "thinking",
                                                 "thinking": thinking,
                                             });
-                                            let _ = stream_manager_clone.write_nowait(
+                                            let _ = sink_clone.append(
                                                 &stream_path_owned,
                                                 &serde_json::to_vec(&frame).unwrap_or_default(),
                                             );
@@ -409,8 +409,8 @@ impl AnthropicBackend {
             }
         }
         let done_bytes = serde_json::to_vec(&done).unwrap_or_default();
-        let _ = stream_manager.write_nowait(stream_path, &done_bytes);
-        let _ = stream_manager.close(stream_path);
+        let _ = sink.append(stream_path, &done_bytes);
+        let _ = sink.close(stream_path);
 
         Ok(())
     }
@@ -594,6 +594,20 @@ fn round_one_decimal(x: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kernel::kernel::Kernel;
+
+    /// A sink backed by a real `Kernel`, because that is the only kind there
+    /// is in production. A recording fake would be easier and would quietly
+    /// stop proving what these tests exist to prove — that a connector's
+    /// output reaches the stream through the kernel's write hooks.
+    fn kernel_sink(stream_path: &str, capacity: usize) -> (Arc<Kernel>, Arc<dyn StreamSink>) {
+        let k = Arc::new(Kernel::new());
+        k.create_stream(stream_path, capacity).unwrap();
+        let ctx = contracts::OperationContext::new("test", "root", false, None, false);
+        let sink = k.stream_sink(ctx);
+        (k, sink)
+    }
+
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -733,16 +747,15 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (_h, url) = serve_once(sse_happy());
         let backend = build_backend(&tmp, &url);
-        let sm = Arc::new(StreamManager::new());
         let stream_path = "/llm/stream/happy";
-        sm.create(stream_path, 1024 * 64).unwrap();
+        let (kernel, sink) = kernel_sink(stream_path, 1024 * 64);
 
         let req = build_request();
         backend
-            .run_streaming(&req, stream_path, &sm)
+            .run_streaming(&req, stream_path, &sink)
             .expect("streaming succeeds");
 
-        let payload = sm.collect_all_payloads(stream_path).unwrap();
+        let payload = kernel.stream_collect_all(stream_path).unwrap();
         let s = String::from_utf8(payload).unwrap();
         assert!(s.starts_with("Hello"), "got: {s}");
         let done_idx = s.find('{').expect("missing done frame");
@@ -766,14 +779,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (_h, url) = serve_once(sse_with_tool_use());
         let backend = build_backend(&tmp, &url);
-        let sm = Arc::new(StreamManager::new());
         let stream_path = "/llm/stream/tools";
-        sm.create(stream_path, 1024 * 64).unwrap();
+        let (kernel, sink) = kernel_sink(stream_path, 1024 * 64);
 
         let req = build_request();
-        backend.run_streaming(&req, stream_path, &sm).unwrap();
+        backend.run_streaming(&req, stream_path, &sink).unwrap();
 
-        let payload = sm.collect_all_payloads(stream_path).unwrap();
+        let payload = kernel.stream_collect_all(stream_path).unwrap();
         let s = String::from_utf8(payload).unwrap();
         let done_idx = s.find('{').unwrap();
         let done: Value = serde_json::from_str(&s[done_idx..]).unwrap();
@@ -793,15 +805,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (_h, url) = serve_once_status(500, r#"{"error":"boom"}"#.to_string());
         let backend = build_backend(&tmp, &url);
-        let sm = Arc::new(StreamManager::new());
         let stream_path = "/llm/stream/err";
-        sm.create(stream_path, 1024 * 16).unwrap();
+        let (kernel, sink) = kernel_sink(stream_path, 1024 * 16);
 
         let req = build_request();
-        let err = backend.run_streaming(&req, stream_path, &sm).unwrap_err();
+        let err = backend.run_streaming(&req, stream_path, &sink).unwrap_err();
         assert!(err.contains("500"));
 
-        let payload = sm.collect_all_payloads(stream_path).unwrap();
+        let payload = kernel.stream_collect_all(stream_path).unwrap();
         let s = String::from_utf8(payload).unwrap();
         let err_idx = s.find('{').expect("missing error frame");
         let err_json: Value = serde_json::from_str(&s[err_idx..]).unwrap();
@@ -923,14 +934,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (_h, url) = serve_once(sse_with_thinking());
         let backend = build_backend(&tmp, &url);
-        let sm = Arc::new(StreamManager::new());
         let stream_path = "/llm/stream/thinking";
-        sm.create(stream_path, 1024 * 64).unwrap();
+        let (kernel, sink) = kernel_sink(stream_path, 1024 * 64);
 
         let req = build_request();
-        backend.run_streaming(&req, stream_path, &sm).unwrap();
+        backend.run_streaming(&req, stream_path, &sink).unwrap();
 
-        let payload = sm.collect_all_payloads(stream_path).unwrap();
+        let payload = kernel.stream_collect_all(stream_path).unwrap();
         let s = String::from_utf8(payload).unwrap();
 
         // Should contain thinking JSON frames before the text
