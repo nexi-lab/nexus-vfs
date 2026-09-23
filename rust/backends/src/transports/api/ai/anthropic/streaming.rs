@@ -1,7 +1,13 @@
 //! Anthropic streaming pipeline — SSE event decode → DT_STREAM → CAS persist.
 //!
-//! Driven from the kernel `llm_start_streaming` syscall, same as the OpenAI
-//! path. Writes text deltas to the DT_STREAM, persists the session envelope
+//! Nothing drives this yet: there is no caller in the tree, so no model call
+//! happens through the kernel today. Earlier docs here named a
+//! `llm_start_streaming` syscall as the driver; no such syscall was ever
+//! written, and the agreed design does not add one — a write to the mount is
+//! the trigger. Same for the OpenAI path.
+//!
+//! Appends text deltas to the DT_STREAM through the caller's `StreamSink`
+//! (so every append runs the kernel's write hooks), persists the session envelope
 //! via `CASEngine::write_content_tracked`, emits a terminal `done` control
 //! frame carrying the session hash. All under the shared tokio runtime —
 //! no per-backend worker pools.

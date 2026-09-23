@@ -1,7 +1,13 @@
 //! OpenAI streaming pipeline — SSE decode → DT_STREAM → CAS persist.
 //!
-//! Driven from the kernel `llm_start_streaming` syscall; runs entirely on
-//! the kernel-shared tokio runtime.
+//! Nothing drives this yet: there is no caller in the tree, so no model call
+//! happens through the kernel today. Earlier docs here named a
+//! `llm_start_streaming` syscall as the driver; no such syscall was ever
+//! written, and the agreed design does not add one — a write to the mount is
+//! the trigger.
+//!
+//! Runs entirely on the kernel-shared tokio runtime, and appends through the
+//! caller's `StreamSink` so every append runs the kernel's write hooks.
 //!
 //! The state machine:
 //!   1. HTTP POST `{base_url}/chat/completions` with `stream=true`.
