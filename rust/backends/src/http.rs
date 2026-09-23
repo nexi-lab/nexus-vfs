@@ -38,3 +38,23 @@ pub(crate) fn http_client() -> reqwest::Client {
         .build()
         .expect("reqwest client: TLS backend unavailable")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Building a client must work without anything else having set up TLS
+    /// first. This is the guarantee that lets `reqwest` be compiled with
+    /// `rustls-no-provider` — with no provider bundled, a client built before
+    /// the process default is installed fails, and the failure would land in
+    /// whichever connector happened to make the first call.
+    ///
+    /// The helper installs it, so ordering stops mattering. Asserted directly
+    /// rather than left to the connector tests, which would only catch it by
+    /// accident and only in whichever one ran first.
+    #[test]
+    fn a_client_builds_without_anyone_else_arming_tls() {
+        let _ = http_client();
+        let _ = http_client_builder().build().expect("builder path");
+    }
+}

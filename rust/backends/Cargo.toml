@@ -114,7 +114,12 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 base64 = "0.22"
 # Connector / cloud HTTP stack — feature-gated so non-connector builds
 # stay slim.
-reqwest = { version = "0.13", features = ["json", "stream", "rustls"], default-features = false, optional = true }
+# `rustls-no-provider`, NOT `rustls`: the latter is defined as
+# `["__rustls-aws-lc-rs", …]`, which hardcodes aws-lc-rs as the crypto
+# provider and links a second C crypto library beside the `ring` this binary
+# already uses for mTLS — 1.40 MiB of duplicate. `-no-provider` takes the
+# process default instead, which `backends::http` guarantees is installed.
+reqwest = { version = "0.13", features = ["json", "stream", "rustls-no-provider"], default-features = false, optional = true }
 hmac = { version = "0.13", optional = true }
 sha2 = { version = "0.11", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["sink"], optional = true }
