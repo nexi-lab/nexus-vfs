@@ -54,9 +54,9 @@ plaintext clients:
 
 ```ts
 const client = NexusVfsClient.withMtls('100.64.0.1:8443', {
-  caPath: '/etc/nexus/ca.pem',
-  certPath: '/etc/nexus/client.pem',
-  keyPath: '/etc/nexus/client-key.pem',
+  ca: '/etc/nexus/ca.pem',
+  cert: '/etc/nexus/client.pem',
+  key: '/etc/nexus/client-key.pem',
 })
 ```
 

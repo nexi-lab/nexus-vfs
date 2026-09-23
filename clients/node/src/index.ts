@@ -53,13 +53,24 @@ const PROTO_LOADER_OPTIONS: protoLoader.Options = {
 }
 
 /** Paths to the PEM material an mTLS connection needs. */
+/**
+ * TLS material, as bytes or as a path to read them from.
+ *
+ * Both forms exist because both are real: a long-lived identity is a file on
+ * disk, while a credential from {@link NexusZoneApiClient.mintSessionAgent}
+ * arrives as bytes and is deliberately never written down. One field per
+ * artefact rather than a path-or-bytes pair, so there is no combination that
+ * has to be rejected at runtime.
+ */
+export type NexusPem = Buffer | string
+
 export interface NexusVfsTlsConfig {
   /** Cluster CA certificate that signed the server cert. */
-  caPath: string
+  ca: NexusPem
   /** This client's certificate. */
-  certPath: string
+  cert: NexusPem
   /** This client's private key. */
-  keyPath: string
+  key: NexusPem
   /** Server-cert SAN to validate. Defaults to {@link DEFAULT_CLUSTER_SERVER_NAME}. */
   serverName?: string
 }
@@ -399,9 +410,9 @@ function dial(endpoint: string, options: NexusVfsClientOptions): Dialled {
   if (options.tls) {
     const serverName = options.tls.serverName ?? DEFAULT_CLUSTER_SERVER_NAME
     credentials = grpc.credentials.createSsl(
-      readPem(options.tls.caPath, 'CA certificate'),
-      readPem(options.tls.keyPath, 'client key'),
-      readPem(options.tls.certPath, 'client certificate'),
+      resolvePem(options.tls.ca, 'CA certificate'),
+      resolvePem(options.tls.key, 'client key'),
+      resolvePem(options.tls.cert, 'client certificate'),
     )
     channelOptions['grpc.ssl_target_name_override'] = serverName
     channelOptions['grpc.default_authority'] = serverName
@@ -924,10 +935,17 @@ export class NexusZoneApiClient {
   }
 }
 
-function readPem(path: string, what: string): Buffer {
+/**
+ * Bytes pass through; a string is a path to read them from. A credential that
+ * was minted in memory therefore needs no temporary file, which is what lets
+ * `mintSessionAgent`'s promise that it never persists the key survive contact
+ * with a caller that wants to dial as that session.
+ */
+function resolvePem(material: NexusPem, what: string): Buffer {
+  if (Buffer.isBuffer(material)) return material
   try {
-    return readFileSync(path)
+    return readFileSync(material)
   } catch (error) {
-    throw new Error(`read nexus ${what} '${path}': ${(error as Error).message}`)
+    throw new Error(`read nexus ${what} '${material}': ${(error as Error).message}`)
   }
 }

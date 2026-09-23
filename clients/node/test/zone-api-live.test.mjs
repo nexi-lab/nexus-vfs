@@ -14,8 +14,7 @@
 // already ships. A test that could not operate the gate could not prove one.
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { X509Certificate } from 'node:crypto'
 
@@ -72,24 +71,20 @@ test(
   { skip: endpoint && tlsDir ? false : 'set NEXUS_ZONE_API_ENDPOINT and NEXUS_ZONE_API_TLS_DIR to run' },
   async (t) => {
     const admin = adminStub()
-    const workDir = mkdtempSync(join(tmpdir(), 'nexus-zone-api-live-'))
-    t.after(() => {
-      admin.close()
-      rmSync(workDir, { recursive: true, force: true })
-    })
+    t.after(() => admin.close())
 
     // An agent identity to act as: the allow-list names agents, so the caller
     // has to be one. A node cert would prove nothing — nodes administer.
     const minted = await adminCall(admin, 'MintAgent', { subject_id: AGENT, display_name: AGENT })
     assert.equal(minted.success, true, `MintAgent failed: ${minted.error}`)
-    const caPath = join(workDir, 'ca.pem')
-    const certPath = join(workDir, 'agent.pem')
-    const keyPath = join(workDir, 'agent-key.pem')
-    writeFileSync(caPath, minted.ca_pem)
-    writeFileSync(certPath, minted.agent_cert_pem)
-    writeFileSync(keyPath, minted.agent_key_pem)
-
-    const agent = NexusZoneApiClient.withMtls(endpoint, { caPath, certPath, keyPath })
+    // Dialled straight from the bytes the daemon returned. Nothing is written
+    // to disk: a minted credential that had to become a file first would make
+    // "this client never persists it" false for its only real use.
+    const agent = NexusZoneApiClient.withMtls(endpoint, {
+      ca: minted.ca_pem,
+      cert: minted.agent_cert_pem,
+      key: minted.agent_key_pem,
+    })
     t.after(() => agent.close())
 
     await t.test('the client exposes no way to administer the list', () => {

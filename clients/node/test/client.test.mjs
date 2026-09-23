@@ -32,11 +32,31 @@ test('withMtls reports which PEM file is missing', () => {
   assert.throws(
     () =>
       NexusVfsClient.withMtls('https://127.0.0.1:1', {
-        caPath: join(packageRoot, 'does-not-exist-ca.pem'),
-        certPath: join(packageRoot, 'does-not-exist-cert.pem'),
-        keyPath: join(packageRoot, 'does-not-exist-key.pem'),
+        ca: join(packageRoot, 'does-not-exist-ca.pem'),
+        cert: join(packageRoot, 'does-not-exist-cert.pem'),
+        key: join(packageRoot, 'does-not-exist-key.pem'),
       }),
     /read nexus CA certificate .*does-not-exist-ca\.pem/,
+  )
+})
+
+test('TLS material given as bytes is never read as a path', () => {
+  // A credential from `mintSessionAgent` arrives in memory and is meant to stay
+  // there, so bytes have to be used as bytes. These bytes are not a usable
+  // certificate and the call fails either way — what this pins down is WHERE:
+  // inside the TLS stack, never in a file read. Whether such material actually
+  // dials is the live test's job; it cannot be shown without a real CA.
+  const bytes = Buffer.from('not a certificate')
+  assert.throws(
+    () => NexusVfsClient.withMtls('https://127.0.0.1:1', { ca: bytes, cert: bytes, key: bytes }),
+    error => {
+      assert.doesNotMatch(
+        error.message,
+        /read nexus/,
+        `bytes were treated as a filename: ${error.message}`,
+      )
+      return true
+    },
   )
 })
 
