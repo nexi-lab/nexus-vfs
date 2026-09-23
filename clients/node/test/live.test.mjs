@@ -11,12 +11,12 @@ const endpoint = process.env.NEXUS_VFS_ENDPOINT
 const token = process.env.NEXUS_VFS_TOKEN ?? ''
 
 const connect = () => {
-  const { NEXUS_VFS_CA: caPath, NEXUS_VFS_CERT: certPath, NEXUS_VFS_KEY: keyPath } = process.env
-  if (caPath && certPath && keyPath) {
+  const { NEXUS_VFS_CA: ca, NEXUS_VFS_CERT: cert, NEXUS_VFS_KEY: key } = process.env
+  if (ca && cert && key) {
     return NexusVfsClient.withMtls(endpoint, {
-      caPath,
-      certPath,
-      keyPath,
+      ca,
+      cert,
+      key,
       serverName: process.env.NEXUS_VFS_SERVER_NAME,
     })
   }
