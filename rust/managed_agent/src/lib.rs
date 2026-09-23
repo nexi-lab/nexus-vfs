@@ -868,7 +868,12 @@ impl<K: KernelSyscall> RustService for ManagedAgentService<K> {
     /// Route the three session-lifecycle methods exposed over
     /// `NexusVFSService.Call`. Method names are versioned so the wire
     /// contract can evolve without breaking older sudowork clients.
-    fn dispatch(&self, method: &str, payload: &[u8]) -> Result<Vec<u8>, RustCallError> {
+    fn dispatch(
+        &self,
+        method: &str,
+        payload: &[u8],
+        _ctx: &contracts::OperationContext,
+    ) -> Result<Vec<u8>, RustCallError> {
         match method {
             "start_session_v1" => {
                 let req: StartSessionRequest = serde_json::from_slice(payload)
@@ -1213,6 +1218,15 @@ mod tests {
         use super::*;
         use serde_json::json;
 
+        /// A caller holding an ordinary credential: an agent cert with no
+        /// owner SAN, or an `sk-` key. The auth layer sets `agent_id` to the
+        /// same subject as `user_id` for an agent acting for itself (and
+        /// `None` for a person), so this is what every caller that predates
+        /// session certs looks like.
+        fn plain_caller() -> contracts::OperationContext {
+            contracts::OperationContext::new("moss", "root", false, Some("moss"), false)
+        }
+
         #[test]
         fn start_session_v1_round_trip() {
             let (_kernel, _table, svc) = fresh_service();
@@ -1225,7 +1239,7 @@ mod tests {
             })
             .to_string();
             let bytes = svc
-                .dispatch("start_session_v1", payload.as_bytes())
+                .dispatch("start_session_v1", payload.as_bytes(), &plain_caller())
                 .unwrap();
             let resp: StartSessionResponse = serde_json::from_slice(&bytes).unwrap();
             assert!(resp.session_id.starts_with("pid-"));
@@ -1240,7 +1254,7 @@ mod tests {
             let (_kernel, _table, svc) = fresh_service();
             let payload = json!({"agent_id": "scode-standard"}).to_string();
             let bytes = svc
-                .dispatch("start_session_v1", payload.as_bytes())
+                .dispatch("start_session_v1", payload.as_bytes(), &plain_caller())
                 .unwrap();
             let resp: StartSessionResponse = serde_json::from_slice(&bytes).unwrap();
             assert!(resp.session_id.starts_with("pid-"));
@@ -1251,7 +1265,9 @@ mod tests {
             let (_kernel, _table, svc) = fresh_service();
             let resp = svc.start_session(req("scode-standard")).unwrap();
             let payload = json!({"session_id": resp.session_id, "mode": "session"}).to_string();
-            let bytes = svc.dispatch("cancel_v1", payload.as_bytes()).unwrap();
+            let bytes = svc
+                .dispatch("cancel_v1", payload.as_bytes(), &plain_caller())
+                .unwrap();
             let cancel: CancelResponse = serde_json::from_slice(&bytes).unwrap();
             assert!(cancel.cancelled);
         }
@@ -1261,7 +1277,9 @@ mod tests {
             let (_kernel, _table, svc) = fresh_service();
             let resp = svc.start_session(req("scode-standard")).unwrap();
             let payload = json!({"session_id": resp.session_id, "mode": "turn"}).to_string();
-            let bytes = svc.dispatch("cancel_v1", payload.as_bytes()).unwrap();
+            let bytes = svc
+                .dispatch("cancel_v1", payload.as_bytes(), &plain_caller())
+                .unwrap();
             let cancel: CancelResponse = serde_json::from_slice(&bytes).unwrap();
             assert!(cancel.cancelled);
         }
@@ -1270,7 +1288,9 @@ mod tests {
         fn cancel_v1_unknown_session_surfaces_invalid_argument() {
             let (_kernel, _table, svc) = fresh_service();
             let payload = json!({"session_id": "pid-bogus", "mode": "session"}).to_string();
-            let err = svc.dispatch("cancel_v1", payload.as_bytes()).unwrap_err();
+            let err = svc
+                .dispatch("cancel_v1", payload.as_bytes(), &plain_caller())
+                .unwrap_err();
             assert!(matches!(err, RustCallError::InvalidArgument(_)));
         }
 
@@ -1279,7 +1299,9 @@ mod tests {
             let (_kernel, _table, svc) = fresh_service();
             let resp = svc.start_session(req("scode-standard")).unwrap();
             let payload = json!({"session_id": resp.session_id}).to_string();
-            let bytes = svc.dispatch("get_session_v1", payload.as_bytes()).unwrap();
+            let bytes = svc
+                .dispatch("get_session_v1", payload.as_bytes(), &plain_caller())
+                .unwrap();
             let snap: GetSessionResponse = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(snap.session_id, resp.session_id);
             assert_eq!(snap.state, "warming_up");
@@ -1288,7 +1310,9 @@ mod tests {
         #[test]
         fn unknown_method_returns_not_found() {
             let (_kernel, _table, svc) = fresh_service();
-            let err = svc.dispatch("does_not_exist", b"{}").unwrap_err();
+            let err = svc
+                .dispatch("does_not_exist", b"{}", &plain_caller())
+                .unwrap_err();
             assert!(matches!(err, RustCallError::NotFound));
         }
 
@@ -1296,7 +1320,7 @@ mod tests {
         fn malformed_payload_surfaces_invalid_argument() {
             let (_kernel, _table, svc) = fresh_service();
             let err = svc
-                .dispatch("start_session_v1", b"this is not json")
+                .dispatch("start_session_v1", b"this is not json", &plain_caller())
                 .unwrap_err();
             assert!(matches!(err, RustCallError::InvalidArgument(_)));
         }

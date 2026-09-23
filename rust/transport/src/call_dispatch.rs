@@ -39,7 +39,7 @@ fn unknown_method_message(method: &str) -> String {
 /// non-syscall control plane stays here.
 pub fn dispatch(
     kernel: &Arc<Kernel>,
-    _ctx: &OperationContext,
+    ctx: &OperationContext,
     method: &str,
     payload: &[u8],
 ) -> Result<Response<CallResponse>, Status> {
@@ -84,7 +84,7 @@ pub fn dispatch(
         // future service plugins.
         _ if method.contains('.') => {
             if let Some((svc_name, svc_method)) = method.split_once('.') {
-                match kernel.dispatch_rust_call(svc_name, svc_method, payload) {
+                match kernel.dispatch_rust_call(svc_name, svc_method, payload, ctx) {
                     Some(Ok(raw_bytes)) => {
                         // Plugin dispatch returns raw protobuf bytes — pass
                         // through without JSON wrapping.

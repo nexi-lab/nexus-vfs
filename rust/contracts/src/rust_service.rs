@@ -8,6 +8,7 @@
 //! `crate::service_registry::{RustService, RustCallError}` import
 //! sites keep compiling.
 
+use crate::operation_context::OperationContext;
 use std::error::Error;
 use std::fmt;
 
@@ -76,9 +77,23 @@ pub trait RustService: Send + Sync {
     /// and encode with `serde_json` and surface decode failures as
     /// `RustCallError::InvalidArgument`.
     ///
+    /// `ctx` is **who is calling**, resolved by the auth layer from the
+    /// credential they presented. It reaches here because a service that
+    /// takes an identity as a request field is taking the caller's word for
+    /// it: `start_session_v1` accepted an `owner_id` in its payload and had
+    /// no way to check it, so an agent could claim to act for anyone. Per
+    /// `OperationContext`, `user_id` is the principal and `agent_id` the
+    /// actor; they differ exactly when the caller holds a delegated
+    /// credential.
+    ///
     /// Default impl returns `NotFound` so services that do not yet
     /// expose any RPCs continue to compile.
-    fn dispatch(&self, _method: &str, _payload: &[u8]) -> Result<Vec<u8>, RustCallError> {
+    fn dispatch(
+        &self,
+        _method: &str,
+        _payload: &[u8],
+        _ctx: &OperationContext,
+    ) -> Result<Vec<u8>, RustCallError> {
         Err(RustCallError::NotFound)
     }
 

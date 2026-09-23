@@ -378,7 +378,20 @@ impl RustService for DylibRustService {
         &self.svc_name
     }
 
-    fn dispatch(&self, method: &str, payload: &[u8]) -> Result<Vec<u8>, RustCallError> {
+    /// The caller context stops here.
+    ///
+    /// A dylib is reached across the plugin C ABI, which carries method name
+    /// and payload bytes and nothing else. Passing identity to a plugin would
+    /// mean widening that ABI — a version bump, and every dylib in
+    /// `--plugin-dir` moving as one set with the daemon. No plugin needs it
+    /// today, so the ABI stays at v6 and this is the seam where identity is
+    /// dropped, stated rather than silent.
+    fn dispatch(
+        &self,
+        method: &str,
+        payload: &[u8],
+        _ctx: &contracts::operation_context::OperationContext,
+    ) -> Result<Vec<u8>, RustCallError> {
         let method_c = CString::new(method)
             .map_err(|_| RustCallError::InvalidArgument("method contains null byte".to_string()))?;
         let mut out_buf: *mut u8 = std::ptr::null_mut();

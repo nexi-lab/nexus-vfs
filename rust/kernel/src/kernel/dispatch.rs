@@ -576,6 +576,7 @@ impl Kernel {
         name: &str,
         method: &str,
         payload: &[u8],
+        ctx: &OperationContext,
     ) -> Option<Result<Vec<u8>, crate::service_registry::RustCallError>> {
         // Built-in kernel plugin management (§10). Handled before
         // ServiceRegistry lookup so plugin.* methods are always
@@ -584,7 +585,7 @@ impl Kernel {
             return Some(self.dispatch_plugin_call(method, payload));
         }
         let svc = self.service_registry.lookup_rust(name)?;
-        Some(svc.dispatch(method, payload))
+        Some(svc.dispatch(method, payload, ctx))
     }
 
     /// Handle `plugin.*` RPC methods — kernel-built-in, not a registered

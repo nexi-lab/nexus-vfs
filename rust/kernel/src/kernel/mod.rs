@@ -4229,13 +4229,23 @@ mod tests {
         use crate::service_registry::{RustCallError, RustService};
         use std::sync::Arc;
 
+        /// Any caller: these tests are about method routing, not identity.
+        fn caller() -> contracts::OperationContext {
+            contracts::OperationContext::new("test", "root", false, None, false)
+        }
+
         struct EchoService;
 
         impl RustService for EchoService {
             fn name(&self) -> &str {
                 "echo"
             }
-            fn dispatch(&self, method: &str, payload: &[u8]) -> Result<Vec<u8>, RustCallError> {
+            fn dispatch(
+                &self,
+                method: &str,
+                payload: &[u8],
+                _ctx: &contracts::OperationContext,
+            ) -> Result<Vec<u8>, RustCallError> {
                 match method {
                     "echo" => Ok(payload.to_vec()),
                     _ => Err(RustCallError::NotFound),
@@ -4246,7 +4256,9 @@ mod tests {
         #[test]
         fn returns_none_for_unknown_service() {
             let k = Kernel::new();
-            assert!(k.dispatch_rust_call("nope", "any", b"{}").is_none());
+            assert!(k
+                .dispatch_rust_call("nope", "any", b"{}", &caller())
+                .is_none());
         }
 
         #[test]
@@ -4256,7 +4268,9 @@ mod tests {
             // Python entries should fall through (None) — caller hands
             // off to the Python `dispatch_method` path.
             let k = Kernel::new();
-            assert!(k.dispatch_rust_call("auth_service", "any", b"{}").is_none());
+            assert!(k
+                .dispatch_rust_call("auth_service", "any", b"{}", &caller())
+                .is_none());
         }
 
         #[test]
@@ -4269,7 +4283,7 @@ mod tests {
             )
             .unwrap();
             let out = k
-                .dispatch_rust_call("echo", "echo", b"hello")
+                .dispatch_rust_call("echo", "echo", b"hello", &caller())
                 .unwrap()
                 .unwrap();
             assert_eq!(out, b"hello");
@@ -4285,7 +4299,7 @@ mod tests {
             )
             .unwrap();
             let err = k
-                .dispatch_rust_call("echo", "nope", b"{}")
+                .dispatch_rust_call("echo", "nope", b"{}", &caller())
                 .unwrap()
                 .unwrap_err();
             assert!(matches!(err, RustCallError::NotFound));

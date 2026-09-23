@@ -53,7 +53,12 @@ impl RustService for EchoDispatcher {
         "echo-test"
     }
 
-    fn dispatch(&self, method: &str, payload: &[u8]) -> Result<Vec<u8>, RustCallError> {
+    fn dispatch(
+        &self,
+        method: &str,
+        payload: &[u8],
+        _ctx: &contracts::OperationContext,
+    ) -> Result<Vec<u8>, RustCallError> {
         assert!(
             method.starts_with("/echo.v1.EchoService/"),
             "proxy must hand the full URL path to plugin dispatch, got {method:?}",
