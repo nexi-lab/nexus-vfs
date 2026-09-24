@@ -59,6 +59,25 @@
 //! after one suffix compare, which is what keeps a feature almost nobody
 //! uses off the path every write takes.
 //!
+//! ## Asking twice, and who owns the name
+//!
+//! Writing a prompt path again **asks again**. The previous answer is
+//! replaced, not appended to and not returned a second time — the same thing
+//! overwriting a file means everywhere else. It is not idempotent: two
+//! identical writes are two completions, and two bills.
+//!
+//! **The stem is the caller's concurrency key, and nothing here allocates
+//! it.** Two requests that may be in flight at once need two stems.
+//! `ask-42.prompt` and `ask-43.prompt` are independent; the same stem written
+//! twice in quick succession is one slot being reused, and the later ask wins
+//! it. That is a deliberate consequence of letting the caller name the pair
+//! rather than handing back a generated id: the names stay meaningful and
+//! greppable, and the cost is that uniqueness is the caller's to keep.
+//!
+//! This is worth stating because the failure it replaces was silent. Before,
+//! a repeat ask did nothing at all and left the first answer in place, so a
+//! caller polling `.reply` read a stale completion and had no way to tell.
+//!
 //! Both paths belong to the caller, who created one and named the other.
 //! Nothing here reaps them: a prompt is an ordinary file and a reply is an
 //! ordinary DT_STREAM, so they persist and are unlinked exactly like anything
@@ -142,6 +161,62 @@ pub const NAME: &str = "llm_mount";
 /// the reply is pumped from a spawned task long after `sys_write` returned.
 struct LlmMountHook {
     kernel: Arc<Kernel>,
+    /// One lock per reply path, held for a whole completion.
+    ///
+    /// Per path rather than one global lock because the lock is held across
+    /// the provider call: a global one would serialise every completion on
+    /// the daemon behind whichever mount is slowest.
+    ///
+    /// Entries are dropped once nobody holds them, so this does not grow a
+    /// row for every path the daemon has ever served.
+    slots: Arc<dashmap::DashMap<String, Arc<std::sync::Mutex<()>>>>,
+}
+
+impl LlmMountHook {
+    /// The lock that owns one reply path, for as long as an answer is being
+    /// written to it.
+    fn slot_for(&self, reply_path: &str) -> Arc<std::sync::Mutex<()>> {
+        self.slots
+            .entry(reply_path.to_string())
+            .or_insert_with(|| Arc::new(std::sync::Mutex::new(())))
+            .clone()
+    }
+}
+
+/// Drops a slot's map row when the last holder leaves, on every exit path
+/// including a panic — a row leaked here would pin a mutex forever.
+struct SlotRelease<'a> {
+    slots: &'a dashmap::DashMap<String, Arc<std::sync::Mutex<()>>>,
+    path: &'a str,
+}
+
+impl Drop for SlotRelease<'_> {
+    fn drop(&mut self) {
+        // Two strong refs at this point are the map's own and this task's, so
+        // that is the "nobody else is waiting" case.
+        self.slots
+            .remove_if(self.path, |_, m| Arc::strong_count(m) <= 2);
+    }
+}
+
+/// Make `reply_path` an empty, open stream ready for this answer, replacing
+/// any previous one. Call with the path's slot held.
+///
+/// Replacing is the whole point. `create_stream` refuses a path that already
+/// exists, so asking twice on one path used to log a warning and return: the
+/// second write succeeded, no completion ran, and the FIRST answer stayed on
+/// `.reply` for the caller to read as though it were the second. Silently
+/// serving a stale answer is the worst of the three behaviours this could
+/// have had, and it is what a test now forbids.
+fn open_reply_stream(kernel: &Arc<Kernel>, reply_path: &str) -> Result<(), String> {
+    if kernel.has_stream(reply_path) {
+        kernel
+            .destroy_stream(reply_path)
+            .map_err(|e| format!("destroying the previous reply: {e:?}"))?;
+    }
+    kernel
+        .create_stream(reply_path, REPLY_CAPACITY)
+        .map_err(|e| format!("creating the reply stream: {e:?}"))
 }
 
 impl NativeInterceptHook for LlmMountHook {
@@ -182,16 +257,6 @@ impl NativeInterceptHook for LlmMountHook {
             return;
         }
 
-        if let Err(e) = self.kernel.create_stream(&reply_path, REPLY_CAPACITY) {
-            tracing::warn!(
-                target: "nexus::llm_mount",
-                path = %reply_path,
-                error = ?e,
-                "llm: could not create the reply stream; no completion started"
-            );
-            return;
-        }
-
         // The sink carries the principal that wrote the request, so every reply
         // frame is attributed to whoever asked — not to the kernel, and not to
         // the mount. A hook inspecting the model's output is then deciding
@@ -206,7 +271,34 @@ impl NativeInterceptHook for LlmMountHook {
         // writer is not held for it either.
         let kernel = Arc::clone(&self.kernel);
         let request_path = w.path.clone();
+        // One completion at a time per reply path, and the slot is taken
+        // inside the task so the writer is never made to wait on a model.
+        //
+        // Held across the WHOLE completion, not just the stream reset. A lock
+        // around the reset alone is not enough and a test proved it: a second
+        // ask would reset the stream out from under a completion still
+        // appending to it, and the reader got a torn answer. Serialising here
+        // is what makes "asking twice replaces the first answer" true rather
+        // than merely likely.
+        let slot = self.slot_for(&reply_path);
+        let slots = Arc::clone(&self.slots);
         self.kernel.runtime().spawn_blocking(move || {
+            let _held = slot.lock().unwrap_or_else(|e| e.into_inner());
+            // Shed the map row once this was its last user, so `slots` tracks
+            // completions in flight rather than every path ever asked.
+            let _release = SlotRelease {
+                slots: &slots,
+                path: &reply_path,
+            };
+            if let Err(e) = open_reply_stream(&kernel, &reply_path) {
+                tracing::warn!(
+                    target: "nexus::llm_mount",
+                    path = %reply_path,
+                    error = %e,
+                    "llm: could not open the reply stream; no completion started"
+                );
+                return;
+            }
             let req = kernel::kernel::ReadRequest {
                 path: request_path,
                 offset: 0,
@@ -329,6 +421,7 @@ fn install(kernel: &Arc<Kernel>) -> Result<(), String> {
         &handle,
         Box::new(LlmMountHook {
             kernel: Arc::clone(kernel),
+            slots: Arc::new(dashmap::DashMap::new()),
         }),
     );
     Ok(())

@@ -32,16 +32,63 @@ const ASK: &str = "/llm/ask.prompt";
 /// Two token frames, a finish, usage, and `[DONE]` — the shape the OpenAI
 /// connector's own tests use, so this exercises the real SSE state machine.
 fn sse_body() -> String {
+    sse_body_saying("Hello")
+}
+
+/// The same frame sequence, saying `text` instead — so two calls can be told
+/// apart by what came back rather than by counting them.
+fn sse_body_saying(text: &str) -> String {
+    let (head, tail) = text.split_at(text.len() / 2);
     [
-        r#"data: {"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"Hel"}}]}"#,
-        r#"data: {"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"lo"}}]}"#,
-        r#"data: {"model":"gpt-4o","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
-        r#"data: {"model":"gpt-4o","usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}"#,
-        r#"data: [DONE]"#,
+        format!(r#"data: {{"model":"gpt-4o","choices":[{{"index":0,"delta":{{"content":"{head}"}}}}]}}"#),
+        format!(r#"data: {{"model":"gpt-4o","choices":[{{"index":0,"delta":{{"content":"{tail}"}}}}]}}"#),
+        r#"data: {"model":"gpt-4o","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#.to_string(),
+        r#"data: {"model":"gpt-4o","usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}"#.to_string(),
+        r#"data: [DONE]"#.to_string(),
     ]
     .iter()
     .map(|f| format!("{f}\n\n"))
     .collect()
+}
+
+/// Serve `bodies` to successive connections, one each, in order. Lets a single
+/// mount answer two asks differently, so a repeat can be told apart by what
+/// came back rather than by counting connections.
+fn serve_sequence(bodies: Vec<String>) -> (std::thread::JoinHandle<()>, String) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let handle = std::thread::spawn(move || {
+        let mut workers = Vec::new();
+        for body in bodies {
+            let Ok((mut sock, _)) = listener.accept() else {
+                break;
+            };
+            // Each connection is served on its OWN thread, so callers overlap.
+            // Answering them one after another would serialise the completions
+            // and silently defeat any test trying to race them — this mock
+            // began that way, and a concurrency test over it passed with the
+            // lock under test removed.
+            workers.push(std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let mut buf = vec![0u8; 8192];
+                let _ = sock.read(&mut buf);
+                // A beat before answering, so the racers are in flight
+                // together rather than finishing as fast as they arrive.
+                std::thread::sleep(std::time::Duration::from_millis(80));
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes());
+                let _ = sock.flush();
+            }));
+        }
+        for w in workers {
+            let _ = w.join();
+        }
+    });
+    (handle, url)
 }
 
 /// One-shot SSE server on loopback. Returns its base URL.
@@ -298,5 +345,93 @@ fn a_write_hook_can_refuse_the_models_reply() {
     assert!(
         !reply.contains("Hello"),
         "refused tokens must not be in the stream; got {reply:?}"
+    );
+}
+
+/// Writing the same prompt path again must ask again.
+///
+/// The FR reporter asked us to write down whether a repeat is a re-ask or an
+/// idempotent no-op. Checking rather than documenting the assumption found it
+/// was neither: `create_stream` refuses a path that already exists, so the
+/// hook logged a warning and returned. The caller's second write succeeded
+/// and nothing happened — leaving the FIRST answer on `.reply` to be read as
+/// if it were the second. Silently serving a stale answer is the worst of the
+/// three behaviours it could have had.
+#[test]
+fn asking_twice_replaces_the_first_answer() {
+    let (_srv, url) = serve_sequence(vec![
+        sse_body_saying("FIRSTFIRST"),
+        sse_body_saying("SECONDSECOND"),
+    ]);
+    let (kernel, _tmp) = kernel_with_llm_mount(&url);
+    let reply = reply_path_for(ASK).unwrap();
+
+    use kernel::kernel::convenience::KernelConvenience;
+    let req = br#"{"messages":[{"role":"user","content":"hi"}],"model":"gpt-4o"}"#;
+
+    kernel.write(ASK, &ctx(), req, 0).expect("first prompt");
+    let first = drain_reply(&kernel, &reply, Duration::from_secs(30));
+    assert!(first.starts_with("FIRSTFIRST"), "got {first:?}");
+
+    kernel.write(ASK, &ctx(), req, 0).expect("second prompt");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let now = kernel
+            .stream_collect_all(&reply)
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+            .unwrap_or_default();
+        if now.starts_with("SECONDSECOND") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the second ask never replaced the first answer; reply still reads {now:?}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Racing asks on ONE stem must still leave a usable reply stream.
+///
+/// The reset is a read-modify-write (destroy, then create). Unlocked, two
+/// racers can both destroy and then one create wins — the loser returns
+/// having done nothing, which is the silent no-op this work exists to remove,
+/// reappearing in exactly the case hardest to notice.
+///
+/// The assertion is deliberately about the stream being THERE and complete,
+/// not about which answer won: the later ask winning a reused slot is the
+/// documented contract, and pinning a winner would be pinning a race.
+#[test]
+fn racing_asks_on_one_stem_still_leave_a_complete_reply() {
+    const RACERS: usize = 6;
+    let (_srv, url) = serve_sequence((0..RACERS).map(|_| sse_body_saying("Hello")).collect());
+    let (kernel, _tmp) = kernel_with_llm_mount(&url);
+    let reply = reply_path_for(ASK).unwrap();
+
+    let mut hands = Vec::new();
+    for _ in 0..RACERS {
+        let k = Arc::clone(&kernel);
+        hands.push(std::thread::spawn(move || {
+            use kernel::kernel::convenience::KernelConvenience;
+            let _ = k.write(
+                ASK,
+                &ctx(),
+                br#"{"messages":[{"role":"user","content":"hi"}],"model":"gpt-4o"}"#,
+                0,
+            );
+        }));
+    }
+    for h in hands {
+        h.join().unwrap();
+    }
+
+    let got = drain_reply(&kernel, &reply, Duration::from_secs(30));
+    assert!(
+        got.contains("\"done\""),
+        "a complete answer must survive the race; got {got:?}"
+    );
+    assert!(
+        got.starts_with("Hello"),
+        "the surviving answer must not be a torn prefix; got {got:?}"
     );
 }

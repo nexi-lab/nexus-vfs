@@ -1764,6 +1764,7 @@ version = "0.1.0"
 dependencies = [
  "backends",
  "contracts",
+ "dashmap",
  "kernel",
  "serde_json",
  "tempfile",
