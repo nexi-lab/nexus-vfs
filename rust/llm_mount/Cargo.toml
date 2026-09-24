@@ -14,6 +14,8 @@ path = "src/lib.rs"
 kernel = { workspace = true }
 contracts = { workspace = true }
 tracing = "0.1"
+# Per-reply-path completion lock — see `LlmMountHook::slot_for`.
+dashmap = "6.1"
 
 [dev-dependencies]
 backends = { workspace = true, features = ["driver-openai"] }
