@@ -1,11 +1,11 @@
 //! Black-box E2E (acceptance 1, R5): a low-privilege authenticated caller
 //! cannot forge `owner_id` / `zone_id` through the generic `Call` surface —
 //! the boundary derives identity from the AUTH CONTEXT, not the payload —
-//! while the admin's legitimate path still passes.
+//! and a non-system admin cannot bypass the explicit zone-grant requirement.
 //!
 //! ApiKey posture (`NEXUS_API_KEY_SECRET` + `--no-tls`): a plain user key
-//! (`zone:rw`, NOT `--admin`) is the forger; an `--admin` key is the
-//! legitimate operator.
+//! (`zone:rw`, NOT `--admin`) is the forger; a zoneless `--admin` key is also
+//! non-system and therefore cannot manufacture root authority.
 
 mod common;
 
@@ -161,10 +161,7 @@ async fn payload_forgery_is_refused_at_the_boundary() {
         "the response must echo the effective zone"
     );
 
-    // ── Admin's legitimate path still passes ──
-    // (A zoneless admin key's effective zone is its context zone — the
-    // boundary derives everything from the auth context; an admin still
-    // cannot name a zone it holds no grant for, by design.)
+    // ── A zoneless non-system admin is not root authority ──
     let admin_reg = vfs
         .call(
             "agent_register",
@@ -173,8 +170,8 @@ async fn payload_forgery_is_refused_at_the_boundary() {
         )
         .await;
     assert!(
-        !admin_reg.is_error,
-        "the admin's own registration must pass: {}",
+        admin_reg.is_error,
+        "a zoneless non-system admin must be refused: {}",
         String::from_utf8_lossy(&admin_reg.payload)
     );
 
