@@ -61,6 +61,7 @@ tower = { version = "0.5", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
+managed-agent = { path = "../managed_agent" }
 rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
 # E2E: real tonic client round-trips a request through PluginProxyService.
 # tonic-prost provides ProstCodec for the raw unary path; prost emits the

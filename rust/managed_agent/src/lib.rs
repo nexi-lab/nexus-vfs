@@ -47,6 +47,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use contracts::{resolve_agent_owner, resolve_agent_zone, AgentContextError, OperationContext};
 use kernel::core::agents::registry::{
     AgentDescriptor, AgentKind, AgentRegistry, AgentState, RepoMount,
 };
@@ -693,6 +694,23 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
             reason: desc.reason.clone(),
         })
     }
+
+    fn authorize_session_owner(
+        &self,
+        ctx: &OperationContext,
+        session_id: &str,
+    ) -> Result<(), RustCallError> {
+        let desc = self.agent_registry.get(session_id).ok_or_else(|| {
+            RustCallError::InvalidArgument(format!("unknown session_id {session_id:?}"))
+        })?;
+        if desc.owner_id != ctx.user_id && !ctx.is_admin && !ctx.is_system {
+            return Err(RustCallError::PermissionDenied(
+                "managed-agent session operation requires ownership or administrator privileges"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 // Production install path stays specific to the concrete `Kernel`
@@ -862,6 +880,13 @@ impl From<ManagedAgentError> for RustCallError {
     }
 }
 
+fn map_agent_context_error(error: AgentContextError) -> RustCallError {
+    match error {
+        AgentContextError::InvalidArgument(message) => RustCallError::InvalidArgument(message),
+        AgentContextError::PermissionDenied(message) => RustCallError::PermissionDenied(message),
+    }
+}
+
 impl<K: KernelSyscall> RustService for ManagedAgentService<K> {
     fn name(&self) -> &str {
         Self::NAME
@@ -900,6 +925,55 @@ impl<K: KernelSyscall> RustService for ManagedAgentService<K> {
                     .map_err(|e| RustCallError::InvalidArgument(e.to_string()))?;
                 let resp = self.get_session(&req.session_id)?;
                 serde_json::to_vec(&resp).map_err(|e| RustCallError::Internal(e.to_string()))
+            }
+            _ => Err(RustCallError::NotFound),
+        }
+    }
+
+    fn dispatch_with_context(
+        &self,
+        ctx: &OperationContext,
+        method: &str,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, RustCallError> {
+        match method {
+            "start_session_v1" => {
+                let mut req: StartSessionRequest = serde_json::from_slice(payload)
+                    .map_err(|error| RustCallError::InvalidArgument(error.to_string()))?;
+                req.owner_id = resolve_agent_owner(
+                    ctx,
+                    (!req.owner_id.is_empty()).then_some(req.owner_id.as_str()),
+                )
+                .map_err(map_agent_context_error)?;
+                req.zone_id = resolve_agent_zone(
+                    ctx,
+                    (!req.zone_id.is_empty()).then_some(req.zone_id.as_str()),
+                )
+                .map_err(map_agent_context_error)?;
+                if !ctx.is_system {
+                    return Err(RustCallError::PermissionDenied(
+                        "verified cohost delegation unavailable".to_string(),
+                    ));
+                }
+                let resp = self.start_session(req)?;
+                serde_json::to_vec(&resp)
+                    .map_err(|error| RustCallError::Internal(error.to_string()))
+            }
+            "cancel_v1" => {
+                let req: CancelRequest = serde_json::from_slice(payload)
+                    .map_err(|error| RustCallError::InvalidArgument(error.to_string()))?;
+                self.authorize_session_owner(ctx, &req.session_id)?;
+                let resp = self.cancel(&req.session_id, req.mode)?;
+                serde_json::to_vec(&resp)
+                    .map_err(|error| RustCallError::Internal(error.to_string()))
+            }
+            "get_session_v1" => {
+                let req: GetSessionRequest = serde_json::from_slice(payload)
+                    .map_err(|error| RustCallError::InvalidArgument(error.to_string()))?;
+                self.authorize_session_owner(ctx, &req.session_id)?;
+                let resp = self.get_session(&req.session_id)?;
+                serde_json::to_vec(&resp)
+                    .map_err(|error| RustCallError::Internal(error.to_string()))
             }
             _ => Err(RustCallError::NotFound),
         }
@@ -1226,6 +1300,20 @@ mod tests {
         use super::*;
         use serde_json::json;
 
+        fn context(
+            user_id: &str,
+            is_admin: bool,
+            is_system: bool,
+            zones: &[&str],
+        ) -> OperationContext {
+            let mut ctx = OperationContext::new(user_id, "root", is_admin, None, is_system);
+            ctx.zone_perms = zones
+                .iter()
+                .map(|zone| ((*zone).to_string(), "rw".to_string()))
+                .collect();
+            ctx
+        }
+
         #[test]
         fn start_session_v1_round_trip() {
             let (_kernel, _table, svc) = fresh_service();
@@ -1312,6 +1400,101 @@ mod tests {
                 .dispatch("start_session_v1", b"this is not json")
                 .unwrap_err();
             assert!(matches!(err, RustCallError::InvalidArgument(_)));
+        }
+
+        #[test]
+        fn contextual_system_start_defaults_to_system_root() {
+            let (_kernel, table, svc) = fresh_service();
+            let payload = json!({"agent_id": "scode-standard"}).to_string();
+            let bytes = svc
+                .dispatch_with_context(
+                    &context("system", true, true, &[]),
+                    "start_session_v1",
+                    payload.as_bytes(),
+                )
+                .unwrap();
+            let resp: StartSessionResponse = serde_json::from_slice(&bytes).unwrap();
+            let desc = table.get(&resp.session_id).unwrap();
+            assert_eq!(desc.owner_id, "system");
+            assert_eq!(desc.zone_id, "root");
+        }
+
+        #[test]
+        fn contextual_non_system_start_is_denied_without_side_effects() {
+            let (_kernel, table, svc) = fresh_service();
+            let payload = json!({
+                "agent_id": "scode-standard",
+                "owner_id": "alice",
+                "zone_id": "alpha",
+            })
+            .to_string();
+            let err = svc
+                .dispatch_with_context(
+                    &context("alice", false, false, &["alpha"]),
+                    "start_session_v1",
+                    payload.as_bytes(),
+                )
+                .unwrap_err();
+            assert!(matches!(err, RustCallError::PermissionDenied(_)));
+            assert_eq!(table.count(), 0);
+        }
+
+        #[test]
+        fn multi_zone_routing_root_is_not_root_authority() {
+            let (_kernel, table, svc) = fresh_service();
+            let payload = json!({"agent_id": "scode-standard", "zone_id": "root"}).to_string();
+            let err = svc
+                .dispatch_with_context(
+                    &context("alice", false, false, &["alpha", "beta"]),
+                    "start_session_v1",
+                    payload.as_bytes(),
+                )
+                .unwrap_err();
+            assert!(matches!(err, RustCallError::PermissionDenied(_)));
+            assert_eq!(table.count(), 0);
+        }
+
+        #[test]
+        fn contextual_start_rejects_invalid_zone_shape() {
+            let (_kernel, table, svc) = fresh_service();
+            let payload = json!({"agent_id": "scode-standard", "zone_id": "bad/"}).to_string();
+            let err = svc
+                .dispatch_with_context(
+                    &context("system", true, true, &[]),
+                    "start_session_v1",
+                    payload.as_bytes(),
+                )
+                .unwrap_err();
+            assert!(matches!(err, RustCallError::InvalidArgument(_)));
+            assert_eq!(table.count(), 0);
+        }
+
+        #[test]
+        fn contextual_cancel_and_get_require_owner_or_admin() {
+            let (_kernel, table, svc) = fresh_service();
+            let resp = svc.start_session(req("scode-standard")).unwrap();
+            let get_payload = json!({"session_id": &resp.session_id}).to_string();
+            let cancel_payload =
+                json!({"session_id": &resp.session_id, "mode": "session"}).to_string();
+            let stranger = context("mallory", false, false, &[]);
+
+            assert!(matches!(
+                svc.dispatch_with_context(&stranger, "get_session_v1", get_payload.as_bytes()),
+                Err(RustCallError::PermissionDenied(_))
+            ));
+            assert!(matches!(
+                svc.dispatch_with_context(&stranger, "cancel_v1", cancel_payload.as_bytes()),
+                Err(RustCallError::PermissionDenied(_))
+            ));
+            assert!(table.get(&resp.session_id).is_some());
+
+            let admin = context("admin", true, false, &[]);
+            svc.dispatch_with_context(&admin, "get_session_v1", get_payload.as_bytes())
+                .unwrap();
+            let owner = context("ethan", false, false, &[]);
+            svc.dispatch_with_context(&owner, "cancel_v1", cancel_payload.as_bytes())
+                .unwrap();
+            assert!(table.get(&resp.session_id).is_none());
         }
     }
 

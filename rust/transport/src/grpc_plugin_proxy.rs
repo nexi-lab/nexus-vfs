@@ -116,6 +116,9 @@ impl Service<http::Request<axum::body::Body>> for PluginProxyService {
                 Ok(Err(RustCallError::InvalidArgument(msg))) => {
                     return Ok(grpc_trailer_only(tonic::Code::InvalidArgument, &msg));
                 }
+                Ok(Err(RustCallError::PermissionDenied(msg))) => {
+                    return Ok(grpc_trailer_only(tonic::Code::PermissionDenied, &msg));
+                }
                 Ok(Err(RustCallError::Internal(msg))) => {
                     return Ok(grpc_trailer_only(tonic::Code::Internal, &msg));
                 }

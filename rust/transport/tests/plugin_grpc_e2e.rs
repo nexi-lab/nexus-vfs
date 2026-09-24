@@ -69,16 +69,37 @@ impl RustService for EchoDispatcher {
     }
 }
 
+struct DeniedDispatcher;
+
+impl RustService for DeniedDispatcher {
+    fn name(&self) -> &str {
+        "denied-test"
+    }
+
+    fn dispatch(&self, _method: &str, _payload: &[u8]) -> Result<Vec<u8>, RustCallError> {
+        Err(RustCallError::PermissionDenied(
+            "denied by test policy".to_string(),
+        ))
+    }
+}
+
 #[tokio::test]
 async fn external_grpc_client_round_trips_through_plugin_proxy() {
     let _ = tracing_subscriber::fmt::try_init();
 
     // ── 1. Build Routes that mirror what the cluster does on boot ──
-    let endpoints = vec![PluginGrpcEndpoint {
-        service_name: "echo.v1.EchoService".to_string(),
-        plugin_name: "echo-test".to_string(),
-        service: Arc::new(EchoDispatcher),
-    }];
+    let endpoints = vec![
+        PluginGrpcEndpoint {
+            service_name: "echo.v1.EchoService".to_string(),
+            plugin_name: "echo-test".to_string(),
+            service: Arc::new(EchoDispatcher),
+        },
+        PluginGrpcEndpoint {
+            service_name: "deny.v1.DenyService".to_string(),
+            plugin_name: "denied-test".to_string(),
+            service: Arc::new(DeniedDispatcher),
+        },
+    ];
     let routes = extend_routes_with_plugin_endpoints(tonic::service::Routes::default(), endpoints);
 
     // ── 2. Serve on an ephemeral port ──────────────────────────────
@@ -130,6 +151,21 @@ async fn external_grpc_client_round_trips_through_plugin_proxy() {
         body.data, payload,
         "proto bytes must round-trip exactly through framing + plugin dispatch",
     );
+
+    let denied_path: http::uri::PathAndQuery =
+        "/deny.v1.DenyService/Deny".parse().expect("deny path");
+    let denied_codec: tonic_prost::ProstCodec<EchoMsg, EchoMsg> =
+        tonic_prost::ProstCodec::default();
+    grpc.ready().await.expect("ready for denied call");
+    let denied = grpc
+        .unary(
+            Request::new(EchoMsg { data: vec![] }),
+            denied_path,
+            denied_codec,
+        )
+        .await
+        .expect_err("permission denial must reach the gRPC client");
+    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
 
     server_handle.abort();
 }

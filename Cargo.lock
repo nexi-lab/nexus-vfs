@@ -3670,6 +3670,7 @@ dependencies = [
  "http-body-util",
  "kernel",
  "lib",
+ "managed-agent",
  "parking_lot",
  "pem",
  "prost",

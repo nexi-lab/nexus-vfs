@@ -26,6 +26,8 @@ pub enum RustCallError {
     InvalidArgument(String),
     /// Service-internal failure (state corruption, downstream IO error).
     Internal(String),
+    /// The authenticated caller is not authorized for this operation.
+    PermissionDenied(String),
 }
 
 impl fmt::Display for RustCallError {
@@ -34,6 +36,7 @@ impl fmt::Display for RustCallError {
             Self::NotFound => write!(f, "method not found"),
             Self::InvalidArgument(m) => write!(f, "invalid argument: {m}"),
             Self::Internal(m) => write!(f, "internal: {m}"),
+            Self::PermissionDenied(m) => write!(f, "permission denied: {m}"),
         }
     }
 }

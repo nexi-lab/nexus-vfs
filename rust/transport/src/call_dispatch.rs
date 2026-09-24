@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use contracts::{validate_zone_id_for, ZoneIdUse};
+use contracts::{resolve_agent_owner, resolve_agent_zone, AgentContextError, RustCallError};
 use kernel::core::agents::registry::{
     AgentDescriptor, AgentError, AgentKind, AgentSignal, AgentState, ExternalProcessInfo,
 };
@@ -93,6 +93,9 @@ pub fn dispatch(
                             payload: raw_bytes,
                             is_error: false,
                         }));
+                    }
+                    Some(Err(RustCallError::PermissionDenied(message))) => {
+                        Err(permission_err(&message))
                     }
                     Some(Err(e)) => Err(call_err(
                         RpcErrorCode::InternalError,
@@ -187,25 +190,21 @@ fn permission_err(message: &str) -> Vec<u8> {
     call_err(RpcErrorCode::PermissionError, message)
 }
 
+fn agent_context_err(error: AgentContextError) -> Vec<u8> {
+    match error {
+        AgentContextError::InvalidArgument(message) => {
+            call_err(RpcErrorCode::ValidationError, &message)
+        }
+        AgentContextError::PermissionDenied(message) => permission_err(&message),
+    }
+}
+
 fn effective_agent_owner(
     ctx: &OperationContext,
     params: &serde_json::Value,
 ) -> Result<String, Vec<u8>> {
     let requested = opt_s(params, "owner_id");
-    if !ctx.is_system
-        && requested
-            .as_deref()
-            .is_some_and(|owner| owner != ctx.user_id)
-    {
-        return Err(permission_err(
-            "agent owner_id must match the authenticated caller",
-        ));
-    }
-    Ok(if ctx.is_system {
-        requested.unwrap_or_else(|| ctx.user_id.clone())
-    } else {
-        ctx.user_id.clone()
-    })
+    resolve_agent_owner(ctx, requested.as_deref()).map_err(agent_context_err)
 }
 
 fn effective_agent_zone(
@@ -213,23 +212,7 @@ fn effective_agent_zone(
     params: &serde_json::Value,
 ) -> Result<String, Vec<u8>> {
     let requested = opt_s(params, "zone_id");
-    let zone_id = requested.unwrap_or_else(|| ctx.zone_id.clone());
-    let allowed = ctx.is_system
-        || zone_id == ctx.zone_id
-        || ctx.context_zone_id.as_deref() == Some(zone_id.as_str())
-        || ctx.zone_perms.iter().any(|(zone, _)| zone == &zone_id);
-    if !allowed {
-        return Err(permission_err(
-            "agent zone_id is not granted to the authenticated caller",
-        ));
-    }
-    validate_zone_id_for(ZoneIdUse::ExistingRef, &zone_id).map_err(|error| {
-        call_err(
-            RpcErrorCode::ValidationError,
-            &format!("invalid agent zone_id: {error}"),
-        )
-    })?;
-    Ok(zone_id)
+    resolve_agent_zone(ctx, requested.as_deref()).map_err(agent_context_err)
 }
 
 fn authorize_agent_owner(
