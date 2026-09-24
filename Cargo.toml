@@ -57,6 +57,18 @@ members = [
     "rust/permission",
     # Plugin ABI — stable C ABI contract for dylib plugins.
     "rust/plugin-abi",
+    # ── nexus-hosted service crates relocated here (2026-09-24) ──
+    #
+    # Previously in nexus repo under `rust/services/`.  Moved so the
+    # search + federated-dispatcher + HTTP surface stack SSOTs from
+    # the same repo as the daemon binary (`nexusd-cluster` in
+    # `profiles/cluster`) that loads them.  All four crates are OPT-IN
+    # via Cargo features on `profiles/cluster` (see the `http-api`
+    # feature there) — the default slim build size is unchanged.
+    "rust/search-common",
+    "rust/federated-search",
+    "rust/rebac",
+    "rust/http-api",
     # Deployment binaries.
     "rust/profiles/cluster",
     # `full` = cluster + the S3/R2 object-store driver. Kept separate from
