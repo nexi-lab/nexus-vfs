@@ -1944,18 +1944,55 @@ impl Kernel {
             _ => {}
         }
 
-        // 5. Destination conflict check — full VFS path (R20.3 contract)
-        let new_exists = self
-            .with_metastore(&new_route.mount_point, |ms| {
-                ms.exists(new_path).unwrap_or(false)
-            })
-            .unwrap_or(false);
-        if new_exists {
-            release_locks(&self.lock_manager, lock1, lock2);
-            return Err(KernelError::FileExists(format!(
-                "Destination path already exists: {}",
-                new_path
-            )));
+        // 5. Destination handling — full VFS path (R20.3 addressing convention).
+        //
+        // `rename(2)` replaces an existing destination atomically, and that
+        // guarantee is the reason programs use rename at all: write to a temp
+        // name, then rename over the target, and a reader sees either the whole
+        // old file or the whole new one even if the writer dies mid-way. git,
+        // every editor, and every package manager update files this way.
+        // Refusing the replace outright made the mount unusable for all of them
+        // — `git init` cannot write its own config (nexus#4830).
+        //
+        // Replacement is only allowed where it is actually atomic and leaves no
+        // orphans. File over file is: the PAS backend's own rename replaces the
+        // bytes atomically, and the metastore rewrite is one redb transaction
+        // whose `insert` overwrites. Anything involving a directory is refused
+        // with the errno POSIX specifies, because a directory's children live
+        // under its key prefix and replacing it would strand every one of them.
+        let new_meta = self
+            .with_metastore(&new_route.mount_point, |ms| ms.get(new_path).ok().flatten())
+            .flatten();
+        let new_is_dir = match &new_meta {
+            Some(m) => m.entry_type == DT_DIR,
+            None => self
+                .with_metastore(&new_route.mount_point, |ms| {
+                    let prefix = format!("{}/", new_path.trim_end_matches('/'));
+                    ms.list(&prefix).map(|v| !v.is_empty()).unwrap_or(false)
+                })
+                .unwrap_or(false),
+        };
+        let replacing = new_meta.is_some() || new_is_dir;
+
+        if replacing {
+            let refusal = if is_directory && !new_is_dir {
+                Some("cannot rename a directory over a file")
+            } else if !is_directory && new_is_dir {
+                Some("cannot rename a file over a directory")
+            } else if is_directory && new_is_dir {
+                // POSIX permits this when the destination is empty. Telling
+                // "empty" from "has children" costs a scan, and no caller needs
+                // it yet — so it is refused rather than half-implemented.
+                Some("cannot replace a directory")
+            } else {
+                None
+            };
+            if let Some(why) = refusal {
+                release_locks(&self.lock_manager, lock1, lock2);
+                return Err(KernelError::FileExists(format!(
+                    "sys_rename: {why}: {new_path}"
+                )));
+            }
         }
 
         // 6. Rename — cross-mount vs same-mount
