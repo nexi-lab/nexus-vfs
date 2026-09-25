@@ -69,6 +69,14 @@ members = [
     "rust/federated-search",
     "rust/rebac",
     "rust/http-api",
+    # nexus-search-plugin — the cdylib the daemon dlopen's via
+    # `--plugin-dir`.  Relocated from `nexus/rust/services/search-plugin/`
+    # 2026-09-25 so search-common's tonic PeerChannelCache resolves
+    # through a workspace path instead of a nexus-vfs git-dep, and the
+    # plugin ships alongside the daemon that loads it.  Its `search.proto`
+    # was already the SSOT here at `rust/proto/nexus/search/v1/search.proto`
+    # (moved in nexus-vfs#319); build.rs reads it via `../proto/...`.
+    "rust/search-plugin",
     # Deployment binaries.
     "rust/profiles/cluster",
     # `full` = cluster + the S3/R2 object-store driver. Kept separate from
