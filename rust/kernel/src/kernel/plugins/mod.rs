@@ -245,6 +245,7 @@ unsafe extern "C" fn kernel_cb_sys_write(
     path: *const std::ffi::c_char,
     data: *const u8,
     data_len: usize,
+    offset: u64,
 ) -> i32 {
     let kernel = &*(kernel as *const Kernel);
     let path = match std::ffi::CStr::from_ptr(path).to_str() {
@@ -260,7 +261,7 @@ unsafe extern "C" fn kernel_cb_sys_write(
     let req = crate::kernel::WriteRequest {
         path: path.to_string(),
         content,
-        offset: 0,
+        offset,
     };
     let results = kernel.sys_write(&[req], &ctx);
     match results.into_iter().next() {

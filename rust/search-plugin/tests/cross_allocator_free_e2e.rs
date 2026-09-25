@@ -186,7 +186,13 @@ unsafe extern "C" fn host_sys_stat(
 }
 
 // grep never invokes these — poison to -1 so a stray call fails loud.
-unsafe extern "C" fn stub_write(_: *const c_void, _: *const c_char, _: *const u8, _: usize) -> i32 {
+unsafe extern "C" fn stub_write(
+    _: *const c_void,
+    _: *const c_char,
+    _: *const u8,
+    _: usize,
+    _: u64,
+) -> i32 {
     -1
 }
 unsafe extern "C" fn stub_path(_: *const c_void, _: *const c_char) -> i32 {
