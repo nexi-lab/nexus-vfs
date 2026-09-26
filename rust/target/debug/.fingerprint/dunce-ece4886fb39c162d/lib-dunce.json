@@ -1,1 +1,0 @@
-{"rustc":8323788817864214825,"features":"[]","declared_features":"[]","target":2507403751003635712,"profile":8805429286780026797,"path":6677488513684486480,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug\\.fingerprint\\dunce-ece4886fb39c162d\\dep-lib-dunce","checksum":false}}],"rustflags":["-C","target-feature=+crt-static"],"config":97754693633927944,"compile_kind":0}

@@ -57,3 +57,27 @@ jobs:
             exit 1
           fi
           echo "Repo boundary OK — no service-tier paths present."
+
+      - name: Forbid tracked build artifacts
+        run: |
+          set -e
+          # `.gitignore` had only `/target/`, anchored at the repo root. A
+          # cargo run from inside a subdirectory produced `rust/target/`,
+          # which that pattern does not match, and 8,493 artifact files were
+          # committed before anyone noticed — 9.7 MB of .o / .rmeta / .pdb
+          # that every clone then carried and every branch then diffed.
+          #
+          # Cheap to check, and the failure it prevents is one nobody looks
+          # for: a green PR that happens to add a build directory.
+          tracked=$(git ls-files | grep -E '(^|/)target/' || true)
+          if [ -n "$tracked" ]; then
+            count=$(echo "$tracked" | wc -l)
+            echo "::error::$count build-artifact files are tracked under a target/ directory."
+            echo "$tracked" | head -10
+            echo "..."
+            echo "Build output must not be committed. Fix with:"
+            echo "  git rm -r --cached <the target dir>"
+            echo "and make sure .gitignore covers it (an unanchored 'target/' does)."
+            exit 1
+          fi
+          echo "No tracked build artifacts."

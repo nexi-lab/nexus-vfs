@@ -1,1 +1,5 @@
 /target/
+# Any nested build dir too: `/target/` is anchored at the repo root, so a
+# stray `cargo` run from inside a subdirectory produced `rust/target/` and
+# 8,493 artifact files were committed before anyone noticed.
+target/

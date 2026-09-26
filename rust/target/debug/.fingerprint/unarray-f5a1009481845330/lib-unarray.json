@@ -1,1 +1,0 @@
-{"rustc":8323788817864214825,"features":"[]","declared_features":"[]","target":229427725475139140,"profile":11134287388994030518,"path":10132782643291877642,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug\\.fingerprint\\unarray-f5a1009481845330\\dep-lib-unarray","checksum":false}}],"rustflags":["-C","target-feature=+crt-static"],"config":97754693633927944,"compile_kind":0}
