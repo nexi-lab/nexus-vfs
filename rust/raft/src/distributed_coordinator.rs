@@ -854,7 +854,17 @@ fn create_founder_zone(
         self_address = %self_address,
         bootstrap_new,
         peers_empty,
-        "founder path — creating 1-voter zone. Other nodes JoinZone here.",
+        // Deliberately NOT "other nodes JoinZone here", which is what this said and
+        // what sent an operator hunting: a joiner cannot find this zone by being
+        // pointed at this node. `DiscoverZones` answers with the root zone's DT_MOUNT
+        // entries, so what a peer can discover is whatever is MOUNTED — never this
+        // founding itself. What this node ends up publishing is reported once at the
+        // convergence gate (`report_published_federation_zones`), where the count is
+        // final; saying anything prescriptive here would be a guess about flags whose
+        // effects land later in boot.
+        "founder path — creating 1-voter zone. Founding a zone does not publish it: \
+         what a peer discovers is what is MOUNTED in the root zone, reported at the \
+         end of boot.",
     );
     // Founder self-registration: encode `{node_id}@{self_address}` so
     // `ZoneManager::create_zone`'s round-trip through

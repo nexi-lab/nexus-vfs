@@ -23,8 +23,79 @@
 //!
 //! The `KernelSyscall` contract is "callable from any thread" (see
 //! `kernel/src/kernel/syscall.rs`); this module is what makes that true.
+//!
+//! The same asymmetry applies at the *end* of a runtime's life — dropping one is
+//! legal from a sync caller and panics from an async one — so [`OwnedRuntime`] lives
+//! here too, next to the rules it belongs with.
 
-use tokio::runtime::{Builder, Handle, RuntimeFlavor};
+use tokio::runtime::{Builder, Handle, Runtime, RuntimeFlavor};
+
+/// An owned `Runtime` that is safe to drop from **any** context, including while
+/// unwinding out of an async fn.
+///
+/// The mirror image of the hazard above, and the one that is easy to miss: a plain
+/// `Runtime` drop blocks until every spawned task exits, and tokio refuses to block
+/// on a worker thread — the drop panics with "Cannot drop a runtime in a context
+/// where blocking is not allowed". `shutdown_background()` is the escape hatch, but
+/// it has to be reached on *every* path out, and the paths that forget are the error
+/// paths: a `Drop` impl written by hand only ever sees a fully-constructed value,
+/// while a `?` between "runtime built" and "value returned" drops the bare runtime
+/// mid-unwind. The panic then replaces the error, so the operator reads a tokio
+/// backtrace instead of "another process has this data dir open".
+///
+/// Owning the runtime in a value whose `Drop` decides makes those paths correct for
+/// free, which is why a fallible constructor should hold this type from the moment it
+/// builds a runtime rather than at the point it succeeds.
+///
+/// Deliberately not `Clone` and not constructible from a `Handle`: this is the type
+/// for the one owner that must shut a runtime down. Everything else passes
+/// `Handle`s, which are cheap to drop anywhere.
+pub struct OwnedRuntime(Option<Runtime>);
+
+impl OwnedRuntime {
+    /// Take ownership of a runtime, so the drop rule applies from here on.
+    pub fn new(runtime: Runtime) -> Self {
+        Self(Some(runtime))
+    }
+
+    /// The runtime — `Some` for the whole lifetime, taken only by `Drop`.
+    pub fn get(&self) -> &Runtime {
+        self.0.as_ref().expect("runtime present until Drop")
+    }
+
+    /// Shorthand for `self.get().handle()`.
+    pub fn handle(&self) -> &Handle {
+        self.get().handle()
+    }
+}
+
+impl std::ops::Deref for OwnedRuntime {
+    type Target = Runtime;
+
+    fn deref(&self) -> &Runtime {
+        self.get()
+    }
+}
+
+impl From<Runtime> for OwnedRuntime {
+    fn from(runtime: Runtime) -> Self {
+        Self::new(runtime)
+    }
+}
+
+impl Drop for OwnedRuntime {
+    fn drop(&mut self) {
+        if let Some(rt) = self.0.take() {
+            // Inside another runtime the blocking shutdown is illegal, so cleanup is
+            // scheduled off-thread; with no ambient runtime, the natural blocking
+            // shutdown is what the caller wants (tasks finish before the process
+            // moves on).
+            if Handle::try_current().is_ok() {
+                rt.shutdown_background();
+            }
+        }
+    }
+}
 
 /// Dispatch a `block_on`-style closure correctly for the ambient runtime:
 ///
@@ -56,10 +127,17 @@ where
     }
 }
 
-/// Bridge a sync façade onto an **owned inner runtime** (`handle`) from any
-/// context — the future runs on `handle`'s runtime. Use when the future's async
+/// Bridge a sync façade onto an owned **multi-thread** inner runtime (`handle`) from
+/// any context — the future runs on `handle`'s runtime. Use when the future's async
 /// work depends on tasks driven by that specific runtime (raft consensus stores
 /// whose `propose` awaits the transport loop; the kernel peer-RPC transport).
+///
+/// The inner runtime must be multi-thread, because this drives the FUTURE and trusts
+/// that runtime's own workers to drive everything else — its IO and time drivers
+/// included. Handed a current-thread runtime's handle, the future is polled while the
+/// connect or timer it awaits is never polled by anyone, and the caller hangs rather
+/// than failing: `Runtime::block_on` from a blocking-legal thread is the way to drive
+/// one of those, since it drives the runtime and the future together.
 pub fn block_on_via<F>(handle: &Handle, fut: F) -> F::Output
 where
     F: std::future::Future + Send,
@@ -89,7 +167,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{block_on_portable, block_on_via};
+    use super::{block_on_portable, block_on_via, OwnedRuntime};
 
     fn inner() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_multi_thread()
@@ -135,6 +213,30 @@ mod tests {
     #[test]
     fn portable_no_ambient_runtime() {
         assert_eq!(block_on_portable(async { 40 + 2 }), 42);
+    }
+
+    // OwnedRuntime — the drop rule, in the context where a bare drop panics.
+    #[test]
+    fn owned_runtime_drops_inside_an_async_context() {
+        // The shape that panics with a bare `Runtime`: a fallible constructor that
+        // builds one and then returns `Err`, with an ambient runtime around it. What
+        // must survive is the error — the caller's reason, not a tokio backtrace.
+        fn fails_after_building_one() -> Result<OwnedRuntime, &'static str> {
+            let _rt = OwnedRuntime::new(inner());
+            Err("the reason the operator needs to see")
+        }
+        let outer = inner();
+        let reason = outer.block_on(async { fails_after_building_one().err() });
+        assert_eq!(reason, Some("the reason the operator needs to see"));
+    }
+
+    #[test]
+    fn owned_runtime_still_runs_work_and_drops_from_sync() {
+        let rt = OwnedRuntime::new(inner());
+        // Deref: an owner uses it exactly like the `Runtime` it wraps.
+        assert_eq!(rt.block_on(async { 40 + 2 }), 42);
+        assert_eq!(block_on_via(rt.handle(), async { 42 }), 42);
+        drop(rt); // no ambient runtime: the blocking shutdown, as intended
     }
 
     #[test]

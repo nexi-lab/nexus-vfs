@@ -77,6 +77,21 @@ pub enum StorageError {
     TreeNotFound(String),
 }
 
+impl StorageError {
+    /// Did this fail because another process holds the database?
+    ///
+    /// redb answers a second opener with `DatabaseAlreadyOpen`, and that is the only
+    /// open failure where the data is fine and the *process layout* is the problem.
+    /// Classified here, where the redb variant is still in hand, so no caller has to
+    /// know redb's wording.
+    pub fn is_data_dir_locked(&self) -> bool {
+        matches!(
+            self,
+            Self::Database(redb::DatabaseError::DatabaseAlreadyOpen)
+        )
+    }
+}
+
 pub type Result<T> = std::result::Result<T, StorageError>;
 
 /// Compute the successor of a byte prefix for range scans.

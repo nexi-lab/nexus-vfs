@@ -228,6 +228,24 @@ pub use lib::transport_primitives::{
 #[cfg(feature = "grpc")]
 pub type Result<T> = lib::transport_primitives::Result<T>;
 
+/// Open a zone's state-machine store, in the transport layer's error vocabulary.
+///
+/// Every zone opening — data node and witness alike — goes through here, so "another
+/// process holds this data dir" keeps its own error variant instead of collapsing into
+/// a generic connection failure at one call site and not the other. The conversion
+/// lives with the vocabulary it produces: storage classifies
+/// ([`crate::storage::StorageError::is_data_dir_locked`]), transport names.
+#[cfg(feature = "grpc")]
+pub(crate) fn open_zone_store(sm_path: std::path::PathBuf) -> Result<crate::storage::RedbStore> {
+    crate::storage::RedbStore::open(&sm_path).map_err(|e| {
+        if e.is_data_dir_locked() {
+            TransportError::DataDirLocked(sm_path.display().to_string())
+        } else {
+            TransportError::Connection(format!("Failed to open store: {e}"))
+        }
+    })
+}
+
 /// The transport peer address book for one zone — the dial addresses of the
 /// **other** nodes in the cluster.
 ///
