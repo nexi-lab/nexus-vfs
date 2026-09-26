@@ -91,16 +91,49 @@ pub fn install_managed_agent(kernel: &Arc<kernel::kernel::Kernel>) -> Result<(),
     ManagedAgentService::<kernel::kernel::Kernel>::install(kernel)
 }
 
+/// This service's canonical name, as it appears in a `ServiceDecl` and in the
+/// boot log.
+///
+/// Exported because an assembly that REPLACES this service — a co-host swapping
+/// the bodiless decl for one carrying a spawn provider — has to find it in the
+/// default list by name, and a name matched as a literal in another repository is
+/// a rename waiting to go unnoticed.
+pub const SERVICE_NAME: &str = "managed_agent";
+
 /// The managed-agent service as a boot declaration for
 /// [`kernel::kernel::Kernel::bring_up_services`] — the uniform path by
 /// which the assembly hands services to the kernel. Wraps
 /// [`install_managed_agent`], which wires the session lifecycle, the
 /// workspace/procfs hooks, and (on unix + `subprocess-host`) the raw ACP
 /// control-plane stream-tunnel spawner via `install_returning`.
+///
+/// No runtime body: `spawn` registers the agent and stamps its procfs subtree,
+/// and nothing turns that into a running loop. For a build that hosts one
+/// in-process, see [`service_decl_with_spawn`].
 pub fn service_decl() -> kernel::kernel::ServiceDecl {
     kernel::kernel::ServiceDecl {
-        name: "managed_agent".to_string(),
+        name: SERVICE_NAME.to_string(),
         install: Box::new(install_managed_agent),
+    }
+}
+
+/// The same service, installed WITH an in-process runtime body.
+///
+/// The sibling of [`service_decl`], here rather than at the call site because the
+/// pairing of this service's name with this service's install is the service's own
+/// knowledge: an assembly that hand-rolled the `ServiceDecl` would be spelling
+/// both, and a rename here would leave that copy compiling and wrong.
+///
+/// `spawn_provider` is what turns a `start_session` into a running agent —
+/// typically a thin adapter over a runtime crate (`sudocode`'s
+/// `SudoCodeSpawnAdapter`). It cannot live in this repo: the runtime crate depends
+/// on the kernel, so linking it here would be a cycle.
+pub fn service_decl_with_spawn(
+    spawn_provider: Arc<dyn SpawnTask<kernel::kernel::Kernel>>,
+) -> kernel::kernel::ServiceDecl {
+    kernel::kernel::ServiceDecl {
+        name: SERVICE_NAME.to_string(),
+        install: Box::new(move |kernel| install_managed_agent_with_spawn(kernel, spawn_provider)),
     }
 }
 
