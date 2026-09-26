@@ -1,0 +1,12 @@
+C:/Users/songym/cursor-projects/nexus-vfs/rust/target\debug\deps\half-10a4e20ed16140e7.d: C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\half-2.7.1\src\lib.rs C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\half-2.7.1\src\bfloat.rs C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\half-2.7.1\src\bfloat\convert.rs C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\half-2.7.1\src\binary16.rs C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\half-2.7.1\src\binary16\arch.rs C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\half-2.7.1\src\binary16\arch\x86.rs C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\half-2.7.1\src\leading_zeros.rs C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\half-2.7.1\src\slice.rs
+
+C:/Users/songym/cursor-projects/nexus-vfs/rust/target\debug\deps\libhalf-10a4e20ed16140e7.rmeta: C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\half-2.7.1\src\lib.rs C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\half-2.7.1\src\bfloat.rs C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\half-2.7.1\src\bfloat\convert.rs C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\half-2.7.1\src\binary16.rs C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\half-2.7.1\src\binary16\arch.rs C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\half-2.7.1\src\binary16\arch\x86.rs C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\half-2.7.1\src\leading_zeros.rs C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\half-2.7.1\src\slice.rs
+
+C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\half-2.7.1\src\lib.rs:
+C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\half-2.7.1\src\bfloat.rs:
+C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\half-2.7.1\src\bfloat\convert.rs:
+C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\half-2.7.1\src\binary16.rs:
+C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\half-2.7.1\src\binary16\arch.rs:
+C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\half-2.7.1\src\binary16\arch\x86.rs:
+C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\half-2.7.1\src\leading_zeros.rs:
+C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\half-2.7.1\src\slice.rs:

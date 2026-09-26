@@ -1,0 +1,1 @@
+cargo:rerun-if-changed=../proto/nexus/search/v1/search.proto

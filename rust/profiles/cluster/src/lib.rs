@@ -1017,7 +1017,7 @@ pub fn default_service_decls(ctx: &ServiceBootCtx) -> Vec<kernel::kernel::Servic
 /// what makes the production `nexusd-cluster` a complete agent host on its own,
 /// with no separate assembly binary.
 pub fn run() -> Result<()> {
-    run_with_services(|ctx| default_service_decls(ctx))
+    run_with_services(default_service_decls)
 }
 
 /// Cluster daemon entry, parameterised by the service set. Boots the
