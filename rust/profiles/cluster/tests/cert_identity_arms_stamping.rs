@@ -45,7 +45,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{cli, free_port, write_tls_bundle, Daemon, Vfs, LOG_FILTER};
+use common::{agent_credential, cli, free_port, write_tls_bundle, Daemon, Vfs, LOG_FILTER};
 use nexus_raft::transport::{generate_agent_cert, generate_join_token, generate_zone_ca};
 
 const ZONE: &str = "sharedzone";
@@ -139,8 +139,7 @@ async fn a_daemon_whose_only_credential_plane_is_mtls_still_stamps_from() {
     );
     assert!(ok, "agent mint failed: {err}");
     let bundle = std::path::PathBuf::from(bundle_dir.trim());
-    let agent_cert = std::fs::read(bundle.join("agent.pem")).expect("read agent.pem");
-    let agent_key = std::fs::read(bundle.join("agent-key.pem")).expect("read agent-key.pem");
+    let cred = agent_credential(&bundle);
 
     // ── 4. Become the out-of-band shape: CA cert + node cert, nothing else ──
     // Dropping the CA key is what makes this node a non-founder, so it does NOT
@@ -168,7 +167,7 @@ async fn a_daemon_whose_only_credential_plane_is_mtls_still_stamps_from() {
         .expect("the daemon serves");
 
     // ── 6. The agent writes a FORGED `from` over its genuine cert ───────────
-    let mut c = Vfs::connect_mtls(port, &ca, &agent_cert, &agent_key, BUDGET).await;
+    let mut c = Vfs::connect_as_agent(port, &cred, BUDGET).await;
     let (conv_dir, mailbox) = conversation(AGENT, "peer");
     c.mkdir(&format!("{MOUNT}{}", a2a::CONVERSATIONS_BASE), "")
         .await

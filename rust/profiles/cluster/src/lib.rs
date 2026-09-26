@@ -490,13 +490,21 @@ fn enroll_port_addr(host_port: &str) -> Result<String> {
 /// arm rather than three.
 #[derive(Debug, Subcommand)]
 enum AuthCmd {
-    /// Mint a key and print it. This is the only time it exists in the clear.
+    /// Mint a credential and print it. This is the only time it exists in the
+    /// clear.
+    ///
+    /// `--subject-type agent` prints a DIRECTORY; the other subject types print
+    /// an `sk-` token. That directory is the agent's whole credential: the client
+    /// cert and key it presents, the CA it trusts, and the TLS server name to
+    /// verify, described by a `credential.json` beside them. A client needs that
+    /// one path plus an endpoint — an agent cert authenticates on its own, so
+    /// there is no token to carry alongside it.
     Mint {
-        /// What the key authenticates: `user`, `agent`, or `service`.
+        /// What the credential authenticates: `user`, `agent`, or `service`.
         ///
-        /// `agent` is the one that matters for A2A: an agent key's subject
-        /// becomes the context's `agent_id`, which is the identity the mailbox
-        /// hook stamps into an envelope's `from`. Nothing else can author that
+        /// `agent` is the one that matters for A2A: an agent's subject becomes
+        /// the context's `agent_id`, which is the identity the mailbox hook
+        /// stamps into an envelope's `from`. Nothing else can author that
         /// agent's mail.
         #[arg(long, default_value = "agent")]
         subject_type: String,
@@ -4704,10 +4712,18 @@ fn parse_zone_grant(spec: &str) -> Result<(String, String)> {
     }
 }
 
-/// Write an agent's signed bundle (`agent.pem` / `agent-key.pem` / `ca.pem`)
-/// under `<data_dir>/agents/<subject_id>/` and return the directory. The one
-/// on-disk layout the local mint (`run_auth_action`) and the remote mint
-/// (`mint_agent_via_founder`) share — extracted so the two paths cannot drift.
+/// Write an agent's signed bundle under `<data_dir>/agents/<subject_id>/` and return
+/// the directory. The one on-disk layout the local mint (`run_auth_action`) and the
+/// remote mint (`mint_agent_via_founder`) share — extracted so the two paths cannot
+/// drift.
+///
+/// The bundle is a CREDENTIAL, not three files plus folklore: alongside the PEMs it
+/// carries the manifest naming them and the TLS server name to verify, so a client
+/// points at this directory and needs nothing else — no layout knowledge, no
+/// `nexus-node` literal of its own, and no second credential, since a verified agent
+/// cert authenticates on its own. See
+/// [`nexus_raft::transport::AgentCredential`], which defines that format for the
+/// clients that read it as well as for this writer.
 fn write_agent_bundle(
     data_dir: &std::path::Path,
     subject_id: &str,
@@ -4723,6 +4739,9 @@ fn write_agent_bundle(
         .with_context(|| format!("write {}/agent-key.pem", out_dir.display()))?;
     std::fs::write(out_dir.join("ca.pem"), ca_pem)
         .with_context(|| format!("write {}/ca.pem", out_dir.display()))?;
+    nexus_raft::transport::AgentCredential::for_bundle(subject_id)
+        .write_to(&out_dir)
+        .with_context(|| format!("write credential manifest in {}", out_dir.display()))?;
     Ok(out_dir)
 }
 
@@ -5373,7 +5392,10 @@ async fn mint_agent_via_founder(
                     out_dir.display()
                 );
                 eprintln!(
-                    "The agent presents agent.pem + agent-key.pem and trusts the server via ca.pem."
+                    "That directory IS the credential: it carries the cert, the key, \
+                     the CA and the TLS server name to verify, so a client needs only \
+                     this one path plus the endpoint to dial. An agent cert \
+                     authenticates on its own — no API key alongside it."
                 );
                 return Ok(());
             }
@@ -5809,16 +5831,17 @@ async fn crl_refresh_loop(
 /// every node drops the agent after its next CRL refresh. Runs on the founder,
 /// where the bundle was minted and the CA lives.
 fn revoke_agent_cert(data_dir: &std::path::Path, name: &str) -> Result<()> {
-    let cert_path = data_dir.join("agents").join(name).join("agent.pem");
-    let cert_pem = std::fs::read(&cert_path).with_context(|| {
-        format!(
-            "revoke agent {name}: read {} — revocation runs on the founder, where the cert \
-             bundle was minted",
-            cert_path.display()
-        )
-    })?;
+    let bundle = data_dir.join("agents").join(name);
+    let cert_pem = nexus_raft::transport::AgentCredential::load(&bundle)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "revoke agent {name}: {e} — revocation runs on the founder, where the \
+                 credential was minted"
+            )
+        })?
+        .cert_pem;
     let serial = nexus_raft::transport::serial_from_cert_pem(&cert_pem)
-        .map_err(|e| anyhow::anyhow!("read serial from {}: {e}", cert_path.display()))?;
+        .map_err(|e| anyhow::anyhow!("read the serial in the {name} credential: {e}"))?;
     let path = nexus_raft::transport::revoked_serials_path(data_dir);
     nexus_raft::transport::add_revoked_serial(&path, &serial)
         .map_err(|e| anyhow::anyhow!("record revoked serial: {e}"))?;
@@ -5935,7 +5958,10 @@ fn run_auth_action(
                     out_dir.display()
                 );
                 eprintln!(
-                    "The agent presents agent.pem + agent-key.pem and trusts the server via ca.pem."
+                    "That directory IS the credential: it carries the cert, the key, \
+                     the CA and the TLS server name to verify, so a client needs only \
+                     this one path plus the endpoint to dial. An agent cert \
+                     authenticates on its own — no API key alongside it."
                 );
                 return Ok(());
             }
