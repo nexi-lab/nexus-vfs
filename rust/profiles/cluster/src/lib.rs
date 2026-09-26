@@ -978,33 +978,46 @@ pub struct ServiceBootCtx {
 type BoxedServiceDeclsBuilder =
     Box<dyn FnOnce(&ServiceBootCtx) -> Vec<kernel::kernel::ServiceDecl> + Send>;
 
-/// Default cluster daemon entry — supplies the nexus-vfs-native service
-/// set: the A2A messaging substrate plus the managed-agent control plane
-/// (spawn/get/cancel + procfs/workspace hooks + the raw ACP-subprocess
-/// spawner). This is what makes the production `nexusd-cluster` a complete
-/// agent host on its own — no separate assembly binary. A co-host build that
-/// additionally links an in-process runtime (sudocode) calls
-/// [`run_with_services`] with a `managed_agent` decl carrying a `SpawnTask`
-/// provider instead (that link lives at the nexus binary edge).
-pub fn run() -> Result<()> {
-    run_with_services(|ctx| {
-        let services = vec![
-            a2a::service_decl(ctx.auth_armed),
-            managed_agent::service_decl(),
-        ];
-        // Present only in a `driver-ai` build. Without it an LLM mount can be
-        // created and will store a request, but nothing turns that write into
-        // a completion — so the driver ships with the connectors it drives,
-        // never separately. Shadowed rather than built `mut`, so the default
-        // build has no unused-mut to silence.
-        #[cfg(feature = "driver-ai")]
-        let services = {
-            let mut services = services;
-            services.push(llm_mount::service_decl());
-            services
-        };
+/// The nexus-vfs-native service set this daemon boots with: the A2A messaging
+/// substrate plus the managed-agent control plane (spawn/get/cancel + procfs /
+/// workspace hooks + the raw ACP-subprocess spawner), and the LLM-mount driver in
+/// a `driver-ai` build.
+///
+/// Public because a co-host build needs THIS set with one entry replaced — the
+/// managed-agent decl carrying a `SpawnTask` provider, so a spawn becomes an
+/// in-process runtime body (that link lives at a binary edge that can depend on
+/// both this crate and the runtime crate). Re-listing it there would be a copy of
+/// this list, and a copy drifts the moment a service is added here: the co-host
+/// would keep booting the old set while every test stayed green. Asking for the
+/// set and swapping a named entry keeps "the co-host is this daemon plus a runtime
+/// body" true in code instead of true by maintenance.
+///
+/// Ordered: `bring_up_services` installs in list order.
+#[must_use]
+pub fn default_service_decls(ctx: &ServiceBootCtx) -> Vec<kernel::kernel::ServiceDecl> {
+    let services = vec![
+        a2a::service_decl(ctx.auth_armed),
+        managed_agent::service_decl(),
+    ];
+    // Present only in a `driver-ai` build. Without it an LLM mount can be
+    // created and will store a request, but nothing turns that write into
+    // a completion — so the driver ships with the connectors it drives,
+    // never separately. Shadowed rather than built `mut`, so the default
+    // build has no unused-mut to silence.
+    #[cfg(feature = "driver-ai")]
+    let services = {
+        let mut services = services;
+        services.push(llm_mount::service_decl());
         services
-    })
+    };
+    services
+}
+
+/// Default cluster daemon entry — [`default_service_decls`], unmodified. This is
+/// what makes the production `nexusd-cluster` a complete agent host on its own,
+/// with no separate assembly binary.
+pub fn run() -> Result<()> {
+    run_with_services(default_service_decls)
 }
 
 /// Cluster daemon entry, parameterised by the service set. Boots the

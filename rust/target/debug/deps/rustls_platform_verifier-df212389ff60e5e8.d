@@ -1,0 +1,8 @@
+C:/Users/songym/cursor-projects/nexus-vfs/rust/target\debug\deps\rustls_platform_verifier-df212389ff60e5e8.d: C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rustls-platform-verifier-0.7.0\src\lib.rs C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rustls-platform-verifier-0.7.0\src\verification\mod.rs C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rustls-platform-verifier-0.7.0\src\verification\windows.rs C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rustls-platform-verifier-0.7.0\src\../README.md
+
+C:/Users/songym/cursor-projects/nexus-vfs/rust/target\debug\deps\librustls_platform_verifier-df212389ff60e5e8.rmeta: C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rustls-platform-verifier-0.7.0\src\lib.rs C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rustls-platform-verifier-0.7.0\src\verification\mod.rs C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rustls-platform-verifier-0.7.0\src\verification\windows.rs C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rustls-platform-verifier-0.7.0\src\../README.md
+
+C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rustls-platform-verifier-0.7.0\src\lib.rs:
+C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rustls-platform-verifier-0.7.0\src\verification\mod.rs:
+C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rustls-platform-verifier-0.7.0\src\verification\windows.rs:
+C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rustls-platform-verifier-0.7.0\src\../README.md:

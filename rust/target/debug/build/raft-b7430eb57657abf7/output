@@ -1,0 +1,4 @@
+cargo:rustc-cfg=has_protos
+cargo:rerun-if-changed=../../proto/nexus/raft/transport.proto
+cargo:rerun-if-changed=../../proto/nexus/raft/commands.proto
+cargo:rerun-if-changed=../../proto/nexus/core/metadata.proto

@@ -1,0 +1,11 @@
+C:/Users/songym/cursor-projects/nexus-vfs/rust/target\debug\deps\rusty_fork-fcc5ae1c8797cae6.d: C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rusty-fork-0.3.1\src\lib.rs C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rusty-fork-0.3.1\src\sugar.rs C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rusty-fork-0.3.1\src\fork_test.rs C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rusty-fork-0.3.1\src\error.rs C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rusty-fork-0.3.1\src\cmdline.rs C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rusty-fork-0.3.1\src\fork.rs C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rusty-fork-0.3.1\src\child_wrapper.rs
+
+C:/Users/songym/cursor-projects/nexus-vfs/rust/target\debug\deps\librusty_fork-fcc5ae1c8797cae6.rmeta: C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rusty-fork-0.3.1\src\lib.rs C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rusty-fork-0.3.1\src\sugar.rs C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rusty-fork-0.3.1\src\fork_test.rs C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rusty-fork-0.3.1\src\error.rs C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rusty-fork-0.3.1\src\cmdline.rs C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rusty-fork-0.3.1\src\fork.rs C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rusty-fork-0.3.1\src\child_wrapper.rs
+
+C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rusty-fork-0.3.1\src\lib.rs:
+C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rusty-fork-0.3.1\src\sugar.rs:
+C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rusty-fork-0.3.1\src\fork_test.rs:
+C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rusty-fork-0.3.1\src\error.rs:
+C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rusty-fork-0.3.1\src\cmdline.rs:
+C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rusty-fork-0.3.1\src\fork.rs:
+C:\Users\songym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rusty-fork-0.3.1\src\child_wrapper.rs:

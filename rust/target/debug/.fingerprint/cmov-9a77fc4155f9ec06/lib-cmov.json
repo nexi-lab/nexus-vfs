@@ -1,0 +1,1 @@
+{"rustc":8323788817864214825,"features":"[]","declared_features":"[]","target":7432811800008246249,"profile":14336173641693380027,"path":4087530889557360872,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug\\.fingerprint\\cmov-9a77fc4155f9ec06\\dep-lib-cmov","checksum":false}}],"rustflags":["-C","target-feature=+crt-static"],"config":97754693633927944,"compile_kind":0}
