@@ -1,1 +1,0 @@
-{"rustc":8323788817864214825,"features":"[]","declared_features":"[]","target":17886154901722686619,"profile":8805429286780026797,"path":7295037077979427146,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug\\.fingerprint\\heck-86635b7ceb214994\\dep-lib-heck","checksum":false}}],"rustflags":["-C","target-feature=+crt-static"],"config":97754693633927944,"compile_kind":0}

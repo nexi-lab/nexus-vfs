@@ -1,3 +1,0 @@
-cargo:rerun-if-changed=\\?\C:\Users\songym\cursor-projects\nexus-vfs\contracts\zone-id\spec.json
-cargo:rerun-if-changed=\\?\C:\Users\songym\cursor-projects\nexus-vfs\contracts\zone-path\spec.json
-cargo:rerun-if-changed=\\?\C:\Users\songym\cursor-projects\nexus-vfs\contracts\zone-path\cases.json
