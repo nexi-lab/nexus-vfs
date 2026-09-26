@@ -95,6 +95,7 @@ unsafe extern "C" fn unused_sys_write(
     _: *const c_char,
     _: *const u8,
     _: usize,
+    _: u64,
 ) -> i32 {
     -1
 }

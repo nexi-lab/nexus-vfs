@@ -640,6 +640,30 @@ impl MetaStore for LocalMetaStore {
                     to_rewrite.push((old_child, new_child, v.value().to_vec()));
                 }
             }
+            // The destination may already exist — `rename(2)` replaces it. The
+            // main-table `insert` below overwrites that row on its own, but the
+            // side-car entries do not: they are keyed `path\0k`, so the old
+            // destination's keys would survive under the new path and appear to
+            // belong to the file that replaced it. Purge them here, inside the
+            // same write transaction, so the replace stays atomic.
+            let stale_start = fm_composite_key(new_path, "");
+            let mut stale_end = new_path.to_string();
+            stale_end.push('\u{1}');
+            let mut stale_fm: Vec<String> = Vec::new();
+            {
+                let fm_probe = txn
+                    .open_table(FILE_METADATA_TABLE)
+                    .map_err(|e| MetaStoreError::IOError(format!("redb open fm table: {e}")))?;
+                let iter = fm_probe
+                    .range(stale_start.as_str()..stale_end.as_str())
+                    .map_err(|e| MetaStoreError::IOError(format!("redb fm range: {e}")))?;
+                for entry in iter {
+                    let (k, _) =
+                        entry.map_err(|e| MetaStoreError::IOError(format!("redb fm iter: {e}")))?;
+                    stale_fm.push(k.value().to_string());
+                }
+            }
+
             for (old_key, new_key, bytes) in &to_rewrite {
                 let mut meta = deserialize_metadata(bytes)?;
                 meta.path = new_key.clone();
@@ -660,6 +684,11 @@ impl MetaStore for LocalMetaStore {
             let mut fm_table = txn
                 .open_table(FILE_METADATA_TABLE)
                 .map_err(|e| MetaStoreError::IOError(format!("redb open fm table: {e}")))?;
+            for key in &stale_fm {
+                fm_table
+                    .remove(key.as_str())
+                    .map_err(|e| MetaStoreError::IOError(format!("redb fm purge: {e}")))?;
+            }
             let mut fm_to_rewrite: Vec<(String, String, Vec<u8>)> = Vec::new();
             for (old_key, new_key, _) in &to_rewrite {
                 let start = fm_composite_key(old_key, "");
@@ -700,6 +729,15 @@ impl MetaStore for LocalMetaStore {
         let old_prefix_for_cache = format!("{}/", old_path.trim_end_matches('/'));
         self.cache
             .retain(|k, _| !k.starts_with(&old_prefix_for_cache));
+        // And under the new name. This was unnecessary while a rename refused an
+        // existing destination — nothing could be cached at a path that was
+        // required not to exist. Now that a rename replaces, a stale row for the
+        // file that was replaced would be served in preference to the one that
+        // replaced it, which reads as the rename having silently not happened.
+        self.cache.remove(new_path);
+        let new_prefix_for_cache = format!("{}/", new_path.trim_end_matches('/'));
+        self.cache
+            .retain(|k, _| !k.starts_with(&new_prefix_for_cache));
         Ok(())
     }
 
@@ -960,6 +998,35 @@ mod tests {
         assert_eq!(
             ms.get_file_metadata("/new/child", "tag").unwrap(),
             Some("value".to_string())
+        );
+    }
+
+    #[test]
+    fn local_rename_path_replaces_an_existing_destination() {
+        // `rename(2)` replaces. The main-table insert overwrites on its own;
+        // this holds the part that does not — the destination's side-car
+        // entries, whose keys embed the path and would otherwise survive under
+        // the new path and look like they belong to the file that replaced it.
+        let (_td, ms) = fresh_local();
+        ms.put("/src", mk_meta("/src", 7)).unwrap();
+        ms.set_file_metadata("/src", "from_src", "yes".to_string())
+            .unwrap();
+        ms.put("/dst", mk_meta("/dst", 1)).unwrap();
+        ms.set_file_metadata("/dst", "from_dst", "stale".to_string())
+            .unwrap();
+
+        ms.rename_path("/src", "/dst", true).unwrap();
+
+        assert!(ms.get("/src").unwrap().is_none());
+        assert_eq!(ms.get("/dst").unwrap().unwrap().version, 7);
+        assert_eq!(
+            ms.get_file_metadata("/dst", "from_src").unwrap(),
+            Some("yes".to_string())
+        );
+        assert_eq!(
+            ms.get_file_metadata("/dst", "from_dst").unwrap(),
+            None,
+            "the replaced file's side-car entries must not survive under the new path"
         );
     }
 

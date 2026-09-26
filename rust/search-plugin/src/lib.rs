@@ -613,6 +613,7 @@ mod tests {
         _: *const c_char,
         _: *const u8,
         _: usize,
+        _: u64,
     ) -> i32 {
         -1
     }
