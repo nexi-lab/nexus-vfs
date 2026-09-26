@@ -49,26 +49,19 @@ async fn run() -> Result<(), String> {
 
     // Two modes by the credential:
     //  * `sk-...`  → token plane, plaintext loopback (the historical form).
-    //  * a bundle dir (`.../agents/{name}/` with agent.pem/agent-key.pem/ca.pem,
-    //    as `auth mint --subject-type agent` writes) → cert plane, mTLS.
-    //    The agent signs each send and verifies each collect with its cert.
+    //  * a credential directory, as `auth mint --subject-type agent` prints → cert
+    //    plane, mTLS. Everything the dial needs comes out of the credential, which
+    //    is the shape a client should copy: no filenames and no server name of its
+    //    own to keep in step with the mint. The agent signs each send and verifies
+    //    each collect with its cert.
     let cert_mode = !cred.starts_with("sk-");
     let (mut c, auth, agent) = if cert_mode {
-        let dir = std::path::Path::new(cred);
-        let name = dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or("cert bundle dir has no agent name")?
-            .to_string();
-        let cert =
-            std::fs::read(dir.join("agent.pem")).map_err(|e| format!("read agent.pem: {e}"))?;
-        let key = std::fs::read(dir.join("agent-key.pem"))
-            .map_err(|e| format!("read agent-key.pem: {e}"))?;
-        let ca = std::fs::read(dir.join("ca.pem")).map_err(|e| format!("read ca.pem: {e}"))?;
+        let loaded = lib::transport_primitives::AgentCredential::load(std::path::Path::new(cred))?;
+        let (name, cert, key, ca) = (loaded.agent, loaded.cert_pem, loaded.key_pem, loaded.ca_pem);
         let tls = ClientTlsConfig::new()
             .ca_certificate(Certificate::from_pem(&ca))
             .identity(Identity::from_pem(&cert, &key))
-            .domain_name(lib::transport_primitives::TlsConfig::CLUSTER_SERVER_NAME);
+            .domain_name(&loaded.server_name);
         let channel = Endpoint::from_shared(format!("https://127.0.0.1:{port}"))
             .map_err(|e| format!("endpoint: {e}"))?
             .tls_config(tls)

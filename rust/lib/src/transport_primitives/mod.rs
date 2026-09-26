@@ -7,6 +7,7 @@
 //! Lives under `lib` per §6 — `lib` is the tier-neutral implementation
 //! crate, mirror of `src/nexus/lib/`.
 
+mod agent_credential;
 pub mod authorship;
 mod channel;
 mod config;
@@ -19,6 +20,7 @@ mod pool;
 mod server_limits;
 mod tofu;
 
+pub use agent_credential::{AgentCredential, LoadedCredential, CREDENTIAL_MANIFEST};
 pub use channel::{create_channel, ensure_crypto_provider};
 pub use config::{ClientConfig, ServerConfig, TlsConfig};
 pub use error::{Result, TransportError};

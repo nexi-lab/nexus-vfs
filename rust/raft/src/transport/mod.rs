@@ -54,6 +54,11 @@ pub use certgen::{
 /// `lib::agent_identity`; this is a pass-through, not a second copy.
 #[cfg(all(feature = "grpc", has_protos))]
 pub use lib::agent_identity::session_agent_name;
+/// Re-exported for the same reason as [`session_agent_name`]: the mint that writes
+/// an agent bundle and the clients that read one both need the credential layout,
+/// and it has one definition in `lib::transport_primitives::agent_credential`.
+#[cfg(all(feature = "grpc", has_protos))]
+pub use lib::transport_primitives::{AgentCredential, LoadedCredential, CREDENTIAL_MANIFEST};
 #[cfg(all(feature = "grpc", has_protos))]
 pub(crate) mod crl;
 #[cfg(all(feature = "grpc", has_protos))]

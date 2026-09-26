@@ -29,8 +29,8 @@ mod common;
 use std::time::Duration;
 
 use common::{
-    free_port, free_port_pair, mint_agent_cert, mint_agent_cert_allow_existing, write_tls_bundle,
-    Daemon, Vfs, LOG_FILTER,
+    agent_credential, free_port, free_port_pair, mint_agent_cert, mint_agent_cert_allow_existing,
+    write_tls_bundle, Daemon, Vfs, LOG_FILTER,
 };
 use nexus_raft::transport::{generate_join_token, generate_zone_ca};
 
@@ -144,10 +144,8 @@ async fn a_revoked_agent_cert_is_rejected_on_a_peer_node_after_crl_refresh() {
     }
     let win_bundle = mint_agent_cert(&founder_env(&fdata, &fid, &fadv, &mounts), "win-ai");
     let mac_bundle = mint_agent_cert(&founder_env(&fdata, &fid, &fadv, &mounts), "mac-ai");
-    let win_cert = std::fs::read(win_bundle.join("agent.pem")).expect("win-ai cert");
-    let win_key = std::fs::read(win_bundle.join("agent-key.pem")).expect("win-ai key");
-    let mac_cert = std::fs::read(mac_bundle.join("agent.pem")).expect("mac-ai cert");
-    let mac_key = std::fs::read(mac_bundle.join("agent-key.pem")).expect("mac-ai key");
+    let win_cred = agent_credential(&win_bundle);
+    let mac_cred = agent_credential(&mac_bundle);
 
     let mut founder = Daemon::spawn(
         &["--bind-addr", &fbind],
@@ -170,7 +168,7 @@ async fn a_revoked_agent_cert_is_rejected_on_a_peer_node_after_crl_refresh() {
 
     // ── HEALTH: the mTLS federation actually replicates founder→joiner, so a
     // write to sharedzone on the joiner has quorum ──────────────────────────
-    let mut wc_f = Vfs::connect_mtls(fport, &ca, &win_cert, &win_key, BUDGET).await;
+    let mut wc_f = Vfs::connect_as_agent(fport, &win_cred, BUDGET).await;
     let health = format!("{MOUNT}/health.txt");
     wc_f.write_file(&health, b"ok", "")
         .await
@@ -178,7 +176,7 @@ async fn a_revoked_agent_cert_is_rejected_on_a_peer_node_after_crl_refresh() {
     let deadline = std::time::Instant::now() + BUDGET;
     let mut replicated = false;
     // Read the health file back through a joiner-side agent connection.
-    let mut probe = Vfs::connect_mtls(jport, &ca, &mac_cert, &mac_key, BUDGET).await;
+    let mut probe = Vfs::connect_as_agent(jport, &mac_cred, BUDGET).await;
     while std::time::Instant::now() < deadline {
         if probe.stat_found(&health, "").await {
             replicated = true;
@@ -192,8 +190,8 @@ async fn a_revoked_agent_cert_is_rejected_on_a_peer_node_after_crl_refresh() {
     );
 
     // ── 4. BEFORE: both agents write on the JOINER — resolved from the cert ──
-    let mut wc = Vfs::connect_mtls(jport, &ca, &win_cert, &win_key, BUDGET).await;
-    let mut mc = Vfs::connect_mtls(jport, &ca, &mac_cert, &mac_key, BUDGET).await;
+    let mut wc = Vfs::connect_as_agent(jport, &win_cred, BUDGET).await;
+    let mut mc = Vfs::connect_as_agent(jport, &mac_cred, BUDGET).await;
     let win_probe = format!("{MOUNT}/win-ai/probe.txt");
     let mac_probe = format!("{MOUNT}/mac-ai/probe.txt");
     wc.write_file(&win_probe, b"before", "")
@@ -230,8 +228,7 @@ async fn a_revoked_agent_cert_is_rejected_on_a_peer_node_after_crl_refresh() {
     drop(founder); // release the data-dir lock for the offline re-mint
     let win2_bundle =
         mint_agent_cert_allow_existing(&founder_env(&fdata, &fid, &fadv, &mounts), "win-ai");
-    let win2_cert = std::fs::read(win2_bundle.join("agent.pem")).expect("rotated win-ai cert");
-    let win2_key = std::fs::read(win2_bundle.join("agent-key.pem")).expect("rotated win-ai key");
+    let win2_cred = agent_credential(&win2_bundle);
     let mut founder = Daemon::spawn(
         &["--bind-addr", &fbind],
         &founder_env(&fdata, &fid, &fadv, &mounts),
@@ -240,7 +237,7 @@ async fn a_revoked_agent_cert_is_rejected_on_a_peer_node_after_crl_refresh() {
         .wait_for_log(&zone_registered, BUDGET)
         .await
         .expect("founder resumes after the rotation re-mint");
-    let mut wc2 = Vfs::connect_mtls(jport, &ca, &win2_cert, &win2_key, BUDGET).await;
+    let mut wc2 = Vfs::connect_as_agent(jport, &win2_cred, BUDGET).await;
     assert!(
         poll_write(&mut wc2, &win_probe, true).await,
         "the rotated win-ai cert works on the joiner — its fresh serial was never revoked"

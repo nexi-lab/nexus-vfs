@@ -18,6 +18,7 @@ use kernel::kernel::vfs_proto::{
     PingRequest, ReadRequest, ReaddirRequest, SetattrRequest, StatRequest, StreamReadAtRequest,
     StreamWriteRequest, WatchRequest, WriteRequest,
 };
+use lib::transport_primitives::{AgentCredential, LoadedCredential};
 use tonic::transport::Channel;
 
 pub const DT_STREAM: i32 = 4;
@@ -409,10 +410,23 @@ pub fn mint_token_key(
     key
 }
 
-/// Mint a cert-agent (`--subject-type agent`) and return its bundle directory
-/// (holding `agent.pem` / `agent-key.pem` / `ca.pem`). An agent's one credential
-/// is a CA-signed identity cert — [`Vfs::connect_mtls`] presents it. Needs the
-/// founder CA at `<data-dir>/tls`; the daemon must NOT hold the data-dir lock.
+/// Read a minted bundle as the ONE credential it is — the PEMs plus the TLS server
+/// name to verify — through the same loader a client outside this repo uses.
+///
+/// Tests go through this rather than reading `agent.pem` and friends by name, for the
+/// reason the credential format exists: a filename or a server name spelled a second
+/// time is a copy that can disagree with the mint. Because every mTLS test dials this
+/// way, a manifest that stopped matching what the mint writes fails the suite loudly
+/// instead of only failing the clients we do not test here.
+pub fn agent_credential(bundle_dir: &std::path::Path) -> LoadedCredential {
+    AgentCredential::load(bundle_dir)
+        .unwrap_or_else(|e| panic!("load the credential at {}: {e}", bundle_dir.display()))
+}
+
+/// Mint a cert-agent (`--subject-type agent`) and return its bundle directory — the
+/// whole credential (see [`agent_credential`]). An agent's one credential is a
+/// CA-signed identity cert; [`Vfs::connect_as_agent`] presents it. Needs the founder
+/// CA at `<data-dir>/tls`; the daemon must NOT hold the data-dir lock.
 pub fn mint_agent_cert(env: &[(&str, &str)], subject_id: &str) -> std::path::PathBuf {
     mint_agent_cert_args(env, subject_id, &[])
 }
@@ -572,12 +586,27 @@ impl Vfs {
         }
     }
 
-    /// Dial the mTLS plane presenting a client identity cert — an agent's
-    /// `agent.pem` / `agent-key.pem` bundle (as `auth mint --subject-type agent` writes),
-    /// chaining to `ca_pem`. The daemon authenticates the caller from the
-    /// client certificate (the peer plane), so calls carry an EMPTY token.
-    /// Polls until the TLS handshake + a bare `Ping` both succeed — the cert
-    /// authenticating IS the readiness gate.
+    /// Dial as an agent with its credential and NOTHING else — the shape a client
+    /// outside this repo has: one directory from `auth mint`, one endpoint.
+    ///
+    /// Every value comes from the credential, the server name included, so this
+    /// proves the manifest is sufficient rather than assuming it. Calls then carry an
+    /// EMPTY token, because a verified agent cert is the whole authentication.
+    pub async fn connect_as_agent(port: u16, cred: &LoadedCredential, budget: Duration) -> Self {
+        Self::connect_mtls_named(
+            port,
+            &cred.ca_pem,
+            &cred.cert_pem,
+            &cred.key_pem,
+            &cred.server_name,
+            budget,
+        )
+        .await
+    }
+
+    /// Dial the mTLS plane presenting a client identity cert chaining to `ca_pem`,
+    /// verifying the server as the cluster's fixed name. For a NODE cert or raw PEMs;
+    /// an agent has a credential, so it uses [`Self::connect_as_agent`].
     pub async fn connect_mtls(
         port: u16,
         ca_pem: &[u8],
@@ -585,11 +614,32 @@ impl Vfs {
         client_key_pem: &[u8],
         budget: Duration,
     ) -> Self {
+        Self::connect_mtls_named(
+            port,
+            ca_pem,
+            client_cert_pem,
+            client_key_pem,
+            lib::transport_primitives::TlsConfig::CLUSTER_SERVER_NAME,
+            budget,
+        )
+        .await
+    }
+
+    /// The one dial: polls until the TLS handshake AND a bare `Ping` both succeed —
+    /// the cert authenticating IS the readiness gate.
+    async fn connect_mtls_named(
+        port: u16,
+        ca_pem: &[u8],
+        client_cert_pem: &[u8],
+        client_key_pem: &[u8],
+        server_name: &str,
+        budget: Duration,
+    ) -> Self {
         use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
         let tls = ClientTlsConfig::new()
             .ca_certificate(Certificate::from_pem(ca_pem))
             .identity(Identity::from_pem(client_cert_pem, client_key_pem))
-            .domain_name(lib::transport_primitives::TlsConfig::CLUSTER_SERVER_NAME);
+            .domain_name(server_name);
         let deadline = Instant::now() + budget;
         loop {
             let connected = Endpoint::from_shared(format!("https://127.0.0.1:{port}"))

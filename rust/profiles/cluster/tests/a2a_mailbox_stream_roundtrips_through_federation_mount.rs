@@ -25,7 +25,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{cli, free_port, write_tls_bundle, Daemon, Vfs, LOG_FILTER};
+use common::{agent_credential, cli, free_port, write_tls_bundle, Daemon, Vfs, LOG_FILTER};
 use nexus_raft::transport::{generate_join_token, generate_zone_ca};
 
 const ZONE: &str = "sharedzone";
@@ -295,12 +295,10 @@ async fn cert_agent_plain_read_of_unprovisioned_inbox_through_federation_mount()
         );
         assert!(ok, "agent cert mint failed for {id}: {err}");
         let b = std::path::PathBuf::from(dir.trim());
-        let cert = std::fs::read(b.join("agent.pem")).expect("agent.pem");
-        let key = std::fs::read(b.join("agent-key.pem")).expect("agent-key.pem");
-        (cert, key)
+        agent_credential(&b)
     };
-    let (mac_cert, mac_key) = mint_agent("mac-ai");
-    let (win_cert, win_key) = mint_agent("win-ai");
+    let mac_cred = mint_agent("mac-ai");
+    let win_cred = mint_agent("win-ai");
 
     let mut founder = Daemon::spawn(&["--bind-addr", &bind], &env);
     founder
@@ -312,13 +310,13 @@ async fn cert_agent_plain_read_of_unprovisioned_inbox_through_federation_mount()
 
     // win-ai (non-admin cert) seeds mac-ai's inbox with a PLAIN write — the
     // inbox is NOT provisioned as a stream (nobody provisions it in prod).
-    let mut win = Vfs::connect_mtls(port, &ca, &win_cert, &win_key, BUDGET).await;
+    let mut win = Vfs::connect_as_agent(port, &win_cred, BUDGET).await;
     let seed = win.write_file(inbox, ENVELOPE, "").await;
     eprintln!("REPRO96 win   write {inbox} => {seed:?}");
 
     // THE GATE — the co-host read: non-admin cert-agent mac-ai, plain sys_read,
     // unprovisioned inbox, through the federation mount.
-    let mut mac = Vfs::connect_mtls(port, &ca, &mac_cert, &mac_key, BUDGET).await;
+    let mut mac = Vfs::connect_as_agent(port, &mac_cred, BUDGET).await;
     let mac_read = mac.read_file(inbox, "").await;
     eprintln!("REPRO96 mac   read  {inbox} => {mac_read:?}");
 
