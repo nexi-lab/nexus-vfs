@@ -1933,10 +1933,18 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         // 1. Handle snapshot (received from leader during catch-up / join)
         if !ready.snapshot().is_empty() {
             let snapshot = ready.snapshot();
+            // A snapshot puts a ConfState in force on this node exactly as applying a
+            // ConfChange entry does, so it reports membership in the SAME shape —
+            // `voter_count` beside `voters`. A joiner receives its own promotion by
+            // whichever path the leader picks (an entry if the log still holds it, a
+            // snapshot once compaction has dropped it), and that choice is a race:
+            // without this field, an observer waiting for "membership is 2 voters"
+            // passes or hangs depending on how loaded the machine is.
             tracing::info!(
                 index = snapshot.get_metadata().index,
                 term = snapshot.get_metadata().term,
                 voters = ?snapshot.get_metadata().get_conf_state().voters,
+                voter_count = snapshot.get_metadata().get_conf_state().voters.len(),
                 "Applying snapshot from leader"
             );
             self.raw_node
