@@ -38,7 +38,6 @@ use crate::raft::{
     reconcile_peers_with_conf_state, Command, CommandResult, FullStateMachine, RaftError,
     WitnessStateMachine, ZoneConsensus, ZoneRaftRegistry,
 };
-use crate::storage::RedbStore;
 use bincode;
 use dashmap::DashMap;
 use prost::Message;
@@ -1347,15 +1346,13 @@ impl ZoneApiService for ZoneApiServiceImpl {
         &self,
         _request: Request<DiscoverZonesRequest>,
     ) -> std::result::Result<Response<DiscoverZonesResponse>, Status> {
-        let root = self.registry.get_node(contracts::ROOT_ZONE_ID);
-        let entries = match root {
-            Some(node) => node
-                .with_state_machine(|sm| sm.iter_dt_mount_entries())
-                .await
-                .unwrap_or_default(),
-            None => Vec::new(),
-        };
-        let zones: Vec<FederationZoneInfo> = entries
+        // The same read the boot summary logs — see
+        // `ZoneRaftRegistry::published_federation_mounts` for why they share one
+        // implementation.
+        let zones: Vec<FederationZoneInfo> = self
+            .registry
+            .published_federation_mounts()
+            .await
             .into_iter()
             .map(|(mount_path, zone_id)| FederationZoneInfo {
                 zone_id,
@@ -2516,8 +2513,7 @@ impl WitnessZoneRegistry {
 
         // Zone-specific storage
         let zone_path = self.base_path.join(zone_id);
-        let store = RedbStore::open(zone_path.join("sm"))
-            .map_err(|e| TransportError::Connection(format!("Failed to open store: {}", e)))?;
+        let store = super::open_zone_store(zone_path.join("sm"))?;
         let raft_storage = RaftStorage::open(zone_path.join("raft")).map_err(|e| {
             TransportError::Connection(format!("Failed to open raft storage: {}", e))
         })?;

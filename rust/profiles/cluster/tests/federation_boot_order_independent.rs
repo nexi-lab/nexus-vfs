@@ -64,9 +64,9 @@ fn joiner_env<'a>(
 }
 
 /// The joiner boots FIRST, with `--peers` pointing at a founder that is not up
-/// yet. It must keep retrying discovery (logging the "waiting for a founder…"
-/// guidance) rather than one-shotting to rootless; then, once the founder
-/// appears, it must auto-join and serve a working `/agents` mount — with no
+/// yet. It must keep retrying discovery (logging the "waiting for a peer to report
+/// federation zones" guidance) rather than one-shotting to rootless; then, once the
+/// founder appears, it must auto-join and serve a working `/agents` mount — with no
 /// restart in between.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn joiner_started_before_founder_auto_joins() {
@@ -93,7 +93,7 @@ async fn joiner_started_before_founder_auto_joins() {
     //    This is the assertion the pre-fix one-shot path could never satisfy —
     //    it would have logged "daemon up rootless-with-peers" and stopped.
     joiner
-        .wait_for_log("waiting for a founder to become reachable", BUDGET)
+        .wait_for_log("waiting for a peer to report federation zones", BUDGET)
         .await
         .expect("joiner retries discovery instead of one-shotting to rootless");
 

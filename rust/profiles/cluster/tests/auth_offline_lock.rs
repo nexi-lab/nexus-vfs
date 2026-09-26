@@ -1,14 +1,15 @@
 //! Black-box E2E: offline `auth` against a RUNNING daemon fails cleanly.
 //!
 //! The `auth` subcommand is offline by design — it opens the data dir's redb
-//! directly, which a running daemon holds an exclusive lock on. That build a
-//! ZoneManager owning a nested tokio runtime; when the open failed on an async
-//! worker of the outer `#[tokio::main]`, dropping that runtime panicked
-//! ("Cannot drop a runtime in a context where blocking is not allowed") — a
-//! cryptic failure for the common operator slip of minting without stopping
-//! the daemon. `run_auth` now runs the whole thing on the blocking pool, so
-//! the lock contention surfaces as a normal, actionable error. This pins that:
-//! a locked data dir FAILS LOUD, never panics.
+//! directly, and a running daemon holds that lock. Minting without stopping the
+//! daemon is the common operator slip, so what it produces has to be an actionable
+//! error and never a panic: opening a data dir builds a ZoneManager owning a nested
+//! tokio runtime, and a runtime dropped on an async worker mid-error panics over the
+//! very message the operator needs (`lib::rt::OwnedRuntime` is what keeps that from
+//! happening, wherever the open is attempted from).
+//!
+//! Sibling coverage: `share`'s half of the same contract lives in
+//! `share_contract.rs`, which also pins the guidance text.
 
 mod common;
 

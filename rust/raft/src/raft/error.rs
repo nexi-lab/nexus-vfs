@@ -68,6 +68,12 @@ pub enum RaftError {
     #[error("transport error: {0}")]
     Transport(String),
 
+    /// A zone's on-disk store is held by another process — the payload is the store
+    /// path. Mirrors [`crate::transport::TransportError::DataDirLocked`] so the fact
+    /// survives the hop into this vocabulary; see that variant for why it is typed.
+    #[error("data dir already open by another process: {0}")]
+    DataDirLocked(String),
+
     /// `create_zone` was called for a zone that already exists with a
     /// different peer-address-book.  Idempotency holds when the
     /// requested address book matches the existing one (same set of

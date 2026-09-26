@@ -20,7 +20,6 @@ use crate::raft::{
     FullStateMachine, RaftConfig, RaftStorage, ReplicationLog, StateMachine, ZoneConsensus,
     ZonePersistence,
 };
-use crate::storage::RedbStore;
 use crate::transport::{
     ClientConfig, NodeAddress, PeerMap, RaftClientPool, SharedPeerMap, TlsConfig, TransportError,
     TransportLoop,
@@ -787,8 +786,7 @@ impl ZoneRaftRegistry {
         };
 
         // Open zone-specific redb + state machine
-        let store = RedbStore::open(persistence.sm_path())
-            .map_err(|e| TransportError::Connection(format!("Failed to open store: {}", e)))?;
+        let store = crate::transport::open_zone_store(persistence.sm_path())?;
         let raft_storage = RaftStorage::open(persistence.raft_path()).map_err(|e| {
             TransportError::Connection(format!("Failed to open raft storage: {}", e))
         })?;
@@ -1045,6 +1043,34 @@ impl ZoneRaftRegistry {
             return Some(entry.node.clone());
         }
         self.materialize(zone_id)
+    }
+
+    /// The federation zones this node PUBLISHES, as `(mount_path, zone_id)` sorted by
+    /// path — exactly what a peer's `DiscoverZones` receives.
+    ///
+    /// One implementation for the RPC and for the boot summary that tells an operator
+    /// what this node offers, so the log they read and the answer a joiner gets cannot
+    /// disagree. That divergence is not hypothetical: a founder logged an invitation
+    /// to "JoinZone here" while answering `DiscoverZones` with an empty list, and the
+    /// operator on the other end had no way to tell which was true.
+    ///
+    /// The source is the ROOT zone's DT_MOUNT entries, which is the contract worth
+    /// knowing: a zone is discoverable by being **mounted**, not by existing.
+    /// Founding one (`--cluster-init <zone>`) without mounting it
+    /// (`--cluster-init-mount <path>=<zone>`) publishes nothing.
+    ///
+    /// Empty is a legitimate steady state — a single-node daemon has nothing to
+    /// federate — so this is never an error here, only a fact a caller may report.
+    pub async fn published_federation_mounts(&self) -> Vec<(String, String)> {
+        let Some(root) = self.get_node(contracts::ROOT_ZONE_ID) else {
+            return Vec::new();
+        };
+        let mut mounts = root
+            .with_state_machine(|sm: &FullStateMachine| sm.iter_dt_mount_entries())
+            .await
+            .unwrap_or_default();
+        mounts.sort();
+        mounts
     }
 
     /// Slow path of [`Self::get_node`]: open a hosted-but-not-resident zone.

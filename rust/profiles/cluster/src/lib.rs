@@ -598,6 +598,16 @@ enum Cmd {
     /// `--mount-at` the new zone exists as a raft group but the sharer's
     /// own writes to `<path>` keep routing to the original (local)
     /// mount, which is the historical pitfall.
+    ///
+    /// Offline: this opens the data dir directly, so the daemon must be
+    /// STOPPED. A running cluster publishes a zone at boot instead
+    /// (`--cluster-init` + `--cluster-init-mount`), with no downtime.
+    ///
+    /// Sharing a path that holds nothing is refused unless
+    /// `--allow-empty` says it was meant — a zero-entry share is
+    /// otherwise a wrong path, and the most common wrong path is a shell
+    /// that rewrote the argument (Git Bash turns `/conversations` into
+    /// `C:/Program Files/Git/conversations`).
     Share {
         /// Subtree path in the parent zone (e.g. `/data/shared`).
         path: String,
@@ -613,6 +623,14 @@ enum Cmd {
         /// the parent zone. Idempotent.
         #[arg(long)]
         mount_at: Option<String>,
+        /// Share a path that holds nothing, deliberately — pre-creating an
+        /// empty zone for later writes is the one legitimate case.
+        ///
+        /// Without it a zero-entry share is an error, because every other way
+        /// to reach zero is a mistake: a typo, a path in the wrong zone, or a
+        /// shell that rewrote the argument.
+        #[arg(long)]
+        allow_empty: bool,
     },
     /// Mint, revoke and list `sk-` API keys.
     ///
@@ -1073,6 +1091,7 @@ where
                     zone_id,
                     parent_zone,
                     mount_at,
+                    allow_empty,
                 }) => {
                     run_share(
                         args.common,
@@ -1080,6 +1099,7 @@ where
                         &path,
                         &zone_id,
                         mount_at.as_deref(),
+                        allow_empty,
                     )
                     .await
                 }
@@ -1302,6 +1322,44 @@ struct ZoneManagerBundle {
     identity_zones: Vec<nexus_raft::identity::IdentityZone>,
 }
 
+/// How a node publishes a federation zone — the one sentence that answers "why can a
+/// peer not see my zone?".
+///
+/// One constant because four call sites need it: the boot summary, the two joiner
+/// waits, the `DiscoverZones`-returned-nothing log, and the locked-data-dir error. They
+/// are reached from different machines in the same investigation — the joiner's log
+/// sends you to the founder's — so the answer has to be identical in all of them, and
+/// the day a live-daemon `share` exists it has to change in all of them at once.
+///
+/// Boot-time first, deliberately: it needs no downtime and it is what a running cluster
+/// should be using. `share` is the offline tool for content that already exists.
+const HOW_TO_PUBLISH_A_ZONE: &str = "declare it at boot with `--cluster-init <zone> \
+     --cluster-init-mount <path>=<zone>` (no downtime), or, with the daemon STOPPED, \
+     run `nexusd-cluster share <path> --zone-id <zone> --mount-at <path>` to publish a \
+     subtree that already has content";
+
+/// What to tell an operator whose offline command met a running daemon.
+///
+/// Reached by matching [`nexus_raft::raft::RaftError::DataDirLocked`], never by reading
+/// error prose: the storage layer classifies redb's `DatabaseAlreadyOpen` and each hop
+/// keeps the fact in its own vocabulary, so this text is the only place that turns it
+/// into advice.
+///
+/// `share` / `join` / `auth` work directly on a stopped node's storage. That contract
+/// is invisible until it bites, and what it produced was a redb sentence about a lock —
+/// true, and useless unless you already knew these were offline tools.
+fn data_dir_locked_error(data_dir: &std::path::Path, store_path: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "another process already has this data dir open: {}\n\n\
+         This command operates directly on a stopped node's storage, so it cannot run \
+         while a daemon is serving that directory — the daemon holds the store lock \
+         ({store_path}).\n\n\
+         If you are publishing a federation zone: {HOW_TO_PUBLISH_A_ZONE}.\n\n\
+         Otherwise stop the daemon, re-run this command, and start it again.",
+        data_dir.display(),
+    )
+}
+
 /// Open a `ZoneManager` against the data dir, sharing the daemon's
 /// startup conventions. Used by both `daemon` and the offline
 /// `share`/`join` subcommands.
@@ -1480,7 +1538,12 @@ fn open_zone_manager(
         extra_grpc_services,
         load_policy,
     )
-    .map_err(|e| anyhow::anyhow!("ZoneManager::with_node_id: {}", e))?;
+    .map_err(|e| match e {
+        nexus_raft::raft::RaftError::DataDirLocked(store_path) => {
+            data_dir_locked_error(&common.data_dir, &store_path)
+        }
+        other => anyhow::anyhow!("ZoneManager::with_node_id: {other}"),
+    })?;
 
     // S3 Phase B: hand the identity directory to the zone registry so
     // every future zone install (both static founder and JoinZone
@@ -2240,10 +2303,15 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
                     }
                     tracing::info!(
                         peers = ?peers.iter().map(|p| p.endpoint.as_str()).collect::<Vec<_>>(),
-                        "waiting for a founder to become reachable to discover its \
-                         zones (retrying) — is a --cluster-init founder started and \
-                         past its \"Static topology applied\" log on one of these \
-                         addresses? A joiner auto-joins once it is.",
+                        "waiting for a peer to report federation zones (retrying). \
+                         TWO different states end up here, and the log line above from \
+                         each peer says which: either no peer answered — a founder is \
+                         not started yet, or not past its \"Static topology applied\" \
+                         gate, or the address is wrong — or a peer answered with \
+                         NOTHING, meaning that founder publishes no zone (its own boot \
+                         log says so: \"this node publishes NO federation zone\"), \
+                         which is fixed on the FOUNDER: {HOW_TO_PUBLISH_A_ZONE}. A \
+                         joiner auto-joins as soon as a peer has a zone to report.",
                     );
                     tokio::time::sleep(JOINER_DISCOVERY_RETRY_INTERVAL).await;
                 };
@@ -2251,7 +2319,10 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
                     tracing::info!(
                         "boot joiner: no federation zones auto-declared and none \
                          reported by peers within the discovery budget; daemon up \
-                         rootless-with-peers. Use `nexusd-cluster join` sidecar for \
+                         rootless-with-peers. If a founder IS running at one of those \
+                         addresses, it publishes nothing yet — a founder-side step, not \
+                         something a joiner can do for itself ({HOW_TO_PUBLISH_A_ZONE}). \
+                         Otherwise use the `nexusd-cluster join` sidecar for \
                          zone-specific joining, or wait for a ConfChange apply to \
                          populate identity.zones.",
                     );
@@ -3116,6 +3187,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
                             "VFS data plane ready — kernel wired and declared topology applied, \
                              serving client requests"
                         );
+                        report_published_federation_zones(&zm_for_loop).await;
                     }
                     tokio::time::sleep(TOPOLOGY_TICK * 6).await;
                 }
@@ -3181,6 +3253,7 @@ async fn run_share(
     path: &str,
     new_zone_id: &str,
     mount_at: Option<&str>,
+    allow_empty: bool,
 ) -> Result<()> {
     let ZoneManagerBundle {
         zm, cli_peer_addrs, ..
@@ -3198,6 +3271,48 @@ async fn run_share(
             "--new-zone {new_zone_id:?} is not a valid zone id: {e}.              The id becomes the first path segment of everything under it and              cannot be changed afterwards."
         )
     })?;
+
+    // Look before leaping: a local, leader-free count of what is actually under
+    // `path`. Zero is almost always a wrong path rather than an empty one, and the
+    // path shown is what this process RECEIVED — which is where the answer usually
+    // is, because Git Bash rewrites a leading-slash argument (`/conversations`
+    // arrives as `C:/Program Files/Git/conversations`) and shares a subtree that was
+    // never there. That case used to create the zone, mount the parent's path onto
+    // it, print "Shared … (0 entries copied)" and exit 0.
+    //
+    // Checked BEFORE `create_zone` so a refusal leaves nothing behind.
+    //
+    // "Is the source there at all" comes first, because the answer is a different
+    // sentence: a data dir with no `root` is not a wrong path, it is a data dir
+    // nothing has ever run against — usually a `--data-dir` typo. Catalog-only
+    // (`hosts_zone` never materializes), so asking costs nothing.
+    if !zm.hosts_zone(parent_zone) {
+        anyhow::bail!(
+            "this node does not host zone {parent_zone:?}, so there is nothing to \
+             share from.\n\n\
+             Data dir: {}\n\n\
+             `share` copies an existing subtree out of a zone that is already here; it \
+             does not create the source. A data dir gets its root zone from the \
+             daemon's first boot (or an offline `auth mint`). Check --data-dir points \
+             at the node you meant, and --parent-zone at a zone it hosts.",
+            common.data_dir.display(),
+        );
+    }
+    let present = zm
+        .subtree_entry_count(parent_zone, path)
+        .map_err(|e| anyhow::anyhow!("count {path:?} in zone {parent_zone:?}: {e}"))?;
+    if present == 0 && !allow_empty {
+        anyhow::bail!(
+            "refusing to share {path:?}: nothing is under it in zone {parent_zone:?}, \
+             so there would be nothing to join.\n\n\
+             The path above is what this process RECEIVED. If it is not what you \
+             typed, your shell rewrote it — Git Bash / MSYS rewrites leading-slash \
+             arguments, so prefix the command with MSYS_NO_PATHCONV=1.\n\n\
+             Otherwise check that the path exists in that zone. To pre-create an \
+             empty zone deliberately, pass --allow-empty.\n\n\
+             Nothing was created."
+        );
+    }
 
     if zm.get_zone(new_zone_id).is_none() {
         zm.create_zone_async(new_zone_id, peers_str)
@@ -3235,6 +3350,46 @@ async fn run_share(
         println!("Mounted zone '{new_zone_id}' at '{mount_path}' in parent zone '{parent_zone}'");
     }
     Ok(())
+}
+
+/// Say, once, what this node offers a peer — and when the answer is "nothing", how to
+/// change that.
+///
+/// "Is your zone up?" is the first question a second machine asks, and the rest of boot
+/// cannot answer it: every other line describes a step this node took, and reading
+/// "Static topology applied: 0 mounts" as "a joiner would discover nothing" requires
+/// already knowing that `DiscoverZones` reports the root zone's DT_MOUNT entries.
+///
+/// Logged at the convergence gate rather than the end of synchronous boot, because that
+/// is when the answer stops changing: declared mounts land through raft tens of
+/// milliseconds later, so an earlier count would under-report exactly when an operator
+/// is watching. Read through the accessor the RPC answers from
+/// ([`nexus_raft::raft::ZoneRaftRegistry::published_federation_mounts`]), so the log and
+/// the wire cannot disagree.
+///
+/// Empty is normal for a single-node daemon, so both branches are INFO — this reports a
+/// state, it does not complain about a configuration nobody asked to change.
+async fn report_published_federation_zones(zm: &Arc<ZoneManager>) {
+    let published = zm.registry().published_federation_mounts().await;
+    if published.is_empty() {
+        tracing::info!(
+            "this node publishes NO federation zone — a peer's DiscoverZones gets an \
+             empty list, so a joiner pointed here discovers nothing and gives up. A \
+             zone becomes discoverable by being MOUNTED in the root zone: \
+             {HOW_TO_PUBLISH_A_ZONE}. Nothing to do if this node is meant to be \
+             standalone.",
+        );
+    } else {
+        tracing::info!(
+            zones = ?published
+                .iter()
+                .map(|(path, zone)| format!("{path}={zone}"))
+                .collect::<Vec<_>>(),
+            "this node publishes {} federation zone(s) — a joiner pointed here \
+             discovers exactly these",
+            published.len(),
+        );
+    }
 }
 
 /// How long a fresh joiner keeps retrying `DiscoverZones` for its founder to
@@ -3297,6 +3452,23 @@ async fn reconcile_federation_from_peers(
         )
         .await
         {
+            Ok(entries) if entries.is_empty() => {
+                // The distinction that matters and that this used to lose: the
+                // peer ANSWERED, so it is up, past its topology gate, and at the
+                // right address — it simply has no federation zone to offer. Every
+                // remedy the retry loop suggests is on the joiner's side, so
+                // without this line an operator re-checks three things that are
+                // already true and never learns the one that is not.
+                tracing::info!(
+                    peer = %peer.endpoint,
+                    "DiscoverZones: peer is reachable but publishes NO federation \
+                     zone — nothing for this node to join, and no joiner-side setting \
+                     changes that. The peer becomes joinable when a path in its root \
+                     zone is MOUNTED at a zone (on THAT node: \
+                     {HOW_TO_PUBLISH_A_ZONE}); a founder's own root zone is never \
+                     discoverable.",
+                );
+            }
             Ok(entries) => {
                 tracing::info!(
                     peer = %peer.endpoint,
@@ -4483,17 +4655,10 @@ fn open_auth_store(
         contracts::CONTROL_ZONE_ID
     };
 
-    // Offline tooling cannot open the data dir while the daemon holds its
-    // exclusive redb lock — by far the dominant failure here — so name that
-    // cause up front rather than leaking a raw redb/OS error.
     let ZoneManagerBundle { zm, .. } = open_zone_manager(
         common,
         None,
         ZoneLoadPolicy::Only(vec![auth_zone.to_string()]),
-    )
-    .context(
-        "offline `auth` could not open the data dir; if the daemon is running, \
-         stop it first (it holds an exclusive lock)",
     )?;
     // Found-on-demand as a SOLO voter: correct for both `root` (per-node, always
     // solo) and the founder's control zone (founder = sole voter). Idempotent
@@ -5524,24 +5689,19 @@ async fn run_auth(common: CommonArgs, action: AuthCmd) -> Result<()> {
         _ => {}
     }
 
-    // The offline `auth` subcommand builds a ZoneManager, which owns a nested
-    // tokio runtime — created, driven, and dropped in this one call. None of
-    // that may happen on an async worker thread of the outer `#[tokio::main]`
-    // runtime: dropping a runtime there panics ("Cannot drop a runtime in a
-    // context where blocking is not allowed"), which is how a still-running
-    // daemon (holding the redb data-dir lock) used to surface — a cryptic
-    // mid-construction panic on the error path instead of a clean "stop the
-    // daemon first". The blocking pool *allows* blocking (and runtime
-    // create/drop), so run the whole thing there. Mirrors the daemon-shutdown
-    // drain (`spawn_blocking(|| zm.shutdown())`) and `join_zones_for_boot`.
+    // The offline body is synchronous and disk-bound end to end — redb opens,
+    // key-store reads and writes, and a `zm.shutdown()` that blocks on the raft
+    // drain — so it belongs on the blocking pool rather than parked on an async
+    // worker for the whole command. Mirrors the daemon-shutdown drain
+    // (`spawn_blocking(|| zm.shutdown())`) and `join_zones_for_boot`.
     tokio::task::spawn_blocking(move || run_auth_blocking(common, action))
         .await
         .context("auth subcommand task panicked")?
 }
 
-/// Synchronous body of the offline `auth` subcommand — see `run_auth` for why
-/// it runs on the blocking pool. Owns the ZoneManager start to finish so its
-/// nested runtime is created and dropped off the async worker threads.
+/// Synchronous body of the offline `auth` subcommand — see `run_auth` for why it runs
+/// on the blocking pool. Owns the ZoneManager start to finish, so the data-dir lock is
+/// taken and released inside this one call.
 fn run_auth_blocking(common: CommonArgs, action: AuthCmd) -> Result<()> {
     // Agent-cert revocation is file-based (no redb): it appends the cert's
     // serial to the founder's revoked-serial file, which the running GetCrl
