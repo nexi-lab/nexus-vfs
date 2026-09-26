@@ -1,0 +1,227 @@
+name: Release Search Plugin
+
+# Release pipeline for the `nexus-search-plugin` cdylib.  Triggered by
+# tags of the form `search-v<semver>`; produces one signed
+# `libnexus_search_plugin.{so,dylib,dll}` per platform and attaches
+# them as GitHub Release assets.
+#
+# History: nexus-vfs#321 relocated the plugin source here from
+# `nexus/rust/services/search-plugin/`; before that release cutting
+# happened in nexus-repo `.github/workflows/release-search-plugin.yml`
+# (retired by nexus#4831 alongside the source deletion).  This is the
+# nexus-vfs replacement — deliberately simpler than the retired one:
+#
+#   * `signing_key_source: github-secret` (no vault dogfood path) —
+#     `PLUGIN_SIGNING_PRIVKEY` reads directly from a repo secret.
+#     The vault + sealed keystore still live in nexus and are not
+#     duplicated here.
+#   * GitHub Releases only (no Tencent COS upload) — the plugin-host
+#     Docker image at `ghcr.io/nexi-lab/nexusd-cluster` remains the
+#     primary path most consumers pull through; tag-based releases
+#     here supplement that for consumers that want a specific
+#     `search-v*` version.
+#
+# The signing key contract is the same across both repos: the runtime
+# verifier is `rust/kernel/src/kernel/plugins/loader.rs` +
+# `rust/kernel/trusted_keys/nexus-team.pub` in this repo, so the
+# PLUGIN_SIGNING_PRIVKEY secret must be the paired privkey of the
+# committed nexus-team pubkey.
+#
+# Prerequisites (one-time repo admin task):
+#   * `PLUGIN_SIGNING_PRIVKEY` — base64 Ed25519 privkey for the
+#     kernel-team trust root.  Filed as issue #324 for repo owners.
+
+on:
+  push:
+    tags:
+      - "search-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. search-v0.1.2). Used for retry without delete+repush."
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-search-plugin-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build-${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            dylib: libnexus_search_plugin.so
+          - name: macos-arm64
+            os: macos-14
+            dylib: libnexus_search_plugin.dylib
+          - name: macos-x86_64
+            os: macos-14
+            target: x86_64-apple-darwin
+            dylib: libnexus_search_plugin.dylib
+          - name: windows-x86_64
+            os: windows-2022
+            dylib: nexus_search_plugin.dll
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # A workflow_dispatch retry from an already-published tag
+          # needs to build off that tag, not the branch head.
+          ref: ${{ inputs.tag || github.ref }}
+
+      # Vendored protoc: search-plugin's build.rs calls
+      # `protoc_bin_vendored::protoc_bin_path()` and the search proto
+      # is generated in-crate — no system protoc install needed here.
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target || '' }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-search-plugin-${{ matrix.os }}-${{ matrix.target || 'native' }}
+
+      - name: Build cdylib
+        run: cargo build --locked --release -p nexus-search-plugin ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+
+      - name: Set up Python (for sign_plugin.py)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install signing deps
+        run: pip install --quiet cryptography
+
+      - name: Ed25519-sign the dylib
+        env:
+          PLUGIN_SIGNING_PRIVKEY: ${{ secrets.PLUGIN_SIGNING_PRIVKEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${PLUGIN_SIGNING_PRIVKEY}" ]; then
+            echo "::error::PLUGIN_SIGNING_PRIVKEY secret is not configured."
+            echo "See issue #324 — the kernel-team Ed25519 privkey must be"
+            echo "added to nexus-vfs's repo secrets before this workflow can sign."
+            exit 1
+          fi
+          BUILD_DIR="target/${{ matrix.target && format('{0}/', matrix.target) || '' }}release"
+          python3 scripts/sign_plugin.py "${BUILD_DIR}/${{ matrix.dylib }}"
+          test -f "${BUILD_DIR}/${{ matrix.dylib }}.sig" || \
+            { echo "::error::sign_plugin.py produced no .sig"; exit 1; }
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUILD_DIR="target/${{ matrix.target && format('{0}/', matrix.target) || '' }}release"
+          PKG="nexus-search-plugin-${{ matrix.name }}"
+          mkdir -p "dist/${PKG}"
+          cp "${BUILD_DIR}/${{ matrix.dylib }}"     "dist/${PKG}/"
+          cp "${BUILD_DIR}/${{ matrix.dylib }}.sig" "dist/${PKG}/"
+          tar -C dist -czf "dist/${PKG}.tar.gz" "${PKG}"
+          ls -la "dist/${PKG}.tar.gz"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $buildDir = "target/release"
+          $pkg = "nexus-search-plugin-${{ matrix.name }}"
+          New-Item -ItemType Directory -Force -Path "dist/$pkg" | Out-Null
+          Copy-Item "$buildDir/${{ matrix.dylib }}"     "dist/$pkg/"
+          Copy-Item "$buildDir/${{ matrix.dylib }}.sig" "dist/$pkg/"
+          Compress-Archive -Force -Path "dist/$pkg" -DestinationPath "dist/$pkg.zip"
+          Get-Item "dist/$pkg.zip" | Format-List Length, FullName
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: search-plugin-${{ matrix.name }}
+          path: dist/nexus-search-plugin-${{ matrix.name }}.*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout (for release body)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Download every artifact
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#search-v}" >> "$GITHUB_OUTPUT"
+
+      - name: Create/update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Deterministic asset list: one archive per platform, each
+          # bundles the signed dylib + `.sig`.  PluginLoader reads the
+          # signature alongside the dylib at `--plugin-dir` scan time.
+          shopt -s nullglob
+          ASSETS=(artifacts/search-plugin-*/*.tar.gz artifacts/search-plugin-*/*.zip)
+          if [ "${#ASSETS[@]}" -eq 0 ]; then
+            echo "::error::no build artifacts to upload"
+            exit 1
+          fi
+          echo "Uploading ${#ASSETS[@]} asset(s):"
+          for a in "${ASSETS[@]}"; do echo "  $a"; done
+
+          BODY=$(cat <<EOF
+          Nexus search service plugin ${VERSION} — hosted by nexusd-cluster over gRPC loopback (Phase P plugin-as-gRPC-service).
+
+          Each archive bundles \`libnexus_search_plugin.{so,dylib,dll}\` + its Ed25519 signature \`.sig\`. Drop both into your nexusd-cluster \`--plugin-dir\`; the plugin loader verifies the signature against the kernel-team trust root at load time.
+
+          Source: relocated to nexus-vfs \`rust/search-plugin/\` in nexus-vfs#321 (2026-09-25).
+          EOF
+          )
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${ASSETS[@]}" --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" "${ASSETS[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "nexus-search-plugin $TAG" \
+              --notes "$BODY"
+          fi
