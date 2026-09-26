@@ -333,17 +333,16 @@ async fn joiner_installs_snapshot_after_compaction_then_cold_reads() {
         .wait_for_log("caught-up learner promoted to voter", BUDGET)
         .await
         .expect("founder MUST promote the caught-up joiner to voter");
-    // `voter_count` is emitted only by `raft.conf_change.applied`, so the count
-    // alone identifies the change: the learner-add leaves it at 1, the promotion
-    // raises it to 2. Matching the count rather than the bare message keeps the
-    // gate honest if the joiner ever starts applying the learner-add as an entry
-    // instead of receiving it inside the installed snapshot — today it does the
-    // latter, and a message-only match would then silently pass on the wrong
-    // change.
+    // The count identifies the change, whichever way it arrives: the learner-add
+    // leaves it at 1 and the promotion raises it to 2, so a message-only match could
+    // pass on the wrong one. Both delivery paths report `voter_count` — an applied
+    // ConfChange entry and an installed snapshot — which is what makes this gate
+    // deterministic: the leader's choice between them depends on whether compaction
+    // has dropped the entry yet, and under load it has.
     joiner
         .wait_for_log("voter_count=2", BUDGET)
         .await
-        .expect("joiner MUST apply the 1→2-voter ConfChange before the quorum is live");
+        .expect("joiner MUST have the 1→2-voter membership in force before the quorum is live");
 
     // Keep appending past ANOTHER compaction — the caught-up follower stays in
     // sync via ordinary replication (no snapshot needed), both logs stay bounded,
