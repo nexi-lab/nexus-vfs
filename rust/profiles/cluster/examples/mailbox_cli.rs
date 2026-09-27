@@ -4,8 +4,9 @@
 //! a spawned-daemon integration test can't cover (it drives THIS founder, with
 //! its real secret / mount / topology). Mirrors `tests/common::Vfs`.
 //!
-//! Usage:
-//!   mailbox_cli <port> <sk-token> readdir   <path>
+//! Usage (a bare `<port>` means loopback; `<host:port>` reaches another node, which
+//! is how a replication check reads the same path from both ends with one credential):
+//!   mailbox_cli <host:port|port> <sk-token> readdir   <path>
 //!   mailbox_cli <port> <sk-token> stat      <path>
 //!   mailbox_cli <port> <sk-token> read      <path>
 //!   mailbox_cli <port> <sk-token> mkstream  <path>            # DT_STREAM (wal,memory)
@@ -24,7 +25,7 @@
 
 use kernel::kernel::vfs_proto::{
     nexus_vfs_service_client::NexusVfsServiceClient, IpcPathRequest, ReadRequest, ReaddirRequest,
-    SetattrRequest, StatRequest, StreamWriteRequest,
+    SetattrRequest, StatRequest, StreamReadAtRequest, StreamWriteRequest,
 };
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
@@ -43,9 +44,24 @@ fn main() {
 async fn run() -> Result<(), String> {
     let a: Vec<String> = std::env::args().collect();
     if a.len() < 5 {
-        return Err("usage: mailbox_cli <port> <token> <op> <path> [message]".into());
+        return Err("usage: mailbox_cli <host:port|port> <token> <op> <path> [message]".into());
     }
-    let (port, cred, op, path) = (&a[1], &a[2], &a[3], &a[4]);
+    let (target, cred, op, path) = (&a[1], &a[2], &a[3], &a[4]);
+
+    // A bare port keeps meaning loopback; `host:port` reaches ANOTHER node.
+    //
+    // The whole purpose of this tool is checking a real deployment, and a
+    // cross-machine one has more than one endpoint: the honest test of "did this
+    // message replicate" is reading the same path from both nodes and comparing the
+    // tails. With loopback baked in, that check needed a second copy of this tool on
+    // the far machine — so the check that matters most was the one that was hardest
+    // to run. An agent credential is cluster-wide, so the same one authenticates at
+    // either endpoint.
+    let authority = if target.contains(':') {
+        target.clone()
+    } else {
+        format!("127.0.0.1:{target}")
+    };
 
     // Two modes by the credential:
     //  * `sk-...`  → token plane, plaintext loopback (the historical form).
@@ -62,13 +78,13 @@ async fn run() -> Result<(), String> {
             .ca_certificate(Certificate::from_pem(&ca))
             .identity(Identity::from_pem(&cert, &key))
             .domain_name(&loaded.server_name);
-        let channel = Endpoint::from_shared(format!("https://127.0.0.1:{port}"))
+        let channel = Endpoint::from_shared(format!("https://{authority}"))
             .map_err(|e| format!("endpoint: {e}"))?
             .tls_config(tls)
             .map_err(|e| format!("tls: {e}"))?
             .connect()
             .await
-            .map_err(|e| format!("mTLS dial :{port}: {e}"))?;
+            .map_err(|e| format!("mTLS dial {authority}: {e}"))?;
         // The cert authenticates; no token.
         (
             NexusVfsServiceClient::new(channel),
@@ -76,9 +92,9 @@ async fn run() -> Result<(), String> {
             Some((name, cert, key, ca)),
         )
     } else {
-        let c = NexusVfsServiceClient::connect(format!("http://127.0.0.1:{port}"))
+        let c = NexusVfsServiceClient::connect(format!("http://{authority}"))
             .await
-            .map_err(|e| format!("dial :{port}: {e}"))?;
+            .map_err(|e| format!("dial {authority}: {e}"))?;
         (c, cred.clone(), None)
     };
 
@@ -165,16 +181,38 @@ async fn run() -> Result<(), String> {
             print!("{}", String::from_utf8_lossy(&data));
         }
         "collect" => {
-            let data = stream_read_all(&mut c, path, &auth).await?;
-            match &agent {
-                // Verify the sealed envelope against the CA and print who really
-                // wrote it — the cross-trust-domain check, on the reader's side.
-                Some((_name, _cert, _key, ca)) => {
-                    let (from, content) = lib::transport_primitives::authorship::open(&data, ca)?;
-                    println!("from={from} content={}", String::from_utf8_lossy(&content));
+            // Frame by frame, cursor-advancing — the shape a real receiver reads in,
+            // and the reason this is not `stream_read_all`: one envelope per frame,
+            // so collecting the whole stream and opening it ONCE fails the moment a
+            // conversation holds a second message ("envelope is not JSON: trailing
+            // characters"), which is every conversation that got a reply.
+            let mut cursor = 0u64;
+            let mut seen = 0usize;
+            loop {
+                let (data, next, eof) = stream_read_frame(&mut c, path, cursor, &auth).await?;
+                if eof {
+                    break;
                 }
-                None => print!("{}", String::from_utf8_lossy(&data)),
+                seen += 1;
+                match &agent {
+                    // Verify each sealed envelope against the CA and print who really
+                    // wrote it — the cross-trust-domain check, on the reader's side.
+                    Some((_name, _cert, _key, ca)) => {
+                        let (from, content) =
+                            lib::transport_primitives::authorship::open(&data, ca)?;
+                        println!(
+                            "[{cursor}] from={from} content={}",
+                            String::from_utf8_lossy(&content)
+                        );
+                    }
+                    None => println!("[{cursor}] {}", String::from_utf8_lossy(&data)),
+                }
+                if next <= cursor {
+                    break;
+                }
+                cursor = next;
             }
+            println!("{seen} frame(s), next offset {cursor}");
         }
         other => return Err(format!("unknown op '{other}'")),
     }
@@ -212,8 +250,33 @@ async fn stream_append(
     Ok(())
 }
 
-/// Read a whole DT_STREAM's bytes. Shared by `collect` (which then opens the
-/// sealed envelope against the CA) and `collect-raw` (which prints them as-is).
+/// One frame at `offset` — `(data, next_offset, eof)`.
+///
+/// Non-blocking: this walks what is already there rather than waiting for more, so
+/// `collect` terminates on a live conversation instead of hanging at the tail.
+async fn stream_read_frame(
+    c: &mut NexusVfsServiceClient<Channel>,
+    path: &str,
+    offset: u64,
+    auth: &str,
+) -> Result<(Vec<u8>, u64, bool), String> {
+    let r = c
+        .stream_read_at(StreamReadAtRequest {
+            path: path.to_string(),
+            offset,
+            blocking: false,
+            timeout_ms: 0,
+            auth_token: auth.to_string(),
+        })
+        .await
+        .map_err(|e| format!("stream_read_at rpc: {e}"))?
+        .into_inner();
+    err_if(r.is_error, &r.error_payload)?;
+    Ok((r.data, r.next_offset, r.eof))
+}
+
+/// Read a whole DT_STREAM's bytes, frames concatenated — `collect-raw`'s view, for
+/// when the question is what is on the wire rather than what it means.
 async fn stream_read_all(
     c: &mut NexusVfsServiceClient<Channel>,
     path: &str,
