@@ -10,7 +10,8 @@
 //!   mailbox_cli <port> <sk-token> stat      <path>
 //!   mailbox_cli <port> <sk-token> read      <path>
 //!   mailbox_cli <port> <sk-token> mkstream  <path>            # DT_STREAM (wal,memory)
-//!   mailbox_cli <port> <sk-token> send      <path> <message>  # sealed append (signed envelope)
+//!   mailbox_cli <port> <credential> send    <peer> <message>  # a message an AGENT reads
+//!   mailbox_cli <port> <credential> send-sealed <path> <msg>  # signed envelope (cross-org)
 //!   mailbox_cli <port> <sk-token> collect   <path>            # read-all + verify seal
 //!   mailbox_cli <port> <sk-token> send-raw  <path> <message>  # UNSIGNED plain-JSON append
 //!   mailbox_cli <port> <sk-token> collect-raw <path>          # read-all, raw bytes (no open)
@@ -165,18 +166,86 @@ async fn run() -> Result<(), String> {
             err_if(r.is_error, &r.error_payload)?;
             println!("mkstream ok: {path}");
         }
+        // `send <peer> <message>` — a message an AGENT will actually read.
+        //
+        // Takes the peer, not a path, and does what the library's send does: derive
+        // the pair's conversation, index it under BOTH agents' chat lists, provision
+        // the transcript, then append a plain envelope. Every one of those is
+        // load-bearing, and learning that cost a live duet debugging session:
+        //
+        //   * a SEALED frame (what this op used to write) is unreadable to an agent —
+        //     its envelope parser cannot parse a seal, so the frame is skipped in
+        //     silence. Use `send-sealed` when the point is the signature.
+        //   * a transcript with no chat-list entry is never discovered: a receiver
+        //     finds conversations by listing `/agents/<name>/conversations/`, so the
+        //     message waits in a stream nobody tails.
+        //   * the conversation id is a hash of the unordered pair, so a caller that
+        //     works in paths has to compute blake3 by hand to say "message mac-ai".
         "send" => {
+            let peer = path; // positional slot 4 is the PEER for this op
             let msg = a.get(5).ok_or("send needs a <message> arg")?;
-            // A cert agent signs its message so any consumer can verify the
-            // `from` against the CA; a token agent sends raw bytes.
-            let data = match &agent {
-                Some((name, cert, key, _ca)) => {
-                    lib::transport_primitives::authorship::seal(name, msg.as_bytes(), key, cert)?
+            let me = match &agent {
+                Some((name, _, _, _)) => name.clone(),
+                None => {
+                    return Err("send needs a credential so the pair can be named; \
+                                    use send-raw <path> <message> on the token plane"
+                        .into())
                 }
-                None => msg.as_bytes().to_vec(),
             };
+            let cid = a2a::conversation_id(&me, peer);
+            let transcript = a2a::conversation_transcript_path(&cid);
+            let root = format!("{}/{cid}", a2a::CONVERSATIONS_BASE);
+
+            // Index under both sides. Body is the conversation root, which is what a
+            // receiver reads to know where to tail.
+            for (owner, other) in [(me.as_str(), peer.as_str()), (peer.as_str(), me.as_str())] {
+                let dir = format!(
+                    "{}/{owner}{}",
+                    a2a::A2A_INBOX_BASE,
+                    a2a::AGENT_CONVERSATIONS_SEGMENT
+                );
+                mkdir(&mut c, &dir, &auth).await?;
+                write_file(
+                    &mut c,
+                    &a2a::agent_conversation_link_path(owner, other),
+                    root.as_bytes(),
+                    &auth,
+                )
+                .await?;
+            }
+            mkstream(&mut c, &transcript, &auth).await?;
+            stream_append(
+                &mut c,
+                &transcript,
+                // The wire SSOT: `a2a::MailboxEnvelope` is the type the stamping hook
+                // and every agent's parser agree on, so the tool serialises THAT
+                // rather than hand-writing its JSON. sudocode's envelope adds fields
+                // (timestamp, kind) that all default, so a three-field one is valid.
+                a2a::MailboxEnvelope {
+                    from: me.clone(),
+                    to: peer.clone(),
+                    body: msg.clone(),
+                }
+                .to_bytes(),
+                &auth,
+            )
+            .await?;
+            println!("to {peer} via {transcript}");
+        }
+        "send-sealed" => {
+            // The cross-org SIGNED form, at an explicit path: a receiver verifies
+            // `from` against the CA itself rather than trusting the node's stamp. Its
+            // own op because an AGENT cannot read it — see `send`.
+            let msg = a.get(5).ok_or("send-sealed needs a <message> arg")?;
+            let (name, cert, key) = match &agent {
+                Some((name, cert, key, _ca)) => (name, cert, key),
+                None => return Err("send-sealed needs a credential, not an sk- token".into()),
+            };
+            let data =
+                lib::transport_primitives::authorship::seal(name, msg.as_bytes(), key, cert)?;
             stream_append(&mut c, path, data, &auth).await?;
         }
+
         "send-raw" => {
             // Unsigned append: plain bytes, no seal. On a `*/transcript`
             // mailbox the daemon's stamp hook rewrites `from` to the
@@ -286,6 +355,70 @@ fn err_if(is_error: bool, payload: &[u8]) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+/// `mkdir`, as a helper so `send` can provision what it indexes.
+async fn mkdir(
+    c: &mut NexusVfsServiceClient<Channel>,
+    path: &str,
+    auth: &str,
+) -> Result<(), String> {
+    let r = c
+        .mkdir(MkdirRequest {
+            path: path.to_string(),
+            auth_token: auth.to_string(),
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| format!("mkdir rpc: {e}"))?
+        .into_inner();
+    // An existing directory is the normal case here, not a failure.
+    if r.is_error && !String::from_utf8_lossy(&r.error_payload).contains("already exists") {
+        return Err(format!(
+            "mkdir {path}: {}",
+            String::from_utf8_lossy(&r.error_payload)
+        ));
+    }
+    Ok(())
+}
+
+/// A plain file write, as a helper for the chat-list entries `send` files.
+async fn write_file(
+    c: &mut NexusVfsServiceClient<Channel>,
+    path: &str,
+    content: &[u8],
+    auth: &str,
+) -> Result<(), String> {
+    let r = c
+        .write(WriteRequest {
+            path: path.to_string(),
+            content: content.to_vec(),
+            auth_token: auth.to_string(),
+        })
+        .await
+        .map_err(|e| format!("write rpc: {e}"))?
+        .into_inner();
+    err_if(r.is_error, &r.error_payload)
+}
+
+/// Provision a DT_STREAM if it is not there — idempotent, like the library's.
+async fn mkstream(
+    c: &mut NexusVfsServiceClient<Channel>,
+    path: &str,
+    auth: &str,
+) -> Result<(), String> {
+    let r = c
+        .setattr(SetattrRequest {
+            path: path.to_string(),
+            auth_token: auth.to_string(),
+            entry_type: DT_STREAM,
+            io_profile: "wal,memory".into(),
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| format!("setattr rpc: {e}"))?
+        .into_inner();
+    err_if(r.is_error, &r.error_payload)
 }
 
 /// Append `data` to a DT_STREAM and print the assigned offset. Shared by the
