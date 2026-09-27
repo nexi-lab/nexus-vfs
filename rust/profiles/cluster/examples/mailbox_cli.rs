@@ -14,6 +14,15 @@
 //!   mailbox_cli <port> <sk-token> collect   <path>            # read-all + verify seal
 //!   mailbox_cli <port> <sk-token> send-raw  <path> <message>  # UNSIGNED plain-JSON append
 //!   mailbox_cli <port> <sk-token> collect-raw <path>          # read-all, raw bytes (no open)
+//!   mailbox_cli <port> <sk-token> mkdir     <path>
+//!   mailbox_cli <port> <sk-token> write     <path> <content>  # plain file write
+//!   mailbox_cli <port> <sk-token> call      <method> <json>   # a service RPC
+//!
+//! `call` reaches the SERVICE plane rather than the file plane — the same
+//! `NexusVFSService.Call` a control-plane client uses, so the agent lifecycle
+//! (`start_session_v1`, `get_session_v1`, `cancel_v1`) is drivable from here. A
+//! co-hosted agent has no terminal: its lifecycle is these RPCs and its input is a
+//! stream append, which is why one tool covers both.
 //!
 //! `send-raw` + `collect-raw` are the cross-org path: an agent writes a plain
 //! JSON envelope and the daemon's A2A stamp hook rewrites `from` to the
@@ -24,8 +33,9 @@
 //! a different (foreign) CA.
 
 use kernel::kernel::vfs_proto::{
-    nexus_vfs_service_client::NexusVfsServiceClient, IpcPathRequest, ReadRequest, ReaddirRequest,
-    SetattrRequest, StatRequest, StreamReadAtRequest, StreamWriteRequest,
+    nexus_vfs_service_client::NexusVfsServiceClient, CallRequest, IpcPathRequest, MkdirRequest,
+    ReadRequest, ReaddirRequest, SetattrRequest, StatRequest, StreamReadAtRequest,
+    StreamWriteRequest, WriteRequest,
 };
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
@@ -213,6 +223,57 @@ async fn run() -> Result<(), String> {
                 cursor = next;
             }
             println!("{seen} frame(s), next offset {cursor}");
+        }
+        "mkdir" => {
+            let r = c
+                .mkdir(MkdirRequest {
+                    path: path.clone(),
+                    auth_token: auth.clone(),
+                    ..Default::default()
+                })
+                .await
+                .map_err(|e| format!("mkdir rpc: {e}"))?
+                .into_inner();
+            err_if(r.is_error, &r.error_payload)?;
+            println!("mkdir ok: {path}");
+        }
+        "write" => {
+            // A plain write, for the entries a conversation needs besides its
+            // transcript — chiefly an agent's chat-list entry
+            // (`/agents/<name>/conversations/<peer>`), which is how a receiver
+            // DISCOVERS a conversation. A transcript nobody is indexed into is a
+            // message that arrives and is never looked at.
+            let content = a.get(5).ok_or("write needs a <content> arg")?;
+            let r = c
+                .write(WriteRequest {
+                    path: path.clone(),
+                    content: content.as_bytes().to_vec(),
+                    auth_token: auth.clone(),
+                })
+                .await
+                .map_err(|e| format!("write rpc: {e}"))?
+                .into_inner();
+            err_if(r.is_error, &r.error_payload)?;
+            println!("wrote {} bytes to {path}", content.len());
+        }
+        "call" => {
+            let payload = a.get(5).map(String::as_str).unwrap_or("{}");
+            let r = c
+                .call(CallRequest {
+                    method: path.clone(),
+                    payload: payload.as_bytes().to_vec(),
+                    auth_token: auth.clone(),
+                })
+                .await
+                .map_err(|e| format!("call rpc: {e}"))?
+                .into_inner();
+            let body = String::from_utf8_lossy(&r.payload).into_owned();
+            // A service refusal comes back IN the response, not as a transport error,
+            // so a caller that only checks the RPC result reads a refusal as success.
+            if r.is_error {
+                return Err(format!("{} refused: {body}", path));
+            }
+            println!("{body}");
         }
         other => return Err(format!("unknown op '{other}'")),
     }
