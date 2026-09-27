@@ -29,7 +29,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use backends::provider::DefaultObjectStoreProvider;
 use backends::storage::path_local::PathLocalBackend;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 mod auth_posture;
 use auth_posture::{AuthPosture, AuthPostureInputs};
@@ -1088,8 +1088,18 @@ pub fn default_service_decls(ctx: &ServiceBootCtx) -> Vec<kernel::kernel::Servic
 /// what makes the production `nexusd-cluster` a complete agent host on its own,
 /// with no separate assembly binary.
 pub fn run() -> Result<()> {
-    run_with_services(default_service_decls)
+    run_with_services(DEFAULT_BINARY_NAME, default_service_decls)
 }
+
+/// What `--version` and `--help` call this program when nobody says otherwise.
+///
+/// A composing binary passes its OWN name to [`run_with_services`]: this crate is a
+/// library, so the product name belongs to whoever ships the executable. Getting that
+/// wrong is not cosmetic — `nexusd-cohost` reported itself as `nexusd-cluster`, and the
+/// two fail identically when an operator has deployed the wrong one (sessions sit in
+/// `warming_up`, because the binary that hosts agents is the other one), so the first
+/// question an incident asks had no way to be answered.
+pub const DEFAULT_BINARY_NAME: &str = "nexusd-cluster";
 
 /// Cluster daemon entry, parameterised by the service set. Boots the
 /// kernel + federation, hands the declared services to
@@ -1097,7 +1107,11 @@ pub fn run() -> Result<()> {
 /// authority — no per-service install code lives in this boot path), then
 /// serves. `build_decls` is invoked once, after the kernel + auth are up,
 /// with a [`ServiceBootCtx`] carrying boot-derived config.
-pub fn run_with_services<F>(build_decls: F) -> Result<()>
+/// `binary_name` is what this program calls itself in `--version`, `--help` and usage
+/// errors — see [`DEFAULT_BINARY_NAME`]. The version string it prefixes is still this
+/// crate's ([`daemon_version_string`]), so a composing binary that wants its own build
+/// identity in there stamps `NEXUSD_BUILD_VERSION` as well.
+pub fn run_with_services<F>(binary_name: &'static str, build_decls: F) -> Result<()>
 where
     F: FnOnce(&ServiceBootCtx) -> Vec<kernel::kernel::ServiceDecl> + Send + 'static,
 {
@@ -1105,7 +1119,17 @@ where
     // `run_daemon` (the daemon path) without a generic bound rippling
     // through every async fn.
     let build_decls: BoxedServiceDeclsBuilder = Box::new(build_decls);
-    let args = Args::parse();
+    // Parsed through a command renamed to the CALLER, so every place clap prints the
+    // program — version, help, usage on a bad flag — names the binary the operator
+    // actually ran.
+    let matches = Args::command().name(binary_name).get_matches();
+    let args = match Args::from_arg_matches(&matches) {
+        Ok(args) => args,
+        // `get_matches` has already handled --help / --version / a bad flag by exiting;
+        // reaching here means the derive and the parsed matches disagree, which is a
+        // build-time mismatch rather than operator input.
+        Err(e) => e.exit(),
+    };
     // Held until this function returns so the non-blocking log writer
     // thread stays alive and flushes on shutdown. Subcommands log to
     // stderr — their stdout is data a caller captures. `serve-local` is
