@@ -13,6 +13,8 @@
 
 #![cfg(all(feature = "grpc", has_protos))]
 
+mod common;
+
 use std::sync::Arc;
 
 use lib::transport_primitives::NodeAddress;
@@ -21,10 +23,7 @@ use nexus_raft::ZoneManager;
 use tempfile::TempDir;
 
 fn alloc_port() -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind 0");
-    let addr = listener.local_addr().expect("local_addr");
-    drop(listener);
-    format!("{addr}")
+    common::node_bind_addr()
 }
 
 fn make_node(node_id: u64, dir: &std::path::Path) -> (Arc<ZoneManager>, String) {

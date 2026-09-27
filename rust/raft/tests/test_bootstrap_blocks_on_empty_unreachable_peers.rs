@@ -9,6 +9,8 @@
 
 #![cfg(all(feature = "grpc", has_protos))]
 
+mod common;
+
 use std::time::Duration;
 
 use nexus_raft::transport::call_join_zone_rpc;
@@ -27,10 +29,7 @@ fn mint_random_id() -> u64 {
 /// Bind a TCP port, drop the listener, return the address — used to
 /// pre-allocate ports for nodes that will bind themselves later.
 fn alloc_port() -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind 0");
-    let addr = listener.local_addr().expect("local_addr");
-    drop(listener);
-    format!("{}", addr)
+    common::node_bind_addr()
 }
 
 fn make_node(node_id: u64, dir: &std::path::Path) -> (std::sync::Arc<ZoneManager>, String) {
