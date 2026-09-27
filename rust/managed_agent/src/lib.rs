@@ -660,6 +660,13 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                             AgentState::Terminated,
                             Some(e.clone()),
                         );
+                        // `Internal`, not `InvalidArgument`: the request was fine and
+                        // the caller cannot fix this by sending a different one — the
+                        // HOST is missing something (model configuration, a usable
+                        // directory). The dispatch vocabulary has no
+                        // failed-precondition code, and widening it for one service is
+                        // not this change's call, so the distinction lives in the
+                        // message the refusal carries.
                         ManagedAgentError::Internal(format!("spawn agent runtime: {e}"))
                     })?;
                 self.spawn_handles.insert(pid.clone(), handle);

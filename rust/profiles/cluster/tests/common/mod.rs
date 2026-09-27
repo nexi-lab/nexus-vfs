@@ -171,6 +171,54 @@ fn pump(
 }
 
 #[cfg(test)]
+mod port_allocation_tests {
+    use super::{free_port, free_port_pair, PORT_BAND_END, PORT_BAND_START};
+
+    /// Handouts are disjoint and inside the band.
+    ///
+    /// The property the band exists for: two daemons must never be handed the same
+    /// port. Asserted directly because the old `:0` form could only be observed
+    /// failing — as a daemon exiting with `Address already in use`, attributed to
+    /// whatever test happened to lose the race.
+    #[test]
+    fn every_handout_is_distinct_and_in_band() {
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..64 {
+            let p = free_port();
+            assert!(
+                (PORT_BAND_START..PORT_BAND_END).contains(&p),
+                "port {p} is outside the band"
+            );
+            assert!(seen.insert(p), "port {p} was handed out twice");
+        }
+    }
+
+    /// A pair takes its neighbour out of circulation.
+    ///
+    /// `p + 1` belongs to this caller's enrollment listener, so no later handout may
+    /// be it — the reason the pair is reserved in one `fetch_add` rather than probed.
+    #[test]
+    fn a_pair_reserves_its_neighbour() {
+        let pairs: Vec<u16> = (0..8).map(|_| free_port_pair()).collect();
+        let mut later = std::collections::BTreeSet::new();
+        for _ in 0..32 {
+            later.insert(free_port());
+        }
+        for p in pairs {
+            assert!(
+                p + 1 < PORT_BAND_END,
+                "pair {p} has no room for its neighbour"
+            );
+            assert!(
+                !later.contains(&p) && !later.contains(&(p + 1)),
+                "a later handout collided with the pair ({p}, {})",
+                p + 1
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod strip_ansi_tests {
     use super::strip_ansi;
 
