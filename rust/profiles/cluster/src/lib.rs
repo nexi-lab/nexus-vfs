@@ -471,22 +471,15 @@ impl CommonArgs {
         if !looks_like_zone_storage {
             return Ok(());
         }
-        let remedy = if self.root_path.is_some() {
-            "Point --root-path at a directory of its own (it is created if absent)."
-        } else {
-            "This data dir predates the root mount moving to `<data-dir>/rootfs`, so \
-             `<data-dir>/root` is now read as the root ZONE's storage. Move whatever \
-             you served at `/` into `<data-dir>/rootfs`, or pass --root-path \
-             explicitly to keep serving it from where it is — as long as that is not \
-             a zone directory."
-        };
+        // Kept short on purpose: this crate has a release size budget, and prose in a
+        // refusal is bytes in the shipped daemon. The facts an operator cannot recover
+        // without are the path, what makes it a zone dir, and the way out.
         anyhow::bail!(
-            "the root mount (--root-path / NEXUS_ROOT_FS) is a zone's storage \
-             directory: {}\n\n\
-             It holds `raft/` and `sm` — a zone's consensus log and state machine. \
-             Serving it at `/` puts them in the namespace this daemon answers for: \
-             `readdir /` lists them, and a write through the VFS reaches the real \
-             files.\n\n{remedy}",
+            "root mount (--root-path / NEXUS_ROOT_FS) is a zone's storage dir: {} \
+             (holds raft/ + sm). Serving it at / puts the consensus files in the \
+             namespace. Point --root-path elsewhere; the default moved to \
+             <data-dir>/rootfs, so a pre-move data dir keeps its files by naming \
+             them explicitly.",
             root_fs.display(),
         )
     }

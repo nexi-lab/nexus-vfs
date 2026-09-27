@@ -101,7 +101,7 @@ async fn a_root_mount_that_is_zone_storage_is_refused() {
         .await
         .expect("a daemon told to serve a zone's storage at / must refuse to boot");
     assert!(
-        logs.contains("zone's storage directory") && logs.contains("raft"),
+        logs.contains("zone's storage dir") && logs.contains("raft"),
         "the refusal must name what it found and why:\n{logs}"
     );
     assert!(
