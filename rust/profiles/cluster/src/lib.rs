@@ -467,8 +467,9 @@ impl CommonArgs {
     /// switching directories under an operator who has files in there.
     fn refuse_root_fs_inside_zone_storage(&self) -> Result<()> {
         let root_fs = self.root_fs_path();
-        let looks_like_zone_storage = root_fs.join("raft").is_dir() && root_fs.join("sm").exists();
-        if !looks_like_zone_storage {
+        // Asked of the type that lays the directory out, so this cannot drift from
+        // where zone storage actually goes.
+        if !nexus_raft::raft::ZonePersistence::looks_like_zone_dir(&root_fs) {
             return Ok(());
         }
         // Kept short on purpose: this crate has a release size budget, and prose in a
