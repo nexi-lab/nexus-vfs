@@ -254,7 +254,17 @@ struct CommonArgs {
     /// Host filesystem directory exposed as the cluster root mount.
     /// `nexusd-cluster` mounts this path at `/` via `PathLocalBackend`
     /// at boot so gRPC writes through DLC land on the host fs.
-    /// Defaults to `<data_dir>/root` for self-contained operation.
+    /// Defaults to `<data_dir>/rootfs` for self-contained operation.
+    ///
+    /// It must not be a zone's storage directory. Zone storage lives at
+    /// `<data_dir>/<zone_id>/{raft,sm}`, so pointing this at one publishes
+    /// the consensus files into the namespace the daemon serves: `readdir /`
+    /// answers `raft`, `sm`, and a write to those paths goes through
+    /// `PathLocalBackend` to the real files. Boot refuses that rather than
+    /// serving it.
+    ///
+    /// Spelled `--root-path` on the command line and `NEXUS_ROOT_FS` in the
+    /// environment — both name this one directory.
     #[arg(long, env = "NEXUS_ROOT_FS", global = true)]
     root_path: Option<PathBuf>,
 
@@ -434,10 +444,51 @@ fn parse_mount_driver_spec(raw: &str) -> Result<MountDriverSpec, String> {
 }
 
 impl CommonArgs {
+    /// The host directory served at `/`.
+    ///
+    /// `<data_dir>/rootfs` by default, NOT `<data_dir>/root`: the latter is where
+    /// the ROOT ZONE's raft storage lives (`<data_dir>/<zone_id>/`, and that zone's
+    /// id is `root`), so the old default served the daemon's own consensus files as
+    /// the namespace. `readdir /` answered `raft` and `sm`, every mount point showed
+    /// its target zone's storage dir, and a write to one of those paths went through
+    /// to the real file.
     fn root_fs_path(&self) -> PathBuf {
         self.root_path
             .clone()
-            .unwrap_or_else(|| self.data_dir.join("root"))
+            .unwrap_or_else(|| self.data_dir.join("rootfs"))
+    }
+
+    /// Refuse a root mount that is a zone's storage directory.
+    ///
+    /// Checked for BOTH the default and an explicit `--root-path`, because the
+    /// collision is a property of the path, not of who chose it. A legacy data dir
+    /// whose `<data_dir>/root` predates the default move is named in the message
+    /// with what to do, rather than silently serving raft files or silently
+    /// switching directories under an operator who has files in there.
+    fn refuse_root_fs_inside_zone_storage(&self) -> Result<()> {
+        let root_fs = self.root_fs_path();
+        let looks_like_zone_storage = root_fs.join("raft").is_dir() && root_fs.join("sm").exists();
+        if !looks_like_zone_storage {
+            return Ok(());
+        }
+        let remedy = if self.root_path.is_some() {
+            "Point --root-path at a directory of its own (it is created if absent)."
+        } else {
+            "This data dir predates the root mount moving to `<data-dir>/rootfs`, so \
+             `<data-dir>/root` is now read as the root ZONE's storage. Move whatever \
+             you served at `/` into `<data-dir>/rootfs`, or pass --root-path \
+             explicitly to keep serving it from where it is — as long as that is not \
+             a zone directory."
+        };
+        anyhow::bail!(
+            "the root mount (--root-path / NEXUS_ROOT_FS) is a zone's storage \
+             directory: {}\n\n\
+             It holds `raft/` and `sm` — a zone's consensus log and state machine. \
+             Serving it at `/` puts them in the namespace this daemon answers for: \
+             `readdir /` lists them, and a write through the VFS reaches the real \
+             files.\n\n{remedy}",
+            root_fs.display(),
+        )
     }
 
     /// Effective raft data-plane bind. `--bind-addr` when given; otherwise
@@ -1762,6 +1813,8 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         "federation cache wired",
     );
 
+    // Before anything is served from it — see `refuse_root_fs_inside_zone_storage`.
+    common.refuse_root_fs_inside_zone_storage()?;
     let root_fs = common.root_fs_path();
     std::fs::create_dir_all(&root_fs)
         .with_context(|| format!("create cluster root mount dir {}", root_fs.display()))?;
