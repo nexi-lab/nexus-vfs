@@ -25,6 +25,8 @@
 
 #![cfg(all(feature = "grpc", has_protos))]
 
+mod common;
+
 use nexus_raft::ZoneManager;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -33,10 +35,7 @@ use tempfile::TempDir;
 /// doesn't actually connect to it — we only need a unique bind address
 /// so concurrent `cargo test` invocations don't collide.
 fn ephemeral_bind_addr() -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind 0");
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    format!("127.0.0.1:{}", port)
+    common::node_bind_addr()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -35,6 +35,8 @@
 
 #![cfg(all(feature = "grpc", has_protos))]
 
+mod common;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -87,10 +89,7 @@ fn write_tls_bundle(dir: &Path, ca_pem: &[u8], cert_pem: &[u8], key_pem: &[u8]) 
 }
 
 async fn make_tls_node(node_id: u64, dir: &Path, tls: TlsFiles) -> (Arc<ZoneManager>, String) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind 0");
-    let addr = listener.local_addr().expect("local_addr");
-    drop(listener);
-    let bind_str = format!("{}", addr);
+    let bind_str = common::node_bind_addr();
 
     let zm = ZoneManager::with_node_id(
         "test-host",

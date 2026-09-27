@@ -29,6 +29,8 @@
 
 #![cfg(all(feature = "grpc", has_protos))]
 
+mod common;
+
 use std::time::Duration;
 
 use nexus_raft::prelude::Command;
@@ -53,10 +55,7 @@ fn write_node_id(dir: &std::path::Path, id: u64) {
 }
 
 async fn make_node(node_id: u64, dir: &std::path::Path) -> (std::sync::Arc<ZoneManager>, String) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind 0");
-    let addr = listener.local_addr().expect("local_addr");
-    drop(listener);
-    let bind_str = format!("{}", addr);
+    let bind_str = common::node_bind_addr();
 
     let zm = ZoneManager::with_node_id(
         "test-host",
