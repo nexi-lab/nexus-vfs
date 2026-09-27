@@ -327,12 +327,22 @@ pub trait SpawnTask<K: KernelSyscall>: Send + Sync + 'static {
     /// at teardown) are service-set. The spawn body's only role w.r.t.
     /// state is to invoke the observer on each transition; it MUST
     /// NOT write to AgentRegistry through any other path.
+    /// # Errors
+    ///
+    /// When this host cannot run an agent at all — no model configuration, an
+    /// unusable host directory. `start_session` turns that into a refusal, which is
+    /// the only place a caller can act on it: a spawn body that cannot report
+    /// failure has to panic on the daemon's own thread, and the operator then reads
+    /// a backtrace about a missing config file instead of an RPC error naming it.
+    ///
+    /// Reserved for "this cannot start", not "this run ended" — a session that
+    /// starts and later fails reports that through `state_observer`.
     fn spawn(
         &self,
         kernel: Arc<K>,
         desc: AgentDescriptor,
         state_observer: Arc<dyn Fn(AgentState, Option<String>) + Send + Sync>,
-    ) -> Box<dyn SpawnHandle>;
+    ) -> Result<Box<dyn SpawnHandle>, String>;
 }
 
 /// Raw ACP-subprocess control-plane spawner — the DI seam for the
@@ -638,7 +648,20 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                             }
                         }
                     });
-                let handle = provider.spawn(Arc::clone(&self.kernel), desc, observer);
+                // A refusal here is the session NOT starting: unwind the registration
+                // rather than leaving a pid whose runtime never existed, so a caller
+                // that retries after fixing the cause is not told the agent is
+                // already running.
+                let handle = provider
+                    .spawn(Arc::clone(&self.kernel), desc, observer)
+                    .map_err(|e| {
+                        let _ = self.agent_registry.update_state_with_reason(
+                            &pid,
+                            AgentState::Terminated,
+                            Some(e.clone()),
+                        );
+                        ManagedAgentError::Internal(format!("spawn agent runtime: {e}"))
+                    })?;
                 self.spawn_handles.insert(pid.clone(), handle);
             }
         }
@@ -1041,14 +1064,69 @@ mod tests {
             _kernel: Arc<Kernel>,
             _desc: AgentDescriptor,
             state_observer: Arc<dyn Fn(AgentState, Option<String>) + Send + Sync>,
-        ) -> Box<dyn SpawnHandle> {
+        ) -> Result<Box<dyn SpawnHandle>, String> {
             state_observer(AgentState::WarmingUp, None);
             state_observer(AgentState::Ready, None);
             state_observer(AgentState::Busy, None);
             // Blocked on a reply it requested — carries an opaque reason.
             state_observer(AgentState::AwaitingInput, Some("permission".to_string()));
-            Box::new(NoopHandle)
+            Ok(Box::new(NoopHandle))
         }
+    }
+
+    /// A host that cannot run an agent at all — no model configuration, an unusable
+    /// host directory — refuses the session instead of dying on the daemon's thread.
+    struct RefusingSpawn;
+    impl SpawnTask<Kernel> for RefusingSpawn {
+        fn spawn(
+            &self,
+            _kernel: Arc<Kernel>,
+            _desc: AgentDescriptor,
+            _state_observer: Arc<dyn Fn(AgentState, Option<String>) + Send + Sync>,
+        ) -> Result<Box<dyn SpawnHandle>, String> {
+            Err("no sudocode configuration at /nowhere".to_string())
+        }
+    }
+
+    /// `start_session` answers with the refusal, and the pid it had already planted
+    /// does not linger as a session whose runtime never existed.
+    ///
+    /// Before the seam could refuse, a co-host with no model configuration panicked
+    /// inside the spawn — so an RPC that should have answered "this daemon has no
+    /// agent configuration" instead took down a daemon thread and left the operator
+    /// reading a backtrace about a missing file.
+    #[test]
+    fn a_host_that_cannot_start_an_agent_refuses_the_session() {
+        let kernel = Arc::new(Kernel::new());
+        let registry = Arc::clone(kernel.agent_registry());
+        let svc = ManagedAgentService::<Kernel>::with_spawn(
+            Arc::clone(&kernel),
+            Arc::clone(&registry),
+            Arc::new(RefusingSpawn),
+        );
+
+        let err = svc
+            .start_session(req("scode-standard"))
+            .expect_err("a host that cannot spawn must refuse");
+        let text = err.to_string();
+        assert!(
+            text.contains("no sudocode configuration"),
+            "the refusal must carry the host's reason, not a generic failure: {text}"
+        );
+
+        // Whatever pid was planted is Terminated WITH that reason — a caller listing
+        // sessions sees why, and a retry after fixing the cause is not told the agent
+        // is already running.
+        let live: Vec<_> = registry
+            .list(None, None, None, None)
+            .into_iter()
+            .filter(|d| d.state != AgentState::Terminated)
+            .map(|d| (d.pid, d.state))
+            .collect();
+        assert!(
+            live.is_empty(),
+            "a refused spawn must leave no live session: {live:?}"
+        );
     }
 
     #[test]
@@ -1134,7 +1212,7 @@ mod tests {
             kernel: Arc<Kernel>,
             desc: AgentDescriptor,
             state_observer: Arc<dyn Fn(AgentState, Option<String>) + Send + Sync>,
-        ) -> Box<dyn SpawnHandle> {
+        ) -> Result<Box<dyn SpawnHandle>, String> {
             state_observer(AgentState::WarmingUp, None);
             let ptr = Arc::as_ptr(&kernel) as usize;
             // Real in-process KernelSyscall on the SHARED kernel: stat the
@@ -1145,7 +1223,7 @@ mod tests {
             let hit = kernel.sys_stat(&ws, &desc.zone_id).is_some();
             self.seen.lock().unwrap().push((ptr, desc.pid.clone(), hit));
             state_observer(AgentState::Ready, None);
-            Box::new(NoopHandle)
+            Ok(Box::new(NoopHandle))
         }
     }
 
