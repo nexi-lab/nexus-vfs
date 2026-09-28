@@ -99,6 +99,24 @@ pub enum MetaStoreError {
     IOError(String),
 }
 
+/// An error that carries its own message.
+///
+/// It had only `Debug`, so every site that wanted to report one either printed
+/// `IOError("…")` at an operator or hand-wrote a sentence around it — and it could
+/// not be boxed as `dyn Error` or lifted with `?` into an `anyhow` chain. Naming the
+/// store in the text rather than at each call site is what keeps those sentences from
+/// drifting apart.
+impl std::fmt::Display for MetaStoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound(key) => write!(f, "metastore key not found: {key}"),
+            Self::IOError(msg) => write!(f, "metastore I/O error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for MetaStoreError {}
+
 /// Result of a `put_if_version` optimistic-concurrency check.
 ///
 /// Naming note: "CAS" in the kernel already means **Content-Addressed
