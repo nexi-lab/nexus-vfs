@@ -3598,9 +3598,39 @@ impl Kernel {
             scan_root.trim_end_matches('/')
         };
 
-        if let Some(ms_children) =
-            self.with_metastore_route(route, |ms| ms.list(&global_prefix).ok())
-        {
+        // A store that cannot be read is reported, not silently folded into "this
+        // directory is empty".
+        //
+        // # Why this WARNs instead of returning an error (#345)
+        //
+        // `sys_readdir` returns a `Vec`, and making it a `Result` is not a local
+        // change: 35 call sites, the async mirror, the gRPC handler — and the plugin
+        // ABI, which is a C dispatch seam. Widening an infra ABI to carry an error
+        // most callers cannot act on is the wrong trade, so the syscall keeps its
+        // shape and the failure becomes VISIBLE here, naming the prefix and the
+        // error, where before it produced an empty listing and no trace at all.
+        //
+        // That leaves one thing this cannot fix: a REMOTE caller still cannot tell
+        // "empty" from "unreadable", because the distinction has to cross the wire to
+        // reach it. That is a `ReaddirResponse` field, not a syscall return type —
+        // decided rather than left open, so the next person does not re-derive it.
+        //
+        // Also note the merge semantics this respects: one mount failing does not
+        // invalidate the others, so the listing continues with what the remaining
+        // mounts hold rather than collapsing to nothing.
+        let listing = self.with_metastore_route(route, |ms| match ms.list(&global_prefix) {
+            Ok(rows) => Some(rows),
+            Err(e) => {
+                tracing::warn!(
+                    prefix = %global_prefix,
+                    error = %e,
+                    "metastore listing failed — this directory's entries from that store \
+                     are MISSING from the result, not absent from the namespace"
+                );
+                None
+            }
+        });
+        if let Some(ms_children) = listing {
             let parent_depth = global_prefix.matches('/').count();
             // Directories that exist because something below them does — see
             // [`implied_relative_dirs`] for why a listing derives them instead of
