@@ -12,77 +12,17 @@
 //!
 //! All tests exercise the public Kernel API only — no `pub(crate)` internals.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use kernel::abc::object_store::{ObjectStore, StorageError, WriteResult};
 use kernel::kernel::syscall::KernelSyscall;
 use kernel::kernel::{Kernel, OperationContext};
 use kernel::service_registry::ServiceLifecycle;
 use kernel::{HookContext, HookOutcome, NativeInterceptHook};
 
+mod common;
+
 // ── Shared test infrastructure ────────────────────────────────────────
-
-/// Minimal in-memory backend for sys_write to succeed.
-#[derive(Default)]
-struct MemBackend {
-    blobs: std::sync::Mutex<HashMap<String, Vec<u8>>>,
-}
-
-impl ObjectStore for MemBackend {
-    fn name(&self) -> &str {
-        "mem"
-    }
-
-    fn write_content(
-        &self,
-        content: &[u8],
-        content_id: &str,
-        _ctx: &OperationContext,
-        offset: u64,
-    ) -> Result<WriteResult, StorageError> {
-        let mut map = self.blobs.lock().unwrap();
-        let entry = map.entry(content_id.to_string()).or_default();
-        let start = offset as usize;
-        if start > entry.len() {
-            entry.resize(start, 0);
-        }
-        let end = start + content.len();
-        if end > entry.len() {
-            entry.resize(end, 0);
-        }
-        entry[start..end].copy_from_slice(content);
-        let size = entry.len() as u64;
-        Ok(WriteResult {
-            content_id: content_id.to_string(),
-            version: content_id.to_string(),
-            size,
-        })
-    }
-
-    fn read_content(
-        &self,
-        content_id: &str,
-        _ctx: &OperationContext,
-    ) -> Result<Vec<u8>, StorageError> {
-        self.blobs
-            .lock()
-            .unwrap()
-            .get(content_id)
-            .cloned()
-            .ok_or_else(|| StorageError::NotFound(content_id.into()))
-    }
-
-    fn get_content_size(&self, content_id: &str) -> Result<u64, StorageError> {
-        self.blobs
-            .lock()
-            .unwrap()
-            .get(content_id)
-            .map(|d| d.len() as u64)
-            .ok_or_else(|| StorageError::NotFound(content_id.into()))
-    }
-}
 
 /// Counting hook — increments `pre_count` on every `on_pre` call.
 struct CountingHook {
@@ -159,35 +99,8 @@ impl ServiceLifecycle for StubService {
 /// along with a system OperationContext.
 fn setup_kernel() -> (Kernel, OperationContext) {
     let k = Kernel::new();
-    let backend = Arc::new(MemBackend::default());
-
-    k.sys_setattr(
-        "/",
-        2, // DT_MOUNT
-        "mem",
-        Some(backend as Arc<dyn ObjectStore>),
-        None,
-        None,
-        "",
-        kernel::ROOT_ZONE_ID,
-        false,
-        0,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None, // created_at_ms
-        None, // link_target
-        None, // source
-        None, // metastore
-    )
-    .expect("mount / with MemBackend");
-
-    let ctx = OperationContext::new("test", "root", true, None, true);
-    (k, ctx)
+    common::mount_mem_root(&k);
+    (k, common::admin_ctx())
 }
 
 /// Helper: perform a single sys_write and return whether it succeeded.
