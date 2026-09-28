@@ -11,7 +11,7 @@
 //!   mailbox_cli <port> <sk-token> read      <path>
 //!   mailbox_cli <port> <sk-token> mkstream  <path>            # DT_STREAM (wal,memory)
 //!   mailbox_cli <port> <credential> send    <peer> <message>  # a message an AGENT reads
-//!   mailbox_cli <port> <credential> send-sealed <path> <msg>  # signed envelope (cross-org)
+//!   mailbox_cli <port> <credential> send-sealed <path> <msg>  # signed; only `collect` opens it
 //!   mailbox_cli <port> <sk-token> collect   <path>            # read-all + verify seal
 //!   mailbox_cli <port> <sk-token> send-raw  <path> <message>  # UNSIGNED plain-JSON append
 //!   mailbox_cli <port> <sk-token> collect-raw <path>          # read-all, raw bytes (no open)
@@ -25,13 +25,21 @@
 //! co-hosted agent has no terminal: its lifecycle is these RPCs and its input is a
 //! stream append, which is why one tool covers both.
 //!
-//! `send-raw` + `collect-raw` are the cross-org path: an agent writes a plain
-//! JSON envelope and the daemon's A2A stamp hook rewrites `from` to the
+//! Three ops put a message on a transcript, and what separates them is what the
+//! RECEIVER can do with the frame. `send` and `send-raw` write a plain JSON
+//! envelope, which is what an agent's parser reads; `send-sealed` writes a
+//! signature, which only `collect` opens. So `send` is the one that reaches an
+//! agent — it names the peer and indexes the conversation — `send-raw` appends
+//! exactly the bytes given at a path, and `send-sealed` is for when the point is
+//! the signature rather than the delivery.
+//!
+//! `send-raw` + `collect-raw` also show the daemon's A2A stamp hook: on a
+//! `*/transcript` mailbox it rewrites a plain envelope's `from` to the
 //! authenticated (possibly cross-trust-domain) `agent_id` — e.g. a foreign
 //! agent whose CA was `foreign-ca register`ed reads back
-//! `"from":"{trust_domain}/agent/{name}"`. In cert mode point `ca.pem` at the
-//! BROKER's cluster CA (to verify the server); the agent leaf may be signed by
-//! a different (foreign) CA.
+//! `"from":"{trust_domain}/agent/{name}"`. That is the identity a receiver gets
+//! without a signature. In cert mode point `ca.pem` at the BROKER's cluster CA
+//! (to verify the server); the agent leaf may be signed by a different (foreign) CA.
 
 use kernel::kernel::vfs_proto::{
     nexus_vfs_service_client::NexusVfsServiceClient, CallRequest, IpcPathRequest, MkdirRequest,
@@ -421,9 +429,9 @@ async fn mkstream(
     err_if(r.is_error, &r.error_payload)
 }
 
-/// Append `data` to a DT_STREAM and print the assigned offset. Shared by the
-/// sealed (`send`) and unsigned (`send-raw`) ops — they differ only in whether
-/// `data` is a signed envelope or plain bytes.
+/// Append `data` to a DT_STREAM and print the assigned offset. Shared by all three
+/// sending ops — they differ only in what `data` is (a plain envelope for `send` and
+/// `send-raw`, a signature for `send-sealed`) and in who picks the path.
 async fn stream_append(
     c: &mut NexusVfsServiceClient<Channel>,
     path: &str,
