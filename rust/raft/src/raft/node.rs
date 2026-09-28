@@ -1429,15 +1429,27 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             .await
             {
                 Ok(result) => Ok(result),
+                // Propagated as a TRANSPORT failure, not rewritten to `NotLeader`.
+                // The request was sent; what is missing is the answer. The leader may
+                // have appended and committed it before the connection broke, so the
+                // outcome is UNKNOWN — see `RaftError::proposal_outcome_unknown`.
+                //
+                // Rewriting it to `NotLeader` told the caller two false things: that
+                // nothing was applied, and that the reason was leadership. #342 is
+                // what that looks like from outside — a write reported as
+                // `not leader, leader hint: None` whose value read back fine a moment
+                // later, and a client that gave up on the rest of its sequence
+                // believing the first step had not happened.
                 Err(RaftError::Transport(e)) => {
                     tracing::warn!(
                         leader_node_id = leader_id,
                         leader_addr = %leader_addr.to_operator_str(),
                         zone = %ctx.zone_id,
-                        "Forward to leader failed (unreachable?): {}",
+                        "Forward to leader failed after the proposal was sent — the \
+                         outcome is UNKNOWN, it may have committed: {}",
                         e,
                     );
-                    Err(RaftError::NotLeader { leader_hint: None })
+                    Err(RaftError::Transport(e))
                 }
                 Err(e) => Err(e),
             };
