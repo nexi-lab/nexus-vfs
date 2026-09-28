@@ -1448,10 +1448,36 @@ fn data_dir_locked_error(data_dir: &std::path::Path, store_path: &str) -> anyhow
 /// `Progress[new_id].matched=0` from the moment AddNode commits, so
 /// heartbeats with `m.commit=0` cannot trip raft-rs 0.7's
 /// `commit_to`'s stale-`Progress` panic.
+/// Where this `ZoneManager`'s raft transport listens.
+///
+/// A `ZoneManager` always starts a raft gRPC server, and the address it takes is
+/// the daemon's. For a daemon that is the point. For a one-shot subcommand it is
+/// collateral: `auth mint` took `0.0.0.0:2126` for the second it ran, so on a
+/// machine that hosts a node the mint failed with `bind … os error 10048` and a
+/// daemon log — which reads as "the mint is broken". It also meant
+/// `cargo test --workspace` could not pass on any developer box running a node,
+/// because the cluster harness shells out to that subcommand.
+///
+/// [`Self::Private`] is NOT a general "offline subcommand" setting, and the
+/// distinction is a raft one: a peer's append/vote RESPONSES are delivered to our
+/// server address, so a command that needs quorum from other voters must be
+/// reachable. It is legal only where the zone is solo — which the credential path
+/// establishes and enforces (per-node `root` under `--no-tls`, or the founder's
+/// sole-voter control zone, with enrolled joiners refused outright). `share` and
+/// `join` keep [`Self::Advertised`] for exactly that reason.
+enum ListenerBind {
+    /// The daemon's advertised bind — peers dial it.
+    Advertised,
+    /// Loopback on an ephemeral port: a listener nothing else can reach, for a
+    /// solo zone that nothing else needs to reach.
+    Private,
+}
+
 fn open_zone_manager(
     common: &CommonArgs,
     extra_grpc_services: Option<tonic::service::Routes>,
     load_policy: ZoneLoadPolicy,
+    listener: ListenerBind,
 ) -> Result<ZoneManagerBundle> {
     std::fs::create_dir_all(&common.data_dir)
         .with_context(|| format!("create data dir {}", common.data_dir.display()))?;
@@ -1575,6 +1601,15 @@ fn open_zone_manager(
         .rsplit_once(':')
         .and_then(|(_, p)| p.parse::<u16>().ok())
         .unwrap_or(2126);
+    // What the raft server BINDS, which is not always the address this node IS: a
+    // private listener still derives its identity and `self_address` from the
+    // configured bind, because those are persisted and read back by peers. Deriving
+    // them from an ephemeral port instead would write `<host>:0` into the identity
+    // — the same class of mistake as pointing a dial target at a listener.
+    let listen_addr = match listener {
+        ListenerBind::Advertised => effective_bind.clone(),
+        ListenerBind::Private => "127.0.0.1:0".to_string(),
+    };
     // A remote peer (any peer NOT on loopback) means this is a cross-machine
     // cluster: a loopback / wildcard / bare-hostname advertise is then
     // unreachable and must fail loud rather than silently wedge the zone.
@@ -1609,7 +1644,7 @@ fn open_zone_manager(
         node_id,
         &zones_dir,
         merged_peers_str,
-        &effective_bind,
+        &listen_addr,
         tls,
         Some(self_address.clone()),
         extra_grpc_services,
@@ -1988,7 +2023,12 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         cli_peer_addrs,
         identity_persisted_peers,
         identity_zones,
-    } = open_zone_manager(&common, Some(vfs_routes), ZoneLoadPolicy::OnDemand)?;
+    } = open_zone_manager(
+        &common,
+        Some(vfs_routes),
+        ZoneLoadPolicy::OnDemand,
+        ListenerBind::Advertised,
+    )?;
 
     // Fill the VFS service's verifier slot now that the ZoneManager (and its
     // eagerly-built verifier) exists. Auth-on ⇒ the VFS request path classifies
@@ -3336,7 +3376,12 @@ async fn run_share(
 ) -> Result<()> {
     let ZoneManagerBundle {
         zm, cli_peer_addrs, ..
-    } = open_zone_manager(&common, None, ZoneLoadPolicy::OnDemand)?;
+    } = open_zone_manager(
+        &common,
+        None,
+        ZoneLoadPolicy::OnDemand,
+        ListenerBind::Advertised,
+    )?;
     let peers_str: Vec<String> = cli_peer_addrs
         .iter()
         .map(NodeAddress::to_raft_peer_str)
@@ -3728,7 +3773,12 @@ async fn run_join(
         node_id,
         self_address,
         ..
-    } = open_zone_manager(&common, None, ZoneLoadPolicy::OnDemand)?;
+    } = open_zone_manager(
+        &common,
+        None,
+        ZoneLoadPolicy::OnDemand,
+        ListenerBind::Advertised,
+    )?;
 
     // Pre-#3996 (and pre-this commit) ``run_join`` only invoked
     // ``zm.join_zone(remote_zone_id, peers, false)`` — that registers
@@ -4738,6 +4788,10 @@ fn open_auth_store(
         common,
         None,
         ZoneLoadPolicy::Only(vec![auth_zone.to_string()]),
+        // Solo zone, one command, no peer that needs to reach us — see
+        // `ListenerBind`. Taking the daemon's port here made `auth mint` fail on
+        // any machine already running a node.
+        ListenerBind::Private,
     )?;
     // Found-on-demand as a SOLO voter: correct for both `root` (per-node, always
     // solo) and the founder's control zone (founder = sole voter). Idempotent
