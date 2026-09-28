@@ -3516,6 +3516,50 @@ impl Kernel {
         )
     }
 
+    /// The directories a row at `path` implies, as segments relative to a listing
+    /// rooted at `global_prefix`: under `/agents/`, a row at
+    /// `/agents/deep/conversations/x` implies `deep`, and recursively also
+    /// `deep/conversations`.
+    ///
+    /// # Why a listing derives these instead of reading them
+    ///
+    /// A write plants the LEAF's row only, so `/a/b/c` leaves `b` with no row of its
+    /// own — while `b` still STATS as a directory, because `sys_stat` resolves a
+    /// path rather than consulting its parent's listing. Filtering the prefix scan
+    /// to rows at exactly one level therefore answered "is this a directory" and "is
+    /// it listed in its parent" differently, and nothing could reconcile the second:
+    /// `sys_setattr(DT_DIR)` on an entry that already resolves is a no-op, so the
+    /// caller that noticed had no move. Live, that made an agent whose subtree was
+    /// first touched deep — a peer writing `/agents/<name>/conversations/<peer>` —
+    /// permanently absent from `readdir /agents` on that node while `stat` found it
+    /// from either machine, so two nodes listed two different sets.
+    ///
+    /// Derived rather than planted on write, deliberately: membership becomes a
+    /// FUNCTION of the rows that exist instead of a second stored fact that can
+    /// disagree with them, the write path stays one row per write, nothing has to be
+    /// backfilled for the rows already on disk, and a read path adds no raft
+    /// traffic. The rows are in hand — the caller's scan returned them — so the cost
+    /// is a segment walk over rows deeper than the listing.
+    ///
+    /// Segments are BORROWED from `path` so a caller can compare before it
+    /// allocates. A recursive listing wants every level, because it reports a
+    /// subtree and a subtree with holes is the same defect one level down; a
+    /// single-level listing wants only the first, which is the only one that is a
+    /// child of that listing.
+    fn implied_relative_dirs<'p>(
+        global_prefix: &str,
+        path: &'p str,
+        recursive: bool,
+    ) -> impl Iterator<Item = &'p str> {
+        // `get`, not a slice: a caller that asks about a path shorter than the
+        // prefix gets an empty iterator rather than a panic on a char boundary.
+        let rest = path.get(global_prefix.len()..).unwrap_or_default();
+        let levels = if recursive { usize::MAX } else { 1 };
+        rest.match_indices('/')
+            .map(move |(off, _)| &rest[..off])
+            .take(levels)
+    }
+
     /// Merge ONE mount's listing into `seen` — the metastore prefix scan plus
     /// the backend `list_dir` / federation `via_federation_readdir` union.
     /// Factored out of [`Self::sys_readdir`] so a recursive scan can call it
@@ -3547,19 +3591,46 @@ impl Kernel {
             self.with_metastore_route(route, |ms| ms.list(&global_prefix).ok())
         {
             let parent_depth = global_prefix.matches('/').count();
+            // Directories that exist because something below them does — see
+            // [`implied_relative_dirs`] for why a listing derives them instead of
+            // reading rows that a write never planted.
+            let mut implied: Vec<(String, Option<String>)> = Vec::new();
+            let mut last_implied = String::new();
             for meta in ms_children.into_iter().flatten() {
+                if !meta.path.starts_with(&global_prefix) {
+                    continue;
+                }
+                let depth = meta.path.matches('/').count();
+                if depth > parent_depth {
+                    for rel in Self::implied_relative_dirs(&global_prefix, &meta.path, recursive) {
+                        // `list` hands back sorted paths, so every row under one
+                        // subtree arrives contiguously, and comparing the BORROWED
+                        // segment first makes a whole subtree cost one allocation
+                        // instead of one per row. Purely a saving: out-of-order rows
+                        // yield duplicates, which the `or_insert` below absorbs.
+                        if rel == last_implied {
+                            continue;
+                        }
+                        last_implied.clear();
+                        last_implied.push_str(rel);
+                        implied.push((format!("{global_prefix}{rel}"), meta.zone_id.clone()));
+                    }
+                }
                 // Single-level keeps direct children only (same depth as the
                 // prefix + 1 segment); recursive keeps the whole subtree the
                 // one prefix scan already returned — that is the round-trip
                 // collapse (one server-side scan vs O(dirs) client calls).
-                if !recursive && meta.path.matches('/').count() != parent_depth {
-                    continue;
-                }
-                if !meta.path.starts_with(&global_prefix) {
+                if !recursive && depth != parent_depth {
                     continue;
                 }
                 seen.entry(meta.path)
                     .or_insert((meta.entry_type, meta.zone_id));
+            }
+            // After the stored rows, never before: a real entry is authoritative
+            // about its own type, and a derived one must not mask it just because
+            // a deeper row happened to be scanned first.
+            for (path, zone_id) in implied {
+                seen.entry(path).or_insert((DT_DIR, zone_id));
             }
         }
 
@@ -4332,5 +4403,67 @@ mod read_batch_tests {
                 format!("v{i}").as_bytes()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod implied_dirs_tests {
+    use crate::kernel::Kernel;
+
+    /// Collect into owned strings so assertions read as the paths they are.
+    fn implied(prefix: &str, path: &str, recursive: bool) -> Vec<String> {
+        Kernel::implied_relative_dirs(prefix, path, recursive)
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn a_direct_child_implies_nothing() {
+        // It IS the listing's child; there is no intermediate to derive.
+        assert!(implied("/agents/", "/agents/bot", false).is_empty());
+        assert!(implied("/agents/", "/agents/bot", true).is_empty());
+    }
+
+    #[test]
+    fn single_level_takes_only_the_child_of_this_listing() {
+        assert_eq!(
+            implied("/agents/", "/agents/deep/conversations/x", false),
+            vec!["deep"]
+        );
+    }
+
+    #[test]
+    fn recursive_takes_every_level_between() {
+        // A recursive listing reports the subtree, so every level it will attach
+        // children to has to be in the result.
+        assert_eq!(
+            implied("/agents/", "/agents/deep/conversations/x", true),
+            vec!["deep", "deep/conversations"]
+        );
+    }
+
+    #[test]
+    fn the_root_listing_prefix_is_handled() {
+        // The root's prefix is "/" rather than "<dir>/", the one case where the
+        // prefix is not a directory path plus a separator.
+        assert_eq!(implied("/", "/agents/deep", false), vec!["agents"]);
+        assert_eq!(implied("/", "/agents/deep", true), vec!["agents"]);
+        assert_eq!(
+            implied("/", "/agents/deep/x", true),
+            vec!["agents", "agents/deep"]
+        );
+    }
+
+    #[test]
+    fn a_path_shorter_than_the_prefix_yields_nothing() {
+        // Defensive: the caller filters by `starts_with` first, so this is
+        // unreachable there — and it must not panic if that ever changes.
+        assert!(implied("/agents/deep/", "/agents", false).is_empty());
+    }
+
+    #[test]
+    fn a_trailing_separator_does_not_imply_an_empty_segment() {
+        // A row stored as "<dir>/" would otherwise derive the listing root itself.
+        assert_eq!(implied("/agents/", "/agents/deep/", false), vec!["deep"]);
     }
 }
