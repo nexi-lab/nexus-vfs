@@ -638,9 +638,12 @@ impl StreamBackend for WalStreamCore {
                     error = %e,
                     "wal DT_STREAM push failed to replicate — write rejected (fail-loud)"
                 );
-                Err(StreamError::Closed(
-                    "wal DT_STREAM push failed to replicate (no reachable leader?)",
-                ))
+                // The reason goes to the CALLER, not only to this log. It used
+                // to be replaced here by a canned "no reachable leader?" and
+                // reported as `Closed`, so a client learned neither what
+                // happened nor that the stream was still open — see
+                // `StreamError::NotReplicated`.
+                Err(StreamError::NotReplicated(e))
             }
         }
     }
@@ -769,6 +772,10 @@ mod tests {
 
     struct MemKvStore {
         inner: Mutex<StreamKv>,
+        /// When set, `append_stream_entry` fails with this message — the store
+        /// side of "the propose did not commit", which is the only way to reach
+        /// the failing branch of `push` without a raft cluster.
+        append_error: Option<String>,
     }
 
     impl MetaStore for MemKvStore {
@@ -795,6 +802,9 @@ mod tests {
             stream_prefix: &str,
             data: &[u8],
         ) -> Result<u64, MetaStoreError> {
+            if let Some(why) = &self.append_error {
+                return Err(MetaStoreError::IOError(why.clone()));
+            }
             let mut i = self.inner.lock().unwrap();
             let seq = *i.tails.get(stream_prefix).unwrap_or(&0);
             i.entries
@@ -965,11 +975,51 @@ mod tests {
     fn store() -> Arc<dyn MetaStore> {
         Arc::new(MemKvStore {
             inner: Mutex::new(StreamKv::default()),
+            append_error: None,
+        })
+    }
+
+    fn store_that_refuses_appends(why: &str) -> Arc<dyn MetaStore> {
+        Arc::new(MemKvStore {
+            inner: Mutex::new(StreamKv::default()),
+            append_error: Some(why.to_string()),
         })
     }
 
     fn core() -> WalStreamCore {
         WalStreamCore::new(store(), "test".into())
+    }
+
+    /// A refused append reports the STORE's reason, and does not claim the
+    /// stream is closed.
+    ///
+    /// Both halves were wrong for a while, and the cost was an afternoon of
+    /// reading CI logs: every failure to replicate reached the client as
+    /// `Closed("wal DT_STREAM push failed to replicate (no reachable leader?)")`
+    /// — a reason the client could not check, attached to an assertion about the
+    /// stream's state that was false (nexi-lab/nexus-vfs#344).
+    #[test]
+    fn a_refused_append_says_why_and_leaves_the_stream_open() {
+        let c = WalStreamCore::new(
+            store_that_refuses_appends("propose timed out after 5s"),
+            "mbox".into(),
+        );
+
+        let err = match StreamBackend::push(&c, b"hello") {
+            Err(e) => e,
+            Ok(off) => panic!("a store that refuses appends must not report success at {off}"),
+        };
+        match &err {
+            StreamError::NotReplicated(why) => assert!(
+                why.contains("propose timed out after 5s"),
+                "the store's own reason must reach the caller: {why}"
+            ),
+            other => panic!("a failed append must not be reported as {other:?}"),
+        }
+        assert!(
+            !StreamBackend::is_closed(&c),
+            "only this append failed — the stream still takes the next one"
+        );
     }
 
     /// The core keeps NO local cursor — the store owns it. A fresh instance
