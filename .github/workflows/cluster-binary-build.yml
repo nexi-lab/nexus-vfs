@@ -23,10 +23,16 @@ jobs:
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
-            max_size_bytes: 17563648  # 16.75 MiB — raised from 16.25 for the
-                                      # managed-agent control plane relocated into
-                                      # nexusd-cluster (#241). Measured 17,130,264 bytes
-                                      # on this platform.
+            max_size_bytes: 17825792  # 17.0 MiB — raised from 16.75 for the bounded
+                                      # channel establishment (#351: the TLS handshake
+                                      # sat between `connect_timeout` and `timeout` and
+                                      # was bounded by neither, so a peer that accepts
+                                      # and never answers parked a dialer forever).
+                                      # Measured 17,565,528 bytes here, 1,880 over the
+                                      # old cap — the timeout future's monomorphisation
+                                      # plus one diagnostic string, not a step change.
+                                      # The other three platforms absorbed it inside
+                                      # their existing budgets; this is the tightest.
           - os: macos-14
             artifact_name: nexusd-cluster-macos-arm64
             package: nexus-cluster
