@@ -7,6 +7,21 @@ use super::error::TransportError;
 ///
 /// Centralizes Endpoint configuration (timeouts, keepalive, TLS) so
 /// each domain crate doesn't reinvent channel setup.
+///
+/// # The whole connect is bounded, not each layer of it
+///
+/// `connect_timeout` bounds the TCP connect and `timeout` bounds a request, and
+/// between them sits the TLS handshake, which neither covers. A peer that ACCEPTS
+/// the connection and then says nothing therefore parks this await forever — and
+/// "accepts and says nothing" is not exotic: a wedged daemon, a port-forward with
+/// nothing behind it, a socket bound by a process that never reads it. Found the
+/// hard way: `auth mint` on an enrolled node dials its own daemon first, and with a
+/// silent listener on that port the command hung indefinitely instead of failing
+/// over to the founder after its stated 15 seconds.
+///
+/// So the caller's `connect_timeout` bounds the entire establishment. A caller that
+/// asks for 15 seconds gets an answer in 15 seconds, whichever layer stalls, which
+/// is the only version of a timeout a caller can reason about.
 #[allow(clippy::result_large_err)]
 pub async fn create_channel(
     endpoint: &str,
@@ -31,7 +46,14 @@ pub async fn create_channel(
         ep = apply_tls(ep, tls)?;
     }
 
-    ep.connect().await.map_err(TransportError::Tonic)
+    match tokio::time::timeout(config.connect_timeout, ep.connect()).await {
+        Ok(result) => result.map_err(TransportError::Tonic),
+        Err(_) => Err(TransportError::Connection(format!(
+            "connect to {endpoint} did not complete within {:?} — the peer may be accepting \
+             connections without completing a handshake",
+            config.connect_timeout
+        ))),
+    }
 }
 
 /// Install the process-level rustls `CryptoProvider` (ring) exactly once.
