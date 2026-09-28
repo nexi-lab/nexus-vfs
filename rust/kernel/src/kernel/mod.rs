@@ -2845,6 +2845,12 @@ fn stream_mgr_err(e: crate::stream_manager::StreamManagerError) -> KernelError {
                 StreamError::Truncated(earliest, req) => {
                     KernelError::StreamTruncated(earliest, req)
                 }
+                // An append that did not commit is an I/O failure, NOT a closed
+                // stream: the reason travels verbatim so the client sees what
+                // happened instead of a Debug dump of the variant.
+                StreamError::NotReplicated(why) => {
+                    KernelError::IOError(format!("stream append did not commit: {why}"))
+                }
                 other => KernelError::IOError(format!("stream: {other:?}")),
             }
         }
