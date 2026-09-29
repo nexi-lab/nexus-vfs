@@ -193,6 +193,24 @@ pub struct TlsFiles {
     pub join_token_hash: Option<String>,
 }
 
+/// Is this bind failure "somebody else already has the address"?
+///
+/// Walks the source chain to an `io::Error` and reads its `kind`, rather than matching
+/// the rendered message. The text is
+/// `connection error: bind 0.0.0.0:2126: address already in use (os error 10048)` on
+/// Windows and `(os error 98)` on Linux, so a string test would be platform-specific
+/// and would go quiet the day tonic rewords it — while still compiling.
+fn addr_in_use(e: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cur = Some(e);
+    while let Some(err) = cur {
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            return io.kind() == std::io::ErrorKind::AddrInUse;
+        }
+        cur = err.source();
+    }
+    false
+}
+
 /// Multi-zone raft registry owner (pure Rust, kernel-internal).
 pub struct ZoneManager {
     registry: Arc<ZoneRaftRegistry>,
@@ -507,6 +525,9 @@ impl ZoneManager {
             server = server.with_extra_services(extra);
         }
         let shutdown_rx_server = shutdown_rx.clone();
+        // Owned: the failure message below names the address, and the task outlives
+        // this borrow.
+        let bind_for_error = bind_addr.to_string();
         runtime.spawn(async move {
             let shutdown = async move {
                 let mut rx = shutdown_rx_server;
@@ -527,13 +548,33 @@ impl ZoneManager {
                 // server startup is a strict prerequisite for
                 // federation and there is no recovery from within the
                 // process — bind is either possible or not.
-                tracing::error!(
-                    error = %e,
-                    "ZoneManager gRPC server terminated with error — this is \
-                     unrecoverable (bind failure on gRPC endpoint); exiting \
-                     the daemon so the operator / supervisor sees a hard fail \
-                     instead of a silently-degraded process",
-                );
+                // Name the one cause an operator can act on. "Someone else has this
+                // address" is a different instruction from "this address is not on any
+                // interface", and a one-shot subcommand hitting the first one used to
+                // read this daemon-shaped sentence and conclude its own federation was
+                // broken (#328).
+                if addr_in_use(&e) {
+                    tracing::error!(
+                        error = %e,
+                        bind = %bind_for_error,
+                        "another process already holds {bind_for_error}. This process has to \
+                         be reachable THERE — a zone with other voters delivers their \
+                         append/vote responses to the address its peers were told to \
+                         dial, so an ephemeral port would leave it waiting forever. \
+                         Stop whatever holds it, or run this against the data dir whose \
+                         node owns that address",
+                    );
+                } else {
+                    tracing::error!(
+                        error = %e,
+                        bind = %bind_for_error,
+                        "gRPC bind on {bind_for_error} failed for a reason other than the \
+                         address being taken — an IP not assigned to any interface (a \
+                         Tailscale address while the tunnel is down does this) or a TLS \
+                         material mismatch. Nothing can reach this process until it \
+                         binds, so there is no degraded mode to continue in",
+                    );
+                }
                 std::process::exit(1);
             }
         });
@@ -1972,5 +2013,60 @@ mod tests {
         let _ = zm
             .create_zone("z1", vec![])
             .expect("create idempotent on restart");
+    }
+}
+
+#[cfg(test)]
+mod bind_failure_tests {
+    use super::addr_in_use;
+
+    /// A tonic bind failure arrives wrapped, so the check has to walk the chain rather
+    /// than look at the top-level error.
+    #[derive(Debug)]
+    struct Wrapped(std::io::Error);
+
+    impl std::fmt::Display for Wrapped {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "connection error")
+        }
+    }
+
+    impl std::error::Error for Wrapped {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    #[test]
+    fn a_taken_address_is_recognised_through_the_wrapper() {
+        let e = Wrapped(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            "address already in use",
+        ));
+        assert!(addr_in_use(&e));
+    }
+
+    #[test]
+    fn an_unassigned_address_is_not_a_taken_one() {
+        // A Tailscale address while the tunnel is down: the operator's action is
+        // different, so the two must not share a message.
+        let e = Wrapped(std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            "cannot assign requested address",
+        ));
+        assert!(!addr_in_use(&e));
+    }
+
+    #[test]
+    fn no_io_error_in_the_chain_is_not_a_taken_address() {
+        #[derive(Debug)]
+        struct Tls;
+        impl std::fmt::Display for Tls {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "tls handshake failed")
+            }
+        }
+        impl std::error::Error for Tls {}
+        assert!(!addr_in_use(&Tls));
     }
 }
