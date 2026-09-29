@@ -3300,7 +3300,63 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
                     // the later read routes to the mount zone and finds nothing
                     // (the federation-mount half of #276). Gate opens once; the
                     // loop keeps reconciling forever after.
+                    // Routing resolved is NOT write-admitted. A wal DT_STREAM push
+                    // replicates through raft, so a zone with no leader refuses it —
+                    // and #344 is what that looked like: this line at 18:00:24, a
+                    // write rejected with "no reachable leader?" at 18:00:36. The
+                    // client did exactly what the line invited it to do.
+                    //
+                    // "serving client requests" is the one observable every harness
+                    // and embedder waits on, so it has to mean a write will be
+                    // admitted. Hold it until the zones this node has MATERIALIZED
+                    // report a leader.
+                    //
+                    // Only materialized ones: an idle zone deliberately has no raft
+                    // node (#269), so demanding a leader for every catalogued zone
+                    // would hold this line shut forever on a node that is working
+                    // perfectly. A write to such a zone materializes it, and
+                    // leadership is that path's business.
+                    //
+                    // But EVERY materialized one, `__control__` included, and that is
+                    // the deliberate part. A node could in principle be ready for the
+                    // zones it leads while blind to one it does not — a joiner
+                    // restarting while its founder is down leads `root` and is a
+                    // learner in `__control__`, where auth records live. One line
+                    // cannot say "writes to A yes, B no": either it means a write will
+                    // be admitted or it means nothing, and per-zone readiness
+                    // observables are a larger contract change (#344's option 2) that
+                    // no client asks for yet.
+                    //
+                    // The cost is that such a joiner stays un-ready until its peer
+                    // returns. That is not a regression: before this it announced
+                    // readiness and then refused the write with "no reachable leader?",
+                    // which is the same outage plus a false promise. And it self-heals
+                    // — the loop keeps ticking, so readiness follows the election.
                     if !ready_for_loop.is_ready() {
+                        let leaderless = zm_for_loop.registry().resident_zones_without_leader();
+                        if !leaderless.is_empty() {
+                            // Say what we are waiting for, every time, because the
+                            // alternative to this line is a harness that times out
+                            // with nothing in the log explaining why — and a joiner
+                            // waiting for quorum is a legitimate long wait, not a
+                            // hang. Naming the voters is the part that distinguishes
+                            // "my peer is not up" from "my own zone is broken".
+                            for zone in &leaderless {
+                                let voters = zm_for_loop.zone_peers(zone).len();
+                                tracing::warn!(
+                                    zone = %zone,
+                                    voters = voters,
+                                    "holding the data plane closed: no leader yet. A write \
+                                     to this zone replicates through raft and would be \
+                                     refused, so readiness is not announced until a leader \
+                                     exists. With more than one voter this waits for the \
+                                     others to be reachable, and clears by itself the \
+                                     moment one is",
+                                );
+                            }
+                            tokio::time::sleep(TOPOLOGY_TICK).await;
+                            continue;
+                        }
                         ready_for_loop.mark_ready();
                         tracing::info!(
                             "VFS data plane ready — kernel wired and declared topology applied, \
