@@ -31,6 +31,7 @@ jobs:
           EXPECTED=$(printf '%s\n' \
             kernel-dogfood-v1.pub \
             nexus-team.pub \
+            nexus-vfs-release-v1.pub \
             | sort)
 
           ACTUAL=$(cd rust/kernel/trusted_keys && ls *.pub 2>/dev/null | sort)
@@ -58,6 +59,7 @@ jobs:
           EXPECTED=$(printf '%s\n' \
             trusted_keys/kernel-dogfood-v1.pub \
             trusted_keys/nexus-team.pub \
+            trusted_keys/nexus-vfs-release-v1.pub \
             | sort)
 
           ACTUAL=$(grep -oE 'trusted_keys/[A-Za-z0-9._-]+\.pub' \

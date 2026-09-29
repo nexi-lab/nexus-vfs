@@ -10,3 +10,4 @@
 *.pub
 !nexus-team.pub
 !kernel-dogfood-v1.pub
+!nexus-vfs-release-v1.pub
