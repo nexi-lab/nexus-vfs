@@ -301,6 +301,25 @@ async fn run() -> Result<(), String> {
             }
             println!("{seen} frame(s), next offset {cursor}");
         }
+        "link" => {
+            // A DT_LINK over the wire — the capability `Setattr` gained a link target
+            // for. Here because a chat-list index is a link, and without a way to make
+            // one from a client there was no way to check that the wire carries it.
+            let target = a.get(5).ok_or("link needs a <target> arg")?;
+            let r = c
+                .setattr(SetattrRequest {
+                    path: path.clone(),
+                    auth_token: auth.clone(),
+                    entry_type: 6, // DT_LINK — 6, not 3 (that is DT_PIPE)
+                    link_target: Some(target.clone()),
+                    ..Default::default()
+                })
+                .await
+                .map_err(|e| format!("setattr rpc: {e}"))?
+                .into_inner();
+            err_if(r.is_error, &r.error_payload)?;
+            println!("linked {path} -> {target}");
+        }
         "mkdir" => {
             let r = c
                 .mkdir(MkdirRequest {
