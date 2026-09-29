@@ -1,0 +1,6 @@
+# nexus-vfs-release-v1
+# Ed25519 public key, 32 raw bytes base64-encoded.
+# Signing identity for nexus-vfs's own plugin releases (search-plugin and
+# whatever follows it). Separate from nexus-team so that key stays the
+# authority for plugins released out of the nexus repo.
+4jeDb7ckkEoKlZCHpOPDYZVrFOGN679i5uCEbO+D3R4=

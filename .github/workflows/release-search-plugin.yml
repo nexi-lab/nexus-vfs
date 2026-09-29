@@ -126,7 +126,7 @@ jobs:
           # publishes and every daemon then refuses the plugin, with nothing in this
           # log to point at. The committed .pub is the authority on which key counts.
           python3 scripts/sign_plugin.py \
-            --trust-root rust/kernel/trusted_keys/nexus-team.pub \
+            --trust-root rust/kernel/trusted_keys/nexus-vfs-release-v1.pub \
             "${BUILD_DIR}/${{ matrix.dylib }}"
           test -f "${BUILD_DIR}/${{ matrix.dylib }}.sig" || \
             { echo "::error::sign_plugin.py produced no .sig"; exit 1; }

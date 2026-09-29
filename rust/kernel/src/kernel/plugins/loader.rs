@@ -50,6 +50,22 @@ const TRUSTED_KEY_FILES: &[&[u8]] = &[
         env!("CARGO_MANIFEST_DIR"),
         "/trusted_keys/kernel-dogfood-v1.pub"
     )),
+    // nexus-vfs's own release identity — signs the plugins released FROM this repo
+    // (search-plugin today). Minted here rather than reusing either key above,
+    // because neither privkey is reachable from this repo: nexus-team's lives only in
+    // the nexi-lab/nexus `PLUGIN_SIGNING_PRIVKEY` secret, which GitHub never returns,
+    // and kernel-dogfood-v1's is sealed in nexus's `data/vault-signing/keys.json`
+    // under a master key held the same way. A third root is the honest answer to
+    // "this repo cuts its own releases"; replacing either of the others would have
+    // invalidated every plugin already published under it.
+    //
+    // Consequence worth knowing: a plugin signed with this key loads on daemons built
+    // from a commit that contains the `.pub` — v0.7.21 onward — or on any daemon whose
+    // operator points `NEXUS_LOCAL_TRUSTED_KEYS_DIR` at a directory holding it.
+    include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/trusted_keys/nexus-vfs-release-v1.pub"
+    )),
 ];
 
 /// Environment variable that, when set, points at a directory of
