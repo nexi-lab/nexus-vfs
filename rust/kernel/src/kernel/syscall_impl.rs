@@ -1568,6 +1568,30 @@ impl Kernel {
                     // which already merge backend results when the
                     // metastore has nothing.
                     if let Some(backend) = route.backend.as_ref() {
+                        // A DIRECTORY reaches this branch too, and `delete_file` is the
+                        // wrong tool for it. `path_local` creates parent directories
+                        // physically on write, so a directory that was never mkdir'd has
+                        // no row — and once its files are deleted, `sys_stat` and
+                        // `sys_readdir` still report it (both merge backend results)
+                        // while `delete_file` returns EISDIR. That error was swallowed
+                        // into `miss(0)`, which a client reads as 404: the directory was
+                        // visible and undeletable, and every emptied workspace folder on
+                        // one production deployment was stuck that way (#320).
+                        //
+                        // `rmdir` is the tool: it tolerates a missing row, and it is
+                        // where the non-empty refusal lives, so `recursive` keeps meaning
+                        // what it means everywhere else.
+                        if matches!(backend.stat(&route.backend_path), Ok(s) if s.is_dir) {
+                            let removed = self.rmdir(path, ctx, recursive)?;
+                            return Ok(SysUnlinkResult {
+                                hit: removed.hit,
+                                entry_type: DT_DIR,
+                                post_hook_needed: removed.post_hook_needed,
+                                path: path.to_string(),
+                                content_id: None,
+                                size: 0,
+                            });
+                        }
                         match backend.delete_file(&route.backend_path) {
                             Ok(()) => {
                                 return Ok(SysUnlinkResult {
@@ -2866,11 +2890,38 @@ impl Kernel {
             }
         }
 
-        // 6. Backend rmdir (best-effort)
-        let _ = route
-            .backend
-            .as_ref()
-            .map(|b| b.rmdir(&route.backend_path, recursive));
+        // 6. Backend rmdir — BEFORE the row is deleted, and the result is read.
+        //
+        // This used to be `let _ = …`, "best-effort", and that discarded the one
+        // answer that matters: a backend refusing to remove a non-empty directory.
+        // The row was deleted anyway, the call returned success, and the directory
+        // stayed on disk — a row gone while the thing it described lives on, which is
+        // the worst of the three outcomes (#320).
+        //
+        // Order is the fix as much as the check: the metastore is the SSOT, so if the
+        // backend still has the directory, the row must stay and say so.
+        if let Some(backend) = route.backend.as_ref() {
+            match backend.rmdir(&route.backend_path, recursive) {
+                Ok(()) => {}
+                // Never had it, or a backend with no directory concept at all
+                // (CAS / remote / api connectors) — the row is the whole truth there.
+                Err(crate::abc::object_store::StorageError::NotFound(_))
+                | Err(crate::abc::object_store::StorageError::NotSupported(_)) => {}
+                Err(e) => {
+                    self.lock_manager.do_release(lock_handle);
+                    // The commonest cause is children this kernel cannot see: a
+                    // physical-only subdirectory left by a write that never went
+                    // through mkdir. Saying "not empty" for a non-recursive call is
+                    // the same answer the metastore check above gives, so a caller
+                    // gets one story regardless of which layer noticed.
+                    return Err(KernelError::IOError(if recursive {
+                        format!("rmdir({path}) failed in the backend: {e:?}")
+                    } else {
+                        format!("Directory not empty: {path}")
+                    }));
+                }
+            }
+        }
 
         // 7. Atomic delete — metastore is the SSOT. Per-key cache
         // invalidation already happened: ``delete_batch`` invalidated

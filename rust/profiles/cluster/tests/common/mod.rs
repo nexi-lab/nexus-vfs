@@ -14,9 +14,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use kernel::kernel::vfs_proto::{
-    nexus_vfs_service_client::NexusVfsServiceClient, CallRequest, IpcPathRequest, MkdirRequest,
-    PingRequest, ReadRequest, ReaddirRequest, SetattrRequest, StatRequest, StreamReadAtRequest,
-    StreamWriteRequest, WatchRequest, WriteRequest,
+    nexus_vfs_service_client::NexusVfsServiceClient, CallRequest, DeleteRequest, IpcPathRequest,
+    MkdirRequest, PingRequest, ReadRequest, ReaddirRequest, SetattrRequest, StatRequest,
+    StreamReadAtRequest, StreamWriteRequest, WatchRequest, WriteRequest,
 };
 use lib::transport_primitives::{AgentCredential, LoadedCredential};
 use tonic::transport::Channel;
@@ -1021,6 +1021,30 @@ impl Vfs {
             .ok()?
             .into_inner();
         r.found.then_some(r.zone_id)
+    }
+
+    /// Typed `Delete`, returning `(success, entry_type)` — the two fields that separate
+    /// the outcomes #320 is about: `(Some(true), 1)` removed a directory,
+    /// `(Some(false), 0)` is the miss a client sees as 404, and an `Err` is a refusal
+    /// such as "Directory not empty".
+    pub async fn delete(
+        &mut self,
+        path: &str,
+        recursive: bool,
+        token: &str,
+    ) -> Result<(Option<bool>, u32), String> {
+        let r = self
+            .c
+            .delete(DeleteRequest {
+                path: path.to_string(),
+                auth_token: token.to_string(),
+                recursive,
+            })
+            .await
+            .map_err(|e| format!("delete rpc: {e}"))?
+            .into_inner();
+        err_if(r.is_error, &r.error_payload, "delete")?;
+        Ok((r.success, r.entry_type))
     }
 
     pub async fn stat_found(&mut self, path: &str, token: &str) -> bool {
