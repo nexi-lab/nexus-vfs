@@ -281,18 +281,40 @@ async fn run() -> Result<(), String> {
                     break;
                 }
                 seen += 1;
-                match &agent {
-                    // Verify each sealed envelope against the CA and print who really
-                    // wrote it — the cross-trust-domain check, on the reader's side.
-                    Some((_name, _cert, _key, ca)) => {
-                        let (from, content) =
-                            lib::transport_primitives::authorship::open(&data, ca)?;
-                        println!(
-                            "[{cursor}] from={from} content={}",
-                            String::from_utf8_lossy(&content)
-                        );
-                    }
-                    None => println!("[{cursor}] {}", String::from_utf8_lossy(&data)),
+                // Read what the writers write — BOTH forms, in the order they occur.
+                //
+                // This used to branch on the credential: an agent credential meant
+                // "open as a seal", which made `collect` unable to read anything `send`
+                // had written. Two halves of one tool describing different formats, and
+                // the reader's error ("envelope has no content") named neither.
+                //
+                // A plain `MailboxEnvelope` is what `send` writes and what a co-host
+                // receiver consumes; a seal is what `send-sealed` writes for the
+                // cross-org path and what a co-host SKIPS. A reader that handles only
+                // one of them is a reader for a conversation nobody is having.
+                if let Some(env) = a2a::MailboxEnvelope::from_bytes(&data) {
+                    println!(
+                        "[{cursor}] plain from={} to={} kind={} body={}",
+                        env.from,
+                        env.to,
+                        // `kind` rides along as an unknown field the substrate does not
+                        // police, so read it out of the JSON rather than the struct.
+                        serde_json::from_slice::<serde_json::Value>(&data)
+                            .ok()
+                            .and_then(|v| v.get("kind").and_then(|k| k.as_str()).map(String::from))
+                            .unwrap_or_default(),
+                        env.body,
+                    );
+                } else if let Some((_name, _cert, _key, ca)) = &agent {
+                    // Verify the seal against the CA and print who really wrote it —
+                    // the cross-trust-domain check, on the reader's side.
+                    let (from, content) = lib::transport_primitives::authorship::open(&data, ca)?;
+                    println!(
+                        "[{cursor}] sealed from={from} content={}",
+                        String::from_utf8_lossy(&content)
+                    );
+                } else {
+                    println!("[{cursor}] raw {}", String::from_utf8_lossy(&data));
                 }
                 if next <= cursor {
                     break;
