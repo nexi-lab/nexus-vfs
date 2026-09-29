@@ -145,6 +145,55 @@ pub enum KernelError {
     Federation(String),
 }
 
+/// The kernel's errors carry their own message.
+///
+/// They had only `Debug`, so every boundary invented a spelling and one of them
+/// invented `format!("{:?}")`: a client saw `IOError("Directory not empty: /ws/a")`
+/// — a Rust variant name wrapped around a quoted, escaped string — in a protocol
+/// message, while a variant that happened to have a hand-written arm got a sentence.
+/// The same fact spelled two ways depending on which arm existed (#350).
+///
+/// So the message is defined HERE, once, and a boundary decides only what it must:
+/// `map_kernel_err` picks the RPC code and takes the text from this impl. A new
+/// variant then cannot reach a client as a Debug dump — the worst it can do is land
+/// under a less specific code.
+///
+/// `IOError` renders its payload bare on purpose. Callers compose a whole sentence
+/// into it ("Directory not empty: /ws/a"), so a category prefix would read as
+/// "I/O error: Directory not empty: /ws/a" — noise in front of the fact.
+impl std::fmt::Display for KernelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidPath(m) => write!(f, "invalid path: {m}"),
+            Self::FileNotFound(p) => write!(f, "file not found: {p}"),
+            Self::FileExists(p) => write!(f, "file exists: {p}"),
+            Self::IOError(m) => write!(f, "{m}"),
+            Self::TrieError(m) => write!(f, "path trie error: {m}"),
+            Self::PipeFull(m) => write!(f, "pipe full: {m}"),
+            Self::PipeEmpty(m) => write!(f, "pipe empty: {m}"),
+            Self::PipeClosed(m) => write!(f, "pipe closed: {m}"),
+            Self::PipeExists(m) => write!(f, "pipe exists: {m}"),
+            Self::PipeNotFound(m) => write!(f, "pipe not found: {m}"),
+            Self::StreamFull(m) => write!(f, "stream full: {m}"),
+            Self::StreamEmpty(m) => write!(f, "stream empty: {m}"),
+            Self::StreamClosed(m) => write!(f, "stream closed: {m}"),
+            Self::StreamExists(m) => write!(f, "stream exists: {m}"),
+            Self::StreamNotFound(m) => write!(f, "stream not found: {m}"),
+            // The wording the wire already carried, kept verbatim: a reader that
+            // trimmed past resets to `earliest`, so both numbers are load-bearing.
+            Self::StreamTruncated(earliest, requested) => {
+                write!(f, "offset {requested} trimmed; earliest {earliest}")
+            }
+            Self::WouldBlock(m) => write!(f, "would block: {m}"),
+            Self::PermissionDenied(m) => write!(f, "permission denied: {m}"),
+            Self::BackendError(m) => write!(f, "backend error: {m}"),
+            Self::Federation(m) => write!(f, "federation: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for KernelError {}
+
 impl From<std::io::Error> for KernelError {
     fn from(e: std::io::Error) -> Self {
         KernelError::IOError(e.to_string())

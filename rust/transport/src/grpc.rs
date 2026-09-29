@@ -304,31 +304,42 @@ impl VfsServiceImpl {
         Ok((ctx, inner))
     }
 
+    /// Pick the RPC code; take the message from the error itself.
+    ///
+    /// This used to do both, and the message half ended in
+    /// `other => format!("{:?}", other)` — so a variant with a hand-written arm
+    /// reached a client as a sentence while every other one arrived as
+    /// `IOError("Directory not empty: /ws/a")`, Rust's internal vocabulary in a
+    /// protocol message (#350). Adding an arm per variant would have fixed the shape
+    /// by writing the kernel's messages a second time, here, where they would drift
+    /// from the ones the kernel logs.
+    ///
+    /// So `KernelError` owns its message (`Display`) and this decides only the code.
+    /// A variant nobody has classified yet still lands under `InternalError`, but it
+    /// can no longer arrive as a Debug dump — which is the part a client could not
+    /// parse and an operator could not read.
     pub(crate) fn map_kernel_err(&self, err: KernelError) -> (RpcErrorCode, String) {
-        match err {
-            KernelError::FileNotFound(p) => (RpcErrorCode::FileNotFound, p),
-            KernelError::PermissionDenied(m) => (RpcErrorCode::PermissionError, m),
-            KernelError::InvalidPath(m) => (RpcErrorCode::InvalidPath, m),
+        let code = match &err {
+            KernelError::FileNotFound(_) => RpcErrorCode::FileNotFound,
+            KernelError::PermissionDenied(_) => RpcErrorCode::PermissionError,
+            KernelError::InvalidPath(_) => RpcErrorCode::InvalidPath,
+            // A backend's own refusal wording is the only signal available for
+            // whether a storage failure was really an authorization one.
             KernelError::BackendError(m) => {
                 let lower = m.to_ascii_lowercase();
                 if lower.contains("permission")
                     || lower.contains("denied")
                     || lower.contains("read-only")
                 {
-                    (RpcErrorCode::PermissionError, m)
+                    RpcErrorCode::PermissionError
                 } else {
-                    (RpcErrorCode::InternalError, m)
+                    RpcErrorCode::InternalError
                 }
             }
-            KernelError::PipeClosed(m) | KernelError::StreamClosed(m) => {
-                (RpcErrorCode::InternalError, m)
-            }
-            KernelError::StreamTruncated(earliest, req) => (
-                RpcErrorCode::OffsetOutOfRange,
-                format!("offset {req} trimmed; earliest {earliest}"),
-            ),
-            other => (RpcErrorCode::InternalError, format!("{:?}", other)),
-        }
+            KernelError::StreamTruncated(..) => RpcErrorCode::OffsetOutOfRange,
+            _ => RpcErrorCode::InternalError,
+        };
+        (code, err.to_string())
     }
 
     /// DT_MOUNT (`entry_type == 2`) handler — bridge-2 (#4262).
