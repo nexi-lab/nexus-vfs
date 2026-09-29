@@ -143,7 +143,15 @@ async fn run() -> Result<(), String> {
                 .await
                 .map_err(|e| format!("stat rpc: {e}"))?
                 .into_inner();
-            println!("found={}", r.found);
+            // `found` alone cannot answer the question this path is usually statted for.
+            // A chat-list entry is supposed to be a DT_LINK into the flat conversation,
+            // and a DT_LINK that got created as a plain directory still stats as found —
+            // so the two layouts were indistinguishable through this tool. entry_type
+            // and link_target are what tell them apart.
+            println!(
+                "found={} entry_type={} is_dir={} size={} link_target={:?} zone={}",
+                r.found, r.entry_type, r.is_directory, r.size, r.link_target, r.zone_id
+            );
         }
         "read" => {
             let r = c
