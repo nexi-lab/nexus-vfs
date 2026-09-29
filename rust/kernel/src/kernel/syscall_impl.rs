@@ -2976,6 +2976,17 @@ impl Kernel {
             .unwrap_or(false)
     }
 
+    /// True when some mount covers `path` in `zone_id`.
+    ///
+    /// Pure routing: it answers whether the namespace is here, NOT whether a
+    /// file exists (that is `access`). `route` returning `None` is the one
+    /// signal that no mount covers the path, and the caller decides what a
+    /// miss means — a reader can turn an unmounted path into a clear
+    /// "outside your mounts" error instead of an ambiguous not-found.
+    pub fn is_mounted(&self, path: &str, zone_id: &str) -> bool {
+        validate_path_fast(path).is_ok() && self.vfs_router.route(path, zone_id).is_some()
+    }
+
     // ── Internal batch functions (not Tier 1 syscalls) ────────────────
 
     /// Batch write implementation — sorted VFS lock acquisition,
@@ -4198,6 +4209,23 @@ mod read_batch_tests {
         assert_eq!(out.len(), 2);
         assert!(matches!(out[0], Err(KernelError::InvalidPath(_))));
         assert!(matches!(out[1], Err(KernelError::FileNotFound(_))));
+    }
+
+    #[test]
+    fn is_mounted_reflects_route_presence_not_file_existence() {
+        // A kernel with a mount at `/` covers every path, whether or not a file
+        // exists there — is_mounted is pure routing, distinct from access.
+        let mounted = kernel_with_backend();
+        assert!(mounted.is_mounted("/anything/here", contracts::ROOT_ZONE_ID));
+        assert!(mounted.is_mounted("/no/such/file.txt", contracts::ROOT_ZONE_ID));
+
+        // A kernel with no mounts covers nothing: the miss a caller turns into
+        // an "outside your mounts" error rather than a plain not-found.
+        let bare = Kernel::new();
+        assert!(!bare.is_mounted("/anything/here", contracts::ROOT_ZONE_ID));
+
+        // An invalid path is never mounted.
+        assert!(!mounted.is_mounted("", contracts::ROOT_ZONE_ID));
     }
 
     #[test]
