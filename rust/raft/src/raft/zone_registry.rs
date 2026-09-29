@@ -1333,6 +1333,28 @@ impl ZoneRaftRegistry {
         self.zones.iter().map(|e| e.key().clone()).collect()
     }
 
+    /// Resident zones that have no leader.
+    ///
+    /// Answered here, in one pass over the resident map, because the two obvious ways
+    /// to assemble it outside are both wrong. `list_zones()` is the CATALOG, and
+    /// feeding it to `get_node` materializes every zone on the node — which is the
+    /// boot-cost sweep this design exists to remove, and `zone_boot_cost` catches it.
+    /// Pairing `resident_zones()` with a per-zone lookup is closer but still racy: a
+    /// zone can leave residency between the two calls, and the lookup would then open
+    /// it again.
+    ///
+    /// Residency is deliberately the scope. A catalogued-but-idle zone has no raft node
+    /// and therefore no leader, and reporting it as leaderless would describe a node
+    /// that is working perfectly as broken. A write to such a zone materializes it
+    /// first, so leadership is that path's concern.
+    pub fn resident_zones_without_leader(&self) -> Vec<String> {
+        self.zones
+            .iter()
+            .filter(|e| e.node.leader_id().is_none())
+            .map(|e| e.key().clone())
+            .collect()
+    }
+
     /// Does this node host `zone_id`? Answers from the catalog WITHOUT
     /// materializing it.
     ///
