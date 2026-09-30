@@ -6,7 +6,9 @@
 //! boots under TLS (an auth-off node binds its control store to per-node
 //! `root`, so epochs never replicate — the property is untestable there).
 //!
-//!   1. TLS founder + joiner; joiner joins the victim zone (holds a replica).
+//!   1. TLS founder + joiner; joiner joins the victim zone explicitly over
+//!      RPC (holds a replica; nothing mounts the victim — a mounted zone
+//!      is (rightly) not deprovisionable).
 //!   2. Joiner goes DOWN.
 //!   3. Founder deprovisions the victim: epoch recorded (replicated to the
 //!      joiner's control-zone learner replica too — via the control plane,
@@ -55,15 +57,21 @@ async fn a_stale_replica_cannot_resurrect_a_deleted_zone() {
         assert!(ok, "enroll-token failed: {err}");
         out.trim().to_string()
     };
-    // A joiner discovers federation zones through the mount topology —
-    // declare the victim as a mount so it is discoverable.
-    let mounts = format!("/{ZONE}={ZONE}");
+    // Discovery needs a DECLARED mount (DiscoverZones reports applied
+    // mounts), but a topology-declared mount keeps the victim's i_links
+    // above zero and deprovision — rightly — refuses to destroy a
+    // still-mounted zone. So the discovery mount rides a harmless dummy
+    // zone; the victim joins explicitly over RPC and nothing ever mounts
+    // it.
+    const DUMMY: &str = "discovery-dummy";
+    let init_zones = format!("{ZONE},{DUMMY}");
+    let mounts = format!("/{DUMMY}={DUMMY}");
     let founder_env = vec![
         ("NEXUS_DATA_DIR", fdata.as_str()),
         ("NEXUS_IDENTITY_DIR", fid.as_str()),
         ("NEXUS_ADVERTISE_ADDR", fadv.as_str()),
         ("NEXUS_ACCEPT_ENROLLMENTS", "true"),
-        ("NEXUS_CLUSTER_INIT", ZONE),
+        ("NEXUS_CLUSTER_INIT", init_zones.as_str()),
         ("NEXUS_CLUSTER_INIT_MOUNTS", mounts.as_str()),
         ("RUST_LOG", LOG_FILTER),
     ];
@@ -81,7 +89,7 @@ async fn a_stale_replica_cannot_resurrect_a_deleted_zone() {
         .await
         .expect("typed surface wired on the founder");
 
-    // ── Joiner: enroll + join the victim (a live replica exists) ──
+    // ── Joiner: enroll, then join the victim explicitly ──────────────
     let joiner_env = vec![
         ("NEXUS_DATA_DIR", jdata.as_str()),
         ("NEXUS_IDENTITY_DIR", jid.as_str()),
@@ -91,10 +99,6 @@ async fn a_stale_replica_cannot_resurrect_a_deleted_zone() {
         ("RUST_LOG", LOG_FILTER),
     ];
     let mut joiner = Daemon::spawn(&["--bind-addr", &jadv], &joiner_env);
-    joiner
-        .wait_for_log(&format!("Zone '{ZONE}' registered"), BUDGET)
-        .await
-        .expect("joiner joins the victim zone");
     // The joiner must ALSO hold a control-zone learner replica BEFORE it
     // goes down — that local replica is how the deletion epoch reaches it
     // while it is offline (the data-plane fan-out it is about to miss).
@@ -102,8 +106,12 @@ async fn a_stale_replica_cannot_resurrect_a_deleted_zone() {
         .wait_for_log("Zone '__control__' registered", BUDGET)
         .await
         .expect("joiner joins the control zone (the epoch home's replica)");
+    joiner
+        .wait_for_log("ZoneRuntimeService live", BUDGET)
+        .await
+        .expect("typed surface wired on the joiner");
 
-    // Founder's client: mTLS with its own node cert (admin+system peer).
+    // Cluster CA + both node certs.
     let ca = std::fs::read(std::path::Path::new(&jdata).join("tls/ca.pem"))
         .or_else(|_| std::fs::read(std::path::Path::new(&fdata).join("tls/ca.pem")))
         .expect("cluster CA pem");
@@ -111,6 +119,20 @@ async fn a_stale_replica_cannot_resurrect_a_deleted_zone() {
         std::fs::read(std::path::Path::new(&fdata).join("tls/node.pem")).expect("node cert"),
         std::fs::read(std::path::Path::new(&fdata).join("tls/node-key.pem")).expect("node key"),
     );
+    let (jcert, jkey) = (
+        std::fs::read(std::path::Path::new(&jdata).join("tls/node.pem")).expect("j node cert"),
+        std::fs::read(std::path::Path::new(&jdata).join("tls/node-key.pem")).expect("j node key"),
+    );
+
+    // The joiner joins the victim explicitly (no mount involved): a live
+    // replica exists on the joiner.
+    let mut j_rt = ZoneRuntime::dial_tls(jport, &ca, &jcert, &jkey, BUDGET).await;
+    let joined = j_rt
+        .zone_join(ZONE, &[fadv.clone()], true, "op-join-victim-0000", "")
+        .await
+        .expect("joiner joins the victim zone over RPC");
+    assert_eq!(joined.outcome, "JOINED");
+
     let mut f_rt = ZoneRuntime::dial_tls(fport, &ca, &fcert, &fkey, BUDGET).await;
     let status = f_rt.zone_status(ZONE, "").await.expect("victim status");
     assert_eq!(status.presence, i32::from(Presence::Resident));
@@ -123,9 +145,12 @@ async fn a_stale_replica_cannot_resurrect_a_deleted_zone() {
     );
 
     // ── The joiner goes DOWN (it will miss the fan-out) ──
+    drop(j_rt);
     drop(joiner);
 
     // ── Deprovision on the founder, while the joiner is down ──
+    // Nothing mounts the victim (i_links == 0), so the i_links guard
+    // passes and no dangling DT_MOUNT can be left behind.
     let receipt = f_rt
         .zone_deprovision(ZONE, "op-dep-victim-0001", "")
         .await
@@ -154,10 +179,6 @@ async fn a_stale_replica_cannot_resurrect_a_deleted_zone() {
 
     // Its status answers DELETED — the epoch reached it through the
     // control zone (the data-plane fan-out it missed was never needed).
-    let (jcert, jkey) = (
-        std::fs::read(std::path::Path::new(&jdata).join("tls/node.pem")).expect("j node cert"),
-        std::fs::read(std::path::Path::new(&jdata).join("tls/node-key.pem")).expect("j node key"),
-    );
     let mut j_rt = ZoneRuntime::dial_tls(jport, &ca, &jcert, &jkey, BUDGET).await;
     let j_status = j_rt.zone_status(ZONE, "").await.expect("joiner status");
     assert_eq!(

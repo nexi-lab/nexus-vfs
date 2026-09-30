@@ -52,9 +52,15 @@ async fn no_auth_loopback_declares_itself() {
         "--no-tls: no permission provider is installed (the gate is a no-op)"
     );
     let zr = caps.zone_runtime.expect("zone-runtime capability");
+    // Under --no-tls the deletion registry binds the per-node SOLO root —
+    // protection is at most per-node (real for a single node, absent
+    // across nodes), and the boolean cannot express that split, so the
+    // conservative answer is false. (A single-node no-tls deployment is
+    // actually protected; the field errs low, never high.)
     assert!(
-        zr.deletion_protection,
-        "the anti-resurrection epoch check is armed"
+        !zr.deletion_protection,
+        "no-tls: the epochs do not replicate across nodes — the capability must not \
+         overstate per-node protection as cluster-wide"
     );
     assert!(
         !zr.journal_zone.is_empty(),

@@ -73,7 +73,7 @@ pub fn dispatch(
         "agent_register" | "agent_register_external" => do_agent_register(kernel, ctx, &params),
         "agent_unregister" => do_agent_unregister(kernel, ctx, &params),
         "agent_unregister_external" => do_agent_unregister_external(kernel, ctx, &params),
-        "agent_get" => do_agent_get(kernel, &params),
+        "agent_get" => do_agent_get(kernel, ctx, &params),
         "agent_list" => do_agent_list(kernel, ctx, &params),
         "agent_update_state" => do_agent_update_state(kernel, ctx, &params),
         "agent_signal" => do_agent_signal(kernel, ctx, &params),
@@ -371,10 +371,24 @@ fn do_agent_unregister_external(
     ok_json(serde_json::json!(true))
 }
 
-fn do_agent_get(kernel: &Arc<Kernel>, params: &serde_json::Value) -> Result<Vec<u8>, Vec<u8>> {
+/// Same ownership rule as every other agent method: the descriptor a
+/// caller reads must be their own, or the caller must be admin/system.
+/// A missing pid keeps answering `null` (the pre-existing shape).
+fn do_agent_get(
+    kernel: &Arc<Kernel>,
+    ctx: &OperationContext,
+    params: &serde_json::Value,
+) -> Result<Vec<u8>, Vec<u8>> {
     let pid = s(params, "pid");
     match kernel.agent_registry().get(&pid) {
-        Some(desc) => ok_json(agent_descriptor_to_json(&desc)),
+        Some(desc) => {
+            if desc.owner_id != ctx.user_id && !ctx.is_admin && !ctx.is_system {
+                return Err(permission_err(
+                    "agent operation requires ownership or administrator privileges",
+                ));
+            }
+            ok_json(agent_descriptor_to_json(&desc))
+        }
         None => ok_json(serde_json::Value::Null),
     }
 }

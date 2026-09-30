@@ -80,6 +80,7 @@ pub const CONTROL_ZONE_ID: &str = "__control__";
 /// `foreign-ca` — cross-org trust anchors (cross-org substrate).
 /// `zone-ops`   — zone-mutation operation journal (`raft::zone_op_journal`).
 /// `zone-registry` — zone deletion epochs/tombstone registry (`raft::zone_deletion_registry`).
+/// `boot-sync`  — per-node boot catch-up markers (`profiles/cluster` boot).
 pub const CONTROL_NS_AUTH: &str = "auth";
 /// See [`CONTROL_NS_AUTH`].
 pub const CONTROL_NS_FOREIGN_CA: &str = "foreign-ca";
@@ -87,6 +88,12 @@ pub const CONTROL_NS_FOREIGN_CA: &str = "foreign-ca";
 pub const CONTROL_NS_ZONE_OPS: &str = "zone-ops";
 /// See [`CONTROL_NS_AUTH`].
 pub const CONTROL_NS_ZONE_REGISTRY: &str = "zone-registry";
+/// See [`CONTROL_NS_AUTH`]. Placement note: single-crate owner
+/// (`nexus-cluster` boot), admitted because the namespace registry's
+/// collision-prevention SSOT requirement outranks the "used by two or more
+/// crates" guideline at the top of this file — same trade-off as
+/// `CONTROL_NS_ZONE_OPS`/`CONTROL_NS_ZONE_REGISTRY`.
+pub const CONTROL_NS_BOOT_SYNC: &str = "boot-sync";
 
 /// Zone IDs that can never be deleted — the replicated-control substrate
 /// itself. Deletion guards (`ZoneManager::remove_zone`, the registry's

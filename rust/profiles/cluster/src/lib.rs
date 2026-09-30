@@ -123,6 +123,10 @@ struct CommonArgs {
     /// replicated registry records as DELETED. Without it, a stale
     /// `--cluster-init` declaration naming a deprovisioned zone is skipped
     /// with an ERROR and boot proceeds — deleted zones stay deleted.
+    /// A `--force` re-found also stamps a fresh local creation epoch, so
+    /// subsequent NORMAL boots resume the zone (the deletion record itself
+    /// is never cleared; zone_status keeps reporting the zone as DELETED
+    /// while it serves — the recorded-epoch semantics, documented trade).
     #[arg(long, global = true)]
     force: bool,
 
@@ -1422,9 +1426,99 @@ fn open_zone_manager(
 
 /// How long boot waits for the epoch zone's restarted learner replica to
 /// catch up with its leader before running the anti-resurrection sweep
-/// (R12). The wait ends the moment a NEWER commit index is applied, so the
-/// common path costs one heartbeat round-trip, not the whole budget.
+/// (R12). The wait ends the moment the boot marker is VISIBLE in the local
+/// state machine (one propose round-trip + local apply on the common
+/// path), so healthy boots never spend the whole budget.
 const EPOCH_CATCHUP_BUDGET_SECS: u64 = 15;
+
+/// Wire the R12 deletion-epoch source onto the zone manager's registry,
+/// bound to the epoch home (the control zone under TLS, the per-node root
+/// otherwise). Shared by the daemon's boot wire points and the offline CLI
+/// subcommands (`run_share`/`run_join`), so every path that can create or
+/// join zones consults the replicated deletion registry. `None` = the
+/// epoch zone is not hosted on this node (e.g. a first-boot founder has no
+/// control zone yet): pre-R12 behavior, no protection.
+fn wire_deletion_registry(
+    zm: &nexus_raft::ZoneManager,
+    no_tls: bool,
+    node_id: u64,
+) -> Option<Arc<nexus_raft::ZoneDeletionRegistry>> {
+    let epoch_zone = if no_tls {
+        contracts::ROOT_ZONE_ID
+    } else {
+        contracts::CONTROL_ZONE_ID
+    };
+    let z = zm.get_zone(epoch_zone)?;
+    let reg = Arc::new(nexus_raft::ZoneDeletionRegistry::new(
+        z.consensus_node(),
+        z.runtime_handle(),
+        node_id,
+    ));
+    zm.registry().set_deletion_epoch_source(
+        Arc::clone(&reg) as Arc<dyn nexus_raft::DeletionEpochSource>
+    );
+    Some(reg)
+}
+
+/// Prove the epoch zone's local replica is current: commit a fresh boot
+/// marker through the leader and wait until THIS replica's state machine
+/// shows it (value visibility). Marker visibility ⇒ every earlier entry —
+/// any deletion record included — has applied locally (raft replicates
+/// contiguously). An index comparison (`applied >= commit`) cannot prove
+/// this on a follower: right after a propose, the local `commit_index` is
+/// still stale, so an index check passes immediately on OLD state (the
+/// trap node.rs documents). Degradation on propose failure / visibility
+/// timeout is a WARN — boot continues and the sweep runs on the local
+/// replica's current state (same contract as before).
+fn catch_up_epoch_zone(zm: &nexus_raft::ZoneManager, epoch_zone: &str, node_id: u64) {
+    let Some(z) = zm.get_zone(epoch_zone) else {
+        return;
+    };
+    let node = z.consensus_node();
+    let store = nexus_raft::control_state_store::ControlStateStore::new(
+        node.clone(),
+        z.runtime_handle(),
+        contracts::CONTROL_NS_BOOT_SYNC,
+    );
+    // Fixed key + fresh value: `put` is an upsert, so the namespace does
+    // not grow per boot (a unique key per boot would accumulate forever).
+    // Same-millisecond collisions across two boots of one node are
+    // physically impossible — the previous boot still had seconds of boot
+    // work after its own visibility wait before the process could exit.
+    let marker_key = format!("boot/{node_id}");
+    let marker_value = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().to_string())
+        .unwrap_or_else(|_| "0".to_string());
+    if let Err(e) = store.put(&marker_key, marker_value.as_bytes()) {
+        tracing::warn!(
+            zone = %epoch_zone,
+            error = %e,
+            "boot-sync marker propose failed; the anti-resurrection sweep runs on \
+             the local replica's current state",
+        );
+        return;
+    }
+    let visible = node.wait_until(
+        || matches!(&store.get(&marker_key), Ok(Some(bytes)) if bytes == marker_value.as_bytes()),
+        EPOCH_CATCHUP_BUDGET_SECS * 1000,
+    );
+    if !visible {
+        tracing::warn!(
+            zone = %epoch_zone,
+            "boot-sync marker not visible within {EPOCH_CATCHUP_BUDGET_SECS}s; the \
+             anti-resurrection sweep runs on the local replica's current state",
+        );
+    }
+}
+
+/// R12 runtime self-heal cadence: how often the daemon re-runs the
+/// deletion purge. The boot sweep only sees the local control-zone
+/// replica, so a node whose replica was behind at boot needs this runtime
+/// pass to destroy a deleted zone it resumed in that window (the
+/// materialize gate stops COLD zones from coming back; only this sweep
+/// stops a zone that slipped through RESIDENT).
+const DELETION_SWEEP_INTERVAL_SECS: u64 = 60;
 
 async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -> Result<()> {
     let hostname = resolve_hostname(common.hostname.as_deref());
@@ -1762,8 +1856,10 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     // Merge plugin-exposed gRPC services onto the same Routes.  Each
     // service-plugin that exported the optional
     // `nexus_plugin_grpc_services` ABI symbol gets one URL prefix per
-    // declared service; the proxy strips the gRPC frame and hands raw
-    // proto bytes to the plugin's existing `nexus_service_dispatch`.
+    // declared service; the proxy authenticates the caller (same auth
+    // provider + boot gate as the VFS face) and hands the resolved
+    // context plus raw proto bytes to the plugin's
+    // `nexus_service_dispatch_v2`.
     // Plugins without the opt-in symbol are unaffected — they keep
     // routing through the legacy Call RPC + ServiceRegistry path.
     let plugin_endpoints = kernel.plugin_grpc_endpoints();
@@ -1776,6 +1872,8 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     let vfs_routes = transport::grpc_plugin_proxy::extend_routes_with_plugin_endpoints(
         vfs_routes,
         plugin_endpoints,
+        Arc::clone(&vfs_auth),
+        Arc::clone(&data_plane_ready),
     );
 
     // Typed Zone runtime service (ZoneRuntimeService) — same port, same auth
@@ -1827,15 +1925,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         } else {
             contracts::CONTROL_ZONE_ID
         };
-        if let Some(z) = zm.get_zone(epoch_zone) {
-            let reg = Arc::new(nexus_raft::ZoneDeletionRegistry::new(
-                z.consensus_node(),
-                z.runtime_handle(),
-                node_id,
-            ));
-            zm.registry().set_deletion_epoch_source(
-                Arc::clone(&reg) as Arc<dyn nexus_raft::DeletionEpochSource>
-            );
+        if let Some(reg) = wire_deletion_registry(&zm, common.no_tls, node_id) {
             deletion_registry_wired = Some(reg);
             tracing::info!(
                 zone = %epoch_zone,
@@ -1843,38 +1933,24 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
             );
             // A restarted LEARNER of the epoch zone missed whatever was
             // committed while it was down — the purge sweep below is only
-            // as current as this replica. Give the raft catch-up a bounded
-            // window: wait until the local apply loop has reached a commit
-            // index NEWER than the one this replica booted with (a solo
-            // founder has nothing to catch up and skips the wait).
+            // as current as this replica. PROVE the replica caught up by
+            // committing a fresh boot marker and waiting for it to become
+            // VISIBLE in the local state machine. Value visibility, not an
+            // index comparison: on a follower `commit_index` right after a
+            // propose is still stale (AppendEntries not yet arrived), so
+            // "wait applied >= commit" passes immediately on OLD state —
+            // node.rs documents exactly this trap. The marker's visibility
+            // implies every earlier entry — any deletion record included —
+            // has applied locally (raft replicates contiguously). A solo
+            // epoch zone commits locally, nothing to catch up: skip.
             let solo = zm.zone_peers(epoch_zone).is_empty();
-            let node = z.consensus_node();
-            let initial_commit = node.commit_index();
             if !solo {
-                let deadline = std::time::Instant::now()
-                    + std::time::Duration::from_secs(EPOCH_CATCHUP_BUDGET_SECS);
-                loop {
-                    let (c, a) = (node.commit_index(), node.applied_index());
-                    if a >= c && c > initial_commit {
-                        break;
-                    }
-                    if std::time::Instant::now() >= deadline {
-                        tracing::warn!(
-                            zone = %epoch_zone,
-                            commit_index = c,
-                            "epoch zone did not catch up with its leader within \
-                             {EPOCH_CATCHUP_BUDGET_SECS}s; the anti-resurrection sweep \
-                             runs on the local replica's current state",
-                        );
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
+                catch_up_epoch_zone(&zm, epoch_zone, node_id);
             }
         }
     }
     // Purge stale replicas NOW — before any boot action can rejoin them.
-    zm.registry().purge_deleted_zones();
+    zm.purge_deleted_zones();
 
     // Fill the VFS service's verifier slot now that the ZoneManager (and its
     // eagerly-built verifier) exists. Auth-on ⇒ the VFS request path classifies
@@ -2808,15 +2884,9 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         let deletion_registry = match deletion_registry_wired {
             Some(reg) => reg,
             None => {
-                let reg = Arc::new(nexus_raft::ZoneDeletionRegistry::new(
-                    zone.consensus_node(),
-                    zone.runtime_handle(),
-                    node_id,
-                ));
-                zm.registry().set_deletion_epoch_source(
-                    Arc::clone(&reg) as Arc<dyn nexus_raft::DeletionEpochSource>
-                );
-                zm.registry().purge_deleted_zones();
+                let reg = wire_deletion_registry(&zm, common.no_tls, node_id)
+                    .expect("journal zone is resident here, so the epoch wire cannot miss");
+                zm.purge_deleted_zones();
                 reg
             }
         };
@@ -2841,9 +2911,14 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
             auth_mode: vfs_auth.mode().to_string(),
             permission_provider_armed: kernel.permission_provider_armed(),
             journal_zone: journal_zone.to_string(),
-            // R12 anti-resurrection is armed: the registry consults the
-            // replicated deletion epochs before materializing.
-            deletion_protection: true,
+            // R12 anti-resurrection is armed ONLY where the epochs
+            // replicate: under TLS they live in the CONTROL zone and
+            // suppress resurrection cluster-wide. Under --no-tls the
+            // registry binds the per-node SOLO root — protection is at
+            // most per-node (real for a single-node deployment, absent
+            // across nodes), and a boolean cannot express that split, so
+            // report the conservative false rather than overstate.
+            deletion_protection: !common.no_tls,
             capabilities: vec![
                 "zone-runtime:create".into(),
                 "zone-runtime:join".into(),
@@ -3199,12 +3274,35 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         }
     });
 
+    // R12 runtime self-heal: re-run the deletion purge on a timer. The
+    // boot sweep only sees the LOCAL control-zone replica; a node whose
+    // replica was behind at boot can have resumed a deleted zone in that
+    // window, and the materialize gate only stops COLD zones from coming
+    // back — only this sweep catches a zone that slipped through
+    // RESIDENT. Runs forever; the purge itself is a cheap catalog scan
+    // when there is nothing to do.
+    let sweep_zm = Arc::clone(&zm);
+    let sweep_handle = tokio::spawn(async move {
+        let mut ticker =
+            tokio::time::interval(std::time::Duration::from_secs(DELETION_SWEEP_INTERVAL_SECS));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let zm = Arc::clone(&sweep_zm);
+            if let Err(e) = tokio::task::spawn_blocking(move || zm.purge_deleted_zones()).await {
+                tracing::warn!(error = %e, "periodic deletion sweep task failed");
+            }
+        }
+    });
+
     wait_for_shutdown().await;
     tracing::info!("nexusd-cluster shutting down");
 
     // Stop the convergence loop first — it's a best-effort reconciler,
-    // safe to abort mid-tick.
+    // safe to abort mid-tick. The deletion sweep is the same kind of
+    // best-effort background pass.
     topology_handle.abort();
+    sweep_handle.abort();
 
     // Drain ZoneManager: signal gRPC + zone transport loops to exit
     // their serve_with_shutdown paths so in-flight raft messages drain
@@ -3254,8 +3352,15 @@ async fn run_share(
     mount_at: Option<&str>,
 ) -> Result<()> {
     let ZoneManagerBundle {
-        zm, cli_peer_addrs, ..
+        zm,
+        node_id,
+        cli_peer_addrs,
+        ..
     } = open_zone_manager(&common, None, ZoneLoadPolicy::OnDemand)?;
+    // R12 on the CLI path too: wire the deletion registry so the guard
+    // below actually consults replicated state (without this the CLI-side
+    // guards would silently see "no record" forever).
+    wire_deletion_registry(&zm, common.no_tls, node_id);
     let peers_str: Vec<String> = cli_peer_addrs
         .iter()
         .map(NodeAddress::to_raft_peer_str)
@@ -3269,6 +3374,17 @@ async fn run_share(
             "--new-zone {new_zone_id:?} is not a valid zone id: {e}.              The id becomes the first path segment of everything under it and              cannot be changed afterwards."
         )
     })?;
+
+    // R12: never create over a deprovisioned zone id (same epoch judgment
+    // as the boot guards — an id re-founded via --force carries a fresh
+    // creation epoch and is NOT refused here).
+    if zm.deleted_newer_than_disk(new_zone_id) {
+        anyhow::bail!(
+            "--new-zone '{new_zone_id}' was deprovisioned (recorded deletion outranks \
+             this replica); refusing to create. Re-use of the id requires an \
+             operator-supervised recovery (founder boot with --force)."
+        );
+    }
 
     if zm.get_zone(new_zone_id).is_none() {
         zm.create_zone_async(new_zone_id, peers_str)
@@ -3549,6 +3665,10 @@ async fn run_join(
         self_address,
         ..
     } = open_zone_manager(&common, None, ZoneLoadPolicy::OnDemand)?;
+    // R12 on the CLI path too: wire the deletion registry so the D9 guard
+    // inside `bootstrap_or_join_zone` actually consults replicated state
+    // (without this the guard would silently see "no record" forever).
+    wire_deletion_registry(&zm, common.no_tls, node_id);
 
     // Pre-#3996 (and pre-this commit) ``run_join`` only invoked
     // ``zm.join_zone(remote_zone_id, peers, false)`` — that registers

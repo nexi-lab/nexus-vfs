@@ -393,6 +393,9 @@ impl DylibRustService {
             rc if rc == PluginResult::InvalidArgument as i32 => Err(
                 RustCallError::InvalidArgument("plugin rejected argument".into()),
             ),
+            rc if rc == PluginResult::PermissionDenied as i32 => Err(
+                RustCallError::PermissionDenied("plugin denied the call for this caller".into()),
+            ),
             rc => Err(RustCallError::Internal(format!("plugin error code {rc}"))),
         }
     }
@@ -449,8 +452,14 @@ impl RustService for DylibRustService {
             .map(|value| to_cstring(value, "agent_id"))
             .transpose()?;
         let request_id = to_cstring(&ctx.request_id, "request_id")?;
+        // v2: the caller's zone grants as JSON, so a plugin can reproduce
+        // `contracts::resolve_agent_zone` authorization semantics.
+        // Serialization of `Vec<(String, String)>` cannot fail.
+        let zone_perms_json = serde_json::to_string(&ctx.zone_perms)
+            .map_err(|e| RustCallError::Internal(format!("zone_perms encode: {e}")))?;
+        let zone_perms_json = to_cstring(&zone_perms_json, "zone_perms_json")?;
         let ffi_ctx = NexusPluginDispatchContext {
-            struct_version: 1,
+            struct_version: 2,
             user_id: user_id.as_ptr(),
             zone_id: zone_id.as_ptr(),
             is_admin: ctx.is_admin,
@@ -462,6 +471,7 @@ impl RustService for DylibRustService {
                 .as_ref()
                 .map_or(std::ptr::null(), |value| value.as_ptr()),
             request_id: request_id.as_ptr(),
+            zone_perms_json: zone_perms_json.as_ptr(),
         };
         let mut out_buf: *mut u8 = std::ptr::null_mut();
         let mut out_len: usize = 0;
@@ -1271,6 +1281,64 @@ mod tests {
     fn new_loader_is_empty() {
         let loader = PluginLoader::new();
         assert!(loader.list().is_empty());
+    }
+
+    // Stub FFI shape for exercising `finish_dispatch`'s rc→error mapping
+    // without a real dylib: rc != 0 never touches the buffers, so the
+    // function pointers are never called.
+    unsafe extern "C" fn stub_dispatch(
+        _svc: *mut c_void,
+        _method: *const std::os::raw::c_char,
+        _payload: *const u8,
+        _payload_len: usize,
+        _out_buf: *mut *mut u8,
+        _out_len: *mut usize,
+    ) -> i32 {
+        PluginResult::Ok as i32
+    }
+
+    unsafe extern "C" fn stub_free(_ptr: *mut u8, _len: usize) {}
+
+    fn stub_service() -> DylibRustService {
+        DylibRustService {
+            svc_name: "stub".to_string(),
+            handle: std::ptr::null_mut(),
+            dispatch_fn: stub_dispatch,
+            dispatch_v2_fn: None,
+            free_fn: stub_free,
+        }
+    }
+
+    #[test]
+    fn permission_denied_rc_maps_to_rust_call_permission_denied() {
+        // v7: a plugin denies the call for the caller by returning
+        // PluginResult::PermissionDenied — the host must surface it as
+        // RustCallError::PermissionDenied (not a generic internal code).
+        let svc = stub_service();
+        let rc = PluginResult::PermissionDenied as i32;
+        let mapped = svc.finish_dispatch(rc, std::ptr::null_mut(), 0);
+        assert!(matches!(
+            mapped,
+            Err(crate::service_registry::RustCallError::PermissionDenied(_))
+        ));
+    }
+
+    #[test]
+    fn other_plugin_result_rcs_keep_their_mappings() {
+        let svc = stub_service();
+        assert!(matches!(
+            svc.finish_dispatch(PluginResult::NotFound as i32, std::ptr::null_mut(), 0),
+            Err(crate::service_registry::RustCallError::NotFound)
+        ));
+        assert!(matches!(
+            svc.finish_dispatch(PluginResult::InvalidArgument as i32, std::ptr::null_mut(), 0),
+            Err(crate::service_registry::RustCallError::InvalidArgument(_))
+        ));
+        // Anything else stays a generic internal error.
+        assert!(matches!(
+            svc.finish_dispatch(-99, std::ptr::null_mut(), 0),
+            Err(crate::service_registry::RustCallError::Internal(_))
+        ));
     }
 
     #[test]

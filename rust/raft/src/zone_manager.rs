@@ -661,6 +661,73 @@ impl ZoneManager {
         self.registry.deletion_epoch(zone_id)
     }
 
+    /// R12's epoch comparison as the boot/guard facade: does the recorded
+    /// deletion outrank this replica's on-disk `.creation-epoch`? Thin
+    /// delegate to the registry's single implementation
+    /// ([`ZoneRaftRegistry::deletion_outranks_disk`]) — every D9 guard and
+    /// the CLI guard call THIS so the judgment cannot drift.
+    pub fn deleted_newer_than_disk(&self, zone_id: &str) -> bool {
+        self.registry.deletion_outranks_disk(zone_id)
+    }
+
+    /// `--force` escape hatch (R12/D9): stamp a FRESH creation epoch on this
+    /// node's replica of `zone_id`, making any recorded deletion no longer
+    /// outrank it. Called where a force boot chooses to resume/re-found a
+    /// registry-deleted zone, so the operator's intent survives later
+    /// sweeps WITHOUT depending on the boot sweep having deleted the stale
+    /// dir first (which only happens when the local deletion record was
+    /// already visible — a node whose control replica was behind would
+    /// otherwise be torn down once it catches up).
+    ///
+    /// Best-effort, mirroring `setup_zone`'s marker write: a failure only
+    /// degrades the resurrection check back to the old epoch. A missing
+    /// zone dir is fine — the fresh-create path in `setup_zone` stamps the
+    /// new epoch itself.
+    pub fn bump_creation_epoch(&self, zone_id: &str) {
+        // Wall-clock ms — the same epoch space `.creation-epoch` and the
+        // replicated deletion epochs live in.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        match crate::raft::ZonePersistence::open(self.registry.base_path(), zone_id) {
+            Ok(persistence) => {
+                if let Err(e) = persistence.write_creation_epoch(now_ms) {
+                    tracing::warn!(
+                        zone = %zone_id,
+                        error = %e,
+                        "--force re-found: failed to bump creation-epoch (resurrection \
+                         check keeps the old epoch for this replica)",
+                    );
+                } else {
+                    tracing::info!(
+                        zone = %zone_id,
+                        "--force re-found: creation-epoch bumped — recorded deletion no \
+                         longer outranks this replica",
+                    );
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // No dir yet: the fresh-create path stamps the epoch.
+            }
+            Err(e) => {
+                tracing::warn!(
+                    zone = %zone_id,
+                    error = %e,
+                    "--force re-found: could not open zone dir to bump creation-epoch",
+                );
+            }
+        }
+    }
+
+    /// R12 sweep facade: run the deletion purge over the catalogued zones
+    /// (see [`ZoneRaftRegistry::purge_deleted_zones`]). Boot and the
+    /// daemon's periodic timer both go through this so the registry's
+    /// internal interface stays behind the manager.
+    pub fn purge_deleted_zones(&self) {
+        self.registry.purge_deleted_zones(self.rt().handle());
+    }
+
     /// Presence ladder for the typed ZoneStatus surface (R10): the registry
     /// distinguishes the durable catalog ("this node hosts the zone") from
     /// the runtime fact ("its raft group is currently resident"), and callers
@@ -763,16 +830,19 @@ impl ZoneManager {
         learner: bool,
     ) -> Result<Arc<ZoneHandle>> {
         // R12: the join path can never resurrect a deprovisioned zone —
-        // a recorded deletion epoch refuses the join outright (auto-rejoin
-        // against a stale identity entry dies here, loudly). Escape hatch:
-        // NEXUS_FORCE_DELETED_ZONE_RECREATE.
-        if std::env::var_os("NEXUS_FORCE_DELETED_ZONE_RECREATE").is_none() {
-            if let Some(epoch) = self.deletion_epoch(zone_id) {
-                return Err(RaftError::InvalidState(format!(
-                    "Zone '{zone_id}' was deprovisioned (deletion epoch {epoch}); refusing to \
-                     join. Set NEXUS_FORCE_DELETED_ZONE_RECREATE=1 to override."
-                )));
-            }
+        // a deletion epoch that outranks this replica's creation epoch
+        // refuses the join outright (auto-rejoin against a stale identity
+        // entry dies here, loudly). Escape hatch:
+        // NEXUS_FORCE_DELETED_ZONE_RECREATE, which ALSO bumps the local
+        // creation epoch so the operator's re-found survives later sweeps.
+        if std::env::var_os("NEXUS_FORCE_DELETED_ZONE_RECREATE").is_some() {
+            self.bump_creation_epoch(zone_id);
+        } else if self.deleted_newer_than_disk(zone_id) {
+            return Err(RaftError::InvalidState(format!(
+                "Zone '{zone_id}' was deprovisioned (recorded deletion outranks this \
+                 replica); refusing to join. Set NEXUS_FORCE_DELETED_ZONE_RECREATE=1 to \
+                 override."
+            )));
         }
         let peer_addrs: Vec<NodeAddress> = peers
             .iter()
@@ -834,20 +904,21 @@ impl ZoneManager {
                 tracing::debug!("Zone '{}' already hosted, skipping", zone_id);
                 continue;
             }
-            // D9 (R12): a zone the replicated registry records as deleted is
-            // NOT re-founded from a stale topology declaration — skip it
-            // (fail-open, the rest of the topology proceeds). Escape hatch:
-            // NEXUS_FORCE_DELETED_ZONE_RECREATE=1.
-            if std::env::var_os("NEXUS_FORCE_DELETED_ZONE_RECREATE").is_none() {
-                if let Some(epoch) = self.deletion_epoch(zone_id) {
-                    tracing::error!(
-                        zone = %zone_id,
-                        deletion_epoch = epoch,
-                        "refusing to re-found a deprovisioned zone (fail-open: skipping this \
-                         zone; set NEXUS_FORCE_DELETED_ZONE_RECREATE=1 to override)"
-                    );
-                    continue;
-                }
+            // D9 (R12): a zone whose recorded deletion outranks this
+            // replica's creation epoch is NOT re-founded from a stale
+            // topology declaration — skip it (fail-open, the rest of the
+            // topology proceeds). Escape hatch:
+            // NEXUS_FORCE_DELETED_ZONE_RECREATE=1, which also bumps the
+            // local creation epoch so the re-found survives later sweeps.
+            if std::env::var_os("NEXUS_FORCE_DELETED_ZONE_RECREATE").is_some() {
+                self.bump_creation_epoch(zone_id);
+            } else if self.deleted_newer_than_disk(zone_id) {
+                tracing::error!(
+                    zone = %zone_id,
+                    "refusing to re-found a deprovisioned zone (fail-open: skipping this \
+                     zone; set NEXUS_FORCE_DELETED_ZONE_RECREATE=1 to override)"
+                );
+                continue;
             }
             self.create_zone(zone_id, peers.clone())?;
         }

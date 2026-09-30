@@ -47,7 +47,10 @@ pub fn resolve_agent_zone(
     let zone_id = if ctx.is_system {
         requested.unwrap_or(ROOT_ZONE_ID).to_string()
     } else if let Some(zone_id) = requested {
-        if !ctx.zone_perms.iter().any(|(granted, _)| granted == zone_id) {
+        // A zoneless global admin may target any zone (same respect for
+        // `is_admin` as `authorize_agent_owner` / `agent_list`); everyone
+        // else needs an explicit grant for it.
+        if !ctx.is_admin && !ctx.zone_perms.iter().any(|(granted, _)| granted == zone_id) {
             return Err(AgentContextError::PermissionDenied(
                 "agent zone_id is not explicitly granted to the authenticated caller".to_string(),
             ));
@@ -56,6 +59,9 @@ pub fn resolve_agent_zone(
     } else {
         match ctx.zone_perms.as_slice() {
             [(zone_id, _)] => zone_id.clone(),
+            // A zoneless admin has no grant to derive from; default to the
+            // same root default the `is_system` entry branch uses above.
+            [] if ctx.is_admin => ROOT_ZONE_ID.to_string(),
             [] => {
                 return Err(AgentContextError::InvalidArgument(
                     "agent zone_id is required when the caller has no explicit zone grant"
@@ -90,6 +96,12 @@ mod tests {
         ctx
     }
 
+    /// A zoneless global admin (auth-side supported: zoneless credentials
+    /// are reserved for admins) — `zone_perms` empty, `is_admin` set.
+    fn zoneless_admin() -> OperationContext {
+        OperationContext::new("alice", ROOT_ZONE_ID, true, None, false)
+    }
+
     #[test]
     fn system_defaults_to_root_and_can_impersonate_owner() {
         let ctx = context(true, &[]);
@@ -120,5 +132,24 @@ mod tests {
             resolve_agent_owner(&ctx, Some("bob")),
             Err(AgentContextError::PermissionDenied(_))
         ));
+    }
+
+    #[test]
+    fn zoneless_admin_may_target_any_zone_and_defaults_to_root() {
+        let ctx = zoneless_admin();
+        // Explicit zone: honored without a grant (is_admin respected, same
+        // as authorize_agent_owner / agent_list).
+        assert_eq!(resolve_agent_zone(&ctx, Some("alpha")).unwrap(), "alpha");
+        // No zone and no grant to derive from: the root default, same as
+        // the is_system entry branch — NOT the "no explicit zone grant"
+        // refusal a zoneless non-admin gets.
+        assert_eq!(resolve_agent_zone(&ctx, None).unwrap(), ROOT_ZONE_ID);
+    }
+
+    #[test]
+    fn admin_with_single_grant_still_derives_that_zone() {
+        let mut ctx = zoneless_admin();
+        ctx.zone_perms = vec![("alpha".to_string(), "rw".to_string())];
+        assert_eq!(resolve_agent_zone(&ctx, None).unwrap(), "alpha");
     }
 }

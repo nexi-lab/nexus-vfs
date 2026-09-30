@@ -589,7 +589,7 @@ impl Kernel {
         // ServiceRegistry lookup so plugin.* methods are always
         // available regardless of what services are registered.
         if name == "plugin" {
-            return Some(self.dispatch_plugin_call(method, payload));
+            return Some(self.dispatch_plugin_call(None, method, payload));
         }
         let svc = self.service_registry.lookup_rust(name)?;
         Some(svc.dispatch(method, payload))
@@ -604,7 +604,7 @@ impl Kernel {
         payload: &[u8],
     ) -> Option<Result<Vec<u8>, crate::service_registry::RustCallError>> {
         if name == "plugin" {
-            return Some(self.dispatch_plugin_call(method, payload));
+            return Some(self.dispatch_plugin_call(Some(ctx), method, payload));
         }
         let svc = self.service_registry.lookup_rust(name)?;
         Some(svc.dispatch_with_context(ctx, method, payload))
@@ -612,8 +612,12 @@ impl Kernel {
 
     /// Handle `plugin.*` RPC methods — kernel-built-in, not a registered
     /// RustService. Needs &self (Kernel) to call load/unload/list.
+    /// `ctx` is the authenticated caller when one exists (the ctx-aware
+    /// dispatch path); `None` is the legacy contextless entry, from which
+    /// privileged methods are refused.
     fn dispatch_plugin_call(
         &self,
+        ctx: Option<&OperationContext>,
         method: &str,
         payload: &[u8],
     ) -> Result<Vec<u8>, crate::service_registry::RustCallError> {
@@ -634,6 +638,14 @@ impl Kernel {
                 serde_json::to_vec(&list).map_err(|e| RustCallError::Internal(e.to_string()))
             }
             "unload" => {
+                // Unloading a plugin is privileged: it requires an
+                // authenticated admin/system context. The contextless v1
+                // entry (ctx == None) is refused outright.
+                if !ctx.is_some_and(|ctx| ctx.is_admin || ctx.is_system) {
+                    return Err(RustCallError::PermissionDenied(
+                        "plugin.unload requires an admin/system context".into(),
+                    ));
+                }
                 let req: serde_json::Value = serde_json::from_slice(payload)
                     .map_err(|e| RustCallError::InvalidArgument(e.to_string()))?;
                 let name = req["name"]

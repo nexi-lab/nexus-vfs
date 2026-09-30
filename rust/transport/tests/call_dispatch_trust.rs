@@ -77,3 +77,64 @@ fn low_privilege_context_cannot_signal_another_owners_agent() {
     );
     assert!(signalled.is_error);
 }
+
+#[test]
+fn agent_get_enforces_ownership_like_every_other_agent_method() {
+    let kernel = Arc::new(Kernel::new());
+    let system = OperationContext::new("cluster-internal", "root", true, None, true);
+    let registered = call(
+        &kernel,
+        &system,
+        "agent_register",
+        serde_json::json!({
+            "name": "bobs-agent",
+            "owner_id": "bob",
+            "zone_id": "tenant-b"
+        }),
+    );
+    assert!(!registered.is_error);
+    let registered: serde_json::Value =
+        serde_json::from_slice(&registered.payload).expect("registered response");
+    let pid = registered["result"]["pid"].as_str().expect("pid").to_string();
+
+    // The owner reads their own descriptor.
+    let bob = OperationContext::new("bob", "tenant-b", false, None, false);
+    let own = call(&kernel, &bob, "agent_get", serde_json::json!({ "pid": pid }));
+    assert!(!own.is_error, "owner reads own agent");
+    let own: serde_json::Value = serde_json::from_slice(&own.payload).expect("own response");
+    assert_eq!(own["result"]["owner_id"], "bob");
+
+    // A low-privilege caller is refused the cross-tenant descriptor.
+    let alice = OperationContext::new("alice", "tenant-a", false, None, false);
+    let denied = call(
+        &kernel,
+        &alice,
+        "agent_get",
+        serde_json::json!({ "pid": pid }),
+    );
+    assert!(denied.is_error, "agent_get must enforce ownership");
+
+    // An admin may read it (the admin/system respect every other agent
+    // method applies).
+    let admin = OperationContext::new("root-admin", "root", true, None, false);
+    let elevated = call(
+        &kernel,
+        &admin,
+        "agent_get",
+        serde_json::json!({ "pid": pid }),
+    );
+    assert!(!elevated.is_error, "admin reads any agent");
+
+    // A missing pid keeps the pre-existing null answer (no existence
+    // leak change versus the old behavior).
+    let missing = call(
+        &kernel,
+        &alice,
+        "agent_get",
+        serde_json::json!({ "pid": "no.such.pid" }),
+    );
+    assert!(!missing.is_error);
+    let missing: serde_json::Value =
+        serde_json::from_slice(&missing.payload).expect("missing response");
+    assert!(missing["result"].is_null());
+}

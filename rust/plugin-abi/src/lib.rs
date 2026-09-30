@@ -105,7 +105,12 @@ use std::os::raw::c_void;
 ///   * v7 — service plugins may receive authenticated caller credentials
 ///     through the optional `nexus_service_dispatch_v2` symbol. The kernel
 ///     continues to accept v6 plugins and falls back to the contextless v1
-///     dispatch symbol when v2 is absent.
+///     dispatch symbol when v2 is absent. A plugin may deny a call for the
+///     caller by returning `PluginResult::PermissionDenied` (`-4`) — the
+///     host maps it onto `RustCallError::PermissionDenied`. Note: the
+///     `declare_service_plugin!` macro's generated v2 symbol forwards to
+///     the contextless v1 dispatch; a plugin that needs the caller
+///     credentials must hand-write `nexus_service_dispatch_v2`.
 pub const PLUGIN_API_VERSION: u32 = 7;
 
 // ── Plugin kind ─────────────────────────────────────────────────────
@@ -143,6 +148,10 @@ pub enum PluginResult {
     NotFound = -1,
     InvalidArgument = -2,
     Internal = -3,
+    /// The plugin refused the call for this caller (v7 credential-aware
+    /// authorization). The host maps it onto
+    /// `RustCallError::PermissionDenied`.
+    PermissionDenied = -4,
 }
 
 // ── KernelHandle — vtable of callbacks a plugin can use ─────────────
@@ -500,6 +509,12 @@ pub type ServiceCreateFn = unsafe extern "C" fn(kernel: *const KernelHandle) -> 
 ///
 /// String pointers are nullable and remain valid only for the duration of the
 /// dispatch call. Plugins must copy values they retain.
+///
+/// `struct_version == 2` adds `zone_perms_json`: a JSON array of
+/// `[zone_id, mode]` pairs (e.g. `[["tenant-a","rw"]]`, `[]` when the caller
+/// has no grants) — what a plugin needs to reproduce
+/// `contracts::resolve_agent_zone` authorization semantics. Plugins should
+/// check `struct_version` before reading fields beyond version 1.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct NexusPluginDispatchContext {
@@ -511,6 +526,9 @@ pub struct NexusPluginDispatchContext {
     pub trust_domain: *const c_char,
     pub agent_id: *const c_char,
     pub request_id: *const c_char,
+    /// v2: JSON `[["zone","rw"], ...]` (`[]` when the caller has no zone
+    /// grants). Never null.
+    pub zone_perms_json: *const c_char,
 }
 
 /// Type of the `nexus_service_dispatch` symbol.

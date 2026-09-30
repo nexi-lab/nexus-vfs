@@ -15,19 +15,39 @@
 //! `tonic::service::Routes` the built-in VFS routes ride on.  The
 //! proxy:
 //!
-//! 1. Strips the gRPC frame header (1-byte compression flag + 4-byte
+//! 1. Waits out the boot gate (the same `DataPlaneReady` door the VFS
+//!    face holds requests at) and authenticates the caller — the token
+//!    rides the standard `authorization` gRPC metadata (HTTP/2 header)
+//!    and resolves through the SAME `AuthProvider` the VFS face uses.
+//!    This door used to be unauthenticated, which silently bypassed the
+//!    v7 "authorize by caller credentials" contract for any plugin that
+//!    relied on it.
+//! 2. Strips the gRPC frame header (1-byte compression flag + 4-byte
 //!    big-endian length) from the inbound HTTP/2 body.
-//! 2. Hands the raw proto bytes to the plugin via
-//!    `RustService::dispatch(path, payload)` — `path` is the full URL
-//!    (e.g. `/nexus.secrets.v1.GenericSecretsService/PutSecret`), so
-//!    the plugin can multiplex many methods through one dispatcher.
-//! 3. Wraps the returned bytes in a fresh gRPC frame and emits
+//! 3. Hands the raw proto bytes to the plugin via
+//!    `RustService::dispatch_with_context(ctx, path, payload)` — `path`
+//!    is the full URL (e.g.
+//!    `/nexus.secrets.v1.GenericSecretsService/PutSecret`), so the
+//!    plugin can multiplex many methods through one dispatcher; `ctx`
+//!    is the authenticated caller (the v7 `nexus_service_dispatch_v2`
+//!    shape).
+//! 4. Wraps the returned bytes in a fresh gRPC frame and emits
 //!    `grpc-status: 0` trailers on success (or the matching tonic
 //!    `Code` for `RustCallError` variants).
 //!
+//! ## Authentication boundary (deliberate, documented)
+//!
+//! Token-only: this raw tower service does not see tonic's
+//! `Extensions`, so the mTLS peer identity (client-cert classification)
+//! is NOT available here — the bearer token is the credential.  An
+//! mTLS-only deployment whose callers present no token is REFUSED on
+//! this face (fail-closed).  Under the `NoAuth` provider the face
+//! behaves exactly like the VFS face (admitted; exposure is bounded by
+//! the auth-posture bind rules).
+//!
 //! ## Contract crossing the dlopen boundary
 //!
-//! Only `(method: &str, payload: &[u8]) -> Result<Vec<u8>, _>` — the
+//! Only `(ctx, method: &str, payload: &[u8]) -> Result<Vec<u8>, _>` — the
 //! existing v2 `nexus_service_dispatch` shape.  No tonic types, no
 //! `tonic::service::Routes`, no `axum::Router`.  The plugin author is
 //! free to use a different tonic / axum / prost version than the
@@ -47,6 +67,10 @@ use http_body_util::{BodyExt, StreamBody};
 use kernel::kernel::PluginGrpcEndpoint;
 use tower::Service;
 
+use crate::auth::{AuthCredentials, AuthProvider};
+use crate::grpc::{DataPlaneReady, DATA_PLANE_READY_BUDGET};
+use kernel::kernel::OperationContext;
+
 /// A tower `Service` that proxies one fully-qualified gRPC service
 /// name through a plugin's bytes-level dispatcher.
 ///
@@ -54,13 +78,40 @@ use tower::Service;
 #[derive(Clone)]
 pub struct PluginProxyService {
     inner: Arc<PluginGrpcEndpoint>,
+    auth: Arc<dyn AuthProvider>,
+    ready: Arc<DataPlaneReady>,
 }
 
 impl PluginProxyService {
-    pub fn new(endpoint: PluginGrpcEndpoint) -> Self {
+    pub fn new(
+        endpoint: PluginGrpcEndpoint,
+        auth: Arc<dyn AuthProvider>,
+        ready: Arc<DataPlaneReady>,
+    ) -> Self {
         Self {
             inner: Arc::new(endpoint),
+            auth,
+            ready,
         }
+    }
+
+    /// The boot gate + token authentication every proxied call passes
+    /// through (see the module doc for the token-only boundary).
+    async fn authenticate(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<OperationContext, tonic::Code> {
+        if !self.ready.wait(DATA_PLANE_READY_BUDGET).await {
+            return Err(tonic::Code::Unavailable);
+        }
+        let raw = headers
+            .get(http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        let token = raw.strip_prefix("Bearer ").unwrap_or(raw);
+        self.auth
+            .resolve(&AuthCredentials::from_token(token))
+            .map_err(|_| tonic::Code::Unauthenticated)
     }
 }
 
@@ -75,9 +126,23 @@ impl Service<http::Request<axum::body::Body>> for PluginProxyService {
     }
 
     fn call(&mut self, req: http::Request<axum::body::Body>) -> Self::Future {
+        let this = self.clone();
         let endpoint = Arc::clone(&self.inner);
         Box::pin(async move {
             let path = req.uri().path().to_string();
+            // Same door as the VFS face: boot gate, then token
+            // authentication (see the module doc for the token-only
+            // boundary). A refused caller never reaches the plugin.
+            let headers = req.headers().clone();
+            let ctx = match this.authenticate(&headers).await {
+                Ok(ctx) => ctx,
+                Err(code) => {
+                    return Ok(grpc_trailer_only(
+                        code,
+                        "plugin-proxy: caller not authenticated",
+                    ));
+                }
+            };
             let body_bytes = match req.into_body().collect().await {
                 Ok(c) => c.to_bytes(),
                 Err(_) => {
@@ -101,7 +166,9 @@ impl Service<http::Request<axum::body::Body>> for PluginProxyService {
             // libsodium, etc.).  Move it off the tokio reactor.
             let dispatch_path = path.clone();
             let result = tokio::task::spawn_blocking(move || {
-                endpoint.service.dispatch(&dispatch_path, &payload)
+                endpoint
+                    .service
+                    .dispatch_with_context(&ctx, &dispatch_path, &payload)
             })
             .await;
 
@@ -194,6 +261,10 @@ fn grpc_trailer_only(code: tonic::Code, message: &str) -> http::Response<axum::b
 /// Consume the kernel's loaded-plugin gRPC opt-ins and add one route
 /// per `(plugin × service_name)` to the supplied `Routes`.
 ///
+/// Every route authenticates through `auth` behind the `ready` boot
+/// gate — the same door the VFS face uses — and dispatches with the
+/// authenticated caller context (v7).
+///
 /// Idempotent against repeated calls only insofar as
 /// `Kernel::plugin_grpc_endpoints` is a snapshot — re-running this on
 /// the same routes with overlapping endpoints would attempt to bind
@@ -204,6 +275,8 @@ fn grpc_trailer_only(code: tonic::Code, message: &str) -> http::Response<axum::b
 pub fn extend_routes_with_plugin_endpoints(
     routes: tonic::service::Routes,
     endpoints: Vec<PluginGrpcEndpoint>,
+    auth: Arc<dyn AuthProvider>,
+    ready: Arc<DataPlaneReady>,
 ) -> tonic::service::Routes {
     if endpoints.is_empty() {
         return routes;
@@ -212,7 +285,7 @@ pub fn extend_routes_with_plugin_endpoints(
     for ep in endpoints {
         let plugin_name = ep.plugin_name.clone();
         let service_name = ep.service_name.clone();
-        let svc = PluginProxyService::new(ep);
+        let svc = PluginProxyService::new(ep, Arc::clone(&auth), Arc::clone(&ready));
         router = router.route_service(&format!("/{service_name}/{{*method}}"), svc);
         tracing::info!(
             plugin = plugin_name,

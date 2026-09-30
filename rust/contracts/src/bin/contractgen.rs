@@ -258,9 +258,31 @@ fn constant_value(source: &str, name: &str) -> Result<String, String> {
         .split_once(&marker)
         .map(|(_, tail)| tail)
         .ok_or_else(|| format!("constant {name} is not a string constant in constants.rs"))?;
-    tail.split_once('"')
-        .map(|(value, _)| value.to_string())
-        .ok_or_else(|| format!("constant {name} has no closing quote"))
+    // Escape-aware scan: a `\\` pair steps over the char that follows it,
+    // and the first UNESCAPED `"` closes the literal. Only `\"` and `\\`
+    // are unescaped; any other escape sequence fails loudly instead of
+    // silently producing a wrong value (splitting at the first quote, the
+    // old behavior, truncates values containing escapes).
+    let mut value = String::new();
+    let mut chars = tail.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Ok(value),
+            '\\' => match chars.next() {
+                Some('"') => value.push('"'),
+                Some('\\') => value.push('\\'),
+                escaped => {
+                    let seq = escaped.map_or_else(String::new, |c| c.to_string());
+                    return Err(format!(
+                        "constant {name} uses an unsupported escape sequence: \\{seq} \
+                         (only \\\" and \\\\ are supported)"
+                    ));
+                }
+            },
+            _ => value.push(c),
+        }
+    }
+    Err(format!("constant {name} has no closing quote"))
 }
 
 fn read_json(path: &Path) -> Result<Value, String> {
@@ -326,4 +348,57 @@ fn sort_json(value: &Value) -> Value {
 fn normalize_newlines(value: &str) -> String {
     let normalized = value.replace("\r\n", "\n").replace('\r', "\n");
     format!("{}\n", normalized.trim_end_matches('\n'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn src(value: &str) -> String {
+        format!("pub const DEMO: &str = \"{value}\";\n")
+    }
+
+    #[test]
+    fn plain_text_value_parses_unchanged() {
+        assert_eq!(constant_value(&src("root"), "DEMO").unwrap(), "root");
+        assert_eq!(
+            constant_value(&src("/__sys__/"), "DEMO").unwrap(),
+            "/__sys__/"
+        );
+    }
+
+    #[test]
+    fn escaped_quotes_and_backslashes_unescape() {
+        // The Rust source text is `pub const DEMO: &str = "a\"b\\c";` — the
+        // parsed value must be `a"b\c`, not a truncation at the first quote.
+        assert_eq!(
+            constant_value(&src("a\\\"b\\\\c"), "DEMO").unwrap(),
+            "a\"b\\c"
+        );
+    }
+
+    #[test]
+    fn unsupported_escapes_fail_loudly() {
+        assert!(constant_value(&src("a\\nb"), "DEMO")
+            .unwrap_err()
+            .contains("unsupported escape sequence"));
+        assert!(constant_value(&src("a\\tb"), "DEMO")
+            .unwrap_err()
+            .contains("unsupported escape sequence"));
+    }
+
+    #[test]
+    fn missing_closing_quote_is_an_error() {
+        let truncated = "pub const DEMO: &str = \"unclosed";
+        assert!(constant_value(truncated, "DEMO")
+            .unwrap_err()
+            .contains("no closing quote"));
+    }
+
+    #[test]
+    fn unknown_constant_is_an_error() {
+        assert!(constant_value(&src("x"), "OTHER")
+            .unwrap_err()
+            .contains("not a string constant"));
+    }
 }
