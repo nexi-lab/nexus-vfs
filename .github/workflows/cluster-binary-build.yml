@@ -23,55 +23,47 @@ jobs:
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
-            max_size_bytes: 17825792  # 17.0 MiB — raised from 16.75 for the bounded
-                                      # channel establishment (#351: the TLS handshake
-                                      # sat between `connect_timeout` and `timeout` and
-                                      # was bounded by neither, so a peer that accepts
-                                      # and never answers parked a dialer forever).
-                                      # Measured 17,565,528 bytes here, 1,880 over the
-                                      # old cap — the timeout future's monomorphisation
-                                      # plus one diagnostic string, not a step change.
-                                      # The other three platforms absorbed it inside
-                                      # their existing budgets; this is the tightest.
+            max_size_bytes: 18350080  # 17.5 MiB — raised from 17.0 for the typed
+                                      # ZoneRuntime plane (#364: the ZoneRuntimeService
+                                      # gRPC surface with read-back receipts, the
+                                      # blake3 idempotency journal, the replicated
+                                      # deletion-epoch registry and boot sweep, and
+                                      # the zone-wire-path admission contract — a
+                                      # whole service tier, not a step change).
+                                      # Measured 18,153,576 bytes here, ~328 KB over
+                                      # the old cap; the other three platforms moved
+                                      # by 70–200 KB for the same code.
           - os: macos-14
             artifact_name: nexusd-cluster-macos-arm64
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
-            max_size_bytes: 15466496  # 14.75 MiB — raised from 13.75 for the
-                                      # ServiceBootCtx `api_key_secret` widen (#261;
-                                      # downstream HTTP mint plumbing for nexus
-                                      # `/v2/auth/keys` POST).  Measured 14,794,160
-                                      # bytes here after the widen; leaves ~650 KB
-                                      # headroom.
+            max_size_bytes: 15728640  # 15.0 MiB — raised from 14.75 for the typed
+                                      # ZoneRuntime plane (#364; see the linux-x86_64
+                                      # entry for the inventory).  Measured
+                                      # 15,539,504 bytes here, ~73 KB over the old
+                                      # cap; leaves ~189 KB headroom.
           - os: macos-14
             artifact_name: nexusd-cluster-macos-x86_64
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
             target: x86_64-apple-darwin
-            max_size_bytes: 16515072  # 15.75 MiB — raised from 14.75 for the
-                                      # ServiceBootCtx `api_key_secret` widen (#261;
-                                      # downstream HTTP mint plumbing for nexus
-                                      # `/v2/auth/keys` POST).  Measured 15,896,728
-                                      # bytes here (the tightest-headroom platform);
-                                      # leaves ~600 KB headroom.
+            max_size_bytes: 17039360  # 16.25 MiB — raised from 15.75 for the typed
+                                      # ZoneRuntime plane (#364; see the linux-x86_64
+                                      # entry for the inventory).  Measured
+                                      # 16,682,744 bytes here, ~168 KB over the old
+                                      # cap; leaves ~357 KB headroom.
           - os: windows-latest
             artifact_name: nexusd-cluster-windows-x86_64
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster.exe
-            max_size_bytes: 16777216  # 16.0 MiB — raised from 15.5 for the
-                                      # session-identity plane: five RPCs
-                                      # (MintSessionAgent, RevokeAgentCert, and the
-                                      # three allow-list admin calls) plus the
-                                      # replicated allow-list store. Measured
-                                      # 16,264,704 bytes here against 16,114,688 on
-                                      # the parent commit — ~146 KB, most of it the
-                                      # tonic client+server code generated per RPC.
-                                      # This is the tightest-headroom platform; the
-                                      # other three absorbed the same change inside
-                                      # their existing budgets.
+            max_size_bytes: 17301504  # 16.5 MiB — raised from 16.0 for the typed
+                                      # ZoneRuntime plane (#364; see the linux-x86_64
+                                      # entry for the inventory).  Measured
+                                      # 16,978,944 bytes here, ~202 KB over the old
+                                      # cap; leaves ~323 KB headroom.
 
 
     steps:
