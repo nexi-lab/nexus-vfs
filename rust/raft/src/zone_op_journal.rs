@@ -10,13 +10,16 @@
 //! attempt (concurrent or a later retry) reads back the winner's record.
 //!
 //! The record then walks `PENDING → COMPLETED` (or `REJECTED`) via a
-//! read-judge-write: `ControlStateStore` has no CAS primitive, so the
-//! completer re-reads the record and only overwrites while it still says
-//! PENDING — a stale writer that lost the race cannot clobber the new
-//! state. That ordering (single executor by `put_if_absent`, one-way
-//! status walk guarded by read-back) IS the "generation" protection the
-//! foundation doc requires on journal updates; full worker lease/fencing
-//! is a Nexus-side concern (step 05), not this work item.
+//! read-judge-write. `ControlStateStore` has no CAS primitive, so this
+//! walk is atomic ONLY under the single-executor guarantee `begin`'s
+//! `put_if_absent` provides: the winner of the insert is the only writer
+//! of the terminal state, and a loser never executes the mutation (it
+//! replays the winner's record instead). The read-judge-write alone does
+//! NOT defend two writers that both hold a PENDING record — two such
+//! writers cannot exist by construction, which is precisely the
+//! "generation" protection the foundation doc requires on journal
+//! updates; full worker lease/fencing is a Nexus-side concern (step 05),
+//! not this work item.
 //!
 //! Storage rides the control zone via `Command::PutControlState` — opaque
 //! bytes the state machine never parses, zero new raft `Command` variants
@@ -153,8 +156,10 @@ impl ZoneOpJournal {
     }
 
     /// Shared read-judge-write for the PENDING → terminal transition. A
-    /// record already terminal (or absent) is left untouched: the winner
-    /// of the `put_if_absent` race owns the terminal write.
+    /// record already terminal (or absent) is left untouched. This is NOT
+    /// a cross-writer CAS — its one-way guarantee holds because the single
+    /// executor established by `begin`'s `put_if_absent` is the only
+    /// writer that reaches here for a live operation (see the module doc).
     fn transition(
         &self,
         operation_id: &str,
