@@ -67,6 +67,20 @@ async fn force_refound_survives_subsequent_normal_boots() {
     };
     let (ca, cert, key) = tls(&fdata);
     let mut rt = ZoneRuntime::dial_tls(fport, &ca, &cert, &key, BUDGET).await;
+    // `victim` is the ONLY declared zone, so the boot's auto-prefix mount
+    // (subsystem-declared replicated prefixes, f1566bd30) landed the three
+    // defaults — /agents, /conversations, /sessions — on IT, each holding a
+    // mount reference. Deprovision (rightly) refuses a still-referenced
+    // zone, so undo the auto-mounts first: this is the operator cleanup the
+    // refusal is asking for, not a workaround for it.
+    for (i, prefix) in ["/agents", "/conversations", "/sessions"]
+        .into_iter()
+        .enumerate()
+    {
+        let _ = rt
+            .zone_unmount("root", prefix, &format!("op-force-unmount-{i:04}"), "")
+            .await;
+    }
     let receipt = rt
         .zone_deprovision(ZONE, "op-force-dep-0001", "")
         .await
