@@ -1,11 +1,12 @@
 //! Black-box E2E (acceptance 1, R5): a low-privilege authenticated caller
 //! cannot forge `owner_id` / `zone_id` through the generic `Call` surface —
-//! the boundary derives identity from the AUTH CONTEXT, not the payload —
-//! and a non-system admin cannot bypass the explicit zone-grant requirement.
+//! the boundary derives identity from the AUTH CONTEXT, not the payload.
 //!
 //! ApiKey posture (`NEXUS_API_KEY_SECRET` + `--no-tls`): a plain user key
-//! (`zone:rw`, NOT `--admin`) is the forger; a zoneless `--admin` key is also
-//! non-system and therefore cannot manufacture root authority.
+//! (`zone:rw`, NOT `--admin`) is the forger. A zoneless `--admin` key is
+//! non-system, but `resolve_agent_zone` respects `is_admin` (like
+//! `authorize_agent_owner` / `agent_list`): its registrations land under the
+//! root default instead of being refused.
 
 mod common;
 
@@ -161,7 +162,10 @@ async fn payload_forgery_is_refused_at_the_boundary() {
         "the response must echo the effective zone"
     );
 
-    // ── A zoneless non-system admin is not root authority ──
+    // ── A zoneless global admin registers under the root default ──
+    // resolve_agent_zone respects is_admin (the same respect
+    // authorize_agent_owner / agent_list show): a zoneless admin gets the
+    // root-zone default instead of the "no explicit zone grant" refusal.
     let admin_reg = vfs
         .call(
             "agent_register",
@@ -170,9 +174,22 @@ async fn payload_forgery_is_refused_at_the_boundary() {
         )
         .await;
     assert!(
-        admin_reg.is_error,
-        "a zoneless non-system admin must be refused: {}",
+        !admin_reg.is_error,
+        "a zoneless global admin registers under the root default: {}",
         String::from_utf8_lossy(&admin_reg.payload)
+    );
+    let admin_registered: serde_json::Value =
+        serde_json::from_slice(&admin_reg.payload).expect("valid json");
+    let admin_result = admin_registered.get("result").expect("result envelope");
+    assert_eq!(
+        admin_result.get("zone_id").and_then(|v| v.as_str()),
+        Some("root"),
+        "the zoneless admin's registration lands in the root default: {admin_result}"
+    );
+    assert_eq!(
+        admin_result.get("owner_id").and_then(|v| v.as_str()),
+        Some("root-op"),
+        "the owner still derives from the AUTH context, never the payload: {admin_result}"
     );
 
     // ── The unauthenticated nobody is nobody ──

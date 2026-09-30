@@ -188,17 +188,27 @@ impl ZoneRuntimeServiceImpl {
     }
 
     /// Zone-level mount-path gate (D3's second layer): the canonical path
-    /// `/{parent_zone}{mount_path}` must be writable for this caller under
+    /// key for the mount point must be writable for this caller under
     /// whatever permission provider this deployment armed. With no
     /// provider armed (NoAuth loopback) the gate is a no-op — the admin
     /// gate above is the authorization basis.
+    ///
+    /// The key is built with the SAME canonicalization the route table
+    /// itself uses (`canonicalize_mount_path`), never a raw `format!`:
+    /// a raw `/{parent}{mount_path}` concatenation mis-shapes non-absolute
+    /// inputs (`"foo"` → `/rootfoo`) and root mounts (`"/"` → `/root/`),
+    /// so the gate would be asking about a path nobody writes. The raft
+    /// layer's `validate_zone_path` admission (which runs after this gate
+    /// in the RPC chain) rejects those inputs outright before any journal
+    /// claim or execution.
     fn check_mount_path(
         &self,
         ctx: &OperationContext,
         parent_zone_id: &str,
         mount_path: &str,
     ) -> Result<(), Status> {
-        let canonical = format!("/{parent_zone_id}{mount_path}");
+        let canonical =
+            kernel::core::vfs_router::canonicalize_mount_path(mount_path, parent_zone_id);
         if let Err(e) = self
             .kernel
             .check_permission(&canonical, kernel::Permission::Write, ctx)
