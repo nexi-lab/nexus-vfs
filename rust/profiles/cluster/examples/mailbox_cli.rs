@@ -143,7 +143,15 @@ async fn run() -> Result<(), String> {
                 .await
                 .map_err(|e| format!("stat rpc: {e}"))?
                 .into_inner();
-            println!("found={}", r.found);
+            // `found` alone cannot answer the question this path is usually statted for.
+            // A chat-list entry is supposed to be a DT_LINK into the flat conversation,
+            // and a DT_LINK that got created as a plain directory still stats as found —
+            // so the two layouts were indistinguishable through this tool. entry_type
+            // and link_target are what tell them apart.
+            println!(
+                "found={} entry_type={} is_dir={} size={} link_target={:?} zone={}",
+                r.found, r.entry_type, r.is_directory, r.size, r.link_target, r.zone_id
+            );
         }
         "read" => {
             let r = c
@@ -322,6 +330,25 @@ async fn run() -> Result<(), String> {
                 cursor = next;
             }
             println!("{seen} frame(s), next offset {cursor}");
+        }
+        "link" => {
+            // A DT_LINK over the wire — the capability `Setattr` gained a link target
+            // for. Here because a chat-list index is a link, and without a way to make
+            // one from a client there was no way to check that the wire carries it.
+            let target = a.get(5).ok_or("link needs a <target> arg")?;
+            let r = c
+                .setattr(SetattrRequest {
+                    path: path.clone(),
+                    auth_token: auth.clone(),
+                    entry_type: 6, // DT_LINK — 6, not 3 (that is DT_PIPE)
+                    link_target: Some(target.clone()),
+                    ..Default::default()
+                })
+                .await
+                .map_err(|e| format!("setattr rpc: {e}"))?
+                .into_inner();
+            err_if(r.is_error, &r.error_payload)?;
+            println!("linked {path} -> {target}");
         }
         "mkdir" => {
             let r = c
