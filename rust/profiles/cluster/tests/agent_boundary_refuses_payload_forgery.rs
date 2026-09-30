@@ -96,7 +96,7 @@ async fn payload_forgery_is_refused_at_the_boundary() {
 
     // ── Forgery 1: claim someone ELSE's owner_id ──
     let forged_owner = vfs
-        .call(
+        .call_raw(
             "agent_register",
             &serde_json::json!({
                 "name": "forged-owner",
@@ -114,7 +114,7 @@ async fn payload_forgery_is_refused_at_the_boundary() {
 
     // ── Forgery 2: claim a zone the caller has NO grant on ──
     let forged_zone = vfs
-        .call(
+        .call_raw(
             "agent_register",
             &serde_json::json!({
                 "name": "forged-zone",
@@ -134,7 +134,7 @@ async fn payload_forgery_is_refused_at_the_boundary() {
     // (owner derives from the token, zone is its own grant — proving the
     // refusals above were the trust boundary, not a broken surface.)
     let honest = vfs
-        .call(
+        .call_raw(
             "agent_register",
             &serde_json::json!({
                 "name": "honest-agent",
@@ -167,7 +167,7 @@ async fn payload_forgery_is_refused_at_the_boundary() {
     // authorize_agent_owner / agent_list show): a zoneless admin gets the
     // root-zone default instead of the "no explicit zone grant" refusal.
     let admin_reg = vfs
-        .call(
+        .call_raw(
             "agent_register",
             &serde_json::json!({ "name": "admin-agent" }),
             &admin,

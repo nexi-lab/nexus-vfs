@@ -64,7 +64,7 @@ impl GDriveBackend {
         );
 
         self.runtime.block_on(async {
-            let client = reqwest::Client::new();
+            let client = crate::http::http_client();
             let resp = client
                 .get(&url)
                 .header("Authorization", format!("Bearer {token}"))
@@ -122,7 +122,7 @@ impl ObjectStore for GDriveBackend {
         let content_owned = content.to_vec();
 
         self.runtime.block_on(async {
-            let client = reqwest::Client::new();
+            let client = crate::http::http_client();
             let boundary = "nexus_multipart_boundary";
             let mut body = Vec::new();
             body.extend_from_slice(
@@ -185,7 +185,7 @@ impl ObjectStore for GDriveBackend {
         let url = format!("{}/files/{}?alt=media", DRIVE_API, content_id);
 
         self.runtime.block_on(async {
-            let client = reqwest::Client::new();
+            let client = crate::http::http_client();
             let resp = client
                 .get(&url)
                 .header("Authorization", format!("Bearer {token}"))
@@ -214,7 +214,7 @@ impl ObjectStore for GDriveBackend {
         let url = format!("{}/files/{}", DRIVE_API, content_id);
 
         self.runtime.block_on(async {
-            let client = reqwest::Client::new();
+            let client = crate::http::http_client();
             let resp = client
                 .delete(&url)
                 .header("Authorization", format!("Bearer {token}"))
@@ -248,7 +248,7 @@ impl ObjectStore for GDriveBackend {
         let url = format!("{}/files", DRIVE_API);
 
         self.runtime.block_on(async {
-            let client = reqwest::Client::new();
+            let client = crate::http::http_client();
             let resp = client
                 .post(&url)
                 .header("Authorization", format!("Bearer {token}"))

@@ -60,7 +60,12 @@ impl RustService for EchoDispatcher {
         "echo-test"
     }
 
-    fn dispatch(&self, method: &str, payload: &[u8]) -> Result<Vec<u8>, RustCallError> {
+    fn dispatch(
+        &self,
+        method: &str,
+        payload: &[u8],
+        _ctx: &contracts::OperationContext,
+    ) -> Result<Vec<u8>, RustCallError> {
         assert!(
             method.starts_with("/echo.v1.EchoService/"),
             "proxy must hand the full URL path to plugin dispatch, got {method:?}",
@@ -83,7 +88,12 @@ impl RustService for DeniedDispatcher {
         "denied-test"
     }
 
-    fn dispatch(&self, _method: &str, _payload: &[u8]) -> Result<Vec<u8>, RustCallError> {
+    fn dispatch(
+        &self,
+        _method: &str,
+        _payload: &[u8],
+        _ctx: &OperationContext,
+    ) -> Result<Vec<u8>, RustCallError> {
         Err(RustCallError::PermissionDenied(
             "denied by test policy".to_string(),
         ))
@@ -101,7 +111,12 @@ impl RustService for CtxCapturingDispatcher {
         "ctx-test"
     }
 
-    fn dispatch(&self, _method: &str, _payload: &[u8]) -> Result<Vec<u8>, RustCallError> {
+    fn dispatch(
+        &self,
+        _method: &str,
+        _payload: &[u8],
+        _ctx: &OperationContext,
+    ) -> Result<Vec<u8>, RustCallError> {
         // The no-ctx entry must NOT be used by the proxy anymore.
         Err(RustCallError::Internal(
             "proxy must dispatch with context".to_string(),

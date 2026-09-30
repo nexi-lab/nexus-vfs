@@ -102,7 +102,22 @@ use std::os::raw::c_void;
 ///     `free_buf`.  All in-tree buffer hand-offs also shrink to an
 ///     exact-capacity boxed slice so the `from_raw_parts(ptr, len,
 ///     len)` free is layout-correct regardless of allocator.
-///   * v7 — service plugins may receive authenticated caller credentials
+///   * v7 — two orthogonal changes:
+///     `sys_write` carries the `offset` the kernel has always had.
+///     [`crate::KernelHandle::sys_write`] took `(path, data, len)` and the
+///     host callback hardcoded `offset: 0`, so a plugin could only ever
+///     replace a whole file.  Everything below the ABI was already ready:
+///     `KernelSyscall::sys_write` takes an offset, `PathLocalBackend`
+///     seeks to it, and `RemoteBackend` rejects a non-zero one loudly.
+///     Only the ABI dropped it, and every filesystem adapter above
+///     inherited the loss — the FUSE one returns EIO on any write past
+///     byte zero, which is why `git init` cannot write its own config
+///     (nexus#4830).  **Breaking**: the fn-ptr signature changed, so
+///     every plugin needs a clean rebuild; a v6 binary is rejected at
+///     load with an ABI-mismatch error rather than silently writing to
+///     the wrong place.
+///
+///     Service plugins may ALSO receive authenticated caller credentials
 ///     through the optional `nexus_service_dispatch_v2` symbol. The kernel
 ///     continues to accept v6 plugins and falls back to the contextless v1
 ///     dispatch symbol when v2 is absent. A plugin may deny a call for the
@@ -111,6 +126,11 @@ use std::os::raw::c_void;
 ///     `declare_service_plugin!` macro's generated v2 symbol forwards to
 ///     the contextless v1 dispatch; a plugin that needs the caller
 ///     credentials must hand-write `nexus_service_dispatch_v2`.
+///
+///     (Both changes were cut as "v7" independently on parallel branches;
+///     they were merged as one revision because neither touches the other's
+///     symbols — one alters an existing fn-ptr signature, the other adds an
+///     optional symbol.)
 pub const PLUGIN_API_VERSION: u32 = 7;
 
 // ── Plugin kind ─────────────────────────────────────────────────────
@@ -184,12 +204,23 @@ pub struct KernelHandle {
         out_len: *mut usize,
     ) -> i32,
 
-    /// `sys_write(kernel, path, data, data_len) -> i32`
+    /// `sys_write(kernel, path, data, data_len, offset) -> i32`
+    ///
+    /// Writes `data_len` bytes at `offset`. `offset == 0` replaces the
+    /// file, which is the common path and what every adapter did before
+    /// v7; a non-zero offset patches in place, and the backend decides
+    /// whether it can — `PathLocalBackend` seeks, `RemoteBackend`
+    /// refuses rather than misroute.
+    ///
+    /// A filesystem adapter cannot be written without this. POSIX lets a
+    /// program open a file and write it in as many calls as it likes,
+    /// and git does exactly that with its own config.
     pub sys_write: unsafe extern "C" fn(
         kernel: *const c_void,
         path: *const c_char,
         data: *const u8,
         data_len: usize,
+        offset: u64,
     ) -> i32,
 
     /// `sys_stat(kernel, path, out_json, out_len) -> i32`

@@ -17,78 +17,16 @@
 //!
 //! All tests exercise the public Kernel API only.
 
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use kernel::abc::object_store::{ObjectStore, StorageError, WriteResult};
+use kernel::abc::object_store::ObjectStore;
 use kernel::kernel::syscall::KernelSyscall;
 use kernel::kernel::{Kernel, OperationContext};
 
-// ── Minimal in-memory backend (mirrors service_hook_lifecycle.rs) ────
-//
-// Content does NOT survive the simulated restart — that is fine: these
-// tests assert on namespace *metadata* (sys_stat), which is exactly what
-// the metastore owns.
+mod common;
 
-#[derive(Default)]
-struct MemBackend {
-    blobs: std::sync::Mutex<HashMap<String, Vec<u8>>>,
-}
-
-impl ObjectStore for MemBackend {
-    fn name(&self) -> &str {
-        "mem"
-    }
-
-    fn write_content(
-        &self,
-        content: &[u8],
-        content_id: &str,
-        _ctx: &OperationContext,
-        offset: u64,
-    ) -> Result<WriteResult, StorageError> {
-        let mut map = self.blobs.lock().unwrap();
-        let entry = map.entry(content_id.to_string()).or_default();
-        let start = offset as usize;
-        if start > entry.len() {
-            entry.resize(start, 0);
-        }
-        let end = start + content.len();
-        if end > entry.len() {
-            entry.resize(end, 0);
-        }
-        entry[start..end].copy_from_slice(content);
-        let size = entry.len() as u64;
-        Ok(WriteResult {
-            content_id: content_id.to_string(),
-            version: content_id.to_string(),
-            size,
-        })
-    }
-
-    fn read_content(
-        &self,
-        content_id: &str,
-        _ctx: &OperationContext,
-    ) -> Result<Vec<u8>, StorageError> {
-        self.blobs
-            .lock()
-            .unwrap()
-            .get(content_id)
-            .cloned()
-            .ok_or_else(|| StorageError::NotFound(content_id.into()))
-    }
-
-    fn get_content_size(&self, content_id: &str) -> Result<u64, StorageError> {
-        self.blobs
-            .lock()
-            .unwrap()
-            .get(content_id)
-            .map(|d| d.len() as u64)
-            .ok_or_else(|| StorageError::NotFound(content_id.into()))
-    }
-}
+use common::MemBackend;
 
 /// Boot a kernel, optionally wiring a durable metastore, and mount the
 /// in-memory backend at "/".
@@ -102,35 +40,9 @@ fn boot(metastore: Option<&Path>) -> (Kernel, OperationContext) {
         k.set_metastore_path(ms.to_str().expect("utf-8 metastore path"))
             .expect("open durable metastore");
     }
-    let backend = Arc::new(MemBackend::default());
-    k.sys_setattr(
-        "/",
-        &OperationContext::new("test", "root", true, None, true),
-        2, // DT_MOUNT
-        "mem",
-        Some(backend as Arc<dyn ObjectStore>),
-        None,
-        None,
-        "",
-        kernel::ROOT_ZONE_ID,
-        false,
-        0,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None, // created_at_ms
-        None, // link_target
-        None, // source
-        None, // metastore
-    )
-    .expect("mount / with MemBackend");
+    common::mount_mem_root(&k);
 
-    let ctx = OperationContext::new("test", "root", true, None, true);
-    (k, ctx)
+    (k, common::admin_ctx())
 }
 
 #[test]

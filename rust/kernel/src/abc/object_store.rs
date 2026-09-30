@@ -92,10 +92,14 @@ pub trait ObjectStore: Send + Sync {
     }
 
     /// Downcast to a streaming-capable LLM backend. Default returns `None`.
-    /// `OpenAIBackend` and `AnthropicBackend` override. Consumed by
-    /// `Kernel::llm_start_streaming` — any ObjectStore that returns
-    /// `Some` implements the full SSE → DT_STREAM →
+    /// `OpenAIBackend` and `AnthropicBackend` override: an ObjectStore that
+    /// returns `Some` implements the full SSE → DT_STREAM →
     /// `CASEngine::write_content_tracked` pipeline.
+    ///
+    /// Nothing consumes this yet. Earlier docs named a
+    /// `Kernel::llm_start_streaming` syscall as the consumer; no such syscall
+    /// exists, and the agreed design does not add one — a write to the mount
+    /// is what will drive a completion.
     ///
     /// Trait declaration lives at `crate::extensions::llm_streaming` —
     /// an ObjectStore extension trait, distinct from §3.B Control-Plane

@@ -108,6 +108,21 @@ impl ZonePersistence {
         base.join(zone_id).join(TOMBSTONE_NAME).exists()
     }
 
+    /// Does `dir` look like a zone's storage directory — the `raft/` + `sm` pair this
+    /// type lays out?
+    ///
+    /// Asked by callers that must not treat such a directory as ordinary storage: the
+    /// cluster profile refuses to serve one as the VFS root, because doing so puts a
+    /// zone's consensus log and state machine in the namespace the daemon answers for.
+    /// The question lives here because the answer is this layout, and a second
+    /// spelling of it elsewhere is one that can disagree with `raft_path` / `sm_path`.
+    ///
+    /// Shape, not contents: a directory that merely looks like this is refused rather
+    /// than opened, which is the safe direction for a caller deciding what NOT to do.
+    pub fn looks_like_zone_dir(dir: &Path) -> bool {
+        dir.join("raft").is_dir() && dir.join("sm").exists()
+    }
+
     pub fn raft_path(&self) -> PathBuf {
         self.zone_path.join("raft")
     }

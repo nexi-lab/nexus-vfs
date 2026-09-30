@@ -66,7 +66,7 @@ fn joiner_env<'a>(
 /// peer that never created it opens + writes it; the owner's parked Watch wakes
 /// and it reads the envelope back.
 async fn mailbox_round(owner_port: u16, sender_port: u16, sender_name: &str, agent: &str) {
-    let mailbox = format!("{MOUNT}/{agent}/chat-with-me");
+    let mailbox = format!("{MOUNT}/{agent}/transcript");
     let envelope =
         format!(r#"{{"from":"{sender_name}","to":"{agent}","body":"ping from {sender_name}"}}"#);
 
@@ -213,7 +213,7 @@ async fn cold_collect_reads_a_peer_created_wal_stream_without_open_or_watch() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (_founder, _joiner, mut fc, mut jc, _fport, _jport) = boot_federation(tmp.path()).await;
 
-    // Founder creates a wal DT_STREAM (NOT a chat-with-me, so no stamp envelope
+    // Founder creates a wal DT_STREAM (NOT a transcript, so no stamp envelope
     // wraps the payload — a clean exact-bytes assertion) and writes one frame.
     let probe = format!("{MOUNT}/cold-probe");
     fc.create_stream(&probe, "")
@@ -272,7 +272,7 @@ async fn mailbox_write_wakes_a_peers_parked_sys_watch_both_directions() {
     tokio::time::sleep(Duration::from_secs(2)).await; // let the survivor observe the loss
     let leaderless = jc
         .stream_write(
-            &format!("{MOUNT}/founder-ai/chat-with-me"),
+            &format!("{MOUNT}/founder-ai/transcript"),
             b"{\"from\":\"probe\"}",
             "",
         )

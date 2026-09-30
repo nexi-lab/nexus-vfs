@@ -283,7 +283,7 @@ impl ZoneRuntimeBackend {
         // path input this surface takes (the contract module's stated
         // purpose). Ahead of the journal claim and execution: a bad path is
         // refused before it can pin an operation id or reach a metastore.
-        contracts::validate_zone_path(&req.mount_path)
+        contracts::validate_zone_wire_path(&req.mount_path)
             .map_err(|e| ZoneRuntimeError::Invalid(format!("mount_path: {e}")))?;
         let hash = request_hash(
             b"mount",
@@ -376,7 +376,7 @@ impl ZoneRuntimeBackend {
         validate_zone_id_for(ZoneIdUse::ExistingRef, &req.parent_zone_id)
             .map_err(|e| ZoneRuntimeError::Invalid(format!("parent_zone_id: {e}")))?;
         // Same API-boundary admission as mount (see `zone_mount`).
-        contracts::validate_zone_path(&req.mount_path)
+        contracts::validate_zone_wire_path(&req.mount_path)
             .map_err(|e| ZoneRuntimeError::Invalid(format!("mount_path: {e}")))?;
         let hash = request_hash(b"unmount", &[&req.parent_zone_id, &req.mount_path]);
 

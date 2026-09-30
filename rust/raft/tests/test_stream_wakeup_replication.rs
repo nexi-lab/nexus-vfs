@@ -35,6 +35,8 @@
 
 #![cfg(all(feature = "grpc", has_protos))]
 
+mod common;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -81,10 +83,7 @@ fn write_node_id(dir: &std::path::Path, id: u64) {
 }
 
 async fn make_node(node_id: u64, dir: &std::path::Path) -> (Arc<ZoneManager>, String) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind 0");
-    let addr = listener.local_addr().expect("local_addr");
-    drop(listener);
-    let bind_str = format!("{}", addr);
+    let bind_str = common::node_bind_addr();
 
     let zm = ZoneManager::with_node_id(
         "test-host",
@@ -248,9 +247,9 @@ async fn replicated_stream_append_wakes_a_parked_watch_only_with_the_observer() 
     // Every append uses the REAL wal-stream key (`/__wal_stream__/{path}/{seq}`)
     // that `WalStreamCore` writes, so the observer's parse is what recovers
     // the watched file path. The `sys_watch` is parked on the bare path.
-    let watch_path_1 = "/agents/win-ai/chat-with-me";
+    let watch_path_1 = "/agents/win-ai/transcript";
     let key_1 = wal_key(watch_path_1, 0);
-    let watch_path_2 = "/agents/mac-ai/chat-with-me";
+    let watch_path_2 = "/agents/mac-ai/transcript";
     let key_2 = wal_key(watch_path_2, 0);
 
     // ── Phase 1 — negative control: no observer, no wake ─────────────────

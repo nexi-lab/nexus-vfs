@@ -4,3 +4,7 @@
 # CRLF slipped into three `raft` sources via PR #178. Enforcing eol=lf here
 # makes it impossible regardless of a contributor's local git config.
 *.rs text eol=lf
+
+# Owner contract sources and generated projections have pinned SHA-256 digests.
+contracts/zone-id/*.json text eol=lf
+contracts/zone-path/*.json text eol=lf

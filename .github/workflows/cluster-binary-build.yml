@@ -23,10 +23,16 @@ jobs:
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
-            max_size_bytes: 17563648  # 16.75 MiB — raised from 16.25 for the
-                                      # managed-agent control plane relocated into
-                                      # nexusd-cluster (#241). Measured 17,130,264 bytes
-                                      # on this platform.
+            max_size_bytes: 17825792  # 17.0 MiB — raised from 16.75 for the bounded
+                                      # channel establishment (#351: the TLS handshake
+                                      # sat between `connect_timeout` and `timeout` and
+                                      # was bounded by neither, so a peer that accepts
+                                      # and never answers parked a dialer forever).
+                                      # Measured 17,565,528 bytes here, 1,880 over the
+                                      # old cap — the timeout future's monomorphisation
+                                      # plus one diagnostic string, not a step change.
+                                      # The other three platforms absorbed it inside
+                                      # their existing budgets; this is the tightest.
           - os: macos-14
             artifact_name: nexusd-cluster-macos-arm64
             package: nexus-cluster
@@ -55,10 +61,17 @@ jobs:
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster.exe
-            max_size_bytes: 16252928  # 15.5 MiB — raised from 15.0 for the
-                                      # managed-agent control plane relocated into
-                                      # nexusd-cluster (#241). Measured 15,738,880 bytes
-                                      # on this platform.
+            max_size_bytes: 16777216  # 16.0 MiB — raised from 15.5 for the
+                                      # session-identity plane: five RPCs
+                                      # (MintSessionAgent, RevokeAgentCert, and the
+                                      # three allow-list admin calls) plus the
+                                      # replicated allow-list store. Measured
+                                      # 16,264,704 bytes here against 16,114,688 on
+                                      # the parent commit — ~146 KB, most of it the
+                                      # tonic client+server code generated per RPC.
+                                      # This is the tightest-headroom platform; the
+                                      # other three absorbed the same change inside
+                                      # their existing budgets.
 
 
     steps:
@@ -112,8 +125,29 @@ jobs:
         with:
           shared-key: cluster-binary-${{ matrix.os }}-${{ matrix.target || 'native' }}
 
+      # A build that enables extra Cargo features produces a DIFFERENT binary,
+      # and consumers pin these by version. Two binaries carrying one version
+      # and one name is a mis-deploy that surfaces downstream as "mount driver
+      # not found" — a symptom that points nowhere near the version. So the
+      # feature set has to be visible in the artifact name, and this refuses
+      # the build rather than trusting whoever adds the next matrix row to
+      # remember.
+      - name: Feature-carrying builds must say so in their name
+        if: matrix.features != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in $(echo "${{ matrix.features }}" | tr ',' ' '); do
+            if [[ "${{ matrix.artifact_name }}" != *"$f"* ]]; then
+              echo "::error::artifact_name '${{ matrix.artifact_name }}' does not name the feature '$f' it is built with."
+              echo "A feature build is a different binary. Name it so, e.g. nexusd-cluster-<platform>-$f."
+              exit 1
+            fi
+          done
+          echo "artifact name carries its features: ${{ matrix.features }}"
+
       - name: Build release binary
-        run: cargo build --release -p ${{ matrix.package }} --bin ${{ matrix.bin }} ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+        run: cargo build --release -p ${{ matrix.package }} --bin ${{ matrix.bin }} ${{ matrix.features && format('--features {0}', matrix.features) || '' }} ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
 
       - name: Check binary size
         shell: bash

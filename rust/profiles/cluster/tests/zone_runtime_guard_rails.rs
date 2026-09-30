@@ -1,7 +1,7 @@
 //! Black-box E2E for the typed ZoneRuntime admission guard rails:
 //!
 //!   1. `zone_mount`/`zone_unmount` admit ONLY contract-valid mount paths —
-//!      the zone-path contract (`validate_zone_path`) is wired at the API
+//!      the zone-wire-path contract (`validate_zone_wire_path`) is wired at the API
 //!      boundary, so relative paths, `..` segments, `\\`, kernel-reserved
 //!      prefixes and over-length inputs are refused `InvalidArgument`
 //!      BEFORE any journal claim or execution.

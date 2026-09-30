@@ -30,6 +30,8 @@
 
 #![cfg(all(feature = "grpc", has_protos))]
 
+mod common;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -99,11 +101,9 @@ async fn spawn_mtls_server(
     server_cert: &[u8],
     server_key: &[u8],
 ) -> (String, SocketAddr, tokio::sync::oneshot::Sender<()>) {
-    // Reserve a free loopback port, then drop the probe so RaftGrpcServer can
-    // rebind it (the make_tls_node pattern in test_mtls_federation).
-    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
-    let addr = probe.local_addr().expect("local_addr");
-    drop(probe);
+    // Handed out from the harness band, so `RaftGrpcServer` can still bind it
+    // when it gets there — see `common::node_bind_addr`.
+    let addr = common::node_bind_socket_addr();
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let registry = Arc::new(ZoneRaftRegistry::new(tmp.path().to_path_buf(), 1));

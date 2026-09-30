@@ -198,7 +198,7 @@ impl ZoneRuntimeServiceImpl {
     /// a raw `/{parent}{mount_path}` concatenation mis-shapes non-absolute
     /// inputs (`"foo"` → `/rootfoo`) and root mounts (`"/"` → `/root/`),
     /// so the gate would be asking about a path nobody writes. The raft
-    /// layer's `validate_zone_path` admission (which runs after this gate
+    /// layer's `validate_zone_wire_path` admission (which runs after this gate
     /// in the RPC chain) rejects those inputs outright before any journal
     /// claim or execution.
     fn check_mount_path(

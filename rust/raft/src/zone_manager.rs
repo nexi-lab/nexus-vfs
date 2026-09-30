@@ -22,6 +22,7 @@ use crate::transport::{
 };
 use crate::zone_handle::ZoneHandle;
 use lib::rt::block_on_via as bridge_block_on;
+use lib::rt::OwnedRuntime;
 
 // ── Federation mount helpers ─────────────────────────────────────────
 
@@ -61,6 +62,22 @@ pub(crate) fn decode_file_metadata(
     use crate::transport::proto::nexus::core::FileMetadata as ProtoFileMetadata;
     use prost::Message;
     ProtoFileMetadata::decode(bytes)
+}
+
+/// The prefix form the metadata scan and [`path_matches_prefix`] both expect.
+///
+/// One normalizer so a subtree means the same thing to every caller: trailing slashes
+/// are noise (`/agents/` and `/agents` are one subtree), and `""` means the whole zone —
+/// which only `"/"` may ask for, because an empty argument anywhere else is a caller
+/// that lost its path, not a request to share everything.
+fn normalize_subtree_prefix(prefix: &str) -> Result<String> {
+    let normalized = prefix.trim_end_matches('/').to_string();
+    if normalized.is_empty() && prefix != "/" {
+        return Err(RaftError::InvalidState(format!(
+            "subtree prefix is empty (got '{prefix}')"
+        )));
+    }
+    Ok(normalized)
 }
 
 /// Is `path` either `normalized_prefix` or a descendant at `/` boundary?
@@ -190,16 +207,34 @@ pub struct TlsFiles {
     pub join_token_hash: Option<String>,
 }
 
+/// Is this bind failure "somebody else already has the address"?
+///
+/// Walks the source chain to an `io::Error` and reads its `kind`, rather than matching
+/// the rendered message. The text is
+/// `connection error: bind 0.0.0.0:2126: address already in use (os error 10048)` on
+/// Windows and `(os error 98)` on Linux, so a string test would be platform-specific
+/// and would go quiet the day tonic rewords it — while still compiling.
+fn addr_in_use(e: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cur = Some(e);
+    while let Some(err) = cur {
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            return io.kind() == std::io::ErrorKind::AddrInUse;
+        }
+        cur = err.source();
+    }
+    false
+}
+
 /// Multi-zone raft registry owner (pure Rust, kernel-internal).
 pub struct ZoneManager {
     registry: Arc<ZoneRaftRegistry>,
-    /// `Option` solely to support `Drop` taking ownership and switching
-    /// to `Runtime::shutdown_background()` when the surrounding caller
-    /// is itself running inside a tokio runtime — naive drop of a
-    /// `Runtime` from an async context panics ("Cannot drop a runtime
-    /// in a context where blocking is not allowed"). Always `Some`
-    /// for the lifetime of the `ZoneManager`; only `take`n in `Drop`.
-    runtime: Option<tokio::runtime::Runtime>,
+    /// The runtime every zone's `transport_loop` and the gRPC server run on.
+    ///
+    /// [`OwnedRuntime`] because dropping a runtime from an async context panics, and
+    /// this manager is built and dropped on both sides of that line — the daemon's
+    /// `#[tokio::main]` and sync tooling — including the constructor's own error
+    /// paths, which drop it before there is a `ZoneManager` to have a `Drop` impl.
+    runtime: OwnedRuntime,
     shutdown_tx: tokio::sync::Mutex<Option<tokio::sync::watch::Sender<bool>>>,
     node_id: u64,
     use_tls: bool,
@@ -227,6 +262,7 @@ pub struct ZoneManager {
     /// siblings) can record cross-org CA anchors once the daemon installs a
     /// `ForeignCaRegistrar`. Empty under `--no-tls`.
     foreign_ca_registrar_slot: crate::foreign_ca_registrar::ForeignCaRegistrarSlot,
+    session_mint_admin_slot: crate::session_mint_admin::SessionMintAdminSlot,
     /// The federated mTLS client-cert verifier — the client-auth trust roots,
     /// hot-swappable so a foreign CA registered at runtime is trusted without a
     /// restart. Built eagerly from the cluster CA (the only root until the
@@ -385,12 +421,18 @@ impl ZoneManager {
         // live even on small multi-zone hosts.
         let worker_threads =
             contracts::recommended_worker_threads(contracts::MIN_SERVER_RUNTIME_WORKERS);
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(worker_threads)
-            .enable_all()
-            .thread_name("nexus-zone-mgr")
-            .build()
-            .map_err(|e| RaftError::Config(format!("Failed to create runtime: {}", e)))?;
+        // Owned from birth, not from `Ok(...)`: every `?` below this line is a path an
+        // operator can reach (a data dir another process has open, unreadable TLS
+        // material, a bind address that is not on this host), and each one drops this
+        // runtime while unwinding — which must not panic over the error it carries.
+        let runtime = OwnedRuntime::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(worker_threads)
+                .enable_all()
+                .thread_name("nexus-zone-mgr")
+                .build()
+                .map_err(|e| RaftError::Config(format!("Failed to create runtime: {}", e)))?,
+        );
 
         let registry = Arc::new(ZoneRaftRegistry::with_tls(
             PathBuf::from(base_path),
@@ -450,11 +492,17 @@ impl ZoneManager {
         };
         registry
             .materialize_now(&eager, peer_addrs.clone(), runtime.handle())
-            .map_err(|e| {
-                RaftError::Raft(format!(
+            .map_err(|e| match e {
+                // Kept typed rather than folded into the message: the caller's
+                // response to "someone else has this data dir" is a different one,
+                // and a CLI should not have to read prose to tell.
+                crate::transport::TransportError::DataDirLocked(path) => {
+                    RaftError::DataDirLocked(path)
+                }
+                other => RaftError::Raft(format!(
                     "Failed to open zones {:?} on startup: {}",
-                    eager, e
-                ))
+                    eager, other
+                )),
             })?;
 
         let blob_fetcher_slot = crate::blob_fetcher::new_blob_fetcher_slot();
@@ -462,6 +510,7 @@ impl ZoneManager {
         let key_minter_slot = crate::key_minter::new_key_minter_slot();
         let foreign_ca_registrar_slot =
             crate::foreign_ca_registrar::new_foreign_ca_registrar_slot();
+        let session_mint_admin_slot = crate::session_mint_admin::new_session_mint_admin_slot();
         // Build the federated client-cert verifier eagerly from the cluster CA
         // when TLS is on, so the serve path (below) and the cross-org
         // apply-observer (cluster profile, via `foreign_ca_verifier()`) share ONE
@@ -480,6 +529,7 @@ impl ZoneManager {
             .with_agent_minter_slot(agent_minter_slot.clone())
             .with_key_minter_slot(key_minter_slot.clone())
             .with_foreign_ca_registrar_slot(foreign_ca_registrar_slot.clone())
+            .with_session_mint_admin_slot(session_mint_admin_slot.clone())
             .with_foreign_ca_verifier(foreign_ca_verifier.clone());
         // Node enrollment (JoinCluster cert provisioning) is NOT served here —
         // this bind is strict mTLS, which a certless joiner cannot reach. The
@@ -489,6 +539,9 @@ impl ZoneManager {
             server = server.with_extra_services(extra);
         }
         let shutdown_rx_server = shutdown_rx.clone();
+        // Owned: the failure message below names the address, and the task outlives
+        // this borrow.
+        let bind_for_error = bind_addr.to_string();
         runtime.spawn(async move {
             let shutdown = async move {
                 let mut rx = shutdown_rx_server;
@@ -509,13 +562,33 @@ impl ZoneManager {
                 // server startup is a strict prerequisite for
                 // federation and there is no recovery from within the
                 // process — bind is either possible or not.
-                tracing::error!(
-                    error = %e,
-                    "ZoneManager gRPC server terminated with error — this is \
-                     unrecoverable (bind failure on gRPC endpoint); exiting \
-                     the daemon so the operator / supervisor sees a hard fail \
-                     instead of a silently-degraded process",
-                );
+                // Name the one cause an operator can act on. "Someone else has this
+                // address" is a different instruction from "this address is not on any
+                // interface", and a one-shot subcommand hitting the first one used to
+                // read this daemon-shaped sentence and conclude its own federation was
+                // broken (#328).
+                if addr_in_use(&e) {
+                    tracing::error!(
+                        error = %e,
+                        bind = %bind_for_error,
+                        "another process already holds {bind_for_error}. This process has to \
+                         be reachable THERE — a zone with other voters delivers their \
+                         append/vote responses to the address its peers were told to \
+                         dial, so an ephemeral port would leave it waiting forever. \
+                         Stop whatever holds it, or run this against the data dir whose \
+                         node owns that address",
+                    );
+                } else {
+                    tracing::error!(
+                        error = %e,
+                        bind = %bind_for_error,
+                        "gRPC bind on {bind_for_error} failed for a reason other than the \
+                         address being taken — an IP not assigned to any interface (a \
+                         Tailscale address while the tunnel is down does this) or a TLS \
+                         material mismatch. Nothing can reach this process until it \
+                         binds, so there is no degraded mode to continue in",
+                    );
+                }
                 std::process::exit(1);
             }
         });
@@ -530,7 +603,7 @@ impl ZoneManager {
 
         Ok(Arc::new(Self {
             registry,
-            runtime: Some(runtime),
+            runtime,
             shutdown_tx: tokio::sync::Mutex::new(Some(shutdown_tx)),
             node_id,
             use_tls,
@@ -539,6 +612,7 @@ impl ZoneManager {
             agent_minter_slot,
             key_minter_slot,
             foreign_ca_registrar_slot,
+            session_mint_admin_slot,
             foreign_ca_verifier,
             pending_mounts: parking_lot::Mutex::new(BTreeMap::new()),
         }))
@@ -567,6 +641,14 @@ impl ZoneManager {
     /// install a concrete registrar on every auth-on daemon. Clone-cheap.
     pub fn foreign_ca_registrar_slot(&self) -> crate::foreign_ca_registrar::ForeignCaRegistrarSlot {
         self.foreign_ca_registrar_slot.clone()
+    }
+
+    /// Hand back the session-mint admin slot so the cluster profile can install
+    /// the impl once the control zone is up. Same late-binding shape as the
+    /// foreign-CA registrar above, for the same reason: the store it administers
+    /// rides the control-zone consensus, which is not ready at construction.
+    pub fn session_mint_admin_slot(&self) -> crate::session_mint_admin::SessionMintAdminSlot {
+        self.session_mint_admin_slot.clone()
     }
 
     /// Hand back the shared federated client-cert verifier so the cluster profile
@@ -629,13 +711,9 @@ impl ZoneManager {
         self.rt().handle().clone()
     }
 
-    /// Internal runtime accessor. The field is `Option` solely so
-    /// `Drop` can take ownership and switch to `shutdown_background()`
-    /// when the caller's thread is itself running on a tokio runtime;
-    /// the option is `Some` for the entire lifetime up to that point,
-    /// so this `expect` is unreachable in practice.
+    /// Internal runtime accessor.
     fn rt(&self) -> &tokio::runtime::Runtime {
-        self.runtime.as_ref().expect("runtime present until Drop")
+        self.runtime.get()
     }
 
     /// The internal zone registry — kernel uses this for apply-cb
@@ -1482,6 +1560,64 @@ impl ZoneManager {
         Ok(target_zone_id_opt)
     }
 
+    /// Every metadata row under `normalized_prefix` in `parent_zone_id`.
+    ///
+    /// The ONE scan behind both "what would a share copy" and "how many are there".
+    /// Sharing what a separate count promised requires the prefix rule to be the same
+    /// rule — two spellings of [`path_matches_prefix`] would let a pre-flight check
+    /// green-light a share that copies something else.
+    ///
+    /// A local, leader-free read: sequential consistency on the parent zone, no
+    /// propose, so a caller may ask before the target zone exists.
+    fn subtree_entries(
+        &self,
+        parent_zone_id: &str,
+        normalized_prefix: &str,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        let parent_node = self.registry.get_node(parent_zone_id).ok_or_else(|| {
+            RaftError::InvalidState(format!("Parent zone '{parent_zone_id}' not found"))
+        })?;
+        let scan_prefix = if normalized_prefix.is_empty() {
+            "/".to_string()
+        } else {
+            normalized_prefix.to_string()
+        };
+        let handle = self.rt().handle().clone();
+        let entries = bridge_block_on(
+            &handle,
+            parent_node
+                .with_state_machine(move |sm: &FullStateMachine| sm.list_metadata(&scan_prefix)),
+        )
+        .map_err(|e| RaftError::Raft(format!("list_metadata: {e}")))?;
+        Ok(entries
+            .into_iter()
+            .filter(|(path, _)| path_matches_prefix(path, normalized_prefix))
+            .collect())
+    }
+
+    /// How many metadata entries live under `prefix` in `parent_zone_id`.
+    ///
+    /// Exposed so a caller can decide whether a share is worth doing BEFORE the
+    /// target zone exists: creating the zone first makes "it copied nothing" a
+    /// discovery you make too late, with an orphan raft group already mounted behind
+    /// a path that was never there.
+    ///
+    /// Zero means "nothing there", and deliberately does not distinguish an empty
+    /// directory from a missing one: the state machine holds metadata rows, not
+    /// directory objects, so at this layer those are the same observation. A caller
+    /// that cares treats zero as a question for the operator.
+    ///
+    /// # Errors
+    ///
+    /// When `prefix` is unusable, `parent_zone_id` is not a zone this node hosts, or
+    /// the state-machine read fails.
+    pub fn subtree_entry_count(&self, parent_zone_id: &str, prefix: &str) -> Result<usize> {
+        let normalized_prefix = normalize_subtree_prefix(prefix)?;
+        Ok(self
+            .subtree_entries(parent_zone_id, &normalized_prefix)?
+            .len())
+    }
+
     /// Copy every FileMetadata entry under `prefix` in `parent_zone_id`
     /// into `new_zone_id` with path rebased; bump `i_links_count` on
     /// every locally-hosted nested DT_MOUNT target. Returns count.
@@ -1491,9 +1627,6 @@ impl ZoneManager {
         prefix: &str,
         new_zone_id: &str,
     ) -> Result<usize> {
-        let parent_node = self.registry.get_node(parent_zone_id).ok_or_else(|| {
-            RaftError::InvalidState(format!("Parent zone '{}' not found", parent_zone_id))
-        })?;
         let new_node = self.registry.get_node(new_zone_id).ok_or_else(|| {
             RaftError::InvalidState(format!(
                 "Target zone '{}' not found (was create_zone called?)",
@@ -1527,37 +1660,17 @@ impl ZoneManager {
             )));
         }
 
-        let normalized_prefix = prefix.trim_end_matches('/').to_string();
-        if normalized_prefix.is_empty() && prefix != "/" {
-            return Err(RaftError::InvalidState(format!(
-                "share_subtree: empty prefix (got '{}')",
-                prefix
-            )));
-        }
+        let normalized_prefix = normalize_subtree_prefix(prefix)?;
+        let entries = self.subtree_entries(parent_zone_id, &normalized_prefix)?;
 
         let handle = self.rt().handle().clone();
         let registry = self.registry.clone();
-
-        let scan_prefix = if normalized_prefix.is_empty() {
-            "/".to_string()
-        } else {
-            normalized_prefix.clone()
-        };
-        let entries = bridge_block_on(
-            &handle,
-            parent_node
-                .with_state_machine(move |sm: &FullStateMachine| sm.list_metadata(&scan_prefix)),
-        )
-        .map_err(|e| RaftError::Raft(format!("list_metadata: {}", e)))?;
 
         let mut copied: usize = 0;
         let mut nested_mount_targets: Vec<String> = Vec::new();
         let mut root_written = false;
 
         for (path, value) in entries {
-            if !path_matches_prefix(&path, &normalized_prefix) {
-                continue;
-            }
             let proto = match decode_file_metadata(&value) {
                 Ok(p) => p,
                 Err(e) => {
@@ -1825,19 +1938,8 @@ impl Drop for ZoneManager {
                 let _ = tx.send(true);
             }
         }
-        // Drop the inner runtime non-blockingly when we're sitting
-        // inside another tokio runtime: a naive `Runtime` drop blocks
-        // until every spawned task exits, and tokio refuses to block
-        // on a worker thread ("Cannot drop a runtime in a context
-        // where blocking is not allowed"). `shutdown_background`
-        // schedules cleanup off-thread; the alternative `drop` path
-        // (sync caller, no outer runtime) is the natural blocking
-        // shutdown.
-        if let Some(rt) = self.runtime.take() {
-            if tokio::runtime::Handle::try_current().is_ok() {
-                rt.shutdown_background();
-            }
-        }
+        // The inner runtime shuts itself down context-correctly — see the `runtime`
+        // field.
     }
 }
 
@@ -1885,10 +1987,22 @@ pub fn join_cluster_and_provision_tls(
         format!("http://{}", peer_address)
     };
 
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| RaftError::Config(format!("Failed to create runtime: {}", e)))?;
+    // Owned (see `OwnedRuntime`) so the `?`s below — a refused RPC, a CA fingerprint
+    // that does not match, an unwritable TLS dir — report their reason instead of
+    // panicking on this runtime's drop while unwinding.
+    //
+    // Driven with `Runtime::block_on`, NOT `bridge_block_on`: this runtime is
+    // current-thread, so nothing but this call drives its IO driver, and a
+    // `Handle::block_on` from elsewhere would poll the future while the connect it is
+    // waiting on is never polled at all — boot hangs at "auto-enrolling" until the
+    // budget expires. Callers reach this from a blocking context (where
+    // `Runtime::block_on` is legal) for exactly that reason.
+    let runtime = OwnedRuntime::new(
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| RaftError::Config(format!("Failed to create runtime: {}", e)))?,
+    );
 
     let result = runtime
         .block_on(call_join_cluster(
@@ -2090,5 +2204,60 @@ mod tests {
         let _ = zm
             .create_zone("z1", vec![])
             .expect("create idempotent on restart");
+    }
+}
+
+#[cfg(test)]
+mod bind_failure_tests {
+    use super::addr_in_use;
+
+    /// A tonic bind failure arrives wrapped, so the check has to walk the chain rather
+    /// than look at the top-level error.
+    #[derive(Debug)]
+    struct Wrapped(std::io::Error);
+
+    impl std::fmt::Display for Wrapped {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "connection error")
+        }
+    }
+
+    impl std::error::Error for Wrapped {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    #[test]
+    fn a_taken_address_is_recognised_through_the_wrapper() {
+        let e = Wrapped(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            "address already in use",
+        ));
+        assert!(addr_in_use(&e));
+    }
+
+    #[test]
+    fn an_unassigned_address_is_not_a_taken_one() {
+        // A Tailscale address while the tunnel is down: the operator's action is
+        // different, so the two must not share a message.
+        let e = Wrapped(std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            "cannot assign requested address",
+        ));
+        assert!(!addr_in_use(&e));
+    }
+
+    #[test]
+    fn no_io_error_in_the_chain_is_not_a_taken_address() {
+        #[derive(Debug)]
+        struct Tls;
+        impl std::fmt::Display for Tls {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "tls handshake failed")
+            }
+        }
+        impl std::error::Error for Tls {}
+        assert!(!addr_in_use(&Tls));
     }
 }

@@ -31,12 +31,25 @@ mod common;
 use std::time::Duration;
 
 use common::{
-    await_replicated, free_port, mint_agent_cert, write_tls_bundle, Daemon, Vfs, LOG_FILTER,
+    agent_credential, await_replicated, free_port, mint_agent_cert, write_tls_bundle, Daemon, Vfs,
+    LOG_FILTER,
 };
 use nexus_raft::transport::{generate_join_token, generate_zone_ca};
 
 const ZONE: &str = "sharedzone";
 const MOUNT: &str = "/agents";
+
+/// The transcript `a` and `b` share, under this test's mount.
+///
+/// Built through the a2a address SSOT, because the stamp hook decides what
+/// it claims from the same constants: a layout change that would un-stamp
+/// these writes must break this test rather than leave it green.
+fn transcript(a: &str, b: &str) -> String {
+    format!(
+        "{MOUNT}{}",
+        a2a::conversation_transcript_path(&a2a::conversation_id(a, b))
+    )
+}
 const SECRET: &str = "e2e-fed-mtls-secret";
 const BUDGET: Duration = Duration::from_secs(120);
 
@@ -160,8 +173,7 @@ async fn from_is_unforgeable_across_an_mtls_federation_both_directions() {
         // drop → kill → release the data-dir lock for the offline mint.
     }
     let win_bundle = mint_agent_cert(&founder_env(&fdata, &fid, &fadv, &mounts), "win-ai");
-    let win_cert = std::fs::read(win_bundle.join("agent.pem")).expect("win-ai cert");
-    let win_key = std::fs::read(win_bundle.join("agent-key.pem")).expect("win-ai key");
+    let win_cred = agent_credential(&win_bundle);
     let mut founder = Daemon::spawn(
         &["--bind-addr", &fbind],
         &founder_env(&fdata, &fid, &fadv, &mounts),
@@ -182,8 +194,7 @@ async fn from_is_unforgeable_across_an_mtls_federation_both_directions() {
             .expect("joiner joins sharedzone over mTLS");
     }
     let mac_bundle = mint_agent_cert(&joiner_env(&jdata, &jid, &jadv, &peers), "mac-ai");
-    let mac_cert = std::fs::read(mac_bundle.join("agent.pem")).expect("mac-ai cert");
-    let mac_key = std::fs::read(mac_bundle.join("agent-key.pem")).expect("mac-ai key");
+    let mac_cred = agent_credential(&mac_bundle);
     let mut joiner = Daemon::spawn(
         &["--bind-addr", &jbind],
         &joiner_env(&jdata, &jid, &jadv, &peers),
@@ -195,8 +206,8 @@ async fn from_is_unforgeable_across_an_mtls_federation_both_directions() {
 
     // Each agent presents its cert on its node's mTLS bind; the handshake is the
     // readiness gate (both certs chain to the one shared CA).
-    let mut wc = Vfs::connect_mtls(fport, &ca, &win_cert, &win_key, BUDGET).await;
-    let mut mc = Vfs::connect_mtls(jport, &ca, &mac_cert, &mac_key, BUDGET).await;
+    let mut wc = Vfs::connect_as_agent(fport, &win_cred, BUDGET).await;
+    let mut mc = Vfs::connect_as_agent(jport, &mac_cred, BUDGET).await;
 
     // ── 4. HEALTH: mTLS federation actually replicates founder→joiner ───────
     let health = format!("{MOUNT}/health.txt");
@@ -248,7 +259,7 @@ async fn from_is_unforgeable_across_an_mtls_federation_both_directions() {
     // backend — the entries replicate over raft, the local stream handle does
     // not. So mac-ai (the owner) materializes its OWN mailbox before reading,
     // and win-ai (the peer sender) opens the same path before writing.
-    let mac_mbox = format!("{MOUNT}/mac-ai/chat-with-me");
+    let mac_mbox = transcript("mac-ai", "mac-peer");
     mc.create_stream(&mac_mbox, "")
         .await
         .expect("mac-ai opens its OWN mailbox");
@@ -267,7 +278,7 @@ async fn from_is_unforgeable_across_an_mtls_federation_both_directions() {
     assert_stamped(&mut mc, &mac_mbox, "win-ai", forged).await;
 
     // ── 6. FWD← : mac-ai writes win-ai's mailbox forged; win-ai reads stamped ─
-    let win_mbox = format!("{MOUNT}/win-ai/chat-with-me");
+    let win_mbox = transcript("win-ai", "win-peer");
     wc.create_stream(&win_mbox, "")
         .await
         .expect("win-ai opens its OWN mailbox");

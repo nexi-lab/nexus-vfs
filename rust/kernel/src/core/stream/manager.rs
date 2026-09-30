@@ -190,7 +190,21 @@ impl StreamManager {
     }
 
     /// Non-blocking write. Returns byte offset.
-    pub fn write_nowait(&self, path: &str, data: &[u8]) -> Result<usize, StreamManagerError> {
+    ///
+    /// `pub(crate)` on purpose, matching `PipeManager::write_nowait`. This
+    /// writes straight into the buffer, so it runs no write hooks — which
+    /// makes it a way around every guarantee those hooks carry (the A2A
+    /// mailbox `from`-stamp, and anything a deployment adds). Reaching it
+    /// from outside the kernel was not hypothetical: the LLM connectors did
+    /// exactly that, and their output was the one write nothing could see.
+    ///
+    /// Out-of-crate producers go through [`crate::kernel::Kernel::stream_write_nowait`]
+    /// or the [`crate::extensions::llm_streaming::StreamSink`] it backs.
+    pub(crate) fn write_nowait(
+        &self,
+        path: &str,
+        data: &[u8],
+    ) -> Result<usize, StreamManagerError> {
         let buf = self
             .resolve(path)
             .ok_or_else(|| StreamManagerError::NotFound(path.to_string()))?;
@@ -637,7 +651,7 @@ mod tests {
     /// the reader parked until its timeout and fail the test.
     #[test]
     fn wake_waiters_wakes_a_reader_over_an_out_of_band_backend_push() {
-        let path = "/agents/peer/chat-with-me";
+        let path = "/agents/peer/transcript";
         let backend = Arc::new(MemoryStreamBackend::new(4096));
         let sm = Arc::new(StreamManager::new());
         // `register` keeps the notify slot the reader parks on; we retain the
@@ -671,6 +685,6 @@ mod tests {
         assert_eq!(data, b"from-a-peer");
 
         // No slot for an unknown path → no-op, reported as false.
-        assert!(!sm.wake_waiters("/agents/nobody/chat-with-me"));
+        assert!(!sm.wake_waiters("/agents/nobody/transcript"));
     }
 }

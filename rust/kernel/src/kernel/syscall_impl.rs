@@ -829,6 +829,17 @@ impl Kernel {
                     Err(crate::stream_manager::StreamManagerError::Backend(
                         crate::stream::StreamError::Closed(msg),
                     )) => return Err(KernelError::StreamClosed(msg.to_string())),
+                    // The append did not commit and the backend said why. Which
+                    // stream, and the reason as given — the two things a client
+                    // needs to decide what to do, and neither was reachable while
+                    // this arrived as a `Closed` carrying a canned guess.
+                    Err(crate::stream_manager::StreamManagerError::Backend(
+                        crate::stream::StreamError::NotReplicated(why),
+                    )) => {
+                        return Err(KernelError::IOError(format!(
+                            "DT_STREAM append at {path} did not commit: {why}"
+                        )))
+                    }
                     // `Full` is BACKPRESSURE, not failure: the frame did not
                     // land, the ring is momentarily full, and the caller is
                     // expected to retry — that is what a miss means here.
@@ -1557,6 +1568,30 @@ impl Kernel {
                     // which already merge backend results when the
                     // metastore has nothing.
                     if let Some(backend) = route.backend.as_ref() {
+                        // A DIRECTORY reaches this branch too, and `delete_file` is the
+                        // wrong tool for it. `path_local` creates parent directories
+                        // physically on write, so a directory that was never mkdir'd has
+                        // no row — and once its files are deleted, `sys_stat` and
+                        // `sys_readdir` still report it (both merge backend results)
+                        // while `delete_file` returns EISDIR. That error was swallowed
+                        // into `miss(0)`, which a client reads as 404: the directory was
+                        // visible and undeletable, and every emptied workspace folder on
+                        // one production deployment was stuck that way (#320).
+                        //
+                        // `rmdir` is the tool: it tolerates a missing row, and it is
+                        // where the non-empty refusal lives, so `recursive` keeps meaning
+                        // what it means everywhere else.
+                        if matches!(backend.stat(&route.backend_path), Ok(s) if s.is_dir) {
+                            let removed = self.rmdir(path, ctx, recursive)?;
+                            return Ok(SysUnlinkResult {
+                                hit: removed.hit,
+                                entry_type: DT_DIR,
+                                post_hook_needed: removed.post_hook_needed,
+                                path: path.to_string(),
+                                content_id: None,
+                                size: 0,
+                            });
+                        }
                         match backend.delete_file(&route.backend_path) {
                             Ok(()) => {
                                 return Ok(SysUnlinkResult {
@@ -1944,18 +1979,55 @@ impl Kernel {
             _ => {}
         }
 
-        // 5. Destination conflict check — full VFS path (R20.3 contract)
-        let new_exists = self
-            .with_metastore(&new_route.mount_point, |ms| {
-                ms.exists(new_path).unwrap_or(false)
-            })
-            .unwrap_or(false);
-        if new_exists {
-            release_locks(&self.lock_manager, lock1, lock2);
-            return Err(KernelError::FileExists(format!(
-                "Destination path already exists: {}",
-                new_path
-            )));
+        // 5. Destination handling — full VFS path (R20.3 addressing convention).
+        //
+        // `rename(2)` replaces an existing destination atomically, and that
+        // guarantee is the reason programs use rename at all: write to a temp
+        // name, then rename over the target, and a reader sees either the whole
+        // old file or the whole new one even if the writer dies mid-way. git,
+        // every editor, and every package manager update files this way.
+        // Refusing the replace outright made the mount unusable for all of them
+        // — `git init` cannot write its own config (nexus#4830).
+        //
+        // Replacement is only allowed where it is actually atomic and leaves no
+        // orphans. File over file is: the PAS backend's own rename replaces the
+        // bytes atomically, and the metastore rewrite is one redb transaction
+        // whose `insert` overwrites. Anything involving a directory is refused
+        // with the errno POSIX specifies, because a directory's children live
+        // under its key prefix and replacing it would strand every one of them.
+        let new_meta = self
+            .with_metastore(&new_route.mount_point, |ms| ms.get(new_path).ok().flatten())
+            .flatten();
+        let new_is_dir = match &new_meta {
+            Some(m) => m.entry_type == DT_DIR,
+            None => self
+                .with_metastore(&new_route.mount_point, |ms| {
+                    let prefix = format!("{}/", new_path.trim_end_matches('/'));
+                    ms.list(&prefix).map(|v| !v.is_empty()).unwrap_or(false)
+                })
+                .unwrap_or(false),
+        };
+        let replacing = new_meta.is_some() || new_is_dir;
+
+        if replacing {
+            let refusal = if is_directory && !new_is_dir {
+                Some("cannot rename a directory over a file")
+            } else if !is_directory && new_is_dir {
+                Some("cannot rename a file over a directory")
+            } else if is_directory && new_is_dir {
+                // POSIX permits this when the destination is empty. Telling
+                // "empty" from "has children" costs a scan, and no caller needs
+                // it yet — so it is refused rather than half-implemented.
+                Some("cannot replace a directory")
+            } else {
+                None
+            };
+            if let Some(why) = refusal {
+                release_locks(&self.lock_manager, lock1, lock2);
+                return Err(KernelError::FileExists(format!(
+                    "sys_rename: {why}: {new_path}"
+                )));
+            }
         }
 
         // 6. Rename — cross-mount vs same-mount
@@ -2818,11 +2890,38 @@ impl Kernel {
             }
         }
 
-        // 6. Backend rmdir (best-effort)
-        let _ = route
-            .backend
-            .as_ref()
-            .map(|b| b.rmdir(&route.backend_path, recursive));
+        // 6. Backend rmdir — BEFORE the row is deleted, and the result is read.
+        //
+        // This used to be `let _ = …`, "best-effort", and that discarded the one
+        // answer that matters: a backend refusing to remove a non-empty directory.
+        // The row was deleted anyway, the call returned success, and the directory
+        // stayed on disk — a row gone while the thing it described lives on, which is
+        // the worst of the three outcomes (#320).
+        //
+        // Order is the fix as much as the check: the metastore is the SSOT, so if the
+        // backend still has the directory, the row must stay and say so.
+        if let Some(backend) = route.backend.as_ref() {
+            match backend.rmdir(&route.backend_path, recursive) {
+                Ok(()) => {}
+                // Never had it, or a backend with no directory concept at all
+                // (CAS / remote / api connectors) — the row is the whole truth there.
+                Err(crate::abc::object_store::StorageError::NotFound(_))
+                | Err(crate::abc::object_store::StorageError::NotSupported(_)) => {}
+                Err(e) => {
+                    self.lock_manager.do_release(lock_handle);
+                    // The commonest cause is children this kernel cannot see: a
+                    // physical-only subdirectory left by a write that never went
+                    // through mkdir. Saying "not empty" for a non-recursive call is
+                    // the same answer the metastore check above gives, so a caller
+                    // gets one story regardless of which layer noticed.
+                    return Err(KernelError::IOError(if recursive {
+                        format!("rmdir({path}) failed in the backend: {e:?}")
+                    } else {
+                        format!("Directory not empty: {path}")
+                    }));
+                }
+            }
+        }
 
         // 7. Atomic delete — metastore is the SSOT. Per-key cache
         // invalidation already happened: ``delete_batch`` invalidated
@@ -2875,6 +2974,17 @@ impl Kernel {
         };
         self.with_metastore_route(&route, |ms| ms.exists(path).unwrap_or(false))
             .unwrap_or(false)
+    }
+
+    /// True when some mount covers `path` in `zone_id`.
+    ///
+    /// Pure routing: it answers whether the namespace is here, NOT whether a
+    /// file exists (that is `access`). `route` returning `None` is the one
+    /// signal that no mount covers the path, and the caller decides what a
+    /// miss means — a reader can turn an unmounted path into a clear
+    /// "outside your mounts" error instead of an ambiguous not-found.
+    pub fn is_mounted(&self, path: &str, zone_id: &str) -> bool {
+        validate_path_fast(path).is_ok() && self.vfs_router.route(path, zone_id).is_some()
     }
 
     // ── Internal batch functions (not Tier 1 syscalls) ────────────────
@@ -3479,6 +3589,50 @@ impl Kernel {
         )
     }
 
+    /// The directories a row at `path` implies, as segments relative to a listing
+    /// rooted at `global_prefix`: under `/agents/`, a row at
+    /// `/agents/deep/conversations/x` implies `deep`, and recursively also
+    /// `deep/conversations`.
+    ///
+    /// # Why a listing derives these instead of reading them
+    ///
+    /// A write plants the LEAF's row only, so `/a/b/c` leaves `b` with no row of its
+    /// own — while `b` still STATS as a directory, because `sys_stat` resolves a
+    /// path rather than consulting its parent's listing. Filtering the prefix scan
+    /// to rows at exactly one level therefore answered "is this a directory" and "is
+    /// it listed in its parent" differently, and nothing could reconcile the second:
+    /// `sys_setattr(DT_DIR)` on an entry that already resolves is a no-op, so the
+    /// caller that noticed had no move. Live, that made an agent whose subtree was
+    /// first touched deep — a peer writing `/agents/<name>/conversations/<peer>` —
+    /// permanently absent from `readdir /agents` on that node while `stat` found it
+    /// from either machine, so two nodes listed two different sets.
+    ///
+    /// Derived rather than planted on write, deliberately: membership becomes a
+    /// FUNCTION of the rows that exist instead of a second stored fact that can
+    /// disagree with them, the write path stays one row per write, nothing has to be
+    /// backfilled for the rows already on disk, and a read path adds no raft
+    /// traffic. The rows are in hand — the caller's scan returned them — so the cost
+    /// is a segment walk over rows deeper than the listing.
+    ///
+    /// Segments are BORROWED from `path` so a caller can compare before it
+    /// allocates. A recursive listing wants every level, because it reports a
+    /// subtree and a subtree with holes is the same defect one level down; a
+    /// single-level listing wants only the first, which is the only one that is a
+    /// child of that listing.
+    fn implied_relative_dirs<'p>(
+        global_prefix: &str,
+        path: &'p str,
+        recursive: bool,
+    ) -> impl Iterator<Item = &'p str> {
+        // `get`, not a slice: a caller that asks about a path shorter than the
+        // prefix gets an empty iterator rather than a panic on a char boundary.
+        let rest = path.get(global_prefix.len()..).unwrap_or_default();
+        let levels = if recursive { usize::MAX } else { 1 };
+        rest.match_indices('/')
+            .map(move |(off, _)| &rest[..off])
+            .take(levels)
+    }
+
     /// Merge ONE mount's listing into `seen` — the metastore prefix scan plus
     /// the backend `list_dir` / federation `via_federation_readdir` union.
     /// Factored out of [`Self::sys_readdir`] so a recursive scan can call it
@@ -3506,23 +3660,80 @@ impl Kernel {
             scan_root.trim_end_matches('/')
         };
 
-        if let Some(ms_children) =
-            self.with_metastore_route(route, |ms| ms.list(&global_prefix).ok())
-        {
+        // A store that cannot be read is reported, not silently folded into "this
+        // directory is empty".
+        //
+        // # Why this WARNs instead of returning an error (#345)
+        //
+        // `sys_readdir` returns a `Vec`, and making it a `Result` is not a local
+        // change: 35 call sites, the async mirror, the gRPC handler — and the plugin
+        // ABI, which is a C dispatch seam. Widening an infra ABI to carry an error
+        // most callers cannot act on is the wrong trade, so the syscall keeps its
+        // shape and the failure becomes VISIBLE here, naming the prefix and the
+        // error, where before it produced an empty listing and no trace at all.
+        //
+        // That leaves one thing this cannot fix: a REMOTE caller still cannot tell
+        // "empty" from "unreadable", because the distinction has to cross the wire to
+        // reach it. That is a `ReaddirResponse` field, not a syscall return type —
+        // decided rather than left open, so the next person does not re-derive it.
+        //
+        // Also note the merge semantics this respects: one mount failing does not
+        // invalidate the others, so the listing continues with what the remaining
+        // mounts hold rather than collapsing to nothing.
+        let listing = self.with_metastore_route(route, |ms| match ms.list(&global_prefix) {
+            Ok(rows) => Some(rows),
+            Err(e) => {
+                tracing::warn!(
+                    prefix = %global_prefix,
+                    error = %e,
+                    "metastore listing failed — this directory's entries from that store \
+                     are MISSING from the result, not absent from the namespace"
+                );
+                None
+            }
+        });
+        if let Some(ms_children) = listing {
             let parent_depth = global_prefix.matches('/').count();
+            // Directories that exist because something below them does — see
+            // [`implied_relative_dirs`] for why a listing derives them instead of
+            // reading rows that a write never planted.
+            let mut implied: Vec<(String, Option<String>)> = Vec::new();
+            let mut last_implied = String::new();
             for meta in ms_children.into_iter().flatten() {
+                if !meta.path.starts_with(&global_prefix) {
+                    continue;
+                }
+                let depth = meta.path.matches('/').count();
+                if depth > parent_depth {
+                    for rel in Self::implied_relative_dirs(&global_prefix, &meta.path, recursive) {
+                        // `list` hands back sorted paths, so every row under one
+                        // subtree arrives contiguously, and comparing the BORROWED
+                        // segment first makes a whole subtree cost one allocation
+                        // instead of one per row. Purely a saving: out-of-order rows
+                        // yield duplicates, which the `or_insert` below absorbs.
+                        if rel == last_implied {
+                            continue;
+                        }
+                        last_implied.clear();
+                        last_implied.push_str(rel);
+                        implied.push((format!("{global_prefix}{rel}"), meta.zone_id.clone()));
+                    }
+                }
                 // Single-level keeps direct children only (same depth as the
                 // prefix + 1 segment); recursive keeps the whole subtree the
                 // one prefix scan already returned — that is the round-trip
                 // collapse (one server-side scan vs O(dirs) client calls).
-                if !recursive && meta.path.matches('/').count() != parent_depth {
-                    continue;
-                }
-                if !meta.path.starts_with(&global_prefix) {
+                if !recursive && depth != parent_depth {
                     continue;
                 }
                 seen.entry(meta.path)
                     .or_insert((meta.entry_type, meta.zone_id));
+            }
+            // After the stored rows, never before: a real entry is authoritative
+            // about its own type, and a derived one must not mask it just because
+            // a deeper row happened to be scanned first.
+            for (path, zone_id) in implied {
+                seen.entry(path).or_insert((DT_DIR, zone_id));
             }
         }
 
@@ -4001,6 +4212,23 @@ mod read_batch_tests {
     }
 
     #[test]
+    fn is_mounted_reflects_route_presence_not_file_existence() {
+        // A kernel with a mount at `/` covers every path, whether or not a file
+        // exists there — is_mounted is pure routing, distinct from access.
+        let mounted = kernel_with_backend();
+        assert!(mounted.is_mounted("/anything/here", contracts::ROOT_ZONE_ID));
+        assert!(mounted.is_mounted("/no/such/file.txt", contracts::ROOT_ZONE_ID));
+
+        // A kernel with no mounts covers nothing: the miss a caller turns into
+        // an "outside your mounts" error rather than a plain not-found.
+        let bare = Kernel::new();
+        assert!(!bare.is_mounted("/anything/here", contracts::ROOT_ZONE_ID));
+
+        // An invalid path is never mounted.
+        assert!(!mounted.is_mounted("", contracts::ROOT_ZONE_ID));
+    }
+
+    #[test]
     fn read_batch_single_file_round_trip() {
         let k = kernel_with_backend();
         let c = ctx();
@@ -4295,5 +4523,67 @@ mod read_batch_tests {
                 format!("v{i}").as_bytes()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod implied_dirs_tests {
+    use crate::kernel::Kernel;
+
+    /// Collect into owned strings so assertions read as the paths they are.
+    fn implied(prefix: &str, path: &str, recursive: bool) -> Vec<String> {
+        Kernel::implied_relative_dirs(prefix, path, recursive)
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn a_direct_child_implies_nothing() {
+        // It IS the listing's child; there is no intermediate to derive.
+        assert!(implied("/agents/", "/agents/bot", false).is_empty());
+        assert!(implied("/agents/", "/agents/bot", true).is_empty());
+    }
+
+    #[test]
+    fn single_level_takes_only_the_child_of_this_listing() {
+        assert_eq!(
+            implied("/agents/", "/agents/deep/conversations/x", false),
+            vec!["deep"]
+        );
+    }
+
+    #[test]
+    fn recursive_takes_every_level_between() {
+        // A recursive listing reports the subtree, so every level it will attach
+        // children to has to be in the result.
+        assert_eq!(
+            implied("/agents/", "/agents/deep/conversations/x", true),
+            vec!["deep", "deep/conversations"]
+        );
+    }
+
+    #[test]
+    fn the_root_listing_prefix_is_handled() {
+        // The root's prefix is "/" rather than "<dir>/", the one case where the
+        // prefix is not a directory path plus a separator.
+        assert_eq!(implied("/", "/agents/deep", false), vec!["agents"]);
+        assert_eq!(implied("/", "/agents/deep", true), vec!["agents"]);
+        assert_eq!(
+            implied("/", "/agents/deep/x", true),
+            vec!["agents", "agents/deep"]
+        );
+    }
+
+    #[test]
+    fn a_path_shorter_than_the_prefix_yields_nothing() {
+        // Defensive: the caller filters by `starts_with` first, so this is
+        // unreachable there — and it must not panic if that ever changes.
+        assert!(implied("/agents/deep/", "/agents", false).is_empty());
+    }
+
+    #[test]
+    fn a_trailing_separator_does_not_imply_an_empty_segment() {
+        // A row stored as "<dir>/" would otherwise derive the listing root itself.
+        assert_eq!(implied("/agents/", "/agents/deep/", false), vec!["deep"]);
     }
 }

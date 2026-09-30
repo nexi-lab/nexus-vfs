@@ -9,7 +9,7 @@
 //!   cross-org id `{trust_domain}/agent/{name}`, so a receiver sees which ORG
 //!   actually wrote it, not a spoofable claim in the envelope.
 //! * CONTAINMENT — that same foreign agent, though authenticated, is confined
-//!   to its `*/chat-with-me` mailbox: a read/write of any other SaaS path is
+//!   to a conversation transcript: a read/write of any other SaaS path is
 //!   denied, so a tampered on-prem box can't exfiltrate. A domestic agent is
 //!   unaffected.
 //!
@@ -25,6 +25,20 @@ use lib::transport_primitives::TlsConfig;
 
 const ZONE: &str = "sharedzone";
 const MOUNT: &str = "/agents";
+
+/// The transcript the foreign agent shares with a local one, under this
+/// test's mount.
+///
+/// A foreign agent is confined to message logs, and that is decided by the
+/// same a2a predicate the path is built from — so a layout change that put
+/// the transcript outside the allow-list fails here rather than silently
+/// widening or closing what a guest may reach.
+fn transcript() -> String {
+    format!(
+        "{MOUNT}{}",
+        a2a::conversation_transcript_path(&a2a::conversation_id("foreign-guest", "broker"))
+    )
+}
 const BUDGET: Duration = Duration::from_secs(120);
 /// The foreign org (its CA is `CA_B`) and one of its agents. The qualified
 /// cross-org identity the plane must attribute is `{ORG}/agent/{AGENT}`.
@@ -253,12 +267,12 @@ async fn foreign_agent_mailbox_write_is_stamped_with_qualified_id() {
     )
     .await;
 
-    // It writes a PLAIN-JSON envelope that LIES about `from`. The mailbox stamp
-    // must overwrite it with the qualified cross-org id — never the spoof. The
-    // mailbox sits directly under the mount: a foreign agent is confined to
-    // `*/chat-with-me` (see `foreign_agent_is_confined_to_its_mailbox`), so it
-    // cannot mkdir a parent dir — the SaaS side owns any deeper provisioning.
-    let mailbox = format!("{MOUNT}/chat-with-me");
+    // It writes a PLAIN-JSON envelope that LIES about `from`. The stamp must
+    // overwrite it with the qualified cross-org id — never the spoof. No mkdir
+    // first: a foreign agent is confined to message logs (see
+    // `foreign_agent_is_confined_to_its_mailbox`) and may not create the
+    // directories above one, so the transcript row is written directly.
+    let mailbox = transcript();
     wc.create_stream(&mailbox, "")
         .await
         .expect("foreign agent opens its mailbox");
@@ -292,7 +306,8 @@ async fn foreign_agent_mailbox_write_is_stamped_with_qualified_id() {
 /// A foreign agent is authenticated but SEMI-TRUSTED (e.g. an on-prem DGX an
 /// FDE delivers to a customer site): it authors its mailbox, but must not read
 /// or write the rest of the SaaS. The permission gate armed on the cross-org
-/// plane confines it to `*/chat-with-me` — so a tampered box can't exfiltrate.
+/// plane confines it to a conversation transcript — so a tampered box can't
+/// exfiltrate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn foreign_agent_is_confined_to_its_mailbox() {
     let fx = boot_founder_with_ca_b().await;
@@ -306,8 +321,8 @@ async fn foreign_agent_is_confined_to_its_mailbox() {
     )
     .await;
 
-    // Positive control: its OWN mailbox is fully usable.
-    let mailbox = format!("{MOUNT}/chat-with-me");
+    // Positive control: the conversation it shares is fully usable.
+    let mailbox = transcript();
     wc.create_stream(&mailbox, "")
         .await
         .expect("foreign agent opens its mailbox");

@@ -62,8 +62,8 @@
 //! ## Scope
 //!
 //! The composition root arms this on every zone whose DT_STREAMs must wake
-//! readers cross-machine — root plus each federation mount (a chat-with-me
-//! in a shared `/agents` zone replicates across members, and this observer
+//! readers cross-machine — root plus each federation mount (a transcript
+//! in a shared zone replicates across members, and this observer
 //! wakes the peer's parked mailbox tail on apply).
 
 use std::sync::{Arc, Weak};

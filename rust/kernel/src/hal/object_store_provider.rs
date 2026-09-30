@@ -91,6 +91,27 @@ pub struct ObjectStoreBuildResult {
 /// syscall threads.
 pub trait ObjectStoreProvider: Send + Sync {
     fn build(&self, args: &ObjectStoreProviderArgs<'_>) -> Result<ObjectStoreBuildResult, String>;
+
+    /// Whether [`Self::build`] can construct this `backend_type` in THIS
+    /// binary.
+    ///
+    /// Feature-gated, so the answer differs between builds: a slim daemon that
+    /// dropped `driver-s3` says `false` for `"s3"`, and one built with
+    /// `driver-ai` says `true` for `"openai"`.
+    ///
+    /// It exists because a caller sometimes has to decide BEFORE constructing
+    /// — the gRPC `DT_MOUNT` handler refuses an unbuildable type rather than
+    /// attempting a build and interpreting the failure. That caller used to
+    /// keep its own literal list of buildable types, which was a second copy
+    /// of this dispatch table in another crate: it said `["s3", "gcs",
+    /// "remote"]` and therefore refused every LLM mount, in every build,
+    /// including the ones compiled specifically to serve them. One authority
+    /// instead — the provider that does the building.
+    ///
+    /// Required rather than defaulted: a `false` default would make a new
+    /// provider silently refuse everything, which is the same failure this
+    /// replaces.
+    fn can_build(&self, backend_type: &str) -> bool;
 }
 
 static OBJECT_STORE_PROVIDER: OnceLock<Arc<dyn ObjectStoreProvider>> = OnceLock::new();

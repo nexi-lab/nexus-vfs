@@ -67,6 +67,10 @@ protoc-bin-vendored = "3"
 
 [dev-dependencies]
 criterion = "0.8"
+# Dev-only, so nothing reaches the daemon binary: the #345 regression asserts that a
+# failed store read LOGS, and a fix whose only observable effect is a log line needs a
+# subscriber to be a tested fix rather than a hopeful one.
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
 rcgen = { version = "0.14", features = ["pem", "x509-parser"] }  # Self-signed CAs for federation_client tests
 tempfile = "3"
 libc = "0.2"

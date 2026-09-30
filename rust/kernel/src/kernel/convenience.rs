@@ -29,6 +29,13 @@ pub trait KernelConvenience: KernelSyscall {
     /// Fast existence check: validate + route + metastore.exists.
     fn access(&self, path: &str, zone_id: &str) -> bool;
 
+    /// True when some mount covers `path` in `zone_id` (pure routing, no
+    /// existence check). Lets a caller distinguish "no mount covers this
+    /// path" from "the file is missing" and construct its own caller-shaped
+    /// error — `route` deliberately returns only presence, the error
+    /// semantics live at the call site.
+    fn is_mounted(&self, path: &str, zone_id: &str) -> bool;
+
     /// Compat alias for the pre-rename `readdir` name — the external
     /// sudocode runtime still calls `.readdir()`. Composes the Tier-1
     /// `sys_readdir` syscall (never reaches into kernel internals), so
@@ -479,6 +486,11 @@ impl KernelConvenience for Kernel {
     fn access(&self, path: &str, zone_id: &str) -> bool {
         // Delegate to the inherent method on Kernel (syscall_impl.rs).
         Kernel::access(self, path, zone_id)
+    }
+
+    fn is_mounted(&self, path: &str, zone_id: &str) -> bool {
+        // Delegate to the inherent method on Kernel (syscall_impl.rs).
+        Kernel::is_mounted(self, path, zone_id)
     }
 
     fn mkdir(

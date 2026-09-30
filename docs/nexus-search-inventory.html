@@ -1,0 +1,608 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>nexus 搜索能力盘点</title>
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #fafaf9;
+    --fg: #1c1917;
+    --muted: #57534e;
+    --card: #ffffff;
+    --border: #e7e5e4;
+    --accent: #0891b2;
+    --accent-soft: #ecfeff;
+    --code-bg: #f5f5f4;
+    --code-fg: #1c1917;
+    --shadow: 0 1px 3px rgba(0,0,0,.06), 0 1px 2px rgba(0,0,0,.04);
+    --shadow-lg: 0 4px 12px rgba(0,0,0,.08), 0 2px 4px rgba(0,0,0,.04);
+    --ok: #059669;
+    --warn: #d97706;
+    --danger: #dc2626;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0c0a09;
+      --fg: #f5f5f4;
+      --muted: #a8a29e;
+      --card: #1c1917;
+      --border: #292524;
+      --accent: #22d3ee;
+      --accent-soft: #164e63;
+      --code-bg: #0c0a09;
+      --code-fg: #e7e5e4;
+      --shadow: 0 1px 3px rgba(0,0,0,.4), 0 1px 2px rgba(0,0,0,.3);
+      --shadow-lg: 0 4px 12px rgba(0,0,0,.5), 0 2px 4px rgba(0,0,0,.3);
+      --ok: #10b981;
+      --warn: #f59e0b;
+      --danger: #ef4444;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0c0a09;
+    --fg: #f5f5f4;
+    --muted: #a8a29e;
+    --card: #1c1917;
+    --border: #292524;
+    --accent: #22d3ee;
+    --accent-soft: #164e63;
+    --code-bg: #0c0a09;
+    --code-fg: #e7e5e4;
+    --shadow: 0 1px 3px rgba(0,0,0,.4), 0 1px 2px rgba(0,0,0,.3);
+    --shadow-lg: 0 4px 12px rgba(0,0,0,.5), 0 2px 4px rgba(0,0,0,.3);
+    --ok: #10b981;
+    --warn: #f59e0b;
+    --danger: #ef4444;
+  }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", Helvetica, Arial, sans-serif;
+    font-size: 15px;
+    line-height: 1.65;
+    padding: 32px 16px 80px;
+    padding-block: 32px 80px;
+    margin: 0;
+  }
+  main {
+    max-width: 900px;
+    margin: 0 auto;
+  }
+  h1 {
+    font-size: 30px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    margin: 0 0 8px;
+  }
+  .subtitle {
+    color: var(--muted);
+    font-size: 15px;
+    margin: 0 0 40px;
+  }
+  h2 {
+    font-size: 22px;
+    font-weight: 650;
+    letter-spacing: -0.01em;
+    margin: 48px 0 16px;
+    padding-bottom: 8px;
+    border-bottom: 2px solid var(--border);
+  }
+  h3 {
+    font-size: 17px;
+    font-weight: 600;
+    margin: 28px 0 12px;
+    color: var(--fg);
+  }
+  h4 {
+    font-size: 14px;
+    font-weight: 600;
+    margin: 20px 0 8px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  p { margin: 0 0 14px; }
+  ul, ol { margin: 0 0 14px; padding-left: 24px; }
+  li { margin: 4px 0; }
+  code {
+    font-family: "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    font-size: 0.88em;
+    background: var(--code-bg);
+    padding: 2px 5px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+  }
+  pre {
+    background: var(--code-bg);
+    color: var(--code-fg);
+    padding: 14px 16px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    overflow-x: auto;
+    font-family: "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    font-size: 13px;
+    line-height: 1.55;
+    margin: 12px 0 18px;
+  }
+  pre code { background: none; padding: 0; border: none; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px 22px;
+    margin: 18px 0;
+    box-shadow: var(--shadow);
+  }
+  .card h3:first-child { margin-top: 0; }
+  .tag {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    background: var(--accent-soft);
+    color: var(--accent);
+    text-transform: uppercase;
+    margin-left: 6px;
+    vertical-align: middle;
+  }
+  .tag-ok { background: rgba(5,150,105,.12); color: var(--ok); }
+  .tag-warn { background: rgba(217,119,6,.12); color: var(--warn); }
+  .tag-danger { background: rgba(220,38,38,.12); color: var(--danger); }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 12px 0 18px;
+    font-size: 14px;
+  }
+  th, td {
+    padding: 10px 12px;
+    text-align: left;
+    vertical-align: top;
+    border-bottom: 1px solid var(--border);
+  }
+  th {
+    background: var(--code-bg);
+    font-weight: 600;
+    color: var(--muted);
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    border-bottom: 2px solid var(--border);
+  }
+  tr:last-child td { border-bottom: none; }
+  .arch-diagram {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 18px;
+    margin: 18px 0;
+    text-align: center;
+    overflow-x: auto;
+  }
+  .arch-diagram svg { max-width: 100%; height: auto; }
+  .callout {
+    border-left: 3px solid var(--accent);
+    background: var(--accent-soft);
+    padding: 12px 16px;
+    border-radius: 4px;
+    margin: 16px 0;
+    font-size: 14px;
+  }
+  .callout-warn {
+    border-left-color: var(--warn);
+    background: rgba(217,119,6,.08);
+  }
+  .callout strong { color: var(--fg); }
+  .tldr {
+    background: linear-gradient(135deg, var(--accent-soft) 0%, transparent 100%);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px 24px;
+    margin: 24px 0 32px;
+  }
+  .tldr h2 { border: none; margin: 0 0 8px; font-size: 15px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--accent); padding: 0; }
+  .tldr p { margin: 0; font-size: 15px; line-height: 1.7; }
+  .toc {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 22px;
+    margin: 24px 0;
+    font-size: 14px;
+  }
+  .toc ol { margin: 4px 0; padding-left: 24px; }
+  .toc a { color: var(--fg); text-decoration: none; }
+  .toc a:hover { color: var(--accent); text-decoration: underline; }
+  @media (max-width: 640px) {
+    body { padding-block: 20px 60px; padding-left: 12px; padding-right: 12px; font-size: 14px; }
+    h1 { font-size: 24px; }
+    h2 { font-size: 19px; }
+    table { font-size: 12px; }
+    th, td { padding: 8px 6px; }
+  }
+</style>
+</head>
+<body>
+<main>
+
+<h1>nexus 搜索能力盘点</h1>
+<p class="subtitle">四种搜索算子 · 三层调用路径 · 多机器 federated · 一图看懂怎么用</p>
+
+<div class="tldr">
+  <h2>TL;DR</h2>
+  <p><strong>4 种搜索算子</strong>（glob / grep / query / index），<strong>3 种调用路径</strong>（syscall in-process / gRPC / HTTP），<strong>自动 federated</strong>（多 zone 权限时自动 fan-out），<strong>1 个环境变量打开 cross-daemon</strong>（<code>NEXUS_SEARCH_REMOTE_ZONE_TARGETS</code>）。</p>
+</div>
+
+<div class="toc">
+  <strong>目录</strong>
+  <ol>
+    <li><a href="#arch">整体架构</a></li>
+    <li><a href="#operators">4 种搜索算子</a></li>
+    <li><a href="#paths">3 种调用路径</a></li>
+    <li><a href="#federated">Federated (跨 zone) 搜索</a></li>
+    <li><a href="#cross-daemon">Cross-daemon (跨 daemon) 搜索</a></li>
+    <li><a href="#peer-fanout">Plugin peer fanout（别混淆）</a></li>
+    <li><a href="#recipe">按场景选路径 / 3 步上手</a></li>
+    <li><a href="#env">环境变量一览</a></li>
+  </ol>
+</div>
+
+<h2 id="arch">1. 整体架构</h2>
+
+<p>nexus 搜索是三层结构。最上面的 CLI/HTTP 是 human-facing 边界；中间 axum 是 auth+federation+delegation 的裁判层；最底下的 plugin 是纯 BM25+ANN 算法。</p>
+
+<div class="arch-diagram">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 700 420" width="700" role="img" aria-label="nexus 搜索三层架构">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/>
+    </marker>
+    <style>
+      .box { fill: var(--card); stroke: var(--border); stroke-width: 1.5; rx: 8; }
+      .box-accent { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.5; }
+      .lbl { fill: var(--fg); font: 600 13px -apple-system, sans-serif; }
+      .lbl-sm { fill: var(--muted); font: 500 11px -apple-system, sans-serif; }
+      .arr { stroke: var(--muted); stroke-width: 1.5; fill: none; }
+      .layer { fill: var(--muted); font: 700 10px -apple-system, sans-serif; letter-spacing: 0.1em; text-transform: uppercase; }
+    </style>
+  </defs>
+
+  <!-- Layer labels -->
+  <text x="20" y="60" class="layer">CLI / Client</text>
+  <text x="20" y="200" class="layer">Daemon (axum)</text>
+  <text x="20" y="340" class="layer">Plugin (cdylib)</text>
+
+  <!-- CLI Layer -->
+  <rect x="160" y="30" width="140" height="50" class="box"/>
+  <text x="230" y="55" text-anchor="middle" class="lbl">nexus CLI</text>
+  <text x="230" y="70" text-anchor="middle" class="lbl-sm">(Python)</text>
+
+  <rect x="320" y="30" width="140" height="50" class="box"/>
+  <text x="390" y="55" text-anchor="middle" class="lbl">HTTP client</text>
+  <text x="390" y="70" text-anchor="middle" class="lbl-sm">(curl / SDK)</text>
+
+  <rect x="480" y="30" width="180" height="50" class="box"/>
+  <text x="570" y="55" text-anchor="middle" class="lbl">In-process caller</text>
+  <text x="570" y="70" text-anchor="middle" class="lbl-sm">(sudocode / co-host)</text>
+
+  <!-- Daemon Layer -->
+  <rect x="160" y="170" width="300" height="70" class="box-accent"/>
+  <text x="310" y="195" text-anchor="middle" class="lbl">/v2/search/{glob,grep,query}</text>
+  <text x="310" y="212" text-anchor="middle" class="lbl-sm">auth · zone gate · federated dispatcher</text>
+  <text x="310" y="228" text-anchor="middle" class="lbl-sm">(nexus-http-api)</text>
+
+  <rect x="480" y="170" width="180" height="70" class="box"/>
+  <text x="570" y="195" text-anchor="middle" class="lbl">KernelSyscall</text>
+  <text x="570" y="212" text-anchor="middle" class="lbl-sm">sys_readdir · sys_read</text>
+  <text x="570" y="228" text-anchor="middle" class="lbl-sm">(11 syscalls total)</text>
+
+  <!-- Plugin Layer -->
+  <rect x="160" y="310" width="500" height="70" class="box"/>
+  <text x="410" y="335" text-anchor="middle" class="lbl">nexus-search-plugin (cdylib)</text>
+  <text x="410" y="352" text-anchor="middle" class="lbl-sm">SearchService gRPC · BM25 (tantivy) · ANN (hnsw_rs) · fusion</text>
+  <text x="410" y="368" text-anchor="middle" class="lbl-sm">peer_fanout · index/refresh · title_arm · query_expansion</text>
+
+  <!-- Arrows -->
+  <path d="M 230 80 L 230 170" class="arr" marker-end="url(#arrow)"/>
+  <path d="M 390 80 L 390 170" class="arr" marker-end="url(#arrow)"/>
+  <path d="M 570 80 L 570 170" class="arr" marker-end="url(#arrow)"/>
+  <path d="M 310 240 L 310 310" class="arr" marker-end="url(#arrow)"/>
+  <path d="M 570 240 L 570 310" class="arr" marker-end="url(#arrow)"/>
+
+  <!-- Path labels -->
+  <text x="245" y="130" class="lbl-sm">HTTP</text>
+  <text x="405" y="130" class="lbl-sm">HTTP</text>
+  <text x="585" y="130" class="lbl-sm">direct call</text>
+  <text x="325" y="280" class="lbl-sm">gRPC</text>
+  <text x="580" y="280" class="lbl-sm">passthrough</text>
+</svg>
+</div>
+
+<h2 id="operators">2. 4 种搜索算子</h2>
+
+<div class="card">
+<h3>2.1 <code>glob</code> — 文件路径通配符 <span class="tag tag-ok">no index</span></h3>
+<p>找符合 <code>*.rs</code> / <code>**/*.md</code> 模式的路径。走文件系统 walk，不需要建索引。</p>
+<h4>用法</h4>
+<pre><code>nexus glob 'src/**/*.py'
+curl "http://localhost:8080/v2/search/glob?pattern=src/**/*.py&amp;max_results=100"</code></pre>
+<h4>参数</h4>
+<table>
+  <tr><th>参数</th><th>说明</th></tr>
+  <tr><td><code>pattern</code></td><td>必填。globset 语法（<code>*.rs</code>、<code>**/*.md</code>）</td></tr>
+  <tr><td><code>root_path</code></td><td>walk 起点，默认 <code>/</code></td></tr>
+  <tr><td><code>max_results</code></td><td>上限，默认 10000</td></tr>
+  <tr><td><code>sort_recency</code></td><td>按 mtime 降序（最新在前）</td></tr>
+  <tr><td><code>zone_id</code></td><td>admin 才能指定别的 zone</td></tr>
+</table>
+</div>
+
+<div class="card">
+<h3>2.2 <code>grep</code> — 内容正则搜索 <span class="tag tag-ok">no index</span></h3>
+<p>找匹配 regex 的行。walk + 逐行 match，不需要建索引。</p>
+<h4>用法</h4>
+<pre><code>nexus grep 'fn main' --file-pattern '*.rs' --before-context 2 --after-context 2
+curl "http://localhost:8080/v2/search/grep?pattern=fn+main&amp;file_pattern=*.rs&amp;ignore_case=true"</code></pre>
+<h4>参数</h4>
+<table>
+  <tr><th>参数</th><th>说明</th></tr>
+  <tr><td><code>pattern</code></td><td>Rust <code>regex</code> crate 语法</td></tr>
+  <tr><td><code>file_pattern</code></td><td>限定文件名 glob（空 = 所有文件）</td></tr>
+  <tr><td><code>ignore_case</code></td><td>忽略大小写</td></tr>
+  <tr><td><code>invert_match</code></td><td>返回 <b>不</b>匹配的行</td></tr>
+  <tr><td><code>before_context</code> / <code>after_context</code></td><td>上下文行数</td></tr>
+  <tr><td><code>sort_recency</code></td><td>按文件 mtime 排序</td></tr>
+</table>
+</div>
+
+<div class="card">
+<h3>2.3 <code>query</code> — 索引搜索 (BM25 / semantic / hybrid) <span class="tag tag-warn">needs index</span></h3>
+<p>全文 / 语义 / 融合搜索。<b>使用前必须先建索引</b>（见 2.4）。</p>
+<h4>用法</h4>
+<pre><code># CLI
+nexus search query "how does auth work" --limit 20 --mode hybrid
+
+# HTTP
+curl -X POST http://localhost:8080/v2/search/query \
+  -H 'Authorization: Bearer sk-xxx' \
+  -H 'Content-Type: application/json' \
+  -d '{"q":"how does auth work","query_type":"hybrid","limit":20}'</code></pre>
+<h4>三种模式（<code>query_type</code>）</h4>
+<table>
+  <tr><th>模式</th><th>算法</th><th>需要 embedder</th><th>特点</th></tr>
+  <tr><td><code>keyword</code></td><td>BM25 (tantivy)</td><td>❌</td><td>最快 · 精确词匹配</td></tr>
+  <tr><td><code>semantic</code></td><td>ANN cosine (hnsw)</td><td>✅</td><td>语义相近 · 无需精确词</td></tr>
+  <tr><td><code>hybrid</code> <span class="tag">推荐</span></td><td>两者融合 (RRF)</td><td>✅</td><td>最准 · 默认权重 0.5</td></tr>
+</table>
+<h4>高级 knobs (POST body 里)</h4>
+<table>
+  <tr><th>字段</th><th>作用</th></tr>
+  <tr><td><code>alpha</code></td><td>hybrid 里 semantic vs keyword 权重 (0-1, 默认 0.5)</td></tr>
+  <tr><td><code>fusion_method</code></td><td><code>rrf</code> / <code>weighted</code> / <code>rrf_weighted</code></td></tr>
+  <tr><td><code>path_filter</code></td><td>只搜路径前缀下的文档</td></tr>
+  <tr><td><code>recency_mode</code></td><td><code>off</code> / <code>on</code> / <code>auto</code>（新文件加权）</td></tr>
+  <tr><td><code>path_prefix_boosts</code></td><td>{"<code>/docs/</code>": 1.5} 按目录分层加权</td></tr>
+  <tr><td><code>expand</code></td><td><code>macro</code> — 每个 hit 返回上下 chunk 拼接</td></tr>
+  <tr><td><code>chunks_per_page</code></td><td>同一文件里 chunk 数上限（防单文件霸榜）</td></tr>
+</table>
+</div>
+
+<div class="card">
+<h3>2.4 <code>index</code> / <code>refresh</code> — 建/更新索引 <span class="tag">必做</span></h3>
+<p>没建索引，query 永远返回空。</p>
+<h4>用法</h4>
+<pre><code># 递归建全量
+nexus search index /docs
+
+# 只顶层
+nexus search index /docs --no-recursive
+
+# 看进度
+nexus search stats
+</code></pre>
+<h4>关系</h4>
+<table>
+  <tr><th>算子</th><th>做什么</th><th>什么时候用</th></tr>
+  <tr><td><code>Index</code></td><td>全量扫 + 全量写入</td><td>第一次 / 大改动后</td></tr>
+  <tr><td><code>Refresh</code></td><td>增量（只处理 mtime 变了的）</td><td>日常刷新 · 定期 cron</td></tr>
+  <tr><td><code>NotifyFileChange</code></td><td>单文件通知</td><td>on-write hook</td></tr>
+  <tr><td><code>IndexDocuments</code></td><td>带内容的批量写入（跳过 walk）</td><td>caller 手上已有文本</td></tr>
+</table>
+<div class="callout"><strong>写-可搜契约（#4736）：</strong>CLI 会同步等 <code>last_index_seq</code> 追上索引才返回；返回后 query 立即能查到刚建的内容。</div>
+</div>
+
+<h2 id="paths">3. 三种调用路径</h2>
+
+<p>同样的 glob/grep/query，你有 3 条路径可以用。选哪条看你在哪一层。</p>
+
+<table>
+  <tr><th>路径</th><th>场景</th><th>延迟</th><th>示例</th></tr>
+  <tr>
+    <td><b>In-process syscall</b><br><span class="tag tag-ok">最快</span></td>
+    <td>跟 kernel 同 dylib / binary，如 sudocode 内嵌</td>
+    <td>⚡ 微秒级（无序列化）</td>
+    <td><code>KernelSyscall::sys_readdir(recursive=true, opts)</code></td>
+  </tr>
+  <tr>
+    <td><b>gRPC → plugin</b></td>
+    <td>跨进程但同机器</td>
+    <td>~ms（loopback + proto）</td>
+    <td><code>SearchService.Glob / Grep / Query</code></td>
+  </tr>
+  <tr>
+    <td><b>HTTP /v2/search/*</b></td>
+    <td>跨机器 · 走 auth 边界 · 走 federated dispatcher</td>
+    <td>~ms + 网络</td>
+    <td><code>GET /v2/search/glob</code></td>
+  </tr>
+</table>
+
+<div class="callout"><strong>Syscall 关键事实：</strong>KernelSyscall trait 里 <b>11 个 sys_*</b>，没有独立的 <code>sys_glob</code> 或 <code>sys_grep</code>。glob = <code>sys_readdir(recursive=true)</code> + globset 过滤；grep = <code>sys_readdir</code> + <code>sys_read</code> + regex。plugin/HTTP/gRPC 只是把这些操作打包成一个 RPC。<br><br>换句话说，<b>你在 in-process 时可以完全绕开 plugin</b>，直接自己 walk + match — 这就是 sudocode <code>glob</code>/<code>grep</code> 工具的实现方式。</div>
+
+<h2 id="federated">4. Federated (跨 zone) 搜索 — 自动</h2>
+
+<p>不需要配置任何东西。<code>/v2/search/query</code> 自动检测：</p>
+
+<div class="arch-diagram">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 320" width="720" role="img" aria-label="Federated 分派流程">
+  <defs>
+    <style>
+      .box { fill: var(--card); stroke: var(--border); stroke-width: 1.5; rx: 6; }
+      .box-hi { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.5; rx: 6; }
+      .lbl { fill: var(--fg); font: 600 12px -apple-system, sans-serif; }
+      .lbl-sm { fill: var(--muted); font: 500 11px -apple-system, sans-serif; }
+      .arr { stroke: var(--muted); stroke-width: 1.5; fill: none; }
+      .yes { fill: var(--ok); font: 700 10px -apple-system, sans-serif; }
+      .no  { fill: var(--muted); font: 700 10px -apple-system, sans-serif; }
+    </style>
+    <marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/>
+    </marker>
+  </defs>
+
+  <!-- Request in -->
+  <rect x="20" y="20" width="150" height="40" class="box"/>
+  <text x="95" y="45" text-anchor="middle" class="lbl">POST /v2/search/query</text>
+
+  <!-- Decision -->
+  <polygon points="270,10 400,55 270,100 140,55" class="box-hi"/>
+  <text x="270" y="50" text-anchor="middle" class="lbl">caller 有几个可读 zone?</text>
+  <text x="270" y="68" text-anchor="middle" class="lbl-sm">(ReBAC list_accessible_zones)</text>
+
+  <path d="M 170 45 L 205 45" class="arr" marker-end="url(#a2)"/>
+
+  <!-- Single-zone path -->
+  <text x="440" y="30" class="no">≤ 1</text>
+  <path d="M 400 55 L 460 55 L 460 100 L 500 100" class="arr" marker-end="url(#a2)"/>
+  <rect x="500" y="80" width="200" height="40" class="box"/>
+  <text x="600" y="105" text-anchor="middle" class="lbl">单 zone 快路径（原样）</text>
+
+  <!-- Multi-zone path -->
+  <text x="270" y="130" text-anchor="middle" class="yes">&gt; 1</text>
+  <path d="M 270 100 L 270 145" class="arr" marker-end="url(#a2)"/>
+  <rect x="150" y="150" width="240" height="45" class="box-hi"/>
+  <text x="270" y="175" text-anchor="middle" class="lbl">FederatedSearchDispatcher</text>
+  <text x="270" y="190" text-anchor="middle" class="lbl-sm">并发 fan-out (semaphore=8)</text>
+
+  <path d="M 270 195 L 270 220" class="arr" marker-end="url(#a2)"/>
+
+  <!-- Per-zone legs -->
+  <rect x="50" y="230" width="130" height="35" class="box"/>
+  <text x="115" y="252" text-anchor="middle" class="lbl-sm">zone A · leg</text>
+  <rect x="200" y="230" width="130" height="35" class="box"/>
+  <text x="265" y="252" text-anchor="middle" class="lbl-sm">zone B · leg</text>
+  <rect x="350" y="230" width="130" height="35" class="box"/>
+  <text x="415" y="252" text-anchor="middle" class="lbl-sm">zone C · leg</text>
+
+  <path d="M 270 195 L 115 230" class="arr" marker-end="url(#a2)"/>
+  <path d="M 270 195 L 265 230" class="arr" marker-end="url(#a2)"/>
+  <path d="M 270 195 L 415 230" class="arr" marker-end="url(#a2)"/>
+
+  <!-- Fusion -->
+  <path d="M 265 265 L 265 285" class="arr" marker-end="url(#a2)"/>
+  <rect x="150" y="285" width="240" height="30" class="box-hi"/>
+  <text x="270" y="305" text-anchor="middle" class="lbl">RRF fusion → 单一响应</text>
+</svg>
+</div>
+
+<ul>
+  <li><b>≤1 zone</b>：走原来的单 zone 快路径，无额外开销</li>
+  <li><b>&gt;1 zone</b>：并发 fan-out（<code>Semaphore(8)</code> + 每 leg <code>timeout=5s</code>），RRF 融合返回</li>
+  <li><b>想强制单 zone</b>：请求 body 里传 <code>"zone_id": "eng"</code> 就绕开</li>
+</ul>
+
+<h2 id="cross-daemon">5. Cross-daemon (跨 daemon) 搜索 — 一个 env var 打开</h2>
+
+<p>如果你部署了多个 nexus daemon，各自拥有独立 zone，一个环境变量就打开跨机器搜索：</p>
+
+<pre><code>export NEXUS_SEARCH_REMOTE_ZONE_TARGETS="eng=http://peer-eng:2126,legal=https://peer-legal:2126"
+nexusd-cluster serve</code></pre>
+
+<h4>行为</h4>
+<ul>
+  <li>Zone <code>eng</code> 的 leg → dial <code>http://peer-eng:2126</code></li>
+  <li>Zone <code>legal</code> 的 leg → dial <code>https://peer-legal:2126</code></li>
+  <li><code>SearchDelegation</code> 走 tonic metadata（<code>x-nexus-search-delegation-bin</code>）</li>
+  <li>对方 daemon 的 <code>delegation_gate</code> 自动 validate（zone allowlist · method allowlist · TTL）</li>
+</ul>
+
+<h4>Fail-loud</h4>
+<div class="callout callout-warn"><strong>Typo 直接 boot 失败</strong>，不会静默：<br>
+• 缺 <code>=</code>（<code>zone1:url1</code>）→ <code>MissingSeparator</code><br>
+• 空 zone_id / 空 URL / 重复 zone_id → 每种都有专门的 <code>Err</code><br>
+Matches standing "fail loud on partial config" rule。</div>
+
+<h2 id="peer-fanout">6. Plugin peer fanout — 别跟 cross-daemon 混淆</h2>
+
+<div class="callout callout-warn"><strong>这是另一个东西，跟上面 cross-daemon 完全不同。</strong></div>
+
+<table>
+  <tr><th></th><th>Plugin peer_fanout</th><th>Daemon cross-daemon</th></tr>
+  <tr><td>层</td><td>Plugin 内部</td><td>Daemon 之间</td></tr>
+  <tr><td>触发</td><td>每次 query <b>无条件</b> fan-out（zone 在白名单内）</td><td>zone 在 registry 里指向 remote target 才 fan-out</td></tr>
+  <tr><td>用途</td><td>内容分片（一半索引在 A，一半在 B）</td><td>zone-owner 分布（zone A 的数据只有 daemon-A 有）</td></tr>
+  <tr><td>Delegation</td><td>❌</td><td>✅ SearchDelegation on metadata</td></tr>
+  <tr><td>Env</td><td><code>NEXUS_SEARCH_PEER_PLUGINS</code> + <code>NEXUS_SEARCH_PEER_FANOUT_ZONES</code></td><td><code>NEXUS_SEARCH_REMOTE_ZONE_TARGETS</code></td></tr>
+</table>
+
+<h4>Plugin peer_fanout 打开方式</h4>
+<pre><code>export NEXUS_SEARCH_PEER_PLUGINS="host1:2126,host2:2126"
+export NEXUS_SEARCH_PEER_FANOUT_ZONES="root,eng"      # 白名单
+export NEXUS_SEARCH_PEER_TLS=true                     # 可选 TLS
+export NEXUS_SEARCH_ALLOW_INSECURE_PEER=true          # 可选：允许 plaintext off-loopback（不推荐）</code></pre>
+
+<div class="callout"><strong>Shared cache（DRY）：</strong>Plugin peer_fanout 和 Daemon cross-daemon 共用同一个 <code>PeerChannelCache</code>（<code>nexus_search_common::transport</code>）—— 一处调整 TLS / 超时规则，两处生效。</div>
+
+<h2 id="recipe">7. 按场景选路径 / 3 步上手</h2>
+
+<h3>决策表</h3>
+<table>
+  <tr><th>我想…</th><th>用这个</th><th>需要建索引？</th></tr>
+  <tr><td>找路径 <code>.py</code> / <code>.md</code></td><td><code>nexus glob</code></td><td>❌</td></tr>
+  <tr><td>找 <code>TODO</code> 出现在哪些行</td><td><code>nexus grep 'TODO'</code></td><td>❌</td></tr>
+  <tr><td>找 "auth 怎么工作的"</td><td><code>nexus search query "..." --mode hybrid</code></td><td>✅</td></tr>
+  <tr><td>新加的文档想被搜到</td><td><code>nexus search index /docs</code>（refresh 更快）</td><td>—</td></tr>
+  <tr><td>跨多个 zone</td><td>有 ReBAC 权限就自动，否则先 grant</td><td>—</td></tr>
+  <tr><td>跨多个 daemon 部署</td><td>设 <code>NEXUS_SEARCH_REMOTE_ZONE_TARGETS</code></td><td>—</td></tr>
+  <tr><td>让新文件在结果里靠前</td><td>POST body <code>"recency_mode": "on"</code></td><td>—</td></tr>
+  <tr><td>调 hybrid 权重</td><td>POST body <code>"alpha": 0.7</code>（越大越偏 semantic）</td><td>—</td></tr>
+  <tr><td>让某些目录得分翻倍</td><td>POST body <code>"path_prefix_boosts": {"/docs/": 1.5}</code></td><td>—</td></tr>
+  <tr><td>返回上下文而不只是命中 chunk</td><td>POST body <code>"expand": "macro"</code></td><td>—</td></tr>
+</table>
+
+<h3>最快上手 3 步</h3>
+<pre><code># 1. 启动 daemon（如果没跑）
+nexusd-cluster serve
+
+# 2. 建一次索引（首次 / 大改动后）
+nexus search index /path/to/your/docs
+
+# 3. 搜
+nexus search query "your question" --mode hybrid --limit 10</code></pre>
+
+<h2 id="env">8. 环境变量一览</h2>
+
+<table>
+  <tr><th>Env</th><th>层</th><th>作用</th></tr>
+  <tr><td><code>NEXUS_SEARCH_REMOTE_ZONE_TARGETS</code></td><td>Daemon</td><td><b>Cross-daemon 总开关</b>。<code>zone1=url1,zone2=url2</code>。空 → 单 daemon（默认）</td></tr>
+  <tr><td><code>NEXUS_SEARCH_PEER_PLUGINS</code></td><td>Plugin</td><td>Plugin peer_fanout 的对端 host:port 列表</td></tr>
+  <tr><td><code>NEXUS_SEARCH_PEER_FANOUT_ZONES</code></td><td>Plugin</td><td>Plugin peer_fanout 白名单 zone</td></tr>
+  <tr><td><code>NEXUS_SEARCH_PEER_TLS</code></td><td>Plugin</td><td>Plugin peer_fanout 打开 TLS</td></tr>
+  <tr><td><code>NEXUS_SEARCH_ALLOW_INSECURE_PEER</code></td><td>Plugin</td><td>允许 plaintext off-loopback（越狱开关）</td></tr>
+  <tr><td><code>NEXUS_SEARCH_TITLE_ARM</code></td><td>Plugin</td><td>关闭 hybrid 里 title arm（默认开）</td></tr>
+  <tr><td><code>NEXUS_SEARCH_QUERY_EXPANSION</code></td><td>Plugin</td><td>打开 LLM query expansion</td></tr>
+  <tr><td><code>NEXUS_SEARCH_PLUGIN_TARGET</code></td><td>Daemon</td><td>本地 plugin 的 gRPC 地址（一般不用改）</td></tr>
+</table>
+
+<div class="tldr" style="margin-top: 40px;">
+  <h2>回顾</h2>
+  <p><b>4 算子</b>（glob / grep / query / index）× <b>3 路径</b>（syscall / gRPC / HTTP）× <b>自动 federated</b>（&gt;1 zone）× <b>1 个 env var</b> 打开 cross-daemon。任何 caller 只要能 <code>curl</code> 或 <code>nexus &lt;cmd&gt;</code>，全部功能都触达。</p>
+</div>
+
+</main>
+</body>
+</html>

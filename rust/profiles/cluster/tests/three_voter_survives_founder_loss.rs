@@ -149,7 +149,7 @@ async fn three_voter_zone_survives_founder_loss_via_new_leader() {
     await_replicated(&mut j1c, &health, "", BUDGET).await;
     await_replicated(&mut j2c, &health, "", BUDGET).await;
 
-    let mailbox = format!("{MOUNT}/probe-ai/chat-with-me");
+    let mailbox = format!("{MOUNT}/probe-ai/transcript");
     fc.mkdir(&format!("{MOUNT}/probe-ai"), "")
         .await
         .expect("mkdir agent dir");

@@ -123,6 +123,46 @@ service ZoneApiService {
   // local `auth mint`, run against the founder's live CA + auth store.
   rpc MintAgent(MintAgentRequest) returns (MintAgentResponse);
 
+  // MintSessionAgent signs a SESSION credential: an agent identity bound to an
+  // owner, with a fresh per-call subject and a short validity. Unlike MintAgent
+  // this is reachable by an AGENT caller — that is its purpose, so a front door
+  // holding only an agent cert can obtain a per-session identity for a person
+  // without ever holding a node cert, which would carry admin and system
+  // privilege it has no use for.
+  //
+  // The caller must be on the replicated session-mint allow-list, matched on
+  // the id it is known by (bare for a local agent, org-qualified for a foreign
+  // one). The gate fails closed: an unarmed or unreadable list denies.
+  //
+  // The owner's truthfulness is the caller's responsibility. This seam stops an
+  // agent forging its OWN identity and makes its actions attributable; it does
+  // not make the cluster an independent authority on who a person is.
+  rpc MintSessionAgent(MintSessionAgentRequest) returns (MintSessionAgentResponse);
+
+  // RevokeAgentCert records a certificate's serial in the CA-plane CRL, so every
+  // node refuses it after its next CRL refresh.
+  //
+  // Takes the certificate itself rather than a name: a session credential is
+  // never written to disk, so there is no bundle to read a serial out of, and
+  // the holder is the one party that has it. The CA holder verifies the cert
+  // chains to this cluster's CA before recording anything — otherwise this
+  // would be an unauthenticated way to pollute the CRL — and records its
+  // notAfter alongside the serial so the entry can be dropped once it can no
+  // longer decide anything.
+  rpc RevokeAgentCert(RevokeAgentCertRequest) returns (RevokeAgentCertResponse);
+
+  // AllowSessionMinter / DenySessionMinter / ListSessionMinters administer the
+  // replicated session-mint allow-list on a live daemon. NODE-gated: an agent
+  // that could edit this list could grant itself the right to mint identities
+  // for anyone, which is the forgery MintSessionAgent's gate exists to prevent.
+  //
+  // The write forwards to the control-zone leader and replicates, so the policy
+  // is one value cluster-wide instead of a per-broker copy that nothing
+  // reconciles.
+  rpc AllowSessionMinter(AllowSessionMinterRequest) returns (AllowSessionMinterResponse);
+  rpc DenySessionMinter(DenySessionMinterRequest) returns (DenySessionMinterResponse);
+  rpc ListSessionMinters(ListSessionMintersRequest) returns (ListSessionMintersResponse);
+
   // MintKey mints an `sk-` user/service credential through the live daemon, so
   // `auth mint --subject-type user|service` just-works while the daemon holds
   // the store lock (no "stop the daemon first"). The daemon HMACs the key with
@@ -331,6 +371,78 @@ message RemoveVoterResponse {
 }
 
 // MintAgentRequest asks the CA holder to sign an agent identity cert.
+// MintSessionAgentRequest asks for a session credential bound to `owner_id`.
+// The subject is NOT a caller input: it is minted fresh per call, so a caller
+// cannot ask for a stable or a colliding identity.
+message MintSessionAgentRequest {
+  // Who the session acts for — signed into the cert as a `nexus://owner/` SAN
+  // and read back by the kernel as the operation's principal.
+  string owner_id = 1;
+  // How long the credential is valid, in seconds. Sized to a session; the
+  // server clamps it to its own ceiling.
+  uint64 validity_secs = 2;
+}
+
+// MintSessionAgentResponse carries the signed bundle, or the refusal. A refusal
+// is deliberately terse on the wire (the operator log carries the reason): a
+// caller that learns WHY it was refused learns about the allow-list.
+message MintSessionAgentResponse {
+  bool success = 1;
+  optional string error = 2;
+  bytes agent_cert_pem = 3;
+  bytes agent_key_pem = 4;
+  bytes ca_pem = 5;
+  // The minted subject (`session-<uuid>`), so a caller can log what it holds
+  // without parsing its own certificate.
+  string subject_id = 6;
+}
+
+// AllowSessionMinterRequest permits one agent to mint session credentials.
+message AllowSessionMinterRequest {
+  // The id the agent is known by: bare for a local agent, org-qualified
+  // `{trust_domain}/agent/{name}` for a foreign one. A bare name is unique only
+  // within one CA's namespace, so the qualified form is what makes an entry
+  // name one identity rather than every namesake.
+  string agent_id = 1;
+}
+
+message AllowSessionMinterResponse {
+  bool success = 1;
+  optional string error = 2;
+}
+
+message DenySessionMinterRequest {
+  string agent_id = 1;
+}
+
+message DenySessionMinterResponse {
+  bool success = 1;
+  optional string error = 2;
+  // Whether an entry was actually present (advisory, for operator output).
+  bool was_present = 3;
+}
+
+message ListSessionMintersRequest {}
+
+message ListSessionMintersResponse {
+  bool success = 1;
+  optional string error = 2;
+  repeated string agent_ids = 3;
+}
+
+// RevokeAgentCertRequest hands over the certificate to revoke, PEM-encoded.
+message RevokeAgentCertRequest {
+  bytes agent_cert_pem = 1;
+}
+
+// RevokeAgentCertResponse reports whether the serial is now recorded. Revoking
+// an already-revoked certificate succeeds — the end state is what was asked
+// for.
+message RevokeAgentCertResponse {
+  bool success = 1;
+  optional string error = 2;
+}
+
 message MintAgentRequest {
   // Agent name → the cert subject `nexus://agent/{subject_id}`.
   string subject_id = 1;

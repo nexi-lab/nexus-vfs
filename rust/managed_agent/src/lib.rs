@@ -1,5 +1,5 @@
 //! `ManagedAgentService` — Rust-flavoured service that owns the
-//! managed-agent surface: the chat-with-me + workspace hooks plus the
+//! managed-agent surface: the stamping + workspace hooks plus the
 //! session lifecycle behind the `proto/nexus/grpc/managed_agent` gRPC
 //! contract.
 //!
@@ -17,7 +17,7 @@
 //!     `KernelDispatch` so every cross-owner `/proc/{pid}/workspace/`
 //!     write is rejected. The mailbox `from`-stamp hook now lives in the
 //!     `a2a` messaging substrate (nexus-vfs), armed once at cluster boot
-//!     — every `*/chat-with-me` write is stamped there, for all writers.
+//!     — every message-log write is stamped there, for all writers.
 //!   * On `enlist_rust`, take the place in the registry that
 //!     `nx.service("managed_agent")` resolves to (Python lookup
 //!     returns None — this service is reachable from Rust callers via
@@ -92,16 +92,49 @@ pub fn install_managed_agent(kernel: &Arc<kernel::kernel::Kernel>) -> Result<(),
     ManagedAgentService::<kernel::kernel::Kernel>::install(kernel)
 }
 
+/// This service's canonical name, as it appears in a `ServiceDecl` and in the
+/// boot log.
+///
+/// Exported because an assembly that REPLACES this service — a co-host swapping
+/// the bodiless decl for one carrying a spawn provider — has to find it in the
+/// default list by name, and a name matched as a literal in another repository is
+/// a rename waiting to go unnoticed.
+pub const SERVICE_NAME: &str = "managed_agent";
+
 /// The managed-agent service as a boot declaration for
 /// [`kernel::kernel::Kernel::bring_up_services`] — the uniform path by
 /// which the assembly hands services to the kernel. Wraps
 /// [`install_managed_agent`], which wires the session lifecycle, the
 /// workspace/procfs hooks, and (on unix + `subprocess-host`) the raw ACP
 /// control-plane stream-tunnel spawner via `install_returning`.
+///
+/// No runtime body: `spawn` registers the agent and stamps its procfs subtree,
+/// and nothing turns that into a running loop. For a build that hosts one
+/// in-process, see [`service_decl_with_spawn`].
 pub fn service_decl() -> kernel::kernel::ServiceDecl {
     kernel::kernel::ServiceDecl {
-        name: "managed_agent".to_string(),
+        name: SERVICE_NAME.to_string(),
         install: Box::new(install_managed_agent),
+    }
+}
+
+/// The same service, installed WITH an in-process runtime body.
+///
+/// The sibling of [`service_decl`], here rather than at the call site because the
+/// pairing of this service's name with this service's install is the service's own
+/// knowledge: an assembly that hand-rolled the `ServiceDecl` would be spelling
+/// both, and a rename here would leave that copy compiling and wrong.
+///
+/// `spawn_provider` is what turns a `start_session` into a running agent —
+/// typically a thin adapter over a runtime crate (`sudocode`'s
+/// `SudoCodeSpawnAdapter`). It cannot live in this repo: the runtime crate depends
+/// on the kernel, so linking it here would be a cycle.
+pub fn service_decl_with_spawn(
+    spawn_provider: Arc<dyn SpawnTask<kernel::kernel::Kernel>>,
+) -> kernel::kernel::ServiceDecl {
+    kernel::kernel::ServiceDecl {
+        name: SERVICE_NAME.to_string(),
+        install: Box::new(move |kernel| install_managed_agent_with_spawn(kernel, spawn_provider)),
     }
 }
 
@@ -183,6 +216,15 @@ pub(crate) struct GetSessionResponse {
     pub session_id: String,
     /// Static agent profile id (mirrors `StartSessionRequest.agent_id`).
     pub agent_id: String,
+    /// Whose session this is, as recorded on the descriptor.
+    ///
+    /// Reported because the caller can no longer infer it. `start_session_v1`
+    /// takes the owner from a delegated credential in preference to the
+    /// request body (see `authenticated_owner`), so a front door that sends no
+    /// `owner_id` has no other way to learn what the daemon attributed the
+    /// session to — and attribution nobody can read back is attribution
+    /// nobody can check.
+    pub owner_id: String,
     pub workspace_path: String,
     pub model: String,
     pub state: String,
@@ -286,12 +328,22 @@ pub trait SpawnTask<K: KernelSyscall>: Send + Sync + 'static {
     /// at teardown) are service-set. The spawn body's only role w.r.t.
     /// state is to invoke the observer on each transition; it MUST
     /// NOT write to AgentRegistry through any other path.
+    /// # Errors
+    ///
+    /// When this host cannot run an agent at all — no model configuration, an
+    /// unusable host directory. `start_session` turns that into a refusal, which is
+    /// the only place a caller can act on it: a spawn body that cannot report
+    /// failure has to panic on the daemon's own thread, and the operator then reads
+    /// a backtrace about a missing config file instead of an RPC error naming it.
+    ///
+    /// Reserved for "this cannot start", not "this run ended" — a session that
+    /// starts and later fails reports that through `state_observer`.
     fn spawn(
         &self,
         kernel: Arc<K>,
         desc: AgentDescriptor,
         state_observer: Arc<dyn Fn(AgentState, Option<String>) + Send + Sync>,
-    ) -> Box<dyn SpawnHandle>;
+    ) -> Result<Box<dyn SpawnHandle>, String>;
 }
 
 /// Raw ACP-subprocess control-plane spawner — the DI seam for the
@@ -388,7 +440,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
     /// Allocate a managed-agent session. Plants a fresh AgentRegistry
     /// record (`AgentRegistry::register` directly — no Python boundary)
     /// and returns the session identity tuple sudowork uses for
-    /// follow-up cancel / get_session calls and chat-with-me writes.
+    /// follow-up cancel / get_session calls.
     ///
     /// `session_id` and `agent_id` are the same value: the AgentRegistry
     /// pid.  No second identifier is allocated — the descriptor is the
@@ -477,7 +529,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
         // Two mutually-exclusive spawn strategies select on the request
         // shape (a session is one or the other), both fired right after
         // procfs is stamped so the first sys_read on
-        // `/proc/{pid}/chat-with-me` (or `/proc/{pid}/fd/*`) routes:
+        // `/proc/{pid}/transcript` (or `/proc/{pid}/fd/*`) routes:
         //
         //   * `spawn_spec` present → the RAW ACP subprocess control-plane
         //     path (frozen contract 2026-08-01). The injected `raw_spawn`
@@ -501,25 +553,14 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
             if let Err(e) = register_proc_entry(self.kernel.as_ref(), &desc) {
                 tracing::warn!(pid=%pid, error=%e, "register_proc_entry failed");
             }
-            // Provision the PERSISTENT per-identity A2A inbox
-            // (`/agents/{name}/chat-with-me`) — the cross-machine mailbox a peer
-            // writes to and this agent reads (via `Mailbox::A2aInbox`). It must
-            // exist as a proper replicated DT_STREAM regardless of who writes
-            // first, never left to be created implicitly as a DT_REG. Unlike the
-            // per-pid procfs subtree above (dropped by `unregister_proc_entry`
-            // on pid death), this inbox OUTLIVES the pid — a message must survive
-            // an agent restart — so it is provisioned here and never torn down.
-            // a2a owns the A2A address + the stream contract; this lifecycle
-            // owner (the agent's host) just says "bring this agent's inbox up".
+            // The agent's replicated attention-state stream, under its
+            // `/agents/{name}` presence. Creating it is also what brings that
+            // presence directory into being, which the conversation chat list
+            // (`/agents/{name}/conversations/{peer}`) hangs off. The observer below publishes
+            // `AwaitingInput` enter/exit here so any node can answer the
+            // cross-machine "which agents are waiting on me?" with a plain read. Best-effort: a std / non-stream
             let system_ctx =
                 kernel::kernel::OperationContext::new("managed_agent", "root", true, None, true);
-            if let Err(e) = a2a::ensure_agent_inbox(self.kernel.as_ref(), &system_ctx, &desc.name) {
-                tracing::warn!(pid=%pid, error=%e, "ensure_agent_inbox failed");
-            }
-            // Sibling attention-state stream (same replicated `/agents/{name}`
-            // presence). The observer below publishes `AwaitingInput` enter/exit
-            // here so any node can answer the cross-machine "which agents are
-            // waiting on me?" with a plain read. Best-effort: a std / non-stream
             // deployment simply has no reader and the agent runs unaffected.
             if let Err(e) =
                 a2a::ensure_agent_state_stream(self.kernel.as_ref(), &system_ctx, &desc.name)
@@ -612,7 +653,27 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                             }
                         }
                     });
-                let handle = provider.spawn(Arc::clone(&self.kernel), desc, observer);
+                // A refusal here is the session NOT starting: unwind the registration
+                // rather than leaving a pid whose runtime never existed, so a caller
+                // that retries after fixing the cause is not told the agent is
+                // already running.
+                let handle = provider
+                    .spawn(Arc::clone(&self.kernel), desc, observer)
+                    .map_err(|e| {
+                        let _ = self.agent_registry.update_state_with_reason(
+                            &pid,
+                            AgentState::Terminated,
+                            Some(e.clone()),
+                        );
+                        // `Internal`, not `InvalidArgument`: the request was fine and
+                        // the caller cannot fix this by sending a different one — the
+                        // HOST is missing something (model configuration, a usable
+                        // directory). The dispatch vocabulary has no
+                        // failed-precondition code, and widening it for one service is
+                        // not this change's call, so the distinction lives in the
+                        // message the refusal carries.
+                        ManagedAgentError::Internal(format!("spawn agent runtime: {e}"))
+                    })?;
                 self.spawn_handles.insert(pid.clone(), handle);
             }
         }
@@ -672,7 +733,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
     }
 
     /// Read-through liveness snapshot. Cheap by design; the live
-    /// message flow uses `sys_watch` over `/proc/{pid}/chat-with-me`,
+    /// message flow uses `sys_watch` over `/proc/{pid}/transcript`,
     /// not this RPC.
     pub(crate) fn get_session(
         &self,
@@ -688,6 +749,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
         Ok(GetSessionResponse {
             session_id: desc.pid.clone(),
             agent_id: desc.name.clone(),
+            owner_id: desc.owner_id.clone(),
             workspace_path,
             model,
             state: desc.state.as_str().to_lowercase(),
@@ -703,7 +765,17 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
         let desc = self.agent_registry.get(session_id).ok_or_else(|| {
             RustCallError::InvalidArgument(format!("unknown session_id {session_id:?}"))
         })?;
-        if desc.owner_id != ctx.user_id && !ctx.is_admin && !ctx.is_system {
+        // An AGENT credential (`agent_id` set — an agent cert or a session
+        // cert) is inside the control plane's own trust domain: the cluster CA
+        // vouched for it, and `start_session_v1` has already run its
+        // owner-attribution rules on this caller's spawns. A bare principal
+        // (a user key reaching the agent plane directly, `agent_id` unset)
+        // gets the ownership/admin check — the tightened boundary.
+        if ctx.agent_id.is_none()
+            && desc.owner_id != ctx.user_id
+            && !ctx.is_admin
+            && !ctx.is_system
+        {
             return Err(RustCallError::PermissionDenied(
                 "managed-agent session operation requires ownership or administrator privileges"
                     .to_string(),
@@ -724,7 +796,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
 impl ManagedAgentService<kernel::kernel::Kernel> {
     /// Install the service into a freshly-constructed kernel:
     ///
-    ///   1. Register the chat-with-me + workspace-boundary hooks into
+    ///   1. Register the workspace-boundary hook into
     ///      the kernel's `KernelDispatch`.
     ///   2. Enlist the service into `ServiceRegistry` so future tonic
     ///      gRPC handlers + Python factory wiring can resolve it via
@@ -821,7 +893,7 @@ impl ManagedAgentService<kernel::kernel::Kernel> {
         // the observer captures `Arc::clone(&svc.spawn_handles)`.
         // Removing the handle and aborting it is best-effort — the
         // worker thread also exits naturally when its sys_read on
-        // the now-missing chat-with-me path returns FileNotFound,
+        // the now-missing procfs path returns FileNotFound,
         // but the explicit abort gives a clean exit without an
         // error-path walk.
         let kernel_for_cb = Arc::clone(kernel);
@@ -861,7 +933,9 @@ impl ManagedAgentService<kernel::kernel::Kernel> {
             .expect("just enlisted managed_agent above; handle must exist");
         kernel.register_service_hook(
             &handle,
-            Box::new(workspace_boundary_hook::WorkspaceBoundaryHook::new()),
+            Box::new(workspace_boundary_hook::WorkspaceBoundaryHook::new(
+                Arc::clone(kernel.agent_registry()),
+            )),
         );
 
         Ok(svc_for_return)
@@ -887,6 +961,59 @@ fn map_agent_context_error(error: AgentContextError) -> RustCallError {
     }
 }
 
+/// Whose session this is, deciding between what the caller *said* and what its
+/// credential *proves*.
+///
+/// The credential wins. `start_session_v1` used to take `owner_id` from the
+/// request body and had no way to check it, so an agent could open a session
+/// attributed to anyone; that is the hole this closes. Per `OperationContext`,
+/// `user_id` is the principal and `agent_id` the actor, and they differ
+/// exactly when the caller holds a delegated credential — a session cert
+/// carrying a `nexus://owner/` SAN, which the auth layer has already resolved
+/// into `user_id`. This never parses a certificate; it reads the context the
+/// auth layer built.
+///
+/// Three cases, and the middle one is the decision worth stating:
+///
+/// * **No delegated credential** — the caller presented an ordinary agent
+///   cert, an `sk-` key, or nothing. Behaviour is unchanged: the body's
+///   `owner_id` stands, empty defaulting to `system` downstream. This is what
+///   makes the enforcement arrive *with the credential* instead of on a flag
+///   day: a caller that starts presenting a session cert starts being held to
+///   it, and everything else keeps working.
+///
+/// * **Delegated, and the body disagrees** — refused, not overwritten.
+///   Overwriting is quieter and that is exactly what is wrong with it: the
+///   caller believes it opened a session for one person while the system
+///   recorded another, with nothing said. A mismatch is a bug in the caller or
+///   a credential being used for someone it was not issued for, and both want
+///   to be loud. For the caller this FR is about, the two agree, so this never
+///   fires in the correct case.
+///
+/// * **Delegated, body empty or already matching** — the credential's owner
+///   is used. An empty body is not a disagreement, so an existing caller that
+///   sends no `owner_id` needs no change.
+fn authenticated_owner(
+    requested: &str,
+    ctx: &contracts::OperationContext,
+) -> Result<String, String> {
+    let delegated = ctx
+        .agent_id
+        .as_deref()
+        .is_some_and(|actor| actor != ctx.user_id);
+    if !delegated {
+        return Ok(requested.to_string());
+    }
+    let proven = ctx.user_id.as_str();
+    if !requested.is_empty() && requested != proven {
+        return Err(format!(
+            "owner_id {requested:?} does not match the caller's credential, which is \
+             issued for {proven:?}; omit owner_id to use the credential's owner"
+        ));
+    }
+    Ok(proven.to_string())
+}
+
 impl<K: KernelSyscall> RustService for ManagedAgentService<K> {
     fn name(&self) -> &str {
         Self::NAME
@@ -906,11 +1033,18 @@ impl<K: KernelSyscall> RustService for ManagedAgentService<K> {
     /// Route the three session-lifecycle methods exposed over
     /// `NexusVFSService.Call`. Method names are versioned so the wire
     /// contract can evolve without breaking older sudowork clients.
-    fn dispatch(&self, method: &str, payload: &[u8]) -> Result<Vec<u8>, RustCallError> {
+    fn dispatch(
+        &self,
+        method: &str,
+        payload: &[u8],
+        ctx: &contracts::OperationContext,
+    ) -> Result<Vec<u8>, RustCallError> {
         match method {
             "start_session_v1" => {
-                let req: StartSessionRequest = serde_json::from_slice(payload)
+                let mut req: StartSessionRequest = serde_json::from_slice(payload)
                     .map_err(|e| RustCallError::InvalidArgument(e.to_string()))?;
+                req.owner_id = authenticated_owner(&req.owner_id, ctx)
+                    .map_err(RustCallError::InvalidArgument)?;
                 let resp = self.start_session(req)?;
                 serde_json::to_vec(&resp).map_err(|e| RustCallError::Internal(e.to_string()))
             }
@@ -940,17 +1074,50 @@ impl<K: KernelSyscall> RustService for ManagedAgentService<K> {
             "start_session_v1" => {
                 let mut req: StartSessionRequest = serde_json::from_slice(payload)
                     .map_err(|error| RustCallError::InvalidArgument(error.to_string()))?;
-                req.owner_id = resolve_agent_owner(
-                    ctx,
-                    (!req.owner_id.is_empty()).then_some(req.owner_id.as_str()),
-                )
-                .map_err(map_agent_context_error)?;
-                req.zone_id = resolve_agent_zone(
-                    ctx,
-                    (!req.zone_id.is_empty()).then_some(req.zone_id.as_str()),
-                )
-                .map_err(map_agent_context_error)?;
-                if !ctx.is_system {
+                // Three caller shapes reach this ctx-aware entry, and they are
+                // deliberately NOT treated alike:
+                //
+                // * **system** — the daemon itself. Owner/zone resolve from the
+                //   auth context with the body as an override the context
+                //   vouches for (`resolve_agent_owner` / `resolve_agent_zone`).
+                // * **an agent credential** (`agent_id` set — an ordinary agent
+                //   cert, or a session cert where it differs from `user_id`)
+                //   — the control plane's native caller. Owner attribution is
+                //   `authenticated_owner`'s call: a session cert's CA-verified
+                //   owner SAN wins over the body (a disagreement is refused,
+                //   naming both), while an ordinary cert's body still stands —
+                //   the rule arrives with the credential, not on a flag day.
+                //   Agents carry no zone tenancy by design, so an omitted zone
+                //   takes the root default; a zone named in the body still
+                //   needs an explicit grant (`resolve_agent_zone`).
+                // * **a bare principal** (`agent_id` unset, not system — a
+                //   user key hitting the agent control plane directly) — no
+                //   cohost delegation is verifiable for such a caller yet, so
+                //   spawning is refused outright rather than trusted.
+                if ctx.is_system {
+                    req.owner_id = resolve_agent_owner(
+                        ctx,
+                        (!req.owner_id.is_empty()).then_some(req.owner_id.as_str()),
+                    )
+                    .map_err(map_agent_context_error)?;
+                    req.zone_id = resolve_agent_zone(
+                        ctx,
+                        (!req.zone_id.is_empty()).then_some(req.zone_id.as_str()),
+                    )
+                    .map_err(map_agent_context_error)?;
+                } else if ctx.agent_id.is_some() {
+                    req.owner_id = authenticated_owner(&req.owner_id, ctx)
+                        .map_err(RustCallError::InvalidArgument)?;
+                    if req.zone_id.is_empty() {
+                        req.zone_id = contracts::ROOT_ZONE_ID.to_string();
+                    } else {
+                        req.zone_id = resolve_agent_zone(
+                            ctx,
+                            Some(req.zone_id.as_str()),
+                        )
+                        .map_err(map_agent_context_error)?;
+                    }
+                } else {
                     return Err(RustCallError::PermissionDenied(
                         "verified cohost delegation unavailable".to_string(),
                     ));
@@ -1025,14 +1192,69 @@ mod tests {
             _kernel: Arc<Kernel>,
             _desc: AgentDescriptor,
             state_observer: Arc<dyn Fn(AgentState, Option<String>) + Send + Sync>,
-        ) -> Box<dyn SpawnHandle> {
+        ) -> Result<Box<dyn SpawnHandle>, String> {
             state_observer(AgentState::WarmingUp, None);
             state_observer(AgentState::Ready, None);
             state_observer(AgentState::Busy, None);
             // Blocked on a reply it requested — carries an opaque reason.
             state_observer(AgentState::AwaitingInput, Some("permission".to_string()));
-            Box::new(NoopHandle)
+            Ok(Box::new(NoopHandle))
         }
+    }
+
+    /// A host that cannot run an agent at all — no model configuration, an unusable
+    /// host directory — refuses the session instead of dying on the daemon's thread.
+    struct RefusingSpawn;
+    impl SpawnTask<Kernel> for RefusingSpawn {
+        fn spawn(
+            &self,
+            _kernel: Arc<Kernel>,
+            _desc: AgentDescriptor,
+            _state_observer: Arc<dyn Fn(AgentState, Option<String>) + Send + Sync>,
+        ) -> Result<Box<dyn SpawnHandle>, String> {
+            Err("no sudocode configuration at /nowhere".to_string())
+        }
+    }
+
+    /// `start_session` answers with the refusal, and the pid it had already planted
+    /// does not linger as a session whose runtime never existed.
+    ///
+    /// Before the seam could refuse, a co-host with no model configuration panicked
+    /// inside the spawn — so an RPC that should have answered "this daemon has no
+    /// agent configuration" instead took down a daemon thread and left the operator
+    /// reading a backtrace about a missing file.
+    #[test]
+    fn a_host_that_cannot_start_an_agent_refuses_the_session() {
+        let kernel = Arc::new(Kernel::new());
+        let registry = Arc::clone(kernel.agent_registry());
+        let svc = ManagedAgentService::<Kernel>::with_spawn(
+            Arc::clone(&kernel),
+            Arc::clone(&registry),
+            Arc::new(RefusingSpawn),
+        );
+
+        let err = svc
+            .start_session(req("scode-standard"))
+            .expect_err("a host that cannot spawn must refuse");
+        let text = err.to_string();
+        assert!(
+            text.contains("no sudocode configuration"),
+            "the refusal must carry the host's reason, not a generic failure: {text}"
+        );
+
+        // Whatever pid was planted is Terminated WITH that reason — a caller listing
+        // sessions sees why, and a retry after fixing the cause is not told the agent
+        // is already running.
+        let live: Vec<_> = registry
+            .list(None, None, None, None)
+            .into_iter()
+            .filter(|d| d.state != AgentState::Terminated)
+            .map(|d| (d.pid, d.state))
+            .collect();
+        assert!(
+            live.is_empty(),
+            "a refused spawn must leave no live session: {live:?}"
+        );
     }
 
     #[test]
@@ -1118,7 +1340,7 @@ mod tests {
             kernel: Arc<Kernel>,
             desc: AgentDescriptor,
             state_observer: Arc<dyn Fn(AgentState, Option<String>) + Send + Sync>,
-        ) -> Box<dyn SpawnHandle> {
+        ) -> Result<Box<dyn SpawnHandle>, String> {
             state_observer(AgentState::WarmingUp, None);
             let ptr = Arc::as_ptr(&kernel) as usize;
             // Real in-process KernelSyscall on the SHARED kernel: stat the
@@ -1129,7 +1351,7 @@ mod tests {
             let hit = kernel.sys_stat(&ws, &desc.zone_id).is_some();
             self.seen.lock().unwrap().push((ptr, desc.pid.clone(), hit));
             state_observer(AgentState::Ready, None);
-            Box::new(NoopHandle)
+            Ok(Box::new(NoopHandle))
         }
     }
 
@@ -1314,6 +1536,129 @@ mod tests {
             ctx
         }
 
+        /// A caller holding an ordinary credential: an agent cert with no
+        /// owner SAN, or an `sk-` key. The auth layer sets `agent_id` to the
+        /// same subject as `user_id` for an agent acting for itself (and
+        /// `None` for a person), so this is what every caller that predates
+        /// session certs looks like.
+        fn plain_caller() -> contracts::OperationContext {
+            contracts::OperationContext::new("moss", "root", false, Some("moss"), false)
+        }
+
+        /// A caller holding a session cert: the actor is the session identity,
+        /// the principal is the owner its `nexus://owner/` SAN names. This is
+        /// the shape `ApiKeyAuthProvider::agent_context` produces when a cert
+        /// carries an owner, and the only shape that reads as delegated.
+        fn session_caller(owner: &str) -> contracts::OperationContext {
+            contracts::OperationContext::new(owner, "root", false, Some("session-7f3a1c20"), false)
+        }
+
+        /// Decision 2 for the requester: a caller with no delegated credential
+        /// is unaffected. The body's `owner_id` stands, so every caller that
+        /// exists today keeps working and the enforcement arrives *with* the
+        /// credential rather than on a flag day.
+        #[test]
+        fn an_ordinary_caller_still_names_its_own_owner() {
+            let ctx = plain_caller();
+            assert_eq!(authenticated_owner("ethan", &ctx).unwrap(), "ethan");
+            assert_eq!(authenticated_owner("", &ctx).unwrap(), "");
+        }
+
+        /// The point of the whole change: a session cert's owner is used, and
+        /// the caller need not repeat it.
+        #[test]
+        fn a_session_cert_supplies_the_owner() {
+            let ctx = session_caller("alice");
+            assert_eq!(authenticated_owner("", &ctx).unwrap(), "alice");
+            assert_eq!(authenticated_owner("alice", &ctx).unwrap(), "alice");
+        }
+
+        /// Decision 1: a body that disagrees with the credential is refused,
+        /// not quietly overwritten. Overwriting would leave the caller
+        /// believing it opened a session for one person while the system
+        /// recorded another — and a mismatch is either a caller bug or a
+        /// credential being used for someone it was not issued for.
+        #[test]
+        fn a_session_cert_refuses_an_owner_it_does_not_prove() {
+            let ctx = session_caller("alice");
+            let err = authenticated_owner("bob", &ctx).unwrap_err();
+            assert!(err.contains("bob"), "err names what was asked: {err}");
+            assert!(err.contains("alice"), "err names what was proven: {err}");
+        }
+
+        /// End to end through `dispatch`: the recorded owner comes from the
+        /// credential, not the body. Asserted on the session the table holds,
+        /// because that — not the response — is what an audit trail reads.
+        #[test]
+        fn start_session_v1_records_the_credentials_owner() {
+            let (_kernel, table, svc) = fresh_service();
+            let payload = json!({"agent_id": "scode-standard"}).to_string();
+            let bytes = svc
+                .dispatch(
+                    "start_session_v1",
+                    payload.as_bytes(),
+                    &session_caller("alice"),
+                )
+                .unwrap();
+            let resp: StartSessionResponse = serde_json::from_slice(&bytes).unwrap();
+            let desc = table.get(&resp.session_id).expect("session registered");
+            assert_eq!(
+                desc.owner_id, "alice",
+                "the owner is the credential's, not the body's default"
+            );
+        }
+
+        /// `get_session_v1` reports the owner, so a caller that sent none can
+        /// read back what the daemon attributed the session to. Without this
+        /// the attribution exists only on the descriptor, where the caller
+        /// cannot see it.
+        #[test]
+        fn get_session_v1_reports_the_owner_that_was_recorded() {
+            let (_kernel, _table, svc) = fresh_service();
+            let started = svc
+                .dispatch(
+                    "start_session_v1",
+                    json!({"agent_id": "scode-standard"}).to_string().as_bytes(),
+                    &session_caller("alice"),
+                )
+                .unwrap();
+            let started: StartSessionResponse = serde_json::from_slice(&started).unwrap();
+
+            let payload = json!({"session_id": started.session_id}).to_string();
+            let bytes = svc
+                .dispatch(
+                    "get_session_v1",
+                    payload.as_bytes(),
+                    &session_caller("alice"),
+                )
+                .unwrap();
+            let snap: GetSessionResponse = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                snap.owner_id, "alice",
+                "the caller sent no owner_id; the credential's owner is what it reads back"
+            );
+        }
+
+        /// The refusal reaches the wire as `InvalidArgument`, not a panic and
+        /// not a session started under the wrong name.
+        #[test]
+        fn start_session_v1_rejects_a_body_the_credential_does_not_prove() {
+            let (_kernel, table, svc) = fresh_service();
+            let payload = json!({"agent_id": "scode-standard", "owner_id": "bob"}).to_string();
+            let err = svc
+                .dispatch(
+                    "start_session_v1",
+                    payload.as_bytes(),
+                    &session_caller("alice"),
+                )
+                .unwrap_err();
+            assert!(matches!(err, RustCallError::InvalidArgument(_)));
+            assert!(
+                table.list(None, None, None, None).is_empty(),
+                "a refused call must not leave a session behind"
+            );
+        }
+
         #[test]
         fn start_session_v1_round_trip() {
             let (_kernel, _table, svc) = fresh_service();
@@ -1326,7 +1671,7 @@ mod tests {
             })
             .to_string();
             let bytes = svc
-                .dispatch("start_session_v1", payload.as_bytes())
+                .dispatch("start_session_v1", payload.as_bytes(), &plain_caller())
                 .unwrap();
             let resp: StartSessionResponse = serde_json::from_slice(&bytes).unwrap();
             assert!(resp.session_id.starts_with("pid-"));
@@ -1341,7 +1686,7 @@ mod tests {
             let (_kernel, _table, svc) = fresh_service();
             let payload = json!({"agent_id": "scode-standard"}).to_string();
             let bytes = svc
-                .dispatch("start_session_v1", payload.as_bytes())
+                .dispatch("start_session_v1", payload.as_bytes(), &plain_caller())
                 .unwrap();
             let resp: StartSessionResponse = serde_json::from_slice(&bytes).unwrap();
             assert!(resp.session_id.starts_with("pid-"));
@@ -1352,7 +1697,9 @@ mod tests {
             let (_kernel, _table, svc) = fresh_service();
             let resp = svc.start_session(req("scode-standard")).unwrap();
             let payload = json!({"session_id": resp.session_id, "mode": "session"}).to_string();
-            let bytes = svc.dispatch("cancel_v1", payload.as_bytes()).unwrap();
+            let bytes = svc
+                .dispatch("cancel_v1", payload.as_bytes(), &plain_caller())
+                .unwrap();
             let cancel: CancelResponse = serde_json::from_slice(&bytes).unwrap();
             assert!(cancel.cancelled);
         }
@@ -1362,7 +1709,9 @@ mod tests {
             let (_kernel, _table, svc) = fresh_service();
             let resp = svc.start_session(req("scode-standard")).unwrap();
             let payload = json!({"session_id": resp.session_id, "mode": "turn"}).to_string();
-            let bytes = svc.dispatch("cancel_v1", payload.as_bytes()).unwrap();
+            let bytes = svc
+                .dispatch("cancel_v1", payload.as_bytes(), &plain_caller())
+                .unwrap();
             let cancel: CancelResponse = serde_json::from_slice(&bytes).unwrap();
             assert!(cancel.cancelled);
         }
@@ -1371,7 +1720,9 @@ mod tests {
         fn cancel_v1_unknown_session_surfaces_invalid_argument() {
             let (_kernel, _table, svc) = fresh_service();
             let payload = json!({"session_id": "pid-bogus", "mode": "session"}).to_string();
-            let err = svc.dispatch("cancel_v1", payload.as_bytes()).unwrap_err();
+            let err = svc
+                .dispatch("cancel_v1", payload.as_bytes(), &plain_caller())
+                .unwrap_err();
             assert!(matches!(err, RustCallError::InvalidArgument(_)));
         }
 
@@ -1380,7 +1731,9 @@ mod tests {
             let (_kernel, _table, svc) = fresh_service();
             let resp = svc.start_session(req("scode-standard")).unwrap();
             let payload = json!({"session_id": resp.session_id}).to_string();
-            let bytes = svc.dispatch("get_session_v1", payload.as_bytes()).unwrap();
+            let bytes = svc
+                .dispatch("get_session_v1", payload.as_bytes(), &plain_caller())
+                .unwrap();
             let snap: GetSessionResponse = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(snap.session_id, resp.session_id);
             assert_eq!(snap.state, "warming_up");
@@ -1389,7 +1742,9 @@ mod tests {
         #[test]
         fn unknown_method_returns_not_found() {
             let (_kernel, _table, svc) = fresh_service();
-            let err = svc.dispatch("does_not_exist", b"{}").unwrap_err();
+            let err = svc
+                .dispatch("does_not_exist", b"{}", &plain_caller())
+                .unwrap_err();
             assert!(matches!(err, RustCallError::NotFound));
         }
 
@@ -1397,7 +1752,7 @@ mod tests {
         fn malformed_payload_surfaces_invalid_argument() {
             let (_kernel, _table, svc) = fresh_service();
             let err = svc
-                .dispatch("start_session_v1", b"this is not json")
+                .dispatch("start_session_v1", b"this is not json", &plain_caller())
                 .unwrap_err();
             assert!(matches!(err, RustCallError::InvalidArgument(_)));
         }
@@ -1548,16 +1903,11 @@ mod tests {
         }
 
         #[test]
-        fn start_session_stamps_workspace_dirent_and_chat_with_me_link() {
+        fn start_session_stamps_the_workspace_dirent() {
             let (kernel, svc) = svc_with_kernel();
             let resp = svc.start_session(req("scode-standard")).unwrap();
 
             assert!(dir_exists(&kernel, &resp.workspace_path));
-            let cwm = format!("{}chat-with-me", resp.workspace_path);
-            assert_eq!(
-                link_target_at(&kernel, &cwm).as_deref(),
-                Some(format!("/proc/{}/chat-with-me", resp.session_id).as_str()),
-            );
         }
 
         #[test]
@@ -1626,11 +1976,9 @@ mod tests {
             let (kernel, svc) = svc_with_kernel();
             let resp = svc.start_session(req("scode-standard")).unwrap();
             svc.cancel(&resp.session_id, CancelMode::Turn).unwrap();
-            assert!(dir_exists(&kernel, &resp.workspace_path));
-            let cwm = format!("{}chat-with-me", resp.workspace_path);
             assert!(
-                link_target_at(&kernel, &cwm).is_some(),
-                "chat-with-me DT_LINK should survive turn cancel",
+                dir_exists(&kernel, &resp.workspace_path),
+                "the workspace subtree should survive turn cancel",
             );
         }
 
@@ -1675,176 +2023,6 @@ mod tests {
                 .signal(&resp.session_id, AgentSignal::Sigterm, None)
                 .expect("SIGTERM");
             assert!(!dir_exists(&kernel, &resp.workspace_path));
-            let cwm = format!("{}chat-with-me", resp.workspace_path);
-            assert!(!entry_exists(&kernel, &cwm));
-        }
-
-        /// Register `/proc` as a route entry on the kernel's
-        /// VFSRouter. The mount carries no per-mount backend or
-        /// metastore — `Kernel::with_metastore` falls back to the
-        /// global metastore on miss, which is where sys_setattr's
-        /// DT_DIR / DT_STREAM / DT_LINK writes land for these paths.
-        /// Without this, `sys_read` / `sys_write` against any
-        /// `/proc/*` path errors at `vfs_router.route()` before ever
-        /// consulting the metastore.
-        fn mount_proc(kernel: &Kernel) {
-            kernel
-                .vfs_router_arc()
-                .add_mount("/proc", "root", None, false);
-        }
-
-        /// End-to-end cross-link: write through the workspace shortcut
-        /// DT_LINK lands in the canonical chat-with-me DT_STREAM;
-        /// reading the canonical path returns the bytes. Validates
-        /// VFSRouter follows DT_LINK transparently for sys_write +
-        /// sys_read — the load-bearing assumption behind dropping
-        /// ProcWorkspaceResolver in favour of plain metastore DT_LINK
-        /// rows.
-        #[test]
-        fn workspace_shortcut_write_lands_in_canonical_chat_with_me_stream() {
-            use kernel::kernel::OperationContext;
-
-            let kernel = Arc::new(Kernel::new());
-            mount_proc(&kernel);
-            let svc = install_managed_agent(&kernel);
-            let resp = svc.start_session(req("scode-standard")).unwrap();
-
-            let shortcut = format!("{}chat-with-me", resp.workspace_path);
-            let canonical = format!("/proc/{}/chat-with-me", resp.session_id);
-            // Pre-stamp the envelope's `from` field with the caller's
-            // agent_id so MailboxStampingHook's rewrite is a no-op for
-            // this test — keeps the assertion focused on "bytes
-            // followed the DT_LINK to the canonical stream" without
-            // coupling to the stamping policy.  The MailboxStamping
-            // e2e companion exercises the rewrite path explicitly.
-            let payload = br#"{"from":"scode-standard","to":"human-ethan","body":"ping"}"#;
-
-            let ctx = OperationContext {
-                user_id: "ethan".into(),
-                zone_id: "root".into(),
-                is_admin: false,
-                agent_id: Some("scode-standard".into()),
-                is_system: false,
-                groups: vec![],
-                admin_capabilities: vec![],
-                subject_type: "user".into(),
-                subject_id: None,
-                request_id: "req-cross-link".into(),
-                trust_domain: None,
-                context_zone_id: None,
-                zone_perms: vec![],
-                propagates_cross_node: false,
-            };
-
-            // Use UFCS through KernelSyscall so we get the single-path
-            // trait wrappers (sys_read_single / sys_write_with_link_depth)
-            // — the inherent Kernel::sys_read/sys_write are now batch-shaped
-            // (&[ReadRequest] / &[WriteRequest]).
-            KernelSyscall::sys_write(kernel.as_ref(), &shortcut, &ctx, payload, 0)
-                .expect("sys_write through workspace shortcut DT_LINK");
-
-            let read = KernelSyscall::sys_read(
-                kernel.as_ref(),
-                &canonical,
-                &ctx,
-                /* timeout_ms */ 0,
-                0,
-            )
-            .expect("sys_read on canonical chat-with-me");
-            let bytes = read.data.expect("stream data present after write");
-            assert_eq!(bytes.as_slice(), payload);
-        }
-
-        /// MailboxStampingHook end-to-end: a sys_write through the
-        /// workspace shortcut DT_LINK runs through the registered hook,
-        /// which rewrites the envelope's `from` field to match
-        /// `OperationContext.agent_id`. Reading the canonical stream
-        /// returns the stamped envelope, not the LLM-authored one.
-        /// Validates dispatch_native_pre_with_replacement is wired
-        /// through sys_write_with_link_depth's EXECUTE phase.
-        #[test]
-        fn mailbox_stamping_hook_rewrites_envelope_through_link_path() {
-            use kernel::kernel::OperationContext;
-
-            let kernel = Arc::new(Kernel::new());
-            mount_proc(&kernel);
-            let svc = install_managed_agent(&kernel);
-            // The stamp hook now lives in the a2a substrate (armed at
-            // cluster boot in production). Arm it here so this test still
-            // exercises managed_agent's DT_LINK shortcut routing THROUGH
-            // the stamp hook end-to-end.
-            let a2a_handle = kernel
-                .enlist_hook_only_service("a2a")
-                .expect("enlist a2a hook-only service");
-            kernel.register_service_hook(&a2a_handle, Box::new(a2a::MailboxStampingHook::new()));
-            let resp = svc.start_session(req("scode-standard")).unwrap();
-
-            let shortcut = format!("{}chat-with-me", resp.workspace_path);
-            let canonical = format!("/proc/{}/chat-with-me", resp.session_id);
-            // LLM-authored envelope claims to be from "scode-standard"
-            // but the real caller is human-ethan; the hook should
-            // rewrite the `from` field.
-            let llm_authored =
-                br#"{"from":"scode-standard","to":"human-ethan","body":"hi"}"#.to_vec();
-
-            let ctx = OperationContext {
-                user_id: "ethan".into(),
-                zone_id: "root".into(),
-                is_admin: false,
-                agent_id: Some("human-ethan".into()),
-                is_system: false,
-                groups: vec![],
-                admin_capabilities: vec![],
-                subject_type: "user".into(),
-                subject_id: None,
-                request_id: "req-stamp".into(),
-                trust_domain: None,
-                context_zone_id: None,
-                zone_perms: vec![],
-                propagates_cross_node: false,
-            };
-
-            KernelSyscall::sys_write(kernel.as_ref(), &shortcut, &ctx, &llm_authored, 0)
-                .expect("sys_write through workspace shortcut DT_LINK");
-
-            let read = KernelSyscall::sys_read(kernel.as_ref(), &canonical, &ctx, 0, 0)
-                .expect("sys_read on canonical chat-with-me");
-            let bytes = read.data.expect("stream data present");
-            let json: serde_json::Value =
-                serde_json::from_slice(&bytes).expect("envelope is valid JSON");
-            assert_eq!(
-                json.get("from").and_then(|v| v.as_str()),
-                Some("human-ethan"),
-                "MailboxStampingHook should overwrite from-field with caller agent_id",
-            );
-        }
-
-        /// Companion structural assertion — keeps the metastore-level
-        /// invariant explicit even if the e2e write/read above is ever
-        /// skipped on a CI matrix that can't satisfy the route().
-        #[test]
-        fn workspace_shortcut_link_targets_canonical_chat_with_me_stream() {
-            let (kernel, svc) = svc_with_kernel();
-            let resp = svc.start_session(req("scode-standard")).unwrap();
-            let shortcut = format!("{}chat-with-me", resp.workspace_path);
-            let canonical = format!("/proc/{}/chat-with-me", resp.session_id);
-
-            // Workspace shortcut is a DT_LINK whose target is the
-            // canonical path.
-            let shortcut_meta = kernel
-                .sys_stat(&shortcut, ROOT_ZONE_ID)
-                .expect("workspace shortcut entry present");
-            assert_eq!(shortcut_meta.entry_type, DT_LINK);
-            assert_eq!(
-                shortcut_meta.link_target.as_deref(),
-                Some(canonical.as_str())
-            );
-
-            // Canonical path holds the DT_STREAM the link points at.
-            let canonical_meta = kernel
-                .sys_stat(&canonical, ROOT_ZONE_ID)
-                .expect("canonical chat-with-me entry present");
-            assert_eq!(canonical_meta.entry_type, DT_STREAM);
         }
 
         #[test]

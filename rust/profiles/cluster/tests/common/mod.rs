@@ -15,13 +15,14 @@ use std::time::{Duration, Instant};
 
 use kernel::kernel::vfs_proto::{
     nexus_vfs_service_client::NexusVfsServiceClient,
-    zone_runtime_service_client::ZoneRuntimeServiceClient, GetRuntimeCapabilitiesRequest,
-    GetZoneOperationRequest, IpcPathRequest, MkdirRequest, PingRequest, ReadRequest,
-    ReaddirRequest, SetattrRequest, SetattrResponse, StatRequest, StreamReadAtRequest,
-    StreamWriteRequest, WatchRequest, WriteRequest, ZoneCreateRequest, ZoneDeprovisionRequest,
-    ZoneJoinRequest, ZoneMountRequest, ZoneMutationHeader, ZoneRemoveReplicaRequest,
-    ZoneStatusRequest, ZoneUnmountRequest,
+    zone_runtime_service_client::ZoneRuntimeServiceClient, CallRequest, DeleteRequest,
+    GetRuntimeCapabilitiesRequest, GetZoneOperationRequest, IpcPathRequest, MkdirRequest,
+    PingRequest, ReadRequest, ReaddirRequest, SetattrRequest, SetattrResponse, StatRequest,
+    StreamReadAtRequest, StreamWriteRequest, WatchRequest, WriteRequest, ZoneCreateRequest,
+    ZoneDeprovisionRequest, ZoneJoinRequest, ZoneMountRequest, ZoneMutationHeader,
+    ZoneRemoveReplicaRequest, ZoneStatusRequest, ZoneUnmountRequest,
 };
+use lib::transport_primitives::{AgentCredential, LoadedCredential};
 use tonic::transport::Channel;
 
 pub const DT_STREAM: i32 = 4;
@@ -37,26 +38,70 @@ pub fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_nexusd-cluster")
 }
 
+/// Ports are handed out from this band, which sits BELOW every platform's ephemeral
+/// range (Linux 32768+, macOS/Windows 49152+).
+///
+/// That is the whole point. A harness port is not used by the process that picks it —
+/// it is handed to a daemon that binds it moments later — so binding `:0` and
+/// releasing it asks the OS for a number and then hopes nobody takes it. The OS hands
+/// out ephemeral ports freely in that window, including to the next test doing the
+/// same thing, and a daemon that loses the race exits with `Address already in use`
+/// and is reported as whatever the test was actually asserting.
+///
+/// Out here the OS assigns nothing spontaneously, so the only competitors are our own
+/// handouts — which the counter below makes disjoint.
+const PORT_BAND_START: u16 = 20_000;
+const PORT_BAND_END: u16 = 32_000;
+
+/// Next candidate in the band, started at a pid-derived offset.
+///
+/// The counter separates handouts within one test binary; the pid seed separates
+/// concurrent binaries, which otherwise start at the same place and collide in step.
+/// Same reasoning as temp-dir naming: a counter is disjoint by construction where a
+/// clock or a random draw is disjoint by luck.
+static PORT_CURSOR: std::sync::LazyLock<std::sync::atomic::AtomicU32> =
+    std::sync::LazyLock::new(|| {
+        let span = u32::from(PORT_BAND_END - PORT_BAND_START);
+        std::sync::atomic::AtomicU32::new(std::process::id().wrapping_mul(37) % span)
+    });
+
+/// Reserve `count` CONSECUTIVE ports in the band and return the first.
+///
+/// One `fetch_add` claims the whole run, which is what makes a multi-port reservation
+/// safe under parallel tests: claiming ports one at a time lets two callers interleave
+/// and both believe they own `p + 1`, since a probe only proves nobody has BOUND it
+/// yet — not that nobody else has been handed the number.
+///
+/// Each port in the run is still probed, so an unrelated service inside the band is
+/// skipped rather than inherited.
+fn reserve_ports(count: u32) -> u16 {
+    let span = u32::from(PORT_BAND_END - PORT_BAND_START);
+    for _ in 0..span {
+        let start = PORT_CURSOR.fetch_add(count, std::sync::atomic::Ordering::Relaxed) % span;
+        // A run that would straddle the band's end is skipped rather than wrapped, so
+        // "consecutive" stays true.
+        if start + count > span {
+            continue;
+        }
+        let base = PORT_BAND_START + start as u16;
+        if (0..count).all(|i| std::net::TcpListener::bind(("127.0.0.1", base + i as u16)).is_ok()) {
+            return base;
+        }
+    }
+    panic!("no free {count}-port run in {PORT_BAND_START}..{PORT_BAND_END} — is something holding the band?");
+}
+
+/// A port to hand to a daemon this test is about to spawn.
 pub fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind :0")
-        .local_addr()
-        .expect("local_addr")
-        .port()
+    reserve_ports(1)
 }
 
 /// A data-plane port `p` such that `p + 1` is ALSO free — for the enrollment
-/// convention (the node-enrollment listener rides one port above the data
-/// plane; both sides derive `p + 1`). Returns `p`; probe both, retry on a taken
-/// neighbour so the pair is deterministic under random ephemeral allocation.
+/// convention (the node-enrollment listener rides one port above the data plane; both
+/// sides derive `p + 1`). Returns `p`, with the neighbour reserved so no other caller
+/// is handed it.
 pub fn free_port_pair() -> u16 {
-    for _ in 0..64 {
-        let p = free_port();
-        if p < u16::MAX && std::net::TcpListener::bind(("127.0.0.1", p + 1)).is_ok() {
-            return p;
-        }
-    }
-    panic!("could not find a data/enroll port pair (p, p+1) both free");
+    reserve_ports(2)
 }
 
 /// A spawned `nexusd-cluster`, killed on drop. Reader threads capture
@@ -69,13 +114,53 @@ pub fn free_port_pair() -> u16 {
 pub struct Daemon {
     child: Child,
     log: Arc<Mutex<String>>,
+    /// Handles of the two pipe-reader threads, so a caller that has seen the
+    /// child exit can wait for them to finish draining — see [`Daemon::drain_settled`].
+    pumps: Vec<std::thread::JoinHandle<()>>,
+}
+
+/// Strip ANSI SGR sequences (`ESC [ ... m`) from captured daemon output.
+///
+/// The daemon writes COLOURED logs, and the colouring lands INSIDE a structured
+/// line: `tracing`'s formatter wraps a field name, its `=` and its value in
+/// separate escapes, so the bytes between `voter_count` and `2` are not `=`.
+/// A gate like `wait_for_log("voter_count=2")` then never matches a line the
+/// eye can plainly read in the failure dump -- the most expensive kind of
+/// mismatch, because the dump looks like it proves the gate wrong.
+///
+/// Stripping once, here, is what lets a gate name a FIELD rather than only a
+/// prose message. Only SGR is removed; nothing else in the stream moves.
+fn strip_ansi(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        // ESC '[' ... 'm' -- consume through the terminator. A truncated tail
+        // (the pipe split mid-sequence) simply ends the scan.
+        if chars.next() != Some('[') {
+            continue;
+        }
+        for p in chars.by_ref() {
+            if p == 'm' {
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// Drain a child pipe into the shared log buffer on a background thread. The
 /// thread exits when the pipe closes (the child is killed on `Daemon` drop).
-fn pump(pipe: Option<impl std::io::Read + Send + 'static>, log: Arc<Mutex<String>>) {
-    let Some(mut pipe) = pipe else { return };
-    std::thread::spawn(move || {
+fn pump(
+    pipe: Option<impl std::io::Read + Send + 'static>,
+    log: Arc<Mutex<String>>,
+) -> Option<std::thread::JoinHandle<()>> {
+    let pipe = pipe?;
+    let mut pipe = pipe;
+    Some(std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
             match pipe.read(&mut buf) {
@@ -83,10 +168,81 @@ fn pump(pipe: Option<impl std::io::Read + Send + 'static>, log: Arc<Mutex<String
                 Ok(n) => log
                     .lock()
                     .unwrap()
-                    .push_str(&String::from_utf8_lossy(&buf[..n])),
+                    .push_str(&strip_ansi(&String::from_utf8_lossy(&buf[..n]))),
             }
         }
-    });
+    }))
+}
+
+#[cfg(test)]
+mod port_allocation_tests {
+    use super::{free_port, free_port_pair, PORT_BAND_END, PORT_BAND_START};
+
+    /// Handouts are disjoint and inside the band.
+    ///
+    /// The property the band exists for: two daemons must never be handed the same
+    /// port. Asserted directly because the old `:0` form could only be observed
+    /// failing — as a daemon exiting with `Address already in use`, attributed to
+    /// whatever test happened to lose the race.
+    #[test]
+    fn every_handout_is_distinct_and_in_band() {
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..64 {
+            let p = free_port();
+            assert!(
+                (PORT_BAND_START..PORT_BAND_END).contains(&p),
+                "port {p} is outside the band"
+            );
+            assert!(seen.insert(p), "port {p} was handed out twice");
+        }
+    }
+
+    /// A pair takes its neighbour out of circulation.
+    ///
+    /// `p + 1` belongs to this caller's enrollment listener, so no later handout may
+    /// be it — the reason the pair is reserved in one `fetch_add` rather than probed.
+    #[test]
+    fn a_pair_reserves_its_neighbour() {
+        let pairs: Vec<u16> = (0..8).map(|_| free_port_pair()).collect();
+        let mut later = std::collections::BTreeSet::new();
+        for _ in 0..32 {
+            later.insert(free_port());
+        }
+        for p in pairs {
+            assert!(
+                p + 1 < PORT_BAND_END,
+                "pair {p} has no room for its neighbour"
+            );
+            assert!(
+                !later.contains(&p) && !later.contains(&(p + 1)),
+                "a later handout collided with the pair ({p}, {})",
+                p + 1
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod strip_ansi_tests {
+    use super::strip_ansi;
+
+    /// A coloured structured line reads as plain `field=value` afterwards.
+    #[test]
+    fn sgr_between_a_field_and_its_value_is_removed() {
+        let coloured = "\u{1b}[2mvoter_count\u{1b}[0m\u{1b}[2m=\u{1b}[0m2";
+        assert_eq!(strip_ansi(coloured), "voter_count=2");
+    }
+
+    /// Uncoloured input survives, and a sequence split across a pipe read does
+    /// not eat the rest of the buffer.
+    #[test]
+    fn plain_text_survives_and_a_truncated_sequence_terminates() {
+        assert_eq!(
+            strip_ansi("raft.conf_change.applied"),
+            "raft.conf_change.applied"
+        );
+        assert_eq!(strip_ansi("a\u{1b}"), "a");
+    }
 }
 
 impl Daemon {
@@ -138,9 +294,14 @@ impl Daemon {
         }
         let mut child = cmd.spawn().expect("spawn nexusd-cluster");
         let log = Arc::new(Mutex::new(String::new()));
-        pump(child.stdout.take(), Arc::clone(&log));
-        pump(child.stderr.take(), Arc::clone(&log));
-        Daemon { child, log }
+        let pumps = [
+            pump(child.stdout.take(), Arc::clone(&log)),
+            pump(child.stderr.take(), Arc::clone(&log)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        Daemon { child, log, pumps }
     }
 
     /// Poll until the TCP `port` accepts a connection (came up) or the process
@@ -150,7 +311,10 @@ impl Daemon {
         let deadline = Instant::now() + budget;
         while Instant::now() < deadline {
             if let Ok(Some(status)) = self.child.try_wait() {
-                return Err(format!("exited (status {status}):\n{}", self.drain()));
+                return Err(format!(
+                    "exited (status {status}):\n{}",
+                    self.drain_settled()
+                ));
             }
             if tokio::net::TcpStream::connect(("127.0.0.1", port))
                 .await
@@ -168,7 +332,7 @@ impl Daemon {
         let deadline = Instant::now() + budget;
         while Instant::now() < deadline {
             if let Ok(Some(_)) = self.child.try_wait() {
-                return Some(self.drain());
+                return Some(self.drain_settled());
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
@@ -194,7 +358,7 @@ impl Daemon {
             if let Ok(Some(status)) = self.child.try_wait() {
                 return Err(format!(
                     "exited (status {status}) before logging {pat:?}:\n{}",
-                    self.drain()
+                    self.drain_settled()
                 ));
             }
             if Instant::now() >= deadline {
@@ -226,7 +390,7 @@ impl Daemon {
             if let Ok(Some(status)) = self.child.try_wait() {
                 return Err(format!(
                     "exited (status {status}) before logging {pat:?} ×{count}:\n{}",
-                    self.drain()
+                    self.drain_settled()
                 ));
             }
             if Instant::now() >= deadline {
@@ -242,6 +406,31 @@ impl Daemon {
     /// Snapshot of everything the child has written to stdout+stderr so far.
     pub fn drain(&self) -> String {
         self.log.lock().unwrap().clone()
+    }
+
+    /// Everything the child wrote, after its pipes have been fully drained.
+    ///
+    /// Call this INSTEAD of [`Daemon::drain`] once `try_wait` has reported the
+    /// child exited. `try_wait` observes process death, which says nothing
+    /// about the reader threads: the pipes still hold whatever the child wrote
+    /// on its way out, and `drain` would snapshot a buffer those threads have
+    /// not finished filling. The faster the child dies, the emptier the
+    /// snapshot — so the tests most likely to lose their output are exactly
+    /// the ones asserting on a refusal, which is the earliest exit there is.
+    ///
+    /// That is not theoretical: `zone_id_refused_at_boot` failed twice on main
+    /// this way, reporting `exited (status 1):` with nothing after the colon
+    /// and an assertion complaining the id was missing from the logs.
+    ///
+    /// Only safe once the child is gone. While it lives its pipes never reach
+    /// EOF, so the reader threads never return and this would block until the
+    /// test's own timeout — which is why the budget-expired paths keep using
+    /// plain `drain`.
+    pub fn drain_settled(&mut self) -> String {
+        for pump in std::mem::take(&mut self.pumps) {
+            let _ = pump.join();
+        }
+        self.drain()
     }
 
     /// The daemon's OS process id — for tests that measure the process itself
@@ -317,10 +506,23 @@ pub fn mint_token_key(
     key
 }
 
-/// Mint a cert-agent (`--subject-type agent`) and return its bundle directory
-/// (holding `agent.pem` / `agent-key.pem` / `ca.pem`). An agent's one credential
-/// is a CA-signed identity cert — [`Vfs::connect_mtls`] presents it. Needs the
-/// founder CA at `<data-dir>/tls`; the daemon must NOT hold the data-dir lock.
+/// Read a minted bundle as the ONE credential it is — the PEMs plus the TLS server
+/// name to verify — through the same loader a client outside this repo uses.
+///
+/// Tests go through this rather than reading `agent.pem` and friends by name, for the
+/// reason the credential format exists: a filename or a server name spelled a second
+/// time is a copy that can disagree with the mint. Because every mTLS test dials this
+/// way, a manifest that stopped matching what the mint writes fails the suite loudly
+/// instead of only failing the clients we do not test here.
+pub fn agent_credential(bundle_dir: &std::path::Path) -> LoadedCredential {
+    AgentCredential::load(bundle_dir)
+        .unwrap_or_else(|e| panic!("load the credential at {}: {e}", bundle_dir.display()))
+}
+
+/// Mint a cert-agent (`--subject-type agent`) and return its bundle directory — the
+/// whole credential (see [`agent_credential`]). An agent's one credential is a
+/// CA-signed identity cert; [`Vfs::connect_as_agent`] presents it. Needs the founder
+/// CA at `<data-dir>/tls`; the daemon must NOT hold the data-dir lock.
 pub fn mint_agent_cert(env: &[(&str, &str)], subject_id: &str) -> std::path::PathBuf {
     mint_agent_cert_args(env, subject_id, &[])
 }
@@ -480,12 +682,27 @@ impl Vfs {
         }
     }
 
-    /// Dial the mTLS plane presenting a client identity cert — an agent's
-    /// `agent.pem` / `agent-key.pem` bundle (as `auth mint --subject-type agent` writes),
-    /// chaining to `ca_pem`. The daemon authenticates the caller from the
-    /// client certificate (the peer plane), so calls carry an EMPTY token.
-    /// Polls until the TLS handshake + a bare `Ping` both succeed — the cert
-    /// authenticating IS the readiness gate.
+    /// Dial as an agent with its credential and NOTHING else — the shape a client
+    /// outside this repo has: one directory from `auth mint`, one endpoint.
+    ///
+    /// Every value comes from the credential, the server name included, so this
+    /// proves the manifest is sufficient rather than assuming it. Calls then carry an
+    /// EMPTY token, because a verified agent cert is the whole authentication.
+    pub async fn connect_as_agent(port: u16, cred: &LoadedCredential, budget: Duration) -> Self {
+        Self::connect_mtls_named(
+            port,
+            &cred.ca_pem,
+            &cred.cert_pem,
+            &cred.key_pem,
+            &cred.server_name,
+            budget,
+        )
+        .await
+    }
+
+    /// Dial the mTLS plane presenting a client identity cert chaining to `ca_pem`,
+    /// verifying the server as the cluster's fixed name. For a NODE cert or raw PEMs;
+    /// an agent has a credential, so it uses [`Self::connect_as_agent`].
     pub async fn connect_mtls(
         port: u16,
         ca_pem: &[u8],
@@ -493,11 +710,32 @@ impl Vfs {
         client_key_pem: &[u8],
         budget: Duration,
     ) -> Self {
+        Self::connect_mtls_named(
+            port,
+            ca_pem,
+            client_cert_pem,
+            client_key_pem,
+            lib::transport_primitives::TlsConfig::CLUSTER_SERVER_NAME,
+            budget,
+        )
+        .await
+    }
+
+    /// The one dial: polls until the TLS handshake AND a bare `Ping` both succeed —
+    /// the cert authenticating IS the readiness gate.
+    async fn connect_mtls_named(
+        port: u16,
+        ca_pem: &[u8],
+        client_cert_pem: &[u8],
+        client_key_pem: &[u8],
+        server_name: &str,
+        budget: Duration,
+    ) -> Self {
         use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
         let tls = ClientTlsConfig::new()
             .ca_certificate(Certificate::from_pem(ca_pem))
             .identity(Identity::from_pem(client_cert_pem, client_key_pem))
-            .domain_name(lib::transport_primitives::TlsConfig::CLUSTER_SERVER_NAME);
+            .domain_name(server_name);
         let deadline = Instant::now() + budget;
         loop {
             let connected = Endpoint::from_shared(format!("https://127.0.0.1:{port}"))
@@ -552,10 +790,12 @@ impl Vfs {
             .map(|_| ())
     }
 
-    /// Generic `Call` — method + JSON params, the surface the agent-trust
-    /// boundary tests drive (`agent_register` payload forgery, R5).
-    /// Returns the in-band outcome so callers assert on `is_error`.
-    pub async fn call(
+    /// Generic `Call` returning the RAW response — method + JSON params, the
+    /// surface the agent-trust boundary tests drive (`agent_register` payload
+    /// forgery, R5). Returns the in-band outcome so callers assert on
+    /// `is_error`. (Named `call_raw` to sit beside [`Self::call`], the
+    /// string-shaped helper; both drive the same RPC.)
+    pub async fn call_raw(
         &mut self,
         method: &str,
         params: &serde_json::Value,
@@ -579,6 +819,34 @@ impl Vfs {
         req: SetattrRequest,
     ) -> Result<SetattrResponse, tonic::Status> {
         self.c.setattr(req).await.map(|r| r.into_inner())
+    }
+
+    /// The generic service RPC: `Call("<service>.<method>", json)`.
+    ///
+    /// This is the path a registered Rust service is reached on, and the one
+    /// that carries the caller's resolved identity — so it is how a test drives
+    /// a service *as somebody*, with the daemon deciding who that is from the
+    /// credential this connection presented.
+    ///
+    /// Returns the response payload as a UTF-8 string, or the error payload as
+    /// `Err` — the daemon reports service-level refusals in-band (`is_error`),
+    /// not as a gRPC status.
+    pub async fn call(&mut self, method: &str, json: &str, token: &str) -> Result<String, String> {
+        let r = self
+            .c
+            .call(CallRequest {
+                method: method.to_string(),
+                payload: json.as_bytes().to_vec(),
+                auth_token: token.to_string(),
+            })
+            .await
+            .map_err(|e| format!("call rpc: {e}"))?
+            .into_inner();
+        let payload = String::from_utf8_lossy(&r.payload).to_string();
+        if r.is_error {
+            return Err(payload);
+        }
+        Ok(payload)
     }
 
     pub async fn mkdir(&mut self, path: &str, token: &str) -> Result<(), String> {
@@ -621,6 +889,37 @@ impl Vfs {
     /// storage (`0` = keep-forever, as `create_stream`). Once sealed cold storage
     /// exceeds the budget the oldest segments are trimmed and `earliest` advances
     /// (Kafka retention). Same `wal,memory` io_profile as `create_stream`.
+    /// Create a DT_MOUNT with a constructed backend — the production path an
+    /// operator takes to mount a connector, `backend_type` + `backend_params`
+    /// straight through to the `ObjectStoreProvider` arm.
+    pub async fn mount_backend(
+        &mut self,
+        path: &str,
+        backend_type: &str,
+        params: &[(&str, &str)],
+        token: &str,
+    ) -> Result<(), String> {
+        const DT_MOUNT: i32 = 2;
+        let r = self
+            .c
+            .setattr(SetattrRequest {
+                path: path.to_string(),
+                auth_token: token.to_string(),
+                entry_type: DT_MOUNT,
+                backend_type: backend_type.to_string(),
+                backend_name: backend_type.to_string(),
+                backend_params: params
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| format!("setattr rpc: {e}"))?
+            .into_inner();
+        err_if(r.is_error, &r.error_payload, "mount_backend")
+    }
+
     pub async fn create_stream_cap(
         &mut self,
         path: &str,
@@ -736,6 +1035,51 @@ impl Vfs {
             .into_inner();
         err_if(r.is_error, &r.error_payload, "read")?;
         Ok(r.content)
+    }
+
+    /// The zone `path` ROUTED to, as the server resolved it — `None` if the
+    /// path does not exist.
+    ///
+    /// `stat_found` answers "is it there", which cannot distinguish a
+    /// replicated federation mount from the node-local `root` fallback: both
+    /// answer yes. Only the resolved zone separates them, and that difference
+    /// is the whole of "does this path replicate cross-machine".
+    pub async fn stat_zone(&mut self, path: &str, token: &str) -> Option<String> {
+        let r = self
+            .c
+            .stat(StatRequest {
+                path: path.to_string(),
+                auth_token: token.to_string(),
+                ..Default::default()
+            })
+            .await
+            .ok()?
+            .into_inner();
+        r.found.then_some(r.zone_id)
+    }
+
+    /// Typed `Delete`, returning `(success, entry_type)` — the two fields that separate
+    /// the outcomes #320 is about: `(Some(true), 1)` removed a directory,
+    /// `(Some(false), 0)` is the miss a client sees as 404, and an `Err` is a refusal
+    /// such as "Directory not empty".
+    pub async fn delete(
+        &mut self,
+        path: &str,
+        recursive: bool,
+        token: &str,
+    ) -> Result<(Option<bool>, u32), String> {
+        let r = self
+            .c
+            .delete(DeleteRequest {
+                path: path.to_string(),
+                auth_token: token.to_string(),
+                recursive,
+            })
+            .await
+            .map_err(|e| format!("delete rpc: {e}"))?
+            .into_inner();
+        err_if(r.is_error, &r.error_payload, "delete")?;
+        Ok((r.success, r.entry_type))
     }
 
     pub async fn stat_found(&mut self, path: &str, token: &str) -> bool {

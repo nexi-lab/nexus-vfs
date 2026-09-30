@@ -21,7 +21,6 @@ use crate::raft::{
     FullStateMachine, RaftConfig, RaftStorage, ReplicationLog, StateMachine, ZoneConsensus,
     ZonePersistence,
 };
-use crate::storage::RedbStore;
 use crate::transport::{
     ClientConfig, NodeAddress, PeerMap, RaftClientPool, SharedPeerMap, TlsConfig, TransportError,
     TransportLoop,
@@ -966,8 +965,7 @@ impl ZoneRaftRegistry {
         }
 
         // Open zone-specific redb + state machine
-        let store = RedbStore::open(persistence.sm_path())
-            .map_err(|e| TransportError::Connection(format!("Failed to open store: {}", e)))?;
+        let store = crate::transport::open_zone_store(persistence.sm_path())?;
         let raft_storage = RaftStorage::open(persistence.raft_path()).map_err(|e| {
             TransportError::Connection(format!("Failed to open raft storage: {}", e))
         })?;
@@ -1224,6 +1222,34 @@ impl ZoneRaftRegistry {
             return Some(entry.node.clone());
         }
         self.materialize(zone_id)
+    }
+
+    /// The federation zones this node PUBLISHES, as `(mount_path, zone_id)` sorted by
+    /// path — exactly what a peer's `DiscoverZones` receives.
+    ///
+    /// One implementation for the RPC and for the boot summary that tells an operator
+    /// what this node offers, so the log they read and the answer a joiner gets cannot
+    /// disagree. That divergence is not hypothetical: a founder logged an invitation
+    /// to "JoinZone here" while answering `DiscoverZones` with an empty list, and the
+    /// operator on the other end had no way to tell which was true.
+    ///
+    /// The source is the ROOT zone's DT_MOUNT entries, which is the contract worth
+    /// knowing: a zone is discoverable by being **mounted**, not by existing.
+    /// Founding one (`--cluster-init <zone>`) without mounting it
+    /// (`--cluster-init-mount <path>=<zone>`) publishes nothing.
+    ///
+    /// Empty is a legitimate steady state — a single-node daemon has nothing to
+    /// federate — so this is never an error here, only a fact a caller may report.
+    pub async fn published_federation_mounts(&self) -> Vec<(String, String)> {
+        let Some(root) = self.get_node(contracts::ROOT_ZONE_ID) else {
+            return Vec::new();
+        };
+        let mut mounts = root
+            .with_state_machine(|sm: &FullStateMachine| sm.iter_dt_mount_entries())
+            .await
+            .unwrap_or_default();
+        mounts.sort();
+        mounts
     }
 
     /// Slow path of [`Self::get_node`]: open a hosted-but-not-resident zone.
@@ -1526,6 +1552,28 @@ impl ZoneRaftRegistry {
     /// shutdown and diagnostics only.
     pub fn resident_zones(&self) -> Vec<String> {
         self.zones.iter().map(|e| e.key().clone()).collect()
+    }
+
+    /// Resident zones that have no leader.
+    ///
+    /// Answered here, in one pass over the resident map, because the two obvious ways
+    /// to assemble it outside are both wrong. `list_zones()` is the CATALOG, and
+    /// feeding it to `get_node` materializes every zone on the node — which is the
+    /// boot-cost sweep this design exists to remove, and `zone_boot_cost` catches it.
+    /// Pairing `resident_zones()` with a per-zone lookup is closer but still racy: a
+    /// zone can leave residency between the two calls, and the lookup would then open
+    /// it again.
+    ///
+    /// Residency is deliberately the scope. A catalogued-but-idle zone has no raft node
+    /// and therefore no leader, and reporting it as leaderless would describe a node
+    /// that is working perfectly as broken. A write to such a zone materializes it
+    /// first, so leadership is that path's concern.
+    pub fn resident_zones_without_leader(&self) -> Vec<String> {
+        self.zones
+            .iter()
+            .filter(|e| e.node.leader_id().is_none())
+            .map(|e| e.key().clone())
+            .collect()
     }
 
     /// Does this node host `zone_id`? Answers from the catalog WITHOUT

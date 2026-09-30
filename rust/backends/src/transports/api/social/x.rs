@@ -175,7 +175,7 @@ impl ObjectStore for XBackend {
         let body = serde_json::json!({ "text": text });
 
         self.runtime.block_on(async {
-            let client = reqwest::Client::new();
+            let client = crate::http::http_client();
             let result = Self::api_post(&client, &url, &token, &body).await?;
 
             let tweet_id = result
@@ -202,7 +202,7 @@ impl ObjectStore for XBackend {
         let (endpoint, param) = Self::resolve_path(content_id);
 
         self.runtime.block_on(async {
-            let client = reqwest::Client::builder()
+            let client = crate::http::http_client_builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .map_err(|e| {
@@ -342,7 +342,7 @@ impl ObjectStore for XBackend {
         let url = format!("{X_API_BASE}/tweets/{tweet_id}");
 
         self.runtime.block_on(async {
-            let client = reqwest::Client::new();
+            let client = crate::http::http_client();
             let resp = client
                 .delete(&url)
                 .header("Authorization", format!("Bearer {token}"))

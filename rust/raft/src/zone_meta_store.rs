@@ -719,14 +719,14 @@ mod tests {
     fn zone_key_to_global_maps_by_mount_point() {
         // Root (or empty) mount ⇒ identity.
         assert_eq!(
-            zone_key_to_global("/", "/win-ai/chat-with-me"),
-            "/win-ai/chat-with-me"
+            zone_key_to_global("/", "/win-ai/transcript"),
+            "/win-ai/transcript"
         );
         assert_eq!(zone_key_to_global("", "/x"), "/x");
         // A mounted zone prepends its mount point (no double slash).
         assert_eq!(
-            zone_key_to_global("/agents", "/win-ai/chat-with-me"),
-            "/agents/win-ai/chat-with-me"
+            zone_key_to_global("/agents", "/win-ai/transcript"),
+            "/agents/win-ai/transcript"
         );
         // The zone's own root key maps to the mount point itself.
         assert_eq!(zone_key_to_global("/agents", "/"), "/agents");

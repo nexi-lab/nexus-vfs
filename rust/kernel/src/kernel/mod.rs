@@ -145,6 +145,55 @@ pub enum KernelError {
     Federation(String),
 }
 
+/// The kernel's errors carry their own message.
+///
+/// They had only `Debug`, so every boundary invented a spelling and one of them
+/// invented `format!("{:?}")`: a client saw `IOError("Directory not empty: /ws/a")`
+/// — a Rust variant name wrapped around a quoted, escaped string — in a protocol
+/// message, while a variant that happened to have a hand-written arm got a sentence.
+/// The same fact spelled two ways depending on which arm existed (#350).
+///
+/// So the message is defined HERE, once, and a boundary decides only what it must:
+/// `map_kernel_err` picks the RPC code and takes the text from this impl. A new
+/// variant then cannot reach a client as a Debug dump — the worst it can do is land
+/// under a less specific code.
+///
+/// `IOError` renders its payload bare on purpose. Callers compose a whole sentence
+/// into it ("Directory not empty: /ws/a"), so a category prefix would read as
+/// "I/O error: Directory not empty: /ws/a" — noise in front of the fact.
+impl std::fmt::Display for KernelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidPath(m) => write!(f, "invalid path: {m}"),
+            Self::FileNotFound(p) => write!(f, "file not found: {p}"),
+            Self::FileExists(p) => write!(f, "file exists: {p}"),
+            Self::IOError(m) => write!(f, "{m}"),
+            Self::TrieError(m) => write!(f, "path trie error: {m}"),
+            Self::PipeFull(m) => write!(f, "pipe full: {m}"),
+            Self::PipeEmpty(m) => write!(f, "pipe empty: {m}"),
+            Self::PipeClosed(m) => write!(f, "pipe closed: {m}"),
+            Self::PipeExists(m) => write!(f, "pipe exists: {m}"),
+            Self::PipeNotFound(m) => write!(f, "pipe not found: {m}"),
+            Self::StreamFull(m) => write!(f, "stream full: {m}"),
+            Self::StreamEmpty(m) => write!(f, "stream empty: {m}"),
+            Self::StreamClosed(m) => write!(f, "stream closed: {m}"),
+            Self::StreamExists(m) => write!(f, "stream exists: {m}"),
+            Self::StreamNotFound(m) => write!(f, "stream not found: {m}"),
+            // The wording the wire already carried, kept verbatim: a reader that
+            // trimmed past resets to `earliest`, so both numbers are load-bearing.
+            Self::StreamTruncated(earliest, requested) => {
+                write!(f, "offset {requested} trimmed; earliest {earliest}")
+            }
+            Self::WouldBlock(m) => write!(f, "would block: {m}"),
+            Self::PermissionDenied(m) => write!(f, "permission denied: {m}"),
+            Self::BackendError(m) => write!(f, "backend error: {m}"),
+            Self::Federation(m) => write!(f, "federation: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for KernelError {}
+
 impl From<std::io::Error> for KernelError {
     fn from(e: std::io::Error) -> Self {
         KernelError::IOError(e.to_string())
@@ -589,10 +638,18 @@ pub struct Kernel {
     /// directly so kernel-internal callers keep the same shared runtime
     /// regardless of whether the host binary has installed the real
     /// peer client yet.
-    // `Option` so `Drop` can `take()` the Arc and hand it to an
-    // off-context thread — see the `Drop for Kernel` impl. `Some` for
-    // the entire observable lifetime of the kernel.
-    pub(crate) runtime: Option<Arc<tokio::runtime::Runtime>>,
+    // Built on FIRST USE, not at construction. The runtime serves peer
+    // RPCs and API-connector streaming; a kernel embedded over local
+    // storage alone performs neither, and paying two worker threads for
+    // it is what makes embedding a kernel in a short-lived process
+    // (a CLI invocation) cost more than it returns.
+    //
+    // `OnceLock` rather than an injected handle: it leaves the accessor's
+    // signature and every downstream type alone, so `RpcTransport`, the AI
+    // backends and `ObjectStoreProviderArgs` keep taking `Arc<Runtime>`.
+    // `take()` in `Drop` still moves the Arc to an off-context thread —
+    // see the `Drop for Kernel` impl.
+    pub(crate) runtime: std::sync::OnceLock<Arc<tokio::runtime::Runtime>>,
     // Shared tokio runtime — constructed once at Kernel::new and used by
     // every peer RPC (scatter-gather chunk fetch + federation remote
     // reads). Replaces the one-shot `Builder::new_current_thread()` inside
@@ -729,16 +786,6 @@ impl Kernel {
     #[allow(clippy::new_without_default)]
     #[allow(clippy::let_and_return)]
     pub fn new() -> Self {
-        // Kernel owns its tokio runtime — multi-thread, two workers
-        // sized for IO-bound peer RPCs.
-        let runtime = Arc::new(
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .thread_name("nexus-kernel-peer")
-                .enable_all()
-                .build()
-                .expect("failed to build kernel tokio runtime"),
-        );
         // The real peer_blob_client lives in
         // `transport::blob::peer_client`. Kernel boots with the no-op
         // fallback; the host binary wires the real impl via
@@ -784,7 +831,7 @@ impl Kernel {
             fdt: crate::fdt::FileDescriptorTable::new(),
             native_hooks: RwLock::new(NativeHookRegistry::new()),
             self_address: parking_lot::RwLock::new(None),
-            runtime: Some(runtime),
+            runtime: std::sync::OnceLock::new(),
             peer_client: parking_lot::RwLock::new(peer_client_dyn),
             distributed_coordinator: parking_lot::RwLock::new(
                 crate::hal::distributed_coordinator::NoopDistributedCoordinator::arc(),
@@ -1927,7 +1974,7 @@ impl Kernel {
                     // node never ran the local setattr) then gets a WalStreamCore
                     // over THIS node's zone metastore, so the mailbox is readable
                     // AND writable on every zone member — not only its creator.
-                    // Without this a peer sending to someone else's chat-with-me,
+                    // Without this a peer sending to someone else's message stream,
                     // or reading a mailbox created on the other machine, hits
                     // StreamNotFound. The inode already exists, so no re-write.
                     self.install_stream_backend(path, capacity, io_profile)?;
@@ -1987,7 +2034,7 @@ impl Kernel {
     /// `consistency`, backed by the metastore of the path's resolved zone.
     ///
     /// The stream MUST live in the PATH's zone, not hardcoded root: a
-    /// `chat-with-me` under a federation mount (`/agents=<zone>`) has to propose
+    /// `message stream` under a federation mount (`/agents=<zone>`) has to propose
     /// its `AppendStreamEntry` to THAT zone's raft so it replicates to peers.
     /// Backing it with root (node-local) would silently never cross machines.
     /// `route().zone_id` is the resolved destination zone (the routing SSOT) —
@@ -2198,7 +2245,7 @@ impl Kernel {
     #[allow(dead_code)]
     fn write_stream_inode(&self, path: &str, capacity: usize) -> Result<(), KernelError> {
         // The DT_STREAM inode MUST live in the PATH's routed zone, not a
-        // hardcoded root: a `chat-with-me` under a federation mount
+        // hardcoded root: a `message stream` under a federation mount
         // (`/agents=<zone>`) has to land in THAT zone's metastore so the inode
         // replicates to peers — the SAME zone `wal_backend_for` resolves for
         // the stream's content backend. Hardcoding root left the inode
@@ -2535,13 +2582,39 @@ impl Kernel {
     // ── Native INTERCEPT hook dispatch ────────────────────────────────
     // (Moved to `kernel::dispatch` submodule.)
 
-    /// Borrow the kernel's shared tokio runtime — kernel owns this Arc
-    /// directly; peer crates (backends LLM connectors, transport gRPC
-    /// server) clone it for their async work.
+    /// Borrow the kernel's shared tokio runtime, building it on first call.
+    ///
+    /// Kernel owns this Arc directly; peer crates (backends, LLM connectors,
+    /// the transport gRPC server) clone it for their async work.
+    ///
+    /// Deferred because the runtime is only needed once something async
+    /// actually happens — a federation read, a blob fetch, an API-connector
+    /// stream. A kernel embedded over local storage alone never reaches any
+    /// of those, and the two worker threads it would otherwise start at
+    /// construction are pure cost in a short-lived process.
+    ///
+    /// Multi-thread with two workers, sized for IO-bound peer RPCs.
     pub fn runtime(&self) -> &Arc<tokio::runtime::Runtime> {
-        self.runtime
-            .as_ref()
-            .expect("kernel runtime present for the Kernel's lifetime")
+        self.runtime.get_or_init(|| {
+            Arc::new(
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .thread_name("nexus-kernel-peer")
+                    .enable_all()
+                    .build()
+                    .expect("failed to build kernel tokio runtime"),
+            )
+        })
+    }
+
+    /// Whether the peer runtime has been built.
+    ///
+    /// Exists so a test can assert the deferral actually holds: a kernel that
+    /// only touched local storage must not have started worker threads, and
+    /// an assertion that cannot observe that would pass either way.
+    #[must_use]
+    pub fn peer_runtime_started(&self) -> bool {
+        self.runtime.get().is_some()
     }
 
     /// Replace the kernel's `peer_client` slot with a concrete
@@ -2823,6 +2896,12 @@ fn stream_mgr_err(e: crate::stream_manager::StreamManagerError) -> KernelError {
                 StreamError::Truncated(earliest, req) => {
                     KernelError::StreamTruncated(earliest, req)
                 }
+                // An append that did not commit is an I/O failure, NOT a closed
+                // stream: the reason travels verbatim so the client sees what
+                // happened instead of a Debug dump of the variant.
+                StreamError::NotReplicated(why) => {
+                    KernelError::IOError(format!("stream append did not commit: {why}"))
+                }
                 other => KernelError::IOError(format!("stream: {other:?}")),
             }
         }
@@ -2867,11 +2946,13 @@ impl Drop for Kernel {
         // (it panics: "Cannot drop a runtime in a context where blocking
         // is not allowed"). A `Kernel` can legitimately be dropped from
         // such a context — e.g. an `Arc<Kernel>` going out of scope at
-        // the end of a `#[tokio::test]` body. `runtime` is therefore an
-        // `Option`: `take()` it (leaving `None`, whose field-drop is a
-        // no-op) and drop the Arc on a dedicated OS thread, where the
-        // join is allowed. When it is the last ref, tokio shuts the
-        // workers down there.
+        // the end of a `#[tokio::test]` body. `take()` the Arc (leaving
+        // the cell empty, whose field-drop is a no-op) and drop it on a
+        // dedicated OS thread, where the join is allowed. When it is the
+        // last ref, tokio shuts the workers down there.
+        //
+        // `None` here is the ordinary case for a kernel that never went
+        // async: nothing was built, so there is nothing to wind down.
         if let Some(old) = self.runtime.take() {
             let _ = std::thread::Builder::new()
                 .name("nexus-kernel-rt-drop".into())
@@ -3000,6 +3081,52 @@ mod tests {
         assert!(validate_path_fast("/has\0null").is_err());
         assert!(validate_path_fast("/has/../traversal").is_err());
         assert!(validate_path_fast("/..").is_err());
+    }
+
+    #[test]
+    fn strict_zone_path_does_not_reinterpret_legacy_vfs_spellings() {
+        for path in ["//alias", "/a//b", "/a/", "/a/./b", "/a\\b"] {
+            assert!(validate_path_fast(path).is_ok(), "legacy path {path:?}");
+            assert!(
+                contracts::zone_path::validate_zone_path(path).is_err(),
+                "strict ZonePath unexpectedly accepted {path:?}"
+            );
+        }
+
+        for path in ["/", "/资料/café", "/literal/%2e%2e"] {
+            assert!(validate_path_fast(path).is_ok(), "legacy path {path:?}");
+            assert!(
+                contracts::zone_path::validate_zone_path(path).is_ok(),
+                "strict ZonePath unexpectedly rejected {path:?}"
+            );
+        }
+    }
+
+    /// A kernel that only touches local storage never starts the peer runtime.
+    ///
+    /// The runtime is two worker threads serving peer RPCs and API-connector
+    /// streams. Building it at construction charged every embedder for
+    /// federation they may never do — which is what makes putting a kernel
+    /// inside a short-lived process (a CLI invocation) cost more than it
+    /// returns. A full local write/read must therefore leave it unbuilt.
+    #[test]
+    fn local_only_work_does_not_start_the_peer_runtime() {
+        let k = kernel_with_root_backend();
+        let ctx = OperationContext::new("test", "root", true, None, true);
+        setattr(&k, "/local.txt", DT_REG as i32).unwrap();
+        k.sys_write_with_link_depth("/local.txt", &ctx, b"bytes", 0, 1)
+            .unwrap();
+        k.sys_read_single("/local.txt", &ctx, 1, 0, 0).unwrap();
+
+        assert!(
+            !k.peer_runtime_started(),
+            "a local write + read must not start the peer runtime"
+        );
+
+        // And it is still there when something actually needs it — deferred,
+        // not removed.
+        let _ = k.runtime();
+        assert!(k.peer_runtime_started());
     }
 
     #[test]
@@ -4009,7 +4136,7 @@ mod tests {
     }
 
     /// Regression: a DT_STREAM's owning zone follows the path's routing SSOT,
-    /// so a `chat-with-me` under a federation mount lands in the mount's TARGET
+    /// so a `message stream` under a federation mount lands in the mount's TARGET
     /// zone (replicates to peers), NOT hardcoded root (node-local). The bug this
     /// guards: `write_stream_inode` hardcoded `ROOT_ZONE_ID` while the parent
     /// dir + the wal content backend routed to the mount zone, so A2A mailboxes
@@ -4029,9 +4156,9 @@ mod tests {
         // resolver `write_stream_inode` (inode) and `wal_backend_for` (content)
         // both use, so inode and backend can't land in different zones.
         assert_eq!(
-            k.routed_zone_id("/agents/w2m/chat-with-me"),
+            k.routed_zone_id("/agents/w2m/transcript"),
             "sharedzone",
-            "a chat-with-me under a federation mount must own the mount's target zone"
+            "an A2A stream under a federation mount must own the mount's target zone"
         );
         assert_eq!(k.routed_zone_id("/agents"), "sharedzone");
         // An unmounted path stays node-local root (e.g. a /proc pipe-stream) —
@@ -4219,13 +4346,23 @@ mod tests {
         use crate::service_registry::{RustCallError, RustService};
         use std::sync::Arc;
 
+        /// Any caller: these tests are about method routing, not identity.
+        fn caller() -> contracts::OperationContext {
+            contracts::OperationContext::new("test", "root", false, None, false)
+        }
+
         struct EchoService;
 
         impl RustService for EchoService {
             fn name(&self) -> &str {
                 "echo"
             }
-            fn dispatch(&self, method: &str, payload: &[u8]) -> Result<Vec<u8>, RustCallError> {
+            fn dispatch(
+                &self,
+                method: &str,
+                payload: &[u8],
+                _ctx: &contracts::OperationContext,
+            ) -> Result<Vec<u8>, RustCallError> {
                 match method {
                     "echo" => Ok(payload.to_vec()),
                     _ => Err(RustCallError::NotFound),
@@ -4236,7 +4373,9 @@ mod tests {
         #[test]
         fn returns_none_for_unknown_service() {
             let k = Kernel::new();
-            assert!(k.dispatch_rust_call("nope", "any", b"{}").is_none());
+            assert!(k
+                .dispatch_rust_call("nope", "any", b"{}", &caller())
+                .is_none());
         }
 
         #[test]
@@ -4246,7 +4385,9 @@ mod tests {
             // Python entries should fall through (None) — caller hands
             // off to the Python `dispatch_method` path.
             let k = Kernel::new();
-            assert!(k.dispatch_rust_call("auth_service", "any", b"{}").is_none());
+            assert!(k
+                .dispatch_rust_call("auth_service", "any", b"{}", &caller())
+                .is_none());
         }
 
         #[test]
@@ -4259,7 +4400,7 @@ mod tests {
             )
             .unwrap();
             let out = k
-                .dispatch_rust_call("echo", "echo", b"hello")
+                .dispatch_rust_call("echo", "echo", b"hello", &caller())
                 .unwrap()
                 .unwrap();
             assert_eq!(out, b"hello");
@@ -4275,7 +4416,7 @@ mod tests {
             )
             .unwrap();
             let err = k
-                .dispatch_rust_call("echo", "nope", b"{}")
+                .dispatch_rust_call("echo", "nope", b"{}", &caller())
                 .unwrap()
                 .unwrap_err();
             assert!(matches!(err, RustCallError::NotFound));
@@ -4740,7 +4881,7 @@ mod tests {
                 Arc::new(TestFederationCoordinator::new()) as Arc<dyn DistributedCoordinator>
             );
             // Mount /proc so sys_stat / sys_read / sys_write can
-            // route to /proc/{pid}/chat-with-me. Production
+            // route to /proc/{pid}/transcript. Production
             // services::managed_agent::install_returning does the
             // same; the e2e test mirrors that fixture so the wal
             // stream the test writes to is reachable by readers.
@@ -4790,20 +4931,20 @@ mod tests {
             let bare = Arc::new(Kernel::new());
             bare.vfs_router
                 .add_mount("/proc", contracts::ROOT_ZONE_ID, None, false);
-            setattr(&bare, "/proc/p-wf/chat-with-me", "wal,memory")
+            setattr(&bare, "/proc/p-wf/transcript", "wal,memory")
                 .expect("wal,memory must fall through to memory without federation");
             let ctx = OperationContext::new("test", "root", true, None, true);
-            bare.sys_write_with_link_depth("/proc/p-wf/chat-with-me", &ctx, b"hi", 0, 1)
+            bare.sys_write_with_link_depth("/proc/p-wf/transcript", &ctx, b"hi", 0, 1)
                 .expect("memory stream write");
             let read = bare
-                .sys_read_single("/proc/p-wf/chat-with-me", &ctx, 1, 0, 0)
+                .sys_read_single("/proc/p-wf/transcript", &ctx, 1, 0, 0)
                 .expect("memory stream read");
             assert_eq!(read.data.expect("bytes").as_slice(), b"hi");
 
             // 2. No federation + bare "wal" → fail loud (audit's contract;
             //    a length-1 waterfall must NOT silently degrade to memory).
             assert!(
-                setattr(&bare, "/proc/p-wl/chat-with-me", "wal").is_err(),
+                setattr(&bare, "/proc/p-wl/transcript", "wal").is_err(),
                 "bare \"wal\" must error when federation is down",
             );
 
@@ -4811,7 +4952,7 @@ mod tests {
             //    (the wal round-trip itself is covered by
             //    sys_setattr_wal_stream_creates_inode_and_round_trips).
             let fed = fresh_federated_kernel();
-            setattr(&fed, "/proc/p-wf2/chat-with-me", "wal,memory")
+            setattr(&fed, "/proc/p-wf2/transcript", "wal,memory")
                 .expect("wal,memory must install the wal stream when federation is up");
         }
 
@@ -4832,7 +4973,7 @@ mod tests {
             // would surface here as a missing metastore wire-up or wrong
             // stream-backend type.
             let kernel = fresh_federated_kernel();
-            let path = "/proc/p-fed/chat-with-me";
+            let path = "/proc/p-fed/transcript";
 
             kernel
                 .sys_setattr(
@@ -4899,7 +5040,7 @@ mod tests {
             // exercise this on the memory branch; this test covers
             // the wal branch).
             let kernel = fresh_federated_kernel();
-            let path = "/proc/p-fed-2/chat-with-me";
+            let path = "/proc/p-fed-2/transcript";
             let ctx = OperationContext::new("test", "root", true, None, true);
 
             for _ in 0..2 {

@@ -26,14 +26,14 @@
 /// ## Non-obvious nuance (hard-won — do not "fix" this away)
 ///
 /// Root **legitimately hosts node-local durable (`wal`) DT_STREAMs**. The
-/// managed-agent mailbox `/proc/{pid}/chat-with-me` (a2a's
+/// managed-agent mailbox `/proc/{pid}/transcript` (a2a's
 /// `NODE_LOCAL_MAILBOX_PREFIX`) is a `wal` stream over root **by design**:
 /// durable + node-local, never meant to cross machines. So **"a `wal` stream
 /// must never live on root" is FALSE** — banning wal-over-root breaks `/proc`
 /// (kernel tests `sys_setattr_wal_stream_*` depend on it).
 ///
 /// The property that actually matters for cross-machine delivery: a
-/// **cross-machine A2A mailbox** (`*/chat-with-me` **not** under `/proc/`)
+/// **cross-machine A2A mailbox** (`*/transcript` **not** under `/proc/`)
 /// must resolve to a **federation zone** (replicated), never root — a mailbox
 /// on node-local root can never reach a peer. Because wal-over-root is
 /// legitimate for `/proc`, this is **not** a generic kernel/root invariant
@@ -44,8 +44,8 @@
 /// `plan_boot_action` returns `Resume` whenever `root` is already on disk,
 /// e.g. an offline `auth mint` created it, SKIPPING the `StaticFounder` arm),
 /// so `/agents` resolves to its replicated zone instead of silently falling
-/// back to root. `a2a`'s `is_a2a_mailbox_path` scopes only `from`-stamping,
-/// NOT mount enforcement.
+/// back to root. `a2a`'s `is_conversation_transcript_path` scopes only
+/// `from`-stamping and the cross-org allow-list, NOT mount enforcement.
 ///
 /// ## Deferred design option (note for a future, context-free reader)
 ///
@@ -76,14 +76,18 @@ pub const CONTROL_ZONE_ID: &str = "__control__";
 /// owner writes only under its own namespace; the state machine never parses
 /// the values. Registry here is the SSOT so two owners can never collide.
 ///
-/// `auth`       — API-key + agent-identity records (`raft::auth_key_store`).
-/// `foreign-ca` — cross-org trust anchors (cross-org substrate).
-/// `zone-ops`   — zone-mutation operation journal (`raft::zone_op_journal`).
-/// `zone-registry` — zone deletion epochs/tombstone registry (`raft::zone_deletion_registry`).
-/// `boot-sync`  — per-node boot catch-up markers (`profiles/cluster` boot).
+/// `auth`               — API-key + agent-identity records (`raft::auth_key_store`).
+/// `foreign-ca`         — cross-org trust anchors (cross-org substrate).
+/// `session-mint-allow` — agents permitted to mint session credentials for an
+///                        owner (`raft::session_mint_allow_store`).
+/// `zone-ops`           — zone-mutation operation journal (`raft::zone_op_journal`).
+/// `zone-registry`      — zone deletion epochs/tombstone registry (`raft::zone_deletion_registry`).
+/// `boot-sync`          — per-node boot catch-up markers (`profiles/cluster` boot).
 pub const CONTROL_NS_AUTH: &str = "auth";
 /// See [`CONTROL_NS_AUTH`].
 pub const CONTROL_NS_FOREIGN_CA: &str = "foreign-ca";
+/// See [`CONTROL_NS_AUTH`].
+pub const CONTROL_NS_SESSION_MINT_ALLOW: &str = "session-mint-allow";
 /// See [`CONTROL_NS_AUTH`].
 pub const CONTROL_NS_ZONE_OPS: &str = "zone-ops";
 /// See [`CONTROL_NS_AUTH`].
@@ -121,6 +125,23 @@ pub const VFS_ROOT: &str = "/";
 /// for zero-content inodes (DT_DIR, empty files). Mirrors the Python
 /// ``nexus.core.hash_utils.BLAKE3_EMPTY`` constant.
 pub const BLAKE3_EMPTY: &str = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
+
+/// Root of the flat, session-id-keyed session store (`/sessions/<sid>/`).
+///
+/// A session directory holds the transcript bytes and is keyed by session-id
+/// ALONE — no workspace hash, no nesting under the owning agent. The per-agent
+/// and per-repo ties are DT_LINK indexes plus an `owner` field, so isolation is
+/// policy rather than path (the agent-context storage matrix records this as
+/// the target shape, with `vfs_paths.py`'s agent-nested layout as the gap to
+/// migrate off).
+///
+/// Lives in `contracts` because it genuinely has no single owner crate: the
+/// bytes are written by the sudocode runtime (through its `FsBackend`'s
+/// `managed_sessions_root()`), while the prefix must be MOUNTED by the
+/// composition root at daemon boot for those bytes to replicate. Neither side
+/// owns the other, and `managed_agent` is not the owner either — it has no
+/// session-id concept at all (its AgentRegistry pid IS the session handle).
+pub const SESSIONS_BASE: &str = "/sessions";
 
 /// Kernel-reserved path prefix for internal system entries
 /// (mount table, ReBAC namespace store, ReBAC version store, zone

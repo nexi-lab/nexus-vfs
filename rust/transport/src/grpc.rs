@@ -319,31 +319,42 @@ impl VfsServiceImpl {
         authenticate_with(&self.auth, &self.ready, &self.foreign_ca_verifier, req).await
     }
 
+    /// Pick the RPC code; take the message from the error itself.
+    ///
+    /// This used to do both, and the message half ended in
+    /// `other => format!("{:?}", other)` — so a variant with a hand-written arm
+    /// reached a client as a sentence while every other one arrived as
+    /// `IOError("Directory not empty: /ws/a")`, Rust's internal vocabulary in a
+    /// protocol message (#350). Adding an arm per variant would have fixed the shape
+    /// by writing the kernel's messages a second time, here, where they would drift
+    /// from the ones the kernel logs.
+    ///
+    /// So `KernelError` owns its message (`Display`) and this decides only the code.
+    /// A variant nobody has classified yet still lands under `InternalError`, but it
+    /// can no longer arrive as a Debug dump — which is the part a client could not
+    /// parse and an operator could not read.
     pub(crate) fn map_kernel_err(&self, err: KernelError) -> (RpcErrorCode, String) {
-        match err {
-            KernelError::FileNotFound(p) => (RpcErrorCode::FileNotFound, p),
-            KernelError::PermissionDenied(m) => (RpcErrorCode::PermissionError, m),
-            KernelError::InvalidPath(m) => (RpcErrorCode::InvalidPath, m),
+        let code = match &err {
+            KernelError::FileNotFound(_) => RpcErrorCode::FileNotFound,
+            KernelError::PermissionDenied(_) => RpcErrorCode::PermissionError,
+            KernelError::InvalidPath(_) => RpcErrorCode::InvalidPath,
+            // A backend's own refusal wording is the only signal available for
+            // whether a storage failure was really an authorization one.
             KernelError::BackendError(m) => {
                 let lower = m.to_ascii_lowercase();
                 if lower.contains("permission")
                     || lower.contains("denied")
                     || lower.contains("read-only")
                 {
-                    (RpcErrorCode::PermissionError, m)
+                    RpcErrorCode::PermissionError
                 } else {
-                    (RpcErrorCode::InternalError, m)
+                    RpcErrorCode::InternalError
                 }
             }
-            KernelError::PipeClosed(m) | KernelError::StreamClosed(m) => {
-                (RpcErrorCode::InternalError, m)
-            }
-            KernelError::StreamTruncated(earliest, req) => (
-                RpcErrorCode::OffsetOutOfRange,
-                format!("offset {req} trimmed; earliest {earliest}"),
-            ),
-            other => (RpcErrorCode::InternalError, format!("{:?}", other)),
-        }
+            KernelError::StreamTruncated(..) => RpcErrorCode::OffsetOutOfRange,
+            _ => RpcErrorCode::InternalError,
+        };
+        (code, err.to_string())
     }
 
     /// DT_MOUNT (`entry_type == 2`) handler — bridge-2 (#4262).
@@ -386,9 +397,11 @@ impl VfsServiceImpl {
             ));
         }
 
-        // Networked object-store drivers the provider builds from the wire
-        // params, and the local-host drivers the host binary owns.
-        const PROVIDER_BUILT: [&str; 3] = ["s3", "gcs", "remote"];
+        // The local-host drivers the host binary owns. Which types the
+        // PROVIDER can build is deliberately NOT listed here — that answer is
+        // feature-dependent and belongs to the provider, which is asked below.
+        // A literal here said `["s3", "gcs", "remote"]`, so an LLM mount was
+        // refused in every build, including ones compiled to serve them.
         const LOCAL_HOST: [&str; 3] = ["path_local", "cas-local", "local_connector"];
 
         // Local-host backends (path_local / cas-local / local_connector) keep
@@ -431,21 +444,22 @@ impl VfsServiceImpl {
             }
             return synthetic_setattr_ack(&req);
         }
-        // Anything else that isn't a provider-built networked driver fails
-        // closed (connector / LLM / typo / version-skewed / future driver).
-        if !PROVIDER_BUILT.contains(&req.backend_type.as_str()) {
-            return error_setattr(Status::unimplemented(format!(
-                "DT_MOUNT backend_type {:?} is not supported by this server; \
-                 no mount was installed",
-                req.backend_type
-            )));
-        }
-
         let Some(provider) = get_provider() else {
             return error_setattr(Status::failed_precondition(
                 "no ObjectStoreProvider registered; cannot build DT_MOUNT backend",
             ));
         };
+
+        // Anything this build cannot construct fails closed (typo /
+        // version-skewed / a driver compiled out of this binary). Asked of the
+        // provider, so a slim build refuses `s3` and a `driver-ai` build
+        // accepts `openai`, with no list here to keep in step.
+        if !provider.can_build(&req.backend_type) {
+            return error_setattr(Status::unimplemented(format!(
+                "DT_MOUNT backend_type {:?} is not supported by this server;                  no mount was installed",
+                req.backend_type
+            )));
+        }
 
         // Build the opaque params map from the proto's `backend_params`.
         // The proto map is already `HashMap<String, String>` — pass
@@ -2538,6 +2552,13 @@ mod tests {
     struct FakeS3Provider;
 
     impl kernel::hal::object_store_provider::ObjectStoreProvider for FakeS3Provider {
+        /// Refuses exactly what `build` refuses. A double that claimed to
+        /// build everything would let the handler's gate pass anything and
+        /// these tests would stop proving the gate exists.
+        fn can_build(&self, backend_type: &str) -> bool {
+            backend_type == "s3"
+        }
+
         fn build(
             &self,
             args: &ObjectStoreProviderArgs<'_>,
@@ -2984,9 +3005,16 @@ mod tests {
         use kernel::PermissionProvider;
 
         // Mailbox-only stub: deny every mutating op (Write) outside a
-        // chat-with-me mailbox — the boundary ForeignAgentMailboxOnly enforces,
-        // reproduced here so the gate is exercised without pulling the a2a
-        // provider into a transport-tier test.
+        // conversation transcript — the boundary `ForeignAgentMailboxOnly`
+        // enforces, mirrored here so the gate is exercised without pulling the
+        // a2a provider across the crate-dependency boundary into a
+        // transport-tier test.
+        //
+        // Mirrored, so it must stay a mirror: `a2a::is_conversation_transcript_path`
+        // tests for the `/conversations/` SEGMENT and not the `/transcript`
+        // leaf alone, because a bare leaf would admit a session transcript or
+        // anything else a user names that way. A stub looser than the real gate
+        // would let this test pass on a path production refuses.
         struct MailboxOnlyStub;
         impl PermissionProvider for MailboxOnlyStub {
             fn check(
@@ -2996,7 +3024,9 @@ mod tests {
                 permission: Permission,
                 _ctx: &OperationContext,
             ) -> Result<(), KernelError> {
-                if matches!(permission, Permission::Write) && !path.contains("chat-with-me") {
+                let is_transcript =
+                    path.contains("/conversations/") && path.ends_with("/transcript");
+                if matches!(permission, Permission::Write) && !is_transcript {
                     return Err(KernelError::PermissionDenied(format!("contained: {path}")));
                 }
                 Ok(())
@@ -3030,7 +3060,7 @@ mod tests {
         // Create a DT_STREAM INSIDE the mailbox → the gate lets it through.
         let allowed = svc.setattr_typed(
             SetattrRequest {
-                path: "/chat-with-me".into(),
+                path: "/conversations/deadbeef/transcript".into(),
                 entry_type: 4,
                 capacity: 16,
                 ..Default::default()

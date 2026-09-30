@@ -47,6 +47,8 @@
 
 #![cfg(all(feature = "grpc", has_protos))]
 
+mod common;
+
 use nexus_raft::distributed_coordinator::bootstrap_or_join_zone;
 use nexus_raft::raft::RaftStorage;
 use nexus_raft::transport::NodeAddress;
@@ -62,10 +64,7 @@ const ZONE_ID: &str = "sharedzone";
 /// Pick a random unused TCP port on localhost so concurrent test
 /// invocations don't collide on the raft gRPC bind.
 fn ephemeral_bind_addr() -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind 0");
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    format!("127.0.0.1:{port}")
+    common::node_bind_addr()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

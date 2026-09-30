@@ -40,6 +40,10 @@
 #![allow(dead_code)]
 
 pub mod addressing;
+/// The single `reqwest::Client` constructor — see the module docs for why a
+/// connector must not build one directly.
+#[cfg(feature = "_http")]
+mod http;
 pub mod provider;
 pub mod storage;
 pub mod transports;

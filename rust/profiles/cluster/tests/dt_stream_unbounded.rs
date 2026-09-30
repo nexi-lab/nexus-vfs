@@ -315,18 +315,34 @@ async fn joiner_installs_snapshot_after_compaction_then_cold_reads() {
 
     // STEADY STATE (2-voter post-join replication). The joiner joined as a
     // learner and caught up via the snapshot above; the founder promotes it to a
-    // voter only once its log has caught up. Writing before that promotion
-    // commits races the 1→2-voter ConfChange — the enlarged quorum is briefly
-    // unreachable and the fail-loud wal push errors. Gate on the founder's
-    // "learner promoted to voter" log so the 2-voter quorum is live before we
-    // append: deterministic, and no client-side write retry (a retry could
-    // double-append a frame whose commit merely TIMED OUT — `WalStreamCore::push`
-    // reports a post-append commit timeout with the same "no reachable leader"
-    // text as a pre-commit rejection, so the client can't tell them apart).
+    // voter once its log has caught up. Appending before the enlarged quorum is
+    // live races the 1→2-voter ConfChange: quorum becomes 2, the new voter is not
+    // yet counting toward it, and the fail-loud wal push rejects the write. No
+    // client-side retry closes that — `WalStreamCore::push` reports a
+    // post-append commit TIMEOUT with the same "no reachable leader" text as a
+    // pre-commit rejection, so a retry could double-append a frame that did
+    // commit.
+    //
+    // So gate on both halves, each on the node that can actually witness it.
+    // The founder's promotion log says the ConfChange COMMITTED; it is emitted
+    // the moment `propose_conf_change` returns on the leader and says nothing
+    // about the joiner. The joiner's apply log is the half that matters for
+    // quorum — until it lands there, the joiner is a voter the leader is
+    // counting but that is not yet counting itself.
     founder
         .wait_for_log("caught-up learner promoted to voter", BUDGET)
         .await
-        .expect("founder MUST promote the caught-up joiner to voter (2-voter quorum live)");
+        .expect("founder MUST promote the caught-up joiner to voter");
+    // The count identifies the change, whichever way it arrives: the learner-add
+    // leaves it at 1 and the promotion raises it to 2, so a message-only match could
+    // pass on the wrong one. Both delivery paths report `voter_count` — an applied
+    // ConfChange entry and an installed snapshot — which is what makes this gate
+    // deterministic: the leader's choice between them depends on whether compaction
+    // has dropped the entry yet, and under load it has.
+    joiner
+        .wait_for_log("voter_count=2", BUDGET)
+        .await
+        .expect("joiner MUST have the 1→2-voter membership in force before the quorum is live");
 
     // Keep appending past ANOTHER compaction — the caught-up follower stays in
     // sync via ordinary replication (no snapshot needed), both logs stay bounded,

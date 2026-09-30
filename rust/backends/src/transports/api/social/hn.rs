@@ -170,7 +170,7 @@ impl HNBackend {
     /// Fetch a story by feed rank, with optional nested comments.
     fn fetch_story(&self, feed: &str, rank: usize) -> Result<Vec<u8>, StorageError> {
         self.runtime.block_on(async {
-            let client = reqwest::Client::builder()
+            let client = crate::http::http_client_builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .map_err(|e| {

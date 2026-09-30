@@ -20,7 +20,9 @@
 //! with `node_id: None`.
 
 use crate::auth::PeerIdentity;
-use lib::transport_primitives::authorship::{agent_name_from_x509, cert_signed_by};
+use lib::transport_primitives::authorship::{
+    agent_name_from_x509, cert_signed_by, owner_from_x509,
+};
 use lib::transport_primitives::ForeignCaAnchor;
 use nexus_raft::transport::parse_node_identity_uri;
 use tonic::transport::server::{TcpConnectInfo, TlsConnectInfo};
@@ -143,6 +145,9 @@ fn from_x509(cert: &x509_parser::certificate::X509Certificate) -> PeerIdentity {
     // cert are told apart identically here and at message-verify time. The
     // cert is a pure identity — there is no authorization extension to read.
     let agent_name = agent_name_from_x509(cert);
+    // A session credential also names who it acts for. Read the same way, from
+    // its own disjoint SAN authority, so an ordinary agent cert simply has none.
+    let owner = owner_from_x509(cert);
 
     // The serial is what a CRL revokes; carry it so the provider can reject a
     // revoked agent cert (the raw bytes match `certgen::serial_from_cert_pem`).
@@ -153,6 +158,7 @@ fn from_x509(cert: &x509_parser::certificate::X509Certificate) -> PeerIdentity {
         node_id,
         zone_id,
         agent_name,
+        owner,
         trust_domain: None,
         serial,
     }
@@ -241,10 +247,48 @@ fn chains_to(cert: &x509_parser::certificate::X509Certificate, ca_der: &[u8]) ->
     }
 }
 
+/// Classify a PEM-encoded certificate against a PEM-encoded cluster CA.
+///
+/// The PEM-taking face of [`classify_peer_cert`], for a caller that holds
+/// certificates as PEM — the wire and disk form — and would otherwise have to
+/// take a `pem` dependency to reach the DER one. The cluster profile keeps
+/// `pem` test-only so its shipped binary does not carry it.
+pub fn classify_peer_cert_pem(
+    cert_pem: &[u8],
+    ca_pem: &[u8],
+    foreign: &[ForeignCaAnchor],
+) -> Result<PeerIdentity, ClassifyError> {
+    let cert = ::pem::parse(cert_pem).map_err(|_| ClassifyError::Unparseable)?;
+    let ca = ::pem::parse(ca_pem).map_err(|_| ClassifyError::Unparseable)?;
+    classify_peer_cert(cert.contents(), ca.contents(), foreign)
+}
+
+/// The certificate's `notAfter` as a unix timestamp, or `None` if it does not
+/// parse. PEM in, for the same reason as [`classify_peer_cert_pem`].
+pub fn not_after_unix_from_pem(cert_pem: &[u8]) -> Option<i64> {
+    let pem = ::pem::parse(cert_pem).ok()?;
+    not_after_unix(pem.contents())
+}
+
+/// The certificate's `notAfter` as a unix timestamp, or `None` if it does not
+/// parse.
+///
+/// Recorded beside a revoked serial so the entry can be dropped once the
+/// certificate expires on its own — see `crl::prune_expired_serials`. Read from
+/// the certificate rather than taken from a request: the expiry that decides
+/// when revocation stops mattering must be the one the CA signed.
+pub fn not_after_unix(cert_der: &[u8]) -> Option<i64> {
+    use x509_parser::prelude::*;
+    let (_, cert) = X509Certificate::from_der(cert_der).ok()?;
+    Some(cert.validity().not_after.timestamp())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nexus_raft::transport::{generate_agent_cert, generate_node_cert, generate_zone_ca};
+    use nexus_raft::transport::{
+        generate_agent_cert, generate_node_cert, generate_session_agent_cert, generate_zone_ca,
+    };
 
     /// A real cert minted by certgen must round-trip through `from_der`
     /// with both its CN and its pinned node id — this is the contract
@@ -344,6 +388,32 @@ mod tests {
         assert_eq!(agent.agent_name.as_deref(), Some("win-ai"));
         assert_eq!(agent.trust_domain, None);
         assert_eq!(agent.display_id(), "agent/win-ai");
+    }
+
+    /// A session credential classifies as the agent it names AND carries the
+    /// owner it was signed for. An ordinary agent cert has no owner — that
+    /// difference is the whole basis for attributing a session's actions to a
+    /// person, so it is asserted from a real signed cert, not a struct literal.
+    #[test]
+    fn a_session_cert_classifies_as_an_agent_and_carries_its_owner() {
+        let (ca_pem, ca_key) = generate_zone_ca("root").unwrap();
+        let (session_pem, _) =
+            generate_session_agent_cert("session-3f2a", "alice", 2 * 60 * 60, &ca_pem, &ca_key)
+                .unwrap();
+        let (plain_pem, _) = generate_agent_cert("win-ai", &ca_pem, &ca_key).unwrap();
+        let cluster_ca = der(&ca_pem);
+
+        let session = classify_peer_cert(&der(&session_pem), &cluster_ca, &[])
+            .expect("a session cert is a local agent");
+        assert_eq!(session.agent_name.as_deref(), Some("session-3f2a"));
+        assert_eq!(session.owner.as_deref(), Some("alice"));
+        // It resolves down the ordinary agent path: same display shape, and
+        // never mistaken for a cluster node.
+        assert_eq!(session.display_id(), "agent/session-3f2a");
+        assert_eq!(session.node_id, None);
+
+        let plain = classify_peer_cert(&der(&plain_pem), &cluster_ca, &[]).expect("local agent");
+        assert_eq!(plain.owner, None, "an ordinary agent acts for itself");
     }
 
     /// A registered foreign CA's AGENT classifies FOREIGN: `trust_domain` set,

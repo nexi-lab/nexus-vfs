@@ -12,16 +12,40 @@
 //! calls) with identity fields. The kernel uses `zone_id` for
 //! routing; hooks use the full context.
 
+/// ## `user_id` is the principal; `agent_id` is the actor
+///
+/// They name two different things and are equal in the common case, which is
+/// what makes the distinction easy to lose:
+///
+/// * `user_id` — **on whose behalf** the operation runs. The one an audit
+///   trail attributes to.
+/// * `agent_id` — **who performed it**. `Some` only for an agent-initiated
+///   operation, and unforgeable: the A2A stamp hook binds an envelope's `from`
+///   to it, and the only way to hold one is to hold that agent's credential.
+///
+/// An agent acting for itself sets both to its own name, so `agent_id ==
+/// user_id`. A session credential — an agent minted to act for a person —
+/// sets `agent_id` to the session identity and `user_id` to its owner, so
+/// **`agent_id != user_id` is exactly the test for delegated action**, with no
+/// third field to keep in sync.
+///
+/// Do not add an `owner_id`. It would duplicate `user_id` for the delegated
+/// case and be meaningless for every other one, and two fields that must agree
+/// are two fields that can disagree.
 #[derive(Clone, Debug)]
 pub struct OperationContext {
-    /// Subject identity (human user or service account).
+    /// The principal this operation runs on behalf of — a human user, a
+    /// service account, or an agent acting for itself. See the type docs: this
+    /// is the attribution identity, distinct from `agent_id`, the actor.
     pub user_id: String,
     /// Routing zone — NexusFS instance zone for mount lookup
     /// (always set).
     pub zone_id: String,
     /// Admin privilege flag.
     pub is_admin: bool,
-    /// Agent identity (optional, for agent-initiated operations).
+    /// The acting agent (optional, for agent-initiated operations). Equal to
+    /// `user_id` when an agent acts for itself; different when it acts for
+    /// someone, which is the delegated case. See the type docs.
     pub agent_id: Option<String>,
     /// Cross-org trust domain for a FOREIGN agent, set by
     /// `classify_peer_cert`: `None` = domestic (a cluster-CA identity),

@@ -418,12 +418,24 @@ mod grpc_cluster {
             request_timeout: Duration::from_secs(2),
             ..Default::default()
         };
-        if connect_client("http://127.0.0.1:2126", probe_config)
-            .await
-            .is_err()
-        {
+        // All THREE, not just the first. A single reachable node is not this cluster:
+        // 2126 is also where a developer's own daemon listens — the cross-machine
+        // co-host duet runs there — so probing one port made this test proceed
+        // against an unrelated node and fail on the missing others. A skip gate has
+        // to ask for the topology it needs, or it is a gate that fires on the wrong
+        // thing and reads as a broken change.
+        let mut unreachable = Vec::new();
+        for port in [2126, 2127, 2128] {
+            if connect_client(&format!("http://127.0.0.1:{port}"), probe_config.clone())
+                .await
+                .is_err()
+            {
+                unreachable.push(port);
+            }
+        }
+        if !unreachable.is_empty() {
             eprintln!(
-                "Skipping Docker cluster test: no gRPC server at localhost:2126. \
+                "Skipping Docker cluster test: no gRPC server at {unreachable:?}. \
                  Start with: docker compose -f dockerfiles/docker-compose.cross-platform-test.yml up -d"
             );
             return;

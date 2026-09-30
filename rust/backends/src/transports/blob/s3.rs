@@ -72,7 +72,7 @@ impl S3Transport {
             .build()?;
         // Build the pooled client once. Keep idle connections warm so
         // back-to-back ops reuse the same TLS session to R2/S3.
-        let client = reqwest::Client::builder()
+        let client = crate::http::http_client_builder()
             .pool_max_idle_per_host(S3_POOL_MAX_IDLE_PER_HOST)
             .pool_idle_timeout(std::time::Duration::from_secs(S3_POOL_IDLE_TIMEOUT_SECS))
             .build()

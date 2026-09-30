@@ -95,6 +95,28 @@ pub fn agent_name_from_x509(cert: &x509_parser::certificate::X509Certificate) ->
         })
 }
 
+/// The `nexus://owner/{owner}` SAN of a parsed cert, if any — who a session
+/// agent acts for. `None` on an ordinary agent cert, which carries no owner.
+///
+/// Its own reader rather than a second return from [`agent_name_from_x509`]:
+/// the two SAN authorities are independent, and a function that answers one
+/// question is the thing callers can reason about. The cost is a second walk
+/// of a list with one or two entries, inside a caller that has already parsed
+/// the DER — the parse dominates.
+#[inline]
+pub fn owner_from_x509(cert: &x509_parser::certificate::X509Certificate) -> Option<String> {
+    use x509_parser::prelude::*;
+    cert.subject_alternative_name()
+        .ok()
+        .flatten()
+        .and_then(|san| {
+            san.value.general_names.iter().find_map(|gn| match gn {
+                GeneralName::URI(uri) => crate::agent_identity::parse_owner_uri(uri),
+                _ => None,
+            })
+        })
+}
+
 /// Whether `cert`'s signature verifies under `ca`'s public key — the single-hop
 /// chain check (a nexus cert is signed directly by its zone CA, no
 /// intermediates). The one definition of "does this cert chain to this CA",

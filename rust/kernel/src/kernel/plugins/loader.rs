@@ -51,6 +51,22 @@ const TRUSTED_KEY_FILES: &[&[u8]] = &[
         env!("CARGO_MANIFEST_DIR"),
         "/trusted_keys/kernel-dogfood-v1.pub"
     )),
+    // nexus-vfs's own release identity — signs the plugins released FROM this repo
+    // (search-plugin today). Minted here rather than reusing either key above,
+    // because neither privkey is reachable from this repo: nexus-team's lives only in
+    // the nexi-lab/nexus `PLUGIN_SIGNING_PRIVKEY` secret, which GitHub never returns,
+    // and kernel-dogfood-v1's is sealed in nexus's `data/vault-signing/keys.json`
+    // under a master key held the same way. A third root is the honest answer to
+    // "this repo cuts its own releases"; replacing either of the others would have
+    // invalidated every plugin already published under it.
+    //
+    // Consequence worth knowing: a plugin signed with this key loads on daemons built
+    // from a commit that contains the `.pub` — v0.7.21 onward — or on any daemon whose
+    // operator points `NEXUS_LOCAL_TRUSTED_KEYS_DIR` at a directory holding it.
+    include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/trusted_keys/nexus-vfs-release-v1.pub"
+    )),
 ];
 
 /// Environment variable that, when set, points at a directory of
@@ -406,7 +422,20 @@ impl RustService for DylibRustService {
         &self.svc_name
     }
 
-    fn dispatch(&self, method: &str, payload: &[u8]) -> Result<Vec<u8>, RustCallError> {
+    /// The caller context stops here.
+    ///
+    /// A dylib is reached across the plugin C ABI, which carries method name
+    /// and payload bytes and nothing else on the v1 dispatch symbol; a plugin
+    /// that wants the caller's identity exports the optional v7
+    /// `nexus_service_dispatch_v2` symbol (see [`Self::dispatch_with_context`]).
+    /// On this, the contextless v1 path, identity is dropped — stated rather
+    /// than silent.
+    fn dispatch(
+        &self,
+        method: &str,
+        payload: &[u8],
+        _ctx: &contracts::operation_context::OperationContext,
+    ) -> Result<Vec<u8>, RustCallError> {
         let method_c = CString::new(method)
             .map_err(|_| RustCallError::InvalidArgument("method contains null byte".to_string()))?;
         let mut out_buf: *mut u8 = std::ptr::null_mut();
@@ -432,7 +461,7 @@ impl RustService for DylibRustService {
         payload: &[u8],
     ) -> Result<Vec<u8>, RustCallError> {
         let Some(dispatch_v2_fn) = self.dispatch_v2_fn else {
-            return self.dispatch(method, payload);
+            return self.dispatch(method, payload, ctx);
         };
         let to_cstring = |value: &str, field: &str| {
             CString::new(value)

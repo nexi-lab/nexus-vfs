@@ -68,6 +68,12 @@ pub enum RaftError {
     #[error("transport error: {0}")]
     Transport(String),
 
+    /// A zone's on-disk store is held by another process — the payload is the store
+    /// path. Mirrors [`crate::transport::TransportError::DataDirLocked`] so the fact
+    /// survives the hop into this vocabulary; see that variant for why it is typed.
+    #[error("data dir already open by another process: {0}")]
+    DataDirLocked(String),
+
     /// `create_zone` was called for a zone that already exists with a
     /// different peer-address-book.  Idempotency holds when the
     /// requested address book matches the existing one (same set of
@@ -80,6 +86,42 @@ pub enum RaftError {
         actual: Vec<String>,
         requested: Vec<String>,
     },
+}
+
+impl RaftError {
+    /// Whether a failed proposal may nonetheless have been committed.
+    ///
+    /// Raft gives a client three outcomes, not two, and the third is the one that
+    /// gets lost: a request that was SENT and whose response never arrived has an
+    /// UNKNOWN outcome — the leader may have appended and committed it before the
+    /// connection broke or the deadline passed. Treating that as "it did not happen"
+    /// is how a retry duplicates a write, and treating it as success is worse.
+    ///
+    /// `NotLeader` is the opposite and is precise: a node that answers "I am not the
+    /// leader" has applied nothing, so a caller may retry elsewhere freely. Conflating
+    /// the two is what #342 observed from outside — a write reported as "not leader,
+    /// leader hint: None" whose value was readable immediately afterwards, because the
+    /// forward had reached the leader and only the reply was lost.
+    ///
+    /// A caller that cannot tolerate a duplicate must READ BACK before retrying when
+    /// this is true. One that is idempotent can simply retry.
+    #[must_use]
+    pub fn proposal_outcome_unknown(&self) -> bool {
+        match self {
+            // Sent, no answer: the leader may have committed it.
+            Self::Transport(_) | Self::Timeout(_) => true,
+            // raft-rs discards a proposal on a leadership change, and whether the
+            // previous leader had already replicated it is not knowable from here.
+            Self::ProposalDropped => true,
+            // Answered, and the answer was "not me" or an explicit rejection: nothing
+            // was applied by anyone on this path.
+            Self::NotLeader { .. } => false,
+            // Local faults that never reached consensus.
+            Self::Storage(_) | Self::Serialization(_) | Self::Config(_) => false,
+            // Everything else is a definite answer from the raft layer.
+            _ => false,
+        }
+    }
 }
 
 impl From<crate::storage::StorageError> for RaftError {
@@ -247,5 +289,37 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         );
+    }
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::RaftError;
+
+    #[test]
+    fn a_lost_answer_leaves_the_outcome_unknown() {
+        // Sent, no reply: the leader may have committed it. This is the case #342
+        // observed — reported as a refusal, readable a moment later.
+        assert!(RaftError::Transport("connection reset".into()).proposal_outcome_unknown());
+        assert!(RaftError::Timeout(5).proposal_outcome_unknown());
+        assert!(RaftError::ProposalDropped.proposal_outcome_unknown());
+    }
+
+    #[test]
+    fn a_refusal_is_a_definite_no() {
+        // Someone answered "not me", so nothing was applied on this path and a caller
+        // may retry elsewhere without reading back first.
+        assert!(!RaftError::NotLeader { leader_hint: None }.proposal_outcome_unknown());
+        assert!(!RaftError::NotLeader {
+            leader_hint: Some("10.0.0.2:2126".into())
+        }
+        .proposal_outcome_unknown());
+    }
+
+    #[test]
+    fn a_local_fault_never_reached_consensus() {
+        assert!(!RaftError::Storage("redb closed".into()).proposal_outcome_unknown());
+        assert!(!RaftError::Config("bad peer".into()).proposal_outcome_unknown());
+        assert!(!RaftError::Serialization("bincode".into()).proposal_outcome_unknown());
     }
 }

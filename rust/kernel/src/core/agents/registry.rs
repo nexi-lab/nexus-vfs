@@ -565,6 +565,16 @@ impl AgentRegistry {
         self.agents.get(pid).map(|r| r.clone())
     }
 
+    /// The agent name a pid belongs to.
+    ///
+    /// [`Self::get`] clones the whole descriptor — repos vector, labels map,
+    /// several owned strings — which is the wrong price for reading one field
+    /// on a per-write hook path. This clones the name alone, and holds the
+    /// DashMap ref only for that.
+    pub fn name_of(&self, pid: &str) -> Option<String> {
+        self.agents.get(pid).map(|r| r.name.clone())
+    }
+
     /// Update state with VALID_AGENT_TRANSITIONS validation, also setting the
     /// `AwaitingInput` reason (agent-reported, opaque). `reason` is stored only
     /// when `new_state == AwaitingInput`; every other transition clears it, so

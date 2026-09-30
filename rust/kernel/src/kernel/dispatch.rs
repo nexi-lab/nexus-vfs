@@ -71,7 +71,7 @@ impl Kernel {
     /// Like [`Self::dispatch_native_pre`] but returns the
     /// `HookOutcome::Replace` payload so callers can substitute write
     /// content at the EXECUTE phase. `sys_write` is the only consumer
-    /// today — `MailboxStampingHook` (registered for `*/chat-with-me`)
+    /// today — `MailboxStampingHook` (registered for `*/transcript`)
     /// rewrites the envelope's `from` field through this path, and the
     /// caller passes `replacement.unwrap_or(content)` into DT_STREAM
     /// push / DT_FILE backend write. Empty registry returns
@@ -90,7 +90,7 @@ impl Kernel {
     }
 
     /// Returns true when at least one registered hook declared a
-    /// `mutating_path_suffix` that matches `path`. `sys_write` uses
+    /// `mutating_path_suffixes` that matches `path`. `sys_write` uses
     /// this as a clone gate: only when a mutating hook matches does the
     /// dispatcher clone the write content into `WriteHookCtx`. The
     /// steady-state path (no mutating hooks) returns false on the
@@ -584,6 +584,7 @@ impl Kernel {
         name: &str,
         method: &str,
         payload: &[u8],
+        ctx: &OperationContext,
     ) -> Option<Result<Vec<u8>, crate::service_registry::RustCallError>> {
         // Built-in kernel plugin management (§10). Handled before
         // ServiceRegistry lookup so plugin.* methods are always
@@ -592,7 +593,7 @@ impl Kernel {
             return Some(self.dispatch_plugin_call(None, method, payload));
         }
         let svc = self.service_registry.lookup_rust(name)?;
-        Some(svc.dispatch(method, payload))
+        Some(svc.dispatch(method, payload, ctx))
     }
 
     /// Dispatch a JSON-encoded RPC to a Rust service with caller credentials.

@@ -1429,15 +1429,27 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             .await
             {
                 Ok(result) => Ok(result),
+                // Propagated as a TRANSPORT failure, not rewritten to `NotLeader`.
+                // The request was sent; what is missing is the answer. The leader may
+                // have appended and committed it before the connection broke, so the
+                // outcome is UNKNOWN — see `RaftError::proposal_outcome_unknown`.
+                //
+                // Rewriting it to `NotLeader` told the caller two false things: that
+                // nothing was applied, and that the reason was leadership. #342 is
+                // what that looks like from outside — a write reported as
+                // `not leader, leader hint: None` whose value read back fine a moment
+                // later, and a client that gave up on the rest of its sequence
+                // believing the first step had not happened.
                 Err(RaftError::Transport(e)) => {
                     tracing::warn!(
                         leader_node_id = leader_id,
                         leader_addr = %leader_addr.to_operator_str(),
                         zone = %ctx.zone_id,
-                        "Forward to leader failed (unreachable?): {}",
+                        "Forward to leader failed after the proposal was sent — the \
+                         outcome is UNKNOWN, it may have committed: {}",
                         e,
                     );
-                    Err(RaftError::NotLeader { leader_hint: None })
+                    Err(RaftError::Transport(e))
                 }
                 Err(e) => Err(e),
             };
@@ -1933,10 +1945,18 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         // 1. Handle snapshot (received from leader during catch-up / join)
         if !ready.snapshot().is_empty() {
             let snapshot = ready.snapshot();
+            // A snapshot puts a ConfState in force on this node exactly as applying a
+            // ConfChange entry does, so it reports membership in the SAME shape —
+            // `voter_count` beside `voters`. A joiner receives its own promotion by
+            // whichever path the leader picks (an entry if the log still holds it, a
+            // snapshot once compaction has dropped it), and that choice is a race:
+            // without this field, an observer waiting for "membership is 2 voters"
+            // passes or hangs depending on how loaded the machine is.
             tracing::info!(
                 index = snapshot.get_metadata().index,
                 term = snapshot.get_metadata().term,
                 voters = ?snapshot.get_metadata().get_conf_state().voters,
+                voter_count = snapshot.get_metadata().get_conf_state().voters.len(),
                 "Applying snapshot from leader"
             );
             self.raw_node
@@ -2264,11 +2284,22 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                         }
                     }
 
+                    // Emitted on EVERY node that applies the entry, not only the
+                    // proposer — a membership change is in force where it has been
+                    // applied. The leader returning from `propose_conf_change` says
+                    // the change COMMITTED; it says nothing about whether a new
+                    // voter is counting toward quorum on its own node yet.
+                    //
+                    // `voter_count` carries the part `voters` makes a reader count
+                    // by hand, and it is what distinguishes the two changes a join
+                    // performs: adding a learner leaves the voter count alone,
+                    // promoting one raises it, and only the second moves quorum.
                     tracing::info!(
                         index = entry.index,
                         change_type = ?cc.get_change_type(),
                         peer_node_id = cc.node_id,
                         voters = ?cs.voters,
+                        voter_count = cs.voters.len(),
                         "raft.conf_change.applied",
                     );
                     sm.apply(entry.index, &Command::Noop)?;
@@ -2317,6 +2348,15 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                         .mut_store()
                         .set_conf_state(&cs)
                         .map_err(|e| RaftError::Storage(e.to_string()))?;
+                    // Same signal as the V1 arm — see its comment. The V2 arm
+                    // had none, so a joint change applied silently.
+                    tracing::info!(
+                        index = entry.index,
+                        num_changes = cc.changes.len(),
+                        voters = ?cs.voters,
+                        voter_count = cs.voters.len(),
+                        "raft.conf_change.applied",
+                    );
                     // Membership changed → refresh the stored snapshot (see V1 arm).
                     self.membership_changed_since_snapshot = true;
 

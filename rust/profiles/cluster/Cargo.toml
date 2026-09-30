@@ -17,6 +17,42 @@ path = "src/main.rs"
 [features]
 default = []
 
+# Model egress through the VFS: mount an LLM connector, and a model call
+# becomes a write that crosses `Kernel::apply_mutating_write_hooks` — the one
+# seam every write syscall funnels through — instead of leaving the process as
+# outbound HTTP no hook can see.
+#
+# OFF by default, and the reason is measured rather than assumed. These
+# connectors speak HTTP, so they pull reqwest and the client side of hyper:
+# the slim binary goes from 16,474,112 to 17,897,984 bytes on the size-gated
+# Windows build, **+1.36 MiB** (both measured at this commit — main moves, so
+# a pair from two different commits is not a delta). Roughly 700 KiB of that is existing crates
+# (hyper, h2, hyper-util) growing as reqwest instantiates client paths that
+# were never compiled before, ~280 KiB is genuinely new code, and ~380 KiB is
+# the Unicode tables `url` -> `idna` -> ICU4X brings for hostname parsing.
+#
+# It was +2.75 MiB until reqwest stopped bundling its own crypto provider
+# beside the `ring` this binary already links; that half is gone and is not
+# coming back, so do not re-measure it from the old figure.
+#
+# What remains is the same "connector HTTP stack" the backends dep above drops
+# on purpose to hold the sudowork target size, so switching it on for every
+# deployment to serve the ones that mount a model would be the wrong default.
+#
+# A tier that wants model calls inside the hook seam builds
+# `--features driver-ai`, exactly as an S3-serving tier builds
+# `--features driver-s3`.
+# `llm-mount` comes with it, not separately: the connectors are what a model
+# call goes THROUGH, and this is what makes one happen. Compiling the drivers
+# without the driver would leave a mount that accepts a request and never
+# answers — the state this tree was already in, and the one the feature exists
+# to end.
+driver-ai = [
+    "backends/driver-anthropic",
+    "backends/driver-openai",
+    "dep:llm-mount",
+]
+
 [dependencies]
 # raft owns federation orchestration (ZoneManager, bootstrap_tls, etc.).
 # Only the grpc feature — that is all this binary needs and dropping the
@@ -30,6 +66,9 @@ contracts = { workspace = true }
 # HTTP stack so the binary stays at the sudowork target size.
 kernel = { workspace = true }
 backends = { workspace = true, default-features = false, features = ["driver-path-local", "driver-remote"] }
+# Drives an LLM mount (see `driver-ai`). Optional so a default build neither
+# compiles it nor registers its hook.
+llm-mount = { workspace = true, optional = true }
 # VFS gRPC server (port 2028) + auth provider (NoAuth — mTLS is the
 # cluster-internal authentication boundary). Cluster binary never pulls
 # the services post-syscall-hooks tier — keep the dep set minimal.
@@ -73,7 +112,8 @@ gethostname = "1.1"
 [dev-dependencies]
 # wire_durable_metastore tests open real redb files in a temp data dir.
 tempfile = "3"
-# The e2e harness encodes generic-`Call` JSON params (agent-trust tests).
+# The e2e harness encodes generic-`Call` JSON params (agent-trust tests),
+# and the live LLM test builds a chat-completion request body. Test-only.
 serde_json = { workspace = true }
 # The remote agent-mint gate test parses minted cert PEM to DER to feed
 # `peer_identity::from_der`. Test-only, so the shipped binary carries no pem dep.

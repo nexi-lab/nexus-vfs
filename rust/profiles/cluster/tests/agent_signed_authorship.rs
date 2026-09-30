@@ -31,12 +31,35 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{cli, free_port, write_tls_bundle, Daemon, Vfs, LOG_FILTER};
+use common::{agent_credential, cli, free_port, write_tls_bundle, Daemon, Vfs, LOG_FILTER};
 use lib::transport_primitives::authorship::{open, seal};
 use nexus_raft::transport::{generate_agent_cert, generate_join_token, generate_zone_ca};
 
 const ZONE: &str = "sharedzone";
 const MOUNT: &str = "/agents";
+
+/// The transcript of the conversation between `a` and `b`, under this
+/// test's mount.
+///
+/// Built through the a2a address SSOT rather than spelled out: the stamp
+/// hook decides what it claims from the same constants, so a layout change
+/// that would un-stamp these writes breaks the test instead of silently
+/// making it prove nothing.
+fn transcript(a: &str, b: &str) -> String {
+    format!(
+        "{MOUNT}{}",
+        a2a::conversation_transcript_path(&a2a::conversation_id(a, b))
+    )
+}
+
+/// The directory holding that conversation, which the transcript hangs off.
+fn conversation_dir(a: &str, b: &str) -> String {
+    format!(
+        "{MOUNT}{}/{}",
+        a2a::CONVERSATIONS_BASE,
+        a2a::conversation_id(a, b)
+    )
+}
 const SECRET: &str = "e2e-signed-authorship-secret";
 const BUDGET: Duration = Duration::from_secs(120);
 
@@ -95,12 +118,13 @@ async fn from_is_unforgeable_across_trust_domains_via_signed_cert() {
     );
     assert!(ok, "agent mint failed: {err}");
     let bundle = std::path::PathBuf::from(bundle_dir.trim());
-    let agent_cert = std::fs::read(bundle.join("agent.pem")).expect("read agent.pem");
-    let agent_key = std::fs::read(bundle.join("agent-key.pem")).expect("read agent-key.pem");
-    let bundle_ca = std::fs::read(bundle.join("ca.pem")).expect("read ca.pem");
-    // The bundle's ca.pem is the very CA we bootstrapped — the agent trusts the
+    let cred = agent_credential(&bundle);
+    // The credential's CA is the very CA we bootstrapped — the agent trusts the
     // server through it, and we open the envelope against it below.
-    assert_eq!(bundle_ca, ca, "the minted bundle ships the cluster CA");
+    assert_eq!(
+        cred.ca_pem, ca,
+        "the minted credential ships the cluster CA"
+    );
 
     // ── 3. RESTART TLS-on; win-ai connects on the mTLS plane with its cert ──
     let mut founder = Daemon::spawn(&["--bind-addr", &bind], &env);
@@ -108,19 +132,22 @@ async fn from_is_unforgeable_across_trust_domains_via_signed_cert() {
         .wait_for_log(&zone_registered, BUDGET)
         .await
         .expect("founder resumes sharedzone");
-    let mut c = Vfs::connect_mtls(port, &ca, &agent_cert, &agent_key, BUDGET).await;
+    let mut c = Vfs::connect_as_agent(port, &cred, BUDGET).await;
 
     // ── 4-5. SEAL → write → read → OPEN: `from` is a VERIFIED win-ai ────────
-    c.mkdir(&format!("{MOUNT}/win-ai"), "")
+    c.mkdir(&format!("{MOUNT}{}", a2a::CONVERSATIONS_BASE), "")
         .await
-        .expect("win-ai makes its own dir");
-    let mailbox = format!("{MOUNT}/win-ai/chat-with-me");
+        .ok();
+    c.mkdir(&conversation_dir("win-ai", "peer"), "")
+        .await
+        .expect("win-ai opens its conversation");
+    let mailbox = transcript("win-ai", "peer");
     c.create_stream(&mailbox, "")
         .await
         .expect("win-ai opens its mailbox");
 
     let body = b"hello from a signed agent";
-    let sealed = seal("win-ai", body, &agent_key, &agent_cert).expect("seal");
+    let sealed = seal("win-ai", body, &cred.key_pem, &cred.cert_pem).expect("seal");
     c.stream_write(&mailbox, &sealed, "")
         .await
         .expect("write the sealed envelope");
@@ -148,10 +175,13 @@ async fn from_is_unforgeable_across_trust_domains_via_signed_cert() {
     )
     .expect("seal forged");
 
-    c.mkdir(&format!("{MOUNT}/forge"), "")
+    c.mkdir(&format!("{MOUNT}{}", a2a::CONVERSATIONS_BASE), "")
+        .await
+        .ok();
+    c.mkdir(&conversation_dir("forge", "peer"), "")
         .await
         .expect("mk forge dir");
-    let forge_mbox = format!("{MOUNT}/forge/chat-with-me");
+    let forge_mbox = transcript("forge", "peer");
     c.create_stream(&forge_mbox, "")
         .await
         .expect("open forge mailbox");
@@ -172,10 +202,13 @@ async fn from_is_unforgeable_across_trust_domains_via_signed_cert() {
     // The same-domain floor: win-ai authenticated over mTLS, so the kernel
     // stamps `from` to the authenticated agent_id regardless of what the
     // (unsigned) envelope claimed. A client that does not seal is still caught.
-    c.mkdir(&format!("{MOUNT}/stamp"), "")
+    c.mkdir(&format!("{MOUNT}{}", a2a::CONVERSATIONS_BASE), "")
+        .await
+        .ok();
+    c.mkdir(&conversation_dir("stamp", "peer"), "")
         .await
         .expect("mk stamp dir");
-    let stamp_mbox = format!("{MOUNT}/stamp/chat-with-me");
+    let stamp_mbox = transcript("stamp", "peer");
     c.create_stream(&stamp_mbox, "")
         .await
         .expect("open stamp mailbox");
@@ -279,8 +312,7 @@ async fn signed_from_replicates_and_verifies_on_a_peer_node() {
     );
     assert!(ok, "agent mint failed: {err}");
     let bundle = std::path::PathBuf::from(bundle_dir.trim());
-    let agent_cert = std::fs::read(bundle.join("agent.pem")).expect("read agent.pem");
-    let agent_key = std::fs::read(bundle.join("agent-key.pem")).expect("read agent-key.pem");
+    let cred = agent_credential(&bundle);
 
     let mut founder = Daemon::spawn(&["--bind-addr", &fbind], &founder_env);
     founder
@@ -295,8 +327,8 @@ async fn signed_from_replicates_and_verifies_on_a_peer_node() {
 
     // The SAME cert authenticates win-ai on either node (both anchor the shared
     // CA): it writes on the founder, reads on the joiner.
-    let mut wc = Vfs::connect_mtls(fport, &ca, &agent_cert, &agent_key, BUDGET).await;
-    let mut rc = Vfs::connect_mtls(jport, &ca, &agent_cert, &agent_key, BUDGET).await;
+    let mut wc = Vfs::connect_as_agent(fport, &cred, BUDGET).await;
+    let mut rc = Vfs::connect_as_agent(jport, &cred, BUDGET).await;
 
     let dump = |founder: &Daemon, joiner: &Daemon| {
         let tail = |s: String| {
@@ -339,11 +371,11 @@ async fn signed_from_replicates_and_verifies_on_a_peer_node() {
 
     // ── SIGN on the founder → replicate → OPEN on the joiner ────────────────
     let body = b"cross-node signed hello";
-    let sealed = seal("win-ai", body, &agent_key, &agent_cert).expect("seal");
+    let sealed = seal("win-ai", body, &cred.key_pem, &cred.cert_pem).expect("seal");
     let replicated = round_trip(
         &mut wc,
         &mut rc,
-        &format!("{MOUNT}/win-ai/chat-with-me"),
+        &transcript("win-ai", "peer"),
         &sealed,
         BUDGET,
     )
@@ -373,7 +405,7 @@ async fn signed_from_replicates_and_verifies_on_a_peer_node() {
     let forged_replicated = round_trip(
         &mut wc,
         &mut rc,
-        &format!("{MOUNT}/forge/chat-with-me"),
+        &transcript("forge", "peer"),
         &forged,
         BUDGET,
     )
