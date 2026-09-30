@@ -15,8 +15,12 @@
 //! `mark_deleted` takes `max(previous + 1, now_ms)` so an epoch is both
 //! monotone per zone and comparable against the local `.creation-epoch`
 //! wall-clock the boot check uses. Deliberately NOT provided: any
-//! restore/un-delete method — R12 has no recovery requirement, and a
-//! recreate is a later explicit work item, not a dead-code path.
+//! restore/un-delete method — R12 has no recovery requirement. The escape
+//! hatch (`NEXUS_FORCE_DELETED_ZONE_RECREATE`, set by `nexusd-cluster
+//! --force`) covers recovery WITHOUT one: the guard that re-founds the zone
+//! also bumps the local `.creation-epoch`, so the fresh epoch outranks the
+//! recorded deletion epoch and normal boots resume the zone — the epoch
+//! ordering IS the recovery semantics, no un-delete API needed.
 
 use contracts::CONTROL_NS_ZONE_REGISTRY;
 
@@ -109,6 +113,30 @@ impl ZoneDeletionRegistry {
         }
     }
 
+    /// The recorded deletion info, with store errors PROPAGATED (no
+    /// best-effort degradation). For the RPC-facing paths (typed zone
+    /// runtime): by the time an RPC is answered the control zone is resident
+    /// and serving, so a store error is a real fault the caller must see,
+    /// not a "no record" answer — the fail-closed intent the best-effort
+    /// variants below cannot express.
+    pub fn deletion_info_checked(
+        &self,
+        zone_id: &str,
+    ) -> Result<Option<DeletedZoneInfo>, String> {
+        match self.store.get(&Self::key(zone_id)) {
+            Ok(None) => Ok(None),
+            Ok(Some(bytes)) => {
+                let record: DeletedRecord = serde_json::from_slice(&bytes)
+                    .map_err(|e| format!("deletion record decode for '{zone_id}': {e}"))?;
+                Ok(Some(DeletedZoneInfo {
+                    deletion_epoch: record.deletion_epoch,
+                    deleted_at_ms: record.deleted_at_ms,
+                }))
+            }
+            Err(e) => Err(format!("deletion registry read for '{zone_id}': {e}")),
+        }
+    }
+
     /// The recorded deletion epoch, if the zone was deprovisioned.
     pub fn deletion_epoch(&self, zone_id: &str) -> Result<Option<u64>, String> {
         match self.store.get(&Self::key(zone_id)) {
@@ -125,6 +153,22 @@ impl ZoneDeletionRegistry {
                 tracing::warn!(zone = %zone_id, error = %e, "deletion registry read failed");
                 Ok(None)
             }
+        }
+    }
+
+    /// The recorded deletion epoch, with store errors PROPAGATED. The
+    /// RPC-facing counterpart of [`Self::deletion_epoch`] — see
+    /// [`Self::deletion_info_checked`] for why the typed zone runtime must
+    /// not silently degrade a live store fault to "not deleted".
+    pub fn deletion_epoch_checked(&self, zone_id: &str) -> Result<Option<u64>, String> {
+        match self.store.get(&Self::key(zone_id)) {
+            Ok(None) => Ok(None),
+            Ok(Some(bytes)) => {
+                let record: DeletedRecord = serde_json::from_slice(&bytes)
+                    .map_err(|e| format!("deletion record decode for '{zone_id}': {e}"))?;
+                Ok(Some(record.deletion_epoch))
+            }
+            Err(e) => Err(format!("deletion registry read for '{zone_id}': {e}")),
         }
     }
 

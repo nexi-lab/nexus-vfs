@@ -100,10 +100,14 @@ impl ZoneRuntimeBackend {
     /// deleted zone id is refused (recreate is a later explicit work
     /// item, not a silent side effect of a stale retry).
     fn refuse_if_deleted(&self, zone_id: &str) -> Result<(), ZoneRuntimeError> {
-        match self.deletions.deletion_epoch(zone_id) {
+        // Checked variant — store errors propagate, not degrade to "not
+        // deleted": by the time an RPC is answered the control zone is
+        // resident, so a store fault is a real failure the caller must see.
+        match self.deletions.deletion_epoch_checked(zone_id) {
             Ok(Some(epoch)) => Err(ZoneRuntimeError::Conflict(format!(
-                "zone '{zone_id}' was deprovisioned (deletion epoch {epoch}); creating it \
-                 again requires an explicit recovery procedure"
+                "zone '{zone_id}' was deprovisioned (deletion epoch {epoch}); re-creating it \
+                 requires an operator-supervised recovery (founder boot with --force / \
+                 NEXUS_FORCE_DELETED_ZONE_RECREATE)"
             ))),
             Ok(None) => Ok(()),
             Err(e) => Err(ZoneRuntimeError::Internal(format!(
@@ -167,6 +171,16 @@ impl ZoneRuntimeBackend {
         let header = require_header(req.mutation.as_ref())?;
         validate_zone_id_for(ZoneIdUse::RemoteLearned, &req.zone_id)
             .map_err(|e| ZoneRuntimeError::Invalid(format!("zone_id: {e}")))?;
+        // The RemoteLearned projection admits reserved ids (a remote peer
+        // legitimately reports `root`/`__control__` existing) — but THIS
+        // surface is an operator RPC, and joining a reserved zone through
+        // it is never valid (boot joins them internally, not via RPC).
+        if contracts::RESERVED_ZONE_IDS.contains(&req.zone_id.as_str()) {
+            return Err(ZoneRuntimeError::Conflict(format!(
+                "zone '{}' is reserved and cannot be joined via the zone runtime surface",
+                req.zone_id
+            )));
+        }
         let hash = request_hash(
             b"join",
             &[
@@ -222,9 +236,12 @@ impl ZoneRuntimeBackend {
         // Deleted (R12) outranks the local ladder: a recorded replicated
         // deletion answers DELETED regardless of what local disk holds
         // (a stale replica that missed the fan-out still hosts the dir).
+        // Checked variant — a store fault fails the RPC rather than
+        // degrading to "not deleted" (the control zone is resident by the
+        // time an RPC is answered).
         if let Some(info) = self
             .deletions
-            .deletion_info(&req.zone_id)
+            .deletion_info_checked(&req.zone_id)
             .map_err(ZoneRuntimeError::Internal)?
         {
             resp.presence = Presence::Deleted.into();
@@ -262,6 +279,12 @@ impl ZoneRuntimeBackend {
             validate_zone_id_for(ZoneIdUse::ExistingRef, id)
                 .map_err(|e| ZoneRuntimeError::Invalid(format!("{label}: {e}")))?;
         }
+        // The zone-path contract is the API-boundary admission for the one
+        // path input this surface takes (the contract module's stated
+        // purpose). Ahead of the journal claim and execution: a bad path is
+        // refused before it can pin an operation id or reach a metastore.
+        contracts::validate_zone_path(&req.mount_path)
+            .map_err(|e| ZoneRuntimeError::Invalid(format!("mount_path: {e}")))?;
         let hash = request_hash(
             b"mount",
             &[&req.parent_zone_id, &req.mount_path, &req.target_zone_id],
@@ -288,26 +311,46 @@ impl ZoneRuntimeBackend {
         }
         // Physical read-back: the parent's state machine must now hold a
         // DT_MOUNT at mount_path pointing at the target, and the target's
-        // i_links must have moved.
+        // i_links must have moved. A FOLLOWER's propose returns once the
+        // leader commits — the local apply lags by a raft tick (node.rs
+        // documents this), so POLL for the value to become visible instead
+        // of snapshotting once: a one-shot read on a follower observes
+        // stale state and would journal a permanent REJECTED for a mount
+        // that actually committed.
         let parent = self
             .zm
             .get_zone(&req.parent_zone_id)
             .ok_or_else(|| ZoneRuntimeError::Internal("parent zone vanished after mount".into()))?;
-        let entry = parent
-            .get_metadata(&req.mount_path)
-            .map_err(|e| ZoneRuntimeError::Internal(format!("mount read-back: {e}")))?
-            .and_then(|bytes| decode_file_metadata(&bytes).ok());
-        let links = self.zm.get_links_count(&req.target_zone_id).unwrap_or(None);
-        let mounted = entry.as_ref().is_some_and(|meta| {
-            meta.entry_type == DT_MOUNT && meta.target_zone_id == req.target_zone_id
+        let mounted_entry = poll_until_visible(CATCHUP_BUDGET, || {
+            parent
+                .get_metadata(&req.mount_path)
+                .ok()
+                .flatten()
+                .and_then(|bytes| decode_file_metadata(&bytes).ok())
+                .filter(|meta| {
+                    meta.entry_type == DT_MOUNT && meta.target_zone_id == req.target_zone_id
+                })
         });
-        if !mounted {
+        if mounted_entry.is_none() {
+            // The mount may still have committed cluster-wide (a follower's
+            // local apply can lag past the budget): the outcome is UNKNOWN,
+            // so do NOT journal REJECTED — the record stays PENDING and the
+            // caller is told to query or retry under a fresh operation id
+            // (mount is idempotent).
             let e = ZoneRuntimeError::Internal(format!(
-                "mount read-back: no DT_MOUNT → {} at '{}' in '{}'",
-                req.target_zone_id, req.mount_path, req.parent_zone_id
+                "mount read-back: no DT_MOUNT → {} at '{}' in '{}' within {:?} — the \
+                 mount may have committed; query GetZoneOperation or retry with a new \
+                 operation_id",
+                req.target_zone_id, req.mount_path, req.parent_zone_id, CATCHUP_BUDGET
             ));
-            return self.fail(&header.operation_id, e, "mount", &req.target_zone_id);
+            tracing::error!(zone = %req.target_zone_id, "zone runtime mount read-back: {e}");
+            return Err(e);
         }
+        // Best-effort snapshot: `zm.mount` writes the parent's DT_MOUNT and
+        // the target's i_links counter on TWO independent raft groups — on
+        // a follower their local applies lag independently, so this count
+        // can read one behind right after the mount becomes visible.
+        let links = self.zm.get_links_count(&req.target_zone_id).unwrap_or(None);
         let mut receipt = base_receipt(
             &header.operation_id,
             &req.target_zone_id,
@@ -332,6 +375,9 @@ impl ZoneRuntimeBackend {
         let header = require_header(req.mutation.as_ref())?;
         validate_zone_id_for(ZoneIdUse::ExistingRef, &req.parent_zone_id)
             .map_err(|e| ZoneRuntimeError::Invalid(format!("parent_zone_id: {e}")))?;
+        // Same API-boundary admission as mount (see `zone_mount`).
+        contracts::validate_zone_path(&req.mount_path)
+            .map_err(|e| ZoneRuntimeError::Invalid(format!("mount_path: {e}")))?;
         let hash = request_hash(b"unmount", &[&req.parent_zone_id, &req.mount_path]);
 
         if let Some(replay) =
@@ -351,6 +397,39 @@ impl ZoneRuntimeBackend {
                 )
             }
         };
+        // Physical read-back (same follower-lag reasoning as `zone_mount`):
+        // poll until the mount point is no longer a DT_MOUNT in the parent.
+        // i_links is a counter with no predictable expected value, so it is
+        // read once the physical fact is visible — best-effort, same
+        // snapshot semantics as the mount receipt.
+        if former_target.is_some() {
+            let parent = self.zm.get_zone(&req.parent_zone_id);
+            let gone = parent.is_some_and(|parent| {
+                poll_until_visible(CATCHUP_BUDGET, || {
+                    let still_mount = parent
+                        .get_metadata(&req.mount_path)
+                        .ok()
+                        .flatten()
+                        .and_then(|bytes| decode_file_metadata(&bytes).ok())
+                        .is_some_and(|meta| meta.entry_type == DT_MOUNT);
+                    (!still_mount).then_some(())
+                })
+                .is_some()
+            });
+            if !gone {
+                // The unmount may still have committed cluster-wide: the
+                // outcome is UNKNOWN — no REJECTED, the record stays
+                // PENDING (mirrors the mount read-back semantics).
+                let e = ZoneRuntimeError::Internal(format!(
+                    "unmount read-back: '{}' in '{}' still a DT_MOUNT within {:?} — the \
+                     unmount may have committed; query GetZoneOperation or retry with a \
+                     new operation_id",
+                    req.mount_path, req.parent_zone_id, CATCHUP_BUDGET
+                ));
+                tracing::error!(zone = %req.parent_zone_id, "zone runtime unmount read-back: {e}");
+                return Err(e);
+            }
+        }
         let links = former_target
             .as_deref()
             .and_then(|t| self.zm.get_links_count(t).unwrap_or(None));
@@ -441,6 +520,37 @@ impl ZoneRuntimeBackend {
             self.begin_or_replay(&header.operation_id, hash, "deprovision", &req.zone_id)?
         {
             return Ok(replay);
+        }
+
+        // The POSIX i_links guard remove_replica enforces (minus its force
+        // escape): deprovisioning a zone that is still MOUNTED would leave
+        // every parent holding a dangling DT_MOUNT. A read error fails
+        // CLOSED — never destroy on an unreadable link count.
+        match self.zm.get_links_count(&req.zone_id) {
+            Ok(Some(count)) if count > 0 => {
+                return self.fail(
+                    &header.operation_id,
+                    ZoneRuntimeError::Conflict(format!(
+                        "zone '{}' still has {} reference(s) (i_links_count > 0); \
+                         unmount all references first",
+                        req.zone_id, count
+                    )),
+                    "deprovision",
+                    &req.zone_id,
+                );
+            }
+            Err(e) => {
+                return self.fail(
+                    &header.operation_id,
+                    ZoneRuntimeError::Internal(format!(
+                        "cannot read i_links_count for '{}': {e}; refusing to deprovision",
+                        req.zone_id
+                    )),
+                    "deprovision",
+                    &req.zone_id,
+                );
+            }
+            _ => {}
         }
 
         // Record the deletion FIRST: the epoch must exist in the replicated
@@ -603,6 +713,26 @@ fn require_header(
         ));
     }
     Ok(header)
+}
+
+/// Poll `probe` until it yields a value or `budget` expires — the
+/// value-visibility pattern `ControlStateStore::wait_visible` established.
+/// A proposal returns once the LEADER commits, but on a follower the local
+/// apply lags by a raft tick (node.rs documents this), so a one-shot
+/// snapshot right after a successful propose can observe stale state. A
+/// transient read error counts as "not visible yet" — only the budget
+/// running out gives up.
+fn poll_until_visible<T>(budget: Duration, mut probe: impl FnMut() -> Option<T>) -> Option<T> {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if let Some(value) = probe() {
+            return Some(value);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn base_receipt(operation_id: &str, zone_id: &str, kind: &str, outcome: &str) -> ZoneReceipt {
