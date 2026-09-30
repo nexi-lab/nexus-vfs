@@ -27,9 +27,13 @@
 //!
 //! | Permission | Candidate relations                     |
 //! |------------|-----------------------------------------|
-//! | Read       | `viewer`, `reader`, `writer`, `owner`   |
-//! | Write      | `writer`, `owner`                       |
-//! | Traverse   | `viewer`, `reader`, `writer`, `owner`   |
+//! | Read       | `viewer`, `reader`, `writer`, `owner`, `direct_viewer` |
+//! | Write      | `writer`, `owner`, `direct_editor`, `direct_owner`    |
+//! | Traverse   | `viewer`, `reader`, `writer`, `owner`, `direct_viewer` |
+//!
+//! The `direct_*` relations are what the Nexus zone-grant projection
+//! writes (Python `_CAPABILITY_RELATIONS`); the enforcer must accept
+//! both vocabularies until one retires the other.
 //!
 //! Rationale: matches the Zanzibar convention that a stronger
 //! relation implies the weaker one.  A future namespace-config
@@ -83,7 +87,9 @@ use crate::graph_cache::ReBACGraphCache;
 /// Relations that satisfy each `Permission` in the fixed v1 map.
 ///
 /// Zanzibar's convention: stronger → weaker.  A caller with `owner`
-/// implicitly reads and writes; a `writer` implicitly reads.  A
+/// implicitly reads and writes; a `writer` implicitly reads.  The
+/// `direct_*` relations mirror the Python zone-grant projection's
+/// vocabulary (`direct_viewer`/`direct_editor`/`direct_owner`).  A
 /// namespace-config import (follow-up) replaces this with per-
 /// namespace expansion.
 ///
@@ -92,8 +98,10 @@ use crate::graph_cache::ReBACGraphCache;
 #[inline]
 fn candidate_relations(permission: Permission) -> &'static [&'static str] {
     match permission {
-        Permission::Read | Permission::Traverse => &["viewer", "reader", "writer", "owner"],
-        Permission::Write => &["writer", "owner"],
+        Permission::Read | Permission::Traverse => {
+            &["viewer", "reader", "writer", "owner", "direct_viewer"]
+        }
+        Permission::Write => &["writer", "owner", "direct_editor", "direct_owner"],
     }
 }
 
@@ -331,6 +339,20 @@ mod tests {
         assert!(provider
             .check(path, None, Permission::Read, &ctx("alice", "root"))
             .is_ok());
+    }
+
+    /// The Python zone-grant projection writes direct_viewer/direct_editor/
+    /// direct_owner; the enforcer's candidate sets must accept them or every
+    /// kernel gate would deny projected grants.
+    #[test]
+    fn direct_projection_relations_are_enforcer_candidates() {
+        assert!(candidate_relations(Permission::Read).contains(&"direct_viewer"));
+        assert!(candidate_relations(Permission::Traverse).contains(&"direct_viewer"));
+        assert!(candidate_relations(Permission::Write).contains(&"direct_editor"));
+        assert!(candidate_relations(Permission::Write).contains(&"direct_owner"));
+        // legacy vocabulary stays intact
+        assert!(candidate_relations(Permission::Read).contains(&"viewer"));
+        assert!(candidate_relations(Permission::Write).contains(&"writer"));
     }
 
     /// A user without any grant is denied.
