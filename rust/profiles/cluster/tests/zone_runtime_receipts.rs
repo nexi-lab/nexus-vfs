@@ -117,7 +117,13 @@ async fn typed_zone_lifecycle_returns_real_receipts() {
     let mut j_rt = ZoneRuntime::dial_ready(jport, BUDGET).await;
 
     let joined = j_rt
-        .zone_join(ZONE, std::slice::from_ref(&fadv), false, "op-join-tenant-a-0003", "")
+        .zone_join(
+            ZONE,
+            std::slice::from_ref(&fadv),
+            false,
+            "op-join-tenant-a-0003",
+            "",
+        )
         .await
         .expect("typed ZoneJoin must reach the founder");
     assert_eq!(
@@ -133,7 +139,13 @@ async fn typed_zone_lifecycle_returns_real_receipts() {
     // learner runtime WAITING for a leader's snapshot, but it must never
     // SELF-FOUND — no voters, no committed log, no leader elected.
     let _ = j_rt
-        .zone_join(GHOST, std::slice::from_ref(&fadv), true, "op-join-ghost-0004", "")
+        .zone_join(
+            GHOST,
+            std::slice::from_ref(&fadv),
+            true,
+            "op-join-ghost-0004",
+            "",
+        )
         .await;
     let ghost_status = j_rt
         .zone_status(GHOST, "")
