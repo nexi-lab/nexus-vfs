@@ -153,7 +153,7 @@ impl ZoneRuntimeBackend {
         let mut receipt = base_receipt(&header.operation_id, &req.zone_id, "create", outcome);
         receipt.cluster = Some(facts);
         receipt.evidence = vec![
-            format!("zone_id passed TenantZoneIdCreate admission"),
+            "zone_id passed TenantZoneIdCreate admission".to_string(),
             format!(
                 "hosts_zone={} voters={} commit_index={}",
                 self.zm.hosts_zone(&req.zone_id),
