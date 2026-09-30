@@ -58,7 +58,7 @@ pub use mailbox_stamping_policy::{MailboxEnvelope, MAILBOX_WRITE_SUFFIXES};
 use kernel::kernel::syscall::KernelSyscall;
 use kernel::kernel::{Kernel, OperationContext};
 
-use kernel::meta_store::{DT_DIR, DT_REG, DT_STREAM};
+use kernel::meta_store::{DT_DIR, DT_LINK, DT_REG, DT_STREAM};
 
 /// Provision `agent_name`'s attention-state stream as a DT_STREAM, idempotently
 /// — the sibling of its inbox under the same replicated `/agents/{name}`
@@ -185,34 +185,84 @@ fn ensure_dir<K: KernelSyscall>(
     metadata_setattr(kernel, ctx, path, DT_DIR, None).map_err(|e| format!("ensure dir {path}: {e}"))
 }
 
-/// File `alias` in the chat list, holding the conversation root it stands for.
+/// The conversation root a chat-list entry stands for, whichever shape it is.
 ///
-/// A plain entry, NOT a DT_LINK — which is what this is, and what it used to
-/// be. Only the in-process caller can make a link: the gRPC `Setattr` carries
-/// no link target, so a standalone agent provisioning over that transport
-/// silently produced no entry at all, and its recipient never learned the
-/// conversation existed. An entry type is immutable once set, so two
-/// provisioners disagreeing about it is not a cosmetic difference: whichever
-/// ran second would fail forever on a conversation the first had already
-/// indexed.
+/// ONE reader for both backends and both eras, because the entry is written by shared
+/// code and must be read by shared code — a per-backend reader is how the two drift.
 ///
-/// Every transport can write bytes. `readdir` needs only the NAME, and the
-/// body keeps `cat` able to answer "pointing at which conversation?" — the
-/// one thing the link gave that a bare directory entry would not.
+/// * a DT_LINK carries the root in `link_target` (what `ensure_conversation` creates);
+/// * a DT_REG carries it as bytes (what clusters provisioned before the wire could
+///   express a link still hold, and re-typing an entry is not possible).
+///
+/// Returns `None` when the entry is neither — a caller that cannot resolve the root
+/// must skip the conversation rather than guess a path, because a guessed cid reads an
+/// empty transcript and looks like a conversation with no messages.
+pub fn conversation_root_of<K: KernelSyscall>(
+    kernel: &K,
+    ctx: &OperationContext,
+    alias: &str,
+) -> Option<String> {
+    let meta = kernel.sys_stat(alias, &ctx.zone_id)?;
+    if meta.entry_type == DT_LINK {
+        // `link_target` is the SSOT for a link. An empty one is a link to nowhere,
+        // which is not a root a caller can use.
+        return meta.link_target.filter(|t| !t.is_empty());
+    }
+    if meta.entry_type == DT_REG {
+        let bytes = kernel.sys_read(alias, ctx, 0, 0).ok()?.data?;
+        let text = String::from_utf8(bytes).ok()?;
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
+}
+
+/// Link `alias` in the chat list to the conversation root it stands for.
+///
+/// A DT_LINK, which is what this is — an index into the flat conversation store,
+/// pointing rather than copying. `readdir` needs only the NAME (the peer); the link
+/// target answers "pointing at which conversation?" from metadata, where a mount with
+/// no content store still keeps it.
+///
+/// It was a plain entry holding the target as bytes until the gRPC `Setattr` could
+/// carry a link target. It could not, and the consequence was structural rather than
+/// cosmetic: a standalone agent provisions over that transport while a co-hosted one
+/// provisions in-process, entry types are immutable, and two provisioners disagreeing
+/// about the type means whichever runs second fails forever on a conversation the
+/// first already indexed. The wire carries it now, so both make the same thing.
 fn index_conversation<K: KernelSyscall>(
     kernel: &K,
     ctx: &OperationContext,
     alias: &str,
     target: &str,
 ) -> Result<(), String> {
-    // Declare the entry, then fill it. The NAME is the contract — `readdir`
-    // needs nothing else — while the body is a convenience, and the two have
-    // different requirements: a mount with no content store keeps metadata and
-    // drops bytes, so an entry created by `sys_write` alone would not exist at
-    // all there. Declaring it first means the index survives anywhere the
-    // metastore does, and `cat` answers wherever content is stored.
-    metadata_setattr(kernel, ctx, alias, DT_REG, None)?;
-    let _ = kernel.sys_write(alias, ctx, target.as_bytes(), 0);
+    // A DT_LINK, with the destination in the METADATA. The design calls this a
+    // "DT_LINK index into the flat store, not the bytes", and the reason is the same
+    // one that used to argue for a plain entry: a mount with no content store keeps
+    // metadata and drops bytes. Putting the target in `link_target` is what makes the
+    // index survive there — the earlier shape wrote the target as CONTENT, which is
+    // exactly the half such a mount throws away.
+    //
+    // This was a plain entry until the gRPC `Setattr` could carry a link target. It
+    // could not, so a standalone agent provisioning over that transport would have
+    // created a DT_REG where a co-hosted one created a DT_LINK; entry types are
+    // immutable, so whichever ran second would fail forever. The wire carries it now.
+    //
+    // # An entry that already exists keeps its type
+    //
+    // That immutability is also why this tolerates what it finds. A cluster
+    // provisioned before this change holds DT_REG chat-list entries, and re-typing
+    // them is not possible — so a pre-existing entry is treated as already indexed
+    // rather than as a failure. `conversation_root_of` reads both shapes, which is
+    // what keeps those conversations discoverable instead of stranding them.
+    if let Some(existing) = kernel.sys_stat(alias, &ctx.zone_id) {
+        if existing.entry_type == DT_LINK || existing.entry_type == DT_REG {
+            return Ok(());
+        }
+    }
+    metadata_setattr(kernel, ctx, alias, DT_LINK, Some(target))?;
     Ok(())
 }
 

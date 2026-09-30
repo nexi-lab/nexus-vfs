@@ -437,6 +437,9 @@ impl FederationClient {
             auth_token: String::new(),
             entry_type: 0,
             zone_id: String::new(),
+            // Regular-file metadata only, per the HAL trait doc — a peer does not
+            // create links through this path.
+            link_target: None,
             mime_type: mime_type.map(|s| s.to_string()),
             content_id: content_id.map(|s| s.to_string()),
             modified_at_ms,

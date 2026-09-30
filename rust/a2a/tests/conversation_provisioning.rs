@@ -31,6 +31,9 @@ use kernel::kernel::{
 const DT_DIR: u8 = 1;
 const DT_STREAM: u8 = 4;
 const DT_REG: u8 = 0;
+// 6, not 3. The header above is about the run where this was 3 — DT_PIPE's
+// discriminant — and every path test stayed green while the index was a pipe.
+const DT_LINK: u8 = 6;
 
 /// The identity provisioning runs as. `ensure_conversation` writes the
 /// chat-list entry, and a write carries a caller — the entry types alone no
@@ -239,18 +242,21 @@ fn chat_list_entry_names_the_shared_conversation() {
         );
         let meta = stat(&kernel, &alias);
         assert_eq!(
-            meta.entry_type, DT_REG,
-            "{alias} must be a plain entry (got entry_type={}) — a type no \
-             transport can produce is a conversation one side cannot index",
+            meta.entry_type, DT_LINK,
+            "{alias} must be a DT_LINK (got entry_type={}) — the index POINTS into the \
+             flat conversation store rather than copying it",
             meta.entry_type
         );
-        // The BODY (the conversation root) is deliberately not asserted here.
-        // A bare kernel has no content store, so bytes written to a DT_REG do
-        // not come back — and that is fine, because the name is what carries
-        // the contract: a receiver lists this directory and reads the entry
-        // NAMES. The body is a convenience for whoever runs `cat`, and it
-        // survives wherever content does.
-        let _ = &expected_target;
+        // The target IS asserted now, and that is the point of the type change: it
+        // lives in metadata, which a bare kernel keeps. The previous shape wrote it as
+        // CONTENT, and this very test could not assert it, because a kernel with no
+        // content store does not give the bytes back. A pointer whose destination is
+        // unreadable exactly where the index is readable was the defect.
+        assert_eq!(
+            meta.link_target.as_deref(),
+            Some(expected_target.as_str()),
+            "{alias} must point at the flat conversation root"
+        );
     }
 }
 
@@ -270,7 +276,7 @@ fn both_participants_are_indexed_whichever_side_provisions() {
             let alias = agent_conversation_link_path(owner, other);
             assert_eq!(
                 stat(&kernel, &alias).entry_type,
-                DT_REG,
+                DT_LINK,
                 "provisioning from {caller} must still index {owner}'s conversation with {other}"
             );
         }
@@ -420,5 +426,81 @@ fn the_reader_register_is_left_to_the_consumer() {
     assert!(
         kernel.sys_stat(&reader, contracts::ROOT_ZONE_ID).is_none(),
         "{reader} must not be pre-created — absence is what reads as offset 0"
+    );
+}
+
+/// A cluster provisioned before the wire could carry a link target holds DT_REG
+/// chat-list entries, and an entry type is immutable — so the new provisioner must
+/// treat one as already indexed rather than fail, and the shared reader must still
+/// resolve it. Failing here would strand every conversation such a cluster already has.
+#[test]
+fn a_legacy_plain_entry_is_tolerated_and_still_resolves() {
+    let kernel = Kernel::new();
+    let ctx = provisioning_ctx();
+
+    // Plant the OLD shape by hand: a plain entry whose body is the target path.
+    let cid = conversation_id("win-ai", "mac-ai");
+    let target = format!("{CONVERSATIONS_BASE}/{cid}");
+    let alias = agent_conversation_link_path("win-ai", "mac-ai");
+    kernel
+        .sys_setattr(
+            &alias,
+            &ctx,
+            DT_REG as i32,
+            "",
+            None,
+            None,
+            None,
+            "",
+            kernel::ROOT_ZONE_ID,
+            false,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("plant a legacy plain entry");
+    // The trait form, not Kernel's inherent batch `sys_write` — the legacy writer was
+    // the single-path one.
+    KernelSyscall::sys_write(&kernel, &alias, &ctx, target.as_bytes(), 0)
+        .expect("legacy entries carry the target as bytes");
+
+    // Provisioning again must NOT fail on it — re-typing is impossible, so the only
+    // alternative to tolerance is a permanent error on a conversation that works.
+    ensure_conversation(&kernel, &ctx, "win-ai", "mac-ai")
+        .expect("a pre-existing plain entry must not break provisioning");
+    assert_eq!(
+        stat(&kernel, &alias).entry_type,
+        DT_REG,
+        "the legacy entry keeps its type — an entry type cannot be changed"
+    );
+
+    // And here is the defect the type change removes, shown rather than argued: on a
+    // kernel with NO content store the legacy body is gone, so the entry names a
+    // conversation whose location cannot be recovered. The pointer exists and its
+    // destination does not.
+    assert_eq!(
+        a2a::conversation_root_of(&kernel, &ctx, &alias),
+        None,
+        "a legacy plain entry cannot resolve where bytes are dropped — that is why the          index moved into metadata"
+    );
+    let _ = &target;
+
+    // The new shape, same kernel, same absence of a content store: it resolves.
+    let fresh = agent_conversation_link_path("win-ai", "other-ai");
+    ensure_conversation(&kernel, &ctx, "win-ai", "other-ai").expect("provision a second pair");
+    let fresh_cid = conversation_id("win-ai", "other-ai");
+    assert_eq!(
+        a2a::conversation_root_of(&kernel, &ctx, &fresh).as_deref(),
+        Some(format!("{CONVERSATIONS_BASE}/{fresh_cid}").as_str()),
+        "a DT_LINK resolves from metadata, which survives where content does not"
     );
 }

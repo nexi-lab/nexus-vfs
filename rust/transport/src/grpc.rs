@@ -528,7 +528,7 @@ impl VfsServiceImpl {
             req.size,
             req.version,
             req.created_at_ms,
-            None,             // link_target
+            req.link_target.as_deref(),
             None, // source — federation joins are not bridged over gRPC (see setattr_mount)
             remote_metastore, // remote arm installs a metastore
         ) {
@@ -591,7 +591,7 @@ impl VfsServiceImpl {
                     req.size,
                     req.version,
                     req.created_at_ms,
-                    None, // link_target — DT_LINK creation isn't on the JSON-wire today
+                    req.link_target.as_deref(),
                     None, // source
                     None, // remote_metastore
                 )
