@@ -117,13 +117,22 @@ async fn mount_via_a_follower_of_the_parent_succeeds_with_real_facts() {
         .zone_mount(PARENT, "/nested", TARGET, OP, "")
         .await
         .expect("a mount landing on a follower of the parent must succeed");
-    assert_eq!(receipt.outcome, "MOUNTED", "real facts, not phantom success");
-    assert_eq!(receipt.mount.as_ref().expect("mount facts").mount_path, "/nested");
+    assert_eq!(
+        receipt.outcome, "MOUNTED",
+        "real facts, not phantom success"
+    );
+    assert_eq!(
+        receipt.mount.as_ref().expect("mount facts").mount_path,
+        "/nested"
+    );
 
     // The journal record is COMPLETED — the follower path must never
     // leave a permanent REJECTED for a mount that committed.
     let op = j_rt.get_zone_operation(OP, "").await.expect("journal");
-    assert_eq!(op.status, "COMPLETED", "the operation is terminal-COMPLETED");
+    assert_eq!(
+        op.status, "COMPLETED",
+        "the operation is terminal-COMPLETED"
+    );
 
     // Physical visibility, the real assertion behind the receipt: the
     // DT_MOUNT is in the parent's replicated state (asked on the founder).

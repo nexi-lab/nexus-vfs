@@ -119,10 +119,7 @@ impl ZoneDeletionRegistry {
     /// and serving, so a store error is a real fault the caller must see,
     /// not a "no record" answer — the fail-closed intent the best-effort
     /// variants below cannot express.
-    pub fn deletion_info_checked(
-        &self,
-        zone_id: &str,
-    ) -> Result<Option<DeletedZoneInfo>, String> {
+    pub fn deletion_info_checked(&self, zone_id: &str) -> Result<Option<DeletedZoneInfo>, String> {
         match self.store.get(&Self::key(zone_id)) {
             Ok(None) => Ok(None),
             Ok(Some(bytes)) => {

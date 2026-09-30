@@ -1719,9 +1719,8 @@ fn wire_deletion_registry(
         z.runtime_handle(),
         node_id,
     ));
-    zm.registry().set_deletion_epoch_source(
-        Arc::clone(&reg) as Arc<dyn nexus_raft::DeletionEpochSource>
-    );
+    zm.registry()
+        .set_deletion_epoch_source(Arc::clone(&reg) as Arc<dyn nexus_raft::DeletionEpochSource>);
     Some(reg)
 }
 

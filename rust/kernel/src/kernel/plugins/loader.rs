@@ -1360,7 +1360,11 @@ mod tests {
             Err(crate::service_registry::RustCallError::NotFound)
         ));
         assert!(matches!(
-            svc.finish_dispatch(PluginResult::InvalidArgument as i32, std::ptr::null_mut(), 0),
+            svc.finish_dispatch(
+                PluginResult::InvalidArgument as i32,
+                std::ptr::null_mut(),
+                0
+            ),
             Err(crate::service_registry::RustCallError::InvalidArgument(_))
         ));
         // Anything else stays a generic internal error.

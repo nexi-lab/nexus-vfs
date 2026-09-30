@@ -159,7 +159,10 @@ fn kernel_with_llm_mount(base_url: &str) -> (Arc<Kernel>, tempfile::TempDir) {
     use kernel::kernel::convenience::KernelConvenience;
     let mount_ctx = contracts::OperationContext::new("llm-mount-test", "root", true, None, true);
     kernel
-        .mount(MOUNT, MountOptions::new(&mount_ctx, "llm").with_backend(backend))
+        .mount(
+            MOUNT,
+            MountOptions::new(&mount_ctx, "llm").with_backend(backend),
+        )
         .expect("mount");
     (kernel, tmp)
 }

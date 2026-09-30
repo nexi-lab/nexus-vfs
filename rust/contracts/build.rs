@@ -689,11 +689,7 @@ fn generate_zone_wire_path(out_dir: &Path) {
         .unwrap_or_else(|| panic!("zone-wire-path spec must contain /length/max"));
     let empty_components = boolean(&spec, "/empty_components", "zone-wire-path spec");
     let trailing_slash = boolean(&spec, "/trailing_slash", "zone-wire-path spec");
-    let reserved = strings(
-        &spec,
-        "/reserved_prefix_constants",
-        "zone-wire-path spec",
-    );
+    let reserved = strings(&spec, "/reserved_prefix_constants", "zone-wire-path spec");
 
     let forbidden_values = forbidden
         .iter()

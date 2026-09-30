@@ -97,10 +97,7 @@ impl PluginProxyService {
 
     /// The boot gate + token authentication every proxied call passes
     /// through (see the module doc for the token-only boundary).
-    async fn authenticate(
-        &self,
-        headers: &HeaderMap,
-    ) -> Result<OperationContext, tonic::Code> {
+    async fn authenticate(&self, headers: &HeaderMap) -> Result<OperationContext, tonic::Code> {
         if !self.ready.wait(DATA_PLANE_READY_BUDGET).await {
             return Err(tonic::Code::Unavailable);
         }

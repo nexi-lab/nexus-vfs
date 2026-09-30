@@ -95,11 +95,19 @@ fn agent_get_enforces_ownership_like_every_other_agent_method() {
     assert!(!registered.is_error);
     let registered: serde_json::Value =
         serde_json::from_slice(&registered.payload).expect("registered response");
-    let pid = registered["result"]["pid"].as_str().expect("pid").to_string();
+    let pid = registered["result"]["pid"]
+        .as_str()
+        .expect("pid")
+        .to_string();
 
     // The owner reads their own descriptor.
     let bob = OperationContext::new("bob", "tenant-b", false, None, false);
-    let own = call(&kernel, &bob, "agent_get", serde_json::json!({ "pid": pid }));
+    let own = call(
+        &kernel,
+        &bob,
+        "agent_get",
+        serde_json::json!({ "pid": pid }),
+    );
     assert!(!own.is_error, "owner reads own agent");
     let own: serde_json::Value = serde_json::from_slice(&own.payload).expect("own response");
     assert_eq!(own["result"]["owner_id"], "bob");

@@ -151,7 +151,13 @@ impl AuthProvider for FixedTokenProvider {
         if creds.token != TEST_TOKEN {
             return Err(tonic::Status::unauthenticated("bad token"));
         }
-        Ok(OperationContext::new("token-user", "root", false, None, false))
+        Ok(OperationContext::new(
+            "token-user",
+            "root",
+            false,
+            None,
+            false,
+        ))
     }
 }
 
@@ -294,7 +300,11 @@ async fn unauthenticated_caller_is_refused_and_token_caller_reaches_plugin_with_
     // No token ⇒ refused at the door, the plugin never sees the call.
     grpc.ready().await.expect("ready");
     let refused = grpc
-        .unary(Request::new(EchoMsg { data: vec![] }), path.clone(), codec.clone())
+        .unary(
+            Request::new(EchoMsg { data: vec![] }),
+            path.clone(),
+            codec.clone(),
+        )
         .await
         .expect_err("caller without a token must be refused");
     assert_eq!(

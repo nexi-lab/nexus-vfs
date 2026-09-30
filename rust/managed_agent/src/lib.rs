@@ -771,10 +771,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
         // owner-attribution rules on this caller's spawns. A bare principal
         // (a user key reaching the agent plane directly, `agent_id` unset)
         // gets the ownership/admin check — the tightened boundary.
-        if ctx.agent_id.is_none()
-            && desc.owner_id != ctx.user_id
-            && !ctx.is_admin
-            && !ctx.is_system
+        if ctx.agent_id.is_none() && desc.owner_id != ctx.user_id && !ctx.is_admin && !ctx.is_system
         {
             return Err(RustCallError::PermissionDenied(
                 "managed-agent session operation requires ownership or administrator privileges"
@@ -1111,11 +1108,8 @@ impl<K: KernelSyscall> RustService for ManagedAgentService<K> {
                     if req.zone_id.is_empty() {
                         req.zone_id = contracts::ROOT_ZONE_ID.to_string();
                     } else {
-                        req.zone_id = resolve_agent_zone(
-                            ctx,
-                            Some(req.zone_id.as_str()),
-                        )
-                        .map_err(map_agent_context_error)?;
+                        req.zone_id = resolve_agent_zone(ctx, Some(req.zone_id.as_str()))
+                            .map_err(map_agent_context_error)?;
                     }
                 } else {
                     return Err(RustCallError::PermissionDenied(

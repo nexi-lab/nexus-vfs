@@ -58,13 +58,13 @@ async fn bad_mount_paths_are_refused_at_admission() {
     // Every shape the zone-path contract refuses. Each one must come back
     // InvalidArgument WITHOUT consuming an operation id into the journal.
     let bad_paths = [
-        "relative-path",      // not absolute
-        "/has/../dotdot",     // forbidden component
-        "/has/./dot",         // forbidden component
-        "/trailing/",         // trailing slash = empty component
-        "/__sys__/reserved",  // kernel-owned prefix
-        "/back\\slash",       // charset violation (Windows separator)
-        "/has%20space",       // charset violation
+        "relative-path",                  // not absolute
+        "/has/../dotdot",                 // forbidden component
+        "/has/./dot",                     // forbidden component
+        "/trailing/",                     // trailing slash = empty component
+        "/__sys__/reserved",              // kernel-owned prefix
+        "/back\\slash",                   // charset violation (Windows separator)
+        "/has%20space",                   // charset violation
         &format!("/{}", "a".repeat(300)), // over-length component
     ];
     for (i, path) in bad_paths.iter().enumerate() {

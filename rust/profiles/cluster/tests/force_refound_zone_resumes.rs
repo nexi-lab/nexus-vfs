@@ -80,7 +80,10 @@ async fn force_refound_survives_subsequent_normal_boots() {
     // ── 2. --force boot re-founds it ────────────────────────────────
     let mut forced = Daemon::spawn(&["--bind-addr", &fadv, "--force"], &founder_env);
     forced
-        .wait_for_log("--force: re-founding registry-deleted zones is ENABLED", BUDGET)
+        .wait_for_log(
+            "--force: re-founding registry-deleted zones is ENABLED",
+            BUDGET,
+        )
         .await
         .expect("the escape hatch is engaged (the startup warning always fires)");
     forced

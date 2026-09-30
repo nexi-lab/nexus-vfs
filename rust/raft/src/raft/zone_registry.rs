@@ -1880,10 +1880,7 @@ mod tests {
             reg2.get_node("victim").is_none(),
             "materialize must refuse a deprovisioned zone"
         );
-        assert!(
-            reg2.resident_zones().is_empty(),
-            "nothing became resident"
-        );
+        assert!(reg2.resident_zones().is_empty(), "nothing became resident");
         // The dir itself stays for the sweep (documented split: the gate
         // stops resurrection, the sweep reclaims the dir).
         reg2.shutdown_all();
