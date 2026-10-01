@@ -161,7 +161,7 @@ async fn list_returns_seeded_records_for_admin() {
 /// A non-admin bearer is rejected with 403 — the router's admin
 /// gate MUST override the bearer middleware's "you're authenticated"
 /// pass.  Regression pin against a refactor that drops the
-/// require_admin call.
+/// Admin extractor.
 #[tokio::test]
 async fn list_rejects_non_admin_with_403() {
     let (base, _store, _h) = spawn_test_server(vec![(
