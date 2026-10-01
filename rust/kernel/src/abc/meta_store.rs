@@ -46,7 +46,12 @@ pub const DT_LINK: u8 = 6;
 ///   layers (e.g. federation) compare it against the local node address
 ///   to route content fetches. There is no per-record `backend_name`:
 ///   each node picks its backend from its own mount table.
-#[derive(Clone, Debug, Default)]
+///
+/// `PartialEq` is for the cross-encoding guard in
+/// `core::meta_store::tests::every_field_survives_the_binary_encoding`: a
+/// field-by-field comparison would itself be a list to forget to extend, so
+/// the test compares whole values.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FileMetadata {
     pub path: String,
     pub size: u64,
