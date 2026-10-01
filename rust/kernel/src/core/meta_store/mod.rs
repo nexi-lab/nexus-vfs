@@ -168,25 +168,47 @@ fn serialize_metadata(meta: &FileMetadata) -> Vec<u8> {
         }
     }
 
+    // Destructured EXHAUSTIVELY, with no `..`: a field added to `FileMetadata`
+    // is then a compile error right here instead of a value this codec quietly
+    // drops. The compiler is the only thing that can insist all three of this
+    // repo's encodings stay complete (nexi-lab/nexus-vfs#371).
+    let FileMetadata {
+        path,
+        size,
+        content_id,
+        gen,
+        version,
+        entry_type,
+        zone_id,
+        mime_type,
+        created_at_ms,
+        modified_at_ms,
+        last_writer_address,
+        target_zone_id,
+        target_subtree,
+        link_target,
+        owner_id,
+    } = meta;
+
     buf.push(4); // version tag - v4 appends gen:u64 after the v3 fields.
-    write_str(&mut buf, &meta.path);
-    buf.extend_from_slice(&meta.size.to_le_bytes());
-    write_opt_str(&mut buf, &meta.content_id);
-    buf.extend_from_slice(&meta.version.to_le_bytes());
-    buf.push(meta.entry_type);
-    write_opt_str(&mut buf, &meta.zone_id);
-    write_opt_str(&mut buf, &meta.mime_type);
-    write_opt_i64(&mut buf, meta.created_at_ms);
-    write_opt_i64(&mut buf, meta.modified_at_ms);
-    write_opt_str(&mut buf, &meta.last_writer_address);
-    write_opt_str(&mut buf, &meta.target_zone_id);
-    write_opt_str(&mut buf, &meta.link_target);
-    buf.extend_from_slice(&meta.gen.to_le_bytes());
-    write_opt_str(&mut buf, &meta.owner_id);
+    write_str(&mut buf, path);
+    buf.extend_from_slice(&size.to_le_bytes());
+    write_opt_str(&mut buf, content_id);
+    buf.extend_from_slice(&version.to_le_bytes());
+    buf.push(*entry_type);
+    write_opt_str(&mut buf, zone_id);
+    write_opt_str(&mut buf, mime_type);
+    write_opt_i64(&mut buf, *created_at_ms);
+    write_opt_i64(&mut buf, *modified_at_ms);
+    write_opt_str(&mut buf, last_writer_address);
+    write_opt_str(&mut buf, target_zone_id);
+    write_opt_str(&mut buf, link_target);
+    buf.extend_from_slice(&gen.to_le_bytes());
+    write_opt_str(&mut buf, owner_id);
     // Appended last, like every field before it: a record written by an older
     // build simply runs out of bytes here and reads back as None, which means
     // "the whole zone" — the same thing every mount meant before subtrees.
-    write_opt_str(&mut buf, &meta.target_subtree);
+    write_opt_str(&mut buf, target_subtree);
 
     buf
 }

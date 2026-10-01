@@ -461,28 +461,50 @@ pub(crate) fn proto_to_kernel(bytes: &[u8]) -> Result<KernelFileMetadata, MetaSt
 }
 
 pub(crate) fn kernel_to_proto(meta: &KernelFileMetadata) -> Vec<u8> {
+    // Destructured EXHAUSTIVELY, with no `..`, so a field added to
+    // `FileMetadata` is a compile error here rather than a value this encoder
+    // silently drops. `FileMetadata` is encoded three ways in this repo and
+    // nothing generates them from one schema (nexi-lab/nexus-vfs#371), so the
+    // compiler is the only thing that can insist all three stay complete.
+    let KernelFileMetadata {
+        path,
+        size,
+        content_id,
+        gen,
+        version,
+        entry_type,
+        zone_id,
+        mime_type,
+        created_at_ms: _,
+        modified_at_ms: _,
+        last_writer_address,
+        target_zone_id,
+        target_subtree,
+        link_target,
+        owner_id: _,
+    } = meta;
     let proto = ProtoFileMetadata {
-        path: meta.path.clone(),
-        size: meta.size as i64,
-        content_id: meta.content_id.clone().unwrap_or_default(),
-        gen: meta.gen,
-        version: meta.version as i32,
-        entry_type: meta.entry_type as i32,
-        zone_id: meta.zone_id.clone().unwrap_or_default(),
-        mime_type: meta.mime_type.clone().unwrap_or_default(),
-        last_writer_address: meta.last_writer_address.clone().unwrap_or_default(),
+        path: path.clone(),
+        size: *size as i64,
+        content_id: content_id.clone().unwrap_or_default(),
+        gen: *gen,
+        version: *version as i32,
+        entry_type: *entry_type as i32,
+        zone_id: zone_id.clone().unwrap_or_default(),
+        mime_type: mime_type.clone().unwrap_or_default(),
+        last_writer_address: last_writer_address.clone().unwrap_or_default(),
         // For DT_MOUNT entries this carries the cross-zone routing
         // pointer that federation's `mount_apply_cb` reads on every
         // replicated SetMetadata to wire the mount on followers.
         // Empty for non-DT_MOUNT entries.
-        target_zone_id: meta.target_zone_id.clone().unwrap_or_default(),
+        target_zone_id: target_zone_id.clone().unwrap_or_default(),
         // Which subtree of that zone the mount exposes; empty means the whole
         // zone, which is what a non-DT_MOUNT entry and a pre-subtree mount
         // both mean.
-        target_subtree: meta.target_subtree.clone().unwrap_or_default(),
+        target_subtree: target_subtree.clone().unwrap_or_default(),
         // For DT_LINK entries this carries the link target path the
         // route() one-hop resolver follows. Empty for non-DT_LINK entries.
-        link_target: meta.link_target.clone().unwrap_or_default(),
+        link_target: link_target.clone().unwrap_or_default(),
         ..Default::default()
     };
     proto.encode_to_vec()
