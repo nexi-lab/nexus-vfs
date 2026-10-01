@@ -1,16 +1,13 @@
-//! `/v2/auth/keys` — HTTP list + revoke over the kernel-adjacent
+//! `/v2/auth/keys` — HTTP mint, list, and revoke over the kernel-adjacent
 //! `AuthKeyStore` (raft-backed, cluster-wide replicated).
 //!
 //! Port of Python nexus-server's `/api/v2/auth/keys` router
 //! (`src/nexus/server/api/v2/routers/auth_keys.py`), R10 arc.
-//! Python-side ships the full CRUD (create + get + list + delete);
-//! this Rust port ships **list + revoke** in this PR — mint (POST)
-//! lands in a follow-up PR that requires plumbing the API-key
-//! secret through `ServiceBootCtx` (needed to HMAC the returned
-//! plaintext key at mint time).
 //!
 //! # Endpoints
 //!
+//! * `POST /v2/auth/keys` — mint and persist a credential, returning its
+//!   plaintext key once. Requires the configured API-key signing secret.
 //! * `GET    /v2/auth/keys` — list every credential record on the
 //!   local raft-applied replica.  Optional query filters
 //!   (`?subject_type=`, `?include_revoked=`, `?is_admin=`) narrow
@@ -24,13 +21,10 @@
 //!
 //! # Auth
 //!
-//! **Admin-only** — the mint / revoke plane on the gRPC side is
-//! gated by a mTLS **node** cert (a peer, not any authenticated
-//! caller).  HTTP has no mTLS cert, so this router substitutes an
-//! `is_admin`-required check at the middleware boundary: a bearer
-//! that resolves to `ctx.is_admin = true` passes, everything else
-//! gets `403`.  Matches Python nexus-server's `dependencies=
-//! [Depends(require_admin)]` posture.
+//! The shared [`Admin`] extractor requires `ctx.is_admin = true` after
+//! bearer authentication. Authenticated non-admins receive `403`; unresolved
+//! credentials receive `401` from the bearer middleware. ReBAC tuple
+//! management uses the same extractor.
 //!
 //! # Wire shape
 //!
@@ -47,11 +41,11 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get};
-use axum::{Extension, Json, Router};
-use contracts::operation_context::OperationContext;
+use axum::{Json, Router};
 use kernel::hal::auth_key_store::AuthKeyStoreError;
 use serde::{Deserialize, Serialize};
 
+use crate::middleware::auth::Admin;
 use crate::AppState;
 
 // ── error surface ────────────────────────────────────────────────
@@ -62,12 +56,6 @@ use crate::AppState;
 /// [`IntoResponse`] impl mapping variants to HTTP status.
 #[derive(Debug, thiserror::Error)]
 pub enum AuthKeysError {
-    /// Bearer resolved but the caller is not an admin.  Maps to
-    /// 403 — matches Python nexus-server's `require_admin`
-    /// rejection.
-    #[error("admin privilege required to manage auth keys")]
-    Forbidden,
-
     /// The `AuthKeyStore` backend refused a read / write.  Maps to
     /// 502 — caller is well-formed, backend is not currently
     /// serving.  Preserves the store's message for the operator log.
@@ -104,28 +92,11 @@ impl From<AuthKeyStoreError> for AuthKeysError {
 impl IntoResponse for AuthKeysError {
     fn into_response(self) -> Response {
         let status = match &self {
-            Self::Forbidden => StatusCode::FORBIDDEN,
             Self::Backend(_) => StatusCode::BAD_GATEWAY,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
         };
         (status, self.to_string()).into_response()
-    }
-}
-
-/// Enforce the "admin-only" gate at the handler boundary.  A bearer
-/// that did not resolve to `is_admin == true` gets 403.
-///
-/// Kept as a plain fn instead of a middleware so the check runs
-/// AFTER the `require_bearer` middleware has stamped
-/// `Extension<OperationContext>` — the middleware's job is authN,
-/// the handler's job is authZ.  Same split Python nexus-server uses
-/// (`Depends(require_admin)` runs after the bearer resolver).
-fn require_admin(ctx: &OperationContext) -> Result<(), AuthKeysError> {
-    if ctx.is_admin {
-        Ok(())
-    } else {
-        Err(AuthKeysError::Forbidden)
     }
 }
 
@@ -236,10 +207,9 @@ pub struct ListResponse {
 /// `raft::key_minter`).
 pub async fn list(
     State(state): State<AppState>,
-    Extension(ctx): Extension<OperationContext>,
+    _admin: Admin,
     Query(params): Query<ListQuery>,
 ) -> Result<Json<ListResponse>, AuthKeysError> {
-    require_admin(&ctx)?;
     let store = Arc::clone(&state.auth_key_store);
     // `store.list()` bridges through raft's blocking read; run
     // under `spawn_blocking` so the axum worker stays responsive.
@@ -301,13 +271,12 @@ pub struct RevokeResponse {
 ///
 /// Matches the `KeyMinter::revoke_key` semantic (see
 /// `raft::key_minter`), one gate over: node-cert gate replaced
-/// with HTTP admin gate at [`require_admin`].
+/// with HTTP admin gate at [`Admin`].
 pub async fn revoke(
     State(state): State<AppState>,
-    Extension(ctx): Extension<OperationContext>,
+    _admin: Admin,
     Path(key_hash): Path<String>,
 ) -> Result<Json<RevokeResponse>, AuthKeysError> {
-    require_admin(&ctx)?;
     let store = Arc::clone(&state.auth_key_store);
     let hash_for_call = key_hash.clone();
     let existed = tokio::task::spawn_blocking(move || store.delete(&hash_for_call))
@@ -382,11 +351,9 @@ pub struct MintResponse {
 /// Handler for `POST /v2/auth/keys` — mint a fresh sk- key.
 pub async fn mint(
     State(state): State<AppState>,
-    Extension(ctx): Extension<OperationContext>,
+    _admin: Admin,
     Json(body): Json<MintBody>,
 ) -> Result<Json<MintResponse>, AuthKeysError> {
-    require_admin(&ctx)?;
-
     // Fail-loud when the daemon has no HMAC secret — matches the
     // gRPC `MintKey` posture (returns success=false under NoAuth).
     let secret = state
