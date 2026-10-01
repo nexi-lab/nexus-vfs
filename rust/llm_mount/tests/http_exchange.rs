@@ -78,6 +78,9 @@ fn server(
                 Err(e) => panic!("accept: {e}"),
             }
         };
+        // Winsock inherits the listener's nonblocking mode on accept. Set the
+        // request socket explicitly before reading a potentially split body.
+        socket.set_nonblocking(false).unwrap();
         socket
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
