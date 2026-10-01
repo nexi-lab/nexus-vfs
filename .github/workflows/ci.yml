@@ -75,6 +75,10 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The version gate below diffs against the PR's merge base, which a
+          # depth-1 checkout does not contain.
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -89,6 +93,34 @@ jobs:
         # Fails when the copy shipped in the package is not byte-identical to
         # proto/nexus/grpc/vfs/vfs.proto, which is the whole point of the package.
         run: npm run build && npm run check-proto
+      - name: A proto change must bump the packaged client's version
+        if: github.event_name == 'pull_request'
+        shell: bash
+        # The release already refuses to overwrite a published version with
+        # different content ("0.4.0 is already published with DIFFERENT
+        # content"), which is the right rule in the wrong place: the proto is
+        # packaged INTO this client, so any proto change changes the package,
+        # and the refusal arrives after a tag has been pushed. That is what
+        # happened to #362 — the tag was cut, every binary built, and the one
+        # artifact a consumer's drift gate reads was the single thing that did
+        # not upload, leaving the published client permanently behind the tag.
+        #
+        # So the same rule is asserted here, where it is still a one-line fix.
+        run: |
+          set -euo pipefail
+          base="$(git merge-base "origin/$GITHUB_BASE_REF" HEAD)"
+          if git diff --quiet "$base" HEAD -- proto/nexus/grpc/vfs/vfs.proto; then
+            echo "proto unchanged — the packaged client's version may stay as it is"
+            exit 0
+          fi
+          ver() { node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).version"; }
+          before="$(git show "$base:clients/node/package.json" | ver)"
+          after="$(ver < clients/node/package.json)"
+          if [ "$before" = "$after" ]; then
+            echo "::error::this PR changes proto/nexus/grpc/vfs/vfs.proto, which is packaged into @nexus-ai-fs/vfs-client — bump clients/node/package.json (still $before) or the release will refuse to republish it and consumers will keep fetching the old proto"
+            exit 1
+          fi
+          echo "proto changed and the packaged client's version moved $before -> $after"
       - name: Test
         working-directory: clients/node
         # Includes no-disk-proto.test.mjs, which catches the client reaching for
