@@ -277,6 +277,21 @@ pub struct Membership {
     /// index — i.e. reachable and caught up, so promoting one to voter can't
     /// strand quorum.  Always a subset of `learners`.
     pub caught_up_learners: Vec<u64>,
+    /// The leader's commit index at the time this was read — the target a
+    /// learner's `matched` is chasing.
+    ///
+    /// Carried alongside the lists because "is it caught up" and "how far off
+    /// is it" are asked by the same caller: JoinZone refuses to promote a
+    /// learner that has not caught up, and the joiner has to decide whether to
+    /// keep waiting. Without a number it can only count attempts, which is how
+    /// a healthy 36-second replay came to be reported as a failed join.
+    pub commit_index: u64,
+    /// Per-learner `matched` index, as `(node_id, matched)`.
+    ///
+    /// The other half of that decision: a learner whose `matched` is advancing
+    /// is being fed and should be waited for however long its backlog is; one
+    /// whose `matched` is stuck is the only case a budget can honestly fail.
+    pub learner_matched: Vec<(u64, u64)>,
 }
 
 impl Membership {
@@ -2580,10 +2595,17 @@ fn read_membership(raw_node: &RawNode<RaftStorage>) -> Membership {
         .copied()
         .filter(|&id| progress_matched(raw_node, id) >= committed)
         .collect();
+    let learner_matched = learners
+        .iter()
+        .copied()
+        .map(|id| (id, progress_matched(raw_node, id)))
+        .collect();
     Membership {
         voters,
         learners,
         caught_up_learners,
+        commit_index: committed,
+        learner_matched,
     }
 }
 
@@ -3166,14 +3188,20 @@ mod tests {
     async fn test_unreachable_learner_is_not_caught_up_so_not_promotable() {
         let (_handle, mut driver, _dir) = leader_1voter().await;
 
-        assert_eq!(
-            read_membership(&driver.raw_node),
-            Membership {
-                voters: vec![1],
-                learners: vec![],
-                caught_up_learners: vec![],
-            },
-            "baseline: self is sole voter, no learners"
+        // Field-wise rather than against a whole literal: `commit_index` is
+        // whatever this fixture's log happens to be, so pinning it would assert
+        // the fixture rather than the membership, and filling it from a second
+        // `read_membership` call would make that field compare equal to itself.
+        let baseline = read_membership(&driver.raw_node);
+        assert_eq!(baseline.voters, vec![1], "baseline: self is sole voter");
+        assert!(baseline.learners.is_empty(), "baseline: no learners");
+        assert!(
+            baseline.caught_up_learners.is_empty(),
+            "baseline: no caught-up learners"
+        );
+        assert!(
+            baseline.learner_matched.is_empty(),
+            "baseline: no learner has a replication position yet"
         );
 
         // Add node 2 as a LEARNER — there is no live peer 2 to replicate to.

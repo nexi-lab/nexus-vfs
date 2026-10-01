@@ -1125,6 +1125,9 @@ impl ZoneApiService for ZoneApiServiceImpl {
                 error: Some("not leader".to_string()),
                 leader_address: leader_addr,
                 config: None,
+                catching_up: false,
+                commit_index: 0,
+                applied_index: 0,
             }));
         }
 
@@ -1166,6 +1169,15 @@ impl ZoneApiService for ZoneApiServiceImpl {
         // response configs from it. Closure captures `peers` by ref and
         // takes id slices, so it needs no `Membership` type in scope and
         // is safe to reuse across the awaits below.
+        // How far the leader has replicated to one learner. Takes the pairs as a
+        // slice for the same reason `make_config` takes id slices — no
+        // `Membership` type in scope here.
+        fn matched_for(learner_matched: &[(u64, u64)], node_id: u64) -> u64 {
+            learner_matched
+                .iter()
+                .find(|(id, _)| *id == node_id)
+                .map_or(0, |(_, matched)| *matched)
+        }
         let peers = self.registry.get_peers(&req.zone_id).unwrap_or_default();
         let make_config = |voters: &[u64], learners: &[u64]| {
             let info = |id: u64, role: i32| ProtoNodeInfo {
@@ -1189,12 +1201,18 @@ impl ZoneApiService for ZoneApiServiceImpl {
                 error: Some("not leader".to_string()),
                 leader_address: leader_hint,
                 config: None,
+                catching_up: false,
+                commit_index: 0,
+                applied_index: 0,
             },
             other => JoinZoneResponse {
                 success: false,
                 error: Some(format!("JoinZone failed: {}", other)),
                 leader_address: None,
                 config: None,
+                catching_up: false,
+                commit_index: 0,
+                applied_index: 0,
             },
         };
 
@@ -1214,6 +1232,9 @@ impl ZoneApiService for ZoneApiServiceImpl {
                 error: None,
                 leader_address: None,
                 config: Some(make_config(&membership.voters, &membership.learners)),
+                catching_up: false,
+                commit_index: 0,
+                applied_index: 0,
             }));
         }
 
@@ -1240,6 +1261,9 @@ impl ZoneApiService for ZoneApiServiceImpl {
                 error: None,
                 leader_address: None,
                 config: Some(make_config(&m.voters, &m.learners)),
+                catching_up: false,
+                commit_index: 0,
+                applied_index: 0,
             }));
         }
 
@@ -1279,6 +1303,10 @@ impl ZoneApiService for ZoneApiServiceImpl {
                 )),
                 leader_address: None,
                 config: Some(make_config(&m.voters, &m.learners)),
+                // Progress, not misconfiguration — see JoinZoneResponse.catching_up.
+                catching_up: true,
+                commit_index: m.commit_index,
+                applied_index: matched_for(&m.learner_matched, req.node_id),
             }));
         }
 
@@ -1305,6 +1333,9 @@ impl ZoneApiService for ZoneApiServiceImpl {
                         error: None,
                         leader_address: None,
                         config: Some(make_config(&conf_state.voters, &learners)),
+                        catching_up: false,
+                        commit_index: 0,
+                        applied_index: 0,
                     }))
                 }
                 Err(e) => Ok(Response::new(fail(e))),
@@ -1325,6 +1356,9 @@ impl ZoneApiService for ZoneApiServiceImpl {
                 )),
                 leader_address: None,
                 config: Some(make_config(&membership.voters, &membership.learners)),
+                catching_up: true,
+                commit_index: membership.commit_index,
+                applied_index: matched_for(&membership.learner_matched, req.node_id),
             }))
         }
     }
