@@ -78,6 +78,18 @@ pub struct FileMetadata {
     /// kernel struct rather than reconstructing it from a sibling
     /// channel.  `None` for non-DT_MOUNT entries.
     pub target_zone_id: Option<String>,
+    /// For `entry_type == DT_MOUNT (2)`: which subtree OF `target_zone_id`
+    /// this mount exposes. `None` or `"/"` means the whole zone, which is
+    /// what every mount meant before this existed.
+    ///
+    /// Carried on the kernel struct for the same reason as
+    /// `target_zone_id`: re-wiring on restart reads the DT_MOUNT record, so
+    /// a subtree held only by the composition root would be right on a
+    /// founder's first boot and silently `"/"` on its next — which is the
+    /// aliasing it exists to prevent (nexi-lab/nexus-vfs#361, where
+    /// `/agents`, `/conversations` and `/sessions` all mounted one zone and
+    /// `readdir /agents` answered with conversation ids).
+    pub target_subtree: Option<String>,
     /// For `entry_type == DT_LINK (6)`: absolute or workspace-relative
     /// VFS path the link resolves to.  `Some` only when entry_type is
     /// DT_LINK.  One-hop resolution at `route()` time with self-loop

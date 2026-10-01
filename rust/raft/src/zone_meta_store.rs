@@ -433,6 +433,14 @@ pub(crate) fn proto_to_kernel(bytes: &[u8]) -> Result<KernelFileMetadata, MetaSt
         },
         created_at_ms: None,
         modified_at_ms: None,
+        // The durable DT_MOUNT wiring path: this is the decoder a mount is
+        // re-wired from on restart, so dropping the subtree here is what would
+        // make a founder correct on its first boot and aliasing on its next.
+        target_subtree: if proto.target_subtree.is_empty() {
+            None
+        } else {
+            Some(proto.target_subtree)
+        },
         last_writer_address: if proto.last_writer_address.is_empty() {
             None
         } else {
@@ -468,6 +476,10 @@ pub(crate) fn kernel_to_proto(meta: &KernelFileMetadata) -> Vec<u8> {
         // replicated SetMetadata to wire the mount on followers.
         // Empty for non-DT_MOUNT entries.
         target_zone_id: meta.target_zone_id.clone().unwrap_or_default(),
+        // Which subtree of that zone the mount exposes; empty means the whole
+        // zone, which is what a non-DT_MOUNT entry and a pre-subtree mount
+        // both mean.
+        target_subtree: meta.target_subtree.clone().unwrap_or_default(),
         // For DT_LINK entries this carries the link target path the
         // route() one-hop resolver follows. Empty for non-DT_LINK entries.
         link_target: meta.link_target.clone().unwrap_or_default(),
@@ -921,7 +933,8 @@ mod tests {
             created_at_ms: None,
             modified_at_ms: None,
             last_writer_address: Some("nexus-1:2028".to_string()),
-            target_zone_id: None,
+            target_zone_id: Some("sharedzone".to_string()),
+            target_subtree: Some("/agents".to_string()),
             link_target: None,
             owner_id: None,
         };
@@ -936,6 +949,10 @@ mod tests {
         assert_eq!(restored.mime_type, meta.mime_type);
         assert_eq!(restored.created_at_ms, None);
         assert_eq!(restored.modified_at_ms, None);
+        assert_eq!(
+            restored.target_subtree, meta.target_subtree,
+            "a mount's declared subtree must survive the proto it is re-wired from"
+        );
         assert_eq!(restored.last_writer_address, meta.last_writer_address);
     }
 
@@ -1022,6 +1039,7 @@ mod tests {
             modified_at_ms: None,
             last_writer_address: Some("nexus-1:2126".to_string()),
             target_zone_id: None,
+            target_subtree: None,
             link_target: None,
             owner_id: None,
         };

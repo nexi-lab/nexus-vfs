@@ -1500,6 +1500,7 @@ impl Kernel {
                 modified_at_ms: None,
                 last_writer_address: None,
                 target_zone_id: Some(route.zone_id.clone()),
+                target_subtree: None,
                 link_target: None,
                 owner_id: None,
             }

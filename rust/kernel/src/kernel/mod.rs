@@ -1123,6 +1123,7 @@ impl Kernel {
             // mkdir, etc.); DT_MOUNT entries are constructed in dlc.rs
             // with the target zone explicitly set.
             target_zone_id: None,
+            target_subtree: None,
             // DT_LINK target: sys_setattr's DT_LINK branch passes the
             // target through a different construction path; non-link
             // metadata never carries a value here.
@@ -1815,6 +1816,7 @@ impl Kernel {
             modified_at_ms: None,
             last_writer_address: self.self_address.read().clone(),
             target_zone_id: None,
+            target_subtree: None,
             link_target: Some(link_target.to_string()),
             owner_id: None,
         };
@@ -3950,6 +3952,7 @@ mod tests {
                 modified_at_ms: None,
                 last_writer_address: None,
                 target_zone_id: None,
+                target_subtree: None,
                 link_target: None,
                 owner_id: None,
             },
@@ -4445,6 +4448,7 @@ mod tests {
                 modified_at_ms: None,
                 last_writer_address: None,
                 target_zone_id: None,
+                target_subtree: None,
                 link_target: Some(target.to_string()),
                 owner_id: None,
             }
@@ -4464,6 +4468,7 @@ mod tests {
                 modified_at_ms: None,
                 last_writer_address: None,
                 target_zone_id: None,
+                target_subtree: None,
                 link_target: None,
                 owner_id: None,
             }

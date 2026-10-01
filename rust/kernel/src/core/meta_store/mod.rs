@@ -175,6 +175,10 @@ fn serialize_metadata(meta: &FileMetadata) -> Vec<u8> {
     write_opt_str(&mut buf, &meta.link_target);
     buf.extend_from_slice(&meta.gen.to_le_bytes());
     write_opt_str(&mut buf, &meta.owner_id);
+    // Appended last, like every field before it: a record written by an older
+    // build simply runs out of bytes here and reads back as None, which means
+    // "the whole zone" — the same thing every mount meant before subtrees.
+    write_opt_str(&mut buf, &meta.target_subtree);
 
     buf
 }
@@ -278,6 +282,9 @@ fn deserialize_metadata(data: &[u8]) -> Result<FileMetadata, MetaStoreError> {
         0
     };
     let owner_id = read_opt_str(data, &mut pos).ok().flatten();
+    // `.ok().flatten()` is what makes the append backward-compatible: an older
+    // record ends before this field and yields None rather than an error.
+    let target_subtree = read_opt_str(data, &mut pos).ok().flatten();
 
     Ok(FileMetadata {
         path,
@@ -291,6 +298,7 @@ fn deserialize_metadata(data: &[u8]) -> Result<FileMetadata, MetaStoreError> {
         created_at_ms,
         modified_at_ms,
         target_zone_id,
+        target_subtree,
         last_writer_address,
         link_target,
         owner_id,
@@ -808,6 +816,7 @@ mod tests {
             modified_at_ms: Some(20),
             last_writer_address: Some("nexus-1:2028".to_string()),
             target_zone_id: None,
+            target_subtree: None,
             link_target: None,
             gen: 42,
             owner_id: None,
@@ -834,6 +843,7 @@ mod tests {
             modified_at_ms: None,
             last_writer_address: None,
             target_zone_id: None,
+            target_subtree: None,
             link_target: None,
             gen: 99,
             owner_id: None,
@@ -862,13 +872,20 @@ mod tests {
             modified_at_ms: None,
             last_writer_address: None,
             target_zone_id: None,
+            target_subtree: None,
             link_target: None,
             gen: 7,
             owner_id: None,
         };
         let mut bytes = serialize_metadata(&meta);
-        // Remove owner_id opt-str (1 byte for None tag) + last byte of gen
-        bytes.truncate(bytes.len() - 2);
+        // Truncate INTO `gen`, which is what must error. Everything written
+        // after `gen` is a `None` opt-str costing one tag byte each, so the
+        // count is "one per trailing optional field, plus one to breach gen":
+        // target_subtree + owner_id + gen's last byte = 3. A field appended
+        // after this one makes it 4 — the decoder tolerates a short tail for
+        // opt-strs by design, so only a number that actually reaches `gen`
+        // tests anything.
+        bytes.truncate(bytes.len() - 3);
 
         let err = deserialize_metadata(&bytes).unwrap_err();
 
@@ -893,6 +910,7 @@ mod tests {
                 modified_at_ms: None,
                 last_writer_address: Some("nexus-1:2028".to_string()),
                 target_zone_id: None,
+                target_subtree: None,
                 link_target: None,
                 owner_id: None,
             },
@@ -909,6 +927,7 @@ mod tests {
                 modified_at_ms: None,
                 last_writer_address: None,
                 target_zone_id: Some("zone-a".to_string()),
+                target_subtree: None,
                 link_target: None,
                 owner_id: None,
             },
@@ -941,6 +960,7 @@ mod tests {
             modified_at_ms: None,
             last_writer_address: None,
             target_zone_id: None,
+            target_subtree: None,
             link_target: None,
             owner_id: None,
         }
@@ -1092,6 +1112,7 @@ mod tests {
             modified_at_ms: None,
             last_writer_address: None,
             target_zone_id: None,
+            target_subtree: None,
             link_target: None,
             owner_id: None,
         };
