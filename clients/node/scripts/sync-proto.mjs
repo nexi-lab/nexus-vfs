@@ -43,6 +43,13 @@ const PROTOS = [
 
 const generated = join(packageRoot, 'src', 'generated', 'proto.ts')
 
+// Release checks consume the same manifest as the packer. A second list missed
+// the Raft protos and let a changed package reuse an already-published version.
+if (process.argv.includes('--list')) {
+  console.log(PROTOS.map(proto => proto.posix).join('\n'))
+  process.exit(0)
+}
+
 for (const proto of PROTOS) {
   if (!existsSync(proto.source)) {
     console.error(`sync-proto: source proto not found at ${proto.source}`)
