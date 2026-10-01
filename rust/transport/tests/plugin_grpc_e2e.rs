@@ -23,8 +23,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use contracts::rust_service::{RustCallError, RustService};
 use kernel::kernel::PluginGrpcEndpoint;
+use nexus_plugin_abi::grpc::{GrpcContext, GrpcError, GrpcService};
 use prost::Message as _;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Endpoint, Server};
@@ -48,28 +48,57 @@ struct EchoMsg {
 /// stripped by the proxy).  Returns proto-encoded response bytes.
 struct EchoDispatcher;
 
-impl RustService for EchoDispatcher {
-    fn name(&self) -> &str {
-        "echo-test"
-    }
-
-    fn dispatch(
-        &self,
-        method: &str,
-        payload: &[u8],
-        _ctx: &contracts::OperationContext,
-    ) -> Result<Vec<u8>, RustCallError> {
+impl GrpcService for EchoDispatcher {
+    fn call(&self, method: &str, payload: &[u8], ctx: &GrpcContext) -> Result<Vec<u8>, GrpcError> {
         assert!(
             method.starts_with("/echo.v1.EchoService/"),
             "proxy must hand the full URL path to plugin dispatch, got {method:?}",
         );
+        assert!(
+            !ctx.peer.is_cluster_node,
+            "headers must not manufacture node provenance"
+        );
+        if method.ends_with("/Reject") {
+            return Err(GrpcError {
+                code: 16,
+                message: "refused 100% / \u{96ea}".into(),
+            });
+        }
         assert!(method.ends_with("/Echo"), "got {method:?}");
-        let req = EchoMsg::decode(payload)
-            .map_err(|e| RustCallError::InvalidArgument(format!("decode EchoRequest: {e}")))?;
+        let tags: Vec<_> = ctx
+            .headers
+            .iter()
+            .filter(|(name, _)| name == "x-tag")
+            .map(|(_, value)| value.as_slice())
+            .collect();
+        assert_eq!(tags, [b"first".as_slice(), b"second".as_slice()]);
+        let mut headers = http::HeaderMap::new();
+        for (name, value) in &ctx.headers {
+            headers.append(
+                http::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                http::HeaderValue::from_bytes(value).unwrap(),
+            );
+        }
+        let metadata = tonic::metadata::MetadataMap::from_headers(headers);
+        assert_eq!(
+            metadata
+                .get_bin("x-bytes-bin")
+                .unwrap()
+                .to_bytes()
+                .unwrap()
+                .as_ref(),
+            &[0, 255, 10]
+        );
+        let req = EchoMsg::decode(payload).map_err(|e| GrpcError {
+            code: 3,
+            message: format!("decode EchoRequest: {e}"),
+        })?;
         let resp = EchoMsg { data: req.data };
         let mut buf = Vec::with_capacity(resp.encoded_len());
-        resp.encode(&mut buf)
-            .map_err(|e| RustCallError::Internal(format!("encode EchoResponse: {e}")))?;
+        resp.encode(&mut buf).map_err(|e| GrpcError {
+            code: 13,
+            message: format!("encode EchoResponse: {e}"),
+        })?;
         Ok(buf)
     }
 }
@@ -84,7 +113,11 @@ async fn external_grpc_client_round_trips_through_plugin_proxy() {
         plugin_name: "echo-test".to_string(),
         service: Arc::new(EchoDispatcher),
     }];
-    let routes = extend_routes_with_plugin_endpoints(tonic::service::Routes::default(), endpoints);
+    let routes = extend_routes_with_plugin_endpoints(
+        tonic::service::Routes::default(),
+        endpoints,
+        Arc::new(std::sync::OnceLock::new()),
+    );
 
     // ── 2. Serve on an ephemeral port ──────────────────────────────
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -119,16 +152,23 @@ async fn external_grpc_client_round_trips_through_plugin_proxy() {
     let path: http::uri::PathAndQuery = "/echo.v1.EchoService/Echo".parse().expect("parse path");
 
     let payload = b"hello from external client".to_vec();
-    let response = grpc
-        .unary(
-            Request::new(EchoMsg {
-                data: payload.clone(),
-            }),
-            path,
-            codec,
-        )
-        .await
-        .expect("unary call");
+    let mut request = Request::new(EchoMsg {
+        data: payload.clone(),
+    });
+    request
+        .metadata_mut()
+        .append("x-tag", "first".parse().unwrap());
+    request
+        .metadata_mut()
+        .append("x-tag", "second".parse().unwrap());
+    request.metadata_mut().insert_bin(
+        "x-bytes-bin",
+        tonic::metadata::MetadataValue::from_bytes(&[0, 255, 10]),
+    );
+    request
+        .metadata_mut()
+        .insert("x-nexus-is-cluster-node", "true".parse().unwrap());
+    let response = grpc.unary(request, path, codec).await.expect("unary call");
 
     let body = response.into_inner();
     assert_eq!(
@@ -136,6 +176,17 @@ async fn external_grpc_client_round_trips_through_plugin_proxy() {
         "proto bytes must round-trip exactly through framing + plugin dispatch",
     );
 
+    grpc.ready().await.unwrap();
+    let error = grpc
+        .unary(
+            Request::new(EchoMsg { data: vec![] }),
+            "/echo.v1.EchoService/Reject".parse().unwrap(),
+            tonic_prost::ProstCodec::<EchoMsg, EchoMsg>::default(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unauthenticated);
+    assert_eq!(error.message(), "refused 100% / \u{96ea}");
     server_handle.abort();
 }
 
@@ -144,7 +195,46 @@ async fn empty_endpoints_passes_routes_through_unchanged() {
     // Cluster boots without any plugin opting in → glue must not
     // perturb existing Routes (otherwise it would silently break the
     // VFS route by reshuffling the axum fallback).
-    let routes = extend_routes_with_plugin_endpoints(tonic::service::Routes::default(), vec![]);
+    let routes = extend_routes_with_plugin_endpoints(
+        tonic::service::Routes::default(),
+        vec![],
+        Arc::new(std::sync::OnceLock::new()),
+    );
     // No panic on into_axum_router → routes survived.
     let _ = routes.into_axum_router();
+}
+
+#[tokio::test]
+async fn malformed_unary_frames_are_rejected_before_dispatch() {
+    use tower::Service;
+
+    struct MustNotDispatch;
+    impl GrpcService for MustNotDispatch {
+        fn call(&self, _: &str, _: &[u8], _: &GrpcContext) -> Result<Vec<u8>, GrpcError> {
+            panic!("malformed requests must not reach a plugin")
+        }
+    }
+    let endpoint = PluginGrpcEndpoint {
+        service_name: "test.Frames".into(),
+        plugin_name: "frames-test".into(),
+        service: Arc::new(MustNotDispatch),
+    };
+    let mut service = transport::grpc_plugin_proxy::PluginProxyService::new(
+        endpoint,
+        Arc::new(std::sync::OnceLock::new()),
+    );
+    for (frame, expected) in [
+        (vec![], "3"),
+        (vec![0, 0, 0, 0], "3"),
+        (vec![0, 0, 0, 0, 2, 1], "3"),
+        (vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0], "3"),
+        (vec![1, 0, 0, 0, 0], "12"),
+    ] {
+        let request = http::Request::builder()
+            .uri("/test.Frames/Call")
+            .body(axum::body::Body::from(frame))
+            .unwrap();
+        let response = service.call(request).await.unwrap();
+        assert_eq!(response.headers()["grpc-status"], expected);
+    }
 }

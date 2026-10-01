@@ -16,11 +16,13 @@
 //! wraps the raw C handles as `Arc<dyn RustService>` or
 //! `Arc<dyn ObjectStore>`.
 //!
-//! **Zero workspace deps** — this crate depends on nothing so plugins
+//! **Zero workspace deps** — default builds have no dependencies so plugins
 //! can be compiled independently of the kernel workspace.
 
 use std::ffi::c_char;
 use std::os::raw::c_void;
+
+pub mod grpc;
 
 // ── ABI version ─────────────────────────────────────────────────────
 
@@ -377,6 +379,9 @@ pub mod symbols {
     pub const SERVICE_CREATE: &str = "nexus_service_create";
     /// `fn(svc, method, payload, len, out_buf, out_len) -> i32`
     pub const SERVICE_DISPATCH: &str = "nexus_service_dispatch";
+    /// Unary gRPC entry point; required when `SERVICE_GRPC_SERVICES` is nonempty.
+    /// See [`crate::grpc::DispatchFn`] for metadata, provenance, and status rules.
+    pub const SERVICE_GRPC_DISPATCH: &str = "nexus_service_dispatch_grpc";
     /// `fn(svc: *mut c_void)`
     pub const SERVICE_DESTROY: &str = "nexus_service_destroy";
     /// `fn() -> *const c_char` — OPTIONAL.
@@ -384,11 +389,12 @@ pub mod symbols {
     /// When present, the kernel's cluster glue exposes this plugin as
     /// an external gRPC service: every `/{service}/{method}` request
     /// whose `{service}` is listed in the returned JSON is routed back
-    /// through the existing [`SERVICE_DISPATCH`] symbol, with `method`
+    /// through the required [`SERVICE_GRPC_DISPATCH`] symbol, with `method`
     /// set to the full path string (`/service/method`) and `payload`
     /// set to the raw proto-encoded request bytes (gRPC frame stripped
     /// by the cluster). The plugin returns proto-encoded response
-    /// bytes; the cluster re-frames them and emits trailers.
+    /// bytes or a gRPC status. Metadata and verified peer provenance travel
+    /// alongside the body; the cluster re-frames replies and emits trailers.
     ///
     /// Return format: null-terminated UTF-8 JSON array of strings,
     /// each a fully-qualified gRPC service name. Example:
@@ -398,7 +404,8 @@ pub mod symbols {
     ///
     /// Plugins that do not export this symbol still load and register
     /// as `RustService` for the legacy in-process `Call` RPC path —
-    /// the symbol is purely additive and does not change the v2 ABI.
+    /// without exporting a gRPC dispatcher. A nonempty advertisement requires
+    /// the gRPC dispatch and buffer-free symbols at load time.
     pub const SERVICE_GRPC_SERVICES: &str = "nexus_plugin_grpc_services";
 
     // ── Driver plugin symbols ───────────────────────────────────

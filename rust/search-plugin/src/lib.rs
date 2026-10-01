@@ -37,9 +37,10 @@
 use std::ffi::c_char;
 use std::sync::Arc;
 
-use nexus_plugin_abi::{declare_service_plugin, KernelHandle};
+use nexus_plugin_abi::grpc::{GrpcContext, GrpcError};
+use nexus_plugin_abi::{declare_grpc_dispatch, declare_service_plugin, KernelHandle};
 use prost::Message;
-use tonic::Request;
+use tonic::Status;
 
 use crate::service::SearchServiceImpl;
 
@@ -175,7 +176,7 @@ fn build_runtime() -> tokio::runtime::Runtime {
 
 /// Plugin-ABI dispatch entry, wrapped in the last line of defence
 /// (#4725).  A panic escaping a handler here would unwind into the
-/// host's `extern "C"` `nexus_service_dispatch` and abort the WHOLE
+/// host's `extern "C"` `nexus_service_dispatch_grpc` and abort the WHOLE
 /// nexusd-cluster process — kernel, raft, every plugin — for one
 /// request's worth of trouble.  The realistic source is tokio
 /// refusing a blocking thread (`OS can't spawn worker thread`), which
@@ -186,12 +187,20 @@ fn build_runtime() -> tokio::runtime::Runtime {
 /// core back from the `CoreGuard` drop when a `block_on` future
 /// panics, so the runtime keeps serving afterwards.  Fail THIS RPC
 /// with `Internal`, count it on Health, carry on.
-fn dispatch_search(plugin: &SearchPlugin, method: &str, payload: &[u8]) -> Result<Vec<u8>, i32> {
+fn dispatch_search(
+    plugin: &SearchPlugin,
+    method: &str,
+    payload: &[u8],
+    context: &GrpcContext,
+) -> Result<Vec<u8>, GrpcError> {
     let guarded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        dispatch_search_inner(plugin, method, payload)
+        dispatch_grpc(plugin, method, payload, context)
     }));
     match guarded {
-        Ok(result) => result,
+        Ok(result) => result.map_err(|status| GrpcError {
+            code: status.code() as u32,
+            message: status.message().to_owned(),
+        }),
         Err(payload) => {
             let reason = crate::http_client::panic_reason(payload.as_ref());
             tracing::error!(
@@ -200,370 +209,79 @@ fn dispatch_search(plugin: &SearchPlugin, method: &str, payload: &[u8]) -> Resul
                 "nexus-search-plugin: handler panicked — failing this RPC instead of the host process",
             );
             plugin.svc.record_dispatch_panic(method, &reason);
-            Err(-3 /* PluginResult::Internal */)
+            Err(GrpcError {
+                code: 13,
+                message: "search handler panicked".into(),
+            })
         }
     }
 }
 
-/// Legacy short-name Call RPC dispatch is intentionally empty — every
-/// caller reaches us through Phase P gRPC routing.  The plugin ABI
-/// still requires a dispatch function pointer, so we translate any
-/// `/`-prefixed method into `dispatch_grpc` and reject the rest.
-fn dispatch_search_inner(
+fn dispatch_grpc(
     plugin: &SearchPlugin,
     method: &str,
     payload: &[u8],
-) -> Result<Vec<u8>, i32> {
-    if method.starts_with('/') {
-        return dispatch_grpc(plugin, method, payload);
+    context: &GrpcContext,
+) -> Result<Vec<u8>, Status> {
+    let method = method
+        .strip_prefix("/nexus.search.v1.SearchService/")
+        .ok_or_else(|| Status::unimplemented("unknown search service"))?;
+    // A search delegation cannot be used on any administrative or file RPC.
+    // Query validates its target zone inside the servicer.
+    if method != "Query" {
+        crate::delegation_gate::extract_and_validate(&context.request(())?, method, "")?;
     }
-    tracing::warn!(
-        method = %method,
-        "nexus-search-plugin: legacy Call RPC method rejected — use gRPC service path",
-    );
-    Err(-2 /* PluginResult::InvalidArgument */)
-}
-
-/// Bytes-level gRPC dispatch (Phase P contract).  `method` is the
-/// full `/<svc.full.Name>/<Method>` path handed to us by the
-/// cluster's `PluginProxyService`; `payload` is the prost-encoded
-/// request body (gRPC frame already stripped upstream); return is
-/// prost-encoded response body.
-fn dispatch_grpc(plugin: &SearchPlugin, method: &str, payload: &[u8]) -> Result<Vec<u8>, i32> {
-    // Strip leading `/` and split off service full name.
-    let (service_and_method, _) = (method.trim_start_matches('/'), ());
-    let mut parts = service_and_method.splitn(2, '/');
-    let (Some(service_full_name), Some(method_name)) = (parts.next(), parts.next()) else {
-        tracing::warn!(method = %method, "malformed gRPC path");
-        return Err(-2);
-    };
-    if service_full_name != "nexus.search.v1.SearchService" {
-        tracing::warn!(
-            service = %service_full_name,
-            method = %method_name,
-            "unknown service",
-        );
-        return Err(-2);
+    macro_rules! call {
+        ($ty:ty, $handler:ident) => {{
+            let body = <$ty>::decode(payload)
+                .map_err(|e| Status::invalid_argument(format!("invalid {method} request: {e}")))?;
+            let request = context.request(body)?;
+            Ok(plugin
+                .rt
+                .block_on(plugin.svc.$handler(request))?
+                .into_inner()
+                .encode_to_vec())
+        }};
     }
-
-    match method_name {
-        "Glob" => {
-            let req = GlobRequest::decode(payload).map_err(|e| {
-                tracing::warn!(err = %e, "Glob decode");
-                -2
-            })?;
-            let resp = plugin
-                .rt
-                .block_on(plugin.svc.glob(Request::new(req)))
-                .map_err(|s| {
-                    tracing::warn!(status = %s, "Glob handler");
-                    -3
-                })?
-                .into_inner();
-            Ok(resp.encode_to_vec())
-        }
-        "Grep" => {
-            let req = GrepRequest::decode(payload).map_err(|e| {
-                tracing::warn!(err = %e, "Grep decode");
-                -2
-            })?;
-            let resp = plugin
-                .rt
-                .block_on(plugin.svc.grep(Request::new(req)))
-                .map_err(|s| {
-                    tracing::warn!(status = %s, "Grep handler");
-                    -3
-                })?
-                .into_inner();
-            Ok(resp.encode_to_vec())
-        }
-        "Query" => {
-            let req = QueryRequest::decode(payload).map_err(|e| {
-                tracing::warn!(err = %e, "Query decode");
-                -2
-            })?;
-            let resp = plugin
-                .rt
-                .block_on(plugin.svc.query(Request::new(req)))
-                .map_err(|s| {
-                    tracing::warn!(status = %s, "Query handler");
-                    -3
-                })?
-                .into_inner();
-            Ok(resp.encode_to_vec())
-        }
-        "Index" => {
-            let req = IndexRequest::decode(payload).map_err(|e| {
-                tracing::warn!(err = %e, "Index decode");
-                -2
-            })?;
-            let resp = plugin
-                .rt
-                .block_on(plugin.svc.index(Request::new(req)))
-                .map_err(|s| {
-                    tracing::warn!(status = %s, "Index handler");
-                    -3
-                })?
-                .into_inner();
-            Ok(resp.encode_to_vec())
-        }
-        "Refresh" => {
-            let req = RefreshRequest::decode(payload).map_err(|e| {
-                tracing::warn!(err = %e, "Refresh decode");
-                -2
-            })?;
-            let resp = plugin
-                .rt
-                .block_on(plugin.svc.refresh(Request::new(req)))
-                .map_err(|s| {
-                    tracing::warn!(status = %s, "Refresh handler");
-                    -3
-                })?
-                .into_inner();
-            Ok(resp.encode_to_vec())
-        }
-        // ── P8 Python-parity RPCs ───────────────────────────
-        //
-        // The dispatch macro pattern repeats; a helper
-        // (dispatch_rpc!(name, req_ty, method)) would DRY it up
-        // but the current 15 arms are still tractable and the
-        // repetition is the code being self-documenting about
-        // which RPCs land here.  Extract when a 20th arm shows
-        // up.
-        "BatchQuery" => {
-            let req = BatchQueryRequest::decode(payload).map_err(|e| {
-                tracing::warn!(err = %e, "BatchQuery decode");
-                -2
-            })?;
-            let resp = plugin
-                .rt
-                .block_on(plugin.svc.batch_query(Request::new(req)))
-                .map_err(|s| {
-                    tracing::warn!(status = %s, "BatchQuery handler");
-                    -3
-                })?
-                .into_inner();
-            Ok(resp.encode_to_vec())
-        }
-        "IndexDocuments" => {
-            let req = IndexDocumentsRequest::decode(payload).map_err(|e| {
-                tracing::warn!(err = %e, "IndexDocuments decode");
-                -2
-            })?;
-            let resp = plugin
-                .rt
-                .block_on(plugin.svc.index_documents(Request::new(req)))
-                .map_err(|s| {
-                    tracing::warn!(status = %s, "IndexDocuments handler");
-                    -3
-                })?
-                .into_inner();
-            Ok(resp.encode_to_vec())
-        }
-        "NotifyFileChange" => {
-            let req = NotifyFileChangeRequest::decode(payload).map_err(|e| {
-                tracing::warn!(err = %e, "NotifyFileChange decode");
-                -2
-            })?;
-            let resp = plugin
-                .rt
-                .block_on(plugin.svc.notify_file_change(Request::new(req)))
-                .map_err(|s| {
-                    tracing::warn!(status = %s, "NotifyFileChange handler");
-                    -3
-                })?
-                .into_inner();
-            Ok(resp.encode_to_vec())
-        }
-        "Locate" => {
-            let req = LocateRequest::decode(payload).map_err(|e| {
-                tracing::warn!(err = %e, "Locate decode");
-                -2
-            })?;
-            let resp = plugin
-                .rt
-                .block_on(plugin.svc.locate(Request::new(req)))
-                .map_err(|s| {
-                    tracing::warn!(status = %s, "Locate handler");
-                    -3
-                })?
-                .into_inner();
-            Ok(resp.encode_to_vec())
-        }
-        "ParkedList" => {
-            let req = ParkedListRequest::decode(payload).map_err(|e| {
-                tracing::warn!(err = %e, "ParkedList decode");
-                -2
-            })?;
-            let resp = plugin
-                .rt
-                .block_on(plugin.svc.parked_list(Request::new(req)))
-                .map_err(|s| {
-                    tracing::warn!(status = %s, "ParkedList handler");
-                    -3
-                })?
-                .into_inner();
-            Ok(resp.encode_to_vec())
-        }
-        "ParkedRetry" => {
-            let req = ParkedRetryRequest::decode(payload).map_err(|e| {
-                tracing::warn!(err = %e, "ParkedRetry decode");
-                -2
-            })?;
-            let resp = plugin
-                .rt
-                .block_on(plugin.svc.parked_retry(Request::new(req)))
-                .map_err(|s| {
-                    tracing::warn!(status = %s, "ParkedRetry handler");
-                    -3
-                })?
-                .into_inner();
-            Ok(resp.encode_to_vec())
-        }
-        "ParkedDiscard" => {
-            let req = ParkedDiscardRequest::decode(payload).map_err(|e| {
-                tracing::warn!(err = %e, "ParkedDiscard decode");
-                -2
-            })?;
-            let resp = plugin
-                .rt
-                .block_on(plugin.svc.parked_discard(Request::new(req)))
-                .map_err(|s| {
-                    tracing::warn!(status = %s, "ParkedDiscard handler");
-                    -3
-                })?
-                .into_inner();
-            Ok(resp.encode_to_vec())
-        }
-        "AddIndexedDirectory" => {
-            let req = AddIndexedDirectoryRequest::decode(payload).map_err(|e| {
-                tracing::warn!(err = %e, "AddIndexedDirectory decode");
-                -2
-            })?;
-            let resp = plugin
-                .rt
-                .block_on(plugin.svc.add_indexed_directory(Request::new(req)))
-                .map_err(|s| {
-                    tracing::warn!(status = %s, "AddIndexedDirectory handler");
-                    -3
-                })?
-                .into_inner();
-            Ok(resp.encode_to_vec())
-        }
-        "RemoveIndexedDirectory" => {
-            let req = RemoveIndexedDirectoryRequest::decode(payload).map_err(|e| {
-                tracing::warn!(err = %e, "RemoveIndexedDirectory decode");
-                -2
-            })?;
-            let resp = plugin
-                .rt
-                .block_on(plugin.svc.remove_indexed_directory(Request::new(req)))
-                .map_err(|s| {
-                    tracing::warn!(status = %s, "RemoveIndexedDirectory handler");
-                    -3
-                })?
-                .into_inner();
-            Ok(resp.encode_to_vec())
-        }
-        "ListIndexedDirectories" => {
-            let req = ListIndexedDirectoriesRequest::decode(payload).map_err(|e| {
-                tracing::warn!(err = %e, "ListIndexedDirectories decode");
-                -2
-            })?;
-            let resp = plugin
-                .rt
-                .block_on(plugin.svc.list_indexed_directories(Request::new(req)))
-                .map_err(|s| {
-                    tracing::warn!(status = %s, "ListIndexedDirectories handler");
-                    -3
-                })?
-                .into_inner();
-            Ok(resp.encode_to_vec())
-        }
-        "SetZoneIndexingMode" => {
-            let req = SetZoneIndexingModeRequest::decode(payload).map_err(|e| {
-                tracing::warn!(err = %e, "SetZoneIndexingMode decode");
-                -2
-            })?;
-            let resp = plugin
-                .rt
-                .block_on(plugin.svc.set_zone_indexing_mode(Request::new(req)))
-                .map_err(|s| {
-                    tracing::warn!(status = %s, "SetZoneIndexingMode handler");
-                    -3
-                })?
-                .into_inner();
-            Ok(resp.encode_to_vec())
-        }
-        "ListZoneIndexingModes" => {
-            let req = ListZoneIndexingModesRequest::decode(payload).map_err(|e| {
-                tracing::warn!(err = %e, "ListZoneIndexingModes decode");
-                -2
-            })?;
-            let resp = plugin
-                .rt
-                .block_on(plugin.svc.list_zone_indexing_modes(Request::new(req)))
-                .map_err(|s| {
-                    tracing::warn!(status = %s, "ListZoneIndexingModes handler");
-                    -3
-                })?
-                .into_inner();
-            Ok(resp.encode_to_vec())
-        }
-        "Health" => {
-            let req = HealthRequest::decode(payload).map_err(|e| {
-                tracing::warn!(err = %e, "Health decode");
-                -2
-            })?;
-            let resp = plugin
-                .rt
-                .block_on(plugin.svc.health(Request::new(req)))
-                .map_err(|s| {
-                    tracing::warn!(status = %s, "Health handler");
-                    -3
-                })?
-                .into_inner();
-            Ok(resp.encode_to_vec())
-        }
-        "Stats" => {
-            let req = StatsRequest::decode(payload).map_err(|e| {
-                tracing::warn!(err = %e, "Stats decode");
-                -2
-            })?;
-            let resp = plugin
-                .rt
-                .block_on(plugin.svc.stats(Request::new(req)))
-                .map_err(|s| {
-                    tracing::warn!(status = %s, "Stats handler");
-                    -3
-                })?
-                .into_inner();
-            Ok(resp.encode_to_vec())
-        }
-        // Test seam (#4725): a panic INSIDE `block_on` — the shape a
-        // thread-spawn failure in `spawn_blocking` takes — so the
-        // dispatch-boundary guard and the runtime's recovery are
-        // exercised end to end.
+    match method {
+        "Glob" => call!(GlobRequest, glob),
+        "Grep" => call!(GrepRequest, grep),
+        "Query" => call!(QueryRequest, query),
+        "Index" => call!(IndexRequest, index),
+        "Refresh" => call!(RefreshRequest, refresh),
+        "BatchQuery" => call!(BatchQueryRequest, batch_query),
+        "IndexDocuments" => call!(IndexDocumentsRequest, index_documents),
+        "NotifyFileChange" => call!(NotifyFileChangeRequest, notify_file_change),
+        "Locate" => call!(LocateRequest, locate),
+        "ParkedList" => call!(ParkedListRequest, parked_list),
+        "ParkedRetry" => call!(ParkedRetryRequest, parked_retry),
+        "ParkedDiscard" => call!(ParkedDiscardRequest, parked_discard),
+        "AddIndexedDirectory" => call!(AddIndexedDirectoryRequest, add_indexed_directory),
+        "RemoveIndexedDirectory" => call!(RemoveIndexedDirectoryRequest, remove_indexed_directory),
+        "ListIndexedDirectories" => call!(ListIndexedDirectoriesRequest, list_indexed_directories),
+        "SetZoneIndexingMode" => call!(SetZoneIndexingModeRequest, set_zone_indexing_mode),
+        "ListZoneIndexingModes" => call!(ListZoneIndexingModesRequest, list_zone_indexing_modes),
+        "Health" => call!(HealthRequest, health),
+        "Stats" => call!(StatsRequest, stats),
         #[cfg(test)]
         "__panic_for_test" => plugin
             .rt
             .block_on(async { panic!("injected dispatch panic") }),
-        _ => {
-            tracing::warn!(method = %method_name, "unknown method");
-            Err(-2)
-        }
+        _ => Err(Status::unimplemented("unknown search method")),
     }
 }
 
 declare_service_plugin!("search", SearchPlugin, {
     create: create_search_plugin,
-    dispatch: dispatch_search,
+    dispatch: |_plugin, _method, _payload| Err(-1),
 });
 
-/// Phase P opt-in: this cdylib exposes the two gRPC service full names
+declare_grpc_dispatch!(SearchPlugin, dispatch_search);
+
+/// Phase P opt-in: this cdylib exposes its gRPC service full name
 /// hosted here, so `nexusd-cluster` can route external tonic traffic
 /// at `/nexus.search.v1.SearchService/<method>` into our
-/// `nexus_service_dispatch`.  See `nexus-plugin-abi`'s
+/// `nexus_service_dispatch_grpc`. See `nexus-plugin-abi`'s
 /// `symbols::SERVICE_GRPC_SERVICES` constant for the JSON contract.
 ///
 /// # Safety
@@ -663,6 +381,7 @@ mod tests {
             plugin,
             "/nexus.search.v1.SearchService/Health",
             &HealthRequest::default().encode_to_vec(),
+            &GrpcContext::default(),
         )
         .expect("health dispatch");
         HealthResponse::decode(bytes.as_slice()).expect("decode health")
@@ -677,9 +396,10 @@ mod tests {
             &plugin,
             "/nexus.search.v1.SearchService/__panic_for_test",
             &[],
+            &GrpcContext::default(),
         )
         .expect_err("a panicking handler fails its RPC");
-        assert_eq!(code, -3, "PluginResult::Internal");
+        assert_eq!(code.code, 13, "PluginResult::Internal");
 
         // The runtime survived the panic inside `block_on` and the
         // service still answers; the panic is on the record.

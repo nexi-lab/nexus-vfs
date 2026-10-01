@@ -366,9 +366,15 @@ impl SearchServiceImpl {
     /// once at first-call time so a second query does not re-log).
     /// Init is lazy — a keyword-only deployment that never wires the
     /// expander pays nothing.
-    fn get_or_init_expander(&self) -> Option<Arc<ExpanderHandle>> {
-        self.expander_slot
-            .get_or_init(|| match build_default_expander() {
+    async fn get_or_init_expander(&self) -> Result<Option<Arc<ExpanderHandle>>, Status> {
+        if let Some(value) = self.expander_slot.get() {
+            return Ok(value.clone());
+        }
+        // reqwest's blocking client must also be constructed outside the
+        // async runtime, before any provider request can run.
+        let slot = Arc::clone(&self.expander_slot);
+        tokio::task::spawn_blocking(move || {
+            slot.get_or_init(|| match build_default_expander() {
                 Ok(None) => None,
                 Ok(Some((expander, cfg))) => {
                     tracing::info!(
@@ -397,6 +403,9 @@ impl SearchServiceImpl {
                 }
             })
             .clone()
+        })
+        .await
+        .map_err(|error| Status::internal(format!("expander initialization failed: {error}")))
     }
 
     /// Peer-fanout dispatcher for THIS process, or `None` if no
@@ -422,9 +431,17 @@ impl SearchServiceImpl {
     /// Contextual-chunking generator for THIS process, or `None` if
     /// the kill-switch is off / misconfig was logged.  Same lazy-
     /// OnceLock story as the sibling getters above.
-    fn get_or_init_context_generator(&self) -> Option<SharedContextGenerator> {
-        self.context_generator_slot
-            .get_or_init(|| match build_default_generator() {
+    async fn get_or_init_context_generator(
+        &self,
+    ) -> Result<Option<SharedContextGenerator>, Status> {
+        if let Some(value) = self.context_generator_slot.get() {
+            return Ok(value.clone());
+        }
+        // reqwest's blocking client must also be constructed outside the
+        // async runtime, before any provider request can run.
+        let slot = Arc::clone(&self.context_generator_slot);
+        tokio::task::spawn_blocking(move || {
+            slot.get_or_init(|| match build_default_generator() {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::error!(
@@ -436,6 +453,11 @@ impl SearchServiceImpl {
                 }
             })
             .clone()
+        })
+        .await
+        .map_err(|error| {
+            Status::internal(format!("context_generator initialization failed: {error}"))
+        })
     }
 
     /// N+1 variant fan-out for LLM query expansion.  Called by
@@ -4025,7 +4047,7 @@ impl SearchService for SearchServiceImpl {
             // never N*M passes down the fleet.  Any expander error
             // (misconfigured / HTTP / timeout) falls through to
             // single-query.
-            if let Some(handle) = self.get_or_init_expander() {
+            if let Some(handle) = self.get_or_init_expander().await? {
                 return self.query_with_expansion(req, handle).await;
             }
         }
@@ -4453,7 +4475,7 @@ impl SearchService for SearchServiceImpl {
         // and re-runs Index.  This matches the "graceful degradation"
         // posture SemanticQuery uses.
         let (embedder, embed_broken) = self.indexing_embedder();
-        let context_generator = self.get_or_init_context_generator();
+        let context_generator = self.get_or_init_context_generator().await?;
         // Retain the zone id for post-outcome cache invalidation
         // (the closure below moves the owned copy into
         // spawn_blocking).
@@ -4529,7 +4551,7 @@ impl SearchService for SearchServiceImpl {
         // embedder means ANN stays unchanged this Refresh; keyword
         // side still incrementally updates.
         let (embedder, embed_broken) = self.indexing_embedder();
-        let context_generator = self.get_or_init_context_generator();
+        let context_generator = self.get_or_init_context_generator().await?;
         let zone_for_invalidate = zone_id.clone();
         let index_seq = Arc::clone(&self.index_seq);
         let outcome = tokio::task::spawn_blocking(move || {
@@ -4675,7 +4697,7 @@ impl SearchService for SearchServiceImpl {
         let default_zone = resolve_zone(&req.zone_id).to_string();
         let manager = Arc::clone(&self.manager);
         let (embedder, embed_broken) = self.indexing_embedder();
-        let context_generator = self.get_or_init_context_generator();
+        let context_generator = self.get_or_init_context_generator().await?;
         let cache = Arc::clone(&self.query_cache);
         let index_seq = Arc::clone(&self.index_seq);
         let embed_gate = Arc::clone(&self.embed_gate);

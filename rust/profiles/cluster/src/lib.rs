@@ -1997,13 +1997,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         daemon_version_string(),
     );
 
-    // Merge plugin-exposed gRPC services onto the same Routes.  Each
-    // service-plugin that exported the optional
-    // `nexus_plugin_grpc_services` ABI symbol gets one URL prefix per
-    // declared service; the proxy strips the gRPC frame and hands raw
-    // proto bytes to the plugin's existing `nexus_service_dispatch`.
-    // Plugins without the opt-in symbol are unaffected — they keep
-    // routing through the legacy Call RPC + ServiceRegistry path.
+    // Plugin gRPC shares the daemon listener and live peer trust roots.
     let plugin_endpoints = kernel.plugin_grpc_endpoints();
     if !plugin_endpoints.is_empty() {
         tracing::info!(
@@ -2014,6 +2008,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     let vfs_routes = transport::grpc_plugin_proxy::extend_routes_with_plugin_endpoints(
         vfs_routes,
         plugin_endpoints,
+        Arc::clone(&fca_verifier_slot),
     );
 
     let ZoneManagerBundle {

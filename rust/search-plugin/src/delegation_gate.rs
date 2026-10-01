@@ -33,17 +33,11 @@
 //! MINTED the delegation, so a broken shape is functionally an
 //! auth failure (their auth material is unusable).
 //!
-//! # Cross-process TTL
-//!
-//! Per the [`SearchDelegation`] cross-process caveat: the mint
-//! side's `created_at_ns` (`Instant`-based) cannot be compared to
-//! the verify side's clock.  We therefore accept the wire's
-//! delegation as if minted NOW on the verifier (the wire trip is
-//! bounded — the TTL protects against replays much later, not
-//! against a delegation older than the wire trip).  Callers who
-//! want a wall-clock freshness check add it on top.
+//! Delegations are admitted only with host-verified cluster-node provenance.
+//! The original Unix timestamp survives transport unchanged, including on replay.
 
-use nexus_search_common::{DelegationError, SearchDelegation, DELEGATION_METADATA_KEY};
+use nexus_plugin_abi::grpc::GrpcPeer;
+use nexus_search_common::{SearchDelegation, DELEGATION_METADATA_KEY};
 use tonic::{Request, Status};
 
 /// What the gate found on an incoming request.  See the module
@@ -89,6 +83,15 @@ pub fn extract_and_validate<T>(
         None => return Ok(GateOutcome::NoDelegation),
         Some(v) => v,
     };
+    if !request
+        .extensions()
+        .get::<GrpcPeer>()
+        .is_some_and(|peer| peer.is_cluster_node)
+    {
+        return Err(Status::unauthenticated(
+            "SearchDelegation requires a verified cluster node",
+        ));
+    }
     let bytes = raw.to_bytes().map_err(|e| {
         Status::unauthenticated(format!(
             "SearchDelegation metadata not valid base64 (per gRPC -bin rule): {e}"
@@ -102,41 +105,11 @@ pub fn extract_and_validate<T>(
     let delegation: SearchDelegation = serde_json::from_slice(&bytes)
         .map_err(|e| Status::unauthenticated(format!("SearchDelegation malformed JSON: {e}")))?;
 
-    // 3. Cross-process TTL: reset `created_at_ns` to NOW on the
-    // verifier so the built-in `is_expired()` check runs against
-    // the verifier's clock, not a comparison to the mint side
-    // (whose Instant epoch is process-local — see the field's
-    // docstring in nexus-search-common).  We keep the original
-    // `ttl_seconds` so a caller that shortens TTLs still gets its
-    // budget respected.
-    let mut fresh = delegation.clone();
-    fresh.created_at_ns = fresh_now_ns();
-
-    // 4. Validate against method + zone + fresh TTL.  Any
-    // violation → Unauthenticated with the specific reason.
-    fresh.validate(method, zone_id).map_err(|e| match e {
-        DelegationError::MethodNotPermitted { .. } => Status::unauthenticated(e.to_string()),
-        DelegationError::ZoneNotPermitted { .. } => Status::unauthenticated(e.to_string()),
-        DelegationError::Expired { .. } => Status::unauthenticated(e.to_string()),
-    })?;
+    delegation
+        .validate(method, zone_id)
+        .map_err(|error| Status::unauthenticated(error.to_string()))?;
 
     Ok(GateOutcome::Accepted { delegation })
-}
-
-/// Same `Instant`-anchored ns count [`SearchDelegation::new_from_now`]
-/// uses on the mint side — reused here so the verifier's cross-
-/// process TTL check has a comparable base.
-fn fresh_now_ns() -> u128 {
-    // `SearchDelegation::new_from_now` uses a private helper on
-    // the type; the field-write path here recomputes it via a
-    // fresh mint (the values match by construction).
-    SearchDelegation::new_from_now(
-        String::new(),
-        String::new(),
-        [String::new()],
-        (String::new(), String::new()),
-    )
-    .created_at_ns
 }
 
 #[cfg(test)]
@@ -145,6 +118,9 @@ mod tests {
     use tonic::metadata::MetadataValue;
 
     fn stamp<T>(req: &mut Request<T>, d: &SearchDelegation) {
+        req.extensions_mut().insert(GrpcPeer {
+            is_cluster_node: true,
+        });
         let bytes = serde_json::to_vec(d).unwrap();
         let key: tonic::metadata::MetadataKey<tonic::metadata::Binary> =
             DELEGATION_METADATA_KEY.parse().unwrap();
@@ -218,8 +194,7 @@ mod tests {
     #[test]
     fn expired_delegation_returns_unauthenticated() {
         // A delegation past its TTL is refused — replay defence.
-        // Use a 0s TTL + brief sleep so the fresh-created_at_ns
-        // on the verifier still reads it as expired.
+        // A zero TTL is expired at issuance, with no scheduler-dependent sleep.
         let d = SearchDelegation::new_with_ttl(
             "sd_expiredx1",
             "peer",
@@ -229,7 +204,6 @@ mod tests {
         );
         let mut req = Request::new(());
         stamp(&mut req, &d);
-        std::thread::sleep(std::time::Duration::from_millis(3));
         let err = extract_and_validate(&req, "search", "eng").unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
     }
@@ -241,6 +215,9 @@ mod tests {
         // Returning Unauthenticated keeps the client-side mapper's
         // "backend refused vs transport failed" split honest.
         let mut req = Request::new(());
+        req.extensions_mut().insert(GrpcPeer {
+            is_cluster_node: true,
+        });
         let key: tonic::metadata::MetadataKey<tonic::metadata::Binary> =
             DELEGATION_METADATA_KEY.parse().unwrap();
         req.metadata_mut()
@@ -270,30 +247,24 @@ mod tests {
     }
 
     #[test]
-    fn cross_process_ttl_uses_verifier_clock_not_mint_time() {
-        // Regression pin for the cross-process TTL note in the
-        // module docstring: a delegation whose mint-side Instant
-        // ns count would look "expired" on the verifier's clock
-        // must still validate, because the gate resets
-        // created_at_ns to the verifier's NOW before the check.
-        //
-        // We can't easily fake a cross-process Instant here, but
-        // we CAN observe that a delegation minted with a modest
-        // TTL (e.g., 5s) passes even after a small wall-clock
-        // sleep — the reset kept it fresh.
-        let d = SearchDelegation::new_with_ttl(
-            "sd_freshxxxxx",
-            "peer",
-            ["eng".to_string()],
-            ("user".into(), "alice".into()),
-            5, // 5s TTL
-        );
+    fn replay_preserves_the_original_expiration() {
+        let mut d = delegation("eng");
+        // A positive TTL already elapsed before this request reached the node.
+        d.created_at_unix_ms -= 60_000;
         let mut req = Request::new(());
         stamp(&mut req, &d);
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        match extract_and_validate(&req, "search", "eng").unwrap() {
-            GateOutcome::Accepted { .. } => {}
-            other => panic!("expected Accepted after tiny sleep, got {other:?}"),
-        }
+        let err = extract_and_validate(&req, "search", "eng").unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+        assert!(err.message().contains("expired"), "{err}");
+    }
+
+    #[test]
+    fn unverified_caller_cannot_supply_a_delegation() {
+        let mut req = Request::new(());
+        stamp(&mut req, &delegation("eng"));
+        req.extensions_mut().remove::<GrpcPeer>();
+        let err = extract_and_validate(&req, "search", "eng").unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+        assert!(err.message().contains("verified cluster node"));
     }
 }
