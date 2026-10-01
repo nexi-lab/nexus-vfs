@@ -3581,10 +3581,15 @@ async fn report_published_federation_zones(zm: &Arc<ZoneManager>) {
              standalone.",
         );
     } else {
+        // Each entry reads `<path>=<zone>:<subtree>`. The subtree is shown
+        // because without it this report was actively misleading: three mounts
+        // onto one zone were listed as three separate publishes while being
+        // one tree with three names (nexi-lab/nexus-vfs#361). `:/` says "the
+        // whole zone", so an operator can see when two entries share one.
         tracing::info!(
             zones = ?published
                 .iter()
-                .map(|(path, zone)| format!("{path}={zone}"))
+                .map(|record| format!("{}={}:{}", record.path, record.zone, record.subtree))
                 .collect::<Vec<_>>(),
             "this node publishes {} federation zone(s) — a joiner pointed here \
              discovers exactly these",

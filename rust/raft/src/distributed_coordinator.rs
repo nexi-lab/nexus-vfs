@@ -131,7 +131,10 @@ pub struct RaftDistributedCoordinator {
     /// "wire what you can, keep what you can't, retry on the next zone" is the
     /// ordering mechanism. It replaces a rescan of every zone per newly wired
     /// zone, which was quadratic in zone count.
-    deferred_mounts: Arc<parking_lot::Mutex<Vec<(String, String, String)>>>,
+    /// `(parent_zone, MountRecord)` — the record carries the mount's path,
+    /// target zone AND declared subtree, so a deferred wire re-applies the same
+    /// mount rather than a whole-zone guess at it.
+    deferred_mounts: Arc<parking_lot::Mutex<Vec<(String, crate::raft::MountRecord)>>>,
     /// Per-peer typed-RPC client used by `peer_*` to dispatch
     /// `NexusVFSService.{Read,Write,Stat,Readdir,Delete,Mkdir,Rename,Setattr}`
     /// against zone voters.  Set by `install_with_kernel`; unset means
@@ -412,8 +415,8 @@ impl RaftDistributedCoordinator {
         let entries = consensus.iter_dt_mount_entries(runtime).unwrap_or_default();
         if !entries.is_empty() {
             let mut deferred = self.deferred_mounts.lock();
-            for (key, target_zone_id) in entries {
-                deferred.push((zone_id.to_string(), key, target_zone_id));
+            for record in entries {
+                deferred.push((zone_id.to_string(), record));
             }
         }
         self.drain_deferred_mounts(kernel);
@@ -440,7 +443,7 @@ impl RaftDistributedCoordinator {
         let lock_manager = kernel.lock_manager_arc();
 
         loop {
-            let batch: Vec<(String, String, String)> = {
+            let batch: Vec<(String, crate::raft::MountRecord)> = {
                 let mut guard = self.deferred_mounts.lock();
                 std::mem::take(&mut *guard)
             };
@@ -448,8 +451,10 @@ impl RaftDistributedCoordinator {
                 return;
             }
             let mut progressed = false;
-            let mut still_deferred: Vec<(String, String, String)> = Vec::new();
-            for (parent_zone_id, mount_path, target_zone_id) in batch {
+            let mut still_deferred: Vec<(String, crate::raft::MountRecord)> = Vec::new();
+            for (parent_zone_id, record) in batch {
+                let mount_path = record.path.clone();
+                let target_zone_id = record.zone.clone();
                 match wire_mount_core(
                     &vfs_router,
                     &lock_manager,
@@ -460,6 +465,7 @@ impl RaftDistributedCoordinator {
                     // Deferred from an apply event, so still zone-relative.
                     MountPath::ZoneRelative(&mount_path),
                     &target_zone_id,
+                    &record.subtree,
                 ) {
                     Ok(()) => {
                         if self.cross_zone_mounts.contains_key(&target_zone_id) {
@@ -468,7 +474,7 @@ impl RaftDistributedCoordinator {
                             // Deferred inside `wire_mount_core` — its parent
                             // mount is not in `cross_zone_mounts` yet, so the
                             // global path cannot be reconstructed.
-                            still_deferred.push((parent_zone_id, mount_path, target_zone_id));
+                            still_deferred.push((parent_zone_id, record));
                         }
                     }
                     // Permanent failure: dropping it matches the previous
@@ -1654,7 +1660,20 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
         mount_path: &str,
         target_zone: &str,
     ) -> CoordinatorResult<()> {
-        wire_mount_impl(self, kernel, parent_zone, mount_path, target_zone)
+        // Whole zone: this is the kernel-side `DistributedCoordinator` trait
+        // method, reached from `sys_setattr DT_MOUNT`, and an operator creating
+        // a mount that way is asking for the zone. The paths that DO declare a
+        // subtree carry it in the DT_MOUNT record and arrive through the apply
+        // observer or the replay, both of which read it from there — so this is
+        // the only mount route that cannot express one, and it does not need to.
+        wire_mount_impl(
+            self,
+            kernel,
+            parent_zone,
+            mount_path,
+            target_zone,
+            contracts::VFS_ROOT,
+        )
     }
 
     fn unwire_mount(
@@ -2402,6 +2421,11 @@ fn wire_mount_core(
     // the tuple by zone-relative key when the row is deleted).
     mount_path: MountPath<'_>,
     target_zone_id: &str,
+    // Which subtree of the TARGET zone this mount exposes; `"/"` for the
+    // whole zone. Threaded because the `ZoneMetaStore` installed here
+    // translates paths with it, and several mounts of one zone alias without
+    // it (nexi-lab/nexus-vfs#361).
+    target_subtree: &str,
 ) -> CoordinatorResult<()> {
     tracing::debug!(
         parent_zone_id = %parent_zone_id,
@@ -2543,16 +2567,16 @@ fn wire_mount_core(
         //    group back on the boot path. The binding resolves on the first
         //    operation that routes through this mount. Reuses the root mount's CAS
         //    backend.
-        // Whole zone, which is what every mount has always exposed. The next
-        // commit lets a mount DECLARE a subtree so one zone can back several
-        // mounts without them aliasing; until a caller declares one, this value
-        // makes both translations the identity and behaviour is unchanged.
+        // The DECLARED subtree, which is what keeps several mounts of one zone
+        // from aliasing: this store translates every path through it, so two
+        // mounts of `sharedzone` exposing `/agents` and `/conversations` keep
+        // disjoint keys instead of collapsing onto one (nexus-vfs#361).
         let metastore: Arc<dyn MetaStore> = ZoneMetaStore::deferred_arc(
             Arc::clone(registry),
             target_zone_id,
             runtime.clone(),
             global_path.clone(),
-            contracts::VFS_ROOT.to_string(),
+            target_subtree.to_string(),
         );
         let root_canonical = canonicalize("/", contracts::ROOT_ZONE_ID);
         let root_backend = vfs_router
@@ -2719,6 +2743,7 @@ fn install_mount_apply_cb_impl(
             MountApplyEvent::Set {
                 key,
                 target_zone_id,
+                target_subtree,
             } => {
                 if let Err(e) = wire_mount_core(
                     &vfs_router,
@@ -2730,6 +2755,7 @@ fn install_mount_apply_cb_impl(
                     // Raft apply: the metastore stripped the parent prefix.
                     MountPath::ZoneRelative(&key),
                     &target_zone_id,
+                    &target_subtree,
                 ) {
                     // The DT_MOUNT is COMMITTED — replicated state says this
                     // path is mounted — and the router on this node does not
@@ -2770,6 +2796,8 @@ fn wire_mount_impl(
     parent_zone_id: &str,
     mount_path: &str,
     target_zone_id: &str,
+    // Subtree of the target zone to expose; `"/"` for the whole zone.
+    target_subtree: &str,
 ) -> CoordinatorResult<()> {
     let zm = provider.zm().ok_or("federation not active")?;
     let runtime = provider
@@ -2823,6 +2851,7 @@ fn wire_mount_impl(
         // The leader was called with the global path (kernel `sys_setattr`).
         MountPath::Global(mount_path),
         target_zone_id,
+        target_subtree,
     )?;
 
     // Best-effort: also install the apply-cb on the parent zone so future
@@ -2967,6 +2996,11 @@ mod tests {
             // apply — so it arrives zone-relative.
             MountPath::ZoneRelative("/cc-tasks/founder"),
             "sharedzone",
+            // This mount exposes the whole zone, which is what a driver mount
+            // nested inside an already-routed zone means. The subtree matters
+            // for SIBLING mounts of one zone (`/agents` vs `/conversations`);
+            // this fixture is about a nested one.
+            contracts::VFS_ROOT,
         )
         .expect("wiring a same-zone driver mount should succeed");
 
@@ -3004,6 +3038,11 @@ mod tests {
             "sharedzone",
             MountPath::ZoneRelative("/cc-tasks/founder"),
             "sharedzone",
+            // This mount exposes the whole zone, which is what a driver mount
+            // nested inside an already-routed zone means. The subtree matters
+            // for SIBLING mounts of one zone (`/agents` vs `/conversations`);
+            // this fixture is about a nested one.
+            contracts::VFS_ROOT,
         )
         .expect("wiring a same-zone driver mount should succeed");
 
