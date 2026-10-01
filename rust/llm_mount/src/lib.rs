@@ -16,6 +16,27 @@
 //! arrives as a structured `error` frame and the stream closes, so a reader is
 //! never left waiting for output that is not coming.
 //!
+//! Clients that already encode a provider's native API can write an HTTP
+//! exchange envelope instead:
+//!
+//! ```json
+//! {"nexus_http":{"version":1,"path":"v1/messages","headers":{}},"body":{"model":"example","messages":[],"stream":true}}
+//! ```
+//!
+//! The connector owns this wire format; the service passes the bytes through.
+//! OpenAI mounts accept `chat/completions` and `responses`. Anthropic mounts
+//! accept `v1/messages` and `v1/messages/count_tokens`. The mount supplies the
+//! upstream base URL and credential. Only `anthropic-version`, `anthropic-beta`
+//! and `x-request-id` request headers may be forwarded.
+//!
+//! The reply starts with JSON `{"type":"response","version":1,"status":200,
+//! "headers":{...}}`. Each body record is one zero byte followed by unchanged
+//! HTTP response bytes, including SSE framing. JSON `done` (with session hash)
+//! or `error` records terminate the exchange. A body cannot impersonate a
+//! control record. Hooks see the unencoded bytes, and clients retain their
+//! existing provider codecs, tool deltas, thinking signatures and cache fields.
+//! Use a unique prompt stem for every in-flight exchange, including retries.
+//!
 //! ## Why a write, and not a syscall
 //!
 //! The predecessor was `PyKernel::llm_start_streaming(mount, zone, request,
