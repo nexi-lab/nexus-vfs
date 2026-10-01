@@ -294,6 +294,7 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -312,6 +313,7 @@ dependencies = [
  "sync_wrapper",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -2478,14 +2480,20 @@ dependencies = [
  "a2a",
  "anyhow",
  "auth",
+ "axum",
  "backends",
+ "base64 0.22.1",
  "clap",
  "contracts",
+ "ed25519-dalek",
  "gethostname",
  "kernel",
  "lib",
  "llm-mount",
  "managed-agent",
+ "nexus-plugin-abi",
+ "nexus-search-common",
+ "nexus-search-plugin",
  "pem",
  "raft 0.1.0",
  "rand 0.10.1",
@@ -2561,6 +2569,10 @@ dependencies = [
 [[package]]
 name = "nexus-plugin-abi"
 version = "0.1.0"
+dependencies = [
+ "http",
+ "tonic",
+]
 
 [[package]]
 name = "nexus-rebac"
@@ -4699,6 +4711,7 @@ version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
+ "log",
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",
@@ -4784,6 +4797,7 @@ dependencies = [
  "http-body-util",
  "kernel",
  "lib",
+ "nexus-plugin-abi",
  "parking_lot",
  "pem",
  "prost",

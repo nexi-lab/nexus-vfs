@@ -1,37 +1,5 @@
-//! Bridge plugin-exported gRPC services into the cluster's tonic
-//! `Routes` without crossing tonic types over the dlopen boundary.
-//!
-//! ## Why this exists
-//!
-//! Plugin cdylibs declare which fully-qualified gRPC services they
-//! handle through the optional `nexus_plugin_grpc_services` ABI symbol
-//! (see `plugin-abi::symbols::SERVICE_GRPC_SERVICES`).  The kernel
-//! [`PluginGrpcEndpoint`] surface (one entry per `(service_name, plugin)`)
-//! wraps each plugin's dispatcher behind `Arc<dyn RustService>` — a
-//! pure bytes-in / bytes-out contract that does not name tonic types.
-//!
-//! This module is the cluster-side glue: for every endpoint, register
-//! a tower `Service` at `/{service_name}/{{*method}}` on the same
-//! `tonic::service::Routes` the built-in VFS routes ride on.  The
-//! proxy:
-//!
-//! 1. Strips the gRPC frame header (1-byte compression flag + 4-byte
-//!    big-endian length) from the inbound HTTP/2 body.
-//! 2. Hands the raw proto bytes to the plugin via
-//!    `RustService::dispatch(path, payload)` — `path` is the full URL
-//!    (e.g. `/nexus.secrets.v1.GenericSecretsService/PutSecret`), so
-//!    the plugin can multiplex many methods through one dispatcher.
-//! 3. Wraps the returned bytes in a fresh gRPC frame and emits
-//!    `grpc-status: 0` trailers on success (or the matching tonic
-//!    `Code` for `RustCallError` variants).
-//!
-//! ## Contract crossing the dlopen boundary
-//!
-//! Only `(method: &str, payload: &[u8]) -> Result<Vec<u8>, _>` — the
-//! existing v2 `nexus_service_dispatch` shape.  No tonic types, no
-//! `tonic::service::Routes`, no `axum::Router`.  The plugin author is
-//! free to use a different tonic / axum / prost version than the
-//! cluster ships; only their proto wire bytes need to agree.
+//! Route unary gRPC calls to plugin C entry points while preserving metadata,
+//! verified peer provenance, and gRPC statuses. The plugin owns protobuf decoding.
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -39,46 +7,14 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use crate::grpc::ForeignCaVerifierSlot;
 use bytes::{BufMut, Bytes, BytesMut};
-use contracts::rust_service::RustCallError;
 use http::HeaderMap;
 use http_body::Frame;
 use http_body_util::{BodyExt, StreamBody};
 use kernel::kernel::PluginGrpcEndpoint;
+use nexus_plugin_abi::grpc::{GrpcContext, GrpcPeer};
 use tower::Service;
-
-/// The caller identity this plane can honestly claim: none.
-///
-/// Unlike the `Call` handler — which runs an [`AuthProvider`] and hands
-/// `dispatch` the resolved principal — these routes are registered straight
-/// onto `tonic::service::Routes` and never resolve a per-request identity. The
-/// *connection* is mTLS-terminated, so the peer is a cert the cluster CA
-/// signed; which agent or person is behind this particular request is simply
-/// not determined here.
-///
-/// So this fabricates nothing. `agent_id` is `None`, which reads as "not a
-/// delegated call" to anything checking (see `managed_agent::authenticated_owner`);
-/// `is_admin` and `is_system` are false, so it can never be mistaken for a
-/// grant. The `user_id` names the plane rather than a principal, so a plugin
-/// that logs it records where the call came from and not a person it could
-/// attribute the action to.
-///
-/// Note that today this reaches only `DylibRustService`, which drops the
-/// context at the dlopen boundary (the v6 plugin ABI passes bytes, not
-/// identity). Resolving a real principal here would mean running the auth
-/// provider on this plane *and* widening the plugin ABI — a separate change,
-/// and one that would alter what plugins are allowed to do.
-///
-/// [`AuthProvider`]: crate::auth::AuthProvider
-fn unauthenticated_caller() -> contracts::OperationContext {
-    contracts::OperationContext::new(
-        "plugin-grpc-proxy",
-        contracts::ROOT_ZONE_ID,
-        /* is_admin */ false,
-        /* agent_id */ None,
-        /* is_system */ false,
-    )
-}
 
 /// A tower `Service` that proxies one fully-qualified gRPC service
 /// name through a plugin's bytes-level dispatcher.
@@ -87,12 +23,14 @@ fn unauthenticated_caller() -> contracts::OperationContext {
 #[derive(Clone)]
 pub struct PluginProxyService {
     inner: Arc<PluginGrpcEndpoint>,
+    verifier: ForeignCaVerifierSlot,
 }
 
 impl PluginProxyService {
-    pub fn new(endpoint: PluginGrpcEndpoint) -> Self {
+    pub fn new(endpoint: PluginGrpcEndpoint, verifier: ForeignCaVerifierSlot) -> Self {
         Self {
             inner: Arc::new(endpoint),
+            verifier,
         }
     }
 }
@@ -109,9 +47,38 @@ impl Service<http::Request<axum::body::Body>> for PluginProxyService {
 
     fn call(&mut self, req: http::Request<axum::body::Body>) -> Self::Future {
         let endpoint = Arc::clone(&self.inner);
+        let verifier = Arc::clone(&self.verifier);
         Box::pin(async move {
             let path = req.uri().path().to_string();
-            let body_bytes = match req.into_body().collect().await {
+            let req = tonic::Request::from_http(req);
+            // An unset verifier cannot vouch for a node, including during boot.
+            // The same live trust roots classify VFS and plugin callers.
+            let is_cluster_node = verifier
+                .get()
+                .and_then(|v| {
+                    crate::peer_identity::classify_from_request(
+                        &req,
+                        v.cluster_ca_der(),
+                        &v.foreign_anchors(),
+                    )
+                })
+                .is_some_and(|peer| {
+                    peer.node_id.is_some()
+                        && peer.agent_name.is_none()
+                        && peer.trust_domain.is_none()
+                });
+            let context = GrpcContext {
+                headers: req
+                    .metadata()
+                    .clone()
+                    .into_headers()
+                    .iter()
+                    .map(|(name, value)| (name.to_string(), value.as_bytes().to_vec()))
+                    .collect(),
+                peer: GrpcPeer { is_cluster_node },
+            };
+
+            let body_bytes = match req.into_inner().collect().await {
                 Ok(c) => c.to_bytes(),
                 Err(_) => {
                     return Ok(grpc_trailer_only(
@@ -128,31 +95,37 @@ impl Service<http::Request<axum::body::Body>> for PluginProxyService {
                     "plugin-proxy: request body shorter than gRPC frame header",
                 ));
             }
+
+            if body_bytes[0] != 0 {
+                return Ok(grpc_trailer_only(
+                    tonic::Code::Unimplemented,
+                    "plugin-proxy: compressed requests are unsupported",
+                ));
+            }
+            let declared = u32::from_be_bytes(body_bytes[1..5].try_into().unwrap()) as usize;
+            if declared != body_bytes.len() - 5 {
+                return Ok(grpc_trailer_only(
+                    tonic::Code::InvalidArgument,
+                    "plugin-proxy: expected one complete unary gRPC message",
+                ));
+            }
             let payload = body_bytes.slice(5..);
 
             // FFI dispatch may block (the plugin reaches into redb,
             // libsodium, etc.).  Move it off the tokio reactor.
             let dispatch_path = path.clone();
             let result = tokio::task::spawn_blocking(move || {
-                endpoint
-                    .service
-                    .dispatch(&dispatch_path, &payload, &unauthenticated_caller())
+                endpoint.service.call(&dispatch_path, &payload, &context)
             })
             .await;
 
             let response_bytes: Vec<u8> = match result {
                 Ok(Ok(b)) => b,
-                Ok(Err(RustCallError::NotFound)) => {
+                Ok(Err(status)) => {
                     return Ok(grpc_trailer_only(
-                        tonic::Code::Unimplemented,
-                        &format!("plugin-proxy: {path}: not implemented"),
+                        tonic::Code::from_i32(status.code as i32),
+                        &status.message,
                     ));
-                }
-                Ok(Err(RustCallError::InvalidArgument(msg))) => {
-                    return Ok(grpc_trailer_only(tonic::Code::InvalidArgument, &msg));
-                }
-                Ok(Err(RustCallError::Internal(msg))) => {
-                    return Ok(grpc_trailer_only(tonic::Code::Internal, &msg));
                 }
                 Err(join_err) => {
                     return Ok(grpc_trailer_only(
@@ -198,27 +171,8 @@ fn grpc_data_response(framed: Bytes) -> http::Response<axum::body::Body> {
 /// `grpc-status` code and `grpc-message`.  HTTP status remains 200 —
 /// gRPC ferries the error through trailers, not the HTTP status line.
 fn grpc_trailer_only(code: tonic::Code, message: &str) -> http::Response<axum::body::Body> {
-    let mut trailers = HeaderMap::new();
-    trailers.insert(
-        "grpc-status",
-        http::HeaderValue::from_str(&(code as i32).to_string())
-            .unwrap_or_else(|_| http::HeaderValue::from_static("13")),
-    );
-    if !message.is_empty() {
-        if let Ok(v) = http::HeaderValue::from_str(message) {
-            trailers.insert("grpc-message", v);
-        }
-    }
-    let trailers_frame: Result<Frame<Bytes>, Infallible> = Ok(Frame::trailers(trailers));
-    let stream = futures::stream::iter([trailers_frame]);
-    let body = axum::body::Body::new(StreamBody::new(stream));
-
-    let mut response = http::Response::new(body);
-    response.headers_mut().insert(
-        http::header::CONTENT_TYPE,
-        http::HeaderValue::from_static("application/grpc"),
-    );
-    response
+    // tonic encodes grpc-message correctly, including Unicode and percent signs.
+    tonic::Status::new(code, message).into_http()
 }
 
 // ── Routes glue ────────────────────────────────────────────────────
@@ -236,6 +190,7 @@ fn grpc_trailer_only(code: tonic::Code, message: &str) -> http::Response<axum::b
 pub fn extend_routes_with_plugin_endpoints(
     routes: tonic::service::Routes,
     endpoints: Vec<PluginGrpcEndpoint>,
+    verifier: ForeignCaVerifierSlot,
 ) -> tonic::service::Routes {
     if endpoints.is_empty() {
         return routes;
@@ -244,7 +199,7 @@ pub fn extend_routes_with_plugin_endpoints(
     for ep in endpoints {
         let plugin_name = ep.plugin_name.clone();
         let service_name = ep.service_name.clone();
-        let svc = PluginProxyService::new(ep);
+        let svc = PluginProxyService::new(ep, Arc::clone(&verifier));
         router = router.route_service(&format!("/{service_name}/{{*method}}"), svc);
         tracing::info!(
             plugin = plugin_name,

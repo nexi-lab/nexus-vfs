@@ -18,6 +18,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use contracts::rust_service::{RustCallError, RustService};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use nexus_plugin_abi::grpc::{
+    DispatchFn as GrpcDispatchFn, GrpcContext, GrpcError, GrpcService, Header,
+};
 use nexus_plugin_abi::{
     signing::{PUBKEY_LENGTH, SIGNATURE_FILE_SUFFIX, SIGNATURE_LENGTH},
     DriverCreateFn, DriverDeleteFileFn, DriverDestroyFn, DriverReadFn, DriverReaddirFn,
@@ -294,6 +297,7 @@ struct LoadedPlugin {
     /// exposing via the optional `nexus_plugin_grpc_services` symbol.
     /// Empty for plugins (or driver kind) that did not export it.
     grpc_services: Vec<String>,
+    grpc_dispatch: Option<(GrpcDispatchFn, NexusFreeFn)>,
 }
 
 // SAFETY: The plugin C ABI contract requires all plugin instances to be
@@ -304,32 +308,12 @@ unsafe impl Sync for LoadedPlugin {}
 
 // ── PluginGrpcEndpoint (public surface to cluster glue) ─────────────
 
-/// One plugin-exposed gRPC service ready for cluster-side tonic
-/// routing.  Returned by [`PluginLoader::collect_grpc_endpoints`].
-///
-/// The cluster builds one tower `Service` per endpoint, registered at
-/// `/{service_name}/{{*method}}` in tonic's axum router.  Inbound
-/// requests strip the gRPC frame header, pass the request bytes to
-/// `service.dispatch(full_path, bytes)`, and re-frame the returned
-/// response bytes.
-///
-/// Contract for the plugin's `RustService::dispatch`:
-///
-/// - `method` is the request URL path, e.g.
-///   `"/nexus.secrets.v1.GenericSecretsService/PutSecret"`.  The
-///   leading `/` distinguishes a gRPC-routed call from the legacy
-///   short-method `Call` RPC convention (`"secret_put"`); plugins
-///   that serve both branches simply match on the prefix.
-/// - `payload` is the proto-encoded request body (gRPC framing
-///   already stripped on the cluster side).
-/// - Returned bytes are the proto-encoded response body; the cluster
-///   re-frames and emits `grpc-status: 0` trailers on success.
-/// - `RustCallError::NotFound` → gRPC `Unimplemented`;
-///   `InvalidArgument` → `InvalidArgument`; `Internal(_)` → `Internal`.
+/// A plugin's unary gRPC endpoint. The dispatcher preserves request metadata,
+/// verified peer provenance, and the gRPC response status across the C boundary.
 pub struct PluginGrpcEndpoint {
     pub service_name: String,
     pub plugin_name: String,
-    pub service: Arc<dyn RustService>,
+    pub service: Arc<dyn GrpcService>,
 }
 
 // ── Cross-allocator buffer hand-back ────────────────────────────────
@@ -367,6 +351,63 @@ fn resolve_plugin_free(lib: &libloading::Library) -> Result<NexusFreeFn, String>
         lib.get::<NexusFreeFn>(b"nexus_free")
             .map(|sym| *sym)
             .map_err(|e| format!("symbol nexus_free: {e}"))
+    }
+}
+
+struct DylibGrpcService {
+    handle: *mut c_void,
+    dispatch: GrpcDispatchFn,
+    free: NexusFreeFn,
+}
+
+// The plugin contract requires concurrent calls to be safe.
+unsafe impl Send for DylibGrpcService {}
+unsafe impl Sync for DylibGrpcService {}
+
+impl GrpcService for DylibGrpcService {
+    fn call(
+        &self,
+        method: &str,
+        payload: &[u8],
+        context: &GrpcContext,
+    ) -> Result<Vec<u8>, GrpcError> {
+        let method = CString::new(method).map_err(|_| GrpcError {
+            code: 3,
+            message: "gRPC method contains a null byte".into(),
+        })?;
+        let headers: Vec<_> = context
+            .headers
+            .iter()
+            .map(|(name, value)| Header::borrowed(name, value))
+            .collect();
+        let mut output = std::ptr::null_mut();
+        let mut len = 0;
+        let code = unsafe {
+            (self.dispatch)(
+                self.handle,
+                method.as_ptr(),
+                payload.as_ptr(),
+                payload.len(),
+                headers.as_ptr(),
+                headers.len(),
+                context.peer.is_cluster_node,
+                &mut output,
+                &mut len,
+            )
+        };
+        // Both success and error buffers belong to the plugin's allocator.
+        let bytes = unsafe { take_plugin_buf(output, len, self.free) };
+        match code {
+            0 => Ok(bytes),
+            1..=16 => Err(GrpcError {
+                code,
+                message: String::from_utf8_lossy(&bytes).into_owned(),
+            }),
+            _ => Err(GrpcError {
+                code: 13,
+                message: format!("plugin returned invalid gRPC status {code}"),
+            }),
+        }
     }
 }
 
@@ -850,6 +891,7 @@ impl PluginLoader {
 
         // 3. Construct instance based on kind
         let mut grpc_services: Vec<String> = Vec::new();
+        let mut grpc_dispatch = None;
         let (handle, destroy_fn) = match kind {
             PluginKind::Service => {
                 let create_fn: ServiceCreateFn = unsafe {
@@ -864,10 +906,6 @@ impl PluginLoader {
                             format!("symbol {}: {e}", nexus_plugin_abi::symbols::SERVICE_DESTROY)
                         })?
                 };
-                let handle = unsafe { create_fn(kernel_handle as *const KernelHandle) };
-                if handle.is_null() {
-                    return Err(format!("nexus_service_create returned null for '{name}'"));
-                }
                 // Optional gRPC opt-in.  Plugin authors that want to be
                 // routed as an external gRPC service export
                 // `nexus_plugin_grpc_services` returning a JSON array
@@ -881,12 +919,26 @@ impl PluginLoader {
                 } {
                     grpc_services = parse_grpc_services_symbol(*sym, &name)?;
                     if !grpc_services.is_empty() {
+                        // A declared gRPC endpoint must preserve the full call
+                        // contract. Refuse an incomplete plugin before creating it.
+                        let dispatch = unsafe {
+                            *lib.get::<GrpcDispatchFn>(
+                                nexus_plugin_abi::symbols::SERVICE_GRPC_DISPATCH.as_bytes(),
+                            )
+                            .map_err(|e| format!("{name}: required gRPC dispatch symbol: {e}"))?
+                        };
+                        grpc_dispatch = Some((dispatch, resolve_plugin_free(&lib)?));
+
                         tracing::info!(
                             plugin = name,
                             services = ?grpc_services,
                             "plugin opted into external gRPC routing",
                         );
                     }
+                }
+                let handle = unsafe { create_fn(kernel_handle as *const KernelHandle) };
+                if handle.is_null() {
+                    return Err(format!("nexus_service_create returned null for '{name}'"));
                 }
                 (handle, destroy_fn)
             }
@@ -943,6 +995,7 @@ impl PluginLoader {
             handle,
             destroy_fn,
             grpc_services,
+            grpc_dispatch,
         };
 
         let mut map = self.loaded.lock().unwrap();
@@ -1074,7 +1127,7 @@ impl PluginLoader {
     ///
     /// One `PluginGrpcEndpoint` is returned per service-name × plugin.
     /// A single plugin exposing N services produces N endpoints sharing
-    /// one underlying `RustService` dispatcher (one plugin instance);
+    /// one underlying `GrpcService` dispatcher (one plugin instance);
     /// the cluster wires each as its own URL prefix in tonic Routes.
     ///
     /// Driver plugins are skipped (no service-dispatch surface).
@@ -1086,39 +1139,13 @@ impl PluginLoader {
             if plugin.kind != PluginKind::Service || plugin.grpc_services.is_empty() {
                 continue;
             }
-            // Resolve dispatch_fn once per plugin; share the Arc across
-            // every service-name the plugin claims.
-            let dispatch_fn: ServiceDispatchFn = match unsafe {
-                plugin
-                    ._lib
-                    .get(nexus_plugin_abi::symbols::SERVICE_DISPATCH.as_bytes())
-            } {
-                Ok(sym) => *sym,
-                Err(e) => {
-                    tracing::warn!(
-                        plugin = plugin_name,
-                        err = %e,
-                        "skip plugin gRPC endpoints — dispatch symbol missing",
-                    );
-                    continue;
-                }
-            };
-            let free_fn = match resolve_plugin_free(&plugin._lib) {
-                Ok(f) => f,
-                Err(e) => {
-                    tracing::warn!(
-                        plugin = plugin_name,
-                        err = %e,
-                        "skip plugin gRPC endpoints — nexus_free symbol missing",
-                    );
-                    continue;
-                }
-            };
-            let svc: Arc<dyn RustService> = Arc::new(DylibRustService {
-                svc_name: plugin_name.clone(),
+            let (dispatch, free) = plugin
+                .grpc_dispatch
+                .expect("gRPC symbols were validated before plugin creation");
+            let svc: Arc<dyn GrpcService> = Arc::new(DylibGrpcService {
                 handle: plugin.handle,
-                dispatch_fn,
-                free_fn,
+                dispatch,
+                free,
             });
             for service_name in &plugin.grpc_services {
                 out.push(PluginGrpcEndpoint {

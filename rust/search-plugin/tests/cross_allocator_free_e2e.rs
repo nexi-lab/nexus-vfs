@@ -38,7 +38,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use nexus_plugin_abi::{KernelHandle, NexusFreeFn, ServiceCreateFn, ServiceDispatchFn};
+use nexus_plugin_abi::{KernelHandle, NexusFreeFn, ServiceCreateFn};
 use nexus_search_plugin::search_proto::{GrepRequest, GrepResponse};
 use prost::Message;
 
@@ -250,8 +250,8 @@ fn grep_over_cdylib_survives_cross_allocator_free() {
         let create: libloading::Symbol<ServiceCreateFn> = lib
             .get(b"nexus_service_create")
             .expect("resolve nexus_service_create");
-        let dispatch: libloading::Symbol<ServiceDispatchFn> = lib
-            .get(b"nexus_service_dispatch")
+        let dispatch: libloading::Symbol<nexus_plugin_abi::grpc::DispatchFn> = lib
+            .get(b"nexus_service_dispatch_grpc")
             .expect("resolve nexus_service_dispatch");
         let destroy: libloading::Symbol<unsafe extern "C" fn(*mut c_void)> = lib
             .get(b"nexus_service_destroy")
@@ -283,6 +283,9 @@ fn grep_over_cdylib_survives_cross_allocator_free() {
             method.as_ptr(),
             payload.as_ptr(),
             payload.len(),
+            std::ptr::null(),
+            0,
+            false,
             &mut out_buf,
             &mut out_len,
         );
