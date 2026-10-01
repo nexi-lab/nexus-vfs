@@ -386,15 +386,30 @@ fn default_replicated_prefixes() -> impl Iterator<Item = &'static str> {
 fn with_default_replicated_mounts(
     declared: &std::collections::BTreeMap<String, String>,
     init_zones: &[String],
-) -> std::collections::BTreeMap<String, String> {
-    let mut resolved = declared.clone();
+) -> std::collections::BTreeMap<String, nexus_raft::zone_manager::MountDecl> {
+    use nexus_raft::zone_manager::MountDecl;
+
+    // An operator who writes `--cluster-init-mount <path>=<zone>` is asking for
+    // that zone, whole — the meaning that flag has always had.
+    let mut resolved: std::collections::BTreeMap<String, MountDecl> = declared
+        .iter()
+        .map(|(path, zone)| (path.clone(), MountDecl::whole_zone(zone)))
+        .collect();
     let [zone] = init_zones else {
         return resolved;
     };
+    // The prefixes this function injects all land on the SAME zone, so each one
+    // must say which subtree of it to expose or they alias: `to_zone_key`
+    // strips the mount prefix, and three mounts exposing the zone's root make
+    // `/agents/win-ai` and `/conversations/win-ai` one key
+    // (nexi-lab/nexus-vfs#361 — `readdir /agents` answered with conversation
+    // ids). The subtree is the prefix itself, declared HERE, at the one place
+    // these mounts are created, and carried on the DT_MOUNT record from here
+    // on so a restart and a joiner both re-apply it rather than re-guess.
     for prefix in default_replicated_prefixes() {
         resolved
             .entry(prefix.to_string())
-            .or_insert_with(|| zone.clone());
+            .or_insert_with(|| MountDecl::subtree_of(zone.clone(), prefix));
     }
     resolved
 }
@@ -2306,7 +2321,12 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         identity_persisted_peers: identity_persisted_peers.clone(),
         cli_peer_addrs: cli_peer_addrs.clone(),
         federation_zones: init_zones.clone(),
-        federation_mounts: federation_mounts.clone(),
+        // The boot matrix asks which paths map to which ZONES (row 6's
+        // split-brain check); a mount's subtree is not part of that question.
+        federation_mounts: federation_mounts
+            .iter()
+            .map(|(path, decl)| (path.clone(), decl.zone.clone()))
+            .collect(),
         bootstrap_new: false, // retired knob; kept on struct for backwards struct-literal compat
         has_disk_state: data_dir_has_root,
         identity_zones: identity_zones.clone(),
@@ -2350,9 +2370,15 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     match boot_action {
         nexus_raft::bootstrap::BootAction::StaticFounder {
             zones,
-            mounts,
+            // The boot matrix reduced these to `path -> zone` because that is
+            // the question it answers; founding needs the DECLARATIONS, which
+            // carry each mount's subtree. `federation_mounts` is what the
+            // matrix was derived from, so this is the same topology with the
+            // part the matrix discarded still attached.
+            mounts: _matrix_mounts,
             peers_for_ha,
         } => {
+            let mounts = federation_mounts.clone();
             // Matrix row 1 — see `plan_boot_action` docstring for the
             // full table.  Pure founder: auto-create SOLO per zone.
             tracing::info!(
@@ -2558,7 +2584,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
                 zm.bootstrap_static_async(
                     init_zones.clone(),
                     Vec::new(),
-                    init_mounts.mounts.clone(),
+                    federation_mounts.clone(),
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("resume re-assert founder topology: {}", e))?;
@@ -6441,12 +6467,31 @@ mod tests {
     fn a_single_declared_zone_mounts_every_declared_prefix() {
         let resolved = with_default_replicated_mounts(&mounts(&[]), &["sharedzone".to_string()]);
         for prefix in default_replicated_prefixes() {
+            let decl = resolved
+                .get(prefix)
+                .unwrap_or_else(|| panic!("{prefix} must be mounted automatically"));
             assert_eq!(
-                resolved.get(prefix).map(String::as_str),
-                Some("sharedzone"),
+                decl.zone, "sharedzone",
                 "{prefix} must be mounted on the declared zone automatically"
             );
+            // And it must say WHICH subtree of that zone. Every injected prefix
+            // lands on the same zone, so without this they expose the zone's
+            // root three times over and `/agents/win-ai` and
+            // `/conversations/win-ai` become one key (nexi-lab/nexus-vfs#361).
+            assert_eq!(
+                decl.subtree, prefix,
+                "{prefix} must expose only its own subtree of the shared zone"
+            );
         }
+        // Stated as a set, so the aliasing is impossible by construction rather
+        // than by three separate assertions that could each be right alone.
+        let subtrees: std::collections::BTreeSet<&str> =
+            resolved.values().map(|d| d.subtree.as_str()).collect();
+        assert_eq!(
+            subtrees.len(),
+            resolved.len(),
+            "two mounts of one zone sharing a subtree is the aliasing itself: {resolved:?}"
+        );
         // The A2A addresses and the session store are all covered by that loop;
         // name one of each so a reader sees what the list actually contains.
         assert!(resolved.contains_key(a2a::A2A_INBOX_BASE));
@@ -6476,13 +6521,15 @@ mod tests {
         let declared = mounts(&[(a2a::A2A_INBOX_BASE, "other-zone")]);
         let resolved = with_default_replicated_mounts(&declared, &["sharedzone".to_string()]);
         assert_eq!(
-            resolved.get(a2a::A2A_INBOX_BASE).map(String::as_str),
+            resolved.get(a2a::A2A_INBOX_BASE).map(|d| d.zone.as_str()),
             Some("other-zone"),
             "the operator said where /agents goes; injection must not move it"
         );
         // …while the prefixes they did NOT mention are still filled in.
         assert_eq!(
-            resolved.get(a2a::CONVERSATIONS_BASE).map(String::as_str),
+            resolved
+                .get(a2a::CONVERSATIONS_BASE)
+                .map(|d| d.zone.as_str()),
             Some("sharedzone"),
         );
     }

@@ -68,6 +68,48 @@ pub(crate) fn encode_file_metadata(
 /// it from `path` would make two nodes that mount one zone at different local
 /// paths disagree about that zone's keys, which `join <peer>:/<zone> <local>`
 /// permits.
+/// One declared federation mount: which zone, and WHICH SUBTREE of it.
+///
+/// The subtree is why this is a struct rather than the `path -> zone` string
+/// map it replaced. That map had nowhere to say "this mount exposes
+/// `/agents` of sharedzone", so every mount exposed the zone's root — and with
+/// `/agents`, `/conversations` and `/sessions` all mounted onto one zone, the
+/// three were one tree with three names (nexi-lab/nexus-vfs#361).
+///
+/// `subtree` is DECLARED by whoever states the topology, never derived from
+/// `path`: `join <peer>:/<zone> <local-path>` lets two nodes mount one zone at
+/// different local paths, and deriving would make them disagree about that
+/// zone's own keys.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MountDecl {
+    /// Zone this mount points into.
+    pub zone: String,
+    /// Subtree of `zone` to expose; `"/"` for the whole zone.
+    pub subtree: String,
+}
+
+impl MountDecl {
+    /// A mount exposing the whole zone — what every mount meant before
+    /// subtrees, and what an operator-declared `--cluster-init-mount
+    /// <path>=<zone>` still means.
+    #[must_use]
+    pub fn whole_zone(zone: impl Into<String>) -> Self {
+        Self {
+            zone: zone.into(),
+            subtree: contracts::VFS_ROOT.to_string(),
+        }
+    }
+
+    /// A mount exposing only `subtree` of the zone.
+    #[must_use]
+    pub fn subtree_of(zone: impl Into<String>, subtree: impl Into<String>) -> Self {
+        Self {
+            zone: zone.into(),
+            subtree: subtree.into(),
+        }
+    }
+}
+
 pub(crate) fn encode_mount_metadata(
     path: &str,
     parent_zone_id: &str,
@@ -292,7 +334,7 @@ pub struct ZoneManager {
     /// incrementally by `apply_topology` as parent + target zones'
     /// leaders settle. BTreeMap so parent paths process before children.
     /// Empty when no static topology is configured.
-    pending_mounts: parking_lot::Mutex<BTreeMap<String, String>>,
+    pending_mounts: parking_lot::Mutex<BTreeMap<String, MountDecl>>,
 }
 
 impl ZoneManager {
@@ -878,7 +920,7 @@ impl ZoneManager {
         &self,
         zones: &[String],
         peers: Vec<String>,
-        mounts: &BTreeMap<String, String>,
+        mounts: &BTreeMap<String, MountDecl>,
     ) -> Result<()> {
         for zone_id in zones {
             // Founding asks about EXISTENCE, not residency. A zone this node
@@ -895,15 +937,15 @@ impl ZoneManager {
         }
         let mut pending = self.pending_mounts.lock();
         pending.clear();
-        for (path, target) in mounts {
-            pending.insert(path.clone(), target.clone());
+        for (path, decl) in mounts {
+            pending.insert(path.clone(), decl.clone());
         }
         Ok(())
     }
 
     /// Snapshot of mounts staged by `bootstrap_static` that have not
     /// yet been applied. Empty when topology has converged.
-    pub fn pending_mounts(&self) -> BTreeMap<String, String> {
+    pub fn pending_mounts(&self) -> BTreeMap<String, MountDecl> {
         self.pending_mounts.lock().clone()
     }
 
@@ -943,20 +985,24 @@ impl ZoneManager {
 
         // Sort by path depth so a parent mount lands before its children
         // (longest-prefix nested mount resolution depends on it).
-        let mut sorted: Vec<(String, String)> = snapshot.into_iter().collect();
+        let mut sorted: Vec<(String, MountDecl)> = snapshot.into_iter().collect();
         sorted.sort_by_key(|(path, _)| path.matches('/').count());
 
         // Per-target expected link counts: every pending mount pointing
         // at the same zone increments its i_links_count once.
         let mut expected: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
-        for (_, target) in &sorted {
-            *expected.entry(target.clone()).or_insert(0) += 1;
+        for (_, decl) in &sorted {
+            *expected.entry(decl.zone.clone()).or_insert(0) += 1;
         }
 
+        // `active` maps an applied mount path to the ZONE it mounts, which is
+        // what longest-prefix parent resolution needs; `remaining` keeps the
+        // whole declaration, because a retry must re-apply the same subtree.
         let mut active: BTreeMap<String, String> = BTreeMap::new();
-        let mut remaining: BTreeMap<String, String> = BTreeMap::new();
+        let mut remaining: BTreeMap<String, MountDecl> = BTreeMap::new();
 
-        for (global_path, target_zone) in &sorted {
+        for (global_path, decl) in &sorted {
+            let target_zone = decl.zone.as_str();
             // Resolve the parent zone via longest-prefix match against
             // already-applied mounts. Falls back to root.
             let mut parent_zone = root_zone_id.to_string();
@@ -972,27 +1018,23 @@ impl ZoneManager {
                 }
             }
 
-            // Step 1: DT_MOUNT in parent zone.
-            // Whole zone, which is what `pending_mounts` can currently express:
-            // it is a `path -> zone` map, so there is nowhere for a declared
-            // subtree to live yet. Widening it (and the composition root that
-            // fills it) is the one change still needed to actually separate
-            // `/agents`, `/conversations` and `/sessions` — everything below
-            // this line already carries a subtree through to the metastore.
+            // Step 1: DT_MOUNT in parent zone, carrying the DECLARED subtree.
+            // This is what keeps several mounts of one zone from aliasing.
             if let Err(err) =
-                self.write_mount_entry(&parent_zone, &local_path, target_zone, contracts::VFS_ROOT)
+                self.write_mount_entry(&parent_zone, &local_path, target_zone, &decl.subtree)
             {
                 tracing::debug!(
-                    "DT_MOUNT write deferred for {} (parent={} target={}): {}",
+                    "DT_MOUNT write deferred for {} (parent={} target={} subtree={}): {}",
                     global_path,
                     parent_zone,
                     target_zone,
+                    decl.subtree,
                     err
                 );
-                remaining.insert(global_path.clone(), target_zone.clone());
+                remaining.insert(global_path.clone(), decl.clone());
                 // Still treat as active so deeper mounts route correctly
                 // once the DT_MOUNT write lands on a later tick.
-                active.insert(global_path.clone(), target_zone.clone());
+                active.insert(global_path.clone(), target_zone.to_string());
                 continue;
             }
 
@@ -1005,12 +1047,12 @@ impl ZoneManager {
                     target_zone,
                     err
                 );
-                remaining.insert(global_path.clone(), target_zone.clone());
-                active.insert(global_path.clone(), target_zone.clone());
+                remaining.insert(global_path.clone(), decl.clone());
+                active.insert(global_path.clone(), target_zone.to_string());
                 continue;
             }
 
-            active.insert(global_path.clone(), target_zone.clone());
+            active.insert(global_path.clone(), target_zone.to_string());
         }
 
         let total = sorted.len();
@@ -1791,7 +1833,7 @@ impl ZoneManager {
         self: &Arc<Self>,
         zones: Vec<String>,
         peers: Vec<String>,
-        mounts: BTreeMap<String, String>,
+        mounts: BTreeMap<String, MountDecl>,
     ) -> Result<()> {
         let this = Arc::clone(self);
         tokio::task::spawn_blocking(move || this.bootstrap_static(&zones, peers, &mounts))
