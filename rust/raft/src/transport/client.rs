@@ -869,6 +869,19 @@ pub struct JoinZoneResult {
     pub error: Option<String>,
     /// Leader's advertise address — set on follower redirects.
     pub leader_address: Option<String>,
+    /// The refusal was "still replicating to you", not a misconfiguration.
+    ///
+    /// Carried so the caller's retry budget can tell the two apart. See
+    /// `JoinZoneResponse.catching_up` in `proto/nexus/raft/transport.proto`:
+    /// charging a healthy catch-up to the budget that exists to catch an
+    /// undeclared-founder mistake is what locked joiners out of any founder
+    /// whose log had grown.
+    pub catching_up: bool,
+    /// Leader's commit index — the target `applied_index` is chasing.
+    pub commit_index: u64,
+    /// How far the leader has replicated to this joiner. The retry waits while
+    /// this ADVANCES and gives up only when it stalls.
+    pub applied_index: u64,
 }
 
 /// Call `ZoneApiService::JoinZone` on a single peer.
@@ -908,6 +921,9 @@ pub async fn call_join_zone_rpc(
         success: response.success,
         error: response.error,
         leader_address: response.leader_address,
+        catching_up: response.catching_up,
+        commit_index: response.commit_index,
+        applied_index: response.applied_index,
     })
 }
 

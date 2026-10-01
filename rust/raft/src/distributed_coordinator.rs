@@ -392,9 +392,23 @@ impl RaftDistributedCoordinator {
         // DT_MOUNTs". At boot the driver is actively applying entries restored
         // from storage, so scanning inside that window silently yields nothing
         // and the mount stays unwired until an operator notices. Wait for
-        // `applied_index >= commit_index` first; capped so a genuinely stuck
-        // zone warns instead of blocking.
-        crate::raft::wait_until_caught_up(consensus, zone_id, std::time::Duration::from_secs(10));
+        // `applied_index >= commit_index` first.
+        //
+        // The budget measures STALL, not total: a joiner replaying a founder's
+        // whole history takes as long as the history is (7317 entries at ~200/s
+        // is half a minute), and cutting that short scanned a partial state
+        // machine and reported "no mounts" — the exact silent-unwired outcome
+        // this wait exists to prevent.
+        if !crate::raft::wait_until_caught_up(consensus, zone_id, crate::raft::RESUME_STALL_BUDGET)
+        {
+            tracing::error!(
+                zone = %zone_id,
+                "skipping DT_MOUNT replay: apply stalled, so a scan now would report \
+                 'no mounts' for a zone that has them. The mounts stay unwired until \
+                 the apply loop recovers."
+            );
+            return;
+        }
         let entries = consensus.iter_dt_mount_entries(runtime).unwrap_or_default();
         if !entries.is_empty() {
             let mut deferred = self.deferred_mounts.lock();
@@ -1024,6 +1038,37 @@ fn wait_for_join_to_apply(zh: &ZoneHandle, zone_id: &str, timeout: Duration) -> 
     ))
 }
 
+/// How far the leader has replicated to a joining learner.
+///
+/// The pair a retry decision needs: `applied_index` chasing `commit_index`.
+#[derive(Debug, Clone, Copy)]
+struct LearnerCatchUp {
+    commit_index: u64,
+    applied_index: u64,
+}
+
+/// Why one JoinZone round did not succeed.
+///
+/// `progress` separates the two conditions the retry budget used to conflate.
+/// `None` is a real failure — unreachable peers, no founder declared, quorum
+/// lost — and the budget exists for it. `Some` means a peer answered "you are a
+/// learner and I am still replicating to you", which is the cluster WORKING;
+/// counting it was what made a founder's own busyness lock new nodes out.
+#[derive(Debug, Clone)]
+struct JoinRoundFailure {
+    message: String,
+    progress: Option<LearnerCatchUp>,
+}
+
+impl From<String> for JoinRoundFailure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            progress: None,
+        }
+    }
+}
+
 // Same rationale as `bootstrap_or_join_zone` above — every arg is a
 // primitive descriptor the caller already names, bundling them adds
 // boilerplate without expressive gain.
@@ -1037,8 +1082,9 @@ fn attempt_join_zone_round(
     join_runtime: &tokio::runtime::Runtime,
     rpc_timeout_secs: u64,
     as_learner: bool,
-) -> Result<(), String> {
+) -> Result<(), JoinRoundFailure> {
     let mut last_err = String::new();
+    let mut last_progress: Option<LearnerCatchUp> = None;
     for peer in peer_addrs {
         let mut endpoint = peer.endpoint.clone();
         let mut redirected_once = false;
@@ -1117,10 +1163,17 @@ fn attempt_join_zone_round(
                         }
                     }
                     last_err = format!("{}: {:?}", endpoint, result.error);
+                    if result.catching_up {
+                        last_progress = Some(LearnerCatchUp {
+                            commit_index: result.commit_index,
+                            applied_index: result.applied_index,
+                        });
+                    }
                     tracing::debug!(
                         endpoint = %endpoint,
                         zone = %zone_id,
                         error = ?result.error,
+                        catching_up = result.catching_up,
                         "JoinZone non-success; trying next peer",
                     );
                     break;
@@ -1138,25 +1191,67 @@ fn attempt_join_zone_round(
             }
         }
     }
-    Err(last_err)
+    Err(JoinRoundFailure {
+        message: last_err,
+        progress: last_progress,
+    })
 }
 
+/// Fold one round's outcome into the retry budget.
+///
+/// `high_water` is the furthest the leader has been seen to replicate to this
+/// joiner, and it is what makes the budget honest. A round that reports
+/// PROGRESS does not spend an attempt: the cluster is replicating to us, and
+/// the only sane thing to do is keep waiting, however long the backlog is. A
+/// round that reports the SAME position as the last one does spend one, so a
+/// learner that has genuinely stopped being fed still fails loud.
+///
+/// Before this, one budget served both, sized for the symmetric-boot mistake it
+/// was written for (two fresh nodes, neither a declared founder — ~2 min, then
+/// fail). A founder driven for a day had 7317 log entries, a joiner applies at
+/// roughly 200/s, and the attempts ran out mid-replay. The effect was a cliff:
+/// past a few hundred entries a founder could never be joined again, and the
+/// error blamed "leader unreachable or quorum lost" while the leader was
+/// healthy and actively feeding the joiner.
 fn record_join_attempt(
-    attempt: Result<(), String>,
+    attempt: Result<(), JoinRoundFailure>,
     attempts: &mut u32,
     max_attempts: Option<u32>,
     zone_id: &str,
+    high_water: &mut u64,
 ) -> Result<bool, String> {
     match attempt {
         Ok(()) => Ok(true),
-        Err(last_err) => {
+        Err(failure) => {
+            if let Some(progress) = failure.progress {
+                if progress.applied_index > *high_water {
+                    *high_water = progress.applied_index;
+                    tracing::info!(
+                        zone = %zone_id,
+                        commit_index = progress.commit_index,
+                        applied_index = progress.applied_index,
+                        "JoinZone: catching up and ADVANCING — waiting rather than spending a retry",
+                    );
+                    return Ok(false);
+                }
+                *attempts = attempts.saturating_add(1);
+                if let Some(max) = max_attempts {
+                    if *attempts >= max {
+                        return Err(format!(
+                            "JoinZone({zone_id}): accepted as a learner, but replication STALLED at applied_index={} of commit_index={} for {} consecutive attempts. The leader is reachable — investigate its apply loop and this node's inbound raft traffic.",
+                            progress.applied_index, progress.commit_index, *attempts,
+                        ));
+                    }
+                }
+                return Ok(false);
+            }
+            let last_err = failure.message;
             *attempts = attempts.saturating_add(1);
             if let Some(max) = max_attempts {
                 if *attempts >= max {
-                    let attempt_count = *attempts;
                     return Err(format!(
-                        "JoinZone({zone_id}): no peer accepted after {attempt_count} attempts; \
-                         leader unreachable or quorum lost on remote zone. Last error: {last_err}",
+                        "JoinZone({zone_id}): no peer accepted after {} attempts; leader unreachable or quorum lost on remote zone. Last error: {last_err}",
+                        *attempts,
                     ));
                 }
             }
@@ -1414,7 +1509,9 @@ pub fn bootstrap_or_join_zone(
                 as_learner,
             ) {
                 Ok(()) => return Ok(()),
-                Err(e) => last_err = e,
+                // This probe only reports WHETHER a cluster was found, so the
+                // catch-up detail is not part of its question.
+                Err(e) => last_err = e.message,
             }
             std::thread::sleep(Duration::from_millis(500));
         }
@@ -1437,6 +1534,9 @@ pub fn bootstrap_or_join_zone(
     }
 
     let mut attempts: u32 = 0;
+    // Furthest the leader has been seen to replicate to us. The budget is spent
+    // on STALL, not on elapsed attempts — see `record_join_attempt`.
+    let mut replication_high_water: u64 = 0;
     loop {
         let joined = record_join_attempt(
             attempt_join_zone_round(
@@ -1452,6 +1552,7 @@ pub fn bootstrap_or_join_zone(
             &mut attempts,
             max_attempts,
             zone_id,
+            &mut replication_high_water,
         )?;
         if joined {
             return Ok(());
@@ -3128,11 +3229,24 @@ mod tests {
         );
     }
 
+    /// A round that is still replicating, at `applied` of `commit`.
+    fn catching_up(applied: u64, commit: u64) -> Result<(), JoinRoundFailure> {
+        Err(JoinRoundFailure {
+            message: format!("added as learner; at {applied} of {commit}"),
+            progress: Some(LearnerCatchUp {
+                commit_index: commit,
+                applied_index: applied,
+            }),
+        })
+    }
+
     #[test]
     fn join_retry_loop_stops_after_successful_join() {
         let mut attempts = 3;
+        let mut high_water = 0;
 
-        let joined = record_join_attempt(Ok(()), &mut attempts, None, "root").unwrap();
+        let joined =
+            record_join_attempt(Ok(()), &mut attempts, None, "root", &mut high_water).unwrap();
 
         assert!(joined, "successful JoinZone must break the retry loop");
         assert_eq!(
@@ -3144,27 +3258,115 @@ mod tests {
     #[test]
     fn join_retry_loop_counts_failures_and_honors_max_attempts() {
         let mut attempts = 0;
+        let mut high_water = 0;
 
         let joined = record_join_attempt(
-            Err("leader unavailable".to_string()),
+            Err("leader unavailable".to_string().into()),
             &mut attempts,
             Some(2),
             "root",
+            &mut high_water,
         )
         .unwrap();
         assert!(!joined);
         assert_eq!(attempts, 1);
 
         let err = record_join_attempt(
-            Err("leader still unavailable".to_string()),
+            Err("leader still unavailable".to_string().into()),
             &mut attempts,
             Some(2),
             "root",
+            &mut high_water,
         )
         .expect_err("second failed attempt should hit max_attempts");
 
         assert!(err.contains("after 2 attempts"));
         assert!(err.contains("leader still unavailable"));
+    }
+
+    /// A learner that is being fed never runs out of attempts.
+    ///
+    /// This is the regression guard for the cliff: a founder driven for a day
+    /// had 7317 log entries, a joiner applies at ~200/s, and the 15-attempt
+    /// budget expired mid-replay — so a busy founder could not be joined at
+    /// all. The budget is for "nobody will ever accept me"; replication in
+    /// progress is the opposite fact and must not spend it.
+    ///
+    /// `Some(2)` with far more than two advancing rounds is the whole point: the
+    /// old code failed on round two regardless of progress.
+    #[test]
+    fn an_advancing_learner_never_spends_a_retry() {
+        let mut attempts = 0;
+        let mut high_water = 0;
+
+        for applied in [500, 1000, 2058, 3000, 4618] {
+            let joined = record_join_attempt(
+                catching_up(applied, 7317),
+                &mut attempts,
+                Some(2),
+                "sharedzone",
+                &mut high_water,
+            )
+            .expect("an advancing learner must not be failed");
+            assert!(!joined, "still catching up, so not joined yet");
+        }
+
+        assert_eq!(
+            attempts, 0,
+            "every round advanced, so none should have been charged",
+        );
+        assert_eq!(high_water, 4618, "the high-water mark follows the leader");
+    }
+
+    /// A learner that has STOPPED advancing still fails loud, and says so.
+    ///
+    /// The other half: without this, "do not spend a retry while catching up"
+    /// would turn a genuinely stuck joiner into an infinite wait. The message
+    /// has to carry the indices, because the old one blamed "leader unreachable
+    /// or quorum lost" for a leader that was reachable the whole time.
+    #[test]
+    fn a_stalled_learner_fails_loud_with_its_position() {
+        let mut attempts = 0;
+        let mut high_water = 0;
+
+        // One advancing round to establish the mark, then the same position twice.
+        record_join_attempt(
+            catching_up(2058, 7317),
+            &mut attempts,
+            Some(2),
+            "sharedzone",
+            &mut high_water,
+        )
+        .expect("advancing round");
+        assert_eq!(attempts, 0);
+
+        record_join_attempt(
+            catching_up(2058, 7317),
+            &mut attempts,
+            Some(2),
+            "sharedzone",
+            &mut high_water,
+        )
+        .expect("first stalled round is charged but not yet fatal");
+        assert_eq!(attempts, 1, "no progress, so this one is charged");
+
+        let err = record_join_attempt(
+            catching_up(2058, 7317),
+            &mut attempts,
+            Some(2),
+            "sharedzone",
+            &mut high_water,
+        )
+        .expect_err("a stalled learner must eventually fail");
+
+        assert!(
+            err.contains("STALLED") && err.contains("2058") && err.contains("7317"),
+            "the error must name the stall and the position, got: {err}"
+        );
+        assert!(
+            !err.contains("unreachable"),
+            "the leader IS reachable here; blaming reachability is what sent the              last investigation the wrong way: {err}"
+        );
     }
 
     // Phase G (2026-07-05): `BootstrapMode` + `validate_bootstrap_mode`

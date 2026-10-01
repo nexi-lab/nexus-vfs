@@ -322,6 +322,26 @@ message JoinZoneResponse {
   optional string leader_address = 3;
   // Current cluster config so the joiner knows all peers.
   optional ClusterConfig config = 4;
+
+  // Set when the refusal is "you are a learner and still replicating" —
+  // PROGRESS, not a misconfiguration.
+  //
+  // The joiner retries JoinZone against a budget (15 attempts) that exists to
+  // catch an operator error: two fresh nodes pointed at each other with no
+  // declared founder, which must fail loud. Catching up is the opposite
+  // situation — the cluster is working and the learner is being fed — and
+  // charging it to the same budget made a healthy join fail: a founder driven
+  // for one day had 7317 log entries, a joiner applies at roughly 200/s, and
+  // the budget ran out at ~35s. The practical effect was that a founder's log
+  // growing past a few hundred entries permanently locked out new nodes.
+  //
+  // The two indices are what make the retry decision a PROGRESS check rather
+  // than another timeout: the joiner keeps waiting while applied_index
+  // advances, and gives up only when it stalls — which is the condition a
+  // budget can honestly describe.
+  bool catching_up = 5;
+  uint64 commit_index = 6;
+  uint64 applied_index = 7;
 }
 
 // DiscoverZonesRequest reads the responder's local federation mount
