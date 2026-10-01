@@ -116,6 +116,10 @@ fn server(
             serde_json::from_slice(&bytes[body_start..body_start + length]).unwrap(),
         ))
         .unwrap();
+        if status == 0 {
+            // Read the real request, then disconnect before any response head.
+            return;
+        }
         write!(socket, "HTTP/1.1 {status} Test\r\nContent-Type: text/event-stream\r\nRetry-After: 2\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
     });
     (url, rx, worker)
@@ -266,5 +270,37 @@ fn request_cannot_override_destination_or_mount_credentials() {
         let error: Value = serde_json::from_slice(records.last().unwrap()).unwrap();
         assert_eq!(error["type"], "error");
         assert!(error["message"].as_str().unwrap().contains("not supported"));
+    }
+}
+
+#[test]
+fn an_upstream_disconnect_is_a_gateway_response_not_a_policy_refusal() {
+    for (provider, path) in [("anthropic", "v1/messages"), ("openai", "chat/completions")] {
+        let (url, captured, worker) = server(0, "");
+        let (kernel, _storage) = mount(provider, &url);
+        kernel
+            .write(
+                "/model/request.prompt",
+                &caller(),
+                &serde_json::to_vec(&exchange(path)).unwrap(),
+                0,
+            )
+            .unwrap();
+        let records = read_reply(&kernel);
+        captured.recv_timeout(Duration::from_secs(2)).unwrap();
+        let head: Value = serde_json::from_slice(&records[0]).unwrap();
+        assert_eq!(head["type"], "response");
+        assert_eq!(head["status"], 502);
+        let body: Vec<u8> = records
+            .iter()
+            .filter(|r| r.first() == Some(&0))
+            .flat_map(|r| r[1..].iter().copied())
+            .collect();
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"]["type"], "upstream_connection_error");
+        let done: Value = serde_json::from_slice(records.last().unwrap()).unwrap();
+        assert_eq!(done["type"], "done");
+        assert!(done["session_hash"].as_str().is_some_and(|s| !s.is_empty()));
+        worker.join().unwrap();
     }
 }

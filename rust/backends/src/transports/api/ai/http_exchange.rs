@@ -86,7 +86,27 @@ pub(super) fn run(
         }
     }
     let response_bytes = runtime.block_on(async {
-        let response = builder.json(&exchange.body).send().await.map_err(|e| e.to_string())?;
+        let response = match builder.json(&exchange.body).send().await {
+            Ok(response) => response,
+            Err(error) if error.is_connect() || error.is_timeout() || error.is_request() => {
+                // This mount is the caller's HTTP gateway. A failed upstream
+                // connection is a 502/504, not a policy/configuration refusal.
+                // Keeping it in the HTTP response contract lets the caller's
+                // normal bounded retry policy run, through this same mount.
+                let status = if error.is_timeout() { 504 } else { 502 };
+                let head = json!({"type":"response","version":1,"status":status,
+                    "headers":{"content-type":"application/json"}});
+                sink.append(stream_path, &serde_json::to_vec(&head).map_err(|e| e.to_string())?)?;
+                let body = serde_json::to_vec(&json!({"error":{
+                    "type":"upstream_connection_error", "message":error.to_string()
+                }})).map_err(|e| e.to_string())?;
+                let mut record = vec![0];
+                record.extend_from_slice(&body);
+                sink.append(stream_path, &record)?;
+                return Ok(body);
+            }
+            Err(error) => return Err(error.to_string()),
+        };
         let mut headers = serde_json::Map::new();
         for name in ["content-type", "retry-after", "request-id", "x-request-id", "x-client-request-id"] {
             if let Some(value) = response.headers().get(name).and_then(|v| v.to_str().ok()) {
