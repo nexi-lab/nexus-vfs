@@ -30,30 +30,32 @@ type StreamMaterializer = Box<dyn Fn(&str) -> Option<Arc<dyn StreamBackend>> + S
 // ---------------------------------------------------------------------------
 
 struct StreamNotify {
-    mutex: Mutex<()>,
+    generation: Mutex<u64>,
     not_empty: Condvar,
 }
 
 impl StreamNotify {
     fn new() -> Self {
         Self {
-            mutex: Mutex::new(()),
+            generation: Mutex::new(0),
             not_empty: Condvar::new(),
         }
     }
 
-    /// Wake one blocked reader (after push). Acquires mutex to avoid
-    /// lost-wakeup race — see `write_nowait` comment.
+    /// Record each wake under the wait mutex. Readers compare generations
+    /// before parking, so backend reads never need to hold this mutex.
     #[inline]
     fn wake_readers(&self) {
-        let _g = self.mutex.lock();
+        let mut generation = self.generation.lock();
+        *generation = generation.wrapping_add(1);
         self.not_empty.notify_one();
     }
 
     /// Wake all blocked readers (shutdown / close). Acquires mutex.
     #[inline]
     fn wake_all_readers(&self) {
-        let _g = self.mutex.lock();
+        let mut generation = self.generation.lock();
+        *generation = generation.wrapping_add(1);
         self.not_empty.notify_all();
     }
 }
@@ -280,22 +282,14 @@ impl StreamManager {
                 .value(),
         );
 
-        // Fast path
-        match buf.read_at(offset) {
-            Ok((data, next)) => return Ok((data, next)),
-            Err(StreamError::ClosedEmpty) => {
-                return Err(StreamManagerError::Closed(path.to_string()));
-            }
-            Err(StreamError::Empty) => {}
-            Err(e) => return Err(StreamManagerError::Backend(e)),
-        }
-
-        // Slow path: wait on condvar
         let timeout = Duration::from_millis(timeout_ms);
         let deadline = std::time::Instant::now() + timeout;
-        let mut guard = notify.mutex.lock();
+        let mut observed = *notify.generation.lock();
 
         loop {
+            // A WAL read takes the Raft state-machine lock. Its apply observer
+            // holds that lock while waking us, so reading under the notification
+            // mutex would invert the two locks and deadlock replication.
             match buf.read_at(offset) {
                 Ok((data, next)) => return Ok((data, next)),
                 Err(StreamError::ClosedEmpty) => {
@@ -311,19 +305,15 @@ impl StreamManager {
                     "stream read timeout".to_string(),
                 ));
             }
-            if notify.not_empty.wait_for(&mut guard, remaining).timed_out() {
-                match buf.read_at(offset) {
-                    Ok((data, next)) => return Ok((data, next)),
-                    Err(StreamError::ClosedEmpty) => {
-                        return Err(StreamManagerError::Closed(path.to_string()));
-                    }
-                    _ => {
-                        return Err(StreamManagerError::WouldBlock(
-                            "stream read timeout".to_string(),
-                        ));
-                    }
-                }
+            let mut generation = notify.generation.lock();
+            if *generation == observed {
+                // No wake since the read began. The condition check and park
+                // share the waker's mutex, so a write cannot slip between them.
+                notify.not_empty.wait_for(&mut generation, remaining);
             }
+            observed = *generation;
+            // Drop the guard before re-reading, including on timeout. Checking
+            // once more then preserves a frame that landed at the deadline.
         }
     }
 
