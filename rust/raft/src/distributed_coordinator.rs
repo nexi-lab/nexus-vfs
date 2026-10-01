@@ -2543,11 +2543,16 @@ fn wire_mount_core(
         //    group back on the boot path. The binding resolves on the first
         //    operation that routes through this mount. Reuses the root mount's CAS
         //    backend.
+        // Whole zone, which is what every mount has always exposed. The next
+        // commit lets a mount DECLARE a subtree so one zone can back several
+        // mounts without them aliasing; until a caller declares one, this value
+        // makes both translations the identity and behaviour is unchanged.
         let metastore: Arc<dyn MetaStore> = ZoneMetaStore::deferred_arc(
             Arc::clone(registry),
             target_zone_id,
             runtime.clone(),
             global_path.clone(),
+            contracts::VFS_ROOT.to_string(),
         );
         let root_canonical = canonicalize("/", contracts::ROOT_ZONE_ID);
         let root_backend = vfs_router

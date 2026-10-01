@@ -80,6 +80,14 @@ pub struct ZoneMetaStore {
     binding: ZoneBinding,
     runtime: tokio::runtime::Handle,
     mount_point: String,
+    /// Which subtree OF THE TARGET ZONE this mount exposes; `"/"` for the whole
+    /// zone, which is the default and what a single-mount zone always wants.
+    ///
+    /// Declared rather than derived from `mount_point`, and that distinction is
+    /// the point: deriving it would make the same zone disagree about its own
+    /// keys when two nodes mount it at different local paths, which `join
+    /// <peer>:/<zone> <local-path>` lets an operator do.
+    target_subtree: String,
     /// Internal cache projection — same shape as `LocalMetaStore` /
     /// `RemoteMetaStore`.  Each zone metastore caches its own hot
     /// entries (keyed by the caller-facing GLOBAL path, mirroring the
@@ -113,9 +121,11 @@ fn register_cache_invalidator(
     node: &ZoneConsensus<FullStateMachine>,
     cache: &Arc<dashmap::DashMap<String, KernelFileMetadata>>,
     mount_point: &str,
+    target_subtree: &str,
 ) {
     let cache_for_cb = Arc::clone(cache);
     let mount_point_for_cb = mount_point.to_string();
+    let subtree_for_cb = target_subtree.to_string();
     node.register_apply_observer(Arc::new(move |entry: &AppliedEntry| {
         let zone_key = match entry.command {
             Command::SetMetadata { key, .. }
@@ -123,7 +133,14 @@ fn register_cache_invalidator(
             | Command::DeleteMetadata { key } => key.as_str(),
             _ => return,
         };
-        let global = zone_key_to_global(&mount_point_for_cb, zone_key);
+        // Every mount on this zone observes every key it commits, so a key
+        // outside MY subtree belongs to a sibling mount. Translating it here
+        // would evict a path this cache never held and leave the real entry
+        // stale — a silent read-your-writes failure.
+        let Some(under_mount) = split_subtree(&subtree_for_cb, zone_key) else {
+            return;
+        };
+        let global = zone_key_to_global(&mount_point_for_cb, &under_mount);
         cache_for_cb.remove(&global);
     }));
 }
@@ -166,6 +183,22 @@ impl ZoneMetaStore {
         runtime: tokio::runtime::Handle,
         mount_point: String,
     ) -> Self {
+        Self::new_with_subtree(node, runtime, mount_point, VFS_ROOT.to_string())
+    }
+
+    /// Like [`Self::new`], but exposing only `target_subtree` of the zone.
+    ///
+    /// Separate constructor rather than a fourth argument on `new`: the callers
+    /// that hold a zone handle directly (the credential store, the ReBAC store,
+    /// the root zone) each surface a WHOLE zone, and saying `"/"` at four call
+    /// sites would be four chances to say something else. Only federation-mount
+    /// wiring, which is where one zone can back several mounts, needs this.
+    pub fn new_with_subtree(
+        node: ZoneConsensus<FullStateMachine>,
+        runtime: tokio::runtime::Handle,
+        mount_point: String,
+        target_subtree: String,
+    ) -> Self {
         let cache: Arc<dashmap::DashMap<String, KernelFileMetadata>> =
             Arc::new(dashmap::DashMap::new());
         // Self-register an apply-side observer. Only SetMetadata /
@@ -177,11 +210,12 @@ impl ZoneMetaStore {
         // form this metastore caches under) before evicting. Capturing
         // ``Arc`` clones keeps the observer self-contained — no
         // back-reference to ZoneMetaStore.
-        register_cache_invalidator(&node, &cache, &mount_point);
+        register_cache_invalidator(&node, &cache, &mount_point, &target_subtree);
         Self {
             binding: ZoneBinding::Ready(node),
             runtime,
             mount_point,
+            target_subtree,
             cache,
         }
     }
@@ -195,11 +229,15 @@ impl ZoneMetaStore {
     /// group's open cost per wired mount would put every mounted zone back on
     /// the boot path, which is exactly what on-demand materialization exists
     /// to avoid.
+    /// `target_subtree` is the subtree OF `zone_id` this mount exposes — `"/"`
+    /// for the whole zone. Federation wiring is the one caller that can mount
+    /// the same zone more than once, so it is the one that must say.
     pub fn deferred_arc(
         registry: Arc<crate::raft::ZoneRaftRegistry>,
         zone_id: &str,
         runtime: tokio::runtime::Handle,
         mount_point: String,
+        target_subtree: String,
     ) -> Arc<dyn MetaStore> {
         Arc::new(Self {
             binding: ZoneBinding::Deferred {
@@ -209,6 +247,7 @@ impl ZoneMetaStore {
             },
             runtime,
             mount_point,
+            target_subtree,
             cache: Arc::new(dashmap::DashMap::new()),
         })
     }
@@ -236,7 +275,12 @@ impl ZoneMetaStore {
                         "ZoneMetaStore: zone '{zone_id}' is not available on this node"
                     ))
                 })?;
-                register_cache_invalidator(&node, &self.cache, &self.mount_point);
+                register_cache_invalidator(
+                    &node,
+                    &self.cache,
+                    &self.mount_point,
+                    &self.target_subtree,
+                );
                 // A concurrent resolve may win; both handles are equivalent
                 // clones of the same consensus, so either is correct.
                 let _ = resolved.set(node);
@@ -268,30 +312,79 @@ impl ZoneMetaStore {
     /// and return the path unchanged in release (never silently
     /// corrupt storage by rewriting an unrelated prefix).
     fn to_zone_key(&self, full_path: &str) -> String {
-        if self.mount_point == VFS_ROOT || self.mount_point.is_empty() {
-            // Root zone: the mount prefix is (effectively) empty, so
-            // full paths already match the zone namespace.
+        let under_mount = if self.mount_point == VFS_ROOT || self.mount_point.is_empty() {
+            // Root zone: the mount prefix is (effectively) empty, so full
+            // paths already match the zone namespace.
+            full_path.to_string()
+        } else if full_path == self.mount_point {
+            VFS_ROOT.to_string()
+        } else if let Some(rest) = full_path.strip_prefix(&format!("{}/", self.mount_point)) {
+            format!("/{rest}")
+        } else {
+            debug_assert!(
+                false,
+                "ZoneMetaStore({}): path {} does not sit under mount point",
+                self.mount_point, full_path
+            );
             return full_path.to_string();
-        }
-        if full_path == self.mount_point {
-            return VFS_ROOT.to_string();
-        }
-        let with_trailing = format!("{}/", self.mount_point);
-        if let Some(rest) = full_path.strip_prefix(&with_trailing) {
-            return format!("/{}", rest);
-        }
-        debug_assert!(
-            false,
-            "ZoneMetaStore({}): path {} does not sit under mount point",
-            self.mount_point, full_path
-        );
-        full_path.to_string()
+        };
+        join_subtree(&self.target_subtree, &under_mount)
     }
 
     /// Zone-relative state-machine key → full caller-facing path.
     fn to_global_path(&self, zone_key: &str) -> String {
-        zone_key_to_global(&self.mount_point, zone_key)
+        // A key outside this mount's subtree is not this mount's to describe.
+        // Falling back to the mount point would hand the caller a path that
+        // resolves to a DIFFERENT object, so the key is returned unchanged and
+        // simply fails to match anything this store caches.
+        split_subtree(&self.target_subtree, zone_key).map_or_else(
+            || zone_key.to_string(),
+            |rest| zone_key_to_global(&self.mount_point, &rest),
+        )
     }
+}
+
+/// Anchor a mount-relative path inside the zone subtree the mount exposes.
+///
+/// `"/"` means "this mount exposes the whole zone", which is the historical and
+/// still-default behaviour, so the result is the input unchanged.
+///
+/// A non-root subtree is what lets ONE zone back SEVERAL mounts without them
+/// aliasing. `to_zone_key` strips the mount prefix and re-anchors at `/`, which
+/// is correct for a single mount and makes N mounts of one zone indistinguishable
+/// — `/agents/win-ai` and `/conversations/win-ai` both became zone key
+/// `/win-ai`, so three top-level namespaces collapsed into one tree with three
+/// names (`readdir /agents` answered with conversation ids and session ids).
+/// Declaring the subtree keeps them disjoint BY DECLARATION rather than by
+/// accident of the local mount path, which also means a zone mounted at a
+/// different local path on another node still agrees about its keys.
+fn join_subtree(target_subtree: &str, under_mount: &str) -> String {
+    if target_subtree == VFS_ROOT || target_subtree.is_empty() {
+        return under_mount.to_string();
+    }
+    if under_mount == VFS_ROOT {
+        return target_subtree.to_string();
+    }
+    format!("{target_subtree}{under_mount}")
+}
+
+/// Inverse of [`join_subtree`]: the mount-relative path for `zone_key`, or
+/// `None` when the key lies outside the subtree this mount exposes.
+///
+/// `None` is the important case and the reason this returns an Option: with
+/// several mounts on one zone, EVERY mount's apply observer sees every key the
+/// zone commits. A mount that translated a key outside its own subtree would
+/// evict a cache entry that does not exist while leaving the real one stale.
+fn split_subtree(target_subtree: &str, zone_key: &str) -> Option<String> {
+    if target_subtree == VFS_ROOT || target_subtree.is_empty() {
+        return Some(zone_key.to_string());
+    }
+    if zone_key == target_subtree {
+        return Some(VFS_ROOT.to_string());
+    }
+    zone_key
+        .strip_prefix(&format!("{target_subtree}/"))
+        .map(|rest| format!("/{rest}"))
 }
 
 /// Map a zone-relative state-machine key to its full caller-facing path,
@@ -714,6 +807,83 @@ mod tests {
     use super::*;
     use crate::raft::ZoneRaftRegistry;
     use tempfile::TempDir;
+
+    /// Two mounts of ONE zone keep disjoint key spaces when they declare
+    /// disjoint subtrees — and alias when they do not.
+    ///
+    /// The second half is the bug, reproduced: with `"/"` (what every mount
+    /// exposed before a subtree could be declared) `/agents/win-ai` and
+    /// `/conversations/win-ai` are the SAME zone key, which is how three
+    /// top-level namespaces came to be one tree with three names on a live
+    /// cluster — `readdir /agents` answered with conversation ids and session
+    /// ids, and `stat /agents/<cid>/transcript` found a conversation.
+    #[test]
+    fn declared_subtrees_keep_sibling_mounts_of_one_zone_disjoint() {
+        // Declared: the mount prefix is re-applied as the zone subtree.
+        assert_eq!(join_subtree("/agents", "/win-ai"), "/agents/win-ai");
+        assert_eq!(
+            join_subtree("/conversations", "/win-ai"),
+            "/conversations/win-ai"
+        );
+        assert_ne!(
+            join_subtree("/agents", "/win-ai"),
+            join_subtree("/conversations", "/win-ai"),
+            "sibling mounts of one zone must not share a key"
+        );
+
+        // Negative control — the old behaviour, which is the defect.
+        assert_eq!(
+            join_subtree("/", "/win-ai"),
+            join_subtree("/", "/win-ai"),
+            "with no declared subtree both mounts land on the same key, which              is exactly the aliasing this field exists to remove"
+        );
+    }
+
+    /// `split_subtree` is the inverse, and refuses keys outside the subtree.
+    ///
+    /// `None` is the load-bearing case: every mount on a zone sees every key
+    /// that zone commits, so the `/agents` mount is handed `/conversations/...`
+    /// applies. Translating one would evict a cache entry that does not exist
+    /// and leave the real one stale — a read-your-writes failure with no error.
+    #[test]
+    fn split_subtree_round_trips_and_rejects_foreign_keys() {
+        assert_eq!(
+            split_subtree("/agents", "/agents/win-ai").as_deref(),
+            Some("/win-ai")
+        );
+        assert_eq!(split_subtree("/agents", "/agents").as_deref(), Some("/"));
+        assert_eq!(
+            split_subtree("/agents", "/conversations/9d41ae"),
+            None,
+            "a sibling mount's key is not this mount's to translate"
+        );
+        // A prefix that is not a path boundary is not a match either.
+        assert_eq!(split_subtree("/agents", "/agentsmith/x"), None);
+        // Whole-zone mounts translate everything, unchanged.
+        assert_eq!(
+            split_subtree("/", "/conversations/9d41ae").as_deref(),
+            Some("/conversations/9d41ae")
+        );
+    }
+
+    /// Composing then splitting is the identity, for every shape.
+    #[test]
+    fn subtree_composition_round_trips() {
+        for (subtree, under_mount) in [
+            ("/", "/win-ai/transcript"),
+            ("/", "/"),
+            ("/agents", "/win-ai/transcript"),
+            ("/agents", "/"),
+            ("/conversations", "/9d41ae/transcript"),
+        ] {
+            let key = join_subtree(subtree, under_mount);
+            assert_eq!(
+                split_subtree(subtree, &key).as_deref(),
+                Some(under_mount),
+                "join then split must be the identity for ({subtree}, {under_mount})"
+            );
+        }
+    }
 
     #[test]
     fn zone_key_to_global_maps_by_mount_point() {
