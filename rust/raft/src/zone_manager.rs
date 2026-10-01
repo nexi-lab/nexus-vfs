@@ -55,6 +55,39 @@ pub(crate) fn encode_file_metadata(
     proto.encode_to_vec()
 }
 
+/// Encode a DT_MOUNT record, including WHICH subtree of the target zone it
+/// exposes.
+///
+/// Separate from [`encode_file_metadata`] rather than a fifth positional
+/// argument on it: of that function's eight callers only two write a mount, so
+/// the other six would be passing `""` for a field that has no meaning for a
+/// directory — and `encode_file_metadata(p, DT_DIR, z, "", "")` reads as two
+/// mistakes rather than one intent.
+///
+/// `target_subtree` is `"/"` for the whole zone. A mount DECLARES it; deriving
+/// it from `path` would make two nodes that mount one zone at different local
+/// paths disagree about that zone's keys, which `join <peer>:/<zone> <local>`
+/// permits.
+pub(crate) fn encode_mount_metadata(
+    path: &str,
+    parent_zone_id: &str,
+    target_zone_id: &str,
+    target_subtree: &str,
+) -> Vec<u8> {
+    use crate::transport::proto::nexus::core::FileMetadata as ProtoFileMetadata;
+    use prost::Message;
+
+    let proto = ProtoFileMetadata {
+        path: path.to_string(),
+        entry_type: DT_MOUNT,
+        zone_id: parent_zone_id.to_string(),
+        target_zone_id: target_zone_id.to_string(),
+        target_subtree: target_subtree.to_string(),
+        ..Default::default()
+    };
+    proto.encode_to_vec()
+}
+
 /// Decode `FileMetadata` proto bytes.
 pub(crate) fn decode_file_metadata(
     bytes: &[u8],
@@ -940,7 +973,15 @@ impl ZoneManager {
             }
 
             // Step 1: DT_MOUNT in parent zone.
-            if let Err(err) = self.write_mount_entry(&parent_zone, &local_path, target_zone) {
+            // Whole zone, which is what `pending_mounts` can currently express:
+            // it is a `path -> zone` map, so there is nowhere for a declared
+            // subtree to live yet. Widening it (and the composition root that
+            // fills it) is the one change still needed to actually separate
+            // `/agents`, `/conversations` and `/sessions` — everything below
+            // this line already carries a subtree through to the metastore.
+            if let Err(err) =
+                self.write_mount_entry(&parent_zone, &local_path, target_zone, contracts::VFS_ROOT)
+            {
                 tracing::debug!(
                     "DT_MOUNT write deferred for {} (parent={} target={}): {}",
                     global_path,
@@ -1035,6 +1076,7 @@ impl ZoneManager {
         parent_zone: &str,
         local_path: &str,
         target_zone: &str,
+        target_subtree: &str,
     ) -> Result<()> {
         let parent_node = self.registry.get_node(parent_zone).ok_or_else(|| {
             RaftError::InvalidState(format!("Parent zone '{}' not found", parent_zone))
@@ -1051,7 +1093,14 @@ impl ZoneManager {
         .map_err(|e| RaftError::Raft(format!("decode existing: {}", e)))?;
 
         if let Some(ref meta) = existing {
-            if meta.entry_type == DT_MOUNT && meta.target_zone_id == target_zone {
+            // The subtree is part of what this record SAYS, so a declaration
+            // that changed it is not already applied. Comparing only the target
+            // zone would silently keep an old whole-zone mount in place and the
+            // aliasing with it.
+            if meta.entry_type == DT_MOUNT
+                && meta.target_zone_id == target_zone
+                && meta.target_subtree == target_subtree
+            {
                 return Ok(());
             }
         } else {
@@ -1059,7 +1108,8 @@ impl ZoneManager {
             propose_set_metadata(&handle, &parent_node, local_path, dir_bytes)?;
         }
 
-        let mount_bytes = encode_file_metadata(local_path, DT_MOUNT, parent_zone, target_zone);
+        let mount_bytes =
+            encode_mount_metadata(local_path, parent_zone, target_zone, target_subtree);
         propose_set_metadata(&handle, &parent_node, local_path, mount_bytes)
     }
 
@@ -1267,6 +1317,31 @@ impl ZoneManager {
         target_zone_id: &str,
         increment_links: bool,
     ) -> Result<()> {
+        self.mount_subtree(
+            parent_zone_id,
+            mount_path,
+            target_zone_id,
+            contracts::VFS_ROOT,
+            increment_links,
+        )
+    }
+
+    /// Like [`Self::mount`], but exposing only `target_subtree` of the target
+    /// zone.
+    ///
+    /// A separate entry point for the same reason `ZoneMetaStore` has one:
+    /// every existing caller mounts a WHOLE zone, and making them all say `"/"`
+    /// would be one more place for one of them to say something else. The
+    /// subtree is what keeps several mounts of ONE zone from aliasing
+    /// (nexi-lab/nexus-vfs#361).
+    pub fn mount_subtree(
+        &self,
+        parent_zone_id: &str,
+        mount_path: &str,
+        target_zone_id: &str,
+        target_subtree: &str,
+        increment_links: bool,
+    ) -> Result<()> {
         let parent_node = self.registry.get_node(parent_zone_id).ok_or_else(|| {
             RaftError::InvalidState(format!("Parent zone '{}' not found", parent_zone_id))
         })?;
@@ -1311,7 +1386,7 @@ impl ZoneManager {
 
         // Replace DT_DIR with DT_MOUNT (shadows original contents).
         let mount_bytes =
-            encode_file_metadata(mount_path, DT_MOUNT, parent_zone_id, target_zone_id);
+            encode_mount_metadata(mount_path, parent_zone_id, target_zone_id, target_subtree);
         propose_set_metadata(&handle, &parent_node, mount_path, mount_bytes)?;
 
         if increment_links {
