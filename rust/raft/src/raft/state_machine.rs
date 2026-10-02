@@ -941,20 +941,27 @@ impl MountDecl {
     /// A mount exposing the whole zone — what every mount meant before
     /// subtrees, and what an operator-declared `--cluster-init-mount
     /// <path>=<zone>` still means.
+    ///
+    /// `&str` rather than `impl Into<String>`: these are called from several
+    /// crates with a mix of `&str`, `String` and `&String`, and a generic
+    /// parameter monomorphizes per combination — `subtree_of` would do it
+    /// across the CROSS PRODUCT of its two. The production binary has a size
+    /// budget measured in CI, and codegen for an ergonomic conversion is not
+    /// what it should be spent on.
     #[must_use]
-    pub fn whole_zone(zone: impl Into<String>) -> Self {
+    pub fn whole_zone(zone: &str) -> Self {
         Self {
-            zone: zone.into(),
+            zone: zone.to_string(),
             subtree: contracts::VFS_ROOT.to_string(),
         }
     }
 
     /// A mount exposing only `subtree` of the zone.
     #[must_use]
-    pub fn subtree_of(zone: impl Into<String>, subtree: impl Into<String>) -> Self {
+    pub fn subtree_of(zone: &str, subtree: &str) -> Self {
         Self {
-            zone: zone.into(),
-            subtree: subtree.into(),
+            zone: zone.to_string(),
+            subtree: subtree.to_string(),
         }
     }
 }

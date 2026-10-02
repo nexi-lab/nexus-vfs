@@ -470,7 +470,7 @@ fn with_default_replicated_mounts(
         .map(|(path, zone)| {
             (
                 path.clone(),
-                MountDecl::subtree_of(zone, replicated_subtree_for(path)),
+                MountDecl::subtree_of(zone, &replicated_subtree_for(path)),
             )
         })
         .collect();
@@ -486,7 +486,7 @@ fn with_default_replicated_mounts(
     for prefix in default_replicated_prefixes() {
         resolved
             .entry(prefix.to_string())
-            .or_insert_with(|| MountDecl::subtree_of(zone.clone(), prefix));
+            .or_insert_with(|| MountDecl::subtree_of(zone, prefix));
     }
     resolved
 }
@@ -2495,7 +2495,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
                             path.clone(),
                             nexus_raft::zone_manager::MountDecl::subtree_of(
                                 zone,
-                                replicated_subtree_for(path),
+                                &replicated_subtree_for(path),
                             ),
                         )
                     })
@@ -3800,8 +3800,8 @@ async fn reconcile_federation_from_peers(
                     discovered_mounts.insert(
                         entry.mount_path,
                         nexus_raft::zone_manager::MountDecl::subtree_of(
-                            entry.zone_id,
-                            entry.target_subtree,
+                            &entry.zone_id,
+                            &entry.target_subtree,
                         ),
                     );
                 }
