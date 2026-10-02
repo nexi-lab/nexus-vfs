@@ -8,13 +8,10 @@
 //!
 //! Authentication happens in [`crate::middleware::auth`], which stamps
 //! the resolved `OperationContext` into request extensions.  Handlers
-//! derive the **zone** from that context via [`crate::zone`]
-//! (nexi-lab/nexus#4740): a non-admin caller searches its own zone
-//! only, an explicit `zone_id` that differs is refused, a credential
-//! with no zone claim is refused rather than routed to ROOT, and
-//! `root_path` is scoped into the zone namespace like the Python RPC
-//! layer does.  File-level ReBAC post-filtering is still the R10 epic's
-//! separate step (#4674).
+//! derive the zone from that context via [`crate::zone`] and forward the
+//! original bearer credential to Search. Paths remain canonical VFS paths;
+//! the host Search policy applies the credential's zone ceiling and live
+//! file permissions. Unpinned queries can fan out over readable zones.
 //!
 //! # Error shape (shared)
 //!
@@ -268,7 +265,7 @@ pub async fn grep(
 pub struct QueryBody {
     /// Query text.
     pub q: String,
-    /// Zone scoping.  Empty ⇒ ROOT_ZONE_ID.
+    /// Zone scoping. Empty uses the caller's zone or readable-zone fanout.
     #[serde(default)]
     pub zone_id: String,
     /// Max results returned.  0 ⇒ server-side default (10).
@@ -279,9 +276,8 @@ pub struct QueryBody {
     pub path_filter: String,
     /// `"keyword"` (default) / `"semantic"` / `"hybrid"`.
     /// Wire-friendly string rather than the raw enum int so callers
-    /// don't have to memorise the proto numeric.  An unknown value
-    /// falls through to `"keyword"` — the same fail-open posture the
-    /// proto's `UNSPECIFIED = 0` treats as keyword.
+    /// don't have to memorise the proto numeric. Values are case-insensitive;
+    /// an unknown non-empty value is a 400 error.
     #[serde(default)]
     pub query_type: String,
     #[serde(default)]
@@ -557,13 +553,31 @@ async fn dispatch_federated(
     body: QueryBody,
     fence_zone: &str,
 ) -> Result<Response, SearchError> {
-    // The federated leg carries one `path_filter`; dropping the extra
-    // prefixes would silently widen the scope.
-    if !body.path_filters.is_empty() {
-        return Err(SearchError::BadRequest(
-            "path_filters is not supported for cross-zone (federated) search; pin zone_id"
-                .to_string(),
-        ));
+    // The dispatcher carries only query type, limit and one path prefix.
+    // Reject settings it cannot preserve before dispatching any leg.
+    for (field, unsupported) in [
+        ("alpha", body.alpha != 0.0),
+        (
+            "fusion_method",
+            !body.fusion_method.is_empty() && !body.fusion_method.eq_ignore_ascii_case("rrf"),
+        ),
+        ("rrf_k", body.rrf_k != 0),
+        ("chunks_per_page", body.chunks_per_page != 0),
+        ("expand", !body.expand.is_empty()),
+        (
+            "recency_mode",
+            !body.recency_mode.is_empty() && !body.recency_mode.eq_ignore_ascii_case("off"),
+        ),
+        ("recency_weight", body.recency_weight != 0.0),
+        ("recency_half_life_days", body.recency_half_life_days != 0.0),
+        ("path_prefix_boosts", !body.path_prefix_boosts.is_empty()),
+        ("path_filters", !body.path_filters.is_empty()),
+    ] {
+        if unsupported {
+            return Err(SearchError::BadRequest(format!(
+                "{field} is not supported for cross-zone (federated) search; pin zone_id"
+            )));
+        }
     }
     let observed = fence
         .enforce(std::sync::Arc::clone(&state.kernel), fence_zone)
@@ -578,7 +592,7 @@ async fn dispatch_federated(
     let req = nexus_federated_search::SearchRequest {
         auth_token: token.0.to_string(),
         query: body.q,
-        search_type: body.query_type,
+        search_type: body.query_type.to_ascii_lowercase(),
         limit,
         path_filter: (!body.path_filter.is_empty()).then_some(body.path_filter),
         // Overwritten by the dispatcher from `subject` — the field
