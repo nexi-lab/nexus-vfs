@@ -46,7 +46,12 @@ pub const DT_LINK: u8 = 6;
 ///   layers (e.g. federation) compare it against the local node address
 ///   to route content fetches. There is no per-record `backend_name`:
 ///   each node picks its backend from its own mount table.
-#[derive(Clone, Debug, Default)]
+///
+/// `PartialEq` is for the cross-encoding guard in
+/// `core::meta_store::tests::every_field_survives_the_binary_encoding`: a
+/// field-by-field comparison would itself be a list to forget to extend, so
+/// the test compares whole values.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FileMetadata {
     pub path: String,
     pub size: u64,
@@ -78,6 +83,18 @@ pub struct FileMetadata {
     /// kernel struct rather than reconstructing it from a sibling
     /// channel.  `None` for non-DT_MOUNT entries.
     pub target_zone_id: Option<String>,
+    /// For `entry_type == DT_MOUNT (2)`: which subtree OF `target_zone_id`
+    /// this mount exposes. `None` or `"/"` means the whole zone, which is
+    /// what every mount meant before this existed.
+    ///
+    /// Carried on the kernel struct for the same reason as
+    /// `target_zone_id`: re-wiring on restart reads the DT_MOUNT record, so
+    /// a subtree held only by the composition root would be right on a
+    /// founder's first boot and silently `"/"` on its next — which is the
+    /// aliasing it exists to prevent (nexi-lab/nexus-vfs#361, where
+    /// `/agents`, `/conversations` and `/sessions` all mounted one zone and
+    /// `readdir /agents` answered with conversation ids).
+    pub target_subtree: Option<String>,
     /// For `entry_type == DT_LINK (6)`: absolute or workspace-relative
     /// VFS path the link resolves to.  `Some` only when entry_type is
     /// DT_LINK.  One-hop resolution at `route()` time with self-loop

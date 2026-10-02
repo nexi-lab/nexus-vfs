@@ -23,16 +23,23 @@ jobs:
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
-            max_size_bytes: 17825792  # 17.0 MiB — raised from 16.75 for the bounded
-                                      # channel establishment (#351: the TLS handshake
-                                      # sat between `connect_timeout` and `timeout` and
-                                      # was bounded by neither, so a peer that accepts
-                                      # and never answers parked a dialer forever).
-                                      # Measured 17,565,528 bytes here, 1,880 over the
-                                      # old cap — the timeout future's monomorphisation
-                                      # plus one diagnostic string, not a step change.
-                                      # The other three platforms absorbed it inside
-                                      # their existing budgets; this is the tightest.
+            max_size_bytes: 18087936  # 17.25 MiB — raised from 17.0 for the declared
+                                      # mount subtree (#361: `/agents`,
+                                      # `/conversations` and `/sessions` all mounted
+                                      # one zone, and `to_zone_key` strips the mount
+                                      # prefix, so the three were one tree with three
+                                      # names — `readdir /agents` answered with
+                                      # conversation ids). Measured 17,826,128 bytes,
+                                      # 336 over the old cap: a durable proto field,
+                                      # the subtree threaded through the three mount
+                                      # routes, and the boot guard's operator-facing
+                                      # message. 648 bytes of the growth were given
+                                      # back first by dropping `impl Into<String>`
+                                      # from MountDecl's constructors, so this is the
+                                      # residue of a permanent feature rather than
+                                      # slack. The other three platforms absorbed it
+                                      # inside their existing budgets; this is the
+                                      # tightest.
           - os: macos-14
             artifact_name: nexusd-cluster-macos-arm64
             package: nexus-cluster

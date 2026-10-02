@@ -367,6 +367,15 @@ message FederationZoneInfo {
   // mounted at — matches the founder's NEXUS_FEDERATION_MOUNTS
   // entry (`<path>=<zone_id>`).
   string mount_path = 2;
+  // Which subtree of `zone_id` that mount exposes; empty or "/" means the
+  // whole zone.
+  //
+  // Reported so a joiner MOUNTS WHAT THE FOUNDER DECLARED instead of
+  // defaulting to the whole zone. Getting this wrong is not cosmetic: the
+  // subtree is part of how a path becomes a zone key, so a joiner using "/"
+  // against a founder using "/agents" would read and write different keys for
+  // the same path and the two would silently diverge.
+  string target_subtree = 3;
 }
 
 // RemoveVoterRequest asks the leader to prune a stale voter/learner

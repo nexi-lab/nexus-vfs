@@ -933,6 +933,14 @@ pub async fn call_join_zone_rpc(
 pub struct DiscoveredZone {
     pub zone_id: String,
     pub mount_path: String,
+    /// Subtree of `zone_id` that mount exposes; `"/"` for the whole zone.
+    ///
+    /// Carried so a joiner mounts what the founder PUBLISHED. Defaulting to the
+    /// whole zone while the founder declared a subtree makes the two translate
+    /// one path to different keys, and they diverge with nothing erroring —
+    /// which is how a peer-created stream became `stream not found` on the
+    /// other node.
+    pub target_subtree: String,
 }
 
 /// Call `ZoneApiService::DiscoverZones` on a single peer.
@@ -962,6 +970,9 @@ pub async fn call_discover_zones_rpc(
         .map(|z| DiscoveredZone {
             zone_id: z.zone_id,
             mount_path: z.mount_path,
+            // Empty is what a founder running a build without subtrees sends,
+            // and it means the whole zone.
+            target_subtree: crate::zone_meta_store::subtree_or_whole_zone(&z.target_subtree),
         })
         .collect())
 }
