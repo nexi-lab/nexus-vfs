@@ -585,8 +585,20 @@ pub trait NativeInterceptHook: Send + Sync {
 
     /// Pre-intercept: return `Err` to abort, `Ok(HookOutcome::Pass)`
     /// to proceed unchanged, or `Ok(HookOutcome::Replace(bytes))` to
-    /// substitute the write content. The replacement variant is only
-    /// honoured by `sys_write`; other syscalls discard it.
+    /// substitute the write content.
+    ///
+    /// `Replace` is honoured on EVERY write path, not just `sys_write`:
+    /// all of them funnel through
+    /// [`Kernel::apply_mutating_write_hooks`](crate::kernel::Kernel::apply_mutating_write_hooks)
+    /// and each applies `replacement.as_deref().unwrap_or(data)` —
+    /// `sys_write` and `write_batch` (DT_FILE), `stream_write_nowait`
+    /// (DT_STREAM), `pipe_write_nowait` (DT_PIPE). A rewrite therefore
+    /// cannot be bypassed by picking a different write RPC, which is the
+    /// property a content gate needs; in particular a rewrite DOES apply
+    /// to the replicated A2A transcript, which is a DT_STREAM.
+    ///
+    /// When several hooks rewrite the same path they compose in
+    /// registration order — see [`NativeHookRegistry::dispatch_pre`].
     fn on_pre(&self, _ctx: &HookContext) -> Result<HookOutcome, String> {
         Ok(HookOutcome::Pass)
     }
@@ -903,14 +915,39 @@ impl NativeHookRegistry {
         false
     }
 
-    /// Dispatch pre-hooks. Returns Err on first abort. The
-    /// `HookOutcome::Replace` variant is propagated to the caller via
-    /// the returned bytes; today only `sys_write` honours it, other
-    /// syscalls drop the replacement.
+    /// Dispatch pre-hooks. Returns Err on first abort, otherwise the
+    /// content the hook chain produced (`None` = nobody rewrote).
+    ///
+    /// Mutating hooks **compose**: each hook sees the bytes the previous
+    /// one produced, not the caller's original. Without that threading
+    /// the chain is last-writer-wins, and the loss is silent — two hooks
+    /// claiming the same suffix each return `Replace` against the same
+    /// input, the second overwrites the first, and no error surfaces
+    /// anywhere. That is a correctness trap for exactly the pairing this
+    /// seam exists to allow: the A2A `from` stamp and a content gate both
+    /// key off `*/transcript`, so an unthreaded chain would drop the
+    /// identity guarantee or the gate's rewrite depending only on
+    /// registration order.
+    ///
+    /// The rebuild is confined to the mutating case. A hook that returns
+    /// `Pass` leaves `replacement` `None` and costs nothing, and a path no
+    /// mutating hook claimed never produces a `Replace` at all — the
+    /// `has_mutating_match` clone gate left `content` empty, so hooks
+    /// short-circuit on it.
     pub(crate) fn dispatch_pre(&self, ctx: &HookContext) -> Result<Option<Vec<u8>>, String> {
         let mut replacement: Option<Vec<u8>> = None;
         for entry in &self.hooks {
-            match entry.hook.on_pre(ctx)? {
+            // Hand this hook the chain's current bytes. Only a write
+            // context carries content, so nothing else is ever rebuilt.
+            let chained = match (&replacement, ctx) {
+                (Some(bytes), HookContext::Write(c)) => {
+                    let mut c = c.clone();
+                    c.content = bytes.clone();
+                    Some(HookContext::Write(c))
+                }
+                _ => None,
+            };
+            match entry.hook.on_pre(chained.as_ref().unwrap_or(ctx))? {
                 HookOutcome::Pass => {}
                 HookOutcome::Replace(bytes) => replacement = Some(bytes),
             }
@@ -1269,6 +1306,142 @@ mod tests {
     fn test_hook_registry_unregister_nonexistent() {
         let mut reg = NativeHookRegistry::new();
         assert!(!reg.unregister("nope"));
+    }
+
+    // ── Mutating-hook composition ──────────────────────────────────────
+    //
+    // Two hooks rewriting the same path is the shape this seam exists to
+    // allow (the A2A `from` stamp plus a content gate, both on
+    // `*/transcript`). Pinned here because the failure mode is silent:
+    // an unthreaded chain returns only the last hook's bytes, so the
+    // earlier rewrite vanishes with no error for anyone to notice.
+
+    /// Appends a marker, so what a hook received is readable from what it
+    /// returned. `Pass` when the content is empty, mirroring the real
+    /// hooks' clone-gate contract.
+    struct AppendHook {
+        hook_name: &'static str,
+        marker: &'static str,
+    }
+
+    impl NativeInterceptHook for AppendHook {
+        fn name(&self) -> &str {
+            self.hook_name
+        }
+        fn mutating_path_suffixes(&self) -> &'static [&'static str] {
+            &["/transcript"]
+        }
+        fn on_pre(&self, ctx: &HookContext) -> Result<HookOutcome, String> {
+            let HookContext::Write(c) = ctx else {
+                return Ok(HookOutcome::Pass);
+            };
+            if c.content.is_empty() {
+                return Ok(HookOutcome::Pass);
+            }
+            let mut out = c.content.clone();
+            out.extend_from_slice(self.marker.as_bytes());
+            Ok(HookOutcome::Replace(out))
+        }
+    }
+
+    fn write_ctx(content: &[u8]) -> HookContext {
+        HookContext::Write(WriteHookCtx {
+            path: "/conversations/abc/transcript".to_string(),
+            identity: HookIdentity::default(),
+            content: content.to_vec(),
+            is_new_file: false,
+            content_id: None,
+            new_version: 0,
+            size_bytes: None,
+        })
+    }
+
+    #[test]
+    fn test_mutating_hooks_compose_rather_than_clobber() {
+        let mut reg = NativeHookRegistry::new();
+        reg.register(Box::new(AppendHook {
+            hook_name: "first",
+            marker: "|first",
+        }));
+        reg.register(Box::new(AppendHook {
+            hook_name: "second",
+            marker: "|second",
+        }));
+        let out = reg
+            .dispatch_pre(&write_ctx(b"body"))
+            .expect("chain accepts")
+            .expect("chain rewrote");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "body|first|second",
+            "second hook must see the first hook's output, and both rewrites must survive"
+        );
+    }
+
+    #[test]
+    fn test_pass_hook_preserves_earlier_replacement() {
+        // An accept/reject hook registered after a rewriting one must not
+        // erase the rewrite by returning `Pass`.
+        let mut reg = NativeHookRegistry::new();
+        reg.register(Box::new(AppendHook {
+            hook_name: "rewriter",
+            marker: "|stamped",
+        }));
+        reg.register(Box::new(DummyHook {
+            hook_name: "audit",
+            suffixes: &[],
+        }));
+        let out = reg
+            .dispatch_pre(&write_ctx(b"body"))
+            .expect("chain accepts")
+            .expect("rewrite must survive a later Pass");
+        assert_eq!(String::from_utf8(out).unwrap(), "body|stamped");
+    }
+
+    #[test]
+    fn test_abort_after_replacement_still_aborts() {
+        /// Rejects every write it is given content for — the fail-closed
+        /// posture a content gate takes on a verdict it cannot redact.
+        struct RejectHook;
+        impl NativeInterceptHook for RejectHook {
+            fn name(&self) -> &str {
+                "rejector"
+            }
+            fn mutating_path_suffixes(&self) -> &'static [&'static str] {
+                &["/transcript"]
+            }
+            fn on_pre(&self, _ctx: &HookContext) -> Result<HookOutcome, String> {
+                Err("denied".to_string())
+            }
+        }
+        let mut reg = NativeHookRegistry::new();
+        reg.register(Box::new(AppendHook {
+            hook_name: "rewriter",
+            marker: "|stamped",
+        }));
+        reg.register(Box::new(RejectHook));
+        assert!(
+            reg.dispatch_pre(&write_ctx(b"body")).is_err(),
+            "an abort downstream of a rewrite must still abort the write"
+        );
+    }
+
+    #[test]
+    fn test_non_write_context_passes_through_chain() {
+        // Only a write context carries content; a read must traverse the
+        // same chain without the rebuild path firing.
+        let mut reg = NativeHookRegistry::new();
+        reg.register(Box::new(AppendHook {
+            hook_name: "rewriter",
+            marker: "|stamped",
+        }));
+        let ctx = HookContext::Read(ReadHookCtx {
+            path: "/conversations/abc/transcript".to_string(),
+            identity: HookIdentity::default(),
+            content: None,
+            content_id: None,
+        });
+        assert!(reg.dispatch_pre(&ctx).expect("chain accepts").is_none());
     }
 
     #[test]
