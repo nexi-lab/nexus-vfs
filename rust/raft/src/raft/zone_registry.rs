@@ -1095,7 +1095,7 @@ impl ZoneRaftRegistry {
     /// federate — so this is never an error here, only a fact a caller may report.
     pub async fn published_federation_mounts(
         &self,
-    ) -> Vec<crate::raft::state_machine::MountRecord> {
+    ) -> Vec<(String, crate::raft::state_machine::MountDecl)> {
         let Some(root) = self.get_node(contracts::ROOT_ZONE_ID) else {
             return Vec::new();
         };
@@ -1105,7 +1105,7 @@ impl ZoneRaftRegistry {
             .unwrap_or_default();
         // By path, which is the order a joiner needs: a parent mount has to be
         // applied before anything nested under it.
-        mounts.sort_by(|a, b| a.path.cmp(&b.path));
+        mounts.sort_by(|a, b| a.0.cmp(&b.0));
         mounts
     }
 

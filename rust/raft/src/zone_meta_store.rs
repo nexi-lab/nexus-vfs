@@ -305,30 +305,11 @@ impl ZoneMetaStore {
 
     /// Full caller-facing path → zone-relative state-machine key.
     ///
-    /// ``/`` when the full path equals the mount point (root of the
-    /// zone). Otherwise strips the mount prefix and re-anchors at
-    /// ``/``. Paths that don't start with the mount point indicate a
-    /// caller bug — we ``debug_assert`` to catch the mistake in tests
-    /// and return the path unchanged in release (never silently
-    /// corrupt storage by rewriting an unrelated prefix).
+    /// Delegates to [`compose_zone_key`], which is the SSOT for the mapping and
+    /// is what the tests exercise — a second implementation here would let the
+    /// tests pass while the real path did something else.
     fn to_zone_key(&self, full_path: &str) -> String {
-        let under_mount = if self.mount_point == VFS_ROOT || self.mount_point.is_empty() {
-            // Root zone: the mount prefix is (effectively) empty, so full
-            // paths already match the zone namespace.
-            full_path.to_string()
-        } else if full_path == self.mount_point {
-            VFS_ROOT.to_string()
-        } else if let Some(rest) = full_path.strip_prefix(&format!("{}/", self.mount_point)) {
-            format!("/{rest}")
-        } else {
-            debug_assert!(
-                false,
-                "ZoneMetaStore({}): path {} does not sit under mount point",
-                self.mount_point, full_path
-            );
-            return full_path.to_string();
-        };
-        join_subtree(&self.target_subtree, &under_mount)
+        compose_zone_key(&self.mount_point, &self.target_subtree, full_path)
     }
 
     /// Zone-relative state-machine key → full caller-facing path.
@@ -344,32 +325,85 @@ impl ZoneMetaStore {
     }
 }
 
-/// Anchor a mount-relative path inside the zone subtree the mount exposes.
+/// A wire/proto `target_subtree` as the domain value: empty means the whole
+/// zone.
 ///
-/// `"/"` means "this mount exposes the whole zone", which is the historical and
-/// still-default behaviour, so the result is the input unchanged.
+/// One function because four places decode that field — the metadata proto, the
+/// DT_MOUNT scan, the mount apply event, and `DiscoverZones` — and "empty means
+/// `/`" written four times is four chances to write something else. An empty
+/// value is what a record or a peer predating subtrees sends, and what every
+/// non-DT_MOUNT entry carries.
+pub(crate) fn subtree_or_whole_zone(raw: &str) -> String {
+    if raw.is_empty() {
+        VFS_ROOT.to_string()
+    } else {
+        raw.to_string()
+    }
+}
+
+/// Full caller-facing path → the zone key a mount at `mount_point` exposing
+/// `target_subtree` of its zone stores it under.
+///
+/// SSOT for the mapping, and the function `to_zone_key` calls — a second
+/// implementation inside the method would let these tests pass while the real
+/// path did something else.
 ///
 /// A non-root subtree is what lets ONE zone back SEVERAL mounts without them
-/// aliasing. `to_zone_key` strips the mount prefix and re-anchors at `/`, which
-/// is correct for a single mount and makes N mounts of one zone indistinguishable
-/// — `/agents/win-ai` and `/conversations/win-ai` both became zone key
+/// aliasing. Stripping the mount prefix and re-anchoring at `/` is correct for a
+/// single mount and makes N mounts of one zone indistinguishable —
+/// `/agents/win-ai` and `/conversations/win-ai` both became zone key
 /// `/win-ai`, so three top-level namespaces collapsed into one tree with three
 /// names (`readdir /agents` answered with conversation ids and session ids).
 /// Declaring the subtree keeps them disjoint BY DECLARATION rather than by
-/// accident of the local mount path, which also means a zone mounted at a
-/// different local path on another node still agrees about its keys.
-fn join_subtree(target_subtree: &str, under_mount: &str) -> String {
-    if target_subtree == VFS_ROOT || target_subtree.is_empty() {
-        return under_mount.to_string();
+/// accident of the local mount path, so a zone mounted at a different local
+/// path on another node still agrees about its keys.
+///
+/// ONE allocation. Stripping to a mount-relative path and then joining the
+/// subtree onto it allocates twice per metadata operation, and a non-root
+/// subtree is exactly the three replicated A2A prefixes — the hot path.
+///
+/// A path that does not sit under `mount_point` is a caller bug:
+/// `debug_assert` catches it in tests, and release returns the path unchanged
+/// rather than silently rewriting an unrelated prefix.
+fn compose_zone_key(mount_point: &str, target_subtree: &str, full_path: &str) -> String {
+    let subtree = if target_subtree == VFS_ROOT || target_subtree.is_empty() {
+        ""
+    } else {
+        target_subtree
+    };
+    if mount_point == VFS_ROOT || mount_point.is_empty() {
+        // Root zone: the mount prefix is (effectively) empty, so full paths
+        // already match the zone namespace.
+        return if subtree.is_empty() {
+            full_path.to_string()
+        } else {
+            format!("{subtree}{full_path}")
+        };
     }
-    if under_mount == VFS_ROOT {
-        return target_subtree.to_string();
+    if full_path == mount_point {
+        // The mount point itself is the subtree's own root.
+        return if subtree.is_empty() {
+            VFS_ROOT.to_string()
+        } else {
+            subtree.to_string()
+        };
     }
-    format!("{target_subtree}{under_mount}")
+    if let Some(rest) = full_path
+        .strip_prefix(mount_point)
+        .and_then(|rest| rest.strip_prefix('/'))
+    {
+        return format!("{subtree}/{rest}");
+    }
+    debug_assert!(
+        false,
+        "ZoneMetaStore({mount_point}): path {full_path} does not sit under mount point"
+    );
+    full_path.to_string()
 }
 
-/// Inverse of [`join_subtree`]: the mount-relative path for `zone_key`, or
-/// `None` when the key lies outside the subtree this mount exposes.
+/// The mount-relative path for `zone_key`, or `None` when the key lies outside
+/// the subtree this mount exposes — the inverse of [`compose_zone_key`]'s
+/// subtree step.
 ///
 /// `None` is the important case and the reason this returns an Option: with
 /// several mounts on one zone, EVERY mount's apply observer sees every key the
@@ -436,6 +470,10 @@ pub(crate) fn proto_to_kernel(bytes: &[u8]) -> Result<KernelFileMetadata, MetaSt
         // The durable DT_MOUNT wiring path: this is the decoder a mount is
         // re-wired from on restart, so dropping the subtree here is what would
         // make a founder correct on its first boot and aliasing on its next.
+        // `None`, not `Some("/")`: on the kernel struct the Option carries
+        // "is this field meaningful at all", and a non-DT_MOUNT entry has no
+        // subtree. Collapsing the two would make this decode non-round-tripping
+        // and tell a caller that every file is a whole-zone mount.
         target_subtree: if proto.target_subtree.is_empty() {
             None
         } else {
@@ -853,23 +891,28 @@ mod tests {
     /// ids, and `stat /agents/<cid>/transcript` found a conversation.
     #[test]
     fn declared_subtrees_keep_sibling_mounts_of_one_zone_disjoint() {
-        // Declared: the mount prefix is re-applied as the zone subtree.
-        assert_eq!(join_subtree("/agents", "/win-ai"), "/agents/win-ai");
-        assert_eq!(
-            join_subtree("/conversations", "/win-ai"),
-            "/conversations/win-ai"
-        );
+        // Asserted through `compose_zone_key`, the function `to_zone_key`
+        // actually calls, and from the CALLER-FACING path — which is the thing
+        // that collided. A helper that only saw mount-relative strings would be
+        // asserting a step rather than the mapping.
+        let agents = compose_zone_key("/agents", "/agents", "/agents/win-ai");
+        let conversations =
+            compose_zone_key("/conversations", "/conversations", "/conversations/win-ai");
+        assert_eq!(agents, "/agents/win-ai");
+        assert_eq!(conversations, "/conversations/win-ai");
         assert_ne!(
-            join_subtree("/agents", "/win-ai"),
-            join_subtree("/conversations", "/win-ai"),
+            agents, conversations,
             "sibling mounts of one zone must not share a key"
         );
 
-        // Negative control — the old behaviour, which is the defect.
+        // Negative control — the old behaviour, which IS the defect: with every
+        // mount exposing the zone's root, two different caller paths land on
+        // one key.
         assert_eq!(
-            join_subtree("/", "/win-ai"),
-            join_subtree("/", "/win-ai"),
-            "with no declared subtree both mounts land on the same key, which              is exactly the aliasing this field exists to remove"
+            compose_zone_key("/agents", "/", "/agents/win-ai"),
+            compose_zone_key("/conversations", "/", "/conversations/win-ai"),
+            "with no declared subtree the two paths collide, which is exactly \
+             the aliasing the subtree exists to remove"
         );
     }
 
@@ -900,21 +943,33 @@ mod tests {
         );
     }
 
-    /// Composing then splitting is the identity, for every shape.
+    /// A caller path composes to a key and back to the same caller path.
+    ///
+    /// Round-tripped through the two functions the store actually uses —
+    /// `compose_zone_key` on the way in and `split_subtree` + `zone_key_to_global`
+    /// on the way out — so a mismatch between them cannot hide behind a helper
+    /// that only one side calls.
     #[test]
     fn subtree_composition_round_trips() {
-        for (subtree, under_mount) in [
-            ("/", "/win-ai/transcript"),
-            ("/", "/"),
-            ("/agents", "/win-ai/transcript"),
-            ("/agents", "/"),
-            ("/conversations", "/9d41ae/transcript"),
+        for (mount_point, subtree, full_path) in [
+            ("/", "/", "/win-ai/transcript"),
+            ("/agents", "/", "/agents/win-ai/transcript"),
+            ("/agents", "/agents", "/agents/win-ai/transcript"),
+            ("/agents", "/agents", "/agents"),
+            (
+                "/conversations",
+                "/conversations",
+                "/conversations/9d41ae/transcript",
+            ),
         ] {
-            let key = join_subtree(subtree, under_mount);
+            let key = compose_zone_key(mount_point, subtree, full_path);
+            let back = split_subtree(subtree, &key)
+                .map(|rest| zone_key_to_global(mount_point, &rest))
+                .unwrap_or_else(|| panic!("{key} fell outside its own subtree {subtree}"));
             assert_eq!(
-                split_subtree(subtree, &key).as_deref(),
-                Some(under_mount),
-                "join then split must be the identity for ({subtree}, {under_mount})"
+                back, full_path,
+                "compose then split must return the caller's path for \
+                 ({mount_point}, {subtree}, {full_path})"
             );
         }
     }

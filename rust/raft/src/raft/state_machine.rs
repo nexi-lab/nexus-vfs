@@ -918,20 +918,45 @@ pub struct FullStateMachine {
     apply_observers: Arc<parking_lot::RwLock<Vec<ApplyObserver>>>,
 }
 
-/// One DT_MOUNT entry as the state machine holds it.
+/// What a mount POINTS AT: a zone, and which subtree of it to expose.
 ///
-/// A tuple carried `(path, zone)` and had nowhere for the subtree, which is the
-/// third thing a mount record actually says. Named fields because the two
-/// strings that follow are both paths and swapping them silently mounts the
-/// wrong thing.
+/// Defined here, at the layer that reads DT_MOUNT records out of the state
+/// machine, so the layers above consume it rather than restating it. A list of
+/// mounts is `(path, MountDecl)` — the path is the key it is stored under, not
+/// a fourth thing to keep in sync.
+///
+/// `subtree` is DECLARED by whoever states the topology, never derived from the
+/// mount path: `join <peer>:/<zone> <local-path>` lets two nodes mount one zone
+/// at different local paths, and deriving would make them disagree about that
+/// zone's own keys.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MountRecord {
-    /// Mount point in the parent zone's namespace.
-    pub path: String,
+pub struct MountDecl {
     /// Zone this mount points into.
     pub zone: String,
-    /// Subtree of `zone` exposed here; `"/"` for the whole zone.
+    /// Subtree of `zone` to expose; `"/"` for the whole zone.
     pub subtree: String,
+}
+
+impl MountDecl {
+    /// A mount exposing the whole zone — what every mount meant before
+    /// subtrees, and what an operator-declared `--cluster-init-mount
+    /// <path>=<zone>` still means.
+    #[must_use]
+    pub fn whole_zone(zone: impl Into<String>) -> Self {
+        Self {
+            zone: zone.into(),
+            subtree: contracts::VFS_ROOT.to_string(),
+        }
+    }
+
+    /// A mount exposing only `subtree` of the zone.
+    #[must_use]
+    pub fn subtree_of(zone: impl Into<String>, subtree: impl Into<String>) -> Self {
+        Self {
+            zone: zone.into(),
+            subtree: subtree.into(),
+        }
+    }
 }
 
 impl FullStateMachine {
@@ -1075,11 +1100,9 @@ impl FullStateMachine {
                         target_zone_id: proto.target_zone_id,
                         // Empty is a record written before subtrees existed,
                         // which meant the whole zone.
-                        target_subtree: if proto.target_subtree.is_empty() {
-                            contracts::VFS_ROOT.to_string()
-                        } else {
-                            proto.target_subtree
-                        },
+                        target_subtree: crate::zone_meta_store::subtree_or_whole_zone(
+                            &proto.target_subtree,
+                        ),
                     })
                 } else if removed_mount_key == Some(key.as_str()) {
                     // Overwrite of prior DT_MOUNT with a non-mount entry
@@ -1402,7 +1425,7 @@ impl FullStateMachine {
     /// Lenient: skips entries that fail to decode or aren't DT_MOUNT
     /// or have an empty target_zone_id.
     #[cfg(feature = "grpc")]
-    pub fn iter_dt_mount_entries(&self) -> Result<Vec<MountRecord>> {
+    pub fn iter_dt_mount_entries(&self) -> Result<Vec<(String, MountDecl)>> {
         use crate::transport::proto::nexus::core::FileMetadata as ProtoFileMetadata;
         use prost::Message as ProstMessage;
 
@@ -1413,17 +1436,17 @@ impl FullStateMachine {
             };
             const DT_MOUNT: i32 = 2;
             if proto.entry_type == DT_MOUNT && !proto.target_zone_id.is_empty() {
-                result.push(MountRecord {
-                    path: key,
-                    zone: proto.target_zone_id,
-                    // Empty is what a record written before subtrees existed
-                    // holds, and it means the whole zone.
-                    subtree: if proto.target_subtree.is_empty() {
-                        contracts::VFS_ROOT.to_string()
-                    } else {
-                        proto.target_subtree
+                result.push((
+                    key,
+                    MountDecl {
+                        zone: proto.target_zone_id,
+                        // Empty is what a record written before subtrees
+                        // existed holds, and it means the whole zone.
+                        subtree: crate::zone_meta_store::subtree_or_whole_zone(
+                            &proto.target_subtree,
+                        ),
                     },
-                });
+                ));
             }
         }
         Ok(result)

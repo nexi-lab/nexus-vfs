@@ -68,47 +68,7 @@ pub(crate) fn encode_file_metadata(
 /// it from `path` would make two nodes that mount one zone at different local
 /// paths disagree about that zone's keys, which `join <peer>:/<zone> <local>`
 /// permits.
-/// One declared federation mount: which zone, and WHICH SUBTREE of it.
-///
-/// The subtree is why this is a struct rather than the `path -> zone` string
-/// map it replaced. That map had nowhere to say "this mount exposes
-/// `/agents` of sharedzone", so every mount exposed the zone's root — and with
-/// `/agents`, `/conversations` and `/sessions` all mounted onto one zone, the
-/// three were one tree with three names (nexi-lab/nexus-vfs#361).
-///
-/// `subtree` is DECLARED by whoever states the topology, never derived from
-/// `path`: `join <peer>:/<zone> <local-path>` lets two nodes mount one zone at
-/// different local paths, and deriving would make them disagree about that
-/// zone's own keys.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MountDecl {
-    /// Zone this mount points into.
-    pub zone: String,
-    /// Subtree of `zone` to expose; `"/"` for the whole zone.
-    pub subtree: String,
-}
-
-impl MountDecl {
-    /// A mount exposing the whole zone — what every mount meant before
-    /// subtrees, and what an operator-declared `--cluster-init-mount
-    /// <path>=<zone>` still means.
-    #[must_use]
-    pub fn whole_zone(zone: impl Into<String>) -> Self {
-        Self {
-            zone: zone.into(),
-            subtree: contracts::VFS_ROOT.to_string(),
-        }
-    }
-
-    /// A mount exposing only `subtree` of the zone.
-    #[must_use]
-    pub fn subtree_of(zone: impl Into<String>, subtree: impl Into<String>) -> Self {
-        Self {
-            zone: zone.into(),
-            subtree: subtree.into(),
-        }
-    }
-}
+pub use crate::raft::MountDecl;
 
 pub(crate) fn encode_mount_metadata(
     path: &str,
@@ -1795,6 +1755,32 @@ impl ZoneManager {
         tokio::task::spawn_blocking(move || this.mount(&parent, &path, &target, increment_links))
             .await
             .map_err(|e| RaftError::InvalidState(format!("mount_async task panicked: {e}")))?
+    }
+
+    /// Async wrapper for [`Self::mount_subtree`].
+    ///
+    /// A joiner needs this, not [`Self::mount_async`]: it mounts what the
+    /// founder PUBLISHED, and a joiner that defaulted to the whole zone while
+    /// the founder declared a subtree would translate the same path to a
+    /// different key and the two would diverge silently.
+    pub async fn mount_subtree_async(
+        self: &Arc<Self>,
+        parent_zone_id: &str,
+        mount_path: &str,
+        target_zone_id: &str,
+        target_subtree: &str,
+        increment_links: bool,
+    ) -> Result<()> {
+        let this = Arc::clone(self);
+        let parent = parent_zone_id.to_string();
+        let path = mount_path.to_string();
+        let target = target_zone_id.to_string();
+        let subtree = target_subtree.to_string();
+        tokio::task::spawn_blocking(move || {
+            this.mount_subtree(&parent, &path, &target, &subtree, increment_links)
+        })
+        .await
+        .map_err(|e| RaftError::InvalidState(format!("mount_subtree_async task panicked: {e}")))?
     }
 
     /// Async wrapper for [`Self::create_zone`].

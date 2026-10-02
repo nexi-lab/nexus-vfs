@@ -131,10 +131,10 @@ pub struct RaftDistributedCoordinator {
     /// "wire what you can, keep what you can't, retry on the next zone" is the
     /// ordering mechanism. It replaces a rescan of every zone per newly wired
     /// zone, which was quadratic in zone count.
-    /// `(parent_zone, MountRecord)` — the record carries the mount's path,
-    /// target zone AND declared subtree, so a deferred wire re-applies the same
-    /// mount rather than a whole-zone guess at it.
-    deferred_mounts: Arc<parking_lot::Mutex<Vec<(String, crate::raft::MountRecord)>>>,
+    /// `(parent_zone, mount_path, decl)` — the declaration carries the target
+    /// zone AND its subtree, so a deferred wire re-applies the same mount
+    /// rather than a whole-zone guess at it.
+    deferred_mounts: Arc<parking_lot::Mutex<Vec<(String, String, crate::raft::MountDecl)>>>,
     /// Per-peer typed-RPC client used by `peer_*` to dispatch
     /// `NexusVFSService.{Read,Write,Stat,Readdir,Delete,Mkdir,Rename,Setattr}`
     /// against zone voters.  Set by `install_with_kernel`; unset means
@@ -415,8 +415,8 @@ impl RaftDistributedCoordinator {
         let entries = consensus.iter_dt_mount_entries(runtime).unwrap_or_default();
         if !entries.is_empty() {
             let mut deferred = self.deferred_mounts.lock();
-            for record in entries {
-                deferred.push((zone_id.to_string(), record));
+            for (path, decl) in entries {
+                deferred.push((zone_id.to_string(), path, decl));
             }
         }
         self.drain_deferred_mounts(kernel);
@@ -443,7 +443,7 @@ impl RaftDistributedCoordinator {
         let lock_manager = kernel.lock_manager_arc();
 
         loop {
-            let batch: Vec<(String, crate::raft::MountRecord)> = {
+            let batch: Vec<(String, String, crate::raft::MountDecl)> = {
                 let mut guard = self.deferred_mounts.lock();
                 std::mem::take(&mut *guard)
             };
@@ -451,10 +451,9 @@ impl RaftDistributedCoordinator {
                 return;
             }
             let mut progressed = false;
-            let mut still_deferred: Vec<(String, crate::raft::MountRecord)> = Vec::new();
-            for (parent_zone_id, record) in batch {
-                let mount_path = record.path.clone();
-                let target_zone_id = record.zone.clone();
+            let mut still_deferred: Vec<(String, String, crate::raft::MountDecl)> = Vec::new();
+            for (parent_zone_id, mount_path, decl) in batch {
+                let target_zone_id = decl.zone.clone();
                 match wire_mount_core(
                     &vfs_router,
                     &lock_manager,
@@ -465,7 +464,7 @@ impl RaftDistributedCoordinator {
                     // Deferred from an apply event, so still zone-relative.
                     MountPath::ZoneRelative(&mount_path),
                     &target_zone_id,
-                    &record.subtree,
+                    &decl.subtree,
                 ) {
                     Ok(()) => {
                         if self.cross_zone_mounts.contains_key(&target_zone_id) {
@@ -474,7 +473,7 @@ impl RaftDistributedCoordinator {
                             // Deferred inside `wire_mount_core` — its parent
                             // mount is not in `cross_zone_mounts` yet, so the
                             // global path cannot be reconstructed.
-                            still_deferred.push((parent_zone_id, record));
+                            still_deferred.push((parent_zone_id, mount_path, decl));
                         }
                     }
                     // Permanent failure: dropping it matches the previous

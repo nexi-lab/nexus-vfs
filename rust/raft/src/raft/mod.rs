@@ -58,7 +58,7 @@ pub use error::{RaftError, Result};
 pub use replication_log::ReplicationLog;
 #[cfg(feature = "grpc")]
 pub use state_machine::MountApplyEvent;
-pub use state_machine::MountRecord;
+pub use state_machine::MountDecl;
 pub use state_machine::{
     AppliedEntry, ApplyObserver, Command, CommandResult, FullStateMachine, HolderInfo,
     LockAcquireResult, LockEntry, LockInfo, LockState, StateMachine, WitnessStateMachine,

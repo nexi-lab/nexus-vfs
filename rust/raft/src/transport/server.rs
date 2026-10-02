@@ -1388,12 +1388,12 @@ impl ZoneApiService for ZoneApiServiceImpl {
             .published_federation_mounts()
             .await
             .into_iter()
-            .map(|record| FederationZoneInfo {
-                zone_id: record.zone,
-                mount_path: record.path,
+            .map(|(path, decl)| FederationZoneInfo {
+                zone_id: decl.zone,
+                mount_path: path,
                 // So the joiner mounts what this founder DECLARED rather than
                 // defaulting to the whole zone and diverging on every key.
-                target_subtree: record.subtree,
+                target_subtree: decl.subtree,
             })
             .collect();
         tracing::debug!(zone_count = zones.len(), "DiscoverZones request served");
