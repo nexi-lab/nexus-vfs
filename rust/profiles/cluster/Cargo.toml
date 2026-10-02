@@ -94,10 +94,9 @@ a2a = { workspace = true }
 # Managed-agent control plane — ManagedAgentService (spawn/get/cancel) +
 # proc_entry / workspace-boundary hooks, brought up as a boot service so the
 # production `nexusd-cluster` carries the agent control plane directly (one
-# production binary, no separate assembly). `subprocess-host` enables the raw
-# ACP-subprocess spawner (unix-only at the mod gate) for the sudowork/hydra
-# spawn_spec tunnel; the in-process co-host adapter lives at the nexus binary
-# edge (it links sudocode — a cycle if pulled here).
+# production binary, no separate assembly). The subprocess host exposes the
+# shared session mailbox; its stdio stays internal. Sudocode's nexusd-cohost
+# injects the in-process provider without creating a kernel dependency cycle.
 managed-agent = { workspace = true, features = ["subprocess-host"] }
 # `auth mint` generates the key_id; the daemon carries no uuid dep.
 rand = "0.10"
