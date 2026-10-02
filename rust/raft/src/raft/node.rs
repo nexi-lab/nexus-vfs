@@ -2658,7 +2658,7 @@ impl ZoneConsensus<super::state_machine::FullStateMachine> {
     pub fn iter_dt_mount_entries(
         &self,
         handle: &tokio::runtime::Handle,
-    ) -> super::Result<Vec<(String, String)>> {
+    ) -> super::Result<Vec<(String, super::state_machine::MountDecl)>> {
         let sm = tokio::task::block_in_place(|| handle.block_on(self.state_machine.read()));
         sm.iter_dt_mount_entries()
     }

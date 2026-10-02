@@ -313,6 +313,13 @@ fn parse_metadata_from_json(value: &serde_json::Value) -> Result<FileMetadata, M
         .ok_or_else(|| MetaStoreError::IOError("expected JSON object".into()))?;
 
     Ok(FileMetadata {
+        // A remote sys_stat answers about an entry, and a DT_MOUNT's subtree is
+        // part of that entry, so it is read when the server sends it.
+        target_subtree: obj
+            .get("target_subtree")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
         path: obj
             .get("path")
             .and_then(|v| v.as_str())

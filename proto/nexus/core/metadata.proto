@@ -84,7 +84,6 @@ message FileMetadata {
   // Mount target namespace (DT_MOUNT only). Kernel concept for cross-zone
   // path resolution — federation extends with Raft consensus per zone.
   string target_zone_id = 14;
-
   // TTL in seconds for ephemeral content (0 or unset = permanent).
   // Routes to TTL-bucketed volumes for zero-cost expiry (Issue #3405).
   double ttl_seconds = 15;
@@ -108,4 +107,18 @@ message FileMetadata {
   // successful content write by an upgraded writer. Existing records and
   // non-content metadata entries default to 0.
   uint64 gen = 18;
+
+  // Which subtree OF `target_zone_id` this mount exposes (DT_MOUNT only).
+  // Empty or "/" means the whole zone, which is what every mount meant
+  // before this field existed, so an existing record reads correctly.
+  //
+  // Durable because re-wiring on restart reads the DT_MOUNT record, not the
+  // boot flags: a subtree kept only in the composition root would be correct
+  // on a founder's first boot and silently "/" on its next one, which is the
+  // aliasing this field exists to prevent (nexi-lab/nexus-vfs#361).
+  //
+  // Declared, never derived from the mount path. `join <peer>:/<zone>
+  // <local-path>` lets two nodes mount one zone at different local paths, and
+  // deriving would make them disagree about that zone's own keys.
+  string target_subtree = 19;
 }

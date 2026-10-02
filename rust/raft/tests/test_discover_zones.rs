@@ -24,6 +24,8 @@
 mod common;
 
 use std::collections::BTreeMap;
+
+use nexus_raft::zone_manager::MountDecl;
 use std::time::Duration;
 
 use nexus_raft::transport::call_discover_zones_rpc;
@@ -96,8 +98,8 @@ async fn discover_zones_returns_dt_mount_entries_from_root_state_machine() {
     assert!(root_handle.is_leader());
 
     let mut mounts = BTreeMap::new();
-    mounts.insert("/shared".to_string(), "sharedzone".to_string());
-    mounts.insert("/corp/eng".to_string(), "corp-eng".to_string());
+    mounts.insert("/shared".to_string(), MountDecl::whole_zone("sharedzone"));
+    mounts.insert("/corp/eng".to_string(), MountDecl::whole_zone("corp-eng"));
     zm.bootstrap_static_async(
         vec!["sharedzone".to_string(), "corp-eng".to_string()],
         vec![format!("{id}@{bind}")],
@@ -117,7 +119,14 @@ async fn discover_zones_returns_dt_mount_entries_from_root_state_machine() {
         .into_iter()
         .map(|d| (d.mount_path, d.zone_id))
         .collect();
-    assert_eq!(by_path, mounts, "DiscoverZones reads DT_MOUNT verbatim");
+    let declared_zones: BTreeMap<String, String> = mounts
+        .iter()
+        .map(|(path, decl)| (path.clone(), decl.zone.clone()))
+        .collect();
+    assert_eq!(
+        by_path, declared_zones,
+        "DiscoverZones reads DT_MOUNT verbatim"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -164,7 +173,7 @@ async fn discover_zones_picks_up_dt_mount_entries_added_at_runtime() {
 
     // Install a first federation zone + mount via bootstrap_static.
     let mut initial = BTreeMap::new();
-    initial.insert("/shared".to_string(), "sharedzone".to_string());
+    initial.insert("/shared".to_string(), MountDecl::whole_zone("sharedzone"));
     zm.bootstrap_static_async(
         vec!["sharedzone".to_string()],
         vec![format!("{id}@{bind}")],
@@ -183,7 +192,11 @@ async fn discover_zones_picks_up_dt_mount_entries_added_at_runtime() {
         .into_iter()
         .map(|d| (d.mount_path, d.zone_id))
         .collect();
-    assert_eq!(first_map, initial);
+    let initial_zones: BTreeMap<String, String> = initial
+        .iter()
+        .map(|(path, decl)| (path.clone(), decl.zone.clone()))
+        .collect();
+    assert_eq!(first_map, initial_zones);
 
     // Add a SECOND federation zone + mount at runtime (simulates
     // `nexusd-cluster share --mount-at`).  Create the zone, then
@@ -210,7 +223,9 @@ async fn discover_zones_picks_up_dt_mount_entries_added_at_runtime() {
         .into_iter()
         .map(|d| (d.mount_path, d.zone_id))
         .collect();
-    let mut expected = initial;
+    // DiscoverZones answers with `(mount_path, zone_id)` pairs, so the
+    // expectation is zones — a mount's subtree is a separate field.
+    let mut expected = initial_zones;
     expected.insert("/corp/eng".to_string(), "corp-eng".to_string());
     assert_eq!(
         second_map, expected,
