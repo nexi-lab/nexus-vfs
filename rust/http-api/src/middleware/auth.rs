@@ -1,53 +1,6 @@
-//! Bearer-token auth middleware for the `/v2/*` protected routes.
-//!
-//! # What this does
-//!
-//! Reads `Authorization: Bearer <token>` off the incoming request,
-//! resolves it through the shared [`AuthProvider`] on [`AppState`],
-//! and — on success — stamps the resulting [`OperationContext`] into
-//! request extensions.  Downstream handlers pull the context via
-//! `axum::Extension<OperationContext>`; a caller that does not need
-//! per-request identity simply does not extract it.  A missing /
-//! malformed / rejected token short-circuits with the appropriate
-//! HTTP status; the underlying handler never runs.
-//!
-//! # Why this crate reuses the transport trait
-//!
-//! [`transport::auth::AuthProvider`] is the SSOT trait every
-//! authenticated `nexus.*.v1` gRPC surface already consumes via
-//! `transport::grpc::VfsServiceImpl::authenticate`, and its resolved
-//! [`OperationContext`] is the SSOT struct every `kernel::sys_*` in
-//! turn consumes.  A local trait would be a needless divergence — the
-//! bearer plane the middleware validates is exactly the plane the
-//! kernel + gRPC surface already accept.
-//!
-//! # First-cut scope (per epic #4674 R10 "auth middleware" step)
-//!
-//! * `Authorization: Bearer <token>` header extraction only —
-//!   plaintext axum stack ships no rustls today, so mTLS peer plane
-//!   is out of scope until the HTTP surface gains a TLS listener.
-//! * `NoAuth` default keeps single-node dev unblocked (matches the
-//!   `nexusd` kernel default).
-//! * `/v2/status` stays PUBLIC (health endpoint used by liveness
-//!   probes before any token exists); every `/v2/search/*` route is
-//!   protected.
-//!
-//! # Explicit non-goals (documented so a follow-up PR knows the
-//! # cutline and does not re-tread ground):
-//!
-//! * mTLS peer plane — pending the HTTP surface's rustls wiring
-//!   (needs a `TlsConnectInfo` shape equivalent to the gRPC path's
-//!   `transport::peer_identity::from_request`).
-//! * Cookie-session handling — Python `nexus-server` does NOT use
-//!   session cookies (the only cookie is an OAuth-CSRF binding, not
-//!   an identity carrier); nothing to port.
-//! * ReBAC post-filter — separate epic step (`src/nexus/bricks/
-//!   permissions/rebac.py` → Rust); this middleware does authN only,
-//!   never authZ.
-//! * Cache invalidation observer — `ApiKeyAuthProvider` HMAC-caches
-//!   at the transport layer already; when a real provider is wired
-//!   into `AppState` its invalidation stream rides on the same raft
-//!   observer path the gRPC interceptor uses.
+//! HTTP bearer authentication. A single Authorization header identifies the
+//! caller. Resolved context and the request's credential travel together in
+//! extensions; handlers use that credential for downstream Search RPCs.
 
 use std::sync::Arc;
 
@@ -60,6 +13,11 @@ use contracts::operation_context::OperationContext;
 use transport::auth::{AuthCredentials, AuthProvider};
 
 use crate::AppState;
+
+/// The credential resolved by the HTTP middleware, retained only for this
+/// request's downstream RPCs. Deliberately has no Debug or serialization impl.
+#[derive(Clone)]
+pub struct BearerToken(pub Arc<str>);
 
 /// A caller allowed to administer credentials and authorization tuples.
 ///
@@ -113,6 +71,9 @@ impl<S: Send + Sync> FromRequestParts<S> for Admin {
 /// Case-insensitive scheme match — RFC 7235 §2.1 says the scheme
 /// is case-insensitive, so `bearer` / `BEARER` are equally valid.
 pub fn parse_bearer(headers: &axum::http::HeaderMap) -> Result<Option<&str>, AuthRejection> {
+    if headers.get_all(header::AUTHORIZATION).iter().count() > 1 {
+        return Err(AuthRejection::MalformedHeader);
+    }
     let Some(raw_value) = headers.get(header::AUTHORIZATION) else {
         return Ok(None);
     };
@@ -165,11 +126,41 @@ pub async fn require_bearer(
     mut req: Request,
     next: Next,
 ) -> Result<Response, AuthRejection> {
-    let token = parse_bearer(req.headers())?.unwrap_or("");
-    let ctx = state
-        .auth
-        .resolve(&AuthCredentials::from_token(token))
-        .map_err(AuthRejection::Rpc)?;
+    if !state.ready.is_ready() {
+        return Err(AuthRejection::Rpc(tonic::Status::unavailable(
+            "data plane is starting",
+        )));
+    }
+    // Query credentials are rejected at the authentication boundary on every
+    // protected route. Other query parameters belong to their own extractors.
+    #[derive(serde::Deserialize)]
+    struct QueryCredential {
+        auth_token: Option<String>,
+    }
+    if req.uri().query().is_some() {
+        let axum::extract::Query(credential) =
+            axum::extract::Query::<QueryCredential>::try_from_uri(req.uri()).map_err(|_| {
+                AuthRejection::Rpc(tonic::Status::invalid_argument("invalid query parameters"))
+            })?;
+        if credential.auth_token.is_some() {
+            return Err(AuthRejection::Rpc(tonic::Status::invalid_argument(
+                "credentials must be sent in the Authorization header",
+            )));
+        }
+    }
+    let token = BearerToken(Arc::from(parse_bearer(req.headers())?.unwrap_or("")));
+    let credential = token.clone();
+    // A cold credential lookup reads the Raft store synchronously. Keep that
+    // work off the HTTP executor, including its single-threaded test runtimes.
+    let ctx = tokio::task::spawn_blocking(move || {
+        state
+            .auth
+            .resolve(&AuthCredentials::from_token(&credential.0))
+    })
+    .await
+    .map_err(|_| AuthRejection::Rpc(tonic::Status::internal("authentication task failed")))?
+    .map_err(AuthRejection::Rpc)?;
+    req.extensions_mut().insert(token);
     req.extensions_mut().insert(ctx);
     Ok(next.run(req).await)
 }
@@ -255,10 +246,53 @@ mod tests {
     use super::*;
     use contracts::operation_context::OperationContext;
 
+    #[tokio::test]
+    async fn management_waits_for_the_shared_bootstrap_gate() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+        let mut state = AppState::for_tests("http://127.0.0.1:1");
+        let ready = transport::grpc::DataPlaneReady::pending();
+        state.ready = Arc::clone(&ready);
+        let router = crate::router(state);
+        let request = || {
+            Request::builder()
+                .uri("/v2/auth/keys")
+                .body(Body::empty())
+                .unwrap()
+        };
+        assert_eq!(
+            router.clone().oneshot(request()).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        ready.mark_ready();
+        assert_eq!(
+            router.oneshot(request()).await.unwrap().status(),
+            StatusCode::OK
+        );
+    }
+
     fn headers_with(auth: &str) -> axum::http::HeaderMap {
         let mut h = axum::http::HeaderMap::new();
         h.insert(header::AUTHORIZATION, auth.parse().unwrap());
         h
+    }
+
+    #[tokio::test]
+    async fn query_credentials_are_rejected_on_management_routes_too() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+        let router = crate::router(AppState::for_tests("http://127.0.0.1:1"));
+        for query in ["auth_token=sk-test", "%61uth_token=sk-test", "auth_token="] {
+            let request = Request::builder()
+                .uri(format!("/v2/auth/keys?{query}"))
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(
+                router.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::BAD_REQUEST,
+                "{query}",
+            );
+        }
     }
 
     #[test]

@@ -96,6 +96,10 @@ impl Default for PeerChannelConfig {
 /// of which variant fires.
 #[derive(Debug, thiserror::Error)]
 pub enum DialError {
+    #[error("TLS is required for peer {target}; use an https endpoint")]
+    TlsRequired { target: String },
+    #[error("connection handshake with peer {target} timed out")]
+    ConnectTimeout { target: String },
     /// The target string is not a valid gRPC endpoint (bad scheme,
     /// bad host:port, tonic could not parse).  Signals a misconfig
     /// — the target will never dial.
@@ -148,6 +152,7 @@ pub enum DialError {
 pub struct PeerChannelCache {
     channels: DashMap<Arc<str>, Channel>,
     config: PeerChannelConfig,
+    tls: Option<ClientTlsConfig>,
 }
 
 impl PeerChannelCache {
@@ -157,6 +162,18 @@ impl PeerChannelCache {
         Self {
             channels: DashMap::new(),
             config,
+            tls: None,
+        }
+    }
+
+    /// Share the daemon's verified cluster CA and node identity with outgoing
+    /// RPCs. Requiring TLS prevents credentials from reaching plaintext peers.
+    pub fn with_tls(mut config: PeerChannelConfig, tls: ClientTlsConfig) -> Self {
+        config.require_tls = true;
+        Self {
+            channels: DashMap::new(),
+            config,
+            tls: Some(tls),
         }
     }
 
@@ -193,6 +210,11 @@ impl PeerChannelCache {
     /// handles reconnection internally, so a cached dead Channel
     /// heals without a caller-visible signal).
     async fn dial(&self, target: &str) -> Result<Channel, DialError> {
+        if self.config.require_tls && !target.starts_with("https://") {
+            return Err(DialError::TlsRequired {
+                target: target.into(),
+            });
+        }
         // Standing rule: refuse plaintext to a non-loopback target
         // unless the caller has EXPLICITLY opted out.  The check
         // uses conservative host-extraction — a DNS name that
@@ -218,7 +240,10 @@ impl PeerChannelCache {
             // roots enabled at build time (webpki-roots on
             // tls-ring) — matches the outbound-client posture the
             // wider tonic 0.14 tree uses.
-            let tls_config = ClientTlsConfig::new().with_enabled_roots();
+            let tls_config = self
+                .tls
+                .clone()
+                .unwrap_or_else(|| ClientTlsConfig::new().with_enabled_roots());
             endpoint = endpoint
                 .tls_config(tls_config)
                 .map_err(|e| DialError::BadEndpoint {
@@ -226,9 +251,11 @@ impl PeerChannelCache {
                     source: e,
                 })?;
         }
-        endpoint
-            .connect()
+        tokio::time::timeout(self.config.connect_timeout, endpoint.connect())
             .await
+            .map_err(|_| DialError::ConnectTimeout {
+                target: target.into(),
+            })?
             .map_err(|e| DialError::ConnectFailed {
                 target: target.to_string(),
                 source: e,
@@ -270,6 +297,48 @@ pub fn is_loopback_url(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tls_identity_refuses_plaintext_even_on_loopback() {
+        let cache =
+            PeerChannelCache::with_tls(PeerChannelConfig::default(), ClientTlsConfig::new());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert!(matches!(
+            rt.block_on(cache.get_or_dial("http://127.0.0.1:1")),
+            Err(DialError::TlsRequired { .. })
+        ));
+    }
+
+    #[test]
+    fn dial_budget_includes_an_unresponsive_tls_handshake() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // TCP can connect, but the listener never responds to TLS.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let cache = PeerChannelCache::with_tls(
+                PeerChannelConfig {
+                    connect_timeout: Duration::from_millis(100),
+                    ..PeerChannelConfig::default()
+                },
+                ClientTlsConfig::new().domain_name("localhost"),
+            );
+            let target = format!("https://{}", listener.local_addr().unwrap());
+            let error = tokio::time::timeout(Duration::from_secs(3), cache.get_or_dial(&target))
+                .await
+                .expect("dial must enforce its own deadline")
+                .unwrap_err();
+            assert!(
+                matches!(error, DialError::ConnectTimeout { .. }),
+                "{error:?}"
+            );
+        });
+    }
 
     #[test]
     fn is_loopback_url_matches_localhost() {

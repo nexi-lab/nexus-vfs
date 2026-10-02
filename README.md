@@ -45,6 +45,35 @@ cargo build --release -p nexus-cluster
 
 The Python app layer connects via gRPC (`RPCTransport`).
 
+### HTTP search and relationship authorization
+
+Build `cargo build --release -p nexus-cluster --features http-api` and run the
+daemon with `--enable-rebac --http-addr 127.0.0.1:2026` alongside its usual
+cluster and signed Search plugin configuration. The `rebac` feature can also be
+built on its own for gRPC deployments. `NEXUS_REBAC_ENABLED=true` and
+`NEXUS_HTTP_ADDR=127.0.0.1:2026` are the corresponding environment settings.
+
+ReBAC enforces file grants for ordinary callers; administrators and system
+operations retain their authority. `/v2/rebac/tuples` manages the same replicated
+tuples that the kernel and Search result filter read. Successful grant/revoke
+responses wait for the local replica to apply the committed change. Other
+replicas enforce their locally applied state as replication progresses.
+
+HTTP clients send `Authorization: Bearer <key>`. Credentials in JSON bodies or
+query strings are rejected. Paths are canonical VFS paths, including configured
+mounts such as `/docs`. The loopback HTTP listener is intended to sit behind a
+TLS reverse proxy; its outbound gRPC connections use the daemon's cluster CA and
+node certificate while preserving the bearer caller's identity.
+
+Cross-zone queries support query type, result limit, and one path prefix. Pin
+`zone_id` to use additional ranking, chunk, or path-filter options; unsupported
+cross-zone options return HTTP 400.
+
+Plugin unload removes registration and closes service instances after active
+calls finish. Library code remains mapped until process exit so dependency
+threads and thread-local destructors can finish safely. Restart the daemon to
+replace plugin binaries.
+
 ## Acknowledgments
 
 We welcome **Zhuotao Liu** (Tsinghua University) as a contributor. The

@@ -6,7 +6,7 @@
 //!
 //! # Consumers
 //!
-//! The federated search dispatcher (upcoming) calls this once per
+//! The federated search dispatcher calls this once per
 //! request to discover the zone set to fan out to, cached per subject
 //! for the TTL window on [`AccessibleZonesCache`].
 //!
@@ -83,26 +83,26 @@ pub fn list_accessible_zones<S: ReBACTupleStore + ?Sized>(
 /// observably.
 pub const DEFAULT_ZONE_CACHE_TTL: Duration = Duration::from_secs(10);
 
-/// Per-subject TTL cache of the zone set — the same shape the Python
-/// federated dispatcher uses (`_zone_cache: dict[subject_key -> (zones,
-/// expiry)]`).
-///
-/// The cache stores `(zones, expiry_instant)`; a lookup after expiry
-/// re-runs the O(N) `list_accessible_zones` scan.  A tuple write
-/// invalidates the cache the NEXT time the caller looks up — safe
-/// because the dispatcher on the mutating side always sees the fresh
-/// tuple table on its next request, and the TTL bounds staleness for
-/// every other caller.
-///
-/// Cache invalidation is NOT wired to `store.put/delete` on purpose:
-/// tightening to zero TTL would defeat the cache's whole point (the
-/// dispatcher exists to defend p99 against the O(N) scan).  If a
-/// caller needs a synchronous invalidate, add an explicit
-/// `invalidate_subject` method — none does today.
-#[derive(Debug, Default)]
+/// Per-subject zone discovery cache. Every hit checks the store revision so
+/// committed grants and revocations are visible immediately on that replica.
+/// TTL bounds reuse between writes. A store without revisions bypasses caching.
+#[derive(Debug)]
 pub struct AccessibleZonesCache {
-    entries: RwLock<std::collections::HashMap<String, (Vec<String>, Instant)>>,
+    entries: RwLock<std::collections::HashMap<String, CachedZones>>,
     ttl: Duration,
+}
+
+#[derive(Debug)]
+struct CachedZones {
+    zones: Vec<String>,
+    expiry: Instant,
+    revision: u64,
+}
+
+impl Default for AccessibleZonesCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AccessibleZonesCache {
@@ -128,12 +128,13 @@ impl AccessibleZonesCache {
         store: &S,
         subject: Subject<'_>,
     ) -> Result<Vec<String>, ReBACTupleStoreError> {
+        let revision = store.revision()?;
         let key = cache_key(subject);
         let now = Instant::now();
         // Fast path — read lock only.
-        if let Some((zones, expiry)) = self.entries.read().get(&key) {
-            if now < *expiry {
-                return Ok(zones.clone());
+        if let Some(entry) = self.entries.read().get(&key) {
+            if revision != 0 && entry.revision == revision && now < entry.expiry {
+                return Ok(entry.zones.clone());
             }
         }
         // Miss or expired — recompute; single scan, then upgrade to
@@ -142,12 +143,21 @@ impl AccessibleZonesCache {
         // stored value is identical either way).
         let zones = list_accessible_zones(store, subject)?;
         let expiry = now + self.ttl;
-        self.entries.write().insert(key, (zones.clone(), expiry));
+        if revision != 0 && store.revision()? == revision {
+            self.entries.write().insert(
+                key,
+                CachedZones {
+                    zones: zones.clone(),
+                    expiry,
+                    revision,
+                },
+            );
+        }
         Ok(zones)
     }
 
     /// Drop every cache entry.  Test-only affordance — production
-    /// callers rely on TTL expiry, not manual invalidation.
+    /// callers rely on revision checks and TTL expiry.
     pub fn clear(&self) {
         self.entries.write().clear();
     }
@@ -273,7 +283,7 @@ mod tests {
     // ── Cache ─────────────────────────────────────────────────────
 
     #[test]
-    fn cache_hit_returns_stored_list_without_scanning() {
+    fn committed_grant_invalidates_zone_discovery() {
         // Seed once, prime the cache, then MUTATE the store — the
         // cache must still return the OLD list within the TTL.
         // Documents the "TTL bounds staleness; invalidation on the
@@ -291,8 +301,8 @@ mod tests {
         let cached = cache.lookup(&s, ("user", "alice")).unwrap();
         assert_eq!(
             cached,
-            vec!["eng".to_string()],
-            "cache must NOT see the fresh row"
+            vec!["eng".to_string(), "legal".to_string()],
+            "a committed grant must be visible without waiting for TTL"
         );
     }
 

@@ -387,8 +387,15 @@ async fn credentials_and_live_permissions_survive_signed_plugin_and_cached_searc
         Code::Unauthenticated
     );
 
+    kernel.unload_plugin("search").unwrap();
+    assert!(kernel.list_plugins().is_empty());
+    // Routes retain their dispatcher after unload; it must reject calls without
+    // touching the destroyed instance or unmapped plugin code.
+    assert_eq!(
+        client.query(query(&admin.key)).await.unwrap_err().code(),
+        Code::Unavailable
+    );
     server.abort();
     let _ = server.await;
-    kernel.unload_plugin("search").unwrap();
     registry.shutdown_all();
 }

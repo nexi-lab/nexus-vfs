@@ -221,6 +221,7 @@ mod tests {
 
     fn req() -> SearchRequest {
         SearchRequest {
+            auth_token: String::new(),
             query: "q".into(),
             search_type: "hybrid".into(),
             limit: 10,

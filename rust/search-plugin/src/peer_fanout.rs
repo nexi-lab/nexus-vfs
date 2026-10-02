@@ -123,6 +123,14 @@ impl PeerFanoutError {
     /// shapes aligned.
     fn from_dial(err: DialError) -> Self {
         match err {
+            DialError::TlsRequired { target } => Self::Unreachable {
+                peer: target,
+                source: tonic::Status::unauthenticated("TLS is required"),
+            },
+            DialError::ConnectTimeout { target } => Self::Unreachable {
+                peer: target,
+                source: tonic::Status::deadline_exceeded("connection handshake timed out"),
+            },
             DialError::BadEndpoint { target, source } => Self::BadEndpoint {
                 peer: target,
                 source,

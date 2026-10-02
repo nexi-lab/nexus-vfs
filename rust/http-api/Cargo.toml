@@ -2,7 +2,7 @@
 name = "nexus-http-api"
 version = "0.1.0"
 edition = "2021"
-description = "PoC axum-based HTTP-API crate for the nexus-server → pure-Rust migration (epic #4674).  v0 ships a single /v2/status handler so the crate + axum plumbing pattern is proven end-to-end before the router surface grows."
+description = "HTTP search, document management, credentials, and ReBAC administration"
 
 [lib]
 name = "nexus_http_api"
@@ -28,11 +28,6 @@ tracing = "0.1"
 tonic = { workspace = true }
 prost = { workspace = true }
 tonic-prost = { workspace = true }
-
-# Sharded cache for per-upstream tonic Channel — one Channel per
-# backend address, dialed lazily on first use.  Same 6.1 pin the
-# sibling search-plugin peer-fanout uses (search-plugin/Cargo.toml).
-dashmap = "6.1"
 
 # `auth::record::AuthKeyRecord` + `SubjectType` decode for the
 # `/v2/auth/keys` list handler.  The store's value bytes are the
@@ -103,7 +98,7 @@ nexus-federated-search = { path = "../federated-search", optional = true }
 # `backends::tonic_remote` cross-daemon impl uses.  Same SSOT
 # `nexus-search-plugin::peer_fanout` reads through, so a dial-time
 # rule tweak lands in ONE place.
-nexus-search-common = { path = "../search-common", optional = true, features = ["transport"] }
+nexus-search-common = { path = "../search-common", features = ["transport"] }
 # `PluginLocalSearchBackend` impls the federated dispatcher's
 # async-trait `LocalSearchBackend`; `async-trait` is required by
 # the trait's own macro.  Same 0.1 pin the federated-search crate
@@ -112,7 +107,7 @@ async-trait = { version = "0.1", optional = true }
 
 [features]
 default = []
-rebac = ["dep:nexus-rebac", "dep:lib", "dep:nexus-federated-search", "dep:nexus-search-common", "dep:async-trait"]
+rebac = ["dep:nexus-rebac", "dep:lib", "dep:nexus-federated-search", "dep:async-trait"]
 
 [build-dependencies]
 # Client-only proto codegen from the workspace's search proto SSOT
