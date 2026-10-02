@@ -5,11 +5,18 @@ today's honor-system-by-string mechanism with a Linux-LSM-style ownership
 model where every non-kernel hook is tied to a lifecycle-managed entity that
 enforces cleanup on drop.
 
-**Status:** design proposal — awaiting review before implementation.
+**Status:** partially implemented. The scoped surface this proposal argues for
+already exists and has its first production consumer: `ServiceRegistry`
+carries a `HookOnly` variant, `Kernel::enlist_hook_only_service` returns a
+`ServiceHandle`, and `a2a` registers its stamping hook through that handle
+(`rust/a2a/src/lib.rs`, `install_a2a_stamp_hook`). What remains open is
+*enforcement* — migrating the unscoped callers listed below, and whitelisting
+the kernel-adjacent ones.
 
 **Scope:** kernel `NativeHookRegistry` + `ObserverRegistry` registration
-APIs, plus `ServiceRegistry`.  Consumer migration: `services::audit` (the
-only true hook-only service today).  Kernel-adjacent trusted code
+APIs, plus `ServiceRegistry`.  Consumer migration: `services::audit`.
+`a2a` is a hook-only service too, but it already registers through the scoped
+surface, so it needs no migration.  Kernel-adjacent trusted code
 (`PermissionHook`, `BoundaryHook`, `transport::transport_observer`) stays
 on the unscoped surface per an explicit whitelist.  Driver-owned hooks
 (`DriverLifecycleCoordinator` extension) is scoped in but tracked as
@@ -46,11 +53,14 @@ drift.
 - `services::managed_agent::install` — two `register_native_hook` calls (unscoped).
 - `services::matrix_adapter::rooms::install` + `sync::install` — `register_native_hook` (unscoped).
 - `transport::transport_observer::install` (nexus-vfs #126) — `register_observer` (unscoped, tag `"transport-observer"`).  Kernel-adjacent trusted transport-tier code; not a `ServiceRegistry` entry.
+- `a2a::install_a2a_stamp_hook` — `enlist_hook_only_service("a2a")` + `register_service_hook` (**scoped**).  The first production consumer of the enforced surface.
 
-No production caller of `register_service_hook` / `register_service_observer`
-exists.  The service-scoped API is defined and unit-tested but no service
-today uses it — all service-tier hooks reach directly for the unscoped
-surface and rely on convention to remember what they installed.  The
+`register_service_hook` now has a production caller: `a2a` enlists a hook-only
+service and installs its stamping hook through the returned handle
+(`rust/a2a/src/lib.rs`, `install_a2a_stamp_hook`).  `register_service_observer`
+still has none.  The remaining service-tier hooks listed above reach directly
+for the unscoped surface and rely on convention to remember what they
+installed.  The
 transport-tier `transport_observer` also uses the unscoped surface, but for
 a different reason: it's kernel-adjacent code and would be whitelisted with
 `PermissionHook` / `BoundaryHook` under the enforced surface below.
