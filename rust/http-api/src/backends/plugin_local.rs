@@ -28,8 +28,7 @@ use async_trait::async_trait;
 use nexus_federated_search::{BackendError, LocalSearchBackend, SearchRequest};
 use nexus_search_common::Hit;
 
-use crate::backends::proto_bridge::hit_from_proto;
-use crate::search_proto::{QueryRequest, QueryType};
+use crate::backends::proto_bridge::{hit_from_proto, query_for_zone};
 use crate::SearchBackend;
 
 /// Dispatches per-zone search requests through the shared
@@ -55,47 +54,13 @@ impl LocalSearchBackend for PluginLocalSearchBackend {
         zone_id: &str,
         req: &SearchRequest,
     ) -> Result<Vec<Hit>, BackendError> {
-        // Map the wire `search_type` string onto the proto enum.  A
-        // typo maps to the proto default (KEYWORD) — the axum handler
-        // already rejects typos with 400 at the caller boundary via
-        // `parse_query_type`, so by the time a request reaches this
-        // impl the string was already normalised.  We're conservative
-        // here anyway: unknown values → keyword.
-        let query_type = match req.search_type.as_str() {
-            "semantic" => QueryType::Semantic,
-            "hybrid" => QueryType::Hybrid,
-            _ => QueryType::Keyword,
-        };
         let mut client = self
             .inner
             .client()
             .await
             .map_err(|e| BackendError::Transport(e.to_string()))?;
-        let proto = QueryRequest {
-            q: req.query.clone(),
-            zone_id: zone_id.to_string(),
-            limit: u32::try_from(req.limit).unwrap_or(u32::MAX),
-            path_filter: req.path_filter.clone().unwrap_or_default(),
-            query_type: query_type as i32,
-            // The plugin uses `auth_token` for its own OperationContext
-            // read-side gate.  Federated legs against the LOCAL plugin
-            // pass through with no token — the axum handler has already
-            // enforced the caller's zone allowlist upstream, so the
-            // plugin trusts what it's asked.  A cross-daemon backend
-            // would instead put its `SearchDelegation` here (PR-followup
-            // task; see `backends::mod`).
-            auth_token: String::new(),
-            alpha: 0.0,
-            fusion_method: 0,
-            rrf_k: 0,
-            chunks_per_page: 0,
-            expand: String::new(),
-            recency_mode: String::new(),
-            recency_weight: 0.0,
-            recency_half_life_days: 0.0,
-            path_prefix_boosts: std::collections::HashMap::new(),
-            path_filters: Vec::new(),
-        };
+        let mut proto = query_for_zone(zone_id, req);
+        proto.auth_token = req.auth_token.clone();
         let resp = client
             .query(tonic::Request::new(proto))
             .await
@@ -112,7 +77,3 @@ impl LocalSearchBackend for PluginLocalSearchBackend {
         Ok(resp.results.into_iter().map(hit_from_proto).collect())
     }
 }
-
-// `hit_from_proto` moved to `crate::backends::proto_bridge` so
-// `tonic_remote` shares the same impl — see that module for the
-// SSOT rule and the extras-key contract.

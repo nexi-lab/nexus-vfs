@@ -2,7 +2,7 @@
 name = "nexus-rebac"
 version = "0.1.0"
 edition = "2021"
-description = "Relationship-based access control (Zanzibar-shaped) for nexus — the Rust replacement for `src/nexus/bricks/rebac/`.  Owns the tuple store trait + in-memory impl + the raft-backed impl, and (in later PRs) the per-zone graph cache, the enforcer facade, the kernel `PermissionProvider` impl, and the HTTP router the /v2/rebac/tuples handlers call."
+description = "Relationship-based authorization with replicated tuples and cached permission graphs"
 authors = ["Nexus Team"]
 publish = false
 

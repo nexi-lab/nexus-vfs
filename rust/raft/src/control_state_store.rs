@@ -14,12 +14,6 @@
 use crate::prelude::{Command, CommandResult, FullStateMachine, ZoneConsensus};
 use lib::rt::block_on_via as bridge_block_on;
 
-/// How long a write waits for its own effect to become visible in the local
-/// state machine before returning (read-your-writes). Admin tooling that writes
-/// then immediately lists must not see its own write missing; control-plane
-/// writes are never a hot path, so paying this is free in practice.
-const READ_YOUR_WRITES_POLL_MS: u64 = 500;
-
 /// A namespace-scoped view of the replicated cluster-control store.
 ///
 /// Clone-cheap in spirit but not `Clone` (holds a `ZoneConsensus`); construct one
@@ -90,13 +84,12 @@ impl ControlStateStore {
 
     fn put_inner(&self, key: &str, value: &[u8], if_absent: bool) -> Result<bool, String> {
         let ns = self.namespace;
-        let expected = value.to_vec();
         let result = bridge_block_on(
             &self.runtime,
             self.node.propose(Command::PutControlState {
                 namespace: ns.to_string(),
                 key: key.to_string(),
-                value: expected.clone(),
+                value: value.to_vec(),
                 if_absent,
             }),
         )
@@ -109,12 +102,12 @@ impl ControlStateStore {
             }
             return Err(format!("put({ns}/{key}) rejected: {msg}"));
         }
-        self.wait_visible(key, &expected);
+        self.read_barrier()?;
         Ok(true)
     }
 
     /// Remove `key` (revocation / un-pin). Returns whether a record was present
-    /// at propose time — advisory (the delete is idempotent, the log is
+    /// in the local view before proposing — advisory (the delete is idempotent, the log is
     /// authoritative), for an operator "removed something" vs "nothing there".
     #[inline]
     pub fn delete(&self, key: &str) -> Result<bool, String> {
@@ -131,31 +124,22 @@ impl ControlStateStore {
         if let CommandResult::Error(msg) = result {
             return Err(format!("delete({ns}/{key}) rejected: {msg}"));
         }
+        self.read_barrier()?;
         Ok(existed)
     }
 
-    /// Read-your-writes: `propose` returns on commit, but the local apply can lag
-    /// it by a raft tick (always on a follower whose proposal was forwarded). Wait
-    /// until this node's state machine shows the committed value. SSOT stays the
-    /// state machine — we only wait for it.
-    fn wait_visible(&self, key: &str, expected: &[u8]) {
-        let runtime = self.runtime.clone();
-        let node = self.node.clone();
-        let ns = self.namespace;
-        let key = key.to_string();
-        let expected = expected.to_vec();
-        let _ = self.node.wait_until(
-            || {
-                let poll_key = key.clone();
-                let observed = bridge_block_on(
-                    &runtime,
-                    node.with_state_machine(move |sm: &FullStateMachine| {
-                        sm.get_control_state(ns, &poll_key)
-                    }),
-                );
-                matches!(&observed, Ok(Some(bytes)) if *bytes == expected)
-            },
-            READ_YOUR_WRITES_POLL_MS,
-        );
+    /// Wait for the local replica to apply all preceding commits through Raft
+    /// ReadIndex. Applies equally to grants and revocations, including writes
+    /// forwarded by followers. Errors are returned to the management caller.
+    fn read_barrier(&self) -> Result<(), String> {
+        bridge_block_on(&self.runtime, async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                self.node.read_linearizable(|_| ()),
+            )
+            .await
+            .map_err(|_| format!("apply barrier({}) timed out", self.namespace))?
+            .map_err(|e| format!("apply barrier({}): {e}", self.namespace))
+        })
     }
 }

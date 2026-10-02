@@ -1,4 +1,6 @@
-//! `RebacPermissionProvider` — the enforcer facade.
+//! Kernel permission provider over per-zone relationship graphs. System and
+//! administrator contexts bypass graph checks. Other callers need a matching
+//! direct or userset grant; missing grants and store failures deny access.
 //!
 //! Impls `kernel::PermissionProvider` on top of the
 //! [`crate::ReBACGraphCache`] + a permission-to-relation map.
@@ -547,7 +549,7 @@ mod tests {
             fn list(&self) -> Result<Vec<(String, Vec<u8>)>, ReBACTupleStoreError> {
                 Err(ReBACTupleStoreError::Backend("backend unavailable".into()))
             }
-            fn zone_revision(&self, _z: &str) -> Result<u64, ReBACTupleStoreError> {
+            fn revision(&self) -> Result<u64, ReBACTupleStoreError> {
                 Ok(0)
             }
         }

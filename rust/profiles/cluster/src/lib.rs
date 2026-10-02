@@ -32,6 +32,7 @@ use backends::storage::path_local::PathLocalBackend;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 mod auth_posture;
+mod authorization;
 use auth_posture::{AuthPosture, AuthPostureInputs};
 use kernel::abc::object_store::ObjectStore;
 use kernel::hal::object_store_provider::set_provider;
@@ -68,6 +69,15 @@ struct Args {
 
 #[derive(Debug, clap::Args)]
 struct CommonArgs {
+    /// Enforce relationship grants from the replicated credential store.
+    /// Requires a build with the `rebac` feature.
+    #[arg(long, env = "NEXUS_REBAC_ENABLED", default_value_t = false)]
+    enable_rebac: bool,
+
+    /// Serve the HTTP API at this address. Requires `http-api` and
+    /// --enable-rebac. Use a TLS reverse proxy for external HTTP clients.
+    #[arg(long, env = "NEXUS_HTTP_ADDR")]
+    http_addr: Option<std::net::SocketAddr>,
     /// This node's hostname. Falls back to NEXUS_HOSTNAME, then OS hostname.
     ///
     /// Display label only — used by ZoneManager for human-readable
@@ -1785,6 +1795,7 @@ fn catch_up_epoch_zone(zm: &nexus_raft::ZoneManager, epoch_zone: &str, node_id: 
 const DELETION_SWEEP_INTERVAL_SECS: u64 = 60;
 
 async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -> Result<()> {
+    authorization::validate(&common)?;
     let hostname = resolve_hostname(common.hostname.as_deref());
     tracing::info!(
         hostname = %hostname,
@@ -3180,6 +3191,16 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         // — the sk- plane simply does not exist there.
         api_key_secret,
     };
+    let mut service_decls = build_decls(&svc_ctx);
+    service_decls.extend(authorization::service_decls(
+        &common,
+        &svc_ctx,
+        cluster_tls.as_ref(),
+        Arc::clone(&data_plane_ready),
+    )?);
+    kernel
+        .bring_up_services(service_decls)
+        .map_err(|e| anyhow::anyhow!("bring up services: {e}"))?;
     // Typed Zone runtime backend (ZoneRuntimeService): the operation journal
     // binds to the SAME zone the auth-key store did (control zone under TLS,
     // per-node `root` under `--no-tls` — D8: journal availability = that
@@ -3263,9 +3284,6 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         );
     }
 
-    kernel
-        .bring_up_services(build_decls(&svc_ctx))
-        .map_err(|e| anyhow::anyhow!("bring up services: {e}"))?;
 
     // (2) Arm the cross-machine stream-wakeup observer PER ZONE: a
     // replicated `AppendStreamEntry` (a transcript write on a

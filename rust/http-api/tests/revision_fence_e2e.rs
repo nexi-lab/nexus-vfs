@@ -12,7 +12,6 @@ use std::sync::Arc;
 
 use nexus_http_api::middleware::revision::StatGen;
 use nexus_http_api::{bind_and_serve, AppState};
-use tokio::net::TcpListener;
 
 /// Fixed-gen `StatGen` for the fence-boundary tests.
 struct FixedGen(u64);
@@ -33,10 +32,9 @@ async fn spawn_with_kernel(kernel: Arc<dyn StatGen>) -> String {
     // here.
     let mut state = AppState::for_tests("http://127.0.0.1:1");
     state.kernel = kernel;
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    let (addr, fut) = bind_and_serve(addr, state).await.expect("bind");
+    let (addr, fut) = bind_and_serve("127.0.0.1:0".parse().unwrap(), state)
+        .await
+        .expect("bind");
     tokio::spawn(async move {
         let _ = fut.await;
     });

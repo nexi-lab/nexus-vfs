@@ -16,6 +16,8 @@ path = "src/main.rs"
 
 [features]
 default = []
+rebac = ["dep:nexus-rebac"]
+http-api = ["rebac", "dep:nexus-http-api", "nexus-http-api/rebac", "dep:nexus-search-common"]
 
 # Model egress through the VFS: mount an LLM connector, and a model call
 # becomes a write that crosses `Kernel::apply_mutating_write_hooks` — the one
@@ -54,6 +56,9 @@ driver-ai = [
 ]
 
 [dependencies]
+nexus-rebac = { path = "../../rebac", optional = true }
+nexus-http-api = { path = "../../http-api", optional = true }
+nexus-search-common = { path = "../../search-common", optional = true, features = ["transport"] }
 # raft owns federation orchestration (ZoneManager, bootstrap_tls, etc.).
 # Only the grpc feature — that is all this binary needs and dropping the
 # others keeps the stripped binary small.
@@ -110,6 +115,7 @@ tracing-appender = "0.2"
 gethostname = "1.1"
 
 [dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 nexus-rebac = { path = "../../rebac" }
 tokio-stream = { version = "0.1", features = ["net"] }
 nexus-plugin-abi = { workspace = true }

@@ -20,7 +20,7 @@
 //! # Why a string encoding (not bincode / serde_json)
 //!
 //! The store's `list()` returns `(String, Vec<u8>)` — the KEY is what
-//! [`crate::store::ReBACTupleStore::zone_revision`] indexes by, and
+//! [`crate::store::ReBACTupleStore::revision`] indexes by, and
 //! the graph cache rebuilds the graph by walking `list()` output.  A
 //! string key means:
 //!

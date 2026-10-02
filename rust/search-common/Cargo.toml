@@ -9,6 +9,7 @@ name = "nexus_search_common"
 crate-type = ["rlib"]
 
 [dependencies]
+tokio = { version = "1", features = ["time"], optional = true }
 # No I/O — pure algorithms + DTOs.  Serde only so a caller that
 # serialises the envelope for a gRPC/HTTP boundary can `#[derive]`
 # without pulling us onto every leaf DTO.
@@ -33,7 +34,7 @@ dashmap = { version = "6.1", optional = true }
 
 [features]
 default = []
-transport = ["dep:tonic", "dep:dashmap"]
+transport = ["dep:tonic", "dep:dashmap", "dep:tokio"]
 
 [dev-dependencies]
 # The `transport` module's dial-error tests spin a single-threaded

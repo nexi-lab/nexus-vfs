@@ -17,8 +17,12 @@ use nexus_search_common::{Hit, SearchDelegation};
 
 /// The dispatcher's per-zone search request.  Owned (not a borrow of
 /// an axum body) so each leg's spawn owns its clone.
-#[derive(Debug, Clone)]
+// Contains a live credential; do not derive Debug or serialization.
+#[derive(Clone)]
 pub struct SearchRequest {
+    /// Original caller credential for local RPC legs. Remote legs use a
+    /// delegated subject over the node's authenticated connection instead.
+    pub auth_token: String,
     /// Raw query text.
     pub query: String,
     /// `keyword` / `semantic` / `hybrid` — kept as a string so a

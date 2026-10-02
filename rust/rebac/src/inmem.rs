@@ -1,39 +1,10 @@
-//! `InMemoryReBACTupleStore` — the real (non-noop) impl backed by a
-//! `parking_lot::RwLock<HashMap>`.
-//!
-//! # When to use
-//!
-//! * **Tests** — the enforcer + graph cache + HTTP handler tests
-//!   all build their fixture graph through this.  Same shape
-//!   real callers use, no boot-order dance.
-//! * **Dev / single-node** — a nexusd built without the raft
-//!   feature (a future opt-out) can install this at the
-//!   composition root.  Grants persist for the process lifetime
-//!   and vanish on restart — CORRECT for dev; NEVER production.
-//!
-//! # Cross-thread safety
-//!
-//! `RwLock<HashMap>`: unbounded readers, at-most-one writer.
-//! Every method takes the lock briefly and returns owned data —
-//! no lock is held across the caller's compute.  The `list()`
-//! call clones the whole map; this is O(N) where N is the tuple
-//! count — the same "one full scan per graph rebuild" cost
-//! model the real raft-backed impl carries.
-//!
-//! # Zone revision tracking
-//!
-//! An in-memory `HashMap<String, u64>` bumps on every `put` /
-//! `delete` for the zone extracted from the tuple key's first
-//! `|`-delimited segment (the tuple key convention this crate
-//! adopts — documented on [`InMemoryReBACTupleStore`]).  A key
-//! that does not encode a zone bumps a `""` global counter — safe
-//! (over-invalidates the enforcer's cache) but the tuple-key
-//! convention is stable enough this branch is never taken in
-//! production.
+//! In-memory tuple store for tests and process-local fixtures.
+//! Mutations advance one revision while holding the entries write lock.
 
 use std::collections::HashMap;
 
 use parking_lot::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::store::{ReBACTupleStore, ReBACTupleStoreError};
 
@@ -41,20 +12,10 @@ use crate::store::{ReBACTupleStore, ReBACTupleStoreError};
 /// takes the lock briefly and returns owned data (no borrow-across-
 /// caller).
 ///
-/// # Tuple key convention
-///
-/// Keys are expected to be pipe-delimited `<zone>|<rest>` — the
-/// zone-revision tracker keys off the first segment.  Any key
-/// without a `|` bumps the empty-string revision counter, which
-/// the enforcer treats as a global cache bust (safe over-
-/// invalidate, no correctness impact).  The full production key
-/// shape lands in the enforcer PR: `<zone>|<object_type>|
-/// <object_id>|<relation>|<subject_type>|<subject_id>[|<subject_
-/// relation>]`.
 #[derive(Debug, Default)]
 pub struct InMemoryReBACTupleStore {
     entries: RwLock<HashMap<String, Vec<u8>>>,
-    zone_revs: RwLock<HashMap<String, u64>>,
+    revision: AtomicU64,
 }
 
 impl InMemoryReBACTupleStore {
@@ -63,40 +24,21 @@ impl InMemoryReBACTupleStore {
     pub fn new() -> Self {
         Self::default()
     }
-
-    /// Extract the zone from a tuple key (first `|`-delimited
-    /// segment).  Returns `""` for a key with no `|` — see the
-    /// struct doc for the safe-over-invalidate rationale.
-    fn zone_of(key: &str) -> &str {
-        key.split_once('|').map(|(z, _)| z).unwrap_or("")
-    }
-
-    fn bump_zone_rev(&self, zone: &str) {
-        let mut revs = self.zone_revs.write();
-        let entry = revs.entry(zone.to_string()).or_insert(0);
-        *entry = entry.saturating_add(1);
-    }
 }
 
 impl ReBACTupleStore for InMemoryReBACTupleStore {
     fn put(&self, key: &str, value: &[u8]) -> Result<(), ReBACTupleStoreError> {
-        // Bump the zone revision on EVERY put — even a same-value
-        // write, matching the `RaftReBACTupleStore` posture (a
-        // raft propose commits regardless of value equality).
-        // Cheap: one lock + one hash insert.
-        self.entries.write().insert(key.to_string(), value.to_vec());
-        self.bump_zone_rev(Self::zone_of(key));
+        let mut entries = self.entries.write();
+        entries.insert(key.to_string(), value.to_vec());
+        self.revision.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
     fn delete(&self, key: &str) -> Result<bool, ReBACTupleStoreError> {
-        let existed = self.entries.write().remove(key).is_some();
-        // Bump the revision only when the delete actually removed
-        // something — a delete-on-missing does not change graph
-        // state, so the enforcer cache stays fresh.  Matches the
-        // idempotent-delete contract.
+        let mut entries = self.entries.write();
+        let existed = entries.remove(key).is_some();
         if existed {
-            self.bump_zone_rev(Self::zone_of(key));
+            self.revision.fetch_add(1, Ordering::Release);
         }
         Ok(existed)
     }
@@ -114,8 +56,8 @@ impl ReBACTupleStore for InMemoryReBACTupleStore {
             .collect())
     }
 
-    fn zone_revision(&self, zone: &str) -> Result<u64, ReBACTupleStoreError> {
-        Ok(self.zone_revs.read().get(zone).copied().unwrap_or(0))
+    fn revision(&self) -> Result<u64, ReBACTupleStoreError> {
+        Ok(self.revision.load(Ordering::Acquire))
     }
 }
 
@@ -168,38 +110,38 @@ mod tests {
     }
 
     #[test]
-    fn put_bumps_zone_revision_for_the_written_zone() {
+    fn put_advances_store_revision() {
         // The enforcer keys its per-zone graph cache on this
         // counter — a bump on write is what makes a stale cache
         // notice it needs to rebuild.  Regression pin: a delete
         // must also bump so a revoke invalidates every reader.
         let s = InMemoryReBACTupleStore::new();
-        assert_eq!(s.zone_revision("root").expect("rev0"), 0);
+        assert_eq!(s.revision().expect("rev0"), 0);
 
         s.put("root|doc:a|reader|user|alice", b"g").expect("put");
-        let rev1 = s.zone_revision("root").expect("rev1");
+        let rev1 = s.revision().expect("rev1");
         assert!(rev1 > 0);
 
         s.put("root|doc:b|reader|user|alice", b"g")
             .expect("put again");
-        let rev2 = s.zone_revision("root").expect("rev2");
+        let rev2 = s.revision().expect("rev2");
         assert!(rev2 > rev1);
 
         s.delete("root|doc:a|reader|user|alice").expect("del");
-        let rev3 = s.zone_revision("root").expect("rev3");
+        let rev3 = s.revision().expect("rev3");
         assert!(rev3 > rev2);
     }
 
     #[test]
-    fn delete_on_missing_key_does_not_bump_zone_revision() {
+    fn delete_on_missing_key_keeps_revision() {
         // Idempotent delete + no-op cache bust — a caller that
         // retries a delete does not spuriously invalidate every
         // reader's cache in the zone.
         let s = InMemoryReBACTupleStore::new();
-        assert_eq!(s.zone_revision("root").expect("rev0"), 0);
+        assert_eq!(s.revision().expect("rev0"), 0);
         assert!(!s.delete("root|missing|reader|user|alice").expect("delete"));
         assert_eq!(
-            s.zone_revision("root").expect("rev unchanged"),
+            s.revision().expect("rev unchanged"),
             0,
             "delete on missing key must NOT bump the revision — a retry \
              storm would otherwise invalidate every reader's cache in the zone",
@@ -207,25 +149,7 @@ mod tests {
     }
 
     #[test]
-    fn zone_revisions_are_independent_across_zones() {
-        // Writing to zone A must not bust zone B's cache.
-        let s = InMemoryReBACTupleStore::new();
-        s.put("A|doc:x|reader|user|alice", b"g").expect("put A");
-        let rev_a_1 = s.zone_revision("A").expect("A rev1");
-        let rev_b_1 = s.zone_revision("B").expect("B rev1");
-
-        s.put("A|doc:y|reader|user|alice", b"g")
-            .expect("put A again");
-        assert!(s.zone_revision("A").expect("A rev2") > rev_a_1);
-        assert_eq!(
-            s.zone_revision("B").expect("B unchanged"),
-            rev_b_1,
-            "write to zone A must not bump zone B's revision",
-        );
-    }
-
-    #[test]
-    fn key_without_zone_prefix_bumps_empty_string_revision() {
+    fn opaque_keys_also_advance_revision() {
         // Safe over-invalidate posture — a malformed key (no `|`)
         // is treated as a global cache bust rather than silently
         // dropped.  Real callers use the documented key shape;
@@ -233,7 +157,7 @@ mod tests {
         let s = InMemoryReBACTupleStore::new();
         s.put("legacy_no_zone_prefix", b"g").expect("put");
         assert_eq!(
-            s.zone_revision("").expect("empty-zone rev"),
+            s.revision().expect("empty-zone rev"),
             1,
             "key without `|` must bump the empty-zone counter, not silently drop",
         );

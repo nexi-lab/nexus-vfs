@@ -320,7 +320,8 @@ async fn multi_zone_caller_with_empty_zone_id_fans_out() {
 
     let body = serde_json::json!({
         "q": "widget",
-        "query_type": "keyword",
+        "query_type": "HYBRID",
+        "fusion_method": "RRF",
     });
     let resp = reqwest::Client::new()
         .post(format!("{base}/v2/search/query"))
@@ -348,6 +349,13 @@ async fn multi_zone_caller_with_empty_zone_id_fans_out() {
     let mut zones: Vec<&str> = queries.iter().map(|q| q.zone_id.as_str()).collect();
     zones.sort();
     assert_eq!(zones, vec!["eng", "legal"]);
+    for query in queries.iter() {
+        assert_eq!(
+            query.query_type,
+            nexus_http_api::search_proto::QueryType::Hybrid as i32
+        );
+        assert_eq!(query.auth_token, "anything");
+    }
 
     // Fused results carry ONE hit per zone (mock stamps one per
     // request), both surviving the RRF fusion + bridge.
@@ -364,6 +372,45 @@ async fn multi_zone_caller_with_empty_zone_id_fans_out() {
     for r in results {
         assert!(!r["zone_id"].as_str().unwrap().is_empty());
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn federated_query_rejects_options_it_cannot_preserve() {
+    let (base, log) = spawn_harness(&["eng", "legal"]).await;
+    let client = reqwest::Client::new();
+    for (field, value) in [
+        ("alpha", serde_json::json!(0.5)),
+        ("fusion_method", serde_json::json!("weighted")),
+        ("rrf_k", serde_json::json!(20)),
+        ("chunks_per_page", serde_json::json!(2)),
+        ("expand", serde_json::json!("macro")),
+        ("recency_mode", serde_json::json!("on")),
+        ("recency_weight", serde_json::json!(0.5)),
+        ("recency_half_life_days", serde_json::json!(7.0)),
+        ("path_prefix_boosts", serde_json::json!({"/docs": 2.0})),
+        ("path_filters", serde_json::json!(["/docs", "/legal"])),
+    ] {
+        let mut body = serde_json::json!({"q": "widget"});
+        body[field] = value;
+        let response = client
+            .post(format!("{base}/v2/search/query"))
+            .bearer_auth("anything")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "{field}"
+        );
+        let error = response.text().await.unwrap();
+        assert!(
+            error.contains(field) && error.contains("pin zone_id"),
+            "{error}"
+        );
+    }
+    assert!(log.queries.lock().unwrap().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

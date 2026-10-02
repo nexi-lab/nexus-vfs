@@ -8,13 +8,10 @@
 //!
 //! Authentication happens in [`crate::middleware::auth`], which stamps
 //! the resolved `OperationContext` into request extensions.  Handlers
-//! derive the **zone** from that context via [`crate::zone`]
-//! (nexi-lab/nexus#4740): a non-admin caller searches its own zone
-//! only, an explicit `zone_id` that differs is refused, a credential
-//! with no zone claim is refused rather than routed to ROOT, and
-//! `root_path` is scoped into the zone namespace like the Python RPC
-//! layer does.  File-level ReBAC post-filtering is still the R10 epic's
-//! separate step (#4674).
+//! derive the zone from that context via [`crate::zone`] and forward the
+//! original bearer credential to Search. Paths remain canonical VFS paths;
+//! the host Search policy applies the credential's zone ceiling and live
+//! file permissions. Unpinned queries can fan out over readable zones.
 //!
 //! # Error shape (shared)
 //!
@@ -28,6 +25,7 @@
 
 use std::collections::HashMap;
 
+use crate::middleware::auth::BearerToken;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -40,10 +38,9 @@ use crate::search_proto::{
     FusionMethod, GlobRequest, GrepRequest, QueryRequest, QueryResult as ProtoQueryResult,
     QueryType,
 };
-use crate::zone::{
-    effective_zone, is_privileged, present_paths, scope_request_path, unscope_path,
-    visible_in_zone, ZoneError,
-};
+#[cfg(feature = "rebac")]
+use crate::zone::is_privileged;
+use crate::zone::{effective_zone, ZoneError};
 use crate::{AppState, BackendError};
 
 // ── /v2/search/glob ──────────────────────────────────────────────
@@ -64,12 +61,6 @@ pub struct GlobQuery {
     /// Cap on returned paths.  0 (or absent) = server default.
     #[serde(default)]
     pub max_results: u32,
-    /// Auth token forwarded through to the RPC.  Optional here
-    /// because auth middleware is separately scoped; when the
-    /// middleware lands it will populate this field before the
-    /// handler runs.
-    #[serde(default)]
-    pub auth_token: String,
     /// Sort results by most-recent-mtime first when `true`.
     #[serde(default)]
     pub sort_recency: bool,
@@ -102,12 +93,13 @@ pub struct GlobResponse {
 /// Handler for `GET /v2/search/glob`.
 pub async fn glob(
     State(state): State<AppState>,
+    Extension(token): Extension<BearerToken>,
     Extension(ctx): Extension<OperationContext>,
     fence: crate::middleware::revision::RevisionFence,
     Query(params): Query<GlobQuery>,
 ) -> Result<Response, SearchError> {
     let zone = effective_zone(&ctx, &params.zone_id)?;
-    let root_path = scope_request_path(&ctx, &zone, &params.root_path)?;
+    let root_path = params.root_path;
     // #4737: wait for the fenced revision to be applied on this node
     // BEFORE running the glob, so a caller who just wrote /ws/a.md
     // and passes X-Nexus-Min-Revision sees the row in the walk.
@@ -120,7 +112,7 @@ pub async fn glob(
         root_path,
         pattern: params.pattern,
         max_results: params.max_results,
-        auth_token: params.auth_token,
+        auth_token: token.0.to_string(),
         sort_recency: params.sort_recency,
     };
     let resp = client
@@ -129,7 +121,7 @@ pub async fn glob(
         .map_err(SearchError::Rpc)?
         .into_inner();
     let mut response = Json(GlobResponse {
-        paths: present_paths(&ctx, &zone, resp.paths),
+        paths: resp.paths,
         truncated: resp.truncated,
         error: resp.error,
     })
@@ -175,8 +167,6 @@ pub struct GrepQuery {
     /// Invert: return lines that do NOT match the pattern.
     #[serde(default)]
     pub invert_match: bool,
-    #[serde(default)]
-    pub auth_token: String,
     /// Sort matches by containing-file mtime descending.
     #[serde(default)]
     pub sort_recency: bool,
@@ -211,13 +201,13 @@ pub struct GrepResponse {
 /// Handler for `GET /v2/search/grep`.
 pub async fn grep(
     State(state): State<AppState>,
+    Extension(token): Extension<BearerToken>,
     Extension(ctx): Extension<OperationContext>,
     fence: crate::middleware::revision::RevisionFence,
     Query(params): Query<GrepQuery>,
 ) -> Result<Response, SearchError> {
     let zone = effective_zone(&ctx, &params.zone_id)?;
-    let root_path = scope_request_path(&ctx, &zone, &params.root_path)?;
-    let privileged = is_privileged(&ctx);
+    let root_path = params.root_path;
     // #4737: fence BEFORE the walk so a fresh write is visible in matches.
     let observed = fence
         .enforce(std::sync::Arc::clone(&state.kernel), &zone)
@@ -233,7 +223,7 @@ pub async fn grep(
         before_context: params.before_context,
         after_context: params.after_context,
         invert_match: params.invert_match,
-        auth_token: params.auth_token,
+        auth_token: token.0.to_string(),
         sort_recency: params.sort_recency,
     };
     let resp = client
@@ -245,9 +235,8 @@ pub async fn grep(
         matches: resp
             .matches
             .into_iter()
-            .filter(|m| privileged || visible_in_zone(&zone, &m.path))
             .map(|m| GrepMatch {
-                path: unscope_path(&zone, &m.path),
+                path: m.path,
                 line_number: m.line_number,
                 line: m.line,
                 before: m.before,
@@ -272,10 +261,11 @@ pub async fn grep(
 /// wire-friendly lowercase strings so a caller reading the proto
 /// enum values and a caller reading this doc reach the same shape.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueryBody {
     /// Query text.
     pub q: String,
-    /// Zone scoping.  Empty ⇒ ROOT_ZONE_ID.
+    /// Zone scoping. Empty uses the caller's zone or readable-zone fanout.
     #[serde(default)]
     pub zone_id: String,
     /// Max results returned.  0 ⇒ server-side default (10).
@@ -286,13 +276,10 @@ pub struct QueryBody {
     pub path_filter: String,
     /// `"keyword"` (default) / `"semantic"` / `"hybrid"`.
     /// Wire-friendly string rather than the raw enum int so callers
-    /// don't have to memorise the proto numeric.  An unknown value
-    /// falls through to `"keyword"` — the same fail-open posture the
-    /// proto's `UNSPECIFIED = 0` treats as keyword.
+    /// don't have to memorise the proto numeric. Values are case-insensitive;
+    /// an unknown non-empty value is a 400 error.
     #[serde(default)]
     pub query_type: String,
-    #[serde(default)]
-    pub auth_token: String,
     #[serde(default)]
     pub alpha: f32,
     /// `"rrf"` (default) / `"weighted"` / `"rrf_weighted"`.
@@ -473,6 +460,7 @@ fn hit_from_proto(r: ProtoQueryResult) -> QueryHit {
 /// zone set is not derivable there.
 pub async fn query(
     State(state): State<AppState>,
+    Extension(token): Extension<BearerToken>,
     Extension(ctx): Extension<OperationContext>,
     fence: crate::middleware::revision::RevisionFence,
     Json(body): Json<QueryBody>,
@@ -484,24 +472,22 @@ pub async fn query(
     // one (admins may still name a zone explicitly).
     let zone_id = effective_zone(&ctx, &body.zone_id)?;
 
-    // Federated fast-out (rebac-only): a caller with ReBAC access to
-    // multiple zones who did NOT pin `zone_id` on the request body
-    // gets a cross-zone fanout.  See the handler docstring for the
-    // three cases.  Fence enforcement happens INSIDE the federated
-    // branch so we fence against the caller's index zone (which the
-    // dispatcher may itself override per leg in a future cross-zone
-    // impl — for now every leg reads the local plugin so one fence
-    // suffices).
+    // Unpinned queries can fan out across the caller's readable zones.
     #[cfg(feature = "rebac")]
     {
         if body.zone_id.is_empty() {
             let subject = subject_for(&ctx);
-            let accessible = state
-                .accessible_zones
-                .lookup(&*state.rebac_store, subject)
-                .unwrap_or_default();
+            let subject = (subject.0.to_owned(), subject.1.to_owned());
+            let cache = std::sync::Arc::clone(&state.accessible_zones);
+            let store = std::sync::Arc::clone(&state.rebac_store);
+            let accessible = tokio::task::spawn_blocking(move || {
+                cache.lookup(&*store, (&subject.0, &subject.1))
+            })
+            .await
+            .map_err(|_| SearchError::Rpc(tonic::Status::internal("zone lookup failed")))?
+            .map_err(|_| SearchError::Rpc(tonic::Status::unavailable("zone lookup unavailable")))?;
             if accessible.len() > 1 {
-                return dispatch_federated(state, ctx, fence, body, &zone_id).await;
+                return dispatch_federated(state, ctx, token, fence, body, &zone_id).await;
             }
         }
     }
@@ -521,7 +507,7 @@ pub async fn query(
         limit: body.limit,
         path_filter: body.path_filter,
         query_type: query_type as i32,
-        auth_token: body.auth_token,
+        auth_token: token.0.to_string(),
         alpha: body.alpha,
         fusion_method: fusion_method as i32,
         rrf_k: body.rrf_k,
@@ -556,24 +542,42 @@ pub async fn query(
 ///
 /// Fences against `fence_zone` (the caller's index zone from
 /// `effective_zone`) so a read-after-write in the caller's default
-/// zone still sees its own writes.  Per-leg fencing across every
-/// federated zone is a follow-up when the cross-daemon leg lands
-/// (it needs its own revision plumbing).
+/// zone still sees its own writes.  The revision fence covers this
+/// node and default zone; it does not fence remote replicas.
 #[cfg(feature = "rebac")]
 async fn dispatch_federated(
     state: AppState,
     ctx: OperationContext,
+    token: BearerToken,
     fence: crate::middleware::revision::RevisionFence,
     body: QueryBody,
     fence_zone: &str,
 ) -> Result<Response, SearchError> {
-    // The federated leg carries one `path_filter`; dropping the extra
-    // prefixes would silently widen the scope.
-    if !body.path_filters.is_empty() {
-        return Err(SearchError::BadRequest(
-            "path_filters is not supported for cross-zone (federated) search; pin zone_id"
-                .to_string(),
-        ));
+    // The dispatcher carries only query type, limit and one path prefix.
+    // Reject settings it cannot preserve before dispatching any leg.
+    for (field, unsupported) in [
+        ("alpha", body.alpha != 0.0),
+        (
+            "fusion_method",
+            !body.fusion_method.is_empty() && !body.fusion_method.eq_ignore_ascii_case("rrf"),
+        ),
+        ("rrf_k", body.rrf_k != 0),
+        ("chunks_per_page", body.chunks_per_page != 0),
+        ("expand", !body.expand.is_empty()),
+        (
+            "recency_mode",
+            !body.recency_mode.is_empty() && !body.recency_mode.eq_ignore_ascii_case("off"),
+        ),
+        ("recency_weight", body.recency_weight != 0.0),
+        ("recency_half_life_days", body.recency_half_life_days != 0.0),
+        ("path_prefix_boosts", !body.path_prefix_boosts.is_empty()),
+        ("path_filters", !body.path_filters.is_empty()),
+    ] {
+        if unsupported {
+            return Err(SearchError::BadRequest(format!(
+                "{field} is not supported for cross-zone (federated) search; pin zone_id"
+            )));
+        }
     }
     let observed = fence
         .enforce(std::sync::Arc::clone(&state.kernel), fence_zone)
@@ -586,15 +590,23 @@ async fn dispatch_federated(
         body.limit as usize
     };
     let req = nexus_federated_search::SearchRequest {
+        auth_token: token.0.to_string(),
         query: body.q,
-        search_type: body.query_type,
+        search_type: body.query_type.to_ascii_lowercase(),
         limit,
         path_filter: (!body.path_filter.is_empty()).then_some(body.path_filter),
         // Overwritten by the dispatcher from `subject` — the field
         // must exist on construction.
         subject: (String::new(), String::new()),
     };
-    let resp = state.federated.search(subject, req, None).await;
+    let zones: Vec<String> = ctx
+        .zone_perms
+        .iter()
+        .filter(|(_, perms)| perms.contains('r'))
+        .map(|(zone, _)| zone.clone())
+        .collect();
+    let filter = (!is_privileged(&ctx)).then_some(zones.as_slice());
+    let resp = state.federated.search(subject, req, filter).await;
     let results = resp
         .results
         .into_iter()

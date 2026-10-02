@@ -296,10 +296,10 @@ async fn index_happy_path_round_trips_full_chain() {
         "zone_id": "root",
         "recursive": true,
         "max_docs": 500,
-        "auth_token": "sk-test",
     });
     let resp = reqwest::Client::new()
         .post(format!("{}/v2/documents/index", h.http_base))
+        .bearer_auth("sk-test")
         .json(&body)
         .send()
         .await
@@ -456,10 +456,10 @@ async fn batch_happy_path_round_trips_documents_list() {
             },
         ],
         "zone_id": "root",
-        "auth_token": "sk-test",
     });
     let resp = reqwest::Client::new()
         .post(format!("{}/v2/documents/batch", h.http_base))
+        .bearer_auth("sk-test")
         .json(&body)
         .send()
         .await

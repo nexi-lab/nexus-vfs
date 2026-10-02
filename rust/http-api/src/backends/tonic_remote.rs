@@ -1,49 +1,6 @@
-//! [`TonicRemoteSearchBackend`] — the concrete
-//! [`nexus_federated_search::RemoteSearchBackend`] impl the axum
-//! daemon wires when a zone's [`nexus_search_common::ZoneSearchRegistry`]
-//! entry names a peer daemon.
-//!
-//! # Shape
-//!
-//! * Dials the peer daemon's `nexus.search.v1.SearchService.Query`
-//!   over tonic gRPC, one Channel-per-peer cached by the shared
-//!   [`nexus_search_common::transport::PeerChannelCache`] (the same
-//!   cache `nexus-search-plugin::peer_fanout` uses — DRY across the
-//!   two callers so the TLS + timeout + loopback rules stay in
-//!   lockstep).
-//! * Stamps the [`nexus_federated_search::RoutingBackend`]-minted
-//!   [`SearchDelegation`] onto tonic metadata under
-//!   [`DELEGATION_METADATA_KEY`].  The wire format is JSON-serialised
-//!   bytes; the `-bin` metadata suffix tells tonic to base64-encode
-//!   on the wire per the gRPC metadata spec, so the receiving
-//!   daemon reads back raw bytes and deserialises directly.
-//! * Converts the peer's [`crate::search_proto::QueryResponse`] into
-//!   [`Vec<Hit>`] via the shared [`crate::backends::proto_bridge::hit_from_proto`]
-//!   so attribution ends up on `Hit::extras` under the SAME keys
-//!   [`crate::handlers::search_bridge`] decodes — two places to
-//!   keep in sync, not three.
-//!
-//! # Why the full delegation on the wire, not just the id
-//!
-//! Every alternative (delegation-id-only, id → shared store) needs a
-//! store synchronised across mint side + verify side.  The
-//! [`SearchDelegation`] struct is self-contained (~150 bytes JSON):
-//! source-zone id, target-zone allowlist, subject, TTL, mint
-//! timestamp.  Sending the whole blob means the receiver's servicer
-//! can validate WITHOUT a lookup — one wire round-trip per remote
-//! leg, matching Python's contract while removing a class of stores-
-//! out-of-sync bugs.
-//!
-//! # Auth surface
-//!
-//! The [`SearchDelegation`] is orthogonal to the request's own
-//! `auth_token` field: `auth_token` remains reserved for a bearer
-//! `sk-` key, delegation rides on metadata.  The receiving daemon's
-//! servicer inspects metadata FIRST — if a valid delegation is
-//! present, it runs the search as the delegation's subject; if
-//! not, it falls back to whatever `auth_token` (or transport-layer
-//! mTLS peer identity) says.  That mapping lands in stage 3 of the
-//! task #57 arc (this file is client-only).
+//! Search RPCs to a remote node using a short-lived delegated subject. The
+//! connection authenticates the issuing node with mTLS; the request carries
+//! delegation metadata and no bearer credential.
 
 use std::sync::Arc;
 
@@ -53,8 +10,9 @@ use nexus_search_common::transport::PeerChannelCache;
 use nexus_search_common::{Hit, SearchDelegation, DELEGATION_METADATA_KEY};
 use tonic::metadata::MetadataValue;
 
-use crate::backends::proto_bridge::hit_from_proto;
+use crate::backends::proto_bridge::{hit_from_proto, query_for_zone};
 use crate::search_proto::search_service_client::SearchServiceClient;
+#[cfg(test)]
 use crate::search_proto::{QueryRequest, QueryType};
 
 /// Dials peer daemons over tonic, stamps a [`SearchDelegation`] on
@@ -107,7 +65,7 @@ impl RemoteSearchBackend for TonicRemoteSearchBackend {
         // 2. Build the tonic request.  The delegation rides on
         // metadata (see DELEGATION_METADATA_KEY above); the
         // request body carries the search parameters only.
-        let proto = build_query_request(zone_id, req);
+        let proto = query_for_zone(zone_id, req);
         let mut request = tonic::Request::new(proto);
         let blob = serde_json::to_vec(delegation).map_err(|e| {
             BackendError::Config(format!("delegation serialise for zone {zone_id:?}: {e}"))
@@ -158,45 +116,6 @@ impl RemoteSearchBackend for TonicRemoteSearchBackend {
             return Err(BackendError::Backend(err));
         }
         Ok(resp.results.into_iter().map(hit_from_proto).collect())
-    }
-}
-
-/// Build the proto request body for a per-leg cross-daemon Query.
-/// Same as `PluginLocalSearchBackend`'s inline builder — extracted
-/// out of the trait fn body only for readability; not shared with
-/// the local backend because that impl deliberately keeps
-/// `auth_token` reserved for a bearer key, whereas the cross-daemon
-/// path leaves `auth_token` empty (delegation rides on metadata,
-/// see the module docstring).
-fn build_query_request(zone_id: &str, req: &SearchRequest) -> QueryRequest {
-    let query_type = match req.search_type.as_str() {
-        "semantic" => QueryType::Semantic,
-        "hybrid" => QueryType::Hybrid,
-        _ => QueryType::Keyword,
-    };
-    QueryRequest {
-        q: req.query.clone(),
-        zone_id: zone_id.to_string(),
-        limit: u32::try_from(req.limit).unwrap_or(u32::MAX),
-        path_filter: req.path_filter.clone().unwrap_or_default(),
-        query_type: query_type as i32,
-        // Leave the wire `auth_token` field EMPTY on cross-daemon
-        // legs — the delegation rides on tonic metadata under
-        // `DELEGATION_METADATA_KEY`.  Overloading auth_token would
-        // fight the receiver's servicer, which (stage 3) will
-        // check metadata FIRST and fall back to auth_token as an
-        // sk-key.
-        auth_token: String::new(),
-        alpha: 0.0,
-        fusion_method: 0,
-        rrf_k: 0,
-        chunks_per_page: 0,
-        expand: String::new(),
-        recency_mode: String::new(),
-        recency_weight: 0.0,
-        recency_half_life_days: 0.0,
-        path_prefix_boosts: std::collections::HashMap::new(),
-        path_filters: Vec::new(),
     }
 }
 
@@ -401,6 +320,7 @@ mod tests {
 
     fn req() -> SearchRequest {
         SearchRequest {
+            auth_token: String::new(),
             query: "widgets".into(),
             search_type: "hybrid".into(),
             limit: 7,

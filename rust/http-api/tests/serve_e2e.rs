@@ -107,7 +107,7 @@ async fn service_decl_install_body_runs_under_a_tokio_runtime() {
     // runtime".
     let result = nexus_http_api::install_impl(
         addr,
-        "http://127.0.0.1:1".to_string(),
+        nexus_http_api::SearchBackend::new("http://127.0.0.1:1"),
         default_no_auth_provider(),
         handle,
         // Empty in-memory `AuthKeyStore` — this test hits only
@@ -124,6 +124,7 @@ async fn service_decl_install_body_runs_under_a_tokio_runtime() {
         // `/v2/rebac/*`, so any store is fine).
         #[cfg(feature = "rebac")]
         std::sync::Arc::new(nexus_rebac::InMemoryReBACTupleStore::new()),
+        transport::grpc::DataPlaneReady::open(),
     );
     assert!(
         result.is_ok(),
@@ -157,7 +158,7 @@ async fn service_decl_install_body_returns_err_on_bind_failure() {
     let handle = tokio::runtime::Handle::current();
     let first = nexus_http_api::install_impl(
         addr,
-        "http://127.0.0.1:1".to_string(),
+        nexus_http_api::SearchBackend::new("http://127.0.0.1:1"),
         default_no_auth_provider(),
         handle.clone(),
         std::sync::Arc::new(nexus_http_api::middleware::auth::empty_auth_key_store_for_tests()),
@@ -166,6 +167,7 @@ async fn service_decl_install_body_returns_err_on_bind_failure() {
         std::sync::Arc::new(nexus_http_api::middleware::revision::ZeroGenKernel),
         #[cfg(feature = "rebac")]
         std::sync::Arc::new(nexus_rebac::InMemoryReBACTupleStore::new()),
+        transport::grpc::DataPlaneReady::open(),
     );
     assert!(first.is_ok(), "first install must succeed; got {first:?}");
 
@@ -173,7 +175,7 @@ async fn service_decl_install_body_returns_err_on_bind_failure() {
     // (address in use) instead of the pre-fix silent-log posture.
     let second = nexus_http_api::install_impl(
         addr,
-        "http://127.0.0.1:1".to_string(),
+        nexus_http_api::SearchBackend::new("http://127.0.0.1:1"),
         default_no_auth_provider(),
         handle,
         std::sync::Arc::new(nexus_http_api::middleware::auth::empty_auth_key_store_for_tests()),
@@ -182,6 +184,7 @@ async fn service_decl_install_body_returns_err_on_bind_failure() {
         std::sync::Arc::new(nexus_http_api::middleware::revision::ZeroGenKernel),
         #[cfg(feature = "rebac")]
         std::sync::Arc::new(nexus_rebac::InMemoryReBACTupleStore::new()),
+        transport::grpc::DataPlaneReady::open(),
     );
     let err = second.expect_err("second install on same addr must Err");
     assert!(

@@ -21,29 +21,12 @@
 //! space — a grant on node A would not resolve on node B, and a
 //! federated grant tool would appear intermittently broken.
 //!
-//! # zone_revision is `Ok(0)` for now — deliberate
+//! # Cache freshness
 //!
-//! [`ReBACTupleStore::zone_revision`] is the per-zone cache-freshness
-//! key the (PR-3) graph cache uses to skip a full-scan rebuild.  For
-//! the raft-backed impl a cross-node revision counter is subtle: two
-//! concurrent writers proposing at different indices need to serialise
-//! their revision bumps through the log (not `get`+`put` — TOCTOU
-//! would drop one bump under contention).
-//!
-//! Rather than ship a subtle counter here, this impl returns `Ok(0)`
-//! and the (PR-3) graph cache treats `0` as **always-stale** — a
-//! guaranteed correct fail-safe.  Cost: every check on a raft-backed
-//! deployment pays the graph rebuild (an `AHashMap`-populate over
-//! `list()`; ~O(ms) for O(100k) tuples, per the Python design point).
-//! Not a hot-path regression — permission checks are behind
-//! `PermissionLeaseCache` upstream, so the rebuild cost is amortised
-//! across a lease window rather than per-syscall.
-//!
-//! The follow-up is a raft-observer hook that bumps a local
-//! `AtomicU64` on every applied `PutControlState` with our namespace —
-//! cross-node correct because every node sees every apply.  Not in
-//! this PR to keep the surface small; the fail-safe posture means
-//! landing it later is a pure perf win, not a correctness fix.
+//! Graphs use the consensus handle's applied index as their revision. This is
+//! a shared atomic published after both log apply and snapshot restore. Cache
+//! hits do not enter the Raft driver or touch disk. Unrelated control records
+//! conservatively invalidate graphs too; no cache counters are persisted.
 
 use std::sync::Arc;
 
@@ -52,13 +35,7 @@ use nexus_raft::prelude::{FullStateMachine, ZoneConsensus};
 
 use crate::store::{ReBACTupleStore, ReBACTupleStoreError};
 
-/// The `PutControlState` namespace this store reads and writes under.
-///
-/// Not upstream in `contracts::CONTROL_NS_*` yet — added there in a
-/// follow-up so all control-plane namespaces stay centralised.
-/// Local `pub const` (not `&'static str` literal) keeps the SSOT
-/// discoverable at `nexus_rebac::raft_store::CONTROL_NS_REBAC` so
-/// admin tooling that spelunks the keyspace has one name to grep for.
+/// Namespace for durable relationship tuples in the credential consensus.
 pub const CONTROL_NS_REBAC: &str = "rebac";
 
 /// Raft-backed `ReBACTupleStore` — the `CONTROL_NS_REBAC` view of the
@@ -69,6 +46,7 @@ pub const CONTROL_NS_REBAC: &str = "rebac";
 /// Per-node `root` would silently give each node its own tuple space.
 pub struct RaftReBACTupleStore {
     inner: ControlStateStore,
+    node: ZoneConsensus<FullStateMachine>,
 }
 
 impl RaftReBACTupleStore {
@@ -78,7 +56,8 @@ impl RaftReBACTupleStore {
     /// `(node, runtime)` pair.
     pub fn new(node: ZoneConsensus<FullStateMachine>, runtime: tokio::runtime::Handle) -> Self {
         Self {
-            inner: ControlStateStore::new(node, runtime, CONTROL_NS_REBAC),
+            inner: ControlStateStore::new(node.clone(), runtime, CONTROL_NS_REBAC),
+            node,
         }
     }
 
@@ -121,10 +100,13 @@ impl ReBACTupleStore for RaftReBACTupleStore {
         self.inner.list().map_err(ReBACTupleStoreError::Backend)
     }
 
-    // zone_revision defaults to Ok(0) via the trait's default impl —
-    // the graph cache in PR-3 treats 0 as "always stale, always
-    // rebuild".  See the module docstring for the rationale (subtle
-    // cross-node counter deferred; fail-safe posture in the meantime).
+    fn revision(&self) -> Result<u64, ReBACTupleStoreError> {
+        // The state machine publishes this atomic after apply AND snapshot
+        // restore. It also starts at the recovered index after restart. Using
+        // the whole control log conservatively invalidates every zone, without
+        // persisting cache bookkeeping or missing snapshot-driven revocations.
+        Ok(self.node.applied_index())
+    }
 }
 
 #[cfg(test)]
@@ -325,35 +307,82 @@ mod tests {
         registry.shutdown_all();
     }
 
-    /// Sanity: `zone_revision` returns `Ok(0)` deliberately (see the
-    /// module docstring — always-stale posture is a fail-safe until
-    /// the raft-observer counter lands).  Pin here so a future
-    /// refactor that starts returning the wrong shape (a nonzero
-    /// value that is NOT actually a real revision) trips this test
-    /// instead of silently miscaching the graph.
+    /// A warm graph is reused, then a committed revoke invalidates it. Snapshot
+    /// restoration must invalidate it too, without relying on apply observers.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn zone_revision_returns_zero_as_always_stale_sentinel() {
+    async fn graph_cache_tracks_apply_and_snapshot_restore() {
+        use crate::ReBACGraphCache;
+        use nexus_raft::prelude::{Command, RedbStore, StateMachine};
         let tmp = TempDir::new().unwrap();
         let registry = ZoneRaftRegistry::new(tmp.path().to_path_buf(), 1);
         let runtime = tokio::runtime::Handle::current();
-        let node = registry
-            .create_zone("root", vec![], &runtime)
-            .expect("create test zone");
-        node.campaign().await.expect("campaign test zone");
-        let store = RaftReBACTupleStore::new(node, runtime);
-
-        assert_eq!(store.zone_revision("root").expect("zone_revision"), 0);
-
-        // A put does not bump the revision (the sentinel is
-        // deliberate; the graph cache treats 0 as always-stale).
-        store.put("root|doc:a|reader|user|alice", b"").expect("put");
-        assert_eq!(
-            store.zone_revision("root").expect("zone_revision post-put"),
-            0,
-            "zone_revision must stay 0 — the graph cache relies on this \
-             sentinel to always-rebuild until the raft-observer counter lands",
-        );
-
+        let node = registry.create_zone("root", vec![], &runtime).unwrap();
+        node.campaign().await.unwrap();
+        let store = Arc::new(RaftReBACTupleStore::new(node.clone(), runtime));
+        let tuple = lib::types::ReBACTuple {
+            object_type: "file".into(),
+            object_id: "/doc".into(),
+            relation: "viewer".into(),
+            subject_type: "user".into(),
+            subject_id: "alice".into(),
+            subject_relation: None,
+        };
+        let key = crate::tuple_key::encode("root", &tuple).unwrap();
+        store.put(&key, b"").unwrap();
+        let cache = ReBACGraphCache::new(store.clone());
+        let subject = lib::types::Entity {
+            entity_type: "user".into(),
+            entity_id: "alice".into(),
+        };
+        let object = lib::types::Entity {
+            entity_type: "file".into(),
+            entity_id: "/doc".into(),
+        };
+        let granted = cache.graph_for_zone("root").unwrap();
+        assert!(granted.check_direct_relation(&subject, "viewer", &object));
+        assert!(Arc::ptr_eq(
+            &granted,
+            &cache.graph_for_zone("root").unwrap()
+        ));
+        let before = store.revision().unwrap();
+        store.delete(&key).unwrap();
+        assert!(store.revision().unwrap() > before);
+        let revoked = cache.graph_for_zone("root").unwrap();
+        assert!(!revoked.check_direct_relation(&subject, "viewer", &object));
+        assert!(!Arc::ptr_eq(&granted, &revoked));
+        assert!(Arc::ptr_eq(
+            &revoked,
+            &cache.graph_for_zone("root").unwrap()
+        ));
+        // A second state machine supplies a newer snapshot, as a replica
+        // catching up after log compaction would receive from its leader.
+        let source_store = RedbStore::open_temporary().unwrap();
+        let mut source = FullStateMachine::new(&source_store).unwrap();
+        let index = node.applied_index() + 10;
+        source
+            .apply(
+                index,
+                &Command::PutControlState {
+                    namespace: CONTROL_NS_REBAC.into(),
+                    key: key.clone(),
+                    value: vec![],
+                    if_absent: false,
+                },
+            )
+            .unwrap();
+        let snapshot = source.snapshot().unwrap();
+        node.with_state_machine_mut(move |sm| sm.restore_snapshot(&snapshot))
+            .await
+            .unwrap();
+        assert_eq!(store.revision().unwrap(), index);
+        assert!(store.get(&key).unwrap().is_some());
+        let restored = cache.graph_for_zone("root").unwrap();
+        assert!(restored.check_direct_relation(&subject, "viewer", &object));
+        assert!(!Arc::ptr_eq(&revoked, &restored));
+        assert!(Arc::ptr_eq(
+            &restored,
+            &cache.graph_for_zone("root").unwrap()
+        ));
         registry.shutdown_all();
     }
 }

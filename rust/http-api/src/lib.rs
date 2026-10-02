@@ -1,46 +1,9 @@
-//! `nexus-http-api` — axum-based HTTP-API surface for the pure-Rust
-//! `nexus-server` migration (epic #4674 review R10).
+//! HTTP API for search, indexing, credentials, and relationship grants.
 //!
-//! # What this crate does
-//!
-//! Serves the `/v2/*` HTTP surface, translating each route into a
-//! typed gRPC call against the appropriate upstream service (search,
-//! documents, auth — one route domain per file under `handlers/`).
-//! Handlers are pure axum functions taking an `axum::extract::State`
-//! holding the upstream client cache; the router itself is a plain
-//! `axum::Router` assembled by [`router`].
-//!
-//! # Extension seam
-//!
-//! Every new route domain lands as an additive `Router::merge` on
-//! [`router`] and a new file under `handlers/`.  The state grows by
-//! adding a new field to [`AppState`] — a fresh domain does not
-//! rewire existing handlers.
-//!
-//! # Auth
-//!
-//! `/v2/status` is PUBLIC (health-probe target that runs before any
-//! bearer exists); every `/v2/search/*` route is protected by
-//! [`middleware::auth::require_bearer`], which resolves the incoming
-//! `Authorization: Bearer <token>` through the shared
-//! [`transport::auth::AuthProvider`] on [`AppState`] and stamps the
-//! resulting `contracts::OperationContext` into request extensions.
-//! Handlers that need per-request identity extract it via
-//! `axum::Extension<OperationContext>`; handlers that do not simply
-//! ignore it.  Default provider is `NoAuth` (single-node dev pass-
-//! through); real deployments swap it for `auth::ApiKeyAuthProvider`
-//! at the composition root.
-//!
-//! # Deliberately absent
-//!
-//! * NO ReBAC post-filter — separate epic step (`bricks/permissions/
-//!   rebac.py` → Rust); the middleware here is authN only.
-//! * NO mTLS peer plane — waits on this crate's HTTP listener
-//!   growing a rustls stack (see the middleware module docs).
-//! * NO wiring into `nexusd-cluster` boot — the assembly binary in
-//!   `rust/nexusd` picks the crate up once the router surface
-//!   justifies the wiring step.  Standalone-testable today via
-//!   `axum::serve` + `tests/*_e2e.rs`.
+//! Protected routes resolve one Authorization bearer and retain it for downstream
+//! RPCs. Search uses canonical VFS paths; the gRPC host enforces zone and file
+//! access, including cached results. Production composition shares the daemon's
+//! auth provider, Raft tuple store, TLS channels, and data-plane readiness gate.
 
 use std::io;
 use std::net::SocketAddr;
@@ -108,6 +71,8 @@ pub type DefaultFederatedDispatcher = nexus_federated_search::FederatedSearchDis
 /// single-node default.
 #[derive(Clone)]
 pub struct AppState {
+    /// Shared daemon bootstrap gate; authentication and management wait for it.
+    pub ready: Arc<transport::grpc::DataPlaneReady>,
     pub search: SearchBackend,
     pub auth: Arc<dyn AuthProvider>,
     /// The kernel-adjacent `AuthKeyStore` — list / revoke backend
@@ -196,7 +161,6 @@ impl AppState {
             use nexus_federated_search::{
                 DispatcherConfig, FederatedSearchDispatcher, RoutingBackend,
             };
-            use nexus_search_common::transport::{PeerChannelCache, PeerChannelConfig};
             use nexus_search_common::InMemoryZoneSearchRegistry;
             let local = Arc::new(
                 crate::backends::plugin_local::PluginLocalSearchBackend::new(search.clone()),
@@ -207,7 +171,7 @@ impl AppState {
             // routes local via `RoutingBackend`.  Wired here so a
             // test that populates the registry gets end-to-end
             // remote dispatch without swapping the backend type.
-            let peer_cache = Arc::new(PeerChannelCache::new(PeerChannelConfig::default()));
+            let peer_cache = Arc::clone(&search.channels);
             let remote =
                 Arc::new(crate::backends::tonic_remote::TonicRemoteSearchBackend::new(peer_cache));
             // Empty registry — every zone falls through to the local
@@ -240,6 +204,7 @@ impl AppState {
             ))
         };
         Self {
+            ready: transport::grpc::DataPlaneReady::open(),
             search,
             auth: middleware::auth::default_no_auth_provider(),
             // Empty in-memory store for `/v2/auth/keys` tests.  The
@@ -307,7 +272,7 @@ pub fn router(state: AppState) -> Router {
 /// Bind `addr` and serve [`router(state)`](router) until the returned
 /// future completes.  Convenience wrapper over
 /// [`axum::serve`] + [`tokio::net::TcpListener::bind`] so callers
-/// (integration tests, the future `nexusd-cluster` assembly
+/// (integration tests and the `nexusd-cluster` assembly
 /// binary) do not each re-implement the two-line startup dance.
 ///
 /// Returns the [`SocketAddr`] actually bound so callers who pass
@@ -339,112 +304,16 @@ pub async fn bind_and_serve(
     Ok((bound, fut))
 }
 
-/// Build a [`kernel::kernel::ServiceDecl`] that spawns the HTTP-API
-/// listener on `addr` at daemon bring-up.  The install closure
-/// captures the resolved auth provider + runtime handle at
-/// decl-BUILD time so the daemon does not have to plumb them
-/// through the kernel's install signature (which only exposes
-/// `&Arc<Kernel>`).
-///
-/// # Wiring
-///
-/// Callers construct this from `nexus_cluster::ServiceBootCtx`:
-///
-/// ```ignore
-/// nexus_http_api::service_decl(
-///     addr,                              // parsed from NEXUS_HTTP_ADDR
-///     "http://127.0.0.1:2126".into(),    // co-hosted gRPC target
-///     std::sync::Arc::clone(&ctx.auth),
-///     ctx.runtime.clone(),
-/// )
-/// ```
-///
-/// Args are taken RAW (not `&ServiceBootCtx`) so this crate does
-/// not need `nexus-cluster` as a dep — tier separation stays clean.
-///
-/// # Failure mode — fail-loud on bind, then detach serve
-///
-/// The install closure BINDS the TCP listener synchronously via
-/// `std::net::TcpListener::bind` (a raw `socket` + `bind` +
-/// `listen` syscall trio — no tokio runtime needed, no I/O),
-/// then hands the fd to tokio via `set_nonblocking(true)` +
-/// `TcpListener::from_std`.  A bind failure — port in use,
-/// permission denied, bad interface — returns `Err` from
-/// `install` and `Kernel::bring_up_services` fails the whole
-/// daemon boot with a nameable error.  The prior posture ("bind
-/// inside a detached `runtime.spawn`, only log on error")
-/// silently degraded a broken HTTP bind to "daemon looks alive
-/// but no HTTP surface" — a bad operator experience the standing
-/// `feedback_fail_loud_interdependent_config` rule forbids.
-///
-/// # Why NOT `runtime.block_on(tokio::TcpListener::bind)`
-///
-/// `bring_up_services` runs INSIDE the tokio runtime the daemon
-/// spun up (via `run_daemon` under `Runtime::block_on`), so a
-/// `Handle::block_on` here panics with `Cannot start a runtime
-/// from within a runtime` — the docker-E2E-caught first
-/// iteration of this fix.  The sync `std::net::bind` path avoids
-/// runtime re-entry entirely (bind is a fast syscall, no I/O)
-/// while preserving the "Err from install" semantic.
-///
-/// Only the SERVE loop is detached: once bind succeeds, the
-/// listener is handed to a spawned task that runs `axum::serve`
-/// until the daemon shuts down.  A serve error mid-flight is
-/// still a `tracing::error!` (nothing sensible we can do about a
-/// half-served request), but the "listener is up" invariant is
-/// established synchronously — matches `a2a::install_a2a_stamp_hook`
-/// which also fails install synchronously if setup errors.
-/// `AuthKeyStore` for the `/v2/auth/keys` handlers comes from the
-/// live kernel — [`kernel::Kernel::auth_key_store`] surfaces the
-/// same `RaftAuthKeyStore` the gRPC bearer-auth path already
-/// reads.  One SSOT, two surfaces (gRPC + HTTP).
-#[cfg(not(feature = "rebac"))]
+/// Declare the HTTP listener with the daemon's shared credential store,
+/// authorization store, transport, and bootstrap gate. Bind errors fail boot.
 pub fn service_decl(
     addr: SocketAddr,
-    upstream_grpc: String,
+    search: SearchBackend,
     auth: Arc<dyn AuthProvider>,
     runtime: tokio::runtime::Handle,
     api_key_secret: Option<Arc<str>>,
-) -> kernel::kernel::ServiceDecl {
-    kernel::kernel::ServiceDecl {
-        name: "http_api".to_string(),
-        install: Box::new(move |kernel| {
-            let auth_key_store = kernel.auth_key_store();
-            // The revision fence polls `sys_stat(path).gen`; hand it
-            // the same kernel the gRPC surface already reads.  The
-            // blanket `impl<K: KernelSyscall> StatGen for K` in
-            // `middleware/revision.rs` covers the Arc coercion.
-            let stat_kernel: Arc<dyn middleware::revision::StatGen> = {
-                let k: Arc<kernel::kernel::Kernel> = Arc::clone(kernel);
-                k
-            };
-            install_impl(
-                addr,
-                upstream_grpc,
-                auth,
-                runtime,
-                auth_key_store,
-                api_key_secret,
-                stat_kernel,
-            )
-        }),
-    }
-}
-
-/// `--features rebac` variant of [`service_decl`] — takes the
-/// tuple store the composition root has already wired for the
-/// kernel's `PermissionProvider`, so grants written via
-/// `/v2/rebac/tuples` land in the same store the enforcer reads
-/// (no second SSOT).  Signature adds the last param; every other
-/// arg matches the feature-off version.
-#[cfg(feature = "rebac")]
-pub fn service_decl(
-    addr: SocketAddr,
-    upstream_grpc: String,
-    auth: Arc<dyn AuthProvider>,
-    runtime: tokio::runtime::Handle,
-    api_key_secret: Option<Arc<str>>,
-    rebac_store: Arc<dyn nexus_rebac::ReBACTupleStore>,
+    #[cfg(feature = "rebac")] rebac_store: Arc<dyn nexus_rebac::ReBACTupleStore>,
+    ready: Arc<transport::grpc::DataPlaneReady>,
 ) -> kernel::kernel::ServiceDecl {
     kernel::kernel::ServiceDecl {
         name: "http_api".to_string(),
@@ -456,13 +325,15 @@ pub fn service_decl(
             };
             install_impl(
                 addr,
-                upstream_grpc,
+                search,
                 auth,
                 runtime,
                 auth_key_store,
                 api_key_secret,
                 stat_kernel,
+                #[cfg(feature = "rebac")]
                 rebac_store,
+                ready,
             )
         }),
     }
@@ -478,38 +349,29 @@ pub fn service_decl(
 /// it under a real tokio runtime.  Production callers should use
 /// [`service_decl`], not this fn directly; a `#[doc(hidden)]`
 /// annotation keeps it out of the rustdoc surface.
-// This deliberately grows one arg at a time as `AppState` accretes
-// state — the composition-root shape sits at the boundary of an FFI
-// install closure, so refactoring into a builder would obscure which
-// fields are threaded from `nexus_cluster::ServiceBootCtx` vs which
-// are wired here.  Documented in the module-level rustdoc.
 #[allow(clippy::too_many_arguments)]
 #[doc(hidden)]
 pub fn install_impl(
     addr: SocketAddr,
-    upstream_grpc: String,
+    search: SearchBackend,
     auth: Arc<dyn AuthProvider>,
     runtime: tokio::runtime::Handle,
     auth_key_store: Arc<dyn kernel::hal::auth_key_store::AuthKeyStore>,
     api_key_secret: Option<Arc<str>>,
     kernel: Arc<dyn middleware::revision::StatGen>,
     #[cfg(feature = "rebac")] rebac_store: Arc<dyn nexus_rebac::ReBACTupleStore>,
+    ready: Arc<transport::grpc::DataPlaneReady>,
 ) -> Result<(), String> {
-    let search = SearchBackend::new(upstream_grpc);
     #[cfg(feature = "rebac")]
     let accessible_zones = Arc::new(nexus_rebac::list_zones::AccessibleZonesCache::new());
     #[cfg(feature = "rebac")]
     let federated = {
         use nexus_federated_search::{DispatcherConfig, FederatedSearchDispatcher, RoutingBackend};
-        use nexus_search_common::transport::{PeerChannelCache, PeerChannelConfig};
         use nexus_search_common::InMemoryZoneSearchRegistry;
         let local =
             Arc::new(crate::backends::plugin_local::PluginLocalSearchBackend::new(search.clone()));
-        // Real tonic-remote backend backed by a fresh
-        // `PeerChannelCache` — one Channel-per-peer cache the
-        // `RoutingBackend` uses when the `ZoneSearchRegistry` hands
-        // it a remote target.
-        let peer_cache = Arc::new(PeerChannelCache::new(PeerChannelConfig::default()));
+        // Local and remote legs share the configured TLS identity and channels.
+        let peer_cache = Arc::clone(&search.channels);
         let remote =
             Arc::new(crate::backends::tonic_remote::TonicRemoteSearchBackend::new(peer_cache));
         // Env-driven registry — the ONE knob for cross-daemon
@@ -528,12 +390,8 @@ pub fn install_impl(
             local,
             remote,
             Arc::clone(&registry) as Arc<dyn nexus_search_common::ZoneSearchRegistry>,
-            // Composition-root self-id.  The kernel-provided
-            // `AuthProvider` implicitly identifies this daemon
-            // via its mTLS peer identity; the value here shows up
-            // on `SearchDelegation::source_zone_id` for audit
-            // trails when the cross-daemon path lands.
-            "local",
+            // The ingress control plane belongs to the root namespace.
+            contracts::ROOT_ZONE_ID,
             std::iter::empty::<String>(),
         );
         Arc::new(FederatedSearchDispatcher::new(
@@ -545,6 +403,7 @@ pub fn install_impl(
         ))
     };
     let state = AppState {
+        ready,
         search,
         auth,
         auth_key_store,
@@ -557,19 +416,8 @@ pub fn install_impl(
         #[cfg(feature = "rebac")]
         accessible_zones,
     };
-    // Bind synchronously so `install` surfaces the failure —
-    // port-in-use / EACCES / bad interface all become an
-    // `install` `Err` instead of a stray `tracing::error!`
-    // on a background task.
-    //
-    // Use SYNC `std::net::TcpListener::bind` (no runtime needed —
-    // `bind` is a raw `socket`+`bind`+`listen` syscall trio),
-    // then hand off to tokio via `from_std`.  A prior iteration
-    // used `runtime.block_on(tokio::TcpListener::bind)` — WRONG:
-    // `bring_up_services` runs INSIDE the tokio runtime the
-    // daemon spun up, so `block_on` panics with "Cannot start a
-    // runtime from within a runtime".  The sync path avoids
-    // runtime re-entry entirely.
+    // Bind synchronously so address errors fail service installation. Convert
+    // the listener on the active runtime without entering a nested runtime.
     let std_listener = std::net::TcpListener::bind(addr)
         .map_err(|e| format!("nexus-http-api: bind {addr}: {e}"))?;
     std_listener
