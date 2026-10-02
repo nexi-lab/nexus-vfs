@@ -176,6 +176,10 @@ pub(crate) struct StartSessionRequest {
     /// the child's stdio through those streams for the client's raw-byte ACP tunnel.
     #[serde(default)]
     pub spawn_spec: Option<SpawnSpec>,
+    /// Durable transcript to restore in an in-process runtime. This is NOT
+    /// the pid-valued `session_id` accepted by get/cancel.
+    #[serde(default)]
+    pub resume_session_id: Option<String>,
 }
 
 /// Raw subprocess spec computed by the embedder. The launch-logic SSOT stays client-side
@@ -198,14 +202,18 @@ pub(crate) struct StartSessionResponse {
     /// AgentRegistry pid for the spawned managed agent.  cancel /
     /// get_session take this back.
     pub session_id: String,
+    /// Runtime-owned transcript ID, when the spawn provider supports persistence.
+    /// Absent for raw subprocesses and providers without durable sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_session_id: Option<String>,
     pub workspace_path: String,
     /// Real OS pid of the spawned subprocess — set ONLY on the raw ACP
     /// control-plane path (`spawn_spec` supplied); `None` for the
     /// runtime-body / procfs-only paths. Surfaced SEPARATELY from
     /// `session_id` (which stays the synthetic AgentRegistry pid) per
     /// the frozen contract ④: the embedder (sudowork) keys its
-    /// pid-bound auth-proxy on the OS pid, but the durable session
-    /// handle for cancel / get_session is `session_id`.
+    /// pid-bound auth-proxy on the OS pid; the process handle for
+    /// cancel / get_session remains `session_id`.
     #[serde(default)]
     pub os_pid: Option<u32>,
 }
@@ -224,6 +232,10 @@ pub(crate) struct GetSessionResponse {
     /// session to — and attribution nobody can read back is attribution
     /// nobody can check.
     pub owner_id: String,
+    /// Runtime-owned transcript ID, when the spawn provider supports persistence.
+    /// Absent for raw subprocesses and providers without durable sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_session_id: Option<String>,
     pub workspace_path: String,
     pub model: String,
     pub state: String,
@@ -299,6 +311,18 @@ pub trait SpawnHandle: Send + Sync {
     /// idempotent — the on_terminate observer can fire concurrently
     /// with an in-progress `cancel(Session)`.
     fn abort(&self);
+
+    /// Durable transcript identity, independent of the registry pid.
+    fn durable_session_id(&self) -> Option<&str> {
+        None
+    }
+}
+
+/// Optional runtime session selection. Existing providers retain their spawn
+/// implementation and explicitly reject recovery until they implement it.
+#[derive(Clone, Debug, Default)]
+pub struct SpawnOptions {
+    pub resume_session_id: Option<String>,
 }
 
 /// Spawn-task provider. `start_session` calls
@@ -343,6 +367,21 @@ pub trait SpawnTask<K: KernelSyscall>: Send + Sync + 'static {
         desc: AgentDescriptor,
         state_observer: Arc<dyn Fn(AgentState, Option<String>) + Send + Sync>,
     ) -> Result<Box<dyn SpawnHandle>, String>;
+
+    /// Spawn with durable session selection. Never silently start fresh when
+    /// the caller requested recovery from a provider that cannot restore.
+    fn spawn_with_options(
+        &self,
+        kernel: Arc<K>,
+        desc: AgentDescriptor,
+        options: SpawnOptions,
+        state_observer: Arc<dyn Fn(AgentState, Option<String>) + Send + Sync>,
+    ) -> Result<Box<dyn SpawnHandle>, String> {
+        if options.resume_session_id.is_some() {
+            return Err("this runtime does not support resume_session_id".into());
+        }
+        self.spawn(kernel, desc, state_observer)
+    }
 }
 
 /// Raw ACP-subprocess control-plane spawner — the DI seam for the
@@ -455,6 +494,23 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                 "'agent_id' is required".into(),
             ));
         }
+        if let Some(id) = req.resume_session_id.as_deref() {
+            if id.is_empty()
+                || id.len() > 128
+                || !id
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+            {
+                return Err(ManagedAgentError::InvalidArgument(
+                    "resume_session_id must be a durable ID, not a path".into(),
+                ));
+            }
+            if req.spawn_spec.is_some() || self.spawn_provider.is_none() {
+                return Err(ManagedAgentError::InvalidArgument(
+                    "resume_session_id requires an in-process runtime provider".into(),
+                ));
+            }
+        }
         // Take the raw spawn spec out early — it selects the spawn
         // strategy below (raw ACP subprocess vs. runtime body) and the
         // rest of the descriptor build doesn't touch it.
@@ -548,6 +604,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
         //
         // Slim builds with neither run procfs-only.
         let mut os_pid: Option<u32> = None;
+        let mut durable_session_id = None;
         if let Some(desc) = self.agent_registry.get(&pid) {
             if let Err(e) = register_proc_entry(self.kernel.as_ref(), &desc) {
                 tracing::warn!(pid=%pid, error=%e, "register_proc_entry failed");
@@ -653,13 +710,16 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                 // that retries after fixing the cause is not told the agent is
                 // already running.
                 let handle = provider
-                    .spawn(Arc::clone(&self.kernel), desc, observer)
+                    .spawn_with_options(
+                        Arc::clone(&self.kernel),
+                        desc,
+                        SpawnOptions {
+                            resume_session_id: req.resume_session_id.clone(),
+                        },
+                        observer,
+                    )
                     .map_err(|e| {
-                        let _ = self.agent_registry.update_state_with_reason(
-                            &pid,
-                            AgentState::Terminated,
-                            Some(e.clone()),
-                        );
+                        let _ = self.agent_registry.kill(&pid, 1);
                         // `Internal`, not `InvalidArgument`: the request was fine and
                         // the caller cannot fix this by sending a different one — the
                         // HOST is missing something (model configuration, a usable
@@ -669,12 +729,25 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                         // message the refusal carries.
                         ManagedAgentError::Internal(format!("spawn agent runtime: {e}"))
                     })?;
+                if req
+                    .resume_session_id
+                    .as_deref()
+                    .is_some_and(|requested| handle.durable_session_id() != Some(requested))
+                {
+                    handle.abort();
+                    let _ = self.agent_registry.kill(&pid, 1);
+                    return Err(ManagedAgentError::Internal(
+                        "runtime did not restore the requested durable session".into(),
+                    ));
+                }
+                durable_session_id = handle.durable_session_id().map(str::to_owned);
                 self.spawn_handles.insert(pid.clone(), handle);
             }
         }
 
         Ok(StartSessionResponse {
             session_id: pid,
+            durable_session_id,
             workspace_path,
             os_pid,
         })
@@ -743,6 +816,10 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
         let model = desc.labels.get(MODEL_LABEL).cloned().unwrap_or_default();
         Ok(GetSessionResponse {
             session_id: desc.pid.clone(),
+            durable_session_id: self
+                .spawn_handles
+                .get(session_id)
+                .and_then(|handle| handle.durable_session_id().map(str::to_owned)),
             agent_id: desc.name.clone(),
             owner_id: desc.owner_id.clone(),
             workspace_path,
@@ -1051,6 +1128,7 @@ mod tests {
             owner_id: "ethan".to_string(),
             zone_id: "root".to_string(),
             spawn_spec: None,
+            resume_session_id: None,
         }
     }
 
