@@ -264,8 +264,26 @@ async fn credentials_and_live_permissions_survive_signed_plugin_and_cached_searc
     denied!(remove_indexed_directory, RemoveIndexedDirectoryRequest);
     denied!(list_indexed_directories, ListIndexedDirectoriesRequest);
     denied!(set_zone_indexing_mode, SetZoneIndexingModeRequest);
-    denied!(list_zone_indexing_modes, ListZoneIndexingModesRequest);
-    denied!(health, HealthRequest);
+    assert_eq!(
+        client
+            .list_zone_indexing_modes(ListZoneIndexingModesRequest {
+                auth_token: alice.key.clone(),
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied,
+    );
+    assert_eq!(
+        client
+            .health(HealthRequest {
+                auth_token: alice.key.clone(),
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied,
+    );
     denied!(stats, StatsRequest);
 
     let batch = client
