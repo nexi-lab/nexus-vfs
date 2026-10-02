@@ -3407,7 +3407,6 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         );
     }
 
-
     // (2) Arm the cross-machine stream-wakeup observer PER ZONE: a
     // replicated `AppendStreamEntry` (a transcript write on a
     // peer) wakes a `sys_watch` parked on this replica. The observer is a

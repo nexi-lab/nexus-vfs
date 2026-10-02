@@ -23,7 +23,7 @@ jobs:
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
-            max_size_bytes: 18350080  # 17.5 MiB — the max of the two raises off 17.0:
+            max_size_bytes: 18612288  # 17.75 MiB — stacked features measured past 17.5:
                                       # typed ZoneRuntime plane (#364, measured
                                       # 18,153,576 here before the mount work) and
                                       # the declared mount subtree (#361, measured
