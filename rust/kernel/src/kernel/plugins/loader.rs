@@ -11,9 +11,10 @@
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, OsString};
+use std::mem::ManuallyDrop;
 use std::os::raw::c_void;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use contracts::rust_service::{RustCallError, RustService};
@@ -279,20 +280,17 @@ fn parse_grpc_services_symbol(
 
 // ── LoadedPlugin ────────────────────────────────────────────────────
 
-/// A loaded plugin — tracks the library handle and instance pointer so
-/// we can destroy the instance and dlclose the library on unload.
+/// A registered plugin. Unload closes its instance and removes registration.
 struct LoadedPlugin {
-    /// The `libloading::Library` handle. Dropped last (after instance
-    /// destroy) to keep the code pages alive while the destructor runs.
-    _lib: libloading::Library,
+    /// Code stays mapped until process exit. Rust dependencies may return from
+    /// destruction before worker threads exit, and host threads may retain
+    /// plugin TLS destructors. Instance shutdown cannot prove dlclose is safe.
+    /// Replacing a plugin binary therefore requires a daemon restart.
+    _lib: ManuallyDrop<libloading::Library>,
     kind: PluginKind,
     name: String,
     path: PathBuf,
-    /// Opaque instance pointer returned by `nexus_service_create` /
-    /// `nexus_driver_create`. Null after destroy.
-    handle: *mut c_void,
-    /// Destroy function — called before dlclose.
-    destroy_fn: unsafe extern "C" fn(*mut c_void),
+    instance: Arc<ServiceInstance>,
     /// Fully-qualified gRPC service names this plugin opted into
     /// exposing via the optional `nexus_plugin_grpc_services` symbol.
     /// Empty for plugins (or driver kind) that did not export it.
@@ -300,11 +298,33 @@ struct LoadedPlugin {
     grpc_dispatch: Option<(GrpcDispatchFn, NexusFreeFn)>,
 }
 
-// SAFETY: The plugin C ABI contract requires all plugin instances to be
-// thread-safe (`Send + Sync`). The `handle` pointer is only accessed
-// through the C ABI functions which are themselves `Send + Sync`.
-unsafe impl Send for LoadedPlugin {}
-unsafe impl Sync for LoadedPlugin {}
+/// Shared by every dispatcher for one service. Read guards cover dispatch and
+/// buffer release; closing waits for those calls and rejects later calls.
+struct ServiceInstance {
+    handle: RwLock<*mut c_void>,
+    destroy: ServiceDestroyFn,
+}
+
+// SAFETY: Plugin instances support concurrent C ABI calls. The write guard
+// exclusively owns destruction, and dispatchers retain a read guard throughout.
+unsafe impl Send for ServiceInstance {}
+unsafe impl Sync for ServiceInstance {}
+
+impl ServiceInstance {
+    fn close(&self) {
+        let mut handle = self.handle.write().unwrap();
+        let old = std::mem::replace(&mut *handle, std::ptr::null_mut());
+        if !old.is_null() {
+            unsafe { (self.destroy)(old) };
+        }
+    }
+}
+
+impl Drop for ServiceInstance {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
 
 // ── PluginGrpcEndpoint (public surface to cluster glue) ─────────────
 
@@ -355,14 +375,10 @@ fn resolve_plugin_free(lib: &libloading::Library) -> Result<NexusFreeFn, String>
 }
 
 struct DylibGrpcService {
-    handle: *mut c_void,
+    instance: Arc<ServiceInstance>,
     dispatch: GrpcDispatchFn,
     free: NexusFreeFn,
 }
-
-// The plugin contract requires concurrent calls to be safe.
-unsafe impl Send for DylibGrpcService {}
-unsafe impl Sync for DylibGrpcService {}
 
 impl GrpcService for DylibGrpcService {
     fn call(
@@ -382,9 +398,16 @@ impl GrpcService for DylibGrpcService {
             .collect();
         let mut output = std::ptr::null_mut();
         let mut len = 0;
+        let handle = self.instance.handle.read().unwrap();
+        if handle.is_null() {
+            return Err(GrpcError {
+                code: 14,
+                message: "plugin is unloaded".into(),
+            });
+        }
         let code = unsafe {
             (self.dispatch)(
-                self.handle,
+                *handle,
                 method.as_ptr(),
                 payload.as_ptr(),
                 payload.len(),
@@ -419,16 +442,12 @@ impl GrpcService for DylibGrpcService {
 /// the same path as compiled-in Rust services.
 pub(crate) struct DylibRustService {
     svc_name: String,
-    handle: *mut c_void,
+    instance: Arc<ServiceInstance>,
     dispatch_fn: ServiceDispatchFn,
     /// The plugin's own `nexus_free` — frees dispatch-output buffers on
     /// the plugin's allocator (never the host's). See `take_plugin_buf`.
     free_fn: NexusFreeFn,
 }
-
-// SAFETY: Plugin C ABI contract requires thread-safe instances.
-unsafe impl Send for DylibRustService {}
-unsafe impl Sync for DylibRustService {}
 
 impl RustService for DylibRustService {
     fn name(&self) -> &str {
@@ -453,10 +472,14 @@ impl RustService for DylibRustService {
             .map_err(|_| RustCallError::InvalidArgument("method contains null byte".to_string()))?;
         let mut out_buf: *mut u8 = std::ptr::null_mut();
         let mut out_len: usize = 0;
+        let handle = self.instance.handle.read().unwrap();
+        if handle.is_null() {
+            return Err(RustCallError::NotFound);
+        }
 
         let rc = unsafe {
             (self.dispatch_fn)(
-                self.handle,
+                *handle,
                 method_c.as_ptr(),
                 payload.as_ptr(),
                 payload.len(),
@@ -499,10 +522,8 @@ impl RustService for DylibRustService {
 /// Lifetime: a `DylibObjectStore` owns the driver instance handle —
 /// `Drop` calls `nexus_driver_destroy(handle)` so each mount's
 /// resources release deterministically when its `Arc` count hits zero.
-/// The underlying `libloading::Library` is held by the
-/// `PluginLoader::loaded` map; callers must keep the plugin loaded
-/// (no `unload_plugin`) for the entire lifetime of any mount it
-/// backs.
+/// Library code stays mapped for the process lifetime. Removing the driver's
+/// registration prevents new instances; existing mounts retain their instances.
 pub(crate) struct DylibObjectStore {
     drv_name: String,
     handle: *mut c_void,
@@ -977,31 +998,30 @@ impl PluginLoader {
                             format!("symbol {}: {e}", nexus_plugin_abi::symbols::DRIVER_DESTROY)
                         })?
                 };
-                // Handle stays null in the LoadedPlugin entry. Each
+                // The shared service handle stays null for a driver. Each
                 // `make_driver` call mints its own (handle, destroy_fn)
                 // pair owned by the returned DylibObjectStore.
-                // `PluginLoader::unload` already skips destroy when
-                // handle is null, so the lifecycle stays correct.
                 (std::ptr::null_mut(), destroy_fn)
             }
         };
 
         // 4. Store in loaded map
         let loaded = LoadedPlugin {
-            _lib: lib,
+            _lib: ManuallyDrop::new(lib),
             kind,
             name: name.clone(),
             path: path.to_path_buf(),
-            handle,
-            destroy_fn,
+            instance: Arc::new(ServiceInstance {
+                handle: RwLock::new(handle),
+                destroy: destroy_fn,
+            }),
             grpc_services,
             grpc_dispatch,
         };
 
         let mut map = self.loaded.lock().unwrap();
         if map.contains_key(&name) {
-            // Destroy the just-created instance before returning error
-            unsafe { (loaded.destroy_fn)(loaded.handle) };
+            drop(map);
             return Err(format!("plugin '{name}' already loaded"));
         }
         map.insert(name.clone(), loaded);
@@ -1143,7 +1163,7 @@ impl PluginLoader {
                 .grpc_dispatch
                 .expect("gRPC symbols were validated before plugin creation");
             let svc: Arc<dyn GrpcService> = Arc::new(DylibGrpcService {
-                handle: plugin.handle,
+                instance: Arc::clone(&plugin.instance),
                 dispatch,
                 free,
             });
@@ -1180,25 +1200,22 @@ impl PluginLoader {
 
         Some(DylibRustService {
             svc_name: name.to_string(),
-            handle: plugin.handle,
+            instance: Arc::clone(&plugin.instance),
             dispatch_fn,
             free_fn,
         })
     }
 
-    /// Unload a plugin by name. For service plugins, the caller must
-    /// unregister from ServiceRegistry first (drain + stop).
+    /// Remove registration and close the service after active calls finish.
+    /// Existing dispatchers reject new calls; library code remains mapped.
     pub fn unload(&self, name: &str) -> Result<(), String> {
-        let mut map = self.loaded.lock().unwrap();
-        let plugin = map
+        let plugin = self
+            .loaded
+            .lock()
+            .unwrap()
             .remove(name)
             .ok_or_else(|| format!("plugin '{name}' not loaded"))?;
-
-        // Destroy the instance before dlclose (which happens on
-        // LoadedPlugin drop when `_lib` goes out of scope).
-        if !plugin.handle.is_null() {
-            unsafe { (plugin.destroy_fn)(plugin.handle) };
-        }
+        plugin.instance.close();
 
         tracing::info!(name, path = %plugin.path.display(), "plugin unloaded");
         Ok(())
@@ -1214,11 +1231,9 @@ impl PluginLoader {
 
     /// Unload all plugins (shutdown path).
     pub fn unload_all(&self) {
-        let mut map = self.loaded.lock().unwrap();
-        for (name, plugin) in map.drain() {
-            if !plugin.handle.is_null() {
-                unsafe { (plugin.destroy_fn)(plugin.handle) };
-            }
+        let plugins = std::mem::take(&mut *self.loaded.lock().unwrap());
+        for (name, plugin) in plugins {
+            plugin.instance.close();
             tracing::debug!(name, "plugin unloaded (shutdown)");
         }
     }
@@ -1251,6 +1266,58 @@ mod tests {
         let loader = PluginLoader::new();
         loader.unload_all();
         assert!(loader.list().is_empty());
+    }
+
+    #[test]
+    fn service_close_waits_for_calls_and_destroys_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{mpsc, Barrier};
+        use std::time::Duration;
+
+        unsafe extern "C" fn destroy(handle: *mut c_void) {
+            let count = Box::from_raw(handle.cast::<Arc<AtomicUsize>>());
+            count.fetch_add(1, Ordering::SeqCst);
+        }
+        let count = Arc::new(AtomicUsize::new(0));
+        let instance = Arc::new(ServiceInstance {
+            handle: RwLock::new(Box::into_raw(Box::new(count.clone())).cast()),
+            destroy,
+        });
+        let entered = Arc::new(Barrier::new(3));
+        let release = Arc::new(Barrier::new(3));
+        let calls: Vec<_> = (0..2)
+            .map(|_| {
+                let instance = instance.clone();
+                let entered = entered.clone();
+                let release = release.clone();
+                std::thread::spawn(move || {
+                    let handle = instance.handle.read().unwrap();
+                    assert!(!handle.is_null());
+                    entered.wait();
+                    release.wait();
+                    drop(handle);
+                })
+            })
+            .collect();
+        entered.wait();
+        let closing = instance.clone();
+        let (done, closed) = mpsc::channel();
+        let closer = std::thread::spawn(move || {
+            closing.close();
+            done.send(()).unwrap();
+        });
+        assert!(closed.try_recv().is_err());
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        release.wait();
+        for call in calls {
+            call.join().unwrap();
+        }
+        closed.recv_timeout(Duration::from_secs(5)).unwrap();
+        closer.join().unwrap();
+        assert!(instance.handle.read().unwrap().is_null());
+        instance.close();
+        drop(instance);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
     // ── signing format tests ────────────────────────────────────────

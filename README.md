@@ -65,6 +65,15 @@ mounts such as `/docs`. The loopback HTTP listener is intended to sit behind a
 TLS reverse proxy; its outbound gRPC connections use the daemon's cluster CA and
 node certificate while preserving the bearer caller's identity.
 
+Cross-zone queries support query type, result limit, and one path prefix. Pin
+`zone_id` to use additional ranking, chunk, or path-filter options; unsupported
+cross-zone options return HTTP 400.
+
+Plugin unload removes registration and closes service instances after active
+calls finish. Library code remains mapped until process exit so dependency
+threads and thread-local destructors can finish safely. Restart the daemon to
+replace plugin binaries.
+
 ## Acknowledgments
 
 We welcome **Zhuotao Liu** (Tsinghua University) as a contributor. The

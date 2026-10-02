@@ -92,8 +92,8 @@ impl Kernel {
         Ok(Arc::new(store))
     }
 
-    /// Unload a plugin by name. Service plugins have their hooks removed
-    /// and are unregistered from ServiceRegistry first (drain + stop).
+    /// Remove a plugin's registration and close its service after active calls
+    /// finish. Library code remains mapped until daemon exit for thread safety.
     pub fn unload_plugin(&self, name: &str) -> Result<(), String> {
         // Check if it's a service — unhook + unregister before destroy
         if self.service_registry.contains(name) {
