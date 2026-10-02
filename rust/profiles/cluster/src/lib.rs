@@ -383,6 +383,56 @@ fn default_replicated_prefixes() -> impl Iterator<Item = &'static str> {
 ///
 /// An operator's explicit entry always wins: this only fills gaps, so
 /// `--cluster-init-mount /agents=other` keeps `/agents` on `other`.
+/// Refuse to boot when two mounts of ONE zone expose overlapping subtrees.
+///
+/// The injected prefixes are disjoint by construction and asserted
+/// (`a_single_declared_zone_mounts_every_declared_prefix`), so this guards the
+/// configuration an OPERATOR can still write: two `--cluster-init-mount` lines
+/// naming the same zone both mean the whole zone, which is exactly the aliasing
+/// nexi-lab/nexus-vfs#361 was about — `/x/win-ai` and `/y/win-ai` become one
+/// key, and `readdir /x` answers with `/y`'s contents.
+///
+/// Refusing rather than warning, because the symptom contains no error: every
+/// write succeeds, every read returns something, and the two namespaces are
+/// quietly the same one. A line in a boot log is not proportionate to a cluster
+/// storing two things in one place.
+///
+/// Overlap, not equality: `/` contains everything and `/a` contains `/a/b`, so
+/// two mounts exposing `/a` and `/a/b` means the second's whole key space is
+/// also reachable through the first.
+fn refuse_overlapping_subtrees(
+    mounts: &std::collections::BTreeMap<String, nexus_raft::zone_manager::MountDecl>,
+) -> anyhow::Result<()> {
+    // Does `outer` contain `inner`, treating both as absolute paths?
+    fn contains(outer: &str, inner: &str) -> bool {
+        outer == contracts::VFS_ROOT || inner == outer || inner.starts_with(&format!("{outer}/"))
+    }
+
+    let declared: Vec<_> = mounts.iter().collect();
+    for (i, (path_a, decl_a)) in declared.iter().enumerate() {
+        for (path_b, decl_b) in declared.iter().skip(i + 1) {
+            if decl_a.zone != decl_b.zone {
+                continue;
+            }
+            if contains(&decl_a.subtree, &decl_b.subtree)
+                || contains(&decl_b.subtree, &decl_a.subtree)
+            {
+                anyhow::bail!(
+                    "mounts {path_a} and {path_b} both expose zone '{}' at overlapping \
+                     subtrees ({} and {}), so the two paths would share one key space — a \
+                     write under either is readable under the other, and `readdir` of \
+                     either answers with both. Give them disjoint subtrees, or point them \
+                     at different zones.",
+                    decl_a.zone,
+                    decl_a.subtree,
+                    decl_b.subtree,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn with_default_replicated_mounts(
     declared: &std::collections::BTreeMap<String, String>,
     init_zones: &[String],
@@ -2311,6 +2361,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     // auto-mount can never make a malformed or contradictory operator input
     // look valid. See `with_default_replicated_mounts`.
     let federation_mounts = with_default_replicated_mounts(&init_mounts.mounts, &init_zones);
+    refuse_overlapping_subtrees(&federation_mounts)?;
 
     // S3 Phase G: single boot decision layer.  `plan_boot_action`
     // is the SSOT for what this daemon does at boot — no more
@@ -6442,6 +6493,63 @@ mod tests {
             .iter()
             .map(|(p, z)| ((*p).to_string(), (*z).to_string()))
             .collect()
+    }
+
+    /// Two operator mounts of ONE zone are refused, and the shipped topology is
+    /// accepted.
+    ///
+    /// The injected prefixes are disjoint by construction, so the guard exists
+    /// for what an operator can still write: two `--cluster-init-mount` lines
+    /// naming the same zone both mean the whole zone, and the two paths then
+    /// share one key space with nothing erroring anywhere.
+    ///
+    /// Both directions are asserted because a guard that refuses everything
+    /// also passes the first half — the shipped configuration going through is
+    /// the half that proves it discriminates.
+    #[test]
+    fn overlapping_subtrees_on_one_zone_refuse_to_boot() {
+        // The configuration we actually ship: one zone, three prefixes, each
+        // declaring its own subtree.
+        let shipped = with_default_replicated_mounts(&mounts(&[]), &["sharedzone".to_string()]);
+        refuse_overlapping_subtrees(&shipped)
+            .expect("the shipped topology is disjoint and must boot");
+
+        // Two operator lines naming one zone: both whole-zone, so they alias.
+        let aliased = with_default_replicated_mounts(
+            &mounts(&[("/x", "sharedzone"), ("/y", "sharedzone")]),
+            &[],
+        );
+        let err = refuse_overlapping_subtrees(&aliased)
+            .expect_err("two whole-zone mounts of one zone must refuse to boot");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("/x") && msg.contains("/y") && msg.contains("sharedzone"),
+            "the error must name both mounts and the zone: {msg}"
+        );
+
+        // Different zones at the same subtree is fine — nothing is shared.
+        let distinct =
+            with_default_replicated_mounts(&mounts(&[("/x", "zone-a"), ("/y", "zone-b")]), &[]);
+        refuse_overlapping_subtrees(&distinct).expect("different zones do not share a key space");
+
+        // NESTED subtrees of one zone overlap too: everything under `/a/b` is
+        // also reachable under `/a`, so equality alone would miss this.
+        let nested: std::collections::BTreeMap<String, nexus_raft::zone_manager::MountDecl> = [
+            (
+                "/outer".to_string(),
+                nexus_raft::zone_manager::MountDecl::subtree_of("sharedzone", "/a"),
+            ),
+            (
+                "/inner".to_string(),
+                nexus_raft::zone_manager::MountDecl::subtree_of("sharedzone", "/a/b"),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        assert!(
+            refuse_overlapping_subtrees(&nested).is_err(),
+            "a subtree nested inside another is still one shared key space"
+        );
     }
 
     /// A joiner must come back UNCHANGED, and this is not a "nothing to do".
