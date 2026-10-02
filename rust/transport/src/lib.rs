@@ -40,10 +40,12 @@ pub mod call_dispatch;
 pub mod federation;
 /// VFS gRPC server (in-bound). Always compiled.
 pub mod grpc;
+pub mod grpc_plugin_access;
 /// Plugin-as-gRPC-service proxy — routes cdylib plugin services onto
 /// the same tonic `Routes` as the built-in VFS server.  See module
 /// docs for the dispatch contract.
 pub mod grpc_plugin_proxy;
+pub mod grpc_search_access;
 pub mod peer_blob;
 /// Recover the caller's identity from the mTLS client certificate that
 /// rustls has already verified against the cluster CA. Feeds

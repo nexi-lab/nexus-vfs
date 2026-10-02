@@ -19,6 +19,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+#[cfg(feature = "driver-remote")]
 use std::time::Duration;
 
 use kernel::hal::object_store_provider::{

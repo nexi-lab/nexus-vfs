@@ -1,10 +1,8 @@
 //! OpenAI streaming pipeline — SSE decode → DT_STREAM → CAS persist.
 //!
-//! Nothing drives this yet: there is no caller in the tree, so no model call
-//! happens through the kernel today. Earlier docs here named a
-//! `llm_start_streaming` syscall as the driver; no such syscall was ever
-//! written, and the agreed design does not add one — a write to the mount is
-//! the trigger.
+//! `llm_mount` drives this after a successful `.prompt` write. Native HTTP
+//! exchange envelopes use `http_exchange`; chat requests use the SSE decoder
+//! below. Both emit through the caller's kernel-bound sink.
 //!
 //! Runs entirely on the kernel-shared tokio runtime, and appends through the
 //! caller's `StreamSink` so every append runs the kernel's write hooks.
@@ -77,6 +75,19 @@ impl OpenAIBackend {
     ) -> Result<(), String> {
         let request: Value = serde_json::from_slice(request_bytes)
             .map_err(|e| format!("request JSON parse: {e}"))?;
+        if super::super::http_exchange::is_exchange(&request) {
+            return super::super::http_exchange::run(
+                request,
+                &self.base_url,
+                &self.api_key,
+                false,
+                &self.http,
+                &self.runtime,
+                &self.engine,
+                stream_path,
+                sink,
+            );
+        }
         let messages = request
             .get("messages")
             .cloned()

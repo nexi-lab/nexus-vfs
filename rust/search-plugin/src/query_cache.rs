@@ -10,12 +10,11 @@
 //!
 //! # Auth boundary
 //!
-//! The plugin never sees subject identity (D5 read-gating stays
-//! kernel-tier).  `zone_id` IS the auth boundary — two callers who
-//! hit the same query in the same zone are equivalent from the
-//! plugin's perspective, so sharing a cache entry between them is
-//! safe.  The kernel-side router already checked read permission
-//! before dialing the plugin.
+//! Entries contain candidates shared by callers in the same zone. The host's
+//! SearchGrpcPolicy authenticates each request and checks every returned path
+//! against that caller's current kernel permissions, including cache hits.
+//! Permission decisions must never be stored in this cache: a grant can be
+//! revoked while the search index and these candidates remain unchanged.
 //!
 //! # Cache key
 //!
@@ -24,7 +23,7 @@
 //! `fusion_method`, `rrf_k`, `chunks_per_page`, `expand`,
 //! `recency_mode`, `recency_weight`, `recency_half_life_days`,
 //! `path_prefix_boosts`.  Explicitly EXCLUDES `auth_token` (per
-//! above — zone is the boundary).  `path_prefix_boosts` is folded
+//! above — authorization runs on every response). `path_prefix_boosts` is folded
 //! in via a sorted-key traversal so map ordering doesn't flap the
 //! hash.
 //!

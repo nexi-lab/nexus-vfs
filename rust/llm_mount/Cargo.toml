@@ -18,7 +18,7 @@ tracing = "0.1"
 dashmap = "6.1"
 
 [dev-dependencies]
-backends = { workspace = true, features = ["driver-openai"] }
+backends = { workspace = true, features = ["driver-openai", "driver-anthropic"] }
 serde_json = { workspace = true }
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }

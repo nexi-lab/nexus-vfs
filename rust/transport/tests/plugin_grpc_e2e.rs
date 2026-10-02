@@ -29,6 +29,9 @@ use prost::Message as _;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Endpoint, Server};
 use tonic::Request;
+use transport::auth::NoAuth;
+use transport::grpc::DataPlaneReady;
+use transport::grpc_plugin_access::AuthenticatedPlugin;
 use transport::grpc_plugin_proxy::extend_routes_with_plugin_endpoints;
 
 /// Single-field bytes message — the wire shape is one byte tag (0x0a)
@@ -117,6 +120,8 @@ async fn external_grpc_client_round_trips_through_plugin_proxy() {
         tonic::service::Routes::default(),
         endpoints,
         Arc::new(std::sync::OnceLock::new()),
+        DataPlaneReady::open(),
+        |_| Arc::new(AuthenticatedPlugin::new(Arc::new(NoAuth))),
     );
 
     // ── 2. Serve on an ephemeral port ──────────────────────────────
@@ -199,6 +204,8 @@ async fn empty_endpoints_passes_routes_through_unchanged() {
         tonic::service::Routes::default(),
         vec![],
         Arc::new(std::sync::OnceLock::new()),
+        DataPlaneReady::open(),
+        |_| Arc::new(AuthenticatedPlugin::new(Arc::new(NoAuth))),
     );
     // No panic on into_axum_router → routes survived.
     let _ = routes.into_axum_router();
@@ -222,6 +229,8 @@ async fn malformed_unary_frames_are_rejected_before_dispatch() {
     let mut service = transport::grpc_plugin_proxy::PluginProxyService::new(
         endpoint,
         Arc::new(std::sync::OnceLock::new()),
+        DataPlaneReady::open(),
+        Arc::new(AuthenticatedPlugin::new(Arc::new(NoAuth))),
     );
     for (frame, expected) in [
         (vec![], "3"),
