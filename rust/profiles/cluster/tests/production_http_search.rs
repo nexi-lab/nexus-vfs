@@ -122,6 +122,27 @@ async fn production_grants_filter_http_search_and_survive_restart() {
         .timeout(Duration::from_secs(20))
         .build()
         .unwrap();
+    for token in [None, Some(admin), Some("sk-never-minted")] {
+        let request = client.get(format!("{base}/v2/status"));
+        let request = match token {
+            Some(token) => request.bearer_auth(token),
+            None => request,
+        };
+        let status = json_ok(request).await;
+        assert_eq!(status["status"], "ok");
+        assert!(status["version"].is_string(), "{status}");
+    }
+    assert_eq!(
+        client
+            .post(format!("{base}/v2/search/query"))
+            .bearer_auth("sk-never-minted")
+            .json(&json!({"q":"widget"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
     let alice = json_ok(client.post(format!("{base}/v2/auth/keys")).bearer_auth(admin)
         .json(&json!({"subject_type":"user", "subject_id":"alice", "zones":["sharedzone:r", "legal:r"]}))).await;
     let alice = alice["key"].as_str().unwrap();

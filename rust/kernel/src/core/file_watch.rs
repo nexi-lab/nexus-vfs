@@ -211,22 +211,32 @@ mod tests {
     use crate::dispatch::FileEventType;
     use std::thread;
 
+    fn notify_after_registration(
+        registry: Arc<FileWatchRegistry>,
+        events: Vec<FileEvent>,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while registry.len() == 0 {
+                assert!(Instant::now() < deadline, "watch was never registered");
+                thread::yield_now();
+            }
+            for event in events {
+                registry.notify_match(&event);
+            }
+        })
+    }
+
     #[test]
     fn wait_for_event_returns_on_matching_notify() {
         let registry = Arc::new(FileWatchRegistry::new());
-        let notifier = Arc::clone(&registry);
-        let waker = thread::spawn(move || {
-            // Give the waiter time to park on the condvar before
-            // notifying — without this sleep the notify may fire
-            // before `wait_for_event` registers its temporary
-            // watch, leaving the waiter to time out.
-            thread::sleep(Duration::from_millis(20));
-            let event = FileEvent::new(FileEventType::FileWrite, "/proc/p1/status");
-            notifier.notify_match(&event);
-        });
+        let waker = notify_after_registration(
+            Arc::clone(&registry),
+            vec![FileEvent::new(FileEventType::FileWrite, "/proc/p1/status")],
+        );
 
         let event = registry
-            .wait_for_event("/proc/p1/status", 1_000)
+            .wait_for_event("/proc/p1/status", 5_000)
             .expect("notify should have woken the waiter");
         assert_eq!(event.path(), "/proc/p1/status");
         waker.join().unwrap();
@@ -260,20 +270,16 @@ mod tests {
     #[test]
     fn wait_for_event_filters_by_pattern() {
         let registry = Arc::new(FileWatchRegistry::new());
-        let notifier = Arc::clone(&registry);
-        let waker = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(20));
-            // Wrong path — must not wake the waiter.
-            let other = FileEvent::new(FileEventType::FileWrite, "/other/path");
-            notifier.notify_match(&other);
-            // Right path — must wake.
-            thread::sleep(Duration::from_millis(20));
-            let target = FileEvent::new(FileEventType::FileWrite, "/proc/p1/status");
-            notifier.notify_match(&target);
-        });
+        let waker = notify_after_registration(
+            Arc::clone(&registry),
+            vec![
+                FileEvent::new(FileEventType::FileWrite, "/other/path"),
+                FileEvent::new(FileEventType::FileWrite, "/proc/p1/status"),
+            ],
+        );
 
         let event = registry
-            .wait_for_event("/proc/p1/status", 500)
+            .wait_for_event("/proc/p1/status", 5_000)
             .expect("only the matching path should wake the waiter");
         assert_eq!(event.path(), "/proc/p1/status");
         waker.join().unwrap();
