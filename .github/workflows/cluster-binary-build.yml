@@ -39,11 +39,11 @@ jobs:
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
-            max_size_bytes: 15728640  # 15.0 MiB — raised from 14.75 for the typed
-                                      # ZoneRuntime plane (#364; see the linux-x86_64
-                                      # entry for the inventory).  Measured
-                                      # 15,539,504 bytes here, ~73 KB over the old
-                                      # cap; leaves ~189 KB headroom.
+            max_size_bytes: 15990784  # 15.25 MiB — raised from 15.0: the typed
+                                      # ZoneRuntime plane (#364) plus the declared
+                                      # mount subtree (#361) stack on the same arm64
+                                      # binary; measured 15,745,360 (16.3 KB over
+                                      # the 15.0 cap that the plane raise set).
           - os: macos-14
             artifact_name: nexusd-cluster-macos-x86_64
             package: nexus-cluster
