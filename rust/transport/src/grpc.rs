@@ -190,7 +190,7 @@ impl DataPlaneReady {
 
     /// Wait (event-driven) for the gate to open, up to `budget`. `false` ⇒ it
     /// never opened and the caller must refuse.
-    async fn wait(&self, budget: std::time::Duration) -> bool {
+    pub(crate) async fn wait(&self, budget: std::time::Duration) -> bool {
         if self.is_ready() {
             return true; // hot path: one atomic read, no subscription
         }
@@ -206,7 +206,7 @@ impl DataPlaneReady {
 /// did nothing wrong. Boot reaches ready in well under a second on an idle
 /// machine; the observed worst case is a heavily loaded CI runner forming raft
 /// zones, which took tens of seconds.
-const DATA_PLANE_READY_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+pub(crate) const DATA_PLANE_READY_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Every VFS request message carries its bearer token in an `auth_token`
 /// field. Naming that shape as a trait is what lets [`VfsServiceImpl::authenticate`]

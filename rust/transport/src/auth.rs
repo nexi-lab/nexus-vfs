@@ -83,6 +83,11 @@ pub struct PeerIdentity {
 }
 
 impl PeerIdentity {
+    /// Only a local node certificate may issue SearchDelegation credentials.
+    pub fn is_cluster_node(&self) -> bool {
+        self.node_id.is_some() && self.agent_name.is_none() && self.trust_domain.is_none()
+    }
+
     /// Stable string used as the `user_id` of a peer-plane context.
     ///
     /// Prefers the self-named `node/{id}` form, falling back to the CN

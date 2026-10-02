@@ -9,6 +9,8 @@
 
 #![allow(dead_code)] // each test file uses a different subset
 
+pub mod search_plugin;
+
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};

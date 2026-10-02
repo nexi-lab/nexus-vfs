@@ -3990,9 +3990,9 @@ impl SearchService for SearchServiceImpl {
         // delegation (`NoDelegation`) is the normal single-daemon
         // path and falls through untouched.  A valid delegation
         // logs the source-side subject; the search itself continues
-        // through the existing pipeline unchanged (subject-based
-        // authorisation happens at kernel-tier ReBAC checks that
-        // sit above this handler — the gate here is purely a
+        // through the existing pipeline unchanged (the host's SearchGrpcPolicy
+        // checks returned paths with the delegated subject's kernel permissions,
+        // including cache hits — the gate here is purely a
         // credential-freshness + zone-allowlist + method-allowlist
         // check on the delegation itself).
         match crate::delegation_gate::extract_and_validate(
@@ -4091,11 +4091,9 @@ impl SearchService for SearchServiceImpl {
                 .map(|fts| fts.generation_id())
         };
 
-        // P7 cache check.  Zone is the auth boundary (D5), so a
-        // hit here is safe to serve directly — we don't need to
-        // re-check permission, the kernel router already did.  A
-        // hit skips FTS + ANN + fusion + scoring + pooling +
-        // expand entirely.
+        // P7 caches candidates, without caller-specific permission decisions.
+        // The host filters every response with the caller's live permissions.
+        // A hit skips FTS + ANN + fusion + scoring + pooling + expand.
         if let Some(epoch) = query_epoch {
             if let Some(cached) = self.query_cache.get(&req_for_cache, title_arm_on, epoch) {
                 return Ok(Response::new(QueryResponse {

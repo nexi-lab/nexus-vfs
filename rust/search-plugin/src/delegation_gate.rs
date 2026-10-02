@@ -37,7 +37,9 @@
 //! The original Unix timestamp survives transport unchanged, including on replay.
 
 use nexus_plugin_abi::grpc::GrpcPeer;
-use nexus_search_common::{SearchDelegation, DELEGATION_METADATA_KEY};
+use nexus_search_common::SearchDelegation;
+#[cfg(test)]
+use nexus_search_common::DELEGATION_METADATA_KEY;
 use tonic::{Request, Status};
 
 /// What the gate found on an incoming request.  See the module
@@ -76,40 +78,15 @@ pub fn extract_and_validate<T>(
     method: &str,
     zone_id: &str,
 ) -> Result<GateOutcome, Status> {
-    // 1. Look for the delegation on tonic metadata.  Absent → the
-    // caller is not using delegation, fall through to the default
-    // auth path.
-    let raw = match request.metadata().get_bin(DELEGATION_METADATA_KEY) {
-        None => return Ok(GateOutcome::NoDelegation),
-        Some(v) => v,
-    };
-    if !request
+    let node = request
         .extensions()
         .get::<GrpcPeer>()
-        .is_some_and(|peer| peer.is_cluster_node)
+        .is_some_and(|peer| peer.is_cluster_node);
+    match nexus_search_common::delegation::from_metadata(request.metadata(), node, method, zone_id)?
     {
-        return Err(Status::unauthenticated(
-            "SearchDelegation requires a verified cluster node",
-        ));
+        None => Ok(GateOutcome::NoDelegation),
+        Some(delegation) => Ok(GateOutcome::Accepted { delegation }),
     }
-    let bytes = raw.to_bytes().map_err(|e| {
-        Status::unauthenticated(format!(
-            "SearchDelegation metadata not valid base64 (per gRPC -bin rule): {e}"
-        ))
-    })?;
-
-    // 2. Deserialise.  A malformed blob is functionally an auth
-    // failure (see module docstring's rationale) — return
-    // Unauthenticated so the client-side mapper reads it as
-    // "backend refused" rather than "transport bad payload".
-    let delegation: SearchDelegation = serde_json::from_slice(&bytes)
-        .map_err(|e| Status::unauthenticated(format!("SearchDelegation malformed JSON: {e}")))?;
-
-    delegation
-        .validate(method, zone_id)
-        .map_err(|error| Status::unauthenticated(error.to_string()))?;
-
-    Ok(GateOutcome::Accepted { delegation })
 }
 
 #[cfg(test)]

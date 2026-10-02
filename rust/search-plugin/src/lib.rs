@@ -6,7 +6,14 @@
 //! routing path — the plugin declares its service list via
 //! `nexus_plugin_grpc_services`, the cluster's `PluginProxyService`
 //! routes external tonic traffic at `/nexus.search.v1.SearchService/<M>`
-//! into this plugin's `nexus_service_dispatch`.
+//! into this plugin's `nexus_service_dispatch_grpc`.
+//!
+//! The host's SearchGrpcPolicy authenticates requests, checks readable zone
+//! grants, and filters every returned path with the kernel's installed permission
+//! provider. Index management and aggregate diagnostics require an administrator
+//! or cluster node. A deployment must install a permission provider to enforce
+//! file-level rules; the bare cluster profile only enforces identity and zones.
+//! The plugin cache stores candidates and never stores authorization decisions.
 //!
 //! ## Why a plugin (and not a kernel primitive)
 //!
