@@ -41,7 +41,9 @@ use crate::search_proto::{
     FusionMethod, GlobRequest, GrepRequest, QueryRequest, QueryResult as ProtoQueryResult,
     QueryType,
 };
-use crate::zone::{effective_zone, is_privileged, ZoneError};
+#[cfg(feature = "rebac")]
+use crate::zone::is_privileged;
+use crate::zone::{effective_zone, ZoneError};
 use crate::{AppState, BackendError};
 
 // ── /v2/search/glob ──────────────────────────────────────────────
