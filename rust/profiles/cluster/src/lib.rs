@@ -397,40 +397,53 @@ fn default_replicated_prefixes() -> impl Iterator<Item = &'static str> {
 /// quietly the same one. A line in a boot log is not proportionate to a cluster
 /// storing two things in one place.
 ///
-/// Overlap, not equality: `/` contains everything and `/a` contains `/a/b`, so
-/// two mounts exposing `/a` and `/a/b` means the second's whole key space is
-/// also reachable through the first.
-fn refuse_overlapping_subtrees(
+/// EQUALITY, not containment, and that boundary was drawn by a real
+/// configuration. Containment is expressible on purpose: a `--cluster-init-mount
+/// /shared=sharedzone` beside the injected `/agents` means "the whole zone here,
+/// and its `/agents` subtree there too" — two paths to one object, which the
+/// operator wrote both of. Refusing that rejected a working deployment. Two
+/// EQUAL subtrees are different: the paths are then indistinguishable
+/// namespaces, and `readdir` of either answers with the other's contents as
+/// though they were its own, which is #361.
+fn refuse_aliased_subtrees(
     mounts: &std::collections::BTreeMap<String, nexus_raft::zone_manager::MountDecl>,
 ) -> anyhow::Result<()> {
-    // Does `outer` contain `inner`, treating both as absolute paths?
-    fn contains(outer: &str, inner: &str) -> bool {
-        outer == contracts::VFS_ROOT || inner == outer || inner.starts_with(&format!("{outer}/"))
-    }
-
     let declared: Vec<_> = mounts.iter().collect();
     for (i, (path_a, decl_a)) in declared.iter().enumerate() {
         for (path_b, decl_b) in declared.iter().skip(i + 1) {
-            if decl_a.zone != decl_b.zone {
-                continue;
-            }
-            if contains(&decl_a.subtree, &decl_b.subtree)
-                || contains(&decl_b.subtree, &decl_a.subtree)
-            {
+            if decl_a.zone == decl_b.zone && decl_a.subtree == decl_b.subtree {
                 anyhow::bail!(
-                    "mounts {path_a} and {path_b} both expose zone '{}' at overlapping \
-                     subtrees ({} and {}), so the two paths would share one key space — a \
-                     write under either is readable under the other, and `readdir` of \
-                     either answers with both. Give them disjoint subtrees, or point them \
-                     at different zones.",
-                    decl_a.zone,
+                    "mounts {path_a} and {path_b} both expose subtree {} of zone '{}', so \
+                     the two paths are one key space under two names — a write under either \
+                     is readable under the other, and `readdir` of either answers with \
+                     both. Give them different subtrees, or point them at different zones.",
                     decl_a.subtree,
-                    decl_b.subtree,
+                    decl_a.zone,
                 );
             }
         }
     }
     Ok(())
+}
+
+/// Which subtree of its target zone a mount at `path` exposes.
+///
+/// One rule, shared by the founder and the joiner: a mount at one of the
+/// replicated prefixes exposes that prefix; anything else exposes the whole
+/// zone, which is what `--cluster-init-mount <path>=<zone>` has always meant.
+///
+/// Derived from the PREFIX LIST rather than from the local mount path, and that
+/// distinction is what makes it safe: `default_replicated_prefixes()` is a
+/// compile-time constant every node shares, so a founder and a joiner reach the
+/// same answer without an RPC. Deriving from a local path would not be safe —
+/// `join <peer>:/<zone> <local-path>` lets two nodes mount one zone at
+/// different paths, and they would then disagree about that zone's keys.
+fn replicated_subtree_for(path: &str) -> String {
+    if default_replicated_prefixes().any(|prefix| prefix == path) {
+        path.to_string()
+    } else {
+        contracts::VFS_ROOT.to_string()
+    }
 }
 
 fn with_default_replicated_mounts(
@@ -439,23 +452,37 @@ fn with_default_replicated_mounts(
 ) -> std::collections::BTreeMap<String, nexus_raft::zone_manager::MountDecl> {
     use nexus_raft::zone_manager::MountDecl;
 
-    // An operator who writes `--cluster-init-mount <path>=<zone>` is asking for
-    // that zone, whole — the meaning that flag has always had.
+    // The subtree follows the PATH, not who wrote the line.
+    //
+    // A mount at one of the replicated prefixes exposes that prefix's subtree
+    // whether this function injected it or an operator spelled it out — and the
+    // documented duet recipe spells all three out
+    // (`NEXUS_CLUSTER_INIT_MOUNTS='/agents=sharedzone,/conversations=sharedzone,…'`),
+    // as do the federation integration tests. Treating an operator's line as
+    // whole-zone made those configurations ALIAS exactly as before while the
+    // injected ones were disjoint, which the boot guard then refused — correctly,
+    // and it is how this was caught.
+    //
+    // Any other path is the whole zone, which is the meaning
+    // `--cluster-init-mount <path>=<zone>` has always had.
     let mut resolved: std::collections::BTreeMap<String, MountDecl> = declared
         .iter()
-        .map(|(path, zone)| (path.clone(), MountDecl::whole_zone(zone)))
+        .map(|(path, zone)| {
+            (
+                path.clone(),
+                MountDecl::subtree_of(zone, replicated_subtree_for(path)),
+            )
+        })
         .collect();
     let [zone] = init_zones else {
         return resolved;
     };
-    // The prefixes this function injects all land on the SAME zone, so each one
-    // must say which subtree of it to expose or they alias: `to_zone_key`
-    // strips the mount prefix, and three mounts exposing the zone's root make
-    // `/agents/win-ai` and `/conversations/win-ai` one key
-    // (nexi-lab/nexus-vfs#361 — `readdir /agents` answered with conversation
-    // ids). The subtree is the prefix itself, declared HERE, at the one place
-    // these mounts are created, and carried on the DT_MOUNT record from here
-    // on so a restart and a joiner both re-apply it rather than re-guess.
+    // Injected prefixes all land on the SAME zone, so each must say which
+    // subtree of it to expose or they alias: `to_zone_key` strips the mount
+    // prefix, and three mounts exposing the zone's root make `/agents/win-ai`
+    // and `/conversations/win-ai` one key (nexi-lab/nexus-vfs#361 — `readdir
+    // /agents` answered with conversation ids). Carried on the DT_MOUNT record
+    // from here on, so a restart and a joiner re-apply it rather than re-guess.
     for prefix in default_replicated_prefixes() {
         resolved
             .entry(prefix.to_string())
@@ -2361,7 +2388,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     // auto-mount can never make a malformed or contradictory operator input
     // look valid. See `with_default_replicated_mounts`.
     let federation_mounts = with_default_replicated_mounts(&init_mounts.mounts, &init_zones);
-    refuse_overlapping_subtrees(&federation_mounts)?;
+    refuse_aliased_subtrees(&federation_mounts)?;
 
     // S3 Phase G: single boot decision layer.  `plan_boot_action`
     // is the SSOT for what this daemon does at boot — no more
@@ -2454,6 +2481,25 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
             as_learner_per_zone,
             mounts,
         } => {
+            // The boot matrix reduced these to `path -> zone`; a joiner must
+            // mount the same SUBTREE the founder declared or the two translate
+            // one path to different keys and diverge silently. The rule is
+            // shared (`replicated_subtree_for`) rather than re-derived, and it
+            // reads a compile-time constant both nodes hold, so no RPC is
+            // needed to agree.
+            let mounts: std::collections::BTreeMap<String, nexus_raft::zone_manager::MountDecl> =
+                mounts
+                    .iter()
+                    .map(|(path, zone)| {
+                        (
+                            path.clone(),
+                            nexus_raft::zone_manager::MountDecl::subtree_of(
+                                zone,
+                                replicated_subtree_for(path),
+                            ),
+                        )
+                    })
+                    .collect();
             // Matrix rows 3 + 4 — see `plan_boot_action` docstring.  Joiner
             // path, two sub-cases:
             //   (A) `zones` empty (no identity.zones snapshot yet) →
@@ -3640,7 +3686,7 @@ async fn report_published_federation_zones(zm: &Arc<ZoneManager>) {
         tracing::info!(
             zones = ?published
                 .iter()
-                .map(|record| format!("{}={}:{}", record.path, record.zone, record.subtree))
+                .map(|(path, decl)| format!("{path}={}:{}", decl.zone, decl.subtree))
                 .collect::<Vec<_>>(),
             "this node publishes {} federation zone(s) — a joiner pointed here \
              discovers exactly these",
@@ -3708,8 +3754,10 @@ async fn reconcile_federation_from_peers(
     // pair (each half exposing a disjoint zone) still discovers both.  The
     // BTreeMap sorts by path; `discovered_zone_order` preserves first-response
     // order for per-zone JoinZone dispatch.
-    let mut discovered_mounts: std::collections::BTreeMap<String, String> =
-        std::collections::BTreeMap::new();
+    let mut discovered_mounts: std::collections::BTreeMap<
+        String,
+        nexus_raft::zone_manager::MountDecl,
+    > = std::collections::BTreeMap::new();
     let mut discovered_zone_order: Vec<String> = Vec::new();
     for peer in &peers {
         match nexus_raft::transport::call_discover_zones_rpc(
@@ -3746,7 +3794,16 @@ async fn reconcile_federation_from_peers(
                     if !discovered_mounts.contains_key(&entry.mount_path) {
                         discovered_zone_order.push(entry.zone_id.clone());
                     }
-                    discovered_mounts.insert(entry.mount_path, entry.zone_id);
+                    // Mount what the founder PUBLISHED, subtree included — a joiner
+                    // defaulting to the whole zone would translate the same path to a
+                    // different key than the founder and diverge silently.
+                    discovered_mounts.insert(
+                        entry.mount_path,
+                        nexus_raft::zone_manager::MountDecl::subtree_of(
+                            entry.zone_id,
+                            entry.target_subtree,
+                        ),
+                    );
                 }
             }
             // Per-peer reachability detail (debug). A boot-time joiner whose
@@ -3822,7 +3879,7 @@ async fn join_zones_for_boot(
     parent_zone: String,
     data_dir: PathBuf,
     zone_ids: Vec<String>,
-    mounts: std::collections::BTreeMap<String, String>,
+    mounts: std::collections::BTreeMap<String, nexus_raft::zone_manager::MountDecl>,
     as_learner_per_zone: Vec<bool>,
 ) -> Result<()> {
     assert_eq!(
@@ -3924,10 +3981,12 @@ async fn join_zones_for_boot(
         );
     }
 
-    for (local_path, zone_id) in &mounts {
-        zm.mount_async(&parent_zone, local_path, zone_id, true)
+    for (local_path, decl) in &mounts {
+        zm.mount_subtree_async(&parent_zone, local_path, &decl.zone, &decl.subtree, true)
             .await
-            .map_err(|e| anyhow::anyhow!("mount({local_path} -> {zone_id}): {}", e))?;
+            .map_err(|e| {
+                anyhow::anyhow!("mount({local_path} -> {}:{}): {e}", decl.zone, decl.subtree)
+            })?;
     }
 
     Ok(())
@@ -4015,8 +4074,13 @@ async fn run_join(
     // the run_join contract (parent_zone user-configurable).  The
     // daemon federation-branch will call the same primitive with the
     // multi-zone federation map in a follow-up commit.
+    // The offline `join <peer>:/<zone> <local-path>` CLI mounts a remote zone
+    // at an operator-chosen path, which means the WHOLE zone.
     let mut mounts = std::collections::BTreeMap::new();
-    mounts.insert(local_path.to_string(), remote_zone_id.to_string());
+    mounts.insert(
+        local_path.to_string(),
+        nexus_raft::zone_manager::MountDecl::whole_zone(remote_zone_id),
+    );
     join_zones_for_boot(
         zm.clone(),
         node_id,
@@ -6495,6 +6559,46 @@ mod tests {
             .collect()
     }
 
+    /// An operator who SPELLS OUT a replicated prefix gets the same subtree the
+    /// injection would have given it.
+    ///
+    /// The documented duet recipe writes all three out
+    /// (`NEXUS_CLUSTER_INIT_MOUNTS='/agents=sharedzone,/conversations=sharedzone,…'`)
+    /// and so do the federation integration tests, so "operator wrote it" is
+    /// the COMMON case, not an exotic one. Treating those lines as whole-zone
+    /// left them aliasing exactly as before while the injected ones were
+    /// disjoint — and the boot guard refused the mixture, which is how this was
+    /// caught, in CI, on the commit that introduced it.
+    #[test]
+    fn a_spelled_out_prefix_gets_the_same_subtree_as_an_injected_one() {
+        let spelled = with_default_replicated_mounts(
+            &mounts(&[
+                (a2a::A2A_INBOX_BASE, "sharedzone"),
+                (a2a::CONVERSATIONS_BASE, "sharedzone"),
+                (contracts::SESSIONS_BASE, "sharedzone"),
+            ]),
+            &["sharedzone".to_string()],
+        );
+        for prefix in default_replicated_prefixes() {
+            assert_eq!(
+                spelled.get(prefix).map(|d| d.subtree.as_str()),
+                Some(prefix),
+                "{prefix} written out by an operator must get its own subtree, \
+                 not the whole zone"
+            );
+        }
+        // And the whole thing must therefore boot.
+        refuse_aliased_subtrees(&spelled).expect("the documented recipe must not be refused");
+
+        // A path that is NOT a replicated prefix still means the whole zone.
+        let other = with_default_replicated_mounts(&mounts(&[("/scratch", "other-zone")]), &[]);
+        assert_eq!(
+            other.get("/scratch").map(|d| d.subtree.as_str()),
+            Some("/"),
+            "an ordinary mount is still the whole zone"
+        );
+    }
+
     /// Two operator mounts of ONE zone are refused, and the shipped topology is
     /// accepted.
     ///
@@ -6507,19 +6611,18 @@ mod tests {
     /// also passes the first half — the shipped configuration going through is
     /// the half that proves it discriminates.
     #[test]
-    fn overlapping_subtrees_on_one_zone_refuse_to_boot() {
+    fn aliased_subtrees_on_one_zone_refuse_to_boot() {
         // The configuration we actually ship: one zone, three prefixes, each
         // declaring its own subtree.
         let shipped = with_default_replicated_mounts(&mounts(&[]), &["sharedzone".to_string()]);
-        refuse_overlapping_subtrees(&shipped)
-            .expect("the shipped topology is disjoint and must boot");
+        refuse_aliased_subtrees(&shipped).expect("the shipped topology is disjoint and must boot");
 
         // Two operator lines naming one zone: both whole-zone, so they alias.
         let aliased = with_default_replicated_mounts(
             &mounts(&[("/x", "sharedzone"), ("/y", "sharedzone")]),
             &[],
         );
-        let err = refuse_overlapping_subtrees(&aliased)
+        let err = refuse_aliased_subtrees(&aliased)
             .expect_err("two whole-zone mounts of one zone must refuse to boot");
         let msg = err.to_string();
         assert!(
@@ -6530,26 +6633,29 @@ mod tests {
         // Different zones at the same subtree is fine — nothing is shared.
         let distinct =
             with_default_replicated_mounts(&mounts(&[("/x", "zone-a"), ("/y", "zone-b")]), &[]);
-        refuse_overlapping_subtrees(&distinct).expect("different zones do not share a key space");
+        refuse_aliased_subtrees(&distinct).expect("different zones do not share a key space");
 
         // NESTED subtrees of one zone overlap too: everything under `/a/b` is
-        // also reachable under `/a`, so equality alone would miss this.
+        // NESTED subtrees of one zone are ALLOWED, and that boundary was drawn
+        // by a real deployment: `--cluster-init-mount /shared=sharedzone`
+        // beside the injected `/agents` means "the whole zone here, and its
+        // `/agents` subtree there too". Two paths to one object, both of which
+        // the operator wrote. Refusing it rejected a working configuration —
+        // the integration suite caught that.
         let nested: std::collections::BTreeMap<String, nexus_raft::zone_manager::MountDecl> = [
             (
-                "/outer".to_string(),
-                nexus_raft::zone_manager::MountDecl::subtree_of("sharedzone", "/a"),
+                "/shared".to_string(),
+                nexus_raft::zone_manager::MountDecl::whole_zone("sharedzone"),
             ),
             (
-                "/inner".to_string(),
-                nexus_raft::zone_manager::MountDecl::subtree_of("sharedzone", "/a/b"),
+                a2a::A2A_INBOX_BASE.to_string(),
+                nexus_raft::zone_manager::MountDecl::subtree_of("sharedzone", a2a::A2A_INBOX_BASE),
             ),
         ]
         .into_iter()
         .collect();
-        assert!(
-            refuse_overlapping_subtrees(&nested).is_err(),
-            "a subtree nested inside another is still one shared key space"
-        );
+        refuse_aliased_subtrees(&nested)
+            .expect("a whole-zone mount beside a subtree mount of it is deliberate nesting");
     }
 
     /// A joiner must come back UNCHANGED, and this is not a "nothing to do".
