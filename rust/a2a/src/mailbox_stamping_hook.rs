@@ -85,7 +85,23 @@ impl NativeInterceptHook for MailboxStampingHook {
         if c.content.is_empty() {
             return Ok(HookOutcome::Pass);
         }
-        let caller = if c.identity.agent_id.is_empty() {
+        // Session control also admits a directly authenticated user. In that
+        // case the principal is the actor; a delegated agent still stamps its
+        // own agent ID. NoAuth deployments retain their provider's shared
+        // cluster-internal identity and do not acquire an identity guarantee.
+        let session_control = c.identity.agent_id.is_empty()
+            && serde_json::from_slice::<serde_json::Value>(&c.content)
+                .ok()
+                .and_then(|v| {
+                    v.get("kind")
+                        .and_then(|kind| kind.as_str())
+                        .map(str::to_owned)
+                })
+                .as_deref()
+                == Some(crate::session::SESSION_KIND);
+        let caller = if session_control && !c.identity.user_id.is_empty() {
+            Some(c.identity.user_id.as_str())
+        } else if c.identity.agent_id.is_empty() {
             None
         } else {
             Some(c.identity.agent_id.as_str())
@@ -267,6 +283,25 @@ mod tests {
                 assert_eq!(v["from"], "win-ai");
             }
             HookOutcome::Pass => panic!("expected Replace, got Pass"),
+        }
+    }
+
+    #[test]
+    fn session_control_stamps_the_authenticated_user_or_delegated_agent() {
+        let hook = MailboxStampingHook::new_fail_closed(true);
+        for (agent, expected) in [("", "user1"), ("delegated", "delegated")] {
+            let ctx = write_ctx(
+                &transcript(expected, "worker"),
+                agent,
+                br#"{"from":"forged","to":"worker","kind":"session","body":"frame"}"#.to_vec(),
+            );
+            match hook.on_pre(&ctx).unwrap() {
+                HookOutcome::Replace(bytes) => {
+                    let message: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(message["from"], expected);
+                }
+                HookOutcome::Pass => panic!("session control must be stamped"),
+            }
         }
     }
 

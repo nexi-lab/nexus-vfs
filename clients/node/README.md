@@ -94,6 +94,40 @@ An RPC that fails in transport rejects with `gRPC <op> failed: <details>`. An
 RPC that reaches the server but fails there rejects with the server's error
 payload verbatim.
 
+## Managed sessions
+
+`NexusSessionTransport` (SDK 0.5.0+) carries complete ACP JSON-RPC objects in
+`acp-mailbox/1` envelopes. Subprocess and co-host runs return the same
+`session_endpoint` from `managed_agent.start_session_v1`. The legacy
+`session_id` field in that call is a process handle; ACP's `sessionId` names the
+persistent transcript.
+
+```ts
+import { NexusSessionTransport } from '@nexus-ai-fs/vfs-client'
+
+const session = new NexusSessionTransport({
+  client,
+  endpoint: started.session_endpoint,
+  authToken,
+  onMessage(message) { dispatchAcp(message) },
+  onClose(error) { rejectPendingRequests(error) },
+})
+session.start()
+await session.send({jsonrpc: '2.0', id: 0, method: 'initialize',
+  params: {protocolVersion: 1, clientCapabilities: {}}})
+// Continue with session/new or session/load, then session/prompt.
+// Reply to reverse permission/question requests using their original ID.
+await session.close()
+```
+
+Keep the authenticated caller used for start on this connection. `onMessage`
+must return promptly; waiting for a UI decision must not block cancellation.
+Transient reads retry from the same cursor. Writes with an unknown outcome
+close the channel without replaying a prompt. Daemon restart requires a new
+start and channel generation, optionally resuming the durable transcript.
+Old daemons without `session_endpoint` must fail visibly; do not fall back to
+public fd streams. The SDK has no hosting-specific session transport.
+
 ## Development
 
 ```bash
