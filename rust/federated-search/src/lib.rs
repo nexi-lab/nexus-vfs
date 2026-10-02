@@ -1,40 +1,7 @@
-//! Cross-zone search fanout dispatcher.
+//! Cross-zone search discovery, bounded concurrent fanout, and result fusion.
 //!
-//! Consumer contract: an axum `/v2/search/query` handler that finds
-//! the caller's token grants more than one zone hands the request to
-//! [`FederatedSearchDispatcher::search`], which returns one
-//! [`FederatedSearchResponse`] covering every zone the caller may
-//! read from.
-//!
-//! # What this crate owns
-//!
-//! * **Zone discovery** — the dispatcher asks
-//!   [`AccessibleZonesCache`] for the caller's zone set (per-subject
-//!   TTL cache on top of `nexus_rebac::list_accessible_zones`).
-//! * **Concurrent fanout** — one tokio task per zone, bounded by a
-//!   `Semaphore` (`max_concurrent_zones`), with a per-zone
-//!   `tokio::time::timeout` so one slow zone does not starve the
-//!   whole request.
-//! * **Fusion** — collected per-zone hit lists fuse through
-//!   [`rrf_multi_fusion`], producing a single ranked list.
-//! * **Envelope** — [`FederatedSearchResponse`] carries the fused
-//!   hits, `zones_searched` / `zones_failed` / `zones_skipped`, and
-//!   an aggregate `latency_ms`.  Callers stamp `semantic_degraded`
-//!   downstream if the deployment profile asks.
-//!
-//! # What this crate deliberately does NOT own
-//!
-//! * **Cross-zone gRPC** — every zone routes to the SAME local
-//!   backend today; the cross-zone leg with `SearchDelegation`
-//!   arrives in the next PR of the arc.  A [`ZoneSearchRegistry`] is
-//!   accepted so the dispatcher can already tell "local vs remote"
-//!   apart, but a remote zone currently falls through to the shared
-//!   local backend — behaviour matches Python's Phase-1 dispatcher.
-//! * **Per-file ReBAC filtering** — composed on top by the caller
-//!   AFTER fusion (Python does the same via
-//!   `filter_federated_results`).  Keeps this crate one concern.
-//! * **Recency / cap / result-cache knobs** — omitted for the first
-//!   pass; the tunables land as they become measurable.
+//! The caller supplies a credential zone ceiling; it is intersected with the
+//! subject's ReBAC zone grants. Backends enforce individual result permissions.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -158,8 +125,22 @@ impl<B: LocalSearchBackend + 'static> FederatedSearchDispatcher<B> {
         // unreachable); we treat it as "no accessible zones" — the
         // response envelope carries an empty result set, matching
         // the Python fallback.
-        let accessible = match self.zone_cache.lookup(&*self.rebac_store, subject) {
-            Ok(z) => z,
+        let cache = Arc::clone(&self.zone_cache);
+        let store = Arc::clone(&self.rebac_store);
+        let owned_subject = req.subject.clone();
+        let lookup = tokio::task::spawn_blocking(move || {
+            cache.lookup(&*store, (&owned_subject.0, &owned_subject.1))
+        })
+        .await;
+        let accessible = match lookup {
+            Ok(Ok(z)) => z,
+            Ok(Err(e)) => {
+                warn!(error = %e, "federated: zone discovery failed");
+                return FederatedSearchResponse {
+                    latency_ms: elapsed_ms(start),
+                    ..Default::default()
+                };
+            }
             Err(e) => {
                 warn!(error = %e, "federated: zone discovery failed");
                 return FederatedSearchResponse {
@@ -372,6 +353,7 @@ mod tests {
 
     fn req() -> SearchRequest {
         SearchRequest {
+            auth_token: String::new(),
             query: "any".into(),
             search_type: "hybrid".into(),
             limit: 10,

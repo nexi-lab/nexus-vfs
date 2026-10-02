@@ -88,8 +88,15 @@ pub const DEFAULT_ZONE_CACHE_TTL: Duration = Duration::from_secs(10);
 /// TTL bounds reuse between writes. A store without revisions bypasses caching.
 #[derive(Debug)]
 pub struct AccessibleZonesCache {
-    entries: RwLock<std::collections::HashMap<String, (Vec<String>, Instant, u64)>>,
+    entries: RwLock<std::collections::HashMap<String, CachedZones>>,
     ttl: Duration,
+}
+
+#[derive(Debug)]
+struct CachedZones {
+    zones: Vec<String>,
+    expiry: Instant,
+    revision: u64,
 }
 
 impl Default for AccessibleZonesCache {
@@ -125,9 +132,9 @@ impl AccessibleZonesCache {
         let key = cache_key(subject);
         let now = Instant::now();
         // Fast path — read lock only.
-        if let Some((zones, expiry, cached_revision)) = self.entries.read().get(&key) {
-            if revision != 0 && *cached_revision == revision && now < *expiry {
-                return Ok(zones.clone());
+        if let Some(entry) = self.entries.read().get(&key) {
+            if revision != 0 && entry.revision == revision && now < entry.expiry {
+                return Ok(entry.zones.clone());
             }
         }
         // Miss or expired — recompute; single scan, then upgrade to
@@ -137,9 +144,14 @@ impl AccessibleZonesCache {
         let zones = list_accessible_zones(store, subject)?;
         let expiry = now + self.ttl;
         if revision != 0 && store.revision()? == revision {
-            self.entries
-                .write()
-                .insert(key, (zones.clone(), expiry, revision));
+            self.entries.write().insert(
+                key,
+                CachedZones {
+                    zones: zones.clone(),
+                    expiry,
+                    revision,
+                },
+            );
         }
         Ok(zones)
     }

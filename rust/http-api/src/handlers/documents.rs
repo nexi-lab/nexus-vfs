@@ -28,6 +28,7 @@
 //!   (fts_doc_count / fts_path_count / ann_chunk_count / etc.).
 //!   Maps to `SearchService::Stats`.
 
+use crate::middleware::auth::BearerToken;
 use axum::extract::{Query, State};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
@@ -39,7 +40,7 @@ use crate::search_proto::{
     DocumentInput as ProtoDocumentInput, IndexDocumentsRequest, IndexRequest, RefreshRequest,
     StatsRequest,
 };
-use crate::zone::{effective_zone, is_privileged, scope_request_path, ZoneError};
+use crate::zone::{effective_zone, is_privileged, ZoneError};
 use crate::AppState;
 
 // ── shared field-shape helpers ───────────────────────────────────
@@ -58,6 +59,7 @@ fn default_zone() -> String {
 /// the proto's [`IndexRequest`] snake_case names 1:1 — same policy
 /// as [`crate::handlers::search::QueryBody`].
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IndexBody {
     /// Walk start.  Absolute VFS path (starts with `/`).
     pub root_path: String,
@@ -73,8 +75,6 @@ pub struct IndexBody {
     /// with narrower `root_path` scopes.
     #[serde(default)]
     pub max_docs: u32,
-    #[serde(default)]
-    pub auth_token: String,
 }
 
 /// Response body of [`index`].  Mirrors proto `IndexResponse`; the
@@ -90,18 +90,19 @@ pub struct IndexResponseBody {
 /// Handler for `POST /v2/documents/index`.
 pub async fn index(
     State(state): State<AppState>,
+    Extension(token): Extension<BearerToken>,
     Extension(ctx): Extension<OperationContext>,
     Json(body): Json<IndexBody>,
 ) -> Result<Json<IndexResponseBody>, SearchError> {
     let zone_id = effective_zone(&ctx, &body.zone_id)?;
-    let root_path = scope_request_path(&ctx, &zone_id, &body.root_path)?;
+    let root_path = body.root_path;
     let mut client = state.search.client().await?;
     let req = IndexRequest {
         root_path,
         zone_id,
         recursive: body.recursive,
         max_docs: body.max_docs,
-        auth_token: body.auth_token,
+        auth_token: token.0.to_string(),
     };
     let resp = client
         .index(tonic::Request::new(req))
@@ -121,6 +122,7 @@ pub async fn index(
 /// [`IndexBody`] — mtime-diff Refresh + full Index take the same
 /// `root_path` + `recursive` + `max_docs` scope.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RefreshBody {
     pub root_path: String,
     #[serde(default = "default_zone")]
@@ -129,8 +131,6 @@ pub struct RefreshBody {
     pub recursive: bool,
     #[serde(default)]
     pub max_docs: u32,
-    #[serde(default)]
-    pub auth_token: String,
 }
 
 /// Response body of [`refresh`].  Adds `unchanged_count` +
@@ -152,18 +152,19 @@ pub struct RefreshResponseBody {
 /// Handler for `POST /v2/documents/refresh`.
 pub async fn refresh(
     State(state): State<AppState>,
+    Extension(token): Extension<BearerToken>,
     Extension(ctx): Extension<OperationContext>,
     Json(body): Json<RefreshBody>,
 ) -> Result<Json<RefreshResponseBody>, SearchError> {
     let zone_id = effective_zone(&ctx, &body.zone_id)?;
-    let root_path = scope_request_path(&ctx, &zone_id, &body.root_path)?;
+    let root_path = body.root_path;
     let mut client = state.search.client().await?;
     let req = RefreshRequest {
         root_path,
         zone_id,
         recursive: body.recursive,
         max_docs: body.max_docs,
-        auth_token: body.auth_token,
+        auth_token: token.0.to_string(),
     };
     let resp = client
         .refresh(tonic::Request::new(req))
@@ -205,13 +206,12 @@ pub struct DocumentInput {
 /// the VFS.  Used by nexus-server today for user-visible document
 /// posts (as opposed to the `Index` RPC which walks the VFS).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BatchBody {
     pub documents: Vec<DocumentInput>,
     /// Batch-wide zone default; per-doc `zone_id` overrides.
     #[serde(default = "default_zone")]
     pub zone_id: String,
-    #[serde(default)]
-    pub auth_token: String,
 }
 
 /// Response body of [`batch`].  `parked_paths` surfaces docs that
@@ -237,6 +237,7 @@ pub struct BatchResponseBody {
 /// Handler for `POST /v2/documents/batch`.
 pub async fn batch(
     State(state): State<AppState>,
+    Extension(token): Extension<BearerToken>,
     Extension(ctx): Extension<OperationContext>,
     Json(body): Json<BatchBody>,
 ) -> Result<Json<BatchResponseBody>, SearchError> {
@@ -271,7 +272,7 @@ pub async fn batch(
     let req = IndexDocumentsRequest {
         documents,
         zone_id,
-        auth_token: body.auth_token,
+        auth_token: token.0.to_string(),
     };
     let resp = client
         .index_documents(tonic::Request::new(req))
@@ -294,12 +295,11 @@ pub async fn batch(
 /// because the wire shape is a bounded scalar tuple — no room for
 /// a list / map that would justify a POST body.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StatsQuery {
     /// Zone scope; empty ⇒ ROOT_ZONE_ID.
     #[serde(default = "default_zone")]
     pub zone_id: String,
-    #[serde(default)]
-    pub auth_token: String,
 }
 
 /// Response body of [`stats`].  Every field mirrors the proto's
@@ -341,12 +341,13 @@ pub struct StatsResponseBody {
 /// Handler for `GET /v2/documents/stats`.
 pub async fn stats(
     State(state): State<AppState>,
+    Extension(token): Extension<BearerToken>,
     Query(params): Query<StatsQuery>,
 ) -> Result<Json<StatsResponseBody>, SearchError> {
     let mut client = state.search.client().await?;
     let req = StatsRequest {
         zone_id: params.zone_id,
-        auth_token: params.auth_token,
+        auth_token: token.0.to_string(),
     };
     let resp = client
         .stats(tonic::Request::new(req))

@@ -47,9 +47,13 @@ impl SearchGrpcPolicy {
         peer: Option<&PeerIdentity>,
         token: &str,
     ) -> Result<OperationContext, Status> {
+        let token = request_token(metadata, token)?;
+        // A gateway's node certificate authenticates its connection. An
+        // explicit bearer still names the caller, whose authority must not be
+        // replaced by that node's system privileges.
         self.auth.resolve(&AuthCredentials {
-            token: request_token(metadata, token)?,
-            peer,
+            token,
+            peer: if token.is_empty() { peer } else { None },
         })
     }
 
@@ -129,6 +133,11 @@ impl PluginGrpcPolicy for SearchGrpcPolicy {
                 )?;
                 let ctx = match delegation {
                     Some(delegation) => {
+                        if !request.auth_token.is_empty() {
+                            return Err(Status::unauthenticated(
+                                "delegation and bearer credentials cannot be combined",
+                            ));
+                        }
                         // Authenticate the issuing connection as well as its
                         // provenance, so provider revocations still apply.
                         self.authenticate(metadata, peer, &request.auth_token)?;

@@ -268,7 +268,6 @@ async fn query_happy_path_round_trips_full_chain() {
         "limit": 15,
         "path_filter": "/notes",
         "query_type": "hybrid",
-        "auth_token": "sk-test",
         "alpha": 0.6,
         "fusion_method": "rrf_weighted",
         "rrf_k": 42,
@@ -281,6 +280,7 @@ async fn query_happy_path_round_trips_full_chain() {
     });
     let resp = reqwest::Client::new()
         .post(format!("{}/v2/search/query", h.http_base))
+        .bearer_auth("sk-test")
         .json(&body)
         .send()
         .await
