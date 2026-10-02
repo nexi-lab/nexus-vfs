@@ -11,33 +11,19 @@
 //! tuple.
 //!
 //! This cache holds an `Arc<ReBACGraph>` per zone, keyed on the
-//! store's [`crate::store::ReBACTupleStore::zone_revision`] counter,
+//! store's [`crate::store::ReBACTupleStore::revision`] counter,
 //! so callers observe an O(1) hit under steady state.  Rebuild fires
 //! only when the revision moves — i.e. after a `put` / `delete` in
 //! that zone.
 //!
-//! # The `zone_revision == 0` fail-safe path
+//! A zero revision means the store cannot track changes: those reads rebuild
+//! without caching. Raft stores use the state machine's applied index, including
+//! snapshot restore. Graphs are process-local derived state.
 //!
-//! The raft-backed store deliberately returns `zone_revision = 0` as
-//! a sentinel (see [`crate::raft_store::RaftReBACTupleStore`] module
-//! doc — a cross-node revision counter is subtle; the fail-safe is
-//! "always stale, always rebuild").  This cache treats `0` as
-//! **bypass the cache entirely**: rebuild every call, never write to
-//! the cache.  Cost: the caller pays the full `list()` + rebuild on
-//! every check.  Not a hot-path regression — enforcer checks are
-//! amortised behind `permission::PermissionLeaseCache` upstream.
-//!
-//! When a follow-up ships the raft-observer counter, this cache
-//! silently becomes fast for the raft store too — no changes here.
-//!
-//! # Concurrency
-//!
-//! Reads take a shared lock, fast-path returns the cached `Arc<
-//! ReBACGraph>` clone; writes take an exclusive lock ONLY when a
-//! rebuild is required.  A stampede (N readers all missing at once)
-//! is bounded — the first writer rebuilds, later writers observe the
-//! now-fresh entry inside the write lock and short-circuit.  No
-//! double rebuild, no lock held across the O(N) rebuild body.
+//! Rebuilds run outside the cache lock. Concurrent misses may build twice, but
+//! no Raft read holds a cache lock or blocks hits for another zone. Entries are
+//! tagged with the revision sampled before the read, so a concurrent mutation
+//! causes the next lookup to rebuild rather than accepting an older graph.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -49,14 +35,14 @@ use parking_lot::RwLock;
 use crate::store::{ReBACTupleStore, ReBACTupleStoreError};
 use crate::tuple_key;
 
-/// A `zone_revision` sentinel meaning "the store cannot cheaply
+/// A `revision` sentinel meaning "the store cannot cheaply
 /// track revisions — bypass the cache and always rebuild".  Matches
-/// [`ReBACTupleStore::zone_revision`]'s default-impl return value.
+/// [`ReBACTupleStore::revision`]'s default-impl return value.
 ///
 /// Named for grepability: a future reviewer scanning for the
 /// `0`-special-case sees the constant and its docstring instead of
 /// a bare literal.
-const ZONE_REV_ALWAYS_STALE: u64 = 0;
+const REV_ALWAYS_STALE: u64 = 0;
 
 /// A cached graph for one zone, keyed by the revision at which it
 /// was built.  Held as `Arc` so a reader holding an old snapshot can
@@ -77,7 +63,7 @@ struct ZoneEntry {
 /// # NOT the enforcer
 ///
 /// This is the *substrate* — one `Arc<ReBACGraph>` per zone.  The
-/// enforcer ([`crate::RebacPermissionProvider`] in the next PR)
+/// enforcer ([`crate::RebacPermissionProvider`])
 /// composes this with a namespace registry + calls `lib::rebac::
 /// compute_permission` on the returned graph.
 pub struct ReBACGraphCache {
@@ -97,75 +83,28 @@ impl ReBACGraphCache {
         }
     }
 
-    /// Return the current graph for `zone`, rebuilding if the
-    /// cached revision does not match the store's `zone_revision`.
-    ///
-    /// # The steady-state fast path
-    ///
-    /// 1. `store.zone_revision(zone)` — one branch-free counter read
-    ///    (raft returns `0`; in-memory returns the real counter).
-    /// 2. Shared-lock read the cache; if `entry.revision == current &&
-    ///    current != 0`, return `Arc::clone(&entry.graph)`.  This is
-    ///    the O(1) hot path.
-    ///
-    /// # The miss path
-    ///
-    /// Under exclusive lock: re-check the entry (a concurrent writer
-    /// may have already rebuilt), otherwise `store.list()`, filter
-    /// by `zone_of(key) == zone`, `decode()` each, hand the vec to
-    /// `ReBACGraph::from_tuples`, wrap in `Arc`, and — only if
-    /// `current != 0` — insert into the cache.  Return the fresh
-    /// `Arc`.
-    ///
-    /// # Error propagation
-    ///
-    /// Backend errors from `store.zone_revision` / `store.list`
-    /// bubble as `ReBACTupleStoreError::Backend`.  The enforcer
-    /// treats these as fail-closed (deny the permission) — the same
-    /// posture as an auth-store read failure denying auth.
+    /// Return a graph from the locally applied tuple snapshot. A concurrent
+    /// apply can invalidate this request's graph; it is never labelled with a
+    /// revision newer than the snapshot used to build it.
     pub fn graph_for_zone(&self, zone: &str) -> Result<Arc<ReBACGraph>, ReBACTupleStoreError> {
-        let current_rev = self.store.zone_revision(zone)?;
-
-        // Fast path: shared lock, exact revision match, non-sentinel.
-        // The `!= ZONE_REV_ALWAYS_STALE` guard is what makes the
-        // raft-backed store (which returns 0) skip this branch and
-        // fall through to a rebuild.
-        if current_rev != ZONE_REV_ALWAYS_STALE {
-            let zones = self.zones.read();
-            if let Some(entry) = zones.get(zone) {
-                if entry.revision == current_rev {
+        let revision = self.store.revision()?;
+        if revision != REV_ALWAYS_STALE {
+            if let Some(entry) = self.zones.read().get(zone) {
+                if entry.revision == revision {
                     return Ok(Arc::clone(&entry.graph));
                 }
             }
         }
-
-        // Miss / sentinel path: rebuild.  Re-check inside the write
-        // lock to collapse a rebuild stampede (N concurrent misses
-        // → one rebuild, N-1 late arrivals observe the fresh entry
-        // and short-circuit).
-        let mut zones = self.zones.write();
-        if current_rev != ZONE_REV_ALWAYS_STALE {
-            if let Some(entry) = zones.get(zone) {
-                if entry.revision == current_rev {
-                    return Ok(Arc::clone(&entry.graph));
-                }
-            }
-        }
-
         let graph = Arc::new(build_graph_for_zone(self.store.as_ref(), zone)?);
-
-        // Skip cache-write under the sentinel — every call rebuilds,
-        // matches the raft-store fail-safe posture.
-        if current_rev != ZONE_REV_ALWAYS_STALE {
-            zones.insert(
-                zone.to_string(),
+        if revision != REV_ALWAYS_STALE && self.store.revision()? == revision {
+            self.zones.write().insert(
+                zone.to_owned(),
                 ZoneEntry {
-                    revision: current_rev,
+                    revision,
                     graph: Arc::clone(&graph),
                 },
             );
         }
-
         Ok(graph)
     }
 
@@ -175,7 +114,7 @@ impl ReBACGraphCache {
     /// Two callers today: (a) test cleanup, (b) an admin tool that
     /// mutated tuples through a side channel and wants to force a
     /// rebuild.  Real writes through the store's `put` / `delete`
-    /// bump `zone_revision` and are picked up naturally by the
+    /// bump `revision` and are picked up naturally by the
     /// steady-state path — this method is the escape hatch, not
     /// the norm.
     pub fn invalidate(&self, zone: &str) {
@@ -186,11 +125,7 @@ impl ReBACGraphCache {
 /// Walk `store.list()`, keep entries whose zone-prefix matches
 /// `zone`, decode each into a `ReBACTuple`, and build the graph.
 ///
-/// Kept as a free fn so `graph_for_zone` doesn't hold the write
-/// lock across `store.list()` (which for the raft-backed store
-/// bridges an async future and can block briefly under contention).
-/// A refactor that inlines this back into `graph_for_zone` MUST
-/// preserve the "no store I/O under the write lock" property.
+/// Called without a cache lock: a store read may wait on the Raft state machine.
 fn build_graph_for_zone(
     store: &dyn ReBACTupleStore,
     zone: &str,
@@ -367,11 +302,11 @@ mod tests {
         );
     }
 
-    /// The `zone_revision == 0` sentinel path (matches the raft-
+    /// The `revision == 0` sentinel path (matches the raft-
     /// backed store's fail-safe posture).  A store that always
     /// returns 0 must never see cache hits — every call rebuilds.
     #[test]
-    fn zone_revision_zero_sentinel_bypasses_cache() {
+    fn revision_zero_sentinel_bypasses_cache() {
         // Custom store that always returns 0 for the revision but
         // is otherwise a real InMemory backend.
         struct AlwaysStale(InMemoryReBACTupleStore);
@@ -388,7 +323,7 @@ mod tests {
             fn list(&self) -> Result<Vec<(String, Vec<u8>)>, ReBACTupleStoreError> {
                 self.0.list()
             }
-            // Deliberately does NOT override zone_revision — the
+            // Deliberately does NOT override revision — the
             // trait default is `Ok(0)`, which is the fail-safe
             // sentinel this test exercises.
         }
@@ -402,7 +337,7 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&g1, &g2),
             "sentinel (revision=0) MUST rebuild every call — cache hit here \
-             would mean the raft-backed store silently serves stale grants",
+             would mean an unversioned store silently serves stale grants",
         );
     }
 

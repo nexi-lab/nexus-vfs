@@ -1,72 +1,10 @@
-//! `RebacPermissionProvider` — the enforcer facade.
+//! Kernel permission provider over per-zone relationship graphs. System and
+//! administrator contexts bypass graph checks. Other callers need a matching
+//! direct or userset grant; missing grants and store failures deny access.
 //!
-//! Impls `kernel::PermissionProvider` on top of the
-//! [`crate::ReBACGraphCache`] + a permission-to-relation map.
-//! Composes into the kernel's ONE `Arc<Box<dyn PermissionProvider>>`
-//! slot at the composition root (see PR 4b — the nexusd wire).
-//!
-//! # v1 scope — direct + userset relations, no namespace-config
-//!
-//! The upstream `lib::rebac::compute_permission` takes a namespace
-//! registry (`AHashMap<String, NamespaceConfig>`) that maps
-//! namespace-level permissions to relations (e.g.
-//! `doc.reader = union(reader, owner)`).  An empty registry
-//! collapses to the direct-relation + userset-expansion fallback
-//! path — sufficient for v1 (matches the "starter tuples" plane the
-//! /v2/rebac HTTP router in PR 5 will ship for grant/revoke).
-//! Namespace-config loading lands in a follow-up when the Python
-//! side's YAML config is ported.
-//!
-//! # Permission → relation mapping
-//!
-//! The kernel's `Permission::{Read, Write, Traverse}` are enum
-//! variants; ReBAC tuples name string relations.  Without a
-//! namespace registry to expand, this impl tries a fixed set of
-//! candidate relations for each `Permission` — a caller with ANY
-//! of them wins:
-//!
-//! | Permission | Candidate relations                     |
-//! |------------|-----------------------------------------|
-//! | Read       | `viewer`, `reader`, `writer`, `owner`   |
-//! | Write      | `writer`, `owner`                       |
-//! | Traverse   | `viewer`, `reader`, `writer`, `owner`   |
-//!
-//! Rationale: matches the Zanzibar convention that a stronger
-//! relation implies the weaker one.  A future namespace-config
-//! import wires the exact expansion; today's fixed set covers
-//! every check the HTTP router in PR 5 exercises.
-//!
-//! # Short-circuits (fail-open, then fail-closed)
-//!
-//! Two short-circuits at the top of `check`:
-//!
-//!   1. `ctx.is_system == true` → allow.  Matches the kernel's
-//!      Linux-`struct cred` posture: kernel-internal system ops
-//!      bypass the enforcer (background reconciliation, boot-time
-//!      metadata population).
-//!
-//!   2. `ctx.is_admin == true` → allow.  Admin capabilities are
-//!      granted upstream (auth-key mint carries admin=true); the
-//!      enforcer treats them as a break-glass.
-//!
-//! Everything else falls through to the graph walk — a
-//! store-read failure DENIES (fail-closed), and an absent grant
-//! DENIES (default deny).
-//!
-//! # Hot-path cost
-//!
-//! Every syscall on a gate-armed profile hits `check`; the budget
-//! is hundreds of nanoseconds.  Under steady state:
-//!
-//!   * `zone_revision` — one branch-free read (raft: 0 → sentinel;
-//!     in-mem: one lock-free counter).
-//!   * `graph_for_zone` — shared-lock read + `Arc::clone`.
-//!   * `check_direct_relation` — one `AHashSet::contains`.
-//!
-//! The three-candidate loop for `Read` / `Traverse` costs 3× the
-//! contains-lookup (cheap).  Under the sentinel path (raft store),
-//! the O(N) rebuild fires per call — amortised by the caller's
-//! upstream `PermissionLeaseCache`.
+//! Read and traverse accept viewer, reader, writer, or owner. Write accepts
+//! writer or owner. An optional namespace registry defines richer expansions.
+//! Graphs are refreshed from the locally applied store revision.
 
 use std::sync::Arc;
 
@@ -525,7 +463,7 @@ mod tests {
             fn list(&self) -> Result<Vec<(String, Vec<u8>)>, ReBACTupleStoreError> {
                 Err(ReBACTupleStoreError::Backend("backend unavailable".into()))
             }
-            fn zone_revision(&self, _z: &str) -> Result<u64, ReBACTupleStoreError> {
+            fn revision(&self) -> Result<u64, ReBACTupleStoreError> {
                 Ok(0)
             }
         }

@@ -1,40 +1,5 @@
-//! The `ReBACTupleStore` HAL trait — the seam every callable ReBAC
-//! surface (enforcer, HTTP grant router, kernel `PermissionProvider`
-//! impl) reads from.
-//!
-//! # Why a trait, not a concrete
-//!
-//! Three impls at different tiers:
-//!
-//!   * [`NoopReBACTupleStore`] — the fail-closed default installed at
-//!     boot, before the raft-backed store exists (matches the
-//!     `NoopAuthKeyStore` posture upstream).
-//!   * [`crate::inmem::InMemoryReBACTupleStore`] — test double + dev
-//!     backend when no cluster is configured.
-//!   * `RaftReBACTupleStore` (PR-2, not in this crate yet) — the
-//!     production impl, a thin wrapper over
-//!     `raft::ControlStateStore` with namespace `"rebac"`.
-//!
-//! Callers hold `Arc<dyn ReBACTupleStore>` and never name a concrete —
-//! same DI shape as `kernel::hal::auth_key_store::AuthKeyStore`
-//! upstream.
-//!
-//! # Values are opaque bytes
-//!
-//! The store never interprets the value; the enforcer owns the
-//! schema (Zanzibar tuple bytes today; a namespace-config blob or
-//! zone-revision counter tomorrow — one store surface, many
-//! callers).  Matches the `AuthKeyStore` "values are opaque"
-//! rationale — keeps the store generic across ReBAC record kinds.
-//!
-//! # Sync by design
-//!
-//! Every caller (the enforcer running in the kernel `PermissionProvider`
-//! slot; the http-api handlers under `axum::extract::State`) reaches
-//! this on the syscall / request hot path.  Async would force a
-//! `runtime.spawn` on every check — the impl bridges to any async
-//! backend internally (raft's `propose` becomes a `block_on_via`
-//! inside `RaftReBACTupleStore`).
+//! Synchronous tuple-store contract shared by authorization management and
+//! enforcement. Async entry points call blocking store operations off-executor.
 
 use std::error::Error;
 use std::fmt;
@@ -63,38 +28,16 @@ pub enum ReBACTupleStoreError {
 impl ReBACTupleStoreError {
     /// Wrap any error into the single `Backend` variant.  Used by
     /// impls that adapt a foreign error type (raft errors, redb
-    /// errors, sqlx errors in the deprecated PG path).
+    /// errors).
     pub fn backend<E: Error + Send + Sync + 'static>(err: E) -> Self {
         ReBACTupleStoreError::Backend(err.to_string())
     }
 }
 
-/// The kernel-adjacent store of Zanzibar tuples.
-///
-/// # Contract
-///
-/// * `put` is idempotent — writing the same `(key, value)` twice
-///   MUST NOT double-count.  Impls that back a log-ordered raft
-///   proposal accept this by convention (a repeated put commits
-///   as a single revision bump; see [`Self::zone_revision`]).
-///
-/// * `delete` is idempotent — deleting a missing key returns
-///   `Ok(false)`, not an error.  Callers `assert!(returned || not_
-///   present)`, they don't retry on false.
-///
-/// * `list` returns the FULL snapshot for the current namespace —
-///   there is no pagination.  Real deployments cap ReBAC tuples at
-///   O(100k) per zone (matches the Python Tiger/Leopard-cached
-///   design point); a full-scan is O(ms) and rebuilds the
-///   in-memory graph cache in one shot.
-///
-/// * `zone_revision(zone)` is a monotonic counter the enforcer
-///   uses as a cache-freshness key: on `put`/`delete` for a given
-///   zone the counter bumps; readers that saw revision N can skip
-///   the full-scan rebuild as long as the current revision is
-///   still N.  A store that cannot cheaply track this returns
-///   `0` (equivalent to "always stale — always rebuild") — safe,
-///   just slower.
+/// Durable authorization tuples. Writes are idempotent. Successful writes are
+/// visible to subsequent local reads, including writes forwarded by followers.
+/// Reads observe locally applied state; replication lag can exist on peers.
+/// `list` returns a consistent snapshot of this namespace.
 pub trait ReBACTupleStore: Send + Sync {
     /// Write `value` at `key`.  Idempotent — same-value writes
     /// are no-ops at the storage layer, though they may bump the
@@ -116,14 +59,11 @@ pub trait ReBACTupleStore: Send + Sync {
     /// see the trait doc for the size-budget rationale.
     fn list(&self) -> Result<Vec<(String, Vec<u8>)>, ReBACTupleStoreError>;
 
-    /// Monotonic per-zone revision counter — the cache-freshness
-    /// key the enforcer's graph cache reads to decide whether it
-    /// can skip the full-scan rebuild.
-    ///
-    /// An impl that cannot cheaply track this returns `0` (always-
-    /// stale — safe but slower).  The default here is `0`, so a
-    /// minimal impl only needs to implement the 4 CRUD methods.
-    fn zone_revision(&self, _zone: &str) -> Result<u64, ReBACTupleStoreError> {
+    /// Revision of the entire locally applied store. Cache entries can be reused
+    /// only while this value matches. It changes after put/delete and snapshot
+    /// restore; zero means revisions are unavailable and caching must be bypassed.
+    /// The revision is derived state and must not be separately persisted.
+    fn revision(&self) -> Result<u64, ReBACTupleStoreError> {
         Ok(0)
     }
 }
@@ -209,7 +149,7 @@ mod tests {
         // 0 = "always stale" = safe fail-closed default for the
         // freshness key.  Real impls override.
         let s = NoopReBACTupleStore;
-        assert_eq!(s.zone_revision("root").expect("revision ok"), 0);
+        assert_eq!(s.revision().expect("revision ok"), 0);
     }
 
     #[test]
