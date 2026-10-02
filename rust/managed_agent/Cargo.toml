@@ -12,11 +12,8 @@ path = "src/lib.rs"
 
 [features]
 default = []
-# The raw ACP-subprocess control-plane spawner (raw_spawn.rs) — spawn an
-# external agent binary (scode / claude / codex) and tunnel its stdio over
-# node-local DT_STREAMs. Unix-only at the mod gate; pulls the shared
-# `subprocess` substrate. In-process co-host (SpawnTask<Kernel>) is a
-# separate DI seam wired at the binary edge, NOT a feature here.
+# Host a subprocess and translate its private ACP stdio into session envelopes.
+# In-process hosts implement the same mailbox contract through SpawnTask.
 subprocess-host = ["dep:subprocess"]
 
 [dependencies]
@@ -28,12 +25,9 @@ dashmap = "6.1"
 uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
 # raw_spawn's SpawnHandle holds a parking_lot::Mutex over the cancel channel
-# (sync lock in an async supervisor). Unix-only path (subprocess-host).
+# (sync lock in an async supervisor).
 parking_lot = "0.12"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 subprocess = { path = "../subprocess", optional = true }
-# a2a owns the mailbox contract (envelope schema + `ensure_mailbox_stream`, the
-# SSOT for provisioning a message DT_STREAM). managed_agent is the lifecycle
-# owner that CALLS it to provision the per-pid pipe and the agent's presence
-# streams. No cycle: a2a depends only on kernel + contracts.
+# Shared authenticated conversation framing and presence provisioning.
 a2a = { workspace = true }

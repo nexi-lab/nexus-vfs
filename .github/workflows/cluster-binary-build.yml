@@ -57,12 +57,11 @@ jobs:
             bin: nexusd-cluster
             binary: nexusd-cluster
             target: x86_64-apple-darwin
-            max_size_bytes: 16515072  # 15.75 MiB — raised from 14.75 for the
-                                      # ServiceBootCtx `api_key_secret` widen (#261;
-                                      # downstream HTTP mint plumbing for nexus
-                                      # `/v2/auth/keys` POST).  Measured 15,896,728
-                                      # bytes here (the tightest-headroom platform);
-                                      # leaves ~600 KB headroom.
+            max_size_bytes: 16777216  # 16 MiB. The ACP mailbox codec and private
+                                      # subprocess adapter in #380 produce
+                                      # 16,541,736 bytes on macOS Intel, 26,664
+                                      # bytes over the previous 15.75 MiB cap.
+                                      # Other platform budgets are unchanged.
           - os: windows-latest
             artifact_name: nexusd-cluster-windows-x86_64
             package: nexus-cluster

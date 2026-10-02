@@ -6,9 +6,12 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 
 struct Provider;
-struct Handle(String);
+struct Handle(String, Option<a2a::session::SessionEndpoint>);
 impl SpawnHandle for Handle {
     fn abort(&self) {}
+    fn session_endpoint(&self) -> Option<&a2a::session::SessionEndpoint> {
+        self.1.as_ref()
+    }
     fn durable_session_id(&self) -> Option<&str> {
         Some(&self.0)
     }
@@ -20,7 +23,7 @@ impl SpawnTask<Kernel> for Provider {
         _: AgentDescriptor,
         _: Arc<dyn Fn(AgentState, Option<String>) + Send + Sync>,
     ) -> Result<Box<dyn SpawnHandle>, String> {
-        Ok(Box::new(Handle("durable-test-session".into())))
+        Ok(Box::new(Handle("durable-test-session".into(), None)))
     }
     fn spawn_with_options(
         &self,
@@ -29,10 +32,13 @@ impl SpawnTask<Kernel> for Provider {
         options: SpawnOptions,
         observer: Arc<dyn Fn(AgentState, Option<String>) + Send + Sync>,
     ) -> Result<Box<dyn SpawnHandle>, String> {
-        match options.resume_session_id {
-            Some(id) => Ok(Box::new(Handle(id))),
-            None => self.spawn(kernel, desc, observer),
-        }
+        let _ = (kernel, desc, observer);
+        Ok(Box::new(Handle(
+            options
+                .resume_session_id
+                .unwrap_or_else(|| "durable-test-session".into()),
+            options.session_endpoint,
+        )))
     }
 }
 struct LegacyProvider;
@@ -43,11 +49,11 @@ impl SpawnTask<Kernel> for LegacyProvider {
         _: AgentDescriptor,
         _: Arc<dyn Fn(AgentState, Option<String>) + Send + Sync>,
     ) -> Result<Box<dyn SpawnHandle>, String> {
-        Ok(Box::new(Handle("legacy-session".into())))
+        Ok(Box::new(Handle("legacy-session".into(), None)))
     }
 }
 fn call(kernel: &Kernel, method: &str, payload: Value) -> Result<Value, String> {
-    let context = OperationContext::new("operator", "root", true, None, true);
+    let context = OperationContext::new("operator", "root", true, Some("operator"), true);
     let bytes = kernel
         .dispatch_rust_call(
             "managed_agent",
@@ -93,7 +99,11 @@ fn durable_identity_survives_a_new_pid_without_changing_get_and_cancel() {
 fn providers_without_recovery_reject_it_instead_of_starting_fresh() {
     let kernel = Arc::new(Kernel::new());
     install_managed_agent_with_spawn(&kernel, Arc::new(LegacyProvider)).unwrap();
-    assert!(call(&kernel, "start_session_v1", json!({"agent_id":"legacy"})).is_ok());
+    assert!(
+        call(&kernel, "start_session_v1", json!({"agent_id":"legacy"}))
+            .unwrap_err()
+            .contains("does not support acp-mailbox/1")
+    );
     let error = call(
         &kernel,
         "start_session_v1",

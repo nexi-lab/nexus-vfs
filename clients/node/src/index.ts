@@ -15,6 +15,9 @@
 
 import { readFileSync } from 'node:fs'
 
+export { SESSION_PROTOCOL, SessionCodec, NexusSessionTransport } from './session.js'
+export type { NexusSessionEndpoint, SessionRpcMessage, NexusSessionTransportOptions } from './session.js'
+
 import * as grpc from '@grpc/grpc-js'
 import * as protoLoader from '@grpc/proto-loader'
 import protobuf from 'protobufjs'
