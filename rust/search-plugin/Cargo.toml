@@ -27,7 +27,7 @@ semantic = ["dep:fastembed", "dep:ort"]
 [dependencies]
 # Plugin ABI — stable C ABI contract for dylib plugins.  The
 # `declare_service_plugin!` macro + KernelHandle live here.
-nexus-plugin-abi = { workspace = true }
+nexus-plugin-abi = { workspace = true, features = ["tonic"] }
 
 # Shared tonic `Channel`-per-peer cache — the SSOT for cross-daemon
 # dial semantics (TLS opt-in, plaintext-off-loopback refusal,

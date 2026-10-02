@@ -2119,15 +2119,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         daemon_version_string(),
     );
 
-    // Merge plugin-exposed gRPC services onto the same Routes.  Each
-    // service-plugin that exported the optional
-    // `nexus_plugin_grpc_services` ABI symbol gets one URL prefix per
-    // declared service; the proxy authenticates the caller (same auth
-    // provider + boot gate as the VFS face) and hands the resolved
-    // context plus raw proto bytes to the plugin's
-    // `nexus_service_dispatch_v2`.
-    // Plugins without the opt-in symbol are unaffected — they keep
-    // routing through the legacy Call RPC + ServiceRegistry path.
+    // Plugin gRPC shares the daemon listener and live peer trust roots.
     let plugin_endpoints = kernel.plugin_grpc_endpoints();
     if !plugin_endpoints.is_empty() {
         tracing::info!(
@@ -2138,8 +2130,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     let vfs_routes = transport::grpc_plugin_proxy::extend_routes_with_plugin_endpoints(
         vfs_routes,
         plugin_endpoints,
-        Arc::clone(&vfs_auth),
-        Arc::clone(&data_plane_ready),
+        Arc::clone(&fca_verifier_slot),
     );
 
     // Typed Zone runtime service (ZoneRuntimeService) — same port, same auth
@@ -3901,6 +3892,16 @@ const JOINER_DISCOVERY_BUDGET: Duration = Duration::from_secs(60);
 /// / an etcd-style client — not a busy spin.
 const JOINER_DISCOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
+/// How long a joiner waits for its PARENT zone to elect before proposing the
+/// declared mounts into it.
+///
+/// A raft election is campaign + votes + a term — tens to hundreds of
+/// milliseconds on a reachable quorum — so this is generous by two orders of
+/// magnitude and still finite. Flat on purpose: unlike log replay, an election
+/// does not take longer because the cluster has been busy, so a timeout here is
+/// evidence about reachability rather than about size.
+const PARENT_ZONE_ELECTION_BUDGET: Duration = Duration::from_secs(30);
+
 /// Re-derive this joiner's federation topology from its peers and (re)wire it,
 /// idempotently.  Returns the number of zones reconciled (0 when no peer
 /// reported any topology — e.g. all peers unreachable at boot, or `peers`
@@ -4122,6 +4123,36 @@ async fn join_zones_for_boot(
         .await
         .map_err(|e| anyhow::anyhow!("boot joiner join task panicked ({zone_id}): {}", e))?
         .map_err(|e| anyhow::anyhow!("bootstrap_or_join_zone({zone_id}): {}", e))?;
+    }
+
+    // Mounts are raft PROPOSALS into the parent zone, so they need a leader to
+    // propose to. On a fresh boot the parent is newly bootstrapped and is leader
+    // immediately, which is why this never showed up there; on a RESTART the
+    // parent resumes from its persisted ConfState and has to re-elect, and a
+    // proposal issued inside that window fails with `not leader, leader hint:
+    // None`.
+    //
+    // That failure used to be fatal here, one `?` per mount — so a restarting
+    // joiner hard-exited, and because the loop is sequential and mounting is
+    // idempotent, each restart got exactly one more mount in. A Mac joining a
+    // Windows founder took FIVE boots: died on /agents, then /conversations,
+    // then /sessions, then succeeded.
+    //
+    // Gating on leadership asks up front what the proposal was asking
+    // implicitly. The budget is flat because an election is bounded work, and a
+    // parent zone that cannot elect inside it is a real failure worth reporting
+    // as one.
+    if !zm
+        .registry()
+        .wait_for_zone_leader(&parent_zone, PARENT_ZONE_ELECTION_BUDGET)
+    {
+        anyhow::bail!(
+            "parent zone '{parent_zone}' elected no leader within \
+             {PARENT_ZONE_ELECTION_BUDGET:?}, so the declared mounts ({}) have nothing to \
+             propose to. The zone is resident but leaderless — check peer reachability and \
+             quorum for it.",
+            mounts.len(),
+        );
     }
 
     for (local_path, zone_id) in &mounts {

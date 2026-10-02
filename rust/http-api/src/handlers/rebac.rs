@@ -33,13 +33,11 @@
 //!
 //! # Auth
 //!
-//! Slotted under the same bearer sub-router as `/v2/search/*` +
-//! `/v2/documents/*` (see [`crate::router`]).  Any authenticated
-//! caller can grant / revoke — grant-authority is not further
-//! gated here.  A later revision may enforce
-//! `is_admin OR (grant delegates)` at this layer; today the tuples
-//! are cluster-wide-trusted (control-plane consensus, not user
-//! data).
+//! Every operation requires a global admin resolved by the shared bearer
+//! middleware. A valid zone credential may use its grants but cannot create,
+//! revoke, or enumerate authorization tuples. The [`Admin`] extractor is
+//! shared with credential management so both control surfaces enforce the
+//! same authority before accessing the store.
 //!
 //! # Wire shape
 //!
@@ -62,6 +60,7 @@ use lib::types::ReBACTuple;
 use nexus_rebac::{tuple_key, ReBACTupleStoreError};
 use serde::{Deserialize, Serialize};
 
+use crate::middleware::auth::Admin;
 use crate::AppState;
 
 // ── error surface ────────────────────────────────────────────────
@@ -192,6 +191,7 @@ pub struct GrantResponse {}
 /// a malformed key).
 pub async fn grant(
     State(state): State<AppState>,
+    _admin: Admin,
     Json(body): Json<TupleBody>,
 ) -> Result<Json<GrantResponse>, RebacError> {
     let store = Arc::clone(&state.rebac_store);
@@ -225,6 +225,7 @@ pub struct RevokeResponse {
 /// Handler for `DELETE /v2/rebac/tuples` — revoke a tuple.
 pub async fn revoke(
     State(state): State<AppState>,
+    _admin: Admin,
     Json(body): Json<TupleBody>,
 ) -> Result<Json<RevokeResponse>, RebacError> {
     let store = Arc::clone(&state.rebac_store);
@@ -263,6 +264,7 @@ pub struct ListResponse {
 /// the store does not wedge the whole listing.
 pub async fn list(
     State(state): State<AppState>,
+    _admin: Admin,
     Query(params): Query<ListQuery>,
 ) -> Result<Json<ListResponse>, RebacError> {
     if params.zone.is_empty() {

@@ -5,19 +5,14 @@
 //! [`transport::grpc_plugin_proxy::extend_routes_with_plugin_endpoints`]
 //! → an **external** tonic client makes a real gRPC unary call →
 //! the request bytes survive HTTP/2 framing, gRPC wire framing, the
-//! tower router, the boot gate + token authentication, and the plugin's
-//! bytes-level dispatcher; the response bytes survive the reverse trip
-//! with `grpc-status: 0` trailers.
+//! tower router, and the plugin's bytes-level dispatcher; the
+//! response bytes survive the reverse trip with `grpc-status: 0`
+//! trailers.
 //!
 //! Catches the Discovery (1) regression: before Phase P, the cluster
 //! tonic server was built from `transport::grpc::build_vfs_routes`
 //! alone and returned `UNIMPLEMENTED` for plugin services because
 //! nothing wired them into `Routes`.
-//!
-//! Catches the auth regression: before the proxy authenticated, any
-//! network client reached the plugin unauthenticated — silently
-//! bypassing the v7 "authorize by caller credentials" contract for any
-//! plugin relying on it.
 //!
 //! The dlopen + signature-verify side of the plugin path is already
 //! covered by `kernel::plugins::loader` unit tests; reproducing it
@@ -28,14 +23,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use contracts::rust_service::{RustCallError, RustService};
-use kernel::kernel::{OperationContext, PluginGrpcEndpoint};
+use kernel::kernel::PluginGrpcEndpoint;
+use nexus_plugin_abi::grpc::{GrpcContext, GrpcError, GrpcService};
 use prost::Message as _;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Endpoint, Server};
 use tonic::Request;
-use transport::auth::{AuthCredentials, AuthProvider, NoAuth};
-use transport::grpc::DataPlaneReady;
 use transport::grpc_plugin_proxy::extend_routes_with_plugin_endpoints;
 
 /// Single-field bytes message — the wire shape is one byte tag (0x0a)
@@ -55,116 +48,59 @@ struct EchoMsg {
 /// stripped by the proxy).  Returns proto-encoded response bytes.
 struct EchoDispatcher;
 
-impl RustService for EchoDispatcher {
-    fn name(&self) -> &str {
-        "echo-test"
-    }
-
-    fn dispatch(
-        &self,
-        method: &str,
-        payload: &[u8],
-        _ctx: &contracts::OperationContext,
-    ) -> Result<Vec<u8>, RustCallError> {
+impl GrpcService for EchoDispatcher {
+    fn call(&self, method: &str, payload: &[u8], ctx: &GrpcContext) -> Result<Vec<u8>, GrpcError> {
         assert!(
             method.starts_with("/echo.v1.EchoService/"),
             "proxy must hand the full URL path to plugin dispatch, got {method:?}",
         );
+        assert!(
+            !ctx.peer.is_cluster_node,
+            "headers must not manufacture node provenance"
+        );
+        if method.ends_with("/Reject") {
+            return Err(GrpcError {
+                code: 16,
+                message: "refused 100% / \u{96ea}".into(),
+            });
+        }
         assert!(method.ends_with("/Echo"), "got {method:?}");
-        let req = EchoMsg::decode(payload)
-            .map_err(|e| RustCallError::InvalidArgument(format!("decode EchoRequest: {e}")))?;
+        let tags: Vec<_> = ctx
+            .headers
+            .iter()
+            .filter(|(name, _)| name == "x-tag")
+            .map(|(_, value)| value.as_slice())
+            .collect();
+        assert_eq!(tags, [b"first".as_slice(), b"second".as_slice()]);
+        let mut headers = http::HeaderMap::new();
+        for (name, value) in &ctx.headers {
+            headers.append(
+                http::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                http::HeaderValue::from_bytes(value).unwrap(),
+            );
+        }
+        let metadata = tonic::metadata::MetadataMap::from_headers(headers);
+        assert_eq!(
+            metadata
+                .get_bin("x-bytes-bin")
+                .unwrap()
+                .to_bytes()
+                .unwrap()
+                .as_ref(),
+            &[0, 255, 10]
+        );
+        let req = EchoMsg::decode(payload).map_err(|e| GrpcError {
+            code: 3,
+            message: format!("decode EchoRequest: {e}"),
+        })?;
         let resp = EchoMsg { data: req.data };
         let mut buf = Vec::with_capacity(resp.encoded_len());
-        resp.encode(&mut buf)
-            .map_err(|e| RustCallError::Internal(format!("encode EchoResponse: {e}")))?;
+        resp.encode(&mut buf).map_err(|e| GrpcError {
+            code: 13,
+            message: format!("encode EchoResponse: {e}"),
+        })?;
         Ok(buf)
     }
-}
-
-struct DeniedDispatcher;
-
-impl RustService for DeniedDispatcher {
-    fn name(&self) -> &str {
-        "denied-test"
-    }
-
-    fn dispatch(
-        &self,
-        _method: &str,
-        _payload: &[u8],
-        _ctx: &OperationContext,
-    ) -> Result<Vec<u8>, RustCallError> {
-        Err(RustCallError::PermissionDenied(
-            "denied by test policy".to_string(),
-        ))
-    }
-}
-
-/// Captures the caller context the proxy hands to the plugin (v7): the
-/// dispatcher echoes the resolved user id back in the response payload
-/// so the test can assert the AUTHENTICATED context (not a stub) is
-/// what reached the plugin.
-struct CtxCapturingDispatcher;
-
-impl RustService for CtxCapturingDispatcher {
-    fn name(&self) -> &str {
-        "ctx-test"
-    }
-
-    fn dispatch(
-        &self,
-        _method: &str,
-        _payload: &[u8],
-        _ctx: &OperationContext,
-    ) -> Result<Vec<u8>, RustCallError> {
-        // The no-ctx entry must NOT be used by the proxy anymore.
-        Err(RustCallError::Internal(
-            "proxy must dispatch with context".to_string(),
-        ))
-    }
-
-    fn dispatch_with_context(
-        &self,
-        ctx: &OperationContext,
-        _method: &str,
-        _payload: &[u8],
-    ) -> Result<Vec<u8>, RustCallError> {
-        let resp = EchoMsg {
-            data: format!("user={}", ctx.user_id).into_bytes(),
-        };
-        let mut buf = Vec::with_capacity(resp.encoded_len());
-        resp.encode(&mut buf)
-            .map_err(|e| RustCallError::Internal(format!("encode: {e}")))?;
-        Ok(buf)
-    }
-}
-
-/// A provider that REQUIRES the well-known test token — what the
-/// "unauthenticated caller is refused" case needs (NoAuth would admit
-/// anything, `transport::auth`'s `RejectAll` would refuse everything).
-struct FixedTokenProvider;
-
-const TEST_TOKEN: &str = "test-token-value";
-
-impl AuthProvider for FixedTokenProvider {
-    fn resolve(&self, creds: &AuthCredentials<'_>) -> Result<OperationContext, tonic::Status> {
-        if creds.token != TEST_TOKEN {
-            return Err(tonic::Status::unauthenticated("bad token"));
-        }
-        Ok(OperationContext::new(
-            "token-user",
-            "root",
-            false,
-            None,
-            false,
-        ))
-    }
-}
-
-fn ready_gate() -> Arc<DataPlaneReady> {
-    let ready = DataPlaneReady::pending();
-    ready.mark_ready();
-    ready
 }
 
 #[tokio::test]
@@ -172,23 +108,15 @@ async fn external_grpc_client_round_trips_through_plugin_proxy() {
     let _ = tracing_subscriber::fmt::try_init();
 
     // ── 1. Build Routes that mirror what the cluster does on boot ──
-    let endpoints = vec![
-        PluginGrpcEndpoint {
-            service_name: "echo.v1.EchoService".to_string(),
-            plugin_name: "echo-test".to_string(),
-            service: Arc::new(EchoDispatcher),
-        },
-        PluginGrpcEndpoint {
-            service_name: "deny.v1.DenyService".to_string(),
-            plugin_name: "denied-test".to_string(),
-            service: Arc::new(DeniedDispatcher),
-        },
-    ];
+    let endpoints = vec![PluginGrpcEndpoint {
+        service_name: "echo.v1.EchoService".to_string(),
+        plugin_name: "echo-test".to_string(),
+        service: Arc::new(EchoDispatcher),
+    }];
     let routes = extend_routes_with_plugin_endpoints(
         tonic::service::Routes::default(),
         endpoints,
-        Arc::new(NoAuth),
-        ready_gate(),
+        Arc::new(std::sync::OnceLock::new()),
     );
 
     // ── 2. Serve on an ephemeral port ──────────────────────────────
@@ -224,16 +152,23 @@ async fn external_grpc_client_round_trips_through_plugin_proxy() {
     let path: http::uri::PathAndQuery = "/echo.v1.EchoService/Echo".parse().expect("parse path");
 
     let payload = b"hello from external client".to_vec();
-    let response = grpc
-        .unary(
-            Request::new(EchoMsg {
-                data: payload.clone(),
-            }),
-            path,
-            codec,
-        )
-        .await
-        .expect("unary call");
+    let mut request = Request::new(EchoMsg {
+        data: payload.clone(),
+    });
+    request
+        .metadata_mut()
+        .append("x-tag", "first".parse().unwrap());
+    request
+        .metadata_mut()
+        .append("x-tag", "second".parse().unwrap());
+    request.metadata_mut().insert_bin(
+        "x-bytes-bin",
+        tonic::metadata::MetadataValue::from_bytes(&[0, 255, 10]),
+    );
+    request
+        .metadata_mut()
+        .insert("x-nexus-is-cluster-node", "true".parse().unwrap());
+    let response = grpc.unary(request, path, codec).await.expect("unary call");
 
     let body = response.into_inner();
     assert_eq!(
@@ -241,99 +176,17 @@ async fn external_grpc_client_round_trips_through_plugin_proxy() {
         "proto bytes must round-trip exactly through framing + plugin dispatch",
     );
 
-    let denied_path: http::uri::PathAndQuery =
-        "/deny.v1.DenyService/Deny".parse().expect("deny path");
-    let denied_codec: tonic_prost::ProstCodec<EchoMsg, EchoMsg> =
-        tonic_prost::ProstCodec::default();
-    grpc.ready().await.expect("ready for denied call");
-    let denied = grpc
+    grpc.ready().await.unwrap();
+    let error = grpc
         .unary(
             Request::new(EchoMsg { data: vec![] }),
-            denied_path,
-            denied_codec,
+            "/echo.v1.EchoService/Reject".parse().unwrap(),
+            tonic_prost::ProstCodec::<EchoMsg, EchoMsg>::default(),
         )
         .await
-        .expect_err("permission denial must reach the gRPC client");
-    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
-
-    server_handle.abort();
-}
-
-#[tokio::test]
-async fn unauthenticated_caller_is_refused_and_token_caller_reaches_plugin_with_ctx() {
-    let _ = tracing_subscriber::fmt::try_init();
-
-    let endpoints = vec![PluginGrpcEndpoint {
-        service_name: "ctx.v1.CtxService".to_string(),
-        plugin_name: "ctx-test".to_string(),
-        service: Arc::new(CtxCapturingDispatcher),
-    }];
-    let routes = extend_routes_with_plugin_endpoints(
-        tonic::service::Routes::default(),
-        endpoints,
-        Arc::new(FixedTokenProvider),
-        ready_gate(),
-    );
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind ephemeral port");
-    let addr = listener.local_addr().expect("local_addr");
-    let server_handle = tokio::spawn(async move {
-        Server::builder()
-            .add_routes(routes)
-            .serve_with_incoming(TcpListenerStream::new(listener))
-            .await
-            .expect("serve");
-    });
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let channel = Endpoint::from_shared(format!("http://{addr}"))
-        .expect("endpoint url")
-        .connect()
-        .await
-        .expect("connect");
-    let mut grpc = tonic::client::Grpc::new(channel);
-    let codec: tonic_prost::ProstCodec<EchoMsg, EchoMsg> = tonic_prost::ProstCodec::default();
-    let path: http::uri::PathAndQuery = "/ctx.v1.CtxService/Echo".parse().expect("path");
-
-    // No token ⇒ refused at the door, the plugin never sees the call.
-    grpc.ready().await.expect("ready");
-    let refused = grpc
-        .unary(
-            Request::new(EchoMsg { data: vec![] }),
-            path.clone(),
-            codec.clone(),
-        )
-        .await
-        .expect_err("caller without a token must be refused");
-    assert_eq!(
-        refused.code(),
-        tonic::Code::Unauthenticated,
-        "got: {refused:?}"
-    );
-
-    // Valid token (standard `authorization: Bearer` metadata) ⇒ the call
-    // reaches the plugin WITH the authenticated context (v7): the
-    // dispatcher echoes the resolved user id.
-    grpc.ready().await.expect("ready");
-    let mut authed = Request::new(EchoMsg { data: vec![] });
-    authed.metadata_mut().insert(
-        "authorization",
-        format!("Bearer {TEST_TOKEN}")
-            .parse()
-            .expect("authorization header value"),
-    );
-    let ok = grpc
-        .unary(authed, path, codec)
-        .await
-        .expect("token-authenticated call must reach the plugin");
-    assert_eq!(
-        String::from_utf8(ok.into_inner().data).expect("utf8"),
-        "user=token-user",
-        "the plugin must receive the AUTHENTICATED caller context",
-    );
-
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unauthenticated);
+    assert_eq!(error.message(), "refused 100% / \u{96ea}");
     server_handle.abort();
 }
 
@@ -345,9 +198,43 @@ async fn empty_endpoints_passes_routes_through_unchanged() {
     let routes = extend_routes_with_plugin_endpoints(
         tonic::service::Routes::default(),
         vec![],
-        Arc::new(NoAuth),
-        ready_gate(),
+        Arc::new(std::sync::OnceLock::new()),
     );
     // No panic on into_axum_router → routes survived.
     let _ = routes.into_axum_router();
+}
+
+#[tokio::test]
+async fn malformed_unary_frames_are_rejected_before_dispatch() {
+    use tower::Service;
+
+    struct MustNotDispatch;
+    impl GrpcService for MustNotDispatch {
+        fn call(&self, _: &str, _: &[u8], _: &GrpcContext) -> Result<Vec<u8>, GrpcError> {
+            panic!("malformed requests must not reach a plugin")
+        }
+    }
+    let endpoint = PluginGrpcEndpoint {
+        service_name: "test.Frames".into(),
+        plugin_name: "frames-test".into(),
+        service: Arc::new(MustNotDispatch),
+    };
+    let mut service = transport::grpc_plugin_proxy::PluginProxyService::new(
+        endpoint,
+        Arc::new(std::sync::OnceLock::new()),
+    );
+    for (frame, expected) in [
+        (vec![], "3"),
+        (vec![0, 0, 0, 0], "3"),
+        (vec![0, 0, 0, 0, 2, 1], "3"),
+        (vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0], "3"),
+        (vec![1, 0, 0, 0, 0], "12"),
+    ] {
+        let request = http::Request::builder()
+            .uri("/test.Frames/Call")
+            .body(axum::body::Body::from(frame))
+            .unwrap();
+        let response = service.call(request).await.unwrap();
+        assert_eq!(response.headers()["grpc-status"], expected);
+    }
 }

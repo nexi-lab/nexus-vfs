@@ -110,6 +110,12 @@ tracing-appender = "0.2"
 gethostname = "1.1"
 
 [dev-dependencies]
+nexus-plugin-abi = { workspace = true }
+nexus-search-plugin = { path = "../../search-plugin", default-features = false }
+nexus-search-common = { path = "../../search-common" }
+ed25519-dalek = "2"
+base64 = "0.22"
+axum = "0.8"
 # wire_durable_metastore tests open real redb files in a temp data dir.
 tempfile = "3"
 # The e2e harness encodes generic-`Call` JSON params (agent-trust tests),

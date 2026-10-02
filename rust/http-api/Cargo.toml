@@ -124,6 +124,9 @@ tonic-prost-build = "0.14"
 protoc-bin-vendored = "3"
 
 [dev-dependencies]
+# Exercise HTTP authorization against real credentials and committed tuples.
+raft = { workspace = true }
+tempfile = "3"
 # In-process router pathway pinning (unit tests use
 # `tower::ServiceExt::oneshot`).
 tower = { version = "0.5", features = ["util"] }

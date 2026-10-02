@@ -51,14 +51,38 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Request, State};
-use axum::http::{header, StatusCode};
+use axum::extract::{FromRequestParts, Request, State};
+use axum::http::{header, request::Parts, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
+use contracts::operation_context::OperationContext;
 use transport::auth::{AuthCredentials, AuthProvider};
 
 use crate::AppState;
+
+/// A caller allowed to administer credentials and authorization tuples.
+///
+/// Extracted after [`require_bearer`] has resolved the credential. Zone access
+/// does not confer grant authority: only the resolved context's global admin
+/// flag admits management operations. Missing identity fails closed through
+/// `Extension` rather than constructing a default context.
+pub struct Admin;
+
+impl<S: Send + Sync> FromRequestParts<S> for Admin {
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let Extension(ctx) = Extension::<OperationContext>::from_request_parts(parts, state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        if ctx.is_admin {
+            Ok(Self)
+        } else {
+            Err((StatusCode::FORBIDDEN, "admin privilege required").into_response())
+        }
+    }
+}
 
 /// Extract the bearer token from an `Authorization` header.
 ///

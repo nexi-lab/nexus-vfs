@@ -13,6 +13,7 @@ default = []
 
 [dependencies]
 contracts = { workspace = true }
+nexus-plugin-abi = { workspace = true }
 # Transport depends on kernel for the in-tree Rust API surface
 # (`Kernel`, `KernelError`, `OperationContext`, `vfs_proto` generated
 # stubs). `default-features = false` keeps the kernel runtime defaults

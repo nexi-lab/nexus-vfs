@@ -112,13 +112,29 @@ const AUTO_JOIN_REMOVAL_SUPPRESSION: Duration = Duration::from_secs(60);
 /// that materializes ON a request has no such grace, and would answer that
 /// very request out of an empty state machine.
 ///
-/// The wait is local work (replaying this node's own log), so it is short in
-/// practice; the cap exists so a wedged apply loop surfaces as a warning
-/// rather than an unbounded hang on the caller's thread.
-const RESUME_CATCHUP_BUDGET: Duration = Duration::from_secs(10);
+/// How long apply may make NO progress before the wait gives up.
+///
+/// A STALL budget, deliberately not a total one. This used to be a flat
+/// 10-second cap on the whole wait, justified by "the wait is local work, so it
+/// is short in practice" — but the work is proportional to the log, which has
+/// no bound. A founder driven for one day reached 7317 entries, a joiner
+/// applies at roughly 200/s, and 36 seconds of healthy replay was reported as a
+/// failure. Worse, the old cap then RETURNED, so the caller went on to read a
+/// state machine it had just been told was half-applied.
+///
+/// Measuring stall instead of total separates the two things a caller actually
+/// wants to tell apart: a wedged apply loop (no progress at all — still caught
+/// in ten seconds) and a long replay (progress every tick — allowed to finish,
+/// however long the log is).
+pub(crate) const RESUME_STALL_BUDGET: Duration = Duration::from_secs(10);
 
-/// Block until `consensus` has applied everything its log says is committed,
-/// or `timeout` expires (warning loudly if so).
+/// Block until `consensus` has applied everything its log says is committed.
+///
+/// Returns `true` when it caught up, `false` when apply STALLED for
+/// `stall_budget` with work still outstanding. A `false` return means the state
+/// machine is knowingly behind its own log, so a caller that is about to read
+/// the zone must treat it as a failure rather than a hint — that is the whole
+/// reason this reports rather than just warning.
 ///
 /// Shared by zone resume and by federation mount replay: both need the same
 /// "this zone's state machine is caught up with its own log" guarantee before
@@ -127,25 +143,34 @@ const RESUME_CATCHUP_BUDGET: Duration = Duration::from_secs(10);
 pub(crate) fn wait_until_caught_up(
     consensus: &ZoneConsensus<FullStateMachine>,
     zone_id: &str,
-    timeout: Duration,
-) {
-    let deadline = Instant::now() + timeout;
+    stall_budget: Duration,
+) -> bool {
+    let began = Instant::now();
+    let mut high_water = consensus.applied_index();
+    let mut last_progress = Instant::now();
     loop {
         let commit = consensus.commit_index();
         let applied = consensus.applied_index();
         if applied >= commit {
-            return;
+            return true;
         }
-        if Instant::now() >= deadline {
+        if applied > high_water {
+            // Progress resets the budget: a replay that is moving is healthy
+            // however many entries remain.
+            high_water = applied;
+            last_progress = Instant::now();
+        } else if last_progress.elapsed() >= stall_budget {
             tracing::warn!(
                 zone = %zone_id,
                 commit_index = commit,
                 applied_index = applied,
-                "zone did not catch up with its own log within {timeout:?}; reads may \
-                 observe partial state. Investigate the driver loop / state-machine \
-                 apply backpressure for this zone."
+                waited_ms = began.elapsed().as_millis() as u64,
+                "zone apply STALLED for {stall_budget:?} with {} entries outstanding; reads \
+                 would observe partial state. Investigate the driver loop / state-machine \
+                 apply backpressure for this zone.",
+                commit.saturating_sub(applied),
             );
-            return;
+            return false;
         }
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -666,7 +691,14 @@ impl ZoneRaftRegistry {
         // Restart preserves the persisted role intent (SSOT) — don't re-guess.
         let intended_role = self.persisted_intent(zone_id);
         let node = self.setup_zone(zone_id, config, peers, runtime_handle, intended_role)?;
-        wait_until_caught_up(&node, zone_id, RESUME_CATCHUP_BUDGET);
+        // Deliberately not fatal here, and deliberately not re-logged: the wait
+        // itself warns with the zone and both indices, and this path has no
+        // error variant that could carry them (`TransportError` is tier-neutral,
+        // so an apply-stall variant there would be a boundary leak). The caller
+        // that actually READS the zone acts on the signal instead — see
+        // `replay_mounts_for_zone`, where scanning a half-applied zone reports
+        // "no mounts" for a zone that has them.
+        let _caught_up = wait_until_caught_up(&node, zone_id, RESUME_STALL_BUDGET);
         Ok(node)
     }
 
@@ -1552,6 +1584,35 @@ impl ZoneRaftRegistry {
     /// shutdown and diagnostics only.
     pub fn resident_zones(&self) -> Vec<String> {
         self.zones.iter().map(|e| e.key().clone()).collect()
+    }
+
+    /// Block until `zone_id` knows who its leader is.
+    ///
+    /// Returns `false` if no leader appeared within `budget`. A FLAT budget is
+    /// right here, unlike the apply wait above: an election is bounded work
+    /// (campaign, votes, a term) and does not grow with the log, so "it has not
+    /// happened by now" really does mean something is wrong.
+    ///
+    /// Exists because a raft PROPOSAL issued before the election completes fails
+    /// with `not leader, leader hint: None`, and callers on the boot path have
+    /// nowhere to put that failure — a joiner's declared-topology mount treated
+    /// it as fatal and hard-exited, so a restart (which is when root re-elects,
+    /// where a fresh bootstrap is leader immediately) could not get its mounts
+    /// in. Gating on leadership asks the question the proposal was implicitly
+    /// asking, before an answer of "not yet" becomes an error.
+    pub fn wait_for_zone_leader(&self, zone_id: &str, budget: Duration) -> bool {
+        let deadline = Instant::now() + budget;
+        loop {
+            if let Some(node) = self.get_node(zone_id) {
+                if node.leader_id().is_some() {
+                    return true;
+                }
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// Resident zones that have no leader.
