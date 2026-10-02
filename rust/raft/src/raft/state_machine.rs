@@ -492,12 +492,20 @@ pub enum MountApplyEvent {
     /// fire time so a subsequent apply to the same key cannot race
     /// the callback into wiring the wrong target.
     ///
-    /// The event carries only ``key`` and ``target_zone_id``.
-    /// io_profile / readonly / admin_only and ``backend_name`` are
-    /// not carried — the kernel-side wire path passes a constant
-    /// label down to the router, and mount records' backend is
-    /// supplied separately by the router's mount config.
-    Set { key: String, target_zone_id: String },
+    /// ``target_subtree`` is snapshotted with it, for the same reason and
+    /// because a follower wiring this mount must translate paths the way the
+    /// writer does — a follower defaulting to the whole zone would read and
+    /// write different keys for the same path.
+    ///
+    /// io_profile / readonly / admin_only and ``backend_name`` are not carried
+    /// — the kernel-side wire path passes a constant label down to the router,
+    /// and mount records' backend is supplied separately by the router's mount
+    /// config.
+    Set {
+        key: String,
+        target_zone_id: String,
+        target_subtree: String,
+    },
     /// DT_MOUNT delete. No proto payload — the entry was removed inside
     /// the same apply txn, so callers look up the prior mount via their
     /// own reverse index (e.g. kernel ``cross_zone_mounts``) to drive
@@ -910,6 +918,54 @@ pub struct FullStateMachine {
     apply_observers: Arc<parking_lot::RwLock<Vec<ApplyObserver>>>,
 }
 
+/// What a mount POINTS AT: a zone, and which subtree of it to expose.
+///
+/// Defined here, at the layer that reads DT_MOUNT records out of the state
+/// machine, so the layers above consume it rather than restating it. A list of
+/// mounts is `(path, MountDecl)` — the path is the key it is stored under, not
+/// a fourth thing to keep in sync.
+///
+/// `subtree` is DECLARED by whoever states the topology, never derived from the
+/// mount path: `join <peer>:/<zone> <local-path>` lets two nodes mount one zone
+/// at different local paths, and deriving would make them disagree about that
+/// zone's own keys.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MountDecl {
+    /// Zone this mount points into.
+    pub zone: String,
+    /// Subtree of `zone` to expose; `"/"` for the whole zone.
+    pub subtree: String,
+}
+
+impl MountDecl {
+    /// A mount exposing the whole zone — what every mount meant before
+    /// subtrees, and what an operator-declared `--cluster-init-mount
+    /// <path>=<zone>` still means.
+    ///
+    /// `&str` rather than `impl Into<String>`: these are called from several
+    /// crates with a mix of `&str`, `String` and `&String`, and a generic
+    /// parameter monomorphizes per combination — `subtree_of` would do it
+    /// across the CROSS PRODUCT of its two. The production binary has a size
+    /// budget measured in CI, and codegen for an ergonomic conversion is not
+    /// what it should be spent on.
+    #[must_use]
+    pub fn whole_zone(zone: &str) -> Self {
+        Self {
+            zone: zone.to_string(),
+            subtree: contracts::VFS_ROOT.to_string(),
+        }
+    }
+
+    /// A mount exposing only `subtree` of the zone.
+    #[must_use]
+    pub fn subtree_of(zone: &str, subtree: &str) -> Self {
+        Self {
+            zone: zone.to_string(),
+            subtree: subtree.to_string(),
+        }
+    }
+}
+
 impl FullStateMachine {
     /// Create a new full state machine with its own advisory-lock Arc.
     ///
@@ -1049,6 +1105,11 @@ impl FullStateMachine {
                     Some(MountApplyEvent::Set {
                         key: key.clone(),
                         target_zone_id: proto.target_zone_id,
+                        // Empty is a record written before subtrees existed,
+                        // which meant the whole zone.
+                        target_subtree: crate::zone_meta_store::subtree_or_whole_zone(
+                            &proto.target_subtree,
+                        ),
                     })
                 } else if removed_mount_key == Some(key.as_str()) {
                     // Overwrite of prior DT_MOUNT with a non-mount entry
@@ -1371,7 +1432,7 @@ impl FullStateMachine {
     /// Lenient: skips entries that fail to decode or aren't DT_MOUNT
     /// or have an empty target_zone_id.
     #[cfg(feature = "grpc")]
-    pub fn iter_dt_mount_entries(&self) -> Result<Vec<(String, String)>> {
+    pub fn iter_dt_mount_entries(&self) -> Result<Vec<(String, MountDecl)>> {
         use crate::transport::proto::nexus::core::FileMetadata as ProtoFileMetadata;
         use prost::Message as ProstMessage;
 
@@ -1382,7 +1443,17 @@ impl FullStateMachine {
             };
             const DT_MOUNT: i32 = 2;
             if proto.entry_type == DT_MOUNT && !proto.target_zone_id.is_empty() {
-                result.push((key, proto.target_zone_id));
+                result.push((
+                    key,
+                    MountDecl {
+                        zone: proto.target_zone_id,
+                        // Empty is what a record written before subtrees
+                        // existed holds, and it means the whole zone.
+                        subtree: crate::zone_meta_store::subtree_or_whole_zone(
+                            &proto.target_subtree,
+                        ),
+                    },
+                ));
             }
         }
         Ok(result)
@@ -2617,9 +2688,14 @@ mod tests {
                 MountApplyEvent::Set {
                     key,
                     target_zone_id,
+                    target_subtree,
                 } => {
                     assert_eq!(key, "/mnt/peer");
                     assert_eq!(target_zone_id, "zone-b");
+                    assert_eq!(
+                        target_subtree, "/",
+                        "a mount written without a subtree exposes the whole zone"
+                    );
                 }
                 other => panic!("expected Set event, got {other:?}"),
             }

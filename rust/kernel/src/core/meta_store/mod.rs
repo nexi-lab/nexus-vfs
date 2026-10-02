@@ -124,10 +124,18 @@ fn fm_composite_key(path: &str, key: &str) -> String {
 
 /// Compact binary serialization for FileMetadata (v4).
 ///
-/// Field order: tag (u8 = 4), path, size, content_id?, version (u32),
-/// entry_type (u8), zone_id?, mime_type?, created_at_ms?,
-/// modified_at_ms?, last_writer_address?, target_zone_id?,
-/// link_target?, gen (u64), owner_id?.
+/// The field order is the order of the `write_*` calls below, and is NOT
+/// restated here: this docstring used to list it and went stale the first time
+/// a field was appended, which is the whole failure mode a prose copy of a
+/// layout has. Read the function.
+///
+/// `FileMetadata` is encoded THREE ways in this repo — here, as the prost
+/// `nexus.core.FileMetadata` proto, and as the JSON a remote `sys_stat`
+/// answers with — so a new field has to be wired in three places or it
+/// survives one hop and vanishes on another. Nothing generates them from the
+/// proto the way Python's `_metadata_mapper_generated.py` does;
+/// `every_field_survives_the_binary_encoding` is the guard that makes a
+/// missed one fail instead of silently dropping.
 ///
 /// Strings carry a u32 length prefix; `Option<_>` fields are framed by
 /// a 1-byte present flag (0 = absent, no payload; 1 = payload follows).
@@ -160,21 +168,47 @@ fn serialize_metadata(meta: &FileMetadata) -> Vec<u8> {
         }
     }
 
+    // Destructured EXHAUSTIVELY, with no `..`: a field added to `FileMetadata`
+    // is then a compile error right here instead of a value this codec quietly
+    // drops. The compiler is the only thing that can insist all three of this
+    // repo's encodings stay complete (nexi-lab/nexus-vfs#371).
+    let FileMetadata {
+        path,
+        size,
+        content_id,
+        gen,
+        version,
+        entry_type,
+        zone_id,
+        mime_type,
+        created_at_ms,
+        modified_at_ms,
+        last_writer_address,
+        target_zone_id,
+        target_subtree,
+        link_target,
+        owner_id,
+    } = meta;
+
     buf.push(4); // version tag - v4 appends gen:u64 after the v3 fields.
-    write_str(&mut buf, &meta.path);
-    buf.extend_from_slice(&meta.size.to_le_bytes());
-    write_opt_str(&mut buf, &meta.content_id);
-    buf.extend_from_slice(&meta.version.to_le_bytes());
-    buf.push(meta.entry_type);
-    write_opt_str(&mut buf, &meta.zone_id);
-    write_opt_str(&mut buf, &meta.mime_type);
-    write_opt_i64(&mut buf, meta.created_at_ms);
-    write_opt_i64(&mut buf, meta.modified_at_ms);
-    write_opt_str(&mut buf, &meta.last_writer_address);
-    write_opt_str(&mut buf, &meta.target_zone_id);
-    write_opt_str(&mut buf, &meta.link_target);
-    buf.extend_from_slice(&meta.gen.to_le_bytes());
-    write_opt_str(&mut buf, &meta.owner_id);
+    write_str(&mut buf, path);
+    buf.extend_from_slice(&size.to_le_bytes());
+    write_opt_str(&mut buf, content_id);
+    buf.extend_from_slice(&version.to_le_bytes());
+    buf.push(*entry_type);
+    write_opt_str(&mut buf, zone_id);
+    write_opt_str(&mut buf, mime_type);
+    write_opt_i64(&mut buf, *created_at_ms);
+    write_opt_i64(&mut buf, *modified_at_ms);
+    write_opt_str(&mut buf, last_writer_address);
+    write_opt_str(&mut buf, target_zone_id);
+    write_opt_str(&mut buf, link_target);
+    buf.extend_from_slice(&gen.to_le_bytes());
+    write_opt_str(&mut buf, owner_id);
+    // Appended last, like every field before it: a record written by an older
+    // build simply runs out of bytes here and reads back as None, which means
+    // "the whole zone" — the same thing every mount meant before subtrees.
+    write_opt_str(&mut buf, target_subtree);
 
     buf
 }
@@ -278,6 +312,9 @@ fn deserialize_metadata(data: &[u8]) -> Result<FileMetadata, MetaStoreError> {
         0
     };
     let owner_id = read_opt_str(data, &mut pos).ok().flatten();
+    // `.ok().flatten()` is what makes the append backward-compatible: an older
+    // record ends before this field and yields None rather than an error.
+    let target_subtree = read_opt_str(data, &mut pos).ok().flatten();
 
     Ok(FileMetadata {
         path,
@@ -291,6 +328,7 @@ fn deserialize_metadata(data: &[u8]) -> Result<FileMetadata, MetaStoreError> {
         created_at_ms,
         modified_at_ms,
         target_zone_id,
+        target_subtree,
         last_writer_address,
         link_target,
         owner_id,
@@ -794,6 +832,50 @@ impl MetaStore for LocalMetaStore {
 mod tests {
     use super::*;
 
+    /// EVERY field survives the binary encoding — the anti-drift guard.
+    ///
+    /// `FileMetadata` is encoded three ways in this repo (this positional
+    /// codec, the prost proto, and the JSON a remote `sys_stat` answers with)
+    /// and nothing generates them from one schema, the way Python's
+    /// `_metadata_mapper_generated.py` is generated. So a field added to the
+    /// struct and wired into only two of the three survives one hop and
+    /// vanishes on another, silently.
+    ///
+    /// This catches the codec below by construction rather than by a list:
+    /// the struct literal has no `..Default::default()`, so a new field makes
+    /// this test FAIL TO COMPILE until someone supplies a value, and the
+    /// whole-value comparison then fails unless the codec carries it. Giving
+    /// every field a NON-default value is what makes the comparison bite —
+    /// a `None` or `0` would round-trip through a codec that dropped it.
+    #[test]
+    fn every_field_survives_the_binary_encoding() {
+        let meta = FileMetadata {
+            path: "/a/b/c.txt".to_string(),
+            size: 4096,
+            content_id: Some("blake3-deadbeef".to_string()),
+            gen: 42,
+            version: 7,
+            entry_type: 2, // DT_MOUNT, the entry type the mount fields describe
+            zone_id: Some("sharedzone".to_string()),
+            mime_type: Some("text/plain".to_string()),
+            created_at_ms: Some(1_700_000_000_000),
+            modified_at_ms: Some(1_700_000_001_000),
+            last_writer_address: Some("100.64.0.27:2126".to_string()),
+            target_zone_id: Some("sharedzone".to_string()),
+            target_subtree: Some("/agents".to_string()),
+            link_target: Some("/conversations/9d41ae".to_string()),
+            owner_id: Some("win-ai".to_string()),
+        };
+
+        let restored = deserialize_metadata(&serialize_metadata(&meta))
+            .expect("a record this codec just wrote must decode");
+
+        assert_eq!(
+            restored, meta,
+            "a field reached the struct without reaching this codec; it would              be dropped on every local metastore write"
+        );
+    }
+
     #[test]
     fn serialize_roundtrip_preserves_gen() {
         let meta = FileMetadata {
@@ -808,6 +890,7 @@ mod tests {
             modified_at_ms: Some(20),
             last_writer_address: Some("nexus-1:2028".to_string()),
             target_zone_id: None,
+            target_subtree: None,
             link_target: None,
             gen: 42,
             owner_id: None,
@@ -834,6 +917,7 @@ mod tests {
             modified_at_ms: None,
             last_writer_address: None,
             target_zone_id: None,
+            target_subtree: None,
             link_target: None,
             gen: 99,
             owner_id: None,
@@ -862,13 +946,20 @@ mod tests {
             modified_at_ms: None,
             last_writer_address: None,
             target_zone_id: None,
+            target_subtree: None,
             link_target: None,
             gen: 7,
             owner_id: None,
         };
         let mut bytes = serialize_metadata(&meta);
-        // Remove owner_id opt-str (1 byte for None tag) + last byte of gen
-        bytes.truncate(bytes.len() - 2);
+        // Truncate INTO `gen`, which is what must error. Everything written
+        // after `gen` is a `None` opt-str costing one tag byte each, so the
+        // count is "one per trailing optional field, plus one to breach gen":
+        // target_subtree + owner_id + gen's last byte = 3. A field appended
+        // after this one makes it 4 — the decoder tolerates a short tail for
+        // opt-strs by design, so only a number that actually reaches `gen`
+        // tests anything.
+        bytes.truncate(bytes.len() - 3);
 
         let err = deserialize_metadata(&bytes).unwrap_err();
 
@@ -893,6 +984,7 @@ mod tests {
                 modified_at_ms: None,
                 last_writer_address: Some("nexus-1:2028".to_string()),
                 target_zone_id: None,
+                target_subtree: None,
                 link_target: None,
                 owner_id: None,
             },
@@ -909,6 +1001,7 @@ mod tests {
                 modified_at_ms: None,
                 last_writer_address: None,
                 target_zone_id: Some("zone-a".to_string()),
+                target_subtree: None,
                 link_target: None,
                 owner_id: None,
             },
@@ -941,6 +1034,7 @@ mod tests {
             modified_at_ms: None,
             last_writer_address: None,
             target_zone_id: None,
+            target_subtree: None,
             link_target: None,
             owner_id: None,
         }
@@ -1092,6 +1186,7 @@ mod tests {
             modified_at_ms: None,
             last_writer_address: None,
             target_zone_id: None,
+            target_subtree: None,
             link_target: None,
             owner_id: None,
         };

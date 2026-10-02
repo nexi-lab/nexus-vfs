@@ -23,16 +23,17 @@ jobs:
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
-            max_size_bytes: 18350080  # 17.5 MiB — raised from 17.0 for the typed
-                                      # ZoneRuntime plane (#364: the ZoneRuntimeService
-                                      # gRPC surface with read-back receipts, the
-                                      # blake3 idempotency journal, the replicated
-                                      # deletion-epoch registry and boot sweep, and
-                                      # the zone-wire-path admission contract — a
-                                      # whole service tier, not a step change).
-                                      # Measured 18,153,576 bytes here, ~328 KB over
-                                      # the old cap; the other three platforms moved
-                                      # by 70–200 KB for the same code.
+            max_size_bytes: 18350080  # 17.5 MiB — the max of the two raises off 17.0:
+                                      # typed ZoneRuntime plane (#364, measured
+                                      # 18,153,576 here before the mount work) and
+                                      # the declared mount subtree (#361, measured
+                                      # 17,826,128 on main: the durable subtree
+                                      # field, the three mount routes, the boot
+                                      # guard — 648 bytes already returned by
+                                      # dropping impl Into<String> from MountDecl).
+                                      # Both are permanent features stacked on the
+                                      # same binary; the cap keeps the leak-catcher
+                                      # margin (~0.5 MiB cannot hide a driver).
           - os: macos-14
             artifact_name: nexusd-cluster-macos-arm64
             package: nexus-cluster

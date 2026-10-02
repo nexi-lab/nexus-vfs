@@ -1272,7 +1272,9 @@ impl ZoneRaftRegistry {
     ///
     /// Empty is a legitimate steady state — a single-node daemon has nothing to
     /// federate — so this is never an error here, only a fact a caller may report.
-    pub async fn published_federation_mounts(&self) -> Vec<(String, String)> {
+    pub async fn published_federation_mounts(
+        &self,
+    ) -> Vec<(String, crate::raft::state_machine::MountDecl)> {
         let Some(root) = self.get_node(contracts::ROOT_ZONE_ID) else {
             return Vec::new();
         };
@@ -1280,7 +1282,9 @@ impl ZoneRaftRegistry {
             .with_state_machine(|sm: &FullStateMachine| sm.iter_dt_mount_entries())
             .await
             .unwrap_or_default();
-        mounts.sort();
+        // By path, which is the order a joiner needs: a parent mount has to be
+        // applied before anything nested under it.
+        mounts.sort_by(|a, b| a.0.cmp(&b.0));
         mounts
     }
 
