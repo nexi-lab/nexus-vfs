@@ -2009,6 +2009,19 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         vfs_routes,
         plugin_endpoints,
         Arc::clone(&fca_verifier_slot),
+        Arc::clone(&data_plane_ready),
+        |endpoint| {
+            if endpoint.service_name == transport::grpc_search_access::SERVICE_NAME {
+                Arc::new(transport::grpc_search_access::SearchGrpcPolicy::new(
+                    Arc::clone(&kernel),
+                    Arc::clone(&vfs_auth),
+                ))
+            } else {
+                Arc::new(transport::grpc_plugin_access::AuthenticatedPlugin::new(
+                    Arc::clone(&vfs_auth),
+                ))
+            }
+        },
     );
 
     let ZoneManagerBundle {

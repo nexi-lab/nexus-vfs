@@ -110,6 +110,8 @@ tracing-appender = "0.2"
 gethostname = "1.1"
 
 [dev-dependencies]
+nexus-rebac = { path = "../../rebac" }
+tokio-stream = { version = "0.1", features = ["net"] }
 nexus-plugin-abi = { workspace = true }
 nexus-search-plugin = { path = "../../search-plugin", default-features = false }
 nexus-search-common = { path = "../../search-common" }

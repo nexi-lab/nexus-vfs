@@ -46,6 +46,41 @@ pub const DELEGATION_METADATA_KEY: &str = "x-nexus-search-delegation-bin";
 /// see a policy skew mid-migration.
 pub const DEFAULT_TTL_SECONDS: u64 = 30;
 
+/// Decode the original credential only after the host has verified a local
+/// cluster-node certificate. Shared by the host policy and the plugin gate.
+#[cfg(feature = "transport")]
+pub fn from_metadata(
+    metadata: &tonic::metadata::MetadataMap,
+    is_cluster_node: bool,
+    method: &str,
+    zone: &str,
+) -> Result<Option<SearchDelegation>, tonic::Status> {
+    let mut values = metadata.get_all_bin(DELEGATION_METADATA_KEY).iter();
+    let Some(raw) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(tonic::Status::unauthenticated(
+            "multiple SearchDelegation credentials",
+        ));
+    }
+    if !is_cluster_node {
+        return Err(tonic::Status::unauthenticated(
+            "SearchDelegation requires a verified cluster node",
+        ));
+    }
+    let bytes = raw.to_bytes().map_err(|error| {
+        tonic::Status::unauthenticated(format!("invalid SearchDelegation metadata: {error}"))
+    })?;
+    let delegation: SearchDelegation = serde_json::from_slice(&bytes).map_err(|error| {
+        tonic::Status::unauthenticated(format!("SearchDelegation malformed JSON: {error}"))
+    })?;
+    delegation
+        .validate(method, zone)
+        .map_err(|error| tonic::Status::unauthenticated(error.to_string()))?;
+    Ok(Some(delegation))
+}
+
 /// A delegation issued by a trusted cluster node. Its timestamp is Unix
 /// milliseconds, comparable across processes. Receivers validate the original
 /// timestamp; receipt or replay never renews the credential.

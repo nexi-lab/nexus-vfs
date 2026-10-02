@@ -2906,7 +2906,8 @@ fn stream_mgr_err(e: crate::stream_manager::StreamManagerError) -> KernelError {
     }
 }
 
-pub(crate) fn validate_path_fast(path: &str) -> Result<(), KernelError> {
+/// Validate the VFS path syntax shared by syscalls and network access policies.
+pub fn validate_path_fast(path: &str) -> Result<(), KernelError> {
     if path.is_empty() {
         return Err(KernelError::InvalidPath("Path cannot be empty".to_string()));
     }
