@@ -639,9 +639,24 @@ impl ZoneRuntimeBackend {
                         rec.error.as_deref().unwrap_or("<no reason recorded>")
                     )))
                 }
+                // A PENDING record with the SAME request hash is a crash
+                // orphan: the previous executor died between begin and
+                // complete, and nothing replays journal PENDINGs. The
+                // resubmitter (the zone worker retrying after its own
+                // crash) takes over as the executor; hash equality proves
+                // it is the same logical operation, so exactly-once is
+                // preserved. A DIFFERENT hash under the same operation_id
+                // stays a hard conflict.
+                crate::zone_op_journal::STATUS_PENDING if rec.request_hash == hash => {
+                    tracing::warn!(
+                        operation_id,
+                        zone_id,
+                        "taking over an orphaned PENDING journal record (crash between begin and complete)"
+                    );
+                    Ok(None)
+                }
                 _ => Err(ZoneRuntimeError::Conflict(format!(
-                    "operation_id '{}' is still PENDING — poll GetZoneOperation or retry \
-                     with a fresh operation_id",
+                    "operation_id '{}' is still PENDING with a different request hash, retry \n                     with a fresh operation_id",
                     operation_id
                 ))),
             },
