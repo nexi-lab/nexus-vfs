@@ -86,6 +86,23 @@ pub struct MountEntry {
     /// from a global path via the existing routing table.
     pub target_zone_id: Option<String>,
 
+    /// For federation mounts: WHICH SUBTREE of `target_zone_id` this mount
+    /// exposes. `None` or `"/"` is the whole zone.
+    ///
+    /// The other half of a mount's target identity, and it lives here with
+    /// `target_zone_id` because [`VFSRouter::route`] is what turns a caller
+    /// path into a zone-relative one. Several mounts of ONE zone are
+    /// indistinguishable without it: stripping the mount prefix alone maps
+    /// `/agents/win-ai` and `/conversations/win-ai` both to `win-ai`, so the
+    /// two share a location in any backend they share and a key in any
+    /// metastore keyed the same way (nexi-lab/nexus-vfs#361).
+    ///
+    /// Holding it anywhere else is how that bug survived its first fix: a
+    /// subtree known only to the per-mount metastore made metadata keys
+    /// disjoint while [`RouteResult::backend_path`] — computed here — stayed
+    /// mount-relative, so the CONTENT still collided. One rule, one owner.
+    pub target_subtree: Option<String>,
+
     /// Cached `backend.as_cas().is_some()` — CAS-vs-PAS classification
     /// is fixed at backend-set time, not per syscall. Set by
     /// [`MountEntry::new`] and refreshed by [`VFSRouter::rebind_missing_backends`]
@@ -105,6 +122,7 @@ impl MountEntry {
             metastore: None,
             is_external: false,
             target_zone_id: None,
+            target_subtree: None,
             is_cas,
         }
     }
@@ -112,6 +130,19 @@ impl MountEntry {
     /// Builder-style target-zone setter (federation mounts only).
     pub fn with_target_zone(mut self, target_zone_id: impl Into<String>) -> Self {
         self.target_zone_id = Some(target_zone_id.into());
+        self
+    }
+
+    /// Builder-style setter for the subtree of the target zone this mount
+    /// exposes. `"/"` records `None` — the whole zone — so a whole-zone mount
+    /// and a pre-subtree mount are the same thing to [`VFSRouter::route`].
+    #[must_use]
+    pub fn with_target_subtree(mut self, target_subtree: &str) -> Self {
+        self.target_subtree = if target_subtree == "/" || target_subtree.is_empty() {
+            None
+        } else {
+            Some(target_subtree.to_string())
+        };
         self
     }
 
@@ -487,16 +518,24 @@ impl VFSRouter {
     }
 
     /// Federation variant: install a mount that carries an explicit
-    /// `target_zone_id`. Routing through this mount resolves to the
-    /// target zone, not the caller's ambient one — so writes tag inode
-    /// metadata with the owning zone and `federation_share` can derive
-    /// `(parent_zone, zone-relative prefix)` from a global path.
+    /// `target_zone_id` and the subtree of it this mount exposes. Routing
+    /// through this mount resolves to the target zone, not the caller's
+    /// ambient one — so writes tag inode metadata with the owning zone and
+    /// `federation_share` can derive `(parent_zone, zone-relative prefix)`
+    /// from a global path.
+    ///
+    /// `target_subtree` takes `"/"` for the whole zone. It is a parameter here,
+    /// beside `target_zone_id`, because the two are one declaration: the caller
+    /// that knows which zone a mount points into is the caller that knows which
+    /// part of it. Splitting them let a mount be wired with a zone but no
+    /// subtree, which is the state nexi-lab/nexus-vfs#361 describes.
     pub fn add_federation_mount(
         &self,
         mount_point: &str,
         zone_id: &str,
         backend: Option<Arc<dyn ObjectStore>>,
         target_zone_id: &str,
+        target_subtree: &str,
         is_external: bool,
     ) {
         self.add(
@@ -504,7 +543,8 @@ impl VFSRouter {
             zone_id,
             MountEntry::new(backend)
                 .with_is_external(is_external)
-                .with_target_zone(target_zone_id),
+                .with_target_zone(target_zone_id)
+                .with_target_subtree(target_subtree),
         );
     }
 
@@ -806,7 +846,10 @@ impl VFSRouter {
         loop {
             if let Some(entry) = self.entries.get(current) {
                 let mount_point = current.to_string();
-                let backend_path = strip_mount_prefix(canonical, current);
+                // Subtree-anchored, so the content address and the metadata key
+                // agree for every mount of a shared zone.
+                let backend_path =
+                    zone_relative_path(canonical, current, entry.target_subtree.as_deref());
                 let is_external = entry.is_external;
                 // CAS-ness is cached at backend-set time (`MountEntry::new` /
                 // `rebind_missing_backends`); the hot path just reads.
@@ -908,36 +951,73 @@ pub fn zone_to_global(mount_point: &str, zone_path: &str) -> String {
     }
 }
 
-/// Strip a mount-point prefix from a canonical path to get the
-/// backend-relative path (without leading slash).
+/// The part of `path` that sits under `mount_point`, borrowed, no leading
+/// slash. `""` when `path` IS the mount point.
 ///
-/// **Precondition:** `mount_point` is an LPM prefix of `path` aligned on
-/// a `/` boundary (or `mount_point == path`, or `mount_point == "/"`).
-/// `VFSRouter::route_in_zone` is the only caller and enforces this by
-/// construction (its walk only inspects ancestors at `/` boundaries via
-/// `rfind('/')`), but the precondition is implicit; spelling it out as
-/// a `debug_assert!` documents the invariant and catches any future
-/// misuse (e.g. a caller passing `path="/root/data2/x"` with
-/// `mount_point="/root/data"` would otherwise silently produce
-/// `"2/x"` instead of a routing miss).
-fn strip_mount_prefix(path: &str, mount_point: &str) -> String {
+/// **Precondition:** `mount_point` is an LPM prefix of `path` aligned on a `/`
+/// boundary (or `mount_point == path`, or `mount_point == "/"`).
+/// [`VFSRouter::route_in_zone`] enforces this by construction — its walk only
+/// inspects ancestors at `/` boundaries via `rfind('/')` — but the precondition
+/// is implicit, so the `debug_assert!` spells it out and catches future misuse:
+/// `path="/root/data2/x"` with `mount_point="/root/data"` would otherwise
+/// silently produce `"2/x"` instead of a routing miss.
+///
+/// Stated once, here, rather than in each of the rules built on it. Release
+/// mode degrades to the whole path instead of panicking: `path.get` rather than
+/// `path[..]` keeps a precondition violation from taking the kernel down on a
+/// non-UTF-8 boundary.
+fn under_mount<'a>(path: &'a str, mount_point: &str) -> &'a str {
     debug_assert!(
         path == mount_point
             || mount_point == "/"
             || path
                 .strip_prefix(mount_point)
                 .is_some_and(|rest| rest.is_empty() || rest.starts_with('/')),
-        "strip_mount_prefix called with non-LPM mount_point: path={path:?} \
+        "under_mount called with non-LPM mount_point: path={path:?} \
          mount_point={mount_point:?}",
     );
     if path == mount_point {
-        String::new()
+        ""
     } else if mount_point == "/" {
-        path.trim_start_matches('/').to_string()
+        path.trim_start_matches('/')
     } else {
-        path[mount_point.len()..]
+        path.get(mount_point.len()..)
+            .unwrap_or(path)
             .trim_start_matches('/')
-            .to_string()
+    }
+}
+
+/// Where `path` sits inside the zone its mount points into: the mount prefix
+/// removed, re-anchored under the subtree the mount exposes. No leading slash.
+///
+/// **The one definition of a path's zone-relative location**, and the reason it
+/// is one: a mount's content address ([`RouteResult::backend_path`]) and its
+/// metadata key have to agree. They were computed separately — this function's
+/// job here, and a near-copy in the per-mount metastore — and when only the
+/// copy learned about subtrees, metadata keys became disjoint while content
+/// kept colliding. Callers that need the metadata key use this too, so the two
+/// cannot drift again (nexi-lab/nexus-vfs#361).
+///
+/// `target_subtree` of `None` or `"/"` means the mount exposes the whole zone:
+/// the path reduces to its mount-relative form, which is what every mount did
+/// before subtrees existed.
+///
+/// One allocation on either branch. `route` calls this for every syscall, and
+/// stripping to an owned mount-relative path before joining the subtree onto it
+/// would allocate twice — hence [`under_mount`] borrows.
+#[must_use]
+pub fn zone_relative_path(path: &str, mount_point: &str, target_subtree: Option<&str>) -> String {
+    let rest = under_mount(path, mount_point);
+    let Some(subtree) = target_subtree
+        .map(|s| s.trim_start_matches('/'))
+        .filter(|s| !s.is_empty())
+    else {
+        return rest.to_string();
+    };
+    if rest.is_empty() {
+        subtree.to_string()
+    } else {
+        format!("{subtree}/{rest}")
     }
 }
 
@@ -980,13 +1060,66 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_mount_prefix() {
+    fn whole_zone_mounts_reduce_to_the_mount_relative_path() {
+        for subtree in [None, Some("/"), Some("")] {
+            assert_eq!(
+                zone_relative_path("/root/workspace/data/file.txt", "/root/workspace", subtree),
+                "data/file.txt"
+            );
+            assert_eq!(
+                zone_relative_path("/root/workspace", "/root/workspace", subtree),
+                ""
+            );
+            assert_eq!(zone_relative_path("/root/a/b", "/root", subtree), "a/b");
+            assert_eq!(zone_relative_path("/a/b", "/", subtree), "a/b");
+        }
+    }
+
+    /// The property #361 was: several mounts of ONE zone must land on disjoint
+    /// zone-relative paths. Whole-zone mounts cannot (`None` throws the prefix
+    /// away by design); a declared subtree is what keeps them apart.
+    #[test]
+    fn mounts_of_one_zone_only_stay_disjoint_when_they_declare_subtrees() {
+        let aliased: Vec<String> = ["/agents", "/conversations", "/sessions"]
+            .iter()
+            .map(|mp| zone_relative_path(&format!("{mp}/win-ai"), mp, None))
+            .collect();
+        assert_eq!(aliased, ["win-ai", "win-ai", "win-ai"], "the bug");
+
+        let declared: Vec<String> = ["/agents", "/conversations", "/sessions"]
+            .iter()
+            .map(|mp| zone_relative_path(&format!("{mp}/win-ai"), mp, Some(mp)))
+            .collect();
         assert_eq!(
-            strip_mount_prefix("/root/workspace/data/file.txt", "/root/workspace"),
-            "data/file.txt"
+            declared,
+            ["agents/win-ai", "conversations/win-ai", "sessions/win-ai"]
         );
-        assert_eq!(strip_mount_prefix("/root/workspace", "/root/workspace"), "");
-        assert_eq!(strip_mount_prefix("/root/a/b", "/root"), "a/b");
+    }
+
+    /// A mount's own path is the subtree root, not the zone root — otherwise
+    /// `readdir` of one prefix would list the whole zone.
+    #[test]
+    fn the_mount_point_itself_is_the_subtree_root() {
+        assert_eq!(
+            zone_relative_path("/agents", "/agents", Some("/agents")),
+            "agents"
+        );
+        assert_eq!(zone_relative_path("/agents", "/agents", None), "");
+    }
+
+    /// The local mount path and the declared subtree are independent: `join
+    /// <peer>:/<zone> <local-path>` lets two nodes expose one subtree at
+    /// different paths, and they must still agree on the key.
+    #[test]
+    fn the_subtree_is_declared_not_derived_from_the_local_mount_path() {
+        assert_eq!(
+            zone_relative_path("/peer/a/win-ai", "/peer/a", Some("/agents")),
+            "agents/win-ai"
+        );
+        assert_eq!(
+            zone_relative_path("/elsewhere/win-ai", "/elsewhere", Some("/agents")),
+            "agents/win-ai"
+        );
     }
 
     #[test]
