@@ -55,6 +55,24 @@ driver-ai = [
     "dep:llm-mount",
 ]
 
+# Egress content gate: classify what a write is about to put on an egress
+# plane (the A2A transcript) and redact or refuse it, on the same
+# `apply_mutating_write_hooks` seam the `from`-stamp already uses.
+#
+# OFF by default, and not because of size — the in-tree detector is a few
+# hundred lines of checksum arithmetic with no new transitive deps. It is
+# off because arming it CHANGES WRITES: a daemon that has no egress promise
+# to keep would start rewriting or refusing A2A messages on a policy nobody
+# at that deployment chose. Which content may leave a node is a deployment
+# decision, so it is opt-in per build, the way `driver-s3` is.
+#
+# A build that turns it on gets the deterministic PRC-identifier rules and
+# the default posture (redact what is provable, refuse what cannot be
+# sanitised, refuse if the detector fails). A deployment that needs a
+# different detector or posture calls `egress_gate::service_decl` from its
+# own composition instead of taking `default_service_decls` unmodified.
+egress-gate = ["dep:egress-gate"]
+
 [dependencies]
 nexus-rebac = { path = "../../rebac", optional = true }
 nexus-http-api = { path = "../../http-api", optional = true }
@@ -91,6 +109,10 @@ auth = { workspace = true }
 # generic raft primitive this binary arms per-zone directly via
 # `nexus_raft::stream_wakeup` — a2a itself carries no raft dep.
 a2a = { workspace = true }
+# Egress content gate (see the `egress-gate` feature). Optional so a
+# default build neither compiles it nor registers its hook, and writes on
+# this daemon are byte-identical to before.
+egress-gate = { workspace = true, optional = true }
 # Managed-agent control plane — ManagedAgentService (spawn/get/cancel) +
 # proc_entry / workspace-boundary hooks, brought up as a boot service so the
 # production `nexusd-cluster` carries the agent control plane directly (one

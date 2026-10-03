@@ -26,6 +26,14 @@ members = [
     # profile binaries; the stamp hook alone is reused by nexus-side
     # frontends without pulling raft (see rust/a2a/Cargo.toml).
     "rust/a2a",
+    # egress_gate/ — the egress content gate. A hook-only service on
+    # `apply_mutating_write_hooks` that classifies what a write is about to
+    # put on an egress plane (the A2A transcript first) and redacts or
+    # refuses it. Detection is behind a trait so the detector is swappable
+    # without touching the seam; one in-tree deterministic rule set ships
+    # with it. OPT-IN via a Cargo feature on `profiles/cluster` — a daemon
+    # with no egress promise to keep should not pay for one.
+    "rust/egress_gate",
     # subprocess/ — the hosted-subprocess substrate (spawn an argv child +
     # surface its stdio to the VFS). Shared by the managed-agent raw
     # control-plane spawner and the nexus-side ACP one-shot path. Kernel-tier:
@@ -117,6 +125,9 @@ auth = { path = "rust/auth" }
 # consumer that needs only the hook does not pull the `install` feature's
 # raft dep; the profile binaries opt into `features = ["install"]`.
 a2a = { path = "rust/a2a", default-features = false }
+# `egress-gate` — the egress content gate hook. Depends on `a2a` for the
+# transcript-leaf SSOT, so it is listed after it.
+egress-gate = { path = "rust/egress_gate" }
 # `subprocess` — hosted-subprocess substrate (kernel + tokio). Shared by
 # managed-agent's raw ACP-subprocess spawner and the nexus-side ACP path.
 subprocess = { path = "rust/subprocess" }

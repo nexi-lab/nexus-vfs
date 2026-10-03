@@ -1153,8 +1153,8 @@ type BoxedServiceDeclsBuilder =
 
 /// The nexus-vfs-native service set this daemon boots with: the A2A messaging
 /// substrate plus the managed-agent control plane (spawn/get/cancel + procfs /
-/// workspace hooks + the raw ACP-subprocess spawner), and the LLM-mount driver in
-/// a `driver-ai` build.
+/// workspace hooks + the raw ACP-subprocess spawner), the LLM-mount driver in
+/// a `driver-ai` build, and the egress content gate in an `egress-gate` build.
 ///
 /// Public because a co-host build needs THIS set with one entry replaced — the
 /// managed-agent decl carrying a `SpawnTask` provider, so a spawn becomes an
@@ -1181,6 +1181,17 @@ pub fn default_service_decls(ctx: &ServiceBootCtx) -> Vec<kernel::kernel::Servic
     let services = {
         let mut services = services;
         services.push(llm_mount::service_decl());
+        services
+    };
+    // Present only in an `egress-gate` build. Listed after a2a, so the
+    // gate classifies the envelope as it will actually be written, stamp
+    // included — though it does not depend on that: mutating hooks compose
+    // (`NativeHookRegistry::dispatch_pre`), so the stamp and the
+    // redaction both survive either order. Shadowed, same as above.
+    #[cfg(feature = "egress-gate")]
+    let services = {
+        let mut services = services;
+        services.push(egress_gate::service_decl_deterministic());
         services
     };
     services
