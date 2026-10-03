@@ -119,6 +119,9 @@ async fn credentials_and_live_permissions_survive_signed_plugin_and_cached_searc
         "root",
         Some(Arc::new(backend)),
         ZONE,
+        // The whole zone: this is the only mount of it, and the backend's files
+        // sit at its root.
+        "/",
         true,
     );
     let alice_grant = grant(tuples.as_ref(), "/docs/public.md", "alice");
