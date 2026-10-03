@@ -1,0 +1,34 @@
+[package]
+name = "egress-gate"
+version = "0.1.0"
+edition = "2021"
+description = "Egress content gate — classifies and enforces on data leaving the node, on the kernel write seam"
+authors = ["Nexus Team"]
+publish = false
+
+[lib]
+name = "egress_gate"
+path = "src/lib.rs"
+
+[dependencies]
+# The gate is a `NativeInterceptHook` on `apply_mutating_write_hooks`, so the
+# kernel is the whole substrate it needs.
+kernel = { workspace = true }
+# `is_system_path` — the native-hook self-exclusion contract.
+contracts = { workspace = true }
+# The A2A transcript leaf is the first gated egress path, and `a2a` owns the
+# address SSOT for it. Depending on the crate rather than re-spelling
+# `"/transcript"` is deliberate: a consumer deciding whether a path is an A2A
+# log must reach the same answer a2a does, and a second copy drifts the moment
+# that leaf is renamed (the rename window is exactly why
+# `mutating_path_suffixes` is a slice). a2a is a thin dep — kernel + contracts
+# + serde_json + blake3, no raft.
+a2a = { workspace = true }
+# Deny / redact decisions are audit events. Content never enters a log line
+# (see `hook.rs`), only the path, the caller and the finding kinds.
+tracing = "0.1"
+
+[dev-dependencies]
+# The composition test reads an envelope back out of the transcript stream
+# to assert the stamp and the redaction both survived.
+serde_json = { workspace = true }
