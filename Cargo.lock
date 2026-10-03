@@ -1137,6 +1137,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "egress-gate"
+version = "0.1.0"
+dependencies = [
+ "a2a",
+ "contracts",
+ "kernel",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2486,6 +2497,7 @@ dependencies = [
  "clap",
  "contracts",
  "ed25519-dalek",
+ "egress-gate",
  "gethostname",
  "kernel",
  "lib",
