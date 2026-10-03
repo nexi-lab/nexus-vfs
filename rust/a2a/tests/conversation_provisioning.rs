@@ -81,6 +81,7 @@ impl KernelSyscall for CountingKernel {
     fn sys_setattr(
         &self,
         path: &str,
+        ctx: &OperationContext,
         entry_type: i32,
         backend_name: &str,
         backend: Option<Arc<dyn kernel::abc::object_store::ObjectStore>>,
@@ -105,6 +106,7 @@ impl KernelSyscall for CountingKernel {
         self.setattrs.fetch_add(1, Ordering::Relaxed);
         self.inner.sys_setattr(
             path,
+            ctx,
             entry_type,
             backend_name,
             backend,
@@ -443,6 +445,7 @@ fn a_legacy_plain_entry_is_tolerated_and_still_resolves() {
     kernel
         .sys_setattr(
             &alias,
+            &ctx,
             DT_REG as i32,
             "",
             None,

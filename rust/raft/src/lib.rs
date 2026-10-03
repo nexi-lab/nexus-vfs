@@ -103,7 +103,28 @@ pub use zone_handle::{Consistency, ZoneHandle};
 #[cfg(all(feature = "grpc", has_protos))]
 pub use raft::ZoneLoadPolicy;
 #[cfg(all(feature = "grpc", has_protos))]
-pub use zone_manager::{join_cluster_and_provision_tls, ClusterStatus, TlsFiles, ZoneManager};
+pub use zone_manager::{
+    join_cluster_and_provision_tls, ClusterStatus, TlsFiles, ZoneManager, ZonePresence,
+};
+/// Replicated zone-deletion registry — deletion epochs on the control
+/// store, the anti-resurrection authority (R12).
+#[cfg(all(feature = "grpc", has_protos))]
+pub mod zone_deletion_registry;
+/// Zone-mutation operation journal — the idempotency substrate behind the
+/// typed ZoneRuntime surface (R8). Control-store backed, like
+/// `auth_key_store`.
+#[cfg(all(feature = "grpc", has_protos))]
+pub mod zone_op_journal;
+/// Typed Zone runtime backend (create/join/status/mount/unmount/
+/// remove-replica/deprovision with receipts).
+#[cfg(all(feature = "grpc", has_protos))]
+pub mod zone_runtime;
+#[cfg(all(feature = "grpc", has_protos))]
+pub use zone_deletion_registry::{DeletionEpochSource, ZoneDeletionRegistry};
+#[cfg(all(feature = "grpc", has_protos))]
+pub use zone_op_journal::ZoneOpJournal;
+#[cfg(all(feature = "grpc", has_protos))]
+pub use zone_runtime::{ZoneRuntimeBackend, ZoneRuntimeError};
 
 /// gRPC transport layer (requires `grpc` feature).
 ///

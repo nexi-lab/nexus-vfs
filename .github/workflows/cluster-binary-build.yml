@@ -23,62 +23,48 @@ jobs:
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
-            max_size_bytes: 18087936  # 17.25 MiB — raised from 17.0 for the declared
-                                      # mount subtree (#361: `/agents`,
-                                      # `/conversations` and `/sessions` all mounted
-                                      # one zone, and `to_zone_key` strips the mount
-                                      # prefix, so the three were one tree with three
-                                      # names — `readdir /agents` answered with
-                                      # conversation ids). Measured 17,826,128 bytes,
-                                      # 336 over the old cap: a durable proto field,
-                                      # the subtree threaded through the three mount
-                                      # routes, and the boot guard's operator-facing
-                                      # message. 648 bytes of the growth were given
-                                      # back first by dropping `impl Into<String>`
-                                      # from MountDecl's constructors, so this is the
-                                      # residue of a permanent feature rather than
-                                      # slack. The other three platforms absorbed it
-                                      # inside their existing budgets; this is the
-                                      # tightest.
+            max_size_bytes: 18612288  # 17.75 MiB — stacked features measured past 17.5:
+                                      # typed ZoneRuntime plane (#364, measured
+                                      # 18,153,576 here before the mount work) and
+                                      # the declared mount subtree (#361, measured
+                                      # 17,826,128 on main: the durable subtree
+                                      # field, the three mount routes, the boot
+                                      # guard — 648 bytes already returned by
+                                      # dropping impl Into<String> from MountDecl).
+                                      # Both are permanent features stacked on the
+                                      # same binary; the cap keeps the leak-catcher
+                                      # margin (~0.5 MiB cannot hide a driver).
           - os: macos-14
             artifact_name: nexusd-cluster-macos-arm64
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
-            max_size_bytes: 15466496  # 14.75 MiB — raised from 13.75 for the
-                                      # ServiceBootCtx `api_key_secret` widen (#261;
-                                      # downstream HTTP mint plumbing for nexus
-                                      # `/v2/auth/keys` POST).  Measured 14,794,160
-                                      # bytes here after the widen; leaves ~650 KB
-                                      # headroom.
+            max_size_bytes: 15990784  # 15.25 MiB — raised from 15.0: the typed
+                                      # ZoneRuntime plane (#364) plus the declared
+                                      # mount subtree (#361) stack on the same arm64
+                                      # binary; measured 15,745,360 (16.3 KB over
+                                      # the 15.0 cap that the plane raise set).
           - os: macos-14
             artifact_name: nexusd-cluster-macos-x86_64
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
             target: x86_64-apple-darwin
-            max_size_bytes: 16515072  # 15.75 MiB — raised from 14.75 for the
-                                      # ServiceBootCtx `api_key_secret` widen (#261;
-                                      # downstream HTTP mint plumbing for nexus
-                                      # `/v2/auth/keys` POST).  Measured 15,896,728
-                                      # bytes here (the tightest-headroom platform);
-                                      # leaves ~600 KB headroom.
+            max_size_bytes: 17039360  # 16.25 MiB — raised from 15.75 for the typed
+                                      # ZoneRuntime plane (#364; see the linux-x86_64
+                                      # entry for the inventory).  Measured
+                                      # 16,682,744 bytes here, ~168 KB over the old
+                                      # cap; leaves ~357 KB headroom.
           - os: windows-latest
             artifact_name: nexusd-cluster-windows-x86_64
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster.exe
-            max_size_bytes: 16777216  # 16.0 MiB — raised from 15.5 for the
-                                      # session-identity plane: five RPCs
-                                      # (MintSessionAgent, RevokeAgentCert, and the
-                                      # three allow-list admin calls) plus the
-                                      # replicated allow-list store. Measured
-                                      # 16,264,704 bytes here against 16,114,688 on
-                                      # the parent commit — ~146 KB, most of it the
-                                      # tonic client+server code generated per RPC.
-                                      # This is the tightest-headroom platform; the
-                                      # other three absorbed the same change inside
-                                      # their existing budgets.
+            max_size_bytes: 17301504  # 16.5 MiB — raised from 16.0 for the typed
+                                      # ZoneRuntime plane (#364; see the linux-x86_64
+                                      # entry for the inventory).  Measured
+                                      # 16,978,944 bytes here, ~202 KB over the old
+                                      # cap; leaves ~323 KB headroom.
 
 
     steps:

@@ -56,6 +56,7 @@ pub(crate) fn register_proc_entry<K: KernelSyscall>(
     kernel: &K,
     desc: &AgentDescriptor,
 ) -> Result<(), String> {
+    let ctx = sys_ctx();
     let pid = desc.pid.as_str();
     let pid_root = format!("/proc/{pid}");
     let workspace_root = format!("/proc/{pid}/workspace");
@@ -70,7 +71,7 @@ pub(crate) fn register_proc_entry<K: KernelSyscall>(
         sessions_root.as_str(),
         tasks_root.as_str(),
     ] {
-        create_dt_dir(kernel, dir)?;
+        create_dt_dir(kernel, &ctx, dir)?;
     }
 
     // /proc/{pid}/agent → /agents/{desc.name} (Linux /proc/{pid}/exe
@@ -78,12 +79,12 @@ pub(crate) fn register_proc_entry<K: KernelSyscall>(
     // validated against entry presence.
     let agent_link = format!("{pid_root}/agent");
     let agent_target = format!("/agents/{}", desc.name);
-    create_dt_link(kernel, &agent_link, &agent_target)?;
+    create_dt_link(kernel, &ctx, &agent_link, &agent_target)?;
 
     // One DT_LINK per repo mount carried in the descriptor.
     for repo in &desc.repos {
         let alias_link = format!("{workspace_root}/{}", repo.alias);
-        create_dt_link(kernel, &alias_link, &repo.mount_path)?;
+        create_dt_link(kernel, &ctx, &alias_link, &repo.mount_path)?;
     }
 
     Ok(())
@@ -119,10 +120,14 @@ pub(crate) fn unregister_proc_entry<K: KernelSyscall>(kernel: &K, desc: &AgentDe
     let _ = kernel.sys_unlink(&pid_root, &ctx, false);
 }
 
-fn create_dt_dir<K: KernelSyscall>(kernel: &K, path: &str) -> Result<(), String> {
+fn create_dt_dir<K: KernelSyscall>(
+    kernel: &K,
+    ctx: &OperationContext,
+    path: &str,
+) -> Result<(), String> {
     kernel
         .sys_setattr(
-            path, DT_DIR, /* backend_name */ "", /* backend */ None,
+            path, ctx, DT_DIR, /* backend_name */ "", /* backend */ None,
             /* metastore */ None, /* raft_backend */ None,
             /* io_profile */ "memory", /* zone_id */ "root",
             /* is_external */ false, /* capacity */ 0, /* read_fd */ None,
@@ -135,10 +140,16 @@ fn create_dt_dir<K: KernelSyscall>(kernel: &K, path: &str) -> Result<(), String>
         .map_err(|e| format!("sys_setattr(DT_DIR at {path:?}): {e:?}"))
 }
 
-fn create_dt_link<K: KernelSyscall>(kernel: &K, path: &str, target: &str) -> Result<(), String> {
+fn create_dt_link<K: KernelSyscall>(
+    kernel: &K,
+    ctx: &OperationContext,
+    path: &str,
+    target: &str,
+) -> Result<(), String> {
     kernel
         .sys_setattr(
             path,
+            ctx,
             DT_LINK,
             /* backend_name */ "",
             /* backend */ None,

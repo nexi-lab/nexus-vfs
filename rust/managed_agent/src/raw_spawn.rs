@@ -79,16 +79,28 @@ fn fd_path(pid: &str, n: u8) -> String {
 fn register_memory_stream(kernel: &Kernel, path: &str) -> Result<(), String> {
     kernel
         .sys_setattr(
-            path, /* entry_type   */ DT_STREAM, /* backend_name */ "",
-            /* backend      */ None, /* metastore    */ None,
-            /* raft_backend */ None, /* io_profile   */ "memory",
-            /* zone_id      */ "root", /* is_external  */ false,
-            /* capacity     */ STREAM_CAP, /* read_fd      */ None,
-            /* write_fd     */ None, /* mime_type       */ None,
-            /* modified_at_ms  */ None, /* content_id      */ None,
-            /* size            */ None, /* version         */ None,
-            /* created_at_ms   */ None, /* link_target     */ None,
-            /* source          */ None, /* remote_metastore*/ None,
+            path,
+            &system_ctx(),
+            /* entry_type   */ DT_STREAM,
+            /* backend_name */ "",
+            /* backend      */ None,
+            /* metastore    */ None,
+            /* raft_backend */ None,
+            /* io_profile   */ "memory",
+            /* zone_id      */ "root",
+            /* is_external  */ false,
+            /* capacity     */ STREAM_CAP,
+            /* read_fd      */ None,
+            /* write_fd     */ None,
+            /* mime_type       */ None,
+            /* modified_at_ms  */ None,
+            /* content_id      */ None,
+            /* size            */ None,
+            /* version         */ None,
+            /* created_at_ms   */ None,
+            /* link_target     */ None,
+            /* source          */ None,
+            /* remote_metastore*/ None,
         )
         .map(|_| ())
         .map_err(|e| format!("{e:?}"))

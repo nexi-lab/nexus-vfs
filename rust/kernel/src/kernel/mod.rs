@@ -1517,6 +1517,7 @@ impl Kernel {
     pub fn sys_setattr(
         &self,
         path: &str,
+        ctx: &OperationContext,
         entry_type: i32,
         // -- DT_MOUNT params (entry_type == 2) --
         backend_name: &str,
@@ -1559,6 +1560,7 @@ impl Kernel {
     ) -> Result<SysSetAttrResult, KernelError> {
         match entry_type {
             2 => {
+                self.check_permission(path, crate::Permission::Write, ctx)?;
                 // DT_MOUNT — full mount lifecycle via DLC.
                 //
                 // Zone-create-on-mount: when the caller did not supply
@@ -3159,6 +3161,7 @@ mod tests {
 
         k.sys_setattr(
             "/mime.txt",
+            &ctx,
             0,
             "",
             None,
@@ -3562,8 +3565,9 @@ mod tests {
         path: &str,
         entry_type: i32,
     ) -> Result<SysSetAttrResult, KernelError> {
+        let ctx = OperationContext::new("test", "root", true, None, true);
         kernel.sys_setattr(
-            path, entry_type, "",   // backend_name
+            path, &ctx, entry_type, "",   // backend_name
             None, // backend
             None, // metastore
             None, // raft_backend
@@ -3777,6 +3781,7 @@ mod tests {
         let err = k
             .sys_setattr(
                 path,
+                &OperationContext::new("test", "root", true, None, true),
                 4, // DT_STREAM
                 "",
                 None,
@@ -3813,6 +3818,7 @@ mod tests {
         // terminal — the waterfall itself is unchanged.
         k.sys_setattr(
             path,
+            &OperationContext::new("test", "root", true, None, true),
             4,
             "",
             None,
@@ -3964,6 +3970,7 @@ mod tests {
         let r = k
             .sys_setattr(
                 "/update-test.txt",
+                &OperationContext::new("test", "root", true, None, true),
                 0,
                 "",
                 None,
@@ -4036,6 +4043,7 @@ mod tests {
         let r = k
             .sys_setattr(
                 "/data/sub",
+                &OperationContext::new("test", "root", true, None, true),
                 1,
                 "",
                 None,
@@ -4082,6 +4090,7 @@ mod tests {
         // Create a DT_DIR at /data/reports
         k.sys_setattr(
             "/data/reports",
+            &OperationContext::new("test", "root", true, None, true),
             1,
             "",
             None,
@@ -4582,6 +4591,7 @@ mod tests {
             // /data/link -> /data/secret
             k.sys_setattr(
                 "/data/link",
+                &OperationContext::new("test", "root", true, None, true),
                 6, // DT_LINK
                 "",
                 None,
@@ -4666,6 +4676,7 @@ mod tests {
             for (path, target) in &[("/data/a", "/data/b"), ("/data/b", "/data/c")] {
                 k.sys_setattr(
                     path,
+                    &OperationContext::new("test", "root", true, None, true),
                     6, // DT_LINK
                     "",
                     None,
@@ -4715,6 +4726,7 @@ mod tests {
             for (path, target) in &[("/data/a", "/data/b"), ("/data/b", "/data/c")] {
                 k.sys_setattr(
                     path,
+                    &OperationContext::new("test", "root", true, None, true),
                     6,
                     "",
                     None,
@@ -4896,6 +4908,7 @@ mod tests {
             let setattr = |k: &Kernel, path: &str, io_profile: &str| {
                 k.sys_setattr(
                     path,
+                    &OperationContext::new("test", "root", true, None, true),
                     DT_STREAM as i32,
                     "",
                     None,
@@ -4971,6 +4984,7 @@ mod tests {
             kernel
                 .sys_setattr(
                     path,
+                    &OperationContext::new("test", "root", true, None, true),
                     DT_STREAM as i32,
                     /* backend_name */ "",
                     /* backend */ None,
@@ -5039,6 +5053,7 @@ mod tests {
                 kernel
                     .sys_setattr(
                         path,
+                        &OperationContext::new("test", "root", true, None, true),
                         DT_STREAM as i32,
                         "",
                         None,

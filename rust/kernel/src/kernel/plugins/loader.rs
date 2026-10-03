@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use contracts::rust_service::{RustCallError, RustService};
+use contracts::OperationContext;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use nexus_plugin_abi::grpc::{
     DispatchFn as GrpcDispatchFn, GrpcContext, GrpcError, GrpcService, Header,
@@ -25,9 +26,9 @@ use nexus_plugin_abi::grpc::{
 use nexus_plugin_abi::{
     signing::{PUBKEY_LENGTH, SIGNATURE_FILE_SUFFIX, SIGNATURE_LENGTH},
     DriverCreateFn, DriverDeleteFileFn, DriverDestroyFn, DriverReadFn, DriverReaddirFn,
-    DriverRmdirFn, DriverStatFn, DriverWriteFn, KernelHandle, NexusFreeFn, PluginGrpcServicesFn,
-    PluginKind, PluginResult, ServiceCreateFn, ServiceDestroyFn, ServiceDispatchFn,
-    PLUGIN_API_VERSION,
+    DriverRmdirFn, DriverStatFn, DriverWriteFn, KernelHandle, NexusFreeFn,
+    NexusPluginDispatchContext, PluginGrpcServicesFn, PluginKind, PluginResult, ServiceCreateFn,
+    ServiceDestroyFn, ServiceDispatchFn, ServiceDispatchV2Fn, PLUGIN_API_VERSION,
 };
 
 use crate::abc::object_store::{BackendStat, ObjectStore, StorageError, WriteResult};
@@ -444,9 +445,40 @@ pub(crate) struct DylibRustService {
     svc_name: String,
     instance: Arc<ServiceInstance>,
     dispatch_fn: ServiceDispatchFn,
+    dispatch_v2_fn: Option<ServiceDispatchV2Fn>,
     /// The plugin's own `nexus_free` — frees dispatch-output buffers on
     /// the plugin's allocator (never the host's). See `take_plugin_buf`.
     free_fn: NexusFreeFn,
+}
+
+// SAFETY: Plugin C ABI contract requires thread-safe instances.
+unsafe impl Send for DylibRustService {}
+unsafe impl Sync for DylibRustService {}
+
+impl DylibRustService {
+    fn finish_dispatch(
+        &self,
+        rc: i32,
+        out_buf: *mut u8,
+        out_len: usize,
+    ) -> Result<Vec<u8>, RustCallError> {
+        match rc {
+            0 => {
+                // The plugin allocated this buffer — copy it out and free it
+                // on the plugin's allocator, never the host's mimalloc.
+                let data = unsafe { take_plugin_buf(out_buf, out_len, self.free_fn) };
+                Ok(data)
+            }
+            rc if rc == PluginResult::NotFound as i32 => Err(RustCallError::NotFound),
+            rc if rc == PluginResult::InvalidArgument as i32 => Err(
+                RustCallError::InvalidArgument("plugin rejected argument".into()),
+            ),
+            rc if rc == PluginResult::PermissionDenied as i32 => Err(
+                RustCallError::PermissionDenied("plugin denied the call for this caller".into()),
+            ),
+            rc => Err(RustCallError::Internal(format!("plugin error code {rc}"))),
+        }
+    }
 }
 
 impl RustService for DylibRustService {
@@ -457,11 +489,11 @@ impl RustService for DylibRustService {
     /// The caller context stops here.
     ///
     /// A dylib is reached across the plugin C ABI, which carries method name
-    /// and payload bytes and nothing else. Passing identity to a plugin would
-    /// mean widening that ABI — a version bump, and every dylib in
-    /// `--plugin-dir` moving as one set with the daemon. No plugin needs it
-    /// today, so the ABI stays at v6 and this is the seam where identity is
-    /// dropped, stated rather than silent.
+    /// and payload bytes and nothing else on the v1 dispatch symbol; a plugin
+    /// that wants the caller's identity exports the optional v7
+    /// `nexus_service_dispatch_v2` symbol (see [`Self::dispatch_with_context`]).
+    /// On this, the contextless v1 path, identity is dropped — stated rather
+    /// than silent.
     fn dispatch(
         &self,
         method: &str,
@@ -487,20 +519,75 @@ impl RustService for DylibRustService {
                 &mut out_len,
             )
         };
+        self.finish_dispatch(rc, out_buf, out_len)
+    }
 
-        match rc {
-            0 => {
-                // The plugin allocated this buffer — copy it out and free it
-                // on the plugin's allocator, never the host's mimalloc.
-                let data = unsafe { take_plugin_buf(out_buf, out_len, self.free_fn) };
-                Ok(data)
-            }
-            rc if rc == PluginResult::NotFound as i32 => Err(RustCallError::NotFound),
-            rc if rc == PluginResult::InvalidArgument as i32 => Err(
-                RustCallError::InvalidArgument("plugin rejected argument".into()),
-            ),
-            rc => Err(RustCallError::Internal(format!("plugin error code {rc}"))),
+    fn dispatch_with_context(
+        &self,
+        ctx: &OperationContext,
+        method: &str,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, RustCallError> {
+        let Some(dispatch_v2_fn) = self.dispatch_v2_fn else {
+            return self.dispatch(method, payload, ctx);
+        };
+        let to_cstring = |value: &str, field: &str| {
+            CString::new(value)
+                .map_err(|_| RustCallError::InvalidArgument(format!("{field} contains null byte")))
+        };
+        let method_c = to_cstring(method, "method")?;
+        let user_id = to_cstring(&ctx.user_id, "user_id")?;
+        let zone_id = to_cstring(&ctx.zone_id, "zone_id")?;
+        let trust_domain = ctx
+            .trust_domain
+            .as_deref()
+            .map(|value| to_cstring(value, "trust_domain"))
+            .transpose()?;
+        let agent_id = ctx
+            .agent_id
+            .as_deref()
+            .map(|value| to_cstring(value, "agent_id"))
+            .transpose()?;
+        let request_id = to_cstring(&ctx.request_id, "request_id")?;
+        // v2: the caller's zone grants as JSON, so a plugin can reproduce
+        // `contracts::resolve_agent_zone` authorization semantics.
+        // Serialization of `Vec<(String, String)>` cannot fail.
+        let zone_perms_json = serde_json::to_string(&ctx.zone_perms)
+            .map_err(|e| RustCallError::Internal(format!("zone_perms encode: {e}")))?;
+        let zone_perms_json = to_cstring(&zone_perms_json, "zone_perms_json")?;
+        let mut out_buf: *mut u8 = std::ptr::null_mut();
+        let mut out_len: usize = 0;
+        let handle = self.instance.handle.read().unwrap();
+        if handle.is_null() {
+            return Err(RustCallError::NotFound);
         }
+        let ffi_ctx = NexusPluginDispatchContext {
+            struct_version: 2,
+            user_id: user_id.as_ptr(),
+            zone_id: zone_id.as_ptr(),
+            is_admin: ctx.is_admin,
+            is_system: ctx.is_system,
+            trust_domain: trust_domain
+                .as_ref()
+                .map_or(std::ptr::null(), |value| value.as_ptr()),
+            agent_id: agent_id
+                .as_ref()
+                .map_or(std::ptr::null(), |value| value.as_ptr()),
+            request_id: request_id.as_ptr(),
+            zone_perms_json: zone_perms_json.as_ptr(),
+        };
+        let rc = unsafe {
+            dispatch_v2_fn(
+                *handle,
+                &ffi_ctx,
+                method_c.as_ptr(),
+                payload.as_ptr(),
+                payload.len(),
+                &mut out_buf,
+                &mut out_len,
+            )
+        };
+        self.finish_dispatch(rc, out_buf, out_len)
     }
 }
 
@@ -884,9 +971,9 @@ impl PluginLoader {
                 .map_err(|e| format!("symbol {}: {e}", nexus_plugin_abi::symbols::API_VERSION))?;
             sym()
         };
-        if api_version != PLUGIN_API_VERSION {
+        if !matches!(api_version, 6 | PLUGIN_API_VERSION) {
             return Err(format!(
-                "plugin API version mismatch: plugin={api_version}, kernel={PLUGIN_API_VERSION}"
+                "plugin API version mismatch: plugin={api_version}, kernel accepts 6 or {PLUGIN_API_VERSION}"
             ));
         }
 
@@ -1196,12 +1283,22 @@ impl PluginLoader {
                 .get(nexus_plugin_abi::symbols::SERVICE_DISPATCH.as_bytes())
                 .ok()?
         };
+        let dispatch_v2_fn = unsafe {
+            plugin
+                ._lib
+                .get::<ServiceDispatchV2Fn>(
+                    nexus_plugin_abi::symbols::SERVICE_DISPATCH_V2.as_bytes(),
+                )
+                .ok()
+                .map(|symbol| *symbol)
+        };
         let free_fn = resolve_plugin_free(&plugin._lib).ok()?;
 
         Some(DylibRustService {
             svc_name: name.to_string(),
             instance: Arc::clone(&plugin.instance),
             dispatch_fn,
+            dispatch_v2_fn,
             free_fn,
         })
     }
@@ -1253,6 +1350,73 @@ mod tests {
     fn new_loader_is_empty() {
         let loader = PluginLoader::new();
         assert!(loader.list().is_empty());
+    }
+
+    // Stub FFI shape for exercising `finish_dispatch`'s rc→error mapping
+    // without a real dylib: rc != 0 never touches the buffers, so the
+    // function pointers are never called.
+    unsafe extern "C" fn stub_dispatch(
+        _svc: *mut c_void,
+        _method: *const std::os::raw::c_char,
+        _payload: *const u8,
+        _payload_len: usize,
+        _out_buf: *mut *mut u8,
+        _out_len: *mut usize,
+    ) -> i32 {
+        PluginResult::Ok as i32
+    }
+
+    unsafe extern "C" fn stub_free(_ptr: *mut u8, _len: usize) {}
+
+    unsafe extern "C" fn stub_destroy(_svc: *mut std::os::raw::c_void) {}
+
+    fn stub_service() -> DylibRustService {
+        DylibRustService {
+            svc_name: "stub".to_string(),
+            instance: Arc::new(ServiceInstance {
+                handle: RwLock::new(std::ptr::null_mut()),
+                destroy: stub_destroy,
+            }),
+            dispatch_fn: stub_dispatch,
+            dispatch_v2_fn: None,
+            free_fn: stub_free,
+        }
+    }
+
+    #[test]
+    fn permission_denied_rc_maps_to_rust_call_permission_denied() {
+        // v7: a plugin denies the call for the caller by returning
+        // PluginResult::PermissionDenied — the host must surface it as
+        // RustCallError::PermissionDenied (not a generic internal code).
+        let svc = stub_service();
+        let rc = PluginResult::PermissionDenied as i32;
+        let mapped = svc.finish_dispatch(rc, std::ptr::null_mut(), 0);
+        assert!(matches!(
+            mapped,
+            Err(crate::service_registry::RustCallError::PermissionDenied(_))
+        ));
+    }
+
+    #[test]
+    fn other_plugin_result_rcs_keep_their_mappings() {
+        let svc = stub_service();
+        assert!(matches!(
+            svc.finish_dispatch(PluginResult::NotFound as i32, std::ptr::null_mut(), 0),
+            Err(crate::service_registry::RustCallError::NotFound)
+        ));
+        assert!(matches!(
+            svc.finish_dispatch(
+                PluginResult::InvalidArgument as i32,
+                std::ptr::null_mut(),
+                0
+            ),
+            Err(crate::service_registry::RustCallError::InvalidArgument(_))
+        ));
+        // Anything else stays a generic internal error.
+        assert!(matches!(
+            svc.finish_dispatch(-99, std::ptr::null_mut(), 0),
+            Err(crate::service_registry::RustCallError::Internal(_))
+        ));
     }
 
     #[test]

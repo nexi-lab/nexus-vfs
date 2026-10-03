@@ -104,7 +104,8 @@ pub mod grpc;
 ///     `free_buf`.  All in-tree buffer hand-offs also shrink to an
 ///     exact-capacity boxed slice so the `from_raw_parts(ptr, len,
 ///     len)` free is layout-correct regardless of allocator.
-///   * v7 — `sys_write` carries the `offset` the kernel has always had.
+///   * v7 — two orthogonal changes:
+///     `sys_write` carries the `offset` the kernel has always had.
 ///     [`crate::KernelHandle::sys_write`] took `(path, data, len)` and the
 ///     host callback hardcoded `offset: 0`, so a plugin could only ever
 ///     replace a whole file.  Everything below the ABI was already ready:
@@ -117,6 +118,21 @@ pub mod grpc;
 ///     every plugin needs a clean rebuild; a v6 binary is rejected at
 ///     load with an ABI-mismatch error rather than silently writing to
 ///     the wrong place.
+///
+///     Service plugins may ALSO receive authenticated caller credentials
+///     through the optional `nexus_service_dispatch_v2` symbol. The kernel
+///     continues to accept v6 plugins and falls back to the contextless v1
+///     dispatch symbol when v2 is absent. A plugin may deny a call for the
+///     caller by returning `PluginResult::PermissionDenied` (`-4`) — the
+///     host maps it onto `RustCallError::PermissionDenied`. Note: the
+///     `declare_service_plugin!` macro's generated v2 symbol forwards to
+///     the contextless v1 dispatch; a plugin that needs the caller
+///     credentials must hand-write `nexus_service_dispatch_v2`.
+///
+///     (Both changes were cut as "v7" independently on parallel branches;
+///     they were merged as one revision because neither touches the other's
+///     symbols — one alters an existing fn-ptr signature, the other adds an
+///     optional symbol.)
 pub const PLUGIN_API_VERSION: u32 = 7;
 
 // ── Plugin kind ─────────────────────────────────────────────────────
@@ -154,6 +170,10 @@ pub enum PluginResult {
     NotFound = -1,
     InvalidArgument = -2,
     Internal = -3,
+    /// The plugin refused the call for this caller (v7 credential-aware
+    /// authorization). The host maps it onto
+    /// `RustCallError::PermissionDenied`.
+    PermissionDenied = -4,
 }
 
 // ── KernelHandle — vtable of callbacks a plugin can use ─────────────
@@ -379,6 +399,8 @@ pub mod symbols {
     pub const SERVICE_CREATE: &str = "nexus_service_create";
     /// `fn(svc, method, payload, len, out_buf, out_len) -> i32`
     pub const SERVICE_DISPATCH: &str = "nexus_service_dispatch";
+    /// `fn(svc, ctx, method, payload, len, out_buf, out_len) -> i32` — OPTIONAL.
+    pub const SERVICE_DISPATCH_V2: &str = "nexus_service_dispatch_v2";
     /// Unary gRPC entry point; required when `SERVICE_GRPC_SERVICES` is nonempty.
     /// See [`crate::grpc::DispatchFn`] for metadata, provenance, and status rules.
     pub const SERVICE_GRPC_DISPATCH: &str = "nexus_service_dispatch_grpc";
@@ -521,9 +543,46 @@ pub type NexusFreeFn = unsafe extern "C" fn(ptr: *mut u8, len: usize);
 /// Type of the `nexus_service_create` symbol.
 pub type ServiceCreateFn = unsafe extern "C" fn(kernel: *const KernelHandle) -> *mut c_void;
 
+/// Authenticated caller credentials passed to `nexus_service_dispatch_v2`.
+///
+/// String pointers are nullable and remain valid only for the duration of the
+/// dispatch call. Plugins must copy values they retain.
+///
+/// `struct_version == 2` adds `zone_perms_json`: a JSON array of
+/// `[zone_id, mode]` pairs (e.g. `[["tenant-a","rw"]]`, `[]` when the caller
+/// has no grants) — what a plugin needs to reproduce
+/// `contracts::resolve_agent_zone` authorization semantics. Plugins should
+/// check `struct_version` before reading fields beyond version 1.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct NexusPluginDispatchContext {
+    pub struct_version: u32,
+    pub user_id: *const c_char,
+    pub zone_id: *const c_char,
+    pub is_admin: bool,
+    pub is_system: bool,
+    pub trust_domain: *const c_char,
+    pub agent_id: *const c_char,
+    pub request_id: *const c_char,
+    /// v2: JSON `[["zone","rw"], ...]` (`[]` when the caller has no zone
+    /// grants). Never null.
+    pub zone_perms_json: *const c_char,
+}
+
 /// Type of the `nexus_service_dispatch` symbol.
 pub type ServiceDispatchFn = unsafe extern "C" fn(
     svc: *mut c_void,
+    method: *const c_char,
+    payload: *const u8,
+    payload_len: usize,
+    out_buf: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32;
+
+/// Type of the optional `nexus_service_dispatch_v2` symbol.
+pub type ServiceDispatchV2Fn = unsafe extern "C" fn(
+    svc: *mut c_void,
+    ctx: *const NexusPluginDispatchContext,
     method: *const c_char,
     payload: *const u8,
     payload_len: usize,
@@ -683,6 +742,19 @@ macro_rules! declare_service_plugin {
                 }
                 Err(code) => code,
             }
+        }
+
+        #[no_mangle]
+        pub unsafe extern "C" fn nexus_service_dispatch_v2(
+            svc: *mut std::os::raw::c_void,
+            _ctx: *const $crate::NexusPluginDispatchContext,
+            method: *const std::ffi::c_char,
+            payload: *const u8,
+            payload_len: usize,
+            out_buf: *mut *mut u8,
+            out_len: *mut usize,
+        ) -> i32 {
+            nexus_service_dispatch(svc, method, payload, payload_len, out_buf, out_len)
         }
 
         #[no_mangle]

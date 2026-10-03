@@ -1,0 +1,218 @@
+// Typed Zone runtime surface — create/join/status/mount/unmount/
+// remove-replica/deprovision with receipts, idempotent retries and
+// read-back facts.
+//
+// Unlike the generic `Call` RPC (JSON params, no auth context past the
+// interceptor), every request here carries `auth_token` through the same
+// `AuthedRequest` authenticate path as the VFS face, and every mutation
+// carries a `ZoneMutationHeader` so a lost response can be retried or
+// queried (`GetZoneOperation`) WITHOUT creating a second zone.
+//
+// Co-hosted with NexusVFSService on the raft data-plane port (same
+// `nexus.grpc.vfs` package, separate file: node clients that vendor only
+// vfs.proto are unaffected).
+//
+// SW-20260915-002: NEXUSVFS-FOUNDATION R7-R10, R13.
+
+syntax = "proto3";
+
+package nexus.grpc.vfs;
+
+service ZoneRuntimeService {
+  // Create a new tenant/data zone. Idempotent per operation_id; the same
+  // address book replays the original receipt, a different one is refused.
+  rpc ZoneCreate(ZoneCreateRequest) returns (ZoneReceipt);
+
+  // Join an existing zone. NEVER bootstraps a founder — a join that cannot
+  // reach a peer fails loudly instead of degrading into a create (R9).
+  rpc ZoneJoin(ZoneJoinRequest) returns (ZoneReceipt);
+
+  // Hosted/resident/local-not-found presence + raft facts (R10).
+  rpc ZoneStatus(ZoneStatusRequest) returns (ZoneStatusResponse);
+
+  rpc ZoneMount(ZoneMountRequest) returns (ZoneReceipt);
+  rpc ZoneUnmount(ZoneUnmountRequest) returns (ZoneReceipt);
+
+  // Destroy this node's local replica only — no global Deleted state.
+  rpc ZoneRemoveReplica(ZoneRemoveReplicaRequest) returns (ZoneReceipt);
+
+  // Full lifecycle teardown: deletion epoch/tombstone + peer fan-out, so an
+  // old replica that missed the fan-out cannot resurrect the zone (R12).
+  rpc ZoneDeprovision(ZoneDeprovisionRequest) returns (ZoneReceipt);
+
+  // Journal lookup for a mutation whose response was lost: PENDING (still
+  // executing / crashed mid-flight), or COMPLETED + the original receipt.
+  rpc GetZoneOperation(GetZoneOperationRequest) returns (ZoneOperationRecord);
+
+  // Boot/readiness capability snapshot for Nexus production assembly (R13).
+  // Unavailable until the data plane is wired — the readiness semantics.
+  rpc GetRuntimeCapabilities(GetRuntimeCapabilitiesRequest)
+      returns (GetRuntimeCapabilitiesResponse);
+}
+
+// Idempotency key every zone mutation carries (R8). `operation_id` is
+// caller-minted and unique per intent; `request_hash` pins the exact
+// payload (blake3 of the canonicalized request fields, recomputed
+// server-side) so a replayed operation_id with a DIFFERENT request is
+// refused, not silently merged.
+message ZoneMutationHeader {
+  string operation_id = 1;
+  uint64 request_hash = 2;
+}
+
+message ZoneCreateRequest {
+  string auth_token = 1;
+  ZoneMutationHeader mutation = 2;
+  string zone_id = 3;
+  repeated string peers = 4;
+}
+
+message ZoneJoinRequest {
+  string auth_token = 1;
+  ZoneMutationHeader mutation = 2;
+  string zone_id = 3;
+  repeated string peers = 4;
+  bool learner = 5;
+}
+
+message ZoneStatusRequest {
+  string auth_token = 1;
+  string zone_id = 2;
+}
+
+message ZoneMountRequest {
+  string auth_token = 1;
+  ZoneMutationHeader mutation = 2;
+  string parent_zone_id = 3;
+  string mount_path = 4;
+  string target_zone_id = 5;
+}
+
+message ZoneUnmountRequest {
+  string auth_token = 1;
+  ZoneMutationHeader mutation = 2;
+  string parent_zone_id = 3;
+  string mount_path = 4;
+}
+
+message ZoneRemoveReplicaRequest {
+  string auth_token = 1;
+  ZoneMutationHeader mutation = 2;
+  string zone_id = 3;
+  bool force = 4;
+}
+
+message ZoneDeprovisionRequest {
+  string auth_token = 1;
+  ZoneMutationHeader mutation = 2;
+  string zone_id = 3;
+}
+
+message GetZoneOperationRequest {
+  string auth_token = 1;
+  string operation_id = 2;
+}
+
+// Raft facts read back AFTER the mutation — the receipt's "this really
+// landed" evidence (acceptance 2/4). Mirrors `ClusterStatus`.
+message ClusterFacts {
+  bool has_store = 1;
+  uint64 term = 2;
+  uint64 commit_index = 3;
+  uint64 applied_index = 4;
+  uint64 leader_id = 5;
+  uint32 voter_count = 6;
+  uint32 witness_count = 7;
+}
+
+// Mount facts re-read from the parent zone's state machine post-mount.
+message MountFacts {
+  string mount_path = 1;
+  string target_zone_id = 2;
+  int64 i_links_count = 3;
+}
+
+message DeletionInfo {
+  uint64 deletion_epoch = 1;
+  int64 deleted_at_ms = 2;
+}
+
+message ZoneReceipt {
+  string operation_id = 1;
+  string zone_id = 2;
+  // create | join | mount | unmount | remove_replica | deprovision
+  string kind = 3;
+  // CREATED | JOINED | ALREADY_PRESENT | MOUNTED | UNMOUNTED |
+  // REPLICA_REMOVED | DEPROVISIONED — explicit, never phantom success.
+  string outcome = 4;
+  ClusterFacts cluster = 5;
+  MountFacts mount = 6;
+  // Human-readable read-back facts (physical evidence the caller can audit).
+  repeated string evidence = 7;
+  int64 completed_at_ms = 8;
+  // True when the journal answered with the ORIGINAL receipt for an
+  // already-executed operation_id — the retry that must not double-create.
+  bool replayed = 9;
+}
+
+message ZoneStatusResponse {
+  // Mirrors the local presence ladder; DELETED is the registry's global
+  // deletion state (epoch > 0).
+  enum Presence {
+    PRESENCE_UNKNOWN = 0;
+    // This node hosts the zone AND its raft runtime is resident.
+    RESIDENT = 1;
+    // Catalogued as hosted but no live local runtime (not materialized).
+    HOSTED_NOT_RESIDENT = 2;
+    // No local knowledge of the zone at all.
+    LOCAL_NOT_FOUND = 3;
+    // A deletion epoch is recorded — the zone is gone cluster-wide.
+    DELETED = 4;
+  }
+  string zone_id = 1;
+  Presence presence = 2;
+  ClusterFacts cluster = 3;
+  DeletionInfo deletion = 4;
+}
+
+message ZoneOperationRecord {
+  string operation_id = 1;
+  string kind = 2;
+  string zone_id = 3;
+  uint64 request_hash = 4;
+  // PENDING | COMPLETED | REJECTED
+  string status = 5;
+  ZoneReceipt receipt = 6;
+  string error = 7;
+}
+
+message GetRuntimeCapabilitiesRequest {
+  string auth_token = 1;
+}
+
+message RuntimeAuthCapability {
+  // Is an identity plane armed (vs NoAuth open loopback)?
+  bool armed = 1;
+  // "no-auth" | "api-key" — the AuthProvider's own declaration.
+  string mode = 2;
+}
+
+message RuntimePermissionCapability {
+  // Is a kernel permission provider installed (vs no-op gate)?
+  bool provider_armed = 1;
+}
+
+message RuntimeZoneCapability {
+  // Which zone backs the operation journal / deletion registry.
+  string journal_zone = 1;
+  bool deletion_protection = 2;
+}
+
+message GetRuntimeCapabilitiesResponse {
+  string node_id = 1;
+  bool data_plane_ready = 2;
+  RuntimeAuthCapability auth = 3;
+  RuntimePermissionCapability permission = 4;
+  RuntimeZoneCapability zone_runtime = 5;
+  repeated string capabilities = 6;
+}

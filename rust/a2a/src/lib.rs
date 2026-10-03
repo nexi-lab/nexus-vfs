@@ -68,9 +68,10 @@ use kernel::meta_store::{DT_DIR, DT_LINK, DT_REG, DT_STREAM};
 /// unaffected.
 pub fn ensure_agent_state_stream<K: KernelSyscall>(
     kernel: &K,
+    ctx: &OperationContext,
     agent_name: &str,
 ) -> Result<(), String> {
-    ensure_mailbox_stream(kernel, &agent_state_path(agent_name))
+    ensure_mailbox_stream(kernel, ctx, &agent_state_path(agent_name))
 }
 
 /// Provision the 1:1 conversation between `agent_name` and `peer_name`,
@@ -139,9 +140,9 @@ pub fn ensure_conversation<K: KernelSyscall>(
     // Without this the chat-list entry lands under a directory nothing can
     // `readdir`, and the chat list is the entire point of the index. Same
     // ordering `managed_agent::proc_entry` uses when it stamps `/proc`.
-    ensure_dir(kernel, CONVERSATIONS_BASE)?;
-    ensure_dir(kernel, &conversation_root)?;
-    ensure_dir(kernel, A2A_INBOX_BASE)?;
+    ensure_dir(kernel, ctx, CONVERSATIONS_BASE)?;
+    ensure_dir(kernel, ctx, &conversation_root)?;
+    ensure_dir(kernel, ctx, A2A_INBOX_BASE)?;
 
     // Both participants get a chat-list entry. A conversation is not owned by
     // whoever provisioned it, so indexing only the local agent would leave the
@@ -152,9 +153,10 @@ pub fn ensure_conversation<K: KernelSyscall>(
     // "my conversation with myself" and a receiver listing the directory would
     // derive the wrong transcript.
     for (name, peer) in [(agent_name, peer_name), (peer_name, agent_name)] {
-        ensure_dir(kernel, &format!("{A2A_INBOX_BASE}/{name}"))?;
+        ensure_dir(kernel, ctx, &format!("{A2A_INBOX_BASE}/{name}"))?;
         ensure_dir(
             kernel,
+            ctx,
             &format!("{A2A_INBOX_BASE}/{name}{AGENT_CONVERSATIONS_SEGMENT}"),
         )?;
         index_conversation(
@@ -167,7 +169,7 @@ pub fn ensure_conversation<K: KernelSyscall>(
     }
 
     // Last — see the completion-sentinel note above.
-    ensure_mailbox_stream(kernel, &transcript)
+    ensure_mailbox_stream(kernel, ctx, &transcript)
 }
 
 /// Create `path` as a DT_DIR, idempotently.
@@ -175,8 +177,12 @@ pub fn ensure_conversation<K: KernelSyscall>(
 /// `setattr_create_dir` treats an existing DT_DIR — or a DT_MOUNT, which is
 /// directory-like — as a no-op, so this is safe to call on a federation mount
 /// point such as `/agents`.
-fn ensure_dir<K: KernelSyscall>(kernel: &K, path: &str) -> Result<(), String> {
-    metadata_setattr(kernel, path, DT_DIR, None).map_err(|e| format!("ensure dir {path}: {e}"))
+fn ensure_dir<K: KernelSyscall>(
+    kernel: &K,
+    ctx: &OperationContext,
+    path: &str,
+) -> Result<(), String> {
+    metadata_setattr(kernel, ctx, path, DT_DIR, None).map_err(|e| format!("ensure dir {path}: {e}"))
 }
 
 /// The conversation root a chat-list entry stands for, whichever shape it is.
@@ -256,7 +262,7 @@ fn index_conversation<K: KernelSyscall>(
             return Ok(());
         }
     }
-    metadata_setattr(kernel, alias, DT_LINK, Some(target))?;
+    metadata_setattr(kernel, ctx, alias, DT_LINK, Some(target))?;
     Ok(())
 }
 
@@ -265,6 +271,7 @@ fn index_conversation<K: KernelSyscall>(
 /// where a misplaced `None` is invisible.
 fn metadata_setattr<K: KernelSyscall>(
     kernel: &K,
+    ctx: &OperationContext,
     path: &str,
     entry_type: u8,
     link_target: Option<&str>,
@@ -272,6 +279,7 @@ fn metadata_setattr<K: KernelSyscall>(
     kernel
         .sys_setattr(
             path,
+            ctx,
             // `kernel::meta_store` types these as `u8`; the syscall arg is
             // `i32`. Widening HERE keeps every call site spelling the named
             // constant instead of an integer literal — which is exactly what
@@ -322,10 +330,15 @@ fn metadata_setattr<K: KernelSyscall>(
 ///
 /// Generic over [`KernelSyscall`] (not `&Kernel`) so the services rlib can call
 /// it without monomorphising against a concrete kernel.
-pub fn ensure_mailbox_stream<K: KernelSyscall>(kernel: &K, path: &str) -> Result<(), String> {
+pub fn ensure_mailbox_stream<K: KernelSyscall>(
+    kernel: &K,
+    ctx: &OperationContext,
+    path: &str,
+) -> Result<(), String> {
     kernel
         .sys_setattr(
             path,
+            ctx,
             i32::from(DT_STREAM),
             /* backend_name */ "",
             /* backend */ None,

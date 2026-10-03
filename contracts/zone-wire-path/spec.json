@@ -1,0 +1,35 @@
+{
+  "$comment": [
+    "SSOT for zone-relative wire paths. This contract validates paths accepted",
+    "at API boundaries; it is distinct from the kernel's internal routing-key",
+    "canonicalizer, which prefixes a zone id when selecting storage.",
+    "",
+    "This contract defines only the path primitive. Product-level ResourceRef",
+    "types belong to Nexus and are intentionally not defined in nexus-vfs.",
+    "",
+    "Reserved prefixes are named by their owning constants in",
+    "rust/contracts/src/constants.rs rather than restated here."
+  ],
+  "version": 1,
+  "root": "/",
+  "must_start_with": "/",
+  "component": {
+    "allowed": "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~!$&'()*+,;=:@-",
+    "max_length": 255,
+    "forbidden": [
+      ".",
+      ".."
+    ]
+  },
+  "depth": {
+    "max": 32
+  },
+  "length": {
+    "max": 1024
+  },
+  "empty_components": false,
+  "trailing_slash": false,
+  "reserved_prefix_constants": [
+    "SYSTEM_PATH_PREFIX"
+  ]
+}

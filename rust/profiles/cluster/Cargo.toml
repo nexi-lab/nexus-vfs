@@ -126,7 +126,8 @@ base64 = "0.22"
 axum = "0.8"
 # wire_durable_metastore tests open real redb files in a temp data dir.
 tempfile = "3"
-# The live LLM test builds a chat-completion request body. Test-only.
+# The e2e harness encodes generic-`Call` JSON params (agent-trust tests),
+# and the live LLM test builds a chat-completion request body. Test-only.
 serde_json = { workspace = true }
 # The remote agent-mint gate test parses minted cert PEM to DER to feed
 # `peer_identity::from_der`. Test-only, so the shipped binary carries no pem dep.
