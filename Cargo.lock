@@ -1141,9 +1141,12 @@ name = "egress-gate"
 version = "0.1.0"
 dependencies = [
  "a2a",
+ "backends",
  "contracts",
  "kernel",
+ "llm-mount",
  "serde_json",
+ "tempfile",
  "tracing",
 ]
 

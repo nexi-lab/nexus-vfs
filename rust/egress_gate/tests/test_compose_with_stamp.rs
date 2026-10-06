@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use a2a::{conversation_id, conversation_transcript_path, install_a2a_stamp_hook};
-use egress_gate::{service_decl_deterministic, GatePolicy, DEFAULT_EGRESS_SUFFIXES};
+use egress_gate::{service_decl_deterministic, EgressPlane, GatePolicy};
 use kernel::kernel::{Kernel, OperationContext};
 
 /// Checksum-valid GB 11643 specimen, issued to nobody.
@@ -123,7 +123,7 @@ fn deny_policy_aborts_the_stream_write() {
         &kernel,
         Arc::new(egress_gate::DeterministicRules::new()),
         GatePolicy::deny_on_finding(),
-        DEFAULT_EGRESS_SUFFIXES,
+        EgressPlane::a2a_transcripts(),
     )
     .expect("install gate");
 
