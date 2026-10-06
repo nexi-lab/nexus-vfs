@@ -121,7 +121,8 @@ async fn subprocess_streams_approvals_and_accepts_cancel_without_public_fd_strea
         let mut codec = SessionCodec::new(endpoint.clone(), SessionSide::Controller).unwrap();
         let mut offset = 0;
         send(&kernel, &endpoint, &mut codec, json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":1}}));
-        assert_eq!(receive(&kernel, &endpoint, &mut codec, &mut offset)["id"], 0);
+        let initialized = receive(&kernel, &endpoint, &mut codec, &mut offset);
+        assert_eq!(initialized["id"], 0, "initialize response: {initialized}");
         send(&kernel, &endpoint, &mut codec, json!({"jsonrpc":"2.0","id":"new","method":"session/new","params":{"cwd":"/"}}));
         assert_eq!(receive(&kernel, &endpoint, &mut codec, &mut offset)["result"]["sessionId"], "durable-fixture-session");
         for (turn, cancelled) in [("first", true), ("second", false)] {
