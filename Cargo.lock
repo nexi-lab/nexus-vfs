@@ -2078,6 +2078,7 @@ dependencies = [
  "ahash",
  "arc-swap",
  "base64 0.22.1",
+ "bincode",
  "blake3",
  "bloomfilter",
  "bytes",
