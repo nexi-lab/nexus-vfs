@@ -1,3 +1,32 @@
 [toolchain]
-channel = "stable"
+# PINNED, not `stable`.
+#
+# This repo gates merges on `clippy -D warnings` and on byte-exact binary size
+# budgets (`.github/workflows/cluster-binary-build.yml`). Neither means much
+# against a moving compiler, and on 2026-10-06 both broke at once from this one
+# cause.
+#
+# `stable` does not even resolve consistently WITHIN A SINGLE RUN, because each
+# runner image ships whatever stable it was baked with. Run 37482311039, one
+# push, one commit:
+#
+#   linux-x86_64    rustc 1.99.0   18,866,640 bytes   over the 18,087,936 budget
+#   windows-x86_64  rustc 1.98.1   16,822,272 bytes   under its budget
+#
+# and the PR build of the IDENTICAL TREE minutes earlier got 1.98.1 on linux and
+# produced 18,048,344 — 818 KB smaller, passing with 0.22% slack. So a green PR
+# merged into a red main, from nothing but which compiler a runner happened to
+# have. The same release also deprecated `Atomic::fetch_update` and began
+# reporting `clippy::double_must_use` inside `tonic::async_trait` output, which
+# is what first turned main red (#385). Separately, a dev box sat on 1.93.1 for
+# weeks while CI moved on, so local `clippy` runs were quietly weaker than the
+# gate they stood in for.
+#
+# 1.98.1 rather than the newest: every size budget in
+# `cluster-binary-build.yml` was measured against it, so pinning here changes no
+# CI verdict and asserts what the numbers already assume. Bumping is then a
+# deliberate commit that re-measures those budgets in the same change — on
+# 1.99.0 the linux binary needs ~18.25 MiB — instead of something that happens
+# to a runner between two jobs.
+channel = "1.98.1"
 components = ["rustfmt", "clippy"]
