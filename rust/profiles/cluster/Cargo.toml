@@ -157,3 +157,6 @@ pem = "3"
 # `transport` feature. Example-only, so the shipped binary carries no direct
 # lib dep beyond what `transport` already pulls.
 lib = { workspace = true, features = ["transport"] }
+
+[lints]
+workspace = true

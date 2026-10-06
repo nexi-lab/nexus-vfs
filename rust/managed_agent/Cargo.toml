@@ -31,3 +31,6 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "m
 subprocess = { path = "../subprocess", optional = true }
 # Shared authenticated conversation framing and presence provisioning.
 a2a = { workspace = true }
+
+[lints]
+workspace = true

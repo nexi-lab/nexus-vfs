@@ -25,3 +25,6 @@ serde_json = { workspace = true }
 # the other repo, which re-exports this function rather than reimplementing it —
 # must derive byte-identical ids, so the hash lives here with the address SSOT.
 blake3 = { workspace = true }
+
+[lints]
+workspace = true

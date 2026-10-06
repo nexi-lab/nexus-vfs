@@ -16,3 +16,6 @@ tonic = ["dep:tonic", "dep:http"]
 [dependencies]
 tonic = { version = "0.14", default-features = false, features = ["codegen"], optional = true }
 http = { version = "1", optional = true }
+
+[lints]
+workspace = true

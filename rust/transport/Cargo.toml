@@ -74,3 +74,6 @@ rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
 tonic-prost = { version = "0.14" }
 tokio-stream = { version = "0.1", features = ["net"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[lints]
+workspace = true

@@ -41,3 +41,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 # neutral `lib` crate owns.  Only tests need to construct it directly
 # (production code goes through nexus-rebac's tuple_key encoder).
 lib = { workspace = true }
+
+[lints]
+workspace = true

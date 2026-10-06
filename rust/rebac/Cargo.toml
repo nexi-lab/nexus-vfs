@@ -70,3 +70,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 # Kernel `AuthKeyStore` trait already available via the normal-dep
 # `kernel` above (bumped from dev-dep now that the enforcer needs
 # `PermissionProvider` at compile time).
+
+[lints]
+workspace = true
