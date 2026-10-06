@@ -30,7 +30,9 @@ pub(crate) struct StrLit {
     /// For a value: the raw text of the key it belongs to — the member
     /// key in an object, the array's own key for an array element. `None`
     /// for a key, and for a value with no key above it (a top-level string
-    /// or a top-level array's element).
+    /// or a top-level array's element). Read by the contextual detector to
+    /// tell prose from protocol, so unread in a build without one.
+    #[cfg_attr(not(feature = "presidio"), allow(dead_code))]
     pub owner: Option<String>,
 }
 
