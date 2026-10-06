@@ -16,6 +16,12 @@ jobs:
     timeout-minutes: 45
     strategy:
       fail-fast: false
+      # Every `max_size_bytes` below is a measurement against the compiler
+      # pinned in `rust-toolchain.toml`, not a property of the source. The same
+      # tree built 818 KB larger on 1.99.0 than on 1.98.1, and before the pin
+      # `stable` resolved differently per runner inside a single run — so these
+      # numbers decided merges by coin flip. Bump the pin and re-measure these
+      # in the same commit, never one without the other.
       matrix:
         include:
           - os: ubuntu-22.04
