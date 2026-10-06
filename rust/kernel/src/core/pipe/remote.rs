@@ -99,11 +99,23 @@ impl PipeBackend for RemotePipeBackend {
 
         let data = B64.decode(data_b64).map_err(|_| PipeError::Empty)?;
 
-        self.msg_count
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
-                Some(c.saturating_sub(1))
-            })
-            .ok();
+        // Saturating decrement. `fetch_update` says this in one call, but a
+        // recent stable renamed it to `try_update` and deprecated the old
+        // name — and `rust-toolchain.toml` tracks `stable`, so naming either
+        // one couples this line to whichever release a given machine happens
+        // to have. A CAS loop is the same atomic operation and does not move.
+        let mut observed = self.msg_count.load(Ordering::Relaxed);
+        while observed > 0 {
+            match self.msg_count.compare_exchange_weak(
+                observed,
+                observed - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(current) => observed = current,
+            }
+        }
 
         Ok(data)
     }
