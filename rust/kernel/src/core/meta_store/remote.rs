@@ -307,59 +307,38 @@ impl MetaStore for RemoteMetaStore {
 }
 
 /// Parse FileMetadata from a JSON value (server sys_stat response).
+/// Parse the `FileMetadata` a remote `sys_stat` answered with.
+///
+/// Derived, not hand-written: the JSON keys are `FileMetadata`'s field names,
+/// so `serde` reads them directly and a field added to the struct arrives
+/// without anyone editing this function. The ~50 lines of `obj.get("…")
+/// .and_then(…)` this replaced were the third of the three hand-maintained
+/// encodings in nexi-lab/nexus-vfs#371.
+///
+/// `#[serde(default)]` on the struct supplies a missing key, which is what the
+/// old `unwrap_or` / `unwrap_or(0)` arms did — and it is load-bearing, not
+/// tidiness: a `sys_stat` reply carrying only `{"size": N}` is a shape this
+/// repo's own transport serves, and without `default` serde would reject it for
+/// want of `path`.
+///
+/// Two deliberate differences from the hand-written version:
+///
+/// * `version` and `entry_type` are `u32`/`u8`. The old code read them as `u64`
+///   and cast with `as`, so a malformed reply silently truncated; serde rejects
+///   it. A metadata field out of its own range is a protocol error, not a value
+///   to round down. Note the `readdir` callers drop unparseable entries via
+///   `filter_map(….ok())`, so this trades a truncated field for a missing row —
+///   both bad, and the second is at least not a plausible-looking lie.
+/// * `target_subtree: ""` no longer maps to `None`. No server in this repo
+///   emits that key at all (grep: nothing writes it as a JSON key), so the arm
+///   guarded a case that does not arise; and now that `FileMetadata` also
+///   derives `Serialize`, both ends agree exactly, `null` for absent. Should a
+///   retired-Python peer still send `""`, every consumer already folds it to
+///   "the whole zone" — `vfs_router::zone_relative_path` filters empty, and
+///   `nexus_raft::zone_meta_store::subtree_or_whole_zone` maps it to `/`.
 fn parse_metadata_from_json(value: &serde_json::Value) -> Result<FileMetadata, MetaStoreError> {
-    let obj = value
-        .as_object()
-        .ok_or_else(|| MetaStoreError::IOError("expected JSON object".into()))?;
-
-    Ok(FileMetadata {
-        // A remote sys_stat answers about an entry, and a DT_MOUNT's subtree is
-        // part of that entry, so it is read when the server sends it.
-        target_subtree: obj
-            .get("target_subtree")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(str::to_string),
-        path: obj
-            .get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        size: obj.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
-        content_id: obj
-            .get("content_id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        gen: obj.get("gen").and_then(|v| v.as_u64()).unwrap_or(0),
-        version: obj.get("version").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-        entry_type: obj.get("entry_type").and_then(|v| v.as_u64()).unwrap_or(0) as u8,
-        zone_id: obj
-            .get("zone_id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        mime_type: obj
-            .get("mime_type")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        created_at_ms: obj.get("created_at_ms").and_then(|v| v.as_i64()),
-        modified_at_ms: obj.get("modified_at_ms").and_then(|v| v.as_i64()),
-        last_writer_address: obj
-            .get("last_writer_address")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        target_zone_id: obj
-            .get("target_zone_id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        link_target: obj
-            .get("link_target")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        owner_id: obj
-            .get("owner_id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-    })
+    serde_json::from_value(value.clone())
+        .map_err(|e| MetaStoreError::IOError(format!("parse remote FileMetadata: {e}")))
 }
 
 #[cfg(test)]
