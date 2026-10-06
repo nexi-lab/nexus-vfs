@@ -8,9 +8,8 @@
 //! `Ok(())` or `Err(KernelError::PermissionDenied)`.
 //!
 //! Neither crate is a kernel primitive and neither is a `RustService`.
-//! Both are plain rlibs that a profile binary links behind a Cargo
-//! feature and installs into the corresponding kernel/transport slot
-//! at its composition root.
+//! Both are plain rlibs that a profile binary links and installs into
+//! the corresponding kernel/transport slot at its composition root.
 //!
 //! ## Where it sits
 //!
@@ -21,11 +20,11 @@
 //! | Identity → **permission** | [`kernel::PermissionProvider`] (kernel DI slot) | **this crate** (or unregistered ⇒ no-op) |
 //! | Peer identity | `PeerIdentity` (mTLS) | transport |
 //!
-//! `nexusd-cluster` does **not** enable the permission feature: the
-//! kernel's `Arc<dyn PermissionProvider>` slot stays `None`, and every
-//! `check_permission` call short-circuits to `Ok(())` in 3 lines of
-//! kernel hook code.  The profile that terminates external client
-//! authorization turns the feature on and installs an impl.
+//! `nexusd-cluster --permission-policy zone-grants` installs the zone
+//! grant policy for API-key-authenticated callers. Without this explicit
+//! policy, the kernel's `Arc<dyn PermissionProvider>` slot stays `None`
+//! and `check_permission` returns `Ok(())`. Other policy compositions
+//! install an implementation at their profile's composition root.
 //!
 //! ## Composition model — 1 slot, N impls
 //!

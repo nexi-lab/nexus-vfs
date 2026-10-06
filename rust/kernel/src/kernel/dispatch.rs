@@ -201,7 +201,15 @@ impl Kernel {
             Some(p) => p,
             None => return Ok(()),
         };
-        provider.check(path, route, permission, ctx)
+        // Authorization must see the SAME owning zone as I/O. Many syscall
+        // gates run before routing and pass None; the caller's ambient zone
+        // cannot establish ownership of a path mounted in another zone.
+        let resolved = if route.is_none() {
+            self.vfs_router.route(path, &ctx.zone_id)
+        } else {
+            None
+        };
+        provider.check(path, route.or(resolved.as_ref()), permission, ctx)
     }
 
     /// Install the kernel's authorization policy.  See the
@@ -209,8 +217,8 @@ impl Kernel {
     /// composition contract and canonical impls.
     ///
     /// Called at composition-root time by a profile binary that
-    /// terminates external client authorization.  `nexusd-cluster`
-    /// does not call this — the slot stays `None`, gate stays no-op.
+    /// terminates external client authorization. `nexusd-cluster` installs
+    /// its configured policy here; a trusted local deployment may leave it empty.
     ///
     /// Overwriting the slot is safe: an in-flight check that already
     /// dereferenced the previous provider completes against it
@@ -673,6 +681,53 @@ mod permission_gate_protective_tests {
                     });
             }
         }
+    }
+
+    #[test]
+    fn permission_provider_receives_the_paths_owning_zone_before_io() {
+        struct RequireOwningZone;
+        impl PermissionProvider for RequireOwningZone {
+            fn check(
+                &self,
+                _path: &str,
+                route: Option<&RouteResult>,
+                _permission: Permission,
+                ctx: &OperationContext,
+            ) -> Result<(), KernelError> {
+                let owner = route
+                    .expect("mounted path must be routed before permission")
+                    .zone_id
+                    .as_str();
+                if ctx
+                    .zone_perms
+                    .iter()
+                    .any(|(zone, perms)| zone == owner && perms.contains('r'))
+                {
+                    Ok(())
+                } else {
+                    Err(KernelError::PermissionDenied("wrong owning zone".into()))
+                }
+            }
+        }
+        let kernel = Kernel::new();
+        kernel.vfs_router.add_mount("/", ROOT_ZONE_ID, None, false);
+        kernel
+            .vfs_router
+            .add_federation_mount("/secret", ROOT_ZONE_ID, None, "secret", "/", false);
+        kernel.set_permission_provider(Arc::new(Box::new(RequireOwningZone)));
+        let mut reader = OperationContext::new("alice", ROOT_ZONE_ID, false, None, false);
+        reader.zone_perms = vec![(ROOT_ZONE_ID.into(), "r".into())];
+        assert!(kernel
+            .check_permission("/public.json", Permission::Read, &reader)
+            .is_ok());
+        assert!(matches!(
+            kernel.check_permission("/secret/private.json", Permission::Read, &reader),
+            Err(KernelError::PermissionDenied(_))
+        ));
+        reader.zone_perms.push(("secret".into(), "r".into()));
+        assert!(kernel
+            .check_permission("/secret/private.json", Permission::Read, &reader)
+            .is_ok());
     }
 
     #[test]

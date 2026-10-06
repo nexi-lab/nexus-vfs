@@ -29,7 +29,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use backends::provider::DefaultObjectStoreProvider;
 use backends::storage::path_local::PathLocalBackend;
-use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 
 mod auth_posture;
 mod authorization;
@@ -65,6 +65,38 @@ struct Args {
 
     #[command(subcommand)]
     cmd: Option<Cmd>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum PermissionPolicy {
+    /// Enforce the authenticated API key's zone read/write grants at every syscall.
+    ZoneGrants,
+}
+
+fn install_permission_policy(
+    kernel: &Kernel,
+    policy: Option<PermissionPolicy>,
+    posture: &AuthPosture,
+    enable_rebac: bool,
+) -> Result<()> {
+    if policy.is_none() {
+        return Ok(());
+    }
+    if enable_rebac {
+        anyhow::bail!(
+            "--permission-policy zone-grants cannot be combined with --enable-rebac; \
+            choose one authorization policy so neither silently replaces the other"
+        );
+    }
+    if !matches!(posture, AuthPosture::ApiKey(_)) {
+        anyhow::bail!(
+            "--permission-policy zone-grants requires API-key authentication; \
+            set NEXUS_API_KEY_SECRET or provision an auth-on founder"
+        );
+    }
+    kernel.set_permission_provider(Arc::new(Box::new(permission::ZonePermsProvider::new())));
+    tracing::info!("zone-grants permission policy armed (read/write checked per owning zone)");
+    Ok(())
 }
 
 #[derive(Debug, clap::Args)]
@@ -277,6 +309,13 @@ struct CommonArgs {
     /// environment — both name this one directory.
     #[arg(long, env = "NEXUS_ROOT_FS", global = true)]
     root_path: Option<PathBuf>,
+
+    /// Data-plane authorisation policy. Zone-grants requires API-key authentication;
+    /// trusted loopback without a policy remains the existing local trust domain.
+    /// Cannot combine with --enable-rebac. Certificate-only principals need a
+    /// separate policy assigning their grants.
+    #[arg(long, env = "NEXUS_PERMISSION_POLICY", global = true)]
+    permission_policy: Option<PermissionPolicy>,
 
     /// Directory of plugin dylibs to auto-load at startup.
     /// All `.so` / `.dylib` files in this directory are loaded via
@@ -2064,6 +2103,12 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     // posture with no identity plane at all — legal on loopback, where the
     // caller is already inside the trust domain.
     let posture = auth_posture(&common)?;
+    install_permission_policy(
+        &kernel,
+        common.permission_policy,
+        &posture,
+        common.enable_rebac,
+    )?;
     let auth_provider = match &posture {
         AuthPosture::ApiKey(secret) => {
             // Reads the kernel's §3.B.3 slot per lookup, so the provider can be
@@ -7693,6 +7738,52 @@ mod tests {
         let mut full = vec!["nexusd-cluster"];
         full.extend_from_slice(args);
         Args::try_parse_from(full).expect("args parse").common
+    }
+
+    #[test]
+    fn permission_policy_refuses_an_unidentified_or_cert_only_caller_plane() {
+        for posture in [AuthPosture::Open, AuthPosture::CertIdentity] {
+            assert!(install_permission_policy(
+                &Kernel::new(),
+                Some(PermissionPolicy::ZoneGrants),
+                &posture,
+                false
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn permission_policy_arms_the_real_kernel_gate() {
+        let kernel = Kernel::new();
+        let policy = common_from(&["--permission-policy", "zone-grants"]).permission_policy;
+        install_permission_policy(
+            &kernel,
+            policy,
+            &AuthPosture::ApiKey("test-secret".into()),
+            false,
+        )
+        .unwrap();
+        let mut caller =
+            kernel::kernel::OperationContext::new("reader", "root", false, None, false);
+        caller.zone_perms = vec![("root".into(), "r".into())];
+        kernel
+            .check_permission("/grant", kernel::Permission::Read, &caller)
+            .unwrap();
+        assert!(kernel
+            .check_permission("/grant", kernel::Permission::Write, &caller)
+            .is_err());
+    }
+
+    #[test]
+    fn permission_policy_cannot_be_silently_replaced_by_rebac() {
+        assert!(install_permission_policy(
+            &Kernel::new(),
+            Some(PermissionPolicy::ZoneGrants),
+            &AuthPosture::ApiKey("test-secret".into()),
+            true
+        )
+        .is_err());
     }
 
     /// The one-address contract: `--advertise-addr` alone determines the bind

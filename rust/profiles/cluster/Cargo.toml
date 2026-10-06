@@ -108,6 +108,7 @@ transport = { workspace = true }
 # trusted network — they configure it. Costs 134 KiB (0.9%) in the binary and
 # nothing at runtime when the posture is Open.
 auth = { workspace = true }
+permission = { workspace = true }
 # A2A messaging substrate — the mailbox `from`-stamp hook, armed at boot
 # by `install_a2a_stamp_hook` (first boot-enlisted service; behaviour-
 # preserving under NoAuth). The cross-machine stream-wakeup observer is a

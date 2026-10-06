@@ -121,14 +121,12 @@ impl PermissionProvider for ZonePermsProvider {
         permission: Permission,
         ctx: &OperationContext,
     ) -> Result<(), KernelError> {
-        // Lease cache — hot path early-return.  Uses `agent_id` when
-        // present, falls back to `user_id` (same as the pre-refactor
-        // gate).  Empty caller id ⇒ skip cache (lease_cache.check
-        // returns false immediately on empty id).
-        let agent_id = ctx.agent_id.as_deref().unwrap_or(&ctx.user_id);
-        if self.lease_cache.check(path, agent_id) {
+        if ctx.is_admin {
             return Ok(());
         }
+        // Leases record successful checks, but current grants still govern.
+        // Uses agent_id when present, otherwise the authenticated user_id.
+        let agent_id = ctx.agent_id.as_deref().unwrap_or(&ctx.user_id);
 
         // Zone-perms path-aware check.  Empty `zone_perms` under an
         // installed provider means "no grants" — deny.  Callers that
@@ -145,7 +143,12 @@ impl PermissionProvider for ZonePermsProvider {
             .any(|(zone_id, perm_chars)| zone_id == path_zone && perm_chars.contains(perm_char));
 
         if has_zone_grant {
-            self.lease_cache.stamp(path, agent_id);
+            // A lease is keyed by path and principal, not action or grants.
+            // It cannot establish today's permission: a successful read must
+            // never grant write, nor survive a changed zone grant/routing.
+            if !self.lease_cache.check(path, agent_id) {
+                self.lease_cache.stamp(path, agent_id);
+            }
             return Ok(());
         }
 
@@ -277,9 +280,9 @@ mod tests {
         assert!(matches!(err, KernelError::PermissionDenied(_)));
     }
 
-    /// Lease cache short-circuits repeat hits (perf contract).
+    /// Cached reads must not override the authenticated context's current grants.
     #[test]
-    fn lease_cache_short_circuits_repeat_hits() {
+    fn lease_cache_does_not_override_current_grants() {
         let provider = ZonePermsProvider::new();
         let ctx = ctx_with("agent-1", "alice", vec![("eng".into(), "rw".into())]);
         let route = RouteResult {
@@ -296,13 +299,25 @@ mod tests {
         provider
             .check("/eng/x", Some(&route), Permission::Read, &ctx)
             .expect("first call must succeed via full check");
-        // Second call: lease cache hit — same result even if we
-        // deliberately pass an empty `zone_perms` (proves the cache
-        // is what answered, not the perms iter).
+        // A cached success must not survive removal of the current grant.
         let mut ctx2 = ctx.clone();
         ctx2.zone_perms.clear();
+        assert!(matches!(
+            provider.check("/eng/x", Some(&route), Permission::Read, &ctx2),
+            Err(KernelError::PermissionDenied(_))
+        ));
+    }
+
+    #[test]
+    fn cached_read_never_grants_write() {
+        let provider = ZonePermsProvider::new();
+        let ctx = ctx_with("reader", "alice", vec![(ROOT_ZONE_ID.into(), "r".into())]);
         provider
-            .check("/eng/x", Some(&route), Permission::Read, &ctx2)
-            .expect("second call must hit lease cache and succeed");
+            .check("/grant.json", None, Permission::Read, &ctx)
+            .unwrap();
+        assert!(matches!(
+            provider.check("/grant.json", None, Permission::Write, &ctx),
+            Err(KernelError::PermissionDenied(_))
+        ));
     }
 }
