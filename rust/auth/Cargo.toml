@@ -34,3 +34,6 @@ dashmap = "6.1"
 parking_lot = "0.12"
 tracing = "0.1"
 tonic = { workspace = true }
+
+[lints]
+workspace = true

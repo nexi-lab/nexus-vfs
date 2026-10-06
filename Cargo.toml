@@ -94,6 +94,28 @@ members = [
     "rust/profiles/full",
 ]
 
+[workspace.lints.rust]
+# `has_protos` is set by `rust/raft/build.rs` when protoc was available. It
+# lives here rather than in raft's own manifest because a crate cannot both
+# inherit `workspace.lints` and declare its own `[lints.*]` overrides — Cargo
+# rejects the manifest. Declaring an expected cfg workspace-wide costs nothing:
+# it only stops rustc warning about a name, and only raft sets it.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(has_protos)"] }
+
+[workspace.lints.clippy]
+# `tonic::async_trait` puts `#[must_use]` on methods that already return a
+# `#[must_use]` future. A recent stable started reporting that, and because
+# `rust-toolchain.toml` tracks `stable` while CI runs `-D warnings`, a
+# toolchain release turned main red — in generated proto code and in every
+# `#[tonic::async_trait]` trait across kernel, raft and federated-search.
+#
+# Declared once here rather than as an `#[allow]` per crate: the trigger is the
+# macro, so per-crate suppression needs another entry the next time anyone
+# declares an async trait, and that person gets a red main with no indication
+# why. We cannot fix the macro's output at the source and the lint is pure
+# style, so the policy belongs with the workspace.
+double_must_use = "allow"
+
 [workspace.dependencies]
 contracts = { path = "rust/contracts" }
 nexus-plugin-abi = { path = "rust/plugin-abi" }
