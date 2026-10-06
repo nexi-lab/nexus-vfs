@@ -304,11 +304,37 @@ impl PresidioAnalyzer {
     }
 }
 
-/// The decoded string values of a JSON document, joined for one analyzer
+/// Keys whose string values are prose — what a person or a model wrote —
+/// in the payloads the gate sees: the A2A envelope's `body`; a chat
+/// request's `content` and its parts' `text`; `system`, `instructions`,
+/// `prompt` and `input` across the provider APIs; a tool call's
+/// `arguments`.
+///
+/// Contextual detection runs on these and nowhere else. Every other value
+/// is protocol, and NER on protocol identifiers is noise with a cost: on a
+/// real request it tagged the model name `qwen3-30b` as a PERSON, and
+/// redacting it made the request unroutable. The provable rules still run
+/// over every byte — an identity number is a leak wherever it sits. The
+/// trade is stated plainly: a name inside a structured tool parameter under
+/// some other key is left to the provable rules.
+const PROSE_KEYS: &[&str] = &[
+    "body",
+    "content",
+    "text",
+    "system",
+    "instructions",
+    "prompt",
+    "input",
+    "arguments",
+];
+
+/// The decoded prose values of a JSON document, joined for one analyzer
 /// call, with every character's raw byte range in the document.
 ///
-/// Values only: keys are the schema, and handing them to NER is how the
-/// key `"to"` came back as a LOCATION. Decoded: a writer that escapes
+/// Prose values only: keys are the schema, and handing them to NER is how
+/// the key `"to"` came back as a LOCATION; other values are protocol (see
+/// [`PROSE_KEYS`]). A value with no key above it — a bare string document —
+/// is prose. Decoded: a writer that escapes
 /// non-ASCII (`json.dumps` does by default) would otherwise hide every
 /// Chinese name behind `\uXXXX`, which NER cannot read. Values are joined
 /// by a blank line so the analyzer never reads two of them as one entity.
@@ -323,7 +349,10 @@ impl DecodedValues {
     fn of(content: &[u8], layout: &crate::json_layout::Layout) -> Result<Self, String> {
         let mut text = String::new();
         let mut raw = Vec::new();
-        for lit in layout.strings.iter().filter(|l| !l.is_key) {
+        let prose = |l: &&crate::json_layout::StrLit| {
+            !l.is_key && l.owner.as_deref().is_none_or(|k| PROSE_KEYS.contains(&k))
+        };
+        for lit in layout.strings.iter().filter(prose) {
             let (value, at) = crate::json_layout::decode(content, lit)
                 .ok_or("content parsed as JSON but a string value did not decode")?;
             if value.is_empty() {
@@ -644,10 +673,10 @@ mod tests {
         // An envelope as Python's json.dumps writes it: the name escaped.
         let name_raw = format!("{}{}", u_esc('张'), u_esc('三'));
         let doc = format!(r#"{{"from":"a","to":"b","body":"客户{name_raw}好"}}"#);
-        // Decoded values, keys left out: "a", "b", "客户张三好" joined by
-        // blank lines — so 张三 is characters 8..10.
+        // Only the prose value is sent, decoded: "客户张三好" — so 张三 is
+        // characters 2..4. `from` and `to` are protocol.
         let (url, rx) = serve(ok_json(
-            r#"[{"entity_type":"PERSON","start":8,"end":10,"score":0.9}]"#,
+            r#"[{"entity_type":"PERSON","start":2,"end":4,"score":0.9}]"#,
         ));
         let a = PresidioAnalyzer::new(cfg(&url)).unwrap();
         let got = classify(&a, &doc).unwrap();
@@ -655,10 +684,7 @@ mod tests {
         let req = String::from_utf8(rx.recv().unwrap()).unwrap();
         let sent: serde_json::Value =
             serde_json::from_str(req.split_once("\r\n\r\n").unwrap().1).unwrap();
-        assert_eq!(
-            sent["text"], "a\n\nb\n\n客户张三好",
-            "values, decoded, no keys"
-        );
+        assert_eq!(sent["text"], "客户张三好", "prose, decoded, nothing else");
 
         assert_eq!(got.findings.len(), 1);
         assert_eq!(&doc[got.findings[0].span.clone()], name_raw);
@@ -671,7 +697,7 @@ mod tests {
 
     #[test]
     fn a_span_across_two_values_becomes_one_finding_per_value() {
-        let doc = r#"{"a":"甲乙","b":"丙丁"}"#;
+        let doc = r#"{"content":"甲乙","text":"丙丁"}"#;
         let layout = crate::json_layout::layout(doc.as_bytes()).unwrap();
         let values = DecodedValues::of(doc.as_bytes(), &layout).unwrap();
         assert_eq!(values.text, "甲乙\n\n丙丁");
@@ -685,5 +711,26 @@ mod tests {
             .unwrap();
         let parts: Vec<&str> = f.iter().map(|x| &doc[x.span.clone()]).collect();
         assert_eq!(parts, vec!["乙", "丙"]);
+    }
+
+    #[test]
+    fn a_chat_requests_protocol_fields_never_reach_the_analyzer() {
+        // On the box, NER tagged the model name as a PERSON and the
+        // redacted request could not be routed.
+        let doc = r#"{"model":"qwen3-30b","messages":[{"role":"user","content":"客户张三"},{"role":"assistant","content":[{"type":"text","text":"好的"}]}],"stream":true}"#;
+        let layout = crate::json_layout::layout(doc.as_bytes()).unwrap();
+        let values = DecodedValues::of(doc.as_bytes(), &layout).unwrap();
+        assert_eq!(values.text, "客户张三\n\n好的");
+        for protocol in ["qwen3-30b", "user", "assistant"] {
+            assert!(!values.text.contains(protocol), "{protocol} was sent");
+        }
+    }
+
+    #[test]
+    fn a_bare_string_document_is_prose() {
+        let doc = r#""客户张三""#;
+        let layout = crate::json_layout::layout(doc.as_bytes()).unwrap();
+        let values = DecodedValues::of(doc.as_bytes(), &layout).unwrap();
+        assert_eq!(values.text, "客户张三");
     }
 }

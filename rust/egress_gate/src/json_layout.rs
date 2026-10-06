@@ -27,6 +27,11 @@ pub(crate) struct StrLit {
     pub raw: Range<usize>,
     /// Followed by `:` — an object key, i.e. the schema's vocabulary.
     pub is_key: bool,
+    /// For a value: the raw text of the key it belongs to — the member
+    /// key in an object, the array's own key for an array element. `None`
+    /// for a key, and for a value with no key above it (a top-level string
+    /// or a top-level array's element).
+    pub owner: Option<String>,
 }
 
 /// The layout of a document that parsed as JSON.
@@ -47,9 +52,24 @@ pub(crate) fn layout(content: &[u8]) -> Option<Layout> {
     serde_json::from_slice::<serde::de::IgnoredAny>(content).ok()?;
     let c = content;
     let mut out = Layout::default();
+    // One entry per open container: for an object, the member key last
+    // read; for an array, the key the array itself belongs to.
+    let mut owners: Vec<Option<String>> = Vec::new();
     let mut i = 0;
     while i < c.len() {
         match c[i] {
+            b'{' => {
+                owners.push(None);
+                i += 1;
+            }
+            b'[' => {
+                owners.push(owners.last().cloned().flatten());
+                i += 1;
+            }
+            b'}' | b']' => {
+                owners.pop();
+                i += 1;
+            }
             b'"' => {
                 let start = i + 1;
                 i = start;
@@ -69,7 +89,16 @@ pub(crate) fn layout(content: &[u8]) -> Option<Layout> {
                     j += 1;
                 }
                 let is_key = c.get(j) == Some(&b':');
-                out.strings.push(StrLit { raw, is_key });
+                let owner = if is_key {
+                    let name = String::from_utf8_lossy(&c[raw.clone()]).into_owned();
+                    if let Some(top) = owners.last_mut() {
+                        *top = Some(name);
+                    }
+                    None
+                } else {
+                    owners.last().cloned().flatten()
+                };
+                out.strings.push(StrLit { raw, is_key, owner });
             }
             b'-' | b'0'..=b'9' => {
                 let start = i;
@@ -185,6 +214,30 @@ mod tests {
     /// character it encodes — which would leave these tests testing nothing.
     fn u_hex(unit: u32) -> String {
         format!("{}u{unit:04x}", '\\')
+    }
+
+    #[test]
+    fn records_which_key_each_value_belongs_to() {
+        let doc = r#"{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"stop":["x"]}"#;
+        let l = layout(doc.as_bytes()).unwrap();
+        let owners: Vec<(&str, Option<&str>)> = l
+            .strings
+            .iter()
+            .filter(|s| !s.is_key)
+            .map(|s| (&doc[s.raw.clone()], s.owner.as_deref()))
+            .collect();
+        assert_eq!(
+            owners,
+            vec![
+                ("m", Some("model")),
+                ("user", Some("role")),
+                ("text", Some("type")),
+                ("hi", Some("text")),
+                ("x", Some("stop")),
+            ]
+        );
+        let top = layout(br#"["a"]"#).unwrap();
+        assert_eq!(top.strings[0].owner, None, "a top-level element has no key");
     }
 
     #[test]
