@@ -4145,6 +4145,7 @@ mod tests {
             contracts::ROOT_ZONE_ID,
             None,
             "sharedzone",
+            "/agents",
             false,
         );
         // A stream path under the mount resolves to the TARGET zone — the same

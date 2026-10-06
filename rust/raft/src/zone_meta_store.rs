@@ -362,43 +362,25 @@ pub(crate) fn subtree_or_whole_zone(raw: &str) -> String {
 /// subtree onto it allocates twice per metadata operation, and a non-root
 /// subtree is exactly the three replicated A2A prefixes — the hot path.
 ///
-/// A path that does not sit under `mount_point` is a caller bug:
-/// `debug_assert` catches it in tests, and release returns the path unchanged
-/// rather than silently rewriting an unrelated prefix.
+/// A path that does not sit under `mount_point` is a caller bug, caught by the
+/// `debug_assert!` in `under_mount`; release mode degrades rather than panics.
 fn compose_zone_key(mount_point: &str, target_subtree: &str, full_path: &str) -> String {
-    let subtree = if target_subtree == VFS_ROOT || target_subtree.is_empty() {
-        ""
+    // Delegates, rather than implementing. The kernel router derives a mount's
+    // CONTENT address from the same rule, and the two have to agree — they did
+    // not, because this function was a near-copy and only the copy learned
+    // about subtrees, so metadata keys became disjoint while the content kept
+    // colliding (nexi-lab/nexus-vfs#361). One definition, two consumers.
+    //
+    // The leading slash is this store's own key convention, not part of the
+    // rule: `zone_relative_path` answers "where inside the zone", and a
+    // metastore key spells that absolutely.
+    let relative =
+        kernel::core::vfs_router::zone_relative_path(full_path, mount_point, Some(target_subtree));
+    if relative.is_empty() {
+        VFS_ROOT.to_string()
     } else {
-        target_subtree
-    };
-    if mount_point == VFS_ROOT || mount_point.is_empty() {
-        // Root zone: the mount prefix is (effectively) empty, so full paths
-        // already match the zone namespace.
-        return if subtree.is_empty() {
-            full_path.to_string()
-        } else {
-            format!("{subtree}{full_path}")
-        };
+        format!("/{relative}")
     }
-    if full_path == mount_point {
-        // The mount point itself is the subtree's own root.
-        return if subtree.is_empty() {
-            VFS_ROOT.to_string()
-        } else {
-            subtree.to_string()
-        };
-    }
-    if let Some(rest) = full_path
-        .strip_prefix(mount_point)
-        .and_then(|rest| rest.strip_prefix('/'))
-    {
-        return format!("{subtree}/{rest}");
-    }
-    debug_assert!(
-        false,
-        "ZoneMetaStore({mount_point}): path {full_path} does not sit under mount point"
-    );
-    full_path.to_string()
 }
 
 /// The mount-relative path for `zone_key`, or `None` when the key lies outside
@@ -956,6 +938,10 @@ mod tests {
             ("/agents", "/", "/agents/win-ai/transcript"),
             ("/agents", "/agents", "/agents/win-ai/transcript"),
             ("/agents", "/agents", "/agents"),
+            // A subtree exposed at the namespace root: the local mount path and
+            // the declared subtree are independent, so this shape is legal and
+            // its key must still carry the subtree.
+            ("/", "/agents", "/win-ai/transcript"),
             (
                 "/conversations",
                 "/conversations",
