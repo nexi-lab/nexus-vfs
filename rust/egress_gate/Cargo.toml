@@ -27,11 +27,24 @@ a2a = { workspace = true }
 # Deny / redact decisions are audit events. Content never enters a log line
 # (see `hook.rs`), only the path, the caller and the finding kinds.
 tracing = "0.1"
+# The Presidio provider's one dependency, off unless `presidio` is enabled.
+# `httparse` is already in the daemon's tree through hyper; the provider
+# speaks plain blocking HTTP/1.1 to a loopback analyzer rather than pulling
+# an async client into a synchronous hook.
+httparse = { version = "1.10", optional = true }
+# JSON content is laid out (keys vs values vs numbers) so redaction never
+# breaks a message and detectors read values, not the schema. Already in the
+# daemon's tree through a2a.
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[features]
+default = []
+# Contextual detection (names, addresses, organisations) by a local
+# Presidio analyzer, in addition to the deterministic rules.
+presidio = ["dep:httparse"]
 
 [dev-dependencies]
-# The composition test reads an envelope back out of the transcript stream
-# to assert the stamp and the redaction both survived.
-serde_json = { workspace = true }
 # The model-plane test drives a real LLM mount through the real OpenAI
 # connector and captures what it sends upstream — test-only, so the gate
 # itself never links an HTTP stack.
