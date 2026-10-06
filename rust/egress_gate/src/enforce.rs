@@ -111,35 +111,58 @@ fn marker(tag: &str) -> Vec<u8> {
     format!("[REDACTED:{safe}]").into_bytes()
 }
 
-/// Replace every finding's span with a marker.
+/// What a redaction did.
+#[derive(Debug)]
+pub struct Redacted {
+    /// The content to write.
+    pub content: Vec<u8>,
+    /// Kinds replaced, one per edit, in content order.
+    pub applied: Vec<String>,
+    /// [`Confidence::Probable`] findings dropped because they fell on JSON
+    /// keys or syntax — a detector reading the schema, not the content.
+    pub discarded: usize,
+}
+
+/// One byte range to replace, and whether the marker needs its own quotes
+/// (it does when it replaces a whole JSON number).
+struct Edit {
+    range: std::ops::Range<usize>,
+    quoted: bool,
+    tag: String,
+}
+
+/// Replace every finding with a marker, without ever changing JSON
+/// structure.
 ///
-/// Spans may arrive unsorted and overlapping; they are sorted and merged
-/// first. Overlapping findings collapse into one marker tagged with the
-/// first kind, because two markers for one run of bytes would imply the
-/// content had two separate items in it.
+/// For content that is not JSON, each span is replaced as given. For JSON
+/// — the usual case on these planes — a redaction may rewrite only:
+///
+/// * **the inside of a string value**: a span is clipped to the quotes and
+///   widened so it never cuts an escape sequence; a span across several
+///   values is redacted value by value;
+/// * **a whole number**, replaced by a *quoted* marker, so a card number
+///   sent as a JSON number becomes a string rather than a syntax error.
+///
+/// Keys are the protocol's vocabulary. A [`Confidence::Probable`] finding
+/// on a key or on bare syntax is a detector reading the schema — NER has
+/// been seen tagging the key `"to"` as a LOCATION — and is discarded. A
+/// [`Confidence::Certain`] one is a provable identifier sitting where it
+/// cannot be redacted without breaking the message, and is refused.
+///
+/// Overlapping edits collapse into one marker tagged with the first kind,
+/// because two markers for one run of bytes would imply the content had
+/// two separate items in it.
 ///
 /// # Errors
 ///
-/// Fail-closed rather than best-effort, in both cases where the findings
-/// cannot be applied faithfully:
-///
-/// * a span outside the content — the provider is describing bytes that
-///   are not there, so no part of its verdict can be trusted to point at
-///   the right place;
-/// * a span that would cut a multi-byte character in valid UTF-8 — the
-///   result would be invalid UTF-8 the reader cannot decode, and a
-///   partially-redacted identifier is still a leak.
-///
-/// Returning `Err` sends the write to [`Action::Deny`], which is the
-/// correct answer: content known to contain something sensitive and
-/// impossible to sanitise must not be written.
-pub fn redact(content: &[u8], findings: &[&Finding]) -> Result<Vec<u8>, String> {
-    if findings.is_empty() {
-        return Ok(content.to_vec());
-    }
+/// Fail-closed rather than best-effort wherever the findings cannot be
+/// applied faithfully: a span outside the content (the provider is
+/// describing bytes that are not there), a span that would cut a UTF-8
+/// character, or a provable identifier on JSON structure. `Err` sends the
+/// write to [`Action::Deny`] — content known to hold something sensitive
+/// and impossible to sanitise must not be written.
+pub fn redact(content: &[u8], findings: &[&Finding]) -> Result<Redacted, String> {
     let text = std::str::from_utf8(content).ok();
-
-    let mut spans: Vec<(usize, usize, &str)> = Vec::with_capacity(findings.len());
     for f in findings {
         let (s, e) = (f.span.start, f.span.end);
         if s > e || e > content.len() {
@@ -155,29 +178,115 @@ pub fn redact(content: &[u8], findings: &[&Finding]) -> Result<Vec<u8>, String> 
                 ));
             }
         }
-        spans.push((s, e, f.kind.tag()));
     }
-    spans.sort_by_key(|&(s, e, _)| (s, e));
 
+    let mut discarded = 0;
+    let mut edits: Vec<Edit> = Vec::new();
+    match crate::json_layout::layout(content) {
+        None => edits.extend(findings.iter().map(|f| Edit {
+            range: f.span.clone(),
+            quoted: false,
+            tag: f.kind.tag().to_string(),
+        })),
+        Some(layout) => {
+            for f in findings {
+                let before = edits.len();
+                let on_structure = json_edits(&layout, f, &mut edits);
+                if on_structure && f.confidence == Confidence::Certain {
+                    return Err(format!(
+                        "a provable {} at {}..{} sits on JSON structure; it cannot be \
+                         redacted without breaking the message",
+                        f.kind.tag(),
+                        f.span.start,
+                        f.span.end
+                    ));
+                }
+                if edits.len() == before {
+                    discarded += 1;
+                }
+            }
+        }
+    }
+    Ok(apply(content, edits, discarded))
+}
+
+/// The edits one finding calls for under a JSON layout. Returns whether
+/// any part of the span fell on a key or on bare syntax.
+fn json_edits(layout: &crate::json_layout::Layout, f: &Finding, edits: &mut Vec<Edit>) -> bool {
+    let (s, e) = (f.span.start, f.span.end);
+    let overlaps = |r: &std::ops::Range<usize>| r.start < e && s < r.end;
+    let mut covered = 0usize;
+    let mut on_key = false;
+    for lit in layout.strings.iter().filter(|l| overlaps(&l.raw)) {
+        let mut clip = s.max(lit.raw.start)..e.min(lit.raw.end);
+        covered += clip.len();
+        if lit.is_key {
+            on_key = true;
+            continue;
+        }
+        for esc in layout.escapes.iter().filter(|x| overlaps(x)) {
+            if esc.start < clip.start && clip.start < esc.end {
+                clip.start = esc.start;
+            }
+            if esc.start < clip.end && clip.end < esc.end {
+                clip.end = esc.end;
+            }
+        }
+        edits.push(Edit {
+            range: clip,
+            quoted: false,
+            tag: f.kind.tag().to_string(),
+        });
+    }
+    for num in layout.numbers.iter().filter(|n| overlaps(n)) {
+        covered += e.min(num.end) - s.max(num.start);
+        edits.push(Edit {
+            range: num.clone(),
+            quoted: true,
+            tag: f.kind.tag().to_string(),
+        });
+    }
+    // Anything in the span that is not inside a string or a number is
+    // quotes, separators or a key: structure.
+    on_key || covered < e - s
+}
+
+fn apply(content: &[u8], mut edits: Vec<Edit>, discarded: usize) -> Redacted {
+    edits.sort_by_key(|x| (x.range.start, x.range.end));
     let mut out = Vec::with_capacity(content.len());
+    let mut applied = Vec::new();
     let mut cursor = 0usize;
     let mut i = 0usize;
-    while i < spans.len() {
-        let (start, mut end, tag) = spans[i];
-        // Merge everything that overlaps or abuts this span.
+    while i < edits.len() {
+        let start = edits[i].range.start;
+        let mut end = edits[i].range.end;
+        let quoted = edits[i].quoted;
+        let tag = edits[i].tag.clone();
+        // Merge everything that overlaps or abuts this edit.
         i += 1;
-        while i < spans.len() && spans[i].0 <= end {
-            end = end.max(spans[i].1);
+        while i < edits.len() && edits[i].range.start <= end {
+            end = end.max(edits[i].range.end);
             i += 1;
         }
         if start >= cursor {
             out.extend_from_slice(&content[cursor..start]);
-            out.extend_from_slice(&marker(tag));
+            if quoted {
+                out.push(b'"');
+            }
+            out.extend_from_slice(&marker(&tag));
+            if quoted {
+                out.push(b'"');
+            }
+            applied.push(tag);
             cursor = end;
         }
     }
     out.extend_from_slice(&content[cursor..]);
-    Ok(out)
+    Redacted {
+        content: out,
+        applied,
+        discarded,
+    }
 }
 
 #[cfg(test)]
@@ -195,7 +304,7 @@ mod tests {
 
     fn redact_owned(content: &str, findings: &[Finding]) -> Result<String, String> {
         let refs: Vec<&Finding> = findings.iter().collect();
-        redact(content.as_bytes(), &refs).map(|b| String::from_utf8(b).unwrap())
+        redact(content.as_bytes(), &refs).map(|r| String::from_utf8(r.content).unwrap())
     }
 
     #[test]
@@ -309,6 +418,144 @@ mod tests {
             GatePolicy::default().on_classifier_error,
             Action::Deny,
             "a gate whose detector is down must not pass writes through"
+        );
+    }
+
+    // ── JSON structure is never changed ─────────────────────────────────
+
+    fn probable(span: std::ops::Range<usize>, kind: &str) -> Finding {
+        Finding {
+            kind: FindingKind::Other(kind.into()),
+            span,
+            confidence: Confidence::Probable,
+        }
+    }
+
+    fn at(doc: &str, needle: &str) -> std::ops::Range<usize> {
+        let i = doc.find(needle).expect("needle in doc");
+        i..i + needle.len()
+    }
+
+    fn parses(s: &str) -> serde_json::Value {
+        serde_json::from_str(s).unwrap_or_else(|e| panic!("redaction broke the JSON ({e}): {s}"))
+    }
+
+    #[test]
+    fn a_detector_reading_a_key_is_discarded_and_the_message_survives() {
+        // The case a real analyzer produced: NER tagged the key "to",
+        // quotes included, as a LOCATION.
+        let doc = r#"{"from":"edge-agent","to":"cloud-agent","body":"客户张三你好"}"#;
+        let refs = [
+            &probable(at(doc, r#""to""#), "LOCATION"),
+            &probable(at(doc, "张三"), "PERSON"),
+        ];
+        let r = redact(doc.as_bytes(), &refs).unwrap();
+        let v = parses(std::str::from_utf8(&r.content).unwrap());
+        assert_eq!(v["to"], "cloud-agent", "the key and its value are schema");
+        assert_eq!(v["body"], "客户[REDACTED:PERSON]你好");
+        assert_eq!(r.applied, vec!["PERSON"]);
+        assert_eq!(r.discarded, 1);
+    }
+
+    #[test]
+    fn a_provable_identifier_on_a_key_is_refused() {
+        let doc = r#"{"4111111111111111":"x"}"#;
+        let err = redact(
+            doc.as_bytes(),
+            &[&finding(at(doc, "4111111111111111"), FindingKind::BankCard)],
+        )
+        .unwrap_err();
+        assert!(err.contains("JSON structure"), "{err}");
+    }
+
+    #[test]
+    fn a_number_is_replaced_by_a_quoted_marker() {
+        let doc = r#"{"card":4111111111111111,"n":1}"#;
+        let got = redact_owned(
+            doc,
+            &[finding(at(doc, "4111111111111111"), FindingKind::BankCard)],
+        )
+        .unwrap();
+        let v = parses(&got);
+        assert_eq!(v["card"], "[REDACTED:BANK-CARD]");
+        assert_eq!(v["n"], 1);
+    }
+
+    #[test]
+    fn a_span_that_includes_the_quotes_is_clipped_to_the_value() {
+        let doc = r#"{"b":"张三"}"#;
+        let got = redact_owned(doc, &[probable(at(doc, r#""张三""#), "PERSON")]).unwrap();
+        assert_eq!(got, r#"{"b":"[REDACTED:PERSON]"}"#);
+    }
+
+    #[test]
+    fn a_span_across_two_values_is_redacted_value_by_value() {
+        let doc = r#"{"a":"甲乙","b":"丙丁"}"#;
+        let s = doc.find('乙').unwrap();
+        let e = doc.find('丙').unwrap() + '丙'.len_utf8();
+        let got = redact_owned(doc, &[probable(s..e, "PERSON")]).unwrap();
+        let v = parses(&got);
+        assert_eq!(v["a"], "甲[REDACTED:PERSON]");
+        assert_eq!(v["b"], "[REDACTED:PERSON]丁");
+    }
+
+    #[test]
+    fn an_escape_sequence_is_never_cut() {
+        // A span that starts on the quote of `\"` would leave a dangling
+        // backslash that escapes the marker's first byte.
+        let doc = r#"{"b":"x\"y"}"#;
+        let q = doc.find(r#"\""#).unwrap() + 1;
+        let got = redact_owned(doc, &[probable(q..q + 2, "X")]).unwrap();
+        let v = parses(&got);
+        assert_eq!(v["b"], "x[REDACTED:X]");
+    }
+
+    #[test]
+    fn non_json_content_is_redacted_as_given() {
+        let got = redact_owned(
+            "not json: 4111111111111111.",
+            &[finding(10..26, FindingKind::BankCard)],
+        );
+        assert_eq!(got.unwrap(), "not json: [REDACTED:BANK-CARD].");
+    }
+
+    #[test]
+    fn no_span_anywhere_can_break_the_json() {
+        // Property: whatever span a detector reports, a redaction either
+        // keeps the document parseable or refuses. Exercised over every
+        // char-aligned span of a document with keys, escapes, numbers,
+        // nesting and multi-byte text.
+        let esc = format!("{}u5f20", '\\');
+        let doc = format!(
+            r#"{{"from":"a","to":"b","n":-12.5e2,"card":4111111111111111,"body":"q\"t\\ {esc}三 中文 x","list":[1,"张三",{{"k":"李四"}}],"t":true}}"#
+        );
+        assert!(serde_json::from_str::<serde_json::Value>(&doc).is_ok());
+        let bounds: Vec<usize> = (0..=doc.len())
+            .filter(|&i| doc.is_char_boundary(i))
+            .collect();
+        let mut checked = 0;
+        for (i, &s) in bounds.iter().enumerate() {
+            for &e in &bounds[i + 1..] {
+                for conf in [Confidence::Probable, Confidence::Certain] {
+                    let f = Finding {
+                        kind: FindingKind::Other("X".into()),
+                        span: s..e,
+                        confidence: conf,
+                    };
+                    if let Ok(r) = redact(doc.as_bytes(), &[&f]) {
+                        let out = String::from_utf8(r.content).expect("still UTF-8");
+                        assert!(
+                            serde_json::from_str::<serde_json::Value>(&out).is_ok(),
+                            "span {s}..{e} ({conf:?}) broke the JSON: {out}"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            checked > 1000,
+            "the property must actually be exercised ({checked})"
         );
     }
 }

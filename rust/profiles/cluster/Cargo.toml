@@ -72,6 +72,11 @@ driver-ai = [
 # different detector or posture calls `egress_gate::service_decl` from its
 # own composition instead of taking `default_service_decls` unmodified.
 egress-gate = ["dep:egress-gate"]
+# The gate with contextual detection: a local Presidio analyzer (named by
+# `NEXUS_EGRESS_GATE_PRESIDIO_URL`, loopback only) runs alongside the
+# deterministic rules. Adds one small dependency (`httparse`, already in this
+# binary through hyper); the analyzer itself is a separate local service.
+egress-gate-presidio = ["egress-gate", "egress-gate/presidio"]
 
 [dependencies]
 nexus-rebac = { path = "../../rebac", optional = true }

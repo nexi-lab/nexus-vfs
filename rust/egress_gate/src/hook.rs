@@ -276,14 +276,26 @@ impl NativeInterceptHook for EgressContentHook {
                 ))
             }
             Action::Redact => match redact(&c.content, &actionable) {
-                Ok(bytes) => {
+                // Everything found was a detector reading the schema (a
+                // key, a quote) — nothing to rewrite, nothing to report as
+                // redacted.
+                Ok(r) if r.applied.is_empty() => {
+                    tracing::debug!(
+                        path = %c.path, classifier = %self.classifier.name(),
+                        discarded = r.discarded,
+                        "egress gate: findings on JSON structure discarded"
+                    );
+                    Ok(HookOutcome::Pass)
+                }
+                Ok(r) => {
                     tracing::warn!(
                         path = %c.path, agent_id = %c.identity.agent_id,
                         classifier = %self.classifier.name(),
-                        kinds = ?kinds, count = actionable.len(),
+                        kinds = ?r.applied, count = r.applied.len(),
+                        discarded = r.discarded,
                         "egress gate: content redacted"
                     );
-                    Ok(HookOutcome::Replace(bytes))
+                    Ok(HookOutcome::Replace(r.content))
                 }
                 // Known-sensitive content that cannot be sanitised
                 // faithfully must not be written. See `enforce::redact`.
