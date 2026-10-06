@@ -524,14 +524,31 @@ impl Kernel {
         // ``new_current_thread()`` per call so the runtime does not
         // linger when the future has not finished draining.
         //
-        // Pass the file's **content_id** to the peer when we have one
-        // (CAS hash for content-addressed storage, backend_path for
-        // path-addressed storage). The peer's ``BlobFetcher::read``
-        // then either fans out by hash across CAS backends or routes
-        // the path to its own mount table. Falls back to the
-        // user-facing global ``path`` when content_id is unset (cold
-        // dcache or unwritten metadata) — ``BlobFetcher::read`` will
-        // path-route it through the peer's VFSRouter.
+        // The key is the user-facing global ``path``, NEVER this entry's
+        // ``content_id``.
+        //
+        // ``content_id`` is a BACKEND-INTERNAL address — a CAS hash, or for a
+        // path-addressed mount the writer's ``backend_path``. The peer's
+        // ``BlobFetcher::read`` routes the key through its own ``VFSRouter``
+        // and keys any metadata it materializes on it, and neither is sound for
+        // a key that is not a caller path. Sending a `backend_path` reached the
+        // bytes anyway — a mount at `/agents` produced `health-founder.txt`,
+        // which fell to the peer's root-zone fallback and was then found by the
+        // fan-out in ``BlobFetcher::read`` — so the read passed while the
+        // routing underneath it was meaningless. Subtree-anchored backend paths
+        // (nexi-lab/nexus-vfs#361) made the same key `agents/health-founder.txt`,
+        // which trips the mount-prefix precondition in `under_mount` outright;
+        // that refusal is how this was found.
+        //
+        // A global path costs nothing in reach: the peer resolves it against
+        // ITS OWN metadata (`lookup_local_content_id`) to get whichever
+        // content_id its backends understand — a CAS hash where it is CAS, its
+        // own backend_path where it is PAS — and falls back to the route's
+        // `backend_path` on a cold metastore. That indirection is strictly
+        // wider than anything the writer's address could name, and it keeps a
+        // backend-internal identifier from crossing a node boundary at all.
+        // Raw-hash fetches with no path (CAS chunk fan-out) address `ReadBlob`
+        // directly and do not come through here.
         //
         // This is a pure read: the fetched bytes are returned to the
         // caller and NOT written back into the local backend. Reads are
@@ -544,11 +561,7 @@ impl Kernel {
         // ``peer_client`` is ``RwLock<Arc<dyn PeerBlobClient>>``;
         // ``peer_client_arc()`` clones the Arc out from under the read
         // lock so the actual fetch happens lock-free.
-        let fetch_key = entry
-            .content_id
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .unwrap_or(path);
+        let fetch_key = path;
         let client = self.peer_client_arc();
         let data = client.fetch(origin, fetch_key).map_err(|e| {
             // Surface cross-node fetch failures — otherwise the error string
