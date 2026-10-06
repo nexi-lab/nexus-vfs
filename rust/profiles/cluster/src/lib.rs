@@ -1188,10 +1188,22 @@ pub fn default_service_decls(ctx: &ServiceBootCtx) -> Vec<kernel::kernel::Servic
     // included — though it does not depend on that: mutating hooks compose
     // (`NativeHookRegistry::dispatch_pre`), so the stamp and the
     // redaction both survive either order. Shadowed, same as above.
+    //
+    // The model plane is the third way out, and it can only exist where the
+    // LLM mount driver does, so the prompt leaf is handed over only in a
+    // `driver-ai` build. Which mounts lead off the node is the deployment's
+    // to say (`NEXUS_EGRESS_GATE_MODEL_MOUNTS`). Ordering against the mount
+    // driver is not load-bearing either: the driver fires in `on_post` and
+    // reads the request back from storage, so it sends what the gate let
+    // through.
     #[cfg(feature = "egress-gate")]
     let services = {
         let mut services = services;
-        services.push(egress_gate::service_decl_deterministic());
+        #[cfg(feature = "driver-ai")]
+        let prompt_suffix = Some(llm_mount::PROMPT_SUFFIX);
+        #[cfg(not(feature = "driver-ai"))]
+        let prompt_suffix = None;
+        services.push(egress_gate::service_decl_from_env(prompt_suffix));
         services
     };
     services

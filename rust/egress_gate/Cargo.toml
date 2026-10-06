@@ -32,6 +32,12 @@ tracing = "0.1"
 # The composition test reads an envelope back out of the transcript stream
 # to assert the stamp and the redaction both survived.
 serde_json = { workspace = true }
+# The model-plane test drives a real LLM mount through the real OpenAI
+# connector and captures what it sends upstream — test-only, so the gate
+# itself never links an HTTP stack.
+llm-mount = { workspace = true }
+backends = { workspace = true, features = ["driver-openai"] }
+tempfile = "3"
 
 [lints]
 workspace = true

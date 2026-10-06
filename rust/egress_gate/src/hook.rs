@@ -32,7 +32,7 @@ use kernel::core::dispatch::{HookContext, HookOutcome, NativeInterceptHook};
 use crate::classifier::{EgressClassifier, EgressRequest};
 use crate::enforce::{redact, Action, GatePolicy};
 
-/// Paths the gate claims by default: the A2A conversation transcript.
+/// Leaves the gate claims by default: the A2A conversation transcript.
 ///
 /// This is the plane the collaboration discipline is written against — a
 /// message leaving the node is the one crossing that it is supposed to be
@@ -40,49 +40,147 @@ use crate::enforce::{redact, Action, GatePolicy};
 /// a rename of the leaf reaches the gate.
 pub const DEFAULT_EGRESS_SUFFIXES: &[&str] = a2a::MAILBOX_WRITE_SUFFIXES;
 
+/// One way content leaves the node: a write leaf, optionally confined to
+/// some mounts.
+///
+/// The confinement is what lets the model plane be gated at all. An LLM
+/// mount's request leaf is `.prompt` on every model mount, but only some
+/// of those mounts leave the node. A prompt to a model served on the box
+/// itself is the private-data path working as designed — the discipline is
+/// that an agent which has touched customer data may only use a local
+/// model — and redacting it would break the one model that is allowed to
+/// see the data. So the model plane is "`.prompt` under the egress mounts",
+/// never "`.prompt`".
+#[derive(Debug, Clone)]
+pub struct EgressPlane {
+    suffix: &'static str,
+    /// Mount points, normalised without a trailing `/`. Empty = anywhere.
+    under: Vec<String>,
+}
+
+impl EgressPlane {
+    /// The leaf, wherever it is written.
+    #[must_use]
+    pub fn anywhere(suffix: &'static str) -> Self {
+        Self {
+            suffix,
+            under: Vec::new(),
+        }
+    }
+
+    /// The leaf, only beneath one of `mounts`.
+    ///
+    /// # Errors
+    ///
+    /// A mount that is not an absolute path, or that names the root. The
+    /// root is refused rather than read as "everywhere" because confining
+    /// to it is never what an operator listing egress mounts meant; a
+    /// plane that really is everywhere is [`Self::anywhere`], said
+    /// explicitly. An empty list is refused for the same reason — it would
+    /// silently claim nothing.
+    pub fn under<I, S>(suffix: &'static str, mounts: I) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut under = Vec::new();
+        for m in mounts {
+            let m = m.as_ref().trim();
+            let normalised = m.trim_end_matches('/');
+            if !m.starts_with('/') || normalised.is_empty() {
+                return Err(format!(
+                    "egress mount {m:?} must be an absolute path below the root"
+                ));
+            }
+            under.push(normalised.to_string());
+        }
+        if under.is_empty() {
+            return Err(format!("egress plane {suffix:?} confined to no mounts"));
+        }
+        Ok(Self { suffix, under })
+    }
+
+    /// The A2A transcript planes — [`DEFAULT_EGRESS_SUFFIXES`], anywhere.
+    #[must_use]
+    pub fn a2a_transcripts() -> Vec<Self> {
+        DEFAULT_EGRESS_SUFFIXES
+            .iter()
+            .map(|s| Self::anywhere(s))
+            .collect()
+    }
+
+    fn covers(&self, path: &str) -> bool {
+        if !path.ends_with(self.suffix) {
+            return false;
+        }
+        // Segment-boundary prefix match: `/cloud-model` covers
+        // `/cloud-model/ask.prompt` but not `/cloud-models-local/ask.prompt`.
+        self.under.is_empty()
+            || self.under.iter().any(|m| {
+                path.strip_prefix(m.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+            })
+    }
+}
+
 /// Classify-and-enforce on the kernel write seam.
 pub struct EgressContentHook {
     classifier: Arc<dyn EgressClassifier>,
     policy: GatePolicy,
+    planes: Vec<EgressPlane>,
+    /// The planes' leaves, deduplicated, for the kernel's clone gate.
     suffixes: &'static [&'static str],
 }
 
 impl EgressContentHook {
-    /// Gate [`DEFAULT_EGRESS_SUFFIXES`] with the default policy (redact
-    /// on a finding, deny when the classifier fails).
+    /// Gate the A2A transcript with the default policy (redact on a
+    /// finding, deny when the classifier fails).
     #[must_use]
     pub fn new(classifier: Arc<dyn EgressClassifier>) -> Self {
-        Self::with_policy(classifier, GatePolicy::default(), DEFAULT_EGRESS_SUFFIXES)
+        Self::with_policy(
+            classifier,
+            GatePolicy::default(),
+            EgressPlane::a2a_transcripts(),
+        )
     }
 
-    /// Full control over policy and claimed paths.
+    /// Full control over policy and claimed planes.
     ///
-    /// `suffixes` is `&'static` because the kernel's clone gate reads it
-    /// from the registered hook. Widening it is how the gate grows to
-    /// cover another egress plane — the model-call leaf of an LLM mount,
-    /// say — without the hook itself changing: a composition decision, not
-    /// a code change here.
+    /// Growing the gate to cover another way out — the model plane, say —
+    /// is a composition decision made here, not a change to the hook.
     #[must_use]
     pub fn with_policy(
         classifier: Arc<dyn EgressClassifier>,
         policy: GatePolicy,
-        suffixes: &'static [&'static str],
+        planes: Vec<EgressPlane>,
     ) -> Self {
+        let mut leaves: Vec<&'static str> = Vec::new();
+        for p in &planes {
+            if !leaves.contains(&p.suffix) {
+                leaves.push(p.suffix);
+            }
+        }
+        // The kernel reads the clone-gate suffixes as `&'static`, and a
+        // plane set is only known at boot. Leaking it is bounded — one
+        // small slice per hook constructed, and the daemon constructs one.
+        let suffixes: &'static [&'static str] = Box::leak(leaves.into_boxed_slice());
         Self {
             classifier,
             policy,
+            planes,
             suffixes,
         }
     }
 
     /// Whether this hook claims `path`.
     ///
-    /// Required, not defensive: the clone gate is global, so content is
-    /// cloned into the context whenever *any* registered mutating hook's
-    /// suffix matches. Without this check the gate would classify writes
-    /// on paths it was never installed for.
+    /// Required, not defensive: the clone gate is global and suffix-only,
+    /// so content is cloned into the context whenever *any* registered
+    /// mutating hook's suffix matches — including a `.prompt` on a local
+    /// model mount this gate deliberately does not cover. Without this
+    /// check the gate would classify writes it was never installed for.
     fn claims(&self, path: &str) -> bool {
-        self.suffixes.iter().any(|s| path.ends_with(s))
+        self.planes.iter().any(|p| p.covers(path))
     }
 }
 
@@ -238,7 +336,7 @@ mod tests {
         EgressContentHook::with_policy(
             Arc::new(DeterministicRules::new()),
             policy,
-            DEFAULT_EGRESS_SUFFIXES,
+            EgressPlane::a2a_transcripts(),
         )
     }
 
@@ -393,7 +491,7 @@ mod tests {
                 on_classifier_error: Action::Allow,
                 ..GatePolicy::default()
             },
-            DEFAULT_EGRESS_SUFFIXES,
+            EgressPlane::a2a_transcripts(),
         );
         let out = hook
             .on_pre(&write_ctx(TRANSCRIPT, r#"{"body":"anything"}"#))
@@ -408,5 +506,105 @@ mod tests {
             .on_pre(&write_ctx(TRANSCRIPT, r#"{"body":"short"}"#))
             .expect_err("a redaction that cannot be applied must deny");
         assert!(err.contains("cannot redact"), "{err}");
+    }
+
+    // ── Plane scoping ───────────────────────────────────────────────────
+
+    fn model_gate(mounts: &[&str]) -> EgressContentHook {
+        let mut planes = EgressPlane::a2a_transcripts();
+        planes.push(EgressPlane::under(".prompt", mounts.iter().copied()).expect("valid mounts"));
+        EgressContentHook::with_policy(
+            Arc::new(DeterministicRules::new()),
+            GatePolicy::default(),
+            planes,
+        )
+    }
+
+    #[test]
+    fn redacts_a_prompt_to_an_egress_model_mount() {
+        let body = format!(r#"{{"messages":[{{"role":"user","content":"身份证 {ID_OK}"}}]}}"#);
+        let got = replaced(
+            model_gate(&["/cloud-model"])
+                .on_pre(&write_ctx("/cloud-model/ask-1.prompt", &body))
+                .unwrap(),
+        );
+        assert!(!got.contains(ID_OK), "{got}");
+        assert!(got.contains("[REDACTED:PRC-ID]"), "{got}");
+    }
+
+    #[test]
+    fn leaves_a_prompt_to_a_local_model_mount_alone() {
+        // The local model is the one allowed to see the data; redacting its
+        // prompt would break the private-data path the discipline relies on.
+        let body = format!(r#"{{"messages":[{{"role":"user","content":"身份证 {ID_OK}"}}]}}"#);
+        let out = model_gate(&["/cloud-model"])
+            .on_pre(&write_ctx("/model/ask-1.prompt", &body))
+            .unwrap();
+        assert!(matches!(out, HookOutcome::Pass));
+    }
+
+    #[test]
+    fn mount_scope_is_segment_bounded() {
+        let body = format!(r#"{{"c":"{ID_OK}"}}"#);
+        let out = model_gate(&["/cloud-model"])
+            .on_pre(&write_ctx("/cloud-models-local/ask-1.prompt", &body))
+            .unwrap();
+        assert!(
+            matches!(out, HookOutcome::Pass),
+            "a sibling mount sharing a name prefix must not be claimed"
+        );
+    }
+
+    #[test]
+    fn trailing_slash_on_a_mount_is_normalised() {
+        let body = format!(r#"{{"c":"{ID_OK}"}}"#);
+        let got = replaced(
+            model_gate(&["/cloud-model/"])
+                .on_pre(&write_ctx("/cloud-model/ask-1.prompt", &body))
+                .unwrap(),
+        );
+        assert!(!got.contains(ID_OK));
+    }
+
+    #[test]
+    fn transcript_plane_still_applies_beside_a_model_plane() {
+        let body = format!(r#"{{"body":"{ID_OK}"}}"#);
+        let got = replaced(
+            model_gate(&["/cloud-model"])
+                .on_pre(&write_ctx(TRANSCRIPT, &body))
+                .unwrap(),
+        );
+        assert!(!got.contains(ID_OK));
+    }
+
+    #[test]
+    fn clone_gate_carries_each_leaf_once() {
+        let mut planes = EgressPlane::a2a_transcripts();
+        planes.push(EgressPlane::under(".prompt", ["/a"]).unwrap());
+        planes.push(EgressPlane::under(".prompt", ["/b"]).unwrap());
+        let hook = EgressContentHook::with_policy(
+            Arc::new(DeterministicRules::new()),
+            GatePolicy::default(),
+            planes,
+        );
+        let mut leaves = hook.mutating_path_suffixes().to_vec();
+        leaves.sort_unstable();
+        assert_eq!(leaves, vec![".prompt", "/transcript"]);
+    }
+
+    #[test]
+    fn a_plane_confined_to_nothing_is_refused() {
+        // An empty mount list would claim nothing and look armed.
+        assert!(EgressPlane::under(".prompt", Vec::<String>::new()).is_err());
+    }
+
+    #[test]
+    fn root_and_relative_mounts_are_refused() {
+        for bad in ["/", "//", "cloud-model", "", "  "] {
+            assert!(
+                EgressPlane::under(".prompt", [bad]).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
     }
 }

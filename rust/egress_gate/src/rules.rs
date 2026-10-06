@@ -22,30 +22,40 @@
 //!
 //! # Scanning model
 //!
-//! The content is split into maximal runs of ASCII alphanumerics, and
-//! each run is scanned. Within a run:
+//! Every numeric identifier is anchored on a **digit boundary**: the whole
+//! maximal run of digits must be the identifier, never a window inside a
+//! longer one.
 //!
-//! * **checksum-backed kinds slide a window** (widths 19 down to 13,
-//!   longest first), so an identifier embedded in a longer token is still
-//!   found. Sliding is safe here precisely because each window must pass
-//!   a checksum to be reported.
-//! * **shape-only kinds require the whole run** — a mobile number has
-//!   nothing to verify it with, so sliding an 11-digit shape window
-//!   across arbitrary digits would report mostly noise.
+//! That rule is load-bearing, and it is measured rather than assumed. An
+//! earlier version slid a 13–19 wide window across each run so an
+//! identifier embedded in a longer token would still be found. Sliding
+//! multiplies the candidates a long number offers — a 19-digit snowflake
+//! id holds 28 card-width windows — and over 20,000 random samples it
+//! reported **49.4% of snowflake ids and 33% of nanosecond timestamps** as
+//! bank cards. Anchored, with per-brand card lengths, those fall to 0.14%
+//! and 0%. A gate on a channel that carries machine output cannot afford
+//! the first number.
 //!
-//! The consequence, stated plainly: a mobile number glued to adjacent
-//! alphanumerics (`tel13912345678end`) is missed. That is the honest cost
-//! of refusing to guess, and it is the kind of gap the richer provider
-//! closes.
+//! The anchor is a digit boundary, not a word boundary, so letters do not
+//! break it: `userid11010519491231002Xsuffix` and `tel13912345678end` are
+//! both found.
+//!
+//! * PRC identity card — an 18-digit run, or 17 digits then `X`/`x`.
+//! * Payment card — a 13–19 digit run, or the same digits in display
+//!   grouping (`6222 0212 3456 7890`, `4111-1111-1111-1111`).
+//! * Mainland mobile — an 11-digit run in a real carrier segment.
+//! * Unified social credit identifier — a maximal upper-case alphanumeric
+//!   run of 18.
+//!
+//! The anchoring rule, the per-brand card lengths, the carrier-segment
+//! table and the grouped display format are borrowed from shellward
+//! (`jnMetaCode/shellward`, Apache-2.0, `src/rules/sensitive-patterns.ts`).
+//! The rules, not the code.
 
 use crate::classifier::{
     Classification, Confidence, EgressClassifier, EgressRequest, Finding, FindingKind,
 };
 
-/// Narrowest checksum-backed candidate considered (shortest payment card).
-const MIN_WINDOW: usize = 13;
-/// Widest checksum-backed candidate considered (longest payment card).
-const MAX_WINDOW: usize = 19;
 /// PRC identity cards and unified social credit identifiers are both this
 /// wide.
 const ID_WIDTH: usize = 18;
@@ -80,83 +90,151 @@ impl EgressClassifier for DeterministicRules {
     }
 }
 
-/// Locate every provable identifier in `content`.
+/// Locate every provable identifier in `content`, in content order.
 #[must_use]
 pub fn scan(content: &[u8]) -> Vec<Finding> {
     let mut findings = Vec::new();
+    scan_digit_runs(content, &mut findings);
+    scan_usci_runs(content, &mut findings);
+    findings.sort_by_key(|f| f.span.start);
+    findings
+}
+
+fn digit_run_end(c: &[u8], start: usize) -> usize {
+    let mut end = start;
+    while end < c.len() && c[end].is_ascii_digit() {
+        end += 1;
+    }
+    end
+}
+
+fn scan_digit_runs(c: &[u8], out: &mut Vec<Finding>) {
     let mut i = 0;
-    while i < content.len() {
-        if !content[i].is_ascii_alphanumeric() {
+    while i < c.len() {
+        if !c[i].is_ascii_digit() {
             i += 1;
             continue;
         }
         let start = i;
-        while i < content.len() && content[i].is_ascii_alphanumeric() {
-            i += 1;
+        let end = digit_run_end(c, start);
+        if let Some(group_end) = grouped_card(c, start, end) {
+            out.push(Finding {
+                kind: FindingKind::BankCard,
+                span: start..group_end,
+                confidence: Confidence::Certain,
+            });
+            i = group_end;
+            continue;
         }
-        scan_run(content, start, i, &mut findings);
-    }
-    findings
-}
-
-/// Scan one maximal alphanumeric run, `content[start..end]`.
-fn scan_run(content: &[u8], start: usize, end: usize, out: &mut Vec<Finding>) {
-    let run = &content[start..end];
-
-    // Shape-only kind: the whole run must be the number. Checked before
-    // the sliding loop and returning early, because nothing wider than 11
-    // can fit in an 11-byte run anyway.
-    if run.len() == MOBILE_WIDTH && is_prc_mobile(run) {
-        out.push(Finding {
-            kind: FindingKind::PrcMobile,
-            span: start..end,
-            confidence: Confidence::Probable,
-        });
-        return;
-    }
-
-    let mut w = 0;
-    while w < run.len() {
-        let mut matched = 0;
-        // Longest first, so a 19-digit card is not reported as a shorter
-        // Luhn-valid prefix of itself.
-        for width in (MIN_WINDOW..=MAX_WINDOW).rev() {
-            if w + width > run.len() {
-                continue;
-            }
-            if let Some(kind) = classify_window(&run[w..w + width]) {
-                out.push(Finding {
-                    kind,
-                    span: start + w..start + w + width,
-                    confidence: Confidence::Certain,
-                });
-                matched = width;
-                break;
-            }
+        if let Some((kind, span_end, confidence)) = classify_digit_run(c, start, end) {
+            out.push(Finding {
+                kind,
+                span: start..span_end,
+                confidence,
+            });
+            i = span_end;
+            continue;
         }
-        w += if matched > 0 { matched } else { 1 };
+        i = end;
     }
 }
 
-/// Identify one fixed-width candidate, or `None`.
+/// Identify the maximal digit run `c[start..end]`, returning the kind and
+/// where its span ends (one past `end` when an identity card's `X` check
+/// character is included).
 ///
-/// Order matters and is fixed: an 18-digit run can in principle satisfy
-/// both the identity-card and the social-credit checksum, so the card is
-/// tried first — its birth-date plausibility gate makes it the more
-/// specific of the two.
-fn classify_window(c: &[u8]) -> Option<FindingKind> {
-    if c.len() == ID_WIDTH {
-        if is_prc_id_card(c) {
-            return Some(FindingKind::PrcIdCard);
-        }
-        if is_usci(c) {
-            return Some(FindingKind::UnifiedSocialCreditId);
-        }
+/// Order matters: an identity card is tried before a card number because
+/// its date and division gates make it the more specific of the two.
+fn classify_digit_run(
+    c: &[u8],
+    start: usize,
+    end: usize,
+) -> Option<(FindingKind, usize, Confidence)> {
+    let run = &c[start..end];
+    // The `X` check character ends the identifier; the 17-digit run before
+    // it is already maximal, so whatever follows the `X` cannot make this a
+    // window inside a longer number.
+    if run.len() == ID_WIDTH - 1
+        && matches!(c.get(end), Some(b'X' | b'x'))
+        && is_prc_id_card(&c[start..=end])
+    {
+        return Some((FindingKind::PrcIdCard, end + 1, Confidence::Certain));
     }
-    if is_bank_card(c) {
-        return Some(FindingKind::BankCard);
+    if run.len() == ID_WIDTH && is_prc_id_card(run) {
+        return Some((FindingKind::PrcIdCard, end, Confidence::Certain));
+    }
+    if is_bank_card(run) {
+        return Some((FindingKind::BankCard, end, Confidence::Certain));
+    }
+    if is_prc_mobile(run) {
+        return Some((FindingKind::PrcMobile, end, Confidence::Probable));
     }
     None
+}
+
+/// A card number in display grouping, starting at the digit run
+/// `c[start..end]`: three or more groups of 3–6 digits joined by one
+/// consistent single separator (space or hyphen). Returns the end of the
+/// last group when the joined digits are a card.
+///
+/// Three groups minimum, so a date (`2026-10-02`) or a spaced phone number
+/// (`139 1234 5678`, 11 digits) can never qualify — the joined digits must
+/// still pass the same brand, length and Luhn gates as an ungrouped card.
+fn grouped_card(c: &[u8], start: usize, end: usize) -> Option<usize> {
+    const GROUP: std::ops::RangeInclusive<usize> = 3..=6;
+    if !GROUP.contains(&(end - start)) {
+        return None;
+    }
+    let sep = *c.get(end)?;
+    if sep != b' ' && sep != b'-' {
+        return None;
+    }
+    let mut digits = c[start..end].to_vec();
+    let mut groups = 1;
+    let mut cursor = end;
+    while c.get(cursor) == Some(&sep) {
+        let g_start = cursor + 1;
+        let g_end = digit_run_end(c, g_start);
+        if !GROUP.contains(&(g_end - g_start)) {
+            break;
+        }
+        digits.extend_from_slice(&c[g_start..g_end]);
+        groups += 1;
+        cursor = g_end;
+        if digits.len() > 19 {
+            return None;
+        }
+    }
+    (groups >= 3 && is_bank_card(&digits)).then_some(cursor)
+}
+
+/// Unified social credit identifiers are alphanumeric, so they are found
+/// on their own boundary: a maximal run of `[0-9A-Z]` exactly 18 long.
+/// A span the digit pass already claimed (an 18-digit identity card) is
+/// not reported twice.
+fn scan_usci_runs(c: &[u8], out: &mut Vec<Finding>) {
+    let upper_alnum = |b: u8| b.is_ascii_digit() || b.is_ascii_uppercase();
+    let mut i = 0;
+    while i < c.len() {
+        if !upper_alnum(c[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < c.len() && upper_alnum(c[i]) {
+            i += 1;
+        }
+        if i - start == ID_WIDTH
+            && is_usci(&c[start..i])
+            && !out.iter().any(|f| f.span.start < i && start < f.span.end)
+        {
+            out.push(Finding {
+                kind: FindingKind::UnifiedSocialCreditId,
+                span: start..i,
+                confidence: Confidence::Certain,
+            });
+        }
+    }
 }
 
 // ── PRC resident identity card (GB 11643-1999) ──────────────────────────
@@ -219,7 +297,17 @@ fn usci_value(b: u8) -> Option<u32> {
     USCI_ALPHABET.iter().position(|&c| c == b).map(|p| p as u32)
 }
 
-/// 18-character unified social credit identifier, MOD 31-3 checked.
+/// 18-character unified social credit identifier: MOD 31-3 over the whole,
+/// and GB 11714 over the organization code it embeds.
+///
+/// Two checks, because one is not enough at 18 characters. MOD 31-3 alone
+/// passes a random 18-digit run 1 time in 31 (3.24% measured), which is
+/// the same "machine ids get flagged" failure the digit anchor exists to
+/// prevent. GB 32100 places the organization code (组织机构代码, GB 11714)
+/// at positions 9–17, and that code carries its own check character;
+/// requiring both brings a random run to 0.314%. Verified against real
+/// identifiers before relying on it — both checks hold on registered
+/// codes, so the second gate costs no recall on real data.
 ///
 /// Upper case only — the standard specifies upper case, and accepting
 /// lower case would widen the alphabet for no real recall.
@@ -237,41 +325,76 @@ fn is_usci(c: &[u8]) -> bool {
     let Some(check) = usci_value(c[17]) else {
         return false;
     };
-    (31 - (sum % 31)) % 31 == check
+    (31 - (sum % 31)) % 31 == check && is_org_code(&c[8..17])
+}
+
+/// GB 11714 weights over the organization code's 8 body characters.
+const ORG_WEIGHTS: [u32; 8] = [3, 7, 9, 10, 5, 8, 4, 2];
+
+/// 9-character organization code: 8 body characters (digits, or letters
+/// valued `A`=10 … `Z`=35) and a MOD 11 check character, `X` for 10 and
+/// `0` for 11.
+fn is_org_code(c: &[u8]) -> bool {
+    let value = |b: u8| -> Option<u32> {
+        match b {
+            b'0'..=b'9' => Some(u32::from(b - b'0')),
+            b'A'..=b'Z' => Some(u32::from(b - b'A') + 10),
+            _ => None,
+        }
+    };
+    let mut sum = 0u32;
+    for (&b, w) in c[..8].iter().zip(ORG_WEIGHTS) {
+        let Some(v) = value(b) else {
+            return false;
+        };
+        sum += v * w;
+    }
+    let expected = match 11 - sum % 11 {
+        10 => b'X',
+        11 => b'0',
+        r => b'0' + r as u8,
+    };
+    c[8] == expected
 }
 
 // ── Payment card ────────────────────────────────────────────────────────
 
-/// 13–19 digits, a recognised issuer prefix, and Luhn-valid.
+/// A recognised brand at that brand's length, and Luhn-valid.
 ///
-/// The issuer prefix is not decoration. Luhn alone passes 1 random run in
-/// 10, which over the digit runs in ordinary machine output (ids,
-/// concatenated timestamps) is far too loose; requiring a real IIN range
-/// as well brings a random-run false positive to roughly 1 in 50. That is
-/// still not zero, and a gate configured to redact will occasionally mask
-/// a long number that was never a card — the deliberate trade, since the
-/// opposite error leaks one.
+/// Neither gate is decoration. Luhn alone passes 1 random run in 10. An
+/// issuer prefix without its length still flags 3.19% of 19-digit ids —
+/// a Visa prefix is one digit, and nothing stopped a 19-digit run starting
+/// with `4`. Pinning each brand to the lengths it actually issues brings
+/// that to 0.14% while every published test card still passes. What
+/// remains (2.41% of random 16-digit numbers) is not reducible: a 16-digit
+/// Luhn-valid number with a Visa prefix *is* a card as far as any detector
+/// can tell.
 fn is_bank_card(c: &[u8]) -> bool {
-    if !(MIN_WINDOW..=MAX_WINDOW).contains(&c.len()) || !c.iter().all(u8::is_ascii_digit) {
+    if !(13..=19).contains(&c.len()) || !c.iter().all(u8::is_ascii_digit) {
         return false;
     }
-    has_known_iin(c) && luhn_ok(c)
+    brand_length_ok(c) && luhn_ok(c)
 }
 
-fn has_known_iin(c: &[u8]) -> bool {
+fn brand_length_ok(c: &[u8]) -> bool {
     let d = |i: usize| u32::from(c[i] - b'0');
     let two = d(0) * 10 + d(1);
     let four = two * 100 + d(2) * 10 + d(3);
-    d(0) == 4                                // Visa
-        || (51..=55).contains(&two)          // Mastercard
-        || (2221..=2720).contains(&four)     // Mastercard 2-series
-        || two == 34
-        || two == 37                         // Amex
-        || two == 62
-        || two == 81                         // UnionPay / 中国银联
-        || two == 35                         // JCB
-        || two == 36
-        || two == 38 // Diners
+    let n = c.len();
+    if d(0) == 4 {
+        return n == 13 || n == 16; // Visa
+    }
+    if (51..=55).contains(&two) || (2221..=2720).contains(&four) {
+        return n == 16; // Mastercard
+    }
+    match two {
+        34 | 37 => n == 15,                             // Amex
+        62 => (16..=19).contains(&n),                   // UnionPay / 中国银联
+        81 => n == 16,                                  // UnionPay 81 range
+        35 => (3528..=3589).contains(&four) && n == 16, // JCB
+        36 | 38 | 30 => n == 14,                        // Diners
+        _ => false,
+    }
 }
 
 fn luhn_ok(c: &[u8]) -> bool {
@@ -297,13 +420,26 @@ fn luhn_ok(c: &[u8]) -> bool {
 
 // ── Mainland mobile ─────────────────────────────────────────────────────
 
-/// 11 digits, `1` then `3`–`9`. No checksum exists, hence
-/// [`Confidence::Probable`] and the maximal-run requirement.
+/// 11 digits in an allocated carrier segment. No checksum exists, hence
+/// [`Confidence::Probable`] and the digit-boundary requirement.
+///
+/// The segment table (second and third digit) is what keeps arbitrary
+/// 11-digit numbers — order numbers, truncated timestamps — out: `1[3-9]`
+/// alone admits segments no carrier issues (`142`, `154`, `160`, `179`, `194`, …).
 fn is_prc_mobile(c: &[u8]) -> bool {
-    c.len() == MOBILE_WIDTH
-        && c[0] == b'1'
-        && (b'3'..=b'9').contains(&c[1])
-        && c.iter().all(u8::is_ascii_digit)
+    if c.len() != MOBILE_WIDTH || c[0] != b'1' || !c.iter().all(u8::is_ascii_digit) {
+        return false;
+    }
+    let third = c[2] - b'0';
+    match c[1] {
+        b'3' | b'8' => true,
+        b'4' => matches!(third, 0 | 1 | 4..=9),
+        b'5' => third != 4,
+        b'6' => matches!(third, 2 | 5 | 6 | 7),
+        b'7' => third <= 8,
+        b'9' => third != 4,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -327,10 +463,32 @@ mod tests {
     const UNIONPAY_OK: &str = "6212345678901232";
     /// Luhn-valid (verified) but no issuer owns a `9` prefix.
     const UNKNOWN_IIN: &str = "9111111111111110";
+    /// Luhn-valid (verified) with a Visa prefix, but 19 digits — a length
+    /// Visa does not issue at, so only the length gate can reject it.
+    const VISA_PREFIX_19: &str = "4111111111111111110";
 
-    /// Synthetic: Beijing enterprise prefix plus a filler body, check
-    /// character computed to satisfy MOD 31-3. Not a real registration.
-    const USCI_OK: &str = "91110000MA0ABCDEFX";
+    /// Synthetic: Beijing enterprise prefix and an organization code, both
+    /// check characters computed (MOD 31-3 and GB 11714) and verified. Not
+    /// a real registration.
+    const USCI_OK: &str = "91110000MA0ABCDE62";
+    /// Passes MOD 31-3 (verified) but its embedded organization code fails
+    /// GB 11714 — isolates the second gate.
+    const USCI_BAD_ORG: &str = "91110000MA0ABCD001";
+
+    /// Machine ids the earlier sliding-window scanner reported as bank
+    /// cards. Found by sampling, not constructed, so they are what real
+    /// traffic looks like: 19-digit snowflake ids and nanosecond
+    /// timestamps.
+    const SNOWFLAKE_FLAGGED_BEFORE: [&str; 3] = [
+        "8903166252872187431",
+        "8205464747235938445",
+        "5167417605511239617",
+    ];
+    const NS_TS_FLAGGED_BEFORE: [&str; 3] = [
+        "1754735533894457906",
+        "1753660912485173331",
+        "1855267831258558245",
+    ];
 
     fn kinds(s: &str) -> Vec<FindingKind> {
         scan(s.as_bytes()).into_iter().map(|f| f.kind).collect()
@@ -393,6 +551,42 @@ mod tests {
     }
 
     #[test]
+    fn usci_requires_a_valid_embedded_organization_code() {
+        // Self-check: the fixture must pass MOD 31-3 on its own, or the
+        // rejection below would prove nothing about the second gate.
+        let b = USCI_BAD_ORG.as_bytes();
+        let sum: u32 = b[..17]
+            .iter()
+            .zip(USCI_WEIGHTS)
+            .map(|(&c, w)| usci_value(c).unwrap() * w)
+            .sum();
+        assert_eq!(
+            (31 - (sum % 31)) % 31,
+            usci_value(b[17]).unwrap(),
+            "fixture must pass MOD 31-3, else this test is vacuous"
+        );
+        assert!(!is_org_code(&b[8..17]));
+        assert!(
+            !is_usci(b),
+            "MOD 31-3 alone passes 1 random run in 31; the organization code \
+             check is what holds machine ids out"
+        );
+    }
+
+    #[test]
+    fn finds_a_usci_on_its_own_boundary() {
+        assert_eq!(
+            kinds(&format!("统一社会信用代码：{USCI_OK}。")),
+            vec![FindingKind::UnifiedSocialCreditId]
+        );
+        // Lower-case letters are not in the USCI alphabet, so they bound it.
+        assert_eq!(
+            kinds(&format!("code{USCI_OK}")),
+            vec![FindingKind::UnifiedSocialCreditId]
+        );
+    }
+
+    #[test]
     fn finds_identifiers_inside_a_json_envelope() {
         let body =
             format!(r#"{{"from":"a","body":"身份证 {ID_OK}，卡号 {VISA_OK}，电话 13912345678"}}"#);
@@ -411,21 +605,82 @@ mod tests {
     }
 
     #[test]
-    fn checksum_kinds_are_found_inside_a_longer_token() {
-        // The sliding window is what makes this work; it is safe because
-        // every reported window had to pass a checksum.
-        let body = format!("userid{ID_OK}suffix");
-        assert_eq!(kinds(&body), vec![FindingKind::PrcIdCard]);
+    fn identifiers_glued_to_letters_are_found() {
+        // The anchor is a digit boundary, not a word boundary.
+        assert_eq!(
+            kinds(&format!("userid{ID_OK}suffix")),
+            vec![FindingKind::PrcIdCard]
+        );
+        assert_eq!(kinds("tel13912345678end"), vec![FindingKind::PrcMobile]);
     }
 
     #[test]
-    fn mobile_requires_a_maximal_run() {
+    fn an_identifier_inside_a_longer_digit_run_is_not_reported() {
+        // The rule that holds machine ids out: a checksum-valid window
+        // inside a longer number is not an identifier, it is part of the
+        // number.
+        assert!(kinds(&format!("99{ID_OK_2}99")).is_empty());
+        assert!(kinds(&format!("7{VISA_OK}")).is_empty());
+    }
+
+    #[test]
+    fn machine_ids_the_sliding_scanner_flagged_stay_clean() {
+        for s in SNOWFLAKE_FLAGGED_BEFORE
+            .iter()
+            .chain(NS_TS_FLAGGED_BEFORE.iter())
+        {
+            assert!(scan(s.as_bytes()).is_empty(), "false positive on {s}");
+        }
+    }
+
+    #[test]
+    fn card_length_is_checked_per_brand() {
+        assert!(
+            luhn_ok(VISA_PREFIX_19.as_bytes()),
+            "fixture must be Luhn-valid, else it tests nothing"
+        );
+        assert!(
+            !is_bank_card(VISA_PREFIX_19.as_bytes()),
+            "Visa does not issue 19-digit numbers; a prefix alone is not a brand"
+        );
+    }
+
+    #[test]
+    fn grouped_card_display_is_found_and_spans_the_separators() {
+        for (body, card) in [
+            ("卡号 6212 3456 7890 1232 已绑定", "6212 3456 7890 1232"),
+            ("card: 4111-1111-1111-1111.", "4111-1111-1111-1111"),
+        ] {
+            let f = scan(body.as_bytes());
+            assert_eq!(f.len(), 1, "{body}: {f:?}");
+            assert_eq!(f[0].kind, FindingKind::BankCard);
+            assert_eq!(&body[f[0].span.clone()], card);
+        }
+    }
+
+    #[test]
+    fn grouped_shapes_that_are_not_cards_stay_clean() {
+        for s in [
+            "2026-10-02",
+            "139 1234 5678",
+            "4111 1111-1111 1111", // inconsistent separator
+            "1234 5678 9012 3456", // grouped, but no brand owns `1`
+        ] {
+            assert!(scan(s.as_bytes()).is_empty(), "false positive on {s:?}");
+        }
+    }
+
+    #[test]
+    fn mobile_requires_an_allocated_carrier_segment() {
         assert_eq!(kinds("13912345678"), vec![FindingKind::PrcMobile]);
         assert_eq!(kinds("tel: 13912345678."), vec![FindingKind::PrcMobile]);
-        // Documented gap, pinned so a future change to it is a decision
-        // rather than an accident: glued to other alphanumerics there is
-        // no checksum to justify a sliding window, so it is missed.
-        assert!(kinds("tel13912345678end").is_empty());
+        for unallocated in ["15412345678", "16012345678", "17912345678", "19412345678"] {
+            assert!(kinds(unallocated).is_empty(), "{unallocated}");
+        }
+        assert!(
+            kinds("139123456789").is_empty(),
+            "12 digits is not a mobile"
+        );
     }
 
     #[test]
@@ -445,6 +700,11 @@ mod tests {
     fn overlapping_candidates_do_not_double_report() {
         let body = format!("{ID_OK}{VISA_OK}");
         let f = scan(body.as_bytes());
+        assert_eq!(
+            f.iter().map(|x| x.kind.clone()).collect::<Vec<_>>(),
+            vec![FindingKind::PrcIdCard, FindingKind::BankCard],
+            "{f:?}"
+        );
         for pair in f.windows(2) {
             assert!(
                 pair[0].span.end <= pair[1].span.start,
