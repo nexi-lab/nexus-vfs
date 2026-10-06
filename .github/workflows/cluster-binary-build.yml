@@ -67,17 +67,12 @@ jobs:
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster.exe
-            max_size_bytes: 16777216  # 16.0 MiB — raised from 15.5 for the
-                                      # session-identity plane: five RPCs
-                                      # (MintSessionAgent, RevokeAgentCert, and the
-                                      # three allow-list admin calls) plus the
-                                      # replicated allow-list store. Measured
-                                      # 16,264,704 bytes here against 16,114,688 on
-                                      # the parent commit — ~146 KB, most of it the
-                                      # tonic client+server code generated per RPC.
-                                      # This is the tightest-headroom platform; the
-                                      # other three absorbed the same change inside
-                                      # their existing budgets.
+            max_size_bytes: 17039360  # 16.25 MiB. The mailbox adapter adds
+                                      # 158,720 bytes over main's 16,663,552-byte
+                                      # Windows build after #384. Measured
+                                      # 16,822,272 bytes at 32bf5524e; this leaves
+                                      # 217,088 bytes of headroom. The previous
+                                      # 16 MiB cap was exceeded by 45,056 bytes.
 
 
     steps:
