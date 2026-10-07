@@ -115,7 +115,7 @@ async fn tls_armed_posture_declares_the_real_plane() {
         "TLS-on boot installs the containment provider — the gate is real"
     );
     let zr = caps.zone_runtime.expect("zone-runtime capability");
-    assert_eq!(zr.journal_zone, "__control__");
+    assert_eq!(zr.journal_zone, contracts::CONTROL_ZONE_ID);
     assert!(zr.deletion_protection);
 }
 

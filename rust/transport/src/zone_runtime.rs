@@ -9,15 +9,21 @@
 //! Authz (deliberately NOT `kernel.check_permission` for the admin gate —
 //! the TLS-on cluster profile installs a containment provider that admits
 //! every domestic caller, so it can never be the authorization basis
-//! here; it IS the additional mount-path defense-in-depth below the admin
-//! gate for shapes that arm a real permission provider):
+//! here. The mount-path check below is likewise NOT a live second layer
+//! under today's armable providers: every caller that reaches it has
+//! already passed `require_admin`, and the providers this profile can
+//! arm (rebac, foreign containment) short-circuit admin/system to allow
+//! — so the check passes unconditionally in practice. It is kept as the
+//! pre-built gate for a future mount surface opened to non-admin
+//! principals, where it becomes the load-bearing layer):
 //!
 //! - every mutation (create/join/mount/unmount/remove-replica/deprovision)
 //!   requires `is_admin || is_system` — the `setattr_mount` gRPC-layer
 //!   admin-gate precedent, now uniform across the zone lifecycle;
 //! - mount/unmount additionally pass
-//!   `kernel.check_permission(canonical_mount_path, Write, ctx)` — the
-//!   zone-level layer of the two-layer mount decision (D3);
+//!   `kernel.check_permission(canonical_mount_path, Write, ctx)` — see
+//!   above for its current (pass-through) and intended (future non-admin
+//!   mount face) semantics;
 //! - status / GetZoneOperation / GetRuntimeCapabilities are reads: any
 //!   authenticated caller.
 
@@ -187,11 +193,14 @@ impl ZoneRuntimeServiceImpl {
         )))
     }
 
-    /// Zone-level mount-path gate (D3's second layer): the canonical path
-    /// key for the mount point must be writable for this caller under
-    /// whatever permission provider this deployment armed. With no
-    /// provider armed (NoAuth loopback) the gate is a no-op — the admin
-    /// gate above is the authorization basis.
+    /// Zone-level mount-path gate: the canonical path key for the mount
+    /// point must be writable for this caller under whatever permission
+    /// provider this deployment armed. Under the providers armable today
+    /// this is a pass-through (see the module doc: callers here are all
+    /// admin/system, and both providers short-circuit them); it becomes
+    /// load-bearing when the mount face opens to non-admin principals.
+    /// With no provider armed (NoAuth loopback) the gate is a no-op — the
+    /// admin gate above is the authorization basis.
     ///
     /// The key is built with the SAME canonicalization the route table
     /// itself uses (`canonicalize_mount_path`), never a raw `format!`:
