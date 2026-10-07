@@ -188,7 +188,10 @@ mod tests {
         // CR-LF text is line-oriented too: a '\r' truncates the same
         // parse a '\n' would, so the write-site guard covers it equally.
         let bad = t("doc", "a\rb", "reader", "user", "alice", None);
-        assert!(encode("root", &bad).is_err(), "must reject carriage return in id");
+        assert!(
+            encode("root", &bad).is_err(),
+            "must reject carriage return in id"
+        );
     }
 
     #[test]

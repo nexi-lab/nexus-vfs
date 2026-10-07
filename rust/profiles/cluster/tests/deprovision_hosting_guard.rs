@@ -58,20 +58,24 @@ async fn deprovision_on_a_non_hosting_node_refuses_without_side_effects() {
     let a_adv = format!("127.0.0.1:{a_port}");
     let b_adv = format!("127.0.0.1:{b_port}");
 
-    let _a = Daemon::spawn(&["--bind-addr", &a_adv, "--no-tls"], &env(&a_data, &a_id, &a_adv));
-    let mut b = Daemon::spawn(&["--bind-addr", &b_adv, "--no-tls"], &env(&b_data, &b_id, &b_adv));
+    let _a = Daemon::spawn(
+        &["--bind-addr", &a_adv, "--no-tls"],
+        &env(&a_data, &a_id, &a_adv),
+    );
+    let mut b = Daemon::spawn(
+        &["--bind-addr", &b_adv, "--no-tls"],
+        &env(&b_data, &b_id, &b_adv),
+    );
     b.wait_for_log("ZoneRuntimeService live", BUDGET)
         .await
         .expect("node B boots the typed surface");
     let mut rt_a = ZoneRuntime::dial_ready(a_port, BUDGET).await;
     let mut rt_b = ZoneRuntime::dial_ready(b_port, BUDGET).await;
 
-    rt_a
-        .zone_create(ZONE_A, &[], "op-hg-create-a-0001", "")
+    rt_a.zone_create(ZONE_A, &[], "op-hg-create-a-0001", "")
         .await
         .expect("node A creates its zone");
-    rt_b
-        .zone_create(ZONE_B, &[], "op-hg-create-b-0002", "")
+    rt_b.zone_create(ZONE_B, &[], "op-hg-create-b-0002", "")
         .await
         .expect("node B creates its own zone");
 
