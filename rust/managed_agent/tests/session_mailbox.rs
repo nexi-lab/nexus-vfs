@@ -9,7 +9,11 @@ use kernel::kernel::{Kernel, OperationContext};
 use serde_json::{json, Value};
 
 fn call(kernel: &Kernel, method: &str, payload: Value) -> Result<Value, String> {
-    let ctx = OperationContext::new("operator", "root", false, Some("operator"), false);
+    let mut ctx = OperationContext::new("operator", "root", false, Some("operator"), false);
+    // The fixture's operator holds an explicit root grant: under the
+    // caller-context rules an ordinary agent credential reaches the root
+    // default only through a grant, never by omitting the field.
+    ctx.zone_perms = vec![("root".to_string(), "rw".to_string())];
     let response = kernel
         .dispatch_rust_call(
             "managed_agent",
@@ -73,15 +77,19 @@ async fn subprocess_streams_approvals_and_accepts_cancel_without_public_fd_strea
     // production provisions the same record API over the replicated WAL.
     let path = a2a::conversation_transcript_path(&a2a::conversation_id("worker", "operator"));
     let parent = path.rsplit_once('/').unwrap().0;
+    // Fixture provisioning: the kernel-level ctx the typed sys_setattr
+    // requires; not the subject under test.
+    let ctx = contracts::OperationContext::new("system", "root", true, None, true);
     kernel
         .sys_setattr(
-            parent, 1, "", None, None, None, "balanced", "root", false, 0, None, None, None, None,
-            None, None, None, None, None, None, None,
+            parent, &ctx, 1, "", None, None, None, "balanced", "root", false, 0, None, None, None,
+            None, None, None, None, None, None, None, None,
         )
         .unwrap();
     kernel
         .sys_setattr(
             &path,
+            &ctx,
             4,
             "",
             None,
