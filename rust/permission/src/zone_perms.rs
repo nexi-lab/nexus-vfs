@@ -49,7 +49,8 @@ const DEFAULT_LEASE_MAX: usize = 100_000;
 /// Path-aware zone-perm authorization provider.
 ///
 /// See the module docstring for the SSOT contract and the historical
-/// bug this fixes.  Internal lease cache memoises hits at ~100-200ns.
+/// bug this fixes. The legacy lease cache remains available to observers,
+/// but cannot establish permission without action and current-grant identity.
 pub struct ZonePermsProvider {
     lease_cache: Arc<PermissionLeaseCache>,
 }
@@ -124,10 +125,6 @@ impl PermissionProvider for ZonePermsProvider {
         if ctx.is_admin {
             return Ok(());
         }
-        // Leases record successful checks, but current grants still govern.
-        // Uses agent_id when present, otherwise the authenticated user_id.
-        let agent_id = ctx.agent_id.as_deref().unwrap_or(&ctx.user_id);
-
         // Zone-perms path-aware check.  Empty `zone_perms` under an
         // installed provider means "no grants" — deny.  Callers that
         // want the pre-refactor "no zone_perms ⇒ fall through" shape
@@ -143,12 +140,9 @@ impl PermissionProvider for ZonePermsProvider {
             .any(|(zone_id, perm_chars)| zone_id == path_zone && perm_chars.contains(perm_char));
 
         if has_zone_grant {
-            // A lease is keyed by path and principal, not action or grants.
-            // It cannot establish today's permission: a successful read must
-            // never grant write, nor survive a changed zone grant/routing.
-            if !self.lease_cache.check(path, agent_id) {
-                self.lease_cache.stamp(path, agent_id);
-            }
+            // Current grants are cheap to inspect. A path/principal lease has
+            // neither action nor grant revision, so consulting or stamping it
+            // cannot help establish today's authorization.
             return Ok(());
         }
 
@@ -299,6 +293,8 @@ mod tests {
         provider
             .check("/eng/x", Some(&route), Permission::Read, &ctx)
             .expect("first call must succeed via full check");
+        provider.lease_cache().stamp("/eng/x", "agent-1");
+        assert!(provider.lease_cache().check("/eng/x", "agent-1"));
         // A cached success must not survive removal of the current grant.
         let mut ctx2 = ctx.clone();
         ctx2.zone_perms.clear();
@@ -315,6 +311,8 @@ mod tests {
         provider
             .check("/grant.json", None, Permission::Read, &ctx)
             .unwrap();
+        provider.lease_cache().stamp("/grant.json", "reader");
+        assert!(provider.lease_cache().check("/grant.json", "reader"));
         assert!(matches!(
             provider.check("/grant.json", None, Permission::Write, &ctx),
             Err(KernelError::PermissionDenied(_))
