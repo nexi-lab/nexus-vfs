@@ -2902,6 +2902,9 @@ fn stream_mgr_err(e: crate::stream_manager::StreamManagerError) -> KernelError {
                 StreamError::NotReplicated(why) => {
                     KernelError::IOError(format!("stream append did not commit: {why}"))
                 }
+                StreamError::ReadFailed(why) => {
+                    KernelError::IOError(format!("stream read failed: {why}"))
+                }
                 other => KernelError::IOError(format!("stream: {other:?}")),
             }
         }

@@ -81,7 +81,7 @@ impl StreamBackend for RemoteStreamBackend {
         let result = self
             .transport
             .stream_read_at(&self.path, offset as u64, false, 0)
-            .map_err(|_| StreamError::Empty)?;
+            .map_err(StreamError::ReadFailed)?;
 
         if result.eof {
             return Err(StreamError::Empty);
@@ -130,5 +130,44 @@ impl StreamBackend for RemoteStreamBackend {
 
     fn msg_count(&self) -> usize {
         self.msg_count.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stream_manager::{StreamManager, StreamManagerError};
+    use std::time::Duration;
+
+    #[test]
+    fn unreachable_remote_drain_reports_read_failure() {
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        // Port zero cannot address a listening service; this exercises the
+        // real transport failure without racing a released ephemeral port.
+        let transport = Arc::new(
+            RpcTransport::new(runtime, "127.0.0.1:0", "", None, Duration::from_millis(100))
+                .unwrap(),
+        );
+        let manager = StreamManager::new();
+        manager
+            .register(
+                "/log",
+                Arc::new(RemoteStreamBackend::new("/log", transport)),
+            )
+            .unwrap();
+        let result = manager.collect_all_payloads("/log");
+        assert!(
+            matches!(
+                result,
+                Err(StreamManagerError::Backend(StreamError::ReadFailed(_)))
+            ),
+            "an unreachable peer must not become an empty stream: {result:?}"
+        );
     }
 }
