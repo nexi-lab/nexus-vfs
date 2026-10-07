@@ -313,8 +313,20 @@ impl ZoneRuntimeBackend {
         }
         // Same ordering rule as zone_create: replay first, then the
         // time-varying deletion check — a mount onto a deprovisioned
-        // target would outlive it and leave a dangling DT_MOUNT.
-        self.refuse_if_deleted(&req.target_zone_id)?;
+        // target would outlive it and leave a dangling DT_MOUNT. The
+        // judgment is the epoch comparison (`deleted_newer_than_disk`), NOT
+        // `refuse_if_deleted`'s "a record exists": a `--force` re-found
+        // zone keeps its deletion RECORD forever (recorded-epoch
+        // semantics) while its bumped creation epoch outranks it, and
+        // mounting the re-found zone is exactly the supported recovery.
+        if self.zm.deleted_newer_than_disk(&req.target_zone_id) {
+            return Err(ZoneRuntimeError::Conflict(format!(
+                "zone '{}' was deprovisioned (the recorded deletion outranks its \
+                 replica); mounting it is refused — re-founding requires the \
+                 operator-supervised recovery (founder boot with --force)",
+                req.target_zone_id
+            )));
+        }
 
         if let Err(e) = self.zm.mount(
             &req.parent_zone_id,
