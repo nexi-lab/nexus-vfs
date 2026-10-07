@@ -16,7 +16,8 @@ pub const OPERATION_ID_MIN_LEN: usize = 1;
 /// anything that could bloat the control store.
 pub const OPERATION_ID_MAX_LEN: usize = 128;
 /// The one permitted separator set.
-pub const OPERATION_ID_CHARSET: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-:._";
+pub const OPERATION_ID_CHARSET: &str =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-:._";
 
 /// Refusal reasons, mirroring the zone-id contract's error shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,7 +75,9 @@ mod tests {
         let long = "x".repeat(OPERATION_ID_MAX_LEN + 1);
         assert_eq!(
             validate_operation_id(&long),
-            Err(OperationIdError::Length { got: OPERATION_ID_MAX_LEN + 1 })
+            Err(OperationIdError::Length {
+                got: OPERATION_ID_MAX_LEN + 1
+            })
         );
         assert_eq!(
             validate_operation_id("op\n"),

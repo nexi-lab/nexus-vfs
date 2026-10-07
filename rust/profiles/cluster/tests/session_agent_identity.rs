@@ -313,9 +313,8 @@ async fn a_front_door_agent_mints_a_session_identity_for_a_person_and_can_revoke
             "",
         )
         .await;
-    let err = as_moss.expect_err(
-        "an ordinary agent cert must not open a session attributed to someone else",
-    );
+    let err = as_moss
+        .expect_err("an ordinary agent cert must not open a session attributed to someone else");
     assert!(
         !err.contains("session_id"),
         "the refusal must not spawn anything: {err}"

@@ -334,7 +334,10 @@ mod tests {
         // file's existence), so the roundtrip check reads the bytes back
         // directly and decodes them.
         let on_disk = std::fs::read(tmp.path().join("z1").join(TOMBSTONE_NAME)).unwrap();
-        assert_eq!(serde_json::from_slice::<DeletionRecord>(&on_disk).unwrap(), rec);
+        assert_eq!(
+            serde_json::from_slice::<DeletionRecord>(&on_disk).unwrap(),
+            rec
+        );
     }
 
     #[test]

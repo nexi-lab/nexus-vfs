@@ -833,9 +833,8 @@ fn require_header(
     // The id becomes a control-store key that rides the raft log — bound
     // its shape (length + charset) before it can reach the store, the same
     // way zone_id and mount_path are bounded.
-    contracts::validate_operation_id(&header.operation_id).map_err(|e| {
-        ZoneRuntimeError::Invalid(format!("operation_id: {e}"))
-    })?;
+    contracts::validate_operation_id(&header.operation_id)
+        .map_err(|e| ZoneRuntimeError::Invalid(format!("operation_id: {e}")))?;
     Ok(header)
 }
 
@@ -1038,11 +1037,7 @@ mod tests {
         (backend, probe, dir)
     }
 
-    fn store_put_record(
-        backend: &ZoneRuntimeBackend,
-        operation_id: &str,
-        rec: &JournalRecord,
-    ) {
+    fn store_put_record(backend: &ZoneRuntimeBackend, operation_id: &str, rec: &JournalRecord) {
         // A second ControlStateStore view on the same namespace the journal
         // uses — the test-only way to plant a record with a chosen stamp.
         let zone = backend
@@ -1085,7 +1080,10 @@ mod tests {
             outcome.unwrap().is_none(),
             "takeover means the caller becomes the executor (no replay receipt)"
         );
-        let after = probe.get("op-takeover-aged").expect("record").expect("present");
+        let after = probe
+            .get("op-takeover-aged")
+            .expect("record")
+            .expect("present");
         assert_eq!(after.status, crate::zone_op_journal::STATUS_PENDING);
         assert!(
             after.updated_at_ms > old,
