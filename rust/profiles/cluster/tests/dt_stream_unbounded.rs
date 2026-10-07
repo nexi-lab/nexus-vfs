@@ -199,7 +199,7 @@ async fn single_node_append_past_window_seals_and_cold_reads_whole_log() {
 /// booted afterwards cold-reads the entire thing with a bare `collect_all`,
 /// pulling each sealed segment from the founder over `ReadBlob`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn joiner_cold_reads_a_sealed_log_pulling_segments_from_the_founder() {
+async fn joiner_cold_reads_a_sealed_log_and_reports_unavailable_segments() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (mut founder, fport) = boot_founder(tmp.path()).await;
     let mut fc = Vfs::dial_ready(fport, BUDGET).await;
@@ -214,9 +214,9 @@ async fn joiner_cold_reads_a_sealed_log_pulling_segments_from_the_founder() {
             .unwrap_or_else(|e| panic!("write frame {i}: {e}"));
     }
     founder
-        .wait_for_log(SEAL_LOG, BUDGET)
+        .wait_for_log_count(SEAL_LOG, 2, BUDGET)
         .await
-        .expect("founder must seal before the joiner joins");
+        .expect("founder must seal at least two segments before the joiner joins");
 
     // Boot a joiner that reaches the zone purely by DiscoverZones.
     let jport = free_port();
@@ -246,8 +246,21 @@ async fn joiner_cold_reads_a_sealed_log_pulling_segments_from_the_founder() {
     // the founder's cache, so the joiner pulls them over ReadBlob. Bytes must be
     // byte-exact vs. what the founder wrote.
     await_collect(&mut jc, &log, &expected_log()).await;
-    drop(joiner);
+
+    // The WAL reader caches only its last segment. At least two were sealed,
+    // so offset 0 needs a new fetch after this full drain. Losing the source
+    // must be an I/O error, never a successful empty/truncated transcript.
+    // These are reads of committed content; they do not need a Raft quorum.
     drop(founder);
+    let error = jc.stream_collect_all(&log, "").await.unwrap_err();
+    assert!(error.contains("stream read failed"), "{error}");
+    assert!(error.contains("cold segment"), "{error}");
+    let read = jc.stream_read_at(&log, 0, "").await.unwrap();
+    assert!(read.is_error, "missing cold content must not be EOF");
+    assert!(read.error_payload.contains("stream read failed"));
+    let error = jc.read_file(&log, "").await.unwrap_err();
+    assert!(error.contains("stream read failed"), "{error}");
+    drop(joiner);
 }
 
 /// P2 (bounds the raft LOG + join transfer): the founder's SC raft log is

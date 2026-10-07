@@ -6,9 +6,6 @@ description = "Raft consensus and embedded storage for Nexus"
 authors = ["Nexus Team"]
 
 # Allow build.rs to set has_protos cfg (set when proto files exist for gRPC codegen)
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(has_protos)"] }
-
 [lib]
 name = "nexus_raft"
 crate-type = ["rlib"]
@@ -115,3 +112,6 @@ consensus = ["raft", "protobuf", "slog", "async"]
 grpc = ["tonic", "prost", "tonic-prost", "lib/transport", "lib/runtime-bridge", "lib", "bytes", "dep:tonic-prost-build", "async", "tracing-subscriber", "consensus", "dashmap", "time", "sha2", "rcgen", "x509-parser", "pem", "base64", "gethostname", "rand"]
 
 full = ["grpc", "consensus"]
+
+[lints]
+workspace = true

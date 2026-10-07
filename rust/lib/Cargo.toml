@@ -98,3 +98,6 @@ tempfile = "3"
 # transport_primitives unit tests need self-signed cert generation +
 # tempdirs. Only compiled when running tests with `--features transport`.
 rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
+
+[lints]
+workspace = true

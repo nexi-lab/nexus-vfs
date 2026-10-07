@@ -16,6 +16,10 @@ pub enum StreamError {
     /// trimming. `(earliest, requested)` — Kafka OffsetOutOfRange. The reader
     /// should reset to `earliest`.
     Truncated(usize, usize),
+    /// Stored stream content could not be read. Keep storage, integrity, and
+    /// peer-fetch failures distinct from an empty or closed stream so a drain
+    /// cannot report a partial transcript as a successful complete read.
+    ReadFailed(String),
     /// An append to a REPLICATING backend did not commit, and this is the
     /// backend's own reason for it.
     ///

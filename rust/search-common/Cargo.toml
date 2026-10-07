@@ -42,3 +42,6 @@ transport = ["dep:tonic", "dep:dashmap", "dep:tokio"]
 # The `transport` feature is enabled for `cargo test`s that touch
 # the module; a caller of this crate opting out never pulls tokio.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

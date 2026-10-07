@@ -1164,8 +1164,8 @@ type BoxedServiceDeclsBuilder =
 
 /// The nexus-vfs-native service set this daemon boots with: the A2A messaging
 /// substrate plus the managed-agent control plane (spawn/get/cancel + procfs /
-/// workspace hooks + the raw ACP-subprocess spawner), and the LLM-mount driver in
-/// a `driver-ai` build.
+/// workspace hooks + the raw ACP-subprocess spawner), the LLM-mount driver in
+/// a `driver-ai` build, and the egress content gate in an `egress-gate` build.
 ///
 /// Public because a co-host build needs THIS set with one entry replaced — the
 /// managed-agent decl carrying a `SpawnTask` provider, so a spawn becomes an
@@ -1192,6 +1192,29 @@ pub fn default_service_decls(ctx: &ServiceBootCtx) -> Vec<kernel::kernel::Servic
     let services = {
         let mut services = services;
         services.push(llm_mount::service_decl());
+        services
+    };
+    // Present only in an `egress-gate` build. Listed after a2a, so the
+    // gate classifies the envelope as it will actually be written, stamp
+    // included — though it does not depend on that: mutating hooks compose
+    // (`NativeHookRegistry::dispatch_pre`), so the stamp and the
+    // redaction both survive either order. Shadowed, same as above.
+    //
+    // The model plane is the third way out, and it can only exist where the
+    // LLM mount driver does, so the prompt leaf is handed over only in a
+    // `driver-ai` build. Which mounts lead off the node is the deployment's
+    // to say (`NEXUS_EGRESS_GATE_MODEL_MOUNTS`). Ordering against the mount
+    // driver is not load-bearing either: the driver fires in `on_post` and
+    // reads the request back from storage, so it sends what the gate let
+    // through.
+    #[cfg(feature = "egress-gate")]
+    let services = {
+        let mut services = services;
+        #[cfg(feature = "driver-ai")]
+        let prompt_suffix = Some(llm_mount::PROMPT_SUFFIX);
+        #[cfg(not(feature = "driver-ai"))]
+        let prompt_suffix = None;
+        services.push(egress_gate::service_decl_from_env(prompt_suffix));
         services
     };
     services

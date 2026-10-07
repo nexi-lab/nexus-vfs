@@ -33,3 +33,6 @@ anyhow = "1"
 [dev-dependencies]
 # The shared cluster main test module opens real redb files in a temp dir.
 tempfile = "3"
+
+[lints]
+workspace = true

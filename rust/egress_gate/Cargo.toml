@@ -1,0 +1,56 @@
+[package]
+name = "egress-gate"
+version = "0.1.0"
+edition = "2021"
+description = "Egress content gate — classifies and enforces on data leaving the node, on the kernel write seam"
+authors = ["Nexus Team"]
+publish = false
+
+[lib]
+name = "egress_gate"
+path = "src/lib.rs"
+
+[dependencies]
+# The gate is a `NativeInterceptHook` on `apply_mutating_write_hooks`, so the
+# kernel is the whole substrate it needs.
+kernel = { workspace = true }
+# `is_system_path` — the native-hook self-exclusion contract.
+contracts = { workspace = true }
+# The A2A transcript leaf is the first gated egress path, and `a2a` owns the
+# address SSOT for it. Depending on the crate rather than re-spelling
+# `"/transcript"` is deliberate: a consumer deciding whether a path is an A2A
+# log must reach the same answer a2a does, and a second copy drifts the moment
+# that leaf is renamed (the rename window is exactly why
+# `mutating_path_suffixes` is a slice). a2a is a thin dep — kernel + contracts
+# + serde_json + blake3, no raft.
+a2a = { workspace = true }
+# Deny / redact decisions are audit events. Content never enters a log line
+# (see `hook.rs`), only the path, the caller and the finding kinds.
+tracing = "0.1"
+# The Presidio provider's one dependency, off unless `presidio` is enabled.
+# `httparse` is already in the daemon's tree through hyper; the provider
+# speaks plain blocking HTTP/1.1 to a loopback analyzer rather than pulling
+# an async client into a synchronous hook.
+httparse = { version = "1.10", optional = true }
+# JSON content is laid out (keys vs values vs numbers) so redaction never
+# breaks a message and detectors read values, not the schema. Already in the
+# daemon's tree through a2a.
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[features]
+default = []
+# Contextual detection (names, addresses, organisations) by a local
+# Presidio analyzer, in addition to the deterministic rules.
+presidio = ["dep:httparse"]
+
+[dev-dependencies]
+# The model-plane test drives a real LLM mount through the real OpenAI
+# connector and captures what it sends upstream — test-only, so the gate
+# itself never links an HTTP stack.
+llm-mount = { workspace = true }
+backends = { workspace = true, features = ["driver-openai"] }
+tempfile = "3"
+
+[lints]
+workspace = true

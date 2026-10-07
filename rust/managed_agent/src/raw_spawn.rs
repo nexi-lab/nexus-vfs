@@ -1,138 +1,40 @@
-//! Raw ACP-subprocess control-plane spawner (frozen contract 2026-08-01).
+//! Subprocess hosting for the session mailbox protocol.
 //!
-//! When `start_session` is given a `spawn_spec`, nexus launches that
-//! subprocess and gives the client a **raw-byte tunnel** to its stdio via
-//! three node-local `io_profile="memory"` `DT_STREAM`s at
-//! `/proc/{pid}/fd/{0,1,2}`:
-//!
-//!   * `fd/1` (stdout) / `fd/2` (stderr) — a nexus PUMP reads the child's
-//!     handle with tokio async I/O (EAGAIN-correct via the reactor) and
-//!     `stream_write_nowait`s the raw bytes; the client reads with
-//!     `read_at(offset)` (byte chunks; `WouldBlock`→poll; `Closed`→eof).
-//!   * `fd/0` (stdin) — the client appends bytes; a nexus pump reads the
-//!     stream and writes the child's stdin.
-//!
-//! Plus a fourth stream `/proc/{pid}/exit` carrying the frozen-contract ③
-//! exit event: on child exit the supervisor writes `{"code":…,"signal":…}`
-//! and closes it, so a client that saw `fd/1` close can read WHY the agent
-//! exited (clean vs signal death) to drive reconnect/resume.
-//!
-//! nexus NEVER frames or parses ACP — NDJSON/LSP framing + all protocol
-//! logic stay client-side. The stream primitive is the same offset-based,
-//! non-destructive log the A2A mailboxes use, so `read_at(offset)` cleanly
-//! separates "no data yet" (`WouldBlock`) from "producer gone" (`Closed`
-//! → eof), which a raw stdio pipe read cannot.
-//!
-//! Kernel-concrete: the tunnel drives Kernel-INHERENT stream ops
-//! (`stream_write_nowait` / `stream_read_at` / `close_stream` /
-//! `destroy_stream`) that are deliberately NOT on the `KernelSyscall`
-//! trait (the v2 audit keeps kernel-internal accessors off the
-//! service-facing surface — same reason `install` reaches
-//! `kernel.agent_registry()` Kernel-specifically). So this is injected
-//! into `ManagedAgentService` at install (Kernel-specific) and called by
-//! the generic `start_session` through `dyn RawSpawn` — mirroring the
-//! `SpawnTask` DI. No syscall-ABI change.
-//!
-//! Gated at its `mod` declaration in `lib.rs` (`#[cfg(feature =
-//! "subprocess-host")]`), so no file-level `#![cfg]` here.
+//! Child stdio is private to this adapter. Both hosting modes expose the same
+//! conversation endpoint; no public fd turn transport is created.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use a2a::session::{SessionEndpoint, SessionPayload, SessionSide, MAX_SESSION_FRAME_BYTES};
+use a2a::session_io::SessionMailbox;
 use dashmap::DashMap;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::ChildStdin;
-use tokio::sync::oneshot;
-
-use kernel::core::agents::registry::{AgentRegistry, AgentState};
+use kernel::core::agents::registry::{AgentDescriptor, AgentRegistry, AgentState};
 use kernel::kernel::{Kernel, OperationContext};
+use subprocess::HostedSubprocess;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{mpsc, oneshot};
 
 use super::{RawSpawn, SpawnHandle, SpawnSpec};
-use subprocess::HostedSubprocess;
 
-/// DT_STREAM entry type (mirrors `kernel::meta_store::DT_STREAM`), typed
-/// `i32` to match the `sys_setattr` `entry_type` parameter.
-const DT_STREAM: i32 = 4;
-/// Per-stream ring capacity. ACP traffic is low-volume; 1 MiB is ample.
-const STREAM_CAP: usize = 1 << 20;
-/// stdin-pump poll interval when the stream has no pending bytes. Bounds
-/// client→agent latency without busy-spinning (the stdout path is
-/// event-driven, so only stdin polls).
-const STDIN_POLL_MS: u64 = 40;
-/// Grace after `close_stream` before `destroy_stream`, so the client can
-/// drain the last stdout/stderr bytes and observe eof before the streams
-/// vanish.
-const DRAIN_GRACE: Duration = Duration::from_secs(5);
-/// Pump read buffer.
-const PUMP_BUF: usize = 8192;
-
-fn system_ctx() -> OperationContext {
-    OperationContext::new("system", "root", true, None, true)
-}
-
-fn fd_path(pid: &str, n: u8) -> String {
-    format!("/proc/{pid}/fd/{n}")
-}
-
-/// Register a node-local in-memory `DT_STREAM` at `path`.
-fn register_memory_stream(kernel: &Kernel, path: &str) -> Result<(), String> {
-    kernel
-        .sys_setattr(
-            path,
-            &system_ctx(),
-            /* entry_type   */ DT_STREAM,
-            /* backend_name */ "",
-            /* backend      */ None,
-            /* metastore    */ None,
-            /* raft_backend */ None,
-            /* io_profile   */ "memory",
-            /* zone_id      */ "root",
-            /* is_external  */ false,
-            /* capacity     */ STREAM_CAP,
-            /* read_fd      */ None,
-            /* write_fd     */ None,
-            /* mime_type       */ None,
-            /* modified_at_ms  */ None,
-            /* content_id      */ None,
-            /* size            */ None,
-            /* version         */ None,
-            /* created_at_ms   */ None,
-            /* link_target     */ None,
-            /* source          */ None,
-            /* remote_metastore*/ None,
-        )
-        .map(|_| ())
-        .map_err(|e| format!("{e:?}"))
-}
-
-/// Roll back a partial spawn: destroy any created streams + reap the
-/// half-planted session so a launch failure surfaces as a clean error
-/// rather than leaking a stream or a zombie descriptor.
-fn rollback(kernel: &Kernel, registry: &AgentRegistry, paths: &[String], pid: &str) {
-    for p in paths {
-        let _ = kernel.destroy_stream(p);
-    }
-    let _ = registry.kill(pid, 127);
-}
-
-/// [`SpawnHandle`] for a raw stream tunnel — holds the supervisor's abort
-/// signal. `abort()` is idempotent (the oneshot is taken on first fire).
-struct RawStreamHandle {
+struct SubprocessHandle {
+    endpoint: SessionEndpoint,
     cancel: parking_lot::Mutex<Option<oneshot::Sender<()>>>,
 }
 
-impl SpawnHandle for RawStreamHandle {
+impl SpawnHandle for SubprocessHandle {
     fn abort(&self) {
-        if let Some(tx) = self.cancel.lock().take() {
-            let _ = tx.send(());
+        if let Some(cancel) = self.cancel.lock().take() {
+            let _ = cancel.send(());
         }
+    }
+    fn session_endpoint(&self) -> Option<&SessionEndpoint> {
+        Some(&self.endpoint)
     }
 }
 
-/// Kernel-concrete [`RawSpawn`] provider. Constructed at
-/// `install_returning` with the same `AgentRegistry` + `spawn_handles`
-/// the service and its `on_terminate` observer share.
 pub(crate) struct KernelRawSpawn {
     kernel: Arc<Kernel>,
     agent_registry: Arc<AgentRegistry>,
@@ -154,215 +56,229 @@ impl KernelRawSpawn {
 }
 
 impl RawSpawn for KernelRawSpawn {
-    fn spawn(&self, pid: &str, spec: SpawnSpec) -> Result<Option<u32>, String> {
+    fn spawn(
+        &self,
+        desc: &AgentDescriptor,
+        spec: SpawnSpec,
+        endpoint: SessionEndpoint,
+    ) -> Result<Option<u32>, String> {
+        let result = self.spawn_inner(desc, spec, endpoint);
+        if result.is_err() {
+            let _ = self.agent_registry.kill(&desc.pid, 127);
+        }
+        result
+    }
+}
+
+impl KernelRawSpawn {
+    fn spawn_inner(
+        &self,
+        desc: &AgentDescriptor,
+        spec: SpawnSpec,
+        endpoint: SessionEndpoint,
+    ) -> Result<Option<u32>, String> {
         if spec.cmd.is_empty() {
-            let _ = self.agent_registry.kill(pid, 127);
             return Err("spawn_spec.cmd is required".into());
         }
-        let mut argv = Vec::with_capacity(1 + spec.args.len());
-        argv.push(spec.cmd);
+        let ctx = OperationContext::new(
+            &desc.owner_id,
+            &desc.zone_id,
+            false,
+            Some(&desc.name),
+            false,
+        );
+        let mailbox = Arc::new(SessionMailbox::open(
+            Arc::clone(&self.kernel),
+            ctx,
+            endpoint.clone(),
+            SessionSide::Agent,
+        )?);
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|_| "subprocess hosting requires an active tokio runtime")?;
+        let mut argv = vec![spec.cmd];
         argv.extend(spec.args);
         let cwd = if spec.cwd.is_empty() {
             PathBuf::from(".")
         } else {
-            PathBuf::from(&spec.cwd)
+            PathBuf::from(spec.cwd)
         };
-
-        let stdin_path = fd_path(pid, 0); // client → agent
-        let stdout_path = fd_path(pid, 1); // agent → client
-        let stderr_path = fd_path(pid, 2); // agent → client
-                                           // Frozen-contract ③: a node-local stream the supervisor writes the
-                                           // child's exit `{code, signal}` to (then closes) so a client that
-                                           // saw fd/1 close can read WHY the agent exited (clean vs signal
-                                           // death) to drive reconnect/resume. Same memory-DT_STREAM lifecycle
-                                           // as the fd tunnels — registered here, destroyed after the drain
-                                           // grace — so the reap teardown (which removes only the stamped
-                                           // procfs dirents, not these streams) leaves it readable meanwhile.
-        let exit_path = format!("/proc/{pid}/exit");
-        let paths = [
-            stdin_path.clone(),
-            stdout_path.clone(),
-            stderr_path.clone(),
-            exit_path.clone(),
-        ];
-        let kernel = self.kernel.as_ref();
-        let registry = self.agent_registry.as_ref();
-
-        for p in &paths {
-            if let Err(e) = register_memory_stream(kernel, p) {
-                rollback(kernel, registry, &paths, pid);
-                return Err(format!("register stream {p}: {e}"));
-            }
-        }
-
-        let rt = tokio::runtime::Handle::try_current().map_err(|_| {
-            rollback(kernel, registry, &paths, pid);
-            "start_session with spawn_spec requires an active tokio runtime".to_string()
-        })?;
-
-        // Spawn the subprocess with NO fd-pipes; we pump the parent-side
-        // handles into the memory streams.
-        let mut sub = rt
+        let mut child = runtime
             .block_on(HostedSubprocess::spawn_no_pipes(argv, spec.env, &cwd))
-            .map_err(|e| {
-                rollback(kernel, registry, &paths, pid);
-                format!("spawn_spec subprocess launch failed: {e}")
-            })?;
-        let os_pid = sub.os_pid();
-        let (stdin, stdout, stderr) = sub.take_stdio_for_connection().map_err(|e| {
-            rollback(kernel, registry, &paths, pid);
-            format!("take subprocess stdio: {e}")
-        })?;
-
-        // Client can drive the tunnel immediately (no in-process loop).
-        if let Err(e) = self.agent_registry.update_state(pid, AgentState::Ready) {
-            tracing::warn!(pid = %pid, error = %e, "raw spawn: READY transition rejected");
-        }
-
-        // stdout / stderr pumps: child handle → memory stream (async read,
-        // EAGAIN-correct). Each closes its OWN stream on EOF (see
-        // `pump_out`), so drain-complete → client eof needs no timeout
-        // here. stdin pump: memory stream → child stdin.
-        rt.spawn(pump_out(
-            stdout,
-            Arc::clone(&self.kernel),
-            stdout_path.clone(),
-        ));
-        rt.spawn(pump_out(
-            stderr,
-            Arc::clone(&self.kernel),
-            stderr_path.clone(),
-        ));
-        let (stdin_stop_tx, stdin_stop_rx) = oneshot::channel::<()>();
-        rt.spawn(pump_in(
-            stdin,
-            Arc::clone(&self.kernel),
-            stdin_path.clone(),
-            stdin_stop_rx,
-        ));
-
-        // Supervisor: race the child's exit against the abort signal.
-        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
-        let kernel = Arc::clone(&self.kernel);
-        let registry = Arc::clone(&self.agent_registry);
-        let pid_owned = pid.to_string();
-        let exit_path_owned = exit_path.clone();
-        rt.spawn(async move {
-            let mut sub = sub;
-            let self_exit = {
-                let waited = sub.wait();
-                tokio::pin!(waited);
-                tokio::select! {
-                    st = &mut waited => Some(st),
-                    _ = cancel_rx => None,
-                }
-            };
-            let exit = match self_exit {
-                Some(st) => st,
-                None => {
-                    sub.kill().await;
-                    sub.wait().await
-                }
-            };
-            // Child is dead ⇒ its stdout/stderr write-ends are closed, so
-            // each output pump reads to EOF, flushes every last byte to
-            // its stream, and closes it (eof) — no timing cutoff here, so
-            // the client never loses the tail (e.g. the final ACP
-            // response). Stop the stdin pump and reap the session
-            // (Terminated → on_terminate tears down the procfs subtree).
-            let _ = stdin_stop_tx.send(());
-            // ③ Surface the exit event on the handle: write `{code,signal}`
-            // to the exit stream + close it, so a client that saw fd/1
-            // close can read WHY the agent exited (clean vs signal death)
-            // to drive reconnect/resume. Best-effort — a destroyed stream
-            // just means the client already disconnected.
-            let exit_json = format!(
-                "{{\"code\":{},\"signal\":{}}}",
-                exit.code
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| "null".to_string()),
-                exit.signal
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "null".to_string()),
-            );
-            let _ =
-                kernel.stream_write_nowait(&exit_path_owned, exit_json.as_bytes(), &system_ctx());
-            let _ = kernel.close_stream(&exit_path_owned);
-            let _ = registry.kill(&pid_owned, exit.as_reap_code());
-            // Give the client a bounded window to drain the closed streams,
-            // then remove them so they don't leak in the registry. (This
-            // also unwedges a pump if a grandchild kept a write-end open,
-            // so the client still disconnects.)
-            tokio::time::sleep(DRAIN_GRACE).await;
-            for p in &paths {
-                let _ = kernel.destroy_stream(p);
-            }
-            tracing::info!(pid = %pid_owned, code = ?exit.code, signal = ?exit.signal, "raw ACP stream tunnel closed");
-        });
-
+            .map_err(|e| format!("launch session subprocess: {e}"))?;
+        let os_pid = child.os_pid();
+        let (mut stdin, stdout, mut stderr) = child
+            .take_stdio_for_connection()
+            .map_err(|e| format!("take subprocess stdio: {e}"))?;
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let (failed_tx, mut failed_rx) = mpsc::unbounded_channel::<String>();
+        let stopped = Arc::new(AtomicBool::new(false));
         self.spawn_handles.insert(
-            pid.to_string(),
-            Box::new(RawStreamHandle {
+            desc.pid.clone(),
+            Box::new(SubprocessHandle {
+                endpoint,
                 cancel: parking_lot::Mutex::new(Some(cancel_tx)),
             }),
         );
+        let _ = self
+            .agent_registry
+            .update_state(&desc.pid, AgentState::Ready);
 
+        let input_mailbox = Arc::clone(&mailbox);
+        let input_stopped = Arc::clone(&stopped);
+        let input_failed = failed_tx.clone();
+        let input = runtime.spawn(async move {
+            while !input_stopped.load(Ordering::Acquire) {
+                let reader = Arc::clone(&input_mailbox);
+                match tokio::task::spawn_blocking(move || reader.receive(200)).await {
+                    Ok(Ok(Some(SessionPayload::Rpc { message }))) => {
+                        let mut bytes = serde_json::to_vec(&message).expect("JSON value");
+                        bytes.push(b'\n');
+                        if let Err(error) = stdin.write_all(&bytes).await {
+                            let _ = input_failed.send(format!("session stdin failed: {error}"));
+                            break;
+                        }
+                        if let Err(error) = stdin.flush().await {
+                            let _ =
+                                input_failed.send(format!("session stdin flush failed: {error}"));
+                            break;
+                        }
+                    }
+                    Ok(Ok(None)) => {}
+                    Ok(Ok(Some(SessionPayload::Closed { reason }))) | Ok(Err(reason)) => {
+                        let _ = input_failed.send(reason);
+                        break;
+                    }
+                    Err(error) => {
+                        let _ = input_failed.send(error.to_string());
+                        break;
+                    }
+                }
+            }
+        });
+        let output_mailbox = Arc::clone(&mailbox);
+        let output = runtime.spawn(async move {
+            let reason = pump_output(stdout, output_mailbox)
+                .await
+                .err()
+                .unwrap_or_else(|| "session subprocess closed stdout".into());
+            let _ = failed_tx.send(reason);
+        });
+        // Diagnostics use the same conversation, never a public fd side channel.
+        let diagnostic_mailbox = Arc::clone(&mailbox);
+        let diagnostics = runtime.spawn(async move {
+            let mut buffer = [0; 8192];
+            while let Ok(count) = stderr.read(&mut buffer).await {
+                if count == 0 {
+                    break;
+                }
+                let message = serde_json::json!({"jsonrpc":"2.0", "method":"_nexus/diagnostic",
+                    "params":{"stream":"stderr","text":String::from_utf8_lossy(&buffer[..count])}});
+                let writer = Arc::clone(&diagnostic_mailbox);
+                if !matches!(
+                    tokio::task::spawn_blocking(
+                        move || writer.send(SessionPayload::Rpc { message })
+                    )
+                    .await,
+                    Ok(Ok(()))
+                ) {
+                    break;
+                }
+            }
+        });
+        let registry = Arc::clone(&self.agent_registry);
+        let pid = desc.pid.clone();
+        runtime.spawn(async move {
+            let (natural_exit, failure) = {
+                let wait = child.wait();
+                tokio::pin!(wait);
+                tokio::select! {
+                    exit = &mut wait => (Some(exit), None),
+                    _ = cancel_rx => (None, Some("session terminated".to_string())),
+                    failure = failed_rx.recv() => (None, failure),
+                }
+            };
+            let exit = match natural_exit {
+                Some(exit) => exit,
+                None => {
+                    child.kill().await;
+                    child.wait().await
+                }
+            };
+            stopped.store(true, Ordering::Release);
+            input.abort();
+            // Drain terminal responses before closure. Bound grandchildren
+            // retaining stdout so they cannot hold session teardown forever.
+            let mut output = output;
+            if tokio::time::timeout(Duration::from_secs(5), &mut output)
+                .await
+                .is_err()
+            {
+                output.abort();
+                let _ = output.await;
+            }
+            let mut diagnostics = diagnostics;
+            if tokio::time::timeout(Duration::from_secs(1), &mut diagnostics)
+                .await
+                .is_err()
+            {
+                diagnostics.abort();
+                let _ = diagnostics.await;
+            }
+            let reason = failure.unwrap_or_else(|| {
+                format!(
+                    "subprocess exited: code={:?}, signal={:?}",
+                    exit.code, exit.signal
+                )
+            });
+            let _ = tokio::task::spawn_blocking(move || {
+                mailbox.send(SessionPayload::Closed { reason })
+            })
+            .await;
+            let _ = registry.kill(&pid, exit.as_reap_code());
+        });
         Ok(os_pid)
     }
 }
 
-/// Pump a child output handle (stdout/stderr) into `path` as raw bytes.
-/// Event-driven via the tokio reactor. On child-side EOF (all bytes
-/// drained) it CLOSES the stream, so the client reads every byte and
-/// then observes a clean eof — with no timeout/cutoff on the teardown
-/// path. Exits on error too (e.g. the stream was destroyed).
-async fn pump_out<R>(mut rd: R, kernel: Arc<Kernel>, path: String)
-where
-    R: AsyncReadExt + Unpin + Send + 'static,
-{
-    let ctx = system_ctx();
-    let mut buf = vec![0u8; PUMP_BUF];
+/// ACP stdio uses newline-delimited JSON. Bound partial lines as well as complete frames.
+async fn pump_output<R: AsyncRead + Unpin>(
+    mut reader: R,
+    mailbox: Arc<SessionMailbox<Kernel>>,
+) -> Result<(), String> {
+    let mut buffer = [0; 8192];
+    let mut line = Vec::new();
     loop {
-        match rd.read(&mut buf).await {
-            Ok(0) => break, // child closed this stream — drain complete
-            Ok(n) => {
-                if kernel.stream_write_nowait(&path, &buf[..n], &ctx).is_err() {
-                    return; // stream destroyed / gone — nothing to close
+        let count = reader
+            .read(&mut buffer)
+            .await
+            .map_err(|e| format!("session stdout failed: {e}"))?;
+        if count == 0 {
+            if !line.is_empty() {
+                forward_line(&line, &mailbox).await?;
+            }
+            return Ok(());
+        }
+        for byte in &buffer[..count] {
+            if *byte == b'\n' {
+                if !line.iter().all(u8::is_ascii_whitespace) {
+                    forward_line(&line, &mailbox).await?;
+                }
+                line.clear();
+            } else {
+                line.push(*byte);
+                if line.len() > MAX_SESSION_FRAME_BYTES {
+                    return Err("subprocess ACP frame exceeds the size limit".into());
                 }
             }
-            Err(_) => break,
         }
     }
-    // Drain complete: signal eof to the client (read_at → Closed once the
-    // client has drained the buffered tail).
-    let _ = kernel.close_stream(&path);
 }
 
-/// Pump the stdin stream into the child's stdin. Polls `read_at` (nowait)
-/// so the async worker is never blocked; stops on the supervisor's signal
-/// or a broken child stdin.
-async fn pump_in(
-    mut wr: ChildStdin,
-    kernel: Arc<Kernel>,
-    path: String,
-    mut stop: oneshot::Receiver<()>,
-) {
-    let mut offset = 0usize;
-    loop {
-        match kernel.stream_read_at(&path, offset) {
-            Ok(Some((data, next))) => {
-                if wr.write_all(&data).await.is_err() || wr.flush().await.is_err() {
-                    break; // child stdin closed
-                }
-                offset = next;
-            }
-            Ok(None) => {
-                tokio::select! {
-                    _ = &mut stop => break,
-                    _ = tokio::time::sleep(Duration::from_millis(STDIN_POLL_MS)) => {}
-                }
-            }
-            Err(_) => break, // stream closed / destroyed
-        }
-    }
+async fn forward_line(line: &[u8], mailbox: &Arc<SessionMailbox<Kernel>>) -> Result<(), String> {
+    let message =
+        serde_json::from_slice(line).map_err(|e| format!("invalid subprocess ACP message: {e}"))?;
+    let mailbox = Arc::clone(mailbox);
+    tokio::task::spawn_blocking(move || mailbox.send(SessionPayload::Rpc { message }))
+        .await
+        .map_err(|e| e.to_string())?
 }

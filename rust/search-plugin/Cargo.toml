@@ -182,3 +182,6 @@ prost = { workspace = true }
 # so tests can dial it).  Only needed by that one test; dev-dep so
 # the plugin's release build stays lean.
 tokio-stream = { version = "0.1", features = ["net"] }
+
+[lints]
+workspace = true

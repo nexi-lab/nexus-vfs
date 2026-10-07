@@ -51,7 +51,8 @@ pub const DT_LINK: u8 = 6;
 /// `core::meta_store::tests::every_field_survives_the_binary_encoding`: a
 /// field-by-field comparison would itself be a list to forget to extend, so
 /// the test compares whole values.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct FileMetadata {
     pub path: String,
     pub size: u64,

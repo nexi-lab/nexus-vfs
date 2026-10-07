@@ -26,6 +26,14 @@ members = [
     # profile binaries; the stamp hook alone is reused by nexus-side
     # frontends without pulling raft (see rust/a2a/Cargo.toml).
     "rust/a2a",
+    # egress_gate/ — the egress content gate. A hook-only service on
+    # `apply_mutating_write_hooks` that classifies what a write is about to
+    # put on an egress plane (the A2A transcript first) and redacts or
+    # refuses it. Detection is behind a trait so the detector is swappable
+    # without touching the seam; one in-tree deterministic rule set ships
+    # with it. OPT-IN via a Cargo feature on `profiles/cluster` — a daemon
+    # with no egress promise to keep should not pay for one.
+    "rust/egress_gate",
     # subprocess/ — the hosted-subprocess substrate (spawn an argv child +
     # surface its stdio to the VFS). Shared by the managed-agent raw
     # control-plane spawner and the nexus-side ACP one-shot path. Kernel-tier:
@@ -86,6 +94,28 @@ members = [
     "rust/profiles/full",
 ]
 
+[workspace.lints.rust]
+# `has_protos` is set by `rust/raft/build.rs` when protoc was available. It
+# lives here rather than in raft's own manifest because a crate cannot both
+# inherit `workspace.lints` and declare its own `[lints.*]` overrides — Cargo
+# rejects the manifest. Declaring an expected cfg workspace-wide costs nothing:
+# it only stops rustc warning about a name, and only raft sets it.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(has_protos)"] }
+
+[workspace.lints.clippy]
+# `tonic::async_trait` puts `#[must_use]` on methods that already return a
+# `#[must_use]` future. A recent stable started reporting that, and because
+# `rust-toolchain.toml` tracks `stable` while CI runs `-D warnings`, a
+# toolchain release turned main red — in generated proto code and in every
+# `#[tonic::async_trait]` trait across kernel, raft and federated-search.
+#
+# Declared once here rather than as an `#[allow]` per crate: the trigger is the
+# macro, so per-crate suppression needs another entry the next time anyone
+# declares an async trait, and that person gets a red main with no indication
+# why. We cannot fix the macro's output at the source and the lint is pure
+# style, so the policy belongs with the workspace.
+double_must_use = "allow"
+
 [workspace.dependencies]
 contracts = { path = "rust/contracts" }
 nexus-plugin-abi = { path = "rust/plugin-abi" }
@@ -117,6 +147,9 @@ auth = { path = "rust/auth" }
 # consumer that needs only the hook does not pull the `install` feature's
 # raft dep; the profile binaries opt into `features = ["install"]`.
 a2a = { path = "rust/a2a", default-features = false }
+# `egress-gate` — the egress content gate hook. Depends on `a2a` for the
+# transcript-leaf SSOT, so it is listed after it.
+egress-gate = { path = "rust/egress_gate" }
 # `subprocess` — hosted-subprocess substrate (kernel + tokio). Shared by
 # managed-agent's raw ACP-subprocess spawner and the nexus-side ACP path.
 subprocess = { path = "rust/subprocess" }

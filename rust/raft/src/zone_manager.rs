@@ -1153,7 +1153,21 @@ impl ZoneManager {
                 continue;
             }
 
-            // Step 2: ensure target zone's i_links_count >= expected.
+            // Step 2: the subtree this mount exposes must exist as a directory
+            // inside the target zone, or `readdir` of a mount with nothing
+            // under it yet answers "not found" instead of "empty" — which
+            // would make `agent_list` on a fresh cluster an error. The zone's
+            // own `/` gets this from `ensure_root_entry`; before subtrees a
+            // mount's listing landed there, so the guarantee held by accident.
+            if decl.subtree != contracts::VFS_ROOT
+                && !self.ensure_dir_entry(target_zone, &decl.subtree)?
+            {
+                remaining.insert(global_path.clone(), decl.clone());
+                active.insert(global_path.clone(), target_zone.to_string());
+                continue;
+            }
+
+            // Step 3: ensure target zone's i_links_count >= expected.
             let want = expected.get(target_zone).copied().unwrap_or(0);
             if let Err(err) = self.ensure_links_count(target_zone, want) {
                 tracing::debug!(
@@ -1195,30 +1209,50 @@ impl ZoneManager {
     /// `Ok(false)` if this node is not the leader yet (caller should
     /// retry on the next tick); `Ok(true)` once present.
     fn ensure_root_entry(&self, root_zone_id: &str) -> Result<bool> {
-        let Some(node) = self.registry.get_node(root_zone_id) else {
+        self.ensure_dir_entry(root_zone_id, "/")
+    }
+
+    /// Ensure a DT_DIR exists at `key` in `zone_id`.
+    ///
+    /// `/` is the zone's own root ([`Self::ensure_root_entry`]); a non-root key
+    /// is the root of the SUBTREE a mount exposes. Both need the same guarantee
+    /// for the same reason: `readdir` of a directory that was never written
+    /// answers "not found" rather than "empty", so a mount with nothing under
+    /// it yet would make `agent_list` on a fresh cluster an error instead of an
+    /// empty list.
+    ///
+    /// One function rather than two: before subtrees, a mount's listing landed
+    /// on the zone root, which `ensure_root_entry` had already created — so the
+    /// guarantee existed by accident of the key translation. Now that a mount
+    /// keys under its own subtree, it has to be stated.
+    ///
+    /// Returns `Ok(false)` when this node cannot reach the leader yet; the
+    /// topology tick retries.
+    fn ensure_dir_entry(&self, zone_id: &str, key: &str) -> Result<bool> {
+        let Some(node) = self.registry.get_node(zone_id) else {
             return Ok(false);
         };
         let handle = self.rt().handle().clone();
 
         let existing = bridge_block_on(
             &handle,
-            node.with_state_machine(|sm: &FullStateMachine| sm.get_metadata("/")),
+            node.with_state_machine(|sm: &FullStateMachine| sm.get_metadata(key)),
         )
-        .map_err(|e| RaftError::Raft(format!("get root metadata: {}", e)))?;
+        .map_err(|e| RaftError::Raft(format!("get metadata {key}: {}", e)))?;
         if existing.is_some() {
             return Ok(true);
         }
 
         // Try to write — propose forwards to leader if we're a follower
         // and reachable; errors mean leader unreachable / not elected.
-        let bytes = encode_file_metadata("/", DT_DIR, root_zone_id, "");
-        match propose_set_metadata(&handle, &node, "/", bytes) {
+        let bytes = encode_file_metadata(key, DT_DIR, zone_id, "");
+        match propose_set_metadata(&handle, &node, key, bytes) {
             Ok(()) => {
-                tracing::info!("Root '/' created in zone '{}'", root_zone_id);
+                tracing::info!("'{key}' created in zone '{zone_id}'");
                 Ok(true)
             }
             Err(err) => {
-                tracing::debug!("Root '/' creation deferred: {}", err);
+                tracing::debug!("'{key}' creation in zone '{zone_id}' deferred: {}", err);
                 Ok(false)
             }
         }

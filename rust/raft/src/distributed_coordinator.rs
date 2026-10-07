@@ -2568,6 +2568,7 @@ fn wire_mount_core(
                 parent_zone_id,
                 None,
                 target_zone_id,
+                target_subtree,
                 false,
             );
 
@@ -2636,11 +2637,15 @@ fn wire_mount_core(
             .and_then(|e| e.backend.clone());
 
         // 4. Install into VFSRouter under the root zone.
+        // One declaration, two consumers: the router composes `backend_path`
+        // from this subtree and the per-mount metastore keys metadata with the
+        // same value, so the content address and the metadata key cannot drift.
         vfs_router.add_federation_mount(
             &global_path,
             contracts::ROOT_ZONE_ID,
             root_backend,
             target_zone_id,
+            target_subtree,
             false,
         );
         let canonical = canonicalize(&global_path, contracts::ROOT_ZONE_ID);

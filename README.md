@@ -91,3 +91,24 @@ ingress node — draws on **BlockA2A** (Zhenhua Zou, Zhuotao Liu et al.,
   the resolvable identity; and the kernel permission gate is the access control.
   This keeps intra-cluster operation strongly consistent with no external
   consensus, while leaving the path open to cross-organization (cross-CA) trust.
+
+
+## Managed-agent durable session recovery
+
+`managed_agent.start_session_v1` retains its existing `session_id` response:
+this is the registry pid used by `get_session_v1`, `cancel_v1`, and `/proc`.
+An in-process runtime can additionally return `durable_session_id`, the key of
+its persistent transcript. `get_session_v1` exposes the same optional field.
+Raw subprocesses and providers without durable sessions omit it.
+
+To restore a stopped co-hosted session, start the same agent with
+`resume_session_id` set to the previous `durable_session_id`. The runtime owns
+loading, identity checks and protection against concurrent writers. A successful
+restore returns a new pid in `session_id` and the original durable ID.
+
+The ID is a single path component (ASCII letters, digits, `_` and `-`, at most
+128 bytes). Recovery is rejected for `spawn_spec`, a daemon without an
+in-process provider, or a provider that has not implemented recovery. It never
+silently falls back to a fresh session. Existing `SpawnTask` implementations
+remain source-compatible: `spawn_with_options` defaults to ordinary `spawn`
+when no recovery was requested, and rejects recovery otherwise.

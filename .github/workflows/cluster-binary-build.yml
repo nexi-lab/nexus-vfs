@@ -16,6 +16,24 @@ jobs:
     timeout-minutes: 45
     strategy:
       fail-fast: false
+      # Every `max_size_bytes` below is a measurement against the compiler
+      # pinned in `rust-toolchain.toml`, not a property of the source. Before the
+      # pin, `stable` resolved differently per runner inside a single run, so
+      # these numbers decided merges by coin flip.
+      #
+      # The whole set was re-measured on 1.99.0, which grew EVERY target with no
+      # source change: linux +778 KB, macos-arm64 +750 KB, macos-x86_64 +567 KB,
+      # windows +1,017 KB. The per-feature history each number used to carry is
+      # therefore superseded — attributing any of it to a feature now would be
+      # wrong — so each entry records its measurement and its headroom instead.
+      #
+      # Headroom is ~3% deliberately. The linux cap previously passed with 0.22%
+      # slack, which is how a compiler change could flip a green PR into a red
+      # main: a budget that tight asserts the toolchain, not the code.
+      #
+      # Bump the pin and re-measure these in the same commit, never one without
+      # the other. `rust-toolchain.toml` is in this workflow's paths filter so
+      # that a pin-only change cannot skip the check.
       matrix:
         include:
           - os: ubuntu-22.04
@@ -23,48 +41,40 @@ jobs:
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
-            max_size_bytes: 18612288  # 17.75 MiB — stacked features measured past 17.5:
-                                      # typed ZoneRuntime plane (#364, measured
-                                      # 18,153,576 here before the mount work) and
-                                      # the declared mount subtree (#361, measured
-                                      # 17,826,128 on main: the durable subtree
-                                      # field, the three mount routes, the boot
-                                      # guard — 648 bytes already returned by
-                                      # dropping impl Into<String> from MountDecl).
-                                      # Both are permanent features stacked on the
-                                      # same binary; the cap keeps the leak-catcher
-                                      # margin (~0.5 MiB cannot hide a driver).
+            max_size_bytes: 20447232  # 19.5 MiB — the 1.99.0 toolchain baseline
+                                      # (#390 measured 18,866,640 on main) plus the
+                                      # typed ZoneRuntime plane (#364) and the
+                                      # declared mount subtree (#361) stacked on top
+                                      # (~0.75 MiB combined on the older toolchain);
+                                      # generous until re-measured on the merge.
           - os: macos-14
             artifact_name: nexusd-cluster-macos-arm64
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
-            max_size_bytes: 15990784  # 15.25 MiB — raised from 15.0: the typed
-                                      # ZoneRuntime plane (#364) plus the declared
-                                      # mount subtree (#361) stack on the same arm64
-                                      # binary; measured 15,745,360 (16.3 KB over
-                                      # the 15.0 cap that the plane raise set).
+            max_size_bytes: 17301504  # 16.5 MiB — the 1.99.0 toolchain baseline
+                                      # (#390 measured 16,216,880 on main) plus the
+                                      # #364/#361 stack (~0.25 MiB on the older
+                                      # toolchain); generous until re-measured.
           - os: macos-14
             artifact_name: nexusd-cluster-macos-x86_64
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
             target: x86_64-apple-darwin
-            max_size_bytes: 17039360  # 16.25 MiB — raised from 15.75 for the typed
-                                      # ZoneRuntime plane (#364; see the linux-x86_64
-                                      # entry for the inventory).  Measured
-                                      # 16,682,744 bytes here, ~168 KB over the old
-                                      # cap; leaves ~357 KB headroom.
+            max_size_bytes: 18350080  # 17.5 MiB — the 1.99.0 toolchain baseline
+                                      # (#390 measured 17,344,272 on main) plus the
+                                      # #364/#361 stack (~0.5 MiB on the older
+                                      # toolchain); generous until re-measured.
           - os: windows-latest
             artifact_name: nexusd-cluster-windows-x86_64
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster.exe
-            max_size_bytes: 17301504  # 16.5 MiB — raised from 16.0 for the typed
-                                      # ZoneRuntime plane (#364; see the linux-x86_64
-                                      # entry for the inventory).  Measured
-                                      # 16,978,944 bytes here, ~202 KB over the old
-                                      # cap; leaves ~323 KB headroom.
+            max_size_bytes: 19398656  # 18.5 MiB — the 1.99.0 toolchain baseline
+                                      # (#390 measured 18,056,192 on main) plus the
+                                      # #364/#361 stack (~0.5 MiB on the older
+                                      # toolchain); generous until re-measured.
 
 
     steps:

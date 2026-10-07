@@ -70,12 +70,16 @@ impl Kernel {
 
     /// Like [`Self::dispatch_native_pre`] but returns the
     /// `HookOutcome::Replace` payload so callers can substitute write
-    /// content at the EXECUTE phase. `sys_write` is the only consumer
-    /// today — `MailboxStampingHook` (registered for `*/transcript`)
-    /// rewrites the envelope's `from` field through this path, and the
-    /// caller passes `replacement.unwrap_or(content)` into DT_STREAM
-    /// push / DT_FILE backend write. Empty registry returns
-    /// `Ok(None)` so the no-hook hot path stays allocation-free.
+    /// content at the EXECUTE phase. Reached from
+    /// [`Self::apply_mutating_write_hooks`], so every write syscall is a
+    /// consumer — `sys_write` / `write_batch` (DT_FILE),
+    /// `stream_write_nowait` (DT_STREAM), `pipe_write_nowait` (DT_PIPE) —
+    /// and each passes `replacement.as_deref().unwrap_or(data)` into its
+    /// backend write. `MailboxStampingHook` (registered for
+    /// `*/transcript`) rewrites the envelope's `from` field through this
+    /// path. Several rewriting hooks on one path compose in registration
+    /// order. Empty registry returns `Ok(None)` so the no-hook hot path
+    /// stays allocation-free.
     pub fn dispatch_native_pre_with_replacement(
         &self,
         ctx: &HookContext,
