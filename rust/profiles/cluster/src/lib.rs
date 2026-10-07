@@ -1803,7 +1803,73 @@ fn open_zone_manager(
     })
 }
 
+/// Environment variables this binary once honoured and no longer reads, with
+/// what replaced each.
+///
+/// A retired FLAG is self-reporting: clap rejects an unknown `--bootstrap-mode`
+/// by name. A retired ENV VAR is silent — the process starts, ignores it, and
+/// does something the operator did not ask for. For founder/joiner declarations
+/// that silence is the worst possible failure: `NEXUS_FEDERATION_ZONES` set and
+/// ignored means a node the operator believes is founding `sharedzone` founds
+/// nothing, and the mistake surfaces later as an empty namespace or a peer that
+/// cannot discover anything.
+///
+/// `NEXUS_FEDERATION_ZONES` is NOT dead repo-wide — `nexus-witness` still reads
+/// it. The message says so, because "that variable does nothing" would be a lie
+/// that sends someone to grep for a bug in the witness.
+const RETIRED_ENV_VARS: &[(&str, &str)] = &[
+    (
+        "NEXUS_FEDERATION_ZONES",
+        "use NEXUS_CLUSTER_INIT (founder-side zone declaration). Note this \
+         variable IS still read by the separate `nexus-witness` binary; it is \
+         `nexusd-cluster` that stopped honouring it",
+    ),
+    (
+        "NEXUS_FEDERATION_MOUNTS",
+        "use NEXUS_CLUSTER_INIT_MOUNTS (founder-side mount declaration)",
+    ),
+    (
+        "NEXUS_BOOTSTRAP_MODE",
+        "deleted with `--bootstrap-mode` (S3 Phase G): the daemon now derives \
+         the boot action from data_dir state + identity + --peers + \
+         --cluster-init via nexus_raft::bootstrap::plan_boot_action, so there \
+         is nothing to declare",
+    ),
+];
+
+/// Refuse to boot when a retired environment variable is set.
+///
+/// Deliberately a refusal and not a warning. A warning is the same outcome as
+/// silence for anyone reading a log after the fact, and this class of mistake
+/// travels: a stale runbook (or a stale memory of one) hands the old name to
+/// the next operator, who sets it, sees a clean boot, and only finds out at the
+/// far end of a federation bring-up.
+fn refuse_retired_env_vars() -> Result<()> {
+    let found: Vec<&(&str, &str)> = RETIRED_ENV_VARS
+        .iter()
+        .filter(|(name, _)| std::env::var_os(name).is_some_and(|v| !v.is_empty() && v != "0"))
+        .collect();
+    if found.is_empty() {
+        return Ok(());
+    }
+    let detail = found
+        .iter()
+        .map(|(name, replacement)| format!("  {name} — {replacement}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Err(anyhow::anyhow!(
+        "{} retired environment variable(s) are set; nexusd-cluster does not read \
+         them and would have started while silently ignoring your intent:\n{}\n\
+         Unset them (or move the value to the replacement) and boot again.",
+        found.len(),
+        detail,
+    ))
+}
+
 async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -> Result<()> {
+    // First, before any state is touched: a retired knob means the operator's
+    // intent and this binary's behaviour have already diverged.
+    refuse_retired_env_vars()?;
     authorization::validate(&common)?;
     let hostname = resolve_hostname(common.hostname.as_deref());
     tracing::info!(
@@ -6606,6 +6672,22 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    /// Serializes the env-mutating tests in THIS module.
+    ///
+    /// `std::env::set_var` is process-global while `cargo test` runs these in
+    /// parallel, so two tests toggling the same name interleave and one reads
+    /// the other's value. Scoped to this module because that is the boundary it
+    /// can actually enforce — a different `mod tests` in this file holds no
+    /// relation to this lock, which is fine only as long as the names do not
+    /// overlap. They do not today: the other one touches
+    /// `NEXUS_ALLOW_HOSTNAME_ADVERTISE`, this one touches `RETIRED_ENV_VARS`.
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        // A test that panicked while holding it poisoned nothing we care about:
+        // the guard protects ordering, not data.
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn mounts(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
         pairs
             .iter()
@@ -7445,6 +7527,60 @@ mod tests {
             std::path::Path::new("/data")
         )
         .is_err());
+    }
+
+    /// Every retired name is refused, and the refusal names its replacement.
+    ///
+    /// Asserted over the table rather than over one hand-picked name, so a name
+    /// added to `RETIRED_ENV_VARS` without a usable replacement string fails
+    /// here instead of shipping a refusal that tells the operator nothing.
+    ///
+    /// Serialized by `env_guard` with the other env-mutating tests in this
+    /// module: `std::env::set_var` is process-global and these run in parallel.
+    #[test]
+    fn every_retired_env_var_is_refused_with_its_replacement() {
+        let _guard = env_guard();
+        for (name, replacement) in RETIRED_ENV_VARS {
+            assert!(
+                !replacement.is_empty(),
+                "{name} must say what replaced it; a bare refusal strands the operator"
+            );
+            std::env::remove_var(name);
+            assert!(
+                refuse_retired_env_vars().is_ok(),
+                "{name} unset must not trip the guard"
+            );
+
+            std::env::set_var(name, "sharedzone");
+            let err = refuse_retired_env_vars()
+                .expect_err("a retired name that is SET must refuse the boot")
+                .to_string();
+            std::env::remove_var(name);
+
+            assert!(err.contains(name), "refusal must name the variable: {err}");
+            assert!(
+                err.contains(replacement),
+                "refusal must carry the migration for {name}: {err}"
+            );
+        }
+    }
+
+    /// An empty or `0` value is someone clearing the variable, not declaring
+    /// intent — refusing that would make `FOO= cmd` impossible to use as an
+    /// unset.
+    #[test]
+    fn a_cleared_retired_env_var_does_not_refuse() {
+        let _guard = env_guard();
+        let (name, _) = RETIRED_ENV_VARS[0];
+        for cleared in ["", "0"] {
+            std::env::set_var(name, cleared);
+            let result = refuse_retired_env_vars();
+            std::env::remove_var(name);
+            assert!(
+                result.is_ok(),
+                "{name}={cleared:?} is a clear, not a declaration"
+            );
+        }
     }
 
     #[test]
