@@ -309,6 +309,16 @@ impl WalStreamCore {
     /// `Ok(None)` if not yet written; `Err` if the stream is closed
     /// and no more data will arrive at this offset.
     pub fn read_at(&self, seq: u64) -> Result<Option<Vec<u8>>, String> {
+        let entry = self.read_committed(seq)?;
+        if entry.is_none() && self.closed.load(Ordering::Acquire) {
+            return Err(format!("WAL stream {} closed at seq {seq}", self.stream_id));
+        }
+        Ok(entry)
+    }
+
+    /// Storage read independent of lifecycle state. The StreamBackend adapter
+    /// translates a genuine miss to Empty/ClosedEmpty, retaining I/O errors.
+    fn read_committed(&self, seq: u64) -> Result<Option<Vec<u8>>, String> {
         let key = self.key(seq);
         // Hot path unchanged: try the entry row first (local, O(1), drives
         // wakeup). A hit returns immediately — no floor/segment lookup.
@@ -333,12 +343,7 @@ impl WalStreamCore {
                 return self.read_cold(seq, cold.as_ref());
             }
         }
-        // Genuinely absent: not yet written (open) or closed for good.
-        if self.closed.load(Ordering::Acquire) {
-            Err(format!("WAL stream {} closed at seq {seq}", self.stream_id))
-        } else {
-            Ok(None)
-        }
+        Ok(None)
     }
 
     /// Resolve a spilled seq from the cold tier: the one-segment cache, else look
@@ -413,20 +418,11 @@ impl WalStreamCore {
     }
 
     pub fn read_batch(&self, start_seq: u64, count: usize) -> Result<(Vec<Vec<u8>>, u64), String> {
-        let mut items = Vec::with_capacity(count);
-        let mut seq = start_seq;
-        for _ in 0..count {
-            match self.read_at(seq) {
-                Ok(Some(data)) => {
-                    items.push(data);
-                    seq += 1;
-                }
-                Ok(None) => break,
-                Err(_) if !items.is_empty() => break,
-                Err(e) => return Err(e),
-            }
-        }
-        Ok((items, seq))
+        let offset = usize::try_from(start_seq)
+            .map_err(|_| format!("stream offset {start_seq} exceeds addressable range"))?;
+        StreamBackend::read_batch(self, offset, count)
+            .map(|(items, next)| (items, next as u64))
+            .map_err(|e| format!("WAL stream {} read_batch: {e:?}", self.stream_id))
     }
 
     pub fn close(&self) {
@@ -649,7 +645,7 @@ impl StreamBackend for WalStreamCore {
     }
 
     fn read_at(&self, offset: usize) -> Result<(Vec<u8>, usize), StreamError> {
-        match WalStreamCore::read_at(self, offset as u64) {
+        match self.read_committed(offset as u64) {
             Ok(Some(data)) => Ok((data, offset + 1)),
             // A miss is either "not written yet" (park a tail reader) or
             // "retention-trimmed" (below `earliest`). Only a trimming cold tier
@@ -659,11 +655,13 @@ impl StreamBackend for WalStreamCore {
                 let earliest = self.earliest_offset();
                 if self.cold.is_some() && offset < earliest {
                     Err(StreamError::Truncated(earliest, offset))
+                } else if self.is_closed() {
+                    Err(StreamError::ClosedEmpty)
                 } else {
                     Err(StreamError::Empty)
                 }
             }
-            Err(_) => Err(StreamError::ClosedEmpty),
+            Err(e) => Err(StreamError::ReadFailed(e)),
         }
     }
 
@@ -672,9 +670,20 @@ impl StreamBackend for WalStreamCore {
         offset: usize,
         count: usize,
     ) -> Result<(Vec<Vec<u8>>, usize), StreamError> {
-        WalStreamCore::read_batch(self, offset as u64, count)
-            .map(|(items, next)| (items, next as usize))
-            .map_err(|_| StreamError::ClosedEmpty)
+        let mut items = Vec::with_capacity(count);
+        let mut next = offset;
+        for _ in 0..count {
+            match StreamBackend::read_at(self, next) {
+                Ok((data, after)) => {
+                    items.push(data);
+                    next = after;
+                }
+                Err(StreamError::Empty) => break,
+                Err(StreamError::ClosedEmpty) if !items.is_empty() => break,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok((items, next))
     }
 
     fn close(&self) {
@@ -1380,6 +1389,90 @@ mod tests {
             v[0] ^= 0xff;
         }
         assert!(c.read_at(0).is_err(), "a corrupt cold blob must fail loud");
+    }
+
+    #[test]
+    fn unavailable_cold_content_never_returns_a_successful_prefix() {
+        use crate::stream_manager::{StreamManager, StreamManagerError};
+
+        for (failed_base, is_corrupt, is_closed) in
+            [(0, false, false), (3, false, false), (3, true, true)]
+        {
+            let store = store();
+            let cold = Arc::new(MockCold::default());
+            let policy = SealPolicy {
+                hot_window: 3,
+                seal_batch: 3,
+            };
+            let c = Arc::new(WalStreamCore::with_cold_tier(
+                Arc::clone(&store),
+                "read-failure".into(),
+                cold.clone(),
+                policy,
+                0,
+            ));
+            let prefix = format!("{WAL_STREAM_KEY_PREFIX}read-failure/");
+            for i in 0..10 {
+                c.write_sync(format!("m{i}").as_bytes()).unwrap();
+            }
+            seal_loop(
+                &store,
+                cold.as_ref(),
+                &prefix,
+                "read-failure",
+                policy,
+                &AtomicU64::new(0),
+                0,
+            );
+            let seg = store
+                .find_stream_segment(&prefix, failed_base)
+                .unwrap()
+                .unwrap();
+            let original = cold.blobs.lock().unwrap().remove(&seg.content_id).unwrap();
+            if is_corrupt {
+                let mut damaged = original.clone();
+                damaged[0] ^= 0xff;
+                cold.blobs
+                    .lock()
+                    .unwrap()
+                    .insert(seg.content_id.clone(), damaged);
+            }
+            if is_closed {
+                c.close();
+            }
+
+            let manager = StreamManager::new();
+            manager.register("/log", c.clone()).unwrap();
+            // Failure at the first frame and after a readable prefix must both
+            // fail, including on a closed stream. The lifecycle flag must not
+            // turn missing/corrupt content into EOF.
+            for result in [
+                manager.read_at("/log", failed_base as usize).map(|_| ()),
+                manager
+                    .read_at_blocking("/log", failed_base as usize, 100)
+                    .map(|_| ()),
+                manager.read_batch("/log", 0, 10).map(|_| ()),
+                manager.collect_all_payloads("/log").map(|_| ()),
+            ] {
+                assert!(
+                    matches!(
+                        result,
+                        Err(StreamManagerError::Backend(StreamError::ReadFailed(_)))
+                    ),
+                    "content failure became EOF or partial success: {result:?}"
+                );
+            }
+            assert!(c.read_batch(0, 10).is_err());
+
+            // A failed read does not close or poison the stream. Repairing the
+            // missing/corrupt blob makes the same reader return the full log.
+            cold.blobs.lock().unwrap().insert(seg.content_id, original);
+            let expected = (0..10).map(|i| format!("m{i}")).collect::<String>();
+            assert_eq!(
+                manager.collect_all_payloads("/log").unwrap(),
+                expected.as_bytes()
+            );
+        }
     }
 
     /// The push path itself triggers the background seal (proving the trigger is
