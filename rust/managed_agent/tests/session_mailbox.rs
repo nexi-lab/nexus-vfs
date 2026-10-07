@@ -9,7 +9,11 @@ use kernel::kernel::{Kernel, OperationContext};
 use serde_json::{json, Value};
 
 fn call(kernel: &Kernel, method: &str, payload: Value) -> Result<Value, String> {
-    let ctx = OperationContext::new("operator", "root", false, Some("operator"), false);
+    let mut ctx = OperationContext::new("operator", "root", false, Some("operator"), false);
+    // The fixture's operator holds an explicit root grant: under the
+    // caller-context rules an ordinary agent credential reaches the root
+    // default only through a grant, never by omitting the field.
+    ctx.zone_perms = vec![("root".to_string(), "rw".to_string())];
     let response = kernel
         .dispatch_rust_call(
             "managed_agent",
