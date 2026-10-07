@@ -1398,6 +1398,70 @@ fn run_enroll_token(common: &CommonArgs) -> Result<()> {
 
 /// `enroll` — PRE-provision a signed mTLS node cert from a founder (joiner).
 ///
+/// Turn an enrollment failure into one that says what to check next.
+///
+/// Both enrollment entry points — the `enroll` subcommand and the boot
+/// auto-enroll — used to wrap the transport error verbatim, which on the common
+/// failures reads as `transport error` and nothing else. The joiner is the blind
+/// side of this handshake: it cannot see the founder's process table, its bind
+/// address or its firewall, so a bare error leaves it guessing at exactly the
+/// moment it has least information.
+///
+/// **The split that matters is refused-vs-timeout**, and it is the one thing the
+/// joiner CAN observe:
+///
+/// * `refused` — a RST came back, so packets reach the host and nothing is
+///   listening on the enrollment port. The founder is down, or it is not running
+///   with `--accept-enrollments`.
+/// * `timeout` — no RST, so packets are being dropped. Something is filtering:
+///   a host firewall, or an overlay ACL. **This is where the port offset bites**:
+///   enrollment listens at a FIXED OFFSET above the data port, so an operator who
+///   opened the data port and stopped has left this one closed, and the symptom
+///   is a hang rather than an error.
+///
+/// The hint also names what the joiner cannot determine from here: a founder
+/// process that was reaped and a founder that bound the wrong address produce
+/// the SAME signature from this side — ICMP answers, TCP times out, no RST — so
+/// the next step belongs to whoever owns that machine, and it is two facts, not
+/// a hypothesis.
+///
+/// Lives here, next to [`enroll_port_addr`], because the offset rule this
+/// explains is defined here; a message in the transport crate would have to
+/// restate it.
+fn enrollment_failure(data_plane_addr: &str, enroll_target: &str, err: &str) -> anyhow::Error {
+    let lower = err.to_ascii_lowercase();
+    let diagnosis = if lower.contains("refused") {
+        "The connection was REFUSED, so packets reach that host and nothing is \
+         listening on the enrollment port. Either the founder is not running, or \
+         it was started without `--accept-enrollments`."
+    } else if lower.contains("timed out") || lower.contains("timeout") || lower.contains("deadline")
+    {
+        "The connection TIMED OUT rather than being refused, so packets are being \
+         DROPPED, not rejected — something is filtering them. The enrollment port \
+         is a fixed offset ABOVE the data-plane port, so opening the data port \
+         alone leaves it closed and enrollment hangs instead of failing. Check a \
+         host firewall rule for the enrollment port specifically, and any overlay \
+         ACL. On Windows also check per-program BLOCK rules: they beat port Allow \
+         rules and accumulate per binary PATH, so a rebuilt or relocated daemon \
+         can be blocked while its port still shows as allowed."
+    } else {
+        "This is neither a refusal nor a timeout, so the port was reachable and \
+         the handshake itself failed — suspect the token (wrong cluster, or a \
+         stale one whose CA fingerprint no longer matches) before the network."
+    };
+    anyhow::anyhow!(
+        "enroll against {enroll_target} failed: {err}\n\n{diagnosis}\n\n\
+         Note {enroll_target} was DERIVED from the data-plane address \
+         {data_plane_addr} you supplied — you do not type it, and it is not a \
+         typo if it differs from what you expected.\n\n\
+         From here a founder process that has exited and a founder that bound the \
+         wrong address are indistinguishable: both answer ICMP and drop TCP. \
+         Whoever owns that machine should report two facts rather than a guess — \
+         whether the process is alive, and what it actually bound (expect \
+         0.0.0.0, not 127.0.0.1)."
+    )
+}
+
 /// Thin CLI over [`nexus_raft::join_cluster_and_provision_tls`]: `peer_addr` is
 /// the founder's DATA-PLANE address (same as `--peers`); the enrollment port is
 /// derived from it ([`enroll_port_addr`], `+1`). Presents the join token,
@@ -1410,7 +1474,7 @@ fn run_enroll(common: &CommonArgs, peer_addr: &str, token: &str) -> Result<()> {
     let tls_dir_str = tls_dir.to_str().context("tls dir must be UTF-8")?;
     let enroll_target = enroll_port_addr(peer_addr)?;
     nexus_raft::join_cluster_and_provision_tls(&enroll_target, token, &hostname, tls_dir_str)
-        .map_err(|e| anyhow::anyhow!("enroll against {enroll_target}: {e}"))?;
+        .map_err(|e| enrollment_failure(peer_addr, &enroll_target, &e.to_string()))?;
     eprintln!(
         "enrolled: cluster cert written to {}. This node can now boot into the mTLS \
          federation — set `--peers <cluster-member>` and start it normally.",
@@ -1973,7 +2037,8 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
                 .into_iter()
                 .next()
                 .ok_or_else(|| anyhow::anyhow!("--token given but --peers is empty"))?;
-            let enroll_target = enroll_port_addr(&first_peer.to_operator_str())?;
+            let data_plane_addr = first_peer.to_operator_str();
+            let enroll_target = enroll_port_addr(&data_plane_addr)?;
             let token = common.token.clone().expect("token present by guard");
             let tls_dir_str = tls_dir
                 .to_str()
@@ -1994,7 +2059,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
             })
             .await
             .context("auto-enroll task panicked")?
-            .map_err(|e| anyhow::anyhow!("auto-enroll against {enroll_target}: {e}"))?;
+            .map_err(|e| enrollment_failure(&data_plane_addr, &enroll_target, &e.to_string()))?;
             tracing::info!("auto-enroll complete — cluster cert provisioned");
         }
     }
@@ -2362,11 +2427,23 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
                 .advertise_addr
                 .clone()
                 .unwrap_or_else(|| format!("<FOUNDER_OVERLAY_IP:{data_port}>"));
+            // Spelled out rather than left implicit: the joiner derives this and
+            // never types it, so an operator opening firewall ports has no
+            // reason to know it exists.
+            let enroll_port = data_port.saturating_add(1);
             match std::fs::read_to_string(tls_dir.join("join-token")) {
                 Ok(token) => tracing::info!(
                     "cluster accepts enrollments. To add a node, run THERE:\n  \
                      nexusd-cluster --advertise-addr <THAT_NODE_OVERLAY:PORT> \
-                     --peers {peers_hint} --token {}",
+                     --peers {peers_hint} --token {}\n\
+                     That node dials TWO ports here: {data_port} (data plane) and \
+                     {enroll_port} (enrollment, derived as data+1). {enroll_port} \
+                     needs its own inbound opening — allowing only {data_port} \
+                     makes enrollment HANG rather than fail, which reads as a \
+                     network problem and is not one. Scope it to the overlay \
+                     range: the enrollment listener is plaintext by design and \
+                     its safety argument is that it only rides the encrypted \
+                     overlay.",
                     token.trim(),
                 ),
                 Err(_) => tracing::info!(
@@ -7579,6 +7656,79 @@ mod tests {
             assert!(
                 result.is_ok(),
                 "{name}={cleared:?} is a clear, not a declaration"
+            );
+        }
+    }
+
+    /// Each failure shape gets the diagnosis that matches it, and the refused /
+    /// timeout branches must not be confusable — they send the operator to
+    /// opposite places (process vs filter).
+    #[test]
+    fn an_enrollment_failure_names_what_to_check() {
+        let refused = enrollment_failure(
+            "100.64.0.27:2126",
+            "100.64.0.27:2127",
+            "transport error: tcp connect error: Connection refused (os error 111)",
+        )
+        .to_string();
+        assert!(
+            refused.contains("REFUSED") && refused.contains("--accept-enrollments"),
+            "a refusal is a process problem and must say so: {refused}"
+        );
+        assert!(
+            !refused.contains("DROPPED"),
+            "a refusal must NOT be described as dropped — that sends the \
+             operator to the firewall for a problem that is not there: {refused}"
+        );
+
+        let timed_out = enrollment_failure(
+            "100.64.0.27:2126",
+            "100.64.0.27:2127",
+            "transport error: tcp connect error: Operation timed out (os error 60)",
+        )
+        .to_string();
+        assert!(
+            timed_out.contains("DROPPED") && timed_out.contains("fixed offset"),
+            "a timeout is a filter problem and must name the port offset: {timed_out}"
+        );
+        assert!(
+            !timed_out.contains("not running"),
+            "a timeout must NOT blame the process: {timed_out}"
+        );
+
+        // Anything else reached the port, so the token is the first suspect.
+        let handshake = enrollment_failure(
+            "100.64.0.27:2126",
+            "100.64.0.27:2127",
+            "invalid join token: CA fingerprint mismatch",
+        )
+        .to_string();
+        assert!(
+            handshake.contains("token"),
+            "a non-connect failure points at the token: {handshake}"
+        );
+    }
+
+    /// Every branch carries both addresses, because the enrollment port is
+    /// DERIVED — an operator who never typed `2127` has no reason to expect it
+    /// in an error and can read it as a bug in the tool.
+    #[test]
+    fn every_enrollment_failure_shows_the_derived_port_and_its_source() {
+        for err in [
+            "Connection refused",
+            "Operation timed out",
+            "something else entirely",
+        ] {
+            let msg = enrollment_failure("100.64.0.27:2126", "100.64.0.27:2127", err).to_string();
+            assert!(
+                msg.contains("100.64.0.27:2127") && msg.contains("100.64.0.27:2126"),
+                "{err:?} must show the derived target AND the address it came \
+                 from: {msg}"
+            );
+            assert!(
+                msg.contains("0.0.0.0"),
+                "{err:?} must tell the far operator what a correct bind looks \
+                 like, since that is the fact only they can produce: {msg}"
             );
         }
     }
