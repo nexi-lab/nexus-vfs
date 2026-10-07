@@ -116,4 +116,27 @@ async fn a_lost_response_never_creates_a_second_zone() {
         .expect("re-read journal");
     assert_eq!(record2.status, "COMPLETED");
     assert_eq!(record2.zone_id, ZONE);
+
+    // ── 4. The journal is DURABLE: the same retry after a full daemon
+    // restart (data directory preserved) still replays the ORIGINAL
+    // receipt — the record rides the control zone's replicated store, not
+    // process memory. A restarted retry that re-EXECUTED the create would
+    // answer ALREADY_PRESENT with replayed=false instead.
+    drop(rt);
+    drop(_d);
+    let _d2 = Daemon::spawn(&["--bind-addr", &adv, "--no-tls"], &e);
+    let mut rt2 = ZoneRuntime::dial_ready(port, BUDGET).await;
+    let restart_retry = rt2
+        .zone_create(ZONE, &[], OP, "")
+        .await
+        .expect("the post-restart retry must be answered (replay), not hung");
+    assert!(
+        restart_retry.replayed,
+        "a retried operation_id after a daemon restart must answer replayed=true: \
+         {restart_retry:?}"
+    );
+    assert_eq!(
+        restart_retry.outcome, "CREATED",
+        "the replay is the original receipt, not a fresh ALREADY_PRESENT execution"
+    );
 }
