@@ -120,10 +120,13 @@ pub mod grpc;
 ///     the wrong place.
 ///
 ///     Service plugins may ALSO receive authenticated caller credentials
-///     through the optional `nexus_service_dispatch_v2` symbol. The kernel
-///     continues to accept v6 plugins and falls back to the contextless v1
-///     dispatch symbol when v2 is absent. A plugin may deny a call for the
-///     caller by returning `PluginResult::PermissionDenied` (`-4`) — the
+///     through the optional `nexus_service_dispatch_v2` symbol; the kernel
+///     falls back to the contextless v1 dispatch symbol when v2 is absent.
+///     The symbol's OPTIONality is not an ABI-version matter: a plugin
+///     compiled against the v6 fn-ptr table would call the 5-argument
+///     `sys_write` callback with the 4-argument convention, so the loader
+///     rejects any version below 7 outright. A plugin may deny a call for
+///     the caller by returning `PluginResult::PermissionDenied` (`-4`) — the
 ///     host maps it onto `RustCallError::PermissionDenied`. Note: the
 ///     `declare_service_plugin!` macro's generated v2 symbol forwards to
 ///     the contextless v1 dispatch; a plugin that needs the caller
@@ -132,7 +135,8 @@ pub mod grpc;
 ///     (Both changes were cut as "v7" independently on parallel branches;
 ///     they were merged as one revision because neither touches the other's
 ///     symbols — one alters an existing fn-ptr signature, the other adds an
-///     optional symbol.)
+///     optional symbol. The merge kept the strict single-version gate: the
+///     optional dispatch symbol never justified accepting a v6 binary.)
 pub const PLUGIN_API_VERSION: u32 = 7;
 
 // ── Plugin kind ─────────────────────────────────────────────────────

@@ -765,14 +765,13 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
         let desc = self.agent_registry.get(session_id).ok_or_else(|| {
             RustCallError::InvalidArgument(format!("unknown session_id {session_id:?}"))
         })?;
-        // An AGENT credential (`agent_id` set — an agent cert or a session
-        // cert) is inside the control plane's own trust domain: the cluster CA
-        // vouched for it, and `start_session_v1` has already run its
-        // owner-attribution rules on this caller's spawns. A bare principal
-        // (a user key reaching the agent plane directly, `agent_id` unset)
-        // gets the ownership/admin check — the tightened boundary.
-        if ctx.agent_id.is_none() && desc.owner_id != ctx.user_id && !ctx.is_admin && !ctx.is_system
-        {
+        // Authorization is by IDENTITY, not by credential type: an agent
+        // credential is a low-privilege subject by design (the auth layer
+        // grants it no zone tenancy), so it passes exactly the same
+        // ownership/admin check a bare principal does. A session cert still
+        // reaches its own sessions because its `ctx.user_id` is the
+        // CA-verified owner SAN the attribution rules stamped in.
+        if desc.owner_id != ctx.user_id && !ctx.is_admin && !ctx.is_system {
             return Err(RustCallError::PermissionDenied(
                 "managed-agent session operation requires ownership or administrator privileges"
                     .to_string(),
@@ -1077,16 +1076,22 @@ impl<K: KernelSyscall> RustService for ManagedAgentService<K> {
                 // * **system** — the daemon itself. Owner/zone resolve from the
                 //   auth context with the body as an override the context
                 //   vouches for (`resolve_agent_owner` / `resolve_agent_zone`).
-                // * **an agent credential** (`agent_id` set — an ordinary agent
-                //   cert, or a session cert where it differs from `user_id`)
-                //   — the control plane's native caller. Owner attribution is
-                //   `authenticated_owner`'s call: a session cert's CA-verified
-                //   owner SAN wins over the body (a disagreement is refused,
-                //   naming both), while an ordinary cert's body still stands —
-                //   the rule arrives with the credential, not on a flag day.
-                //   Agents carry no zone tenancy by design, so an omitted zone
-                //   takes the root default; a zone named in the body still
-                //   needs an explicit grant (`resolve_agent_zone`).
+                // * **a session credential** (`agent_id` set AND differing
+                //   from `user_id`) — a minted session cert whose CA-verified
+                //   owner SAN is the attribution: `authenticated_owner` lets
+                //   that SAN win over the body (a disagreement is refused,
+                //   naming both). The cert carries no zone grant, so an
+                //   omitted zone takes the root default; a zone named in the
+                //   body still needs an explicit grant
+                //   (`resolve_agent_zone`).
+                // * **an ordinary agent credential** (`agent_id` == `user_id`)
+                //   — a low-privilege subject with NO verifiable owner
+                //   attribution beyond itself: the owner is forced to the
+                //   credential's own identity (`resolve_agent_owner`) and a
+                //   zone — omitted or named — needs an explicit grant, which
+                //   by design agents do not carry. It cannot spawn sessions
+                //   attributed to someone else, and cannot reach the root
+                //   default by omitting the field.
                 // * **a bare principal** (`agent_id` unset, not system — a
                 //   user key hitting the agent control plane directly) — no
                 //   cohost delegation is verifiable for such a caller yet, so
@@ -1103,12 +1108,42 @@ impl<K: KernelSyscall> RustService for ManagedAgentService<K> {
                     )
                     .map_err(map_agent_context_error)?;
                 } else if ctx.agent_id.is_some() {
-                    req.owner_id = authenticated_owner(&req.owner_id, ctx)
-                        .map_err(RustCallError::InvalidArgument)?;
-                    if req.zone_id.is_empty() {
-                        req.zone_id = contracts::ROOT_ZONE_ID.to_string();
+                    let delegated =
+                        ctx.agent_id.as_deref().is_some_and(|agent| agent != ctx.user_id);
+                    if delegated {
+                        // A session credential: the mint's allow-list
+                        // vouched for the owner binding (the CA-stamped SAN
+                        // wins over the body), and the credential carries
+                        // no zone grant by design — an omitted zone takes
+                        // the root default, a named one still needs a
+                        // grant.
+                        req.owner_id = authenticated_owner(&req.owner_id, ctx)
+                            .map_err(RustCallError::InvalidArgument)?;
+                        if req.zone_id.is_empty() {
+                            req.zone_id = contracts::ROOT_ZONE_ID.to_string();
+                        } else {
+                            req.zone_id = resolve_agent_zone(ctx, Some(req.zone_id.as_str()))
+                                .map_err(map_agent_context_error)?;
+                        }
                     } else {
-                        req.zone_id = resolve_agent_zone(ctx, Some(req.zone_id.as_str()))
+                        // An ordinary agent credential: no verifiable
+                        // owner attribution beyond itself, so the owner is
+                        // forced to the credential's own identity, and an
+                        // omitted zone means root — through the SAME
+                        // explicit-grant check a named zone takes, so
+                        // omission can never be MORE permissive than
+                        // naming it.
+                        req.owner_id = resolve_agent_owner(
+                            ctx,
+                            (!req.owner_id.is_empty()).then_some(req.owner_id.as_str()),
+                        )
+                        .map_err(map_agent_context_error)?;
+                        let requested_zone = if req.zone_id.is_empty() {
+                            contracts::ROOT_ZONE_ID
+                        } else {
+                            req.zone_id.as_str()
+                        };
+                        req.zone_id = resolve_agent_zone(ctx, Some(requested_zone))
                             .map_err(map_agent_context_error)?;
                     }
                 } else {

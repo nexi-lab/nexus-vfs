@@ -1006,6 +1006,12 @@ impl ZoneManager {
         peers: Vec<String>,
         mounts: &BTreeMap<String, MountDecl>,
     ) -> Result<()> {
+        // Zones skipped by the D9 guard below — mounts pointing at them are
+        // dropped from the pending set, or the topology loop would chase a
+        // target that never comes back (ensure_links_count fails forever,
+        // apply_topology never converges, the data plane never reports
+        // ready).
+        let mut deprovisioned: std::collections::HashSet<String> = Default::default();
         for zone_id in zones {
             // Founding asks about EXISTENCE, not residency. A zone this node
             // already hosts needs nothing done to it, and materializing every
@@ -1031,6 +1037,7 @@ impl ZoneManager {
                     "refusing to re-found a deprovisioned zone (fail-open: skipping this \
                      zone; set NEXUS_FORCE_DELETED_ZONE_RECREATE=1 to override)"
                 );
+                deprovisioned.insert(zone_id.clone());
                 continue;
             }
             self.create_zone(zone_id, peers.clone())?;
@@ -1038,6 +1045,14 @@ impl ZoneManager {
         let mut pending = self.pending_mounts.lock();
         pending.clear();
         for (path, decl) in mounts {
+            if deprovisioned.contains(&decl.zone) {
+                tracing::warn!(
+                    path = %path,
+                    target = %decl.zone,
+                    "skipping declared mount: target zone was deprovisioned (D9 skip)"
+                );
+                continue;
+            }
             pending.insert(path.clone(), decl.clone());
         }
         Ok(())
@@ -1541,6 +1556,19 @@ impl ZoneManager {
         let target_node = self.registry.get_node(target_zone_id).ok_or_else(|| {
             RaftError::InvalidState(format!("Target zone '{}' not found", target_zone_id))
         })?;
+        // R12: a deprovisioned target must not gain a mount. A RESIDENT
+        // target bypasses the cold-boot materialize gate (that gate only
+        // sees zones materializing from disk), so the deletion check is
+        // repeated here — the same epoch-vs-creation comparison the boot
+        // and purge paths use. This closes the mount side of the
+        // deprovision/mount race to the (replication-lag + interleave)
+        // window shared by both checks.
+        if self.deleted_newer_than_disk(target_zone_id) {
+            return Err(RaftError::InvalidState(format!(
+                "Target zone '{}' was deprovisioned; mount refused",
+                target_zone_id
+            )));
+        }
 
         let handle = self.rt().handle().clone();
 
@@ -1556,8 +1584,24 @@ impl ZoneManager {
         if let Some(ref meta) = existing {
             if meta.entry_type == DT_MOUNT {
                 if meta.target_zone_id == target_zone_id {
-                    // Idempotent.
-                    return Ok(());
+                    // The subtree is part of a mount's identity (a whole-zone
+                    // mount and a subtree mount of the same zone are
+                    // DIFFERENT mounts — write_mount_entry compares both on
+                    // the topology path). Answering idempotent-success for a
+                    // same-target/different-subtree request would report a
+                    // mount that was not made; upgrading in place instead
+                    // would double-count the target's i_links (this path
+                    // has no ensure_links_count reconciliation), so a
+                    // subtree change is a refusal: unmount first.
+                    if meta.target_subtree == target_subtree {
+                        // Idempotent.
+                        return Ok(());
+                    }
+                    return Err(RaftError::InvalidState(format!(
+                        "Mount point '{}' already mounts a different subtree of zone '{}' \
+                         ('{}' != '{}'); unmount first",
+                        mount_path, target_zone_id, meta.target_subtree, target_subtree
+                    )));
                 }
                 return Err(RaftError::InvalidState(format!(
                     "Mount point '{}' is already a DT_MOUNT in zone '{}'. Unmount first.",

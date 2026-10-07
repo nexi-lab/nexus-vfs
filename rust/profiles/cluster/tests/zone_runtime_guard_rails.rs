@@ -123,7 +123,7 @@ async fn joining_a_reserved_zone_over_rpc_is_refused() {
         .expect("boot wires the typed zone runtime surface");
     let mut rt = ZoneRuntime::dial_ready(port, BUDGET).await;
 
-    for reserved in ["root", "__control__"] {
+    for reserved in contracts::RESERVED_ZONE_IDS {
         let refused = rt
             .zone_join(reserved, &[], false, "op-gr-join-reserved", "")
             .await
@@ -179,4 +179,42 @@ async fn deprovision_of_a_mounted_zone_is_refused_until_unmounted() {
         .await
         .expect("deprovision after unmount");
     assert_eq!(done.outcome, "DEPROVISIONED");
+}
+
+/// The mount side of the deprovision/mount race: a deprovisioned target
+/// must not gain a mount. `mount_subtree` repeats the deletion check the
+/// cold-boot materialize gate does (a RESIDENT target never passes through
+/// that gate), so mounting onto a recorded-deleted zone is refused instead
+/// of leaving a DT_MOUNT that points at a destroyed zone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mount_onto_a_deprovisioned_target_is_refused() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let data = tmp.path().join("data").to_string_lossy().into_owned();
+    let id = tmp.path().join("id").to_string_lossy().into_owned();
+    let port = free_port();
+    let adv = format!("127.0.0.1:{port}");
+
+    let mut daemon = Daemon::spawn(&["--bind-addr", &adv, "--no-tls"], &env(&data, &id, &adv));
+    daemon
+        .wait_for_log("ZoneRuntimeService live", BUDGET)
+        .await
+        .expect("boot wires the typed zone runtime surface");
+    let mut rt = ZoneRuntime::dial_ready(port, BUDGET).await;
+
+    rt.zone_create(ZONE, &[], "op-md-create-0001", "")
+        .await
+        .expect("create");
+    rt.zone_deprovision(ZONE, "op-md-deprovision-0002", "")
+        .await
+        .expect("deprovision");
+
+    let refused = rt
+        .zone_mount("root", "/tenant-a", ZONE, "op-md-mount-0003", "")
+        .await
+        .expect_err("mount onto a deprovisioned target must be refused");
+    assert_eq!(
+        refused.code(),
+        tonic::Code::FailedPrecondition,
+        "{refused:?}"
+    );
 }

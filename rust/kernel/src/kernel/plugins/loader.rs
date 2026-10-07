@@ -971,9 +971,9 @@ impl PluginLoader {
                 .map_err(|e| format!("symbol {}: {e}", nexus_plugin_abi::symbols::API_VERSION))?;
             sym()
         };
-        if !matches!(api_version, 6 | PLUGIN_API_VERSION) {
+        if api_version != PLUGIN_API_VERSION {
             return Err(format!(
-                "plugin API version mismatch: plugin={api_version}, kernel accepts 6 or {PLUGIN_API_VERSION}"
+                "plugin API version mismatch: plugin={api_version}, kernel requires {PLUGIN_API_VERSION}"
             ));
         }
 

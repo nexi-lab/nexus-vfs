@@ -29,9 +29,9 @@
 //!
 //! | Permission | Candidate relations                     |
 //! |------------|-----------------------------------------|
-//! | Read       | `viewer`, `reader`, `writer`, `owner`, `direct_viewer` |
+//! | Read       | `viewer`, `reader`, `writer`, `owner`, `direct_viewer`, `direct_editor`, `direct_owner` |
 //! | Write      | `writer`, `owner`, `direct_editor`, `direct_owner`    |
-//! | Traverse   | `viewer`, `reader`, `writer`, `owner`, `direct_viewer` |
+//! | Traverse   | `viewer`, `reader`, `writer`, `owner`, `direct_viewer`, `direct_editor`, `direct_owner` |
 //!
 //! The `direct_*` relations are what the Nexus zone-grant projection
 //! writes (Python `_CAPABILITY_RELATIONS`); the enforcer must accept
@@ -100,9 +100,15 @@ use crate::graph_cache::ReBACGraphCache;
 #[inline]
 fn candidate_relations(permission: Permission) -> &'static [&'static str] {
     match permission {
-        Permission::Read | Permission::Traverse => {
-            &["viewer", "reader", "writer", "owner", "direct_viewer"]
-        }
+        Permission::Read | Permission::Traverse => &[
+            "viewer",
+            "reader",
+            "writer",
+            "owner",
+            "direct_viewer",
+            "direct_editor",
+            "direct_owner",
+        ],
         Permission::Write => &["writer", "owner", "direct_editor", "direct_owner"],
     }
 }
@@ -355,6 +361,29 @@ mod tests {
         // legacy vocabulary stays intact
         assert!(candidate_relations(Permission::Read).contains(&"viewer"));
         assert!(candidate_relations(Permission::Write).contains(&"writer"));
+    }
+
+    /// The Zanzibar stronger→weaker convention must hold for the direct
+    /// mirrors exactly as it does for the legacy relations: a direct
+    /// editor/owner can read and traverse, not just write.
+    #[test]
+    fn direct_editor_and_direct_owner_can_read_and_traverse() {
+        let path = "/root/documents/spec.md";
+        for relation in ["direct_editor", "direct_owner"] {
+            let provider = make_provider("root", &[tuple("file", path, relation, "user", "alice")]);
+            assert!(
+                provider
+                    .check(path, None, Permission::Read, &ctx("alice", "root"))
+                    .is_ok(),
+                "a {relation} holder must be able to read"
+            );
+            assert!(
+                provider
+                    .check(path, None, Permission::Traverse, &ctx("alice", "root"))
+                    .is_ok(),
+                "a {relation} holder must be able to traverse"
+            );
+        }
     }
 
     /// A user without any grant is denied.

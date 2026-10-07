@@ -1798,6 +1798,17 @@ fn open_zone_manager(
 /// path), so healthy boots never spend the whole budget.
 const EPOCH_CATCHUP_BUDGET_SECS: u64 = 15;
 
+/// Which zone carries the R12 deletion epochs: the control zone under
+/// TLS, the per-node root otherwise. The single source for
+/// [`wire_deletion_registry`] and the CLI catch-up call sites.
+fn epoch_zone_id(no_tls: bool) -> &'static str {
+    if no_tls {
+        contracts::ROOT_ZONE_ID
+    } else {
+        contracts::CONTROL_ZONE_ID
+    }
+}
+
 /// Wire the R12 deletion-epoch source onto the zone manager's registry,
 /// bound to the epoch home (the control zone under TLS, the per-node root
 /// otherwise). Shared by the daemon's boot wire points and the offline CLI
@@ -1810,11 +1821,7 @@ fn wire_deletion_registry(
     no_tls: bool,
     node_id: u64,
 ) -> Option<Arc<nexus_raft::ZoneDeletionRegistry>> {
-    let epoch_zone = if no_tls {
-        contracts::ROOT_ZONE_ID
-    } else {
-        contracts::CONTROL_ZONE_ID
-    };
+    let epoch_zone = epoch_zone_id(no_tls);
     let z = zm.get_zone(epoch_zone)?;
     let reg = Arc::new(nexus_raft::ZoneDeletionRegistry::new(
         z.consensus_node(),
@@ -1848,14 +1855,23 @@ fn catch_up_epoch_zone(zm: &nexus_raft::ZoneManager, epoch_zone: &str, node_id: 
     );
     // Fixed key + fresh value: `put` is an upsert, so the namespace does
     // not grow per boot (a unique key per boot would accumulate forever).
-    // Same-millisecond collisions across two boots of one node are
-    // physically impossible — the previous boot still had seconds of boot
-    // work after its own visibility wait before the process could exit.
+    // The value mixes pid + a sub-nanos salt into the millisecond stamp, so
+    // two boots of one node can never produce the SAME value — kill -9
+    // right after the put plus a supervisor instant restart would
+    // otherwise leave the new boot's equality wait satisfied by the OLD
+    // marker within the same millisecond (a false "caught up").
     let marker_key = format!("boot/{node_id}");
-    let marker_value = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis().to_string())
-        .unwrap_or_else(|_| "0".to_string());
+    let marker_value = {
+        let d = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        format!(
+            "{}-{}-{}",
+            d.as_millis(),
+            std::process::id(),
+            d.subsec_nanos()
+        )
+    };
     if let Err(e) = store.put(&marker_key, marker_value.as_bytes()) {
         tracing::warn!(
             zone = %epoch_zone,
@@ -2323,7 +2339,15 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
             // epoch zone commits locally, nothing to catch up: skip.
             let solo = zm.zone_peers(epoch_zone).is_empty();
             if !solo {
-                catch_up_epoch_zone(&zm, epoch_zone, node_id);
+                // Off the async worker (the run_enroll/sweep pattern): the
+                // catch-up parks the calling thread in a 5 ms poll loop for
+                // up to EPOCH_CATCHUP_BUDGET_SECS.
+                let zm_catchup = std::sync::Arc::clone(&zm);
+                tokio::task::spawn_blocking(move || {
+                    catch_up_epoch_zone(&zm_catchup, epoch_zone, node_id)
+                })
+                .await
+                .ok();
             }
         }
     }
@@ -3888,6 +3912,13 @@ async fn run_share(
     // below actually consults replicated state (without this the CLI-side
     // guards would silently see "no record" forever).
     wire_deletion_registry(&zm, common.no_tls, node_id);
+    // The wire bound a registry over THIS replica of the epoch zone — a
+    // replica that stopped when this node's daemon stopped. A deletion
+    // recorded on another member since then is invisible until the replica
+    // catches up, so prove the replica current BEFORE the guard reads it
+    // (same call the daemon's own boot makes). A no-op when the epoch zone
+    // is not hosted here.
+    catch_up_epoch_zone(&zm, epoch_zone_id(common.no_tls), node_id);
     let peers_str: Vec<String> = cli_peer_addrs
         .iter()
         .map(NodeAddress::to_raft_peer_str)
@@ -4358,6 +4389,12 @@ async fn run_join(
     // inside `bootstrap_or_join_zone` actually consults replicated state
     // (without this the guard would silently see "no record" forever).
     wire_deletion_registry(&zm, common.no_tls, node_id);
+    // A rejoining node's epoch-zone replica stopped with its daemon: catch
+    // it up BEFORE the joiner's D9 guard reads it, or a deletion the
+    // founder recorded while this node was down stays invisible and the
+    // joiner would re-found the deleted zone (same call the daemon's boot
+    // makes; no-op when the epoch zone is not hosted here).
+    catch_up_epoch_zone(&zm, epoch_zone_id(common.no_tls), node_id);
 
     // Pre-#3996 (and pre-this commit) ``run_join`` only invoked
     // ``zm.join_zone(remote_zone_id, peers, false)`` — that registers

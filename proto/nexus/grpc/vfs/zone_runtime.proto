@@ -51,7 +51,10 @@ service ZoneRuntimeService {
 }
 
 // Idempotency key every zone mutation carries (R8). `operation_id` is
-// caller-minted and unique per intent; `request_hash` pins the exact
+// caller-minted and unique per intent; it is bounded to 1..=128 chars of
+// [A-Za-z0-9-:._] (it becomes a replicated control-store key, so an
+// unbounded string would be a resource-hygiene hole — the server rejects
+// other shapes with InvalidArgument). `request_hash` pins the exact
 // payload (blake3 of the canonicalized request fields, recomputed
 // server-side) so a replayed operation_id with a DIFFERENT request is
 // refused, not silently merged.

@@ -184,15 +184,24 @@ fn generated_outputs(
 }
 
 fn zone_id_pattern(charset: &str, no_leading: &str, no_trailing: &str) -> String {
-    let edge_chars = charset
+    // The hand-written validator (zone_id.rs) checks each edge against its
+    // OWN forbidden set — the first character against `no_leading`, the
+    // last against `no_trailing` — so the generated classes must stay
+    // per-edge too. Sharing one class for both ends would silently widen
+    // (or narrow) one edge the day the two sets diverge.
+    let first_chars = charset
         .chars()
-        .filter(|character| !no_leading.contains(*character) && !no_trailing.contains(*character))
+        .filter(|character| !no_leading.contains(*character))
+        .collect::<String>();
+    let last_chars = charset
+        .chars()
+        .filter(|character| !no_trailing.contains(*character))
         .collect::<String>();
     format!(
         "^[{}][{}]*[{}]$",
-        regex_class(&edge_chars),
+        regex_class(&first_chars),
         regex_class(charset),
-        regex_class(&edge_chars)
+        regex_class(&last_chars)
     )
 }
 

@@ -133,16 +133,16 @@ fn agent_get_enforces_ownership_like_every_other_agent_method() {
     );
     assert!(!elevated.is_error, "admin reads any agent");
 
-    // A missing pid keeps the pre-existing null answer (no existence
-    // leak change versus the old behavior).
+    // A missing pid answers with the SAME error as someone else's pid —
+    // an error-vs-null split would be an existence oracle.
     let missing = call(
         &kernel,
         &alice,
         "agent_get",
         serde_json::json!({ "pid": "no.such.pid" }),
     );
-    assert!(!missing.is_error);
-    let missing: serde_json::Value =
-        serde_json::from_slice(&missing.payload).expect("missing response");
-    assert!(missing["result"].is_null());
+    assert!(
+        missing.is_error,
+        "a missing pid must not be distinguishable from someone else's pid"
+    );
 }

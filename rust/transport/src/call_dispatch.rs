@@ -373,7 +373,10 @@ fn do_agent_unregister_external(
 
 /// Same ownership rule as every other agent method: the descriptor a
 /// caller reads must be their own, or the caller must be admin/system.
-/// A missing pid keeps answering `null` (the pre-existing shape).
+/// A missing pid answers with the SAME permission error as someone
+/// else's pid — an error-vs-null split would hand the caller an
+/// existence oracle ("does this pid belong to someone?") without ever
+/// granting the descriptor.
 fn do_agent_get(
     kernel: &Arc<Kernel>,
     ctx: &OperationContext,
@@ -389,7 +392,9 @@ fn do_agent_get(
             }
             ok_json(agent_descriptor_to_json(&desc))
         }
-        None => ok_json(serde_json::Value::Null),
+        None => Err(permission_err(
+            "agent operation requires ownership or administrator privileges",
+        )),
     }
 }
 

@@ -2102,6 +2102,21 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
         new_zone_id: &str,
     ) -> CoordinatorResult<ShareInfo> {
         let zm = self.zm().ok_or("federation not active")?;
+        // D9 (R12), same judgment as create_founder_zone: a `get_or_create`
+        // over a deprovisioned id would write a FRESH creation epoch that
+        // outranks the recorded deletion — the zone resurrects and the
+        // purge/materialize gates never suppress it again. Escape hatch:
+        // NEXUS_FORCE_DELETED_ZONE_RECREATE (the daemon's --force), which
+        // bumps the local creation epoch.
+        if std::env::var_os("NEXUS_FORCE_DELETED_ZONE_RECREATE").is_some() {
+            zm.bump_creation_epoch(new_zone_id);
+        } else if zm.deleted_newer_than_disk(new_zone_id) {
+            return Err(format!(
+                "zone '{new_zone_id}' was deprovisioned (recorded deletion outranks this \
+                 replica); sharing into it is refused. Re-use of the id requires an \
+                 operator-supervised recovery (founder boot with --force)."
+            ));
+        }
         // Atomic create + copy + register: materialise the zone first
         // so it is visible to followers before content lands.
         zm.get_or_create_zone(new_zone_id)

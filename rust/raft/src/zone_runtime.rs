@@ -77,6 +77,18 @@ pub(crate) const OUTCOME_DEPROVISIONED: &str = "DEPROVISIONED";
 /// coordinator's federation replay).
 const CATCHUP_BUDGET: Duration = Duration::from_secs(10);
 
+/// A PENDING journal record may only be TAKEN OVER by a same-hash retry
+/// once it is at least this old — before that the original executor is
+/// assumed alive and a retry is a hard conflict. Engineering value, not a
+/// precise bound: the slowest legitimate mutation is a deprovision fan-out
+/// (10 s per peer, serial) plus a 10 s read-back budget, so 120 s covers
+/// roughly a ten-peer cluster. A cluster with peers enough to stretch a
+/// live deprovision past the grace can still see a stuck executor taken
+/// over mid-flight (the mutation layer is idempotent; the journal warns on
+/// the resulting terminal-state race). The taker-over re-stamps the record
+/// (`ZoneOpJournal::refresh`) so its own execution window is protected.
+const PENDING_TAKEOVER_GRACE_MS: i64 = 120_000;
+
 pub struct ZoneRuntimeBackend {
     zm: Arc<ZoneManager>,
     journal: ZoneOpJournal,
@@ -125,7 +137,6 @@ impl ZoneRuntimeBackend {
         let header = require_header(req.mutation.as_ref())?;
         validate_zone_id_for(ZoneIdUse::TenantCreate, &req.zone_id)
             .map_err(|e| ZoneRuntimeError::Invalid(format!("zone_id: {e}")))?;
-        self.refuse_if_deleted(&req.zone_id)?;
         let hash = request_hash(b"create", &[&req.zone_id, &join_sorted(&req.peers)]);
 
         if let Some(replay) =
@@ -133,6 +144,11 @@ impl ZoneRuntimeBackend {
         {
             return Ok(replay);
         }
+        // Durable-deletion state changes over time (unlike the shape checks
+        // above), so it is checked only AFTER the journal replay: a retried
+        // operation id must answer with its original receipt even when the
+        // zone has since been deprovisioned.
+        self.refuse_if_deleted(&req.zone_id)?;
 
         let existed = self.zm.get_zone(&req.zone_id).is_some();
         if let Err(e) = self.zm.create_zone(&req.zone_id, req.peers.clone()) {
@@ -295,6 +311,10 @@ impl ZoneRuntimeBackend {
         {
             return Ok(replay);
         }
+        // Same ordering rule as zone_create: replay first, then the
+        // time-varying deletion check — a mount onto a deprovisioned
+        // target would outlive it and leave a dangling DT_MOUNT.
+        self.refuse_if_deleted(&req.target_zone_id)?;
 
         if let Err(e) = self.zm.mount(
             &req.parent_zone_id,
@@ -328,7 +348,13 @@ impl ZoneRuntimeBackend {
                 .flatten()
                 .and_then(|bytes| decode_file_metadata(&bytes).ok())
                 .filter(|meta| {
-                    meta.entry_type == DT_MOUNT && meta.target_zone_id == req.target_zone_id
+                    // The subtree is part of the mount's identity: this RPC
+                    // mounts the WHOLE zone (mount_subtree with VFS_ROOT),
+                    // so a same-target subtree mount left by join/CLI must
+                    // not satisfy the read-back as if it were this one.
+                    meta.entry_type == DT_MOUNT
+                        && meta.target_zone_id == req.target_zone_id
+                        && meta.target_subtree == contracts::VFS_ROOT
                 })
         });
         if mounted_entry.is_none() {
@@ -522,22 +548,46 @@ impl ZoneRuntimeBackend {
             return Ok(replay);
         }
 
+        // This node must actually host the zone. The zone registry is
+        // node-local, so on a non-hosting node the link-count guard below
+        // would silently pass, the deletion epoch would still be written
+        // globally, the fan-out would reach zero peers (get_peers reads the
+        // same local registry) and the local teardown would fail — the
+        // caller would get a REJECTED receipt for a deletion that in fact
+        // took effect cluster-wide. Refusing here keeps the receipt and the
+        // physical world consistent, and stops a deprovision of a
+        // never-existed id from permanently banning it via the epoch.
+        if !self.zm.hosts_zone(&req.zone_id) {
+            return self.fail(
+                &header.operation_id,
+                ZoneRuntimeError::NotFound(format!(
+                    "zone '{}' is not hosted on this node; route the deprovision to one \
+                     of the zone's hosting nodes",
+                    req.zone_id
+                )),
+                "deprovision",
+                &req.zone_id,
+            );
+        }
+
         // The POSIX i_links guard remove_replica enforces (minus its force
         // escape): deprovisioning a zone that is still MOUNTED would leave
         // every parent holding a dangling DT_MOUNT. A read error fails
         // CLOSED — never destroy on an unreadable link count.
         match self.zm.get_links_count(&req.zone_id) {
-            Ok(Some(count)) if count > 0 => {
-                return self.fail(
-                    &header.operation_id,
-                    ZoneRuntimeError::Conflict(format!(
-                        "zone '{}' still has {} reference(s) (i_links_count > 0); \
-                         unmount all references first",
-                        req.zone_id, count
-                    )),
-                    "deprovision",
-                    &req.zone_id,
-                );
+            Ok(Some(count)) => {
+                if count > 0 {
+                    return self.fail(
+                        &header.operation_id,
+                        ZoneRuntimeError::Conflict(format!(
+                            "zone '{}' still has {} reference(s) (i_links_count > 0); \
+                             unmount all references first",
+                            req.zone_id, count
+                        )),
+                        "deprovision",
+                        &req.zone_id,
+                    );
+                }
             }
             Err(e) => {
                 return self.fail(
@@ -550,7 +600,22 @@ impl ZoneRuntimeBackend {
                     &req.zone_id,
                 );
             }
-            _ => {}
+            // Ok(None) — the zone vanished from the local registry between
+            // the hosting check above and this read (e.g. a concurrent
+            // deprovision tore it down). Fail closed like an unreadable
+            // count: never destroy on an unanswerable link count.
+            Ok(None) => {
+                return self.fail(
+                    &header.operation_id,
+                    ZoneRuntimeError::Internal(format!(
+                        "cannot read i_links_count for '{}' (zone not registered locally \
+                         anymore); refusing to deprovision",
+                        req.zone_id
+                    )),
+                    "deprovision",
+                    &req.zone_id,
+                );
+            }
         }
 
         // Record the deletion FIRST: the epoch must exist in the replicated
@@ -571,13 +636,20 @@ impl ZoneRuntimeBackend {
         // that is DOWN is expected, not an error — the epoch is the
         // authority and its stale replica self-cleans at next boot.
         self.zm.fan_out_delete_best_effort(&req.zone_id, false);
+        // A local teardown failure past this point is NOT an operation
+        // failure: the epoch recorded above is the global authority and the
+        // periodic sweep converges every replica to it. Answering with
+        // REJECTED here would tell the caller "nothing happened" for a
+        // deletion that has already taken effect cluster-wide (and a retry
+        // under a new operation id would then bounce between the refusal
+        // and refuse_if_deleted). Record it as a degraded success instead.
+        let mut teardown_note = String::new();
         if let Err(e) = self.zm.remove_local_zone(&req.zone_id) {
-            return self.fail(
-                &header.operation_id,
-                map_raft_err(e),
-                "deprovision",
-                &req.zone_id,
+            teardown_note = format!(
+                "local teardown degraded ({e}); epoch {epoch} is authoritative, the \
+                 periodic sweep converges replicas"
             );
+            tracing::warn!(zone = %req.zone_id, "zone deprovision: {teardown_note}");
         }
         let mut receipt = base_receipt(
             &header.operation_id,
@@ -587,10 +659,15 @@ impl ZoneRuntimeBackend {
         );
         receipt.evidence = vec![
             format!("deletion epoch {epoch} recorded in the replicated registry"),
-            format!(
-                "local replica destroyed, live peers fanned out (hosts_zone={} after removal)",
-                self.zm.hosts_zone(&req.zone_id)
-            ),
+            if teardown_note.is_empty() {
+                format!(
+                    "local replica destroyed, live peers fanned out (hosts_zone={} after \
+                     removal)",
+                    self.zm.hosts_zone(&req.zone_id)
+                )
+            } else {
+                teardown_note
+            },
         ];
         self.complete(&header.operation_id, &req.zone_id, receipt)
     }
@@ -641,22 +718,43 @@ impl ZoneRuntimeBackend {
                 }
                 // A PENDING record with the SAME request hash is a crash
                 // orphan: the previous executor died between begin and
-                // complete, and nothing replays journal PENDINGs. The
-                // resubmitter (the zone worker retrying after its own
-                // crash) takes over as the executor; hash equality proves
-                // it is the same logical operation, so exactly-once is
-                // preserved. A DIFFERENT hash under the same operation_id
-                // stays a hard conflict.
+                // complete, and nothing replays journal PENDINGs. Hash
+                // equality makes it the same logical operation — but that
+                // alone cannot tell a dead executor from one still in
+                // flight (the mount read-back budget alone is 10 s), so a
+                // takeover additionally requires the record to be older
+                // than PENDING_TAKEOVER_GRACE_MS, and the taker-over
+                // re-stamps the record (journal refresh) so its own
+                // execution window is grace-protected too. A DIFFERENT
+                // hash under the same operation_id stays a hard conflict,
+                // and a grace-window retry is told the operation is still
+                // in flight.
                 crate::zone_op_journal::STATUS_PENDING if rec.request_hash == hash => {
+                    let now = wall_now_ms();
+                    if !pending_takeover_allowed(&rec, now) {
+                        return Err(ZoneRuntimeError::Conflict(format!(
+                            "operation_id '{operation_id}' is still in flight (PENDING for \
+                             {} ms); retry after {PENDING_TAKEOVER_GRACE_MS} ms, query \
+                             GetZoneOperation, or mint a fresh operation_id",
+                            now - rec.updated_at_ms
+                        )));
+                    }
                     tracing::warn!(
                         operation_id,
                         zone_id,
                         "taking over an orphaned PENDING journal record (crash between begin and complete)"
                     );
+                    // Restart the grace window from the takeover point.
+                    if let Err(e) = self.journal.refresh(operation_id) {
+                        return Err(ZoneRuntimeError::Internal(format!(
+                            "journal refresh for takeover: {e}"
+                        )));
+                    }
                     Ok(None)
                 }
                 _ => Err(ZoneRuntimeError::Conflict(format!(
-                    "operation_id '{}' is still PENDING with a different request hash, retry \n                     with a fresh operation_id",
+                    "operation_id '{}' is still PENDING with a different request hash; \
+                     mint a fresh operation_id",
                     operation_id
                 ))),
             },
@@ -689,7 +787,17 @@ impl ZoneRuntimeBackend {
         kind: &str,
         zone_id: &str,
     ) -> Result<ZoneReceipt, ZoneRuntimeError> {
-        let _ = self.journal.reject(operation_id, &err.to_string());
+        if let Err(journal_err) = self.journal.reject(operation_id, &err.to_string()) {
+            // The record stays PENDING: a same-hash retry may take it over
+            // once the grace window passes (the mutation layer is
+            // idempotent), but the refusal reason is lost — say so, loudly.
+            tracing::warn!(
+                zone = %zone_id,
+                kind = %kind,
+                "journal reject failed ({journal_err}); the PENDING record keeps the \
+                 operation take-over-eligible after the grace: {err}"
+            );
+        }
         tracing::error!(zone = %zone_id, kind = %kind, "zone runtime mutation refused: {err}");
         Err(err)
     }
@@ -722,11 +830,12 @@ fn require_header(
 ) -> Result<&kernel::kernel::vfs_proto::ZoneMutationHeader, ZoneRuntimeError> {
     let header =
         header.ok_or_else(|| ZoneRuntimeError::Invalid("missing ZoneMutationHeader".into()))?;
-    if header.operation_id.is_empty() {
-        return Err(ZoneRuntimeError::Invalid(
-            "operation_id must not be empty".into(),
-        ));
-    }
+    // The id becomes a control-store key that rides the raft log — bound
+    // its shape (length + charset) before it can reach the store, the same
+    // way zone_id and mount_path are bounded.
+    contracts::validate_operation_id(&header.operation_id).map_err(|e| {
+        ZoneRuntimeError::Invalid(format!("operation_id: {e}"))
+    })?;
     Ok(header)
 }
 
@@ -770,7 +879,21 @@ fn base_receipt(operation_id: &str, zone_id: &str, kind: &str, outcome: &str) ->
 fn decode_receipt(rec: &JournalRecord) -> ZoneReceipt {
     rec.receipt
         .as_deref()
-        .and_then(|bytes| ZoneReceipt::decode(bytes).ok())
+        .and_then(|bytes| {
+            ZoneReceipt::decode(bytes)
+                .map_err(|e| {
+                    // Corrupted receipt bytes degrade to an empty outcome —
+                    // but never silently: the replay is claiming success on
+                    // the strength of a record whose evidence did not decode.
+                    tracing::warn!(
+                        operation_id = %rec.operation_id,
+                        "journal COMPLETED receipt failed to decode ({e:?}); replaying an \
+                         empty-outcome fallback receipt"
+                    );
+                    e
+                })
+                .ok()
+        })
         .unwrap_or_else(|| base_receipt(&rec.operation_id, &rec.zone_id, &rec.kind, ""))
 }
 
@@ -825,4 +948,178 @@ fn join_sorted(peers: &[String]) -> String {
     let mut sorted = peers.to_vec();
     sorted.sort();
     sorted.join("\u{1}")
+}
+
+fn wall_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Whether a PENDING journal record is old enough to be taken over by a
+/// same-hash retry — see [`PENDING_TAKEOVER_GRACE_MS`].
+fn pending_takeover_allowed(rec: &JournalRecord, now_ms: i64) -> bool {
+    now_ms - rec.updated_at_ms >= PENDING_TAKEOVER_GRACE_MS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record_stamped(updated_at_ms: i64) -> JournalRecord {
+        JournalRecord {
+            operation_id: "op-takeover-test".to_string(),
+            request_hash: 42,
+            kind: "mount".to_string(),
+            zone_id: "tenant-a".to_string(),
+            status: crate::zone_op_journal::STATUS_PENDING.to_string(),
+            receipt: None,
+            error: None,
+            updated_at_ms,
+        }
+    }
+
+    #[test]
+    fn takeover_requires_the_grace_age() {
+        let now = 1_000_000;
+        let rec = record_stamped(now - PENDING_TAKEOVER_GRACE_MS);
+        assert!(
+            pending_takeover_allowed(&rec, now),
+            "a record exactly at the grace age is takeover-eligible"
+        );
+        let rec = record_stamped(now - PENDING_TAKEOVER_GRACE_MS + 1);
+        assert!(
+            !pending_takeover_allowed(&rec, now),
+            "a record one millisecond short of the grace stays protected"
+        );
+        let rec = record_stamped(now);
+        assert!(
+            !pending_takeover_allowed(&rec, now),
+            "a freshly begun record is never takeover-eligible"
+        );
+    }
+
+    #[test]
+    fn clock_regression_keeps_the_record_protected() {
+        let now = 1_000_000;
+        let rec = record_stamped(now + PENDING_TAKEOVER_GRACE_MS);
+        assert!(
+            !pending_takeover_allowed(&rec, now),
+            "a negative age (local clock behind the record's stamp) must not allow a takeover"
+        );
+    }
+
+    /// Live-consensus fixture for the takeover path: a solo control zone
+    /// carrying both the journal and the deletion registry, plus a second
+    /// journal handle sharing the same store for assertions.
+    fn make_backend() -> (ZoneRuntimeBackend, ZoneOpJournal, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let zm = ZoneManager::with_node_id(
+            "takeover-test",
+            1,
+            dir.path().to_str().expect("utf-8"),
+            vec![],
+            "127.0.0.1:0",
+            None,
+            None,
+            None,
+        )
+        .expect("ZoneManager");
+        let zone = zm
+            .create_zone(contracts::CONTROL_ZONE_ID, vec![])
+            .expect("control zone");
+        let node = zone.consensus_node();
+        let handle = zone.runtime_handle();
+        let journal = ZoneOpJournal::new(node.clone(), handle.clone());
+        let probe = ZoneOpJournal::new(node.clone(), handle.clone());
+        let deletions = Arc::new(ZoneDeletionRegistry::new(node, handle, 1));
+        let backend = ZoneRuntimeBackend::new(zm, journal, deletions);
+        (backend, probe, dir)
+    }
+
+    fn store_put_record(
+        backend: &ZoneRuntimeBackend,
+        operation_id: &str,
+        rec: &JournalRecord,
+    ) {
+        // A second ControlStateStore view on the same namespace the journal
+        // uses — the test-only way to plant a record with a chosen stamp.
+        let zone = backend
+            .zm
+            .get_zone(contracts::CONTROL_ZONE_ID)
+            .expect("control zone lives");
+        let store = crate::control_state_store::ControlStateStore::new(
+            zone.consensus_node(),
+            zone.runtime_handle(),
+            contracts::CONTROL_NS_ZONE_OPS,
+        );
+        let bytes = serde_json::to_vec(rec).expect("record encode");
+        store.put(operation_id, &bytes).expect("plant record");
+    }
+
+    #[test]
+    fn an_aged_pending_record_is_taken_over_and_restamped() {
+        let (backend, probe, _dir) = make_backend();
+        let hash = request_hash(b"mount", &["root", "/agents", "tenant-a"]);
+        let old = wall_now_ms() - (PENDING_TAKEOVER_GRACE_MS + 5_000);
+        let rec = JournalRecord {
+            operation_id: "op-takeover-aged".to_string(),
+            request_hash: hash,
+            kind: "mount".to_string(),
+            zone_id: "tenant-a".to_string(),
+            status: crate::zone_op_journal::STATUS_PENDING.to_string(),
+            receipt: None,
+            error: None,
+            updated_at_ms: old,
+        };
+        store_put_record(&backend, "op-takeover-aged", &rec);
+
+        let outcome = backend.begin_or_replay("op-takeover-aged", hash, "mount", "tenant-a");
+        assert!(
+            outcome.is_ok(),
+            "an over-grace PENDING record with the same hash must be taken over: {:?}",
+            outcome.err()
+        );
+        assert!(
+            outcome.unwrap().is_none(),
+            "takeover means the caller becomes the executor (no replay receipt)"
+        );
+        let after = probe.get("op-takeover-aged").expect("record").expect("present");
+        assert_eq!(after.status, crate::zone_op_journal::STATUS_PENDING);
+        assert!(
+            after.updated_at_ms > old,
+            "the takeover must re-stamp the record so its own execution window is \
+             grace-protected (stamp {} did not advance past {})",
+            after.updated_at_ms,
+            old
+        );
+    }
+
+    #[test]
+    fn a_fresh_pending_record_is_not_taken_over() {
+        let (backend, _probe, _dir) = make_backend();
+        let hash = request_hash(b"mount", &["root", "/agents", "tenant-a"]);
+        let rec = JournalRecord {
+            operation_id: "op-takeover-fresh".to_string(),
+            request_hash: hash,
+            kind: "mount".to_string(),
+            zone_id: "tenant-a".to_string(),
+            status: crate::zone_op_journal::STATUS_PENDING.to_string(),
+            receipt: None,
+            error: None,
+            updated_at_ms: wall_now_ms(),
+        };
+        store_put_record(&backend, "op-takeover-fresh", &rec);
+
+        let err = backend
+            .begin_or_replay("op-takeover-fresh", hash, "mount", "tenant-a")
+            .expect_err("a record inside the grace window must not be taken over");
+        match err {
+            ZoneRuntimeError::Conflict(msg) => {
+                assert!(msg.contains("still in flight"), "message: {msg}");
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+    }
 }

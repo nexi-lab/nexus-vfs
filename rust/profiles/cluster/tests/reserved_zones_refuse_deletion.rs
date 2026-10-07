@@ -9,6 +9,7 @@ mod common;
 use std::time::Duration;
 
 use common::{free_port, Daemon, ZoneRuntime, LOG_FILTER};
+use contracts::{CONTROL_ZONE_ID, ROOT_ZONE_ID};
 use kernel::kernel::vfs_proto::zone_status_response::Presence;
 use tonic::Code;
 
@@ -61,7 +62,7 @@ async fn reserved_zones_refuse_deletion_on_every_layer() {
 
     // ── Typed deprovision of `root` → refused ──
     let err = rt
-        .zone_deprovision("root", "op-dep-root-0001", "")
+        .zone_deprovision(ROOT_ZONE_ID, "op-dep-root-0001", "")
         .await
         .expect_err("deprovision(root) must be refused");
     assert_eq!(
@@ -73,14 +74,14 @@ async fn reserved_zones_refuse_deletion_on_every_layer() {
 
     // ── Typed deprovision of `__control__` → refused ──
     let err = rt
-        .zone_deprovision("__control__", "op-dep-control-0002", "")
+        .zone_deprovision(CONTROL_ZONE_ID, "op-dep-control-0002", "")
         .await
         .expect_err("deprovision(__control__) must be refused");
     assert_eq!(err.code(), Code::FailedPrecondition, "{}", err.message());
 
     // ── Remove-replica of a reserved zone → refused (fan-out layer) ──
     let err = rt
-        .zone_remove_replica("root", false, "op-rm-root-0003", "")
+        .zone_remove_replica(ROOT_ZONE_ID, false, "op-rm-root-0003", "")
         .await
         .expect_err("remove_replica(root) must be refused");
     assert_eq!(
@@ -90,7 +91,7 @@ async fn reserved_zones_refuse_deletion_on_every_layer() {
         err.message()
     );
     let err = rt
-        .zone_remove_replica("__control__", true, "op-rm-control-0004", "")
+        .zone_remove_replica(CONTROL_ZONE_ID, true, "op-rm-control-0004", "")
         .await
         .expect_err(
             "remove_replica(__control__, force) must be refused — force does not \
@@ -99,7 +100,7 @@ async fn reserved_zones_refuse_deletion_on_every_layer() {
     assert_eq!(err.code(), Code::FailedPrecondition, "{}", err.message());
 
     // ── And the refusals were not destructive: root is still RESIDENT ──
-    let status = rt.zone_status("root", "").await.expect("root status");
+    let status = rt.zone_status(ROOT_ZONE_ID, "").await.expect("root status");
     assert_eq!(
         status.presence,
         i32::from(Presence::Resident),
@@ -109,7 +110,7 @@ async fn reserved_zones_refuse_deletion_on_every_layer() {
     // refusal is per-mutation, never a boot/boot-path failure).
     let mut j_rt = ZoneRuntime::dial_ready(jport, BUDGET).await;
     let j_status = j_rt
-        .zone_status("root", "")
+        .zone_status(ROOT_ZONE_ID, "")
         .await
         .expect("joiner root status");
     assert_eq!(j_status.presence, i32::from(Presence::Resident));

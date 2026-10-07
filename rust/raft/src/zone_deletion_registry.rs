@@ -11,10 +11,29 @@
 //! `ZoneRaftRegistry` consults without depending on the control store's
 //! implementation (high cohesion: the registry knows epochs, not stores).
 //!
-//! Epoch semantics: wall-clock-based and strictly increasing —
-//! `mark_deleted` takes `max(previous + 1, now_ms)` so an epoch is both
-//! monotone per zone and comparable against the local `.creation-epoch`
-//! wall-clock the boot check uses. Deliberately NOT provided: any
+//! Epoch semantics: wall-clock-based and monotone per zone under the
+//! single-writer conditions deprovision actually runs under —
+//! `mark_deleted` takes `max(previous + 1, now_ms)`. Preconditions worth
+//! stating plainly:
+//!
+//! * The read-judge-write is NOT a cross-node CAS: two concurrent
+//!   `mark_deleted` calls for one zone (different nodes, different
+//!   operation ids) can interleave such that the later-applied write
+//!   carries the SMALLER epoch under clock skew — the value can regress.
+//!   Deprovision is an admin-rate operation and the journal already
+//!   dedups per `operation_id`, so the exposure is accepted rather than
+//!   paying for a state-machine-side epoch command.
+//! * Both sides of the comparison are wall-clocks read on DIFFERENT
+//!   nodes: the deletion epoch on the initiating node, the replica's
+//!   `.creation-epoch` where it was created. A replica whose clock runs
+//!   ahead of the initiator by more than the zone's created→deprovisioned
+//!   interval satisfies `creation_epoch >= deletion_epoch` forever, and
+//!   the resurrection check never fires for it — fail-open, the same
+//!   degradation direction as a store-unreachable `None`. Operations
+//!   premise: node clocks stay synchronized to well under a zone's
+//!   minimum lifetime.
+//!
+//! Deliberately NOT provided: any
 //! restore/un-delete method — R12 has no recovery requirement. The escape
 //! hatch (`NEXUS_FORCE_DELETED_ZONE_RECREATE`, set by `nexusd-cluster
 //! --force`) covers recovery WITHOUT one: the guard that re-founds the zone
@@ -74,8 +93,15 @@ impl ZoneDeletionRegistry {
     /// Record (or re-record) `zone_id` as deleted, returning the new
     /// epoch. Idempotent in effect — repeated calls keep bumping the
     /// epoch, which is harmless (any epoch > a stale replica's creation
-    /// epoch suppresses it) and keeps the value strictly increasing.
+    /// epoch suppresses it). Monotone under the single-writer conditions
+    /// of the module doc: this is a read-judge-write over the locally
+    /// applied state, so the `previous` read barriers first (a follower
+    /// proposing this must not compute its bump from a stale local view),
+    /// and concurrent writers + clock skew remain the documented residual.
     pub fn mark_deleted(&self, zone_id: &str) -> Result<u64, String> {
+        self.store
+            .read_barrier()
+            .map_err(|e| format!("mark_deleted({zone_id}) read barrier: {e}"))?;
         let previous = self.deletion_epoch(zone_id)?;
         let now = now_ms();
         let epoch = previous.map_or(now, |prev| (prev + 1).max(now));

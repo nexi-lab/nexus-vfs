@@ -22,8 +22,10 @@
 //! 7. USE      the session credential authenticates to the daemon and writes.
 //! 8. BIND     the owner REACHES a service and outranks the request body:
 //!    `start_session_v1` records `alice` for a caller that named nobody, and
-//!    refuses one that names `bob`. The control is `moss`, whose ordinary
-//!    agent cert has no owner SAN and whose body is still honoured.
+//!    refuses one that names `bob`. The boundary holds for `moss` too, whose
+//!    ordinary agent cert has no owner SAN: its body's owner claim is
+//!    refused — an ordinary agent credential cannot attribute a session to
+//!    anyone but itself.
 //! 9. REVOKE   `moss` revokes it by handing back the certificate; after the CRL
 //!    refresh the daemon rejects it, while `moss` keeps working.
 //! 10. INTACT  `MintAgent`'s node-only gate is untouched: `moss` still cannot
@@ -297,9 +299,12 @@ async fn a_front_door_agent_mints_a_session_identity_for_a_person_and_can_revoke
         "the refusal must name both what was asked and what was proven; got {err}"
     );
 
-    // The control: `moss`, holding an ORDINARY agent cert with no owner SAN,
-    // is unaffected — its body still stands. This is what makes the rule
-    // arrive with the credential instead of on a flag day.
+    // The boundary: `moss`, holding an ORDINARY agent cert (no owner SAN,
+    // no zone grant), must NOT be able to open a session attributed to
+    // someone else. An ordinary agent credential has no verifiable owner
+    // attribution beyond itself — its body's owner claim is refused, not
+    // honoured, and it carries no zone grant so the omitted-zone root
+    // default is out of reach too.
     let mut front_door = Vfs::connect_mtls(fport, &ca, &moss_cert, &moss_key, BUDGET).await;
     let as_moss = front_door
         .call(
@@ -307,25 +312,13 @@ async fn a_front_door_agent_mints_a_session_identity_for_a_person_and_can_revoke
             r#"{"agent_id":"scode-standard","owner_id":"bob"}"#,
             "",
         )
-        .await
-        .expect("an ordinary agent cert keeps naming its own owner");
-    let moss_sid = as_moss
-        .split("\"session_id\":\"")
-        .nth(1)
-        .and_then(|s| s.split('"').next())
-        .expect("response carries a session_id")
-        .to_string();
-    let moss_recorded = front_door
-        .call(
-            "managed_agent.get_session_v1",
-            &format!(r#"{{"session_id":"{moss_sid}"}}"#),
-            "",
-        )
-        .await
-        .expect("readable");
+        .await;
+    let err = as_moss.expect_err(
+        "an ordinary agent cert must not open a session attributed to someone else",
+    );
     assert!(
-        moss_recorded.contains("\"owner_id\":\"bob\""),
-        "a caller with no owner SAN is unchanged; got {moss_recorded}"
+        !err.contains("session_id"),
+        "the refusal must not spawn anything: {err}"
     );
 
     // ── 9. REVOKE by handing back the certificate ───────────────────────────

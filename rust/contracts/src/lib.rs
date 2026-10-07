@@ -10,6 +10,7 @@ pub mod agent_pid;
 pub mod constants;
 pub mod lock_state;
 pub mod operation_context;
+pub mod operation_id;
 pub mod rust_service;
 pub mod zone_id;
 pub mod zone_path;
@@ -25,6 +26,7 @@ pub use constants::{
 };
 pub use lock_state::{HolderInfo, LockAcquireResult, LockEntry, LockInfo, LockState, Locks};
 pub use operation_context::OperationContext;
+pub use operation_id::{validate_operation_id, OperationIdError};
 pub use rust_service::{RustCallError, RustService};
 pub use zone_id::{validate_zone_id, validate_zone_id_for, ZoneIdError, ZoneIdUse};
 pub use zone_path::{validate_zone_path, ZonePathError};
