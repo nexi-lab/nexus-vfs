@@ -10,6 +10,7 @@
 use crate::stream::{MemoryStreamBackend, StreamBackend, StreamError};
 use dashmap::DashMap;
 use parking_lot::{Condvar, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -32,6 +33,23 @@ type StreamMaterializer = Box<dyn Fn(&str) -> Option<Arc<dyn StreamBackend>> + S
 struct StreamNotify {
     generation: Mutex<u64>,
     not_empty: Condvar,
+    /// How many readers are parked on `not_empty` right now.
+    ///
+    /// Exists so "a reader is parked" is a state a caller can WAIT FOR instead
+    /// of a duration it has to guess. `destroy` waking a parked reader is only
+    /// the behaviour under test once the reader is actually parked; before that,
+    /// `destroy` removes the stream and the reader gets `NotFound` out of
+    /// `resolve` — equally correct, and a different test. A `sleep` between the
+    /// two cannot tell them apart (nexi-lab/nexus-vfs#383).
+    ///
+    /// Incremented while HOLDING `generation`'s guard, which `Condvar::wait_for`
+    /// then releases atomically. That ordering is what makes the count usable
+    /// as a rendezvous rather than just a statistic: a waker has to take the
+    /// same guard to bump the generation, so it cannot acquire it until the
+    /// reader has released it by parking. An observer that sees a non-zero
+    /// count and then wakes therefore cannot signal into the gap before the
+    /// park.
+    waiters: AtomicUsize,
 }
 
 impl StreamNotify {
@@ -39,6 +57,7 @@ impl StreamNotify {
         Self {
             generation: Mutex::new(0),
             not_empty: Condvar::new(),
+            waiters: AtomicUsize::new(0),
         }
     }
 
@@ -57,6 +76,12 @@ impl StreamNotify {
         let mut generation = self.generation.lock();
         *generation = generation.wrapping_add(1);
         self.not_empty.notify_all();
+    }
+
+    /// Readers parked on this stream's condvar right now.
+    #[inline]
+    fn parked(&self) -> usize {
+        self.waiters.load(Ordering::Acquire)
     }
 }
 
@@ -246,6 +271,22 @@ impl StreamManager {
         }
     }
 
+    /// Readers currently parked in [`Self::read_at_blocking`] on `path`.
+    ///
+    /// `0` for a path with no notify slot, which is the same answer as "nothing
+    /// is parked there" and needs no separate case.
+    ///
+    /// For callers that have to establish "a reader is waiting" before doing
+    /// the thing that should wake it. Tests are the obvious user —
+    /// `destroy`-wakes-a-parked-reader is a different assertion from
+    /// `destroy`-then-read-misses, and sleeping between the two picks one at
+    /// random (nexi-lab/nexus-vfs#383). Production code should not need this:
+    /// a waker never has to know whether anyone is listening, and
+    /// [`Self::wake_waiters`] is already a safe no-op when nobody is.
+    pub fn parked_readers(&self, path: &str) -> usize {
+        self.notify.get(path).map_or(0, |n| n.parked())
+    }
+
     /// Read one message at byte offset. Returns (data, next_offset) or None if empty.
     pub fn read_at(
         &self,
@@ -309,7 +350,14 @@ impl StreamManager {
             if *generation == observed {
                 // No wake since the read began. The condition check and park
                 // share the waker's mutex, so a write cannot slip between them.
+                //
+                // The counter is bumped INSIDE that guard and dropped after the
+                // wait returns, so it is non-zero exactly while this thread is
+                // parked — see `StreamNotify::waiters` for why that ordering is
+                // what lets a caller rendezvous on it.
+                notify.waiters.fetch_add(1, Ordering::Release);
                 notify.not_empty.wait_for(&mut generation, remaining);
+                notify.waiters.fetch_sub(1, Ordering::Release);
             }
             observed = *generation;
             // Drop the guard before re-reading, including on timeout. Checking
@@ -603,8 +651,34 @@ mod tests {
         mgr.destroy("/stream").expect("destroy");
     }
 
-    /// Sanity check that destroy() wakes a parked blocking reader
-    /// instead of leaving it stuck until timeout.
+    /// Wait until `path` has `want` parked readers, or fail saying what it saw.
+    ///
+    /// The budget is a backstop for a reader that never arrives, not the
+    /// rendezvous itself — on success this returns as soon as the state holds,
+    /// so it does not cost the suite wall-clock the way a fixed sleep does.
+    fn await_parked(mgr: &StreamManager, path: &str, want: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if mgr.parked_readers(path) == want {
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!(
+            "{path}: waited 5s for {want} parked reader(s), saw {}",
+            mgr.parked_readers(path)
+        );
+    }
+
+    /// `destroy` wakes a parked blocking reader instead of leaving it stuck
+    /// until timeout.
+    ///
+    /// Gated on the reader actually being parked, not on a sleep. Both
+    /// orderings are legal behaviour — park-then-destroy gives `Closed`,
+    /// destroy-then-read gives `NotFound` from `resolve` — so a race decides
+    /// WHICH CONTRACT gets tested, and under load the sleep lost often enough
+    /// to read as flakiness (nexi-lab/nexus-vfs#383). `await_parked` makes the
+    /// precondition a state this test establishes rather than hopes for.
     #[test]
     fn read_at_blocking_wakes_on_destroy() {
         let mgr = Arc::new(StreamManager::new());
@@ -616,7 +690,7 @@ mod tests {
             reader_mgr.read_at_blocking("/closeme", 0, 30_000)
         });
 
-        thread::sleep(Duration::from_millis(50));
+        await_parked(&mgr, "/closeme", 1);
 
         mgr.destroy("/closeme").expect("destroy");
 
@@ -624,6 +698,62 @@ mod tests {
         match result {
             Err(StreamManagerError::Closed(_)) => {}
             other => panic!("expected Closed, got {other:?}"),
+        }
+    }
+
+    /// The other ordering, stated rather than left to chance: destroying first
+    /// makes the read a plain miss.
+    ///
+    /// This is the outcome the old sleep-based test produced when it lost its
+    /// race, reported as `expected Closed, got NotFound`. It is correct
+    /// behaviour and now has its own name, so seeing it is a pass somewhere
+    /// instead of a confusing failure in the test above.
+    #[test]
+    fn read_at_blocking_on_a_destroyed_stream_is_not_found() {
+        let mgr = StreamManager::new();
+        mgr.create("/gone", 1024).expect("create");
+        mgr.destroy("/gone").expect("destroy");
+
+        let err = mgr.read_at_blocking("/gone", 0, 30_000).unwrap_err();
+
+        assert!(
+            matches!(&err, StreamManagerError::NotFound(p) if p == "/gone"),
+            "a destroyed stream must miss, not block: {err:?}"
+        );
+    }
+
+    /// The counter is zero when nobody is parked, and back to zero afterwards.
+    ///
+    /// Without this, `await_parked` could be satisfied by a counter that is
+    /// simply always `1`, which would make the gate above vacuous.
+    #[test]
+    fn parked_readers_counts_only_actually_parked_readers() {
+        let mgr = Arc::new(StreamManager::new());
+        mgr.create("/counted", 1024).expect("create");
+        assert_eq!(mgr.parked_readers("/counted"), 0, "nothing parked yet");
+        assert_eq!(
+            mgr.parked_readers("/never-registered"),
+            0,
+            "a path with no notify slot has nothing parked"
+        );
+
+        let reader_mgr = Arc::clone(&mgr);
+        let reader = thread::spawn(move || reader_mgr.read_at_blocking("/counted", 0, 30_000));
+        await_parked(&mgr, "/counted", 1);
+
+        // A real frame, so the reader returns through the normal path rather
+        // than through `destroy` — the decrement must happen either way.
+        mgr.write_nowait("/counted", b"frame").expect("write");
+        let (data, _) = reader.join().expect("reader thread").expect("read");
+        assert_eq!(data, b"frame");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while mgr.parked_readers("/counted") != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "waiter count never returned to 0 after the reader finished"
+            );
+            thread::sleep(Duration::from_millis(1));
         }
     }
 
@@ -656,8 +786,13 @@ mod tests {
             // `WouldBlock` here rather than hanging the suite.
             reader_sm.read_at_blocking(path, 0, 3_000)
         });
-        // Let the reader actually reach the condvar wait before the frame lands.
-        thread::sleep(Duration::from_millis(100));
+        // Gate on the reader being parked, not on a sleep. This is load-bearing
+        // in a way the destroy test's gate is not: if the reader has NOT parked
+        // when the frame lands, its own first `buf.read_at` finds the frame and
+        // returns, so the test passes WITHOUT `wake_waiters` ever having woken
+        // anything. A sleep that loses its race here does not fail — it stops
+        // testing the thing (nexi-lab/nexus-vfs#383).
+        await_parked(&sm, path, 1);
 
         // Out-of-band materialisation: the frame is now readable, but nothing
         // signalled the condvar (this is the replica apply path, not a write).
