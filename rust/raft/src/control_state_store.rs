@@ -98,6 +98,12 @@ impl ControlStateStore {
             // The only expected rejection is the CAS conflict; surface anything
             // else (an upsert must never be refused).
             if if_absent {
+                // The winner's insert is committed, but on a follower the
+                // local apply lags the returned leader result — barrier
+                // before reporting the loss so a caller that reads the
+                // record back right away (the journal's begin does) sees
+                // the winner instead of a stale miss.
+                self.read_barrier()?;
                 return Ok(false);
             }
             return Err(format!("put({ns}/{key}) rejected: {msg}"));
@@ -131,7 +137,7 @@ impl ControlStateStore {
     /// Wait for the local replica to apply all preceding commits through Raft
     /// ReadIndex. Applies equally to grants and revocations, including writes
     /// forwarded by followers. Errors are returned to the management caller.
-    fn read_barrier(&self) -> Result<(), String> {
+    pub(crate) fn read_barrier(&self) -> Result<(), String> {
         bridge_block_on(&self.runtime, async {
             tokio::time::timeout(
                 std::time::Duration::from_secs(10),

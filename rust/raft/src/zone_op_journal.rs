@@ -11,15 +11,21 @@
 //!
 //! The record then walks `PENDING → COMPLETED` (or `REJECTED`) via a
 //! read-judge-write. `ControlStateStore` has no CAS primitive, so this
-//! walk is atomic ONLY under the single-executor guarantee `begin`'s
-//! `put_if_absent` provides: the winner of the insert is the only writer
-//! of the terminal state, and a loser never executes the mutation (it
-//! replays the winner's record instead). The read-judge-write alone does
-//! NOT defend two writers that both hold a PENDING record — two such
-//! writers cannot exist by construction, which is precisely the
-//! "generation" protection the foundation doc requires on journal
-//! updates; full worker lease/fencing is a Nexus-side concern (step 05),
-//! not this work item.
+//! walk is guarded by a single-executor design plus a takeover grace:
+//!
+//! * The winner of `begin`'s insert is the executor; a concurrent or
+//!   immediate retry replays its record instead of executing.
+//! * A PENDING record whose `updated_at_ms` is older than the takeover
+//!   grace (see the zone runtime, which owns the constant) may be TAKEN
+//!   OVER by a retryer with the same request hash — the crash-orphan
+//!   recovery path. The taker re-stamps `updated_at_ms` (`refresh`) so
+//!   ITS execution window is grace-protected too.
+//! * Two writers can therefore overlap only in the crash-recovery corner
+//!   (the original executor alive but stuck past the grace). The
+//!   transition's read-judge-write re-reads before its unconditional
+//!   `put`, so a late writer abandons rather than overwriting a record
+//!   that went terminal mid-write; the residual window is the
+//!   microseconds between that re-read and the `put`.
 //!
 //! Storage rides the control zone via `Command::PutControlState` — opaque
 //! bytes the state machine never parses, zero new raft `Command` variants
@@ -126,7 +132,7 @@ impl ZoneOpJournal {
     /// record still PENDING — a stale concurrent writer cannot regress a
     /// finished record).
     pub fn complete(&self, operation_id: &str, receipt: &[u8]) -> Result<(), String> {
-        self.transition(operation_id, |mut rec| {
+        self.transition(operation_id, "complete", |mut rec| {
             rec.status = STATUS_COMPLETED.to_string();
             rec.receipt = Some(receipt.to_vec());
             rec.error = None;
@@ -137,9 +143,20 @@ impl ZoneOpJournal {
 
     /// Mark REJECTED with the refusal reason (same one-way guard).
     pub fn reject(&self, operation_id: &str, error: &str) -> Result<(), String> {
-        self.transition(operation_id, |mut rec| {
+        self.transition(operation_id, "reject", |mut rec| {
             rec.status = STATUS_REJECTED.to_string();
             rec.error = Some(error.to_string());
+            rec.updated_at_ms = now_ms();
+            rec
+        })
+    }
+
+    /// Re-stamp a PENDING record's `updated_at_ms` (no other field changes).
+    /// Called by a takeover executor: the grace window restarts from the
+    /// takeover point, so a later retryer cannot immediately take over the
+    /// taker-over. No-op on a record that is terminal or absent.
+    pub(crate) fn refresh(&self, operation_id: &str) -> Result<(), String> {
+        self.transition(operation_id, "refresh", |mut rec| {
             rec.updated_at_ms = now_ms();
             rec
         })
@@ -157,12 +174,16 @@ impl ZoneOpJournal {
 
     /// Shared read-judge-write for the PENDING → terminal transition. A
     /// record already terminal (or absent) is left untouched. This is NOT
-    /// a cross-writer CAS — its one-way guarantee holds because the single
-    /// executor established by `begin`'s `put_if_absent` is the only
-    /// writer that reaches here for a live operation (see the module doc).
+    /// a cross-writer CAS — the store's `put` is an unconditional upsert,
+    /// so a writer that judged PENDING can still land after a concurrent
+    /// terminal write; the pre-put re-read below narrows that overwrite
+    /// window to the microseconds between the re-read and the `put` (the
+    /// single-executor design plus the takeover grace make a genuine
+    /// two-writer overlap a crash-recovery corner — see the module doc).
     fn transition(
         &self,
         operation_id: &str,
+        intent: &str,
         f: impl FnOnce(JournalRecord) -> JournalRecord,
     ) -> Result<(), String> {
         let Some(current) = self.get(operation_id)? else {
@@ -173,9 +194,31 @@ impl ZoneOpJournal {
         if current.status != STATUS_PENDING {
             // Lost the race to a terminal state (or replayed an old call) —
             // the durable record already says something at least as final.
+            tracing::warn!(
+                operation_id,
+                status = %current.status,
+                "journal transition '{intent}' skipped: record already terminal"
+            );
             return Ok(());
         }
         let next = f(current);
+        // Pre-put re-read: write only while the record is STILL pending, so
+        // a writer that judged PENDING earlier cannot overwrite a terminal
+        // state that landed mid-write (nor can a takeover `refresh` revert
+        // one).
+        let Some(reread) = self.get(operation_id)? else {
+            return Err(format!(
+                "journal record '{operation_id}' vanished before transition"
+            ));
+        };
+        if reread.status != STATUS_PENDING {
+            tracing::warn!(
+                operation_id,
+                status = %reread.status,
+                "journal transition '{intent}' abandoned: record went terminal mid-write"
+            );
+            return Ok(());
+        }
         let bytes = serde_json::to_vec(&next).map_err(|e| format!("journal encode: {e}"))?;
         self.store.put(operation_id, &bytes)
     }
