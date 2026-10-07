@@ -63,6 +63,7 @@
 
 pub mod classifier;
 pub mod combine;
+pub mod credentials;
 pub mod enforce;
 pub mod hook;
 mod json_layout;
@@ -74,6 +75,7 @@ pub use classifier::{
     Classification, Confidence, EgressClassifier, EgressRequest, Finding, FindingKind,
 };
 pub use combine::AllOf;
+pub use credentials::CredentialRules;
 pub use enforce::{redact, Action, GatePolicy, Redacted};
 pub use hook::{EgressContentHook, EgressPlane, DEFAULT_EGRESS_SUFFIXES};
 pub use rules::DeterministicRules;
@@ -213,7 +215,7 @@ impl GateConfig {
     /// that deployment believes contextual detection is running, and it is
     /// not — or an analyzer URL the provider refuses (not loopback).
     pub fn classifier(&self) -> Result<Arc<dyn EgressClassifier>, String> {
-        let rules: Arc<dyn EgressClassifier> = Arc::new(DeterministicRules::new());
+        let rules: Arc<dyn EgressClassifier> = deterministic();
         let Some(p) = &self.presidio else {
             return Ok(rules);
         };
@@ -238,6 +240,16 @@ impl GateConfig {
             ))
         }
     }
+}
+
+/// The in-tree detectors together: provable PRC identifiers and
+/// credentials. Both are deterministic and need no network, so every
+/// configuration runs them.
+fn deterministic() -> Arc<dyn EgressClassifier> {
+    Arc::new(AllOf::new(vec![
+        Arc::new(DeterministicRules::new()),
+        Arc::new(CredentialRules::new()),
+    ]))
 }
 
 /// Arm the gate. Call once at daemon boot.
@@ -292,7 +304,7 @@ pub fn service_decl(
 /// it is the one a build can turn on unconditionally.
 pub fn service_decl_deterministic() -> ServiceDecl {
     service_decl(
-        Arc::new(DeterministicRules::new()),
+        deterministic(),
         GatePolicy::default(),
         EgressPlane::a2a_transcripts(),
     )
@@ -351,7 +363,10 @@ mod tests {
         assert_eq!(c.policy.on_finding, Action::Redact);
         assert!(c.model_mounts.is_empty());
         assert!(c.presidio.is_none());
-        assert_eq!(c.classifier().unwrap().name(), "deterministic-prc");
+        assert_eq!(
+            c.classifier().unwrap().name(),
+            "deterministic-prc+credentials"
+        );
     }
 
     #[test]
@@ -412,7 +427,10 @@ mod tests {
     #[test]
     fn an_analyzer_joins_the_rules() {
         let c = parse(&[(ENV_PRESIDIO_URL, "http://127.0.0.1:5002")]).unwrap();
-        assert_eq!(c.classifier().unwrap().name(), "deterministic-prc+presidio");
+        assert_eq!(
+            c.classifier().unwrap().name(),
+            "deterministic-prc+credentials+presidio"
+        );
     }
 
     #[cfg(feature = "presidio")]
