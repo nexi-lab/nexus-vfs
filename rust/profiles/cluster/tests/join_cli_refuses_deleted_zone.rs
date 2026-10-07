@@ -116,7 +116,13 @@ async fn the_join_cli_does_not_refound_a_zone_deleted_while_the_node_was_down() 
 
     let mut j_rt = ZoneRuntime::dial_tls(jport, &ca, &jcert, &jkey, BUDGET).await;
     let joined = j_rt
-        .zone_join(ZONE, std::slice::from_ref(&fadv), true, "op-m4-join-0000", "")
+        .zone_join(
+            ZONE,
+            std::slice::from_ref(&fadv),
+            true,
+            "op-m4-join-0000",
+            "",
+        )
         .await
         .expect("joiner joins the victim zone over RPC");
     assert_eq!(joined.outcome, "JOINED");

@@ -1195,8 +1195,10 @@ impl<K: KernelSyscall> RustService for ManagedAgentService<K> {
                     )
                     .map_err(map_agent_context_error)?;
                 } else if ctx.agent_id.is_some() {
-                    let delegated =
-                        ctx.agent_id.as_deref().is_some_and(|agent| agent != ctx.user_id);
+                    let delegated = ctx
+                        .agent_id
+                        .as_deref()
+                        .is_some_and(|agent| agent != ctx.user_id);
                     if delegated {
                         // A session credential: the mint's allow-list
                         // vouched for the owner binding (the CA-stamped SAN
@@ -1867,11 +1869,7 @@ mod tests {
             let resp = svc.start_session(req("scode-standard")).unwrap();
             let payload = json!({"session_id": resp.session_id, "mode": "session"}).to_string();
             let bytes = svc
-                .dispatch(
-                    "cancel_v1",
-                    payload.as_bytes(),
-                    &session_caller("ethan"),
-                )
+                .dispatch("cancel_v1", payload.as_bytes(), &session_caller("ethan"))
                 .unwrap();
             let cancel: CancelResponse = serde_json::from_slice(&bytes).unwrap();
             assert!(cancel.cancelled);
@@ -1883,11 +1881,7 @@ mod tests {
             let resp = svc.start_session(req("scode-standard")).unwrap();
             let payload = json!({"session_id": resp.session_id, "mode": "turn"}).to_string();
             let error = svc
-                .dispatch(
-                    "cancel_v1",
-                    payload.as_bytes(),
-                    &session_caller("ethan"),
-                )
+                .dispatch("cancel_v1", payload.as_bytes(), &session_caller("ethan"))
                 .unwrap_err();
             assert!(
                 matches!(error, RustCallError::InvalidArgument(message) if message.contains("session/cancel"))

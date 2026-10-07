@@ -78,28 +78,8 @@ async fn subprocess_streams_approvals_and_accepts_cancel_without_public_fd_strea
     let ctx = contracts::OperationContext::new("system", "root", true, None, true);
     kernel
         .sys_setattr(
-            parent,
-            &ctx,
-            1,
-            "",
-            None,
-            None,
-            None,
-            "balanced",
-            "root",
-            false,
-            0,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            parent, &ctx, 1, "", None, None, None, "balanced", "root", false, 0, None, None, None,
+            None, None, None, None, None, None, None, None,
         )
         .unwrap();
     kernel

@@ -82,10 +82,7 @@ async fn single_zone_deprovision_then_normal_restart_converges() {
     //       the pending mounts chased a target that never comes back.
     let mut normal = Daemon::spawn(&["--bind-addr", &fadv], &founder_env);
     normal
-        .wait_for_log(
-            "refusing to re-found a deprovisioned zone",
-            BUDGET,
-        )
+        .wait_for_log("refusing to re-found a deprovisioned zone", BUDGET)
         .await
         .expect("the D9 guard fires for the declared-but-deleted zone");
     normal
