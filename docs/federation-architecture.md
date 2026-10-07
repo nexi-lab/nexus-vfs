@@ -185,7 +185,7 @@ Etcd / TiKV-style opaque IDs + leader-driven `AddNode`.
 - **Address book** — `NEXUS_PEERS` (or `--peers`) is a hostname → endpoint mapping for OTHER nodes only that seeds the transport peer map.  Entries are `"host:port"` strings — peer `node_id` is opaque, random per boot, and never carried in the address book (`learn_peer_address` in `transport/server.rs` populates the real id from the first inbound raft message).  Persisted separately at node-bound `identity.json` (Windows `%LOCALAPPDATA%\Nexus\identity.json`, macOS `~/Library/Application Support/Nexus/identity.json`, Linux `$XDG_DATA_HOME/nexus/identity.json`) so a cache-cleaner removing `<NEXUS_DATA_DIR>` does not force the operator to re-specify `--peers` on next boot.  Boot merges CLI/env peers with identity's persisted `peers[]` and rewrites identity monotonically when the CLI set widens.  Self joins the cluster through `create_zone(self)` (founder) or `AddNode(self)` on the leader (joiner) — never through the address book.  Boot fails loud (`peer list contains self ...`) when the merged peer list includes the local node so the joiner-loop self-RPC stall surfaces at parse time, not after `Zone 'root' registered`.  `ConfState` lives in raft storage and is mutated only by `ConfChange` (AddNode / RemoveNode) driven by JoinZone; `identity.json`'s `peers[]` is a *transport seed*, not a `ConfState` shadow.
 
 - **Advertise address — `--advertise-addr` decoupled from `--hostname`** — `--hostname` / `NEXUS_HOSTNAME` is the display label only (ZoneManager registry + TLS cert SANs).  The reachable network endpoint this node broadcasts to peers as `StepMessage.sender_address` comes from `--advertise-addr` / `NEXUS_ADVERTISE_ADDR` instead, defaulting to `<hostname>:<bind_port>` for backward compatibility.  Cross-machine federation over overlay networks (Tailscale, WireGuard, VPN) MUST pin `--advertise-addr` to the overlay IP — the OS hostname does not resolve through the overlay, so the joiner's initial `JoinZone` RPC succeeds (the caller passed the peer addr directly) but subsequent raft heartbeats / log replication target `http://<peer-hostname>:2126` and fail at the DNS layer, surfacing minutes later as silent "ConfState install timeout". Boot logs a warning when the resolved advertise address looks unreachable (`0.0.0.0:*`, loopback with peers, or bare hostname with peers configured on a remote machine) so the misconfiguration surfaces immediately rather than after long timeouts.
-- **Bootstrap mode** — operator declares intent up front via `NEXUS_BOOTSTRAP_MODE` (or `--bootstrap-mode` for `nexusd-cluster`).  The validator runs once at boot and rejects any state × flag combination that does not match the declared mode, so misconfiguration surfaces before the gRPC server starts rather than as a silent stall later.  See [`BootstrapMode`](../../rust/raft/src/distributed_coordinator.rs).
+- **Boot action** — the operator declares *role*, not *mode*: `--cluster-init` (+ `--accept-enrollments`) to found, `--peers` (+ `--token`) to join, and the two are mutually exclusive at boot. The daemon derives the action from `(data_dir state, identity, --peers, --cluster-init)` and dispatches through [`plan_boot_action`](../../rust/raft/src/bootstrap.rs); misconfiguration surfaces before the gRPC server starts rather than as a silent stall later. There is no mode flag to set — `--bootstrap-mode` / `NEXUS_BOOTSTRAP_MODE` were deleted in S3 Phase G, and `nexusd-cluster` now refuses to boot if the retired env var is still set rather than ignoring it.
 
   | Mode | Required state | Required flags | Forbidden flags | Bootstrap dispatch |
   |------|---------------|----------------|-----------------|---------------------|
@@ -195,7 +195,7 @@ Etcd / TiKV-style opaque IDs + leader-driven `AddNode`.
 
 - **Root is per-node SOLO** — every nexus daemon owns its OWN 1-voter `root` zone.  Federation between independent nodes happens through NAMED zones (e.g. `sharedzone`), joined via the `nexusd-cluster join` sidecar — NEVER by adding another node into a peer's root cluster.  `NEXUS_PEERS` is reserved for in-cluster transport seeding; setting it at boot time on a fresh data dir is rejected with a clear error (`bootstrap_or_join_zone` SOLO-invariant gate) so the operator-facing misconfig "I want to federate with `<peer>`, so I set `NEXUS_PEERS=<peer>`" surfaces at boot rather than cascading through ConfChange / heartbeat / cross-federation pollution.  HA scenarios use named zones: 3 nodes wanting shared data create + join `dc1-namespace`; their per-node roots stay independent.  Pinned by [`test_root_zone_solo_contract`](../../rust/raft/tests/test_root_zone_solo_contract.rs).
 
-- **`nexusd-cluster join` auto-bootstraps the parent zone** — the join sidecar writes a DT_MOUNT entry into `<parent_zone>` (defaults to root) to stitch the remote zone into local namespace at `<local_path>`.  That DT_MOUNT propose lands in the parent zone's raft log, so the parent zone MUST be loaded locally before the mount step.  Pre-this-contract behaviour assumed the operator had bootstrapped the parent zone via a prior step (`nexusd-cluster --bootstrap-mode static` once, then `join`); the sidecar would silently no-op on the mount propose when called against a fresh data dir, producing an empty `<local_path>` namespace and the "wire_mount: root zone not loaded — distributed locks NOT installed" warn that wedged the Mac↔Win cc-tasks-share L1 smoke.  The sidecar now SOLO-bootstraps the parent zone (empty peers, matching the per-node SOLO contract above) when `<data_dir>/<parent_zone>/raft/` is missing — idempotent (no-op when the zone already exists), so the join CLI runs end-to-end against a brand-new data dir without an operator pre-step.
+- **`nexusd-cluster join` auto-bootstraps the parent zone** — the join sidecar writes a DT_MOUNT entry into `<parent_zone>` (defaults to root) to stitch the remote zone into local namespace at `<local_path>`.  That DT_MOUNT propose lands in the parent zone's raft log, so the parent zone MUST be loaded locally before the mount step.  Pre-this-contract behaviour assumed the operator had bootstrapped the parent zone via a prior step (a prior `nexusd-cluster` boot that founded the parent zone, then `join`); the sidecar would silently no-op on the mount propose when called against a fresh data dir, producing an empty `<local_path>` namespace and the "wire_mount: root zone not loaded — distributed locks NOT installed" warn that wedged the Mac↔Win cc-tasks-share L1 smoke.  The sidecar now SOLO-bootstraps the parent zone (empty peers, matching the per-node SOLO contract above) when `<data_dir>/<parent_zone>/raft/` is missing — idempotent (no-op when the zone already exists), so the join CLI runs end-to-end against a brand-new data dir without an operator pre-step.
 
 - **`join <peer_addr>` — `host:port` is the ONLY accepted form** — operators DO NOT sync opaque `node_id` between peers.  `nexusd-cluster join 100.64.0.27:2126 sharedzone /shared` is the shape; the peer's real `node_id` (random per boot under PR #3996) is learned from the first inbound `MsgSnapshot.sender_address` via [`learn_peer_address`](../../rust/raft/src/transport/server.rs) and populates the peer_map entry outbound raft replies route through.  The legacy `<id>@host:port` form is hard-rejected at parse time with a migration message pointing at the bare form (see `PeerAddress::parse`) — carrying an explicit id in the address book had no protocol purpose and misled operators into thinking a peer rebuild required an id lookup ceremony.  Operational implication: cross-peer coordination for `join` reduces to sharing the leader's TCP endpoint plus the zone name, matching the Docker Swarm `docker swarm join <addr>` / Consul `consul join <addr>` UX curve.
 
@@ -203,9 +203,9 @@ Etcd / TiKV-style opaque IDs + leader-driven `AddNode`.
 
 ##### S3 完全体 — Unified bring-up decision layer
 
-The daemon reads `(identity.peers, --peers, NEXUS_FEDERATION_ZONES)` at boot and dispatches deterministically via [`nexus_raft::bootstrap::plan_boot_action`](../../rust/raft/src/bootstrap.rs).  Six-row matrix; two rows fail loud (both-founder / ambiguous-fresh-founder), three rows drive the pre-refactor primitives (`bootstrap_static_async` for the founder, `bootstrap_or_join_zone` for the joiner), one row is a no-op.  Replaces three separate operator ceremonies (daemon founder, daemon joiner, offline `join` sidecar) with one command.
+The daemon reads `(identity.peers, --peers, NEXUS_CLUSTER_INIT)` at boot and dispatches deterministically via [`nexus_raft::bootstrap::plan_boot_action`](../../rust/raft/src/bootstrap.rs).  Six-row matrix; two rows fail loud (both-founder / ambiguous-fresh-founder), three rows drive the pre-refactor primitives (`bootstrap_static_async` for the founder, `bootstrap_or_join_zone` for the joiner), one row is a no-op.  Replaces three separate operator ceremonies (daemon founder, daemon joiner, offline `join` sidecar) with one command.
 
-| # | `identity.peers` | CLI `--peers` | `NEXUS_FEDERATION_ZONES` | Action |
+| # | `identity.peers` | CLI `--peers` | `NEXUS_CLUSTER_INIT` | Action |
 |---|---|---|---|---|
 | 1 | empty     | empty     | set     | `StaticFounder` — auto-create SOLO |
 | 2 | empty     | empty     | unset   | `RootlessDynamic` — daemon up, no zone auto-boot |
@@ -249,6 +249,53 @@ The one property rotate-on-wipe does NOT deliver is **stable node identity acros
 Together these three restore commit-log linearity across the wipe boundary without changing raft-rs's `RaftLog::commit_to` safety invariant.  Deferred to a dedicated PR because the three parts must ship together to preserve safety, and the design needs review time before code lands.
 
 Cross-refs (raft-rs 0.7 source at `~/.cargo/registry/src/index.crates.io-*/raft-0.7.0/src/`): `commit_to` invariant at `raft_log.rs:286`; leader-side heartbeat commit computation at `raft.rs:868`; `ProgressTracker::apply_conf` drop+insert at `tracker.rs:370` and `Progress::new` matched-zero init at `tracker/progress.rs:60-72`.
+
+##### Diagnosing a peer that cannot be reached
+
+Earned during a Win↔Mac bring-up, where the joining side spent a round trip on
+two wrong hypotheses because the right evidence only exists on the other machine.
+
+**`timeout` and `refused` are different findings, and the difference is the
+first thing to establish.** `Connection refused` means the filter let the SYN
+through and nothing was listening — a dead or wrong-port daemon. A `timeout`
+with no RST means the packet was dropped — a firewall or overlay ACL. Reaching
+for the wrong half of that split is most of the wasted time.
+
+**From the far side, "the process is gone" and "the daemon bound the wrong
+address" are the SAME signature**: ICMP answers (the host IP stack is alive),
+TCP times out, no RST. Neither `tailscale ping --icmp` nor `--tsmp` distinguishes
+them, because both are answered by `tailscaled`, not by the daemon. So the
+machine that OWNS the daemon has to produce two facts before the remote side
+hypothesises anything:
+
+```sh
+# is it alive, and what did it actually bind?
+netstat -ano | grep -E ':2126|:2127'    # want 0.0.0.0:2126, not 127.0.0.1:2126
+```
+
+A daemon started from a shell can also be reaped with that shell — on Windows a
+detached `Start-Process` is still subject to the parent's job object, which
+silently kills it with an empty stderr and a last log line that reads like a
+healthy boot. Launch anything that must outlive the session from the Task
+Scheduler (or an equivalent service manager) rather than a shell.
+
+**Windows: a per-program Block rule beats a port Allow rule.** Windows
+accumulates one inbound rule per *binary path*, so a daemon that is reachable
+from one location becomes silently unreachable after it is rebuilt or unpacked
+somewhere else — the port rule still says Allow, and a Block for the new path
+wins. Check both before blaming the network:
+
+```powershell
+Get-NetFirewallRule -Direction Inbound -Action Block -Enabled True |
+  ForEach-Object { $_ | Get-NetFirewallApplicationFilter } |
+  Where-Object Program -match 'nexusd'
+```
+
+The enrollment listener needs its own inbound opening: it rides a fixed offset
+above the data-plane port, so allowing `2126` alone leaves `2127` closed and
+enrollment hangs rather than failing. Scope that opening to the overlay range
+(`100.64.0.0/10` for Tailscale) — the listener is plaintext by design and its
+safety argument is that it only rides the encrypted overlay.
 
 ##### Witness
 
