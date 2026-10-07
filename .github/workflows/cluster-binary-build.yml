@@ -17,11 +17,23 @@ jobs:
     strategy:
       fail-fast: false
       # Every `max_size_bytes` below is a measurement against the compiler
-      # pinned in `rust-toolchain.toml`, not a property of the source. The same
-      # tree built 818 KB larger on 1.99.0 than on 1.98.1, and before the pin
-      # `stable` resolved differently per runner inside a single run — so these
-      # numbers decided merges by coin flip. Bump the pin and re-measure these
-      # in the same commit, never one without the other.
+      # pinned in `rust-toolchain.toml`, not a property of the source. Before the
+      # pin, `stable` resolved differently per runner inside a single run, so
+      # these numbers decided merges by coin flip.
+      #
+      # The whole set was re-measured on 1.99.0, which grew EVERY target with no
+      # source change: linux +778 KB, macos-arm64 +750 KB, macos-x86_64 +567 KB,
+      # windows +1,017 KB. The per-feature history each number used to carry is
+      # therefore superseded — attributing any of it to a feature now would be
+      # wrong — so each entry records its measurement and its headroom instead.
+      #
+      # Headroom is ~3% deliberately. The linux cap previously passed with 0.22%
+      # slack, which is how a compiler change could flip a green PR into a red
+      # main: a budget that tight asserts the toolchain, not the code.
+      #
+      # Bump the pin and re-measure these in the same commit, never one without
+      # the other. `rust-toolchain.toml` is in this workflow's paths filter so
+      # that a pin-only change cannot skip the check.
       matrix:
         include:
           - os: ubuntu-22.04
@@ -29,56 +41,32 @@ jobs:
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
-            max_size_bytes: 18087936  # 17.25 MiB — raised from 17.0 for the declared
-                                      # mount subtree (#361: `/agents`,
-                                      # `/conversations` and `/sessions` all mounted
-                                      # one zone, and `to_zone_key` strips the mount
-                                      # prefix, so the three were one tree with three
-                                      # names — `readdir /agents` answered with
-                                      # conversation ids). Measured 17,826,128 bytes,
-                                      # 336 over the old cap: a durable proto field,
-                                      # the subtree threaded through the three mount
-                                      # routes, and the boot guard's operator-facing
-                                      # message. 648 bytes of the growth were given
-                                      # back first by dropping `impl Into<String>`
-                                      # from MountDecl's constructors, so this is the
-                                      # residue of a permanent feature rather than
-                                      # slack. The other three platforms absorbed it
-                                      # inside their existing budgets; this is the
-                                      # tightest.
+            max_size_bytes: 19398656  # 18.5 MiB. Measured 18,866,640 on 1.99.0;
+                                      # 532,016 bytes (2.8%) of headroom.
           - os: macos-14
             artifact_name: nexusd-cluster-macos-arm64
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
-            max_size_bytes: 15466496  # 14.75 MiB — raised from 13.75 for the
-                                      # ServiceBootCtx `api_key_secret` widen (#261;
-                                      # downstream HTTP mint plumbing for nexus
-                                      # `/v2/auth/keys` POST).  Measured 14,794,160
-                                      # bytes here after the widen; leaves ~650 KB
-                                      # headroom.
+            max_size_bytes: 16777216  # 16 MiB. Measured 16,216,880 on 1.99.0;
+                                      # 560,336 bytes (3.5%) of headroom.
           - os: macos-14
             artifact_name: nexusd-cluster-macos-x86_64
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
             target: x86_64-apple-darwin
-            max_size_bytes: 16777216  # 16 MiB. The ACP mailbox codec and private
-                                      # subprocess adapter in #380 produce
-                                      # 16,541,736 bytes on macOS Intel, 26,664
-                                      # bytes over the previous 15.75 MiB cap.
-                                      # Other platform budgets are unchanged.
+            max_size_bytes: 17825792  # 17 MiB. Measured 17,344,272 on 1.99.0;
+                                      # 481,520 bytes (2.8%) of headroom.
           - os: windows-latest
             artifact_name: nexusd-cluster-windows-x86_64
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster.exe
-            max_size_bytes: 17039360  # 16.25 MiB. The mailbox adapter adds
-                                      # 158,720 bytes over main's 16,663,552-byte
-                                      # Windows build after #384. Measured
-                                      # 16,822,272 bytes at 32bf5524e; this leaves
-                                      # 217,088 bytes of headroom. The previous
-                                      # 16 MiB cap was exceeded by 45,056 bytes.
+            max_size_bytes: 18612224  # 17.75 MiB. Measured 18,056,192 on 1.99.0;
+                                      # 556,032 bytes (3.1%) of headroom. The
+                                      # largest compiler-attributable jump of the
+                                      # four, +1,017 KB over its 1.98.1 number.
 
 
     steps:

@@ -28,5 +28,5 @@
 # deliberate commit that re-measures those budgets in the same change — on
 # 1.99.0 the linux binary needs ~18.25 MiB — instead of something that happens
 # to a runner between two jobs.
-channel = "1.98.1"
+channel = "1.99.0"
 components = ["rustfmt", "clippy"]

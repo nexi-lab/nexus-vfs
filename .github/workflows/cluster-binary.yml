@@ -8,6 +8,11 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "proto/**"
+      # The compiler decides the binary size these budgets assert. Omitting it
+      # meant a pin bump ran NO size check at all — verified on PR #390, where
+      # a `rust-toolchain.toml`-only commit got CI but not this workflow, so
+      # the one change that moves every number skipped the gate on every one.
+      - "rust-toolchain.toml"
       - ".github/workflows/cluster-binary.yml"
       - ".github/workflows/cluster-binary-build.yml"
   pull_request:
@@ -16,6 +21,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "proto/**"
+      - "rust-toolchain.toml"
       - ".github/workflows/cluster-binary.yml"
       - ".github/workflows/cluster-binary-build.yml"
 
