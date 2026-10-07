@@ -43,9 +43,9 @@
 //! global paths stores one authoritative copy per zone-relative key).
 //!
 //! Field fidelity note: the kernel ``FileMetadata`` struct tracks a
-//! subset of the proto fields (path/backend_name/physical_path/size/content_id/
-//! version/entry_type/zone_id/mime_type). Missing fields (``owner_id``,
-//! ``ttl_seconds`` and the ``created_at``/``modified_at`` ISO-8601
+//! subset of the proto fields (path/size/content_id/gen/version/entry_type/
+//! zone_id/mime_type/owner_id). Missing fields (``ttl_seconds`` and the
+//! ``created_at``/``modified_at`` ISO-8601
 //! strings — distinct from the ``created_at_ms``/``modified_at_ms``
 //! epoch fields already tracked) still round-trip through Python-side
 //! writes fine but are defaulted on kernel-only writes. Widening the
@@ -476,7 +476,11 @@ pub(crate) fn proto_to_kernel(bytes: &[u8]) -> Result<KernelFileMetadata, MetaSt
         } else {
             Some(proto.link_target)
         },
-        owner_id: None,
+        owner_id: if proto.owner_id.is_empty() {
+            None
+        } else {
+            Some(proto.owner_id)
+        },
     })
 }
 
@@ -501,7 +505,7 @@ pub(crate) fn kernel_to_proto(meta: &KernelFileMetadata) -> Vec<u8> {
         target_zone_id,
         target_subtree,
         link_target,
-        owner_id: _,
+        owner_id,
     } = meta;
     let proto = ProtoFileMetadata {
         path: path.clone(),
@@ -525,6 +529,7 @@ pub(crate) fn kernel_to_proto(meta: &KernelFileMetadata) -> Vec<u8> {
         // For DT_LINK entries this carries the link target path the
         // route() one-hop resolver follows. Empty for non-DT_LINK entries.
         link_target: link_target.clone().unwrap_or_default(),
+        owner_id: owner_id.clone().unwrap_or_default(),
         ..Default::default()
     };
     proto.encode_to_vec()
@@ -977,11 +982,8 @@ mod tests {
         assert_eq!(zone_key_to_global("/agents", "/"), "/agents");
     }
 
-    /// Proto encode↔decode preserves every field the kernel struct
-    /// tracks. ``target_zone_id`` deliberately not asserted here —
-    /// `target_zone_id` is now carried on the kernel struct (added back
-    /// for federation's `mount_apply_cb` to read on every replicated
-    /// SetMetadata) and round-trips through the proto.
+    /// Metadata fields with wire representations survive encode and decode,
+    /// including ownership used by callers after a cold read or replication.
     #[test]
     fn proto_roundtrip_preserves_kernel_fields() {
         let meta = KernelFileMetadata {
@@ -999,24 +1001,16 @@ mod tests {
             target_zone_id: Some("sharedzone".to_string()),
             target_subtree: Some("/agents".to_string()),
             link_target: None,
-            owner_id: None,
+            owner_id: Some("user-alice".to_string()),
         };
         let restored = proto_to_kernel(&kernel_to_proto(&meta)).unwrap();
-        assert_eq!(restored.path, meta.path);
-        assert_eq!(restored.size, meta.size);
-        assert_eq!(restored.content_id, meta.content_id);
-        assert_eq!(restored.gen, meta.gen);
-        assert_eq!(restored.version, meta.version);
-        assert_eq!(restored.entry_type, meta.entry_type);
-        assert_eq!(restored.zone_id, meta.zone_id);
-        assert_eq!(restored.mime_type, meta.mime_type);
-        assert_eq!(restored.created_at_ms, None);
-        assert_eq!(restored.modified_at_ms, None);
-        assert_eq!(
-            restored.target_subtree, meta.target_subtree,
-            "a mount's declared subtree must survive the proto it is re-wired from"
-        );
-        assert_eq!(restored.last_writer_address, meta.last_writer_address);
+        assert_eq!(restored, meta);
+
+        let legacy = KernelFileMetadata {
+            owner_id: None,
+            ..meta
+        };
+        assert_eq!(proto_to_kernel(&kernel_to_proto(&legacy)).unwrap(), legacy);
     }
 
     /// Pure-function translation is unit-testable without a live
