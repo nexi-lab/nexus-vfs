@@ -141,6 +141,10 @@ async fn metadata_and_delegation_survive_the_real_daemon_and_signed_cdylib() {
         .unwrap();
     let mut node = client(port, &ca, &node_cert, &node_key).await;
     let mut agent = client(port, &ca, &agent_cert, &agent_key).await;
+    let mut vfs = common::Vfs::connect_mtls(port, &ca, &node_cert, &node_key, BUDGET).await;
+    vfs.write_file("/docs/needle.md", b"widget external internal after", "")
+        .await
+        .unwrap();
     let batch = IndexDocumentsRequest {
         zone_id: "sharedzone".into(),
         documents: vec![DocumentInput {
