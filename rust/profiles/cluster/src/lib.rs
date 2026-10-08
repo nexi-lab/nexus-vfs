@@ -1398,6 +1398,131 @@ fn run_enroll_token(common: &CommonArgs) -> Result<()> {
 
 /// `enroll` — PRE-provision a signed mTLS node cert from a founder (joiner).
 ///
+/// Why enrollment could not proceed.
+///
+/// Each variant is ESTABLISHED, not guessed. The first version of this inferred
+/// the cause by substring-matching the transport error's `Display`, and a live
+/// run disproved it immediately: tonic collapses a refused connection into
+/// `transport error` with no OS detail, so a refusal was reported as "neither a
+/// refusal nor a timeout" and sent the operator after the token. The unit test
+/// had passed because it fed in the string the author ASSUMED tonic produces.
+///
+/// So the classification now comes from a connect this binary performs itself,
+/// where the `io::ErrorKind` is a fact rather than a rendering.
+#[derive(Debug, PartialEq, Eq)]
+enum EnrollmentBlock {
+    /// `host:port` did not resolve to any address.
+    Unresolved,
+    /// Our own TCP connect to the enrollment port failed, with its real kind.
+    Connect(std::io::ErrorKind),
+    /// The port accepted a connection, so the failure is past the network.
+    /// Carries the transport/protocol error verbatim.
+    Handshake(String),
+}
+
+/// Connect to the enrollment port to establish reachability before attempting
+/// the handshake.
+///
+/// A deliberate extra round trip. It buys a classification the RPC cannot give
+/// back (see [`EnrollmentBlock`]), and on the failure paths it is strictly
+/// faster than the RPC's own retry budget. On success it costs one TCP
+/// handshake against a port we are about to use anyway.
+fn probe_enrollment_port(enroll_target: &str, timeout: std::time::Duration) -> EnrollmentBlock {
+    use std::net::ToSocketAddrs;
+    let Ok(mut addrs) = enroll_target.to_socket_addrs() else {
+        return EnrollmentBlock::Unresolved;
+    };
+    let Some(addr) = addrs.next() else {
+        return EnrollmentBlock::Unresolved;
+    };
+    match std::net::TcpStream::connect_timeout(&addr, timeout) {
+        // Reachable. `Handshake` is the right shape for "anything that happens
+        // from here is past the network", and the empty string is replaced by
+        // the real error if the RPC then fails.
+        Ok(_) => EnrollmentBlock::Handshake(String::new()),
+        Err(e) => EnrollmentBlock::Connect(e.kind()),
+    }
+}
+
+/// Render an enrollment failure as something that says what to check next.
+///
+/// The joiner is the blind side of this handshake: it cannot see the founder's
+/// process table, its bind address or its firewall. Both entry points used to
+/// wrap the transport error verbatim, which reads as `transport error` and
+/// nothing more, exactly when the caller has least information. A doc cannot
+/// fix that — whoever hits it is reading a terminal, and that is as true of an
+/// agent driving the CLI as of a person.
+///
+/// Lives next to [`enroll_port_addr`] because the offset rule it explains is
+/// defined there; a message in the transport crate would have to restate it.
+fn enrollment_failure(
+    data_plane_addr: &str,
+    enroll_target: &str,
+    block: EnrollmentBlock,
+) -> anyhow::Error {
+    let diagnosis = match &block {
+        EnrollmentBlock::Unresolved => format!(
+            "`{enroll_target}` did not resolve to an address. Supply the \
+             founder's overlay IP rather than a hostname — an OS hostname \
+             usually does not resolve through an overlay network, which is why \
+             `--advertise-addr` demands an IP."
+        ),
+        EnrollmentBlock::Connect(std::io::ErrorKind::ConnectionRefused) => {
+            "The connection was REFUSED, so packets reach that host and nothing \
+             is listening on the enrollment port. Either the founder is not \
+             running, or it was started without `--accept-enrollments`."
+                .to_string()
+        }
+        EnrollmentBlock::Connect(std::io::ErrorKind::TimedOut) => {
+            "The connection TIMED OUT rather than being refused, so the packet \
+             was DROPPED rather than rejected.\n\
+             This one is NOT conclusive, and it is worth knowing why: a host \
+             behind a TUN VPN or a default-deny firewall drops packets to a \
+             CLOSED port too, instead of answering with a reset. So a timeout \
+             means either (a) something is filtering a port that is open, or \
+             (b) nothing is listening on a host that does not send resets.\n\
+             Check in this order. The enrollment port is a fixed offset ABOVE \
+             the data-plane port, so an operator who opened the data port and \
+             stopped has left this one closed — that is (a) and it is the most \
+             common cause. On Windows also check per-program BLOCK rules: they \
+             beat port Allow rules and accumulate per binary PATH, so a rebuilt \
+             or relocated daemon can be blocked while its port still shows as \
+             allowed. If both look right, it is (b), and only the far side's \
+             process list can tell you."
+                .to_string()
+        }
+        EnrollmentBlock::Connect(kind) => format!(
+            "The connect failed as `{kind:?}` — neither refused nor timed out. \
+             Treat it as a transport fault on the path rather than a founder \
+             or a token problem."
+        ),
+        EnrollmentBlock::Handshake(err) => format!(
+            "The enrollment port ACCEPTED a connection, so the network is fine \
+             and the handshake itself failed: {err}. Suspect the token first — \
+             wrong cluster, or a stale one whose pinned CA fingerprint no \
+             longer matches the founder's CA."
+        ),
+    };
+    // The far-operator note only helps when the problem could be on that
+    // machine. After a successful connect it would be misdirection.
+    let far_side = if matches!(block, EnrollmentBlock::Handshake(_)) {
+        String::new()
+    } else {
+        "\n\nFrom here a founder process that has exited and a founder that \
+         bound the wrong address are indistinguishable: both answer ICMP and \
+         drop TCP. Whoever owns that machine should report two facts rather \
+         than a guess — whether the process is alive, and what it actually \
+         bound (expect 0.0.0.0, not 127.0.0.1)."
+            .to_string()
+    };
+    anyhow::anyhow!(
+        "enroll against {enroll_target} failed.\n\n{diagnosis}\n\n\
+         Note {enroll_target} was DERIVED from the data-plane address \
+         {data_plane_addr} you supplied — you do not type it, and it is not a \
+         typo if it differs from what you expected.{far_side}"
+    )
+}
+
 /// Thin CLI over [`nexus_raft::join_cluster_and_provision_tls`]: `peer_addr` is
 /// the founder's DATA-PLANE address (same as `--peers`); the enrollment port is
 /// derived from it ([`enroll_port_addr`], `+1`). Presents the join token,
@@ -1409,8 +1534,20 @@ fn run_enroll(common: &CommonArgs, peer_addr: &str, token: &str) -> Result<()> {
     let tls_dir = common.data_dir.join("tls");
     let tls_dir_str = tls_dir.to_str().context("tls dir must be UTF-8")?;
     let enroll_target = enroll_port_addr(peer_addr)?;
+    // Establish reachability before the handshake, so a failure past this point
+    // is provably not the network.
+    let probe = probe_enrollment_port(&enroll_target, std::time::Duration::from_secs(5));
+    if !matches!(probe, EnrollmentBlock::Handshake(_)) {
+        return Err(enrollment_failure(peer_addr, &enroll_target, probe));
+    }
     nexus_raft::join_cluster_and_provision_tls(&enroll_target, token, &hostname, tls_dir_str)
-        .map_err(|e| anyhow::anyhow!("enroll against {enroll_target}: {e}"))?;
+        .map_err(|e| {
+            enrollment_failure(
+                peer_addr,
+                &enroll_target,
+                EnrollmentBlock::Handshake(e.to_string()),
+            )
+        })?;
     eprintln!(
         "enrolled: cluster cert written to {}. This node can now boot into the mTLS \
          federation — set `--peers <cluster-member>` and start it normally.",
@@ -1803,7 +1940,73 @@ fn open_zone_manager(
     })
 }
 
+/// Environment variables this binary once honoured and no longer reads, with
+/// what replaced each.
+///
+/// A retired FLAG is self-reporting: clap rejects an unknown `--bootstrap-mode`
+/// by name. A retired ENV VAR is silent — the process starts, ignores it, and
+/// does something the operator did not ask for. For founder/joiner declarations
+/// that silence is the worst possible failure: `NEXUS_FEDERATION_ZONES` set and
+/// ignored means a node the operator believes is founding `sharedzone` founds
+/// nothing, and the mistake surfaces later as an empty namespace or a peer that
+/// cannot discover anything.
+///
+/// `NEXUS_FEDERATION_ZONES` is NOT dead repo-wide — `nexus-witness` still reads
+/// it. The message says so, because "that variable does nothing" would be a lie
+/// that sends someone to grep for a bug in the witness.
+const RETIRED_ENV_VARS: &[(&str, &str)] = &[
+    (
+        "NEXUS_FEDERATION_ZONES",
+        "use NEXUS_CLUSTER_INIT (founder-side zone declaration). Note this \
+         variable IS still read by the separate `nexus-witness` binary; it is \
+         `nexusd-cluster` that stopped honouring it",
+    ),
+    (
+        "NEXUS_FEDERATION_MOUNTS",
+        "use NEXUS_CLUSTER_INIT_MOUNTS (founder-side mount declaration)",
+    ),
+    (
+        "NEXUS_BOOTSTRAP_MODE",
+        "deleted with `--bootstrap-mode` (S3 Phase G): the daemon now derives \
+         the boot action from data_dir state + identity + --peers + \
+         --cluster-init via nexus_raft::bootstrap::plan_boot_action, so there \
+         is nothing to declare",
+    ),
+];
+
+/// Refuse to boot when a retired environment variable is set.
+///
+/// Deliberately a refusal and not a warning. A warning is the same outcome as
+/// silence for anyone reading a log after the fact, and this class of mistake
+/// travels: a stale runbook (or a stale memory of one) hands the old name to
+/// the next operator, who sets it, sees a clean boot, and only finds out at the
+/// far end of a federation bring-up.
+fn refuse_retired_env_vars() -> Result<()> {
+    let found: Vec<&(&str, &str)> = RETIRED_ENV_VARS
+        .iter()
+        .filter(|(name, _)| std::env::var_os(name).is_some_and(|v| !v.is_empty() && v != "0"))
+        .collect();
+    if found.is_empty() {
+        return Ok(());
+    }
+    let detail = found
+        .iter()
+        .map(|(name, replacement)| format!("  {name} — {replacement}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Err(anyhow::anyhow!(
+        "{} retired environment variable(s) are set; nexusd-cluster does not read \
+         them and would have started while silently ignoring your intent:\n{}\n\
+         Unset them (or move the value to the replacement) and boot again.",
+        found.len(),
+        detail,
+    ))
+}
+
 async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -> Result<()> {
+    // First, before any state is touched: a retired knob means the operator's
+    // intent and this binary's behaviour have already diverged.
+    refuse_retired_env_vars()?;
     authorization::validate(&common)?;
     let hostname = resolve_hostname(common.hostname.as_deref());
     tracing::info!(
@@ -1907,7 +2110,8 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
                 .into_iter()
                 .next()
                 .ok_or_else(|| anyhow::anyhow!("--token given but --peers is empty"))?;
-            let enroll_target = enroll_port_addr(&first_peer.to_operator_str())?;
+            let data_plane_addr = first_peer.to_operator_str();
+            let enroll_target = enroll_port_addr(&data_plane_addr)?;
             let token = common.token.clone().expect("token present by guard");
             let tls_dir_str = tls_dir
                 .to_str()
@@ -1915,6 +2119,13 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
                 .to_string();
             let hostname_for_enroll = hostname.clone();
             tracing::info!(%enroll_target, "no cluster cert on disk — auto-enrolling at boot");
+            // Same probe-then-handshake split as the `enroll` subcommand: a
+            // boot that dies here is the most expensive place to get a vague
+            // error, since the operator is usually driving two machines.
+            let probe = probe_enrollment_port(&enroll_target, std::time::Duration::from_secs(5));
+            if !matches!(probe, EnrollmentBlock::Handshake(_)) {
+                return Err(enrollment_failure(&data_plane_addr, &enroll_target, probe));
+            }
             // `join_cluster_and_provision_tls` spins its own runtime + block_on,
             // so it must run OFF this async worker (nested-runtime panic; #176).
             let target_for_task = enroll_target.clone();
@@ -1928,7 +2139,13 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
             })
             .await
             .context("auto-enroll task panicked")?
-            .map_err(|e| anyhow::anyhow!("auto-enroll against {enroll_target}: {e}"))?;
+            .map_err(|e| {
+                enrollment_failure(
+                    &data_plane_addr,
+                    &enroll_target,
+                    EnrollmentBlock::Handshake(e.to_string()),
+                )
+            })?;
             tracing::info!("auto-enroll complete — cluster cert provisioned");
         }
     }
@@ -2296,11 +2513,23 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
                 .advertise_addr
                 .clone()
                 .unwrap_or_else(|| format!("<FOUNDER_OVERLAY_IP:{data_port}>"));
+            // Spelled out rather than left implicit: the joiner derives this and
+            // never types it, so an operator opening firewall ports has no
+            // reason to know it exists.
+            let enroll_port = data_port.saturating_add(1);
             match std::fs::read_to_string(tls_dir.join("join-token")) {
                 Ok(token) => tracing::info!(
                     "cluster accepts enrollments. To add a node, run THERE:\n  \
                      nexusd-cluster --advertise-addr <THAT_NODE_OVERLAY:PORT> \
-                     --peers {peers_hint} --token {}",
+                     --peers {peers_hint} --token {}\n\
+                     That node dials TWO ports here: {data_port} (data plane) and \
+                     {enroll_port} (enrollment, derived as data+1). {enroll_port} \
+                     needs its own inbound opening — allowing only {data_port} \
+                     makes enrollment HANG rather than fail, which reads as a \
+                     network problem and is not one. Scope it to the overlay \
+                     range: the enrollment listener is plaintext by design and \
+                     its safety argument is that it only rides the encrypted \
+                     overlay.",
                     token.trim(),
                 ),
                 Err(_) => tracing::info!(
@@ -6606,6 +6835,22 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    /// Serializes the env-mutating tests in THIS module.
+    ///
+    /// `std::env::set_var` is process-global while `cargo test` runs these in
+    /// parallel, so two tests toggling the same name interleave and one reads
+    /// the other's value. Scoped to this module because that is the boundary it
+    /// can actually enforce — a different `mod tests` in this file holds no
+    /// relation to this lock, which is fine only as long as the names do not
+    /// overlap. They do not today: the other one touches
+    /// `NEXUS_ALLOW_HOSTNAME_ADVERTISE`, this one touches `RETIRED_ENV_VARS`.
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        // A test that panicked while holding it poisoned nothing we care about:
+        // the guard protects ordering, not data.
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn mounts(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
         pairs
             .iter()
@@ -7445,6 +7690,200 @@ mod tests {
             std::path::Path::new("/data")
         )
         .is_err());
+    }
+
+    /// Every retired name is refused, and the refusal names its replacement.
+    ///
+    /// Asserted over the table rather than over one hand-picked name, so a name
+    /// added to `RETIRED_ENV_VARS` without a usable replacement string fails
+    /// here instead of shipping a refusal that tells the operator nothing.
+    ///
+    /// Serialized by `env_guard` with the other env-mutating tests in this
+    /// module: `std::env::set_var` is process-global and these run in parallel.
+    #[test]
+    fn every_retired_env_var_is_refused_with_its_replacement() {
+        let _guard = env_guard();
+        for (name, replacement) in RETIRED_ENV_VARS {
+            assert!(
+                !replacement.is_empty(),
+                "{name} must say what replaced it; a bare refusal strands the operator"
+            );
+            std::env::remove_var(name);
+            assert!(
+                refuse_retired_env_vars().is_ok(),
+                "{name} unset must not trip the guard"
+            );
+
+            std::env::set_var(name, "sharedzone");
+            let err = refuse_retired_env_vars()
+                .expect_err("a retired name that is SET must refuse the boot")
+                .to_string();
+            std::env::remove_var(name);
+
+            assert!(err.contains(name), "refusal must name the variable: {err}");
+            assert!(
+                err.contains(replacement),
+                "refusal must carry the migration for {name}: {err}"
+            );
+        }
+    }
+
+    /// An empty or `0` value is someone clearing the variable, not declaring
+    /// intent — refusing that would make `FOO= cmd` impossible to use as an
+    /// unset.
+    #[test]
+    fn a_cleared_retired_env_var_does_not_refuse() {
+        let _guard = env_guard();
+        let (name, _) = RETIRED_ENV_VARS[0];
+        for cleared in ["", "0"] {
+            std::env::set_var(name, cleared);
+            let result = refuse_retired_env_vars();
+            std::env::remove_var(name);
+            assert!(
+                result.is_ok(),
+                "{name}={cleared:?} is a clear, not a declaration"
+            );
+        }
+    }
+
+    /// Refused and timed-out must not be confusable: they send the operator to
+    /// opposite places (a process vs a filter), and conflating them is what the
+    /// first version of this did.
+    #[test]
+    fn a_connect_failure_is_diagnosed_by_its_real_kind() {
+        use std::io::ErrorKind;
+
+        let refused = enrollment_failure(
+            "100.64.0.27:2126",
+            "100.64.0.27:2127",
+            EnrollmentBlock::Connect(ErrorKind::ConnectionRefused),
+        )
+        .to_string();
+        assert!(
+            refused.contains("REFUSED") && refused.contains("--accept-enrollments"),
+            "a refusal is a process problem and must say so: {refused}"
+        );
+        assert!(
+            !refused.contains("DROPPED") && !refused.contains("firewall"),
+            "a refusal must NOT point at the firewall — that is the other \
+             branch, and sending someone there costs the most time: {refused}"
+        );
+
+        let timed_out = enrollment_failure(
+            "100.64.0.27:2126",
+            "100.64.0.27:2127",
+            EnrollmentBlock::Connect(ErrorKind::TimedOut),
+        )
+        .to_string();
+        assert!(
+            timed_out.contains("DROPPED") && timed_out.contains("fixed offset"),
+            "a timeout is a filter problem and must name the port offset: {timed_out}"
+        );
+        assert!(
+            !timed_out.contains("not running"),
+            "a timeout must NOT blame the process: {timed_out}"
+        );
+    }
+
+    /// A connect that SUCCEEDED means the network is exonerated, so the message
+    /// must neither mention the firewall nor send the reader to the far
+    /// operator — both would be misdirection.
+    #[test]
+    fn a_handshake_failure_exonerates_the_network() {
+        let msg = enrollment_failure(
+            "100.64.0.27:2126",
+            "100.64.0.27:2127",
+            EnrollmentBlock::Handshake("CA fingerprint mismatch".into()),
+        )
+        .to_string();
+        assert!(
+            msg.contains("ACCEPTED") && msg.contains("token"),
+            "a post-connect failure points at the token: {msg}"
+        );
+        assert!(
+            !msg.contains("0.0.0.0") && !msg.contains("firewall"),
+            "the far-operator / firewall advice is misdirection once the port \
+             answered: {msg}"
+        );
+    }
+
+    /// Every branch names the derived port AND where it came from, because an
+    /// operator who never typed `2127` can read it as a bug in the tool.
+    #[test]
+    fn every_enrollment_failure_shows_the_derived_port_and_its_source() {
+        use std::io::ErrorKind;
+        for block in [
+            EnrollmentBlock::Unresolved,
+            EnrollmentBlock::Connect(ErrorKind::ConnectionRefused),
+            EnrollmentBlock::Connect(ErrorKind::TimedOut),
+            EnrollmentBlock::Connect(ErrorKind::PermissionDenied),
+            EnrollmentBlock::Handshake("boom".into()),
+        ] {
+            let msg = enrollment_failure("100.64.0.27:2126", "100.64.0.27:2127", block).to_string();
+            assert!(
+                msg.contains("100.64.0.27:2127") && msg.contains("100.64.0.27:2126"),
+                "must show the derived target AND its source: {msg}"
+            );
+        }
+    }
+
+    /// The probe classifies against REAL sockets, which is the gap that let the
+    /// string-matching version ship broken.
+    ///
+    /// Only the two environment-independent outcomes are asserted. A closed
+    /// local port is deliberately NOT asserted to be `ConnectionRefused`: on
+    /// this project's own Windows box, behind a TUN VPN, it comes back
+    /// `TimedOut`, because that stack drops rather than resets. That is a fact
+    /// about hosts, not a flake — and it is why the timeout branch of
+    /// `enrollment_failure` tells the reader a timeout is not conclusive.
+    #[test]
+    fn the_probe_classifies_real_sockets() {
+        let listening = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listening.local_addr().expect("addr");
+        assert!(
+            matches!(
+                probe_enrollment_port(&addr.to_string(), std::time::Duration::from_secs(2)),
+                EnrollmentBlock::Handshake(_)
+            ),
+            "a listening port must classify as reachable"
+        );
+
+        // A closed port is one of the two drop/reset outcomes, never reachable
+        // and never a resolution failure — that much holds on every host.
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let a = l.local_addr().expect("addr");
+            drop(l);
+            a
+        };
+        let got = probe_enrollment_port(&closed.to_string(), std::time::Duration::from_secs(2));
+        assert!(
+            matches!(
+                got,
+                EnrollmentBlock::Connect(
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut
+                )
+            ),
+            "a closed port must be a connect failure, got {got:?}"
+        );
+    }
+
+    /// A target that cannot even be parsed into an address is `Unresolved`.
+    ///
+    /// Asserted with a syntactically invalid target rather than a bogus
+    /// hostname: this box's DNS answers NXDOMAIN with a fake address (Clash
+    /// fake-ip + TUN), so `no-such-host.invalid:2127` actually RESOLVES and
+    /// connects here. A test that relied on DNS failing would pass only on
+    /// machines without a hijacking resolver.
+    #[test]
+    fn an_unparseable_target_is_named_as_unresolved() {
+        for target in ["no-port-at-all", "", "100.64.0.27:not-a-port"] {
+            assert_eq!(
+                probe_enrollment_port(target, std::time::Duration::from_secs(2)),
+                EnrollmentBlock::Unresolved,
+                "{target:?} cannot become a socket address"
+            );
+        }
     }
 
     #[test]
