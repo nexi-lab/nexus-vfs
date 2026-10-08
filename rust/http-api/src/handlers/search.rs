@@ -212,6 +212,10 @@ pub struct GrepQuery {
     /// Optional working set. JSON `[]` searches nothing; omission walks the root.
     #[serde(default)]
     pub files: Option<Vec<String>>,
+    #[serde(default)]
+    pub block_type: Option<String>,
+    #[serde(default)]
+    pub section: Option<String>,
 }
 
 /// One match row in [`GrepResponse::matches`].  Same field names as
@@ -225,6 +229,16 @@ pub struct GrepMatch {
     pub before: Vec<String>,
     #[serde(default)]
     pub after: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section: Option<GrepSection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GrepSection {
+    pub heading: String,
+    pub depth: u32,
+    pub line_start: u32,
+    pub line_end: u32,
 }
 
 /// Response body of [`grep`].  Same shape / policy as
@@ -277,11 +291,19 @@ async fn grep_with_params(
         .await
         .map_err(SearchError::Fence)?;
     let mut client = state.search.client().await?;
-    let expected_filters = if params.files.is_some() {
+    let expected_filters = (if params.files.is_some() {
         DiscoveryFilter::Files as u32
     } else {
         0
-    };
+    }) | (if params.block_type.is_some() {
+        DiscoveryFilter::BlockType as u32
+    } else {
+        0
+    }) | (if params.section.is_some() {
+        DiscoveryFilter::Section as u32
+    } else {
+        0
+    });
     let req = GrepRequest {
         root_path,
         pattern: params.pattern,
@@ -294,6 +316,8 @@ async fn grep_with_params(
         auth_token: token.0.to_string(),
         sort_recency: params.sort_recency,
         files: params.files.map(|paths| DiscoveryFiles { paths }),
+        block_type: params.block_type,
+        section: params.section,
     };
     let resp = client
         .grep(tonic::Request::new(req))
@@ -311,6 +335,12 @@ async fn grep_with_params(
                 line: m.line,
                 before: m.before,
                 after: m.after,
+                section: m.section.map(|section| GrepSection {
+                    heading: section.heading,
+                    depth: section.depth,
+                    line_start: section.line_start,
+                    line_end: section.line_end,
+                }),
             })
             .collect(),
         truncated: resp.truncated,

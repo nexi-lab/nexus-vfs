@@ -123,6 +123,8 @@ service SearchService {
 enum DiscoveryFilter {
   DISCOVERY_FILTER_UNSPECIFIED = 0;
   DISCOVERY_FILTER_FILES = 1;
+  DISCOVERY_FILTER_BLOCK_TYPE = 2;
+  DISCOVERY_FILTER_SECTION = 4;
 }
 
 message DiscoveryFiles {
@@ -193,6 +195,22 @@ message GrepRequest {
   // Python-SearchDaemon mirror context (nexi-lab/nexus#4553).
   bool sort_recency = 10;
   optional DiscoveryFiles files = 11;
+  // Markdown block: code, table, frontmatter, paragraph, blockquote, list, heading.
+  // Applied before the result cap. Non-Markdown files pass this filter unchanged.
+  optional string block_type = 12;
+  // Case-insensitive heading (exact first, then substring); optional ## depth.
+  // CommonMark + tables/YAML frontmatter, derived from the bytes being searched.
+  // Includes descendant headings until the next heading of equal or lesser depth.
+  // Non-Markdown files and missing sections produce no matches.
+  optional string section = 13;
+}
+
+message GrepSection {
+  string heading = 1;
+  uint32 depth = 2;
+  // Inclusive 1-based source line bounds, including the heading itself.
+  uint32 line_start = 3;
+  uint32 line_end = 4;
 }
 
 message GrepMatch {
@@ -207,6 +225,7 @@ message GrepMatch {
   // following. Empty when `before_context` / `after_context` is 0.
   repeated string before = 4;
   repeated string after = 5;
+  optional GrepSection section = 6;
 }
 
 message GrepResponse {

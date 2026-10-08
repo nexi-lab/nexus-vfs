@@ -72,6 +72,7 @@ pub mod internal_call;
 pub mod kernel_io;
 pub mod llm_chat;
 pub mod macro_expand;
+mod markdown;
 pub mod parked_state;
 pub mod path_scope;
 pub mod peer_fanout;

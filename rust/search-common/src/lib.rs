@@ -47,6 +47,7 @@
 //! function — one place to keep the two in lockstep.
 
 pub mod delegation;
+pub mod discovery;
 pub mod federated;
 pub mod fusion;
 pub mod registry;
