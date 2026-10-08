@@ -40,6 +40,103 @@ fn working_set(paths: Vec<String>) -> Option<DiscoveryFiles> {
 }
 
 #[tokio::test]
+async fn discovery_prunes_ignored_subtrees_before_io_and_result_caps() {
+    let mut kernel = MockKernel::new();
+    kernel.add_dir("/");
+    kernel.add_dir("/repo");
+    for directory in [".git", "node_modules", ".venv", "target"] {
+        let root = format!("/repo/{directory}");
+        kernel.add_dir(&root);
+        kernel.add_file(&format!("{root}/ignored.md"), b"needle ignored\n", 99);
+    }
+    kernel.add_file("/repo/session.log", b"needle ignored\n", 99);
+    kernel.add_file("/repo/editor.swp", b"needle ignored\n", 99);
+    kernel.add_file("/repo/visible.md", b"needle visible\n", 1);
+    let mut harness = Harness::new(kernel);
+
+    let glob = harness
+        .service
+        .glob(Request::new(GlobRequest {
+            root_path: "/repo".into(),
+            pattern: "**/*".into(),
+            max_results: 1,
+            sort_recency: true,
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(glob.error.is_none());
+    assert_eq!(glob.paths, ["/repo/visible.md"]);
+    assert!(!glob.truncated);
+    assert_eq!(harness.kernel.io_counts(), (0, 1, 1));
+
+    for files in [None, working_set(glob.paths.clone())] {
+        let before = harness.kernel.io_counts();
+        let grep = harness
+            .service
+            .grep(Request::new(GrepRequest {
+                root_path: "/repo".into(),
+                pattern: "needle".into(),
+                files: files.clone(),
+                max_results: 1,
+                sort_recency: true,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(grep.error.is_none());
+        assert!(!grep.truncated);
+        assert_eq!(grep.matches.len(), 1);
+        assert_eq!(grep.matches[0].path, "/repo/visible.md");
+        let after = harness.kernel.io_counts();
+        assert_eq!(after.0 - before.0, 1, "only visible bytes are read");
+        assert_eq!(after.1 - before.1, usize::from(files.is_none()));
+        assert_eq!(after.2 - before.2, 1, "ignored paths are not statted");
+    }
+
+    // Exact selections express caller intent and do not inherit walk exclusions.
+    let before = harness.kernel.io_counts();
+    let exact = harness
+        .service
+        .grep(Request::new(GrepRequest {
+            root_path: "/repo".into(),
+            pattern: "needle".into(),
+            files: working_set(vec![
+                "/repo/.git/ignored.md".into(),
+                "/repo/session.log".into(),
+                "/repo/visible.md".into(),
+            ]),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(exact.matches.len(), 3);
+    let after = harness.kernel.io_counts();
+    assert_eq!(after.0 - before.0, 3);
+    assert_eq!(after.1 - before.1, 0);
+    assert_eq!(after.2 - before.2, 3);
+
+    harness
+        .kernel
+        .add_file("/repo/visible.md", b"needle changed\n", 2);
+    let changed = harness
+        .service
+        .grep(Request::new(GrepRequest {
+            root_path: "/repo".into(),
+            pattern: "needle".into(),
+            files: working_set(glob.paths),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(changed.matches[0].line, "needle changed");
+}
+
+#[tokio::test]
 async fn glob_to_grep_refinement_preserves_working_set_context_and_empty_selection() {
     let mut kernel = MockKernel::new();
     kernel.add_dir("/");
