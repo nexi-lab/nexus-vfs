@@ -903,6 +903,44 @@ impl ManagedAgentService<kernel::kernel::Kernel> {
         kernel: &Arc<kernel::kernel::Kernel>,
         spawn_provider: Option<Arc<dyn SpawnTask<kernel::kernel::Kernel>>>,
     ) -> Result<Arc<Self>, String> {
+        // State at boot what this build can and cannot do with a session,
+        // because the two capabilities look identical from a caller until the
+        // agent fails to come up.
+        //
+        // `start_session_v1` succeeds either way: a provider-less build
+        // registers identity, ownership and the /proc subtree on purpose, and
+        // those are real. What it cannot do is RUN the agent loop — and the
+        // caller learns that only as `session_endpoint: None`, `os_pid: null`,
+        // and a session that never leaves WARMING_UP. Nothing in that set says
+        // "wrong binary".
+        //
+        // That is not hypothetical. A cross-machine bring-up was told to use
+        // `nexusd-cluster`, which CANNOT embed the sudocode runtime — the
+        // dependency edge is one-way, sudocode → nexus-vfs — so there was
+        // nothing to dispatch to, and the session sat in WARMING_UP with an
+        // empty log while the operator looked for the bug in their own call.
+        // One line at boot answers the question they were actually asking:
+        // is this the binary that can host an agent?
+        //
+        // Deliberately at install rather than per call: the answer is a
+        // property of the build, fixed before any request arrives, and an
+        // operator choosing a binary reads the boot log, not a per-call warning
+        // they have to provoke first.
+        if spawn_provider.is_some() {
+            tracing::info!(
+                "managed-agent: in-process runtime provider WIRED — start_session_v1 \
+                 can host agent loops"
+            );
+        } else {
+            tracing::warn!(
+                "managed-agent: NO in-process runtime provider — start_session_v1 \
+                 will register sessions (identity, ownership, /proc) but cannot run \
+                 an agent loop, so a session stays WARMING_UP with no os_pid and no \
+                 session mailbox. Use a build that wires one (install_with_spawn), \
+                 or drive a subprocess agent by passing spawn_spec."
+            );
+        }
+
         // Mount the /proc namespace this service stamps into. VFSRouter
         // routes by mount-point lookup, so `sys_unlink` on
         // `/proc/{pid}/...` paths needs the mount entry to exist
