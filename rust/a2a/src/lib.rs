@@ -36,7 +36,7 @@ pub mod mailbox_stamping_policy;
 pub mod session;
 pub mod session_io;
 
-pub use foreign_containment::{install_foreign_agent_containment, ForeignAgentMailboxOnly};
+pub use foreign_containment::ForeignAgentMailboxOnly;
 pub use mailbox_stamping_hook::MailboxStampingHook;
 
 // The crate root is the stable surface: consumers spell `a2a::X` and never name

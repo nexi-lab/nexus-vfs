@@ -21,18 +21,3 @@ pub use inmem::InMemoryReBACTupleStore;
 pub use permission_provider::RebacPermissionProvider;
 pub use raft_store::{RaftReBACTupleStore, CONTROL_NS_REBAC};
 pub use store::{NoopReBACTupleStore, ReBACTupleStore, ReBACTupleStoreError};
-
-/// Install the kernel policy before any data-plane listener is marked ready.
-/// The caller supplies the same store used by authorization management.
-pub fn service_decl(store: std::sync::Arc<dyn ReBACTupleStore>) -> kernel::kernel::ServiceDecl {
-    kernel::kernel::ServiceDecl {
-        name: "rebac".into(),
-        install: Box::new(move |kernel| {
-            let cache = std::sync::Arc::new(ReBACGraphCache::new(store));
-            kernel.set_permission_provider(std::sync::Arc::new(Box::new(
-                RebacPermissionProvider::new(cache),
-            )));
-            Ok(())
-        }),
-    }
-}
