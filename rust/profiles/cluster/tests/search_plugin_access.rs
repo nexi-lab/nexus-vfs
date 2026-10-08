@@ -404,7 +404,7 @@ async fn credentials_and_live_permissions_survive_signed_plugin_and_cached_searc
         .unwrap()
         .into_inner();
     assert!(refined.error.is_none(), "{refined:?}");
-    assert!(refined.files_applied);
+    assert_eq!(refined.applied_filters, DiscoveryFilter::Files as u32);
     assert_eq!(refined.matches.len(), 1);
     assert_eq!(refined.matches[0].path, "/docs/public.md");
     assert!(

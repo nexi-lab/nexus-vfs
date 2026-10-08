@@ -40,15 +40,15 @@ use crate::query_expansion::{build_default_expander, ExpansionCache, QueryExpand
 use crate::search_proto::search_service_server::SearchService;
 use crate::search_proto::{
     AddIndexedDirectoryRequest, AddIndexedDirectoryResponse, BatchQueryRequest, BatchQueryResponse,
-    FusionMethod, GlobRequest, GlobResponse, GrepRequest, GrepResponse, HealthRequest,
-    HealthResponse, IndexDocumentsRequest, IndexDocumentsResponse, IndexRequest, IndexResponse,
-    ListIndexedDirectoriesRequest, ListIndexedDirectoriesResponse, ListZoneIndexingModesRequest,
-    ListZoneIndexingModesResponse, LocateRequest, LocateResponse, NotifyFileChangeRequest,
-    NotifyFileChangeResponse, ParkedDiscardRequest, ParkedDiscardResponse, ParkedListRequest,
-    ParkedListResponse, ParkedRetryRequest, ParkedRetryResponse, QueryRequest, QueryResponse,
-    QueryResult, QueryType, RefreshRequest, RefreshResponse, RemoveIndexedDirectoryRequest,
-    RemoveIndexedDirectoryResponse, SetZoneIndexingModeRequest, SetZoneIndexingModeResponse,
-    StatsRequest, StatsResponse,
+    DiscoveryFilter, FusionMethod, GlobRequest, GlobResponse, GrepRequest, GrepResponse,
+    HealthRequest, HealthResponse, IndexDocumentsRequest, IndexDocumentsResponse, IndexRequest,
+    IndexResponse, ListIndexedDirectoriesRequest, ListIndexedDirectoriesResponse,
+    ListZoneIndexingModesRequest, ListZoneIndexingModesResponse, LocateRequest, LocateResponse,
+    NotifyFileChangeRequest, NotifyFileChangeResponse, ParkedDiscardRequest, ParkedDiscardResponse,
+    ParkedListRequest, ParkedListResponse, ParkedRetryRequest, ParkedRetryResponse, QueryRequest,
+    QueryResponse, QueryResult, QueryType, RefreshRequest, RefreshResponse,
+    RemoveIndexedDirectoryRequest, RemoveIndexedDirectoryResponse, SetZoneIndexingModeRequest,
+    SetZoneIndexingModeResponse, StatsRequest, StatsResponse,
 };
 
 /// Server-side default when the caller sends `max_results = 0`.
@@ -3498,7 +3498,11 @@ fn health_verdict(
 impl SearchService for SearchServiceImpl {
     async fn glob(&self, request: Request<GlobRequest>) -> Result<Response<GlobResponse>, Status> {
         let mut req = request.into_inner();
-        let files_applied = req.files.is_some();
+        let applied_filters = if req.files.is_some() {
+            DiscoveryFilter::Files as u32
+        } else {
+            0
+        };
         let root = if req.root_path.is_empty() {
             "/".to_string()
         } else {
@@ -3523,20 +3527,24 @@ impl SearchService for SearchServiceImpl {
                 paths,
                 truncated,
                 error: None,
-                files_applied,
+                applied_filters,
             })),
             Err(err) => Ok(Response::new(GlobResponse {
                 paths: Vec::new(),
                 truncated: false,
                 error: Some(err),
-                files_applied,
+                applied_filters,
             })),
         }
     }
 
     async fn grep(&self, request: Request<GrepRequest>) -> Result<Response<GrepResponse>, Status> {
         let mut req = request.into_inner();
-        let files_applied = req.files.is_some();
+        let applied_filters = if req.files.is_some() {
+            DiscoveryFilter::Files as u32
+        } else {
+            0
+        };
         let root = if req.root_path.is_empty() {
             "/".to_string()
         } else {
@@ -3557,13 +3565,13 @@ impl SearchService for SearchServiceImpl {
                 matches,
                 truncated,
                 error: None,
-                files_applied,
+                applied_filters,
             })),
             Err(err) => Ok(Response::new(GrepResponse {
                 matches: Vec::new(),
                 truncated: false,
                 error: Some(err),
-                files_applied,
+                applied_filters,
             })),
         }
     }

@@ -23,8 +23,8 @@ use std::sync::{Arc, Mutex};
 use nexus_http_api::search_proto::search_service_server::{SearchService, SearchServiceServer};
 use nexus_http_api::search_proto::{
     AddIndexedDirectoryRequest, AddIndexedDirectoryResponse, BatchQueryRequest, BatchQueryResponse,
-    GlobRequest, GlobResponse, GrepRequest, GrepResponse, HealthRequest, HealthResponse,
-    IndexDocumentsRequest, IndexDocumentsResponse, IndexRequest, IndexResponse,
+    DiscoveryFilter, GlobRequest, GlobResponse, GrepRequest, GrepResponse, HealthRequest,
+    HealthResponse, IndexDocumentsRequest, IndexDocumentsResponse, IndexRequest, IndexResponse,
     ListIndexedDirectoriesRequest, ListIndexedDirectoriesResponse, ListZoneIndexingModesRequest,
     ListZoneIndexingModesResponse, LocateRequest, LocateResponse, NotifyFileChangeRequest,
     NotifyFileChangeResponse, ParkedDiscardRequest, ParkedDiscardResponse, ParkedListRequest,
@@ -76,7 +76,11 @@ struct MockSearchService {
 impl SearchService for MockSearchService {
     async fn glob(&self, req: Request<GlobRequest>) -> Result<Response<GlobResponse>, Status> {
         let inner = req.into_inner();
-        let files_applied = inner.files.is_some();
+        let applied_filters = if inner.files.is_some() {
+            DiscoveryFilter::Files as u32
+        } else {
+            0
+        };
         self.log.globs.lock().unwrap().push(inner);
         match &self.behaviour {
             MockBehaviour::Success {
@@ -87,7 +91,7 @@ impl SearchService for MockSearchService {
                 paths: paths.clone(),
                 truncated: *truncated,
                 error: error.clone(),
-                files_applied,
+                applied_filters,
             })),
             MockBehaviour::LegacyProtocol => Ok(Response::new(GlobResponse::default())),
             MockBehaviour::RpcCode { code, message } => Err(Status::new(*code, message.clone())),
@@ -565,6 +569,9 @@ async fn glob_working_set_fails_closed_with_an_old_plugin_response() {
             .unwrap();
         assert_eq!(selected.status(), reqwest::StatusCode::NOT_IMPLEMENTED);
         let body: serde_json::Value = selected.json().await.unwrap();
-        assert!(body["error"].as_str().unwrap().contains("working sets"));
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("requested filters"));
     }
 }

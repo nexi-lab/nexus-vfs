@@ -32,11 +32,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use contracts::operation_context::OperationContext;
-use nexus_search_common::require_working_set_applied;
+use nexus_search_common::require_discovery_filters;
 use serde::{Deserialize, Serialize};
 
 use crate::search_proto::{
-    DiscoveryFiles, FusionMethod, GlobRequest, GrepRequest, QueryRequest,
+    DiscoveryFiles, DiscoveryFilter, FusionMethod, GlobRequest, GrepRequest, QueryRequest,
     QueryResult as ProtoQueryResult, QueryType,
 };
 #[cfg(feature = "rebac")]
@@ -92,6 +92,9 @@ pub struct GlobResponse {
     /// error (RPC transport errors surface as HTTP 5xx instead).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Applied optional filter bits from the shared DiscoveryFilter protocol.
+    #[serde(default)]
+    pub applied_filters: u32,
 }
 
 /// Handler for `GET /v2/search/glob`.
@@ -133,7 +136,11 @@ async fn glob_with_params(
         .await
         .map_err(SearchError::Fence)?;
     let mut client = state.search.client().await?;
-    let files_requested = params.files.is_some();
+    let expected_filters = if params.files.is_some() {
+        DiscoveryFilter::Files as u32
+    } else {
+        0
+    };
     let req = GlobRequest {
         root_path,
         pattern: params.pattern,
@@ -147,11 +154,12 @@ async fn glob_with_params(
         .await
         .map_err(SearchError::Rpc)?
         .into_inner();
-    require_working_set_applied(files_requested, resp.files_applied).map_err(SearchError::Rpc)?;
+    require_discovery_filters(expected_filters, resp.applied_filters).map_err(SearchError::Rpc)?;
     let mut response = Json(GlobResponse {
         paths: resp.paths,
         truncated: resp.truncated,
         error: resp.error,
+        applied_filters: resp.applied_filters,
     })
     .into_response();
     if let Some(tok) = observed {
@@ -227,6 +235,9 @@ pub struct GrepResponse {
     pub truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Applied optional filter bits from the shared DiscoveryFilter protocol.
+    #[serde(default)]
+    pub applied_filters: u32,
 }
 
 /// Handler for `GET /v2/search/grep`.
@@ -266,7 +277,11 @@ async fn grep_with_params(
         .await
         .map_err(SearchError::Fence)?;
     let mut client = state.search.client().await?;
-    let files_requested = params.files.is_some();
+    let expected_filters = if params.files.is_some() {
+        DiscoveryFilter::Files as u32
+    } else {
+        0
+    };
     let req = GrepRequest {
         root_path,
         pattern: params.pattern,
@@ -285,7 +300,7 @@ async fn grep_with_params(
         .await
         .map_err(SearchError::Rpc)?
         .into_inner();
-    require_working_set_applied(files_requested, resp.files_applied).map_err(SearchError::Rpc)?;
+    require_discovery_filters(expected_filters, resp.applied_filters).map_err(SearchError::Rpc)?;
     let body = GrepResponse {
         matches: resp
             .matches
@@ -300,6 +315,7 @@ async fn grep_with_params(
             .collect(),
         truncated: resp.truncated,
         error: resp.error,
+        applied_filters: resp.applied_filters,
     };
     let mut response = Json(body).into_response();
     if let Some(tok) = observed {

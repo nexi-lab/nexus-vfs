@@ -118,7 +118,13 @@ service SearchService {
 // Presence distinguishes a bounded working set from a recursive walk.
 // An explicitly empty set searches nothing. Paths are absolute VFS paths;
 // the host validates, deduplicates, scopes and authorizes them before dispatch.
-// At most 10,000 paths; a files-scoped response must confirm files_applied.
+// At most 10,000 paths; responses must acknowledge DISCOVERY_FILTER_FILES.
+// Bits acknowledged in GlobResponse/GrepResponse.applied_filters.
+enum DiscoveryFilter {
+  DISCOVERY_FILTER_UNSPECIFIED = 0;
+  DISCOVERY_FILTER_FILES = 1;
+}
+
 message DiscoveryFiles {
   repeated string paths = 1;
 }
@@ -151,10 +157,10 @@ message GlobResponse {
   // not found, permission denied). Callers should treat a
   // non-empty error the same as an empty `paths` list.
   optional string error = 3;
-  // True when this response applied the caller's explicit working set. Hosts
-  // and clients must reject a files-scoped response without this confirmation;
-  // older plugins ignore unknown request fields and leave this flag false.
-  bool files_applied = 4;
+  // Bitmask of applied optional filters, using DiscoveryFilter values. Hosts
+  // and clients must require every requested filter bit. Older plugins ignore
+  // unknown request fields and return zero, so scoped requests fail closed.
+  uint32 applied_filters = 4;
 }
 
 // ── Grep ──────────────────────────────────────────────────────────
@@ -207,10 +213,10 @@ message GrepResponse {
   repeated GrepMatch matches = 1;
   bool truncated = 2;
   optional string error = 3;
-  // True when this response applied the caller's explicit working set. Hosts
-  // and clients must reject a files-scoped response without this confirmation;
-  // older plugins ignore unknown request fields and leave this flag false.
-  bool files_applied = 4;
+  // Bitmask of applied optional filters, using DiscoveryFilter values. Hosts
+  // and clients must require every requested filter bit. Older plugins ignore
+  // unknown request fields and return zero, so scoped requests fail closed.
+  uint32 applied_filters = 4;
 }
 
 // ── Query / Index ─────────────────────────────────────────────────

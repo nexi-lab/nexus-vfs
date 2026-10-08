@@ -14,7 +14,7 @@ use kernel::kernel::{validate_path_fast, Kernel, KernelError, OperationContext};
 use kernel::Permission;
 use nexus_search_common::delegation::from_metadata;
 use nexus_search_common::{
-    require_working_set_applied, DELEGATION_METADATA_KEY, MAX_DISCOVERY_FILES,
+    require_discovery_filters, DELEGATION_METADATA_KEY, MAX_DISCOVERY_FILES,
 };
 use prost::Message;
 use tonic::{metadata::MetadataMap, Status};
@@ -187,7 +187,11 @@ impl PluginGrpcPolicy for SearchGrpcPolicy {
                 *payload = request.encode_to_vec();
                 SearchResponse::Glob {
                     view,
-                    files_requested: request.files.is_some(),
+                    expected_filters: if request.files.is_some() {
+                        DiscoveryFilter::Files as u32
+                    } else {
+                        0
+                    },
                 }
             }
             "Grep" => {
@@ -201,7 +205,11 @@ impl PluginGrpcPolicy for SearchGrpcPolicy {
                 *payload = request.encode_to_vec();
                 SearchResponse::Grep {
                     view,
-                    files_requested: request.files.is_some(),
+                    expected_filters: if request.files.is_some() {
+                        DiscoveryFilter::Files as u32
+                    } else {
+                        0
+                    },
                 }
             }
             "Locate" => {
@@ -405,11 +413,11 @@ enum SearchResponse {
     Batch(Vec<ReadView>),
     Glob {
         view: ReadView,
-        files_requested: bool,
+        expected_filters: u32,
     },
     Grep {
         view: ReadView,
-        files_requested: bool,
+        expected_filters: u32,
     },
     Locate(ReadView, String),
 }
@@ -434,20 +442,20 @@ impl AuthorizedPluginCall for SearchResponse {
             }
             Self::Glob {
                 view,
-                files_requested,
+                expected_filters,
             } => {
                 let mut response = decode_response::<GlobResponse>(&payload)?;
-                require_working_set_applied(files_requested, response.files_applied)?;
+                require_discovery_filters(expected_filters, response.applied_filters)?;
                 view.filter(&mut response.paths, |path| path)?;
                 view.redact_error(&mut response.error);
                 Ok(response.encode_to_vec())
             }
             Self::Grep {
                 view,
-                files_requested,
+                expected_filters,
             } => {
                 let mut response = decode_response::<GrepResponse>(&payload)?;
-                require_working_set_applied(files_requested, response.files_applied)?;
+                require_discovery_filters(expected_filters, response.applied_filters)?;
                 view.filter(&mut response.matches, |hit| &hit.path)?;
                 view.redact_error(&mut response.error);
                 Ok(response.encode_to_vec())

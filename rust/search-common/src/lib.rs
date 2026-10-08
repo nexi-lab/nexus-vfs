@@ -74,14 +74,14 @@ pub use results::{Hit, BACKEND_LEG_TIMING_KEYS};
 /// Maximum caller-supplied paths in one Glob or Grep request.
 pub const MAX_DISCOVERY_FILES: usize = 10_000;
 
-/// Require confirmation that a plugin honored the explicit working set.
-/// An older plugin silently ignores unknown protobuf fields, so a response
-/// without confirmation cannot satisfy a files-scoped request.
+/// Require confirmation that a plugin honored every requested optional filter.
+/// Unknown protobuf fields are ignored by older plugins; an unacknowledged
+/// selector cannot satisfy the caller's requested scope.
 #[cfg(feature = "transport")]
-pub fn require_working_set_applied(requested: bool, applied: bool) -> Result<(), tonic::Status> {
-    if requested && !applied {
+pub fn require_discovery_filters(expected: u32, applied: u32) -> Result<(), tonic::Status> {
+    if applied & expected != expected {
         Err(tonic::Status::unimplemented(
-            "search backend does not support working sets",
+            "search backend does not support requested filters",
         ))
     } else {
         Ok(())
