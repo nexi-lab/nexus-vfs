@@ -137,10 +137,9 @@ fn register_cache_invalidator(
         // outside MY subtree belongs to a sibling mount. Translating it here
         // would evict a path this cache never held and leave the real entry
         // stale — a silent read-your-writes failure.
-        let Some(under_mount) = split_subtree(&subtree_for_cb, zone_key) else {
+        let Some(global) = project_zone_key(&mount_point_for_cb, &subtree_for_cb, zone_key) else {
             return;
         };
-        let global = zone_key_to_global(&mount_point_for_cb, &under_mount);
         cache_for_cb.remove(&global);
     }));
 }
@@ -318,10 +317,8 @@ impl ZoneMetaStore {
         // Falling back to the mount point would hand the caller a path that
         // resolves to a DIFFERENT object, so the key is returned unchanged and
         // simply fails to match anything this store caches.
-        split_subtree(&self.target_subtree, zone_key).map_or_else(
-            || zone_key.to_string(),
-            |rest| zone_key_to_global(&self.mount_point, &rest),
-        )
+        project_zone_key(&self.mount_point, &self.target_subtree, zone_key)
+            .unwrap_or_else(|| zone_key.to_string())
     }
 }
 
@@ -364,7 +361,7 @@ pub(crate) fn subtree_or_whole_zone(raw: &str) -> String {
 ///
 /// A path that does not sit under `mount_point` is a caller bug, caught by the
 /// `debug_assert!` in `under_mount`; release mode degrades rather than panics.
-fn compose_zone_key(mount_point: &str, target_subtree: &str, full_path: &str) -> String {
+pub(crate) fn compose_zone_key(mount_point: &str, target_subtree: &str, full_path: &str) -> String {
     // Delegates, rather than implementing. The kernel router derives a mount's
     // CONTENT address from the same rule, and the two have to agree — they did
     // not, because this function was a near-copy and only the copy learned
@@ -401,6 +398,17 @@ fn split_subtree(target_subtree: &str, zone_key: &str) -> Option<String> {
     zone_key
         .strip_prefix(&format!("{target_subtree}/"))
         .map(|rest| format!("/{rest}"))
+}
+
+/// Project a zone key through a mount, excluding keys outside its subtree.
+/// Metadata, cache invalidation and nested mount routing share this mapping.
+pub(crate) fn project_zone_key(
+    mount_point: &str,
+    target_subtree: &str,
+    zone_key: &str,
+) -> Option<String> {
+    split_subtree(target_subtree, zone_key)
+        .map(|relative| zone_key_to_global(mount_point, &relative))
 }
 
 /// Map a zone-relative state-machine key to its full caller-facing path,
