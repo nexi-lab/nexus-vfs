@@ -14,7 +14,13 @@ fn visit_candidates(
     visit: &mut dyn FnMut(&str, u8, Option<i64>) -> WalkAction,
 ) -> Result<(), KernelIoError> {
     match files {
-        None => walk_recursive(handle, root, &mut |path, kind| visit(path, kind, None)),
+        None => walk_recursive(handle, root, &mut |path, kind| {
+            if ignored_discovery_path(path) {
+                WalkAction::SkipSubtree
+            } else {
+                visit(path, kind, None)
+            }
+        }),
         Some(files) => {
             for path in &files.paths {
                 match kernel_io::sys_stat(handle, path) {
@@ -30,6 +36,44 @@ fn visit_candidates(
             Ok(())
         }
     }
+}
+
+/// Recursive discovery skips build artifacts; working sets name exact candidates.
+fn ignored_discovery_path(path: &str) -> bool {
+    path.split('/').any(|part| {
+        matches!(
+            part,
+            ".git"
+                | ".svn"
+                | ".hg"
+                | "node_modules"
+                | "vendor"
+                | ".venv"
+                | "venv"
+                | "__pycache__"
+                | ".tox"
+                | ".nox"
+                | "dist"
+                | "build"
+                | ".next"
+                | ".nuxt"
+                | "target"
+                | ".idea"
+                | ".vscode"
+                | ".DS_Store"
+                | "Thumbs.db"
+                | ".cache"
+                | ".pytest_cache"
+                | ".mypy_cache"
+                | ".ruff_cache"
+                | "coverage"
+                | ".coverage"
+                | "htmlcov"
+                | "logs"
+        ) || [".swp", ".swo", ".pyc", ".pyo", ".log"]
+            .iter()
+            .any(|suffix| part.ends_with(suffix))
+    })
 }
 
 pub(crate) fn do_glob(
@@ -272,6 +316,7 @@ pub(crate) fn grep_scan(
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WalkAction {
     Continue,
+    SkipSubtree,
     Stop,
 }
 
@@ -318,8 +363,10 @@ fn walk_entries(
 ) -> WalkAction {
     for entry in entries {
         let child_path = kernel_io::join_vfs_path(parent, &entry.name);
-        if visit(&child_path, entry.entry_type) == WalkAction::Stop {
-            return WalkAction::Stop;
+        match visit(&child_path, entry.entry_type) {
+            WalkAction::Stop => return WalkAction::Stop,
+            WalkAction::SkipSubtree => continue,
+            WalkAction::Continue => {}
         }
         // Recurse into DT_DIR + DT_MOUNT (we walk THROUGH mounts
         // per the filesystem invariant that a mount replaces the

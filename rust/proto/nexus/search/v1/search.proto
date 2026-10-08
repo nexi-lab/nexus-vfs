@@ -15,6 +15,8 @@ service SearchService {
   // RESPONSE paths are the full absolute VFS path (starts with `/`),
   // matching `GrepMatch.path` convention across the service so callers
   // decode both rpcs' path fields with one rule.
+  // Recursive discovery skips VCS, dependency/build directories and temporary
+  // artifacts. An explicit files set searches exactly those authorized paths.
   rpc Glob(GlobRequest) returns (GlobResponse);
 
   // Recursively walk `root_path` and return every regex match in
