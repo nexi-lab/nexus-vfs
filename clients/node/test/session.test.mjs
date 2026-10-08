@@ -145,3 +145,109 @@ test('transient read failure preserves the cursor and does not duplicate a delta
     assert.deepEqual(offsets.slice(0, 3), ['0', '1', '1'])
   } finally { await transport.close() }
 })
+
+test('a new attachment reads a retained log without replaying an older generation', async () => {
+  const old = new SessionCodec({ ...endpoint, channel_id: 'previous' }, 'agent')
+  const agent = new SessionCodec(endpoint, 'agent')
+  const records = [old.encode(rpc({ id: 1, result: { stale: true } })), agent.encode(rpc({ id: 0, result: { initialized: true } }))]
+  const offsets = []
+  const received = []
+  let complete
+  const done = new Promise(resolve => { complete = resolve })
+  const transport = new NexusSessionTransport({ endpoint, authToken: '',
+    client: {
+      async streamReadAt(_path, offset) {
+        offsets.push(offset)
+        if (offset === '0') throw new Error(JSON.stringify({ code: -32019, message: 'offset 0 trimmed; earliest 512' }))
+        const record = records[Number(offset) - 512]
+        if (!record) await delay(5)
+        return { data: record ?? Buffer.alloc(0), nextOffset: record ? String(Number(offset) + 1) : offset }
+      },
+      async streamWrite() {},
+    },
+    onMessage(message) { received.push(message); complete() },
+    onClose(error) { assert.equal(error, undefined) },
+  })
+  transport.start()
+  try {
+    await Promise.race([done, delay(1000).then(() => { throw new Error('retained initialization timed out') })])
+    assert.deepEqual(received, [{ jsonrpc: '2.0', id: 0, result: { initialized: true } }])
+    assert.deepEqual(offsets.slice(0, 3), ['0', '512', '513'])
+  } finally { await transport.close() }
+})
+
+test('recovering the initial retention floor still rejects a missing frame in this generation', async () => {
+  const agent = new SessionCodec(endpoint, 'agent')
+  agent.encode(rpc({ method: 'session/update', params: { text: 'lost' } }))
+  const retained = agent.encode(rpc({ id: 1, result: { stopReason: 'end_turn' } }))
+  const received = []
+  let complete
+  const done = new Promise(resolve => { complete = resolve })
+  const transport = new NexusSessionTransport({ endpoint, authToken: '',
+    client: {
+      async streamReadAt(_path, offset) {
+        if (offset === '0') throw new Error(JSON.stringify({ code: -32019, message: 'offset 0 trimmed; earliest 512' }))
+        return { data: retained, nextOffset: '513' }
+      },
+      async streamWrite() {},
+    },
+    onMessage(message) { received.push(message) },
+    onClose(error) { complete(error) },
+  })
+  transport.start()
+  try {
+    const error = await Promise.race([done, delay(1000).then(() => { throw new Error('missing-frame failure timed out') })])
+    assert.match(error.message, /gap/)
+    assert.deepEqual(received, [])
+  } finally { await transport.close() }
+})
+
+for (const failure of [
+  { code: -32019, message: 'offset 1 trimmed; earliest 512' },
+  { code: -32019, message: 'offset 0 trimmed; earliest 0' },
+  { code: -32001, message: 'offset 0 trimmed; earliest 512' },
+]) test(`unrelated or invalid retention error closes the channel: ${JSON.stringify(failure)}`, async () => {
+  let reads = 0
+  let complete
+  const done = new Promise(resolve => { complete = resolve })
+  const transport = new NexusSessionTransport({ endpoint, authToken: '',
+    client: {
+      async streamReadAt() { reads++; throw new Error(JSON.stringify(failure)) },
+      async streamWrite() {},
+    },
+    onMessage() { assert.fail('failed reads must not deliver messages') },
+    onClose(error) { complete(error) },
+  })
+  transport.start()
+  try {
+    const error = await Promise.race([done, delay(1000).then(() => { throw new Error('retention rejection timed out') })])
+    assert.equal(error.message, JSON.stringify(failure))
+    assert.equal(reads, 1)
+  } finally { await transport.close() }
+})
+
+test('retention overtaking an active attachment fails without dropping current traffic', async () => {
+  const agent = new SessionCodec(endpoint, 'agent')
+  const first = agent.encode(rpc({ method: 'session/update', params: { text: 'first' } }))
+  const failure = JSON.stringify({ code: -32019, message: 'offset 1 trimmed; earliest 512' })
+  const received = []
+  let complete
+  const done = new Promise(resolve => { complete = resolve })
+  const transport = new NexusSessionTransport({ endpoint, authToken: '',
+    client: {
+      async streamReadAt(_path, offset) {
+        if (offset === '0') return { data: first, nextOffset: '1' }
+        throw new Error(failure)
+      },
+      async streamWrite() {},
+    },
+    onMessage(message) { received.push(message.params.text) },
+    onClose(error) { complete(error) },
+  })
+  transport.start()
+  try {
+    const error = await Promise.race([done, delay(1000).then(() => { throw new Error('active retention failure timed out') })])
+    assert.equal(error.message, failure)
+    assert.deepEqual(received, ['first'])
+  } finally { await transport.close() }
+})

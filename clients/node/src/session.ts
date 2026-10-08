@@ -34,6 +34,21 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
+/** Read the kernel's OffsetOutOfRange response for a new attachment only. */
+function initialRetentionFloor(error: unknown, offset: string): string | undefined {
+  if (offset !== '0' || !(error instanceof Error)) return undefined
+  try {
+    const response: unknown = JSON.parse(error.message)
+    if (!isObject(response) || response.code !== -32019 || typeof response.message !== 'string') return undefined
+    const match = /^offset 0 trimmed; earliest ([0-9]+)$/.exec(response.message)
+    const floor = match?.[1]
+    if (floor !== undefined && BigInt(floor) > 0n) return floor
+  } catch {
+    // Other kernel and gRPC failures retain their existing handling.
+  }
+  return undefined
+}
+
 function rpcMessage(value: unknown): SessionRpcMessage {
   if (!isObject(value) || value.jsonrpc !== '2.0') throw new Error('Session RPC requires a JSON-RPC 2.0 object')
   if ('id' in value && typeof value.id !== 'string' && !Number.isSafeInteger(value.id)) {
@@ -193,6 +208,12 @@ export class NexusSessionTransport {
           )
           retryMs = 200
         } catch (error) {
+          const floor = initialRetentionFloor(error, this.offset)
+          if (floor !== undefined) {
+            // Keep the codec: missing frames in this generation must still fail.
+            this.offset = floor
+            continue
+          }
           // Reads have no effects: keep the cursor and codec across a transient
           // gRPC failure. Writes deliberately have different retry semantics.
           const code = isObject(error) ? error.code : undefined

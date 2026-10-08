@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use kernel::kernel::syscall::KernelSyscall;
-use kernel::kernel::OperationContext;
+use kernel::kernel::{KernelError, OperationContext};
 
 use crate::session::{SessionCodec, SessionEndpoint, SessionPayload, SessionSide};
 
@@ -108,15 +108,23 @@ impl<K: KernelSyscall> SessionMailbox<K> {
             return Err("session channel is closed".into());
         }
         let mut reader = self.reader.lock().map_err(|_| "session reader poisoned")?;
-        let result = self
-            .kernel
-            .sys_read(
-                &self.endpoint.transcript,
-                &self.ctx,
-                timeout_ms,
-                reader.offset,
-            )
-            .map_err(|e| format!("session read failed: {e:?}"))?;
+        let result = match self.kernel.sys_read(
+            &self.endpoint.transcript,
+            &self.ctx,
+            timeout_ms,
+            reader.offset,
+        ) {
+            Ok(result) => result,
+            Err(KernelError::StreamTruncated(earliest, 0))
+                if reader.offset == 0 && earliest > 0 =>
+            {
+                // A new attachment reuses its participants' retained log. The
+                // codec still rejects gaps in this attachment's own sequence.
+                reader.offset = earliest as u64;
+                return Ok(None);
+            }
+            Err(error) => return Err(format!("session read failed: {error}")),
+        };
         let Some(bytes) = result.data.filter(|bytes| !bytes.is_empty()) else {
             return Ok(None);
         };
