@@ -49,7 +49,8 @@ const DEFAULT_LEASE_MAX: usize = 100_000;
 /// Path-aware zone-perm authorization provider.
 ///
 /// See the module docstring for the SSOT contract and the historical
-/// bug this fixes.  Internal lease cache memoises hits at ~100-200ns.
+/// bug this fixes. The legacy lease cache remains available to observers,
+/// but cannot establish permission without action and current-grant identity.
 pub struct ZonePermsProvider {
     lease_cache: Arc<PermissionLeaseCache>,
 }
@@ -121,15 +122,9 @@ impl PermissionProvider for ZonePermsProvider {
         permission: Permission,
         ctx: &OperationContext,
     ) -> Result<(), KernelError> {
-        // Lease cache — hot path early-return.  Uses `agent_id` when
-        // present, falls back to `user_id` (same as the pre-refactor
-        // gate).  Empty caller id ⇒ skip cache (lease_cache.check
-        // returns false immediately on empty id).
-        let agent_id = ctx.agent_id.as_deref().unwrap_or(&ctx.user_id);
-        if self.lease_cache.check(path, agent_id) {
+        if ctx.is_admin {
             return Ok(());
         }
-
         // Zone-perms path-aware check.  Empty `zone_perms` under an
         // installed provider means "no grants" — deny.  Callers that
         // want the pre-refactor "no zone_perms ⇒ fall through" shape
@@ -145,7 +140,9 @@ impl PermissionProvider for ZonePermsProvider {
             .any(|(zone_id, perm_chars)| zone_id == path_zone && perm_chars.contains(perm_char));
 
         if has_zone_grant {
-            self.lease_cache.stamp(path, agent_id);
+            // Current grants are cheap to inspect. A path/principal lease has
+            // neither action nor grant revision, so consulting or stamping it
+            // cannot help establish today's authorization.
             return Ok(());
         }
 
@@ -277,9 +274,9 @@ mod tests {
         assert!(matches!(err, KernelError::PermissionDenied(_)));
     }
 
-    /// Lease cache short-circuits repeat hits (perf contract).
+    /// Cached reads must not override the authenticated context's current grants.
     #[test]
-    fn lease_cache_short_circuits_repeat_hits() {
+    fn lease_cache_does_not_override_current_grants() {
         let provider = ZonePermsProvider::new();
         let ctx = ctx_with("agent-1", "alice", vec![("eng".into(), "rw".into())]);
         let route = RouteResult {
@@ -296,13 +293,29 @@ mod tests {
         provider
             .check("/eng/x", Some(&route), Permission::Read, &ctx)
             .expect("first call must succeed via full check");
-        // Second call: lease cache hit — same result even if we
-        // deliberately pass an empty `zone_perms` (proves the cache
-        // is what answered, not the perms iter).
+        provider.lease_cache().stamp("/eng/x", "agent-1");
+        assert!(provider.lease_cache().check("/eng/x", "agent-1"));
+        // A cached success must not survive removal of the current grant.
         let mut ctx2 = ctx.clone();
         ctx2.zone_perms.clear();
+        assert!(matches!(
+            provider.check("/eng/x", Some(&route), Permission::Read, &ctx2),
+            Err(KernelError::PermissionDenied(_))
+        ));
+    }
+
+    #[test]
+    fn cached_read_never_grants_write() {
+        let provider = ZonePermsProvider::new();
+        let ctx = ctx_with("reader", "alice", vec![(ROOT_ZONE_ID.into(), "r".into())]);
         provider
-            .check("/eng/x", Some(&route), Permission::Read, &ctx2)
-            .expect("second call must hit lease cache and succeed");
+            .check("/grant.json", None, Permission::Read, &ctx)
+            .unwrap();
+        provider.lease_cache().stamp("/grant.json", "reader");
+        assert!(provider.lease_cache().check("/grant.json", "reader"));
+        assert!(matches!(
+            provider.check("/grant.json", None, Permission::Write, &ctx),
+            Err(KernelError::PermissionDenied(_))
+        ));
     }
 }
