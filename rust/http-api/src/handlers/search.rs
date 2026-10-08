@@ -32,11 +32,12 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use contracts::operation_context::OperationContext;
+use nexus_search_common::require_working_set_applied;
 use serde::{Deserialize, Serialize};
 
 use crate::search_proto::{
-    FusionMethod, GlobRequest, GrepRequest, QueryRequest, QueryResult as ProtoQueryResult,
-    QueryType,
+    DiscoveryFiles, FusionMethod, GlobRequest, GrepRequest, QueryRequest,
+    QueryResult as ProtoQueryResult, QueryType,
 };
 #[cfg(feature = "rebac")]
 use crate::zone::is_privileged;
@@ -69,6 +70,9 @@ pub struct GlobQuery {
     /// 403 (#4740).  Empty ⇒ the caller's zone.
     #[serde(default)]
     pub zone_id: String,
+    /// Optional working set. JSON `[]` searches nothing; omission walks the root.
+    #[serde(default)]
+    pub files: Option<Vec<String>>,
 }
 
 fn default_root() -> String {
@@ -98,6 +102,27 @@ pub async fn glob(
     fence: crate::middleware::revision::RevisionFence,
     Query(params): Query<GlobQuery>,
 ) -> Result<Response, SearchError> {
+    glob_with_params(state, token, ctx, fence, params).await
+}
+
+/// JSON form of the same search, for working sets that exceed URL limits.
+pub async fn glob_post(
+    State(state): State<AppState>,
+    Extension(token): Extension<BearerToken>,
+    Extension(ctx): Extension<OperationContext>,
+    fence: crate::middleware::revision::RevisionFence,
+    Json(params): Json<GlobQuery>,
+) -> Result<Response, SearchError> {
+    glob_with_params(state, token, ctx, fence, params).await
+}
+
+async fn glob_with_params(
+    state: AppState,
+    token: BearerToken,
+    ctx: OperationContext,
+    fence: crate::middleware::revision::RevisionFence,
+    params: GlobQuery,
+) -> Result<Response, SearchError> {
     let zone = effective_zone(&ctx, &params.zone_id)?;
     let root_path = params.root_path;
     // #4737: wait for the fenced revision to be applied on this node
@@ -108,18 +133,21 @@ pub async fn glob(
         .await
         .map_err(SearchError::Fence)?;
     let mut client = state.search.client().await?;
+    let files_requested = params.files.is_some();
     let req = GlobRequest {
         root_path,
         pattern: params.pattern,
         max_results: params.max_results,
         auth_token: token.0.to_string(),
         sort_recency: params.sort_recency,
+        files: params.files.map(|paths| DiscoveryFiles { paths }),
     };
     let resp = client
         .glob(tonic::Request::new(req))
         .await
         .map_err(SearchError::Rpc)?
         .into_inner();
+    require_working_set_applied(files_requested, resp.files_applied).map_err(SearchError::Rpc)?;
     let mut response = Json(GlobResponse {
         paths: resp.paths,
         truncated: resp.truncated,
@@ -173,6 +201,9 @@ pub struct GrepQuery {
     /// Zone to search — same contract as [`GlobQuery::zone_id`] (#4740).
     #[serde(default)]
     pub zone_id: String,
+    /// Optional working set. JSON `[]` searches nothing; omission walks the root.
+    #[serde(default)]
+    pub files: Option<Vec<String>>,
 }
 
 /// One match row in [`GrepResponse::matches`].  Same field names as
@@ -206,6 +237,27 @@ pub async fn grep(
     fence: crate::middleware::revision::RevisionFence,
     Query(params): Query<GrepQuery>,
 ) -> Result<Response, SearchError> {
+    grep_with_params(state, token, ctx, fence, params).await
+}
+
+/// JSON form of the same search, for working sets that exceed URL limits.
+pub async fn grep_post(
+    State(state): State<AppState>,
+    Extension(token): Extension<BearerToken>,
+    Extension(ctx): Extension<OperationContext>,
+    fence: crate::middleware::revision::RevisionFence,
+    Json(params): Json<GrepQuery>,
+) -> Result<Response, SearchError> {
+    grep_with_params(state, token, ctx, fence, params).await
+}
+
+async fn grep_with_params(
+    state: AppState,
+    token: BearerToken,
+    ctx: OperationContext,
+    fence: crate::middleware::revision::RevisionFence,
+    params: GrepQuery,
+) -> Result<Response, SearchError> {
     let zone = effective_zone(&ctx, &params.zone_id)?;
     let root_path = params.root_path;
     // #4737: fence BEFORE the walk so a fresh write is visible in matches.
@@ -214,6 +266,7 @@ pub async fn grep(
         .await
         .map_err(SearchError::Fence)?;
     let mut client = state.search.client().await?;
+    let files_requested = params.files.is_some();
     let req = GrepRequest {
         root_path,
         pattern: params.pattern,
@@ -225,12 +278,14 @@ pub async fn grep(
         invert_match: params.invert_match,
         auth_token: token.0.to_string(),
         sort_recency: params.sort_recency,
+        files: params.files.map(|paths| DiscoveryFiles { paths }),
     };
     let resp = client
         .grep(tonic::Request::new(req))
         .await
         .map_err(SearchError::Rpc)?
         .into_inner();
+    require_working_set_applied(files_requested, resp.files_applied).map_err(SearchError::Rpc)?;
     let body = GrepResponse {
         matches: resp
             .matches
@@ -665,8 +720,8 @@ fn subject_for(ctx: &OperationContext) -> (&str, &str) {
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/v2/search/glob", get(glob))
-        .route("/v2/search/grep", get(grep))
+        .route("/v2/search/glob", get(glob).post(glob_post))
+        .route("/v2/search/grep", get(grep).post(grep_post))
         .route("/v2/search/query", post(query))
 }
 

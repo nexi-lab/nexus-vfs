@@ -1,12 +1,9 @@
 //! `nexus-search-plugin` — SearchService cdylib.
 //!
-//! Loaded by `nexusd-cluster` at startup via `--plugin-dir`.  Exposes
-//! `nexus.search.v1.SearchService` (recursive `Glob` + regex `Grep`
-//! over the kernel VFS) through the Phase P plugin-as-gRPC-service
-//! routing path — the plugin declares its service list via
-//! `nexus_plugin_grpc_services`, the cluster's `PluginProxyService`
-//! routes external tonic traffic at `/nexus.search.v1.SearchService/<M>`
-//! into this plugin's `nexus_service_dispatch_grpc`.
+//! Loaded by `nexusd-cluster` via `--plugin-dir`. Exposes indexed keyword,
+//! semantic and hybrid search alongside VFS glob and regex grep. The plugin
+//! declares `nexus.search.v1.SearchService` through `nexus_plugin_grpc_services`;
+//! the host routes tonic traffic into `nexus_service_dispatch_grpc`.
 //!
 //! The host's SearchGrpcPolicy authenticates requests, checks readable zone
 //! grants, and filters every returned path with the kernel's installed permission
@@ -25,21 +22,13 @@
 //! zero search logic) and lets the plugin ship its own release
 //! cadence with its own signed release chain.
 //!
-//! ## What v1 does
+//! ## VFS discovery
 //!
-//! Sequential recursive walk from `root_path` via `sys_readdir`.  Glob
-//! matches via `globset`; grep reads file content via `sys_read` and
-//! scans with the `regex` crate.  Results are unary responses capped
-//! by `max_results` (default 10_000 for glob, 1_000 for grep).
-//! Cross-node paths resolve transparently: `sys_readdir` returns
-//! federation-mounted names, `sys_read` falls through to
-//! `try_remote_fetch` on non-local paths — the plugin holds no
-//! federation awareness of its own.
-//!
-//! v2 will add: streaming responses, trigram-indexed fast-path grep,
-//! adaptive glob strategy per pattern shape, and (behind a feature
-//! flag) semantic embeddings.  Kept separate from v1 to keep the
-//! initial cdylib review surface small.
+//! Recursive discovery uses `sys_readdir`; explicit working sets use `sys_stat`
+//! on each authorized path. Glob matches with `globset`; grep reads UTF-8 file
+//! content and scans with `regex`. The default result caps are 10,000 paths
+//! for glob and 1,000 lines for grep. Recency sorting precedes the cap.
+//! Cross-node paths resolve through the kernel's mounted filesystem backends.
 
 use std::ffi::c_char;
 use std::sync::Arc;
@@ -69,6 +58,7 @@ pub mod contextual_chunker;
 /// module docstring for the caller contract (used by
 /// `SearchServiceImpl::query`).
 pub mod delegation_gate;
+mod discovery;
 pub mod embed_cache;
 pub mod embedder;
 pub mod fts_index;

@@ -70,3 +70,20 @@ pub use federated::{is_all_peers_failed, FederatedSearchResponse, ZoneFailure};
 pub use fusion::{rrf_multi_fusion, FusionConfig, FusionMethod, RRF_TOP1_BONUS, RRF_TOP3_BONUS};
 pub use registry::{InMemoryZoneSearchRegistry, SearchDaemonTarget, ZoneSearchRegistry};
 pub use results::{Hit, BACKEND_LEG_TIMING_KEYS};
+
+/// Maximum caller-supplied paths in one Glob or Grep request.
+pub const MAX_DISCOVERY_FILES: usize = 10_000;
+
+/// Require confirmation that a plugin honored the explicit working set.
+/// An older plugin silently ignores unknown protobuf fields, so a response
+/// without confirmation cannot satisfy a files-scoped request.
+#[cfg(feature = "transport")]
+pub fn require_working_set_applied(requested: bool, applied: bool) -> Result<(), tonic::Status> {
+    if requested && !applied {
+        Err(tonic::Status::unimplemented(
+            "search backend does not support working sets",
+        ))
+    } else {
+        Ok(())
+    }
+}
