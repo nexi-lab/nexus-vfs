@@ -16,14 +16,15 @@ use std::sync::{Arc, Mutex};
 use nexus_http_api::search_proto::search_service_server::{SearchService, SearchServiceServer};
 use nexus_http_api::search_proto::{
     AddIndexedDirectoryRequest, AddIndexedDirectoryResponse, BatchQueryRequest, BatchQueryResponse,
-    GlobRequest, GlobResponse, GrepMatch, GrepRequest, GrepResponse, HealthRequest, HealthResponse,
-    IndexDocumentsRequest, IndexDocumentsResponse, IndexRequest, IndexResponse,
-    ListIndexedDirectoriesRequest, ListIndexedDirectoriesResponse, ListZoneIndexingModesRequest,
-    ListZoneIndexingModesResponse, LocateRequest, LocateResponse, NotifyFileChangeRequest,
-    NotifyFileChangeResponse, ParkedDiscardRequest, ParkedDiscardResponse, ParkedListRequest,
-    ParkedListResponse, ParkedRetryRequest, ParkedRetryResponse, QueryRequest, QueryResponse,
-    RefreshRequest, RefreshResponse, RemoveIndexedDirectoryRequest, RemoveIndexedDirectoryResponse,
-    SetZoneIndexingModeRequest, SetZoneIndexingModeResponse, StatsRequest, StatsResponse,
+    DiscoveryFilter, GlobRequest, GlobResponse, GrepMatch, GrepRequest, GrepResponse,
+    HealthRequest, HealthResponse, IndexDocumentsRequest, IndexDocumentsResponse, IndexRequest,
+    IndexResponse, ListIndexedDirectoriesRequest, ListIndexedDirectoriesResponse,
+    ListZoneIndexingModesRequest, ListZoneIndexingModesResponse, LocateRequest, LocateResponse,
+    NotifyFileChangeRequest, NotifyFileChangeResponse, ParkedDiscardRequest, ParkedDiscardResponse,
+    ParkedListRequest, ParkedListResponse, ParkedRetryRequest, ParkedRetryResponse, QueryRequest,
+    QueryResponse, RefreshRequest, RefreshResponse, RemoveIndexedDirectoryRequest,
+    RemoveIndexedDirectoryResponse, SetZoneIndexingModeRequest, SetZoneIndexingModeResponse,
+    StatsRequest, StatsResponse,
 };
 use nexus_http_api::{bind_and_serve, AppState};
 use tokio::net::TcpListener;
@@ -47,7 +48,11 @@ enum MockBehaviour {
     /// Upstream returns a specific `tonic::Code`.  Same shape as the
     /// query-side + glob-side mocks; subsumes the earlier
     /// `InvalidArgument(String)` variant which was a strict subset.
-    RpcCode { code: tonic::Code, message: String },
+    RpcCode {
+        code: tonic::Code,
+        message: String,
+    },
+    LegacyProtocol,
 }
 
 #[derive(Clone)]
@@ -60,6 +65,11 @@ struct MockSearchService {
 impl SearchService for MockSearchService {
     async fn grep(&self, req: Request<GrepRequest>) -> Result<Response<GrepResponse>, Status> {
         let inner = req.into_inner();
+        let applied_filters = if inner.files.is_some() {
+            DiscoveryFilter::Files as u32
+        } else {
+            0
+        };
         self.log.greps.lock().unwrap().push(inner);
         match &self.behaviour {
             MockBehaviour::Success {
@@ -70,7 +80,9 @@ impl SearchService for MockSearchService {
                 matches: matches.clone(),
                 truncated: *truncated,
                 error: error.clone(),
+                applied_filters,
             })),
+            MockBehaviour::LegacyProtocol => Ok(Response::new(GrepResponse::default())),
             MockBehaviour::RpcCode { code, message } => Err(Status::new(*code, message.clone())),
         }
     }
@@ -413,4 +425,79 @@ async fn grep_defaults_reach_backend_intact() {
     assert_eq!(r.after_context, 0);
     assert!(!r.invert_match);
     assert!(!r.sort_recency);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grep_json_working_sets_preserve_presence_and_caller_credential() {
+    let h = Harness::start(MockBehaviour::Success {
+        matches: vec![],
+        truncated: false,
+        error: None,
+    })
+    .await;
+    let client = reqwest::Client::new();
+    let selected: Vec<String> = (0..4096)
+        .map(|i| format!("/docs/long-working-set-{i}.md"))
+        .collect();
+    for body in [
+        serde_json::json!({"pattern": "needle", "root_path": "/docs", "files": selected}),
+        serde_json::json!({"pattern": "needle", "root_path": "/docs", "files": []}),
+        serde_json::json!({"pattern": "needle", "root_path": "/docs"}),
+    ] {
+        let response = client
+            .post(format!("{}/v2/search/grep", h.http_base))
+            .bearer_auth("working-set-test-only")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+    }
+    let recorded = h.log.greps.lock().unwrap().clone();
+    assert_eq!(recorded.len(), 3);
+    assert_eq!(recorded[0].files.as_ref().unwrap().paths, selected);
+    assert!(recorded[1].files.as_ref().unwrap().paths.is_empty());
+    assert!(recorded[2].files.is_none());
+    for request in &recorded {
+        assert_eq!(request.auth_token, "working-set-test-only");
+        assert_eq!(request.root_path, "/docs");
+    }
+    let invalid = client
+        .post(format!("{}/v2/search/grep", h.http_base))
+        .json(&serde_json::json!({"pattern": "needle", "files": "invalid"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        h.log.greps.lock().unwrap().len(),
+        3,
+        "invalid payload must not reach gRPC"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grep_working_set_fails_closed_with_an_old_plugin_response() {
+    let h = Harness::start(MockBehaviour::LegacyProtocol).await;
+    let client = reqwest::Client::new();
+    let recursive = client
+        .get(format!("{}/v2/search/grep?pattern=needle", h.http_base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(recursive.status(), reqwest::StatusCode::OK);
+    for files in [serde_json::json!([]), serde_json::json!(["/docs/a.md"])] {
+        let selected = client
+            .post(format!("{}/v2/search/grep", h.http_base))
+            .json(&serde_json::json!({"pattern": "needle", "files": files}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(selected.status(), reqwest::StatusCode::NOT_IMPLEMENTED);
+        let body: serde_json::Value = selected.json().await.unwrap();
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("requested filters"));
+    }
 }

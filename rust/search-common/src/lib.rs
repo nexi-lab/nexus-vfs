@@ -70,3 +70,20 @@ pub use federated::{is_all_peers_failed, FederatedSearchResponse, ZoneFailure};
 pub use fusion::{rrf_multi_fusion, FusionConfig, FusionMethod, RRF_TOP1_BONUS, RRF_TOP3_BONUS};
 pub use registry::{InMemoryZoneSearchRegistry, SearchDaemonTarget, ZoneSearchRegistry};
 pub use results::{Hit, BACKEND_LEG_TIMING_KEYS};
+
+/// Maximum caller-supplied paths in one Glob or Grep request.
+pub const MAX_DISCOVERY_FILES: usize = 10_000;
+
+/// Require confirmation that a plugin honored every requested optional filter.
+/// Unknown protobuf fields are ignored by older plugins; an unacknowledged
+/// selector cannot satisfy the caller's requested scope.
+#[cfg(feature = "transport")]
+pub fn require_discovery_filters(expected: u32, applied: u32) -> Result<(), tonic::Status> {
+    if applied & expected != expected {
+        Err(tonic::Status::unimplemented(
+            "search backend does not support requested filters",
+        ))
+    } else {
+        Ok(())
+    }
+}

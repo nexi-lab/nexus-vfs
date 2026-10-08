@@ -84,6 +84,7 @@ impl SearchService for MockSearchService {
             paths: vec!["/hit.md".into()],
             truncated: false,
             error: None,
+            applied_filters: 0,
         }))
     }
 

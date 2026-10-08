@@ -857,7 +857,8 @@ mod tests {
         let root = PathBuf::from("/tmp");
         match build_default_embedder(&root) {
             Err(EmbedError::NotAvailable(msg)) => assert!(msg.contains("semantic")),
-            other => panic!("expected NotAvailable, got {other:?}"),
+            Err(error) => panic!("expected NotAvailable, got {error:?}"),
+            Ok(_) => panic!("expected NotAvailable, got an embedder"),
         }
     }
 

@@ -141,6 +141,7 @@ tracing-appender = "0.2"
 gethostname = "1.1"
 
 [dev-dependencies]
+prost = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 nexus-rebac = { path = "../../rebac" }
 tokio-stream = { version = "0.1", features = ["net"] }
