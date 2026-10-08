@@ -3540,11 +3540,24 @@ impl SearchService for SearchServiceImpl {
 
     async fn grep(&self, request: Request<GrepRequest>) -> Result<Response<GrepResponse>, Status> {
         let mut req = request.into_inner();
-        let applied_filters = if req.files.is_some() {
+        let filter = nexus_search_common::discovery::StructuralFilter::parse(
+            req.block_type.as_deref(),
+            req.section.as_deref(),
+        )
+        .map_err(Status::invalid_argument)?;
+        let applied_filters = (if req.files.is_some() {
             DiscoveryFilter::Files as u32
         } else {
             0
-        };
+        }) | (if req.block_type.is_some() {
+            DiscoveryFilter::BlockType as u32
+        } else {
+            0
+        }) | (if req.section.is_some() {
+            DiscoveryFilter::Section as u32
+        } else {
+            0
+        });
         let root = if req.root_path.is_empty() {
             "/".to_string()
         } else {
@@ -3556,9 +3569,10 @@ impl SearchService for SearchServiceImpl {
             req.max_results as usize
         };
         let handle = Arc::clone(&self.handle);
-        let outcome = tokio::task::spawn_blocking(move || do_grep(&handle, &root, &req, cap))
-            .await
-            .map_err(|e| Status::internal(format!("spawn_blocking joined error: {e}")))?;
+        let outcome =
+            tokio::task::spawn_blocking(move || do_grep(&handle, &root, &req, cap, &filter))
+                .await
+                .map_err(|e| Status::internal(format!("spawn_blocking joined error: {e}")))?;
 
         match outcome {
             Ok((matches, truncated)) => Ok(Response::new(GrepResponse {
@@ -5624,6 +5638,7 @@ mod tests {
                 invert_match: false,
                 max_results: 100,
             },
+            None,
             &mut out,
         );
         assert_eq!(out.len(), 1);
@@ -5646,6 +5661,7 @@ mod tests {
                 invert_match: false,
                 max_results: 100,
             },
+            None,
             &mut out,
         );
         assert_eq!(out.len(), 1);
@@ -5668,6 +5684,7 @@ mod tests {
                 invert_match: true,
                 max_results: 100,
             },
+            None,
             &mut out,
         );
         assert_eq!(out.len(), 2);
@@ -5690,6 +5707,7 @@ mod tests {
                 invert_match: false,
                 max_results: 2,
             },
+            None,
             &mut out,
         );
         assert_eq!(out.len(), 2);

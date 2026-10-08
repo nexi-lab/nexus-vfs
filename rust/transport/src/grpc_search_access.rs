@@ -201,15 +201,28 @@ impl PluginGrpcPolicy for SearchGrpcPolicy {
                     request.root_path = "/".into();
                 }
                 let view = self.path_view(ctx, &request.root_path)?;
+                nexus_search_common::discovery::StructuralFilter::parse(
+                    request.block_type.as_deref(),
+                    request.section.as_deref(),
+                )
+                .map_err(Status::invalid_argument)?;
                 view.prepare_files(&request.root_path, request.files.as_mut())?;
                 *payload = request.encode_to_vec();
                 SearchResponse::Grep {
                     view,
-                    expected_filters: if request.files.is_some() {
+                    expected_filters: (if request.files.is_some() {
                         DiscoveryFilter::Files as u32
                     } else {
                         0
-                    },
+                    }) | (if request.block_type.is_some() {
+                        DiscoveryFilter::BlockType as u32
+                    } else {
+                        0
+                    }) | (if request.section.is_some() {
+                        DiscoveryFilter::Section as u32
+                    } else {
+                        0
+                    }),
                 }
             }
             "Locate" => {

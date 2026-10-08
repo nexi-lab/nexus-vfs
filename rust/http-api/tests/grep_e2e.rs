@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use nexus_http_api::search_proto::search_service_server::{SearchService, SearchServiceServer};
 use nexus_http_api::search_proto::{
     AddIndexedDirectoryRequest, AddIndexedDirectoryResponse, BatchQueryRequest, BatchQueryResponse,
-    DiscoveryFilter, GlobRequest, GlobResponse, GrepMatch, GrepRequest, GrepResponse,
+    DiscoveryFilter, GlobRequest, GlobResponse, GrepMatch, GrepRequest, GrepResponse, GrepSection,
     HealthRequest, HealthResponse, IndexDocumentsRequest, IndexDocumentsResponse, IndexRequest,
     IndexResponse, ListIndexedDirectoriesRequest, ListIndexedDirectoriesResponse,
     ListZoneIndexingModesRequest, ListZoneIndexingModesResponse, LocateRequest, LocateResponse,
@@ -53,6 +53,7 @@ enum MockBehaviour {
         message: String,
     },
     LegacyProtocol,
+    AppliedFilters(u32),
 }
 
 #[derive(Clone)]
@@ -65,11 +66,19 @@ struct MockSearchService {
 impl SearchService for MockSearchService {
     async fn grep(&self, req: Request<GrepRequest>) -> Result<Response<GrepResponse>, Status> {
         let inner = req.into_inner();
-        let applied_filters = if inner.files.is_some() {
+        let applied_filters = (if inner.files.is_some() {
             DiscoveryFilter::Files as u32
         } else {
             0
-        };
+        }) | (if inner.block_type.is_some() {
+            DiscoveryFilter::BlockType as u32
+        } else {
+            0
+        }) | (if inner.section.is_some() {
+            DiscoveryFilter::Section as u32
+        } else {
+            0
+        });
         self.log.greps.lock().unwrap().push(inner);
         match &self.behaviour {
             MockBehaviour::Success {
@@ -83,6 +92,10 @@ impl SearchService for MockSearchService {
                 applied_filters,
             })),
             MockBehaviour::LegacyProtocol => Ok(Response::new(GrepResponse::default())),
+            MockBehaviour::AppliedFilters(filters) => Ok(Response::new(GrepResponse {
+                applied_filters: *filters,
+                ..Default::default()
+            })),
             MockBehaviour::RpcCode { code, message } => Err(Status::new(*code, message.clone())),
         }
     }
@@ -253,6 +266,7 @@ async fn grep_happy_path_round_trips_full_chain() {
                 line: "the widget hums along".to_string(),
                 before: vec!["previous line".to_string()],
                 after: vec!["following line".to_string()],
+                section: None,
             },
             GrepMatch {
                 path: "/logs/x.log".to_string(),
@@ -260,6 +274,7 @@ async fn grep_happy_path_round_trips_full_chain() {
                 line: "widget assembled".to_string(),
                 before: vec![],
                 after: vec![],
+                section: None,
             },
         ],
         truncated: false,
@@ -499,5 +514,86 @@ async fn grep_working_set_fails_closed_with_an_old_plugin_response() {
             .as_str()
             .unwrap()
             .contains("requested filters"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grep_markdown_selectors_and_section_metadata_cross_http_and_grpc() {
+    let h = Harness::start(MockBehaviour::Success {
+        matches: vec![GrepMatch {
+            path: "/spec.md".into(),
+            line_number: 4,
+            line: "needle code".into(),
+            section: Some(GrepSection {
+                heading: "Target".into(),
+                depth: 2,
+                line_start: 2,
+                line_end: 7,
+            }),
+            ..Default::default()
+        }],
+        truncated: false,
+        error: None,
+    })
+    .await;
+    let client = reqwest::Client::new();
+    let get = client
+        .get(format!("{}/v2/search/grep", h.http_base))
+        .query(&[
+            ("pattern", "needle"),
+            ("block_type", "code"),
+            ("section", "## Target"),
+        ])
+        .bearer_auth("structural-filter-test-only")
+        .send()
+        .await
+        .unwrap();
+    let post = client.post(format!("{}/v2/search/grep", h.http_base))
+        .bearer_auth("structural-filter-test-only")
+        .json(&serde_json::json!({"pattern":"needle", "files":["/spec.md"], "block_type":"code", "section":"## Target"}))
+        .send().await.unwrap();
+    let structural = DiscoveryFilter::BlockType as u32 | DiscoveryFilter::Section as u32;
+    for (response, filters) in [
+        (get, structural),
+        (post, structural | DiscoveryFilter::Files as u32),
+    ] {
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["applied_filters"], filters);
+        assert_eq!(
+            body["matches"][0]["section"],
+            serde_json::json!({"heading":"Target", "depth":2, "line_start":2, "line_end":7})
+        );
+    }
+    let recorded = h.log.greps.lock().unwrap();
+    assert_eq!(recorded.len(), 2);
+    for request in recorded.iter() {
+        assert_eq!(request.block_type.as_deref(), Some("code"));
+        assert_eq!(request.section.as_deref(), Some("## Target"));
+        assert_eq!(request.auth_token, "structural-filter-test-only");
+    }
+    assert!(recorded[0].files.is_none());
+    assert_eq!(recorded[1].files.as_ref().unwrap().paths, ["/spec.md"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grep_rejects_partial_plugin_filter_acknowledgment() {
+    let h = Harness::start(MockBehaviour::AppliedFilters(DiscoveryFilter::Files as u32)).await;
+    let client = reqwest::Client::new();
+    for extra in [
+        serde_json::json!({"block_type":"code"}),
+        serde_json::json!({"section":"Target"}),
+    ] {
+        let mut body = serde_json::json!({"pattern":"needle", "files":["/spec.md"]});
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let response = client
+            .post(format!("{}/v2/search/grep", h.http_base))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_IMPLEMENTED);
     }
 }

@@ -527,6 +527,77 @@ async fn credentials_and_live_permissions_survive_signed_plugin_and_cached_searc
         );
     }
 
+    // A plugin that implements files but lacks structural filters must also fail closed.
+    let mut partial_request = GrepRequest {
+        root_path: "/docs".into(),
+        pattern: "widget".into(),
+        files: Some(DiscoveryFiles {
+            paths: vec!["/docs/public.md".into()],
+        }),
+        section: Some("Chapter".into()),
+        auth_token: alice.key.clone(),
+        ..Default::default()
+    }
+    .encode_to_vec();
+    let call = policy
+        .authorize("Grep", &mut partial_request, &Default::default(), None)
+        .unwrap();
+    let partial_response = GrepResponse {
+        applied_filters: DiscoveryFilter::Files as u32,
+        ..Default::default()
+    }
+    .encode_to_vec();
+    assert_eq!(
+        call.complete(partial_response).unwrap_err().code(),
+        Code::Unimplemented
+    );
+
+    // Parse current source bytes through the signed plugin and live authorization.
+    std::fs::write(
+        docs.join("public.md"),
+        "# Chapter\nwidget prose\n```txt\nwidget code\n```\n",
+    )
+    .unwrap();
+    let structural = client
+        .grep(GrepRequest {
+            root_path: "/docs".into(),
+            pattern: "widget".into(),
+            max_results: 1,
+            files: Some(DiscoveryFiles {
+                paths: vec!["/docs/private.md".into(), "/docs/public.md".into()],
+            }),
+            block_type: Some("code".into()),
+            section: Some("# Chapter".into()),
+            auth_token: alice.key.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        structural.applied_filters,
+        DiscoveryFilter::Files as u32
+            | DiscoveryFilter::BlockType as u32
+            | DiscoveryFilter::Section as u32
+    );
+    assert_eq!(structural.matches.len(), 1, "{structural:?}");
+    assert_eq!(structural.matches[0].line, "widget code");
+    assert_eq!(structural.matches[0].line_number, 4);
+    let section = structural.matches[0].section.as_ref().unwrap();
+    assert_eq!(
+        (
+            &*section.heading,
+            section.depth,
+            section.line_start,
+            section.line_end
+        ),
+        ("Chapter", 1, 1, 5)
+    );
+    assert!(
+        !structural.truncated,
+        "prose and denied files cannot consume the cap"
+    );
+
     // Changing only a relation does not invalidate the plugin's search cache.
     // The response must nevertheless reflect the new permission graph.
     tuples.delete(&alice_grant).unwrap();

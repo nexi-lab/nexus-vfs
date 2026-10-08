@@ -113,6 +113,7 @@ pub(crate) fn do_grep(
     root: &str,
     request: &crate::search_proto::GrepRequest,
     cap: usize,
+    filter: &nexus_search_common::discovery::StructuralFilter,
 ) -> Result<(Vec<GrepMatch>, bool), String> {
     if request.pattern.is_empty() {
         return Err("grep pattern must not be empty".into());
@@ -134,7 +135,15 @@ pub(crate) fn do_grep(
         match kernel_io::sys_read(handle, path) {
             Ok(bytes) if bytes.len() <= GREP_MAX_FILE_BYTES => {
                 if let Ok(text) = std::str::from_utf8(&bytes) {
-                    truncated = grep_scan(text, path, &regex, options, &mut matches);
+                    let selection = crate::markdown::select_lines(path, text, filter);
+                    truncated = grep_scan(
+                        text,
+                        path,
+                        &regex,
+                        options,
+                        selection.as_ref(),
+                        &mut matches,
+                    );
                 }
             }
             Ok(_) | Err(KernelIoError::NotFound) => {}
@@ -207,12 +216,19 @@ pub(crate) fn grep_scan(
     path: &str,
     regex: &regex::Regex,
     options: ScanOptions,
+    selection: Option<&crate::markdown::LineSelection>,
     out: &mut Vec<GrepMatch>,
 ) -> bool {
+    if selection.is_some_and(crate::markdown::LineSelection::is_empty) {
+        return false;
+    }
     // The common context-free path streams lines without a per-file line table.
     let context: Option<Vec<&str>> =
         (options.before_context != 0 || options.after_context != 0).then(|| text.lines().collect());
     for (idx, line) in text.lines().enumerate() {
+        if selection.is_some_and(|selection| !selection.contains(idx)) {
+            continue;
+        }
         if regex.is_match(line) == options.invert_match {
             continue;
         }
@@ -245,6 +261,7 @@ pub(crate) fn grep_scan(
             line: line.into(),
             before,
             after,
+            section: selection.and_then(|selection| selection.section.clone()),
         });
     }
     false
