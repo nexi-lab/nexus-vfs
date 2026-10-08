@@ -71,11 +71,7 @@ impl SearchGrpcPolicy {
             .map(|route| route.zone_id.as_str())
             .unwrap_or(ctx.zone_id.as_str())
             .to_owned();
-        let view = self.view(ctx, &zone)?;
-        if !view.allows(path)? {
-            return Err(Status::permission_denied("search path is not readable"));
-        }
-        Ok(view)
+        self.view(ctx, &zone)
     }
 
     fn admin(
@@ -183,7 +179,7 @@ impl PluginGrpcPolicy for SearchGrpcPolicy {
                     request.root_path = "/".into();
                 }
                 let view = self.path_view(ctx, &request.root_path)?;
-                view.prepare_files(&request.root_path, request.files.as_mut())?;
+                view.prepare_candidates(&request.root_path, request.files.as_mut())?;
                 *payload = request.encode_to_vec();
                 SearchResponse::Glob {
                     view,
@@ -206,7 +202,7 @@ impl PluginGrpcPolicy for SearchGrpcPolicy {
                     request.section.as_deref(),
                 )
                 .map_err(Status::invalid_argument)?;
-                view.prepare_files(&request.root_path, request.files.as_mut())?;
+                view.prepare_candidates(&request.root_path, request.files.as_mut())?;
                 *payload = request.encode_to_vec();
                 SearchResponse::Grep {
                     view,
@@ -299,8 +295,15 @@ impl ReadView {
 
     /// Validate every supplied path before dispatch, then intersect with the
     /// subtree and current caller's permissions. An empty set stays explicit.
-    fn prepare_files(&self, root: &str, files: Option<&mut DiscoveryFiles>) -> Result<(), Status> {
+    fn prepare_candidates(
+        &self,
+        root: &str,
+        files: Option<&mut DiscoveryFiles>,
+    ) -> Result<(), Status> {
         let Some(files) = files else {
+            if !self.allows(root)? {
+                return Err(Status::permission_denied("search path is not readable"));
+            }
             return Ok(());
         };
         if files.paths.len() > MAX_DISCOVERY_FILES {
