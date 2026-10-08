@@ -218,6 +218,66 @@ async fn production_grants_filter_http_search_and_survive_restart() {
     .await;
     assert_eq!(greps["matches"].as_array().unwrap().len(), 1, "{greps}");
     assert_eq!(greps["matches"][0]["path"], "/docs/public.md");
+    // Bob has an exact file grant, with no root-directory grant. Bounded
+    // discovery authorizes those candidates; it cannot walk the directory.
+    assert_eq!(
+        client
+            .get(format!("{base}/v2/search/glob?root_path=/docs&pattern=*"))
+            .bearer_auth(bob)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    for (operation, pattern, field) in [("glob", "*.md", "paths"), ("grep", "widget", "matches")] {
+        for files in [json!(["/docs/public.md", "/docs/private.md"]), json!([])] {
+            let bounded = json_ok(
+                client
+                    .post(format!("{base}/v2/search/{operation}"))
+                    .bearer_auth(bob)
+                    .json(&json!({"root_path":"/docs", "pattern":pattern, "files":files, "max_results":1})),
+            )
+            .await;
+            let hits = bounded[field].as_array().unwrap();
+            assert_eq!(
+                hits.len(),
+                usize::from(!files.as_array().unwrap().is_empty())
+            );
+            if let Some(hit) = hits.first() {
+                let path = if operation == "glob" {
+                    hit
+                } else {
+                    &hit["path"]
+                };
+                assert_eq!(path, "/docs/private.md");
+            }
+        }
+    }
+    grant(
+        &client,
+        &base,
+        admin,
+        ("sharedzone", "file", "/docs/private.md", "bob"),
+        Method::DELETE,
+    )
+    .await;
+    let revoked = json_ok(
+        client
+            .post(format!("{base}/v2/search/grep"))
+            .bearer_auth(bob)
+            .json(&json!({"root_path":"/docs", "pattern":"widget", "files":["/docs/private.md"]})),
+    )
+    .await;
+    assert!(revoked["matches"].as_array().unwrap().is_empty());
+    grant(
+        &client,
+        &base,
+        admin,
+        ("sharedzone", "file", "/docs/private.md", "bob"),
+        Method::POST,
+    )
+    .await;
     assert_eq!(
         client
             .get(format!("{base}/v2/documents/stats"))
