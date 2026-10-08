@@ -35,6 +35,102 @@ const DT_REG: u8 = 0;
 // discriminant — and every path test stayed green while the index was a pipe.
 const DT_LINK: u8 = 6;
 
+#[test]
+fn new_session_attachment_recovers_retained_log_and_ignores_old_generation() {
+    use a2a::session::{SessionCodec, SessionEndpoint, SessionPayload, SessionSide};
+    use a2a::session_io::SessionMailbox;
+    use serde_json::json;
+
+    let kernel = Arc::new(CountingKernel::new());
+    kernel
+        .inner
+        .vfs_router_arc()
+        .add_mount("/", "root", None, false);
+    let endpoint = SessionEndpoint::new("worker".into(), "operator".into(), "new".into());
+    let agent_ctx = OperationContext::new("worker", "root", false, Some("worker"), false);
+    let controller_ctx = OperationContext::new("operator", "root", false, Some("operator"), false);
+    let mailbox = SessionMailbox::open(
+        Arc::clone(&kernel),
+        agent_ctx,
+        endpoint.clone(),
+        SessionSide::Agent,
+    )
+    .unwrap();
+    let old_endpoint = SessionEndpoint::new("worker".into(), "operator".into(), "old".into());
+    let mut old = SessionCodec::new(old_endpoint, SessionSide::Controller).unwrap();
+    let mut current = SessionCodec::new(endpoint.clone(), SessionSide::Controller).unwrap();
+    let old_message = SessionPayload::Rpc {
+        message: json!({"jsonrpc":"2.0","id":1,"method":"session/prompt"}),
+    };
+    let initialize = SessionPayload::Rpc {
+        message: json!({"jsonrpc":"2.0","id":0,"method":"initialize"}),
+    };
+    for bytes in [
+        old.encode(old_message).unwrap(),
+        current.encode(initialize.clone()).unwrap(),
+    ] {
+        kernel
+            .sys_write(&endpoint.transcript, &controller_ctx, &bytes, 0)
+            .unwrap();
+    }
+    kernel.read_floor.store(512, Ordering::Relaxed);
+    assert_eq!(
+        mailbox.receive(0).unwrap(),
+        None,
+        "recover the server retention floor"
+    );
+    assert_eq!(
+        mailbox.receive(0).unwrap(),
+        None,
+        "ignore traffic from the old attachment"
+    );
+    assert_eq!(mailbox.receive(0).unwrap(), Some(initialize));
+    kernel.read_floor.store(4096, Ordering::Relaxed);
+    assert!(
+        mailbox.receive(0).unwrap_err().contains("trimmed"),
+        "an active reader must report lost traffic"
+    );
+}
+
+#[test]
+fn retained_log_recovery_does_not_hide_a_missing_current_generation_frame() {
+    use a2a::session::{SessionCodec, SessionEndpoint, SessionPayload, SessionSide};
+    use a2a::session_io::SessionMailbox;
+    use serde_json::json;
+
+    let kernel = Arc::new(CountingKernel::new());
+    kernel
+        .inner
+        .vfs_router_arc()
+        .add_mount("/", "root", None, false);
+    let endpoint = SessionEndpoint::new("worker".into(), "operator".into(), "new".into());
+    let agent_ctx = OperationContext::new("worker", "root", false, Some("worker"), false);
+    let controller_ctx = OperationContext::new("operator", "root", false, Some("operator"), false);
+    let mailbox = SessionMailbox::open(
+        Arc::clone(&kernel),
+        agent_ctx,
+        endpoint.clone(),
+        SessionSide::Agent,
+    )
+    .unwrap();
+    let mut codec = SessionCodec::new(endpoint.clone(), SessionSide::Controller).unwrap();
+    let message = SessionPayload::Rpc {
+        message: json!({"jsonrpc":"2.0","id":1,"method":"session/prompt"}),
+    };
+    codec.encode(message.clone()).unwrap();
+    kernel
+        .sys_write(
+            &endpoint.transcript,
+            &controller_ctx,
+            &codec.encode(message).unwrap(),
+            0,
+        )
+        .unwrap();
+    kernel.read_floor.store(512, Ordering::Relaxed);
+    assert_eq!(mailbox.receive(0).unwrap(), None);
+    assert!(mailbox.receive(0).unwrap_err().contains("sequence gap"));
+}
+
 /// The identity provisioning runs as. `ensure_conversation` writes the
 /// chat-list entry, and a write carries a caller — the entry types alone no
 /// longer tell the whole story now that one of them holds bytes.
@@ -57,6 +153,7 @@ fn stat(kernel: &Kernel, path: &str) -> StatResult {
 struct CountingKernel {
     inner: Kernel,
     setattrs: AtomicUsize,
+    read_floor: AtomicUsize,
 }
 
 impl CountingKernel {
@@ -64,6 +161,7 @@ impl CountingKernel {
         Self {
             inner: Kernel::new(),
             setattrs: AtomicUsize::new(0),
+            read_floor: AtomicUsize::new(0),
         }
     }
 
@@ -136,7 +234,15 @@ impl KernelSyscall for CountingKernel {
         timeout_ms: u64,
         offset: u64,
     ) -> Result<SysReadResult, KernelError> {
-        KernelSyscall::sys_read(&self.inner, path, ctx, timeout_ms, offset)
+        // Model the WAL retention floor while keeping real kernel frame I/O.
+        let floor = self.read_floor.load(Ordering::Relaxed);
+        if offset < floor as u64 {
+            return Err(KernelError::StreamTruncated(floor, offset as usize));
+        }
+        let mut result =
+            KernelSyscall::sys_read(&self.inner, path, ctx, timeout_ms, offset - floor as u64)?;
+        result.stream_next_offset = result.stream_next_offset.map(|next| next + floor);
+        Ok(result)
     }
     fn sys_write(
         &self,
