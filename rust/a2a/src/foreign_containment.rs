@@ -16,13 +16,10 @@
 //! [`crate::is_conversation_transcript_path`] — a foreign agent reaches the
 //! conversation it participates in, and nothing else.
 //!
-//! Composition: this is the sole provider `nexusd-cluster` installs. If a
-//! second policy (e.g. zone-perms) is ever added to that profile, wrap
-//! both in a composite — the kernel holds a single provider slot.
+//! The cluster composition root combines this check with any enabled
+//! relationship policy before installing the kernel's single provider slot.
 
-use std::sync::Arc;
-
-use kernel::kernel::{Kernel, KernelError, OperationContext};
+use kernel::kernel::{KernelError, OperationContext};
 use kernel::vfs_router::RouteResult;
 use kernel::{Permission, PermissionProvider};
 
@@ -84,15 +81,6 @@ impl PermissionProvider for ForeignAgentMailboxOnly {
              reader registers); '{path}' is out of scope for {permission:?}"
         )))
     }
-}
-
-/// Arm the foreign-agent containment gate. Call once at daemon boot on a
-/// profile that admits foreign agents (e.g. `nexusd-cluster`). Idempotent:
-/// re-installing replaces the slot (`ArcSwapOption`).
-pub fn install_foreign_agent_containment(kernel: &Kernel) {
-    kernel.set_permission_provider(Arc::new(
-        Box::new(ForeignAgentMailboxOnly) as Box<dyn PermissionProvider>
-    ));
 }
 
 #[cfg(test)]

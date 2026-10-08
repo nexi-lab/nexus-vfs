@@ -204,13 +204,8 @@ impl Kernel {
         provider.check(path, route, permission, ctx)
     }
 
-    /// Install the kernel's authorization policy.  See the
-    /// `permission` crate's top-level docstring for the 1-slot +
-    /// composition contract and canonical impls.
-    ///
-    /// Called at composition-root time by a profile binary that
-    /// terminates external client authorization.  `nexusd-cluster`
-    /// does not call this — the slot stays `None`, gate stays no-op.
+    /// Install the kernel's authorization policy. Profile composition roots
+    /// combine their policies into this single slot before serving requests.
     ///
     /// Overwriting the slot is safe: an in-flight check that already
     /// dereferenced the previous provider completes against it

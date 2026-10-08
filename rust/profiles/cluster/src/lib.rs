@@ -2394,12 +2394,6 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
             // admits against the other.
             tracing::warn!("foreign-CA verifier slot was already filled; keeping the first");
         }
-        // A foreign agent this verifier admits is authenticated but
-        // semi-trusted (e.g. an on-prem DGX delivered to a customer site):
-        // it authors its mailbox, but must not read/write the rest of the
-        // SaaS. Arm the least-privilege gate whenever the foreign-CA plane
-        // is live; a domestic caller (`trust_domain = None`) is unaffected.
-        a2a::install_foreign_agent_containment(&kernel);
     }
 
     // The session-mint allow-list handle, created here and bound when the

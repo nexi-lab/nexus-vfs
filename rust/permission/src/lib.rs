@@ -21,11 +21,10 @@
 //! | Identity → **permission** | [`kernel::PermissionProvider`] (kernel DI slot) | **this crate** (or unregistered ⇒ no-op) |
 //! | Peer identity | `PeerIdentity` (mTLS) | transport |
 //!
-//! `nexusd-cluster` does **not** enable the permission feature: the
-//! kernel's `Arc<dyn PermissionProvider>` slot stays `None`, and every
-//! `check_permission` call short-circuits to `Ok(())` in 3 lines of
-//! kernel hook code.  The profile that terminates external client
-//! authorization turns the feature on and installs an impl.
+//! A profile selects and composes its policies before installing the
+//! kernel's single provider slot. The cluster always enforces foreign-agent
+//! containment and can also enable relationship enforcement. This crate
+//! supplies the optional zone-grant policy.
 //!
 //! ## Composition model — 1 slot, N impls
 //!
