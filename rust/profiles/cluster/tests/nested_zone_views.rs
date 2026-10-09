@@ -6,7 +6,7 @@ mod common;
 
 use kernel::kernel::syscall::ReaddirOpts;
 use kernel::kernel::Kernel;
-use kernel::meta_store::{FileMetadata, MetaStore};
+use kernel::meta_store::{FileMetadata, MetaStore, DT_MOUNT, DT_STREAM};
 use nexus_raft::distributed_coordinator::{bootstrap_or_join_zone, RaftDistributedCoordinator};
 use nexus_raft::transport::NodeAddress;
 use nexus_raft::zone_meta_store::ZoneMetaStore;
@@ -321,4 +321,166 @@ fn nested_view_device_worker() {
     };
     assert_view(&kernel, &manager, &user, other);
     manager.shutdown();
+}
+
+/// A subtree mount limits paths, while zone membership determines which
+/// metadata is replicated. The public directory uses synthetic stream dirents;
+/// the single-entry mount also reads real replicated WAL records. No user
+/// authorization or agent runtime is installed in this topology probe.
+#[test]
+fn public_discovery_can_exclude_private_zones_but_subtree_mounts_cannot_filter_replication() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let source_dir = tempfile::tempdir().unwrap();
+    let source_addr = address();
+    let source = node(41, source_dir.path(), &source_addr);
+    rt.block_on(async {
+        for zone in ["root", "discovery", "data-alice", "data-bob"] {
+            source
+                .create_zone_async(zone, vec![format!("41@{source_addr}")])
+                .await
+                .unwrap()
+                .consensus_node()
+                .campaign()
+                .await
+                .unwrap();
+        }
+    });
+    for name in ["alice", "bob"] {
+        seed_agent(&source, name);
+        let public_path = format!("/agents/{name}/chat-with-me");
+        store(&source, "discovery")
+            .put(
+                &public_path,
+                FileMetadata {
+                    path: public_path.clone(),
+                    entry_type: DT_STREAM,
+                    zone_id: Some("discovery".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    // An alternative layout: the public child is in the same data zone as
+    // the agent's private sessions. Project ONLY that child onto the peer.
+    let child_path = "/agents/alice/public/chat-with-me";
+    store(&source, "data-alice")
+        .put(
+            child_path,
+            FileMetadata {
+                path: child_path.into(),
+                entry_type: DT_STREAM,
+                zone_id: Some("data-alice".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    source
+        .mount_subtree(
+            "root",
+            "/agents/alice",
+            "data-alice",
+            "/agents/alice",
+            false,
+        )
+        .unwrap();
+    let source_kernel = build_kernel(&source, &source_addr);
+    let inbox = "/agents/alice/chat-with-me";
+    a2a::ensure_mailbox_stream(source_kernel.as_ref(), inbox).unwrap();
+    let context = kernel::kernel::OperationContext::new("alice", "root", true, None, true);
+    let messages: [&[u8]; 2] = [
+        br#"{"from":"bob","to":"alice","body":"only for alice"}"#,
+        br#"{"from":"carol","to":"alice","body":"also only for alice"}"#,
+    ];
+    for message in messages {
+        source_kernel
+            .stream_write_nowait(inbox, message, &context)
+            .unwrap();
+    }
+    assert_eq!(
+        source_kernel
+            .stream_read_at_blocking(inbox, 0, 1_000)
+            .unwrap()
+            .0,
+        messages[0]
+    );
+
+    for (id, zone, mount, subtree) in [
+        (42, "discovery", "/agents", "/agents"),
+        (43, "data-alice", "/agents/alice", "/agents/alice/public"),
+        (
+            44,
+            "data-alice",
+            "/agents/alice/chat-with-me",
+            "/agents/alice/chat-with-me",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = address();
+        let target = node(id, dir.path(), &addr);
+        rt.block_on(async {
+            target
+                .create_zone_async("root", vec![format!("{id}@{addr}")])
+                .await
+                .unwrap()
+                .consensus_node()
+                .campaign()
+                .await
+                .unwrap();
+        });
+        join(&target, zone, id, &addr, &source_addr);
+        target
+            .mount_subtree("root", mount, zone, subtree, false)
+            .unwrap();
+        let kernel = build_kernel(&target, &addr);
+        let listed = kernel.sys_readdir("/agents/alice", "root", false, ReaddirOpts::default());
+        if id == 44 {
+            assert_eq!(listed, vec![(inbox.into(), DT_MOUNT)]);
+            let stat = kernel.sys_stat(inbox, "root").unwrap();
+            assert_eq!(stat.entry_type, DT_STREAM);
+            assert!(!stat.is_directory);
+            // A single stream can be mounted, but all its senders' records
+            // remain readable by the replica. Mounting is not append-only access.
+            let mut offset = 0;
+            for expected in messages {
+                let (data, next) = kernel
+                    .stream_read_at_blocking(inbox, offset, 1_000)
+                    .unwrap();
+                assert_eq!(data, expected);
+                offset = next;
+            }
+        } else {
+            assert_eq!(
+                listed,
+                vec![("/agents/alice/chat-with-me".into(), DT_STREAM)]
+            );
+        }
+        assert!(kernel.sys_stat("/agents/alice/memory.md", "root").is_none());
+        assert!(kernel
+            .sys_stat("/sessions/sid-alice/transcript.jsonl", "root")
+            .is_none());
+
+        let names: Vec<_> = kernel
+            .sys_readdir("/agents", "root", false, ReaddirOpts::default())
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+        if zone == "discovery" {
+            assert_eq!(names, vec!["/agents/alice", "/agents/bob"]);
+            assert!(!target.hosts_zone("data-alice"));
+            assert!(!target.hosts_zone("data-bob"));
+        } else {
+            assert_eq!(names, vec!["/agents/alice"]);
+            // Hidden from the mounted view, but PRESENT in the target's Raft
+            // state: a valid narrow subtree mount is not a privacy boundary.
+            let replica = store(&target, "data-alice");
+            assert!(replica.get("/agents/alice/memory.md").unwrap().is_some());
+            assert!(replica
+                .get("/sessions/sid-alice/transcript.jsonl")
+                .unwrap()
+                .is_some());
+        }
+        target.shutdown();
+    }
+    source.shutdown();
 }
