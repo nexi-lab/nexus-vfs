@@ -238,6 +238,18 @@ impl Kernel {
     ) -> Result<SysReadResult, KernelError> {
         let not_found = || KernelError::FileNotFound(path.to_string());
 
+        // Directory links are namespace aliases, including when the leaf does
+        // not exist yet. Re-enter the gated syscall with the SAME identity so
+        // both the caller's spelling and the target get permission/hooks.
+        if let Some(target) = self.directory_link_target(path, &ctx.zone_id)? {
+            if max_link_hops == 0 {
+                return Err(KernelError::PermissionDenied(format!(
+                    "DT_LINK chain rejected (ELOOP) at {path}"
+                )));
+            }
+            return self.sys_read_single(&target, ctx, max_link_hops - 1, timeout_ms, offset);
+        }
+
         // 2. Route (pure Rust LPM)
         let route = match self.vfs_router.route(path, &ctx.zone_id) {
             Some(r) => r,
@@ -716,6 +728,21 @@ impl Kernel {
         // `check_permission(Write)` first, then the hooks.
         let replacement = self.apply_mutating_write_hooks(path, ctx, content)?;
         let effective_content: &[u8] = replacement.as_deref().unwrap_or(content);
+
+        if let Some(target) = self.directory_link_target(path, &ctx.zone_id)? {
+            if max_link_hops == 0 {
+                return Err(KernelError::PermissionDenied(format!(
+                    "DT_LINK chain rejected (ELOOP) at {path}"
+                )));
+            }
+            return self.sys_write_with_link_depth(
+                &target,
+                ctx,
+                effective_content,
+                offset,
+                max_link_hops - 1,
+            );
+        }
 
         // 2. Route (check write access)
         let route = match self.vfs_router.route(path, &ctx.zone_id) {
@@ -3039,6 +3066,24 @@ impl Kernel {
                     .map(|r| Err(KernelError::InvalidPath(r.path.clone())))
                     .collect();
             }
+        }
+
+        // Links need the single-path recursion: it gates both spellings and
+        // commits metadata at the target. The batch fast path writes directly
+        // to its pre-routed backend and cannot preserve that contract.
+        if reqs.iter().any(|req| {
+            self.directory_link_target(&req.path, &ctx.zone_id)
+                .map_or(true, |target| target.is_some())
+                || self
+                    .sys_stat(&req.path, &ctx.zone_id)
+                    .is_some_and(|entry| entry.entry_type == crate::meta_store::DT_LINK)
+        }) {
+            return reqs
+                .iter()
+                .map(|req| {
+                    self.sys_write_with_link_depth(&req.path, ctx, &req.content, req.offset, 1)
+                })
+                .collect();
         }
 
         // 1b. Permission gate + native pre-hooks per item. The previous

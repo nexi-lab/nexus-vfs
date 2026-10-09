@@ -1468,6 +1468,38 @@ impl Kernel {
         Ok(Some(target))
     }
 
+    /// Resolve the first DT_LINK in the ancestors of a path. The caller must
+    /// gate the original path first, then gate the returned path with the same
+    /// identity and consume a link hop. The leaf is excluded: stat/unlink keep
+    /// their lstat semantics, and read/write handle leaf links separately.
+    pub(crate) fn directory_link_target(
+        &self,
+        path: &str,
+        zone_id: &str,
+    ) -> Result<Option<String>, KernelError> {
+        for (end, _) in path.match_indices('/').skip(1) {
+            let ancestor = &path[..end];
+            let entry = match self.vfs_router.route(ancestor, zone_id) {
+                Some(route) => self
+                    .with_metastore_route(&route, |ms| ms.get(ancestor))
+                    .transpose()
+                    .map_err(|e| KernelError::IOError(format!("read link at {ancestor}: {e:?}")))?
+                    .flatten(),
+                None => self
+                    .metastore_get(ancestor)
+                    .map_err(|e| KernelError::IOError(format!("read link at {ancestor}: {e:?}")))?,
+            };
+            if let Some(entry) = entry {
+                if let Some(target) = Self::dt_link_target(ancestor, &entry)? {
+                    let resolved = format!("{}{}", target.trim_end_matches('/'), &path[end..]);
+                    validate_path_fast(&resolved)?;
+                    return Ok(Some(resolved));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Clone the shared VFSRouter ``Arc`` for federation apply-event
     /// callbacks that need to look up mount-points-for-zone at
     /// invalidation time. The cache itself lives as long as *any*
