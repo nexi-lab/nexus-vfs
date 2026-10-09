@@ -114,7 +114,7 @@ async fn capabilities_follow_the_loaded_plugin_without_disk_or_embedding_io() {
             ],
         );
         daemon
-            .wait_for_log("Static topology applied", BUDGET)
+            .wait_for_log("VFS data plane ready", BUDGET)
             .await
             .unwrap();
         std::fs::write(&stale_path, stale).unwrap();
