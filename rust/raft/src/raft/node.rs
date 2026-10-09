@@ -1863,8 +1863,9 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                     #[cfg(not(all(feature = "grpc", has_protos)))]
                     let leader_hint = None;
                     tracing::debug!(
-                        node_id = self.config.id,
-                        leader_id = self.raw_node.raft.leader_id,
+                        local_node_id = self.config.id,
+                        leader_node_id = self.raw_node.raft.leader_id,
+                        leader_addr = leader_hint.as_deref().unwrap_or("unknown"),
                         term = self.raw_node.raft.term,
                         "leadership changed before local proposal; nothing submitted"
                     );
