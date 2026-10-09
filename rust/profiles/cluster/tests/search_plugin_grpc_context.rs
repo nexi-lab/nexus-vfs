@@ -163,8 +163,6 @@ async fn metadata_and_delegation_survive_the_real_daemon_and_signed_cdylib() {
     assert_eq!(indexed.indexed_count, 1);
     let error = agent.index_documents(batch.clone()).await.unwrap_err();
     assert_eq!(error.code(), Code::PermissionDenied);
-    let error = agent.query(query("widget external")).await.unwrap_err();
-    assert_eq!(error.code(), Code::PermissionDenied);
     let response = node
         .query(query("widget external"))
         .await
@@ -256,6 +254,35 @@ async fn metadata_and_delegation_survive_the_real_daemon_and_signed_cdylib() {
         calls.load(Ordering::SeqCst),
         2,
         "ordinary calls keep expanding after refusals"
+    );
+
+    // This fixture leaves the Kernel's file policy open. Certificate agents
+    // must have the same read access through VFS and Search; their lack of
+    // zone tenancy does not impose a separate Search permission policy.
+    let mut agent_vfs = common::Vfs::connect_mtls(port, &ca, &agent_cert, &agent_key, BUDGET).await;
+    assert_eq!(
+        agent_vfs.read_file("/docs/needle.md", "").await.unwrap(),
+        b"widget external internal after"
+    );
+    let response = agent
+        .query(query("widget external"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(response.error.is_none(), "{response:?}");
+    assert_eq!(
+        response
+            .results
+            .iter()
+            .map(|hit| hit.path.as_str())
+            .collect::<Vec<_>>(),
+        ["/docs/needle.md"]
+    );
+    let mut invalid = query("widget");
+    invalid.auth_token = "sk-never-minted".into();
+    assert_eq!(
+        agent.query(invalid).await.unwrap_err().code(),
+        Code::Unauthenticated
     );
 }
 
