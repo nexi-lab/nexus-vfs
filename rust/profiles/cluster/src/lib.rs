@@ -33,6 +33,7 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 mod auth_posture;
 mod authorization;
+mod search_capabilities;
 use auth_posture::{AuthPosture, AuthPostureInputs};
 use kernel::abc::object_store::ObjectStore;
 use kernel::hal::object_store_provider::set_provider;
@@ -3381,6 +3382,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     kernel
         .bring_up_services(service_decls)
         .map_err(|e| anyhow::anyhow!("bring up services: {e}"))?;
+    search_capabilities::install(&zm, &kernel);
 
     // (2) Arm the cross-machine stream-wakeup observer PER ZONE: a
     // replicated `AppendStreamEntry` (a transcript write on a

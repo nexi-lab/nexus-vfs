@@ -17,7 +17,7 @@ path = "src/main.rs"
 [features]
 default = []
 rebac = ["dep:nexus-rebac"]
-http-api = ["rebac", "dep:nexus-http-api", "nexus-http-api/rebac", "dep:nexus-search-common"]
+http-api = ["rebac", "dep:nexus-http-api", "nexus-http-api/rebac", "nexus-search-common/transport"]
 
 # Model egress through the VFS: mount an LLM connector, and a model call
 # becomes a write that crosses `Kernel::apply_mutating_write_hooks` — the one
@@ -79,9 +79,10 @@ egress-gate = ["dep:egress-gate"]
 egress-gate-presidio = ["egress-gate", "egress-gate/presidio"]
 
 [dependencies]
+serde_json = { workspace = true }
 nexus-rebac = { path = "../../rebac", optional = true }
 nexus-http-api = { path = "../../http-api", optional = true }
-nexus-search-common = { path = "../../search-common", optional = true, features = ["transport"] }
+nexus-search-common = { path = "../../search-common" }
 # raft owns federation orchestration (ZoneManager, bootstrap_tls, etc.).
 # Only the grpc feature — that is all this binary needs and dropping the
 # others keeps the stripped binary small.
@@ -153,8 +154,6 @@ base64 = "0.22"
 axum = "0.8"
 # wire_durable_metastore tests open real redb files in a temp data dir.
 tempfile = "3"
-# The live LLM test builds a chat-completion request body. Test-only.
-serde_json = { workspace = true }
 # The remote agent-mint gate test parses minted cert PEM to DER to feed
 # `peer_identity::from_der`. Test-only, so the shipped binary carries no pem dep.
 pem = "3"
