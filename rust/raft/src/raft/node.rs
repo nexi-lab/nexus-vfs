@@ -1320,6 +1320,13 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             Ok(rx) => {
                 // Leader path: wait for commit
                 match tokio::time::timeout(Duration::from_secs(PROPOSAL_TIMEOUT_SECS), rx).await {
+                    // The actor may process a leadership change after the handle
+                    // checked its cached role. A definite pre-submit refusal can
+                    // use the normal leader-forwarding path without replaying a
+                    // command that may already have committed.
+                    Ok(Ok(Err(RaftError::NotLeader { .. }))) => {
+                        self.forward_to_leader(command).await
+                    }
                     Ok(Ok(result)) => result,
                     Ok(Err(_)) => Err(RaftError::ProposalDropped),
                     Err(_) => Err(RaftError::Timeout(PROPOSAL_TIMEOUT_SECS)),
@@ -1839,6 +1846,31 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                 }
             }
             RaftMsg::Propose { data, tx, .. } => {
+                // The handle's leader check precedes this queue boundary. Check
+                // again against the actor's actual role before allocating an ID
+                // or calling RawNode::propose, which can otherwise reject a
+                // queued write with the unhelpful generic "proposal dropped".
+                if !self.is_leader() {
+                    self.update_cached_status();
+                    #[cfg(all(feature = "grpc", has_protos))]
+                    let leader_hint = self.peer_map.as_ref().and_then(|peers| {
+                        peers
+                            .read()
+                            .ok()?
+                            .get(&self.raw_node.raft.leader_id)
+                            .map(|address| address.to_operator_str())
+                    });
+                    #[cfg(not(all(feature = "grpc", has_protos)))]
+                    let leader_hint = None;
+                    tracing::debug!(
+                        node_id = self.config.id,
+                        leader_id = self.raw_node.raft.leader_id,
+                        term = self.raw_node.raft.term,
+                        "leadership changed before local proposal; nothing submitted"
+                    );
+                    let _ = tx.send(Err(RaftError::NotLeader { leader_hint }));
+                    return;
+                }
                 // Generate the real proposal ID here in the driver
                 let id = self.proposal_id.fetch_add(1, Ordering::SeqCst);
 
