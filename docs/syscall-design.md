@@ -164,6 +164,28 @@ inode types all flow through it:
 - **Idempotent open**: Same `entry_type` on existing path recovers the buffer (pipes/streams)
 - **`/__sys__/`**: Kernel management namespace (service register, config, etc.)
 
+#### DT_STREAM identity across mounts
+
+A stream is identified by its owning zone and its path within that zone.
+Different mount spellings share one WAL, offset sequence, local backend and
+reader notification. Equal paths in different zones remain separate. Routing
+comes from `VFSRouter`; stream operations retain the caller's zone, and link
+targets and backing paths pass through authorization with the same identity.
+Write hooks run on the backing path as well, including A2A sender stamping.
+
+WAL keys remain zone-relative paths; the local registry's zone-qualified key
+is never persisted. Raft apply observers receive the owning zone explicitly
+and only wake local waiters. They do not read metadata or propose commands.
+Cold segment addresses include the zone when the blob backend uses paths.
+
+Older writers could append under a visible mount spelling instead of the
+backing path. When opening a stream, records under another currently mounted
+spelling cause an explicit migration error. They are not silently merged,
+discarded or replaced by an empty log. Recovering such histories must preserve
+their offsets and reader positions. This check does not discover orphaned WALs
+whose old mounts have already been removed; upgrade inventories must include
+those paths. Quiesce older writers before introducing renamed stream mounts.
+
 ### 4.4 sys_lock / sys_unlock: Advisory locks (POSIX fcntl)
 
 Exposed as kernel syscalls (not service-layer). Two syscalls cover all lock

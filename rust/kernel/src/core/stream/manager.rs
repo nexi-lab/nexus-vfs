@@ -1,7 +1,7 @@
 //! StreamManager — owns DT_STREAM buffer registry with blocking wait.
 //!
-//! `DashMap<String, Arc<dyn StreamBackend>>` enables heterogeneous backends
-//! (memory, shared memory, future gRPC proxy).
+//! Opaque registry keys select heterogeneous backends (memory, shared memory,
+//! WAL). Each entry publishes its backend and notification together.
 //!
 //! Blocking read uses `parking_lot::Condvar` so the waiter parks
 //! without spinning; `StreamNotify` wakes blocked readers after each
@@ -24,7 +24,8 @@ use std::time::Duration;
 /// Deliberately opaque: the manager stays a pure registry and never learns
 /// about the metastore / raft / zones — that knowledge lives entirely in the
 /// injected closure, so no upward dependency leaks into `core::stream`.
-type StreamMaterializer = Box<dyn Fn(&str) -> Option<Arc<dyn StreamBackend>> + Send + Sync>;
+type StreamMaterializer =
+    Box<dyn Fn(&str) -> Result<Option<Arc<dyn StreamBackend>>, String> + Send + Sync>;
 
 // ---------------------------------------------------------------------------
 // Per-stream notification
@@ -89,10 +90,15 @@ impl StreamNotify {
 // StreamManager
 // ---------------------------------------------------------------------------
 
+/// Backend and wake state are published atomically as one registry entry.
+struct StreamSlot {
+    backend: Arc<dyn StreamBackend>,
+    notify: Arc<StreamNotify>,
+}
+
 /// Registry of active DT_STREAM buffers with blocking wait support.
 pub struct StreamManager {
-    buffers: DashMap<String, Arc<dyn StreamBackend>>,
-    notify: DashMap<String, Arc<StreamNotify>>,
+    buffers: DashMap<String, StreamSlot>,
     /// Miss-materializer injected once at federation boot. `None` on a
     /// non-federated kernel, so [`Self::resolve`] is then behaviourally
     /// identical to a bare `buffers.get` — the lazy path only ever affects
@@ -110,7 +116,6 @@ impl StreamManager {
     pub fn new() -> Self {
         Self {
             buffers: DashMap::new(),
-            notify: DashMap::new(),
             materializer: OnceLock::new(),
         }
     }
@@ -136,9 +141,9 @@ impl StreamManager {
     /// Hot path (hit) is inlined to a single `DashMap` lookup — zero call
     /// overhead vs. the pre-chokepoint code; the cold miss is out-of-line.
     #[inline]
-    fn resolve(&self, path: &str) -> Option<Arc<dyn StreamBackend>> {
+    fn resolve(&self, path: &str) -> Result<Option<Arc<dyn StreamBackend>>, StreamManagerError> {
         if let Some(b) = self.buffers.get(path) {
-            return Some(Arc::clone(b.value()));
+            return Ok(Some(Arc::clone(&b.backend)));
         }
         self.materialize_miss(path)
     }
@@ -149,23 +154,24 @@ impl StreamManager {
     /// `#[inline(never)]` so its bulk never bloats the inlined hot path.
     #[cold]
     #[inline(never)]
-    fn materialize_miss(&self, path: &str) -> Option<Arc<dyn StreamBackend>> {
-        let backend = (self.materializer.get()?)(path)?;
+    fn materialize_miss(
+        &self,
+        path: &str,
+    ) -> Result<Option<Arc<dyn StreamBackend>>, StreamManagerError> {
+        let Some(materializer) = self.materializer.get() else {
+            return Ok(None);
+        };
+        let Some(backend) = materializer(path).map_err(StreamManagerError::Resolve)? else {
+            return Ok(None);
+        };
         // Ignore `Exists`: a concurrent resolve may have registered first.
         let _ = self.register(path, backend);
-        self.buffers.get(path).map(|r| Arc::clone(r.value()))
+        Ok(self.buffers.get(path).map(|r| Arc::clone(&r.backend)))
     }
 
     /// Create a new in-memory stream backend and register it.
     pub fn create(&self, path: &str, capacity: usize) -> Result<(), StreamManagerError> {
-        if self.buffers.contains_key(path) {
-            return Err(StreamManagerError::Exists(path.to_string()));
-        }
-        let buf = MemoryStreamBackend::new(capacity);
-        self.buffers.insert(path.to_string(), Arc::new(buf));
-        self.notify
-            .insert(path.to_string(), Arc::new(StreamNotify::new()));
-        Ok(())
+        self.register(path, Arc::new(MemoryStreamBackend::new(capacity)))
     }
 
     /// Register an external backend (SHM, gRPC, etc.).
@@ -174,23 +180,26 @@ impl StreamManager {
         path: &str,
         backend: Arc<dyn StreamBackend>,
     ) -> Result<(), StreamManagerError> {
-        if self.buffers.contains_key(path) {
-            return Err(StreamManagerError::Exists(path.to_string()));
+        match self.buffers.entry(path.to_owned()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                Err(StreamManagerError::Exists(path.to_owned()))
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(StreamSlot {
+                    backend,
+                    notify: Arc::new(StreamNotify::new()),
+                });
+                Ok(())
+            }
         }
-        self.buffers.insert(path.to_string(), backend);
-        self.notify
-            .insert(path.to_string(), Arc::new(StreamNotify::new()));
-        Ok(())
     }
 
     /// Destroy a stream — close, notify waiters, and remove from registry.
     pub fn destroy(&self, path: &str) -> Result<(), StreamManagerError> {
         match self.buffers.remove(path) {
             Some((_, buf)) => {
-                buf.close();
-                if let Some((_, n)) = self.notify.remove(path) {
-                    n.wake_all_readers();
-                }
+                buf.backend.close();
+                buf.notify.wake_all_readers();
                 Ok(())
             }
             None => Err(StreamManagerError::NotFound(path.to_string())),
@@ -201,10 +210,8 @@ impl StreamManager {
     pub fn close(&self, path: &str) -> Result<(), StreamManagerError> {
         match self.buffers.get(path) {
             Some(buf) => {
-                buf.close();
-                if let Some(n) = self.notify.get(path) {
-                    n.wake_all_readers();
-                }
+                buf.backend.close();
+                buf.notify.wake_all_readers();
                 Ok(())
             }
             None => Err(StreamManagerError::NotFound(path.to_string())),
@@ -233,12 +240,12 @@ impl StreamManager {
         data: &[u8],
     ) -> Result<usize, StreamManagerError> {
         let buf = self
-            .resolve(path)
+            .resolve(path)?
             .ok_or_else(|| StreamManagerError::NotFound(path.to_string()))?;
         let offset = buf.push(data).map_err(StreamManagerError::Backend)?;
         // Wake blocked readers — see StreamNotify::wake_all_readers doc.
-        if let Some(notify) = self.notify.get(path) {
-            notify.wake_all_readers();
+        if let Some(notify) = self.buffers.get(path) {
+            notify.notify.wake_all_readers();
         }
         Ok(offset)
     }
@@ -262,9 +269,9 @@ impl StreamManager {
     /// absent slot means nothing is parked to wake, and a later reader takes
     /// the fast path over the already-committed data.
     pub fn wake_waiters(&self, path: &str) -> bool {
-        match self.notify.get(path) {
+        match self.buffers.get(path) {
             Some(n) => {
-                n.wake_all_readers();
+                n.notify.wake_all_readers();
                 true
             }
             None => false,
@@ -284,7 +291,7 @@ impl StreamManager {
     /// a waker never has to know whether anyone is listening, and
     /// [`Self::wake_waiters`] is already a safe no-op when nobody is.
     pub fn parked_readers(&self, path: &str) -> usize {
-        self.notify.get(path).map_or(0, |n| n.parked())
+        self.buffers.get(path).map_or(0, |n| n.notify.parked())
     }
 
     /// Read one message at byte offset. Returns (data, next_offset) or None if empty.
@@ -294,7 +301,7 @@ impl StreamManager {
         offset: usize,
     ) -> Result<Option<(Vec<u8>, usize)>, StreamManagerError> {
         let buf = self
-            .resolve(path)
+            .resolve(path)?
             .ok_or_else(|| StreamManagerError::NotFound(path.to_string()))?;
         match buf.read_at(offset) {
             Ok((data, next)) => Ok(Some((data, next))),
@@ -314,13 +321,14 @@ impl StreamManager {
         timeout_ms: u64,
     ) -> Result<(Vec<u8>, usize), StreamManagerError> {
         let buf = self
-            .resolve(path)
+            .resolve(path)?
             .ok_or_else(|| StreamManagerError::NotFound(path.to_string()))?;
         let notify = Arc::clone(
-            self.notify
+            &self
+                .buffers
                 .get(path)
                 .ok_or_else(|| StreamManagerError::NotFound(path.to_string()))?
-                .value(),
+                .notify,
         );
 
         let timeout = Duration::from_millis(timeout_ms);
@@ -373,7 +381,7 @@ impl StreamManager {
         count: usize,
     ) -> Result<(Vec<Vec<u8>>, usize), StreamManagerError> {
         let buf = self
-            .resolve(path)
+            .resolve(path)?
             .ok_or_else(|| StreamManagerError::NotFound(path.to_string()))?;
         buf.read_batch(offset, count)
             .map_err(StreamManagerError::Backend)
@@ -393,7 +401,7 @@ impl StreamManager {
     /// producer finishes pumping tokens.
     pub fn collect_all_payloads(&self, path: &str) -> Result<Vec<u8>, StreamManagerError> {
         let buf = self
-            .resolve(path)
+            .resolve(path)?
             .ok_or_else(|| StreamManagerError::NotFound(path.to_string()))?;
         let tail = buf.tail_offset();
         let mut out = Vec::with_capacity(tail);
@@ -415,7 +423,7 @@ impl StreamManager {
     /// through the chokepoint, so a cold sys_read/sys_write of a peer-created
     /// wal stream materializes its local handle instead of missing.
     pub fn get(&self, path: &str) -> Option<Arc<dyn StreamBackend>> {
-        self.resolve(path)
+        self.resolve(path).ok().flatten()
     }
 
     /// Current tail (write offset) of a registered stream.
@@ -424,7 +432,7 @@ impl StreamManager {
     /// this for the seek-to-end pattern: `cursor = tail(path)` then
     /// `read_at(path, cursor)` skips all history and blocks for new data.
     pub fn tail(&self, path: &str) -> Option<usize> {
-        self.resolve(path).map(|b| b.tail_offset())
+        self.resolve(path).ok().flatten().map(|b| b.tail_offset())
     }
 
     /// Unix-ms of the last successful append to the stream at `path`.
@@ -433,7 +441,10 @@ impl StreamManager {
     /// wall-clock time — see [`StreamBackend::last_append_ms`]).
     /// Surfaced by `sys_stat` as the stream's `modified_at_ms`.
     pub fn last_append_ms(&self, path: &str) -> Option<i64> {
-        self.resolve(path).and_then(|b| b.last_append_ms())
+        self.resolve(path)
+            .ok()
+            .flatten()
+            .and_then(|b| b.last_append_ms())
     }
 
     /// Append all entries from `from` (starting at `from_offset`) into `to`.
@@ -452,10 +463,10 @@ impl StreamManager {
         from_offset: usize,
     ) -> Result<(usize, usize), StreamManagerError> {
         let src = self
-            .resolve(from)
+            .resolve(from)?
             .ok_or_else(|| StreamManagerError::NotFound(from.to_string()))?;
         let dst = self
-            .resolve(to)
+            .resolve(to)?
             .ok_or_else(|| StreamManagerError::NotFound(to.to_string()))?;
 
         let mut offset = from_offset;
@@ -474,8 +485,8 @@ impl StreamManager {
         }
 
         if forwarded > 0 {
-            if let Some(notify) = self.notify.get(to) {
-                notify.wake_readers();
+            if let Some(notify) = self.buffers.get(to) {
+                notify.notify.wake_readers();
             }
         }
 
@@ -490,10 +501,8 @@ impl StreamManager {
     /// Close all streams (shutdown).
     pub fn close_all(&self) {
         for entry in self.buffers.iter() {
-            entry.value().close();
-        }
-        for entry in self.notify.iter() {
-            entry.wake_all_readers();
+            entry.backend.close();
+            entry.notify.wake_all_readers();
         }
     }
 }
@@ -509,6 +518,7 @@ pub enum StreamManagerError {
     Closed(String),
     WouldBlock(String),
     Backend(StreamError),
+    Resolve(String),
 }
 
 // ---------------------------------------------------------------------------

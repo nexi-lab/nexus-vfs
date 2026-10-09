@@ -539,8 +539,8 @@ async fn retention_trims_old_segments_and_reads_below_earliest_are_truncated() {
     drop(founder);
 }
 
-/// Count sealed cold-segment blobs on disk: files under a `__seg__` directory
-/// (the `{stream}/__seg__/{base}` seal layout, the SSOT in `cold_segment.rs`).
+/// Count sealed cold-segment blobs on disk under `__stream_segments__`.
+/// The layout includes the owning zone, stream path and segment base.
 /// The physical-storage proof for retention — a trimmed segment's blob is gone
 /// from here once the trim-GC observer reclaims it.
 fn count_seg_blobs(dir: &std::path::Path) -> usize {
@@ -550,7 +550,10 @@ fn count_seg_blobs(dir: &std::path::Path) -> usize {
             let p = e.path();
             if p.is_dir() {
                 n += count_seg_blobs(&p);
-            } else if p.to_string_lossy().contains("__seg__") {
+            } else if p
+                .components()
+                .any(|part| part.as_os_str() == "__stream_segments__")
+            {
                 n += 1;
             }
         }

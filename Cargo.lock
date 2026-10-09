@@ -2515,6 +2515,7 @@ dependencies = [
  "nexus-search-common",
  "nexus-search-plugin",
  "pem",
+ "permission",
  "prost",
  "raft 0.1.0",
  "rand 0.10.1",
@@ -2898,7 +2899,6 @@ name = "permission"
 version = "0.1.0"
 dependencies = [
  "contracts",
- "dashmap",
  "kernel",
  "tempfile",
 ]

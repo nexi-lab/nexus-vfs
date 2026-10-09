@@ -409,9 +409,9 @@ impl Permission {
 ///   present to avoid a redundant `VFSRouter::route` call — the
 ///   `check_permission_with_route` kernel hook wires this per-syscall
 ///   so path→zone extraction happens exactly once per request.
-/// * Runs on every syscall on gate-armed profiles, so impls SHOULD
-///   memoise repeat hits (e.g. via `permission::PermissionLeaseCache`)
-///   — the hot-path budget is on the order of hundreds of nanoseconds.
+/// * Runs on every syscall on gate-armed profiles. Checks must use the
+///   current identity, grants, owning zone and requested permission;
+///   the hot-path budget is on the order of hundreds of nanoseconds.
 pub trait PermissionProvider: Send + Sync {
     fn check(
         &self,

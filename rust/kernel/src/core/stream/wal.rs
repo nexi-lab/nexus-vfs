@@ -40,6 +40,11 @@ use crate::stream::{StreamBackend, StreamError};
 /// it — the two are round-trip-tested together.
 pub const WAL_STREAM_KEY_PREFIX: &str = "/__wal_stream__/";
 
+/// Durable key prefix for a stream in its owning store.
+pub fn wal_stream_prefix(stream_id: &str) -> String {
+    format!("{WAL_STREAM_KEY_PREFIX}{stream_id}/")
+}
+
 /// Recover the watched file path from a wal-stream entry key OR stream prefix.
 ///
 /// `stream_id` is the DT_STREAM's path (the path a `sys_watch` is parked on).
@@ -241,7 +246,7 @@ impl WalStreamCore {
     /// unbounded-in-raft behaviour). Used by non-federated callers and by every
     /// existing unit test.
     pub fn new(store: Arc<dyn MetaStore>, stream_id: String) -> Self {
-        let prefix = format!("{WAL_STREAM_KEY_PREFIX}{stream_id}/");
+        let prefix = wal_stream_prefix(&stream_id);
         Self {
             store,
             stream_id,
@@ -268,7 +273,7 @@ impl WalStreamCore {
         policy: SealPolicy,
         retention: u64,
     ) -> Self {
-        let prefix = format!("{WAL_STREAM_KEY_PREFIX}{stream_id}/");
+        let prefix = wal_stream_prefix(&stream_id);
         Self {
             store,
             stream_id,

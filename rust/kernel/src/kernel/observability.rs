@@ -111,6 +111,19 @@ impl Kernel {
     /// sys_watch — block until a file event matching the pattern arrives, or timeout.
     /// Tier 1 syscall (inotify equivalent). Returns matching FileEvent or None on timeout.
     pub fn sys_watch(&self, pattern: &str, timeout_ms: u64) -> Option<FileEvent> {
+        if self
+            .sys_stat(pattern, contracts::ROOT_ZONE_ID)
+            .is_some_and(|entry| entry.entry_type == crate::meta_store::DT_STREAM)
+        {
+            let key = self.stream_address(pattern, contracts::ROOT_ZONE_ID).key();
+            return self
+                .file_watches
+                .wait_for_event(&key, timeout_ms)
+                .map(|mut event| {
+                    event.path = pattern.to_owned();
+                    event
+                });
+        }
         self.file_watches.wait_for_event(pattern, timeout_ms)
     }
 
@@ -156,6 +169,20 @@ impl Kernel {
     /// applied. Cheap + non-blocking (one `DashMap` get + a condvar notify);
     /// a no-op when no reader is parked on `path`.
     pub fn wake_stream_waiters(&self, path: &str) {
-        self.stream_manager.wake_waiters(path);
+        self.stream_manager
+            .wake_waiters(&self.stream_address(path, contracts::ROOT_ZONE_ID).key());
+    }
+
+    /// Apply-side notification: `path` is already relative to the committed zone.
+    /// Never route or read the metastore while the Raft apply lock is held.
+    pub fn wake_stream_waiters_in_zone(&self, path: &str, zone: &str) {
+        let key = super::StreamAddress {
+            zone: zone.to_owned(),
+            path: path.to_owned(),
+        }
+        .key();
+        self.stream_manager.wake_waiters(&key);
+        self.file_watches
+            .notify_match(&FileEvent::new(FileEventType::FileWrite, &key));
     }
 }

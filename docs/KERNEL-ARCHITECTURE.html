@@ -362,7 +362,7 @@ graph LR
     class G gate
 </pre>
 
-<p>The kernel holds zero authorization logic. Composition model: <strong>1 kernel slot, N impls composed inside a single provider that fans out</strong>. Canonical impl <code>ZonePermsProvider</code> uses inheritance-aware <code>PermissionLeaseCache</code>; a parent-directory lease covers child files. See &sect;2.4.1 for how the gate fits into the dispatch pipeline.</p>
+<p>The kernel holds zero authorization logic. Composition model: <strong>1 kernel slot, N impls composed inside a single provider that fans out</strong>. Canonical impl <code>ZonePermsProvider</code> checks the current request grants against the routed owning zone and requested operation. A successful read does not grant writes or access to another zone. See &sect;2.4.1 for how the gate fits into the dispatch pipeline.</p>
 
 <p><strong>Two policy slots, one shape.</strong> Authentication (<em>who</em>) and authorization (<em>may</em>) are <strong>separate</strong> slots &mdash; each a no-op default swapped for an injected impl, composed independently. A caller never plugs into &ldquo;the auth slot&rdquo;; it plugs into one of these two.</p>
 <table>

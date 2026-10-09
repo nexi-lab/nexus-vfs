@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use crate::extensions::llm_streaming::StreamSink;
-use crate::meta_store::{DT_PIPE, DT_STREAM};
+use crate::meta_store::DT_PIPE;
 
 use super::{pipe_mgr_err, stream_mgr_err, Kernel, KernelError, OperationContext};
 
@@ -120,34 +120,35 @@ impl Kernel {
 
     /// Create a stream buffer in the IPC registry.
     pub fn create_stream(&self, path: &str, capacity: usize) -> Result<(), KernelError> {
+        let address = self.stream_address(path, contracts::ROOT_ZONE_ID);
         self.stream_manager
-            .create(path, capacity)
+            .create(&address.key(), capacity)
             .map_err(stream_mgr_err)?;
 
-        let meta = self.build_metadata(
-            path,
-            contracts::ROOT_ZONE_ID,
-            DT_STREAM,
-            capacity as u64,
-            None,
-            0,
-            1,
-            None,
-            None,
-            None,
-        );
-        self.metastore_put(path, meta)?;
+        self.write_stream_inode(path, capacity)?;
 
         Ok(())
     }
 
     /// Destroy a stream buffer.
     pub fn destroy_stream(&self, path: &str) -> Result<(), KernelError> {
-        self.stream_manager.destroy(path).map_err(stream_mgr_err)?;
+        self.destroy_stream_in_zone(path, contracts::ROOT_ZONE_ID)
+    }
 
-        self.metastore_delete(path)?;
-
-        Ok(())
+    pub(super) fn destroy_stream_in_zone(&self, path: &str, zone: &str) -> Result<(), KernelError> {
+        let route = self.vfs_router.route(path, zone);
+        let address = super::StreamAddress::from_route(path, zone, route.as_ref());
+        if let Some(route) = route {
+            self.with_metastore_route(&route, |ms| ms.delete(path))
+                .ok_or_else(|| KernelError::IOError("no stream metastore wired".into()))?
+                .map_err(|e| KernelError::IOError(e.to_string()))?;
+        } else {
+            self.metastore_delete(path)?;
+        }
+        match self.stream_manager.destroy(&address.key()) {
+            Ok(()) | Err(crate::stream_manager::StreamManagerError::NotFound(_)) => Ok(()),
+            Err(error) => Err(stream_mgr_err(error)),
+        }
     }
 
     /// Close a stream (signal close, keep in registry for drain), waking
@@ -160,12 +161,21 @@ impl Kernel {
     /// the only write there is. Closing carries no content, so no hook runs —
     /// unlike the write, there is nothing here to inspect or rewrite.
     pub fn close_stream(&self, path: &str) -> Result<(), KernelError> {
-        self.stream_manager.close(path).map_err(stream_mgr_err)
+        self.stream_manager
+            .close(&self.stream_address(path, contracts::ROOT_ZONE_ID).key())
+            .map_err(stream_mgr_err)
     }
 
     /// Check if a stream exists.
     pub fn has_stream(&self, path: &str) -> bool {
-        self.stream_manager.has(path)
+        self.stream_manager
+            .has(&self.stream_address(path, contracts::ROOT_ZONE_ID).key())
+    }
+
+    /// Number of readers currently parked on this stream's notification.
+    pub fn stream_parked_readers(&self, path: &str, zone: &str) -> usize {
+        self.stream_manager
+            .parked_readers(&self.stream_address(path, zone).key())
     }
 
     /// Current tail (write offset) of a DT_STREAM.
@@ -177,7 +187,7 @@ impl Kernel {
     /// helper: read-only probe, no syscall dispatch.
     pub fn stream_tail(&self, path: &str) -> Result<usize, KernelError> {
         self.stream_manager
-            .tail(path)
+            .tail(&self.stream_address(path, contracts::ROOT_ZONE_ID).key())
             .ok_or_else(|| KernelError::FileNotFound(path.to_string()))
     }
 
@@ -195,10 +205,20 @@ impl Kernel {
         data: &[u8],
         ctx: &OperationContext,
     ) -> Result<usize, KernelError> {
-        let replacement = self.apply_mutating_write_hooks(path, ctx, data)?;
-        let effective: &[u8] = replacement.as_deref().unwrap_or(data);
+        let mut replacement: Option<Vec<u8>> = None;
+        let address = self.resolve_stream_address(path, ctx, |path, route, ctx| {
+            if let Some(updated) = self.apply_mutating_write_hooks_with_route(
+                path,
+                route,
+                ctx,
+                replacement.as_deref().unwrap_or(data),
+            )? {
+                replacement = Some(updated);
+            }
+            Ok(())
+        })?;
         self.stream_manager
-            .write_nowait(path, effective)
+            .write_nowait(&address.key(), replacement.as_deref().unwrap_or(data))
             .map_err(stream_mgr_err)
     }
 
@@ -224,7 +244,10 @@ impl Kernel {
         offset: usize,
     ) -> Result<Option<(Vec<u8>, usize)>, KernelError> {
         self.stream_manager
-            .read_at(path, offset)
+            .read_at(
+                &self.stream_address(path, contracts::ROOT_ZONE_ID).key(),
+                offset,
+            )
             .map_err(stream_mgr_err)
     }
 
@@ -236,7 +259,11 @@ impl Kernel {
         count: usize,
     ) -> Result<(Vec<Vec<u8>>, usize), KernelError> {
         self.stream_manager
-            .read_batch(path, offset, count)
+            .read_batch(
+                &self.stream_address(path, contracts::ROOT_ZONE_ID).key(),
+                offset,
+                count,
+            )
             .map_err(stream_mgr_err)
     }
 
@@ -249,13 +276,29 @@ impl Kernel {
     /// `check_permission(Read)` for this whole-stream variant), never here.
     pub fn stream_collect_all(&self, path: &str) -> Result<Vec<u8>, KernelError> {
         self.stream_manager
-            .collect_all_payloads(path)
+            .collect_all_payloads(&self.stream_address(path, contracts::ROOT_ZONE_ID).key())
             .map_err(stream_mgr_err)
     }
 
     /// List all streams with their paths.
     pub fn list_streams(&self) -> Vec<String> {
-        self.stream_manager.list()
+        let mut paths = Vec::new();
+        for key in self.stream_manager.list() {
+            let address = super::StreamAddress::from_key(&key);
+            if address.zone == contracts::ROOT_ZONE_ID {
+                paths.push(address.path.clone());
+            }
+            paths.extend(
+                self.vfs_router
+                    .project_zone_path(&address.zone, &address.path)
+                    .into_iter()
+                    .filter(|(zone, _)| zone == contracts::ROOT_ZONE_ID)
+                    .map(|(_, path)| path),
+            );
+        }
+        paths.sort();
+        paths.dedup();
+        paths
     }
 
     /// Blocking read at offset — Condvar wait.
@@ -273,7 +316,11 @@ impl Kernel {
         timeout_ms: u64,
     ) -> Result<(Vec<u8>, usize), KernelError> {
         self.stream_manager
-            .read_at_blocking(path, offset, timeout_ms)
+            .read_at_blocking(
+                &self.stream_address(path, contracts::ROOT_ZONE_ID).key(),
+                offset,
+                timeout_ms,
+            )
             .map_err(stream_mgr_err)
     }
 
@@ -302,7 +349,10 @@ impl StreamSink for KernelStreamSink {
     }
 
     fn close(&self, path: &str) -> Result<(), String> {
-        self.kernel.close_stream(path).map_err(|e| format!("{e:?}"))
+        self.kernel
+            .stream_manager
+            .close(&self.kernel.stream_address(path, &self.ctx.zone_id).key())
+            .map_err(|e| format!("{e:?}"))
     }
 }
 

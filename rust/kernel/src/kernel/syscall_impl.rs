@@ -203,12 +203,19 @@ impl Kernel {
         timeout_ms: u64,
         ctx: &OperationContext,
     ) -> Result<Option<(Vec<u8>, usize)>, KernelError> {
-        self.check_permission(path, Permission::Read, ctx)?;
+        let address = self.resolve_stream_address(path, ctx, |path, route, ctx| {
+            self.check_permission_with_route(path, route, Permission::Read, ctx)
+        })?;
+        let key = address.key();
         if timeout_ms == 0 {
-            self.stream_read_at(path, offset)
+            self.stream_manager
+                .read_at(&key, offset)
+                .map_err(super::stream_mgr_err)
         } else {
-            self.stream_read_at_blocking(path, offset, timeout_ms)
+            self.stream_manager
+                .read_at_blocking(&key, offset, timeout_ms)
                 .map(Some)
+                .map_err(super::stream_mgr_err)
         }
     }
 
@@ -220,8 +227,12 @@ impl Kernel {
         path: &str,
         ctx: &OperationContext,
     ) -> Result<Vec<u8>, KernelError> {
-        self.check_permission(path, Permission::Read, ctx)?;
-        self.stream_collect_all(path)
+        let address = self.resolve_stream_address(path, ctx, |path, route, ctx| {
+            self.check_permission_with_route(path, route, Permission::Read, ctx)
+        })?;
+        self.stream_manager
+            .collect_all_payloads(&address.key())
+            .map_err(super::stream_mgr_err)
     }
 
     /// Shared read logic: route → metastore → DT_LINK follow → backend.
@@ -368,7 +379,21 @@ impl Kernel {
 
         // DT_STREAM — Rust IPC registry: offset-based read with optional blocking.
         if entry.entry_type == DT_STREAM {
-            match self.stream_read_at(path, offset as usize) {
+            let address = super::StreamAddress::from_route(path, &ctx.zone_id, Some(&route));
+            let mut target_ctx = ctx.clone();
+            target_ctx.zone_id = address.zone.clone();
+            self.check_permission_with_route(
+                &address.path,
+                Some(&route),
+                Permission::Read,
+                &target_ctx,
+            )?;
+            let key = address.key();
+            match self
+                .stream_manager
+                .read_at(&key, offset as usize)
+                .map_err(super::stream_mgr_err)
+            {
                 Ok(Some((data, next_offset))) => {
                     return Ok(SysReadResult::ipc(DT_STREAM, Some(data), Some(next_offset)));
                 }
@@ -376,7 +401,11 @@ impl Kernel {
                     if timeout_ms == 0 {
                         return Ok(SysReadResult::ipc(DT_STREAM, None, None));
                     }
-                    match self.stream_read_at_blocking(path, offset as usize, timeout_ms) {
+                    match self
+                        .stream_manager
+                        .read_at_blocking(&key, offset as usize, timeout_ms)
+                        .map_err(super::stream_mgr_err)
+                    {
                         Ok((data, next_offset)) => {
                             return Ok(SysReadResult::ipc(
                                 DT_STREAM,
@@ -836,7 +865,24 @@ impl Kernel {
                 // blocking `read_at_blocking` / `sys_read(timeout>0)` on the same
                 // node missed a local write until its timeout — the mailbox
                 // append RPC (`stream_write_nowait`) already went through here.
-                match self.stream_manager.write_nowait(path, effective_content) {
+                let address = super::StreamAddress::from_route(path, &ctx.zone_id, Some(&route));
+                let mut target_ctx = ctx.clone();
+                target_ctx.zone_id = address.zone.clone();
+                let target_replacement = if address.path != path || address.zone != ctx.zone_id {
+                    self.apply_mutating_write_hooks_with_route(
+                        &address.path,
+                        Some(&route),
+                        &target_ctx,
+                        effective_content,
+                    )?
+                } else {
+                    None
+                };
+                let effective_content = target_replacement.as_deref().unwrap_or(effective_content);
+                match self
+                    .stream_manager
+                    .write_nowait(&address.key(), effective_content)
+                {
                     Ok(offset) => {
                         // POST hooks fire on the IPC short-circuit
                         // path the same as for DT_REG. Hook
@@ -1394,7 +1440,7 @@ impl Kernel {
         // a not-yet-materialised remote stream).
         let size = if entry.entry_type == DT_STREAM {
             self.stream_manager
-                .tail(path)
+                .tail(&super::StreamAddress::from_route(path, zone_id, Some(&route)).key())
                 .map_or(entry.size, |tail| tail as u64)
         } else if is_dir && entry.size == 0 {
             4096
@@ -1413,7 +1459,9 @@ impl Kernel {
         // never been appended to on this replica.
         let modified_at_ms = if entry.entry_type == DT_STREAM {
             self.stream_manager
-                .last_append_ms(path)
+                .last_append_ms(
+                    &super::StreamAddress::from_route(path, zone_id, Some(&route)).key(),
+                )
                 .or(entry.modified_at_ms)
         } else {
             entry.modified_at_ms
@@ -1687,7 +1735,7 @@ impl Kernel {
             }
             DT_STREAM => {
                 // Destroy stream buffer + metastore/dcache cleanup (Rust-native)
-                let _ = self.destroy_stream(path);
+                self.destroy_stream_in_zone(path, &ctx.zone_id)?;
                 return Ok(SysUnlinkResult {
                     hit: true,
                     entry_type: DT_STREAM,

@@ -380,56 +380,7 @@ pub(crate) fn compose_zone_key(mount_point: &str, target_subtree: &str, full_pat
     }
 }
 
-/// The mount-relative path for `zone_key`, or `None` when the key lies outside
-/// the subtree this mount exposes — the inverse of [`compose_zone_key`]'s
-/// subtree step.
-///
-/// `None` is the important case and the reason this returns an Option: with
-/// several mounts on one zone, EVERY mount's apply observer sees every key the
-/// zone commits. A mount that translated a key outside its own subtree would
-/// evict a cache entry that does not exist while leaving the real one stale.
-fn split_subtree(target_subtree: &str, zone_key: &str) -> Option<String> {
-    if target_subtree == VFS_ROOT || target_subtree.is_empty() {
-        return Some(zone_key.to_string());
-    }
-    if zone_key == target_subtree {
-        return Some(VFS_ROOT.to_string());
-    }
-    zone_key
-        .strip_prefix(&format!("{target_subtree}/"))
-        .map(|rest| format!("/{rest}"))
-}
-
-/// Project a zone key through a mount, excluding keys outside its subtree.
-/// Metadata, cache invalidation and nested mount routing share this mapping.
-pub(crate) fn project_zone_key(
-    mount_point: &str,
-    target_subtree: &str,
-    zone_key: &str,
-) -> Option<String> {
-    split_subtree(target_subtree, zone_key)
-        .map(|relative| zone_key_to_global(mount_point, &relative))
-}
-
-/// Map a zone-relative state-machine key to its full caller-facing path,
-/// given the zone's mount point — the inverse of `to_zone_key`.
-///
-/// SSOT for the zone-key → global-path mapping used on the FileMetadata
-/// path: the `ZoneMetaStore` read path (`to_global_path`) and its
-/// DCache-invalidation apply observer both call this, so a zone mounted at
-/// `/agents` maps `/win-ai/notes.md` → `/agents/win-ai/notes.md`
-/// identically. (Stream-wakeup does NOT use this — wal-stream keys carry
-/// the full path already; see `stream_wakeup`.)
-fn zone_key_to_global(mount_point: &str, zone_key: &str) -> String {
-    if mount_point == VFS_ROOT || mount_point.is_empty() {
-        return zone_key.to_string();
-    }
-    if zone_key == VFS_ROOT {
-        return mount_point.to_string();
-    }
-    // zone_key begins with '/'; avoid a double slash.
-    format!("{}{}", mount_point, zone_key)
-}
+pub(crate) use kernel::core::vfs_router::project_zone_key;
 
 pub(crate) fn proto_to_kernel(bytes: &[u8]) -> Result<KernelFileMetadata, MetaStoreError> {
     let proto = ProtoFileMetadata::decode(bytes)
@@ -920,20 +871,23 @@ mod tests {
     #[test]
     fn split_subtree_round_trips_and_rejects_foreign_keys() {
         assert_eq!(
-            split_subtree("/agents", "/agents/win-ai").as_deref(),
+            project_zone_key("/", "/agents", "/agents/win-ai").as_deref(),
             Some("/win-ai")
         );
-        assert_eq!(split_subtree("/agents", "/agents").as_deref(), Some("/"));
         assert_eq!(
-            split_subtree("/agents", "/conversations/9d41ae"),
+            project_zone_key("/", "/agents", "/agents").as_deref(),
+            Some("/")
+        );
+        assert_eq!(
+            project_zone_key("/", "/agents", "/conversations/9d41ae"),
             None,
             "a sibling mount's key is not this mount's to translate"
         );
         // A prefix that is not a path boundary is not a match either.
-        assert_eq!(split_subtree("/agents", "/agentsmith/x"), None);
+        assert_eq!(project_zone_key("/", "/agents", "/agentsmith/x"), None);
         // Whole-zone mounts translate everything, unchanged.
         assert_eq!(
-            split_subtree("/", "/conversations/9d41ae").as_deref(),
+            project_zone_key("/", "/", "/conversations/9d41ae").as_deref(),
             Some("/conversations/9d41ae")
         );
     }
@@ -962,8 +916,7 @@ mod tests {
             ),
         ] {
             let key = compose_zone_key(mount_point, subtree, full_path);
-            let back = split_subtree(subtree, &key)
-                .map(|rest| zone_key_to_global(mount_point, &rest))
+            let back = project_zone_key(mount_point, subtree, &key)
                 .unwrap_or_else(|| panic!("{key} fell outside its own subtree {subtree}"));
             assert_eq!(
                 back, full_path,
@@ -977,17 +930,17 @@ mod tests {
     fn zone_key_to_global_maps_by_mount_point() {
         // Root (or empty) mount ⇒ identity.
         assert_eq!(
-            zone_key_to_global("/", "/win-ai/transcript"),
+            project_zone_key("/", "/", "/win-ai/transcript").unwrap(),
             "/win-ai/transcript"
         );
-        assert_eq!(zone_key_to_global("", "/x"), "/x");
+        assert_eq!(project_zone_key("", "/", "/x").unwrap(), "/x");
         // A mounted zone prepends its mount point (no double slash).
         assert_eq!(
-            zone_key_to_global("/agents", "/win-ai/transcript"),
+            project_zone_key("/agents", "/", "/win-ai/transcript").unwrap(),
             "/agents/win-ai/transcript"
         );
         // The zone's own root key maps to the mount point itself.
-        assert_eq!(zone_key_to_global("/agents", "/"), "/agents");
+        assert_eq!(project_zone_key("/agents", "/", "/").unwrap(), "/agents");
     }
 
     /// Metadata fields with wire representations survive encode and decode,

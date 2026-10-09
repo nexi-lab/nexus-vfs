@@ -1,5 +1,6 @@
 //! Directory views come from distinct replicated zones and nested mounts.
-//! Uses native Raft transport and kernel routing, without a user auth policy.
+//! Uses native Raft transport and kernel routing; the alias test also installs
+//! the zone-grant permission provider.
 //! Does not claim scoped admission, cold content retention or runtime handoff.
 
 mod common;
@@ -17,6 +18,361 @@ use std::time::{Duration, Instant};
 
 fn address() -> String {
     format!("127.0.0.1:{}", common::free_port())
+}
+
+#[test]
+fn stream_aliases_share_content_and_offsets() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let addr = address();
+    let manager = node(41, dir.path(), &addr);
+    rt.block_on(async {
+        for zone in ["root", "contact-probe"] {
+            manager
+                .create_zone_async(zone, vec![format!("41@{addr}")])
+                .await
+                .unwrap()
+                .consensus_node()
+                .campaign()
+                .await
+                .unwrap();
+        }
+    });
+    let canonical = a2a::conversation_transcript_path(&a2a::conversation_id("alice", "bob"));
+    let alias = "/aliases/inbox";
+    manager
+        .mount_subtree(
+            "root",
+            "/conversations",
+            "contact-probe",
+            "/conversations",
+            false,
+        )
+        .unwrap();
+    manager
+        .mount_subtree("root", alias, "contact-probe", &canonical, false)
+        .unwrap();
+    let kernel = build_kernel(&manager, &addr);
+    a2a::ensure_mailbox_stream(kernel.as_ref(), &canonical).unwrap();
+    let ctx = kernel::kernel::OperationContext::new("bob", "root", true, Some("bob"), true);
+    let body = b"one existing conversation record";
+    kernel.stream_write_nowait(&canonical, body, &ctx).unwrap();
+    let direct = kernel
+        .sys_stream_read_at(&canonical, 0, 1_000, &ctx)
+        .unwrap()
+        .unwrap();
+    assert_eq!(direct.0, body);
+    assert_eq!(
+        kernel.sys_stat(alias, "root").unwrap().entry_type,
+        DT_STREAM
+    );
+    assert_eq!(
+        kernel.sys_stream_read_at(alias, 0, 0, &ctx).unwrap(),
+        Some(direct.clone())
+    );
+    let second = b"written through another mount";
+    assert_eq!(
+        kernel.stream_write_nowait(alias, second, &ctx).unwrap(),
+        direct.1
+    );
+    let via_original = kernel
+        .sys_stream_read_at(&canonical, direct.1, 0, &ctx)
+        .unwrap()
+        .unwrap();
+    assert_eq!(via_original.0, second);
+    assert_eq!(kernel.stream_tail(alias).unwrap(), via_original.1);
+    assert_eq!(
+        kernel.sys_stat(alias, "root").unwrap().size,
+        via_original.1 as u64
+    );
+    assert_eq!(
+        kernel.sys_stream_collect_all(alias, &ctx).unwrap(),
+        [body.as_slice(), second.as_slice()].concat()
+    );
+    // A fresh kernel has no registry handles. It reconstructs the same WAL
+    // from the committed inode, without proposing a replacement inode.
+    let cold = build_kernel(&manager, &addr);
+    assert_eq!(
+        cold.sys_stream_read_at(alias, 0, 0, &ctx).unwrap(),
+        Some(direct)
+    );
+    assert_eq!(
+        cold.stream_read_batch(alias, 0, 3).unwrap().0,
+        vec![body.to_vec(), second.to_vec()]
+    );
+
+    // An alias without the transcript suffix must still run the canonical
+    // conversation hook. The authenticated actor wins over a forged envelope.
+    let contact = alias;
+    a2a::install_a2a_stamp_hook(&kernel, true).unwrap();
+    let payload = br#"{"from":"mallory","to":"alice","body":"hello"}"#;
+    let at = kernel.stream_write_nowait(contact, payload, &ctx).unwrap();
+    let stamped = kernel
+        .sys_stream_read_at(&canonical, at, 0, &ctx)
+        .unwrap()
+        .unwrap();
+    let envelope: serde_json::Value = serde_json::from_slice(&stamped.0).unwrap();
+    assert_eq!(envelope["from"], "bob");
+
+    kernel.set_permission_provider(Arc::new(Box::new(permission::ZonePermsProvider::new())));
+    let mut reader =
+        kernel::kernel::OperationContext::new("bob", "root", false, Some("bob"), false);
+    reader.zone_perms = vec![("contact-probe".into(), "r".into())];
+    for visible in [alias, canonical.as_str()] {
+        let mut results = kernel.sys_read(
+            &[kernel::kernel::ReadRequest {
+                path: visible.into(),
+                offset: 0,
+                len: None,
+                timeout_ms: 0,
+            }],
+            &reader,
+        );
+        assert_eq!(results.remove(0).unwrap().data.unwrap(), body);
+        assert_eq!(
+            kernel
+                .sys_stream_read_at(visible, 0, 0, &reader)
+                .unwrap()
+                .unwrap()
+                .0,
+            body
+        );
+        assert!(
+            matches!(
+                kernel.stream_write_nowait(visible, payload, &reader),
+                Err(kernel::kernel::KernelError::PermissionDenied(_))
+            ),
+            "a successful read must not grant write access"
+        );
+        assert!(matches!(
+            kernel
+                .sys_write(
+                    &[kernel::kernel::WriteRequest {
+                        path: visible.into(),
+                        content: payload.to_vec(),
+                        offset: 0,
+                    }],
+                    &reader
+                )
+                .remove(0),
+            Err(kernel::kernel::KernelError::PermissionDenied(_))
+        ));
+    }
+    reader.zone_perms = vec![("root".into(), "rw".into())];
+    for visible in [alias, canonical.as_str()] {
+        assert!(
+            matches!(
+                kernel.sys_stream_collect_all(visible, &reader),
+                Err(kernel::kernel::KernelError::PermissionDenied(_))
+            ),
+            "the mount's zone grant is required, including after a previous read"
+        );
+    }
+    manager.shutdown();
+}
+
+#[test]
+fn stream_registry_separates_zones_and_uses_the_callers_namespace() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let addr = address();
+    let manager = node(41, dir.path(), &addr);
+    rt.block_on(async {
+        for zone in ["root", "alice-data", "bob-data"] {
+            manager
+                .create_zone_async(zone, vec![format!("41@{addr}")])
+                .await
+                .unwrap()
+                .consensus_node()
+                .campaign()
+                .await
+                .unwrap();
+        }
+    });
+    let kernel = build_kernel(&manager, &addr);
+    let router = kernel.vfs_router_arc();
+    let path = "/conversations/same/transcript";
+    for (zone, bytes) in [
+        ("alice-data", b"alice".as_slice()),
+        ("bob-data", b"bob".as_slice()),
+    ] {
+        router.add_mount("/", zone, None, false);
+        router.install_metastore(
+            &kernel::core::vfs_router::canonicalize_mount_path("/", zone),
+            Arc::new(store(&manager, zone)),
+        );
+        kernel
+            .sys_setattr(
+                path,
+                DT_STREAM.into(),
+                "",
+                None,
+                None,
+                None,
+                "wal",
+                zone,
+                false,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let ctx = kernel::kernel::OperationContext::new(zone, zone, true, Some(zone), true);
+        assert_eq!(kernel.stream_write_nowait(path, bytes, &ctx).unwrap(), 0);
+    }
+    for (zone, expected) in [
+        ("alice-data", b"alice".as_slice()),
+        ("bob-data", b"bob".as_slice()),
+    ] {
+        let ctx = kernel::kernel::OperationContext::new(zone, zone, true, Some(zone), true);
+        assert_eq!(kernel.sys_stream_collect_all(path, &ctx).unwrap(), expected);
+        assert_eq!(kernel.sys_stat(path, zone).unwrap().size, 1);
+    }
+    let root = kernel::kernel::OperationContext::new("system", "root", true, None, true);
+    assert!(kernel.sys_stream_read_at(path, 0, 0, &root).is_err());
+    manager.shutdown();
+}
+
+#[test]
+fn replicated_stream_append_wakes_a_reader_under_a_different_mount() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let founder_dir = tempfile::tempdir().unwrap();
+    let replica_dir = tempfile::tempdir().unwrap();
+    let founder_addr = address();
+    let replica_addr = address();
+    let founder = node(41, founder_dir.path(), &founder_addr);
+    let replica = node(42, replica_dir.path(), &replica_addr);
+    rt.block_on(async {
+        for (manager, id, addr, zones) in [
+            (&founder, 41, &founder_addr, vec!["root", "messages"]),
+            (&replica, 42, &replica_addr, vec!["root"]),
+        ] {
+            for zone in zones {
+                manager
+                    .create_zone_async(zone, vec![format!("{id}@{addr}")])
+                    .await
+                    .unwrap()
+                    .consensus_node()
+                    .campaign()
+                    .await
+                    .unwrap();
+            }
+        }
+    });
+    let original = "/conversations/pair/transcript";
+    let alias = "/mounted/inbox";
+    founder
+        .mount_subtree(
+            "root",
+            "/conversations",
+            "messages",
+            "/conversations",
+            false,
+        )
+        .unwrap();
+    join(&replica, "messages", 42, &replica_addr, &founder_addr);
+    replica
+        .mount_subtree("root", alias, "messages", original, false)
+        .unwrap();
+    let writer = build_kernel(&founder, &founder_addr);
+    let reader = build_kernel(&replica, &replica_addr);
+    nexus_raft::stream_wakeup::install_stream_wakeup_observer(
+        &replica.get_zone("messages").unwrap().consensus_node(),
+        Arc::downgrade(&reader),
+        "messages",
+    );
+    a2a::ensure_mailbox_stream(writer.as_ref(), original).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while reader.sys_stat(alias, "root").is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "replica did not apply stream inode"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let reading = Arc::clone(&reader);
+    let waiter = std::thread::spawn(move || {
+        let ctx = kernel::kernel::OperationContext::new("bob", "root", true, Some("bob"), true);
+        reading.sys_stream_read_at(alias, 0, 10_000, &ctx)
+    });
+    while reader.stream_parked_readers(alias, "root") == 0 {
+        assert!(Instant::now() < deadline, "replica reader never parked");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let ctx = kernel::kernel::OperationContext::new("alice", "root", true, Some("alice"), true);
+    let started = Instant::now();
+    writer
+        .stream_write_nowait(original, b"from another node", &ctx)
+        .unwrap();
+    let received = waiter.join().unwrap().unwrap().unwrap();
+    assert_eq!(received.0, b"from another node");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "reader only observed the append at its timeout"
+    );
+    replica.shutdown();
+    founder.shutdown();
+}
+
+#[test]
+fn legacy_alias_wal_is_reported_instead_of_opening_an_empty_stream() {
+    use kernel::core::stream::wal::WalStreamCore;
+    use kernel::stream::StreamBackend;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let addr = address();
+    let manager = node(41, dir.path(), &addr);
+    rt.block_on(async {
+        for zone in ["root", "legacy"] {
+            manager
+                .create_zone_async(zone, vec![format!("41@{addr}")])
+                .await
+                .unwrap()
+                .consensus_node()
+                .campaign()
+                .await
+                .unwrap();
+        }
+    });
+    let path = "/conversations/legacy/transcript";
+    let alias = "/old/inbox";
+    manager
+        .mount_subtree("root", "/conversations", "legacy", "/conversations", false)
+        .unwrap();
+    manager
+        .mount_subtree("root", alias, "legacy", path, false)
+        .unwrap();
+    let metadata = FileMetadata {
+        path: path.into(),
+        entry_type: DT_STREAM,
+        zone_id: Some("legacy".into()),
+        ..Default::default()
+    };
+    let backing = Arc::new(store(&manager, "legacy"));
+    backing.put(path, metadata).unwrap();
+    let legacy = WalStreamCore::new(backing, alias.into());
+    legacy.push(b"existing history").unwrap();
+    let kernel = build_kernel(&manager, &addr);
+    let ctx = kernel::kernel::OperationContext::new("system", "root", true, None, true);
+    for visible in [path, alias] {
+        let error = kernel.sys_stream_read_at(visible, 0, 0, &ctx).unwrap_err();
+        assert!(format!("{error:?}").contains("migrate"), "{error:?}");
+        assert!(kernel
+            .stream_write_nowait(visible, b"must not fork", &ctx)
+            .is_err());
+    }
+    assert_eq!(legacy.read_at(0).unwrap().unwrap(), b"existing history");
+    assert_eq!(legacy.tail_offset(), 1);
+    manager.shutdown();
 }
 
 fn node(id: u64, dir: &Path, addr: &str) -> Arc<ZoneManager> {
