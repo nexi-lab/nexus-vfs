@@ -65,13 +65,7 @@ impl SearchGrpcPolicy {
     }
 
     fn path_view(&self, ctx: OperationContext, path: &str) -> Result<ReadView, Status> {
-        validate_path_fast(path).map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let route = self.kernel.vfs_router_arc().route(path, &ctx.zone_id);
-        let zone = route
-            .as_ref()
-            .map(|route| route.zone_id.as_str())
-            .unwrap_or(ctx.zone_id.as_str())
-            .to_owned();
+        let zone = search_zone_for_path(&self.kernel.vfs_router_arc(), &ctx, path)?;
         self.view(ctx, &zone)
     }
 
@@ -252,6 +246,23 @@ impl PluginGrpcPolicy for SearchGrpcPolicy {
         };
         Ok(Box::new(filter))
     }
+}
+
+/// Resolve the zone owning a discovery root in the canonical VFS namespace.
+/// HTTP fences and the gRPC policy must use the same mount decision.
+pub fn search_zone_for_path(
+    router: &kernel::vfs_router::VFSRouter,
+    ctx: &OperationContext,
+    path: &str,
+) -> Result<String, Status> {
+    let path = if path.is_empty() { "/" } else { path };
+    validate_path_fast(path).map_err(|error| Status::invalid_argument(error.to_string()))?;
+    Ok(router
+        .route(path, &ctx.zone_id)
+        .as_ref()
+        .map(|route| route.zone_id.as_str())
+        .unwrap_or(&ctx.zone_id)
+        .to_owned())
 }
 
 fn privileged(ctx: &OperationContext) -> bool {

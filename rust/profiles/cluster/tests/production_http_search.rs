@@ -254,6 +254,79 @@ async fn production_grants_filter_http_search_and_survive_restart() {
             }
         }
     }
+    let mut legal_paths = vfs.readdir_names("/legal", "").await.unwrap();
+    legal_paths.retain(|path| path.ends_with(".md"));
+    legal_paths.sort();
+    assert!(legal_paths.iter().any(|path| path == "/legal/contract.md"));
+    assert_eq!(
+        vfs.stat_zone("/legal/contract.md", "").await.as_deref(),
+        Some("legal")
+    );
+    for (operation, pattern, field) in [("glob", "*.md", "paths"), ("grep", "widget", "matches")] {
+        let legal = json_ok(
+            client
+                .post(format!("{base}/v2/search/{operation}"))
+                .bearer_auth(alice)
+                .json(
+                    &json!({"root_path":"/legal", "zone_id":"legal", "pattern":pattern,
+                          "files":["/legal/contract.md"]}),
+                ),
+        )
+        .await;
+        let hits = legal[field].as_array().unwrap();
+        assert_eq!(hits.len(), 1, "{legal}");
+        let path = if operation == "glob" {
+            &hits[0]
+        } else {
+            &hits[0]["path"]
+        };
+        assert_eq!(path, "/legal/contract.md");
+        assert_eq!(
+            client
+                .post(format!("{base}/v2/search/{operation}"))
+                .bearer_auth(bob)
+                .json(&json!({"root_path":"/legal", "pattern":pattern,
+                          "files":["/legal/contract.md"]}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            client
+                .post(format!("{base}/v2/search/{operation}"))
+                .bearer_auth(admin)
+                .json(&json!({"root_path":"/docs", "zone_id":"legal", "pattern":pattern}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let admin_legal = json_ok(
+            client
+                .post(format!("{base}/v2/search/{operation}"))
+                .bearer_auth(admin)
+                .json(&json!({"root_path":"/legal", "zone_id":"legal", "pattern":pattern})),
+        )
+        .await;
+        let mut admin_paths: Vec<_> = admin_legal[field]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| {
+                if operation == "glob" {
+                    hit
+                } else {
+                    &hit["path"]
+                }
+            })
+            .map(|path| path.as_str().unwrap().to_owned())
+            .collect();
+        admin_paths.sort();
+        assert_eq!(admin_paths, legal_paths, "{admin_legal}");
+    }
     grant(
         &client,
         &base,

@@ -149,3 +149,49 @@ async fn fenced_grep_reads_min_revision_from_header() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["detail"]["current_revision"], "/ws/a.txt@2");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discovery_fences_use_the_live_mount_zone_for_get_and_post() {
+    struct ZoneGen;
+    impl StatGen for ZoneGen {
+        fn stat_gen(&self, path: &str, zone_id: &str) -> u64 {
+            assert_eq!(path, "/legal/contract.md");
+            assert_eq!(zone_id, "legal");
+            3
+        }
+    }
+    let mut state = AppState::for_tests("http://127.0.0.1:1");
+    state.kernel = Arc::new(ZoneGen);
+    let mounts = Arc::clone(&state.vfs_router);
+    let (addr, serve) = bind_and_serve("127.0.0.1:0".parse().unwrap(), state)
+        .await
+        .unwrap();
+    tokio::spawn(async move { serve.await.unwrap() });
+    // Install after the listener starts to prove routing uses the live table.
+    mounts.add_federation_mount("/legal", "root", None, "legal", "/", false);
+    let client = reqwest::Client::new();
+    for operation in ["glob", "grep"] {
+        for method in [reqwest::Method::GET, reqwest::Method::POST] {
+            let mut request = client.request(
+                method.clone(),
+                format!("http://{addr}/v2/search/{operation}"),
+            );
+            if method == reqwest::Method::GET {
+                request = request.query(&[("root_path", "/legal"), ("pattern", "widget")]);
+            } else {
+                request = request.json(&serde_json::json!({"root_path":"/legal", "zone_id":"legal", "pattern":"widget"}));
+            }
+            let response = request
+                .header("X-Nexus-Min-Revision", "/legal/contract.md@7")
+                .header("X-Nexus-Revision-Timeout-Ms", "0")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::PRECONDITION_FAILED);
+            assert_eq!(
+                response.headers()["X-Nexus-Revision"],
+                "/legal/contract.md@3"
+            );
+        }
+    }
+}
