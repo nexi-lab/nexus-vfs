@@ -47,9 +47,16 @@ async fn no_auth_loopback_declares_itself() {
     assert!(!auth.armed, "no-auth posture: no identity plane is armed");
     assert_eq!(auth.mode, "no-auth", "the provider declares its own mode");
     let perm = caps.permission.expect("permission capability");
+    // Since main's authorization-composition change the cluster provider
+    // slot is armed unconditionally (foreign containment first, the ReBAC
+    // relationship layer only under --enable-rebac). Under NoAuth loopback
+    // every caller is domestic, containment passes them, and ReBAC is not
+    // enabled — the armed slot is behaviourally a no-op gate, which is
+    // what this posture has always meant.
     assert!(
-        !perm.provider_armed,
-        "--no-tls: no permission provider is installed (the gate is a no-op)"
+        perm.provider_armed,
+        "--no-tls: the composed cluster provider is armed (containment-only; \
+         behaviourally a no-op for this all-domestic, no-rebac posture)"
     );
     let zr = caps.zone_runtime.expect("zone-runtime capability");
     // Under --no-tls the deletion registry binds the per-node SOLO root —
