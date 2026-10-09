@@ -7,13 +7,15 @@
 //! plugin execution, including cached and expanded results. Filtering may leave
 //! fewer results than the requested limit.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use kernel::kernel::{validate_path_fast, Kernel, KernelError, OperationContext};
 use kernel::Permission;
 use nexus_search_common::delegation::from_metadata;
-use nexus_search_common::DELEGATION_METADATA_KEY;
+use nexus_search_common::{
+    require_discovery_filters, DELEGATION_METADATA_KEY, MAX_DISCOVERY_FILES,
+};
 use prost::Message;
 use tonic::{metadata::MetadataMap, Status};
 
@@ -69,11 +71,7 @@ impl SearchGrpcPolicy {
             .map(|route| route.zone_id.as_str())
             .unwrap_or(ctx.zone_id.as_str())
             .to_owned();
-        let view = self.view(ctx, &zone)?;
-        if !view.allows(path)? {
-            return Err(Status::permission_denied("search path is not readable"));
-        }
-        Ok(view)
+        self.view(ctx, &zone)
     }
 
     fn admin(
@@ -175,14 +173,53 @@ impl PluginGrpcPolicy for SearchGrpcPolicy {
                 SearchResponse::Batch(views)
             }
             "Glob" => {
-                let request = decode_request::<GlobRequest>(payload)?;
+                let mut request = decode_request::<GlobRequest>(payload)?;
                 let ctx = self.authenticate(metadata, peer, &request.auth_token)?;
-                SearchResponse::Glob(self.path_view(ctx, &request.root_path)?)
+                if request.root_path.is_empty() {
+                    request.root_path = "/".into();
+                }
+                let view = self.path_view(ctx, &request.root_path)?;
+                view.prepare_candidates(&request.root_path, request.files.as_mut())?;
+                *payload = request.encode_to_vec();
+                SearchResponse::Glob {
+                    view,
+                    expected_filters: if request.files.is_some() {
+                        DiscoveryFilter::Files as u32
+                    } else {
+                        0
+                    },
+                }
             }
             "Grep" => {
-                let request = decode_request::<GrepRequest>(payload)?;
+                let mut request = decode_request::<GrepRequest>(payload)?;
                 let ctx = self.authenticate(metadata, peer, &request.auth_token)?;
-                SearchResponse::Grep(self.path_view(ctx, &request.root_path)?)
+                if request.root_path.is_empty() {
+                    request.root_path = "/".into();
+                }
+                let view = self.path_view(ctx, &request.root_path)?;
+                nexus_search_common::discovery::StructuralFilter::parse(
+                    request.block_type.as_deref(),
+                    request.section.as_deref(),
+                )
+                .map_err(Status::invalid_argument)?;
+                view.prepare_candidates(&request.root_path, request.files.as_mut())?;
+                *payload = request.encode_to_vec();
+                SearchResponse::Grep {
+                    view,
+                    expected_filters: (if request.files.is_some() {
+                        DiscoveryFilter::Files as u32
+                    } else {
+                        0
+                    }) | (if request.block_type.is_some() {
+                        DiscoveryFilter::BlockType as u32
+                    } else {
+                        0
+                    }) | (if request.section.is_some() {
+                        DiscoveryFilter::Section as u32
+                    } else {
+                        0
+                    }),
+                }
             }
             "Locate" => {
                 let mut request = decode_request::<LocateRequest>(payload)?;
@@ -254,6 +291,63 @@ impl ReadView {
         }
         ctx.zone_id = zone.clone();
         Ok(Self { kernel, ctx, zone })
+    }
+
+    /// Validate every supplied path before dispatch, then intersect with the
+    /// subtree and current caller's permissions. An empty set stays explicit.
+    fn prepare_candidates(
+        &self,
+        root: &str,
+        files: Option<&mut DiscoveryFiles>,
+    ) -> Result<(), Status> {
+        let Some(files) = files else {
+            if !self.allows(root)? {
+                return Err(Status::permission_denied("search path is not readable"));
+            }
+            return Ok(());
+        };
+        if files.paths.len() > MAX_DISCOVERY_FILES {
+            return Err(Status::invalid_argument(format!(
+                "files list exceeds {MAX_DISCOVERY_FILES} paths"
+            )));
+        }
+        let mut seen = HashSet::new();
+        let mut normalized = Vec::with_capacity(files.paths.len());
+        for path in &files.paths {
+            let path = if path.starts_with('/') {
+                path.clone()
+            } else {
+                format!("/{path}")
+            };
+            validate_path_fast(&path)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            let route = self.kernel.vfs_router_arc().route(&path, &self.zone);
+            if route
+                .as_ref()
+                .is_some_and(|route| route.zone_id != self.zone)
+            {
+                return Err(Status::permission_denied(
+                    "working set crosses search zones",
+                ));
+            }
+            if seen.insert(path.clone()) {
+                normalized.push(path);
+            }
+        }
+        let root = root.trim_end_matches('/');
+        let mut permitted = Vec::with_capacity(normalized.len());
+        for path in normalized {
+            let in_scope = root.is_empty()
+                || path == root
+                || path
+                    .strip_prefix(root)
+                    .is_some_and(|suffix| suffix.starts_with('/'));
+            if in_scope && self.allows(&path)? {
+                permitted.push(path);
+            }
+        }
+        files.paths = permitted;
+        Ok(())
     }
 
     fn allows(&self, path: &str) -> Result<bool, Status> {
@@ -333,8 +427,14 @@ impl ReadView {
 enum SearchResponse {
     Query(ReadView),
     Batch(Vec<ReadView>),
-    Glob(ReadView),
-    Grep(ReadView),
+    Glob {
+        view: ReadView,
+        expected_filters: u32,
+    },
+    Grep {
+        view: ReadView,
+        expected_filters: u32,
+    },
     Locate(ReadView, String),
 }
 
@@ -356,14 +456,22 @@ impl AuthorizedPluginCall for SearchResponse {
                 }
                 Ok(response.encode_to_vec())
             }
-            Self::Glob(view) => {
+            Self::Glob {
+                view,
+                expected_filters,
+            } => {
                 let mut response = decode_response::<GlobResponse>(&payload)?;
+                require_discovery_filters(expected_filters, response.applied_filters)?;
                 view.filter(&mut response.paths, |path| path)?;
                 view.redact_error(&mut response.error);
                 Ok(response.encode_to_vec())
             }
-            Self::Grep(view) => {
+            Self::Grep {
+                view,
+                expected_filters,
+            } => {
                 let mut response = decode_response::<GrepResponse>(&payload)?;
+                require_discovery_filters(expected_filters, response.applied_filters)?;
                 view.filter(&mut response.matches, |hit| &hit.path)?;
                 view.redact_error(&mut response.error);
                 Ok(response.encode_to_vec())

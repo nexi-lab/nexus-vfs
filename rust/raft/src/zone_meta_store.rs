@@ -43,9 +43,9 @@
 //! global paths stores one authoritative copy per zone-relative key).
 //!
 //! Field fidelity note: the kernel ``FileMetadata`` struct tracks a
-//! subset of the proto fields (path/backend_name/physical_path/size/content_id/
-//! version/entry_type/zone_id/mime_type). Missing fields (``owner_id``,
-//! ``ttl_seconds`` and the ``created_at``/``modified_at`` ISO-8601
+//! subset of the proto fields (path/size/content_id/gen/version/entry_type/
+//! zone_id/mime_type/owner_id). Missing fields (``ttl_seconds`` and the
+//! ``created_at``/``modified_at`` ISO-8601
 //! strings — distinct from the ``created_at_ms``/``modified_at_ms``
 //! epoch fields already tracked) still round-trip through Python-side
 //! writes fine but are defaulted on kernel-only writes. Widening the
@@ -137,10 +137,9 @@ fn register_cache_invalidator(
         // outside MY subtree belongs to a sibling mount. Translating it here
         // would evict a path this cache never held and leave the real entry
         // stale — a silent read-your-writes failure.
-        let Some(under_mount) = split_subtree(&subtree_for_cb, zone_key) else {
+        let Some(global) = project_zone_key(&mount_point_for_cb, &subtree_for_cb, zone_key) else {
             return;
         };
-        let global = zone_key_to_global(&mount_point_for_cb, &under_mount);
         cache_for_cb.remove(&global);
     }));
 }
@@ -318,10 +317,8 @@ impl ZoneMetaStore {
         // Falling back to the mount point would hand the caller a path that
         // resolves to a DIFFERENT object, so the key is returned unchanged and
         // simply fails to match anything this store caches.
-        split_subtree(&self.target_subtree, zone_key).map_or_else(
-            || zone_key.to_string(),
-            |rest| zone_key_to_global(&self.mount_point, &rest),
-        )
+        project_zone_key(&self.mount_point, &self.target_subtree, zone_key)
+            .unwrap_or_else(|| zone_key.to_string())
     }
 }
 
@@ -364,7 +361,7 @@ pub(crate) fn subtree_or_whole_zone(raw: &str) -> String {
 ///
 /// A path that does not sit under `mount_point` is a caller bug, caught by the
 /// `debug_assert!` in `under_mount`; release mode degrades rather than panics.
-fn compose_zone_key(mount_point: &str, target_subtree: &str, full_path: &str) -> String {
+pub(crate) fn compose_zone_key(mount_point: &str, target_subtree: &str, full_path: &str) -> String {
     // Delegates, rather than implementing. The kernel router derives a mount's
     // CONTENT address from the same rule, and the two have to agree — they did
     // not, because this function was a near-copy and only the copy learned
@@ -401,6 +398,17 @@ fn split_subtree(target_subtree: &str, zone_key: &str) -> Option<String> {
     zone_key
         .strip_prefix(&format!("{target_subtree}/"))
         .map(|rest| format!("/{rest}"))
+}
+
+/// Project a zone key through a mount, excluding keys outside its subtree.
+/// Metadata, cache invalidation and nested mount routing share this mapping.
+pub(crate) fn project_zone_key(
+    mount_point: &str,
+    target_subtree: &str,
+    zone_key: &str,
+) -> Option<String> {
+    split_subtree(target_subtree, zone_key)
+        .map(|relative| zone_key_to_global(mount_point, &relative))
 }
 
 /// Map a zone-relative state-machine key to its full caller-facing path,
@@ -476,7 +484,11 @@ pub(crate) fn proto_to_kernel(bytes: &[u8]) -> Result<KernelFileMetadata, MetaSt
         } else {
             Some(proto.link_target)
         },
-        owner_id: None,
+        owner_id: if proto.owner_id.is_empty() {
+            None
+        } else {
+            Some(proto.owner_id)
+        },
     })
 }
 
@@ -501,7 +513,7 @@ pub(crate) fn kernel_to_proto(meta: &KernelFileMetadata) -> Vec<u8> {
         target_zone_id,
         target_subtree,
         link_target,
-        owner_id: _,
+        owner_id,
     } = meta;
     let proto = ProtoFileMetadata {
         path: path.clone(),
@@ -525,6 +537,7 @@ pub(crate) fn kernel_to_proto(meta: &KernelFileMetadata) -> Vec<u8> {
         // For DT_LINK entries this carries the link target path the
         // route() one-hop resolver follows. Empty for non-DT_LINK entries.
         link_target: link_target.clone().unwrap_or_default(),
+        owner_id: owner_id.clone().unwrap_or_default(),
         ..Default::default()
     };
     proto.encode_to_vec()
@@ -977,11 +990,8 @@ mod tests {
         assert_eq!(zone_key_to_global("/agents", "/"), "/agents");
     }
 
-    /// Proto encode↔decode preserves every field the kernel struct
-    /// tracks. ``target_zone_id`` deliberately not asserted here —
-    /// `target_zone_id` is now carried on the kernel struct (added back
-    /// for federation's `mount_apply_cb` to read on every replicated
-    /// SetMetadata) and round-trips through the proto.
+    /// Metadata fields with wire representations survive encode and decode,
+    /// including ownership used by callers after a cold read or replication.
     #[test]
     fn proto_roundtrip_preserves_kernel_fields() {
         let meta = KernelFileMetadata {
@@ -999,24 +1009,16 @@ mod tests {
             target_zone_id: Some("sharedzone".to_string()),
             target_subtree: Some("/agents".to_string()),
             link_target: None,
-            owner_id: None,
+            owner_id: Some("user-alice".to_string()),
         };
         let restored = proto_to_kernel(&kernel_to_proto(&meta)).unwrap();
-        assert_eq!(restored.path, meta.path);
-        assert_eq!(restored.size, meta.size);
-        assert_eq!(restored.content_id, meta.content_id);
-        assert_eq!(restored.gen, meta.gen);
-        assert_eq!(restored.version, meta.version);
-        assert_eq!(restored.entry_type, meta.entry_type);
-        assert_eq!(restored.zone_id, meta.zone_id);
-        assert_eq!(restored.mime_type, meta.mime_type);
-        assert_eq!(restored.created_at_ms, None);
-        assert_eq!(restored.modified_at_ms, None);
-        assert_eq!(
-            restored.target_subtree, meta.target_subtree,
-            "a mount's declared subtree must survive the proto it is re-wired from"
-        );
-        assert_eq!(restored.last_writer_address, meta.last_writer_address);
+        assert_eq!(restored, meta);
+
+        let legacy = KernelFileMetadata {
+            owner_id: None,
+            ..meta
+        };
+        assert_eq!(proto_to_kernel(&kernel_to_proto(&legacy)).unwrap(), legacy);
     }
 
     /// Pure-function translation is unit-testable without a live

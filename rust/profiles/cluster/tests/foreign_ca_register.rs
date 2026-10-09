@@ -105,7 +105,7 @@ impl XorgFixture {
 /// Generate `CA_B` + a `CA_B`-signed [`AGENT`] leaf, then boot a TLS-on founder
 /// that founds the control zone (wiring the foreign-ca apply observer) and forms
 /// `/agents`. Does NOT register `CA_B` — the caller does, at its own point.
-async fn boot_founder_with_ca_b() -> XorgFixture {
+async fn boot_founder_with_ca_b(options: &[&str]) -> XorgFixture {
     let (ca_b_pem, ca_b_key_pem) = nexus_raft::transport::generate_zone_ca(ORG).expect("gen CA_B");
     let (foreign_cert, foreign_key) =
         nexus_raft::transport::generate_agent_cert(AGENT, &ca_b_pem, &ca_b_key_pem)
@@ -132,7 +132,9 @@ async fn boot_founder_with_ca_b() -> XorgFixture {
         ("NEXUS_CLUSTER_INIT_MOUNTS", mounts.as_str()),
         ("RUST_LOG", LOG_FILTER),
     ];
-    let mut founder = Daemon::spawn(&["--bind-addr", &fadv], &founder_env);
+    let mut args = vec!["--bind-addr", &fadv];
+    args.extend_from_slice(options);
+    let mut founder = Daemon::spawn(&args, &founder_env);
     founder
         .wait_for_log("control zone up", BUDGET)
         .await
@@ -191,7 +193,7 @@ async fn handshake_accepted(port: u16, client_tls: &TlsConfig, budget: Duration)
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn register_foreign_ca_makes_it_trusted_at_the_handshake_live() {
-    let fx = boot_founder_with_ca_b().await;
+    let fx = boot_founder_with_ca_b(&[]).await;
 
     // The client identity we're proving gets trusted: the CA_B-signed leaf as
     // the client cert/key, and the cluster CA to verify the (cluster-signed)
@@ -252,7 +254,7 @@ async fn register_foreign_ca_makes_it_trusted_at_the_handshake_live() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn foreign_agent_mailbox_write_is_stamped_with_qualified_id() {
-    let fx = boot_founder_with_ca_b().await;
+    let fx = boot_founder_with_ca_b(&[]).await;
     fx.register_ca_b();
 
     // The foreign agent connects: the cluster CA verifies the SERVER cert; the
@@ -310,7 +312,7 @@ async fn foreign_agent_mailbox_write_is_stamped_with_qualified_id() {
 /// exfiltrate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn foreign_agent_is_confined_to_its_mailbox() {
-    let fx = boot_founder_with_ca_b().await;
+    let fx = boot_founder_with_ca_b(&[]).await;
     fx.register_ca_b();
     let mut wc = Vfs::connect_mtls(
         fx.fport,
@@ -372,4 +374,123 @@ async fn foreign_agent_is_confined_to_its_mailbox() {
     );
 
     drop(fx.founder);
+}
+
+#[cfg(feature = "http-api")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn foreign_containment_and_live_relationship_grants_both_apply() {
+    use reqwest::{Client, Method};
+    use serde_json::json;
+
+    let http = format!("127.0.0.1:{}", common::free_port());
+    let mut fx = boot_founder_with_ca_b(&["--enable-rebac", "--http-addr", &http]).await;
+    fx.founder
+        .wait_for_log("VFS data plane ready", BUDGET)
+        .await
+        .unwrap();
+    fx.register_ca_b();
+    let (ok, out, err) = cli(
+        &fx.cli_env(),
+        &[
+            "auth",
+            "mint",
+            "--subject-type",
+            "user",
+            "--subject-id",
+            "operator",
+            "--admin",
+        ],
+    );
+    assert!(ok, "admin mint failed: {err}");
+    let admin = out.trim();
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .unwrap();
+    let mailbox = transcript();
+    let off_limits = format!("{MOUNT}/secret.txt");
+    let tuple = |path: &str| {
+        json!({
+            "zone":ZONE, "object_type":"file", "object_id":path, "relation":"writer",
+            "subject_type":"agent", "subject_id":format!("{ORG}/agent/{AGENT}"),
+        })
+    };
+    for path in [&mailbox, &off_limits] {
+        let response = client
+            .post(format!("http://{http}/v2/rebac/tuples"))
+            .bearer_auth(admin)
+            .json(&tuple(path))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_success(),
+            "grant: {}",
+            response.status()
+        );
+    }
+    let tls_dir = std::path::Path::new(&fx.fdata).join("tls");
+    let mut node = Vfs::connect_mtls(
+        fx.fport,
+        &fx.cluster_ca,
+        &std::fs::read(tls_dir.join("node.pem")).unwrap(),
+        &std::fs::read(tls_dir.join("node-key.pem")).unwrap(),
+        BUDGET,
+    )
+    .await;
+    node.write_file(&off_limits, b"private data", "")
+        .await
+        .unwrap();
+    let mut foreign = Vfs::connect_mtls(
+        fx.fport,
+        &fx.cluster_ca,
+        &fx.foreign_cert,
+        &fx.foreign_key,
+        BUDGET,
+    )
+    .await;
+    foreign.create_stream(&mailbox, "").await.unwrap();
+    foreign
+        .stream_write(&mailbox, br#"{"body":"permitted message"}"#, "")
+        .await
+        .unwrap();
+    assert!(!foreign
+        .stream_collect_all(&mailbox, "")
+        .await
+        .unwrap()
+        .is_empty());
+
+    // Even an explicit relationship grant cannot widen the foreign trust boundary.
+    let error = foreign
+        .write_file(&off_limits, b"outside data", "")
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("confined"),
+        "containment must deny despite the writer grant: {error}"
+    );
+    let error = foreign.read_file(&off_limits, "").await.unwrap_err();
+    assert!(
+        error.contains("confined"),
+        "reads must retain containment: {error}"
+    );
+    assert_eq!(
+        node.read_file(&off_limits, "").await.unwrap(),
+        b"private data"
+    );
+
+    let response = client
+        .request(Method::DELETE, format!("http://{http}/v2/rebac/tuples"))
+        .bearer_auth(admin)
+        .json(&tuple(&mailbox))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    let error = foreign.stream_collect_all(&mailbox, "").await.unwrap_err();
+    assert!(
+        error.contains("rebac"),
+        "containment approval must still require a live grant: {error}"
+    );
 }

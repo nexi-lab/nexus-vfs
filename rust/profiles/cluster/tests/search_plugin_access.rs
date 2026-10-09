@@ -13,8 +13,10 @@ use nexus_raft::auth_key_store::RaftAuthKeyStore;
 use nexus_raft::raft::ZoneRaftRegistry;
 use nexus_rebac::{RaftReBACTupleStore, ReBACGraphCache, ReBACTupleStore, RebacPermissionProvider};
 use nexus_search_plugin::search_proto::{search_service_client::SearchServiceClient, *};
+use prost::Message;
 use tonic::{Code, Request};
 use transport::grpc::DataPlaneReady;
+use transport::grpc_plugin_access::PluginGrpcPolicy;
 use transport::grpc_plugin_proxy::extend_routes_with_plugin_endpoints;
 use transport::grpc_search_access::SearchGrpcPolicy;
 
@@ -121,6 +123,15 @@ async fn credentials_and_live_permissions_survive_signed_plugin_and_cached_searc
         ZONE,
         // The whole zone: this is the only mount of it, and the backend's files
         // sit at its root.
+        "/",
+        true,
+    );
+    let other_backend = backends::storage::path_local::PathLocalBackend::new(&docs, false).unwrap();
+    kernel.vfs_router_arc().add_federation_mount(
+        "/other-docs",
+        "root",
+        Some(Arc::new(other_backend)),
+        "otherzone",
         "/",
         true,
     );
@@ -370,6 +381,223 @@ async fn credentials_and_live_permissions_survive_signed_plugin_and_cached_searc
         ["/docs/public.md"]
     );
 
+    // Refine the discovery result through the same caller boundary. Private
+    // paths precede public ones to catch cap starvation before authorization.
+    let working = DiscoveryFiles {
+        paths: vec![
+            "/docs/private.md".into(),
+            "docs/public.md".into(),
+            "/docs/public.md".into(),
+            "/docs-other/public.md".into(),
+        ],
+    };
+    let refined = client
+        .grep(GrepRequest {
+            root_path: "/docs".into(),
+            pattern: "widget".into(),
+            max_results: 1,
+            files: Some(working),
+            auth_token: alice.key.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(refined.error.is_none(), "{refined:?}");
+    assert_eq!(refined.applied_filters, DiscoveryFilter::Files as u32);
+    assert_eq!(refined.matches.len(), 1);
+    assert_eq!(refined.matches[0].path, "/docs/public.md");
+    assert!(
+        !refined.truncated,
+        "denied and duplicate paths cannot consume the cap"
+    );
+    let empty = client
+        .glob(GlobRequest {
+            root_path: "/docs".into(),
+            pattern: "*.md".into(),
+            files: Some(DiscoveryFiles { paths: vec![] }),
+            auth_token: alice.key.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(empty.paths.is_empty());
+    assert_eq!(
+        client
+            .grep(GrepRequest {
+                root_path: "/docs".into(),
+                pattern: "widget".into(),
+                files: Some(DiscoveryFiles {
+                    paths: vec!["/docs/../private.md".into()]
+                }),
+                auth_token: alice.key.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    assert_eq!(
+        client
+            .glob(GlobRequest {
+                root_path: "/docs".into(),
+                pattern: "*.md".into(),
+                files: Some(DiscoveryFiles {
+                    paths: vec!["/docs/public.md".into(); 10_001]
+                }),
+                auth_token: alice.key.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+
+    assert_eq!(
+        client
+            .grep(GrepRequest {
+                root_path: "/docs".into(),
+                pattern: "widget".into(),
+                files: Some(DiscoveryFiles {
+                    paths: vec!["/other-docs/public.md".into()]
+                }),
+                auth_token: alice.key.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+
+    // Old plugins encode no acknowledgement even for readable results. The
+    // host must reject those responses before returning an unscoped result.
+    let selection = Some(DiscoveryFiles {
+        paths: vec!["/docs/public.md".into()],
+    });
+    let legacy_cases = [
+        (
+            "Glob",
+            GlobRequest {
+                root_path: "/docs".into(),
+                pattern: "*.md".into(),
+                files: selection.clone(),
+                auth_token: alice.key.clone(),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+            GlobResponse {
+                paths: vec!["/docs/public.md".into()],
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ),
+        (
+            "Grep",
+            GrepRequest {
+                root_path: "/docs".into(),
+                pattern: "widget".into(),
+                files: selection,
+                auth_token: alice.key.clone(),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+            GrepResponse {
+                matches: vec![GrepMatch {
+                    path: "/docs/public.md".into(),
+                    line_number: 1,
+                    line: "widget".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ),
+    ];
+    for (method, mut request, old_response) in legacy_cases {
+        let call = policy
+            .authorize(method, &mut request, &Default::default(), None)
+            .unwrap();
+        assert_eq!(
+            call.complete(old_response).unwrap_err().code(),
+            Code::Unimplemented
+        );
+    }
+
+    // A plugin that implements files but lacks structural filters must also fail closed.
+    let mut partial_request = GrepRequest {
+        root_path: "/docs".into(),
+        pattern: "widget".into(),
+        files: Some(DiscoveryFiles {
+            paths: vec!["/docs/public.md".into()],
+        }),
+        section: Some("Chapter".into()),
+        auth_token: alice.key.clone(),
+        ..Default::default()
+    }
+    .encode_to_vec();
+    let call = policy
+        .authorize("Grep", &mut partial_request, &Default::default(), None)
+        .unwrap();
+    let partial_response = GrepResponse {
+        applied_filters: DiscoveryFilter::Files as u32,
+        ..Default::default()
+    }
+    .encode_to_vec();
+    assert_eq!(
+        call.complete(partial_response).unwrap_err().code(),
+        Code::Unimplemented
+    );
+
+    // Parse current source bytes through the signed plugin and live authorization.
+    std::fs::write(
+        docs.join("public.md"),
+        "# Chapter\nwidget prose\n```txt\nwidget code\n```\n",
+    )
+    .unwrap();
+    let structural = client
+        .grep(GrepRequest {
+            root_path: "/docs".into(),
+            pattern: "widget".into(),
+            max_results: 1,
+            files: Some(DiscoveryFiles {
+                paths: vec!["/docs/private.md".into(), "/docs/public.md".into()],
+            }),
+            block_type: Some("code".into()),
+            section: Some("# Chapter".into()),
+            auth_token: alice.key.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        structural.applied_filters,
+        DiscoveryFilter::Files as u32
+            | DiscoveryFilter::BlockType as u32
+            | DiscoveryFilter::Section as u32
+    );
+    assert_eq!(structural.matches.len(), 1, "{structural:?}");
+    assert_eq!(structural.matches[0].line, "widget code");
+    assert_eq!(structural.matches[0].line_number, 4);
+    let section = structural.matches[0].section.as_ref().unwrap();
+    assert_eq!(
+        (
+            &*section.heading,
+            section.depth,
+            section.line_start,
+            section.line_end
+        ),
+        ("Chapter", 1, 1, 5)
+    );
+    assert!(
+        !structural.truncated,
+        "prose and denied files cannot consume the cap"
+    );
+
     // Changing only a relation does not invalidate the plugin's search cache.
     // The response must nevertheless reflect the new permission graph.
     tuples.delete(&alice_grant).unwrap();
@@ -377,6 +605,24 @@ async fn credentials_and_live_permissions_survive_signed_plugin_and_cached_searc
     assert_eq!(
         paths(client.query(query(&bob.key)).await.unwrap().into_inner()),
         ["/docs/private.md"]
+    );
+    let revoked = client
+        .grep(GrepRequest {
+            root_path: "/docs".into(),
+            pattern: "widget".into(),
+            files: Some(DiscoveryFiles {
+                paths: vec!["/docs/public.md".into()],
+            }),
+            auth_token: alice.key.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(revoked.error.is_none());
+    assert!(
+        revoked.matches.is_empty(),
+        "working sets must observe live grant revocation"
     );
     grant(tuples.as_ref(), "/docs/public.md", "alice");
     assert_eq!(

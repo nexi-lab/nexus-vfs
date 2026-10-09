@@ -2,7 +2,7 @@
 name = "nexus-search-plugin"
 version = "0.1.0"
 edition = "2021"
-description = "Nexus search plugin — cdylib loaded by `nexusd-cluster` via `--plugin-dir`. Hosts SearchService (recursive glob + regex grep over the kernel VFS) as a Phase P plugin-as-gRPC-service. Rust replacement for the Python `nexus.bricks.search.search_service.SearchService`."
+description = "Indexed search and VFS discovery as a Nexus gRPC service plugin"
 authors = ["Nexus Team"]
 publish = false
 
@@ -48,6 +48,7 @@ tonic-prost = { workspace = true }
 # glob paths, so pattern semantics stay identical across the
 # Python / Rust boundary while the migration is in flight.
 globset = { workspace = true }
+pulldown-cmark = { version = "0.13", default-features = false }
 
 # Regex engine for grep.  `regex-syntax` is pulled transitively.
 regex = { workspace = true }

@@ -32,12 +32,14 @@ use kernel::core::dispatch::{HookContext, HookOutcome, NativeInterceptHook};
 use crate::classifier::{EgressClassifier, EgressRequest};
 use crate::enforce::{redact, Action, GatePolicy};
 
-/// Leaves the gate claims by default: the A2A conversation transcript.
+/// The A2A conversation transcript leaf.
 ///
-/// This is the plane the collaboration discipline is written against — a
-/// message leaving the node is the one crossing that it is supposed to be
-/// possible to assert about. Taken from `a2a` rather than spelled here so
-/// a rename of the leaf reaches the gate.
+/// The message plane the collaboration discipline is written against. It is
+/// claimed only under the cross-domain mounts a deployment names, never
+/// everywhere: a managed session's turns are a conversation too, and a
+/// user's messages to the agent on their own node are not egress. Taken
+/// from `a2a` rather than spelled here so a rename of the leaf reaches the
+/// gate.
 pub const DEFAULT_EGRESS_SUFFIXES: &[&str] = a2a::MAILBOX_WRITE_SUFFIXES;
 
 /// One way content leaves the node: a write leaf, optionally confined to
@@ -101,6 +103,10 @@ impl EgressPlane {
     }
 
     /// The A2A transcript planes — [`DEFAULT_EGRESS_SUFFIXES`], anywhere.
+    ///
+    /// Only for a daemon whose every conversation crosses a domain
+    /// boundary. Where managed sessions are hosted, use
+    /// [`Self::under`] with the cross-domain mounts instead.
     #[must_use]
     pub fn a2a_transcripts() -> Vec<Self> {
         DEFAULT_EGRESS_SUFFIXES
@@ -133,8 +139,9 @@ pub struct EgressContentHook {
 }
 
 impl EgressContentHook {
-    /// Gate the A2A transcript with the default policy (redact on a
-    /// finding, deny when the classifier fails).
+    /// Gate every A2A transcript with the default policy (redact on a
+    /// finding, deny when the classifier fails). See
+    /// [`EgressPlane::a2a_transcripts`] for where that is appropriate.
     #[must_use]
     pub fn new(classifier: Arc<dyn EgressClassifier>) -> Self {
         Self::with_policy(

@@ -19,6 +19,7 @@
 use std::collections::HashMap;
 use std::ffi::{c_void, CStr};
 use std::os::raw::c_char;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use nexus_plugin_abi::KernelHandle;
 
@@ -26,7 +27,7 @@ use nexus_plugin_abi::KernelHandle;
 
 struct FileEntry {
     bytes: Vec<u8>,
-    mtime_ms: i64,
+    mtime_ms: Option<i64>,
     /// entry_type reported by `sys_stat` — `0` (DT_REG) for regular
     /// files, `4` (DT_STREAM) for streams.  Kept per-entry so the
     /// mock's stat matches the shape a real kernel returns; the
@@ -40,6 +41,9 @@ struct FileEntry {
 pub struct MockKernel {
     files: HashMap<String, FileEntry>,
     dirs: HashMap<String, Vec<(String, u8)>>,
+    reads: AtomicUsize,
+    readdirs: AtomicUsize,
+    stats: AtomicUsize,
 }
 
 impl MockKernel {
@@ -47,7 +51,19 @@ impl MockKernel {
         Self {
             files: HashMap::new(),
             dirs: HashMap::new(),
+            reads: AtomicUsize::new(0),
+            readdirs: AtomicUsize::new(0),
+            stats: AtomicUsize::new(0),
         }
+    }
+
+    /// (read, readdir, stat) callbacks observed by this filesystem.
+    pub fn io_counts(&self) -> (usize, usize, usize) {
+        (
+            self.reads.load(Ordering::Relaxed),
+            self.readdirs.load(Ordering::Relaxed),
+            self.stats.load(Ordering::Relaxed),
+        )
     }
 
     pub fn add_file(&mut self, path: &str, bytes: &[u8], mtime_ms: i64) {
@@ -55,7 +71,7 @@ impl MockKernel {
             path.to_string(),
             FileEntry {
                 bytes: bytes.to_vec(),
-                mtime_ms,
+                mtime_ms: Some(mtime_ms),
                 entry_type: 0, // DT_REG
             },
         );
@@ -76,7 +92,7 @@ impl MockKernel {
             path.to_string(),
             FileEntry {
                 bytes: bytes.to_vec(),
-                mtime_ms,
+                mtime_ms: Some(mtime_ms),
                 entry_type: 4, // DT_STREAM
             },
         );
@@ -85,6 +101,10 @@ impl MockKernel {
             .entry(parent)
             .or_default()
             .push((name, 4 /* DT_STREAM */));
+    }
+
+    pub fn clear_mtime(&mut self, path: &str) {
+        self.files.get_mut(path).expect("registered file").mtime_ms = None;
     }
 
     /// Append bytes to an existing DT_STREAM path (idempotent test-
@@ -99,7 +119,7 @@ impl MockKernel {
             .expect("append_to_stream: path not registered");
         assert_eq!(entry.entry_type, 4, "append_to_stream requires DT_STREAM");
         entry.bytes.extend_from_slice(extra);
-        entry.mtime_ms = new_mtime_ms;
+        entry.mtime_ms = Some(new_mtime_ms);
     }
 
     /// Remove a registered path — used by tests that exercise the
@@ -159,6 +179,7 @@ unsafe extern "C" fn mock_sys_read(
     out_len: *mut usize,
 ) -> i32 {
     let kernel = &*(k as *const MockKernel);
+    kernel.reads.fetch_add(1, Ordering::Relaxed);
     let p = match CStr::from_ptr(path).to_str() {
         Ok(s) => s,
         Err(_) => return -2,
@@ -179,6 +200,7 @@ unsafe extern "C" fn mock_sys_readdir(
     out_len: *mut usize,
 ) -> i32 {
     let kernel = &*(k as *const MockKernel);
+    kernel.readdirs.fetch_add(1, Ordering::Relaxed);
     let p = match CStr::from_ptr(parent_path).to_str() {
         Ok(s) => s,
         Err(_) => return -2,
@@ -205,6 +227,7 @@ unsafe extern "C" fn mock_sys_stat(
     out_len: *mut usize,
 ) -> i32 {
     let kernel = &*(k as *const MockKernel);
+    kernel.stats.fetch_add(1, Ordering::Relaxed);
     let p = match CStr::from_ptr(path).to_str() {
         Ok(s) => s,
         Err(_) => return -2,

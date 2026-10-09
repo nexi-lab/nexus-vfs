@@ -63,6 +63,7 @@
 
 pub mod classifier;
 pub mod combine;
+pub mod credentials;
 pub mod enforce;
 pub mod hook;
 mod json_layout;
@@ -74,6 +75,7 @@ pub use classifier::{
     Classification, Confidence, EgressClassifier, EgressRequest, Finding, FindingKind,
 };
 pub use combine::AllOf;
+pub use credentials::CredentialRules;
 pub use enforce::{redact, Action, GatePolicy, Redacted};
 pub use hook::{EgressContentHook, EgressPlane, DEFAULT_EGRESS_SUFFIXES};
 pub use rules::DeterministicRules;
@@ -91,6 +93,17 @@ pub const ENV_POLICY: &str = "NEXUS_EGRESS_GATE_POLICY";
 /// Env var listing, comma-separated, the model mounts whose prompts leave
 /// the node. Unset or empty = the model plane is not gated.
 pub const ENV_MODEL_MOUNTS: &str = "NEXUS_EGRESS_GATE_MODEL_MOUNTS";
+/// Env var listing, comma-separated, the mounts under which A2A
+/// conversation transcripts leave the node. Unset or empty = no transcript
+/// is gated.
+///
+/// Opt-in and scoped for the same reason the model plane is: a managed
+/// session's turns are themselves an A2A conversation (`a2a::session`), so
+/// gating every transcript would redact what a user tells the agent on
+/// their own node — the private-data path the local runtime exists for.
+/// Only conversations that cross to another domain are egress, and that is
+/// a deployment fact the daemon cannot infer from a path.
+pub const ENV_A2A_MOUNTS: &str = "NEXUS_EGRESS_GATE_A2A_MOUNTS";
 /// Env var naming a local Presidio analyzer (`http://127.0.0.1:<port>`).
 /// Set = contextual detection runs alongside the deterministic rules.
 pub const ENV_PRESIDIO_URL: &str = "NEXUS_EGRESS_GATE_PRESIDIO_URL";
@@ -114,6 +127,9 @@ pub struct GateConfig {
     pub policy: GatePolicy,
     /// Mount points whose `.prompt` writes reach a model outside the node.
     pub model_mounts: Vec<String>,
+    /// Mount points under which conversation transcripts are shared with
+    /// another domain.
+    pub a2a_mounts: Vec<String>,
     /// A local Presidio analyzer to run alongside the deterministic rules.
     pub presidio: Option<PresidioSettings>,
 }
@@ -200,8 +216,38 @@ impl GateConfig {
         Ok(Self {
             policy,
             model_mounts: list(ENV_MODEL_MOUNTS),
+            a2a_mounts: list(ENV_A2A_MOUNTS),
             presidio,
         })
+    }
+
+    /// The planes these settings name: transcripts under the A2A mounts,
+    /// and `prompt_suffix` (the LLM mount request leaf, `None` in a build
+    /// without the model driver) under the model mounts.
+    ///
+    /// # Errors
+    ///
+    /// A mount that is not an absolute path below the root, or model mounts
+    /// named on a build without the model driver — that deployment believes
+    /// its prompts are gated, and no prompt can reach the gate.
+    pub fn planes(&self, prompt_suffix: Option<&'static str>) -> Result<Vec<EgressPlane>, String> {
+        let mut planes = Vec::new();
+        if !self.a2a_mounts.is_empty() {
+            for leaf in DEFAULT_EGRESS_SUFFIXES {
+                planes.push(EgressPlane::under(leaf, &self.a2a_mounts)?);
+            }
+        }
+        if !self.model_mounts.is_empty() {
+            let Some(suffix) = prompt_suffix else {
+                return Err(format!(
+                    "{ENV_MODEL_MOUNTS} names {:?}, but this build has no LLM mount \
+                     driver, so no prompt can reach a model through it",
+                    self.model_mounts
+                ));
+            };
+            planes.push(EgressPlane::under(suffix, &self.model_mounts)?);
+        }
+        Ok(planes)
     }
 
     /// The classifier these settings call for: the deterministic rules,
@@ -213,7 +259,7 @@ impl GateConfig {
     /// that deployment believes contextual detection is running, and it is
     /// not — or an analyzer URL the provider refuses (not loopback).
     pub fn classifier(&self) -> Result<Arc<dyn EgressClassifier>, String> {
-        let rules: Arc<dyn EgressClassifier> = Arc::new(DeterministicRules::new());
+        let rules: Arc<dyn EgressClassifier> = deterministic();
         let Some(p) = &self.presidio else {
             return Ok(rules);
         };
@@ -238,6 +284,16 @@ impl GateConfig {
             ))
         }
     }
+}
+
+/// The in-tree detectors together: provable PRC identifiers and
+/// credentials. Both are deterministic and need no network, so every
+/// configuration runs them.
+fn deterministic() -> Arc<dyn EgressClassifier> {
+    Arc::new(AllOf::new(vec![
+        Arc::new(DeterministicRules::new()),
+        Arc::new(CredentialRules::new()),
+    ]))
 }
 
 /// Arm the gate. Call once at daemon boot.
@@ -284,23 +340,28 @@ pub fn service_decl(
     }
 }
 
-/// The gate with the in-tree deterministic rules and the default policy,
-/// on the A2A transcript — redact what is provable, refuse what cannot be
-/// sanitised, refuse if the detector fails.
+/// The gate with the in-tree deterministic rules and the default policy on
+/// **every** A2A transcript — redact what is provable, refuse what cannot
+/// be sanitised, refuse if the detector fails.
 ///
-/// This is the configuration that needs no procurement and no network, so
-/// it is the one a build can turn on unconditionally.
+/// Only for a daemon whose every conversation crosses a domain boundary.
+/// A daemon that hosts managed sessions must not use it: session turns are
+/// conversations too, and this would redact a user's own messages to their
+/// local agent. Such a daemon uses [`service_decl_from_env`] and names the
+/// cross-domain mounts.
 pub fn service_decl_deterministic() -> ServiceDecl {
     service_decl(
-        Arc::new(DeterministicRules::new()),
+        deterministic(),
         GatePolicy::default(),
         EgressPlane::a2a_transcripts(),
     )
 }
 
 /// The gate configured from the environment: the deterministic rules (plus
-/// a Presidio analyzer if one is named), the A2A transcript plane, and the
-/// model plane on `prompt_suffix` under [`GateConfig::model_mounts`].
+/// a Presidio analyzer if one is named), the transcript plane under
+/// [`GateConfig::a2a_mounts`], and the model plane on `prompt_suffix` under
+/// [`GateConfig::model_mounts`]. With neither configured the gate is armed
+/// and claims nothing, which the boot log says.
 ///
 /// `prompt_suffix` is `None` in a build with no LLM mount driver. A
 /// deployment that names model mounts on such a build is refused at
@@ -316,16 +377,12 @@ pub fn service_decl_from_env(prompt_suffix: Option<&'static str>) -> ServiceDecl
         name: SERVICE_NAME.to_string(),
         install: Box::new(move |kernel| {
             let config = config?;
-            let mut planes = EgressPlane::a2a_transcripts();
-            if !config.model_mounts.is_empty() {
-                let Some(suffix) = prompt_suffix else {
-                    return Err(format!(
-                        "{ENV_MODEL_MOUNTS} names {:?}, but this build has no LLM mount \
-                         driver, so no prompt can reach a model through it",
-                        config.model_mounts
-                    ));
-                };
-                planes.push(EgressPlane::under(suffix, &config.model_mounts)?);
+            let planes = config.planes(prompt_suffix)?;
+            if planes.is_empty() {
+                tracing::warn!(
+                    "egress gate built but no plane configured; nothing is gated (set {} and/or {})",
+                    ENV_MODEL_MOUNTS, ENV_A2A_MOUNTS
+                );
             }
             install_egress_content_gate(kernel, config.classifier()?, config.policy, planes)
         }),
@@ -350,8 +407,15 @@ mod tests {
         let c = parse(&[]).unwrap();
         assert_eq!(c.policy.on_finding, Action::Redact);
         assert!(c.model_mounts.is_empty());
+        assert!(
+            c.a2a_mounts.is_empty(),
+            "no transcript is gated unless named"
+        );
         assert!(c.presidio.is_none());
-        assert_eq!(c.classifier().unwrap().name(), "deterministic-prc");
+        assert_eq!(
+            c.classifier().unwrap().name(),
+            "deterministic-prc+credentials"
+        );
     }
 
     #[test]
@@ -412,7 +476,10 @@ mod tests {
     #[test]
     fn an_analyzer_joins_the_rules() {
         let c = parse(&[(ENV_PRESIDIO_URL, "http://127.0.0.1:5002")]).unwrap();
-        assert_eq!(c.classifier().unwrap().name(), "deterministic-prc+presidio");
+        assert_eq!(
+            c.classifier().unwrap().name(),
+            "deterministic-prc+credentials+presidio"
+        );
     }
 
     #[cfg(feature = "presidio")]

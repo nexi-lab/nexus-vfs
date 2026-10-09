@@ -60,6 +60,11 @@ pub enum FindingKind {
     /// PRC unified social credit identifier (统一社会信用代码), 18
     /// characters.
     UnifiedSocialCreditId,
+    /// A credential — a key, token or password — named by what it is, e.g.
+    /// `AWS-ACCESS-KEY` or `PRIVATE-KEY`. One variant rather than one per
+    /// issuer because the set grows with every cloud a deployment talks
+    /// to, and the gate treats them all alike.
+    Credential(&'static str),
     /// A kind reported by an external provider.
     Other(String),
 }
@@ -77,6 +82,7 @@ impl FindingKind {
             Self::BankCard => "BANK-CARD",
             Self::PrcMobile => "PRC-MOBILE",
             Self::UnifiedSocialCreditId => "PRC-USCI",
+            Self::Credential(s) => s,
             Self::Other(s) => s,
         }
     }
