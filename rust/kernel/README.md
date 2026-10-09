@@ -1,8 +1,7 @@
 # kernel
 
 Pure Rust VFS kernel crate. Owns all core state: VFSRouter, Trie,
-MetaStore, LockManager, PipeManager, StreamManager, FileWatchRegistry,
-PermissionLeaseCache.
+MetaStore, LockManager, PipeManager, StreamManager, FileWatchRegistry.
 
 Zero Python dependency. The kernel compiles into `nexusd-cluster`
 (standalone binary). Python interacts via gRPC (no in-process binding).
@@ -70,7 +69,6 @@ src/
     dispatch/         FileEvent, HookContext, NativeInterceptHook trait
     vfs_router.rs     Longest-prefix-match mount routing
     meta_store/       MetaStore trait + redb/remote impls
-    permission_cache.rs  PermissionLeaseCache
   abc/                ObjectStore, MetaStore trait definitions
   pipe_manager.rs     DT_PIPE ring buffers
   stream_manager.rs   DT_STREAM append-only logs

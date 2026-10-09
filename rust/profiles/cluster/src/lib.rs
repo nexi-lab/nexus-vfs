@@ -3420,11 +3420,11 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
                         consensus: &nexus_raft::prelude::ZoneConsensus<
             nexus_raft::prelude::FullStateMachine,
         >| {
-            // The observer self-recovers the watched file path from the
-            // wal-stream entry key — no per-zone mapping needed.
+            // WAL paths are relative to the consensus that committed them.
             nexus_raft::stream_wakeup::install_stream_wakeup_observer(
                 consensus,
                 kernel_for_hook.clone(),
+                zone_id,
             );
             // Same per-zone spine, sibling concern: a replicated
             // `TrimStreamSegment` (a wal DT_STREAM over its retention budget)
@@ -3433,6 +3433,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
             nexus_raft::stream_retention_gc::install_stream_trim_gc_observer(
                 consensus,
                 kernel_for_hook.clone(),
+                zone_id,
                 runtime_for_hook.clone(),
             );
             tracing::info!(zone_id = %zone_id, "a2a stream-wakeup + retention-GC observers armed");
