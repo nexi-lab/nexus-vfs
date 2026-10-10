@@ -907,14 +907,31 @@ impl ManagedAgentService<kernel::kernel::Kernel> {
         // routes by mount-point lookup, so `sys_unlink` on
         // `/proc/{pid}/...` paths needs the mount entry to exist
         // (`route()` returns NotMounted otherwise and unlink no-ops).
-        // No backing store / per-mount metastore — `metastore=None`
-        // means dirent reads/writes fall through to the global
-        // metastore (matches the procfs-virtualised semantics this
-        // mount represents). Idempotent re-call: VFSRouter::add_mount
-        // ignores duplicates.
-        kernel
-            .vfs_router_arc()
-            .add_mount("/proc", "root", None, false);
+        // Process inodes have the same lifetime as the kernel-owned PCBs.
+        // Keep their namespace outside the durable file metastore, preserving
+        // an existing process namespace if this service is installed again.
+        let router = kernel.vfs_router_arc();
+        router.add_mount("/proc", contracts::ROOT_ZONE_ID, None, false);
+        let is_store_installed = router
+            .get("/proc", contracts::ROOT_ZONE_ID)
+            .is_some_and(|entry| entry.metastore.is_some());
+        if !is_store_installed {
+            let ctx = contracts::OperationContext::new(
+                SERVICE_NAME,
+                contracts::ROOT_ZONE_ID,
+                true,
+                None,
+                true,
+            );
+            KernelSyscall::sys_unlink(&**kernel, "/proc", &ctx, true)
+                .map_err(|error| format!("process namespace cleanup: {error}"))?;
+            let store = kernel::meta_store::LocalMetaStore::in_memory()
+                .map_err(|error| format!("process metastore: {error:?}"))?;
+            router.install_metastore(
+                &kernel::vfs_router::canonicalize_mount_path("/proc", contracts::ROOT_ZONE_ID),
+                Arc::new(store),
+            );
+        }
 
         // Holding `Arc<Kernel>` inside the service does create a
         // Kernel ↔ Service Arc cycle, but services live for process
