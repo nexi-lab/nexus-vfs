@@ -15,7 +15,7 @@ use crate::grpc::{tests::kernel_with_mem_backend, VfsServiceImpl};
 struct AgentAuth;
 impl AuthProvider for AgentAuth {
     fn resolve(&self, _: &AuthCredentials<'_>) -> Result<OperationContext, Status> {
-        let mut ctx = OperationContext::new("owner", "root", false, Some("agent-a".into()), false);
+        let mut ctx = OperationContext::new("owner", "root", false, Some("agent-a"), false);
         ctx.subject_type = "agent".into();
         ctx.subject_id = Some("agent-a".into());
         Ok(ctx)
