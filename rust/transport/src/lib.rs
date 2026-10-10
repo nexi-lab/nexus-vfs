@@ -56,6 +56,8 @@ pub mod peer_blob;
 /// rustls has already verified against the cluster CA. Feeds
 /// `AuthCredentials::peer`.
 pub mod peer_identity;
+/// User-runtime confinement and original-agent delegation over a verified gateway.
+pub mod runtime_scope;
 /// Post-transport substrate observability.  Dual of
 /// [`peer_blob`]: peer_blob does cross-node blob fetches,
 /// transport_observer classifies which substrate path each fetch
