@@ -805,18 +805,19 @@ impl NexusVfsService for VfsServiceImpl {
     }
 
     async fn stat(&self, req: Request<StatRequest>) -> Result<Response<StatResponse>, Status> {
-        let (ctx, req) = match self.authenticate(req).await {
+        let (mut ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_stat(s))),
         };
-        let zone_id = if req.zone_id.is_empty() {
-            ctx.zone_id.as_str()
-        } else {
-            req.zone_id.as_str()
-        };
+        if !req.zone_id.is_empty() {
+            ctx.zone_id = req.zone_id;
+        }
+        if let Err(status) = self.authorize_path(&req.path, Permission::Read, &ctx) {
+            return Ok(Response::new(error_stat(status)));
+        }
         // `sys_stat` returns `Option` — `None` is "no such path", a
         // normal result surfaced as `found = false` (not an error).
-        match self.kernel.sys_stat(&req.path, zone_id) {
+        match self.kernel.sys_stat(&req.path, &ctx.zone_id) {
             Some(s) => Ok(Response::new(StatResponse {
                 found: true,
                 path: s.path,
@@ -848,15 +849,17 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<ReaddirRequest>,
     ) -> Result<Response<ReaddirResponse>, Status> {
-        let (ctx, req) = match self.authenticate(req).await {
+        let (mut ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_readdir(s))),
         };
-        let zone_id = if req.zone_id.is_empty() {
-            ctx.zone_id.as_str()
-        } else {
-            req.zone_id.as_str()
-        };
+        if !req.zone_id.is_empty() {
+            ctx.zone_id = req.zone_id;
+        }
+        if let Err(status) = self.authorize_path(&req.path, Permission::Read, &ctx) {
+            return Ok(Response::new(error_readdir(status)));
+        }
+        let zone_id = ctx.zone_id.as_str();
         // `is_admin` comes from the auth-resolved context, never the
         // request — clients can't spoof admin reads of `/__sys__/zones/`.
         //
@@ -888,7 +891,8 @@ impl NexusVfsService for VfsServiceImpl {
             // a client's glob/grep off tree-walking. `limit == 0` is unbounded.
             let opts = kernel::kernel::syscall::ReaddirOpts {
                 recursive: req.recursive,
-                limit: (req.limit != 0).then_some(req.limit as usize),
+                // Apply the cap after authorization so hidden names cannot fill a page.
+                limit: None,
             };
             match self
                 .kernel
@@ -905,13 +909,21 @@ impl NexusVfsService for VfsServiceImpl {
                 }
             }
         };
-        let mapped: Vec<ReaddirEntry> = entries
-            .into_iter()
-            .map(|(name, dt)| ReaddirEntry {
+        let mut mapped = Vec::new();
+        for (name, dt) in entries {
+            match self.authorize_path(&name, Permission::Read, &ctx) {
+                Ok(()) => {}
+                Err(status) if status.code() == tonic::Code::PermissionDenied => continue,
+                Err(status) => return Ok(Response::new(error_readdir(status))),
+            }
+            mapped.push(ReaddirEntry {
                 name,
                 entry_type: dt as u32,
-            })
-            .collect();
+            });
+            if !req.from_peer && req.limit != 0 && mapped.len() >= req.limit as usize {
+                break;
+            }
+        }
         Ok(Response::new(ReaddirResponse {
             entries: mapped,
             is_error: false,
@@ -1025,10 +1037,13 @@ impl NexusVfsService for VfsServiceImpl {
     }
 
     async fn lock(&self, req: Request<LockRequest>) -> Result<Response<LockResponse>, Status> {
-        let (_ctx, req) = match self.authenticate(req).await {
+        let (ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_lock(s))),
         };
+        if let Err(status) = self.authorize_path(&req.path, Permission::Write, &ctx) {
+            return Ok(Response::new(error_lock(status)));
+        }
         // Match the Call wire surface (mode / max_holders / ttl_secs are
         // hardcoded on the JSON path; expose only when there's a caller
         // that needs to vary them).
@@ -1068,10 +1083,13 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<UnlockRequest>,
     ) -> Result<Response<UnlockResponse>, Status> {
-        let (_ctx, req) = match self.authenticate(req).await {
+        let (ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_unlock(s))),
         };
+        if let Err(status) = self.authorize_path(&req.path, Permission::Write, &ctx) {
+            return Ok(Response::new(error_unlock(status)));
+        }
         match self.kernel.sys_unlock(&req.path, &req.lock_id, req.force) {
             Ok(released) => Ok(Response::new(UnlockResponse {
                 released,
@@ -1090,10 +1108,15 @@ impl NexusVfsService for VfsServiceImpl {
     }
 
     async fn watch(&self, req: Request<WatchRequest>) -> Result<Response<WatchResponse>, Status> {
-        let (_ctx, req) = match self.authenticate(req).await {
+        let (ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_watch(s))),
         };
+        if let Err(status) =
+            self.authorize_path(Self::watch_scope(&req.path), Permission::Read, &ctx)
+        {
+            return Ok(Response::new(error_watch(status)));
+        }
         // Offload: sys_watch blocks up to 30s waiting for events
         let kernel = self.kernel.clone();
         let path = req.path;
@@ -1104,6 +1127,11 @@ impl NexusVfsService for VfsServiceImpl {
                 .map(|evt| (evt.path().to_string(), format!("{:?}", evt.event_type)))
         })
         .await?;
+        if let Some((path, _)) = &matched {
+            if let Err(status) = self.authorize_path(path, Permission::Read, &ctx) {
+                return Ok(Response::new(error_watch(status)));
+            }
+        }
         match matched {
             Some((path, event_type)) => Ok(Response::new(WatchResponse {
                 matched: true,
@@ -1126,12 +1154,14 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<GetXattrRequest>,
     ) -> Result<Response<GetXattrResponse>, Status> {
-        let (_ctx, req) = match self.authenticate(req).await {
+        let (ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_get_xattr(s))),
         };
-        match KernelConvenience::get_xattr(&*self.kernel, &req.path, &req.key, kernel::ROOT_ZONE_ID)
-        {
+        if let Err(status) = self.authorize_path(&req.path, Permission::Read, &ctx) {
+            return Ok(Response::new(error_get_xattr(status)));
+        }
+        match KernelConvenience::get_xattr(&*self.kernel, &req.path, &req.key, &ctx.zone_id) {
             Ok(Some(value)) => Ok(Response::new(GetXattrResponse {
                 found: true,
                 value,
@@ -1160,16 +1190,19 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<SetXattrRequest>,
     ) -> Result<Response<SetXattrResponse>, Status> {
-        let (_ctx, req) = match self.authenticate(req).await {
+        let (ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_set_xattr(s))),
         };
+        if let Err(status) = self.authorize_path(&req.path, Permission::Write, &ctx) {
+            return Ok(Response::new(error_set_xattr(status)));
+        }
         match KernelConvenience::set_xattr(
             &*self.kernel,
             &req.path,
             &req.key,
             req.value,
-            kernel::ROOT_ZONE_ID,
+            &ctx.zone_id,
         ) {
             Ok(()) => Ok(Response::new(SetXattrResponse {
                 is_error: false,
@@ -1189,16 +1222,16 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<GetXattrBulkRequest>,
     ) -> Result<Response<GetXattrBulkResponse>, Status> {
-        let (_ctx, req) = match self.authenticate(req).await {
+        let (ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_get_xattr_bulk(s))),
         };
-        match KernelConvenience::get_xattr_bulk(
-            &*self.kernel,
-            &req.paths,
-            &req.key,
-            kernel::ROOT_ZONE_ID,
-        ) {
+        for path in &req.paths {
+            if let Err(status) = self.authorize_path(path, Permission::Read, &ctx) {
+                return Ok(Response::new(error_get_xattr_bulk(status)));
+            }
+        }
+        match KernelConvenience::get_xattr_bulk(&*self.kernel, &req.paths, &req.key, &ctx.zone_id) {
             Ok(rows) => Ok(Response::new(GetXattrBulkResponse {
                 items: rows
                     .into_iter()
@@ -1223,10 +1256,13 @@ impl NexusVfsService for VfsServiceImpl {
     }
 
     async fn close_pipe(&self, req: Request<IpcPathRequest>) -> Result<Response<IpcAck>, Status> {
-        let (_ctx, req) = match self.authenticate(req).await {
+        let (ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_ipc_ack(s))),
         };
+        if let Err(status) = self.authorize_path(&req.path, Permission::Write, &ctx) {
+            return Ok(Response::new(error_ipc_ack(status)));
+        }
         match self.kernel.close_pipe(&req.path) {
             Ok(()) => Ok(Response::new(IpcAck {
                 is_error: false,
@@ -1246,10 +1282,13 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<IpcPathRequest>,
     ) -> Result<Response<IpcHasResponse>, Status> {
-        let (_ctx, req) = match self.authenticate(req).await {
+        let (ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_ipc_has(s))),
         };
+        if let Err(status) = self.authorize_path(&req.path, Permission::Read, &ctx) {
+            return Ok(Response::new(error_ipc_has(status)));
+        }
         Ok(Response::new(IpcHasResponse {
             present: self.kernel.has_pipe(&req.path),
             is_error: false,
@@ -1258,10 +1297,15 @@ impl NexusVfsService for VfsServiceImpl {
     }
 
     async fn close_all_pipes(&self, req: Request<IpcEmpty>) -> Result<Response<IpcAck>, Status> {
-        let (_ctx, _req) = match self.authenticate(req).await {
+        let (ctx, _req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_ipc_ack(s))),
         };
+        if !ctx.is_admin && !ctx.is_system {
+            return Ok(Response::new(error_ipc_ack(Status::permission_denied(
+                "closing all pipes requires an administrator",
+            ))));
+        }
         self.kernel.close_all_pipes();
         Ok(Response::new(IpcAck {
             is_error: false,
@@ -1270,10 +1314,13 @@ impl NexusVfsService for VfsServiceImpl {
     }
 
     async fn close_stream(&self, req: Request<IpcPathRequest>) -> Result<Response<IpcAck>, Status> {
-        let (_ctx, req) = match self.authenticate(req).await {
+        let (ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_ipc_ack(s))),
         };
+        if let Err(status) = self.authorize_path(&req.path, Permission::Write, &ctx) {
+            return Ok(Response::new(error_ipc_ack(status)));
+        }
         match self.kernel.close_stream(&req.path) {
             Ok(()) => Ok(Response::new(IpcAck {
                 is_error: false,
@@ -1293,10 +1340,13 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<IpcPathRequest>,
     ) -> Result<Response<IpcHasResponse>, Status> {
-        let (_ctx, req) = match self.authenticate(req).await {
+        let (ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_ipc_has(s))),
         };
+        if let Err(status) = self.authorize_path(&req.path, Permission::Read, &ctx) {
+            return Ok(Response::new(error_ipc_has(status)));
+        }
         Ok(Response::new(IpcHasResponse {
             present: self.kernel.has_stream(&req.path),
             is_error: false,
@@ -1536,23 +1586,23 @@ impl NexusVfsService for VfsServiceImpl {
         &self,
         req: Request<BatchStatRequest>,
     ) -> Result<Response<BatchStatResponse>, Status> {
-        let (ctx, req) = match self.authenticate(req).await {
+        let (mut ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Err(s),
         };
-        // No federation guard: stat_batch goes through metastore-direct path
-        // and the per-path sys_stat fallback, both of which inherit the
-        // permission gate's zone_perms enforcement.
-        let zone_id = if req.zone_id.is_empty() {
-            ctx.zone_id.as_str()
-        } else {
-            req.zone_id.as_str()
-        };
+        if !req.zone_id.is_empty() {
+            ctx.zone_id = req.zone_id;
+        }
+        // BatchStat has no per-item error field. Refuse the whole request before
+        // reading metadata if any path is unauthorized.
+        for path in &req.paths {
+            self.authorize_path(path, Permission::Read, &ctx)?;
+        }
 
         // KernelConvenience::stat_batch picks the optimized path on
         // Kernel — single redb read txn via `with_metastore::get_batch`,
         // falling back to per-path sys_stat for implicit dirs / synthetic views.
-        let results = KernelConvenience::stat_batch(&*self.kernel, &req.paths, zone_id);
+        let results = KernelConvenience::stat_batch(&*self.kernel, &req.paths, &ctx.zone_id);
         let mapped: Vec<BatchStatItem> = results
             .into_iter()
             .map(|opt| match opt {
@@ -2005,7 +2055,7 @@ fn status_to_code(s: &Status) -> RpcErrorCode {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     use std::collections::HashMap;
@@ -2069,7 +2119,7 @@ mod tests {
         }
     }
 
-    fn kernel_with_mem_backend() -> Kernel {
+    pub(crate) fn kernel_with_mem_backend() -> Kernel {
         let k = Kernel::new();
         let backend: std::sync::Arc<dyn ObjectStore> = std::sync::Arc::new(MemBackend::default());
         k.mount(
