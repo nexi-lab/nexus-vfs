@@ -601,8 +601,8 @@ pub async fn query(
                 cache.lookup(&*store, (&subject.0, &subject.1))
             })
             .await
-            .map_err(|_| SearchError::Rpc(tonic::Status::internal("zone lookup failed")))?
-            .map_err(|_| SearchError::Rpc(tonic::Status::unavailable("zone lookup unavailable")))?;
+            .map_err(|_| nexus_federated_search::DispatchError::ZoneDiscoveryUnavailable)?
+            .map_err(|_| nexus_federated_search::DispatchError::ZoneDiscoveryUnavailable)?;
             if accessible.len() > 1 {
                 return dispatch_federated(state, ctx, token, fence, body, &zone_id).await;
             }
@@ -723,7 +723,7 @@ async fn dispatch_federated(
         .map(|(zone, _)| zone.clone())
         .collect();
     let filter = (!is_privileged(&ctx)).then_some(zones.as_slice());
-    let resp = state.federated.search(subject, req, filter).await;
+    let resp = state.federated.search(subject, req, filter).await?;
     let results = resp
         .results
         .into_iter()
@@ -808,6 +808,9 @@ pub fn router() -> Router<AppState> {
 pub enum SearchError {
     #[error("backend unavailable: {0}")]
     BackendUnavailable(#[from] BackendError),
+    #[cfg(feature = "rebac")]
+    #[error("{0}")]
+    Discovery(#[from] nexus_federated_search::DispatchError),
     #[error("bad request: {0}")]
     BadRequest(String),
     /// #4740: zone refusal — zone-less non-admin caller, an explicit
@@ -837,6 +840,8 @@ impl IntoResponse for SearchError {
         }
         let (status, message) = match self {
             SearchError::BackendUnavailable(e) => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
+            #[cfg(feature = "rebac")]
+            SearchError::Discovery(e) => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
             SearchError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             SearchError::Forbidden(e) => (StatusCode::FORBIDDEN, e.to_string()),
             SearchError::Rpc(s) => (grpc_status_to_http(s.code()), s.message().to_string()),

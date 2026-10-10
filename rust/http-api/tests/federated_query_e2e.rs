@@ -26,6 +26,7 @@
 
 #![cfg(feature = "rebac")]
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use contracts::operation_context::OperationContext;
@@ -43,7 +44,7 @@ use nexus_http_api::search_proto::{
     StatsRequest, StatsResponse,
 };
 use nexus_http_api::{bind_and_serve, AppState};
-use nexus_rebac::{tuple_key, InMemoryReBACTupleStore, ReBACTupleStore};
+use nexus_rebac::{tuple_key, InMemoryReBACTupleStore, ReBACTupleStore, ReBACTupleStoreError};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status};
@@ -254,22 +255,19 @@ fn grant_alice_reader(store: &InMemoryReBACTupleStore, zone: &str) {
 }
 
 async fn spawn_harness(zones: &[&str]) -> (String, RequestLog) {
+    let rebac = Arc::new(InMemoryReBACTupleStore::new());
+    for zone in zones {
+        grant_alice_reader(&rebac, zone);
+    }
+    spawn_harness_with_store(rebac).await
+}
+
+async fn spawn_harness_with_store(rebac: Arc<dyn ReBACTupleStore>) -> (String, RequestLog) {
     let (plugin_target, log) = spawn_mock_plugin().await;
     let mut state = AppState::for_tests(plugin_target);
     state.auth = Arc::new(AliceAdmin);
-    // Rebuild the ReBAC store with grants BEFORE constructing the
-    // dispatcher — the dispatcher's `AccessibleZonesCache` reads
-    // through the store on every miss so subsequent grants take
-    // effect within the TTL window.  Wire the fresh store here.
-    let rebac = Arc::new(InMemoryReBACTupleStore::new());
-    for z in zones {
-        grant_alice_reader(&rebac, z);
-    }
-    state.rebac_store = Arc::clone(&rebac) as Arc<dyn ReBACTupleStore>;
-    // Rewire the federated dispatcher to read the SAME store the
-    // AppState holds — `for_tests` built one against its own store,
-    // and swapping `rebac_store` here would otherwise leave the
-    // dispatcher pointed at the original empty one.
+    // Both discovery stages read the same store and ephemeral cache.
+    state.rebac_store = Arc::clone(&rebac);
     {
         use nexus_federated_search::{DispatcherConfig, FederatedSearchDispatcher, RoutingBackend};
         use nexus_search_common::transport::{PeerChannelCache, PeerChannelConfig};
@@ -295,7 +293,7 @@ async fn spawn_harness(zones: &[&str]) -> (String, RequestLog) {
         );
         state.federated = Arc::new(FederatedSearchDispatcher::new(
             Arc::new(routing),
-            Arc::clone(&rebac) as Arc<dyn ReBACTupleStore>,
+            rebac,
             Arc::clone(&state.accessible_zones),
             registry,
             DispatcherConfig::default(),
@@ -311,6 +309,108 @@ async fn spawn_harness(zones: &[&str]) -> (String, RequestLog) {
 }
 
 // ── Tests ──────────────────────────────────────────────────────
+
+#[derive(Clone, Copy)]
+enum LookupFailure {
+    StoreError,
+    WorkerPanic,
+}
+
+struct IntermittentStore {
+    inner: InMemoryReBACTupleStore,
+    reads: AtomicUsize,
+    fail_on_read: usize,
+    failure: LookupFailure,
+}
+
+impl ReBACTupleStore for IntermittentStore {
+    fn put(&self, key: &str, value: &[u8]) -> Result<(), ReBACTupleStoreError> {
+        self.inner.put(key, value)
+    }
+
+    fn delete(&self, key: &str) -> Result<bool, ReBACTupleStoreError> {
+        self.inner.delete(key)
+    }
+
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, ReBACTupleStoreError> {
+        self.inner.get(key)
+    }
+
+    fn list(&self) -> Result<Vec<(String, Vec<u8>)>, ReBACTupleStoreError> {
+        // Fail one scan at the handler's precheck or during dispatch.
+        // No revisions means the shared cache cannot hide either failure.
+        if self.reads.fetch_add(1, Ordering::SeqCst) == self.fail_on_read {
+            match self.failure {
+                LookupFailure::StoreError => {
+                    return Err(ReBACTupleStoreError::Backend(
+                        "private backend detail".into(),
+                    ));
+                }
+                LookupFailure::WorkerPanic => panic!("private worker detail"),
+            }
+        }
+        self.inner.list()
+    }
+}
+
+async fn discovery_failure_and_recovery(failure: LookupFailure, fail_on_read: usize) {
+    let store = Arc::new(IntermittentStore {
+        inner: InMemoryReBACTupleStore::new(),
+        reads: AtomicUsize::new(0),
+        fail_on_read,
+        failure,
+    });
+    grant_alice_reader(&store.inner, "eng");
+    grant_alice_reader(&store.inner, "legal");
+    let (base, log) = spawn_harness_with_store(store).await;
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({"q": "widget"});
+
+    let response = client
+        .post(format!("{base}/v2/search/query"))
+        .bearer_auth("anything")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let error = response.text().await.unwrap();
+    assert!(error.contains("zone lookup unavailable"), "{error}");
+    assert!(!error.contains("private"), "{error}");
+    assert!(log.queries.lock().unwrap().is_empty());
+
+    // Reuse the same server and channel. A failed lookup must not cache
+    // an empty zone set or prevent the next request from reaching both zones.
+    let response = client
+        .post(format!("{base}/v2/search/query"))
+        .bearer_auth("anything")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let response: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(response["results"].as_array().unwrap().len(), 2);
+    let queries = log.queries.lock().unwrap();
+    let mut zones: Vec<&str> = queries.iter().map(|query| query.zone_id.as_str()).collect();
+    zones.sort();
+    assert_eq!(zones, ["eng", "legal"]);
+    assert!(queries.iter().all(|query| query.auth_token == "anything"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zone_discovery_error_returns_503_and_recovers() {
+    for fail_on_read in [0, 1] {
+        discovery_failure_and_recovery(LookupFailure::StoreError, fail_on_read).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zone_discovery_panic_returns_503_and_recovers() {
+    for fail_on_read in [0, 1] {
+        discovery_failure_and_recovery(LookupFailure::WorkerPanic, fail_on_read).await;
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn multi_zone_caller_with_empty_zone_id_fans_out() {
