@@ -66,6 +66,7 @@ tonic-prost-build = "0.14"
 protoc-bin-vendored = "3"
 
 [dev-dependencies]
+auth = { workspace = true }
 tempfile = "3"
 rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
 # E2E: real tonic client round-trips a request through PluginProxyService.

@@ -155,6 +155,19 @@ impl<'a> AuthCredentials<'a> {
 /// when the token is absent. A rejected token must not inherit peer authority.
 pub trait AuthProvider: Send + Sync + 'static {
     fn resolve(&self, creds: &AuthCredentials<'_>) -> Result<OperationContext, tonic::Status>;
+
+    /// Resolve the original principal after transport verifies a runtime gateway.
+    /// Implementations retain their own agent-context mapping; unsupported
+    /// providers refuse forwarding instead of inheriting the gateway's privileges.
+    fn resolve_forwarded_agent(
+        &self,
+        _user_id: &str,
+        _agent_id: &str,
+    ) -> Result<OperationContext, tonic::Status> {
+        Err(tonic::Status::unauthenticated(
+            "this authentication provider does not support runtime delegation",
+        ))
+    }
 }
 
 /// Single-node-dev all-pass policy. Every request becomes a

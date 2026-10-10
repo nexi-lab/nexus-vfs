@@ -18,6 +18,7 @@ use std::time::Instant;
 
 use crate::auth::{AuthCredentials, AuthProvider};
 use crate::peer_identity;
+use crate::runtime_scope::RuntimeScope;
 use tokio::sync::oneshot;
 use tonic::{transport::Server, Request, Response, Status};
 
@@ -102,6 +103,7 @@ pub type ForeignCaVerifierSlot =
 pub(crate) struct VfsServiceImpl {
     pub(crate) kernel: Arc<Kernel>,
     pub(crate) auth: Arc<dyn AuthProvider>,
+    runtime_scope: Option<Arc<RuntimeScope>>,
     /// Late-bound verifier (see [`ForeignCaVerifierSlot`]). Filled ⇒ `authenticate`
     /// classifies the peer cert against it so a registered foreign CA's agent
     /// resolves qualified (`{trust_domain}/agent/{name}`) rather than a bare local
@@ -296,12 +298,21 @@ impl VfsServiceImpl {
             }
             None => peer_identity::from_request(&req),
         };
-        let inner = req.into_inner();
         let ctx = self.auth.resolve(&AuthCredentials {
-            token: inner.auth_token(),
+            token: req.get_ref().auth_token(),
             peer: peer.as_ref(),
         })?;
-        Ok((ctx, inner))
+        let ctx = match &self.runtime_scope {
+            Some(scope) => scope.resolve(
+                self.auth.as_ref(),
+                ctx,
+                peer.as_ref(),
+                req.get_ref().auth_token(),
+                req.metadata(),
+            )?,
+            None => ctx,
+        };
+        Ok((ctx, req.into_inner()))
     }
 
     /// Pick the RPC code; take the message from the error itself.
@@ -609,6 +620,7 @@ impl VfsServiceImpl {
         Self {
             kernel,
             auth: Arc::new(crate::auth::NoAuth),
+            runtime_scope: None,
             foreign_ca_verifier: Arc::new(std::sync::OnceLock::new()),
             ready,
             server_started_at: Instant::now(),
@@ -1796,9 +1808,51 @@ pub fn build_vfs_routes(
     max_message_bytes: usize,
     server_version: &str,
 ) -> tonic::service::Routes {
+    build_routes(
+        kernel,
+        auth,
+        foreign_ca_verifier,
+        ready,
+        max_message_bytes,
+        server_version,
+        None,
+    )
+}
+
+/// Build the same typed VFS surface with confinement to one user runtime.
+pub fn build_user_runtime_routes(
+    kernel: Arc<Kernel>,
+    auth: Arc<dyn AuthProvider>,
+    scope: RuntimeScope,
+    foreign_ca_verifier: ForeignCaVerifierSlot,
+    ready: Arc<DataPlaneReady>,
+    max_message_bytes: usize,
+    server_version: &str,
+) -> tonic::service::Routes {
+    build_routes(
+        kernel,
+        auth,
+        foreign_ca_verifier,
+        ready,
+        max_message_bytes,
+        server_version,
+        Some(Arc::new(scope)),
+    )
+}
+
+fn build_routes(
+    kernel: Arc<Kernel>,
+    auth: Arc<dyn AuthProvider>,
+    foreign_ca_verifier: ForeignCaVerifierSlot,
+    ready: Arc<DataPlaneReady>,
+    max_message_bytes: usize,
+    server_version: &str,
+    runtime_scope: Option<Arc<RuntimeScope>>,
+) -> tonic::service::Routes {
     let svc = VfsServiceImpl {
         kernel,
         auth,
+        runtime_scope,
         foreign_ca_verifier,
         ready,
         server_started_at: Instant::now(),
