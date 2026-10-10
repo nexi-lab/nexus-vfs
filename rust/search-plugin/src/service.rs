@@ -324,6 +324,29 @@ impl SearchServiceImpl {
         }
     }
 
+    /// Configured search modes and current model identity. Does not initialise
+    /// an embedder, read an index, or contact an embedding endpoint.
+    pub fn capabilities(&self) -> nexus_search_common::capabilities::SearchCapabilities {
+        let embedder = self
+            .embedder_slot
+            .lock()
+            .as_ref()
+            .map(|embedder| (embedder.tag().to_owned(), embedder.dim()))
+            .or_else(crate::embedder::configured_embedder_spec);
+        let mut modes = vec!["keyword".to_owned()];
+        if embedder.is_some() {
+            modes.extend(["semantic".to_owned(), "hybrid".to_owned()]);
+        }
+        let (model, dimensions) = embedder.unwrap_or_default();
+        nexus_search_common::capabilities::SearchCapabilities {
+            device_tier: "server".into(),
+            search_modes: modes,
+            embedding_model: model,
+            embedding_dimensions: dimensions,
+            has_graph: false,
+        }
+    }
+
     /// Record a handler panic caught at the dispatch boundary (#4725);
     /// see [`DispatchPanicLog`].
     pub fn record_dispatch_panic(&self, method: &str, reason: &str) {

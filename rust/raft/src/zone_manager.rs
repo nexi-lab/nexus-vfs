@@ -271,6 +271,7 @@ pub struct ZoneManager {
     /// installs an impl. Stays empty on slim / no-federation runtimes
     /// (the RPC is still advertised but returns `NotFound`).
     blob_fetcher_slot: crate::blob_fetcher::BlobFetcherSlot,
+    search_capabilities_slot: crate::search_capabilities::SearchCapabilitiesSlot,
     /// Shared with the gRPC server so `ZoneApiService::mint_agent` can sign
     /// agent certs once the founder installs an `AgentMinter`. Empty on a
     /// joiner (not the CA holder) — the RPC returns success=false there.
@@ -527,6 +528,7 @@ impl ZoneManager {
             })?;
 
         let blob_fetcher_slot = crate::blob_fetcher::new_blob_fetcher_slot();
+        let search_capabilities_slot = crate::search_capabilities::new_search_capabilities_slot();
         let agent_minter_slot = crate::agent_minter::new_agent_minter_slot();
         let key_minter_slot = crate::key_minter::new_key_minter_slot();
         let foreign_ca_registrar_slot =
@@ -547,6 +549,7 @@ impl ZoneManager {
         };
         let mut server = RaftGrpcServer::new(registry.clone(), config)
             .with_blob_fetcher_slot(blob_fetcher_slot.clone())
+            .with_search_capabilities_slot(search_capabilities_slot.clone())
             .with_agent_minter_slot(agent_minter_slot.clone())
             .with_key_minter_slot(key_minter_slot.clone())
             .with_foreign_ca_registrar_slot(foreign_ca_registrar_slot.clone())
@@ -630,6 +633,7 @@ impl ZoneManager {
             use_tls,
             default_peers: peers,
             blob_fetcher_slot,
+            search_capabilities_slot,
             agent_minter_slot,
             key_minter_slot,
             foreign_ca_registrar_slot,
@@ -644,6 +648,10 @@ impl ZoneManager {
     /// wired. Clone-cheap (just an `Arc`).
     pub fn blob_fetcher_slot(&self) -> crate::blob_fetcher::BlobFetcherSlot {
         self.blob_fetcher_slot.clone()
+    }
+
+    pub fn search_capabilities_slot(&self) -> crate::search_capabilities::SearchCapabilitiesSlot {
+        self.search_capabilities_slot.clone()
     }
 
     /// Hand the shared `AgentMinter` slot back so the cluster profile can

@@ -710,16 +710,20 @@ const E5_PASSAGE_PREFIX: &str = "passage: ";
 /// `None` = keyword-only mode (no embedder configured, or a partial
 /// remote config that build_default_embedder will reject loudly).
 pub fn configured_embedder_tag() -> Option<String> {
+    configured_embedder_spec().map(|(tag, _)| tag)
+}
+
+/// Configured model identity and dimension without loading a model. The local
+/// dimension is unknown until the model's first inference probe.
+pub fn configured_embedder_spec() -> Option<(String, usize)> {
     match RemoteEmbedderConfig::from_env() {
-        Ok(Some(cfg)) => return Some(cfg.tag()),
+        Ok(Some(cfg)) => return Some((cfg.tag(), cfg.dim)),
         Ok(None) => {}
-        // Partial remote config: the embedder build fails loud, so
-        // reporting the local fallback here would lie.
         Err(_) => return None,
     }
     #[cfg(feature = "semantic")]
     {
-        Some(LOCAL_EMBEDDER_TAG.to_string())
+        Some((LOCAL_EMBEDDER_TAG.to_string(), 0))
     }
     #[cfg(not(feature = "semantic"))]
     {

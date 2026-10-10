@@ -76,6 +76,9 @@ pub mod zone_manager;
 #[cfg(all(feature = "grpc", has_protos))]
 pub mod blob_fetcher;
 
+#[cfg(all(feature = "grpc", has_protos))]
+pub mod search_capabilities;
+
 /// AgentMinter trait — lets the raft gRPC server serve `MintAgent` (remote
 /// agent-cert signing on the CA holder) without depending on `auth` or
 /// `peer_identity`. The cluster profile installs the impl on the founder at

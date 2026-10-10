@@ -271,7 +271,13 @@ fn dispatch_grpc(
 
 declare_service_plugin!("search", SearchPlugin, {
     create: create_search_plugin,
-    dispatch: |_plugin, _method, _payload| Err(-1),
+    dispatch: |plugin, method, _payload| {
+        if method != "capabilities" {
+            return Err(nexus_plugin_abi::PluginResult::NotFound as i32);
+        }
+        serde_json::to_vec(&plugin.svc.capabilities())
+            .map_err(|_| nexus_plugin_abi::PluginResult::Internal as i32)
+    },
 });
 
 declare_grpc_dispatch!(SearchPlugin, dispatch_search);

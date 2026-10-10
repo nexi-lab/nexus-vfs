@@ -46,6 +46,7 @@
 //! crate so both shapes remain but their conversion is a single named
 //! function — one place to keep the two in lockstep.
 
+pub mod capabilities;
 pub mod delegation;
 pub mod discovery;
 pub mod federated;
