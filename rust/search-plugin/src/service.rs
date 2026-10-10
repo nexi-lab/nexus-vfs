@@ -113,6 +113,13 @@ fn resolve_zone(z: &str) -> &str {
     }
 }
 
+fn checked_index_zone(zone: &str) -> Result<&str, Status> {
+    let zone = resolve_zone(zone);
+    crate::index_manager::validate_index_zone(zone)
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    Ok(zone)
+}
+
 /// Wall-clock now in millis-since-epoch.  Broken out so the P6
 /// recency scorer has a single injection point + tests can mock it
 /// (via a #[cfg(test)] override) if we ever need to.  `SystemTime`
@@ -919,9 +926,12 @@ fn do_keyword_query(
     limit: usize,
     scope: &PathScope,
 ) -> Result<Vec<QueryResult>, String> {
-    let index = manager
-        .get_or_open(zone_id)
-        .map_err(|e| format!("open index for zone {zone_id:?}: {e}"))?;
+    let Some(index) = manager
+        .get_existing(zone_id)
+        .map_err(|e| format!("open index for zone {zone_id:?}: {e}"))?
+    else {
+        return Ok(Vec::new());
+    };
 
     let hits = index
         .search(q, limit, Some(scope))
@@ -1073,9 +1083,12 @@ fn do_semantic_query_scoped(
     max_fetch: usize,
     exact_max: usize,
 ) -> Result<Vec<QueryResult>, String> {
-    let ann = manager
-        .get_or_open_ann(zone_id, embedder.tag(), embedder.dim())
-        .map_err(|e| format!("open ann for zone {zone_id:?}: {e}"))?;
+    let Some(ann) = manager
+        .get_existing_ann(zone_id, embedder.tag(), embedder.dim())
+        .map_err(|e| format!("open ann for zone {zone_id:?}: {e}"))?
+    else {
+        return Ok(Vec::new());
+    };
 
     // #4610: cached — a fan-out repeating the same q across path
     // filters embeds once instead of serialising N times on the
@@ -1085,7 +1098,7 @@ fn do_semantic_query_scoped(
     // Materialise chunk_text + mtime via the FTS index — the ANN
     // stores only vectors + paths, but the RPC contract carries the
     // full QueryResult shape so callers don't need a follow-up read.
-    let fts = manager.get_or_open(zone_id).ok();
+    let fts = manager.get_existing(zone_id).ok().flatten();
     // Per-query memo of each hit path's stored chunks: ANN hits are
     // keyed by (path, chunk_index) and several hits commonly share a
     // path, so each path's chunks are read at most once per query
@@ -1430,6 +1443,10 @@ fn do_title_locate(
             tracing::debug!(zone = %zone_id, "title arm: skeleton build in flight — empty arm, uncacheable");
             TitleArmRun::degraded()
         }
+        Ok(crate::index_manager::SkeletonAccess::Missing) => TitleArmRun {
+            hits: Vec::new(),
+            cacheable: false,
+        },
         Err(e) => {
             tracing::debug!(err = %e, zone = %zone_id, "title arm: skeleton unavailable — degrading, uncacheable");
             TitleArmRun::degraded()
@@ -1576,7 +1593,7 @@ fn build_kw_lane(
     if title_hits.is_empty() {
         return keyword;
     }
-    let fts = manager.get_or_open(zone_id).ok();
+    let fts = manager.get_existing(zone_id).ok().flatten();
     let hydrated = hydrate_title_hits(fts.as_deref(), title_hits, &keyword, semantic, zone_id);
     if hydrated.is_empty() {
         return keyword;
@@ -3389,9 +3406,12 @@ fn do_locate(
     zone_id: &str,
     path: &str,
 ) -> Result<(bool, u32, Option<i64>), String> {
-    let fts = manager
-        .get_or_open(zone_id)
-        .map_err(|e| format!("open fts for zone {zone_id:?}: {e}"))?;
+    let Some(fts) = manager
+        .get_existing(zone_id)
+        .map_err(|e| format!("open fts for zone {zone_id:?}: {e}"))?
+    else {
+        return Ok((false, 0, None));
+    };
     let hits = fts
         .get_chunks_by_path(path)
         .map_err(|e| format!("locate: {e}"))?;
@@ -3662,6 +3682,7 @@ impl SearchService for SearchServiceImpl {
                 error: Some("q must not be empty".into()),
             }));
         }
+        checked_index_zone(&req.zone_id)?;
         if !skip_outer_middleware {
             // Peer fan-out runs FIRST (outer-most wrapper).  Only
             // fires when the zone is in the
@@ -3720,8 +3741,9 @@ impl SearchService for SearchServiceImpl {
             None
         } else {
             self.manager
-                .get_or_open(&req_for_cache.zone_id)
+                .get_existing(&req_for_cache.zone_id)
                 .ok()
+                .flatten()
                 .map(|fts| fts.generation_id())
         };
 
@@ -3771,7 +3793,7 @@ impl SearchService for SearchServiceImpl {
         } else {
             limit
         };
-        let zone_id = resolve_zone(&req.zone_id).to_string();
+        let zone_id = checked_index_zone(&req.zone_id)?.to_string();
         // Now safe to move fields out.
         let q = req.q;
         // `path_filter` OR any `path_filters`: one fused ranking over
@@ -4092,7 +4114,7 @@ impl SearchService for SearchServiceImpl {
         } else {
             req.root_path
         };
-        let zone_id = resolve_zone(&req.zone_id).to_string();
+        let zone_id = checked_index_zone(&req.zone_id)?.to_string();
         let recursive = req.recursive;
         let max_docs = if req.max_docs == 0 {
             DEFAULT_INDEX_MAX_DOCS
@@ -4170,7 +4192,7 @@ impl SearchService for SearchServiceImpl {
         } else {
             req.root_path
         };
-        let zone_id = resolve_zone(&req.zone_id).to_string();
+        let zone_id = checked_index_zone(&req.zone_id)?.to_string();
         let recursive = req.recursive;
         let max_docs = if req.max_docs == 0 {
             DEFAULT_INDEX_MAX_DOCS
@@ -4250,6 +4272,9 @@ impl SearchService for SearchServiceImpl {
         request: Request<BatchQueryRequest>,
     ) -> Result<Response<BatchQueryResponse>, Status> {
         let req = request.into_inner();
+        for query in &req.queries {
+            checked_index_zone(&query.zone_id)?;
+        }
         // #4610: the batch used to run strictly serially, so a caller
         // batching N queries paid N × full query latency — measured
         // live as the throughput ceiling on Koodle's cross-workspace
@@ -4326,7 +4351,12 @@ impl SearchService for SearchServiceImpl {
         let req = request.into_inner();
         // #4736: `pending` covers accept → return for the whole batch.
         let pending = PendingDocsGuard::enter(&self.pending_docs, req.documents.len() as u32);
-        let default_zone = resolve_zone(&req.zone_id).to_string();
+        let default_zone = checked_index_zone(&req.zone_id)?.to_string();
+        for doc in &req.documents {
+            if !doc.zone_id.is_empty() {
+                checked_index_zone(&doc.zone_id)?;
+            }
+        }
         let manager = Arc::clone(&self.manager);
         let (embedder, embed_broken) = self.indexing_embedder();
         let context_generator = self.get_or_init_context_generator().await?;
@@ -4381,7 +4411,7 @@ impl SearchService for SearchServiceImpl {
         request: Request<NotifyFileChangeRequest>,
     ) -> Result<Response<NotifyFileChangeResponse>, Status> {
         let req = request.into_inner();
-        let zone_id = resolve_zone(&req.zone_id).to_string();
+        let zone_id = checked_index_zone(&req.zone_id)?.to_string();
         let change = req.change_type.clone();
         let path = req.path.clone();
         let manager = Arc::clone(&self.manager);
@@ -4421,7 +4451,7 @@ impl SearchService for SearchServiceImpl {
         request: Request<LocateRequest>,
     ) -> Result<Response<LocateResponse>, Status> {
         let req = request.into_inner();
-        let zone_id = resolve_zone(&req.zone_id).to_string();
+        let zone_id = checked_index_zone(&req.zone_id)?.to_string();
         let path = req.path;
         let manager = Arc::clone(&self.manager);
         let zone_reply = zone_id.clone();
@@ -4456,11 +4486,11 @@ impl SearchService for SearchServiceImpl {
         request: Request<ParkedListRequest>,
     ) -> Result<Response<ParkedListResponse>, Status> {
         let req = request.into_inner();
-        let zone_id = resolve_zone(&req.zone_id).to_string();
+        let zone_id = checked_index_zone(&req.zone_id)?.to_string();
         let manager = Arc::clone(&self.manager);
         let zone_for_entries = zone_id.clone();
         let outcome = tokio::task::spawn_blocking(move || {
-            crate::parked_state::ParkedQueue::open_or_create(manager.zone_root(&zone_id))
+            crate::parked_state::ParkedQueue::load(manager.zone_root(&zone_id))
                 .map(|q| q.list())
                 .map_err(|e| format!("open parked queue: {e}"))
         })
@@ -4492,11 +4522,11 @@ impl SearchService for SearchServiceImpl {
         request: Request<ParkedRetryRequest>,
     ) -> Result<Response<ParkedRetryResponse>, Status> {
         let req = request.into_inner();
-        let zone_id = resolve_zone(&req.zone_id).to_string();
+        let zone_id = checked_index_zone(&req.zone_id)?.to_string();
         let paths = req.paths;
         let manager = Arc::clone(&self.manager);
         let outcome = tokio::task::spawn_blocking(move || -> Result<(u32, u32), String> {
-            let q = crate::parked_state::ParkedQueue::open_or_create(manager.zone_root(&zone_id))
+            let q = crate::parked_state::ParkedQueue::load(manager.zone_root(&zone_id))
                 .map_err(|e| format!("open parked queue: {e}"))?;
             // Empty paths ⇒ retry every parked doc (matches
             // Python).  "Retry" here just drops entries from the
@@ -4541,11 +4571,11 @@ impl SearchService for SearchServiceImpl {
         request: Request<ParkedDiscardRequest>,
     ) -> Result<Response<ParkedDiscardResponse>, Status> {
         let req = request.into_inner();
-        let zone_id = resolve_zone(&req.zone_id).to_string();
+        let zone_id = checked_index_zone(&req.zone_id)?.to_string();
         let paths = req.paths;
         let manager = Arc::clone(&self.manager);
         let outcome = tokio::task::spawn_blocking(move || -> Result<u32, String> {
-            let q = crate::parked_state::ParkedQueue::open_or_create(manager.zone_root(&zone_id))
+            let q = crate::parked_state::ParkedQueue::load(manager.zone_root(&zone_id))
                 .map_err(|e| format!("open parked queue: {e}"))?;
             let targets: Vec<String> = if paths.is_empty() {
                 q.list().into_iter().map(|e| e.path).collect()
@@ -4581,14 +4611,13 @@ impl SearchService for SearchServiceImpl {
         request: Request<AddIndexedDirectoryRequest>,
     ) -> Result<Response<AddIndexedDirectoryResponse>, Status> {
         let req = request.into_inner();
-        let zone_id = resolve_zone(&req.zone_id).to_string();
+        let zone_id = checked_index_zone(&req.zone_id)?.to_string();
         let path = req.path;
         let manager = Arc::clone(&self.manager);
         let outcome = tokio::task::spawn_blocking(move || -> Result<bool, String> {
-            let r = crate::indexed_dirs_state::IndexedDirsRegistry::open_or_create(
-                manager.zone_root(&zone_id),
-            )
-            .map_err(|e| format!("open indexed_dirs: {e}"))?;
+            let r =
+                crate::indexed_dirs_state::IndexedDirsRegistry::load(manager.zone_root(&zone_id))
+                    .map_err(|e| format!("open indexed_dirs: {e}"))?;
             let added = r.add(&path, current_time_ms());
             r.save().map_err(|e| format!("save indexed_dirs: {e}"))?;
             Ok(added)
@@ -4613,14 +4642,13 @@ impl SearchService for SearchServiceImpl {
         request: Request<RemoveIndexedDirectoryRequest>,
     ) -> Result<Response<RemoveIndexedDirectoryResponse>, Status> {
         let req = request.into_inner();
-        let zone_id = resolve_zone(&req.zone_id).to_string();
+        let zone_id = checked_index_zone(&req.zone_id)?.to_string();
         let path = req.path;
         let manager = Arc::clone(&self.manager);
         let outcome = tokio::task::spawn_blocking(move || -> Result<bool, String> {
-            let r = crate::indexed_dirs_state::IndexedDirsRegistry::open_or_create(
-                manager.zone_root(&zone_id),
-            )
-            .map_err(|e| format!("open indexed_dirs: {e}"))?;
+            let r =
+                crate::indexed_dirs_state::IndexedDirsRegistry::load(manager.zone_root(&zone_id))
+                    .map_err(|e| format!("open indexed_dirs: {e}"))?;
             let removed = r.remove(&path);
             r.save().map_err(|e| format!("save indexed_dirs: {e}"))?;
             Ok(removed)
@@ -4645,15 +4673,13 @@ impl SearchService for SearchServiceImpl {
         request: Request<ListIndexedDirectoriesRequest>,
     ) -> Result<Response<ListIndexedDirectoriesResponse>, Status> {
         let req = request.into_inner();
-        let zone_id = resolve_zone(&req.zone_id).to_string();
+        let zone_id = checked_index_zone(&req.zone_id)?.to_string();
         let zone_for_reply = zone_id.clone();
         let manager = Arc::clone(&self.manager);
         let outcome = tokio::task::spawn_blocking(move || {
-            crate::indexed_dirs_state::IndexedDirsRegistry::open_or_create(
-                manager.zone_root(&zone_id),
-            )
-            .map(|r| r.list())
-            .map_err(|e| format!("open indexed_dirs: {e}"))
+            crate::indexed_dirs_state::IndexedDirsRegistry::load(manager.zone_root(&zone_id))
+                .map(|r| r.list())
+                .map_err(|e| format!("open indexed_dirs: {e}"))
         })
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking joined error: {e}")))?;
@@ -4682,14 +4708,13 @@ impl SearchService for SearchServiceImpl {
         request: Request<SetZoneIndexingModeRequest>,
     ) -> Result<Response<SetZoneIndexingModeResponse>, Status> {
         let req = request.into_inner();
-        let zone_id = resolve_zone(&req.zone_id).to_string();
+        let zone_id = checked_index_zone(&req.zone_id)?.to_string();
         let mode = req.mode;
         let manager = Arc::clone(&self.manager);
         let outcome = tokio::task::spawn_blocking(move || -> Result<(), String> {
-            let reg = crate::zone_modes_state::ZoneModesRegistry::open_or_create(
-                manager.root().to_path_buf(),
-            )
-            .map_err(|e| format!("open zone_modes: {e}"))?;
+            let reg =
+                crate::zone_modes_state::ZoneModesRegistry::load(manager.root().to_path_buf())
+                    .map_err(|e| format!("open zone_modes: {e}"))?;
             reg.set(&zone_id, &mode)
                 .map_err(|e| format!("set zone mode: {e}"))?;
             reg.save().map_err(|e| format!("save zone_modes: {e}"))?;
@@ -4712,7 +4737,7 @@ impl SearchService for SearchServiceImpl {
     ) -> Result<Response<ListZoneIndexingModesResponse>, Status> {
         let manager = Arc::clone(&self.manager);
         let outcome = tokio::task::spawn_blocking(move || {
-            crate::zone_modes_state::ZoneModesRegistry::open_or_create(manager.root().to_path_buf())
+            crate::zone_modes_state::ZoneModesRegistry::load(manager.root().to_path_buf())
                 .map(|r| r.list())
                 .map_err(|e| format!("open zone_modes: {e}"))
         })
@@ -4765,7 +4790,7 @@ impl SearchService for SearchServiceImpl {
         request: Request<StatsRequest>,
     ) -> Result<Response<StatsResponse>, Status> {
         let req = request.into_inner();
-        let zone_id = resolve_zone(&req.zone_id).to_string();
+        let zone_id = checked_index_zone(&req.zone_id)?.to_string();
         let manager = Arc::clone(&self.manager);
         let embedder_tag_dim = self
             .embedder_slot
@@ -4794,8 +4819,9 @@ impl SearchService for SearchServiceImpl {
             // (proto contract).  Zero counts on error — Stats is a
             // poll surface, not a source of truth.
             let (fts_doc_count, fts_path_count) = manager
-                .get_or_open(&zone_id)
+                .get_existing(&zone_id)
                 .ok()
+                .flatten()
                 .and_then(|fts| fts.counts().ok())
                 .map(|c| {
                     (
@@ -4806,16 +4832,15 @@ impl SearchService for SearchServiceImpl {
                 .unwrap_or((0, 0));
             let ann_chunk_count = if let Some((tag, dim)) = embedder_tag_dim {
                 manager
-                    .get_or_open_ann(&zone_id, &tag, dim)
-                    .map(|a| a.live_count() as u32)
+                    .get_existing_ann(&zone_id, &tag, dim)
+                    .map(|a| a.map_or(0, |a| a.live_count() as u32))
                     .unwrap_or(0)
             } else {
                 0
             };
-            let parked_count =
-                crate::parked_state::ParkedQueue::open_or_create(manager.zone_root(&zone_id))
-                    .map(|q| q.len() as u32)
-                    .unwrap_or(0);
+            let parked_count = crate::parked_state::ParkedQueue::load(manager.zone_root(&zone_id))
+                .map(|q| q.len() as u32)
+                .unwrap_or(0);
             Ok(StatsResponse {
                 fts_doc_count,
                 fts_path_count,

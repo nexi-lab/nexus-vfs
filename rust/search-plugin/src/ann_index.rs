@@ -248,30 +248,45 @@ impl AnnIndex {
         std::fs::create_dir_all(&dir)
             .map_err(|e| AnnError::CreateDir(dir.display().to_string(), e.to_string()))?;
 
-        let sidecar_path = dir.join(SIDECAR_FILE);
+        let sidecar = Self::read_sidecar(&dir)?;
+        Self::from_sidecar(dir, dim, sidecar)
+    }
 
-        // The sidecar is the source of truth for WHICH dump pair is
-        // live (see Sidecar::graph_basename) — read it first, then
-        // open exactly the pair it names.
-        let loaded_sidecar: Option<Sidecar> = if sidecar_path.exists() {
-            let bytes = std::fs::read(&sidecar_path)
-                .map_err(|e| AnnError::Open(sidecar_path.display().to_string(), e.to_string()))?;
-            let sidecar: Sidecar = serde_json::from_slice(&bytes)
-                .map_err(|e| AnnError::Open(sidecar_path.display().to_string(), e.to_string()))?;
-            if sidecar.version != SIDECAR_VERSION {
-                return Err(AnnError::Open(
-                    sidecar_path.display().to_string(),
-                    format!(
-                        "sidecar version {} ≠ expected {}; drop this dir and reindex",
-                        sidecar.version, SIDECAR_VERSION,
-                    ),
-                ));
-            }
-            Some(sidecar)
-        } else {
-            None
+    /// Load a committed graph without creating an empty index or directory.
+    pub fn open_existing(dir: PathBuf, dim: usize) -> Result<Option<Arc<Self>>, AnnError> {
+        let Some(sidecar) = Self::read_sidecar(&dir)? else {
+            return Ok(None);
         };
+        Self::from_sidecar(dir, dim, Some(sidecar)).map(Some)
+    }
 
+    fn read_sidecar(dir: &Path) -> Result<Option<Sidecar>, AnnError> {
+        let path = dir.join(SIDECAR_FILE);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(AnnError::Open(path.display().to_string(), e.to_string())),
+        };
+        let sidecar: Sidecar = serde_json::from_slice(&bytes)
+            .map_err(|e| AnnError::Open(path.display().to_string(), e.to_string()))?;
+        if sidecar.version != SIDECAR_VERSION {
+            return Err(AnnError::Open(
+                path.display().to_string(),
+                format!(
+                    "sidecar version {} != expected {}; reindex required",
+                    sidecar.version, SIDECAR_VERSION
+                ),
+            ));
+        }
+        Ok(Some(sidecar))
+    }
+
+    fn from_sidecar(
+        dir: PathBuf,
+        dim: usize,
+        loaded_sidecar: Option<Sidecar>,
+    ) -> Result<Arc<Self>, AnnError> {
+        assert!(dim > 0, "AnnIndex dim must be > 0");
         let fresh = || {
             let hnsw = Hnsw::<f32, DistCosine>::new(
                 HNSW_M,

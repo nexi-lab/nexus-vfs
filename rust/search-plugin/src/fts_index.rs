@@ -321,6 +321,41 @@ impl FtsIndex {
         let index = Index::open_or_create(mmap, schema.clone())
             .map_err(|e| IndexError::Open(dir.display().to_string(), e.to_string()))?;
 
+        Self::from_index(index, schema)
+    }
+
+    /// Open persisted facts without creating a directory or an empty index.
+    pub fn open_existing(dir: PathBuf) -> Result<Option<Arc<Self>>, IndexError> {
+        match std::fs::metadata(&dir) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(IndexError::Open(
+                    dir.display().to_string(),
+                    error.to_string(),
+                ))
+            }
+            Ok(_) => {}
+        }
+        let mmap = MmapDirectory::open(&dir)
+            .map_err(|e| IndexError::Open(dir.display().to_string(), e.to_string()))?;
+        if !Index::exists(&mmap)
+            .map_err(|e| IndexError::Open(dir.display().to_string(), e.to_string()))?
+        {
+            return Ok(None);
+        }
+        let index = Index::open(mmap)
+            .map_err(|e| IndexError::Open(dir.display().to_string(), e.to_string()))?;
+        let schema = build_schema();
+        if index.schema() != schema {
+            return Err(IndexError::Open(
+                dir.display().to_string(),
+                "unexpected index schema".into(),
+            ));
+        }
+        Self::from_index(index, schema).map(Some)
+    }
+
+    fn from_index(index: Index, schema: Schema) -> Result<Arc<Self>, IndexError> {
         let fields = Fields::from_schema(&schema);
 
         let writer = open_writer(&index)?;
@@ -894,6 +929,8 @@ impl FtsIndex {
 
 #[derive(Debug, thiserror::Error)]
 pub enum IndexError {
+    #[error("index zone must be a single portable directory component: {0:?}")]
+    InvalidZone(String),
     #[error("create index dir {0}: {1}")]
     CreateDir(String, String),
     #[error("open index at {0}: {1}")]
