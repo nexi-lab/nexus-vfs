@@ -9,10 +9,11 @@ use kernel::{Permission, PermissionProvider};
 
 mod common;
 
-fn link(kernel: &Kernel, path: &str, target: &str) {
+fn link(kernel: &Kernel, ctx: &OperationContext, path: &str, target: &str) {
     KernelSyscall::sys_setattr(
         kernel,
         path,
+        ctx,
         6,
         "",
         None,
@@ -40,14 +41,16 @@ fn link(kernel: &Kernel, path: &str, target: &str) {
 fn boot() -> (Kernel, OperationContext) {
     let kernel = Kernel::new();
     common::mount_mem_root(&kernel);
+    let ctx = OperationContext::new("alice", "root", false, Some("alice"), false);
     link(
         &kernel,
+        &ctx,
         "/proc/p1/workspace/repo",
         "/agents/alice/workspaces/s1",
     );
     (
         kernel,
-        OperationContext::new("alice", "root", false, Some("alice"), false),
+        ctx,
     )
 }
 
@@ -117,8 +120,8 @@ fn both_the_workspace_alias_and_the_target_must_be_authorized() {
 #[test]
 fn directory_aliases_do_not_allow_an_extra_link_hop_or_parent_escape() {
     let (kernel, ctx) = boot();
-    link(&kernel, "/agents/alice/workspaces/s1/again", "/secrets");
-    link(&kernel, "/escape", "/agents/../secrets");
+    link(&kernel, &ctx, "/agents/alice/workspaces/s1/again", "/secrets");
+    link(&kernel, &ctx, "/escape", "/agents/../secrets");
     for path in ["/proc/p1/workspace/repo/again/key", "/escape/key"] {
         assert!(KernelSyscall::sys_write(&kernel, path, &ctx, b"no", 0).is_err());
         assert!(KernelSyscall::sys_read(&kernel, path, &ctx, 0, 0).is_err());
@@ -134,12 +137,13 @@ fn a_root_proc_alias_preserves_the_non_root_sessions_zone() {
         Some(Arc::new(common::MemBackend::default())),
         false,
     );
+    let ctx = OperationContext::new("alice", "edge", false, Some("alice"), false);
     link(
         &kernel,
+        &ctx,
         "/proc/p1/workspace/repo",
         "/agents/alice/workspaces/s1",
     );
-    let ctx = OperationContext::new("alice", "edge", false, Some("alice"), false);
     let alias = "/proc/p1/workspace/repo/proof.txt";
     let target = "/agents/alice/workspaces/s1/proof.txt";
     assert!(
