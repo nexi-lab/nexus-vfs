@@ -116,6 +116,19 @@ impl LocalMetaStore {
             .create(path)
             .map_err(|e| MetaStoreError::IOError(format!("redb open {}: {e}", path.display())))?;
 
+        Self::from_database(db, path)
+    }
+
+    /// Create an ephemeral namespace using the same metadata API and encoding.
+    pub fn in_memory() -> Result<Self, MetaStoreError> {
+        let db = Database::builder()
+            .set_cache_size(1024 * 1024)
+            .create_with_backend(redb::backends::InMemoryBackend::new())
+            .map_err(|e| MetaStoreError::IOError(format!("redb in-memory open: {e}")))?;
+        Self::from_database(db, Path::new("in-memory"))
+    }
+
+    fn from_database(db: Database, path: &Path) -> Result<Self, MetaStoreError> {
         // Ensure tables exist and the value encoding is the current one. One
         // write txn: a half-migrated store is not a state anything downstream
         // knows how to read, so the rewrite and the version row commit together
