@@ -48,10 +48,7 @@ fn boot() -> (Kernel, OperationContext) {
         "/proc/p1/workspace/repo",
         "/agents/alice/workspaces/s1",
     );
-    (
-        kernel,
-        ctx,
-    )
+    (kernel, ctx)
 }
 
 #[test]
@@ -120,7 +117,12 @@ fn both_the_workspace_alias_and_the_target_must_be_authorized() {
 #[test]
 fn directory_aliases_do_not_allow_an_extra_link_hop_or_parent_escape() {
     let (kernel, ctx) = boot();
-    link(&kernel, &ctx, "/agents/alice/workspaces/s1/again", "/secrets");
+    link(
+        &kernel,
+        &ctx,
+        "/agents/alice/workspaces/s1/again",
+        "/secrets",
+    );
     link(&kernel, &ctx, "/escape", "/agents/../secrets");
     for path in ["/proc/p1/workspace/repo/again/key", "/escape/key"] {
         assert!(KernelSyscall::sys_write(&kernel, path, &ctx, b"no", 0).is_err());
