@@ -88,6 +88,7 @@ pub struct RaftGrpcServer {
     /// backend is wired. `None` while the slot is empty —
     /// `ReadBlob` returns `NotFound` until the kernel installs one.
     blob_fetcher_slot: Option<BlobFetcherSlot>,
+    search_capabilities_slot: Option<crate::search_capabilities::SearchCapabilitiesSlot>,
     /// Slot the cluster profile binds an `AgentMinter` into on the founder
     /// (CA holder) at boot. `None` on a joiner — `MintAgent` returns
     /// success=false there ("not the CA holder").
@@ -121,6 +122,7 @@ impl RaftGrpcServer {
             config,
             registry,
             blob_fetcher_slot: None,
+            search_capabilities_slot: None,
             agent_minter_slot: None,
             key_minter_slot: None,
             foreign_ca_registrar_slot: None,
@@ -136,6 +138,14 @@ impl RaftGrpcServer {
     /// owning `ZoneManager` so both halves reach the same `Arc`.
     pub fn with_blob_fetcher_slot(mut self, slot: BlobFetcherSlot) -> Self {
         self.blob_fetcher_slot = Some(slot);
+        self
+    }
+
+    pub fn with_search_capabilities_slot(
+        mut self,
+        slot: crate::search_capabilities::SearchCapabilitiesSlot,
+    ) -> Self {
+        self.search_capabilities_slot = Some(slot);
         self
     }
 
@@ -221,6 +231,7 @@ impl RaftGrpcServer {
         let client_service = ZoneApiServiceImpl {
             registry: self.registry.clone(),
             blob_fetcher_slot: self.blob_fetcher_slot.clone(),
+            search_capabilities_slot: self.search_capabilities_slot.clone(),
             agent_minter_slot: self.agent_minter_slot.clone(),
             key_minter_slot: self.key_minter_slot.clone(),
             foreign_ca_registrar_slot: self.foreign_ca_registrar_slot.clone(),
@@ -292,6 +303,7 @@ impl RaftGrpcServer {
         let client_service = ZoneApiServiceImpl {
             registry: self.registry.clone(),
             blob_fetcher_slot: self.blob_fetcher_slot.clone(),
+            search_capabilities_slot: self.search_capabilities_slot.clone(),
             agent_minter_slot: self.agent_minter_slot.clone(),
             key_minter_slot: self.key_minter_slot.clone(),
             foreign_ca_registrar_slot: self.foreign_ca_registrar_slot.clone(),
@@ -776,6 +788,7 @@ struct ZoneApiServiceImpl {
     /// Optional late-bound `BlobFetcher` for `ReadBlob`. Empty slot
     /// (or `None` here) → `read_blob` returns `NotFound`.
     blob_fetcher_slot: Option<BlobFetcherSlot>,
+    search_capabilities_slot: Option<crate::search_capabilities::SearchCapabilitiesSlot>,
     /// Optional late-bound `AgentMinter` for `MintAgent`. Present only on the
     /// CA holder (founder); `None` → `mint_agent` returns success=false.
     agent_minter_slot: Option<AgentMinterSlot>,
@@ -1503,33 +1516,21 @@ impl ZoneApiService for ZoneApiServiceImpl {
         }
     }
 
-    /// Return search capabilities for a zone.
-    ///
-    /// Reads `{base_path}/{zone_id}/search_caps.json` on each RPC.
-    /// Python search daemon writes the file at startup. Falls back to
-    /// keyword-only defaults if the file is missing or malformed.
+    /// Return the current host's search capabilities for an existing zone.
     async fn get_search_capabilities(
         &self,
         request: Request<GetSearchCapabilitiesRequest>,
     ) -> std::result::Result<Response<SearchCapabilities>, Status> {
-        let req = request.into_inner();
-        let zone_id = req.zone_id;
-
-        if self.registry.get_node(&zone_id).is_none() {
+        let zone_id = request.into_inner().zone_id;
+        if !self.registry.hosts(&zone_id) {
             return Err(Status::not_found(format!("Zone '{}' not found", zone_id)));
         }
-
-        let caps =
-            crate::raft::read_search_caps(self.registry.base_path(), &zone_id).unwrap_or_default();
-
-        Ok(Response::new(SearchCapabilities {
-            zone_id,
-            device_tier: caps.device_tier,
-            search_modes: caps.search_modes,
-            embedding_model: caps.embedding_model,
-            embedding_dimensions: caps.embedding_dimensions,
-            has_graph: caps.has_graph,
-        }))
+        let provider = self
+            .search_capabilities_slot
+            .as_ref()
+            .and_then(|slot| slot.read().clone())
+            .ok_or_else(|| Status::unavailable("search capability provider is not ready"))?;
+        provider.capabilities(&zone_id).await.map(Response::new)
     }
 
     /// Serve a peer's content fetch — store-and-forward.

@@ -23,7 +23,9 @@
 //!   remote mounts ride on — all of which send an empty `auth_token`.
 //!
 //! * **Agent / user** — [`AuthCredentials::token`] carries an `sk-` API
-//!   key. Resolved against the replicated key store.
+//!   key. Resolved against the replicated key store. A presented nonempty
+//!   token selects this identity even on a verified mTLS connection; a strict
+//!   provider rejects an invalid token without falling back to the peer.
 //!
 //! Keeping both on one struct is what lets a strict provider reject an
 //! empty token *without* killing federation: no token but a valid peer
@@ -149,6 +151,8 @@ impl<'a> AuthCredentials<'a> {
 }
 
 /// Resolve a request's credentials into an `OperationContext`.
+/// Strict providers resolve a nonempty token first, and use the peer only
+/// when the token is absent. A rejected token must not inherit peer authority.
 pub trait AuthProvider: Send + Sync + 'static {
     fn resolve(&self, creds: &AuthCredentials<'_>) -> Result<OperationContext, tonic::Status>;
 

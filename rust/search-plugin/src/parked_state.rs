@@ -69,9 +69,7 @@ pub struct ParkedQueue {
 impl ParkedQueue {
     /// Load the sidecar at `<zone_root>/parked.json` if it exists;
     /// otherwise start empty.
-    pub fn open_or_create(zone_root: PathBuf) -> Result<Self, ParkedError> {
-        std::fs::create_dir_all(&zone_root)
-            .map_err(|e| ParkedError::CreateDir(zone_root.display().to_string(), e.to_string()))?;
+    pub fn load(zone_root: PathBuf) -> Result<Self, ParkedError> {
         let path = zone_root.join(PARKED_FILE);
         let mut map: HashMap<String, ParkedEntry> = HashMap::new();
         if path.exists() {
@@ -139,6 +137,8 @@ impl ParkedQueue {
     /// Persist to disk.  Atomic write-then-rename; same shape as
     /// IndexState.save.
     pub fn save(&self) -> Result<(), ParkedError> {
+        std::fs::create_dir_all(&self.dir)
+            .map_err(|e| ParkedError::CreateDir(self.dir.display().to_string(), e.to_string()))?;
         let path = self.dir.join(PARKED_FILE);
         let entries: Vec<ParkedEntry> = self.inner.read().values().cloned().collect();
         let persisted = Persisted {
@@ -179,15 +179,15 @@ mod tests {
     }
 
     #[test]
-    fn open_or_create_returns_empty_on_fresh_zone() {
-        let q = ParkedQueue::open_or_create(tempdir()).expect("open");
+    fn load_returns_empty_on_fresh_zone() {
+        let q = ParkedQueue::load(tempdir()).expect("open");
         assert_eq!(q.len(), 0);
         assert!(q.is_empty());
     }
 
     #[test]
     fn park_then_list_returns_entry() {
-        let q = ParkedQueue::open_or_create(tempdir()).expect("open");
+        let q = ParkedQueue::load(tempdir()).expect("open");
         q.park("/x.md", "writer full", 1_700_000_000_000);
         let entries = q.list();
         assert_eq!(entries.len(), 1);
@@ -200,7 +200,7 @@ mod tests {
     fn park_bumps_prior_entry_reason_and_time() {
         // Re-park with a fresher reason overwrites; ensures the
         // operator UI shows the current failure, not the ancient one.
-        let q = ParkedQueue::open_or_create(tempdir()).expect("open");
+        let q = ParkedQueue::load(tempdir()).expect("open");
         q.park("/x.md", "writer full", 1);
         q.park("/x.md", "embed failed", 2);
         assert_eq!(q.len(), 1);
@@ -211,7 +211,7 @@ mod tests {
 
     #[test]
     fn remove_returns_true_only_when_present() {
-        let q = ParkedQueue::open_or_create(tempdir()).expect("open");
+        let q = ParkedQueue::load(tempdir()).expect("open");
         q.park("/x.md", "r", 1);
         assert!(q.remove("/x.md"));
         assert!(!q.remove("/x.md"), "second remove is a no-op");
@@ -220,7 +220,7 @@ mod tests {
 
     #[test]
     fn list_sorted_by_parked_at_ascending() {
-        let q = ParkedQueue::open_or_create(tempdir()).expect("open");
+        let q = ParkedQueue::load(tempdir()).expect("open");
         q.park("/b.md", "r", 100);
         q.park("/a.md", "r", 50);
         q.park("/c.md", "r", 200);
@@ -233,12 +233,12 @@ mod tests {
     fn save_then_reopen_survives_restart() {
         let dir = tempdir();
         {
-            let q = ParkedQueue::open_or_create(dir.clone()).expect("open");
+            let q = ParkedQueue::load(dir.clone()).expect("open");
             q.park("/x.md", "r1", 1);
             q.park("/y.md", "r2", 2);
             q.save().expect("save");
         }
-        let q2 = ParkedQueue::open_or_create(dir).expect("reopen");
+        let q2 = ParkedQueue::load(dir).expect("reopen");
         assert_eq!(q2.len(), 2);
         let entries = q2.list();
         assert_eq!(entries[0].path, "/x.md");

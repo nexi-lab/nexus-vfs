@@ -286,6 +286,7 @@ async fn replicated_stream_append_wakes_a_parked_watch_only_with_the_observer() 
     install_stream_wakeup_observer(
         &zone_joiner.consensus_node(),
         Arc::downgrade(&kernel_joiner),
+        "sharedzone",
     );
 
     let data_2 = b"phase-2-observer-armed".to_vec();

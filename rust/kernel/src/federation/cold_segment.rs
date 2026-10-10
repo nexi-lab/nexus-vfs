@@ -34,9 +34,7 @@ impl Kernel {
     /// WAL cores (unbounded-in-raft) — the pre-P1 behaviour for a non-federated
     /// kernel.
     pub(crate) fn arm_stream_cold_tier(self: &Arc<Self>) {
-        let store: Arc<dyn ColdSegmentStore> = Arc::new(KernelColdSegmentStore {
-            kernel: Arc::downgrade(self),
-        });
+        let store = Arc::downgrade(self);
         if self.cold_segment_store.set(store).is_err() {
             // Already armed: boot arms this alongside the stream materializer
             // and both are idempotent. Nothing is lost — the first store wins
@@ -47,8 +45,11 @@ impl Kernel {
     }
 
     /// The armed cold-tier store, if any. `None` ⇒ hot-only WAL streams.
-    pub(crate) fn cold_segment_store_arc(&self) -> Option<Arc<dyn ColdSegmentStore>> {
-        self.cold_segment_store.get().cloned()
+    pub(crate) fn cold_segment_store_for(&self, zone: &str) -> Option<Arc<dyn ColdSegmentStore>> {
+        Some(Arc::new(KernelColdSegmentStore {
+            kernel: self.cold_segment_store.get()?.clone(),
+            zone: zone.to_owned(),
+        }))
     }
 
     /// Roll thresholds for WAL DT_STREAM sealing. `NEXUS_STREAM_HOT_WINDOW` /
@@ -77,11 +78,23 @@ impl Kernel {
     /// kernel-global federation cache for a placeholder mount — the SAME
     /// resolution `sys_write`/`sys_read` use for DT_REG content, so a stream
     /// segment lands in and reads from exactly the store file bytes do.
-    fn stream_content_backend(&self, stream_path: &str) -> Option<Arc<dyn ObjectStore>> {
-        self.vfs_router
-            .route(stream_path, contracts::ROOT_ZONE_ID)
-            .and_then(|r| r.backend.clone())
-            .or_else(|| self.federation_cache_arc())
+    fn stream_content_backend(
+        &self,
+        stream_path: &str,
+        zone: &str,
+    ) -> Option<Arc<dyn ObjectStore>> {
+        for (lookup_zone, path) in self.vfs_router.project_zone_path(zone, stream_path) {
+            if let Some(route) = self.vfs_router.route(&path, &lookup_zone) {
+                let address =
+                    crate::kernel::StreamAddress::from_route(&path, &lookup_zone, Some(&route));
+                if address.zone == zone && address.path == stream_path {
+                    if let Some(backend) = route.backend {
+                        return Some(backend);
+                    }
+                }
+            }
+        }
+        self.federation_cache_arc()
     }
 
     /// Write a sealed segment blob to the content pillar, returning the id to
@@ -90,22 +103,20 @@ impl Kernel {
     pub(crate) fn write_cold_segment(
         &self,
         stream_path: &str,
+        zone_id: &str,
         base: u64,
         bytes: &[u8],
     ) -> Result<String, String> {
-        let zone_id = self.routed_zone_id(stream_path);
         let backend = self
-            .stream_content_backend(stream_path)
+            .stream_content_backend(stream_path, zone_id)
             .ok_or_else(|| format!("no content backend for stream {stream_path}"))?;
         let ctx = OperationContext::new(
-            "system", &zone_id, /* is_admin */ true, None, /* is_system */ true,
+            "system", zone_id, /* is_admin */ true, None, /* is_system */ true,
         );
-        // A unique per-segment key: ignored by a content-addressed backend
-        // (id = hash of the bytes), the storage/fetch path for a path-addressed
-        // one. Under the stream so a placeholder-mount route lands it in the
-        // stream's zone, resolvable by a peer's `BlobFetcher::read` the same way
-        // a DT_REG file is.
-        let seg_key = format!("{stream_path}/__seg__/{base}");
+        // Path-addressed caches are shared by zones. Include the owning zone
+        // so equal stream paths and offsets cannot overwrite each other's blobs.
+        // CAS backends derive their identifier from the bytes instead.
+        let seg_key = format!("/__stream_segments__/{zone_id}{stream_path}/{base}");
         let wr = backend
             .write_content(bytes, &seg_key, &ctx, 0)
             .map_err(|e| format!("write cold segment ({stream_path} base {base}): {e:?}"))?;
@@ -118,17 +129,17 @@ impl Kernel {
     pub(crate) fn read_cold_segment(
         &self,
         stream_path: &str,
+        zone_id: &str,
         content_id: &str,
         origin: &str,
     ) -> Result<Vec<u8>, String> {
-        let zone_id = self.routed_zone_id(stream_path);
         let ctx = OperationContext::new(
-            "system", &zone_id, /* is_admin */ true, None, /* is_system */ true,
+            "system", zone_id, /* is_admin */ true, None, /* is_system */ true,
         );
 
         // Local content store first (the writer node, or any node that has
         // fetched it before under a shared/replicated backend).
-        if let Some(backend) = self.stream_content_backend(stream_path) {
+        if let Some(backend) = self.stream_content_backend(stream_path, zone_id) {
             if let Ok(data) = backend.read_content(content_id, &ctx) {
                 return Ok(data);
             }
@@ -163,8 +174,13 @@ impl Kernel {
     /// ignored. Returns `true` if a backend accepted the delete; `false` when
     /// neither did (no local backend, or the blob was already gone — the caller
     /// logs that, so a genuine reclaim failure is not silent).
-    pub(crate) fn delete_cold_segment(&self, stream_path: &str, content_id: &str) -> bool {
-        let Some(backend) = self.stream_content_backend(stream_path) else {
+    pub(crate) fn delete_cold_segment(
+        &self,
+        stream_path: &str,
+        zone_id: &str,
+        content_id: &str,
+    ) -> bool {
+        let Some(backend) = self.stream_content_backend(stream_path, zone_id) else {
             return false;
         };
         // Either arm succeeding is a reclaim; NotSupported from the wrong arm for
@@ -185,14 +201,19 @@ impl Kernel {
     /// silently refuses deletes) would leave the retention budget unbounded on
     /// disk with no signal — the log is the operator-visible proof the cold tier
     /// is actually reclaimed, and the hook the live e2e gates on.
-    pub fn gc_trimmed_cold_segments(&self, stream_path: &str, trimmed: &[(String, String)]) {
+    pub fn gc_trimmed_cold_segments(
+        &self,
+        stream_path: &str,
+        zone_id: &str,
+        trimmed: &[(String, String)],
+    ) {
         let me = self.self_address.read().clone().unwrap_or_default();
         let mut owned = 0usize;
         let mut reclaimed = 0usize;
         for (origin, content_id) in trimmed {
             if origin.as_str() == me.as_str() {
                 owned += 1;
-                if self.delete_cold_segment(stream_path, content_id) {
+                if self.delete_cold_segment(stream_path, zone_id, content_id) {
                     reclaimed += 1;
                 }
             }
@@ -221,6 +242,7 @@ impl Kernel {
 /// outlives the kernel degrades to a clean error instead of keeping it alive.
 struct KernelColdSegmentStore {
     kernel: Weak<Kernel>,
+    zone: String,
 }
 
 impl ColdSegmentStore for KernelColdSegmentStore {
@@ -232,7 +254,7 @@ impl ColdSegmentStore for KernelColdSegmentStore {
 
     fn write_segment(&self, stream_id: &str, base: u64, bytes: &[u8]) -> Result<String, String> {
         let k = self.kernel.upgrade().ok_or("kernel dropped")?;
-        k.write_cold_segment(stream_id, base, bytes)
+        k.write_cold_segment(stream_id, &self.zone, base, bytes)
     }
 
     fn read_segment(
@@ -242,6 +264,6 @@ impl ColdSegmentStore for KernelColdSegmentStore {
         origin: &str,
     ) -> Result<Vec<u8>, String> {
         let k = self.kernel.upgrade().ok_or("kernel dropped")?;
-        k.read_cold_segment(stream_id, content_id, origin)
+        k.read_cold_segment(stream_id, &self.zone, content_id, origin)
     }
 }

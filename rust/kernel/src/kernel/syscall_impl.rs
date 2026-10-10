@@ -56,14 +56,10 @@ fn clone_read_result(
     match shared {
         Err(e) => Err(e.clone()),
         Ok(src) => {
-            let data = src.data.as_ref().map(|bytes| {
-                let off = (req.offset as usize).min(bytes.len());
-                let end = match req.len {
-                    Some(l) => off.saturating_add(l as usize).min(bytes.len()),
-                    None => bytes.len(),
-                };
-                bytes[off..end].to_vec()
-            });
+            let data = src
+                .data
+                .as_ref()
+                .map(|bytes| read_window(bytes, req).to_vec());
             // Per-consumer metadata when available; fall back to lead's
             // values only when the consumer's metadata is missing (cold
             // PAS-mount path read).
@@ -91,18 +87,29 @@ fn clone_read_result(
     }
 }
 
+fn read_window<'a>(bytes: &'a [u8], req: &crate::kernel::ReadRequest) -> &'a [u8] {
+    let off = usize::try_from(req.offset)
+        .unwrap_or(usize::MAX)
+        .min(bytes.len());
+    let end = match req.len {
+        Some(len) => off
+            .saturating_add(usize::try_from(len).unwrap_or(usize::MAX))
+            .min(bytes.len()),
+        None => bytes.len(),
+    };
+    &bytes[off..end]
+}
+
 fn slice_read_result(
     r: Result<SysReadResult, KernelError>,
     req: &crate::kernel::ReadRequest,
 ) -> Result<SysReadResult, KernelError> {
     let mut r = r?;
+    if req.offset == 0 && req.len.is_none() {
+        return Ok(r);
+    }
     if let Some(bytes) = r.data.as_ref() {
-        let off = (req.offset as usize).min(bytes.len());
-        let end = match req.len {
-            Some(l) => off.saturating_add(l as usize).min(bytes.len()),
-            None => bytes.len(),
-        };
-        r.data = Some(bytes[off..end].to_vec());
+        r.data = Some(read_window(bytes, req).to_vec());
     }
     Ok(r)
 }
@@ -123,7 +130,16 @@ impl Kernel {
         }
         if reqs.len() == 1 {
             let req = &reqs[0];
-            return vec![self.sys_read_single(&req.path, ctx, 1, req.timeout_ms, req.offset)];
+            let result = self
+                .sys_read_single(&req.path, ctx, 1, req.timeout_ms, req.offset)
+                .and_then(|result| {
+                    if matches!(result.entry_type, DT_PIPE | DT_STREAM) {
+                        Ok(result)
+                    } else {
+                        slice_read_result(Ok(result), req)
+                    }
+                });
+            return vec![result];
         }
         self.sys_read_batch_impl(reqs, ctx)
     }
@@ -203,12 +219,19 @@ impl Kernel {
         timeout_ms: u64,
         ctx: &OperationContext,
     ) -> Result<Option<(Vec<u8>, usize)>, KernelError> {
-        self.check_permission(path, Permission::Read, ctx)?;
+        let address = self.resolve_stream_address(path, ctx, |path, route, ctx| {
+            self.check_permission_with_route(path, route, Permission::Read, ctx)
+        })?;
+        let key = address.key();
         if timeout_ms == 0 {
-            self.stream_read_at(path, offset)
+            self.stream_manager
+                .read_at(&key, offset)
+                .map_err(super::stream_mgr_err)
         } else {
-            self.stream_read_at_blocking(path, offset, timeout_ms)
+            self.stream_manager
+                .read_at_blocking(&key, offset, timeout_ms)
                 .map(Some)
+                .map_err(super::stream_mgr_err)
         }
     }
 
@@ -220,8 +243,12 @@ impl Kernel {
         path: &str,
         ctx: &OperationContext,
     ) -> Result<Vec<u8>, KernelError> {
-        self.check_permission(path, Permission::Read, ctx)?;
-        self.stream_collect_all(path)
+        let address = self.resolve_stream_address(path, ctx, |path, route, ctx| {
+            self.check_permission_with_route(path, route, Permission::Read, ctx)
+        })?;
+        self.stream_manager
+            .collect_all_payloads(&address.key())
+            .map_err(super::stream_mgr_err)
     }
 
     /// Shared read logic: route → metastore → DT_LINK follow → backend.
@@ -237,6 +264,18 @@ impl Kernel {
         offset: u64,
     ) -> Result<SysReadResult, KernelError> {
         let not_found = || KernelError::FileNotFound(path.to_string());
+
+        // Directory links are namespace aliases, including when the leaf does
+        // not exist yet. Re-enter the gated syscall with the SAME identity so
+        // both the caller's spelling and the target get permission/hooks.
+        if let Some(target) = self.directory_link_target(path, &ctx.zone_id)? {
+            if max_link_hops == 0 {
+                return Err(KernelError::PermissionDenied(format!(
+                    "DT_LINK chain rejected (ELOOP) at {path}"
+                )));
+            }
+            return self.sys_read_single(&target, ctx, max_link_hops - 1, timeout_ms, offset);
+        }
 
         // 2. Route (pure Rust LPM)
         let route = match self.vfs_router.route(path, &ctx.zone_id) {
@@ -356,7 +395,21 @@ impl Kernel {
 
         // DT_STREAM — Rust IPC registry: offset-based read with optional blocking.
         if entry.entry_type == DT_STREAM {
-            match self.stream_read_at(path, offset as usize) {
+            let address = super::StreamAddress::from_route(path, &ctx.zone_id, Some(&route));
+            let mut target_ctx = ctx.clone();
+            target_ctx.zone_id = address.zone.clone();
+            self.check_permission_with_route(
+                &address.path,
+                Some(&route),
+                Permission::Read,
+                &target_ctx,
+            )?;
+            let key = address.key();
+            match self
+                .stream_manager
+                .read_at(&key, offset as usize)
+                .map_err(super::stream_mgr_err)
+            {
                 Ok(Some((data, next_offset))) => {
                     return Ok(SysReadResult::ipc(DT_STREAM, Some(data), Some(next_offset)));
                 }
@@ -364,7 +417,11 @@ impl Kernel {
                     if timeout_ms == 0 {
                         return Ok(SysReadResult::ipc(DT_STREAM, None, None));
                     }
-                    match self.stream_read_at_blocking(path, offset as usize, timeout_ms) {
+                    match self
+                        .stream_manager
+                        .read_at_blocking(&key, offset as usize, timeout_ms)
+                        .map_err(super::stream_mgr_err)
+                    {
                         Ok((data, next_offset)) => {
                             return Ok(SysReadResult::ipc(
                                 DT_STREAM,
@@ -717,6 +774,21 @@ impl Kernel {
         let replacement = self.apply_mutating_write_hooks(path, ctx, content)?;
         let effective_content: &[u8] = replacement.as_deref().unwrap_or(content);
 
+        if let Some(target) = self.directory_link_target(path, &ctx.zone_id)? {
+            if max_link_hops == 0 {
+                return Err(KernelError::PermissionDenied(format!(
+                    "DT_LINK chain rejected (ELOOP) at {path}"
+                )));
+            }
+            return self.sys_write_with_link_depth(
+                &target,
+                ctx,
+                effective_content,
+                offset,
+                max_link_hops - 1,
+            );
+        }
+
         // 2. Route (check write access)
         let route = match self.vfs_router.route(path, &ctx.zone_id) {
             Some(r) => r,
@@ -809,7 +881,24 @@ impl Kernel {
                 // blocking `read_at_blocking` / `sys_read(timeout>0)` on the same
                 // node missed a local write until its timeout — the mailbox
                 // append RPC (`stream_write_nowait`) already went through here.
-                match self.stream_manager.write_nowait(path, effective_content) {
+                let address = super::StreamAddress::from_route(path, &ctx.zone_id, Some(&route));
+                let mut target_ctx = ctx.clone();
+                target_ctx.zone_id = address.zone.clone();
+                let target_replacement = if address.path != path || address.zone != ctx.zone_id {
+                    self.apply_mutating_write_hooks_with_route(
+                        &address.path,
+                        Some(&route),
+                        &target_ctx,
+                        effective_content,
+                    )?
+                } else {
+                    None
+                };
+                let effective_content = target_replacement.as_deref().unwrap_or(effective_content);
+                match self
+                    .stream_manager
+                    .write_nowait(&address.key(), effective_content)
+                {
                     Ok(offset) => {
                         // POST hooks fire on the IPC short-circuit
                         // path the same as for DT_REG. Hook
@@ -1367,7 +1456,7 @@ impl Kernel {
         // a not-yet-materialised remote stream).
         let size = if entry.entry_type == DT_STREAM {
             self.stream_manager
-                .tail(path)
+                .tail(&super::StreamAddress::from_route(path, zone_id, Some(&route)).key())
                 .map_or(entry.size, |tail| tail as u64)
         } else if is_dir && entry.size == 0 {
             4096
@@ -1386,7 +1475,9 @@ impl Kernel {
         // never been appended to on this replica.
         let modified_at_ms = if entry.entry_type == DT_STREAM {
             self.stream_manager
-                .last_append_ms(path)
+                .last_append_ms(
+                    &super::StreamAddress::from_route(path, zone_id, Some(&route)).key(),
+                )
                 .or(entry.modified_at_ms)
         } else {
             entry.modified_at_ms
@@ -1660,7 +1751,7 @@ impl Kernel {
             }
             DT_STREAM => {
                 // Destroy stream buffer + metastore/dcache cleanup (Rust-native)
-                let _ = self.destroy_stream(path);
+                self.destroy_stream_in_zone(path, &ctx.zone_id)?;
                 return Ok(SysUnlinkResult {
                     hit: true,
                     entry_type: DT_STREAM,
@@ -3039,6 +3130,24 @@ impl Kernel {
                     .map(|r| Err(KernelError::InvalidPath(r.path.clone())))
                     .collect();
             }
+        }
+
+        // Links need the single-path recursion: it gates both spellings and
+        // commits metadata at the target. The batch fast path writes directly
+        // to its pre-routed backend and cannot preserve that contract.
+        if reqs.iter().any(|req| {
+            self.directory_link_target(&req.path, &ctx.zone_id)
+                .map_or(true, |target| target.is_some())
+                || self
+                    .sys_stat(&req.path, &ctx.zone_id)
+                    .is_some_and(|entry| entry.entry_type == crate::meta_store::DT_LINK)
+        }) {
+            return reqs
+                .iter()
+                .map(|req| {
+                    self.sys_write_with_link_depth(&req.path, ctx, &req.content, req.offset, 1)
+                })
+                .collect();
         }
 
         // 1b. Permission gate + native pre-hooks per item. The previous
@@ -4488,6 +4597,41 @@ mod read_batch_tests {
         assert_eq!(out[1].as_ref().unwrap().data.as_deref().unwrap(), b"3456");
         assert_eq!(out[2].as_ref().unwrap().data.as_deref().unwrap(), b"");
         assert_eq!(out[3].as_ref().unwrap().data.as_deref().unwrap(), b"89");
+    }
+
+    #[test]
+    fn read_single_and_batch_ranges_have_identical_results() {
+        let k = kernel_with_backend();
+        let c = ctx();
+        let payload = "héllo needle".as_bytes();
+        k.sys_write_with_link_depth("/range.txt", &c, payload, 0, 1)
+            .unwrap();
+        for (offset, len, expected) in [
+            (0, None, payload),
+            (1, Some(3), &payload[1..4]),
+            (1, None, &payload[1..]),
+            (0, Some(0), &payload[0..0]),
+            (payload.len() as u64, None, &payload[0..0]),
+            (u64::MAX, None, &payload[0..0]),
+            (2, Some(u64::MAX), &payload[2..]),
+        ] {
+            let single = k.sys_read(&[rreq("/range.txt", offset, len)], &c);
+            let batch = k.sys_read(
+                &[rreq("/range.txt", offset, len), rreq("/range.txt", 0, None)],
+                &c,
+            );
+            let single = single[0].as_ref().unwrap();
+            let batch = batch[0].as_ref().unwrap();
+            assert_eq!(
+                single.data.as_deref().unwrap(),
+                expected,
+                "offset={offset}, len={len:?}"
+            );
+            assert_eq!(batch.data.as_deref().unwrap(), expected);
+            assert_eq!(single.content_id, batch.content_id);
+            assert_eq!(single.gen, batch.gen);
+            assert_eq!(single.entry_type, batch.entry_type);
+        }
     }
 
     #[test]

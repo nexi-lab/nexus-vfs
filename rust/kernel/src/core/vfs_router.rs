@@ -626,6 +626,34 @@ impl VFSRouter {
         keys
     }
 
+    /// Visible spellings of one backing path, paired with their lookup zone.
+    /// Used on cold resolution; it inspects routing metadata, never storage.
+    pub fn project_zone_path(&self, zone: &str, path: &str) -> Vec<(String, String)> {
+        self.entries
+            .iter()
+            .filter_map(|entry| {
+                let (lookup_zone, mount) = extract_zone_from_canonical(entry.key());
+                let target = entry.target_zone_id.as_deref().unwrap_or(&lookup_zone);
+                if target != zone {
+                    return None;
+                }
+                let visible = if entry.target_zone_id.is_some() {
+                    project_zone_key(&mount, entry.target_subtree.as_deref().unwrap_or("/"), path)?
+                } else if mount == "/"
+                    || path == mount
+                    || path
+                        .strip_prefix(&mount)
+                        .is_some_and(|tail| tail.starts_with('/'))
+                {
+                    path.to_owned()
+                } else {
+                    return None;
+                };
+                Some((lookup_zone, visible))
+            })
+            .collect()
+    }
+
     /// Snapshot every non-empty backend registered on the mount table.
     ///
     /// Used by `KernelBlobFetcher` to resolve `ReadBlob` by content hash
@@ -1024,6 +1052,29 @@ pub fn zone_relative_path(path: &str, mount_point: &str, target_subtree: Option<
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Inverse of `zone_relative_path`: expose a backing key through a mount.
+/// A key outside the mounted subtree has no spelling through that mount.
+pub fn project_zone_key(mount: &str, subtree: &str, key: &str) -> Option<String> {
+    let relative = if subtree.is_empty() || subtree == "/" {
+        key
+    } else if key == subtree {
+        "/"
+    } else {
+        let suffix = key.strip_prefix(subtree)?;
+        if !suffix.starts_with('/') {
+            return None;
+        }
+        suffix
+    };
+    Some(if mount.is_empty() || mount == "/" {
+        relative.to_owned()
+    } else if relative == "/" {
+        mount.to_owned()
+    } else {
+        format!("{mount}{relative}")
+    })
+}
 
 #[cfg(test)]
 mod tests {

@@ -99,6 +99,8 @@ pub struct AppState {
     /// (see `for_tests` — a `ZeroGenKernel` that returns 0, so a
     /// fenced request just 412s).
     pub kernel: Arc<dyn middleware::revision::StatGen>,
+    /// Live mount table shared with the gRPC host for discovery routing.
+    pub vfs_router: Arc<kernel::vfs_router::VFSRouter>,
     /// The kernel-adjacent ReBAC tuple store — grant / list / revoke
     /// backend for `/v2/rebac/tuples`.  Present iff this crate was
     /// built `--features rebac`; the composition root in `nexusd`
@@ -218,6 +220,7 @@ impl AppState {
             // Real deployments pull the live kernel from the install
             // closure (see `service_decl`).
             kernel: Arc::new(middleware::revision::ZeroGenKernel),
+            vfs_router: Arc::new(kernel::vfs_router::VFSRouter::new()),
             #[cfg(feature = "rebac")]
             rebac_store,
             #[cfg(feature = "rebac")]
@@ -331,6 +334,7 @@ pub fn service_decl(
                 auth_key_store,
                 api_key_secret,
                 stat_kernel,
+                kernel.vfs_router_arc(),
                 #[cfg(feature = "rebac")]
                 rebac_store,
                 ready,
@@ -359,6 +363,7 @@ pub fn install_impl(
     auth_key_store: Arc<dyn kernel::hal::auth_key_store::AuthKeyStore>,
     api_key_secret: Option<Arc<str>>,
     kernel: Arc<dyn middleware::revision::StatGen>,
+    vfs_router: Arc<kernel::vfs_router::VFSRouter>,
     #[cfg(feature = "rebac")] rebac_store: Arc<dyn nexus_rebac::ReBACTupleStore>,
     ready: Arc<transport::grpc::DataPlaneReady>,
 ) -> Result<(), String> {
@@ -409,6 +414,7 @@ pub fn install_impl(
         auth_key_store,
         api_key_secret,
         kernel,
+        vfs_router,
         #[cfg(feature = "rebac")]
         rebac_store,
         #[cfg(feature = "rebac")]

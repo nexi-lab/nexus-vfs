@@ -1,50 +1,41 @@
-//! Per-zone [`FtsIndex`] cache with lazy open-or-create (Phase 1 of
-//! the Python-parity roadmap; see `PARITY_ROADMAP.md` D1).
+//! Per-zone FTS and ANN index handles.
 //!
-//! # Rationale
+//! Reads open only existing indexes. Explicit indexing creates missing indexes.
+//! The manager caches positive handles so pending writes and commit generations
+//! remain shared, and leaves absent zones uncached so later indexing is visible.
 //!
-//! `FtsIndex` is the storage primitive — one directory, one schema,
-//! one writer lock.  `IndexManager` is the zone router — it maps
-//! `zone_id -> Arc<FtsIndex>` and lazily opens an index the first
-//! time a Query or Index call names a zone the manager hasn't seen
-//! yet.  Separating the two keeps `service.rs` free of directory
-//! plumbing: the RPC handler asks the manager for an index and
-//! calls into it.
+//! A mutex serializes first opens and protects each handle map. Index operations
+//! run after releasing it. Zone IDs must be single directory components before
+//! they reach storage; authorization remains the host's responsibility.
 //!
-//! # Concurrency
-//!
-//! The cache is a `parking_lot::Mutex<HashMap<zone_id, Arc<FtsIndex>>>`;
-//! the lock is held for a hash lookup (typically ns) or a first-boot
-//! `open_or_create` (typically low-ms once per zone).  A `DashMap`
-//! would be lower-overhead in principle but zone count is small
-//! (single-digit typical, tens max) and Query lookups take zero
-//! locks after the first-boot cost — the `Arc<FtsIndex>` is cloned
-//! out under the lock and the rest of the request runs lock-free.
-//!
-//! # Storage roots
-//!
-//! The directory layout is `<root>/<zone_id>/fts-v2/`.  Root resolves
-//! from the `NEXUS_DATA_DIR` env var (same convention as
-//! [`nexus-vault`]'s per-node state), falling back to `./nexus-data`
-//! when unset — one SSOT lets operators relocate ALL plugins by
-//! pointing `NEXUS_DATA_DIR` at a data volume.  Tests pass an
-//! explicit tempdir via [`IndexManager::with_root`].
-//!
-//! Zone-id sanitisation is minimal — the caller (the kernel-tier
-//! RPC handler) never lets a client-controlled string reach this
-//! API; `zone_id` values are drawn from the raft-managed zone
-//! registry.
+//! Storage lives under `$NEXUS_DATA_DIR/plugins/search`, falling back to
+//! `./nexus-data/plugins/search`. Tests use [`IndexManager::with_root`].
 //!
 //! [`nexus-vault`]: ../../../vault/src/lib.rs
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 
 use crate::ann_index::{AnnError, AnnIndex};
 use crate::fts_index::{FtsIndex, IndexError, WriterStatus};
+
+/// Logical zone identities must stay inside one index directory. This checks
+/// storage representation without changing kernel zone admission.
+pub fn validate_index_zone(zone: &str) -> Result<(), IndexError> {
+    let mut components = Path::new(zone).components();
+    if zone.contains(['/', '\\', ':', '\0'])
+        // Windows normalizes these suffixes before filesystem lookup.
+        || zone.ends_with(['.', ' '])
+        || !matches!(components.next(), Some(Component::Normal(name)) if name == zone)
+        || components.next().is_some()
+    {
+        return Err(IndexError::InvalidZone(zone.to_owned()));
+    }
+    Ok(())
+}
 
 /// Directory name inside a per-zone index root for the FTS store.
 /// Sibling directories (Phase 2's `ann/` for HNSW, etc.) land next
@@ -155,6 +146,8 @@ pub enum SkeletonAccess {
     /// A rebuild is in flight and no prior snapshot exists (cold
     /// start) — callers run with an empty title arm.
     Building,
+    /// No FTS corpus exists for this zone.
+    Missing,
 }
 
 impl IndexManager {
@@ -195,6 +188,7 @@ impl IndexManager {
     /// interrupted write left unreconciled drift) — callers use it
     /// to avoid clearing dirt they didn't create.
     pub fn mark_zone_dirty(&self, zone_id: &str) -> Result<bool, String> {
+        validate_index_zone(zone_id).map_err(|e| e.to_string())?;
         let was_dirty = self.zone_is_dirty(zone_id);
         self.dirty_zones.lock().insert(zone_id.to_string());
         let sentinel = self.zone_dirty_sentinel(zone_id);
@@ -228,6 +222,9 @@ impl IndexManager {
     /// restart would observe, instead of silently diverging until
     /// one.
     pub fn clear_zone_dirty(&self, zone_id: &str) {
+        if validate_index_zone(zone_id).is_err() {
+            return;
+        }
         let sentinel = self.zone_dirty_sentinel(zone_id);
         // NotFound also syncs (review R10): a PRIOR unlink may still
         // be unsynced in the directory, so "already absent" is only
@@ -265,6 +262,9 @@ impl IndexManager {
     /// Sentinel metadata errors read as DIRTY (review R7) — a
     /// filesystem that can't answer must not re-enable caching.
     pub fn zone_is_dirty(&self, zone_id: &str) -> bool {
+        if validate_index_zone(zone_id).is_err() {
+            return true;
+        }
         self.dirty_zones.lock().contains(zone_id)
             || !matches!(self.zone_dirty_sentinel(zone_id).try_exists(), Ok(false))
     }
@@ -323,6 +323,7 @@ impl IndexManager {
     /// the same handle so writer state (buffered adds) survives
     /// across RPCs.
     pub fn get_or_open(&self, zone_id: &str) -> Result<Arc<FtsIndex>, IndexError> {
+        validate_index_zone(zone_id)?;
         let mut zones = self.zones.lock();
         if let Some(idx) = zones.get(zone_id) {
             return Ok(Arc::clone(idx));
@@ -330,6 +331,21 @@ impl IndexManager {
         let idx = FtsIndex::open_or_create(self.index_dir(zone_id))?;
         zones.insert(zone_id.to_string(), Arc::clone(&idx));
         Ok(idx)
+    }
+
+    /// Cache only an existing corpus. A missing corpus stays absent so an
+    /// ordinary read cannot create persistent state or retain an empty writer.
+    pub fn get_existing(&self, zone_id: &str) -> Result<Option<Arc<FtsIndex>>, IndexError> {
+        validate_index_zone(zone_id)?;
+        let mut zones = self.zones.lock();
+        if let Some(index) = zones.get(zone_id) {
+            return Ok(Some(Arc::clone(index)));
+        }
+        let Some(index) = FtsIndex::open_existing(self.index_dir(zone_id))? else {
+            return Ok(None);
+        };
+        zones.insert(zone_id.to_owned(), Arc::clone(&index));
+        Ok(Some(index))
     }
 
     /// Writer liveness for every zone this process has opened
@@ -372,7 +388,9 @@ impl IndexManager {
     /// The winning builder holds only the per-zone build lock during
     /// the scan, never the snapshot-cache lock.
     pub fn get_or_build_skeleton(&self, zone_id: &str) -> Result<SkeletonAccess, IndexError> {
-        let fts = self.get_or_open(zone_id)?;
+        let Some(fts) = self.get_existing(zone_id)? else {
+            return Ok(SkeletonAccess::Missing);
+        };
         let current_gen = fts.generation_id();
         let stale = self.skeletons.lock().get(zone_id).map(Arc::clone);
         if let Some(sk) = &stale {
@@ -439,6 +457,8 @@ impl IndexManager {
         embedder_tag: &str,
         dim: usize,
     ) -> Result<Arc<AnnIndex>, AnnError> {
+        validate_index_zone(zone_id)
+            .map_err(|e| AnnError::Open(zone_id.to_owned(), e.to_string()))?;
         let key = AnnKey {
             zone_id: zone_id.to_string(),
             embedder_tag: embedder_tag.to_string(),
@@ -450,6 +470,30 @@ impl IndexManager {
         let idx = AnnIndex::open_or_create(self.ann_dir(zone_id, embedder_tag), dim)?;
         zones.insert(key, Arc::clone(&idx));
         Ok(idx)
+    }
+
+    /// Read an existing ANN corpus, including a live handle with pending writes.
+    pub fn get_existing_ann(
+        &self,
+        zone_id: &str,
+        embedder_tag: &str,
+        dim: usize,
+    ) -> Result<Option<Arc<AnnIndex>>, AnnError> {
+        validate_index_zone(zone_id)
+            .map_err(|e| AnnError::Open(zone_id.to_owned(), e.to_string()))?;
+        let key = AnnKey {
+            zone_id: zone_id.to_owned(),
+            embedder_tag: embedder_tag.to_owned(),
+        };
+        let mut zones = self.ann_zones.lock();
+        if let Some(index) = zones.get(&key) {
+            return Ok(Some(Arc::clone(index)));
+        }
+        let Some(index) = AnnIndex::open_existing(self.ann_dir(zone_id, embedder_tag), dim)? else {
+            return Ok(None);
+        };
+        zones.insert(key, Arc::clone(&index));
+        Ok(Some(index))
     }
 }
 
@@ -465,6 +509,111 @@ mod tests {
 
     fn tempdir() -> PathBuf {
         tempfile::tempdir().expect("tempdir").keep()
+    }
+
+    #[test]
+    fn absent_reads_allocate_no_indexes_and_do_not_hide_later_commits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("search");
+        let mgr = IndexManager::with_root(root.clone());
+        for i in 0..100 {
+            let zone = format!("zone-{i}");
+            assert!(mgr.get_existing(&zone).unwrap().is_none());
+            assert!(mgr.get_existing_ann(&zone, "mock", 8).unwrap().is_none());
+            assert!(matches!(
+                mgr.get_or_build_skeleton(&zone).unwrap(),
+                SkeletonAccess::Missing
+            ));
+        }
+        assert!(!root.exists());
+        assert!(mgr.fts_writer_report().is_empty());
+        assert!(mgr.ann_zones.lock().is_empty());
+        assert!(mgr.skeleton_build_locks.lock().is_empty());
+        let fts = mgr.get_or_open("zone-0").unwrap();
+        fts.add_document("/a.md", 0, "gentian", Some(1)).unwrap();
+        fts.commit().unwrap();
+        assert!(Arc::ptr_eq(
+            &fts,
+            &mgr.get_existing("zone-0").unwrap().unwrap()
+        ));
+        let ann = mgr.get_or_open_ann("zone-0", "mock", 8).unwrap();
+        ann.add_vector("/a.md", 0, &[1.0; 8]).unwrap();
+        assert!(Arc::ptr_eq(
+            &ann,
+            &mgr.get_existing_ann("zone-0", "mock", 8).unwrap().unwrap()
+        ));
+        ann.commit().unwrap();
+        drop(ann);
+        drop(fts);
+        drop(mgr);
+        let restarted = IndexManager::with_root(root);
+        let fts = restarted.get_existing("zone-0").unwrap().unwrap();
+        assert_eq!(fts.search("gentian", 10, None).unwrap()[0].path, "/a.md");
+        assert_eq!(
+            restarted
+                .get_existing_ann("zone-0", "mock", 8)
+                .unwrap()
+                .unwrap()
+                .live_count(),
+            1
+        );
+    }
+
+    #[test]
+    fn existing_reads_do_not_replace_corrupt_storage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = IndexManager::with_root(tmp.path().join("search"));
+        let fts_dir = mgr.index_dir("broken");
+        std::fs::create_dir_all(&fts_dir).unwrap();
+        std::fs::write(fts_dir.join("meta.json"), b"broken metadata").unwrap();
+        assert!(mgr.get_existing("broken").is_err());
+        assert_eq!(
+            std::fs::read(fts_dir.join("meta.json")).unwrap(),
+            b"broken metadata"
+        );
+        assert!(mgr.fts_writer_report().is_empty());
+        let ann_dir = mgr.ann_dir("broken", "mock");
+        std::fs::create_dir_all(&ann_dir).unwrap();
+        std::fs::write(ann_dir.join("sidecar.json"), b"broken metadata").unwrap();
+        assert!(mgr.get_existing_ann("broken", "mock", 8).is_err());
+        assert_eq!(
+            std::fs::read(ann_dir.join("sidecar.json")).unwrap(),
+            b"broken metadata"
+        );
+        assert!(mgr.ann_zones.lock().is_empty());
+    }
+
+    #[test]
+    fn unsafe_zone_paths_are_rejected_before_storage_and_legacy_names_remain_valid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("search");
+        let mgr = IndexManager::with_root(root.clone());
+        for zone in [
+            "",
+            ".",
+            "..",
+            "../outside",
+            "a/b",
+            "a\\b",
+            "/tmp/outside",
+            "C:outside",
+            ".. ",
+            "zone.",
+            "zone ",
+            "a\0b",
+        ] {
+            assert!(validate_index_zone(zone).is_err(), "{zone:?}");
+            assert!(mgr.get_or_open(zone).is_err());
+            assert!(mgr.get_existing(zone).is_err());
+            assert!(mgr.get_or_open_ann(zone, "mock", 8).is_err());
+            assert!(mgr.get_existing_ann(zone, "mock", 8).is_err());
+            assert!(mgr.mark_zone_dirty(zone).is_err());
+            mgr.clear_zone_dirty(zone);
+        }
+        assert!(!root.exists());
+        for zone in ["root", "control", "zoneA", "z", "finance%", "\u{96ea}"] {
+            validate_index_zone(zone).unwrap();
+        }
     }
 
     #[test]
@@ -630,8 +779,11 @@ mod tests {
         assert_eq!(sk2.doc_count(), 2);
 
         // Zone isolation: an unrelated zone builds its own skeleton.
-        let sk_other = expect_fresh(mgr.get_or_build_skeleton("zoneB"));
-        assert_eq!(sk_other.doc_count(), 0);
+        assert!(matches!(
+            mgr.get_or_build_skeleton("zoneB").unwrap(),
+            SkeletonAccess::Missing
+        ));
+        assert!(!mgr.zone_root("zoneB").exists());
     }
 
     fn expect_fresh(
@@ -641,6 +793,7 @@ mod tests {
             SkeletonAccess::Fresh(sk) => sk,
             SkeletonAccess::Stale(_) => panic!("expected Fresh, got Stale"),
             SkeletonAccess::Building => panic!("expected Fresh, got Building"),
+            SkeletonAccess::Missing => panic!("expected Fresh, got Missing"),
         }
     }
 
@@ -723,6 +876,7 @@ mod tests {
                 }
                 SkeletonAccess::Fresh(_) => panic!("stale snapshot must not be reported Fresh"),
                 SkeletonAccess::Building => panic!("prior snapshot exists — must be Stale"),
+                SkeletonAccess::Missing => panic!("corpus exists - must be Stale"),
             }
         }
         // Lock released → the next call rebuilds to the new generation.

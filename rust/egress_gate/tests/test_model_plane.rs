@@ -241,3 +241,72 @@ fn a_denied_prompt_never_reaches_the_upstream() {
         "a denied prompt must not open a connection to the model at all"
     );
 }
+
+fn model_directory_alias(kernel: &Kernel) -> &'static str {
+    use kernel::kernel::syscall::KernelSyscall;
+    let alias = "/proc/edge/workspace/cloud";
+    KernelSyscall::sys_setattr(
+        kernel,
+        alias,
+        6,
+        "",
+        None,
+        None,
+        None,
+        "memory",
+        "root",
+        false,
+        0,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(EGRESS_MOUNT),
+        None,
+        None,
+    )
+    .expect("register a model directory alias");
+    alias
+}
+
+#[test]
+fn a_directory_alias_cannot_bypass_redaction_on_the_egress_mount() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (url, rx) = capturing_upstream();
+    let kernel = gated_kernel(GatePolicy::default());
+    mount_model(&kernel, EGRESS_MOUNT, &url, &tmp.path().to_string_lossy());
+    let alias = model_directory_alias(&kernel);
+    kernel
+        .write(
+            &format!("{alias}/alias.prompt"),
+            &ctx(),
+            &prompt_with_id(),
+            0,
+        )
+        .unwrap();
+    let sent = upstream_body(&rx);
+    assert!(!sent.contains(ID_SPECIMEN));
+    assert!(sent.contains("[REDACTED:PRC-ID]"));
+}
+
+#[test]
+fn a_directory_alias_cannot_bypass_denial_on_the_egress_mount() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (url, rx) = capturing_upstream();
+    let kernel = gated_kernel(GatePolicy::deny_on_finding());
+    mount_model(&kernel, EGRESS_MOUNT, &url, &tmp.path().to_string_lossy());
+    let alias = model_directory_alias(&kernel);
+    assert!(kernel
+        .write(
+            &format!("{alias}/alias.prompt"),
+            &ctx(),
+            &prompt_with_id(),
+            0
+        )
+        .is_err());
+    assert!(rx.recv_timeout(Duration::from_secs(3)).is_err());
+}

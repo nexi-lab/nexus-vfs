@@ -65,9 +65,8 @@ pub struct GlobQuery {
     /// Sort results by most-recent-mtime first when `true`.
     #[serde(default)]
     pub sort_recency: bool,
-    /// Zone to search.  Admin / system callers may name any zone;
-    /// everyone else gets their own zone and a differing value is a
-    /// 403 (#4740).  Empty ⇒ the caller's zone.
+    /// Optional assertion of the zone owning `root_path`. A mismatch
+    /// is rejected; discovery addresses the canonical VFS namespace.
     #[serde(default)]
     pub zone_id: String,
     /// Optional working set. JSON `[]` searches nothing; omission walks the root.
@@ -95,6 +94,23 @@ pub struct GlobResponse {
     /// Applied optional filter bits from the shared DiscoveryFilter protocol.
     #[serde(default)]
     pub applied_filters: u32,
+}
+
+fn discovery_zone(
+    state: &AppState,
+    ctx: &OperationContext,
+    root: &str,
+    requested: &str,
+) -> Result<String, SearchError> {
+    let zone = transport::grpc_search_access::search_zone_for_path(&state.vfs_router, ctx, root)
+        .map_err(SearchError::Rpc)?;
+    effective_zone(ctx, &zone)?;
+    if !requested.trim().is_empty() && requested.trim() != zone {
+        return Err(SearchError::BadRequest(
+            "zone_id does not match the zone owning root_path".into(),
+        ));
+    }
+    Ok(zone)
 }
 
 /// Handler for `GET /v2/search/glob`.
@@ -126,8 +142,8 @@ async fn glob_with_params(
     fence: crate::middleware::revision::RevisionFence,
     params: GlobQuery,
 ) -> Result<Response, SearchError> {
-    let zone = effective_zone(&ctx, &params.zone_id)?;
     let root_path = params.root_path;
+    let zone = discovery_zone(&state, &ctx, &root_path, &params.zone_id)?;
     // #4737: wait for the fenced revision to be applied on this node
     // BEFORE running the glob, so a caller who just wrote /ws/a.md
     // and passes X-Nexus-Min-Revision sees the row in the walk.
@@ -283,8 +299,8 @@ async fn grep_with_params(
     fence: crate::middleware::revision::RevisionFence,
     params: GrepQuery,
 ) -> Result<Response, SearchError> {
-    let zone = effective_zone(&ctx, &params.zone_id)?;
     let root_path = params.root_path;
+    let zone = discovery_zone(&state, &ctx, &root_path, &params.zone_id)?;
     // #4737: fence BEFORE the walk so a fresh write is visible in matches.
     let observed = fence
         .enforce(std::sync::Arc::clone(&state.kernel), &zone)
@@ -585,8 +601,8 @@ pub async fn query(
                 cache.lookup(&*store, (&subject.0, &subject.1))
             })
             .await
-            .map_err(|_| SearchError::Rpc(tonic::Status::internal("zone lookup failed")))?
-            .map_err(|_| SearchError::Rpc(tonic::Status::unavailable("zone lookup unavailable")))?;
+            .map_err(|_| nexus_federated_search::DispatchError::ZoneDiscoveryUnavailable)?
+            .map_err(|_| nexus_federated_search::DispatchError::ZoneDiscoveryUnavailable)?;
             if accessible.len() > 1 {
                 return dispatch_federated(state, ctx, token, fence, body, &zone_id).await;
             }
@@ -707,7 +723,7 @@ async fn dispatch_federated(
         .map(|(zone, _)| zone.clone())
         .collect();
     let filter = (!is_privileged(&ctx)).then_some(zones.as_slice());
-    let resp = state.federated.search(subject, req, filter).await;
+    let resp = state.federated.search(subject, req, filter).await?;
     let results = resp
         .results
         .into_iter()
@@ -792,6 +808,9 @@ pub fn router() -> Router<AppState> {
 pub enum SearchError {
     #[error("backend unavailable: {0}")]
     BackendUnavailable(#[from] BackendError),
+    #[cfg(feature = "rebac")]
+    #[error("{0}")]
+    Discovery(#[from] nexus_federated_search::DispatchError),
     #[error("bad request: {0}")]
     BadRequest(String),
     /// #4740: zone refusal — zone-less non-admin caller, an explicit
@@ -821,6 +840,8 @@ impl IntoResponse for SearchError {
         }
         let (status, message) = match self {
             SearchError::BackendUnavailable(e) => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
+            #[cfg(feature = "rebac")]
+            SearchError::Discovery(e) => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
             SearchError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             SearchError::Forbidden(e) => (StatusCode::FORBIDDEN, e.to_string()),
             SearchError::Rpc(s) => (grpc_status_to_http(s.code()), s.message().to_string()),

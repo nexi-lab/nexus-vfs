@@ -40,6 +40,11 @@ pub mod call_dispatch;
 pub mod federation;
 /// VFS gRPC server (in-bound). Always compiled.
 pub mod grpc;
+#[cfg(test)]
+mod grpc_metadata_access_tests;
+mod grpc_path_access;
+#[cfg(test)]
+mod grpc_path_access_tests;
 pub mod grpc_plugin_access;
 /// Plugin-as-gRPC-service proxy — routes cdylib plugin services onto
 /// the same tonic `Routes` as the built-in VFS server.  See module

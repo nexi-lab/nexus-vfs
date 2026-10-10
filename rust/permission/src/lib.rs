@@ -69,10 +69,8 @@
 //! `kernel_default_permission_provider_is_none_and_gate_is_no_op`
 //! protective test in the kernel crate.
 
-pub mod lease_cache;
 pub mod zone_perms;
 
-pub use lease_cache::PermissionLeaseCache;
 pub use zone_perms::ZonePermsProvider;
 
 // The `PermissionProvider` trait lives in the `kernel` crate (with its

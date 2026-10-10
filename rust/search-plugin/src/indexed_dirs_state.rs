@@ -56,9 +56,7 @@ pub struct IndexedDirsRegistry {
 }
 
 impl IndexedDirsRegistry {
-    pub fn open_or_create(zone_root: PathBuf) -> Result<Self, DirsError> {
-        std::fs::create_dir_all(&zone_root)
-            .map_err(|e| DirsError::CreateDir(zone_root.display().to_string(), e.to_string()))?;
+    pub fn load(zone_root: PathBuf) -> Result<Self, DirsError> {
         let path = zone_root.join(DIRS_FILE);
         let mut map: HashMap<String, IndexedDirEntry> = HashMap::new();
         if path.exists() {
@@ -127,6 +125,8 @@ impl IndexedDirsRegistry {
     }
 
     pub fn save(&self) -> Result<(), DirsError> {
+        std::fs::create_dir_all(&self.dir)
+            .map_err(|e| DirsError::CreateDir(self.dir.display().to_string(), e.to_string()))?;
         let path = self.dir.join(DIRS_FILE);
         let entries: Vec<IndexedDirEntry> = self.inner.read().values().cloned().collect();
         let persisted = Persisted {
@@ -167,15 +167,15 @@ mod tests {
     }
 
     #[test]
-    fn open_or_create_returns_empty() {
-        let r = IndexedDirsRegistry::open_or_create(tempdir()).expect("open");
+    fn load_returns_empty() {
+        let r = IndexedDirsRegistry::load(tempdir()).expect("open");
         assert!(r.is_empty());
         assert_eq!(r.len(), 0);
     }
 
     #[test]
     fn add_is_idempotent_and_reports_new_status() {
-        let r = IndexedDirsRegistry::open_or_create(tempdir()).expect("open");
+        let r = IndexedDirsRegistry::load(tempdir()).expect("open");
         assert!(r.add("/docs", 100));
         assert!(
             !r.add("/docs", 200),
@@ -186,7 +186,7 @@ mod tests {
 
     #[test]
     fn remove_returns_true_only_when_present() {
-        let r = IndexedDirsRegistry::open_or_create(tempdir()).expect("open");
+        let r = IndexedDirsRegistry::load(tempdir()).expect("open");
         r.add("/docs", 100);
         assert!(r.remove("/docs"));
         assert!(!r.remove("/docs"));
@@ -195,7 +195,7 @@ mod tests {
 
     #[test]
     fn list_sorted_oldest_first() {
-        let r = IndexedDirsRegistry::open_or_create(tempdir()).expect("open");
+        let r = IndexedDirsRegistry::load(tempdir()).expect("open");
         r.add("/c", 300);
         r.add("/a", 100);
         r.add("/b", 200);
@@ -208,12 +208,12 @@ mod tests {
     fn save_then_reopen_survives_restart() {
         let dir = tempdir();
         {
-            let r = IndexedDirsRegistry::open_or_create(dir.clone()).expect("open");
+            let r = IndexedDirsRegistry::load(dir.clone()).expect("open");
             r.add("/docs", 100);
             r.add("/notes", 200);
             r.save().expect("save");
         }
-        let r2 = IndexedDirsRegistry::open_or_create(dir).expect("reopen");
+        let r2 = IndexedDirsRegistry::load(dir).expect("reopen");
         assert_eq!(r2.len(), 2);
         assert_eq!(r2.list()[0].path, "/docs");
     }

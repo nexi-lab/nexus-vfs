@@ -124,6 +124,16 @@ impl Kernel {
         ctx: &OperationContext,
         content: &[u8],
     ) -> Result<Option<Vec<u8>>, KernelError> {
+        self.apply_mutating_write_hooks_with_route(path, None, ctx, content)
+    }
+
+    pub(super) fn apply_mutating_write_hooks_with_route(
+        &self,
+        path: &str,
+        route: Option<&RouteResult>,
+        ctx: &OperationContext,
+        content: &[u8],
+    ) -> Result<Option<Vec<u8>>, KernelError> {
         // §13 permission gate — enforced HERE, in the single write seam, so
         // EVERY write path is gated identically: sys_write / write_batch
         // (DT_FILE), stream_write_nowait (DT_STREAM), pipe_write_nowait
@@ -132,7 +142,7 @@ impl Kernel {
         // file syscalls that used to gate separately (sys_write, write_batch)
         // no longer do; the check is not bypassable by choosing the stream /
         // pipe RPC over sys_write.
-        self.check_permission(path, Permission::Write, ctx)?;
+        self.check_permission_with_route(path, route, Permission::Write, ctx)?;
 
         let hook_content = if self.has_mutating_hook_match(path) {
             content.to_vec()
@@ -200,6 +210,14 @@ impl Kernel {
         let provider = match guard.as_ref() {
             Some(p) => p,
             None => return Ok(()),
+        };
+        let resolved;
+        let route = match route {
+            Some(route) => Some(route),
+            None => {
+                resolved = self.vfs_router.route(path, &ctx.zone_id);
+                resolved.as_ref()
+            }
         };
         provider.check(path, route, permission, ctx)
     }

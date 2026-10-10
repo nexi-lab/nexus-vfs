@@ -23,6 +23,14 @@ pub use backend::{
 };
 pub use routing::RoutingBackend;
 
+/// A request failed before any zone could be searched.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum DispatchError {
+    /// Readable zones could not be established from the authorization store.
+    #[error("zone lookup unavailable")]
+    ZoneDiscoveryUnavailable,
+}
+
 /// Knobs a caller may tune per dispatcher instance.  Defaults match
 /// the Python `FederatedSearchConfig` so a Python-to-Rust swap does
 /// not shift observable timing.
@@ -106,12 +114,16 @@ impl<B: LocalSearchBackend + 'static> FederatedSearchDispatcher<B> {
     /// cannot widen the caller's effective scope beyond what the
     /// token grants (intersected with the ReBAC-derived readable
     /// set).  `None` = no upper bound (still ReBAC-scoped).
+    ///
+    /// # Errors
+    /// Returns [`DispatchError::ZoneDiscoveryUnavailable`] if zone discovery
+    /// cannot read the authorization store or its blocking task fails.
     pub async fn search(
         &self,
         subject: Subject<'_>,
         mut req: SearchRequest,
         zone_filter: Option<&[String]>,
-    ) -> FederatedSearchResponse {
+    ) -> Result<FederatedSearchResponse, DispatchError> {
         let start = Instant::now();
 
         // Stamp the subject onto the request so the routing
@@ -121,10 +133,8 @@ impl<B: LocalSearchBackend + 'static> FederatedSearchDispatcher<B> {
         // request anyway.
         req.subject = (subject.0.to_string(), subject.1.to_string());
 
-        // 1. Zone discovery.  Failure here is unusual (store
-        // unreachable); we treat it as "no accessible zones" — the
-        // response envelope carries an empty result set, matching
-        // the Python fallback.
+        // Discover zones before starting any search. An unavailable store
+        // cannot establish whether the subject has an empty zone set.
         let cache = Arc::clone(&self.zone_cache);
         let store = Arc::clone(&self.rebac_store);
         let owned_subject = req.subject.clone();
@@ -136,25 +146,19 @@ impl<B: LocalSearchBackend + 'static> FederatedSearchDispatcher<B> {
             Ok(Ok(z)) => z,
             Ok(Err(e)) => {
                 warn!(error = %e, "federated: zone discovery failed");
-                return FederatedSearchResponse {
-                    latency_ms: elapsed_ms(start),
-                    ..Default::default()
-                };
+                return Err(DispatchError::ZoneDiscoveryUnavailable);
             }
             Err(e) => {
                 warn!(error = %e, "federated: zone discovery failed");
-                return FederatedSearchResponse {
-                    latency_ms: elapsed_ms(start),
-                    ..Default::default()
-                };
+                return Err(DispatchError::ZoneDiscoveryUnavailable);
             }
         };
         let searchable = intersect_filter(accessible, zone_filter);
         if searchable.is_empty() {
-            return FederatedSearchResponse {
+            return Ok(FederatedSearchResponse {
                 latency_ms: elapsed_ms(start),
                 ..Default::default()
-            };
+            });
         }
 
         // 2. Concurrent fanout with a semaphore + per-zone timeout.
@@ -224,7 +228,7 @@ impl<B: LocalSearchBackend + 'static> FederatedSearchDispatcher<B> {
             self.config.rrf_top_rank_bonus,
         );
 
-        FederatedSearchResponse {
+        Ok(FederatedSearchResponse {
             results: fused,
             zones_searched,
             zones_failed,
@@ -233,7 +237,7 @@ impl<B: LocalSearchBackend + 'static> FederatedSearchDispatcher<B> {
             cached: false,
             search_timing: Default::default(),
             semantic_degraded: false,
-        }
+        })
     }
 }
 
@@ -369,7 +373,7 @@ mod tests {
     async fn empty_accessible_zone_set_returns_empty_envelope() {
         let rebac = Arc::new(InMemoryReBACTupleStore::new());
         let d = dispatcher(FakeBackend::default(), rebac, DispatcherConfig::default());
-        let out = d.search(("user", "alice"), req(), None).await;
+        let out = d.search(("user", "alice"), req(), None).await.unwrap();
         assert!(out.results.is_empty());
         assert!(out.zones_searched.is_empty());
         assert!(out.zones_failed.is_empty());
@@ -388,7 +392,7 @@ mod tests {
         b.by_zone
             .insert("legal".into(), vec![hit("/legal/x.md", 4.0, "legal")]);
         let d = dispatcher(b, rebac, DispatcherConfig::default());
-        let out = d.search(("user", "alice"), req(), None).await;
+        let out = d.search(("user", "alice"), req(), None).await.unwrap();
         assert_eq!(out.zones_searched.len(), 2, "{out:?}");
         assert!(out.zones_failed.is_empty(), "{out:?}");
         // Every unique hit crosses fusion.
@@ -408,7 +412,7 @@ mod tests {
             .insert("eng".into(), vec![hit("/eng/a.md", 5.0, "eng")]);
         b.error_zones.insert("legal".into());
         let d = dispatcher(b, rebac, DispatcherConfig::default());
-        let out = d.search(("user", "alice"), req(), None).await;
+        let out = d.search(("user", "alice"), req(), None).await.unwrap();
         assert_eq!(out.zones_searched, vec!["eng".to_string()]);
         assert_eq!(out.zones_failed.len(), 1);
         assert_eq!(out.zones_failed[0].zone_id, "legal");
@@ -433,7 +437,7 @@ mod tests {
             ..DispatcherConfig::default()
         };
         let d = dispatcher(b, rebac, cfg);
-        let out = d.search(("user", "alice"), req(), None).await;
+        let out = d.search(("user", "alice"), req(), None).await.unwrap();
         assert_eq!(out.zones_searched, vec!["eng".to_string()]);
         assert_eq!(out.zones_failed.len(), 1);
         assert!(
@@ -457,7 +461,10 @@ mod tests {
             .insert("legal".into(), vec![hit("/legal/x.md", 5.0, "legal")]);
         let d = dispatcher(b, rebac, DispatcherConfig::default());
         let filter = vec!["eng".to_string()];
-        let out = d.search(("user", "alice"), req(), Some(&filter)).await;
+        let out = d
+            .search(("user", "alice"), req(), Some(&filter))
+            .await
+            .unwrap();
         assert_eq!(out.zones_searched, vec!["eng".to_string()]);
         assert!(out
             .results
@@ -478,7 +485,10 @@ mod tests {
             .insert("legal".into(), vec![hit("/legal/never.md", 5.0, "legal")]);
         let d = dispatcher(b, rebac, DispatcherConfig::default());
         let filter = vec!["eng".to_string(), "legal".to_string()];
-        let out = d.search(("user", "alice"), req(), Some(&filter)).await;
+        let out = d
+            .search(("user", "alice"), req(), Some(&filter))
+            .await
+            .unwrap();
         assert_eq!(out.zones_searched, vec!["eng".to_string()]);
         assert!(
             out.results
@@ -525,7 +535,7 @@ mod tests {
             Arc::new(InMemoryZoneSearchRegistry::new()),
             DispatcherConfig::default(),
         );
-        let _ = d.search(("user", "alice"), req(), None).await;
+        let _ = d.search(("user", "alice"), req(), None).await.unwrap();
         let seen = recorder.seen.lock().unwrap();
         assert_eq!(seen.len(), 2);
         for subj in seen.iter() {
@@ -542,7 +552,7 @@ mod tests {
         b.error_zones.insert("eng".into());
         b.error_zones.insert("legal".into());
         let d = dispatcher(b, rebac, DispatcherConfig::default());
-        let out = d.search(("user", "alice"), req(), None).await;
+        let out = d.search(("user", "alice"), req(), None).await.unwrap();
         assert!(all_peers_failed(&out));
     }
 }

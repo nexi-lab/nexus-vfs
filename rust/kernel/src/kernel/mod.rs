@@ -94,6 +94,8 @@ mod dispatch;
 // `ServiceDecl`s without reaching into the private `dispatch` submodule.
 pub use dispatch::ServiceDecl;
 mod ipc;
+mod stream_address;
+pub(crate) use stream_address::StreamAddress;
 mod locks;
 mod mount;
 mod observability;
@@ -711,8 +713,7 @@ pub struct Kernel {
     /// non-federated kernel behaves exactly as before. Accessors +
     /// `write_cold_segment` / `read_cold_segment` live in
     /// `federation/cold_segment.rs` (federation-domain file, like the cache).
-    pub(crate) cold_segment_store:
-        std::sync::OnceLock<Arc<dyn crate::core::stream::wal::ColdSegmentStore>>,
+    pub(crate) cold_segment_store: std::sync::OnceLock<std::sync::Weak<Kernel>>,
     // No `chunk_fetcher` field: `Kernel::peer_client` is the SSOT for
     // the cross-node blob client.  `Kernel::sys_setattr` constructs a
     // fresh `GrpcChunkFetcher` per `DT_MOUNT` against the just-cloned
@@ -1468,6 +1469,38 @@ impl Kernel {
         Ok(Some(target))
     }
 
+    /// Resolve the first DT_LINK in the ancestors of a path. The caller must
+    /// gate the original path first, then gate the returned path with the same
+    /// identity and consume a link hop. The leaf is excluded: stat/unlink keep
+    /// their lstat semantics, and read/write handle leaf links separately.
+    pub(crate) fn directory_link_target(
+        &self,
+        path: &str,
+        zone_id: &str,
+    ) -> Result<Option<String>, KernelError> {
+        for (end, _) in path.match_indices('/').skip(1) {
+            let ancestor = &path[..end];
+            let entry = match self.vfs_router.route(ancestor, zone_id) {
+                Some(route) => self
+                    .with_metastore_route(&route, |ms| ms.get(ancestor))
+                    .transpose()
+                    .map_err(|e| KernelError::IOError(format!("read link at {ancestor}: {e:?}")))?
+                    .flatten(),
+                None => self
+                    .metastore_get(ancestor)
+                    .map_err(|e| KernelError::IOError(format!("read link at {ancestor}: {e:?}")))?,
+            };
+            if let Some(entry) = entry {
+                if let Some(target) = Self::dt_link_target(ancestor, &entry)? {
+                    let resolved = format!("{}{}", target.trim_end_matches('/'), &path[end..]);
+                    validate_path_fast(&resolved)?;
+                    return Ok(Some(resolved));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Clone the shared VFSRouter ``Arc`` for federation apply-event
     /// callbacks that need to look up mount-points-for-zone at
     /// invalidation time. The cache itself lives as long as *any*
@@ -1719,7 +1752,7 @@ impl Kernel {
             }
             4 => {
                 // DT_STREAM — create or idempotent-open
-                self.setattr_stream(path, capacity, io_profile)
+                self.setattr_stream(path, capacity, io_profile, zone_id)
             }
             1 => {
                 // DT_DIR — create directory inode
@@ -1966,10 +1999,21 @@ impl Kernel {
         path: &str,
         capacity: usize,
         io_profile: &str,
+        zone: &str,
     ) -> Result<SysSetAttrResult, KernelError> {
-        if let Some(meta) = self.metastore_get(path).ok().flatten() {
+        let address = self.stream_address(path, zone);
+        let route = self.vfs_router.route(path, zone);
+        let meta = match route.as_ref() {
+            Some(route) => self
+                .with_metastore_route(route, |ms| ms.get(path))
+                .transpose()
+                .map_err(|e| KernelError::IOError(format!("stream inode: {e:?}")))?
+                .flatten(),
+            None => self.metastore_get(path)?,
+        };
+        if let Some(meta) = meta {
             if meta.entry_type == DT_STREAM {
-                if !self.has_stream(path) {
+                if !self.stream_manager.has(&address.key()) {
                     // Reconstruct the SAME backend the creator installed — run
                     // the io_profile waterfall, NOT a memory-only create_stream.
                     // A wal DT_STREAM whose inode replicated in from a peer (this
@@ -1979,7 +2023,7 @@ impl Kernel {
                     // Without this a peer sending to someone else's message stream,
                     // or reading a mailbox created on the other machine, hits
                     // StreamNotFound. The inode already exists, so no re-write.
-                    self.install_stream_backend(path, capacity, io_profile)?;
+                    self.install_stream_backend(&address, capacity, io_profile)?;
                 }
                 return Ok(SysSetAttrResult {
                     path: path.to_string(),
@@ -1999,8 +2043,8 @@ impl Kernel {
             )));
         }
 
-        let (shm_path, data_rd_fd) = self.install_stream_backend(path, capacity, io_profile)?;
-        self.write_stream_inode(path, capacity)?;
+        let (shm_path, data_rd_fd) = self.install_stream_backend(&address, capacity, io_profile)?;
+        self.write_stream_inode_at(path, zone, capacity)?;
 
         Ok(SysSetAttrResult {
             path: path.to_string(),
@@ -2049,42 +2093,20 @@ impl Kernel {
     /// Returns `Ok(true)` when installed, `Ok(false)` when no zone metastore is
     /// available (federation not wired) so the caller falls through the
     /// io_profile waterfall; a register failure propagates as `Err`.
-    fn install_wal_stream(&self, path: &str, retention: u64) -> Result<bool, KernelError> {
-        match self.wal_backend_for(path, retention) {
+    fn install_wal_stream(
+        &self,
+        address: &StreamAddress,
+        retention: u64,
+    ) -> Result<bool, KernelError> {
+        match self.wal_backend_for(address, retention)? {
             Some(backend) => {
                 self.stream_manager
-                    .register(path, backend)
+                    .register(&address.key(), backend)
                     .map_err(stream_mgr_err)?;
                 Ok(true)
             }
             None => Ok(false),
         }
-    }
-
-    /// Build (but do NOT register) a WAL DT_STREAM backend for `path`, over the
-    /// metastore of the path's resolved zone. `None` when no zone metastore is
-    /// available (federation not wired) — the caller then keeps a genuine miss.
-    ///
-    /// Read-only + raft-safe: constructs a `WalStreamCore` (a stateless view
-    /// over the replicated store) and proposes NOTHING — no raft command, no
-    /// inode write, no term/vote mutation. Safe on any replica for a stream
-    /// created elsewhere; entries read straight from the committed log. Shared
-    /// by `install_wal_stream` (setattr / reopen) and the StreamManager
-    /// miss-materializer (cold read/write), so both build the identical backend.
-    /// The zone that owns `path`, per the VFS routing SSOT — root for an
-    /// unmounted path (e.g. a node-local `/proc/{id}/fd/N` stream), the
-    /// federation zone under a mount (`/agents=<zone>`). The SINGLE resolver
-    /// for "which zone backs this stream", shared by the inode write
-    /// ([`Self::write_stream_inode`]) and the content backend
-    /// ([`Self::wal_backend_for`]) so the two can NEVER disagree: a divergence
-    /// (inode in root while the backend targeted the mount zone) is exactly
-    /// what silently made A2A mailboxes node-local and un-replicated.
-    #[inline]
-    pub(crate) fn routed_zone_id(&self, path: &str) -> String {
-        self.vfs_router
-            .route(path, contracts::ROOT_ZONE_ID)
-            .map(|r| r.zone_id)
-            .unwrap_or_else(|| contracts::ROOT_ZONE_ID.to_string())
     }
 
     /// `retention` is the stream's cold-storage byte budget (its inode
@@ -2093,28 +2115,50 @@ impl Kernel {
     /// written at create time) and from `meta.size` on the miss-materializer.
     fn wal_backend_for(
         &self,
-        path: &str,
+        address: &StreamAddress,
         retention: u64,
-    ) -> Option<Arc<dyn crate::stream::StreamBackend>> {
-        let zone_id = self.routed_zone_id(path);
-        let store = self
+    ) -> Result<Option<Arc<dyn crate::stream::StreamBackend>>, KernelError> {
+        let store = match self
             .distributed_coordinator()
-            .metastore_for_zone(self, &zone_id)
-            .ok()?;
+            .metastore_for_zone(self, &address.zone)
+        {
+            Ok(store) => store,
+            Err(_) => return Ok(None),
+        };
+        // A prior writer may have keyed data by a mount spelling. Refuse to
+        // open a different log as empty; recovering those records needs an
+        // explicit migration that preserves offsets and reader positions.
+        for (_, visible) in self
+            .vfs_router
+            .project_zone_path(&address.zone, &address.path)
+        {
+            if visible != address.path {
+                let prefix = crate::core::stream::wal::wal_stream_prefix(&visible);
+                let tail = store
+                    .stream_tail(&prefix)
+                    .map_err(|e| KernelError::IOError(e.to_string()))?;
+                if tail > 0 {
+                    return Err(KernelError::IOError(format!(
+                        "stream in zone {} has records under mount path {visible}; migrate its WAL and reader offsets before opening {}",
+                        address.zone, address.path,
+                    )));
+                }
+            }
+        }
         // Tiered storage when the cold tier is armed (federation boot): appends
         // past the hot window roll off into cold segments, bounding the raft SM.
         // Unarmed (non-federated) ⇒ hot-only, the pre-P1 behaviour.
-        let core = match self.cold_segment_store_arc() {
+        let core = match self.cold_segment_store_for(&address.zone) {
             Some(cold) => crate::core::stream::wal::WalStreamCore::with_cold_tier(
                 store,
-                path.to_string(),
+                address.path.clone(),
                 cold,
                 self.seal_policy(),
                 retention,
             ),
-            None => crate::core::stream::wal::WalStreamCore::new(store, path.to_string()),
+            None => crate::core::stream::wal::WalStreamCore::new(store, address.path.clone()),
         };
-        Some(Arc::new(core))
+        Ok(Some(Arc::new(core)))
     }
 
     /// Arm the StreamManager's miss-materializer so a COLD read/write of a wal
@@ -2142,21 +2186,15 @@ impl Kernel {
         self.arm_stream_cold_tier();
         let weak = Arc::downgrade(self);
         self.stream_manager
-            .set_materializer(Box::new(move |path: &str| {
-                let kernel = weak.upgrade()?;
-                match kernel.metastore_get(path).ok().flatten() {
-                    // `meta.size` is the stream's inode capacity == retention.
-                    Some(meta) if meta.entry_type == DT_STREAM => {
-                        kernel.wal_backend_for(path, meta.size)
-                    }
-                    _ => None,
-                }
+            .set_materializer(Box::new(move |path: &str| match weak.upgrade() {
+                Some(kernel) => kernel.materialize_stream(path),
+                None => Ok(None),
             }));
     }
 
     fn install_stream_backend(
         &self,
-        path: &str,
+        address: &StreamAddress,
         capacity: usize,
         io_profile: &str,
     ) -> Result<(Option<String>, Option<i32>), KernelError> {
@@ -2168,7 +2206,7 @@ impl Kernel {
                         let (backend, shm, dfd) =
                             crate::shm_stream::SharedMemoryStreamBackend::create_native(capacity)?;
                         self.stream_manager
-                            .register(path, Arc::new(backend))
+                            .register(&address.key(), Arc::new(backend))
                             .map_err(stream_mgr_err)?;
                         return Ok((Some(shm), Some(dfd)));
                     }
@@ -2185,7 +2223,7 @@ impl Kernel {
                     // (federation wired); if not, fall through to the next
                     // backend in the waterfall. `capacity` is the stream's
                     // cold-storage retention budget (0 = keep-forever).
-                    if self.install_wal_stream(path, capacity as u64)? {
+                    if self.install_wal_stream(address, capacity as u64)? {
                         return Ok((None, None));
                     }
                 }
@@ -2211,7 +2249,7 @@ impl Kernel {
                         )));
                     }
                     self.stream_manager
-                        .create(path, capacity)
+                        .create(&address.key(), capacity)
                         .map_err(stream_mgr_err)?;
                     return Ok((None, None));
                 }
@@ -2243,27 +2281,21 @@ impl Kernel {
         self.metastore_put(path, meta)
     }
 
-    /// Write DT_STREAM inode to metastore (shared by create_stream and SHM path).
-    #[allow(dead_code)]
     fn write_stream_inode(&self, path: &str, capacity: usize) -> Result<(), KernelError> {
-        // The DT_STREAM inode MUST live in the PATH's routed zone, not a
-        // hardcoded root: a `message stream` under a federation mount
-        // (`/agents=<zone>`) has to land in THAT zone's metastore so the inode
-        // replicates to peers — the SAME zone `wal_backend_for` resolves for
-        // the stream's content backend. Hardcoding root left the inode
-        // node-local (per-node SOLO) while its parent dir was federated, so the
-        // A2A mailbox silently never crossed machines: the content backend
-        // targeted the mount zone but the inode sat in root, so a peer's cold
-        // read materialized an empty stream (or missed the inode entirely).
-        // Mirror `setattr_create_dir`: `build_metadata` writes `zone_id` and
-        // `metastore_put` derives the routing zone from it, so passing the
-        // routed zone here makes the inode zone-aware. `routed_zone_id` is the
-        // SAME resolver `wal_backend_for` uses for the content backend, so the
-        // inode and the backend land in one zone by construction.
-        let zone_id = self.routed_zone_id(path);
+        self.write_stream_inode_at(path, contracts::ROOT_ZONE_ID, capacity)
+    }
+
+    fn write_stream_inode_at(
+        &self,
+        path: &str,
+        zone: &str,
+        capacity: usize,
+    ) -> Result<(), KernelError> {
+        let route = self.vfs_router.route(path, zone);
+        let address = StreamAddress::from_route(path, zone, route.as_ref());
         let meta = self.build_metadata(
             path,
-            &zone_id,
+            &address.zone,
             DT_STREAM,
             capacity as u64,
             None,
@@ -2273,7 +2305,13 @@ impl Kernel {
             None,
             None,
         );
-        self.metastore_put(path, meta)
+        match route {
+            Some(route) => self
+                .with_metastore_route(&route, |ms| ms.put(path, meta))
+                .ok_or_else(|| KernelError::IOError("no stream metastore wired".into()))?
+                .map_err(|e| KernelError::IOError(format!("stream inode: {e:?}"))),
+            None => self.metastore_put(path, meta),
+        }
     }
 
     /// DT_DIR: create directory inode via metastore.
@@ -2729,6 +2767,12 @@ impl Kernel {
         zone_id: &str,
         stream_path: &str,
     ) -> Result<Arc<crate::core::stream::wal::WalStreamCore>, KernelError> {
+        let address = self.stream_address(stream_path, zone_id);
+        if address.zone != zone_id {
+            return Err(KernelError::IOError(format!(
+                "audit stream {stream_path} must be mounted in zone {zone_id}"
+            )));
+        }
         // WAL streams are kernel primitives composing whatever
         // distributed `MetaStore` the coordinator has DI'd via
         // `DistributedCoordinator::metastore_for_zone`. The coordinator
@@ -2740,15 +2784,15 @@ impl Kernel {
             .map_err(KernelError::IOError)?;
         let core = Arc::new(crate::core::stream::wal::WalStreamCore::new(
             store,
-            stream_path.to_string(),
+            address.path.clone(),
         ));
         // Register with StreamManager — ignore Exists (idempotent re-call).
         let _ = self.stream_manager.register(
-            stream_path,
+            &address.key(),
             Arc::clone(&core) as Arc<dyn crate::stream::StreamBackend>,
         );
         // Seed DCache + metastore inode so sys_read can locate the stream.
-        let _ = self.write_stream_inode(stream_path, 0);
+        self.write_stream_inode_at(stream_path, zone_id, 0)?;
         Ok(core)
     }
 
@@ -2887,6 +2931,7 @@ fn stream_mgr_err(e: crate::stream_manager::StreamManagerError) -> KernelError {
         StreamManagerError::NotFound(p) => KernelError::StreamNotFound(p),
         StreamManagerError::Closed(p) => KernelError::StreamClosed(p),
         StreamManagerError::WouldBlock(msg) => KernelError::WouldBlock(msg),
+        StreamManagerError::Resolve(msg) => KernelError::IOError(msg),
         StreamManagerError::Backend(be) => {
             use crate::stream::StreamError;
             match be {
@@ -4164,19 +4209,22 @@ mod tests {
         // resolver `write_stream_inode` (inode) and `wal_backend_for` (content)
         // both use, so inode and backend can't land in different zones.
         assert_eq!(
-            k.routed_zone_id("/agents/w2m/transcript"),
+            k.stream_address("/agents/w2m/transcript", "root").zone,
             "sharedzone",
             "an A2A stream under a federation mount must own the mount's target zone"
         );
-        assert_eq!(k.routed_zone_id("/agents"), "sharedzone");
+        assert_eq!(k.stream_address("/agents", "root").zone, "sharedzone");
         // An unmounted path stays node-local root (e.g. a /proc pipe-stream) —
         // the fix must not federate everything, only mounted paths.
         assert_eq!(
-            k.routed_zone_id("/proc/p1/fd/1"),
+            k.stream_address("/proc/p1/fd/1", "root").zone,
             contracts::ROOT_ZONE_ID,
             "an unmounted stream path stays node-local root"
         );
-        assert_eq!(k.routed_zone_id("/nowhere/x"), contracts::ROOT_ZONE_ID);
+        assert_eq!(
+            k.stream_address("/nowhere/x", "root").zone,
+            contracts::ROOT_ZONE_ID
+        );
     }
 
     #[test]

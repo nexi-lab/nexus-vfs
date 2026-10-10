@@ -17,10 +17,6 @@ crate-type = ["rlib"]
 # an `Arc<Kernel>`), so there is no cycle risk despite the dep.
 kernel = { workspace = true, default-features = false }
 contracts = { workspace = true }
-# DashMap for the lease-cache's two-level (path → agent_id → Instant)
-# lock-free concurrent reads.  Same version other kernel-tier crates
-# pull in via workspace resolution.
-dashmap = "6.1"
 
 [dev-dependencies]
 tempfile = "3"

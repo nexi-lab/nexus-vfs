@@ -41,8 +41,6 @@
 
 mod error;
 pub mod replication_log;
-#[cfg(all(feature = "grpc", has_protos))]
-pub mod search_caps;
 mod state_machine;
 #[cfg(all(feature = "grpc", has_protos))]
 pub mod zone_persistence;
@@ -67,8 +65,6 @@ pub use state_machine::{
 
 #[cfg(feature = "consensus")]
 pub use node::{ConfStateAppliedCb, RaftConfig, RaftMsg, ZoneConsensus, ZoneConsensusDriver};
-#[cfg(all(feature = "grpc", has_protos))]
-pub use search_caps::{read_search_caps, write_search_caps, SearchCapabilitiesInfo};
 #[cfg(feature = "consensus")]
 pub use storage::RaftStorage;
 #[cfg(all(feature = "grpc", has_protos))]

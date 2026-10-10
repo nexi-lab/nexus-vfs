@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::search_plugin::{sign_plugin, signed_plugin};
+use common::search_plugin::{mtls_client as client, sign_plugin, signed_plugin};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,31 +12,12 @@ use nexus_raft::transport::{generate_agent_cert, generate_join_token, generate_z
 use nexus_search_common::{SearchDelegation, DELEGATION_METADATA_KEY};
 use nexus_search_plugin::internal_call::INTERNAL_CALL_HEADER;
 use nexus_search_plugin::search_proto::{
-    search_service_client::SearchServiceClient, DocumentInput, IndexDocumentsRequest, QueryRequest,
-    QueryType,
+    DocumentInput, IndexDocumentsRequest, QueryRequest, QueryType,
 };
 use tonic::metadata::MetadataValue;
-use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tonic::{Code, Request};
 
 const BUDGET: Duration = Duration::from_secs(120);
-
-async fn client(port: u16, ca: &[u8], cert: &[u8], key: &[u8]) -> SearchServiceClient<Channel> {
-    let tls = ClientTlsConfig::new()
-        .ca_certificate(Certificate::from_pem(ca))
-        .identity(Identity::from_pem(cert, key))
-        .domain_name("localhost");
-    let channel = Endpoint::from_shared(format!("https://127.0.0.1:{port}"))
-        .unwrap()
-        .tls_config(tls)
-        .unwrap()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(10))
-        .connect()
-        .await
-        .unwrap();
-    SearchServiceClient::new(channel)
-}
 
 fn query(q: &str) -> QueryRequest {
     QueryRequest {
@@ -141,6 +122,10 @@ async fn metadata_and_delegation_survive_the_real_daemon_and_signed_cdylib() {
         .unwrap();
     let mut node = client(port, &ca, &node_cert, &node_key).await;
     let mut agent = client(port, &ca, &agent_cert, &agent_key).await;
+    let mut vfs = common::Vfs::connect_mtls(port, &ca, &node_cert, &node_key, BUDGET).await;
+    vfs.write_file("/docs/needle.md", b"widget external internal after", "")
+        .await
+        .unwrap();
     let batch = IndexDocumentsRequest {
         zone_id: "sharedzone".into(),
         documents: vec![DocumentInput {
@@ -158,8 +143,6 @@ async fn metadata_and_delegation_survive_the_real_daemon_and_signed_cdylib() {
     assert!(indexed.error.is_none(), "{indexed:?}\n{}", daemon.drain());
     assert_eq!(indexed.indexed_count, 1);
     let error = agent.index_documents(batch.clone()).await.unwrap_err();
-    assert_eq!(error.code(), Code::PermissionDenied);
-    let error = agent.query(query("widget external")).await.unwrap_err();
     assert_eq!(error.code(), Code::PermissionDenied);
     let response = node
         .query(query("widget external"))
@@ -252,6 +235,35 @@ async fn metadata_and_delegation_survive_the_real_daemon_and_signed_cdylib() {
         calls.load(Ordering::SeqCst),
         2,
         "ordinary calls keep expanding after refusals"
+    );
+
+    // This fixture leaves the Kernel's file policy open. Certificate agents
+    // must have the same read access through VFS and Search; their lack of
+    // zone tenancy does not impose a separate Search permission policy.
+    let mut agent_vfs = common::Vfs::connect_mtls(port, &ca, &agent_cert, &agent_key, BUDGET).await;
+    assert_eq!(
+        agent_vfs.read_file("/docs/needle.md", "").await.unwrap(),
+        b"widget external internal after"
+    );
+    let response = agent
+        .query(query("widget external"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(response.error.is_none(), "{response:?}");
+    assert_eq!(
+        response
+            .results
+            .iter()
+            .map(|hit| hit.path.as_str())
+            .collect::<Vec<_>>(),
+        ["/docs/needle.md"]
+    );
+    let mut invalid = query("widget");
+    invalid.auth_token = "sk-never-minted".into();
+    assert_eq!(
+        agent.query(invalid).await.unwrap_err().code(),
+        Code::Unauthenticated
     );
 }
 

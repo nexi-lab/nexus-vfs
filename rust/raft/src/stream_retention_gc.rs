@@ -63,8 +63,10 @@ use crate::prelude::{AppliedEntry, Command, FullStateMachine, ZoneConsensus};
 pub fn install_stream_trim_gc_observer(
     consensus: &ZoneConsensus<FullStateMachine>,
     kernel: Weak<Kernel>,
+    zone_id: &str,
     runtime: tokio::runtime::Handle,
 ) {
+    let zone_id = zone_id.to_owned();
     // Keyed for the same reason as the stream-wakeup sibling: one observer
     // per zone no matter how many times arming runs.
     consensus.register_keyed_apply_observer(
@@ -91,8 +93,9 @@ pub fn install_stream_trim_gc_observer(
             // reach it — this only reclaims the space.
             let path = path.to_string();
             let trimmed = trimmed.clone();
+            let zone_id = zone_id.clone();
             runtime.spawn_blocking(move || {
-                kernel.gc_trimmed_cold_segments(&path, &trimmed);
+                kernel.gc_trimmed_cold_segments(&path, &zone_id, &trimmed);
             });
         }),
     );

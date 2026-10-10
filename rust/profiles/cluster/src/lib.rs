@@ -33,6 +33,7 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 mod auth_posture;
 mod authorization;
+mod search_capabilities;
 use auth_posture::{AuthPosture, AuthPostureInputs};
 use kernel::abc::object_store::ObjectStore;
 use kernel::hal::object_store_provider::set_provider;
@@ -3594,6 +3595,8 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     kernel
         .bring_up_services(service_decls)
         .map_err(|e| anyhow::anyhow!("bring up services: {e}"))?;
+    search_capabilities::install(&zm, &kernel);
+
     // Typed Zone runtime backend (ZoneRuntimeService): the operation journal
     // binds to the SAME zone the auth-key store did (control zone under TLS,
     // per-node `root` under `--no-tls` — D8: journal availability = that
@@ -3715,11 +3718,11 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
                         consensus: &nexus_raft::prelude::ZoneConsensus<
             nexus_raft::prelude::FullStateMachine,
         >| {
-            // The observer self-recovers the watched file path from the
-            // wal-stream entry key — no per-zone mapping needed.
+            // WAL paths are relative to the consensus that committed them.
             nexus_raft::stream_wakeup::install_stream_wakeup_observer(
                 consensus,
                 kernel_for_hook.clone(),
+                zone_id,
             );
             // Same per-zone spine, sibling concern: a replicated
             // `TrimStreamSegment` (a wal DT_STREAM over its retention budget)
@@ -3728,6 +3731,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
             nexus_raft::stream_retention_gc::install_stream_trim_gc_observer(
                 consensus,
                 kernel_for_hook.clone(),
+                zone_id,
                 runtime_for_hook.clone(),
             );
             tracing::info!(zone_id = %zone_id, "a2a stream-wakeup + retention-GC observers armed");
