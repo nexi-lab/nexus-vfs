@@ -543,41 +543,36 @@ impl VfsServiceImpl {
     /// `ForeignAgentMailboxOnly` can create only inside its mailbox — the same
     /// boundary the write seam enforces on stream/pipe appends.
     fn setattr_typed(&self, req: SetattrRequest, ctx: &OperationContext) -> SetattrResponse {
-        let zone_id_str = req.zone_id;
-        let zone_id = if zone_id_str.is_empty() {
-            kernel::ROOT_ZONE_ID
-        } else {
-            &zone_id_str
-        };
-
-        let result = self
-            .kernel
-            .check_permission(&req.path, Permission::Write, ctx)
-            .and_then(|()| {
-                self.kernel.sys_setattr(
-                    &req.path,
-                    req.entry_type,
-                    &req.backend_name,
-                    None, // backend (non-mount entry types don't need one)
-                    None, // metastore
-                    None, // raft_backend
-                    &req.io_profile,
-                    zone_id,
-                    req.is_external,
-                    req.capacity as usize,
-                    None, // read_fd  — DT_PIPE stdio uses the in-process AcpSubprocess path
-                    None, // write_fd
-                    req.mime_type.as_deref(),
-                    req.modified_at_ms,
-                    req.content_id.as_deref(),
-                    req.size,
-                    req.version,
-                    req.created_at_ms,
-                    req.link_target.as_deref(),
-                    None, // source
-                    None, // remote_metastore
-                )
-            });
+        let mut ctx = ctx.clone();
+        if !req.zone_id.is_empty() {
+            ctx.zone_id = req.zone_id;
+        }
+        if let Err(status) = self.authorize_path(&req.path, Permission::Write, &ctx) {
+            return error_setattr(status);
+        }
+        let result = self.kernel.sys_setattr(
+            &req.path,
+            req.entry_type,
+            &req.backend_name,
+            None, // backend (non-mount entry types don't need one)
+            None, // metastore
+            None, // raft_backend
+            &req.io_profile,
+            &ctx.zone_id,
+            req.is_external,
+            req.capacity as usize,
+            None, // read_fd  — DT_PIPE stdio uses the in-process AcpSubprocess path
+            None, // write_fd
+            req.mime_type.as_deref(),
+            req.modified_at_ms,
+            req.content_id.as_deref(),
+            req.size,
+            req.version,
+            req.created_at_ms,
+            req.link_target.as_deref(),
+            None, // source
+            None, // remote_metastore
+        );
 
         match result {
             Ok(r) => SetattrResponse {
@@ -1087,10 +1082,20 @@ impl NexusVfsService for VfsServiceImpl {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_unlock(s))),
         };
+        if req.force && !ctx.is_admin && !ctx.is_system {
+            return Ok(Response::new(error_unlock(Status::permission_denied(
+                "force unlock requires an administrator",
+            ))));
+        }
         if let Err(status) = self.authorize_path(&req.path, Permission::Write, &ctx) {
             return Ok(Response::new(error_unlock(status)));
         }
-        match self.kernel.sys_unlock(&req.path, &req.lock_id, req.force) {
+        // Distributed locks synchronously propose through the Raft runtime,
+        // just like acquisition. Keep both operations off async workers.
+        let kernel = self.kernel.clone();
+        let unlocked =
+            run_blocking(move || kernel.sys_unlock(&req.path, &req.lock_id, req.force)).await?;
+        match unlocked {
             Ok(released) => Ok(Response::new(UnlockResponse {
                 released,
                 is_error: false,

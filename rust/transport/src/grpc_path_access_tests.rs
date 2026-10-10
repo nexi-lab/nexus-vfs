@@ -199,6 +199,16 @@ async fn writer_can_use_attributes_and_locks_while_bulk_reads_preflight_all_path
         .unwrap()
         .into_inner();
     assert!(response.acquired && !response.is_error);
+    let denied = service
+        .unlock(Request::new(UnlockRequest {
+            path: path.into(),
+            force: true,
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(denied.is_error && !denied.released);
     let response = service
         .unlock(Request::new(UnlockRequest {
             path: path.into(),
