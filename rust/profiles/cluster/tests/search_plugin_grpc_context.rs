@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::search_plugin::{sign_plugin, signed_plugin};
+use common::search_plugin::{mtls_client as client, sign_plugin, signed_plugin};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,31 +12,12 @@ use nexus_raft::transport::{generate_agent_cert, generate_join_token, generate_z
 use nexus_search_common::{SearchDelegation, DELEGATION_METADATA_KEY};
 use nexus_search_plugin::internal_call::INTERNAL_CALL_HEADER;
 use nexus_search_plugin::search_proto::{
-    search_service_client::SearchServiceClient, DocumentInput, IndexDocumentsRequest, QueryRequest,
-    QueryType,
+    DocumentInput, IndexDocumentsRequest, QueryRequest, QueryType,
 };
 use tonic::metadata::MetadataValue;
-use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tonic::{Code, Request};
 
 const BUDGET: Duration = Duration::from_secs(120);
-
-async fn client(port: u16, ca: &[u8], cert: &[u8], key: &[u8]) -> SearchServiceClient<Channel> {
-    let tls = ClientTlsConfig::new()
-        .ca_certificate(Certificate::from_pem(ca))
-        .identity(Identity::from_pem(cert, key))
-        .domain_name("localhost");
-    let channel = Endpoint::from_shared(format!("https://127.0.0.1:{port}"))
-        .unwrap()
-        .tls_config(tls)
-        .unwrap()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(10))
-        .connect()
-        .await
-        .unwrap();
-    SearchServiceClient::new(channel)
-}
 
 fn query(q: &str) -> QueryRequest {
     QueryRequest {

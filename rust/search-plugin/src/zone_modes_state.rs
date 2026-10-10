@@ -63,12 +63,10 @@ pub struct ZoneModesRegistry {
 }
 
 impl ZoneModesRegistry {
-    /// Open (or create empty) at `<root>/zone_modes.json`.  Invalid
+    /// Load existing state or start empty in memory at `<root>/zone_modes.json`.  Invalid
     /// modes in the stored file are silently reset to `DEFAULT_MODE`
     /// so a hand-edited file with a typo doesn't lock a zone out.
-    pub fn open_or_create(root: PathBuf) -> Result<Self, ModesError> {
-        std::fs::create_dir_all(&root)
-            .map_err(|e| ModesError::CreateDir(root.display().to_string(), e.to_string()))?;
+    pub fn load(root: PathBuf) -> Result<Self, ModesError> {
         let path = root.join(MODES_FILE);
         let mut map: HashMap<String, String> = HashMap::new();
         if path.exists() {
@@ -146,6 +144,8 @@ impl ZoneModesRegistry {
     }
 
     pub fn save(&self) -> Result<(), ModesError> {
+        std::fs::create_dir_all(&self.dir)
+            .map_err(|e| ModesError::CreateDir(self.dir.display().to_string(), e.to_string()))?;
         let path = self.dir.join(MODES_FILE);
         let persisted = Persisted {
             version: MODES_VERSION,
@@ -188,13 +188,13 @@ mod tests {
 
     #[test]
     fn get_unknown_zone_returns_default() {
-        let r = ZoneModesRegistry::open_or_create(tempdir()).expect("open");
+        let r = ZoneModesRegistry::load(tempdir()).expect("open");
         assert_eq!(r.get("never-set-zone"), "on");
     }
 
     #[test]
     fn set_then_get_roundtrip() {
-        let r = ZoneModesRegistry::open_or_create(tempdir()).expect("open");
+        let r = ZoneModesRegistry::load(tempdir()).expect("open");
         r.set("za", "off").expect("set");
         r.set("zb", "sandbox").expect("set");
         assert_eq!(r.get("za"), "off");
@@ -204,7 +204,7 @@ mod tests {
 
     #[test]
     fn set_empty_resets_to_default() {
-        let r = ZoneModesRegistry::open_or_create(tempdir()).expect("open");
+        let r = ZoneModesRegistry::load(tempdir()).expect("open");
         r.set("za", "off").expect("set");
         r.set("za", "").expect("reset");
         assert_eq!(r.get("za"), "on");
@@ -212,7 +212,7 @@ mod tests {
 
     #[test]
     fn set_invalid_mode_errors() {
-        let r = ZoneModesRegistry::open_or_create(tempdir()).expect("open");
+        let r = ZoneModesRegistry::load(tempdir()).expect("open");
         assert!(matches!(
             r.set("za", "unknown"),
             Err(ModesError::InvalidMode(_))
@@ -221,7 +221,7 @@ mod tests {
 
     #[test]
     fn list_sorted_by_zone() {
-        let r = ZoneModesRegistry::open_or_create(tempdir()).expect("open");
+        let r = ZoneModesRegistry::load(tempdir()).expect("open");
         r.set("zc", "off").unwrap();
         r.set("za", "sandbox").unwrap();
         r.set("zb", "on").unwrap();
@@ -236,12 +236,12 @@ mod tests {
     fn save_then_reopen_survives_restart() {
         let dir = tempdir();
         {
-            let r = ZoneModesRegistry::open_or_create(dir.clone()).expect("open");
+            let r = ZoneModesRegistry::load(dir.clone()).expect("open");
             r.set("za", "off").unwrap();
             r.set("zb", "sandbox").unwrap();
             r.save().expect("save");
         }
-        let r2 = ZoneModesRegistry::open_or_create(dir).expect("reopen");
+        let r2 = ZoneModesRegistry::load(dir).expect("reopen");
         assert_eq!(r2.get("za"), "off");
         assert_eq!(r2.get("zb"), "sandbox");
     }
@@ -252,7 +252,7 @@ mod tests {
         let dir = tempdir();
         let path = dir.join(MODES_FILE);
         std::fs::write(&path, r#"{"version":1,"modes":{"za":"typo-value"}}"#).unwrap();
-        let r = ZoneModesRegistry::open_or_create(dir).expect("open");
+        let r = ZoneModesRegistry::load(dir).expect("open");
         assert_eq!(r.get("za"), "on", "invalid stored mode should fall back");
     }
 }

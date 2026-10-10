@@ -1,6 +1,9 @@
 use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
+use nexus_search_plugin::search_proto::search_service_client::SearchServiceClient;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
 pub fn signed_plugin(root: &Path) -> PathBuf {
     // Always ask Cargo: an existing cdylib may predate the source under test.
@@ -36,4 +39,26 @@ pub fn sign_plugin(plugin: &Path, trust: &Path) {
         base64::engine::general_purpose::STANDARD.encode(key.verifying_key().as_bytes()),
     )
     .unwrap();
+}
+
+pub async fn mtls_client(
+    port: u16,
+    ca: &[u8],
+    cert: &[u8],
+    key: &[u8],
+) -> SearchServiceClient<Channel> {
+    let tls = ClientTlsConfig::new()
+        .ca_certificate(Certificate::from_pem(ca))
+        .identity(Identity::from_pem(cert, key))
+        .domain_name("localhost");
+    let channel = Endpoint::from_shared(format!("https://127.0.0.1:{port}"))
+        .unwrap()
+        .tls_config(tls)
+        .unwrap()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(10))
+        .connect()
+        .await
+        .unwrap();
+    SearchServiceClient::new(channel)
 }
