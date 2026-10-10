@@ -248,6 +248,7 @@ fn model_directory_alias(kernel: &Kernel) -> &'static str {
     KernelSyscall::sys_setattr(
         kernel,
         alias,
+        &ctx(),
         6,
         "",
         None,
