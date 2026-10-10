@@ -1,7 +1,8 @@
 //! Access control for SearchService at the daemon's gRPC boundary.
 //!
-//! Query, BatchQuery, Glob, Grep and Locate use the authenticated caller's
-//! readable zones and the kernel's installed permission policy. Index management
+//! Query, BatchQuery, Glob, Grep and Locate use the kernel's installed file
+//! permission policy. User and service keys also require a readable zone grant.
+//! Certificate agents carry identity without zone tenancy. Index management
 //! and aggregate diagnostics require an administrator or a cluster node because
 //! those operations act on the shared index. Every returned path is checked after
 //! plugin execution, including cached and expanded results. Indexed hits are
@@ -292,8 +293,13 @@ impl ReadView {
             zone
         }
         .to_owned();
+        // Certificate agents have no zone tenancy. The installed kernel policy
+        // controls their file access, including containment and ReBAC.
+        let certificate_agent =
+            ctx.subject_type == "agent" && ctx.agent_id.is_some() && ctx.zone_perms.is_empty();
         if zone.is_empty()
             || (!privileged(&ctx)
+                && !certificate_agent
                 && !ctx
                     .zone_perms
                     .iter()
