@@ -52,13 +52,7 @@ impl SearchGrpcPolicy {
         token: &str,
     ) -> Result<OperationContext, Status> {
         let token = request_token(metadata, token)?;
-        // A gateway's node certificate authenticates its connection. An
-        // explicit bearer still names the caller, whose authority must not be
-        // replaced by that node's system privileges.
-        self.auth.resolve(&AuthCredentials {
-            token,
-            peer: if token.is_empty() { peer } else { None },
-        })
+        self.auth.resolve(&AuthCredentials { token, peer })
     }
 
     fn view(&self, ctx: OperationContext, requested: &str) -> Result<ReadView, Status> {

@@ -6,13 +6,11 @@
 //!
 //! ## Two planes, one decision
 //!
-//! * **Peer plane.** [`AuthCredentials::peer`] is `Some` ⇒ rustls already
-//!   verified a client certificate against the cluster CA, so the caller is
-//!   provably a cluster node. It gets a system context. This is what lets
-//!   the provider reject empty tokens **without killing federation**, which
-//!   sends `auth_token: ""` on every peer fan-out.
 //! * **Token plane.** An `sk-` key, resolved against the replicated store.
-//!   External clients only.
+//!   A nonempty request token selects this plane, including on mTLS connections.
+//!   Rejection never falls back to the connection's certificate identity.
+//! * **Peer plane.** With no token, a verified certificate supplies the node
+//!   or agent identity. Federation sends `auth_token: ""` and uses this plane.
 //!
 //! A caller with neither is rejected.
 //!
@@ -29,9 +27,6 @@
 //! that had demanded certificates from everybody.
 //!
 //! ## The gates, all fail-closed
-//!
-//! Ported from `nexus/src/nexus/bricks/auth/providers/database_key.py`,
-//! which stays the reference for the exact semantics:
 //!
 //! 1. format — `sk-` prefix, minimum length;
 //! 2. HMAC-SHA256 of the key under the signing secret → the store's lookup key;
@@ -502,16 +497,14 @@ fn serial_revoked(revoked: &RwLock<HashSet<Vec<u8>>>, serial: &[u8]) -> bool {
 
 impl AuthProvider for ApiKeyAuthProvider {
     fn resolve(&self, creds: &AuthCredentials<'_>) -> Result<OperationContext, Status> {
-        // Peer plane first: a verified cluster node needs no token, which is
-        // exactly why federation survives a strict provider.
+        if !creds.token.is_empty() {
+            return self.resolve_token(creds.token);
+        }
         if let Some(peer) = creds.peer {
             return resolve_verified_peer(peer, &self.revoked_serials);
         }
-        if creds.token.is_empty() {
-            tracing::debug!("rejected: no credentials (no token, no peer cert)");
-            return Err(unauthenticated());
-        }
-        self.resolve_token(creds.token)
+        tracing::debug!("rejected: no credentials (no token, no peer cert)");
+        Err(unauthenticated())
     }
 }
 
@@ -931,6 +924,104 @@ mod tests {
     }
 
     // ── The peer plane ───────────────────────────────────────────────
+
+    fn gateway_peers() -> [PeerIdentity; 2] {
+        let node = PeerIdentity {
+            common_name: "gateway-node".into(),
+            node_id: Some(42),
+            zone_id: Some("sharedzone".into()),
+            agent_name: None,
+            owner: None,
+            trust_domain: None,
+            serial: vec![1],
+        };
+        let agent = PeerIdentity {
+            common_name: "gateway-agent".into(),
+            node_id: None,
+            agent_name: Some("gateway".into()),
+            ..node.clone()
+        };
+        [node, agent]
+    }
+
+    #[test]
+    fn request_bearer_defines_identity_on_a_verified_connection() {
+        let store = MemStore::arc();
+        let mut record = agent_record();
+        record.subject_type = SubjectType::User;
+        record.subject_id = "alice".into();
+        plant(&store, USER_KEY, &record);
+        let auth = provider(store);
+        for peer in gateway_peers() {
+            let ctx = auth
+                .resolve(&AuthCredentials {
+                    token: USER_KEY,
+                    peer: Some(&peer),
+                })
+                .unwrap();
+            assert_eq!(ctx.user_id, "alice");
+            assert_eq!(ctx.subject_type, "user");
+            assert_eq!(ctx.subject_id.as_deref(), Some("alice"));
+            assert!(ctx.agent_id.is_none());
+            assert!(!ctx.is_admin && !ctx.is_system);
+            assert_eq!(ctx.zone_perms, record.zone_perms);
+        }
+    }
+
+    #[test]
+    fn rejected_request_bearer_cannot_fall_back_to_a_verified_peer() {
+        for peer in gateway_peers() {
+            let store = MemStore::arc();
+            for token in ["malformed", USER_KEY] {
+                assert_eq!(
+                    provider(Arc::clone(&store))
+                        .resolve(&AuthCredentials {
+                            token,
+                            peer: Some(&peer)
+                        })
+                        .unwrap_err()
+                        .code(),
+                    tonic::Code::Unauthenticated,
+                );
+            }
+            for expired in [false, true] {
+                let mut record = agent_record();
+                record.revoked = !expired;
+                record.expires_at_ms = expired.then_some(1);
+                plant(&store, USER_KEY, &record);
+                assert_eq!(
+                    provider(Arc::clone(&store))
+                        .resolve(&AuthCredentials {
+                            token: USER_KEY,
+                            peer: Some(&peer)
+                        })
+                        .unwrap_err()
+                        .code(),
+                    tonic::Code::Unauthenticated,
+                );
+            }
+            assert_eq!(
+                provider(MemStore::broken())
+                    .resolve(&AuthCredentials {
+                        token: USER_KEY,
+                        peer: Some(&peer)
+                    })
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::Unavailable,
+            );
+            assert_eq!(
+                ApiKeyAuthProvider::cert_identity_only()
+                    .resolve(&AuthCredentials {
+                        token: USER_KEY,
+                        peer: Some(&peer)
+                    })
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::Unauthenticated,
+            );
+        }
+    }
 
     /// The regression that would otherwise break federation: every peer
     /// fan-out sends `auth_token: ""`. A verified cert must authenticate on
