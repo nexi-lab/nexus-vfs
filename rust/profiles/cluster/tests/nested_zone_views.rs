@@ -53,8 +53,8 @@ fn stream_aliases_share_content_and_offsets() {
         .mount_subtree("root", alias, "contact-probe", &canonical, false)
         .unwrap();
     let kernel = build_kernel(&manager, &addr);
-    a2a::ensure_mailbox_stream(kernel.as_ref(), &canonical).unwrap();
     let ctx = kernel::kernel::OperationContext::new("bob", "root", true, Some("bob"), true);
+    a2a::ensure_mailbox_stream(kernel.as_ref(), &ctx, &canonical).unwrap();
     let body = b"one existing conversation record";
     kernel.stream_write_nowait(&canonical, body, &ctx).unwrap();
     let direct = kernel
@@ -201,9 +201,11 @@ fn stream_registry_separates_zones_and_uses_the_callers_namespace() {
             &kernel::core::vfs_router::canonicalize_mount_path("/", zone),
             Arc::new(store(&manager, zone)),
         );
+        let ctx = kernel::kernel::OperationContext::new(zone, zone, true, Some(zone), true);
         kernel
             .sys_setattr(
                 path,
+                &ctx,
                 DT_STREAM.into(),
                 "",
                 None,
@@ -226,7 +228,6 @@ fn stream_registry_separates_zones_and_uses_the_callers_namespace() {
                 None,
             )
             .unwrap();
-        let ctx = kernel::kernel::OperationContext::new(zone, zone, true, Some(zone), true);
         assert_eq!(kernel.stream_write_nowait(path, bytes, &ctx).unwrap(), 0);
     }
     for (zone, expected) in [
@@ -290,7 +291,9 @@ fn replicated_stream_append_wakes_a_reader_under_a_different_mount() {
         Arc::downgrade(&reader),
         "messages",
     );
-    a2a::ensure_mailbox_stream(writer.as_ref(), original).unwrap();
+    let writer_ctx =
+        kernel::kernel::OperationContext::new("alice", "root", true, Some("alice"), true);
+    a2a::ensure_mailbox_stream(writer.as_ref(), &writer_ctx, original).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     while reader.sys_stat(alias, "root").is_none() {
         assert!(
@@ -742,8 +745,8 @@ fn public_discovery_can_exclude_private_zones_but_subtree_mounts_cannot_filter_r
         .unwrap();
     let source_kernel = build_kernel(&source, &source_addr);
     let inbox = "/agents/alice/chat-with-me";
-    a2a::ensure_mailbox_stream(source_kernel.as_ref(), inbox).unwrap();
     let context = kernel::kernel::OperationContext::new("alice", "root", true, None, true);
+    a2a::ensure_mailbox_stream(source_kernel.as_ref(), &context, inbox).unwrap();
     let messages: [&[u8]; 2] = [
         br#"{"from":"bob","to":"alice","body":"only for alice"}"#,
         br#"{"from":"carol","to":"alice","body":"also only for alice"}"#,

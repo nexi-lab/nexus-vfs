@@ -3340,6 +3340,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "bincode",
+ "blake3",
  "bytes",
  "contracts",
  "dashmap",
@@ -4820,6 +4821,7 @@ dependencies = [
  "http-body-util",
  "kernel",
  "lib",
+ "managed-agent",
  "nexus-plugin-abi",
  "nexus-search-common",
  "parking_lot",

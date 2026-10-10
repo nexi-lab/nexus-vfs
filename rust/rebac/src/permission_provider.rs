@@ -2,9 +2,77 @@
 //! administrator contexts bypass graph checks. Other callers need a matching
 //! direct or userset grant; missing grants and store failures deny access.
 //!
-//! Read and traverse accept viewer, reader, writer, or owner. Write accepts
-//! writer or owner. An optional namespace registry defines richer expansions.
-//! Graphs are refreshed from the locally applied store revision.
+//! Impls `kernel::PermissionProvider` on top of the
+//! [`crate::ReBACGraphCache`] + a permission-to-relation map.
+//! Composes into the kernel's ONE `Arc<Box<dyn PermissionProvider>>`
+//! slot at the composition root (see PR 4b — the nexusd wire).
+//!
+//! # v1 scope — direct + userset relations, no namespace-config
+//!
+//! The upstream `lib::rebac::compute_permission` takes a namespace
+//! registry (`AHashMap<String, NamespaceConfig>`) that maps
+//! namespace-level permissions to relations (e.g.
+//! `doc.reader = union(reader, owner)`).  An empty registry
+//! collapses to the direct-relation + userset-expansion fallback
+//! path — sufficient for v1 (matches the "starter tuples" plane the
+//! /v2/rebac HTTP router in PR 5 will ship for grant/revoke).
+//! Namespace-config loading lands in a follow-up when the Python
+//! side's YAML config is ported.
+//!
+//! # Permission → relation mapping
+//!
+//! The kernel's `Permission::{Read, Write, Traverse}` are enum
+//! variants; ReBAC tuples name string relations.  Without a
+//! namespace registry to expand, this impl tries a fixed set of
+//! candidate relations for each `Permission` — a caller with ANY
+//! of them wins:
+//!
+//! | Permission | Candidate relations                     |
+//! |------------|-----------------------------------------|
+//! | Read       | `viewer`, `reader`, `writer`, `owner`, `direct_viewer`, `direct_editor`, `direct_owner` |
+//! | Write      | `writer`, `owner`, `direct_editor`, `direct_owner`    |
+//! | Traverse   | `viewer`, `reader`, `writer`, `owner`, `direct_viewer`, `direct_editor`, `direct_owner` |
+//!
+//! The `direct_*` relations are what the Nexus zone-grant projection
+//! writes (Python `_CAPABILITY_RELATIONS`); the enforcer must accept
+//! both vocabularies until one retires the other.
+//!
+//! Rationale: matches the Zanzibar convention that a stronger
+//! relation implies the weaker one.  A future namespace-config
+//! import wires the exact expansion; today's fixed set covers
+//! every check the HTTP router in PR 5 exercises.
+//!
+//! # Short-circuits (fail-open, then fail-closed)
+//!
+//! Two short-circuits at the top of `check`:
+//!
+//!   1. `ctx.is_system == true` → allow.  Matches the kernel's
+//!      Linux-`struct cred` posture: kernel-internal system ops
+//!      bypass the enforcer (background reconciliation, boot-time
+//!      metadata population).
+//!
+//!   2. `ctx.is_admin == true` → allow.  Admin capabilities are
+//!      granted upstream (auth-key mint carries admin=true); the
+//!      enforcer treats them as a break-glass.
+//!
+//! Everything else falls through to the graph walk — a
+//! store-read failure DENIES (fail-closed), and an absent grant
+//! DENIES (default deny).
+//!
+//! # Hot-path cost
+//!
+//! Every syscall on a gate-armed profile hits `check`; the budget
+//! is hundreds of nanoseconds.  Under steady state:
+//!
+//!   * `zone_revision` — one branch-free read (raft: 0 → sentinel;
+//!     in-mem: one lock-free counter).
+//!   * `graph_for_zone` — shared-lock read + `Arc::clone`.
+//!   * `check_direct_relation` — one `AHashSet::contains`.
+//!
+//! The three-candidate loop for `Read` / `Traverse` costs 3× the
+//! contains-lookup (cheap).  Under the sentinel path (raft store),
+//! the O(N) rebuild fires per call — amortised by the caller's
+//! upstream `PermissionLeaseCache`.
 
 use std::sync::Arc;
 
@@ -21,7 +89,9 @@ use crate::graph_cache::ReBACGraphCache;
 /// Relations that satisfy each `Permission` in the fixed v1 map.
 ///
 /// Zanzibar's convention: stronger → weaker.  A caller with `owner`
-/// implicitly reads and writes; a `writer` implicitly reads.  A
+/// implicitly reads and writes; a `writer` implicitly reads.  The
+/// `direct_*` relations mirror the Python zone-grant projection's
+/// vocabulary (`direct_viewer`/`direct_editor`/`direct_owner`).  A
 /// namespace-config import (follow-up) replaces this with per-
 /// namespace expansion.
 ///
@@ -30,8 +100,16 @@ use crate::graph_cache::ReBACGraphCache;
 #[inline]
 fn candidate_relations(permission: Permission) -> &'static [&'static str] {
     match permission {
-        Permission::Read | Permission::Traverse => &["viewer", "reader", "writer", "owner"],
-        Permission::Write => &["writer", "owner"],
+        Permission::Read | Permission::Traverse => &[
+            "viewer",
+            "reader",
+            "writer",
+            "owner",
+            "direct_viewer",
+            "direct_editor",
+            "direct_owner",
+        ],
+        Permission::Write => &["writer", "owner", "direct_editor", "direct_owner"],
     }
 }
 
@@ -269,6 +347,43 @@ mod tests {
         assert!(provider
             .check(path, None, Permission::Read, &ctx("alice", "root"))
             .is_ok());
+    }
+
+    /// The Python zone-grant projection writes direct_viewer/direct_editor/
+    /// direct_owner; the enforcer's candidate sets must accept them or every
+    /// kernel gate would deny projected grants.
+    #[test]
+    fn direct_projection_relations_are_enforcer_candidates() {
+        assert!(candidate_relations(Permission::Read).contains(&"direct_viewer"));
+        assert!(candidate_relations(Permission::Traverse).contains(&"direct_viewer"));
+        assert!(candidate_relations(Permission::Write).contains(&"direct_editor"));
+        assert!(candidate_relations(Permission::Write).contains(&"direct_owner"));
+        // legacy vocabulary stays intact
+        assert!(candidate_relations(Permission::Read).contains(&"viewer"));
+        assert!(candidate_relations(Permission::Write).contains(&"writer"));
+    }
+
+    /// The Zanzibar stronger→weaker convention must hold for the direct
+    /// mirrors exactly as it does for the legacy relations: a direct
+    /// editor/owner can read and traverse, not just write.
+    #[test]
+    fn direct_editor_and_direct_owner_can_read_and_traverse() {
+        let path = "/root/documents/spec.md";
+        for relation in ["direct_editor", "direct_owner"] {
+            let provider = make_provider("root", &[tuple("file", path, relation, "user", "alice")]);
+            assert!(
+                provider
+                    .check(path, None, Permission::Read, &ctx("alice", "root"))
+                    .is_ok(),
+                "a {relation} holder must be able to read"
+            );
+            assert!(
+                provider
+                    .check(path, None, Permission::Traverse, &ctx("alice", "root"))
+                    .is_ok(),
+                "a {relation} holder must be able to traverse"
+            );
+        }
     }
 
     /// A user without any grant is denied.

@@ -68,7 +68,7 @@ pub use node::{ConfStateAppliedCb, RaftConfig, RaftMsg, ZoneConsensus, ZoneConse
 #[cfg(feature = "consensus")]
 pub use storage::RaftStorage;
 #[cfg(all(feature = "grpc", has_protos))]
-pub use zone_persistence::ZonePersistence;
+pub use zone_persistence::{DeletionRecord, ZonePersistence};
 #[cfg(all(feature = "grpc", has_protos))]
 pub(crate) use zone_registry::reconcile_peers_with_conf_state;
 pub(crate) use zone_registry::wait_until_caught_up;

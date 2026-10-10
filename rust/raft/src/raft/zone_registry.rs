@@ -16,6 +16,7 @@
 //!   └── ...
 //! ```
 
+use crate::raft::zone_persistence::DeletionRecord;
 use crate::raft::{
     FullStateMachine, RaftConfig, RaftStorage, ReplicationLog, StateMachine, ZoneConsensus,
     ZonePersistence,
@@ -24,7 +25,9 @@ use crate::transport::{
     ClientConfig, NodeAddress, PeerMap, RaftClientPool, SharedPeerMap, TlsConfig, TransportError,
     TransportLoop,
 };
+use crate::zone_deletion_registry::DeletionEpochSource;
 use dashmap::DashMap;
+use lib::rt::block_on_via as bridge_block_on;
 use raft::eraftpb::ConfState;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -32,6 +35,16 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+
+/// Wall-clock ms — the epoch space both the creation marker and the
+/// replicated deletion epoch live in (strictly increasing via
+/// `mark_deleted`'s `max(prev + 1, now)`).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// Reconcile a static peer roster with persisted Raft membership.
 ///
@@ -276,6 +289,12 @@ pub struct ZoneRaftRegistry {
     /// and embedded-mode expectations.  Set once at boot via
     /// [`Self::set_identity_dir`].
     identity_dir: Arc<RwLock<Option<PathBuf>>>,
+    /// The replicated deletion-epoch authority (R12), injected at boot via
+    /// [`Self::set_deletion_epoch_source`] — the `set_identity_dir` pattern.
+    /// `None` (tests, embedded, auth-off single node without a control
+    /// store) degrades the boot resurrection check to the pre-existing
+    /// tombstone + 60s-window behavior.
+    deletion_epoch_source: RwLock<Option<Arc<dyn DeletionEpochSource>>>,
     /// Per-zone concurrent-op guard: tracks zone_ids currently undergoing
     /// setup or removal. Prevents two threads from concurrently opening
     /// the same RedbStore ("Database already open") and from racing a
@@ -329,6 +348,7 @@ impl ZoneRaftRegistry {
             tls: Arc::new(RwLock::new(None)),
             self_address: Arc::new(RwLock::new(String::new())),
             identity_dir: Arc::new(RwLock::new(None)),
+            deletion_epoch_source: RwLock::new(None),
             creating: DashMap::new(),
             recently_removed: DashMap::new(),
             materialization: RwLock::new(None),
@@ -346,6 +366,7 @@ impl ZoneRaftRegistry {
             tls: Arc::new(RwLock::new(tls)),
             self_address: Arc::new(RwLock::new(String::new())),
             identity_dir: Arc::new(RwLock::new(None)),
+            deletion_epoch_source: RwLock::new(None),
             creating: DashMap::new(),
             recently_removed: DashMap::new(),
             materialization: RwLock::new(None),
@@ -384,6 +405,114 @@ impl ZoneRaftRegistry {
     /// is installed at zone-setup time, not runtime-poked).
     pub fn set_identity_dir(&self, dir: PathBuf) {
         *self.identity_dir.write().unwrap() = Some(dir);
+    }
+
+    /// Inject the replicated deletion-epoch authority (R12). Call at boot,
+    /// once the control zone is up; the registry consults it before
+    /// indexing/materializing a persisted zone so a replica that missed a
+    /// deprovision's peer fan-out destroys itself instead of resurrecting
+    /// the deleted zone.
+    pub fn set_deletion_epoch_source(&self, source: Arc<dyn DeletionEpochSource>) {
+        *self.deletion_epoch_source.write().unwrap() = Some(source);
+    }
+
+    /// The replicated deletion epoch for `zone_id`, via the injected
+    /// source. `None` = not deleted / no source / store unreachable —
+    /// callers degrade to pre-R12 behavior.
+    pub fn deletion_epoch(&self, zone_id: &str) -> Option<u64> {
+        self.deletion_epoch_source
+            .read()
+            .unwrap()
+            .clone()?
+            .deletion_epoch(zone_id)
+    }
+
+    /// R12's single epoch comparison, the ONE implementation every guard
+    /// shares: does the recorded deletion outrank this replica's on-disk
+    /// `.creation-epoch`? True ⇒ this is (or must never become) a live
+    /// replica of a deprovisioned zone. Used by the materialize gate below,
+    /// the boot/D9 guards and the CLI guard (via the `ZoneManager` facade)
+    /// so the judgment can never drift between call sites. A zone
+    /// re-founded through the `--force` escape hatch carries a FRESH
+    /// creation epoch, which makes this false again — that ordering is the
+    /// recovery semantics, no un-delete API exists.
+    pub fn deletion_outranks_disk(&self, zone_id: &str) -> bool {
+        let Some(deletion_epoch) = self.deletion_epoch(zone_id) else {
+            return false;
+        };
+        let creation_epoch =
+            ZonePersistence::read_creation_epoch(&self.base_path, zone_id).unwrap_or(0);
+        deletion_epoch > creation_epoch
+    }
+
+    /// R12 sweep: destroy every CATALOGUED zone dir whose replicated
+    /// deletion epoch is newer than its local creation epoch.
+    ///
+    /// `index_persisted_zones` runs inside `open_zone_manager`, BEFORE the
+    /// control zone (the epoch home) is reachable — so the per-zone check
+    /// there can only fire for a source wired mid-boot. Boot calls this
+    /// sweep once the deletion source IS wired, closing the window for a
+    /// stale replica that re-indexed before the source existed. The daemon
+    /// ALSO runs it on a periodic timer: the boot-time sweep only sees the
+    /// local control-zone replica, so a node whose replica was behind at
+    /// boot needs the runtime pass to self-heal once it catches up.
+    ///
+    /// A RESIDENT (materialized) deleted zone — possible when the boot
+    /// resume path ran while the local deletion record was not yet visible
+    /// — is torn down through the regular `remove_zone` path (concurrency
+    /// guard, transport shutdown, Windows handle release, then destroy),
+    /// NEVER a bare `remove_dir_all` over a live runtime. Cold
+    /// (unmaterialized) dirs are cleaned directly.
+    pub fn purge_deleted_zones(&self, rt: &tokio::runtime::Handle) {
+        let Some(source) = self.deletion_epoch_source.read().unwrap().clone() else {
+            return;
+        };
+        for zone_id in self.hosted.iter().map(|z| z.clone()).collect::<Vec<_>>() {
+            let Some(deletion_epoch) = source.deletion_epoch(&zone_id) else {
+                continue;
+            };
+            let creation_epoch =
+                ZonePersistence::read_creation_epoch(&self.base_path, &zone_id).unwrap_or(0);
+            if deletion_epoch <= creation_epoch {
+                continue;
+            }
+            tracing::error!(
+                zone = %zone_id,
+                deletion_epoch,
+                creation_epoch,
+                "catalogued zone predates a recorded deletion — destroying the stale \
+                 replica instead of resurrecting the deleted zone",
+            );
+            if self.zones.contains_key(&zone_id) {
+                // Live runtime: regular teardown. `remove_zone` also drops
+                // the catalog entry and writes the epoch-bearing tombstone.
+                match bridge_block_on(rt, self.remove_zone(&zone_id)) {
+                    Ok(()) => tracing::info!(
+                        zone = %zone_id,
+                        "Tore down resident replica of deleted zone"
+                    ),
+                    Err(e) => tracing::warn!(
+                        zone = %zone_id,
+                        error = %e,
+                        "Failed to tear down resident replica of deleted zone; retrying \
+                         on the next sweep",
+                    ),
+                }
+                continue;
+            }
+            match ZonePersistence::cleanup_tombstoned(&self.base_path, &zone_id) {
+                Ok(()) => {
+                    self.hosted.remove(&zone_id);
+                    tracing::info!(zone = %zone_id, "Destroyed stale replica of deleted zone");
+                }
+                Err(e) => tracing::warn!(
+                    zone = %zone_id,
+                    error = %e,
+                    "Failed to destroy stale replica of deleted zone; it stays catalogued \
+                     this boot (remove the dir manually if this recurs)",
+                ),
+            }
+        }
     }
 
     /// Current identity directory, if set.
@@ -646,6 +775,9 @@ impl ZoneRaftRegistry {
     /// Is `zone_id` present + resumable on disk? Finishes an interrupted
     /// removal (tombstone) rather than resurrecting a zombie zone that would
     /// send raft messages to peers who — correctly — return NotFound.
+    /// R12: a zone the replicated registry says is DELETED (epoch greater
+    /// than this dir's creation epoch) is a stale replica that missed the
+    /// deprovision fan-out — destroy it, never materialize it.
     fn index_persisted_zone_if_present(&self, zone_id: &str) -> bool {
         if ZonePersistence::has_tombstone(&self.base_path, zone_id) {
             match ZonePersistence::cleanup_tombstoned(&self.base_path, zone_id) {
@@ -659,6 +791,38 @@ impl ZoneRaftRegistry {
                 ),
             }
             return false;
+        }
+        // Replicated deletion check (the anti-resurrection ladder's step 2):
+        // no LOCAL tombstone, but the control zone recorded a deletion
+        // NEWER than this dir's creation. Store unreachable / not wired ⇒
+        // `None` ⇒ unchanged pre-R12 behavior (step 3 of the ladder).
+        if let Some(source) = self.deletion_epoch_source.read().unwrap().clone() {
+            if let Some(deletion_epoch) = source.deletion_epoch(zone_id) {
+                let creation_epoch =
+                    ZonePersistence::read_creation_epoch(&self.base_path, zone_id).unwrap_or(0);
+                if deletion_epoch > creation_epoch {
+                    tracing::error!(
+                        zone = %zone_id,
+                        deletion_epoch,
+                        creation_epoch,
+                        "persisted zone dir predates a recorded deletion — destroying the \
+                         stale replica instead of resurrecting the deleted zone",
+                    );
+                    match ZonePersistence::cleanup_tombstoned(&self.base_path, zone_id) {
+                        Ok(()) => tracing::info!(
+                            zone = %zone_id,
+                            "Destroyed stale replica of deleted zone at startup"
+                        ),
+                        Err(e) => tracing::warn!(
+                            zone = %zone_id,
+                            error = %e,
+                            "Failed to destroy stale replica of deleted zone; it stays \
+                             un-indexed (not materialized) this boot",
+                        ),
+                    }
+                    return false;
+                }
+            }
         }
         // If `{zone}/raft/` doesn't exist, this isn't a persisted zone — skip.
         // Matches `RaftStorage::open`, which is what creates that subdir.
@@ -801,6 +965,7 @@ impl ZoneRaftRegistry {
             )));
         }
         let zone_dir = self.base_path.join(zone_id);
+        let is_fresh_zone = !zone_dir.exists();
         let mut persistence = if zone_dir.exists() {
             ZonePersistence::open(&self.base_path, zone_id).map_err(|e| {
                 TransportError::Connection(format!(
@@ -816,6 +981,20 @@ impl ZoneRaftRegistry {
                 ))
             })?
         };
+        // R12: stamp the fresh replica's creation wall-clock — the boot
+        // resurrection check compares the replicated deletion epoch against
+        // it. Best-effort: a missing marker reads as epoch 0, which only
+        // makes the check more conservative.
+        if is_fresh_zone {
+            if let Err(e) = persistence.write_creation_epoch(now_ms()) {
+                tracing::warn!(
+                    zone = %zone_id,
+                    error = %e,
+                    "Failed to write creation-epoch marker (resurrection check degrades \
+                     to epoch 0 for this replica)",
+                );
+            }
+        }
 
         // Open zone-specific redb + state machine
         let store = crate::transport::open_zone_store(persistence.sm_path())?;
@@ -1114,6 +1293,18 @@ impl ZoneRaftRegistry {
         if !self.hosted.contains(zone_id) {
             return None;
         }
+        // R12 runtime guard: a catalogued dir whose recorded deletion
+        // outranks its creation epoch must NEVER come alive on first access
+        // — before this check, a deleted-but-not-yet-swept zone would
+        // materialize and keep serving until the next reboot.
+        if self.deletion_outranks_disk(zone_id) {
+            tracing::error!(
+                zone = %zone_id,
+                "refusing to materialize a deprovisioned zone (deletion epoch outranks \
+                 this replica's creation epoch); the sweep will destroy the stale dir",
+            );
+            return None;
+        }
         let (peers, runtime) = {
             let guard = self.materialization.read().unwrap();
             let m = guard.as_ref()?;
@@ -1237,6 +1428,14 @@ impl ZoneRaftRegistry {
     /// 5. `persistence.destroy()` — the `rmdir -r`.
     #[allow(clippy::result_large_err)]
     pub async fn remove_zone(&self, zone_id: &str) -> Result<(), TransportError> {
+        // R12 bottom-layer guard: the reserved zones are the substrate the
+        // deletion itself rides on (the control store lives IN the control
+        // zone) — destroying them is never a valid zone operation.
+        if contracts::RESERVED_ZONE_IDS.contains(&zone_id) {
+            return Err(TransportError::Connection(format!(
+                "Zone '{zone_id}' is reserved and cannot be removed"
+            )));
+        }
         // Serialize against setup_zone on the same zone_id.
         {
             use dashmap::mapref::entry::Entry;
@@ -1293,7 +1492,29 @@ impl ZoneRaftRegistry {
         // case: the zone is gone from memory, dir is still on disk; on
         // next restart re-indexes it. No
         // zombie — no remote peers were told this zone is dying.
-        if let Err(e) = persistence.write_tombstone() {
+        //
+        // R12: when the replicated registry knows a deletion epoch for
+        // this zone (the deprovision path recorded one), the tombstone
+        // carries it — a crash mid-teardown then leaves an epoch-bearing
+        // marker instead of a bare one, and a rebuilt replica can never
+        // mistake the leftover for a pre-deletion state.
+        let tombstone_err = match self
+            .deletion_epoch_source
+            .read()
+            .unwrap()
+            .clone()
+            .and_then(|s| s.deletion_epoch(zone_id))
+        {
+            Some(epoch) => persistence.write_tombstone_with_epoch(&DeletionRecord {
+                version: 1,
+                zone_id: zone_id.to_string(),
+                deletion_epoch: epoch,
+                deleted_at_ms: now_ms(),
+                initiated_by_node: self.node_id,
+            }),
+            None => persistence.write_tombstone(),
+        };
+        if let Err(e) = tombstone_err {
             // Best-effort: put the zone back so state isn't lost from memory.
             self.zones.insert(
                 zone_id.to_string(),
@@ -1564,6 +1785,171 @@ mod tests {
         assert_eq!(reg2.index_persisted_zones().unwrap(), 1);
         assert_eq!(reg2.index_persisted_zones().unwrap(), 1);
         assert_eq!(reg2.list_zones().len(), 1);
+    }
+
+    /// Fixed-epoch deletion source for the R12 guard tests — no raft
+    /// control zone needed, the registry only ever asks "what epoch?".
+    struct StubEpochSource(Option<u64>);
+
+    impl DeletionEpochSource for StubEpochSource {
+        fn deletion_epoch(&self, _zone_id: &str) -> Option<u64> {
+            self.0
+        }
+    }
+
+    #[test]
+    fn deletion_outranks_disk_without_source_is_false() {
+        let tmp = TempDir::new().unwrap();
+        let reg = ZoneRaftRegistry::new(tmp.path().to_path_buf(), 1);
+        assert!(
+            !reg.deletion_outranks_disk("anywhere"),
+            "no wired source = pre-R12 behavior, nothing outranks the disk"
+        );
+    }
+
+    #[test]
+    fn deletion_outranks_disk_compares_epochs_and_a_fresh_epoch_outranks() {
+        // The epoch comparison every R12 guard shares, plus the --force
+        // recovery semantics: a FRESH creation epoch (what
+        // `ZoneManager::bump_creation_epoch` stamps on a re-found) makes
+        // the recorded deletion no longer outrank the replica.
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().to_path_buf();
+        let reg = ZoneRaftRegistry::new(base.clone(), 1);
+
+        let mut p = ZonePersistence::create(&base, "victim").unwrap();
+        p.commit();
+        let old_creation = 1_000u64;
+        p.write_creation_epoch(old_creation).unwrap();
+
+        reg.set_deletion_epoch_source(Arc::new(StubEpochSource(Some(2_000))));
+        assert!(
+            reg.deletion_outranks_disk("victim"),
+            "deletion (2000) after creation (1000): stale replica"
+        );
+
+        // What a --force re-found does: stamp a fresh epoch.
+        ZonePersistence::open(&base, "victim")
+            .unwrap()
+            .write_creation_epoch(3_000)
+            .unwrap();
+        assert!(
+            !reg.deletion_outranks_disk("victim"),
+            "fresh creation epoch (3000) outranks the recorded deletion (2000): the \
+             operator's re-found survives later sweeps"
+        );
+
+        reg.set_deletion_epoch_source(Arc::new(StubEpochSource(Some(500))));
+        assert!(
+            !reg.deletion_outranks_disk("victim"),
+            "deletion older than the replica's creation: a pre-deletion copy is not stale"
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_sweeps_cold_deleted_dirs_without_touching_the_disk_of_others() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().to_path_buf();
+        let reg = ZoneRaftRegistry::new(base.clone(), 1);
+        reg.create_zone("victim", vec![], &tokio::runtime::Handle::current())
+            .unwrap();
+        reg.create_zone("healthy", vec![], &tokio::runtime::Handle::current())
+            .unwrap();
+        reg.shutdown_all();
+        drop(reg);
+        await_shutdown_cleanup().await;
+
+        let reg2 = ZoneRaftRegistry::new(base.clone(), 1);
+        assert_eq!(reg2.index_persisted_zones().unwrap(), 2);
+        // Only "victim" has a recorded deletion that outranks its creation.
+        struct SelectiveStub;
+        impl DeletionEpochSource for SelectiveStub {
+            fn deletion_epoch(&self, zone_id: &str) -> Option<u64> {
+                (zone_id == "victim").then_some(u64::MAX)
+            }
+        }
+        reg2.set_deletion_epoch_source(Arc::new(SelectiveStub));
+        reg2.purge_deleted_zones(&tokio::runtime::Handle::current());
+
+        assert!(
+            !base.join("victim").exists(),
+            "the cold deleted dir is destroyed"
+        );
+        assert!(!reg2.hosts("victim"), "and de-catalogued");
+        assert!(
+            base.join("healthy").exists(),
+            "a healthy zone dir is untouched"
+        );
+        assert!(reg2.hosts("healthy"));
+    }
+
+    // multi_thread: the resident tear-down path runs `remove_zone` through
+    // `bridge_block_on`, whose current-thread branch (scratch-thread
+    // block_on) cannot drive a runtime that the test owner is already
+    // driving — the production daemon is multi-threaded and takes the
+    // block_in_place branch, so this is also the realistic shape.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn purge_tears_down_a_resident_deleted_zone_through_the_remove_path() {
+        // The boot-race window case: the zone is RESIDENT (materialized)
+        // when the deletion record becomes visible. The sweep must route
+        // it through the regular remove path — concurrency guard,
+        // transport shutdown, handle release, THEN destroy — never a bare
+        // remove_dir_all over a live runtime.
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().to_path_buf();
+        let reg = ZoneRaftRegistry::new(base.clone(), 1);
+        reg.create_zone("victim", vec![], &tokio::runtime::Handle::current())
+            .unwrap();
+        assert_eq!(reg.resident_zones(), vec!["victim".to_string()]);
+        assert!(base.join("victim").exists());
+
+        reg.set_deletion_epoch_source(Arc::new(StubEpochSource(Some(u64::MAX))));
+        reg.purge_deleted_zones(&tokio::runtime::Handle::current());
+
+        assert!(
+            !base.join("victim").exists(),
+            "the resident deleted zone's dir is destroyed by the teardown"
+        );
+        assert!(
+            reg.resident_zones().is_empty(),
+            "its runtime was torn down (not just the dir)"
+        );
+        assert!(!reg.hosts("victim"), "and it is de-catalogued");
+        reg.shutdown_all();
+        await_shutdown_cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn materialize_refuses_a_deleted_zone() {
+        // A cold hosted dir whose deletion outranks its creation must
+        // NEVER come alive on first access.
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().to_path_buf();
+        let reg = ZoneRaftRegistry::new(base.clone(), 1);
+        reg.create_zone("victim", vec![], &tokio::runtime::Handle::current())
+            .unwrap();
+        reg.shutdown_all();
+        drop(reg);
+        await_shutdown_cleanup().await;
+
+        let reg2 = ZoneRaftRegistry::new(base, 1);
+        assert_eq!(reg2.index_persisted_zones().unwrap(), 1);
+        reg2.arm_materialization(
+            vec![],
+            tokio::runtime::Handle::current(),
+            ZoneLoadPolicy::OnDemand,
+        );
+        reg2.set_deletion_epoch_source(Arc::new(StubEpochSource(Some(u64::MAX))));
+
+        assert!(
+            reg2.get_node("victim").is_none(),
+            "materialize must refuse a deprovisioned zone"
+        );
+        assert!(reg2.resident_zones().is_empty(), "nothing became resident");
+        // The dir itself stays for the sweep (documented split: the gate
+        // stops resurrection, the sweep reclaims the dir).
+        reg2.shutdown_all();
+        await_shutdown_cleanup().await;
     }
 
     #[tokio::test]

@@ -92,6 +92,7 @@ fn populate_dir(kernel: &Kernel, ctx: &OperationContext, dir: &str, n: usize) {
     kernel
         .sys_setattr(
             dir,
+            &OperationContext::new("test", "root", true, None, true),
             DT_DIR as i32,
             "",
             None,

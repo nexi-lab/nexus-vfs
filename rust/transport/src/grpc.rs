@@ -253,6 +253,50 @@ impl_authed_request!(
     WriteRequest,
 );
 
+/// The authenticate half of the VFS request path, as a free function so
+/// the ZoneRuntime service (same port, same boot gate, same auth plane)
+/// rides the IDENTICAL door: ready-gate wait → peer identity (foreign-CA
+/// aware) → `AuthProvider::resolve`. Extracted from
+/// [`VfsServiceImpl::authenticate`], which now forwards here.
+pub(crate) async fn authenticate_with<T: AuthedRequest>(
+    auth: &Arc<dyn AuthProvider>,
+    ready: &DataPlaneReady,
+    foreign_ca_verifier: &ForeignCaVerifierSlot,
+    req: Request<T>,
+) -> Result<(OperationContext, T), Status> {
+    if !ready.wait(DATA_PLANE_READY_BUDGET).await {
+        return Err(Status::unavailable(
+            "nexusd is still booting: the VFS data plane is not wired yet \
+             (no distributed coordinator) — retry",
+        ));
+    }
+    // Resolve the peer identity, foreign-CA aware only when it can matter.
+    // `foreign_anchors()` is an O(1) ArcSwap read the apply observer keeps
+    // fresh. When it is empty — the common case, and always so on an
+    // auth-off node — every rustls-admitted cert is cluster-CA, so
+    // classification would just re-derive "local"; take the plain parse
+    // path and skip the per-request signature verify. Only once a foreign
+    // CA is registered do we classify (to resolve its agents qualified,
+    // `{trust_domain}/agent/{name}`).
+    let peer = match foreign_ca_verifier.get() {
+        Some(v) => {
+            let anchors = v.foreign_anchors();
+            if anchors.is_empty() {
+                peer_identity::from_request(&req)
+            } else {
+                peer_identity::classify_from_request(&req, v.cluster_ca_der(), &anchors)
+            }
+        }
+        None => peer_identity::from_request(&req),
+    };
+    let inner = req.into_inner();
+    let ctx = auth.resolve(&AuthCredentials {
+        token: inner.auth_token(),
+        peer: peer.as_ref(),
+    })?;
+    Ok((ctx, inner))
+}
+
 impl VfsServiceImpl {
     /// Authenticate a request and unwrap it.
     ///
@@ -272,36 +316,7 @@ impl VfsServiceImpl {
         &self,
         req: Request<T>,
     ) -> Result<(OperationContext, T), Status> {
-        if !self.ready.wait(DATA_PLANE_READY_BUDGET).await {
-            return Err(Status::unavailable(
-                "nexusd is still booting: the VFS data plane is not wired yet \
-                 (no distributed coordinator) — retry",
-            ));
-        }
-        // Resolve the peer identity, foreign-CA aware only when it can matter.
-        // `foreign_anchors()` is an O(1) ArcSwap read the apply observer keeps
-        // fresh. When it is empty — the common case, and always so on an auth-off
-        // node — every rustls-admitted cert is cluster-CA, so classification would
-        // just re-derive "local"; take the plain parse path and skip the per-request
-        // signature verify. Only once a foreign CA is registered do we classify (to
-        // resolve its agents qualified, `{trust_domain}/agent/{name}`).
-        let peer = match self.foreign_ca_verifier.get() {
-            Some(v) => {
-                let anchors = v.foreign_anchors();
-                if anchors.is_empty() {
-                    peer_identity::from_request(&req)
-                } else {
-                    peer_identity::classify_from_request(&req, v.cluster_ca_der(), &anchors)
-                }
-            }
-            None => peer_identity::from_request(&req),
-        };
-        let inner = req.into_inner();
-        let ctx = self.auth.resolve(&AuthCredentials {
-            token: inner.auth_token(),
-            peer: peer.as_ref(),
-        })?;
-        Ok((ctx, inner))
+        authenticate_with(&self.auth, &self.ready, &self.foreign_ca_verifier, req).await
     }
 
     /// Pick the RPC code; take the message from the error itself.
@@ -473,7 +488,7 @@ impl VfsServiceImpl {
 
         // Mount the freshly-built backend (and any remote metastore the
         // provider produced) through the kernel.
-        self.mount_via_kernel(&req, built.backend, built.pending_remote_meta_store)
+        self.mount_via_kernel(&req, ctx, built.backend, built.pending_remote_meta_store)
     }
 
     /// Issue the DT_MOUNT `Kernel::sys_setattr` from a `SetattrRequest` with a
@@ -484,6 +499,7 @@ impl VfsServiceImpl {
     fn mount_via_kernel(
         &self,
         req: &SetattrRequest,
+        ctx: &OperationContext,
         backend: Option<Arc<dyn kernel::abc::object_store::ObjectStore>>,
         remote_metastore: Option<Arc<dyn kernel::meta_store::MetaStore>>,
     ) -> SetattrResponse {
@@ -494,6 +510,7 @@ impl VfsServiceImpl {
         };
         match self.kernel.sys_setattr(
             &req.path,
+            ctx,
             req.entry_type,
             &req.backend_name,
             backend,
@@ -543,22 +560,24 @@ impl VfsServiceImpl {
     /// `ForeignAgentMailboxOnly` can create only inside its mailbox — the same
     /// boundary the write seam enforces on stream/pipe appends.
     fn setattr_typed(&self, req: SetattrRequest, ctx: &OperationContext) -> SetattrResponse {
-        let mut ctx = ctx.clone();
-        if !req.zone_id.is_empty() {
-            ctx.zone_id = req.zone_id;
-        }
-        if let Err(status) = self.authorize_path(&req.path, Permission::Write, &ctx) {
+        let zone_id = if req.zone_id.is_empty() {
+            kernel::ROOT_ZONE_ID
+        } else {
+            req.zone_id.as_str()
+        };
+        if let Err(status) = self.authorize_path(&req.path, Permission::Write, ctx) {
             return error_setattr(status);
         }
         let result = self.kernel.sys_setattr(
             &req.path,
+            ctx,
             req.entry_type,
             &req.backend_name,
             None, // backend (non-mount entry types don't need one)
             None, // metastore
             None, // raft_backend
             &req.io_profile,
-            &ctx.zone_id,
+            zone_id,
             req.is_external,
             req.capacity as usize,
             None, // read_fd  — DT_PIPE stdio uses the in-process AcpSubprocess path
@@ -2129,9 +2148,12 @@ pub(crate) mod tests {
         let backend: std::sync::Arc<dyn ObjectStore> = std::sync::Arc::new(MemBackend::default());
         k.mount(
             "/",
-            MountOptions::new("mem")
-                .with_backend(backend)
-                .with_io_profile(""),
+            MountOptions::new(
+                &kernel::kernel::OperationContext::new("test", "root", true, None, true),
+                "mem",
+            )
+            .with_backend(backend)
+            .with_io_profile(""),
         )
         .expect("kernel_with_mem_backend: mount DT_MOUNT");
         k

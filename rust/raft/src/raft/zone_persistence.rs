@@ -22,7 +22,29 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 const TOMBSTONE_NAME: &str = ".removed";
+/// In-dir marker of when this zone's LOCAL replica was created — the
+/// wall-clock the boot resurrection check compares the replicated
+/// deletion epoch against ("deleted after this copy was made ⇒ stale
+/// copy, do not materialize").
+const CREATION_EPOCH_NAME: &str = ".creation-epoch";
+
+/// Tombstone payload (R12). Historically the tombstone was a zero-byte
+/// marker; a zero-byte or unparsable file is read back as `deletion_epoch
+/// == 0` (legacy), which suppresses nothing extra — the file's mere
+/// existence still triggers the existing tombstone cleanup.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DeletionRecord {
+    pub version: u32,
+    pub zone_id: String,
+    /// Strictly increasing per zone; the boot check is
+    /// `deletion_epoch > local creation epoch`.
+    pub deletion_epoch: u64,
+    pub deleted_at_ms: u64,
+    pub initiated_by_node: u64,
+}
 
 /// Owns the on-disk dir for a single zone. See module doc.
 #[derive(Debug)]
@@ -133,6 +155,47 @@ impl ZonePersistence {
         Ok(())
     }
 
+    /// Write the tombstone with a deletion epoch (R12) — the deprovision
+    /// path. The epoch payload is OFFLINE AUDIT DATA: boot destroys a
+    /// tombstoned directory unconditionally on the tombstone's EXISTENCE,
+    /// and the anti-resurrection comparison a missed-fan-out replica
+    /// performs at boot reads the REPLICATED registry's deletion epoch
+    /// against the local `.creation-epoch` (zone_registry), never this
+    /// file. Written via temp-file + rename (the identity.rs pattern): a
+    /// crash mid-write leaves the previous state, never a torn record.
+    pub fn write_tombstone_with_epoch(&self, record: &DeletionRecord) -> io::Result<()> {
+        let bytes = serde_json::to_vec(record).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("deletion record encode: {e}"),
+            )
+        })?;
+        write_atomic(&self.tombstone_path, &bytes)
+    }
+
+    /// Record when this local replica was created (wall-clock ms) — the
+    /// boot resurrection check's comparison point. Best-effort by design:
+    /// an unreadable/missing epoch reads as 0, which makes the check
+    /// conservative (a stale copy with epoch 0 is cleaned only by the
+    /// tombstone/60s-window paths, never resurrected as authoritative).
+    /// Written via temp-file + rename, same as the tombstone above.
+    pub fn write_creation_epoch(&self, epoch_ms: u64) -> io::Result<()> {
+        write_atomic(
+            &self.zone_path.join(CREATION_EPOCH_NAME),
+            epoch_ms.to_string().as_bytes(),
+        )
+    }
+
+    /// Read a zone dir's creation epoch, if present. `None` = no marker
+    /// (pre-R12 dir or write failed) — callers treat it as epoch 0.
+    pub fn read_creation_epoch(base: &Path, zone_id: &str) -> Option<u64> {
+        std::fs::read_to_string(base.join(zone_id).join(CREATION_EPOCH_NAME))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
     /// Delete the zone dir. Caller MUST have released all handles to
     /// files inside (redb snapshots, raft storage, etc.) — consumes self
     /// so the type system prevents use-after-destroy.
@@ -153,6 +216,16 @@ impl ZonePersistence {
         }
         Ok(())
     }
+}
+
+/// Write `bytes` to `path` atomically: temp file in the same directory,
+/// then rename over the target (the identity.rs persistence pattern). A
+/// crash mid-write leaves the previous state instead of a torn record.
+fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 impl Drop for ZonePersistence {
@@ -237,6 +310,40 @@ mod tests {
         std::fs::write(zone_path.join("some-data"), b"x").unwrap();
         ZonePersistence::cleanup_tombstoned(tmp.path(), "z1").unwrap();
         assert!(!zone_path.exists());
+    }
+
+    #[test]
+    fn test_epoch_tombstone_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let mut p = ZonePersistence::create(tmp.path(), "z1").unwrap();
+        p.commit();
+        p.write_creation_epoch(1_700_000_000_000).unwrap();
+        assert_eq!(
+            ZonePersistence::read_creation_epoch(tmp.path(), "z1"),
+            Some(1_700_000_000_000)
+        );
+        let rec = DeletionRecord {
+            version: 1,
+            zone_id: "z1".into(),
+            deletion_epoch: 1_700_000_000_001,
+            deleted_at_ms: 1_700_000_000_001,
+            initiated_by_node: 7,
+        };
+        p.write_tombstone_with_epoch(&rec).unwrap();
+        // The tombstone's payload is offline audit data (boot keys off the
+        // file's existence), so the roundtrip check reads the bytes back
+        // directly and decodes them.
+        let on_disk = std::fs::read(tmp.path().join("z1").join(TOMBSTONE_NAME)).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<DeletionRecord>(&on_disk).unwrap(),
+            rec
+        );
+    }
+
+    #[test]
+    fn test_missing_epoch_reads_none() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(ZonePersistence::read_creation_epoch(tmp.path(), "z1"), None);
     }
 
     #[test]

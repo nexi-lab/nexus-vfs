@@ -81,3 +81,64 @@ async fn follower_put_and_revoke_return_after_local_apply() {
     .unwrap();
     assert_eq!(observed, None);
 }
+
+/// A replica that LOSES a `put_if_absent` CAS race must see the winner's
+/// record when it reads back immediately: the losing branch barriers
+/// before returning `Ok(false)`, so the caller that reads the record back
+/// right away (the journal's `begin` does) sees the winner instead of a
+/// stale miss. Built on a same-replica double insert — the deterministic
+/// shape of "lost the CAS, now read back" (a forwarded follower CAS does
+/// not currently surface the leader's refusal as `Ok(false)`, which is a
+/// transport-semantic gap outside this test's scope).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cas_loss_reads_back_the_winners_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let addr = common::node_bind_addr();
+    let zm = ZoneManager::with_node_id(
+        "cas-visibility-test",
+        1,
+        dir.path().to_str().unwrap(),
+        vec![],
+        &addr,
+        None,
+        Some(format!("http://{addr}")),
+        None,
+    )
+    .unwrap();
+    let zone = zm
+        .create_zone("sharedzone", vec![format!("1@{addr}")])
+        .unwrap();
+    for _ in 0..100 {
+        if zone.is_leader() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(zone.is_leader(), "solo node must self-elect");
+
+    let store = ControlStateStore::new(
+        zone.consensus_node(),
+        zone.runtime_handle(),
+        "cas-visibility-test",
+    );
+
+    tokio::task::spawn_blocking(move || {
+        let winner = b"winner".to_vec();
+        let loser = b"loser".to_vec();
+        assert!(
+            store.put_if_absent("cas-key", &winner).unwrap(),
+            "the first insert wins"
+        );
+        assert!(
+            !store.put_if_absent("cas-key", &loser).unwrap(),
+            "the second insert loses the CAS"
+        );
+        let observed = store.get("cas-key").unwrap().expect(
+            "the losing branch must barrier: the winner's record is committed, so a \
+             read-back miss here would be a stale-apply artifact",
+        );
+        assert_eq!(observed, winner);
+    })
+    .await
+    .unwrap();
+}

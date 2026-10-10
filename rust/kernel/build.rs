@@ -1,5 +1,6 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=../../proto/nexus/grpc/vfs/vfs.proto");
+    println!("cargo:rerun-if-changed=../../proto/nexus/grpc/vfs/zone_runtime.proto");
 
     // Point tonic_prost_build (via prost-build) at the vendored protoc binary so the
     // crate builds without a system-wide protobuf-compiler. Respect an
@@ -11,11 +12,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Compile vfs.proto for both client (inter-node ReadBlob, REMOTE profile)
     // and server (Rust-native VfsGrpcServer that owns :2028; replaces the
     // Python `grpc.aio.server` for the typed Read/Write/Delete/Ping path).
+    //
+    // zone_runtime.proto (typed Zone create/join/status/mount/... surface)
+    // shares the `nexus.grpc.vfs` package, so it MUST ride the SAME
+    // compile_protos call: prost-build emits one file per package, so a
+    // second call would overwrite the first's generated code.
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
-        .compile_protos(&["../../proto/nexus/grpc/vfs/vfs.proto"], &["../../proto"])?;
+        .compile_protos(
+            &[
+                "../../proto/nexus/grpc/vfs/vfs.proto",
+                "../../proto/nexus/grpc/vfs/zone_runtime.proto",
+            ],
+            &["../../proto"],
+        )?;
 
     println!("cargo:rerun-if-changed=../../proto/nexus/grpc/vfs/vfs.proto");
+    println!("cargo:rerun-if-changed=../../proto/nexus/grpc/vfs/zone_runtime.proto");
     Ok(())
 }

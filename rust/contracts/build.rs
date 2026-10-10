@@ -13,6 +13,7 @@ fn main() {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     generate_zone_id(&out_dir);
     generate_zone_path(&out_dir);
+    generate_zone_wire_path(&out_dir);
 }
 
 fn contract_path(relative: &str) -> PathBuf {
@@ -654,4 +655,68 @@ fn generate_zone_path(out_dir: &Path) {
     );
     std::fs::write(out_dir.join("zone_path_meta_schema.json"), meta_schema_json)
         .expect("failed to write generated zone-path meta-schema");
+}
+
+/// Generates the zone-runtime API admission rules from
+/// `contracts/zone-wire-path/spec.json`.
+///
+/// Distinct from [`generate_zone_path`]: that one emits the strict portable
+/// ZonePath subset, while this one emits the wire-path admission bounds
+/// (component charset/depth/length, reserved prefixes) enforced at the typed
+/// ZoneRuntime surface. Constants keep the `ZONE_PATH_` spelling because they
+/// are consumed only inside `zone_wire_path.rs`, whose include is a separate
+/// file from the portable primitive's.
+fn generate_zone_wire_path(out_dir: &Path) {
+    let spec_path = contract_path("contracts/zone-wire-path/spec.json");
+    println!("cargo:rerun-if-changed={}", spec_path.display());
+
+    let spec = read_json(&spec_path, "contracts/zone-wire-path/spec.json");
+    let root = text(&spec, "/root", "zone-wire-path spec");
+    let must_start_with = text(&spec, "/must_start_with", "zone-wire-path spec");
+    let charset = text(&spec, "/component/allowed", "zone-wire-path spec");
+    let component_max = spec
+        .pointer("/component/max_length")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("zone-wire-path spec must contain /component/max_length"));
+    let forbidden = strings(&spec, "/component/forbidden", "zone-wire-path spec");
+    let depth_max = spec
+        .pointer("/depth/max")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("zone-wire-path spec must contain /depth/max"));
+    let length_max = spec
+        .pointer("/length/max")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("zone-wire-path spec must contain /length/max"));
+    let empty_components = boolean(&spec, "/empty_components", "zone-wire-path spec");
+    let trailing_slash = boolean(&spec, "/trailing_slash", "zone-wire-path spec");
+    let reserved = strings(&spec, "/reserved_prefix_constants", "zone-wire-path spec");
+
+    let forbidden_values = forbidden
+        .iter()
+        .map(|value| format!("    {value:?},"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let reserved_refs = reserved
+        .iter()
+        .map(|name| format!("    crate::constants::{name},"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let generated = format!(
+        "// @generated from contracts/zone-wire-path/spec.json — do not edit.\n\
+         // Regenerated on every build; this file lives in OUT_DIR, not the tree.\n\
+         pub const ZONE_PATH_ROOT: &str = {root:?};\n\
+         pub const ZONE_PATH_START: &str = {must_start_with:?};\n\
+         pub const ZONE_PATH_COMPONENT_CHARSET: &str = {charset:?};\n\
+         pub const ZONE_PATH_COMPONENT_MAX_LEN: usize = {component_max};\n\
+         pub const ZONE_PATH_FORBIDDEN_COMPONENTS: &[&str] = &[\n{forbidden_values}\n];\n\
+         pub const ZONE_PATH_MAX_DEPTH: usize = {depth_max};\n\
+         pub const ZONE_PATH_MAX_LEN: usize = {length_max};\n\
+         pub const ZONE_PATH_ALLOW_EMPTY_COMPONENTS: bool = {empty_components};\n\
+         pub const ZONE_PATH_ALLOW_TRAILING_SLASH: bool = {trailing_slash};\n\
+         pub const ZONE_PATH_RESERVED_PREFIXES: &[&str] = &[\n{reserved_refs}\n];\n"
+    );
+
+    std::fs::write(out_dir.join("zone_wire_path_rules.rs"), generated)
+        .expect("failed to write generated zone-wire-path rules");
 }

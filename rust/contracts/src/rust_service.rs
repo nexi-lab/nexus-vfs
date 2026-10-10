@@ -25,6 +25,8 @@ pub enum RustCallError {
     InvalidArgument(String),
     /// Service-internal failure (state corruption, downstream IO error).
     Internal(String),
+    /// The authenticated caller is not authorized for this operation.
+    PermissionDenied(String),
 }
 
 impl fmt::Display for RustCallError {
@@ -33,6 +35,7 @@ impl fmt::Display for RustCallError {
             Self::NotFound => write!(f, "method not found"),
             Self::InvalidArgument(m) => write!(f, "invalid argument: {m}"),
             Self::Internal(m) => write!(f, "internal: {m}"),
+            Self::PermissionDenied(m) => write!(f, "permission denied: {m}"),
         }
     }
 }
@@ -95,6 +98,20 @@ pub trait RustService: Send + Sync {
         _ctx: &OperationContext,
     ) -> Result<Vec<u8>, RustCallError> {
         Err(RustCallError::NotFound)
+    }
+
+    /// Dispatch a JSON-encoded RPC with the authenticated caller context.
+    ///
+    /// Existing in-process services keep their v1 behavior through this adapter;
+    /// external entry points call this method so context-aware implementations
+    /// can make authorization decisions without trusting their payload.
+    fn dispatch_with_context(
+        &self,
+        ctx: &OperationContext,
+        method: &str,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, RustCallError> {
+        self.dispatch(method, payload, ctx)
     }
 
     /// Declared RPC method names this service exports. Used by

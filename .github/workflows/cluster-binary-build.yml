@@ -41,32 +41,40 @@ jobs:
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
-            max_size_bytes: 19398656  # 18.5 MiB. Measured 18,866,640 on 1.99.0;
-                                      # 532,016 bytes (2.8%) of headroom.
+            max_size_bytes: 20447232  # 19.5 MiB — the 1.99.0 toolchain baseline
+                                      # (#390 measured 18,866,640 on main) plus the
+                                      # typed ZoneRuntime plane (#364) and the
+                                      # declared mount subtree (#361) stacked on top
+                                      # (~0.75 MiB combined on the older toolchain);
+                                      # generous until re-measured on the merge.
           - os: macos-14
             artifact_name: nexusd-cluster-macos-arm64
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
-            max_size_bytes: 16777216  # 16 MiB. Measured 16,216,880 on 1.99.0;
-                                      # 560,336 bytes (3.5%) of headroom.
+            max_size_bytes: 17301504  # 16.5 MiB — the 1.99.0 toolchain baseline
+                                      # (#390 measured 16,216,880 on main) plus the
+                                      # #364/#361 stack (~0.25 MiB on the older
+                                      # toolchain); generous until re-measured.
           - os: macos-14
             artifact_name: nexusd-cluster-macos-x86_64
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
             target: x86_64-apple-darwin
-            max_size_bytes: 17825792  # 17 MiB. Measured 17,344,272 on 1.99.0;
-                                      # 481,520 bytes (2.8%) of headroom.
+            max_size_bytes: 18350080  # 17.5 MiB — the 1.99.0 toolchain baseline
+                                      # (#390 measured 17,344,272 on main) plus the
+                                      # #364/#361 stack (~0.5 MiB on the older
+                                      # toolchain); generous until re-measured.
           - os: windows-latest
             artifact_name: nexusd-cluster-windows-x86_64
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster.exe
-            max_size_bytes: 18612224  # 17.75 MiB. Measured 18,056,192 on 1.99.0;
-                                      # 556,032 bytes (3.1%) of headroom. The
-                                      # largest compiler-attributable jump of the
-                                      # four, +1,017 KB over its 1.98.1 number.
+            max_size_bytes: 19398656  # 18.5 MiB — the 1.99.0 toolchain baseline
+                                      # (#390 measured 18,056,192 on main) plus the
+                                      # #364/#361 stack (~0.5 MiB on the older
+                                      # toolchain); generous until re-measured.
 
 
     steps:

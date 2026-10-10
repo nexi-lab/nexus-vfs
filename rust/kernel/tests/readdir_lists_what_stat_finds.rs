@@ -36,10 +36,11 @@ fn boot() -> (Kernel, OperationContext) {
 
 /// Plant a directory the way a service announces presence: `sys_setattr(DT_DIR)`,
 /// no content.
-fn mkdir(k: &Kernel, path: &str) {
+fn mkdir(k: &Kernel, ctx: &OperationContext, path: &str) {
     KernelSyscall::sys_setattr(
         k,
         path,
+        ctx,
         i32::from(DT_DIR),
         "",
         None,
@@ -134,8 +135,8 @@ fn an_agent_announced_after_a_peer_wrote_into_its_subtree_is_discoverable() {
     // caller-side fix (dropping the "already a directory" skip so it re-plants)
     // could not work, and why this has to be the listing's problem: a re-`setattr`
     // on an entry that exists changes nothing.
-    mkdir(&k, "/agents/bot");
-    mkdir(&k, "/agents/bot/conversations");
+    mkdir(&k, &ctx, "/agents/bot");
+    mkdir(&k, &ctx, "/agents/bot/conversations");
 
     // 3: discovery — the question `agent_list` answers.
     let listed = names(&k, "/agents");
@@ -212,10 +213,10 @@ fn a_stored_entry_keeps_its_own_type_against_a_deeper_row() {
 
 #[test]
 fn deriving_parents_invents_nothing() {
-    let (k, _ctx) = boot();
+    let (k, ctx) = boot();
     // An empty directory still lists empty: membership is derived from rows that
     // exist, so a directory with nothing beneath it has no children to imply.
-    mkdir(&k, "/empty");
+    mkdir(&k, &ctx, "/empty");
     assert!(
         names(&k, "/empty").is_empty(),
         "an empty directory lists nothing"

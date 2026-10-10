@@ -90,6 +90,7 @@ fn non_root_mount_entry_row_survives_kernel_restart() {
         let sub_backend = Arc::new(MemBackend::default());
         k.sys_setattr(
             "/sub",
+            &OperationContext::new("test", "root", true, None, true),
             2, // DT_MOUNT
             "mem-sub",
             Some(sub_backend as Arc<dyn ObjectStore>),
@@ -154,6 +155,7 @@ fn remount_persists_dt_mount_row_into_parent_store_not_child() {
         let mount_sub = |per_mount: Arc<dyn MetaStore>| {
             k.sys_setattr(
                 "/sub",
+                &OperationContext::new("test", "root", true, None, true),
                 2, // DT_MOUNT
                 "mem-sub",
                 Some(Arc::new(MemBackend::default()) as Arc<dyn ObjectStore>),
@@ -219,6 +221,7 @@ fn cross_zone_mount_without_replicated_parent_store_uses_durable_global_fallback
         let backend = Arc::new(MemBackend::default());
         k.sys_setattr(
             "/corp",
+            &OperationContext::new("test", "root", true, None, true),
             2, // DT_MOUNT
             "mem-corp",
             Some(backend as Arc<dyn ObjectStore>),
@@ -266,6 +269,7 @@ fn cross_zone_unmount_removes_durable_row_and_live_route() {
     let (k, ctx) = boot(Some(&ms));
     k.sys_setattr(
         "/corp",
+        &OperationContext::new("test", "root", true, None, true),
         2, // DT_MOUNT
         "mem-corp",
         Some(Arc::new(MemBackend::default()) as Arc<dyn ObjectStore>),
@@ -324,6 +328,7 @@ fn orphan_mount_row_unlinks_after_restart_without_live_route() {
         let (k, _ctx) = boot(Some(&ms));
         k.sys_setattr(
             "/corp",
+            &OperationContext::new("test", "root", true, None, true),
             2, // DT_MOUNT
             "mem-corp",
             Some(Arc::new(MemBackend::default()) as Arc<dyn ObjectStore>),
@@ -407,6 +412,7 @@ fn unmount_keeps_route_when_durable_row_delete_fails() {
     let mount = |path: &str, zone: &str, per_mount: Option<Arc<dyn MetaStore>>| {
         k.sys_setattr(
             path,
+            &OperationContext::new("test", "root", true, None, true),
             2, // DT_MOUNT
             "mem",
             Some(Arc::new(MemBackend::default()) as Arc<dyn ObjectStore>),
@@ -514,6 +520,7 @@ fn cross_zone_mount_persists_row_into_parent_per_mount_store() {
         Arc::new(LocalMetaStore::open(&root_ms_path).expect("open root per-mount store"));
     k.sys_setattr(
         "/",
+        &OperationContext::new("test", "root", true, None, true),
         2, // DT_MOUNT
         "mem",
         Some(Arc::new(MemBackend::default()) as Arc<dyn ObjectStore>),
@@ -539,6 +546,7 @@ fn cross_zone_mount_persists_row_into_parent_per_mount_store() {
 
     k.sys_setattr(
         "/corp",
+        &OperationContext::new("test", "root", true, None, true),
         2, // DT_MOUNT
         "mem-corp",
         Some(Arc::new(MemBackend::default()) as Arc<dyn ObjectStore>),
@@ -592,6 +600,7 @@ fn non_root_mount_without_parent_route_fails_closed() {
     let vault_backend = Arc::new(MemBackend::default());
     k.sys_setattr(
         "/vault",
+        &OperationContext::new("test", "root", true, None, true),
         2, // DT_MOUNT
         "mem-vault",
         Some(vault_backend as Arc<dyn ObjectStore>),
@@ -617,6 +626,7 @@ fn non_root_mount_without_parent_route_fails_closed() {
     let backend = Arc::new(MemBackend::default());
     let mounted = k.sys_setattr(
         "/orphan",
+        &OperationContext::new("test", "root", true, None, true),
         2, // DT_MOUNT
         "mem",
         Some(backend as Arc<dyn ObjectStore>),
@@ -656,6 +666,7 @@ fn first_mount_bootstrap_of_non_root_subtree_is_allowed() {
     let backend = Arc::new(MemBackend::default());
     k.sys_setattr(
         "/vault",
+        &OperationContext::new("test", "root", true, None, true),
         2, // DT_MOUNT
         "mem-vault",
         Some(backend as Arc<dyn ObjectStore>),

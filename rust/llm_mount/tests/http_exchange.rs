@@ -45,10 +45,11 @@ fn mount(provider: &str, url: &str) -> (Arc<Kernel>, tempfile::TempDir) {
             runtime: kernel.runtime(),
         })
         .unwrap();
+    let mount_ctx = contracts::OperationContext::new("llm-mount-test", "root", true, None, true);
     kernel
         .mount(
             "/model",
-            MountOptions::new("model").with_backend(built.backend.unwrap()),
+            MountOptions::new(&mount_ctx, "model").with_backend(built.backend.unwrap()),
         )
         .unwrap();
     (kernel, dir)
