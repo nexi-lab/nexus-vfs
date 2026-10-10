@@ -56,14 +56,10 @@ fn clone_read_result(
     match shared {
         Err(e) => Err(e.clone()),
         Ok(src) => {
-            let data = src.data.as_ref().map(|bytes| {
-                let off = (req.offset as usize).min(bytes.len());
-                let end = match req.len {
-                    Some(l) => off.saturating_add(l as usize).min(bytes.len()),
-                    None => bytes.len(),
-                };
-                bytes[off..end].to_vec()
-            });
+            let data = src
+                .data
+                .as_ref()
+                .map(|bytes| read_window(bytes, req).to_vec());
             // Per-consumer metadata when available; fall back to lead's
             // values only when the consumer's metadata is missing (cold
             // PAS-mount path read).
@@ -91,18 +87,29 @@ fn clone_read_result(
     }
 }
 
+fn read_window<'a>(bytes: &'a [u8], req: &crate::kernel::ReadRequest) -> &'a [u8] {
+    let off = usize::try_from(req.offset)
+        .unwrap_or(usize::MAX)
+        .min(bytes.len());
+    let end = match req.len {
+        Some(len) => off
+            .saturating_add(usize::try_from(len).unwrap_or(usize::MAX))
+            .min(bytes.len()),
+        None => bytes.len(),
+    };
+    &bytes[off..end]
+}
+
 fn slice_read_result(
     r: Result<SysReadResult, KernelError>,
     req: &crate::kernel::ReadRequest,
 ) -> Result<SysReadResult, KernelError> {
     let mut r = r?;
+    if req.offset == 0 && req.len.is_none() {
+        return Ok(r);
+    }
     if let Some(bytes) = r.data.as_ref() {
-        let off = (req.offset as usize).min(bytes.len());
-        let end = match req.len {
-            Some(l) => off.saturating_add(l as usize).min(bytes.len()),
-            None => bytes.len(),
-        };
-        r.data = Some(bytes[off..end].to_vec());
+        r.data = Some(read_window(bytes, req).to_vec());
     }
     Ok(r)
 }
@@ -123,7 +130,16 @@ impl Kernel {
         }
         if reqs.len() == 1 {
             let req = &reqs[0];
-            return vec![self.sys_read_single(&req.path, ctx, 1, req.timeout_ms, req.offset)];
+            let result = self
+                .sys_read_single(&req.path, ctx, 1, req.timeout_ms, req.offset)
+                .and_then(|result| {
+                    if matches!(result.entry_type, DT_PIPE | DT_STREAM) {
+                        Ok(result)
+                    } else {
+                        slice_read_result(Ok(result), req)
+                    }
+                });
+            return vec![result];
         }
         self.sys_read_batch_impl(reqs, ctx)
     }
@@ -4581,6 +4597,41 @@ mod read_batch_tests {
         assert_eq!(out[1].as_ref().unwrap().data.as_deref().unwrap(), b"3456");
         assert_eq!(out[2].as_ref().unwrap().data.as_deref().unwrap(), b"");
         assert_eq!(out[3].as_ref().unwrap().data.as_deref().unwrap(), b"89");
+    }
+
+    #[test]
+    fn read_single_and_batch_ranges_have_identical_results() {
+        let k = kernel_with_backend();
+        let c = ctx();
+        let payload = "héllo needle".as_bytes();
+        k.sys_write_with_link_depth("/range.txt", &c, payload, 0, 1)
+            .unwrap();
+        for (offset, len, expected) in [
+            (0, None, payload),
+            (1, Some(3), &payload[1..4]),
+            (1, None, &payload[1..]),
+            (0, Some(0), &payload[0..0]),
+            (payload.len() as u64, None, &payload[0..0]),
+            (u64::MAX, None, &payload[0..0]),
+            (2, Some(u64::MAX), &payload[2..]),
+        ] {
+            let single = k.sys_read(&[rreq("/range.txt", offset, len)], &c);
+            let batch = k.sys_read(
+                &[rreq("/range.txt", offset, len), rreq("/range.txt", 0, None)],
+                &c,
+            );
+            let single = single[0].as_ref().unwrap();
+            let batch = batch[0].as_ref().unwrap();
+            assert_eq!(
+                single.data.as_deref().unwrap(),
+                expected,
+                "offset={offset}, len={len:?}"
+            );
+            assert_eq!(batch.data.as_deref().unwrap(), expected);
+            assert_eq!(single.content_id, batch.content_id);
+            assert_eq!(single.gen, batch.gen);
+            assert_eq!(single.entry_type, batch.entry_type);
+        }
     }
 
     #[test]
