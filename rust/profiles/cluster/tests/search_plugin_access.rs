@@ -204,7 +204,7 @@ async fn credentials_and_live_permissions_survive_signed_plugin_and_cached_searc
     assert_eq!(indexed.indexed_count, 3);
     assert_eq!(
         paths(client.query(query(&admin.key)).await.unwrap().into_inner()),
-        ["/__sys__/auth/keys", "/docs/private.md", "/docs/public.md"]
+        ["/docs/private.md", "/docs/public.md"]
     );
 
     for token in ["", "sk-this-unknown-key-is-long-enough-to-parse"] {
@@ -629,6 +629,36 @@ async fn credentials_and_live_permissions_survive_signed_plugin_and_cached_searc
         paths(client.query(query(&alice.key)).await.unwrap().into_inner()),
         ["/docs/public.md"]
     );
+    // Keep the grant and warm index unchanged. Removing the backend's file
+    // must hide its cached snippets from both Query and BatchQuery.
+    std::fs::remove_file(docs.join("private.md")).unwrap();
+    assert!(paths(client.query(query(&bob.key)).await.unwrap().into_inner()).is_empty());
+    let batch = client
+        .batch_query(BatchQueryRequest {
+            queries: vec![query(""), query("")],
+            auth_token: bob.key.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(batch
+        .responses
+        .into_iter()
+        .all(|response| paths(response).is_empty()));
+    assert_eq!(
+        paths(client.query(query(&admin.key)).await.unwrap().into_inner()),
+        ["/docs/public.md"]
+    );
+    let located = client
+        .locate(LocateRequest {
+            path: "/docs/private.md".into(),
+            zone_id: ZONE.into(),
+            auth_token: bob.key.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!located.indexed && located.chunk_count == 0 && located.mtime_ms.is_none());
     keys.delete(&alice.key_hash).unwrap();
     auth.invalidate(&alice.key_hash);
     assert_eq!(

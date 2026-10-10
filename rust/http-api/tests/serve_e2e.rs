@@ -118,6 +118,7 @@ async fn service_decl_install_body_runs_under_a_tokio_runtime() {
         // Revision fence kernel — /v2/status never fences, so
         // ZeroGenKernel (always reports gen 0) is fine.
         std::sync::Arc::new(nexus_http_api::middleware::revision::ZeroGenKernel),
+        std::sync::Arc::new(kernel::vfs_router::VFSRouter::new()),
         // The `--features rebac` build widens `install_impl` with a
         // tuple-store arg — use the same in-memory default the
         // `AppState::for_tests` helper wires (this test never hits
@@ -165,6 +166,7 @@ async fn service_decl_install_body_returns_err_on_bind_failure() {
         // No api_key_secret needed — this test only hits /v2/status.
         None,
         std::sync::Arc::new(nexus_http_api::middleware::revision::ZeroGenKernel),
+        std::sync::Arc::new(kernel::vfs_router::VFSRouter::new()),
         #[cfg(feature = "rebac")]
         std::sync::Arc::new(nexus_rebac::InMemoryReBACTupleStore::new()),
         transport::grpc::DataPlaneReady::open(),
@@ -182,6 +184,7 @@ async fn service_decl_install_body_returns_err_on_bind_failure() {
         // No api_key_secret needed — this test only hits /v2/status.
         None,
         std::sync::Arc::new(nexus_http_api::middleware::revision::ZeroGenKernel),
+        std::sync::Arc::new(kernel::vfs_router::VFSRouter::new()),
         #[cfg(feature = "rebac")]
         std::sync::Arc::new(nexus_rebac::InMemoryReBACTupleStore::new()),
         transport::grpc::DataPlaneReady::open(),

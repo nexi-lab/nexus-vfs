@@ -4,7 +4,8 @@
 //! readable zones and the kernel's installed permission policy. Index management
 //! and aggregate diagnostics require an administrator or a cluster node because
 //! those operations act on the shared index. Every returned path is checked after
-//! plugin execution, including cached and expanded results. Filtering may leave
+//! plugin execution, including cached and expanded results. Indexed hits are
+//! also checked against the live VFS namespace. Filtering may leave
 //! fewer results than the requested limit.
 
 use std::collections::{HashMap, HashSet};
@@ -64,13 +65,7 @@ impl SearchGrpcPolicy {
     }
 
     fn path_view(&self, ctx: OperationContext, path: &str) -> Result<ReadView, Status> {
-        validate_path_fast(path).map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let route = self.kernel.vfs_router_arc().route(path, &ctx.zone_id);
-        let zone = route
-            .as_ref()
-            .map(|route| route.zone_id.as_str())
-            .unwrap_or(ctx.zone_id.as_str())
-            .to_owned();
+        let zone = search_zone_for_path(&self.kernel.vfs_router_arc(), &ctx, path)?;
         self.view(ctx, &zone)
     }
 
@@ -253,6 +248,23 @@ impl PluginGrpcPolicy for SearchGrpcPolicy {
     }
 }
 
+/// Resolve the zone owning a discovery root in the canonical VFS namespace.
+/// HTTP fences and the gRPC policy must use the same mount decision.
+pub fn search_zone_for_path(
+    router: &kernel::vfs_router::VFSRouter,
+    ctx: &OperationContext,
+    path: &str,
+) -> Result<String, Status> {
+    let path = if path.is_empty() { "/" } else { path };
+    validate_path_fast(path).map_err(|error| Status::invalid_argument(error.to_string()))?;
+    Ok(router
+        .route(path, &ctx.zone_id)
+        .as_ref()
+        .map(|route| route.zone_id.as_str())
+        .unwrap_or(&ctx.zone_id)
+        .to_owned())
+}
+
 fn privileged(ctx: &OperationContext) -> bool {
     ctx.is_admin || ctx.is_system
 }
@@ -386,7 +398,12 @@ impl ReadView {
         }
     }
 
-    fn filter<T>(&self, values: &mut Vec<T>, path: impl Fn(&T) -> &str) -> Result<(), Status> {
+    fn filter<T>(
+        &self,
+        values: &mut Vec<T>,
+        path: impl Fn(&T) -> &str,
+        require_existing: bool,
+    ) -> Result<(), Status> {
         let mut decisions = HashMap::<String, bool>::new();
         let mut kept = Vec::with_capacity(values.len());
         for value in std::mem::take(values) {
@@ -394,7 +411,10 @@ impl ReadView {
             let allowed = if let Some(allowed) = decisions.get(path) {
                 *allowed
             } else {
-                let allowed = self.allows(path)?;
+                // An index entry is a candidate, not a namespace fact. Check
+                // the live VFS once per path, including on warm cache hits.
+                let allowed = self.allows(path)?
+                    && (!require_existing || self.kernel.sys_stat(path, &self.zone).is_some());
                 decisions.insert(path.to_owned(), allowed);
                 allowed
             };
@@ -410,7 +430,7 @@ impl ReadView {
         response
             .results
             .retain(|hit| hit.zone_id.is_empty() || hit.zone_id == self.zone);
-        self.filter(&mut response.results, |hit| &hit.path)?;
+        self.filter(&mut response.results, |hit| &hit.path, true)?;
         self.redact_error(&mut response.error);
         Ok(())
     }
@@ -462,7 +482,7 @@ impl AuthorizedPluginCall for SearchResponse {
             } => {
                 let mut response = decode_response::<GlobResponse>(&payload)?;
                 require_discovery_filters(expected_filters, response.applied_filters)?;
-                view.filter(&mut response.paths, |path| path)?;
+                view.filter(&mut response.paths, |path| path, false)?;
                 view.redact_error(&mut response.error);
                 Ok(response.encode_to_vec())
             }
@@ -472,13 +492,20 @@ impl AuthorizedPluginCall for SearchResponse {
             } => {
                 let mut response = decode_response::<GrepResponse>(&payload)?;
                 require_discovery_filters(expected_filters, response.applied_filters)?;
-                view.filter(&mut response.matches, |hit| &hit.path)?;
+                view.filter(&mut response.matches, |hit| &hit.path, false)?;
                 view.redact_error(&mut response.error);
                 Ok(response.encode_to_vec())
             }
             Self::Locate(view, path) => {
                 if !view.allows(&path)? {
                     return Err(Status::permission_denied("search path is not readable"));
+                }
+                if view.kernel.sys_stat(&path, &view.zone).is_none() {
+                    return Ok(LocateResponse {
+                        zone_id: view.zone,
+                        ..Default::default()
+                    }
+                    .encode_to_vec());
                 }
                 Ok(payload)
             }
