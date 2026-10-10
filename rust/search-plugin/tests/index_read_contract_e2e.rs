@@ -133,6 +133,9 @@ async fn every_indexed_rpc_rejects_unsafe_zone_before_creating_state() {
         "..",
         "/tmp/escape",
         "C:escape",
+        ".. ",
+        "zone.",
+        "zone ",
         "a\0b",
     ] {
         rejects!(svc.query(Request::new(query(zone, QueryType::Keyword))));

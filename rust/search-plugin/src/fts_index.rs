@@ -929,7 +929,7 @@ impl FtsIndex {
 
 #[derive(Debug, thiserror::Error)]
 pub enum IndexError {
-    #[error("index zone must be a single portable directory component: {0:?}")]
+    #[error("index zone must be an unambiguous directory component: {0:?}")]
     InvalidZone(String),
     #[error("create index dir {0}: {1}")]
     CreateDir(String, String),

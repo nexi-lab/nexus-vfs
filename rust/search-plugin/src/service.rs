@@ -3682,7 +3682,7 @@ impl SearchService for SearchServiceImpl {
                 error: Some("q must not be empty".into()),
             }));
         }
-        checked_index_zone(&req.zone_id)?;
+        let zone_id = checked_index_zone(&req.zone_id)?.to_owned();
         if !skip_outer_middleware {
             // Peer fan-out runs FIRST (outer-most wrapper).  Only
             // fires when the zone is in the
@@ -3713,7 +3713,7 @@ impl SearchService for SearchServiceImpl {
         // the same resolved value or invalidation misses a call
         // that inserted under the empty string.
         let mut req_for_cache = req.clone();
-        req_for_cache.zone_id = resolve_zone(&req.zone_id).to_string();
+        req_for_cache.zone_id = zone_id.clone();
 
         // Parse borrow-only fields FIRST so later `let q = req.q`
         // moves don't leave `req` partially moved for later reads.
@@ -3793,7 +3793,6 @@ impl SearchService for SearchServiceImpl {
         } else {
             limit
         };
-        let zone_id = checked_index_zone(&req.zone_id)?.to_string();
         // Now safe to move fields out.
         let q = req.q;
         // `path_filter` OR any `path_filters`: one fused ranking over

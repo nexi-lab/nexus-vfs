@@ -23,10 +23,12 @@ use crate::ann_index::{AnnError, AnnIndex};
 use crate::fts_index::{FtsIndex, IndexError, WriterStatus};
 
 /// Logical zone identities must stay inside one index directory. This checks
-/// storage representation, preserving existing zone names and kernel admission.
+/// storage representation without changing kernel zone admission.
 pub fn validate_index_zone(zone: &str) -> Result<(), IndexError> {
     let mut components = Path::new(zone).components();
     if zone.contains(['/', '\\', ':', '\0'])
+        // Windows normalizes these suffixes before filesystem lookup.
+        || zone.ends_with(['.', ' '])
         || !matches!(components.next(), Some(Component::Normal(name)) if name == zone)
         || components.next().is_some()
     {
@@ -595,6 +597,9 @@ mod tests {
             "a\\b",
             "/tmp/outside",
             "C:outside",
+            ".. ",
+            "zone.",
+            "zone ",
             "a\0b",
         ] {
             assert!(validate_index_zone(zone).is_err(), "{zone:?}");
