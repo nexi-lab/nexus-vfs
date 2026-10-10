@@ -291,7 +291,8 @@ fn replicated_stream_append_wakes_a_reader_under_a_different_mount() {
         Arc::downgrade(&reader),
         "messages",
     );
-    let writer_ctx = kernel::kernel::OperationContext::new("alice", "root", true, Some("alice"), true);
+    let writer_ctx =
+        kernel::kernel::OperationContext::new("alice", "root", true, Some("alice"), true);
     a2a::ensure_mailbox_stream(writer.as_ref(), &writer_ctx, original).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     while reader.sys_stat(alias, "root").is_none() {
