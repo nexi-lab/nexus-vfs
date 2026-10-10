@@ -328,6 +328,66 @@ async fn a_front_door_agent_mints_a_session_identity_for_a_person_and_can_revoke
         "a caller with no owner SAN is unchanged; got {moss_recorded}"
     );
 
+    let bob_identity = call_mint_session_agent_rpc(&rpc, "bob", SESSION_SECS, moss_tls(), 10)
+        .await
+        .expect("mint reaches the daemon");
+    assert!(
+        bob_identity.success,
+        "bob mint failed: {:?}",
+        bob_identity.error
+    );
+    let mut bob = Vfs::connect_mtls(
+        fport,
+        &ca,
+        &bob_identity.agent_cert_pem,
+        &bob_identity.agent_key_pem,
+        BUDGET,
+    )
+    .await;
+    let control_payload = format!(r#"{{"session_id":"{session_id}","mode":"session"}}"#);
+    for method in ["managed_agent.get_session_v1", "managed_agent.cancel_v1"] {
+        let error = bob
+            .call(method, &control_payload, "")
+            .await
+            .expect_err("another owner's credential cannot read or cancel alice's session");
+        assert!(
+            error.contains("owner"),
+            "owner boundary must reach the wire: {error}"
+        );
+        session
+            .call("managed_agent.get_session_v1", &control_payload, "")
+            .await
+            .expect("a refused cancellation must leave the owner's session intact");
+    }
+    let renewed_identity = call_mint_session_agent_rpc(&rpc, "alice", SESSION_SECS, moss_tls(), 10)
+        .await
+        .expect("mint reaches the daemon");
+    assert!(
+        renewed_identity.success,
+        "alice mint failed: {:?}",
+        renewed_identity.error
+    );
+    let mut renewed = Vfs::connect_mtls(
+        fport,
+        &ca,
+        &renewed_identity.agent_cert_pem,
+        &renewed_identity.agent_key_pem,
+        BUDGET,
+    )
+    .await;
+    renewed
+        .call("managed_agent.get_session_v1", &control_payload, "")
+        .await
+        .expect("a renewed owner credential can read the same session");
+    renewed
+        .call("managed_agent.cancel_v1", &control_payload, "")
+        .await
+        .expect("the owner can cancel its session");
+    assert!(session
+        .call("managed_agent.get_session_v1", &control_payload, "")
+        .await
+        .is_err());
+
     // ── 9. REVOKE by handing back the certificate ───────────────────────────
     call_revoke_agent_cert_rpc(&rpc, &minted.agent_cert_pem, moss_tls(), 10)
         .await
