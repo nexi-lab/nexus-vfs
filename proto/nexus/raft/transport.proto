@@ -139,6 +139,21 @@ service ZoneApiService {
   // not make the cluster an independent authority on who a person is.
   rpc MintSessionAgent(MintSessionAgentRequest) returns (MintSessionAgentResponse);
 
+  // A user runtime serves mTLS using its own owner-bound agent credential.
+  // The issuer derives its DNS SAN from the owner; callers cannot choose a
+  // server name or obtain node authority. DNS SAN = "nexus-user-" plus the
+  // first 40 lowercase hex digits of SHA-256(owner UTF-8). No node URI or CA
+  // capability. Validity is at most 300 seconds.
+  // Same allow-list and revocation plane as session controllers. Renewal
+  // preserves the original signed server capability through RenewSessionAgent.
+  rpc MintUserRuntime(MintSessionAgentRequest) returns (MintSessionAgentResponse);
+
+  // Renew an existing controller without changing its signed owner or subject.
+  // Requires an allow-listed minter and proof of the current session key. An
+  // expired or revoked credential cannot be renewed. This does not let a caller
+  // choose a subject for MintSessionAgent.
+  rpc RenewSessionAgent(RenewSessionAgentRequest) returns (MintSessionAgentResponse);
+
   // RevokeAgentCert records a certificate's serial in the CA-plane CRL, so every
   // node refuses it after its next CRL refresh.
   //
@@ -424,6 +439,17 @@ message MintSessionAgentResponse {
   // The minted subject (`session-<uuid>`), so a caller can log what it holds
   // without parsing its own certificate.
   string subject_id = 6;
+}
+
+message RenewSessionAgentRequest {
+  bytes agent_cert_pem = 1;
+  uint64 validity_secs = 2;
+  uint64 issued_at_unix_ms = 3;
+  // P-256/SHA-256 ASN.1 signature by the session key. Canonical bytes:
+  // ASCII "nexus/session-renewal/v1\0", SHA-256(session certificate DER),
+  // SHA-256(requester's mTLS leaf DER), validity_secs and issued_at_unix_ms
+  // as two unsigned big-endian 64-bit integers. Valid for at most 30 seconds.
+  bytes proof = 4;
 }
 
 // AllowSessionMinterRequest permits one agent to mint session credentials.

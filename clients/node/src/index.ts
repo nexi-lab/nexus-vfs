@@ -14,6 +14,7 @@
  */
 
 import { readFileSync } from 'node:fs'
+import { createHash, createPrivateKey, sign, X509Certificate } from 'node:crypto'
 
 export { SESSION_PROTOCOL, SessionCodec, NexusSessionTransport } from './session.js'
 export type { NexusSessionEndpoint, SessionRpcMessage, NexusSessionTransportOptions } from './session.js'
@@ -122,6 +123,7 @@ interface UnaryClient {
   Unlock: GrpcMethod<UnlockRequest, UnlockResponse>
   Watch: GrpcMethod<WatchRequest, WatchResponse>
   close(): void
+  getChannel(): grpc.Channel
 }
 
 type GrpcMethod<Req, Res> = (
@@ -129,7 +131,7 @@ type GrpcMethod<Req, Res> = (
   metadata: grpc.Metadata,
   options: grpc.CallOptions,
   callback: (error: grpc.ServiceError | null, response: Res) => void,
-) => void
+) => grpc.ClientUnaryCall
 
 interface CallRequest {
   method: string
@@ -400,6 +402,8 @@ interface Dialled {
   target: string
   credentials: grpc.ChannelCredentials
   channelOptions: grpc.ChannelOptions
+  clientCertPem?: Buffer
+  caPem?: Buffer
 }
 
 /**
@@ -409,13 +413,18 @@ interface Dialled {
 function dial(endpoint: string, options: NexusVfsClientOptions): Dialled {
   const channelOptions: grpc.ChannelOptions = {}
   let credentials = grpc.credentials.createInsecure()
+  let clientCertPem: Buffer | undefined
+  let caPem: Buffer | undefined
 
   if (options.tls) {
     const serverName = options.tls.serverName ?? DEFAULT_CLUSTER_SERVER_NAME
+    caPem = resolvePem(options.tls.ca, 'CA certificate')
+    const keyPem = resolvePem(options.tls.key, 'client key')
+    clientCertPem = resolvePem(options.tls.cert, 'client certificate')
     credentials = grpc.credentials.createSsl(
-      resolvePem(options.tls.ca, 'CA certificate'),
-      resolvePem(options.tls.key, 'client key'),
-      resolvePem(options.tls.cert, 'client certificate'),
+      caPem,
+      keyPem,
+      clientCertPem,
     )
     channelOptions['grpc.ssl_target_name_override'] = serverName
     channelOptions['grpc.default_authority'] = serverName
@@ -424,7 +433,7 @@ function dial(endpoint: string, options: NexusVfsClientOptions): Dialled {
     channelOptions['grpc.max_receive_message_length'] = options.maxReceiveMessageBytes
   }
 
-  return { target: toGrpcTarget(endpoint), credentials, channelOptions }
+  return { target: toGrpcTarget(endpoint), credentials, channelOptions, clientCertPem, caPem }
 }
 
 /**
@@ -437,6 +446,7 @@ function invoke<Req, Res>(
   operation: string,
   request: Req,
   deadlineMs: number,
+  calls?: Set<grpc.ClientUnaryCall>,
 ): Promise<Res> {
   return new Promise((resolve, reject) => {
     // Queue the call while the channel connects instead of failing fast:
@@ -445,7 +455,11 @@ function invoke<Req, Res>(
     // grpc-js this is a Metadata flag, not a CallOption.
     const metadata = new grpc.Metadata({ waitForReady: true })
     const callOptions: grpc.CallOptions = { deadline: Date.now() + deadlineMs }
-    method.call(owner, request, metadata, callOptions, (error, response) => {
+    let isCompleted = false
+    let call: grpc.ClientUnaryCall | undefined
+    call = method.call(owner, request, metadata, callOptions, (error, response) => {
+      isCompleted = true
+      if (call) calls?.delete(call)
       if (error) {
         const status = String(grpc.status[error.code] ?? error.code)
         reject(new NexusRpcError(error.code, status, operation, error.details || error.message))
@@ -453,6 +467,31 @@ function invoke<Req, Res>(
       }
       resolve(response)
     })
+    if (!isCompleted) calls?.add(call)
+  })
+}
+
+/** Prepare TLS without allowing a closed channel to reconnect. */
+function waitForChannel(channel: grpc.Channel, deadline: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const check = (error?: Error) => {
+      if (error) {
+        reject(new NexusRpcError(grpc.status.DEADLINE_EXCEEDED, 'DEADLINE_EXCEEDED', 'rotate TLS', error.message))
+        return
+      }
+      try {
+        let state = channel.getConnectivityState(false)
+        if (state === grpc.connectivityState.SHUTDOWN) {
+          reject(new Error('nexus VFS channel closed during credential rotation'))
+          return
+        }
+        channel.getConnectivityState(true)
+        state = channel.getConnectivityState(false)
+        if (state === grpc.connectivityState.READY) resolve()
+        else channel.watchConnectivityState(state, deadline, check)
+      } catch (failure) { reject(failure) }
+    }
+    check()
   })
 }
 
@@ -474,7 +513,16 @@ export class NexusVfsClient {
   /** The resolved `host:port` this client dials. */
   readonly target: string
 
-  private readonly client: UnaryClient
+  private client: UnaryClient
+  private readonly options: NexusVfsClientOptions
+  private readonly channels = new Map<UnaryClient, number>()
+  private readonly calls = new Set<grpc.ClientUnaryCall>()
+  private isClosed = false
+  private isRotating = false
+  private preparingChannel?: UnaryClient
+  private stopCredentialRenewal?: () => void
+  private readonly tlsServerName?: string
+  private credentialFailure?: Error
   private readonly connectTimeoutMs: number
   private readonly blockingReadMarginMs: number
 
@@ -493,13 +541,16 @@ export class NexusVfsClient {
       options.blockingReadMarginMs ?? BLOCKING_READ_DEADLINE_MARGIN_MS
     this.target = target
     this.client = new Service(target, credentials, channelOptions) as unknown as UnaryClient
+    this.options = { ...options, tls: undefined }
+    this.tlsServerName = options.tls?.serverName
+    this.channels.set(this.client, 0)
   }
 
   /**
    * Connect with mutual TLS, required to reach an auth-on production
-   * `nexusd-cluster` (it rejects plaintext clients). Caller identity still
-   * rides the per-request auth token; the certificate authenticates the
-   * process, not the user.
+   * `nexusd-cluster` (it rejects plaintext clients). A delegated certificate
+   * carries its signed owner; send an empty auth token so a second credential
+   * cannot override it.
    */
   static withMtls(
     endpoint: string,
@@ -774,9 +825,111 @@ export class NexusVfsClient {
     return this.unary<PingRequest, PingResponse>('Ping', 'ping', { auth_token: authToken })
   }
 
-  /** Close the underlying channel. */
+  /** Keep a controller credential current for this client's lifetime. */
+  maintainSessionCredential(
+    initial: SessionCredential,
+    options: {
+      validitySecs: number
+      renew: (current: SessionCredential, signal: AbortSignal) => Promise<SessionCredential>
+    },
+  ): void {
+    if (this.isClosed) throw new Error('nexus VFS client is closed')
+    if (this.stopCredentialRenewal) throw new Error('session credential renewal is already active')
+    if (!Number.isSafeInteger(options.validitySecs) || options.validitySecs <= 0) {
+      throw new Error('session renewal requires a positive integer validity')
+    }
+    let current = initial
+    let expiresAt = Date.parse(new X509Certificate(current.certPem).validTo)
+    if (expiresAt <= Date.now()) throw new Error('session credential is already expired')
+    const abort = new AbortController()
+    let renewalTimer: ReturnType<typeof setTimeout> | undefined
+    let expiryTimer: ReturnType<typeof setTimeout> | undefined
+    this.stopCredentialRenewal = () => {
+      abort.abort()
+      clearTimeout(renewalTimer)
+      clearTimeout(expiryTimer)
+    }
+    const armExpiry = () => {
+      clearTimeout(expiryTimer)
+      expiryTimer = setTimeout(() => {
+        if (Date.now() >= expiresAt) {
+          this.credentialFailure = new Error('session credential expired before renewal completed')
+          this.close()
+        }
+        else armExpiry()
+      }, Math.min(2_147_483_647, Math.max(0, expiresAt - Date.now())))
+      expiryTimer.unref()
+    }
+    const schedule = (delay: number) => {
+      renewalTimer = setTimeout(() => { void renew() }, delay)
+      renewalTimer.unref()
+    }
+    const renew = async () => {
+      try {
+        const next = await options.renew(current, abort.signal)
+        if (abort.signal.aborted) return
+        validateRenewedCredential(current, next)
+        await this.rotateTls({ ca: next.caPem, cert: next.certPem, key: next.keyPem, serverName: this.tlsServerName })
+        if (abort.signal.aborted) return
+        current = next
+        expiresAt = Date.parse(new X509Certificate(current.certPem).validTo)
+        armExpiry()
+        schedule(Math.max(1, Math.min(expiresAt - Date.now(), options.validitySecs * 1000) * 2 / 3))
+      } catch (error) {
+        if (abort.signal.aborted) return
+        if (error instanceof NexusRpcError
+          && ['UNAVAILABLE', 'DEADLINE_EXCEEDED', 'RESOURCE_EXHAUSTED'].includes(error.status)
+          && Date.now() < expiresAt) {
+          schedule(Math.min(1000, expiresAt - Date.now()))
+        } else {
+          this.credentialFailure = error instanceof Error ? error : new Error(String(error))
+          this.close()
+        }
+      }
+    }
+    armExpiry()
+    schedule(Math.max(1, Math.min(expiresAt - Date.now(), options.validitySecs * 1000) * 2 / 3))
+  }
+
+  /** Prepare new credentials, then switch new calls while old calls drain. */
+  async rotateTls(tls: NexusVfsTlsConfig): Promise<void> {
+    if (this.isClosed) throw new Error('nexus VFS client is closed')
+    if (this.isRotating) throw new Error('nexus VFS credential rotation is already in progress')
+    this.isRotating = true
+    let candidate: UnaryClient | undefined
+    try {
+      const Service = serviceConstructor()
+      const { target, credentials, channelOptions } = dial(this.target, { ...this.options, tls })
+      candidate = new Service(target, credentials, channelOptions) as unknown as UnaryClient
+      this.preparingChannel = candidate
+      const channel = candidate
+      await waitForChannel(channel.getChannel(), Date.now() + this.connectTimeoutMs)
+      if (this.isClosed) throw new Error('nexus VFS client closed during credential rotation')
+      const previous = this.client
+      this.client = channel
+      this.channels.set(channel, 0)
+      candidate = undefined
+      if (this.channels.get(previous) === 0) {
+        this.channels.delete(previous)
+        previous.close()
+      }
+    } finally {
+      candidate?.close()
+      this.preparingChannel = undefined
+      this.isRotating = false
+    }
+  }
+
+  /** Close all channels, including calls still draining after rotation. */
   close(): void {
-    this.client.close()
+    this.isClosed = true
+    this.preparingChannel?.close()
+    this.stopCredentialRenewal?.()
+    this.stopCredentialRenewal = undefined
+    for (const call of this.calls) call.cancel()
+    this.calls.clear()
+    for (const channel of this.channels.keys()) channel.close()
+    this.channels.clear()
   }
 
   private unary<Req, Res>(
@@ -789,13 +942,29 @@ export class NexusVfsClient {
     // the right bound for an RPC the server answers immediately. A call that
     // asks the server to hold the response needs its own, longer bound — see
     // the blocking branch of `streamReadAt`.
-    return invoke(
-      this.client,
-      this.client[rpc] as unknown as GrpcMethod<Req, Res>,
+    if (this.isClosed) return Promise.reject(this.credentialFailure ?? new Error('nexus VFS client is closed'))
+    const channel = this.client
+    this.channels.set(channel, (this.channels.get(channel) ?? 0) + 1)
+    return invoke<Req, Res>(
+      channel,
+      channel[rpc] as unknown as GrpcMethod<Req, Res>,
       operation,
       request,
       deadlineMs ?? this.connectTimeoutMs,
-    )
+      this.calls,
+    ).catch(error => {
+      if (this.isClosed && this.credentialFailure) throw this.credentialFailure
+      throw error
+    }).finally(() => {
+      const active = this.channels.get(channel)
+      if (active === undefined) return
+      if (active === 1 && channel !== this.client) {
+        this.channels.delete(channel)
+        channel.close()
+      } else {
+        this.channels.set(channel, active - 1)
+      }
+    })
   }
 }
 
@@ -806,6 +975,30 @@ export interface SessionCredential {
   caPem: Buffer
   /** The minted subject (`session-<uuid>`), so a holder can log what it has. */
   subjectId: string
+}
+
+function validateRenewedCredential(previous: SessionCredential, next: SessionCredential): void {
+  const certificate = new X509Certificate(next.certPem)
+  const original = new X509Certificate(previous.certPem)
+  const ca = new X509Certificate(previous.caPem)
+  if (next.subjectId !== previous.subjectId
+    || certificate.subjectAltName !== original.subjectAltName
+    || JSON.stringify(certificate.keyUsage) !== JSON.stringify(original.keyUsage)
+    || !new X509Certificate(next.caPem).raw.equals(ca.raw)
+    || !certificate.verify(ca.publicKey)
+    || !certificate.checkPrivateKey(createPrivateKey(next.keyPem))
+    || Date.parse(certificate.validFrom) > Date.now()
+    || Date.parse(certificate.validTo) <= Date.now()) {
+    throw new Error('renew session agent returned inconsistent credentials')
+  }
+}
+
+/** The issuer's owner-bound TLS name; it does not depend on Pod IP or DNS. */
+export function userRuntimeServerName(ownerId: string): string {
+  if (!ownerId || Buffer.byteLength(ownerId) > 256 || /\p{Cc}/u.test(ownerId)) {
+    throw new Error('invalid user runtime owner')
+  }
+  return 'nexus-user-' + createHash('sha256').update(ownerId).digest('hex').slice(0, 40)
 }
 
 interface MintSessionAgentRequest {
@@ -823,6 +1016,12 @@ interface MintSessionAgentResponse {
 interface RevokeAgentCertRequest {
   agent_cert_pem: Buffer
 }
+interface RenewSessionAgentRequest {
+  agent_cert_pem: Buffer
+  validity_secs: string
+  issued_at_unix_ms: string
+  proof: Buffer
+}
 interface RevokeAgentCertResponse {
   success: boolean
   error?: string
@@ -830,6 +1029,8 @@ interface RevokeAgentCertResponse {
 
 interface ZoneApiMethods {
   MintSessionAgent: GrpcMethod<MintSessionAgentRequest, MintSessionAgentResponse>
+  MintUserRuntime: GrpcMethod<MintSessionAgentRequest, MintSessionAgentResponse>
+  RenewSessionAgent: GrpcMethod<RenewSessionAgentRequest, MintSessionAgentResponse>
   RevokeAgentCert: GrpcMethod<RevokeAgentCertRequest, RevokeAgentCertResponse>
   close(): void
 }
@@ -852,12 +1053,18 @@ export class NexusZoneApiClient {
 
   private readonly client: ZoneApiMethods
   private readonly connectTimeoutMs: number
+  private readonly callerCertDer?: Buffer
+  private readonly caPem?: Buffer
+  private readonly calls = new Set<grpc.ClientUnaryCall>()
 
   constructor(endpoint: string, options: NexusVfsClientOptions = {}) {
     const Service = zoneApiConstructor()
-    const { target, credentials, channelOptions } = dial(endpoint, options)
+    const { target, credentials, channelOptions, clientCertPem, caPem } = dial(endpoint, options)
     this.connectTimeoutMs = options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS
     this.target = target
+    // Bind proofs to the same certificate bytes that built the TLS credentials.
+    if (clientCertPem) this.callerCertDer = new X509Certificate(clientCertPem).raw
+    this.caPem = caPem
     this.client = new Service(target, credentials, channelOptions) as unknown as ZoneApiMethods
   }
 
@@ -893,15 +1100,49 @@ export class NexusZoneApiClient {
     ownerId: string,
     options: { validitySecs: number },
   ): Promise<SessionCredential> {
+    return this.mintOwnerCredential(this.client.MintSessionAgent, 'mint session agent', ownerId, options.validitySecs)
+  }
+
+  /** Issue a TLS runtime identity for one owner, valid for at most 300 seconds. */
+  async mintUserRuntime(ownerId: string, options: { validitySecs: number }): Promise<SessionCredential> {
+    const serverName = userRuntimeServerName(ownerId)
+    if (!Number.isSafeInteger(options.validitySecs) || options.validitySecs < 1 || options.validitySecs > 300) {
+      throw new Error('user runtime validity must be between 1 and 300 seconds')
+    }
+    const credential = await this.mintOwnerCredential(this.client.MintUserRuntime, 'mint user runtime', ownerId, options.validitySecs)
+    const certificate = new X509Certificate(credential.certPem)
+    const ca = new X509Certificate(credential.caPem)
+    if (!this.caPem || !ca.raw.equals(new X509Certificate(this.caPem).raw)
+      || certificate.ca || certificate.checkHost(serverName, { subject: 'never' }) !== serverName
+      || !certificate.verify(ca.publicKey) || !certificate.checkPrivateKey(createPrivateKey(credential.keyPem))
+      || Date.parse(certificate.validFrom) > Date.now() || Date.parse(certificate.validTo) <= Date.now()
+      || (Date.parse(certificate.validTo) - Date.parse(certificate.validFrom)) / 1000 > options.validitySecs
+      || !/^session-[0-9a-f-]{36}$/.test(credential.subjectId)
+      || !certificate.subjectAltName?.split(', ').includes(`URI:nexus://agent/${credential.subjectId}`)
+      || certificate.subjectAltName?.includes('URI:nexus://zone/')
+      || !certificate.keyUsage?.includes('1.3.6.1.5.5.7.3.1')
+      || !certificate.keyUsage?.includes('1.3.6.1.5.5.7.3.2')) {
+      throw new Error('mint user runtime returned inconsistent credentials')
+    }
+    return credential
+  }
+
+  private async mintOwnerCredential(
+    method: GrpcMethod<MintSessionAgentRequest, MintSessionAgentResponse>,
+    operation: string,
+    ownerId: string,
+    validitySecs: number,
+  ): Promise<SessionCredential> {
     const response = await invoke<MintSessionAgentRequest, MintSessionAgentResponse>(
       this.client,
-      this.client.MintSessionAgent,
-      'mint session agent',
-      { owner_id: ownerId, validity_secs: String(options.validitySecs) },
+      method,
+      operation,
+      { owner_id: ownerId, validity_secs: String(validitySecs) },
       this.connectTimeoutMs,
+      this.calls,
     )
     if (!response.success) {
-      throw new Error(`mint session agent refused: ${response.error || 'no reason given'}`)
+      throw new Error(`${operation} refused: ${response.error || 'no reason given'}`)
     }
     return {
       certPem: response.agent_cert_pem,
@@ -909,6 +1150,46 @@ export class NexusZoneApiClient {
       caPem: response.ca_pem,
       subjectId: response.subject_id,
     }
+  }
+
+  /** Renew the same signed owner and controller, proving the existing key. */
+  async renewSessionAgent(
+    credential: SessionCredential,
+    options: { validitySecs: number },
+  ): Promise<SessionCredential> {
+    if (!this.callerCertDer) throw new Error('session renewal requires mTLS')
+    if (!Number.isSafeInteger(options.validitySecs) || options.validitySecs <= 0) {
+      throw new Error('session renewal requires a positive integer validity')
+    }
+    const previous = new X509Certificate(credential.certPem)
+    const issuedAt = Date.now()
+    const integers = Buffer.alloc(16)
+    integers.writeBigUInt64BE(BigInt(options.validitySecs), 0)
+    integers.writeBigUInt64BE(BigInt(issuedAt), 8)
+    const message = Buffer.concat([
+      Buffer.from('nexus/session-renewal/v1\0'),
+      createHash('sha256').update(previous.raw).digest(),
+      createHash('sha256').update(this.callerCertDer).digest(),
+      integers,
+    ])
+    const response = await invoke<RenewSessionAgentRequest, MintSessionAgentResponse>(
+      this.client, this.client.RenewSessionAgent, 'renew session agent',
+      {
+        agent_cert_pem: credential.certPem,
+        validity_secs: String(options.validitySecs),
+        issued_at_unix_ms: String(issuedAt),
+        proof: sign('sha256', message, credential.keyPem),
+      },
+      this.connectTimeoutMs,
+      this.calls,
+    )
+    if (!response.success) throw new Error(`renew session agent refused: ${response.error || 'no reason given'}`)
+    const next = {
+      certPem: response.agent_cert_pem, keyPem: response.agent_key_pem,
+      caPem: response.ca_pem, subjectId: response.subject_id,
+    }
+    validateRenewedCredential(credential, next)
+    return next
   }
 
   /**
@@ -926,6 +1207,7 @@ export class NexusZoneApiClient {
       'revoke agent cert',
       { agent_cert_pem: certPem },
       this.connectTimeoutMs,
+      this.calls,
     )
     if (!response.success) {
       throw new Error(`revoke agent cert failed: ${response.error || 'no reason given'}`)
@@ -934,6 +1216,8 @@ export class NexusZoneApiClient {
 
   /** Close the underlying channel. */
   close(): void {
+    for (const call of this.calls) call.cancel()
+    this.calls.clear()
     this.client.close()
   }
 }

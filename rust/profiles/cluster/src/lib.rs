@@ -2423,6 +2423,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
                     // session minting is closed, which is the safe default for
                     // a gate that cannot read its policy.
                     session_allow: Arc::clone(&session_mint_allow_slot),
+                    peer_verifier: Arc::clone(&fca_verifier_slot),
                 });
             *zm.agent_minter_slot().write() = Some(minter);
             tracing::info!("CA holder armed MintAgent RPC (remote agent-cert mint)");
@@ -5416,6 +5417,69 @@ struct FounderAgentMinter {
     /// Unbound means session minting is CLOSED, not open: a gate that cannot
     /// read its policy denies.
     session_allow: nexus_raft::session_mint_allow_store::SessionMintAllowSlot,
+    /// The live verifier also used by handshake admission and VFS attribution.
+    peer_verifier: transport::grpc::ForeignCaVerifierSlot,
+}
+
+enum OwnerCredentialKind {
+    Session,
+    UserRuntime,
+}
+
+impl FounderAgentMinter {
+    fn session_minter_caller(
+        &self,
+        caller_cert_der: Option<Vec<u8>>,
+    ) -> std::result::Result<String, String> {
+        let der = caller_cert_der.ok_or("session signing requires an mTLS client certificate")?;
+        let verifier = self
+            .peer_verifier
+            .get()
+            .ok_or("session signer peer verifier is unavailable")?;
+        let anchors = verifier.foreign_anchors();
+        let peer = transport::peer_identity::classify_current_peer_cert(
+            &der,
+            verifier.cluster_ca_der(),
+            &anchors,
+        )
+        .ok_or("session signing requires a current trusted peer certificate")?;
+        let revoked = nexus_raft::transport::read_revoked_serials_checked(
+            &nexus_raft::transport::revoked_serials_path(&self.data_dir),
+        )?;
+        if revoked.contains(&peer.serial) {
+            return Err("session signing refused for a revoked caller".into());
+        }
+        gate_allowlisted_session_minter(&peer, &self.session_allow)
+    }
+
+    fn mint_owner_credential(
+        &self,
+        caller_cert_der: Option<Vec<u8>>,
+        owner_id: &str,
+        validity_secs: u64,
+        kind: OwnerCredentialKind,
+    ) -> std::result::Result<nexus_raft::agent_minter::AgentBundle, String> {
+        let caller = self.session_minter_caller(caller_cert_der)?;
+        let subject_id = nexus_raft::transport::session_agent_name(&uuid_v4());
+        let ca_pem = std::fs::read(self.tls_dir.join("ca.pem"))
+            .map_err(|e| format!("read cluster CA: {e}"))?;
+        let ca_key_pem = std::fs::read(self.tls_dir.join("ca-key.pem"))
+            .map_err(|e| format!("read cluster CA key: {e}"))?;
+        let signer = match kind {
+            OwnerCredentialKind::Session => nexus_raft::transport::generate_session_agent_cert,
+            OwnerCredentialKind::UserRuntime => nexus_raft::transport::generate_user_runtime_cert,
+        };
+        let (cert_pem, key_pem) =
+            signer(&subject_id, owner_id, validity_secs, &ca_pem, &ca_key_pem)?;
+        tracing::info!(caller = %caller, owner = %owner_id, subject = %subject_id, validity_secs, "minted owner credential");
+        // Owner and lifetime are signed facts; issuing a credential creates no record.
+        Ok(nexus_raft::agent_minter::AgentBundle {
+            cert_pem,
+            key_pem,
+            ca_pem,
+            subject_id,
+        })
+    }
 }
 
 #[tonic::async_trait]
@@ -5470,42 +5534,73 @@ impl nexus_raft::agent_minter::AgentMinter for FounderAgentMinter {
         owner_id: &str,
         validity_secs: u64,
     ) -> std::result::Result<nexus_raft::agent_minter::AgentBundle, String> {
-        // Gate: an allow-listed AGENT, not a node. This is the one mint an
-        // agent cert may reach, so the allow-list is the whole thing standing
-        // between it and "any agent may mint an identity for anyone".
-        let caller = gate_allowlisted_session_minter(caller_cert_der, &self.session_allow)?;
-
-        // A fresh subject per call: a session credential names one session, so
-        // a leaked one authorises exactly that session and revoking it cannot
-        // touch another.
-        let subject_id = nexus_raft::transport::session_agent_name(&uuid_v4());
-
-        let ca_pem = std::fs::read(self.tls_dir.join("ca.pem"))
-            .map_err(|e| format!("read {}/ca.pem: {e}", self.tls_dir.display()))?;
-        let ca_key_pem = std::fs::read(self.tls_dir.join("ca-key.pem"))
-            .map_err(|e| format!("read {}/ca-key.pem: {e}", self.tls_dir.display()))?;
-        let (cert_pem, key_pem) = nexus_raft::transport::generate_session_agent_cert(
-            &subject_id,
+        self.mint_owner_credential(
+            caller_cert_der,
             owner_id,
             validity_secs,
-            &ca_pem,
-            &ca_key_pem,
+            OwnerCredentialKind::Session,
         )
-        .map_err(|e| format!("generate session agent cert: {e}"))?;
+    }
 
-        // Nothing is written to the auth store. A uuid subject is unique
-        // without a uniqueness record, the cert carries its own expiry, and the
-        // owner rides in the cert — so there is no durable fact here to record,
-        // only a credential that expires on its own. Revocation writes the one
-        // fact that IS durable, and only if it ever happens.
-        tracing::info!(
-            caller = %caller,
-            owner = %owner_id,
-            subject = %subject_id,
+    async fn mint_user_runtime(
+        &self,
+        caller_cert_der: Option<Vec<u8>>,
+        owner_id: &str,
+        validity_secs: u64,
+    ) -> std::result::Result<nexus_raft::agent_minter::AgentBundle, String> {
+        self.mint_owner_credential(
+            caller_cert_der,
+            owner_id,
             validity_secs,
-            "minted a session credential"
-        );
+            OwnerCredentialKind::UserRuntime,
+        )
+    }
 
+    async fn renew_session(
+        &self,
+        caller_cert_der: Option<Vec<u8>>,
+        renewal: nexus_raft::agent_minter::SessionRenewal<'_>,
+    ) -> std::result::Result<nexus_raft::agent_minter::AgentBundle, String> {
+        let caller = self.session_minter_caller(caller_cert_der.clone())?;
+        let caller_der = caller_cert_der.ok_or("session renewal requires mTLS")?;
+        let ca_pem = std::fs::read(self.tls_dir.join("ca.pem"))
+            .map_err(|e| format!("read cluster CA: {e}"))?;
+        if renewal.cert_pem.len() > 16 * 1024 {
+            return Err("session renewal certificate exceeds its size bound".into());
+        }
+        let serial = nexus_raft::transport::serial_from_cert_pem(renewal.cert_pem)?;
+        let ca_key_pem = std::fs::read(self.tls_dir.join("ca-key.pem"))
+            .map_err(|e| format!("read cluster CA key: {e}"))?;
+        let (cert_pem, key_pem, subject_id) = nexus_raft::transport::with_unrevoked_serial(
+            &nexus_raft::transport::revoked_serials_path(&self.data_dir),
+            &serial,
+            || {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|_| "session renewal clock precedes epoch")?
+                    .as_millis();
+                let verified = nexus_raft::transport::verify_session_renewal(
+                    &renewal,
+                    &caller_der,
+                    &ca_pem,
+                    u64::try_from(now_ms).map_err(|_| "session renewal clock overflow")?,
+                )?;
+                let signer = if verified.runtime_server_name.is_some() {
+                    nexus_raft::transport::generate_user_runtime_cert
+                } else {
+                    nexus_raft::transport::generate_session_agent_cert
+                };
+                let (cert_pem, key_pem) = signer(
+                    &verified.subject_id,
+                    &verified.owner_id,
+                    renewal.validity_secs,
+                    &ca_pem,
+                    &ca_key_pem,
+                )?;
+                Ok((cert_pem, key_pem, verified.subject_id))
+            },
+        )?;
+        tracing::info!(caller = %caller, subject = %subject_id, "renewed session credential");
         Ok(nexus_raft::agent_minter::AgentBundle {
             cert_pem,
             key_pem,
@@ -5529,7 +5624,8 @@ impl nexus_raft::agent_minter::AgentMinter for FounderAgentMinter {
         // operator path.
         let caller = match gate_node_caller(caller_cert_der.clone(), OP) {
             Ok(()) => "node".to_string(),
-            Err(node_err) => gate_allowlisted_session_minter(caller_cert_der, &self.session_allow)
+            Err(node_err) => self
+                .session_minter_caller(caller_cert_der)
                 .map_err(|agent_err| format!("{node_err}; {agent_err}"))?,
         };
 
@@ -5572,13 +5668,10 @@ impl nexus_raft::agent_minter::AgentMinter for FounderAgentMinter {
 /// because they mean the gate could not do its job, which an operator needs to
 /// see rather than read as a quiet denial.
 fn gate_allowlisted_session_minter(
-    caller_cert_der: Option<Vec<u8>>,
+    peer: &transport::auth::PeerIdentity,
     slot: &nexus_raft::session_mint_allow_store::SessionMintAllowSlot,
 ) -> std::result::Result<String, String> {
     const OP: &str = "MintSessionAgent";
-    let der = caller_cert_der.ok_or_else(|| format!("{OP} requires an mTLS client certificate"))?;
-    let peer = transport::peer_identity::from_der(&der)
-        .ok_or_else(|| format!("{OP}: client certificate did not parse"))?;
     // An agent identity, not a node: a node holds the CA and mints directly.
     if peer.agent_name.is_none() {
         return Err(format!(
@@ -7119,6 +7212,7 @@ mod tests {
             // This test exercises the node gate on `mint`; session minting is
             // unbound, which is exactly the closed default.
             session_allow: nexus_raft::session_mint_allow_store::new_session_mint_allow_slot(),
+            peer_verifier: test_peer_verifier(&ca_pem),
         };
 
         let der = |p: &[u8]| ::pem::parse(p).unwrap().contents().to_vec();
@@ -7163,6 +7257,13 @@ mod tests {
     }
 
     use kernel::hal::auth_key_store::{AuthKeyStore, AuthKeyStoreError};
+
+    fn test_peer_verifier(ca_pem: &[u8]) -> transport::grpc::ForeignCaVerifierSlot {
+        let slot = Arc::new(std::sync::OnceLock::new());
+        slot.set(lib::transport_primitives::FederatedClientCertVerifier::new(ca_pem).unwrap())
+            .unwrap();
+        slot
+    }
 
     /// In-memory `AuthKeyStore` for the minter tests — shared by both so the
     /// "session minting writes nothing" assertion and the agent-mint record
@@ -7224,6 +7325,7 @@ mod tests {
             tls_dir,
             data_dir: dir.path().to_path_buf(),
             session_allow: Arc::clone(&slot),
+            peer_verifier: test_peer_verifier(&ca_pem),
         };
         let der = |p: &[u8]| ::pem::parse(p).unwrap().contents().to_vec();
         let (moss_cert, _k) = generate_agent_cert("moss", &ca_pem, &ca_key_pem).unwrap();
@@ -7311,6 +7413,96 @@ mod tests {
         let id2 = transport::peer_identity::from_der(&der(&second.cert_pem)).unwrap();
         assert_ne!(id.agent_name, id2.agent_name, "subjects must not repeat");
 
+        // Renewal has no caller-selected owner or subject. The original key
+        // proves continuity and binds the proof to this minter's TLS identity.
+        let issued_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let message = nexus_raft::transport::session_renewal_message(
+            &der(&bundle.cert_pem),
+            &der(&moss_cert),
+            300,
+            issued_at,
+        );
+        let proof = lib::transport_primitives::authorship::sign(&message, &bundle.key_pem).unwrap();
+        let renewal = || nexus_raft::agent_minter::SessionRenewal {
+            cert_pem: &bundle.cert_pem,
+            validity_secs: 300,
+            issued_at_unix_ms: issued_at,
+            proof: &proof,
+        };
+        let renewed = minter
+            .renew_session(Some(der(&moss_cert)), renewal())
+            .await
+            .expect("renewal");
+        assert_eq!(renewed.subject_id, bundle.subject_id);
+        let renewed_id = transport::peer_identity::from_der(&der(&renewed.cert_pem)).unwrap();
+        assert_eq!(renewed_id.owner, id.owner);
+        assert_eq!(renewed_id.agent_name, id.agent_name);
+        assert_ne!(renewed.key_pem, bundle.key_pem);
+        assert_ne!(
+            nexus_raft::transport::serial_from_cert_pem(&renewed.cert_pem).unwrap(),
+            nexus_raft::transport::serial_from_cert_pem(&bundle.cert_pem).unwrap()
+        );
+        assert!(minter
+            .renew_session(Some(der(&other_cert)), renewal())
+            .await
+            .is_err());
+        assert!(minter.renew_session(None, renewal()).await.is_err());
+        minter
+            .revoke_cert(Some(der(&moss_cert)), &bundle.cert_pem)
+            .await
+            .unwrap();
+        assert!(
+            minter
+                .renew_session(Some(der(&moss_cert)), renewal())
+                .await
+                .is_err(),
+            "revoked key cannot renew"
+        );
+        let revoked_path = nexus_raft::transport::revoked_serials_path(&minter.data_dir);
+        std::fs::write(&revoked_path, "invalid-base64!\n").unwrap();
+        // A separate, valid credential must also fail when revocation truth
+        // cannot be read.
+        let message = nexus_raft::transport::session_renewal_message(
+            &der(&renewed.cert_pem),
+            &der(&moss_cert),
+            300,
+            issued_at,
+        );
+        let renewed_proof =
+            lib::transport_primitives::authorship::sign(&message, &renewed.key_pem).unwrap();
+        assert!(
+            minter
+                .renew_session(
+                    Some(der(&moss_cert)),
+                    nexus_raft::agent_minter::SessionRenewal {
+                        cert_pem: &renewed.cert_pem,
+                        validity_secs: 300,
+                        issued_at_unix_ms: issued_at,
+                        proof: &renewed_proof,
+                    }
+                )
+                .await
+                .is_err(),
+            "malformed revocation state refuses issuance"
+        );
+
+        std::fs::write(&revoked_path, "").unwrap();
+        minter
+            .revoke_cert(Some(der(&moss_cert)), &moss_cert)
+            .await
+            .unwrap();
+        let revoked_caller = match minter
+            .mint_session(Some(der(&moss_cert)), "alice", 300)
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("a revoked minter must not issue credentials"),
+        };
+        assert!(revoked_caller.contains("revoked caller"));
+
         // Minting wrote nothing to the auth store: a uuid subject needs no
         // uniqueness record and an expiring credential is not a durable fact.
         assert!(
@@ -7344,6 +7536,7 @@ mod tests {
             tls_dir,
             data_dir: dir.path().to_path_buf(),
             session_allow: new_session_mint_allow_slot(),
+            peer_verifier: test_peer_verifier(&ca_pem),
         };
         let der = |p: &[u8]| ::pem::parse(p).unwrap().contents().to_vec();
         let (node_cert, _k) =

@@ -127,28 +127,67 @@ pub struct RevokedEntry {
 /// is a pre-existing entry and reads back with `not_after_unix: None`, which is
 /// what makes adding the field a format extension rather than a migration.
 pub fn read_revoked_entries(path: &Path) -> Vec<RevokedEntry> {
-    use base64::Engine;
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    text.lines()
+    revoked_file_contents(path)
+        .unwrap_or_default()
+        .lines()
         .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .filter_map(|l| {
-            let (b64, rest) = match l.split_once(' ') {
-                Some((b64, rest)) => (b64, Some(rest.trim())),
-                None => (l, None),
-            };
-            let serial = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
-            Some(RevokedEntry {
-                serial,
-                // A malformed timestamp reads as unknown rather than dropping
-                // the line: losing the expiry costs a prune, losing the line
-                // un-revokes a certificate.
-                not_after_unix: rest.and_then(|r| r.parse::<i64>().ok()),
-            })
-        })
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| parse_revoked_entry(line).ok())
         .collect()
+}
+
+fn revoked_file_contents(path: &Path) -> Result<String, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(format!("read {}: {error}", path.display())),
+    }
+}
+
+fn parse_revoked_entry(line: &str) -> Result<RevokedEntry, String> {
+    use base64::Engine;
+    let (b64, rest) = match line.split_once(' ') {
+        Some((b64, rest)) => (b64, Some(rest.trim())),
+        None => (line, None),
+    };
+    let serial = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|_| "invalid revoked certificate serial".to_string())?;
+    Ok(RevokedEntry {
+        serial,
+        // Unknown expiry costs a prune; dropping the serial un-revokes it.
+        not_after_unix: rest.and_then(|value| value.parse::<i64>().ok()),
+    })
+}
+
+/// Authoritative revocation read for issuance: unreadable or malformed state
+/// refuses renewal. A missing file means no revocations have been recorded.
+pub fn read_revoked_serials_checked(path: &Path) -> Result<Vec<Vec<u8>>, String> {
+    revoked_file_contents(path)?
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| parse_revoked_entry(line).map(|entry| entry.serial))
+        .collect()
+}
+
+/// Keep the revocation check and issuance atomic against the revoke RPC and
+/// pruning. A revocation recorded first cannot race into a new credential.
+pub fn with_unrevoked_serial<T>(
+    path: &Path,
+    serial: &[u8],
+    issue: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let _guard = SERIALS_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if read_revoked_serials_checked(path)?
+        .iter()
+        .any(|entry| entry == serial)
+    {
+        return Err("session renewal refused for a revoked certificate".into());
+    }
+    issue()
 }
 
 /// The revoked serials (raw bytes) — what the CRL is built from. Thin view over

@@ -80,7 +80,9 @@ per-request auth token, so every method takes one.
 | `mkdir(path, authToken, { parents?, existOk? })` | Create a directory. |
 | `ping(authToken)` | Liveness; resolves to the server's version string. |
 | `serverInfo(authToken)` | Version, zone and uptime, from the typed `Ping` RPC. |
-| `close()` | Close the channel. |
+| `rotateTls(tls)` | Prepare a new mTLS channel; new calls use it while existing calls drain. |
+| `maintainSessionCredential(credential, { validitySecs, renew })` | Renew a controller credential in memory for the client's lifetime. |
+| `close()` | Stop renewal and cancel outstanding calls on every channel. |
 
 `endpoint` accepts `host:port` or a `http(s)://` URL.
 
@@ -128,6 +130,56 @@ start and channel generation, optionally resuming the durable transcript.
 Old daemons without `session_endpoint` must fail visibly; do not fall back to
 public fd streams. The SDK has no hosting-specific session transport.
 
+## Controller credential renewal
+
+`MintSessionAgent` always chooses a fresh controller subject. Use
+`NexusZoneApiClient.renewSessionAgent(current, { validitySecs })` to preserve
+an existing controller, including its mailbox participant. Renewal requires
+the original session key and an allow-listed minter's mTLS identity. The issuer
+derives the owner and subject from the certificate and rejects expired or
+revoked credentials, stale proofs and longer lifetimes. It issues a fresh key
+and serial without creating an authorization-store record.
+
+```ts
+const credential = await issuer.mintSessionAgent(ownerId, { validitySecs: 300 })
+const client = NexusVfsClient.withMtls(endpoint, {
+  ca: credential.caPem, cert: credential.certPem, key: credential.keyPem,
+})
+client.maintainSessionCredential(credential, {
+  validitySecs: 300,
+  renew: (current) => issuer.renewSessionAgent(current, { validitySecs: 300 }),
+})
+// The certificate proves the owner. Send an empty auth token.
+await client.read('/agents/example/sessions/session-id', '')
+client.close()
+issuer.close()
+```
+
+Renewal starts before expiry and prepares the new connection before switching
+calls. Pending reads remain on the original connection until completion.
+Transient transport errors retry within the current certificate's lifetime;
+a refusal, identity change or expired lease closes the client. The renewal
+callback receives an `AbortSignal`, so an application can also cancel its
+issuer RPC when the controller closes. These credentials and timers are never
+persisted. This API requires an issuer implementing `RenewSessionAgent`;
+older issuers fail visibly and cannot provide controller continuity.
+
+## User runtime TLS identity
+
+An allow-listed control plane can call
+`issuer.mintUserRuntime(ownerId, { validitySecs: 300 })`. The returned agent
+credential carries the signed owner, client/server TLS usage and a DNS SAN
+from `userRuntimeServerName(ownerId)`. It has no node identity or CA authority.
+The issuer bounds the lifetime to 300 seconds and accepts no caller-selected
+server name. A gateway must verify this exact owner-derived name when it dials
+the runtime; the Pod address may change without changing that identity.
+
+`renewSessionAgent` preserves the signed owner, subject, TLS name and key
+usage, while changing the key and serial. The same minter gate and revocation
+checks apply. Server certificate rotation and trusted runtime placement remain
+deployment responsibilities; `maintainSessionCredential` rotates client
+channels and does not install or rotate a TLS server.
+
 ## Development
 
 ```bash
@@ -137,4 +189,5 @@ npm test             # offline unit tests
 npm run check-proto  # CI guard: fails if the packaged proto is stale
 
 NEXUS_VFS_ENDPOINT=127.0.0.1:2126 npm run test:live
+NEXUS_ZONE_API_ENDPOINT=127.0.0.1:2126 NEXUS_ZONE_API_TLS_DIR=/data/tls npm run test:zone-api-live
 ```

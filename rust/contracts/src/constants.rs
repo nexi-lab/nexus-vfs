@@ -70,6 +70,9 @@ pub const ROOT_ZONE_ID: &str = "root";
 /// Headless — it carries no VFS mount, only the control store.
 pub const CONTROL_ZONE_ID: &str = "__control__";
 
+/// Maximum signed lifetime of a user-runtime TLS credential.
+pub const USER_RUNTIME_MAX_VALIDITY_SECS: u64 = 300;
+
 /// Namespaces of the replicated cluster-control store — the one raft-backed
 /// key space that carries ALL cluster-control state as opaque values behind a
 /// single generic `PutControlState`/`DeleteControlState` command pair. Each

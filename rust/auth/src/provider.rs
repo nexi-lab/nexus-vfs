@@ -496,6 +496,14 @@ fn serial_revoked(revoked: &RwLock<HashSet<Vec<u8>>>, serial: &[u8]) -> bool {
 }
 
 impl AuthProvider for ApiKeyAuthProvider {
+    fn resolve_forwarded_agent(
+        &self,
+        user_id: &str,
+        agent_id: &str,
+    ) -> Result<OperationContext, Status> {
+        Ok(Self::agent_context(agent_id, Some(user_id)))
+    }
+
     fn resolve(&self, creds: &AuthCredentials<'_>) -> Result<OperationContext, Status> {
         if !creds.token.is_empty() {
             return self.resolve_token(creds.token);
