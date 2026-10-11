@@ -447,7 +447,6 @@ async fn a_front_door_agent_mints_a_session_identity_for_a_person_and_can_revoke
         .await
         .is_err());
 
-
     // ── 9. REVOKE by handing back the certificate ───────────────────────────
     call_revoke_agent_cert_rpc(&rpc, &minted.agent_cert_pem, moss_tls(), 10)
         .await

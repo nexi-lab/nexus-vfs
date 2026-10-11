@@ -1676,6 +1676,28 @@ impl ZoneApiService for ZoneApiServiceImpl {
         ))
     }
 
+    /// Issue one owner-bound TLS server identity through the same signing policy.
+    async fn mint_user_runtime(
+        &self,
+        request: Request<MintSessionAgentRequest>,
+    ) -> std::result::Result<Response<MintSessionAgentResponse>, Status> {
+        let caller_cert_der = peer_cert_der(&request);
+        let req = request.into_inner();
+        let minter = self
+            .agent_minter_slot
+            .as_ref()
+            .and_then(|slot| slot.read().as_ref().cloned());
+        let result = match minter {
+            Some(minter) => {
+                minter
+                    .mint_user_runtime(caller_cert_der, &req.owner_id, req.validity_secs)
+                    .await
+            }
+            None => Err("this node does not hold the cluster CA; mint against the founder".into()),
+        };
+        Ok(session_credential_response(result))
+    }
+
     /// Renew a controller only after the CA holder verifies its current key.
     async fn renew_session_agent(
         &self,

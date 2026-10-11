@@ -403,6 +403,7 @@ interface Dialled {
   credentials: grpc.ChannelCredentials
   channelOptions: grpc.ChannelOptions
   clientCertPem?: Buffer
+  caPem?: Buffer
 }
 
 /**
@@ -413,10 +414,11 @@ function dial(endpoint: string, options: NexusVfsClientOptions): Dialled {
   const channelOptions: grpc.ChannelOptions = {}
   let credentials = grpc.credentials.createInsecure()
   let clientCertPem: Buffer | undefined
+  let caPem: Buffer | undefined
 
   if (options.tls) {
     const serverName = options.tls.serverName ?? DEFAULT_CLUSTER_SERVER_NAME
-    const caPem = resolvePem(options.tls.ca, 'CA certificate')
+    caPem = resolvePem(options.tls.ca, 'CA certificate')
     const keyPem = resolvePem(options.tls.key, 'client key')
     clientCertPem = resolvePem(options.tls.cert, 'client certificate')
     credentials = grpc.credentials.createSsl(
@@ -431,7 +433,7 @@ function dial(endpoint: string, options: NexusVfsClientOptions): Dialled {
     channelOptions['grpc.max_receive_message_length'] = options.maxReceiveMessageBytes
   }
 
-  return { target: toGrpcTarget(endpoint), credentials, channelOptions, clientCertPem }
+  return { target: toGrpcTarget(endpoint), credentials, channelOptions, clientCertPem, caPem }
 }
 
 /**
@@ -981,6 +983,7 @@ function validateRenewedCredential(previous: SessionCredential, next: SessionCre
   const ca = new X509Certificate(previous.caPem)
   if (next.subjectId !== previous.subjectId
     || certificate.subjectAltName !== original.subjectAltName
+    || JSON.stringify(certificate.keyUsage) !== JSON.stringify(original.keyUsage)
     || !new X509Certificate(next.caPem).raw.equals(ca.raw)
     || !certificate.verify(ca.publicKey)
     || !certificate.checkPrivateKey(createPrivateKey(next.keyPem))
@@ -988,6 +991,14 @@ function validateRenewedCredential(previous: SessionCredential, next: SessionCre
     || Date.parse(certificate.validTo) <= Date.now()) {
     throw new Error('renew session agent returned inconsistent credentials')
   }
+}
+
+/** The issuer's owner-bound TLS name; it does not depend on Pod IP or DNS. */
+export function userRuntimeServerName(ownerId: string): string {
+  if (!ownerId || Buffer.byteLength(ownerId) > 256 || /\p{Cc}/u.test(ownerId)) {
+    throw new Error('invalid user runtime owner')
+  }
+  return 'nexus-user-' + createHash('sha256').update(ownerId).digest('hex').slice(0, 40)
 }
 
 interface MintSessionAgentRequest {
@@ -1018,6 +1029,7 @@ interface RevokeAgentCertResponse {
 
 interface ZoneApiMethods {
   MintSessionAgent: GrpcMethod<MintSessionAgentRequest, MintSessionAgentResponse>
+  MintUserRuntime: GrpcMethod<MintSessionAgentRequest, MintSessionAgentResponse>
   RenewSessionAgent: GrpcMethod<RenewSessionAgentRequest, MintSessionAgentResponse>
   RevokeAgentCert: GrpcMethod<RevokeAgentCertRequest, RevokeAgentCertResponse>
   close(): void
@@ -1042,15 +1054,17 @@ export class NexusZoneApiClient {
   private readonly client: ZoneApiMethods
   private readonly connectTimeoutMs: number
   private readonly callerCertDer?: Buffer
+  private readonly caPem?: Buffer
   private readonly calls = new Set<grpc.ClientUnaryCall>()
 
   constructor(endpoint: string, options: NexusVfsClientOptions = {}) {
     const Service = zoneApiConstructor()
-    const { target, credentials, channelOptions, clientCertPem } = dial(endpoint, options)
+    const { target, credentials, channelOptions, clientCertPem, caPem } = dial(endpoint, options)
     this.connectTimeoutMs = options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS
     this.target = target
     // Bind proofs to the same certificate bytes that built the TLS credentials.
     if (clientCertPem) this.callerCertDer = new X509Certificate(clientCertPem).raw
+    this.caPem = caPem
     this.client = new Service(target, credentials, channelOptions) as unknown as ZoneApiMethods
   }
 
@@ -1086,16 +1100,49 @@ export class NexusZoneApiClient {
     ownerId: string,
     options: { validitySecs: number },
   ): Promise<SessionCredential> {
+    return this.mintOwnerCredential(this.client.MintSessionAgent, 'mint session agent', ownerId, options.validitySecs)
+  }
+
+  /** Issue a TLS runtime identity for one owner, valid for at most 300 seconds. */
+  async mintUserRuntime(ownerId: string, options: { validitySecs: number }): Promise<SessionCredential> {
+    const serverName = userRuntimeServerName(ownerId)
+    if (!Number.isSafeInteger(options.validitySecs) || options.validitySecs < 1 || options.validitySecs > 300) {
+      throw new Error('user runtime validity must be between 1 and 300 seconds')
+    }
+    const credential = await this.mintOwnerCredential(this.client.MintUserRuntime, 'mint user runtime', ownerId, options.validitySecs)
+    const certificate = new X509Certificate(credential.certPem)
+    const ca = new X509Certificate(credential.caPem)
+    if (!this.caPem || !ca.raw.equals(new X509Certificate(this.caPem).raw)
+      || certificate.ca || certificate.checkHost(serverName, { subject: 'never' }) !== serverName
+      || !certificate.verify(ca.publicKey) || !certificate.checkPrivateKey(createPrivateKey(credential.keyPem))
+      || Date.parse(certificate.validFrom) > Date.now() || Date.parse(certificate.validTo) <= Date.now()
+      || (Date.parse(certificate.validTo) - Date.parse(certificate.validFrom)) / 1000 > options.validitySecs
+      || !/^session-[0-9a-f-]{36}$/.test(credential.subjectId)
+      || !certificate.subjectAltName?.split(', ').includes(`URI:nexus://agent/${credential.subjectId}`)
+      || certificate.subjectAltName?.includes('URI:nexus://zone/')
+      || !certificate.keyUsage?.includes('1.3.6.1.5.5.7.3.1')
+      || !certificate.keyUsage?.includes('1.3.6.1.5.5.7.3.2')) {
+      throw new Error('mint user runtime returned inconsistent credentials')
+    }
+    return credential
+  }
+
+  private async mintOwnerCredential(
+    method: GrpcMethod<MintSessionAgentRequest, MintSessionAgentResponse>,
+    operation: string,
+    ownerId: string,
+    validitySecs: number,
+  ): Promise<SessionCredential> {
     const response = await invoke<MintSessionAgentRequest, MintSessionAgentResponse>(
       this.client,
-      this.client.MintSessionAgent,
-      'mint session agent',
-      { owner_id: ownerId, validity_secs: String(options.validitySecs) },
+      method,
+      operation,
+      { owner_id: ownerId, validity_secs: String(validitySecs) },
       this.connectTimeoutMs,
       this.calls,
     )
     if (!response.success) {
-      throw new Error(`mint session agent refused: ${response.error || 'no reason given'}`)
+      throw new Error(`${operation} refused: ${response.error || 'no reason given'}`)
     }
     return {
       certPem: response.agent_cert_pem,

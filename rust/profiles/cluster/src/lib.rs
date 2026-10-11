@@ -5421,6 +5421,11 @@ struct FounderAgentMinter {
     peer_verifier: transport::grpc::ForeignCaVerifierSlot,
 }
 
+enum OwnerCredentialKind {
+    Session,
+    UserRuntime,
+}
+
 impl FounderAgentMinter {
     fn session_minter_caller(
         &self,
@@ -5445,6 +5450,35 @@ impl FounderAgentMinter {
             return Err("session signing refused for a revoked caller".into());
         }
         gate_allowlisted_session_minter(&peer, &self.session_allow)
+    }
+
+    fn mint_owner_credential(
+        &self,
+        caller_cert_der: Option<Vec<u8>>,
+        owner_id: &str,
+        validity_secs: u64,
+        kind: OwnerCredentialKind,
+    ) -> std::result::Result<nexus_raft::agent_minter::AgentBundle, String> {
+        let caller = self.session_minter_caller(caller_cert_der)?;
+        let subject_id = nexus_raft::transport::session_agent_name(&uuid_v4());
+        let ca_pem = std::fs::read(self.tls_dir.join("ca.pem"))
+            .map_err(|e| format!("read cluster CA: {e}"))?;
+        let ca_key_pem = std::fs::read(self.tls_dir.join("ca-key.pem"))
+            .map_err(|e| format!("read cluster CA key: {e}"))?;
+        let signer = match kind {
+            OwnerCredentialKind::Session => nexus_raft::transport::generate_session_agent_cert,
+            OwnerCredentialKind::UserRuntime => nexus_raft::transport::generate_user_runtime_cert,
+        };
+        let (cert_pem, key_pem) =
+            signer(&subject_id, owner_id, validity_secs, &ca_pem, &ca_key_pem)?;
+        tracing::info!(caller = %caller, owner = %owner_id, subject = %subject_id, validity_secs, "minted owner credential");
+        // Owner and lifetime are signed facts; issuing a credential creates no record.
+        Ok(nexus_raft::agent_minter::AgentBundle {
+            cert_pem,
+            key_pem,
+            ca_pem,
+            subject_id,
+        })
     }
 }
 
@@ -5500,48 +5534,26 @@ impl nexus_raft::agent_minter::AgentMinter for FounderAgentMinter {
         owner_id: &str,
         validity_secs: u64,
     ) -> std::result::Result<nexus_raft::agent_minter::AgentBundle, String> {
-        // Gate: an allow-listed AGENT, not a node. This is the one mint an
-        // agent cert may reach, so the allow-list is the whole thing standing
-        // between it and "any agent may mint an identity for anyone".
-        let caller = self.session_minter_caller(caller_cert_der)?;
-
-        // A fresh subject per call: a session credential names one session, so
-        // a leaked one authorises exactly that session and revoking it cannot
-        // touch another.
-        let subject_id = nexus_raft::transport::session_agent_name(&uuid_v4());
-
-        let ca_pem = std::fs::read(self.tls_dir.join("ca.pem"))
-            .map_err(|e| format!("read {}/ca.pem: {e}", self.tls_dir.display()))?;
-        let ca_key_pem = std::fs::read(self.tls_dir.join("ca-key.pem"))
-            .map_err(|e| format!("read {}/ca-key.pem: {e}", self.tls_dir.display()))?;
-        let (cert_pem, key_pem) = nexus_raft::transport::generate_session_agent_cert(
-            &subject_id,
+        self.mint_owner_credential(
+            caller_cert_der,
             owner_id,
             validity_secs,
-            &ca_pem,
-            &ca_key_pem,
+            OwnerCredentialKind::Session,
         )
-        .map_err(|e| format!("generate session agent cert: {e}"))?;
+    }
 
-        // Nothing is written to the auth store. A uuid subject is unique
-        // without a uniqueness record, the cert carries its own expiry, and the
-        // owner rides in the cert — so there is no durable fact here to record,
-        // only a credential that expires on its own. Revocation writes the one
-        // fact that IS durable, and only if it ever happens.
-        tracing::info!(
-            caller = %caller,
-            owner = %owner_id,
-            subject = %subject_id,
+    async fn mint_user_runtime(
+        &self,
+        caller_cert_der: Option<Vec<u8>>,
+        owner_id: &str,
+        validity_secs: u64,
+    ) -> std::result::Result<nexus_raft::agent_minter::AgentBundle, String> {
+        self.mint_owner_credential(
+            caller_cert_der,
+            owner_id,
             validity_secs,
-            "minted a session credential"
-        );
-
-        Ok(nexus_raft::agent_minter::AgentBundle {
-            cert_pem,
-            key_pem,
-            ca_pem,
-            subject_id,
-        })
+            OwnerCredentialKind::UserRuntime,
+        )
     }
 
     async fn renew_session(
@@ -5573,7 +5585,12 @@ impl nexus_raft::agent_minter::AgentMinter for FounderAgentMinter {
                     &ca_pem,
                     u64::try_from(now_ms).map_err(|_| "session renewal clock overflow")?,
                 )?;
-                let (cert_pem, key_pem) = nexus_raft::transport::generate_session_agent_cert(
+                let signer = if verified.runtime_server_name.is_some() {
+                    nexus_raft::transport::generate_user_runtime_cert
+                } else {
+                    nexus_raft::transport::generate_session_agent_cert
+                };
+                let (cert_pem, key_pem) = signer(
                     &verified.subject_id,
                     &verified.owner_id,
                     renewal.validity_secs,
