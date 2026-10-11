@@ -17,12 +17,13 @@ import test from 'node:test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { X509Certificate } from 'node:crypto'
+import { createServer, request } from 'node:https'
 
 import grpc from '@grpc/grpc-js'
 import protoLoader from '@grpc/proto-loader'
 import protobuf from 'protobufjs'
 
-import { NexusVfsClient, NexusZoneApiClient } from '../dist/index.js'
+import { NexusVfsClient, NexusZoneApiClient, userRuntimeServerName } from '../dist/index.js'
 import {
   CORE_METADATA_PROTO,
   RAFT_COMMANDS_PROTO,
@@ -36,7 +37,7 @@ const OWNER = `live-owner-${process.pid}`
 const AGENT = `live-minter-${process.pid}`
 const VALIDITY_SECS = 120
 
-function adminStub() {
+function adminStub(tls) {
   const root = new protobuf.Root()
   for (const source of [CORE_METADATA_PROTO, RAFT_COMMANDS_PROTO, RAFT_TRANSPORT_PROTO]) {
     protobuf.parse(source, root, { keepCase: true })
@@ -45,11 +46,10 @@ function adminStub() {
   const ZoneApi = grpc.loadPackageDefinition(
     protoLoader.fromJSON(root.toJSON(), { keepCase: true, longs: String, defaults: true }),
   ).nexus.raft.ZoneApiService
-  const credentials = grpc.credentials.createSsl(
-    readFileSync(join(tlsDir, 'ca.pem')),
-    readFileSync(join(tlsDir, 'node-key.pem')),
-    readFileSync(join(tlsDir, 'node.pem')),
-  )
+  const credentials = tls
+    ? grpc.credentials.createSsl(tls.caPem, tls.keyPem, tls.certPem)
+    : grpc.credentials.createSsl(readFileSync(join(tlsDir, 'ca.pem')),
+      readFileSync(join(tlsDir, 'node-key.pem')), readFileSync(join(tlsDir, 'node.pem')))
   return new ZoneApi(endpoint, credentials, {
     'grpc.ssl_target_name_override': SERVER_NAME,
     'grpc.default_authority': SERVER_NAME,
@@ -103,6 +103,7 @@ test(
         .then(() => null, err => err)
       assert.ok(error, 'minting must not succeed before the agent is allow-listed')
       assert.match(error.message, /refused/, 'a refusal is reported as one')
+      await assert.rejects(agent.mintUserRuntime(OWNER, { validitySecs: 120 }), /refused/)
     })
 
     await t.test('a node can put the agent on the list', async () => {
@@ -146,6 +147,58 @@ test(
       )
 
       await agent.revokeAgentCert(credential.certPem)
+    })
+
+    await t.test('a runtime serves real mutual TLS for its signed owner and renews without node authority', async () => {
+      const minter = adminStub({ caPem: minted.ca_pem, keyPem: minted.agent_key_pem, certPem: minted.agent_cert_pem })
+      try {
+        for (const validity_secs of ['0', '301', '18446744073709551615']) {
+          const rejected = await adminCall(minter, 'MintUserRuntime', { owner_id: OWNER, validity_secs })
+          assert.equal(rejected.success, false, 'the issuer enforces its own lifetime bound')
+        }
+      } finally { minter.close() }
+      const original = await agent.mintUserRuntime(OWNER, { validitySecs: 120 })
+      const credential = await agent.renewSessionAgent(original, { validitySecs: 120 })
+      assert.equal(credential.subjectId, original.subjectId)
+      assert.notDeepEqual(credential.keyPem, original.keyPem)
+      const cert = new X509Certificate(credential.certPem)
+      assert.equal(cert.ca, false)
+      assert.equal(cert.subjectAltName, new X509Certificate(original.certPem).subjectAltName)
+      assert.deepEqual(cert.keyUsage, ['1.3.6.1.5.5.7.3.2', '1.3.6.1.5.5.7.3.1'])
+      assert.ok(cert.subjectAltName.includes(`URI:nexus://owner/${OWNER}`))
+      assert.ok(!cert.subjectAltName.includes('nexus://zone/'))
+      const serverName = userRuntimeServerName(OWNER)
+      const server = createServer({ key: credential.keyPem, cert: credential.certPem,
+        ca: credential.caPem, requestCert: true, rejectUnauthorized: true }, (_req, res) => res.end('runtime-ok'))
+      await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+      const port = server.address().port
+      const fetch = name => new Promise((resolve, reject) => {
+        const req = request({ host: '127.0.0.1', port, servername: name, ca: credential.caPem,
+          key: readFileSync(join(tlsDir, 'node-key.pem')), cert: readFileSync(join(tlsDir, 'node.pem')),
+          agent: false, timeout: 3000 }, res => {
+          const chunks = []
+          res.on('data', chunk => chunks.push(chunk))
+          res.on('end', () => resolve(Buffer.concat(chunks).toString()))
+        })
+        req.on('error', reject)
+        req.on('timeout', () => req.destroy(new Error('runtime TLS request timeout')))
+        req.end()
+      })
+      try {
+        assert.equal(await fetch(serverName), 'runtime-ok')
+        await assert.rejects(fetch(userRuntimeServerName('another-owner')), { code: 'ERR_TLS_CERT_ALTNAME_INVALID' })
+        await assert.rejects(fetch(SERVER_NAME), { code: 'ERR_TLS_CERT_ALTNAME_INVALID' })
+      } finally { await new Promise(resolve => server.close(resolve)) }
+      const runtime = NexusZoneApiClient.withMtls(endpoint, { ca: credential.caPem, cert: credential.certPem, key: credential.keyPem })
+      const unprivileged = adminStub(credential)
+      try {
+        await assert.rejects(runtime.mintSessionAgent('another-owner', { validitySecs: 120 }), /refused/)
+        await assert.rejects(runtime.mintUserRuntime('another-owner', { validitySecs: 120 }), /refused/)
+        assert.equal((await adminCall(unprivileged, 'MintAgent', { subject_id: `forged-${process.pid}` })).success, false)
+        assert.equal((await adminCall(unprivileged, 'AllowSessionMinter', { agent_id: credential.subjectId })).success, false)
+      } finally { runtime.close(); unprivileged.close() }
+      await agent.revokeAgentCert(credential.certPem)
+      await assert.rejects(agent.renewSessionAgent(credential, { validitySecs: 120 }), /revoked/)
     })
 
     await t.test('renewal preserves the actor, bytes and a pending watch across real certificate expiry', async () => {
@@ -198,6 +251,7 @@ test(
         .mintSessionAgent(OWNER, { validitySecs: VALIDITY_SECS })
         .then(() => null, err => err)
       assert.ok(error, 'revoking the permission has to take effect')
+      await assert.rejects(agent.mintUserRuntime(OWNER, { validitySecs: 120 }), /refused/)
     })
   },
 )

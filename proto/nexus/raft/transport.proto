@@ -139,6 +139,15 @@ service ZoneApiService {
   // not make the cluster an independent authority on who a person is.
   rpc MintSessionAgent(MintSessionAgentRequest) returns (MintSessionAgentResponse);
 
+  // A user runtime serves mTLS using its own owner-bound agent credential.
+  // The issuer derives its DNS SAN from the owner; callers cannot choose a
+  // server name or obtain node authority. DNS SAN = "nexus-user-" plus the
+  // first 40 lowercase hex digits of SHA-256(owner UTF-8). No node URI or CA
+  // capability. Validity is at most 300 seconds.
+  // Same allow-list and revocation plane as session controllers. Renewal
+  // preserves the original signed server capability through RenewSessionAgent.
+  rpc MintUserRuntime(MintSessionAgentRequest) returns (MintSessionAgentResponse);
+
   // Renew an existing controller without changing its signed owner or subject.
   // Requires an allow-listed minter and proof of the current session key. An
   // expired or revoked credential cannot be renewed. This does not let a caller

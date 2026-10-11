@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { NexusRpcError, NexusZoneApiClient } from '../dist/index.js'
+import { NexusRpcError, NexusZoneApiClient, userRuntimeServerName } from '../dist/index.js'
 
 /**
  * The zone-api plane is a second service, loaded from a three-file proto
@@ -21,6 +21,27 @@ import { NexusRpcError, NexusZoneApiClient } from '../dist/index.js'
 const UNREACHABLE = '127.0.0.1:1'
 
 const client = () => new NexusZoneApiClient(UNREACHABLE, { connectTimeoutMs: 150 })
+
+test('a runtime TLS name binds the exact owner and never the root node name', () => {
+  assert.equal(userRuntimeServerName('alice'), 'nexus-user-2bd806c97f0e00af1a1fc3328fa763a9269723c8')
+  assert.notEqual(userRuntimeServerName('alice'), userRuntimeServerName('Alice'))
+  assert.notEqual(userRuntimeServerName('alice'), userRuntimeServerName('bob'))
+  for (const owner of ['', 'alice\n', 'a'.repeat(257)]) {
+    assert.throws(() => userRuntimeServerName(owner), /invalid/)
+  }
+})
+
+test('mintUserRuntime exposes a real typed RPC and refuses invalid lifetime before dispatch', async () => {
+  const c = client()
+  try {
+    for (const validitySecs of [0, -1, 301, 1.5, Number.MAX_SAFE_INTEGER]) {
+      await assert.rejects(c.mintUserRuntime('alice', { validitySecs }), /between 1 and 300/)
+    }
+    const error = await c.mintUserRuntime('alice', { validitySecs: 300 }).catch(error => error)
+    assert.ok(error instanceof NexusRpcError)
+    assert.equal(error.operation, 'mint user runtime')
+  } finally { c.close() }
+})
 
 test('the zone-api proto closure resolves and the service loads', () => {
   const c = client()
