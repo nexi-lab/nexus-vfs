@@ -824,6 +824,27 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
         }
     }
 
+    /// Apply the same delegated-owner boundary used when starting a session.
+    fn authorize_session_control(
+        &self,
+        session_id: &str,
+        ctx: &contracts::OperationContext,
+    ) -> Result<(), ManagedAgentError> {
+        if ctx.is_admin || ctx.is_system || delegated_owner(ctx).is_none() {
+            return Ok(());
+        }
+        let descriptor = self
+            .agent_registry
+            .get(session_id)
+            .ok_or_else(|| ManagedAgentError::UnknownSession(session_id.to_string()))?;
+        if descriptor.owner_id != ctx.user_id {
+            return Err(ManagedAgentError::InvalidArgument(
+                "session owner does not match the caller's credential".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Read-through liveness snapshot. Cheap by design; the live
     /// message flow uses `sys_watch` over `/proc/{pid}/transcript`,
     /// not this RPC.
@@ -1063,14 +1084,9 @@ fn authenticated_owner(
     requested: &str,
     ctx: &contracts::OperationContext,
 ) -> Result<String, String> {
-    let delegated = ctx
-        .agent_id
-        .as_deref()
-        .is_some_and(|actor| actor != ctx.user_id);
-    if !delegated {
+    let Some(proven) = delegated_owner(ctx) else {
         return Ok(requested.to_string());
-    }
-    let proven = ctx.user_id.as_str();
+    };
     if !requested.is_empty() && requested != proven {
         return Err(format!(
             "owner_id {requested:?} does not match the caller's credential, which is \
@@ -1078,6 +1094,13 @@ fn authenticated_owner(
         ));
     }
     Ok(proven.to_string())
+}
+
+fn delegated_owner(ctx: &contracts::OperationContext) -> Option<&str> {
+    ctx.agent_id
+        .as_deref()
+        .filter(|actor| *actor != ctx.user_id)
+        .map(|_| ctx.user_id.as_str())
 }
 
 impl<K: KernelSyscall> RustService for ManagedAgentService<K> {
@@ -1120,12 +1143,14 @@ impl<K: KernelSyscall> RustService for ManagedAgentService<K> {
             "cancel_v1" => {
                 let req: CancelRequest = serde_json::from_slice(payload)
                     .map_err(|e| RustCallError::InvalidArgument(e.to_string()))?;
+                self.authorize_session_control(&req.session_id, ctx)?;
                 let resp = self.cancel(&req.session_id, req.mode)?;
                 serde_json::to_vec(&resp).map_err(|e| RustCallError::Internal(e.to_string()))
             }
             "get_session_v1" => {
                 let req: GetSessionRequest = serde_json::from_slice(payload)
                     .map_err(|e| RustCallError::InvalidArgument(e.to_string()))?;
+                self.authorize_session_control(&req.session_id, ctx)?;
                 let resp = self.get_session(&req.session_id)?;
                 serde_json::to_vec(&resp).map_err(|e| RustCallError::Internal(e.to_string()))
             }
@@ -1714,6 +1739,61 @@ mod tests {
                 .unwrap();
             let cancel: CancelResponse = serde_json::from_slice(&bytes).unwrap();
             assert!(cancel.cancelled);
+        }
+
+        #[test]
+        fn delegated_session_controls_require_the_recorded_owner() {
+            let (_kernel, table, svc) = fresh_service();
+            let mut request = req("scode-standard");
+            request.owner_id = "alice".into();
+            let started = svc.start_session(request).unwrap();
+            let payload = json!({"session_id": started.session_id, "mode": "session"}).to_string();
+
+            for method in ["get_session_v1", "cancel_v1"] {
+                let error = svc
+                    .dispatch(method, payload.as_bytes(), &session_caller("bob"))
+                    .unwrap_err();
+                assert!(
+                    matches!(error, RustCallError::InvalidArgument(message) if message.contains("owner")),
+                    "a different owner's delegated credential must be refused"
+                );
+                assert!(table.get(&started.session_id).is_some());
+            }
+
+            let renewed = contracts::OperationContext::new(
+                "alice",
+                "root",
+                false,
+                Some("session-renewed"),
+                false,
+            );
+            svc.dispatch("get_session_v1", payload.as_bytes(), &renewed)
+                .expect("a renewed credential retains its owner's access");
+            svc.dispatch("cancel_v1", payload.as_bytes(), &renewed)
+                .expect("the owner can cancel the session");
+            assert!(table.get(&started.session_id).is_none());
+        }
+
+        #[test]
+        fn privileged_session_controls_retain_operator_access() {
+            for (is_admin, is_system) in [(true, false), (false, true)] {
+                let (_kernel, table, svc) = fresh_service();
+                let started = svc.start_session(req("scode-standard")).unwrap();
+                let payload =
+                    json!({"session_id": started.session_id, "mode": "session"}).to_string();
+                let operator = contracts::OperationContext::new(
+                    "operator",
+                    "root",
+                    is_admin,
+                    Some("node"),
+                    is_system,
+                );
+                svc.dispatch("get_session_v1", payload.as_bytes(), &operator)
+                    .unwrap();
+                svc.dispatch("cancel_v1", payload.as_bytes(), &operator)
+                    .unwrap();
+                assert!(table.get(&started.session_id).is_none());
+            }
         }
 
         #[test]
