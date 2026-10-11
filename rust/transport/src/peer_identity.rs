@@ -79,8 +79,7 @@ fn classify_from_extensions(
     foreign_anchors: &[ForeignCaAnchor],
 ) -> Option<PeerIdentity> {
     with_leaf_der(ext, |der| {
-        let cert = current_certificate(der)?;
-        classify_x509(&cert, cluster_ca_der, foreign_anchors).ok()
+        classify_current_peer_cert(der, cluster_ca_der, foreign_anchors)
     })
     .flatten()
 }
@@ -219,6 +218,17 @@ pub fn classify_peer_cert(
     use x509_parser::prelude::*;
     let (_, cert) = X509Certificate::from_der(der).map_err(|_| ClassifyError::Unparseable)?;
     classify_x509(&cert, cluster_ca_der, foreign_anchors)
+}
+
+/// Resolve a network caller against current trust roots and certificate time.
+/// Offline identity and historical authorship readers keep their own semantics.
+pub fn classify_current_peer_cert(
+    der: &[u8],
+    cluster_ca_der: &[u8],
+    foreign_anchors: &[ForeignCaAnchor],
+) -> Option<PeerIdentity> {
+    let cert = current_certificate(der)?;
+    classify_x509(&cert, cluster_ca_der, foreign_anchors).ok()
 }
 
 fn classify_x509(

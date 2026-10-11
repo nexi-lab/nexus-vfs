@@ -45,6 +45,67 @@ const BUDGET: Duration = Duration::from_secs(120);
 const ORG: &str = "hospital-a";
 const AGENT: &str = "cardio";
 
+/// A foreign namesake must not inherit a domestic front door's signing policy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn foreign_namesake_cannot_use_a_domestic_session_minter_entry() {
+    use nexus_raft::transport::{call_allow_session_minter_rpc, call_mint_session_agent_rpc};
+    let fixture = boot_founder_with_ca_b(&[]).await;
+    fixture.register_ca_b();
+    let tls_dir = std::path::Path::new(&fixture.fdata).join("tls");
+    let node_tls = TlsConfig {
+        ca_pem: fixture.cluster_ca.clone(),
+        cert_pem: std::fs::read(tls_dir.join("node.pem")).unwrap(),
+        key_pem: std::fs::read(tls_dir.join("node-key.pem")).unwrap(),
+    };
+    let endpoint = format!("https://127.0.0.1:{}", fixture.fport);
+    call_allow_session_minter_rpc(&endpoint, AGENT, Some(node_tls), 10)
+        .await
+        .unwrap()
+        .expect("operator permits a domestic minter name");
+    let foreign_tls = TlsConfig {
+        ca_pem: fixture.cluster_ca.clone(),
+        cert_pem: fixture.foreign_cert.clone(),
+        key_pem: fixture.foreign_key.clone(),
+    };
+    assert!(
+        handshake_accepted(fixture.fport, &foreign_tls, Duration::from_secs(10)).await,
+        "foreign agent is admitted by the registered CA before testing its authority"
+    );
+    let minted = call_mint_session_agent_rpc(&endpoint, "victim", 300, Some(foreign_tls), 10)
+        .await
+        .expect("real foreign mTLS request reaches the issuer");
+    assert!(
+        !minted.success,
+        "a foreign namesake inherited the domestic minter policy"
+    );
+    let node_tls = TlsConfig {
+        ca_pem: fixture.cluster_ca.clone(),
+        cert_pem: std::fs::read(tls_dir.join("node.pem")).unwrap(),
+        key_pem: std::fs::read(tls_dir.join("node-key.pem")).unwrap(),
+    };
+    call_allow_session_minter_rpc(
+        &endpoint,
+        &format!("{ORG}/agent/{AGENT}"),
+        Some(node_tls),
+        10,
+    )
+    .await
+    .unwrap()
+    .expect("operator explicitly permits the qualified foreign minter");
+    let foreign_tls = TlsConfig {
+        ca_pem: fixture.cluster_ca.clone(),
+        cert_pem: fixture.foreign_cert.clone(),
+        key_pem: fixture.foreign_key.clone(),
+    };
+    assert!(
+        call_mint_session_agent_rpc(&endpoint, "authorized-owner", 300, Some(foreign_tls), 10)
+            .await
+            .unwrap()
+            .success,
+        "qualified authorization remains usable"
+    );
+}
+
 /// A booted TLS-on founder (control zone up, `/agents` formed) plus a freshly
 /// generated foreign CA (`CA_B`, org [`ORG`]) and a `CA_B`-signed agent leaf
 /// ([`AGENT`]). Shared by both cross-org tests: each registers `CA_B` at its own
