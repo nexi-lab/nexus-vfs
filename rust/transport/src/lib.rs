@@ -56,6 +56,8 @@ pub mod peer_blob;
 /// rustls has already verified against the cluster CA. Feeds
 /// `AuthCredentials::peer`.
 pub mod peer_identity;
+/// Complete VFS forwarding to the runtime selected by authenticated ownership.
+pub mod runtime_gateway;
 /// User-runtime confinement and original-agent delegation over a verified gateway.
 pub mod runtime_scope;
 /// Post-transport substrate observability.  Dual of
