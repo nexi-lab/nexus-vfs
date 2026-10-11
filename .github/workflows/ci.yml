@@ -180,6 +180,14 @@ jobs:
           bun build ./test/live-entry.mjs --outfile="$RUNNER_TEMP/live-bundled.mjs" --target=node --format=esm
           node "$RUNNER_TEMP/live-bundled.mjs"
 
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the current cluster protocol
+        # Released-server round-trips above guard compatibility. New CA-plane
+        # RPCs must also be exercised against the source under review.
+        run: cargo build -p nexus-cluster --bin nexusd-cluster
+
       - name: Start an auth-on cluster
         shell: bash
         # `serve-local --no-tls` cannot reach the zone-api plane: those RPCs
@@ -188,7 +196,7 @@ jobs:
         # on first boot, which is all the gate test needs.
         run: |
           set -euo pipefail
-          ./nexusd --cluster-init citest \
+          ./target/debug/nexusd-cluster --cluster-init citest \
             --hostname ci-founder \
             --advertise-addr 127.0.0.1:22127 \
             --data-dir "$RUNNER_TEMP/zone-data" \
