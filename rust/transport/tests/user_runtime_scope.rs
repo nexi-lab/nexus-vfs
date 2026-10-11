@@ -93,6 +93,16 @@ impl Listener {
     }
 
     async fn start_routed(ca: &[u8], cert: &[u8], key: &[u8], routing: Routing) -> Self {
+        Self::start_verified(ca, cert, key, routing, Arc::new(std::sync::OnceLock::new())).await
+    }
+
+    async fn start_verified(
+        ca: &[u8],
+        cert: &[u8],
+        key: &[u8],
+        routing: Routing,
+        verifier: transport::grpc::ForeignCaVerifierSlot,
+    ) -> Self {
         let root = tempfile::tempdir().unwrap();
         let kernel = Arc::new(Kernel::new());
         kernel
@@ -117,7 +127,7 @@ impl Listener {
                 Arc::clone(&kernel),
                 auth,
                 scope,
-                Arc::new(std::sync::OnceLock::new()),
+                verifier,
                 DataPlaneReady::open(),
                 1024 * 1024,
                 "scope-test",
@@ -125,7 +135,7 @@ impl Listener {
             Routing::Local => build_vfs_routes(
                 Arc::clone(&kernel),
                 auth,
-                Arc::new(std::sync::OnceLock::new()),
+                verifier,
                 DataPlaneReady::open(),
                 1024 * 1024,
                 "root-test",
@@ -134,7 +144,7 @@ impl Listener {
                 Arc::clone(&kernel),
                 auth,
                 resolver,
-                Arc::new(std::sync::OnceLock::new()),
+                verifier,
                 DataPlaneReady::open(),
                 1024 * 1024,
                 "gateway-test",
@@ -648,6 +658,95 @@ fn ping(delegation: &RuntimeDelegation) -> Request<PingRequest> {
     let mut request = Request::new(PingRequest::default());
     delegation.apply(request.metadata_mut()).unwrap();
     request
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_expired_session_certificate_cannot_keep_using_an_established_channel() {
+    lib::transport_primitives::ensure_crypto_provider();
+    let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let (node_cert, node_key) = generate_node_cert(1, "root", &ca, &ca_key, &[], None).unwrap();
+    let root = Listener::start(&ca, &node_cert, &node_key, None).await;
+    let classifier = lib::transport_primitives::FederatedClientCertVerifier::new(&ca).unwrap();
+    let (foreign_ca, _) = generate_zone_ca("foreign").unwrap();
+    classifier
+        .set_foreign_cas(&[lib::transport_primitives::ForeignCaAnchor::new(
+            "foreign",
+            pem::parse(foreign_ca).unwrap().into_contents(),
+        )])
+        .unwrap();
+    let verifier = Arc::new(std::sync::OnceLock::new());
+    verifier.set(classifier).unwrap();
+    let classified =
+        Listener::start_verified(&ca, &node_cert, &node_key, Routing::Local, verifier).await;
+    let (cert, key) =
+        generate_session_agent_cert("short-session", "alice", 30, &ca, &ca_key).unwrap();
+    let expires = transport::peer_identity::not_after_unix_from_pem(&cert).unwrap();
+    let mut clients = [
+        root.client(&ca, &cert, &key).await,
+        classified.client(&ca, &cert, &key).await,
+    ];
+    for client in &mut clients {
+        let first = client
+            .write(WriteRequest {
+                path: "/before-expiry.txt".into(),
+                content: b"valid credential".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!first.is_error);
+    }
+    let after_expiry = std::time::UNIX_EPOCH + std::time::Duration::from_secs(expires as u64 + 1);
+    if let Ok(wait) = after_expiry.duration_since(std::time::SystemTime::now()) {
+        tokio::time::sleep(wait).await;
+    }
+    for client in &mut clients {
+        let expired = client
+            .write(WriteRequest {
+                path: "/after-expiry.txt".into(),
+                content: b"expired credential".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            expired.is_error,
+            "an established TLS connection must not extend the credential lifetime"
+        );
+    }
+    for server in [&root, &classified] {
+        let mut operator = server.client(&ca, &node_cert, &node_key).await;
+        assert!(
+            !operator
+                .stat(StatRequest {
+                    path: "/after-expiry.txt".into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .into_inner()
+                .found
+        );
+    }
+    let (renewed_cert, renewed_key) =
+        generate_session_agent_cert("short-session", "alice", 300, &ca, &ca_key).unwrap();
+    for server in [&root, &classified] {
+        let mut renewed = server.client(&ca, &renewed_cert, &renewed_key).await;
+        let retained = renewed
+            .read(ReadRequest {
+                path: "/before-expiry.txt".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!retained.is_error);
+        assert_eq!(retained.content, b"valid credential");
+    }
+    root.close().await;
+    classified.close().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

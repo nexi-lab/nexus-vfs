@@ -67,7 +67,10 @@ pub fn classify_from_request<T>(
 // monomorphized across every request type (that duplication is real binary size).
 
 fn from_extensions(ext: &tonic::Extensions) -> Option<PeerIdentity> {
-    with_leaf_der(ext, from_der).flatten()
+    with_leaf_der(ext, |der| {
+        current_certificate(der).map(|cert| from_x509(&cert))
+    })
+    .flatten()
 }
 
 fn classify_from_extensions(
@@ -76,9 +79,18 @@ fn classify_from_extensions(
     foreign_anchors: &[ForeignCaAnchor],
 ) -> Option<PeerIdentity> {
     with_leaf_der(ext, |der| {
-        classify_peer_cert(der, cluster_ca_der, foreign_anchors).ok()
+        let cert = current_certificate(der)?;
+        classify_x509(&cert, cluster_ca_der, foreign_anchors).ok()
     })
     .flatten()
+}
+
+/// TLS validates time at connection setup; each request must still be within
+/// the credential's validity window on a long-lived connection.
+fn current_certificate(der: &[u8]) -> Option<x509_parser::certificate::X509Certificate<'_>> {
+    use x509_parser::prelude::*;
+    let (_, cert) = X509Certificate::from_der(der).ok()?;
+    cert.validity().is_valid().then_some(cert)
 }
 
 /// Run `f` with the TLS-verified leaf cert DER borrowed in place off the request
@@ -195,7 +207,7 @@ pub enum ClassifyError {
 /// * Chains to a foreign CA but is not an agent → [`ClassifyError::ForeignNotAnAgent`].
 /// * Chains to nothing registered → [`ClassifyError::UntrustedIssuer`].
 ///
-/// Runs once per handshake (not per message): the cluster CA is tried first —
+/// The cluster CA is tried first —
 /// the common case, one signature verify — and the foreign anchors only if that
 /// misses. `foreign_anchors` is the caller's cached set (rebuilt on an
 /// apply-observer invalidation), so classification does no store I/O.
@@ -206,16 +218,23 @@ pub fn classify_peer_cert(
 ) -> Result<PeerIdentity, ClassifyError> {
     use x509_parser::prelude::*;
     let (_, cert) = X509Certificate::from_der(der).map_err(|_| ClassifyError::Unparseable)?;
+    classify_x509(&cert, cluster_ca_der, foreign_anchors)
+}
 
+fn classify_x509(
+    cert: &x509_parser::certificate::X509Certificate<'_>,
+    cluster_ca_der: &[u8],
+    foreign_anchors: &[ForeignCaAnchor],
+) -> Result<PeerIdentity, ClassifyError> {
     // Local first — the common case, and a hit is a single signature verify.
-    if chains_to(&cert, cluster_ca_der) {
-        return Ok(from_x509(&cert));
+    if chains_to(cert, cluster_ca_der) {
+        return Ok(from_x509(cert));
     }
 
     // Foreign — whichever registered CA actually signed it names its domain.
     for anchor in foreign_anchors {
-        if chains_to(&cert, &anchor.ca_cert_der) {
-            let mut id = from_x509(&cert);
+        if chains_to(cert, &anchor.ca_cert_der) {
+            let mut id = from_x509(cert);
             if id.agent_name.is_none() {
                 // A foreign CA vouching for a node (or a SAN-less) cert is the
                 // exact thing the two-anchor split forbids.
