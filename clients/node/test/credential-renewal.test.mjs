@@ -157,11 +157,14 @@ test('a refused or substituted renewal closes the client without using another i
   const endpoint = await serve(t, { 'nexus.grpc.vfs.NexusVFSService': {
     Read(_call, callback) { callback(null, { content: Buffer.from('original session') }) },
   } })
-  for (const renew of [async () => { throw new Error('renewal revoked') }, async () => credential('other')]) {
+  for (const [renew, expected] of [
+    [async () => { throw new Error('renewal revoked') }, /renewal revoked/],
+    [async () => credential('other'), /inconsistent credentials/],
+  ]) {
     const client = NexusVfsClient.withMtls(endpoint, tls('old'), { connectTimeoutMs: 2000 })
     t.after(() => client.close())
     client.maintainSessionCredential(credential('old'), { validitySecs: 1, renew })
     await new Promise(resolve => setTimeout(resolve, 850))
-    await assert.rejects(client.read('/agents/a/history', ''), /closed/)
+    await assert.rejects(client.read('/agents/a/history', ''), expected)
   }
 })

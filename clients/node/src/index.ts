@@ -520,6 +520,7 @@ export class NexusVfsClient {
   private preparingChannel?: UnaryClient
   private stopCredentialRenewal?: () => void
   private readonly tlsServerName?: string
+  private credentialFailure?: Error
   private readonly connectTimeoutMs: number
   private readonly blockingReadMarginMs: number
 
@@ -849,7 +850,10 @@ export class NexusVfsClient {
     const armExpiry = () => {
       clearTimeout(expiryTimer)
       expiryTimer = setTimeout(() => {
-        if (Date.now() >= expiresAt) this.close()
+        if (Date.now() >= expiresAt) {
+          this.credentialFailure = new Error('session credential expired before renewal completed')
+          this.close()
+        }
         else armExpiry()
       }, Math.min(2_147_483_647, Math.max(0, expiresAt - Date.now())))
       expiryTimer.unref()
@@ -875,7 +879,10 @@ export class NexusVfsClient {
           && ['UNAVAILABLE', 'DEADLINE_EXCEEDED', 'RESOURCE_EXHAUSTED'].includes(error.status)
           && Date.now() < expiresAt) {
           schedule(Math.min(1000, expiresAt - Date.now()))
-        } else this.close()
+        } else {
+          this.credentialFailure = error instanceof Error ? error : new Error(String(error))
+          this.close()
+        }
       }
     }
     armExpiry()
@@ -933,7 +940,7 @@ export class NexusVfsClient {
     // the right bound for an RPC the server answers immediately. A call that
     // asks the server to hold the response needs its own, longer bound — see
     // the blocking branch of `streamReadAt`.
-    if (this.isClosed) return Promise.reject(new Error('nexus VFS client is closed'))
+    if (this.isClosed) return Promise.reject(this.credentialFailure ?? new Error('nexus VFS client is closed'))
     const channel = this.client
     this.channels.set(channel, (this.channels.get(channel) ?? 0) + 1)
     return invoke<Req, Res>(
@@ -943,7 +950,10 @@ export class NexusVfsClient {
       request,
       deadlineMs ?? this.connectTimeoutMs,
       this.calls,
-    ).finally(() => {
+    ).catch(error => {
+      if (this.isClosed && this.credentialFailure) throw this.credentialFailure
+      throw error
+    }).finally(() => {
       const active = this.channels.get(channel)
       if (active === undefined) return
       if (active === 1 && channel !== this.client) {
