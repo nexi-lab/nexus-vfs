@@ -36,8 +36,8 @@ use std::time::Duration;
 use common::{free_port_pair, mint_agent_cert, write_tls_bundle, Daemon, Vfs, LOG_FILTER};
 use nexus_raft::transport::{
     call_allow_session_minter_rpc, call_list_session_minters_rpc, call_mint_agent_rpc,
-    call_mint_session_agent_rpc, call_revoke_agent_cert_rpc, generate_join_token, generate_zone_ca,
-    TlsConfig,
+    call_mint_session_agent_rpc, call_renew_session_agent_rpc, call_revoke_agent_cert_rpc,
+    generate_join_token, generate_zone_ca, TlsConfig,
 };
 
 const ZONE: &str = "sharedzone";
@@ -328,11 +328,77 @@ async fn a_front_door_agent_mints_a_session_identity_for_a_person_and_can_revoke
         "a caller with no owner SAN is unchanged; got {moss_recorded}"
     );
 
+    // Renew through the live issuer, then use the unchanged actor to control
+    // the original process. Fresh minting cannot provide this continuity.
+    let issued_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let message = nexus_raft::transport::session_renewal_message(
+        ::pem::parse(&minted.agent_cert_pem).unwrap().contents(),
+        ::pem::parse(&moss_cert).unwrap().contents(),
+        300,
+        issued_at,
+    );
+    let proof =
+        lib::transport_primitives::authorship::sign(&message, &minted.agent_key_pem).unwrap();
+    let renewal = || nexus_raft::agent_minter::SessionRenewal {
+        cert_pem: &minted.agent_cert_pem,
+        validity_secs: 300,
+        issued_at_unix_ms: issued_at,
+        proof: &proof,
+    };
+    let renewed = call_renew_session_agent_rpc(&rpc, renewal(), moss_tls(), 10)
+        .await
+        .expect("renew RPC");
+    assert!(renewed.success, "renew refused: {:?}", renewed.error);
+    assert_eq!(renewed.subject_id, minted.subject_id);
+    assert_ne!(renewed.agent_key_pem, minted.agent_key_pem);
+    let mut renewed_session = Vfs::connect_mtls(
+        fport,
+        &ca,
+        &renewed.agent_cert_pem,
+        &renewed.agent_key_pem,
+        BUDGET,
+    )
+    .await;
+    let original_process = renewed_session
+        .call(
+            "managed_agent.get_session_v1",
+            &format!(r#"{{"session_id":"{session_id}"}}"#),
+            "",
+        )
+        .await
+        .expect("renewed actor reads original process");
+    let original_process: serde_json::Value = serde_json::from_str(&original_process).unwrap();
+    assert_eq!(original_process["session_id"], session_id);
+    assert_eq!(original_process["owner_id"], "alice");
+    let bad_proof = nexus_raft::agent_minter::SessionRenewal {
+        cert_pem: &minted.agent_cert_pem,
+        validity_secs: 300,
+        issued_at_unix_ms: issued_at,
+        proof: b"forged",
+    };
+    assert!(
+        !call_renew_session_agent_rpc(&rpc, bad_proof, moss_tls(), 10)
+            .await
+            .unwrap()
+            .success
+    );
+
     // ── 9. REVOKE by handing back the certificate ───────────────────────────
     call_revoke_agent_cert_rpc(&rpc, &minted.agent_cert_pem, moss_tls(), 10)
         .await
         .expect("rpc reaches the daemon")
         .expect("the minter that issued it may revoke it");
+
+    assert!(
+        !call_renew_session_agent_rpc(&rpc, renewal(), moss_tls(), 10)
+            .await
+            .unwrap()
+            .success,
+        "a revoked original key cannot obtain another credential"
+    );
 
     let mut revoked_conn = Vfs::connect_mtls(
         fport,

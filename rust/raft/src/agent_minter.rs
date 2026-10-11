@@ -26,6 +26,14 @@ pub struct AgentBundle {
     pub subject_id: String,
 }
 
+/// Proof-bound renewal of one current controller credential.
+pub struct SessionRenewal<'a> {
+    pub cert_pem: &'a [u8],
+    pub validity_secs: u64,
+    pub issued_at_unix_ms: u64,
+    pub proof: &'a [u8],
+}
+
 /// The CA holder's credential operations for remote callers: issue, and
 /// withdraw.
 ///
@@ -71,6 +79,15 @@ pub trait AgentMinter: Send + Sync {
         caller_cert_der: Option<Vec<u8>>,
         owner_id: &str,
         validity_secs: u64,
+    ) -> Result<AgentBundle, String>;
+
+    /// Preserve the signed session owner and actor, with a fresh key and serial.
+    /// The allow-listed minter must also prove possession of the current key;
+    /// expiry or revocation closes renewal. No execution state is persisted.
+    async fn renew_session(
+        &self,
+        caller_cert_der: Option<Vec<u8>>,
+        renewal: SessionRenewal<'_>,
     ) -> Result<AgentBundle, String>;
 
     /// Record `agent_cert_pem`'s serial in the CA-plane CRL, with its expiry.
