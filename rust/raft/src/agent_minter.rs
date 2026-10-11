@@ -81,6 +81,15 @@ pub trait AgentMinter: Send + Sync {
         validity_secs: u64,
     ) -> Result<AgentBundle, String>;
 
+    /// Issue a short-lived TLS server/client identity confined to one owner.
+    /// The issuer derives the server name; node and CA authority are absent.
+    async fn mint_user_runtime(
+        &self,
+        caller_cert_der: Option<Vec<u8>>,
+        owner_id: &str,
+        validity_secs: u64,
+    ) -> Result<AgentBundle, String>;
+
     /// Preserve the signed session owner and actor, with a fresh key and serial.
     /// The allow-listed minter must also prove possession of the current key;
     /// expiry or revocation closes renewal. No execution state is persisted.

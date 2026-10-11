@@ -224,6 +224,7 @@ pub fn generate_agent_cert(
         name,
         None,
         time::Duration::days(NODE_CERT_VALIDITY_DAYS),
+        None,
         ca_cert_pem,
         ca_key_pem,
     )
@@ -264,18 +265,41 @@ pub fn generate_session_agent_cert(
         name,
         Some(owner_id),
         time::Duration::seconds(validity_secs as i64),
+        None,
         ca_cert_pem,
         ca_key_pem,
     )
 }
 
-/// The one place an agent cert is built. Both public entry points differ only
-/// in their owner SAN and validity, so they share this rather than two copies
-/// of the key type, DN, EKU and signing that must not drift apart.
+/// Sign one short-lived user runtime identity without node or CA authority.
+pub fn generate_user_runtime_cert(
+    name: &str,
+    owner_id: &str,
+    validity_secs: u64,
+    ca_cert_pem: &[u8],
+    ca_key_pem: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    use lib::transport_primitives::{user_runtime_server_name, USER_RUNTIME_MAX_VALIDITY_SECS};
+    if validity_secs == 0 || validity_secs > USER_RUNTIME_MAX_VALIDITY_SECS {
+        return Err("user runtime validity must be between 1 and 300 seconds".into());
+    }
+    let server_name = user_runtime_server_name(owner_id)?;
+    sign_agent_cert(
+        name,
+        Some(owner_id),
+        time::Duration::seconds(validity_secs as i64),
+        Some(&server_name),
+        ca_cert_pem,
+        ca_key_pem,
+    )
+}
+
+/// Shared signing for agent, controller and user-runtime identities.
 fn sign_agent_cert(
     name: &str,
     owner_id: Option<&str>,
     validity: time::Duration,
+    server_name: Option<&str>,
     ca_cert_pem: &[u8],
     ca_key_pem: &[u8],
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
@@ -291,11 +315,8 @@ fn sign_agent_cert(
     dn.push(DnType::CommonName, format!("nexus-agent-{name}"));
     params.distinguished_name = dn;
 
-    // The machine-readable identity. No localhost / IP / cluster server-name
-    // SANs — an agent never serves TLS, it presents this as a client cert, and
-    // rustls ignores URI SANs for hostname verification. A session cert adds an
-    // owner SAN beside it; the two authorities are disjoint, so neither parser
-    // can read the other's URI.
+    // Agent identity and owner use disjoint URI authorities. A user runtime
+    // adds only its owner-derived DNS name, never the cluster node name.
     let mut sans = vec![SanType::URI(
         lib::agent_identity::agent_identity_uri(name)
             .as_str()
@@ -310,11 +331,23 @@ fn sign_agent_cert(
                 .map_err(|e| format!("owner SAN error: {e}"))?,
         ));
     }
+    if let Some(server_name) = server_name {
+        sans.push(SanType::DnsName(
+            server_name
+                .try_into()
+                .map_err(|e| format!("runtime DNS SAN: {e}"))?,
+        ));
+    }
     params.subject_alt_names = sans;
 
-    // Client only, and a signing key (it signs both the mTLS handshake and
-    // message envelopes).
+    // The same key authenticates mTLS and signs messages. Server capability
+    // exists only on the explicit owner-bound runtime path.
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    if server_name.is_some() {
+        params
+            .extended_key_usages
+            .push(ExtendedKeyUsagePurpose::ServerAuth);
+    }
     params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     params.is_ca = IsCa::NoCa;
 
@@ -820,6 +853,113 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("owner"), "{err}");
+    }
+
+    #[test]
+    fn user_runtime_certificate_is_a_short_owner_bound_agent_and_tls_server() {
+        use lib::transport_primitives::{user_runtime_name_from_x509, user_runtime_server_name};
+        use x509_parser::prelude::*;
+        let (ca, key) = generate_test_ca();
+        let (bytes, _) = generate_user_runtime_cert(
+            "session-runtime",
+            "alice",
+            300,
+            ca.as_bytes(),
+            key.as_bytes(),
+        )
+        .unwrap();
+        let pem = ::pem::parse(bytes).unwrap();
+        let (_, cert) = X509Certificate::from_der(pem.contents()).unwrap();
+        assert_eq!(
+            user_runtime_server_name("alice").unwrap(),
+            "nexus-user-2bd806c97f0e00af1a1fc3328fa763a9269723c8"
+        );
+        assert_eq!(
+            user_runtime_name_from_x509(&cert).unwrap(),
+            Some(user_runtime_server_name("alice").unwrap())
+        );
+        assert_eq!(
+            lib::transport_primitives::authorship::owner_from_x509(&cert).as_deref(),
+            Some("alice")
+        );
+        assert!(!cert.is_ca());
+        assert_eq!(
+            cert.validity().not_after.timestamp() - cert.validity().not_before.timestamp(),
+            300
+        );
+        let uris: Vec<_> = cert
+            .subject_alternative_name()
+            .unwrap()
+            .unwrap()
+            .value
+            .general_names
+            .iter()
+            .filter_map(|name| match name {
+                GeneralName::URI(uri) => Some(*uri),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            uris,
+            ["nexus://agent/session-runtime", "nexus://owner/alice"]
+        );
+        let (controller, _) = generate_session_agent_cert(
+            "session-controller",
+            "alice",
+            300,
+            ca.as_bytes(),
+            key.as_bytes(),
+        )
+        .unwrap();
+        let pem = ::pem::parse(controller).unwrap();
+        let (_, cert) = X509Certificate::from_der(pem.contents()).unwrap();
+        assert_eq!(user_runtime_name_from_x509(&cert).unwrap(), None);
+    }
+
+    #[test]
+    fn user_runtime_certificate_refuses_unbounded_or_ambiguous_owner_and_lifetime() {
+        let (ca, key) = generate_test_ca();
+        for owner in ["", "alice\n", &"a".repeat(257)] {
+            assert!(generate_user_runtime_cert(
+                "session-runtime",
+                owner,
+                300,
+                ca.as_bytes(),
+                key.as_bytes()
+            )
+            .is_err());
+        }
+        for seconds in [0, 301, u64::MAX] {
+            assert!(generate_user_runtime_cert(
+                "session-runtime",
+                "alice",
+                seconds,
+                ca.as_bytes(),
+                key.as_bytes()
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn runtime_capability_cannot_be_renewed_with_a_root_or_another_owners_server_name() {
+        use x509_parser::prelude::*;
+        let (ca, key) = generate_test_ca();
+        let bob = lib::transport_primitives::user_runtime_server_name("bob").unwrap();
+        for name in ["nexus-node", bob.as_str()] {
+            let (bytes, _) = sign_agent_cert(
+                "session-runtime",
+                Some("alice"),
+                ::time::Duration::seconds(300),
+                Some(name),
+                ca.as_bytes(),
+                key.as_bytes(),
+            )
+            .unwrap();
+            let pem = ::pem::parse(bytes).unwrap();
+            let (_, cert) = X509Certificate::from_der(pem.contents()).unwrap();
+            assert!(lib::transport_primitives::user_runtime_name_from_x509(&cert).is_err());
+        }
     }
 
     /// Every node cert must carry the fixed cluster server name as a DNS SAN —

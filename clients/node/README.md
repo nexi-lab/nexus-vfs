@@ -164,6 +164,22 @@ issuer RPC when the controller closes. These credentials and timers are never
 persisted. This API requires an issuer implementing `RenewSessionAgent`;
 older issuers fail visibly and cannot provide controller continuity.
 
+## User runtime TLS identity
+
+An allow-listed control plane can call
+`issuer.mintUserRuntime(ownerId, { validitySecs: 300 })`. The returned agent
+credential carries the signed owner, client/server TLS usage and a DNS SAN
+from `userRuntimeServerName(ownerId)`. It has no node identity or CA authority.
+The issuer bounds the lifetime to 300 seconds and accepts no caller-selected
+server name. A gateway must verify this exact owner-derived name when it dials
+the runtime; the Pod address may change without changing that identity.
+
+`renewSessionAgent` preserves the signed owner, subject, TLS name and key
+usage, while changing the key and serial. The same minter gate and revocation
+checks apply. Server certificate rotation and trusted runtime placement remain
+deployment responsibilities; `maintainSessionCredential` rotates client
+channels and does not install or rotate a TLS server.
+
 ## Development
 
 ```bash

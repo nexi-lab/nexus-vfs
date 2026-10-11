@@ -44,8 +44,9 @@ pub(crate) mod certgen;
 #[cfg(all(feature = "grpc", has_protos))]
 pub use certgen::{
     append_join_token_hash, bootstrap_tls, generate_agent_cert, generate_join_token,
-    generate_node_cert, generate_session_agent_cert, generate_zone_ca, join_token_hash_path,
-    node_identity_uri, parse_node_identity_uri, read_join_token_hashes, BootstrapTls,
+    generate_node_cert, generate_session_agent_cert, generate_user_runtime_cert, generate_zone_ca,
+    join_token_hash_path, node_identity_uri, parse_node_identity_uri, read_join_token_hashes,
+    BootstrapTls,
 };
 /// Re-exported so a caller that already depends on this crate can name a
 /// session subject without taking a direct dependency on `lib` — the cluster
@@ -54,6 +55,8 @@ pub use certgen::{
 /// `lib::agent_identity`; this is a pass-through, not a second copy.
 #[cfg(all(feature = "grpc", has_protos))]
 pub use lib::agent_identity::session_agent_name;
+#[cfg(all(feature = "grpc", has_protos))]
+pub use lib::transport_primitives::{user_runtime_server_name, USER_RUNTIME_MAX_VALIDITY_SECS};
 /// Re-exported for the same reason as [`session_agent_name`]: the mint that writes
 /// an agent bundle and the clients that read one both need the credential layout,
 /// and it has one definition in `lib::transport_primitives::agent_credential`.

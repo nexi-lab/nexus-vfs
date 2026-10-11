@@ -24,6 +24,7 @@ pub struct VerifiedSessionRenewal {
     pub subject_id: String,
     pub owner_id: String,
     pub serial: Vec<u8>,
+    pub runtime_server_name: Option<String>,
 }
 
 /// Verify the existing key, issuer, credential lifetime and requester binding.
@@ -77,10 +78,12 @@ pub fn verify_session_renewal(
     let owner_id = lib::transport_primitives::authorship::owner_from_x509(&cert)
         .filter(|owner| !owner.is_empty())
         .ok_or("session renewal requires a signed owner")?;
+    let runtime_server_name = lib::transport_primitives::user_runtime_name_from_x509(&cert)?;
     Ok(VerifiedSessionRenewal {
         subject_id,
         owner_id,
         serial: cert.raw_serial().to_vec(),
+        runtime_server_name,
     })
 }
 
