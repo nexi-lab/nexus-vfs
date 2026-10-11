@@ -9,7 +9,7 @@
 //! | -------------------------------- | ---------------------------------------- |
 //! | `Read`/`Write`/`Delete`/`Ping`   | Pure Rust → `Kernel::sys_*`              |
 //! | `BatchRead`                      | Pure Rust → `Kernel::sys_read` (batch)   |
-//! | `Call`                           | Stubbed (`Unimplemented`)                |
+//! | `Call`                           | Kernel-native service dispatcher         |
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -18,6 +18,8 @@ use std::time::Instant;
 
 use crate::auth::{AuthCredentials, AuthProvider};
 use crate::peer_identity;
+use crate::runtime_gateway::{UserRuntimeGateway, UserRuntimeResolver};
+use crate::runtime_scope::{RuntimeScope, RUNTIME_DELEGATION_METADATA_KEY};
 use tokio::sync::oneshot;
 use tonic::{transport::Server, Request, Response, Status};
 
@@ -102,6 +104,7 @@ pub type ForeignCaVerifierSlot =
 pub(crate) struct VfsServiceImpl {
     pub(crate) kernel: Arc<Kernel>,
     pub(crate) auth: Arc<dyn AuthProvider>,
+    runtime_scope: Option<Arc<RuntimeScope>>,
     /// Late-bound verifier (see [`ForeignCaVerifierSlot`]). Filled ⇒ `authenticate`
     /// classifies the peer cert against it so a registered foreign CA's agent
     /// resolves qualified (`{trust_domain}/agent/{name}`) rather than a bare local
@@ -253,6 +256,11 @@ impl_authed_request!(
     WriteRequest,
 );
 
+/// An identity already resolved for this in-process request. Extensions never
+/// cross the network, so a caller cannot supply this authentication result.
+#[derive(Clone)]
+pub(crate) struct AuthenticatedRequestContext(pub(crate) OperationContext);
+
 impl VfsServiceImpl {
     /// Authenticate a request and unwrap it.
     ///
@@ -272,11 +280,22 @@ impl VfsServiceImpl {
         &self,
         req: Request<T>,
     ) -> Result<(OperationContext, T), Status> {
+        let ctx = self.request_context(&req).await?;
+        Ok((ctx, req.into_inner()))
+    }
+
+    pub(crate) async fn request_context<T: AuthedRequest>(
+        &self,
+        req: &Request<T>,
+    ) -> Result<OperationContext, Status> {
         if !self.ready.wait(DATA_PLANE_READY_BUDGET).await {
             return Err(Status::unavailable(
                 "nexusd is still booting: the VFS data plane is not wired yet \
                  (no distributed coordinator) — retry",
             ));
+        }
+        if let Some(ctx) = req.extensions().get::<AuthenticatedRequestContext>() {
+            return Ok(ctx.0.clone());
         }
         // Resolve the peer identity, foreign-CA aware only when it can matter.
         // `foreign_anchors()` is an O(1) ArcSwap read the apply observer keeps
@@ -289,19 +308,39 @@ impl VfsServiceImpl {
             Some(v) => {
                 let anchors = v.foreign_anchors();
                 if anchors.is_empty() {
-                    peer_identity::from_request(&req)
+                    peer_identity::from_request(req)
                 } else {
-                    peer_identity::classify_from_request(&req, v.cluster_ca_der(), &anchors)
+                    peer_identity::classify_from_request(req, v.cluster_ca_der(), &anchors)
                 }
             }
-            None => peer_identity::from_request(&req),
+            None => peer_identity::from_request(req),
         };
-        let inner = req.into_inner();
         let ctx = self.auth.resolve(&AuthCredentials {
-            token: inner.auth_token(),
+            token: req.get_ref().auth_token(),
             peer: peer.as_ref(),
         })?;
-        Ok((ctx, inner))
+        let ctx = match &self.runtime_scope {
+            Some(scope) => scope.resolve(
+                self.auth.as_ref(),
+                ctx,
+                peer.as_ref(),
+                req.get_ref().auth_token(),
+                req.metadata(),
+            )?,
+            None => {
+                if req
+                    .metadata()
+                    .get_bin(RUNTIME_DELEGATION_METADATA_KEY)
+                    .is_some()
+                {
+                    return Err(Status::permission_denied(
+                        "runtime delegation is not enabled on this endpoint",
+                    ));
+                }
+                ctx
+            }
+        };
+        Ok(ctx)
     }
 
     /// Pick the RPC code; take the message from the error itself.
@@ -609,6 +648,7 @@ impl VfsServiceImpl {
         Self {
             kernel,
             auth: Arc::new(crate::auth::NoAuth),
+            runtime_scope: None,
             foreign_ca_verifier: Arc::new(std::sync::OnceLock::new()),
             ready,
             server_started_at: Instant::now(),
@@ -1796,15 +1836,102 @@ pub fn build_vfs_routes(
     max_message_bytes: usize,
     server_version: &str,
 ) -> tonic::service::Routes {
+    build_routes(
+        kernel,
+        auth,
+        foreign_ca_verifier,
+        ready,
+        max_message_bytes,
+        server_version,
+        RuntimeRouting::Local,
+    )
+}
+
+/// Build the same typed VFS surface with confinement to one user runtime.
+pub fn build_user_runtime_routes(
+    kernel: Arc<Kernel>,
+    auth: Arc<dyn AuthProvider>,
+    scope: RuntimeScope,
+    foreign_ca_verifier: ForeignCaVerifierSlot,
+    ready: Arc<DataPlaneReady>,
+    max_message_bytes: usize,
+    server_version: &str,
+) -> tonic::service::Routes {
+    build_routes(
+        kernel,
+        auth,
+        foreign_ca_verifier,
+        ready,
+        max_message_bytes,
+        server_version,
+        RuntimeRouting::User(Arc::new(scope)),
+    )
+}
+
+/// Build a root gateway whose session-agent requests use deployment placement.
+pub fn build_runtime_gateway_routes(
+    kernel: Arc<Kernel>,
+    auth: Arc<dyn AuthProvider>,
+    resolver: Arc<dyn UserRuntimeResolver>,
+    foreign_ca_verifier: ForeignCaVerifierSlot,
+    ready: Arc<DataPlaneReady>,
+    max_message_bytes: usize,
+    server_version: &str,
+) -> tonic::service::Routes {
+    build_routes(
+        kernel,
+        auth,
+        foreign_ca_verifier,
+        ready,
+        max_message_bytes,
+        server_version,
+        RuntimeRouting::Gateway(resolver),
+    )
+}
+
+enum RuntimeRouting {
+    Local,
+    User(Arc<RuntimeScope>),
+    Gateway(Arc<dyn UserRuntimeResolver>),
+}
+
+fn build_routes(
+    kernel: Arc<Kernel>,
+    auth: Arc<dyn AuthProvider>,
+    foreign_ca_verifier: ForeignCaVerifierSlot,
+    ready: Arc<DataPlaneReady>,
+    max_message_bytes: usize,
+    server_version: &str,
+    routing: RuntimeRouting,
+) -> tonic::service::Routes {
+    let runtime_scope = match &routing {
+        RuntimeRouting::User(scope) => Some(Arc::clone(scope)),
+        _ => None,
+    };
     let svc = VfsServiceImpl {
         kernel,
         auth,
+        runtime_scope,
         foreign_ca_verifier,
         ready,
         server_started_at: Instant::now(),
         server_version: Arc::from(server_version),
         started_secs: Arc::new(AtomicU64::new(0)),
     };
+    match routing {
+        RuntimeRouting::Gateway(resolver) => vfs_routes(
+            UserRuntimeGateway {
+                local: svc,
+                resolver,
+                max_message_bytes,
+            },
+            max_message_bytes,
+        ),
+        _ => vfs_routes(svc, max_message_bytes),
+    }
+}
+
+fn vfs_routes<T: NexusVfsService>(svc: T, max_message_bytes: usize) -> tonic::service::Routes {
     let server = NexusVfsServiceServer::new(svc)
         .max_decoding_message_size(max_message_bytes)
         .max_encoding_message_size(max_message_bytes);

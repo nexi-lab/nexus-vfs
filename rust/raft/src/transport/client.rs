@@ -12,9 +12,9 @@ use super::proto::nexus::raft::{
     GetLockInfo, GetMetadata, JoinClusterRequest, JoinZoneRequest, ListForeignCasRequest,
     ListKeysRequest, ListMetadata, ListSessionMintersRequest, MintAgentRequest, MintKeyRequest,
     MintSessionAgentRequest, ProposeRequest, PutMetadata, QueryRequest, RaftCommand, RaftQuery,
-    RegisterForeignCaRequest, ReleaseLock, RemoveVoterRequest, ReplicateEntriesRequest,
-    RevokeAgentCertRequest, RevokeKeyRequest, SnapshotEcStateRequest, StepMessageRequest,
-    UnregisterForeignCaRequest,
+    RegisterForeignCaRequest, ReleaseLock, RemoveVoterRequest, RenewSessionAgentRequest,
+    ReplicateEntriesRequest, RevokeAgentCertRequest, RevokeKeyRequest, SnapshotEcStateRequest,
+    StepMessageRequest, UnregisterForeignCaRequest,
 };
 use super::{NodeAddress, Result, TransportError};
 use std::collections::HashMap;
@@ -1172,6 +1172,19 @@ pub struct MintSessionAgentResult {
     pub subject_id: String,
 }
 
+impl From<super::proto::nexus::raft::MintSessionAgentResponse> for MintSessionAgentResult {
+    fn from(response: super::proto::nexus::raft::MintSessionAgentResponse) -> Self {
+        Self {
+            success: response.success,
+            error: response.error,
+            agent_cert_pem: response.agent_cert_pem,
+            agent_key_pem: response.agent_key_pem,
+            ca_pem: response.ca_pem,
+            subject_id: response.subject_id,
+        }
+    }
+}
+
 /// Ask the CA holder for a session credential bound to `owner_id`.
 ///
 /// The caller must present an mTLS client certificate that is on the cluster's
@@ -1193,14 +1206,28 @@ pub async fn call_mint_session_agent_rpc(
         .await
         .map_err(|e| TransportError::Rpc(format!("MintSessionAgent RPC failed: {e}")))?
         .into_inner();
-    Ok(MintSessionAgentResult {
-        success: response.success,
-        error: response.error,
-        agent_cert_pem: response.agent_cert_pem,
-        agent_key_pem: response.agent_key_pem,
-        ca_pem: response.ca_pem,
-        subject_id: response.subject_id,
-    })
+    Ok(response.into())
+}
+
+/// Renew the same actor using a session-key proof bound to the minter's TLS leaf.
+pub async fn call_renew_session_agent_rpc(
+    peer_addr: &str,
+    renewal: crate::agent_minter::SessionRenewal<'_>,
+    tls: Option<super::TlsConfig>,
+    timeout_secs: u64,
+) -> Result<MintSessionAgentResult> {
+    let mut client = connect_zone_api(peer_addr, tls, timeout_secs, "RenewSessionAgent").await?;
+    let response = client
+        .renew_session_agent(RenewSessionAgentRequest {
+            agent_cert_pem: renewal.cert_pem.to_vec(),
+            validity_secs: renewal.validity_secs,
+            issued_at_unix_ms: renewal.issued_at_unix_ms,
+            proof: renewal.proof.to_vec(),
+        })
+        .await
+        .map_err(|e| TransportError::Rpc(format!("RenewSessionAgent RPC failed: {e}")))?
+        .into_inner();
+    Ok(response.into())
 }
 
 /// Revoke a certificate by handing it over — the holder is the party that has

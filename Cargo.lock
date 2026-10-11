@@ -4807,6 +4807,7 @@ dependencies = [
 name = "transport"
 version = "0.1.0"
 dependencies = [
+ "auth",
  "axum",
  "backends",
  "base64 0.22.1",
@@ -4820,6 +4821,7 @@ dependencies = [
  "http-body-util",
  "kernel",
  "lib",
+ "managed-agent",
  "nexus-plugin-abi",
  "nexus-search-common",
  "parking_lot",
