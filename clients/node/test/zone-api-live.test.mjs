@@ -22,7 +22,7 @@ import grpc from '@grpc/grpc-js'
 import protoLoader from '@grpc/proto-loader'
 import protobuf from 'protobufjs'
 
-import { NexusZoneApiClient } from '../dist/index.js'
+import { NexusVfsClient, NexusZoneApiClient } from '../dist/index.js'
 import {
   CORE_METADATA_PROTO,
   RAFT_COMMANDS_PROTO,
@@ -146,6 +146,48 @@ test(
       )
 
       await agent.revokeAgentCert(credential.certPem)
+    })
+
+    await t.test('renewal preserves the actor, bytes and a pending watch across real certificate expiry', async () => {
+      const validitySecs = 6
+      const original = await agent.mintSessionAgent(OWNER, { validitySecs })
+      const originalTls = { ca: original.caPem, cert: original.certPem, key: original.keyPem }
+      const expired = NexusVfsClient.withMtls(endpoint, originalTls, { connectTimeoutMs: 3000 })
+      const active = NexusVfsClient.withMtls(endpoint, originalTls, { connectTimeoutMs: 3000 })
+      const path = `/agents/credential-renewal-${process.pid}`
+      const before = Buffer.from('before real certificate expiry')
+      const after = Buffer.from('same actor after real certificate expiry')
+      let current = original
+      let renewals = 0
+      try {
+        await expired.write(path, before, '')
+        const watch = active.watch(path, '', { timeoutMs: 20000 })
+        void watch.catch(() => {})
+        active.maintainSessionCredential(original, {
+          validitySecs,
+          renew: async (credential, signal) => {
+            assert.equal(signal.aborted, false)
+            current = await agent.renewSessionAgent(credential, { validitySecs })
+            assert.equal(current.subjectId, original.subjectId)
+            renewals++
+            return current
+          },
+        })
+        const until = Date.parse(new X509Certificate(original.certPem).validTo) + 6500
+        await new Promise(resolve => setTimeout(resolve, Math.max(0, until - Date.now())))
+        assert.ok(renewals >= 2, `expected continuous renewal, got ${renewals}`)
+        await assert.rejects(expired.read(path, ''), 'the original established TLS connection must lose authority')
+        assert.deepEqual(await active.read(path, ''), before)
+        await active.write(path, after, '')
+        assert.equal((await watch).matched, true, 'the poll started under the original certificate completes after rotation')
+        assert.deepEqual(await active.read(path, ''), after)
+        active.close()
+        await agent.revokeAgentCert(current.certPem)
+        await assert.rejects(agent.renewSessionAgent(current, { validitySecs }), /revoked/)
+      } finally {
+        expired.close()
+        active.close()
+      }
     })
 
     await t.test('taking the agent off the list refuses it again', async () => {

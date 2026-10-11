@@ -60,12 +60,19 @@ pub use lib::agent_identity::session_agent_name;
 #[cfg(all(feature = "grpc", has_protos))]
 pub use lib::transport_primitives::{AgentCredential, LoadedCredential, CREDENTIAL_MANIFEST};
 #[cfg(all(feature = "grpc", has_protos))]
+mod session_renewal;
+#[cfg(all(feature = "grpc", has_protos))]
+pub use session_renewal::{
+    session_renewal_message, verify_session_renewal, VerifiedSessionRenewal,
+};
+#[cfg(all(feature = "grpc", has_protos))]
 pub(crate) mod crl;
 #[cfg(all(feature = "grpc", has_protos))]
 pub use crl::{
     add_revoked_serial, add_revoked_serial_with_expiry, crl_revoked_serials, generate_crl,
-    prune_expired_serials, read_revoked_entries, read_revoked_serials, revoked_serials_path,
-    serial_from_cert_pem, RevokedEntry,
+    prune_expired_serials, read_revoked_entries, read_revoked_serials,
+    read_revoked_serials_checked, revoked_serials_path, serial_from_cert_pem,
+    with_unrevoked_serial, RevokedEntry,
 };
 #[cfg(all(feature = "grpc", has_protos))]
 mod client;
@@ -80,11 +87,11 @@ pub use client::{
     call_discover_zones_rpc, call_get_crl, call_join_cluster, call_join_zone_rpc,
     call_list_foreign_cas_rpc, call_list_keys_rpc, call_list_session_minters_rpc,
     call_mint_agent_rpc, call_mint_key_rpc, call_mint_session_agent_rpc,
-    call_register_foreign_ca_rpc, call_remove_voter_rpc, call_revoke_agent_cert_rpc,
-    call_revoke_key_rpc, call_unregister_foreign_ca_rpc, ClientConfig, ClusterInfoResult,
-    DiscoveredZone, JoinClusterResult, JoinZoneResult, MintAgentResult, MintKeyArgs,
-    MintSessionAgentResult, ProposeResult, QueryResult, RaftApiClient, RaftClient, RaftClientPool,
-    RemoveVoterResult,
+    call_register_foreign_ca_rpc, call_remove_voter_rpc, call_renew_session_agent_rpc,
+    call_revoke_agent_cert_rpc, call_revoke_key_rpc, call_unregister_foreign_ca_rpc, ClientConfig,
+    ClusterInfoResult, DiscoveredZone, JoinClusterResult, JoinZoneResult, MintAgentResult,
+    MintKeyArgs, MintSessionAgentResult, ProposeResult, QueryResult, RaftApiClient, RaftClient,
+    RaftClientPool, RemoveVoterResult,
 };
 #[cfg(all(feature = "grpc", has_protos))]
 pub use server::{
