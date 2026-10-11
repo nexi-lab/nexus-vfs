@@ -24,16 +24,40 @@ use super::proto::nexus::raft::{
     MintSessionAgentResponse, NodeInfo as ProtoNodeInfo, ProposeRequest, ProposeResponse,
     QueryRequest, QueryResponse, RaftCommand, RaftQueryResponse, RaftResponse, ReadBlobRequest,
     ReadBlobResponse, RegisterForeignCaRequest, RegisterForeignCaResponse, RemoveVoterRequest,
-    RemoveVoterResponse, ReplicateEntriesRequest, ReplicateEntriesResponse, RevokeAgentCertRequest,
-    RevokeAgentCertResponse, RevokeKeyRequest, RevokeKeyResponse, SearchCapabilities,
-    SnapshotEcStateRequest, SnapshotEcStateResponse, StepMessageRequest, StepMessageResponse,
-    UnregisterForeignCaRequest, UnregisterForeignCaResponse,
+    RemoveVoterResponse, RenewSessionAgentRequest, ReplicateEntriesRequest,
+    ReplicateEntriesResponse, RevokeAgentCertRequest, RevokeAgentCertResponse, RevokeKeyRequest,
+    RevokeKeyResponse, SearchCapabilities, SnapshotEcStateRequest, SnapshotEcStateResponse,
+    StepMessageRequest, StepMessageResponse, UnregisterForeignCaRequest,
+    UnregisterForeignCaResponse,
 };
 use super::{NodeAddress, Result, SharedPeerMap, TransportError};
-use crate::agent_minter::AgentMinterSlot;
+use crate::agent_minter::{AgentBundle, AgentMinterSlot};
 use crate::blob_fetcher::BlobFetcherSlot;
 use crate::foreign_ca_registrar::ForeignCaRegistrarSlot;
 use crate::key_minter::{KeyMinterSlot, MintKeyParams};
+
+fn session_credential_response(
+    result: std::result::Result<AgentBundle, String>,
+) -> Response<MintSessionAgentResponse> {
+    Response::new(match result {
+        Ok(bundle) => MintSessionAgentResponse {
+            success: true,
+            error: None,
+            agent_cert_pem: bundle.cert_pem,
+            agent_key_pem: bundle.key_pem,
+            ca_pem: bundle.ca_pem,
+            subject_id: bundle.subject_id,
+        },
+        Err(error) => MintSessionAgentResponse {
+            success: false,
+            error: Some(error),
+            agent_cert_pem: Vec::new(),
+            agent_key_pem: Vec::new(),
+            ca_pem: Vec::new(),
+            subject_id: String::new(),
+        },
+    })
+}
 use crate::raft::{
     reconcile_peers_with_conf_state, Command, CommandResult, FullStateMachine, RaftError,
     WitnessStateMachine, ZoneConsensus, ZoneRaftRegistry,
@@ -1636,41 +1660,50 @@ impl ZoneApiService for ZoneApiServiceImpl {
     ) -> std::result::Result<Response<MintSessionAgentResponse>, Status> {
         let caller_cert_der = peer_cert_der(&request);
         let req = request.into_inner();
-        let err_resp = |msg: String| {
-            Response::new(MintSessionAgentResponse {
-                success: false,
-                error: Some(msg),
-                agent_cert_pem: Vec::new(),
-                agent_key_pem: Vec::new(),
-                ca_pem: Vec::new(),
-                subject_id: String::new(),
-            })
-        };
         let minter = self
             .agent_minter_slot
             .as_ref()
             .and_then(|slot| slot.read().as_ref().cloned());
         let Some(minter) = minter else {
-            return Ok(err_resp(
+            return Ok(session_credential_response(Err(
                 "this node does not hold the cluster CA; mint against the founder".to_string(),
-            ));
+            )));
         };
-        match minter
-            .mint_session(caller_cert_der, &req.owner_id, req.validity_secs)
-            .await
-        {
-            // The subject comes from the bundle, not from anything the caller
-            // sent: the caller does not choose it.
-            Ok(bundle) => Ok(Response::new(MintSessionAgentResponse {
-                success: true,
-                error: None,
-                agent_cert_pem: bundle.cert_pem,
-                agent_key_pem: bundle.key_pem,
-                ca_pem: bundle.ca_pem,
-                subject_id: bundle.subject_id,
-            })),
-            Err(e) => Ok(err_resp(e)),
-        }
+        Ok(session_credential_response(
+            minter
+                .mint_session(caller_cert_der, &req.owner_id, req.validity_secs)
+                .await,
+        ))
+    }
+
+    /// Renew a controller only after the CA holder verifies its current key.
+    async fn renew_session_agent(
+        &self,
+        request: Request<RenewSessionAgentRequest>,
+    ) -> std::result::Result<Response<MintSessionAgentResponse>, Status> {
+        let caller_cert_der = peer_cert_der(&request);
+        let req = request.into_inner();
+        let minter = self
+            .agent_minter_slot
+            .as_ref()
+            .and_then(|slot| slot.read().as_ref().cloned());
+        let result = match minter {
+            Some(minter) => {
+                minter
+                    .renew_session(
+                        caller_cert_der,
+                        crate::agent_minter::SessionRenewal {
+                            cert_pem: &req.agent_cert_pem,
+                            validity_secs: req.validity_secs,
+                            issued_at_unix_ms: req.issued_at_unix_ms,
+                            proof: &req.proof,
+                        },
+                    )
+                    .await
+            }
+            None => Err("this node does not hold the cluster CA; renew against the founder".into()),
+        };
+        Ok(session_credential_response(result))
     }
 
     /// Record a certificate's serial in the CA-plane CRL.

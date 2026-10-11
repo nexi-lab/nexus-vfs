@@ -5514,6 +5514,54 @@ impl nexus_raft::agent_minter::AgentMinter for FounderAgentMinter {
         })
     }
 
+    async fn renew_session(
+        &self,
+        caller_cert_der: Option<Vec<u8>>,
+        renewal: nexus_raft::agent_minter::SessionRenewal<'_>,
+    ) -> std::result::Result<nexus_raft::agent_minter::AgentBundle, String> {
+        let caller = gate_allowlisted_session_minter(caller_cert_der.clone(), &self.session_allow)?;
+        let caller_der = caller_cert_der.ok_or("session renewal requires mTLS")?;
+        let ca_pem = std::fs::read(self.tls_dir.join("ca.pem"))
+            .map_err(|e| format!("read cluster CA: {e}"))?;
+        if renewal.cert_pem.len() > 16 * 1024 {
+            return Err("session renewal certificate exceeds its size bound".into());
+        }
+        let serial = nexus_raft::transport::serial_from_cert_pem(renewal.cert_pem)?;
+        let ca_key_pem = std::fs::read(self.tls_dir.join("ca-key.pem"))
+            .map_err(|e| format!("read cluster CA key: {e}"))?;
+        let (cert_pem, key_pem, subject_id) = nexus_raft::transport::with_unrevoked_serial(
+            &nexus_raft::transport::revoked_serials_path(&self.data_dir),
+            &serial,
+            || {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|_| "session renewal clock precedes epoch")?
+                    .as_millis();
+                let verified = nexus_raft::transport::verify_session_renewal(
+                    &renewal,
+                    &caller_der,
+                    &ca_pem,
+                    u64::try_from(now_ms).map_err(|_| "session renewal clock overflow")?,
+                )?;
+                let (cert_pem, key_pem) = nexus_raft::transport::generate_session_agent_cert(
+                    &verified.subject_id,
+                    &verified.owner_id,
+                    renewal.validity_secs,
+                    &ca_pem,
+                    &ca_key_pem,
+                )?;
+                Ok((cert_pem, key_pem, verified.subject_id))
+            },
+        )?;
+        tracing::info!(caller = %caller, subject = %subject_id, "renewed session credential");
+        Ok(nexus_raft::agent_minter::AgentBundle {
+            cert_pem,
+            key_pem,
+            ca_pem,
+            subject_id,
+        })
+    }
+
     async fn revoke_cert(
         &self,
         caller_cert_der: Option<Vec<u8>>,
@@ -7310,6 +7358,82 @@ mod tests {
             .expect("mints again");
         let id2 = transport::peer_identity::from_der(&der(&second.cert_pem)).unwrap();
         assert_ne!(id.agent_name, id2.agent_name, "subjects must not repeat");
+
+        // Renewal has no caller-selected owner or subject. The original key
+        // proves continuity and binds the proof to this minter's TLS identity.
+        let issued_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let message = nexus_raft::transport::session_renewal_message(
+            &der(&bundle.cert_pem),
+            &der(&moss_cert),
+            300,
+            issued_at,
+        );
+        let proof = lib::transport_primitives::authorship::sign(&message, &bundle.key_pem).unwrap();
+        let renewal = || nexus_raft::agent_minter::SessionRenewal {
+            cert_pem: &bundle.cert_pem,
+            validity_secs: 300,
+            issued_at_unix_ms: issued_at,
+            proof: &proof,
+        };
+        let renewed = minter
+            .renew_session(Some(der(&moss_cert)), renewal())
+            .await
+            .expect("renewal");
+        assert_eq!(renewed.subject_id, bundle.subject_id);
+        let renewed_id = transport::peer_identity::from_der(&der(&renewed.cert_pem)).unwrap();
+        assert_eq!(renewed_id.owner, id.owner);
+        assert_eq!(renewed_id.agent_name, id.agent_name);
+        assert_ne!(renewed.key_pem, bundle.key_pem);
+        assert_ne!(
+            nexus_raft::transport::serial_from_cert_pem(&renewed.cert_pem).unwrap(),
+            nexus_raft::transport::serial_from_cert_pem(&bundle.cert_pem).unwrap()
+        );
+        assert!(minter
+            .renew_session(Some(der(&other_cert)), renewal())
+            .await
+            .is_err());
+        assert!(minter.renew_session(None, renewal()).await.is_err());
+        minter
+            .revoke_cert(Some(der(&moss_cert)), &bundle.cert_pem)
+            .await
+            .unwrap();
+        assert!(
+            minter
+                .renew_session(Some(der(&moss_cert)), renewal())
+                .await
+                .is_err(),
+            "revoked key cannot renew"
+        );
+        let revoked_path = nexus_raft::transport::revoked_serials_path(&minter.data_dir);
+        std::fs::write(&revoked_path, "invalid-base64!\n").unwrap();
+        // A separate, valid credential must also fail when revocation truth
+        // cannot be read. Restoring the file is unnecessary in this fixture.
+        let message = nexus_raft::transport::session_renewal_message(
+            &der(&renewed.cert_pem),
+            &der(&moss_cert),
+            300,
+            issued_at,
+        );
+        let renewed_proof =
+            lib::transport_primitives::authorship::sign(&message, &renewed.key_pem).unwrap();
+        assert!(
+            minter
+                .renew_session(
+                    Some(der(&moss_cert)),
+                    nexus_raft::agent_minter::SessionRenewal {
+                        cert_pem: &renewed.cert_pem,
+                        validity_secs: 300,
+                        issued_at_unix_ms: issued_at,
+                        proof: &renewed_proof,
+                    }
+                )
+                .await
+                .is_err(),
+            "malformed revocation state refuses issuance"
+        );
 
         // Minting wrote nothing to the auth store: a uuid subject needs no
         // uniqueness record and an expiring credential is not a durable fact.
