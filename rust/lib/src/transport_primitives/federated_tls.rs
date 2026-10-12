@@ -46,9 +46,59 @@ use rustls::{
     client::danger::HandshakeSignatureValid, DigitallySignedStruct, DistinguishedName,
     Error as TlsError, RootCertStore, ServerConfig, SignatureScheme,
 };
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::server::TlsStream;
 use tokio_rustls::TlsAcceptor;
+
+/// One in-memory server identity snapshot shared by handshakes and request gates.
+pub struct ReloadableServerIdentity {
+    current: arc_swap::ArcSwap<ServerIdentity>,
+}
+
+struct ServerIdentity {
+    config: Arc<ServerConfig>,
+    expires_at: u64,
+}
+
+impl ServerIdentity {
+    fn is_live(&self) -> bool {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .is_ok_and(|now| now.as_secs() < self.expires_at)
+    }
+}
+
+impl ReloadableServerIdentity {
+    /// Install an already validated identity. The issuer and owner are checked by the composition.
+    pub fn new(config: ServerConfig, expires_at: u64) -> Arc<Self> {
+        Arc::new(Self {
+            current: arc_swap::ArcSwap::from_pointee(ServerIdentity {
+                config: Arc::new(config),
+                expires_at,
+            }),
+        })
+    }
+
+    /// Publish a complete replacement without interrupting established connections.
+    pub fn replace(&self, config: ServerConfig, expires_at: u64) {
+        self.current.store(Arc::new(ServerIdentity {
+            config: Arc::new(config),
+            expires_at,
+        }));
+    }
+
+    /// Refuse service once the currently installed credential expires.
+    #[must_use]
+    pub fn is_live(&self) -> bool {
+        self.current.load().is_live()
+    }
+
+    fn config(&self) -> Option<Arc<ServerConfig>> {
+        let snapshot = self.current.load();
+        snapshot.is_live().then(|| Arc::clone(&snapshot.config))
+    }
+}
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
 
@@ -291,7 +341,21 @@ pub fn federated_tls_incoming(
     listener: TcpListener,
     cfg: Arc<ServerConfig>,
 ) -> impl Stream<Item = io::Result<TlsStream<TcpStream>>> {
-    let acceptor = TlsAcceptor::from(cfg);
+    tls_incoming(listener, move || Some(Arc::clone(&cfg)))
+}
+
+/// Accept new connections using the current live identity; expired identities fail closed.
+pub fn reloadable_tls_incoming(
+    listener: TcpListener,
+    identity: Arc<ReloadableServerIdentity>,
+) -> impl Stream<Item = io::Result<TlsStream<TcpStream>>> {
+    tls_incoming(listener, move || identity.config())
+}
+
+fn tls_incoming(
+    listener: TcpListener,
+    config: impl Fn() -> Option<Arc<ServerConfig>> + Send + 'static,
+) -> impl Stream<Item = io::Result<TlsStream<TcpStream>>> {
     let (tx, rx) = tokio::sync::mpsc::channel(ACCEPT_BUFFER);
     tokio::spawn(async move {
         loop {
@@ -314,7 +378,11 @@ pub fn federated_tls_incoming(
                     continue;
                 }
             };
-            let acceptor = acceptor.clone();
+            let Some(config) = config() else {
+                drop(tcp);
+                continue;
+            };
+            let acceptor = TlsAcceptor::from(config);
             let tx = tx.clone();
             tokio::spawn(async move {
                 // A failed handshake (untrusted cert, garbage) is surfaced as an

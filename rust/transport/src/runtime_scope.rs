@@ -76,6 +76,7 @@ impl RuntimeDelegation {
 pub struct RuntimeScope {
     user_id: String,
     gateway_nodes: HashSet<u64>,
+    server_identity: Option<std::sync::Arc<lib::transport_primitives::ReloadableServerIdentity>>,
 }
 
 impl RuntimeScope {
@@ -87,7 +88,18 @@ impl RuntimeScope {
         Ok(Self {
             user_id,
             gateway_nodes: gateway_nodes.into_iter().collect(),
+            server_identity: None,
         })
+    }
+
+    /// Tie requests on established connections to the server's live credential.
+    #[must_use]
+    pub fn with_server_identity(
+        mut self,
+        identity: std::sync::Arc<lib::transport_primitives::ReloadableServerIdentity>,
+    ) -> Self {
+        self.server_identity = Some(identity);
+        self
     }
 
     pub(crate) fn resolve(
@@ -98,6 +110,15 @@ impl RuntimeScope {
         token: &str,
         metadata: &MetadataMap,
     ) -> Result<OperationContext, Status> {
+        if self
+            .server_identity
+            .as_ref()
+            .is_some_and(|identity| !identity.is_live())
+        {
+            return Err(Status::unavailable(
+                "user runtime server credential expired",
+            ));
+        }
         let mut values = metadata.get_all_bin(RUNTIME_DELEGATION_METADATA_KEY).iter();
         let Some(raw) = values.next() else {
             return self.confine(ctx);

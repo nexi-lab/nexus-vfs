@@ -34,6 +34,7 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 mod auth_posture;
 mod authorization;
 mod search_capabilities;
+mod user_runtime;
 use auth_posture::{AuthPosture, AuthPostureInputs};
 use kernel::abc::object_store::ObjectStore;
 use kernel::hal::object_store_provider::set_provider;
@@ -990,6 +991,15 @@ enum Cmd {
         #[arg(long, default_value_t = 2126)]
         port: u16,
     },
+    /// Serve one owner's durable VFS and services using an externally issued credential.
+    ServeUser {
+        /// Fixed owner of this runtime and its data directory.
+        #[arg(long)]
+        owner: String,
+        /// Agent credential bundle directory; replaced atomically by the issuer coordinator.
+        #[arg(long)]
+        credential: PathBuf,
+    },
     /// Mint an EXTRA join token for THIS cluster (founder), and print it.
     ///
     /// Usually unnecessary: the day-1 TLS bootstrap already mints a token, and
@@ -1062,87 +1072,23 @@ impl JoinRole {
 /// per-service env) belongs in the service's own layer, NOT here — the
 /// ctx is a live-handles bag, not a config kitchen sink.
 pub struct ServiceBootCtx {
-    /// True iff an auth provider is armed (sk- API-key auth). a2a uses it
-    /// as its from-stamp fail-closed posture.
-    ///
-    /// Kept as an orthogonal facet alongside [`Self::auth`] — a service
-    /// that only needs a posture bit (a2a) reads this; a service that
-    /// needs the resolver (an HTTP bearer middleware) reads
-    /// [`Self::auth`].  Materialised here so consumers do not each need
-    /// to downcast `Arc<dyn AuthProvider>` to check for `NoAuth`.
+    /// Whether requests carry authenticated identities.
     pub auth_armed: bool,
-
-    /// Live auth provider — the SAME `Arc<dyn AuthProvider>` the
-    /// kernel's gRPC interceptor consumes (via
-    /// `transport::grpc::VfsServiceImpl::authenticate`).  A service that
-    /// authenticates callers (e.g. an HTTP bearer middleware, a future
-    /// SOCKS proxy) injects this into its request path so both surfaces
-    /// speak the same auth plane — no fork, no re-implementation.
-    /// Always `Arc<NoAuth>` when the daemon booted without an ApiKey
-    /// posture — never absent at this seam — so consumers can call
-    /// `.resolve(...)` unconditionally.
-    pub auth: std::sync::Arc<dyn transport::auth::AuthProvider>,
-
-    /// Handle to the tokio runtime `run_daemon` is executing under.
-    /// Services that need to spawn background tasks (long-running
-    /// listeners, workers, per-connection loops) go through this so
-    /// they inherit the daemon's runtime instead of spinning their own.
-    /// One runtime per process is a strict invariant — a service that
-    /// creates a fresh runtime here would fragment `tokio::spawn`
-    /// scoping and break the daemon's graceful-shutdown contract.
+    /// The same provider used by the VFS request boundary.
+    pub auth: Arc<dyn transport::auth::AuthProvider>,
+    /// The daemon runtime used by services and their workers.
     pub runtime: tokio::runtime::Handle,
+    /// The cluster credential authority, absent in a confined user runtime.
+    pub credential_plane: Option<CredentialPlaneBootCtx>,
+}
 
-    /// The **credential-store `ZoneConsensus`** — same `ZoneConsensus`
-    /// the `RaftAuthKeyStore` above is bound to (control zone under
-    /// auth-on, `root` under `--no-tls`).  Exposed so downstream
-    /// service crates can wire their OWN typed `ControlStateStore`
-    /// views over the same consensus without re-plumbing zone lookup.
-    ///
-    /// Precedent: `RaftAuthKeyStore` (`CONTROL_NS_AUTH`) + the
-    /// foreign-CA anchor store (`CONTROL_NS_FOREIGN_CA`) already share
-    /// this consensus.  A new caller — the downstream `nexus-rebac`
-    /// crate's `RaftReBACTupleStore` (`CONTROL_NS_REBAC`) — needs the
-    /// same handle at composition-root time, and the assembly binary
-    /// lives outside this crate (so it cannot reach `zm` directly).
-    ///
-    /// Cloneable — `ZoneConsensus` is Arc-inside; downstream construct
-    /// their store via `Store::new(consensus.clone(),
-    /// credential_zone_runtime.clone())`.
-    pub credential_consensus:
-        nexus_raft::prelude::ZoneConsensus<nexus_raft::prelude::FullStateMachine>,
-
-    /// The runtime handle bound to [`Self::credential_consensus`].
-    /// Distinct from [`Self::runtime`] (the daemon runtime) because
-    /// the zone consensus was constructed with its own runtime handle
-    /// via `Zone::runtime_handle()` — a downstream store must bridge
-    /// its async `propose` on THAT handle for read-your-writes to
-    /// observe the committed value on the same runtime workers.
-    /// (In practice both handles refer to the same runtime since
-    /// `ZoneManager` receives `Handle::current()` at boot — but the
-    /// pairing is explicit here so a future runtime-per-zone change
-    /// stays sound at this seam.)
-    pub credential_zone_runtime: tokio::runtime::Handle,
-
-    /// The daemon's HMAC secret for sk- key material — `Some(_)` when
-    /// the daemon booted with API-key auth (a persisted or env-supplied
-    /// secret was resolved via `effective_api_key_secret`), `None`
-    /// under `--no-tls` (no auth plane; sk- credentials can't be
-    /// minted).
-    ///
-    /// Exposed so downstream service crates can call `auth::mint_key
-    /// (&store, secret, record, allow_existing)` directly — same shape
-    /// the internal `DaemonKeyMinter` uses one layer over.  Precedent
-    /// caller: the nexus assembly's `/v2/auth/keys` POST handler
-    /// (HTTP-side mint parity with the Python nexus-server).
-    ///
-    /// **Not for logging or side-channel disclosure** — the secret is
-    /// the HMAC key that anchors every sk- token; leaking it invites
-    /// key forgery.  Consumer clones once at capture-into-closure time
-    /// (same shape the internal `DaemonKeyMinter { secret: String }`
-    /// already uses).  Kept as `String` (not `Arc<str>`) so the widen
-    /// stays byte-for-byte within the slim cluster binary's size
-    /// budget — a fresh `Arc<str>` monomorphisation was measured at
-    /// ~430 KB over the §7 macos-x86_64 budget.
+/// Resources belonging to the cluster credential authority, never a user runtime.
+pub struct CredentialPlaneBootCtx {
+    /// The same consensus backing the cluster's credential store.
+    pub consensus: nexus_raft::prelude::ZoneConsensus<nexus_raft::prelude::FullStateMachine>,
+    /// The runtime owning that consensus; proposals must use this handle.
+    pub runtime: tokio::runtime::Handle,
+    /// Secret for the token plane, absent under certificate-only authentication.
     pub api_key_secret: Option<String>,
 }
 
@@ -1261,7 +1207,10 @@ where
     // stderr — their stdout is data a caller captures. `serve-local` is
     // a daemon, not a data-emitting subcommand, so it logs to stdout
     // like the default (no-subcommand) daemon.
-    let is_daemon = matches!(args.cmd, None | Some(Cmd::ServeLocal { .. }));
+    let is_daemon = matches!(
+        args.cmd,
+        None | Some(Cmd::ServeLocal { .. } | Cmd::ServeUser { .. })
+    );
     let _tracing_guard = install_tracing(/* logs_to_stderr */ !is_daemon);
     // Size the multi-thread runtime against the host: federation
     // gRPC + raft IO is IO-bound, so the kernel `available_parallelism`
@@ -1280,6 +1229,9 @@ where
         .block_on(async move {
             match args.cmd {
                 None => run_daemon(args.common, build_decls).await,
+                Some(Cmd::ServeUser { owner, credential }) => {
+                    user_runtime::serve(args.common, build_decls, owner, credential).await
+                }
                 Some(Cmd::ServeLocal { port }) => {
                     // Force the trusted-local-backend posture: loopback
                     // bind + plaintext. auth_posture then grants the
@@ -2004,6 +1956,27 @@ fn refuse_retired_env_vars() -> Result<()> {
     ))
 }
 
+fn mount_root_filesystem(kernel: &Arc<Kernel>, common: &CommonArgs) -> Result<()> {
+    // Before anything is served from it — see `refuse_root_fs_inside_zone_storage`.
+    common.refuse_root_fs_inside_zone_storage()?;
+    let root_fs = common.root_fs_path();
+    std::fs::create_dir_all(&root_fs)
+        .with_context(|| format!("create cluster root mount dir {}", root_fs.display()))?;
+    let backend: Arc<dyn ObjectStore> = Arc::new(
+        PathLocalBackend::new(&root_fs, /* fsync */ false)
+            .with_context(|| format!("PathLocalBackend init at {}", root_fs.display()))?,
+    );
+    kernel
+        .mount("/", MountOptions::new("local").with_backend(backend))
+        .map_err(|e| anyhow::anyhow!("mount / via path_local: {:?}", e))?;
+    tracing::info!(
+        root_fs = %root_fs.display(),
+        "mounted host-fs at \"/\" via PathLocalBackend",
+    );
+
+    Ok(())
+}
+
 async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -> Result<()> {
     // First, before any state is touched: a retired knob means the operator's
     // intent and this binary's behaviour have already diverged.
@@ -2210,22 +2183,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         "federation cache wired",
     );
 
-    // Before anything is served from it — see `refuse_root_fs_inside_zone_storage`.
-    common.refuse_root_fs_inside_zone_storage()?;
-    let root_fs = common.root_fs_path();
-    std::fs::create_dir_all(&root_fs)
-        .with_context(|| format!("create cluster root mount dir {}", root_fs.display()))?;
-    let backend: Arc<dyn ObjectStore> = Arc::new(
-        PathLocalBackend::new(&root_fs, /* fsync */ false)
-            .with_context(|| format!("PathLocalBackend init at {}", root_fs.display()))?,
-    );
-    kernel
-        .mount("/", MountOptions::new("local").with_backend(backend))
-        .map_err(|e| anyhow::anyhow!("mount / via path_local: {:?}", e))?;
-    tracing::info!(
-        root_fs = %root_fs.display(),
-        "mounted host-fs at \"/\" via PathLocalBackend",
-    );
+    mount_root_filesystem(&kernel, &common)?;
 
     // ── Plugin loading (§10) ─────────────────────────────────────────
     // Auto-load all .so/.dylib files from --plugin-dir (if specified).
@@ -3365,13 +3323,11 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         // nexus assembly binary) can bind their own typed
         // `ControlStateStore` view on the same consensus that
         // already backs `RaftAuthKeyStore` — one namespace over.
-        credential_consensus,
-        credential_zone_runtime,
-        // `Some(secret)` iff API-key auth is armed (a persisted or
-        // env-supplied HMAC secret was resolved).  Downstream /v2/auth
-        // HTTP mint gates on `.is_some()` and returns 503 under NoAuth
-        // — the sk- plane simply does not exist there.
-        api_key_secret,
+        credential_plane: Some(CredentialPlaneBootCtx {
+            consensus: credential_consensus,
+            runtime: credential_zone_runtime,
+            api_key_secret,
+        }),
     };
     let mut service_decls = build_decls(&svc_ctx);
     service_decls.extend(authorization::service_decls(

@@ -140,6 +140,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # server's accept/handshake path on the shared runtime).
 tracing-appender = "0.2"
 gethostname = "1.1"
+lib = { workspace = true, features = ["transport"] }
+pem = "3"
+x509-parser = "0.18"
 
 [dev-dependencies]
 sqlx = { workspace = true, features = ["runtime-tokio", "sqlite"] }
@@ -156,14 +159,5 @@ base64 = "0.22"
 axum = "0.8"
 # wire_durable_metastore tests open real redb files in a temp data dir.
 tempfile = "3"
-# The remote agent-mint gate test parses minted cert PEM to DER to feed
-# `peer_identity::from_der`. Test-only, so the shipped binary carries no pem dep.
-pem = "3"
-# The `mailbox_cli` example seals / opens signed envelopes and names the
-# cluster server-name — both live in `lib::transport_primitives` behind its
-# `transport` feature. Example-only, so the shipped binary carries no direct
-# lib dep beyond what `transport` already pulls.
-lib = { workspace = true, features = ["transport"] }
-
 [lints]
 workspace = true

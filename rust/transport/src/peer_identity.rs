@@ -280,8 +280,7 @@ fn chains_to(cert: &x509_parser::certificate::X509Certificate, ca_der: &[u8]) ->
 ///
 /// The PEM-taking face of [`classify_peer_cert`], for a caller that holds
 /// certificates as PEM — the wire and disk form — and would otherwise have to
-/// take a `pem` dependency to reach the DER one. The cluster profile keeps
-/// `pem` test-only so its shipped binary does not carry it.
+/// take a `pem` dependency to reach the DER one.
 pub fn classify_peer_cert_pem(
     cert_pem: &[u8],
     ca_pem: &[u8],

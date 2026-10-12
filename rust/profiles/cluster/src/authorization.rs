@@ -77,12 +77,17 @@ pub(super) fn service_decls(
     _ready: Arc<DataPlaneReady>,
 ) -> Result<Vec<ServiceDecl>> {
     #[cfg(feature = "rebac")]
-    let store = common.enable_rebac.then(|| {
-        nexus_rebac::RaftReBACTupleStore::new_arc(
-            _ctx.credential_consensus.clone(),
-            _ctx.credential_zone_runtime.clone(),
-        )
-    });
+    let store = if common.enable_rebac {
+        let plane = _ctx.credential_plane.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("relationship management requires the cluster credential plane")
+        })?;
+        Some(nexus_rebac::RaftReBACTupleStore::new_arc(
+            plane.consensus.clone(),
+            plane.runtime.clone(),
+        ))
+    } else {
+        None
+    };
     #[cfg(feature = "rebac")]
     let relationships = store.as_ref().map(|store| {
         nexus_rebac::RebacPermissionProvider::new(Arc::new(nexus_rebac::ReBACGraphCache::new(
@@ -107,7 +112,11 @@ pub(super) fn service_decls(
         let mut services = services;
         if let Some(store) = store {
             if let Some(addr) = common.http_addr {
-                if _ctx.auth_armed && _ctx.api_key_secret.is_none() {
+                let api_key_secret = _ctx
+                    .credential_plane
+                    .as_ref()
+                    .and_then(|plane| plane.api_key_secret.as_deref());
+                if _ctx.auth_armed && api_key_secret.is_none() {
                     bail!("HTTP bearer authentication requires NEXUS_API_KEY_SECRET; the certificate-only auth posture cannot authenticate HTTP callers");
                 }
                 use nexus_search_common::transport::{PeerChannelCache, PeerChannelConfig};
@@ -143,7 +152,7 @@ pub(super) fn service_decls(
                     search,
                     Arc::clone(&_ctx.auth),
                     _ctx.runtime.clone(),
-                    _ctx.api_key_secret.as_deref().map(Arc::from),
+                    api_key_secret.map(Arc::from),
                     store,
                     _ready,
                 ));
