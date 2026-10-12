@@ -14,6 +14,9 @@
 
 pub mod remote;
 
+#[cfg(test)]
+mod coherence_tests;
+
 // Re-export the trait surface from `abc/` so callers writing
 // `use crate::core::meta_store::{MetaStore, FileMetadata, …}` (or the
 // flat `crate::meta_store::…` shim) reach the canonical declaration in
@@ -88,14 +91,19 @@ const METADATA_FORMAT_LEGACY_POSITIONAL: u64 = 4;
 /// hot entries.  `get` consults the cache first and populates on miss;
 /// `put` commits the store first and refreshes the cache row on
 /// commit success, so a failed commit can never leave a phantom hit
-/// in the cache; `delete` invalidates the cache before the store
-/// delete so concurrent readers cannot observe a stale hit after the
-/// row is gone. Cache management is metastore-internal and
+/// in the cache. A shared coherence guard covers reads and cache fills;
+/// mutations hold it exclusively through the commit and cache update.
+/// Readers cannot refill a deleted row from an older redb snapshot, and
+/// writers cannot publish cache updates out of commit order.
+/// Cache management is metastore-internal and
 /// transparent to callers — there is no separate metadata cache that
 /// callers can consult.
 pub struct LocalMetaStore {
     db: Arc<Database>,
     cache: DashMap<String, FileMetadata>,
+    // Lock order: coherence -> redb -> cache. Cache-hit readers remain
+    // concurrent; redb already serializes writers. No syscall caller owns it.
+    cache_coherence: parking_lot::RwLock<()>,
 }
 
 impl LocalMetaStore {
@@ -215,6 +223,7 @@ impl LocalMetaStore {
         Ok(Self {
             db: Arc::new(db),
             cache: DashMap::new(),
+            cache_coherence: parking_lot::RwLock::new(()),
         })
     }
 }
@@ -401,6 +410,7 @@ fn decode_legacy_positional(data: &[u8]) -> Result<FileMetadata, MetaStoreError>
 
 impl MetaStore for LocalMetaStore {
     fn get(&self, path: &str) -> Result<Option<FileMetadata>, MetaStoreError> {
+        let _coherence = self.cache_coherence.read();
         // Internal cache fast path — see struct docstring for invariants.
         if let Some(cached) = self.cache.get(path) {
             return Ok(Some(cached.clone()));
@@ -426,6 +436,7 @@ impl MetaStore for LocalMetaStore {
     }
 
     fn put(&self, path: &str, metadata: FileMetadata) -> Result<(), MetaStoreError> {
+        let _coherence = self.cache_coherence.write();
         let data = serialize_metadata(&metadata);
         let txn = self
             .db
@@ -448,10 +459,9 @@ impl MetaStore for LocalMetaStore {
     }
 
     fn delete(&self, path: &str) -> Result<bool, MetaStoreError> {
-        // Invalidate cache before store delete — concurrent readers
-        // observe either "cache empty → fall through to store" or
-        // "store missing" depending on race timing, but never a stale
-        // hit after the store delete.
+        let _coherence = self.cache_coherence.write();
+        // Readers cannot refill this entry while the delete is in flight.
+        // If the commit fails, a subsequent cache miss reloads the stored row.
         self.cache.remove(path);
         let txn = self
             .db
@@ -559,6 +569,7 @@ impl MetaStore for LocalMetaStore {
 
     /// Single write transaction for all items — optimal for redb.
     fn put_batch(&self, items: &[(String, FileMetadata)]) -> Result<(), MetaStoreError> {
+        let _coherence = self.cache_coherence.write();
         let txn = self
             .db
             .begin_write()
@@ -586,7 +597,8 @@ impl MetaStore for LocalMetaStore {
 
     /// Single write transaction for all deletes — optimal for redb.
     fn delete_batch(&self, paths: &[String]) -> Result<usize, MetaStoreError> {
-        // Invalidate cache up-front (same race-safety reasoning as `delete`).
+        let _coherence = self.cache_coherence.write();
+        // Invalidation and commit share the same guard as single-row deletes.
         for path in paths {
             self.cache.remove(path);
         }
@@ -616,6 +628,7 @@ impl MetaStore for LocalMetaStore {
 
     /// Single read transaction for all paths.
     fn get_batch(&self, paths: &[String]) -> Result<Vec<Option<FileMetadata>>, MetaStoreError> {
+        let _coherence = self.cache_coherence.read();
         let txn = self
             .db
             .begin_read()
@@ -644,6 +657,7 @@ impl MetaStore for LocalMetaStore {
         metadata: FileMetadata,
         expected_version: u32,
     ) -> Result<PutIfVersionResult, MetaStoreError> {
+        let _coherence = self.cache_coherence.write();
         let path = metadata.path.clone();
         let new_ver = metadata.version;
         let data = serialize_metadata(&metadata);
@@ -702,6 +716,7 @@ impl MetaStore for LocalMetaStore {
         if old_path == new_path {
             return Ok(());
         }
+        let _coherence = self.cache_coherence.write();
         let old_prefix = format!("{}/", old_path.trim_end_matches('/'));
         let new_prefix = format!("{}/", new_path.trim_end_matches('/'));
         let txn = self
