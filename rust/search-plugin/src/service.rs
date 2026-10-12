@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Instant;
 
+use contracts::ROOT_ZONE_ID;
 use futures_util::StreamExt;
 use nexus_plugin_abi::KernelHandle;
 use parking_lot::Mutex;
@@ -100,14 +101,8 @@ const SEARCH_BACKEND_NAME: &str = "rust-plugin";
 /// Maximum input document size for an index walk.
 const INDEX_MAX_FILE_BYTES: usize = 8 * 1024 * 1024;
 
-/// Empty `zone_id` on a request means "the root zone" — same rule
-/// the Python router uses when a token has no explicit zone scope
-/// (see `nexus.contracts.constants.ROOT_ZONE_ID`).  Kept as a plain
-/// string here so the plugin dep tree stays free of the wider
-/// contracts crate.
-const ROOT_ZONE_ID: &str = "root";
-
-pub(crate) fn resolve_zone(z: &str) -> &str {
+/// Empty request zones resolve to the shared root zone.
+fn resolve_zone(z: &str) -> &str {
     if z.is_empty() {
         ROOT_ZONE_ID
     } else {
@@ -3567,16 +3562,43 @@ fn health_verdict(
     }
 }
 
+fn path_context_to_proto(record: crate::path_contexts::PathContextRecord) -> PathContext {
+    PathContext {
+        zone_id: record.zone_id,
+        path_prefix: record.path_prefix,
+        description: record.description,
+        weight: record.weight,
+        created_at: record.created_at.format("%Y-%m-%dT%H:%M:%S%.f").to_string(),
+        updated_at: record.updated_at.format("%Y-%m-%dT%H:%M:%S%.f").to_string(),
+    }
+}
+
+fn path_context_status(error: crate::path_contexts::PathContextError) -> Status {
+    use crate::path_contexts::PathContextError;
+    match error {
+        PathContextError::InvalidArgument(message) => Status::invalid_argument(message),
+        PathContextError::Unavailable(message) => Status::unavailable(message),
+        PathContextError::NotFound(message) => Status::not_found(message),
+    }
+}
+
 #[async_trait]
 impl SearchService for SearchServiceImpl {
     async fn put_path_context(
         &self,
         request: Request<PutPathContextRequest>,
     ) -> Result<Response<PathContext>, Status> {
+        let request = request.into_inner();
         self.required_path_context_store()?
-            .put(request.into_inner())
+            .put(crate::path_contexts::PathContextInput {
+                zone_id: request.zone_id,
+                path_prefix: request.path_prefix,
+                description: request.description,
+                weight: request.weight,
+            })
             .await
-            .map(Response::new)
+            .map_err(path_context_status)
+            .map(|record| Response::new(path_context_to_proto(record)))
     }
 
     async fn list_path_contexts(
@@ -3588,9 +3610,16 @@ impl SearchService for SearchServiceImpl {
             .zone_id
             .as_deref()
             .map(crate::path_contexts::checked_zone)
-            .transpose()?;
-        let contexts = self.required_path_context_store()?.list(zone).await?;
-        Ok(Response::new(ListPathContextsResponse { contexts }))
+            .transpose()
+            .map_err(path_context_status)?;
+        let contexts = self
+            .required_path_context_store()?
+            .list(zone)
+            .await
+            .map_err(path_context_status)?;
+        Ok(Response::new(ListPathContextsResponse {
+            contexts: contexts.into_iter().map(path_context_to_proto).collect(),
+        }))
     }
 
     async fn delete_path_context(
@@ -3598,11 +3627,13 @@ impl SearchService for SearchServiceImpl {
         request: Request<DeletePathContextRequest>,
     ) -> Result<Response<DeletePathContextResponse>, Status> {
         let request = request.into_inner();
-        let zone = crate::path_contexts::checked_zone(&request.zone_id)?;
+        let zone =
+            crate::path_contexts::checked_zone(&request.zone_id).map_err(path_context_status)?;
         let prefix = self
             .required_path_context_store()?
             .delete(zone, &request.path_prefix)
-            .await?;
+            .await
+            .map_err(path_context_status)?;
         Ok(Response::new(DeletePathContextResponse {
             zone_id: zone.to_owned(),
             path_prefix: prefix,

@@ -25,6 +25,7 @@ default = ["semantic"]
 semantic = ["dep:fastembed", "dep:ort"]
 
 [dependencies]
+contracts = { workspace = true }
 # Plugin ABI — stable C ABI contract for dylib plugins.  The
 # `declare_service_plugin!` macro + KernelHandle live here.
 nexus-plugin-abi = { workspace = true, features = ["tonic"] }

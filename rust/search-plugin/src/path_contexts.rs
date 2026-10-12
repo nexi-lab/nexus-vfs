@@ -11,9 +11,6 @@ use chrono::{NaiveDateTime, Utc};
 use parking_lot::Mutex;
 use sqlx::{postgres::PgPoolOptions, sqlite::SqlitePoolOptions, PgPool, SqlitePool};
 use tokio::sync::OnceCell;
-use tonic::Status;
-
-use crate::search_proto::{PathContext, PutPathContextRequest};
 
 const MAX_CACHED_ZONES: usize = 2048;
 const DEFAULT_FRESHNESS: Duration = Duration::from_secs(1);
@@ -30,13 +27,40 @@ type Row = (
 );
 pub type Boosts = HashMap<String, f32>;
 
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum PathContextError {
+    #[error("{0}")]
+    InvalidArgument(&'static str),
+    #[error("{0}")]
+    Unavailable(&'static str),
+    #[error("{0}")]
+    NotFound(&'static str),
+}
+
+pub struct PathContextInput {
+    pub zone_id: String,
+    pub path_prefix: String,
+    pub description: String,
+    pub weight: Option<f64>,
+}
+
+#[derive(Debug)]
+pub struct PathContextRecord {
+    pub zone_id: String,
+    pub path_prefix: String,
+    pub description: String,
+    pub weight: Option<f64>,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+}
+
 enum Database {
     Postgres(PgPool),
     Sqlite(SqlitePool),
 }
 
 struct CachedBoosts {
-    value: Result<Arc<Boosts>, Status>,
+    value: Result<Arc<Boosts>, PathContextError>,
     loaded_at: Instant,
 }
 
@@ -75,7 +99,7 @@ impl PathContextStore {
         Some(Self::new(url, freshness))
     }
 
-    async fn database(&self) -> Result<&Database, Status> {
+    async fn database(&self) -> Result<&Database, PathContextError> {
         self.database
             .get_or_try_init(|| async {
                 // Accept the existing SQLAlchemy connection spellings too.
@@ -109,7 +133,7 @@ impl PathContextStore {
                         .map(Database::Sqlite)
                         .map_err(database_error)
                 } else {
-                    Err(Status::unavailable(
+                    Err(PathContextError::Unavailable(
                         "path-context database URL must use PostgreSQL or SQLite",
                     ))
                 }
@@ -123,7 +147,10 @@ impl PathContextStore {
         &self.refresh[hash.finish() as usize % self.refresh.len()]
     }
 
-    pub async fn list(&self, zone: Option<&str>) -> Result<Vec<PathContext>, Status> {
+    pub async fn list(
+        &self,
+        zone: Option<&str>,
+    ) -> Result<Vec<PathContextRecord>, PathContextError> {
         let predicate = if zone.is_some() {
             "zone_id = $1"
         } else {
@@ -148,12 +175,15 @@ impl PathContextStore {
         Ok(rows.into_iter().map(from_row).collect())
     }
 
-    pub async fn put(&self, mut request: PutPathContextRequest) -> Result<PathContext, Status> {
+    pub async fn put(
+        &self,
+        mut request: PathContextInput,
+    ) -> Result<PathContextRecord, PathContextError> {
         request.zone_id = checked_zone(&request.zone_id)?.to_owned();
         request.path_prefix = normalize_prefix(&request.path_prefix)?;
         let length = request.description.chars().count();
         if !(1..=4096).contains(&length) {
-            return Err(Status::invalid_argument(
+            return Err(PathContextError::InvalidArgument(
                 "description must contain 1..4096 characters",
             ));
         }
@@ -161,7 +191,7 @@ impl PathContextStore {
             .weight
             .is_some_and(|weight| !weight.is_finite() || !(0.1..=10.0).contains(&weight))
         {
-            return Err(Status::invalid_argument(
+            return Err(PathContextError::InvalidArgument(
                 "weight must be finite and between 0.1 and 10.0",
             ));
         }
@@ -188,7 +218,7 @@ impl PathContextStore {
         Ok(from_row(row))
     }
 
-    pub async fn delete(&self, zone: &str, prefix: &str) -> Result<String, Status> {
+    pub async fn delete(&self, zone: &str, prefix: &str) -> Result<String, PathContextError> {
         let zone = checked_zone(zone)?;
         let prefix = normalize_prefix(prefix)?;
         let _guard = self.stripe(zone).lock().await;
@@ -209,12 +239,12 @@ impl PathContextStore {
         };
         self.cache.lock().remove(zone);
         if count == 0 {
-            return Err(Status::not_found("path context not found"));
+            return Err(PathContextError::NotFound("path context not found"));
         }
         Ok(prefix)
     }
 
-    fn cached(&self, zone: &str) -> Option<Result<Arc<Boosts>, Status>> {
+    fn cached(&self, zone: &str) -> Option<Result<Arc<Boosts>, PathContextError>> {
         self.cache
             .lock()
             .get(zone)
@@ -229,7 +259,28 @@ impl PathContextStore {
             .map(|entry| entry.value.clone())
     }
 
-    pub async fn boosts(&self, zone: &str) -> Result<Arc<Boosts>, Status> {
+    async fn load_boosts(&self, zone: &str) -> Result<Boosts, PathContextError> {
+        // Query refreshes need only weights. Descriptions and timestamps stay
+        // on the management read path, avoiding text copies on every refresh.
+        macro_rules! rows {
+            ($pool:expr) => {
+                sqlx::query_as::<_, (String, Option<f64>)>(
+                    "SELECT path_prefix, weight FROM path_contexts WHERE zone_id = $1",
+                )
+                .bind(zone)
+                .fetch_all($pool)
+                .await
+                .map_err(database_error)?
+            };
+        }
+        let rows = match self.database().await? {
+            Database::Postgres(pool) => rows!(pool),
+            Database::Sqlite(pool) => rows!(pool),
+        };
+        Ok(prefix_boosts(&rows))
+    }
+
+    pub async fn boosts(&self, zone: &str) -> Result<Arc<Boosts>, PathContextError> {
         if let Some(value) = self.cached(zone) {
             return value;
         }
@@ -239,10 +290,7 @@ impl PathContextStore {
         }
         // Reload actual rows: COUNT/MAX timestamps cannot detect every update
         // (including clock changes). The TTL bounds external-write staleness.
-        let value = self
-            .list(Some(zone))
-            .await
-            .map(|records| Arc::new(prefix_boosts(&records)));
+        let value = self.load_boosts(zone).await.map(Arc::new);
         let mut cache = self.cache.lock();
         if cache.len() >= MAX_CACHED_ZONES && !cache.contains_key(zone) {
             if let Some(oldest) = cache
@@ -264,36 +312,42 @@ impl PathContextStore {
     }
 }
 
-fn database_error(_error: sqlx::Error) -> Status {
+fn database_error(_error: sqlx::Error) -> PathContextError {
     // Connection errors can contain connection parameters. Keep them out of
     // RPC responses and logs; callers can diagnose the deployment separately.
-    Status::unavailable("path-context database operation failed")
+    PathContextError::Unavailable("path-context database operation failed")
 }
 
-fn from_row(row: Row) -> PathContext {
-    PathContext {
+fn from_row(row: Row) -> PathContextRecord {
+    PathContextRecord {
         zone_id: row.0,
         path_prefix: row.1,
         description: row.2,
         weight: row.3,
-        created_at: row.4.format("%Y-%m-%dT%H:%M:%S%.f").to_string(),
-        updated_at: row.5.format("%Y-%m-%dT%H:%M:%S%.f").to_string(),
+        created_at: row.4,
+        updated_at: row.5,
     }
 }
 
-pub fn checked_zone(zone: &str) -> Result<&str, Status> {
-    let zone = crate::service::resolve_zone(zone);
+pub fn checked_zone(zone: &str) -> Result<&str, PathContextError> {
+    let zone = if zone.is_empty() {
+        contracts::ROOT_ZONE_ID
+    } else {
+        zone
+    };
     if zone.chars().count() > 255 || zone.chars().any(char::is_control) {
-        return Err(Status::invalid_argument("invalid path-context zone_id"));
+        return Err(PathContextError::InvalidArgument(
+            "invalid path-context zone_id",
+        ));
     }
     Ok(zone)
 }
 
-pub fn normalize_prefix(raw: &str) -> Result<String, Status> {
+pub fn normalize_prefix(raw: &str) -> Result<String, PathContextError> {
     static FORBIDDEN: LazyLock<regex::Regex> =
         LazyLock::new(|| regex::Regex::new(r"[\x00-\x1f\x7f\p{Cf}]").unwrap());
     if raw.chars().count() > 1024 || FORBIDDEN.is_match(raw.trim()) {
-        return Err(Status::invalid_argument(
+        return Err(PathContextError::InvalidArgument(
             "invalid path_prefix length or characters",
         ));
     }
@@ -303,29 +357,29 @@ pub fn normalize_prefix(raw: &str) -> Result<String, Status> {
             .split('/')
             .any(|part| matches!(part, "" | "." | ".."))
     {
-        return Err(Status::invalid_argument(
+        return Err(PathContextError::InvalidArgument(
             "path_prefix must not contain empty, '.' or '..' segments",
         ));
     }
     Ok(prefix.to_owned())
 }
 
-fn prefix_boosts(records: &[PathContext]) -> Boosts {
+fn prefix_boosts(records: &[(String, Option<f64>)]) -> Boosts {
     if !records
         .iter()
-        .any(|record| record.weight.is_some_and(|weight| weight != 1.0))
+        .any(|(_, weight)| weight.is_some_and(|weight| weight != 1.0))
     {
         return HashMap::new();
     }
     records
         .iter()
-        .map(|record| {
-            let prefix = if record.path_prefix.is_empty() {
+        .map(|(path_prefix, weight)| {
+            let prefix = if path_prefix.is_empty() {
                 String::new()
             } else {
-                format!("/{}/", record.path_prefix)
+                format!("/{path_prefix}/")
             };
-            (prefix, record.weight.unwrap_or(1.0) as f32)
+            (prefix, weight.unwrap_or(1.0) as f32)
         })
         .collect()
 }
@@ -345,13 +399,12 @@ mod tests {
         store
     }
 
-    fn request(zone: &str, prefix: &str, weight: Option<f64>) -> PutPathContextRequest {
-        PutPathContextRequest {
+    fn request(zone: &str, prefix: &str, weight: Option<f64>) -> PathContextInput {
+        PathContextInput {
             zone_id: zone.into(),
             path_prefix: prefix.into(),
             description: "durable configuration".into(),
             weight,
-            auth_token: String::new(),
         }
     }
 
@@ -389,8 +442,8 @@ mod tests {
         store.delete("beta", "/z/").await.unwrap();
         assert!(store.boosts("beta").await.unwrap().is_empty());
         assert_eq!(
-            store.delete("beta", "z").await.unwrap_err().code(),
-            tonic::Code::NotFound
+            store.delete("beta", "z").await.unwrap_err(),
+            PathContextError::NotFound("path context not found")
         );
     }
 
@@ -538,28 +591,20 @@ mod tests {
     async fn invalid_inputs_are_rejected_before_database_access() {
         let store = PathContextStore::new("unsupported://private-secret", Duration::ZERO);
         for prefix in ["docs//a", "../a", "docs/./a", "docs\u{200b}", "docs\0a"] {
-            assert_eq!(
-                store
-                    .put(request("alpha", prefix, Some(2.0)))
-                    .await
-                    .unwrap_err()
-                    .code(),
-                tonic::Code::InvalidArgument
-            );
+            assert!(matches!(
+                store.put(request("alpha", prefix, Some(2.0))).await,
+                Err(PathContextError::InvalidArgument(_))
+            ));
         }
         for weight in [0.0, 10.1, f64::NAN, f64::INFINITY] {
-            assert_eq!(
-                store
-                    .put(request("alpha", "docs", Some(weight)))
-                    .await
-                    .unwrap_err()
-                    .code(),
-                tonic::Code::InvalidArgument
-            );
+            assert!(matches!(
+                store.put(request("alpha", "docs", Some(weight))).await,
+                Err(PathContextError::InvalidArgument(_))
+            ));
         }
         let status = store.boosts("alpha").await.unwrap_err();
-        assert_eq!(status.code(), tonic::Code::Unavailable);
-        assert!(!status.message().contains("private-secret"));
+        assert!(matches!(status, PathContextError::Unavailable(_)));
+        assert!(!status.to_string().contains("private-secret"));
         assert!(store.cached("alpha").unwrap().is_err());
     }
 }
