@@ -55,6 +55,7 @@ use transport::auth::{AuthCredentials, AuthProvider};
 #[derive(Default, Clone)]
 struct RequestLog {
     queries: Arc<Mutex<Vec<QueryRequest>>>,
+    delegations: Arc<Mutex<Vec<nexus_search_common::SearchDelegation>>>,
 }
 
 /// Mock that returns one canned hit per zone_id so the fused
@@ -69,6 +70,17 @@ struct FanoutMock {
 #[tonic::async_trait]
 impl SearchService for FanoutMock {
     async fn query(&self, req: Request<QueryRequest>) -> Result<Response<QueryResponse>, Status> {
+        if let Some(blob) = req
+            .metadata()
+            .get_bin(nexus_search_common::DELEGATION_METADATA_KEY)
+        {
+            let bytes = blob
+                .to_bytes()
+                .map_err(|_| Status::invalid_argument("delegation bytes"))?;
+            let delegation = serde_json::from_slice(&bytes)
+                .map_err(|_| Status::invalid_argument("delegation JSON"))?;
+            self.log.delegations.lock().unwrap().push(delegation);
+        }
         let inner = req.into_inner();
         let zone = inner.zone_id.clone();
         self.log.queries.lock().unwrap().push(inner);
@@ -216,11 +228,10 @@ impl AuthProvider for AliceAdmin {
 
 // ── Harness ────────────────────────────────────────────────────
 
-async fn spawn_mock_plugin() -> (String, RequestLog) {
+async fn spawn_mock_plugin(log: RequestLog) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().unwrap();
-    let log = RequestLog::default();
-    let mock = FanoutMock { log: log.clone() };
+    let mock = FanoutMock { log };
     tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(SearchServiceServer::new(mock))
@@ -228,7 +239,7 @@ async fn spawn_mock_plugin() -> (String, RequestLog) {
             .await
             .expect("plugin serve");
     });
-    (format!("http://{addr}"), log)
+    format!("http://{addr}")
 }
 
 /// Grant `user:alice` `reader` on `zone` in `store`.  Uses the same
@@ -263,8 +274,16 @@ async fn spawn_harness(zones: &[&str]) -> (String, RequestLog) {
 }
 
 async fn spawn_harness_with_store(rebac: Arc<dyn ReBACTupleStore>) -> (String, RequestLog) {
-    let (plugin_target, log) = spawn_mock_plugin().await;
-    let mut state = AppState::for_tests(plugin_target);
+    spawn_harness_with_remote(rebac, &[]).await
+}
+
+async fn spawn_harness_with_remote(
+    rebac: Arc<dyn ReBACTupleStore>,
+    remote_zones: &[&str],
+) -> (String, RequestLog) {
+    let log = RequestLog::default();
+    let plugin_target = spawn_mock_plugin(log.clone()).await;
+    let mut state = AppState::for_tests(plugin_target.clone());
     state.auth = Arc::new(AliceAdmin);
     // Both discovery stages read the same store and ephemeral cache.
     state.rebac_store = Arc::clone(&rebac);
@@ -283,13 +302,20 @@ async fn spawn_harness_with_store(rebac: Arc<dyn ReBACTupleStore>) -> (String, R
         let remote = Arc::new(
             nexus_http_api::backends::tonic_remote::TonicRemoteSearchBackend::new(peer_cache),
         );
-        let registry: Arc<InMemoryZoneSearchRegistry> = Arc::new(InMemoryZoneSearchRegistry::new());
+        let mut registry = InMemoryZoneSearchRegistry::new();
+        if !remote_zones.is_empty() {
+            let remote_target = spawn_mock_plugin(log.clone()).await;
+            for zone in remote_zones {
+                registry.insert(*zone, remote_target.clone());
+            }
+        }
+        let registry = Arc::new(registry);
         let routing = RoutingBackend::new(
             local,
             remote,
             Arc::clone(&registry) as Arc<dyn nexus_search_common::ZoneSearchRegistry>,
             "test",
-            std::iter::empty::<String>(),
+            std::iter::once(plugin_target),
         );
         state.federated = Arc::new(FederatedSearchDispatcher::new(
             Arc::new(routing),
@@ -475,23 +501,87 @@ async fn multi_zone_caller_with_empty_zone_id_fans_out() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn federated_query_rejects_options_it_cannot_preserve() {
+async fn federated_query_preserves_options_on_local_and_delegated_legs() {
+    let rebac = Arc::new(InMemoryReBACTupleStore::new());
+    grant_alice_reader(&rebac, "eng");
+    grant_alice_reader(&rebac, "legal");
+    let (base, log) = spawn_harness_with_remote(rebac, &["legal"]).await;
+    let client = reqwest::Client::new();
+    let mut body = serde_json::json!({
+        "q": "widget", "query_type": "HYBRID", "limit": 7,
+        "path_filter": "/docs", "alpha": 0.4, "fusion_method": "WEIGHTED",
+        "rrf_k": 20, "chunks_per_page": 2, "expand": "macro",
+        "recency_mode": "auto", "recency_weight": 0.5,
+        "recency_half_life_days": 7.0,
+        "path_prefix_boosts": {"/docs": 2.0, "/legal": 0.5},
+        "path_filters": ["/docs", "/legal"]
+    });
+    let response = client
+        .post(format!("{base}/v2/search/query"))
+        .bearer_auth("caller-bearer")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let json: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::OK, "{json}");
+    assert_eq!(json["results"].as_array().unwrap().len(), 2);
+
+    // The same HTTP settings must encode identically on the single-zone path.
+    body["zone_id"] = serde_json::json!("eng");
+    let response = client
+        .post(format!("{base}/v2/search/query"))
+        .bearer_auth("caller-bearer")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let queries = log.queries.lock().unwrap();
+    assert_eq!(queries.len(), 3);
+    for query in queries.iter() {
+        assert_eq!(query.q, "widget");
+        assert_eq!(query.limit, 7);
+        assert_eq!(query.path_filter, "/docs");
+        assert_eq!(
+            query.query_type,
+            nexus_http_api::search_proto::QueryType::Hybrid as i32
+        );
+        assert_eq!(query.alpha, 0.4);
+        assert_eq!(
+            query.fusion_method,
+            nexus_http_api::search_proto::FusionMethod::Weighted as i32
+        );
+        assert_eq!(query.rrf_k, 20);
+        assert_eq!(query.chunks_per_page, 2);
+        assert_eq!(query.expand, "macro");
+        assert_eq!(query.recency_mode, "auto");
+        assert_eq!(query.recency_weight, 0.5);
+        assert_eq!(query.recency_half_life_days, 7.0);
+        assert_eq!(query.path_prefix_boosts.get("/docs"), Some(&2.0));
+        assert_eq!(query.path_prefix_boosts.get("/legal"), Some(&0.5));
+        assert_eq!(query.path_filters, ["/docs", "/legal"]);
+        if query.zone_id == "legal" {
+            assert!(query.auth_token.is_empty());
+        } else {
+            assert_eq!(query.zone_id, "eng");
+            assert_eq!(query.auth_token, "caller-bearer");
+        }
+    }
+    let delegations = log.delegations.lock().unwrap();
+    assert_eq!(delegations.len(), 1);
+    assert_eq!(delegations[0].subject, ("user".into(), "alice".into()));
+    assert_eq!(delegations[0].target_zones, ["legal".to_owned()]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn federated_query_rejects_invalid_enums_before_any_rpc() {
     let (base, log) = spawn_harness(&["eng", "legal"]).await;
     let client = reqwest::Client::new();
-    for (field, value) in [
-        ("alpha", serde_json::json!(0.5)),
-        ("fusion_method", serde_json::json!("weighted")),
-        ("rrf_k", serde_json::json!(20)),
-        ("chunks_per_page", serde_json::json!(2)),
-        ("expand", serde_json::json!("macro")),
-        ("recency_mode", serde_json::json!("on")),
-        ("recency_weight", serde_json::json!(0.5)),
-        ("recency_half_life_days", serde_json::json!(7.0)),
-        ("path_prefix_boosts", serde_json::json!({"/docs": 2.0})),
-        ("path_filters", serde_json::json!(["/docs", "/legal"])),
-    ] {
+    for field in ["query_type", "fusion_method"] {
         let mut body = serde_json::json!({"q": "widget"});
-        body[field] = value;
+        body[field] = serde_json::json!("typo");
         let response = client
             .post(format!("{base}/v2/search/query"))
             .bearer_auth("anything")
@@ -499,16 +589,8 @@ async fn federated_query_rejects_options_it_cannot_preserve() {
             .send()
             .await
             .unwrap();
-        assert_eq!(
-            response.status(),
-            reqwest::StatusCode::BAD_REQUEST,
-            "{field}"
-        );
-        let error = response.text().await.unwrap();
-        assert!(
-            error.contains(field) && error.contains("pin zone_id"),
-            "{error}"
-        );
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert!(response.text().await.unwrap().contains(field));
     }
     assert!(log.queries.lock().unwrap().is_empty());
 }

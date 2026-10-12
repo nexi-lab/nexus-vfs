@@ -158,6 +158,13 @@ async fn production_grants_filter_http_search_and_survive_restart() {
         .json(&json!({"subject_type":"user", "subject_id":"alice", "zones":["sharedzone:r"], "allow_existing":true}))).await;
     let narrow = narrow["key"].as_str().unwrap();
 
+    let modified_at_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
     for (zone, path) in [
         ("sharedzone", "/docs/public.md"),
         ("sharedzone", "/docs/private.md"),
@@ -169,7 +176,7 @@ async fn production_grants_filter_http_search_and_survive_restart() {
                 .post(format!("{base}/v2/documents/batch"))
                 .bearer_auth(admin)
                 .json(
-                    &json!({"zone_id":zone, "documents":[{"path":path,"text":"widget document"}]}),
+                    &json!({"zone_id":zone, "documents":[{"path":path,"text":"widget document", "mtime_ms":modified_at_ms}]}),
                 ),
         )
         .await;
@@ -433,6 +440,60 @@ async fn production_grants_filter_http_search_and_survive_restart() {
         ["/docs/public.md", "/legal/contract.md"]
     );
     assert_eq!(query(&client, &base, narrow, "").await, ["/docs/public.md"]);
+    // Real signed plugin and Raft-backed file grants on both the local leg and
+    // the mTLS delegation leg. Tuning must still preserve the caller's scope.
+    let options = json!({
+        "q":"widget", "query_type":"keyword", "limit":20,
+        "alpha":0.4, "fusion_method":"rrf_weighted", "rrf_k":20,
+        "chunks_per_page":1, "expand":"macro", "recency_mode":"on",
+        "recency_weight":0.5, "recency_half_life_days":7.0,
+        "path_prefix_boosts":{"/docs/":2.0,"/legal/":3.0},
+        "path_filters":["/docs","/legal"]
+    });
+    let tuned = json_ok(
+        client
+            .post(format!("{base}/v2/search/query"))
+            .bearer_auth(alice)
+            .json(&options),
+    )
+    .await;
+    assert!(tuned["error"].is_null(), "{tuned}");
+    let hits = tuned["results"].as_array().unwrap();
+    assert_eq!(hits.len(), 2, "{tuned}");
+    for hit in hits {
+        let expected_boost = match hit["path"].as_str().unwrap() {
+            "/docs/public.md" => 2.0,
+            "/legal/contract.md" => 3.0,
+            path => panic!("unexpected authorized hit {path}"),
+        };
+        assert_eq!(hit["tier_boost"].as_f64(), Some(expected_boost), "{hit}");
+        assert!(hit["recency_boost"].as_f64().unwrap() >= 1.0, "{hit}");
+    }
+    let mut narrowed = options.clone();
+    narrowed["path_filters"] = json!(["/legal"]);
+    let filtered = json_ok(
+        client
+            .post(format!("{base}/v2/search/query"))
+            .bearer_auth(alice)
+            .json(&narrowed),
+    )
+    .await;
+    assert!(filtered["error"].is_null(), "{filtered}");
+    assert_eq!(
+        filtered["results"].as_array().unwrap().len(),
+        1,
+        "{filtered}"
+    );
+    assert_eq!(filtered["results"][0]["path"], "/legal/contract.md");
+    let ceiling = json_ok(
+        client
+            .post(format!("{base}/v2/search/query"))
+            .bearer_auth(narrow)
+            .json(&options),
+    )
+    .await;
+    assert_eq!(ceiling["results"].as_array().unwrap().len(), 1, "{ceiling}");
+    assert_eq!(ceiling["results"][0]["path"], "/docs/public.md");
     grant(
         &client,
         &base,
@@ -446,6 +507,16 @@ async fn production_grants_filter_http_search_and_survive_restart() {
         query(&client, &base, alice, "").await,
         ["/legal/contract.md"]
     );
+    let revoked = json_ok(
+        client
+            .post(format!("{base}/v2/search/query"))
+            .bearer_auth(alice)
+            .json(&options),
+    )
+    .await;
+    assert!(revoked["error"].is_null(), "{revoked}");
+    assert_eq!(revoked["results"].as_array().unwrap().len(), 1, "{revoked}");
+    assert_eq!(revoked["results"][0]["path"], "/legal/contract.md");
 
     drop(vfs);
     drop(client);

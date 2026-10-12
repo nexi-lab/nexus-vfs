@@ -52,6 +52,7 @@ impl RemoteSearchBackend for TonicRemoteSearchBackend {
         zone_id: &str,
         req: &SearchRequest,
     ) -> Result<Vec<Hit>, BackendError> {
+        let proto = query_for_zone(zone_id, req)?;
         // 1. Dial (or hit cache).  Dial-time gate failures
         // (plaintext off-loopback, bad endpoint) surface as
         // Transport — every failure here is BEFORE the request
@@ -65,7 +66,6 @@ impl RemoteSearchBackend for TonicRemoteSearchBackend {
         // 2. Build the tonic request.  The delegation rides on
         // metadata (see DELEGATION_METADATA_KEY above); the
         // request body carries the search parameters only.
-        let proto = query_for_zone(zone_id, req);
         let mut request = tonic::Request::new(proto);
         let blob = serde_json::to_vec(delegation).map_err(|e| {
             BackendError::Config(format!("delegation serialise for zone {zone_id:?}: {e}"))
@@ -321,10 +321,13 @@ mod tests {
     fn req() -> SearchRequest {
         SearchRequest {
             auth_token: String::new(),
-            query: "widgets".into(),
-            search_type: "hybrid".into(),
-            limit: 7,
-            path_filter: Some("/docs".into()),
+            parameters: Arc::new(nexus_search_common::QueryParameters {
+                q: "widgets".into(),
+                query_type: "hybrid".into(),
+                limit: 7,
+                path_filter: "/docs".into(),
+                ..Default::default()
+            }),
             subject: subject(),
         }
     }
@@ -457,13 +460,14 @@ mod tests {
             ("keyword", QueryType::Keyword),
             ("semantic", QueryType::Semantic),
             ("hybrid", QueryType::Hybrid),
-            ("unknown_falls_back", QueryType::Keyword),
+            ("HYBRID", QueryType::Hybrid),
+            ("", QueryType::Keyword),
         ] {
             let mock = RecordingMock::default();
             let target = spawn_mock(mock.clone()).await;
             let backend = backend_for(target.clone());
             let mut r = req();
-            r.search_type = wire.into();
+            Arc::make_mut(&mut r.parameters).query_type = wire.into();
             let _ = backend
                 .search_remote_zone(&target, &delegation("z"), "z", &r)
                 .await;
@@ -473,6 +477,20 @@ mod tests {
                 "wire {wire:?} must map to {expected:?}",
             );
         }
+    }
+
+    #[tokio::test]
+    async fn invalid_query_settings_are_rejected_before_remote_io() {
+        let mut request = req();
+        Arc::make_mut(&mut request.parameters).query_type = "typo".into();
+        let target = "not-an-endpoint";
+        let backend = backend_for(target.into());
+        let error = backend
+            .search_remote_zone(target, &delegation("legal"), "legal", &request)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, BackendError::Config(_)), "{error}");
+        assert!(error.to_string().contains("query_type"));
     }
 
     #[test]

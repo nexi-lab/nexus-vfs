@@ -23,21 +23,19 @@
 //! reach the caller intact.  A new handler reuses the enum + mapper
 //! instead of hand-rolling its own.
 
-use std::collections::HashMap;
-
 use crate::middleware::auth::BearerToken;
+use crate::query::{parse_fusion_method, parse_query_type, query_request};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use contracts::operation_context::OperationContext;
-use nexus_search_common::require_discovery_filters;
+use nexus_search_common::{require_discovery_filters, QueryParameters};
 use serde::{Deserialize, Serialize};
 
 use crate::search_proto::{
-    DiscoveryFiles, DiscoveryFilter, FusionMethod, GlobRequest, GrepRequest, QueryRequest,
-    QueryResult as ProtoQueryResult, QueryType,
+    DiscoveryFiles, DiscoveryFilter, GlobRequest, GrepRequest, QueryResult as ProtoQueryResult,
 };
 #[cfg(feature = "rebac")]
 use crate::zone::is_privileged;
@@ -373,59 +371,11 @@ async fn grep_with_params(
 // ── /v2/search/query ─────────────────────────────────────────────
 
 /// JSON body for `POST /v2/search/query`.  Field names match the
-/// proto's [`QueryRequest`] snake_case names 1:1 (same policy as
+/// proto's [`crate::search_proto::QueryRequest`] snake_case names 1:1 (same policy as
 /// [`GlobQuery`] / [`GrepQuery`]).  Enum-shaped fields land as
 /// wire-friendly lowercase strings so a caller reading the proto
 /// enum values and a caller reading this doc reach the same shape.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct QueryBody {
-    /// Query text.
-    pub q: String,
-    /// Zone scoping. Empty uses the caller's zone or readable-zone fanout.
-    #[serde(default)]
-    pub zone_id: String,
-    /// Max results returned.  0 ⇒ server-side default (10).
-    #[serde(default)]
-    pub limit: u32,
-    /// Optional path-prefix filter.
-    #[serde(default)]
-    pub path_filter: String,
-    /// `"keyword"` (default) / `"semantic"` / `"hybrid"`.
-    /// Wire-friendly string rather than the raw enum int so callers
-    /// don't have to memorise the proto numeric. Values are case-insensitive;
-    /// an unknown non-empty value is a 400 error.
-    #[serde(default)]
-    pub query_type: String,
-    #[serde(default)]
-    pub alpha: f32,
-    /// `"rrf"` (default) / `"weighted"` / `"rrf_weighted"`.
-    #[serde(default)]
-    pub fusion_method: String,
-    #[serde(default)]
-    pub rrf_k: u32,
-    /// Per-document chunk cap for pooling (#4542). 0 = no pooling.
-    #[serde(default)]
-    pub chunks_per_page: u32,
-    /// `"macro"` (neighbour context expansion) / anything else ⇒
-    /// none.  Absent ⇒ none.
-    #[serde(default)]
-    pub expand: String,
-    /// `""` / `"off"` (default) / `"on"` / `"auto"`.
-    #[serde(default)]
-    pub recency_mode: String,
-    #[serde(default)]
-    pub recency_weight: f32,
-    #[serde(default)]
-    pub recency_half_life_days: f32,
-    /// Per-prefix score multiplier map.  Empty ⇒ no per-prefix boost.
-    #[serde(default)]
-    pub path_prefix_boosts: HashMap<String, f32>,
-    /// Extra path prefixes OR-ed with `path_filter` — one fused
-    /// ranking over the union.  Empty ⇒ only `path_filter` applies.
-    #[serde(default)]
-    pub path_filters: Vec<String>,
-}
+pub type QueryBody = QueryParameters;
 
 /// One result row in [`QueryResponseBody::results`].  Every field
 /// mirrors the proto's [`QueryResult`](ProtoQueryResult) so a
@@ -465,75 +415,6 @@ pub struct QueryResponseBody {
     pub results: Vec<QueryHit>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-}
-
-/// Shared "wire-string to proto enum" parser used by
-/// [`parse_query_type`] + [`parse_fusion_method`].
-///
-/// # Contract
-///
-/// * Empty `s` — returns `Ok(default)`.  Matches the proto's
-///   `UNSPECIFIED = 0` posture: an absent field means "server
-///   default", not an error.
-/// * Case-insensitive match against `variants` — returns `Ok(variant)`.
-/// * Non-empty NON-matching `s` — returns `Err` naming the field and
-///   listing the accepted values.  The caller maps this to `400 Bad
-///   Request` so a caller typo (`"semantik"`) surfaces as an
-///   actionable error instead of silently degrading to the default.
-///
-/// Extracted at the extract-on-second-occurrence trigger — both
-/// query_type and fusion_method share the identical
-/// "empty→default, N case-insensitive branches, else Err naming the
-/// field" template.
-fn parse_wire_enum<T: Copy>(
-    s: &str,
-    field: &str,
-    default: T,
-    variants: &[(&str, T)],
-) -> Result<T, String> {
-    if s.is_empty() {
-        return Ok(default);
-    }
-    for (name, variant) in variants {
-        if s.eq_ignore_ascii_case(name) {
-            return Ok(*variant);
-        }
-    }
-    let names: Vec<String> = variants.iter().map(|(n, _)| format!("\"{n}\"")).collect();
-    Err(format!(
-        "unknown {field} {s:?} (expected {})",
-        names.join(", ")
-    ))
-}
-
-/// Parse the `query_type` wire string into the proto enum.
-/// See [`parse_wire_enum`] for the shared empty-vs-typo contract.
-fn parse_query_type(s: &str) -> Result<QueryType, String> {
-    parse_wire_enum(
-        s,
-        "query_type",
-        QueryType::Keyword,
-        &[
-            ("keyword", QueryType::Keyword),
-            ("semantic", QueryType::Semantic),
-            ("hybrid", QueryType::Hybrid),
-        ],
-    )
-}
-
-/// Parse the `fusion_method` wire string into the proto enum.
-/// See [`parse_wire_enum`] for the shared empty-vs-typo contract.
-fn parse_fusion_method(s: &str) -> Result<FusionMethod, String> {
-    parse_wire_enum(
-        s,
-        "fusion_method",
-        FusionMethod::Rrf,
-        &[
-            ("rrf", FusionMethod::Rrf),
-            ("weighted", FusionMethod::Weighted),
-            ("rrf_weighted", FusionMethod::RrfWeighted),
-        ],
-    )
 }
 
 fn hit_from_proto(r: ProtoQueryResult) -> QueryHit {
@@ -582,9 +463,8 @@ pub async fn query(
     fence: crate::middleware::revision::RevisionFence,
     Json(body): Json<QueryBody>,
 ) -> Result<Response, SearchError> {
-    let query_type = parse_query_type(&body.query_type).map_err(SearchError::BadRequest)?;
-    let fusion_method =
-        parse_fusion_method(&body.fusion_method).map_err(SearchError::BadRequest)?;
+    parse_query_type(&body.query_type).map_err(SearchError::BadRequest)?;
+    parse_fusion_method(&body.fusion_method).map_err(SearchError::BadRequest)?;
     // #4740: the index zone is the caller's zone, never a wire-supplied
     // one (admins may still name a zone explicitly).
     let zone_id = effective_zone(&ctx, &body.zone_id)?;
@@ -618,24 +498,10 @@ pub async fn query(
         .await
         .map_err(SearchError::Fence)?;
     let mut client = state.search.client().await?;
-    let req = QueryRequest {
-        q: body.q,
-        zone_id,
-        limit: body.limit,
-        path_filter: body.path_filter,
-        query_type: query_type as i32,
-        auth_token: token.0.to_string(),
-        alpha: body.alpha,
-        fusion_method: fusion_method as i32,
-        rrf_k: body.rrf_k,
-        chunks_per_page: body.chunks_per_page,
-        expand: body.expand,
-        recency_mode: body.recency_mode,
-        recency_weight: body.recency_weight,
-        recency_half_life_days: body.recency_half_life_days,
-        path_prefix_boosts: body.path_prefix_boosts,
-        path_filters: body.path_filters,
-    };
+    let mut body = body;
+    body.zone_id = zone_id;
+    let mut req = query_request(body).map_err(SearchError::BadRequest)?;
+    req.auth_token = token.0.to_string();
     let resp = client
         .query(tonic::Request::new(req))
         .await
@@ -670,48 +536,14 @@ async fn dispatch_federated(
     body: QueryBody,
     fence_zone: &str,
 ) -> Result<Response, SearchError> {
-    // The dispatcher carries only query type, limit and one path prefix.
-    // Reject settings it cannot preserve before dispatching any leg.
-    for (field, unsupported) in [
-        ("alpha", body.alpha != 0.0),
-        (
-            "fusion_method",
-            !body.fusion_method.is_empty() && !body.fusion_method.eq_ignore_ascii_case("rrf"),
-        ),
-        ("rrf_k", body.rrf_k != 0),
-        ("chunks_per_page", body.chunks_per_page != 0),
-        ("expand", !body.expand.is_empty()),
-        (
-            "recency_mode",
-            !body.recency_mode.is_empty() && !body.recency_mode.eq_ignore_ascii_case("off"),
-        ),
-        ("recency_weight", body.recency_weight != 0.0),
-        ("recency_half_life_days", body.recency_half_life_days != 0.0),
-        ("path_prefix_boosts", !body.path_prefix_boosts.is_empty()),
-        ("path_filters", !body.path_filters.is_empty()),
-    ] {
-        if unsupported {
-            return Err(SearchError::BadRequest(format!(
-                "{field} is not supported for cross-zone (federated) search; pin zone_id"
-            )));
-        }
-    }
     let observed = fence
         .enforce(std::sync::Arc::clone(&state.kernel), fence_zone)
         .await
         .map_err(SearchError::Fence)?;
     let subject = subject_for(&ctx);
-    let limit = if body.limit == 0 {
-        10
-    } else {
-        body.limit as usize
-    };
     let req = nexus_federated_search::SearchRequest {
         auth_token: token.0.to_string(),
-        query: body.q,
-        search_type: body.query_type.to_ascii_lowercase(),
-        limit,
-        path_filter: (!body.path_filter.is_empty()).then_some(body.path_filter),
+        parameters: std::sync::Arc::new(body),
         // Overwritten by the dispatcher from `subject` — the field
         // must exist on construction.
         subject: (String::new(), String::new()),

@@ -54,13 +54,13 @@ impl LocalSearchBackend for PluginLocalSearchBackend {
         zone_id: &str,
         req: &SearchRequest,
     ) -> Result<Vec<Hit>, BackendError> {
+        let mut proto = query_for_zone(zone_id, req)?;
+        proto.auth_token = req.auth_token.clone();
         let mut client = self
             .inner
             .client()
             .await
             .map_err(|e| BackendError::Transport(e.to_string()))?;
-        let mut proto = query_for_zone(zone_id, req);
-        proto.auth_token = req.auth_token.clone();
         let resp = client
             .query(tonic::Request::new(proto))
             .await

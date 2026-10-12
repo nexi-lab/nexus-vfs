@@ -195,7 +195,12 @@ impl<B: LocalSearchBackend + 'static> FederatedSearchDispatcher<B> {
             std::collections::BTreeMap::new();
         for (zone_id, outcome) in legs {
             match outcome {
-                Ok(Ok(hits)) => {
+                Ok(Ok(mut hits)) => {
+                    for hit in &mut hits {
+                        if hit.zone_id.as_deref() != Some(zone_id.as_str()) {
+                            hit.zone_id = Some(zone_id.clone());
+                        }
+                    }
                     zones_searched.push(zone_id.clone());
                     per_zone_hits.insert(zone_id, hits);
                 }
@@ -218,13 +223,13 @@ impl<B: LocalSearchBackend + 'static> FederatedSearchDispatcher<B> {
         // score attribution lands on `Hit::extras` as `<zone>_score`
         // for a debug / regression reader.
         let sources: Vec<(&str, Vec<Hit>)> = per_zone_hits
-            .iter()
-            .map(|(zone, hits)| (zone.as_str(), hits.clone()))
+            .iter_mut()
+            .map(|(zone, hits)| (zone.as_str(), std::mem::take(hits)))
             .collect();
         let fused = rrf_multi_fusion(
             &sources,
             self.config.rrf_k,
-            req.limit,
+            req.parameters.effective_limit(),
             self.config.rrf_top_rank_bonus,
         );
 
@@ -358,13 +363,12 @@ mod tests {
     fn req() -> SearchRequest {
         SearchRequest {
             auth_token: String::new(),
-            query: "any".into(),
-            search_type: "hybrid".into(),
-            limit: 10,
-            path_filter: None,
-            // Overwritten by the dispatcher before spawning legs
-            // (see `FederatedSearchDispatcher::search`) — the
-            // fixture value is a placeholder proving that path.
+            parameters: Arc::new(nexus_search_common::QueryParameters {
+                q: "any".into(),
+                query_type: "hybrid".into(),
+                limit: 10,
+                ..Default::default()
+            }),
             subject: (String::new(), String::new()),
         }
     }
@@ -400,6 +404,44 @@ mod tests {
         assert!(paths.contains(&"/eng/a.md"));
         assert!(paths.contains(&"/eng/b.md"));
         assert!(paths.contains(&"/legal/x.md"));
+    }
+
+    #[tokio::test]
+    async fn source_zones_keep_identical_paths_distinct_and_limit_the_fused_response() {
+        let rebac = Arc::new(InMemoryReBACTupleStore::new());
+        grant_zone(&rebac, "eng", "alice");
+        grant_zone(&rebac, "legal", "alice");
+        let mut backend = FakeBackend::default();
+        let mut untagged = hit("/shared.md", 1.0, "eng");
+        untagged.zone_id = None;
+        backend.by_zone.insert("eng".into(), vec![untagged]);
+        backend
+            .by_zone
+            .insert("legal".into(), vec![hit("/shared.md", 1.0, "eng")]);
+        let dispatcher = dispatcher(backend, rebac, DispatcherConfig::default());
+        let mut defaults = req();
+        Arc::make_mut(&mut defaults.parameters).limit = 0;
+        let response = dispatcher
+            .search(("user", "alice"), defaults, None)
+            .await
+            .unwrap();
+        assert_eq!(response.results.len(), 2);
+        let mut zones: Vec<_> = response
+            .results
+            .iter()
+            .map(|hit| hit.zone_id.as_deref().unwrap())
+            .collect();
+        zones.sort_unstable();
+        assert_eq!(zones, ["eng", "legal"]);
+
+        let mut capped = req();
+        Arc::make_mut(&mut capped.parameters).limit = 1;
+        let response = dispatcher
+            .search(("user", "alice"), capped, None)
+            .await
+            .unwrap();
+        assert_eq!(response.zones_searched.len(), 2);
+        assert_eq!(response.results.len(), 1);
     }
 
     #[tokio::test]

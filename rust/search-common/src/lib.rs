@@ -51,6 +51,7 @@ pub mod delegation;
 pub mod discovery;
 pub mod federated;
 pub mod fusion;
+pub mod query;
 pub mod registry;
 pub mod results;
 /// Shared tonic `Channel`-per-peer cache — the ONE dial+cache impl
@@ -70,6 +71,7 @@ pub use delegation::{
 };
 pub use federated::{is_all_peers_failed, FederatedSearchResponse, ZoneFailure};
 pub use fusion::{rrf_multi_fusion, FusionConfig, FusionMethod, RRF_TOP1_BONUS, RRF_TOP3_BONUS};
+pub use query::QueryParameters;
 pub use registry::{InMemoryZoneSearchRegistry, SearchDaemonTarget, ZoneSearchRegistry};
 pub use results::{Hit, BACKEND_LEG_TIMING_KEYS};
 

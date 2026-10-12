@@ -222,10 +222,12 @@ mod tests {
     fn req() -> SearchRequest {
         SearchRequest {
             auth_token: String::new(),
-            query: "q".into(),
-            search_type: "hybrid".into(),
-            limit: 10,
-            path_filter: None,
+            parameters: Arc::new(nexus_search_common::QueryParameters {
+                q: "q".into(),
+                query_type: "hybrid".into(),
+                limit: 10,
+                ..Default::default()
+            }),
             subject: ("user".into(), "alice".into()),
         }
     }

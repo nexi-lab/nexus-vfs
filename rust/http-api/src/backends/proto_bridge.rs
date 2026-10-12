@@ -81,21 +81,10 @@ pub(crate) fn hit_from_proto(r: ProtoQueryResult) -> Hit {
 pub(crate) fn query_for_zone(
     zone: &str,
     req: &nexus_federated_search::SearchRequest,
-) -> crate::search_proto::QueryRequest {
-    use crate::search_proto::{QueryRequest, QueryType};
-    let query_type = match req.search_type.as_str() {
-        "semantic" => QueryType::Semantic,
-        "hybrid" => QueryType::Hybrid,
-        _ => QueryType::Keyword,
-    };
-    QueryRequest {
-        q: req.query.clone(),
-        zone_id: zone.to_owned(),
-        limit: u32::try_from(req.limit).unwrap_or(u32::MAX),
-        path_filter: req.path_filter.clone().unwrap_or_default(),
-        query_type: query_type as i32,
-        ..Default::default()
-    }
+) -> Result<crate::search_proto::QueryRequest, nexus_federated_search::BackendError> {
+    let mut parameters = (*req.parameters).clone();
+    parameters.zone_id = zone.to_owned();
+    crate::query::query_request(parameters).map_err(nexus_federated_search::BackendError::Config)
 }
 
 #[cfg(test)]

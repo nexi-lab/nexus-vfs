@@ -4,16 +4,9 @@
 //! without the plugin gRPC stack, and lets a future cross-zone gRPC
 //! impl slot in behind the same shape.
 //!
-//! # Request shape
-//!
-//! [`SearchRequest`] is the minimum the dispatcher builds from an
-//! axum request.  Backend-specific tuning knobs (recency, alpha,
-//! fusion method, chunks_per_page, path_prefix_boosts, …) will
-//! extend this struct as they migrate off the Python surface.  Kept
-//! narrow for the first landing so the shape is easy to review.
-
 use async_trait::async_trait;
-use nexus_search_common::{Hit, SearchDelegation};
+use nexus_search_common::{Hit, QueryParameters, SearchDelegation};
+use std::sync::Arc;
 
 /// The dispatcher's per-zone search request.  Owned (not a borrow of
 /// an axum body) so each leg's spawn owns its clone.
@@ -23,16 +16,9 @@ pub struct SearchRequest {
     /// Original caller credential for local RPC legs. Remote legs use a
     /// delegated subject over the node's authenticated connection instead.
     pub auth_token: String,
-    /// Raw query text.
-    pub query: String,
-    /// `keyword` / `semantic` / `hybrid` — kept as a string so a
-    /// caller reading a JSON body round-trips it verbatim; the
-    /// backend interprets.
-    pub search_type: String,
-    /// Cap on hits returned per zone AND on the fused result set.
-    pub limit: usize,
-    /// Optional path prefix — narrow the search to a subtree.
-    pub path_filter: Option<String>,
+    /// Shared immutable query parameters. Queued legs clone the Arc rather than
+    /// prefix maps and filters; the transport copies them into its wire request.
+    pub parameters: Arc<QueryParameters>,
     /// The original caller a per-zone leg runs the search AS.  A
     /// remote-zone backend stamps this onto the [`SearchDelegation`]
     /// it mints so the servicer records the correct subject on its
@@ -73,12 +59,8 @@ pub trait LocalSearchBackend: Send + Sync {
     ) -> Result<Vec<Hit>, BackendError>;
 }
 
-/// Dial-a-remote-daemon-and-run-a-search abstraction.  The concrete
-/// impl in PR 5 talks tonic gRPC to another daemon's
-/// `nexus.search.v1.SearchService.Query`, attaching `delegation.delegation_id`
-/// as the request's `auth_token`.  The trait is decl-only here so
-/// [`crate::routing::RoutingBackend`] can compose against a fake in unit tests
-/// without pulling the tonic stack into this crate's test build.
+/// Run a search on the owning remote daemon. The transport authenticates the
+/// issuing node and carries the already-minted delegation with the RPC.
 ///
 /// # Why the trait sees the delegation, not the raw subject
 ///
