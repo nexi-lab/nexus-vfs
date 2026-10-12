@@ -1,0 +1,12 @@
+name: Setup protobuf compiler
+description: Install the protobuf compiler used by Nexus builds
+runs:
+  using: composite
+  steps:
+    - name: Install protoc
+      shell: python
+      env:
+        NEXUS_PROTOC_ACTION_DIR: ${{ github.action_path }}
+      run: |
+        import os, runpy
+        runpy.run_path(os.path.join(os.environ['NEXUS_PROTOC_ACTION_DIR'], 'install.py'), run_name='__main__')
