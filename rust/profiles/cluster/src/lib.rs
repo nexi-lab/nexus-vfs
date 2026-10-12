@@ -33,8 +33,8 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 mod auth_posture;
 mod authorization;
-mod runtime_backends;
 mod plugin_loading;
+mod runtime_backends;
 mod search_capabilities;
 mod user_runtime;
 use auth_posture::{AuthPosture, AuthPostureInputs};
