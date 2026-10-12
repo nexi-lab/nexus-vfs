@@ -57,7 +57,7 @@ add 349–408 KB over the latest cluster baseline:
 | macOS x86_64 | 17,576,720 | 17,947,120 | 370,400 |
 | Windows x86_64 | 18,223,104 | 18,572,288 | 349,184 |
 
-These are CI measurements from baseline `4dc4c8bda` ([run 38209505701](https://github.com/nexi-lab/nexus-vfs/actions/runs/38209505701))
+These are CI measurements from baseline `09d75a4bf` (PR #427, merged as `4dc4c8bda`; [run 38209505701](https://github.com/nexi-lab/nexus-vfs/actions/runs/38209505701))
 and runtime `fcb877273` ([run 38231386244](https://github.com/nexi-lab/nexus-vfs/actions/runs/38231386244)).
 The runtime measurement follows a route factory split that removes 558–764 KB
 of unneeded remote gateway code from the local binary. The workflow retains
