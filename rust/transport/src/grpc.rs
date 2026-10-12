@@ -1836,14 +1836,16 @@ pub fn build_vfs_routes(
     max_message_bytes: usize,
     server_version: &str,
 ) -> tonic::service::Routes {
-    build_routes(
-        kernel,
-        auth,
-        foreign_ca_verifier,
-        ready,
+    vfs_routes(
+        build_vfs_service(
+            kernel,
+            auth,
+            foreign_ca_verifier,
+            ready,
+            server_version,
+            None,
+        ),
         max_message_bytes,
-        server_version,
-        RuntimeRouting::Local,
     )
 }
 
@@ -1857,14 +1859,16 @@ pub fn build_user_runtime_routes(
     max_message_bytes: usize,
     server_version: &str,
 ) -> tonic::service::Routes {
-    build_routes(
-        kernel,
-        auth,
-        foreign_ca_verifier,
-        ready,
+    vfs_routes(
+        build_vfs_service(
+            kernel,
+            auth,
+            foreign_ca_verifier,
+            ready,
+            server_version,
+            Some(Arc::new(scope)),
+        ),
         max_message_bytes,
-        server_version,
-        RuntimeRouting::User(Arc::new(scope)),
     )
 }
 
@@ -1878,37 +1882,33 @@ pub fn build_runtime_gateway_routes(
     max_message_bytes: usize,
     server_version: &str,
 ) -> tonic::service::Routes {
-    build_routes(
+    let local = build_vfs_service(
         kernel,
         auth,
         foreign_ca_verifier,
         ready,
-        max_message_bytes,
         server_version,
-        RuntimeRouting::Gateway(resolver),
+        None,
+    );
+    vfs_routes(
+        UserRuntimeGateway {
+            local,
+            resolver,
+            max_message_bytes,
+        },
+        max_message_bytes,
     )
 }
 
-enum RuntimeRouting {
-    Local,
-    User(Arc<RuntimeScope>),
-    Gateway(Arc<dyn UserRuntimeResolver>),
-}
-
-fn build_routes(
+fn build_vfs_service(
     kernel: Arc<Kernel>,
     auth: Arc<dyn AuthProvider>,
     foreign_ca_verifier: ForeignCaVerifierSlot,
     ready: Arc<DataPlaneReady>,
-    max_message_bytes: usize,
     server_version: &str,
-    routing: RuntimeRouting,
-) -> tonic::service::Routes {
-    let runtime_scope = match &routing {
-        RuntimeRouting::User(scope) => Some(Arc::clone(scope)),
-        _ => None,
-    };
-    let svc = VfsServiceImpl {
+    runtime_scope: Option<Arc<RuntimeScope>>,
+) -> VfsServiceImpl {
+    VfsServiceImpl {
         kernel,
         auth,
         runtime_scope,
@@ -1917,17 +1917,6 @@ fn build_routes(
         server_started_at: Instant::now(),
         server_version: Arc::from(server_version),
         started_secs: Arc::new(AtomicU64::new(0)),
-    };
-    match routing {
-        RuntimeRouting::Gateway(resolver) => vfs_routes(
-            UserRuntimeGateway {
-                local: svc,
-                resolver,
-                max_message_bytes,
-            },
-            max_message_bytes,
-        ),
-        _ => vfs_routes(svc, max_message_bytes),
     }
 }
 
