@@ -1,0 +1,67 @@
+name: User runtime Vault E2E
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  signed-vault:
+    name: Signed Vault (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            asset: nexus-vault-linux-x86_64.tar.gz
+            library: libnexus_vault.so
+          - os: windows-latest
+            asset: nexus-vault-windows-x86_64.zip
+            library: nexus_vault.dll
+          - os: macos-14
+            asset: nexus-vault-macos-arm64.tar.gz
+            library: libnexus_vault.dylib
+    env:
+      VAULT_FIXTURE_VERSION: '0.5.68'
+      VAULT_FIXTURE_ASSET: ${{ matrix.asset }}
+      VAULT_FIXTURE_LIBRARY: ${{ matrix.library }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Stage the released Vault library and its detached signature
+        shell: python
+        run: |
+          import io, os, pathlib, tarfile, urllib.request, zipfile
+          asset = os.environ['VAULT_FIXTURE_ASSET']
+          version = os.environ['VAULT_FIXTURE_VERSION']
+          url = f'https://sudowork-runtime-1309794936.cos.accelerate.myqcloud.com/nexus-vault/release/v{version}/{asset}'
+          with urllib.request.urlopen(url, timeout=120) as response:
+              data = response.read()
+          directory = pathlib.Path(os.environ['RUNNER_TEMP']) / 'signed-vault'
+          directory.mkdir()
+          names = {os.environ['VAULT_FIXTURE_LIBRARY'], os.environ['VAULT_FIXTURE_LIBRARY'] + '.sig'}
+          if asset.endswith('.zip'):
+              with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                  for entry in archive.infolist():
+                      name = pathlib.PurePosixPath(entry.filename).name
+                      if name in names:
+                          (directory / name).write_bytes(archive.read(entry))
+          else:
+              with tarfile.open(fileobj=io.BytesIO(data), mode='r:gz') as archive:
+                  for entry in archive:
+                      name = pathlib.PurePosixPath(entry.name).name
+                      if entry.isfile() and name in names:
+                          (directory / name).write_bytes(archive.extractfile(entry).read())
+          assert all((directory / name).is_file() for name in names)
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as output:
+              output.write(f'NEXUS_VAULT_PLUGIN_DIR={directory}\n')
+      - name: Verify real plugin storage and cross-owner refusal over mTLS
+        run: cargo test -p nexus-cluster --test user_runtime signed_vault_uses_the_owned_data_root_and_keeps_the_owner_boundary -- --ignored

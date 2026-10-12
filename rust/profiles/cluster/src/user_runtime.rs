@@ -122,12 +122,11 @@ fn validate_options(common: &CommonArgs) -> Result<()> {
         || !common.cluster_init_mount.is_empty()
         || common.enable_rebac
         || common.http_addr.is_some()
-        || common.plugin_dir.is_some()
         || !common.mount_drivers.is_empty()
         || common.identity_dir.is_some()
         || common.advertise_addr.is_some()
     {
-        bail!("serve-user accepts a fixed owner, external credential and local durable storage; cluster authority, federation, plugins and unauthenticated listeners are unavailable");
+        bail!("serve-user accepts a fixed owner, external credential and local durable storage; cluster authority, federation and unauthenticated listeners are unavailable");
     }
     Ok(())
 }
@@ -201,6 +200,7 @@ pub(super) async fn serve(
         );
     let auth: Arc<dyn transport::auth::AuthProvider> =
         Arc::new(auth::ApiKeyAuthProvider::cert_identity_only());
+    super::plugin_loading::load(&kernel, common.plugin_dir.as_deref())?;
     let ctx = ServiceBootCtx {
         auth_armed: true,
         auth: Arc::clone(&auth),
