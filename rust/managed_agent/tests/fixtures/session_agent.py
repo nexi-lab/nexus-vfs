@@ -17,7 +17,7 @@ for line in sys.stdin:
     message = json.loads(line)
     method = message.get('method')
     if method == 'initialize':
-        emit({'id': message['id'], 'result': {'protocolVersion': 1, 'agentCapabilities': {}}})
+        emit({'id': message['id'], 'result': {'protocolVersion': 1, 'agentCapabilities': {}, '_meta': {'nativePid': os.getpid()}}})
     elif method == 'session/new':
         emit({'id': message['id'], 'result': {'sessionId': 'durable-fixture-session'}})
     elif method == 'session/prompt':

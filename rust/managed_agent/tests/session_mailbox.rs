@@ -116,13 +116,16 @@ async fn subprocess_streams_approvals_and_accepts_cancel_without_public_fd_strea
         let pid = started["session_id"].as_str().unwrap();
         let endpoint: SessionEndpoint = serde_json::from_value(started["session_endpoint"].clone()).unwrap();
         assert_eq!(endpoint.controller, "operator");
-        assert!(started["os_pid"].as_u64().is_some());
+        let native = started["os_pid"].as_u64().expect("real child OS PID");
+        assert_eq!(pid, native.to_string());
+        assert_ne!(native, u64::from(std::process::id()));
         for fd in 0..3 { assert!(kernel.sys_stat(&format!("/proc/{pid}/fd/{fd}"), "root").is_none()); }
         let mut codec = SessionCodec::new(endpoint.clone(), SessionSide::Controller).unwrap();
         let mut offset = 0;
         send(&kernel, &endpoint, &mut codec, json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":1}}));
         let initialized = receive(&kernel, &endpoint, &mut codec, &mut offset);
         assert_eq!(initialized["id"], 0, "initialize response: {initialized}");
+        assert_eq!(initialized["result"]["_meta"]["nativePid"], native, "PID must be the actual Python process, not the broker");
         send(&kernel, &endpoint, &mut codec, json!({"jsonrpc":"2.0","id":"new","method":"session/new","params":{"cwd":"/"}}));
         assert_eq!(receive(&kernel, &endpoint, &mut codec, &mut offset)["result"]["sessionId"], "durable-fixture-session");
         for (turn, cancelled) in [("first", true), ("second", false)] {

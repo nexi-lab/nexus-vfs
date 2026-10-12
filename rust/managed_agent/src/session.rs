@@ -6,18 +6,19 @@
 //! (workspace_path, model, agent name, state) is derived from the
 //! descriptor on demand.
 
-use uuid::Uuid;
+use std::sync::atomic::{AtomicU32, Ordering};
 
-pub(crate) fn alloc_pid() -> String {
-    format!("pid-{}", short_uuid())
-}
-
-/// 12-char hex prefix of a v4 uuid. Plenty of entropy for kernel-local
-/// pid scope, and short enough to fit in log lines + path segments
-/// (`/proc/{pid}/workspace/`) without being noisy.
-fn short_uuid() -> String {
-    let s = Uuid::new_v4().simple().to_string();
-    s[..12].to_string()
+/// A co-hosted runtime belongs to this OS process. One process-wide counter
+/// disambiguates runtimes across every service/kernel instance in the process.
+pub(crate) fn alloc_pid() -> Result<String, String> {
+    static NEXT: AtomicU32 = AtomicU32::new(1);
+    let local = NEXT
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+        .map_err(|_| "in-process runtime PID counter exhausted".to_string())?;
+    Ok(contracts::agent_pid::encode_agent_pid(
+        i64::from(std::process::id()),
+        Some(local),
+    ))
 }
 
 pub(crate) fn now_ms() -> u64 {
@@ -26,24 +27,4 @@ pub(crate) fn now_ms() -> u64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn alloc_pid_has_pid_prefix() {
-        let p = alloc_pid();
-        assert!(p.starts_with("pid-"));
-        assert_eq!(p.len(), 4 + 12);
-    }
-
-    #[test]
-    fn alloc_pid_collisions_are_unlikely() {
-        let mut seen = std::collections::HashSet::new();
-        for _ in 0..1024 {
-            assert!(seen.insert(alloc_pid()), "pid collision in 1024 draws");
-        }
-    }
 }

@@ -17,7 +17,7 @@ use subprocess::HostedSubprocess;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
-use super::{RawSpawn, SpawnHandle, SpawnSpec};
+use super::{PreparedRawSpawn, RawSpawn, SpawnHandle, SpawnSpec};
 
 struct SubprocessHandle {
     endpoint: SessionEndpoint,
@@ -35,6 +35,7 @@ impl SpawnHandle for SubprocessHandle {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct KernelRawSpawn {
     kernel: Arc<Kernel>,
     agent_registry: Arc<AgentRegistry>,
@@ -56,30 +57,66 @@ impl KernelRawSpawn {
 }
 
 impl RawSpawn for KernelRawSpawn {
-    fn spawn(
-        &self,
-        desc: &AgentDescriptor,
-        spec: SpawnSpec,
-        endpoint: SessionEndpoint,
-    ) -> Result<Option<u32>, String> {
-        let result = self.spawn_inner(desc, spec, endpoint);
-        if result.is_err() {
-            let _ = self.agent_registry.kill(&desc.pid, 127);
+    fn prepare(&self, spec: SpawnSpec) -> Result<Box<dyn PreparedRawSpawn>, String> {
+        if spec.cmd.is_empty() {
+            return Err("spawn_spec.cmd is required".into());
         }
-        result
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|_| "subprocess hosting requires an active tokio runtime")?;
+        let mut argv = vec![spec.cmd];
+        argv.extend(spec.args);
+        let cwd = if spec.cwd.is_empty() {
+            PathBuf::from(".")
+        } else {
+            PathBuf::from(spec.cwd)
+        };
+        let child = runtime
+            .block_on(HostedSubprocess::spawn_no_pipes(argv, spec.env, &cwd))
+            .map_err(|e| format!("launch session subprocess: {e}"))?;
+        let os_pid = child.os_pid().ok_or("launched subprocess has no OS PID")?;
+        Ok(Box::new(PreparedSubprocess {
+            spawner: self.clone(),
+            child,
+            runtime,
+            os_pid,
+        }))
+    }
+}
+
+struct PreparedSubprocess {
+    spawner: KernelRawSpawn,
+    child: HostedSubprocess,
+    runtime: tokio::runtime::Handle,
+    os_pid: u32,
+}
+
+impl PreparedRawSpawn for PreparedSubprocess {
+    fn os_pid(&self) -> u32 {
+        self.os_pid
+    }
+    fn attach(
+        self: Box<Self>,
+        desc: &AgentDescriptor,
+        endpoint: SessionEndpoint,
+    ) -> Result<(), String> {
+        let Self {
+            spawner,
+            child,
+            runtime,
+            ..
+        } = *self;
+        spawner.attach(desc, endpoint, child, runtime)
     }
 }
 
 impl KernelRawSpawn {
-    fn spawn_inner(
+    fn attach(
         &self,
         desc: &AgentDescriptor,
-        spec: SpawnSpec,
         endpoint: SessionEndpoint,
-    ) -> Result<Option<u32>, String> {
-        if spec.cmd.is_empty() {
-            return Err("spawn_spec.cmd is required".into());
-        }
+        mut child: HostedSubprocess,
+        runtime: tokio::runtime::Handle,
+    ) -> Result<(), String> {
         let ctx = OperationContext::new(
             &desc.owner_id,
             &desc.zone_id,
@@ -93,19 +130,6 @@ impl KernelRawSpawn {
             endpoint.clone(),
             SessionSide::Agent,
         )?);
-        let runtime = tokio::runtime::Handle::try_current()
-            .map_err(|_| "subprocess hosting requires an active tokio runtime")?;
-        let mut argv = vec![spec.cmd];
-        argv.extend(spec.args);
-        let cwd = if spec.cwd.is_empty() {
-            PathBuf::from(".")
-        } else {
-            PathBuf::from(spec.cwd)
-        };
-        let mut child = runtime
-            .block_on(HostedSubprocess::spawn_no_pipes(argv, spec.env, &cwd))
-            .map_err(|e| format!("launch session subprocess: {e}"))?;
-        let os_pid = child.os_pid();
         let (mut stdin, stdout, mut stderr) = child
             .take_stdio_for_connection()
             .map_err(|e| format!("take subprocess stdio: {e}"))?;
@@ -236,7 +260,7 @@ impl KernelRawSpawn {
             .await;
             let _ = registry.kill(&pid, exit.as_reap_code());
         });
-        Ok(os_pid)
+        Ok(())
     }
 }
 
