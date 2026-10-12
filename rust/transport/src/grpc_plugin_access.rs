@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tonic::{metadata::MetadataMap, Status};
 
 use crate::auth::{AuthCredentials, AuthProvider, PeerIdentity};
+use crate::runtime_scope::RuntimeScope;
 
 /// Authorize a decoded unary request before the plugin sees it. A policy may
 /// bind request fields to the authenticated caller by replacing the payload.
@@ -50,6 +51,39 @@ impl PluginGrpcPolicy for AuthenticatedPlugin {
             peer,
         })?;
         Ok(Box::new(AuthenticatedResponse))
+    }
+}
+
+/// Apply the runtime's owner and live-credential gate before a service policy.
+pub struct RuntimeScopedPlugin {
+    inner: Arc<dyn PluginGrpcPolicy>,
+    auth: Arc<dyn AuthProvider>,
+    scope: Arc<RuntimeScope>,
+}
+
+impl RuntimeScopedPlugin {
+    pub fn new(
+        inner: Arc<dyn PluginGrpcPolicy>,
+        auth: Arc<dyn AuthProvider>,
+        scope: Arc<RuntimeScope>,
+    ) -> Self {
+        Self { inner, auth, scope }
+    }
+}
+
+impl PluginGrpcPolicy for RuntimeScopedPlugin {
+    fn authorize(
+        &self,
+        method: &str,
+        payload: &mut Vec<u8>,
+        metadata: &MetadataMap,
+        peer: Option<&PeerIdentity>,
+    ) -> Result<Box<dyn AuthorizedPluginCall>, Status> {
+        let token = request_token(metadata, "")?;
+        let ctx = self.auth.resolve(&AuthCredentials { token, peer })?;
+        self.scope
+            .resolve(self.auth.as_ref(), ctx, peer, token, metadata)?;
+        self.inner.authorize(method, payload, metadata, peer)
     }
 }
 

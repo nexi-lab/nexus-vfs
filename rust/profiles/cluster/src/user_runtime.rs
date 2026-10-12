@@ -199,7 +199,9 @@ pub(super) async fn serve(
             peer_client,
         );
     let auth: Arc<dyn transport::auth::AuthProvider> =
-        Arc::new(auth::ApiKeyAuthProvider::cert_identity_only());
+        Arc::new(auth::ApiKeyAuthProvider::cert_identity_for_user_runtime(
+            initial.bundle.server_name.clone(),
+        ));
     super::plugin_loading::load(&kernel, common.plugin_dir.as_deref())?;
     let ctx = ServiceBootCtx {
         auth_armed: true,
@@ -215,14 +217,24 @@ pub(super) async fn serve(
     verifier_slot
         .set(Arc::clone(&verifier))
         .map_err(|_| anyhow::anyhow!("runtime verifier already installed"))?;
+    let scope = scope.with_server_identity(Arc::clone(&identity));
+    let ready = DataPlaneReady::open();
     let routes = build_user_runtime_routes(
-        kernel,
-        auth,
-        scope.with_server_identity(Arc::clone(&identity)),
-        verifier_slot,
-        DataPlaneReady::open(),
+        Arc::clone(&kernel),
+        Arc::clone(&auth),
+        scope.clone(),
+        Arc::clone(&verifier_slot),
+        Arc::clone(&ready),
         contracts::MAX_GRPC_MESSAGE_BYTES,
         super::daemon_version_string(),
+    );
+    let routes = super::plugin_loading::routes(
+        routes,
+        &kernel,
+        &auth,
+        verifier_slot,
+        ready,
+        Some(Arc::new(scope)),
     );
     let bind = common.effective_bind_addr();
     let listener = tokio::net::TcpListener::bind(&bind)

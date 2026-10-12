@@ -149,6 +149,7 @@ x509-parser = "0.18"
 sqlx = { workspace = true, features = ["runtime-tokio", "sqlite"] }
 permission = { workspace = true }
 prost = { workspace = true }
+tonic-prost = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 nexus-rebac = { path = "../../rebac" }
 tokio-stream = { version = "0.1", features = ["net"] }

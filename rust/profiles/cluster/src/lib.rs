@@ -2296,31 +2296,13 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         daemon_version_string(),
     );
 
-    // Plugin gRPC shares the daemon listener and live peer trust roots.
-    let plugin_endpoints = kernel.plugin_grpc_endpoints();
-    if !plugin_endpoints.is_empty() {
-        tracing::info!(
-            count = plugin_endpoints.len(),
-            "merging plugin gRPC endpoints into VFS Routes",
-        );
-    }
-    let vfs_routes = transport::grpc_plugin_proxy::extend_routes_with_plugin_endpoints(
+    let vfs_routes = plugin_loading::routes(
         vfs_routes,
-        plugin_endpoints,
+        &kernel,
+        &vfs_auth,
         Arc::clone(&fca_verifier_slot),
         Arc::clone(&data_plane_ready),
-        |endpoint| {
-            if endpoint.service_name == transport::grpc_search_access::SERVICE_NAME {
-                Arc::new(transport::grpc_search_access::SearchGrpcPolicy::new(
-                    Arc::clone(&kernel),
-                    Arc::clone(&vfs_auth),
-                ))
-            } else {
-                Arc::new(transport::grpc_plugin_access::AuthenticatedPlugin::new(
-                    Arc::clone(&vfs_auth),
-                ))
-            }
-        },
+        None,
     );
 
     let ZoneManagerBundle {

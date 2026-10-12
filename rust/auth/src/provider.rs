@@ -147,6 +147,8 @@ pub struct ApiKeyAuthProvider {
     /// The composition root refreshes it from the CA-signed CRL (the CA's own
     /// trust plane, orthogonal to raft); empty until the first refresh.
     revoked_serials: RwLock<HashSet<Vec<u8>>>,
+    /// The confined endpoint where an owner-bound server identity may act as a client.
+    runtime_server_name: Option<String>,
 }
 
 impl ApiKeyAuthProvider {
@@ -167,6 +169,7 @@ impl ApiKeyAuthProvider {
                 cache_ttl,
             }),
             revoked_serials: RwLock::new(HashSet::new()),
+            runtime_server_name: None,
         }
     }
 
@@ -183,7 +186,15 @@ impl ApiKeyAuthProvider {
         Self {
             keys: None,
             revoked_serials: RwLock::new(HashSet::new()),
+            runtime_server_name: None,
         }
+    }
+
+    /// Resolve certificates on the endpoint belonging to this signed owner.
+    pub fn cert_identity_for_user_runtime(server_name: String) -> Self {
+        let mut provider = Self::cert_identity_only();
+        provider.runtime_server_name = Some(server_name);
+        provider
     }
 
     /// Whether this daemon resolves `sk-` keys at all. The composition root
@@ -505,6 +516,16 @@ impl AuthProvider for ApiKeyAuthProvider {
     }
 
     fn resolve(&self, creds: &AuthCredentials<'_>) -> Result<OperationContext, Status> {
+        if let Some(name) = creds
+            .peer
+            .and_then(|peer| peer.runtime_server_name.as_ref())
+        {
+            if self.runtime_server_name.as_ref() != Some(name) {
+                return Err(Status::permission_denied(
+                    "user runtime credential belongs to another endpoint",
+                ));
+            }
+        }
         if !creds.token.is_empty() {
             return self.resolve_token(creds.token);
         }
@@ -637,6 +658,7 @@ mod tests {
             agent_name: Some("mac-ai".into()),
             owner: None,
             trust_domain: None,
+            runtime_server_name: None,
             serial: vec![1, 2, 3],
         };
         // The store is empty on purpose: resolution reads the cert, not a record.
@@ -672,6 +694,7 @@ mod tests {
             agent_name: Some("session-3f2a".into()),
             owner: Some("alice".into()),
             trust_domain: None,
+            runtime_server_name: None,
             serial: vec![4, 2],
         };
         let ctx = provider(MemStore::arc())
@@ -717,6 +740,7 @@ mod tests {
             agent_name: Some("mac-ai".into()),
             owner: None,
             trust_domain: None,
+            runtime_server_name: None,
             serial: vec![1],
         };
         let ctx = provider(MemStore::arc())
@@ -744,6 +768,7 @@ mod tests {
             agent_name: Some("cardio".into()),
             owner: None,
             trust_domain: Some("hospital-a".into()),
+            runtime_server_name: None,
             serial: vec![7, 7, 7],
         };
         let ctx = provider(MemStore::arc())
@@ -776,6 +801,7 @@ mod tests {
             agent_name: Some("mac-ai".into()),
             owner: None,
             trust_domain: None,
+            runtime_server_name: None,
             serial: vec![9, 9, 9],
         };
         let provider = provider(MemStore::arc());
@@ -941,6 +967,7 @@ mod tests {
             agent_name: None,
             owner: None,
             trust_domain: None,
+            runtime_server_name: None,
             serial: vec![1],
         };
         let agent = PeerIdentity {
@@ -1043,6 +1070,7 @@ mod tests {
             agent_name: None,
             owner: None,
             trust_domain: None,
+            runtime_server_name: None,
             serial: vec![],
         };
         let ctx = provider(MemStore::arc())
@@ -1082,6 +1110,7 @@ mod tests {
             agent_name: Some("mac-ai".into()),
             owner: None,
             trust_domain: None,
+            runtime_server_name: None,
             serial: vec![1, 2, 3],
         };
         let creds = AuthCredentials {
@@ -1111,6 +1140,7 @@ mod tests {
             agent_name: Some("cardio".into()),
             owner: None,
             trust_domain: Some("hospital-a".into()),
+            runtime_server_name: None,
             serial: vec![7, 7, 7],
         };
         let ctx = ApiKeyAuthProvider::cert_identity_only()
@@ -1134,6 +1164,7 @@ mod tests {
             agent_name: Some("mac-ai".into()),
             owner: None,
             trust_domain: None,
+            runtime_server_name: None,
             serial: vec![9, 9, 9],
         };
         let p = ApiKeyAuthProvider::cert_identity_only();

@@ -67,4 +67,4 @@ jobs:
           with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as output:
               output.write(f'NEXUS_VAULT_PLUGIN_DIR={directory}\n')
       - name: Verify real plugin storage and cross-owner refusal over mTLS
-        run: cargo test -p nexus-cluster --test user_runtime signed_vault_uses_the_owned_data_root_and_keeps_the_owner_boundary -- --ignored
+        run: cargo test -p nexus-cluster --test user_runtime signed_vault_ -- --ignored

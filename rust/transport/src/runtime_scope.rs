@@ -73,6 +73,7 @@ impl RuntimeDelegation {
 }
 
 /// The user owning a runtime and the root-zone nodes allowed to forward to it.
+#[derive(Clone)]
 pub struct RuntimeScope {
     user_id: String,
     gateway_nodes: HashSet<u64>,

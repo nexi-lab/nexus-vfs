@@ -78,6 +78,8 @@ pub struct PeerIdentity {
     /// on any node the CA reaches. This is what lets the kernel attribute a
     /// session agent's actions to a person.
     pub owner: Option<String>,
+    /// Owner-derived TLS server name for a confined user runtime's certificate.
+    pub runtime_server_name: Option<String>,
     /// The certificate's raw serial-number bytes. For an agent cert this is
     /// what revocation names: `resolve` rejects a peer whose serial is in the
     /// cluster CA's signed CRL. Every X.509 cert carries a serial.
@@ -231,6 +233,7 @@ mod tests {
             agent_name: None,
             owner: None,
             trust_domain: None,
+            runtime_server_name: None,
             serial: vec![],
         };
         assert_eq!(named.display_id(), "node/7");
@@ -242,6 +245,7 @@ mod tests {
             agent_name: None,
             owner: None,
             trust_domain: None,
+            runtime_server_name: None,
             serial: vec![],
         };
         assert_eq!(legacy.display_id(), "nexus-zone-root-node-win");
@@ -253,6 +257,7 @@ mod tests {
             agent_name: Some("win-ai".into()),
             owner: None,
             trust_domain: None,
+            runtime_server_name: None,
             serial: vec![],
         };
         assert_eq!(agent.display_id(), "agent/win-ai");
