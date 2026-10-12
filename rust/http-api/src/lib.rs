@@ -260,6 +260,7 @@ pub fn router(state: AppState) -> Router {
     let protected_router = {
         let r = Router::new()
             .merge(handlers::search::router())
+            .merge(handlers::path_contexts::router())
             .merge(handlers::documents::router())
             .merge(handlers::auth::router());
         #[cfg(feature = "rebac")]

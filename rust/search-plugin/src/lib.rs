@@ -74,6 +74,7 @@ pub mod llm_chat;
 pub mod macro_expand;
 mod markdown;
 pub mod parked_state;
+pub mod path_contexts;
 pub mod path_scope;
 pub mod peer_fanout;
 pub mod peer_registry;
@@ -86,11 +87,12 @@ pub mod zone_modes_state;
 
 use search_proto::search_service_server::SearchService as SearchServiceTrait;
 use search_proto::{
-    AddIndexedDirectoryRequest, BatchQueryRequest, GlobRequest, GrepRequest, HealthRequest,
-    IndexDocumentsRequest, IndexRequest, ListIndexedDirectoriesRequest,
-    ListZoneIndexingModesRequest, LocateRequest, NotifyFileChangeRequest, ParkedDiscardRequest,
-    ParkedListRequest, ParkedRetryRequest, QueryRequest, RefreshRequest,
-    RemoveIndexedDirectoryRequest, SetZoneIndexingModeRequest, StatsRequest,
+    AddIndexedDirectoryRequest, BatchQueryRequest, DeletePathContextRequest, GlobRequest,
+    GrepRequest, HealthRequest, IndexDocumentsRequest, IndexRequest, ListIndexedDirectoriesRequest,
+    ListPathContextsRequest, ListZoneIndexingModesRequest, LocateRequest, NotifyFileChangeRequest,
+    ParkedDiscardRequest, ParkedListRequest, ParkedRetryRequest, PutPathContextRequest,
+    QueryRequest, RefreshRequest, RemoveIndexedDirectoryRequest, SetZoneIndexingModeRequest,
+    StatsRequest,
 };
 
 /// Plugin state held between `create` and `destroy`.
@@ -261,6 +263,9 @@ fn dispatch_grpc(
         "ListZoneIndexingModes" => call!(ListZoneIndexingModesRequest, list_zone_indexing_modes),
         "Health" => call!(HealthRequest, health),
         "Stats" => call!(StatsRequest, stats),
+        "PutPathContext" => call!(PutPathContextRequest, put_path_context),
+        "ListPathContexts" => call!(ListPathContextsRequest, list_path_contexts),
+        "DeletePathContext" => call!(DeletePathContextRequest, delete_path_context),
         #[cfg(test)]
         "__panic_for_test" => plugin
             .rt

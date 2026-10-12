@@ -64,6 +64,25 @@ struct MockSearchService {
 
 #[tonic::async_trait]
 impl SearchService for MockSearchService {
+    async fn put_path_context(
+        &self,
+        _: Request<nexus_http_api::search_proto::PutPathContextRequest>,
+    ) -> Result<Response<nexus_http_api::search_proto::PathContext>, Status> {
+        unreachable!()
+    }
+    async fn list_path_contexts(
+        &self,
+        _: Request<nexus_http_api::search_proto::ListPathContextsRequest>,
+    ) -> Result<Response<nexus_http_api::search_proto::ListPathContextsResponse>, Status> {
+        unreachable!()
+    }
+    async fn delete_path_context(
+        &self,
+        _: Request<nexus_http_api::search_proto::DeletePathContextRequest>,
+    ) -> Result<Response<nexus_http_api::search_proto::DeletePathContextResponse>, Status> {
+        unreachable!()
+    }
+
     async fn grep(&self, req: Request<GrepRequest>) -> Result<Response<GrepResponse>, Status> {
         let inner = req.into_inner();
         let applied_filters = (if inner.files.is_some() {

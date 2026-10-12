@@ -3,6 +3,9 @@
 
 mod common;
 
+use nexus_search_plugin::search_proto::{
+    BatchQueryRequest, ListPathContextsRequest, PutPathContextRequest, QueryRequest,
+};
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -58,6 +61,26 @@ async fn grant(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn production_grants_filter_http_search_and_survive_restart() {
     let tmp = tempfile::tempdir().unwrap();
+    let database_path = tmp.path().join("configuration.db");
+    let database_url = format!(
+        "sqlite:///{}",
+        database_path.to_string_lossy().replace('\\', "/")
+    );
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&database_path)
+                .create_if_missing(true),
+        )
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE path_contexts (id INTEGER PRIMARY KEY, zone_id VARCHAR(255) NOT NULL DEFAULT 'root', path_prefix VARCHAR(1024) NOT NULL, description TEXT NOT NULL, weight FLOAT, created_at TIMESTAMP NOT NULL, updated_at TIMESTAMP NOT NULL, UNIQUE(zone_id, path_prefix))")
+        .execute(&pool).await.unwrap();
+    // Existing database facts must work without a migration to another store.
+    sqlx::query("INSERT INTO path_contexts (zone_id, path_prefix, description, weight, created_at, updated_at) VALUES ('legal', 'legal', 'existing configuration', 5.0, '2026-01-01 00:00:00.000000', '2026-01-01 00:00:00.000000')")
+        .execute(&pool).await.unwrap();
+    pool.close().await;
     let plugins = common::search_plugin::signed_plugin(tmp.path());
     let data = tmp.path().join("data");
     let id = tmp.path().join("identity");
@@ -76,6 +99,8 @@ async fn production_grants_filter_http_search_and_survive_restart() {
     // Exercise the remote delegation leg against a real mTLS listener too.
     let remote = format!("legal=https://{grpc}");
     let env = [
+        ("DATABASE_URL", database_url.as_str()),
+        ("NEXUS_PATH_CONTEXT_FRESHNESS_SECONDS", "3600"),
         ("NEXUS_DATA_DIR", data.to_str().unwrap()),
         ("NEXUS_IDENTITY_DIR", id.to_str().unwrap()),
         ("NEXUS_BIND_ADDR", grpc.as_str()),
@@ -440,6 +465,175 @@ async fn production_grants_filter_http_search_and_survive_restart() {
         ["/docs/public.md", "/legal/contract.md"]
     );
     assert_eq!(query(&client, &base, narrow, "").await, ["/docs/public.md"]);
+
+    let contexts_url = format!("{base}/v2/search/path-contexts");
+    assert_eq!(client.put(&contexts_url).bearer_auth(alice)
+        .json(&json!({"zone_id":"sharedzone", "path_prefix":"docs", "description":"documents", "weight":4.0}))
+        .send().await.unwrap().status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        client
+            .get(&contexts_url)
+            .bearer_auth(narrow)
+            .query(&[("zone_id", "legal")])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        client
+            .put(&contexts_url)
+            .bearer_auth(admin)
+            .json(&json!({"path_prefix":"../escape", "description":"invalid"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let saved = json_ok(client.put(&contexts_url).bearer_auth(admin)
+        .json(&json!({"zone_id":"sharedzone", "path_prefix":"/docs/", "description":"documents", "weight":4.0}))).await;
+    assert_eq!(saved["path_prefix"], "docs");
+    let scoped = json_ok(client.get(&contexts_url).bearer_auth(narrow)).await;
+    assert_eq!(scoped["contexts"].as_array().unwrap().len(), 1, "{scoped}");
+    assert_eq!(scoped["contexts"][0]["zone_id"], "sharedzone");
+    let configured = json_ok(
+        client
+            .post(format!("{base}/v2/search/query"))
+            .bearer_auth(alice)
+            .json(&json!({"q":"widget", "limit":20})),
+    )
+    .await;
+    let configured_hits = configured["results"].as_array().unwrap();
+    assert_eq!(configured_hits.len(), 2, "{configured}");
+    for hit in configured_hits {
+        let expected = if hit["zone_id"] == "legal" { 5.0 } else { 4.0 };
+        assert_eq!(hit["tier_boost"].as_f64(), Some(expected), "{hit}");
+    }
+    let mut grpc_search =
+        common::search_plugin::mtls_client(port, &ca, &node_cert, &node_key).await;
+    assert_eq!(
+        grpc_search
+            .put_path_context(PutPathContextRequest {
+                zone_id: "sharedzone".into(),
+                path_prefix: "docs".into(),
+                description: "forbidden".into(),
+                weight: Some(9.0),
+                auth_token: narrow.into()
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    assert_eq!(
+        grpc_search
+            .list_path_contexts(ListPathContextsRequest {
+                zone_id: Some("legal".into()),
+                auth_token: narrow.into()
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    let grpc_hits = grpc_search
+        .query(QueryRequest {
+            q: "widget".into(),
+            zone_id: "sharedzone".into(),
+            auth_token: narrow.into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(grpc_hits.results.len(), 1);
+    assert_eq!(grpc_hits.results[0].tier_boost, Some(4.0));
+    let batch = grpc_search
+        .batch_query(BatchQueryRequest {
+            auth_token: alice.into(),
+            queries: ["sharedzone", "legal"]
+                .into_iter()
+                .map(|zone| QueryRequest {
+                    q: "widget".into(),
+                    zone_id: zone.into(),
+                    ..Default::default()
+                })
+                .collect(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(batch.responses.len(), 2);
+    assert_eq!(batch.responses[0].results[0].tier_boost, Some(4.0));
+    assert_eq!(batch.responses[1].results[0].tier_boost, Some(5.0));
+    // A weightless child exempts itself from a weighted parent, even with a
+    // warm candidate cache and a one-hour configuration refresh window.
+    json_ok(client.put(&contexts_url).bearer_auth(admin).json(
+        &json!({"zone_id":"sharedzone", "path_prefix":"docs/public.md", "description":"plain"}),
+    ))
+    .await;
+    let plain = grpc_search
+        .query(QueryRequest {
+            q: "widget".into(),
+            zone_id: "sharedzone".into(),
+            auth_token: narrow.into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(plain.results[0].tier_boost, Some(1.0));
+    let ranked = json_ok(
+        client
+            .post(format!("{base}/v2/search/query"))
+            .bearer_auth(admin)
+            .json(&json!({"q":"widget", "zone_id":"sharedzone", "limit":1})),
+    )
+    .await;
+    assert_eq!(ranked["results"][0]["path"], "/docs/private.md", "{ranked}");
+    json_ok(client.put(&contexts_url).bearer_auth(admin)
+        .json(&json!({"zone_id":"sharedzone", "path_prefix":"docs/public.md", "description":"promoted", "weight":9.0}))).await;
+    let promoted = json_ok(
+        client
+            .post(format!("{base}/v2/search/query"))
+            .bearer_auth(admin)
+            .json(&json!({"q":"widget", "zone_id":"sharedzone", "limit":1})),
+    )
+    .await;
+    assert_eq!(
+        promoted["results"][0]["path"], "/docs/public.md",
+        "{promoted}"
+    );
+    json_ok(client.delete(&contexts_url).bearer_auth(admin).query(&[
+        ("zone_id", "sharedzone"),
+        ("path_prefix", "/docs/public.md/"),
+    ]))
+    .await;
+    let boosted = grpc_search
+        .query(QueryRequest {
+            q: "widget".into(),
+            zone_id: "sharedzone".into(),
+            auth_token: narrow.into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(boosted.results[0].tier_boost, Some(4.0));
+    assert_eq!(
+        client
+            .delete(&contexts_url)
+            .bearer_auth(admin)
+            .query(&[("zone_id", "sharedzone"), ("path_prefix", "docs/public.md")])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    drop(grpc_search);
     // Real signed plugin and Raft-backed file grants on both the local leg and
     // the mTLS delegation leg. Tuning must still preserve the caller's scope.
     let options = json!({
@@ -532,6 +726,9 @@ async fn production_grants_filter_http_search_and_survive_restart() {
         .build()
         .unwrap();
     // Persisted grants AND revocations remain effective after process restart.
+    let persisted = json_ok(client.get(&contexts_url).bearer_auth(admin)).await;
+    assert_eq!(persisted["contexts"].as_array().unwrap().len(), 2);
+    assert_eq!(persisted["contexts"][1]["created_at"], saved["created_at"]);
     assert!(query(&client, &base, alice, "sharedzone").await.is_empty());
     assert_eq!(
         query(&client, &base, bob, "sharedzone").await,

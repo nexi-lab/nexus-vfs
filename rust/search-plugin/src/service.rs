@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Instant;
 
+use contracts::ROOT_ZONE_ID;
 use futures_util::StreamExt;
 use nexus_plugin_abi::KernelHandle;
 use parking_lot::Mutex;
@@ -40,12 +41,14 @@ use crate::query_expansion::{build_default_expander, ExpansionCache, QueryExpand
 use crate::search_proto::search_service_server::SearchService;
 use crate::search_proto::{
     AddIndexedDirectoryRequest, AddIndexedDirectoryResponse, BatchQueryRequest, BatchQueryResponse,
-    DiscoveryFilter, FusionMethod, GlobRequest, GlobResponse, GrepRequest, GrepResponse,
-    HealthRequest, HealthResponse, IndexDocumentsRequest, IndexDocumentsResponse, IndexRequest,
-    IndexResponse, ListIndexedDirectoriesRequest, ListIndexedDirectoriesResponse,
-    ListZoneIndexingModesRequest, ListZoneIndexingModesResponse, LocateRequest, LocateResponse,
-    NotifyFileChangeRequest, NotifyFileChangeResponse, ParkedDiscardRequest, ParkedDiscardResponse,
-    ParkedListRequest, ParkedListResponse, ParkedRetryRequest, ParkedRetryResponse, QueryRequest,
+    DeletePathContextRequest, DeletePathContextResponse, DiscoveryFilter, FusionMethod,
+    GlobRequest, GlobResponse, GrepRequest, GrepResponse, HealthRequest, HealthResponse,
+    IndexDocumentsRequest, IndexDocumentsResponse, IndexRequest, IndexResponse,
+    ListIndexedDirectoriesRequest, ListIndexedDirectoriesResponse, ListPathContextsRequest,
+    ListPathContextsResponse, ListZoneIndexingModesRequest, ListZoneIndexingModesResponse,
+    LocateRequest, LocateResponse, NotifyFileChangeRequest, NotifyFileChangeResponse,
+    ParkedDiscardRequest, ParkedDiscardResponse, ParkedListRequest, ParkedListResponse,
+    ParkedRetryRequest, ParkedRetryResponse, PathContext, PutPathContextRequest, QueryRequest,
     QueryResponse, QueryResult, QueryType, RefreshRequest, RefreshResponse,
     RemoveIndexedDirectoryRequest, RemoveIndexedDirectoryResponse, SetZoneIndexingModeRequest,
     SetZoneIndexingModeResponse, StatsRequest, StatsResponse,
@@ -98,13 +101,7 @@ const SEARCH_BACKEND_NAME: &str = "rust-plugin";
 /// Maximum input document size for an index walk.
 const INDEX_MAX_FILE_BYTES: usize = 8 * 1024 * 1024;
 
-/// Empty `zone_id` on a request means "the root zone" — same rule
-/// the Python router uses when a token has no explicit zone scope
-/// (see `nexus.contracts.constants.ROOT_ZONE_ID`).  Kept as a plain
-/// string here so the plugin dep tree stays free of the wider
-/// contracts crate.
-const ROOT_ZONE_ID: &str = "root";
-
+/// Empty request zones resolve to the shared root zone.
 fn resolve_zone(z: &str) -> &str {
     if z.is_empty() {
         ROOT_ZONE_ID
@@ -135,6 +132,8 @@ fn current_time_ms() -> i64 {
 
 pub struct SearchServiceImpl {
     handle: Arc<KernelHandle>,
+    path_contexts: OnceLock<Option<Arc<crate::path_contexts::PathContextStore>>>,
+    path_context_error_logged: std::sync::atomic::AtomicBool,
     /// Per-zone `FtsIndex` + `AnnIndex` caches used by Query, Index,
     /// and SemanticQuery.  `Arc<IndexManager>` so tests can inject a
     /// manager rooted at a tempdir instead of the default.
@@ -328,6 +327,7 @@ impl SearchServiceImpl {
             context_generator_pin: None,
             embed_gate: None,
             ann_flush: None,
+            path_contexts_pin: None,
         }
     }
 
@@ -352,6 +352,19 @@ impl SearchServiceImpl {
             embedding_dimensions: dimensions,
             has_graph: false,
         }
+    }
+
+    fn path_context_store(&self) -> Option<&Arc<crate::path_contexts::PathContextStore>> {
+        self.path_contexts
+            .get_or_init(|| crate::path_contexts::PathContextStore::from_env().map(Arc::new))
+            .as_ref()
+    }
+
+    fn required_path_context_store(
+        &self,
+    ) -> Result<&Arc<crate::path_contexts::PathContextStore>, Status> {
+        self.path_context_store()
+            .ok_or_else(|| Status::unavailable("path-context database is not configured"))
     }
 
     /// Record a handler panic caught at the dispatch boundary (#4725);
@@ -758,9 +771,19 @@ pub struct SearchServiceBuilder {
     context_generator_pin: Option<Option<SharedContextGenerator>>,
     embed_gate: Option<Arc<crate::ann_flush::EmbedGate>>,
     ann_flush: Option<Arc<crate::ann_flush::AnnFlushCoordinator>>,
+    path_contexts_pin: Option<Option<Arc<crate::path_contexts::PathContextStore>>>,
 }
 
 impl SearchServiceBuilder {
+    pub fn path_contexts(mut self, store: Arc<crate::path_contexts::PathContextStore>) -> Self {
+        self.path_contexts_pin = Some(Some(store));
+        self
+    }
+
+    pub fn no_path_contexts(mut self) -> Self {
+        self.path_contexts_pin = Some(None);
+        self
+    }
     /// Pin the embedding concurrency gate (#4777) — tests use it to
     /// avoid reading `NEXUS_SEARCH_EMBED_CONCURRENCY` from the host env.
     pub fn embed_gate(mut self, gate: Arc<crate::ann_flush::EmbedGate>) -> Self {
@@ -871,6 +894,8 @@ impl SearchServiceBuilder {
         let index_seq = Arc::new(crate::index_seq::IndexSeq::open_or_create(manager.root()));
         SearchServiceImpl {
             handle: self.handle,
+            path_contexts: pin_to_once_lock(self.path_contexts_pin),
+            path_context_error_logged: std::sync::atomic::AtomicBool::new(false),
             manager,
             embedder_slot: Arc::new(Mutex::new(self.embedder)),
             query_cache: self
@@ -3537,8 +3562,83 @@ fn health_verdict(
     }
 }
 
+fn path_context_to_proto(record: crate::path_contexts::PathContextRecord) -> PathContext {
+    PathContext {
+        zone_id: record.zone_id,
+        path_prefix: record.path_prefix,
+        description: record.description,
+        weight: record.weight,
+        created_at: record.created_at.format("%Y-%m-%dT%H:%M:%S%.f").to_string(),
+        updated_at: record.updated_at.format("%Y-%m-%dT%H:%M:%S%.f").to_string(),
+    }
+}
+
+fn path_context_status(error: crate::path_contexts::PathContextError) -> Status {
+    use crate::path_contexts::PathContextError;
+    match error {
+        PathContextError::InvalidArgument(message) => Status::invalid_argument(message),
+        PathContextError::Unavailable(message) => Status::unavailable(message),
+        PathContextError::NotFound(message) => Status::not_found(message),
+    }
+}
+
 #[async_trait]
 impl SearchService for SearchServiceImpl {
+    async fn put_path_context(
+        &self,
+        request: Request<PutPathContextRequest>,
+    ) -> Result<Response<PathContext>, Status> {
+        let request = request.into_inner();
+        self.required_path_context_store()?
+            .put(crate::path_contexts::PathContextInput {
+                zone_id: request.zone_id,
+                path_prefix: request.path_prefix,
+                description: request.description,
+                weight: request.weight,
+            })
+            .await
+            .map_err(path_context_status)
+            .map(|record| Response::new(path_context_to_proto(record)))
+    }
+
+    async fn list_path_contexts(
+        &self,
+        request: Request<ListPathContextsRequest>,
+    ) -> Result<Response<ListPathContextsResponse>, Status> {
+        let request = request.into_inner();
+        let zone = request
+            .zone_id
+            .as_deref()
+            .map(crate::path_contexts::checked_zone)
+            .transpose()
+            .map_err(path_context_status)?;
+        let contexts = self
+            .required_path_context_store()?
+            .list(zone)
+            .await
+            .map_err(path_context_status)?;
+        Ok(Response::new(ListPathContextsResponse {
+            contexts: contexts.into_iter().map(path_context_to_proto).collect(),
+        }))
+    }
+
+    async fn delete_path_context(
+        &self,
+        request: Request<DeletePathContextRequest>,
+    ) -> Result<Response<DeletePathContextResponse>, Status> {
+        let request = request.into_inner();
+        let zone =
+            crate::path_contexts::checked_zone(&request.zone_id).map_err(path_context_status)?;
+        let prefix = self
+            .required_path_context_store()?
+            .delete(zone, &request.path_prefix)
+            .await
+            .map_err(path_context_status)?;
+        Ok(Response::new(DeletePathContextResponse {
+            zone_id: zone.to_owned(),
+            path_prefix: prefix,
+        }))
+    }
     async fn glob(&self, request: Request<GlobRequest>) -> Result<Response<GlobResponse>, Status> {
         let mut req = request.into_inner();
         let applied_filters = if req.files.is_some() {
@@ -3675,7 +3775,7 @@ impl SearchService for SearchServiceImpl {
         // recursion from our own middleware).  See internal_call.rs
         // for the two mechanisms behind this single boolean.
         let skip_outer_middleware = is_internal_call(&request);
-        let req = request.into_inner();
+        let mut req = request.into_inner();
         if req.q.is_empty() {
             return Ok(Response::new(QueryResponse {
                 results: Vec::new(),
@@ -3704,6 +3804,28 @@ impl SearchService for SearchServiceImpl {
             // single-query.
             if let Some(handle) = self.get_or_init_expander().await? {
                 return self.query_with_expansion(req, handle).await;
+            }
+        }
+        // Resolve durable configuration at the executing zone, after fan-out.
+        // Explicit request weights override configured defaults. Resolve before
+        // candidate-cache lookup so a configuration change changes its key.
+        if let Some(store) = self.path_context_store() {
+            match store.boosts(&zone_id).await {
+                Ok(boosts) => {
+                    for (prefix, weight) in boosts.iter() {
+                        req.path_prefix_boosts
+                            .entry(prefix.clone())
+                            .or_insert(*weight);
+                    }
+                }
+                Err(_) => {
+                    if !self
+                        .path_context_error_logged
+                        .swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        tracing::warn!("path-context database unavailable; searching without configured weights");
+                    }
+                }
             }
         }
         // Canonicalise the zone BEFORE cache lookup so the cache

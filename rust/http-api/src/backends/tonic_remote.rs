@@ -161,6 +161,25 @@ mod tests {
 
     #[tonic::async_trait]
     impl SearchService for RecordingMock {
+        async fn put_path_context(
+            &self,
+            _: Request<crate::search_proto::PutPathContextRequest>,
+        ) -> Result<Response<crate::search_proto::PathContext>, Status> {
+            unreachable!()
+        }
+        async fn list_path_contexts(
+            &self,
+            _: Request<crate::search_proto::ListPathContextsRequest>,
+        ) -> Result<Response<crate::search_proto::ListPathContextsResponse>, Status> {
+            unreachable!()
+        }
+        async fn delete_path_context(
+            &self,
+            _: Request<crate::search_proto::DeletePathContextRequest>,
+        ) -> Result<Response<crate::search_proto::DeletePathContextResponse>, Status> {
+            unreachable!()
+        }
+
         async fn query(
             &self,
             req: Request<QueryRequest>,

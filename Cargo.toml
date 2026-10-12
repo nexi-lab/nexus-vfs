@@ -117,6 +117,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(has_protos)"] }
 double_must_use = "allow"
 
 [workspace.dependencies]
+sqlx = { version = "0.8.6", default-features = false }
 contracts = { path = "rust/contracts" }
 nexus-plugin-abi = { path = "rust/plugin-abi" }
 # `lib` is the tier-neutral implementation crate per §6 — algorithms
