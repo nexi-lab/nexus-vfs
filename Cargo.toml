@@ -205,9 +205,8 @@ strip = "symbols"
 
 # Cluster binary ships standalone for sudowork; size matters more than
 # raw throughput. opt-level="z" picks the cluster code path that
-# minimizes object size. Current gate: Linux/macOS-x86_64 16 MiB,
-# macOS-arm64 13.75 MiB, Windows 14.5 MiB
-# (`.github/workflows/cluster-binary-build.yml`). Bringing this down
+# minimizes object size. Per-target budgets and measurements live in
+# `.github/workflows/cluster-binary-build.yml`. Bringing this down
 # toward a ~5 MB target is a follow-up (cargo bloat pass, potential
 # nightly build-std with panic_immediate_abort — tracked separately).
 [profile.release.package.nexus-cluster]
