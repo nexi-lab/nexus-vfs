@@ -9,6 +9,33 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  path-contexts-postgres:
+    name: Search path configuration / PostgreSQL
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: search_config_test
+          POSTGRES_USER: search_test
+          POSTGRES_PASSWORD: disposable-test-password
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U search_test -d search_config_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      NEXUS_PATH_CONTEXT_TEST_POSTGRES_URL: postgres://search_test:disposable-test-password@127.0.0.1:5432/search_config_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-search-postgres-ubuntu-22.04
+      - run: cargo test -p nexus-search-plugin --no-default-features path_contexts::tests::postgres_durable_replacement_and_cache_invalidation -- --ignored
+
   check:
     name: cargo check
     runs-on: ubuntu-22.04

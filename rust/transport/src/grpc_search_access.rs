@@ -234,6 +234,31 @@ impl PluginGrpcPolicy for SearchGrpcPolicy {
             "RemoveIndexedDirectory" => admin!(RemoveIndexedDirectoryRequest),
             "ListIndexedDirectories" => admin!(ListIndexedDirectoriesRequest),
             "SetZoneIndexingMode" => admin!(SetZoneIndexingModeRequest),
+            "PutPathContext" => admin!(PutPathContextRequest),
+            "DeletePathContext" => admin!(DeletePathContextRequest),
+            "ListPathContexts" => {
+                let mut request = decode_request::<ListPathContextsRequest>(payload)?;
+                let ctx = self.authenticate(metadata, peer, &request.auth_token)?;
+                if !privileged(&ctx) {
+                    let view = self.view(ctx, request.zone_id.as_deref().unwrap_or(""))?;
+                    // Configuration enumeration requires a zone grant. A
+                    // certificate agent's per-file permissions alone do not
+                    // authorize reading every prefix description in a zone.
+                    if !view
+                        .ctx
+                        .zone_perms
+                        .iter()
+                        .any(|(zone, perms)| zone == &view.zone && perms.contains('r'))
+                    {
+                        return Err(Status::permission_denied(
+                            "path-context zone is not readable",
+                        ));
+                    }
+                    request.zone_id = Some(view.zone);
+                    *payload = request.encode_to_vec();
+                }
+                return Ok(Box::new(AuthenticatedResponse));
+            }
             "ListZoneIndexingModes" => admin!(ListZoneIndexingModesRequest),
             "Health" => admin!(HealthRequest),
             "Stats" => admin!(StatsRequest),

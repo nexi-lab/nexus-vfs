@@ -9,6 +9,7 @@
 
 pub mod auth;
 pub mod documents;
+pub mod path_contexts;
 #[cfg(feature = "rebac")]
 pub mod rebac;
 pub mod search;

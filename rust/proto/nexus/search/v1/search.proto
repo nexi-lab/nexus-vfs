@@ -113,6 +113,53 @@ service SearchService {
   // already exposes via `/health` + `/stats`.
   rpc Health(HealthRequest) returns (HealthResponse);
   rpc Stats(StatsRequest) returns (StatsResponse);
+
+  // Durable per-zone ranking configuration. Writes require administrator
+  // credentials; an unscoped list is available only to administrators.
+  rpc PutPathContext(PutPathContextRequest) returns (PathContext);
+  rpc ListPathContexts(ListPathContextsRequest) returns (ListPathContextsResponse);
+  rpc DeletePathContext(DeletePathContextRequest) returns (DeletePathContextResponse);
+}
+
+message PathContext {
+  string zone_id = 1;
+  // Canonical prefix without outer slashes; empty means the whole zone.
+  string path_prefix = 2;
+  string description = 3;
+  // Absent means 1.0. A child without a weight overrides a weighted parent.
+  optional double weight = 4;
+  string created_at = 5;
+  string updated_at = 6;
+}
+
+message PutPathContextRequest {
+  string zone_id = 1;
+  string path_prefix = 2;
+  string description = 3;
+  // PUT replacement: omitting this field clears the existing weight.
+  optional double weight = 4;
+  string auth_token = 5;
+}
+
+message ListPathContextsRequest {
+  // Absence lists all zones for an administrator and the caller zone otherwise.
+  optional string zone_id = 1;
+  string auth_token = 2;
+}
+
+message ListPathContextsResponse {
+  repeated PathContext contexts = 1;
+}
+
+message DeletePathContextRequest {
+  string zone_id = 1;
+  string path_prefix = 2;
+  string auth_token = 3;
+}
+
+message DeletePathContextResponse {
+  string zone_id = 1;
+  string path_prefix = 2;
 }
 
 // ── Glob ──────────────────────────────────────────────────────────

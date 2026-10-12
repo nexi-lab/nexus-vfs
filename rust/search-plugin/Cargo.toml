@@ -58,6 +58,10 @@ regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+# Durable Search configuration uses the deployment's existing path_contexts table.
+sqlx = { workspace = true, features = ["runtime-tokio", "tls-rustls-ring", "postgres", "sqlite", "chrono"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
 # Diagnostic logging — silent by default; the cluster binary's
 # RUST_LOG opts specific targets in.
 tracing = "0.1"
