@@ -17,6 +17,7 @@ use transport::auth::AuthProvider;
 pub mod backends;
 pub mod handlers;
 pub mod middleware;
+mod query;
 pub mod revision;
 pub mod search_backend;
 pub mod zone;
