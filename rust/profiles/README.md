@@ -22,6 +22,28 @@ profiles/
         └── main.rs         # 3 lines: nexus_cluster::run()
 ```
 
+## Confined user runtime
+
+`nexusd-cluster --data-dir <user-volume> --bind-addr <address> serve-user
+--owner <owner-id> --credential <bundle-directory>` runs the same Kernel and
+service declarations under one fixed owner's delegated mTLS identity. The
+external issuer supplies the standard `AgentCredential` bundle. The certificate
+must have the owner's runtime server name and a lifetime of at most 300 seconds.
+
+The runtime opens a local root Raft zone without a peer/control-plane listener.
+Namespace metadata, WAL transcripts, files and the owner/volume binding are
+durable. Raft keeps its normal persisted node ID and ConfState. Credentials,
+channels and execution state are not saved in the VFS metastore. The process has
+no cluster CA private key, signing service, enrollment listener or operator token.
+
+The issuer coordinator replaces the mounted bundle using an atomic directory
+projection. The runtime validates the unchanged trust root and owner before
+installing a new TLS identity. Requests on established connections and new TLS
+connections stop when the current credential expires; a later valid replacement
+restores service. This mode is also available to binaries composing
+`run_with_services`, including the in-process SudoCode adapter. Pod placement,
+credential delivery and renewal remain the control plane's responsibility.
+
 ## Adding a new dependency
 
 Add it to **`profiles/cluster/Cargo.toml`** only. It flows to every binary

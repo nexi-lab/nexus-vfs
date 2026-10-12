@@ -26,7 +26,8 @@ pub use channel::{create_channel, ensure_crypto_provider};
 pub use config::{ClientConfig, ServerConfig, TlsConfig};
 pub use error::{Result, TransportError};
 pub use federated_tls::{
-    federated_mtls_incoming, federated_tls_incoming, server_config, FederatedClientCertVerifier,
+    federated_mtls_incoming, federated_tls_incoming, reloadable_tls_incoming, server_config,
+    FederatedClientCertVerifier, ReloadableServerIdentity,
 };
 pub use foreign_ca::{CaFingerprint, ForeignCaAnchor};
 pub use peer::{hostname_to_node_id, NodeAddress, PeerAddress};

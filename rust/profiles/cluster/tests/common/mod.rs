@@ -262,9 +262,11 @@ impl Daemon {
         // path in the error. Refusing here makes the whole class impossible
         // rather than remembered, which is the same reason the daemon itself
         // refuses an unauthenticated reachable bind instead of warning about it.
-        let has_identity_dir = args
-            .iter()
-            .any(|a| *a == "--identity-dir" || a.starts_with("--identity-dir="))
+        // The confined profile uses only its own data dir and never writes identity.json.
+        let has_identity_dir = args.contains(&"serve-user")
+            || args
+                .iter()
+                .any(|a| *a == "--identity-dir" || a.starts_with("--identity-dir="))
             || env.iter().any(|(k, _)| *k == "NEXUS_IDENTITY_DIR");
         assert!(
             has_identity_dir,

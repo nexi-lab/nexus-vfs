@@ -385,6 +385,52 @@ impl ZoneManager {
         extra_grpc_services: Option<tonic::service::Routes>,
         load_policy: ZoneLoadPolicy,
     ) -> Result<Arc<Self>> {
+        Self::with_node_id_profile(
+            hostname,
+            node_id,
+            base_path,
+            peers,
+            bind_addr,
+            tls,
+            self_address,
+            extra_grpc_services,
+            load_policy,
+            true,
+        )
+    }
+
+    /// Open one local durable root zone without a peer or control-plane listener.
+    /// The persisted node ID and ConfState retain the normal Raft restart contract.
+    pub fn isolated(base_path: &str) -> Result<Arc<Self>> {
+        let node_id = crate::distributed_coordinator::read_or_mint_node_id(base_path)
+            .map_err(RaftError::Config)?;
+        Self::with_node_id_profile(
+            "user-runtime",
+            node_id,
+            base_path,
+            Vec::new(),
+            "127.0.0.1:0",
+            None,
+            None,
+            None,
+            ZoneLoadPolicy::Only(vec![contracts::ROOT_ZONE_ID.to_string()]),
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_node_id_profile(
+        hostname: &str,
+        node_id: u64,
+        base_path: &str,
+        peers: Vec<String>,
+        bind_addr: &str,
+        tls: Option<TlsFiles>,
+        self_address: Option<String>,
+        extra_grpc_services: Option<tonic::service::Routes>,
+        load_policy: ZoneLoadPolicy,
+        is_listener_enabled: bool,
+    ) -> Result<Arc<Self>> {
         // Initialize tracing once.
         static TRACING_INIT: std::sync::Once = std::sync::Once::new();
         TRACING_INIT.call_once(|| {
@@ -566,56 +612,58 @@ impl ZoneManager {
         // Owned: the failure message below names the address, and the task outlives
         // this borrow.
         let bind_for_error = bind_addr.to_string();
-        runtime.spawn(async move {
-            let shutdown = async move {
-                let mut rx = shutdown_rx_server;
-                let _ = rx.changed().await;
-            };
-            if let Err(e) = server.serve_with_shutdown(shutdown).await {
-                // gRPC bind failure (port in use, IP not assigned to any
-                // interface — e.g. Tailscale in NoState — TLS cert
-                // mismatch, etc.) leaves the daemon half-alive: raft
-                // driver + FUSE plugin + LocalConnector all up, but no
-                // one can talk to us over the wire.  Operators observed
-                // this as "everything looks fine locally, but peers
-                // never see me" for 30+ minutes before diagnosis.
-                //
-                // Fail loud: log at ERROR (visible in every launcher
-                // stdout) and exit(1) so the process supervisor / CI
-                // gate / operator's `echo $?` sees non-zero.  gRPC
-                // server startup is a strict prerequisite for
-                // federation and there is no recovery from within the
-                // process — bind is either possible or not.
-                // Name the one cause an operator can act on. "Someone else has this
-                // address" is a different instruction from "this address is not on any
-                // interface", and a one-shot subcommand hitting the first one used to
-                // read this daemon-shaped sentence and conclude its own federation was
-                // broken (#328).
-                if addr_in_use(&e) {
-                    tracing::error!(
-                        error = %e,
-                        bind = %bind_for_error,
-                        "another process already holds {bind_for_error}. This process has to \
-                         be reachable THERE — a zone with other voters delivers their \
-                         append/vote responses to the address its peers were told to \
-                         dial, so an ephemeral port would leave it waiting forever. \
-                         Stop whatever holds it, or run this against the data dir whose \
-                         node owns that address",
-                    );
-                } else {
-                    tracing::error!(
-                        error = %e,
-                        bind = %bind_for_error,
-                        "gRPC bind on {bind_for_error} failed for a reason other than the \
-                         address being taken — an IP not assigned to any interface (a \
-                         Tailscale address while the tunnel is down does this) or a TLS \
-                         material mismatch. Nothing can reach this process until it \
-                         binds, so there is no degraded mode to continue in",
-                    );
+        if is_listener_enabled {
+            runtime.spawn(async move {
+                let shutdown = async move {
+                    let mut rx = shutdown_rx_server;
+                    let _ = rx.changed().await;
+                };
+                if let Err(e) = server.serve_with_shutdown(shutdown).await {
+                    // gRPC bind failure (port in use, IP not assigned to any
+                    // interface — e.g. Tailscale in NoState — TLS cert
+                    // mismatch, etc.) leaves the daemon half-alive: raft
+                    // driver + FUSE plugin + LocalConnector all up, but no
+                    // one can talk to us over the wire.  Operators observed
+                    // this as "everything looks fine locally, but peers
+                    // never see me" for 30+ minutes before diagnosis.
+                    //
+                    // Fail loud: log at ERROR (visible in every launcher
+                    // stdout) and exit(1) so the process supervisor / CI
+                    // gate / operator's `echo $?` sees non-zero.  gRPC
+                    // server startup is a strict prerequisite for
+                    // federation and there is no recovery from within the
+                    // process — bind is either possible or not.
+                    // Name the one cause an operator can act on. "Someone else has this
+                    // address" is a different instruction from "this address is not on any
+                    // interface", and a one-shot subcommand hitting the first one used to
+                    // read this daemon-shaped sentence and conclude its own federation was
+                    // broken (#328).
+                    if addr_in_use(&e) {
+                        tracing::error!(
+                            error = %e,
+                            bind = %bind_for_error,
+                            "another process already holds {bind_for_error}. This process has to \
+                             be reachable THERE — a zone with other voters delivers their \
+                             append/vote responses to the address its peers were told to \
+                             dial, so an ephemeral port would leave it waiting forever. \
+                             Stop whatever holds it, or run this against the data dir whose \
+                             node owns that address",
+                        );
+                    } else {
+                        tracing::error!(
+                            error = %e,
+                            bind = %bind_for_error,
+                            "gRPC bind on {bind_for_error} failed for a reason other than the \
+                             address being taken — an IP not assigned to any interface (a \
+                             Tailscale address while the tunnel is down does this) or a TLS \
+                             material mismatch. Nothing can reach this process until it \
+                             binds, so there is no degraded mode to continue in",
+                        );
+                    }
+                    std::process::exit(1);
                 }
-                std::process::exit(1);
-            }
-        });
+            });
+        }
 
         tracing::info!(
             "ZoneManager local_node_id={} hostname={} started (bind={}, tls={})",
