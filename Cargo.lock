@@ -2696,6 +2696,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+ "tonic-prost",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",

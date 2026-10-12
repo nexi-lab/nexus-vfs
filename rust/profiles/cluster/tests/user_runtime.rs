@@ -20,6 +20,15 @@ async fn dial_client(
     port: u16,
     credential: &LoadedCredential,
 ) -> Result<NexusVfsServiceClient<tonic::transport::Channel>, tonic::transport::Error> {
+    Ok(NexusVfsServiceClient::new(
+        dial_channel(port, credential).await?,
+    ))
+}
+
+async fn dial_channel(
+    port: u16,
+    credential: &LoadedCredential,
+) -> Result<tonic::transport::Channel, tonic::transport::Error> {
     use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
     let tls = ClientTlsConfig::new()
         .ca_certificate(Certificate::from_pem(&credential.ca_pem))
@@ -34,7 +43,27 @@ async fn dial_client(
         .connect_timeout(Duration::from_secs(3))
         .connect()
         .await?;
-    Ok(NexusVfsServiceClient::new(channel))
+    Ok(channel)
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct EmptyMessage {}
+
+async fn list_vault_metadata(
+    port: u16,
+    credential: &LoadedCredential,
+) -> Result<tonic::Response<EmptyMessage>, tonic::Status> {
+    let channel = dial_channel(port, credential).await.unwrap();
+    let mut grpc = tonic::client::Grpc::new(channel);
+    grpc.ready().await.unwrap();
+    grpc.unary(
+        tonic::Request::new(EmptyMessage {}),
+        "/nexus.secrets.v1.GenericSecretsService/ListSecrets"
+            .parse()
+            .unwrap(),
+        tonic_prost::ProstCodec::default(),
+    )
+    .await
 }
 
 fn assert_owner_refusal(is_error: bool, payload: &[u8]) {
@@ -306,6 +335,203 @@ async fn malformed_startup_backends_fail_before_touching_owner_storage() {
 }
 
 #[tokio::test]
+async fn a_requested_unsigned_plugin_blocks_the_confined_server() {
+    let root = tempfile::tempdir().unwrap();
+    let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let (cert, key) =
+        generate_user_runtime_cert("runtime-alice", "alice", 300, &ca, &ca_key).unwrap();
+    let credential = root.path().join("credential");
+    bundle(&credential, "runtime-alice", "alice", &ca, &cert, &key);
+    let plugins = root.path().join("plugins");
+    std::fs::create_dir(&plugins).unwrap();
+    let name = format!("unsigned{}", std::env::consts::DLL_SUFFIX);
+    std::fs::write(plugins.join(&name), b"unverified bytes").unwrap();
+    let data = root.path().join("data");
+    let mut rejected = Daemon::spawn(
+        &[
+            "--data-dir",
+            data.to_str().unwrap(),
+            "--plugin-dir",
+            plugins.to_str().unwrap(),
+            "serve-user",
+            "--owner",
+            "alice",
+            "--credential",
+            credential.to_str().unwrap(),
+        ],
+        &[("RUST_LOG", LOG_FILTER)],
+    );
+    let log = rejected.wait_exit(BUDGET).await.unwrap();
+    assert!(
+        log.contains(&name) && log.to_lowercase().contains("signature"),
+        "{log}"
+    );
+    assert!(!log.contains("confined user runtime ready"), "{log}");
+}
+
+#[tokio::test]
+#[ignore = "requires NEXUS_VAULT_PLUGIN_DIR containing the signed release library"]
+async fn signed_vault_uses_the_owned_data_root_and_keeps_the_owner_boundary() {
+    let plugins = std::env::var("NEXUS_VAULT_PLUGIN_DIR").expect("signed Vault fixture directory");
+    let root = tempfile::tempdir().unwrap();
+    let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let (cert, key) =
+        generate_user_runtime_cert("runtime-alice", "alice", 300, &ca, &ca_key).unwrap();
+    let credential = root.path().join("server");
+    bundle(&credential, "runtime-alice", "alice", &ca, &cert, &key);
+    let data = root.path().join("owned-data");
+    let unrelated = root.path().join("unrelated-data");
+    let port = free_port();
+    let mut daemon = Daemon::spawn(
+        &[
+            "--data-dir",
+            data.to_str().unwrap(),
+            "--plugin-dir",
+            &plugins,
+            "--bind-addr",
+            &format!("127.0.0.1:{port}"),
+            "serve-user",
+            "--owner",
+            "alice",
+            "--credential",
+            credential.to_str().unwrap(),
+        ],
+        &[
+            ("RUST_LOG", LOG_FILTER),
+            ("NEXUS_DATA_DIR", unrelated.to_str().unwrap()),
+        ],
+    );
+    daemon
+        .wait_for_log("confined user runtime ready", BUDGET)
+        .await
+        .unwrap();
+    assert!(data.join("vault/master.key").is_file());
+    assert!(
+        !unrelated.exists(),
+        "plugins must use the selected durable data root"
+    );
+    let runtime_client = AgentCredential::load(&credential).unwrap();
+    list_vault_metadata(port, &runtime_client).await.unwrap();
+    for owner in ["alice", "bob"] {
+        let (cert, key) =
+            generate_session_agent_cert("session-reader", owner, 300, &ca, &ca_key).unwrap();
+        let client_bundle = bundle(
+            &root.path().join(owner),
+            "session-reader",
+            "alice",
+            &ca,
+            &cert,
+            &key,
+        );
+        let mut client = dial_client(port, &client_bundle).await.unwrap();
+        // An empty protobuf ListSecretsRequest asks the actual Vault for its metadata.
+        let result = client
+            .call(CallRequest {
+                method: "password-vault.secret_list".into(),
+                payload: Vec::new(),
+                auth_token: String::new(),
+            })
+            .await;
+        if owner == "alice" {
+            let result = result.unwrap().into_inner();
+            assert!(!result.is_error, "{result:?}");
+            assert!(
+                result.payload.is_empty(),
+                "a fresh Vault contains no secrets"
+            );
+        } else {
+            let refusal = result.unwrap_err();
+            assert_eq!(refusal.code(), tonic::Code::PermissionDenied);
+            assert_eq!(
+                refusal.message(),
+                "request does not belong to this user runtime"
+            );
+        }
+        let native_result = list_vault_metadata(port, &client_bundle).await;
+        if owner == "alice" {
+            native_result.unwrap();
+        } else {
+            assert_eq!(
+                native_result.unwrap_err().code(),
+                tonic::Code::PermissionDenied
+            );
+        }
+    }
+    drop(daemon);
+}
+
+#[tokio::test]
+#[ignore = "requires NEXUS_VAULT_PLUGIN_DIR containing the signed release library"]
+async fn signed_vault_on_the_control_plane_refuses_a_user_runtime_identity() {
+    let plugins = std::env::var("NEXUS_VAULT_PLUGIN_DIR").unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("root-data");
+    let identity = root.path().join("identity");
+    let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let (_, hash) = nexus_raft::transport::generate_join_token(&ca).unwrap();
+    common::write_tls_bundle(&data, 1, &ca, &ca_key, &hash);
+    let port = common::free_port_pair();
+    let address = format!("127.0.0.1:{port}");
+    let mut daemon = Daemon::spawn(
+        &[
+            "--data-dir",
+            data.to_str().unwrap(),
+            "--identity-dir",
+            identity.to_str().unwrap(),
+            "--plugin-dir",
+            &plugins,
+            "--bind-addr",
+            &address,
+        ],
+        &[
+            ("RUST_LOG", LOG_FILTER),
+            ("NEXUS_CLUSTER_INIT", "control-data"),
+            ("NEXUS_API_KEY_SECRET", "synthetic-control-plane-secret"),
+            ("NEXUS_ADVERTISE_ADDR", &address),
+        ],
+    );
+    daemon
+        .wait_for_log("VFS data plane ready", BUDGET)
+        .await
+        .unwrap();
+    let mut operator = bundle(
+        &root.path().join("operator"),
+        "operator",
+        "alice",
+        &ca,
+        &std::fs::read(data.join("tls/node.pem")).unwrap(),
+        &std::fs::read(data.join("tls/node-key.pem")).unwrap(),
+    );
+    operator.server_name = "nexus-node".into();
+    let mut privileged = dial_client(port, &operator).await.unwrap();
+    let request = || CallRequest {
+        method: "password-vault.secret_list".into(),
+        ..Default::default()
+    };
+    let positive = privileged.call(request()).await.unwrap().into_inner();
+    assert!(!positive.is_error, "{positive:?}");
+    let (cert, key) =
+        generate_user_runtime_cert("runtime-alice", "alice", 300, &ca, &ca_key).unwrap();
+    let mut runtime = bundle(
+        &root.path().join("runtime"),
+        "runtime-alice",
+        "alice",
+        &ca,
+        &cert,
+        &key,
+    );
+    runtime.server_name = operator.server_name.clone();
+    let mut unprivileged = dial_client(port, &runtime).await.unwrap();
+    let refused = unprivileged.call(request()).await.unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+    list_vault_metadata(port, &operator).await.unwrap();
+    let refused = list_vault_metadata(port, &runtime).await.unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+    let positive = privileged.call(request()).await.unwrap().into_inner();
+    assert!(!positive.is_error, "{positive:?}");
+}
+
+#[tokio::test]
 async fn owner_boundary_stream_history_and_memory_survive_a_real_process_restart() {
     let root = tempfile::tempdir().unwrap();
     let (ca, ca_key) = generate_zone_ca("root").unwrap();
@@ -482,7 +708,12 @@ async fn boot_refuses_cluster_authority_and_a_client_only_identity_before_creati
         };
         let mut rejected = Daemon::spawn(&args, &env);
         let log = rejected.wait_exit(BUDGET).await.unwrap();
-        assert!(log.contains("cluster authority, federation, plugins and unauthenticated listeners are unavailable"), "{log}");
+        assert!(
+            log.contains(
+                "cluster authority, federation and unauthenticated listeners are unavailable"
+            ),
+            "{log}"
+        );
         assert!(
             !data.exists(),
             "invalid options must not initialize durable storage"

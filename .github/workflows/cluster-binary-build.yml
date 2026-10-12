@@ -70,41 +70,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install protoc (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          set -euo pipefail
-          PROTOC_VERSION=3.20.2
-          case "$(uname -m)" in
-            arm64) ARCH=aarch_64 ;;
-            x86_64) ARCH=x86_64 ;;
-            *) echo "Unsupported arch: $(uname -m)" >&2; exit 1 ;;
-          esac
-          mkdir -p "$HOME/protoc"
-          curl -fsSL -o /tmp/protoc.zip \
-            "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-osx-${ARCH}.zip"
-          unzip -o /tmp/protoc.zip -d "$HOME/protoc"
-          echo "$HOME/protoc/bin" >> "$GITHUB_PATH"
-          "$HOME/protoc/bin/protoc" --version
-
-      - name: Install protoc (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $protocVersion = '3.20.2'
-          $protocDir = Join-Path $env:USERPROFILE 'protoc'
-          New-Item -ItemType Directory -Force -Path $protocDir | Out-Null
-          $zipPath = Join-Path $env:RUNNER_TEMP 'protoc.zip'
-          Invoke-WebRequest -UseBasicParsing -Uri `
-            "https://github.com/protocolbuffers/protobuf/releases/download/v${protocVersion}/protoc-${protocVersion}-win64.zip" `
-            -OutFile $zipPath
-          Expand-Archive -Force -Path $zipPath -DestinationPath $protocDir
-          $protocBinDir = Join-Path $protocDir 'bin'
-          $protocExe = Join-Path $protocBinDir 'protoc.exe'
-          Add-Content -Path $env:GITHUB_PATH -Value $protocBinDir
-          Add-Content -Path $env:GITHUB_ENV -Value "PROTOC=$protocExe"
-          & $protocExe --version
+      - uses: ./.github/actions/setup-protoc
 
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1

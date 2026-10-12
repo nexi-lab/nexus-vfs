@@ -170,6 +170,9 @@ fn from_x509(cert: &x509_parser::certificate::X509Certificate) -> PeerIdentity {
         zone_id,
         agent_name,
         owner,
+        runtime_server_name: lib::transport_primitives::user_runtime_name_from_x509(cert)
+            .ok()
+            .flatten(),
         trust_domain: None,
         serial,
     }

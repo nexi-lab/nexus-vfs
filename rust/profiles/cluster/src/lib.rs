@@ -33,6 +33,7 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 mod auth_posture;
 mod authorization;
+mod plugin_loading;
 mod runtime_backends;
 mod search_capabilities;
 mod user_runtime;
@@ -1215,6 +1216,11 @@ where
         args.cmd,
         None | Some(Cmd::ServeLocal { .. } | Cmd::ServeUser { .. })
     );
+    if is_daemon && args.common.plugin_dir.is_some() {
+        // Plugins consume this process-level data-root contract. Resolve it from
+        // the same CLI arguments before tracing and runtime threads are started.
+        std::env::set_var("NEXUS_DATA_DIR", &args.common.data_dir);
+    }
     let _tracing_guard = install_tracing(/* logs_to_stderr */ !is_daemon);
     // Size the multi-thread runtime against the host: federation
     // gRPC + raft IO is IO-bound, so the kernel `available_parallelism`
@@ -2194,25 +2200,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
 
     mount_root_filesystem(&kernel, &common)?;
 
-    // ── Plugin loading (§10) ─────────────────────────────────────────
-    // Auto-load all .so/.dylib files from --plugin-dir (if specified).
-    // Runs after kernel + root mount so plugins can use sys_read/sys_write.
-    if let Some(ref plugin_dir) = common.plugin_dir {
-        // Fail loud: an operator who passes --plugin-dir REQUIRES those plugins.
-        // A load failure (signature/ABI/symbol) is boot-blocking — never a warn
-        // that leaves the daemon running short a plugin (see load_plugin_dir).
-        let names = kernel.load_plugin_dir(plugin_dir).map_err(|e| {
-            anyhow::anyhow!("--plugin-dir {} load failed: {e}", plugin_dir.display())
-        })?;
-        if !names.is_empty() {
-            tracing::info!(
-                count = names.len(),
-                names = ?names,
-                dir = %plugin_dir.display(),
-                "plugins loaded from --plugin-dir",
-            );
-        }
-    }
+    plugin_loading::load(&kernel, common.plugin_dir.as_deref())?;
 
     // Build VFS gRPC service as tonic Routes — co-hosted on the raft
     // port via ZoneManager.
@@ -2308,31 +2296,13 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         daemon_version_string(),
     );
 
-    // Plugin gRPC shares the daemon listener and live peer trust roots.
-    let plugin_endpoints = kernel.plugin_grpc_endpoints();
-    if !plugin_endpoints.is_empty() {
-        tracing::info!(
-            count = plugin_endpoints.len(),
-            "merging plugin gRPC endpoints into VFS Routes",
-        );
-    }
-    let vfs_routes = transport::grpc_plugin_proxy::extend_routes_with_plugin_endpoints(
+    let vfs_routes = plugin_loading::routes(
         vfs_routes,
-        plugin_endpoints,
+        &kernel,
+        &vfs_auth,
         Arc::clone(&fca_verifier_slot),
         Arc::clone(&data_plane_ready),
-        |endpoint| {
-            if endpoint.service_name == transport::grpc_search_access::SERVICE_NAME {
-                Arc::new(transport::grpc_search_access::SearchGrpcPolicy::new(
-                    Arc::clone(&kernel),
-                    Arc::clone(&vfs_auth),
-                ))
-            } else {
-                Arc::new(transport::grpc_plugin_access::AuthenticatedPlugin::new(
-                    Arc::clone(&vfs_auth),
-                ))
-            }
-        },
+        None,
     );
 
     let ZoneManagerBundle {
