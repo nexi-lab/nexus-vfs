@@ -72,7 +72,9 @@ fn durable_identity_survives_a_new_pid_without_changing_get_and_cancel() {
     let first = call(&kernel, "start_session_v1", json!({"agent_id":"agent"})).unwrap();
     let pid = first["session_id"].as_str().unwrap();
     let sid = first["durable_session_id"].as_str().unwrap();
-    assert!(pid.starts_with("pid-"));
+    let (native, local) = contracts::agent_pid::decode_agent_pid(pid);
+    assert_eq!(native, Some(i64::from(std::process::id())));
+    assert!(local.is_some());
     assert_ne!(pid, sid);
     let snapshot = call(&kernel, "get_session_v1", json!({"session_id":pid})).unwrap();
     assert_eq!(snapshot["durable_session_id"], sid);
@@ -94,6 +96,10 @@ fn durable_identity_survives_a_new_pid_without_changing_get_and_cancel() {
     .unwrap();
     assert_ne!(second["session_id"], pid);
     assert_eq!(second["durable_session_id"], sid);
+    let (second_native, second_local) =
+        contracts::agent_pid::decode_agent_pid(second["session_id"].as_str().unwrap());
+    assert_eq!(second_native, native);
+    assert_ne!(second_local, local);
 }
 #[test]
 fn providers_without_recovery_reject_it_instead_of_starting_fresh() {
@@ -145,4 +151,25 @@ fn raw_spawns_and_paths_cannot_be_used_as_durable_recovery() {
         .unwrap()
         .get("durable_session_id")
         .is_none());
+}
+
+#[test]
+fn cohost_local_ids_are_unique_across_independent_kernel_instances() {
+    let mut pids = std::collections::HashSet::new();
+    for _ in 0..64 {
+        let kernel = Arc::new(Kernel::new());
+        install_managed_agent_with_spawn(&kernel, Arc::new(Provider)).unwrap();
+        let started = call(
+            &kernel,
+            "start_session_v1",
+            json!({"agent_id":"same-agent"}),
+        )
+        .unwrap();
+        let pid = started["session_id"].as_str().unwrap();
+        assert_eq!(
+            contracts::agent_pid::decode_agent_pid(pid).0,
+            Some(i64::from(std::process::id()))
+        );
+        assert!(pids.insert(pid.to_owned()));
+    }
 }

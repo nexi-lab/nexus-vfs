@@ -120,3 +120,65 @@ fn a_live_process_namespace_survives_service_reinstall_but_not_kernel_reopen() {
         "a process inode must not outlive its kernel-owned PCB"
     );
 }
+
+#[test]
+fn independent_nexus_namespaces_do_not_share_process_views_or_workspace_bytes() {
+    let first_root = tempfile::tempdir().unwrap();
+    let second_root = tempfile::tempdir().unwrap();
+    for root in [&first_root, &second_root] {
+        std::fs::create_dir_all(root.path().join("files")).unwrap();
+    }
+    let first = boot(
+        &first_root.path().join("metadata.redb"),
+        &first_root.path().join("files"),
+    );
+    let second = boot(
+        &second_root.path().join("metadata.redb"),
+        &second_root.path().join("files"),
+    );
+    managed_agent::install_managed_agent(&first).unwrap();
+    managed_agent::install_managed_agent(&second).unwrap();
+    let caller = OperationContext::new("operator", "root", true, Some("operator"), true);
+    let repository = "/agents/isolated/workspaces/repository";
+    let file = format!("{repository}/retained.txt");
+    KernelSyscall::sys_write(&*first, &file, &caller, b"persistent repository", 0).unwrap();
+    let started = transport::call_dispatch::dispatch(&first, &caller, "managed_agent.start_session_v1",
+        serde_json::json!({"agent_id":"isolated", "repos":[{"alias":"workspace", "host_path":repository}]}).to_string().as_bytes()).unwrap().into_inner();
+    assert!(
+        !started.is_error,
+        "{}",
+        String::from_utf8_lossy(&started.payload)
+    );
+    let started: serde_json::Value = serde_json::from_slice(&started.payload).unwrap();
+    let pid = started["session_id"].as_str().unwrap();
+    let process = format!("/proc/{pid}");
+    let view = format!("{process}/workspace/workspace/retained.txt");
+    assert_eq!(
+        KernelSyscall::sys_read(&*first, &view, &caller, 0, 0)
+            .unwrap()
+            .data
+            .unwrap(),
+        b"persistent repository"
+    );
+    assert!(KernelSyscall::sys_stat(&*second, &process, "root").is_none());
+    assert!(KernelSyscall::sys_read(&*second, &file, &caller, 0, 0).is_err());
+    let cancelled = transport::call_dispatch::dispatch(
+        &first,
+        &caller,
+        "managed_agent.cancel_v1",
+        serde_json::json!({"session_id":pid,"mode":"session"})
+            .to_string()
+            .as_bytes(),
+    )
+    .unwrap()
+    .into_inner();
+    assert!(!cancelled.is_error);
+    assert!(KernelSyscall::sys_stat(&*first, &process, "root").is_none());
+    assert_eq!(
+        KernelSyscall::sys_read(&*first, &file, &caller, 0, 0)
+            .unwrap()
+            .data
+            .unwrap(),
+        b"persistent repository"
+    );
+}

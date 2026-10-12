@@ -397,20 +397,19 @@ pub trait SpawnTask<K: KernelSyscall>: Send + Sync + 'static {
 /// concrete and injected at install (Kernel-specific); this trait erases
 /// `K` so the generic `start_session` can call it. `None` in slim builds ⇒ `spawn_spec` is rejected with InvalidArgument.
 pub(crate) trait RawSpawn: Send + Sync {
-    /// Launch `spec`, connect its private stdio to the session mailbox, and store
-    /// an abort handle in the shared `spawn_handles` (keyed by `pid`, so
-    /// the `on_terminate` observer tears it down). Returns the real OS pid
-    /// (contract ④). `Err` on bad spec / launch failure — the impl rolls
-    /// back the half-planted session.
-    fn spawn(
-        &self,
-        desc: &AgentDescriptor,
-        spec: SpawnSpec,
-        endpoint: a2a::session::SessionEndpoint,
-    ) -> Result<Option<u32>, String>;
+    /// Launch before registry insertion so the descriptor uses the actual child
+    /// OS PID. Dropping an unattached launch terminates the child.
+    fn prepare(&self, spec: SpawnSpec) -> Result<Box<dyn PreparedRawSpawn>, String>;
 }
 
-// ── Service ─────────────────────────────────────────────────────────────
+pub(crate) trait PreparedRawSpawn: Send {
+    fn os_pid(&self) -> u32;
+    fn attach(
+        self: Box<Self>,
+        desc: &AgentDescriptor,
+        endpoint: a2a::session::SessionEndpoint,
+    ) -> Result<(), String>;
+}
 
 pub(crate) struct ManagedAgentService<K: KernelSyscall> {
     /// Shared kernel handle for `start_session` to stamp the per-pid
@@ -488,7 +487,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
     /// `session_id` and `agent_id` are the same value: the AgentRegistry
     /// pid.  No second identifier is allocated — the descriptor is the
     /// SSOT for everything cancel / get_session needs.  On `register`
-    /// collision (effectively impossible given uuid-allocated pids) we
+    /// collision (a conflicting live native PID) we
     /// surface `Internal` so the caller sees a hard error.
     #[cfg(test)]
     pub(crate) fn start_session(
@@ -558,7 +557,22 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
             req.zone_id.clone()
         };
 
-        let pid = alloc_pid();
+        let raw_session = if let Some(spec) = spawn_spec {
+            let spawner = self.raw_spawn.as_ref().ok_or_else(|| {
+                ManagedAgentError::InvalidArgument(
+                    "spawn_spec requires the subprocess-host feature".into(),
+                )
+            })?;
+            Some(spawner.prepare(spec).map_err(ManagedAgentError::Internal)?)
+        } else {
+            None
+        };
+        let os_pid = raw_session.as_ref().map(|child| child.os_pid());
+        let pid = if let Some(native) = os_pid {
+            contracts::agent_pid::encode_agent_pid(i64::from(native), None)
+        } else {
+            alloc_pid().map_err(ManagedAgentError::Internal)?
+        };
         let workspace_path = format!("/proc/{pid}/workspace/");
 
         let repos: Vec<RepoMount> = req
@@ -616,7 +630,6 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
         // Hosting differs; the session endpoint and protocol do not. The raw
         // adapter translates internal stdio. An injected provider hosts its
         // engine in-process. Slim builds without either only register procfs.
-        let mut os_pid: Option<u32> = None;
         let mut durable_session_id = None;
         if let Some(desc) = self.agent_registry.get(&pid) {
             if let Err(e) = register_proc_entry(self.kernel.as_ref(), &desc) {
@@ -632,29 +645,13 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
             if let Err(e) = a2a::ensure_agent_state_stream(self.kernel.as_ref(), &desc.name) {
                 tracing::warn!(pid=%pid, error=%e, "ensure_agent_state_stream failed");
             }
-            if let Some(spec) = spawn_spec {
-                match self.raw_spawn.as_ref() {
-                    Some(rs) => {
-                        os_pid = rs
-                            .spawn(
-                                &desc,
-                                spec,
-                                session_endpoint.clone().expect("hosted endpoint"),
-                            )
-                            .map_err(ManagedAgentError::Internal)?;
-                    }
-                    None => {
-                        // No raw spawner wired (slim / non-unix). Roll back
-                        // the half-planted session so the caller sees a
-                        // clean failure rather than a zombie record.
+            if let Some(child) = raw_session {
+                child
+                    .attach(&desc, session_endpoint.clone().expect("hosted endpoint"))
+                    .map_err(|error| {
                         let _ = self.agent_registry.kill(&pid, 127);
-                        return Err(ManagedAgentError::InvalidArgument(
-                            "spawn_spec (raw subprocess host) requires a unix build with the \
-                             subprocess-host feature"
-                                .into(),
-                        ));
-                    }
-                }
+                        ManagedAgentError::Internal(error)
+                    })?;
             } else if let Some(provider) = self.spawn_provider.as_ref() {
                 // Construct the SSOT state observer. AgentRegistry is
                 // the single writer of AgentState in the runtime path
@@ -1465,7 +1462,10 @@ mod tests {
         let resp = svc.start_session(req("scode-standard")).unwrap();
 
         // session_id IS the pid — no second identifier.
-        assert!(resp.session_id.starts_with("pid-"));
+        assert_eq!(
+            contracts::agent_pid::decode_agent_pid(&resp.session_id).0,
+            Some(i64::from(std::process::id()))
+        );
         assert_eq!(
             resp.workspace_path,
             format!("/proc/{}/workspace/", resp.session_id)
@@ -1728,7 +1728,10 @@ mod tests {
                 .dispatch("start_session_v1", payload.as_bytes(), &plain_caller())
                 .unwrap();
             let resp: StartSessionResponse = serde_json::from_slice(&bytes).unwrap();
-            assert!(resp.session_id.starts_with("pid-"));
+            assert_eq!(
+                contracts::agent_pid::decode_agent_pid(&resp.session_id).0,
+                Some(i64::from(std::process::id()))
+            );
             assert_eq!(
                 resp.workspace_path,
                 format!("/proc/{}/workspace/", resp.session_id)
@@ -1743,7 +1746,10 @@ mod tests {
                 .dispatch("start_session_v1", payload.as_bytes(), &plain_caller())
                 .unwrap();
             let resp: StartSessionResponse = serde_json::from_slice(&bytes).unwrap();
-            assert!(resp.session_id.starts_with("pid-"));
+            assert_eq!(
+                contracts::agent_pid::decode_agent_pid(&resp.session_id).0,
+                Some(i64::from(std::process::id()))
+            );
         }
 
         #[test]
