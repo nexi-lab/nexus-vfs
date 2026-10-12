@@ -3,6 +3,8 @@ import os
 import pathlib
 import platform
 import subprocess
+import time
+import urllib.error
 import urllib.request
 import zipfile
 
@@ -17,8 +19,19 @@ else:
     target = {'Darwin': 'osx', 'Linux': 'linux'}[system] + '-' + architecture
     executable = 'protoc'
 url = f'https://github.com/protocolbuffers/protobuf/releases/download/v{VERSION}/protoc-{VERSION}-{target}.zip'
-with urllib.request.urlopen(url, timeout=120) as response:
-    data = response.read(32 * 1024 * 1024 + 1)
+for attempt in range(4):
+    try:
+        with urllib.request.urlopen(url, timeout=120) as response:
+            data = response.read(32 * 1024 * 1024 + 1)
+        break
+    except urllib.error.HTTPError as error:
+        if attempt == 3 or error.code not in (429, 500, 502, 503, 504):
+            raise
+        time.sleep(2 ** attempt)
+    except (urllib.error.URLError, TimeoutError):
+        if attempt == 3:
+            raise
+        time.sleep(2 ** attempt)
 if len(data) > 32 * 1024 * 1024:
     raise ValueError('protobuf compiler archive exceeds its size limit')
 directory = pathlib.Path(os.environ['RUNNER_TEMP']) / 'nexus-protoc'
