@@ -82,6 +82,229 @@ fn start(data: &Path, credential: &Path, owner: &str, port: u16) -> Daemon {
     )
 }
 
+#[cfg(feature = "driver-ai")]
+#[tokio::test]
+async fn local_backend_configuration_serves_model_requests_without_granting_mount_authority() {
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider_url = format!("http://{}", listener.local_addr().unwrap());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&requests);
+    let key = "runtime-provider-key-must-not-be-durable";
+    let provider = tokio::spawn(async move {
+        for text in ["MODEL-FIRST", "MODEL-AFTER-RESTART"] {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            loop {
+                let mut chunk = [0; 4096];
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert!(count > 0, "provider request closed before its body");
+                bytes.extend_from_slice(&chunk[..count]);
+                if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let headers = std::str::from_utf8(&bytes[..end]).unwrap().to_lowercase();
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.strip_prefix("content-length:")
+                                .map(|value| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap();
+                    if bytes.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            captured
+                .lock()
+                .unwrap()
+                .push(String::from_utf8(bytes).unwrap());
+            let body = format!(
+                "data: {{\"model\":\"fixture\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{text}\"}}}}]}}\n\n\
+                 data: {{\"model\":\"fixture\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\n\
+                 data: [DONE]\n\n"
+            );
+            socket.write_all(format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
+            ).as_bytes()).await.unwrap();
+        }
+    });
+    let root = tempfile::tempdir().unwrap();
+    let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let (server_cert, server_key) =
+        generate_user_runtime_cert("runtime-alice", "alice", 300, &ca, &ca_key).unwrap();
+    let credential = root.path().join("credential");
+    bundle(
+        &credential,
+        "runtime-alice",
+        "alice",
+        &ca,
+        &server_cert,
+        &server_key,
+    );
+    let (cert, key_material) =
+        generate_session_agent_cert("session-alice", "alice", 300, &ca, &ca_key).unwrap();
+    let alice = bundle(
+        &root.path().join("alice"),
+        "session-alice",
+        "alice",
+        &ca,
+        &cert,
+        &key_material,
+    );
+    let data = root.path().join("data");
+    let config = root.path().join("backends.json");
+    std::fs::write(&config, serde_json::to_vec(&serde_json::json!({"mounts": [{
+        "path": "/models/openai", "backend_type": "openai", "backend_name": "user-provider",
+        "backend_params": {"base_url": provider_url, "blob_root": data.join("model-blobs"), "api_key": key}
+    }]})).unwrap()).unwrap();
+    let port = free_port();
+    for (index, reply) in ["MODEL-FIRST", "MODEL-AFTER-RESTART"].iter().enumerate() {
+        let mut daemon = Daemon::spawn(
+            &[
+                "--data-dir",
+                data.to_str().unwrap(),
+                "--bind-addr",
+                &format!("127.0.0.1:{port}"),
+                "serve-user",
+                "--owner",
+                "alice",
+                "--credential",
+                credential.to_str().unwrap(),
+                "--backend-config",
+                config.to_str().unwrap(),
+            ],
+            &[("RUST_LOG", LOG_FILTER)],
+        );
+        daemon
+            .wait_for_log("confined user runtime ready", BUDGET)
+            .await
+            .unwrap();
+        let mut owner = Vfs::connect_as_agent(port, &alice, BUDGET).await;
+        let request = serde_json::json!({"model": "fixture", "messages": [{"role": "user", "content": "boot-model-probe"}], "max_tokens": 32});
+        let prompt = format!("/models/openai/turn-{index}.prompt");
+        let response = format!("/models/openai/turn-{index}.reply");
+        owner
+            .write_file(&prompt, request.to_string().as_bytes(), "")
+            .await
+            .unwrap();
+        let deadline = std::time::Instant::now() + BUDGET;
+        loop {
+            if let Ok(bytes) = owner.stream_collect_all(&response, "").await {
+                let text = String::from_utf8(bytes).unwrap();
+                assert!(!text.contains("\"error\""), "{text}");
+                if text.contains("\"done\"") {
+                    assert!(text.contains(reply), "{text}");
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reply did not complete: {}",
+                daemon.drain()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        if index == 1 {
+            assert!(String::from_utf8(
+                owner
+                    .read_file("/models/openai/turn-0.prompt", "")
+                    .await
+                    .unwrap()
+            )
+            .unwrap()
+            .contains("boot-model-probe"));
+        }
+        assert!(
+            owner
+                .mount_backend(
+                    "/another-model",
+                    "openai",
+                    &[("blob_root", root.path().to_str().unwrap())],
+                    ""
+                )
+                .await
+                .is_err(),
+            "ordinary user must still lack mount authority"
+        );
+        drop(owner);
+        drop(daemon);
+    }
+    provider.await.unwrap();
+    let captured = requests.lock().unwrap();
+    assert_eq!(captured.len(), 2);
+    for request in &*captured {
+        assert!(request
+            .to_lowercase()
+            .contains(&format!("authorization: bearer {key}")));
+        assert!(request.contains("boot-model-probe"));
+    }
+    fn assert_no_key(dir: &Path, key: &[u8]) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                assert_no_key(&path, key);
+            } else {
+                assert!(
+                    !std::fs::read(&path)
+                        .unwrap()
+                        .windows(key.len())
+                        .any(|part| part == key),
+                    "provider credential persisted in {}",
+                    path.display()
+                );
+            }
+        }
+    }
+    assert_no_key(&data, key.as_bytes());
+    assert!(!data.join("tls/ca-key.pem").exists());
+}
+
+#[tokio::test]
+async fn malformed_startup_backends_fail_before_touching_owner_storage() {
+    let root = tempfile::tempdir().unwrap();
+    let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let (cert, key) =
+        generate_user_runtime_cert("runtime-alice", "alice", 300, &ca, &ca_key).unwrap();
+    let credential = root.path().join("credential");
+    bundle(&credential, "runtime-alice", "alice", &ca, &cert, &key);
+    let mount =
+        serde_json::json!({"path": "/model", "backend_type": "openai", "backend_name": "fixture"});
+    let cases = [
+        serde_json::json!({"mounts": [{"path": "/proc/model", "backend_type": "openai", "backend_name": "fixture"}]}),
+        serde_json::json!({"mounts": [{"path": "/model/../agent", "backend_type": "openai", "backend_name": "fixture"}]}),
+        serde_json::json!({"mounts": [mount.clone(), mount]}),
+        serde_json::json!({"mounts": [{"path": "/external", "backend_type": "remote", "backend_name": "fixture"}]}),
+        serde_json::json!({"mounts": [], "zone_id": "foreign-zone"}),
+    ];
+    for (index, config) in cases.into_iter().enumerate() {
+        let data = root.path().join(format!("data-{index}"));
+        let config_path = root.path().join(format!("config-{index}.json"));
+        std::fs::write(&config_path, config.to_string()).unwrap();
+        let mut daemon = Daemon::spawn(
+            &[
+                "--data-dir",
+                data.to_str().unwrap(),
+                "serve-user",
+                "--owner",
+                "alice",
+                "--credential",
+                credential.to_str().unwrap(),
+                "--backend-config",
+                config_path.to_str().unwrap(),
+            ],
+            &[("RUST_LOG", LOG_FILTER)],
+        );
+        let log = daemon
+            .wait_exit(BUDGET)
+            .await
+            .expect("malformed backends must refuse startup");
+        assert!(!data.exists(), "case {index} touched storage: {log}");
+        assert!(log.contains("runtime backend"), "{log}");
+    }
+}
+
 #[tokio::test]
 async fn owner_boundary_stream_history_and_memory_survive_a_real_process_restart() {
     let root = tempfile::tempdir().unwrap();
