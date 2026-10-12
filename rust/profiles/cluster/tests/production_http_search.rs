@@ -182,6 +182,9 @@ async fn production_grants_filter_http_search_and_survive_restart() {
     let narrow = json_ok(client.post(format!("{base}/v2/auth/keys")).bearer_auth(admin)
         .json(&json!({"subject_type":"user", "subject_id":"alice", "zones":["sharedzone:r"], "allow_existing":true}))).await;
     let narrow = narrow["key"].as_str().unwrap();
+    let writer = json_ok(client.post(format!("{base}/v2/auth/keys")).bearer_auth(admin)
+        .json(&json!({"subject_type":"user", "subject_id":"alice", "zones":["sharedzone:w", "legal:w"], "allow_existing":true}))).await;
+    let writer = writer["key"].as_str().unwrap();
 
     let modified_at_ms = i64::try_from(
         std::time::SystemTime::now()
@@ -568,6 +571,87 @@ async fn production_grants_filter_http_search_and_survive_restart() {
     assert_eq!(batch.responses.len(), 2);
     assert_eq!(batch.responses[0].results[0].tier_boost, Some(4.0));
     assert_eq!(batch.responses[1].results[0].tier_boost, Some(5.0));
+    let batch_url = format!("{base}/v2/search/query/batch");
+    let batch_body = json!({"queries": [
+        {"q":"widget", "zone_id":"sharedzone"},
+        {"q":"widget", "zone_id":"legal"},
+        {"q":"", "zone_id":"sharedzone"}
+    ]});
+    assert_eq!(
+        client
+            .post(&batch_url)
+            .bearer_auth(writer)
+            .json(&batch_body)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        client
+            .post(format!("{base}/v2/search/query"))
+            .bearer_auth(writer)
+            .json(&json!({"q":"widget", "zone_id":"sharedzone"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let http_batch = json_ok(client.post(&batch_url).bearer_auth(alice).json(&batch_body)).await;
+    assert_eq!(http_batch["responses"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        http_batch["responses"][0]["results"][0]["path"],
+        "/docs/public.md"
+    );
+    assert_eq!(http_batch["responses"][0]["results"][0]["tier_boost"], 4.0);
+    assert_eq!(
+        http_batch["responses"][1]["results"][0]["path"],
+        "/legal/contract.md"
+    );
+    assert_eq!(http_batch["responses"][1]["results"][0]["tier_boost"], 5.0);
+    assert!(http_batch["responses"][2]["error"].is_string());
+    assert_eq!(
+        client
+            .post(&batch_url)
+            .bearer_auth(narrow)
+            .json(&batch_body)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        client
+            .post(&batch_url)
+            .bearer_auth("sk-unknown")
+            .json(&batch_body)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        client
+            .post(&batch_url)
+            .json(&batch_body)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let oversized = BatchQueryRequest {
+        auth_token: alice.into(),
+        queries: vec![QueryRequest::default(); nexus_search_common::query::MAX_BATCH_QUERIES + 1],
+    };
+    assert_eq!(
+        grpc_search.batch_query(oversized).await.unwrap_err().code(),
+        tonic::Code::InvalidArgument
+    );
     // A weightless child exempts itself from a weighted parent, even with a
     // warm candidate cache and a one-hour configuration refresh window.
     json_ok(client.put(&contexts_url).bearer_auth(admin).json(
@@ -697,6 +781,15 @@ async fn production_grants_filter_http_search_and_survive_restart() {
     )
     .await;
     assert!(query(&client, &base, alice, "sharedzone").await.is_empty());
+    let revoked_batch = json_ok(client.post(&batch_url).bearer_auth(alice).json(&batch_body)).await;
+    assert!(revoked_batch["responses"][0]["results"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        revoked_batch["responses"][1]["results"][0]["path"],
+        "/legal/contract.md"
+    );
     assert_eq!(
         query(&client, &base, alice, "").await,
         ["/legal/contract.md"]

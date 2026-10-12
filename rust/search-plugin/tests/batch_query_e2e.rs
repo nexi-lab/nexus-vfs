@@ -174,6 +174,24 @@ fn query_req(q: &str, query_type: QueryType, path_filter: &str) -> QueryRequest 
 
 // ── Tests ───────────────────────────────────────────────────────
 
+#[tokio::test]
+async fn oversized_batch_is_rejected_before_embedding_or_dispatch() {
+    let h = Harness::start(CountingEmbedder::new());
+    let error = h
+        .svc
+        .batch_query(Request::new(BatchQueryRequest {
+            queries: vec![
+                query_req("same semantic query", QueryType::Semantic, "");
+                nexus_search_common::query::MAX_BATCH_QUERIES + 1
+            ],
+            auth_token: String::new(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert_eq!(h.embedder.calls.load(Ordering::SeqCst), 0);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn batch_same_q_across_path_filters_embeds_once() {
     // The koodle#2176 fan-out shape: SAME query text, one semantic

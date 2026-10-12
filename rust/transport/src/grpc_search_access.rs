@@ -151,6 +151,8 @@ impl PluginGrpcPolicy for SearchGrpcPolicy {
                 let mut request = decode_request::<BatchQueryRequest>(payload)?;
                 request.auth_token = request_token(metadata, &request.auth_token)?.to_owned();
                 let ctx = self.authenticate(metadata, peer, &request.auth_token)?;
+                nexus_search_common::query::validate_batch_size(request.queries.len())
+                    .map_err(Status::invalid_argument)?;
                 let mut views = Vec::with_capacity(request.queries.len());
                 for query in &mut request.queries {
                     let view = self.view(ctx.clone(), &query.zone_id)?;

@@ -35,7 +35,8 @@ use nexus_search_common::{require_discovery_filters, QueryParameters};
 use serde::{Deserialize, Serialize};
 
 use crate::search_proto::{
-    DiscoveryFiles, DiscoveryFilter, GlobRequest, GrepRequest, QueryResult as ProtoQueryResult,
+    BatchQueryRequest, DiscoveryFiles, DiscoveryFilter, GlobRequest, GrepRequest,
+    QueryResponse as ProtoQueryResponse, QueryResult as ProtoQueryResult,
 };
 #[cfg(feature = "rebac")]
 use crate::zone::is_privileged;
@@ -417,6 +418,28 @@ pub struct QueryResponseBody {
     pub error: Option<String>,
 }
 
+impl From<ProtoQueryResponse> for QueryResponseBody {
+    fn from(response: ProtoQueryResponse) -> Self {
+        Self {
+            results: response.results.into_iter().map(hit_from_proto).collect(),
+            error: response.error,
+        }
+    }
+}
+
+/// One authenticated, order-preserving BatchQuery call. Each query addresses
+/// one zone; an omitted zone selects the caller's default zone.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchQueryBody {
+    pub queries: Vec<QueryBody>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BatchQueryResponseBody {
+    pub responses: Vec<QueryResponseBody>,
+}
+
 fn hit_from_proto(r: ProtoQueryResult) -> QueryHit {
     QueryHit {
         path: r.path,
@@ -507,13 +530,56 @@ pub async fn query(
         .await
         .map_err(SearchError::Rpc)?
         .into_inner();
-    let mut response = Json(QueryResponseBody {
-        results: resp.results.into_iter().map(hit_from_proto).collect(),
-        error: resp.error,
-    })
-    .into_response();
+    let mut response = Json(QueryResponseBody::from(resp)).into_response();
     if let Some(tok) = observed {
         crate::middleware::revision::stamp_revision(&mut response, &tok);
+    }
+    Ok(response)
+}
+
+/// HTTP adapter for BatchQuery. The host authorizes the entire batch under the
+/// original credential, then applies live file permissions to each response.
+pub async fn batch_query(
+    State(state): State<AppState>,
+    Extension(token): Extension<BearerToken>,
+    Extension(ctx): Extension<OperationContext>,
+    fence: crate::middleware::revision::RevisionFence,
+    Json(body): Json<BatchQueryBody>,
+) -> Result<Response, SearchError> {
+    nexus_search_common::query::validate_batch_size(body.queries.len())
+        .map_err(SearchError::BadRequest)?;
+    let queries = body
+        .queries
+        .into_iter()
+        .map(|mut query| {
+            query.zone_id = effective_zone(&ctx, &query.zone_id)?;
+            query_request(query).map_err(SearchError::BadRequest)
+        })
+        .collect::<Result<Vec<_>, SearchError>>()?;
+    // As with federated Query, the request fence covers the caller's default
+    // zone on this node. It does not fence remote replicas or other zones.
+    let fence_zone = effective_zone(&ctx, "")?;
+    let observed = fence
+        .enforce(std::sync::Arc::clone(&state.kernel), &fence_zone)
+        .await
+        .map_err(SearchError::Fence)?;
+    let response = state
+        .search
+        .client()
+        .await?
+        .batch_query(BatchQueryRequest {
+            queries,
+            auth_token: token.0.to_string(),
+        })
+        .await
+        .map_err(SearchError::Rpc)?
+        .into_inner();
+    let mut response = Json(BatchQueryResponseBody {
+        responses: response.responses.into_iter().map(Into::into).collect(),
+    })
+    .into_response();
+    if let Some(token) = observed {
+        crate::middleware::revision::stamp_revision(&mut response, &token);
     }
     Ok(response)
 }
@@ -617,6 +683,7 @@ pub fn router() -> Router<AppState> {
         .route("/v2/search/glob", get(glob).post(glob_post))
         .route("/v2/search/grep", get(grep).post(grep_post))
         .route("/v2/search/query", post(query))
+        .route("/v2/search/query/batch", post(batch_query))
 }
 
 /// Shared handler-level error surfaced as an HTTP response.
