@@ -95,28 +95,12 @@ pub(crate) fn register_proc_entry<K: KernelSyscall>(
 /// Nothing here outlives the pid: an agent's durable state hangs off its
 /// name, under `/agents/{name}/`.
 pub(crate) fn unregister_proc_entry<K: KernelSyscall>(kernel: &K, desc: &AgentDescriptor) {
-    let pid = desc.pid.as_str();
-    let pid_root = format!("/proc/{pid}");
-    let workspace_root = format!("/proc/{pid}/workspace");
-    let sessions_root = format!("/proc/{pid}/sessions");
-    let tasks_root = format!("/proc/{pid}/tasks");
-    let ctx = sys_ctx();
-
-    // Alias links first, then the workspace dir.
-    for repo in &desc.repos {
-        let _ = kernel.sys_unlink(&format!("{workspace_root}/{}", repo.alias), &ctx, false);
+    let pid_root = format!("/proc/{}", desc.pid);
+    // Runtime-created workspace, session and task children are ephemeral too.
+    // Recursive unlink removes their rows without following DT_LINK targets.
+    if let Err(error) = kernel.sys_unlink(&pid_root, &sys_ctx(), true) {
+        tracing::warn!(pid = %desc.pid, error = %error, "procfs runtime cleanup failed");
     }
-    let _ = kernel.sys_unlink(&workspace_root, &ctx, false);
-
-    // Sessions / tasks are leaf dirents from this layer's perspective —
-    // any sub-entries are sudo-code's bookkeeping, dropped here as a
-    // bulk-delete because the pid is going away.
-    let _ = kernel.sys_unlink(&sessions_root, &ctx, false);
-    let _ = kernel.sys_unlink(&tasks_root, &ctx, false);
-
-    // Agent link, then the pid root itself.
-    let _ = kernel.sys_unlink(&format!("{pid_root}/agent"), &ctx, false);
-    let _ = kernel.sys_unlink(&pid_root, &ctx, false);
 }
 
 fn create_dt_dir<K: KernelSyscall>(kernel: &K, path: &str) -> Result<(), String> {
