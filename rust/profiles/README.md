@@ -44,6 +44,34 @@ restores service. This mode is also available to binaries composing
 `run_with_services`, including the in-process SudoCode adapter. Pod placement,
 credential delivery and renewal remain the control plane's responsibility.
 
+### Startup backends
+
+`serve-user --backend-config <local-json-file>` installs the runtime's backends
+before admitting requests. It uses the same `ObjectStoreProvider` and mount
+primitive as the cluster. The file contains no zone membership or remote-kernel
+configuration; each mount belongs to the runtime's existing local root zone.
+
+```json
+{
+  "mounts": [{
+    "path": "/models/anthropic",
+    "backend_type": "anthropic",
+    "backend_name": "user-model",
+    "backend_params": {
+      "base_url": "https://api.sudorouter.ai",
+      "blob_root": "/data/model-blobs"
+    }
+  }]
+}
+```
+
+Model backends require a `driver-ai` build. Provider credentials supplied in the
+local constructor parameters remain in the backend's process memory; the runtime
+does not save these parameters in metadata or Raft. The coordinator should deliver
+this file and the runtime credential through volatile storage. Reapply the same
+configuration on restart to reopen durable model content. Ordinary delegated
+callers remain unable to create mounts through the administrator RPC.
+
 ### Binary measurements
 
 The standalone binary includes the confined profile alongside the cluster CLI.

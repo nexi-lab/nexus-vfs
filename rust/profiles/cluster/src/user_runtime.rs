@@ -137,9 +137,11 @@ pub(super) async fn serve(
     build_decls: BoxedServiceDeclsBuilder,
     owner: String,
     credential_path: PathBuf,
+    backend_config: Option<PathBuf>,
 ) -> Result<()> {
     super::refuse_retired_env_vars()?;
     validate_options(&common)?;
+    let backends = super::runtime_backends::RuntimeBackends::load(backend_config.as_deref())?;
     let scope = RuntimeScope::new(owner.clone(), [])?;
     let initial = AgentCredential::load(&credential_path).map_err(anyhow::Error::msg)?;
     let verifier = FederatedClientCertVerifier::new(&initial.ca_pem).map_err(anyhow::Error::msg)?;
@@ -208,6 +210,7 @@ pub(super) async fn serve(
     kernel
         .bring_up_services(build_decls(&ctx))
         .map_err(|error| anyhow::anyhow!("bring up user runtime services: {error}"))?;
+    backends.install(&kernel)?;
     let verifier_slot = Arc::new(std::sync::OnceLock::new());
     verifier_slot
         .set(Arc::clone(&verifier))

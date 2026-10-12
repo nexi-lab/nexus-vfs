@@ -79,6 +79,7 @@ egress-gate = ["dep:egress-gate"]
 egress-gate-presidio = ["egress-gate", "egress-gate/presidio"]
 
 [dependencies]
+serde = { workspace = true }
 serde_json = { workspace = true }
 nexus-rebac = { path = "../../rebac", optional = true }
 nexus-http-api = { path = "../../http-api", optional = true }

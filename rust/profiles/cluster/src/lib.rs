@@ -33,6 +33,7 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 mod auth_posture;
 mod authorization;
+mod runtime_backends;
 mod search_capabilities;
 mod user_runtime;
 use auth_posture::{AuthPosture, AuthPostureInputs};
@@ -999,6 +1000,9 @@ enum Cmd {
         /// Agent credential bundle directory; replaced atomically by the issuer coordinator.
         #[arg(long)]
         credential: PathBuf,
+        /// Local startup backend configuration; credentials remain in process memory.
+        #[arg(long)]
+        backend_config: Option<PathBuf>,
     },
     /// Mint an EXTRA join token for THIS cluster (founder), and print it.
     ///
@@ -1229,8 +1233,13 @@ where
         .block_on(async move {
             match args.cmd {
                 None => run_daemon(args.common, build_decls).await,
-                Some(Cmd::ServeUser { owner, credential }) => {
-                    user_runtime::serve(args.common, build_decls, owner, credential).await
+                Some(Cmd::ServeUser {
+                    owner,
+                    credential,
+                    backend_config,
+                }) => {
+                    user_runtime::serve(args.common, build_decls, owner, credential, backend_config)
+                        .await
                 }
                 Some(Cmd::ServeLocal { port }) => {
                     // Force the trusted-local-backend posture: loopback
