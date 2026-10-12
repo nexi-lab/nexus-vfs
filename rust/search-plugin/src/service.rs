@@ -4393,6 +4393,8 @@ impl SearchService for SearchServiceImpl {
         request: Request<BatchQueryRequest>,
     ) -> Result<Response<BatchQueryResponse>, Status> {
         let req = request.into_inner();
+        nexus_search_common::query::validate_batch_size(req.queries.len())
+            .map_err(Status::invalid_argument)?;
         for query in &req.queries {
             checked_index_zone(&query.zone_id)?;
         }

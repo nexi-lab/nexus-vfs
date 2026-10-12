@@ -3,6 +3,19 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Bound one batch before allocating per-query authorization views or tasks.
+pub const MAX_BATCH_QUERIES: usize = 500;
+
+pub fn validate_batch_size(count: usize) -> Result<(), String> {
+    if count > MAX_BATCH_QUERIES {
+        Err(format!(
+            "too many queries: {count} exceeds the limit of {MAX_BATCH_QUERIES}"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// Ranking and selection parameters. Credentials and delegated identity are
 /// supplied by the transport rather than accepted in this request body.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

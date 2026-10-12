@@ -43,10 +43,12 @@ use tonic::{Request, Response, Status};
 #[derive(Default, Clone)]
 struct RequestLog {
     queries: Arc<Mutex<Vec<QueryRequest>>>,
+    batches: Arc<Mutex<Vec<BatchQueryRequest>>>,
 }
 
 #[derive(Clone)]
 enum MockBehaviour {
+    BatchSuccess(Vec<QueryResponse>),
     Success {
         results: Vec<QueryResult>,
         error: Option<String>,
@@ -57,7 +59,10 @@ enum MockBehaviour {
     /// per-variant enum blow-up here.  Subsumes the earlier
     /// `InvalidArgument(String)` variant (which was a strict subset
     /// of `RpcCode { code: tonic::Code::InvalidArgument, .. }`).
-    RpcCode { code: tonic::Code, message: String },
+    RpcCode {
+        code: tonic::Code,
+        message: String,
+    },
 }
 
 #[derive(Clone)]
@@ -91,6 +96,7 @@ impl SearchService for MockSearchService {
         let inner = req.into_inner();
         self.log.queries.lock().unwrap().push(inner);
         match &self.behaviour {
+            MockBehaviour::BatchSuccess(_) => unreachable!(),
             MockBehaviour::Success { results, error } => Ok(Response::new(QueryResponse {
                 results: results.clone(),
                 error: error.clone(),
@@ -117,9 +123,26 @@ impl SearchService for MockSearchService {
     }
     async fn batch_query(
         &self,
-        _: Request<BatchQueryRequest>,
+        req: Request<BatchQueryRequest>,
     ) -> Result<Response<BatchQueryResponse>, Status> {
-        unreachable!()
+        let request = req.into_inner();
+        self.log.batches.lock().unwrap().push(request.clone());
+        match &self.behaviour {
+            MockBehaviour::BatchSuccess(responses) => Ok(Response::new(BatchQueryResponse {
+                responses: responses.clone(),
+            })),
+            MockBehaviour::Success { results, error } => Ok(Response::new(BatchQueryResponse {
+                responses: request
+                    .queries
+                    .iter()
+                    .map(|_| QueryResponse {
+                        results: results.clone(),
+                        error: error.clone(),
+                    })
+                    .collect(),
+            })),
+            MockBehaviour::RpcCode { code, message } => Err(Status::new(*code, message.clone())),
+        }
     }
     async fn index_documents(
         &self,
@@ -268,6 +291,170 @@ fn full_hit() -> QueryResult {
         tier_boost: Some(1.5),
         recency_boost: Some(1.2),
         expansion_variant_index: Some(2),
+    }
+}
+
+#[tokio::test]
+async fn batch_query_preserves_order_errors_and_original_credential() {
+    let h = Harness::start(MockBehaviour::BatchSuccess(vec![
+        QueryResponse {
+            results: vec![full_hit()],
+            error: None,
+        },
+        QueryResponse {
+            results: vec![],
+            error: Some("empty query".into()),
+        },
+    ]))
+    .await;
+    let response = reqwest::Client::new()
+        .post(format!("{}/v2/search/query/batch", h.http_base))
+        .bearer_auth("sk-original")
+        .json(&serde_json::json!({"queries": [
+            {"q": "widget", "zone_id": "root", "query_type": "hybrid",
+             "fusion_method": "weighted", "path_filters": ["/notes", "/docs"],
+             "path_prefix_boosts": {"/notes": 4.0}, "recency_mode": "auto"},
+            {"q": "", "zone_id": "legal"}
+        ]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["responses"].as_array().unwrap().len(), 2);
+    assert_eq!(body["responses"][0]["results"][0]["path"], "/notes/a.md");
+    assert_eq!(body["responses"][0]["results"][0]["tier_boost"], 1.5);
+    assert!(body["responses"][0].get("error").is_none());
+    assert_eq!(body["responses"][1]["error"], "empty query");
+    let batches = h.log.batches.lock().unwrap();
+    assert_eq!(batches.len(), 1);
+    let batch = &batches[0];
+    assert_eq!(batch.auth_token, "sk-original");
+    assert!(batch
+        .queries
+        .iter()
+        .all(|query| query.auth_token.is_empty()));
+    assert_eq!(batch.queries[0].q, "widget");
+    assert_eq!(batch.queries[1].q, "");
+    assert_eq!(batch.queries[1].zone_id, "legal");
+    assert_eq!(batch.queries[0].path_filters, ["/notes", "/docs"]);
+    assert_eq!(batch.queries[0].path_prefix_boosts["/notes"], 4.0);
+    assert_eq!(batch.queries[0].recency_mode, "auto");
+    assert_eq!(
+        batch.queries[0].query_type,
+        nexus_http_api::search_proto::QueryType::Hybrid as i32
+    );
+    assert_eq!(
+        batch.queries[0].fusion_method,
+        nexus_http_api::search_proto::FusionMethod::Weighted as i32
+    );
+    assert!(h.log.queries.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn batch_query_rejects_invalid_settings_and_credential_overrides_before_rpc() {
+    let h = Harness::start(MockBehaviour::Success {
+        results: vec![],
+        error: None,
+    })
+    .await;
+    let client = reqwest::Client::new();
+    for body in [
+        serde_json::json!({"queries": [{"q": "valid"}, {"q": "x", "query_type": "typo"}]}),
+        serde_json::json!({"queries": [{"q": "x", "fusion_method": "typo"}]}),
+        serde_json::json!({"queries": vec![serde_json::json!({"q": "x"}); nexus_search_common::query::MAX_BATCH_QUERIES + 1]}),
+    ] {
+        let response = client
+            .post(format!("{}/v2/search/query/batch", h.http_base))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    }
+    for body in [
+        serde_json::json!({"queries": [{"q": "x", "auth_token": "sk-forged"}]}),
+        serde_json::json!({"queries": [{"q": "x"}], "auth_token": "sk-forged"}),
+    ] {
+        let response = client
+            .post(format!("{}/v2/search/query/batch", h.http_base))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    assert!(h.log.batches.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn batch_query_obeys_rpc_error_mapping_and_revision_fence() {
+    for (code, status) in [
+        (
+            tonic::Code::InvalidArgument,
+            reqwest::StatusCode::BAD_REQUEST,
+        ),
+        (
+            tonic::Code::Unauthenticated,
+            reqwest::StatusCode::UNAUTHORIZED,
+        ),
+        (
+            tonic::Code::PermissionDenied,
+            reqwest::StatusCode::FORBIDDEN,
+        ),
+        (
+            tonic::Code::Unavailable,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        ),
+    ] {
+        let h = Harness::start(MockBehaviour::RpcCode {
+            code,
+            message: "rejected".into(),
+        })
+        .await;
+        let response = reqwest::Client::new()
+            .post(format!("{}/v2/search/query/batch", h.http_base))
+            .json(&serde_json::json!({"queries": [{"q": "x"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+    }
+    let h = Harness::start(MockBehaviour::Success {
+        results: vec![],
+        error: None,
+    })
+    .await;
+    let response = reqwest::Client::new()
+        .post(format!("{}/v2/search/query/batch", h.http_base))
+        .header("X-Nexus-Min-Revision", "/notes/a.md@1")
+        .header("X-Nexus-Revision-Timeout-Ms", "0")
+        .json(&serde_json::json!({"queries": [{"q": "x"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::PRECONDITION_FAILED);
+    assert!(response.headers().contains_key("X-Nexus-Revision"));
+    assert!(h.log.batches.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn batch_query_allows_empty_batch_and_maximum_cardinality() {
+    let h = Harness::start(MockBehaviour::Success {
+        results: vec![],
+        error: None,
+    })
+    .await;
+    for count in [0, nexus_search_common::query::MAX_BATCH_QUERIES] {
+        let response = reqwest::Client::new()
+            .post(format!("{}/v2/search/query/batch", h.http_base))
+            .json(&serde_json::json!({"queries": vec![serde_json::json!({"q": "x"}); count]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["responses"].as_array().unwrap().len(), count);
     }
 }
 
