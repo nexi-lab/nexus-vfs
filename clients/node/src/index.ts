@@ -15,6 +15,10 @@
 
 import { readFileSync } from 'node:fs'
 import { createHash, createPrivateKey, sign, X509Certificate } from 'node:crypto'
+import { assertUserRuntimeCredential, userRuntimeServerName, type SessionCredential } from './credentials.js'
+
+export { userRuntimeServerName, createUserRuntimeCredentialBundle } from './credentials.js'
+export type { SessionCredential, UserRuntimeCredentialBundle } from './credentials.js'
 
 export { SESSION_PROTOCOL, SessionCodec, NexusSessionTransport } from './session.js'
 export type { NexusSessionEndpoint, SessionRpcMessage, NexusSessionTransportOptions } from './session.js'
@@ -968,15 +972,6 @@ export class NexusVfsClient {
   }
 }
 
-/** A freshly minted session credential. This client never persists it. */
-export interface SessionCredential {
-  certPem: Buffer
-  keyPem: Buffer
-  caPem: Buffer
-  /** The minted subject (`session-<uuid>`), so a holder can log what it has. */
-  subjectId: string
-}
-
 function validateRenewedCredential(previous: SessionCredential, next: SessionCredential): void {
   const certificate = new X509Certificate(next.certPem)
   const original = new X509Certificate(previous.certPem)
@@ -991,14 +986,6 @@ function validateRenewedCredential(previous: SessionCredential, next: SessionCre
     || Date.parse(certificate.validTo) <= Date.now()) {
     throw new Error('renew session agent returned inconsistent credentials')
   }
-}
-
-/** The issuer's owner-bound TLS name; it does not depend on Pod IP or DNS. */
-export function userRuntimeServerName(ownerId: string): string {
-  if (!ownerId || Buffer.byteLength(ownerId) > 256 || /\p{Cc}/u.test(ownerId)) {
-    throw new Error('invalid user runtime owner')
-  }
-  return 'nexus-user-' + createHash('sha256').update(ownerId).digest('hex').slice(0, 40)
 }
 
 interface MintSessionAgentRequest {
@@ -1105,25 +1092,16 @@ export class NexusZoneApiClient {
 
   /** Issue a TLS runtime identity for one owner, valid for at most 300 seconds. */
   async mintUserRuntime(ownerId: string, options: { validitySecs: number }): Promise<SessionCredential> {
-    const serverName = userRuntimeServerName(ownerId)
+    userRuntimeServerName(ownerId)
     if (!Number.isSafeInteger(options.validitySecs) || options.validitySecs < 1 || options.validitySecs > 300) {
       throw new Error('user runtime validity must be between 1 and 300 seconds')
     }
     const credential = await this.mintOwnerCredential(this.client.MintUserRuntime, 'mint user runtime', ownerId, options.validitySecs)
-    const certificate = new X509Certificate(credential.certPem)
     const ca = new X509Certificate(credential.caPem)
-    if (!this.caPem || !ca.raw.equals(new X509Certificate(this.caPem).raw)
-      || certificate.ca || certificate.checkHost(serverName, { subject: 'never' }) !== serverName
-      || !certificate.verify(ca.publicKey) || !certificate.checkPrivateKey(createPrivateKey(credential.keyPem))
-      || Date.parse(certificate.validFrom) > Date.now() || Date.parse(certificate.validTo) <= Date.now()
-      || (Date.parse(certificate.validTo) - Date.parse(certificate.validFrom)) / 1000 > options.validitySecs
-      || !/^session-[0-9a-f-]{36}$/.test(credential.subjectId)
-      || !certificate.subjectAltName?.split(', ').includes(`URI:nexus://agent/${credential.subjectId}`)
-      || certificate.subjectAltName?.includes('URI:nexus://zone/')
-      || !certificate.keyUsage?.includes('1.3.6.1.5.5.7.3.1')
-      || !certificate.keyUsage?.includes('1.3.6.1.5.5.7.3.2')) {
+    if (!this.caPem || !ca.raw.equals(new X509Certificate(this.caPem).raw)) {
       throw new Error('mint user runtime returned inconsistent credentials')
     }
+    assertUserRuntimeCredential(credential, ownerId, options.validitySecs)
     return credential
   }
 
