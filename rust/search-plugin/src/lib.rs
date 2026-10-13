@@ -64,6 +64,7 @@ pub mod embedder;
 pub mod fts_index;
 pub mod fusion;
 pub mod http_client;
+mod index_admission;
 pub mod index_manager;
 pub mod index_seq;
 pub mod index_state;

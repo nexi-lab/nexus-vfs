@@ -160,7 +160,7 @@ pub struct SearchServiceImpl {
     /// #4623: in-flight explicit Index / IndexDocuments / Refresh
     /// operations.  Surfaced on Stats as `indexing_in_progress` so
     /// pollers can tell "genuinely empty" from "still building".
-    indexing_ops: Arc<std::sync::atomic::AtomicU32>,
+    index_admission: Arc<crate::index_admission::IndexAdmission>,
     /// #4736: plugin-wide index sequence + last-commit clock.  Every
     /// committed index mutation advances it; IndexDocuments returns
     /// the value as `index_seq`, Stats reports the latest as
@@ -220,29 +220,6 @@ pub struct ExpanderHandle {
     pub config: crate::query_expansion::QueryExpansionConfig,
 }
 
-/// RAII increment of [`SearchServiceImpl::indexing_ops`].
-///
-/// MUST be moved INTO the `spawn_blocking` closure doing the actual
-/// index mutation: a guard owned by the async RPC future would be
-/// dropped on RPC cancellation/timeout while the already-started
-/// blocking task keeps mutating the indices — understating
-/// `indexing_in_progress` during exactly the partial-build window
-/// the counter exists to expose (#4623 review R1).
-struct IndexingGuard(Arc<std::sync::atomic::AtomicU32>);
-
-impl IndexingGuard {
-    fn enter(counter: &Arc<std::sync::atomic::AtomicU32>) -> Self {
-        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Self(Arc::clone(counter))
-    }
-}
-
-impl Drop for IndexingGuard {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
 /// One handler panic caught at the plugin's dispatch boundary (#4725).
 #[derive(Debug, Clone)]
 pub struct DispatchPanic {
@@ -281,7 +258,7 @@ impl DispatchPanicLog {
     }
 }
 
-/// #4736: `pending` counterpart of [`IndexingGuard`] — adds the batch
+/// Documents accepted by an indexing operation — adds the batch
 /// size on entry, subtracts it on drop.  Moved INTO the blocking
 /// closure for the same cancellation reason: the count must cover the
 /// work, not the RPC future.
@@ -327,6 +304,7 @@ impl SearchServiceImpl {
             peer_fanout_pin: None,
             context_generator_pin: None,
             embed_gate: None,
+            index_max_inflight: None,
             ann_flush: None,
             path_contexts_pin: None,
         }
@@ -387,19 +365,26 @@ impl SearchServiceImpl {
     /// not block concurrent Query / Index requests.  Two concurrent
     /// first-callers duplicate work but both succeed — a rare cost
     /// worth paying to keep the lock's critical section short.
-    fn get_or_init_embedder(&self) -> Result<Arc<dyn Embedder>, EmbedError> {
+    async fn get_or_init_embedder(&self) -> Result<Arc<dyn Embedder>, EmbedError> {
         if let Some(e) = self.embedder_slot.lock().as_ref() {
             return Ok(Arc::clone(e));
         }
         let data_root = self.manager.root().to_path_buf();
-        let built = build_default_embedder(&data_root)?;
-        // Race-check: another thread may have won.
-        let mut slot = self.embedder_slot.lock();
-        if let Some(existing) = slot.as_ref() {
-            return Ok(Arc::clone(existing));
-        }
-        *slot = Some(Arc::clone(&built));
-        Ok(built)
+        let slot = Arc::clone(&self.embedder_slot);
+        // Remote client construction and ONNX loading both perform blocking
+        // work. reqwest's blocking client also cannot be built in an async task.
+        tokio::task::spawn_blocking(move || {
+            let built = build_default_embedder(&data_root)?;
+            // Race-check: another thread may have won.
+            let mut slot = slot.lock();
+            if let Some(existing) = slot.as_ref() {
+                return Ok(Arc::clone(existing));
+            }
+            *slot = Some(Arc::clone(&built));
+            Ok(built)
+        })
+        .await
+        .map_err(|error| EmbedError::Runtime(format!("embedder initialization failed: {error}")))?
     }
 
     /// LLM query expander for THIS process, or `None` if the
@@ -727,8 +712,8 @@ impl SearchServiceImpl {
     /// Refresh/IndexDocuments retries its vectors once the embedder
     /// recovers, instead of the failure minting permanently
     /// keyword-only documents behind a success response).
-    fn indexing_embedder(&self) -> (Option<Arc<dyn Embedder>>, bool) {
-        match self.get_or_init_embedder() {
+    async fn indexing_embedder(&self) -> (Option<Arc<dyn Embedder>>, bool) {
+        match self.get_or_init_embedder().await {
             Ok(e) => (Some(e), false),
             Err(EmbedError::NotAvailable(_)) => (None, false),
             Err(e) => {
@@ -771,11 +756,20 @@ pub struct SearchServiceBuilder {
     peer_fanout_pin: Option<Option<SharedPeerFanoutDispatcher>>,
     context_generator_pin: Option<Option<SharedContextGenerator>>,
     embed_gate: Option<Arc<crate::ann_flush::EmbedGate>>,
+    index_max_inflight: Option<u32>,
     ann_flush: Option<Arc<crate::ann_flush::AnnFlushCoordinator>>,
     path_contexts_pin: Option<Option<Arc<crate::path_contexts::PathContextStore>>>,
 }
 
 impl SearchServiceBuilder {
+    /// Maximum simultaneous Index, Refresh and IndexDocuments operations.
+    /// Zero disables the cap. Unset reads NEXUS_SEARCH_INDEX_MAX_INFLIGHT
+    /// once when building the service (default 8).
+    pub fn index_max_inflight(mut self, limit: u32) -> Self {
+        self.index_max_inflight = Some(limit);
+        self
+    }
+
     pub fn path_contexts(mut self, store: Arc<crate::path_contexts::PathContextStore>) -> Self {
         self.path_contexts_pin = Some(Some(store));
         self
@@ -908,7 +902,11 @@ impl SearchServiceBuilder {
             embed_cache: self
                 .embed_cache
                 .unwrap_or_else(|| Arc::new(QueryEmbedCache::from_env())),
-            indexing_ops: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            index_admission: Arc::new(
+                self.index_max_inflight
+                    .map(crate::index_admission::IndexAdmission::new)
+                    .unwrap_or_else(crate::index_admission::IndexAdmission::from_env),
+            ),
             index_seq,
             pending_docs: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             title_arm: self.title_arm,
@@ -3955,7 +3953,7 @@ impl SearchService for SearchServiceImpl {
                 // Load / NotAvailable error surfaces synchronously
                 // with an actionable message instead of getting
                 // wrapped as an opaque JoinError.
-                let embedder = match self.get_or_init_embedder() {
+                let embedder = match self.get_or_init_embedder().await {
                     Ok(e) => e,
                     Err(e) => {
                         return Ok(Response::new(QueryResponse {
@@ -3984,7 +3982,7 @@ impl SearchService for SearchServiceImpl {
                 // needs the embedder to run its semantic leg, so a
                 // missing embedder degrades hybrid the same way (with
                 // a clearer "hybrid unavailable" prefix).
-                let embedder = match self.get_or_init_embedder() {
+                let embedder = match self.get_or_init_embedder().await {
                     Ok(e) => e,
                     Err(e) => {
                         return Ok(Response::new(QueryResponse {
@@ -4232,7 +4230,6 @@ impl SearchService for SearchServiceImpl {
         &self,
         request: Request<IndexRequest>,
     ) -> Result<Response<IndexResponse>, Status> {
-        let indexing = IndexingGuard::enter(&self.indexing_ops);
         let req = request.into_inner();
         let root = if req.root_path.is_empty() {
             "/".to_string()
@@ -4240,6 +4237,7 @@ impl SearchService for SearchServiceImpl {
             req.root_path
         };
         let zone_id = checked_index_zone(&req.zone_id)?.to_string();
+        let indexing = self.index_admission.admit()?;
         let recursive = req.recursive;
         let max_docs = if req.max_docs == 0 {
             DEFAULT_INDEX_MAX_DOCS
@@ -4253,7 +4251,7 @@ impl SearchService for SearchServiceImpl {
         // just stays empty until an operator wires the embedder up
         // and re-runs Index.  This matches the "graceful degradation"
         // posture SemanticQuery uses.
-        let (embedder, embed_broken) = self.indexing_embedder();
+        let (embedder, embed_broken) = self.indexing_embedder().await;
         let context_generator = self.get_or_init_context_generator().await?;
         // Retain the zone id for post-outcome cache invalidation
         // (the closure below moves the owned copy into
@@ -4310,7 +4308,6 @@ impl SearchService for SearchServiceImpl {
         &self,
         request: Request<RefreshRequest>,
     ) -> Result<Response<RefreshResponse>, Status> {
-        let indexing = IndexingGuard::enter(&self.indexing_ops);
         let req = request.into_inner();
         let root = if req.root_path.is_empty() {
             "/".to_string()
@@ -4318,6 +4315,7 @@ impl SearchService for SearchServiceImpl {
             req.root_path
         };
         let zone_id = checked_index_zone(&req.zone_id)?.to_string();
+        let indexing = self.index_admission.admit()?;
         let recursive = req.recursive;
         let max_docs = if req.max_docs == 0 {
             DEFAULT_INDEX_MAX_DOCS
@@ -4329,7 +4327,7 @@ impl SearchService for SearchServiceImpl {
         // Same best-effort embedder posture as Index: a missing
         // embedder means ANN stays unchanged this Refresh; keyword
         // side still incrementally updates.
-        let (embedder, embed_broken) = self.indexing_embedder();
+        let (embedder, embed_broken) = self.indexing_embedder().await;
         let context_generator = self.get_or_init_context_generator().await?;
         let zone_for_invalidate = zone_id.clone();
         let index_seq = Arc::clone(&self.index_seq);
@@ -4444,7 +4442,7 @@ impl SearchService for SearchServiceImpl {
         if !dupe_texts.is_empty() {
             // Embedder init failure is fine here — the inner queries
             // will produce their per-query "unavailable" errors.
-            if let Ok(embedder) = self.get_or_init_embedder() {
+            if let Ok(embedder) = self.get_or_init_embedder().await {
                 let cache = Arc::clone(&self.embed_cache);
                 let _ = tokio::task::spawn_blocking(move || {
                     for text in dupe_texts {
@@ -4474,18 +4472,18 @@ impl SearchService for SearchServiceImpl {
         &self,
         request: Request<IndexDocumentsRequest>,
     ) -> Result<Response<IndexDocumentsResponse>, Status> {
-        let indexing = IndexingGuard::enter(&self.indexing_ops);
         let req = request.into_inner();
-        // #4736: `pending` covers accept → return for the whole batch.
-        let pending = PendingDocsGuard::enter(&self.pending_docs, req.documents.len() as u32);
         let default_zone = checked_index_zone(&req.zone_id)?.to_string();
         for doc in &req.documents {
             if !doc.zone_id.is_empty() {
                 checked_index_zone(&doc.zone_id)?;
             }
         }
+        let indexing = self.index_admission.admit()?;
+        // `pending` covers accepted work, including after RPC cancellation.
+        let pending = PendingDocsGuard::enter(&self.pending_docs, req.documents.len() as u32);
         let manager = Arc::clone(&self.manager);
-        let (embedder, embed_broken) = self.indexing_embedder();
+        let (embedder, embed_broken) = self.indexing_embedder().await;
         let context_generator = self.get_or_init_context_generator().await?;
         let cache = Arc::clone(&self.query_cache);
         let index_seq = Arc::clone(&self.index_seq);
@@ -4924,7 +4922,7 @@ impl SearchService for SearchServiceImpl {
         // #4623: non-zero while explicit Index/IndexDocuments/Refresh
         // ops are in flight — "empty results" during that window mean
         // "still building", not "no matches".
-        let indexing_in_progress = self.indexing_ops.load(std::sync::atomic::Ordering::SeqCst);
+        let indexing_in_progress = self.index_admission.inflight();
         // #4736 stall-detection triple: last committed seq + its clock,
         // and the documents accepted but not yet returned.
         let seq_snapshot = self.index_seq.snapshot();
