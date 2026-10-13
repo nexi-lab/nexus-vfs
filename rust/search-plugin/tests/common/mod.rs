@@ -253,7 +253,7 @@ unsafe extern "C" fn mock_sys_stat(
         into_out_buf(serde_json::to_vec(&payload).unwrap(), out_json, out_len);
         0
     } else {
-        -404
+        -1
     }
 }
 

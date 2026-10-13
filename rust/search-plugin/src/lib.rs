@@ -61,6 +61,7 @@ pub mod delegation_gate;
 mod discovery;
 pub mod embed_cache;
 pub mod embedder;
+mod file_index;
 pub mod fts_index;
 pub mod fusion;
 pub mod http_client;
@@ -88,11 +89,11 @@ pub mod title_index;
 use search_proto::search_service_server::SearchService as SearchServiceTrait;
 use search_proto::{
     AddIndexedDirectoryRequest, BatchQueryRequest, DeletePathContextRequest, GlobRequest,
-    GrepRequest, HealthRequest, IndexDocumentsRequest, IndexRequest, ListIndexedDirectoriesRequest,
-    ListPathContextsRequest, ListZoneIndexingModesRequest, LocateRequest, NotifyFileChangeRequest,
-    ParkedDiscardRequest, ParkedListRequest, ParkedRetryRequest, PutPathContextRequest,
-    QueryRequest, RefreshRequest, RemoveIndexedDirectoryRequest, SetZoneIndexingModeRequest,
-    StatsRequest,
+    GrepRequest, HealthRequest, IndexDocumentsRequest, IndexFileRequest, IndexRequest,
+    ListIndexedDirectoriesRequest, ListPathContextsRequest, ListZoneIndexingModesRequest,
+    LocateRequest, NotifyFileChangeRequest, ParkedDiscardRequest, ParkedListRequest,
+    ParkedRetryRequest, PutPathContextRequest, QueryRequest, RefreshRequest,
+    RemoveIndexedDirectoryRequest, SetZoneIndexingModeRequest, StatsRequest,
 };
 
 /// Plugin state held between `create` and `destroy`.
@@ -251,6 +252,7 @@ fn dispatch_grpc(
         "Refresh" => call!(RefreshRequest, refresh),
         "BatchQuery" => call!(BatchQueryRequest, batch_query),
         "IndexDocuments" => call!(IndexDocumentsRequest, index_documents),
+        "IndexFile" => call!(IndexFileRequest, index_file),
         "NotifyFileChange" => call!(NotifyFileChangeRequest, notify_file_change),
         "Locate" => call!(LocateRequest, locate),
         "ParkedList" => call!(ParkedListRequest, parked_list),

@@ -38,6 +38,8 @@ struct RequestLog {
     index: Arc<Mutex<Vec<IndexRequest>>>,
     refresh: Arc<Mutex<Vec<RefreshRequest>>>,
     index_documents: Arc<Mutex<Vec<IndexDocumentsRequest>>>,
+    index_file: Arc<Mutex<Vec<nexus_http_api::search_proto::IndexFileRequest>>>,
+    notify_file_change: Arc<Mutex<Vec<NotifyFileChangeRequest>>>,
     stats: Arc<Mutex<Vec<StatsRequest>>>,
 }
 
@@ -49,6 +51,7 @@ struct MockConfig {
     index_resp: IndexResponse,
     refresh_resp: RefreshResponse,
     index_documents_resp: IndexDocumentsResponse,
+    index_file_resp: nexus_http_api::search_proto::IndexFileResponse,
     stats_resp: StatsResponse,
     /// When Some, EVERY doc-side RPC returns this Status instead of
     /// its Ok response — lets a test pin the shared status mapper
@@ -93,6 +96,12 @@ impl Default for MockConfig {
                 pending: 0,
                 last_successful_index_at_ms: 1_700_000_000_000,
             },
+            index_file_resp: nexus_http_api::search_proto::IndexFileResponse {
+                status: "indexed".into(),
+                reason: None,
+                index_seq: 12,
+                zone_id: "root".into(),
+            },
             rpc_err: None,
         }
     }
@@ -116,6 +125,13 @@ macro_rules! err_or {
 
 #[tonic::async_trait]
 impl SearchService for MockSearchService {
+    async fn index_file(
+        &self,
+        req: Request<nexus_http_api::search_proto::IndexFileRequest>,
+    ) -> Result<Response<nexus_http_api::search_proto::IndexFileResponse>, Status> {
+        self.log.index_file.lock().unwrap().push(req.into_inner());
+        err_or!(self, self.config.index_file_resp.clone())
+    }
     async fn put_path_context(
         &self,
         _: Request<nexus_http_api::search_proto::PutPathContextRequest>,
@@ -183,9 +199,21 @@ impl SearchService for MockSearchService {
     }
     async fn notify_file_change(
         &self,
-        _: Request<NotifyFileChangeRequest>,
+        req: Request<NotifyFileChangeRequest>,
     ) -> Result<Response<NotifyFileChangeResponse>, Status> {
-        unreachable!()
+        self.log
+            .notify_file_change
+            .lock()
+            .unwrap()
+            .push(req.into_inner());
+        err_or!(
+            self,
+            NotifyFileChangeResponse {
+                status: "accepted".into(),
+                error: None,
+                index_seq: 13,
+            }
+        )
     }
     async fn locate(&self, _: Request<LocateRequest>) -> Result<Response<LocateResponse>, Status> {
         unreachable!()
@@ -535,11 +563,173 @@ async fn batch_parked_paths_survive_round_trip() {
         .send()
         .await
         .expect("send");
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
     let parsed: serde_json::Value = resp.json().await.expect("parse json");
     let parked = parsed["parked_paths"].as_array().expect("parked array");
     assert_eq!(parked.len(), 2);
     assert_eq!(parked[0], "/notes/a.md");
     assert_eq!(parked[1], "/notes/c.md");
+    assert_eq!(parsed["indexed_count"], 2);
+    assert_eq!(parsed["index_seq"], 12);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_index_and_bodyless_eviction_preserve_path_credential_and_receipt() {
+    let h = Harness::start(MockConfig::default()).await;
+    let client = reqwest::Client::new();
+    let url = format!("{}/v2/documents/file", h.http_base);
+    let path = "/notes/space & quote\" 虹.md";
+    let response = client
+        .post(&url)
+        .bearer_auth("original-caller")
+        .json(&serde_json::json!({"path": path}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["status"], "indexed");
+    assert_eq!(body["index_seq"], 12);
+    assert_eq!(body["zone_id"], "root");
+    let response = client
+        .delete(&url)
+        .bearer_auth("original-caller")
+        .query(&[("path", path)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["status"], "deleted");
+    assert_eq!(body["index_seq"], 13);
+    assert_eq!(body["zone_id"], "root");
+    let indexed = h.log.index_file.lock().unwrap();
+    assert_eq!(indexed.len(), 1);
+    assert_eq!(indexed[0].path, path);
+    assert_eq!(indexed[0].zone_id, "root");
+    assert_eq!(indexed[0].auth_token, "original-caller");
+    let deleted = h.log.notify_file_change.lock().unwrap();
+    assert_eq!(deleted.len(), 1);
+    assert_eq!(deleted[0].path, path);
+    assert_eq!(deleted[0].change_type, "delete");
+    assert_eq!(deleted[0].zone_id, "root");
+    assert_eq!(deleted[0].auth_token, "original-caller");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_skips_preserve_reason_and_actual_commit_receipt() {
+    for (reason, index_seq) in [("non_text", 0), ("empty", 19)] {
+        let h = Harness::start(MockConfig {
+            index_file_resp: nexus_http_api::search_proto::IndexFileResponse {
+                status: "skipped".into(),
+                reason: Some(reason.into()),
+                index_seq,
+                zone_id: "root".into(),
+            },
+            ..MockConfig::default()
+        })
+        .await;
+        let response = reqwest::Client::new()
+            .post(format!("{}/v2/documents/file", h.http_base))
+            .json(&serde_json::json!({"path": "/notes/a.md"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["status"], "skipped");
+        assert_eq!(body["reason"], reason);
+        assert_eq!(body["index_seq"], index_seq);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_zone_assertions_are_checked_before_any_rpc() {
+    let h = Harness::start(MockConfig::default()).await;
+    let client = reqwest::Client::new();
+    let url = format!("{}/v2/documents/file", h.http_base);
+    let response = client
+        .post(&url)
+        .json(&serde_json::json!({"path": "/notes/a.md", "zone_id": "other"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let response = client
+        .delete(&url)
+        .query(&[("path", "/notes/a.md"), ("zone_id", "other")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(h.log.index_file.lock().unwrap().is_empty());
+    assert!(h.log.notify_file_change.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_rpc_failures_preserve_http_status_and_retry_after() {
+    for (code, expected) in [
+        (tonic::Code::NotFound, reqwest::StatusCode::NOT_FOUND),
+        (
+            tonic::Code::PermissionDenied,
+            reqwest::StatusCode::FORBIDDEN,
+        ),
+        (
+            tonic::Code::ResourceExhausted,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+        ),
+    ] {
+        let h = Harness::start(MockConfig {
+            rpc_err: Some(code),
+            ..MockConfig::default()
+        })
+        .await;
+        let response = reqwest::Client::new()
+            .post(format!("{}/v2/documents/file", h.http_base))
+            .json(&serde_json::json!({"path": "/notes/a.md"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+        assert_eq!(
+            response
+                .headers()
+                .get("retry-after")
+                .map(|v| v.to_str().unwrap()),
+            (code == tonic::Code::ResourceExhausted).then_some("5")
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mutation_application_errors_and_invalid_file_outcomes_never_report_success() {
+    let mut config = MockConfig::default();
+    config.index_resp.error = Some("storage unavailable".into());
+    config.refresh_resp.error = Some("storage unavailable".into());
+    config.index_documents_resp.error = Some("storage unavailable".into());
+    config.index_file_resp.index_seq = 0;
+    let h = Harness::start(config).await;
+    for (operation, body) in [
+        ("index", serde_json::json!({"root_path": "/notes"})),
+        ("refresh", serde_json::json!({"root_path": "/notes"})),
+        (
+            "batch",
+            serde_json::json!({"documents": [{"path": "/notes/a.md", "text": "gentian"}]}),
+        ),
+        ("file", serde_json::json!({"path": "/notes/a.md"})),
+    ] {
+        let response = reqwest::Client::new()
+            .post(format!("{}/v2/documents/{operation}", h.http_base))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "{operation}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

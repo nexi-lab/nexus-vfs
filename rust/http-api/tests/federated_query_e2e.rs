@@ -69,6 +69,13 @@ struct FanoutMock {
 
 #[tonic::async_trait]
 impl SearchService for FanoutMock {
+    async fn index_file(
+        &self,
+        _: tonic::Request<nexus_http_api::search_proto::IndexFileRequest>,
+    ) -> Result<tonic::Response<nexus_http_api::search_proto::IndexFileResponse>, tonic::Status>
+    {
+        unreachable!()
+    }
     async fn put_path_context(
         &self,
         _: Request<nexus_http_api::search_proto::PutPathContextRequest>,
