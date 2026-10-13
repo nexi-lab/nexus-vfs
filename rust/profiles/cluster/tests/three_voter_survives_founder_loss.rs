@@ -108,6 +108,10 @@ async fn three_voter_zone_survives_founder_loss_via_new_leader() {
         .wait_for_log("Static topology applied", BUDGET)
         .await
         .expect("founder MUST commit its declared mount into root (zone discoverable)");
+    founder
+        .wait_for_log("VFS data plane ready", BUDGET)
+        .await
+        .expect("founder installs its VFS routes before client writes");
 
     let mut j1 = Daemon::spawn(
         &["--bind-addr", &j1bind],
@@ -117,6 +121,9 @@ async fn three_voter_zone_survives_founder_loss_via_new_leader() {
     j1.wait_for_log(&zone_registered, BUDGET)
         .await
         .expect("joiner1 joins sharedzone");
+    j1.wait_for_log("VFS data plane ready", BUDGET)
+        .await
+        .expect("joiner1 applies discovered mounts and has a leader");
 
     let mut j2 = Daemon::spawn(
         &["--bind-addr", &j2bind],
@@ -126,6 +133,9 @@ async fn three_voter_zone_survives_founder_loss_via_new_leader() {
     j2.wait_for_log(&zone_registered, BUDGET)
         .await
         .expect("joiner2 joins sharedzone");
+    j2.wait_for_log("VFS data plane ready", BUDGET)
+        .await
+        .expect("joiner2 applies discovered mounts and has a leader");
 
     // Both joiners register the zone before their all-voter promotion COMMITS on
     // the founder. Writing while a 1→2 or 2→3 AddNode ConfChange is still pending
@@ -146,6 +156,11 @@ async fn three_voter_zone_survives_founder_loss_via_new_leader() {
     fc.write_file(&health, b"3voter-health", "")
         .await
         .expect("founder writes health");
+    assert_eq!(
+        fc.stat_zone(&health, "").await.as_deref(),
+        Some(ZONE),
+        "the health write must use the shared Raft zone"
+    );
     await_replicated(&mut j1c, &health, "", BUDGET).await;
     await_replicated(&mut j2c, &health, "", BUDGET).await;
 
