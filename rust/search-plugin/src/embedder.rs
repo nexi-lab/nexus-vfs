@@ -680,9 +680,13 @@ pub const ORT_DYLIB_ENV: &str = "ORT_DYLIB_PATH";
 /// [`crate::index_manager::default_root`] returns (i.e. the plugin's
 /// per-node state root).
 pub fn resolve_model_dir(data_root: &Path) -> PathBuf {
-    std::env::var(MODEL_DIR_ENV)
+    resolve_model_dir_from_config(data_root, std::env::var(MODEL_DIR_ENV).ok().as_deref())
+}
+
+fn resolve_model_dir_from_config(data_root: &Path, configured: Option<&str>) -> PathBuf {
+    configured
         .map(PathBuf::from)
-        .unwrap_or_else(|_| data_root.join("models"))
+        .unwrap_or_else(|| data_root.join("models"))
 }
 
 /// AnnIndex tag of the built-in local model — single source for
@@ -829,30 +833,18 @@ mod tests {
 
     #[test]
     fn resolve_model_dir_falls_back_to_data_root() {
-        // Guard the env in case the user has NEXUS_SEARCH_MODEL_DIR
-        // set in their shell.
-        let saved = std::env::var(MODEL_DIR_ENV).ok();
-        // SAFETY: this test does not run in parallel with any other
-        // test that reads MODEL_DIR_ENV.
-        unsafe { std::env::remove_var(MODEL_DIR_ENV) };
         let root = PathBuf::from("/opt/nexus-data/plugins/search");
-        let dir = resolve_model_dir(&root);
+        let dir = resolve_model_dir_from_config(&root, None);
         assert_eq!(dir, root.join("models"));
-        if let Some(v) = saved {
-            unsafe { std::env::set_var(MODEL_DIR_ENV, v) };
-        }
     }
 
     #[test]
-    fn resolve_model_dir_honours_env() {
-        let saved = std::env::var(MODEL_DIR_ENV).ok();
-        unsafe { std::env::set_var(MODEL_DIR_ENV, "/mnt/models") };
-        let dir = resolve_model_dir(&PathBuf::from("/opt/nexus-data/plugins/search"));
+    fn resolve_model_dir_honours_configuration() {
+        let dir = resolve_model_dir_from_config(
+            &PathBuf::from("/opt/nexus-data/plugins/search"),
+            Some("/mnt/models"),
+        );
         assert_eq!(dir, PathBuf::from("/mnt/models"));
-        match saved {
-            Some(v) => unsafe { std::env::set_var(MODEL_DIR_ENV, v) },
-            None => unsafe { std::env::remove_var(MODEL_DIR_ENV) },
-        }
     }
 
     #[cfg(not(feature = "semantic"))]

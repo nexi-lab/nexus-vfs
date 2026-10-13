@@ -737,6 +737,8 @@ impl IntoResponse for SearchError {
         if let SearchError::Fence(e) = self {
             return e.into_response();
         }
+        let overloaded =
+            matches!(&self, SearchError::Rpc(s) if s.code() == tonic::Code::ResourceExhausted);
         let (status, message) = match self {
             SearchError::BackendUnavailable(e) => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
             #[cfg(feature = "rebac")]
@@ -746,7 +748,14 @@ impl IntoResponse for SearchError {
             SearchError::Rpc(s) => (grpc_status_to_http(s.code()), s.message().to_string()),
             SearchError::Fence(_) => unreachable!("handled above"),
         };
-        (status, Json(serde_json::json!({ "error": message }))).into_response()
+        let mut response = (status, Json(serde_json::json!({ "error": message }))).into_response();
+        if overloaded {
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("5"),
+            );
+        }
+        response
     }
 }
 

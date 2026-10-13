@@ -655,6 +655,10 @@ impl AnnIndex {
             return Ok(Vec::new());
         }
         let ids: Vec<usize> = prefixes.iter().flat_map(|p| self.ids_under(p)).collect();
+        Ok(self.exact_search_ids(query, ids, k))
+    }
+
+    fn exact_search_ids(&self, query: &[f32], ids: Vec<usize>, k: usize) -> Vec<AnnHit> {
         let dist = DistCosine {};
         let mut scored: Vec<(f32, usize)> = Vec::with_capacity(ids.len());
         {
@@ -677,7 +681,7 @@ impl AnnIndex {
         scored.sort_by(|a, b| a.0.total_cmp(&b.0));
         scored.truncate(k);
         let id_map = self.id_to_chunk.read();
-        Ok(scored
+        scored
             .into_iter()
             .filter_map(|(distance, id)| {
                 id_map.get(&id).map(|(path, chunk_index)| AnnHit {
@@ -686,7 +690,7 @@ impl AnnIndex {
                     distance,
                 })
             })
-            .collect())
+            .collect()
     }
 
     /// Nearest-`k` search.  Returns hits sorted by cosine distance
@@ -722,6 +726,22 @@ impl AnnIndex {
             return Ok(Vec::new());
         }
 
+        let (exhaustive_ids, shadow_count) = {
+            let sidecar = self.sidecar.read();
+            (
+                (k >= sidecar.entries.len())
+                    .then(|| sidecar.entries.iter().map(|entry| entry.id).collect()),
+                sidecar.shadowed.len(),
+            )
+        };
+        // A request covering the entire live corpus needs every vector.
+        // HNSW can leave nodes unreachable even at exhaustive ef; scoring the
+        // live vectors directly guarantees completeness. Snapshot the IDs while
+        // checking the count so concurrent inserts cannot expand the scan past k.
+        if let Some(ids) = exhaustive_ids {
+            return Ok(self.exact_search_ids(query, ids, k));
+        }
+
         // Over-fetch so the shadow filter can drop stale hits and
         // still return `k` live results in the typical case (few
         // shadows).
@@ -734,7 +754,7 @@ impl AnnIndex {
         // came back full but the filter starved it, widen; every
         // shadow ahead of a live hit is at most the shadow count, so
         // `k + shadowed` bounds the widening.
-        let ceiling = k.saturating_add(self.sidecar.read().shadowed.len());
+        let ceiling = k.saturating_add(shadow_count);
         loop {
             let effective_ef = std::cmp::max(ef, overfetch);
             let neighbours: Vec<Neighbour> = self.hnsw.search(query, overfetch, effective_ef);
@@ -1466,6 +1486,39 @@ mod tests {
         );
         let hits = idx2.search(&vec_seed(4, 1.0), 3).expect("search");
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn exhaustive_requests_include_unreachable_live_vectors_and_exclude_shadows() {
+        let dir = tempdir().join("ann");
+        let mut idx = AnnIndex::open_or_create(dir, 4).expect("open");
+        let query = vec_seed(4, 5.0);
+        idx.add_vector("/a", 0, &vec_seed(4, 1.0)).unwrap();
+        idx.add_vector("/a", 0, &query).unwrap();
+        idx.add_vector("/b", 0, &vec_seed(4, 9.0)).unwrap();
+        idx.add_vector("/deleted", 0, &query).unwrap();
+        idx.delete_all_chunks("/deleted");
+        assert_eq!(idx.live_count(), 2);
+        // Make graph reachability fail deterministically; its independent live
+        // vector lookup still contains the current vectors, including inserts
+        // awaiting a commit. Random graph construction cannot govern this test.
+        Arc::get_mut(&mut idx).unwrap().hnsw = Hnsw::new(
+            HNSW_M,
+            DEFAULT_CAPACITY,
+            HNSW_MAX_LAYER,
+            HNSW_EF_CONSTRUCTION,
+            DistCosine {},
+        );
+        assert!(idx.hnsw.search(&query, 4, 32).is_empty());
+        for k in [2, 10, usize::MAX] {
+            let hits = idx.search_with_ef(&query, k, 1).unwrap();
+            assert_eq!(
+                hits.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(),
+                ["/a", "/b"]
+            );
+            assert!(hits[0].distance.abs() < 1e-6);
+            assert!(hits[1].distance >= hits[0].distance);
+        }
     }
 
     #[test]

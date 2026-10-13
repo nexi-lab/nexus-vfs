@@ -464,6 +464,10 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if std::thread::panicking() {
+            let logs = self.drain_settled();
+            eprintln!("daemon {} logs at test failure:\n{logs}", self.pid());
+        }
     }
 }
 
