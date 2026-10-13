@@ -95,7 +95,7 @@ pub struct GlobResponse {
     pub applied_filters: u32,
 }
 
-fn discovery_zone(
+pub(super) fn path_zone(
     state: &AppState,
     ctx: &OperationContext,
     root: &str,
@@ -106,7 +106,7 @@ fn discovery_zone(
     effective_zone(ctx, &zone)?;
     if !requested.trim().is_empty() && requested.trim() != zone {
         return Err(SearchError::BadRequest(
-            "zone_id does not match the zone owning root_path".into(),
+            "zone_id does not match the zone owning the path".into(),
         ));
     }
     Ok(zone)
@@ -142,7 +142,7 @@ async fn glob_with_params(
     params: GlobQuery,
 ) -> Result<Response, SearchError> {
     let root_path = params.root_path;
-    let zone = discovery_zone(&state, &ctx, &root_path, &params.zone_id)?;
+    let zone = path_zone(&state, &ctx, &root_path, &params.zone_id)?;
     // #4737: wait for the fenced revision to be applied on this node
     // BEFORE running the glob, so a caller who just wrote /ws/a.md
     // and passes X-Nexus-Min-Revision sees the row in the walk.
@@ -299,7 +299,7 @@ async fn grep_with_params(
     params: GrepQuery,
 ) -> Result<Response, SearchError> {
     let root_path = params.root_path;
-    let zone = discovery_zone(&state, &ctx, &root_path, &params.zone_id)?;
+    let zone = path_zone(&state, &ctx, &root_path, &params.zone_id)?;
     // #4737: fence BEFORE the walk so a fresh write is visible in matches.
     let observed = fence
         .enforce(std::sync::Arc::clone(&state.kernel), &zone)

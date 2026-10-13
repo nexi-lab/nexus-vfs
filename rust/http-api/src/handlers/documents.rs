@@ -1,11 +1,8 @@
 //! `/v2/documents/*` — HTTP shims over the upstream
 //! `nexus.search.v1.SearchService` write / meta RPCs.
 //!
-//! Sibling of [`crate::handlers::search`] (which owns the read RPCs
-//! — glob / grep / query).  The split follows the Python
-//! `nexus-server` two-router shape (search=read, documents=
-//! write+meta) so callers migrating from FastAPI keep their URL
-//! namespaces intact.
+//! [`crate::handlers::search`] owns discovery and query RPCs;
+//! this module owns index mutations and diagnostics.
 //!
 //! Every handler here reuses [`crate::handlers::search::SearchError`]
 //! (same wire mapping table — `Unimplemented → 501`,
@@ -24,12 +21,18 @@
 //! * `POST /v2/documents/batch`   — explicit upsert of a list of
 //!   documents (`{path, text, mtime_ms?, zone_id?}`).  Maps to
 //!   `SearchService::IndexDocuments`.
+//! * `POST /v2/documents/file` — read and index one VFS file.
+//!   Maps to `SearchService::IndexFile`.
+//! * `DELETE /v2/documents/file` — evict one file's index entries.
+//!   Maps to `SearchService::NotifyFileChange(delete)`.
 //! * `GET  /v2/documents/stats`   — index diagnostics
 //!   (fts_doc_count / fts_path_count / ann_chunk_count / etc.).
 //!   Maps to `SearchService::Stats`.
 
 use crate::middleware::auth::BearerToken;
 use axum::extract::{Query, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use contracts::operation_context::OperationContext;
@@ -37,11 +40,120 @@ use serde::{Deserialize, Serialize};
 
 use crate::handlers::search::SearchError;
 use crate::search_proto::{
-    DocumentInput as ProtoDocumentInput, IndexDocumentsRequest, IndexRequest, RefreshRequest,
-    StatsRequest,
+    DocumentInput as ProtoDocumentInput, IndexDocumentsRequest, IndexFileRequest, IndexRequest,
+    NotifyFileChangeRequest, RefreshRequest, StatsRequest,
 };
 use crate::zone::{effective_zone, is_privileged, ZoneError};
 use crate::AppState;
+
+fn require_success(error: &Option<String>) -> Result<(), SearchError> {
+    match error {
+        Some(error) => Err(SearchError::Rpc(tonic::Status::internal(error.clone()))),
+        None => Ok(()),
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileBody {
+    pub path: String,
+    #[serde(default)]
+    pub zone_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileResponseBody {
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub index_seq: u64,
+    pub zone_id: String,
+}
+
+/// Read and synchronously index one file in its owning VFS zone.
+pub async fn index_file(
+    State(state): State<AppState>,
+    Extension(token): Extension<BearerToken>,
+    Extension(ctx): Extension<OperationContext>,
+    fence: crate::middleware::revision::RevisionFence,
+    Json(body): Json<FileBody>,
+) -> Result<Response, SearchError> {
+    let zone = crate::handlers::search::path_zone(&state, &ctx, &body.path, &body.zone_id)?;
+    let observed = fence
+        .enforce(std::sync::Arc::clone(&state.kernel), &zone)
+        .await
+        .map_err(SearchError::Fence)?;
+    let resp = state
+        .search
+        .client()
+        .await?
+        .index_file(tonic::Request::new(IndexFileRequest {
+            path: body.path,
+            zone_id: zone,
+            auth_token: token.0.to_string(),
+        }))
+        .await
+        .map_err(SearchError::Rpc)?
+        .into_inner();
+    let status = match resp.status.as_str() {
+        "indexed" if resp.index_seq > 0 && resp.reason.is_none() => StatusCode::OK,
+        "skipped" if resp.reason.is_some() => StatusCode::CONFLICT,
+        _ => {
+            return Err(SearchError::Rpc(tonic::Status::internal(
+                "file indexing returned an invalid outcome",
+            )));
+        }
+    };
+    let mut response = (
+        status,
+        Json(FileResponseBody {
+            status: resp.status,
+            reason: resp.reason,
+            index_seq: resp.index_seq,
+            zone_id: resp.zone_id,
+        }),
+    )
+        .into_response();
+    if let Some(revision) = observed {
+        crate::middleware::revision::stamp_revision(&mut response, &revision);
+    }
+    Ok(response)
+}
+
+/// Evict one file's index facts without deleting the VFS file.
+pub async fn delete_file(
+    State(state): State<AppState>,
+    Extension(token): Extension<BearerToken>,
+    Extension(ctx): Extension<OperationContext>,
+    Query(params): Query<FileBody>,
+) -> Result<Json<FileResponseBody>, SearchError> {
+    let zone = crate::handlers::search::path_zone(&state, &ctx, &params.path, &params.zone_id)?;
+    let resp = state
+        .search
+        .client()
+        .await?
+        .notify_file_change(tonic::Request::new(NotifyFileChangeRequest {
+            path: params.path,
+            change_type: "delete".into(),
+            zone_id: zone.clone(),
+            auth_token: token.0.to_string(),
+        }))
+        .await
+        .map_err(SearchError::Rpc)?
+        .into_inner();
+    require_success(&resp.error)?;
+    if resp.status != "accepted" || resp.index_seq == 0 {
+        return Err(SearchError::Rpc(tonic::Status::internal(
+            "file eviction did not commit",
+        )));
+    }
+    Ok(Json(FileResponseBody {
+        status: "deleted".into(),
+        reason: None,
+        index_seq: resp.index_seq,
+        zone_id: zone,
+    }))
+}
 
 // ── shared field-shape helpers ───────────────────────────────────
 
@@ -78,7 +190,7 @@ pub struct IndexBody {
 }
 
 /// Response body of [`index`].  Mirrors proto `IndexResponse`; the
-/// optional error rides through per the sibling-handler convention.
+/// application errors become HTTP 500.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IndexResponseBody {
     pub indexed_count: u32,
@@ -109,6 +221,7 @@ pub async fn index(
         .await
         .map_err(SearchError::Rpc)?
         .into_inner();
+    require_success(&resp.error)?;
     Ok(Json(IndexResponseBody {
         indexed_count: resp.indexed_count,
         skipped_count: resp.skipped_count,
@@ -171,6 +284,7 @@ pub async fn refresh(
         .await
         .map_err(SearchError::Rpc)?
         .into_inner();
+    require_success(&resp.error)?;
     Ok(Json(RefreshResponseBody {
         reindexed_count: resp.reindexed_count,
         removed_count: resp.removed_count,
@@ -240,7 +354,7 @@ pub async fn batch(
     Extension(token): Extension<BearerToken>,
     Extension(ctx): Extension<OperationContext>,
     Json(body): Json<BatchBody>,
-) -> Result<Json<BatchResponseBody>, SearchError> {
+) -> Result<Response, SearchError> {
     let zone_id = effective_zone(&ctx, &body.zone_id)?;
     // #4740: a non-privileged caller indexes into its own zone only —
     // a per-document override naming another zone is refused, never
@@ -279,14 +393,24 @@ pub async fn batch(
         .await
         .map_err(SearchError::Rpc)?
         .into_inner();
-    Ok(Json(BatchResponseBody {
-        indexed_count: resp.indexed_count,
-        skipped_count: resp.skipped_count,
-        parked_paths: resp.parked_paths,
-        index_seq: resp.index_seq,
-        skipped_paths: resp.skipped_paths,
-        error: resp.error,
-    }))
+    require_success(&resp.error)?;
+    let status = if resp.parked_paths.is_empty() {
+        StatusCode::OK
+    } else {
+        StatusCode::CONFLICT
+    };
+    Ok((
+        status,
+        Json(BatchResponseBody {
+            indexed_count: resp.indexed_count,
+            skipped_count: resp.skipped_count,
+            parked_paths: resp.parked_paths,
+            index_seq: resp.index_seq,
+            skipped_paths: resp.skipped_paths,
+            error: resp.error,
+        }),
+    )
+        .into_response())
 }
 
 // ── /v2/documents/stats ──────────────────────────────────────────
@@ -376,5 +500,6 @@ pub fn router() -> Router<AppState> {
         .route("/v2/documents/index", post(index))
         .route("/v2/documents/refresh", post(refresh))
         .route("/v2/documents/batch", post(batch))
+        .route("/v2/documents/file", post(index_file).delete(delete_file))
         .route("/v2/documents/stats", get(stats))
 }

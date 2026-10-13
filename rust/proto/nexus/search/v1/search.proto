@@ -74,6 +74,12 @@ service SearchService {
   // `SearchDaemon.index_documents`).
   rpc IndexDocuments(IndexDocumentsRequest) returns (IndexDocumentsResponse);
 
+  // Read one canonical VFS file and synchronously upsert its current text.
+  // The host requires management authority and resolves the owning zone.
+  // Missing paths fail with NOT_FOUND. Binary content is skipped without a
+  // mutation; empty text removes prior chunks and returns its commit sequence.
+  rpc IndexFile(IndexFileRequest) returns (IndexFileResponse);
+
   // Per-file change notification.  Distinct from `Refresh(root)`:
   // this is a single-file event, so an on-write hook (once
   // federation adds one) or a Python caller with the exact path
@@ -660,6 +666,22 @@ message IndexDocumentsResponse {
   // batch caller report per-document outcome instead of a bare
   // aggregate.
   repeated string skipped_paths = 6;
+}
+
+message IndexFileRequest {
+  string path = 1;
+  // Optional assertion of the VFS path's owning zone.
+  string zone_id = 2;
+  string auth_token = 3;
+}
+message IndexFileResponse {
+  // "indexed" or "skipped". No queued outcome.
+  string status = 1;
+  // "non_text", "empty", or "no_indexed_chunks" when skipped.
+  optional string reason = 2;
+  // Assigned after the index commit; 0 when no mutation occurred.
+  uint64 index_seq = 3;
+  string zone_id = 4;
 }
 
 message NotifyFileChangeRequest {

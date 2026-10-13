@@ -283,24 +283,26 @@ unsafe extern "C" fn kernel_cb_sys_stat(
     };
     match kernel.sys_stat(path, contracts::ROOT_ZONE_ID) {
         Some(result) => {
-            // StatResult fields plugins typically need, serialized as JSON.
-            // `modified_at_ms` (Unix ms, nullable) added so plugins that want
-            // freshness-aware behavior (recency sort in search, cache TTL in
-            // driver plugins, …) don't have to open a side channel — it's
-            // been present on `StatResult` since the kernel introduced the
-            // Tier-2 metadata bag; this callback just now exposes it too.
-            // Additive-only: existing consumers ignore the new field.
-            let json = format!(
-                r#"{{"path":"{}","entry_type":{},"size":{},"zone_id":"{}","modified_at_ms":{}}}"#,
-                result.path,
-                result.entry_type,
-                result.size,
-                result.zone_id.as_deref().unwrap_or("root"),
-                result
-                    .modified_at_ms
-                    .map_or_else(|| "null".to_string(), |ms| ms.to_string()),
-            );
-            yield_host_buf(json.into_bytes(), out_json, out_len);
+            #[derive(serde::Serialize)]
+            struct Reply<'a> {
+                path: &'a str,
+                entry_type: u8,
+                size: u64,
+                zone_id: &'a str,
+                modified_at_ms: Option<i64>,
+            }
+            let reply = Reply {
+                path: &result.path,
+                entry_type: result.entry_type,
+                size: result.size,
+                zone_id: result.zone_id.as_deref().unwrap_or(contracts::ROOT_ZONE_ID),
+                modified_at_ms: result.modified_at_ms,
+            };
+            let json = match serde_json::to_vec(&reply) {
+                Ok(json) => json,
+                Err(_) => return -3,
+            };
+            yield_host_buf(json, out_json, out_len);
             0
         }
         None => -1, // NotFound

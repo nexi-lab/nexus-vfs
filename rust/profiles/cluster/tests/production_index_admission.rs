@@ -4,7 +4,8 @@ mod common;
 
 use axum::{extract::State, routing::post, Json, Router};
 use nexus_search_plugin::search_proto::{
-    DocumentInput, IndexDocumentsRequest, IndexRequest, RefreshRequest,
+    DocumentInput, IndexDocumentsRequest, IndexFileRequest, IndexRequest, NotifyFileChangeRequest,
+    RefreshRequest,
 };
 use reqwest::{Client, StatusCode};
 use serde_json::{json, Value};
@@ -150,22 +151,27 @@ async fn overload_and_cancellation_preserve_authority_capacity_and_committed_fac
         vfs.write_file(path, b"gentian", "").await.unwrap();
     }
     let batch_url = format!("{base}/v2/documents/batch");
+    let file_url = format!("{base}/v2/documents/file");
     let stats_url = format!("{base}/v2/documents/stats");
     let initial = ok(client
         .get(&stats_url)
         .bearer_auth(admin)
         .query(&[("zone_id", "sharedzone")]))
     .await;
-    let submitted = client.post(&batch_url).bearer_auth(admin)
-        .json(&json!({"zone_id":"sharedzone", "documents":[{"path":"/docs/accepted.md", "text":"gentian"}]}));
+    // The administrator has no tenant zone; the actual /docs mount owns the
+    // input and the host must select sharedzone from that VFS route.
+    let submitted = client
+        .post(&file_url)
+        .bearer_auth(admin)
+        .json(&json!({"path":"/docs/accepted.md"}));
     let mut pending = tokio::spawn(async move { submitted.send().await });
     tokio::select! {
         entered = tokio::time::timeout(Duration::from_secs(30), provider.entered.notified()) => {
-            assert!(entered.is_ok(), "accepted batch never reached the embedding provider");
+            assert!(entered.is_ok(), "accepted file never reached the embedding provider");
         }
         result = &mut pending => {
             let response = result.unwrap().unwrap();
-            panic!("batch returned before embedding: {} {}\n{}", response.status(), response.text().await.unwrap(), daemon.drain());
+            panic!("file indexing returned before embedding: {} {}\n{}", response.status(), response.text().await.unwrap(), daemon.drain());
         }
     }
     pending.abort();
@@ -184,6 +190,7 @@ async fn overload_and_cancellation_preserve_authority_capacity_and_committed_fac
             &format!("{base}/v2/documents/refresh"),
             json!({"zone_id":"sharedzone", "root_path":"/docs"}),
         ),
+        (&file_url, json!({"path":"/docs/rejected.md"})),
     ] {
         let denied = client
             .post(url)
@@ -208,6 +215,70 @@ async fn overload_and_cancellation_preserve_authority_capacity_and_committed_fac
             .unwrap()
             .contains("backlog"));
     }
+    for credential in [reader, admin] {
+        let response = client
+            .delete(&file_url)
+            .bearer_auth(credential)
+            .query(&[("path", "/docs/accepted.md")])
+            .send()
+            .await
+            .unwrap();
+        if credential == reader {
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert!(response.headers().get("retry-after").is_none());
+        } else {
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(response.headers()["retry-after"], "5");
+        }
+    }
+    assert_eq!(
+        rpc.index_file(IndexFileRequest {
+            path: "/docs/rejected.md".into(),
+            auth_token: reader.into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err()
+        .code(),
+        tonic::Code::PermissionDenied
+    );
+    assert_eq!(
+        rpc.index_file(IndexFileRequest {
+            path: "/docs/rejected.md".into(),
+            auth_token: admin.into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err()
+        .code(),
+        tonic::Code::ResourceExhausted
+    );
+    assert_eq!(
+        rpc.notify_file_change(NotifyFileChangeRequest {
+            path: "/docs/accepted.md".into(),
+            change_type: "delete".into(),
+            zone_id: "sharedzone".into(),
+            auth_token: admin.into(),
+        })
+        .await
+        .unwrap_err()
+        .code(),
+        tonic::Code::ResourceExhausted
+    );
+    let notification = rpc
+        .notify_file_change(NotifyFileChangeRequest {
+            path: "/docs/accepted.md".into(),
+            change_type: "update".into(),
+            zone_id: "sharedzone".into(),
+            auth_token: admin.into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        (notification.status.as_str(), notification.index_seq),
+        ("skipped", 0)
+    );
     assert_eq!(
         rpc.index_documents(batch("/docs/rejected.md", reader))
             .await
@@ -318,7 +389,7 @@ async fn overload_and_cancellation_preserve_authority_capacity_and_committed_fac
     );
     // A fresh service also initializes the remote client safely when its first
     // embedding operation is a query. Both durable indexes must serve the
-    // cancelled-but-committed batch and exclude every rejected document.
+    // cancelled-but-committed file and exclude every rejected document.
     for query_type in ["semantic", "keyword"] {
         let results = ok(client
             .post(format!("{base}/v2/search/query"))
@@ -342,5 +413,121 @@ async fn overload_and_cancellation_preserve_authority_capacity_and_committed_fac
     let after_restart = ok(client.post(&batch_url).bearer_auth(admin)
         .json(&json!({"zone_id":"sharedzone", "documents":[{"path":"/docs/recovered.md", "text":"gentian"}]}))).await;
     assert_eq!(after_restart["index_seq"], 3);
+    let mut rpc = common::search_plugin::mtls_client(port, &ca, &cert, &key).await;
+    let mut vfs = common::Vfs::connect_mtls(port, &ca, &cert, &key, BUDGET).await;
+    assert_eq!(
+        rpc.index_file(IndexFileRequest {
+            path: "/docs/accepted.md".into(),
+            zone_id: "root".into(),
+            auth_token: admin.into(),
+        })
+        .await
+        .unwrap_err()
+        .code(),
+        tonic::Code::InvalidArgument
+    );
+    let file = rpc
+        .index_file(IndexFileRequest {
+            path: "/docs/accepted.md".into(),
+            auth_token: admin.into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        (file.status.as_str(), file.index_seq, file.zone_id.as_str()),
+        ("indexed", 4, "sharedzone")
+    );
+    let deleted = ok(client
+        .delete(&file_url)
+        .bearer_auth(admin)
+        .query(&[("path", "/docs/accepted.md")]))
+    .await;
+    assert_eq!(deleted["status"], "deleted");
+    assert_eq!(deleted["index_seq"], 5);
+    let located = ok(client
+        .post(format!("{base}/v2/search/locate"))
+        .bearer_auth(admin)
+        .json(&json!({"path":"/docs/accepted.md", "zone_id":"sharedzone"})))
+    .await;
+    assert_eq!(located["indexed"], false);
+    let restored = ok(client
+        .post(&file_url)
+        .bearer_auth(admin)
+        .json(&json!({"path":"/docs/accepted.md"})))
+    .await;
+    assert_eq!(restored["index_seq"], 6);
+    let missing = client
+        .post(&file_url)
+        .bearer_auth(admin)
+        .json(&json!({"path":"/docs/missing.md"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    vfs.write_file("/docs/binary.md", &[0xff, 0xfe], "")
+        .await
+        .unwrap();
+    let binary = client
+        .post(&file_url)
+        .bearer_auth(admin)
+        .json(&json!({"path":"/docs/binary.md"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(binary.status(), StatusCode::CONFLICT);
+    let binary: Value = binary.json().await.unwrap();
+    assert_eq!(binary["reason"], "non_text");
+    assert_eq!(binary["index_seq"], 0);
+    vfs.write_file("/docs/accepted.md", b" \n\t", "")
+        .await
+        .unwrap();
+    let empty = client
+        .post(&file_url)
+        .bearer_auth(admin)
+        .json(&json!({"path":"/docs/accepted.md"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(empty.status(), StatusCode::CONFLICT);
+    let empty: Value = empty.json().await.unwrap();
+    assert_eq!(empty["reason"], "empty");
+    assert_eq!(empty["index_seq"], 7);
+    let located = ok(client
+        .post(format!("{base}/v2/search/locate"))
+        .bearer_auth(admin)
+        .json(&json!({"path":"/docs/accepted.md", "zone_id":"sharedzone"})))
+    .await;
+    assert_eq!(located["indexed"], false);
+    let escaped = if cfg!(windows) {
+        "/docs/space & 虹.md"
+    } else {
+        "/docs/space & quote\" 虹.md"
+    };
+    vfs.write_file(escaped, b"gentian escaped path", "")
+        .await
+        .unwrap();
+    let indexed = ok(client
+        .post(&file_url)
+        .bearer_auth(admin)
+        .json(&json!({"path":escaped})))
+    .await;
+    assert_eq!(indexed["index_seq"], 8);
+    assert_eq!(indexed["zone_id"], "sharedzone");
+    let stats = ok(client
+        .get(&stats_url)
+        .bearer_auth(admin)
+        .query(&[("zone_id", "sharedzone")]))
+    .await;
+    assert_eq!(stats["last_index_seq"], 8);
+    assert_eq!(stats["indexing_in_progress"], 0);
+    assert_eq!(stats["pending"], 0);
+    let located = ok(client
+        .post(format!("{base}/v2/search/locate"))
+        .bearer_auth(admin)
+        .json(&json!({"path":escaped, "zone_id":"sharedzone"})))
+    .await;
+    assert_eq!(located["indexed"], true);
     provider_task.abort();
 }

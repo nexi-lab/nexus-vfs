@@ -43,15 +43,15 @@ use crate::search_proto::{
     AddIndexedDirectoryRequest, AddIndexedDirectoryResponse, BatchQueryRequest, BatchQueryResponse,
     DeletePathContextRequest, DeletePathContextResponse, DiscoveryFilter, FusionMethod,
     GlobRequest, GlobResponse, GrepRequest, GrepResponse, HealthRequest, HealthResponse,
-    IndexDocumentsRequest, IndexDocumentsResponse, IndexRequest, IndexResponse,
-    ListIndexedDirectoriesRequest, ListIndexedDirectoriesResponse, ListPathContextsRequest,
-    ListPathContextsResponse, ListZoneIndexingModesRequest, ListZoneIndexingModesResponse,
-    LocateRequest, LocateResponse, NotifyFileChangeRequest, NotifyFileChangeResponse,
-    ParkedDiscardRequest, ParkedDiscardResponse, ParkedListRequest, ParkedListResponse,
-    ParkedRetryRequest, ParkedRetryResponse, PathContext, PutPathContextRequest, QueryRequest,
-    QueryResponse, QueryResult, QueryType, RefreshRequest, RefreshResponse,
-    RemoveIndexedDirectoryRequest, RemoveIndexedDirectoryResponse, SetZoneIndexingModeRequest,
-    SetZoneIndexingModeResponse, StatsRequest, StatsResponse,
+    IndexDocumentsRequest, IndexDocumentsResponse, IndexFileRequest, IndexFileResponse,
+    IndexRequest, IndexResponse, ListIndexedDirectoriesRequest, ListIndexedDirectoriesResponse,
+    ListPathContextsRequest, ListPathContextsResponse, ListZoneIndexingModesRequest,
+    ListZoneIndexingModesResponse, LocateRequest, LocateResponse, NotifyFileChangeRequest,
+    NotifyFileChangeResponse, ParkedDiscardRequest, ParkedDiscardResponse, ParkedListRequest,
+    ParkedListResponse, ParkedRetryRequest, ParkedRetryResponse, PathContext,
+    PutPathContextRequest, QueryRequest, QueryResponse, QueryResult, QueryType, RefreshRequest,
+    RefreshResponse, RemoveIndexedDirectoryRequest, RemoveIndexedDirectoryResponse,
+    SetZoneIndexingModeRequest, SetZoneIndexingModeResponse, StatsRequest, StatsResponse,
 };
 
 /// Server-side default when the caller sends `max_results = 0`.
@@ -765,7 +765,7 @@ pub struct SearchServiceBuilder {
 }
 
 impl SearchServiceBuilder {
-    /// Maximum simultaneous Index, Refresh and IndexDocuments operations.
+    /// Maximum simultaneous index mutations, including file eviction.
     /// Zero disables the cap. Unset reads NEXUS_SEARCH_INDEX_MAX_INFLIGHT
     /// once when building the service (default 8).
     pub fn index_max_inflight(mut self, limit: u32) -> Self {
@@ -2801,6 +2801,55 @@ struct IndexDocumentsOutcome {
     skipped_paths: Vec<String>,
 }
 
+/// Shared resources for explicit text batches and VFS file upserts.
+struct DocumentIndexing {
+    manager: Arc<IndexManager>,
+    embedder: Option<Arc<dyn Embedder>>,
+    embed_broken: bool,
+    context_generator: Option<SharedContextGenerator>,
+    cache: crate::query_cache::SharedQueryCache,
+    index_seq: Arc<crate::index_seq::IndexSeq>,
+    embed_gate: Arc<crate::ann_flush::EmbedGate>,
+    ann_flush: Arc<crate::ann_flush::AnnFlushCoordinator>,
+}
+
+impl SearchServiceImpl {
+    async fn prepare_document_indexing(&self) -> Result<DocumentIndexing, Status> {
+        let (embedder, embed_broken) = self.indexing_embedder().await;
+        Ok(DocumentIndexing {
+            manager: Arc::clone(&self.manager),
+            embedder,
+            embed_broken,
+            context_generator: self.get_or_init_context_generator().await?,
+            cache: Arc::clone(&self.query_cache),
+            index_seq: Arc::clone(&self.index_seq),
+            embed_gate: Arc::clone(&self.embed_gate),
+            ann_flush: Arc::clone(&self.ann_flush),
+        })
+    }
+}
+
+impl DocumentIndexing {
+    fn run(
+        &self,
+        zone: &str,
+        documents: Vec<crate::search_proto::DocumentInput>,
+    ) -> Result<(IndexDocumentsOutcome, u64), String> {
+        do_index_documents(
+            &self.manager,
+            self.embedder.as_ref(),
+            self.embed_broken,
+            self.context_generator.as_deref(),
+            zone,
+            documents,
+            &self.cache,
+            &self.embed_gate,
+            &self.ann_flush,
+        )
+        .map(|outcome| (outcome, self.index_seq.advance().seq))
+    }
+}
+
 /// One document of an `IndexDocuments` batch as it moves through the
 /// three phases of [`do_index_documents`] (#4777).
 struct BatchDoc {
@@ -4477,6 +4526,9 @@ impl SearchService for SearchServiceImpl {
     ) -> Result<Response<IndexDocumentsResponse>, Status> {
         let req = request.into_inner();
         let default_zone = checked_index_zone(&req.zone_id)?.to_string();
+        if req.documents.is_empty() {
+            return Err(Status::invalid_argument("documents must not be empty"));
+        }
         for doc in &req.documents {
             if !doc.zone_id.is_empty() {
                 checked_index_zone(&doc.zone_id)?;
@@ -4485,31 +4537,11 @@ impl SearchService for SearchServiceImpl {
         let indexing = self.index_admission.admit()?;
         // `pending` covers accepted work, including after RPC cancellation.
         let pending = PendingDocsGuard::enter(&self.pending_docs, req.documents.len() as u32);
-        let manager = Arc::clone(&self.manager);
-        let (embedder, embed_broken) = self.indexing_embedder().await;
-        let context_generator = self.get_or_init_context_generator().await?;
-        let cache = Arc::clone(&self.query_cache);
-        let index_seq = Arc::clone(&self.index_seq);
-        let embed_gate = Arc::clone(&self.embed_gate);
-        let ann_flush = Arc::clone(&self.ann_flush);
+        let work = self.prepare_document_indexing().await?;
         let outcome = tokio::task::spawn_blocking(move || {
             let _indexing = indexing; // held until the WORK ends, not the RPC
             let _pending = pending;
-            do_index_documents(
-                &manager,
-                embedder.as_ref(),
-                embed_broken,
-                context_generator.as_deref(),
-                &default_zone,
-                req.documents,
-                &cache,
-                &embed_gate,
-                &ann_flush,
-            )
-            // Sequence assigned AFTER the per-zone commits above —
-            // `last_index_seq >= this` on Stats means the batch is
-            // served (#4736).
-            .map(|outcome| (outcome, index_seq.advance().seq))
+            work.run(&default_zone, req.documents)
         })
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking joined error: {e}")))?;
@@ -4534,6 +4566,42 @@ impl SearchService for SearchServiceImpl {
         }
     }
 
+    async fn index_file(
+        &self,
+        request: Request<IndexFileRequest>,
+    ) -> Result<Response<IndexFileResponse>, Status> {
+        let req = request.into_inner();
+        let zone = checked_index_zone(&req.zone_id)?.to_owned();
+        let indexing = self.index_admission.admit()?;
+        let pending = PendingDocsGuard::enter(&self.pending_docs, 1);
+        let handle = Arc::clone(&self.handle);
+        let work = self.prepare_document_indexing().await?;
+        tokio::task::spawn_blocking(move || {
+            let _indexing = indexing;
+            let _pending = pending;
+            let Some(doc) = crate::file_index::read_document(&handle, &req.path, &zone)? else {
+                return Ok(Response::new(IndexFileResponse {
+                    status: "skipped".into(),
+                    reason: Some("non_text".into()),
+                    index_seq: 0,
+                    zone_id: zone,
+                }));
+            };
+            let empty = doc.text.trim().is_empty();
+            let (outcome, seq) = work.run(&zone, vec![doc]).map_err(Status::internal)?;
+            let indexed = outcome.indexed > 0;
+            Ok(Response::new(IndexFileResponse {
+                status: if indexed { "indexed" } else { "skipped" }.into(),
+                reason: (!indexed)
+                    .then(|| if empty { "empty" } else { "no_indexed_chunks" }.into()),
+                index_seq: seq,
+                zone_id: zone,
+            }))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking joined error: {e}")))?
+    }
+
     async fn notify_file_change(
         &self,
         request: Request<NotifyFileChangeRequest>,
@@ -4542,10 +4610,14 @@ impl SearchService for SearchServiceImpl {
         let zone_id = checked_index_zone(&req.zone_id)?.to_string();
         let change = req.change_type.clone();
         let path = req.path.clone();
+        let indexing = matches!(change.as_str(), "delete" | "delete_prefix")
+            .then(|| self.index_admission.admit())
+            .transpose()?;
         let manager = Arc::clone(&self.manager);
         let cache = Arc::clone(&self.query_cache);
         let index_seq = Arc::clone(&self.index_seq);
         let outcome = tokio::task::spawn_blocking(move || {
+            let _indexing = indexing;
             do_notify_file_change(&manager, &zone_id, &path, &change, &cache).map(|status| {
                 // Only a MUTATING outcome advances the sequence — a
                 // "skipped" ack committed nothing (#4736).

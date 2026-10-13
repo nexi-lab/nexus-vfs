@@ -161,6 +161,13 @@ mod tests {
 
     #[tonic::async_trait]
     impl SearchService for RecordingMock {
+        async fn index_file(
+            &self,
+            _: tonic::Request<crate::search_proto::IndexFileRequest>,
+        ) -> Result<tonic::Response<crate::search_proto::IndexFileResponse>, tonic::Status>
+        {
+            unreachable!()
+        }
         async fn put_path_context(
             &self,
             _: Request<crate::search_proto::PutPathContextRequest>,

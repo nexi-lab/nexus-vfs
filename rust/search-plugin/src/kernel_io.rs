@@ -140,8 +140,8 @@ pub fn sys_read(handle: &KernelHandle, path: &str) -> Result<Vec<u8>, KernelIoEr
     }
 }
 
-/// Subset of `StatResult`'s JSON shape that the plugin walker cares
-/// about.  Serde ignores unknown fields (`size`, `zone_id`, `path`,
+/// Subset of `StatResult`'s JSON shape used for indexing.
+/// Serde ignores unknown fields (`size`, `path`,
 /// …) so this stays additive-compatible with any future schema
 /// growth on the kernel side.  `modified_at_ms` is `null`-safe:
 /// older kernels that predate the field return it as `null` and the
@@ -155,6 +155,7 @@ pub struct StatInfo {
     pub modified_at_ms: Option<i64>,
     #[serde(default)]
     pub entry_type: u8,
+    pub zone_id: Option<String>,
 }
 
 /// Wrap `handle.sys_stat(path)`.

@@ -64,18 +64,28 @@ impl SearchGrpcPolicy {
         self.view(ctx, &zone)
     }
 
-    fn admin(
+    fn management_context(
         &self,
         metadata: &MetadataMap,
         peer: Option<&PeerIdentity>,
         token: &str,
-    ) -> Result<Box<dyn AuthorizedPluginCall>, Status> {
+    ) -> Result<OperationContext, Status> {
         let ctx = self.authenticate(metadata, peer, token)?;
         if !privileged(&ctx) {
             return Err(Status::permission_denied(
                 "search index management requires an administrator",
             ));
         }
+        Ok(ctx)
+    }
+
+    fn admin(
+        &self,
+        metadata: &MetadataMap,
+        peer: Option<&PeerIdentity>,
+        token: &str,
+    ) -> Result<Box<dyn AuthorizedPluginCall>, Status> {
+        self.management_context(metadata, peer, token)?;
         Ok(Box::new(AuthenticatedResponse))
     }
 }
@@ -228,6 +238,20 @@ impl PluginGrpcPolicy for SearchGrpcPolicy {
             "Index" => admin!(IndexRequest),
             "Refresh" => admin!(RefreshRequest),
             "IndexDocuments" => admin!(IndexDocumentsRequest),
+            "IndexFile" => {
+                let mut request = decode_request::<IndexFileRequest>(payload)?;
+                let ctx = self.management_context(metadata, peer, &request.auth_token)?;
+                let zone =
+                    search_zone_for_path(&self.kernel.vfs_router_arc(), &ctx, &request.path)?;
+                if !request.zone_id.is_empty() && request.zone_id != zone {
+                    return Err(Status::invalid_argument(
+                        "zone_id does not match the file's owning zone",
+                    ));
+                }
+                request.zone_id = zone;
+                *payload = request.encode_to_vec();
+                return Ok(Box::new(AuthenticatedResponse));
+            }
             "NotifyFileChange" => admin!(NotifyFileChangeRequest),
             "ParkedList" => admin!(ParkedListRequest),
             "ParkedRetry" => admin!(ParkedRetryRequest),
