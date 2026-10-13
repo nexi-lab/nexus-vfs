@@ -2200,18 +2200,16 @@ fn index_one_stream_append(
     let next_chunk_index = prior.as_ref().map(|s| s.next_chunk_index).unwrap_or(0);
 
     let new_len = bytes.len() as u64;
-    if new_len < indexed_byte_len {
-        // Retention-trim recovery: kernel-side dropped the prefix
-        // we already indexed.  Cannot delta-append against a
-        // shorter blob; wipe prior chunks + reset checkpoint, then
-        // fall into a fresh full pass.  Failure to drop chunks is
-        // still SkippedTransient — a partial cleanup would leave
-        // dangling chunks with stale text.
+    if prior.is_none() || new_len < indexed_byte_len {
+        // Inline upserts replace sink facts without a stream checkpoint.
+        // A missing cursor or a trimmed prefix requires a full replacement
+        // before append indexing can safely resume.
         tracing::info!(
             path = %vfs_path,
             new_len,
             prior_indexed = indexed_byte_len,
-            "index-stream: retention-trim detected — dropping prior chunks + re-indexing",
+            checkpoint_missing = prior.is_none(),
+            "index-stream: rebuilding chunks and checkpoint",
         );
         sinks.fts.delete_all_chunks(vfs_path);
         if let Some(ann) = sinks.ann {
