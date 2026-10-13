@@ -62,6 +62,8 @@ mod discovery;
 pub mod embed_cache;
 pub mod embedder;
 mod file_index;
+#[cfg(windows)]
+mod fts_directory;
 pub mod fts_index;
 pub mod fusion;
 pub mod http_client;

@@ -529,5 +529,40 @@ async fn overload_and_cancellation_preserve_authority_capacity_and_committed_fac
         .json(&json!({"path":escaped, "zone_id":"sharedzone"})))
     .await;
     assert_eq!(located["indexed"], true);
+    let stream = "/docs/stream-facts/transcript";
+    vfs.create_stream(stream, "").await.unwrap();
+    let text = "primrose durable stream paragraph.\n\n".repeat(600);
+    vfs.stream_write(stream, text.as_bytes(), "").await.unwrap();
+    let indexed = ok(client
+        .post(&file_url)
+        .bearer_auth(admin)
+        .json(&json!({"path":stream})))
+    .await;
+    assert_eq!(indexed["status"], "indexed");
+    let located = ok(client
+        .post(format!("{base}/v2/search/locate"))
+        .bearer_auth(admin)
+        .json(&json!({"path":stream,"zone_id":"sharedzone"})))
+    .await;
+    let initial_chunks = located["chunk_count"].as_u64().unwrap();
+    assert!(initial_chunks > 1);
+    vfs.stream_write(stream, b"freesia appended tail\n", "")
+        .await
+        .unwrap();
+    let rebuilt = ok(client
+        .post(format!("{base}/v2/documents/index"))
+        .bearer_auth(admin)
+        .json(&json!({"root_path":"/docs/stream-facts","zone_id":"sharedzone"})))
+    .await;
+    assert_eq!(rebuilt["indexed_count"], 1);
+    let located = ok(client
+        .post(format!("{base}/v2/search/locate"))
+        .bearer_auth(admin)
+        .json(&json!({"path":stream,"zone_id":"sharedzone"})))
+    .await;
+    assert!(
+        located["chunk_count"].as_u64().unwrap() <= initial_chunks + 1,
+        "directory indexing duplicated the stream's old chunks: {located}"
+    );
     provider_task.abort();
 }

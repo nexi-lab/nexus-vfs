@@ -213,3 +213,67 @@ async fn storage_failure_is_an_rpc_error_and_releases_the_shared_slot() {
         (0, 0, 0)
     );
 }
+
+#[tokio::test]
+async fn refresh_after_file_upsert_rebuilds_a_trimmed_stream_and_resumes_incremental_append() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut kernel = Box::new(common::MockKernel::new());
+    let original = "gentian archived stream paragraph.\n\n".repeat(600);
+    let path = "/docs/transcript";
+    kernel.add_stream(path, original.as_bytes(), 100);
+    let svc = SearchServiceImpl::builder(Arc::new(common::handle_for(&*kernel)))
+        .manager(Arc::new(IndexManager::with_root(tmp.path().to_owned())))
+        .embedder(Arc::new(MockEmbedder::with_dim(8)))
+        .no_context_generator()
+        .build();
+    let indexed = svc.index_file(request(path)).await.unwrap().into_inner();
+    assert_eq!(indexed.status, "indexed");
+    let before = svc
+        .stats(Request::new(StatsRequest::default()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        before.fts_doc_count > 1,
+        "regression requires multiple old chunks"
+    );
+
+    let retained = b"freesia retained stream tail\n";
+    kernel.remove_path(path);
+    kernel.add_stream(path, retained, 101);
+    let refresh = || {
+        Request::new(RefreshRequest {
+            root_path: "/docs".into(),
+            recursive: true,
+            ..Default::default()
+        })
+    };
+    let rebuilt = svc.refresh(refresh()).await.unwrap().into_inner();
+    assert!(rebuilt.error.is_none(), "{rebuilt:?}");
+    assert!(
+        paths(&svc).await.is_empty(),
+        "trimmed chunks remained searchable"
+    );
+    let state =
+        nexus_search_plugin::index_state::IndexState::open_or_create(tmp.path().join("root"))
+            .unwrap();
+    let checkpoint = state
+        .stream_state(path)
+        .expect("refresh must restore a stream checkpoint");
+    assert_eq!(checkpoint.indexed_byte_len, retained.len() as u64);
+    assert_eq!(checkpoint.next_chunk_index, 1);
+    kernel.append_to_stream(path, b"orchid appended tail\n", 102);
+    let appended = svc.refresh(refresh()).await.unwrap().into_inner();
+    assert!(appended.error.is_none(), "{appended:?}");
+    let stats = svc
+        .stats(Request::new(StatsRequest::default()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        stats.fts_doc_count, 2,
+        "one retained chunk plus one appended chunk"
+    );
+    assert_eq!(stats.ann_chunk_count, 2);
+    assert!(paths(&svc).await.is_empty());
+}
