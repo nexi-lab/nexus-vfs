@@ -180,6 +180,15 @@ checks apply. Server certificate rotation and trusted runtime placement remain
 deployment responsibilities; `maintainSessionCredential` rotates client
 channels and does not install or rotate a TLS server.
 
+`createUserRuntimeCredentialBundle(ownerId, credential)` prepares the manifest
+and PEM bytes accepted by `serve-user`. It validates the signed owner, key and
+runtime capabilities and performs no filesystem I/O. Deliver `bundle.files`
+into the runtime's memory-backed credential directory, then atomically replace
+`bundle.manifestName` with `bundle.manifest`. Renewed credentials use distinct
+generation filenames, so a reader sees one complete cert/key pair. Never put
+these short-lived secrets in a durable volume or Kubernetes Secret. The bundle
+contains public CA trust, not the issuer's signing key.
+
 ## Development
 
 ```bash

@@ -242,6 +242,7 @@ jobs:
         working-directory: clients/node
         env:
           NEXUS_ZONE_API_ENDPOINT: 127.0.0.1:22127
+          NEXUS_USER_RUNTIME_BIN: ${{ github.workspace }}/target/debug/nexusd-cluster
         run: |
           set -euo pipefail
           NEXUS_ZONE_API_TLS_DIR="$RUNNER_TEMP/zone-data/tls" npm run test:zone-api-live

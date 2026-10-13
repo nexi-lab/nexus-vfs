@@ -1,6 +1,6 @@
 {
   "name": "@nexus-ai-fs/vfs-client",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Official Node client for the Nexus VFS gRPC service, generated from this repository's proto",
   "license": "MIT",
   "publishConfig": {
@@ -36,7 +36,7 @@
     "lint": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test \"test/*.test.mjs\"",
     "test:live": "npm run build && node --test test/live.test.mjs",
-    "test:zone-api-live": "npm run build && node --test test/zone-api-live.test.mjs"
+    "test:zone-api-live": "npm run build && node --test test/zone-api-live.test.mjs test/runtime-bundle-live.test.mjs"
   },
   "dependencies": {
     "@grpc/grpc-js": "^1.14.4",

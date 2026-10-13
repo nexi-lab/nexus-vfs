@@ -23,7 +23,7 @@ import grpc from '@grpc/grpc-js'
 import protoLoader from '@grpc/proto-loader'
 import protobuf from 'protobufjs'
 
-import { NexusVfsClient, NexusZoneApiClient, userRuntimeServerName } from '../dist/index.js'
+import { NexusVfsClient, NexusZoneApiClient, userRuntimeServerName, createUserRuntimeCredentialBundle } from '../dist/index.js'
 import {
   CORE_METADATA_PROTO,
   RAFT_COMMANDS_PROTO,
@@ -159,6 +159,21 @@ test(
       } finally { minter.close() }
       const original = await agent.mintUserRuntime(OWNER, { validitySecs: 120 })
       const credential = await agent.renewSessionAgent(original, { validitySecs: 120 })
+      const bundle = createUserRuntimeCredentialBundle(OWNER, credential)
+      const manifest = JSON.parse(bundle.manifest)
+      assert.equal(bundle.manifestName, 'credential.json')
+      assert.equal(manifest.version, 1)
+      assert.equal(manifest.agent, credential.subjectId)
+      assert.equal(manifest.server_name, userRuntimeServerName(OWNER))
+      assert.deepEqual(bundle.files[manifest.ca], credential.caPem)
+      assert.deepEqual(bundle.files[manifest.cert], credential.certPem)
+      assert.ok(bundle.files[manifest.key].equals(credential.keyPem), 'bundle references the matching private key')
+      const previousBundle = createUserRuntimeCredentialBundle(OWNER, original)
+      assert.ok(Object.keys(bundle.files).every(name => !Object.hasOwn(previousBundle.files, name)), 'renewal uses distinct generation files')
+      assert.throws(() => createUserRuntimeCredentialBundle('another-owner', credential), /signed owner/)
+      assert.throws(() => createUserRuntimeCredentialBundle(OWNER, { ...credential, keyPem: original.keyPem }))
+      const ordinary = await agent.mintSessionAgent(OWNER, { validitySecs: 120 })
+      assert.throws(() => createUserRuntimeCredentialBundle(OWNER, ordinary), /signed owner/)
       assert.equal(credential.subjectId, original.subjectId)
       assert.notDeepEqual(credential.keyPem, original.keyPem)
       const cert = new X509Certificate(credential.certPem)
