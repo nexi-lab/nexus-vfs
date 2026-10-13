@@ -33,6 +33,7 @@ use kernel::kernel::OperationContext;
 pub(crate) struct AnthropicBackend {
     pub(crate) backend_name: String,
     pub(crate) base_url: String,
+    pub(crate) openai_base_url: Option<String>,
     pub(crate) api_key: String,
     pub(crate) default_model: String,
     pub(crate) engine: CASEngine,
@@ -63,6 +64,7 @@ impl AnthropicBackend {
         Ok(Self {
             backend_name: name.to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
+            openai_base_url: None,
             api_key: api_key.to_string(),
             default_model: default_model.to_string(),
             engine,
@@ -73,6 +75,29 @@ impl AnthropicBackend {
 
     pub(crate) fn engine(&self) -> &CASEngine {
         &self.engine
+    }
+
+    /// Enable OpenAI HTTP exchanges for a gateway on the same origin.
+    pub(crate) fn with_openai_base_url(mut self, value: Option<&str>) -> std::io::Result<Self> {
+        if let Some(value) = value {
+            let invalid = || {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput,
+                "openai_base_url must be an HTTP gateway URL on the same origin without credentials, query or fragment")
+            };
+            let base = reqwest::Url::parse(&self.base_url).map_err(|_| invalid())?;
+            let target = reqwest::Url::parse(value).map_err(|_| invalid())?;
+            if !matches!(target.scheme(), "http" | "https")
+                || target.origin() != base.origin()
+                || !target.username().is_empty()
+                || target.password().is_some()
+                || target.query().is_some()
+                || target.fragment().is_some()
+            {
+                return Err(invalid());
+            }
+            self.openai_base_url = Some(value.trim_end_matches('/').to_string());
+        }
+        Ok(self)
     }
 }
 
@@ -151,6 +176,51 @@ impl ObjectStore for AnthropicBackend {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn openai_compatibility_keeps_the_mount_origin_and_excludes_url_credentials() {
+        let dir = TempDir::new().unwrap();
+        let runtime = Arc::new(tokio::runtime::Runtime::new().unwrap());
+        for value in [
+            "https://other.example/v1",
+            "http://gateway.example/v1",
+            "https://gateway.example:8443/v1",
+            "https://user:secret@gateway.example/v1",
+            "https://gateway.example/v1?api_key=secret",
+            "https://gateway.example/v1#fragment",
+        ] {
+            let backend = AnthropicBackend::new(
+                "fixture",
+                "https://gateway.example",
+                "fixture-key",
+                "fixture-model",
+                dir.path(),
+                Arc::clone(&runtime),
+            )
+            .unwrap();
+            assert!(
+                backend.with_openai_base_url(Some(value)).is_err(),
+                "invalid gateway route accepted"
+            );
+        }
+        let backend = AnthropicBackend::new(
+            "fixture",
+            "https://gateway.example",
+            "fixture-key",
+            "fixture-model",
+            dir.path(),
+            runtime,
+        )
+        .unwrap();
+        assert_eq!(
+            backend
+                .with_openai_base_url(Some("https://gateway.example/v1/"))
+                .unwrap()
+                .openai_base_url
+                .as_deref(),
+            Some("https://gateway.example/v1")
+        );
+    }
 
     fn test_ctx() -> OperationContext {
         OperationContext::new("test", "root", false, None, false)

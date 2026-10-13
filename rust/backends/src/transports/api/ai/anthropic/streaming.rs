@@ -80,6 +80,7 @@ impl AnthropicBackend {
                 &self.base_url,
                 &self.api_key,
                 true,
+                self.openai_base_url.as_deref(),
                 &self.http,
                 &self.runtime,
                 &self.engine,

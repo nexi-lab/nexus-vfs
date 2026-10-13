@@ -40,6 +40,7 @@ pub(super) fn run(
     base_url: &str,
     api_key: &str,
     anthropic: bool,
+    openai_base_url: Option<&str>,
     http: &reqwest::Client,
     runtime: &tokio::runtime::Runtime,
     engine: &CASEngine,
@@ -52,20 +53,20 @@ pub(super) fn run(
         return Err("unsupported LLM HTTP exchange version".into());
     }
     let path = exchange.nexus_http.path.as_str();
-    let allowed = if anthropic {
-        matches!(path, "v1/messages" | "v1/messages/count_tokens")
-    } else {
-        matches!(path, "chat/completions" | "responses")
+    let (is_anthropic, target_base_url) = match (path, anthropic, openai_base_url) {
+        ("v1/messages" | "v1/messages/count_tokens", true, _) => (true, base_url),
+        ("chat/completions" | "responses", false, _) => (false, base_url),
+        ("chat/completions" | "responses", true, Some(url)) => (false, url),
+        _ => {
+            return Err(format!(
+                "endpoint {path:?} is not supported by this model mount"
+            ))
+        }
     };
-    if !allowed {
-        return Err(format!(
-            "endpoint {path:?} is not supported by this model mount"
-        ));
-    }
     let mut builder = http
-        .post(format!("{}/{path}", base_url.trim_end_matches('/')))
+        .post(format!("{}/{path}", target_base_url.trim_end_matches('/')))
         .header("content-type", "application/json");
-    builder = if anthropic {
+    builder = if is_anthropic {
         builder
             .header("x-api-key", api_key)
             .header("anthropic-version", "2023-06-01")

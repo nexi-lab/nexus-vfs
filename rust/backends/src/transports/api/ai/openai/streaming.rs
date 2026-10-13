@@ -81,6 +81,7 @@ impl OpenAIBackend {
                 &self.base_url,
                 &self.api_key,
                 false,
+                None,
                 &self.http,
                 &self.runtime,
                 &self.engine,

@@ -28,6 +28,9 @@
 //! accept `v1/messages` and `v1/messages/count_tokens`. The mount supplies the
 //! upstream base URL and credential. Only `anthropic-version`, `anthropic-beta`
 //! and `x-request-id` request headers may be forwarded.
+//! An Anthropic mount for a gateway can additionally configure `openai_base_url`
+//! on the same HTTP origin, allowing Chat Completions and Responses with the
+//! same mount-owned credential. The caller still selects only an endpoint.
 //!
 //! The reply starts with JSON `{"type":"response","version":1,"status":200,
 //! "headers":{...}}`. Each body record is one zero byte followed by unchanged

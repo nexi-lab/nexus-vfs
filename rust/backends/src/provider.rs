@@ -307,6 +307,7 @@ impl ObjectStoreProvider for DefaultObjectStoreProvider {
                     Path::new(blob_root),
                     Arc::clone(args.runtime),
                 )
+                .and_then(|backend| backend.with_openai_base_url(param(p, "openai_base_url")))
                 .map_err(|e| format!("anthropic init: {e}"))?;
                 Ok(backend_only(Arc::new(backend)))
             }
