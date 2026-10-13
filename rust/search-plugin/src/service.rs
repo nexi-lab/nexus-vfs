@@ -84,8 +84,11 @@ fn title_arm_env_enabled() -> bool {
 }
 
 fn batch_query_concurrency() -> usize {
-    std::env::var(BATCH_QUERY_CONCURRENCY_ENV)
-        .ok()
+    parse_batch_query_concurrency(std::env::var(BATCH_QUERY_CONCURRENCY_ENV).ok().as_deref())
+}
+
+fn parse_batch_query_concurrency(configured: Option<&str>) -> usize {
+    configured
         .and_then(|v| v.trim().parse::<usize>().ok())
         .map(|n| n.clamp(1, MAX_BATCH_QUERY_CONCURRENCY))
         .unwrap_or(DEFAULT_BATCH_QUERY_CONCURRENCY)
@@ -5877,28 +5880,24 @@ mod tests {
 
     #[test]
     fn batch_query_concurrency_defaults_and_clamps() {
-        // SAFETY: no other test in this binary reads
-        // NEXUS_SEARCH_BATCH_CONCURRENCY (same convention as the
-        // embedder.rs env tests).
-        let saved = std::env::var(BATCH_QUERY_CONCURRENCY_ENV).ok();
-        unsafe { std::env::remove_var(BATCH_QUERY_CONCURRENCY_ENV) };
-        assert_eq!(batch_query_concurrency(), DEFAULT_BATCH_QUERY_CONCURRENCY);
-        unsafe { std::env::set_var(BATCH_QUERY_CONCURRENCY_ENV, "8") };
-        assert_eq!(batch_query_concurrency(), 8);
-        unsafe { std::env::set_var(BATCH_QUERY_CONCURRENCY_ENV, "0") };
         assert_eq!(
-            batch_query_concurrency(),
+            parse_batch_query_concurrency(None),
+            DEFAULT_BATCH_QUERY_CONCURRENCY
+        );
+        assert_eq!(parse_batch_query_concurrency(Some("8")), 8);
+        assert_eq!(
+            parse_batch_query_concurrency(Some("0")),
             1,
             "0 clamps to serial, not panic"
         );
-        unsafe { std::env::set_var(BATCH_QUERY_CONCURRENCY_ENV, "9999") };
-        assert_eq!(batch_query_concurrency(), MAX_BATCH_QUERY_CONCURRENCY);
-        unsafe { std::env::set_var(BATCH_QUERY_CONCURRENCY_ENV, "not-a-number") };
-        assert_eq!(batch_query_concurrency(), DEFAULT_BATCH_QUERY_CONCURRENCY);
-        match saved {
-            Some(v) => unsafe { std::env::set_var(BATCH_QUERY_CONCURRENCY_ENV, v) },
-            None => unsafe { std::env::remove_var(BATCH_QUERY_CONCURRENCY_ENV) },
-        }
+        assert_eq!(
+            parse_batch_query_concurrency(Some("9999")),
+            MAX_BATCH_QUERY_CONCURRENCY
+        );
+        assert_eq!(
+            parse_batch_query_concurrency(Some("not-a-number")),
+            DEFAULT_BATCH_QUERY_CONCURRENCY
+        );
     }
 
     #[test]

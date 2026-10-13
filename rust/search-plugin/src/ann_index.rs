@@ -655,6 +655,10 @@ impl AnnIndex {
             return Ok(Vec::new());
         }
         let ids: Vec<usize> = prefixes.iter().flat_map(|p| self.ids_under(p)).collect();
+        Ok(self.exact_search_ids(query, ids, k))
+    }
+
+    fn exact_search_ids(&self, query: &[f32], ids: Vec<usize>, k: usize) -> Vec<AnnHit> {
         let dist = DistCosine {};
         let mut scored: Vec<(f32, usize)> = Vec::with_capacity(ids.len());
         {
@@ -677,7 +681,7 @@ impl AnnIndex {
         scored.sort_by(|a, b| a.0.total_cmp(&b.0));
         scored.truncate(k);
         let id_map = self.id_to_chunk.read();
-        Ok(scored
+        scored
             .into_iter()
             .filter_map(|(distance, id)| {
                 id_map.get(&id).map(|(path, chunk_index)| AnnHit {
@@ -686,7 +690,7 @@ impl AnnIndex {
                     distance,
                 })
             })
-            .collect())
+            .collect()
     }
 
     /// Nearest-`k` search.  Returns hits sorted by cosine distance
@@ -722,15 +726,20 @@ impl AnnIndex {
             return Ok(Vec::new());
         }
 
-        let (live_count, shadow_count) = {
+        let (exhaustive_ids, shadow_count) = {
             let sidecar = self.sidecar.read();
-            (sidecar.entries.len(), sidecar.shadowed.len())
+            (
+                (k >= sidecar.entries.len())
+                    .then(|| sidecar.entries.iter().map(|entry| entry.id).collect()),
+                sidecar.shadowed.len(),
+            )
         };
         // A request covering the entire live corpus needs every vector.
         // HNSW can leave nodes unreachable even at exhaustive ef; scoring the
-        // live vectors directly guarantees completeness at this bounded size.
-        if k >= live_count {
-            return self.exact_search_under(query, "", k);
+        // live vectors directly guarantees completeness. Snapshot the IDs while
+        // checking the count so concurrent inserts cannot expand the scan past k.
+        if let Some(ids) = exhaustive_ids {
+            return Ok(self.exact_search_ids(query, ids, k));
         }
 
         // Over-fetch so the shadow filter can drop stale hits and
