@@ -88,9 +88,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(windows)]
+use crate::fts_directory::FtsDirectory;
 use parking_lot::Mutex;
 use tantivy::collector::TopDocs;
-use tantivy::directory::MmapDirectory;
+#[cfg(not(windows))]
+use tantivy::directory::MmapDirectory as FtsDirectory;
 use tantivy::query::{BooleanQuery, BoostQuery, Occur, Query, QueryParser, RangeQuery, TermQuery};
 use tantivy::schema::{
     Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Type, Value, STORED, STRING,
@@ -314,7 +317,7 @@ impl FtsIndex {
         std::fs::create_dir_all(&dir)
             .map_err(|e| IndexError::CreateDir(dir.display().to_string(), e.to_string()))?;
 
-        let mmap = MmapDirectory::open(&dir)
+        let mmap = FtsDirectory::open(&dir)
             .map_err(|e| IndexError::Open(dir.display().to_string(), e.to_string()))?;
 
         let schema = build_schema();
@@ -336,7 +339,7 @@ impl FtsIndex {
             }
             Ok(_) => {}
         }
-        let mmap = MmapDirectory::open(&dir)
+        let mmap = FtsDirectory::open(&dir)
             .map_err(|e| IndexError::Open(dir.display().to_string(), e.to_string()))?;
         if !Index::exists(&mmap)
             .map_err(|e| IndexError::Open(dir.display().to_string(), e.to_string()))?
