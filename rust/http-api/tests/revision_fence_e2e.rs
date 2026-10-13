@@ -91,6 +91,31 @@ async fn fenced_query_400s_on_malformed_min_revision() {
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn locate_fence_rejects_stale_and_malformed_revisions_before_rpc() {
+    let base = spawn_with_kernel(Arc::new(FixedGen(3))).await;
+    let client = reqwest::Client::new();
+    for (revision, expected) in [
+        ("/ws/a.txt@7", reqwest::StatusCode::PRECONDITION_FAILED),
+        ("/ws/a.txt@invalid", reqwest::StatusCode::BAD_REQUEST),
+    ] {
+        let response = client
+            .post(format!("{base}/v2/search/locate"))
+            .header("X-Nexus-Min-Revision", revision)
+            .header("X-Nexus-Revision-Timeout-Ms", "80")
+            .json(&serde_json::json!({"path":"/ws/a.txt"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+        if expected == reqwest::StatusCode::PRECONDITION_FAILED {
+            assert_eq!(response.headers()["X-Nexus-Revision"], "/ws/a.txt@3");
+            let body: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(body["detail"]["error"], "revision_not_applied");
+        }
+    }
+}
+
 /// A zone-anchored fence (`root@1234`) answers 501 today —
 /// `nexusd-cluster` does not expose `federation_cluster_info`.
 /// Guards the "no silent zone-fence" contract so a client that asked

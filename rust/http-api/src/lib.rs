@@ -262,6 +262,8 @@ pub fn router(state: AppState) -> Router {
             .merge(handlers::search::router())
             .merge(handlers::path_contexts::router())
             .merge(handlers::documents::router())
+            .merge(handlers::index_status::router())
+            .merge(handlers::indexing_config::router())
             .merge(handlers::auth::router());
         #[cfg(feature = "rebac")]
         let r = r.merge(handlers::rebac::router());
