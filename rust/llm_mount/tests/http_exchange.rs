@@ -17,12 +17,20 @@ fn caller() -> OperationContext {
 }
 
 fn mount(provider: &str, url: &str) -> (Arc<Kernel>, tempfile::TempDir) {
+    mount_with_openai_base_url(provider, url, None)
+}
+
+fn mount_with_openai_base_url(
+    provider: &str,
+    url: &str,
+    openai_url: Option<&str>,
+) -> (Arc<Kernel>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let kernel = Arc::new(Kernel::new());
     kernel
         .bring_up_services(vec![llm_mount::service_decl()])
         .unwrap();
-    let params: HashMap<_, _> = [
+    let mut params: HashMap<_, _> = [
         (
             "blob_root".into(),
             dir.path().to_string_lossy().into_owned(),
@@ -33,6 +41,9 @@ fn mount(provider: &str, url: &str) -> (Arc<Kernel>, tempfile::TempDir) {
     ]
     .into_iter()
     .collect();
+    if let Some(openai_url) = openai_url {
+        params.insert("openai_base_url".into(), openai_url.into());
+    }
     let peer = kernel::hal::peer::NoopPeerBlobClient::arc();
     let built = backends::provider::DefaultObjectStoreProvider
         .build(&ObjectStoreProviderArgs {
@@ -159,6 +170,82 @@ fn read_reply(kernel: &Kernel) -> Vec<Vec<u8>> {
         }
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+#[test]
+fn a_gateway_mount_supports_both_protocols_with_one_owner_credential() {
+    const BODY: &str = "data: {\"text\":\"gateway reply\"}\n\n";
+    for path in ["v1/messages", "chat/completions", "responses"] {
+        let (url, captured, worker) = server(200, BODY);
+        let openai_url = format!("{url}/v1");
+        let (kernel, _dir) = mount_with_openai_base_url("anthropic", &url, Some(&openai_url));
+        let request = exchange(path);
+        kernel
+            .write(
+                "/model/request.prompt",
+                &caller(),
+                &serde_json::to_vec(&request).unwrap(),
+                0,
+            )
+            .unwrap();
+        let records = read_reply(&kernel);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&records[0]).unwrap()["status"],
+            200,
+            "gateway returned a non-response: {records:?}"
+        );
+        let (header, body) = captured.recv_timeout(Duration::from_secs(2)).unwrap();
+        let expected_path = if path == "v1/messages" {
+            path.to_string()
+        } else {
+            format!("v1/{path}")
+        };
+        assert!(header.starts_with(&format!("POST /{expected_path} ")));
+        let header = header.to_ascii_lowercase();
+        assert!(!header.contains("caller-forged-key"));
+        if path == "v1/messages" {
+            assert!(header.contains("x-api-key: mount-credential"));
+            assert!(!header.contains("authorization: bearer"));
+        } else {
+            assert!(header.contains("authorization: bearer mount-credential"));
+            assert!(!header.contains("x-api-key:"));
+        }
+        assert_eq!(body, request["body"]);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&records[0]).unwrap()["status"],
+            200
+        );
+        let output: Vec<u8> = records
+            .iter()
+            .filter(|record| record.first() == Some(&0))
+            .flat_map(|record| record[1..].iter().copied())
+            .collect();
+        assert_eq!(output, BODY.as_bytes());
+        worker.join().unwrap();
+    }
+}
+
+#[test]
+fn gateway_compatibility_does_not_allow_caller_credentials() {
+    let (kernel, _dir) = mount_with_openai_base_url(
+        "anthropic",
+        "http://127.0.0.1:9",
+        Some("http://127.0.0.1:9/v1"),
+    );
+    let mut request = exchange("chat/completions");
+    request["nexus_http"]["headers"]["authorization"] = json!("Bearer caller-forged-key");
+    kernel
+        .write(
+            "/model/request.prompt",
+            &caller(),
+            &serde_json::to_vec(&request).unwrap(),
+            0,
+        )
+        .unwrap();
+    let records = read_reply(&kernel);
+    let error: Value = serde_json::from_slice(records.last().unwrap()).unwrap();
+    assert_eq!(error["type"], "error");
+    assert!(error["message"].as_str().unwrap().contains("authorization"));
 }
 
 #[test]
