@@ -67,7 +67,7 @@ pub mod http_client;
 pub mod index_manager;
 pub mod index_seq;
 pub mod index_state;
-pub mod indexed_dirs_state;
+mod indexing_config;
 pub mod internal_call;
 pub mod kernel_io;
 pub mod llm_chat;
@@ -83,7 +83,6 @@ pub mod query_expansion;
 pub mod scoring;
 pub mod service;
 pub mod title_index;
-pub mod zone_modes_state;
 
 use search_proto::search_service_server::SearchService as SearchServiceTrait;
 use search_proto::{

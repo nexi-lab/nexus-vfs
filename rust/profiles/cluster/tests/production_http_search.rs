@@ -234,6 +234,211 @@ async fn production_grants_filter_http_search_and_survive_restart() {
         query(&client, &base, bob, "sharedzone").await,
         ["/docs/private.md"]
     );
+    let health = json_ok(
+        client
+            .get(format!("{base}/v2/search/health"))
+            .bearer_auth(admin),
+    )
+    .await;
+    assert_eq!(health["status"], "degraded", "{health}");
+    assert_eq!(health["fts_writer_faults"], 0);
+    assert_eq!(health["fts_writer_unavailable"], 0);
+    assert_eq!(health["dispatch_panics"], 0);
+    assert!(
+        health["last_verified_commit_age_ms"].is_number(),
+        "{health}"
+    );
+    let located = json_ok(
+        client
+            .post(format!("{base}/v2/search/locate"))
+            .bearer_auth(alice)
+            .json(&json!({"path":"/docs/public.md", "zone_id":"sharedzone"})),
+    )
+    .await;
+    assert_eq!(located["indexed"], true);
+    assert_eq!(located["chunk_count"], 1);
+    assert_eq!(located["mtime_ms"], modified_at_ms);
+    assert_eq!(located["zone_id"], "sharedzone");
+    assert_eq!(
+        client
+            .post(format!("{base}/v2/search/locate"))
+            .bearer_auth(alice)
+            .json(&json!({"path":"/docs/private.md", "zone_id":"sharedzone"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+
+    let directories_url = format!("{base}/v2/documents/directories");
+    let modes_url = format!("{base}/v2/documents/indexing-modes");
+    let directory = json!({"path":"/docs", "zone_id":"sharedzone"});
+    for expected_added in [true, false] {
+        let added = json_ok(
+            client
+                .post(&directories_url)
+                .bearer_auth(admin)
+                .json(&directory),
+        )
+        .await;
+        assert_eq!(added, json!({"added":expected_added}));
+    }
+    let directories = json_ok(
+        client
+            .get(&directories_url)
+            .bearer_auth(admin)
+            .query(&[("zone_id", "sharedzone")]),
+    )
+    .await;
+    let saved_directory = directories["directories"][0].clone();
+    assert_eq!(saved_directory["path"], "/docs");
+    assert_eq!(saved_directory["zone_id"], "sharedzone");
+    assert!(saved_directory["added_at_ms"].as_i64().unwrap() > 0);
+    assert!(directories.get("indexing_mode").is_none());
+    let mut registrations = tokio::task::JoinSet::new();
+    for number in 0..16 {
+        let client = client.clone();
+        let url = directories_url.clone();
+        let token = admin.to_owned();
+        registrations.spawn(async move {
+            let result = json_ok(client.post(url).bearer_auth(token).json(&json!({
+                "path":format!("/docs/concurrent-{number}"), "zone_id":"sharedzone",
+            })))
+            .await;
+            assert_eq!(result, json!({"added":true}));
+        });
+    }
+    while let Some(result) = registrations.join_next().await {
+        result.unwrap();
+    }
+    let concurrent = json_ok(
+        client
+            .get(&directories_url)
+            .bearer_auth(admin)
+            .query(&[("zone_id", "sharedzone")]),
+    )
+    .await;
+    let entries = concurrent["directories"].as_array().unwrap();
+    assert_eq!(entries.len(), 17);
+    for number in 0..16 {
+        let path = format!("/docs/concurrent-{number}");
+        assert!(
+            entries.iter().any(|entry| entry["path"] == path),
+            "{concurrent}"
+        );
+        assert_eq!(
+            json_ok(
+                client
+                    .delete(&directories_url)
+                    .bearer_auth(admin)
+                    .query(&[("path", path.as_str()), ("zone_id", "sharedzone")])
+            )
+            .await,
+            json!({"removed":true})
+        );
+    }
+    assert_eq!(
+        json_ok(
+            client
+                .put(&modes_url)
+                .bearer_auth(admin)
+                .json(&json!({"zone_id":"sharedzone", "mode":"sandbox"}))
+        )
+        .await,
+        json!({})
+    );
+    let modes = json_ok(client.get(&modes_url).bearer_auth(admin)).await;
+    assert!(modes["modes"]
+        .as_array()
+        .unwrap()
+        .contains(&json!({"zone_id":"sharedzone", "mode":"sandbox"})));
+
+    for (method, route, body) in [
+        (Method::GET, "/v2/search/health", None),
+        (Method::GET, "/v2/documents/stats?zone_id=sharedzone", None),
+        (
+            Method::POST,
+            "/v2/documents/directories",
+            Some(directory.clone()),
+        ),
+        (
+            Method::DELETE,
+            "/v2/documents/directories",
+            Some(directory.clone()),
+        ),
+        (
+            Method::GET,
+            "/v2/documents/directories?zone_id=sharedzone",
+            None,
+        ),
+        (
+            Method::PUT,
+            "/v2/documents/indexing-modes",
+            Some(json!({"zone_id":"sharedzone", "mode":"off"})),
+        ),
+        (Method::GET, "/v2/documents/indexing-modes", None),
+    ] {
+        for (credential, expected) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (Some("sk-never-minted"), StatusCode::UNAUTHORIZED),
+            (Some(alice), StatusCode::FORBIDDEN),
+            (Some(bob), StatusCode::FORBIDDEN),
+            (Some(writer), StatusCode::FORBIDDEN),
+        ] {
+            let mut request = client.request(method.clone(), format!("{base}{route}"));
+            if let Some(token) = credential {
+                request = request.bearer_auth(token);
+            }
+            if let Some(body) = &body {
+                request = if method == Method::DELETE {
+                    request.query(body)
+                } else {
+                    request.json(body)
+                };
+            }
+            let response = request.send().await.unwrap();
+            assert_eq!(response.status(), expected, "{method} {route}");
+        }
+    }
+    for (method, route, mut body) in [
+        (
+            Method::POST,
+            "/v2/search/locate",
+            json!({"path":"/docs/public.md"}),
+        ),
+        (Method::POST, "/v2/documents/directories", directory.clone()),
+        (
+            Method::DELETE,
+            "/v2/documents/directories",
+            directory.clone(),
+        ),
+        (
+            Method::PUT,
+            "/v2/documents/indexing-modes",
+            json!({"mode":"on"}),
+        ),
+    ] {
+        body["auth_token"] = json!(admin);
+        let request = client
+            .request(method.clone(), format!("{base}{route}"))
+            .bearer_auth(admin);
+        let request = if method == Method::DELETE {
+            request.query(&body)
+        } else {
+            request.json(&body)
+        };
+        let response = request.send().await.unwrap();
+        assert_eq!(
+            response.status(),
+            if method == Method::DELETE {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::UNPROCESSABLE_ENTITY
+            },
+            "{method} {route}"
+        );
+    }
     let globs = json_ok(
         client
             .get(format!(
@@ -819,6 +1024,48 @@ async fn production_grants_filter_http_search_and_survive_restart() {
         .build()
         .unwrap();
     // Persisted grants AND revocations remain effective after process restart.
+    let directories = json_ok(
+        client
+            .get(&directories_url)
+            .bearer_auth(admin)
+            .query(&[("zone_id", "sharedzone")]),
+    )
+    .await;
+    assert_eq!(directories["directories"], json!([saved_directory]));
+    let modes = json_ok(client.get(&modes_url).bearer_auth(admin)).await;
+    assert!(modes["modes"]
+        .as_array()
+        .unwrap()
+        .contains(&json!({"zone_id":"sharedzone", "mode":"sandbox"})));
+    for expected_removed in [true, false] {
+        let removed = json_ok(
+            client
+                .delete(&directories_url)
+                .bearer_auth(admin)
+                .query(&directory),
+        )
+        .await;
+        assert_eq!(removed, json!({"removed":expected_removed}));
+    }
+    let directories = json_ok(
+        client
+            .get(&directories_url)
+            .bearer_auth(admin)
+            .query(&[("zone_id", "sharedzone")]),
+    )
+    .await;
+    assert_eq!(directories["directories"], json!([]));
+    assert_eq!(
+        client
+            .post(format!("{base}/v2/search/locate"))
+            .bearer_auth(alice)
+            .json(&json!({"path":"/docs/public.md", "zone_id":"sharedzone"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
     let persisted = json_ok(client.get(&contexts_url).bearer_auth(admin)).await;
     assert_eq!(persisted["contexts"].as_array().unwrap().len(), 2);
     assert_eq!(persisted["contexts"][1]["created_at"], saved["created_at"]);

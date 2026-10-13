@@ -138,6 +138,7 @@ pub struct SearchServiceImpl {
     /// and SemanticQuery.  `Arc<IndexManager>` so tests can inject a
     /// manager rooted at a tempdir instead of the default.
     manager: Arc<IndexManager>,
+    indexing_config: Arc<crate::indexing_config::IndexingConfigStore>,
     /// Lazy embedder slot.  `None` until the first SemanticQuery
     /// attempts to initialise; `Some(Arc<dyn Embedder>)` on success.
     /// Failed init leaves it `None` and is retried on the next call
@@ -896,6 +897,9 @@ impl SearchServiceBuilder {
             handle: self.handle,
             path_contexts: pin_to_once_lock(self.path_contexts_pin),
             path_context_error_logged: std::sync::atomic::AtomicBool::new(false),
+            indexing_config: Arc::new(crate::indexing_config::IndexingConfigStore::new(
+                Arc::clone(&manager),
+            )),
             manager,
             embedder_slot: Arc::new(Mutex::new(self.embedder)),
             query_cache: self
@@ -4736,14 +4740,11 @@ impl SearchService for SearchServiceImpl {
         let req = request.into_inner();
         let zone_id = checked_index_zone(&req.zone_id)?.to_string();
         let path = req.path;
-        let manager = Arc::clone(&self.manager);
-        let outcome = tokio::task::spawn_blocking(move || -> Result<bool, String> {
-            let r =
-                crate::indexed_dirs_state::IndexedDirsRegistry::load(manager.zone_root(&zone_id))
-                    .map_err(|e| format!("open indexed_dirs: {e}"))?;
-            let added = r.add(&path, current_time_ms());
-            r.save().map_err(|e| format!("save indexed_dirs: {e}"))?;
-            Ok(added)
+        let store = Arc::clone(&self.indexing_config);
+        let outcome = tokio::task::spawn_blocking(move || {
+            store
+                .add_directory(&zone_id, &path, current_time_ms())
+                .map_err(|error| error.to_string())
         })
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking joined error: {e}")))?;
@@ -4767,14 +4768,11 @@ impl SearchService for SearchServiceImpl {
         let req = request.into_inner();
         let zone_id = checked_index_zone(&req.zone_id)?.to_string();
         let path = req.path;
-        let manager = Arc::clone(&self.manager);
-        let outcome = tokio::task::spawn_blocking(move || -> Result<bool, String> {
-            let r =
-                crate::indexed_dirs_state::IndexedDirsRegistry::load(manager.zone_root(&zone_id))
-                    .map_err(|e| format!("open indexed_dirs: {e}"))?;
-            let removed = r.remove(&path);
-            r.save().map_err(|e| format!("save indexed_dirs: {e}"))?;
-            Ok(removed)
+        let store = Arc::clone(&self.indexing_config);
+        let outcome = tokio::task::spawn_blocking(move || {
+            store
+                .remove_directory(&zone_id, &path)
+                .map_err(|error| error.to_string())
         })
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking joined error: {e}")))?;
@@ -4798,11 +4796,11 @@ impl SearchService for SearchServiceImpl {
         let req = request.into_inner();
         let zone_id = checked_index_zone(&req.zone_id)?.to_string();
         let zone_for_reply = zone_id.clone();
-        let manager = Arc::clone(&self.manager);
+        let store = Arc::clone(&self.indexing_config);
         let outcome = tokio::task::spawn_blocking(move || {
-            crate::indexed_dirs_state::IndexedDirsRegistry::load(manager.zone_root(&zone_id))
-                .map(|r| r.list())
-                .map_err(|e| format!("open indexed_dirs: {e}"))
+            store
+                .list_directories(&zone_id)
+                .map_err(|error| error.to_string())
         })
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking joined error: {e}")))?;
@@ -4833,15 +4831,11 @@ impl SearchService for SearchServiceImpl {
         let req = request.into_inner();
         let zone_id = checked_index_zone(&req.zone_id)?.to_string();
         let mode = req.mode;
-        let manager = Arc::clone(&self.manager);
-        let outcome = tokio::task::spawn_blocking(move || -> Result<(), String> {
-            let reg =
-                crate::zone_modes_state::ZoneModesRegistry::load(manager.root().to_path_buf())
-                    .map_err(|e| format!("open zone_modes: {e}"))?;
-            reg.set(&zone_id, &mode)
-                .map_err(|e| format!("set zone mode: {e}"))?;
-            reg.save().map_err(|e| format!("save zone_modes: {e}"))?;
-            Ok(())
+        let store = Arc::clone(&self.indexing_config);
+        let outcome = tokio::task::spawn_blocking(move || {
+            store
+                .set_mode(&zone_id, &mode)
+                .map_err(|error| error.to_string())
         })
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking joined error: {e}")))?;
@@ -4858,11 +4852,9 @@ impl SearchService for SearchServiceImpl {
         &self,
         _request: Request<ListZoneIndexingModesRequest>,
     ) -> Result<Response<ListZoneIndexingModesResponse>, Status> {
-        let manager = Arc::clone(&self.manager);
+        let store = Arc::clone(&self.indexing_config);
         let outcome = tokio::task::spawn_blocking(move || {
-            crate::zone_modes_state::ZoneModesRegistry::load(manager.root().to_path_buf())
-                .map(|r| r.list())
-                .map_err(|e| format!("open zone_modes: {e}"))
+            store.list_modes().map_err(|error| error.to_string())
         })
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking joined error: {e}")))?;
