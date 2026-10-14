@@ -252,6 +252,12 @@ pub(crate) struct CancelRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+struct CancelSessionRequest {
+    session_id: String,
+    channel_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct GetSessionRequest {
     pub session_id: String,
 }
@@ -1161,6 +1167,28 @@ impl<K: KernelSyscall> RustService for ManagedAgentService<K> {
                 let resp = self.cancel(&req.session_id, req.mode)?;
                 serde_json::to_vec(&resp).map_err(|e| RustCallError::Internal(e.to_string()))
             }
+            "cancel_v2" => {
+                let req: CancelSessionRequest = serde_json::from_slice(payload)
+                    .map_err(|e| RustCallError::InvalidArgument(e.to_string()))?;
+                self.authorize_session_control(&req.session_id, ctx)?;
+                if req.channel_id.is_empty() {
+                    return Err(RustCallError::InvalidArgument(
+                        "session cancellation requires its channel generation".into(),
+                    ));
+                }
+                let snapshot = self.get_session(&req.session_id)?;
+                // A PID can be reused after a daemon restart. The existing
+                // channel generation identifies this live attachment.
+                let resp = if snapshot
+                    .session_endpoint
+                    .is_some_and(|endpoint| endpoint.channel_id == req.channel_id)
+                {
+                    self.cancel(&req.session_id, CancelMode::Session)?
+                } else {
+                    CancelResponse { cancelled: false }
+                };
+                serde_json::to_vec(&resp).map_err(|e| RustCallError::Internal(e.to_string()))
+            }
             "get_session_v1" => {
                 let req: GetSessionRequest = serde_json::from_slice(payload)
                     .map_err(|e| RustCallError::InvalidArgument(e.to_string()))?;
@@ -1762,6 +1790,71 @@ mod tests {
                 .unwrap();
             let cancel: CancelResponse = serde_json::from_slice(&bytes).unwrap();
             assert!(cancel.cancelled);
+        }
+
+        #[test]
+        fn cancel_v2_fences_an_old_attachment_and_preserves_the_current_session() {
+            let kernel = Arc::new(Kernel::new());
+            let table = Arc::clone(kernel.agent_registry());
+            let svc = ManagedAgentService::<Kernel>::with_spawn(
+                kernel,
+                Arc::clone(&table),
+                Arc::new(ScriptedSpawn),
+            );
+            let mut request = req("scode-standard");
+            request.owner_id = "alice".into();
+            let started = svc
+                .start_session_for(request, Some("controller-alice"))
+                .unwrap();
+            let current = started.session_endpoint.unwrap();
+            for channel in ["a-retired-channel", current.channel_id.as_str()] {
+                let payload =
+                    json!({"session_id":started.session_id, "channel_id":channel}).to_string();
+                let bytes = svc
+                    .dispatch("cancel_v2", payload.as_bytes(), &session_caller("alice"))
+                    .unwrap();
+                let response: CancelResponse = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(response.cancelled, channel == current.channel_id);
+                assert_eq!(
+                    table.get(&started.session_id).is_some(),
+                    !response.cancelled
+                );
+            }
+        }
+
+        #[test]
+        fn cancel_v2_requires_both_the_owner_and_a_nonempty_channel() {
+            let kernel = Arc::new(Kernel::new());
+            let table = Arc::clone(kernel.agent_registry());
+            let svc = ManagedAgentService::<Kernel>::with_spawn(
+                kernel,
+                Arc::clone(&table),
+                Arc::new(ScriptedSpawn),
+            );
+            let mut request = req("scode-standard");
+            request.owner_id = "alice".into();
+            let started = svc
+                .start_session_for(request, Some("controller-alice"))
+                .unwrap();
+            let payload = json!({"session_id":started.session_id,
+                "channel_id":started.session_endpoint.unwrap().channel_id})
+            .to_string();
+            assert!(svc
+                .dispatch("cancel_v2", payload.as_bytes(), &session_caller("bob"))
+                .is_err());
+            for payload in [
+                json!({"session_id":started.session_id}),
+                json!({"session_id":started.session_id,"channel_id":""}),
+            ] {
+                assert!(svc
+                    .dispatch(
+                        "cancel_v2",
+                        payload.to_string().as_bytes(),
+                        &session_caller("alice")
+                    )
+                    .is_err());
+            }
+            assert!(table.get(&started.session_id).is_some());
         }
 
         #[test]

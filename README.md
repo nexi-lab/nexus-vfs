@@ -101,6 +101,13 @@ An in-process runtime can additionally return `durable_session_id`, the key of
 its persistent transcript. `get_session_v1` exposes the same optional field.
 Raw subprocesses and providers without durable sessions omit it.
 
+Hosted controllers cancel a live attachment with `managed_agent.cancel_v2`,
+passing `session_id` and the returned `session_endpoint.channel_id`. A retired
+channel returns `cancelled: false` and leaves the current execution running,
+even if a restart reused its PID. The existing channel generation is the
+attachment identity; it is never persisted as a transcript ID. This method
+retains the same delegated-owner authorization as the existing controls.
+
 To restore a stopped co-hosted session, start the same agent with
 `resume_session_id` set to the previous `durable_session_id`. The runtime owns
 loading, identity checks and protection against concurrent writers. A successful
