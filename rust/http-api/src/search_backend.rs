@@ -2,9 +2,19 @@
 use crate::search_proto::search_service_client::SearchServiceClient;
 use nexus_search_common::transport::{PeerChannelCache, PeerChannelConfig};
 use std::sync::Arc;
+use std::time::Duration;
 use tonic::transport::Channel;
 
 pub use nexus_search_common::transport::DialError as BackendError;
+
+/// Applies the interactive RPC deadline at the request boundary.
+pub(crate) async fn bounded_rpc<T>(
+    response: impl std::future::Future<Output = Result<tonic::Response<T>, tonic::Status>>,
+) -> Result<tonic::Response<T>, tonic::Status> {
+    tokio::time::timeout(Duration::from_secs(8), response)
+        .await
+        .unwrap_or_else(|_| Err(tonic::Status::deadline_exceeded("Search RPC timed out")))
+}
 
 #[derive(Clone)]
 pub struct SearchBackend {

@@ -50,15 +50,14 @@ pub async fn add_directory(
     Extension(ctx): Extension<OperationContext>,
     Json(body): Json<DirectoryParameters>,
 ) -> Result<Json<AddedBody>, SearchError> {
-    let result = state
-        .search
-        .client()
-        .await?
-        .add_indexed_directory(AddIndexedDirectoryRequest {
-            path: body.path,
-            zone_id: effective_zone(&ctx, &body.zone_id)?,
-            auth_token: token.0.to_string(),
-        })
+    let result =
+        crate::search_backend::bounded_rpc(state.search.client().await?.add_indexed_directory(
+            AddIndexedDirectoryRequest {
+                path: body.path,
+                zone_id: effective_zone(&ctx, &body.zone_id)?,
+                auth_token: token.0.to_string(),
+            },
+        ))
         .await
         .map_err(SearchError::Rpc)?
         .into_inner();
@@ -74,15 +73,14 @@ pub async fn remove_directory(
     Extension(ctx): Extension<OperationContext>,
     Query(body): Query<DirectoryParameters>,
 ) -> Result<Json<RemovedBody>, SearchError> {
-    let result = state
-        .search
-        .client()
-        .await?
-        .remove_indexed_directory(RemoveIndexedDirectoryRequest {
-            path: body.path,
-            zone_id: effective_zone(&ctx, &body.zone_id)?,
-            auth_token: token.0.to_string(),
-        })
+    let result =
+        crate::search_backend::bounded_rpc(state.search.client().await?.remove_indexed_directory(
+            RemoveIndexedDirectoryRequest {
+                path: body.path,
+                zone_id: effective_zone(&ctx, &body.zone_id)?,
+                auth_token: token.0.to_string(),
+            },
+        ))
         .await
         .map_err(SearchError::Rpc)?
         .into_inner();
@@ -112,14 +110,13 @@ pub async fn list_directories(
     Extension(ctx): Extension<OperationContext>,
     Query(query): Query<DirectoryQuery>,
 ) -> Result<Json<DirectoriesBody>, SearchError> {
-    let result = state
-        .search
-        .client()
-        .await?
-        .list_indexed_directories(ListIndexedDirectoriesRequest {
-            zone_id: effective_zone(&ctx, &query.zone_id)?,
-            auth_token: token.0.to_string(),
-        })
+    let result =
+        crate::search_backend::bounded_rpc(state.search.client().await?.list_indexed_directories(
+            ListIndexedDirectoriesRequest {
+                zone_id: effective_zone(&ctx, &query.zone_id)?,
+                auth_token: token.0.to_string(),
+            },
+        ))
         .await
         .map_err(SearchError::Rpc)?
         .into_inner();
@@ -157,15 +154,14 @@ pub async fn set_mode(
     Extension(ctx): Extension<OperationContext>,
     Json(body): Json<ModeBody>,
 ) -> Result<Json<ModeResult>, SearchError> {
-    let result = state
-        .search
-        .client()
-        .await?
-        .set_zone_indexing_mode(SetZoneIndexingModeRequest {
-            mode: body.mode,
-            zone_id: effective_zone(&ctx, &body.zone_id)?,
-            auth_token: token.0.to_string(),
-        })
+    let result =
+        crate::search_backend::bounded_rpc(state.search.client().await?.set_zone_indexing_mode(
+            SetZoneIndexingModeRequest {
+                mode: body.mode,
+                zone_id: effective_zone(&ctx, &body.zone_id)?,
+                auth_token: token.0.to_string(),
+            },
+        ))
         .await
         .map_err(SearchError::Rpc)?
         .into_inner();
@@ -191,13 +187,12 @@ pub async fn list_modes(
     State(state): State<AppState>,
     Extension(token): Extension<BearerToken>,
 ) -> Result<Json<ModesBody>, SearchError> {
-    let result = state
-        .search
-        .client()
-        .await?
-        .list_zone_indexing_modes(ListZoneIndexingModesRequest {
-            auth_token: token.0.to_string(),
-        })
+    let result =
+        crate::search_backend::bounded_rpc(state.search.client().await?.list_zone_indexing_modes(
+            ListZoneIndexingModesRequest {
+                auth_token: token.0.to_string(),
+            },
+        ))
         .await
         .map_err(SearchError::Rpc)?
         .into_inner();

@@ -61,8 +61,7 @@ impl LocalSearchBackend for PluginLocalSearchBackend {
             .client()
             .await
             .map_err(|e| BackendError::Transport(e.to_string()))?;
-        let resp = client
-            .query(tonic::Request::new(proto))
+        let resp = crate::search_backend::bounded_rpc(client.query(tonic::Request::new(proto)))
             .await
             .map_err(|s| BackendError::Backend(s.message().to_string()))?
             .into_inner();

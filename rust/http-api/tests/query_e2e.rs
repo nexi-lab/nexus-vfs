@@ -48,6 +48,7 @@ struct RequestLog {
 
 #[derive(Clone)]
 enum MockBehaviour {
+    Pending,
     BatchSuccess(Vec<QueryResponse>),
     Success {
         results: Vec<QueryResult>,
@@ -103,6 +104,7 @@ impl SearchService for MockSearchService {
         let inner = req.into_inner();
         self.log.queries.lock().unwrap().push(inner);
         match &self.behaviour {
+            MockBehaviour::Pending => std::future::pending().await,
             MockBehaviour::BatchSuccess(_) => unreachable!(),
             MockBehaviour::Success { results, error } => Ok(Response::new(QueryResponse {
                 results: results.clone(),
@@ -135,6 +137,7 @@ impl SearchService for MockSearchService {
         let request = req.into_inner();
         self.log.batches.lock().unwrap().push(request.clone());
         match &self.behaviour {
+            MockBehaviour::Pending => std::future::pending().await,
             MockBehaviour::BatchSuccess(responses) => Ok(Response::new(BatchQueryResponse {
                 responses: responses.clone(),
             })),
@@ -299,6 +302,31 @@ fn full_hit() -> QueryResult {
         recency_boost: Some(1.2),
         expansion_variant_index: Some(2),
     }
+}
+
+#[tokio::test]
+async fn stalled_query_and_batch_return_gateway_timeout() {
+    let h = Harness::start(MockBehaviour::Pending).await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap();
+    let query = client
+        .post(format!("{}/v2/search/query", h.http_base))
+        .json(&serde_json::json!({"q": "widget", "zone_id": "root"}));
+    let batch = client
+        .post(format!("{}/v2/search/query/batch", h.http_base))
+        .json(&serde_json::json!({"queries": [{"q": "widget", "zone_id": "root"}]}));
+    let (query, batch) = tokio::join!(query.send(), batch.send());
+    for response in [query, batch] {
+        let response = response.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::GATEWAY_TIMEOUT);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert!(!body["error"].as_str().unwrap().is_empty());
+    }
+    assert_eq!(h.log.queries.lock().unwrap().len(), 1);
+    assert_eq!(h.log.batches.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]

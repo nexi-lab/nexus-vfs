@@ -164,8 +164,7 @@ async fn glob_with_params(
         sort_recency: params.sort_recency,
         files: params.files.map(|paths| DiscoveryFiles { paths }),
     };
-    let resp = client
-        .glob(tonic::Request::new(req))
+    let resp = crate::search_backend::bounded_rpc(client.glob(tonic::Request::new(req)))
         .await
         .map_err(SearchError::Rpc)?
         .into_inner();
@@ -334,8 +333,7 @@ async fn grep_with_params(
         block_type: params.block_type,
         section: params.section,
     };
-    let resp = client
-        .grep(tonic::Request::new(req))
+    let resp = crate::search_backend::bounded_rpc(client.grep(tonic::Request::new(req)))
         .await
         .map_err(SearchError::Rpc)?
         .into_inner();
@@ -525,8 +523,7 @@ pub async fn query(
     body.zone_id = zone_id;
     let mut req = query_request(body).map_err(SearchError::BadRequest)?;
     req.auth_token = token.0.to_string();
-    let resp = client
-        .query(tonic::Request::new(req))
+    let resp = crate::search_backend::bounded_rpc(client.query(tonic::Request::new(req)))
         .await
         .map_err(SearchError::Rpc)?
         .into_inner();
@@ -563,17 +560,15 @@ pub async fn batch_query(
         .enforce(std::sync::Arc::clone(&state.kernel), &fence_zone)
         .await
         .map_err(SearchError::Fence)?;
-    let response = state
-        .search
-        .client()
-        .await?
-        .batch_query(BatchQueryRequest {
+    let response = crate::search_backend::bounded_rpc(state.search.client().await?.batch_query(
+        BatchQueryRequest {
             queries,
             auth_token: token.0.to_string(),
-        })
-        .await
-        .map_err(SearchError::Rpc)?
-        .into_inner();
+        },
+    ))
+    .await
+    .map_err(SearchError::Rpc)?
+    .into_inner();
     let mut response = Json(BatchQueryResponseBody {
         responses: response.responses.into_iter().map(Into::into).collect(),
     })

@@ -76,20 +76,18 @@ pub async fn put(
     Extension(token): Extension<BearerToken>,
     Json(body): Json<PutBody>,
 ) -> Result<Json<Record>, SearchError> {
-    let result = state
-        .search
-        .client()
-        .await?
-        .put_path_context(PutPathContextRequest {
+    let result = crate::search_backend::bounded_rpc(state.search.client().await?.put_path_context(
+        PutPathContextRequest {
             zone_id: body.zone_id,
             path_prefix: body.path_prefix,
             description: body.description,
             weight: body.weight,
             auth_token: token.0.to_string(),
-        })
-        .await
-        .map_err(SearchError::Rpc)?
-        .into_inner();
+        },
+    ))
+    .await
+    .map_err(SearchError::Rpc)?
+    .into_inner();
     Ok(Json(result.into()))
 }
 
@@ -98,14 +96,13 @@ pub async fn list(
     Extension(token): Extension<BearerToken>,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<ListBody>, SearchError> {
-    let result = state
-        .search
-        .client()
-        .await?
-        .list_path_contexts(ListPathContextsRequest {
-            zone_id: query.zone_id,
-            auth_token: token.0.to_string(),
-        })
+    let result =
+        crate::search_backend::bounded_rpc(state.search.client().await?.list_path_contexts(
+            ListPathContextsRequest {
+                zone_id: query.zone_id,
+                auth_token: token.0.to_string(),
+            },
+        ))
         .await
         .map_err(SearchError::Rpc)?
         .into_inner();
@@ -119,15 +116,14 @@ pub async fn delete(
     Extension(token): Extension<BearerToken>,
     Query(query): Query<DeleteQuery>,
 ) -> Result<Json<DeletedBody>, SearchError> {
-    let result = state
-        .search
-        .client()
-        .await?
-        .delete_path_context(DeletePathContextRequest {
-            zone_id: query.zone_id,
-            path_prefix: query.path_prefix,
-            auth_token: token.0.to_string(),
-        })
+    let result =
+        crate::search_backend::bounded_rpc(state.search.client().await?.delete_path_context(
+            DeletePathContextRequest {
+                zone_id: query.zone_id,
+                path_prefix: query.path_prefix,
+                auth_token: token.0.to_string(),
+            },
+        ))
         .await
         .map_err(SearchError::Rpc)?
         .into_inner();

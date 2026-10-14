@@ -96,8 +96,7 @@ impl RemoteSearchBackend for TonicRemoteSearchBackend {
         //     message rides through verbatim.
         let mut client =
             SearchServiceClient::new(channel).max_decoding_message_size(64 * 1024 * 1024);
-        let resp = client
-            .query(request)
+        let resp = crate::search_backend::bounded_rpc(client.query(request))
             .await
             .map_err(|s| match s.code() {
                 tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => {

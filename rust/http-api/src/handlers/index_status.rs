@@ -42,15 +42,12 @@ pub async fn locate(
         .enforce(std::sync::Arc::clone(&state.kernel), &zone_id)
         .await
         .map_err(SearchError::Fence)?;
-    let result = state
-        .search
-        .client()
-        .await?
-        .locate(LocateRequest {
+    let result =
+        crate::search_backend::bounded_rpc(state.search.client().await?.locate(LocateRequest {
             path: body.path,
             zone_id,
             auth_token: token.0.to_string(),
-        })
+        }))
         .await
         .map_err(SearchError::Rpc)?
         .into_inner();
@@ -81,13 +78,10 @@ pub async fn health(
     State(state): State<AppState>,
     Extension(token): Extension<BearerToken>,
 ) -> Result<Json<HealthResponseBody>, SearchError> {
-    let result = state
-        .search
-        .client()
-        .await?
-        .health(HealthRequest {
+    let result =
+        crate::search_backend::bounded_rpc(state.search.client().await?.health(HealthRequest {
             auth_token: token.0.to_string(),
-        })
+        }))
         .await
         .map_err(SearchError::Rpc)?
         .into_inner();

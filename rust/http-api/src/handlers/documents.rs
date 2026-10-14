@@ -473,8 +473,7 @@ pub async fn stats(
         zone_id: params.zone_id,
         auth_token: token.0.to_string(),
     };
-    let resp = client
-        .stats(tonic::Request::new(req))
+    let resp = crate::search_backend::bounded_rpc(client.stats(tonic::Request::new(req)))
         .await
         .map_err(SearchError::Rpc)?
         .into_inner();
