@@ -1,5 +1,5 @@
 //! [`PeerChannelCache`] — shared tonic `Channel`-per-peer cache
-//! consumed by every cross-daemon caller that dials a peer's
+//! consumed by local and cross-daemon callers that dial
 //! `nexus.search.v1.SearchService`.
 //!
 //! # Why this lives in `nexus-search-common`
@@ -8,22 +8,20 @@
 //!
 //! * `nexus-search-plugin::peer_fanout` — the plugin fans out its
 //!   own Query to every peer plugin and merges the ranked lists.
-//! * `nexus-http-api`'s upcoming `TonicRemoteSearchBackend` — the
+//! * `nexus-http-api`'s `TonicRemoteSearchBackend` — the
 //!   axum handler's federated dispatcher dials a peer's plugin per
 //!   remote-zone leg with a [`SearchDelegation`](crate::SearchDelegation).
 //!
 //! Both need: TLS opt-in, plaintext-off-loopback refusal, connect
-//! and request timeouts, dial-once-per-peer caching, dashmap sharding
-//! so a slow dial does not stall a fast-cache hit.  Duplicating those
-//! 50 lines in each caller is a DRY break the user treats as a code
-//! break; sharing one impl behind an `Arc<PeerChannelCache>` is the
-//! systematic answer.
+//! timeouts, dial-once-per-peer caching, dashmap sharding
+//! so a slow dial does not stall a fast-cache hit. The HTTP gateway
+//! also shares these connections for indexing and configuration RPCs.
 //!
 //! # SRP
 //!
 //! Kept trait-narrow — `get_or_dial(target)` only.  The caller owns
 //! everything above the tonic Channel: request shaping, timeouts on
-//! individual RPCs (via `Request::set_timeout`), fusion, error
+//! individual RPCs, fusion, error
 //! bucketing at their own error boundary.  Adding "fan-out to
 //! every peer" or "delegation attach" logic here would fold two
 //! callers' orthogonal responsibilities into one type.
@@ -51,12 +49,6 @@ pub struct PeerChannelConfig {
     /// channel.  Kept tight so a hosed peer stops the caller fast
     /// instead of stretching p99.
     pub connect_timeout: Duration,
-    /// Per-request timeout — the send + response wait side.
-    /// Larger than `connect_timeout` so a legitimately heavy query
-    /// has room; still bounded to keep caller latency predictable.
-    /// Callers may also override per-request via
-    /// `tonic::Request::set_timeout`.
-    pub request_timeout: Duration,
     /// Whether dials must use TLS.  `false` in a private-overlay
     /// deployment (Tailnet, Docker bridge) that stays plaintext.
     pub require_tls: bool,
@@ -69,14 +61,11 @@ pub struct PeerChannelConfig {
 }
 
 impl PeerChannelConfig {
-    /// The shared defaults every known caller uses today:
-    /// 1_500 ms connect, 8_000 ms request, plaintext (both callers
-    /// today opt in via env), no insecure bypass.  A caller with a
-    /// different budget builds a struct literal directly.
+    /// Default connection budget: 1_500 ms, TLS disabled, insecure
+    /// off-loopback access refused. `with_tls` enables TLS.
     pub const fn const_default() -> Self {
         Self {
             connect_timeout: Duration::from_millis(1_500),
-            request_timeout: Duration::from_secs(8),
             require_tls: false,
             allow_insecure_peer: false,
         }
@@ -233,7 +222,6 @@ impl PeerChannelCache {
             })?;
         endpoint = endpoint
             .connect_timeout(self.config.connect_timeout)
-            .timeout(self.config.request_timeout)
             .tcp_keepalive(Some(Duration::from_secs(30)));
         if self.config.require_tls {
             // `with_enabled_roots` opts into the platform trust
@@ -508,7 +496,6 @@ mod tests {
         // is a conscious cross-caller decision, not a stealth bump.
         let cfg = PeerChannelConfig::default();
         assert_eq!(cfg.connect_timeout, Duration::from_millis(1_500));
-        assert_eq!(cfg.request_timeout, Duration::from_secs(8));
         assert!(!cfg.require_tls);
         assert!(!cfg.allow_insecure_peer);
     }

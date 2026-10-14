@@ -59,8 +59,7 @@ pub use crate::internal_call::INTERNAL_CALL_HEADER as PEER_FANOUT_MARKER_HEADER;
 /// shared cache's connect timeout so a legitimately heavy semantic
 /// query has room to complete, but still bounded to keep fan-out
 /// latency predictable.  Applied per-RPC via
-/// [`tonic::Request::set_timeout`] (on top of the cache's
-/// endpoint-level timeout).
+/// [`tonic::Request::set_timeout`] and a caller-side timeout.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Errors surfaced to callers of [`PeerFanoutDispatcher::query`].
@@ -224,7 +223,11 @@ impl PeerFanoutDispatcher {
                 if let Ok(v) = tonic::metadata::MetadataValue::try_from("1") {
                     request.metadata_mut().insert(PEER_FANOUT_MARKER_HEADER, v);
                 }
-                let resp = client.query(request).await;
+                let resp = tokio::time::timeout(REQUEST_TIMEOUT, client.query(request))
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(tonic::Status::deadline_exceeded("peer query timed out"))
+                    });
                 (peer_url_for_log, resp)
             }));
         }

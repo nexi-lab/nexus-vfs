@@ -64,6 +64,15 @@ fn batch(path: &str, token: &str) -> IndexDocumentsRequest {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn overload_and_cancellation_preserve_authority_capacity_and_committed_facts() {
+    index_admission(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slow_http_indexing_returns_its_committed_receipt_and_releases_capacity() {
+    index_admission(false).await;
+}
+
+async fn index_admission(cancel: bool) {
     let provider = Arc::new(Provider::default());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let embedding_url = format!("http://{}/v1/embeddings", listener.local_addr().unwrap());
@@ -174,9 +183,21 @@ async fn overload_and_cancellation_preserve_authority_capacity_and_committed_fac
             panic!("file indexing returned before embedding: {} {}\n{}", response.status(), response.text().await.unwrap(), daemon.drain());
         }
     }
-    pending.abort();
-    assert!(pending.await.unwrap_err().is_cancelled());
-    // Cancellation of the HTTP caller leaves the plugin's accepted work alive.
+    // Accepted indexing may outlive the interactive query budget.
+    tokio::select! {
+        result = &mut pending => {
+            let response = result.unwrap().unwrap();
+            panic!("indexing ended before the provider was released: {} {}", response.status(), response.text().await.unwrap());
+        }
+        _ = tokio::time::sleep(Duration::from_secs(9)) => {}
+    }
+    let mut pending = Some(pending);
+    if cancel {
+        let pending = pending.take().unwrap();
+        pending.abort();
+        assert!(pending.await.unwrap_err().is_cancelled());
+    }
+    // Accepted work keeps its capacity until the provider completes.
     for (url, body) in [
         (
             &batch_url,
@@ -341,6 +362,16 @@ async fn overload_and_cancellation_preserve_authority_capacity_and_committed_fac
         "rejected work reached the embedder"
     );
     provider.release.notify_one();
+    if let Some(pending) = pending {
+        let response = pending.await.unwrap().unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let receipt: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(receipt["status"], "indexed");
+        assert_eq!(receipt["index_seq"], 1);
+        assert_eq!(receipt["zone_id"], "sharedzone");
+    }
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let stats = ok(client
