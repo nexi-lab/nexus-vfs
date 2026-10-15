@@ -27,7 +27,7 @@ fn run() -> Result<(), String> {
         .and_then(Path::parent)
         .ok_or_else(|| "contracts crate is not under rust/contracts".to_string())?;
     let zone_id_dir = repository.join("contracts/zone-id");
-    let zone_path_dir = repository.join("contracts/zone-path");
+    let zone_path_dir = repository.join("contracts/zone-wire-path");
     let constants = fs::read_to_string(manifest_dir.join("src/constants.rs"))
         .map_err(|error| format!("cannot read constants.rs: {error}"))?;
 
@@ -135,9 +135,9 @@ fn generated_outputs(
 
     let path_schema = json!({
         "$schema": SCHEMA_DIALECT,
-        "$id": "https://nexus-vfs.dev/contracts/zone-path/zone-path.schema.gen.json",
-        "title": "ZonePath",
-        "description": "Canonical zone-relative wire path. This is not a product ResourceRef.",
+        "$id": "https://nexus-vfs.dev/contracts/zone-wire-path/zone-wire-path.schema.gen.json",
+        "title": "ZoneWirePath",
+        "description": "Canonical zone-relative wire path admitted at zone-runtime API boundaries. This is not a product ResourceRef.",
         "type": "string",
         "maxLength": max_length,
         "pattern": path_pattern
@@ -176,7 +176,10 @@ fn generated_outputs(
                 schema
             },
         ),
-        (zone_path_dir.join("zone-path.schema.gen.json"), path_schema),
+        (
+            zone_path_dir.join("zone-wire-path.schema.gen.json"),
+            path_schema,
+        ),
     ]))
 }
 

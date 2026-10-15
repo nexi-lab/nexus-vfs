@@ -104,6 +104,7 @@ fn one_unreadable_mount_does_not_empty_the_rest_of_the_listing() {
     // A subtree whose own store cannot be listed.
     k.sys_setattr(
         "/broken",
+        &ctx,
         2, // DT_MOUNT
         "mem",
         Some(Arc::new(common::MemBackend::default())
