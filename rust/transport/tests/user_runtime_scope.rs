@@ -105,10 +105,13 @@ impl Listener {
     ) -> Self {
         let root = tempfile::tempdir().unwrap();
         let kernel = Arc::new(Kernel::new());
+        // Harness boot mount: the system/admin context every boot-tier
+        // mount uses (see `mount_root_filesystem` in the cluster profile).
+        let boot_ctx = OperationContext::new("system", "root", true, None, true);
         kernel
             .mount(
                 "/",
-                MountOptions::new("local")
+                MountOptions::new(&boot_ctx, "local")
                     .with_backend(Arc::new(PathLocalBackend::new(root.path(), false).unwrap())),
             )
             .unwrap();

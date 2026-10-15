@@ -2103,8 +2103,14 @@ fn mount_root_filesystem(kernel: &Arc<Kernel>, common: &CommonArgs) -> Result<()
         PathLocalBackend::new(&root_fs, /* fsync */ false)
             .with_context(|| format!("PathLocalBackend init at {}", root_fs.display()))?,
     );
+    // Boot-tier mount: the same system/admin context the managed-agent
+    // substrate uses for kernel-tier calls (see `raw_spawn`).
+    let boot_ctx = OperationContext::new("system", "root", true, None, true);
     kernel
-        .mount("/", MountOptions::new("local").with_backend(backend))
+        .mount(
+            "/",
+            MountOptions::new(&boot_ctx, "local").with_backend(backend),
+        )
         .map_err(|e| anyhow::anyhow!("mount / via path_local: {:?}", e))?;
     tracing::info!(
         root_fs = %root_fs.display(),
@@ -2331,6 +2337,11 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     );
 
     mount_root_filesystem(&kernel, &common)?;
+
+    // Boot-tier context for the daemon's own kernel-tier mounts below
+    // (driver mounts, runtime backends): the same system/admin identity
+    // `mount_root_filesystem` mounts the root with.
+    let boot_ctx = OperationContext::new("system", "root", true, None, true);
 
     plugin_loading::load(&kernel, common.plugin_dir.as_deref())?;
 
