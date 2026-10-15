@@ -253,6 +253,11 @@ impl Daemon {
     /// test's own (for `RUST_LOG=info` debugging); nothing is captured then, so
     /// `drain()` / `wait_for_log()` see nothing.
     pub fn spawn(args: &[&str], env: &[(&str, &str)]) -> Self {
+        Self::spawn_binary(bin(), args, env)
+    }
+
+    /// Drive the same wire contract against an explicitly selected cohost binary.
+    pub fn spawn_binary(binary: &str, args: &[&str], env: &[(&str, &str)]) -> Self {
         // A daemon with no identity dir falls back to the USER-GLOBAL one
         // (`~/.local/share/nexus/identity.json`). Every test in a binary then
         // shares it, they run concurrently, and the loser of the atomic-rename
@@ -276,7 +281,7 @@ impl Daemon {
              the failure surfaces as an unrelated assertion. args: {args:?}"
         );
         let inherit = std::env::var("NEXUS_E2E_INHERIT_LOGS").is_ok();
-        let mut cmd = Command::new(bin());
+        let mut cmd = Command::new(binary);
         cmd.args(args)
             .env_remove("NEXUS_API_KEY_SECRET")
             .env_remove("NEXUS_INSECURE_NO_AUTH")
