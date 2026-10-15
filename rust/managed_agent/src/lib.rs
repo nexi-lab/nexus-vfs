@@ -853,6 +853,33 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
         Ok(())
     }
 
+    /// The stricter v1 boundary: legacy `*_v1` spellings predate the
+    /// delegated-credential model, so context attribution there is the
+    /// weakest — every caller must prove ownership (or admin/system),
+    /// regardless of credential class.
+    fn authorize_session_owner(
+        &self,
+        ctx: &contracts::OperationContext,
+        session_id: &str,
+    ) -> Result<(), RustCallError> {
+        let desc = self.agent_registry.get(session_id).ok_or_else(|| {
+            RustCallError::InvalidArgument(format!("unknown session_id {session_id:?}"))
+        })?;
+        // Authorization is by IDENTITY, not by credential type: an agent
+        // credential is a low-privilege subject by design (the auth layer
+        // grants it no zone tenancy), so it passes exactly the same
+        // ownership/admin check a bare principal does. A session cert still
+        // reaches its own sessions because its `ctx.user_id` is the
+        // CA-verified owner SAN the attribution rules stamped in.
+        if desc.owner_id != ctx.user_id && !ctx.is_admin && !ctx.is_system {
+            return Err(RustCallError::PermissionDenied(
+                "managed-agent session operation requires ownership or administrator privileges"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Read-through liveness snapshot. Cheap by design; the live
     /// message flow uses `sys_watch` over `/proc/{pid}/transcript`,
     /// not this RPC.
@@ -1309,6 +1336,7 @@ impl<K: KernelSyscall> RustService for ManagedAgentService<K> {
                 let req: CancelRequest = serde_json::from_slice(payload)
                     .map_err(|e| RustCallError::InvalidArgument(e.to_string()))?;
                 self.authorize_session_control(&req.session_id, ctx)?;
+                self.authorize_session_owner(ctx, &req.session_id)?;
                 let resp = self.cancel(&req.session_id, req.mode)?;
                 serde_json::to_vec(&resp)
                     .map_err(|error| RustCallError::Internal(error.to_string()))
@@ -1339,6 +1367,7 @@ impl<K: KernelSyscall> RustService for ManagedAgentService<K> {
                 let req: GetSessionRequest = serde_json::from_slice(payload)
                     .map_err(|e| RustCallError::InvalidArgument(e.to_string()))?;
                 self.authorize_session_control(&req.session_id, ctx)?;
+                self.authorize_session_owner(ctx, &req.session_id)?;
                 let resp = self.get_session(&req.session_id)?;
                 serde_json::to_vec(&resp)
                     .map_err(|error| RustCallError::Internal(error.to_string()))

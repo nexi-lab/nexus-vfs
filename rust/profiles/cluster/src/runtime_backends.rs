@@ -7,7 +7,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use kernel::hal::object_store_provider::{get_provider, ObjectStoreProviderArgs};
 use kernel::kernel::convenience::{KernelConvenience, MountOptions};
-use kernel::kernel::Kernel;
+use kernel::kernel::{Kernel, OperationContext};
 use serde::Deserialize;
 
 #[derive(Default, Deserialize)]
@@ -65,6 +65,10 @@ impl RuntimeBackends {
             return Ok(());
         }
         let provider = get_provider().context("runtime ObjectStoreProvider unavailable")?;
+        // Boot-tier mounts of operator-declared backends: the same
+        // system/admin context every other boot mount uses (see
+        // `mount_root_filesystem`).
+        let boot_ctx = OperationContext::new("system", "root", true, None, true);
         for mount in self.mounts {
             if !provider.can_build(&mount.backend_type) {
                 bail!(
@@ -102,7 +106,7 @@ impl RuntimeBackends {
                 .vfs_router_arc()
                 .route(parent, contracts::ROOT_ZONE_ID)
                 .and_then(|route| route.metastore);
-            let mut options = MountOptions::new(&mount.backend_name)
+            let mut options = MountOptions::new(&boot_ctx, &mount.backend_name)
                 .with_backend(backend)
                 .with_zone(contracts::ROOT_ZONE_ID);
             if let Some(metastore) = parent_metastore {

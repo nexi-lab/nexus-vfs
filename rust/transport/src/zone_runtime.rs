@@ -181,7 +181,18 @@ impl ZoneRuntimeServiceImpl {
         &self,
         req: Request<T>,
     ) -> Result<(OperationContext, T), Status> {
-        authenticate_with(&self.auth, &self.ready, &self.foreign_ca_verifier, req).await
+        // No runtime delegation on the zone plane: a gateway-forwarded
+        // credential must be refused here rather than silently fall back to
+        // the gateway's own identity (fail closed, as `resolve_request_context`
+        // does for every door without a wired scope).
+        authenticate_with(
+            &self.auth,
+            &self.ready,
+            &self.foreign_ca_verifier,
+            None,
+            req,
+        )
+        .await
     }
 
     fn require_admin(ctx: &OperationContext, mutation: &str) -> Result<(), Status> {
@@ -207,7 +218,7 @@ impl ZoneRuntimeServiceImpl {
     /// a raw `/{parent}{mount_path}` concatenation mis-shapes non-absolute
     /// inputs (`"foo"` → `/rootfoo`) and root mounts (`"/"` → `/root/`),
     /// so the gate would be asking about a path nobody writes. The raft
-    /// layer's `validate_zone_path` admission (which runs after this gate
+    /// layer's `validate_zone_wire_path` admission (which runs after this gate
     /// in the RPC chain) rejects those inputs outright before any journal
     /// claim or execution.
     fn check_mount_path(
