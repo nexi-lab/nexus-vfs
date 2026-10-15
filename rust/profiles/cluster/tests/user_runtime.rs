@@ -16,6 +16,219 @@ use nexus_raft::transport::{
 
 const BUDGET: Duration = Duration::from_secs(30);
 
+#[tokio::test]
+async fn signed_search_keeps_the_owner_boundary_and_reopens_committed_indexes() {
+    use nexus_search_plugin::search_proto::{
+        search_service_client::SearchServiceClient, DeletePathContextRequest, IndexRequest,
+        ListPathContextsRequest, PutPathContextRequest, QueryRequest, QueryType, StatsRequest,
+    };
+
+    async fn assert_owned_hits(
+        search: &mut SearchServiceClient<tonic::transport::Channel>,
+        template: QueryRequest,
+        real_models: bool,
+    ) {
+        let kinds: &[QueryType] = if real_models {
+            &[QueryType::Keyword, QueryType::Semantic, QueryType::Hybrid]
+        } else {
+            &[QueryType::Keyword]
+        };
+        for &kind in kinds {
+            let hits = search
+                .query(QueryRequest {
+                    query_type: kind as i32,
+                    ..template.clone()
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(hits.error.is_none(), "{kind:?}: {hits:?}");
+            assert!(
+                hits.results.iter().any(|hit| hit.path == "/owner-note.md"),
+                "{kind:?}: {hits:?}"
+            );
+        }
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let plugins = common::search_plugin::signed_plugin(root.path());
+    let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let (cert, key) =
+        generate_user_runtime_cert("runtime-alice", "alice", 300, &ca, &ca_key).unwrap();
+    let credential = root.path().join("server");
+    bundle(&credential, "runtime-alice", "alice", &ca, &cert, &key);
+    let mut clients = Vec::new();
+    for owner in ["alice", "bob"] {
+        let actor = format!("session-{owner}");
+        let (cert, key) = generate_session_agent_cert(&actor, owner, 300, &ca, &ca_key).unwrap();
+        clients.push(bundle(
+            &root.path().join(owner),
+            &actor,
+            "alice",
+            &ca,
+            &cert,
+            &key,
+        ));
+    }
+    let models = root.path().join("empty-models");
+    std::fs::create_dir(&models).unwrap();
+    let real_models = std::env::var("NEXUS_SEARCH_E2E_MODEL_DIR").ok();
+    let model_dir = real_models
+        .as_deref()
+        .unwrap_or_else(|| models.to_str().unwrap());
+    let binary = std::env::var("NEXUS_SEARCH_USER_RUNTIME_BINARY")
+        .unwrap_or_else(|_| common::bin().to_owned());
+    eprintln!(
+        "Search runtime binary under test: {binary}; real model: {}",
+        real_models.is_some()
+    );
+    let data = root.path().join("owned-data");
+    let unrelated = root.path().join("unrelated-data");
+    let port = free_port();
+    let spawn = || {
+        Daemon::spawn_binary(
+            &binary,
+            &[
+                "--data-dir",
+                data.to_str().unwrap(),
+                "--plugin-dir",
+                plugins.to_str().unwrap(),
+                "--bind-addr",
+                &format!("127.0.0.1:{port}"),
+                "serve-user",
+                "--owner",
+                "alice",
+                "--credential",
+                credential.to_str().unwrap(),
+            ],
+            &[
+                ("RUST_LOG", LOG_FILTER),
+                (
+                    "NEXUS_LOCAL_TRUSTED_KEYS_DIR",
+                    root.path().join("trust").to_str().unwrap(),
+                ),
+                ("NEXUS_DATA_DIR", unrelated.to_str().unwrap()),
+                ("NEXUS_SEARCH_MODEL_DIR", model_dir),
+                ("NEXUS_SEARCH_EMBED_API_URL", ""),
+                ("NEXUS_SEARCH_QUERY_EXPANSION", "false"),
+                ("NEXUS_SEARCH_CONTEXTUAL_CHUNKING", "false"),
+            ],
+        )
+    };
+    let mut daemon = spawn();
+    daemon
+        .wait_for_log("confined user runtime ready", BUDGET)
+        .await
+        .unwrap();
+    let mut owner = Vfs::connect_as_agent(port, &clients[0], BUDGET).await;
+    owner
+        .write_file("/owner-note.md", b"gentian durable owner document", "")
+        .await
+        .unwrap();
+    let query = || QueryRequest {
+        q: "gentian".into(),
+        limit: 10,
+        query_type: QueryType::Keyword as i32,
+        ..Default::default()
+    };
+    let mut foreign = SearchServiceClient::new(dial_channel(port, &clients[1]).await.unwrap());
+    let refusal = foreign.query(query()).await.unwrap_err();
+    assert_eq!(refusal.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        refusal.message(),
+        "request does not belong to this user runtime"
+    );
+    assert_eq!(
+        foreign
+            .index(IndexRequest::default())
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    assert_eq!(
+        foreign
+            .stats(StatsRequest::default())
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    let mut search = SearchServiceClient::new(dial_channel(port, &clients[0]).await.unwrap());
+    let indexed = search
+        .index(IndexRequest {
+            root_path: "/".into(),
+            recursive: true,
+            max_docs: 10,
+            ..Default::default()
+        })
+        .await
+        .expect("the confined owner must be able to index its own workspace")
+        .into_inner();
+    assert_eq!(indexed.indexed_count, 1, "{indexed:?}");
+    assert_owned_hits(&mut search, query(), real_models.is_some()).await;
+    let before = search
+        .stats(StatsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(before.last_index_seq > 0, "{before:?}");
+    assert_eq!(
+        search
+            .put_path_context(PutPathContextRequest::default())
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    assert_eq!(
+        search
+            .delete_path_context(DeletePathContextRequest::default())
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    assert_eq!(
+        search
+            .list_path_contexts(ListPathContextsRequest::default())
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    let mut invalid = tonic::Request::new(query());
+    invalid
+        .metadata_mut()
+        .insert("authorization", "Bearer invalid".parse().unwrap());
+    assert_eq!(
+        search.query(invalid).await.unwrap_err().code(),
+        tonic::Code::Unauthenticated
+    );
+    assert!(!unrelated.exists());
+    assert!(!data.join("tls/ca-key.pem").exists());
+    assert!(!data.join("tls/api-key-secret").exists());
+    drop(search);
+    drop(foreign);
+    drop(owner);
+    drop(daemon);
+    let mut restarted = spawn();
+    restarted
+        .wait_for_log("confined user runtime ready", BUDGET)
+        .await
+        .unwrap();
+    let mut search = SearchServiceClient::new(dial_channel(port, &clients[0]).await.unwrap());
+    assert_owned_hits(&mut search, query(), real_models.is_some()).await;
+    let after = search
+        .stats(StatsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(after.last_index_seq >= before.last_index_seq, "{after:?}");
+    assert_eq!(after.pending, 0);
+    assert_eq!(after.indexing_in_progress, 0);
+}
+
 async fn dial_client(
     port: u16,
     credential: &LoadedCredential,

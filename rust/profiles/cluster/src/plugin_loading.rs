@@ -43,11 +43,15 @@ pub(super) fn routes(
         verifier,
         ready,
         |endpoint| {
-            let policy: Arc<dyn PluginGrpcPolicy> = if endpoint.service_name == SERVICE_NAME {
-                Arc::new(SearchGrpcPolicy::new(Arc::clone(kernel), Arc::clone(auth)))
-            } else {
-                Arc::new(AuthenticatedPlugin::new(Arc::clone(auth)))
-            };
+            if endpoint.service_name == SERVICE_NAME {
+                let policy = SearchGrpcPolicy::new(Arc::clone(kernel), Arc::clone(auth));
+                return Arc::new(match &scope {
+                    Some(scope) => policy.with_runtime_scope(Arc::clone(scope)),
+                    None => policy,
+                }) as Arc<dyn PluginGrpcPolicy>;
+            }
+            let policy: Arc<dyn PluginGrpcPolicy> =
+                Arc::new(AuthenticatedPlugin::new(Arc::clone(auth)));
             match &scope {
                 Some(scope) => Arc::new(RuntimeScopedPlugin::new(
                     policy,

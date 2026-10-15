@@ -3,8 +3,10 @@
 //! Query, BatchQuery, Glob, Grep and Locate use the kernel's installed file
 //! permission policy. User and service keys also require a readable zone grant.
 //! Certificate agents carry identity without zone tenancy. Index management
-//! and aggregate diagnostics require an administrator or a cluster node because
-//! those operations act on the shared index. Every returned path is checked after
+//! and aggregate diagnostics require an administrator or a cluster node on a
+//! shared host. A confined runtime's validated owner may manage its private index;
+//! external path-context configuration retains its administrator gate.
+//! Every returned path is checked after
 //! plugin execution, including cached and expanded results. Indexed hits are
 //! also checked against the live VFS namespace. Filtering may leave
 //! fewer results than the requested limit.
@@ -25,6 +27,7 @@ use crate::auth::{AuthCredentials, AuthProvider, PeerIdentity};
 use crate::grpc_plugin_access::{
     request_token, AuthenticatedResponse, AuthorizedPluginCall, PluginGrpcPolicy,
 };
+use crate::runtime_scope::RuntimeScope;
 
 /// Generated from the shared SearchService protocol, without the search engine.
 pub mod proto {
@@ -38,11 +41,23 @@ pub const SERVICE_NAME: &str = "nexus.search.v1.SearchService";
 pub struct SearchGrpcPolicy {
     kernel: Arc<Kernel>,
     auth: Arc<dyn AuthProvider>,
+    runtime_scope: Option<Arc<RuntimeScope>>,
 }
 
 impl SearchGrpcPolicy {
     pub fn new(kernel: Arc<Kernel>, auth: Arc<dyn AuthProvider>) -> Self {
-        Self { kernel, auth }
+        Self {
+            kernel,
+            auth,
+            runtime_scope: None,
+        }
+    }
+
+    /// Confine requests to the runtime owner before applying Search policy.
+    #[must_use]
+    pub fn with_runtime_scope(mut self, scope: Arc<RuntimeScope>) -> Self {
+        self.runtime_scope = Some(scope);
+        self
     }
 
     fn authenticate(
@@ -52,7 +67,11 @@ impl SearchGrpcPolicy {
         token: &str,
     ) -> Result<OperationContext, Status> {
         let token = request_token(metadata, token)?;
-        self.auth.resolve(&AuthCredentials { token, peer })
+        let ctx = self.auth.resolve(&AuthCredentials { token, peer })?;
+        match &self.runtime_scope {
+            Some(scope) => scope.resolve(self.auth.as_ref(), ctx, peer, token, metadata),
+            None => Ok(ctx),
+        }
     }
 
     fn view(&self, ctx: OperationContext, requested: &str) -> Result<ReadView, Status> {
@@ -71,22 +90,21 @@ impl SearchGrpcPolicy {
         token: &str,
     ) -> Result<OperationContext, Status> {
         let ctx = self.authenticate(metadata, peer, token)?;
-        if !privileged(&ctx) {
-            return Err(Status::permission_denied(
-                "search index management requires an administrator",
-            ));
+        if self.runtime_scope.is_none() {
+            require_administrator(&ctx)?;
         }
         Ok(ctx)
     }
 
-    fn admin(
+    fn administrator_context(
         &self,
         metadata: &MetadataMap,
         peer: Option<&PeerIdentity>,
         token: &str,
-    ) -> Result<Box<dyn AuthorizedPluginCall>, Status> {
-        self.management_context(metadata, peer, token)?;
-        Ok(Box::new(AuthenticatedResponse))
+    ) -> Result<OperationContext, Status> {
+        let ctx = self.authenticate(metadata, peer, token)?;
+        require_administrator(&ctx)?;
+        Ok(ctx)
     }
 }
 
@@ -105,10 +123,11 @@ impl PluginGrpcPolicy for SearchGrpcPolicy {
             )));
         }
 
-        macro_rules! admin {
-            ($request:ty) => {{
+        macro_rules! authorize {
+            ($request:ty, $context:ident) => {{
                 let request = decode_request::<$request>(payload)?;
-                return self.admin(metadata, peer, &request.auth_token);
+                self.$context(metadata, peer, &request.auth_token)?;
+                return Ok(Box::new(AuthenticatedResponse));
             }};
         }
 
@@ -235,9 +254,9 @@ impl PluginGrpcPolicy for SearchGrpcPolicy {
                 *payload = request.encode_to_vec();
                 SearchResponse::Locate(view, path)
             }
-            "Index" => admin!(IndexRequest),
-            "Refresh" => admin!(RefreshRequest),
-            "IndexDocuments" => admin!(IndexDocumentsRequest),
+            "Index" => authorize!(IndexRequest, management_context),
+            "Refresh" => authorize!(RefreshRequest, management_context),
+            "IndexDocuments" => authorize!(IndexDocumentsRequest, management_context),
             "IndexFile" => {
                 let mut request = decode_request::<IndexFileRequest>(payload)?;
                 let ctx = self.management_context(metadata, peer, &request.auth_token)?;
@@ -252,16 +271,20 @@ impl PluginGrpcPolicy for SearchGrpcPolicy {
                 *payload = request.encode_to_vec();
                 return Ok(Box::new(AuthenticatedResponse));
             }
-            "NotifyFileChange" => admin!(NotifyFileChangeRequest),
-            "ParkedList" => admin!(ParkedListRequest),
-            "ParkedRetry" => admin!(ParkedRetryRequest),
-            "ParkedDiscard" => admin!(ParkedDiscardRequest),
-            "AddIndexedDirectory" => admin!(AddIndexedDirectoryRequest),
-            "RemoveIndexedDirectory" => admin!(RemoveIndexedDirectoryRequest),
-            "ListIndexedDirectories" => admin!(ListIndexedDirectoriesRequest),
-            "SetZoneIndexingMode" => admin!(SetZoneIndexingModeRequest),
-            "PutPathContext" => admin!(PutPathContextRequest),
-            "DeletePathContext" => admin!(DeletePathContextRequest),
+            "NotifyFileChange" => authorize!(NotifyFileChangeRequest, management_context),
+            "ParkedList" => authorize!(ParkedListRequest, management_context),
+            "ParkedRetry" => authorize!(ParkedRetryRequest, management_context),
+            "ParkedDiscard" => authorize!(ParkedDiscardRequest, management_context),
+            "AddIndexedDirectory" => authorize!(AddIndexedDirectoryRequest, management_context),
+            "RemoveIndexedDirectory" => {
+                authorize!(RemoveIndexedDirectoryRequest, management_context)
+            }
+            "ListIndexedDirectories" => {
+                authorize!(ListIndexedDirectoriesRequest, management_context)
+            }
+            "SetZoneIndexingMode" => authorize!(SetZoneIndexingModeRequest, management_context),
+            "PutPathContext" => authorize!(PutPathContextRequest, administrator_context),
+            "DeletePathContext" => authorize!(DeletePathContextRequest, administrator_context),
             "ListPathContexts" => {
                 let mut request = decode_request::<ListPathContextsRequest>(payload)?;
                 let ctx = self.authenticate(metadata, peer, &request.auth_token)?;
@@ -285,9 +308,9 @@ impl PluginGrpcPolicy for SearchGrpcPolicy {
                 }
                 return Ok(Box::new(AuthenticatedResponse));
             }
-            "ListZoneIndexingModes" => admin!(ListZoneIndexingModesRequest),
-            "Health" => admin!(HealthRequest),
-            "Stats" => admin!(StatsRequest),
+            "ListZoneIndexingModes" => authorize!(ListZoneIndexingModesRequest, management_context),
+            "Health" => authorize!(HealthRequest, management_context),
+            "Stats" => authorize!(StatsRequest, management_context),
             _ => return Err(Status::unimplemented("unknown SearchService method")),
         };
         Ok(Box::new(filter))
@@ -313,6 +336,15 @@ pub fn search_zone_for_path(
 
 fn privileged(ctx: &OperationContext) -> bool {
     ctx.is_admin || ctx.is_system
+}
+
+fn require_administrator(ctx: &OperationContext) -> Result<(), Status> {
+    if !privileged(ctx) {
+        return Err(Status::permission_denied(
+            "search index management requires an administrator",
+        ));
+    }
+    Ok(())
 }
 
 struct ReadView {
@@ -571,3 +603,7 @@ fn decode_request<M: Message + Default>(payload: &[u8]) -> Result<M, Status> {
 fn decode_response<M: Message + Default>(payload: &[u8]) -> Result<M, Status> {
     M::decode(payload).map_err(|_| Status::internal("invalid search response"))
 }
+
+#[cfg(test)]
+#[path = "grpc_search_access_tests.rs"]
+mod tests;
