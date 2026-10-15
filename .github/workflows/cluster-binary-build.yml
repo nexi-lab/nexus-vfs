@@ -40,36 +40,35 @@ jobs:
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
-            max_size_bytes: 20447232  # 19.5 MiB. Main measured 19,515,016 on
-                                      # 1.99.0; the typed ZoneRuntime plane (#364)
-                                      # and the declared mount subtree (#361) stack
-                                      # ~0.75 MiB on top. Generous until
-                                      # re-measured on the merge.
+            max_size_bytes: 20764672  # 19.75 MiB. Measured 20,202,880 on the
+                                      # rebased #364 (main's 1.99.0 baseline 19,515,016
+                                      # plus the typed ZoneRuntime plane and the declared
+                                      # mount subtree); ~2.8% headroom.
           - os: macos-14
             artifact_name: nexusd-cluster-macos-arm64
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
-            max_size_bytes: 17301504  # 16.5 MiB. Main measured 16,804,432 on
-                                      # 1.99.0; the #364/#361 stack adds ~0.25 MiB,
-                                      # which still leaves headroom.
+            max_size_bytes: 18087936  # 17.25 MiB. Measured 17,419,600 on the
+                                      # rebased #364 (main's 1.99.0 baseline 16,804,432
+                                      # plus the #364/#361 stack); ~3.8% headroom.
           - os: macos-14
             artifact_name: nexusd-cluster-macos-x86_64
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
             target: x86_64-apple-darwin
-            max_size_bytes: 18612224  # 17.75 MiB. Main measured 17,947,120 on
-                                      # 1.99.0; the #364/#361 stack adds ~0.5 MiB,
-                                      # which still leaves headroom.
+            max_size_bytes: 19148800  # 18.25 MiB. Measured 18,580,176 on the
+                                      # rebased #364 (main's 1.99.0 baseline 17,947,120
+                                      # plus the #364/#361 stack); ~3.1% headroom.
           - os: windows-latest
             artifact_name: nexusd-cluster-windows-x86_64
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster.exe
-            max_size_bytes: 19398656  # 18.5 MiB. Main measured 18,572,288 on
-                                      # 1.99.0; the #364/#361 stack adds ~0.5 MiB,
-                                      # which still leaves headroom.
+            max_size_bytes: 19922944  # 19 MiB. Measured 19,324,416 on the
+                                      # rebased #364 (main's 1.99.0 baseline 18,572,288
+                                      # plus the #364/#361 stack); ~3.1% headroom.
 
 
     steps:
