@@ -48,20 +48,31 @@ use std::sync::Arc;
 /// Owns a raw file descriptor; closes on drop.
 struct FileHandle {
     fd: RawFd,
+    physical_path: std::path::PathBuf,
+    device: u64,
+    inode: u64,
 }
 
 #[cfg(unix)]
 impl FileHandle {
     /// Open `path` with O_RDWR. Returns `None` if open fails.
     fn open(path: &Path) -> Option<Self> {
-        use std::ffi::CString;
-        let c_path = CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
-        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR) };
-        if fd < 0 {
-            None
-        } else {
-            Some(Self { fd })
-        }
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_CLOEXEC)
+            .open(path)
+            .ok()?;
+        let metadata = file.metadata().ok()?;
+        Some(Self {
+            fd: file.into_raw_fd(),
+            physical_path: path.to_path_buf(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
     }
 
     /// Atomic positioned read — no seek state mutation.
@@ -75,16 +86,12 @@ impl FileHandle {
         unsafe { libc::pwrite(self.fd, buf.as_ptr().cast(), buf.len(), offset) }
     }
 
-    /// File size via fstat.
-    fn size(&self) -> Option<u64> {
-        unsafe {
-            let mut stat: libc::stat = std::mem::zeroed();
-            if libc::fstat(self.fd, &mut stat) == 0 {
-                Some(stat.st_size as u64)
-            } else {
-                None
-            }
-        }
+    /// Only reuse a descriptor while its physical path still names that inode.
+    fn current_size(&self) -> Option<u64> {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = std::fs::metadata(&self.physical_path).ok()?;
+        (metadata.dev() == self.device && metadata.ino() == self.inode).then_some(metadata.len())
     }
 }
 
@@ -136,8 +143,15 @@ impl FileDescriptorTable {
 
     /// Read the entire file content via the pre-opened fd. Returns `None` on miss.
     pub(crate) fn pread(&self, vfs_path: &str) -> Option<Vec<u8>> {
-        let handle = self.fds.get(vfs_path)?;
-        let size = handle.size()? as usize;
+        let handle = Arc::clone(self.fds.get(vfs_path)?.value());
+        let Some(size) = handle.current_size() else {
+            // The backend must resolve a replacement under its own policy.
+            // Do not evict a newer registration installed during this read.
+            self.fds
+                .remove_if(vfs_path, |_, cached| Arc::ptr_eq(cached, &handle));
+            return None;
+        };
+        let size = size as usize;
         if size == 0 {
             return Some(Vec::new());
         }
@@ -155,7 +169,7 @@ impl FileDescriptorTable {
         self.fds.remove(vfs_path);
     }
 
-    /// Re-key an fd from `old_path` to `new_path` (Unix rename keeps fd valid).
+    /// Re-key an fd; reads still validate its original physical path.
     pub(crate) fn rename(&self, old_path: &str, new_path: &str) {
         if let Some((_, handle)) = self.fds.remove(old_path) {
             self.fds.insert(new_path.to_string(), handle);
@@ -269,5 +283,50 @@ mod tests {
         // pread reflects the new content (fd stays valid after external truncate+write)
         let data = fdt.pread("/mut").unwrap();
         assert_eq!(data, b"v2-longer");
+    }
+
+    #[test]
+    fn atomic_external_replace_invalidates_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("document.txt");
+        let replacement = dir.path().join("replacement.txt");
+        std::fs::write(&file, b"old contents").unwrap();
+
+        let fdt = FileDescriptorTable::new();
+        assert!(fdt.register("/document.txt", &file));
+        assert_eq!(fdt.pread("/document.txt").unwrap(), b"old contents");
+        std::fs::write(&replacement, b"new").unwrap();
+        std::fs::rename(&replacement, &file).unwrap();
+
+        assert!(fdt.pread("/document.txt").is_none());
+        assert!(fdt.fds.is_empty());
+        assert!(fdt.register("/document.txt", &file));
+        assert_eq!(fdt.pread("/document.txt").unwrap(), b"new");
+    }
+
+    #[test]
+    fn external_delete_invalidates_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("deleted.txt");
+        std::fs::write(&file, b"deleted contents").unwrap();
+        let fdt = FileDescriptorTable::new();
+        assert!(fdt.register("/deleted.txt", &file));
+
+        std::fs::remove_file(&file).unwrap();
+        assert!(fdt.pread("/deleted.txt").is_none());
+        assert!(fdt.fds.is_empty());
+    }
+
+    #[test]
+    fn cached_descriptor_does_not_survive_exec() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("private.txt");
+        std::fs::write(&file, b"private").unwrap();
+        let fdt = FileDescriptorTable::new();
+        assert!(fdt.register("/private.txt", &file));
+        let handle = fdt.fds.get("/private.txt").unwrap();
+        let flags = unsafe { libc::fcntl(handle.fd, libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
     }
 }
