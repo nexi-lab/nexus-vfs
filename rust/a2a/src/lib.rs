@@ -268,7 +268,7 @@ fn index_conversation<K: KernelSyscall>(
     Ok(())
 }
 
-/// The shared `sys_setattr` shape for a2a's metadata-only entries — 21
+/// The shared `sys_setattr` shape for a2a's metadata-only entries — 22
 /// positional arguments are worth naming once rather than at each call site,
 /// where a misplaced `None` is invisible.
 fn metadata_setattr<K: KernelSyscall>(

@@ -2465,7 +2465,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         Arc::clone(&kernel),
         Arc::clone(&zone_runtime_caps_slot),
         Arc::clone(&fca_verifier_slot),
-        64 * 1024 * 1024,
+        contracts::MAX_GRPC_MESSAGE_BYTES,
     );
     // Same-package services co-host cleanly: the zone-runtime addon is an
     // explicitly-routed (fallback-free) axum router, so it merges under
@@ -4108,8 +4108,14 @@ async fn run_share(
     // recorded on another member since then is invisible until the replica
     // catches up, so prove the replica current BEFORE the guard reads it
     // (same call the daemon's own boot makes). A no-op when the epoch zone
-    // is not hosted here.
-    catch_up_epoch_zone(&zm, epoch_zone_id(common.no_tls), node_id);
+    // is not hosted here. Off the async worker, the same wrap the daemon's
+    // boot uses: the catch-up parks the calling thread in a 5 ms poll loop
+    // for up to EPOCH_CATCHUP_BUDGET_SECS.
+    let epoch_zone = epoch_zone_id(common.no_tls);
+    let zm_catchup = std::sync::Arc::clone(&zm);
+    tokio::task::spawn_blocking(move || catch_up_epoch_zone(&zm_catchup, epoch_zone, node_id))
+        .await
+        .ok();
     let peers_str: Vec<String> = cli_peer_addrs
         .iter()
         .map(NodeAddress::to_raft_peer_str)
@@ -4584,8 +4590,14 @@ async fn run_join(
     // it up BEFORE the joiner's D9 guard reads it, or a deletion the
     // founder recorded while this node was down stays invisible and the
     // joiner would re-found the deleted zone (same call the daemon's boot
-    // makes; no-op when the epoch zone is not hosted here).
-    catch_up_epoch_zone(&zm, epoch_zone_id(common.no_tls), node_id);
+    // makes; no-op when the epoch zone is not hosted here). Off the async
+    // worker, the same wrap the daemon's boot uses: the catch-up parks the
+    // calling thread in a 5 ms poll loop for up to EPOCH_CATCHUP_BUDGET_SECS.
+    let epoch_zone = epoch_zone_id(common.no_tls);
+    let zm_catchup = std::sync::Arc::clone(&zm);
+    tokio::task::spawn_blocking(move || catch_up_epoch_zone(&zm_catchup, epoch_zone, node_id))
+        .await
+        .ok();
 
     // Pre-#3996 (and pre-this commit) ``run_join`` only invoked
     // ``zm.join_zone(remote_zone_id, peers, false)`` — that registers

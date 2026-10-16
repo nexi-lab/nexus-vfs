@@ -289,6 +289,7 @@ impl Daemon {
         cmd.args(args)
             .env_remove("NEXUS_API_KEY_SECRET")
             .env_remove("NEXUS_INSECURE_NO_AUTH")
+            .env_remove("NEXUS_FORCE_DELETED_ZONE_RECREATE")
             .env(
                 "RUST_LOG",
                 std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".into()),

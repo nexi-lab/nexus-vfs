@@ -625,24 +625,28 @@ impl VfsServiceImpl {
     /// `ForeignAgentMailboxOnly` can create only inside its mailbox — the same
     /// boundary the write seam enforces on stream/pipe appends.
     fn setattr_typed(&self, req: SetattrRequest, ctx: &OperationContext) -> SetattrResponse {
-        let zone_id = if req.zone_id.is_empty() {
-            kernel::ROOT_ZONE_ID
-        } else {
-            req.zone_id.as_str()
-        };
-        if let Err(status) = self.authorize_path(&req.path, Permission::Write, ctx) {
+        // Authorization and the write must resolve in the SAME zone: an
+        // explicit zone_id rewrites the context before the gate (exactly the
+        // stat/readdir/batch_stat seam), and an omitted zone_id keeps the
+        // authenticated zone — a tenant that omits it must land in its own
+        // zone, not silently in root.
+        let mut ctx = ctx.clone();
+        if !req.zone_id.is_empty() {
+            ctx.zone_id = req.zone_id.clone();
+        }
+        if let Err(status) = self.authorize_path(&req.path, Permission::Write, &ctx) {
             return error_setattr(status);
         }
         let result = self.kernel.sys_setattr(
             &req.path,
-            ctx,
+            &ctx,
             req.entry_type,
             &req.backend_name,
             None, // backend (non-mount entry types don't need one)
             None, // metastore
             None, // raft_backend
             &req.io_profile,
-            zone_id,
+            &ctx.zone_id,
             req.is_external,
             req.capacity as usize,
             None, // read_fd  — DT_PIPE stdio uses the in-process AcpSubprocess path

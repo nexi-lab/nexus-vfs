@@ -26,7 +26,7 @@ use prost::Message;
 use crate::raft::{wait_until_caught_up, RaftError};
 use crate::zone_deletion_registry::ZoneDeletionRegistry;
 use crate::zone_manager::{decode_file_metadata, ZoneManager, ZonePresence, DT_MOUNT};
-use crate::zone_op_journal::{BeginOutcome, JournalRecord, ZoneOpJournal};
+use crate::zone_op_journal::{BeginOutcome, JournalError, JournalRecord, ZoneOpJournal};
 
 /// prost flattens the nested `ZoneStatusResponse.Presence` enum into a
 /// sibling module — re-exported here so the ladder reads as one type.
@@ -71,6 +71,10 @@ pub(crate) const OUTCOME_MOUNTED: &str = "MOUNTED";
 pub(crate) const OUTCOME_UNMOUNTED: &str = "UNMOUNTED";
 pub(crate) const OUTCOME_REPLICA_REMOVED: &str = "REPLICA_REMOVED";
 pub(crate) const OUTCOME_DEPROVISIONED: &str = "DEPROVISIONED";
+/// Replay fallback when a COMPLETED record's receipt bytes fail to decode:
+/// the replay still answers (status + evidence trail), but the outcome says
+/// the receipt was undecodable instead of silently reading as empty.
+pub(crate) const OUTCOME_RECEIPT_UNDECODABLE: &str = "RECEIPT-UNDECODABLE";
 
 /// How long a receipt read-back waits for the zone's apply loop to catch
 /// up with its own log before snapshotting facts (same budget as the
@@ -88,6 +92,13 @@ const CATCHUP_BUDGET: Duration = Duration::from_secs(10);
 /// the resulting terminal-state race). The taker-over re-stamps the record
 /// (`ZoneOpJournal::refresh`) so its own execution window is protected.
 const PENDING_TAKEOVER_GRACE_MS: i64 = 120_000;
+
+/// Resource-hygiene bound on `ZoneCreateRequest.peers`: the set is sorted,
+/// joined and hashed in a blocking context, and a 64 MiB message could
+/// otherwise carry an unbounded membership spec into that work.
+const MAX_CREATE_PEERS: usize = 32;
+/// One peer is a `host:port` string (host ≤ 253 + separator + port ≤ 5).
+const MAX_CREATE_PEER_LEN: usize = 256;
 
 pub struct ZoneRuntimeBackend {
     zm: Arc<ZoneManager>,
@@ -137,6 +148,21 @@ impl ZoneRuntimeBackend {
         let header = require_header(req.mutation.as_ref())?;
         validate_zone_id_for(ZoneIdUse::TenantCreate, &req.zone_id)
             .map_err(|e| ZoneRuntimeError::Invalid(format!("zone_id: {e}")))?;
+        // Resource hygiene: bound the peer set BEFORE the sort+join+hash —
+        // an unbounded membership inside the 64 MiB message budget would
+        // otherwise land that work in this blocking context.
+        if req.peers.len() > MAX_CREATE_PEERS {
+            return Err(ZoneRuntimeError::Invalid(format!(
+                "peers: at most {MAX_CREATE_PEERS} allowed, got {}",
+                req.peers.len()
+            )));
+        }
+        if let Some(peer) = req.peers.iter().find(|p| p.len() > MAX_CREATE_PEER_LEN) {
+            return Err(ZoneRuntimeError::Invalid(format!(
+                "peers: an entry exceeds {MAX_CREATE_PEER_LEN} bytes (got {})",
+                peer.len()
+            )));
+        }
         let hash = request_hash(b"create", &[&req.zone_id, &join_sorted(&req.peers)]);
 
         if let Some(replay) =
@@ -148,8 +174,18 @@ impl ZoneRuntimeBackend {
         // above), so it is checked only AFTER the journal replay: a retried
         // operation id must answer with its original receipt even when the
         // zone has since been deprovisioned.
-        self.refuse_if_deleted(&req.zone_id)?;
+        // fail(), not `?`: the claim is already pinned, so the refusal must
+        // write the REJECTED terminal state like every other post-claim
+        // rejection — a bare Err would strand the record PENDING forever
+        // (still-in-flight retries, endless takeover).
+        if let Err(e) = self.refuse_if_deleted(&req.zone_id) {
+            return self.fail(&header.operation_id, e, "create", &req.zone_id);
+        }
 
+        // Advisory pre-read on THIS node, taken before the create: on a
+        // multi-node cluster (or under a concurrent create) the
+        // CREATED/ALREADY_PRESENT wording may differ from what a peer would
+        // report — the cluster-facts read-back below is the physical truth.
         let existed = self.zm.get_zone(&req.zone_id).is_some();
         if let Err(e) = self.zm.create_zone(&req.zone_id, req.peers.clone()) {
             return self.fail(
@@ -320,12 +356,17 @@ impl ZoneRuntimeBackend {
         // semantics) while its bumped creation epoch outranks it, and
         // mounting the re-found zone is exactly the supported recovery.
         if self.zm.deleted_newer_than_disk(&req.target_zone_id) {
-            return Err(ZoneRuntimeError::Conflict(format!(
+            // fail(), not `?`: the claim is already pinned, so the refusal
+            // must write the REJECTED terminal state like every other
+            // post-claim rejection — a bare Err would strand the record
+            // PENDING forever (still-in-flight retries, endless takeover).
+            let err = ZoneRuntimeError::Conflict(format!(
                 "zone '{}' was deprovisioned (the recorded deletion outranks its \
                  replica); mounting it is refused — re-founding requires the \
                  operator-supervised recovery (founder boot with --force)",
                 req.target_zone_id
-            )));
+            ));
+            return self.fail(&header.operation_id, err, "mount", &req.target_zone_id);
         }
 
         if let Err(e) = self.zm.mount(
@@ -585,8 +626,11 @@ impl ZoneRuntimeBackend {
         // The POSIX i_links guard remove_replica enforces (minus its force
         // escape): deprovisioning a zone that is still MOUNTED would leave
         // every parent holding a dangling DT_MOUNT. A read error fails
-        // CLOSED — never destroy on an unreadable link count.
-        match self.zm.get_links_count(&req.zone_id) {
+        // CLOSED — never destroy on an unreadable link count. The
+        // LINEARIZABLE twin: this node may be a follower host whose local
+        // apply lags a just-committed mount — a plain local read could miss
+        // it and let the deprovision through.
+        match self.zm.get_links_count_linearizable(&req.zone_id) {
             Ok(Some(count)) => {
                 if count > 0 {
                     return self.fail(
@@ -689,6 +733,11 @@ impl ZoneRuntimeBackend {
         &self,
         req: &GetZoneOperationRequest,
     ) -> Result<ZoneOperationRecord, ZoneRuntimeError> {
+        // The read face takes the SAME shape bound the mutation face
+        // enforces (require_header): the id is a control-store key, and a
+        // raw arbitrary string must not reach the store from here either.
+        contracts::validate_operation_id(&req.operation_id)
+            .map_err(|e| ZoneRuntimeError::Invalid(format!("operation_id: {e}")))?;
         let rec = self
             .journal
             .get(&req.operation_id)
@@ -770,7 +819,11 @@ impl ZoneRuntimeBackend {
                     operation_id
                 ))),
             },
-            Err(e) => Err(ZoneRuntimeError::Conflict(e)),
+            // A store/transport failure is retryable (the claim's outcome is
+            // unknown) — INTERNAL, not FAILED_PRECONDITION, so a transient
+            // leader election is not mistaken for a hard conflict.
+            Err(JournalError::Store(e)) => Err(ZoneRuntimeError::Internal(e)),
+            Err(JournalError::Conflict(e)) => Err(ZoneRuntimeError::Conflict(e)),
         }
     }
 
@@ -905,7 +958,14 @@ fn decode_receipt(rec: &JournalRecord) -> ZoneReceipt {
                 })
                 .ok()
         })
-        .unwrap_or_else(|| base_receipt(&rec.operation_id, &rec.zone_id, &rec.kind, ""))
+        .unwrap_or_else(|| {
+            base_receipt(
+                &rec.operation_id,
+                &rec.zone_id,
+                &rec.kind,
+                OUTCOME_RECEIPT_UNDECODABLE,
+            )
+        })
 }
 
 fn record_from_journal(rec: JournalRecord) -> ZoneOperationRecord {

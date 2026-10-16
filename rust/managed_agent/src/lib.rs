@@ -1250,12 +1250,15 @@ impl<K: KernelSyscall> RustService for ManagedAgentService<K> {
                         // A session credential: the mint's allow-list
                         // vouched for the owner binding (the CA-stamped SAN
                         // wins over the body), and the credential carries
-                        // no zone grant by design — an omitted zone takes
-                        // the root default, a named one still needs a
-                        // grant.
+                        // no zone grant by design — root is the documented
+                        // default for a session, and naming it explicitly is
+                        // the SAME request as omitting it (omission can
+                        // never be MORE permissive than naming it, the rule
+                        // the ordinary branch below states); any other zone
+                        // still needs an explicit grant.
                         req.owner_id = authenticated_owner(&req.owner_id, ctx)
                             .map_err(RustCallError::InvalidArgument)?;
-                        if req.zone_id.is_empty() {
+                        if req.zone_id.is_empty() || req.zone_id == contracts::ROOT_ZONE_ID {
                             req.zone_id = contracts::ROOT_ZONE_ID.to_string();
                         } else {
                             req.zone_id = resolve_agent_zone(ctx, Some(req.zone_id.as_str()))
@@ -2174,14 +2177,23 @@ mod tests {
         fn multi_zone_routing_root_is_not_root_authority() {
             let (_kernel, table, svc) = fresh_service();
             let payload = json!({"agent_id": "scode-standard", "zone_id": "root"}).to_string();
+            // An AGENT credential (agent_id set, acting for itself) so the
+            // call takes the zone-resolution branch the test name promises
+            // — a multi-zone grant holder naming root — instead of the
+            // bare-principal refusal a person-shaped context takes.
+            let mut ctx = context("alice", false, false, &["alpha", "beta"]);
+            ctx.agent_id = Some("alice".to_string());
             let err = svc
-                .dispatch_with_context(
-                    &context("alice", false, false, &["alpha", "beta"]),
-                    "start_session_v1",
-                    payload.as_bytes(),
-                )
+                .dispatch_with_context(&ctx, "start_session_v1", payload.as_bytes())
                 .unwrap_err();
-            assert!(matches!(err, RustCallError::PermissionDenied(_)));
+            let RustCallError::PermissionDenied(msg) = &err else {
+                panic!("expected PermissionDenied from the zone-grant branch, got {err:?}");
+            };
+            assert!(
+                msg.contains("not explicitly granted"),
+                "the refusal must come from the zone-grant branch, not the bare-principal \
+                 one; got {msg}"
+            );
             assert_eq!(table.count(), 0);
         }
 

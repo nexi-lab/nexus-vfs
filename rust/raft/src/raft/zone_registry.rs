@@ -500,6 +500,22 @@ impl ZoneRaftRegistry {
                 }
                 continue;
             }
+            // A concurrent setup_zone owns this zone's dir right now — it
+            // holds the `creating` guard for the milliseconds of its setup
+            // window (the live branch above is safe: remove_zone itself
+            // serializes on the same guard). Removing the dir from under a
+            // setup in progress would silently destroy a zone being brought
+            // up; skip and let the next sweep re-evaluate. Read-only check
+            // on purpose — the sweep never inserts into `creating`, and the
+            // check-then-act window is closed by the next sweep.
+            if self.creating.contains_key(&zone_id) {
+                tracing::warn!(
+                    zone = %zone_id,
+                    "skipping purge of deleted zone: a concurrent setup/remove owns it this \
+                     instant; the next sweep re-evaluates"
+                );
+                continue;
+            }
             match ZonePersistence::cleanup_tombstoned(&self.base_path, &zone_id) {
                 Ok(()) => {
                     self.hosted.remove(&zone_id);

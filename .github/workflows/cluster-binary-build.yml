@@ -40,7 +40,7 @@ jobs:
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
-            max_size_bytes: 20764672  # 19.75 MiB. Measured 20,202,880 on the
+            max_size_bytes: 20764672  # 19.8 MiB. Measured 20,202,880 on the
                                       # rebased #364 (main's 1.99.0 baseline 19,515,016
                                       # plus the typed ZoneRuntime plane and the declared
                                       # mount subtree); ~2.8% headroom.
