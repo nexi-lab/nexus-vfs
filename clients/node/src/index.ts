@@ -116,6 +116,7 @@ interface UnaryClient {
   Call: GrpcMethod<CallRequest, CallResponse>
   Read: GrpcMethod<ReadRequest, ReadResponse>
   Write: GrpcMethod<WriteRequest, WriteResponse>
+  Chmod: GrpcMethod<ChmodRequest, WriteResponse>
   Delete: GrpcMethod<DeleteRequest, DeleteResponse>
   Ping: GrpcMethod<PingRequest, PingResponse>
   Stat: GrpcMethod<StatRequest, StatResponse>
@@ -163,6 +164,11 @@ interface WriteRequest {
 interface WriteResponse {
   is_error: boolean
   error_payload: Buffer
+}
+interface ChmodRequest {
+  path: string
+  mode: number
+  auth_token: string
 }
 interface DeleteRequest {
   path: string
@@ -602,6 +608,19 @@ export class NexusVfsClient {
       auth_token: authToken,
     })
     if (response.is_error) throw vfsError(response.error_payload, 'write')
+  }
+
+  /** Set native permissions on a local reference-backed file or directory. */
+  async chmod(path: string, mode: number, authToken: string): Promise<void> {
+    if (!Number.isInteger(mode) || mode < 0 || mode > 0o777) {
+      throw new RangeError('mode must contain permission bits only (0000..0777)')
+    }
+    const response = await this.unary<ChmodRequest, WriteResponse>('Chmod', 'chmod', {
+      path,
+      mode,
+      auth_token: authToken,
+    })
+    if (response.is_error) throw vfsError(response.error_payload, 'chmod')
   }
 
   /** Delete a VFS path. Non-recursive, matching the Rust client. */

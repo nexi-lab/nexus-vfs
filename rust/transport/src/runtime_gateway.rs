@@ -136,6 +136,7 @@ mod tests {
 gateway_methods! {
     read: ReadRequest => ReadResponse,
     write: WriteRequest => WriteResponse,
+    chmod: ChmodRequest => ChmodResponse,
     delete: DeleteRequest => DeleteResponse,
     mkdir: MkdirRequest => MkdirResponse,
     stat: StatRequest => StatResponse,

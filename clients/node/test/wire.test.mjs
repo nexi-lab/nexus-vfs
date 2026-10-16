@@ -62,3 +62,17 @@ test('the loaded package exposes the service constructor', () => {
   const pkg = grpc.loadPackageDefinition(definition())
   assert.equal(typeof pkg.nexus.grpc.vfs.NexusVFSService, 'function')
 })
+
+test('native permission updates preserve an explicit zero mode on the wire', () => {
+  const service = definition()['nexus.grpc.vfs.NexusVFSService']
+  for (const mode of [0, 0o600, 0o700]) {
+    const decoded = service.Chmod.requestDeserialize(service.Chmod.requestSerialize({
+      path: '/project/run.sh',
+      mode,
+      auth_token: 'owner-token',
+    }))
+    assert.equal(decoded.path, '/project/run.sh')
+    assert.equal(decoded.mode, mode)
+    assert.equal(decoded.auth_token, 'owner-token')
+  }
+})

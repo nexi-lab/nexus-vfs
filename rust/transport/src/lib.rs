@@ -42,6 +42,8 @@ pub mod federation;
 pub mod grpc;
 #[cfg(test)]
 mod grpc_metadata_access_tests;
+#[cfg(test)]
+mod grpc_native_permissions_tests;
 mod grpc_path_access;
 #[cfg(test)]
 mod grpc_path_access_tests;

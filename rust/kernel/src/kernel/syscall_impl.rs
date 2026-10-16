@@ -25,6 +25,37 @@ use super::{
     SysWriteResult,
 };
 
+/// Only materialized path references use live filesystem attributes. A
+/// metadata-only regular entry, stream, pipe, or link keeps its VFS meaning.
+fn reference_file_metadata(
+    route: &crate::vfs_router::RouteResult,
+    entry: &FileMetadata,
+) -> Option<std::io::Result<crate::abc::object_store::ReferenceMetadata>> {
+    if entry.entry_type != DT_REG
+        || entry.content_id.as_deref() != Some(route.backend_path.as_str())
+    {
+        return None;
+    }
+    route
+        .backend
+        .as_ref()?
+        .reference_metadata(&route.backend_path)
+}
+
+fn apply_reference_metadata(
+    stat: &mut StatResult,
+    metadata: crate::abc::object_store::ReferenceMetadata,
+) {
+    stat.size = metadata.size;
+    stat.mode = metadata.mode;
+    stat.is_directory = metadata.is_dir;
+    stat.entry_type = if metadata.is_dir { DT_DIR } else { DT_REG };
+    if metadata.is_dir {
+        stat.mime_type = "inode/directory".to_string();
+    }
+    stat.modified_at_ms = metadata.modified_at_ms;
+}
+
 /// Per-request resolved state produced by Phase A of `sys_read` (batch path).
 /// Kept file-private; callers only see the final `Vec<Result<…>>`.
 /// `entry` is `None` when the metastore has no record yet; Phase B
@@ -1316,6 +1347,22 @@ impl Kernel {
         {
             Some(meta) => meta,
             None => {
+                // A reference-backed file may arrive through an editor or
+                // shell without a metastore row. Its attributes come from
+                // the same physical file the backend reads, including mode.
+                if let Some(Ok(metadata)) = route
+                    .backend
+                    .as_ref()
+                    .and_then(|backend| backend.reference_metadata(&route.backend_path))
+                {
+                    let mut stat = StatResult::from(FileMetadata {
+                        path: path.to_string(),
+                        zone_id: Some(route.zone_id.clone()),
+                        ..Default::default()
+                    });
+                    apply_reference_metadata(&mut stat, metadata);
+                    return Some(stat);
+                }
                 // Implicit directory: children exist under this prefix
                 // but no explicit entry. Eliminates Python fallback to
                 // _check_is_directory() (Crossing 3a).
@@ -1431,6 +1478,14 @@ impl Kernel {
             }
         };
 
+        if let Some(observation) = reference_file_metadata(&route, &entry) {
+            let metadata = observation.ok()?;
+            let mut stat = StatResult::from(entry);
+            stat.lock = self.lock_manager.get_lock_info(path);
+            apply_reference_metadata(&mut stat, metadata);
+            return Some(stat);
+        }
+
         // Treat DT_MOUNT like a directory for VFS callers — a mount point is
         // the zone-root inode, analogous to a DT_DIR from the user's view.
         let is_dir = entry.entry_type == DT_DIR || entry.entry_type == DT_MOUNT;
@@ -1501,6 +1556,60 @@ impl Kernel {
             link_target: entry.link_target,
             owner_id: entry.owner_id,
         })
+    }
+
+    /// Set native file permissions through the route's reference backend.
+    ///
+    /// This capability does not change the syscall/plugin ABI or persist a
+    /// shadow mode in the metastore. Authorization and mutation observation
+    /// use the same identity and routing path as other filesystem mutations.
+    pub fn set_file_mode(
+        &self,
+        path: &str,
+        ctx: &OperationContext,
+        mode: u32,
+    ) -> Result<(), KernelError> {
+        validate_path_fast(path)?;
+        if mode & !0o777 != 0 {
+            return Err(KernelError::InvalidPath(
+                "invalid file permission bits".into(),
+            ));
+        }
+        let route = self
+            .vfs_router
+            .route(path, &ctx.zone_id)
+            .ok_or_else(|| KernelError::FileNotFound(path.to_string()))?;
+        self.check_permission_with_route(path, Some(&route), Permission::Write, ctx)?;
+        if self
+            .with_metastore_route(&route, |store| store.get(path).ok().flatten())
+            .flatten()
+            .is_some_and(|entry| entry.entry_type != DT_REG && entry.entry_type != DT_DIR)
+        {
+            return Err(KernelError::InvalidPath(
+                "native permissions require a regular file or directory".into(),
+            ));
+        }
+        let backend = route
+            .backend
+            .ok_or_else(|| KernelError::IOError("file mode is unsupported by this route".into()))?;
+        let lock =
+            self.lock_manager
+                .blocking_acquire(path, LockMode::Write, self.vfs_lock_timeout_ms());
+        if lock == 0 {
+            return Err(KernelError::IOError("file mode lock timed out".into()));
+        }
+        let result = backend.set_file_mode(&route.backend_path, mode);
+        self.lock_manager.do_release(lock);
+        result.map_err(|error| match error {
+            crate::abc::object_store::StorageError::IOError(error)
+                if error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                KernelError::FileNotFound(path.to_string())
+            }
+            error => KernelError::IOError(format!("set file mode: {error:?}")),
+        })?;
+        self.dispatch_mutation(FileEventType::MetadataChange, path, ctx, |_| {});
+        Ok(())
     }
 
     // ── sys_unlink ────────────────────────────────────────────────────
@@ -3817,6 +3926,11 @@ impl Kernel {
         });
         if let Some(ms_children) = listing {
             let parent_depth = global_prefix.matches('/').count();
+            let has_local_references = route
+                .backend
+                .as_ref()
+                .and_then(|backend| backend.resolve_physical_path(""))
+                .is_some();
             // Directories that exist because something below them does — see
             // [`implied_relative_dirs`] for why a listing derives them instead of
             // reading rows that a write never planted.
@@ -3826,6 +3940,30 @@ impl Kernel {
                 if !meta.path.starts_with(&global_prefix) {
                     continue;
                 }
+                // A stored generation describes the last Nexus write; it
+                // does not prove that its reference still exists on disk.
+                // Do not delete the row (or propose a Raft mutation) merely
+                // because a shell removed the file. Revalidate the read view.
+                let child_route = (has_local_references && meta.entry_type == DT_REG)
+                    .then(|| self.vfs_router.route(&meta.path, &route.zone_id))
+                    .flatten();
+                let entry_type = if let Some(child_route) = child_route {
+                    match reference_file_metadata(&child_route, &meta) {
+                        Some(Ok(metadata)) => {
+                            if metadata.is_dir {
+                                DT_DIR
+                            } else {
+                                DT_REG
+                            }
+                        }
+                        Some(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                            continue;
+                        }
+                        _ => meta.entry_type,
+                    }
+                } else {
+                    meta.entry_type
+                };
                 let depth = meta.path.matches('/').count();
                 if depth > parent_depth {
                     for rel in Self::implied_relative_dirs(&global_prefix, &meta.path, recursive) {
@@ -3849,8 +3987,7 @@ impl Kernel {
                 if !recursive && depth != parent_depth {
                     continue;
                 }
-                seen.entry(meta.path)
-                    .or_insert((meta.entry_type, meta.zone_id));
+                seen.entry(meta.path).or_insert((entry_type, meta.zone_id));
             }
             // After the stored rows, never before: a real entry is authoritative
             // about its own type, and a derived one must not mask it just because

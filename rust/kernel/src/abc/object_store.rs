@@ -63,6 +63,48 @@ pub struct BackendStat {
     pub is_dir: bool,
 }
 
+/// Live attributes of a file held by reference on the local filesystem.
+/// These are observations, not metastore updates or replicated generations.
+#[derive(Debug, Clone, Copy)]
+pub struct ReferenceMetadata {
+    pub size: u64,
+    pub is_dir: bool,
+    pub mode: u32,
+    pub modified_at_ms: Option<i64>,
+}
+
+impl From<std::fs::Metadata> for ReferenceMetadata {
+    fn from(metadata: std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            metadata.permissions().mode() & 0o777
+        };
+        #[cfg(not(unix))]
+        let mode = if metadata.is_dir() {
+            0o755
+        } else if metadata.permissions().readonly() {
+            0o444
+        } else {
+            0o644
+        };
+        Self {
+            size: if metadata.is_dir() {
+                4096
+            } else {
+                metadata.len()
+            },
+            is_dir: metadata.is_dir(),
+            mode,
+            modified_at_ms: metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .and_then(|duration| i64::try_from(duration.as_millis()).ok()),
+        }
+    }
+}
+
 /// ObjectStore pillar — kernel `file_operations` contract.
 ///
 /// Rust equivalent of Python `ObjectStoreABC` (one of the Four Storage Pillars).
@@ -255,5 +297,52 @@ pub trait ObjectStore: Send + Sync {
     fn resolve_physical_path(&self, content_id: &str) -> Option<std::path::PathBuf> {
         let _ = content_id;
         None
+    }
+
+    /// Revalidate a local reference without changing its durable metadata.
+    ///
+    /// Uses the same physical-path capability as the descriptor cache. CAS,
+    /// remote, and opaque driver backends return `None`; callers keep their
+    /// metastore semantics. `Some(Err(NotFound))` means an externally deleted
+    /// reference, which must not be presented as a live regular file.
+    fn reference_metadata(&self, path: &str) -> Option<io::Result<ReferenceMetadata>> {
+        self.resolve_physical_path(path)
+            .map(|physical| std::fs::metadata(physical).map(ReferenceMetadata::from))
+    }
+
+    /// Change native permission bits on a reference-backed local file.
+    /// Other storage types must refuse, rather than store a mode disconnected
+    /// from the executable that native commands actually open.
+    fn set_file_mode(&self, path: &str, mode: u32) -> Result<(), StorageError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let physical = self
+                .resolve_physical_path(path)
+                .ok_or(StorageError::NotSupported("set_file_mode"))?;
+            let root = self
+                .resolve_physical_path("")
+                .ok_or(StorageError::NotSupported("set_file_mode"))?
+                .canonicalize()
+                .map_err(StorageError::IOError)?;
+            let metadata = std::fs::symlink_metadata(&physical).map_err(StorageError::IOError)?;
+            let resolved = physical.canonicalize().map_err(StorageError::IOError)?;
+            if metadata.is_symlink()
+                || !resolved.starts_with(root)
+                || !(metadata.is_file() || metadata.is_dir())
+            {
+                return Err(StorageError::IOError(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "native permissions require a file within the backend root",
+                )));
+            }
+            std::fs::set_permissions(resolved, std::fs::Permissions::from_mode(mode))
+                .map_err(StorageError::IOError)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (path, mode);
+            Err(StorageError::NotSupported("set_file_mode"))
+        }
     }
 }

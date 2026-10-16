@@ -49,6 +49,12 @@ const mounts = JSON.parse(await client.call('get_mount_points', '{}', authToken)
 client.close()
 ```
 
+For a script on local reference storage, `await client.chmod('/project/run.sh',
+0o700, authToken)` changes the native executable's permission bits. The call
+requires write permission. Missing files, unsupported backends, and older
+servers fail explicitly; a successful call does not create a second copy of
+the mode in Nexus metadata. Permission bits range from `0` through `0o777`.
+
 Against an auth-on `nexusd-cluster`, which serves mutual TLS and rejects
 plaintext clients:
 

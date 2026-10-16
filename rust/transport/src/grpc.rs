@@ -31,14 +31,15 @@ use kernel::kernel::vfs_proto::{
     nexus_vfs_service_server::{NexusVfsService, NexusVfsServiceServer},
     BatchReadItemResponse, BatchReadRequest, BatchReadResponse, BatchStatItem, BatchStatRequest,
     BatchStatResponse, BatchWriteItemResponse, BatchWriteRequest, BatchWriteResponse, CallRequest,
-    CallResponse, CopyRequest, CopyResponse, DeleteRequest, DeleteResponse, GetXattrBulkItem,
-    GetXattrBulkRequest, GetXattrBulkResponse, GetXattrRequest, GetXattrResponse, IpcAck, IpcEmpty,
-    IpcHasResponse, IpcPathRequest, LockRequest, LockResponse, MkdirRequest, MkdirResponse,
-    PingRequest, PingResponse, ReadRequest, ReadResponse, ReaddirEntry, ReaddirRequest,
-    ReaddirResponse, RenameRequest, RenameResponse, SetXattrRequest, SetXattrResponse,
-    SetattrRequest, SetattrResponse, StatRequest, StatResponse, StreamCollectAllResponse,
-    StreamReadAtRequest, StreamReadAtResponse, StreamWriteRequest, StreamWriteResponse,
-    UnlockRequest, UnlockResponse, WatchRequest, WatchResponse, WriteRequest, WriteResponse,
+    CallResponse, ChmodRequest, ChmodResponse, CopyRequest, CopyResponse, DeleteRequest,
+    DeleteResponse, GetXattrBulkItem, GetXattrBulkRequest, GetXattrBulkResponse, GetXattrRequest,
+    GetXattrResponse, IpcAck, IpcEmpty, IpcHasResponse, IpcPathRequest, LockRequest, LockResponse,
+    MkdirRequest, MkdirResponse, PingRequest, PingResponse, ReadRequest, ReadResponse,
+    ReaddirEntry, ReaddirRequest, ReaddirResponse, RenameRequest, RenameResponse, SetXattrRequest,
+    SetXattrResponse, SetattrRequest, SetattrResponse, StatRequest, StatResponse,
+    StreamCollectAllResponse, StreamReadAtRequest, StreamReadAtResponse, StreamWriteRequest,
+    StreamWriteResponse, UnlockRequest, UnlockResponse, WatchRequest, WatchResponse, WriteRequest,
+    WriteResponse,
 };
 use kernel::kernel::{Kernel, KernelError, OperationContext};
 use kernel::Permission;
@@ -234,6 +235,7 @@ impl_authed_request!(
     BatchStatRequest,
     BatchWriteRequest,
     CallRequest,
+    ChmodRequest,
     CopyRequest,
     DeleteRequest,
     GetXattrBulkRequest,
@@ -677,6 +679,31 @@ where
 
 #[tonic::async_trait]
 impl NexusVfsService for VfsServiceImpl {
+    async fn chmod(&self, req: Request<ChmodRequest>) -> Result<Response<ChmodResponse>, Status> {
+        let (ctx, req) = match self.authenticate(req).await {
+            Ok(value) => value,
+            Err(status) => return Ok(Response::new(error_chmod(status))),
+        };
+        if let Err(status) = self.authorize_path(&req.path, Permission::Write, &ctx) {
+            return Ok(Response::new(error_chmod(status)));
+        }
+        let kernel = self.kernel.clone();
+        let result = run_blocking(move || kernel.set_file_mode(&req.path, &ctx, req.mode)).await?;
+        Ok(Response::new(match result {
+            Ok(()) => ChmodResponse {
+                is_error: false,
+                error_payload: Vec::new(),
+            },
+            Err(error) => {
+                let (code, message) = self.map_kernel_err(error);
+                ChmodResponse {
+                    is_error: true,
+                    error_payload: encode_rpc_error(code, &message),
+                }
+            }
+        }))
+    }
+
     async fn read(&self, req: Request<ReadRequest>) -> Result<Response<ReadResponse>, Status> {
         let (ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
@@ -2155,6 +2182,13 @@ fn error_setattr(status: Status) -> SetattrResponse {
     }
 }
 
+fn error_chmod(status: Status) -> ChmodResponse {
+    ChmodResponse {
+        is_error: true,
+        error_payload: encode_rpc_error_bytes(status_to_code(&status), status.message()),
+    }
+}
+
 fn error_stat(status: Status) -> StatResponse {
     StatResponse {
         found: false,
@@ -2295,6 +2329,10 @@ pub(crate) mod tests {
 
     #[tonic::async_trait]
     impl NexusVfsService for HubStub {
+        async fn chmod(&self, _: Request<ChmodRequest>) -> Result<Response<ChmodResponse>, Status> {
+            Err(Status::unimplemented("test hub has no local files"))
+        }
+
         async fn call(
             &self,
             request: Request<CallRequest>,
