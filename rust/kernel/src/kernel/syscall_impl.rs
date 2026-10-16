@@ -27,12 +27,22 @@ use super::{
 
 /// Only materialized path references use live filesystem attributes. A
 /// metadata-only regular entry, stream, pipe, or link keeps its VFS meaning.
+fn has_local_content_origin(entry: &FileMetadata, local_address: Option<&str>) -> bool {
+    entry
+        .last_writer_address
+        .as_deref()
+        .filter(|writer| !writer.is_empty())
+        .is_none_or(|writer| Some(writer) == local_address)
+}
+
 fn reference_file_metadata(
     route: &crate::vfs_router::RouteResult,
     entry: &FileMetadata,
+    local_address: Option<&str>,
 ) -> Option<std::io::Result<crate::abc::object_store::ReferenceMetadata>> {
     if entry.entry_type != DT_REG
         || entry.content_id.as_deref() != Some(route.backend_path.as_str())
+        || !has_local_content_origin(entry, local_address)
     {
         return None;
     }
@@ -1507,7 +1517,11 @@ impl Kernel {
             }
         };
 
-        if let Some(observation) = reference_file_metadata(&route, &entry) {
+        // A replicated inode can name another node's bytes. That node's
+        // durable metadata remains authoritative over this node's filesystem.
+        let reference =
+            reference_file_metadata(&route, &entry, self.self_address.read().as_deref());
+        if let Some(observation) = reference {
             let metadata = observation.ok()?;
             let mut stat = StatResult::from(entry);
             stat.lock = self.lock_manager.get_lock_info(path);
@@ -1516,7 +1530,9 @@ impl Kernel {
         }
         // Virtual directory inodes may exist without a native directory. When
         // there is one, report its real permissions without persisting a copy.
-        if entry.entry_type == DT_DIR {
+        if entry.entry_type == DT_DIR
+            && has_local_content_origin(&entry, self.self_address.read().as_deref())
+        {
             if let Some(Ok(metadata)) = route
                 .backend
                 .as_ref()
@@ -1627,10 +1643,13 @@ impl Kernel {
         if self
             .with_metastore_route(&route, |store| store.get(path).ok().flatten())
             .flatten()
-            .is_some_and(|entry| entry.entry_type != DT_REG && entry.entry_type != DT_DIR)
+            .is_some_and(|entry| {
+                (entry.entry_type != DT_REG && entry.entry_type != DT_DIR)
+                    || !has_local_content_origin(&entry, self.self_address.read().as_deref())
+            })
         {
             return Err(KernelError::InvalidPath(
-                "native permissions require a regular file or directory".into(),
+                "native permissions require a local regular file or directory".into(),
             ));
         }
         let backend = route
@@ -3982,6 +4001,7 @@ impl Kernel {
         });
         if let Some(ms_children) = listing {
             let parent_depth = global_prefix.matches('/').count();
+            let local_address = self.self_address.read().clone();
             let has_local_references = route
                 .backend
                 .as_ref()
@@ -4004,7 +4024,7 @@ impl Kernel {
                     .then(|| self.vfs_router.route(&meta.path, &route.zone_id))
                     .flatten();
                 let entry_type = if let Some(child_route) = child_route {
-                    match reference_file_metadata(&child_route, &meta) {
+                    match reference_file_metadata(&child_route, &meta, local_address.as_deref()) {
                         Some(Ok(metadata)) => {
                             if metadata.is_dir {
                                 DT_DIR
