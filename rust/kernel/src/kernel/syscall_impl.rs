@@ -56,6 +56,35 @@ fn apply_reference_metadata(
     stat.modified_at_ms = metadata.modified_at_ms;
 }
 
+fn materialize_reference_directory(
+    route: &crate::vfs_router::RouteResult,
+    parents: bool,
+    exist_ok: bool,
+) -> Result<(), KernelError> {
+    use crate::abc::object_store::StorageError;
+    let Some(backend) = route.backend.as_ref() else {
+        return Ok(());
+    };
+    if backend.resolve_physical_path(&route.backend_path).is_none() {
+        return Ok(());
+    }
+    match backend.mkdir(&route.backend_path, parents, exist_ok) {
+        Ok(()) => Ok(()),
+        Err(StorageError::IOError(error))
+            if exist_ok
+                && error.kind() == std::io::ErrorKind::AlreadyExists
+                && backend
+                    .stat(&route.backend_path)
+                    .is_ok_and(|metadata| metadata.is_dir) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(KernelError::IOError(format!(
+            "create reference directory: {error:?}"
+        ))),
+    }
+}
+
 /// Per-request resolved state produced by Phase A of `sys_read` (batch path).
 /// Kept file-private; callers only see the final `Vec<Result<…>>`.
 /// `entry` is `None` when the metastore has no record yet; Phase B
@@ -1485,6 +1514,21 @@ impl Kernel {
             apply_reference_metadata(&mut stat, metadata);
             return Some(stat);
         }
+        // Virtual directory inodes may exist without a native directory. When
+        // there is one, report its real permissions without persisting a copy.
+        if entry.entry_type == DT_DIR {
+            if let Some(Ok(metadata)) = route
+                .backend
+                .as_ref()
+                .and_then(|backend| backend.reference_metadata(&route.backend_path))
+                .filter(|observation| observation.as_ref().is_ok_and(|metadata| metadata.is_dir))
+            {
+                let mut stat = StatResult::from(entry);
+                stat.lock = self.lock_manager.get_lock_info(path);
+                apply_reference_metadata(&mut stat, metadata);
+                return Some(stat);
+            }
+        }
 
         // Treat DT_MOUNT like a directory for VFS callers — a mount point is
         // the zone-root inode, analogous to a DT_DIR from the user's view.
@@ -2907,9 +2951,11 @@ impl Kernel {
                     "Directory already exists: {path}"
                 )));
             }
-            // Explicit entry: ensure parents and return (already materialized).
+            // A logical inode can outlive an externally removed native dir.
+            // Explicit mkdir must materialize the reference before returning.
             // Implicit dir: fall through to create explicit DT_DIR entry.
             if explicit_exists {
+                materialize_reference_directory(&route, parents, true)?;
                 if parents {
                     self.ensure_parent_directories(path, ctx, &route)?;
                 }
@@ -2920,11 +2966,21 @@ impl Kernel {
             }
         }
 
-        // 4. Backend mkdir (best-effort, PAS backends create physical dirs)
-        let _ = route
+        // 4. A local reference must exist before publishing its inode. Other
+        // backends retain their metadata-only directory semantics.
+        if route
             .backend
             .as_ref()
-            .map(|b| b.mkdir(&route.backend_path, parents, true));
+            .and_then(|backend| backend.resolve_physical_path(&route.backend_path))
+            .is_some()
+        {
+            materialize_reference_directory(&route, parents, exist_ok || parents)?;
+        } else {
+            let _ = route
+                .backend
+                .as_ref()
+                .map(|backend| backend.mkdir(&route.backend_path, parents, true));
+        }
 
         // 5. Ensure parent directories
         if parents {
