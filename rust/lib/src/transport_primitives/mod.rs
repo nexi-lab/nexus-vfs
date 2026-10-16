@@ -18,6 +18,7 @@ mod peer;
 mod peer_blob_client;
 mod pool;
 mod runtime_credential;
+mod secret_file;
 mod server_limits;
 mod tofu;
 
@@ -36,5 +37,6 @@ pub use pool::ConnectionPool;
 pub use runtime_credential::{
     user_runtime_name_from_x509, user_runtime_server_name, USER_RUNTIME_MAX_VALIDITY_SECS,
 };
+pub use secret_file::write_secret;
 pub use server_limits::apply_server_limits;
 pub use tofu::{cert_fingerprint, TofuError, TofuResult, TofuTrustStore, TrustedZone};

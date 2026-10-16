@@ -1350,7 +1350,9 @@ fn run_enroll_token(common: &CommonArgs) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("generate cluster CA: {e}"))?;
         std::fs::write(&ca_path, &ca_pem)
             .with_context(|| format!("write {}", ca_path.display()))?;
-        std::fs::write(&ca_key_path, &ca_key_pem)
+        // The cluster CA key signs every node and agent identity in the cluster;
+        // world-readable it would let any local user mint them.
+        lib::transport_primitives::write_secret(&ca_key_path, &ca_key_pem)
             .with_context(|| format!("write {}", ca_key_path.display()))?;
         tracing::info!(ca = %ca_path.display(), "bootstrapped cluster CA for enrollment");
     }
@@ -5684,7 +5686,7 @@ fn write_agent_bundle(
     std::fs::create_dir_all(&out_dir).with_context(|| format!("create {}", out_dir.display()))?;
     std::fs::write(out_dir.join("agent.pem"), cert_pem)
         .with_context(|| format!("write {}/agent.pem", out_dir.display()))?;
-    std::fs::write(out_dir.join("agent-key.pem"), key_pem)
+    lib::transport_primitives::write_secret(&out_dir.join("agent-key.pem"), key_pem)
         .with_context(|| format!("write {}/agent-key.pem", out_dir.display()))?;
     std::fs::write(out_dir.join("ca.pem"), ca_pem)
         .with_context(|| format!("write {}/ca.pem", out_dir.display()))?;
@@ -7179,27 +7181,6 @@ fn generate_api_key_secret() -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-/// Persist a secret file with owner-only perms (0600 on unix), mirroring the
-/// enrollment joiner's `tls/api-key-secret` write in `zone_manager`.
-fn write_secret_file(path: &std::path::Path, secret: &str) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        f.write_all(secret.as_bytes())
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, secret.as_bytes())
-    }
-}
-
 /// Idempotent: persist the durable cluster api-key HMAC secret. Called ONLY on
 /// the daemon boot path (never the shared `open_zone_manager`, so an offline
 /// `auth mint` / `share` / `join` cannot trigger it and stamp a throwaway env
@@ -7222,7 +7203,7 @@ fn provision_api_key_secret(
     let secret = env_secret
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(generate_api_key_secret);
-    write_secret_file(&secret_path, &secret)?;
+    lib::transport_primitives::write_secret(&secret_path, secret.as_bytes())?;
     Ok(true)
 }
 
@@ -8380,6 +8361,32 @@ mod tests {
                 "{target:?} cannot become a socket address"
             );
         }
+    }
+
+    /// An agent bundle's private key is owner-only.
+    ///
+    /// The case a cross-machine bring-up found by hand: `agent-key.pem` came out
+    /// `0644`, readable by every local user, because this writer used a bare
+    /// `std::fs::write` while other key writers each rolled their own `0600`.
+    ///
+    /// Only the key is asserted. The cert's mode follows the process umask, so
+    /// pinning it would make this test fail on a box with `umask 077` for a
+    /// reason that has nothing to do with this code.
+    #[cfg(unix)]
+    #[test]
+    fn an_agent_bundle_key_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = tempfile::tempdir().expect("tempdir");
+        let dir = write_agent_bundle(td.path(), "aurora", b"CERT", b"KEY", b"CA").expect("bundle");
+        let mode = std::fs::metadata(dir.join("agent-key.pem"))
+            .expect("agent-key.pem")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the private key must be owner-only, got {mode:o}"
+        );
     }
 
     #[test]
