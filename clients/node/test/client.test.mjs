@@ -14,7 +14,7 @@ test('ships the service definition it was built against', () => {
 
 test('loads the service and exposes the drop-in surface', () => {
   const client = new NexusVfsClient('http://127.0.0.1:1')
-  for (const method of ['call', 'callBinary', 'read', 'write', 'delete', 'ping', 'serverInfo']) {
+  for (const method of ['call', 'callBinary', 'read', 'write', 'chmod', 'delete', 'ping', 'serverInfo']) {
     assert.equal(typeof client[method], 'function', `${method} missing`)
   }
   client.close()
