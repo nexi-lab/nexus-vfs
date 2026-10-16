@@ -3131,14 +3131,12 @@ impl Kernel {
 
         // 3. Get metadata (per-mount or global) — full path
         let entry_type = self
-            .with_metastore(&route.mount_point, |ms| {
+            .with_metastore_route(&route, |ms| {
                 ms.get(path)
-                    .ok()
-                    .flatten()
-                    .map(|m| m.entry_type)
-                    .unwrap_or(DT_DIR)
+                    .map(|entry| entry.map_or(DT_DIR, |m| m.entry_type))
             })
-            .unwrap_or(DT_DIR);
+            .ok_or_else(|| KernelError::IOError("no metastore wired".into()))?
+            .map_err(|e| KernelError::IOError(format!("metastore_get({path}): {e:?}")))?;
 
         // DT_MOUNT(2) / DT_EXTERNAL_STORAGE(5) → Python handles unmount
         if entry_type == 2 || entry_type == 5 {
@@ -3153,31 +3151,37 @@ impl Kernel {
         }
 
         // 4. Check children (per-mount or global) — full-path prefix
-        let mut children_deleted = 0;
-        if let Some(result) = self.with_metastore(&route.mount_point, |ms| {
-            let prefix = format!("{}/", path.trim_end_matches('/'));
-            let children = ms.list(&prefix).unwrap_or_default();
+        let children_result = self
+            .with_metastore_route(&route, |ms| {
+                let prefix = format!("{}/", path.trim_end_matches('/'));
+                let children = ms.list(&prefix).map_err(|e| {
+                    KernelError::IOError(format!("metastore_list({prefix}): {e:?}"))
+                })?;
 
-            if !children.is_empty() {
-                if !recursive {
-                    return Err(KernelError::IOError(format!("Directory not empty: {path}")));
-                }
+                if !children.is_empty() {
+                    if !recursive {
+                        return Err(KernelError::IOError(format!("Directory not empty: {path}")));
+                    }
 
-                // 5. Recursive: batch delete all children
-                let child_paths: Vec<String> = children.iter().map(|c| c.path.clone()).collect();
-                Ok(ms.delete_batch(&child_paths).unwrap_or(0))
-            } else {
-                Ok(0)
-            }
-        }) {
-            match result {
-                Ok(deleted) => children_deleted = deleted,
-                Err(err) => {
-                    self.lock_manager.do_release(lock_handle);
-                    return Err(err);
+                    // 5. Recursive: batch delete all children
+                    let child_paths: Vec<String> =
+                        children.iter().map(|c| c.path.clone()).collect();
+                    ms.delete_batch(&child_paths).map_err(|e| {
+                        KernelError::IOError(format!("metastore_delete_batch({path}): {e:?}"))
+                    })
+                } else {
+                    Ok(0)
                 }
+            })
+            .ok_or_else(|| KernelError::IOError("no metastore wired".into()))
+            .and_then(|result| result);
+        let children_deleted = match children_result {
+            Ok(deleted) => deleted,
+            Err(err) => {
+                self.lock_manager.do_release(lock_handle);
+                return Err(err);
             }
-        }
+        };
 
         // 6. Backend rmdir — BEFORE the row is deleted, and the result is read.
         //
@@ -3212,10 +3216,8 @@ impl Kernel {
             }
         }
 
-        // 7. Atomic delete — metastore is the SSOT. Per-key cache
-        // invalidation already happened: ``delete_batch`` invalidated
-        // each child's cache row, and ``ms.delete`` invalidates the
-        // parent's. No kernel-global cache to evict.
+        // 7. Delete the parent row only after the backend accepted removal.
+        // Metastore implementations invalidate their own cached metadata.
         let delete_result = self
             .with_metastore_route(&route, |ms| ms.delete(path))
             .ok_or_else(|| KernelError::IOError("no metastore wired".into()))
@@ -3227,6 +3229,7 @@ impl Kernel {
             return Err(err);
         }
 
+        self.fdt.remove_tree(path);
         self.lock_manager.do_release(lock_handle);
 
         // 9. OBSERVE-phase dispatch (§11 OBSERVE): queue DirDelete.

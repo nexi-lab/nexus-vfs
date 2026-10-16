@@ -623,12 +623,12 @@ export class NexusVfsClient {
     if (response.is_error) throw vfsError(response.error_payload, 'chmod')
   }
 
-  /** Delete a VFS path. Non-recursive, matching the Rust client. */
-  async delete(path: string, authToken: string): Promise<void> {
+  /** Delete a VFS path; directory recursion requires an explicit option. */
+  async delete(path: string, authToken: string, options: { recursive?: boolean } = {}): Promise<void> {
     const response = await this.unary<DeleteRequest, DeleteResponse>('Delete', 'delete', {
       path,
       auth_token: authToken,
-      recursive: false,
+      recursive: options.recursive ?? false,
     })
     if (response.is_error) throw vfsError(response.error_payload, 'delete')
   }
