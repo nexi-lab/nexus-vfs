@@ -111,6 +111,51 @@ fn stat_revalidates_reference_files_without_rewriting_durable_metadata() {
 }
 
 #[test]
+fn replicated_reference_metadata_is_not_replaced_by_this_nodes_filesystem() {
+    let root = tempfile::tempdir().unwrap();
+    let (kernel, context) = setup(root.path());
+    kernel.set_self_address("writer:2126");
+    kernel
+        .sys_write(
+            &[WriteRequest {
+                path: "/replicated.txt".into(),
+                content: b"remote content".to_vec(),
+                offset: 0,
+            }],
+            &context,
+        )
+        .pop()
+        .unwrap()
+        .unwrap();
+
+    // The same replicated inode on another node need not have local bytes.
+    kernel.set_self_address("reader:2126");
+    std::fs::remove_file(root.path().join("replicated.txt")).unwrap();
+    let remote = kernel.sys_stat("/replicated.txt", "root").unwrap();
+    assert_eq!(remote.size, 14);
+    assert_eq!(remote.last_writer_address.as_deref(), Some("writer:2126"));
+    assert!(kernel
+        .sys_readdir("/", "root", false, Default::default())
+        .iter()
+        .any(|(path, _)| path == "/replicated.txt"));
+
+    // Even an unrelated local collision cannot replace the writer's facts.
+    std::fs::write(root.path().join("replicated.txt"), b"x").unwrap();
+    assert_eq!(kernel.sys_stat("/replicated.txt", "root").unwrap().size, 14);
+    assert!(kernel
+        .set_file_mode("/replicated.txt", &context, 0o700)
+        .is_err());
+    assert_eq!(
+        std::fs::metadata(root.path().join("replicated.txt"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644,
+    );
+}
+
+#[test]
 fn stat_reports_executable_mode_for_a_file_created_outside_the_kernel() {
     let root = tempfile::tempdir().unwrap();
     let (kernel, _) = setup(root.path());
