@@ -6,14 +6,13 @@
 //! `None` from `resolve_physical_path`). `sys_read` hits the FDT before
 //! falling through to the full backend read path.
 //!
-//! Uses `libc::pread` / `libc::pwrite` — atomic, no seek state, thread-safe.
+//! Uses read-only descriptors and `libc::pread` — no shared seek state.
 //! Each `FileHandle` owns its `RawFd` and closes it on Drop.
 
 use std::path::Path;
 
 // ── Non-Unix stub ─────────────────────────────────────────────────────
-// FDT is Unix-only (libc::pread/pwrite). On Windows the struct is a
-// no-op: all reads miss, writes are no-ops. Production targets Linux/macOS.
+// FDT uses libc::pread on Unix. On Windows the descriptor cache is disabled.
 
 #[cfg(not(unix))]
 pub(crate) struct FileDescriptorTable;
@@ -55,14 +54,13 @@ struct FileHandle {
 
 #[cfg(unix)]
 impl FileHandle {
-    /// Open `path` with O_RDWR. Returns `None` if open fails.
+    /// Open a read-only cache handle without preventing native execution.
     fn open(path: &Path) -> Option<Self> {
         use std::os::fd::IntoRawFd;
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
         let file = std::fs::OpenOptions::new()
             .read(true)
-            .write(true)
             .custom_flags(libc::O_CLOEXEC)
             .open(path)
             .ok()?;
@@ -78,12 +76,6 @@ impl FileHandle {
     /// Atomic positioned read — no seek state mutation.
     fn pread(&self, buf: &mut [u8], offset: i64) -> isize {
         unsafe { libc::pread(self.fd, buf.as_mut_ptr().cast(), buf.len(), offset) }
-    }
-
-    /// Atomic positioned write — no seek state mutation.
-    #[allow(dead_code)]
-    fn pwrite(&self, buf: &[u8], offset: i64) -> isize {
-        unsafe { libc::pwrite(self.fd, buf.as_ptr().cast(), buf.len(), offset) }
     }
 
     /// Only reuse a descriptor while its physical path still names that inode.
@@ -104,7 +96,7 @@ impl Drop for FileHandle {
     }
 }
 
-// SAFETY: RawFd is an integer; pread/pwrite are thread-safe (no shared seek cursor).
+// SAFETY: The descriptor is read-only; pread has no shared seek cursor.
 #[cfg(unix)]
 unsafe impl Send for FileHandle {}
 #[cfg(unix)]

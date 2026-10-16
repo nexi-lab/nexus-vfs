@@ -80,6 +80,45 @@ fn kernel_does_not_read_deleted_contents_from_a_cached_descriptor() {
 }
 
 #[test]
+fn a_script_written_through_the_kernel_can_execute_while_the_kernel_is_alive() {
+    let root = tempfile::tempdir().unwrap();
+    let (kernel, context) = setup(root.path());
+    let script = b"#!/bin/sh\nprintf native-script-ready\n";
+    kernel
+        .sys_write(
+            &[WriteRequest {
+                path: "/run.sh".into(),
+                content: script.to_vec(),
+                offset: 0,
+            }],
+            &context,
+        )
+        .pop()
+        .unwrap()
+        .unwrap();
+    kernel.set_file_mode("/run.sh", &context, 0o700).unwrap();
+    let output = std::process::Command::new(root.path().join("run.sh"))
+        .output()
+        .expect("a cached reference descriptor must not prevent native execution");
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"native-script-ready");
+    let result = kernel
+        .sys_read(
+            &[ReadRequest {
+                path: "/run.sh".into(),
+                offset: 0,
+                len: None,
+                timeout_ms: 0,
+            }],
+            &context,
+        )
+        .pop()
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.data.unwrap(), script);
+}
+
+#[test]
 fn stat_revalidates_reference_files_without_rewriting_durable_metadata() {
     let root = tempfile::tempdir().unwrap();
     let (kernel, context) = setup(root.path());
