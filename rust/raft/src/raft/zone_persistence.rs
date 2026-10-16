@@ -221,10 +221,29 @@ impl ZonePersistence {
 /// Write `bytes` to `path` atomically: temp file in the same directory,
 /// then rename over the target (the identity.rs persistence pattern). A
 /// crash mid-write leaves the previous state instead of a torn record.
+/// The temp file is fsynced before the rename (and the parent dir fsynced
+/// after it, where the platform allows) so a POWER LOSS cannot drop the
+/// marker the rename installed — a lost `.creation-epoch` reads back as 0
+/// and the next 60s sweep would destroy the zone it was protecting.
 fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes)?;
+    let mut file = std::fs::File::create(&tmp)?;
+    std::io::Write::write_all(&mut file, bytes)?;
+    file.sync_all()?;
+    drop(file);
     std::fs::rename(&tmp, path)?;
+    #[cfg(unix)]
+    {
+        // Persist the directory entry the rename just replaced. Opening a
+        // directory and fsyncing it is a no-op error on Windows, which has
+        // no direct equivalent — accepted there (the file-level fsync above
+        // already carries the data).
+        if let Some(dir) = path.parent() {
+            if let Ok(dir_file) = std::fs::File::open(dir) {
+                let _ = dir_file.sync_all();
+            }
+        }
+    }
     Ok(())
 }
 

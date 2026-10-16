@@ -1109,6 +1109,25 @@ impl ZoneManager {
                 );
                 continue;
             }
+            // D9 for targets NOT declared in `zones`: `deprovisioned` above
+            // only covers declared-and-skipped zones, so a
+            // `--cluster-init-mount` pointing at an undeclared (already
+            // deprovisioned) zone would otherwise stage a mount whose
+            // write_mount_entry lands a dangling DT_MOUNT and whose
+            // ensure_links_count defers forever — apply_topology never
+            // converges. Same epoch comparison and same operator escape
+            // hatch as the zones loop (no epoch bump here: this path does
+            // not re-found the zone).
+            else if std::env::var_os("NEXUS_FORCE_DELETED_ZONE_RECREATE").is_none()
+                && self.deleted_newer_than_disk(&decl.zone)
+            {
+                tracing::warn!(
+                    path = %path,
+                    target = %decl.zone,
+                    "skipping declared mount: target zone was deprovisioned (D9 skip)"
+                );
+                continue;
+            }
             pending.insert(path.clone(), decl.clone());
         }
         Ok(())
@@ -1406,6 +1425,29 @@ impl ZoneManager {
         let bytes = bridge_block_on(self.rt().handle(), async move {
             node.with_state_machine(|sm: &FullStateMachine| sm.get_metadata(&key))
                 .await
+        })?;
+        let count = bytes
+            .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
+            .map(i64::from_be_bytes)
+            .unwrap_or(0);
+        Ok(Some(count))
+    }
+
+    /// Linearizable twin of [`Self::get_links_count`]: the ReadIndex barrier
+    /// guarantees the value observes every write committed cluster-wide
+    /// before the call (a plain local read on a FOLLOWER host lags the
+    /// leader's apply by a raft tick — the same lag `poll_until_visible`
+    /// exists for), so a guard decision made on it cannot miss an
+    /// already-committed mount. One leader heartbeat round-trip, no log
+    /// write — the same primitive `ControlStateStore::read_barrier` uses.
+    pub fn get_links_count_linearizable(&self, zone_id: &str) -> Result<Option<i64>> {
+        let Some(node) = self.registry.get_node(zone_id) else {
+            return Ok(None);
+        };
+        let key = I_LINKS_COUNT_KEY.to_string();
+        let bytes = bridge_block_on(self.rt().handle(), async move {
+            node.read_linearizable(|sm: &FullStateMachine| sm.get_metadata(&key))
+                .await?
         })?;
         let count = bytes
             .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())

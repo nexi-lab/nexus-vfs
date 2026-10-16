@@ -142,3 +142,91 @@ async fn cas_loss_reads_back_the_winners_value() {
     .await
     .unwrap();
 }
+
+/// The FORWARDED shape of [`cas_loss_reads_back_the_winners_value`]: the
+/// loser's `put_if_absent` runs on a FOLLOWER, so its propose is forwarded
+/// to the leader and the refusal travels back through the transport as the
+/// inner `RaftResponse{success:false}` of the forwarded reply. The decoder
+/// must surface it as `Ok(false)` — the zone-op journal's single-executor
+/// grant rides on this: a follower that decoded the leader's refusal as
+/// `Success` would believe IT won the insert and become a second executor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forwarded_cas_loss_reports_the_loss() {
+    let founder_dir = tempfile::tempdir().unwrap();
+    let follower_dir = tempfile::tempdir().unwrap();
+    let founder_addr = common::node_bind_addr();
+    let follower_addr = common::node_bind_addr();
+    let make_node = |id, dir: &std::path::Path, addr: &str| {
+        ZoneManager::with_node_id(
+            "forwarded-cas-test",
+            id,
+            dir.to_str().unwrap(),
+            vec![],
+            addr,
+            None,
+            Some(format!("http://{addr}")),
+            None,
+        )
+        .unwrap()
+    };
+    let founder = make_node(1, founder_dir.path(), &founder_addr);
+    let follower = make_node(2, follower_dir.path(), &follower_addr);
+    let leader_zone = founder
+        .create_zone("sharedzone", vec![format!("1@{founder_addr}")])
+        .unwrap();
+    leader_zone.consensus_node().campaign().await.unwrap();
+    let follower_zone = follower
+        .join_zone("sharedzone", vec![format!("1@{founder_addr}")], true)
+        .unwrap();
+    let joined = call_join_zone_rpc(
+        &format!("http://{founder_addr}"),
+        "sharedzone",
+        2,
+        &format!("http://{follower_addr}"),
+        true,
+        None,
+        30,
+    )
+    .await
+    .unwrap();
+    assert!(joined.success, "{:?}", joined.error);
+
+    let founder_store = ControlStateStore::new(
+        leader_zone.consensus_node(),
+        leader_zone.runtime_handle(),
+        "forwarded-cas-test",
+    );
+    let follower_store = ControlStateStore::new(
+        follower_zone.consensus_node(),
+        follower_zone.runtime_handle(),
+        "forwarded-cas-test",
+    );
+
+    // The winner inserts from the leader itself; the loser's CAS is
+    // FORWARDED from the follower to the leader and must come back a loss.
+    let winner = b"winner".to_vec();
+    let loser = b"loser".to_vec();
+    let expected = winner.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        assert!(
+            founder_store.put_if_absent("cas-key", &winner).unwrap(),
+            "the leader-side insert wins"
+        );
+        let lost = follower_store
+            .put_if_absent("cas-key", &loser)
+            .expect("the forwarded propose itself succeeds (the leader applies it)");
+        let observed = follower_store.get("cas-key").unwrap().expect(
+            "the losing branch must barrier: the winner's record is committed, so a \
+             read-back miss here would be a stale-apply artifact",
+        );
+        (lost, observed)
+    })
+    .await
+    .unwrap();
+    assert!(
+        !outcome.0,
+        "a follower whose forwarded CAS loses must be told it lost — decoding the \
+         leader's refusal as Success would crown a second executor"
+    );
+    assert_eq!(outcome.1, expected);
+}

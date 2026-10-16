@@ -192,9 +192,14 @@ pub(crate) async fn forward_propose(
 
 /// Decode a proto `RaftResponse` back into an internal `CommandResult`.
 ///
-/// Only the variants that the server actually emits (Success / LockResult)
-/// are handled; other commands carry no typed result and collapse to
-/// `Success`, matching the old single-node path.
+/// The server encodes a leader-computed refusal (`CommandResult::Error`) as
+/// the inner `success: false` + `error` pair (the outer `ProposeResponse`
+/// stays `success: true` for any applied command), so a follower replaying a
+/// forwarded propose through this decoder must surface that pair as `Error`
+/// — collapsing it to `Success` would report a CAS rejection as an insert
+/// win (the zone-op journal's single-executor guarantee rides on this).
+/// `LockResult` / `ValueResult` round-trip through `result`; commands with
+/// no typed result collapse to `Success`, matching the old single-node path.
 #[cfg(all(feature = "grpc", has_protos))]
 fn proto_result_to_command_result(
     result: Option<proto::nexus::raft::RaftResponse>,
@@ -205,6 +210,12 @@ fn proto_result_to_command_result(
     let Some(resp) = result else {
         return CommandResult::Success;
     };
+    if !resp.success {
+        return CommandResult::Error(
+            resp.error
+                .unwrap_or_else(|| "raft command refused".to_string()),
+        );
+    }
 
     match resp.result {
         Some(ProtoVariant::LockResult(lr)) => {
@@ -457,5 +468,50 @@ mod peer_map_tests {
         let changed = m.insert(SELF_ID, addr(SELF_ID)); // ConfChange::AddNode(self)
         assert!(!changed);
         assert_eq!(m.len(), 1);
+    }
+}
+
+#[cfg(all(test, feature = "grpc", has_protos))]
+mod decode_tests {
+    use super::proto::nexus::raft::RaftResponse;
+    use super::proto_result_to_command_result;
+    use crate::raft::CommandResult;
+
+    #[test]
+    fn inner_refusal_decodes_to_error() {
+        // The exact shape command_result_to_proto emits for
+        // CommandResult::Error: inner success:false + error, no typed result
+        // (the outer ProposeResponse stays success:true for any applied
+        // command). A follower replaying a forwarded CAS conflict through
+        // this decoder must see the refusal — collapsing it to Success would
+        // claim the insert and defeat the journal's single-executor grant.
+        let resp = RaftResponse {
+            success: false,
+            error: Some("control state z/k already exists".to_string()),
+            result: None,
+        };
+        let decoded = proto_result_to_command_result(Some(resp));
+        assert!(matches!(
+            decoded,
+            CommandResult::Error(ref e) if e == "control state z/k already exists"
+        ));
+    }
+
+    #[test]
+    fn absent_result_decodes_to_success() {
+        let resp = RaftResponse {
+            success: true,
+            error: None,
+            result: None,
+        };
+        assert!(matches!(
+            proto_result_to_command_result(Some(resp)),
+            CommandResult::Success
+        ));
+        // No inner response at all — the old single-node shape.
+        assert!(matches!(
+            proto_result_to_command_result(None),
+            CommandResult::Success
+        ));
     }
 }
