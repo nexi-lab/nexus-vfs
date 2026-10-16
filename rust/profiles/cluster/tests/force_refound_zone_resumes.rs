@@ -143,6 +143,11 @@ async fn force_refound_survives_subsequent_normal_boots() {
         .wait_for_log("VFS data plane ready", BUDGET)
         .await
         .expect("normal boot completes");
+    // Coverage note: this 3s window observes the boot sweep plus tokio's
+    // immediate FIRST interval tick only — the 60s-periodic later ticks are
+    // not covered here (waiting a real minute per test run is
+    // disproportionate); the read_file data assertion below is the durable
+    // backstop that the re-found zone actually survived.
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert!(
         !normal.log_contains("predates a recorded deletion"),

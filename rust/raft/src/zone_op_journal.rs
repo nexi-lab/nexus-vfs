@@ -75,6 +75,17 @@ pub enum BeginOutcome {
     AlreadyInProgress(JournalRecord),
 }
 
+/// Why [`ZoneOpJournal::begin`] failed. The split matters to the caller:
+/// [`Self::Store`] is a transport/replication failure (retryable, surfaces
+/// as INTERNAL — the claim's outcome is genuinely unknown), while
+/// [`Self::Conflict`] is a semantic refusal (the id is pinned to a different
+/// request — surfacing that as INTERNAL would invite blind retries against
+/// a hard conflict).
+pub enum JournalError {
+    Store(String),
+    Conflict(String),
+}
+
 /// The zone-mutation journal: a namespaced view on the control store.
 pub struct ZoneOpJournal {
     store: ControlStateStore,
@@ -99,7 +110,7 @@ impl ZoneOpJournal {
         request_hash: u64,
         kind: &str,
         zone_id: &str,
-    ) -> Result<BeginOutcome, String> {
+    ) -> Result<BeginOutcome, JournalError> {
         let pending = JournalRecord {
             operation_id: operation_id.to_string(),
             request_hash,
@@ -110,20 +121,30 @@ impl ZoneOpJournal {
             error: None,
             updated_at_ms: now_ms(),
         };
-        let bytes = serde_json::to_vec(&pending).map_err(|e| format!("journal encode: {e}"))?;
-        if self.store.put_if_absent(operation_id, &bytes)? {
+        let bytes = serde_json::to_vec(&pending)
+            .map_err(|e| JournalError::Store(format!("journal encode: {e}")))?;
+        if self
+            .store
+            .put_if_absent(operation_id, &bytes)
+            .map_err(JournalError::Store)?
+        {
             return Ok(BeginOutcome::Begin);
         }
         // Already claimed. Hash match ⇒ replay; mismatch ⇒ refuse.
         let existing = self
-            .get(operation_id)?
-            .ok_or_else(|| format!("journal record '{operation_id}' vanished mid-begin"))?;
+            .get(operation_id)
+            .map_err(JournalError::Store)?
+            .ok_or_else(|| {
+                JournalError::Store(format!(
+                    "journal record '{operation_id}' vanished mid-begin"
+                ))
+            })?;
         if existing.request_hash != request_hash {
-            return Err(format!(
+            return Err(JournalError::Conflict(format!(
                 "operation_id '{operation_id}' already recorded with a different request \
                  (hash {} ≠ {}); mint a new operation_id for a new request",
                 existing.request_hash, request_hash
-            ));
+            )));
         }
         Ok(BeginOutcome::AlreadyInProgress(existing))
     }

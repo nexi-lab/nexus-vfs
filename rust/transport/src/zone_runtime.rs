@@ -256,7 +256,13 @@ fn status_from(e: ZoneRuntimeError) -> Status {
         ZoneRuntimeError::Invalid(m) => Status::invalid_argument(m),
         ZoneRuntimeError::Conflict(m) => Status::failed_precondition(m),
         ZoneRuntimeError::NotFound(m) => Status::not_found(m),
-        ZoneRuntimeError::Internal(m) => Status::internal(m),
+        ZoneRuntimeError::Internal(m) => {
+            // Same discipline as `map_kernel_err` on the VFS face: the
+            // detail (store errors, RaftError Debug text) is for the
+            // operator's log, not the wire.
+            tracing::error!("zone runtime internal error: {m}");
+            Status::internal("internal error")
+        }
     }
 }
 
@@ -296,12 +302,19 @@ impl kernel::kernel::vfs_proto::zone_runtime_service_server::ZoneRuntimeService
         &self,
         req: Request<ZoneStatusRequest>,
     ) -> Result<Response<ZoneStatusResponse>, Status> {
-        let (_ctx, inner) = self.authenticate(req).await?;
+        let (ctx, inner) = self.authenticate(req).await?;
         let ops = self.ops()?;
-        let out = tokio::task::spawn_blocking(move || ops.zone_status(&inner))
+        let mut out = tokio::task::spawn_blocking(move || ops.zone_status(&inner))
             .await
             .map_err(|e| Status::internal(format!("zone runtime worker panicked: {e}")))?
             .map_err(status_from)?;
+        // Reads are open to any authenticated caller, but the raft topology
+        // (term / commit index / leader / voter & witness counts) is
+        // operator intelligence — strip it for anyone the mutation face's
+        // gate would refuse. The presence ladder stays: it is the answer.
+        if !(ctx.is_admin || ctx.is_system) {
+            out.cluster = None;
+        }
         Ok(Response::new(out))
     }
 
@@ -367,12 +380,29 @@ impl kernel::kernel::vfs_proto::zone_runtime_service_server::ZoneRuntimeService
         &self,
         req: Request<GetZoneOperationRequest>,
     ) -> Result<Response<ZoneOperationRecord>, Status> {
-        let (_ctx, inner) = self.authenticate(req).await?;
+        let (ctx, inner) = self.authenticate(req).await?;
         let ops = self.ops()?;
-        let out = tokio::task::spawn_blocking(move || ops.get_zone_operation(&inner))
+        let mut out = tokio::task::spawn_blocking(move || ops.get_zone_operation(&inner))
             .await
             .map_err(|e| Status::internal(format!("zone runtime worker panicked: {e}")))?
             .map_err(status_from)?;
+        // Same reader-facing filter as zone_status: the receipt's cluster
+        // facts and the raw refusal text (which can carry peer addresses
+        // via membership-conflict errors) stay operator-only; the status
+        // ladder and receipt identity are the caller's answer.
+        if !(ctx.is_admin || ctx.is_system) {
+            if let Some(receipt) = out.receipt.as_mut() {
+                receipt.cluster = None;
+            }
+            if !out.error.is_empty() {
+                tracing::warn!(
+                    operation_id = %out.operation_id,
+                    "zone operation error redacted for a non-admin caller: {}",
+                    out.error
+                );
+                out.error = "operation was rejected".to_string();
+            }
+        }
         Ok(Response::new(out))
     }
 
