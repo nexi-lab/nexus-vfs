@@ -44,3 +44,22 @@ test('an older daemon cannot silently acknowledge a chmod it never performed', a
     await assert.rejects(client.chmod('/project/run.sh', 0o700, ''), /UNIMPLEMENTED/)
   } finally { await close() }
 })
+
+test('directory deletion opts into the existing recursive RPC and preserves authorization failures', async () => {
+  const requests = []
+  const { client, close } = await fixture({ delete(call, reply) {
+    requests.push(call.request)
+    if (call.request.path === '/denied') reply({ code: grpc.status.PERMISSION_DENIED, details: 'Owner cannot delete this directory' })
+    else reply(null, { success: true, is_error: false })
+  } })
+  try {
+    await client.delete('/project/file', 'owner-token')
+    await client.delete('/project/skills', 'owner-token', { recursive: true })
+    assert.deepEqual(requests, [
+      { path: '/project/file', auth_token: 'owner-token', recursive: false },
+      { path: '/project/skills', auth_token: 'owner-token', recursive: true },
+    ])
+    await assert.rejects(client.delete('/denied', 'owner-token', { recursive: true }), /PERMISSION_DENIED/)
+    assert.equal(requests[2].auth_token, 'owner-token')
+  } finally { await close() }
+})

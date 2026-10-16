@@ -55,6 +55,11 @@ requires write permission. Missing files, unsupported backends, and older
 servers fail explicitly; a successful call does not create a second copy of
 the mode in Nexus metadata. Permission bits range from `0` through `0o777`.
 
+Directory cleanup uses the existing authorized Delete RPC:
+`await client.delete('/project/skills', authToken, { recursive: true })`.
+Omitting the option keeps deletion non-recursive. The server applies its
+normal filesystem authorization and refuses protected paths.
+
 Against an auth-on `nexusd-cluster`, which serves mutual TLS and rejects
 plaintext clients:
 

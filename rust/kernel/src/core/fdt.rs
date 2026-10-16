@@ -29,6 +29,7 @@ impl FileDescriptorTable {
         None
     }
     pub(crate) fn remove(&self, _vfs_path: &str) {}
+    pub(crate) fn remove_tree(&self, _vfs_path: &str) {}
     pub(crate) fn rename(&self, _old_path: &str, _new_path: &str) {}
     #[allow(dead_code)]
     pub(crate) fn close_all(&self) {}
@@ -161,6 +162,13 @@ impl FileDescriptorTable {
         self.fds.remove(vfs_path);
     }
 
+    /// Release directory descendants without matching similarly named siblings.
+    pub(crate) fn remove_tree(&self, vfs_path: &str) {
+        let prefix = format!("{}/", vfs_path.trim_end_matches('/'));
+        self.fds
+            .retain(|path, _| path != vfs_path && !path.starts_with(&prefix));
+    }
+
     /// Re-key an fd; reads still validate its original physical path.
     pub(crate) fn rename(&self, old_path: &str, new_path: &str) {
         if let Some((_, handle)) = self.fds.remove(old_path) {
@@ -233,6 +241,26 @@ mod tests {
         fdt.rename("/old", "/new");
         assert!(fdt.pread("/old").is_none());
         assert_eq!(fdt.pread("/new").unwrap(), b"content");
+    }
+
+    #[test]
+    fn remove_tree_closes_descendants_and_retains_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("asset");
+        std::fs::write(&file, b"asset").unwrap();
+        let fdt = FileDescriptorTable::new();
+        assert!(fdt.register("/skills/a/run.sh", &file));
+        assert!(fdt.register("/skills/ab/keep.sh", &file));
+        let removed = Arc::downgrade(fdt.fds.get("/skills/a/run.sh").unwrap().value());
+
+        fdt.remove_tree("/skills/a/");
+
+        assert!(
+            removed.upgrade().is_none(),
+            "the descriptor owner must be dropped"
+        );
+        assert!(fdt.pread("/skills/a/run.sh").is_none());
+        assert_eq!(fdt.pread("/skills/ab/keep.sh").unwrap(), b"asset");
     }
 
     #[test]
