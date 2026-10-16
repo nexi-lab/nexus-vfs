@@ -7,6 +7,7 @@ use std::sync::Arc;
 use backends::storage::path_local::PathLocalBackend;
 use kernel::abc::meta_store::{DT_DIR, DT_LINK, DT_REG, DT_STREAM};
 use kernel::abc::object_store::ObjectStore;
+use kernel::kernel::convenience::KernelConvenience;
 use kernel::kernel::{Kernel, KernelError, OperationContext, ReadRequest, WriteRequest};
 
 fn setup(root: &Path) -> (Kernel, OperationContext) {
@@ -215,4 +216,20 @@ fn native_permission_changes_apply_to_the_executed_file_and_reject_symlinks() {
         kernel.sys_stat("/document.txt", "root").unwrap().mode,
         0o700
     );
+}
+
+#[test]
+fn mkdir_recreates_deleted_native_directories_and_does_not_publish_failed_creates() {
+    let root = tempfile::tempdir().unwrap();
+    let (kernel, context) = setup(root.path());
+    KernelConvenience::mkdir(&kernel, "/project", &context, true, true).unwrap();
+    kernel.set_file_mode("/project", &context, 0o700).unwrap();
+    assert_eq!(kernel.sys_stat("/project", "root").unwrap().mode, 0o700);
+    std::fs::remove_dir(root.path().join("project")).unwrap();
+    KernelConvenience::mkdir(&kernel, "/project", &context, true, true).unwrap();
+    assert!(root.path().join("project").is_dir());
+    assert!(
+        KernelConvenience::mkdir(&kernel, "/document.txt/child", &context, true, true).is_err()
+    );
+    assert!(kernel.sys_stat("/document.txt/child", "root").is_none());
 }
