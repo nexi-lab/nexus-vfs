@@ -80,21 +80,10 @@ async fn all_read_paths_leave_unknown_corpora_absent() {
         (
             stats.fts_doc_count,
             stats.ann_chunk_count,
-            stats.parked_count,
             stats.last_index_seq
         ),
-        (0, 0, 0, 0)
+        (0, 0, 0)
     );
-    assert!(svc
-        .parked_list(Request::new(ParkedListRequest {
-            zone_id: "unknown".into(),
-            ..Default::default()
-        }))
-        .await
-        .unwrap()
-        .into_inner()
-        .entries
-        .is_empty());
     assert!(svc
         .list_indexed_directories(Request::new(ListIndexedDirectoriesRequest {
             zone_id: "unknown".into(),
@@ -130,11 +119,6 @@ async fn statistics_report_corrupt_storage_instead_of_successful_zero_counts() {
             "broken-ann",
             manager.ann_dir("broken-ann", "mock").join("sidecar.json"),
             "ANN",
-        ),
-        (
-            "broken-parked",
-            manager.zone_root("broken-parked").join("parked.json"),
-            "parked",
         ),
     ] {
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -210,18 +194,6 @@ async fn every_indexed_rpc_rejects_unsafe_zone_before_creating_state() {
             }))
         );
         rejects!(svc.locate(Request::new(LocateRequest {
-            zone_id: zone.into(),
-            ..Default::default()
-        })));
-        rejects!(svc.parked_list(Request::new(ParkedListRequest {
-            zone_id: zone.into(),
-            ..Default::default()
-        })));
-        rejects!(svc.parked_retry(Request::new(ParkedRetryRequest {
-            zone_id: zone.into(),
-            ..Default::default()
-        })));
-        rejects!(svc.parked_discard(Request::new(ParkedDiscardRequest {
             zone_id: zone.into(),
             ..Default::default()
         })));

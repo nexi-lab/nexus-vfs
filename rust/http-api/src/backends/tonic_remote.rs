@@ -128,11 +128,10 @@ mod tests {
         HealthResponse, IndexDocumentsRequest, IndexDocumentsResponse, IndexRequest, IndexResponse,
         ListIndexedDirectoriesRequest, ListIndexedDirectoriesResponse,
         ListZoneIndexingModesRequest, ListZoneIndexingModesResponse, LocateRequest, LocateResponse,
-        NotifyFileChangeRequest, NotifyFileChangeResponse, ParkedDiscardRequest,
-        ParkedDiscardResponse, ParkedListRequest, ParkedListResponse, ParkedRetryRequest,
-        ParkedRetryResponse, QueryResponse, QueryResult, RefreshRequest, RefreshResponse,
-        RemoveIndexedDirectoryRequest, RemoveIndexedDirectoryResponse, SetZoneIndexingModeRequest,
-        SetZoneIndexingModeResponse, StatsRequest, StatsResponse,
+        NotifyFileChangeRequest, NotifyFileChangeResponse, QueryResponse, QueryResult,
+        RefreshRequest, RefreshResponse, RemoveIndexedDirectoryRequest,
+        RemoveIndexedDirectoryResponse, SetZoneIndexingModeRequest, SetZoneIndexingModeResponse,
+        StatsRequest, StatsResponse,
     };
     use nexus_search_common::transport::PeerChannelConfig;
     use nexus_search_common::SearchDelegation;
@@ -265,24 +264,6 @@ mod tests {
             &self,
             _: Request<LocateRequest>,
         ) -> Result<Response<LocateResponse>, Status> {
-            unreachable!()
-        }
-        async fn parked_list(
-            &self,
-            _: Request<ParkedListRequest>,
-        ) -> Result<Response<ParkedListResponse>, Status> {
-            unreachable!()
-        }
-        async fn parked_retry(
-            &self,
-            _: Request<ParkedRetryRequest>,
-        ) -> Result<Response<ParkedRetryResponse>, Status> {
-            unreachable!()
-        }
-        async fn parked_discard(
-            &self,
-            _: Request<ParkedDiscardRequest>,
-        ) -> Result<Response<ParkedDiscardResponse>, Status> {
             unreachable!()
         }
         async fn add_indexed_directory(

@@ -18,10 +18,9 @@ use nexus_http_api::search_proto::{
     IndexDocumentsRequest, IndexDocumentsResponse, IndexRequest, IndexResponse,
     ListIndexedDirectoriesRequest, ListIndexedDirectoriesResponse, ListZoneIndexingModesRequest,
     ListZoneIndexingModesResponse, LocateRequest, LocateResponse, NotifyFileChangeRequest,
-    NotifyFileChangeResponse, ParkedDiscardRequest, ParkedDiscardResponse, ParkedListRequest,
-    ParkedListResponse, ParkedRetryRequest, ParkedRetryResponse, QueryRequest, QueryResponse,
-    RefreshRequest, RefreshResponse, RemoveIndexedDirectoryRequest, RemoveIndexedDirectoryResponse,
-    SetZoneIndexingModeRequest, SetZoneIndexingModeResponse, StatsRequest, StatsResponse,
+    NotifyFileChangeResponse, QueryRequest, QueryResponse, RefreshRequest, RefreshResponse,
+    RemoveIndexedDirectoryRequest, RemoveIndexedDirectoryResponse, SetZoneIndexingModeRequest,
+    SetZoneIndexingModeResponse, StatsRequest, StatsResponse,
 };
 use nexus_http_api::{bind_and_serve, AppState};
 use tokio::net::TcpListener;
@@ -78,7 +77,6 @@ impl Default for MockConfig {
             index_documents_resp: IndexDocumentsResponse {
                 indexed_count: 7,
                 skipped_count: 0,
-                parked_paths: vec![],
                 error: None,
                 index_seq: 11,
                 skipped_paths: vec![],
@@ -87,7 +85,6 @@ impl Default for MockConfig {
                 fts_doc_count: 1234,
                 fts_path_count: 567,
                 ann_chunk_count: 890,
-                parked_count: 0,
                 error: None,
                 backend: "rust-plugin".into(),
                 embedding_model: "mE5-small-v1".into(),
@@ -216,24 +213,6 @@ impl SearchService for MockSearchService {
         )
     }
     async fn locate(&self, _: Request<LocateRequest>) -> Result<Response<LocateResponse>, Status> {
-        unreachable!()
-    }
-    async fn parked_list(
-        &self,
-        _: Request<ParkedListRequest>,
-    ) -> Result<Response<ParkedListResponse>, Status> {
-        unreachable!()
-    }
-    async fn parked_retry(
-        &self,
-        _: Request<ParkedRetryRequest>,
-    ) -> Result<Response<ParkedRetryResponse>, Status> {
-        unreachable!()
-    }
-    async fn parked_discard(
-        &self,
-        _: Request<ParkedDiscardRequest>,
-    ) -> Result<Response<ParkedDiscardResponse>, Status> {
         unreachable!()
     }
     async fn add_indexed_directory(
@@ -515,7 +494,6 @@ async fn batch_happy_path_round_trips_documents_list() {
     let parsed: serde_json::Value = resp.json().await.expect("parse json");
     assert_eq!(parsed["indexed_count"], 7);
     assert_eq!(parsed["skipped_count"], 0);
-    assert_eq!(parsed["parked_paths"].as_array().unwrap().len(), 0);
     // #4736: the plugin's sequence + per-path skips ride along.
     assert_eq!(parsed["index_seq"], 11);
     assert_eq!(parsed["skipped_paths"].as_array().unwrap().len(), 0);
@@ -537,40 +515,6 @@ async fn batch_happy_path_round_trips_documents_list() {
     );
     assert_eq!(r.zone_id, "root");
     assert_eq!(r.auth_token, "sk-test");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn batch_parked_paths_survive_round_trip() {
-    // A partial-failure response surfaces `parked_paths` — a caller
-    // gating on retry logic reads this list to schedule follow-ups.
-    let h = Harness::start(MockConfig {
-        index_documents_resp: IndexDocumentsResponse {
-            indexed_count: 2,
-            skipped_count: 0,
-            parked_paths: vec!["/notes/a.md".into(), "/notes/c.md".into()],
-            error: None,
-            index_seq: 12,
-            skipped_paths: vec![],
-        },
-        ..MockConfig::default()
-    })
-    .await;
-    let resp = reqwest::Client::new()
-        .post(format!("{}/v2/documents/batch", h.http_base))
-        .json(&serde_json::json!({
-            "documents": [{"path": "/x", "text": "x"}],
-        }))
-        .send()
-        .await
-        .expect("send");
-    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
-    let parsed: serde_json::Value = resp.json().await.expect("parse json");
-    let parked = parsed["parked_paths"].as_array().expect("parked array");
-    assert_eq!(parked.len(), 2);
-    assert_eq!(parked[0], "/notes/a.md");
-    assert_eq!(parked[1], "/notes/c.md");
-    assert_eq!(parsed["indexed_count"], 2);
-    assert_eq!(parsed["index_seq"], 12);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -771,7 +715,6 @@ async fn stats_happy_path_surfaces_backend_identity_and_counters() {
     assert_eq!(parsed["fts_doc_count"], 1234);
     assert_eq!(parsed["fts_path_count"], 567);
     assert_eq!(parsed["ann_chunk_count"], 890);
-    assert_eq!(parsed["parked_count"], 0);
     assert_eq!(parsed["backend"], "rust-plugin");
     assert_eq!(parsed["embedding_model"], "mE5-small-v1");
     assert_eq!(parsed["indexing_in_progress"], 0);

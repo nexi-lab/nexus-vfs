@@ -25,7 +25,7 @@ fn query(q: &str) -> QueryRequest {
 async fn certificate_reads_preserve_storage_and_committed_index_survives_restart() {
     use nexus_search_plugin::search_proto::{
         BatchQueryRequest, ListIndexedDirectoriesRequest, ListZoneIndexingModesRequest,
-        LocateRequest, ParkedListRequest, StatsRequest,
+        LocateRequest, StatsRequest,
     };
     let tmp = tempfile::tempdir().unwrap();
     let plugins = signed_plugin(tmp.path());
@@ -122,16 +122,6 @@ async fn certificate_reads_preserve_storage_and_committed_index_survives_restart
         .unwrap()
         .into_inner();
     assert_eq!((before.fts_doc_count, before.last_index_seq), (0, 0));
-    assert!(node
-        .parked_list(ParkedListRequest {
-            zone_id: "unindexed".into(),
-            ..Default::default()
-        })
-        .await
-        .unwrap()
-        .into_inner()
-        .entries
-        .is_empty());
     assert!(node
         .list_indexed_directories(ListIndexedDirectoriesRequest {
             zone_id: "unindexed".into(),

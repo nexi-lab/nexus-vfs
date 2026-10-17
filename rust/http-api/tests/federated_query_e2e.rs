@@ -37,11 +37,9 @@ use nexus_http_api::search_proto::{
     IndexDocumentsRequest, IndexDocumentsResponse, IndexRequest, IndexResponse,
     ListIndexedDirectoriesRequest, ListIndexedDirectoriesResponse, ListZoneIndexingModesRequest,
     ListZoneIndexingModesResponse, LocateRequest, LocateResponse, NotifyFileChangeRequest,
-    NotifyFileChangeResponse, ParkedDiscardRequest, ParkedDiscardResponse, ParkedListRequest,
-    ParkedListResponse, ParkedRetryRequest, ParkedRetryResponse, QueryRequest, QueryResponse,
-    QueryResult, RefreshRequest, RefreshResponse, RemoveIndexedDirectoryRequest,
-    RemoveIndexedDirectoryResponse, SetZoneIndexingModeRequest, SetZoneIndexingModeResponse,
-    StatsRequest, StatsResponse,
+    NotifyFileChangeResponse, QueryRequest, QueryResponse, QueryResult, RefreshRequest,
+    RefreshResponse, RemoveIndexedDirectoryRequest, RemoveIndexedDirectoryResponse,
+    SetZoneIndexingModeRequest, SetZoneIndexingModeResponse, StatsRequest, StatsResponse,
 };
 use nexus_http_api::{bind_and_serve, AppState};
 use nexus_rebac::{tuple_key, InMemoryReBACTupleStore, ReBACTupleStore, ReBACTupleStoreError};
@@ -168,24 +166,6 @@ impl SearchService for FanoutMock {
         unreachable!()
     }
     async fn locate(&self, _: Request<LocateRequest>) -> Result<Response<LocateResponse>, Status> {
-        unreachable!()
-    }
-    async fn parked_list(
-        &self,
-        _: Request<ParkedListRequest>,
-    ) -> Result<Response<ParkedListResponse>, Status> {
-        unreachable!()
-    }
-    async fn parked_retry(
-        &self,
-        _: Request<ParkedRetryRequest>,
-    ) -> Result<Response<ParkedRetryResponse>, Status> {
-        unreachable!()
-    }
-    async fn parked_discard(
-        &self,
-        _: Request<ParkedDiscardRequest>,
-    ) -> Result<Response<ParkedDiscardResponse>, Status> {
         unreachable!()
     }
     async fn add_indexed_directory(

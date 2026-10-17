@@ -272,9 +272,6 @@ impl PluginGrpcPolicy for SearchGrpcPolicy {
                 return Ok(Box::new(AuthenticatedResponse));
             }
             "NotifyFileChange" => authorize!(NotifyFileChangeRequest, management_context),
-            "ParkedList" => authorize!(ParkedListRequest, management_context),
-            "ParkedRetry" => authorize!(ParkedRetryRequest, management_context),
-            "ParkedDiscard" => authorize!(ParkedDiscardRequest, management_context),
             "AddIndexedDirectory" => authorize!(AddIndexedDirectoryRequest, management_context),
             "RemoveIndexedDirectory" => {
                 authorize!(RemoveIndexedDirectoryRequest, management_context)
