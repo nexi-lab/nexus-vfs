@@ -71,15 +71,15 @@ fn recursive_removal_propagates_store_failures_and_releases_its_lock() {
     for failure in 1..=4 {
         let kernel = Kernel::new();
         let store = Arc::new(FailingStore::default());
+        let ctx = common::admin_ctx();
         kernel
             .mount(
                 "/",
-                MountOptions::new("mem")
+                MountOptions::new(&ctx, "mem")
                     .with_backend(Arc::new(common::MemBackend::default()))
                     .with_metastore(store.clone()),
             )
             .unwrap();
-        let ctx = common::admin_ctx();
         kernel.mkdir("/skills", &ctx, true, true).unwrap();
         kernel.write("/skills/run.sh", &ctx, b"script", 0).unwrap();
         store.failure.store(failure, Ordering::SeqCst);
