@@ -2,7 +2,7 @@
 name = "nexus-http-api"
 version = "0.1.0"
 edition = "2021"
-description = "HTTP search, document management, credentials, and ReBAC administration"
+description = "HTTP file access, search, document management, credentials, and ReBAC administration"
 
 [lib]
 name = "nexus_http_api"

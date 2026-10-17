@@ -1,4 +1,4 @@
-//! HTTP API for search, indexing, credentials, and relationship grants.
+//! HTTP API for files, search, indexing, credentials, and relationship grants.
 //!
 //! Protected routes resolve one Authorization bearer and retain it for downstream
 //! RPCs. Search uses canonical VFS paths; the gRPC host enforces zone and file
@@ -16,11 +16,14 @@ use transport::auth::AuthProvider;
 
 pub mod backends;
 pub mod browser;
+mod error;
 pub mod handlers;
 pub mod middleware;
 mod query;
 pub mod revision;
 pub mod search_backend;
+mod upstream;
+pub mod vfs_backend;
 pub mod zone;
 
 /// Client stubs for the workspace's `nexus.search.v1` proto SSOT
@@ -78,6 +81,7 @@ pub struct AppState {
     /// Shared daemon bootstrap gate; authentication and management wait for it.
     pub ready: Arc<transport::grpc::DataPlaneReady>,
     pub search: SearchBackend,
+    pub vfs: vfs_backend::VfsBackend,
     pub auth: Arc<dyn AuthProvider>,
     /// The kernel-adjacent `AuthKeyStore` — list / revoke backend
     /// for `/v2/auth/keys`.  Threaded from the same
@@ -177,7 +181,7 @@ impl AppState {
             // routes local via `RoutingBackend`.  Wired here so a
             // test that populates the registry gets end-to-end
             // remote dispatch without swapping the backend type.
-            let peer_cache = Arc::clone(&search.channels);
+            let peer_cache = Arc::clone(&search.endpoint().channels);
             let remote =
                 Arc::new(crate::backends::tonic_remote::TonicRemoteSearchBackend::new(peer_cache));
             // Empty registry — every zone falls through to the local
@@ -212,6 +216,7 @@ impl AppState {
         Self {
             browser_origins: browser::BrowserOrigins::default(),
             ready: transport::grpc::DataPlaneReady::open(),
+            vfs: vfs_backend::VfsBackend::from_endpoint(search.endpoint().clone()),
             search,
             auth: middleware::auth::default_no_auth_provider(),
             // Empty in-memory store for `/v2/auth/keys` tests.  The
@@ -267,6 +272,7 @@ pub fn router(state: AppState) -> Router {
             .merge(handlers::search::router())
             .merge(handlers::path_contexts::router())
             .merge(handlers::documents::router())
+            .merge(handlers::files::router())
             .merge(handlers::index_status::router())
             .merge(handlers::indexing_config::router())
             .merge(handlers::identity::router())
@@ -390,7 +396,7 @@ pub fn install_impl(
         let local =
             Arc::new(crate::backends::plugin_local::PluginLocalSearchBackend::new(search.clone()));
         // Local and remote legs share the configured TLS identity and channels.
-        let peer_cache = Arc::clone(&search.channels);
+        let peer_cache = Arc::clone(&search.endpoint().channels);
         let remote =
             Arc::new(crate::backends::tonic_remote::TonicRemoteSearchBackend::new(peer_cache));
         // Env-driven registry — the ONE knob for cross-daemon
@@ -424,6 +430,7 @@ pub fn install_impl(
     let state = AppState {
         browser_origins: browser::BrowserOrigins::from_env()?,
         ready,
+        vfs: vfs_backend::VfsBackend::from_endpoint(search.endpoint().clone()),
         search,
         auth,
         auth_key_store,
