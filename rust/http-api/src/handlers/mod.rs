@@ -9,6 +9,7 @@
 
 pub mod auth;
 pub mod documents;
+pub mod files;
 pub mod identity;
 pub mod index_status;
 pub mod indexing_config;

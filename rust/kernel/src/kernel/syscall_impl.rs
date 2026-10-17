@@ -1517,6 +1517,17 @@ impl Kernel {
             }
         };
 
+        self.stat_from_metadata(path, zone_id, route, entry)
+    }
+
+    /// Resolve live stat fields from an already-read inode for point and batch reads.
+    pub(super) fn stat_from_metadata(
+        &self,
+        path: &str,
+        zone_id: &str,
+        route: crate::vfs_router::RouteResult,
+        entry: FileMetadata,
+    ) -> Option<StatResult> {
         // A replicated inode can name another node's bytes. That node's
         // durable metadata remains authoritative over this node's filesystem.
         let reference =

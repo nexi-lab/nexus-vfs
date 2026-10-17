@@ -23,6 +23,7 @@
 //! reach the caller intact.  A new handler reuses the enum + mapper
 //! instead of hand-rolling its own.
 
+use crate::error::grpc_status_to_http;
 use crate::middleware::auth::BearerToken;
 use crate::query::{parse_fusion_method, parse_query_type, query_request};
 use axum::extract::{Query, State};
@@ -751,72 +752,5 @@ impl IntoResponse for SearchError {
             );
         }
         response
-    }
-}
-
-/// gRPC → HTTP status mapping.  `pub(crate)` so `middleware::auth`
-/// delegates instead of maintaining its own subset table; a real
-/// `ApiKeyAuthProvider` can emit `ResourceExhausted` (rate limit)
-/// / `InvalidArgument` (malformed sk-key) which would otherwise
-/// silently degrade to 500 under a subset mapper.  Both routes
-/// (search-RPC and auth-RPC) share the same wire semantics — no
-/// reason to fork the table.
-///
-/// Covers every `tonic::Code` variant
-/// the proto SSOT (`nexus/search/v1/search.proto`) declares upstream
-/// can emit — plus the ambient retryable / auth codes any RPC can
-/// surface — so no legitimate upstream signal silently degrades to
-/// HTTP 500 (pager-worthy).
-///
-/// Table:
-/// - `InvalidArgument` → 400 Bad Request
-/// - `NotFound` → 404 Not Found
-/// - `AlreadyExists` → 409 Conflict
-/// - `PermissionDenied` → 403 Forbidden
-/// - `ResourceExhausted` → 429 Too Many Requests (retry-after fits)
-/// - `FailedPrecondition` → 412 Precondition Failed
-/// - `Aborted` → 409 Conflict (transactional abort)
-/// - `OutOfRange` → 400 Bad Request
-/// - `Unimplemented` → 501 Not Implemented (proto declares Query returns
-///   this for non-KEYWORD query_type in P1)
-/// - `Unavailable` → 503 Service Unavailable
-/// - `DeadlineExceeded` → 504 Gateway Timeout
-/// - `Unauthenticated` → 401 Unauthorized
-/// - `Ok` / `Cancelled` / `Unknown` / `Internal` / `DataLoss` → 500
-///   Internal Server Error
-///
-/// `Ok` in the fallback is deliberate — surfacing an "Ok" gRPC status
-/// as an HTTP error at all is a caller-side contract violation
-/// (`Ok` should never come through `Result::Err`), so 500 flags the
-/// bug rather than silently returning 200.
-pub(crate) fn grpc_status_to_http(code: tonic::Code) -> StatusCode {
-    match code {
-        tonic::Code::InvalidArgument => StatusCode::BAD_REQUEST,
-        tonic::Code::NotFound => StatusCode::NOT_FOUND,
-        tonic::Code::AlreadyExists => StatusCode::CONFLICT,
-        tonic::Code::PermissionDenied => StatusCode::FORBIDDEN,
-        tonic::Code::ResourceExhausted => StatusCode::TOO_MANY_REQUESTS,
-        tonic::Code::FailedPrecondition => StatusCode::PRECONDITION_FAILED,
-        tonic::Code::Aborted => StatusCode::CONFLICT,
-        tonic::Code::OutOfRange => StatusCode::BAD_REQUEST,
-        tonic::Code::Unimplemented => StatusCode::NOT_IMPLEMENTED,
-        tonic::Code::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
-        tonic::Code::DeadlineExceeded => StatusCode::GATEWAY_TIMEOUT,
-        tonic::Code::Unauthenticated => StatusCode::UNAUTHORIZED,
-        // Ok / Cancelled / Unknown / Internal / DataLoss — no HTTP
-        // status distinguishes these usefully to a caller.  500
-        // ensures an unmapped upstream signal never surfaces as 200.
-        //
-        // Exhaustive rather than `_` so a tonic upgrade that adds a
-        // new `Code` variant breaks the build here loudly instead of
-        // silently degrading production callers to 500.  When that
-        // happens: add the new variant with a considered HTTP mapping
-        // (or leave it in this fallback group with a docstring
-        // update) — do NOT add `_ => 500` back.
-        tonic::Code::Ok
-        | tonic::Code::Cancelled
-        | tonic::Code::Unknown
-        | tonic::Code::Internal
-        | tonic::Code::DataLoss => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }

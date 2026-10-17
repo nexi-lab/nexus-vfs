@@ -114,13 +114,13 @@ pub fn parse_bearer(headers: &axum::http::HeaderMap) -> Result<Option<&str>, Aut
 /// mapping (including `Unauthenticated`, `PermissionDenied`,
 /// `ResourceExhausted`, `InvalidArgument`, `Unavailable`,
 /// `DeadlineExceeded`, `Unimplemented`, and the rest) delegates to
-/// the shared [`handlers::search::grpc_status_to_http`] table so
+/// the shared [`error::grpc_status_to_http`] table so
 /// both HTTP surfaces (search RPCs + auth-provider RPCs) speak the
 /// same wire semantics.
 ///
 /// Absent-header behaviour is provider-driven (see [`parse_bearer`]).
 ///
-/// [`handlers::search::grpc_status_to_http`]: crate::handlers::search::grpc_status_to_http
+/// [`error::grpc_status_to_http`]: crate::error::grpc_status_to_http
 pub async fn require_bearer(
     State(state): State<AppState>,
     mut req: Request,
@@ -194,7 +194,7 @@ impl IntoResponse for AuthRejection {
                 // limit) → 429 and `InvalidArgument` (malformed sk-key)
                 // → 400 through the shared map; a local subset table
                 // silently swallowed both into 500 (audit finding).
-                crate::handlers::search::grpc_status_to_http(s.code()),
+                crate::error::grpc_status_to_http(s.code()),
                 s.message().to_string(),
             ),
         };
@@ -375,7 +375,7 @@ mod tests {
     #[test]
     fn auth_rejection_rpc_covers_the_full_shared_status_table() {
         // `AuthRejection::Rpc` now delegates to the shared search
-        // module mapper (`handlers::search::grpc_status_to_http`) —
+        // module mapper (`error::grpc_status_to_http`) —
         // so a real `ApiKeyAuthProvider` returning
         // `ResourceExhausted` (rate limit) surfaces as 429 not 500,
         // and `InvalidArgument` (malformed sk-key) as 400 not 500.

@@ -1956,9 +1956,9 @@ fn vfs_routes<T: NexusVfsService>(svc: T, max_message_bytes: usize) -> tonic::se
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-/// Subset of `RPCErrorCode` from `nexus.contracts.rpc_types`.
+/// Wire error codes returned in typed VFS RPC error payloads.
 #[derive(Copy, Clone)]
-pub(crate) enum RpcErrorCode {
+pub enum RpcErrorCode {
     InvalidPath = -32004,
     PermissionError = -32003,
     AccessDenied = -32018,

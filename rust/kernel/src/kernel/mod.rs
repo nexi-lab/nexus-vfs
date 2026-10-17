@@ -3701,6 +3701,19 @@ mod tests {
             "sys_stat.size must track the live stream tail, not the stale metastore size"
         );
         assert_eq!(stat.size, 19, "tail = (4+5) + (4+6) = 19 framed bytes");
+        let batched = crate::kernel::convenience::KernelConvenience::stat_batch(
+            &k,
+            &[path.to_owned()],
+            "root",
+        )
+        .pop()
+        .flatten()
+        .expect("batched stream stat");
+        assert_eq!(
+            batched.size, stat.size,
+            "batch stat must use the live stream tail"
+        );
+        assert_eq!(batched.modified_at_ms, stat.modified_at_ms);
     }
 
     /// `sys_stat` reports a DT_STREAM's last-append wall-clock as
