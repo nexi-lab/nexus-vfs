@@ -11,9 +11,13 @@ use reqwest::{Client, StatusCode};
 use serde_json::json;
 
 const BUDGET: Duration = Duration::from_secs(90);
+const BROWSER_ORIGIN: &str = "https://console.example.test";
 
 fn http_client() -> Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(reqwest::header::ORIGIN, BROWSER_ORIGIN.parse().unwrap());
     Client::builder()
+        .default_headers(headers)
         .no_proxy()
         .timeout(Duration::from_secs(15))
         .build()
@@ -24,6 +28,10 @@ async fn identity(client: &Client, url: &str, key: &str) -> IdentityResponse {
     let response = client.get(url).bearer_auth(key).send().await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(
+        response.headers()["access-control-allow-origin"],
+        BROWSER_ORIGIN
+    );
     let bytes = response.bytes().await.unwrap();
     assert!(!String::from_utf8_lossy(&bytes).contains(key));
     serde_json::from_slice(&bytes).unwrap()
@@ -47,6 +55,7 @@ async fn browser_identity_follows_native_grants_revocation_and_restart() {
         ("NEXUS_BIND_ADDR", grpc.as_str()),
         ("NEXUS_ADVERTISE_ADDR", grpc.as_str()),
         ("NEXUS_HTTP_ADDR", http.as_str()),
+        ("NEXUS_HTTP_ALLOWED_ORIGINS", BROWSER_ORIGIN),
         ("NEXUS_API_KEY_SECRET", "synthetic-browser-identity-secret"),
         ("NEXUS_REBAC_ENABLED", "true"),
         ("NEXUS_CLUSTER_INIT", "sharedzone"),
@@ -73,15 +82,49 @@ async fn browser_identity_follows_native_grants_revocation_and_restart() {
     let admin = admin.trim();
     let client = http_client();
 
+    let preflight = client
+        .request(reqwest::Method::OPTIONS, &url)
+        .header("access-control-request-method", "GET")
+        .header(
+            "access-control-request-headers",
+            "authorization,content-type",
+        )
+        .send()
+        .await
+        .unwrap();
+    assert!(preflight.status().is_success());
+    assert_eq!(
+        preflight.headers()["access-control-allow-origin"],
+        BROWSER_ORIGIN
+    );
+    assert_eq!(
+        preflight.headers()["access-control-allow-credentials"],
+        "true"
+    );
+
+    let untrusted = client
+        .request(reqwest::Method::OPTIONS, &url)
+        .header("origin", "https://unconfigured.example.test")
+        .header("access-control-request-method", "GET")
+        .header("access-control-request-headers", "authorization")
+        .send()
+        .await
+        .unwrap();
+    assert!(!untrusted
+        .headers()
+        .contains_key("access-control-allow-origin"));
+
     for token in [None, Some("sk-unknown-browser-key")] {
         let request = client.get(&url);
         let request = match token {
             Some(key) => request.bearer_auth(key),
             None => request,
         };
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(
-            request.send().await.unwrap().status(),
-            StatusCode::UNAUTHORIZED
+            response.headers()["access-control-allow-origin"],
+            BROWSER_ORIGIN
         );
     }
     assert_eq!(
@@ -181,4 +224,18 @@ async fn browser_identity_follows_native_grants_revocation_and_restart() {
     );
     assert_eq!(identity(&client, &url, &issued[1].0).await, issued[1].2);
     drop(daemon);
+
+    let mut invalid_env = env.to_vec();
+    invalid_env.push((
+        "NEXUS_HTTP_ALLOWED_ORIGINS",
+        "https://console.example.test,invalid",
+    ));
+    let mut invalid = common::Daemon::spawn(&[], &invalid_env);
+    assert!(
+        invalid.wait_exit(BUDGET).await.is_some(),
+        "invalid browser configuration did not stop boot"
+    );
+    assert!(invalid
+        .drain_settled()
+        .contains("NEXUS_HTTP_ALLOWED_ORIGINS must contain"));
 }

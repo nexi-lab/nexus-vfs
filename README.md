@@ -65,6 +65,16 @@ mounts such as `/docs`. The loopback HTTP listener is intended to sit behind a
 TLS reverse proxy; its outbound gRPC connections use the daemon's cluster CA and
 node certificate while preserving the bearer caller's identity.
 
+For a separately hosted browser console, set
+`NEXUS_HTTP_ALLOWED_ORIGINS=https://console.example.com,http://localhost:5173`.
+The listener validates this list at boot and matches complete origins. Empty
+configuration leaves cross-origin access disabled; wildcards, credentials and
+URLs containing paths, queries or fragments are rejected. Allowed origins can
+preflight bearer/JSON requests and read authentication errors and revision
+headers. CORS does not authenticate requests or replace OAuth browser binding
+and CSRF checks. The ordinary credential, readiness and authorization gates
+still apply to every actual API call.
+
 Cross-zone queries support query type, result limit, and one path prefix. Pin
 `zone_id` to use additional ranking, chunk, or path-filter options; unsupported
 cross-zone options return HTTP 400.

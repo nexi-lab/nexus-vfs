@@ -19,6 +19,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal
 serde = { workspace = true }
 serde_json = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors"] }
+url = "2"
 tracing = "0.1"
 
 # tonic client for talking to the upstream search-plugin (and

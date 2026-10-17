@@ -15,6 +15,7 @@ use tokio::net::TcpListener;
 use transport::auth::AuthProvider;
 
 pub mod backends;
+pub mod browser;
 pub mod handlers;
 pub mod middleware;
 mod query;
@@ -72,6 +73,8 @@ pub type DefaultFederatedDispatcher = nexus_federated_search::FederatedSearchDis
 /// single-node default.
 #[derive(Clone)]
 pub struct AppState {
+    /// Resolved HTTP origin policy; no environment lookup on request paths.
+    pub browser_origins: browser::BrowserOrigins,
     /// Shared daemon bootstrap gate; authentication and management wait for it.
     pub ready: Arc<transport::grpc::DataPlaneReady>,
     pub search: SearchBackend,
@@ -207,6 +210,7 @@ impl AppState {
             ))
         };
         Self {
+            browser_origins: browser::BrowserOrigins::default(),
             ready: transport::grpc::DataPlaneReady::open(),
             search,
             auth: middleware::auth::default_no_auth_provider(),
@@ -254,6 +258,7 @@ impl AppState {
 /// unaware of the split beyond optionally extracting
 /// `Extension<OperationContext>`.
 pub fn router(state: AppState) -> Router {
+    let cors = state.browser_origins.layer();
     let public_router = Router::new()
         .merge(handlers::status::router())
         .with_state(state.clone());
@@ -274,7 +279,11 @@ pub fn router(state: AppState) -> Router {
         ))
         .with_state(state)
     };
-    Router::new().merge(public_router).merge(protected_router)
+    let router = Router::new().merge(public_router).merge(protected_router);
+    match cors {
+        Some(cors) => router.layer(cors),
+        None => router,
+    }
 }
 
 /// Bind `addr` and serve [`router(state)`](router) until the returned
@@ -413,6 +422,7 @@ pub fn install_impl(
         ))
     };
     let state = AppState {
+        browser_origins: browser::BrowserOrigins::from_env()?,
         ready,
         search,
         auth,
