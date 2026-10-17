@@ -26,7 +26,7 @@ fn mixed_mounts_preserve_positions_duplicates_missing_paths_and_metadata_ownersh
         kernel
             .mount(
                 mount,
-                MountOptions::new("mem")
+                MountOptions::new(&ctx, "mem")
                     .with_backend(Arc::new(common::MemBackend::default()))
                     .with_metastore(store.clone()),
             )

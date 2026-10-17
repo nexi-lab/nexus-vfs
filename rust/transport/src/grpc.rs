@@ -263,6 +263,92 @@ impl_authed_request!(
 #[derive(Clone)]
 pub(crate) struct AuthenticatedRequestContext(pub(crate) OperationContext);
 
+/// The authenticate half of the VFS request path, as a free function so
+/// the ZoneRuntime service (same port, same boot gate, same auth plane)
+/// rides the IDENTICAL door: ready-gate wait → in-process identity → peer
+/// identity (foreign-CA aware) → `AuthProvider::resolve` → runtime
+/// delegation scope. Extracted from [`VfsServiceImpl::authenticate`],
+/// which now forwards here.
+pub(crate) async fn authenticate_with<T: AuthedRequest>(
+    auth: &Arc<dyn AuthProvider>,
+    ready: &DataPlaneReady,
+    foreign_ca_verifier: &ForeignCaVerifierSlot,
+    runtime_scope: Option<&Arc<RuntimeScope>>,
+    req: Request<T>,
+) -> Result<(OperationContext, T), Status> {
+    let ctx =
+        resolve_request_context(auth, ready, foreign_ca_verifier, runtime_scope, &req).await?;
+    Ok((ctx, req.into_inner()))
+}
+
+/// The context-resolution half shared by every door on this port. Callers
+/// that have already resolved an identity in-process (see
+/// [`AuthenticatedRequestContext`]) skip re-resolution; runtime delegation
+/// is honoured only where a scope was wired, and refused — not silently
+/// ignored — everywhere else.
+pub(crate) async fn resolve_request_context<T: AuthedRequest>(
+    auth: &Arc<dyn AuthProvider>,
+    ready: &DataPlaneReady,
+    foreign_ca_verifier: &ForeignCaVerifierSlot,
+    runtime_scope: Option<&Arc<RuntimeScope>>,
+    req: &Request<T>,
+) -> Result<OperationContext, Status> {
+    if !ready.wait(DATA_PLANE_READY_BUDGET).await {
+        return Err(Status::unavailable(
+            "nexusd is still booting: the VFS data plane is not wired yet \
+             (no distributed coordinator) — retry",
+        ));
+    }
+    if let Some(ctx) = req.extensions().get::<AuthenticatedRequestContext>() {
+        return Ok(ctx.0.clone());
+    }
+    // Resolve the peer identity, foreign-CA aware only when it can matter.
+    // `foreign_anchors()` is an O(1) ArcSwap read the apply observer keeps
+    // fresh. When it is empty — the common case, and always so on an
+    // auth-off node — every rustls-admitted cert is cluster-CA, so
+    // classification would just re-derive "local"; take the plain parse
+    // path and skip the per-request signature verify. Only once a foreign
+    // CA is registered do we classify (to resolve its agents qualified,
+    // `{trust_domain}/agent/{name}`).
+    let peer = match foreign_ca_verifier.get() {
+        Some(v) => {
+            let anchors = v.foreign_anchors();
+            if anchors.is_empty() {
+                peer_identity::from_request(req)
+            } else {
+                peer_identity::classify_from_request(req, v.cluster_ca_der(), &anchors)
+            }
+        }
+        None => peer_identity::from_request(req),
+    };
+    let ctx = auth.resolve(&AuthCredentials {
+        token: req.get_ref().auth_token(),
+        peer: peer.as_ref(),
+    })?;
+    let ctx = match runtime_scope {
+        Some(scope) => scope.resolve(
+            auth.as_ref(),
+            ctx,
+            peer.as_ref(),
+            req.get_ref().auth_token(),
+            req.metadata(),
+        )?,
+        None => {
+            if req
+                .metadata()
+                .get_bin(RUNTIME_DELEGATION_METADATA_KEY)
+                .is_some()
+            {
+                return Err(Status::permission_denied(
+                    "runtime delegation is not enabled on this endpoint",
+                ));
+            }
+            ctx
+        }
+    };
+    Ok(ctx)
+}
+
 impl VfsServiceImpl {
     /// Authenticate a request and unwrap it.
     ///
@@ -290,59 +376,14 @@ impl VfsServiceImpl {
         &self,
         req: &Request<T>,
     ) -> Result<OperationContext, Status> {
-        if !self.ready.wait(DATA_PLANE_READY_BUDGET).await {
-            return Err(Status::unavailable(
-                "nexusd is still booting: the VFS data plane is not wired yet \
-                 (no distributed coordinator) — retry",
-            ));
-        }
-        if let Some(ctx) = req.extensions().get::<AuthenticatedRequestContext>() {
-            return Ok(ctx.0.clone());
-        }
-        // Resolve the peer identity, foreign-CA aware only when it can matter.
-        // `foreign_anchors()` is an O(1) ArcSwap read the apply observer keeps
-        // fresh. When it is empty — the common case, and always so on an auth-off
-        // node — every rustls-admitted cert is cluster-CA, so classification would
-        // just re-derive "local"; take the plain parse path and skip the per-request
-        // signature verify. Only once a foreign CA is registered do we classify (to
-        // resolve its agents qualified, `{trust_domain}/agent/{name}`).
-        let peer = match self.foreign_ca_verifier.get() {
-            Some(v) => {
-                let anchors = v.foreign_anchors();
-                if anchors.is_empty() {
-                    peer_identity::from_request(req)
-                } else {
-                    peer_identity::classify_from_request(req, v.cluster_ca_der(), &anchors)
-                }
-            }
-            None => peer_identity::from_request(req),
-        };
-        let ctx = self.auth.resolve(&AuthCredentials {
-            token: req.get_ref().auth_token(),
-            peer: peer.as_ref(),
-        })?;
-        let ctx = match &self.runtime_scope {
-            Some(scope) => scope.resolve(
-                self.auth.as_ref(),
-                ctx,
-                peer.as_ref(),
-                req.get_ref().auth_token(),
-                req.metadata(),
-            )?,
-            None => {
-                if req
-                    .metadata()
-                    .get_bin(RUNTIME_DELEGATION_METADATA_KEY)
-                    .is_some()
-                {
-                    return Err(Status::permission_denied(
-                        "runtime delegation is not enabled on this endpoint",
-                    ));
-                }
-                ctx
-            }
-        };
-        Ok(ctx)
+        resolve_request_context(
+            &self.auth,
+            &self.ready,
+            &self.foreign_ca_verifier,
+            self.runtime_scope.as_ref(),
+            req,
+        )
+        .await
     }
 
     /// Pick the RPC code; take the message from the error itself.
@@ -514,7 +555,7 @@ impl VfsServiceImpl {
 
         // Mount the freshly-built backend (and any remote metastore the
         // provider produced) through the kernel.
-        self.mount_via_kernel(&req, built.backend, built.pending_remote_meta_store)
+        self.mount_via_kernel(&req, ctx, built.backend, built.pending_remote_meta_store)
     }
 
     /// Issue the DT_MOUNT `Kernel::sys_setattr` from a `SetattrRequest` with a
@@ -525,6 +566,7 @@ impl VfsServiceImpl {
     fn mount_via_kernel(
         &self,
         req: &SetattrRequest,
+        ctx: &OperationContext,
         backend: Option<Arc<dyn kernel::abc::object_store::ObjectStore>>,
         remote_metastore: Option<Arc<dyn kernel::meta_store::MetaStore>>,
     ) -> SetattrResponse {
@@ -535,6 +577,7 @@ impl VfsServiceImpl {
         };
         match self.kernel.sys_setattr(
             &req.path,
+            ctx,
             req.entry_type,
             &req.backend_name,
             backend,
@@ -584,15 +627,21 @@ impl VfsServiceImpl {
     /// `ForeignAgentMailboxOnly` can create only inside its mailbox — the same
     /// boundary the write seam enforces on stream/pipe appends.
     fn setattr_typed(&self, req: SetattrRequest, ctx: &OperationContext) -> SetattrResponse {
+        // Authorization and the write must resolve in the SAME zone: an
+        // explicit zone_id rewrites the context before the gate (exactly the
+        // stat/readdir/batch_stat seam), and an omitted zone_id keeps the
+        // authenticated zone — a tenant that omits it must land in its own
+        // zone, not silently in root.
         let mut ctx = ctx.clone();
         if !req.zone_id.is_empty() {
-            ctx.zone_id = req.zone_id;
+            ctx.zone_id = req.zone_id.clone();
         }
         if let Err(status) = self.authorize_path(&req.path, Permission::Write, &ctx) {
             return error_setattr(status);
         }
         let result = self.kernel.sys_setattr(
             &req.path,
+            &ctx,
             req.entry_type,
             &req.backend_name,
             None, // backend (non-mount entry types don't need one)
@@ -2279,9 +2328,12 @@ pub(crate) mod tests {
         let backend: std::sync::Arc<dyn ObjectStore> = std::sync::Arc::new(MemBackend::default());
         k.mount(
             "/",
-            MountOptions::new("mem")
-                .with_backend(backend)
-                .with_io_profile(""),
+            MountOptions::new(
+                &kernel::kernel::OperationContext::new("test", "root", true, None, true),
+                "mem",
+            )
+            .with_backend(backend)
+            .with_io_profile(""),
         )
         .expect("kernel_with_mem_backend: mount DT_MOUNT");
         k
