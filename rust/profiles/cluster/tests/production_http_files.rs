@@ -109,6 +109,21 @@ async fn file_bytes_metadata_rename_and_live_permissions_use_the_native_node() {
     })))
     .await;
     assert_eq!(mkdir["hit"], true);
+    let root = json_ok(
+        client
+            .get(&directory)
+            .bearer_auth(admin)
+            .query(&[("path", "/")]),
+    )
+    .await;
+    assert!(
+        root["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["path"] == "/docs" && entry["is_directory"] == true),
+        "{root}"
+    );
     json_ok(client.post(&directory).bearer_auth(admin).json(&json!({
         "path":"/docs/nested", "parents":true, "exist_ok":true,
     })))
