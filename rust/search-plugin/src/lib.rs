@@ -77,7 +77,6 @@ pub mod kernel_io;
 pub mod llm_chat;
 pub mod macro_expand;
 mod markdown;
-pub mod parked_state;
 pub mod path_contexts;
 pub mod path_scope;
 pub mod peer_fanout;
@@ -93,8 +92,7 @@ use search_proto::{
     AddIndexedDirectoryRequest, BatchQueryRequest, DeletePathContextRequest, GlobRequest,
     GrepRequest, HealthRequest, IndexDocumentsRequest, IndexFileRequest, IndexRequest,
     ListIndexedDirectoriesRequest, ListPathContextsRequest, ListZoneIndexingModesRequest,
-    LocateRequest, NotifyFileChangeRequest, ParkedDiscardRequest, ParkedListRequest,
-    ParkedRetryRequest, PutPathContextRequest, QueryRequest, RefreshRequest,
+    LocateRequest, NotifyFileChangeRequest, PutPathContextRequest, QueryRequest, RefreshRequest,
     RemoveIndexedDirectoryRequest, SetZoneIndexingModeRequest, StatsRequest,
 };
 
@@ -257,9 +255,6 @@ fn dispatch_grpc(
         "IndexFile" => call!(IndexFileRequest, index_file),
         "NotifyFileChange" => call!(NotifyFileChangeRequest, notify_file_change),
         "Locate" => call!(LocateRequest, locate),
-        "ParkedList" => call!(ParkedListRequest, parked_list),
-        "ParkedRetry" => call!(ParkedRetryRequest, parked_retry),
-        "ParkedDiscard" => call!(ParkedDiscardRequest, parked_discard),
         "AddIndexedDirectory" => call!(AddIndexedDirectoryRequest, add_indexed_directory),
         "RemoveIndexedDirectory" => call!(RemoveIndexedDirectoryRequest, remove_indexed_directory),
         "ListIndexedDirectories" => call!(ListIndexedDirectoriesRequest, list_indexed_directories),

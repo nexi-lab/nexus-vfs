@@ -47,11 +47,10 @@ use crate::search_proto::{
     IndexRequest, IndexResponse, ListIndexedDirectoriesRequest, ListIndexedDirectoriesResponse,
     ListPathContextsRequest, ListPathContextsResponse, ListZoneIndexingModesRequest,
     ListZoneIndexingModesResponse, LocateRequest, LocateResponse, NotifyFileChangeRequest,
-    NotifyFileChangeResponse, ParkedDiscardRequest, ParkedDiscardResponse, ParkedListRequest,
-    ParkedListResponse, ParkedRetryRequest, ParkedRetryResponse, PathContext,
-    PutPathContextRequest, QueryRequest, QueryResponse, QueryResult, QueryType, RefreshRequest,
-    RefreshResponse, RemoveIndexedDirectoryRequest, RemoveIndexedDirectoryResponse,
-    SetZoneIndexingModeRequest, SetZoneIndexingModeResponse, StatsRequest, StatsResponse,
+    NotifyFileChangeResponse, PathContext, PutPathContextRequest, QueryRequest, QueryResponse,
+    QueryResult, QueryType, RefreshRequest, RefreshResponse, RemoveIndexedDirectoryRequest,
+    RemoveIndexedDirectoryResponse, SetZoneIndexingModeRequest, SetZoneIndexingModeResponse,
+    StatsRequest, StatsResponse,
 };
 
 /// Server-side default when the caller sends `max_results = 0`.
@@ -4548,7 +4547,6 @@ impl SearchService for SearchServiceImpl {
             Ok((outcome, seq)) => Ok(Response::new(IndexDocumentsResponse {
                 indexed_count: outcome.indexed,
                 skipped_count: outcome.skipped,
-                parked_paths: Vec::new(), // parked queue lands in step 4
                 error: None,
                 index_seq: seq,
                 skipped_paths: outcome.skipped_paths,
@@ -4556,7 +4554,6 @@ impl SearchService for SearchServiceImpl {
             Err(err) => Ok(Response::new(IndexDocumentsResponse {
                 indexed_count: 0,
                 skipped_count: 0,
-                parked_paths: Vec::new(),
                 error: Some(err),
                 index_seq: 0,
                 skipped_paths: Vec::new(),
@@ -4676,131 +4673,6 @@ impl SearchService for SearchServiceImpl {
                     zone_id: zone_reply,
                 }))
             }
-        }
-    }
-
-    async fn parked_list(
-        &self,
-        request: Request<ParkedListRequest>,
-    ) -> Result<Response<ParkedListResponse>, Status> {
-        let req = request.into_inner();
-        let zone_id = checked_index_zone(&req.zone_id)?.to_string();
-        let manager = Arc::clone(&self.manager);
-        let zone_for_entries = zone_id.clone();
-        let outcome = tokio::task::spawn_blocking(move || {
-            crate::parked_state::ParkedQueue::load(manager.zone_root(&zone_id))
-                .map(|q| q.list())
-                .map_err(|e| format!("open parked queue: {e}"))
-        })
-        .await
-        .map_err(|e| Status::internal(format!("spawn_blocking joined error: {e}")))?;
-
-        match outcome {
-            Ok(entries) => Ok(Response::new(ParkedListResponse {
-                entries: entries
-                    .into_iter()
-                    .map(|e| crate::search_proto::ParkedEntry {
-                        path: e.path,
-                        zone_id: zone_for_entries.clone(),
-                        parked_at_ms: e.parked_at_ms,
-                        reason: e.reason,
-                    })
-                    .collect(),
-                error: None,
-            })),
-            Err(err) => Ok(Response::new(ParkedListResponse {
-                entries: Vec::new(),
-                error: Some(err),
-            })),
-        }
-    }
-
-    async fn parked_retry(
-        &self,
-        request: Request<ParkedRetryRequest>,
-    ) -> Result<Response<ParkedRetryResponse>, Status> {
-        let req = request.into_inner();
-        let zone_id = checked_index_zone(&req.zone_id)?.to_string();
-        let paths = req.paths;
-        let manager = Arc::clone(&self.manager);
-        let outcome = tokio::task::spawn_blocking(move || -> Result<(u32, u32), String> {
-            let q = crate::parked_state::ParkedQueue::load(manager.zone_root(&zone_id))
-                .map_err(|e| format!("open parked queue: {e}"))?;
-            // Empty paths ⇒ retry every parked doc (matches
-            // Python).  "Retry" here just drops entries from the
-            // queue — real retry means the caller follows with
-            // IndexDocuments carrying the fresh text.  Same shape
-            // Python has: /parked/retry acks the caller; the retry
-            // actually happens on the next IndexDocuments call.
-            let targets: Vec<String> = if paths.is_empty() {
-                q.list().into_iter().map(|e| e.path).collect()
-            } else {
-                paths
-            };
-            let mut retried: u32 = 0;
-            for p in &targets {
-                if q.remove(p) {
-                    retried += 1;
-                }
-            }
-            q.save().map_err(|e| format!("save parked queue: {e}"))?;
-            let still = q.len() as u32;
-            Ok((retried, still))
-        })
-        .await
-        .map_err(|e| Status::internal(format!("spawn_blocking joined error: {e}")))?;
-
-        match outcome {
-            Ok((retried, still)) => Ok(Response::new(ParkedRetryResponse {
-                retried_count: retried,
-                still_parked_count: still,
-                error: None,
-            })),
-            Err(err) => Ok(Response::new(ParkedRetryResponse {
-                retried_count: 0,
-                still_parked_count: 0,
-                error: Some(err),
-            })),
-        }
-    }
-
-    async fn parked_discard(
-        &self,
-        request: Request<ParkedDiscardRequest>,
-    ) -> Result<Response<ParkedDiscardResponse>, Status> {
-        let req = request.into_inner();
-        let zone_id = checked_index_zone(&req.zone_id)?.to_string();
-        let paths = req.paths;
-        let manager = Arc::clone(&self.manager);
-        let outcome = tokio::task::spawn_blocking(move || -> Result<u32, String> {
-            let q = crate::parked_state::ParkedQueue::load(manager.zone_root(&zone_id))
-                .map_err(|e| format!("open parked queue: {e}"))?;
-            let targets: Vec<String> = if paths.is_empty() {
-                q.list().into_iter().map(|e| e.path).collect()
-            } else {
-                paths
-            };
-            let mut discarded: u32 = 0;
-            for p in &targets {
-                if q.remove(p) {
-                    discarded += 1;
-                }
-            }
-            q.save().map_err(|e| format!("save parked queue: {e}"))?;
-            Ok(discarded)
-        })
-        .await
-        .map_err(|e| Status::internal(format!("spawn_blocking joined error: {e}")))?;
-
-        match outcome {
-            Ok(count) => Ok(Response::new(ParkedDiscardResponse {
-                discarded_count: count,
-                error: None,
-            })),
-            Err(err) => Ok(Response::new(ParkedDiscardResponse {
-                discarded_count: 0,
-                error: Some(err),
-            })),
         }
     }
 
@@ -5024,10 +4896,7 @@ impl SearchService for SearchServiceImpl {
             } else {
                 0
             };
-            let parked = crate::parked_state::ParkedQueue::load(manager.zone_root(&zone_id))
-                .map_err(|e| format!("read parked statistics: {e}"))?;
-            let parked_count = u32::try_from(parked.len()).unwrap_or(u32::MAX);
-            Ok((fts_doc_count, fts_path_count, ann_chunk_count, parked_count))
+            Ok((fts_doc_count, fts_path_count, ann_chunk_count))
         })
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking joined error: {e}")))?;
@@ -5042,11 +4911,10 @@ impl SearchService for SearchServiceImpl {
             ..Default::default()
         };
         match outcome {
-            Ok((fts_doc_count, fts_path_count, ann_chunk_count, parked_count)) => {
+            Ok((fts_doc_count, fts_path_count, ann_chunk_count)) => {
                 response.fts_doc_count = fts_doc_count;
                 response.fts_path_count = fts_path_count;
                 response.ann_chunk_count = ann_chunk_count;
-                response.parked_count = parked_count;
             }
             Err(err) => response.error = Some(err),
         }

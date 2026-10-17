@@ -271,9 +271,6 @@ async fn credentials_and_live_permissions_survive_signed_plugin_and_cached_searc
     denied!(refresh, RefreshRequest);
     denied!(index_documents, IndexDocumentsRequest);
     denied!(notify_file_change, NotifyFileChangeRequest);
-    denied!(parked_list, ParkedListRequest);
-    denied!(parked_retry, ParkedRetryRequest);
-    denied!(parked_discard, ParkedDiscardRequest);
     denied!(add_indexed_directory, AddIndexedDirectoryRequest);
     denied!(remove_indexed_directory, RemoveIndexedDirectoryRequest);
     denied!(list_indexed_directories, ListIndexedDirectoriesRequest);

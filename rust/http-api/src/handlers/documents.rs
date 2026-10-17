@@ -328,16 +328,11 @@ pub struct BatchBody {
     pub zone_id: String,
 }
 
-/// Response body of [`batch`].  `parked_paths` surfaces docs that
-/// hit a transient failure and got parked for retry (see the
-/// `ParkedList` RPC surface, exposed elsewhere) — kept optional-
-/// but-always-present because an empty vec is the wire's "no
-/// parking" signal.
+/// Batch counts, per-path skips and the visibility sequence.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BatchResponseBody {
     pub indexed_count: u32,
     pub skipped_count: u32,
-    pub parked_paths: Vec<String>,
     /// #4736: plugin-wide sequence stamped after this batch's commit —
     /// `stats.last_index_seq >= index_seq` means the batch is served.
     pub index_seq: u64,
@@ -394,23 +389,14 @@ pub async fn batch(
         .map_err(SearchError::Rpc)?
         .into_inner();
     require_success(&resp.error)?;
-    let status = if resp.parked_paths.is_empty() {
-        StatusCode::OK
-    } else {
-        StatusCode::CONFLICT
-    };
-    Ok((
-        status,
-        Json(BatchResponseBody {
-            indexed_count: resp.indexed_count,
-            skipped_count: resp.skipped_count,
-            parked_paths: resp.parked_paths,
-            index_seq: resp.index_seq,
-            skipped_paths: resp.skipped_paths,
-            error: resp.error,
-        }),
-    )
-        .into_response())
+    Ok(Json(BatchResponseBody {
+        indexed_count: resp.indexed_count,
+        skipped_count: resp.skipped_count,
+        index_seq: resp.index_seq,
+        skipped_paths: resp.skipped_paths,
+        error: resp.error,
+    })
+    .into_response())
 }
 
 // ── /v2/documents/stats ──────────────────────────────────────────
@@ -437,7 +423,6 @@ pub struct StatsResponseBody {
     pub fts_doc_count: u32,
     pub fts_path_count: u32,
     pub ann_chunk_count: u32,
-    pub parked_count: u32,
     /// Constant `"rust-plugin"` post-P12 — distinguishes this
     /// generation from the deleted Python daemon's BM25S / pgvector
     /// stacks.  Pollers gating on backend identity keep their
@@ -481,7 +466,6 @@ pub async fn stats(
         fts_doc_count: resp.fts_doc_count,
         fts_path_count: resp.fts_path_count,
         ann_chunk_count: resp.ann_chunk_count,
-        parked_count: resp.parked_count,
         backend: resp.backend,
         embedding_model: resp.embedding_model,
         indexing_in_progress: resp.indexing_in_progress,

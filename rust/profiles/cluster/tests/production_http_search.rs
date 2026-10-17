@@ -1010,6 +1010,34 @@ async fn production_grants_filter_http_search_and_survive_restart() {
     assert_eq!(revoked["results"].as_array().unwrap().len(), 1, "{revoked}");
     assert_eq!(revoked["results"][0]["path"], "/legal/contract.md");
 
+    let receipt_path = "/docs/batch-receipt.md";
+    vfs.write_file(receipt_path, b"cobaltvisiblebatch", "")
+        .await
+        .unwrap();
+    let mixed_batch = json_ok(
+        client
+            .post(format!("{base}/v2/documents/batch"))
+            .bearer_auth(admin)
+            .json(&json!({"zone_id":"sharedzone", "documents":[
+                {"path":receipt_path, "text":"cobaltvisiblebatch"},
+                {"path":"/docs/empty.md", "text":""},
+                {"path":"/docs/blank.md", "text":" \n\t"},
+            ]})),
+    )
+    .await;
+    assert_eq!(mixed_batch["indexed_count"], 1, "{mixed_batch}");
+    assert_eq!(mixed_batch["skipped_count"], 2, "{mixed_batch}");
+    let mut skipped: Vec<_> = mixed_batch["skipped_paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|path| path.as_str().unwrap())
+        .collect();
+    skipped.sort();
+    assert_eq!(skipped, ["/docs/blank.md", "/docs/empty.md"]);
+    let batch_seq = mixed_batch["index_seq"].as_u64().unwrap();
+    assert!(batch_seq > 0, "{mixed_batch}");
+
     drop(vfs);
     drop(client);
     drop(daemon);
@@ -1087,6 +1115,19 @@ async fn production_grants_filter_http_search_and_survive_restart() {
         ["/docs/public.md"]
     );
 
+    let batch_hits = json_ok(
+        client
+            .post(format!("{base}/v2/search/query"))
+            .bearer_auth(admin)
+            .json(
+                &json!({"q":"cobaltvisiblebatch", "zone_id":"sharedzone", "query_type":"keyword"}),
+            ),
+    )
+    .await;
+    assert!(batch_hits["error"].is_null(), "{batch_hits}");
+    assert_eq!(batch_hits["results"].as_array().unwrap().len(), 1);
+    assert_eq!(batch_hits["results"][0]["path"], receipt_path);
+
     let indices =
         nexus_search_plugin::index_manager::IndexManager::with_root(data.join("plugins/search"));
     let corrupt_metadata = indices.index_dir("stats-corrupt").join("meta.json");
@@ -1111,6 +1152,21 @@ async fn production_grants_filter_http_search_and_survive_restart() {
         std::fs::read(&corrupt_metadata).unwrap(),
         b"broken metadata"
     );
+    let failed_batch = client
+        .post(format!("{base}/v2/documents/batch"))
+        .bearer_auth(admin)
+        .json(&json!({"zone_id":"stats-corrupt", "documents":[
+            {"path":"/failed.md", "text":"neveracknowledged"},
+        ]}))
+        .send()
+        .await
+        .unwrap();
+    assert!(failed_batch.status().is_server_error(), "{failed_batch:?}");
+    assert!(!failed_batch.text().await.unwrap().is_empty());
+    assert_eq!(
+        std::fs::read(&corrupt_metadata).unwrap(),
+        b"broken metadata"
+    );
     let healthy_stats = json_ok(
         client
             .get(format!("{base}/v2/documents/stats"))
@@ -1119,6 +1175,7 @@ async fn production_grants_filter_http_search_and_survive_restart() {
     )
     .await;
     assert!(healthy_stats["error"].is_null(), "{healthy_stats}");
+    assert!(healthy_stats["last_index_seq"].as_u64().unwrap() >= batch_seq);
     assert!(
         healthy_stats["fts_path_count"].as_u64().unwrap() > 0,
         "{healthy_stats}"
