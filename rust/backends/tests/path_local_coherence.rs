@@ -227,7 +227,7 @@ fn local_connector_uses_the_same_reference_revalidation() {
 #[test]
 fn reference_revalidation_preserves_virtual_entries_and_implicit_directories() {
     let root = tempfile::tempdir().unwrap();
-    let (kernel, _) = setup(root.path());
+    let (kernel, context) = setup(root.path());
     for (path, kind, target) in [
         ("/virtual", DT_DIR, None),
         ("/virtual/metadata-only", DT_REG, None),
@@ -238,6 +238,7 @@ fn reference_revalidation_preserves_virtual_entries_and_implicit_directories() {
         kernel
             .sys_setattr(
                 path,
+                &context,
                 i32::from(kind),
                 "",
                 None,
