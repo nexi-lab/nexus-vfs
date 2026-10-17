@@ -210,33 +210,6 @@ async fn production_grants_filter_http_search_and_survive_restart() {
         .await;
         assert_eq!(result["indexed_count"], 1, "{result}");
     }
-    let receipt_path = "/docs/batch-receipt.md";
-    vfs.write_file(receipt_path, b"cobaltvisiblebatch", "")
-        .await
-        .unwrap();
-    let mixed_batch = json_ok(
-        client
-            .post(format!("{base}/v2/documents/batch"))
-            .bearer_auth(admin)
-            .json(&json!({"zone_id":"sharedzone", "documents":[
-                {"path":receipt_path, "text":"cobaltvisiblebatch"},
-                {"path":"/docs/empty.md", "text":""},
-                {"path":"/docs/blank.md", "text":" \n\t"},
-            ]})),
-    )
-    .await;
-    assert_eq!(mixed_batch["indexed_count"], 1, "{mixed_batch}");
-    assert_eq!(mixed_batch["skipped_count"], 2, "{mixed_batch}");
-    let mut skipped: Vec<_> = mixed_batch["skipped_paths"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|path| path.as_str().unwrap())
-        .collect();
-    skipped.sort();
-    assert_eq!(skipped, ["/docs/blank.md", "/docs/empty.md"]);
-    let batch_seq = mixed_batch["index_seq"].as_u64().unwrap();
-    assert!(batch_seq > 0, "{mixed_batch}");
     assert!(query(&client, &base, alice, "sharedzone").await.is_empty());
     for (zone, path, subject) in [
         ("sharedzone", "/docs", "alice"),
@@ -1036,6 +1009,34 @@ async fn production_grants_filter_http_search_and_survive_restart() {
     assert!(revoked["error"].is_null(), "{revoked}");
     assert_eq!(revoked["results"].as_array().unwrap().len(), 1, "{revoked}");
     assert_eq!(revoked["results"][0]["path"], "/legal/contract.md");
+
+    let receipt_path = "/docs/batch-receipt.md";
+    vfs.write_file(receipt_path, b"cobaltvisiblebatch", "")
+        .await
+        .unwrap();
+    let mixed_batch = json_ok(
+        client
+            .post(format!("{base}/v2/documents/batch"))
+            .bearer_auth(admin)
+            .json(&json!({"zone_id":"sharedzone", "documents":[
+                {"path":receipt_path, "text":"cobaltvisiblebatch"},
+                {"path":"/docs/empty.md", "text":""},
+                {"path":"/docs/blank.md", "text":" \n\t"},
+            ]})),
+    )
+    .await;
+    assert_eq!(mixed_batch["indexed_count"], 1, "{mixed_batch}");
+    assert_eq!(mixed_batch["skipped_count"], 2, "{mixed_batch}");
+    let mut skipped: Vec<_> = mixed_batch["skipped_paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|path| path.as_str().unwrap())
+        .collect();
+    skipped.sort();
+    assert_eq!(skipped, ["/docs/blank.md", "/docs/empty.md"]);
+    let batch_seq = mixed_batch["index_seq"].as_u64().unwrap();
+    assert!(batch_seq > 0, "{mixed_batch}");
 
     drop(vfs);
     drop(client);
