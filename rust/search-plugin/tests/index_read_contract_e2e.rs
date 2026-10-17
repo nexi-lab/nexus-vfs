@@ -117,6 +117,51 @@ async fn all_read_paths_leave_unknown_corpora_absent() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn statistics_report_corrupt_storage_instead_of_successful_zero_counts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (svc, manager) = service(tmp.path());
+    for (zone, file, stage) in [
+        (
+            "broken-fts",
+            manager.index_dir("broken-fts").join("meta.json"),
+            "FTS",
+        ),
+        (
+            "broken-ann",
+            manager.ann_dir("broken-ann", "mock").join("sidecar.json"),
+            "ANN",
+        ),
+        (
+            "broken-parked",
+            manager.zone_root("broken-parked").join("parked.json"),
+            "parked",
+        ),
+    ] {
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"broken metadata").unwrap();
+        let response = svc
+            .stats(Request::new(StatsRequest {
+                zone_id: zone.into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            response
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains(stage)),
+            "{stage} storage failure must remain an error: {response:?}"
+        );
+        assert_eq!(response.backend, "rust-plugin");
+        assert_eq!(response.embedding_model, "mock");
+        assert_eq!(std::fs::read(&file).unwrap(), b"broken metadata");
+    }
+    assert!(manager.fts_writer_report().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_indexed_rpc_rejects_unsafe_zone_before_creating_state() {
     let tmp = tempfile::tempdir().unwrap();
     let (svc, _) = service(tmp.path());

@@ -5000,66 +5000,57 @@ impl SearchService for SearchServiceImpl {
         // and the documents accepted but not yet returned.
         let seq_snapshot = self.index_seq.snapshot();
         let pending = self.pending_docs.load(std::sync::atomic::Ordering::SeqCst);
-        let outcome = tokio::task::spawn_blocking(move || -> Result<StatsResponse, String> {
-            // FTS side: alive chunks + distinct live paths in the zone
-            // (proto contract).  Zero counts on error — Stats is a
-            // poll surface, not a source of truth.
-            let (fts_doc_count, fts_path_count) = manager
+        let outcome = tokio::task::spawn_blocking(move || -> Result<_, String> {
+            let (fts_doc_count, fts_path_count) = match manager
                 .get_existing(&zone_id)
-                .ok()
-                .flatten()
-                .and_then(|fts| fts.counts().ok())
-                .map(|c| {
+                .map_err(|e| format!("open FTS statistics: {e}"))?
+            {
+                Some(fts) => {
+                    let counts = fts
+                        .counts()
+                        .map_err(|e| format!("read FTS statistics: {e}"))?;
                     (
-                        u32::try_from(c.chunks).unwrap_or(u32::MAX),
-                        u32::try_from(c.paths).unwrap_or(u32::MAX),
+                        u32::try_from(counts.chunks).unwrap_or(u32::MAX),
+                        u32::try_from(counts.paths).unwrap_or(u32::MAX),
                     )
-                })
-                .unwrap_or((0, 0));
+                }
+                None => (0, 0),
+            };
             let ann_chunk_count = if let Some((tag, dim)) = embedder_tag_dim {
                 manager
                     .get_existing_ann(&zone_id, &tag, dim)
-                    .map(|a| a.map_or(0, |a| a.live_count() as u32))
-                    .unwrap_or(0)
+                    .map_err(|e| format!("read ANN statistics: {e}"))?
+                    .map_or(0, |ann| u32::try_from(ann.live_count()).unwrap_or(u32::MAX))
             } else {
                 0
             };
-            let parked_count = crate::parked_state::ParkedQueue::load(manager.zone_root(&zone_id))
-                .map(|q| q.len() as u32)
-                .unwrap_or(0);
-            Ok(StatsResponse {
-                fts_doc_count,
-                fts_path_count,
-                ann_chunk_count,
-                parked_count,
-                error: None,
-                backend: SEARCH_BACKEND_NAME.to_string(),
-                embedding_model,
-                indexing_in_progress,
-                last_index_seq: seq_snapshot.seq,
-                pending,
-                last_successful_index_at_ms: seq_snapshot.at_ms,
-            })
+            let parked = crate::parked_state::ParkedQueue::load(manager.zone_root(&zone_id))
+                .map_err(|e| format!("read parked statistics: {e}"))?;
+            let parked_count = u32::try_from(parked.len()).unwrap_or(u32::MAX);
+            Ok((fts_doc_count, fts_path_count, ann_chunk_count, parked_count))
         })
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking joined error: {e}")))?;
 
+        let mut response = StatsResponse {
+            backend: SEARCH_BACKEND_NAME.to_string(),
+            embedding_model,
+            indexing_in_progress,
+            last_index_seq: seq_snapshot.seq,
+            pending,
+            last_successful_index_at_ms: seq_snapshot.at_ms,
+            ..Default::default()
+        };
         match outcome {
-            Ok(resp) => Ok(Response::new(resp)),
-            Err(err) => Ok(Response::new(StatsResponse {
-                fts_doc_count: 0,
-                fts_path_count: 0,
-                ann_chunk_count: 0,
-                parked_count: 0,
-                error: Some(err),
-                backend: SEARCH_BACKEND_NAME.to_string(),
-                embedding_model: String::new(),
-                indexing_in_progress: 0,
-                last_index_seq: 0,
-                pending: 0,
-                last_successful_index_at_ms: 0,
-            })),
+            Ok((fts_doc_count, fts_path_count, ann_chunk_count, parked_count)) => {
+                response.fts_doc_count = fts_doc_count;
+                response.fts_path_count = fts_path_count;
+                response.ann_chunk_count = ann_chunk_count;
+                response.parked_count = parked_count;
+            }
+            Err(err) => response.error = Some(err),
         }
+        Ok(Response::new(response))
     }
 }
 

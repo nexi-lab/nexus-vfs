@@ -1086,4 +1086,41 @@ async fn production_grants_filter_http_search_and_survive_restart() {
         query(&client, &base, alice, "sharedzone").await,
         ["/docs/public.md"]
     );
+
+    let indices =
+        nexus_search_plugin::index_manager::IndexManager::with_root(data.join("plugins/search"));
+    let corrupt_metadata = indices.index_dir("stats-corrupt").join("meta.json");
+    std::fs::create_dir_all(corrupt_metadata.parent().unwrap()).unwrap();
+    std::fs::write(&corrupt_metadata, b"broken metadata").unwrap();
+    let failed_stats = json_ok(
+        client
+            .get(format!("{base}/v2/documents/stats"))
+            .bearer_auth(admin)
+            .query(&[("zone_id", "stats-corrupt")]),
+    )
+    .await;
+    assert!(
+        failed_stats["error"].as_str().unwrap().contains("FTS"),
+        "{failed_stats}"
+    );
+    assert!(
+        failed_stats["last_index_seq"].as_u64().unwrap() > 0,
+        "{failed_stats}"
+    );
+    assert_eq!(
+        std::fs::read(&corrupt_metadata).unwrap(),
+        b"broken metadata"
+    );
+    let healthy_stats = json_ok(
+        client
+            .get(format!("{base}/v2/documents/stats"))
+            .bearer_auth(admin)
+            .query(&[("zone_id", "sharedzone")]),
+    )
+    .await;
+    assert!(healthy_stats["error"].is_null(), "{healthy_stats}");
+    assert!(
+        healthy_stats["fts_path_count"].as_u64().unwrap() > 0,
+        "{healthy_stats}"
+    );
 }
