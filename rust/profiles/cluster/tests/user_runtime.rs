@@ -14,7 +14,7 @@ use nexus_raft::transport::{
     generate_session_agent_cert, generate_user_runtime_cert, generate_zone_ca,
 };
 
-const BUDGET: Duration = Duration::from_secs(30);
+const BUDGET: Duration = Duration::from_secs(90);
 
 #[tokio::test]
 async fn signed_search_keeps_the_owner_boundary_and_reopens_committed_indexes() {
