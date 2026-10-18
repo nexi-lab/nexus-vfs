@@ -48,7 +48,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use kernel::core::agents::registry::{
-    AgentDescriptor, AgentKind, AgentRegistry, AgentState, RepoMount,
+    AgentDescriptor, AgentInstance, AgentKind, AgentRegistry, AgentState, RepoMount,
 };
 use kernel::kernel::syscall::KernelSyscall;
 use kernel::service_registry::{RustCallError, RustService};
@@ -413,6 +413,7 @@ pub(crate) trait PreparedRawSpawn: Send {
     fn attach(
         self: Box<Self>,
         desc: &AgentDescriptor,
+        instance: AgentInstance,
         endpoint: a2a::session::SessionEndpoint,
     ) -> Result<(), String>;
 }
@@ -611,11 +612,11 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
             ..Default::default()
         };
 
-        if !self.agent_registry.register(desc) {
-            return Err(ManagedAgentError::Internal(format!(
+        let instance = self.agent_registry.register_instance(desc).ok_or_else(|| {
+            ManagedAgentError::Internal(format!(
                 "AgentRegistry.register collided on freshly-allocated pid {pid}"
-            )));
-        }
+            ))
+        })?;
         // Move into WARMING_UP — the runtime crate is responsible for
         // the WARMING_UP → READY transition once it finishes
         // initialising the agent loop. The transition is best-effort:
@@ -624,7 +625,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
         // recoverable.
         let _ = self
             .agent_registry
-            .update_state(&pid, AgentState::WarmingUp);
+            .update_instance_state(&instance, AgentState::WarmingUp, None);
 
         // Stamp the per-pid procfs subtree: dirents for /proc/,
         // /proc/{pid}/, /proc/{pid}/workspace/, plus the workspace
@@ -653,9 +654,13 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
             }
             if let Some(child) = raw_session {
                 child
-                    .attach(&desc, session_endpoint.clone().expect("hosted endpoint"))
+                    .attach(
+                        &desc,
+                        instance.clone(),
+                        session_endpoint.clone().expect("hosted endpoint"),
+                    )
                     .map_err(|error| {
-                        let _ = self.agent_registry.kill(&pid, 127);
+                        let _ = self.agent_registry.kill_instance(&instance, 127);
                         ManagedAgentError::Internal(error)
                     })?;
             } else if let Some(provider) = self.spawn_provider.as_ref() {
@@ -672,6 +677,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                 // instead of taking down the worker thread.
                 let registry = Arc::clone(&self.agent_registry);
                 let pid_for_observer = pid.clone();
+                let observer_instance = instance.clone();
                 let kernel_for_observer = Arc::clone(&self.kernel);
                 let agent_name = desc.name.clone();
                 let observer: Arc<dyn Fn(AgentState, Option<String>) + Send + Sync> =
@@ -683,17 +689,22 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                             .get(&pid_for_observer)
                             .map(|d| d.state == AgentState::AwaitingInput)
                             .unwrap_or(false);
-                        if let Err(e) = registry.update_state_with_reason(
-                            &pid_for_observer,
+                        match registry.update_instance_state(
+                            &observer_instance,
                             state,
                             reason.clone(),
                         ) {
-                            tracing::warn!(
-                                pid = %pid_for_observer,
-                                state = ?state,
-                                error = %e,
-                                "AgentRegistry.update_state rejected runtime-side transition",
-                            );
+                            Ok(true) => {}
+                            Ok(false) => return,
+                            Err(e) => {
+                                tracing::warn!(
+                                    pid = %pid_for_observer,
+                                    state = ?state,
+                                    error = %e,
+                                    "AgentRegistry.update_state rejected runtime-side transition",
+                                );
+                                return;
+                            }
                         }
                         // Publish the AwaitingInput enter/exit edge to the
                         // agent's replicated state stream — best-effort, so a
@@ -742,7 +753,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                         observer,
                     )
                     .map_err(|e| {
-                        let _ = self.agent_registry.kill(&pid, 1);
+                        let _ = self.agent_registry.kill_instance(&instance, 1);
                         // `Internal`, not `InvalidArgument`: the request was fine and
                         // the caller cannot fix this by sending a different one — the
                         // HOST is missing something (model configuration, a usable
@@ -758,7 +769,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                     .is_some_and(|requested| handle.durable_session_id() != Some(requested))
                 {
                     handle.abort();
-                    let _ = self.agent_registry.kill(&pid, 1);
+                    let _ = self.agent_registry.kill_instance(&instance, 1);
                     return Err(ManagedAgentError::Internal(
                         "runtime did not restore the requested durable session".into(),
                     ));
@@ -766,7 +777,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                 durable_session_id = handle.durable_session_id().map(str::to_owned);
                 if handle.session_endpoint() != session_endpoint.as_ref() {
                     handle.abort();
-                    let _ = self.agent_registry.kill(&pid, 1);
+                    let _ = self.agent_registry.kill_instance(&instance, 1);
                     return Err(ManagedAgentError::Internal(
                         "runtime did not attach the session mailbox".into(),
                     ));
@@ -840,6 +851,16 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
             .agent_registry
             .get(session_id)
             .ok_or_else(|| ManagedAgentError::UnknownSession(session_id.to_string()))?;
+        Self::authorize_session_descriptor(&descriptor, ctx)
+    }
+
+    fn authorize_session_descriptor(
+        descriptor: &AgentDescriptor,
+        ctx: &contracts::OperationContext,
+    ) -> Result<(), ManagedAgentError> {
+        if ctx.is_admin || ctx.is_system || delegated_owner(ctx).is_none() {
+            return Ok(());
+        }
         if descriptor.owner_id != ctx.user_id {
             return Err(ManagedAgentError::InvalidArgument(
                 "session owner does not match the caller's credential".into(),
@@ -1208,7 +1229,11 @@ impl<K: KernelSyscall> RustService for ManagedAgentService<K> {
             "cancel_v2" => {
                 let req: CancelSessionRequest = serde_json::from_slice(payload)
                     .map_err(|e| RustCallError::InvalidArgument(e.to_string()))?;
-                self.authorize_session_control(&req.session_id, ctx)?;
+                let (instance, descriptor) = self
+                    .agent_registry
+                    .get_instance(&req.session_id)
+                    .ok_or_else(|| ManagedAgentError::UnknownSession(req.session_id.clone()))?;
+                Self::authorize_session_descriptor(&descriptor, ctx)?;
                 if req.channel_id.is_empty() {
                     return Err(RustCallError::InvalidArgument(
                         "session cancellation requires its channel generation".into(),
@@ -1221,7 +1246,14 @@ impl<K: KernelSyscall> RustService for ManagedAgentService<K> {
                     .session_endpoint
                     .is_some_and(|endpoint| endpoint.channel_id == req.channel_id)
                 {
-                    self.cancel(&req.session_id, CancelMode::Session)?
+                    // Bind the channel check and authorization to the captured
+                    // incarnation even if the raw OS PID is reused concurrently.
+                    let cancelled = self
+                        .agent_registry
+                        .kill_instance(&instance, 0)
+                        .map_err(|error| ManagedAgentError::Internal(error.to_string()))?
+                        .is_some();
+                    CancelResponse { cancelled }
                 } else {
                     CancelResponse { cancelled: false }
                 };
