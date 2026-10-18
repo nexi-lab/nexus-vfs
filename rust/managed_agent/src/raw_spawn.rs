@@ -11,7 +11,7 @@ use std::time::Duration;
 use a2a::session::{SessionEndpoint, SessionPayload, SessionSide, MAX_SESSION_FRAME_BYTES};
 use a2a::session_io::SessionMailbox;
 use dashmap::DashMap;
-use kernel::core::agents::registry::{AgentDescriptor, AgentRegistry, AgentState};
+use kernel::core::agents::registry::{AgentDescriptor, AgentInstance, AgentRegistry, AgentState};
 use kernel::kernel::{Kernel, OperationContext};
 use subprocess::HostedSubprocess;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -97,6 +97,7 @@ impl PreparedRawSpawn for PreparedSubprocess {
     fn attach(
         self: Box<Self>,
         desc: &AgentDescriptor,
+        instance: AgentInstance,
         endpoint: SessionEndpoint,
     ) -> Result<(), String> {
         let Self {
@@ -105,7 +106,7 @@ impl PreparedRawSpawn for PreparedSubprocess {
             runtime,
             ..
         } = *self;
-        spawner.attach(desc, endpoint, child, runtime)
+        spawner.attach(desc, instance, endpoint, child, runtime)
     }
 }
 
@@ -113,6 +114,7 @@ impl KernelRawSpawn {
     fn attach(
         &self,
         desc: &AgentDescriptor,
+        instance: AgentInstance,
         endpoint: SessionEndpoint,
         mut child: HostedSubprocess,
         runtime: tokio::runtime::Handle,
@@ -145,7 +147,7 @@ impl KernelRawSpawn {
         );
         let _ = self
             .agent_registry
-            .update_state(&desc.pid, AgentState::Ready);
+            .update_instance_state(&instance, AgentState::Ready, None);
 
         let input_mailbox = Arc::clone(&mailbox);
         let input_stopped = Arc::clone(&stopped);
@@ -210,7 +212,6 @@ impl KernelRawSpawn {
             }
         });
         let registry = Arc::clone(&self.agent_registry);
-        let pid = desc.pid.clone();
         runtime.spawn(async move {
             let (natural_exit, failure) = {
                 let wait = child.wait();
@@ -258,7 +259,7 @@ impl KernelRawSpawn {
                 mailbox.send(SessionPayload::Closed { reason })
             })
             .await;
-            let _ = registry.kill(&pid, exit.as_reap_code());
+            let _ = registry.kill_instance(&instance, exit.as_reap_code());
         });
         Ok(())
     }

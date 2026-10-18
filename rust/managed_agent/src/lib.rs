@@ -49,7 +49,7 @@ use serde::{Deserialize, Serialize};
 
 use contracts::{resolve_agent_owner, resolve_agent_zone, AgentContextError, OperationContext};
 use kernel::core::agents::registry::{
-    AgentDescriptor, AgentKind, AgentRegistry, AgentState, RepoMount,
+    AgentDescriptor, AgentInstance, AgentKind, AgentRegistry, AgentState, RepoMount,
 };
 use kernel::kernel::syscall::KernelSyscall;
 use kernel::service_registry::{RustCallError, RustService};
@@ -414,6 +414,7 @@ pub(crate) trait PreparedRawSpawn: Send {
     fn attach(
         self: Box<Self>,
         desc: &AgentDescriptor,
+        instance: AgentInstance,
         endpoint: a2a::session::SessionEndpoint,
     ) -> Result<(), String>;
 }
@@ -612,11 +613,11 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
             ..Default::default()
         };
 
-        if !self.agent_registry.register(desc) {
-            return Err(ManagedAgentError::Internal(format!(
+        let instance = self.agent_registry.register_instance(desc).ok_or_else(|| {
+            ManagedAgentError::Internal(format!(
                 "AgentRegistry.register collided on freshly-allocated pid {pid}"
-            )));
-        }
+            ))
+        })?;
         // Move into WARMING_UP — the runtime crate is responsible for
         // the WARMING_UP → READY transition once it finishes
         // initialising the agent loop. The transition is best-effort:
@@ -625,7 +626,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
         // recoverable.
         let _ = self
             .agent_registry
-            .update_state(&pid, AgentState::WarmingUp);
+            .update_instance_state(&instance, AgentState::WarmingUp, None);
 
         // Stamp the per-pid procfs subtree: dirents for /proc/,
         // /proc/{pid}/, /proc/{pid}/workspace/, plus the workspace
@@ -658,9 +659,13 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
             }
             if let Some(child) = raw_session {
                 child
-                    .attach(&desc, session_endpoint.clone().expect("hosted endpoint"))
+                    .attach(
+                        &desc,
+                        instance.clone(),
+                        session_endpoint.clone().expect("hosted endpoint"),
+                    )
                     .map_err(|error| {
-                        let _ = self.agent_registry.kill(&pid, 127);
+                        let _ = self.agent_registry.kill_instance(&instance, 127);
                         ManagedAgentError::Internal(error)
                     })?;
             } else if let Some(provider) = self.spawn_provider.as_ref() {
@@ -677,6 +682,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                 // instead of taking down the worker thread.
                 let registry = Arc::clone(&self.agent_registry);
                 let pid_for_observer = pid.clone();
+                let observer_instance = instance.clone();
                 let kernel_for_observer = Arc::clone(&self.kernel);
                 let agent_name = desc.name.clone();
                 let observer: Arc<dyn Fn(AgentState, Option<String>) + Send + Sync> =
@@ -688,17 +694,22 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                             .get(&pid_for_observer)
                             .map(|d| d.state == AgentState::AwaitingInput)
                             .unwrap_or(false);
-                        if let Err(e) = registry.update_state_with_reason(
-                            &pid_for_observer,
+                        match registry.update_instance_state(
+                            &observer_instance,
                             state,
                             reason.clone(),
                         ) {
-                            tracing::warn!(
-                                pid = %pid_for_observer,
-                                state = ?state,
-                                error = %e,
-                                "AgentRegistry.update_state rejected runtime-side transition",
-                            );
+                            Ok(true) => {}
+                            Ok(false) => return,
+                            Err(e) => {
+                                tracing::warn!(
+                                    pid = %pid_for_observer,
+                                    state = ?state,
+                                    error = %e,
+                                    "AgentRegistry.update_state rejected runtime-side transition",
+                                );
+                                return;
+                            }
                         }
                         // Publish the AwaitingInput enter/exit edge to the
                         // agent's replicated state stream — best-effort, so a
@@ -747,7 +758,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                         observer,
                     )
                     .map_err(|e| {
-                        let _ = self.agent_registry.kill(&pid, 1);
+                        let _ = self.agent_registry.kill_instance(&instance, 1);
                         // `Internal`, not `InvalidArgument`: the request was fine and
                         // the caller cannot fix this by sending a different one — the
                         // HOST is missing something (model configuration, a usable
@@ -763,7 +774,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                     .is_some_and(|requested| handle.durable_session_id() != Some(requested))
                 {
                     handle.abort();
-                    let _ = self.agent_registry.kill(&pid, 1);
+                    let _ = self.agent_registry.kill_instance(&instance, 1);
                     return Err(ManagedAgentError::Internal(
                         "runtime did not restore the requested durable session".into(),
                     ));
@@ -771,7 +782,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                 durable_session_id = handle.durable_session_id().map(str::to_owned);
                 if handle.session_endpoint() != session_endpoint.as_ref() {
                     handle.abort();
-                    let _ = self.agent_registry.kill(&pid, 1);
+                    let _ = self.agent_registry.kill_instance(&instance, 1);
                     return Err(ManagedAgentError::Internal(
                         "runtime did not attach the session mailbox".into(),
                     ));
@@ -805,46 +816,54 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
         session_id: &str,
         mode: CancelMode,
     ) -> Result<CancelResponse, ManagedAgentError> {
-        // session_id IS the pid in AgentRegistry (no second identifier).
-        if self.agent_registry.get(session_id).is_none() {
-            return Err(ManagedAgentError::UnknownSession(session_id.to_string()));
-        }
+        let (instance, _) = self
+            .agent_registry
+            .get_instance(session_id)
+            .ok_or_else(|| ManagedAgentError::UnknownSession(session_id.to_string()))?;
+        self.cancel_instance(&instance, mode)
+    }
 
+    fn cancel_instance(
+        &self,
+        instance: &AgentInstance,
+        mode: CancelMode,
+    ) -> Result<CancelResponse, ManagedAgentError> {
         match mode {
             CancelMode::Turn => Err(ManagedAgentError::InvalidArgument(
                 "turn cancellation uses session/cancel on the session mailbox".into(),
             )),
             CancelMode::Session => {
-                // `kill` transitions to Terminated (firing the
-                // on_terminate observer that drops the procfs dirent)
-                // and auto-reaps the descriptor when the agent is an
-                // orphan — which managed agents always are today
-                // (start_session passes parent_pid=None).  Reaping is
-                // what surfaces `UnknownSession` on a follow-up
-                // cancel / get_session.
                 let cancelled = self
                     .agent_registry
-                    .kill(session_id, 0)
-                    .map(|_| true)
-                    .unwrap_or(false);
+                    .kill_instance(instance, 0)
+                    .map_err(|error| ManagedAgentError::Internal(error.to_string()))?
+                    .is_some();
                 Ok(CancelResponse { cancelled })
             }
         }
     }
 
-    /// Apply the same delegated-owner boundary used when starting a session.
+    /// Capture the same registry incarnation for authorization and control.
     fn authorize_session_control(
         &self,
         session_id: &str,
+        ctx: &contracts::OperationContext,
+    ) -> Result<(AgentInstance, AgentDescriptor), ManagedAgentError> {
+        let (instance, descriptor) = self
+            .agent_registry
+            .get_instance(session_id)
+            .ok_or_else(|| ManagedAgentError::UnknownSession(session_id.to_string()))?;
+        Self::authorize_session_descriptor(&descriptor, ctx)?;
+        Ok((instance, descriptor))
+    }
+
+    fn authorize_session_descriptor(
+        descriptor: &AgentDescriptor,
         ctx: &contracts::OperationContext,
     ) -> Result<(), ManagedAgentError> {
         if ctx.is_admin || ctx.is_system || delegated_owner(ctx).is_none() {
             return Ok(());
         }
-        let descriptor = self
-            .agent_registry
-            .get(session_id)
-            .ok_or_else(|| ManagedAgentError::UnknownSession(session_id.to_string()))?;
         if descriptor.owner_id != ctx.user_id {
             return Err(ManagedAgentError::InvalidArgument(
                 "session owner does not match the caller's credential".into(),
@@ -858,13 +877,9 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
     /// weakest — every caller must prove ownership (or admin/system),
     /// regardless of credential class.
     fn authorize_session_owner(
-        &self,
         ctx: &contracts::OperationContext,
-        session_id: &str,
+        desc: &AgentDescriptor,
     ) -> Result<(), RustCallError> {
-        let desc = self.agent_registry.get(session_id).ok_or_else(|| {
-            RustCallError::InvalidArgument(format!("unknown session_id {session_id:?}"))
-        })?;
         // Authorization is by IDENTITY, not by credential type: an agent
         // credential is a low-privilege subject by design (the auth layer
         // grants it no zone tenancy), so it passes exactly the same
@@ -887,23 +902,38 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
         &self,
         session_id: &str,
     ) -> Result<GetSessionResponse, ManagedAgentError> {
-        // session_id IS the pid; the descriptor is the SSOT.
-        let desc = self
+        let (instance, desc) = self
             .agent_registry
-            .get(session_id)
+            .get_instance(session_id)
             .ok_or_else(|| ManagedAgentError::UnknownSession(session_id.to_string()))?;
+        self.session_snapshot(&instance, desc)
+    }
+
+    fn session_snapshot(
+        &self,
+        instance: &AgentInstance,
+        desc: AgentDescriptor,
+    ) -> Result<GetSessionResponse, ManagedAgentError> {
+        let (session_endpoint, durable_session_id) = self
+            .spawn_handles
+            .get(&desc.pid)
+            .map(|handle| {
+                (
+                    handle.session_endpoint().cloned(),
+                    handle.durable_session_id().map(str::to_owned),
+                )
+            })
+            .unwrap_or_default();
+        // Never combine an authorized PCB with another incarnation's handle.
+        if !self.agent_registry.is_current_instance(instance) {
+            return Err(ManagedAgentError::UnknownSession(desc.pid));
+        }
         let workspace_path = format!("/proc/{}/workspace/", desc.pid);
         let model = desc.labels.get(MODEL_LABEL).cloned().unwrap_or_default();
         Ok(GetSessionResponse {
             session_id: desc.pid.clone(),
-            session_endpoint: self
-                .spawn_handles
-                .get(session_id)
-                .and_then(|handle| handle.session_endpoint().cloned()),
-            durable_session_id: self
-                .spawn_handles
-                .get(session_id)
-                .and_then(|handle| handle.durable_session_id().map(str::to_owned)),
+            session_endpoint,
+            durable_session_id,
             agent_id: desc.name.clone(),
             owner_id: desc.owner_id.clone(),
             workspace_path,
@@ -1338,29 +1368,31 @@ impl<K: KernelSyscall> RustService for ManagedAgentService<K> {
             "cancel_v1" => {
                 let req: CancelRequest = serde_json::from_slice(payload)
                     .map_err(|e| RustCallError::InvalidArgument(e.to_string()))?;
-                self.authorize_session_control(&req.session_id, ctx)?;
-                self.authorize_session_owner(ctx, &req.session_id)?;
-                let resp = self.cancel(&req.session_id, req.mode)?;
-                serde_json::to_vec(&resp)
-                    .map_err(|error| RustCallError::Internal(error.to_string()))
+                let (instance, descriptor) =
+                    self.authorize_session_control(&req.session_id, ctx)?;
+                Self::authorize_session_owner(ctx, &descriptor)?;
+                let resp = self.cancel_instance(&instance, req.mode)?;
+                serde_json::to_vec(&resp).map_err(|e| RustCallError::Internal(e.to_string()))
             }
             "cancel_v2" => {
                 let req: CancelSessionRequest = serde_json::from_slice(payload)
                     .map_err(|e| RustCallError::InvalidArgument(e.to_string()))?;
-                self.authorize_session_control(&req.session_id, ctx)?;
+                let (instance, _) = self.authorize_session_control(&req.session_id, ctx)?;
                 if req.channel_id.is_empty() {
                     return Err(RustCallError::InvalidArgument(
                         "session cancellation requires its channel generation".into(),
                     ));
                 }
-                let snapshot = self.get_session(&req.session_id)?;
-                // A PID can be reused after a daemon restart. The existing
-                // channel generation identifies this live attachment.
-                let resp = if snapshot
-                    .session_endpoint
-                    .is_some_and(|endpoint| endpoint.channel_id == req.channel_id)
-                {
-                    self.cancel(&req.session_id, CancelMode::Session)?
+                let is_current_channel =
+                    self.spawn_handles
+                        .get(&req.session_id)
+                        .is_some_and(|handle| {
+                            handle
+                                .session_endpoint()
+                                .is_some_and(|endpoint| endpoint.channel_id == req.channel_id)
+                        });
+                let resp = if is_current_channel {
+                    self.cancel_instance(&instance, CancelMode::Session)?
                 } else {
                     CancelResponse { cancelled: false }
                 };
@@ -1369,11 +1401,11 @@ impl<K: KernelSyscall> RustService for ManagedAgentService<K> {
             "get_session_v1" => {
                 let req: GetSessionRequest = serde_json::from_slice(payload)
                     .map_err(|e| RustCallError::InvalidArgument(e.to_string()))?;
-                self.authorize_session_control(&req.session_id, ctx)?;
-                self.authorize_session_owner(ctx, &req.session_id)?;
-                let resp = self.get_session(&req.session_id)?;
-                serde_json::to_vec(&resp)
-                    .map_err(|error| RustCallError::Internal(error.to_string()))
+                let (instance, descriptor) =
+                    self.authorize_session_control(&req.session_id, ctx)?;
+                Self::authorize_session_owner(ctx, &descriptor)?;
+                let resp = self.session_snapshot(&instance, descriptor)?;
+                serde_json::to_vec(&resp).map_err(|e| RustCallError::Internal(e.to_string()))
             }
             _ => Err(RustCallError::NotFound),
         }
