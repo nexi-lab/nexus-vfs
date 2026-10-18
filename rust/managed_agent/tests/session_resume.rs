@@ -54,16 +54,130 @@ impl SpawnTask<Kernel> for LegacyProvider {
 }
 fn call(kernel: &Kernel, method: &str, payload: Value) -> Result<Value, String> {
     let context = OperationContext::new("operator", "root", true, Some("operator"), true);
+    call_as(kernel, &context, method, payload)
+}
+
+fn call_as(
+    kernel: &Kernel,
+    context: &OperationContext,
+    method: &str,
+    payload: Value,
+) -> Result<Value, String> {
     let bytes = kernel
         .dispatch_rust_call(
             "managed_agent",
             method,
             payload.to_string().as_bytes(),
-            &context,
+            context,
         )
         .expect("installed service")
         .map_err(|e| format!("{e:?}"))?;
     Ok(serde_json::from_slice(&bytes).unwrap())
+}
+
+#[test]
+fn runtime_listing_preserves_multiple_instances_and_owner_control_boundaries() {
+    let kernel = Arc::new(Kernel::new());
+    install_managed_agent_with_spawn(&kernel, Arc::new(Provider)).unwrap();
+    let first = call(
+        &kernel,
+        "start_session_v1",
+        json!({"agent_id":"peer", "owner_id":"alice"}),
+    )
+    .unwrap();
+    let second = call(
+        &kernel,
+        "start_session_v1",
+        json!({"agent_id":"peer", "owner_id":"alice",
+        "resume_session_id":first["durable_session_id"]}),
+    )
+    .unwrap();
+    let bob = call(
+        &kernel,
+        "start_session_v1",
+        json!({"agent_id":"private-bob", "owner_id":"bob"}),
+    )
+    .unwrap();
+    let alice = OperationContext::new("alice", "root", false, Some("actor-alice"), false);
+    let bob_context = OperationContext::new("bob", "root", false, Some("actor-bob"), false);
+    let stranger = OperationContext::new("charlie", "root", false, Some("actor-charlie"), false);
+    let listed = call_as(&kernel, &alice, "list_sessions_v1", json!({})).unwrap();
+    let sessions = listed["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 2);
+    let pids: std::collections::BTreeSet<_> = sessions
+        .iter()
+        .map(|session| {
+            assert_eq!(session["owner_id"], "alice");
+            assert_eq!(session["agent_id"], "peer");
+            assert_eq!(session["durable_session_id"], first["durable_session_id"]);
+            assert!(!session["session_endpoint"]["channel_id"]
+                .as_str()
+                .unwrap()
+                .is_empty());
+            session["session_id"].as_str().unwrap()
+        })
+        .collect();
+    assert_eq!(
+        pids,
+        std::collections::BTreeSet::from([
+            first["session_id"].as_str().unwrap(),
+            second["session_id"].as_str().unwrap()
+        ])
+    );
+    assert_ne!(
+        first["session_endpoint"]["channel_id"],
+        second["session_endpoint"]["channel_id"]
+    );
+    assert_eq!(
+        call_as(
+            &kernel,
+            &alice,
+            "list_sessions_v1",
+            json!({"agent_id":"peer"})
+        )
+        .unwrap(),
+        listed
+    );
+    assert!(call_as(
+        &kernel,
+        &bob_context,
+        "list_sessions_v1",
+        json!({"agent_id":"peer"})
+    )
+    .unwrap()["sessions"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(
+        call_as(&kernel, &stranger, "list_sessions_v1", json!({})).unwrap()["sessions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        call(&kernel, "list_sessions_v1", json!({})).unwrap()["sessions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    for invalid in [json!({"owner_id":"bob"}), json!({"agent_id":""})] {
+        assert!(call_as(&kernel, &alice, "list_sessions_v1", invalid).is_err());
+    }
+    call_as(
+        &kernel,
+        &alice,
+        "cancel_v2",
+        json!({"session_id":first["session_id"],
+        "channel_id":first["session_endpoint"]["channel_id"]}),
+    )
+    .unwrap();
+    let remaining = call_as(&kernel, &alice, "list_sessions_v1", json!({})).unwrap();
+    let sessions = remaining["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0]["session_id"], second["session_id"]);
+    let bob_listed = call_as(&kernel, &bob_context, "list_sessions_v1", json!({})).unwrap();
+    assert_eq!(bob_listed["sessions"][0]["session_id"], bob["session_id"]);
 }
 #[test]
 fn durable_identity_survives_a_new_pid_without_changing_get_and_cancel() {

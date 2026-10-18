@@ -60,6 +60,7 @@ use kernel::service_registry::{RustCallError, RustService};
 pub(crate) mod raw_spawn;
 
 pub(crate) mod proc_entry;
+mod runtime_discovery;
 pub(crate) mod session;
 pub(crate) mod workspace_boundary_hook;
 
@@ -886,13 +887,17 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
         // ownership/admin check a bare principal does. A session cert still
         // reaches its own sessions because its `ctx.user_id` is the
         // CA-verified owner SAN the attribution rules stamped in.
-        if desc.owner_id != ctx.user_id && !ctx.is_admin && !ctx.is_system {
+        if Self::session_owner_scope(ctx).is_some_and(|owner| desc.owner_id != owner) {
             return Err(RustCallError::PermissionDenied(
                 "managed-agent session operation requires ownership or administrator privileges"
                     .to_string(),
             ));
         }
         Ok(())
+    }
+
+    fn session_owner_scope(ctx: &OperationContext) -> Option<&str> {
+        (!ctx.is_admin && !ctx.is_system).then_some(ctx.user_id.as_str())
     }
 
     /// Read-through liveness snapshot. Cheap by design; the live
@@ -1397,6 +1402,14 @@ impl<K: KernelSyscall> RustService for ManagedAgentService<K> {
                     CancelResponse { cancelled: false }
                 };
                 serde_json::to_vec(&resp).map_err(|e| RustCallError::Internal(e.to_string()))
+            }
+            "list_sessions_v1" => {
+                let request: runtime_discovery::ListSessionsRequest =
+                    serde_json::from_slice(payload)
+                        .map_err(|error| RustCallError::InvalidArgument(error.to_string()))?;
+                let response = self.list_sessions(ctx, request)?;
+                serde_json::to_vec(&response)
+                    .map_err(|error| RustCallError::Internal(error.to_string()))
             }
             "get_session_v1" => {
                 let req: GetSessionRequest = serde_json::from_slice(payload)
