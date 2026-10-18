@@ -1,0 +1,52 @@
+{
+  "cases": [
+    {
+      "path": "/",
+      "valid": true
+    },
+    {
+      "path": "/documents/report-2026.txt",
+      "valid": true
+    },
+    {
+      "path": "/A_z~!$&'()*+,;=:@-",
+      "valid": true
+    },
+    {
+      "path": "relative/path",
+      "valid": false
+    },
+    {
+      "path": "/trailing/",
+      "valid": false
+    },
+    {
+      "path": "/double//slash",
+      "valid": false
+    },
+    {
+      "path": "/./child",
+      "valid": false
+    },
+    {
+      "path": "/parent/../child",
+      "valid": false
+    },
+    {
+      "path": "/encoded%2Fslash",
+      "valid": false
+    },
+    {
+      "path": "/contains space",
+      "valid": false
+    },
+    {
+      "path": "/__sys__",
+      "valid": false
+    },
+    {
+      "path": "/__sys__/zones",
+      "valid": false
+    }
+  ]
+}

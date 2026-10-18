@@ -122,10 +122,13 @@ fn mount_model(kernel: &Arc<Kernel>, mount: &str, base_url: &str, blob_root: &st
             runtime: &runtime,
         })
         .expect("openai mount builds through the real provider");
+    // Test-harness mount: the kernel-level ctx the convenience builder
+    // requires. The gate under test observes the REQUEST ctx, not this one.
+    let mount_ctx = contracts::OperationContext::new("system", "root", true, None, true);
     kernel
         .mount(
             mount,
-            MountOptions::new(mount.trim_start_matches('/'))
+            MountOptions::new(&mount_ctx, mount.trim_start_matches('/'))
                 .with_backend(built.backend.expect("provider returns a backend")),
         )
         .expect("mount");
@@ -245,6 +248,7 @@ fn model_directory_alias(kernel: &Kernel) -> &'static str {
     KernelSyscall::sys_setattr(
         kernel,
         alias,
+        &ctx(),
         6,
         "",
         None,

@@ -1,0 +1,53 @@
+{
+  "cases": [
+    {
+      "id": "tenant-001",
+      "tenant_create": true,
+      "system": true,
+      "existing_ref": true,
+      "remote_learned": true
+    },
+    {
+      "id": "root",
+      "tenant_create": false,
+      "system": true,
+      "existing_ref": true,
+      "remote_learned": true
+    },
+    {
+      "id": "__control__",
+      "tenant_create": false,
+      "system": true,
+      "existing_ref": true,
+      "remote_learned": true
+    },
+    {
+      "id": "ab",
+      "tenant_create": false,
+      "system": false,
+      "existing_ref": false,
+      "remote_learned": false
+    },
+    {
+      "id": "Has-Upper",
+      "tenant_create": false,
+      "system": false,
+      "existing_ref": false,
+      "remote_learned": false
+    },
+    {
+      "id": "-leading",
+      "tenant_create": false,
+      "system": false,
+      "existing_ref": false,
+      "remote_learned": false
+    },
+    {
+      "id": "trailing-",
+      "tenant_create": false,
+      "system": false,
+      "existing_ref": false,
+      "remote_learned": false
+    }
+  ]
+}

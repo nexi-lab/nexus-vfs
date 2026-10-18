@@ -89,6 +89,7 @@ pub fn mount_mem_root(k: &Kernel) {
     let backend = Arc::new(MemBackend::default());
     k.sys_setattr(
         "/",
+        &admin_ctx(),
         2, // DT_MOUNT
         "mem",
         Some(backend as Arc<dyn ObjectStore>),

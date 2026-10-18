@@ -14,10 +14,13 @@ fn boot(metadata: &Path, files: &Path) -> Arc<Kernel> {
     kernel
         .set_metastore_path(metadata.to_str().unwrap())
         .unwrap();
+    // Harness boot mount uses the system/admin boot context every
+    // boot-tier mount uses.
+    let boot_ctx = OperationContext::new("system", "root", true, None, true);
     kernel
         .mount(
             "/",
-            MountOptions::new("local")
+            MountOptions::new(&boot_ctx, "local")
                 .with_backend(Arc::new(PathLocalBackend::new(files, false).unwrap())),
         )
         .unwrap();

@@ -870,6 +870,28 @@ fn create_founder_zone(
     bootstrap_new: bool,
     peers_empty: bool,
 ) -> Result<(), String> {
+    // D9 (R12): a recorded deprovision that outranks this replica's
+    // creation epoch outranks a `--cluster-init` declaration — re-founding
+    // a deleted zone from a stale topology file would resurrect it.
+    // Fail-open: skip THIS zone with an ERROR (the rest of boot proceeds).
+    // Escape hatch for an operator who really means it:
+    // NEXUS_FORCE_DELETED_ZONE_RECREATE=1 (set by the daemon's `--force`
+    // flag), which also bumps the local creation epoch so the re-found
+    // survives later sweeps.
+    if std::env::var_os("NEXUS_FORCE_DELETED_ZONE_RECREATE").is_some() {
+        tracing::warn!(
+            zone = %zone_id,
+            "force escape hatch active — re-founding a zone the registry records as deleted"
+        );
+        zm.bump_creation_epoch(zone_id);
+    } else if zm.deleted_newer_than_disk(zone_id) {
+        tracing::error!(
+            zone = %zone_id,
+            "refusing to re-found a deprovisioned zone (fail-open: skipping this zone; \
+             set NEXUS_FORCE_DELETED_ZONE_RECREATE=1 to override)"
+        );
+        return Ok(());
+    }
     tracing::info!(
         local_node_id = node_id,
         zone = %zone_id,
@@ -1357,6 +1379,22 @@ pub fn bootstrap_or_join_zone(
     max_attempts: Option<u32>,
     as_learner: bool,
 ) -> Result<(), String> {
+    // D9 (R12) fail-open: a zone whose recorded deletion outranks this
+    // replica's creation epoch is SKIPPED (resume, rejoin and found paths
+    // all refuse it) — an auto-rejoin against a stale identity entry must
+    // not resurrect the zone NOR abort the rest of boot. Escape hatch
+    // (founder re-founding): NEXUS_FORCE_DELETED_ZONE_RECREATE, which also
+    // bumps the local creation epoch so the re-found survives later sweeps.
+    if std::env::var_os("NEXUS_FORCE_DELETED_ZONE_RECREATE").is_some() {
+        zm.bump_creation_epoch(zone_id);
+    } else if zm.deleted_newer_than_disk(zone_id) {
+        tracing::error!(
+            zone = %zone_id,
+            "refusing to bootstrap/resume/join a deprovisioned zone (fail-open: skipping \
+             this zone; set NEXUS_FORCE_DELETED_ZONE_RECREATE=1 to override)"
+        );
+        return Ok(());
+    }
     // Root-SOLO invariant: every nexus daemon owns its own per-node `root`
     // zone (1-voter, local namespace).  Federation between independent
     // nodes happens through NAMED zones (e.g. `sharedzone`) joined via
@@ -2069,6 +2107,21 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
         new_zone_id: &str,
     ) -> CoordinatorResult<ShareInfo> {
         let zm = self.zm().ok_or("federation not active")?;
+        // D9 (R12), same judgment as create_founder_zone: a `get_or_create`
+        // over a deprovisioned id would write a FRESH creation epoch that
+        // outranks the recorded deletion — the zone resurrects and the
+        // purge/materialize gates never suppress it again. Escape hatch:
+        // NEXUS_FORCE_DELETED_ZONE_RECREATE (the daemon's --force), which
+        // bumps the local creation epoch.
+        if std::env::var_os("NEXUS_FORCE_DELETED_ZONE_RECREATE").is_some() {
+            zm.bump_creation_epoch(new_zone_id);
+        } else if zm.deleted_newer_than_disk(new_zone_id) {
+            return Err(format!(
+                "zone '{new_zone_id}' was deprovisioned (recorded deletion outranks this \
+                 replica); sharing into it is refused. Re-use of the id requires an \
+                 operator-supervised recovery (founder boot with --force)."
+            ));
+        }
         // Atomic create + copy + register: materialise the zone first
         // so it is visible to followers before content lands.
         zm.get_or_create_zone(new_zone_id)
