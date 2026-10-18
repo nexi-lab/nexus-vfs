@@ -816,47 +816,45 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
         session_id: &str,
         mode: CancelMode,
     ) -> Result<CancelResponse, ManagedAgentError> {
-        // session_id IS the pid in AgentRegistry (no second identifier).
-        if self.agent_registry.get(session_id).is_none() {
-            return Err(ManagedAgentError::UnknownSession(session_id.to_string()));
-        }
+        let (instance, _) = self
+            .agent_registry
+            .get_instance(session_id)
+            .ok_or_else(|| ManagedAgentError::UnknownSession(session_id.to_string()))?;
+        self.cancel_instance(&instance, mode)
+    }
 
+    fn cancel_instance(
+        &self,
+        instance: &AgentInstance,
+        mode: CancelMode,
+    ) -> Result<CancelResponse, ManagedAgentError> {
         match mode {
             CancelMode::Turn => Err(ManagedAgentError::InvalidArgument(
                 "turn cancellation uses session/cancel on the session mailbox".into(),
             )),
             CancelMode::Session => {
-                // `kill` transitions to Terminated (firing the
-                // on_terminate observer that drops the procfs dirent)
-                // and auto-reaps the descriptor when the agent is an
-                // orphan — which managed agents always are today
-                // (start_session passes parent_pid=None).  Reaping is
-                // what surfaces `UnknownSession` on a follow-up
-                // cancel / get_session.
                 let cancelled = self
                     .agent_registry
-                    .kill(session_id, 0)
-                    .map(|_| true)
-                    .unwrap_or(false);
+                    .kill_instance(instance, 0)
+                    .map_err(|error| ManagedAgentError::Internal(error.to_string()))?
+                    .is_some();
                 Ok(CancelResponse { cancelled })
             }
         }
     }
 
-    /// Apply the same delegated-owner boundary used when starting a session.
+    /// Capture the same registry incarnation for authorization and control.
     fn authorize_session_control(
         &self,
         session_id: &str,
         ctx: &contracts::OperationContext,
-    ) -> Result<(), ManagedAgentError> {
-        if ctx.is_admin || ctx.is_system || delegated_owner(ctx).is_none() {
-            return Ok(());
-        }
-        let descriptor = self
+    ) -> Result<(AgentInstance, AgentDescriptor), ManagedAgentError> {
+        let (instance, descriptor) = self
             .agent_registry
-            .get(session_id)
+            .get_instance(session_id)
             .ok_or_else(|| ManagedAgentError::UnknownSession(session_id.to_string()))?;
-        Self::authorize_session_descriptor(&descriptor, ctx)
+        Self::authorize_session_descriptor(&descriptor, ctx)?;
+        Ok((instance, descriptor))
     }
 
     fn authorize_session_descriptor(
@@ -879,13 +877,9 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
     /// weakest — every caller must prove ownership (or admin/system),
     /// regardless of credential class.
     fn authorize_session_owner(
-        &self,
         ctx: &contracts::OperationContext,
-        session_id: &str,
+        desc: &AgentDescriptor,
     ) -> Result<(), RustCallError> {
-        let desc = self.agent_registry.get(session_id).ok_or_else(|| {
-            RustCallError::InvalidArgument(format!("unknown session_id {session_id:?}"))
-        })?;
         // Authorization is by IDENTITY, not by credential type: an agent
         // credential is a low-privilege subject by design (the auth layer
         // grants it no zone tenancy), so it passes exactly the same
@@ -908,23 +902,38 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
         &self,
         session_id: &str,
     ) -> Result<GetSessionResponse, ManagedAgentError> {
-        // session_id IS the pid; the descriptor is the SSOT.
-        let desc = self
+        let (instance, desc) = self
             .agent_registry
-            .get(session_id)
+            .get_instance(session_id)
             .ok_or_else(|| ManagedAgentError::UnknownSession(session_id.to_string()))?;
+        self.session_snapshot(&instance, desc)
+    }
+
+    fn session_snapshot(
+        &self,
+        instance: &AgentInstance,
+        desc: AgentDescriptor,
+    ) -> Result<GetSessionResponse, ManagedAgentError> {
+        let (session_endpoint, durable_session_id) = self
+            .spawn_handles
+            .get(&desc.pid)
+            .map(|handle| {
+                (
+                    handle.session_endpoint().cloned(),
+                    handle.durable_session_id().map(str::to_owned),
+                )
+            })
+            .unwrap_or_default();
+        // Never combine an authorized PCB with another incarnation's handle.
+        if !self.agent_registry.is_current_instance(instance) {
+            return Err(ManagedAgentError::UnknownSession(desc.pid));
+        }
         let workspace_path = format!("/proc/{}/workspace/", desc.pid);
         let model = desc.labels.get(MODEL_LABEL).cloned().unwrap_or_default();
         Ok(GetSessionResponse {
             session_id: desc.pid.clone(),
-            session_endpoint: self
-                .spawn_handles
-                .get(session_id)
-                .and_then(|handle| handle.session_endpoint().cloned()),
-            durable_session_id: self
-                .spawn_handles
-                .get(session_id)
-                .and_then(|handle| handle.durable_session_id().map(str::to_owned)),
+            session_endpoint,
+            durable_session_id,
             agent_id: desc.name.clone(),
             owner_id: desc.owner_id.clone(),
             workspace_path,
@@ -1359,40 +1368,31 @@ impl<K: KernelSyscall> RustService for ManagedAgentService<K> {
             "cancel_v1" => {
                 let req: CancelRequest = serde_json::from_slice(payload)
                     .map_err(|e| RustCallError::InvalidArgument(e.to_string()))?;
-                self.authorize_session_control(&req.session_id, ctx)?;
-                self.authorize_session_owner(ctx, &req.session_id)?;
-                let resp = self.cancel(&req.session_id, req.mode)?;
-                serde_json::to_vec(&resp)
-                    .map_err(|error| RustCallError::Internal(error.to_string()))
+                let (instance, descriptor) =
+                    self.authorize_session_control(&req.session_id, ctx)?;
+                Self::authorize_session_owner(ctx, &descriptor)?;
+                let resp = self.cancel_instance(&instance, req.mode)?;
+                serde_json::to_vec(&resp).map_err(|e| RustCallError::Internal(e.to_string()))
             }
             "cancel_v2" => {
                 let req: CancelSessionRequest = serde_json::from_slice(payload)
                     .map_err(|e| RustCallError::InvalidArgument(e.to_string()))?;
-                let (instance, descriptor) = self
-                    .agent_registry
-                    .get_instance(&req.session_id)
-                    .ok_or_else(|| ManagedAgentError::UnknownSession(req.session_id.clone()))?;
-                Self::authorize_session_descriptor(&descriptor, ctx)?;
+                let (instance, _) = self.authorize_session_control(&req.session_id, ctx)?;
                 if req.channel_id.is_empty() {
                     return Err(RustCallError::InvalidArgument(
                         "session cancellation requires its channel generation".into(),
                     ));
                 }
-                let snapshot = self.get_session(&req.session_id)?;
-                // A PID can be reused after a daemon restart. The existing
-                // channel generation identifies this live attachment.
-                let resp = if snapshot
-                    .session_endpoint
-                    .is_some_and(|endpoint| endpoint.channel_id == req.channel_id)
-                {
-                    // Bind the channel check and authorization to the captured
-                    // incarnation even if the raw OS PID is reused concurrently.
-                    let cancelled = self
-                        .agent_registry
-                        .kill_instance(&instance, 0)
-                        .map_err(|error| ManagedAgentError::Internal(error.to_string()))?
-                        .is_some();
-                    CancelResponse { cancelled }
+                let is_current_channel =
+                    self.spawn_handles
+                        .get(&req.session_id)
+                        .is_some_and(|handle| {
+                            handle
+                                .session_endpoint()
+                                .is_some_and(|endpoint| endpoint.channel_id == req.channel_id)
+                        });
+                let resp = if is_current_channel {
+                    self.cancel_instance(&instance, CancelMode::Session)?
                 } else {
                     CancelResponse { cancelled: false }
                 };
@@ -1401,11 +1401,11 @@ impl<K: KernelSyscall> RustService for ManagedAgentService<K> {
             "get_session_v1" => {
                 let req: GetSessionRequest = serde_json::from_slice(payload)
                     .map_err(|e| RustCallError::InvalidArgument(e.to_string()))?;
-                self.authorize_session_control(&req.session_id, ctx)?;
-                self.authorize_session_owner(ctx, &req.session_id)?;
-                let resp = self.get_session(&req.session_id)?;
-                serde_json::to_vec(&resp)
-                    .map_err(|error| RustCallError::Internal(error.to_string()))
+                let (instance, descriptor) =
+                    self.authorize_session_control(&req.session_id, ctx)?;
+                Self::authorize_session_owner(ctx, &descriptor)?;
+                let resp = self.session_snapshot(&instance, descriptor)?;
+                serde_json::to_vec(&resp).map_err(|e| RustCallError::Internal(e.to_string()))
             }
             _ => Err(RustCallError::NotFound),
         }

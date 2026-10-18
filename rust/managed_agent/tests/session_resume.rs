@@ -174,8 +174,7 @@ fn cohost_local_ids_are_unique_across_independent_kernel_instances() {
     }
 }
 
-#[test]
-fn channel_checked_cancel_cannot_kill_a_concurrently_reused_pid() {
+fn replacement_race_fixture() -> (Arc<Kernel>, Arc<std::sync::atomic::AtomicBool>, Value) {
     use kernel::core::agents::registry::AgentRegistry;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -231,6 +230,13 @@ fn channel_checked_cancel_cannot_kill_a_concurrently_reused_pid() {
     let armed = Arc::new(AtomicBool::new(false));
     install_managed_agent_with_spawn(&kernel, Arc::new(RaceProvider(Arc::clone(&armed)))).unwrap();
     let started = call(&kernel, "start_session_v1", json!({"agent_id":"old"})).unwrap();
+    (kernel, armed, started)
+}
+
+#[test]
+fn channel_checked_cancel_cannot_kill_a_concurrently_reused_pid() {
+    use std::sync::atomic::Ordering;
+    let (kernel, armed, started) = replacement_race_fixture();
     let pid = started["session_id"].as_str().unwrap();
     armed.store(true, Ordering::SeqCst);
     let response = call(
@@ -240,6 +246,20 @@ fn channel_checked_cancel_cannot_kill_a_concurrently_reused_pid() {
     )
     .unwrap();
     assert_eq!(response["cancelled"], false);
+    let replacement = kernel.agent_registry().get(pid).unwrap();
+    assert_eq!(replacement.name, "replacement");
+    assert_eq!(replacement.owner_id, "another-owner");
+    assert_eq!(replacement.state, AgentState::Registered);
+    kernel.agent_registry().kill(pid, 0).unwrap();
+}
+
+#[test]
+fn session_snapshot_rejects_a_pid_replaced_during_attachment_lookup() {
+    use std::sync::atomic::Ordering;
+    let (kernel, armed, started) = replacement_race_fixture();
+    let pid = started["session_id"].as_str().unwrap();
+    armed.store(true, Ordering::SeqCst);
+    assert!(call(&kernel, "get_session_v1", json!({"session_id":pid})).is_err());
     let replacement = kernel.agent_registry().get(pid).unwrap();
     assert_eq!(replacement.name, "replacement");
     assert_eq!(replacement.owner_id, "another-owner");

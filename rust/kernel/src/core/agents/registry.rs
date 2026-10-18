@@ -646,6 +646,13 @@ impl AgentRegistry {
         Some((record.instance(), record.descriptor.clone()))
     }
 
+    /// Whether this exact incarnation is still present in the registry.
+    pub fn is_current_instance(&self, instance: &AgentInstance) -> bool {
+        self.agents
+            .get(&instance.pid)
+            .is_some_and(|record| !record.removing && record.matches(instance))
+    }
+
     /// The agent name a pid belongs to.
     ///
     /// [`Self::get`] clones the whole descriptor — repos vector, labels map,
@@ -1125,6 +1132,8 @@ mod tests {
         reg.kill_instance(&old, 0).unwrap().unwrap();
         // Even identical PCB fields and millisecond timestamps cannot alias.
         let current = reg.register_instance(desc.clone()).unwrap();
+        assert!(!reg.is_current_instance(&old));
+        assert!(reg.is_current_instance(&current));
         assert!(!reg
             .update_instance_state(&old, AgentState::WarmingUp, None)
             .unwrap());
