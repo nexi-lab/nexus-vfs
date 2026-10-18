@@ -90,7 +90,10 @@ jobs:
   test:
     name: cargo test
     runs-on: ubuntu-22.04
-    timeout-minutes: 20
+    # A core change can require a ~12-minute cold build before the real
+    # multi-daemon journeys run. Keep their own deadlines and allow the full
+    # suite to finish instead of canceling passing tests at the job boundary.
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
