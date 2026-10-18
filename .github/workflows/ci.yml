@@ -9,6 +9,29 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  process-instances:
+    name: Process instance lifecycle / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-process-instances-${{ matrix.os }}
+      # Linux exercises these in the full workspace test job below.
+      - run: cargo test -p kernel --no-default-features core::agents::registry --lib
+      - run: cargo test -p managed-agent --all-features --test session_mailbox --test session_resume
+
   search-windows:
     name: Search FTS / Windows
     runs-on: windows-2022
