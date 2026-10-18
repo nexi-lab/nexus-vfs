@@ -1016,6 +1016,8 @@ graph TB
   </tbody>
 </table>
 
+<p><strong>Agent process instances.</strong> A PID selects the current registry entry in its execution namespace and may be reused after exit. Asynchronous lifecycle work retains an opaque <code>AgentInstance</code> returned atomically by <code>register_instance</code>; conditional state updates and termination compare that reference under the registry write guard. The reference shares the entry's notification allocation, so equal descriptor fields or timestamps cannot identify a replacement. Termination observers finish before reaping exposes the PID for reuse. State waiters retain the same instance. This is an in-memory kernel primitive; <code>OS PID[.local_id]</code>, wire descriptors and <code>KernelSyscall</code> remain unchanged.</p>
+
 <h3 id="lock-manager">4.1 Unified LockManager &mdash; I/O Lock + Advisory Lock</h3>
 
 <p>Rust <code>LockManager</code> (<code>rust/kernel/src/core/lock/</code>) unifies the kernel's two locking concerns in one primitive &mdash; shared path-normalisation helper, shared hierarchy-aware conflict logic, shared <code>core/lock/</code> module home. Constructed in <code>Kernel::new()</code> with a default <code>LocalLocks</code> advisory backend; a replicated backend swaps in via <code>install_locks(Arc&lt;dyn Locks&gt;)</code> at federation mount time (first-wins, idempotent).</p>

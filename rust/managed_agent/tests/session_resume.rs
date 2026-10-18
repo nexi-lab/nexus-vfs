@@ -173,3 +173,96 @@ fn cohost_local_ids_are_unique_across_independent_kernel_instances() {
         assert!(pids.insert(pid.to_owned()));
     }
 }
+
+fn replacement_race_fixture() -> (Arc<Kernel>, Arc<std::sync::atomic::AtomicBool>, Value) {
+    use kernel::core::agents::registry::AgentRegistry;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct RaceProvider(Arc<AtomicBool>);
+    struct RaceHandle {
+        armed: Arc<AtomicBool>,
+        registry: Arc<AgentRegistry>,
+        descriptor: AgentDescriptor,
+        endpoint: a2a::session::SessionEndpoint,
+    }
+    impl SpawnHandle for RaceHandle {
+        fn abort(&self) {}
+        fn session_endpoint(&self) -> Option<&a2a::session::SessionEndpoint> {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                // Replace the PCB between the service's snapshot and kill,
+                // without relying on a scheduler or native allocator timing.
+                self.registry.unregister(&self.descriptor.pid).unwrap();
+                let mut replacement = self.descriptor.clone();
+                replacement.name = "replacement".into();
+                replacement.owner_id = "another-owner".into();
+                replacement.state = AgentState::Registered;
+                assert!(self.registry.register(replacement));
+            }
+            Some(&self.endpoint)
+        }
+    }
+    impl SpawnTask<Kernel> for RaceProvider {
+        fn spawn(
+            &self,
+            _: Arc<Kernel>,
+            _: AgentDescriptor,
+            _: Arc<dyn Fn(AgentState, Option<String>) + Send + Sync>,
+        ) -> Result<Box<dyn SpawnHandle>, String> {
+            Err("this fixture requires a session endpoint".into())
+        }
+        fn spawn_with_options(
+            &self,
+            kernel: Arc<Kernel>,
+            descriptor: AgentDescriptor,
+            options: SpawnOptions,
+            _: Arc<dyn Fn(AgentState, Option<String>) + Send + Sync>,
+        ) -> Result<Box<dyn SpawnHandle>, String> {
+            Ok(Box::new(RaceHandle {
+                armed: Arc::clone(&self.0),
+                registry: Arc::clone(kernel.agent_registry()),
+                descriptor,
+                endpoint: options.session_endpoint.unwrap(),
+            }))
+        }
+    }
+
+    let kernel = Arc::new(Kernel::new());
+    let armed = Arc::new(AtomicBool::new(false));
+    install_managed_agent_with_spawn(&kernel, Arc::new(RaceProvider(Arc::clone(&armed)))).unwrap();
+    let started = call(&kernel, "start_session_v1", json!({"agent_id":"old"})).unwrap();
+    (kernel, armed, started)
+}
+
+#[test]
+fn channel_checked_cancel_cannot_kill_a_concurrently_reused_pid() {
+    use std::sync::atomic::Ordering;
+    let (kernel, armed, started) = replacement_race_fixture();
+    let pid = started["session_id"].as_str().unwrap();
+    armed.store(true, Ordering::SeqCst);
+    let response = call(
+        &kernel,
+        "cancel_v2",
+        json!({"session_id":pid,"channel_id":started["session_endpoint"]["channel_id"]}),
+    )
+    .unwrap();
+    assert_eq!(response["cancelled"], false);
+    let replacement = kernel.agent_registry().get(pid).unwrap();
+    assert_eq!(replacement.name, "replacement");
+    assert_eq!(replacement.owner_id, "another-owner");
+    assert_eq!(replacement.state, AgentState::Registered);
+    kernel.agent_registry().kill(pid, 0).unwrap();
+}
+
+#[test]
+fn session_snapshot_rejects_a_pid_replaced_during_attachment_lookup() {
+    use std::sync::atomic::Ordering;
+    let (kernel, armed, started) = replacement_race_fixture();
+    let pid = started["session_id"].as_str().unwrap();
+    armed.store(true, Ordering::SeqCst);
+    assert!(call(&kernel, "get_session_v1", json!({"session_id":pid})).is_err());
+    let replacement = kernel.agent_registry().get(pid).unwrap();
+    assert_eq!(replacement.name, "replacement");
+    assert_eq!(replacement.owner_id, "another-owner");
+    assert_eq!(replacement.state, AgentState::Registered);
+    kernel.agent_registry().kill(pid, 0).unwrap();
+}
