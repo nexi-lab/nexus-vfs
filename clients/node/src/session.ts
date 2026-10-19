@@ -4,6 +4,17 @@ import type { NexusVfsClient } from './index.js'
 export const SESSION_PROTOCOL = 'acp-mailbox/1' as const
 const MAX_FRAME_BYTES = 4 * 1024 * 1024
 
+const RETRYABLE_READ_CODES = new Set<string | number>([
+  1, 4, 8, 10, 14,
+  'CANCELLED', 'DEADLINE_EXCEEDED', 'RESOURCE_EXHAUSTED', 'ABORTED', 'UNAVAILABLE',
+])
+
+/** Retry a failed read with the same cursor, channel and codec until closed. */
+export function isRetryableSessionReadError(error: unknown): boolean {
+  const code = isObject(error) ? error.code : undefined
+  return (typeof code === 'string' || typeof code === 'number') && RETRYABLE_READ_CODES.has(code)
+}
+
 /** The control plane supplies the canonical conversation address. */
 export interface NexusSessionEndpoint {
   protocol: typeof SESSION_PROTOCOL
@@ -208,6 +219,7 @@ export class NexusSessionTransport {
           )
           retryMs = 200
         } catch (error) {
+          if (this.isClosed) return
           const floor = initialRetentionFloor(error, this.offset)
           if (floor !== undefined) {
             // Keep the codec: missing frames in this generation must still fail.
@@ -216,8 +228,7 @@ export class NexusSessionTransport {
           }
           // Reads have no effects: keep the cursor and codec across a transient
           // gRPC failure. Writes deliberately have different retry semantics.
-          const code = isObject(error) ? error.code : undefined
-          if (![4, 8, 10, 14, 'DEADLINE_EXCEEDED', 'RESOURCE_EXHAUSTED', 'ABORTED', 'UNAVAILABLE'].includes(code as string | number)) throw error
+          if (!isRetryableSessionReadError(error)) throw error
           await delay(retryMs, undefined, { signal: this.stopped.signal })
           retryMs = Math.min(retryMs * 2, 5000)
           continue

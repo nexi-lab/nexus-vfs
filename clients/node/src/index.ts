@@ -20,7 +20,7 @@ import { assertUserRuntimeCredential, userRuntimeServerName, type SessionCredent
 export { userRuntimeServerName, createUserRuntimeCredentialBundle } from './credentials.js'
 export type { SessionCredential, UserRuntimeCredentialBundle } from './credentials.js'
 
-export { SESSION_PROTOCOL, SessionCodec, NexusSessionTransport } from './session.js'
+export { SESSION_PROTOCOL, SessionCodec, NexusSessionTransport, isRetryableSessionReadError } from './session.js'
 export type { NexusSessionEndpoint, SessionRpcMessage, NexusSessionTransportOptions } from './session.js'
 
 import * as grpc from '@grpc/grpc-js'

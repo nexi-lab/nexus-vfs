@@ -5,6 +5,14 @@ on:
     tags:
       - 'v[0-9]*.[0-9]*.[0-9]*'
   workflow_dispatch:
+    inputs:
+      component:
+        description: Release the Node client independently or build every component
+        type: choice
+        options:
+          - all
+          - node-client
+        default: all
 
 permissions:
   contents: write
@@ -18,6 +26,7 @@ env:
 
 jobs:
   build:
+    if: github.event_name != 'workflow_dispatch' || inputs.component != 'node-client'
     name: build-${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
