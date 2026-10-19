@@ -12,9 +12,17 @@ Pure JavaScript over [`@grpc/grpc-js`](https://www.npmjs.com/package/@grpc/grpc-
 No native addon: installing needs no Rust toolchain, and an Electron consumer
 needs no ABI rebuild per release.
 
+Session transports retry transient reads, including a server timeout reported
+as `CANCELLED`, from the same cursor and channel. Managed-runtime hosts can use
+`isRetryableSessionReadError` to verify their execution identity before allowing
+that retry. Closing the transport stops retries; failed writes retain their
+uncertain delivery outcome.
+
 ## Installing
 
 Published two ways by `.github/workflows/release.yml`:
+
+Dispatch with `component=node-client` to publish the client independently.
 
 - **npm** — `@nexus-ai-fs/vfs-client`, the same scope and registry as
   `@nexus-ai-fs/api-client`. Requires `NPM_TOKEN` on this repository; the job
