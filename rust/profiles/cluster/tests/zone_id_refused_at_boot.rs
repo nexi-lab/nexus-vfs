@@ -133,7 +133,7 @@ async fn a_conforming_zone_id_still_boots() {
 #[tokio::test]
 async fn share_refuses_a_malformed_new_zone_id() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (data, _ident) = dirs(dir.path());
+    let (data, ident) = dirs(dir.path());
 
     for (zone, why) in MALFORMED {
         // `--zone-id=<id>`, not `--zone-id <id>`: an id starting with a hyphen
@@ -141,7 +141,10 @@ async fn share_refuses_a_malformed_new_zone_id() {
         // wrong reason — green test, nothing proven. Same trap the boot case
         // above documents.
         let (ok, out, err) = cli(
-            &[("NEXUS_DATA_DIR", data.as_str())],
+            &[
+                ("NEXUS_DATA_DIR", data.as_str()),
+                ("NEXUS_IDENTITY_DIR", ident.as_str()),
+            ],
             &["share", &format!("--zone-id={zone}"), "/some/subtree"],
         );
         assert!(

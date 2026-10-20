@@ -306,15 +306,11 @@ async fn tls_bootstrap_loop(
                     std::fs::write(tls_dir.join("node.pem"), &result.node_cert_pem)
                         .expect("write cert");
 
-                    // Write key with restricted permissions
-                    let key_path = tls_dir.join("node-key.pem");
-                    std::fs::write(&key_path, &result.node_key_pem).expect("write key");
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
-                            .ok();
-                    }
+                    lib::transport_primitives::write_secret(
+                        &tls_dir.join("node-key.pem"),
+                        &result.node_key_pem,
+                    )
+                    .expect("write node key (owner-only)");
 
                     tracing::info!(
                         "TLS bootstrap: received signed cert from peer {} — restart to enable mTLS",

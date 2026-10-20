@@ -2307,48 +2307,16 @@ pub fn join_cluster_and_provision_tls(
     std::fs::write(dir.join("node.pem"), &result.node_cert_pem)
         .map_err(|e| RaftError::Config(format!("Failed to write node.pem: {}", e)))?;
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true).mode(0o600);
-        use std::io::Write;
-        let mut f = opts
-            .open(dir.join("node-key.pem"))
-            .map_err(|e| RaftError::Config(format!("Failed to write node-key.pem: {}", e)))?;
-        f.write_all(&result.node_key_pem)
-            .map_err(|e| RaftError::Config(format!("Failed to write node-key.pem: {}", e)))?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(dir.join("node-key.pem"), &result.node_key_pem)
-            .map_err(|e| RaftError::Config(format!("Failed to write node-key.pem: {}", e)))?;
-    }
+    lib::transport_primitives::write_secret(&dir.join("node-key.pem"), &result.node_key_pem)
+        .map_err(|e| RaftError::Config(format!("Failed to write node-key.pem: {}", e)))?;
 
     // Persist the cluster API-key secret (if the founder served one) to the
     // single SSOT `tls/api-key-secret`, so this joiner authenticates
-    // cluster-minted `sk-` keys with NO local `NEXUS_API_KEY_SECRET`. Secret
-    // material → 0600, same as node-key.pem. Absent ⇒ founder is auth-off, so
-    // write nothing and the joiner stays auth-off too.
+    // cluster-minted `sk-` keys with NO local `NEXUS_API_KEY_SECRET`. Absent ⇒
+    // founder is auth-off, so write nothing and the joiner stays auth-off too.
     if let Some(secret) = &result.api_key_secret {
-        let secret_path = dir.join("api-key-secret");
-        #[cfg(unix)]
-        {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut opts = std::fs::OpenOptions::new();
-            opts.write(true).create(true).truncate(true).mode(0o600);
-            let mut f = opts
-                .open(&secret_path)
-                .map_err(|e| RaftError::Config(format!("Failed to write api-key-secret: {}", e)))?;
-            f.write_all(secret.as_bytes())
-                .map_err(|e| RaftError::Config(format!("Failed to write api-key-secret: {}", e)))?;
-        }
-        #[cfg(not(unix))]
-        {
-            std::fs::write(&secret_path, secret.as_bytes())
-                .map_err(|e| RaftError::Config(format!("Failed to write api-key-secret: {}", e)))?;
-        }
+        lib::transport_primitives::write_secret(&dir.join("api-key-secret"), secret.as_bytes())
+            .map_err(|e| RaftError::Config(format!("Failed to write api-key-secret: {}", e)))?;
     }
 
     Ok(())

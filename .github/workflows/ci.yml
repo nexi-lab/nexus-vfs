@@ -9,6 +9,26 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  secret-file-permissions:
+    name: Secret file permissions / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-2022, macos-14]
+    env:
+      CARGO_BUILD_JOBS: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-secret-file-permissions-${{ matrix.os }}
+      - run: cargo test -p lib --features transport transport_primitives::secret_file --lib
+
   process-instances:
     name: Process instance lifecycle / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}

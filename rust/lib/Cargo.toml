@@ -29,6 +29,7 @@ transport = [
     "dep:tokio-rustls",
     "dep:tokio-stream",
     "dep:arc-swap",
+    "dep:windows-sys",
 ]
 
 # `lib::rt` — the sync→async runtime bridge (block_on_via / block_on_portable),
@@ -91,6 +92,9 @@ x509-parser = { version = "0.18", features = ["verify"], optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.4", features = ["wasm_js"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 proptest = "1.5"

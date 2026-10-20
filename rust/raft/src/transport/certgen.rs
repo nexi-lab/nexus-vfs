@@ -524,7 +524,10 @@ pub fn bootstrap_tls(
         read_hash()
     } else {
         let (token, hash) = generate_join_token(&ca_pem)?;
-        std::fs::write(tls_dir.join("join-token"), &token)
+        // The token itself is a credential — whoever holds it can enroll a node
+        // into this cluster — so it is secret material. The hash beside it is
+        // not, and stays a plain write.
+        lib::transport_primitives::write_secret(&tls_dir.join("join-token"), token.as_bytes())
             .map_err(|e| format!("Failed to write join-token: {e}"))?;
         std::fs::write(&join_token_hash_path, &hash)
             .map_err(|e| format!("Failed to write join-token-hash: {e}"))?;
@@ -599,19 +602,12 @@ pub fn append_join_token_hash(path: &Path, hash: &str) -> std::io::Result<()> {
 }
 
 fn write_pem(path: &Path, pem: &[u8], private: bool) -> Result<(), String> {
-    std::fs::write(path, pem).map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
-    if private {
-        // POSIX-only: tighten private-key file permissions to 0o600.
-        // No-op on Windows where ACLs handle this differently.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            std::fs::set_permissions(path, perms)
-                .map_err(|e| format!("chmod 600 {}: {}", path.display(), e))?;
-        }
-    }
-    Ok(())
+    let written = if private {
+        lib::transport_primitives::write_secret(path, pem)
+    } else {
+        std::fs::write(path, pem)
+    };
+    written.map_err(|e| format!("Failed to write {}: {}", path.display(), e))
 }
 
 /// Compute a SHA-256 fingerprint of a PEM-encoded CA certificate.
