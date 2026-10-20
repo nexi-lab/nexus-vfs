@@ -1,34 +1,19 @@
-//! The one way this workspace writes secret material to disk.
+//! Owner-only persistence for private keys, API-key secrets and join tokens.
 //!
-//! Private keys (CA, node, agent), the cluster API-key HMAC secret and join
-//! tokens all land as files, and every one of them must be owner-only. That rule
-//! used to be written out separately at each site — and the copies disagreed. A
-//! cross-machine bring-up found an agent's private key sitting at `0644`,
-//! readable by every local user, because the agent-bundle writer used a bare
-//! `std::fs::write`; the cluster CA key and the join token were written the same
-//! way, while the node key and API-key secret each had their own hand-rolled
-//! `0600`. One function makes the rule impossible to skip by accident.
-//!
-//! **Unix:** `0o600`, and tightened on EVERY write, not only on create.
-//! `OpenOptions::mode` applies when a file is CREATED; a file that already
-//! existed keeps whatever mode it had. So a key first written world-readable
-//! stays world-readable through every later rotation unless something resets it
-//! — which is exactly the state a node upgraded from the old writer is in. The
-//! order is: open (truncating, so the old bytes are gone), tighten, then write,
-//! so the NEW secret is never present in a file anyone else can read.
-//!
-//! **Windows:** a plain write. Files inherit the ACL of their directory, and a
-//! data directory under the user's profile is already owner-only; Windows has no
-//! mode bits to set here, so there is nothing truthful to add.
+//! Permissions are tightened before writing new bytes, including when replacing
+//! an existing file: Unix uses `0600`; Windows installs a protected owner-only
+//! DACL on the open file handle. Directory inheritance does not grant access to
+//! a secret file. A permissions error prevents the new secret from being written.
 
 use std::io::Write;
 use std::path::Path;
 
+#[cfg(windows)]
+mod windows;
+
 /// Write `contents` to `path` readable and writable by the owner only.
 ///
-/// Creates or replaces the file. On unix the permissions are forced to `0o600`
-/// even when the file already existed with looser ones — see the module docs
-/// for why "on create" is not enough.
+/// Creates or replaces the file, enforcing permissions on every write.
 pub fn write_secret(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -46,7 +31,13 @@ pub fn write_secret(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         f.write_all(contents)?;
         f.flush()
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let mut f = windows::open_owner_only(path)?;
+        f.write_all(contents)?;
+        f.flush()
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let mut f = std::fs::File::create(path)?;
         f.write_all(contents)?;
