@@ -200,7 +200,7 @@ fn shared_holder_to_kernel(h: &SharedHolderInfo) -> KernelHolderInfo {
     }
 }
 
-fn shared_lock_to_kernel(lock: contracts::LockInfo) -> KernelLockInfo {
+pub(crate) fn shared_lock_to_kernel(lock: contracts::LockInfo) -> KernelLockInfo {
     KernelLockInfo {
         path: lock.path,
         max_holders: lock.max_holders,
@@ -312,7 +312,7 @@ impl LockManager {
         self.installed.load(Ordering::Acquire)
     }
 
-    fn locks_backend(&self) -> Arc<dyn Locks> {
+    pub(crate) fn locks_backend(&self) -> Arc<dyn Locks> {
         self.locks.read().clone()
     }
 

@@ -8,11 +8,9 @@
 //! same post-R14 consistency model as the previous in-kernel
 //! implementation.
 //!
-//! The kernel installs this backend via
-//! ``Kernel::install_locks(Arc<DistributedLocks>, shared_state)``
-//! exactly once per process; federation's ``setup_zone`` is the
-//! caller and pre-migrates existing local holders into the state
-//! machine's map before the swap.
+//! The kernel resolves a zone via its mount table and requests this backend
+//! through `DistributedCoordinator::locks_for_zone`. Each zone's committed
+//! state remains separate; local or other-zone holders are never copied in.
 
 use std::sync::Arc;
 
@@ -41,79 +39,13 @@ pub struct DistributedLocks {
 }
 
 impl DistributedLocks {
-    /// Construct a distributed backend + migrate existing local holders
-    /// into the state machine's advisory map.
-    ///
-    /// ``kernel_local_state`` is the kernel's current advisory Arc
-    /// (``LockManager::advisory_state_arc()``) — any holders already
-    /// in it are merged into the state machine's map, using
-    /// state-machine state as authoritative (raft may have replayed
-    /// committed entries the moment the state machine was
-    /// constructed; never overwrite raft-owned paths with stale
-    /// local data).
-    ///
-    /// The returned backend exposes its shared state via the
-    /// ``Locks::shared_state_arc`` trait method, so callers don't pass
-    /// a separate state Arc to ``LockManager::install_locks`` — the
-    /// kernel pulls it back through the trait, eliminating the misuse
-    /// risk of mismatching backend/state Arcs at install time.
-    pub fn new(
-        node: ZoneConsensus<FullStateMachine>,
-        runtime: tokio::runtime::Handle,
-        kernel_local_state: Arc<Mutex<LockState>>,
-    ) -> Self {
-        // Adopt the state machine's shared advisory Arc.  Two callers
-        // reach this path:
-        //
-        //   1. ``kernel::sys_setattr DT_MOUNT`` — sync gRPC handler
-        //      thread, no tokio runtime context.
-        //   2. ``mount_apply_cb`` on followers — the closure fires
-        //      inside the raft apply loop, which IS a tokio task on
-        //      the zone manager's multi-thread runtime.
-        //
-        // Calling ``runtime.block_on`` from path (2) panics with
-        // "Cannot start a runtime from within a runtime", and
-        // ``block_in_place`` only papers over the panic without fixing
-        // the worker-exhaustion deadlock that follows under
-        // concurrent DT_MOUNT load.
-        //
-        // ``advisory_state_blocking`` uses ``RwLock::blocking_read``
-        // which suspends the OS thread without reentering the runtime
-        // — works identically from both paths (sync gRPC thread or
-        // raft apply task) and never deadlocks because the read-side
-        // is read-mostly + the apply path holds the write lock only
-        // briefly per entry.
+    /// Bind to the zone's existing apply-owned state. This is a handle, not
+    /// another lock table, so reads observe that same local replica.
+    pub fn new(node: ZoneConsensus<FullStateMachine>, runtime: tokio::runtime::Handle) -> Self {
+        // This accessor clones the apply-owned handle cached by ZoneConsensus;
+        // it neither reenters the runtime nor waits on the state machine.
+        // Snapshot restore replaces the contents under this same shared Arc.
         let shared_state: Arc<Mutex<LockState>> = node.advisory_state_blocking();
-        let _ = runtime;
-
-        // Merge kernel-local holders that have no corresponding
-        // raft-apply row. Raft may already have replayed entries; we
-        // treat raft's state as authoritative and only fill gaps.
-        {
-            let mut dst = shared_state.lock();
-            let src = kernel_local_state.lock();
-            let mut migrated = 0usize;
-            let mut skipped = 0usize;
-            for (path, entry) in &src.locks {
-                if entry.holders.is_empty() {
-                    continue;
-                }
-                if dst.locks.contains_key(path) {
-                    skipped += 1;
-                    continue;
-                }
-                dst.locks.insert(path.clone(), entry.clone());
-                migrated += 1;
-            }
-            if migrated > 0 || skipped > 0 {
-                tracing::info!(
-                    migrated = migrated,
-                    skipped_because_raft_owns = skipped,
-                    "DistributedLocks::new: migrated local advisory holders into state-machine map",
-                );
-            }
-        }
-
         Self {
             node,
             runtime,
