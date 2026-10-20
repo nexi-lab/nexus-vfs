@@ -174,7 +174,7 @@ async fn stat_follow_links_over_tcp_preserves_lstat_and_rechecks_target_grants()
         .sys_setattr(
             "/alias",
             &ctx,
-            kernel::meta_store::DT_LINK as u32,
+            i32::from(kernel::meta_store::DT_LINK),
             "",
             None,
             None,
