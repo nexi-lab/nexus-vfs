@@ -99,8 +99,9 @@ mod tests {
     use windows_sys::Win32::Security::Authorization::{
         ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo,
     };
+    use windows_sys::Win32::Security::{GetSecurityDescriptorControl, SE_DACL_PROTECTED};
 
-    fn dacl_sddl(path: &Path) -> String {
+    fn protected_dacl(path: &Path) -> (bool, String) {
         let file = File::open(path).unwrap();
         let mut descriptor = ptr::null_mut();
         // SAFETY: file has READ_CONTROL and descriptor is a writable output.
@@ -118,6 +119,13 @@ mod tests {
         };
         assert_eq!(status, 0);
         let descriptor = SecurityDescriptor(descriptor);
+        let mut control = 0;
+        let mut revision = 0;
+        // SAFETY: descriptor is valid and the output slots remain live.
+        assert_ne!(
+            unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) },
+            0
+        );
         let mut text = ptr::null_mut();
         let mut length = 0;
         // SAFETY: descriptor is valid; text and length are live output slots.
@@ -133,13 +141,24 @@ mod tests {
             },
             0
         );
-        // SAFETY: the API returns length UTF-16 code units including the NUL.
+        // SAFETY: the API returns an allocation of length UTF-16 code units.
+        // Read only through the first NUL, including when Windows reports a
+        // larger output buffer than the text it actually formatted.
         let value = unsafe {
-            String::from_utf16_lossy(std::slice::from_raw_parts(text, length as usize - 1))
+            let wide = std::slice::from_raw_parts(text, length as usize);
+            let end = wide
+                .iter()
+                .position(|unit| *unit == 0)
+                .expect("SDDL terminator");
+            String::from_utf16_lossy(&wide[..end])
         };
         // SAFETY: the API allocates text with LocalAlloc; it is no longer used.
         unsafe { LocalFree(text.cast()) };
-        value
+        // Windows may retain the informational AI (auto-inherited) control
+        // flag after protecting a DACL. Assert the protection bit itself and
+        // the exact ACE list rather than that incidental SDDL representation.
+        let entries = value[value.find('(').expect("DACL must contain an ACE")..].to_string();
+        (control & SE_DACL_PROTECTED != 0, entries)
     }
 
     #[test]
@@ -147,7 +166,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("secret");
         crate::transport_primitives::write_secret(&path, b"key").unwrap();
-        assert_eq!(dacl_sddl(&path), OWNER_ONLY);
+        assert_eq!(protected_dacl(&path), (true, "(A;;FA;;;OW)".into()));
         assert_eq!(std::fs::read(&path).unwrap(), b"key");
     }
 
@@ -164,10 +183,10 @@ mod tests {
         set_dacl(&file, "D:P(A;;FA;;;WD)").unwrap();
         std::io::Write::write_all(&mut file, b"old").unwrap();
         drop(file);
-        assert_eq!(dacl_sddl(&path), "D:P(A;;FA;;;WD)");
+        assert_eq!(protected_dacl(&path), (true, "(A;;FA;;;WD)".into()));
 
         crate::transport_primitives::write_secret(&path, b"new").unwrap();
-        assert_eq!(dacl_sddl(&path), OWNER_ONLY);
+        assert_eq!(protected_dacl(&path), (true, "(A;;FA;;;OW)".into()));
         assert_eq!(std::fs::read(&path).unwrap(), b"new");
     }
 }
