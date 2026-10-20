@@ -140,6 +140,7 @@ gateway_methods! {
     delete: DeleteRequest => DeleteResponse,
     mkdir: MkdirRequest => MkdirResponse,
     stat: StatRequest => StatResponse,
+    stat_follow: StatRequest => StatResponse,
     readdir: ReaddirRequest => ReaddirResponse,
     setattr: SetattrRequest => SetattrResponse,
     rename: RenameRequest => RenameResponse,

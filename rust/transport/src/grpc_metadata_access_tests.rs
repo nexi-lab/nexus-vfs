@@ -3,10 +3,13 @@ use std::sync::{Arc, Mutex};
 
 use kernel::kernel::syscall::KernelSyscall;
 use kernel::kernel::vfs_proto::{
-    nexus_vfs_service_server::NexusVfsService, BatchStatRequest, ReaddirRequest, StatRequest,
+    nexus_vfs_service_client::NexusVfsServiceClient,
+    nexus_vfs_service_server::{NexusVfsService, NexusVfsServiceServer},
+    BatchStatRequest, ReaddirRequest, StatRequest,
 };
 use kernel::kernel::{KernelError, OperationContext};
 use kernel::{Permission, PermissionProvider};
+use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Code, Request, Status};
 
 use crate::auth::{AuthCredentials, AuthProvider};
@@ -160,4 +163,90 @@ async fn stat_and_batch_stat_require_current_file_grants() {
         .unwrap()
         .into_inner();
     assert!(response.is_error && !response.found);
+}
+
+#[tokio::test]
+async fn stat_follow_links_over_tcp_preserves_lstat_and_rechecks_target_grants() {
+    let (service, grants) = fixture();
+    let ctx = OperationContext::new("setup", "root", true, None, true);
+    service
+        .kernel
+        .sys_setattr(
+            "/alias",
+            &ctx,
+            kernel::meta_store::DT_LINK as u32,
+            "",
+            None,
+            None,
+            None,
+            "memory",
+            "root",
+            false,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("/docs"),
+            None,
+            None,
+        )
+        .unwrap();
+    let alias = "/alias/b-own.txt";
+    let target = "/docs/b-own.txt";
+    grants
+        .lock()
+        .unwrap()
+        .extend(["/alias".into(), alias.into()]);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(NexusVfsServiceServer::new(service))
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                let _ = stopped.await;
+            })
+            .await
+            .unwrap();
+    });
+    let mut client = NexusVfsServiceClient::connect(endpoint).await.unwrap();
+    let request = |path: &str| StatRequest {
+        path: path.into(),
+        ..Default::default()
+    };
+    let lstat = client.stat(request("/alias")).await.unwrap().into_inner();
+    assert!(!lstat.is_error && lstat.found);
+    assert_eq!(lstat.entry_type, i32::from(kernel::meta_store::DT_LINK));
+    assert_eq!(lstat.link_target, "/docs");
+    let denied = client
+        .stat_follow(request(alias))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(denied.is_error && !denied.found && denied.content_id.is_empty());
+    grants.lock().unwrap().insert(target.into());
+    let found = client
+        .stat_follow(request(alias))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!found.is_error && found.found);
+    assert_eq!(found.entry_type, i32::from(kernel::meta_store::DT_REG));
+    assert_eq!(found.path, target);
+    assert_eq!(found.size, 6);
+    grants.lock().unwrap().remove(target);
+    let revoked = client
+        .stat_follow(request(alias))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(revoked.is_error && !revoked.found && revoked.path.is_empty());
+    drop(client);
+    stop.send(()).unwrap();
+    server.await.unwrap();
 }

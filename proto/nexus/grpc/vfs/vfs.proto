@@ -41,6 +41,10 @@ service NexusVFSService {
   // Typed metadata stat — the hottest metadata op.
   rpc Stat(StatRequest) returns (StatResponse);
 
+  // Metadata of the resolved I/O target, authorized on each link spelling
+  // and its target. Older nodes return UNIMPLEMENTED.
+  rpc StatFollow(StatRequest) returns (StatResponse);
+
   // Typed directory listing — metastore + backend merge, procfs intercepts.
   rpc Readdir(ReaddirRequest) returns (ReaddirResponse);
 
