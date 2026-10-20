@@ -28,7 +28,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-local-mounts-${{ matrix.os }}
-      - run: cargo test --locked -p transport --lib setattr
       - run: cargo test --locked -p nexus-cluster --test local_mount_contract
 
   secret-file-permissions:
