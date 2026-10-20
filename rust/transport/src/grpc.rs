@@ -424,35 +424,10 @@ impl VfsServiceImpl {
         (code, err.to_string())
     }
 
-    /// DT_MOUNT (`entry_type == 2`) handler — bridge-2 (#4262).
-    ///
-    /// Builds a live `ObjectStore` from the wire-carried backend params via
-    /// the registered [`ObjectStoreProvider`] and mounts it through
-    /// `Kernel::sys_setattr`, replacing the old blanket synthetic ack — but
-    /// only for the *networked* object-store drivers the provider
-    /// constructs from those params: `s3` (the epic's focus, and the path
-    /// S3-compatible Cloudflare R2 / MinIO ride via `s3_endpoint` +
-    /// `aws_region = "auto"`) plus the forward-compat `gcs` / `remote` arms.
-    ///
-    /// Three-way on the `backend_type`, fail-closed:
-    ///   * `{s3, gcs, remote}` → build via the provider and mount.
-    ///   * **synthetic ack** (no provider build, as before): the empty
-    ///     `backend_type` (metadata-only / federation), and the local-host
-    ///     backends (`path_local` / `cas-local` / `local_connector`) at ANY
-    ///     path — they carry no `local_root` on the wire, but the host binary
-    ///     serves every local path through its root `/` mount (host-fs), so a
-    ///     write to e.g. `/files/…` falls through and lands on disk. (The boot
-    ///     `sys_setattr(DT_MOUNT, "/")` remount is the same case.)
-    ///   * anything else (a connector / LLM type this server can't build, a
-    ///     typo, a legacy name like `path_s3`, a version-skewed client, a
-    ///     future driver) → **error, never a silent ack**: those have no
-    ///     host-fs fall-through, so a bare `created=false` ack would let the
-    ///     caller write into a phantom mount — a silent data-placement failure.
-    ///
-    /// Requires an admin or system context, mirroring the Python
-    /// `sys_setattr(DT_MOUNT)` gate: this path is now stateful (creates /
-    /// overwrites mounts), so a non-privileged token must not reach
-    /// `provider.build` / `Kernel::sys_setattr`.
+    /// Construct the requested backend through the registered provider, then
+    /// install it through the kernel. Provider capabilities follow the binary's
+    /// compiled drivers; an unavailable driver cannot acknowledge a mount.
+    /// Construction and the kernel syscall run on the blocking pool.
     fn setattr_mount(&self, req: SetattrRequest, ctx: &OperationContext) -> SetattrResponse {
         // DT_MOUNT mutates mount/zone state — gate it admin-only like the
         // Python primitive. The cluster's NoAuth resolves to an admin+system
@@ -464,25 +439,6 @@ impl VfsServiceImpl {
             ));
         }
 
-        // The local-host drivers the host binary owns. Which types the
-        // PROVIDER can build is deliberately NOT listed here — that answer is
-        // feature-dependent and belongs to the provider, which is asked below.
-        // A literal here said `["s3", "gcs", "remote"]`, so an LLM mount was
-        // refused in every build, including ones compiled to serve them.
-        const LOCAL_HOST: [&str; 3] = ["path_local", "cas-local", "local_connector"];
-
-        // Local-host backends (path_local / cas-local / local_connector) keep
-        // the pre-#4262 synthetic ack at ANY path. They carry no `local_root`
-        // on the wire so they can't be built here, but the host binary serves
-        // every local path through its root `/` mount (host-fs): acking lets a
-        // write to e.g. `/files/…` fall through to that root mount and land on
-        // disk — the established behavior the self-contained e2e suite relies
-        // on (it mounts `cas-local` at `/files` over gRPC). The boot-time
-        // DT_MOUNT("/") remount is the same case. (Connector / LLM / unknown
-        // types below have NO such fall-through, so they fail closed instead.)
-        if LOCAL_HOST.contains(&req.backend_type.as_str()) {
-            return synthetic_setattr_ack(&req);
-        }
         // Empty backend_type — federation / metadata-only DT_MOUNT. This is a
         // no-op ack over gRPC (the pre-#4262 behavior, deliberately retained).
         // Federation zone mounts are created via `share --mount-at` / `join`
@@ -559,10 +515,8 @@ impl VfsServiceImpl {
     }
 
     /// Issue the DT_MOUNT `Kernel::sys_setattr` from a `SetattrRequest` with a
-    /// caller-supplied backend: `Some(_)` from the provider for networked
-    /// object stores, or `None` for a federation / zoned mount where the
-    /// kernel creates the raft zone + route itself. Maps the kernel result
-    /// onto the typed `SetattrResponse`.
+    /// caller-supplied backend and optional remote metastore. Maps the kernel
+    /// result onto the typed `SetattrResponse`.
     fn mount_via_kernel(
         &self,
         req: &SetattrRequest,
@@ -1050,19 +1004,16 @@ impl NexusVfsService for VfsServiceImpl {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_setattr(s))),
         };
-        // DT_MOUNT (entry_type == 2) — bridge-2 (#4262): build a live
-        // backend via the registered `ObjectStoreProvider` for the
-        // networked object-store drivers it constructs from wire params
-        // (`s3` — including S3-compatible Cloudflare R2 / MinIO — plus the
-        // forward-compat `gcs` / `remote` arms), then mount it through
-        // `Kernel::sys_setattr`. `setattr_mount` owns the admin gate, the
-        // build-vs-ack-vs-error discriminator, and the rationale. Dispatched
-        // with the auth context and before `zone_id` is moved out of `req`,
-        // so the helper gets an intact request.
-        if req.entry_type == 2 {
-            return Ok(Response::new(self.setattr_mount(req, &ctx)));
-        }
-        Ok(Response::new(self.setattr_typed(req, &ctx)))
+        let service = self.clone();
+        let response = run_blocking(move || {
+            if req.entry_type == 2 {
+                service.setattr_mount(req, &ctx)
+            } else {
+                service.setattr_typed(req, &ctx)
+            }
+        })
+        .await?;
+        Ok(Response::new(response))
     }
 
     async fn rename(
@@ -2783,20 +2734,16 @@ pub(crate) mod tests {
         set_provider, ObjectStoreBuildResult, ObjectStoreProviderArgs,
     };
 
-    /// A minimal `ObjectStoreProvider` that hands back an in-memory backend
-    /// for `backend_type == "s3"`. Stands in for `DefaultObjectStoreProvider`
-    /// (whose real `s3` arm needs the aws-sdk that the `transport` crate
-    /// deliberately does not compile), so the DT_MOUNT→provider→kernel→
-    /// read/write bridge can be exercised in-process. It requires the S3
-    /// params, proving the handler actually threads them off the wire.
-    struct FakeS3Provider;
+    /// Use the local path driver and an in-memory S3 stand-in so both bridges
+    /// can be tested without the AWS SDK or external credentials.
+    struct TestBackendProvider;
 
-    impl kernel::hal::object_store_provider::ObjectStoreProvider for FakeS3Provider {
+    impl kernel::hal::object_store_provider::ObjectStoreProvider for TestBackendProvider {
         /// Refuses exactly what `build` refuses. A double that claimed to
         /// build everything would let the handler's gate pass anything and
         /// these tests would stop proving the gate exists.
         fn can_build(&self, backend_type: &str) -> bool {
-            backend_type == "s3"
+            matches!(backend_type, "s3" | "path_local")
         }
 
         fn build(
@@ -2821,7 +2768,8 @@ pub(crate) mod tests {
                         pending_remote_meta_store: None,
                     })
                 }
-                other => Err(format!("fake provider: unsupported backend_type '{other}'")),
+                "path_local" => backends::provider::DefaultObjectStoreProvider.build(args),
+                other => Err(format!("test provider: unsupported backend_type '{other}'")),
             }
         }
     }
@@ -2901,7 +2849,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn setattr_dt_mount_s3_builds_backend_and_serves_io() {
         // Provider slot is process-global + set-once; tolerate a prior set.
-        let _ = set_provider(std::sync::Arc::new(FakeS3Provider));
+        let _ = set_provider(std::sync::Arc::new(TestBackendProvider));
 
         let kernel = std::sync::Arc::new(kernel_with_mem_backend());
         let svc = VfsServiceImpl::for_test(kernel.clone());
@@ -2959,7 +2907,7 @@ pub(crate) mod tests {
     /// required-arg check rejects them.
     #[tokio::test]
     async fn setattr_dt_mount_s3_empty_required_param_errors() {
-        let _ = set_provider(std::sync::Arc::new(FakeS3Provider));
+        let _ = set_provider(std::sync::Arc::new(TestBackendProvider));
         let kernel = std::sync::Arc::new(kernel_with_mem_backend());
         let svc = VfsServiceImpl::for_test(kernel);
 
@@ -2987,82 +2935,89 @@ pub(crate) mod tests {
         assert!(!resp.created);
     }
 
-    /// A local-host `backend_type` at the ROOT path keeps the historical
-    /// synthetic ack — it must NOT rebuild/clobber the live boot mount the
-    /// host binary owns.
     #[tokio::test]
-    async fn setattr_dt_mount_root_local_backend_type_synthetic_acks() {
-        let kernel = std::sync::Arc::new(kernel_with_mem_backend());
+    async fn setattr_dt_mount_local_missing_root_preserves_existing_root() {
+        let _ = set_provider(Arc::new(TestBackendProvider));
+        let kernel = Arc::new(kernel_with_mem_backend());
         let svc = VfsServiceImpl::for_test(kernel.clone());
-
-        // Seed a file through the live "/" mount.
         let ctx = OperationContext::new("test", "root", true, None, true);
-        KernelSyscall::sys_write(&*kernel, "/seed.txt", &ctx, b"alive", 0).expect("seed write");
+        KernelSyscall::sys_write(&*kernel, "/seed.txt", &ctx, b"alive", 0).unwrap();
 
-        // Re-emit DT_MOUNT for "/" with a local backend_type (as the Python
-        // factory does at boot). Must ack synthetically, not rebuild.
-        let resp = svc
-            .setattr(tonic::Request::new(SetattrRequest {
-                path: "/".into(),
-                auth_token: "test-key".into(),
-                entry_type: 2,
-                backend_name: "local".into(),
-                backend_type: "cas-local".into(),
-                ..Default::default()
-            }))
-            .await
-            .expect("setattr rpc ok")
-            .into_inner();
-        assert!(!resp.is_error, "local DT_MOUNT must not error: {resp:?}");
-        assert!(
-            !resp.created,
-            "local DT_MOUNT must be a synthetic ack (created=false)"
-        );
-
-        // The live "/" mount is intact — the seeded file still reads back.
+        for path in ["/", "/files"] {
+            for backend_type in ["path_local", "cas-local", "local_connector"] {
+                let response = svc
+                    .setattr(Request::new(SetattrRequest {
+                        path: path.into(),
+                        entry_type: 2,
+                        backend_type: backend_type.into(),
+                        ..Default::default()
+                    }))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert!(
+                    response.is_error,
+                    "missing local_root must fail: {response:?}"
+                );
+                assert!(!response.created);
+            }
+        }
         let read = svc
-            .read(tonic::Request::new(ReadRequest {
+            .read(Request::new(ReadRequest {
                 path: "/seed.txt".into(),
-                auth_token: "test-key".into(),
-                timeout_ms: 0,
                 ..Default::default()
             }))
             .await
-            .expect("read rpc ok")
+            .unwrap()
             .into_inner();
-        assert!(!read.is_error, "boot mount was clobbered: {read:?}");
+        assert!(!read.is_error);
         assert_eq!(read.content, b"alive");
     }
 
-    /// A local-host `backend_type` at a NON-root path synthetic-acks (like the
-    /// root remount): the host binary serves the path through its `/` host-fs
-    /// mount, so the write falls through and lands on disk. This is the
-    /// established behavior the self-contained e2e suite relies on — it mounts
-    /// `cas-local` at `/files` over gRPC, then writes/reads it.
     #[tokio::test]
-    async fn setattr_dt_mount_non_root_local_backend_acks() {
-        let kernel = std::sync::Arc::new(kernel_with_mem_backend());
-        let svc = VfsServiceImpl::for_test(kernel);
+    async fn setattr_dt_mount_local_writes_requested_directory() {
+        let _ = set_provider(Arc::new(TestBackendProvider));
+        let directory = tempfile::tempdir().unwrap();
+        let kernel = Arc::new(kernel_with_mem_backend());
+        let svc = VfsServiceImpl::for_test(kernel.clone());
+        let response = svc
+            .setattr(Request::new(SetattrRequest {
+                path: "/workspace".into(),
+                entry_type: 2,
+                backend_type: "path_local".into(),
+                backend_name: "local".into(),
+                backend_params: HashMap::from([
+                    (
+                        "local_root".into(),
+                        directory.path().to_str().unwrap().into(),
+                    ),
+                    ("fsync".into(), "true".into()),
+                ]),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!response.is_error, "mount failed: {response:?}");
+        assert!(response.created);
 
-        for bt in ["path_local", "cas-local", "local_connector"] {
-            let resp = svc
-                .setattr(tonic::Request::new(SetattrRequest {
-                    path: "/files".into(),
-                    auth_token: "test-key".into(),
-                    entry_type: 2,
-                    backend_name: "local".into(),
-                    backend_type: bt.into(),
-                    ..Default::default()
-                }))
-                .await
-                .expect("setattr rpc ok")
-                .into_inner();
-            assert!(
-                !resp.is_error,
-                "non-root local DT_MOUNT {bt:?} must ack, not error: {resp:?}"
-            );
-            assert!(!resp.created, "local DT_MOUNT is a synthetic ack: {resp:?}");
-        }
+        let ctx = OperationContext::new("test", "root", true, None, true);
+        let bytes: Vec<u8> = (0..=255).collect();
+        KernelSyscall::sys_write(&*kernel, "/workspace/binary.bin", &ctx, &bytes, 0).unwrap();
+        assert_eq!(
+            std::fs::read(directory.path().join("binary.bin")).unwrap(),
+            bytes
+        );
+        let read = svc
+            .read(Request::new(ReadRequest {
+                path: "/workspace/binary.bin".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!read.is_error);
+        assert_eq!(read.content, bytes);
     }
 
     /// metadata-only / federation DT_MOUNTs (empty `backend_type`) keep the
