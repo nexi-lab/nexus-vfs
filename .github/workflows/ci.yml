@@ -24,6 +24,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache: false
+      - uses: ./.github/actions/setup-protoc
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-local-mounts-${{ matrix.os }}
