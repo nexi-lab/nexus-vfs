@@ -60,9 +60,11 @@ fn main() {
         let tls = node_dir.join("tls");
         std::fs::create_dir_all(&tls).expect("mkdir tls");
         std::fs::write(tls.join("ca.pem"), &ca_pem).expect("write ca.pem");
-        std::fs::write(tls.join("ca-key.pem"), &ca_key_pem).expect("write ca-key.pem");
+        lib::transport_primitives::write_secret(&tls.join("ca-key.pem"), &ca_key_pem)
+            .expect("write ca-key.pem");
         std::fs::write(tls.join("node.pem"), &cert).expect("write node.pem");
-        std::fs::write(tls.join("node-key.pem"), &key).expect("write node-key.pem");
+        lib::transport_primitives::write_secret(&tls.join("node-key.pem"), &key)
+            .expect("write node-key.pem");
         std::fs::write(tls.join("join-token-hash"), "0".repeat(64)).expect("write join-token-hash");
         std::fs::write(node_dir.join(".node_id"), id.to_be_bytes()).expect("write .node_id");
         println!(
