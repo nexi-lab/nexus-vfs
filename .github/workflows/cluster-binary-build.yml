@@ -135,6 +135,23 @@ jobs:
         shell: bash
         run: target/release/${{ matrix.binary }} --help
 
+      - uses: actions/setup-node@v4
+        if: ${{ !matrix.target }}
+        with:
+          node-version: '22'
+
+      - name: Install the native client
+        if: ${{ !matrix.target }}
+        working-directory: clients/node
+        run: npm ci
+
+      - name: Verify local mount storage and cold restart
+        if: ${{ !matrix.target }}
+        working-directory: clients/node
+        env:
+          NEXUS_LOCAL_MOUNT_BINARY: ${{ github.workspace }}/target/release/${{ matrix.binary }}
+        run: node --test test/local-mount.test.mjs
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
