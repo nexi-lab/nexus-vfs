@@ -1274,6 +1274,15 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         &self,
         command: Command,
     ) -> Result<oneshot::Receiver<Result<CommandResult>>> {
+        // The metadata transaction is a foundation, not an activated zone
+        // protocol. Refuse before serialization/forwarding: mixed members may
+        // not even decode the new enum variant. A future activation gate must
+        // replace this refusal only after membership and storage are enforced.
+        if matches!(&command, Command::WriteVersionedMetadata { .. }) {
+            return Err(RaftError::Config(
+                "conditional metadata proposals are not activated".into(),
+            ));
+        }
         if !self.is_leader() {
             return Err(RaftError::NotLeader {
                 leader_hint: self.leader_hint_addr(),

@@ -156,6 +156,16 @@ skipped protected entries, apply unrelated entries, and leave both the managed
 image and its allocator absent. This is a node/RPC boundary check, not public
 file-CAS or mixed-version acceptance.
 
+The generic `Propose.raw_command` RPC is an additional submission boundary:
+absence of a dedicated file RPC does not prevent it from decoding the new
+internal command. An initial real-RPC check demonstrated a successful proposal
+whose legacy response adapter refused only after apply. Both the generic RPC
+and local submission now reject `WriteVersionedMetadata` before enqueueing it;
+the RPC returns UNIMPLEMENTED for direct and forwarded requests. The fixture
+checks that neither the Raft log nor the conditional image/allocator changes.
+State-machine tests can still exercise the isolated apply transaction directly.
+These refusals must remain until an enforced protocol activation replaces them.
+
 This foundation still does not complete N2. Before exposing any file capability:
 
 - Every voter and learner must implement the policy and the command encoding.
@@ -183,6 +193,36 @@ the current path and then attaches the caller's earlier metadata generation.
 That is not a versioned snapshot. The conditional capability must fetch the exact
 immutable object through the existing hash/chunk transport, or fail. It must not
 fall through to a current-path fetch with an old generation.
+
+### Activation review: membership alone is insufficient
+
+The next source design must cover bootstrap, snapshot installation, reopen,
+auto-join and live messages as well as the central ConfChange driver. A member
+can restart an old binary with the same identity and directory without any
+membership change. Its Raft ACK does not prove that it can decode or apply a new
+command. Class support must therefore be enforced at authenticated live-message
+boundaries, including votes and acknowledgements; rejecting such a peer can make
+a two-voter zone unavailable, which is preferable to silently counting it.
+
+A reserved zone-id form can select a protocol class but cannot prove its
+semantics: old creation paths accept arbitrary strings. An authoritative class
+and incarnation declaration must instead be established through the existing SC
+log/control-state machinery before data, then checked on joins, snapshots and
+reopen. The activation decision must carry its verified membership and compare
+it against membership at the same log position; a preflight check can race a
+previously proposed ConfChange. No second registry or daemon is proposed.
+
+Current StepMessage routing trusts the message's self-reported sender id after
+transport authentication. The managed class needs a binding from the actual
+current local-cluster mTLS Node identity to that Raft sender before accepting
+its class proof, votes or ACKs. Missing, old, foreign, agent and mismatched
+identities must fail closed. A version string or a zone name is not this proof.
+The same policy must cover witnesses and EC ingress, not just JoinZone.
+
+These are review constraints, not implemented activation. A supported restore or
+replacement must establish a new replicated incarnation; the local wall-clock
+creation marker and force-recreate escape hatch cannot supply it. Out-of-band
+rollback of the complete cluster is not claimed safe by this proposal.
 
 ## Delivery slices and required evidence
 

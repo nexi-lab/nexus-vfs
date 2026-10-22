@@ -891,6 +891,15 @@ impl ZoneApiService for ZoneApiServiceImpl {
             }
         };
 
+        // raw_command is also reachable over the generic public Propose RPC.
+        // A missing dedicated file RPC does not isolate an enum variant. Return
+        // a definite refusal before either direct or forwarded submission.
+        if matches!(&cmd, Command::WriteVersionedMetadata { .. }) {
+            return Err(Status::unimplemented(
+                "conditional metadata proposals are not activated",
+            ));
+        }
+
         // Use submit_to_channel (leader-only, no forwarding) for forwarded
         // requests to prevent infinite loops. For direct requests, use
         // propose() which may forward to leader transparently.

@@ -5,7 +5,9 @@
 mod common;
 
 use nexus_raft::prelude::Command;
-use nexus_raft::transport::proto::EcReplicationEntry;
+use nexus_raft::transport::proto::{
+    zone_api_service_client::ZoneApiServiceClient, EcReplicationEntry, ProposeRequest,
+};
 use nexus_raft::transport::{ClientConfig, RaftClient};
 use nexus_raft::ZoneManager;
 use std::time::Duration;
@@ -68,6 +70,39 @@ async fn protected_ec_is_refused_before_wal_and_acknowledged_without_blocking_re
     .await
     .expect("isolated one-voter fixture must elect itself");
     let node = zone.consensus_node();
+    node.read_linearizable(|_| ()).await.unwrap();
+    let log_before = node.last_index();
+    let experimental = Command::WriteVersionedMetadata {
+        key: MANAGED.into(),
+        value: b"not activated".to_vec(),
+        expected: None,
+        incarnation: [7; 16],
+    };
+    let mut api = ZoneApiServiceClient::connect(format!("http://{bind}"))
+        .await
+        .unwrap();
+    for forwarded in [false, true] {
+        let refusal = api
+            .propose(ProposeRequest {
+                command: None,
+                request_id: "unactivated-conditional-fixture".into(),
+                zone_id: ZONE.into(),
+                raw_command: bincode::serialize(&experimental).unwrap(),
+                forwarded,
+            })
+            .await
+            .expect_err("raw RPC must refuse the experimental command before proposal");
+        assert_eq!(refusal.code(), tonic::Code::Unimplemented);
+    }
+    assert!(
+        node.propose(experimental).await.is_err(),
+        "the local submission path must also reject unactivated commands"
+    );
+    assert_eq!(
+        node.last_index(),
+        log_before,
+        "no refused proposal may enter Raft"
+    );
     let before = node.ec_wal_bounds().expect("full node has an EC WAL").1;
     for command in protected_commands() {
         assert!(node.propose_ec_local(command).await.is_err());
@@ -138,6 +173,7 @@ async fn protected_ec_is_refused_before_wal_and_acknowledged_without_blocking_re
         );
     })
     .await;
+    drop(api);
     drop(client);
     manager.shutdown();
 }
