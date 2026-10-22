@@ -98,7 +98,9 @@ cannot delete the name binding.
 Token revoke-by-hash refuses agent: AND the entire credential- namespace,
 including F and future renewal intents. Token mint/revoke derive HMAC hex
 keys and cannot address these reserved keys. Supported legacy upsert/delete
-paths cannot erase I or F. Old issuer binaries/raw operator store mutation
+paths cannot erase I or F. The HTTP DELETE endpoint uses the same guarded
+revoke function instead of its former direct store.delete; reserved targets
+return HTTP 400, including absent/future records. Old issuer binaries/raw operator store mutation
 are outside this invariant: authoritative writers must be upgraded before
 future RPC enablement. No running writer is upgraded by this slice.
 
@@ -117,7 +119,9 @@ wrapper would otherwise discard the backend CAS.
   reserved deletes, malformed schemas and unsupported stores failing closed.
 - Readers: real legacy decoding and token provider/cache rejection of
   incomplete prefixes; ordinary legacy authentication, invalidation and
-  rotation stay compatible. This does not pretend the token fixture tests
+  rotation stay compatible. Actual HTTP admin DELETE preserves reserved
+  records; HTTP listing retains the expired prefix and skips F's schema.
+  This does not pretend the token fixture tests
   the independent certificate identity plane.
 - Composition: real one-voter Raft through KernelSlotStore; eight distinct
   CSR operations/one unsigned winner; concurrent real ECDSA finalizers;

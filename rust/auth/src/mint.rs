@@ -110,14 +110,12 @@ pub fn agent_store_key(name: &str) -> String {
     format!("agent:{name}")
 }
 
-/// Record the authorization grants for a cert-authenticated agent.
+/// Reserve the stable name and audit record for a cert-authenticated agent.
 ///
-/// Parallel to [`mint_key`] but for the agent-cert plane: the identity IS the
-/// cert (minted by the caller, who holds the CA), so this records only the
-/// agent's grants — `zone_perms`, expiry, revoked — keyed by [`agent_store_key`].
-/// The provider resolves an agent-cert peer's `agent_id` from the cert SAN and
-/// its authorization from this record; revocation flips the `revoked` flag (or
-/// deletes the record) exactly as for an `sk-` key.
+/// Certificate identity/lifetime and CRL govern authentication; this record
+/// enforces name uniqueness, not the certificate-provider hot path. Supported
+/// token revocation cannot delete this permanent name binding. Legacy rotation
+/// may update a legacy row, but never a managed lifecycle intent or receipt.
 ///
 /// Enforces the same one-active-credential-per-subject uniqueness as
 /// [`mint_key`] (unless `allow_existing`, the rotation escape): two records
