@@ -7,7 +7,7 @@
 //! Storage layout:
 //!     root / "cas" / hash[0..2] / hash[2..4] / hash
 
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -25,6 +25,34 @@ pub(crate) fn blob_key(content_id: &str) -> String {
         &content_id[2..4],
         content_id
     )
+}
+
+/// Existence alone is not a deduplication proof: an interrupted legacy write
+/// can leave a partial file at the final hash path. Stream the existing bytes
+/// before accepting them, and propagate errors rather than overwriting them.
+/// This is an integrity check, not an atomic publication/reservation primitive.
+fn validated_existing_blob(path: &Path, content_id: &str) -> io::Result<bool> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    if hasher.finalize().to_hex().as_str() != content_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "existing CAS object does not match its content hash",
+        ));
+    }
+    Ok(true)
 }
 
 /// Pure Rust CAS transport for local filesystem blob I/O.
@@ -100,7 +128,7 @@ impl LocalCASTransport {
 
     /// Write content to CAS, returning the BLAKE3 content hash.
     ///
-    /// CAS dedup: if the blob already exists, the write is skipped entirely.
+    /// CAS dedup skips a write only after the existing object's hash is verified.
     ///
     /// Corresponds to Python `CASAddressingEngine.write_content()` (hash) +
     /// `LocalTransport.store()` (I/O).
@@ -117,8 +145,7 @@ impl LocalCASTransport {
         let key = blob_key(&hash);
         let path = self.resolve(&key);
 
-        // CAS dedup: if blob already exists, skip write
-        if path.exists() {
+        if validated_existing_blob(&path, &hash)? {
             return Ok((hash, false));
         }
 
@@ -148,11 +175,16 @@ impl LocalCASTransport {
     /// bloom filter check). Returns `true` if the blob was actually written,
     /// `false` if it already existed (CAS dedup).
     pub fn write_blob_with_hash(&self, content: &[u8], content_id: &str) -> io::Result<bool> {
+        if lib::hash::hash_content(content) != content_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "supplied CAS content hash does not match the input bytes",
+            ));
+        }
         let key = blob_key(content_id);
         let path = self.resolve(&key);
 
-        // CAS dedup
-        if path.exists() {
+        if validated_existing_blob(&path, content_id)? {
             return Ok(false);
         }
 
