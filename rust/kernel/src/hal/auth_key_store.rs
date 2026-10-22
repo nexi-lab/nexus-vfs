@@ -117,7 +117,8 @@ pub trait AuthKeyStore: Send + Sync {
     /// The default is a best-effort get-then-put, which is a TOCTOU under
     /// concurrent writers. A replicated impl (`RaftAuthKeyStore`) OVERRIDES it
     /// with a log-ordered apply-time CAS so uniqueness holds even when two nodes
-    /// mint the same name at once — the guarantee `mint_agent_authz` relies on.
+    /// mint the same name at once. New durable name/issuance writers use the
+    /// strict `put_if_absent_atomic` method below and never this default.
     fn put_if_absent(&self, key_hash: &str, record: &[u8]) -> Result<bool, AuthKeyStoreError> {
         if self.get(key_hash)?.is_some() {
             return Ok(false);

@@ -105,3 +105,25 @@ fn changed_or_mismatched_issuer_cannot_finalize_the_intent() {
     assert!(sign_committed_agent_intent(&intent, &ca, &other_key).is_err());
     assert!(sign_committed_agent_intent(&intent, &other_ca, &key).is_err());
 }
+
+#[test]
+fn unsigned_and_signed_intents_enforce_size_and_validity_bounds() {
+    let (intent, ca, key) = fixture();
+    let mut too_large = intent.clone();
+    too_large.tbs_certificate_der = vec![0; 16 * 1024 + 1];
+    assert!(sign_committed_agent_intent(&too_large, &ca, &key).is_err());
+    let mut too_large = intent.clone();
+    too_large.subject_public_key_info_der = vec![0; 1025];
+    assert!(sign_committed_agent_intent(&too_large, &ca, &key).is_err());
+    let mut expired = intent.clone();
+    expired.not_after_unix_s = expired.not_before_unix_s;
+    assert!(sign_committed_agent_intent(&expired, &ca, &key).is_err());
+    let mut extended = intent.clone();
+    extended.not_after_unix_s = extended.not_before_unix_s + 90 * 86400 + 1;
+    assert!(sign_committed_agent_intent(&extended, &ca, &key).is_err());
+    let mut oversized_pem = ca.clone();
+    oversized_pem.resize(64 * 1024 + 1, b' ');
+    assert!(public_issuer(&oversized_pem).is_err());
+    let issuer = ::pem::encode(&::pem::Pem::new("CERTIFICATE", vec![0; 16 * 1024 + 1]));
+    assert!(public_issuer(issuer.as_bytes()).is_err());
+}

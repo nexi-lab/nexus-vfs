@@ -372,6 +372,34 @@ fn absent_query_is_only_not_observed_and_does_not_sign_or_elect() {
 }
 
 #[test]
+fn legacy_name_creation_never_uses_a_backends_weaker_default_cas() {
+    struct AtomicOnly;
+    impl AuthKeyStore for AtomicOnly {
+        fn get(&self, _: &str) -> Result<Option<Vec<u8>>, AuthKeyStoreError> {
+            Ok(None)
+        }
+        fn put(&self, _: &str, _: &[u8]) -> Result<(), AuthKeyStoreError> {
+            panic!("legacy get-then-put would erase I")
+        }
+        fn put_if_absent_atomic(&self, _: &str, _: &[u8]) -> Result<bool, AuthKeyStoreError> {
+            Ok(false)
+        }
+        fn delete(&self, _: &str) -> Result<bool, AuthKeyStoreError> {
+            unreachable!()
+        }
+        fn list(&self) -> Result<Vec<(String, Vec<u8>)>, AuthKeyStoreError> {
+            unreachable!()
+        }
+    }
+    let store: Arc<dyn AuthKeyStore> = Arc::new(AtomicOnly);
+    assert!(mint_agent_authz(&store, authorization(), false).is_err());
+    assert!(mint_agent_authz(&store, authorization(), true).is_err());
+    let unsupported = kernel::hal::auth_key_store::NoopAuthKeyStore::arc();
+    assert!(mint_agent_authz(&unsupported, authorization(), false).is_err());
+    assert!(mint_agent_authz(&unsupported, authorization(), true).is_err());
+}
+
+#[test]
 fn legacy_upsert_and_token_delete_cannot_erase_intent_final_or_future_reserved_keys() {
     let (_, store) = memory();
     let policy = Policy::default();

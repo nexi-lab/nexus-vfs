@@ -152,7 +152,10 @@ pub fn mint_agent_authz(
     // minting the same name concurrently can never both win. (Agent records are
     // never deleted — revocation is CRL-based — and there is one record per
     // name, so "key present" IS "name taken".)
-    if store.put_if_absent(&key, &bytes)? {
+    // The legacy trait default is get-then-put. Even a backend with strict
+    // lifecycle CAS could inherit it, allowing this route to erase a racing
+    // managed intent. Unsupported backends must refuse name creation.
+    if store.put_if_absent_atomic(&key, &bytes)? {
         Ok(())
     } else {
         Err(AuthKeyStoreError::Backend(format!(
@@ -237,6 +240,16 @@ mod tests {
                 .lock()
                 .insert(key_hash.to_string(), record.to_vec());
             Ok(())
+        }
+        fn put_if_absent_atomic(&self, key: &str, bytes: &[u8]) -> Result<bool, AuthKeyStoreError> {
+            use std::collections::btree_map::Entry;
+            match self.records.lock().entry(key.into()) {
+                Entry::Occupied(_) => Ok(false),
+                Entry::Vacant(entry) => {
+                    entry.insert(bytes.to_vec());
+                    Ok(true)
+                }
+            }
         }
         fn delete(&self, key_hash: &str) -> Result<bool, AuthKeyStoreError> {
             Ok(self.records.lock().remove(key_hash).is_some())

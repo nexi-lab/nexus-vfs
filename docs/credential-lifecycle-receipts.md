@@ -105,7 +105,11 @@ are outside this invariant: authoritative writers must be upgraded before
 future RPC enablement. No running writer is upgraded by this slice.
 
 Strict atomic CAS and linearizable read APIs default to errors, never weak
-fallbacks. Raft uses existing apply-time CAS/ReadIndex. KernelSlotStore
+fallbacks. Legacy new-name mint also requires strict CAS: inheriting the
+trait's weaker get-then-put cannot erase a managed insert even on a backend
+that implements only the strict method. Unsupported stores refuse creation;
+existing readable legacy rotations remain compatible.
+Raft uses existing apply-time CAS/ReadIndex. KernelSlotStore
 forwards those plus the legacy CAS; its old trait-default get-then-put
 wrapper would otherwise discard the backend CAS.
 
