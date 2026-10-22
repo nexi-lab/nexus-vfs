@@ -2,13 +2,10 @@
 //!
 //! ``LocalLocks`` mutates the shared ``Arc<Mutex<LockState>>`` directly
 //! — no replication. It is the kernel's default backend, used in
-//! standalone deployments and as the boot-time default before the
-//! distributed-coordinator HAL installs a replicated backend (if
-//! configured). The trait boundary ``Arc<dyn contracts::Locks>``
-//! keeps the kernel free of any HAL-impl concrete type — replicated
-//! backends live in their own crate and are wired in via
-//! ``Kernel::install_locks`` at nexus init time (first-wins,
-//! idempotent).
+//! standalone deployments. A distributed kernel resolves its per-zone
+//! backend through the coordinator instead of promoting this map into a
+//! replicated zone. The trait boundary ``Arc<dyn contracts::Locks>`` keeps
+//! the kernel free of any HAL-impl concrete type.
 
 use std::sync::Arc;
 
@@ -28,11 +25,9 @@ pub struct LocalLocks {
 
 impl LocalLocks {
     /// Construct a LocalLocks that shares ``state`` with whoever owns
-    /// the Arc (typically the kernel's own ``LockManager``). When the
-    /// backend is later swapped for a replicated HAL impl, the kernel
-    /// hands the current state Arc to that impl's constructor so
-    /// existing holders are not lost — the impl merges them into its
-    /// own map under the same mutex discipline.
+    /// the Arc (typically the embedded kernel's own ``LockManager``).
+    /// A replicated zone owns its own state; these local holders are not
+    /// imported into a distributed domain.
     pub fn new(state: Arc<Mutex<LockState>>) -> Self {
         Self { state }
     }

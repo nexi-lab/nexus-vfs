@@ -72,17 +72,26 @@ class VFSSemaphore:
 
 Advisory locks and I/O locks are **fundamentally different concerns**.
 
-### 3.1 Why No Router
+### 3.1 I/O serialization and advisory domains
 
-1. **Writes converge**: In all deployment modes (standalone, REMOTE, federation),
-   writes to the same path converge to a single process. VFSLockManager
-   (in-memory, ~200ns) is sufficient for I/O serialization.
-2. **Advisory locks ARE metadata**: Like HDFS leases in the NameNode's
-   FSImage+EditLog, advisory locks should live in the metastore — visible,
-   queryable, Raft-replicated in federation, persistent with TTL cleanup.
-3. **Factory DI suffices**: `factory.py` injects `LocalLockManager` (standalone)
-   or `RaftLockManager` (federation). Both implement `LockManagerBase`.
-   No runtime routing needed.
+I/O serialization stays node-local. Advisory coordination follows the VFS mount
+projection in `rust/kernel/src/kernel/locks.rs`: one route supplies the resolved
+zone and its subtree-relative key. The kernel obtains the zone's backend through
+`DistributedCoordinator::locks_for_zone`; the raft implementation binds it to that
+zone's existing apply-owned lock state.
+
+Each node's `root` is an independent SOLO zone. A process-wide backend bound to
+`root` therefore cannot provide cross-node exclusion merely because the lock's
+string begins with `/agents`. `/agents/a/receiver` must use the shared zone's
+`/agents/a/receiver` key. A whole-zone alias such as `/sharedzone/agents/a/receiver`
+contends on that same key, while `/conversations/a/receiver` is a different key.
+Node-private root paths remain independent across nodes.
+
+Acquire, renew and release use the same projection. Stat and the administrator's
+synthetic lock view query those same domains and project keys back to visible
+paths. Reads observe locally applied state; they do not claim ReadIndex freshness.
+A shared mount without an available distributed backend fails instead of silently
+using a node-local table. Bare embedded kernels retain their local backend.
 
 ### 3.2 Two Locks
 
@@ -110,13 +119,24 @@ TTL expires → auto-released. No orphans.
 // Rust Kernel::new() creates LockManager (kernel owns)
 lock_manager: Arc<LockManager>,  // local VFSSemaphore by default
 
-// Federation: auto-upgrade at DLC mount time when Raft handle provided
-// Kernel::add_mount() with raft_backend → lock_manager.upgrade_to_distributed()
+// Federation: advisory syscall routes path → (zone, subtree key).
+// DistributedCoordinator::locks_for_zone(zone) → that zone's Locks backend.
 ```
 
-Rust `LockManager` owns both I/O and advisory lock state. Federation upgrade
-happens automatically when `sys_setattr(DT_MOUNT)` provides a `ZoneConsensus`
-handle — no Python factory wiring needed.
+Rust `LockManager` owns I/O serialization and the embedded local advisory fallback.
+Federated advisory state belongs to each zone's consensus. Mount wiring never
+copies local holders into a replicated map or installs the first zone as the
+backend for every other zone.
+
+This is advisory exclusion, not a fenced write transaction. A successful renew
+followed by a separate write does not stop a paused old holder from writing after
+lease takeover. Consumers that persist cursors need an atomic conditional commit
+and a precise handover point. Do not claim exactly-once effects from this lock API.
+
+Upgrade all participating nodes before claiming cross-node exclusion: an old node
+still using its private root does not participate in the new shared lock domain.
+Lease holders using the old domain must stop or lose ownership during cutover;
+their rows must not be copied into another consensus group's state.
 
 Exposed via kernel syscalls:
 - `sys_lock(path, lock_id=None)` — acquire (lock_id=None) or extend TTL (lock_id=existing)
