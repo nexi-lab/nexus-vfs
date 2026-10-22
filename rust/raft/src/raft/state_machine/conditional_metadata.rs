@@ -47,6 +47,196 @@ pub struct VersionedMetadata {
     pub version: Option<Vec<u8>>,
 }
 
+fn revision_key(path: &str) -> Vec<u8> {
+    control_key(NAMESPACE, &format!("{PATH_PREFIX}{path}"))
+}
+
+fn storage_error(error: impl std::fmt::Display) -> super::super::RaftError {
+    super::super::RaftError::Storage(format!("conditional metadata: {error}"))
+}
+
+impl FullStateMachine {
+    /// Read metadata and revision in one redb snapshot. A present untracked
+    /// legacy key is refused. Reading must NEVER enrol a replica-local image.
+    /// Migration creates a verified image in a new managed namespace instead.
+    pub fn get_versioned_metadata(&self, key: &str) -> Result<VersionedMetadata> {
+        Self::require_managed_key(key)?;
+        let txn = self.metadata.raw_db().begin_read().map_err(storage_error)?;
+        let metadata = txn
+            .open_table(redb::TableDefinition::<&[u8], &[u8]>::new(
+                self.metadata.name(),
+            ))
+            .map_err(storage_error)?;
+        let versions = txn
+            .open_table(redb::TableDefinition::<&[u8], &[u8]>::new(
+                self.control_state.name(),
+            ))
+            .map_err(storage_error)?;
+        let value = metadata
+            .get(key.as_bytes())
+            .map_err(storage_error)?
+            .map(|v| v.value().to_vec());
+        let version = versions
+            .get(revision_key(key).as_slice())
+            .map_err(storage_error)?
+            .map(|v| v.value().to_vec());
+        Self::versioned_image(value, version)
+    }
+
+    fn versioned_image(
+        value: Option<Vec<u8>>,
+        version: Option<Vec<u8>>,
+    ) -> Result<VersionedMetadata> {
+        if value.is_none() {
+            return Ok(VersionedMetadata::default());
+        }
+        if version.as_ref().is_none_or(|v| v.len() != TOKEN_LEN) {
+            return Err(super::super::RaftError::InvalidState(
+                "metadata key has no committed content revision".into(),
+            ));
+        }
+        Ok(VersionedMetadata { value, version })
+    }
+
+    fn require_managed_key(key: &str) -> Result<()> {
+        if is_managed_key(key) {
+            Ok(())
+        } else {
+            Err(super::super::RaftError::InvalidState(
+                "conditional content unsupported outside the managed metadata subtree".into(),
+            ))
+        }
+    }
+
+    fn metadata_in_txn(&self, txn: &redb::WriteTransaction, key: &str) -> Result<Option<Vec<u8>>> {
+        let table = txn
+            .open_table(redb::TableDefinition::<&[u8], &[u8]>::new(
+                self.metadata.name(),
+            ))
+            .map_err(storage_error)?;
+        let value = table
+            .get(key.as_bytes())
+            .map_err(storage_error)?
+            .map(|v| v.value().to_vec());
+        Ok(value)
+    }
+
+    fn revision_in_txn(&self, txn: &redb::WriteTransaction, key: &str) -> Result<Option<Vec<u8>>> {
+        let table = txn
+            .open_table(redb::TableDefinition::<&[u8], &[u8]>::new(
+                self.control_state.name(),
+            ))
+            .map_err(storage_error)?;
+        let value = table
+            .get(revision_key(key).as_slice())
+            .map_err(storage_error)?
+            .map(|v| v.value().to_vec());
+        Ok(value)
+    }
+
+    /// Allocate at apply, in the transaction that publishes the pointer. No
+    /// wall clock, per-node counter, local creation marker or path hash enters
+    /// the token. Every replica consumes the same committed incarnation.
+    fn allocate_revision(
+        &self,
+        txn: &redb::WriteTransaction,
+        key: &str,
+        initial: Option<[u8; 16]>,
+    ) -> Result<Vec<u8>> {
+        let mut table = txn
+            .open_table(redb::TableDefinition::<&[u8], &[u8]>::new(
+                self.control_state.name(),
+            ))
+            .map_err(storage_error)?;
+        let allocator_key = control_key(NAMESPACE, ALLOCATOR);
+        let previous = table
+            .get(allocator_key.as_slice())
+            .map_err(storage_error)?
+            .map(|v| v.value().to_vec());
+        let mut token = match previous {
+            Some(token) if token.len() == TOKEN_LEN => token,
+            Some(_) => return Err(storage_error("invalid revision allocator")),
+            None => {
+                let incarnation = initial.ok_or_else(|| storage_error("missing allocator"))?;
+                let mut token = incarnation.to_vec();
+                token.extend_from_slice(&0_u64.to_be_bytes());
+                token
+            }
+        };
+        let counter = u64::from_be_bytes(token[16..].try_into().expect("validated token length"));
+        let next = counter
+            .checked_add(1)
+            .ok_or_else(|| storage_error("content revision space exhausted"))?;
+        token[16..].copy_from_slice(&next.to_be_bytes());
+        table
+            .insert(allocator_key.as_slice(), token.as_slice())
+            .map_err(storage_error)?;
+        table
+            .insert(revision_key(key).as_slice(), token.as_slice())
+            .map_err(storage_error)?;
+        Ok(token)
+    }
+
+    /// Ordinary SC writes, including byte-identical replacements and deletes,
+    /// invalidate a previously observed token. They do not opt unrelated keys
+    /// into conditional semantics. This is called inside their apply txn.
+    pub(super) fn refresh_tracked_version(
+        &self,
+        txn: &redb::WriteTransaction,
+        key: &str,
+    ) -> Result<()> {
+        if self.revision_in_txn(txn, key)?.is_some() {
+            self.allocate_revision(txn, key, None)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn write_versioned_in_txn(
+        &self,
+        txn: &redb::WriteTransaction,
+        key: &str,
+        value: &[u8],
+        expected: Option<&[u8]>,
+        incarnation: [u8; 16],
+    ) -> Result<CommandResult> {
+        if !is_managed_key(key) {
+            return Ok(CommandResult::Error(
+                "conditional content unsupported outside the managed metadata subtree".into(),
+            ));
+        }
+        let current = self.metadata_in_txn(txn, key)?;
+        let version = self.revision_in_txn(txn, key)?;
+        // The first image MUST travel in the SC create command. An occupied
+        // unversioned legacy key is not eligible for automatic admission.
+        if current.is_some() && version.is_none() {
+            return Ok(CommandResult::Error(
+                "conditional content unsupported for an occupied unversioned legacy key".into(),
+            ));
+        }
+        let current = Self::versioned_image(current, version)?;
+        if current.version.as_deref() != expected {
+            return Ok(CommandResult::ConditionalMetadata {
+                committed: false,
+                current,
+            });
+        }
+        let version = self.allocate_revision(txn, key, Some(incarnation))?;
+        let mut table = txn
+            .open_table(redb::TableDefinition::<&[u8], &[u8]>::new(
+                self.metadata.name(),
+            ))
+            .map_err(storage_error)?;
+        table.insert(key.as_bytes(), value).map_err(storage_error)?;
+        Ok(CommandResult::ConditionalMetadata {
+            committed: true,
+            current: VersionedMetadata {
+                value: Some(value.to_vec()),
+                version: Some(version),
+            },
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,195 +700,5 @@ mod tests {
             sm.get_control_state(NAMESPACE, ALLOCATOR).unwrap(),
             allocator
         );
-    }
-}
-
-fn revision_key(path: &str) -> Vec<u8> {
-    control_key(NAMESPACE, &format!("{PATH_PREFIX}{path}"))
-}
-
-fn storage_error(error: impl std::fmt::Display) -> super::super::RaftError {
-    super::super::RaftError::Storage(format!("conditional metadata: {error}"))
-}
-
-impl FullStateMachine {
-    /// Read metadata and revision in one redb snapshot. A present untracked
-    /// legacy key is refused. Reading must NEVER enrol a replica-local image.
-    /// Migration creates a verified image in a new managed namespace instead.
-    pub fn get_versioned_metadata(&self, key: &str) -> Result<VersionedMetadata> {
-        Self::require_managed_key(key)?;
-        let txn = self.metadata.raw_db().begin_read().map_err(storage_error)?;
-        let metadata = txn
-            .open_table(redb::TableDefinition::<&[u8], &[u8]>::new(
-                self.metadata.name(),
-            ))
-            .map_err(storage_error)?;
-        let versions = txn
-            .open_table(redb::TableDefinition::<&[u8], &[u8]>::new(
-                self.control_state.name(),
-            ))
-            .map_err(storage_error)?;
-        let value = metadata
-            .get(key.as_bytes())
-            .map_err(storage_error)?
-            .map(|v| v.value().to_vec());
-        let version = versions
-            .get(revision_key(key).as_slice())
-            .map_err(storage_error)?
-            .map(|v| v.value().to_vec());
-        Self::versioned_image(value, version)
-    }
-
-    fn versioned_image(
-        value: Option<Vec<u8>>,
-        version: Option<Vec<u8>>,
-    ) -> Result<VersionedMetadata> {
-        if value.is_none() {
-            return Ok(VersionedMetadata::default());
-        }
-        if version.as_ref().is_none_or(|v| v.len() != TOKEN_LEN) {
-            return Err(super::super::RaftError::InvalidState(
-                "metadata key has no committed content revision".into(),
-            ));
-        }
-        Ok(VersionedMetadata { value, version })
-    }
-
-    fn require_managed_key(key: &str) -> Result<()> {
-        if is_managed_key(key) {
-            Ok(())
-        } else {
-            Err(super::super::RaftError::InvalidState(
-                "conditional content unsupported outside the managed metadata subtree".into(),
-            ))
-        }
-    }
-
-    fn metadata_in_txn(&self, txn: &redb::WriteTransaction, key: &str) -> Result<Option<Vec<u8>>> {
-        let table = txn
-            .open_table(redb::TableDefinition::<&[u8], &[u8]>::new(
-                self.metadata.name(),
-            ))
-            .map_err(storage_error)?;
-        let value = table
-            .get(key.as_bytes())
-            .map_err(storage_error)?
-            .map(|v| v.value().to_vec());
-        Ok(value)
-    }
-
-    fn revision_in_txn(&self, txn: &redb::WriteTransaction, key: &str) -> Result<Option<Vec<u8>>> {
-        let table = txn
-            .open_table(redb::TableDefinition::<&[u8], &[u8]>::new(
-                self.control_state.name(),
-            ))
-            .map_err(storage_error)?;
-        let value = table
-            .get(revision_key(key).as_slice())
-            .map_err(storage_error)?
-            .map(|v| v.value().to_vec());
-        Ok(value)
-    }
-
-    /// Allocate at apply, in the transaction that publishes the pointer. No
-    /// wall clock, per-node counter, local creation marker or path hash enters
-    /// the token. Every replica consumes the same committed incarnation.
-    fn allocate_revision(
-        &self,
-        txn: &redb::WriteTransaction,
-        key: &str,
-        initial: Option<[u8; 16]>,
-    ) -> Result<Vec<u8>> {
-        let mut table = txn
-            .open_table(redb::TableDefinition::<&[u8], &[u8]>::new(
-                self.control_state.name(),
-            ))
-            .map_err(storage_error)?;
-        let allocator_key = control_key(NAMESPACE, ALLOCATOR);
-        let previous = table
-            .get(allocator_key.as_slice())
-            .map_err(storage_error)?
-            .map(|v| v.value().to_vec());
-        let mut token = match previous {
-            Some(token) if token.len() == TOKEN_LEN => token,
-            Some(_) => return Err(storage_error("invalid revision allocator")),
-            None => {
-                let incarnation = initial.ok_or_else(|| storage_error("missing allocator"))?;
-                let mut token = incarnation.to_vec();
-                token.extend_from_slice(&0_u64.to_be_bytes());
-                token
-            }
-        };
-        let counter = u64::from_be_bytes(token[16..].try_into().expect("validated token length"));
-        let next = counter
-            .checked_add(1)
-            .ok_or_else(|| storage_error("content revision space exhausted"))?;
-        token[16..].copy_from_slice(&next.to_be_bytes());
-        table
-            .insert(allocator_key.as_slice(), token.as_slice())
-            .map_err(storage_error)?;
-        table
-            .insert(revision_key(key).as_slice(), token.as_slice())
-            .map_err(storage_error)?;
-        Ok(token)
-    }
-
-    /// Ordinary SC writes, including byte-identical replacements and deletes,
-    /// invalidate a previously observed token. They do not opt unrelated keys
-    /// into conditional semantics. This is called inside their apply txn.
-    pub(super) fn refresh_tracked_version(
-        &self,
-        txn: &redb::WriteTransaction,
-        key: &str,
-    ) -> Result<()> {
-        if self.revision_in_txn(txn, key)?.is_some() {
-            self.allocate_revision(txn, key, None)?;
-        }
-        Ok(())
-    }
-
-    pub(super) fn write_versioned_in_txn(
-        &self,
-        txn: &redb::WriteTransaction,
-        key: &str,
-        value: &[u8],
-        expected: Option<&[u8]>,
-        incarnation: [u8; 16],
-    ) -> Result<CommandResult> {
-        if !is_managed_key(key) {
-            return Ok(CommandResult::Error(
-                "conditional content unsupported outside the managed metadata subtree".into(),
-            ));
-        }
-        let current = self.metadata_in_txn(txn, key)?;
-        let version = self.revision_in_txn(txn, key)?;
-        // The first image MUST travel in the SC create command. An occupied
-        // unversioned legacy key is not eligible for automatic admission.
-        if current.is_some() && version.is_none() {
-            return Ok(CommandResult::Error(
-                "conditional content unsupported for an occupied unversioned legacy key".into(),
-            ));
-        }
-        let current = Self::versioned_image(current, version)?;
-        if current.version.as_deref() != expected {
-            return Ok(CommandResult::ConditionalMetadata {
-                committed: false,
-                current,
-            });
-        }
-        let version = self.allocate_revision(txn, key, Some(incarnation))?;
-        let mut table = txn
-            .open_table(redb::TableDefinition::<&[u8], &[u8]>::new(
-                self.metadata.name(),
-            ))
-            .map_err(storage_error)?;
-        table.insert(key.as_bytes(), value).map_err(storage_error)?;
-        Ok(CommandResult::ConditionalMetadata {
-            committed: true,
-            current: VersionedMetadata {
-                value: Some(value.to_vec()),
-                version: Some(version),
-            },
-        })
     }
 }
