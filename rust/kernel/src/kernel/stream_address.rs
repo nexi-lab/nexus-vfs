@@ -3,7 +3,7 @@
 use crate::core::vfs_router::RouteResult;
 use crate::meta_store::DT_STREAM;
 
-use super::{validate_path_fast, Kernel, KernelError, OperationContext, StatResult};
+use super::{validate_path_fast, Kernel, KernelError, OperationContext};
 use crate::Permission;
 
 pub(crate) struct StreamAddress {
@@ -14,6 +14,14 @@ pub(crate) struct StreamAddress {
 struct ResolvedIoPath {
     path: String,
     address: StreamAddress,
+}
+
+/// An authorized I/O target, including the path of a not-yet-created entry.
+/// Entry classification carries no content bytes or content identifiers.
+#[derive(Debug, Clone)]
+pub struct IoTarget {
+    pub path: String,
+    pub entry_type: Option<u8>,
 }
 
 impl StreamAddress {
@@ -76,16 +84,22 @@ impl Kernel {
     /// Inspect the target of an I/O operation without reading its contents.
     /// The operation's permission is checked on every link spelling and on
     /// the target in its owning zone, using the same resolution as stream I/O.
-    pub fn stat_follow(
+    pub fn inspect_target(
         &self,
         path: &str,
         permission: Permission,
         ctx: &OperationContext,
-    ) -> Result<Option<StatResult>, KernelError> {
+    ) -> Result<IoTarget, KernelError> {
         let resolved = self.resolve_io_path(path, ctx, |path, route, ctx| {
             self.check_permission_with_route(path, route, permission, ctx)
         })?;
-        Ok(self.sys_stat(&resolved.path, &ctx.zone_id))
+        let entry_type = self
+            .sys_stat(&resolved.path, &ctx.zone_id)
+            .map(|stat| stat.entry_type);
+        Ok(IoTarget {
+            path: resolved.path,
+            entry_type,
+        })
     }
 
     fn resolve_io_path(

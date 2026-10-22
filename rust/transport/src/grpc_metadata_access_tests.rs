@@ -3,9 +3,10 @@ use std::sync::{Arc, Mutex};
 
 use kernel::kernel::syscall::KernelSyscall;
 use kernel::kernel::vfs_proto::{
+    inspect_target_request::Access,
     nexus_vfs_service_client::NexusVfsServiceClient,
     nexus_vfs_service_server::{NexusVfsService, NexusVfsServiceServer},
-    BatchStatRequest, ReaddirRequest, StatRequest,
+    BatchStatRequest, InspectTargetRequest, ReaddirRequest, StatRequest,
 };
 use kernel::kernel::{KernelError, OperationContext};
 use kernel::{Permission, PermissionProvider};
@@ -166,7 +167,7 @@ async fn stat_and_batch_stat_require_current_file_grants() {
 }
 
 #[tokio::test]
-async fn stat_follow_links_over_tcp_preserves_lstat_and_rechecks_target_grants() {
+async fn inspect_target_over_tcp_preserves_lstat_and_rechecks_target_grants() {
     let (service, grants) = fixture();
     let ctx = OperationContext::new("setup", "root", true, None, true);
     service
@@ -202,6 +203,72 @@ async fn stat_follow_links_over_tcp_preserves_lstat_and_rechecks_target_grants()
         .lock()
         .unwrap()
         .extend(["/alias".into(), alias.into()]);
+    let (mut client, stop, server) = serve(service).await;
+    let request = |path: &str| InspectTargetRequest {
+        path: path.into(),
+        access: Access::Read as i32,
+        ..Default::default()
+    };
+    let lstat = client
+        .stat(StatRequest {
+            path: "/alias".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!lstat.is_error && lstat.found);
+    assert_eq!(lstat.entry_type, i32::from(kernel::meta_store::DT_LINK));
+    assert_eq!(lstat.link_target, "/docs");
+    let denied = client
+        .inspect_target(request(alias))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(denied.is_error && denied.entry_type.is_none() && denied.path.is_empty());
+    grants.lock().unwrap().insert(target.into());
+    let found = client
+        .inspect_target(request(alias))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!found.is_error);
+    assert_eq!(
+        found.entry_type,
+        Some(i32::from(kernel::meta_store::DT_REG))
+    );
+    assert_eq!(found.path, target);
+    grants.lock().unwrap().remove(target);
+    let revoked = client
+        .inspect_target(request(alias))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(revoked.is_error && revoked.entry_type.is_none() && revoked.path.is_empty());
+    grants
+        .lock()
+        .unwrap()
+        .extend(["/alias/new".into(), "/docs/new".into()]);
+    let missing = client
+        .inspect_target(request("/alias/new"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!missing.is_error);
+    assert_eq!(missing.path, "/docs/new");
+    assert_eq!(missing.entry_type, None);
+    drop(client);
+    stop.send(()).unwrap();
+    server.await.unwrap();
+}
+
+async fn serve(
+    service: VfsServiceImpl,
+) -> (
+    NexusVfsServiceClient<tonic::transport::Channel>,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let (stop, stopped) = tokio::sync::oneshot::channel();
@@ -214,38 +281,73 @@ async fn stat_follow_links_over_tcp_preserves_lstat_and_rechecks_target_grants()
             .await
             .unwrap();
     });
-    let mut client = NexusVfsServiceClient::connect(endpoint).await.unwrap();
-    let request = |path: &str| StatRequest {
-        path: path.into(),
+    (
+        NexusVfsServiceClient::connect(endpoint).await.unwrap(),
+        stop,
+        server,
+    )
+}
+
+struct WriteOnly;
+impl PermissionProvider for WriteOnly {
+    fn check(
+        &self,
+        _: &str,
+        _: Option<&kernel::vfs_router::RouteResult>,
+        permission: Permission,
+        ctx: &OperationContext,
+    ) -> Result<(), KernelError> {
+        assert_eq!(ctx.subject_id.as_deref(), Some("agent-a"));
+        if matches!(permission, Permission::Write) {
+            Ok(())
+        } else {
+            Err(KernelError::PermissionDenied("write only".into()))
+        }
+    }
+}
+
+#[tokio::test]
+async fn inspect_write_target_over_tcp_does_not_require_content_read_permission() {
+    let kernel = Arc::new(kernel_with_mem_backend());
+    kernel.create_stream("/inbox", 4096).unwrap();
+    kernel.set_permission_provider(Arc::new(Box::new(WriteOnly)));
+    let mut service = VfsServiceImpl::for_test(kernel);
+    service.auth = Arc::new(AgentAuth);
+    let (mut client, stop, server) = serve(service).await;
+    let request = |access| InspectTargetRequest {
+        path: "/inbox".into(),
+        access,
         ..Default::default()
     };
-    let lstat = client.stat(request("/alias")).await.unwrap().into_inner();
-    assert!(!lstat.is_error && lstat.found);
-    assert_eq!(lstat.entry_type, i32::from(kernel::meta_store::DT_LINK));
-    assert_eq!(lstat.link_target, "/docs");
-    let denied = client
-        .stat_follow(request(alias))
+    let target = client
+        .inspect_target(request(Access::Write as i32))
         .await
         .unwrap()
         .into_inner();
-    assert!(denied.is_error && !denied.found && denied.content_id.is_empty());
-    grants.lock().unwrap().insert(target.into());
-    let found = client
-        .stat_follow(request(alias))
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(!found.is_error && found.found);
-    assert_eq!(found.entry_type, i32::from(kernel::meta_store::DT_REG));
-    assert_eq!(found.path, target);
-    assert_eq!(found.size, 6);
-    grants.lock().unwrap().remove(target);
-    let revoked = client
-        .stat_follow(request(alias))
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(revoked.is_error && !revoked.found && revoked.path.is_empty());
+    assert!(!target.is_error);
+    assert_eq!(target.path, "/inbox");
+    assert_eq!(
+        target.entry_type,
+        Some(i32::from(kernel::meta_store::DT_STREAM))
+    );
+    assert_eq!(
+        client
+            .inspect_target(request(Access::Read as i32))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    for invalid in [Access::Unspecified as i32, 255] {
+        assert_eq!(
+            client
+                .inspect_target(request(invalid))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::InvalidArgument
+        );
+    }
     drop(client);
     stop.send(()).unwrap();
     server.await.unwrap();

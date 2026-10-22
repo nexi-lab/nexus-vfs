@@ -33,13 +33,13 @@ use kernel::kernel::vfs_proto::{
     BatchStatResponse, BatchWriteItemResponse, BatchWriteRequest, BatchWriteResponse, CallRequest,
     CallResponse, ChmodRequest, ChmodResponse, CopyRequest, CopyResponse, DeleteRequest,
     DeleteResponse, GetXattrBulkItem, GetXattrBulkRequest, GetXattrBulkResponse, GetXattrRequest,
-    GetXattrResponse, IpcAck, IpcEmpty, IpcHasResponse, IpcPathRequest, LockRequest, LockResponse,
-    MkdirRequest, MkdirResponse, PingRequest, PingResponse, ReadRequest, ReadResponse,
-    ReaddirEntry, ReaddirRequest, ReaddirResponse, RenameRequest, RenameResponse, SetXattrRequest,
-    SetXattrResponse, SetattrRequest, SetattrResponse, StatRequest, StatResponse,
-    StreamCollectAllResponse, StreamReadAtRequest, StreamReadAtResponse, StreamWriteRequest,
-    StreamWriteResponse, UnlockRequest, UnlockResponse, WatchRequest, WatchResponse, WriteRequest,
-    WriteResponse,
+    GetXattrResponse, InspectTargetRequest, InspectTargetResponse, IpcAck, IpcEmpty,
+    IpcHasResponse, IpcPathRequest, LockRequest, LockResponse, MkdirRequest, MkdirResponse,
+    PingRequest, PingResponse, ReadRequest, ReadResponse, ReaddirEntry, ReaddirRequest,
+    ReaddirResponse, RenameRequest, RenameResponse, SetXattrRequest, SetXattrResponse,
+    SetattrRequest, SetattrResponse, StatRequest, StatResponse, StreamCollectAllResponse,
+    StreamReadAtRequest, StreamReadAtResponse, StreamWriteRequest, StreamWriteResponse,
+    UnlockRequest, UnlockResponse, WatchRequest, WatchResponse, WriteRequest, WriteResponse,
 };
 use kernel::kernel::{Kernel, KernelError, OperationContext};
 use kernel::Permission;
@@ -251,6 +251,7 @@ impl_authed_request!(
     SetXattrRequest,
     SetattrRequest,
     StatRequest,
+    InspectTargetRequest,
     StreamReadAtRequest,
     StreamWriteRequest,
     UnlockRequest,
@@ -639,66 +640,6 @@ impl VfsServiceImpl {
         }
     }
 
-    async fn stat_metadata(
-        &self,
-        req: Request<StatRequest>,
-        follow_links: bool,
-    ) -> Result<Response<StatResponse>, Status> {
-        let (mut ctx, req) = match self.authenticate(req).await {
-            Ok(v) => v,
-            Err(s) => return Ok(Response::new(error_stat(s))),
-        };
-        if !req.zone_id.is_empty() {
-            ctx.zone_id = req.zone_id;
-        }
-        if let Err(status) = self.authorize_path(&req.path, Permission::Read, &ctx) {
-            return Ok(Response::new(error_stat(status)));
-        }
-        // `sys_stat` returns `Option` — `None` is "no such path", a
-        // normal result surfaced as `found = false` (not an error).
-        let stat = if follow_links {
-            match self.kernel.stat_follow(&req.path, Permission::Read, &ctx) {
-                Ok(stat) => stat,
-                Err(error) => {
-                    let (code, message) = self.map_kernel_err(error);
-                    return Ok(Response::new(StatResponse {
-                        is_error: true,
-                        error_payload: encode_rpc_error(code, &message),
-                        ..Default::default()
-                    }));
-                }
-            }
-        } else {
-            self.kernel.sys_stat(&req.path, &ctx.zone_id)
-        };
-        match stat {
-            Some(s) => Ok(Response::new(StatResponse {
-                found: true,
-                path: s.path,
-                size: s.size as i64,
-                content_id: s.content_id.unwrap_or_default(),
-                mime_type: s.mime_type,
-                is_directory: s.is_directory,
-                entry_type: s.entry_type as i32,
-                mode: s.mode,
-                version: s.version,
-                gen: s.gen,
-                zone_id: s.zone_id.unwrap_or_default(),
-                created_at_ms: s.created_at_ms,
-                modified_at_ms: s.modified_at_ms,
-                last_writer_address: s.last_writer_address.unwrap_or_default(),
-                link_target: s.link_target.unwrap_or_default(),
-                owner_id: s.owner_id.unwrap_or_default(),
-                is_error: false,
-                error_payload: Vec::new(),
-            })),
-            None => Ok(Response::new(StatResponse {
-                found: false,
-                ..Default::default()
-            })),
-        }
-    }
-
     /// Test-only constructor. The gate is OPEN — a test kernel is wired before
     /// the test calls anything. [`Self::for_test_pending`] is the variant that
     /// exercises the boot window itself.
@@ -930,14 +871,83 @@ impl NexusVfsService for VfsServiceImpl {
     }
 
     async fn stat(&self, req: Request<StatRequest>) -> Result<Response<StatResponse>, Status> {
-        self.stat_metadata(req, false).await
+        let (mut ctx, req) = match self.authenticate(req).await {
+            Ok(v) => v,
+            Err(s) => return Ok(Response::new(error_stat(s))),
+        };
+        if !req.zone_id.is_empty() {
+            ctx.zone_id = req.zone_id;
+        }
+        if let Err(status) = self.authorize_path(&req.path, Permission::Read, &ctx) {
+            return Ok(Response::new(error_stat(status)));
+        }
+        // `sys_stat` returns `Option` — `None` is "no such path", a
+        // normal result surfaced as `found = false` (not an error).
+        let stat = self.kernel.sys_stat(&req.path, &ctx.zone_id);
+        match stat {
+            Some(s) => Ok(Response::new(StatResponse {
+                found: true,
+                path: s.path,
+                size: s.size as i64,
+                content_id: s.content_id.unwrap_or_default(),
+                mime_type: s.mime_type,
+                is_directory: s.is_directory,
+                entry_type: s.entry_type as i32,
+                mode: s.mode,
+                version: s.version,
+                gen: s.gen,
+                zone_id: s.zone_id.unwrap_or_default(),
+                created_at_ms: s.created_at_ms,
+                modified_at_ms: s.modified_at_ms,
+                last_writer_address: s.last_writer_address.unwrap_or_default(),
+                link_target: s.link_target.unwrap_or_default(),
+                owner_id: s.owner_id.unwrap_or_default(),
+                is_error: false,
+                error_payload: Vec::new(),
+            })),
+            None => Ok(Response::new(StatResponse {
+                found: false,
+                ..Default::default()
+            })),
+        }
     }
 
-    async fn stat_follow(
+    async fn inspect_target(
         &self,
-        req: Request<StatRequest>,
-    ) -> Result<Response<StatResponse>, Status> {
-        self.stat_metadata(req, true).await
+        req: Request<InspectTargetRequest>,
+    ) -> Result<Response<InspectTargetResponse>, Status> {
+        use kernel::kernel::vfs_proto::inspect_target_request::Access;
+        let (mut ctx, req) = self.authenticate(req).await?;
+        if !req.zone_id.is_empty() {
+            ctx.zone_id = req.zone_id;
+        }
+        let permission = match Access::try_from(req.access) {
+            Ok(Access::Read) => Permission::Read,
+            Ok(Access::Write) => Permission::Write,
+            _ => {
+                return Err(Status::invalid_argument(
+                    "target access must be READ or WRITE",
+                ))
+            }
+        };
+        self.authorize_path(&req.path, permission, &ctx)?;
+        Ok(Response::new(
+            match self.kernel.inspect_target(&req.path, permission, &ctx) {
+                Ok(target) => InspectTargetResponse {
+                    path: target.path,
+                    entry_type: target.entry_type.map(i32::from),
+                    ..Default::default()
+                },
+                Err(error) => {
+                    let (code, message) = self.map_kernel_err(error);
+                    InspectTargetResponse {
+                        is_error: true,
+                        error_payload: encode_rpc_error(code, &message),
+                        ..Default::default()
+                    }
+                }
+            },
+        ))
     }
 
     async fn readdir(
@@ -2487,10 +2497,10 @@ pub(crate) mod tests {
         async fn stat(&self, _: Request<StatRequest>) -> Result<Response<StatResponse>, Status> {
             Err(Status::unimplemented("hub stub"))
         }
-        async fn stat_follow(
+        async fn inspect_target(
             &self,
-            _: Request<StatRequest>,
-        ) -> Result<Response<StatResponse>, Status> {
+            _: Request<InspectTargetRequest>,
+        ) -> Result<Response<InspectTargetResponse>, Status> {
             Err(Status::unimplemented("hub stub"))
         }
         async fn readdir(

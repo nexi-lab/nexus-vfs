@@ -112,7 +112,7 @@ fn both_the_workspace_alias_and_the_target_must_be_authorized() {
             Err(KernelError::PermissionDenied(_))
         ));
         assert!(matches!(
-            kernel.stat_follow(alias, Permission::Read, &ctx),
+            kernel.inspect_target(alias, Permission::Read, &ctx),
             Err(KernelError::PermissionDenied(_))
         ));
     }
@@ -131,7 +131,7 @@ fn directory_aliases_do_not_allow_an_extra_link_hop_or_parent_escape() {
     for path in ["/proc/p1/workspace/repo/again/key", "/escape/key"] {
         assert!(KernelSyscall::sys_write(&kernel, path, &ctx, b"no", 0).is_err());
         assert!(KernelSyscall::sys_read(&kernel, path, &ctx, 0, 0).is_err());
-        assert!(kernel.stat_follow(path, Permission::Read, &ctx).is_err());
+        assert!(kernel.inspect_target(path, Permission::Read, &ctx).is_err());
     }
 }
 
@@ -174,12 +174,10 @@ fn a_root_proc_alias_preserves_the_non_root_sessions_zone() {
     );
     assert_eq!(
         kernel
-            .stat_follow(alias, Permission::Read, &ctx)
+            .inspect_target(alias, Permission::Read, &ctx)
             .unwrap()
-            .unwrap()
-            .zone_id
-            .as_deref(),
-        Some("edge")
+            .path,
+        target
     );
 }
 
@@ -191,11 +189,8 @@ fn target_metadata_follows_leaf_and_directory_links_without_reading_a_frame() {
     KernelSyscall::sys_write(&kernel, target, &ctx, b"first frame", 0).unwrap();
     link(&kernel, &ctx, "/transcript-alias", target);
     for path in ["/transcript-alias", "/proc/p1/workspace/repo/transcript"] {
-        let metadata = kernel
-            .stat_follow(path, Permission::Read, &ctx)
-            .unwrap()
-            .unwrap();
-        assert_eq!(metadata.entry_type, kernel::meta_store::DT_STREAM);
+        let metadata = kernel.inspect_target(path, Permission::Read, &ctx).unwrap();
+        assert_eq!(metadata.entry_type, Some(kernel::meta_store::DT_STREAM));
         assert_eq!(metadata.path, target);
         let first = KernelSyscall::sys_read(&kernel, path, &ctx, 0, 0).unwrap();
         assert_eq!(first.data.as_deref(), Some(b"first frame".as_slice()));
@@ -207,10 +202,11 @@ fn target_metadata_follows_leaf_and_directory_links_without_reading_a_frame() {
             .entry_type,
         6
     );
-    assert!(kernel
-        .stat_follow("/proc/p1/workspace/repo/missing", Permission::Read, &ctx)
-        .unwrap()
-        .is_none());
+    let missing = kernel
+        .inspect_target("/proc/p1/workspace/repo/missing", Permission::Write, &ctx)
+        .unwrap();
+    assert_eq!(missing.path, "/agents/alice/workspaces/s1/missing");
+    assert_eq!(missing.entry_type, None);
 }
 
 struct WriteOnly;
@@ -241,14 +237,13 @@ fn append_classification_uses_write_permission_and_preserves_identity() {
     let alias = "/proc/p1/workspace/repo/transcript";
     assert_eq!(
         kernel
-            .stat_follow(alias, Permission::Write, &ctx)
-            .unwrap()
+            .inspect_target(alias, Permission::Write, &ctx)
             .unwrap()
             .entry_type,
-        kernel::meta_store::DT_STREAM
+        Some(kernel::meta_store::DT_STREAM)
     );
     assert!(matches!(
-        kernel.stat_follow(alias, Permission::Read, &ctx),
+        kernel.inspect_target(alias, Permission::Read, &ctx),
         Err(KernelError::PermissionDenied(_))
     ));
 }
@@ -261,11 +256,10 @@ fn target_metadata_does_not_consume_pipe_contents() {
     link(&kernel, &ctx, "/inbox-alias", "/queued-message");
     assert_eq!(
         kernel
-            .stat_follow("/inbox-alias", Permission::Read, &ctx)
-            .unwrap()
+            .inspect_target("/inbox-alias", Permission::Read, &ctx)
             .unwrap()
             .entry_type,
-        kernel::meta_store::DT_PIPE
+        Some(kernel::meta_store::DT_PIPE)
     );
     let received = KernelSyscall::sys_read(&kernel, "/inbox-alias", &ctx, 0, 0).unwrap();
     assert_eq!(received.data.as_deref(), Some(b"pending".as_slice()));
