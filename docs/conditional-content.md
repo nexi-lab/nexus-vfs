@@ -1,7 +1,8 @@
 # Conditional visible-content writes (N2 design review)
 
 Status: implementation proposal, not a supported server capability yet.
-Source reviewed: main `044a37393`.
+Initial metadata source reviewed: main `044a37393`. CAS publication rechecked
+against main `ab8129e242e694c2b03da1693bec197502eb2fad`.
 
 ## Contract
 
@@ -43,12 +44,34 @@ read-then-put, or metadata-only approximation.
 is not a content token. The existing Raft CasSetMetadata compares metadata only.
 None of those is the requested primitive.
 
-CasLocalBackend already provides immutable content staging. For that backend,
-stage and fsync the immutable object, then conditionally publish its pointer and
-generation in one existing zone-Raft/redb transaction. An unsuccessful comparison
-may leave an unreachable staged object, never changed visible content. Keep the
-existing CAS retention/GC ownership; do not delete an object that a concurrent
-reader or another file can still reference.
+The existing CAS transport does not yet provide atomic complete-object staging.
+`LocalCASTransport::write_blob_tracked` and `write_blob_with_hash` deduplicate on
+path existence, then otherwise create and truncate the final hash path before
+writing its bytes. A concurrent writer can therefore accept an incomplete file
+as a deduplication hit. A crash after creation can leave a partial final object
+that later writes also accept. `fsync_on_write` only syncs the file after writing;
+it supplies neither atomic publication nor the parent-directory durability
+barrier. The earlier claim that this backend already supplied immutable staging
+was incorrect. This is a source counterexample, not a production incident claim.
+
+Before CAS can support N2, every object writer must publish a complete candidate
+without clobbering a winner and validate existing objects rather than trusting
+existence. Reuse one publication primitive in the existing Rust `lib` facilities,
+also needed for private credential pending files; do not introduce another store.
+Atomic visibility and durable publication have distinct results. A failed barrier
+after publication must not be reported as proof of absence or permission to
+overwrite the final path. Platform and newly created parent-directory barriers
+must be established before durable staging is reported. Unsupported guarantees
+fail closed. Process-crash tests do not prove a stronger power-loss guarantee
+than the documented OS primitives.
+
+After those prerequisites, stage the immutable object durably, then conditionally
+publish its pointer and generation in one existing zone-Raft/redb transaction.
+An unsuccessful comparison may leave an unreachable staged object, never changed
+visible content. Keep the existing CAS retention/GC ownership; do not delete an
+object that a concurrent reader or another file can still reference. The current
+cluster profile compiles PathLocalBackend by default; `driver-cas-local` and its
+mount/durability configuration also need explicit opt-in and acceptance.
 
 PathLocalBackend instead truncates a live path. The cluster currently uses it
 for both the root mount and federation cache. It cannot truthfully implement the
@@ -139,9 +162,10 @@ This foundation still does not complete N2. Before exposing any file capability:
   Activation and membership admission must enforce that fact; a comment or an
   operator's version-string assertion is insufficient. Mixed old/new operation
   cannot provide this guarantee.
-- A new managed mount must use the existing immutable CAS backend and translate
-  to the reserved metadata subtree consistently across aliases and nodes. PAS
-  and native-reference mounts remain Unsupported. No running mount is retargeted.
+- The existing CAS transport must first gain verified complete-object and durable
+  publication. A new managed CAS mount must then translate to the reserved
+  metadata subtree consistently across aliases and nodes. PAS and native-reference
+  mounts remain Unsupported. No running mount is retargeted.
 - The existing zone lifecycle must supply a replicated incarnation boundary and
   prevent token reuse after an administrative restore/replacement. The proposed
   16-byte incarnation in the first SC create is only an isolated allocator seed.
