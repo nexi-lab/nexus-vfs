@@ -23,7 +23,9 @@ mod common;
 
 use std::time::Duration;
 
-use nexus_raft::transport::{call_join_zone_rpc, call_remove_voter_rpc};
+use nexus_raft::transport::{
+    call_join_zone_rpc, call_remove_voter_rpc, ClientConfig, RaftApiClient,
+};
 use nexus_raft::ZoneManager;
 use tempfile::TempDir;
 
@@ -147,6 +149,25 @@ async fn remove_voter_prunes_learner_from_conf_state() {
     }
     assert!(saw_joiner, "AddLearnerNode did not apply on owner");
 
+    // Exercise the wire response and the public client: neither may drop a
+    // learner that the driver's authoritative membership query can see.
+    let mut client = RaftApiClient::connect(&endpoint_owner, ClientConfig::default())
+        .await
+        .expect("connect cluster-info client")
+        .with_zone_id("sharedzone".into());
+    let config = client
+        .get_cluster_info()
+        .await
+        .expect("cluster info with learner")
+        .config
+        .expect("membership config");
+    assert_eq!(config.voters.len(), 1);
+    assert_eq!(config.voters[0].id, id_owner);
+    assert_eq!(config.learners.len(), 1, "RPC must not hide learners");
+    assert_eq!(config.learners[0].id, id_joiner);
+    assert_eq!(config.learners[0].role, 1);
+    assert_eq!(config.learners[0].address, endpoint_joiner);
+
     // Prune the learner.
     let result = call_remove_voter_rpc(&endpoint_owner, "sharedzone", id_joiner, None, 15)
         .await
@@ -170,6 +191,15 @@ async fn remove_voter_prunes_learner_from_conf_state() {
         pruned,
         "RemoveNode did not apply on owner (ConfState still lists the learner)"
     );
+    let config = client
+        .get_cluster_info()
+        .await
+        .expect("cluster info after removal")
+        .config
+        .expect("membership config after removal");
+    assert!(config.learners.is_empty(), "removed learner must disappear");
+    assert_eq!(config.voters.len(), 1);
+    assert_eq!(config.voters[0].id, id_owner);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
