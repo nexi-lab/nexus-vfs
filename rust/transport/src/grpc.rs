@@ -33,13 +33,13 @@ use kernel::kernel::vfs_proto::{
     BatchStatResponse, BatchWriteItemResponse, BatchWriteRequest, BatchWriteResponse, CallRequest,
     CallResponse, ChmodRequest, ChmodResponse, CopyRequest, CopyResponse, DeleteRequest,
     DeleteResponse, GetXattrBulkItem, GetXattrBulkRequest, GetXattrBulkResponse, GetXattrRequest,
-    GetXattrResponse, IpcAck, IpcEmpty, IpcHasResponse, IpcPathRequest, LockRequest, LockResponse,
-    MkdirRequest, MkdirResponse, PingRequest, PingResponse, ReadRequest, ReadResponse,
-    ReaddirEntry, ReaddirRequest, ReaddirResponse, RenameRequest, RenameResponse, SetXattrRequest,
-    SetXattrResponse, SetattrRequest, SetattrResponse, StatRequest, StatResponse,
-    StreamCollectAllResponse, StreamReadAtRequest, StreamReadAtResponse, StreamWriteRequest,
-    StreamWriteResponse, UnlockRequest, UnlockResponse, WatchRequest, WatchResponse, WriteRequest,
-    WriteResponse,
+    GetXattrResponse, InspectTargetRequest, InspectTargetResponse, IpcAck, IpcEmpty,
+    IpcHasResponse, IpcPathRequest, LockRequest, LockResponse, MkdirRequest, MkdirResponse,
+    PingRequest, PingResponse, ReadRequest, ReadResponse, ReaddirEntry, ReaddirRequest,
+    ReaddirResponse, RenameRequest, RenameResponse, SetXattrRequest, SetXattrResponse,
+    SetattrRequest, SetattrResponse, StatRequest, StatResponse, StreamCollectAllResponse,
+    StreamReadAtRequest, StreamReadAtResponse, StreamWriteRequest, StreamWriteResponse,
+    UnlockRequest, UnlockResponse, WatchRequest, WatchResponse, WriteRequest, WriteResponse,
 };
 use kernel::kernel::{Kernel, KernelError, OperationContext};
 use kernel::Permission;
@@ -251,6 +251,7 @@ impl_authed_request!(
     SetXattrRequest,
     SetattrRequest,
     StatRequest,
+    InspectTargetRequest,
     StreamReadAtRequest,
     StreamWriteRequest,
     UnlockRequest,
@@ -882,7 +883,8 @@ impl NexusVfsService for VfsServiceImpl {
         }
         // `sys_stat` returns `Option` — `None` is "no such path", a
         // normal result surfaced as `found = false` (not an error).
-        match self.kernel.sys_stat(&req.path, &ctx.zone_id) {
+        let stat = self.kernel.sys_stat(&req.path, &ctx.zone_id);
+        match stat {
             Some(s) => Ok(Response::new(StatResponse {
                 found: true,
                 path: s.path,
@@ -908,6 +910,44 @@ impl NexusVfsService for VfsServiceImpl {
                 ..Default::default()
             })),
         }
+    }
+
+    async fn inspect_target(
+        &self,
+        req: Request<InspectTargetRequest>,
+    ) -> Result<Response<InspectTargetResponse>, Status> {
+        use kernel::kernel::vfs_proto::inspect_target_request::Access;
+        let (mut ctx, req) = self.authenticate(req).await?;
+        if !req.zone_id.is_empty() {
+            ctx.zone_id = req.zone_id;
+        }
+        let permission = match Access::try_from(req.access) {
+            Ok(Access::Read) => Permission::Read,
+            Ok(Access::Write) => Permission::Write,
+            _ => {
+                return Err(Status::invalid_argument(
+                    "target access must be READ or WRITE",
+                ))
+            }
+        };
+        self.authorize_path(&req.path, permission, &ctx)?;
+        Ok(Response::new(
+            match self.kernel.inspect_target(&req.path, permission, &ctx) {
+                Ok(target) => InspectTargetResponse {
+                    path: target.path,
+                    entry_type: target.entry_type.map(i32::from),
+                    ..Default::default()
+                },
+                Err(error) => {
+                    let (code, message) = self.map_kernel_err(error);
+                    InspectTargetResponse {
+                        is_error: true,
+                        error_payload: encode_rpc_error(code, &message),
+                        ..Default::default()
+                    }
+                }
+            },
+        ))
     }
 
     async fn readdir(
@@ -2455,6 +2495,12 @@ pub(crate) mod tests {
             Err(Status::unimplemented("hub stub"))
         }
         async fn stat(&self, _: Request<StatRequest>) -> Result<Response<StatResponse>, Status> {
+            Err(Status::unimplemented("hub stub"))
+        }
+        async fn inspect_target(
+            &self,
+            _: Request<InspectTargetRequest>,
+        ) -> Result<Response<InspectTargetResponse>, Status> {
             Err(Status::unimplemented("hub stub"))
         }
         async fn readdir(

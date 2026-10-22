@@ -4,10 +4,24 @@ use crate::core::vfs_router::RouteResult;
 use crate::meta_store::DT_STREAM;
 
 use super::{validate_path_fast, Kernel, KernelError, OperationContext};
+use crate::Permission;
 
 pub(crate) struct StreamAddress {
     pub zone: String,
     pub path: String,
+}
+
+struct ResolvedIoPath {
+    path: String,
+    address: StreamAddress,
+}
+
+/// An authorized I/O target, including the path of a not-yet-created entry.
+/// Entry classification carries no content bytes or content identifiers.
+#[derive(Debug, Clone)]
+pub struct IoTarget {
+    pub path: String,
+    pub entry_type: Option<u8>,
 }
 
 impl StreamAddress {
@@ -61,8 +75,39 @@ impl Kernel {
         &self,
         path: &str,
         ctx: &OperationContext,
-        mut gate: impl FnMut(&str, Option<&RouteResult>, &OperationContext) -> Result<(), KernelError>,
+        gate: impl FnMut(&str, Option<&RouteResult>, &OperationContext) -> Result<(), KernelError>,
     ) -> Result<StreamAddress, KernelError> {
+        self.resolve_io_path(path, ctx, gate)
+            .map(|resolved| resolved.address)
+    }
+
+    /// Inspect the target of an I/O operation without reading its contents.
+    /// The operation's permission is checked on every link spelling and on
+    /// the target in its owning zone, using the same resolution as stream I/O.
+    pub fn inspect_target(
+        &self,
+        path: &str,
+        permission: Permission,
+        ctx: &OperationContext,
+    ) -> Result<IoTarget, KernelError> {
+        let resolved = self.resolve_io_path(path, ctx, |path, route, ctx| {
+            self.check_permission_with_route(path, route, permission, ctx)
+        })?;
+        let entry_type = self
+            .sys_stat(&resolved.path, &ctx.zone_id)
+            .map(|stat| stat.entry_type);
+        Ok(IoTarget {
+            path: resolved.path,
+            entry_type,
+        })
+    }
+
+    fn resolve_io_path(
+        &self,
+        path: &str,
+        ctx: &OperationContext,
+        mut gate: impl FnMut(&str, Option<&RouteResult>, &OperationContext) -> Result<(), KernelError>,
+    ) -> Result<ResolvedIoPath, KernelError> {
         let mut path = path.to_owned();
         for hops in 0..=1 {
             validate_path_fast(&path)?;
@@ -76,7 +121,7 @@ impl Kernel {
                         Some(route) => self
                             .with_metastore_route(route, |ms| ms.get(&path))
                             .transpose()
-                            .map_err(|e| KernelError::IOError(format!("stream metadata: {e:?}")))?
+                            .map_err(|e| KernelError::IOError(format!("path metadata: {e:?}")))?
                             .flatten(),
                         None => self.metastore_get(&path).ok().flatten(),
                     };
@@ -101,7 +146,7 @@ impl Kernel {
                 target_ctx.zone_id = address.zone.clone();
                 gate(&address.path, route.as_ref(), &target_ctx)?;
             }
-            return Ok(address);
+            return Ok(ResolvedIoPath { path, address });
         }
         unreachable!("link hop limit returns above")
     }

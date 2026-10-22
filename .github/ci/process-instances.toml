@@ -1,0 +1,10 @@
+# These jobs check registry/process behavior, not optimized performance.
+# A cold Windows build exhausted the job budget before starting any test.
+# Keep debug assertions and every test deadline; reduce disposable build work.
+[profile.test]
+opt-level = 0
+debug = 0
+incremental = false
+
+[profile.test.package."*"]
+opt-level = 0

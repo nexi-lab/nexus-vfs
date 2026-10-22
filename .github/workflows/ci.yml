@@ -33,6 +33,8 @@ jobs:
     name: Process instance lifecycle / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: 1
     strategy:
       fail-fast: false
       matrix:
@@ -49,8 +51,8 @@ jobs:
         with:
           shared-key: ci-process-instances-${{ matrix.os }}
       # Linux exercises these in the full workspace test job below.
-      - run: cargo test -p kernel --no-default-features core::agents::registry --lib
-      - run: cargo test -p managed-agent --all-features --test session_mailbox --test session_resume
+      - run: cargo --config .github/ci/process-instances.toml test -p kernel --no-default-features core::agents::registry --lib
+      - run: cargo --config .github/ci/process-instances.toml test -p managed-agent --all-features --test session_mailbox --test session_resume
 
   search-windows:
     name: Search FTS / Windows

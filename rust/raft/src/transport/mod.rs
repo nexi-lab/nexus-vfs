@@ -45,7 +45,8 @@ pub(crate) mod certgen;
 pub use certgen::{
     append_join_token_hash, bootstrap_tls, generate_agent_cert, generate_join_token,
     generate_node_cert, generate_session_agent_cert, generate_user_runtime_cert, generate_zone_ca,
-    join_token_hash_path, node_identity_uri, parse_node_identity_uri, read_join_token_hashes,
+    join_token_hash_path, node_identity_uri, parse_node_identity_uri, prepare_agent_csr_intent,
+    read_join_token_hashes, sign_agent_csr, sign_committed_agent_intent, sign_node_csr,
     BootstrapTls,
 };
 /// Re-exported so a caller that already depends on this crate can name a
