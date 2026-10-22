@@ -2298,6 +2298,7 @@ dependencies = [
  "pem",
  "proptest",
  "rcgen",
+ "redb",
  "regex",
  "regex-syntax",
  "ring",

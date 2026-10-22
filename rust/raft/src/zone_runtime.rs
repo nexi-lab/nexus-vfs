@@ -844,7 +844,7 @@ impl ZoneRuntimeBackend {
         Ok(receipt)
     }
 
-    /// Persist a REJECTED record and surface the refusal.
+    /// Persist definitive refusals; unknown outcomes remain recoverable.
     fn fail(
         &self,
         operation_id: &str,
@@ -852,6 +852,13 @@ impl ZoneRuntimeBackend {
         kind: &str,
         zone_id: &str,
     ) -> Result<ZoneReceipt, ZoneRuntimeError> {
+        if matches!(err, ZoneRuntimeError::Internal(_)) {
+            // Storage and consensus failures do not establish a business
+            // refusal. Keep the original intent PENDING so polling and a
+            // same-operation takeover can recover it after the grace period.
+            tracing::error!(zone = %zone_id, kind = %kind, "zone runtime mutation outcome unknown: {err}");
+            return Err(err);
+        }
         if let Err(journal_err) = self.journal.reject(operation_id, &err.to_string()) {
             // The record stays PENDING: a same-hash retry may take it over
             // once the grace window passes (the mutation layer is
@@ -1190,6 +1197,79 @@ mod tests {
                 assert!(msg.contains("still in flight"), "message: {msg}");
             }
             other => panic!("expected Conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn internal_failure_keeps_the_original_intent_recoverable() {
+        let (backend, probe, _dir) = make_backend();
+        let operation_id = "op-internal-recovery";
+        let hash = request_hash(b"create", &["tenant-a"]);
+        assert!(backend
+            .begin_or_replay(operation_id, hash, "create", "tenant-a")
+            .unwrap()
+            .is_none());
+        let before = probe.get(operation_id).unwrap().unwrap();
+        let result = backend.fail(
+            operation_id,
+            ZoneRuntimeError::Internal("store unavailable".into()),
+            "create",
+            "tenant-a",
+        );
+        assert!(matches!(result, Err(ZoneRuntimeError::Internal(_))));
+        let after = probe.get(operation_id).unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&before).unwrap(),
+            serde_json::to_value(&after).unwrap()
+        );
+        assert_eq!(after.status, crate::zone_op_journal::STATUS_PENDING);
+
+        let mut aged = after;
+        aged.updated_at_ms = wall_now_ms() - PENDING_TAKEOVER_GRACE_MS - 5_000;
+        store_put_record(&backend, operation_id, &aged);
+        assert!(backend
+            .begin_or_replay(operation_id, hash, "create", "tenant-a")
+            .unwrap()
+            .is_none());
+        let receipt = base_receipt(operation_id, "tenant-a", "create", OUTCOME_CREATED);
+        backend.complete(operation_id, "tenant-a", receipt).unwrap();
+        let durable = probe.get(operation_id).unwrap().unwrap();
+        assert_eq!(durable.status, crate::zone_op_journal::STATUS_COMPLETED);
+        assert_eq!(durable.request_hash, hash);
+        assert!(
+            backend
+                .begin_or_replay(operation_id, hash, "create", "tenant-a")
+                .unwrap()
+                .unwrap()
+                .replayed
+        );
+    }
+
+    #[test]
+    fn definitive_refusals_remain_rejected() {
+        let (backend, probe, _dir) = make_backend();
+        for (index, error) in [
+            ZoneRuntimeError::PermissionDenied("denied".into()),
+            ZoneRuntimeError::Invalid("invalid".into()),
+            ZoneRuntimeError::Conflict("conflict".into()),
+            ZoneRuntimeError::NotFound("missing".into()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let operation_id = format!("op-definitive-{index}");
+            let hash = request_hash(b"create", &["tenant-a"]);
+            assert!(backend
+                .begin_or_replay(&operation_id, hash, "create", "tenant-a")
+                .unwrap()
+                .is_none());
+            let reason = error.to_string();
+            assert!(backend
+                .fail(&operation_id, error, "create", "tenant-a")
+                .is_err());
+            let durable = probe.get(&operation_id).unwrap().unwrap();
+            assert_eq!(durable.status, crate::zone_op_journal::STATUS_REJECTED);
+            assert_eq!(durable.error.as_deref(), Some(reason.as_str()));
         }
     }
 }

@@ -31,6 +31,7 @@ kernel = { workspace = true }
 # Issue #1330: Replaced sled 0.34 with redb for reliability + maintenance.
 redb = "4"
 tempfile = "3"
+lib = { workspace = true, features = ["redb-storage"] }
 
 # Raft consensus (tikv/raft-rs)
 raft = { version = "0.7", default-features = false, features = ["protobuf-codec"], optional = true }
@@ -63,7 +64,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net", "
 # tls feature enables rustls for mTLS (mutual TLS) transport encryption.
 # `lib::transport_primitives` (gated by lib's `transport` feature)
 # provides shared TLS / pool / addressing / TOFU / PeerBlobClient.
-lib = { workspace = true, optional = true }
 tonic = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
 tonic-prost = { workspace = true, optional = true }
@@ -109,7 +109,7 @@ consensus = ["raft", "protobuf", "slog", "async"]
 # Enable gRPC transport (tonic + protobuf) — EXPERIMENTAL, default OFF.
 # Requires `consensus` feature. Not used in production.
 # See: docs/rfcs/adr-raft-sled-strategy.md (Decision 4)
-grpc = ["tonic", "prost", "tonic-prost", "lib/transport", "lib/runtime-bridge", "lib", "bytes", "dep:tonic-prost-build", "async", "tracing-subscriber", "consensus", "dashmap", "time", "sha2", "rcgen", "x509-parser", "pem", "base64", "gethostname", "rand"]
+grpc = ["tonic", "prost", "tonic-prost", "lib/transport", "lib/runtime-bridge", "bytes", "dep:tonic-prost-build", "async", "tracing-subscriber", "consensus", "dashmap", "time", "sha2", "rcgen", "x509-parser", "pem", "base64", "gethostname", "rand"]
 
 full = ["grpc", "consensus"]
 
