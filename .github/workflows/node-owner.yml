@@ -1,0 +1,26 @@
+name: Node owner entrypoints
+
+on:
+  push:
+    branches: [main]
+    paths: ['scripts/cluster/**', '.github/workflows/node-owner.yml']
+  pull_request:
+    paths: ['scripts/cluster/**', '.github/workflows/node-owner.yml']
+
+jobs:
+  node-record:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Private idempotent no-clobber publication
+        run: python scripts/cluster/test_node_record.py
+      - name: Parse the shared role entrypoints
+        shell: bash
+        run: bash -n scripts/cluster/start-common.sh scripts/cluster/start-founder.sh scripts/cluster/start-joiner.sh
