@@ -170,7 +170,8 @@ pub fn commit_agent_issuance(
             replayed: false,
         });
     }
-    // The candidate stays local and is dropped. Read only the committed winner.
+    // Never return the losing candidate. Read only the committed winner;
+    // its proposed bytes may still exist in consensus logs (module docs).
     let receipt =
         query_agent_issuance(store, &record.credential_lifecycle.binding)?.ok_or_else(|| {
             IssuanceError::Unknown("CAS conflict without an observed winning row".into())

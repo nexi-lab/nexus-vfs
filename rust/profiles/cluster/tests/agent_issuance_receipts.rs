@@ -163,6 +163,20 @@ async fn one_winner_and_unknown_result_survive_real_raft_restart() {
         .open_persisted_zone(contracts::CONTROL_ZONE_ID, vec![], &runtime)
         .unwrap();
     node.campaign().await.unwrap();
+    // campaign acknowledges the role transition before Ready persists/applies
+    // the new leader's no-op. Raft 0.7 drops ReadIndex requests made before
+    // a current-term entry commits. Wait for this isolated singleton's real
+    // apply readiness, then exercise the unchanged linearizable query path.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if node.is_leader() && node.applied_index() >= node.last_index() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("restarted singleton must apply its current-term leader entry");
     let kernel = Arc::new(Kernel::new());
     kernel.set_auth_key_store(RaftAuthKeyStore::new_arc(node, runtime));
     let store = auth::KernelSlotStore::new_arc(kernel);
