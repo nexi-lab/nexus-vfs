@@ -1677,7 +1677,7 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
         Ok(store)
     }
 
-    fn locks_for_zone(&self, kernel: &Kernel, zone_id: &str) -> CoordinatorResult<Arc<dyn Locks>> {
+    fn locks_for_zone(&self, _kernel: &Kernel, zone_id: &str) -> CoordinatorResult<Arc<dyn Locks>> {
         let zm = self.zm().ok_or("federation not active")?;
         let runtime = self
             .runtime
@@ -1687,9 +1687,7 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
             .registry()
             .get_node(zone_id)
             .ok_or_else(|| format!("zone '{zone_id}' not loaded locally"))?;
-        let kernel_state = kernel.lock_manager_arc().advisory_state_arc();
-        let backend =
-            crate::federation::DistributedLocks::new(consensus, runtime.clone(), kernel_state);
+        let backend = crate::federation::DistributedLocks::new(consensus, runtime.clone());
         Ok(Arc::new(backend))
     }
 
@@ -2466,7 +2464,7 @@ fn reconstruct_mount(
 #[allow(clippy::too_many_arguments)]
 fn wire_mount_core(
     vfs_router: &Arc<kernel::core::vfs_router::VFSRouter>,
-    lock_manager: &Arc<kernel::core::lock::LockManager>,
+    _lock_manager: &Arc<kernel::core::lock::LockManager>,
     registry: &Arc<crate::raft::ZoneRaftRegistry>,
     runtime: &tokio::runtime::Handle,
     cross_zone_mounts: &DashMap<String, Vec<CrossZoneMount>>,
@@ -2660,31 +2658,9 @@ fn wire_mount_core(
         let canonical = canonicalize(&global_path, contracts::ROOT_ZONE_ID);
         vfs_router.install_metastore(&canonical, metastore);
 
-        // 5. LockManager upgrade on first federated mount — distributed
-        //    locks bound to the ROOT zone's consensus.
-        if !lock_manager.locks_installed() {
-            match registry.get_node(contracts::ROOT_ZONE_ID) {
-                Some(root_consensus) => {
-                    tracing::info!(
-                        parent_zone = %parent_zone_id,
-                        global_path = %global_path,
-                        "wire_mount: installing distributed locks bound to ROOT zone"
-                    );
-                    let kernel_state = lock_manager.advisory_state_arc();
-                    let backend = crate::federation::DistributedLocks::new(
-                        root_consensus,
-                        runtime.clone(),
-                        kernel_state,
-                    );
-                    lock_manager.install_locks(Arc::new(backend));
-                }
-                None => {
-                    tracing::warn!(
-                        "wire_mount: root zone not loaded — distributed locks NOT installed; sys_lock stays local-only until next mount"
-                    );
-                }
-            }
-        }
+        // Advisory syscalls resolve this mount's actual zone at call time.
+        // Installing root's consensus as a process-wide backend here would
+        // let different nodes acquire independent locks on this shared path.
 
         // 6. DT_MOUNT mount-point synthesis: ``sys_stat`` /``sys_unlink``
         // synthesise a DT_MOUNT result directly from the routing structure

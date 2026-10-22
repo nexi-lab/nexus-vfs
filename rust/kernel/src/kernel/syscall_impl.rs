@@ -1535,7 +1535,7 @@ impl Kernel {
         if let Some(observation) = reference {
             let metadata = observation.ok()?;
             let mut stat = StatResult::from(entry);
-            stat.lock = self.lock_manager.get_lock_info(path);
+            stat.lock = self.advisory_lock_info(path, zone_id);
             apply_reference_metadata(&mut stat, metadata);
             return Some(stat);
         }
@@ -1551,7 +1551,7 @@ impl Kernel {
                 .filter(|observation| observation.as_ref().is_ok_and(|metadata| metadata.is_dir))
             {
                 let mut stat = StatResult::from(entry);
-                stat.lock = self.lock_manager.get_lock_info(path);
+                stat.lock = self.advisory_lock_info(path, zone_id);
                 apply_reference_metadata(&mut stat, metadata);
                 return Some(stat);
             }
@@ -1570,7 +1570,7 @@ impl Kernel {
             })
             .to_string();
 
-        let lock = self.lock_manager.get_lock_info(path);
+        let lock = self.advisory_lock_info(path, zone_id);
 
         // A DT_STREAM's byte length is its live append tail, tracked in the
         // stream subsystem — the metastore `entry.size` is not maintained for
