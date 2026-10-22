@@ -212,8 +212,9 @@ async fn run() -> Result<(), String> {
             let transcript = a2a::conversation_transcript_path(&cid);
             let root = format!("{}/{cid}", a2a::CONVERSATIONS_BASE);
 
-            // Index under both sides. Body is the conversation root, which is what a
-            // receiver reads to know where to tail.
+            // Match the agent mailbox: index both sides with a native DT_LINK.
+            // A plain write cannot replace an existing link (on Windows it tries
+            // to open the link's directory as a file and gets access denied).
             for (owner, other) in [(me.as_str(), peer.as_str()), (peer.as_str(), me.as_str())] {
                 let dir = format!(
                     "{}/{owner}{}",
@@ -221,10 +222,10 @@ async fn run() -> Result<(), String> {
                     a2a::AGENT_CONVERSATIONS_SEGMENT
                 );
                 mkdir(&mut c, &dir, &auth).await?;
-                write_file(
+                link(
                     &mut c,
                     &a2a::agent_conversation_link_path(owner, other),
-                    root.as_bytes(),
+                    &root,
                     &auth,
                 )
                 .await?;
@@ -336,18 +337,7 @@ async fn run() -> Result<(), String> {
             // for. Here because a chat-list index is a link, and without a way to make
             // one from a client there was no way to check that the wire carries it.
             let target = a.get(5).ok_or("link needs a <target> arg")?;
-            let r = c
-                .setattr(SetattrRequest {
-                    path: path.clone(),
-                    auth_token: auth.clone(),
-                    entry_type: 6, // DT_LINK — 6, not 3 (that is DT_PIPE)
-                    link_target: Some(target.clone()),
-                    ..Default::default()
-                })
-                .await
-                .map_err(|e| format!("setattr rpc: {e}"))?
-                .into_inner();
-            err_if(r.is_error, &r.error_payload)?;
+            link(&mut c, path, target, &auth).await?;
             println!("linked {path} -> {target}");
         }
         "mkdir" => {
@@ -439,21 +429,23 @@ async fn mkdir(
     Ok(())
 }
 
-/// A plain file write, as a helper for the chat-list entries `send` files.
-async fn write_file(
+/// Native conversation indexes, shared by `send` and the explicit `link` op.
+async fn link(
     c: &mut NexusVfsServiceClient<Channel>,
     path: &str,
-    content: &[u8],
+    target: &str,
     auth: &str,
 ) -> Result<(), String> {
     let r = c
-        .write(WriteRequest {
+        .setattr(SetattrRequest {
             path: path.to_string(),
-            content: content.to_vec(),
             auth_token: auth.to_string(),
+            entry_type: 6, // DT_LINK, matching the agent mailbox contract.
+            link_target: Some(target.to_string()),
+            ..Default::default()
         })
         .await
-        .map_err(|e| format!("write rpc: {e}"))?
+        .map_err(|e| format!("link {path} rpc: {e}"))?
         .into_inner();
     err_if(r.is_error, &r.error_payload)
 }

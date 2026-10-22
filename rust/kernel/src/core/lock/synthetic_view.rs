@@ -44,8 +44,7 @@ impl SyntheticViewProvider for LocksView {
             format!("/{sub_path}")
         };
         kernel
-            .lock_manager_arc()
-            .list_locks(&path_prefix, MAX_LOCKS)
+            .list_advisory_locks(&path_prefix, MAX_LOCKS)
             .into_iter()
             .map(|lock| (lock.path, DT_REG))
             .collect()
