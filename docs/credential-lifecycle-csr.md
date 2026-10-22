@@ -57,5 +57,5 @@ CI's existing `cargo test --workspace --all-features` job runs the fixtures.
 The focused command is:
 
 ```sh
-cargo test -p raft --all-features transport::certgen::csr_tests --lib
+cargo test -p raft@0.1.0 --all-features transport::certgen::csr_tests --lib
 ```

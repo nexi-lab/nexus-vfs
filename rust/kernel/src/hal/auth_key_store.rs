@@ -97,6 +97,15 @@ pub trait AuthKeyStore: Send + Sync {
     /// ("could not tell"), which callers must fail closed on.
     fn get(&self, key_hash: &str) -> Result<Option<Vec<u8>>, AuthKeyStoreError>;
 
+    /// A linearizable read for recovering a mutation's unknown result.
+    /// The ordinary authentication cache read above is not this guarantee.
+    /// Implementations without a consensus/read barrier must fail closed.
+    fn get_linearizable(&self, _key_hash: &str) -> Result<Option<Vec<u8>>, AuthKeyStoreError> {
+        Err(AuthKeyStoreError::Backend(
+            "linearizable auth read is not supported".into(),
+        ))
+    }
+
     /// Upsert a record. Key-minting tooling only, never the
     /// authentication hot path.
     fn put(&self, key_hash: &str, record: &[u8]) -> Result<(), AuthKeyStoreError>;
@@ -115,6 +124,18 @@ pub trait AuthKeyStore: Send + Sync {
         }
         self.put(key_hash, record)?;
         Ok(true)
+    }
+
+    /// Strict atomic creation for immutable public issuance receipts. Unlike
+    /// the legacy method's default, this must never degrade to get-then-put.
+    fn put_if_absent_atomic(
+        &self,
+        _key_hash: &str,
+        _record: &[u8],
+    ) -> Result<bool, AuthKeyStoreError> {
+        Err(AuthKeyStoreError::Backend(
+            "atomic auth creation is not supported".into(),
+        ))
     }
 
     /// Remove a record (revocation). Returns whether a record was

@@ -47,8 +47,26 @@ impl AuthKeyStore for KernelSlotStore {
         self.kernel.auth_key_store().get(key_hash)
     }
 
+    fn get_linearizable(&self, key_hash: &str) -> Result<Option<Vec<u8>>, AuthKeyStoreError> {
+        self.kernel.auth_key_store().get_linearizable(key_hash)
+    }
+
     fn put(&self, key_hash: &str, record: &[u8]) -> Result<(), AuthKeyStoreError> {
         self.kernel.auth_key_store().put(key_hash, record)
+    }
+
+    fn put_if_absent(&self, key_hash: &str, record: &[u8]) -> Result<bool, AuthKeyStoreError> {
+        self.kernel.auth_key_store().put_if_absent(key_hash, record)
+    }
+
+    fn put_if_absent_atomic(
+        &self,
+        key_hash: &str,
+        record: &[u8],
+    ) -> Result<bool, AuthKeyStoreError> {
+        self.kernel
+            .auth_key_store()
+            .put_if_absent_atomic(key_hash, record)
     }
 
     fn delete(&self, key_hash: &str) -> Result<bool, AuthKeyStoreError> {
@@ -86,6 +104,14 @@ mod tests {
                 .lock()
                 .insert(key_hash.to_string(), record.to_vec());
             Ok(())
+        }
+        fn put_if_absent(&self, key_hash: &str, record: &[u8]) -> Result<bool, AuthKeyStoreError> {
+            let mut rows = self.records.lock();
+            if rows.contains_key(key_hash) {
+                return Ok(false);
+            }
+            rows.insert(key_hash.into(), record.to_vec());
+            Ok(true)
         }
         fn delete(&self, key_hash: &str) -> Result<bool, AuthKeyStoreError> {
             Ok(self.records.lock().remove(key_hash).is_some())
@@ -145,5 +171,46 @@ mod tests {
             .resolve(&AuthCredentials::from_token(KEY))
             .expect("the provider must see the newly installed store");
         assert_eq!(ctx.agent_id.as_deref(), Some("mac-ai"));
+    }
+
+    #[test]
+    fn slot_preserves_atomic_and_consistent_backend_operations() {
+        // A backend can refuse a CAS even when a local GET sees absence.
+        // Get-then-put would incorrectly report success and overwrite it.
+        struct BarrierStore;
+        impl AuthKeyStore for BarrierStore {
+            fn get(&self, _: &str) -> Result<Option<Vec<u8>>, AuthKeyStoreError> {
+                Ok(None)
+            }
+            fn put(&self, _: &str, _: &[u8]) -> Result<(), AuthKeyStoreError> {
+                panic!("CAS must not degrade to put")
+            }
+            fn put_if_absent(&self, _: &str, _: &[u8]) -> Result<bool, AuthKeyStoreError> {
+                Ok(false)
+            }
+            fn put_if_absent_atomic(&self, _: &str, _: &[u8]) -> Result<bool, AuthKeyStoreError> {
+                Ok(false)
+            }
+            fn get_linearizable(&self, _: &str) -> Result<Option<Vec<u8>>, AuthKeyStoreError> {
+                Ok(Some(b"committed-winner".to_vec()))
+            }
+            fn delete(&self, _: &str) -> Result<bool, AuthKeyStoreError> {
+                unreachable!()
+            }
+            fn list(&self) -> Result<Vec<(String, Vec<u8>)>, AuthKeyStoreError> {
+                unreachable!()
+            }
+        }
+        let kernel = Arc::new(Kernel::new());
+        let slot = KernelSlotStore::new_arc(kernel.clone());
+        assert!(slot.put_if_absent_atomic("agent:a", b"candidate").is_err());
+        assert!(slot.get_linearizable("agent:a").is_err());
+        kernel.set_auth_key_store(Arc::new(BarrierStore));
+        assert!(!slot.put_if_absent("agent:a", b"candidate").unwrap());
+        assert!(!slot.put_if_absent_atomic("agent:a", b"candidate").unwrap());
+        assert_eq!(
+            slot.get_linearizable("agent:a").unwrap(),
+            Some(b"committed-winner".to_vec())
+        );
     }
 }

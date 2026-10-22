@@ -139,8 +139,15 @@ pub fn mint_agent_authz(
     })?;
     let key = agent_store_key(&record.subject_id);
     if allow_existing {
-        // Rotation: overwrite the name's record in place.
-        return store.put(&key, &bytes);
+        if let Some(existing) = store.get(&key)? {
+            crate::agent_issuance::require_legacy_agent_record(&existing, &record.subject_id)?;
+            // An existing legacy row cannot become a managed claim: managed
+            // issuance only inserts absent names, and agent rows cannot be
+            // deleted through token revocation (see revoke_key_hash).
+            return store.put(&key, &bytes);
+        }
+        // A previously absent name still needs the apply-time CAS. A read
+        // followed by an upsert could overwrite a concurrent managed claim.
     }
     // Uniqueness is enforced at raft APPLY via the store's CAS put-if-absent
     // (keyed by `agent:<name>`), not a client-side read-then-write: two nodes
@@ -199,6 +206,11 @@ pub fn revoke_key_hash(
     store: &Arc<dyn AuthKeyStore>,
     key_hash: &str,
 ) -> Result<bool, AuthKeyStoreError> {
+    if key_hash.starts_with("agent:") {
+        return Err(AuthKeyStoreError::Backend(
+            "agent name claims are permanent; revoke the certificate through the CA revocation path".into(),
+        ));
+    }
     store.delete(key_hash)
 }
 
