@@ -1,103 +1,135 @@
-# Atomic first-agent claim and public receipt foundation
+# Immutable agent intent and selected final certificate
 
-This source slice adds storage helpers, not an issuance RPC or a production
-rollout. It builds on the caller-owned CSR signing foundation. A minter must
-authenticate and authorize the caller, verify its CSR, select the trusted
-issuer/profile and check revocation before constructing a candidate. Those
-transport/policy gates are not implemented by this storage module.
+This slice proves isolated crypto/storage composition. It enables no RPC,
+production signing, renewal, deployment or client activation. It supersedes
+the unshipped signed-candidate prototype: a losing signed identity must not
+be recoverable from the Raft WAL by a holder of the corresponding CSR key.
 
-## One name, one record, one apply
+## Two records in the existing control store
 
-`auth::agent_issuance` stores the existing `AuthKeyRecord` fields at the JSON
-top level and adds one reserved `credential_lifecycle` field containing a
-versioned public receipt. The existing `agent:<name>` claim and its receipt
-are the same value, inserted once using the existing control-zone Raft CAS.
-There is no second claim registry, database, journal, daemon or Raft command.
-Legacy `AuthKeyRecord::decode`, provider and listing readers ignore the extra
-field and keep reading the same identity record.
+- **I**, at the existing cluster-global `agent:<name>` key: the legacy
+  AuthKeyRecord JSON prefix plus version-2 `credential_lifecycle`. This
+  binds verified caller, owner, issuer fingerprint, actor name, operation ID
+  and canonical request digest to the complete unsigned X.509 TBS, verified
+  SPKI, positive serial and second-precision validity window. Name claim and
+  unsigned identity are one apply-time put_if_absent. No signature exists
+  before this selection.
+- **F**, at `credential-final:<SHA256(canonical I)>`: version, intent hash,
+  TBS hash, serial and selected final DER. Another immutable put_if_absent
+  in the SAME existing auth control store, using the SAME Raft command.
+  No second registry, issuer, journal, database or daemon.
 
-The receipt binds issuer fingerprint, authenticated caller and owner, agent
-name, operation ID, full canonical request digest, and the exact public
-certificate DER/serial. A competing operation or changed request returns a
-typed Conflict. An identical request returns the committed bytes, even when
-a newly signed candidate has a different serial/signature. No private key
-or token belongs in this record.
+The digest is domain separated (nexus-agent-intent-v2 followed by NUL) over
+the serialized typed intent, whose fields are ordered and contain no maps.
+Versions, names, SPKI, serial, validity and TBS/DER sizes are bounded.
+Unknown versions fail closed rather than reinterpret policy after upgrade.
 
-The HAL's explicit `put_if_absent_atomic` and `get_linearizable` default to
-errors. The Raft driver delegates them to its existing apply-time CAS and
-ReadIndex barrier. `KernelSlotStore` forwards both and also forwards the
-existing legacy `put_if_absent`: previously that wrapper accidentally used
-the trait's get-then-put default, losing the installed backend's CAS.
+| Observed records | Derived state | Recovery |
+|---|---|---|
+| No I at this barrier | NotObserved | Retain original key/CSR/op; an in-flight proposal may still commit |
+| I and no F | IntentCommitted | Recheck current authority, sign only exact I, select F |
+| I and F | Finalized | Recheck current authority and return only stored F |
 
-## Legacy rotation invariant
+There is no mutable takeover journal.
 
-Legacy rotation may update an existing, readable legacy agent row. It cannot
-overwrite any `credential_lifecycle` marker, including malformed or future
-versions. If its initial read finds no row, it must insert with CAS rather
-than upsert: a managed insert might win after that read.
+## Serialize without a signing key, then guard the existing signer
 
-The existing-row guard depends on a permanent name binding: managed claims
-only insert absent names, and supported token revoke-by-hash now rejects
-all `agent:` keys. Certificate revocation continues through the existing CA
-CRL path. Therefore a readable legacy row cannot be deleted and replaced by
-a managed row between its class check and legacy update. Legacy rotations
-of that row remain legacy. This is a state-transition invariant, not a claim
-that read-then-upsert is a general CAS.
+prepare_agent_csr_intent verifies bounded P-256 CSR proof using the existing
+verifier, discards all requested policy and builds the ordinary-agent v1
+profile through the existing policy builder. A public-only SigningKey
+adapter captures rcgen's exact TBS and refuses signing. Preparation does not
+accept the CA private key. Issuer DN encoding, algorithm identifiers,
+extensions, SPKI, serial and validity are committed as bytes, rather than
+a profile label that might later change.
 
-Every writer must use these guarded routes. An old issuer binary or direct
-operator mutation of the raw store is outside the invariant. Enabling the
-future CSR RPC requires the authoritative writer upgrade first; compatibility
-with legacy readers does not authorize unguarded legacy writers. No running
-writer is upgraded by this slice.
+Only after I is committed does finalize_agent_issuance call its trusted
+crypto adapter with the stored winning intent. sign_committed_agent_intent
+uses the SAME existing CA loader and rcgen signer. It verifies exact issuer
+fingerprint, current CA/signing capability, matching CA key, leaf validity,
+subject algorithm and policy. A guarded key compares the encoder's entire
+TBS with I BEFORE delegating to the real CA key. Changed bytes, fields,
+algorithms or issuer encodings are refused. Output is parsed and its
+signature, TBS and serial checked again.
 
-## Unknown and replay authorization
+Concurrent finalizers may produce randomized ECDSA encodings of the SAME
+committed TBS/serial. F's CAS selects one encoding. Both winners and losers
+read F back; ONLY that stored DER is returned or replayed. This promises
+exact returned-certificate replay, not one mathematically possible ECDSA
+signature. Losing F proposals can contain a valid encoding of the already
+committed identity. Losing I proposals contain no signature. No expanded
+log-reader trust or TLS receipt lookup is added to admission.
 
-Store failures are Unknown, including a reply lost after the real apply or a
-failed read barrier. The client retains the same private key, CSR, operation
-ID and request binding. A query uses a read barrier and checks issuer,
-authenticated caller, owner and name before comparing operation/digest.
-Knowing an operation ID confers no query/replay authority. A missing result
-means only "not observed at this read barrier": an in-flight proposal may
-still commit. It never permits a fresh operation, key or name.
+## Crash, Unknown and current authorization
 
-Caller authorization is re-evaluated by the future RPC handler for every
-attempt/query. A receipt is not a bearer credential. Expired, lost or revoked
-authentication requires explicit operator recovery; receipt storage does not
-provide a re-mint or a recovery bypass. Pending key/CSR/op persistence and
-leaf activation remain a separate client-side slice.
+Crashes before I apply, after I, after signing, after F apply and before
+response retain the same client key, CSR, operation and request binding.
+Signing failure after I never elects another serial/key. Lost commit replies
+and failed read barriers return Unknown. Replaying F never signs again.
+An absent linearizable query is absence at that barrier, not proof that a
+prior submission cannot still apply.
 
-## Sign-before-CAS consensus log boundary
+The coordinator requires a per-request IssuanceAuthorizer from the future
+composition root. It derives identity from authenticated caller context and
+checks current caller validity, CRL, owner and applicable policy. Checks
+apply to commit/query/replay, before signing/F CAS and before returning a
+certificate. Receipt strings, operation IDs and the expired legacy prefix
+grant no authority. Changed request/op is a typed Conflict; changed
+issuer/caller/owner is refused. Lost, expired or revoked authentication
+requires explicit operator recovery, never silent remint or allow_existing.
 
-Signing before the atomic insert preserves exact committed certificate bytes
-despite randomized signatures and serials. The coordinator exposes only the
-winner and does not application-log a losing certificate. However the Raft
-proposal carries the candidate value BEFORE apply. A failed-CAS candidate
-can therefore remain in consensus logs/WAL even though it is absent from the
-final claim row. This design cannot promise that losers were never persisted.
+Owner-only pending key/CSR/op persistence, transport policy/CRL wiring and
+activation are NOT implemented here. Fleet/session/runtime paths are unchanged.
 
-A CSR holder already owns the corresponding private key. If it can also read
-those logs, it may recover a cryptographically valid losing leaf. The current
-CA-chain/CRL verifier does not consult this receipt to reject such a serial.
-Before RPC/renewal integration, the issuer policy must explicitly accept
-consensus-log access as trusted issuer/operator authority, or add an agreed
-admission check for the committed serial. This slice enables neither option
-and must not be described as enforcing one valid leaf cryptographically.
+## Legacy reader/cache and writer compatibility
 
-## Isolated CI coverage
+I retains a decodable legacy prefix with expires_at_ms=0 and revoked=false.
+Legacy authentication refuses expiry; name dedup still sees a permanent
+binding. This sentinel is NOT operator revocation and cannot override
+current authorization/CRL. F completion never activates the legacy row.
+Existing certificate identity remains CA-chain/CRL based, with no receipt
+store lookup.
 
-Unit fixtures exercise the one-row layout, legacy decoding and rotation,
-changed operations/requests, unauthorized queries, a lost commit reply,
-unknown/future markers, unsupported stores, and the absent-read/managed-insert
-race. A cluster-profile fixture uses a real one-voter control zone through the
-kernel slot: eight competing operations, one winner, a lost reply after real
-Raft apply, shutdown, persisted-zone reopen and exact certificate recovery.
-Existing provider/list/legacy rotation tests remain in the workspace CI.
+Every managed marker, including malformed/future versions, refuses legacy
+allow_existing rotation. A legacy absent-read must insert with CAS, never
+upsert over a concurrent I. Existing readable legacy rows can rotate as
+legacy: managed insertion requires absence, and supported token revocation
+cannot delete the name binding.
+
+Token revoke-by-hash refuses agent: AND the entire credential- namespace,
+including F and future renewal intents. Token mint/revoke derive HMAC hex
+keys and cannot address these reserved keys. Supported legacy upsert/delete
+paths cannot erase I or F. Old issuer binaries/raw operator store mutation
+are outside this invariant: authoritative writers must be upgraded before
+future RPC enablement. No running writer is upgraded by this slice.
+
+Strict atomic CAS and linearizable read APIs default to errors, never weak
+fallbacks. Raft uses existing apply-time CAS/ReadIndex. KernelSlotStore
+forwards those plus the legacy CAS; its old trait-default get-then-put
+wrapper would otherwise discard the backend CAS.
+
+## Isolated CI fixtures
+
+- Crypto: public-only unsigned TBS; hostile CSR policy discarded;
+  key/serial/time/issuer/TBS mutations refused; repeated signatures verify
+  against the same committed TBS/serial.
+- Storage: competing operations, immutable I/F, current-authority revocation,
+  crash at I/sign/F/response, exact stored DER, concurrent finalizers,
+  reserved deletes, malformed schemas and unsupported stores failing closed.
+- Readers: real legacy decoding and token provider/cache rejection of
+  incomplete prefixes; ordinary legacy authentication, invalidation and
+  rotation stay compatible. This does not pretend the token fixture tests
+  the independent certificate identity plane.
+- Composition: real one-voter Raft through KernelSlotStore; eight distinct
+  CSR operations/one unsigned winner; concurrent real ECDSA finalizers;
+  lost replies after actual I/F apply; crash after signing; persisted-zone
+  reopen without changing original intent. Restart waits for leader entry
+  apply before ReadIndex, without warm-up writes or production Raft changes.
+
+Commands run in CI, with no local Cargo build:
 
 ```sh
+cargo test -p raft@0.1.0 --all-features transport::certgen::csr_intent --lib
 cargo test -p auth agent_issuance --lib
 cargo test -p auth slot_store --lib
 cargo test -p nexus-cluster --test agent_issuance_receipts
 ```
-
-Ordinary NodeRenew/AgentRenew RPCs, revoked-caller authorization, owner-only
-pending state, activation and cohost capability wiring remain later slices.

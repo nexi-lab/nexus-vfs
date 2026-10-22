@@ -8,6 +8,7 @@
 pub mod agent_context;
 pub mod agent_pid;
 pub mod constants;
+pub mod credential_intent;
 pub mod lock_state;
 pub mod operation_context;
 pub mod operation_id;
@@ -25,6 +26,7 @@ pub use constants::{
     SESSIONS_BASE, SHARE_REGISTRY_PREFIX, SYSTEM_PATH_PREFIX, USER_RUNTIME_MAX_VALIDITY_SECS,
     VFS_ROOT, ZONES_PATH_PREFIX,
 };
+pub use credential_intent::{AgentCertificateIntent, SignedAgentCertificate};
 pub use lock_state::{HolderInfo, LockAcquireResult, LockEntry, LockInfo, LockState, Locks};
 pub use operation_context::OperationContext;
 pub use operation_id::{validate_operation_id, OperationIdError};

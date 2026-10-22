@@ -146,6 +146,7 @@ pem = "3"
 x509-parser = "0.18"
 
 [dev-dependencies]
+rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
 sqlx = { workspace = true, features = ["runtime-tokio", "sqlite"] }
 permission = { workspace = true }
 prost = { workspace = true }

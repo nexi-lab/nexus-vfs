@@ -206,9 +206,9 @@ pub fn revoke_key_hash(
     store: &Arc<dyn AuthKeyStore>,
     key_hash: &str,
 ) -> Result<bool, AuthKeyStoreError> {
-    if key_hash.starts_with("agent:") {
+    if crate::agent_issuance::is_reserved_lifecycle_key(key_hash) {
         return Err(AuthKeyStoreError::Backend(
-            "agent name claims are permanent; revoke the certificate through the CA revocation path".into(),
+            "credential lifecycle records are immutable; revoke certificates through the CA revocation path".into(),
         ));
     }
     store.delete(key_hash)
