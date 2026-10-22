@@ -8,10 +8,10 @@
 //!   - **Advisory lock** (user-facing): try-once, hierarchy-aware, TTL-based,
 //!     explicit lock_id via `acquire_lock` / `release_lock` / `extend_lock`.
 //!     Mutations go through the installed `Locks` HAL backend (`LocalLocks`
-//!     by default, swapped via `install_locks` at federation mount time);
-//!     every backend mutates the same shared `Arc<Mutex<contracts::LockState>>`,
-//!     so a replicated apply-path commit is visible to a local read without
-//!     a quorum round-trip.
+//!     by default for an embedded kernel). A federated kernel resolves each
+//!     advisory operation's mounted zone through `DistributedCoordinator`;
+//!     it does not install one zone as a process-wide lock domain. Reads use
+//!     that zone's apply-owned state without a quorum round-trip.
 
 pub mod locks;
 pub mod synthetic_view;
