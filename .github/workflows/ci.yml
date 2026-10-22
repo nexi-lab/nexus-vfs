@@ -28,7 +28,7 @@ jobs:
         with:
           shared-key: ci-database-bootstrap-${{ matrix.os }}
       - run: cargo test -p lib --features redb-storage redb_storage::tests --lib
-      - run: cargo test -p raft@0.1.0 --lib zone_runtime::tests raft::storage::tests raft::replication_log::tests raft::zone_persistence::tests
+      - run: cargo test -p raft@0.1.0 --lib -- zone_runtime::tests raft::storage::tests raft::replication_log::tests raft::zone_persistence::tests
 
   secret-file-permissions:
     name: Secret file permissions / ${{ matrix.os }}
