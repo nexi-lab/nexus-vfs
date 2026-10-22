@@ -126,6 +126,13 @@ both replicas, with no revision allocation. A second test exercises a follower
 receiving a future EC image before its first SC create: it ACKs without applying
 that image and later applies the explicit SC create unchanged.
 
+A separate isolated one-voter integration fixture exercises the actual node
+admission and gRPC replication paths. Protected local proposals leave the WAL's
+maximum sequence unchanged. ReplicateEntries and SnapshotEcState acknowledge
+skipped protected entries, apply unrelated entries, and leave both the managed
+image and its allocator absent. This is a node/RPC boundary check, not public
+file-CAS or mixed-version acceptance.
+
 This foundation still does not complete N2. Before exposing any file capability:
 
 - Every voter and learner must implement the policy and the command encoding.
@@ -171,6 +178,13 @@ fall through to a current-path fetch with an old generation.
    existing data, identities, certificates and durable reader values before any
    coordinated backend change. Migration uses native APIs and verified bytes;
    operator cursor edits or resets are not an acceptance method.
+   The S6 adoption seam can move only the regular-file reader registers into
+   the managed subtree; transcripts and their stream positions stay on their
+   existing mount. Under the original reader lock, an absent new register is
+   conditionally created from the verified legacy register value, including
+   its durable offset. The lock path stays shared with old clients. The path
+   switch and this seed branch must ship together; absence must not reset a
+   migrated reader to zero. Mixed old writers remain at-least-once.
 6. Land S6 binding against a real released NexusVFS tag, then verify a stopped or
    frozen old owner cannot regress the newer claimant's committed cursor. Source
    availability, distinct-identity F6, successful send and lease renewal do not
@@ -178,3 +192,9 @@ fall through to a current-path fetch with an old generation.
 
 The existing F6 archive remains frozen. This work introduces its own isolated
 fixtures and receipts and does not reuse the 30 old directed cases as proof.
+
+ReadVersioned and WriteIfVersion must be advertised as one paired capability.
+Absent is a distinct result, stale reads must still pair one image with its own
+token, and a possibly submitted write error is Unknown. The internal allocator
+already allocates across the whole zone rather than independently per path;
+the external token format and real incarnation lifecycle remain to be frozen.
