@@ -16,7 +16,9 @@ $a=Get-Acl -LiteralPath $env:NEXUS_RECORD_ACL_TARGET
 [pscustomobject]@{current=$s;owner=$a.GetOwner([Security.Principal.SecurityIdentifier]).Value;protected=$a.AreAccessRulesProtected;rules=@($a.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]) | ForEach-Object {[pscustomobject]@{sid=$_.IdentityReference.Value;type=$_.AccessControlType.ToString()}})} | ConvertTo-Json -Depth 4 -Compress'''
     result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', command],
                             env={**os.environ, 'NEXUS_RECORD_ACL_TARGET': str(path)},
-                            capture_output=True, text=True, timeout=10, check=True)
+                            capture_output=True, text=True, timeout=10)
+    if result.returncode:
+        raise OSError(f'Windows ACL query failed: {result.stderr.strip()}')
     return json.loads(result.stdout)
 
 
