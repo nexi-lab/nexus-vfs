@@ -1499,6 +1499,13 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
     ///
     /// Latency: ~5-50μs (redb write, no network).
     pub async fn propose_ec_local(&self, command: Command) -> Result<u64> {
+        // Reject BEFORE appending to the EC WAL. A successful-looking local
+        // no-op would otherwise be returned as a replicated write token.
+        if command.requires_conditional_sc() {
+            return Err(RaftError::InvalidState(
+                "EC write to SC-managed content is unsupported".into(),
+            ));
+        }
         let repl_log = self.replication_log.as_ref().ok_or_else(|| {
             RaftError::InvalidState("EC local writes require a ReplicationLog".into())
         })?;
@@ -1541,6 +1548,10 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         command: Command,
         entry_timestamp: u64,
     ) -> Result<CommandResult> {
+        if command.requires_conditional_sc() {
+            tracing::warn!("acknowledging skipped EC entry for SC-managed content");
+            return Ok(CommandResult::Success);
+        }
         let mut sm = self.state_machine.write().await;
         sm.apply_ec_with_lww(&command, entry_timestamp)
     }
