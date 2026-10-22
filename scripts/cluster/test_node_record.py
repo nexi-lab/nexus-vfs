@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 SOURCE = Path(__file__).with_name('publish-node-record.py')
 spec = importlib.util.spec_from_file_location('node_record', SOURCE)
@@ -18,6 +19,20 @@ RECORD = dict(version=1, endpoint='127.0.0.1:2126',
 
 
 class Publication(unittest.TestCase):
+    @unittest.skipUnless(os.name == 'nt', 'Windows PowerShell module discovery')
+    def test_windows_acl_ignores_parent_powershell_module_path(self):
+        with tempfile.TemporaryDirectory(prefix='nexus-record-modules-') as temporary:
+            module = Path(temporary) / 'Microsoft.PowerShell.Security'
+            module.mkdir()
+            (module / 'Microsoft.PowerShell.Security.psd1').write_text(
+                "@{RootModule='missing.psm1';ModuleVersion='99.0';"
+                "GUID='ce5b150c-b777-4426-822d-a714f62f2a02';"
+                "CmdletsToExport=@('Get-Acl')}\n", encoding='utf-8')
+            # A pwsh parent can export modules that Windows PowerShell cannot
+            # load. The publisher must use its own native module environment.
+            with patch.dict(os.environ, {'PSModulePath': temporary}):
+                self.assertTrue(publisher.windows_acl(Path(temporary))['current'])
+
     def test_private_idempotent_and_no_clobber(self):
         with tempfile.TemporaryDirectory(prefix='nexus-record-') as temporary:
             target = Path(temporary) / 'run' / 'node.json'

@@ -14,8 +14,14 @@ def windows_acl(path):
     command = r'''$s=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $a=Get-Acl -LiteralPath $env:NEXUS_RECORD_ACL_TARGET
 [pscustomobject]@{current=$s;owner=$a.GetOwner([Security.Principal.SecurityIdentifier]).Value;protected=$a.AreAccessRulesProtected;rules=@($a.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]) | ForEach-Object {[pscustomobject]@{sid=$_.IdentityReference.Value;type=$_.AccessControlType.ToString()}})} | ConvertTo-Json -Depth 4 -Compress'''
+    # A PowerShell 7 host exports its own PSModulePath. Passing that to
+    # Windows PowerShell 5 can select an incompatible Security module and
+    # make Get-Acl unavailable. Let this child resolve its native modules.
+    environment = {key: value for key, value in os.environ.items()
+                   if key.upper() != 'PSMODULEPATH'}
+    environment['NEXUS_RECORD_ACL_TARGET'] = str(path)
     result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', command],
-                            env={**os.environ, 'NEXUS_RECORD_ACL_TARGET': str(path)},
+                            env=environment,
                             capture_output=True, text=True, timeout=10)
     if result.returncode:
         raise OSError(f'Windows ACL query failed: {result.stderr.strip()}')
