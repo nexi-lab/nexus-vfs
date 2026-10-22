@@ -295,3 +295,36 @@ fn leaf_validity_never_exceeds_issuer_expiry() {
         assert!(leaf.validity().not_after > leaf.validity().not_before);
     }
 }
+
+#[test]
+fn fixed_committed_parameters_replay_exact_tbs_and_serial() {
+    // Feasibility fixture for the proposed commit-then-sign contract. This
+    // does not change the current coordinator or expose a signing RPC.
+    let (ca_pem, ca_key) = generate_zone_ca("isolated-intent-fixture").unwrap();
+    let (_, csr) = caller();
+    let public_key = verified_csr_key(&csr).unwrap();
+    let issuer = ca_issuer_from_pem(&ca_pem, &ca_key).unwrap();
+    let now_secs = time::OffsetDateTime::now_utc().unix_timestamp();
+    let mut params =
+        agent_certificate_params("committed-actor", None, time::Duration::seconds(120), None)
+            .unwrap();
+    params.serial_number = Some(rcgen::SerialNumber::from_slice(&[1, 2, 3, 4]));
+    params.not_before = time::OffsetDateTime::from_unix_timestamp(now_secs - 1).unwrap();
+    params.not_after = time::OffsetDateTime::from_unix_timestamp(now_secs + 120).unwrap();
+    let first = params.signed_by(&public_key, &issuer).unwrap();
+    let second = params.signed_by(&public_key, &issuer).unwrap();
+    let (_, first_x509) = X509Certificate::from_der(first.der().as_ref()).unwrap();
+    let (_, second_x509) = X509Certificate::from_der(second.der().as_ref()).unwrap();
+    assert_eq!(first_x509.raw_serial(), &[1, 2, 3, 4]);
+    assert_eq!(first_x509.raw_serial(), second_x509.raw_serial());
+    assert_eq!(
+        first_x509.tbs_certificate.as_ref(),
+        second_x509.tbs_certificate.as_ref()
+    );
+    let ca_der = ::pem::parse(ca_pem).unwrap();
+    let (_, ca) = X509Certificate::from_der(ca_der.contents()).unwrap();
+    first_x509.verify_signature(Some(ca.public_key())).unwrap();
+    second_x509.verify_signature(Some(ca.public_key())).unwrap();
+    // Full certificate/signature bytes are deliberately not compared: the
+    // existing ECDSA signer is randomized while the signed TBS stays fixed.
+}

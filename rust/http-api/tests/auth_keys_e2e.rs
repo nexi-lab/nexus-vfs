@@ -4,8 +4,9 @@
 //! `AppState` whose `auth_key_store` is a hand-rolled in-memory
 //! double (populated with pre-encoded `AuthKeyRecord` bytes).
 //! The list handler reads the store, decodes each row, filters by
-//! query params, and shapes the response.  Revoke calls
-//! `store.delete(hash)`.  Same wire shape the raft-backed store
+//! query params, and shapes the response. Revoke uses the shared
+//! reserved-lifecycle-key guard before deleting ordinary token hashes.
+//! Same wire shape the raft-backed store
 //! serves in production.
 
 use std::sync::Arc;
@@ -359,6 +360,72 @@ async fn list_soft_skips_undecodable_row() {
 }
 
 // ── DELETE /v2/auth/keys/:key_hash tests ─────────────────────────
+
+/// Even an authenticated admin cannot delete immutable I/F or future lifecycle
+/// records through a legacy token endpoint. This exercises the real HTTP
+/// route, which previously bypassed auth::revoke_key_hash via store.delete.
+#[tokio::test]
+async fn revoke_cannot_erase_agent_intent_final_or_future_lifecycle_records() {
+    let (base, store, _h) = spawn_test_server(vec![]).await;
+    let reserved = [
+        "agent:fixture-agent",
+        "credential-final:fixture-intent-digest",
+        "credential-renewal-intent:fixture-prior-serial",
+        "credential-future:unknown-version",
+    ];
+    for key in reserved {
+        store.put(key, b"opaque immutable lifecycle bytes").unwrap();
+    }
+    let before = store.list().unwrap();
+    for key in reserved
+        .into_iter()
+        .chain(["credential-final:not-yet-observed"])
+    {
+        let response = reqwest::Client::new()
+            .delete(format!("{base}/v2/auth/keys/{key}"))
+            .bearer_auth("admin-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST, "{key}");
+    }
+    assert_eq!(store.list().unwrap(), before);
+}
+
+#[tokio::test]
+async fn list_preserves_expired_managed_prefix_and_skips_final_certificate_schema() {
+    let (base, store, _h) = spawn_test_server(vec![]).await;
+    let mut record = sample_record("managed", "fixture-agent", false, false);
+    record.subject_type = SubjectType::Agent;
+    record.zone_perms.clear();
+    record.expires_at_ms = Some(0);
+    let mut row = serde_json::to_value(record).unwrap();
+    // A future marker still decodes as an expired legacy audit record.
+    row["credential_lifecycle"] = json!({"schema_version": 999});
+    store
+        .put("agent:fixture-agent", &serde_json::to_vec(&row).unwrap())
+        .unwrap();
+    store
+        .put(
+            "credential-final:fixture",
+            br#"{"schema_version":1,"certificate_der":[1]}"#,
+        )
+        .unwrap();
+    let response: serde_json::Value = reqwest::Client::new()
+        .get(format!("{base}/v2/auth/keys"))
+        .bearer_auth("admin-token")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let keys = response["keys"].as_array().unwrap();
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0]["key_hash"], "agent:fixture-agent");
+    assert_eq!(keys[0]["expires_at_ms"], 0);
+    assert_eq!(keys[0]["revoked"], false);
+}
 
 /// Happy path: revoke an existing key returns 200 with existed=true;
 /// the store row is really gone.

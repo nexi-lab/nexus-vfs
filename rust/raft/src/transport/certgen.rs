@@ -539,6 +539,9 @@ fn agent_certificate_params(
 #[cfg(test)]
 mod csr_tests;
 
+mod csr_intent;
+pub use csr_intent::{prepare_agent_csr_intent, sign_committed_agent_intent};
+
 /// Generate a self-signed root CA certificate for a zone.
 ///
 /// Mirrors Python `nexus.security.tls.certgen.generate_zone_ca`:

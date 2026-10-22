@@ -63,6 +63,7 @@
 //! the other. Once this is wired, that Python store is a second auth SSOT and
 //! must be retired.
 
+pub mod agent_issuance;
 pub mod mint;
 pub mod provider;
 pub mod record;
