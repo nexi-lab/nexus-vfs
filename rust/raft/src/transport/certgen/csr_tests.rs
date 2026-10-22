@@ -21,13 +21,11 @@ fn caller() -> (KeyPair, Vec<u8>) {
 fn issuer(adjust: impl FnOnce(&mut CertificateParams)) -> (Vec<u8>, Vec<u8>) {
     let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
     let now = time::OffsetDateTime::now_utc();
-    let mut params = CertificateParams {
-        is_ca: IsCa::Ca(BasicConstraints::Constrained(0)),
-        key_usages: vec![KeyUsagePurpose::KeyCertSign],
-        not_before: now - time::Duration::minutes(1),
-        not_after: now + time::Duration::days(365),
-        ..CertificateParams::default()
-    };
+    let mut params = CertificateParams::default();
+    params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+    params.not_before = now - time::Duration::minutes(1);
+    params.not_after = now + time::Duration::days(365);
     params
         .distinguished_name
         .push(DnType::CommonName, "isolated CSR fixture issuer");
@@ -37,20 +35,18 @@ fn issuer(adjust: impl FnOnce(&mut CertificateParams)) -> (Vec<u8>, Vec<u8>) {
 }
 
 fn untrusted_request(key: &KeyPair) -> Vec<u8> {
-    let mut params = CertificateParams {
-        subject_alt_names: vec![
-            SanType::URI("nexus://agent/forged".try_into().unwrap()),
-            SanType::URI("nexus://owner/forged".try_into().unwrap()),
-            SanType::URI("nexus://zone/forged/node/1".try_into().unwrap()),
-            SanType::DnsName("attacker.invalid".try_into().unwrap()),
-        ],
-        key_usages: vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign],
-        extended_key_usages: vec![
-            ExtendedKeyUsagePurpose::Any,
-            ExtendedKeyUsagePurpose::ServerAuth,
-        ],
-        ..CertificateParams::default()
-    };
+    let mut params = CertificateParams::default();
+    params.subject_alt_names = vec![
+        SanType::URI("nexus://agent/forged".try_into().unwrap()),
+        SanType::URI("nexus://owner/forged".try_into().unwrap()),
+        SanType::URI("nexus://zone/forged/node/1".try_into().unwrap()),
+        SanType::DnsName("attacker.invalid".try_into().unwrap()),
+    ];
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    params.extended_key_usages = vec![
+        ExtendedKeyUsagePurpose::Any,
+        ExtendedKeyUsagePurpose::ServerAuth,
+    ];
     params
         .distinguished_name
         .push(DnType::CommonName, "forged administrator");
@@ -219,13 +215,11 @@ fn malformed_oversized_multiblock_and_trailing_der_requests_are_rejected() {
 fn unknown_requested_extension_fails_closed() {
     let (ca_pem, ca_key) = generate_zone_ca("root").unwrap();
     let (key, _) = caller();
-    let params = CertificateParams {
-        custom_extensions: vec![CustomExtension::from_oid_content(
-            &[1, 2, 3, 4, 5],
-            vec![5, 0],
-        )],
-        ..CertificateParams::default()
-    };
+    let mut params = CertificateParams::default();
+    params.custom_extensions = vec![CustomExtension::from_oid_content(
+        &[1, 2, 3, 4, 5],
+        vec![5, 0],
+    )];
     let csr = request(params, &key);
     assert!(sign_agent_csr("agent", &csr, &ca_pem, &ca_key).is_err());
 }
