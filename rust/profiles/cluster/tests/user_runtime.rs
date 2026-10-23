@@ -946,6 +946,97 @@ async fn boot_refuses_cluster_authority_and_a_client_only_identity_before_creati
 }
 
 #[tokio::test]
+async fn restart_with_expired_identity_waits_for_renewal_without_losing_owner_data() {
+    let root = tempfile::tempdir().unwrap();
+    let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let (cert, key) =
+        generate_user_runtime_cert("runtime-alice", "alice", 300, &ca, &ca_key).unwrap();
+    let credential_dir = root.path().join("server-credential");
+    bundle(&credential_dir, "runtime-alice", "alice", &ca, &cert, &key);
+    let (client_cert, client_key) =
+        generate_session_agent_cert("session-alice", "alice", 300, &ca, &ca_key).unwrap();
+    let client = bundle(
+        &root.path().join("client"),
+        "session-alice",
+        "alice",
+        &ca,
+        &client_cert,
+        &client_key,
+    );
+    let data = root.path().join("data");
+    let port = free_port();
+    let mut daemon = start(&data, &credential_dir, "alice", port);
+    daemon
+        .wait_for_log("confined user runtime ready", BUDGET)
+        .await
+        .unwrap();
+    let mut connected = Vfs::connect_as_agent(port, &client, BUDGET).await;
+    connected
+        .write_file(
+            "/agents/agent-a/memory/MEMORY.md",
+            b"retained-owner-memory",
+            "",
+        )
+        .await
+        .unwrap();
+    let original_node = std::fs::read(data.join(".node_id")).unwrap();
+    drop(connected);
+    drop(daemon);
+
+    let (expired, expired_key) =
+        generate_user_runtime_cert("runtime-alice", "alice", 1, &ca, &ca_key).unwrap();
+    let expires_at = transport::peer_identity::not_after_unix_from_pem(&expired).unwrap();
+    bundle(
+        &credential_dir,
+        "runtime-alice",
+        "alice",
+        &ca,
+        &expired,
+        &expired_key,
+    );
+    while std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        <= expires_at as u64
+    {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let mut daemon = start(&data, &credential_dir, "alice", port);
+    daemon
+        .wait_for_log("confined user runtime ready", BUDGET)
+        .await
+        .unwrap();
+    assert!(
+        dial_client(port, &client).await.is_err(),
+        "bootstrap must not make expired server authority usable"
+    );
+    let (renewed, renewed_key) =
+        generate_user_runtime_cert("runtime-alice", "alice", 300, &ca, &ca_key).unwrap();
+    bundle(
+        &credential_dir,
+        "runtime-alice",
+        "alice",
+        &ca,
+        &renewed,
+        &renewed_key,
+    );
+    daemon
+        .wait_for_log("runtime server identity rotated", BUDGET)
+        .await
+        .unwrap();
+    let mut connected = Vfs::connect_as_agent(port, &client, BUDGET).await;
+    assert_eq!(std::fs::read(data.join(".node_id")).unwrap(), original_node);
+    assert_eq!(
+        connected
+            .read_file("/agents/agent-a/memory/MEMORY.md", "")
+            .await
+            .unwrap(),
+        b"retained-owner-memory"
+    );
+}
+
+#[tokio::test]
 async fn rotation_keeps_existing_connections_and_expiry_refuses_them_until_a_valid_replacement() {
     let root = tempfile::tempdir().unwrap();
     let (ca, ca_key) = generate_zone_ca("root").unwrap();
