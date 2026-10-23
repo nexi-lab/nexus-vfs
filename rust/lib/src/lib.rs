@@ -27,6 +27,9 @@ pub mod search;
 pub mod trigram;
 pub mod types;
 
+#[cfg(feature = "redb-storage")]
+pub mod redb_storage;
+
 #[cfg(feature = "transport")]
 pub mod transport_primitives;
 

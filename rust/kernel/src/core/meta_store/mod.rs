@@ -109,20 +109,17 @@ pub struct LocalMetaStore {
 impl LocalMetaStore {
     /// Open or create a redb database at the given path.
     pub fn open(path: &Path) -> Result<Self, MetaStoreError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| MetaStoreError::IOError(format!("mkdir {}: {e}", parent.display())))?;
-        }
         let cache_bytes = std::env::var("NEXUS_REDB_CACHE_MB")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(64)
             * 1024
             * 1024;
-        let db = Database::builder()
-            .set_cache_size(cache_bytes)
-            .create(path)
-            .map_err(|e| MetaStoreError::IOError(format!("redb open {}: {e}", path.display())))?;
+        let db = lib::redb_storage::open_or_create(
+            path,
+            Database::builder().set_cache_size(cache_bytes),
+        )
+        .map_err(|e| MetaStoreError::IOError(format!("redb open {}: {e}", path.display())))?;
 
         Self::from_database(db, path)
     }

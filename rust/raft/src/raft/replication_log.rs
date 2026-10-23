@@ -399,8 +399,8 @@ mod tests {
 
     #[test]
     fn test_replication_log_persistence() {
-        let tmpfile = tempfile::NamedTempFile::new().unwrap();
-        let path = tmpfile.path().to_path_buf();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("replication.redb");
 
         // Write some entries
         {
@@ -499,8 +499,8 @@ mod tests {
 
     #[test]
     fn test_compact_persistence() {
-        let tmpfile = tempfile::NamedTempFile::new().unwrap();
-        let path = tmpfile.path().to_path_buf();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("replication.redb");
 
         // Write entries and compact
         {
@@ -548,8 +548,8 @@ mod tests {
 
     #[test]
     fn test_recovery_consistency() {
-        let tmpfile = tempfile::NamedTempFile::new().unwrap();
-        let path = tmpfile.path().to_path_buf();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("replication.redb");
 
         // Write entries
         {
@@ -582,8 +582,8 @@ mod tests {
 
     #[test]
     fn test_recovery_after_restart() {
-        let tmpfile = tempfile::NamedTempFile::new().unwrap();
-        let path = tmpfile.path().to_path_buf();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("replication.redb");
 
         let expected_seq;
         {

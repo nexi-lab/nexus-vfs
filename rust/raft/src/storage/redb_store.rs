@@ -127,18 +127,16 @@ impl RedbStore {
     /// Creates parent directories if they don't exist (matching sled behavior).
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(redb::StorageError::Io)?;
-        }
         let cache_bytes = std::env::var("NEXUS_REDB_CACHE_MB")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(64)
             * 1024
             * 1024;
-        let db = Database::builder()
-            .set_cache_size(cache_bytes)
-            .create(path)?;
+        let db = lib::redb_storage::open_or_create(
+            path,
+            Database::builder().set_cache_size(cache_bytes),
+        )?;
         Ok(Self {
             db: Arc::new(db),
             next_id: Arc::new(AtomicU64::new(0)),

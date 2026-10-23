@@ -37,6 +37,9 @@ transport = [
 # Lighter than `transport`: only tokio's rt + rt-multi-thread, no tonic/rustls.
 runtime-bridge = ["dep:tokio", "tokio/rt", "tokio/rt-multi-thread"]
 
+# Durable database bootstrap; excluded from WASM and pure algorithm callers.
+redb-storage = ["dep:redb", "dep:tempfile"]
+
 [dependencies]
 # Constants SSOT — pulled unconditionally because the crate is
 # zero-dep-cost (only `pub const` definitions). transport_primitives
@@ -54,6 +57,8 @@ blake3 = { workspace = true }
 string-interner = { workspace = true }
 regex-syntax = { workspace = true }
 crc32fast = { workspace = true }
+redb = { version = "4", optional = true }
+tempfile = { version = "3", optional = true }
 
 # Transport-primitives module deps (gated by the `transport` feature).
 tonic = { workspace = true, optional = true }
