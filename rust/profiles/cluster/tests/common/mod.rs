@@ -649,6 +649,47 @@ pub struct Vfs {
 }
 
 impl Vfs {
+    pub async fn try_lock(
+        &mut self,
+        path: &str,
+        lock_id: &str,
+        timeout_ms: u64,
+    ) -> Result<Option<String>, String> {
+        let response = self
+            .c
+            .lock(kernel::kernel::vfs_proto::LockRequest {
+                path: path.to_string(),
+                lock_id: lock_id.to_string(),
+                timeout_ms,
+                auth_token: String::new(),
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .into_inner();
+        if response.is_error {
+            return Err(String::from_utf8_lossy(&response.error_payload).into_owned());
+        }
+        Ok(response.acquired.then_some(response.lock_id))
+    }
+
+    pub async fn unlock(&mut self, path: &str, lock_id: &str) -> Result<bool, String> {
+        let response = self
+            .c
+            .unlock(kernel::kernel::vfs_proto::UnlockRequest {
+                path: path.to_string(),
+                lock_id: lock_id.to_string(),
+                force: false,
+                auth_token: String::new(),
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .into_inner();
+        if response.is_error {
+            return Err(String::from_utf8_lossy(&response.error_payload).into_owned());
+        }
+        Ok(response.released)
+    }
+
     pub async fn dial(port: u16) -> Option<Self> {
         let ch = Channel::from_shared(format!("http://127.0.0.1:{port}"))
             .expect("valid uri")

@@ -67,6 +67,13 @@ impl AuthKeyStore for RaftAuthKeyStore {
         self.inner.get(key_hash).map_err(AuthKeyStoreError::Backend)
     }
 
+    fn get_linearizable(&self, key_hash: &str) -> Result<Option<Vec<u8>>, AuthKeyStoreError> {
+        self.inner
+            .read_barrier()
+            .map_err(AuthKeyStoreError::Backend)?;
+        self.get(key_hash)
+    }
+
     #[inline]
     fn put(&self, key_hash: &str, record: &[u8]) -> Result<(), AuthKeyStoreError> {
         // AuthKeyStore::put is an upsert (rotation replaces a record in place);
@@ -85,6 +92,14 @@ impl AuthKeyStore for RaftAuthKeyStore {
         self.inner
             .put_if_absent(key_hash, record)
             .map_err(AuthKeyStoreError::Backend)
+    }
+
+    fn put_if_absent_atomic(
+        &self,
+        key_hash: &str,
+        record: &[u8],
+    ) -> Result<bool, AuthKeyStoreError> {
+        self.put_if_absent(key_hash, record)
     }
 
     #[inline]

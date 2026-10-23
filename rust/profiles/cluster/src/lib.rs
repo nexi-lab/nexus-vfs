@@ -7570,6 +7570,16 @@ mod tests {
                 .insert(k.to_string(), r.to_vec());
             Ok(())
         }
+        fn put_if_absent_atomic(&self, k: &str, r: &[u8]) -> Result<bool, AuthKeyStoreError> {
+            use std::collections::btree_map::Entry;
+            match self.records.lock().unwrap().entry(k.to_string()) {
+                Entry::Occupied(_) => Ok(false),
+                Entry::Vacant(entry) => {
+                    entry.insert(r.to_vec());
+                    Ok(true)
+                }
+            }
+        }
         fn delete(&self, k: &str) -> Result<bool, AuthKeyStoreError> {
             Ok(self.records.lock().unwrap().remove(k).is_some())
         }

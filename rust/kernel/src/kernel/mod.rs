@@ -95,6 +95,7 @@ mod dispatch;
 pub use dispatch::ServiceDecl;
 mod ipc;
 mod stream_address;
+pub use stream_address::IoTarget;
 pub(crate) use stream_address::StreamAddress;
 mod locks;
 mod mount;

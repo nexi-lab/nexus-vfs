@@ -8,8 +8,9 @@
 //! during JoinCluster to sign certs for joining nodes.
 
 use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
-    Issuer, KeyPair, KeyUsagePurpose, SanType, PKCS_ECDSA_P256_SHA256,
+    BasicConstraints, CertificateParams, CertificateSigningRequestParams, DistinguishedName,
+    DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, PublicKey, SanType,
+    PKCS_ECDSA_P256_SHA256,
 };
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
@@ -29,6 +30,9 @@ const NODE_CERT_VALIDITY_DAYS: i64 = 90;
 /// long-lived-root conventions (DigiCert / ISRG Root X1 / Amazon Root
 /// CA all sit at 10-20y).
 const CA_VALIDITY_DAYS: i64 = 365 * 10;
+
+/// A CSR is a public key and proof, not an unbounded certificate-policy input.
+const MAX_CSR_PEM_BYTES: usize = 16 * 1024;
 
 /// Scheme + authority of the identity URI SAN. Certificates are the
 /// only place a node's identity is stated in a way the far end can
@@ -105,6 +109,24 @@ pub fn generate_node_cert(
     let node_key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
         .map_err(|e| format!("Failed to generate node key: {e}"))?;
 
+    let params = node_certificate_params(node_id, zone_id, extra_hostnames, hostname)?;
+    let node_cert = params
+        .signed_by(&node_key_pair, &ca_issuer)
+        .map_err(|e| format!("Failed to sign node cert: {e}"))?;
+
+    Ok((
+        node_cert.pem().into_bytes(),
+        node_key_pair.serialize_pem().into_bytes(),
+    ))
+}
+
+/// The server's node policy is shared by local key generation and CSR signing.
+fn node_certificate_params(
+    node_id: u64,
+    zone_id: &str,
+    extra_hostnames: &[String],
+    hostname: Option<&str>,
+) -> Result<CertificateParams, String> {
     // Build node certificate parameters
     let mut params = CertificateParams::default();
 
@@ -182,15 +204,7 @@ pub fn generate_node_cert(
     params.not_before = now;
     params.not_after = now + time::Duration::days(NODE_CERT_VALIDITY_DAYS);
 
-    // Sign with CA
-    let node_cert = params
-        .signed_by(&node_key_pair, &ca_issuer)
-        .map_err(|e| format!("Failed to sign node cert: {e}"))?;
-
-    let cert_pem = node_cert.pem().into_bytes();
-    let key_pem = node_key_pair.serialize_pem().into_bytes();
-
-    Ok((cert_pem, key_pem))
+    Ok(params)
 }
 
 /// Generate an agent certificate signed by the cluster CA.
@@ -228,6 +242,153 @@ pub fn generate_agent_cert(
         ca_cert_pem,
         ca_key_pem,
     )
+}
+
+/// Sign a caller-owned P-256 node key without receiving or returning its private key.
+///
+/// `node_id`, `zone_id`, hostnames and display name MUST come from the issuer's
+/// authenticated policy. None is taken from the CSR: its signature proves key
+/// possession, while its requested DN, SANs and usages confer no authority.
+/// This helper performs no enrollment, name claim, persistence or renewal.
+pub fn sign_node_csr(
+    csr_pem: &[u8],
+    node_id: u64,
+    zone_id: &str,
+    ca_cert_pem: &[u8],
+    ca_key_pem: &[u8],
+    extra_hostnames: &[String],
+    hostname: Option<&str>,
+) -> Result<Vec<u8>, String> {
+    let key = verified_csr_key(csr_pem)?;
+    let params = node_certificate_params(node_id, zone_id, extra_hostnames, hostname)?;
+    sign_csr_certificate(&key, params, ca_cert_pem, ca_key_pem)
+}
+
+/// Sign an ordinary agent's caller-owned P-256 key using the existing agent policy.
+///
+/// The authorized `name` is supplied by the issuer, never by the CSR. The result
+/// is client-only and has neither an owner SAN nor node/server/CA capability.
+/// Owner-bound controller/runtime credentials retain their separate short-lived
+/// issuance and renewal paths. This helper does not claim or overwrite a name.
+pub fn sign_agent_csr(
+    name: &str,
+    csr_pem: &[u8],
+    ca_cert_pem: &[u8],
+    ca_key_pem: &[u8],
+) -> Result<Vec<u8>, String> {
+    let key = verified_csr_key(csr_pem)?;
+    let params = agent_certificate_params(
+        name,
+        None,
+        time::Duration::days(NODE_CERT_VALIDITY_DAYS),
+        None,
+    )?;
+    sign_csr_certificate(&key, params, ca_cert_pem, ca_key_pem)
+}
+
+/// Read only the verified public key; requested certificate policy is discarded.
+fn verified_csr_key(csr_pem: &[u8]) -> Result<PublicKey, String> {
+    use x509_parser::certification_request::X509CertificationRequest;
+    use x509_parser::prelude::FromDer;
+
+    if csr_pem.is_empty() || csr_pem.len() > MAX_CSR_PEM_BYTES {
+        return Err("CSR PEM must be nonempty and at most 16384 bytes".into());
+    }
+    let text = std::str::from_utf8(csr_pem).map_err(|_| "CSR PEM is not UTF-8")?;
+    let text = text.trim();
+    if !text.starts_with("-----BEGIN CERTIFICATE REQUEST-----")
+        || !text.ends_with("-----END CERTIFICATE REQUEST-----")
+    {
+        return Err("CSR must be one CERTIFICATE REQUEST PEM block".into());
+    }
+    let blocks = ::pem::parse_many(text).map_err(|_| "invalid CSR PEM")?;
+    let [block] = blocks.as_slice() else {
+        return Err("CSR must be one CERTIFICATE REQUEST PEM block".into());
+    };
+    if block.tag() != "CERTIFICATE REQUEST" {
+        return Err("CSR must be one CERTIFICATE REQUEST PEM block".into());
+    }
+    let (remaining, parsed) =
+        X509CertificationRequest::from_der(block.contents()).map_err(|_| "invalid CSR DER")?;
+    if !remaining.is_empty() {
+        return Err("CSR DER contains trailing bytes".into());
+    }
+    // Check the SPKI curve as well as the CSR's signature algorithm. Rcgen's
+    // PublicKey::algorithm reports the latter; it is not a substitute for the
+    // requested key's id-ecPublicKey / prime256v1 algorithm identifiers.
+    let algorithm = &parsed.certification_request_info.subject_pki.algorithm;
+    let curve = algorithm
+        .parameters
+        .as_ref()
+        .and_then(|value| value.as_oid().ok());
+    if algorithm.algorithm.to_id_string() != "1.2.840.10045.2.1"
+        || curve.as_ref().map(|oid| oid.to_id_string()).as_deref() != Some("1.2.840.10045.3.1.7")
+    {
+        return Err("CSR key must use EC P-256".into());
+    }
+    let request = CertificateSigningRequestParams::from_der(&block.contents().into())
+        .map_err(|_| "CSR signature or extensions are invalid")?;
+    if request.public_key.algorithm() != &PKCS_ECDSA_P256_SHA256 {
+        return Err("CSR signature must use ECDSA P-256 with SHA-256".into());
+    }
+    Ok(request.public_key)
+}
+
+/// Rcgen signs supplied policy; it does not validate an issuer's CA capability
+/// or key match. Keep the existing CA loader and check the resulting chain here.
+fn sign_csr_certificate(
+    key: &PublicKey,
+    mut params: CertificateParams,
+    ca_cert_pem: &[u8],
+    ca_key_pem: &[u8],
+) -> Result<Vec<u8>, String> {
+    use rand::Rng;
+    use x509_parser::prelude::{FromDer, X509Certificate};
+
+    let pem = ::pem::parse(ca_cert_pem).map_err(|_| "invalid issuer certificate PEM")?;
+    let (remaining, ca) =
+        X509Certificate::from_der(pem.contents()).map_err(|_| "invalid issuer certificate DER")?;
+    if !remaining.is_empty() || !ca.validity().is_valid() {
+        return Err("CSR issuer certificate must be current".into());
+    }
+    let constraints = ca
+        .basic_constraints()
+        .map_err(|_| "invalid issuer basic constraints")?;
+    if !constraints.is_some_and(|extension| extension.value.ca) {
+        return Err("CSR issuer certificate must be a CA".into());
+    }
+    if ca
+        .key_usage()
+        .map_err(|_| "invalid issuer key usage")?
+        .is_some_and(|usage| !usage.value.key_cert_sign())
+    {
+        return Err("CSR issuer does not permit certificate signing".into());
+    }
+    let issuer_expiry =
+        time::OffsetDateTime::from_unix_timestamp(ca.validity().not_after.timestamp())
+            .map_err(|_| "invalid issuer expiry")?;
+    params.not_after = params.not_after.min(issuer_expiry);
+    if params.not_after <= params.not_before {
+        return Err("CSR issuer has no remaining leaf validity".into());
+    }
+    // Rcgen otherwise derives the serial from the subject key. A caller may
+    // reuse a key for a later certificate, so that would alias revocation and
+    // renewal lineage. The issuer chooses an independent positive serial.
+    // Idempotent issuance must persist/replay the committed certificate, not
+    // call this stateless signer again for the same operation.
+    let mut serial = [0u8; 20];
+    rand::rng().fill_bytes(&mut serial);
+    serial[0] = (serial[0] & 0x7f) | 1;
+    params.serial_number = Some(rcgen::SerialNumber::from_slice(&serial));
+    let issuer = ca_issuer_from_pem(ca_cert_pem, ca_key_pem)?;
+    let cert = params
+        .signed_by(key, &issuer)
+        .map_err(|_| "failed to sign CSR certificate")?;
+    let (_, leaf) = X509Certificate::from_der(cert.der().as_ref())
+        .map_err(|_| "invalid signed CSR certificate")?;
+    leaf.verify_signature(Some(ca.public_key()))
+        .map_err(|_| "issuer certificate and private key do not match")?;
+    Ok(cert.pem().into_bytes())
 }
 
 /// Sign a SESSION agent cert: an agent identity bound to an owner, valid for
@@ -309,6 +470,23 @@ fn sign_agent_cert(
     let agent_key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
         .map_err(|e| format!("Failed to generate agent key: {e}"))?;
 
+    let params = agent_certificate_params(name, owner_id, validity, server_name)?;
+    let agent_cert = params
+        .signed_by(&agent_key_pair, &ca_issuer)
+        .map_err(|e| format!("Failed to sign agent cert: {e}"))?;
+
+    Ok((
+        agent_cert.pem().into_bytes(),
+        agent_key_pair.serialize_pem().into_bytes(),
+    ))
+}
+
+fn agent_certificate_params(
+    name: &str,
+    owner_id: Option<&str>,
+    validity: time::Duration,
+    server_name: Option<&str>,
+) -> Result<CertificateParams, String> {
     let mut params = CertificateParams::default();
     let mut dn = DistinguishedName::new();
     dn.push(DnType::OrganizationName, "Nexus");
@@ -355,15 +533,14 @@ fn sign_agent_cert(
     params.not_before = now;
     params.not_after = now + validity;
 
-    let agent_cert = params
-        .signed_by(&agent_key_pair, &ca_issuer)
-        .map_err(|e| format!("Failed to sign agent cert: {e}"))?;
-
-    Ok((
-        agent_cert.pem().into_bytes(),
-        agent_key_pair.serialize_pem().into_bytes(),
-    ))
+    Ok(params)
 }
+
+#[cfg(test)]
+mod csr_tests;
+
+mod csr_intent;
+pub use csr_intent::{prepare_agent_csr_intent, sign_committed_agent_intent};
 
 /// Generate a self-signed root CA certificate for a zone.
 ///

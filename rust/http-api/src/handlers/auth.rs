@@ -277,11 +277,17 @@ pub async fn revoke(
     _admin: Admin,
     Path(key_hash): Path<String>,
 ) -> Result<Json<RevokeResponse>, AuthKeysError> {
+    if auth::agent_issuance::is_reserved_lifecycle_key(&key_hash) {
+        return Err(AuthKeysError::BadRequest(
+            "credential lifecycle records cannot be deleted through token revocation".into(),
+        ));
+    }
     let store = Arc::clone(&state.auth_key_store);
     let hash_for_call = key_hash.clone();
-    let existed = tokio::task::spawn_blocking(move || store.delete(&hash_for_call))
-        .await
-        .map_err(|e| AuthKeysError::Backend(format!("revoke task panicked: {e}")))??;
+    let existed =
+        tokio::task::spawn_blocking(move || auth::revoke_key_hash(&store, &hash_for_call))
+            .await
+            .map_err(|e| AuthKeysError::Backend(format!("revoke task panicked: {e}")))??;
     Ok(Json(RevokeResponse { existed, key_hash }))
 }
 

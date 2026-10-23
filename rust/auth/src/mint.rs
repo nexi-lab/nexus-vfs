@@ -110,14 +110,12 @@ pub fn agent_store_key(name: &str) -> String {
     format!("agent:{name}")
 }
 
-/// Record the authorization grants for a cert-authenticated agent.
+/// Reserve the stable name and audit record for a cert-authenticated agent.
 ///
-/// Parallel to [`mint_key`] but for the agent-cert plane: the identity IS the
-/// cert (minted by the caller, who holds the CA), so this records only the
-/// agent's grants — `zone_perms`, expiry, revoked — keyed by [`agent_store_key`].
-/// The provider resolves an agent-cert peer's `agent_id` from the cert SAN and
-/// its authorization from this record; revocation flips the `revoked` flag (or
-/// deletes the record) exactly as for an `sk-` key.
+/// Certificate identity/lifetime and CRL govern authentication; this record
+/// enforces name uniqueness, not the certificate-provider hot path. Supported
+/// token revocation cannot delete this permanent name binding. Legacy rotation
+/// may update a legacy row, but never a managed lifecycle intent or receipt.
 ///
 /// Enforces the same one-active-credential-per-subject uniqueness as
 /// [`mint_key`] (unless `allow_existing`, the rotation escape): two records
@@ -139,15 +137,25 @@ pub fn mint_agent_authz(
     })?;
     let key = agent_store_key(&record.subject_id);
     if allow_existing {
-        // Rotation: overwrite the name's record in place.
-        return store.put(&key, &bytes);
+        if let Some(existing) = store.get(&key)? {
+            crate::agent_issuance::require_legacy_agent_record(&existing, &record.subject_id)?;
+            // An existing legacy row cannot become a managed claim: managed
+            // issuance only inserts absent names, and agent rows cannot be
+            // deleted through token revocation (see revoke_key_hash).
+            return store.put(&key, &bytes);
+        }
+        // A previously absent name still needs the apply-time CAS. A read
+        // followed by an upsert could overwrite a concurrent managed claim.
     }
     // Uniqueness is enforced at raft APPLY via the store's CAS put-if-absent
     // (keyed by `agent:<name>`), not a client-side read-then-write: two nodes
     // minting the same name concurrently can never both win. (Agent records are
     // never deleted — revocation is CRL-based — and there is one record per
     // name, so "key present" IS "name taken".)
-    if store.put_if_absent(&key, &bytes)? {
+    // The legacy trait default is get-then-put. Even a backend with strict
+    // lifecycle CAS could inherit it, allowing this route to erase a racing
+    // managed intent. Unsupported backends must refuse name creation.
+    if store.put_if_absent_atomic(&key, &bytes)? {
         Ok(())
     } else {
         Err(AuthKeyStoreError::Backend(format!(
@@ -199,6 +207,11 @@ pub fn revoke_key_hash(
     store: &Arc<dyn AuthKeyStore>,
     key_hash: &str,
 ) -> Result<bool, AuthKeyStoreError> {
+    if crate::agent_issuance::is_reserved_lifecycle_key(key_hash) {
+        return Err(AuthKeyStoreError::Backend(
+            "credential lifecycle records are immutable; revoke certificates through the CA revocation path".into(),
+        ));
+    }
     store.delete(key_hash)
 }
 
@@ -227,6 +240,16 @@ mod tests {
                 .lock()
                 .insert(key_hash.to_string(), record.to_vec());
             Ok(())
+        }
+        fn put_if_absent_atomic(&self, key: &str, bytes: &[u8]) -> Result<bool, AuthKeyStoreError> {
+            use std::collections::btree_map::Entry;
+            match self.records.lock().entry(key.into()) {
+                Entry::Occupied(_) => Ok(false),
+                Entry::Vacant(entry) => {
+                    entry.insert(bytes.to_vec());
+                    Ok(true)
+                }
+            }
         }
         fn delete(&self, key_hash: &str) -> Result<bool, AuthKeyStoreError> {
             Ok(self.records.lock().remove(key_hash).is_some())
