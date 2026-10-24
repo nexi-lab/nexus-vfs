@@ -13,6 +13,7 @@
   },
   "type": "module",
   "main": "./dist/index.js",
+  "bin": { "nexus-node-operator": "./bin/nexus-node-operator.mjs" },
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
@@ -22,8 +23,10 @@
   },
   "files": [
     "dist",
+    "bin",
     "proto",
-    "README.md"
+    "README.md",
+    "OPERATOR.md"
   ],
   "engines": {
     "node": ">=18"
