@@ -39,6 +39,9 @@
 //! nexus_raft = { version = "0.1", features = ["grpc"] }
 //! ```
 
+mod node_authority;
+pub use node_authority::{current_local_node_certificate, LocalNodeCertificate};
+
 #[cfg(all(feature = "grpc", has_protos))]
 pub(crate) mod certgen;
 #[cfg(all(feature = "grpc", has_protos))]
