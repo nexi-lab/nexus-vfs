@@ -35,3 +35,11 @@ an automatic deployment rollback.
 Scripted mTLS tests qualify the client transport and reconciliation behavior.
 Actual Node-versus-Agent authorization, real existing-controller minting and
 product session recovery still require a native daemon acceptance case.
+
+`npm run package:operator -- /absolute/new-runtime.tgz` builds a portable
+runtime archive from clean producer source. It includes the normal compiled
+SDK, canonical CLI and exact lockfile-installed production dependencies, with
+per-file/source hashes and an adjacent archive receipt. The target runs
+`node runtime/bin/nexus-node-operator.mjs ...` without npm or a compiler. Its
+private operator config stays outside the archive. This packaging selects no
+service, changes no grants and publishes nothing to an npm registry.
