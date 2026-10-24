@@ -30,6 +30,8 @@
 //! only the daemon calls [`install_a2a_stamp_hook`].
 
 pub mod addresses;
+#[cfg(feature = "experimental-domain-join")]
+pub mod domain_address;
 pub mod foreign_containment;
 pub mod mailbox_stamping_hook;
 pub mod mailbox_stamping_policy;

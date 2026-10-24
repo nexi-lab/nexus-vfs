@@ -1,0 +1,31 @@
+name: Experimental domain addresses
+
+on:
+  pull_request:
+    paths: ['rust/a2a/**', 'docs/cross-domain-agent-join.md', '.github/workflows/domain-address.yml']
+  push:
+    branches: [main]
+    paths: ['rust/a2a/**', 'docs/cross-domain-agent-join.md', '.github/workflows/domain-address.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  address-values:
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, windows-2022, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: domain-address-${{ matrix.os }}
+      - run: cargo test --locked -p a2a --features experimental-domain-join --lib
+      - run: cargo clippy --locked -p a2a --features experimental-domain-join --lib -- -D warnings
