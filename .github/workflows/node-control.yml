@@ -31,5 +31,7 @@ jobs:
         with:
           shared-key: node-control-${{ matrix.os }}
       - run: cargo test --locked -p raft@0.1.0 --test node_rpc_boundaries
+      - run: cargo test --locked -p raft@0.1.0 --test generated_contract_binding
       - run: cargo test --locked -p raft@0.1.0 --lib transport::node_authority::tests
       - run: cargo test --locked -p nexus-cluster --lib
+      - run: cargo test --locked -p nexus-cluster --features experimental-managed-agent-csr --lib managed_csr::tests

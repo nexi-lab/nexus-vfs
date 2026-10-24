@@ -379,6 +379,8 @@ pub mod proto {
     //!   - nexus::core - FileMetadata, PaginatedResult
     //!   - nexus::raft - ZoneTransportService, ZoneApiService, commands, transport messages
 
+    include!("proto_binding.rs");
+
     /// Core types (FileMetadata, etc.)
     pub mod nexus {
         pub mod core {
