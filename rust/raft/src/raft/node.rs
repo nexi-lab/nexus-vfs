@@ -1274,6 +1274,15 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         &self,
         command: Command,
     ) -> Result<oneshot::Receiver<Result<CommandResult>>> {
+        // The metadata transaction is a foundation, not an activated zone
+        // protocol. Refuse before serialization/forwarding: mixed members may
+        // not even decode the new enum variant. A future activation gate must
+        // replace this refusal only after membership and storage are enforced.
+        if matches!(&command, Command::WriteVersionedMetadata { .. }) {
+            return Err(RaftError::Config(
+                "conditional metadata proposals are not activated".into(),
+            ));
+        }
         if !self.is_leader() {
             return Err(RaftError::NotLeader {
                 leader_hint: self.leader_hint_addr(),
@@ -1499,6 +1508,13 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
     ///
     /// Latency: ~5-50μs (redb write, no network).
     pub async fn propose_ec_local(&self, command: Command) -> Result<u64> {
+        // Reject BEFORE appending to the EC WAL. A successful-looking local
+        // no-op would otherwise be returned as a replicated write token.
+        if command.requires_conditional_sc() {
+            return Err(RaftError::InvalidState(
+                "EC write to SC-managed content is unsupported".into(),
+            ));
+        }
         let repl_log = self.replication_log.as_ref().ok_or_else(|| {
             RaftError::InvalidState("EC local writes require a ReplicationLog".into())
         })?;
@@ -1541,6 +1557,10 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         command: Command,
         entry_timestamp: u64,
     ) -> Result<CommandResult> {
+        if command.requires_conditional_sc() {
+            tracing::warn!("acknowledging skipped EC entry for SC-managed content");
+            return Ok(CommandResult::Success);
+        }
         let mut sm = self.state_machine.write().await;
         sm.apply_ec_with_lww(&command, entry_timestamp)
     }
