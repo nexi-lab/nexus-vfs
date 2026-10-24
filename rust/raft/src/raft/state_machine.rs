@@ -21,6 +21,9 @@ pub use contracts::lock_state::{HolderInfo, LockAcquireResult, LockEntry, LockIn
 
 use super::Result;
 
+mod conditional_metadata;
+pub use conditional_metadata::VersionedMetadata;
+
 /// Command to be replicated through Raft.
 ///
 /// Commands are serialized and stored in the Raft log, then applied
@@ -254,6 +257,16 @@ pub enum Command {
         /// observer on each node can delete the blobs it owns (`origin == self`).
         trimmed: Vec<(String, String)>,
     },
+
+    /// Conditionally publish already-staged immutable content metadata.
+    /// This is a metadata primitive, NOT a visible-content CAS by itself.
+    /// The kernel must admit only immutable object storage before proposing it.
+    WriteVersionedMetadata {
+        key: String,
+        value: Vec<u8>,
+        expected: Option<Vec<u8>>,
+        incarnation: [u8; 16],
+    },
 }
 
 /// Result of applying a command.
@@ -278,6 +291,13 @@ pub enum CommandResult {
 
     /// Command failed.
     Error(String),
+
+    /// A conditional metadata result. A failed comparison changes neither
+    /// the metadata nor its revision.
+    ConditionalMetadata {
+        committed: bool,
+        current: VersionedMetadata,
+    },
 }
 
 // Advisory lock types — `HolderInfo`, `LockInfo`, `LockAcquireResult`,
@@ -1744,6 +1764,9 @@ impl FullStateMachine {
                  advance are one atomic txn); the non-txn path must never receive it"
                     .into(),
             )),
+            Command::WriteVersionedMetadata { .. } => Err(super::RaftError::InvalidState(
+                "versioned metadata requires a Raft-committed transaction".into(),
+            )),
             Command::PutControlState {
                 namespace,
                 key,
@@ -1787,6 +1810,7 @@ impl FullStateMachine {
 
         match command {
             Command::SetMetadata { key, value } => {
+                self.refresh_tracked_version(txn, key)?;
                 let mut table = txn
                     .open_table(meta_def)
                     .map_err(|e| super::RaftError::Storage(format!("open metadata: {e}")))?;
@@ -1818,6 +1842,7 @@ impl FullStateMachine {
                         current_version,
                     });
                 }
+                self.refresh_tracked_version(txn, key)?;
                 table
                     .insert(key.as_bytes(), value.as_slice())
                     .map_err(|e| super::RaftError::Storage(format!("insert metadata: {e}")))?;
@@ -1828,6 +1853,7 @@ impl FullStateMachine {
             }
 
             Command::DeleteMetadata { key } => {
+                self.refresh_tracked_version(txn, key)?;
                 let mut table = txn
                     .open_table(meta_def)
                     .map_err(|e| super::RaftError::Storage(format!("open metadata: {e}")))?;
@@ -1838,6 +1864,11 @@ impl FullStateMachine {
             }
 
             Command::AdjustCounter { key, delta } => {
+                if conditional_metadata::is_managed_key(key) {
+                    return Ok(CommandResult::Error(
+                        "counter operations cannot replace managed content metadata".into(),
+                    ));
+                }
                 let mut table = txn
                     .open_table(meta_def)
                     .map_err(|e| super::RaftError::Storage(format!("open metadata: {e}")))?;
@@ -2037,6 +2068,11 @@ impl FullStateMachine {
                 if_absent,
             } => {
                 let def = redb::TableDefinition::<&[u8], &[u8]>::new(self.control_state.name());
+                if namespace == conditional_metadata::NAMESPACE {
+                    return Ok(CommandResult::Error(
+                        "conditional revision control state is owned by its apply primitive".into(),
+                    ));
+                }
                 let mut table = txn
                     .open_table(def)
                     .map_err(|e| super::RaftError::Storage(format!("open control_state: {e}")))?;
@@ -2064,6 +2100,11 @@ impl FullStateMachine {
 
             Command::DeleteControlState { namespace, key } => {
                 let def = redb::TableDefinition::<&[u8], &[u8]>::new(self.control_state.name());
+                if namespace == conditional_metadata::NAMESPACE {
+                    return Ok(CommandResult::Error(
+                        "conditional revision control state is owned by its apply primitive".into(),
+                    ));
+                }
                 let mut table = txn
                     .open_table(def)
                     .map_err(|e| super::RaftError::Storage(format!("open control_state: {e}")))?;
@@ -2072,6 +2113,13 @@ impl FullStateMachine {
                     .map_err(|e| super::RaftError::Storage(format!("remove control_state: {e}")))?;
                 Ok(CommandResult::Success)
             }
+
+            Command::WriteVersionedMetadata {
+                key,
+                value,
+                expected,
+                incarnation,
+            } => self.write_versioned_in_txn(txn, key, value, expected.as_deref(), *incarnation),
 
             Command::Noop => Ok(CommandResult::Success),
 
@@ -2098,6 +2146,11 @@ impl FullStateMachine {
 
 impl StateMachine for FullStateMachine {
     fn apply_local(&mut self, command: &Command) -> Result<CommandResult> {
+        if command.requires_conditional_sc() {
+            return Err(super::RaftError::InvalidState(
+                "EC write to SC-managed content is unsupported".into(),
+            ));
+        }
         match command {
             Command::SetMetadata { .. }
             | Command::CasSetMetadata { .. }
@@ -2147,6 +2200,12 @@ impl StateMachine for FullStateMachine {
         command: &Command,
         entry_timestamp: u64,
     ) -> Result<CommandResult> {
+        if command.requires_conditional_sc() {
+            // ACK the skipped old/lagging peer entry: returning Err here would
+            // pin its EC sequence forever and block unrelated EC traffic.
+            tracing::warn!("skipping EC entry for SC-managed content");
+            return Ok(CommandResult::Success);
+        }
         // Track whether an LWW check short-circuited as a stale no-op, so the
         // observer spine below doesn't fire side effects for a write we
         // deliberately dropped.
@@ -2223,6 +2282,7 @@ impl StateMachine for FullStateMachine {
         self.list_metadata("")
             .unwrap_or_default()
             .into_iter()
+            .filter(|(key, _)| !conditional_metadata::is_managed_key(key))
             .map(|(key, value)| Command::SetMetadata { key, value })
             .collect()
     }
