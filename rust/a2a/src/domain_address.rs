@@ -4,7 +4,8 @@
 //! grant access. A later native authorizer must derive the caller from current
 //! mTLS/managed context and enforce the enrolled collaboration-space policy.
 //! No existing daemon route, stamp, mailbox or permission provider uses this
-//! module. Its separate path family fails closed under the legacy foreign gate.
+//! module. The legacy gate denies this family only for foreign callers;
+//! domestic/unidentified callers on an old node have no such protection.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 
@@ -13,7 +14,8 @@ const MAX_SUBJECT_BYTES: usize = 128;
 const MAX_AGENT_SEGMENT: usize = 218;
 const MAX_PAIR_PATH: usize = PREFIX.len() + 32 + 7 + MAX_AGENT_SEGMENT * 3 + 1 + 9;
 
-/// A public Agent address bound to a full issuer-CA DER SHA256 fingerprint.
+/// A public Agent address bound to SHA256 of its registered anchor's DER SPKI.
+/// This is the authority key, not the complete certificate or a leaf issuer DN.
 /// Subject bytes are exact UTF-8; no normalization or display-name fallback.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentAddress {
@@ -42,6 +44,16 @@ impl AgentAddress {
     #[must_use]
     pub fn subject(&self) -> &str {
         &self.subject
+    }
+
+    /// Unambiguous ASCII rendering for permission review. Raw names can contain
+    /// format characters; approvals must also show the full canonical segment.
+    #[must_use]
+    pub fn escaped_subject(&self) -> String {
+        self.subject
+            .chars()
+            .flat_map(char::escape_default)
+            .collect()
     }
 
     /// One reversible, path-safe segment, bounded to 218 ASCII bytes. Display
@@ -241,6 +253,19 @@ mod tests {
     }
 
     #[test]
+    fn review_rendering_exposes_invisible_and_directional_subject_bytes() {
+        for (value, escaped) in [
+            ("worker\u{200b}", "worker\\u{200b}"),
+            ("worker\u{202e}", "worker\\u{202e}"),
+            ("worker\u{feff}", "worker\\u{feff}"),
+        ] {
+            let address = agent(4, value);
+            assert_eq!(address.escaped_subject(), escaped);
+            assert_ne!(address.segment(), agent(4, "worker").segment());
+        }
+    }
+
+    #[test]
     fn both_domains_derive_the_same_pair_and_only_their_own_reader() {
         let a = agent(1, "worker");
         let b = agent(2, "worker");
@@ -283,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn new_family_is_not_accidentally_allowed_by_the_legacy_foreign_gate() {
+    fn legacy_gate_denies_new_family_only_for_foreign_callers() {
         use kernel::kernel::OperationContext;
         use kernel::{Permission, PermissionProvider};
         let conversation =
@@ -294,6 +319,21 @@ mod tests {
             assert!(crate::ForeignAgentMailboxOnly
                 .check(&conversation.transcript(), None, permission, &context)
                 .is_err());
+        }
+        // Record the counterexample: a profile-wide boundary and zone-wide
+        // version qualification are required before activating the new family.
+        for actor in [Some("worker"), None] {
+            let domestic = OperationContext::new("caller", "root", false, actor, false);
+            for permission in [Permission::Read, Permission::Write] {
+                for path in [
+                    conversation.transcript(),
+                    conversation.reader(&agent(1, "a")).unwrap(),
+                ] {
+                    assert!(crate::ForeignAgentMailboxOnly
+                        .check(&path, None, permission, &domestic)
+                        .is_ok());
+                }
+            }
         }
     }
 }

@@ -36,11 +36,11 @@ to a remote Raft quorum merely to make its mailbox visible.
 
 ## Public identity and addressing values
 
-The proposed global Agent address binds the **full SHA256 of the issuer CA
-DER** and the exact UTF-8 Agent subject. Operator labels, endpoints and display
-names are not authority identifiers. CA rotation therefore requires explicit
-reviewed rebinding/recovery; an endpoint or label change cannot silently elect
-another identity.
+The proposed global Agent address binds the **full SHA256 of the registered
+anchor's DER SubjectPublicKeyInfo (SPKI)** and the exact UTF-8 Agent subject.
+The same rule applies to the domestic cluster CA. The registered anchor is the
+authority, not the leaf's direct issuer if intermediates are later supported.
+Operator labels, endpoints and display names are not authority identifiers.
 
 The experimental `a2a::domain_address::AgentAddress` codec is:
 
@@ -60,12 +60,20 @@ descriptor/owner composition. An address decoded from a request cannot be
 promoted into that proof. Node, controller, session and durable managed-Agent
 identities must remain distinct.
 
-This prototype treats the full issuer fingerprint as an authority generation.
-Rotating a CA therefore produces different addresses even if its display domain
-is unchanged. It does not silently confer identity continuity across an anchor
-replacement. Any continuity/rotation transition needs an explicit native
-authority decision before this experimental encoding can become a deployed
-contract; deployment scripts cannot alias the two generations themselves.
+The existing classifier verifies signatures and picks the first matching
+anchor. Two renewed CA certificates using one key must therefore produce the
+same address; complete-certificate DER is unsuitable as that input. Before
+activation, native enrollment must reject an ambiguous key registered under
+conflicting domains or grants, and current classification must detect an
+already-conflicting anchor set rather than pick its iteration order. A new
+authority key produces different addresses. Any continuity across that key
+rotation needs an explicit native authority decision; deployment scripts cannot
+alias the two generations themselves.
+
+Raw subjects are exact values, not trusted display labels. `escaped_subject`
+produces an ASCII rendering that exposes format characters, including U+200B,
+U+202E and U+FEFF. Permission/grant review must show this rendering and the full
+canonical segment, rather than accepting a visually ambiguous display name.
 
 For initial one-to-one collaboration, derive membership from an ordered pair
 in the address itself, rather than introducing another mutable CID-membership
@@ -83,10 +91,17 @@ reader in this pair. Both domains derive the same path. Exact parsing rejects
 prefix lookalikes, extra segments, noncanonical order and unrelated readers.
 
 This separate path family does not match the legacy transcript allow-list.
-An older server fails closed instead of interpreting a new shape under its
-broad legacy foreign permission. The feature's regression calls the actual
-legacy provider to verify that refusal. This does not make the new family
-usable: it is not yet mounted, stamped or authorized by a live profile.
+The actual legacy provider refuses it for a foreign caller, but allows domestic
+and unidentified callers. The old stamping hook also leaves these paths
+unstamped. The regression records both the foreign denial and that domestic
+counterexample; it is not a claim of a profile-wide fail-closed boundary.
+
+Before activation a native profile-wide rule must reserve `/collaboration/`
+independently of this feature flag, across transcript, reader and other I/O.
+Every node that can serve the hosting zone must enforce the boundary; an
+individual peer's capability cannot qualify a mixed-version zone. Existing
+older binaries cannot gain that enforcement through negotiation. The family
+is not yet mounted, replicated, stamped or authorized by this prototype.
 
 ## Enrollment and authority
 
@@ -105,7 +120,10 @@ The minimal join needs three explicit decisions:
    do not rename a session or static profile into a durable Agent.
 3. **Authorization**: anchor trust does not imply access to every collaboration
    space. Extend the existing native trust/control authority with explicit
-   space-scoped grants and revocation. Default for an old anchor with no such
+   space-scoped grants and revocation. Each space must immutably select one
+   hosting authority and its authoritative replicated zone/endpoint. Non-hosts
+   must route to that authority and must not first create a local transcript.
+   Default for an old anchor with no such
    grant is no access to this new family. Do not add another identity database.
    A space grant is distinct from model, filesystem, administrative, owner
    adoption and cluster membership rights.
@@ -127,6 +145,11 @@ policy, and forward under that Agent's own current credential. The same global
 path is used at both ends, preserving identity through routing. The adapter
 must cover metadata/indexing, framed stream append/read, lock/renew and the
 caller's own reader commits; an ObjectStore write alone is insufficient.
+
+The hosting profile must include `/collaboration` in its replicated prefix and
+mount configuration before admitting a space. Otherwise an apparently global
+path can silently land in a node's SOLO root zone. The space authority/grant
+record, not the path's appearance or local first write, chooses the one copy.
 
 Keep one authoritative transcript. Local delivery/reconciliation evidence is
 not a second authoritative log. A proven native pre-submission refusal is
