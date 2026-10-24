@@ -45,6 +45,7 @@ pub use node_authority::{current_local_node_certificate, LocalNodeCertificate};
 #[cfg(all(feature = "grpc", has_protos))]
 pub(crate) mod certgen;
 #[cfg(all(feature = "grpc", has_protos))]
+pub(crate) use certgen::verified_csr_key;
 pub use certgen::{
     append_join_token_hash, bootstrap_tls, generate_agent_cert, generate_join_token,
     generate_node_cert, generate_session_agent_cert, generate_user_runtime_cert, generate_zone_ca,

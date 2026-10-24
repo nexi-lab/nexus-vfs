@@ -188,7 +188,19 @@ async fn real_mtls_issuance_preserves_original_key_and_reconciles_both_lost_repl
     assert_eq!(caps.version, 1);
     assert_eq!(caps.issuer_sha256, Sha256::digest(der(&ca)).to_vec());
 
-    let (first, original_key) = request(&ca, "existing-product-agent");
+    let binding = nexus_raft::agent_csr_client::AgentCsrBinding {
+        agent_name: "existing-product-agent",
+        owner_id: "existing-product-owner",
+        display_name: "原设备 Agent",
+        operation_id: "original-existing-product-agent",
+    };
+    let pending_path = private.path().join("caller-pending.json");
+    let pending =
+        nexus_raft::agent_csr_client::PendingAgentCsr::create(&pending_path, &binding, &ca)
+            .unwrap();
+    let first = pending.request().clone();
+    let original_pending_bytes = std::fs::read(&pending_path).unwrap();
+    drop(pending);
     state(
         &operator
             .query_agent_csr_v1(first.clone())
@@ -215,6 +227,14 @@ async fn real_mtls_issuance_preserves_original_key_and_reconciles_both_lost_repl
         .into_inner();
     state(&committed, AgentCsrState::IntentCommitted);
     assert!(committed.certificate_der.is_empty());
+    // A different process can recover the same persisted operation after the
+    // actual I-apply reply was lost. No replacement key or request is created.
+    let pending =
+        nexus_raft::agent_csr_client::PendingAgentCsr::load(&pending_path, &binding, &ca).unwrap();
+    assert_eq!(pending.request(), &first);
+    let bundle = private.path().join("caller-bundle");
+    assert!(pending.publish(&committed, &bundle).is_err());
+    assert!(!bundle.exists());
     std::fs::rename(tls.join("held-key.pem"), tls.join("ca-key.pem")).unwrap();
     let final_reply = operator
         .issue_agent_csr_v1(first.clone())
@@ -224,6 +244,16 @@ async fn real_mtls_issuance_preserves_original_key_and_reconciles_both_lost_repl
     state(&final_reply, AgentCsrState::Finalized);
     assert_eq!(final_reply.serial, committed.serial);
     assert_eq!(final_reply.intent_sha256, committed.intent_sha256);
+    let manifest = pending.publish(&final_reply, &bundle).unwrap();
+    let loaded = lib::transport_primitives::AgentCredential::load(&manifest).unwrap();
+    let original_key =
+        rcgen::KeyPair::from_pem(std::str::from_utf8(&loaded.key_pem).unwrap()).unwrap();
+    assert_eq!(loaded.agent, binding.agent_name);
+    assert_eq!(
+        std::fs::read(&pending_path).unwrap(),
+        original_pending_bytes
+    );
+    assert_eq!(pending.publish(&final_reply, &bundle).unwrap(), manifest);
     let (_, certificate) = X509Certificate::from_der(&final_reply.certificate_der).unwrap();
     use rcgen::PublicKeyData;
     assert_eq!(

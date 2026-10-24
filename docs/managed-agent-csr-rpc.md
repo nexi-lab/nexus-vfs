@@ -63,8 +63,29 @@ it cannot replace the key, operation, owner or name. An occupied legacy name
 is refused: there is no `allow_existing`, adoption or server-generated-key
 fallback. Returned DER must be checked against the original key, expected CA,
 Agent name and current validity before publication in the existing credential
-bundle format. This slice does not yet implement that caller persistence or
-managed runtime activation.
+bundle format.
+
+`raft::agent_csr_client::PendingAgentCsr` supplies that caller persistence. The
+native owner-checked deploy adapter passes its resolved `AgentCsrBinding` and
+public local CA. `create` persists a new P-256 key and the exact protobuf
+request in one owner-only document, syncing the file before returning the
+request. Existing files (including interrupted writes) are never replaced.
+`load` is explicit recovery: it rejects changed Agent/owner/display/operation,
+issuer, malformed material and a CSR/key mismatch. Neither method makes an
+RPC. The caller submits once or queries the original persisted request; an
+explicit finish of the same operation is separate from an automatic retry.
+
+`publish` accepts only the bound `Finalized` response from the authenticated
+issuer. It checks request/identity/serial, the pinned CA, signature, current
+validity, ordinary Agent SAN/client-only usage and the original public key.
+It uses the existing `AgentCredential` filenames and writes `credential.json`
+last. Identical files can complete an explicitly resumed publication;
+conflicts or partial bytes refuse without overwrite. The pending document is
+retained. This is local caller state, not an issuer, grant store or runtime
+activation receipt. A lost write/sync can leave a partial file requiring native
+operator recovery; no request is returned for submission after that error.
+These primitives do not resolve a managed owner, install trust, activate an
+outbound runtime identity, or implement a domain join by themselves.
 
 The CA private key is read only in the coordinator's guarded signer callback
 after I wins. Query and F replay do not need it. Tests use a real isolated
@@ -72,5 +93,8 @@ mTLS listener, real one-voter Raft, the native issuer and caller-generated key;
 fault injection loses replies after actual I/F apply. No model, fleet endpoint
 or deployment is involved. Windows executed that native fixture successfully,
 then all 73 cluster-profile library tests passed with the feature enabled.
-Those results precede the normal merge of the latest Node-boundary/main source;
-the composed head still needs its own validation and exact-head CI.
+Prior local passes used a shared target directory that was later found to
+reuse dependency artifacts across worktrees. They are retained as diagnostic
+history, not final source qualification. Requalification uses a stable profile
+per source workline under the same target root. The composed caller-persistence
+head still needs its own native validation and exact-head three-platform CI.
