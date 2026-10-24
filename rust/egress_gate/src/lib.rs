@@ -64,6 +64,7 @@
 pub mod classifier;
 pub mod combine;
 pub mod credentials;
+pub mod dynamic;
 pub mod enforce;
 pub mod hook;
 mod json_layout;
@@ -372,6 +373,9 @@ pub fn service_decl_deterministic() -> ServiceDecl {
 /// Every error here is reported by the install, so a misconfigured gate
 /// stops the daemon rather than leaving it running ungated.
 pub fn service_decl_from_env(prompt_suffix: Option<&'static str>) -> ServiceDecl {
+    if let Some(path) = std::env::var_os(dynamic::ENV_CONFIG) {
+        return dynamic::service_decl(std::path::PathBuf::from(path), prompt_suffix);
+    }
     let config = GateConfig::from_env();
     ServiceDecl {
         name: SERVICE_NAME.to_string(),
