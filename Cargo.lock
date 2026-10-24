@@ -6,6 +6,7 @@ version = 4
 name = "a2a"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "blake3",
  "contracts",
  "kernel",
@@ -3577,6 +3578,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 name = "raft"
 version = "0.1.0"
 dependencies = [
+ "a2a",
  "base64 0.22.1",
  "bincode",
  "blake3",
@@ -5305,6 +5307,7 @@ dependencies = [
 name = "transport"
 version = "0.1.0"
 dependencies = [
+ "a2a",
  "auth",
  "axum",
  "backends",

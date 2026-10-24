@@ -12,9 +12,10 @@
 //! an on-prem DGX an FDE delivers to a customer site: authenticated to the
 //! SaaS, but it must not read the SaaS's other data if tampered with).
 //!
-//! Scope note: the allow-list is exactly
-//! [`crate::is_conversation_transcript_path`] — a foreign agent reaches the
-//! conversation it participates in, and nothing else.
+//! This legacy allow-list is by path shape, not conversation participation.
+//! It must not be reused for the experimental cross-domain protocol.
+//! `/collaboration` is reserved for the future native authorizer and denied
+//! to every non-system caller, independently of address feature flags.
 //!
 //! The cluster composition root combines this check with any enabled
 //! relationship policy before installing the kernel's single provider slot.
@@ -39,6 +40,15 @@ impl PermissionProvider for ForeignAgentMailboxOnly {
         permission: Permission,
         ctx: &OperationContext,
     ) -> Result<(), KernelError> {
+        // Reserve the entire new namespace before the domestic fast path.
+        // Older nodes do not enforce this rule: every serving node must be
+        // qualified before a hosting zone can activate the protocol.
+        if !ctx.is_system && (path == "/collaboration" || path.starts_with("/collaboration/")) {
+            return Err(KernelError::PermissionDenied(
+                "the collaboration namespace is reserved; native domain authorization is not enabled"
+                    .into(),
+            ));
+        }
         // Only a foreign agent is bounded; a domestic caller (the common
         // case) short-circuits to allow with a single branch on the hot
         // path — no allocation, no path scan.
@@ -161,6 +171,58 @@ mod tests {
             .is_ok());
         assert!(p
             .check("/any/path", None, Permission::Write, &domestic)
+            .is_ok());
+    }
+
+    #[test]
+    fn reserved_namespace_is_denied_through_real_kernel_io_for_every_non_system_caller() {
+        use kernel::kernel::syscall::KernelSyscall;
+        use kernel::kernel::Kernel;
+        use std::sync::Arc;
+
+        let kernel = Kernel::new();
+        kernel.set_permission_provider(Arc::new(Box::new(ForeignAgentMailboxOnly)));
+        let mut unidentified = ctx_with(None);
+        unidentified.agent_id = None;
+        let mut admin = ctx_with(None);
+        admin.is_admin = true;
+        for ctx in [
+            ctx_with(Some("foreign")),
+            ctx_with(None),
+            unidentified,
+            admin,
+        ] {
+            for path in [
+                "/collaboration",
+                "/collaboration/v1/space/pairs/a/b/transcript",
+                "/collaboration/v1/space/pairs/a/b/readers/a",
+                "/collaboration/not-a-valid-protocol-path",
+            ] {
+                assert!(matches!(
+                    KernelSyscall::sys_read(&kernel, path, &ctx, 0, 0),
+                    Err(KernelError::PermissionDenied(_))
+                ));
+                assert!(matches!(
+                    KernelSyscall::sys_write(&kernel, path, &ctx, b"forged", 0),
+                    Err(KernelError::PermissionDenied(_))
+                ));
+            }
+        }
+        // This rule has no broad substring match or new authority grant.
+        let domestic = ctx_with(None);
+        for path in [
+            "/collaboration-not-reserved",
+            "/workspace/collaboration/file",
+            "/conversations/old/transcript",
+        ] {
+            assert!(kernel
+                .check_permission(path, Permission::Write, &domestic)
+                .is_ok());
+        }
+        let mut system = domestic;
+        system.is_system = true;
+        assert!(kernel
+            .check_permission("/collaboration", Permission::Write, &system)
             .is_ok());
     }
 }

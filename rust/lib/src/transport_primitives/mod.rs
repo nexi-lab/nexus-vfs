@@ -30,7 +30,7 @@ pub use federated_tls::{
     federated_mtls_incoming, federated_tls_incoming, reloadable_tls_incoming, server_config,
     FederatedClientCertVerifier, ReloadableServerIdentity,
 };
-pub use foreign_ca::{CaFingerprint, ForeignCaAnchor};
+pub use foreign_ca::{CaFingerprint, ForeignCaAnchor, ForeignCaScope};
 pub use peer::{hostname_to_node_id, NodeAddress, PeerAddress};
 pub use peer_blob_client::{NoopPeerBlobClient, PeerBlobClient, PeerBlobResult};
 pub use pool::ConnectionPool;

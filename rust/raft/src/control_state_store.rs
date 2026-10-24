@@ -56,6 +56,28 @@ impl ControlStateStore {
         bridge_block_on(&self.runtime, fut).map_err(|e| format!("get({ns}/{key}): {e}"))
     }
 
+    /// Read related control records at one consensus read point. Unlike a
+    /// sequence of cached/local gets, a grant and its revocation cannot come
+    /// from different state-machine snapshots. This orders admission, not a
+    /// later data-plane append in another zone.
+    pub fn get_many_linearizable(&self, keys: &[String]) -> Result<Vec<Option<Vec<u8>>>, String> {
+        let ns = self.namespace;
+        let keys = keys.to_vec();
+        bridge_block_on(&self.runtime, async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                self.node.read_linearizable(move |sm| {
+                    keys.iter()
+                        .map(|key| sm.get_control_state(ns, key).map_err(|e| e.to_string()))
+                        .collect::<Result<Vec<_>, String>>()
+                }),
+            )
+            .await
+            .map_err(|_| format!("control snapshot({ns}) timed out"))?
+            .map_err(|e| format!("control snapshot({ns}): {e}"))?
+        })
+    }
+
     /// Enumerate this namespace as `(key, value)` — a prefix scan.
     #[inline]
     pub fn list(&self) -> Result<Vec<(String, Vec<u8>)>, String> {
