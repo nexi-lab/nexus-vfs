@@ -141,7 +141,7 @@ impl LocalCASTransport {
                 }
                 options.open(path)
             })?;
-        staged.write_all(content)?;
+        staged.as_file_mut().write_all(content)?;
         if self.fsync_on_write {
             staged.as_file().sync_all()?;
         }
