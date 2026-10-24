@@ -43,6 +43,15 @@ fn recovery_keeps_exact_key_request_and_operation_before_publishing_the_native_b
     drop(pending);
     let pending = PendingAgentCsr::load(&path, &binding(), &ca).unwrap();
     assert_eq!(pending.request().encode_to_vec(), original_request);
+    let mut reformatted_ca = ca.clone();
+    reformatted_ca.extend_from_slice(b"\n");
+    assert_eq!(
+        PendingAgentCsr::load(&path, &binding(), &reformatted_ca)
+            .unwrap()
+            .request(),
+        pending.request(),
+        "issuer binding is the certificate DER, not PEM whitespace"
+    );
     let response = finalized(&pending, &ca_key);
     let directory = private.path().join("bundle");
     let manifest = pending.publish(&response, &directory).unwrap();
@@ -133,7 +142,9 @@ fn unknown_wrong_binding_wrong_key_and_privileged_certificates_publish_nothing()
                 let other =
                     PendingAgentCsr::create(&private.path().join("another-key"), &binding(), &ca)
                         .unwrap();
-                reply.certificate_der = finalized(&other, &ca_key).certificate_der;
+                let other_reply = finalized(&other, &ca_key);
+                reply.serial = other_reply.serial;
+                reply.certificate_der = other_reply.certificate_der;
             }
             6 => {
                 let issuer_key = KeyPair::from_pem(std::str::from_utf8(&ca_key).unwrap()).unwrap();

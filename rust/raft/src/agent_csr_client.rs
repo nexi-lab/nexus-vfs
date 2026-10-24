@@ -1,6 +1,8 @@
 //! Durable caller-owned key/request, with no automatic RPC or replacement.
 //! The native deploy adapter must first resolve this binding through its
 //! owner-checked managed host. A path or receipt does not confer that authority.
+//! Pending documents and bundles belong in the native owner's controlled
+//! storage directory; this is not an API for caller-selected shared paths.
 
 use std::path::{Path, PathBuf};
 
@@ -114,7 +116,10 @@ impl PendingAgentCsr {
         let actual = AgentCsrRequest::decode(stored.request_protobuf.as_slice())
             .map_err(|_| "invalid pending Agent request protobuf")?;
         let expected = request(binding, actual.csr_pem.clone(), ca_pem)?;
-        if actual != expected || stored.ca_pem != ca_pem {
+        if actual != expected
+            || first_certificate_der(&stored.ca_pem, "persisted Agent issuer")?
+                != first_certificate_der(ca_pem, "expected Agent issuer")?
+        {
             return Err("pending Agent CSR binding or issuer changed".into());
         }
         let key = KeyPair::from_pem(&stored.key_pem).map_err(|_| "invalid pending Agent key")?;
