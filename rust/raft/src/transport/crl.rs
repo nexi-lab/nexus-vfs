@@ -80,19 +80,11 @@ pub fn generate_crl(
 /// what lets a node trust a CRL fetched over the plaintext CA plane, the same
 /// way it trusts a cert.
 pub fn crl_revoked_serials(crl_pem: &[u8], ca_cert_pem: &[u8]) -> Result<Vec<Vec<u8>>, String> {
-    use x509_parser::prelude::*;
-    let ca = ::pem::parse(ca_cert_pem).map_err(|e| format!("CA PEM: {e}"))?;
-    let (_, ca_cert) =
-        X509Certificate::from_der(ca.contents()).map_err(|e| format!("CA DER: {e}"))?;
-    let crl = ::pem::parse(crl_pem).map_err(|e| format!("CRL PEM: {e}"))?;
-    let (_, crl) =
-        CertificateRevocationList::from_der(crl.contents()).map_err(|e| format!("CRL DER: {e}"))?;
-    crl.verify_signature(ca_cert.public_key())
-        .map_err(|e| format!("CRL not signed by cluster CA: {e}"))?;
-    Ok(crl
-        .iter_revoked_certificates()
-        .map(|rc| rc.raw_serial().to_vec())
-        .collect())
+    let verified = lib::transport_primitives::verify_signed_crl(crl_pem, ca_cert_pem)?;
+    // Legacy cluster callers retain their existing clock policy. Experimental
+    // collaboration must additionally check bounded freshness and establish a
+    // current authoritative source; signature-only validation cannot do that.
+    Ok(verified.revoked_serials().to_vec())
 }
 
 /// The founder's revoked-serial file: one revoked agent-cert serial per line
