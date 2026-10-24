@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use ahash::AHashSet;
+use tempfile::TempPath;
 
 /// Map content hash to CAS blob key: `cas/{h[0..2]}/{h[2..4]}/{hash}`.
 ///
@@ -117,6 +118,63 @@ impl LocalCASTransport {
         Ok(())
     }
 
+    /// Stage complete bytes beside their destination so publication stays on
+    /// one filesystem. File syncing precedes visibility; directory durability
+    /// is a separate guarantee.
+    fn stage_file(&self, path: &Path, content: &[u8]) -> io::Result<TempPath> {
+        self.ensure_parent(path)?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "CAS path has no parent"))?;
+        let mut staged = tempfile::Builder::new()
+            .prefix(".cas-")
+            .suffix(".tmp")
+            .make_in(parent, |path| {
+                // A regular file also retains normal caching attributes after
+                // std::fs::rename on Windows. Tempfile owns its name and cleanup.
+                let mut options = std::fs::OpenOptions::new();
+                options.read(true).write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                options.open(path)
+            })?;
+        staged.as_file_mut().write_all(content)?;
+        if self.fsync_on_write {
+            staged.as_file().sync_all()?;
+        }
+        // Publication needs the owned path, rather than an open writer handle.
+        Ok(staged.into_temp_path())
+    }
+
+    /// Publish an already verified hash without replacing a concurrent winner.
+    fn publish_blob(&self, content: &[u8], content_id: &str) -> io::Result<bool> {
+        let path = self.resolve(&blob_key(content_id));
+        if validated_existing_blob(&path, content_id)? {
+            return Ok(false);
+        }
+
+        match self.stage_file(&path, content)?.persist_noclobber(&path) {
+            Ok(_) => Ok(true),
+            Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
+                // Drop only our candidate. A concurrent writer owns the final
+                // path; absence after the collision is not a successful dedup.
+                drop(error);
+                if validated_existing_blob(&path, content_id)? {
+                    Ok(false)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "CAS object disappeared during publication",
+                    ))
+                }
+            }
+            Err(error) => Err(error.error),
+        }
+    }
+
     /// Read a CAS blob by content hash.
     ///
     /// Corresponds to Python `LocalTransport.fetch(CASAddressingEngine._blob_key(hash))`.
@@ -136,37 +194,14 @@ impl LocalCASTransport {
         self.write_blob_tracked(content).map(|(h, _)| h)
     }
 
-    /// Same as `write_blob` but also reports whether the write actually
-    /// touched disk (`true`) or hit CAS dedup (`false`). Used by
+    /// Same as `write_blob` but also reports whether this writer published the
+    /// object (`true`) or hit CAS dedup (`false`). Used by
     /// `CASEngine::write_content_tracked` to drive the `is_new` bit that
     /// Python's on_write_callback (e.g. Zoekt reindex) keys off.
     pub fn write_blob_tracked(&self, content: &[u8]) -> io::Result<(String, bool)> {
         let hash = lib::hash::hash_content(content);
-        let key = blob_key(&hash);
-        let path = self.resolve(&key);
-
-        if validated_existing_blob(&path, &hash)? {
-            return Ok((hash, false));
-        }
-
-        self.ensure_parent(&path)?;
-
-        // Write content using O_CREAT | O_WRONLY | O_TRUNC semantics.
-        // OpenOptions::create(true).truncate(true) matches Python's
-        // os.open(path, O_CREAT | O_WRONLY | O_TRUNC, 0o644).
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)?;
-
-        file.write_all(content)?;
-
-        if self.fsync_on_write {
-            file.sync_all()?;
-        }
-
-        Ok((hash, true))
+        let published = self.publish_blob(content, &hash)?;
+        Ok((hash, published))
     }
 
     /// Write a pre-hashed blob (caller already knows the content hash).
@@ -181,28 +216,7 @@ impl LocalCASTransport {
                 "supplied CAS content hash does not match the input bytes",
             ));
         }
-        let key = blob_key(content_id);
-        let path = self.resolve(&key);
-
-        if validated_existing_blob(&path, content_id)? {
-            return Ok(false);
-        }
-
-        self.ensure_parent(&path)?;
-
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)?;
-
-        file.write_all(content)?;
-
-        if self.fsync_on_write {
-            file.sync_all()?;
-        }
-
-        Ok(true)
+        self.publish_blob(content, content_id)
     }
 
     /// Check if a CAS blob exists on disk.
@@ -228,23 +242,17 @@ impl LocalCASTransport {
         Ok(std::fs::metadata(&path)?.len())
     }
 
-    /// Remove a CAS blob from disk.
     /// Write a `.meta` JSON sidecar next to a blob (used by CDC to flag
     /// chunked manifests for GC + Python-side `is_chunked` compatibility).
     /// Path is `cas/<h[0..2]>/<h[2..4]>/<hash>.meta`.
     pub fn write_meta(&self, content_id: &str, meta: &[u8]) -> io::Result<()> {
         let key = blob_key(content_id);
         let path = self.resolve(&format!("{}.meta", key));
-        self.ensure_parent(&path)?;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)?;
-        file.write_all(meta)?;
-        if self.fsync_on_write {
-            file.sync_all()?;
-        }
+        let mut staged = self.stage_file(&path, meta)?;
+        // Rust's native replacement handles open readers on Windows through
+        // FileRenameInfoEx as well as the normal rename path on Unix.
+        std::fs::rename(&staged, &path)?;
+        staged.disable_cleanup(true);
         Ok(())
     }
 
