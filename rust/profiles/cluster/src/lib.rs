@@ -34,6 +34,8 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 mod auth_posture;
 mod authorization;
 #[cfg(feature = "experimental-managed-agent-csr")]
+mod csr_cli;
+#[cfg(feature = "experimental-managed-agent-csr")]
 mod managed_csr;
 mod plugin_loading;
 mod runtime_backends;
@@ -654,6 +656,13 @@ fn enroll_port_addr(host_port: &str) -> Result<String> {
 /// arm rather than three.
 #[derive(Debug, Subcommand)]
 enum AuthCmd {
+    /// Experimental caller-owned Agent CSR operations through one live issuer.
+    /// No offline signing, endpoint failover or automatic issuance retry.
+    #[cfg(feature = "experimental-managed-agent-csr")]
+    Csr {
+        #[command(subcommand)]
+        action: csr_cli::CsrCommand,
+    },
     /// Mint a credential and print it. This is the only time it exists in the
     /// clear.
     ///
@@ -6639,6 +6648,8 @@ enum DaemonOutcome {
 async fn sk_via_daemon(common: &CommonArgs, action: &AuthCmd) -> Result<DaemonOutcome> {
     let (endpoint, tls) = local_daemon_target(common)?;
     match action {
+        #[cfg(feature = "experimental-managed-agent-csr")]
+        AuthCmd::Csr { .. } => anyhow::bail!("CSR operations cannot use legacy credential routing"),
         AuthCmd::Mint {
             subject_type,
             subject_id,
@@ -6718,6 +6729,11 @@ async fn sk_via_daemon(common: &CommonArgs, action: &AuthCmd) -> Result<DaemonOu
 }
 
 async fn run_auth(common: CommonArgs, action: AuthCmd) -> Result<()> {
+    #[cfg(feature = "experimental-managed-agent-csr")]
+    let action = match action {
+        AuthCmd::Csr { action } => return csr_cli::run(common, action).await,
+        other => other,
+    };
     // Agent-cert mint (task #40): route through a LIVE cluster daemon whenever
     // one is reachable, so `auth mint --subject-type agent NAME` just-works on
     // ANY enrolled node — founder or joiner — regardless of whether the local
@@ -6806,6 +6822,10 @@ async fn run_auth(common: CommonArgs, action: AuthCmd) -> Result<()> {
 /// on the blocking pool. Owns the ZoneManager start to finish, so the data-dir lock is
 /// taken and released inside this one call.
 fn run_auth_blocking(common: CommonArgs, action: AuthCmd) -> Result<()> {
+    #[cfg(feature = "experimental-managed-agent-csr")]
+    if matches!(action, AuthCmd::Csr { .. }) {
+        anyhow::bail!("CSR operations are remote-only; no offline store may be opened");
+    }
     // Agent-cert revocation is file-based (no redb): it appends the cert's
     // serial to the founder's revoked-serial file, which the running GetCrl
     // endpoint reads live. So it takes no store lock and works while the daemon
@@ -6942,6 +6962,8 @@ fn run_auth_action(
     action: AuthCmd,
 ) -> Result<()> {
     match action {
+        #[cfg(feature = "experimental-managed-agent-csr")]
+        AuthCmd::Csr { .. } => anyhow::bail!("CSR operations cannot use the offline issuer"),
         AuthCmd::Mint {
             subject_type,
             subject_id,

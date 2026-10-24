@@ -140,6 +140,52 @@ impl PendingAgentCsr {
         &self.request
     }
 
+    /// Validate an authenticated issuer observation without publishing files.
+    /// Unknown/refused observations do not establish the prior operation's
+    /// absence. A finalized observation also verifies the original key/profile.
+    pub fn observe(&self, response: &AgentCsrResponse) -> Result<AgentCsrState, String> {
+        let state = AgentCsrState::try_from(response.state)
+            .map_err(|_| "unsupported Agent CSR observation state")?;
+        match state {
+            AgentCsrState::Unknown | AgentCsrState::NotSubmitted => return Ok(state),
+            AgentCsrState::Unspecified => return Err("unspecified Agent CSR observation".into()),
+            AgentCsrState::Finalized => {
+                self.verify(response)?;
+                return Ok(state);
+            }
+            AgentCsrState::NotObserved | AgentCsrState::IntentCommitted => {}
+        }
+        self.verify_binding(response)?;
+        if !response.certificate_der.is_empty() {
+            return Err("unfinished Agent issuance returned a certificate".into());
+        }
+        if state == AgentCsrState::NotObserved {
+            if !response.serial.is_empty() || !response.intent_sha256.is_empty() {
+                return Err("absent Agent issuance returned intent material".into());
+            }
+        } else if response.serial.is_empty()
+            || response.serial.len() > 20
+            || response.intent_sha256.len() != 32
+        {
+            return Err("invalid committed Agent intent observation".into());
+        }
+        Ok(state)
+    }
+
+    fn verify_binding(&self, response: &AgentCsrResponse) -> Result<(), String> {
+        if response.error.is_some()
+            || response.agent_name != self.request.agent_name
+            || response.owner_id != self.request.owner_id
+            || response.operation_id != self.request.operation_id
+            || response.request_sha256 != agent_csr_request_digest(&self.request)?
+            || first_certificate_der(&response.ca_pem, "returned Agent issuer")?
+                != first_certificate_der(&self.ca_pem, "expected Agent issuer")?
+        {
+            return Err("Agent issuer observation changed its binding".into());
+        }
+        Ok(())
+    }
+
     /// Publish the native credential format only after validating the final
     /// authenticated issuer response. The manifest is created last. A repeated
     /// explicit publication accepts identical files; conflicts/partial bytes
@@ -184,12 +230,8 @@ impl PendingAgentCsr {
     }
 
     fn verify(&self, response: &AgentCsrResponse) -> Result<Vec<u8>, String> {
+        self.verify_binding(response)?;
         if response.state != AgentCsrState::Finalized as i32
-            || response.error.is_some()
-            || response.agent_name != self.request.agent_name
-            || response.owner_id != self.request.owner_id
-            || response.operation_id != self.request.operation_id
-            || response.request_sha256 != agent_csr_request_digest(&self.request)?
             || response.intent_sha256.len() != 32
             || response.serial.is_empty()
             || response.certificate_der.len() > 16 * 1024
@@ -197,9 +239,6 @@ impl PendingAgentCsr {
             return Err("Agent issuer response is not the bound finalized operation".into());
         }
         let ca_der = first_certificate_der(&self.ca_pem, "expected Agent issuer")?;
-        if first_certificate_der(&response.ca_pem, "returned Agent issuer")? != ca_der {
-            return Err("Agent issuer response changed the CA".into());
-        }
         let (rest, ca) =
             X509Certificate::from_der(&ca_der).map_err(|_| "invalid Agent issuer DER")?;
         if !rest.is_empty()
