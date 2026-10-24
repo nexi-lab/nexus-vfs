@@ -30,9 +30,14 @@ jobs:
           shared-key: domain-address-${{ matrix.os }}
       - run: cargo test --locked -p a2a --features experimental-domain-join --lib
       - run: cargo test --locked -p lib --features transport --lib transport_primitives::foreign_ca::tests
+      - run: cargo test --locked -p lib --features transport --lib transport_primitives::crl::tests
+      - run: cargo clippy --locked -p lib --features transport --all-targets -- -D warnings
+      - run: cargo test --locked -p raft@0.1.0 --lib transport::crl::tests
       - run: cargo clippy --locked -p a2a --features experimental-domain-join --lib -- -D warnings
       - run: cargo test --locked -p transport --features experimental-domain-join --lib collaboration_identity::tests
       - run: cargo test --locked -p transport --features experimental-domain-join --lib peer_identity::tests::collaboration_only_anchor
       - run: cargo test --locked -p raft@0.1.0 --features experimental-domain-join --lib collaboration_store::tests
+      - run: cargo test --locked -p raft@0.1.0 --features experimental-domain-join --lib collaboration_crl::tests
+      - run: cargo clippy --locked -p raft@0.1.0 --features experimental-domain-join --all-targets -- -D warnings
       - run: cargo test --locked -p raft@0.1.0 --features experimental-domain-join --lib foreign_ca_store::tests
       - run: cargo clippy --locked -p transport --features experimental-domain-join --lib -- -D warnings

@@ -199,6 +199,44 @@ is another current admission, not permission to replay the write. Foreign-CRL
 distribution and offline/live issuer writers must be integrated before enabling
 this path; a callback returning `()` is not that implementation.
 
+### Signed CRL freshness and retained revocations
+
+The shared transport library validates complete, direct-issuer CRLs, including
+the explicitly selected CA/signature, issuer/algorithm consistency, update
+interval and bounded input/serial sizes. Delta, partitioned and indirect CRLs
+are refused rather than interpreted as complete snapshots. Admission also
+requires the issuer to be currently valid and the snapshot to be within the
+native composition's 1–300 second maximum age, with no grace beyond
+`nextUpdate`. See [RFC 5280 CRL processing](https://www.rfc-editor.org/rfc/rfc5280.html#section-6.3).
+The existing cluster-only signature reader reuses this parser, retaining its
+existing clock policy; that older policy is insufficient for collaboration.
+
+`RaftCollaborationCrlStore` stores signed snapshots and irreversible,
+SPKI-authority-scoped serial tombstones in the existing control namespace.
+Refresh records observed revocations before publishing freshness bytes. Every
+admission reads the signed snapshot and its serial tombstone at one consensus
+point. Replaying an earlier empty CRL, refreshing a pruned list, and restarting
+cannot erase an already observed revoke. Uncertainty after a possible control
+write remains Unknown; partial installation can deny more access, never undo a
+revoke. This typed store has no deletion/un-revoke operation. Unknown certificate
+expiry is not permission to prune a tombstone. Authority-key rotation is a
+separate reviewed operation.
+
+This deliberately does not use the legacy `GetCrl` number as a monotonic
+version: that number is currently the revoked-entry count and can decrease
+when expired entries are pruned. Signed freshness bounds an unseen foreign
+revocation; it cannot make one known before an authentic refresh. Replay within
+the accepted freshness window is not claimed absent. A native deployment must
+choose/document its refresh interval and freshness budget, fail closed when
+fresh state cannot be established, and resolve the current registered issuer
+independently on every admission. Removing an anchor still refuses the caller;
+the presence of a stored CRL does not preserve trust.
+
+No profile currently installs this store as `CurrentAgentAuthority`. Live
+foreign refresh, registry/actual-TLS binding and the product's collaboration
+route remain activation gates. Neither a signed list nor a deployment JSON
+record grants a space or proves that the DGX has joined it.
+
 ## Data plane and compatibility
 
 New joining authorities use a collaboration-only trust purpose, not the old
