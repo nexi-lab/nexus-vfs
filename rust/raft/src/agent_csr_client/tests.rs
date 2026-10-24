@@ -196,3 +196,58 @@ fn interrupted_publication_refuses_conflicts_and_keeps_the_manifest_absent() {
     );
     assert!(!directory.join(CREDENTIAL_MANIFEST).exists());
 }
+
+#[test]
+fn observations_validate_binding_and_never_turn_an_unfinished_or_unknown_state_into_a_bundle() {
+    let private = tempfile::tempdir().unwrap();
+    let (ca, ca_key) = generate_zone_ca("observation-fixture").unwrap();
+    let pending =
+        PendingAgentCsr::create(&private.path().join("pending"), &binding(), &ca).unwrap();
+    let finalized = finalized(&pending, &ca_key);
+    assert_eq!(
+        pending.observe(&finalized).unwrap(),
+        AgentCsrState::Finalized
+    );
+    let mut absent = finalized.clone();
+    absent.state = AgentCsrState::NotObserved as i32;
+    absent.certificate_der.clear();
+    absent.serial.clear();
+    absent.intent_sha256.clear();
+    assert_eq!(
+        pending.observe(&absent).unwrap(),
+        AgentCsrState::NotObserved
+    );
+    absent.owner_id.push('!');
+    assert!(pending.observe(&absent).is_err());
+    let mut committed = finalized.clone();
+    committed.state = AgentCsrState::IntentCommitted as i32;
+    assert!(
+        pending.observe(&committed).is_err(),
+        "unfinished observation carried a certificate"
+    );
+    committed.certificate_der.clear();
+    assert_eq!(
+        pending.observe(&committed).unwrap(),
+        AgentCsrState::IntentCommitted
+    );
+    committed.intent_sha256.pop();
+    assert!(pending.observe(&committed).is_err());
+    for state in [AgentCsrState::Unknown, AgentCsrState::NotSubmitted] {
+        let failure = AgentCsrResponse {
+            state: state as i32,
+            error: Some("native refusal or uncertainty".into()),
+            ..Default::default()
+        };
+        assert_eq!(pending.observe(&failure).unwrap(), state);
+        assert!(pending
+            .publish(&failure, &private.path().join("bundle"))
+            .is_err());
+    }
+    assert!(pending
+        .observe(&AgentCsrResponse {
+            state: i32::MAX,
+            ..Default::default()
+        })
+        .is_err());
+    assert!(!private.path().join("bundle").exists());
+}
