@@ -185,6 +185,9 @@ impl FullStateMachine {
         txn: &redb::WriteTransaction,
         key: &str,
     ) -> Result<()> {
+        if !is_managed_key(key) {
+            return Ok(());
+        }
         if self.revision_in_txn(txn, key)?.is_some() {
             self.allocate_revision(txn, key, None)?;
         }
@@ -534,8 +537,7 @@ mod tests {
         );
     }
 
-    // The old prototype's red counterexample is preserved in the task archive.
-    // Divergent legacy images cannot be certified by allocating on read.
+    // Divergent legacy images remain unversioned on every replica.
     #[test]
     fn enrolment_cannot_certify_divergent_legacy_images_with_one_token() {
         let a_dir = tempfile::tempdir().unwrap();
