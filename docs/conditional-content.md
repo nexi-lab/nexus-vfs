@@ -1,8 +1,8 @@
 # Conditional visible-content writes (N2 design review)
 
 Status: implementation proposal, not a supported server capability yet.
-CAS publication reviewed against main `10fd74c7c`, including the existing-object
-integrity checks from #466 and database bootstrap publication from #462.
+CAS publication uses the existing-object integrity checks from #466 and the same
+`tempfile` publication primitives used by database bootstrap in #462.
 
 ## Contract
 
@@ -44,22 +44,24 @@ read-then-put, or metadata-only approximation.
 is not a content token. The existing Raft CasSetMetadata compares metadata only.
 None of those is the requested primitive.
 
-The existing CAS transport does not yet provide atomic complete-object staging.
-`LocalCASTransport::write_blob_tracked` and `write_blob_with_hash` verify the
-existing object's content hash before deduplicating. Both otherwise create and
-truncate the final hash path before writing its bytes. Concurrent first writers
-can therefore truncate the same final object, and readers can see incomplete
-bytes. A crash after creation can leave a partial final object; the integrity
-check rejects that object on subsequent writes. `fsync_on_write` syncs the file
-after writing;
-it supplies neither atomic publication nor the parent-directory durability
-barrier. Complete immutable staging requires a separate publication primitive.
+`LocalCASTransport::write_blob_tracked` and `write_blob_with_hash` share one
+publication path. They verify an existing object's content hash before
+deduplicating, stage new bytes in a private sibling file, and publish the complete
+candidate without replacing an existing winner. A concurrent winner is validated
+before reporting deduplication; a missing winner is an error. Sidecars share the
+staging path and atomically replace their previous complete bytes. A failed
+staging write leaves the final path unchanged. Legacy partial final objects are
+rejected by the integrity check.
 
-Before CAS can support N2, every object writer must publish a complete candidate
-without clobbering a winner and validate existing objects rather than trusting
-existence. Reuse one publication primitive in the existing Rust `lib` facilities,
-also needed for private credential pending files; do not introduce another store.
-The existing `lib::redb_storage` initializer publishes a new database without
+`fsync_on_write` syncs the staged file before publication. Atomic visibility is
+distinct from durable publication: parent-directory, newly created ancestor and
+platform-specific durability barriers still need a verified contract before CAS
+can report durable staging for N2. Concurrent-reader and short-write regressions
+establish visibility and failure behavior, rather than a power-loss guarantee.
+
+Before CAS can support N2, every object writer must preserve complete publication
+and verified deduplication, and the publication result must include the required
+durability barriers. The existing `lib::redb_storage` initializer publishes a new database without
 overwriting an existing file. Its redb-specific initialization and locking stay
 with that module; shared publication facilities belong in the existing `lib`
 tier. Atomic visibility and durable publication have distinct results. A failed barrier
