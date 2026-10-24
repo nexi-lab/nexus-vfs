@@ -287,7 +287,7 @@ pub fn sign_agent_csr(
 }
 
 /// Read only the verified public key; requested certificate policy is discarded.
-fn verified_csr_key(csr_pem: &[u8]) -> Result<PublicKey, String> {
+pub(crate) fn verified_csr_key(csr_pem: &[u8]) -> Result<PublicKey, String> {
     use x509_parser::certification_request::X509CertificationRequest;
     use x509_parser::prelude::FromDer;
 
