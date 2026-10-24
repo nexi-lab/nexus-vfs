@@ -1,8 +1,9 @@
 # Cross-domain Agent join: native source proposal
 
-Status: experimental address/value foundation, not an enabled federation
-protocol. The `a2a/experimental-domain-join` feature has no daemon composition,
-permission-provider replacement, credential issuance or mount activation.
+Status: experimental address/value foundation plus an unconditional reservation
+of `/collaboration` in the existing cluster permission provider. This is not an
+enabled federation protocol. The `a2a/experimental-domain-join` feature has no
+credential issuance, native collaboration authorization or mount activation.
 Existing local conversations and their identifiers are unchanged.
 
 The deployment target is an existing SudoWork/Moss/cohost product runtime on
@@ -91,13 +92,15 @@ reader in this pair. Both domains derive the same path. Exact parsing rejects
 prefix lookalikes, extra segments, noncanonical order and unrelated readers.
 
 This separate path family does not match the legacy transcript allow-list.
-The actual legacy provider refuses it for a foreign caller, but allows domestic
-and unidentified callers. The old stamping hook also leaves these paths
-unstamped. The regression records both the foreign denial and that domestic
-counterexample; it is not a claim of a profile-wide fail-closed boundary.
+The v0.8.23 provider refuses it for a foreign caller, but allows domestic and
+unidentified callers. The old stamping hook leaves these paths unstamped.
+This change reserves the complete `/collaboration` path component in the
+existing permission provider, before its domestic fast path and independently
+of the experimental feature. It denies non-system callers, including admins,
+on transcript, reader and malformed paths. A real Kernel I/O regression covers
+those caller classes, with ordinary local paths retaining their existing rules.
 
-Before activation a native profile-wide rule must reserve `/collaboration/`
-independently of this feature flag, across transcript, reader and other I/O.
+The reservation is a denial, not the future native participant authorizer.
 Every node that can serve the hosting zone must enforce the boundary; an
 individual peer's capability cannot qualify a mixed-version zone. Existing
 older binaries cannot gain that enforcement through negotiation. The family

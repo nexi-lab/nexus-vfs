@@ -4,8 +4,8 @@
 //! grant access. A later native authorizer must derive the caller from current
 //! mTLS/managed context and enforce the enrolled collaboration-space policy.
 //! No existing daemon route, stamp, mailbox or permission provider uses this
-//! module. The legacy gate denies this family only for foreign callers;
-//! domestic/unidentified callers on an old node have no such protection.
+//! module. A separate unconditional namespace reservation denies this family
+//! to non-system callers. Older nodes lack that rule and must not host it.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 
@@ -308,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_gate_denies_new_family_only_for_foreign_callers() {
+    fn namespace_reservation_applies_to_canonical_paths_for_all_agent_classes() {
         use kernel::kernel::OperationContext;
         use kernel::{Permission, PermissionProvider};
         let conversation =
@@ -320,8 +320,8 @@ mod tests {
                 .check(&conversation.transcript(), None, permission, &context)
                 .is_err());
         }
-        // Record the counterexample: a profile-wide boundary and zone-wide
-        // version qualification are required before activating the new family.
+        // Old versions allowed these domestic/unidentified operations. The
+        // reservation must not depend on trust_domain or the address feature.
         for actor in [Some("worker"), None] {
             let domestic = OperationContext::new("caller", "root", false, actor, false);
             for permission in [Permission::Read, Permission::Write] {
@@ -331,7 +331,7 @@ mod tests {
                 ] {
                     assert!(crate::ForeignAgentMailboxOnly
                         .check(&path, None, permission, &domestic)
-                        .is_ok());
+                        .is_err());
                 }
             }
         }
