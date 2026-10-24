@@ -1,10 +1,11 @@
 # Cross-domain Agent join: native source proposal
 
-Status: experimental address/value foundation plus an unconditional reservation
-of `/collaboration` in the existing cluster permission provider. This is not an
-enabled federation protocol. The `a2a/experimental-domain-join` feature has no
-credential issuance, native collaboration authorization or mount activation.
-Existing local conversations and their identifiers are unchanged.
+Status: experimental address, request-identity and immutable space-policy
+foundation, plus an unconditional reservation of `/collaboration` in the existing
+cluster permission provider. No daemon installs the experimental identity/policy
+path. Credential issuance, current foreign-CRL policy, authenticated management,
+Kernel forwarding and mount activation are still required. Existing local
+conversations and their identifiers are unchanged.
 
 The deployment target is an existing SudoWork/Moss/cohost product runtime on
 Edge, then existing Cloud Agent allocations. A separate standalone Agent is
@@ -42,6 +43,9 @@ anchor's DER SubjectPublicKeyInfo (SPKI)** and the exact UTF-8 Agent subject.
 The same rule applies to the domestic cluster CA. The registered anchor is the
 authority, not the leaf's direct issuer if intermediates are later supported.
 Operator labels, endpoints and display names are not authority identifiers.
+The existing foreign-CA registry/bootstrap fingerprint remains SHA256 of the
+complete certificate DER. That registry key and the SPKI address authority are
+different pins and must not be substituted for each other in native APIs.
 
 The experimental `a2a::domain_address::AgentAddress` codec is:
 
@@ -55,13 +59,13 @@ is an address-format bound; it does not replace the issuer's subject policy or
 establish that the subject appears in any valid certificate. No normalization,
 slash replacement, CN fallback or handwritten downstream codec is permitted.
 
-An address is public data, not a `VerifiedPrincipal`. The later authorizer must
+An address is public data, not an authenticated principal. The authorizer must
 derive its caller from the current actual mTLS leaf or the trusted managed
 descriptor/owner composition. An address decoded from a request cannot be
 promoted into that proof. Node, controller, session and durable managed-Agent
 identities must remain distinct.
 
-The existing classifier verifies signatures and picks the first matching
+The legacy classifier verifies signatures and picks the first matching
 anchor. Two renewed CA certificates using one key must therefore produce the
 same address; complete-certificate DER is unsuitable as that input. Before
 activation, native enrollment must reject an ambiguous key registered under
@@ -69,7 +73,23 @@ conflicting domains or grants, and current classification must detect an
 already-conflicting anchor set rather than pick its iteration order. A new
 authority key produces different addresses. Any continuity across that key
 rotation needs an explicit native authority decision; deployment scripts cannot
-alias the two generations themselves.
+alias the two generations themselves. The experimental transport entry now
+derives the address from the actual TLS leaf and current anchors, rejects
+conflicting matches instead of choosing their order, and requires exactly one
+Nexus Agent SAN. It refuses Node, owner/session and user-runtime credentials,
+nonempty bearer tokens and runtime-delegation carriers. Its authenticated result
+has no public constructor or deserializer. A required native current-authority
+check runs on each admission; there is no default allow policy. In particular,
+the old cluster-only CRL projection cannot satisfy foreign revocation policy.
+
+Certificate-only fixtures prove signature/SPKI/address and refusal rules. A
+separate real tonic/rustls connection checks the composed admission against a
+real Raft space store, then rejects later requests on that same channel after
+space revocation, current-policy denial and foreign-anchor removal. Its current
+certificate-policy callback is a test stand-in, not a foreign-CRL implementation;
+its Ping carrier performs no collaboration data operation or mount activation.
+Parsing a public certificate alone is deliberately a private helper, not an
+authentication entry point.
 
 Raw subjects are exact values, not trusted display labels. `escaped_subject`
 produces an ASCII rendering that exposes format characters, including U+200B,
@@ -137,14 +157,38 @@ The minimal join needs three explicit decisions:
    A space grant is distinct from model, filesystem, administrative, owner
    adoption and cluster membership rights.
 
-The precise grant schema and authority-update operation remain a native review
-gate. A deployment manifest can name required capabilities and public pins;
-it cannot declare that a remote peer has granted permission.
+The initial experimental `SpacePolicy` fixes its version, opaque space ID,
+hosting SPKI authority, non-reserved replicated zone, sorted unique set of 2..64
+canonical Agent members and a half-open validity interval. Members explicitly
+grant pairwise collaboration inside that space. Both participants must be in
+that grant, and the actual caller must be one of those two: a third authorized
+space member still cannot read their pair. Reader read/write/lock/unlock is
+restricted to that caller's own leaf. Transcript verbs are read and append;
+generic replacement, rename, copy, deletion or an operation wildcard is not
+implied. Host and routed-zone mismatches refuse local creation.
 
-Current authorization must apply to new requests and queries on a previously
-established TLS channel. Map live and offline revocation writers before
-claiming atomic ordering through append/receipt completion. A process-local
-mutex or a callback returning `()` is not a cross-process ordering proof.
+`RaftSpacePolicyStore` is a typed view over the existing replicated control
+store's `collaboration` namespace. Host/membership records are immutable CAS
+inserts. Identical requests reconcile to the same policy; conflicting bindings
+refuse. A space revocation is an irreversible tombstone, including when it wins
+before an in-flight create. Changes need a new space ID. Policy and revocation
+are read together at one consensus read point, never as unrelated cached gets.
+Ambiguous mutation responses remain Unknown and do not trigger a second proposal.
+These storage primitives are trusted composition-root methods, not Agent RPCs.
+
+Authenticated Node/operator management, a verified authority-to-endpoint routing
+record, whole-zone capability/readiness checks and the native permission-provider
+wiring remain activation gates. A deployment manifest cannot declare that the
+remote host granted permission or choose an arbitrary forwarding endpoint.
+
+Current authorization applies to new admissions and queries on a previously
+established TLS channel. A revocation ordered before an admission refuses it.
+An already admitted operation may finish: the control-zone read does not order
+revocation atomically through a later data-zone append. Claiming drained/quiescent
+revocation would additionally require the actual worker fence. Receipt recovery
+is another current admission, not permission to replay the write. Foreign-CRL
+distribution and offline/live issuer writers must be integrated before enabling
+this path; a callback returning `()` is not that implementation.
 
 ## Data plane and compatibility
 
@@ -180,7 +224,7 @@ silently translated to a bare name or a legacy remote filesystem write.
 Directory visibility is addressability, not proof of a running receiver.
 
 Before using the new family, the daemon's stamping hook must derive the same
-canonical sender from trusted context. This prototype does not change the old
+canonical sender from trusted context. This foundation does not change the old
 `resolved_agent_id`, envelope, or wide stamping predicate. Stamping and narrow
 authorization are separate consumers and must not share opposite safety
 assumptions about over-including paths.

@@ -163,6 +163,8 @@ pub mod transport;
 pub mod auth_key_store;
 #[cfg(all(feature = "grpc", has_protos))]
 pub mod blob_fetcher_handler;
+#[cfg(all(feature = "experimental-domain-join", has_protos))]
+pub mod collaboration_store;
 /// Generic replicated cluster-control store (`PutControlState` namespaces).
 /// Shared DRY layer under `auth_key_store` and the cross-org foreign-CA registry.
 #[cfg(all(feature = "grpc", has_protos))]

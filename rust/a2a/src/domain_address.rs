@@ -14,6 +14,17 @@ const MAX_SUBJECT_BYTES: usize = 128;
 const MAX_AGENT_SEGMENT: usize = 218;
 const MAX_PAIR_PATH: usize = PREFIX.len() + 32 + 7 + MAX_AGENT_SEGMENT * 3 + 1 + 9;
 
+pub(crate) fn validate_space_id(space: &str) -> Result<(), &'static str> {
+    if space.len() != 32
+        || !space
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err("Space ID must be exactly 32 lowercase hexadecimal characters");
+    }
+    Ok(())
+}
+
 /// A public Agent address bound to SHA256 of its registered anchor's DER SPKI.
 /// This is the authority key, not the complete certificate or a leaf issuer DN.
 /// Subject bytes are exact UTF-8; no normalization or display-name fallback.
@@ -106,14 +117,18 @@ pub struct ConversationAddress {
 }
 
 impl ConversationAddress {
+    #[must_use]
+    pub fn space(&self) -> &str {
+        &self.space
+    }
+
+    #[must_use]
+    pub fn participants(&self) -> (&AgentAddress, &AgentAddress) {
+        (&self.first, &self.second)
+    }
+
     pub fn new(space: String, a: AgentAddress, b: AgentAddress) -> Result<Self, &'static str> {
-        if space.len() != 32
-            || !space
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
-            return Err("Space ID must be exactly 32 lowercase hexadecimal characters");
-        }
+        validate_space_id(&space)?;
         let a_segment = a.segment();
         let b_segment = b.segment();
         if a_segment == b_segment {

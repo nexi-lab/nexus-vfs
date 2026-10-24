@@ -215,7 +215,7 @@ pub(crate) const DATA_PLANE_READY_BUDGET: std::time::Duration = std::time::Durat
 /// Every VFS request message carries its bearer token in an `auth_token`
 /// field. Naming that shape as a trait is what lets [`VfsServiceImpl::authenticate`]
 /// be written once instead of 28 times.
-pub(crate) trait AuthedRequest {
+pub trait AuthedRequest {
     fn auth_token(&self) -> &str;
 }
 
@@ -1967,7 +1967,7 @@ pub fn build_runtime_gateway_routes(
     )
 }
 
-fn build_vfs_service(
+pub(crate) fn build_vfs_service(
     kernel: Arc<Kernel>,
     auth: Arc<dyn AuthProvider>,
     foreign_ca_verifier: ForeignCaVerifierSlot,

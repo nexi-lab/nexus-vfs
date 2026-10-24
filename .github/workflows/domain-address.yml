@@ -2,10 +2,10 @@ name: Experimental domain addresses
 
 on:
   pull_request:
-    paths: ['rust/a2a/**', 'docs/cross-domain-agent-join.md', '.github/workflows/domain-address.yml']
+    paths: ['rust/a2a/**', 'rust/transport/**', 'rust/raft/**', 'rust/contracts/**', 'docs/cross-domain-agent-join.md', '.github/workflows/domain-address.yml']
   push:
     branches: [main]
-    paths: ['rust/a2a/**', 'docs/cross-domain-agent-join.md', '.github/workflows/domain-address.yml']
+    paths: ['rust/a2a/**', 'rust/transport/**', 'rust/raft/**', 'rust/contracts/**', 'docs/cross-domain-agent-join.md', '.github/workflows/domain-address.yml']
 
 permissions:
   contents: read
@@ -16,7 +16,7 @@ jobs:
       matrix:
         os: [ubuntu-22.04, windows-2022, macos-14]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 60
     env:
       CARGO_BUILD_JOBS: 1
     steps:
@@ -29,3 +29,6 @@ jobs:
           shared-key: domain-address-${{ matrix.os }}
       - run: cargo test --locked -p a2a --features experimental-domain-join --lib
       - run: cargo clippy --locked -p a2a --features experimental-domain-join --lib -- -D warnings
+      - run: cargo test --locked -p transport --features experimental-domain-join --lib collaboration_identity::tests
+      - run: cargo test --locked -p raft@0.1.0 --features experimental-domain-join --lib collaboration_store::tests
+      - run: cargo clippy --locked -p transport --features experimental-domain-join --lib -- -D warnings
