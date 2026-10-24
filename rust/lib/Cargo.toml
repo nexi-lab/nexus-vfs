@@ -38,7 +38,10 @@ transport = [
 runtime-bridge = ["dep:tokio", "tokio/rt", "tokio/rt-multi-thread"]
 
 # Durable database bootstrap; excluded from WASM and pure algorithm callers.
-redb-storage = ["dep:redb", "dep:tempfile"]
+redb-storage = ["dep:redb", "dep:tempfile", "file-storage"]
+
+# Native filesystem synchronization; excluded from portable algorithm callers.
+file-storage = []
 
 [dependencies]
 # Constants SSOT — pulled unconditionally because the crate is

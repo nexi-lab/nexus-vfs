@@ -53,15 +53,32 @@ staging path and atomically replace their previous complete bytes. A failed
 staging write leaves the final path unchanged. Legacy partial final objects are
 rejected by the integrity check.
 
-`fsync_on_write` syncs the staged file before publication. Atomic visibility is
-distinct from durable publication: parent-directory, newly created ancestor and
-platform-specific durability barriers still need a verified contract before CAS
-can report durable staging for N2. Concurrent-reader and short-write regressions
-establish visibility and failure behavior, rather than a power-loss guarantee.
+`fsync_on_write` syncs the staged file before publication.
+`LocalCASTransport::new_durable` selects the stronger Linux protocol: establish
+the root's ancestor barriers, synchronize an uncached blob-parent chain before
+using it, synchronize candidate bytes, publish atomically, then synchronize the
+containing directory. A verified deduplication hit synchronizes the existing
+file and directory too. Only successful ancestor preparation enters the parent
+cache. Namespace barriers are shared with database bootstrap through
+`lib::file_durability`.
+
+`PublishedButNotDurable` preserves the underlying OS error when an object is
+visible and its requested barrier fails. Retrying validates and synchronizes the
+same object; the error grants no permission to overwrite or remove it. macOS
+and Windows return Unsupported from `new_durable` before creating storage until
+their stronger protocols are qualified. macOS needs its device-cache flush
+semantics; the file-only constructor retains its existing contract.
+
+Atomic visibility and OS barriers still require qualification of the actual
+mount's persistent backing and device behavior. Injected sync failures and
+process-crash recovery verify ordering, failure and restart behavior; they do
+not simulate hardware power loss. Existing callers of the file-only constructor
+do not acquire the stronger contract automatically.
 
 Before CAS can support N2, every object writer must preserve complete publication
 and verified deduplication, and the publication result must include the required
-durability barriers. The existing `lib::redb_storage` initializer publishes a new database without
+durability barriers. The existing `lib::redb_storage` initializer publishes a new
+database without
 overwriting an existing file. Its redb-specific initialization and locking stay
 with that module; shared publication facilities belong in the existing `lib`
 tier. Atomic visibility and durable publication have distinct results. A failed barrier
