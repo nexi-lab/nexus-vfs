@@ -13,6 +13,7 @@
   },
   "type": "module",
   "main": "./dist/index.js",
+  "bin": { "nexus-node-operator": "./bin/nexus-node-operator.mjs" },
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
@@ -22,8 +23,10 @@
   },
   "files": [
     "dist",
+    "bin",
     "proto",
-    "README.md"
+    "README.md",
+    "OPERATOR.md"
   ],
   "engines": {
     "node": ">=18"
@@ -32,6 +35,7 @@
     "sync-proto": "node scripts/sync-proto.mjs",
     "check-proto": "node scripts/sync-proto.mjs --check",
     "build": "node scripts/sync-proto.mjs && tsc -p tsconfig.json",
+    "package:operator": "npm run build && node scripts/package-operator.mjs",
     "prepare": "npm run build",
     "lint": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test \"test/*.test.mjs\"",
