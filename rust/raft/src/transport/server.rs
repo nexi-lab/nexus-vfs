@@ -140,7 +140,39 @@ pub struct RaftGrpcServer {
     extra_services: Option<tonic::service::Routes>,
 }
 
+type GuardedRaftService =
+    super::node_authority::NodeControlService<ZoneTransportServiceServer<ZoneTransportServiceImpl>>;
+type GuardedApiService =
+    super::node_authority::NodeControlService<ZoneApiServiceServer<ZoneApiServiceImpl>>;
+
 impl RaftGrpcServer {
+    fn guarded_services(&self) -> Result<(GuardedRaftService, GuardedApiService)> {
+        use super::node_authority::{
+            NodeControlPolicy, NodeControlService, AGENT_CREDENTIAL_METHODS,
+        };
+        let policy = NodeControlPolicy::from_tls(self.config.tls.as_ref())
+            .map_err(TransportError::Connection)?;
+        let raft = ZoneTransportServiceImpl {
+            registry: self.registry.clone(),
+        };
+        let api = ZoneApiServiceImpl {
+            registry: self.registry.clone(),
+            blob_fetcher_slot: self.blob_fetcher_slot.clone(),
+            search_capabilities_slot: self.search_capabilities_slot.clone(),
+            agent_minter_slot: self.agent_minter_slot.clone(),
+            key_minter_slot: self.key_minter_slot.clone(),
+            foreign_ca_registrar_slot: self.foreign_ca_registrar_slot.clone(),
+            session_mint_admin_slot: self.session_mint_admin_slot.clone(),
+        };
+        Ok((
+            NodeControlService::new(ZoneTransportServiceServer::new(raft), policy.clone(), &[]),
+            NodeControlService::new(
+                ZoneApiServiceServer::new(api),
+                policy,
+                AGENT_CREDENTIAL_METHODS,
+            ),
+        ))
+    }
     pub fn new(registry: Arc<ZoneRaftRegistry>, config: ServerConfig) -> Self {
         Self {
             config,
@@ -249,18 +281,7 @@ impl RaftGrpcServer {
             tls_enabled,
         );
 
-        let raft_service = ZoneTransportServiceImpl {
-            registry: self.registry.clone(),
-        };
-        let client_service = ZoneApiServiceImpl {
-            registry: self.registry.clone(),
-            blob_fetcher_slot: self.blob_fetcher_slot.clone(),
-            search_capabilities_slot: self.search_capabilities_slot.clone(),
-            agent_minter_slot: self.agent_minter_slot.clone(),
-            key_minter_slot: self.key_minter_slot.clone(),
-            foreign_ca_registrar_slot: self.foreign_ca_registrar_slot.clone(),
-            session_mint_admin_slot: self.session_mint_admin_slot.clone(),
-        };
+        let (raft_service, client_service) = self.guarded_services()?;
 
         let mut builder =
             lib::transport_primitives::apply_server_limits(tonic::transport::Server::builder());
@@ -271,12 +292,12 @@ impl RaftGrpcServer {
         let router = if let Some(extra) = self.extra_services {
             builder
                 .add_routes(extra)
-                .add_service(ZoneTransportServiceServer::new(raft_service))
-                .add_service(ZoneApiServiceServer::new(client_service))
+                .add_service(raft_service)
+                .add_service(client_service)
         } else {
             builder
-                .add_service(ZoneTransportServiceServer::new(raft_service))
-                .add_service(ZoneApiServiceServer::new(client_service))
+                .add_service(raft_service)
+                .add_service(client_service)
         };
 
         // mTLS via a custom acceptor whose client-cert verifier is HOT-SWAPPABLE
@@ -321,18 +342,7 @@ impl RaftGrpcServer {
             tls_enabled,
         );
 
-        let raft_service = ZoneTransportServiceImpl {
-            registry: self.registry.clone(),
-        };
-        let client_service = ZoneApiServiceImpl {
-            registry: self.registry.clone(),
-            blob_fetcher_slot: self.blob_fetcher_slot.clone(),
-            search_capabilities_slot: self.search_capabilities_slot.clone(),
-            agent_minter_slot: self.agent_minter_slot.clone(),
-            key_minter_slot: self.key_minter_slot.clone(),
-            foreign_ca_registrar_slot: self.foreign_ca_registrar_slot.clone(),
-            session_mint_admin_slot: self.session_mint_admin_slot.clone(),
-        };
+        let (raft_service, client_service) = self.guarded_services()?;
 
         let mut builder =
             lib::transport_primitives::apply_server_limits(tonic::transport::Server::builder());
@@ -340,12 +350,12 @@ impl RaftGrpcServer {
         let router = if let Some(extra) = self.extra_services {
             builder
                 .add_routes(extra)
-                .add_service(ZoneTransportServiceServer::new(raft_service))
-                .add_service(ZoneApiServiceServer::new(client_service))
+                .add_service(raft_service)
+                .add_service(client_service)
         } else {
             builder
-                .add_service(ZoneTransportServiceServer::new(raft_service))
-                .add_service(ZoneApiServiceServer::new(client_service))
+                .add_service(raft_service)
+                .add_service(client_service)
         };
 
         // Hot-swappable federated mTLS acceptor — see `serve` for the rationale
@@ -2757,7 +2767,13 @@ impl RaftWitnessServer {
 
         let mut builder =
             lib::transport_primitives::apply_server_limits(tonic::transport::Server::builder());
-        let router = builder.add_service(ZoneTransportServiceServer::new(service));
+        let policy = super::node_authority::NodeControlPolicy::from_tls(self.config.tls.as_ref())
+            .map_err(TransportError::Connection)?;
+        let router = builder.add_service(super::node_authority::NodeControlService::new(
+            ZoneTransportServiceServer::new(service),
+            policy,
+            &[],
+        ));
 
         // The witness mTLS bind is CLUSTER-ONLY: it is a raft tie-breaker, never
         // a target for foreign agents (those write mailboxes on the broker), so
