@@ -3,7 +3,7 @@
 Status: experimental address, request-identity and immutable space-policy
 foundation, plus an unconditional reservation of `/collaboration` in the existing
 cluster permission provider. No daemon installs the experimental identity/policy
-path. Credential issuance, current foreign-CRL policy, authenticated management,
+path. Credential issuance, current foreign-CRL policy, management installation,
 Kernel forwarding and mount activation are still required. Existing local
 conversations and their identifiers are unchanged.
 
@@ -175,8 +175,17 @@ before an in-flight create. Changes need a new space ID. Policy and revocation
 are read together at one consensus read point, never as unrelated cached gets.
 Ambiguous mutation responses remain Unknown and do not trigger a second proposal.
 These storage primitives are trusted composition-root methods, not Agent RPCs.
+`SpaceManagementService` exposes the native management boundary through the
+existing context-aware Kernel Call service, without another HTTP/IPC protocol.
+It refuses Open/NoAuth construction and separately requires the resolved local
+Node subject, canonical Node identity and native system/admin flags on every
+call. A plain system/admin context, foreign Agent or owner/session is insufficient;
+request bodies cannot supply the caller. DTOs reject unknown fields. Once a
+mutation is attempted, errors remain typed Unknown and read-only reconciliation
+does not resubmit it. Its capability is `managementVersion:1, dataPlaneVersion:0`:
+confirmed control state is not a usable collaboration route or delivery.
 
-Authenticated Node/operator management, a verified authority-to-endpoint routing
+Native profile installation of that management service, a verified authority-to-endpoint routing
 record, whole-zone capability/readiness checks and the native permission-provider
 wiring remain activation gates. A deployment manifest cannot declare that the
 remote host granted permission or choose an arbitrary forwarding endpoint.
