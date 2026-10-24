@@ -209,8 +209,8 @@ test(
       try {
         await assert.rejects(runtime.mintSessionAgent('another-owner', { validitySecs: 120 }), /refused/)
         await assert.rejects(runtime.mintUserRuntime('another-owner', { validitySecs: 120 }), /refused/)
-        assert.equal((await adminCall(unprivileged, 'MintAgent', { subject_id: `forged-${process.pid}` })).success, false)
-        assert.equal((await adminCall(unprivileged, 'AllowSessionMinter', { agent_id: credential.subjectId })).success, false)
+        await assert.rejects(adminCall(unprivileged, 'MintAgent', { subject_id: `forged-${process.pid}` }), /^Error: MintAgent: PERMISSION_DENIED:/)
+        await assert.rejects(adminCall(unprivileged, 'AllowSessionMinter', { agent_id: credential.subjectId }), /^Error: AllowSessionMinter: PERMISSION_DENIED:/)
       } finally { runtime.close(); unprivileged.close() }
       await agent.revokeAgentCert(credential.certPem)
       await assert.rejects(agent.renewSessionAgent(credential, { validitySecs: 120 }), /revoked/)
