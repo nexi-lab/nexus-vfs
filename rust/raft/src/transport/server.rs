@@ -1124,25 +1124,35 @@ impl ZoneApiService for ZoneApiServiceImpl {
         let term = node.term();
         let leader_addr = peers.get(&leader_id).map(|a| a.endpoint.clone());
 
-        // SSOT: voters come from raft-rs `ProgressTracker` (mirrored
-        // into `ZoneConsensus::cached_voters` by the driver's
-        // post-advance refresh).  Do NOT union with `peers` — the
+        // Reuse the driver's membership query so voters and learners come
+        // from one ProgressTracker view. Do NOT union with `peers` — the
         // peer address book is a superset (learners, witnesses,
         // ghosts from wipe-rejoins), and unioning with a hand-added
         // self entry produced the "leader appears twice in voters
         // list" issue #7.  `peers` is used only to resolve id →
-        // endpoint address for each authoritative voter.
-        let voters: Vec<ProtoNodeInfo> = node
-            .voters()
+        // endpoint address for each authoritative member. This is membership,
+        // not proof of reachability, feature support or a ReadIndex barrier.
+        let membership = node
+            .membership()
+            .await
+            .map_err(|e| Status::unavailable(format!("read zone membership: {e}")))?;
+        let member_info = |id, role| ProtoNodeInfo {
+            id,
+            address: peers
+                .get(&id)
+                .map(|a| a.endpoint.clone())
+                .unwrap_or_default(),
+            role,
+        };
+        let voters = membership
+            .voters
             .into_iter()
-            .map(|id| ProtoNodeInfo {
-                id,
-                address: peers
-                    .get(&id)
-                    .map(|a| a.endpoint.clone())
-                    .unwrap_or_default(),
-                role: 0,
-            })
+            .map(|id| member_info(id, 0))
+            .collect();
+        let learners = membership
+            .learners
+            .into_iter()
+            .map(|id| member_info(id, 1))
             .collect();
 
         Ok(Response::new(GetClusterInfoResponse {
@@ -1151,7 +1161,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
             term,
             config: Some(ProtoClusterConfig {
                 voters,
-                learners: vec![],
+                learners,
                 witnesses: vec![],
             }),
             is_leader,

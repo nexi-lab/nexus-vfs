@@ -25,10 +25,16 @@ struct ValidatedCredential {
     expires_at: u64,
 }
 
+enum CredentialUse {
+    Bootstrap,
+    Rotation,
+}
+
 fn validate_credential(
     bundle: LoadedCredential,
     owner: &str,
     verifier: &FederatedClientCertVerifier,
+    usage: CredentialUse,
 ) -> Result<ValidatedCredential> {
     let ca = ::pem::parse(&bundle.ca_pem).context("runtime CA PEM")?;
     if ca.contents() != verifier.cluster_ca_der() {
@@ -47,7 +53,12 @@ fn validate_credential(
     {
         bail!("runtime certificate belongs to another owner or lacks server capability");
     }
-    if !cert.validity().is_valid() {
+    // Bootstrap may retain an expired identity while awaiting its projected
+    // replacement. TLS and RuntimeScope still refuse expired authority. This
+    // avoids a container restart backoff outlasting every renewed credential.
+    let is_expired_bootstrap =
+        matches!(usage, CredentialUse::Bootstrap) && cert.validity().not_after < ASN1Time::now();
+    if !cert.validity().is_valid() && !is_expired_bootstrap {
         bail!("runtime certificate is outside its validity window");
     }
     let lifetime = cert.validity().not_after.timestamp() - cert.validity().not_before.timestamp();
@@ -144,7 +155,7 @@ pub(super) async fn serve(
     let scope = RuntimeScope::new(owner.clone(), [])?;
     let initial = AgentCredential::load(&credential_path).map_err(anyhow::Error::msg)?;
     let verifier = FederatedClientCertVerifier::new(&initial.ca_pem).map_err(anyhow::Error::msg)?;
-    let initial = validate_credential(initial, &owner, &verifier)?;
+    let initial = validate_credential(initial, &owner, &verifier, CredentialUse::Bootstrap)?;
     let identity = ReloadableServerIdentity::new(
         server_config(
             Arc::clone(&verifier),
@@ -267,13 +278,14 @@ pub(super) async fn serve(
             {
                 continue;
             }
-            let candidate = match validate_credential(candidate, &owner, &verifier) {
-                Ok(candidate) => candidate,
-                Err(error) => {
-                    tracing::warn!(%error, "runtime credential replacement refused");
-                    continue;
-                }
-            };
+            let candidate =
+                match validate_credential(candidate, &owner, &verifier, CredentialUse::Rotation) {
+                    Ok(candidate) => candidate,
+                    Err(error) => {
+                        tracing::warn!(%error, "runtime credential replacement refused");
+                        continue;
+                    }
+                };
             match server_config(
                 Arc::clone(&verifier),
                 &candidate.bundle.cert_pem,

@@ -668,6 +668,7 @@ impl RaftApiClient {
             term: resp.term,
             is_leader: resp.is_leader,
             leader_address: resp.leader_address,
+            config: resp.config,
         })
     }
 }
@@ -711,6 +712,9 @@ pub struct ClusterInfoResult {
     pub is_leader: bool,
     /// Leader address (if known).
     pub leader_address: Option<String>,
+    /// Authoritative local membership, including learners. This does not
+    /// certify reachability or support for a particular feature.
+    pub config: Option<super::proto::nexus::raft::ClusterConfig>,
 }
 
 // =============================================================================
