@@ -6648,6 +6648,8 @@ enum DaemonOutcome {
 async fn sk_via_daemon(common: &CommonArgs, action: &AuthCmd) -> Result<DaemonOutcome> {
     let (endpoint, tls) = local_daemon_target(common)?;
     match action {
+        #[cfg(feature = "experimental-managed-agent-csr")]
+        AuthCmd::Csr { .. } => anyhow::bail!("CSR operations cannot use legacy credential routing"),
         AuthCmd::Mint {
             subject_type,
             subject_id,
