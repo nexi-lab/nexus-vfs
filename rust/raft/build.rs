@@ -55,7 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // First compile core/metadata.proto separately
         let core_protos = &[core_proto];
-        let includes = &[proto_root.clone()];
+        let includes = std::slice::from_ref(&proto_root);
 
         tonic_prost_build::configure()
             .build_server(false)
