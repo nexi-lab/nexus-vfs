@@ -27,6 +27,9 @@ pub mod search;
 pub mod trigram;
 pub mod types;
 
+#[cfg(feature = "file-storage")]
+pub mod file_durability;
+
 #[cfg(feature = "redb-storage")]
 pub mod redb_storage;
 

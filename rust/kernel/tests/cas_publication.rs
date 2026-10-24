@@ -68,15 +68,23 @@ struct Worker(Child);
 
 impl Worker {
     fn spawn(root: &Path, role: &str, id: usize) -> Self {
-        Self(
-            Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "cas_process_worker", "--nocapture"])
-                .env(WORKER_ROLE, role)
-                .env(WORKER_ROOT, root)
-                .env(WORKER_ID, id.to_string())
-                .spawn()
-                .unwrap(),
-        )
+        Self::spawn_with(root, role, id, |_| {})
+    }
+
+    fn spawn_with(
+        root: &Path,
+        role: &str,
+        id: usize,
+        configure: impl FnOnce(&mut Command),
+    ) -> Self {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", "cas_process_worker", "--nocapture"])
+            .env(WORKER_ROLE, role)
+            .env(WORKER_ROOT, root)
+            .env(WORKER_ID, id.to_string());
+        configure(&mut command);
+        Self(command.spawn().unwrap())
     }
 
     fn is_finished(&mut self) -> bool {
@@ -131,11 +139,25 @@ fn start_writers(root: &Path, role: &str) -> Vec<Worker> {
 
 #[test]
 fn concurrent_processes_publish_one_complete_blob() {
+    concurrent_blob_publication("blob", false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn concurrent_processes_publish_one_durable_blob() {
+    concurrent_blob_publication("strong-blob", true);
+}
+
+fn concurrent_blob_publication(role: &str, durable: bool) {
     let root = tempfile::tempdir().unwrap();
-    let transport = LocalCASTransport::new(root.path(), true).unwrap();
+    let transport = if durable {
+        LocalCASTransport::new_durable(root.path()).unwrap()
+    } else {
+        LocalCASTransport::new(root.path(), true).unwrap()
+    };
     let content = concurrent_content();
     let hash = lib::hash::hash_content(&content);
-    let mut workers = start_writers(root.path(), "blob");
+    let mut workers = start_writers(root.path(), role);
     let mut was_visible = false;
     wait_until(|| {
         match transport.read_blob(&hash) {
@@ -209,21 +231,32 @@ fn cas_process_worker() {
     let root = std::env::var_os(WORKER_ROOT).unwrap();
     let root = Path::new(&root);
     let id: usize = std::env::var(WORKER_ID).unwrap().parse().unwrap();
-    let transport = LocalCASTransport::new(root, true).unwrap();
-    if role == "blob" || role == "meta" {
-        let content = if role == "blob" {
+    #[cfg(target_os = "linux")]
+    if let Some(mode) = role.strip_prefix("durable-") {
+        durable_process_worker(root, mode);
+        return;
+    }
+    let is_durable = role == "strong-blob";
+    let transport = if is_durable {
+        LocalCASTransport::new_durable(root).unwrap()
+    } else {
+        LocalCASTransport::new(root, true).unwrap()
+    };
+    if role == "blob" || role == "meta" || is_durable {
+        let is_blob = role != "meta";
+        let content = if is_blob {
             concurrent_content()
         } else {
             sidecar_content(id)
         };
-        let hash = if role == "blob" {
+        let hash = if is_blob {
             lib::hash::hash_content(&content)
         } else {
             lib::hash::hash_content(b"sidecar object")
         };
         std::fs::write(root.join(format!("ready-{id}")), []).unwrap();
         wait_until(|| root.join("start").exists());
-        if role == "blob" {
+        if is_blob {
             // Compete through both public entry points against the same object.
             let published = if id.is_multiple_of(2) {
                 transport.write_blob_tracked(&content).unwrap().1
@@ -307,4 +340,248 @@ fn failed_prehashed_write_leaves_no_final_object() {
 #[test]
 fn failed_sidecar_replacement_preserves_previous_bytes() {
     failed_publication("meta");
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn unqualified_durability_is_refused_before_creating_storage() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("not-created");
+    let result = LocalCASTransport::new_durable(&root);
+    assert_eq!(result.err().unwrap().kind(), io::ErrorKind::Unsupported);
+    assert!(!root.exists());
+}
+
+#[cfg(target_os = "linux")]
+fn durable_process_worker(root: &Path, mode: &str) {
+    use lib::file_durability::PublishedButNotDurable;
+
+    let transport = LocalCASTransport::new_durable(root).unwrap();
+    let content = b"complete object acknowledged after file and namespace barriers";
+    let hash = lib::hash::hash_content(content);
+    if mode == "success" || mode == "kill-before" || mode == "kill-after" {
+        assert_eq!(
+            transport.write_blob_tracked(content).unwrap(),
+            (hash.clone(), true)
+        );
+        if mode == "kill-after" {
+            unsafe { libc::raise(libc::SIGKILL) };
+            panic!("SIGKILL returned");
+        }
+        assert_eq!(transport.read_blob(&hash).unwrap(), content);
+        return;
+    }
+    let error = if mode == "meta" {
+        transport
+            .write_meta(&hash, br#"{"complete":true}"#)
+            .unwrap_err()
+    } else {
+        transport.write_blob_with_hash(content, &hash).unwrap_err()
+    };
+    if mode == "prepare" || mode == "file" {
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        assert!(!transport.blob_path(&hash).exists());
+    } else {
+        let state = error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<PublishedButNotDurable>()
+            .unwrap();
+        assert_eq!(state.io_error().raw_os_error(), Some(libc::EIO));
+        if mode == "meta" {
+            assert_eq!(transport.read_meta(&hash).unwrap(), br#"{"complete":true}"#);
+        } else {
+            assert_eq!(transport.read_blob(&hash).unwrap(), content);
+        }
+    }
+    // Recover the same transport after the injected OS barrier failure.
+    std::env::remove_var("NEXUS_CAS_SYNC_FAULT");
+    if mode == "meta" {
+        transport
+            .write_meta(&hash, br#"{"complete":true}"#)
+            .unwrap();
+    } else {
+        let published = transport.write_blob_with_hash(content, &hash).unwrap();
+        assert_eq!(published, mode == "prepare" || mode == "file");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn durability_fixture() -> tempfile::TempDir {
+    let fixture = tempfile::tempdir().unwrap();
+    let source = fixture.path().join("fault.c");
+    std::fs::write(&source, include_str!("fixtures/cas_fsync_fault.c")).unwrap();
+    let output = Command::new("cc")
+        .args(["-shared", "-fPIC", "-O0", "-Wall", "-Wextra", "-Werror"])
+        .arg(source)
+        .arg("-o")
+        .arg(fixture.path().join("fault.so"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fixture
+}
+
+#[cfg(target_os = "linux")]
+fn durable_child(
+    root: &Path,
+    target: &Path,
+    fixture: &Path,
+    trace: &Path,
+    mode: &str,
+    fault: &str,
+) -> Worker {
+    Worker::spawn_with(root, &format!("durable-{mode}"), 0, |command| {
+        command
+            .env("LD_PRELOAD", fixture.join("fault.so"))
+            .env("NEXUS_CAS_SYNC_ROOT", root)
+            .env("NEXUS_CAS_SYNC_TARGET", target)
+            .env("NEXUS_CAS_SYNC_TRACE", trace)
+            .env("NEXUS_CAS_SYNC_FAULT", fault)
+            .env("NEXUS_CAS_SYNC_MARKER", root.join("paused"));
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn durable_publication_orders_file_and_directory_barriers() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("new/nested/storage");
+    let hash =
+        lib::hash::hash_content(b"complete object acknowledged after file and namespace barriers");
+    let target = root.join(format!("cas/{}/{}/{hash}", &hash[..2], &hash[2..4]));
+    let fixture = durability_fixture();
+    let trace = parent.path().join("trace");
+    let mut worker = durable_child(&root, &target, fixture.path(), &trace, "success", "");
+    wait_until(|| worker.is_finished());
+    let events = std::fs::read_to_string(trace).unwrap();
+    let events: Vec<_> = events.lines().collect();
+    let file = events
+        .iter()
+        .position(|line| line.starts_with("F|0|0|"))
+        .unwrap();
+    for directory in target.parent().unwrap().ancestors() {
+        let event = format!("D|0|0|{}", directory.display());
+        assert!(
+            events[..file].contains(&event.as_str()),
+            "missing prepublication barrier: {event}"
+        );
+    }
+    let published = format!("D|1|0|{}", target.parent().unwrap().display());
+    assert!(events[file + 1..].contains(&published.as_str()));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn durable_failures_preserve_publication_state_and_retry_barriers() {
+    for (mode, fault) in [
+        ("prepare", "prepare-dir"),
+        ("file", "staged-file"),
+        ("published", "published-dir"),
+        ("dedup", "existing-file"),
+        ("meta", "published-dir"),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let content = b"complete object acknowledged after file and namespace barriers";
+        let hash = lib::hash::hash_content(content);
+        let transport = LocalCASTransport::new(root.path(), false).unwrap();
+        let blob = transport.blob_path(&hash);
+        if mode == "dedup" {
+            transport.write_blob(content).unwrap();
+        }
+        let target = if mode == "meta" {
+            blob.with_extension("meta")
+        } else {
+            blob
+        };
+        let fixture = durability_fixture();
+        let trace = root.path().join("trace");
+        let mut worker = durable_child(root.path(), &target, fixture.path(), &trace, mode, fault);
+        wait_until(|| worker.is_finished());
+        let events = std::fs::read_to_string(trace).unwrap();
+        assert!(
+            events
+                .lines()
+                .any(|line| line.split('|').nth(2) == Some("1")),
+            "fault not exercised: {mode}"
+        );
+        let lines: Vec<_> = events.lines().collect();
+        let failed = lines
+            .iter()
+            .position(|line| line.split('|').nth(2) == Some("1"))
+            .unwrap();
+        let acknowledged = format!("D|1|0|{}", target.parent().unwrap().display());
+        assert!(
+            lines[failed + 1..].contains(&acknowledged.as_str()),
+            "retry acknowledged without a successful publication barrier: {mode}"
+        );
+        if mode == "dedup" {
+            assert!(
+                !events.contains(".cas-"),
+                "dedup must synchronize the existing object"
+            );
+            let retry = format!("F|1|0|{}", target.display());
+            assert!(events.lines().any(|line| line == retry));
+        }
+        if mode == "prepare" {
+            let retry = format!("D|0|0|{}", target.parent().unwrap().display());
+            assert!(
+                events.lines().any(|line| line == retry),
+                "failed parent preparation must be retried"
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn killed_publishers_recover_before_and_after_acknowledgement() {
+    use std::os::unix::process::ExitStatusExt;
+
+    for mode in ["kill-before", "kill-after"] {
+        let root = tempfile::tempdir().unwrap();
+        let content = b"complete object acknowledged after file and namespace barriers";
+        let hash = lib::hash::hash_content(content);
+        let transport = LocalCASTransport::new(root.path(), false).unwrap();
+        let target = transport.blob_path(&hash);
+        let fixture = durability_fixture();
+        let trace = root.path().join("trace");
+        let fault = if mode == "kill-before" {
+            "pause-file"
+        } else {
+            ""
+        };
+        let mut worker = durable_child(root.path(), &target, fixture.path(), &trace, mode, fault);
+        if mode == "kill-before" {
+            wait_until(|| {
+                assert!(!worker.is_finished(), "publisher exited before pause");
+                root.path().join("paused").exists()
+            });
+            worker.0.kill().unwrap();
+        }
+        let mut status = None;
+        wait_until(|| {
+            status = worker.0.try_wait().unwrap();
+            status.is_some()
+        });
+        assert_eq!(status.unwrap().signal(), Some(libc::SIGKILL));
+        let recovered = LocalCASTransport::new_durable(root.path()).unwrap();
+        if mode == "kill-before" {
+            assert_eq!(
+                recovered.read_blob(&hash).unwrap_err().kind(),
+                io::ErrorKind::NotFound
+            );
+        } else {
+            assert_eq!(recovered.read_blob(&hash).unwrap(), content);
+        }
+        assert_eq!(
+            recovered.write_blob_tracked(content).unwrap(),
+            (hash.clone(), mode == "kill-before")
+        );
+        assert_eq!(recovered.read_blob(&hash).unwrap(), content);
+    }
 }

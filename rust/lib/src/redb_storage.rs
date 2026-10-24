@@ -49,7 +49,7 @@ fn open_or_create_with(
     match staged.persist_noclobber(path) {
         Ok(_) => {
             #[cfg(unix)]
-            File::open(parent)?.sync_all()?;
+            crate::file_durability::sync_directory(parent)?;
             Ok(database)
         }
         Err(error) if error.error.kind() == ErrorKind::AlreadyExists => {
