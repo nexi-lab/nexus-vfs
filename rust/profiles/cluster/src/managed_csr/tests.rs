@@ -164,7 +164,9 @@ async fn real_mtls_issuance_preserves_original_key_and_reconciles_both_lost_repl
     let running = tokio::spawn(async move {
         server
             .serve_with_shutdown(async {
-                let _ = stopped.await;
+                stopped
+                    .await
+                    .expect("fixture shutdown must be explicitly signaled");
             })
             .await
             .unwrap();
