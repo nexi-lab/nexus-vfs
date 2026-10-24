@@ -205,15 +205,13 @@ mod tests {
             ),
             (-60, 120, vec!["nexus://zone/root/node/007"]),
         ] {
-            let params = rcgen::CertificateParams {
-                not_before: now + time::Duration::seconds(start),
-                not_after: now + time::Duration::seconds(end),
-                subject_alt_names: identities
-                    .into_iter()
-                    .map(|s| rcgen::SanType::URI(s.try_into().unwrap()))
-                    .collect(),
-                ..Default::default()
-            };
+            let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            params.not_before = now + time::Duration::seconds(start);
+            params.not_after = now + time::Duration::seconds(end);
+            params.subject_alt_names = identities
+                .into_iter()
+                .map(|s| rcgen::SanType::URI(s.try_into().unwrap()))
+                .collect();
             let leaf = params.signed_by(&key, &issuer).unwrap();
             assert!(current_local_node_certificate(leaf.der(), &der(&ca)).is_err());
         }
