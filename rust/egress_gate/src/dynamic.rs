@@ -16,7 +16,7 @@ pub const ENV_CONFIG: &str = "NEXUS_EGRESS_GATE_CONFIG";
 const MAX_BYTES: u64 = 1024 * 1024;
 const MAX_REVISION: u64 = 9_007_199_254_740_991;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PolicyDocument {
     pub version: u32,
@@ -30,7 +30,7 @@ pub struct PolicyDocument {
     pub business_policy: BusinessPolicy,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Analyzer {
     pub url: String,
@@ -40,7 +40,7 @@ pub struct Analyzer {
     pub timeout_ms: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct BusinessPolicy {
     pub version: u32,
@@ -239,7 +239,9 @@ impl LivePolicy {
                 return Ok(None);
             }
             let (document, hook) = decode(&bytes, self.suffix)?;
-            if document.revision <= active.document.revision {
+            if document.revision < active.document.revision
+                || (document.revision == active.document.revision && document != active.document)
+            {
                 return Err("egress policy revision must increase".into());
             }
             Ok(Some((bytes, document, hook)))
@@ -447,6 +449,19 @@ mod tests {
         }
         std::fs::remove_file(&path).unwrap();
         assert!(hook.on_pre(&write("/cloud-model/ask.prompt")).is_err());
+    }
+
+    #[test]
+    fn formatting_changes_keep_the_same_admitted_policy_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("policy.json");
+        let document = document(1, true, "redact");
+        std::fs::write(&path, document.to_string()).unwrap();
+        let policy = LivePolicy::open(path.clone(), Some(".prompt")).unwrap();
+        std::fs::write(path, serde_json::to_string_pretty(&document).unwrap()).unwrap();
+        let active = policy.refresh();
+        assert_eq!(active.document.revision, 1);
+        assert!(active.error.is_none());
     }
 
     #[test]
