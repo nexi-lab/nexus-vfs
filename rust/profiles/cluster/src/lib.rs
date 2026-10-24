@@ -33,6 +33,8 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 mod auth_posture;
 mod authorization;
+#[cfg(feature = "experimental-managed-agent-csr")]
+mod managed_csr;
 mod plugin_loading;
 mod runtime_backends;
 mod search_capabilities;
@@ -5713,6 +5715,7 @@ fn write_agent_bundle(
 /// Recheck the client leaf against the current LOCAL cluster CA and its Node
 /// role; the listener may also admit foreign CA leaves for VFS. An agent can never
 /// be leveraged into minting further agents (privilege confinement).
+#[derive(Clone)]
 struct FounderAgentMinter {
     store: Arc<dyn kernel::hal::auth_key_store::AuthKeyStore>,
     tls_dir: PathBuf,
@@ -5797,6 +5800,32 @@ impl FounderAgentMinter {
 
 #[tonic::async_trait]
 impl nexus_raft::agent_minter::AgentMinter for FounderAgentMinter {
+    #[cfg(feature = "experimental-managed-agent-csr")]
+    fn csr_capabilities(&self) -> nexus_raft::transport::proto::AgentCsrCapabilitiesResponse {
+        managed_csr::capabilities(self)
+    }
+
+    #[cfg(feature = "experimental-managed-agent-csr")]
+    async fn agent_csr_v1(
+        &self,
+        caller_cert_der: Option<Vec<u8>>,
+        request: nexus_raft::transport::proto::AgentCsrRequest,
+        query_only: bool,
+    ) -> nexus_raft::transport::proto::AgentCsrResponse {
+        let issuer = self.clone();
+        match tokio::task::spawn_blocking(move || {
+            managed_csr::execute(&issuer, caller_cert_der, request, query_only)
+        })
+        .await
+        {
+            Ok(response) => response,
+            Err(_) => managed_csr::failure(
+                nexus_raft::transport::proto::AgentCsrState::Unknown,
+                "Agent CSR issuer worker did not return",
+            ),
+        }
+    }
+
     async fn mint(
         &self,
         caller_cert_der: Option<Vec<u8>>,

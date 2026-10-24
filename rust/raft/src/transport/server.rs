@@ -841,8 +841,61 @@ struct ZoneApiServiceImpl {
     session_mint_admin_slot: Option<crate::session_mint_admin::SessionMintAdminSlot>,
 }
 
+impl ZoneApiServiceImpl {
+    async fn agent_csr_response(
+        &self,
+        request: Request<super::proto::AgentCsrRequest>,
+        query_only: bool,
+    ) -> std::result::Result<Response<super::proto::AgentCsrResponse>, Status> {
+        let caller = peer_cert_der(&request);
+        let minter = self
+            .agent_minter_slot
+            .as_ref()
+            .and_then(|s| s.read().clone());
+        let Some(minter) = minter else {
+            return Ok(Response::new(super::proto::AgentCsrResponse {
+                state: super::proto::AgentCsrState::NotSubmitted as i32,
+                error: Some("caller-owned Agent CSR issuer is unarmed on this node".into()),
+                ..Default::default()
+            }));
+        };
+        Ok(Response::new(
+            minter
+                .agent_csr_v1(caller, request.into_inner(), query_only)
+                .await,
+        ))
+    }
+}
+
 #[tonic::async_trait]
 impl ZoneApiService for ZoneApiServiceImpl {
+    async fn get_agent_csr_capabilities(
+        &self,
+        _request: Request<super::proto::AgentCsrCapabilitiesRequest>,
+    ) -> std::result::Result<Response<super::proto::AgentCsrCapabilitiesResponse>, Status> {
+        let minter = self
+            .agent_minter_slot
+            .as_ref()
+            .and_then(|s| s.read().clone());
+        Ok(Response::new(
+            minter.map_or_else(Default::default, |m| m.csr_capabilities()),
+        ))
+    }
+
+    async fn issue_agent_csr_v1(
+        &self,
+        request: Request<super::proto::AgentCsrRequest>,
+    ) -> std::result::Result<Response<super::proto::AgentCsrResponse>, Status> {
+        self.agent_csr_response(request, false).await
+    }
+
+    async fn query_agent_csr_v1(
+        &self,
+        request: Request<super::proto::AgentCsrRequest>,
+    ) -> std::result::Result<Response<super::proto::AgentCsrResponse>, Status> {
+        self.agent_csr_response(request, true).await
+    }
+
     /// Handle a client proposal (write operation).
     async fn propose(
         &self,
