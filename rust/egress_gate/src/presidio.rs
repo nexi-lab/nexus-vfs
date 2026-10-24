@@ -69,6 +69,7 @@ pub struct PresidioConfig {
 
 /// Contextual classification by a local Presidio analyzer.
 pub struct PresidioAnalyzer {
+    business_policy: Option<serde_json::Value>,
     addr: SocketAddr,
     host: String,
     path: String,
@@ -111,6 +112,7 @@ impl PresidioAnalyzer {
             ));
         }
         Ok(Self {
+            business_policy: None,
             addr: addrs[0],
             host: authority.to_string(),
             path: format!("{prefix}/analyze"),
@@ -121,6 +123,12 @@ impl PresidioAnalyzer {
         })
     }
 
+    /// Supply trusted runtime policy, never a model-request field.
+    pub fn with_business_policy(mut self, policy: serde_json::Value) -> Self {
+        self.business_policy = Some(policy);
+        self
+    }
+
     fn request_body(&self, text: &str) -> Vec<u8> {
         let mut body = serde_json::json!({
             "text": text,
@@ -129,6 +137,9 @@ impl PresidioAnalyzer {
         });
         if !self.entities.is_empty() {
             body["entities"] = serde_json::json!(self.entities);
+        }
+        if let Some(policy) = &self.business_policy {
+            body["business_policy"] = policy.clone();
         }
         body.to_string().into_bytes()
     }

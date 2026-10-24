@@ -139,6 +139,21 @@ pub struct EgressContentHook {
 }
 
 impl EgressContentHook {
+    /// Immutable policy state evaluated by a separately registered live hook.
+    /// The wrapper owns the clone-gate suffixes, so updates allocate no leaked slices.
+    pub(crate) fn policy_snapshot(
+        classifier: Arc<dyn EgressClassifier>,
+        policy: GatePolicy,
+        planes: Vec<EgressPlane>,
+    ) -> Self {
+        Self {
+            classifier,
+            policy,
+            planes,
+            suffixes: &[],
+        }
+    }
+
     /// Gate every A2A transcript with the default policy (redact on a
     /// finding, deny when the classifier fails). See
     /// [`EgressPlane::a2a_transcripts`] for where that is appropriate.
@@ -186,7 +201,7 @@ impl EgressContentHook {
     /// mutating hook's suffix matches — including a `.prompt` on a local
     /// model mount this gate deliberately does not cover. Without this
     /// check the gate would classify writes it was never installed for.
-    fn claims(&self, path: &str) -> bool {
+    pub(crate) fn claims(&self, path: &str) -> bool {
         self.planes.iter().any(|p| p.covers(path))
     }
 }
