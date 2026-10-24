@@ -170,6 +170,33 @@ mod tests {
     use clap::Parser;
 
     #[test]
+    fn open_posture_bypasses_collaboration_namespace_reservation() {
+        use transport::auth::{AuthCredentials, AuthProvider, NoAuth};
+
+        let auth = NoAuth;
+        let context = auth.resolve(&AuthCredentials::from_token("")).unwrap();
+        assert_eq!(auth.mode(), "no-auth");
+        assert!(context.is_system && context.is_admin);
+        let kernel = kernel::kernel::Kernel::new();
+        let provider = ClusterPermissionProvider {
+            #[cfg(feature = "rebac")]
+            router: kernel.vfs_router_arc(),
+            #[cfg(feature = "rebac")]
+            relationships: None,
+        };
+        kernel.set_permission_provider(Arc::new(Box::new(provider)));
+        // Recorded counterexample, not proof of authorization: Open posture
+        // cannot qualify a hosting node for collaboration-space activation.
+        assert!(kernel
+            .check_permission(
+                "/collaboration/v1/space/pairs/a/b/transcript",
+                Permission::Write,
+                &context,
+            )
+            .is_ok());
+    }
+
+    #[test]
     fn http_requires_compiled_enforcement_and_loopback() {
         let mut args = crate::Args::try_parse_from(["nexusd-cluster"])
             .unwrap()

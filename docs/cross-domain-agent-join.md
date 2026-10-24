@@ -101,6 +101,12 @@ on transcript, reader and malformed paths. A real Kernel I/O regression covers
 those caller classes, with ordinary local paths retaining their existing rules.
 
 The reservation is a denial, not the future native participant authorizer.
+Every serving node must also be **identity armed** (`CertIdentity` or `ApiKey`).
+An `Open`/`NoAuth` profile resolves network requests as `is_system=true`, and
+the Kernel deliberately bypasses permission providers for that context. Such
+a profile does not protect this namespace and must not host a collaboration
+space, even on loopback. Future activation must refuse this posture rather
+than reinterpret its synthetic system context as an authenticated Agent.
 Every node that can serve the hosting zone must enforce the boundary; an
 individual peer's capability cannot qualify a mixed-version zone. Existing
 older binaries cannot gain that enforcement through negotiation. The family
