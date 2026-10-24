@@ -235,25 +235,17 @@ async fn boot_founder_with_ca_b(options: &[&str]) -> XorgFixture {
 /// the live client-cert verifier's roots (i.e. registered + hot-swapped).
 async fn handshake_accepted(port: u16, client_tls: &TlsConfig, budget: Duration) -> bool {
     use kernel::kernel::vfs_proto::{nexus_vfs_service_client::NexusVfsServiceClient, PingRequest};
-    use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
+    use lib::transport_primitives::{create_channel, ClientConfig};
     let endpoint = format!("https://127.0.0.1:{port}");
-    let tls = ClientTlsConfig::new()
-        .domain_name(TlsConfig::CLUSTER_SERVER_NAME)
-        .ca_certificate(Certificate::from_pem(&client_tls.ca_pem))
-        .identity(Identity::from_pem(
-            &client_tls.cert_pem,
-            &client_tls.key_pem,
-        ));
+    let config = ClientConfig {
+        tls: Some(client_tls.clone()),
+        connect_timeout: Duration::from_secs(5),
+        request_timeout: Duration::from_secs(5),
+        ..Default::default()
+    };
     let deadline = Instant::now() + budget;
     loop {
-        let connected = Endpoint::from_shared(endpoint.clone())
-            .unwrap()
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(5))
-            .tls_config(tls.clone())
-            .unwrap()
-            .connect()
-            .await;
+        let connected = create_channel(&endpoint, &config).await;
         if let Ok(channel) = connected {
             if NexusVfsServiceClient::new(channel)
                 .ping(PingRequest::default())
