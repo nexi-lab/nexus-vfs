@@ -379,53 +379,7 @@ pub mod proto {
     //!   - nexus::core - FileMetadata, PaginatedResult
     //!   - nexus::raft - ZoneTransportService, ZoneApiService, commands, transport messages
 
-    // Fail closed if a reused build-script output came from another worktree
-    // or schema. include_bytes! also gives rustc the actual contract inputs.
-    const fn same_bytes(left: &[u8], right: &[u8]) -> bool {
-        if left.len() != right.len() {
-            return false;
-        }
-        let mut i = 0;
-        while i < left.len() {
-            if left[i] != right[i] {
-                return false;
-            }
-            i += 1;
-        }
-        true
-    }
-    const _: () = {
-        assert!(
-            same_bytes(
-                include_bytes!(concat!(env!("OUT_DIR"), "/raft-transport.source.proto")),
-                include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../proto/nexus/raft/transport.proto"
-                ))
-            ),
-            "stale generated Raft transport contract; regenerate from this worktree"
-        );
-        assert!(
-            same_bytes(
-                include_bytes!(concat!(env!("OUT_DIR"), "/raft-commands.source.proto")),
-                include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../proto/nexus/raft/commands.proto"
-                ))
-            ),
-            "stale generated Raft command contract; regenerate from this worktree"
-        );
-        assert!(
-            same_bytes(
-                include_bytes!(concat!(env!("OUT_DIR"), "/raft-metadata.source.proto")),
-                include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../proto/nexus/core/metadata.proto"
-                ))
-            ),
-            "stale generated Raft metadata contract; regenerate from this worktree"
-        );
-    };
+    include!("proto_binding.rs");
 
     /// Core types (FileMetadata, etc.)
     pub mod nexus {
