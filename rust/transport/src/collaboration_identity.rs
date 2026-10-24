@@ -413,6 +413,15 @@ mod tests {
     /// is deliberately a test stand-in, not a foreign-CRL implementation.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn established_mtls_connection_rechecks_policy_and_removed_anchor() {
+        exercise_mtls_admission(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scoped_mtls_admission_does_not_authorize_the_legacy_vfs_door() {
+        exercise_mtls_admission(true).await;
+    }
+
+    async fn exercise_mtls_admission(scoped: bool) {
         use crate::collaboration_access::SpaceAuthorizer;
         use a2a::{
             collaboration_policy::{CollaborationOperation, SpacePolicy, SpacePolicyStore},
@@ -438,8 +447,13 @@ mod tests {
         let (client_cert, client_key) =
             generate_agent_cert("existing-agent", &foreign, &foreign_key).unwrap();
         let verifier = FederatedClientCertVerifier::new(&local).unwrap();
+        let anchor = ForeignCaAnchor::new("edge", der(&foreign));
         verifier
-            .set_foreign_cas(&[ForeignCaAnchor::new("edge", der(&foreign))])
+            .set_foreign_cas(&[if scoped {
+                anchor.collaboration_only()
+            } else {
+                anchor
+            }])
             .unwrap();
         let local_der = der(&local);
         let (_, local_anchor) = X509Certificate::from_der(&local_der).unwrap();
@@ -527,8 +541,15 @@ mod tests {
         let gate_current = current.clone();
         let gate_admitted = admitted.clone();
         let gate_store = store.clone();
+        let check_space = Arc::new(AtomicBool::new(true));
+        let gate_check_space = check_space.clone();
         let service =
             NexusVfsServiceServer::with_interceptor(service, move |request: Request<()>| {
+                if !gate_check_space.load(Ordering::SeqCst) {
+                    // Test-only final request exercises the native VFS resolver
+                    // directly, independent of the space admission gate.
+                    return Ok(request);
+                }
                 let (metadata, extensions, ()) = request.into_parts();
                 let request = Request::from_parts(metadata, extensions, PingRequest::default());
                 // This is an admission fixture over Ping, not a transcript
@@ -591,7 +612,21 @@ mod tests {
             .await
             .unwrap();
         let mut client = NexusVfsServiceClient::new(channel);
-        client.ping(PingRequest::default()).await.unwrap();
+        if scoped {
+            // Actual TLS/space admission passed, but the ordinary native VFS
+            // resolver must refuse this CA. This proves no legacy permission;
+            // it does not claim an installed collaboration data plane.
+            assert_eq!(
+                client
+                    .ping(PingRequest::default())
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::Unauthenticated
+            );
+        } else {
+            client.ping(PingRequest::default()).await.unwrap();
+        }
         store.revoke(space).unwrap();
         assert_eq!(
             client
@@ -618,6 +653,16 @@ mod tests {
                 .unwrap_err()
                 .code(),
             tonic::Code::PermissionDenied
+        );
+        check_space.store(false, Ordering::SeqCst);
+        assert_eq!(
+            client
+                .ping(PingRequest::default())
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unauthenticated,
+            "removing the last anchor must not reclassify its established TLS leaf as local"
         );
         assert_eq!(
             handshakes.load(Ordering::SeqCst),

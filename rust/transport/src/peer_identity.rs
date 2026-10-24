@@ -192,6 +192,9 @@ pub enum ClassifyError {
     /// member — this is the invariant that stops a customer's CA from minting a
     /// node (a voter) in our raft.
     ForeignNotAnAgent,
+    /// Recognized only by the versioned collaboration admission seam, never
+    /// by legacy VFS, delegated owner/session or other foreign-agent doors.
+    CollaborationOnly,
 }
 
 /// Classify a TLS-verified peer certificate into a [`PeerIdentity`], deciding
@@ -244,6 +247,15 @@ fn classify_x509(
         return Ok(from_x509(cert));
     }
 
+    // Scope is checked over ALL matching anchors before picking a legacy
+    // label. A same-key renewal/re-registration must not bypass a restrictive
+    // scope merely because a legacy encoding happens to appear first.
+    if foreign_anchors.iter().any(|anchor| {
+        anchor.scope == lib::transport_primitives::ForeignCaScope::CollaborationOnlyV1
+            && chains_to(cert, &anchor.ca_cert_der)
+    }) {
+        return Err(ClassifyError::CollaborationOnly);
+    }
     // Foreign — whichever registered CA actually signed it names its domain.
     for anchor in foreign_anchors {
         if chains_to(cert, &anchor.ca_cert_der) {
@@ -463,6 +475,26 @@ mod tests {
         assert_eq!(id.node_id, None, "a foreign identity is never a member");
         assert_eq!(id.zone_id, None);
         assert_eq!(id.display_id(), "hospital-a/agent/cardio");
+    }
+
+    #[test]
+    fn collaboration_only_anchor_refuses_legacy_identity_in_either_anchor_order() {
+        let (local, _) = generate_zone_ca("root").unwrap();
+        let (foreign, key) = generate_zone_ca("root").unwrap();
+        let (agent, _) = generate_agent_cert("existing-agent", &foreign, &key).unwrap();
+        let legacy = anchor("edge", &foreign);
+        let scoped = legacy.clone().collaboration_only();
+        for anchors in [
+            vec![scoped.clone()],
+            vec![legacy.clone(), scoped.clone()],
+            vec![scoped, legacy],
+        ] {
+            assert_eq!(
+                classify_peer_cert(&der(&agent), &der(&local), &anchors),
+                Err(ClassifyError::CollaborationOnly)
+            );
+            assert!(classify_current_peer_cert(&der(&agent), &der(&local), &anchors).is_none());
+        }
     }
 
     /// The wiring data path: a foreign agent registered on the VERIFIER (via

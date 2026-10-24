@@ -2,10 +2,10 @@ name: Experimental domain addresses
 
 on:
   pull_request:
-    paths: ['rust/a2a/**', 'rust/transport/**', 'rust/raft/**', 'rust/contracts/**', 'docs/cross-domain-agent-join.md', '.github/workflows/domain-address.yml']
+    paths: ['rust/a2a/**', 'rust/transport/**', 'rust/raft/**', 'rust/lib/src/transport_primitives/**', 'rust/contracts/**', 'docs/cross-domain-agent-join.md', '.github/workflows/domain-address.yml']
   push:
     branches: [main]
-    paths: ['rust/a2a/**', 'rust/transport/**', 'rust/raft/**', 'rust/contracts/**', 'docs/cross-domain-agent-join.md', '.github/workflows/domain-address.yml']
+    paths: ['rust/a2a/**', 'rust/transport/**', 'rust/raft/**', 'rust/lib/src/transport_primitives/**', 'rust/contracts/**', 'docs/cross-domain-agent-join.md', '.github/workflows/domain-address.yml']
 
 permissions:
   contents: read
@@ -29,7 +29,10 @@ jobs:
         with:
           shared-key: domain-address-${{ matrix.os }}
       - run: cargo test --locked -p a2a --features experimental-domain-join --lib
+      - run: cargo test --locked -p lib --features transport --lib transport_primitives::foreign_ca::tests
       - run: cargo clippy --locked -p a2a --features experimental-domain-join --lib -- -D warnings
       - run: cargo test --locked -p transport --features experimental-domain-join --lib collaboration_identity::tests
+      - run: cargo test --locked -p transport --features experimental-domain-join --lib peer_identity::tests::collaboration_only_anchor
       - run: cargo test --locked -p raft@0.1.0 --features experimental-domain-join --lib collaboration_store::tests
+      - run: cargo test --locked -p raft@0.1.0 --features experimental-domain-join --lib foreign_ca_store::tests
       - run: cargo clippy --locked -p transport --features experimental-domain-join --lib -- -D warnings

@@ -303,22 +303,12 @@ pub(crate) async fn resolve_request_context<T: AuthedRequest>(
     if let Some(ctx) = req.extensions().get::<AuthenticatedRequestContext>() {
         return Ok(ctx.0.clone());
     }
-    // Resolve the peer identity, foreign-CA aware only when it can matter.
-    // `foreign_anchors()` is an O(1) ArcSwap read the apply observer keeps
-    // fresh. When it is empty — the common case, and always so on an
-    // auth-off node — every rustls-admitted cert is cluster-CA, so
-    // classification would just re-derive "local"; take the plain parse
-    // path and skip the per-request signature verify. Only once a foreign
-    // CA is registered do we classify (to resolve its agents qualified,
-    // `{trust_domain}/agent/{name}`).
+    // Reclassify against CURRENT roots even when the foreign set is empty.
+    // A connection established before its last foreign anchor was removed
+    // still carries that leaf; parsing it as local would revive its identity.
     let peer = match foreign_ca_verifier.get() {
         Some(v) => {
-            let anchors = v.foreign_anchors();
-            if anchors.is_empty() {
-                peer_identity::from_request(req)
-            } else {
-                peer_identity::classify_from_request(req, v.cluster_ca_der(), &anchors)
-            }
+            peer_identity::classify_from_request(req, v.cluster_ca_der(), &v.foreign_anchors())
         }
         None => peer_identity::from_request(req),
     };

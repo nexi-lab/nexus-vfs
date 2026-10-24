@@ -201,6 +201,27 @@ this path; a callback returning `()` is not that implementation.
 
 ## Data plane and compatibility
 
+New joining authorities use a collaboration-only trust purpose, not the old
+global foreign-mailbox recognition route. The existing foreign-CA store owns
+this purpose too: its versioned scoped envelope omits the old decoder's
+required root fields, so an older binary cannot silently ignore a new scope
+field and newly install the CA with legacy permission. The legacy encoding
+and existing local/foreign mailbox semantics remain available for their
+existing explicit trust configuration. Scoped roots are refused by ordinary
+foreign identity resolution even if a same-key legacy alias appears first.
+The versioned collaboration authenticator still needs its independent space
+grant and current-authority policy; recognition is not access.
+
+This is not an in-place downgrade guarantee for a CA previously installed as
+legacy: an older daemon may retain an earlier cached trust set after a decode
+error. All serving nodes must advertise the current scope/admission capability,
+and any previous legacy registration must be explicitly reconciled before
+activation. No profile/old RegisterForeignCa method installs a scoped grant in
+this slice. Open/NoAuth remains unprotected and cannot host the new family.
+The native VFS resolver reclassifies a long-lived TLS leaf against current
+roots even when the foreign set becomes empty; removing the last anchor must
+not turn an old foreign leaf into a local identity.
+
 The existing local Kernel remains the execution boundary. A collaboration
 mount/adapter must authorize the verified Agent, apply its configured content
 policy, and forward under that Agent's own current credential. The same global
