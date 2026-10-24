@@ -389,8 +389,9 @@ mod tests {
         let (ca, _) = generate_zone_ca("root").unwrap();
         let verifier = FederatedClientCertVerifier::new(&ca).unwrap();
         let current = Current::new();
-        let mut message = kernel::kernel::vfs_proto::PingRequest::default();
-        message.auth_token = "bogus-token".into();
+        let message = kernel::kernel::vfs_proto::PingRequest {
+            auth_token: "bogus-token".into(),
+        };
         assert_eq!(
             authenticate_request(&Request::new(message), &verifier, &current).unwrap_err(),
             IdentityError::UnsupportedCredentialPlane
