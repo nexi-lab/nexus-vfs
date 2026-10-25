@@ -207,4 +207,4 @@ pub(super) fn execute(
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

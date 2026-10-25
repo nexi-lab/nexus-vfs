@@ -20,9 +20,21 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 
 // Inject reply loss AFTER the existing real Raft store has applied I or F.
 // No fake consensus, issuer, authorization decision or certificate is used.
-struct LoseReply {
+pub(crate) struct LoseReply {
     inner: Arc<dyn AuthKeyStore>,
     stage: AtomicU8,
+}
+impl LoseReply {
+    pub(crate) fn new(inner: Arc<dyn AuthKeyStore>) -> Self {
+        Self {
+            inner,
+            stage: AtomicU8::new(0),
+        }
+    }
+    pub(crate) fn lose_next_applied_reply(&self, stage: u8) {
+        assert!(matches!(stage, 1 | 2));
+        self.stage.store(stage, Ordering::SeqCst);
+    }
 }
 impl AuthKeyStore for LoseReply {
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>, AuthKeyStoreError> {

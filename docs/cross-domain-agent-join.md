@@ -261,7 +261,15 @@ The experimental managed CSR profile also installs the versioned
 `managed_agent_credentials` native Call service when the actual boot posture
 has an armed identity plane and TLS. `Open`/`NoAuth` and plaintext boots do not
 install it. Its preparation capability is distinct from the Node-privileged
-issuer protocol: `prepareVersion:1, issuanceVersion:0, activationVersion:0`.
+issuer protocol: `prepareVersion:1, activationVersion:0`. `issuanceVersion` is
+one only when this native host has the existing v1 CA-holder slot armed for
+the exact prepared issuer and the selected TLS identity is a current local
+Node. Empty/non-founder or unsupported slots report zero and refuse issuance;
+they do not fall back to a legacy mint, another issuer or an offline CA key.
+A confined owner runtime's valid non-Node TLS identity also leaves issuance
+at zero while keeping preparation available. That optional capability must
+neither abort its normal boot nor promote it to Node authority; this slice
+does not add remote issuance for that posture.
 
 `prepare_v1` and explicit recovery through `inspect_v1` accept only an existing
 registry PID and the original operation ID. The actual request context must
@@ -282,7 +290,11 @@ subprocess hosts without that durable binding remain unsupported by this seam.
 
 The host uses the existing `PendingAgentCsr` implementation, in its native
 owner-controlled TLS storage. A bounded operation ID is validated by the shared
-contracts codec and hashed into one filename; no request selects a host path.
+contracts codec. The filename hashes a domain-separated, length-framed tuple
+of the actual Agent, actual owner and operation ID; unrelated owners/Agents
+cannot reserve each other's local operation namespace. It excludes the PID
+so a validated reincarnation can recover the same request. No request selects
+a host path.
 The response contains public request fields/digest and the resolved binding,
 never the private key. Repeated or partial preparation does not replace stored
 bytes. Explicit inspection can recover that same request after the same logical
@@ -290,10 +302,28 @@ Agent/owner resumes under another native PID. Another owner or issuer cannot
 adopt it. The instance is rechecked after persistence before reporting success.
 
 Preparation performs no issuer RPC, activates no runtime credential and grants
-no space. A later native issuer client must authenticate the selected issuer,
-submit/query the original request through the existing I/F protocol and publish
-verified F using the same caller-key implementation. Accepting unauthenticated
-response fields or treating a prepared key as a completed join is insufficient.
+no space. `issue_v1`, `query_v1` and `publish_v1` accept the same PID/operation
+shape and re-resolve the real owner and host binding. They load the original
+key/request; none implicitly prepares a missing request. The native profile
+supplies its selected TLS identity and its existing `AgentMinterSlot`, not a
+certificate or URL supplied by the caller. Issuance is an in-process call to
+that same current Node-gated I/F coordinator, not a second issuer or a claim
+that public DER alone is proof of mTLS possession.
+
+Each call invokes the issuer once. `query_v1` only observes; `publish_v1` also
+uses a query and writes the existing bundle format only after stored F passes
+the shared exact-request, key, signature and ordinary-Agent profile checks.
+The manifest is written last, under a native operation-derived location.
+Responses disclose public binding/digests and an opaque local credential ID,
+never private key bytes or a caller-selectable host path. The native host
+incarnation is rechecked before issuer work, after it and after publication.
+
+`submissionAttempted` describes this call, not the absence of an earlier
+ambiguous operation. Lost applied I/F results remain `issuanceOutcome:unknown`;
+explicit inspection/query of the original operation can reconcile them.
+`not_observed` or a current invocation's refusal never proves a prior send was
+absent. No remint or automatic retry occurs. Publication does not activate a
+managed runtime, confer a space grant, install routing or complete domain join.
 
 ## Data plane and compatibility
 
