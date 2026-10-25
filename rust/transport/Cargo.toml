@@ -10,9 +10,11 @@ crate-type = ["rlib"]
 
 [features]
 default = []
+experimental-domain-join = ["dep:a2a", "a2a/experimental-domain-join", "raft/experimental-domain-join"]
 
 [dependencies]
 contracts = { workspace = true }
+a2a = { workspace = true, optional = true }
 nexus-plugin-abi = { workspace = true }
 nexus-search-common = { path = "../search-common", features = ["transport"] }
 # Transport depends on kernel for the in-tree Rust API surface

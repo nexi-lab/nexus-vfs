@@ -20,6 +20,7 @@ required-features = ["grpc"]
 # ``nexus.contracts.constants``. Pulled in so raft shares one source
 # of truth with the kernel crate instead of hardcoding ``"root"``.
 contracts = { workspace = true }
+a2a = { workspace = true, optional = true }
 # raft → kernel direction. Lets raft state-machine impls
 # (zone_meta_store, wal_stream_backend) and the
 # `RaftDistributedCoordinator` trait impl depend on kernel-defined
@@ -95,6 +96,7 @@ regex = { workspace = true }
 
 [features]
 default = ["full"]
+experimental-domain-join = ["grpc", "dep:a2a", "a2a/experimental-domain-join"]
 mimalloc = ["dep:mimalloc"]
 
 # Enable async support (Tokio runtime)

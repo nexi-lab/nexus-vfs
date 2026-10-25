@@ -11,6 +11,7 @@ mod agent_credential;
 pub mod authorship;
 mod channel;
 mod config;
+mod crl;
 mod error;
 mod federated_tls;
 mod foreign_ca;
@@ -25,12 +26,16 @@ mod tofu;
 pub use agent_credential::{AgentCredential, LoadedCredential, CREDENTIAL_MANIFEST};
 pub use channel::{create_channel, ensure_crypto_provider};
 pub use config::{ClientConfig, ServerConfig, TlsConfig};
+pub use crl::{
+    ca_spki_sha256, canonical_certificate_serial, verify_signed_crl, VerifiedCrl,
+    CRL_MAXIMUM_AGE_SECS,
+};
 pub use error::{Result, TransportError};
 pub use federated_tls::{
     federated_mtls_incoming, federated_tls_incoming, reloadable_tls_incoming, server_config,
     FederatedClientCertVerifier, ReloadableServerIdentity,
 };
-pub use foreign_ca::{first_certificate_der, CaFingerprint, ForeignCaAnchor};
+pub use foreign_ca::{first_certificate_der, CaFingerprint, ForeignCaAnchor, ForeignCaScope};
 pub use peer::{hostname_to_node_id, NodeAddress, PeerAddress};
 pub use peer_blob_client::{NoopPeerBlobClient, PeerBlobClient, PeerBlobResult};
 pub use pool::ConnectionPool;

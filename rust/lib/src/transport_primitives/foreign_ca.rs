@@ -48,6 +48,41 @@ use super::cert_fingerprint;
 /// presented agent cert's issuer is matched against.
 pub type CaFingerprint = [u8; 32];
 
+/// Cryptographic recognition does not grant every protocol's authority.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForeignCaScope {
+    #[default]
+    LegacyMailbox,
+    CollaborationOnlyV1,
+}
+
+// A distinct envelope intentionally omits the old decoder's required root
+// fields. Old binaries must reject a scoped record, not ignore a new policy
+// field and install its CA with legacy mailbox authority.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CollaborationAnchorRecord {
+    schema_version: u8,
+    collaboration_anchor_v1: CollaborationAnchorMaterial,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CollaborationAnchorMaterial {
+    trust_domain_id: String,
+    ca_cert_der: Vec<u8>,
+}
+#[derive(Serialize)]
+struct LegacyAnchorRef<'a> {
+    trust_domain_id: &'a str,
+    ca_cert_der: &'a [u8],
+}
+#[derive(Deserialize)]
+struct LegacyAnchorRecord {
+    trust_domain_id: String,
+    ca_cert_der: Vec<u8>,
+}
+
 /// The DER of every `CERTIFICATE` block in `pem` (one cert, or a chain). `what`
 /// names the input in errors. The one PEM→DER cert-block decode for the
 /// cross-org TLS primitives — used by [`first_certificate_der`],
@@ -75,7 +110,7 @@ pub fn first_certificate_der(pem: &[u8], what: &str) -> Result<Vec<u8>, String> 
 /// Stored DER-encoded because the fingerprint is defined over DER (matching
 /// `openssl x509 -outform DER | dgst -sha256`, the form sudoedge exports).
 /// PEM↔DER conversion happens at the registration boundary, above this type.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ForeignCaAnchor {
     /// The trust domain this CA speaks for, e.g. `hospital-a`. Pinned by the
     /// registering admin and bound to [`Self::fingerprint`] — this, not the
@@ -84,6 +119,55 @@ pub struct ForeignCaAnchor {
     /// The foreign CA certificate, DER-encoded. The public root; verification
     /// checks that a presented agent cert chains to this. Never a private key.
     pub ca_cert_der: Vec<u8>,
+    pub scope: ForeignCaScope,
+}
+
+// Serde and the store codec use exactly the same representation. A caller
+// serializing the public type directly cannot accidentally emit a flat scope
+// field that an old decoder would ignore.
+impl Serialize for ForeignCaAnchor {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.scope {
+            ForeignCaScope::LegacyMailbox => LegacyAnchorRef {
+                trust_domain_id: &self.trust_domain_id,
+                ca_cert_der: &self.ca_cert_der,
+            }
+            .serialize(serializer),
+            ForeignCaScope::CollaborationOnlyV1 => CollaborationAnchorRecord {
+                schema_version: 1,
+                collaboration_anchor_v1: CollaborationAnchorMaterial {
+                    trust_domain_id: self.trust_domain_id.clone(),
+                    ca_cert_der: self.ca_cert_der.clone(),
+                },
+            }
+            .serialize(serializer),
+        }
+    }
+}
+impl<'de> Deserialize<'de> for ForeignCaAnchor {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if value.get("collaboration_anchor_v1").is_some() {
+            let record: CollaborationAnchorRecord =
+                serde_json::from_value(value).map_err(D::Error::custom)?;
+            if record.schema_version != 1 {
+                return Err(D::Error::custom("unsupported collaboration anchor version"));
+            }
+            return Ok(Self::new(
+                record.collaboration_anchor_v1.trust_domain_id,
+                record.collaboration_anchor_v1.ca_cert_der,
+            )
+            .collaboration_only());
+        }
+        if value.get("scope").is_some() {
+            return Err(D::Error::custom(
+                "scoped anchor requires its versioned envelope",
+            ));
+        }
+        let legacy: LegacyAnchorRecord = serde_json::from_value(value).map_err(D::Error::custom)?;
+        Ok(Self::new(legacy.trust_domain_id, legacy.ca_cert_der))
+    }
 }
 
 impl ForeignCaAnchor {
@@ -91,7 +175,16 @@ impl ForeignCaAnchor {
         Self {
             trust_domain_id: trust_domain_id.into(),
             ca_cert_der,
+            scope: ForeignCaScope::LegacyMailbox,
         }
+    }
+
+    /// The new collaboration service can recognize this root, while ordinary
+    /// foreign VFS/session/control admission must refuse it. Store through
+    /// encode(), whose versioned envelope also fails closed on older binaries.
+    pub fn collaboration_only(mut self) -> Self {
+        self.scope = ForeignCaScope::CollaborationOnlyV1;
+        self
     }
 
     /// Build from the **PEM** form sudoedge exports in the onboarding triple
@@ -156,6 +249,38 @@ mod tests {
     fn roundtrips_through_the_store_encoding() {
         let restored = ForeignCaAnchor::decode(&anchor().encode().unwrap()).unwrap();
         assert_eq!(restored, anchor());
+    }
+
+    #[test]
+    fn scoped_encoding_cannot_be_installed_by_the_legacy_decoder() {
+        #[derive(Deserialize)]
+        struct LegacyAnchor {
+            trust_domain_id: String,
+            ca_cert_der: Vec<u8>,
+        }
+        let legacy = anchor();
+        let scoped = legacy.clone().collaboration_only();
+        assert_eq!(scoped.fingerprint(), legacy.fingerprint());
+        let old = serde_json::from_slice::<LegacyAnchor>(&legacy.encode().unwrap()).unwrap();
+        assert_eq!(old.trust_domain_id, legacy.trust_domain_id);
+        assert_eq!(old.ca_cert_der, legacy.ca_cert_der);
+        let encoded = scoped.encode().unwrap();
+        assert!(serde_json::from_slice::<LegacyAnchor>(&encoded).is_err());
+        assert_eq!(ForeignCaAnchor::decode(&encoded).unwrap(), scoped);
+        let mut future: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        future["schema_version"] = 2.into();
+        assert!(ForeignCaAnchor::decode(&serde_json::to_vec(&future).unwrap()).is_err());
+        future["schema_version"] = 1.into();
+        future["collaboration_anchor_v1"]["unknown_policy"] = true.into();
+        assert!(ForeignCaAnchor::decode(&serde_json::to_vec(&future).unwrap()).is_err());
+        // Adding an ignorable root field to the old format is NOT a supported
+        // way to publish a restrictive scope.
+        let mut flat = serde_json::to_value(&legacy).unwrap();
+        flat["scope"] = "collaboration_only_v1".into();
+        let flat = serde_json::to_vec(&flat).unwrap();
+        assert!(serde_json::from_slice::<LegacyAnchor>(&flat).is_ok());
+        assert!(ForeignCaAnchor::decode(&flat).is_err());
+        assert_eq!(serde_json::to_vec(&scoped).unwrap(), encoded);
     }
 
     /// The fingerprint is defined by the cert bytes alone, so two anchors that
