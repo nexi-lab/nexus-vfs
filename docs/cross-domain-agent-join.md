@@ -232,10 +232,28 @@ fresh state cannot be established, and resolve the current registered issuer
 independently on every admission. Removing an anchor still refuses the caller;
 the presence of a stored CRL does not preserve trust.
 
-No profile currently installs this store as `CurrentAgentAuthority`. Live
-foreign refresh, registry/actual-TLS binding and the product's collaboration
-route remain activation gates. Neither a signed list nor a deployment JSON
-record grants a space or proves that the DGX has joined it.
+`RaftCurrentAgentAuthority` now composes the actual request's selected issuer
+DER pin, SPKI address authority, trust-domain binding and serial with that
+store. Current foreign registrations, signed freshness bytes and the serial's
+irreversible marker are read at one control-zone consensus point. A stale TLS
+verifier cache cannot preserve a removed anchor. Foreign admission requires
+the versioned collaboration-only purpose; conflicting same-key domain or legacy
+aliases refuse. Local callers use the same freshness/revocation rules and cannot
+be relabelled through a foreign alias. The DER pin identifies the registered
+certificate selected for this admission; SPKI continues to identify the public
+Agent across certificate renewal.
+
+A real established mTLS connection exercises this native composition against
+the real control store, with no test allow callback in the current-authority
+path: registration removal, trust-purpose widening and retained revocation after
+an older signed empty CRL each refuse subsequent admissions. This remains a
+Ping admission fixture, not a transcript append, mount or product join.
+
+No profile currently installs this policy. Live foreign refresh, management
+installation and the product's collaboration route remain activation gates.
+Neither a signed list nor a deployment JSON record grants a space or proves
+that the DGX has joined it. The combined issuer/CRL snapshot does not make the
+separate space-grant snapshot or a later data-zone append atomic with revocation.
 
 ## Data plane and compatibility
 

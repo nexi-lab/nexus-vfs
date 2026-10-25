@@ -63,18 +63,28 @@ impl ControlStateStore {
     pub fn get_many_linearizable(&self, keys: &[String]) -> Result<Vec<Option<Vec<u8>>>, String> {
         let ns = self.namespace;
         let keys = keys.to_vec();
+        self.read_linearizable(move |sm| {
+            keys.iter()
+                .map(|key| sm.get_control_state(ns, key).map_err(|e| e.to_string()))
+                .collect::<Result<Vec<_>, String>>()
+        })?
+    }
+
+    /// Typed native stores can inspect related namespaces at ONE ReadIndex.
+    /// No caller-controlled namespace, mutation or public RPC is exposed here.
+    pub(crate) fn read_linearizable<T: Send + 'static>(
+        &self,
+        read: impl FnOnce(&FullStateMachine) -> T + Send + 'static,
+    ) -> Result<T, String> {
+        let ns = self.namespace;
         bridge_block_on(&self.runtime, async {
             tokio::time::timeout(
                 std::time::Duration::from_secs(10),
-                self.node.read_linearizable(move |sm| {
-                    keys.iter()
-                        .map(|key| sm.get_control_state(ns, key).map_err(|e| e.to_string()))
-                        .collect::<Result<Vec<_>, String>>()
-                }),
+                self.node.read_linearizable(read),
             )
             .await
             .map_err(|_| format!("control snapshot({ns}) timed out"))?
-            .map_err(|e| format!("control snapshot({ns}): {e}"))?
+            .map_err(|e| format!("control snapshot({ns}): {e}"))
         })
     }
 
