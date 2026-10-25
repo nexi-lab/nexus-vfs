@@ -59,6 +59,7 @@ use kernel::service_registry::{RustCallError, RustService};
 #[cfg(feature = "subprocess-host")]
 pub(crate) mod raw_spawn;
 
+pub mod credential_binding;
 pub(crate) mod proc_entry;
 mod runtime_discovery;
 pub(crate) mod session;

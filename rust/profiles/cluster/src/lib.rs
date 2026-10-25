@@ -37,6 +37,8 @@ mod authorization;
 mod csr_cli;
 #[cfg(feature = "experimental-managed-agent-csr")]
 mod managed_csr;
+#[cfg(feature = "experimental-managed-agent-csr")]
+mod managed_csr_binding;
 mod plugin_loading;
 mod runtime_backends;
 mod search_capabilities;
@@ -3545,6 +3547,13 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         }),
     };
     let mut service_decls = build_decls(&svc_ctx);
+    #[cfg(feature = "experimental-managed-agent-csr")]
+    if identity_armed && !common.no_tls {
+        service_decls.push(managed_csr_binding::service_decl(
+            common.data_dir.join("tls"),
+            identity_armed,
+        )?);
+    }
     service_decls.extend(authorization::service_decls(
         &common,
         &svc_ctx,

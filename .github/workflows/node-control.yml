@@ -7,6 +7,7 @@ on:
     paths:
       - 'rust/raft/**'
       - 'rust/profiles/cluster/**'
+      - 'rust/managed_agent/**'
       - 'rust/lib/src/transport_primitives/**'
       - 'proto/nexus/raft/**'
       - '.github/workflows/node-control.yml'
@@ -36,4 +37,6 @@ jobs:
       - run: cargo test --locked -p raft@0.1.0 --lib agent_csr_client::tests
       - run: cargo test --locked -p nexus-cluster --lib
       - run: cargo test --locked -p nexus-cluster --features experimental-managed-agent-csr --lib managed_csr::tests
+      - run: cargo test --locked -p managed-agent --lib credential_binding::tests
+      - run: cargo test --locked -p nexus-cluster --features experimental-managed-agent-csr --lib managed_csr_binding::tests
       - run: cargo test --locked -p nexus-cluster --features experimental-managed-agent-csr --test csr_operator
