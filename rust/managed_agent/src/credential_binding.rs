@@ -44,6 +44,7 @@ impl ManagedCredentialBinding {
             || descriptor.zone_id.is_empty()
             || descriptor.kind != AgentKind::Managed
             || descriptor.state.is_terminal()
+            || !registry.is_managed_host_bound(&instance)
         {
             return Err(RustCallError::PermissionDenied(
                 "managed Agent credentials require its current authenticated local owner".into(),
@@ -77,7 +78,7 @@ impl ManagedCredentialBinding {
         let (_, descriptor) = registry
             .get_instance(&self.pid)
             .ok_or(RustCallError::NotFound)?;
-        if !registry.is_current_instance(&self.instance)
+        if !registry.is_managed_host_bound(&self.instance)
             || descriptor.state.is_terminal()
             || descriptor.kind != AgentKind::Managed
             || descriptor.name != self.agent
@@ -95,7 +96,10 @@ impl ManagedCredentialBinding {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{SpawnHandle, SpawnOptions, SpawnTask};
+    use contracts::RustService;
     use kernel::core::agents::registry::{AgentDescriptor, AgentState};
+    use std::sync::Arc;
 
     fn owner() -> OperationContext {
         let mut ctx = OperationContext::new("alice", "root", false, Some("session-actual"), false);
@@ -116,7 +120,8 @@ mod tests {
     #[test]
     fn actual_owner_resolves_existing_agent_but_foreign_admin_node_and_wrong_owner_do_not() {
         let registry = AgentRegistry::new();
-        assert!(registry.register(descriptor()));
+        let instance = registry.register_instance(descriptor()).unwrap();
+        assert!(registry.bind_managed_host(&instance));
         let proof = ManagedCredentialBinding::resolve(&registry, &owner(), "existing.1").unwrap();
         assert_eq!(
             (proof.agent(), proof.owner(), proof.zone()),
@@ -148,7 +153,8 @@ mod tests {
     #[test]
     fn same_pid_replacement_and_terminated_or_unmanaged_instances_cannot_reuse_the_proof() {
         let registry = AgentRegistry::new();
-        assert!(registry.register(descriptor()));
+        let instance = registry.register_instance(descriptor()).unwrap();
+        assert!(registry.bind_managed_host(&instance));
         let proof = ManagedCredentialBinding::resolve(&registry, &owner(), "existing.1").unwrap();
         registry.unregister("existing.1").unwrap();
         assert!(registry.register(descriptor()));
@@ -163,5 +169,88 @@ mod tests {
         unmanaged.kind = AgentKind::Unmanaged;
         assert!(registry.register(unmanaged));
         assert!(ManagedCredentialBinding::resolve(&registry, &owner(), "existing.1").is_err());
+    }
+
+    struct Host {
+        durable: bool,
+        mailbox: bool,
+    }
+    struct Handle {
+        endpoint: Option<a2a::session::SessionEndpoint>,
+        durable: bool,
+    }
+    impl SpawnHandle for Handle {
+        fn abort(&self) {}
+        fn session_endpoint(&self) -> Option<&a2a::session::SessionEndpoint> {
+            self.endpoint.as_ref()
+        }
+        fn durable_session_id(&self) -> Option<&str> {
+            self.durable.then_some("session-native-host")
+        }
+    }
+    impl SpawnTask<Kernel> for Host {
+        fn spawn(
+            &self,
+            _: Arc<Kernel>,
+            _: AgentDescriptor,
+            _: Arc<dyn Fn(AgentState, Option<String>) + Send + Sync>,
+        ) -> Result<Box<dyn SpawnHandle>, String> {
+            Err("fixture requires native options".into())
+        }
+        fn spawn_with_options(
+            &self,
+            _: Arc<Kernel>,
+            _: AgentDescriptor,
+            options: SpawnOptions,
+            observer: Arc<dyn Fn(AgentState, Option<String>) + Send + Sync>,
+        ) -> Result<Box<dyn SpawnHandle>, String> {
+            observer(AgentState::Ready, None);
+            Ok(Box::new(Handle {
+                endpoint: if self.mailbox {
+                    options.session_endpoint
+                } else {
+                    None
+                },
+                durable: self.durable,
+            }))
+        }
+    }
+    #[test]
+    fn actual_managed_service_binds_only_the_validated_durable_host_handle() {
+        for (durable, mailbox) in [(true, true), (false, true), (true, false)] {
+            let kernel = Arc::new(Kernel::new());
+            let registry = kernel.agent_registry().clone();
+            let service = ManagedAgentService::with_spawn(
+                kernel,
+                registry.clone(),
+                Arc::new(Host { durable, mailbox }),
+            );
+            let started = service.dispatch(
+                "start_session_v1",
+                br#"{"agent_id":"native-host-agent"}"#,
+                &owner(),
+            );
+            if !mailbox {
+                assert!(
+                    started.is_err(),
+                    "host without the selected mailbox must be refused"
+                );
+                assert!(registry
+                    .list(None, None, None, None)
+                    .into_iter()
+                    .all(|d| d.state.is_terminal()));
+                continue;
+            }
+            let response: serde_json::Value = serde_json::from_slice(&started.unwrap()).unwrap();
+            let pid = response["session_id"].as_str().unwrap();
+            let binding = ManagedCredentialBinding::resolve(&registry, &owner(), pid);
+            assert_eq!(binding.is_ok(), durable);
+            if let Ok(binding) = binding {
+                assert_eq!(
+                    (binding.agent(), binding.owner()),
+                    ("native-host-agent", "alice")
+                );
+            }
+        }
     }
 }

@@ -30,7 +30,11 @@ fn setup() -> (tempfile::TempDir, Arc<Kernel>) {
             service_decl(directory.path().to_path_buf(), true).unwrap()
         ])
         .unwrap();
-    assert!(kernel.agent_registry().register(descriptor()));
+    let instance = kernel
+        .agent_registry()
+        .register_instance(descriptor())
+        .unwrap();
+    assert!(kernel.agent_registry().bind_managed_host(&instance));
     (directory, kernel)
 }
 fn payload(pid: &str, operation: &str) -> Vec<u8> {
@@ -157,7 +161,8 @@ fn original_key_survives_same_agent_reentry_but_cannot_be_adopted_by_replacement
     kernel.agent_registry().unregister("host.1").unwrap();
     let mut resumed = descriptor();
     resumed.pid = "host.2".into();
-    assert!(kernel.agent_registry().register(resumed));
+    let instance = kernel.agent_registry().register_instance(resumed).unwrap();
+    assert!(kernel.agent_registry().bind_managed_host(&instance));
     let recovered = call(
         &kernel,
         "inspect_v1",
@@ -171,7 +176,8 @@ fn original_key_survives_same_agent_reentry_but_cannot_be_adopted_by_replacement
     let mut other = descriptor();
     other.pid = "host.2".into();
     other.owner_id = "bob".into();
-    assert!(kernel.agent_registry().register(other));
+    let instance = kernel.agent_registry().register_instance(other).unwrap();
+    assert!(kernel.agent_registry().bind_managed_host(&instance));
     let denied = call(&kernel, "inspect_v1", &payload("host.2", OP), &owner("bob")).unwrap();
     assert_eq!(denied["localPreparationOutcome"], "unknown");
     assert!(denied.get("publicRequest").is_none());
@@ -312,4 +318,48 @@ fn service_is_not_noauth_issuer_or_activation_and_request_text_never_selects_a_p
     for entry in std::fs::read_dir(directory.path()).unwrap() {
         assert_eq!(entry.unwrap().path().parent().unwrap(), directory.path());
     }
+}
+
+#[test]
+fn generic_registry_metadata_never_authorizes_credential_preparation() {
+    let (directory, kernel) = setup();
+    let mut registrant = OperationContext::new("alice", "root", false, None, false);
+    registrant.subject_type = "user".into();
+    registrant.subject_id = Some("alice".into());
+    registrant.zone_perms = vec![("root".into(), "rw".into())];
+    let reply = transport::call_dispatch::dispatch(
+        &kernel,
+        &registrant,
+        "agent_register",
+        &serde_json::to_vec(
+            &json!({"name":"forged-metadata","pid":"500.1","kind":"MANAGED",
+            "owner_id":"alice","zone_id":"root","labels":{"managed_host_bound":"true"}}),
+        )
+        .unwrap(),
+    )
+    .unwrap()
+    .into_inner();
+    assert!(
+        !reply.is_error,
+        "negative must reach a real generic registry insertion: {}",
+        String::from_utf8_lossy(&reply.payload)
+    );
+    let raw: Value = serde_json::from_slice(&reply.payload).unwrap();
+    let pid = raw.get("result").unwrap_or(&raw)["pid"].as_str().unwrap();
+    let record = kernel.agent_registry().get(pid).unwrap();
+    assert_eq!(record.kind, AgentKind::Managed);
+    assert_eq!(record.owner_id, "alice");
+    assert!(
+        matches!(
+            call(
+                &kernel,
+                "prepare_v1",
+                &payload(pid, "generic-register-negative"),
+                &owner("alice")
+            ),
+            Err(RustCallError::PermissionDenied(_))
+        ),
+        "public registry metadata must not stand in for a native host binding"
+    );
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
 }
