@@ -405,6 +405,7 @@ fn native_issuer_rejects_non_node_and_foreign_tls_selection_without_request_auth
         key_pem: key,
     };
     assert!(NativeIssuer::from_tls(slot.clone(), &tls, runtime.handle().clone()).is_err());
+    assert!(NativeIssuer::for_host(slot.clone(), &tls, runtime.handle().clone()).is_none());
     let (foreign, foreign_key) = generate_zone_ca("foreign").unwrap();
     let (node, key) = generate_node_cert(9, "root", &foreign, &foreign_key, &[], None).unwrap();
     let tls = TlsConfig {
@@ -412,5 +413,74 @@ fn native_issuer_rejects_non_node_and_foreign_tls_selection_without_request_auth
         cert_pem: node,
         key_pem: key,
     };
-    assert!(NativeIssuer::from_tls(slot, &tls, runtime.handle().clone()).is_err());
+    assert!(NativeIssuer::from_tls(slot.clone(), &tls, runtime.handle().clone()).is_err());
+    assert!(NativeIssuer::for_host(slot, &tls, runtime.handle().clone()).is_none());
+}
+
+#[test]
+fn confined_runtime_keeps_preparation_without_node_issuing_authority_or_boot_failure() {
+    let runtime = lib::rt::OwnedRuntime::new(tokio::runtime::Runtime::new().unwrap());
+    let directory = tempfile::tempdir().unwrap();
+    let (issuer, issuer_key) = generate_zone_ca("runtime-parent").unwrap();
+    std::fs::write(directory.path().join("ca.pem"), &issuer).unwrap();
+    let (cert, key) = nexus_raft::transport::generate_user_runtime_cert(
+        "runtime-controller",
+        "alice",
+        300,
+        &issuer,
+        &issuer_key,
+    )
+    .unwrap();
+    let tls = TlsConfig {
+        ca_pem: issuer.clone(),
+        cert_pem: cert,
+        key_pem: key,
+    };
+    let native = NativeIssuer::for_host(
+        nexus_raft::agent_minter::new_agent_minter_slot(),
+        &tls,
+        runtime.handle().clone(),
+    );
+    assert!(
+        native.is_none(),
+        "confined runtime must not inherit a Node capability"
+    );
+    // Same native factory used by boot: this must install, rather than abort a
+    // valid confined runtime because its optional issuer capability is absent.
+    let service = service_decl(directory.path().to_path_buf(), true, native).unwrap();
+    let kernel = Arc::new(Kernel::new());
+    kernel
+        .bring_up_services(vec![
+            managed_agent::service_decl_with_spawn(Arc::new(Host)),
+            service,
+        ])
+        .unwrap();
+    let owner = crate::managed_csr_binding::tests::owner("alice");
+    let started = kernel
+        .dispatch_rust_call_ctx(
+            &owner,
+            "managed_agent",
+            "start_session_v1",
+            br#"{"agent_id":"original-agent"}"#,
+        )
+        .unwrap()
+        .unwrap();
+    let started: Value = serde_json::from_slice(&started).unwrap();
+    let pid = started["session_id"].as_str().unwrap();
+    let caps =
+        crate::managed_csr_binding::tests::call(&kernel, "capabilities_v1", b"{}", &owner).unwrap();
+    assert_eq!(caps["issuanceVersion"], 0);
+    assert_eq!(caps["activationVersion"], 0);
+    let prepared = crate::managed_csr_binding::tests::call(
+        &kernel,
+        "prepare_v1",
+        &crate::managed_csr_binding::tests::payload(pid, "confined-prepare"),
+        &owner,
+    )
+    .unwrap();
+    assert_eq!(prepared["localPreparationOutcome"], "prepared");
+    assert_eq!(
+        prepared["publicRequest"]["issuer_sha256"],
+        json!(Sha256::digest(first_certificate_der(&issuer, "original issuer").unwrap()).to_vec())
+    );
 }

@@ -2,7 +2,7 @@ use super::*;
 use kernel::core::agents::registry::{AgentDescriptor, AgentKind, AgentState};
 
 const OP: &str = "d5881c0c-4886-4445-976a-e42c95829b16";
-fn owner(name: &str) -> OperationContext {
+pub(super) fn owner(name: &str) -> OperationContext {
     let mut context =
         OperationContext::new(name, "root", false, Some("actual-session-leaf"), false);
     context.subject_type = "agent".into();
@@ -40,10 +40,10 @@ fn setup() -> (tempfile::TempDir, Arc<Kernel>) {
     assert!(kernel.agent_registry().bind_managed_host(&instance));
     (directory, kernel)
 }
-fn payload(pid: &str, operation: &str) -> Vec<u8> {
+pub(super) fn payload(pid: &str, operation: &str) -> Vec<u8> {
     serde_json::to_vec(&json!({"pid":pid,"operation_id":operation})).unwrap()
 }
-fn call(
+pub(super) fn call(
     kernel: &Kernel,
     verb: &str,
     payload: &[u8],

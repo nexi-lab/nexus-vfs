@@ -16,6 +16,17 @@ pub(crate) struct NativeIssuer {
 }
 
 impl NativeIssuer {
+    /// An owner-confined runtime has no Node issuing authority. Keep its
+    /// preparation service usable with issuance capability zero; never promote
+    /// its TLS identity or turn this optional capability into a boot failure.
+    pub(crate) fn for_host(
+        slot: AgentMinterSlot,
+        tls: &TlsConfig,
+        runtime: tokio::runtime::Handle,
+    ) -> Option<Self> {
+        Self::from_tls(slot, tls, runtime).ok()
+    }
+
     /// Only the trusted profile calls this with the SAME TLS configuration
     /// used by the daemon. This is an in-process native call, not a claim that
     /// a public DER supplied over Call proves possession or Node authority.

@@ -266,6 +266,10 @@ one only when this native host has the existing v1 CA-holder slot armed for
 the exact prepared issuer and the selected TLS identity is a current local
 Node. Empty/non-founder or unsupported slots report zero and refuse issuance;
 they do not fall back to a legacy mint, another issuer or an offline CA key.
+A confined owner runtime's valid non-Node TLS identity also leaves issuance
+at zero while keeping preparation available. That optional capability must
+neither abort its normal boot nor promote it to Node authority; this slice
+does not add remote issuance for that posture.
 
 `prepare_v1` and explicit recovery through `inspect_v1` accept only an existing
 registry PID and the original operation ID. The actual request context must
