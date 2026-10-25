@@ -1,7 +1,7 @@
 //! Owner-resolved CSR preparation on the actual managed host. Uses the native
 //! context-aware Call service and the SAME registry, caller-key persistence and
-//! issuer request codec. No remote issuer call, credential activation or extra
-//! identity store is implied by preparing a key/request.
+//! issuer request codec. Issuance reuses the daemon's existing CA-holder slot;
+//! publication never implies managed-runtime activation or domain admission.
 
 use std::{
     path::{Path, PathBuf},
@@ -21,9 +21,23 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 const NAME: &str = "managed_agent_credentials";
-const METHODS: &[&str] = &["capabilities_v1", "prepare_v1", "inspect_v1"];
+const METHODS: &[&str] = &[
+    "capabilities_v1",
+    "prepare_v1",
+    "inspect_v1",
+    "issue_v1",
+    "query_v1",
+    "publish_v1",
+];
 
-pub(super) fn service_decl(root: PathBuf, identity_armed: bool) -> anyhow::Result<ServiceDecl> {
+mod issuance;
+pub(super) use issuance::NativeIssuer;
+
+pub(super) fn service_decl(
+    root: PathBuf,
+    identity_armed: bool,
+    issuer: Option<NativeIssuer>,
+) -> anyhow::Result<ServiceDecl> {
     if !identity_armed {
         anyhow::bail!("managed Agent credential preparation requires an armed identity plane");
     }
@@ -37,6 +51,7 @@ pub(super) fn service_decl(root: PathBuf, identity_armed: bool) -> anyhow::Resul
                 kernel: kernel.clone(),
                 root: root.clone(),
                 ca: ca.clone(),
+                issuer,
             });
             kernel.register_rust_service(NAME, service.clone(), service.exports())
         }),
@@ -75,6 +90,7 @@ struct PreparationService {
     kernel: Arc<Kernel>,
     root: PathBuf,
     ca: Vec<u8>,
+    issuer: Option<NativeIssuer>,
 }
 
 #[derive(Deserialize)]
@@ -85,6 +101,27 @@ struct Target {
 }
 
 impl PreparationService {
+    fn operation_key(agent: &str, owner: &str, operation: &str) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"nexus-managed-agent-storage-v1\0");
+        for field in [agent, owner, operation] {
+            digest.update((field.len() as u64).to_be_bytes());
+            digest.update(field.as_bytes());
+        }
+        digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    fn pending_path(&self, managed: &ManagedCredentialBinding, operation: &str) -> PathBuf {
+        self.root.join(format!(
+            "managed-csr-{}.json",
+            Self::operation_key(managed.agent(), managed.owner(), operation)
+        ))
+    }
+
     fn request(&self, payload: &[u8]) -> Result<Target, RustCallError> {
         if payload.len() > 4096 {
             return Err(RustCallError::InvalidArgument(
@@ -118,11 +155,7 @@ impl PreparationService {
         };
         // One bounded filename in the existing owner-controlled TLS directory.
         // Neither caller paths nor arbitrary sender/owner strings are accepted.
-        let operation_key: String = Sha256::digest(target.operation_id.as_bytes())
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        let path = self.root.join(format!("managed-csr-{operation_key}.json"));
+        let path = self.pending_path(&managed, &target.operation_id);
         let pending = if verb == "prepare_v1" {
             PendingAgentCsr::create(&path, &binding, &self.ca)
         } else {
@@ -187,10 +220,17 @@ impl RustService for PreparationService {
                         "capabilities requires an empty object".into(),
                     ));
                 }
-                json!({"prepareVersion":1,"issuanceVersion":0,"activationVersion":0,
+                let issuance = self
+                    .issuer
+                    .as_ref()
+                    .is_some_and(|issuer| issuer.minter(&self.ca).is_ok());
+                json!({"prepareVersion":1,"issuanceVersion":u32::from(issuance),"activationVersion":0,
                     "issuerSha256": <[u8;32]>::from(Sha256::digest(first_certificate_der(&self.ca,"native Agent issuer").map_err(RustCallError::Internal)?))})
             }
             "prepare_v1" | "inspect_v1" => self.prepare(method, self.request(payload)?, ctx)?,
+            "issue_v1" | "query_v1" | "publish_v1" => {
+                self.issue(method, self.request(payload)?, ctx)?
+            }
             _ => return Err(RustCallError::NotFound),
         };
         serde_json::to_vec(&response).map_err(|e| RustCallError::Internal(e.to_string()))

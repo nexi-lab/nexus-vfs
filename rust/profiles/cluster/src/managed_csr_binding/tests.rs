@@ -26,9 +26,12 @@ fn setup() -> (tempfile::TempDir, Arc<Kernel>) {
     std::fs::write(directory.path().join("ca.pem"), ca).unwrap();
     let kernel = Arc::new(Kernel::new());
     kernel
-        .bring_up_services(vec![
-            service_decl(directory.path().to_path_buf(), true).unwrap()
-        ])
+        .bring_up_services(vec![service_decl(
+            directory.path().to_path_buf(),
+            true,
+            None,
+        )
+        .unwrap()])
         .unwrap();
     let instance = kernel
         .agent_registry()
@@ -201,6 +204,7 @@ fn changed_ca_and_partial_pending_refuse_without_overwrite_or_activation() {
         kernel: kernel.clone(),
         root: directory.path().to_path_buf(),
         ca: different,
+        issuer: None,
     };
     let changed: Value = serde_json::from_slice(
         &service
@@ -275,7 +279,7 @@ fn simultaneous_preparations_keep_one_persisted_request_and_explicit_recovery() 
 #[test]
 fn service_is_not_noauth_issuer_or_activation_and_request_text_never_selects_a_path() {
     let (directory, kernel) = setup();
-    assert!(service_decl(directory.path().to_path_buf(), false).is_err());
+    assert!(service_decl(directory.path().to_path_buf(), false, None).is_err());
     let caps = call(&kernel, "capabilities_v1", b"{}", &owner("alice")).unwrap();
     assert_eq!(
         (
@@ -285,10 +289,14 @@ fn service_is_not_noauth_issuer_or_activation_and_request_text_never_selects_a_p
         ),
         (Some(1), Some(0), Some(0))
     );
-    assert!(matches!(
-        call(&kernel, "issue_v1", b"{}", &owner("alice")),
-        Err(RustCallError::NotFound)
-    ));
+    let unsupported = call(&kernel, "issue_v1", &payload("host.1", OP), &owner("alice")).unwrap();
+    assert_eq!(unsupported["submissionAttempted"], false);
+    assert_eq!(unsupported["issuanceOutcome"], "unknown");
+    assert!(unsupported["error"]
+        .as_str()
+        .unwrap()
+        .contains("unsupported"));
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     assert!(matches!(
         call(
             &kernel,
@@ -307,10 +315,7 @@ fn service_is_not_noauth_issuer_or_activation_and_request_text_never_selects_a_p
     .unwrap();
     assert_eq!(value["localPreparationOutcome"], "prepared");
     assert_eq!(value["issuanceSubmitted"], false);
-    let expected: String = Sha256::digest(b"CON:retry.2")
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let expected = PreparationService::operation_key("original-agent", "alice", "CON:retry.2");
     assert!(directory
         .path()
         .join(format!("managed-csr-{expected}.json"))
@@ -362,4 +367,47 @@ fn generic_registry_metadata_never_authorizes_credential_preparation() {
         "public registry metadata must not stand in for a native host binding"
     );
     assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn owners_do_not_reserve_each_others_local_operation_namespace() {
+    let (directory, kernel) = setup();
+    let first = call(
+        &kernel,
+        "prepare_v1",
+        &payload("host.1", OP),
+        &owner("alice"),
+    )
+    .unwrap();
+    assert_eq!(first["localPreparationOutcome"], "prepared");
+    let mut second = descriptor();
+    second.pid = "other-host.1".into();
+    second.name = "other-agent".into();
+    second.owner_id = "bob".into();
+    let instance = kernel.agent_registry().register_instance(second).unwrap();
+    assert!(kernel.agent_registry().bind_managed_host(&instance));
+    let other = call(
+        &kernel,
+        "prepare_v1",
+        &payload("other-host.1", OP),
+        &owner("bob"),
+    )
+    .unwrap();
+    assert_eq!(
+        other["localPreparationOutcome"], "prepared",
+        "another owned Agent's operation must not reserve this namespace"
+    );
+    assert_ne!(first["requestSha256"], other["requestSha256"]);
+    assert_eq!(other["binding"]["ownerId"], "bob");
+    assert_eq!(
+        call(
+            &kernel,
+            "inspect_v1",
+            &payload("host.1", OP),
+            &owner("alice")
+        )
+        .unwrap()["publicRequest"],
+        first["publicRequest"]
+    );
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 3);
 }

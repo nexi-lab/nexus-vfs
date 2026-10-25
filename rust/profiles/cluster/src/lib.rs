@@ -3552,6 +3552,13 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         service_decls.push(managed_csr_binding::service_decl(
             common.data_dir.join("tls"),
             identity_armed,
+            Some(managed_csr_binding::NativeIssuer::from_tls(
+                zm.agent_minter_slot(),
+                cluster_tls.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("managed credentials require the selected native TLS identity")
+                })?,
+                svc_ctx.runtime.clone(),
+            )?),
         )?);
     }
     service_decls.extend(authorization::service_decls(
