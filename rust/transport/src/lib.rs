@@ -39,6 +39,8 @@ pub mod call_dispatch;
 #[cfg(feature = "experimental-domain-join")]
 pub mod collaboration_access;
 #[cfg(feature = "experimental-domain-join")]
+pub mod collaboration_authority;
+#[cfg(feature = "experimental-domain-join")]
 pub mod collaboration_identity;
 /// Federation peer client — discover/join RPCs for cross-zone membership.
 pub mod federation;

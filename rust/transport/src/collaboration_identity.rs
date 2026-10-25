@@ -29,6 +29,7 @@ pub struct CertificateAgent {
     trust_domain: Option<String>,
     serial: Vec<u8>,
     leaf_sha256: [u8; 32],
+    issuer_sha256: [u8; 32],
 }
 
 impl CertificateAgent {
@@ -43,6 +44,11 @@ impl CertificateAgent {
     }
     pub fn leaf_sha256(&self) -> &[u8; 32] {
         &self.leaf_sha256
+    }
+    /// Complete DER pin of the actual selected TLS issuer; the public Agent
+    /// address separately uses SPKI so certificate renewal cannot rename it.
+    pub fn issuer_sha256(&self) -> &[u8; 32] {
+        &self.issuer_sha256
     }
 }
 
@@ -129,6 +135,7 @@ fn admit_leaf(
     }
 
     let mut matched: Option<([u8; 32], Option<&str>)> = None;
+    let mut issuer_sha256 = [0; 32];
     for (anchor_der, domain) in std::iter::once((local_anchor, None)).chain(
         foreign
             .iter()
@@ -149,6 +156,7 @@ fn admit_leaf(
             }
         } else {
             matched = Some((authority, domain));
+            issuer_sha256 = Sha256::digest(anchor_der).into();
         }
     }
     let (authority, domain) = matched.ok_or(IdentityError::UntrustedAuthority)?;
@@ -187,6 +195,7 @@ fn admit_leaf(
         trust_domain: domain.map(str::to_owned),
         serial: leaf.raw_serial().to_vec(),
         leaf_sha256: Sha256::digest(der).into(),
+        issuer_sha256,
     };
     current
         .check_current(&certificate)
@@ -413,15 +422,20 @@ mod tests {
     /// is deliberately a test stand-in, not a foreign-CRL implementation.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn established_mtls_connection_rechecks_policy_and_removed_anchor() {
-        exercise_mtls_admission(false).await;
+        exercise_mtls_admission(false, false).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn scoped_mtls_admission_does_not_authorize_the_legacy_vfs_door() {
-        exercise_mtls_admission(true).await;
+        exercise_mtls_admission(true, false).await;
     }
 
-    async fn exercise_mtls_admission(scoped: bool) {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn established_mtls_uses_current_registered_issuer_and_retained_crl_revocations() {
+        exercise_mtls_admission(true, true).await;
+    }
+
+    async fn exercise_mtls_admission(scoped: bool, native_current: bool) {
         use crate::collaboration_access::SpaceAuthorizer;
         use a2a::{
             collaboration_policy::{CollaborationOperation, SpacePolicy, SpacePolicyStore},
@@ -436,7 +450,11 @@ mod tests {
             Kernel,
         };
         use lib::transport_primitives::{federated_tls_incoming, server_config};
-        use nexus_raft::{collaboration_store::RaftSpacePolicyStore, raft::ZoneRaftRegistry};
+        use nexus_raft::{
+            collaboration_crl::RaftCollaborationCrlStore,
+            collaboration_store::RaftSpacePolicyStore, foreign_ca_store::RaftForeignCaStore,
+            raft::ZoneRaftRegistry, transport::generate_crl,
+        };
         use std::sync::{Arc, Mutex, OnceLock};
         use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, Server};
 
@@ -448,12 +466,13 @@ mod tests {
             generate_agent_cert("existing-agent", &foreign, &foreign_key).unwrap();
         let verifier = FederatedClientCertVerifier::new(&local).unwrap();
         let anchor = ForeignCaAnchor::new("edge", der(&foreign));
+        let anchor = if scoped {
+            anchor.collaboration_only()
+        } else {
+            anchor
+        };
         verifier
-            .set_foreign_cas(&[if scoped {
-                anchor.collaboration_only()
-            } else {
-                anchor
-            }])
+            .set_foreign_cas(std::slice::from_ref(&anchor))
             .unwrap();
         let local_der = der(&local);
         let (_, local_anchor) = X509Certificate::from_der(&local_der).unwrap();
@@ -465,6 +484,7 @@ mod tests {
             &Current::new(),
         )
         .unwrap();
+        let serial = client_identity.certificate().serial().to_vec();
         let other = AgentAddress::new(host, "other-agent".into()).unwrap();
         let space = "0123456789abcdef0123456789abcdef";
         let pair = ConversationAddress::new(
@@ -480,6 +500,21 @@ mod tests {
             .create_zone(contracts::CONTROL_ZONE_ID, vec![], &runtime)
             .unwrap();
         node.campaign().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !node.is_leader() || node.applied_index() < node.last_index() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let crls =
+            Arc::new(RaftCollaborationCrlStore::new(node.clone(), runtime.clone(), 60).unwrap());
+        let issuers = RaftForeignCaStore::new(node.clone(), runtime.clone());
+        let empty_crl = generate_crl(&[], 0, &foreign, &foreign_key).unwrap();
+        if native_current {
+            issuers.register(&anchor).unwrap();
+            crls.publish(&foreign, &empty_crl).unwrap();
+        }
         let store = Arc::new(RaftSpacePolicyStore::new(node, runtime));
         let expires: u64 = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -501,6 +536,17 @@ mod tests {
             )
             .unwrap();
         let current = Arc::new(Current::new());
+        let gate_current: Arc<dyn CurrentAgentAuthority> = if native_current {
+            Arc::new(
+                crate::collaboration_authority::RaftCurrentAgentAuthority::new(
+                    local.clone(),
+                    crls.clone(),
+                )
+                .unwrap(),
+            )
+        } else {
+            current.clone()
+        };
         let admitted = Arc::new(Mutex::new(Vec::new()));
         let slot = Arc::new(OnceLock::new());
         slot.set(verifier.clone()).unwrap();
@@ -538,7 +584,6 @@ mod tests {
             None,
         );
         let gate_verifier = verifier.clone();
-        let gate_current = current.clone();
         let gate_admitted = admitted.clone();
         let gate_store = store.clone();
         let check_space = Arc::new(AtomicBool::new(true));
@@ -627,6 +672,71 @@ mod tests {
         } else {
             client.ping(PingRequest::default()).await.unwrap();
         }
+        if native_current {
+            // Keep the handshake verifier intentionally stale: the consensus
+            // registry, not an apply-observer cache, must reject this channel.
+            assert_eq!(verifier.foreign_anchors().len(), 1);
+            issuers.unregister(&anchor.fingerprint_hex()).unwrap();
+            assert_eq!(
+                client
+                    .ping(PingRequest::default())
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::PermissionDenied
+            );
+            issuers.register(&anchor).unwrap();
+            assert_eq!(
+                client
+                    .ping(PingRequest::default())
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::Unauthenticated
+            );
+            issuers.unregister(&anchor.fingerprint_hex()).unwrap();
+            let legacy = ForeignCaAnchor::new("edge", anchor.ca_cert_der.clone());
+            issuers.register(&legacy).unwrap();
+            assert_eq!(
+                client
+                    .ping(PingRequest::default())
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::PermissionDenied
+            );
+            issuers.unregister(&anchor.fingerprint_hex()).unwrap();
+            issuers.register(&anchor).unwrap();
+            assert_eq!(
+                client
+                    .ping(PingRequest::default())
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::Unauthenticated
+            );
+            let revoke =
+                generate_crl(std::slice::from_ref(&serial), 1, &foreign, &foreign_key).unwrap();
+            crls.publish(&foreign, &revoke).unwrap();
+            assert_eq!(
+                client
+                    .ping(PingRequest::default())
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::PermissionDenied
+            );
+            crls.publish(&foreign, &empty_crl).unwrap();
+            assert_eq!(
+                client
+                    .ping(PingRequest::default())
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::PermissionDenied,
+                "replaying a still-fresh signed empty CRL must not un-revoke an observed serial"
+            );
+        }
         store.revoke(space).unwrap();
         assert_eq!(
             client
@@ -671,10 +781,13 @@ mod tests {
         );
         assert_eq!(
             current.calls.load(Ordering::SeqCst),
-            3,
+            if native_current { 0 } else { 3 },
             "removed anchor refuses before policy"
         );
-        assert_eq!(admitted.lock().unwrap().len(), 1);
+        assert_eq!(
+            admitted.lock().unwrap().len(),
+            if native_current { 3 } else { 1 }
+        );
         stop.send(()).unwrap();
         drop(client);
         server.await.unwrap();

@@ -17,7 +17,8 @@ use crate::{
     prelude::{FullStateMachine, ZoneConsensus},
 };
 use lib::transport_primitives::{
-    canonical_certificate_serial, verify_signed_crl, VerifiedCrl, CRL_MAXIMUM_AGE_SECS,
+    canonical_certificate_serial, verify_signed_crl, ForeignCaAnchor, ForeignCaScope, VerifiedCrl,
+    CRL_MAXIMUM_AGE_SECS,
 };
 use sha2::{Digest, Sha256};
 
@@ -159,6 +160,96 @@ impl RaftCollaborationCrlStore {
         self.check_at(ca_pem, serial, now().map_err(CrlStateError::Unavailable)?)
     }
 
+    /// Compose CURRENT issuer registration and revocation in ONE consensus
+    /// snapshot. Inputs must come from the actual admitted TLS leaf/anchor;
+    /// this trusted composition method does not authenticate public values.
+    /// Foreign callers require the versioned collaboration-only purpose.
+    pub fn check_registered_serial(
+        &self,
+        local_ca_pem: &[u8],
+        authority: &[u8; 32],
+        selected_issuer_sha256: &[u8; 32],
+        trust_domain: Option<&str>,
+        serial: &[u8],
+    ) -> Result<(), CrlStateError> {
+        let snapshot = snapshot_key(authority);
+        let revoked = revoked_key(authority, serial).map_err(CrlStateError::Unavailable)?;
+        let (anchors, values) = self
+            .inner
+            .read_linearizable(move |sm| {
+                let anchors = sm
+                    .list_control_state(contracts::CONTROL_NS_FOREIGN_CA)
+                    .map_err(|e| e.to_string())?;
+                let values = [snapshot, revoked]
+                    .iter()
+                    .map(|key| {
+                        sm.get_control_state(contracts::constants::CONTROL_NS_COLLABORATION, key)
+                            .map_err(|e| e.to_string())
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                Ok::<_, String>((anchors, values))
+            })
+            .map_err(CrlStateError::Unavailable)?
+            .map_err(CrlStateError::Unavailable)?;
+        let local_authority = lib::transport_primitives::ca_spki_sha256(local_ca_pem)
+            .map_err(CrlStateError::Unavailable)?;
+        let local_der = pem::parse(local_ca_pem)
+            .map_err(|e| CrlStateError::Unavailable(e.to_string()))?
+            .into_contents();
+        if trust_domain.is_some() && *authority == local_authority {
+            return Err(CrlStateError::Unavailable(
+                "local authority cannot be foreign".into(),
+            ));
+        }
+        let mut selected = None;
+        for (key, bytes) in anchors {
+            let anchor = ForeignCaAnchor::decode(&bytes)
+                .map_err(|error| CrlStateError::Unavailable(error.to_string()))?;
+            if key != anchor.fingerprint_hex() {
+                return Err(CrlStateError::Unavailable(
+                    "foreign registry key mismatch".into(),
+                ));
+            }
+            let pem = pem::encode(&pem::Pem::new("CERTIFICATE", anchor.ca_cert_der.as_slice()));
+            let candidate = lib::transport_primitives::ca_spki_sha256(pem.as_bytes())
+                .map_err(CrlStateError::Unavailable)?;
+            if candidate != *authority {
+                continue;
+            }
+            if trust_domain != Some(anchor.trust_domain_id.as_str())
+                || anchor.scope != ForeignCaScope::CollaborationOnlyV1
+            {
+                return Err(CrlStateError::Unavailable(
+                    "ambiguous authority or trust purpose".into(),
+                ));
+            }
+            if anchor.fingerprint() == *selected_issuer_sha256 {
+                selected = Some(pem.into_bytes());
+            }
+        }
+        let ca_pem = match trust_domain {
+            None if *authority == local_authority
+                && <[u8; 32]>::from(Sha256::digest(&local_der)) == *selected_issuer_sha256 =>
+            {
+                local_ca_pem
+            }
+            Some(_) => selected.as_deref().ok_or_else(|| {
+                CrlStateError::Unavailable("TLS issuer is no longer registered".into())
+            })?,
+            _ => {
+                return Err(CrlStateError::Unavailable(
+                    "local issuer binding mismatch".into(),
+                ))
+            }
+        };
+        self.check_values(
+            &values,
+            ca_pem,
+            serial,
+            now().map_err(CrlStateError::Unavailable)?,
+        )
+    }
+
     fn check_at(&self, ca_pem: &[u8], serial: &[u8], at: i64) -> Result<(), CrlStateError> {
         let authority = lib::transport_primitives::ca_spki_sha256(ca_pem)
             .map_err(CrlStateError::Unavailable)?;
@@ -167,7 +258,17 @@ impl RaftCollaborationCrlStore {
             .inner
             .get_many_linearizable(&[snapshot_key(&authority), revoked])
             .map_err(CrlStateError::Unavailable)?;
-        match values.as_slice() {
+        self.check_values(&values, ca_pem, serial, at)
+    }
+
+    fn check_values(
+        &self,
+        values: &[Option<Vec<u8>>],
+        ca_pem: &[u8],
+        serial: &[u8],
+        at: i64,
+    ) -> Result<(), CrlStateError> {
+        match values {
             [_, Some(value)] if value == REVOKED => Err(CrlStateError::Revoked),
             [_, Some(_)] => Err(CrlStateError::Unavailable(
                 "invalid revocation marker".into(),
