@@ -353,6 +353,9 @@ struct AgentRecord {
     identity: Arc<AgentNotify>,
     callbacks_running: bool,
     removing: bool,
+    // Native host provenance, never a wire descriptor/label supplied by a
+    // registry caller. It belongs to this exact incarnation and is not liveness.
+    managed_host_bound: bool,
 }
 
 impl std::ops::Deref for AgentRecord {
@@ -470,6 +473,7 @@ impl AgentRegistry {
                     identity: Arc::new(AgentNotify::new()),
                     callbacks_running: false,
                     removing: false,
+                    managed_host_bound: false,
                 };
                 let instance = record.instance();
                 v.insert(record);
@@ -651,6 +655,34 @@ impl AgentRegistry {
         self.agents
             .get(&instance.pid)
             .is_some_and(|record| !record.removing && record.matches(instance))
+    }
+
+    /// Trusted native host seam, after validating its session handle. Generic
+    /// registry RPCs only register descriptors and cannot set this private bit.
+    pub fn bind_managed_host(&self, instance: &AgentInstance) -> bool {
+        let Some(mut record) = self.agents.get_mut(&instance.pid) else {
+            return false;
+        };
+        if record.removing
+            || !record.matches(instance)
+            || record.kind != AgentKind::Managed
+            || record.state.is_terminal()
+        {
+            return false;
+        }
+        record.managed_host_bound = true;
+        true
+    }
+
+    /// Provenance at this read, not online proof or a permanent admission grant.
+    pub fn is_managed_host_bound(&self, instance: &AgentInstance) -> bool {
+        self.agents.get(&instance.pid).is_some_and(|record| {
+            !record.removing
+                && record.matches(instance)
+                && record.managed_host_bound
+                && record.kind == AgentKind::Managed
+                && !record.state.is_terminal()
+        })
     }
 
     /// The agent name a pid belongs to.
@@ -1122,6 +1154,29 @@ mod tests {
             updated_at_ms: 1000,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn native_host_binding_is_private_to_one_managed_incarnation() {
+        let registry = AgentRegistry::new();
+        let mut descriptor = make_desc("42", "same");
+        descriptor.kind = AgentKind::Managed;
+        let original = registry.register_instance(descriptor.clone()).unwrap();
+        assert!(!registry.is_managed_host_bound(&original));
+        assert!(registry.bind_managed_host(&original));
+        assert!(registry.is_managed_host_bound(&original));
+        let copied = AgentRegistry::new();
+        let copy = copied.register_instance(descriptor.clone()).unwrap();
+        assert!(!copied.is_managed_host_bound(&copy));
+        registry.unregister("42").unwrap();
+        let replacement = registry.register_instance(descriptor).unwrap();
+        assert!(!registry.is_managed_host_bound(&original));
+        assert!(!registry.bind_managed_host(&original));
+        assert!(!registry.is_managed_host_bound(&replacement));
+        let worker = registry
+            .register_instance(make_desc("43", "worker"))
+            .unwrap();
+        assert!(!registry.bind_managed_host(&worker));
     }
 
     #[test]

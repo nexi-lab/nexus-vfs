@@ -59,6 +59,7 @@ use kernel::service_registry::{RustCallError, RustService};
 #[cfg(feature = "subprocess-host")]
 pub(crate) mod raw_spawn;
 
+pub mod credential_binding;
 pub(crate) mod proc_entry;
 mod runtime_discovery;
 pub(crate) mod session;
@@ -786,6 +787,17 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                     let _ = self.agent_registry.kill_instance(&instance, 1);
                     return Err(ManagedAgentError::Internal(
                         "runtime did not attach the session mailbox".into(),
+                    ));
+                }
+                if durable_session_id
+                    .as_deref()
+                    .is_some_and(|id| !id.is_empty())
+                    && !self.agent_registry.bind_managed_host(&instance)
+                {
+                    handle.abort();
+                    let _ = self.agent_registry.kill_instance(&instance, 1);
+                    return Err(ManagedAgentError::Internal(
+                        "managed runtime incarnation retired before host binding".into(),
                     ));
                 }
                 self.spawn_handles.insert(pid.clone(), handle);

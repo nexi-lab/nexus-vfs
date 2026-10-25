@@ -123,6 +123,14 @@ service ZoneApiService {
   // local `auth mint`, run against the founder's live CA + auth store.
   rpc MintAgent(MintAgentRequest) returns (MintAgentResponse);
 
+  // Versioned, Node-only caller-owned key issuance. These methods use the same
+  // CA-holder slot and immutable I/F records, never MintAgent's generated key
+  // or allow_existing path. Query is read-only; NotObserved cannot prove a
+  // previous submission will not commit. Clients retain the original CSR/op.
+  rpc GetAgentCsrCapabilities(AgentCsrCapabilitiesRequest) returns (AgentCsrCapabilitiesResponse);
+  rpc IssueAgentCsrV1(AgentCsrRequest) returns (AgentCsrResponse);
+  rpc QueryAgentCsrV1(AgentCsrRequest) returns (AgentCsrResponse);
+
   // MintSessionAgent signs a SESSION credential: an agent identity bound to an
   // owner, with a fresh per-call subject and a short validity. Unlike MintAgent
   // this is reachable by an AGENT caller — that is its purpose, so a front door
@@ -217,15 +225,45 @@ service ZoneApiService {
   rpc ListForeignCas(ListForeignCasRequest) returns (ListForeignCasResponse);
 }
 
-// NodeEnrollmentService is the pre-mTLS BOOTSTRAP plane: the one surface a
-// brand-new node reaches BEFORE it owns a cluster cert. It lives apart from
-// ZoneApiService on purpose — the data plane is strict mTLS (client cert
-// required), which a certless joiner cannot satisfy, so enrollment cannot live
-// there. Runs on its own listener; auth is the join token (k3s/kubeadm model),
-// integrity is the CA fingerprint pinned inside the token, and the channel is
-// carried by the encrypted overlay. Keeping it a dedicated single-RPC service
-// is fail-safe: no data-plane method is even registered on the enroll listener,
-// so nothing can be reached there without mTLS.
+message AgentCsrCapabilitiesRequest {}
+message AgentCsrCapabilitiesResponse {
+  uint32 version = 1; // 0 = unsupported/unarmed, 1 = immutable ordinary-Agent I/F
+  bytes issuer_sha256 = 2; // full registered local CA certificate DER, not SPKI
+}
+message AgentCsrRequest {
+  string agent_name = 1;
+  string owner_id = 2;
+  string display_name = 3;
+  string operation_id = 4;
+  bytes csr_pem = 5; // bounded PKCS#10 only; never a private key
+  bytes issuer_sha256 = 6; // exact expected CA DER SHA256, 32 bytes
+}
+enum AgentCsrState {
+  AGENT_CSR_STATE_UNSPECIFIED = 0;
+  AGENT_CSR_STATE_FINALIZED = 1;
+  AGENT_CSR_STATE_INTENT_COMMITTED = 2;
+  AGENT_CSR_STATE_NOT_OBSERVED = 3;
+  AGENT_CSR_STATE_NOT_SUBMITTED = 4; // proven pre-issue refusal of this request
+  AGENT_CSR_STATE_UNKNOWN = 5; // retain key/CSR/op; no automatic retry or remint
+}
+message AgentCsrResponse {
+  AgentCsrState state = 1;
+  optional string error = 2;
+  string agent_name = 3;
+  string owner_id = 4;
+  string operation_id = 5;
+  bytes request_sha256 = 6;
+  bytes intent_sha256 = 7;
+  bytes serial = 8;
+  bytes certificate_der = 9; // only the immutable selected F; no private key
+  bytes ca_pem = 10;
+}
+
+// NodeEnrollmentService is the separate pre-mTLS bootstrap plane. Its join
+// token authenticates certless joiners, which cannot reach the strict-mTLS
+// ZoneApiService. The pinned CA fingerprint protects issuer selection; the
+// channel is carried by the encrypted overlay. No data-plane RPC is registered
+// on this listener. GetCrl serves only a public CA-signed artifact.
 service NodeEnrollmentService {
   // JoinCluster provisions a new node with cluster TLS certificates. The caller
   // authenticates with the join token password (k3s/kubeadm "join" model); the

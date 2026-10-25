@@ -255,6 +255,46 @@ Neither a signed list nor a deployment JSON record grants a space or proves
 that the DGX has joined it. The combined issuer/CRL snapshot does not make the
 separate space-grant snapshot or a later data-zone append atomic with revocation.
 
+## Managed owner and caller-key preparation
+
+The experimental managed CSR profile also installs the versioned
+`managed_agent_credentials` native Call service when the actual boot posture
+has an armed identity plane and TLS. `Open`/`NoAuth` and plaintext boots do not
+install it. Its preparation capability is distinct from the Node-privileged
+issuer protocol: `prepareVersion:1, issuanceVersion:0, activationVersion:0`.
+
+`prepare_v1` and explicit recovery through `inspect_v1` accept only an existing
+registry PID and the original operation ID. The actual request context must
+prove that Agent's local owner; an admin override, Node identity, foreign name,
+caller-supplied owner/sender/Agent or filesystem path is insufficient. Moss
+already obtains this context through its existing `connectSessionRuntime`
+owner credential and suppresses an operator token that could override it. Cloud
+and Edge can consume that same native seam.
+
+Registry metadata alone is not host provenance: the generic registry RPC can
+plant a `Managed` record. The credential resolver therefore requires a private
+binding on that exact registry incarnation. Only the trusted native managed
+host sets it after verifying the selected mailbox and a nonempty durable SID
+from its runtime handle. Descriptor copying, labels, PID reuse and terminated
+instances cannot supply or inherit this binding. It proves the host attachment
+at that read, not online status, delivery or a permanent admission grant. Raw
+subprocess hosts without that durable binding remain unsupported by this seam.
+
+The host uses the existing `PendingAgentCsr` implementation, in its native
+owner-controlled TLS storage. A bounded operation ID is validated by the shared
+contracts codec and hashed into one filename; no request selects a host path.
+The response contains public request fields/digest and the resolved binding,
+never the private key. Repeated or partial preparation does not replace stored
+bytes. Explicit inspection can recover that same request after the same logical
+Agent/owner resumes under another native PID. Another owner or issuer cannot
+adopt it. The instance is rechecked after persistence before reporting success.
+
+Preparation performs no issuer RPC, activates no runtime credential and grants
+no space. A later native issuer client must authenticate the selected issuer,
+submit/query the original request through the existing I/F protocol and publish
+verified F using the same caller-key implementation. Accepting unauthenticated
+response fields or treating a prepared key as a completed join is insufficient.
+
 ## Data plane and compatibility
 
 New joining authorities use a collaboration-only trust purpose, not the old

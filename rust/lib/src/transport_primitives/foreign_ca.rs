@@ -97,7 +97,7 @@ pub(crate) fn certificate_ders(pem: &[u8], what: &str) -> Result<Vec<Vec<u8>>, S
 }
 
 /// The DER of the FIRST `CERTIFICATE` block — a single CA cert. Errors if none.
-pub(crate) fn first_certificate_der(pem: &[u8], what: &str) -> Result<Vec<u8>, String> {
+pub fn first_certificate_der(pem: &[u8], what: &str) -> Result<Vec<u8>, String> {
     certificate_ders(pem, what)?
         .into_iter()
         .next()

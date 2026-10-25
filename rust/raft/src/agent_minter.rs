@@ -13,6 +13,48 @@
 
 use std::sync::Arc;
 
+/// Exact caller-owned CSR request binding shared by native producer/consumer.
+/// Six ordered fields, each u64 big-endian length + bytes, after a NUL-ended
+/// domain. No JSON key order or caller-provided digest is trusted.
+pub fn agent_csr_request_digest(
+    request: &crate::transport::proto::AgentCsrRequest,
+) -> Result<[u8; 32], String> {
+    use sha2::{Digest, Sha256};
+    contracts::validate_operation_id(&request.operation_id).map_err(|e| e.to_string())?;
+    for value in [&request.agent_name, &request.owner_id] {
+        if value.is_empty()
+            || value.len() > 256
+            || value
+                .chars()
+                .any(|c| c.is_control() || c.is_whitespace() || c == '/' || c == '\\')
+        {
+            return Err("invalid Agent or owner identity".into());
+        }
+    }
+    if request.display_name.len() > 256
+        || request.display_name.chars().any(char::is_control)
+        || request.csr_pem.is_empty()
+        || request.csr_pem.len() > 16 * 1024
+        || request.issuer_sha256.len() != 32
+    {
+        return Err("invalid Agent CSR request bounds".into());
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"nexus-managed-agent-csr-v1\0");
+    for field in [
+        request.agent_name.as_bytes(),
+        request.owner_id.as_bytes(),
+        request.display_name.as_bytes(),
+        request.operation_id.as_bytes(),
+        request.csr_pem.as_slice(),
+        request.issuer_sha256.as_slice(),
+    ] {
+        hash.update((field.len() as u64).to_be_bytes());
+        hash.update(field);
+    }
+    Ok(hash.finalize().into())
+}
+
 /// A signed agent identity bundle — the same three artifacts the local
 /// `auth mint --subject-type agent` writes.
 pub struct AgentBundle {
@@ -50,6 +92,25 @@ pub struct SessionRenewal<'a> {
 /// the gate + the CA + the store all live in the impl (cluster profile).
 #[tonic::async_trait]
 pub trait AgentMinter: Send + Sync {
+    /// No second issuer slot: compositions opt into the I/F coordinator here.
+    fn csr_capabilities(&self) -> crate::transport::proto::AgentCsrCapabilitiesResponse {
+        crate::transport::proto::AgentCsrCapabilitiesResponse::default()
+    }
+
+    /// Actual TLS leaf is supplied by the transport, never by the request body.
+    async fn agent_csr_v1(
+        &self,
+        _caller_cert_der: Option<Vec<u8>>,
+        _request: crate::transport::proto::AgentCsrRequest,
+        _query_only: bool,
+    ) -> crate::transport::proto::AgentCsrResponse {
+        crate::transport::proto::AgentCsrResponse {
+            state: crate::transport::proto::AgentCsrState::NotSubmitted as i32,
+            error: Some("caller-owned Agent CSR issuance is unsupported by this issuer".into()),
+            ..Default::default()
+        }
+    }
+
     async fn mint(
         &self,
         caller_cert_der: Option<Vec<u8>>,

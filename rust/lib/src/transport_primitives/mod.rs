@@ -35,13 +35,13 @@ pub use federated_tls::{
     federated_mtls_incoming, federated_tls_incoming, reloadable_tls_incoming, server_config,
     FederatedClientCertVerifier, ReloadableServerIdentity,
 };
-pub use foreign_ca::{CaFingerprint, ForeignCaAnchor, ForeignCaScope};
+pub use foreign_ca::{first_certificate_der, CaFingerprint, ForeignCaAnchor, ForeignCaScope};
 pub use peer::{hostname_to_node_id, NodeAddress, PeerAddress};
 pub use peer_blob_client::{NoopPeerBlobClient, PeerBlobClient, PeerBlobResult};
 pub use pool::ConnectionPool;
 pub use runtime_credential::{
     user_runtime_name_from_x509, user_runtime_server_name, USER_RUNTIME_MAX_VALIDITY_SECS,
 };
-pub use secret_file::write_secret;
+pub use secret_file::{create_secret, protect_secret, write_secret};
 pub use server_limits::apply_server_limits;
 pub use tofu::{cert_fingerprint, TofuError, TofuResult, TofuTrustStore, TrustedZone};

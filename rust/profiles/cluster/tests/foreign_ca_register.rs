@@ -224,26 +224,36 @@ async fn boot_founder_with_ca_b(options: &[&str]) -> XorgFixture {
 }
 
 /// Does the founder ACCEPT `client_tls` (a foreign-CA client identity) at the
-/// mTLS handshake? Polls the *ungated* `DiscoverZones` RPC until it returns `Ok`
-/// or `budget` expires, and reports whether it ever did.
+/// mTLS handshake? Polls the authenticated VFS Ping until it returns `Ok`
+/// or `budget` expires. Raft discovery is Node-only, so its permission refusal
+/// cannot be used as evidence that an Agent's TLS handshake failed.
 ///
-/// `DiscoverZones` is the ideal probe: it takes no auth and reads only public
-/// topology, so the ONLY thing that can make it fail for a well-formed request
-/// is the TLS layer refusing the client cert. We can't judge trust by
-/// `Endpoint::connect()` alone — under TLS 1.3 the client's connect completes
+/// We can't judge trust by `Endpoint::connect()` alone — under TLS 1.3 the client's connect completes
 /// before the server has validated the client cert, so a doomed cert still
 /// "connects"; the rejection only surfaces when a real request tries to read.
 /// Issuing an actual RPC forces that read: `Ok` ⟺ the cert's issuing CA is in
 /// the live client-cert verifier's roots (i.e. registered + hot-swapped).
 async fn handshake_accepted(port: u16, client_tls: &TlsConfig, budget: Duration) -> bool {
+    use kernel::kernel::vfs_proto::{nexus_vfs_service_client::NexusVfsServiceClient, PingRequest};
+    use lib::transport_primitives::{create_channel, ClientConfig};
     let endpoint = format!("https://127.0.0.1:{port}");
+    let config = ClientConfig {
+        tls: Some(client_tls.clone()),
+        connect_timeout: Duration::from_secs(5),
+        request_timeout: Duration::from_secs(5),
+        ..Default::default()
+    };
     let deadline = Instant::now() + budget;
     loop {
-        if nexus_raft::transport::call_discover_zones_rpc(&endpoint, Some(client_tls.clone()), 5)
-            .await
-            .is_ok()
-        {
-            return true;
+        let connected = create_channel(&endpoint, &config).await;
+        if let Ok(channel) = connected {
+            if NexusVfsServiceClient::new(channel)
+                .ping(PingRequest::default())
+                .await
+                .is_ok()
+            {
+                return true;
+            }
         }
         if Instant::now() >= deadline {
             return false;

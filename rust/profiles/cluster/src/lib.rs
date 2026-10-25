@@ -33,6 +33,12 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 mod auth_posture;
 mod authorization;
+#[cfg(feature = "experimental-managed-agent-csr")]
+mod csr_cli;
+#[cfg(feature = "experimental-managed-agent-csr")]
+mod managed_csr;
+#[cfg(feature = "experimental-managed-agent-csr")]
+mod managed_csr_binding;
 mod plugin_loading;
 mod runtime_backends;
 mod search_capabilities;
@@ -652,6 +658,13 @@ fn enroll_port_addr(host_port: &str) -> Result<String> {
 /// arm rather than three.
 #[derive(Debug, Subcommand)]
 enum AuthCmd {
+    /// Experimental caller-owned Agent CSR operations through one live issuer.
+    /// No offline signing, endpoint failover or automatic issuance retry.
+    #[cfg(feature = "experimental-managed-agent-csr")]
+    Csr {
+        #[command(subcommand)]
+        action: csr_cli::CsrCommand,
+    },
     /// Mint a credential and print it. This is the only time it exists in the
     /// clear.
     ///
@@ -3316,6 +3329,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
                     Arc::new(DaemonKeyMinter {
                         store: Arc::clone(&store),
                         secret: secret.to_string(),
+                        peer_verifier: Arc::clone(&fca_verifier_slot),
                     });
                 *zm.key_minter_slot().write() = Some(minter);
                 tracing::info!("sk- MintKey/RevokeKey RPC armed (mint while the daemon is up)");
@@ -3384,7 +3398,10 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
             // The same store behind the operator-facing RPCs. One store, two
             // faces: the gate reads it per mint, the admin RPCs change it.
             let admin: Arc<dyn nexus_raft::session_mint_admin::SessionMintAdmin> =
-                Arc::new(DaemonSessionMintAdmin { store: allow });
+                Arc::new(DaemonSessionMintAdmin {
+                    store: allow,
+                    peer_verifier: Arc::clone(&fca_verifier_slot),
+                });
             *zm.session_mint_admin_slot().write() = Some(admin);
             tracing::info!(
                 "session-mint allow-list bound (MintSessionAgent gate + admin RPCs live)"
@@ -3401,6 +3418,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
             let registrar: Arc<dyn nexus_raft::foreign_ca_registrar::ForeignCaRegistrar> =
                 Arc::new(DaemonForeignCaRegistrar {
                     store: Arc::clone(&fca_store),
+                    peer_verifier: Arc::clone(&fca_verifier_slot),
                 });
             *zm.foreign_ca_registrar_slot().write() = Some(registrar);
             match fca_store.list() {
@@ -3529,6 +3547,13 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         }),
     };
     let mut service_decls = build_decls(&svc_ctx);
+    #[cfg(feature = "experimental-managed-agent-csr")]
+    if identity_armed && !common.no_tls {
+        service_decls.push(managed_csr_binding::service_decl(
+            common.data_dir.join("tls"),
+            identity_armed,
+        )?);
+    }
     service_decls.extend(authorization::service_decls(
         &common,
         &svc_ctx,
@@ -5705,9 +5730,10 @@ fn write_agent_bundle(
 /// (`generate_agent_cert` + `mint_agent_authz`), so the remote and local paths
 /// stay byte-identical by construction — they differ only in WHERE the CA key
 /// is read and the bundle is written. The caller is gated to a cluster NODE:
-/// mTLS already proved the client leaf chains to the cluster CA; we additionally
-/// require it be a node identity, so an agent cert (a pure identity) can never
+/// Recheck the client leaf against the current LOCAL cluster CA and its Node
+/// role; the listener may also admit foreign CA leaves for VFS. An agent can never
 /// be leveraged into minting further agents (privilege confinement).
+#[derive(Clone)]
 struct FounderAgentMinter {
     store: Arc<dyn kernel::hal::auth_key_store::AuthKeyStore>,
     tls_dir: PathBuf,
@@ -5792,6 +5818,32 @@ impl FounderAgentMinter {
 
 #[tonic::async_trait]
 impl nexus_raft::agent_minter::AgentMinter for FounderAgentMinter {
+    #[cfg(feature = "experimental-managed-agent-csr")]
+    fn csr_capabilities(&self) -> nexus_raft::transport::proto::AgentCsrCapabilitiesResponse {
+        managed_csr::capabilities(self)
+    }
+
+    #[cfg(feature = "experimental-managed-agent-csr")]
+    async fn agent_csr_v1(
+        &self,
+        caller_cert_der: Option<Vec<u8>>,
+        request: nexus_raft::transport::proto::AgentCsrRequest,
+        query_only: bool,
+    ) -> nexus_raft::transport::proto::AgentCsrResponse {
+        let issuer = self.clone();
+        match tokio::task::spawn_blocking(move || {
+            managed_csr::execute(&issuer, caller_cert_der, request, query_only)
+        })
+        .await
+        {
+            Ok(response) => response,
+            Err(_) => managed_csr::failure(
+                nexus_raft::transport::proto::AgentCsrState::Unknown,
+                "Agent CSR issuer worker did not return",
+            ),
+        }
+    }
+
     async fn mint(
         &self,
         caller_cert_der: Option<Vec<u8>>,
@@ -5801,7 +5853,7 @@ impl nexus_raft::agent_minter::AgentMinter for FounderAgentMinter {
     ) -> std::result::Result<nexus_raft::agent_minter::AgentBundle, String> {
         // Gate: node-only. An agent cert carries no authorization, so a valid
         // agent cert must never be leverageable into minting more agents.
-        gate_node_caller(caller_cert_der, "MintAgent")?;
+        gate_node_caller(caller_cert_der, &self.peer_verifier, "MintAgent")?;
 
         let ca_pem = std::fs::read(self.tls_dir.join("ca.pem"))
             .map_err(|e| format!("read {}/ca.pem: {e}", self.tls_dir.display()))?;
@@ -5930,7 +5982,7 @@ impl nexus_raft::agent_minter::AgentMinter for FounderAgentMinter {
         // front door that minted it is the party that knows when the session
         // ended, and it holds only an agent cert. A node caller covers the
         // operator path.
-        let caller = match gate_node_caller(caller_cert_der.clone(), OP) {
+        let caller = match gate_node_caller(caller_cert_der.clone(), &self.peer_verifier, OP) {
             Ok(()) => "node".to_string(),
             Err(node_err) => self
                 .session_minter_caller(caller_cert_der)
@@ -6029,6 +6081,7 @@ fn gate_allowlisted_session_minter(
 /// authority, which is reconnaissance for anyone deciding what to steal.
 struct DaemonSessionMintAdmin {
     store: Arc<nexus_raft::session_mint_allow_store::RaftSessionMintAllowStore>,
+    peer_verifier: transport::grpc::ForeignCaVerifierSlot,
 }
 
 #[tonic::async_trait]
@@ -6038,7 +6091,7 @@ impl nexus_raft::session_mint_admin::SessionMintAdmin for DaemonSessionMintAdmin
         caller_cert_der: Option<Vec<u8>>,
         agent_id: &str,
     ) -> std::result::Result<(), String> {
-        gate_node_caller(caller_cert_der, "AllowSessionMinter")?;
+        gate_node_caller(caller_cert_der, &self.peer_verifier, "AllowSessionMinter")?;
         if agent_id.is_empty() {
             return Err("AllowSessionMinter: agent_id must not be empty".to_string());
         }
@@ -6052,7 +6105,7 @@ impl nexus_raft::session_mint_admin::SessionMintAdmin for DaemonSessionMintAdmin
         caller_cert_der: Option<Vec<u8>>,
         agent_id: &str,
     ) -> std::result::Result<bool, String> {
-        gate_node_caller(caller_cert_der, "DenySessionMinter")?;
+        gate_node_caller(caller_cert_der, &self.peer_verifier, "DenySessionMinter")?;
         let was_present = self.store.deny(agent_id).map_err(|e| e.to_string())?;
         tracing::info!(
             agent_id,
@@ -6066,7 +6119,7 @@ impl nexus_raft::session_mint_admin::SessionMintAdmin for DaemonSessionMintAdmin
         &self,
         caller_cert_der: Option<Vec<u8>>,
     ) -> std::result::Result<Vec<String>, String> {
-        gate_node_caller(caller_cert_der, "ListSessionMinters")?;
+        gate_node_caller(caller_cert_der, &self.peer_verifier, "ListSessionMinters")?;
         self.store.list().map_err(|e| e.to_string())
     }
 }
@@ -6076,16 +6129,17 @@ impl nexus_raft::session_mint_admin::SessionMintAdmin for DaemonSessionMintAdmin
 /// is a node/admin operation, so a bare agent cert — a pure identity — must
 /// never be leverageable into it. Shared by `FounderAgentMinter` and
 /// `DaemonKeyMinter` so both gates read identically.
-fn gate_node_caller(caller_cert_der: Option<Vec<u8>>, op: &str) -> std::result::Result<(), String> {
+fn gate_node_caller(
+    caller_cert_der: Option<Vec<u8>>,
+    verifier: &transport::grpc::ForeignCaVerifierSlot,
+    op: &str,
+) -> std::result::Result<(), String> {
     let der = caller_cert_der.ok_or_else(|| format!("{op} requires an mTLS client certificate"))?;
-    let peer = transport::peer_identity::from_der(&der)
-        .ok_or_else(|| format!("{op}: client certificate did not parse"))?;
-    if peer.node_id.is_none() {
-        return Err(format!(
-            "{op} is a node-only operation; caller {} is not a cluster node",
-            peer.display_id(),
-        ));
-    }
+    let verifier = verifier
+        .get()
+        .ok_or_else(|| format!("{op} node-only authority is not ready"))?;
+    nexus_raft::transport::current_local_node_certificate(&der, verifier.cluster_ca_der())
+        .map_err(|e| format!("{op} is a node-only operation: {e}"))?;
     Ok(())
 }
 
@@ -6150,6 +6204,7 @@ fn build_sk_record(
 struct DaemonKeyMinter {
     store: Arc<dyn kernel::hal::auth_key_store::AuthKeyStore>,
     secret: String,
+    peer_verifier: transport::grpc::ForeignCaVerifierSlot,
 }
 
 #[tonic::async_trait]
@@ -6159,7 +6214,7 @@ impl nexus_raft::key_minter::KeyMinter for DaemonKeyMinter {
         caller_cert_der: Option<Vec<u8>>,
         params: nexus_raft::key_minter::MintKeyParams,
     ) -> std::result::Result<String, String> {
-        gate_node_caller(caller_cert_der, "MintKey")?;
+        gate_node_caller(caller_cert_der, &self.peer_verifier, "MintKey")?;
         let expires_at_ms = if params.expires_at_ms == 0 {
             None
         } else {
@@ -6185,7 +6240,7 @@ impl nexus_raft::key_minter::KeyMinter for DaemonKeyMinter {
         key: Option<String>,
         key_hash: Option<String>,
     ) -> std::result::Result<bool, String> {
-        gate_node_caller(caller_cert_der, "RevokeKey")?;
+        gate_node_caller(caller_cert_der, &self.peer_verifier, "RevokeKey")?;
         match (key, key_hash) {
             (Some(key), None) => auth::revoke_key(&self.store, &self.secret, &key),
             (None, Some(hash)) => auth::revoke_key_hash(&self.store, &hash),
@@ -6198,7 +6253,7 @@ impl nexus_raft::key_minter::KeyMinter for DaemonKeyMinter {
         &self,
         caller_cert_der: Option<Vec<u8>>,
     ) -> std::result::Result<Vec<(String, Vec<u8>)>, String> {
-        gate_node_caller(caller_cert_der, "ListKeys")?;
+        gate_node_caller(caller_cert_der, &self.peer_verifier, "ListKeys")?;
         // A read of the local applied replica (no leader round-trip); on a
         // learner it returns that node's replicated records.
         self.store.list().map_err(|e| e.to_string())
@@ -6213,6 +6268,7 @@ impl nexus_raft::key_minter::KeyMinter for DaemonKeyMinter {
 /// (one store view). Node-cert gated (a cross-org trust decision is an admin op).
 struct DaemonForeignCaRegistrar {
     store: Arc<nexus_raft::foreign_ca_store::RaftForeignCaStore>,
+    peer_verifier: transport::grpc::ForeignCaVerifierSlot,
 }
 
 #[tonic::async_trait]
@@ -6224,7 +6280,7 @@ impl nexus_raft::foreign_ca_registrar::ForeignCaRegistrar for DaemonForeignCaReg
         ca_cert_pem: &[u8],
         expected_fingerprint: &str,
     ) -> std::result::Result<String, String> {
-        gate_node_caller(caller_cert_der, "RegisterForeignCa")?;
+        gate_node_caller(caller_cert_der, &self.peer_verifier, "RegisterForeignCa")?;
         let anchor =
             nexus_raft::transport::ForeignCaAnchor::from_pem(trust_domain_id, ca_cert_pem)?;
         // Out-of-band anti-swap: registering an anchor IS the trust-bootstrap
@@ -6247,7 +6303,7 @@ impl nexus_raft::foreign_ca_registrar::ForeignCaRegistrar for DaemonForeignCaReg
         caller_cert_der: Option<Vec<u8>>,
         fingerprint: &str,
     ) -> std::result::Result<bool, String> {
-        gate_node_caller(caller_cert_der, "UnregisterForeignCa")?;
+        gate_node_caller(caller_cert_der, &self.peer_verifier, "UnregisterForeignCa")?;
         self.store
             .unregister(fingerprint)
             .map_err(|e| e.to_string())
@@ -6257,7 +6313,7 @@ impl nexus_raft::foreign_ca_registrar::ForeignCaRegistrar for DaemonForeignCaReg
         &self,
         caller_cert_der: Option<Vec<u8>>,
     ) -> std::result::Result<Vec<(String, String)>, String> {
-        gate_node_caller(caller_cert_der, "ListForeignCas")?;
+        gate_node_caller(caller_cert_der, &self.peer_verifier, "ListForeignCas")?;
         let anchors = self.store.list().map_err(|e| e.to_string())?;
         Ok(anchors
             .into_iter()
@@ -6601,6 +6657,8 @@ enum DaemonOutcome {
 async fn sk_via_daemon(common: &CommonArgs, action: &AuthCmd) -> Result<DaemonOutcome> {
     let (endpoint, tls) = local_daemon_target(common)?;
     match action {
+        #[cfg(feature = "experimental-managed-agent-csr")]
+        AuthCmd::Csr { .. } => anyhow::bail!("CSR operations cannot use legacy credential routing"),
         AuthCmd::Mint {
             subject_type,
             subject_id,
@@ -6680,6 +6738,11 @@ async fn sk_via_daemon(common: &CommonArgs, action: &AuthCmd) -> Result<DaemonOu
 }
 
 async fn run_auth(common: CommonArgs, action: AuthCmd) -> Result<()> {
+    #[cfg(feature = "experimental-managed-agent-csr")]
+    let action = match action {
+        AuthCmd::Csr { action } => return csr_cli::run(common, action).await,
+        other => other,
+    };
     // Agent-cert mint (task #40): route through a LIVE cluster daemon whenever
     // one is reachable, so `auth mint --subject-type agent NAME` just-works on
     // ANY enrolled node — founder or joiner — regardless of whether the local
@@ -6768,6 +6831,10 @@ async fn run_auth(common: CommonArgs, action: AuthCmd) -> Result<()> {
 /// on the blocking pool. Owns the ZoneManager start to finish, so the data-dir lock is
 /// taken and released inside this one call.
 fn run_auth_blocking(common: CommonArgs, action: AuthCmd) -> Result<()> {
+    #[cfg(feature = "experimental-managed-agent-csr")]
+    if matches!(action, AuthCmd::Csr { .. }) {
+        anyhow::bail!("CSR operations are remote-only; no offline store may be opened");
+    }
     // Agent-cert revocation is file-based (no redb): it appends the cert's
     // serial to the founder's revoked-serial file, which the running GetCrl
     // endpoint reads live. So it takes no store lock and works while the daemon
@@ -6904,6 +6971,8 @@ fn run_auth_action(
     action: AuthCmd,
 ) -> Result<()> {
     match action {
+        #[cfg(feature = "experimental-managed-agent-csr")]
+        AuthCmd::Csr { .. } => anyhow::bail!("CSR operations cannot use the offline issuer"),
         AuthCmd::Mint {
             subject_type,
             subject_id,
@@ -7540,6 +7609,57 @@ mod tests {
         assert!(
             dup.contains("already has an active credential"),
             "unexpected dup error: {dup}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_mint_rejects_a_registered_foreign_node() {
+        use nexus_raft::agent_minter::AgentMinter;
+        use nexus_raft::transport::{generate_node_cert, generate_zone_ca};
+        let (ca, key) = generate_zone_ca("root").unwrap();
+        // Same issuer DN, different key: names cannot establish locality.
+        let (foreign, foreign_key) = generate_zone_ca("root").unwrap();
+        let (foreign_node, _) =
+            generate_node_cert(7, "root", &foreign, &foreign_key, &[], None).unwrap();
+        let der = |p: &[u8]| ::pem::parse(p).unwrap().into_contents();
+        let verifier = test_peer_verifier(&ca);
+        verifier
+            .get()
+            .unwrap()
+            .set_foreign_cas(&[lib::transport_primitives::ForeignCaAnchor::new(
+                "edge",
+                der(&foreign),
+            )])
+            .unwrap();
+        assert!(transport::peer_identity::classify_current_peer_cert(
+            &der(&foreign_node),
+            &der(&ca),
+            &verifier.get().unwrap().foreign_anchors()
+        )
+        .is_none());
+        let directory = tempfile::tempdir().unwrap();
+        let tls = directory.path().join("tls");
+        std::fs::create_dir(&tls).unwrap();
+        std::fs::write(tls.join("ca.pem"), &ca).unwrap();
+        std::fs::write(tls.join("ca-key.pem"), &key).unwrap();
+        let minter = FounderAgentMinter {
+            store: Arc::new(MemStore::default()),
+            tls_dir: tls,
+            data_dir: directory.path().to_path_buf(),
+            session_allow: nexus_raft::session_mint_allow_store::new_session_mint_allow_slot(),
+            peer_verifier: verifier,
+        };
+        assert!(
+            minter
+                .mint(
+                    Some(der(&foreign_node)),
+                    "boundary-victim",
+                    "boundary-victim",
+                    false
+                )
+                .await
+                .is_err(),
+            "registered foreign Node must not receive a local Agent certificate"
         );
     }
 

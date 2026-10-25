@@ -9,6 +9,7 @@
 //!   proto/nexus/raft/commands.proto  - Raft state machine commands
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("cargo:rerun-if-env-changed=CARGO_MANIFEST_DIR");
     // Only compile protos when grpc feature is enabled
     #[cfg(feature = "grpc")]
     {
@@ -20,14 +21,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Proto files are in project root's proto/ directory (SSOT)
-        let proto_root = "../../proto";
-        let core_proto = format!("{}/nexus/core/metadata.proto", proto_root);
+        // A shared target directory can outlive the worktree that generated
+        // its previous output. Watch absolute inputs from this invocation's
+        // manifest, not relative paths interpreted against an older root.
+        let manifest = std::path::PathBuf::from(
+            std::env::var_os("CARGO_MANIFEST_DIR").ok_or("missing manifest directory")?,
+        );
+        let proto_root = manifest
+            .parent()
+            .and_then(std::path::Path::parent)
+            .ok_or("raft manifest is not below the repository root")?
+            .join("proto");
+        let core_proto = proto_root.join("nexus/core/metadata.proto");
 
         // Skip proto compilation if proto files don't exist yet (Issue #1159)
-        if !std::path::Path::new(&core_proto).exists() {
+        if !core_proto.exists() {
             println!(
-                "cargo:warning=Proto files not found at {proto_root}, \
-                 skipping gRPC codegen. See Issue #1159."
+                "cargo:warning=Proto files not found at {}, \
+                 skipping gRPC codegen. See Issue #1159.",
+                proto_root.display()
             );
             // Create empty stub files so include!() in transport/mod.rs won't fail
             let out_dir = std::env::var("OUT_DIR")?;
@@ -43,7 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // First compile core/metadata.proto separately
         let core_protos = &[core_proto];
-        let includes = &[proto_root.to_string()];
+        let includes = std::slice::from_ref(&proto_root);
 
         tonic_prost_build::configure()
             .build_server(false)
@@ -53,8 +65,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Then compile raft protos, mapping nexus.core to the generated module
         let raft_protos = &[
-            format!("{}/nexus/raft/transport.proto", proto_root),
-            format!("{}/nexus/raft/commands.proto", proto_root),
+            proto_root.join("nexus/raft/transport.proto"),
+            proto_root.join("nexus/raft/commands.proto"),
         ];
 
         tonic_prost_build::configure()
@@ -65,19 +77,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .out_dir(std::env::var("OUT_DIR")?)
             .compile_protos(raft_protos, includes)?;
 
-        // Tell cargo to recompile if protos change
-        println!(
-            "cargo:rerun-if-changed={}/nexus/raft/transport.proto",
-            proto_root
+        let out_dir = std::path::PathBuf::from(
+            std::env::var_os("OUT_DIR").ok_or("missing output directory")?,
         );
-        println!(
-            "cargo:rerun-if-changed={}/nexus/raft/commands.proto",
-            proto_root
-        );
-        println!(
-            "cargo:rerun-if-changed={}/nexus/core/metadata.proto",
-            proto_root
-        );
+        for (source, snapshot) in [
+            ("nexus/raft/transport.proto", "raft-transport.source.proto"),
+            ("nexus/raft/commands.proto", "raft-commands.source.proto"),
+            ("nexus/core/metadata.proto", "raft-metadata.source.proto"),
+        ] {
+            let source = proto_root.join(source).canonicalize()?;
+            println!("cargo:rerun-if-changed={}", source.display());
+            std::fs::copy(source, out_dir.join(snapshot))?;
+        }
     }
 
     Ok(())
