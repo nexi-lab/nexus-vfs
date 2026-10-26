@@ -5,7 +5,9 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::Path;
 use std::ptr;
 
-use windows_sys::Win32::Foundation::{LocalFree, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{
+    LocalFree, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
+};
 use windows_sys::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SetSecurityInfo, SDDL_REVISION_1,
     SE_FILE_OBJECT,
@@ -15,8 +17,8 @@ use windows_sys::Win32::Security::{
     PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, WRITE_DAC,
+    CreateFileW, CREATE_ALWAYS, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, WRITE_DAC,
 };
 
 // OW resolves to the file's owner. P protects the DACL from broader parent
@@ -42,7 +44,28 @@ pub(super) fn open_owner_only(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+pub(super) fn create_owner_only(path: &Path) -> io::Result<File> {
+    create_with_disposition(path, &security_descriptor(OWNER_ONLY)?, CREATE_NEW)
+}
+
+pub(super) fn protect_owner_only(path: &Path) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .access_mode(GENERIC_READ | WRITE_DAC)
+        .open(path)?;
+    set_dacl(&file, OWNER_ONLY)
+}
+
 fn create_with_descriptor(path: &Path, descriptor: &SecurityDescriptor) -> io::Result<File> {
+    create_with_disposition(path, descriptor, CREATE_ALWAYS)
+}
+
+fn create_with_disposition(
+    path: &Path,
+    descriptor: &SecurityDescriptor,
+    disposition: u32,
+) -> io::Result<File> {
     // Resolve relative paths before using the verbatim prefix, retaining long
     // Unicode paths without requiring a longPathAware executable manifest.
     let absolute = std::path::absolute(path)?;
@@ -78,7 +101,7 @@ fn create_with_descriptor(path: &Path, descriptor: &SecurityDescriptor) -> io::R
             GENERIC_WRITE | WRITE_DAC,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             &attributes,
-            CREATE_ALWAYS,
+            disposition,
             FILE_ATTRIBUTE_NORMAL,
             ptr::null_mut(),
         )
@@ -245,6 +268,34 @@ mod tests {
         crate::transport_primitives::write_secret(&path, b"key").unwrap();
         assert_eq!(protected_dacl(&path), (true, "(A;;FA;;;OW)".into()));
         assert_eq!(std::fs::read(&path).unwrap(), b"key");
+    }
+
+    #[test]
+    fn create_only_secret_is_private_at_creation_and_refuses_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pending");
+        crate::transport_primitives::create_secret(&path, b"original").unwrap();
+        assert_eq!(protected_dacl(&path), (true, "(A;;FA;;;OW)".into()));
+        assert_eq!(
+            crate::transport_primitives::create_secret(&path, b"replacement")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(path).unwrap(), b"original");
+    }
+
+    #[test]
+    fn protecting_a_broad_secret_keeps_bytes_and_repairs_the_dacl() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recovered");
+        let file = create_with_descriptor(&path, &security_descriptor("D:P(A;;FA;;;WD)").unwrap())
+            .unwrap();
+        drop(file);
+        std::fs::write(&path, b"original key").unwrap();
+        crate::transport_primitives::protect_secret(&path).unwrap();
+        assert_eq!(protected_dacl(&path), (true, "(A;;FA;;;OW)".into()));
+        assert_eq!(std::fs::read(path).unwrap(), b"original key");
     }
 
     #[test]

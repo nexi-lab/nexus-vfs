@@ -86,6 +86,11 @@ pub mod search_capabilities;
 #[cfg(all(feature = "grpc", has_protos))]
 pub mod agent_minter;
 
+/// Caller-owned CSR persistence and verified credential publication. This has
+/// no issuer, transport retry, owner resolution or runtime activation policy.
+#[cfg(all(feature = "grpc", has_protos))]
+pub mod agent_csr_client;
+
 /// KeyMinter trait — lets the raft gRPC server serve `MintKey`/`RevokeKey`
 /// (`sk-` credential mint/revoke against a live daemon) without depending on
 /// `auth` or the api-key secret. The cluster profile installs the impl at boot.
@@ -163,6 +168,10 @@ pub mod transport;
 pub mod auth_key_store;
 #[cfg(all(feature = "grpc", has_protos))]
 pub mod blob_fetcher_handler;
+#[cfg(all(feature = "experimental-domain-join", has_protos))]
+pub mod collaboration_crl;
+#[cfg(all(feature = "experimental-domain-join", has_protos))]
+pub mod collaboration_store;
 /// Generic replicated cluster-control store (`PutControlState` namespaces).
 /// Shared DRY layer under `auth_key_store` and the cross-org foreign-CA registry.
 #[cfg(all(feature = "grpc", has_protos))]

@@ -181,6 +181,16 @@ mod tests {
         assert!(!store.unregister(&fp).expect("re-remove a"));
         assert_eq!(store.list().expect("list after remove").len(), 1);
 
+        let scoped = anchor("edge-collaboration", b"scope-only-ca-der").collaboration_only();
+        store.register(&scoped).expect("register scoped anchor");
+        assert_eq!(find(&scoped.fingerprint_hex()), Some(scoped.clone()));
+        let same_ca_legacy = anchor("edge-collaboration", b"scope-only-ca-der");
+        assert!(matches!(
+            store.register(&same_ca_legacy),
+            Err(ForeignCaStoreError::AlreadyRegistered { .. })
+        ));
+        assert_eq!(find(&scoped.fingerprint_hex()), Some(scoped));
+
         registry.shutdown_all();
     }
 

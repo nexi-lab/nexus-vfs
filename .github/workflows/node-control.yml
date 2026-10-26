@@ -1,0 +1,61 @@
+name: Node control authorization
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - 'rust/raft/**'
+      - 'rust/profiles/cluster/**'
+      - 'rust/managed_agent/**'
+      - 'rust/lib/src/transport_primitives/**'
+      - 'proto/nexus/raft/**'
+      - '.github/workflows/node-control.yml'
+
+jobs:
+  node-boundary:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-2022, macos-14]
+    env:
+      CARGO_BUILD_JOBS: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-protoc
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: node-control-${{ matrix.os }}
+      - run: cargo test --locked -p raft@0.1.0 --test node_rpc_boundaries
+      - run: cargo test --locked -p raft@0.1.0 --test generated_contract_binding
+      - run: cargo test --locked -p raft@0.1.0 --lib transport::node_authority::tests
+      - run: cargo test --locked -p raft@0.1.0 --lib agent_csr_client::tests
+      - run: cargo test --locked -p nexus-cluster --lib
+
+  managed-credentials:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-2022, macos-14]
+    env:
+      CARGO_BUILD_JOBS: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-protoc
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: managed-credentials-${{ matrix.os }}
+      - run: cargo test --locked -p nexus-cluster --features experimental-managed-agent-csr --lib managed_csr::tests
+      - run: cargo test --locked -p managed-agent --lib credential_binding::tests
+      - run: 'cargo test --locked -p nexus-cluster --features experimental-managed-agent-csr --lib managed_csr_binding::'
+      - run: cargo test --locked -p nexus-cluster --features experimental-managed-agent-csr --test csr_operator

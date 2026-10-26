@@ -36,10 +36,15 @@ mod common;
 use std::time::Duration;
 
 use common::{free_port_pair, mint_agent_cert, write_tls_bundle, Daemon, Vfs, LOG_FILTER};
+use lib::transport_primitives::{create_channel, ClientConfig};
+use nexus_raft::transport::proto::{
+    zone_api_service_client::ZoneApiServiceClient, AllowSessionMinterRequest,
+    ListSessionMintersRequest, MintAgentRequest,
+};
 use nexus_raft::transport::{
-    call_allow_session_minter_rpc, call_list_session_minters_rpc, call_mint_agent_rpc,
-    call_mint_session_agent_rpc, call_renew_session_agent_rpc, call_revoke_agent_cert_rpc,
-    generate_join_token, generate_zone_ca, TlsConfig,
+    call_allow_session_minter_rpc, call_list_session_minters_rpc, call_mint_session_agent_rpc,
+    call_renew_session_agent_rpc, call_revoke_agent_cert_rpc, generate_join_token,
+    generate_zone_ca, TlsConfig,
 };
 
 const ZONE: &str = "sharedzone";
@@ -47,6 +52,13 @@ const MOUNT: &str = "/agents";
 const SECRET: &str = "e2e-session-secret";
 const BUDGET: Duration = Duration::from_secs(120);
 const SESSION_SECS: u64 = 3600;
+
+fn assert_node_permission_denied<T>(result: Result<tonic::Response<T>, tonic::Status>) {
+    match result {
+        Err(status) => assert_eq!(status.code(), tonic::Code::PermissionDenied),
+        Ok(_) => panic!("an Agent reached a Node-only management operation"),
+    }
+}
 
 fn founder_env<'a>(
     data: &'a str,
@@ -145,12 +157,27 @@ async fn a_front_door_agent_mints_a_session_identity_for_a_person_and_can_revoke
     let node_tls = || Some(tls_for(&ca, &node_cert, &node_key));
 
     // ── 3. POLICY is node-gated ─────────────────────────────────────────────
-    let self_serve = call_allow_session_minter_rpc(&rpc, "moss", moss_tls(), 10)
+    // Inspect the native gRPC status: a Node-boundary refusal happens before
+    // the old in-band management result. Connection failures cannot pass.
+    let mut agent_admin = ZoneApiServiceClient::new(
+        create_channel(
+            &rpc,
+            &ClientConfig {
+                tls: moss_tls(),
+                connect_timeout: Duration::from_secs(10),
+                request_timeout: Duration::from_secs(10),
+                ..Default::default()
+            },
+        )
         .await
-        .expect("rpc reaches the daemon");
-    assert!(
-        self_serve.is_err(),
-        "an agent must not be able to add itself to the allow-list"
+        .expect("the Agent's real TLS channel is established"),
+    );
+    assert_node_permission_denied(
+        agent_admin
+            .allow_session_minter(AllowSessionMinterRequest {
+                agent_id: "moss".into(),
+            })
+            .await,
     );
 
     call_allow_session_minter_rpc(&rpc, "moss", node_tls(), 10)
@@ -164,12 +191,10 @@ async fn a_front_door_agent_mints_a_session_identity_for_a_person_and_can_revoke
         .expect("a node caller lists the allow-list");
     assert_eq!(listed, vec!["moss".to_string()]);
 
-    assert!(
-        call_list_session_minters_rpc(&rpc, moss_tls(), 10)
-            .await
-            .expect("rpc reaches the daemon")
-            .is_err(),
-        "reading the policy is node-gated too — it names who holds delegated authority"
+    assert_node_permission_denied(
+        agent_admin
+            .list_session_minters(ListSessionMintersRequest {})
+            .await,
     );
 
     // ── 4. REFUSE an agent that is not on the list ──────────────────────────
@@ -484,19 +509,13 @@ async fn a_front_door_agent_mints_a_session_identity_for_a_person_and_can_revoke
     );
 
     // ── 9. The node-only gate on MintAgent is untouched ─────────────────────
-    let escalation = call_mint_agent_rpc(&rpc, "sneaky", "sneaky", false, moss_tls(), 10)
-        .await
-        .expect("rpc reaches the daemon");
-    assert!(
-        !escalation.success,
-        "an allow-listed session minter must still not be able to mint ORDINARY agents"
-    );
-    assert!(
-        escalation
-            .error
-            .as_deref()
-            .is_some_and(|e| e.contains("node-only")),
-        "refused by the node gate, not by accident: {:?}",
-        escalation.error
+    assert_node_permission_denied(
+        agent_admin
+            .mint_agent(MintAgentRequest {
+                subject_id: "sneaky".into(),
+                display_name: "sneaky".into(),
+                allow_existing: false,
+            })
+            .await,
     );
 }
