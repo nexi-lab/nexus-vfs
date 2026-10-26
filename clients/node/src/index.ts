@@ -1219,6 +1219,108 @@ export class NexusZoneApiClient {
   }
 }
 
+interface SessionMinterResult { success: boolean; error?: string }
+interface SessionMinterList extends SessionMinterResult { agent_ids: string[] }
+interface NodeOperatorMethods {
+  AllowSessionMinter: GrpcMethod<{ agent_id: string }, SessionMinterResult>
+  DenySessionMinter: GrpcMethod<{ agent_id: string }, SessionMinterResult & { was_present: boolean }>
+  ListSessionMinters: GrpcMethod<Record<string, never>, SessionMinterList>
+  close(): void
+}
+
+export class NexusOperatorOutcomeUnknown extends Error {
+  readonly outcome = 'unknown' as const
+  constructor(readonly mutationError?: unknown, readonly reconciliationError?: unknown) {
+    super('session minter mutation outcome unknown; reconcile without resubmitting')
+    this.name = 'NexusOperatorOutcomeUnknown'
+  }
+}
+
+/** Node administration, deliberately separate from the agent-facing client.
+ * The daemon authenticates and authorizes every request; this JS type grants
+ * no authority. Keep its Node credential in the deployment operator, not Moss.
+ */
+export class NexusNodeOperatorClient {
+  readonly target: string
+  private readonly client: NodeOperatorMethods
+  private readonly timeout: number
+  private readonly calls = new Set<grpc.ClientUnaryCall>()
+  private closed = false
+
+  constructor(endpoint: string, tls: NexusVfsTlsConfig, options: Omit<NexusVfsClientOptions, 'tls'> = {}) {
+    if (!tls) throw new Error('node administration requires explicit mTLS')
+    const Service = zoneApiConstructor()
+    const connection = dial(endpoint, { ...options, tls })
+    this.target = connection.target
+    this.timeout = options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS
+    this.client = new Service(connection.target, connection.credentials, connection.channelOptions) as unknown as NodeOperatorMethods
+  }
+
+  private open(): void {
+    if (this.closed) throw new Error('nexus node operator client is closed')
+  }
+
+  async listSessionMinters(): Promise<string[]> {
+    this.open()
+    const result = await invoke(this.client, this.client.ListSessionMinters, 'list session minters', {}, this.timeout, this.calls)
+    if (!result.success) throw new Error(`list session minters failed: ${result.error || 'no reason given'}`)
+    return result.agent_ids
+  }
+
+  /** One mutation attempt; errors do not prove that the grant was not applied. */
+  async allowSessionMinter(agentId: string): Promise<void> {
+    this.open()
+    if (!agentId) throw new Error('session minter agent id must not be empty')
+    const result = await invoke(this.client, this.client.AllowSessionMinter, 'allow session minter', { agent_id: agentId }, this.timeout, this.calls)
+    if (!result.success) throw new Error(`allow session minter failed: ${result.error || 'no reason given'}`)
+  }
+
+  async denySessionMinter(agentId: string): Promise<boolean> {
+    this.open()
+    if (!agentId) throw new Error('session minter agent id must not be empty')
+    const result = await invoke(this.client, this.client.DenySessionMinter, 'deny session minter', { agent_id: agentId }, this.timeout, this.calls)
+    if (!result.success) throw new Error(`deny session minter failed: ${result.error || 'no reason given'}`)
+    return result.was_present
+  }
+
+  /** Reconcile by reading; never retry an ambiguous mutation. Presence proves
+   * the current allow-list state, not which writer established it.
+   */
+  async ensureSessionMinter(agentId: string): Promise<{
+    agentId: string; present: true; mutationSubmitted: boolean;
+    mutationResponse: 'not-needed' | 'confirmed' | 'unknown'; automaticResend: false;
+    mutationError?: { message: string; code?: number; status?: string }
+  }> {
+    if (!agentId) throw new Error('session minter agent id must not be empty')
+    if ((await this.listSessionMinters()).includes(agentId)) {
+      return { agentId, present: true, mutationSubmitted: false, mutationResponse: 'not-needed', automaticResend: false }
+    }
+    let mutationResponse: 'confirmed' | 'unknown' = 'confirmed'
+    let mutationError: { message: string; code?: number; status?: string } | undefined
+    let mutationFailure: unknown
+    try { await this.allowSessionMinter(agentId) } catch (error) {
+      mutationFailure = error
+      mutationResponse = 'unknown'
+      mutationError = { message: error instanceof Error ? error.message : 'mutation response unavailable',
+        ...(error instanceof NexusRpcError ? { code: error.code, status: error.status } : {}) }
+    }
+    // A read failure or a missing entry leaves the mutation outcome Unknown.
+    let present: boolean
+    try { present = (await this.listSessionMinters()).includes(agentId) }
+    catch (error) { throw new NexusOperatorOutcomeUnknown(mutationFailure, error) }
+    if (!present) throw new NexusOperatorOutcomeUnknown(mutationFailure)
+    return { agentId, present: true, mutationSubmitted: true, mutationResponse, automaticResend: false,
+      ...(mutationError ? { mutationError } : {}) }
+  }
+
+  close(): void {
+    this.closed = true
+    for (const call of this.calls) call.cancel()
+    this.calls.clear()
+    this.client.close()
+  }
+}
+
 /**
  * Bytes pass through; a string is a path to read them from. A credential that
  * was minted in memory therefore needs no temporary file, which is what lets
