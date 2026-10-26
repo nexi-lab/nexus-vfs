@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use ahash::AHashSet;
+use lib::file_durability::{sync_directory, sync_directory_ancestors, PublishedButNotDurable};
 use tempfile::TempPath;
 
 /// Map content hash to CAS blob key: `cas/{h[0..2]}/{h[2..4]}/{hash}`.
@@ -32,10 +33,10 @@ pub(crate) fn blob_key(content_id: &str) -> String {
 /// can leave a partial file at the final hash path. Stream the existing bytes
 /// before accepting them, and propagate errors rather than overwriting them.
 /// This is an integrity check, not an atomic publication/reservation primitive.
-fn validated_existing_blob(path: &Path, content_id: &str) -> io::Result<bool> {
+fn validated_existing_blob(path: &Path, content_id: &str) -> io::Result<Option<std::fs::File>> {
     let mut file = match std::fs::File::open(path) {
         Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
     let mut hasher = blake3::Hasher::new();
@@ -53,7 +54,14 @@ fn validated_existing_blob(path: &Path, content_id: &str) -> io::Result<bool> {
             "existing CAS object does not match its content hash",
         ));
     }
-    Ok(true)
+    Ok(Some(file))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WriteDurability {
+    Buffered,
+    File,
+    FileAndDirectory,
 }
 
 /// Pure Rust CAS transport for local filesystem blob I/O.
@@ -63,7 +71,7 @@ fn validated_existing_blob(path: &Path, content_id: &str) -> io::Result<bool> {
 #[allow(dead_code)]
 pub struct LocalCASTransport {
     root: PathBuf,
-    fsync_on_write: bool,
+    durability: WriteDurability,
     /// Monotonic parent-directory cache — once a CAS two-level dir exists,
     /// it is never deleted during normal operation. Matches Python
     /// `LocalTransport._known_parents`.
@@ -76,10 +84,43 @@ impl LocalCASTransport {
     ///
     /// The root directory is created if it does not exist.
     pub fn new(root_path: &Path, fsync_on_write: bool) -> io::Result<Self> {
+        let durability = if fsync_on_write {
+            WriteDurability::File
+        } else {
+            WriteDurability::Buffered
+        };
+        Self::with_durability(root_path, durability)
+    }
+
+    /// Open storage with file and namespace barriers for complete publication.
+    ///
+    /// Linux supplies this mode's file and directory barriers. The filesystem
+    /// must provide persistent backing and honor successful fsync barriers.
+    /// Other platforms return Unsupported before creating the root. A write
+    /// error may contain PublishedButNotDurable after a complete object becomes
+    /// visible; retry verifies and synchronizes that object without replacing it.
+    pub fn new_durable(root_path: &Path) -> io::Result<Self> {
+        if !cfg!(target_os = "linux") {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "complete CAS durability is not qualified on this platform",
+            ));
+        }
+        Self::with_durability(root_path, WriteDurability::FileAndDirectory)
+    }
+
+    fn with_durability(root_path: &Path, durability: WriteDurability) -> io::Result<Self> {
         std::fs::create_dir_all(root_path)?;
+        let root = if durability == WriteDurability::FileAndDirectory {
+            let root = root_path.canonicalize()?;
+            sync_directory_ancestors(&root, None)?;
+            root
+        } else {
+            root_path.to_path_buf()
+        };
         Ok(Self {
-            root: root_path.to_path_buf(),
-            fsync_on_write,
+            root,
+            durability,
             known_parents: Mutex::new(AHashSet::new()),
         })
     }
@@ -111,6 +152,9 @@ impl LocalCASTransport {
 
         // Slow path: mkdir + insert into cache
         std::fs::create_dir_all(parent)?;
+        if self.durability == WriteDurability::FileAndDirectory {
+            sync_directory_ancestors(parent, Some(&self.root))?;
+        }
         {
             let mut cache = self.known_parents.lock().unwrap();
             cache.insert(parent_str);
@@ -119,8 +163,8 @@ impl LocalCASTransport {
     }
 
     /// Stage complete bytes beside their destination so publication stays on
-    /// one filesystem. File syncing precedes visibility; directory durability
-    /// is a separate guarantee.
+    /// one filesystem. File syncing precedes visibility. Strong mode prepares
+    /// the parent chain before publication and synchronizes its entry afterward.
     fn stage_file(&self, path: &Path, content: &[u8]) -> io::Result<TempPath> {
         self.ensure_parent(path)?;
         let parent = path
@@ -142,27 +186,54 @@ impl LocalCASTransport {
                 options.open(path)
             })?;
         staged.as_file_mut().write_all(content)?;
-        if self.fsync_on_write {
+        if self.durability != WriteDurability::Buffered {
             staged.as_file().sync_all()?;
         }
         // Publication needs the owned path, rather than an open writer handle.
         Ok(staged.into_temp_path())
     }
 
+    fn sync_published(&self, path: &Path) -> io::Result<()> {
+        if self.durability == WriteDurability::FileAndDirectory {
+            let parent = path.parent().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "CAS path has no parent")
+            })?;
+            sync_directory(parent).map_err(PublishedButNotDurable::into_io_error)?;
+        }
+        Ok(())
+    }
+
+    fn confirm_existing_blob(&self, path: &Path, content_id: &str) -> io::Result<bool> {
+        let Some(file) = validated_existing_blob(path, content_id)? else {
+            return Ok(false);
+        };
+        if self.durability == WriteDurability::FileAndDirectory {
+            self.ensure_parent(path)
+                .map_err(PublishedButNotDurable::into_io_error)?;
+            file.sync_all()
+                .map_err(PublishedButNotDurable::into_io_error)?;
+            self.sync_published(path)?;
+        }
+        Ok(true)
+    }
+
     /// Publish an already verified hash without replacing a concurrent winner.
     fn publish_blob(&self, content: &[u8], content_id: &str) -> io::Result<bool> {
         let path = self.resolve(&blob_key(content_id));
-        if validated_existing_blob(&path, content_id)? {
+        if self.confirm_existing_blob(&path, content_id)? {
             return Ok(false);
         }
 
         match self.stage_file(&path, content)?.persist_noclobber(&path) {
-            Ok(_) => Ok(true),
+            Ok(_) => {
+                self.sync_published(&path)?;
+                Ok(true)
+            }
             Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
                 // Drop only our candidate. A concurrent writer owns the final
                 // path; absence after the collision is not a successful dedup.
                 drop(error);
-                if validated_existing_blob(&path, content_id)? {
+                if self.confirm_existing_blob(&path, content_id)? {
                     Ok(false)
                 } else {
                     Err(io::Error::new(
@@ -253,6 +324,7 @@ impl LocalCASTransport {
         // FileRenameInfoEx as well as the normal rename path on Unix.
         std::fs::rename(&staged, &path)?;
         staged.disable_cleanup(true);
+        self.sync_published(&path)?;
         Ok(())
     }
 
