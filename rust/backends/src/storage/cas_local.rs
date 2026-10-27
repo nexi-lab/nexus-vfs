@@ -25,6 +25,24 @@ impl CasLocalBackend {
         Ok(Self(CASEngine::new(transport)))
     }
 
+    /// Publish complete immutable objects with file and directory barriers.
+    ///
+    /// The transport owns platform qualification and publication-state errors.
+    /// Storage must provide persistent backing and honor successful barriers.
+    pub fn new_durable(root: &Path) -> io::Result<Self> {
+        let transport = LocalCASTransport::new_durable(root)?;
+        Ok(Self(CASEngine::new(transport)))
+    }
+
+    /// Attach the existing immutable hash/chunk fetcher to this backend.
+    pub fn with_fetcher(
+        mut self,
+        fetcher: std::sync::Arc<dyn kernel::cas_remote::RemoteChunkFetcher>,
+    ) -> Self {
+        self.0.set_fetcher(fetcher);
+        self
+    }
+
     /// Build a backend with a scatter-gather fetcher pre-wired. Used by
     /// `add_mount` so every per-mount `CASEngine` can fall through to
     /// peer RPCs on local chunk miss.
@@ -33,10 +51,7 @@ impl CasLocalBackend {
         fsync: bool,
         fetcher: std::sync::Arc<dyn kernel::cas_remote::RemoteChunkFetcher>,
     ) -> io::Result<Self> {
-        let transport = LocalCASTransport::new(root, fsync)?;
-        let mut engine = CASEngine::new(transport);
-        engine.set_fetcher(fetcher);
-        Ok(Self(engine))
+        Ok(Self::new(root, fsync)?.with_fetcher(fetcher))
     }
 }
 
