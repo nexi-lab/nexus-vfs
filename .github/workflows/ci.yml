@@ -57,6 +57,8 @@ jobs:
           shared-key: ci-cas-publication-${{ matrix.os }}
       - name: CAS complete publication on the native filesystem
         run: cargo test -p kernel --test cas_publication
+      - name: Durable CAS ObjectStore composition
+        run: cargo test -p backends --no-default-features --features driver-cas-local --test cas_durable_backend
 
   secret-file-permissions:
     name: Secret file permissions / ${{ matrix.os }}
