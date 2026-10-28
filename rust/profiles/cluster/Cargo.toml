@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [features]
 default = []
+driver-cas-local = ["backends/driver-cas-local"]
 experimental-managed-agent-csr = ["dep:sha2"]
 rebac = ["dep:nexus-rebac"]
 http-api = ["rebac", "dep:nexus-http-api", "nexus-http-api/rebac", "nexus-search-common/transport"]

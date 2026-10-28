@@ -94,7 +94,13 @@ An unsuccessful comparison may leave an unreachable staged object, never changed
 visible content. Keep the existing CAS retention/GC ownership; do not delete an
 object that a concurrent reader or another file can still reference. The current
 cluster profile compiles PathLocalBackend by default; `driver-cas-local` and its
-mount/durability configuration also need explicit opt-in and acceptance.
+mount/durability configuration use explicit opt-in. The cluster's
+`driver-cas-local` feature enables the existing runtime backend configuration
+door for both local CAS policies. `backend_type: "cas-local-durable"` selects
+complete immutable publication with file and directory barriers on qualified
+Linux storage. Its constructor owns those barriers; `fsync` is a parameter of
+the file-only `cas-local` policy. Older factories refuse the distinct durable
+type. Runtime configuration restores the same mount after process restart.
 
 PathLocalBackend instead truncates a live path. The cluster currently uses it
 for both the root mount and federation cache. It cannot truthfully implement the

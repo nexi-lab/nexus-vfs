@@ -60,6 +60,26 @@ jobs:
       - name: Durable CAS ObjectStore composition
         run: cargo test -p backends --no-default-features --features driver-cas-local --test cas_durable_backend
 
+  durable-runtime:
+    name: Durable CAS user runtime / Linux
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    env:
+      CARGO_BUILD_JOBS: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-protoc
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-durable-runtime-linux
+      - name: Required backend availability at startup
+        run: cargo test --locked -p nexus-cluster --test user_runtime required_durable_backend_obeys_build_and_platform_at_startup
+      - name: Durable mount, owner confinement and process recovery
+        run: cargo test --locked -p nexus-cluster --features driver-cas-local --test user_runtime durable_cas_mount_reopens_immutable_content_with_the_owner_boundary
+
   secret-file-permissions:
     name: Secret file permissions / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
