@@ -245,6 +245,8 @@ peer's identity. Incremental EC and snapshot ingress check `sender_node_id`
 before applying metadata or acknowledging progress. Raft messages are decoded
 once for both admission and consensus execution.
 
+Enrollment and restart use the [persisted Node identity](federation-architecture.md#631-bootstrap).
+
 Managed-class activation builds on that authenticated sender to evaluate its
 class proof, votes and ACKs. Its policy covers current class support and
 membership at joins, snapshots, reopen and live-message boundaries. The

@@ -179,6 +179,15 @@ Path resolution across zones is **all local** (~5us per hop) because mounting = 
 
 Etcd / TiKV-style opaque IDs + leader-driven `AddNode`.
 
+Automatic enrollment and the explicit `enroll` command certify the same Node ID
+that daemon startup loads from the data directory. Restart retains the issued
+certificate and Raft membership. Startup verifies the certificate's Node ID
+before opening zone storage. The operator renews a mismatched certificate with
+`enroll <founder-address> <join-token>` using the existing data directory; the
+persisted Node ID and consensus state remain authoritative.
+For a rolling upgrade, renew mismatched certificates on the sending nodes before
+updating receivers that enforce the certificate-to-sender binding.
+
 - **Identity** — `node_id` is an opaque random `u64` minted at first daemon boot, persisted as 8 bytes BE u64 to `<NEXUS_DATA_DIR>/.node_id`.  Decoupling identity from hostname lets a wiped follower rejoin under a fresh ID; the leader's `Progress[new_id]` is created with `matched=0` by `AddNode`, so the first heartbeat carries `m.commit=0` — within `RaftLog::commit_to`'s safe range on a fresh follower (`last_index=0`).  Pinned by [`test_handle_heartbeat_on_empty_follower_with_stale_commit_panics`](../../rust/raft/src/raft/storage.rs).  `<NEXUS_DATA_DIR>` wipe MUST rotate `node_id` — reusing the old id against a leader that still remembers `Progress[old_id].matched > 0` trips exactly this panic (heartbeat commit lands above the fresh follower's `last_index=0`).
 - **Address book** — `NEXUS_PEERS` (or `--peers`) is a hostname → endpoint mapping for OTHER nodes only that seeds the transport peer map.  Entries are `"host:port"` strings — peer `node_id` is opaque, random per boot, and never carried in the address book (`learn_peer_address` in `rust/raft/src/transport/server.rs` populates the real id from the first inbound raft message).  Persisted separately at node-bound `identity.json` (Windows `%LOCALAPPDATA%\Nexus\identity.json`, macOS `~/Library/Application Support/Nexus/identity.json`, Linux `$XDG_DATA_HOME/nexus/identity.json`) so a cache-cleaner removing `<NEXUS_DATA_DIR>` does not force the operator to re-specify `--peers` on next boot.  Boot merges CLI/env peers with identity's persisted `peers[]` and rewrites identity monotonically when the CLI set widens.  Self joins the cluster through `create_zone(self)` (founder) or `AddNode(self)` on the leader (joiner) — never through the address book.  Boot fails loud (`peer list contains self ...`) when the merged peer list includes the local node so the joiner-loop self-RPC stall surfaces at parse time, not after `Zone 'root' registered`.  `ConfState` lives in raft storage and is mutated only by `ConfChange` (AddNode / RemoveNode) driven by JoinZone; `identity.json`'s `peers[]` is a *transport seed*, not a `ConfState` shadow.
 

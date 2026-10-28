@@ -33,6 +33,34 @@ const BUDGET: Duration = Duration::from_secs(120);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_certless_node_auto_enrolls_at_boot_then_federates_over_mtls() {
+    enrollment_journey(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pre_enrolled_node_keeps_its_identity_across_federation_and_restart() {
+    enrollment_journey(true).await;
+}
+
+fn assert_enrolled_identity(data: &str) -> (Vec<u8>, Vec<u8>) {
+    let root = std::path::Path::new(data);
+    let id = std::fs::read(root.join(".node_id"))
+        .expect("enrollment must persist the authoritative Raft Node ID");
+    let node_id = u64::from_be_bytes(id.as_slice().try_into().expect("8-byte Node ID"));
+    let cert = std::fs::read(root.join("tls/node.pem")).unwrap();
+    let ca = std::fs::read(root.join("tls/ca.pem")).unwrap();
+    let identity = nexus_raft::transport::current_local_node_certificate(
+        ::pem::parse(&cert).unwrap().contents(),
+        ::pem::parse(&ca).unwrap().contents(),
+    )
+    .unwrap();
+    assert_eq!(
+        identity.node_id, node_id,
+        "enrollment must certify the persisted Raft Node ID"
+    );
+    (id, cert)
+}
+
+async fn enrollment_journey(is_pre_enrolled: bool) {
     let zone_registered = format!("Zone '{ZONE}' registered");
     let tmp = tempfile::tempdir().expect("tempdir");
     let fdata = tmp.path().join("f-data").to_string_lossy().into_owned();
@@ -129,8 +157,46 @@ async fn a_certless_node_auto_enrolls_at_boot_then_federates_over_mtls() {
         ("NEXUS_JOIN_TOKEN", token.as_str()),
         ("RUST_LOG", LOG_FILTER),
     ];
+    let provisioned = if is_pre_enrolled {
+        let persisted_id =
+            nexus_raft::distributed_coordinator::read_or_mint_node_id(&jdata).unwrap();
+        let mismatched_id = persisted_id.wrapping_add(1).max(1);
+        let founder_tls = std::path::Path::new(&fdata).join("tls");
+        let cluster_ca = std::fs::read(founder_tls.join("ca.pem")).unwrap();
+        let cluster_key = std::fs::read(founder_tls.join("ca-key.pem")).unwrap();
+        let (legacy_cert, legacy_key) = nexus_raft::transport::generate_node_cert(
+            mismatched_id,
+            "root",
+            &cluster_ca,
+            &cluster_key,
+            &[],
+            None,
+        )
+        .unwrap();
+        let legacy_tls = std::path::Path::new(&jdata).join("tls");
+        std::fs::create_dir_all(&legacy_tls).unwrap();
+        std::fs::write(legacy_tls.join("ca.pem"), &cluster_ca).unwrap();
+        std::fs::write(legacy_tls.join("node.pem"), &legacy_cert).unwrap();
+        lib::transport_primitives::write_secret(&legacy_tls.join("node-key.pem"), &legacy_key)
+            .unwrap();
+        let (ok, _, error) = cli(&joiner_env, &["enroll", &fadv, &token]);
+        assert!(ok, "explicit enrollment failed: {error}");
+        let repaired = assert_enrolled_identity(&jdata);
+        assert_eq!(repaired.0, persisted_id.to_be_bytes());
+        assert_ne!(repaired.1, legacy_cert);
+        Some(repaired)
+    } else {
+        None
+    };
     let mut joiner = Daemon::spawn(&["--bind-addr", &jadv], &joiner_env);
     let joined = joiner.wait_for_log(&zone_registered, BUDGET).await;
+    let enrolled = assert_enrolled_identity(&jdata);
+    if let Some(provisioned) = provisioned {
+        assert_eq!(
+            provisioned, enrolled,
+            "boot must reuse the enrolled identity"
+        );
+    }
 
     // The boot-time auto-enroll must have written an issued identity — but NOT
     // the CA key (an enrolled node is not a CA).
@@ -180,6 +246,26 @@ async fn a_certless_node_auto_enrolls_at_boot_then_federates_over_mtls() {
         tail(&joiner),
     );
 
+    joiner
+        .wait_for_log("VFS data plane ready", BUDGET)
+        .await
+        .expect("enrolled joiner completes replication and serves");
+    let (ok, _, error) = cli(&joiner_env, &["auth", "list"]);
+    assert!(ok, "joiner reads its live replicated auth state: {error}");
+
     drop(joiner);
+    let mut restarted = Daemon::spawn(&["--bind-addr", &jadv], &joiner_env);
+    restarted
+        .wait_for_log("VFS data plane ready", BUDGET)
+        .await
+        .expect("enrolled joiner restores its existing membership");
+    assert_eq!(enrolled, assert_enrolled_identity(&jdata));
+    assert!(!restarted.drain().contains("auto-enroll complete"));
+    let (ok, _, error) = cli(&joiner_env, &["auth", "list"]);
+    assert!(
+        ok,
+        "restarted joiner reads its live replicated auth state: {error}"
+    );
+    drop(restarted);
     drop(founder);
 }

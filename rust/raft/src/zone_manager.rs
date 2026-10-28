@@ -347,8 +347,7 @@ impl ZoneManager {
     /// it seeds the transport peer map for raft messaging but is **not**
     /// the source of truth for ConfState — ConfState is mutated only
     /// by ConfChange (AddNode / RemoveNode) driven by JoinZone.  The
-    /// witness binary path uses [`Self::new`] which derives the ID
-    /// from hostname (witnesses don't wipe-rejoin).
+    /// Callers that supply an explicit ID also supply its matching TLS identity.
     /// `self_address` is this node's advertise address (e.g.,
     /// `"http://10.0.0.3:2126"` or `"10.0.0.3:2126"`).  Carried in every
     /// outbound `StepMessageRequest.sender_address` so peers learn
@@ -478,6 +477,19 @@ impl ZoneManager {
                     e
                 ))
             })?;
+            let cert_der = lib::transport_primitives::first_certificate_der(&cert_pem, "Node")
+                .map_err(RaftError::Config)?;
+            let ca_der = lib::transport_primitives::first_certificate_der(&ca_pem, "cluster CA")
+                .map_err(RaftError::Config)?;
+            let identity = crate::transport::current_local_node_certificate(&cert_der, &ca_der)
+                .map_err(RaftError::Config)?;
+            if identity.node_id != node_id {
+                return Err(RaftError::Config(format!(
+                    "Node certificate identifies {}, but the configured Raft Node ID is {node_id}; \
+                     renew the certificate with `enroll` against the founder using this data directory",
+                    identity.node_id
+                )));
+            }
             Some(TlsConfig {
                 cert_pem,
                 key_pem,
@@ -2226,15 +2238,13 @@ impl Drop for ZoneManager {
 
 /// K3s-style join: connect to leader with TOFU TLS, verify CA
 /// fingerprint from the join token, write `ca.pem` / `node.pem` /
-/// `node-key.pem` into `tls_dir`. Called BEFORE ZoneManager exists.
+/// `node-key.pem` into `<data_dir>/tls`. Enrollment and ZoneManager use the same
+/// persisted opaque Node ID. Called BEFORE ZoneManager exists.
 pub fn join_cluster_and_provision_tls(
     peer_address: &str,
     join_token: &str,
-    hostname: &str,
-    tls_dir: &str,
+    data_dir: &std::path::Path,
 ) -> Result<()> {
-    let node_id = hostname_to_node_id(hostname);
-
     let token_prefix = "K10";
     let separator = "::server:";
     if !join_token.starts_with(token_prefix) {
@@ -2259,6 +2269,12 @@ pub fn join_cluster_and_provision_tls(
             "Invalid join token: fingerprint must start with 'SHA256:'".to_string(),
         ));
     }
+
+    let data_path = data_dir
+        .to_str()
+        .ok_or_else(|| RaftError::Config("data directory must be UTF-8".into()))?;
+    let node_id = crate::distributed_coordinator::read_or_mint_node_id(data_path)
+        .map_err(RaftError::Config)?;
 
     let endpoint = if peer_address.starts_with("http") {
         peer_address.to_string()
@@ -2298,8 +2314,8 @@ pub fn join_cluster_and_provision_tls(
         )));
     }
 
-    let dir = std::path::Path::new(tls_dir);
-    std::fs::create_dir_all(dir)
+    let dir = data_dir.join("tls");
+    std::fs::create_dir_all(&dir)
         .map_err(|e| RaftError::Config(format!("Failed to create TLS dir: {}", e)))?;
 
     std::fs::write(dir.join("ca.pem"), &result.ca_pem)
@@ -2326,6 +2342,44 @@ pub fn join_cluster_and_provision_tls(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn mismatched_node_certificate_is_refused_before_opening_zone_storage() {
+        let directory = TempDir::new().unwrap();
+        let data = directory.path().join("data");
+        let (ca, ca_key) = crate::transport::generate_zone_ca("root").unwrap();
+        let (cert, key) =
+            crate::transport::generate_node_cert(7, "root", &ca, &ca_key, &[], None).unwrap();
+        let files = TlsFiles {
+            cert_path: directory.path().join("node.pem"),
+            key_path: directory.path().join("node-key.pem"),
+            ca_path: directory.path().join("ca.pem"),
+            ca_key_path: None,
+            join_token_hash: None,
+        };
+        std::fs::write(&files.cert_path, &cert).unwrap();
+        lib::transport_primitives::write_secret(&files.key_path, &key).unwrap();
+        std::fs::write(&files.ca_path, &ca).unwrap();
+        let result = ZoneManager::with_node_id(
+            "test-host",
+            9,
+            data.to_str().unwrap(),
+            Vec::new(),
+            "127.0.0.1:0",
+            Some(files.clone()),
+            None,
+            None,
+        );
+        let Err(RaftError::Config(error)) = result else {
+            panic!("mismatched certificate must fail before starting the node");
+        };
+        assert!(error.contains("configured Raft Node ID is 9"), "{error}");
+        assert!(
+            !data.exists(),
+            "refusal must leave existing zone storage alone"
+        );
+        assert_eq!(std::fs::read(files.cert_path).unwrap(), cert);
+    }
 
     /// Reusable ZoneManager fixture binding to an OS-allocated port so
     /// parallel tests don't collide.  Tests must drop the returned

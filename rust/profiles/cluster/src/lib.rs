@@ -1524,9 +1524,7 @@ fn enrollment_failure(
 /// writes the bundle into `<data-dir>/tls/`. Usually unnecessary — the daemon
 /// auto-enrolls from `--token` at boot; this only pre-provisions the cert.
 fn run_enroll(common: &CommonArgs, peer_addr: &str, token: &str) -> Result<()> {
-    let hostname = resolve_hostname(common.hostname.as_deref());
     let tls_dir = common.data_dir.join("tls");
-    let tls_dir_str = tls_dir.to_str().context("tls dir must be UTF-8")?;
     let enroll_target = enroll_port_addr(peer_addr)?;
     // Establish reachability before the handshake, so a failure past this point
     // is provably not the network.
@@ -1534,14 +1532,15 @@ fn run_enroll(common: &CommonArgs, peer_addr: &str, token: &str) -> Result<()> {
     if !matches!(probe, EnrollmentBlock::Handshake(_)) {
         return Err(enrollment_failure(peer_addr, &enroll_target, probe));
     }
-    nexus_raft::join_cluster_and_provision_tls(&enroll_target, token, &hostname, tls_dir_str)
-        .map_err(|e| {
+    nexus_raft::join_cluster_and_provision_tls(&enroll_target, token, &common.data_dir).map_err(
+        |e| {
             enrollment_failure(
                 peer_addr,
                 &enroll_target,
                 EnrollmentBlock::Handshake(e.to_string()),
             )
-        })?;
+        },
+    )?;
     eprintln!(
         "enrolled: cluster cert written to {}. This node can now boot into the mTLS \
          federation — set `--peers <cluster-member>` and start it normally.",
@@ -2255,11 +2254,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
             let data_plane_addr = first_peer.to_operator_str();
             let enroll_target = enroll_port_addr(&data_plane_addr)?;
             let token = common.token.clone().expect("token present by guard");
-            let tls_dir_str = tls_dir
-                .to_str()
-                .context("tls dir must be UTF-8")?
-                .to_string();
-            let hostname_for_enroll = hostname.clone();
+            let data_dir_for_enroll = common.data_dir.clone();
             tracing::info!(%enroll_target, "no cluster cert on disk — auto-enrolling at boot");
             // Same probe-then-handshake split as the `enroll` subcommand: a
             // boot that dies here is the most expensive place to get a vague
@@ -2275,8 +2270,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
                 nexus_raft::join_cluster_and_provision_tls(
                     &target_for_task,
                     &token,
-                    &hostname_for_enroll,
-                    &tls_dir_str,
+                    &data_dir_for_enroll,
                 )
             })
             .await
