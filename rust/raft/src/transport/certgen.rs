@@ -619,8 +619,9 @@ pub struct BootstrapTls {
 /// `ZoneManager._auto_generate_tls`.
 ///
 /// `zone_id` is the root zone id (used in CA CN); `hostname` is the
-/// node's hostname (used in node cert CN + SAN). `node_id` is the
-/// hostname-derived numeric id used in node cert CN.
+/// node's display hostname (used in node cert CN + SAN). `node_id` is the
+/// caller's Raft identity; daemon enrollment and startup load it from the
+/// existing data-directory identity store.
 pub fn bootstrap_tls(
     base_path: &Path,
     zone_id: &str,

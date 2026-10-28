@@ -36,6 +36,9 @@ jobs:
       - run: cargo test --locked -p raft@0.1.0 --lib transport::node_authority::tests
       - run: cargo test --locked -p raft@0.1.0 --lib agent_csr_client::tests
       - run: cargo test --locked -p nexus-cluster --lib
+      - run: cargo test --locked -p raft@0.1.0 --lib zone_manager::tests::mismatched_node_certificate
+      - name: Enroll, replicate credentials and restore the same Node identity
+        run: cargo test --locked -p nexus-cluster --test node_enrollment --test cross_node_sk_replication -- --test-threads=1
 
   managed-credentials:
     runs-on: ${{ matrix.os }}
