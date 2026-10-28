@@ -11,7 +11,7 @@ use tonic::{
     codegen::{http, BoxFuture, Service},
     server::NamedService,
     transport::server::{TcpConnectInfo, TlsConnectInfo},
-    Status,
+    Request, Status,
 };
 use x509_parser::{certificate::X509Certificate, extensions::GeneralName, prelude::FromDer};
 
@@ -22,6 +22,58 @@ pub struct LocalNodeCertificate {
     pub node_id: u64,
     pub zone_id: String,
     pub serial: Vec<u8>,
+}
+
+/// A Node ID taken from the actual authenticated TLS connection.
+#[derive(Clone)]
+struct AuthenticatedNodeId(u64);
+
+fn authenticated_node_id<T>(request: &Request<T>) -> Result<Option<u64>, Status> {
+    if let Some(peer) = request.extensions().get::<AuthenticatedNodeId>() {
+        return Ok(Some(peer.0));
+    }
+    if request
+        .extensions()
+        .get::<TlsConnectInfo<TcpConnectInfo>>()
+        .is_some()
+    {
+        return Err(Status::permission_denied(
+            "message requires an authenticated local Node",
+        ));
+    }
+    Ok(None)
+}
+
+/// Bind an EC sender to its connection before applying or acknowledging data.
+pub(super) fn authorize_ec_sender<T>(request: &Request<T>, sender: u64) -> Result<(), Status> {
+    if authenticated_node_id(request)?.is_some_and(|peer| peer != sender) {
+        return Err(Status::permission_denied(
+            "message sender does not match the authenticated Node",
+        ));
+    }
+    Ok(())
+}
+
+/// Preserve raft-rs request relaying and return the actual transport peer.
+pub(super) fn authorize_raft_sender<T>(
+    request: &Request<T>,
+    message: &raft::eraftpb::Message,
+) -> Result<u64, Status> {
+    let Some(peer) = authenticated_node_id(request)? else {
+        return Ok(message.from);
+    };
+    let is_relayed_request = matches!(
+        message.get_msg_type(),
+        raft::eraftpb::MessageType::MsgPropose
+            | raft::eraftpb::MessageType::MsgReadIndex
+            | raft::eraftpb::MessageType::MsgTransferLeader
+    );
+    if message.from != peer && (!is_relayed_request || message.from == 0) {
+        return Err(Status::permission_denied(
+            "Raft sender does not match the authenticated Node",
+        ));
+    }
+    Ok(peer)
 }
 
 /// Verify against the configured LOCAL cluster anchor, never the union of
@@ -88,11 +140,11 @@ impl NodeControlPolicy {
                 .transpose()?,
         })
     }
-    fn check(&self, extensions: &http::Extensions) -> Result<(), Status> {
+    fn check(&self, extensions: &http::Extensions) -> Result<Option<AuthenticatedNodeId>, Status> {
         // Explicit plaintext/development listeners retain their old contract.
         // They must not host the protected collaboration namespace.
         let Some(ca) = &self.local_ca else {
-            return Ok(());
+            return Ok(None);
         };
         let certs = extensions
             .get::<TlsConnectInfo<TcpConnectInfo>>()
@@ -104,7 +156,7 @@ impl NodeControlPolicy {
             .first()
             .ok_or_else(|| Status::permission_denied("missing Node mTLS leaf"))?;
         current_local_node_certificate(leaf.as_ref(), ca)
-            .map(|_| ())
+            .map(|peer| Some(AuthenticatedNodeId(peer.node_id)))
             .map_err(|_| {
                 Status::permission_denied("Raft control requires a current local Node certificate")
             })
@@ -146,10 +198,14 @@ where
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
     }
-    fn call(&mut self, request: http::Request<Body>) -> Self::Future {
+    fn call(&mut self, mut request: http::Request<Body>) -> Self::Future {
         if !self.delegated.iter().any(|p| p == request.uri().path()) {
-            if let Err(status) = self.policy.check(request.extensions()) {
-                return Box::pin(async move { Ok(status.into_http()) });
+            match self.policy.check(request.extensions()) {
+                Ok(Some(peer)) => {
+                    request.extensions_mut().insert(peer);
+                }
+                Ok(None) => {}
+                Err(status) => return Box::pin(async move { Ok(status.into_http()) }),
             }
         }
         let future = self.inner.call(request);

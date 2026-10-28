@@ -502,28 +502,23 @@ fn command_result_to_proto(result: &CommandResult) -> RaftResponse {
     }
 }
 
-/// Parse raw raft-rs message bytes, step into the given ZoneConsensus node,
-/// and return a StepMessageResponse.
-///
-/// Shared by both `ZoneTransportServiceImpl::step_message` (fullnode) and
-/// `WitnessServiceImpl::step_message` (witness) to avoid duplicated parsing
-/// and stepping logic.
-async fn parse_and_step_message<S: crate::raft::StateMachine + Send + Sync + 'static>(
+/// Decode once for both sender admission and consensus execution.
+fn parse_raft_message(
+    bytes: &[u8],
+) -> std::result::Result<raft::eraftpb::Message, StepMessageResponse> {
+    raft::eraftpb::Message::parse_from_bytes(bytes).map_err(|error| StepMessageResponse {
+        success: false,
+        error: Some(format!("Failed to deserialize raft message: {error}")),
+    })
+}
+
+/// Step an admitted message with the same full-node and witness semantics.
+async fn step_raft_message<S: crate::raft::StateMachine + Send + Sync + 'static>(
     node: &ZoneConsensus<S>,
-    message_bytes: &[u8],
+    mut msg: raft::eraftpb::Message,
     zone_id: &str,
     log_prefix: &str,
 ) -> std::result::Result<Response<StepMessageResponse>, Status> {
-    let mut msg = match raft::eraftpb::Message::parse_from_bytes(message_bytes) {
-        Ok(m) => m,
-        Err(e) => {
-            return Ok(Response::new(StepMessageResponse {
-                success: false,
-                error: Some(format!("Failed to deserialize raft message: {}", e)),
-            }));
-        }
-    };
-
     tracing::trace!(
         "{} StepMessage [zone={}]: type={:?}, from={}, to={}, term={}",
         log_prefix,
@@ -604,8 +599,12 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
         &self,
         request: Request<StepMessageRequest>,
     ) -> std::result::Result<Response<StepMessageResponse>, Status> {
+        let message = match parse_raft_message(&request.get_ref().message) {
+            Ok(message) => message,
+            Err(response) => return Ok(Response::new(response)),
+        };
+        let peer = super::node_authority::authorize_raft_sender(&request, &message)?;
         let req = request.into_inner();
-        let peek = raft::eraftpb::Message::parse_from_bytes(&req.message).ok();
         let node = match self.registry.get_node(&req.zone_id) {
             Some(n) => n,
             None => {
@@ -643,11 +642,9 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
             }
         };
 
-        // Learn the sender's advertise address from this inbound
-        // StepMessage — every received message proves the sender's
-        // reachable address, satisfying the transport peer-map's
-        // runtime SSOT under the opaque-ID contract.  Done BEFORE
-        // any raft step so outbound responses route correctly.
+        // Learn the connected peer's address before stepping. Relayed requests
+        // retain their logical origin in `from`; that origin does not own the
+        // forwarder's advertised address.
         //
         // No separate membership check: the peer-map *is* the
         // membership SSOT (populated via inbound StepMessage +
@@ -657,12 +654,10 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
         // heartbeat rejected before it could install ConfState.
         // Authentication is the transport layer's job (mTLS when
         // enabled).
-        if let Some(peek) = peek.as_ref() {
-            self.registry
-                .learn_peer_address(&req.zone_id, peek.from, &req.sender_address);
-        }
+        self.registry
+            .learn_peer_address(&req.zone_id, peer, &req.sender_address);
 
-        parse_and_step_message(&node, &req.message, &req.zone_id, "").await
+        step_raft_message(&node, message, &req.zone_id, "").await
     }
 
     /// Handle EC replication entries from a peer (Phase C).
@@ -673,6 +668,7 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
         &self,
         request: Request<ReplicateEntriesRequest>,
     ) -> std::result::Result<Response<ReplicateEntriesResponse>, Status> {
+        super::node_authority::authorize_ec_sender(&request, request.get_ref().sender_node_id)?;
         let req = request.into_inner();
         let node = get_zone_node(&self.registry, &req.zone_id)?;
 
@@ -760,6 +756,7 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
         &self,
         request: Request<SnapshotEcStateRequest>,
     ) -> std::result::Result<Response<SnapshotEcStateResponse>, Status> {
+        super::node_authority::authorize_ec_sender(&request, request.get_ref().sender_node_id)?;
         let req = request.into_inner();
         let node = get_zone_node(&self.registry, &req.zone_id)?;
 
@@ -2867,6 +2864,11 @@ impl ZoneTransportService for WitnessServiceImpl {
         &self,
         request: Request<StepMessageRequest>,
     ) -> std::result::Result<Response<StepMessageResponse>, Status> {
+        let message = match parse_raft_message(&request.get_ref().message) {
+            Ok(message) => message,
+            Err(response) => return Ok(Response::new(response)),
+        };
+        let peer = super::node_authority::authorize_raft_sender(&request, &message)?;
         let req = request.into_inner();
 
         // Route by zone_id — auto-join if zone not found (dynamic federation)
@@ -2889,12 +2891,10 @@ impl ZoneTransportService for WitnessServiceImpl {
         };
 
         // Learn sender's advertise address from this inbound StepMessage.
-        if let Ok(peek) = raft::eraftpb::Message::parse_from_bytes(&req.message) {
-            self.registry
-                .learn_peer_address(&req.zone_id, peek.from, &req.sender_address);
-        }
+        self.registry
+            .learn_peer_address(&req.zone_id, peer, &req.sender_address);
 
-        parse_and_step_message(&node, &req.message, &req.zone_id, "[Witness]").await
+        step_raft_message(&node, message, &req.zone_id, "[Witness]").await
     }
 
     /// Witness nodes do not participate in EC replication.

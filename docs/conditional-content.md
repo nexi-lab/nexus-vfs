@@ -235,12 +235,20 @@ reopen. The activation decision must carry its verified membership and compare
 it against membership at the same log position; a preflight check can race a
 previously proposed ConfChange. No second registry or daemon is proposed.
 
-Current StepMessage routing trusts the message's self-reported sender id after
-transport authentication. The managed class needs a binding from the actual
-current local-cluster mTLS Node identity to that Raft sender before accepting
-its class proof, votes or ACKs. Missing, old, foreign, agent and mismatched
-identities must fail closed. A version string or a zone name is not this proof.
-The same policy must cover witnesses and EC ingress, not just JoinZone.
+The transport binds a message's sender to the current local-cluster Node's
+actual mTLS connection. The existing certificate verifier supplies the global
+Node ID for the current request. Full nodes and witnesses bind consensus
+messages, including votes and acknowledgements, to that peer before zone
+routing. Raft's forwarded proposal, read-index and leadership-transfer requests
+retain their logical origin in `from`; address learning uses the connected
+peer's identity. Incremental EC and snapshot ingress check `sender_node_id`
+before applying metadata or acknowledging progress. Raft messages are decoded
+once for both admission and consensus execution.
+
+Managed-class activation builds on that authenticated sender to evaluate its
+class proof, votes and ACKs. Its policy covers current class support and
+membership at joins, snapshots, reopen and live-message boundaries. The
+explicit plaintext development transport retains its existing separate scope.
 
 These are review constraints, not implemented activation. A supported restore or
 replacement must establish a new replicated incarnation; the local wall-clock
