@@ -66,6 +66,7 @@ jobs:
     timeout-minutes: 25
     env:
       CARGO_BUILD_JOBS: 1
+      MOSS_RUNTIME_TOOLS_REV: aa02a532fa8067506922102212459720fb421127
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-protoc
@@ -79,6 +80,32 @@ jobs:
         run: cargo test --locked -p nexus-cluster --test user_runtime required_durable_backend_obeys_build_and_platform_at_startup
       - name: Durable mount, owner confinement and process recovery
         run: cargo test --locked -p nexus-cluster --features driver-cas-local --test user_runtime durable_cas_mount_reopens_immutable_content_with_the_owner_boundary
+      - uses: actions/checkout@v4
+        with:
+          repository: sudoprivacy/moss
+          ref: ${{ env.MOSS_RUNTIME_TOOLS_REV }}
+          path: .moss-runtime-tools
+          sparse-checkout: |
+            deploy/runtime/gvisor
+            scripts/e2e/gvisor-sync
+      - name: Record the runtime executables
+        run: cargo test --locked -p nexus-cluster --features driver-cas-local --test user_runtime --no-run --message-format=json > "$RUNNER_TEMP/durable-runtime-artifacts.json"
+      - name: Durable recovery under the qualified gVisor release
+        run: |
+          sudo unshare --mount --propagation private python3 scripts/e2e/durable_runtime.py \
+            --moss-tools=.moss-runtime-tools \
+            --artifacts="$RUNNER_TEMP/durable-runtime-artifacts.json" \
+            --results="$RUNNER_TEMP/durable-runtime-gvisor" \
+            --cache="$RUNNER_TEMP/durable-runtime-cache" \
+            --work-dir="$RUNNER_TEMP/durable-runtime-work" \
+            --runtime-prefix=/tmp/nexus-durable-runtime-gvisor
+      - name: Retain durable runtime sandbox evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: durable-runtime-gvisor
+          path: ${{ runner.temp }}/durable-runtime-gvisor
+          if-no-files-found: warn
 
   secret-file-permissions:
     name: Secret file permissions / ${{ matrix.os }}
