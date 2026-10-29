@@ -2,10 +2,10 @@ mod common;
 
 use std::sync::{Arc, Mutex};
 
-use kernel::dispatch::{FileEvent, FileEventType, MutationObserver};
 use kernel::kernel::convenience::{KernelConvenience, MountOptions};
 use kernel::kernel::{Kernel, WriteRequest};
 use kernel::meta_store::{FileMetadata, LocalMetaStore, MetaStore, MetaStoreError};
+use kernel::{FileEvent, FileEventType, MutationObserver};
 
 struct RefusingStore(LocalMetaStore);
 
