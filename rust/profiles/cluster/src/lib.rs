@@ -5045,7 +5045,7 @@ fn daemon_version_string() -> &'static str {
     })
 }
 
-const DEFAULT_LOG_FILTER_BASE: &str = "nexusd_cluster=info,nexus_raft=info";
+const DEFAULT_LOG_FILTER_BASE: &str = "nexus_cluster=info,nexusd_cluster=info,nexus_raft=info";
 
 /// The effective default filter: [`DEFAULT_LOG_FILTER_BASE`] with every
 /// privacy-critical target directive folded on top. Built at startup
@@ -8102,10 +8102,18 @@ mod tests {
             // below warn → dropped
             tracing::info!(target: contracts::constants::TRANSPORT_OBSERVER_LOG_TARGET, "chatter");
             tracing::info!(target: "nexusd_cluster", "boot"); // explicit info → survives
+            tracing::info!(target: "nexus_cluster", "library boot");
             tracing::info!(target: "some_unlisted_dep", "noise"); // no directive → ERROR default → dropped
         });
 
         let seen = seen.lock().unwrap();
+        for runtime in ["nexus_cluster", "nexusd_cluster"] {
+            assert!(
+                seen.iter()
+                    .any(|(t, l)| t == runtime && *l == tracing::Level::INFO),
+                "runtime startup must clear the default filter for {runtime}, saw: {seen:?}",
+            );
+        }
         assert!(
             seen.iter()
                 .any(|(t, l)| t == target && *l == tracing::Level::WARN),
