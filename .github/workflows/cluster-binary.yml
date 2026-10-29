@@ -15,6 +15,8 @@ on:
       - "rust-toolchain.toml"
       - ".github/workflows/cluster-binary.yml"
       - ".github/workflows/cluster-binary-build.yml"
+      - ".github/workflows/release.yml"
+      - "scripts/e2e/cluster_binary_enrollment.py"
   pull_request:
     paths:
       - "rust/**"
@@ -24,6 +26,8 @@ on:
       - "rust-toolchain.toml"
       - ".github/workflows/cluster-binary.yml"
       - ".github/workflows/cluster-binary-build.yml"
+      - ".github/workflows/release.yml"
+      - "scripts/e2e/cluster_binary_enrollment.py"
 
 jobs:
   build:

@@ -109,8 +109,24 @@ jobs:
           done
           echo "artifact name carries its features: ${{ matrix.features }}"
 
+      - name: Prepare native enrollment fixture
+        if: matrix.artifact_name == 'nexusd-cluster-linux-x86_64'
+        run: python3 scripts/e2e/cluster_binary_enrollment.py prepare --output "$RUNNER_TEMP/release-enrollment"
+
       - name: Build release binary
         run: cargo build --release -p ${{ matrix.package }} --bin ${{ matrix.bin }} ${{ matrix.features && format('--features {0}', matrix.features) || '' }} ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+
+      - name: Qualify the optimized binary before publication
+        if: matrix.artifact_name == 'nexusd-cluster-linux-x86_64'
+        run: python3 scripts/e2e/cluster_binary_enrollment.py run --binary target/release/nexusd-cluster --output "$RUNNER_TEMP/release-enrollment"
+
+      - name: Retain native enrollment evidence
+        if: always() && matrix.artifact_name == 'nexusd-cluster-linux-x86_64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-enrollment
+          path: ${{ runner.temp }}/release-enrollment
+          if-no-files-found: error
 
       - name: Check binary size
         shell: bash
