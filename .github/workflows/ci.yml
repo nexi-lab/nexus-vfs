@@ -80,6 +80,10 @@ jobs:
         run: cargo test --locked -p nexus-cluster --test user_runtime required_durable_backend_obeys_build_and_platform_at_startup
       - name: Durable mount, owner confinement and process recovery
         run: cargo test --locked -p nexus-cluster --features driver-cas-local --test user_runtime durable_cas_mount_reopens_immutable_content_with_the_owner_boundary
+      - name: Immutable peer objects and logical file contents over real gRPC
+        run: cargo test --locked -p nexus-cluster --features driver-cas-local --test cas_peer_blob
+      - name: Late peer reads existing sealed stream segments
+        run: cargo test --locked -p nexus-cluster --features driver-cas-local --test dt_stream_unbounded joiner_cold_reads_a_sealed_log_and_reports_unavailable_segments
       - uses: actions/checkout@v4
         with:
           repository: sudoprivacy/moss

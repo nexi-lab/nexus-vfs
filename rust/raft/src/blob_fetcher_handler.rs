@@ -8,12 +8,12 @@
 //! syscall surface — no ``MetaStore`` Arc leaks across the crate
 //! boundary.
 //!
-//! Store-and-forward: ``content_id`` is opaque. The fetcher resolves
-//! it via the local ``VFSRouter`` — for federation reads ``content_id``
-//! is a global VFS path, the router picks the matching mount, and the
+//! Absolute ``content_id`` values name global VFS paths. The fetcher resolves
+//! those via the local ``VFSRouter``; the router picks the matching mount, and the
 //! mount's backend interprets the locally-stored
 //! ``FileMetadata.content_id`` (hash for CAS, backend_path for PAS).
-//! The kernel never inspects the string.
+//! Other values address stored objects directly. CAS serves the raw object
+//! whose hash was requested, including a manifest before chunk assembly.
 //!
 //! Installation: [`install`] is called from
 //! `RaftDistributedCoordinator::install_with_kernel` once the
@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 use crate::blob_fetcher::BlobFetcher;
 
+use kernel::abc::object_store::{ObjectStore, StorageError};
 use kernel::kernel::{Kernel, OperationContext};
 use kernel::vfs_router::VFSRouter;
 
@@ -35,6 +36,22 @@ use kernel::vfs_router::VFSRouter;
 /// fetcher consults the metastore through the kernel's syscall layer
 /// (no ``MetaStore`` symbol crossing the crate boundary).
 type LocalContentIdLookup = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
+/// Read an addressed object. CAS manifests are objects in their own right;
+/// assembling their chunks belongs to a logical file read.
+fn read_backend_object(
+    backend: &dyn ObjectStore,
+    content_id: &str,
+    ctx: &OperationContext,
+) -> Result<Vec<u8>, StorageError> {
+    match backend.as_cas() {
+        Some(cas) => cas
+            .transport()
+            .read_blob(content_id)
+            .map_err(|error| StorageError::from(kernel::cas_engine::CASError::from(error))),
+        None => backend.read_content(content_id, ctx),
+    }
+}
 
 /// Kernel-side `BlobFetcher` — backed by the kernel's `VFSRouter` plus
 /// a narrow content-id-lookup closure.
@@ -62,8 +79,7 @@ impl KernelBlobFetcher {
 impl BlobFetcher for KernelBlobFetcher {
     /// Resolve ``content_id`` against the local data plane.
     ///
-    /// The peer doesn't tell us whether ``content_id`` is a VFS path, a
-    /// CAS hash, or a backend-specific handle. We try in order:
+    /// Absolute paths request logical files; other addresses request objects.
     ///
     /// 1. **Path-style local read** — if ``vfs_router.route()`` resolves
     ///    ``content_id`` to a mount, try reading from that mount with
@@ -71,11 +87,10 @@ impl BlobFetcher for KernelBlobFetcher {
     ///    ``backend_path`` as a cold-cache fallback). This handles
     ///    federation reads where the peer asked for a VFS path.
     ///
-    /// 2. **CAS hash fan-out** — if the path-style attempt didn't
-    ///    return bytes (mount lookup miss, or backend returned an
-    ///    error), try every backend's ``read_content(content_id, ctx)``.
-    ///    CAS backends recognise their hashes here; PAS / connector
-    ///    backends will reject and we move on. This catches:
+    /// 2. **Addressed-object fan-out** — try each backend for its
+    ///    locally stored object. CAS serves the exact immutable blob,
+    ///    including manifests; other backends use their content reader.
+    ///    This serves:
     ///      * CAS chunk fetches whose ``content_id`` is a raw hash
     ///        with no mount path
     ///      * Federation reads where the peer's local routing of the
@@ -105,13 +120,17 @@ impl BlobFetcher for KernelBlobFetcher {
         ctx.propagates_cross_node = true;
 
         // Step 1: try path-style routing → local mount read.
-        if let Some(route) = self.vfs_router.route(content_id, contracts::ROOT_ZONE_ID) {
+        if let Some(route) = content_id
+            .starts_with('/')
+            .then(|| self.vfs_router.route(content_id, contracts::ROOT_ZONE_ID))
+            .flatten()
+        {
             let local_content_id = (self.lookup_local_content_id)(content_id)
                 .unwrap_or_else(|| route.backend_path.clone());
             if let Some(bytes) = route
                 .backend
                 .as_ref()
-                .and_then(|b| b.read_content(&local_content_id, &ctx).ok())
+                .and_then(|backend| backend.read_content(&local_content_id, &ctx).ok())
             {
                 // `content_id` here is the global VFS path the peer
                 // asked for — that's the key the metadata is keyed on.
@@ -175,7 +194,7 @@ impl BlobFetcher for KernelBlobFetcher {
         }
         let mut last_err: Option<String> = None;
         for backend in backends {
-            match backend.read_content(content_id, &ctx) {
+            match read_backend_object(backend.as_ref(), content_id, &ctx) {
                 Ok(bytes) => return Ok(bytes),
                 Err(e) => last_err = Some(format!("{:?}", e)),
             }
