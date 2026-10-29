@@ -148,6 +148,18 @@ pub const BLAKE3_EMPTY: &str = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7
 /// session-id concept at all (its AgentRegistry pid IS the session handle).
 pub const SESSIONS_BASE: &str = "/sessions";
 
+/// Logical subtree governed by the managed conditional-content revision policy.
+pub const MANAGED_CONTENT_ROOT: &str = "/__managed_content_v1__";
+
+/// True for the managed root and its slash-delimited descendants.
+#[inline]
+pub fn is_managed_content_path(path: &str) -> bool {
+    path == MANAGED_CONTENT_ROOT
+        || path
+            .strip_prefix(MANAGED_CONTENT_ROOT)
+            .is_some_and(|tail| tail.starts_with('/'))
+}
+
 /// Kernel-reserved path prefix for internal system entries
 /// (mount table, ReBAC namespace store, ReBAC version store, zone
 /// revisions, …).

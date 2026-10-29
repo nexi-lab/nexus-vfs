@@ -5,22 +5,12 @@
 //! that overwrites live bytes before proposing metadata is still unsupported.
 
 use super::*;
+pub(super) use contracts::is_managed_content_path as is_managed_key;
 
 pub(super) const NAMESPACE: &str = "content-version-v1";
 const ALLOCATOR: &str = "allocator";
 const PATH_PREFIX: &str = "path:";
 const TOKEN_LEN: usize = 24;
-/// Reserved metadata subtree for a NEW managed-content mount. This is a key
-/// policy, never inferred from a replica's applied revision/admission state.
-/// No public mount or file RPC exposes this experimental namespace yet.
-const MANAGED_ROOT: &str = "/__managed_content_v1__";
-
-pub(super) fn is_managed_key(key: &str) -> bool {
-    key == MANAGED_ROOT
-        || key
-            .strip_prefix(MANAGED_ROOT)
-            .is_some_and(|tail| tail.starts_with('/'))
-}
 
 impl Command {
     /// Fixed on every replica, including one that has not applied a first SC
