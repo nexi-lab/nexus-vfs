@@ -57,6 +57,7 @@ def run(root, output, binary):
         "fixtureSha256": prepared["fixtureSha256"], "cpuCount": os.cpu_count(),
         "scriptSha256": prepared["scriptSha256"], "fixtureSources": prepared["fixtureSources"],
         "sourceCommit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
+        "sourceTree": subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=root, text=True).strip(),
     }
     try:
         assert all(digest(root / name) == expected for name, expected in prepared["fixtureSources"].items())
