@@ -183,6 +183,13 @@ pub struct PaginatedList {
 /// federation-layer concerns never leak up. Returned ``FileMetadata.path``
 /// values are likewise full paths.
 pub trait MetaStore: Send + Sync {
+    /// A paired snapshot/replacement extension selected by the owning store.
+    fn as_conditional_metadata(
+        &self,
+    ) -> Option<&dyn crate::extensions::conditional_metadata::ConditionalMetadata> {
+        None
+    }
+
     /// Get metadata for a path. Returns None if not found.
     fn get(&self, path: &str) -> Result<Option<FileMetadata>, MetaStoreError>;
 

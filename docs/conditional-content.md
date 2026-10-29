@@ -265,6 +265,32 @@ rollback of the complete cluster is not claimed safe by this proposal.
 
 ## Delivery slices and required evidence
 
+### Isolated metadata boundary
+
+`MetaStore::as_conditional_metadata` supplies the paired authoritative metadata
+snapshot and atomic replacement operations. `ZoneMetaStore` exposes this
+extension for an already bound consensus handle constructed with `FixedLocal`.
+That policy validates restored membership and retained history and excludes
+membership changes and remote ingress for the runtime's lifetime. The existing
+zone-relative path projection owns alias and subtree translation.
+
+The dedicated in-process operation submits through the existing SC actor.
+Generic local proposals and the raw proposal RPC retain their activation guard.
+Managed membership and deferred network mounts keep the extension closed until
+their protocol admission is qualified. Unsupported legacy images have a typed
+result; corrupt committed revisions are storage failures. Once a write enters
+the actor, a failed answer is Unknown unless the actor proves a pre-submit
+refusal. Apply observers invalidate metadata caches across aliases.
+
+Metadata admission and immutable-object durability are separate requirements.
+The content operation requires both this paired metadata extension and an actual
+CAS transport constructed with file-and-directory publication barriers. Existing
+file syscalls and RPCs keep their existing contracts. The public conditional
+content pair, authenticated kernel integration, actual released artifact and
+reader-register adoption require the subsequent delivery slices below.
+
+### Content and consumer delivery
+
 1. Freeze the public RPC/token contract with the S6 consumer, including the zone
    incarnation and definite-error/Unknown rules. Default trait capability is
    Unsupported; no mock advertises stronger behavior than its real backend.

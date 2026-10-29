@@ -298,6 +298,9 @@ pub enum CommandResult {
         committed: bool,
         current: VersionedMetadata,
     },
+
+    /// The path has no admitted conditional metadata image.
+    ConditionalMetadataUnsupported,
 }
 
 // Advisory lock types — `HolderInfo`, `LockInfo`, `LockAcquireResult`,

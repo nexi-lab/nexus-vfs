@@ -60,6 +60,10 @@ pub enum RaftError {
     #[error("invalid state: {0}")]
     InvalidState(String),
 
+    /// The selected storage or membership policy cannot provide an operation.
+    #[error("unsupported operation: {0}")]
+    UnsupportedOperation(&'static str),
+
     /// The actor channel was closed (driver dropped).
     #[error("raft actor channel closed")]
     ChannelClosed,

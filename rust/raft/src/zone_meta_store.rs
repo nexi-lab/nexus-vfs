@@ -59,6 +59,8 @@ use contracts::VFS_ROOT;
 use lib::rt::block_on_via as bridge_block_on;
 use prost::Message;
 
+mod conditional;
+
 use kernel::meta_store::{
     FileMetadata as KernelFileMetadata, MetaStore, MetaStoreError, StreamSegment,
 };
@@ -99,8 +101,8 @@ pub struct ZoneMetaStore {
     /// surfaces of the same zone on the leader): every ZoneMetaStore
     /// constructed against a consensus self-registers an apply-side
     /// observer on the consensus's apply_observers_slot. When the
-    /// state machine commits a SetMetadata / CasSetMetadata /
-    /// DeleteMetadata, the slot fires every registered observer — each
+    /// state machine commits a metadata replacement or deletion,
+    /// the slot fires every registered observer — each
     /// one evicts its own cache row for the corresponding global path.
     /// Wrapped in ``Arc`` so the closure can hold a stable handle that
     /// survives the ZoneMetaStore's call frames.
@@ -109,8 +111,8 @@ pub struct ZoneMetaStore {
 
 /// Register the apply-side cache invalidator for one zone metastore.
 ///
-/// Only `SetMetadata` / `CasSetMetadata` / `DeleteMetadata` mutate a cached
-/// row, so the observer matches exactly those. The zone-relative key is
+/// Ordinary and conditional metadata replacements and deletions evict the
+/// affected row. The zone-relative key is
 /// translated back to the caller-facing global path (the form this metastore
 /// caches under) before evicting. Capturing `Arc` clones keeps the observer
 /// self-contained — no back-reference to the `ZoneMetaStore`.
@@ -130,7 +132,8 @@ fn register_cache_invalidator(
         let zone_key = match entry.command {
             Command::SetMetadata { key, .. }
             | Command::CasSetMetadata { key, .. }
-            | Command::DeleteMetadata { key } => key.as_str(),
+            | Command::DeleteMetadata { key }
+            | Command::WriteVersionedMetadata { key, .. } => key.as_str(),
             _ => return,
         };
         // Every mount on this zone observes every key it commits, so a key
@@ -200,15 +203,8 @@ impl ZoneMetaStore {
     ) -> Self {
         let cache: Arc<dashmap::DashMap<String, KernelFileMetadata>> =
             Arc::new(dashmap::DashMap::new());
-        // Self-register an apply-side observer. Only SetMetadata /
-        // CasSetMetadata / DeleteMetadata mutate a cached row, so the
-        // observer matches exactly those (ignoring every other command
-        // variant — this preserves the pre-unification behavior, where
-        // invalidation fired only for these three). The zone-relative
-        // key is translated back to the caller-facing global path (the
-        // form this metastore caches under) before evicting. Capturing
-        // ``Arc`` clones keeps the observer self-contained — no
-        // back-reference to ZoneMetaStore.
+        // Each mount projects the committed zone key into its own global
+        // namespace before evicting the derived cache entry.
         register_cache_invalidator(&node, &cache, &mount_point, &target_subtree);
         Self {
             binding: ZoneBinding::Ready(node),
@@ -495,6 +491,10 @@ pub(crate) fn kernel_to_proto(meta: &KernelFileMetadata) -> Vec<u8> {
 }
 
 impl MetaStore for ZoneMetaStore {
+    fn as_conditional_metadata(&self) -> Option<&dyn kernel::meta_store::ConditionalMetadata> {
+        self.conditional_metadata()
+    }
+
     fn get(&self, path: &str) -> Result<Option<KernelFileMetadata>, MetaStoreError> {
         if let Some(cached) = self.cache.get(path) {
             return Ok(Some(cached.clone()));

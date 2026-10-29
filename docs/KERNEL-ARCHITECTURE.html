@@ -710,7 +710,7 @@ graph TB
 graph LR
     subgraph KDIR["rust/kernel/src/"]
         ABC["abc/ &mdash; the 3 &sect;3.A pillars<br/>(meta_store.rs, object_store.rs, cache_store.rs)"]
-        EXT["extensions/ &mdash; opt-in ObjectStore extensions<br/>(LlmStreamingBackend, ObserverBackend)"]
+        EXT["extensions/ &mdash; opt-in storage-pillar extensions<br/>(LlmStreamingBackend, ConditionalMetadata)"]
         HAL["hal/ &mdash; the &sect;3.B DI surfaces<br/>(distributed_coordinator, object_store_provider,<br/>auth_key_store)"]
         CORE["core/ &mdash; concrete kernel primitives (&sect;4)"]
     end

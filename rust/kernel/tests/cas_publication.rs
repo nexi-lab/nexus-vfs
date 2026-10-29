@@ -287,6 +287,7 @@ fn concurrent_blob_publication(role: &str, durable: bool) {
     } else {
         LocalCASTransport::new(root.path(), true).unwrap()
     };
+    assert_eq!(transport.has_durable_publication(), durable);
     let content = concurrent_content();
     let hash = lib::hash::hash_content(&content);
     let mut workers = start_writers(root.path(), role);
@@ -536,6 +537,7 @@ fn durable_process_worker(root: &Path, mode: &str) {
     use lib::file_durability::PublishedButNotDurable;
 
     let transport = LocalCASTransport::new_durable(root).unwrap();
+    assert!(transport.has_durable_publication());
     let content = b"complete object acknowledged after file and namespace barriers";
     let hash = lib::hash::hash_content(content);
     if mode == "success" || mode == "kill-before" || mode == "kill-after" {
