@@ -194,6 +194,9 @@ pub struct RaftConfig {
     /// which is populated by `ZoneManager::new` before any zone is
     /// registered.
     pub bootstrap_self_address: String,
+
+    /// Membership authority selected by the owning runtime.
+    pub membership_policy: super::MembershipPolicy,
 }
 
 impl Default for RaftConfig {
@@ -209,6 +212,7 @@ impl Default for RaftConfig {
             tick_interval: Duration::from_millis(10),
             skip_bootstrap: false,
             bootstrap_self_address: String::new(),
+            membership_policy: super::MembershipPolicy::Managed,
         }
     }
 }
@@ -630,6 +634,10 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         let initial_state = storage
             .initial_state()
             .map_err(|e| RaftError::Storage(e.to_string()))?;
+
+        config
+            .membership_policy
+            .validate_storage(&config, &storage)?;
 
         if !config.skip_bootstrap {
             // Bootstrap contract — `create_zone` only.  Under the
@@ -1598,6 +1606,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         node_id: u64,
         context: Vec<u8>,
     ) -> Result<ConfState> {
+        self.config.membership_policy.require_managed()?;
         if !self.is_leader() {
             return Err(RaftError::NotLeader {
                 leader_hint: self.leader_hint_addr(),
@@ -1641,6 +1650,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
     /// correct behavior: the peer's gRPC call blocks until the driver
     /// can accept the message.
     pub async fn step(&self, msg: Message) -> Result<()> {
+        self.config.membership_policy.require_managed()?;
         self.msg_tx
             .send(RaftMsg::Step { msg })
             .await
@@ -1912,6 +1922,10 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                 }
             }
             RaftMsg::ProposeConfChange { change, tx } => {
+                if let Err(error) = self.config.membership_policy.require_managed() {
+                    let _ = tx.send(Err(error));
+                    return;
+                }
                 let target_node_id = change.node_id;
                 tracing::debug!(
                     peer_node_id = target_node_id,
