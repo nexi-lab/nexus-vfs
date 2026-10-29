@@ -28,6 +28,13 @@ pub enum CASError {
     IOError(io::Error),
 }
 
+/// Immutable object produced by a partial write and its logical byte length.
+#[derive(Debug)]
+pub struct PartialWriteResult {
+    pub content_id: String,
+    pub size: u64,
+}
+
 /// `From<CASError> for StorageError` lives next to the canonical
 /// `CASError` site so `abc/object_store.rs` stays free of
 /// `cas_engine` references. Both types are kernel-local, so the
@@ -162,6 +169,11 @@ impl CASEngine {
     /// manifest hash was actually written (`true`) or hit CAS dedup (`false`).
     /// Surfaces the bit Python's on_write_callback (Zoekt reindex) relies on.
     pub fn write_content_tracked(&self, content: &[u8]) -> Result<(String, bool), CASError> {
+        if self.chunk_assembler.is_some()
+            && super::chunking::parse_chunk_manifest(content).is_some()
+        {
+            return super::chunking::write_literal_manifest(content, &self.transport);
+        }
         match &self.chunking_strategy {
             Some(strategy) if strategy.should_chunk(content) => {
                 strategy.write_chunked(content, &self.transport)
@@ -185,7 +197,7 @@ impl CASEngine {
         self.transport.exists(content_id)
     }
 
-    /// Get content size by hash.
+    /// Get the physical blob size by hash; `get_size` returns the logical length.
     pub fn content_size(&self, content_id: &str) -> Result<u64, CASError> {
         self.transport
             .blob_size(content_id)
@@ -377,7 +389,7 @@ impl CASEngine {
         old_manifest_hash: &str,
         buf: &[u8],
         offset: u64,
-    ) -> Result<String, CASError> {
+    ) -> Result<PartialWriteResult, CASError> {
         self.write_chunked_partial_with_origins(old_manifest_hash, buf, offset, &[])
     }
 
@@ -391,14 +403,14 @@ impl CASEngine {
     /// Non-chunked (single blob): read-modify-write the whole blob in Rust
     /// — splice `buf` at `offset`, resize if the splice extends past end,
     /// zero-fill any gap if `offset > old.len()`, then write the new full
-    /// blob. Returns the new CAS hash.
+    /// blob. Returns the new CAS identifier and logical byte length.
     pub fn write_partial(
         &self,
         old_hash: &str,
         buf: &[u8],
         offset: u64,
         origins: &[String],
-    ) -> Result<String, CASError> {
+    ) -> Result<PartialWriteResult, CASError> {
         if self.is_chunked(old_hash) {
             return self.write_chunked_partial_with_origins(old_hash, buf, offset, origins);
         }
@@ -425,13 +437,16 @@ impl CASEngine {
         if end < old.len() {
             new_blob[end..old.len()].copy_from_slice(&old[end..]);
         }
-        self.write_content(&new_blob)
+        Ok(PartialWriteResult {
+            content_id: self.write_content(&new_blob)?,
+            size: new_len as u64,
+        })
     }
 
     /// Partial write into chunked content: splice `buf` at `offset`, rewriting
     /// only the affected chunks. Unaffected chunks are reused. Returns the new
-    /// manifest hash. Requires an injected `ChunkingStrategy` that supports
-    /// byte-offset partial writes (e.g. FastCDC). Mirrors Python
+    /// manifest identifier and logical byte length. Requires an injected
+    /// `ChunkingStrategy` that supports byte-offset partial writes (e.g. FastCDC). Mirrors Python
     /// `CDCEngine.write_chunked_partial`.
     ///
     /// Missing "affected" chunks fall through to the injected
@@ -444,7 +459,7 @@ impl CASEngine {
         buf: &[u8],
         offset: u64,
         origins: &[String],
-    ) -> Result<String, CASError> {
+    ) -> Result<PartialWriteResult, CASError> {
         let strategy = self.chunking_strategy.as_ref().ok_or_else(|| {
             CASError::IOError(io::Error::other(
                 "write_chunked_partial requires a ChunkingStrategy",
@@ -593,7 +608,10 @@ impl CASEngine {
             String::new(),
             &self.transport,
         )
-        .map(|(hash, _is_new)| hash)
+        .map(|(content_id, _is_new)| PartialWriteResult {
+            content_id,
+            size: total_size,
+        })
     }
 }
 
@@ -619,6 +637,44 @@ mod tests {
 
         let read_back = engine.read_content(&hash).unwrap();
         assert_eq!(read_back, content);
+    }
+
+    #[test]
+    fn manifest_shaped_file_bytes_keep_their_literal_value_across_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let content = br#"{"type":"chunked_manifest","total_size":0,"chunks":[]}"#;
+        let hash = {
+            let engine = CASEngine::new(LocalCASTransport::new(root.path(), true).unwrap());
+            let (hash, is_new) = engine.write_content_tracked(content).unwrap();
+            assert!(is_new);
+            assert_ne!(hash, lib::hash::hash_content(content));
+            assert_eq!(engine.read_content(&hash).unwrap(), content);
+            assert_eq!(
+                engine.write_content_tracked(content).unwrap(),
+                (hash.clone(), false)
+            );
+            hash
+        };
+        let engine = CASEngine::new(LocalCASTransport::new(root.path(), true).unwrap());
+        assert_eq!(engine.read_content(&hash).unwrap(), content);
+    }
+
+    #[test]
+    fn literal_bytes_can_share_an_existing_manifest_blob_without_changing_its_readers() {
+        let root = tempfile::tempdir().unwrap();
+        let transport = LocalCASTransport::new(root.path(), true).unwrap();
+        let payload = b"encoded content";
+        let payload_hash = transport.write_blob(payload).unwrap();
+        let (manifest_hash, _) = super::super::chunking::finalize_manifest(
+            vec![serde_json::json!({"chunk_hash": payload_hash, "offset": 0, "length": payload.len()})],
+            1, payload.len(), lib::hash::hash_content(payload), &transport,
+        ).unwrap();
+        let literal = transport.read_blob(&manifest_hash).unwrap();
+        let engine = CASEngine::new(transport);
+        let literal_hash = engine.write_content(&literal).unwrap();
+        assert_ne!(literal_hash, manifest_hash);
+        assert_eq!(engine.read_content(&literal_hash).unwrap(), literal);
+        assert_eq!(engine.read_content(&manifest_hash).unwrap(), payload);
     }
 
     #[test]
@@ -979,7 +1035,9 @@ mod tests {
         assert!(!engine.is_chunked(&old_hash));
 
         // Splice "RUST" at offset 6, overwriting "world"[..4].
-        let new_hash = engine.write_partial(&old_hash, b"RUST", 6, &[]).unwrap();
+        let result = engine.write_partial(&old_hash, b"RUST", 6, &[]).unwrap();
+        assert_eq!(result.size, old.len() as u64);
+        let new_hash = result.content_id;
         assert_ne!(new_hash, old_hash);
         let new_bytes = engine.read_content(&new_hash).unwrap();
         let mut expected = old.to_vec();
@@ -993,7 +1051,9 @@ mod tests {
         let old = b"short";
         let old_hash = engine.write_content(old).unwrap();
         // Write past end with a gap: offset 10, buf "tail" → bytes 5..10 zero-filled.
-        let new_hash = engine.write_partial(&old_hash, b"tail", 10, &[]).unwrap();
+        let result = engine.write_partial(&old_hash, b"tail", 10, &[]).unwrap();
+        assert_eq!(result.size, 14);
+        let new_hash = result.content_id;
         let new_bytes = engine.read_content(&new_hash).unwrap();
         let mut expected = vec![0u8; 14];
         expected[..5].copy_from_slice(b"short");
@@ -1011,9 +1071,11 @@ mod tests {
         }
         let manifest_hash = engine.write_content(&content).unwrap();
         assert!(engine.is_chunked(&manifest_hash));
-        let new_hash = engine
+        let result = engine
             .write_partial(&manifest_hash, b"xyz", 1_000_000, &[])
             .unwrap();
+        assert_eq!(result.size, content.len() as u64);
+        let new_hash = result.content_id;
         assert_ne!(new_hash, manifest_hash);
         assert!(engine.is_chunked(&new_hash));
     }
@@ -1032,9 +1094,11 @@ mod tests {
         // Splice a 1 KiB region at offset 1 MiB.
         let buf = vec![0xEFu8; 1024];
         let splice_offset = 1024u64 * 1024;
-        let new_hash = engine
+        let result = engine
             .write_chunked_partial(&manifest_hash, &buf, splice_offset)
             .unwrap();
+        assert_eq!(result.size, content.len() as u64);
+        let new_hash = result.content_id;
         assert_ne!(new_hash, manifest_hash);
         assert!(engine.is_chunked(&new_hash));
 

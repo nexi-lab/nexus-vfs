@@ -30,7 +30,6 @@ async fn peer_blob_preserves_manifest_identity_and_logical_path_contents() {
         "chunks": [{"chunk_hash": chunk, "offset": 0, "length": content.len()}]
     }))
     .unwrap();
-    let hash = lib::hash::hash_content(&manifest);
     let kernel = Arc::new(Kernel::new());
     kernel
         .vfs_router_arc()
@@ -44,6 +43,13 @@ async fn peer_blob_preserves_manifest_identity_and_logical_path_contents() {
         &ctx,
     );
     assert!(written[0].is_ok(), "{:?}", written[0].as_ref().err());
+    let hash = written[0].as_ref().unwrap().content_id.clone().unwrap();
+    let stored_manifest = backend
+        .as_cas()
+        .unwrap()
+        .transport()
+        .read_blob(&hash)
+        .unwrap();
     let lookup = kernel.content_id_lookup_fn(contracts::ROOT_ZONE_ID);
     assert_eq!(lookup("/published"), Some(hash.clone()));
     assert_eq!(lookup(&hash), None);
@@ -86,7 +92,7 @@ async fn peer_blob_preserves_manifest_identity_and_logical_path_contents() {
         .into_inner();
     assert!(raw.error.is_empty(), "{}", raw.error);
     assert_eq!(
-        raw.content, manifest,
+        raw.content, stored_manifest,
         "a hash request must return the object with that exact hash"
     );
     assert_eq!(lib::hash::hash_content(&raw.content), hash);
@@ -103,7 +109,7 @@ async fn peer_blob_preserves_manifest_identity_and_logical_path_contents() {
         .unwrap()
         .into_inner();
     assert!(logical.error.is_empty(), "{}", logical.error);
-    assert_eq!(logical.content, content);
+    assert_eq!(logical.content, manifest);
     assert_eq!(lookup("/published"), Some(hash.clone()));
     // Absolute file paths remain distinct from immutable addresses, including
     // a file whose name happens to be a hexadecimal content hash.
@@ -126,7 +132,7 @@ async fn peer_blob_preserves_manifest_identity_and_logical_path_contents() {
         .unwrap()
         .into_inner();
     assert!(addressed.error.is_empty(), "{}", addressed.error);
-    assert_eq!(addressed.content, manifest);
+    assert_eq!(addressed.content, stored_manifest);
     let named = client
         .read_blob(ReadBlobRequest {
             content_id: hex_path,

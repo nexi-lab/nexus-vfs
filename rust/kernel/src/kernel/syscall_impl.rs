@@ -252,21 +252,7 @@ impl Kernel {
         }
 
         // 1c. Permission gate (§13) — BEFORE native hooks.
-        self.check_permission(path, Permission::Read, ctx)?;
-
-        // 1d. Native INTERCEPT PRE hooks (§11 native hooks) — audit etc.
-        let hook_id = HookIdentity {
-            user_id: ctx.user_id.clone(),
-            zone_id: ctx.zone_id.clone(),
-            agent_id: ctx.agent_id.clone().unwrap_or_default(),
-            is_admin: ctx.is_admin,
-        };
-        self.dispatch_native_pre(&HookContext::Read(ReadHookCtx {
-            path: path.to_string(),
-            identity: hook_id,
-            content: None,
-            content_id: None,
-        }))?;
+        self.apply_read_hooks(path, ctx)?;
 
         // Route → metastore → backend (shared logic)
         self.sys_read_after_auth(path, ctx, max_link_hops, timeout_ms, offset)
@@ -1078,6 +1064,78 @@ impl Kernel {
         }
     }
 
+    pub(super) fn replacement_file_metadata(
+        &self,
+        path: &str,
+        zone_id: &str,
+        written: &crate::abc::object_store::WriteResult,
+        old: Option<&FileMetadata>,
+    ) -> FileMetadata {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as i64)
+            .unwrap_or(0);
+        self.build_metadata(
+            path,
+            zone_id,
+            DT_REG,
+            written.size,
+            Some(written.content_id.clone()),
+            old.map_or(0, |entry| entry.gen).saturating_add(1),
+            old.map_or(0, |entry| entry.version) + 1,
+            None,
+            old.and_then(|entry| entry.created_at_ms).or(Some(now_ms)),
+            Some(now_ms),
+        )
+    }
+
+    pub(super) fn file_write_result(
+        &self,
+        metadata: &FileMetadata,
+        written: crate::abc::object_store::WriteResult,
+        old: Option<&FileMetadata>,
+    ) -> SysWriteResult {
+        SysWriteResult {
+            hit: true,
+            content_id: Some(written.content_id),
+            post_hook_needed: self.write_hook_count.load(Ordering::Relaxed) > 0,
+            version: metadata.version,
+            gen: metadata.gen,
+            size: metadata.size,
+            is_new: old.is_none(),
+            old_content_id: old.and_then(|entry| entry.content_id.clone()),
+            old_size: old.map(|entry| entry.size),
+            old_version: old.map(|entry| entry.version),
+            old_modified_at_ms: old.and_then(|entry| entry.modified_at_ms),
+        }
+    }
+
+    /// Notify observers and native post-hooks after a regular file commit.
+    pub(super) fn notify_file_write(
+        &self,
+        path: &str,
+        ctx: &OperationContext,
+        result: &SysWriteResult,
+    ) {
+        self.dispatch_mutation(FileEventType::FileWrite, path, ctx, |event| {
+            event.size = Some(result.size);
+            event.content_id = result.content_id.clone();
+            event.version = Some(result.version);
+            event.gen = Some(result.gen);
+            event.is_new = result.is_new;
+            event.old_content_id = result.old_content_id.clone();
+        });
+        self.dispatch_native_post(&HookContext::Write(WriteHookCtx {
+            path: path.to_string(),
+            identity: HookIdentity::from(ctx),
+            content: Vec::new(),
+            is_new_file: result.is_new,
+            content_id: None,
+            new_version: result.version.into(),
+            size_bytes: Some(result.size),
+        }));
+    }
+
     fn commit_write_through(
         &self,
         input: WriteCommitInput<'_>,
@@ -1212,36 +1270,13 @@ impl Kernel {
                 // dcache (matches the authority that Python metadata.get()
                 // had before this crossing elimination).
                 let old_entry = self.commit_old_metadata(&input);
-                let old_version = old_entry.as_ref().map(|e| e.version).unwrap_or(0);
-                let old_gen = old_entry.as_ref().map(|e| e.gen).unwrap_or(0);
-                let old_content_id = old_entry.as_ref().and_then(|e| e.content_id.clone());
-                let new_version = old_version + 1;
-                let new_gen = old_gen.saturating_add(1);
-
-                // Build FileMetadata and persist via metastore (per-mount or global)
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0);
-                let created_at_ms = old_entry
-                    .as_ref()
-                    .and_then(|e| e.created_at_ms)
-                    .or(Some(now_ms));
-                // Always pass the full global path. Per-mount
-                // ZoneMetaStore translates at its boundary; the global
-                // fallback stores full paths directly.
-                let meta = self.build_metadata(
+                let meta = self.replacement_file_metadata(
                     input.path,
                     &input.route.zone_id,
-                    DT_REG,
-                    wr.size,
-                    Some(wr.content_id.clone()),
-                    new_gen,
-                    new_version,
-                    None,
-                    created_at_ms,
-                    Some(now_ms),
+                    &wr,
+                    old_entry.as_ref(),
                 );
+                let result = self.file_write_result(&meta, wr, old_entry.as_ref());
                 // Atomic commit — metastore (raft) write. Hot path: bypass
                 // the routing wrapper and dispatch through the trait via
                 // route.metastore (already resolved above).
@@ -1255,53 +1290,8 @@ impl Kernel {
                     });
                 put_res?;
 
-                // Snapshot old_entry fields for the result struct before
-                // dispatch_mutation moves old_content_id into its closure.
-                let result_is_new = old_entry.is_none();
-                let result_old_etag = old_content_id.clone();
-                let result_old_size = old_entry.as_ref().map(|e| e.size);
-                let result_old_version = old_entry.as_ref().map(|e| e.version);
-                let result_old_modified_at_ms = old_entry.as_ref().and_then(|e| e.modified_at_ms);
-
-                // OBSERVE-phase dispatch (§11 OBSERVE): queue FileWrite to
-                // the kernel observer ThreadPool. Returns immediately —
-                // observer callbacks run off the syscall hot path.
-                let content_id = wr.content_id.clone();
-                let size = wr.size;
-                self.dispatch_mutation(FileEventType::FileWrite, input.path, input.ctx, |ev| {
-                    ev.size = Some(size);
-                    ev.content_id = Some(content_id);
-                    ev.version = Some(new_version);
-                    ev.gen = Some(new_gen);
-                    ev.is_new = old_version == 0;
-                    ev.old_content_id = old_content_id;
-                });
-
-                // Native POST hooks (fire-and-forget — AuditHook sends to channel
-                // in ~100 ns; no content clone on post path).
-                self.dispatch_native_post(&HookContext::Write(WriteHookCtx {
-                    path: input.path.to_string(),
-                    identity: HookIdentity::from(input.ctx),
-                    content: vec![],
-                    is_new_file: result_is_new,
-                    content_id: None,
-                    new_version: new_version.into(),
-                    size_bytes: Some(wr.size),
-                }));
-
-                Ok(SysWriteResult {
-                    hit: true,
-                    content_id: Some(wr.content_id),
-                    post_hook_needed: self.write_hook_count.load(Ordering::Relaxed) > 0,
-                    version: new_version,
-                    gen: new_gen,
-                    size: wr.size,
-                    is_new: result_is_new,
-                    old_content_id: result_old_etag,
-                    old_size: result_old_size,
-                    old_version: result_old_version,
-                    old_modified_at_ms: result_old_modified_at_ms,
-                })
+                self.notify_file_write(input.path, input.ctx, &result);
+                Ok(result)
             }
             None => miss(),
         };
@@ -3554,23 +3544,7 @@ impl Kernel {
         for (i, req) in reqs.iter().enumerate() {
             if let Some(Ok(ref r)) = results.get(i) {
                 if r.hit {
-                    self.dispatch_mutation(FileEventType::FileWrite, &req.path, ctx, |ev| {
-                        ev.size = Some(r.size);
-                        ev.content_id = r.content_id.clone();
-                        ev.version = Some(r.version);
-                        ev.gen = Some(r.gen);
-                        ev.is_new = r.is_new;
-                        ev.old_content_id = r.old_content_id.clone();
-                    });
-                    self.dispatch_native_post(&HookContext::Write(WriteHookCtx {
-                        path: req.path.clone(),
-                        identity: HookIdentity::from(ctx),
-                        content: vec![],
-                        is_new_file: r.is_new,
-                        content_id: None,
-                        new_version: r.version.into(),
-                        size_bytes: Some(r.size),
-                    }));
+                    self.notify_file_write(&req.path, ctx, r);
                 }
             }
         }

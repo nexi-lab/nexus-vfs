@@ -6,7 +6,8 @@
 
 use crate::core::vfs_router::RouteResult;
 use crate::dispatch::{
-    HookContext, HookIdentity, NativeInterceptHook, Permission, PermissionProvider, WriteHookCtx,
+    HookContext, HookIdentity, NativeInterceptHook, Permission, PermissionProvider, ReadHookCtx,
+    WriteHookCtx,
 };
 
 use super::{Kernel, KernelError, OperationContext, RwLockExt};
@@ -41,6 +42,21 @@ pub struct ServiceDecl {
 }
 
 impl Kernel {
+    /// Apply the read permission gate and native pre-hooks with the same identity.
+    pub(super) fn apply_read_hooks(
+        &self,
+        path: &str,
+        ctx: &OperationContext,
+    ) -> Result<(), KernelError> {
+        self.check_permission(path, Permission::Read, ctx)?;
+        self.dispatch_native_pre(&HookContext::Read(ReadHookCtx {
+            path: path.to_string(),
+            identity: HookIdentity::from(ctx),
+            content: None,
+            content_id: None,
+        }))
+    }
+
     // ── Native INTERCEPT hook dispatch ─────────────────
 
     /// Dispatch PRE-INTERCEPT hooks from NativeHookRegistry.

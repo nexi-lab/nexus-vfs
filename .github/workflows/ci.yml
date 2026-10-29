@@ -59,6 +59,8 @@ jobs:
         run: cargo test -p kernel --test cas_publication
       - name: Durable CAS ObjectStore composition
         run: cargo test -p backends --no-default-features --features driver-cas-local --test cas_durable_backend
+      - name: Logical file size across CAS manifest and partial writes
+        run: cargo test --locked -p backends --no-default-features --features driver-cas-local,driver-path-local,driver-local-connector --lib storage::cas_local::tests::manifest_shaped_content_keeps_its_logical_size_after_partial_writes
 
   durable-runtime:
     name: Durable CAS user runtime / Linux
@@ -82,6 +84,8 @@ jobs:
         run: cargo test --locked -p nexus-cluster --features driver-cas-local --test user_runtime durable_cas_mount_reopens_immutable_content_with_the_owner_boundary
       - name: Immutable peer objects and logical file contents over real gRPC
         run: cargo test --locked -p nexus-cluster --features driver-cas-local --test cas_peer_blob
+      - name: Conditional content through isolated Raft and durable CAS
+        run: cargo test --locked -p nexus-cluster --features driver-cas-local --test conditional_content -- --test-threads=1
       - name: Late peer reads existing sealed stream segments
         run: cargo test --locked -p nexus-cluster --features driver-cas-local --test dt_stream_unbounded joiner_cold_reads_a_sealed_log_and_reports_unavailable_segments
       - uses: actions/checkout@v4

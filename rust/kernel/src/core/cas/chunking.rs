@@ -68,6 +68,38 @@ pub(crate) trait ChunkAssembler: Send + Sync {
 /// `CASEngine::read_content()` — now extracted for composition.
 pub(crate) struct ChunkedManifestAssembler;
 
+/// Recognize exactly the object shape the chunk assembler interprets.
+pub(crate) fn parse_chunk_manifest(data: &[u8]) -> Option<Value> {
+    if data.len() >= 500 * 1024 || data.first() != Some(&b'{') {
+        return None;
+    }
+    let manifest: Value = serde_json::from_slice(data).ok()?;
+    if manifest.get("type").and_then(Value::as_str) == Some("chunked_manifest")
+        && manifest.get("chunks").and_then(Value::as_array).is_some()
+    {
+        Some(manifest)
+    } else {
+        None
+    }
+}
+
+/// Encode literal manifest-shaped bytes as one raw chunk using the canonical format.
+pub(crate) fn write_literal_manifest(
+    content: &[u8],
+    transport: &LocalCASTransport,
+) -> Result<(String, bool), CASError> {
+    let (hash, _) = transport
+        .write_blob_tracked(content)
+        .map_err(CASError::from)?;
+    finalize_manifest(
+        vec![json!({"chunk_hash": hash.as_str(), "offset": 0, "length": content.len()})],
+        1,
+        content.len(),
+        hash,
+        transport,
+    )
+}
+
 impl ChunkAssembler for ChunkedManifestAssembler {
     fn try_reassemble(
         &self,
@@ -76,33 +108,9 @@ impl ChunkAssembler for ChunkedManifestAssembler {
         fetcher: Option<&dyn RemoteChunkFetcher>,
         origins: &[String],
     ) -> Result<Option<Vec<u8>>, CASError> {
-        // Fast reject: only check blobs < 500KB (manifests are always small —
-        // ~100 bytes per chunk entry). Parse as JSON and check the `type`
-        // field directly — key order is not guaranteed across serializers
-        // (serde_json default sorts alphabetically, Python dict preserves
-        // insertion order, so anchored prefix matches are unreliable).
-        if data.len() >= 500 * 1024 {
+        let Some(manifest) = parse_chunk_manifest(data) else {
             return Ok(None);
-        }
-        // Cheap pre-check: must start with `{` to even be JSON object.
-        if data.first() != Some(&b'{') {
-            return Ok(None);
-        }
-
-        let manifest: Value = match serde_json::from_slice(data) {
-            Ok(v) => v,
-            Err(_) => return Ok(None),
         };
-
-        // Only act on blobs whose top-level `type` is `chunked_manifest`;
-        // leaves every other JSON blob untouched.
-        let is_manifest = manifest
-            .get("type")
-            .and_then(|t| t.as_str())
-            .is_some_and(|t| t == "chunked_manifest");
-        if !is_manifest {
-            return Ok(None);
-        }
 
         let chunks = match manifest.get("chunks").and_then(|c| c.as_array()) {
             Some(c) => c,
