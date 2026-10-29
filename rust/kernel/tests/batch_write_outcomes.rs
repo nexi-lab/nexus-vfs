@@ -53,6 +53,7 @@ fn a_commit_failure_keeps_its_request_identity_after_a_miss() {
     ));
     let kernel = Kernel::new();
     let ctx = common::admin_ctx();
+    kernel.mount("/", MountOptions::new(&ctx, "mem")).unwrap();
     kernel
         .mount(
             "/files",
