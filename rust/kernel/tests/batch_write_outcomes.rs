@@ -2,8 +2,9 @@ mod common;
 
 use std::sync::{Arc, Mutex};
 
+use kernel::abc::object_store::{ObjectStore, StorageError, WriteResult};
 use kernel::kernel::convenience::{KernelConvenience, MountOptions};
-use kernel::kernel::{Kernel, WriteRequest};
+use kernel::kernel::{Kernel, OperationContext, WriteRequest};
 use kernel::meta_store::{FileMetadata, LocalMetaStore, MetaStore, MetaStoreError};
 use kernel::{FileEvent, FileEventType, MutationObserver};
 
@@ -43,6 +44,85 @@ impl MutationObserver for Writes {
             self.0.lock().unwrap().push(event.path.clone());
         }
     }
+}
+
+#[derive(Default)]
+struct RefusingBackend(common::MemBackend);
+
+impl ObjectStore for RefusingBackend {
+    fn name(&self) -> &str {
+        "refusing-memory"
+    }
+
+    fn write_content(
+        &self,
+        content: &[u8],
+        content_id: &str,
+        ctx: &OperationContext,
+        offset: u64,
+    ) -> Result<WriteResult, StorageError> {
+        if content == b"refuse" {
+            return Err(StorageError::IOError(std::io::Error::other(
+                "injected backend failure",
+            )));
+        }
+        self.0.write_content(content, content_id, ctx, offset)
+    }
+
+    fn read_content(
+        &self,
+        content_id: &str,
+        ctx: &OperationContext,
+    ) -> Result<Vec<u8>, StorageError> {
+        self.0.read_content(content_id, ctx)
+    }
+}
+
+#[test]
+fn a_backend_failure_is_an_error_while_its_sibling_commits() {
+    let kernel = Kernel::new();
+    let ctx = common::admin_ctx();
+    kernel.mount("/", MountOptions::new(&ctx, "mem")).unwrap();
+    kernel
+        .mount(
+            "/files",
+            MountOptions::new(&ctx, "mem").with_backend(Arc::new(RefusingBackend::default())),
+        )
+        .unwrap();
+    let writes = Arc::new(Writes::default());
+    let handle = kernel.enlist_hook_only_service("write-observer").unwrap();
+    kernel.register_service_observer(&handle, writes.clone(), "writes".into(), u32::MAX);
+    let requests = [
+        WriteRequest {
+            path: "/files/refused".into(),
+            content: b"refuse".to_vec(),
+            offset: 0,
+        },
+        WriteRequest {
+            path: "/files/kept".into(),
+            content: b"saved".to_vec(),
+            offset: 0,
+        },
+    ];
+
+    let results = kernel.sys_write(&requests, &ctx);
+
+    let error = results[0]
+        .as_ref()
+        .err()
+        .expect("backend failure must be reported");
+    assert!(error.to_string().contains("injected backend failure"));
+    assert!(matches!(&results[1], Ok(result) if result.hit));
+    assert_eq!(
+        kernel
+            .read("/files/kept", &ctx, 0, 0)
+            .unwrap()
+            .data
+            .unwrap(),
+        b"saved"
+    );
+    assert!(kernel.read("/files/refused", &ctx, 0, 0).is_err());
+    assert_eq!(*writes.0.lock().unwrap(), ["/files/kept"]);
 }
 
 #[test]
