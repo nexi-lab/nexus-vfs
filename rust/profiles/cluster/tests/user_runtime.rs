@@ -308,20 +308,198 @@ fn bundle(
 }
 
 fn start(data: &Path, credential: &Path, owner: &str, port: u16) -> Daemon {
-    Daemon::spawn(
-        &[
-            "--data-dir",
-            data.to_str().unwrap(),
-            "--bind-addr",
-            &format!("127.0.0.1:{port}"),
-            "serve-user",
-            "--owner",
-            owner,
-            "--credential",
-            credential.to_str().unwrap(),
-        ],
-        &[("RUST_LOG", LOG_FILTER)],
-    )
+    start_with_backends(data, credential, owner, port, None)
+}
+
+fn start_with_backends(
+    data: &Path,
+    credential: &Path,
+    owner: &str,
+    port: u16,
+    config: Option<&Path>,
+) -> Daemon {
+    let bind = format!("127.0.0.1:{port}");
+    let mut arguments = vec![
+        "--data-dir",
+        data.to_str().unwrap(),
+        "--bind-addr",
+        &bind,
+        "serve-user",
+        "--owner",
+        owner,
+        "--credential",
+        credential.to_str().unwrap(),
+    ];
+    if let Some(config) = config {
+        arguments.extend(["--backend-config", config.to_str().unwrap()]);
+    }
+    Daemon::spawn(&arguments, &[("RUST_LOG", LOG_FILTER)])
+}
+
+#[cfg(all(feature = "driver-cas-local", target_os = "linux"))]
+#[tokio::test]
+async fn durable_cas_mount_reopens_immutable_content_with_the_owner_boundary() {
+    let root = tempfile::tempdir().unwrap();
+    let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let (server_cert, server_key) =
+        generate_user_runtime_cert("runtime-alice", "alice", 300, &ca, &ca_key).unwrap();
+    let credential = root.path().join("server");
+    bundle(
+        &credential,
+        "runtime-alice",
+        "alice",
+        &ca,
+        &server_cert,
+        &server_key,
+    );
+    let mut clients = Vec::new();
+    for owner in ["alice", "bob"] {
+        let actor = format!("session-{owner}");
+        let (cert, key) = generate_session_agent_cert(&actor, owner, 300, &ca, &ca_key).unwrap();
+        clients.push(bundle(
+            &root.path().join(owner),
+            &actor,
+            "alice",
+            &ca,
+            &cert,
+            &key,
+        ));
+    }
+    let data = root.path().join("data");
+    let backing = root.path().join("immutable-content");
+    let config = root.path().join("backends.json");
+    std::fs::write(&config, serde_json::to_vec(&serde_json::json!({"mounts": [{
+        "path": "/managed-files", "backend_type": "cas-local-durable", "backend_name": "managed-files",
+        "backend_params": {"local_root": backing}
+    }]})).unwrap()).unwrap();
+    let first = b"first durable runtime image";
+    let next = b"replacement durable runtime image";
+    let port = free_port();
+    for turn in 0..3 {
+        let mut daemon = start_with_backends(&data, &credential, "alice", port, Some(&config));
+        daemon
+            .wait_for_log("confined user runtime ready", BUDGET)
+            .await
+            .unwrap();
+        let mut owner = Vfs::connect_as_agent(port, &clients[0], BUDGET).await;
+        match turn {
+            0 => {
+                owner
+                    .write_file("/plain-note", b"ordinary root image", "")
+                    .await
+                    .unwrap();
+                owner
+                    .write_file("/managed-files/register", first, "")
+                    .await
+                    .unwrap();
+            }
+            1 => {
+                assert_eq!(
+                    owner
+                        .read_file("/managed-files/register", "")
+                        .await
+                        .unwrap(),
+                    first
+                );
+                owner
+                    .write_file("/managed-files/register", next, "")
+                    .await
+                    .unwrap();
+            }
+            _ => assert_eq!(
+                owner
+                    .read_file("/managed-files/register", "")
+                    .await
+                    .unwrap(),
+                next
+            ),
+        }
+        assert_eq!(
+            owner.read_file("/plain-note", "").await.unwrap(),
+            b"ordinary root image"
+        );
+        for bytes in [first.as_slice(), next.as_slice()]
+            .into_iter()
+            .take(if turn == 0 { 1 } else { 2 })
+        {
+            let hash = lib::hash::hash_content(bytes);
+            assert!(backing
+                .join(format!("cas/{}/{}/{hash}", &hash[..2], &hash[2..4]))
+                .is_file());
+        }
+        assert!(!data.join("rootfs/managed-files/register").exists());
+        let mut outsider = dial_client(port, &clients[1]).await.unwrap();
+        let refusal = outsider
+            .read(ReadRequest {
+                path: "/managed-files/register".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_owner_refusal(refusal.is_error, &refusal.error_payload);
+        let unmounted = root.path().join("unmounted");
+        assert!(owner
+            .mount_backend(
+                "/unauthorized",
+                "cas-local-durable",
+                &[("local_root", unmounted.to_str().unwrap())],
+                ""
+            )
+            .await
+            .is_err());
+        assert!(!unmounted.exists());
+        drop(outsider);
+        drop(owner);
+        drop(daemon);
+    }
+}
+
+#[tokio::test]
+async fn required_durable_backend_obeys_build_and_platform_at_startup() {
+    use backends::provider::DefaultObjectStoreProvider;
+    use kernel::hal::object_store_provider::ObjectStoreProvider;
+
+    let root = tempfile::tempdir().unwrap();
+    let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let (cert, key) =
+        generate_user_runtime_cert("runtime-alice", "alice", 300, &ca, &ca_key).unwrap();
+    let credential = root.path().join("server");
+    bundle(&credential, "runtime-alice", "alice", &ca, &cert, &key);
+    let backing = root.path().join("unavailable-content");
+    let config = root.path().join("backends.json");
+    std::fs::write(&config, serde_json::to_vec(&serde_json::json!({"mounts": [{
+        "path": "/managed-files", "backend_type": "cas-local-durable", "backend_name": "managed-files",
+        "backend_params": {"local_root": backing}
+    }]})).unwrap()).unwrap();
+    let mut daemon = start_with_backends(
+        &root.path().join("data"),
+        &credential,
+        "alice",
+        free_port(),
+        Some(&config),
+    );
+    let is_available = DefaultObjectStoreProvider.can_build("cas-local-durable");
+    if is_available && cfg!(target_os = "linux") {
+        daemon
+            .wait_for_log("confined user runtime ready", BUDGET)
+            .await
+            .unwrap();
+        assert!(backing.is_dir());
+    } else {
+        let output = daemon
+            .wait_exit(BUDGET)
+            .await
+            .expect("unsupported required backend must refuse startup");
+        let diagnostic = if is_available {
+            "complete CAS durability is not qualified on this platform"
+        } else {
+            "is unavailable in this build"
+        };
+        assert!(output.contains(diagnostic), "{output}");
+        assert!(!backing.exists());
+        assert!(!output.contains("confined user runtime ready"));
+    }
 }
 
 #[cfg(feature = "driver-ai")]

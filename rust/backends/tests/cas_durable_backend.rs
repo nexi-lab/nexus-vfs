@@ -1,6 +1,49 @@
 //! Qualify the ObjectStore composition using the shared native CAS fault fixture.
 #![cfg(feature = "driver-cas-local")]
 
+use std::{collections::HashMap, path::Path, sync::Arc};
+
+use backends::provider::DefaultObjectStoreProvider;
+use kernel::abc::object_store::ObjectStore;
+use kernel::hal::object_store_provider::{ObjectStoreProvider, ObjectStoreProviderArgs};
+
+fn from_provider(root: &Path, fsync: Option<&str>) -> Result<Arc<dyn ObjectStore>, String> {
+    let peer = kernel::hal::peer::NoopPeerBlobClient::arc();
+    let runtime = Arc::new(
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap(),
+    );
+    let mut parameters = HashMap::from([("local_root".into(), root.to_str().unwrap().into())]);
+    if let Some(fsync) = fsync {
+        parameters.insert("fsync".into(), fsync.into());
+    }
+    DefaultObjectStoreProvider
+        .build(&ObjectStoreProviderArgs {
+            backend_type: "cas-local-durable",
+            backend_name: "durable-fixture",
+            mount_path: Some("/managed"),
+            backend_params: &parameters,
+            peer_client: &peer,
+            self_address: None,
+            runtime: &runtime,
+        })?
+        .backend
+        .ok_or_else(|| "provider returned no backend".into())
+}
+
+#[test]
+fn durable_factory_refuses_a_second_publication_policy_before_creating_storage() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("new-storage");
+    assert!(DefaultObjectStoreProvider.can_build("cas-local-durable"));
+    for fsync in ["false", "true", ""] {
+        let error = from_provider(&root, Some(fsync)).err().unwrap();
+        assert!(error.contains("fsync"), "{error}");
+        assert!(!root.exists());
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use backends::storage::cas_local::CasLocalBackend;
@@ -12,6 +55,14 @@ mod linux {
     use std::time::{Duration, Instant};
 
     const CONTENT: &[u8] = b"complete immutable backend object";
+
+    fn backend(root: &Path, source: &str) -> std::sync::Arc<dyn ObjectStore> {
+        match source {
+            "constructor" => std::sync::Arc::new(CasLocalBackend::new_durable(root).unwrap()),
+            "provider" => super::from_provider(root, None).unwrap(),
+            _ => panic!("unknown fixture source: {source}"),
+        }
+    }
 
     fn context() -> kernel::kernel::OperationContext {
         kernel::kernel::OperationContext::new("test", "root", false, None, false)
@@ -31,7 +82,8 @@ mod linux {
         let Ok(root) = std::env::var("NEXUS_CAS_BACKEND_ROOT") else {
             return;
         };
-        let backend = CasLocalBackend::new_durable(Path::new(&root)).unwrap();
+        let source = std::env::var("NEXUS_CAS_BACKEND_SOURCE").unwrap();
+        let backend = backend(Path::new(&root), &source);
         let result = backend.write_content(CONTENT, "", &context(), 0);
         let fault = std::env::var("NEXUS_CAS_SYNC_FAULT").unwrap();
         if fault.is_empty() {
@@ -89,12 +141,17 @@ mod linux {
             String::from_utf8_lossy(&compile.stderr)
         );
         let hash = lib::hash::hash_content(CONTENT);
-        for fault in ["", "staged-file", "published-dir", "existing-file"] {
-            let root = fixture
-                .path()
-                .join(if fault.is_empty() { "success" } else { fault });
+        for (source, fault) in ["constructor", "provider"].into_iter().flat_map(|source| {
+            ["", "staged-file", "published-dir", "existing-file"]
+                .into_iter()
+                .map(move |fault| (source, fault))
+        }) {
+            let root = fixture.path().join(format!(
+                "{source}-{}",
+                if fault.is_empty() { "success" } else { fault }
+            ));
             let target = root.join(format!("cas/{}/{}/{hash}", &hash[..2], &hash[2..4]));
-            let trace = fixture.path().join(format!("{fault}-trace"));
+            let trace = fixture.path().join(format!("{source}-{fault}-trace"));
             let original_inode = if fault == "existing-file" {
                 std::fs::create_dir_all(target.parent().unwrap()).unwrap();
                 std::fs::write(&target, CONTENT).unwrap();
@@ -105,6 +162,7 @@ mod linux {
             let child = Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "linux::durable_backend_worker", "--nocapture"])
                 .env("NEXUS_CAS_BACKEND_ROOT", &root)
+                .env("NEXUS_CAS_BACKEND_SOURCE", source)
                 .env("LD_PRELOAD", &library)
                 .env("NEXUS_CAS_SYNC_ROOT", &root)
                 .env("NEXUS_CAS_SYNC_TARGET", &target)
@@ -157,7 +215,7 @@ mod linux {
                     "native injected failure must be observed"
                 );
             }
-            let backend = CasLocalBackend::new_durable(&root).unwrap();
+            let backend = backend(&root, source);
             assert_eq!(
                 backend
                     .write_content(CONTENT, "", &context(), 0)
@@ -206,5 +264,7 @@ fn unqualified_platform_refuses_before_creating_storage() {
         .err()
         .unwrap();
     assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    assert!(!root.exists());
+    assert!(from_provider(&root, None).is_err());
     assert!(!root.exists());
 }

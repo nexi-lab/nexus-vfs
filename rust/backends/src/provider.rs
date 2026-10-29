@@ -97,6 +97,8 @@ pub fn supported_backend_types() -> &'static [&'static str] {
         "path_local",
         #[cfg(feature = "driver-cas-local")]
         "cas-local",
+        #[cfg(feature = "driver-cas-local")]
+        "cas-local-durable",
         #[cfg(feature = "driver-local-connector")]
         "local_connector",
         #[cfg(feature = "driver-remote")]
@@ -131,20 +133,25 @@ impl ObjectStoreProvider for DefaultObjectStoreProvider {
             }
 
             #[cfg(feature = "driver-cas-local")]
-            "cas-local" => {
-                let root = required_param(p, "local_root", "cas-local")?;
-                let fsync = bool_param(p, "fsync");
+            "cas-local" | "cas-local-durable" => {
+                let root = required_param(p, "local_root", args.backend_type)?;
+                let backend = if args.backend_type == "cas-local-durable" {
+                    if p.contains_key("fsync") {
+                        return Err("cas-local-durable fixes its publication barriers; fsync applies to cas-local".into());
+                    }
+                    crate::storage::cas_local::CasLocalBackend::new_durable(Path::new(root))
+                } else {
+                    crate::storage::cas_local::CasLocalBackend::new(
+                        Path::new(root),
+                        bool_param(p, "fsync"),
+                    )
+                }
+                .map_err(|e| format!("{} init at '{root}': {e}", args.backend_type))?;
                 let fetcher = Arc::new(kernel::cas_remote::GrpcChunkFetcher::new(
                     Arc::clone(args.peer_client),
                     args.self_address.map(String::from),
                 ));
-                let backend = crate::storage::cas_local::CasLocalBackend::new_with_fetcher(
-                    Path::new(root),
-                    fsync,
-                    fetcher,
-                )
-                .map_err(|e| format!("cas-local init at '{root}': {e}"))?;
-                Ok(backend_only(Arc::new(backend)))
+                Ok(backend_only(Arc::new(backend.with_fetcher(fetcher))))
             }
 
             #[cfg(feature = "driver-local-connector")]
