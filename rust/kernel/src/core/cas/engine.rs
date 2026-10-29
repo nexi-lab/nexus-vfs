@@ -11,11 +11,9 @@
 //! - Multipart upload
 //! - Write callbacks (e.g., Zoekt reindex)
 
-use std::io;
-use std::sync::{Arc, RwLock};
-
-use bloomfilter::Bloom;
 use serde_json::{json, Value};
+use std::io;
+use std::sync::Arc;
 
 use super::chunking::{finalize_manifest, read_and_verify_chunk, ChunkingStrategy};
 use super::remote::RemoteChunkFetcher;
@@ -79,10 +77,6 @@ pub struct CASEngine {
     /// chunk miss falls through to a bounded fan-out RPC against the
     /// file's origin set. `None` = local-only (tests, single-node).
     fetcher: Option<Arc<dyn RemoteChunkFetcher>>,
-    /// Best-effort bloom filter for fast content_exists negative cache.
-    /// Updated on every write_content; checked in content_exists to avoid
-    /// filesystem stat for known-absent hashes. ~0 false negatives.
-    bloom: RwLock<Bloom<str>>,
 }
 
 #[allow(dead_code)]
@@ -96,13 +90,7 @@ impl CASEngine {
             chunk_assembler: Some(super::chunking::default_chunk_assembler()),
             chunking_strategy: Some(super::chunking::default_chunking_strategy()),
             fetcher: None,
-            bloom: RwLock::new(Self::new_bloom()),
         }
-    }
-
-    /// Create a fresh bloom filter (100k expected items, 1% FP rate).
-    fn new_bloom() -> Bloom<str> {
-        Bloom::new_for_fp_rate(100_000, 0.01).expect("bloom filter creation")
     }
 
     /// Construct with an explicit chunking strategy. LLM backends inject
@@ -117,7 +105,6 @@ impl CASEngine {
             chunk_assembler: Some(super::chunking::default_chunk_assembler()),
             chunking_strategy: Some(strategy),
             fetcher: None,
-            bloom: RwLock::new(Self::new_bloom()),
         }
     }
 
@@ -174,34 +161,26 @@ impl CASEngine {
     /// Like `write_content` but also reports whether the top-level blob/
     /// manifest hash was actually written (`true`) or hit CAS dedup (`false`).
     /// Surfaces the bit Python's on_write_callback (Zoekt reindex) relies on.
-    /// Updates the bloom filter so subsequent `content_exists` checks hit.
     pub fn write_content_tracked(&self, content: &[u8]) -> Result<(String, bool), CASError> {
-        let result = if let Some(strategy) = &self.chunking_strategy {
-            if strategy.should_chunk(content) {
-                strategy.write_chunked(content, &self.transport)?
-            } else {
-                self.transport.write_blob_tracked(content)?
+        match &self.chunking_strategy {
+            Some(strategy) if strategy.should_chunk(content) => {
+                strategy.write_chunked(content, &self.transport)
             }
-        } else {
-            self.transport.write_blob_tracked(content)?
-        };
-        // Update bloom filter (best-effort — poisoned lock is non-fatal).
-        if let Ok(mut bloom) = self.bloom.write() {
-            bloom.set(&result.0);
+            _ => self
+                .transport
+                .write_blob_tracked(content)
+                .map_err(CASError::from),
         }
-        Ok(result)
     }
 
     /// Check if content exists by hash.
     ///
-    /// Uses bloom filter as fast negative cache: if bloom says "not present",
-    /// skip the filesystem stat. False positives fall through to transport.
+    /// The shared transport owns presence across engine instances and restarts.
     pub fn content_exists(&self, content_id: &str) -> bool {
-        // Bloom fast-reject: definitely absent → skip I/O.
-        if let Ok(bloom) = self.bloom.read() {
-            if !bloom.check(content_id) {
-                return false;
-            }
+        if content_id.len() != blake3::OUT_LEN * 2
+            || !content_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return false;
         }
         self.transport.exists(content_id)
     }
