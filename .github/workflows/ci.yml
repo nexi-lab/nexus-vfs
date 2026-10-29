@@ -210,6 +210,11 @@ jobs:
         with:
           shared-key: ci-check-ubuntu-22.04
       - run: cargo check --workspace
+      - name: Check storage and consensus feature boundaries
+        run: |
+          cargo check --locked -p raft@0.1.0 --no-default-features
+          cargo check --locked -p raft@0.1.0 --no-default-features --features consensus
+          cargo check --locked -p kernel --no-default-features
       - name: Check generated contracts
         run: cargo run -p contracts --bin contractgen -- --check
 

@@ -3,6 +3,17 @@
 /// Commit budget shared by local proposals, forwarding and forwarded RPCs.
 pub(crate) const PROPOSAL_TIMEOUT_SECS: u64 = 10;
 
+pub(super) async fn wait_for_commit(
+    receiver: tokio::sync::oneshot::Receiver<super::Result<super::CommandResult>>,
+    deadline: tokio::time::Instant,
+) -> super::Result<super::CommandResult> {
+    match tokio::time::timeout_at(deadline, receiver).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(super::RaftError::ProposalDropped),
+        Err(_) => Err(super::RaftError::Timeout(PROPOSAL_TIMEOUT_SECS)),
+    }
+}
+
 #[cfg(all(feature = "grpc", has_protos))]
 pub(super) async fn retry_leader_refusals<T, F, Fut>(
     deadline: tokio::time::Instant,

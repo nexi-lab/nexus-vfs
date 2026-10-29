@@ -494,7 +494,8 @@ fn command_result_to_proto(result: &CommandResult) -> RaftResponse {
             error: Some(e.clone()),
             result: None,
         },
-        CommandResult::ConditionalMetadata { .. } => RaftResponse {
+        CommandResult::ConditionalMetadata { .. }
+        | CommandResult::ConditionalMetadataUnsupported => RaftResponse {
             success: false,
             error: Some("versioned metadata is not supported by this legacy response".into()),
             result: None,

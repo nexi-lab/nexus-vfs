@@ -1,4 +1,4 @@
-//! `extensions/` — opt-in §3.A.2 ObjectStore extension traits.
+//! `extensions/` — opt-in storage-pillar extension traits.
 //!
 //! The §3.A storage HAL has two flavors of contract:
 //!
@@ -7,15 +7,15 @@
 //!   [`crate::abc`], one trait file each.
 //! * **Opt-in extensions** — sub-capabilities a backend MAY expose so
 //!   the kernel can drive a richer syscall against it.  Each is reached
-//!   through an `ObjectStore::as_*() -> Option<&dyn Ext>` downcast, so
+//!   through a pillar's `as_*() -> Option<&dyn Ext>` method, so
 //!   the extension trait DECLARATION must sit at the kernel boundary
-//!   (the method signature in [`crate::abc::object_store`] references
+//!   (the pillar method signature references
 //!   it).  Those declarations live here.
 //!
 //! This directory is the home for the second flavor.  It's a sibling to
 //! `abc/` (pillars), `hal/` (§3.B control-plane DI surfaces), and
 //! `core/` (§4 primitives) — a fourth tier-directory whose members are
-//! all ObjectStore extension-trait declarations, nothing else.
+//! all optional storage-pillar extension declarations.
 //!
 //! Concrete impls never live here — they live in `rust/backends/` next
 //! to the backend that opts in (e.g. `OpenAIBackend` /
@@ -23,6 +23,8 @@
 //!
 //! Current members:
 //!
+//! * [`conditional_metadata`] — atomic metadata snapshots and replacements
+//!   (reached via `MetaStore::as_conditional_metadata`).
 //! * [`llm_streaming`] — `LlmStreamingBackend`, connector-backend SSE
 //!   streaming (reached via `ObjectStore::as_llm_streaming`).
 //!
@@ -31,4 +33,5 @@
 //! cross the dylib C-ABI), not an `as_*` extension trait — it lives in
 //! `crate::core::metadata_sync`.
 
+pub mod conditional_metadata;
 pub mod llm_streaming;

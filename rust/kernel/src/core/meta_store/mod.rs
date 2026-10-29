@@ -22,6 +22,10 @@ mod coherence_tests;
 // flat `crate::meta_store::…` shim) reach the canonical declaration in
 // `crate::abc::meta_store` without churn. This is a stable compat
 // alias, not a parallel declaration.
+pub use crate::extensions::conditional_metadata::{
+    ConditionalMetadata, ConditionalMetadataError, ConditionalMetadataResult, MetadataSnapshot,
+};
+
 pub use crate::abc::meta_store::{
     pas_update_content_id, FileMetadata, MetaStore, MetaStoreError, PaginatedList, PathEtag,
     PathValueStr, PutIfVersionResult, StreamSegment, DT_DIR, DT_EXTERNAL_STORAGE, DT_LINK,

@@ -114,6 +114,12 @@ impl LocalCASTransport {
         Self::with_durability(root_path, WriteDurability::FileAndDirectory)
     }
 
+    /// Whether successful publication includes complete bytes and namespace barriers.
+    /// The constructor selects this policy for the transport's lifetime.
+    pub fn has_durable_publication(&self) -> bool {
+        self.durability == WriteDurability::FileAndDirectory
+    }
+
     fn with_durability(root_path: &Path, durability: WriteDurability) -> io::Result<Self> {
         std::fs::create_dir_all(root_path)?;
         let root = if durability == WriteDurability::FileAndDirectory {
@@ -407,6 +413,7 @@ mod tests {
     #[test]
     fn test_write_and_read_blob() {
         let (_tmp, transport) = setup();
+        assert!(!transport.has_durable_publication());
         let content = b"hello world";
 
         let hash = transport.write_blob(content).unwrap();
@@ -559,6 +566,7 @@ mod tests {
     fn test_fsync_on_write() {
         let tmp = TempDir::new().unwrap();
         let transport = LocalCASTransport::new(tmp.path(), true).unwrap();
+        assert!(!transport.has_durable_publication());
 
         // fsync=true should still produce correct output
         let content = b"fsync content";

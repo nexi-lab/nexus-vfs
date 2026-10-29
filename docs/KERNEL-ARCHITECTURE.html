@@ -710,7 +710,7 @@ graph TB
 graph LR
     subgraph KDIR["rust/kernel/src/"]
         ABC["abc/ &mdash; the 3 &sect;3.A pillars<br/>(meta_store.rs, object_store.rs, cache_store.rs)"]
-        EXT["extensions/ &mdash; opt-in ObjectStore extensions<br/>(LlmStreamingBackend, ObserverBackend)"]
+        EXT["extensions/ &mdash; opt-in storage-pillar extensions<br/>(LlmStreamingBackend, ConditionalMetadata)"]
         HAL["hal/ &mdash; the &sect;3.B DI surfaces<br/>(distributed_coordinator, object_store_provider,<br/>auth_key_store)"]
         CORE["core/ &mdash; concrete kernel primitives (&sect;4)"]
     end
@@ -730,6 +730,20 @@ graph LR
 <p><strong>Orthogonality.</strong> Between pillars = different query patterns. Within pillars = interchangeable drivers (deployment-time config). See <a href="https://github.com/nexi-lab/nexus-vfs/blob/main/docs/data-storage-matrix.md">data-storage-matrix</a>.</p>
 
 <p><strong>Rust naming note:</strong> <code>MetaStore</code> (two-word PascalCase) matches <code>ObjectStore</code> / <code>CacheStore</code> for visual symmetry. The Python ABC stays <code>MetastoreABC</code> (one word) &mdash; the Python tier is on a sunset path, so the Rust trait carries the forward-looking name.</p>
+
+<h4 id="storage-pillar-extensions">Optional storage-pillar extensions</h4>
+
+<p>A pillar exposes an optional capability through its <code>as_*()</code> method. Interface declarations and their result types live in <code>rust/kernel/src/extensions/</code>; concrete implementations live beside the storage owner. The table below owns the extension-file inventory consumed by CI.</p>
+
+<table id="storage-pillar-extension-inventory">
+  <thead><tr><th>Pillar</th><th>Selector</th><th>Interface declaration</th><th>Capability</th></tr></thead>
+  <tbody>
+    <tr><td><code>ObjectStore</code></td><td><code>as_llm_streaming</code></td><td><code>rust/kernel/src/extensions/llm_streaming.rs</code></td><td><code>LlmStreamingBackend</code>: model-streaming storage operations</td></tr>
+    <tr><td><code>MetaStore</code></td><td><code>as_conditional_metadata</code></td><td><code>rust/kernel/src/extensions/conditional_metadata.rs</code></td><td><code>ConditionalMetadata</code>: one committed image/revision snapshot and atomic conditional replacement</td></tr>
+  </tbody>
+</table>
+
+<p>The conditional metadata extension is one requirement of <a href="conditional-content.md">conditional visible-content writes</a>. Immutable-object publication and the authenticated content operation provide the other storage and kernel boundaries.</p>
 
 <h4 id="metastore-abc">3.A.1 <code>MetaStore</code> &mdash; Inode Layer <span class="role-badge">Linux analogue: <code>struct inode_operations</code></span></h4>
 
@@ -764,7 +778,7 @@ graph TB
     OS -->|"streaming variants"| STREAM["stream_read / stream_write<br/>(large blobs)"]
     OS -->|"backends that support them"| DIR["mkdir / rmdir / list_dir"]
     OS -->|"optional (capability-dependent)"| REN["rename"]
-    OS -.->|"opt-in via as_*() downcast<br/>(extension trait, NOT mandatory pillar)"| EXT["LlmStreamingBackend<br/>ObserverBackend"]
+    OS -.->|"optional capability via as_*()"| EXT["LlmStreamingBackend"]
 
     classDef opt fill:none,stroke:#94a3b8,stroke-dasharray:4 3
     class DIR,REN,EXT opt

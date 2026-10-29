@@ -6,6 +6,9 @@ on:
   pull_request:
     paths:
       - 'rust/raft/**'
+      - 'rust/kernel/src/abc/meta_store.rs'
+      - 'rust/kernel/src/core/meta_store/**'
+      - 'rust/kernel/src/extensions/conditional_metadata.rs'
       - 'rust/profiles/cluster/**'
       - 'rust/managed_agent/**'
       - 'rust/lib/src/transport_primitives/**'
@@ -33,6 +36,8 @@ jobs:
           shared-key: node-control-${{ matrix.os }}
       - run: cargo test --locked -p raft@0.1.0 --test node_rpc_boundaries
       - run: cargo test --locked -p raft@0.1.0 --test generated_contract_binding
+      - name: Conditional metadata and isolated membership boundaries
+        run: cargo test --locked -p raft@0.1.0 --test test_conditional_zone_metadata --test test_conditional_metadata_ec_boundary --test test_isolated_root_admission -- --test-threads=1
       - run: cargo test --locked -p raft@0.1.0 --lib transport::node_authority::tests
       - run: cargo test --locked -p raft@0.1.0 --lib agent_csr_client::tests
       - run: cargo test --locked -p nexus-cluster --lib

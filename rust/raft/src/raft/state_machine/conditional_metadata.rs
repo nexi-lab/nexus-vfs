@@ -90,10 +90,13 @@ impl FullStateMachine {
         if value.is_none() {
             return Ok(VersionedMetadata::default());
         }
-        if version.as_ref().is_none_or(|v| v.len() != TOKEN_LEN) {
-            return Err(super::super::RaftError::InvalidState(
-                "metadata key has no committed content revision".into(),
+        if version.is_none() {
+            return Err(super::super::RaftError::UnsupportedOperation(
+                "metadata key has no committed content revision",
             ));
+        }
+        if version.as_ref().is_some_and(|v| v.len() != TOKEN_LEN) {
+            return Err(storage_error("invalid committed content revision"));
         }
         Ok(VersionedMetadata { value, version })
     }
@@ -102,8 +105,8 @@ impl FullStateMachine {
         if is_managed_key(key) {
             Ok(())
         } else {
-            Err(super::super::RaftError::InvalidState(
-                "conditional content unsupported outside the managed metadata subtree".into(),
+            Err(super::super::RaftError::UnsupportedOperation(
+                "conditional content outside the managed metadata subtree",
             ))
         }
     }
@@ -203,18 +206,14 @@ impl FullStateMachine {
         incarnation: [u8; 16],
     ) -> Result<CommandResult> {
         if !is_managed_key(key) {
-            return Ok(CommandResult::Error(
-                "conditional content unsupported outside the managed metadata subtree".into(),
-            ));
+            return Ok(CommandResult::ConditionalMetadataUnsupported);
         }
         let current = self.metadata_in_txn(txn, key)?;
         let version = self.revision_in_txn(txn, key)?;
         // The first image MUST travel in the SC create command. An occupied
         // unversioned legacy key is not eligible for automatic admission.
         if current.is_some() && version.is_none() {
-            return Ok(CommandResult::Error(
-                "conditional content unsupported for an occupied unversioned legacy key".into(),
-            ));
+            return Ok(CommandResult::ConditionalMetadataUnsupported);
         }
         let current = Self::versioned_image(current, version)?;
         if current.version.as_deref() != expected {
@@ -243,6 +242,21 @@ impl FullStateMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_corrupt_committed_revision_is_a_storage_failure() {
+        assert!(matches!(
+            FullStateMachine::versioned_image(
+                Some(b"pointer".to_vec()),
+                Some(vec![1; TOKEN_LEN - 1])
+            ),
+            Err(super::super::super::RaftError::Storage(_))
+        ));
+        assert!(matches!(
+            FullStateMachine::versioned_image(Some(b"legacy".to_vec()), None),
+            Err(super::super::super::RaftError::UnsupportedOperation(_))
+        ));
+    }
 
     fn machine(dir: &std::path::Path) -> (RedbStore, FullStateMachine) {
         let store = RedbStore::open(dir.join("state.redb")).unwrap();
@@ -393,7 +407,7 @@ mod tests {
                 &write("/__managed_content_v1__/legacy", b"force-create", None)
             )
             .unwrap(),
-            CommandResult::Error(_)
+            CommandResult::ConditionalMetadataUnsupported
         ));
         assert!(sm
             .get_versioned_metadata("/__managed_content_v1__/legacy")
@@ -634,7 +648,7 @@ mod tests {
             .is_err());
         assert!(matches!(
             sm.apply(1, &write("/legacy", b"unexpected", None)).unwrap(),
-            CommandResult::Error(_)
+            CommandResult::ConditionalMetadataUnsupported
         ));
         let key = "/__managed_content_v1__/cursor";
         let first = committed(

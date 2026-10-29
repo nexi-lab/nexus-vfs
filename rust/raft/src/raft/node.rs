@@ -1289,6 +1289,13 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
                 "conditional metadata proposals are not activated".into(),
             ));
         }
+        self.enqueue_proposal(command)
+    }
+
+    fn enqueue_proposal(
+        &self,
+        command: &Command,
+    ) -> Result<oneshot::Receiver<Result<CommandResult>>> {
         if !self.is_leader() {
             return Err(RaftError::NotLeader {
                 leader_hint: self.leader_hint_addr(),
@@ -1307,6 +1314,49 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             .map_err(channel_try_send_err)?;
 
         Ok(rx)
+    }
+
+    /// FixedLocal validates restored history and excludes membership and peer
+    /// ingress for its complete lifetime. Its sole voter executes this code.
+    #[cfg(all(feature = "grpc", has_protos))]
+    pub(crate) fn supports_conditional_metadata(&self) -> bool {
+        self.config.membership_policy == super::MembershipPolicy::FixedLocal
+    }
+
+    /// Publish through the existing SC actor on an enforced isolated runtime.
+    /// Generic and forwarded proposal doors retain their activation refusal.
+    #[cfg(all(feature = "grpc", has_protos))]
+    pub(crate) async fn replace_conditional_metadata(
+        &self,
+        key: String,
+        value: Vec<u8>,
+        expected: Option<Vec<u8>>,
+        incarnation: [u8; 16],
+    ) -> Result<CommandResult> {
+        if !self.supports_conditional_metadata() {
+            return Err(RaftError::UnsupportedOperation(
+                "conditional metadata requires fixed local membership",
+            ));
+        }
+        let command = Command::WriteVersionedMetadata {
+            key,
+            value,
+            expected,
+            incarnation,
+        };
+        let receiver = self.enqueue_proposal(&command)?;
+        // Once enqueued, any failure without a proven refusal is ambiguous.
+        // The state machine may have committed before its answer was lost.
+        match super::proposal::wait_for_commit(
+            receiver,
+            tokio::time::Instant::now() + Duration::from_secs(PROPOSAL_TIMEOUT_SECS),
+        )
+        .await
+        {
+            Err(error @ RaftError::NotLeader { .. }) => Err(error),
+            Err(error) => Err(RaftError::ProposalOutcomeUnknown(error.to_string())),
+            result => result,
+        }
     }
 
     /// Propose a command with Eventual Consistency — fire and forget.
@@ -1334,17 +1384,18 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         match self.submit_to_channel(&command) {
             Ok(rx) => {
                 // Leader path: wait for commit
-                match tokio::time::timeout(Duration::from_secs(PROPOSAL_TIMEOUT_SECS), rx).await {
+                match super::proposal::wait_for_commit(
+                    rx,
+                    tokio::time::Instant::now() + Duration::from_secs(PROPOSAL_TIMEOUT_SECS),
+                )
+                .await
+                {
                     // The actor may process a leadership change after the handle
                     // checked its cached role. A definite pre-submit refusal can
                     // use the normal leader-forwarding path without replaying a
                     // command that may already have committed.
-                    Ok(Ok(Err(RaftError::NotLeader { .. }))) => {
-                        self.forward_to_leader(command).await
-                    }
-                    Ok(Ok(result)) => result,
-                    Ok(Err(_)) => Err(RaftError::ProposalDropped),
-                    Err(_) => Err(RaftError::Timeout(PROPOSAL_TIMEOUT_SECS)),
+                    Err(RaftError::NotLeader { .. }) => self.forward_to_leader(command).await,
+                    result => result,
                 }
             }
             Err(RaftError::NotLeader { .. }) => {
@@ -1389,6 +1440,8 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             })
             .await;
         }
+        #[cfg(not(all(feature = "grpc", has_protos)))]
+        let _ = command;
         Err(RaftError::NotLeader {
             leader_hint: self.leader_hint_addr(),
         })
@@ -1430,13 +1483,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
                 }
                 match self.submit_to_channel(command) {
                     Ok(rx) => {
-                        let remaining =
-                            deadline.saturating_duration_since(tokio::time::Instant::now());
-                        return match tokio::time::timeout(remaining, rx).await {
-                            Ok(Ok(result)) => result,
-                            Ok(Err(_)) => Err(RaftError::ProposalDropped),
-                            Err(_) => Err(RaftError::Timeout(PROPOSAL_TIMEOUT_SECS)),
-                        };
+                        return super::proposal::wait_for_commit(rx, deadline).await;
                     }
                     Err(RaftError::NotLeader { .. }) => continue,
                     Err(e) => return Err(e),
