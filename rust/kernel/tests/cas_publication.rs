@@ -8,6 +8,62 @@ use std::time::{Duration, Instant};
 use kernel::core::cas::engine::{CASEngine, CASError};
 use kernel::core::cas::transport::LocalCASTransport;
 
+#[test]
+fn cas_exists_survives_reopening_the_persistent_store() {
+    let root = tempfile::tempdir().unwrap();
+    let content = b"durable bytes from the earlier engine instance";
+    let hash = {
+        let engine = CASEngine::new(LocalCASTransport::new(root.path(), true).unwrap());
+        let hash = engine.write_content(content).unwrap();
+        assert!(engine.content_exists(&hash));
+        hash
+    };
+    let reopened = CASEngine::new(LocalCASTransport::new(root.path(), true).unwrap());
+    assert_eq!(reopened.read_content(&hash).unwrap(), content);
+    assert!(
+        reopened.content_exists(&hash),
+        "existing persistent content must be discoverable after reopen"
+    );
+}
+
+#[test]
+fn cas_exists_observes_other_engines_using_the_same_store() {
+    let root = tempfile::tempdir().unwrap();
+    let observer = CASEngine::new(LocalCASTransport::new(root.path(), true).unwrap());
+    let publisher = CASEngine::new(LocalCASTransport::new(root.path(), true).unwrap());
+    let content = b"one immutable store shared by two engine views";
+    let hash = publisher.write_content(content).unwrap();
+    assert_eq!(observer.read_content(&hash).unwrap(), content);
+    assert!(
+        observer.content_exists(&hash),
+        "a second engine must observe the published object"
+    );
+    publisher.delete_content(&hash).unwrap();
+    assert!(!observer.content_exists(&hash));
+}
+
+#[test]
+fn cas_exists_refuses_invalid_addresses_without_panicking() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = CASEngine::new(LocalCASTransport::new(root.path(), true).unwrap());
+    engine
+        .write_content(b"initialize the physical CAS directories")
+        .unwrap();
+    for invalid in [
+        String::new(),
+        "x".into(),
+        "abc".into(),
+        "z".repeat(64),
+        "\u{1f4be}".repeat(16),
+        "/".repeat(64),
+    ] {
+        assert!(
+            !engine.content_exists(&invalid),
+            "invalid address: {invalid:?}"
+        );
+    }
+}
+
 fn interrupted_final_object() -> (tempfile::TempDir, LocalCASTransport, Vec<u8>, String) {
     let root = tempfile::tempdir().unwrap();
     let transport = LocalCASTransport::new(root.path(), true).unwrap();
@@ -351,16 +407,9 @@ fn cas_process_worker() {
 
     #[cfg(target_os = "linux")]
     if let Some(mode) = role.strip_prefix("fail-") {
-        // Exercise a real short write followed by EFBIG, isolated to this child.
-        // This never changes limits or signal handlers in the parent test runner.
-        let limit = libc::rlimit {
-            rlim_cur: 4096,
-            rlim_max: 4096,
-        };
-        unsafe {
-            assert_ne!(libc::signal(libc::SIGXFSZ, libc::SIG_IGN), libc::SIG_ERR);
-            assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limit), 0);
-        }
+        // Keep the real EFBIG injection within the storage operation. Libtest
+        // must regain its original file limit before reporting the result.
+        let _limit = ScopedFileSizeLimit::new();
         let content = vec![42; 64 * 1024];
         let hash = lib::hash::hash_content(&content);
         let error = match mode {
@@ -376,7 +425,51 @@ fn cas_process_worker() {
 }
 
 #[cfg(target_os = "linux")]
+struct ScopedFileSizeLimit {
+    previous: libc::rlimit,
+    previous_signal: libc::sighandler_t,
+}
+
+#[cfg(target_os = "linux")]
+impl ScopedFileSizeLimit {
+    fn new() -> Self {
+        unsafe {
+            let mut previous = std::mem::zeroed();
+            assert_eq!(libc::getrlimit(libc::RLIMIT_FSIZE, &mut previous), 0);
+            assert!(previous.rlim_cur >= 4096);
+            let previous_signal = libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            assert_ne!(previous_signal, libc::SIG_ERR);
+            let guard = Self {
+                previous,
+                previous_signal,
+            };
+            let limit = libc::rlimit {
+                rlim_cur: 4096,
+                rlim_max: guard.previous.rlim_max,
+            };
+            assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limit), 0);
+            guard
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ScopedFileSizeLimit {
+    fn drop(&mut self) {
+        unsafe {
+            assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &self.previous), 0);
+            assert_ne!(
+                libc::signal(libc::SIGXFSZ, self.previous_signal),
+                libc::SIG_ERR
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn failed_publication(mode: &str) {
+    use std::io::Write;
+
     let root = tempfile::tempdir().unwrap();
     let transport = LocalCASTransport::new(root.path(), true).unwrap();
     let hash = lib::hash::hash_content(&vec![42; 64 * 1024]);
@@ -384,8 +477,18 @@ fn failed_publication(mode: &str) {
     if mode == "meta" {
         transport.write_meta(&hash, previous_meta).unwrap();
     }
-    let mut worker = Worker::spawn(root.path(), &format!("fail-{mode}"), 0);
+    let log_path = root.path().join("worker.log");
+    let mut log = std::fs::File::create(&log_path).unwrap();
+    // A regular stdout file already beyond the injected limit deterministically
+    // exercises restoration before libtest emits its completion report.
+    log.write_all(&[b' '; 8192]).unwrap();
+    let mut worker = Worker::spawn_with(root.path(), &format!("fail-{mode}"), 0, |command| {
+        command.stdout(log);
+    });
     wait_until(|| worker.is_finished());
+    assert!(std::fs::read_to_string(log_path)
+        .unwrap()
+        .contains("test result: ok. 1 passed;"));
     assert!(
         !transport.blob_path(&hash).exists(),
         "failed write published a partial blob"
