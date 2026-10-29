@@ -66,14 +66,14 @@ pub fn classify_from_request<T>(
 // cert-parse / signature-verify code here means it is compiled ONCE instead of
 // monomorphized across every request type (that duplication is real binary size).
 
-fn from_extensions(ext: &tonic::Extensions) -> Option<PeerIdentity> {
+pub(crate) fn from_extensions(ext: &tonic::Extensions) -> Option<PeerIdentity> {
     with_leaf_der(ext, |der| {
         current_certificate(der).map(|cert| from_x509(&cert))
     })
     .flatten()
 }
 
-fn classify_from_extensions(
+pub(crate) fn classify_from_extensions(
     ext: &tonic::Extensions,
     cluster_ca_der: &[u8],
     foreign_anchors: &[ForeignCaAnchor],

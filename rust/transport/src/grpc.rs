@@ -303,36 +303,49 @@ pub(crate) async fn resolve_request_context<T: AuthedRequest>(
              (no distributed coordinator) — retry",
         ));
     }
-    if let Some(ctx) = req.extensions().get::<AuthenticatedRequestContext>() {
+    resolve_request_identity(
+        auth,
+        foreign_ca_verifier,
+        runtime_scope,
+        req.get_ref().auth_token(),
+        req.extensions(),
+        req.metadata(),
+    )
+}
+
+// Identity depends on the envelope, independently of the protobuf message type.
+// Keep one compiled resolver for every VFS and ZoneRuntime request shape.
+#[inline(never)]
+fn resolve_request_identity(
+    auth: &Arc<dyn AuthProvider>,
+    foreign_ca_verifier: &ForeignCaVerifierSlot,
+    runtime_scope: Option<&Arc<RuntimeScope>>,
+    token: &str,
+    extensions: &tonic::Extensions,
+    metadata: &tonic::metadata::MetadataMap,
+) -> Result<OperationContext, Status> {
+    if let Some(ctx) = extensions.get::<AuthenticatedRequestContext>() {
         return Ok(ctx.0.clone());
     }
     // Reclassify against CURRENT roots even when the foreign set is empty.
     // A connection established before its last foreign anchor was removed
     // still carries that leaf; parsing it as local would revive its identity.
     let peer = match foreign_ca_verifier.get() {
-        Some(v) => {
-            peer_identity::classify_from_request(req, v.cluster_ca_der(), &v.foreign_anchors())
-        }
-        None => peer_identity::from_request(req),
+        Some(v) => peer_identity::classify_from_extensions(
+            extensions,
+            v.cluster_ca_der(),
+            &v.foreign_anchors(),
+        ),
+        None => peer_identity::from_extensions(extensions),
     };
     let ctx = auth.resolve(&AuthCredentials {
-        token: req.get_ref().auth_token(),
+        token,
         peer: peer.as_ref(),
     })?;
     let ctx = match runtime_scope {
-        Some(scope) => scope.resolve(
-            auth.as_ref(),
-            ctx,
-            peer.as_ref(),
-            req.get_ref().auth_token(),
-            req.metadata(),
-        )?,
+        Some(scope) => scope.resolve(auth.as_ref(), ctx, peer.as_ref(), token, metadata)?,
         None => {
-            if req
-                .metadata()
-                .get_bin(RUNTIME_DELEGATION_METADATA_KEY)
-                .is_some()
-            {
+            if metadata.get_bin(RUNTIME_DELEGATION_METADATA_KEY).is_some() {
                 return Err(Status::permission_denied(
                     "runtime delegation is not enabled on this endpoint",
                 ));
