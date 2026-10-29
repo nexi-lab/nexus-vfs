@@ -46,6 +46,7 @@ pub mod collaboration_identity;
 pub mod federation;
 /// VFS gRPC server (in-bound). Always compiled.
 pub mod grpc;
+mod grpc_conditional_content;
 #[cfg(test)]
 mod grpc_metadata_access_tests;
 #[cfg(test)]

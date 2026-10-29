@@ -22,6 +22,10 @@ service NexusVFSService {
   // Typed RPCs for content operations — native bytes, no JSON/base64.
   rpc Read(ReadRequest) returns (ReadResponse);
   rpc Write(WriteRequest) returns (WriteResponse);
+  // Coherent snapshots and conditional complete-file replacement are a pair.
+  // Each path must provide atomic metadata and durable immutable publication.
+  rpc ReadVersioned(ReadVersionedRequest) returns (ReadVersionedResponse);
+  rpc WriteIfVersion(WriteIfVersionRequest) returns (WriteIfVersionResponse);
   // Native permissions on local reference storage. Older servers return
   // UNIMPLEMENTED; an unsupported backend must never acknowledge a fake mode.
   rpc Chmod(ChmodRequest) returns (ChmodResponse);
@@ -154,16 +158,7 @@ message WriteRequest {
   string path = 1;
   bytes content = 2;       // Raw file bytes — no base64
   string auth_token = 3;
-  // Field 4 (`content_id` — documented as "If-Match" conditional
-  // write) removed for issue #5.  The server never enforced it, so
-  // the documented optimistic-concurrency contract was a silent
-  // no-op that would mask concurrent-writer data loss in any
-  // client that trusted it.  Dropped rather than half-implemented
-  // per YAGNI: the `content_id` at rest is a hash (CAS backends)
-  // or a path (PAS backends), neither of which is the right shape
-  // for a versioning token.  If optimistic-write semantics come
-  // back later, key off `WriteResponse.gen` (monotonic version)
-  // via an explicit `expected_gen` field, not `content_id`.
+  // Conditional replacement uses WriteIfVersion and its opaque snapshot token.
   reserved 4;
   reserved "content_id";
 }
@@ -174,6 +169,56 @@ message WriteResponse {
   bool is_error = 3;
   bytes error_payload = 4;
   uint64 gen = 5;
+}
+
+message ReadVersionedRequest {
+  string path = 1;
+  string auth_token = 2;
+}
+
+message VersionedContent {
+  bytes content = 1;
+  bytes version = 2; // Opaque token associated with exactly these bytes.
+}
+
+message AbsentContent {}
+
+message ConditionalContentFailure {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    UNSUPPORTED = 1;
+    FAILED = 2; // The operation definitely did not publish a new file image.
+    UNKNOWN = 3; // Publication may have committed; resolve through readback.
+  }
+  Kind kind = 1;
+  string message = 2;
+}
+
+message ReadVersionedResponse {
+  oneof outcome {
+    VersionedContent snapshot = 1;
+    AbsentContent absent = 2;
+    ConditionalContentFailure failure = 3;
+  }
+}
+
+message WriteIfVersionRequest {
+  string path = 1;
+  bytes content = 2; // The complete replacement image.
+  string auth_token = 3;
+  optional bytes expected_version = 4; // Absent requires an absent file.
+}
+
+message ConditionalContentConflict {
+  optional bytes current_version = 1; // Absent when the file is absent.
+}
+
+message WriteIfVersionResponse {
+  oneof outcome {
+    bytes committed_version = 1;
+    ConditionalContentConflict conflict = 2;
+    ConditionalContentFailure failure = 3;
+  }
 }
 
 message ChmodRequest {
@@ -242,6 +287,9 @@ message PingResponse {
   string version = 1;
   string zone_id = 2;
   int64 uptime_seconds = 3;
+  // Protocol support for the ReadVersioned/WriteIfVersion pair. Version 1
+  // defines the messages above; storage support is determined for each path.
+  uint32 conditional_content_version = 4;
 }
 
 // --- Batch read (Issue #4058) ---

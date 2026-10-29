@@ -92,13 +92,15 @@ per-request auth token, so every method takes one.
 | `callBinary(method, payload, authToken)` | Generic dispatch with raw bytes, for protobuf plugin methods (`password-vault.*`). |
 | `read(path, authToken)` | Read a VFS path; returns raw bytes. |
 | `write(path, content, authToken)` | Write raw bytes to a VFS path. |
+| `readVersioned(path, authToken)` | Read a coherent content/version snapshot, or `null` for an absent file. |
+| `writeIfVersion(path, content, expectedVersion, authToken)` | Replace complete contents against an opaque token; `null` requires absence. Returns committed version or conflict. |
 | `delete(path, authToken)` | Delete a VFS path. |
 | `stat(path, authToken)` | Metadata for a path, or `null` when it does not exist. |
 | `exists(path, authToken)` | Whether a path exists. Throws on any failure that is not a clean not-found. |
 | `readdir(path, authToken)` | A directory's immediate children as `{ name, entryType }`. |
 | `mkdir(path, authToken, { parents?, existOk? })` | Create a directory. |
 | `ping(authToken)` | Liveness; resolves to the server's version string. |
-| `serverInfo(authToken)` | Version, zone and uptime, from the typed `Ping` RPC. |
+| `serverInfo(authToken)` | Version, zone, uptime and paired conditional-content protocol support, from typed `Ping`. |
 | `rotateTls(tls)` | Prepare a new mTLS channel; new calls use it while existing calls drain. |
 | `maintainSessionCredential(credential, { validitySecs, renew })` | Renew a controller credential in memory for the client's lifetime. |
 | `close()` | Stop renewal and cancel outstanding calls on every channel. |
@@ -106,7 +108,7 @@ per-request auth token, so every method takes one.
 `endpoint` accepts `host:port` or a `http(s)://` URL.
 
 Filesystem operations are typed RPCs of their own — `Read`, `Write`, `Delete`,
-`Stat`, `Readdir`, `Mkdir`, `Rename`, `Setattr`, `Ping` — not names you pass to
+`ReadVersioned`, `WriteIfVersion`, `Stat`, `Readdir`, `Mkdir`, `Rename`, `Setattr`, `Ping` — not names you pass to
 `call()`. `call()` reaches the registry operations (`get_mount_points`,
 `add_mount`, …) and `<service>.<method>` plugin dispatch; asking it for `mkdir`
 or `readdir` answers `unknown Call method`. Use the methods above.
@@ -114,6 +116,10 @@ or `readdir` answers `unknown Call method`. Use the methods above.
 An RPC that fails in transport rejects with `gRPC <op> failed: <details>`. An
 RPC that reaches the server but fails there rejects with the server's error
 payload verbatim.
+
+The conditional pair exposes `NexusConditionalContentError.kind` and the
+snapshot/replacement results defined in the
+[conditional content contract](../../docs/conditional-content.md).
 
 ## Managed sessions
 

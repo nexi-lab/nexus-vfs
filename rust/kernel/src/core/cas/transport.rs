@@ -69,6 +69,9 @@ enum WriteDurability {
     FileAndDirectory,
 }
 
+/// Qualification shared by durable construction and its capability query.
+const NAMESPACE_DURABILITY_QUALIFIED: bool = cfg!(target_os = "linux");
+
 /// Pure Rust CAS transport for local filesystem blob I/O.
 ///
 /// Thread-safe: all mutable state is behind `Mutex`. Designed to be shared
@@ -105,7 +108,7 @@ impl LocalCASTransport {
     /// error may contain PublishedButNotDurable after a complete object becomes
     /// visible; retry verifies and synchronizes that object without replacing it.
     pub fn new_durable(root_path: &Path) -> io::Result<Self> {
-        if !cfg!(target_os = "linux") {
+        if !NAMESPACE_DURABILITY_QUALIFIED {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "complete CAS durability is not qualified on this platform",
@@ -116,8 +119,9 @@ impl LocalCASTransport {
 
     /// Whether successful publication includes complete bytes and namespace barriers.
     /// The constructor selects this policy for the transport's lifetime.
+    #[inline]
     pub fn has_durable_publication(&self) -> bool {
-        self.durability == WriteDurability::FileAndDirectory
+        NAMESPACE_DURABILITY_QUALIFIED && self.durability == WriteDurability::FileAndDirectory
     }
 
     fn with_durability(root_path: &Path, durability: WriteDurability) -> io::Result<Self> {

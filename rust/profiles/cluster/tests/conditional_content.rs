@@ -1,6 +1,9 @@
 //! Qualify the kernel content boundary with the actual isolated actor and durable CAS.
 #![cfg(all(feature = "driver-cas-local", target_os = "linux"))]
 
+#[path = "conditional_content/rpc.rs"]
+mod rpc;
+
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
 

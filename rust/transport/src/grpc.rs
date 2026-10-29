@@ -35,11 +35,12 @@ use kernel::kernel::vfs_proto::{
     DeleteResponse, GetXattrBulkItem, GetXattrBulkRequest, GetXattrBulkResponse, GetXattrRequest,
     GetXattrResponse, InspectTargetRequest, InspectTargetResponse, IpcAck, IpcEmpty,
     IpcHasResponse, IpcPathRequest, LockRequest, LockResponse, MkdirRequest, MkdirResponse,
-    PingRequest, PingResponse, ReadRequest, ReadResponse, ReaddirEntry, ReaddirRequest,
-    ReaddirResponse, RenameRequest, RenameResponse, SetXattrRequest, SetXattrResponse,
-    SetattrRequest, SetattrResponse, StatRequest, StatResponse, StreamCollectAllResponse,
-    StreamReadAtRequest, StreamReadAtResponse, StreamWriteRequest, StreamWriteResponse,
-    UnlockRequest, UnlockResponse, WatchRequest, WatchResponse, WriteRequest, WriteResponse,
+    PingRequest, PingResponse, ReadRequest, ReadResponse, ReadVersionedRequest,
+    ReadVersionedResponse, ReaddirEntry, ReaddirRequest, ReaddirResponse, RenameRequest,
+    RenameResponse, SetXattrRequest, SetXattrResponse, SetattrRequest, SetattrResponse,
+    StatRequest, StatResponse, StreamCollectAllResponse, StreamReadAtRequest, StreamReadAtResponse,
+    StreamWriteRequest, StreamWriteResponse, UnlockRequest, UnlockResponse, WatchRequest,
+    WatchResponse, WriteIfVersionRequest, WriteIfVersionResponse, WriteRequest, WriteResponse,
 };
 use kernel::kernel::{Kernel, KernelError, OperationContext};
 use kernel::Permission;
@@ -246,6 +247,7 @@ impl_authed_request!(
     MkdirRequest,
     PingRequest,
     ReadRequest,
+    ReadVersionedRequest,
     ReaddirRequest,
     RenameRequest,
     SetXattrRequest,
@@ -257,6 +259,7 @@ impl_authed_request!(
     UnlockRequest,
     WatchRequest,
     WriteRequest,
+    WriteIfVersionRequest,
 );
 
 /// An identity already resolved for this in-process request. Extensions never
@@ -300,36 +303,49 @@ pub(crate) async fn resolve_request_context<T: AuthedRequest>(
              (no distributed coordinator) — retry",
         ));
     }
-    if let Some(ctx) = req.extensions().get::<AuthenticatedRequestContext>() {
+    resolve_request_identity(
+        auth,
+        foreign_ca_verifier,
+        runtime_scope,
+        req.get_ref().auth_token(),
+        req.extensions(),
+        req.metadata(),
+    )
+}
+
+// Identity depends on the envelope, independently of the protobuf message type.
+// Keep one compiled resolver for every VFS and ZoneRuntime request shape.
+#[inline(never)]
+fn resolve_request_identity(
+    auth: &Arc<dyn AuthProvider>,
+    foreign_ca_verifier: &ForeignCaVerifierSlot,
+    runtime_scope: Option<&Arc<RuntimeScope>>,
+    token: &str,
+    extensions: &tonic::Extensions,
+    metadata: &tonic::metadata::MetadataMap,
+) -> Result<OperationContext, Status> {
+    if let Some(ctx) = extensions.get::<AuthenticatedRequestContext>() {
         return Ok(ctx.0.clone());
     }
     // Reclassify against CURRENT roots even when the foreign set is empty.
     // A connection established before its last foreign anchor was removed
     // still carries that leaf; parsing it as local would revive its identity.
     let peer = match foreign_ca_verifier.get() {
-        Some(v) => {
-            peer_identity::classify_from_request(req, v.cluster_ca_der(), &v.foreign_anchors())
-        }
-        None => peer_identity::from_request(req),
+        Some(v) => peer_identity::classify_from_extensions(
+            extensions,
+            v.cluster_ca_der(),
+            &v.foreign_anchors(),
+        ),
+        None => peer_identity::from_extensions(extensions),
     };
     let ctx = auth.resolve(&AuthCredentials {
-        token: req.get_ref().auth_token(),
+        token,
         peer: peer.as_ref(),
     })?;
     let ctx = match runtime_scope {
-        Some(scope) => scope.resolve(
-            auth.as_ref(),
-            ctx,
-            peer.as_ref(),
-            req.get_ref().auth_token(),
-            req.metadata(),
-        )?,
+        Some(scope) => scope.resolve(auth.as_ref(), ctx, peer.as_ref(), token, metadata)?,
         None => {
-            if req
-                .metadata()
-                .get_bin(RUNTIME_DELEGATION_METADATA_KEY)
-                .is_some()
-            {
+            if metadata.get_bin(RUNTIME_DELEGATION_METADATA_KEY).is_some() {
                 return Err(Status::permission_denied(
                     "runtime delegation is not enabled on this endpoint",
                 ));
@@ -661,7 +677,7 @@ impl VfsServiceImpl {
 /// reads, VFS write lock waits, sys_watch up to 30s). Running those inline
 /// parks a worker, and enough concurrent blocking calls starve the raft-
 /// shared runtime. Offloading to the blocking pool keeps async workers free.
-async fn run_blocking<F, T>(f: F) -> Result<T, Status>
+pub(crate) async fn run_blocking<F, T>(f: F) -> Result<T, Status>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
@@ -673,6 +689,20 @@ where
 
 #[tonic::async_trait]
 impl NexusVfsService for VfsServiceImpl {
+    async fn read_versioned(
+        &self,
+        req: Request<ReadVersionedRequest>,
+    ) -> Result<Response<ReadVersionedResponse>, Status> {
+        self.read_versioned_content(req).await
+    }
+
+    async fn write_if_version(
+        &self,
+        req: Request<WriteIfVersionRequest>,
+    ) -> Result<Response<WriteIfVersionResponse>, Status> {
+        self.write_content_if_version(req).await
+    }
+
     async fn chmod(&self, req: Request<ChmodRequest>) -> Result<Response<ChmodResponse>, Status> {
         let (ctx, req) = match self.authenticate(req).await {
             Ok(value) => value,
@@ -1615,6 +1645,7 @@ impl NexusVfsService for VfsServiceImpl {
             version: self.server_version.to_string(),
             zone_id: ctx.zone_id,
             uptime_seconds: uptime,
+            conditional_content_version: 1,
         }))
     }
 
@@ -2362,6 +2393,18 @@ pub(crate) mod tests {
 
     #[tonic::async_trait]
     impl NexusVfsService for HubStub {
+        async fn read_versioned(
+            &self,
+            _: Request<ReadVersionedRequest>,
+        ) -> Result<Response<ReadVersionedResponse>, Status> {
+            Err(Status::unimplemented("conditional content is unsupported"))
+        }
+        async fn write_if_version(
+            &self,
+            _: Request<WriteIfVersionRequest>,
+        ) -> Result<Response<WriteIfVersionResponse>, Status> {
+            Err(Status::unimplemented("conditional content is unsupported"))
+        }
         async fn chmod(&self, _: Request<ChmodRequest>) -> Result<Response<ChmodResponse>, Status> {
             Err(Status::unimplemented("test hub has no local files"))
         }
