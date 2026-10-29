@@ -36,6 +36,10 @@ pub enum RaftError {
     #[error("proposal dropped")]
     ProposalDropped,
 
+    /// A remote proposal failed without a definite pre-submission refusal.
+    #[error("proposal outcome unknown: {0}")]
+    ProposalOutcomeUnknown(String),
+
     /// Proposal timed out waiting for consensus.
     #[error("proposal timed out after {0} seconds")]
     Timeout(u64),
@@ -109,7 +113,7 @@ impl RaftError {
     pub fn proposal_outcome_unknown(&self) -> bool {
         match self {
             // Sent, no answer: the leader may have committed it.
-            Self::Transport(_) | Self::Timeout(_) => true,
+            Self::Transport(_) | Self::Timeout(_) | Self::ProposalOutcomeUnknown(_) => true,
             // raft-rs discards a proposal on a leadership change, and whether the
             // previous leader had already replicated it is not knowable from here.
             Self::ProposalDropped => true,

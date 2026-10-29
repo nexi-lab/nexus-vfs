@@ -50,6 +50,8 @@ mod membership_policy;
 #[cfg(feature = "consensus")]
 mod node;
 #[cfg(feature = "consensus")]
+mod proposal;
+#[cfg(feature = "consensus")]
 mod storage;
 #[cfg(all(feature = "grpc", has_protos))]
 mod zone_registry;
@@ -69,6 +71,8 @@ pub use state_machine::{
 pub use membership_policy::MembershipPolicy;
 #[cfg(feature = "consensus")]
 pub use node::{ConfStateAppliedCb, RaftConfig, RaftMsg, ZoneConsensus, ZoneConsensusDriver};
+#[cfg(feature = "consensus")]
+pub(crate) use proposal::PROPOSAL_TIMEOUT_SECS;
 #[cfg(feature = "consensus")]
 pub use storage::RaftStorage;
 #[cfg(all(feature = "grpc", has_protos))]

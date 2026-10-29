@@ -107,17 +107,20 @@ async fn enrollment_journey(is_pre_enrolled: bool) {
         ("NEXUS_ACCEPT_ENROLLMENTS", "true"),
         ("NEXUS_CLUSTER_INIT", ZONE),
         ("NEXUS_CLUSTER_INIT_MOUNTS", mounts.as_str()),
-        ("RUST_LOG", LOG_FILTER),
         // NEXUS_NO_TLS deliberately UNSET — TLS is ON (the founder owns the CA).
         // NEXUS_API_KEY_SECRET deliberately UNSET — an auth-on founder
         // SELF-GENERATES the durable cluster secret at bootstrap (like the CA),
         // so the minimal-info contract is "founder states neither secret nor peers".
     ];
-    let mut founder = Daemon::spawn(&["--bind-addr", &fadv], &founder_env);
+    let mut founder = Daemon::spawn_default_logging(&["--bind-addr", &fadv], &founder_env);
     founder
         .wait_for_log("Static topology applied", BUDGET)
         .await
         .expect("founder forms + persists sharedzone over mTLS");
+    founder
+        .wait_for_log("VFS data plane ready", BUDGET)
+        .await
+        .expect("default runtime logging exposes complete founder readiness");
 
     // The founder set NO NEXUS_API_KEY_SECRET, yet an auth-on founder must
     // SELF-PROVISION a durable cluster secret at bootstrap (the same way it
