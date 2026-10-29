@@ -54,7 +54,11 @@ response and an unrecognized outcome remain Unknown. Read failures remain
 distinct from absence.
 
 The Rust `RpcTransport` and Node `NexusVfsClient` expose the same content/token
-and result semantics. The Node API represents an absent precondition or file
+and result semantics. Rust's asynchronous calls in
+`rpc_transport::conditional_content` accept an existing typed client and request
+envelope, preserving its channel, caller credentials, metadata, deadlines and
+message limits. `RpcTransport` delegates to those same calls for blocking use.
+The Node API represents an absent precondition or file
 with `null`; Rust uses `None`. Both clients reject an empty expected token before
 dispatch. Both clients preserve a typed Unsupported result from an older server.
 

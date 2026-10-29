@@ -15,7 +15,7 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity
 
 use crate::kernel::vfs_proto;
 
-mod conditional_content;
+pub mod conditional_content;
 
 /// Optional TLS material for the remote connection.
 #[derive(Debug, Clone)]
