@@ -81,7 +81,7 @@ impl ObjectStore for CasLocalBackend {
         offset: u64,
     ) -> Result<WriteResult, StorageError> {
         if offset == 0 {
-            // Fast path: full-content write (new hash = hash(content)).
+            // Full-content writes can produce a blob or a chunk manifest.
             let hash = self.0.write_content(content).map_err(StorageError::from)?;
             return Ok(WriteResult {
                 version: hash.clone(),
@@ -100,22 +100,14 @@ impl ObjectStore for CasLocalBackend {
                 "CasLocalBackend partial write requires content_id (old hash)",
             )));
         }
-        let new_hash = self
+        let result = self
             .0
             .write_partial(content_id, content, offset, &[])
             .map_err(StorageError::from)?;
-        // New size = max(old_size, offset + content.len()). For the common
-        // case of splice-within-bounds we'd need a get_content_size call;
-        // read_content_size is available so use it.
-        let new_size = self
-            .0
-            .content_size(&new_hash)
-            .map_err(StorageError::from)
-            .unwrap_or(offset + content.len() as u64);
         Ok(WriteResult {
-            version: new_hash.clone(),
-            size: new_size,
-            content_id: new_hash,
+            version: result.content_id.clone(),
+            size: result.size,
+            content_id: result.content_id,
         })
     }
 
@@ -126,7 +118,7 @@ impl ObjectStore for CasLocalBackend {
     }
 
     fn get_content_size(&self, content_id: &str) -> Result<u64, StorageError> {
-        self.0.content_size(content_id).map_err(StorageError::from)
+        self.0.get_size(content_id).map_err(StorageError::from)
     }
 }
 #[cfg(test)]
@@ -210,6 +202,43 @@ mod tests {
         assert_eq!(
             backend.get_content_size(&r.content_id).unwrap(),
             content.len() as u64
+        );
+    }
+
+    #[test]
+    fn manifest_shaped_content_keeps_its_logical_size_after_partial_writes() {
+        let (_tmp, backend) = setup();
+        let ctx = test_ctx();
+        let content = br#"{"type":"chunked_manifest","total_size":0,"chunks":[]}"#;
+        let original = backend.write_content(content, "", &ctx, 0).unwrap();
+        assert_eq!(original.size, content.len() as u64);
+        assert_eq!(
+            backend.get_content_size(&original.content_id).unwrap(),
+            original.size
+        );
+        let written = backend
+            .write_content(b" ", &original.content_id, &ctx, 1)
+            .unwrap();
+        assert_eq!(written.size, original.size);
+        assert_eq!(
+            backend.get_content_size(&written.content_id).unwrap(),
+            written.size
+        );
+        let mut expected = content.to_vec();
+        expected[1] = b' ';
+        assert_eq!(
+            backend.read_content(&written.content_id, &ctx).unwrap(),
+            expected
+        );
+
+        let extended = backend
+            .write_content(b"tail", &written.content_id, &ctx, original.size + 3)
+            .unwrap();
+        expected.extend_from_slice(b"\0\0\0tail");
+        assert_eq!(extended.size, expected.len() as u64);
+        assert_eq!(
+            backend.read_content(&extended.content_id, &ctx).unwrap(),
+            expected
         );
     }
 

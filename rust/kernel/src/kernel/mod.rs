@@ -87,6 +87,7 @@ pub mod vfs_proto {
 // Each submodule carries an `impl Kernel` block over a method subset.
 // Every method remains a member of `Kernel` and is invoked the same
 // way.
+pub mod conditional_content;
 pub mod convenience;
 mod dispatch;
 // The service-boot declaration type consumed by `Kernel::bring_up_services`.

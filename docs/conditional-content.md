@@ -289,6 +289,39 @@ file syscalls and RPCs keep their existing contracts. The public conditional
 content pair, authenticated kernel integration, actual released artifact and
 reader-register adoption require the subsequent delivery slices below.
 
+### Kernel content boundary
+
+`Kernel::read_versioned_content` and `Kernel::replace_content_if_version` compose
+the metadata extension with the mounted CAS engine's constructor-selected durable
+publication policy. Both guarantees belong to the resolved mount. The metastore
+owns zone-relative key translation, including aliases of the managed subtree.
+
+Read selects one metadata image and its revision, then reads the immutable
+content identifier from that image. Missing metadata returns absence. A missing,
+corrupt or incorrectly sized object returns a storage failure. Replacement stages
+the complete immutable content, then compares and commits its pointer through the
+existing metadata transaction. A conflict preserves the visible image; staged
+objects remain under the existing CAS retention ownership.
+
+The ordinary read permission/pre-hook seam and mutating write-hook seam also
+govern this pair. Directory links re-enter those gates with the original caller's
+identity at the target. Ordinary and conditional writes share metadata construction
+and successful-commit notifications. Conflict and failure produce their typed
+result before success notifications.
+
+The Rust pair lives in `kernel/conditional_content.rs`. It composes the kernel's
+existing storage and dispatch primitives alongside the syscall implementation;
+the public transport pair and consumer adoption use the delivery contract below.
+
+CAS file writes preserve literal bytes that have the same JSON shape as a chunk
+manifest by storing them as one raw chunk inside the existing canonical manifest
+format. Readers use the same manifest recognition function as writers. Raw
+immutable-object requests retain the bytes addressed by the requested hash.
+Partial writes return their logical byte length with the new content identifier;
+the ObjectStore uses that result when constructing file metadata. The existing
+CAS `content_size` operation measures the physical blob, while `get_size` measures
+the logical file.
+
 ### Content and consumer delivery
 
 1. Freeze the public RPC/token contract with the S6 consumer, including the zone
