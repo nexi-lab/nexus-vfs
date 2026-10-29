@@ -129,19 +129,7 @@ pub(crate) fn read_and_verify_chunk(
     origins: &[String],
 ) -> Result<Vec<u8>, CASError> {
     match transport.read_blob(expected_hash) {
-        Ok(data) => {
-            let actual = lib::hash::hash_content(&data);
-            if actual != expected_hash {
-                return Err(CASError::IOError(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "chunk hash mismatch: expected {}, got {}",
-                        expected_hash, actual
-                    ),
-                )));
-            }
-            Ok(data)
-        }
+        Ok(data) => Ok(data),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // Scatter-gather fall-back: pull from a peer, hash-verify again,
             // write-back to local CAS, return. Idempotent for CAS.

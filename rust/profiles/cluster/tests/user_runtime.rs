@@ -453,6 +453,44 @@ async fn durable_cas_mount_reopens_immutable_content_with_the_owner_boundary() {
         drop(owner);
         drop(daemon);
     }
+    let hash = lib::hash::hash_content(next);
+    let object = backing.join(format!("cas/{}/{}/{hash}", &hash[..2], &hash[2..4]));
+    let corrupted = b"a different durable runtime image";
+    std::fs::write(&object, corrupted).unwrap();
+    let mut daemon = start_with_backends(&data, &credential, "alice", port, Some(&config));
+    daemon
+        .wait_for_log("confined user runtime ready", BUDGET)
+        .await
+        .unwrap();
+    let mut owner = Vfs::connect_as_agent(port, &clients[0], BUDGET).await;
+    assert_eq!(
+        owner.read_file("/plain-note", "").await.unwrap(),
+        b"ordinary root image"
+    );
+    std::fs::create_dir(data.join("rootfs/untracked-directory")).unwrap();
+    let error = owner
+        .read_file("/untracked-directory", "")
+        .await
+        .unwrap_err();
+    assert!(error.contains("backend read failed"), "{error}");
+    let error = owner
+        .read_file("/managed-files/register", "")
+        .await
+        .unwrap_err();
+    assert!(error.contains("content hash"), "{error}");
+    assert_eq!(std::fs::read(&object).unwrap(), corrupted);
+    owner
+        .write_file("/managed-files/register", b"a complete replacement", "")
+        .await
+        .unwrap();
+    assert_eq!(
+        owner
+            .read_file("/managed-files/register", "")
+            .await
+            .unwrap(),
+        b"a complete replacement"
+    );
+    assert_eq!(std::fs::read(object).unwrap(), corrupted);
 }
 
 #[tokio::test]
