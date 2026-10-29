@@ -1,0 +1,17 @@
+name: Prepare Rust tests
+description: Install the pinned Rust/protobuf tools and restore the selected test cache
+inputs:
+  cache-key:
+    description: Cache ownership for one native test dependency graph
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: ./.github/actions/setup-protoc
+    - uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        cache: false
+    - uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: ${{ inputs.cache-key }}
+        save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
