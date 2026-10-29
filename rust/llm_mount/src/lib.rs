@@ -32,6 +32,10 @@
 //! on the same HTTP origin, allowing Chat Completions and Responses with the
 //! same mount-owned credential. The caller still selects only an endpoint.
 //!
+//! Model HTTP clients allow ten seconds for DNS, TCP and TLS connection setup.
+//! A connection timeout returns a 504 response through the same exchange, so the
+//! caller's request policy owns retries and their budget.
+//!
 //! The reply starts with JSON `{"type":"response","version":1,"status":200,
 //! "headers":{...}}`. Each body record is one zero byte followed by unchanged
 //! HTTP response bytes, including SSE framing. JSON `done` (with session hash)

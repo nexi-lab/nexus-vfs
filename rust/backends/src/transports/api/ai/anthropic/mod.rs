@@ -57,10 +57,7 @@ impl AnthropicBackend {
     ) -> std::io::Result<Self> {
         let transport = LocalCASTransport::new(blob_root, false)?;
         let engine = CASEngine::with_strategy(transport, Arc::new(MessageBoundaryStrategy));
-        let http = crate::http::http_client_builder()
-            .pool_idle_timeout(std::time::Duration::from_secs(60))
-            .build()
-            .map_err(|e| std::io::Error::other(format!("reqwest build: {e}")))?;
+        let http = super::http_client()?;
         Ok(Self {
             backend_name: name.to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),

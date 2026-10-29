@@ -392,3 +392,59 @@ fn an_upstream_disconnect_is_a_gateway_response_not_a_policy_refusal() {
         worker.join().unwrap();
     }
 }
+
+#[test]
+fn a_stalled_tls_handshake_returns_a_gateway_timeout() {
+    for (provider, path) in [("anthropic", "v1/messages"), ("openai", "chat/completions")] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("https://{}", listener.local_addr().unwrap());
+        let (release, released) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let until = Instant::now() + Duration::from_secs(10);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < until, "upstream was never connected");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                }
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut first = [0_u8; 1];
+            socket.read_exact(&mut first).unwrap();
+            assert_eq!(first[0], 22, "the caller must start a TLS handshake");
+            // Keep TCP alive while withholding the TLS server handshake.
+            let _ = released.recv_timeout(Duration::from_secs(25));
+        });
+        let (kernel, _storage) = mount(provider, &url);
+        kernel
+            .write(
+                "/model/request.prompt",
+                &caller(),
+                &serde_json::to_vec(&exchange(path)).unwrap(),
+                0,
+            )
+            .unwrap();
+        let records = read_reply(&kernel);
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        let head: Value = serde_json::from_slice(&records[0]).unwrap();
+        assert_eq!(head["type"], "response");
+        assert_eq!(head["status"], 504);
+        let body: Vec<u8> = records
+            .iter()
+            .filter(|record| record.first() == Some(&0))
+            .flat_map(|record| record[1..].iter().copied())
+            .collect();
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"]["type"], "upstream_connection_error");
+        let done: Value = serde_json::from_slice(records.last().unwrap()).unwrap();
+        assert_eq!(done["type"], "done");
+    }
+}
