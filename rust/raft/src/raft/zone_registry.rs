@@ -268,6 +268,7 @@ pub struct ZoneRaftRegistry {
     hosted: dashmap::DashSet<String>,
     /// Base path for sled databases. Each zone gets `{base_path}/{zone_id}/`.
     base_path: PathBuf,
+    membership_policy: super::MembershipPolicy,
     /// This node's global ID (same across all zones on this node).
     node_id: u64,
     /// Shared TLS config — can be updated at runtime for plaintext→mTLS upgrade.
@@ -340,20 +341,13 @@ impl ZoneRaftRegistry {
     /// * `base_path` — Base directory for zone sled databases.
     /// * `node_id` — This node's ID (used across all zones).
     pub fn new(base_path: PathBuf, node_id: u64) -> Self {
-        Self {
-            zones: DashMap::new(),
-            hosted: dashmap::DashSet::new(),
-            base_path,
-            node_id,
-            tls: Arc::new(RwLock::new(None)),
-            self_address: Arc::new(RwLock::new(String::new())),
-            identity_dir: Arc::new(RwLock::new(None)),
-            deletion_epoch_source: RwLock::new(None),
-            creating: DashMap::new(),
-            recently_removed: DashMap::new(),
-            materialization: RwLock::new(None),
-            on_materialized: RwLock::new(Vec::new()),
-        }
+        Self::with_tls(base_path, node_id, None)
+    }
+
+    pub(crate) fn isolated_root(base_path: PathBuf, node_id: u64) -> Self {
+        let mut registry = Self::new(base_path, node_id);
+        registry.membership_policy = super::MembershipPolicy::FixedLocal;
+        registry
     }
 
     /// Create a new empty registry with TLS configuration.
@@ -362,6 +356,7 @@ impl ZoneRaftRegistry {
             zones: DashMap::new(),
             hosted: dashmap::DashSet::new(),
             base_path,
+            membership_policy: super::MembershipPolicy::Managed,
             node_id,
             tls: Arc::new(RwLock::new(tls)),
             self_address: Arc::new(RwLock::new(String::new())),
@@ -655,6 +650,9 @@ impl ZoneRaftRegistry {
         learner: bool,
         runtime_handle: &tokio::runtime::Handle,
     ) -> Result<ZoneConsensus<FullStateMachine>, TransportError> {
+        self.membership_policy
+            .require_managed()
+            .map_err(|error| TransportError::Connection(error.to_string()))?;
         self.clear_auto_join_suppression(zone_id);
         // Per raft contract: joining nodes start uninitialized (empty ConfState).
         // The leader will send a snapshot with the correct voter set after
@@ -776,6 +774,14 @@ impl ZoneRaftRegistry {
                 continue;
             }
             let zone_id = entry.file_name().to_string_lossy().into_owned();
+            if self.membership_policy == super::MembershipPolicy::FixedLocal
+                && zone_id != contracts::ROOT_ZONE_ID
+                && ZonePersistence::looks_like_zone_dir(&entry.path())
+            {
+                return Err(TransportError::Connection(
+                    "isolated root storage contains another zone".into(),
+                ));
+            }
             if self.index_persisted_zone_if_present(&zone_id) {
                 self.hosted.insert(zone_id);
             }
@@ -887,7 +893,7 @@ impl ZoneRaftRegistry {
     fn setup_zone(
         &self,
         zone_id: &str,
-        config: RaftConfig,
+        mut config: RaftConfig,
         mut peers: Vec<NodeAddress>,
         runtime_handle: &tokio::runtime::Handle,
         // This node's DURABLE role intent for the zone (voter/learner as
@@ -896,6 +902,14 @@ impl ZoneRaftRegistry {
         // ephemeral achieved role. See `identity::persist_zone_intent`.
         intended_role: crate::identity::IdentityZoneRole,
     ) -> Result<ZoneConsensus<FullStateMachine>, TransportError> {
+        if self.membership_policy == super::MembershipPolicy::FixedLocal {
+            if zone_id != contracts::ROOT_ZONE_ID || !peers.is_empty() {
+                return Err(TransportError::Connection(
+                    "isolated root accepts its local root only".into(),
+                ));
+            }
+            config.membership_policy = self.membership_policy;
+        }
         // Fast path: zone already exists — no work needed.
         if let Some(entry) = self.zones.get(zone_id) {
             return Ok(entry.node.clone());

@@ -312,6 +312,12 @@ pub struct ZoneManager {
     pending_mounts: parking_lot::Mutex<BTreeMap<String, MountDecl>>,
 }
 
+#[derive(Clone, Copy)]
+enum RuntimeProfile {
+    Networked,
+    IsolatedRoot,
+}
+
 impl ZoneManager {
     /// Create a new `ZoneManager`.
     ///
@@ -408,7 +414,7 @@ impl ZoneManager {
             self_address,
             extra_grpc_services,
             load_policy,
-            true,
+            RuntimeProfile::Networked,
         )
     }
 
@@ -427,7 +433,7 @@ impl ZoneManager {
             None,
             None,
             ZoneLoadPolicy::Only(vec![contracts::ROOT_ZONE_ID.to_string()]),
-            false,
+            RuntimeProfile::IsolatedRoot,
         )
     }
 
@@ -442,7 +448,7 @@ impl ZoneManager {
         self_address: Option<String>,
         extra_grpc_services: Option<tonic::service::Routes>,
         load_policy: ZoneLoadPolicy,
-        is_listener_enabled: bool,
+        profile: RuntimeProfile,
     ) -> Result<Arc<Self>> {
         // Initialize tracing once.
         static TRACING_INIT: std::sync::Once = std::sync::Once::new();
@@ -528,11 +534,14 @@ impl ZoneManager {
                 .map_err(|e| RaftError::Config(format!("Failed to create runtime: {}", e)))?,
         );
 
-        let registry = Arc::new(ZoneRaftRegistry::with_tls(
-            PathBuf::from(base_path),
-            node_id,
-            tls_config.clone(),
-        ));
+        let registry = Arc::new(match profile {
+            RuntimeProfile::Networked => {
+                ZoneRaftRegistry::with_tls(PathBuf::from(base_path), node_id, tls_config.clone())
+            }
+            RuntimeProfile::IsolatedRoot => {
+                ZoneRaftRegistry::isolated_root(PathBuf::from(base_path), node_id)
+            }
+        });
         if let Some(ref addr) = self_address {
             registry.set_self_address(addr.clone());
         }
@@ -638,7 +647,7 @@ impl ZoneManager {
         // Owned: the failure message below names the address, and the task outlives
         // this borrow.
         let bind_for_error = bind_addr.to_string();
-        if is_listener_enabled {
+        if matches!(profile, RuntimeProfile::Networked) {
             runtime.spawn(async move {
                 let shutdown = async move {
                     let mut rx = shutdown_rx_server;
