@@ -29,6 +29,16 @@ pub(crate) fn blob_key(content_id: &str) -> String {
     )
 }
 
+fn validate_content_hash(content_id: &str, actual: blake3::Hash) -> io::Result<()> {
+    if actual.to_hex().as_str() != content_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "CAS object does not match its content hash",
+        ));
+    }
+    Ok(())
+}
+
 /// Existence alone is not a deduplication proof: an interrupted legacy write
 /// can leave a partial file at the final hash path. Stream the existing bytes
 /// before accepting them, and propagate errors rather than overwriting them.
@@ -48,12 +58,7 @@ fn validated_existing_blob(path: &Path, content_id: &str) -> io::Result<Option<s
         }
         hasher.update(&buffer[..count]);
     }
-    if hasher.finalize().to_hex().as_str() != content_id {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "existing CAS object does not match its content hash",
-        ));
-    }
+    validate_content_hash(content_id, hasher.finalize())?;
     Ok(Some(file))
 }
 
@@ -246,13 +251,15 @@ impl LocalCASTransport {
         }
     }
 
-    /// Read a CAS blob by content hash.
+    /// Read complete bytes and verify their CAS content hash.
     ///
     /// Corresponds to Python `LocalTransport.fetch(CASAddressingEngine._blob_key(hash))`.
     pub fn read_blob(&self, content_id: &str) -> io::Result<Vec<u8>> {
         let key = blob_key(content_id);
         let path = self.resolve(&key);
-        std::fs::read(&path)
+        let content = std::fs::read(&path)?;
+        validate_content_hash(content_id, blake3::hash(&content))?;
+        Ok(content)
     }
 
     /// Write content to CAS, returning the BLAKE3 content hash.

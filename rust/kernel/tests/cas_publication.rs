@@ -5,6 +5,7 @@ use std::path::Path;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
+use kernel::core::cas::engine::{CASEngine, CASError};
 use kernel::core::cas::transport::LocalCASTransport;
 
 fn interrupted_final_object() -> (tempfile::TempDir, LocalCASTransport, Vec<u8>, String) {
@@ -29,7 +30,10 @@ fn a_partial_final_object_is_not_a_successful_deduplication_hit() {
         "partial final object must not be accepted as a dedup hit: {result:?}"
     );
     assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
-    assert_eq!(transport.read_blob(&hash).unwrap(), &complete[..9]);
+    assert_eq!(
+        std::fs::read(transport.blob_path(&hash)).unwrap(),
+        &complete[..9]
+    );
 }
 
 #[test]
@@ -41,7 +45,79 @@ fn prehashed_writes_also_refuse_a_partial_final_object() {
         "prehashed write must not accept a partial final object: {result:?}"
     );
     assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
-    assert_eq!(transport.read_blob(&hash).unwrap(), &complete[..9]);
+    assert_eq!(
+        std::fs::read(transport.blob_path(&hash)).unwrap(),
+        &complete[..9]
+    );
+}
+
+fn assert_corruption(error: CASError) {
+    match error {
+        CASError::IOError(error) => assert_eq!(error.kind(), io::ErrorKind::InvalidData),
+        other => panic!("expected an integrity failure, got {other:?}"),
+    }
+}
+
+#[test]
+fn corrupt_regular_content_is_refused_without_rewriting_it() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = CASEngine::new(LocalCASTransport::new(root.path(), true).unwrap());
+    let hash = engine.write_content(b"original durable register").unwrap();
+    let path = engine.transport().blob_path(&hash);
+    let corruption = b"different register bytes";
+    std::fs::write(&path, corruption).unwrap();
+    assert_corruption(engine.read_content(&hash).unwrap_err());
+    assert_eq!(std::fs::read(path).unwrap(), corruption);
+}
+
+#[test]
+fn corrupt_regular_content_cannot_seed_a_partial_write() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = CASEngine::new(LocalCASTransport::new(root.path(), true).unwrap());
+    let hash = engine.write_content(b"original durable register").unwrap();
+    let path = engine.transport().blob_path(&hash);
+    std::fs::write(&path, b"different register bytes").unwrap();
+    assert_corruption(engine.write_partial(&hash, b"new", 4, &[]).unwrap_err());
+    assert_eq!(std::fs::read(path).unwrap(), b"different register bytes");
+}
+
+fn substituted_manifest() -> (tempfile::TempDir, CASEngine, String, Vec<u8>) {
+    let root = tempfile::tempdir().unwrap();
+    let engine = CASEngine::new(LocalCASTransport::new(root.path(), true).unwrap());
+    let hash = engine.write_content(&vec![b'a'; 17 * 1024 * 1024]).unwrap();
+    assert!(engine.is_chunked(&hash));
+    let path = engine.transport().blob_path(&hash);
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let first = &mut manifest["chunks"][0];
+    let length = first["length"].as_u64().unwrap() as usize;
+    let replacement = engine.transport().write_blob(&vec![b'z'; length]).unwrap();
+    first["chunk_hash"] = replacement.into();
+    let substituted = serde_json::to_vec(&manifest).unwrap();
+    std::fs::write(path, &substituted).unwrap();
+    (root, engine, hash, substituted)
+}
+
+#[test]
+fn corrupt_manifest_is_refused_before_full_reassembly() {
+    let (_root, engine, hash, substituted) = substituted_manifest();
+    assert_corruption(engine.read_content(&hash).unwrap_err());
+    assert_eq!(
+        std::fs::read(engine.transport().blob_path(&hash)).unwrap(),
+        substituted
+    );
+}
+
+#[test]
+fn corrupt_manifest_is_refused_before_range_reassembly() {
+    let (_root, engine, hash, _) = substituted_manifest();
+    assert_corruption(engine.read_chunked_range(&hash, 0, 16).unwrap_err());
+}
+
+#[test]
+fn corrupt_manifest_cannot_seed_a_partial_write() {
+    let (_root, engine, hash, _) = substituted_manifest();
+    assert_corruption(engine.write_partial(&hash, b"new", 4, &[]).unwrap_err());
 }
 
 #[test]

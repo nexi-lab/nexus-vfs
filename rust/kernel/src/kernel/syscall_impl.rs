@@ -25,6 +25,24 @@ use super::{
     SysWriteResult,
 };
 
+fn backend_read_or_miss(
+    result: Option<Result<Vec<u8>, crate::abc::object_store::StorageError>>,
+) -> Result<Option<Vec<u8>>, KernelError> {
+    use crate::abc::object_store::StorageError;
+    match result {
+        Some(Ok(content)) => Ok(Some(content)),
+        Some(Err(StorageError::IOError(error))) => match error.kind() {
+            std::io::ErrorKind::NotFound => Ok(None),
+            _ => Err(KernelError::BackendError(format!(
+                "backend read failed: {error}"
+            ))),
+        },
+        // Absent local bytes and backends without a local read operation can
+        // still be served through the existing federation route.
+        None | Some(Err(StorageError::NotFound(_) | StorageError::NotSupported(_))) => Ok(None),
+    }
+}
+
 /// Only materialized path references use live filesystem attributes. A
 /// metadata-only regular entry, stream, pipe, or link keeps its VFS meaning.
 fn has_local_content_origin(entry: &FileMetadata, local_address: Option<&str>) -> bool {
@@ -369,11 +387,12 @@ impl Kernel {
                 // uniformly).  LocalConnector hits the host fs by path here;
                 // PathLocal hits its backend slot; CAS / remote backends
                 // return miss (they have nothing to serve without a hash).
-                if let Some(data) = route
-                    .backend
-                    .as_ref()
-                    .and_then(|b| b.read_content(&route.backend_path, ctx).ok())
-                {
+                if let Some(data) = backend_read_or_miss(
+                    route
+                        .backend
+                        .as_ref()
+                        .map(|b| b.read_content(&route.backend_path, ctx)),
+                )? {
                     let size = data.len() as u64;
                     // Lazy metadata materialization — single duality gate
                     // inside the helper.  For a local-user ctx
@@ -578,13 +597,10 @@ impl Kernel {
                 .is_some_and(|(writer, me)| writer == me);
         let content = if federation_cache_substitution_read {
             self.federation_cache_arc()
-                .and_then(|b| b.read_content(path, ctx).ok())
+                .map(|b| b.read_content(path, ctx))
         } else {
             match content_id_opt {
-                Some(cid) => route
-                    .backend
-                    .as_ref()
-                    .and_then(|b| b.read_content(cid, ctx).ok()),
+                Some(cid) => route.backend.as_ref().map(|b| b.read_content(cid, ctx)),
                 None => None,
             }
         };
@@ -593,7 +609,7 @@ impl Kernel {
         self.lock_manager.do_release(lock_handle);
 
         // 7. Return result
-        match content {
+        match backend_read_or_miss(content)? {
             Some(data) => Ok(SysReadResult {
                 data: Some(data),
                 post_hook_needed: self.read_hook_count.load(Ordering::Relaxed) > 0,
@@ -2855,16 +2871,18 @@ impl Kernel {
             }
         };
 
-        let content = src_route
-            .backend
-            .as_ref()
-            .and_then(|b| b.read_content(content_id, ctx).ok())
-            .ok_or_else(|| {
-                KernelError::IOError(format!(
-                    "sys_copy: failed to read source content at {}",
-                    src_route.backend_path
-                ))
-            })?;
+        let content = backend_read_or_miss(
+            src_route
+                .backend
+                .as_ref()
+                .map(|b| b.read_content(content_id, ctx)),
+        )?
+        .ok_or_else(|| {
+            KernelError::IOError(format!(
+                "sys_copy: failed to read source content at {}",
+                src_route.backend_path
+            ))
+        })?;
 
         let wr = dst_route
             .backend
