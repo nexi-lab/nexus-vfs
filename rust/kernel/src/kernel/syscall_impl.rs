@@ -3401,8 +3401,8 @@ impl Kernel {
         }
 
         // 4. Write each item — collect metadata for batch put
-        // Tuple: (mount_point, path, FileMetadata) for per-mount metastore support
-        let mut batch_meta: Vec<(String, String, crate::meta_store::FileMetadata)> = Vec::new();
+        // Keep the original request index and its resolved route through commit.
+        let mut batch_meta = Vec::new();
 
         for (i, (req, route_opt)) in reqs.iter().zip(routes.iter()).enumerate() {
             if let Some(e) = pre_errors[i].take() {
@@ -3428,10 +3428,20 @@ impl Kernel {
             // semantics: a failure only taints that item's result, not the
             // whole batch.
             let effective_content = replacements[i].as_deref().unwrap_or(&req.content);
-            let write_result = route.backend.as_ref().and_then(|b| {
-                b.write_content(effective_content, &route.backend_path, ctx, 0)
-                    .ok()
-            });
+            let write_result = match route
+                .backend
+                .as_ref()
+                .map(|backend| {
+                    backend.write_content(effective_content, &route.backend_path, ctx, 0)
+                })
+                .transpose()
+            {
+                Ok(written) => written,
+                Err(error) => {
+                    results.push(Err(KernelError::BackendError(format!("{error:?}"))));
+                    continue;
+                }
+            };
 
             match write_result {
                 Some(wr) => {
@@ -3460,21 +3470,12 @@ impl Kernel {
                     // we can group raft proposes per mount and mark
                     // each result hit/miss based on the actual
                     // commit outcome rather than eagerly lying.
-                    batch_meta.push((route.mount_point.clone(), req.path.to_string(), meta));
-
-                    results.push(Ok(SysWriteResult {
-                        hit: true,
-                        content_id: Some(wr.content_id),
-                        post_hook_needed: self.write_hook_count.load(Ordering::Relaxed) > 0,
-                        version: new_version,
-                        gen: new_gen,
-                        size: wr.size,
-                        is_new: batch_old_entry.is_none(),
-                        old_content_id: batch_old_entry.as_ref().and_then(|e| e.content_id.clone()),
-                        old_size: batch_old_entry.as_ref().map(|e| e.size),
-                        old_version: batch_old_entry.as_ref().map(|e| e.version),
-                        old_modified_at_ms: batch_old_entry.as_ref().and_then(|e| e.modified_at_ms),
-                    }));
+                    results.push(Ok(self.file_write_result(
+                        &meta,
+                        wr,
+                        batch_old_entry.as_ref(),
+                    )));
+                    batch_meta.push((i, route, meta));
                 }
                 None => {
                     results.push(Ok(write_miss()));
@@ -3485,47 +3486,40 @@ impl Kernel {
         // 4b. Atomic per-item commit. Per-mount items dispatch through the
         // mount's own metastore (raft propose for federation zones); global
         // items (no per-mount metastore) collect into a batch put since the
-        // global LocalMetaStore can do that as one redb txn. Failures flip
-        // the corresponding result entry from hit=true → hit=false so the
-        // caller learns which items actually committed.
+        // global LocalMetaStore can do that as one redb txn. A commit failure
+        // becomes an error on each affected request, as in the single-write path.
         if !batch_meta.is_empty() {
             let mut global_items: Vec<(String, crate::meta_store::FileMetadata)> = Vec::new();
             let mut global_idx: Vec<usize> = Vec::new();
-            for (idx, (mp, path, meta)) in batch_meta.into_iter().enumerate() {
-                let has_per_mount = self
-                    .vfs_router
-                    .get_canonical(&mp)
-                    .map(|e| e.metastore.is_some())
-                    .unwrap_or(false);
-                if has_per_mount {
+            for (idx, route, meta) in batch_meta {
+                let path = &reqs[idx].path;
+                if route.metastore.is_some() {
                     let put_res = self
-                        .with_metastore(&mp, move |ms| ms.put(&path, meta))
+                        .with_metastore_route(route, |ms| ms.put(path, meta))
                         .ok_or_else(|| KernelError::IOError("no metastore wired".into()))
                         .and_then(|r| r.map_err(|e| KernelError::IOError(format!("{e:?}"))));
-                    if let Err(_e) = put_res {
-                        // Mark this batch entry as not-hit so the
-                        // caller knows the propose didn't commit.
-                        if let Some(Ok(r)) = results.get_mut(idx) {
-                            r.hit = false;
-                        }
+                    if let Err(error) = put_res {
+                        results[idx] = Err(error);
                     }
                 } else {
-                    global_items.push((path, meta));
+                    global_items.push((path.clone(), meta));
                     global_idx.push(idx);
                 }
             }
             if !global_items.is_empty() {
-                let put_ok = self
+                let put_result = self
                     .metastore
                     .read()
                     .as_ref()
-                    .map(|ms| ms.put_batch(&global_items).is_ok())
-                    .unwrap_or(false);
-                if !put_ok {
+                    .ok_or_else(|| KernelError::IOError("no metastore wired".into()))
+                    .and_then(|ms| {
+                        ms.put_batch(&global_items).map_err(|error| {
+                            KernelError::IOError(format!("metastore_put_batch: {error:?}"))
+                        })
+                    });
+                if let Err(error) = put_result {
                     for idx in global_idx {
-                        if let Some(Ok(r)) = results.get_mut(idx) {
-                            r.hit = false;
-                        }
+                        results[idx] = Err(error.clone());
                     }
                 }
             }
