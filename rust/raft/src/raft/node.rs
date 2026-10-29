@@ -61,6 +61,7 @@ use tokio::sync::{mpsc, oneshot, RwLock};
 use super::replication_log::ReplicationLog;
 use super::state_machine::StateMachine;
 use super::storage::RaftStorage;
+use super::PROPOSAL_TIMEOUT_SECS;
 use super::{Command, CommandResult, RaftError, Result};
 
 /// Capacity of the bounded channel between [`ZoneConsensus`] handles and the
@@ -610,9 +611,6 @@ pub type ConfStateAppliedCb = Arc<dyn Fn(&ConfState, u64) + Send + Sync + 'stati
 // ---------------------------------------------------------------------------
 // ZoneConsensus (handle) implementation
 // ---------------------------------------------------------------------------
-
-/// Timeout for proposals and conf changes waiting for commit.
-const PROPOSAL_TIMEOUT_SECS: u64 = 10;
 
 impl<S: StateMachine + 'static> ZoneConsensus<S> {
     /// Create a new Raft node, returning a (handle, driver) pair.
@@ -1280,13 +1278,13 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
     /// (SC path). EC callers simply drop the receiver.
     pub(crate) fn submit_to_channel(
         &self,
-        command: Command,
+        command: &Command,
     ) -> Result<oneshot::Receiver<Result<CommandResult>>> {
         // The metadata transaction is a foundation, not an activated zone
         // protocol. Refuse before serialization/forwarding: mixed members may
         // not even decode the new enum variant. A future activation gate must
         // replace this refusal only after membership and storage are enforced.
-        if matches!(&command, Command::WriteVersionedMetadata { .. }) {
+        if matches!(command, Command::WriteVersionedMetadata { .. }) {
             return Err(RaftError::Config(
                 "conditional metadata proposals are not activated".into(),
             ));
@@ -1297,7 +1295,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             });
         }
 
-        let data = bincode::serialize(&command)?;
+        let data = bincode::serialize(command)?;
         let (tx, rx) = oneshot::channel();
 
         self.msg_tx
@@ -1319,7 +1317,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
     ///
     /// Latency: ~5-10μs (serialize + channel send).
     pub async fn propose_ec(&self, command: Command) -> Result<()> {
-        let _rx = self.submit_to_channel(command)?; // drop receiver
+        let _rx = self.submit_to_channel(&command)?; // drop receiver
         Ok(())
     }
 
@@ -1333,7 +1331,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
     /// # Timeout
     /// Proposals time out after 10 seconds.
     pub async fn propose(&self, command: Command) -> Result<CommandResult> {
-        match self.submit_to_channel(command.clone()) {
+        match self.submit_to_channel(&command) {
             Ok(rx) => {
                 // Leader path: wait for commit
                 match tokio::time::timeout(Duration::from_secs(PROPOSAL_TIMEOUT_SECS), rx).await {
@@ -1377,126 +1375,130 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
     async fn forward_to_leader(&self, command: Command) -> Result<CommandResult> {
         #[cfg(all(feature = "grpc", has_protos))]
         if let Some(ctx) = &self.forward_ctx {
-            let leader_id = match self.leader_id() {
-                Some(id) => id,
-                None => {
-                    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-                    let mut found: Option<u64> = None;
-                    while tokio::time::Instant::now() < deadline {
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                        if let Some(id) = self.leader_id() {
-                            found = Some(id);
-                            break;
-                        }
-                    }
-                    match found {
-                        Some(id) => id,
-                        None => return Err(RaftError::NotLeader { leader_hint: None }),
-                    }
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(PROPOSAL_TIMEOUT_SECS);
+            let election_deadline =
+                deadline.min(tokio::time::Instant::now() + Duration::from_secs(5));
+            while self.leader_id().is_none() {
+                if tokio::time::Instant::now() >= election_deadline {
+                    return Err(RaftError::NotLeader { leader_hint: None });
                 }
-            };
-
-            // Leader-is-self path: don't RPC-forward to ourselves.
-            //
-            // Forwarding via gRPC to our own advertised address either
-            // hits a hairpin failure (Tailscale: own public IP
-            // unreachable from self on Windows / macOS) or uselessly
-            // round-trips the proposal across two extra HTTP/2 hops
-            // back to the same process.  The reason we're in
-            // `forward_to_leader` despite being leader is the boot-time
-            // window where `submit_to_channel` ran before
-            // `update_cached_status` reflected post-election state.
-            // That window closes within one driver tick (~10ms), so
-            // bounded local retry of `submit_to_channel` resolves
-            // cleanly without ever leaving the process.
-            //
-            // PROPOSAL_TIMEOUT_SECS aligns this path's bound with the
-            // leader-path timeout above; 20ms backoff is two
-            // tick_intervals so each retry samples fresh raft state.
-            if leader_id == self.config.id {
-                let deadline =
-                    tokio::time::Instant::now() + Duration::from_secs(PROPOSAL_TIMEOUT_SECS);
-                loop {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                    if tokio::time::Instant::now() >= deadline {
-                        return Err(RaftError::Timeout(PROPOSAL_TIMEOUT_SECS));
-                    }
-                    match self.submit_to_channel(command.clone()) {
-                        Ok(rx) => {
-                            let remaining =
-                                deadline.saturating_duration_since(tokio::time::Instant::now());
-                            return match tokio::time::timeout(remaining, rx).await {
-                                Ok(Ok(result)) => result,
-                                Ok(Err(_)) => Err(RaftError::ProposalDropped),
-                                Err(_) => Err(RaftError::Timeout(PROPOSAL_TIMEOUT_SECS)),
-                            };
-                        }
-                        Err(RaftError::NotLeader { .. }) => continue,
-                        Err(e) => return Err(e),
-                    }
-                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-
-            let leader_addr = {
-                let peers = ctx.peers.read().unwrap();
-                // peer_map miss here means we know a leader_id but have
-                // no address for it — pass `None` for the hint (loud &
-                // honest) rather than surface the bare id.  See
-                // RaftError::NotLeader docstring.
-                peers
-                    .get(&leader_id)
-                    .cloned()
-                    .ok_or(RaftError::NotLeader { leader_hint: None })?
-            };
-
-            tracing::debug!(
-                leader_node_id = leader_id,
-                leader_addr = %leader_addr.to_operator_str(),
-                zone = %ctx.zone_id,
-                "Forwarding propose to leader"
-            );
-
-            // If forwarding fails (leader unreachable), return NotLeader
-            // so the caller can retry after election completes.
-            return match crate::transport::forward_propose(
-                &ctx.client_pool,
-                &leader_addr,
-                command,
-                &ctx.zone_id,
-                &ctx.cached_api_client,
-            )
-            .await
-            {
-                Ok(result) => Ok(result),
-                // Propagated as a TRANSPORT failure, not rewritten to `NotLeader`.
-                // The request was sent; what is missing is the answer. The leader may
-                // have appended and committed it before the connection broke, so the
-                // outcome is UNKNOWN — see `RaftError::proposal_outcome_unknown`.
-                //
-                // Rewriting it to `NotLeader` told the caller two false things: that
-                // nothing was applied, and that the reason was leadership. #342 is
-                // what that looks like from outside — a write reported as
-                // `not leader, leader hint: None` whose value read back fine a moment
-                // later, and a client that gave up on the rest of its sequence
-                // believing the first step had not happened.
-                Err(RaftError::Transport(e)) => {
-                    tracing::warn!(
-                        leader_node_id = leader_id,
-                        leader_addr = %leader_addr.to_operator_str(),
-                        zone = %ctx.zone_id,
-                        "Forward to leader failed after the proposal was sent — the \
-                         outcome is UNKNOWN, it may have committed: {}",
-                        e,
-                    );
-                    Err(RaftError::Transport(e))
-                }
-                Err(e) => Err(e),
-            };
+            return super::proposal::retry_leader_refusals(deadline, || {
+                self.forward_to_leader_once(ctx, &command, deadline)
+            })
+            .await;
         }
-
         Err(RaftError::NotLeader {
             leader_hint: self.leader_hint_addr(),
         })
+    }
+
+    #[cfg(all(feature = "grpc", has_protos))]
+    async fn forward_to_leader_once(
+        &self,
+        ctx: &ForwardContext,
+        command: &Command,
+        deadline: tokio::time::Instant,
+    ) -> Result<CommandResult> {
+        let leader_id = self
+            .leader_id()
+            .ok_or(RaftError::NotLeader { leader_hint: None })?;
+
+        // Leader-is-self path: don't RPC-forward to ourselves.
+        //
+        // Forwarding via gRPC to our own advertised address either
+        // hits a hairpin failure (Tailscale: own public IP
+        // unreachable from self on Windows / macOS) or uselessly
+        // round-trips the proposal across two extra HTTP/2 hops
+        // back to the same process.  The reason we're in
+        // `forward_to_leader` despite being leader is the boot-time
+        // window where `submit_to_channel` ran before
+        // `update_cached_status` reflected post-election state.
+        // That window closes within one driver tick (~10ms), so
+        // bounded local retry of `submit_to_channel` resolves
+        // cleanly without ever leaving the process.
+        //
+        // PROPOSAL_TIMEOUT_SECS aligns this path's bound with the
+        // leader-path timeout above; 20ms backoff is two
+        // tick_intervals so each retry samples fresh raft state.
+        if leader_id == self.config.id {
+            loop {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(RaftError::Timeout(PROPOSAL_TIMEOUT_SECS));
+                }
+                match self.submit_to_channel(command) {
+                    Ok(rx) => {
+                        let remaining =
+                            deadline.saturating_duration_since(tokio::time::Instant::now());
+                        return match tokio::time::timeout(remaining, rx).await {
+                            Ok(Ok(result)) => result,
+                            Ok(Err(_)) => Err(RaftError::ProposalDropped),
+                            Err(_) => Err(RaftError::Timeout(PROPOSAL_TIMEOUT_SECS)),
+                        };
+                    }
+                    Err(RaftError::NotLeader { .. }) => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        let leader_addr = {
+            let peers = ctx.peers.read().unwrap();
+            // peer_map miss here means we know a leader_id but have
+            // no address for it — pass `None` for the hint (loud &
+            // honest) rather than surface the bare id.  See
+            // RaftError::NotLeader docstring.
+            peers
+                .get(&leader_id)
+                .cloned()
+                .ok_or(RaftError::NotLeader { leader_hint: None })?
+        };
+
+        tracing::debug!(
+            leader_node_id = leader_id,
+            leader_addr = %leader_addr.to_operator_str(),
+            zone = %ctx.zone_id,
+            "Forwarding propose to leader"
+        );
+
+        // A transport failure retains its unknown proposal outcome.
+        match crate::transport::forward_propose(
+            &ctx.client_pool,
+            &leader_addr,
+            command,
+            &ctx.zone_id,
+            deadline,
+            &ctx.cached_api_client,
+        )
+        .await
+        {
+            Ok(result) => Ok(result),
+            // Propagated as a TRANSPORT failure, not rewritten to `NotLeader`.
+            // The request was sent; what is missing is the answer. The leader may
+            // have appended and committed it before the connection broke, so the
+            // outcome is UNKNOWN — see `RaftError::proposal_outcome_unknown`.
+            //
+            // Rewriting it to `NotLeader` told the caller two false things: that
+            // nothing was applied, and that the reason was leadership. #342 is
+            // what that looks like from outside — a write reported as
+            // `not leader, leader hint: None` whose value read back fine a moment
+            // later, and a client that gave up on the rest of its sequence
+            // believing the first step had not happened.
+            Err(RaftError::Transport(e)) => {
+                tracing::warn!(
+                    leader_node_id = leader_id,
+                    leader_addr = %leader_addr.to_operator_str(),
+                    zone = %ctx.zone_id,
+                    "Forward to leader failed after the proposal was sent — the \
+                     outcome is UNKNOWN, it may have committed: {}",
+                    e,
+                );
+                Err(RaftError::Transport(e))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// True Local-First EC write — bypasses Raft entirely.

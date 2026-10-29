@@ -122,14 +122,15 @@ pub use transport_loop::TransportLoop;
 pub(crate) async fn forward_propose(
     client_pool: &RaftClientPool,
     leader_addr: &NodeAddress,
-    command: crate::raft::Command,
+    command: &crate::raft::Command,
     zone_id: &str,
+    deadline: tokio::time::Instant,
     cached_client: &tokio::sync::Mutex<Option<(String, RaftApiClient)>>,
 ) -> crate::raft::Result<crate::raft::CommandResult> {
     use crate::raft::RaftError;
 
     let raw_bytes =
-        bincode::serialize(&command).map_err(|e| RaftError::Serialization(e.to_string()))?;
+        bincode::serialize(command).map_err(|e| RaftError::Serialization(e.to_string()))?;
 
     // Get or create a cached API client. Evict if the leader endpoint changed.
     let mut api_client = {
@@ -140,7 +141,8 @@ pub(crate) async fn forward_propose(
                 // Connect with short timeouts — fail fast on unreachable leader.
                 let mut forward_config = client_pool.config().clone();
                 forward_config.connect_timeout = std::time::Duration::from_secs(2);
-                forward_config.request_timeout = std::time::Duration::from_secs(5);
+                forward_config.request_timeout =
+                    std::time::Duration::from_secs(crate::raft::PROPOSAL_TIMEOUT_SECS);
 
                 RaftApiClient::connect(&leader_addr.endpoint, forward_config)
                     .await
@@ -149,13 +151,14 @@ pub(crate) async fn forward_propose(
         }
     };
 
-    let request = tonic::Request::new(proto::nexus::raft::ProposeRequest {
+    let mut request = tonic::Request::new(proto::nexus::raft::ProposeRequest {
         command: None,
         request_id: String::new(),
         zone_id: zone_id.to_string(),
         raw_command: raw_bytes,
         forwarded: true,
     });
+    request.set_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()));
 
     let result = api_client
         .inner_mut()
@@ -169,29 +172,42 @@ pub(crate) async fn forward_propose(
             let mut guard = cached_client.lock().await;
             *guard = Some((leader_addr.endpoint.clone(), api_client));
 
-            let resp = response.into_inner();
-            if !resp.success {
-                if let Some(ref err) = resp.error {
-                    if err.contains("Not the leader") || err.contains("not leader") {
-                        return Err(RaftError::NotLeader { leader_hint: None });
-                    } else {
-                        return Err(RaftError::Raft(err.clone()));
-                    }
-                }
-                return Err(RaftError::Raft("Propose failed".to_string()));
-            }
-
-            // Decode the typed RaftResponse so lock/metadata commands see
-            // the same CommandResult variant the leader computed. Without
-            // this, AcquireLock/ReleaseLock/ExtendLock would hit an
-            // "Unexpected result type" branch on the caller side.
-            Ok(proto_result_to_command_result(resp.result))
+            decode_propose_response(response.into_inner())
         }
         Err(e) => {
             // Transport error — evict cached client (already taken above).
             // Next call will reconnect.
             Err(e)
         }
+    }
+}
+
+#[cfg(all(feature = "grpc", has_protos))]
+pub(super) const NOT_LEADER_ERROR: &str = "Not the leader";
+
+#[cfg(all(feature = "grpc", has_protos))]
+fn decode_propose_response(
+    response: proto::nexus::raft::ProposeResponse,
+) -> crate::raft::Result<crate::raft::CommandResult> {
+    use crate::raft::RaftError;
+
+    if response.success {
+        return Ok(proto_result_to_command_result(response.result));
+    }
+    match response.error {
+        Some(error)
+            if error == NOT_LEADER_ERROR
+                && response.result.is_none()
+                && response.applied_index == 0 =>
+        {
+            Err(RaftError::NotLeader {
+                leader_hint: response.leader_address,
+            })
+        }
+        Some(error) => Err(RaftError::ProposalOutcomeUnknown(error)),
+        None => Err(RaftError::ProposalOutcomeUnknown(
+            "remote proposal returned no result or refusal reason".into(),
+        )),
     }
 }
 
@@ -520,5 +536,47 @@ mod decode_tests {
             proto_result_to_command_result(None),
             CommandResult::Success
         ));
+    }
+
+    #[test]
+    fn only_a_definite_pre_submission_refusal_can_redirect_a_write() {
+        use super::proto::nexus::raft::ProposeResponse;
+        use super::{decode_propose_response, NOT_LEADER_ERROR};
+        use crate::raft::RaftError;
+
+        let refused = ProposeResponse {
+            success: false,
+            error: Some(NOT_LEADER_ERROR.into()),
+            leader_address: Some("127.0.0.1:9000".into()),
+            result: None,
+            applied_index: 0,
+        };
+        let error = decode_propose_response(refused.clone()).unwrap_err();
+        assert!(
+            matches!(error, RaftError::NotLeader { leader_hint: Some(ref address) }
+            if address == "127.0.0.1:9000")
+        );
+        for response in [
+            ProposeResponse {
+                error: Some("Proposal failed: not leader after an uncertain operation".into()),
+                ..refused.clone()
+            },
+            ProposeResponse {
+                applied_index: 42,
+                ..refused.clone()
+            },
+            ProposeResponse {
+                result: Some(RaftResponse {
+                    success: true,
+                    error: None,
+                    result: None,
+                }),
+                ..refused
+            },
+        ] {
+            let error = decode_propose_response(response).unwrap_err();
+            assert!(!matches!(error, RaftError::NotLeader { .. }));
+            assert!(error.proposal_outcome_unknown());
+        }
     }
 }

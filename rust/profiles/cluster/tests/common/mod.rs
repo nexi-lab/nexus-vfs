@@ -262,6 +262,22 @@ impl Daemon {
 
     /// Drive the same wire contract against an explicitly selected cohost binary.
     pub fn spawn_binary(binary: &str, args: &[&str], env: &[(&str, &str)]) -> Self {
+        let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".into());
+        Self::spawn_with_logging(binary, args, env, Some(&filter))
+    }
+
+    /// Exercise the runtime's default filter independently of ambient diagnostics.
+    pub fn spawn_default_logging(args: &[&str], env: &[(&str, &str)]) -> Self {
+        assert!(env.iter().all(|(key, _)| *key != "RUST_LOG"));
+        Self::spawn_with_logging(bin(), args, env, None)
+    }
+
+    fn spawn_with_logging(
+        binary: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+        filter: Option<&str>,
+    ) -> Self {
         // A daemon with no identity dir falls back to the USER-GLOBAL one
         // (`~/.local/share/nexus/identity.json`). Every test in a binary then
         // shares it, they run concurrently, and the loser of the atomic-rename
@@ -290,10 +306,10 @@ impl Daemon {
             .env_remove("NEXUS_API_KEY_SECRET")
             .env_remove("NEXUS_INSECURE_NO_AUTH")
             .env_remove("NEXUS_FORCE_DELETED_ZONE_RECREATE")
-            .env(
-                "RUST_LOG",
-                std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".into()),
-            );
+            .env_remove("RUST_LOG");
+        if let Some(filter) = filter {
+            cmd.env("RUST_LOG", filter);
+        }
         if inherit {
             cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
         } else {

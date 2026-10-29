@@ -965,12 +965,17 @@ impl ZoneApiService for ZoneApiServiceImpl {
         // propose() which may forward to leader transparently.
         let result = if req.forwarded {
             // Forwarded request: must be handled locally (no re-forwarding)
-            match node.submit_to_channel(cmd) {
+            match node.submit_to_channel(&cmd) {
                 Ok(rx) => {
-                    match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(crate::raft::PROPOSAL_TIMEOUT_SECS),
+                        rx,
+                    )
+                    .await
+                    {
                         Ok(Ok(r)) => r,
                         Ok(Err(_)) => Err(RaftError::ProposalDropped),
-                        Err(_) => Err(RaftError::Timeout(10)),
+                        Err(_) => Err(RaftError::Timeout(crate::raft::PROPOSAL_TIMEOUT_SECS)),
                     }
                 }
                 Err(e) => Err(e),
@@ -996,7 +1001,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
                 // lookup needed.  See RaftError::NotLeader docstring.
                 Ok(Response::new(ProposeResponse {
                     success: false,
-                    error: Some("Not the leader".to_string()),
+                    error: Some(super::NOT_LEADER_ERROR.to_string()),
                     leader_address: leader_hint,
                     result: None,
                     applied_index: 0,
