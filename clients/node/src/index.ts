@@ -16,6 +16,14 @@
 import { readFileSync } from 'node:fs'
 import { createHash, createPrivateKey, sign, X509Certificate } from 'node:crypto'
 import { assertUserRuntimeCredential, userRuntimeServerName, type SessionCredential } from './credentials.js'
+import {
+  NexusConditionalContentError, decodeConditionalWrite, decodeVersionedContent,
+  type NexusConditionalWriteResult, type NexusVersionedContent,
+  type ReadVersionedResponse, type WriteIfVersionResponse,
+} from './conditionalContent.js'
+
+export { NexusConditionalContentError } from './conditionalContent.js'
+export type { NexusConditionalWriteResult, NexusConditionalFailureKind, NexusVersionedContent } from './conditionalContent.js'
 
 export { userRuntimeServerName, createUserRuntimeCredentialBundle } from './credentials.js'
 export type { SessionCredential, UserRuntimeCredentialBundle } from './credentials.js'
@@ -116,6 +124,8 @@ interface UnaryClient {
   Call: GrpcMethod<CallRequest, CallResponse>
   Read: GrpcMethod<ReadRequest, ReadResponse>
   Write: GrpcMethod<WriteRequest, WriteResponse>
+  ReadVersioned: GrpcMethod<ReadRequest, ReadVersionedResponse>
+  WriteIfVersion: GrpcMethod<WriteIfVersionRequest, WriteIfVersionResponse>
   Chmod: GrpcMethod<ChmodRequest, WriteResponse>
   Delete: GrpcMethod<DeleteRequest, DeleteResponse>
   Ping: GrpcMethod<PingRequest, PingResponse>
@@ -160,6 +170,9 @@ interface WriteRequest {
   path: string
   content: Buffer
   auth_token: string
+}
+interface WriteIfVersionRequest extends WriteRequest {
+  expected_version?: Buffer
 }
 interface WriteResponse {
   is_error: boolean
@@ -339,6 +352,8 @@ export interface NexusServerInfo {
   version: string
   zone_id: string
   uptime_seconds: string
+  /** Paired RPC protocol version; each path independently qualifies its storage. */
+  conditional_content_version: number
 }
 type PingResponse = NexusServerInfo
 
@@ -519,6 +534,13 @@ function vfsError(payload: Buffer | undefined, operation: string): Error {
   return new Error(detail)
 }
 
+function conditionalCallError(error: unknown, isWrite: boolean): NexusConditionalContentError {
+  if (error instanceof NexusConditionalContentError) return error
+  const kind = error instanceof NexusRpcError && error.code === grpc.status.UNIMPLEMENTED
+    ? 'unsupported' : isWrite ? 'unknown' : 'failed'
+  return new NexusConditionalContentError(kind, error instanceof Error ? error.message : String(error), error)
+}
+
 export class NexusVfsClient {
   /** The resolved `host:port` this client dials. */
   readonly target: string
@@ -598,6 +620,28 @@ export class NexusVfsClient {
     })
     if (response.is_error) throw vfsError(response.error_payload, 'read')
     return response.content
+  }
+
+  /** Select one complete immutable file image and its associated opaque version. */
+  async readVersioned(path: string, authToken: string): Promise<NexusVersionedContent | null> {
+    try {
+      return decodeVersionedContent(await this.unary<ReadRequest, ReadVersionedResponse>('ReadVersioned', 'read versioned', {
+        path, auth_token: authToken,
+      }))
+    } catch (error) { throw conditionalCallError(error, false) }
+  }
+
+  /** Replace once against a snapshot token; null explicitly requires an absent file. */
+  async writeIfVersion(path: string, content: Buffer, expectedVersion: Buffer | null, authToken: string): Promise<NexusConditionalWriteResult> {
+    if (expectedVersion !== null && (!Buffer.isBuffer(expectedVersion) || !expectedVersion.length)) {
+      throw new NexusConditionalContentError('failed', 'expected version must be a nonempty token or null')
+    }
+    try {
+      return decodeConditionalWrite(await this.unary<WriteIfVersionRequest, WriteIfVersionResponse>('WriteIfVersion', 'write if version', {
+        path, content, auth_token: authToken,
+        ...(expectedVersion === null ? {} : { expected_version: expectedVersion }),
+      }))
+    } catch (error) { throw conditionalCallError(error, true) }
   }
 
   /** Write raw bytes to a VFS path. */
