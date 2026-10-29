@@ -57,6 +57,8 @@ jobs:
           shared-key: ci-cas-publication-${{ matrix.os }}
       - name: CAS complete publication on the native filesystem
         run: cargo test -p kernel --test cas_publication
+      - name: Batch write results and commit notifications on the native filesystem
+        run: cargo test --locked -p kernel --test batch_write_outcomes
       - name: Durable CAS ObjectStore composition
         run: cargo test -p backends --no-default-features --features driver-cas-local --test cas_durable_backend
       - name: Logical file size across CAS manifest and partial writes
