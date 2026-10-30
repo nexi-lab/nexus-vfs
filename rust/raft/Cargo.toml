@@ -91,7 +91,6 @@ tonic-prost-build = { version = "0.14", optional = true }
 protoc-bin-vendored = "3"
 
 [dev-dependencies]
-tokio-test = "0.4"
 regex = { workspace = true }
 
 [features]

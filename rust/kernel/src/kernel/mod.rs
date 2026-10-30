@@ -564,16 +564,6 @@ pub struct Kernel {
     // don't need ``&mut self`` — lets the host hold an ``Arc<Kernel>``
     // for the apply-side federation-mount callback.
     metastore: parking_lot::RwLock<Option<Box<dyn crate::meta_store::MetaStore>>>,
-    // Tempdir backing the boot-default ``LocalMetaStore``. ``Kernel::new``
-    // creates a tempdir and opens a redb against it so bare kernels
-    // (tests, quickstarts, minimal-mode boots) have a working SSOT
-    // without explicit ``set_metastore_path``. The slot is dropped (set
-    // to ``None``) when ``set_metastore_path`` swaps in a real path so
-    // the ephemeral redb file is released along with the old metastore
-    // ``Box<dyn MetaStore>``. This replaces the pre-U
-    // ``MemoryMetaStore`` boot default — see the U commit body for the
-    // ownership argument.
-    boot_metastore_tempdir: parking_lot::RwLock<Option<tempfile::TempDir>>,
     // VFS lock timeout for blocking acquire (ms) — ``AtomicU64`` so
     // ``set_vfs_lock_timeout`` stays ``&self``; reads are lock-free.
     vfs_lock_timeout_ms: AtomicU64,
@@ -799,24 +789,16 @@ impl Kernel {
         // doc).
         let peer_client_dyn: Arc<dyn crate::hal::peer::PeerBlobClient> =
             crate::hal::peer::NoopPeerBlobClient::arc();
-        // Bare kernels boot with a tempfile-backed ``LocalMetaStore`` so
-        // tests, quickstarts, and minimal-mode boots have a working
-        // redb-backed SSOT without explicit ``set_metastore_path``. The
-        // tempdir is held by the kernel; it drops when the kernel drops
-        // (or when ``set_metastore_path`` swaps in a real path). No
-        // separate in-memory impl: every code path now exercises the
-        // production redb implementation.
-        let boot_tempdir = tempfile::tempdir().expect("failed to create kernel boot tempdir");
-        let boot_redb = boot_tempdir.path().join("meta.redb");
-        let boot_metastore = crate::core::meta_store::LocalMetaStore::open(&boot_redb)
-            .expect("failed to open kernel boot LocalMetaStore");
+        // Boot metadata shares LocalMetaStore's redb tables and codec while
+        // living in this Kernel's memory. Hosts select durable paths explicitly.
+        let boot_metastore = crate::core::meta_store::LocalMetaStore::in_memory()
+            .expect("failed to initialize kernel boot metadata");
         let k = Self {
             dlc: crate::dlc::DriverLifecycleCoordinator::new(),
             vfs_router: Arc::new(VFSRouter::new()),
             trie: Trie::new(),
             lock_manager: Arc::new(LockManager::new()),
             metastore: parking_lot::RwLock::new(Some(Box::new(boot_metastore))),
-            boot_metastore_tempdir: parking_lot::RwLock::new(Some(boot_tempdir)),
             vfs_lock_timeout_ms: AtomicU64::new(5000),
             read_batch_max_concurrency: AtomicUsize::new(16),
             read_batch_max_aggregate_bytes: AtomicUsize::new(usize::MAX),
@@ -1000,10 +982,6 @@ impl Kernel {
         let ms = LocalMetaStore::open(std::path::Path::new(path))
             .map_err(|e| KernelError::IOError(format!("LocalMetaStore: {e:?}")))?;
         *self.metastore.write() = Some(Box::new(ms));
-        // Drop the boot tempdir so the ephemeral redb file is released.
-        // The old metastore Box drops with the assignment above; the
-        // tempdir's RAII clean-up runs here.
-        *self.boot_metastore_tempdir.write() = None;
         Ok(())
     }
 
@@ -1014,7 +992,6 @@ impl Kernel {
     /// SQLite-lifecycle regression).
     pub fn release_metastores(&self) {
         *self.metastore.write() = None;
-        *self.boot_metastore_tempdir.write() = None;
         // Drop per-mount metastores by clearing their slot on each
         // MountEntry. We iterate via `iter_mut` to avoid a full rebuild.
         for mut entry in self.vfs_router.entries_iter_mut() {
@@ -1593,9 +1570,26 @@ impl Kernel {
         // registration so remote reads resolve through the correct metastore.
         remote_metastore: Option<Arc<dyn crate::meta_store::MetaStore>>,
     ) -> Result<SysSetAttrResult, KernelError> {
+        // Metadata uses the caller's zone when omitted. An explicit zone selects
+        // the same view for authorization and mutation; a mount's target zone
+        // remains separate from the caller's parent namespace.
+        let zone_id = if entry_type != 2 && zone_id.is_empty() {
+            ctx.zone_id.as_str()
+        } else {
+            zone_id
+        };
+        let projected = if entry_type != 2 && zone_id != ctx.zone_id.as_str() {
+            Some(OperationContext {
+                zone_id: zone_id.to_string(),
+                ..ctx.clone()
+            })
+        } else {
+            None
+        };
+        let ctx = projected.as_ref().unwrap_or(ctx);
+        self.check_metadata_permission(path, crate::Permission::Write, ctx)?;
         match entry_type {
             2 => {
-                self.check_permission(path, crate::Permission::Write, ctx)?;
                 // DT_MOUNT — full mount lifecycle via DLC.
                 //
                 // Zone-create-on-mount: when the caller did not supply
