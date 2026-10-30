@@ -69,7 +69,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 25
     env:
-      CARGO_BUILD_JOBS: 1
+      CARGO_BUILD_JOBS: 2
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
@@ -85,11 +85,10 @@ jobs:
       - name: Verify source-bound executable transfer
         run: python3 -m unittest discover -s scripts/e2e -p test_durable_artifacts.py
       - name: Required backend availability at startup
-        run: cargo test --locked -p nexus-cluster --test user_runtime required_durable_backend_obeys_build_and_platform_at_startup
+        run: cargo test --locked -p nexus-cluster -p raft@0.1.0 --test user_runtime --test test_protected_zone_metadata required_durable_backend_obeys_build_and_platform_at_startup
       - name: Build and record the shared runtime executables
         run: |
-          cargo test --locked -p nexus-cluster --features driver-cas-local --test user_runtime --test conditional_content --test cas_peer_blob --test dt_stream_unbounded --no-run --message-format=json > "$RUNNER_TEMP/durable-runtime-artifacts.json"
-          cargo test --locked -p raft@0.1.0 --test test_protected_zone_metadata --no-run --message-format=json >> "$RUNNER_TEMP/durable-runtime-artifacts.json"
+          cargo test --locked -p nexus-cluster -p raft@0.1.0 --features nexus-cluster/driver-cas-local --test user_runtime --test conditional_content --test cas_peer_blob --test dt_stream_unbounded --test test_protected_zone_metadata --no-run --message-format=json > "$RUNNER_TEMP/durable-runtime-artifacts.json"
           python3 scripts/e2e/durable_artifacts.py pack --artifacts "$RUNNER_TEMP/durable-runtime-artifacts.json" --directory "$RUNNER_TEMP/durable-runtime-bundle"
       - uses: actions/upload-artifact@v4
         with:
