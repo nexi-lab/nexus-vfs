@@ -290,35 +290,7 @@ pub trait MetaStore: Send + Sync {
         new_path: &str,
         is_pas: bool,
     ) -> Result<(), MetaStoreError> {
-        if old_path == new_path {
-            return Ok(());
-        }
-        if let Some(mut meta) = self.get(old_path)? {
-            meta.path = new_path.to_string();
-            if is_pas {
-                pas_update_content_id(&mut meta, old_path, new_path);
-            }
-            self.put(new_path, meta)?;
-            self.delete(old_path)?;
-        }
-        let old_prefix = format!("{}/", old_path.trim_end_matches('/'));
-        let new_prefix = format!("{}/", new_path.trim_end_matches('/'));
-        let children = self.list(&old_prefix)?;
-        for mut child in children {
-            let suffix = match child.path.strip_prefix(&old_prefix) {
-                Some(s) => s.to_string(),
-                None => continue,
-            };
-            let old_child = child.path.clone();
-            let new_child = format!("{}{}", new_prefix, suffix);
-            child.path = new_child.clone();
-            if is_pas {
-                pas_update_content_id(&mut child, &old_child, &new_child);
-            }
-            self.put(&new_child, child)?;
-            self.delete(&old_child)?;
-        }
-        Ok(())
+        rename_metadata_path(self, old_path, new_path, is_pas)
     }
 
     /// Store an auxiliary key/value blob attached to a path (e.g.
@@ -608,13 +580,59 @@ pub struct StreamSegment {
 /// is a hash and must not be overwritten with a path string.
 pub fn pas_update_content_id(meta: &mut FileMetadata, old_vfs: &str, new_vfs: &str) {
     if let Some(cid) = meta.content_id.as_deref() {
-        let pas_suffix = format!("/{cid}");
-        if old_vfs.ends_with(pas_suffix.as_str()) || old_vfs == cid {
-            let prefix_len = old_vfs.len() - cid.len();
-            let mount_prefix = &old_vfs[..prefix_len];
-            if new_vfs.starts_with(mount_prefix) {
-                meta.content_id = Some(new_vfs[prefix_len..].to_string());
-            }
+        if let Some(updated) = renamed_pas_content_id(cid, old_vfs, new_vfs) {
+            meta.content_id = Some(updated);
         }
     }
+}
+
+/// The backend-relative content path selected by a PAS rename.
+/// `None` keeps an opaque connector identifier or a different mount's identifier.
+pub fn renamed_pas_content_id(cid: &str, old_vfs: &str, new_vfs: &str) -> Option<String> {
+    let pas_suffix = format!("/{cid}");
+    if old_vfs.ends_with(pas_suffix.as_str()) || old_vfs == cid {
+        let prefix_len = old_vfs.len() - cid.len();
+        let mount_prefix = &old_vfs[..prefix_len];
+        if new_vfs.starts_with(mount_prefix) {
+            return Some(new_vfs[prefix_len..].to_string());
+        }
+    }
+    None
+}
+
+/// Execute the portable rename contract using a store's basic metadata methods.
+/// Stores with a transactional rename select their own implementation.
+pub fn rename_metadata_path<S: MetaStore + ?Sized>(
+    store: &S,
+    old_path: &str,
+    new_path: &str,
+    is_pas: bool,
+) -> Result<(), MetaStoreError> {
+    if old_path == new_path {
+        return Ok(());
+    }
+    if let Some(mut meta) = store.get(old_path)? {
+        meta.path = new_path.to_string();
+        if is_pas {
+            pas_update_content_id(&mut meta, old_path, new_path);
+        }
+        store.put(new_path, meta)?;
+        store.delete(old_path)?;
+    }
+    let old_prefix = format!("{}/", old_path.trim_end_matches('/'));
+    let new_prefix = format!("{}/", new_path.trim_end_matches('/'));
+    for mut child in store.list(&old_prefix)? {
+        let Some(suffix) = child.path.strip_prefix(&old_prefix) else {
+            continue;
+        };
+        let new_child = format!("{new_prefix}{suffix}");
+        let old_child = child.path.clone();
+        child.path = new_child.clone();
+        if is_pas {
+            pas_update_content_id(&mut child, &old_child, &new_child);
+        }
+        store.put(&new_child, child)?;
+        store.delete(&old_child)?;
+    }
+    Ok(())
 }

@@ -38,6 +38,16 @@ fn decode_policy(value: Option<Vec<u8>>) -> Result<bool> {
 }
 
 impl FullStateMachine {
+    pub(super) fn ordinary_metadata_refusal(
+        &self,
+        txn: &redb::WriteTransaction,
+        path: &str,
+    ) -> Result<Option<CommandResult>> {
+        Ok(self.protected_in_txn(txn, path)?.then(|| {
+            CommandResult::Error("protected metadata requires a conditional write".into())
+        }))
+    }
+
     /// Export reads the policy set once, rather than opening a transaction per
     /// metadata key in a potentially large anti-entropy image.
     pub(super) fn protected_metadata_paths(&self) -> Result<std::collections::HashSet<String>> {
