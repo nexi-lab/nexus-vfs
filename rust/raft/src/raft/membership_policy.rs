@@ -1,12 +1,17 @@
 //! Construction and ingress policy for a fixed local consensus group.
 
-use protobuf::Message;
-use raft::eraftpb::{ConfChange, ConfChangeType, ConfState, Entry, EntryType};
-use raft::{GetEntriesContext, Storage};
-
-use super::{Command, RaftConfig, RaftError, RaftStorage, Result, StateMachine};
+#[cfg(feature = "consensus")]
+use {
+    super::{Command, RaftConfig, RaftError, RaftStorage, Result, StateMachine},
+    protobuf::Message,
+    raft::{
+        eraftpb::{ConfChange, ConfChangeType, ConfState, Entry, EntryType},
+        GetEntriesContext, Storage,
+    },
+};
 
 /// The membership authority selected by the owning runtime at construction.
+/// Storage requirements remain inspectable independently of the consensus driver.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MembershipPolicy {
     #[default]
@@ -14,6 +19,7 @@ pub enum MembershipPolicy {
     FixedLocal,
 }
 
+#[cfg(feature = "consensus")]
 impl Command {
     pub(crate) fn requires_fixed_local_storage(&self) -> bool {
         matches!(
@@ -23,6 +29,7 @@ impl Command {
     }
 }
 
+#[cfg(feature = "consensus")]
 impl MembershipPolicy {
     pub(crate) fn require_managed(self) -> Result<()> {
         if self == Self::FixedLocal {
@@ -140,6 +147,7 @@ impl MembershipPolicy {
     }
 }
 
+#[cfg(feature = "consensus")]
 fn require_local(state: &ConfState, node_id: u64) -> Result<()> {
     if state.voters != [node_id]
         || !state.learners.is_empty()
@@ -154,6 +162,7 @@ fn require_local(state: &ConfState, node_id: u64) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "consensus")]
 fn invalid(reason: &str) -> RaftError {
     RaftError::Config(format!("isolated root: {reason}"))
 }

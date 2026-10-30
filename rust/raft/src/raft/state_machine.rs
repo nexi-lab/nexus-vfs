@@ -290,6 +290,7 @@ impl Command {
     }
 
     /// Normal entries carry the proposal ID followed by the serialized command.
+    #[cfg(feature = "consensus")]
     pub(crate) fn from_log_data(data: &[u8]) -> Result<(u64, Self)> {
         let id = data
             .get(..8)
