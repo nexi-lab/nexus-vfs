@@ -86,8 +86,9 @@ its admission policy throughout the runtime's lifetime. Managed membership and
 deferred network mounts require their own qualified protocol admission before
 exposing this capability.
 
-The managed metadata subtree is `/__managed_content_v1__`, including its
-slash-delimited descendants. Its eligibility is a fixed key policy shared by
+The managed metadata subtree is defined by
+[`MANAGED_CONTENT_ROOT` and `is_managed_content_path`](../rust/contracts/src/constants.rs),
+including its slash-delimited descendants. Its eligibility is a fixed key policy shared by
 the EC origin, peer ingress, anti-entropy and state-machine boundaries.
 Protected metadata and its allocator enter through SC. An occupied unversioned
 image returns Unsupported. Migration conditionally creates a verified image in
