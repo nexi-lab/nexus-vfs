@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, windows-2022, macos-14]
+        os: [ubuntu-22.04, windows-2022, macos-15]
     env:
       CARGO_BUILD_JOBS: 1
     steps:
@@ -43,7 +43,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, windows-2022, macos-14]
+        os: [ubuntu-22.04, windows-2022, macos-15]
     env:
       CARGO_BUILD_JOBS: 1
     steps:
@@ -126,7 +126,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, windows-2022, macos-14]
+        os: [ubuntu-22.04, windows-2022, macos-15]
     env:
       CARGO_BUILD_JOBS: 1
     steps:
@@ -148,7 +148,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-2022, macos-14]
+        os: [windows-2022, macos-15]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
