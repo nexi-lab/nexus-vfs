@@ -10,7 +10,7 @@ use crate::dispatch::{
     WriteHookCtx,
 };
 
-use super::{Kernel, KernelError, OperationContext, RwLockExt};
+use super::{validate_path_fast, Kernel, KernelError, OperationContext, RwLockExt};
 
 use std::sync::Arc;
 
@@ -196,6 +196,24 @@ impl Kernel {
         ctx: &OperationContext,
     ) -> Result<(), KernelError> {
         self.check_permission_with_route(path, None, permission, ctx)
+    }
+
+    /// Gate metadata primitives, including the administrator-owned synthetic
+    /// namespace, through the same identity-aware boundary for every adapter.
+    pub fn check_metadata_permission(
+        &self,
+        path: &str,
+        permission: Permission,
+        ctx: &OperationContext,
+    ) -> Result<(), KernelError> {
+        validate_path_fast(path)?;
+        if !ctx.is_admin && !ctx.is_system && (path == "/__sys__" || path.starts_with("/__sys__/"))
+        {
+            return Err(KernelError::PermissionDenied(
+                "system metadata requires an administrator".into(),
+            ));
+        }
+        self.check_permission(path, permission, ctx)
     }
 
     /// Variant of [`Self::check_permission`] that passes a

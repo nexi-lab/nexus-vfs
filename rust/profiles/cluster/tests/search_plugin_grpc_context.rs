@@ -117,7 +117,7 @@ async fn metadata_and_delegation_survive_the_real_daemon_and_signed_cdylib() {
         ],
     );
     daemon
-        .wait_for_log("Static topology applied", BUDGET)
+        .wait_for_log("VFS data plane ready", BUDGET)
         .await
         .unwrap();
     let mut node = client(port, &ca, &node_cert, &node_key).await;

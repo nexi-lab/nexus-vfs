@@ -11,6 +11,8 @@ import shutil
 import subprocess
 import sys
 
+from durable_artifacts import load_executables
+
 SUITES = [
     ('owner', 'user_runtime', ['--exact', 'durable_cas_mount_reopens_immutable_content_with_the_owner_boundary']),
     ('content', 'conditional_content', []),
@@ -39,14 +41,7 @@ def main():
     from qualify import digest, run_logged, runtime_command, verify_release
 
     required_executables = {executable for _, executable, _ in SUITES} | {'nexusd-cluster'}
-    executables = {}
-    for line in args.artifacts.read_text().splitlines():
-        row = json.loads(line)
-        if row.get('reason') == 'compiler-artifact' and row.get('executable'):
-            name = row['target']['name']
-            if name in required_executables:
-                executables[name] = Path(row['executable']).resolve(strict=True)
-    assert set(executables) == required_executables
+    executables = load_executables(args.artifacts, required_executables)
     selected_counts = {}
     for label, executable, selection in SUITES:
         listed = subprocess.check_output([str(executables[executable]), *selection, '--list'], text=True)
