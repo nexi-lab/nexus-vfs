@@ -4,13 +4,49 @@ use kernel::abc::object_store::ObjectStore;
 use kernel::kernel::conditional_content::ConditionalContentError;
 use kernel::kernel::convenience::KernelConvenience;
 use kernel::kernel::{KernelError, OperationContext, UnlinkRequest, WriteRequest};
-use kernel::meta_store::{FileMetadata, RecordProtectionResult, DT_LINK};
+use kernel::meta_store::{ConditionalMetadataError, FileMetadata, RecordProtectionResult, DT_LINK};
 use std::sync::Arc;
 
 use super::{context, Fixture};
 
 #[test]
+fn deferred_capability_probe_is_lazy_and_unavailable_zone_is_an_error() {
+    let directory = tempfile::tempdir().unwrap();
+    let manager = nexus_raft::ZoneManager::isolated(directory.path().to_str().unwrap()).unwrap();
+    let registry = manager.registry();
+    let before = registry.resident_zones();
+    let store = nexus_raft::zone_meta_store::ZoneMetaStore::deferred_arc(
+        registry.clone(),
+        "unavailable-private-zone",
+        manager.runtime_handle(),
+        "/conversations".into(),
+        "/conversations".into(),
+    );
+    let conditional = store.as_conditional_metadata().unwrap();
+    let protection = store.as_record_protection().unwrap();
+    assert_eq!(registry.resident_zones(), before);
+    let path = "/conversations/pair/readers/owner";
+    assert!(matches!(
+        conditional.read_versioned(path),
+        Err(ConditionalMetadataError::Failed(_))
+    ));
+    assert!(matches!(
+        protection.protect_record(path, &|_| panic!("unavailable zone cannot qualify content")),
+        Err(ConditionalMetadataError::Failed(_))
+    ));
+    assert_eq!(registry.resident_zones(), before);
+    drop(store);
+    manager.shutdown();
+}
+
+#[test]
 fn reader_admission_keeps_the_canonical_conversation_path_across_restart() {
+    for is_deferred in [false, true] {
+        reader_admission_across_restart(is_deferred);
+    }
+}
+
+fn reader_admission_across_restart(is_deferred: bool) {
     const PATH: &str = "/conversations/stable-cid/readers/agent-a";
     const ALIAS: &str = "/alias/stable-cid/readers/agent-a";
     const LEGACY: &[u8] =
@@ -18,8 +54,12 @@ fn reader_admission_keeps_the_canonical_conversation_path_across_restart() {
     const CURRENT: &[u8] =
         br#"{"epoch":2,"holder":"current-runtime","claim_id":"current","read_offset":82}"#;
     let root = Arc::new(tempfile::tempdir().unwrap());
-    let fixture =
-        Fixture::open_root_with_namespace(root.clone(), "/conversations", "/conversations");
+    let fixture = Fixture::open_root_with_binding(
+        root.clone(),
+        "/conversations",
+        "/conversations",
+        is_deferred,
+    );
     KernelConvenience::mkdir(
         fixture.kernel.as_ref(),
         "/conversations/stable-cid/readers",
@@ -63,7 +103,8 @@ fn reader_admission_keeps_the_canonical_conversation_path_across_restart() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].path, PATH);
     drop(fixture);
-    let restored = Fixture::open_root_with_namespace(root, "/conversations", "/conversations");
+    let restored =
+        Fixture::open_root_with_binding(root, "/conversations", "/conversations", is_deferred);
     let after = restored
         .kernel
         .read_versioned_content(PATH, &context())

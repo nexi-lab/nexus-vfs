@@ -50,20 +50,29 @@ impl Fixture {
         mount_point: &str,
         subtree: &str,
     ) -> Self {
+        Self::open_root_with_binding(root, mount_point, subtree, false)
+    }
+
+    fn open_root_with_binding(
+        root: Arc<tempfile::TempDir>,
+        mount_point: &str,
+        subtree: &str,
+        is_deferred: bool,
+    ) -> Self {
         let manager = ZoneManager::isolated(root.path().join("raft").to_str().unwrap()).unwrap();
         let zone = manager.create_zone("root", vec![]).unwrap();
         assert!(zone.wait_for_leader(Duration::from_secs(10)));
         let kernel = Arc::new(Kernel::new());
         let backend = Arc::new(CasLocalBackend::new_durable(&root.path().join("cas")).unwrap());
-        let store: Arc<dyn MetaStore> = Arc::new(ZoneMetaStore::new_with_subtree(
-            zone.consensus_node().clone(),
-            manager.runtime_handle(),
-            mount_point.into(),
-            subtree.into(),
-        ));
-        for mount in [mount_point, "/alias"] {
-            let metadata: Arc<dyn MetaStore> = if mount == mount_point {
-                store.clone()
+        let bind = |mount: &str| -> Arc<dyn MetaStore> {
+            if is_deferred {
+                ZoneMetaStore::deferred_arc(
+                    manager.registry(),
+                    "root",
+                    manager.runtime_handle(),
+                    mount.into(),
+                    subtree.into(),
+                )
             } else {
                 Arc::new(ZoneMetaStore::new_with_subtree(
                     zone.consensus_node().clone(),
@@ -71,6 +80,14 @@ impl Fixture {
                     mount.into(),
                     subtree.into(),
                 ))
+            }
+        };
+        let store = bind(mount_point);
+        for mount in [mount_point, "/alias"] {
+            let metadata: Arc<dyn MetaStore> = if mount == mount_point {
+                store.clone()
+            } else {
+                bind(mount)
             };
             kernel
                 .vfs_router_arc()
