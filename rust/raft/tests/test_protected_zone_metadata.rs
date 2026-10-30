@@ -1,11 +1,13 @@
 //! Stable-path adoption through the actual Raft actor and persistent redb store.
 #![cfg(all(feature = "grpc", has_protos))]
 
-use kernel::meta_store::{ConditionalMetadataResult, FileMetadata, MetaStore};
+use kernel::meta_store::{
+    ConditionalMetadataResult, FileMetadata, MetaStore, RecordProtection, RecordProtectionResult,
+};
 use nexus_raft::prelude::{Command, CommandResult, FullStateMachine, StateMachine};
 use nexus_raft::raft::{RaftConfig, RaftStorage, ZoneConsensus, ZonePersistence};
 use nexus_raft::storage::RedbStore;
-use nexus_raft::zone_meta_store::{ProtectedMetadataAdoption, ZoneMetaStore};
+use nexus_raft::zone_meta_store::ZoneMetaStore;
 use nexus_raft::ZoneManager;
 use raft::eraftpb::{Entry, Message, MessageType};
 use std::sync::Arc;
@@ -50,14 +52,79 @@ fn image(content: &str) -> FileMetadata {
 }
 
 fn protected(store: &ZoneMetaStore, path: &str) -> Option<kernel::meta_store::MetadataSnapshot> {
-    match store.adopt_protected_record(path).unwrap() {
-        ProtectedMetadataAdoption::Protected => store
+    match store.protect_record(path, &|_| Ok(())).unwrap() {
+        RecordProtectionResult::Protected => store
             .as_conditional_metadata()
             .unwrap()
             .read_versioned(path)
             .unwrap(),
-        ProtectedMetadataAdoption::Conflict => panic!("quiescent adoption must commit"),
+        RecordProtectionResult::Conflict => panic!("quiescent adoption must commit"),
     }
+}
+
+#[test]
+fn qualification_and_adoption_compare_the_same_legacy_image() {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = Runtime::open(directory.path());
+    let store = runtime.store("/", "/");
+    let alias = runtime.store("/alias", "/conversations/stable-cid/readers");
+    store.put(PATH, image("qualified-image")).unwrap();
+    let outcome = store
+        .protect_record(PATH, &|metadata| {
+            assert_eq!(metadata.path, PATH);
+            assert_eq!(metadata.content_id.as_deref(), Some("qualified-image"));
+            alias.put("/alias/agent-a", image("concurrent-image"))
+        })
+        .unwrap();
+    assert_eq!(outcome, RecordProtectionResult::Conflict);
+    assert_eq!(
+        store.get(PATH).unwrap().unwrap().content_id.as_deref(),
+        Some("concurrent-image")
+    );
+    assert!(store
+        .as_conditional_metadata()
+        .unwrap()
+        .read_versioned(PATH)
+        .is_err());
+    // A conflicted admission has committed neither a policy nor a revision.
+    store.put(PATH, image("still-ordinary")).unwrap();
+    protected(&store, PATH).unwrap();
+    assert!(store.put(PATH, image("now-refused")).is_err());
+}
+
+#[test]
+fn failed_qualification_preserves_the_ordinary_record_and_its_policy() {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = Runtime::open(directory.path());
+    let store = runtime.store("/", "/");
+    store.put(PATH, image("unqualified-content")).unwrap();
+    assert!(store
+        .protect_record(PATH, &|_| {
+            Err(kernel::meta_store::MetaStoreError::IOError(
+                "immutable object is unavailable".into(),
+            ))
+        })
+        .is_err());
+    assert_eq!(
+        store.get(PATH).unwrap().unwrap().content_id.as_deref(),
+        Some("unqualified-content")
+    );
+    store.put(PATH, image("ordinary-repair")).unwrap();
+    assert!(store.delete(PATH).unwrap());
+    store
+        .put(
+            PATH,
+            FileMetadata {
+                entry_type: kernel::meta_store::DT_DIR,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        store.protect_record(PATH, &|_| panic!("directories have no record content")),
+        Err(kernel::meta_store::ConditionalMetadataError::Unsupported)
+    ));
+    assert!(store.delete(PATH).unwrap());
 }
 
 #[test]

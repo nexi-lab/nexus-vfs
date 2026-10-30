@@ -25,6 +25,8 @@
 //!
 //! * [`conditional_metadata`] — atomic metadata snapshots and replacements
 //!   (reached via `MetaStore::as_conditional_metadata`).
+//! * [`record_protection`] — qualified admission of conditional-only records
+//!   (reached via `MetaStore::as_record_protection`).
 //! * [`llm_streaming`] — `LlmStreamingBackend`, connector-backend SSE
 //!   streaming (reached via `ObjectStore::as_llm_streaming`).
 //!
@@ -35,3 +37,4 @@
 
 pub mod conditional_metadata;
 pub mod llm_streaming;
+pub mod record_protection;

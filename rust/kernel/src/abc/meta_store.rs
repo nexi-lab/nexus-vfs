@@ -183,6 +183,13 @@ pub struct PaginatedList {
 /// federation-layer concerns never leak up. Returned ``FileMetadata.path``
 /// values are likewise full paths.
 pub trait MetaStore: Send + Sync {
+    /// Storage-owned conversion to a conditional-only write policy.
+    fn as_record_protection(
+        &self,
+    ) -> Option<&dyn crate::extensions::record_protection::RecordProtection> {
+        None
+    }
+
     /// A paired snapshot/replacement extension selected by the owning store.
     fn as_conditional_metadata(
         &self,

@@ -159,6 +159,21 @@ reads keep their existing read-only semantics, and ordinary conditional updates
 keep their existing token and uncertain-outcome semantics. Zone projection
 continues to determine the record's owner and physical placement.
 
+`Kernel::protect_record_content` is the runtime service's native admission
+operation. It requires an administrator or system identity, rechecks metadata
+write and content read permissions on directory-link targets, and resolves the
+same qualified immutable storage as the content pair. The metastore's optional
+`RecordProtection` extension owns the authoritative snapshot, runs the Kernel's
+content qualification outside consensus and database transactions, then compares
+that exact serialized image while committing protection. Qualification reads and
+hash-verifies the complete content and uses the existing durable publisher,
+including its deduplication barriers, to confirm the same immutable identifier.
+Legacy images that require a different canonical identifier remain ordinary until
+the owning service converts them. An absent path can be
+reserved before its first conditional create. Failed qualification and a
+concurrent ordinary write preserve the existing policy and image. This operation
+admits the storage policy; the owning runtime service owns consumer retirement.
+
 ## Content publication and reads
 
 Read selects metadata once, then obtains the immutable object named by that

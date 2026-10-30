@@ -4,6 +4,9 @@
 #[path = "conditional_content/rpc.rs"]
 mod rpc;
 
+#[path = "conditional_content/protection.rs"]
+mod protection;
+
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
 
