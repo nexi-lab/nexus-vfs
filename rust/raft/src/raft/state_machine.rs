@@ -1007,7 +1007,8 @@ pub struct FullStateMachine {
     ///
     /// Elements are [`ApplyObserver`] — a `(dedup_key, cb)` pair so a
     /// keyed consumer (federation mount) replaces its prior registration
-    /// on re-install while anonymous ones (DCache) accumulate.
+    /// on re-install. Runtime subscriptions remove their anonymous entry
+    /// when the owning mount is dropped.
     apply_observers: Arc<parking_lot::RwLock<Vec<ApplyObserver>>>,
 }
 

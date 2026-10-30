@@ -114,8 +114,8 @@ pub struct ZoneMetaStore {
     /// `RemoteMetaStore`.  Each zone metastore caches its own hot
     /// entries (keyed by the caller-facing GLOBAL path, mirroring the
     /// `to_global_path` rewrite done on read so callers see consistent
-    /// keys).  `get` consults the cache first; `put` is write-through;
-    /// `delete` invalidates pre-propose.
+    /// keys). `get` consults the cache first; `put` fills it from an
+    /// authoritative committed image; `delete` invalidates pre-propose.
     ///
     /// Apply-side coherence on follower nodes (and on crosslink
     /// surfaces of the same zone on the leader): every ZoneMetaStore
@@ -124,9 +124,10 @@ pub struct ZoneMetaStore {
     /// state machine commits a metadata replacement or deletion,
     /// the slot fires every registered observer — each
     /// one evicts its own cache row for the corresponding global path.
-    /// Wrapped in ``Arc`` so the closure can hold a stable handle that
-    /// survives the ZoneMetaStore's call frames.
+    /// The callback observes this cache through a weak reference. Its
+    /// subscription follows the metastore's runtime lifetime.
     cache: Arc<MetadataCache>,
+    cache_subscription: std::sync::OnceLock<Option<crate::raft::ApplySubscription>>,
 }
 
 /// Register the apply-side cache invalidator for one zone metastore.
@@ -134,8 +135,8 @@ pub struct ZoneMetaStore {
 /// Ordinary and conditional metadata replacements and deletions evict the
 /// affected row. The zone-relative key is
 /// translated back to the caller-facing global path (the form this metastore
-/// caches under) before evicting. A weak cache reference follows the mount's
-/// lifetime while the zone actor retains its observer.
+/// caches under) before evicting. The mount owns its subscription and the
+/// callback holds a weak cache reference for in-flight notifications.
 ///
 /// Called at construction for an already-bound zone, and at resolve time for a
 /// deferred one, so both bindings get the same coherence guarantee.
@@ -144,11 +145,11 @@ fn register_cache_invalidator(
     cache: &Arc<MetadataCache>,
     mount_point: &str,
     target_subtree: &str,
-) {
+) -> Option<crate::raft::ApplySubscription> {
     let cache_for_cb = Arc::downgrade(cache);
     let mount_point_for_cb = mount_point.to_string();
     let subtree_for_cb = target_subtree.to_string();
-    node.register_apply_observer(Arc::new(move |entry: &AppliedEntry| {
+    node.subscribe_apply_observer(move |entry: &AppliedEntry| {
         let Some(cache_for_cb) = cache_for_cb.upgrade() else {
             return;
         };
@@ -183,7 +184,7 @@ fn register_cache_invalidator(
             return;
         };
         cache_for_cb.invalidate(&global);
-    }));
+    })
 }
 
 /// How a [`ZoneMetaStore`] reaches its zone's consensus handle.
@@ -243,13 +244,14 @@ impl ZoneMetaStore {
         let cache = Arc::new(MetadataCache::default());
         // Each mount projects the committed zone key into its own global
         // namespace before evicting the derived cache entry.
-        register_cache_invalidator(&node, &cache, &mount_point, &target_subtree);
+        let subscription = register_cache_invalidator(&node, &cache, &mount_point, &target_subtree);
         Self {
             binding: ZoneBinding::Ready(node),
             runtime,
             mount_point,
             target_subtree,
             cache,
+            cache_subscription: std::sync::OnceLock::from(subscription),
         }
     }
 
@@ -282,6 +284,7 @@ impl ZoneMetaStore {
             mount_point,
             target_subtree,
             cache: Arc::new(MetadataCache::default()),
+            cache_subscription: std::sync::OnceLock::new(),
         })
     }
 
@@ -300,28 +303,28 @@ impl ZoneMetaStore {
                 zone_id,
                 resolved,
             } => {
-                if let Some(node) = resolved.get() {
-                    return Ok(node);
+                if resolved.get().is_none() {
+                    let node = registry.get_node(zone_id).ok_or_else(|| {
+                        MetaStoreError::IOError(format!(
+                            "ZoneMetaStore: zone '{zone_id}' is not available on this node"
+                        ))
+                    })?;
+                    let _ = resolved.set(node);
                 }
-                let node = registry.get_node(zone_id).ok_or_else(|| {
-                    MetaStoreError::IOError(format!(
-                        "ZoneMetaStore: zone '{zone_id}' is not available on this node"
-                    ))
-                })?;
-                register_cache_invalidator(
-                    &node,
-                    &self.cache,
-                    &self.mount_point,
-                    &self.target_subtree,
-                );
-                // A concurrent resolve may win; both handles are equivalent
-                // clones of the same consensus, so either is correct.
-                let _ = resolved.set(node);
-                resolved.get().ok_or_else(|| {
+                let node = resolved.get().ok_or_else(|| {
                     MetaStoreError::IOError(format!(
                         "ZoneMetaStore: zone '{zone_id}' resolve raced to nothing"
                     ))
-                })
+                })?;
+                self.cache_subscription.get_or_init(|| {
+                    register_cache_invalidator(
+                        node,
+                        &self.cache,
+                        &self.mount_point,
+                        &self.target_subtree,
+                    )
+                });
+                Ok(node)
             }
         }
     }
