@@ -114,6 +114,51 @@ incarnation handling before conditional capability admission. Consumers treat
 the wire token as opaque rather than deriving it from a content hash, local
 clock, PID or the ordinary file generation field.
 
+### Protected record admission
+
+A protected record keeps its existing logical path and one authoritative image.
+Its owning service explicitly adopts the record into a conditional write policy.
+The file pair continues to read and update it through the existing operations.
+The general file pair also serves ordinary files, whose ordinary SC writes
+continue to advance their revisions as described above.
+
+Adoption compares the exact committed legacy image and commits its content
+pointer, first revision and conditional write policy in one SC transaction.
+It preserves the record's bytes. A concurrent legacy write causes adoption to
+conflict; the owning service reads the new image and decides again. An uncertain
+adoption result is settled by reading its committed policy and image.
+
+The storage policy governs every mutation of that record, including replacement,
+deletion, metadata changes, aliases and replication ingress. A protected update
+supplies its committed version. An ordinary mutation is refused before it can
+change the authoritative image or revision. The same policy check belongs to the
+SC apply transaction and the EC ingress boundary; kernel-side validation also
+avoids staging content for an already forbidden mutation.
+
+```mermaid
+flowchart LR
+    Service["Record-owning service"] --> Adopt["Compare legacy image and adopt"]
+    Adopt --> Transaction["SC: image + revision + write policy"]
+    Transaction --> Path["Existing logical path"]
+    Reader["Authenticated reader"] --> Path
+    Writer["Writer with current version"] --> Guard["Storage policy and version comparison"]
+    Guard --> Path
+```
+
+The zone's admitted storage and replica versions enforce this policy before
+adoption is enabled. Capability admission covers retained logs, snapshots,
+restart and subsequent membership changes. New processes and restored stores
+qualify against the same policy requirement. The record owner retires previous
+consumer versions and verifies its active bindings before adopting a legacy
+record. Storage fencing protects the committed record; delivery side effects
+retain their consumer's separate acknowledgement contract.
+
+Protected-record admission is a distinct capability from the general file pair.
+Its control operation owns legacy conversion and lifecycle retirement. Ordinary
+reads keep their existing read-only semantics, and ordinary conditional updates
+keep their existing token and uncertain-outcome semantics. Zone projection
+continues to determine the record's owner and physical placement.
+
 ## Content publication and reads
 
 Read selects metadata once, then obtains the immutable object named by that
