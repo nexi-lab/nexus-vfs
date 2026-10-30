@@ -55,8 +55,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-cas-publication-${{ matrix.os }}
-      - name: CAS complete publication on the native filesystem
-        run: cargo test -p kernel --test cas_publication
+      - name: Kernel boot and CAS publication on the native filesystem
+        run: cargo test -p kernel --test cas_publication --test boot_metastore
       - name: Batch write results and commit notifications on the native filesystem
         run: cargo test --locked -p kernel --test batch_write_outcomes
       - name: Durable CAS ObjectStore composition
