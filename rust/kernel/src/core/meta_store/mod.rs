@@ -23,6 +23,7 @@ mod coherence_tests;
 pub use crate::extensions::conditional_metadata::{
     ConditionalMetadata, ConditionalMetadataError, ConditionalMetadataResult, MetadataSnapshot,
 };
+pub use crate::extensions::record_protection::{RecordProtection, RecordProtectionResult};
 
 pub use crate::abc::meta_store::{
     pas_update_content_id, FileMetadata, MetaStore, MetaStoreError, PaginatedList, PathEtag,

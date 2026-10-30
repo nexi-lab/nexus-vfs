@@ -94,8 +94,20 @@ impl Kernel {
         let Some(snapshot) = self.conditional_content_snapshot(path, &route)? else {
             return Ok(None);
         };
-        require_regular(&snapshot.metadata)?;
-        let content_id = snapshot.metadata.content_id.as_deref().ok_or_else(|| {
+        let content = self.read_immutable_content(&route, &snapshot.metadata)?;
+        Ok(Some(VersionedContent {
+            content,
+            version: snapshot.version,
+        }))
+    }
+
+    pub(super) fn read_immutable_content(
+        &self,
+        route: &RouteResult,
+        metadata: &FileMetadata,
+    ) -> Result<Vec<u8>, ConditionalContentError> {
+        require_regular(metadata)?;
+        let content_id = metadata.content_id.as_deref().ok_or_else(|| {
             ConditionalContentError::Failed(KernelError::BackendError(
                 "versioned regular file has no immutable content identifier".into(),
             ))
@@ -106,15 +118,12 @@ impl Kernel {
             .and_then(|backend| backend.as_cas())
             .ok_or(ConditionalContentError::Unsupported)?;
         let content = engine.read_content(content_id).map_err(storage_error)?;
-        if content.len() as u64 != snapshot.metadata.size {
+        if content.len() as u64 != metadata.size {
             return Err(ConditionalContentError::Failed(KernelError::BackendError(
                 "versioned content size differs from its metadata image".into(),
             )));
         }
-        Ok(Some(VersionedContent {
-            content,
-            version: snapshot.version,
-        }))
+        Ok(content)
     }
 
     /// Stage durable immutable bytes, then compare and publish their pointer atomically.
@@ -199,7 +208,7 @@ impl Kernel {
         })
     }
 
-    fn conditional_content_route(
+    pub(super) fn conditional_content_route(
         &self,
         path: &str,
         ctx: &OperationContext,
@@ -246,7 +255,7 @@ fn require_regular(metadata: &FileMetadata) -> Result<(), ConditionalContentErro
     }
 }
 
-fn require_link_hop(path: &str, remaining: u8) -> Result<(), ConditionalContentError> {
+pub(super) fn require_link_hop(path: &str, remaining: u8) -> Result<(), ConditionalContentError> {
     if remaining == 0 {
         Err(
             KernelError::PermissionDenied(format!("DT_LINK chain rejected (ELOOP) at {path}"))

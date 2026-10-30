@@ -4,6 +4,9 @@
 #[path = "conditional_content/rpc.rs"]
 mod rpc;
 
+#[path = "conditional_content/protection.rs"]
+mod protection;
+
 #[path = "conditional_content/rename.rs"]
 mod rename;
 
@@ -39,6 +42,14 @@ impl Fixture {
     }
 
     fn open_root(root: Arc<tempfile::TempDir>) -> Self {
+        Self::open_root_with_namespace(root, "/state", MANAGED)
+    }
+
+    fn open_root_with_namespace(
+        root: Arc<tempfile::TempDir>,
+        mount_point: &str,
+        subtree: &str,
+    ) -> Self {
         let manager = ZoneManager::isolated(root.path().join("raft").to_str().unwrap()).unwrap();
         let zone = manager.create_zone("root", vec![]).unwrap();
         assert!(zone.wait_for_leader(Duration::from_secs(10)));
@@ -47,18 +58,18 @@ impl Fixture {
         let store: Arc<dyn MetaStore> = Arc::new(ZoneMetaStore::new_with_subtree(
             zone.consensus_node().clone(),
             manager.runtime_handle(),
-            "/state".into(),
-            MANAGED.into(),
+            mount_point.into(),
+            subtree.into(),
         ));
-        for mount in ["/state", "/alias"] {
-            let metadata: Arc<dyn MetaStore> = if mount == "/state" {
+        for mount in [mount_point, "/alias"] {
+            let metadata: Arc<dyn MetaStore> = if mount == mount_point {
                 store.clone()
             } else {
                 Arc::new(ZoneMetaStore::new_with_subtree(
                     zone.consensus_node().clone(),
                     manager.runtime_handle(),
                     mount.into(),
-                    MANAGED.into(),
+                    subtree.into(),
                 ))
             };
             kernel

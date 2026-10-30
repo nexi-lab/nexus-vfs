@@ -1,20 +1,18 @@
 //! Public Kernel rename over the actual CAS, actor and aliased namespace.
 
-use super::{context, Fixture, ZoneMetaStore, MANAGED};
-use nexus_raft::zone_meta_store::ProtectedMetadataAdoption;
+use super::{context, Fixture};
+use kernel::kernel::OperationContext;
+use kernel::meta_store::RecordProtectionResult;
 
 fn protect(fixture: &Fixture, path: &str) {
-    let zone = fixture.manager.get_zone("root").unwrap();
-    let store = ZoneMetaStore::new_with_subtree(
-        zone.consensus_node().clone(),
-        fixture.manager.runtime_handle(),
-        "/state".into(),
-        MANAGED.into(),
+    let service = OperationContext::new("alice", "root", true, None, false);
+    assert_eq!(
+        fixture
+            .kernel
+            .protect_record_content(path, &service)
+            .unwrap(),
+        RecordProtectionResult::Protected
     );
-    assert!(matches!(
-        store.adopt_protected_record(path).unwrap(),
-        ProtectedMetadataAdoption::Protected
-    ));
 }
 
 #[test]

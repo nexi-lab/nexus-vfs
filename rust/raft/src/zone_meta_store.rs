@@ -63,7 +63,6 @@ mod cache;
 mod conditional;
 mod protected;
 use cache::MetadataCache;
-pub use protected::ProtectedMetadataAdoption;
 
 fn require_metadata_success(
     result: CommandResult,
@@ -548,6 +547,10 @@ pub(crate) fn kernel_to_proto(meta: &KernelFileMetadata) -> Vec<u8> {
 }
 
 impl MetaStore for ZoneMetaStore {
+    fn as_record_protection(&self) -> Option<&dyn kernel::meta_store::RecordProtection> {
+        self.conditional_metadata().map(|_| self as _)
+    }
+
     fn as_conditional_metadata(&self) -> Option<&dyn kernel::meta_store::ConditionalMetadata> {
         self.conditional_metadata()
     }
