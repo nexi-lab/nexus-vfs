@@ -39,7 +39,8 @@ mod csr_cli;
 mod managed_csr;
 #[cfg(feature = "experimental-managed-agent-csr")]
 mod managed_csr_binding;
-mod operator_enrollment;
+#[cfg(feature = "operator-agent-enrollment")]
+pub mod operator_enrollment;
 mod plugin_loading;
 mod runtime_backends;
 mod search_capabilities;
@@ -766,22 +767,6 @@ enum ForeignCaCmd {
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
-    /// Operator-granted, single-endpoint Agent enrollment (bounded JSON stdin).
-    /// Never signs offline or retries an ambiguous MintAgent operation.
-    OperatorAgentEnroll {
-        /// Private owner-created grant; Node/CA authority is never returned.
-        #[arg(long)]
-        grant: PathBuf,
-        /// Prepare the owner grant without issuing or starting a service.
-        #[arg(long)]
-        initialize: bool,
-        /// Exact live issuer endpoint; required only when preparing a grant.
-        #[arg(long, requires = "initialize")]
-        endpoint: Option<String>,
-        /// Explicit native workspace subtree authorized to request codex-* names.
-        #[arg(long, requires = "initialize")]
-        workspace_root: Vec<PathBuf>,
-    },
     /// Detach a local subtree into a new federation zone.
     ///
     /// The subtree under `<path>` (in the parent zone) is copied into a
@@ -1315,25 +1300,6 @@ where
                     .await
                 }
                 Some(Cmd::Auth { action }) => run_auth(args.common, action).await,
-                Some(Cmd::OperatorAgentEnroll {
-                    grant,
-                    initialize,
-                    endpoint,
-                    workspace_root,
-                }) => {
-                    if initialize {
-                        operator_enrollment::initialize(
-                            &grant,
-                            &args.common.data_dir,
-                            endpoint
-                                .as_deref()
-                                .context("--initialize requires --endpoint")?,
-                            workspace_root,
-                        )
-                    } else {
-                        operator_enrollment::run(&grant).await
-                    }
-                }
                 Some(Cmd::ForeignCa { action }) => run_foreign_ca(args.common, action).await,
                 Some(Cmd::Doctor { data_dir, zone }) => run_doctor(&data_dir, zone.as_deref()),
                 Some(Cmd::Reset {

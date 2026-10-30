@@ -1,16 +1,25 @@
 # Operator-granted Agent enrollment
 
-`nexusd-cluster operator-agent-enroll` is a single-destination client of the
+`nexus-agent-enroll` is a single-destination client of the
 existing Node-mTLS-gated `nexus.raft.ZoneApiService/MintAgent` RPC. It can use an
 older daemon that already exposes that RPC. It neither starts a daemon nor
 opens its data store, loads a CA private key, signs offline, searches peers or
 uses `allow_existing`. The existing server verifier, minter and replicated name
 claim stay authoritative. This is not the experimental managed-CSR lifecycle.
+The operator-only entry cannot start a daemon. Build it with
+`cargo build --release -p nexus-cluster --bin nexus-agent-enroll --features operator-agent-enrollment`.
+Default daemon builds exclude the operator module; both entries still reuse the
+same existing TLS loader, RPC client and bundle writer. CI publishes the client
+separately with its feature in the artifact name and applies the same unchanged
+per-platform size cap. It does not replace the running Node executable.
+Future normal release archives carry both distinctly named executables under
+the existing archive checksum; a client-only installation copies only the
+operator entry and leaves the selected running Node intact.
 
 An operator prepares policy explicitly, without minting:
 
 ```sh
-nexusd-cluster --data-dir /absolute/existing-box operator-agent-enroll \
+nexus-agent-enroll --data-dir /absolute/existing-box \
   --initialize --grant /absolute/private/node-grant.json \
   --endpoint https://selected-issuer:2126 --workspace-root /absolute/workspaces
 ```
@@ -32,7 +41,7 @@ The command accepts one JSON claim on stdin, bounded to 8 KiB:
 {"version":1,"actor":"codex-0123456789abcdef0123456789abcdef","operationId":"00000000-0000-4000-8000-000000000001","threadId":"00000000-0000-4000-8000-000000000002","workspace":"/absolute/workspaces/project"}
 ```
 
-Invoke `operator-agent-enroll --grant /absolute/private/node-grant.json`.
+Invoke `nexus-agent-enroll --grant /absolute/private/node-grant.json`.
 Only `codex-` followed by 32 lowercase hex digits is permitted. The canonical
 workspace must lie beneath an explicitly granted canonical subtree. The local
 Node leaf and CA must still match their pins. Endpoint, key paths and authority

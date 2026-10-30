@@ -9,8 +9,49 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, ensure, Context, Result};
+use clap::Parser;
 use lib::transport_primitives::{cert_fingerprint, create_secret, first_certificate_der};
 use serde::{Deserialize, Serialize};
+
+#[derive(Parser)]
+#[command(
+    name = "nexus-agent-enroll",
+    version = super::daemon_version_string(),
+    about = "Operator-granted client of the existing Node MintAgent RPC"
+)]
+struct Args {
+    #[arg(long)]
+    grant: PathBuf,
+    #[arg(long)]
+    initialize: bool,
+    #[arg(long, requires = "initialize")]
+    data_dir: Option<PathBuf>,
+    #[arg(long, requires = "initialize")]
+    endpoint: Option<String>,
+    #[arg(long, requires = "initialize")]
+    workspace_root: Vec<PathBuf>,
+}
+
+/// Standalone client entry; never dispatches the daemon or opens its database.
+pub fn main() -> Result<()> {
+    let args = Args::parse();
+    if args.initialize {
+        return initialize(
+            &args.grant,
+            args.data_dir
+                .as_deref()
+                .context("--initialize requires --data-dir")?,
+            args.endpoint
+                .as_deref()
+                .context("--initialize requires --endpoint")?,
+            args.workspace_root,
+        );
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(run(&args.grant))
+}
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

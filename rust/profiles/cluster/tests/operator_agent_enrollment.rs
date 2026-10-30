@@ -1,5 +1,6 @@
 //! Real CLI + private mTLS founder: exact-target grants, concurrent requests,
 //! immutable local replay and Unknown recovery without offline signing.
+#![cfg(feature = "operator-agent-enrollment")]
 mod common;
 
 use std::io::Write;
@@ -7,12 +8,12 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use common::{cli, free_port_pair, Daemon, LOG_FILTER};
+use common::{free_port_pair, Daemon, LOG_FILTER};
 use serde_json::{json, Value};
 
 fn request(grant: &Path, claim: &Value) -> Value {
-    let mut child = Command::new(common::bin())
-        .args(["operator-agent-enroll", "--grant"])
+    let mut child = Command::new(env!("CARGO_BIN_EXE_nexus-agent-enroll"))
+        .arg("--grant")
         .arg(grant)
         .env_remove("NEXUS_INSECURE_NO_AUTH")
         .stdin(Stdio::piped())
@@ -76,20 +77,26 @@ async fn operator_enrollment_reuses_the_live_minter_and_never_replays_unknown() 
     ready(&mut daemon).await;
     let grant = root.join("grant.json");
     let endpoint = format!("https://{address}");
-    let (ok, out, err) = cli(
-        &env,
-        &[
-            "operator-agent-enroll",
+    let initialized = Command::new(env!("CARGO_BIN_EXE_nexus-agent-enroll"))
+        .args([
             "--initialize",
             "--grant",
             grant.to_str().unwrap(),
+            "--data-dir",
+            data.to_str().unwrap(),
             "--endpoint",
             &endpoint,
             "--workspace-root",
             workspace.to_str().unwrap(),
-        ],
+        ])
+        .output()
+        .unwrap();
+    let out = String::from_utf8(initialized.stdout).unwrap();
+    assert!(
+        initialized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initialized.stderr)
     );
-    assert!(ok, "{out}\n{err}");
     assert_eq!(
         serde_json::from_str::<Value>(&out).unwrap()["issued"],
         false
