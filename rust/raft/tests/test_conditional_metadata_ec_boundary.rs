@@ -84,6 +84,11 @@ async fn protected_ec_is_refused_before_wal_and_acknowledged_without_blocking_re
             expected_image: None,
             incarnation: [7; 16],
         },
+        Command::RenameMetadata {
+            old_key: "/conversations/private/readers/owner".into(),
+            new_key: "/conversations/private/readers/other".into(),
+            is_pas: false,
+        },
     ];
     let mut api = ZoneApiServiceClient::connect(format!("http://{bind}"))
         .await

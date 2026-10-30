@@ -4,10 +4,8 @@
 //! `crate::abc::meta_store`; this module is the home for the
 //! kernel-internal *implementation*:
 //!
-//! * [`LocalMetaStore`] — redb-backed durable impl (~5μs reads).
-//!   Used everywhere — bare-kernel boot opens one against a tempdir
-//!   so tests / quickstarts have a working SSOT without explicit
-//!   ``set_metastore_path``; production swaps in a real path.
+//! * [`LocalMetaStore`] — redb tables and metadata encoding for local storage.
+//!   Kernel boot keeps them in memory; explicit paths persist them on disk.
 //!
 //! Remote / federation impls live in their respective neighbours:
 //! [`remote`] (gRPC proxy) and `raft::meta_store`.

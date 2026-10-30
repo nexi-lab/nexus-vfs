@@ -1379,6 +1379,21 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         }
     }
 
+    #[cfg(all(feature = "grpc", has_protos))]
+    pub(crate) async fn rename_metadata(
+        &self,
+        old_key: String,
+        new_key: String,
+        is_pas: bool,
+    ) -> Result<CommandResult> {
+        self.submit_conditional_storage(Command::RenameMetadata {
+            old_key,
+            new_key,
+            is_pas,
+        })
+        .await
+    }
+
     /// Propose a command with Eventual Consistency — fire and forget.
     ///
     /// Submits the command to Raft but does NOT wait for commit confirmation.

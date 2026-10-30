@@ -2,11 +2,81 @@
 
 use kernel::abc::object_store::ObjectStore;
 use kernel::kernel::conditional_content::ConditionalContentError;
+use kernel::kernel::convenience::KernelConvenience;
 use kernel::kernel::{KernelError, OperationContext, UnlinkRequest, WriteRequest};
 use kernel::meta_store::{FileMetadata, RecordProtectionResult, DT_LINK};
 use std::sync::Arc;
 
 use super::{context, Fixture};
+
+#[test]
+fn reader_admission_keeps_the_canonical_conversation_path_across_restart() {
+    const PATH: &str = "/conversations/stable-cid/readers/agent-a";
+    const ALIAS: &str = "/alias/stable-cid/readers/agent-a";
+    const LEGACY: &[u8] =
+        br#"{"epoch":1,"holder":"legacy-runtime","claim_id":"legacy","read_offset":41}"#;
+    const CURRENT: &[u8] =
+        br#"{"epoch":2,"holder":"current-runtime","claim_id":"current","read_offset":82}"#;
+    let root = Arc::new(tempfile::tempdir().unwrap());
+    let fixture =
+        Fixture::open_root_with_namespace(root.clone(), "/conversations", "/conversations");
+    KernelConvenience::mkdir(
+        fixture.kernel.as_ref(),
+        "/conversations/stable-cid/readers",
+        &context(),
+        true,
+        true,
+    )
+    .unwrap();
+    assert!(write(&fixture, PATH, LEGACY));
+    assert!(matches!(
+        fixture.kernel.read_versioned_content(PATH, &context()),
+        Err(ConditionalContentError::Unsupported)
+    ));
+    assert_eq!(
+        fixture
+            .kernel
+            .protect_record_content(PATH, &service())
+            .unwrap(),
+        RecordProtectionResult::Protected
+    );
+    let admitted = fixture
+        .kernel
+        .read_versioned_content(ALIAS, &context())
+        .unwrap()
+        .unwrap();
+    assert_eq!(admitted.content, LEGACY);
+    let current = fixture.replace(ALIAS, CURRENT, Some(&admitted.version));
+    for spelling in [PATH, ALIAS] {
+        assert!(!write(&fixture, spelling, LEGACY));
+    }
+    let destination = "/conversations/stable-cid/readers/renamed-agent";
+    assert!(fixture
+        .kernel
+        .sys_rename(PATH, destination, &context())
+        .is_err());
+    assert!(fixture.store.get(destination).unwrap().is_none());
+    let rows = fixture
+        .store
+        .list("/conversations/stable-cid/readers/")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].path, PATH);
+    drop(fixture);
+    let restored = Fixture::open_root_with_namespace(root, "/conversations", "/conversations");
+    let after = restored
+        .kernel
+        .read_versioned_content(PATH, &context())
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.content, CURRENT);
+    assert_eq!(after.version, current);
+    assert!(!write(&restored, ALIAS, LEGACY));
+    assert!(matches!(
+        restored.kernel.replace_content_if_version(PATH, &context(), LEGACY, Some(&admitted.version)).unwrap(),
+        kernel::kernel::conditional_content::ConditionalContentResult::Conflict { current_version: Some(version) } if version == current
+    ));
+}
 
 fn service() -> OperationContext {
     OperationContext::new("alice", "root", true, None, false)
