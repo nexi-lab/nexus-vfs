@@ -1593,9 +1593,26 @@ impl Kernel {
         // registration so remote reads resolve through the correct metastore.
         remote_metastore: Option<Arc<dyn crate::meta_store::MetaStore>>,
     ) -> Result<SysSetAttrResult, KernelError> {
+        // Metadata uses the caller's zone when omitted. An explicit zone selects
+        // the same view for authorization and mutation; a mount's target zone
+        // remains separate from the caller's parent namespace.
+        let zone_id = if entry_type != 2 && zone_id.is_empty() {
+            ctx.zone_id.as_str()
+        } else {
+            zone_id
+        };
+        let projected = if entry_type != 2 && zone_id != ctx.zone_id.as_str() {
+            Some(OperationContext {
+                zone_id: zone_id.to_string(),
+                ..ctx.clone()
+            })
+        } else {
+            None
+        };
+        let ctx = projected.as_ref().unwrap_or(ctx);
+        self.check_metadata_permission(path, crate::Permission::Write, ctx)?;
         match entry_type {
             2 => {
-                self.check_permission(path, crate::Permission::Write, ctx)?;
                 // DT_MOUNT — full mount lifecycle via DLC.
                 //
                 // Zone-create-on-mount: when the caller did not supply

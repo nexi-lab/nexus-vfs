@@ -120,6 +120,198 @@ impl Drop for Server {
 }
 
 #[test]
+fn metadata_mutation_authorization_is_shared_by_native_and_rpc_entrypoints() {
+    use kernel::kernel::vfs_proto::{
+        nexus_vfs_service_client::NexusVfsServiceClient, SetattrRequest,
+    };
+
+    struct MetadataOwner;
+    impl PermissionProvider for MetadataOwner {
+        fn check(
+            &self,
+            _: &str,
+            _: Option<&kernel::vfs_router::RouteResult>,
+            _: Permission,
+            ctx: &OperationContext,
+        ) -> Result<(), KernelError> {
+            if ctx.user_id == "alice" && ctx.zone_id == "root" {
+                Ok(())
+            } else {
+                Err(KernelError::PermissionDenied(
+                    "private metadata owner".into(),
+                ))
+            }
+        }
+    }
+
+    let fixture = Fixture::open();
+    let server = Server::open(&fixture);
+    fixture
+        .kernel
+        .set_permission_provider(Arc::new(Box::new(MetadataOwner)));
+    let alice = server.client("alice");
+    let first = committed(
+        alice
+            .write_if_version("/state/register", b"owner bytes", None)
+            .unwrap(),
+    );
+    let cases = [
+        (0, "/state/register"),
+        (0, "/state/denied-file"),
+        (1, "/state/denied-dir"),
+        (2, "/state/denied-mount"),
+        (3, "/state/denied-pipe"),
+        (4, "/state/denied-stream"),
+        (6, "/state/denied-link"),
+    ];
+    server.runtime.block_on(async {
+        let mut client = NexusVfsServiceClient::connect(server.endpoint.clone())
+            .await
+            .unwrap();
+        for (entry_type, path) in cases {
+            let response = client
+                .setattr(SetattrRequest {
+                    path: path.into(),
+                    auth_token: "bob".into(),
+                    entry_type,
+                    zone_id: "root".into(),
+                    mime_type: Some("text/plain".into()),
+                    io_profile: "memory".into(),
+                    capacity: 4096,
+                    link_target: Some("/state/register".into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(
+                response.is_error,
+                "RPC metadata operation {entry_type} must refuse bob"
+            );
+            let error: serde_json::Value = serde_json::from_slice(&response.error_payload).unwrap();
+            assert!(
+                [
+                    transport::grpc::RpcErrorCode::PermissionError as i64,
+                    transport::grpc::RpcErrorCode::AccessDenied as i64
+                ]
+                .contains(&error["code"].as_i64().unwrap()),
+                "RPC metadata operation {entry_type} must report authorization failure: {error}"
+            );
+        }
+    });
+    let native = |path: &str, entry_type, ctx: &OperationContext, zone: &str| {
+        fixture.kernel.sys_setattr(
+            path,
+            ctx,
+            entry_type,
+            "",
+            None,
+            None,
+            None,
+            "memory",
+            zone,
+            false,
+            4096,
+            None,
+            None,
+            Some("text/plain"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("/state/register"),
+            None,
+            None,
+        )
+    };
+    let bob = OperationContext::new("bob", "root", false, None, false);
+    for (entry_type, path) in cases {
+        let result = native(path, entry_type, &bob, "root");
+        assert!(
+            matches!(&result, Err(KernelError::PermissionDenied(_))),
+            "native metadata operation {entry_type} must refuse bob: {result:?}"
+        );
+    }
+    let after = alice.read_versioned("/state/register").unwrap().unwrap();
+    assert_eq!(after.content, b"owner bytes");
+    assert_eq!(after.version, first);
+    for (_, path) in &cases[1..] {
+        assert!(
+            fixture.store.get(path).unwrap().is_none(),
+            "denied create left {path}"
+        );
+    }
+    // An explicit metadata zone selects the same view for authorization and
+    // mutation. Omitting it retains the authenticated caller's zone.
+    let elsewhere = OperationContext::new("alice", "other-zone", false, None, false);
+    assert!(matches!(
+        native("/state/register", 0, &elsewhere, ""),
+        Err(KernelError::PermissionDenied(_))
+    ));
+    native("/state/register", 0, &elsewhere, "root").unwrap();
+    let owner = OperationContext::new("alice", "root", false, None, false);
+    for path in ["/__sys__", "/__sys__/private-metadata"] {
+        assert!(
+            matches!(
+                native(path, 0, &owner, "root"),
+                Err(KernelError::PermissionDenied(_))
+            ),
+            "native metadata must protect the system namespace: {path}"
+        );
+        server.runtime.block_on(async {
+            let mut client = NexusVfsServiceClient::connect(server.endpoint.clone())
+                .await
+                .unwrap();
+            let response = client
+                .setattr(SetattrRequest {
+                    path: path.into(),
+                    auth_token: "alice".into(),
+                    zone_id: "root".into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(response.is_error, "RPC must protect the system namespace");
+            let error: serde_json::Value = serde_json::from_slice(&response.error_payload).unwrap();
+            assert_eq!(
+                error["code"].as_i64().unwrap(),
+                transport::grpc::RpcErrorCode::PermissionError as i64
+            );
+        });
+        assert!(
+            kernel::kernel::syscall::KernelSyscall::sys_stat(&*fixture.kernel, path, "root")
+                .is_none()
+        );
+    }
+    native("/state/owner-directory", 1, &owner, "").unwrap();
+    assert_eq!(
+        fixture
+            .store
+            .get("/state/register")
+            .unwrap()
+            .unwrap()
+            .mime_type
+            .as_deref(),
+        Some("text/plain")
+    );
+    assert_eq!(
+        alice
+            .read_versioned("/state/register")
+            .unwrap()
+            .unwrap()
+            .content,
+        b"owner bytes"
+    );
+    assert!(fixture
+        .store
+        .get("/state/owner-directory")
+        .unwrap()
+        .is_some());
+}
+
+#[test]
 fn typed_rpc_preserves_atomic_images_conflicts_and_authenticated_ownership() {
     let fixture = Fixture::open();
     let server = Server::open(&fixture);
