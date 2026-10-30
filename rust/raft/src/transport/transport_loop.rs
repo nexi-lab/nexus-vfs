@@ -1010,35 +1010,37 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
             let covering_seq = repl_log.max_seq().saturating_sub(1);
 
             tokio::spawn(async move {
-                // Re-materialize the whole EC-replicable state as idempotent
-                // commands — metadata as SetMetadata, stream entries (A2A
-                // messages) as AppendStreamEntry (see `ec_state_snapshot`).
-                // Sc-plane keys the peer already holds via raft are
-                // byte-identical, so LWW no-ops them; only the EC keys/entries
-                // the peer missed actually change.  (A delta/chunked snapshot
-                // is a future optimization — this path is rare, correctness
-                // over bytes.)
-                let cmds = sm_arc.read().await.ec_state_snapshot();
-                let entries: Vec<EcReplicationEntry> = cmds
-                    .into_iter()
-                    .map(|command| EcReplicationEntry {
-                        seq: covering_seq,
-                        command: bincode::serialize(&command).unwrap_or_default(),
-                        // SetMetadata/AppendStreamEntry LWW uses the value's own
-                        // embedded ordering, so this envelope timestamp is unused.
-                        timestamp: 0,
+                // Materialization and serialization participate in the same
+                // completion path as transmission. Failed reads cannot become
+                // an acknowledged empty snapshot and advance the peer's floor.
+                let send = async {
+                    let commands = sm_arc
+                        .read()
+                        .await
+                        .ec_state_snapshot()
+                        .map_err(|error| format!("materialize EC snapshot: {error}"))?;
+                    let entries = commands
+                        .into_iter()
+                        .map(|command| {
+                            Ok(EcReplicationEntry {
+                                seq: covering_seq,
+                                command: bincode::serialize(&command)
+                                    .map_err(|error| format!("serialize EC snapshot: {error}"))?,
+                                timestamp: 0,
+                                node_id,
+                            })
+                        })
+                        .collect::<std::result::Result<Vec<_>, String>>()?;
+                    send_ec_snapshot(
+                        &client_pool,
+                        &peer_addr,
+                        zone_id,
+                        entries,
+                        covering_seq,
                         node_id,
-                    })
-                    .collect();
-
-                let send = send_ec_snapshot(
-                    &client_pool,
-                    &peer_addr,
-                    zone_id,
-                    entries,
-                    covering_seq,
-                    node_id,
-                );
+                    )
+                    .await
+                };
                 report_ec_completion(
                     peer_id,
                     EC_SNAPSHOT_TIMEOUT,

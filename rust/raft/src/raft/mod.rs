@@ -45,7 +45,6 @@ mod state_machine;
 #[cfg(all(feature = "grpc", has_protos))]
 pub mod zone_persistence;
 
-#[cfg(feature = "consensus")]
 mod membership_policy;
 #[cfg(feature = "consensus")]
 mod node;
@@ -67,7 +66,6 @@ pub use state_machine::{
     WitnessStateMachineInMemory,
 };
 
-#[cfg(feature = "consensus")]
 pub use membership_policy::MembershipPolicy;
 #[cfg(feature = "consensus")]
 pub use node::{ConfStateAppliedCb, RaftConfig, RaftMsg, ZoneConsensus, ZoneConsensusDriver};

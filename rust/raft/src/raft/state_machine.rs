@@ -22,6 +22,7 @@ pub use contracts::lock_state::{HolderInfo, LockAcquireResult, LockEntry, LockIn
 use super::Result;
 
 mod conditional_metadata;
+mod protected_metadata;
 pub use conditional_metadata::VersionedMetadata;
 
 /// Command to be replicated through Raft.
@@ -267,6 +268,38 @@ pub enum Command {
         expected: Option<Vec<u8>>,
         incarnation: [u8; 16],
     },
+    /// Adopt the exact legacy image and its conditional-only policy together.
+    /// The typed fixed-local storage door owns admission of this command.
+    AdoptProtectedMetadata {
+        key: String,
+        expected_image: Option<Vec<u8>>,
+        incarnation: [u8; 16],
+    },
+}
+
+impl Command {
+    /// Ordinary commands that replace, remove or reinterpret a metadata image.
+    pub(super) fn ordinary_metadata_key(&self) -> Option<&str> {
+        match self {
+            Self::SetMetadata { key, .. }
+            | Self::DeleteMetadata { key }
+            | Self::CasSetMetadata { key, .. }
+            | Self::AdjustCounter { key, .. } => Some(key),
+            _ => None,
+        }
+    }
+
+    /// Normal entries carry the proposal ID followed by the serialized command.
+    #[cfg(feature = "consensus")]
+    pub(crate) fn from_log_data(data: &[u8]) -> Result<(u64, Self)> {
+        let id = data
+            .get(..8)
+            .ok_or_else(|| super::RaftError::Serialization("incomplete proposal ID".into()))?;
+        Ok((
+            u64::from_be_bytes(id.try_into().expect("checked proposal ID length")),
+            bincode::deserialize(&data[8..])?,
+        ))
+    }
 }
 
 /// Result of applying a command.
@@ -301,6 +334,8 @@ pub enum CommandResult {
 
     /// The path has no admitted conditional metadata image.
     ConditionalMetadataUnsupported,
+    /// Adoption preserves the current image. A changed legacy image conflicts.
+    ProtectedMetadata { protected: bool },
 }
 
 // Advisory lock types — `HolderInfo`, `LockInfo`, `LockAcquireResult`,
@@ -321,6 +356,25 @@ pub enum CommandResult {
 /// File content is NOT stored in the state machine - it remains in
 /// the content-addressable storage (CAS) backend (S3, GCS, local).
 pub trait StateMachine: Send + Sync {
+    /// Check durable storage requirements against the selected replica policy.
+    fn validate_membership_policy(&self, _policy: super::MembershipPolicy) -> Result<()> {
+        Ok(())
+    }
+
+    /// Validate an incoming snapshot before it enters the Raft message queue.
+    fn validate_snapshot_membership(
+        &self,
+        _data: &[u8],
+        _policy: super::MembershipPolicy,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Admission shared by EC origin, ingress and state-machine apply.
+    fn requires_strong_consistency(&self, command: &Command) -> Result<bool> {
+        Ok(command.requires_conditional_sc())
+    }
+
     /// Apply a committed command to the state machine.
     ///
     /// This is called when a log entry is committed (replicated to a quorum).
@@ -395,8 +449,8 @@ pub trait StateMachine: Send + Sync {
     ///
     /// Default: empty (a state machine that holds no EC state — e.g. a
     /// witness — has nothing to transfer). Override in [`FullStateMachine`].
-    fn ec_state_snapshot(&self) -> Vec<Command> {
-        Vec::new()
+    fn ec_state_snapshot(&self) -> Result<Vec<Command>> {
+        Ok(Vec::new())
     }
 
     /// Get the last applied log index.
@@ -1767,7 +1821,7 @@ impl FullStateMachine {
                  advance are one atomic txn); the non-txn path must never receive it"
                     .into(),
             )),
-            Command::WriteVersionedMetadata { .. } => Err(super::RaftError::InvalidState(
+            Command::WriteVersionedMetadata { .. } | Command::AdoptProtectedMetadata { .. } => Err(super::RaftError::InvalidState(
                 "versioned metadata requires a Raft-committed transaction".into(),
             )),
             Command::PutControlState {
@@ -1809,6 +1863,13 @@ impl FullStateMachine {
         txn: &redb::WriteTransaction,
         command: &Command,
     ) -> Result<CommandResult> {
+        if let Some(key) = command.ordinary_metadata_key() {
+            if self.protected_in_txn(txn, key)? {
+                return Ok(CommandResult::Error(
+                    "protected metadata requires a conditional write".into(),
+                ));
+            }
+        }
         let meta_def = redb::TableDefinition::<&[u8], &[u8]>::new(self.metadata.name());
 
         match command {
@@ -2124,6 +2185,12 @@ impl FullStateMachine {
                 incarnation,
             } => self.write_versioned_in_txn(txn, key, value, expected.as_deref(), *incarnation),
 
+            Command::AdoptProtectedMetadata {
+                key,
+                expected_image,
+                incarnation,
+            } => self.adopt_protected_in_txn(txn, key, expected_image.as_deref(), *incarnation),
+
             Command::Noop => Ok(CommandResult::Success),
 
             // Lock commands never flow here.
@@ -2148,8 +2215,25 @@ impl FullStateMachine {
 }
 
 impl StateMachine for FullStateMachine {
+    fn validate_membership_policy(&self, policy: super::MembershipPolicy) -> Result<()> {
+        self.validate_protected_storage_policy(policy)
+    }
+
+    fn validate_snapshot_membership(
+        &self,
+        data: &[u8],
+        policy: super::MembershipPolicy,
+    ) -> Result<()> {
+        let snapshot: Snapshot = bincode::deserialize(data)?;
+        Self::validate_protected_snapshot_policy(&snapshot, policy)
+    }
+
+    fn requires_strong_consistency(&self, command: &Command) -> Result<bool> {
+        Ok(command.requires_conditional_sc() || self.ordinary_write_is_protected(command)?)
+    }
+
     fn apply_local(&mut self, command: &Command) -> Result<CommandResult> {
-        if command.requires_conditional_sc() {
+        if self.requires_strong_consistency(command)? {
             return Err(super::RaftError::InvalidState(
                 "EC write to SC-managed content is unsupported".into(),
             ));
@@ -2203,7 +2287,7 @@ impl StateMachine for FullStateMachine {
         command: &Command,
         entry_timestamp: u64,
     ) -> Result<CommandResult> {
-        if command.requires_conditional_sc() {
+        if self.requires_strong_consistency(command)? {
             // ACK the skipped old/lagging peer entry: returning Err here would
             // pin its EC sequence forever and block unrelated EC traffic.
             tracing::warn!("skipping EC entry for SC-managed content");
@@ -2275,19 +2359,22 @@ impl StateMachine for FullStateMachine {
         result
     }
 
-    fn ec_state_snapshot(&self) -> Vec<Command> {
+    fn ec_state_snapshot(&self) -> Result<Vec<Command>> {
         // EC anti-entropy snapshot = metadata registers only. `list_metadata`
         // skips internal `__` keys → SetMetadata. LWW-idempotent on the
         // receiver; Sc-plane keys are byte-identical there so they no-op, only
         // missed EC keys change. DT_STREAM entries are NOT here: streams are
         // strong consistency (raft-committed), replicated via the log itself,
         // never the EC plane.
-        self.list_metadata("")
-            .unwrap_or_default()
+        let protected = self.protected_metadata_paths()?;
+        Ok(self
+            .list_metadata("")?
             .into_iter()
-            .filter(|(key, _)| !conditional_metadata::is_managed_key(key))
+            .filter(|(key, _)| {
+                !conditional_metadata::is_managed_key(key) && !protected.contains(key)
+            })
             .map(|(key, value)| Command::SetMetadata { key, value })
-            .collect()
+            .collect())
     }
 
     fn apply(&mut self, index: u64, command: &Command) -> Result<CommandResult> {

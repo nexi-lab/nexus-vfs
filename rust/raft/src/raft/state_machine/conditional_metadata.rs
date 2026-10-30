@@ -16,14 +16,13 @@ impl Command {
     /// Fixed on every replica, including one that has not applied a first SC
     /// create. EC must never publish either managed metadata or its allocator.
     pub(crate) fn requires_conditional_sc(&self) -> bool {
+        if let Some(key) = self.ordinary_metadata_key() {
+            return is_managed_key(key);
+        }
         match self {
-            Self::SetMetadata { key, .. }
-            | Self::DeleteMetadata { key }
-            | Self::CasSetMetadata { key, .. }
-            | Self::AdjustCounter { key, .. } => is_managed_key(key),
             Self::PutControlState { namespace, .. }
             | Self::DeleteControlState { namespace, .. } => namespace == NAMESPACE,
-            Self::WriteVersionedMetadata { .. } => true,
+            Self::WriteVersionedMetadata { .. } | Self::AdoptProtectedMetadata { .. } => true,
             _ => false,
         }
     }
@@ -41,17 +40,19 @@ fn revision_key(path: &str) -> Vec<u8> {
     control_key(NAMESPACE, &format!("{PATH_PREFIX}{path}"))
 }
 
-fn storage_error(error: impl std::fmt::Display) -> super::super::RaftError {
+pub(super) fn storage_error(error: impl std::fmt::Display) -> super::super::RaftError {
     super::super::RaftError::Storage(format!("conditional metadata: {error}"))
 }
 
 impl FullStateMachine {
     /// Read metadata and revision in one redb snapshot. A present untracked
-    /// legacy key is refused. Reading must NEVER enrol a replica-local image.
-    /// Migration creates a verified image in a new managed namespace instead.
+    /// legacy key is refused. Explicit SC adoption enrolls its exact image;
+    /// reads preserve their existing observation-only semantics.
     pub fn get_versioned_metadata(&self, key: &str) -> Result<VersionedMetadata> {
-        Self::require_managed_key(key)?;
         let txn = self.metadata.raw_db().begin_read().map_err(storage_error)?;
+        if !is_managed_key(key) && !self.protected_in_read(&txn, key)? {
+            Self::require_managed_key(key)?;
+        }
         let metadata = txn
             .open_table(redb::TableDefinition::<&[u8], &[u8]>::new(
                 self.metadata.name(),
@@ -101,7 +102,11 @@ impl FullStateMachine {
         }
     }
 
-    fn metadata_in_txn(&self, txn: &redb::WriteTransaction, key: &str) -> Result<Option<Vec<u8>>> {
+    pub(super) fn metadata_in_txn(
+        &self,
+        txn: &redb::WriteTransaction,
+        key: &str,
+    ) -> Result<Option<Vec<u8>>> {
         let table = txn
             .open_table(redb::TableDefinition::<&[u8], &[u8]>::new(
                 self.metadata.name(),
@@ -130,7 +135,7 @@ impl FullStateMachine {
     /// Allocate at apply, in the transaction that publishes the pointer. No
     /// wall clock, per-node counter, local creation marker or path hash enters
     /// the token. Every replica consumes the same committed incarnation.
-    fn allocate_revision(
+    pub(super) fn allocate_revision(
         &self,
         txn: &redb::WriteTransaction,
         key: &str,
@@ -195,7 +200,7 @@ impl FullStateMachine {
         expected: Option<&[u8]>,
         incarnation: [u8; 16],
     ) -> Result<CommandResult> {
-        if !is_managed_key(key) {
+        if !is_managed_key(key) && !self.protected_in_txn(txn, key)? {
             return Ok(CommandResult::ConditionalMetadataUnsupported);
         }
         let current = self.metadata_in_txn(txn, key)?;
@@ -605,6 +610,7 @@ mod tests {
         assert_eq!(committed(b.apply(1, &create).unwrap()), first);
         assert!(!a
             .ec_state_snapshot()
+            .unwrap()
             .iter()
             .any(Command::requires_conditional_sc));
     }

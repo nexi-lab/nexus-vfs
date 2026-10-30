@@ -72,32 +72,41 @@ async fn protected_ec_is_refused_before_wal_and_acknowledged_without_blocking_re
     let node = zone.consensus_node();
     node.read_linearizable(|_| ()).await.unwrap();
     let log_before = node.last_index();
-    let experimental = Command::WriteVersionedMetadata {
-        key: MANAGED.into(),
-        value: b"not activated".to_vec(),
-        expected: None,
-        incarnation: [7; 16],
-    };
+    let experimental = [
+        Command::WriteVersionedMetadata {
+            key: MANAGED.into(),
+            value: b"not activated".to_vec(),
+            expected: None,
+            incarnation: [7; 16],
+        },
+        Command::AdoptProtectedMetadata {
+            key: "/conversations/private/readers/owner".into(),
+            expected_image: None,
+            incarnation: [7; 16],
+        },
+    ];
     let mut api = ZoneApiServiceClient::connect(format!("http://{bind}"))
         .await
         .unwrap();
-    for forwarded in [false, true] {
-        let refusal = api
-            .propose(ProposeRequest {
-                command: None,
-                request_id: "unactivated-conditional-fixture".into(),
-                zone_id: ZONE.into(),
-                raw_command: bincode::serialize(&experimental).unwrap(),
-                forwarded,
-            })
-            .await
-            .expect_err("raw RPC must refuse the experimental command before proposal");
-        assert_eq!(refusal.code(), tonic::Code::Unimplemented);
+    for command in experimental {
+        for forwarded in [false, true] {
+            let refusal = api
+                .propose(ProposeRequest {
+                    command: None,
+                    request_id: "unactivated-conditional-fixture".into(),
+                    zone_id: ZONE.into(),
+                    raw_command: bincode::serialize(&command).unwrap(),
+                    forwarded,
+                })
+                .await
+                .expect_err("raw RPC must refuse the experimental command before proposal");
+            assert_eq!(refusal.code(), tonic::Code::Unimplemented);
+        }
+        assert!(
+            node.propose(command).await.is_err(),
+            "the local submission path must also reject unactivated commands"
+        );
     }
-    assert!(
-        node.propose(experimental).await.is_err(),
-        "the local submission path must also reject unactivated commands"
-    );
     assert_eq!(
         node.last_index(),
         log_before,

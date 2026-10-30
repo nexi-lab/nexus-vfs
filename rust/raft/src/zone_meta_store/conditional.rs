@@ -7,7 +7,7 @@ use kernel::meta_store::{
     MetaStoreError, MetadataSnapshot,
 };
 
-fn map_error(error: RaftError) -> ConditionalMetadataError {
+pub(super) fn map_error(error: RaftError) -> ConditionalMetadataError {
     match error {
         RaftError::UnsupportedOperation(_) => ConditionalMetadataError::Unsupported,
         error if error.proposal_outcome_unknown() => {
