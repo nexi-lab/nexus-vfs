@@ -20,16 +20,6 @@ pub enum MembershipPolicy {
 }
 
 #[cfg(feature = "consensus")]
-impl Command {
-    pub(crate) fn requires_fixed_local_storage(&self) -> bool {
-        matches!(
-            self,
-            Self::WriteVersionedMetadata { .. } | Self::AdoptProtectedMetadata { .. }
-        )
-    }
-}
-
-#[cfg(feature = "consensus")]
 impl MembershipPolicy {
     pub(crate) fn require_managed(self) -> Result<()> {
         if self == Self::FixedLocal {

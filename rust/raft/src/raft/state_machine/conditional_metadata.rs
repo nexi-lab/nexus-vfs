@@ -16,13 +16,15 @@ impl Command {
     /// Fixed on every replica, including one that has not applied a first SC
     /// create. EC must never publish either managed metadata or its allocator.
     pub(crate) fn requires_conditional_sc(&self) -> bool {
+        if self.requires_fixed_local_storage() {
+            return true;
+        }
         if let Some(key) = self.ordinary_metadata_key() {
             return is_managed_key(key);
         }
         match self {
             Self::PutControlState { namespace, .. }
             | Self::DeleteControlState { namespace, .. } => namespace == NAMESPACE,
-            Self::WriteVersionedMetadata { .. } | Self::AdoptProtectedMetadata { .. } => true,
             _ => false,
         }
     }
@@ -177,19 +179,21 @@ impl FullStateMachine {
 
     /// Ordinary SC writes, including byte-identical replacements and deletes,
     /// invalidate a previously observed token. They do not opt unrelated keys
-    /// into conditional semantics. This is called inside their apply txn.
+    /// into conditional semantics. Returns whether a revision was refreshed;
+    /// rename uses that fact to carry eligibility to its new managed key.
     pub(super) fn refresh_tracked_version(
         &self,
         txn: &redb::WriteTransaction,
         key: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if !is_managed_key(key) {
-            return Ok(());
+            return Ok(false);
         }
         if self.revision_in_txn(txn, key)?.is_some() {
             self.allocate_revision(txn, key, None)?;
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     pub(super) fn write_versioned_in_txn(

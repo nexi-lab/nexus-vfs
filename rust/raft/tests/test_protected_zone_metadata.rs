@@ -61,6 +61,432 @@ fn protected(store: &ZoneMetaStore, path: &str) -> Option<kernel::meta_store::Me
 }
 
 #[test]
+fn protected_rename_refuses_before_publishing_a_destination() {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = Runtime::open(directory.path());
+    let store = runtime.store("/", "/");
+    store.put(PATH, image("reader-position-41")).unwrap();
+    let before = protected(&store, PATH).unwrap();
+    let destination = "/conversations/stable-cid/readers/renamed-agent";
+    assert!(store.rename_path(PATH, destination, false).is_err());
+    assert!(
+        store.get(destination).unwrap().is_none(),
+        "rejected rename must not publish a destination"
+    );
+    let after = store
+        .as_conditional_metadata()
+        .unwrap()
+        .read_versioned(PATH)
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.version, before.version);
+    assert_eq!(after.metadata.content_id, before.metadata.content_id);
+}
+
+#[test]
+fn deferred_alias_rename_uses_the_resolved_nodes_atomic_policy() {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = Runtime::open(directory.path());
+    let store = runtime.store("/", "/");
+    store.put(PATH, image("reader-position-41")).unwrap();
+    let before = protected(&store, PATH).unwrap();
+    let alias = ZoneMetaStore::deferred_arc(
+        runtime.0.registry(),
+        "root",
+        runtime.0.runtime_handle(),
+        "/alias".into(),
+        "/conversations/stable-cid/readers".into(),
+    );
+    assert!(alias
+        .rename_path("/alias/agent-a", "/alias/renamed-agent", false)
+        .is_err());
+    assert!(alias.get("/alias/renamed-agent").unwrap().is_none());
+    let after = store
+        .as_conditional_metadata()
+        .unwrap()
+        .read_versioned(PATH)
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.version, before.version);
+    assert_eq!(after.metadata.content_id, before.metadata.content_id);
+    store
+        .put("/ordinary/source", image("ordinary-content"))
+        .unwrap();
+    let ordinary_alias = ZoneMetaStore::deferred_arc(
+        runtime.0.registry(),
+        "root",
+        runtime.0.runtime_handle(),
+        "/ordinary-alias".into(),
+        "/ordinary".into(),
+    );
+    ordinary_alias
+        .rename_path("/ordinary-alias/source", "/ordinary-alias/target", false)
+        .unwrap();
+    assert!(store.get("/ordinary/source").unwrap().is_none());
+    assert_eq!(
+        store
+            .get("/ordinary/target")
+            .unwrap()
+            .unwrap()
+            .content_id
+            .as_deref(),
+        Some("ordinary-content")
+    );
+}
+
+#[test]
+fn rename_refreshes_conditional_revisions_for_both_paths() {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = Runtime::open(directory.path());
+    let store = runtime.store("/", "/");
+    let operation = store.as_conditional_metadata().unwrap();
+    let source = "/__managed_content_v1__/source";
+    let destination = "/__managed_content_v1__/target";
+    for path in [source, destination] {
+        assert!(matches!(
+            operation
+                .replace_if_version(path, image(path), None)
+                .unwrap(),
+            ConditionalMetadataResult::Committed { .. }
+        ));
+    }
+    let old_source = operation.read_versioned(source).unwrap().unwrap();
+    let old_target = operation.read_versioned(destination).unwrap().unwrap();
+    store.rename_path(source, destination, false).unwrap();
+    assert!(operation.read_versioned(source).unwrap().is_none());
+    let after = operation.read_versioned(destination).unwrap().unwrap();
+    assert_ne!(after.version, old_source.version);
+    assert_ne!(after.version, old_target.version);
+    assert_eq!(after.metadata.content_id, old_source.metadata.content_id);
+    for (path, version) in [
+        (source, old_source.version),
+        (destination, old_target.version),
+    ] {
+        assert!(matches!(
+            operation
+                .replace_if_version(path, image("stale"), Some(&version))
+                .unwrap(),
+            ConditionalMetadataResult::Conflict { .. }
+        ));
+    }
+    assert!(operation.read_versioned(source).unwrap().is_none());
+    assert_eq!(
+        operation
+            .read_versioned(destination)
+            .unwrap()
+            .unwrap()
+            .version,
+        after.version
+    );
+}
+
+#[test]
+fn a_moved_subtree_carries_existing_revision_eligibility_to_new_paths() {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = Runtime::open(directory.path());
+    let store = runtime.store("/view", "/__managed_content_v1__");
+    let operation = store.as_conditional_metadata().unwrap();
+    store
+        .put(
+            "/view/source",
+            FileMetadata {
+                entry_type: kernel::meta_store::DT_DIR,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        operation
+            .replace_if_version("/view/source/tracked", image("qualified-source"), None)
+            .unwrap(),
+        ConditionalMetadataResult::Committed { .. }
+    ));
+    let original = operation
+        .read_versioned("/view/source/tracked")
+        .unwrap()
+        .unwrap();
+    store
+        .put("/view/source/legacy", image("ordinary-source"))
+        .unwrap();
+    store
+        .rename_path("/view/source", "/view/destination", false)
+        .unwrap();
+    assert!(operation
+        .read_versioned("/view/source/tracked")
+        .unwrap()
+        .is_none());
+    let moved = operation
+        .read_versioned("/view/destination/tracked")
+        .unwrap()
+        .unwrap();
+    assert_ne!(moved.version, original.version);
+    assert_eq!(moved.metadata.content_id, original.metadata.content_id);
+    assert_eq!(moved.metadata.path, "/view/destination/tracked");
+    assert!(matches!(
+        operation
+            .replace_if_version(
+                "/view/destination/tracked",
+                image("stale-source-token"),
+                Some(&original.version)
+            )
+            .unwrap(),
+        ConditionalMetadataResult::Conflict { .. }
+    ));
+    // An unrelated ordinary child remains outside conditional admission.
+    assert!(matches!(
+        operation.read_versioned("/view/destination/legacy"),
+        Err(kernel::meta_store::ConditionalMetadataError::Unsupported)
+    ));
+    assert_eq!(
+        store
+            .get("/view/destination/legacy")
+            .unwrap()
+            .unwrap()
+            .content_id
+            .as_deref(),
+        Some("ordinary-source")
+    );
+}
+
+#[test]
+fn malformed_subtree_rename_refuses_without_partial_effects_and_actor_keeps_serving() {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = Runtime::open(directory.path());
+    let store = runtime.store("/", "/");
+    store.put("/source/a", image("valid")).unwrap();
+    let node = runtime.0.get_zone("root").unwrap().consensus_node().clone();
+    runtime
+        .0
+        .runtime_handle()
+        .block_on(node.propose(Command::SetMetadata {
+            key: "/source/b".into(),
+            value: vec![0xff],
+        }))
+        .unwrap();
+    assert!(store.rename_path("/source", "/target", false).is_err());
+    assert_eq!(
+        store
+            .get("/source/a")
+            .unwrap()
+            .unwrap()
+            .content_id
+            .as_deref(),
+        Some("valid")
+    );
+    assert!(store.get("/target/a").unwrap().is_none());
+    store
+        .put("/after-refusal", image("actor-still-serving"))
+        .unwrap();
+    assert_eq!(
+        store
+            .get("/after-refusal")
+            .unwrap()
+            .unwrap()
+            .content_id
+            .as_deref(),
+        Some("actor-still-serving")
+    );
+}
+
+#[test]
+fn subtree_rename_preserves_raw_fields_and_updates_every_cached_view() {
+    use nexus_raft::transport::proto::nexus::core::FileMetadata as Proto;
+    use prost::Message as _;
+
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = Runtime::open(directory.path());
+    let store = runtime.store("/left", "/records");
+    let alias = runtime.store("/right", "/records");
+    let node = runtime.0.get_zone("root").unwrap().consensus_node().clone();
+    let original = Proto {
+        path: "/records/source".into(),
+        content_id: "source-content".into(),
+        owner_id: "owner".into(),
+        ttl_seconds: 57.0,
+        created_at: "2026-10-30T00:00:00Z".into(),
+        modified_at: "2026-10-30T01:00:00Z".into(),
+        ..Default::default()
+    };
+    runtime
+        .0
+        .runtime_handle()
+        .block_on(node.propose(Command::SetMetadata {
+            key: original.path.clone(),
+            value: original.encode_to_vec(),
+        }))
+        .unwrap();
+    store
+        .put("/left/source/child", image("child-content"))
+        .unwrap();
+    store
+        .put("/left/source-neighbor", image("neighbor-content"))
+        .unwrap();
+    store.put("/left/target", image("previous-target")).unwrap();
+    assert!(alias.get("/right/source").unwrap().is_some());
+    assert!(alias.get("/right/source/child").unwrap().is_some());
+    assert_eq!(
+        alias
+            .get("/right/target")
+            .unwrap()
+            .unwrap()
+            .content_id
+            .as_deref(),
+        Some("previous-target")
+    );
+    store
+        .rename_path("/left/source", "/left/target", false)
+        .unwrap();
+    assert!(alias.get("/right/source").unwrap().is_none());
+    assert!(alias.get("/right/source/child").unwrap().is_none());
+    assert_eq!(
+        alias
+            .get("/right/target")
+            .unwrap()
+            .unwrap()
+            .content_id
+            .as_deref(),
+        Some("source-content")
+    );
+    let child = alias.get("/right/target/child").unwrap().unwrap();
+    assert_eq!(child.path, "/right/target/child");
+    assert_eq!(child.content_id.as_deref(), Some("child-content"));
+    assert_eq!(
+        store
+            .get("/left/source-neighbor")
+            .unwrap()
+            .unwrap()
+            .content_id
+            .as_deref(),
+        Some("neighbor-content")
+    );
+    let raw = runtime.0.runtime_handle().block_on(
+        node.with_state_machine(|state| state.get_metadata("/records/target").unwrap().unwrap()),
+    );
+    let renamed = Proto::decode(raw.as_slice()).unwrap();
+    assert_eq!(renamed.path, "/records/target");
+    assert_eq!(renamed.ttl_seconds, original.ttl_seconds);
+    assert_eq!(renamed.created_at, original.created_at);
+    assert_eq!(renamed.modified_at, original.modified_at);
+    assert_eq!(renamed.owner_id, original.owner_id);
+    drop(node);
+    drop(alias);
+    drop(store);
+    drop(runtime);
+    let restarted = Runtime::open(directory.path());
+    let store = restarted.store("/restored", "/records");
+    assert!(store.get("/restored/source").unwrap().is_none());
+    assert_eq!(
+        store
+            .get("/restored/target/child")
+            .unwrap()
+            .unwrap()
+            .content_id
+            .as_deref(),
+        Some("child-content")
+    );
+}
+
+#[test]
+fn protected_descendant_and_destination_keep_the_entire_rename_unchanged() {
+    for protection in ["/source/b", "/target/b"] {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = Runtime::open(directory.path());
+        let store = runtime.store("/", "/");
+        for (path, content) in [
+            ("/source/a", "a"),
+            ("/source/b", "b"),
+            ("/target", "existing"),
+        ] {
+            store.put(path, image(content)).unwrap();
+        }
+        protected(&store, protection);
+        let node = runtime.0.get_zone("root").unwrap().consensus_node().clone();
+        let before = runtime
+            .0
+            .runtime_handle()
+            .block_on(node.with_state_machine(|state| state.list_metadata("/").unwrap()));
+        assert!(store.rename_path("/source", "/target", false).is_err());
+        let after = runtime
+            .0
+            .runtime_handle()
+            .block_on(node.with_state_machine(|state| state.list_metadata("/").unwrap()));
+        assert_eq!(
+            after, before,
+            "protected entry {protection} must abort every mutation"
+        );
+        assert_eq!(
+            store.get("/target").unwrap().unwrap().content_id.as_deref(),
+            Some("existing")
+        );
+        assert!(store.get("/target/a").unwrap().is_none());
+    }
+}
+
+#[test]
+fn pas_rename_keeps_relative_content_paths_consistent_across_subtree_views() {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = Runtime::open(directory.path());
+    let store = runtime.store("/visible", "/namespace/root");
+    let alias = runtime.store("/alias", "/namespace/root");
+    store.put("/visible/source/a", image("source/a")).unwrap();
+    store
+        .put("/visible/source/b", image("opaque:connector-id"))
+        .unwrap();
+    store
+        .rename_path("/visible/source", "/visible/target", true)
+        .unwrap();
+    assert_eq!(
+        alias
+            .get("/alias/target/a")
+            .unwrap()
+            .unwrap()
+            .content_id
+            .as_deref(),
+        Some("target/a")
+    );
+    assert_eq!(
+        alias
+            .get("/alias/target/b")
+            .unwrap()
+            .unwrap()
+            .content_id
+            .as_deref(),
+        Some("opaque:connector-id")
+    );
+    assert!(alias.get("/alias/source/a").unwrap().is_none());
+}
+
+#[test]
+fn namespace_rename_preserves_service_owned_endpoints_and_mounts() {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = Runtime::open(directory.path());
+    let store = runtime.store("/", "/");
+    for entry_type in [2, 3, 4, 5] {
+        let source = format!("/source-{entry_type}");
+        let destination = format!("/target-{entry_type}");
+        let endpoint = FileMetadata {
+            entry_type,
+            ..image("endpoint")
+        };
+        store.put(&source, endpoint.clone()).unwrap();
+        assert!(store.rename_path(&source, &destination, false).is_err());
+        assert!(store.get(&source).unwrap().is_some());
+        assert!(store.get(&destination).unwrap().is_none());
+        store.put(&destination, endpoint).unwrap();
+        store.put(&source, image("ordinary")).unwrap();
+        assert!(store.rename_path(&source, &destination, false).is_err());
+        assert_eq!(
+            store.get(&source).unwrap().unwrap().content_id.as_deref(),
+            Some("ordinary")
+        );
+        assert_eq!(
+            store.get(&destination).unwrap().unwrap().entry_type,
+            entry_type
+        );
+    }
+}
+
+#[test]
 fn adoption_retains_the_path_and_image_and_fences_ordinary_writes_across_restart() {
     let directory = tempfile::tempdir().unwrap();
     let version;

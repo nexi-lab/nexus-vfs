@@ -445,8 +445,9 @@ pub struct ZoneConsensus<S: StateMachine + 'static> {
     /// DCache coherence) can register observers without holding the
     /// state-machine's async RwLock. Elements are
     /// [`super::state_machine::ApplyObserver`] (`(dedup_key, cb)`); only
-    /// Vec mutations serialize through the inner lock. Registrations
-    /// accumulate (keyed ones replace by key) and each fires on every
+    /// Vec mutations serialize through the inner lock. Keyed observers
+    /// replace by key and scoped subscriptions unregister on drop. Each fires
+    /// on every
     /// committed metadata-path command (mount wiring, DCache
     /// invalidation, A2A / auth-cache eviction all share this one spine).
     apply_observers_slot:
@@ -1146,12 +1147,10 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         self.apply_observers_slot.clone()
     }
 
-    /// Register an **anonymous** apply-side observer on this consensus.
-    /// Anonymous observers accumulate — every committed metadata-path
-    /// command fires every registered observer in registration order
-    /// (each matches the variants it cares about). Used by the DCache
-    /// invalidator (one per ``ZoneMetaStore`` surface). ``None`` slot
-    /// (witness state machine) is a silent no-op.
+    /// Register an observer for the lifetime of this consensus instance.
+    /// Every committed metadata command notifies observers in registration
+    /// order. Each observer selects the command variants it handles.
+    /// Witness state machines have no observer slot.
     pub fn register_apply_observer(
         &self,
         cb: Arc<dyn Fn(&super::state_machine::AppliedEntry) + Send + Sync>,
@@ -1159,6 +1158,20 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         if let Some(slot) = self.apply_observers_slot.as_ref() {
             slot.write().push((None, cb));
         }
+    }
+
+    /// Register an observer owned by the returned runtime subscription.
+    /// Dropping it removes this registration. An in-flight notification owns
+    /// its snapshot and can finish after the subscription is dropped.
+    #[must_use = "Keep the subscription for the lifetime of the observer"]
+    pub fn subscribe_apply_observer<F>(&self, cb: F) -> Option<super::ApplySubscription>
+    where
+        F: Fn(&super::state_machine::AppliedEntry) + Send + Sync + 'static,
+    {
+        let slot = self.apply_observers_slot.as_ref()?;
+        let cb: Arc<dyn Fn(&super::state_machine::AppliedEntry) + Send + Sync> = Arc::new(cb);
+        self.register_apply_observer(Arc::clone(&cb));
+        Some(super::ApplySubscription::new(slot, cb))
     }
 
     /// Register a **keyed** apply-side observer: registering again with
@@ -1377,6 +1390,21 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             Err(error) => Err(RaftError::ProposalOutcomeUnknown(error.to_string())),
             result => result,
         }
+    }
+
+    #[cfg(all(feature = "grpc", has_protos))]
+    pub(crate) async fn rename_metadata(
+        &self,
+        old_key: String,
+        new_key: String,
+        is_pas: bool,
+    ) -> Result<CommandResult> {
+        self.submit_conditional_storage(Command::RenameMetadata {
+            old_key,
+            new_key,
+            is_pas,
+        })
+        .await
     }
 
     /// Propose a command with Eventual Consistency — fire and forget.

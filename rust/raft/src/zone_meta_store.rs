@@ -59,8 +59,10 @@ use contracts::VFS_ROOT;
 use lib::rt::block_on_via as bridge_block_on;
 use prost::Message;
 
+mod cache;
 mod conditional;
 mod protected;
+use cache::MetadataCache;
 pub use protected::ProtectedMetadataAdoption;
 
 fn require_metadata_success(
@@ -112,8 +114,8 @@ pub struct ZoneMetaStore {
     /// `RemoteMetaStore`.  Each zone metastore caches its own hot
     /// entries (keyed by the caller-facing GLOBAL path, mirroring the
     /// `to_global_path` rewrite done on read so callers see consistent
-    /// keys).  `get` consults the cache first; `put` is write-through;
-    /// `delete` invalidates pre-propose.
+    /// keys). `get` consults the cache first; `put` fills it from an
+    /// authoritative committed image; `delete` invalidates pre-propose.
     ///
     /// Apply-side coherence on follower nodes (and on crosslink
     /// surfaces of the same zone on the leader): every ZoneMetaStore
@@ -122,9 +124,10 @@ pub struct ZoneMetaStore {
     /// state machine commits a metadata replacement or deletion,
     /// the slot fires every registered observer — each
     /// one evicts its own cache row for the corresponding global path.
-    /// Wrapped in ``Arc`` so the closure can hold a stable handle that
-    /// survives the ZoneMetaStore's call frames.
-    cache: Arc<dashmap::DashMap<String, KernelFileMetadata>>,
+    /// The callback observes this cache through a weak reference. Its
+    /// subscription follows the metastore's runtime lifetime.
+    cache: Arc<MetadataCache>,
+    cache_subscription: std::sync::OnceLock<Option<crate::raft::ApplySubscription>>,
 }
 
 /// Register the apply-side cache invalidator for one zone metastore.
@@ -132,21 +135,39 @@ pub struct ZoneMetaStore {
 /// Ordinary and conditional metadata replacements and deletions evict the
 /// affected row. The zone-relative key is
 /// translated back to the caller-facing global path (the form this metastore
-/// caches under) before evicting. Capturing `Arc` clones keeps the observer
-/// self-contained — no back-reference to the `ZoneMetaStore`.
+/// caches under) before evicting. The mount owns its subscription and the
+/// callback holds a weak cache reference for in-flight notifications.
 ///
 /// Called at construction for an already-bound zone, and at resolve time for a
 /// deferred one, so both bindings get the same coherence guarantee.
 fn register_cache_invalidator(
     node: &ZoneConsensus<FullStateMachine>,
-    cache: &Arc<dashmap::DashMap<String, KernelFileMetadata>>,
+    cache: &Arc<MetadataCache>,
     mount_point: &str,
     target_subtree: &str,
-) {
-    let cache_for_cb = Arc::clone(cache);
+) -> Option<crate::raft::ApplySubscription> {
+    let cache_for_cb = Arc::downgrade(cache);
     let mount_point_for_cb = mount_point.to_string();
     let subtree_for_cb = target_subtree.to_string();
-    node.register_apply_observer(Arc::new(move |entry: &AppliedEntry| {
+    node.subscribe_apply_observer(move |entry: &AppliedEntry| {
+        let Some(cache_for_cb) = cache_for_cb.upgrade() else {
+            return;
+        };
+        if let Command::RenameMetadata {
+            old_key, new_key, ..
+        } = entry.command
+        {
+            let old_prefix = format!("{}/", old_key.trim_end_matches('/'));
+            let new_prefix = format!("{}/", new_key.trim_end_matches('/'));
+            cache_for_cb.invalidate_where(|path| {
+                let key = compose_zone_key(&mount_point_for_cb, &subtree_for_cb, path);
+                key == *old_key
+                    || key == *new_key
+                    || key.starts_with(&old_prefix)
+                    || key.starts_with(&new_prefix)
+            });
+            return;
+        }
         let zone_key = match entry.command {
             Command::SetMetadata { key, .. }
             | Command::CasSetMetadata { key, .. }
@@ -162,8 +183,8 @@ fn register_cache_invalidator(
         let Some(global) = project_zone_key(&mount_point_for_cb, &subtree_for_cb, zone_key) else {
             return;
         };
-        cache_for_cb.remove(&global);
-    }));
+        cache_for_cb.invalidate(&global);
+    })
 }
 
 /// How a [`ZoneMetaStore`] reaches its zone's consensus handle.
@@ -220,17 +241,17 @@ impl ZoneMetaStore {
         mount_point: String,
         target_subtree: String,
     ) -> Self {
-        let cache: Arc<dashmap::DashMap<String, KernelFileMetadata>> =
-            Arc::new(dashmap::DashMap::new());
+        let cache = Arc::new(MetadataCache::default());
         // Each mount projects the committed zone key into its own global
         // namespace before evicting the derived cache entry.
-        register_cache_invalidator(&node, &cache, &mount_point, &target_subtree);
+        let subscription = register_cache_invalidator(&node, &cache, &mount_point, &target_subtree);
         Self {
             binding: ZoneBinding::Ready(node),
             runtime,
             mount_point,
             target_subtree,
             cache,
+            cache_subscription: std::sync::OnceLock::from(subscription),
         }
     }
 
@@ -262,7 +283,8 @@ impl ZoneMetaStore {
             runtime,
             mount_point,
             target_subtree,
-            cache: Arc::new(dashmap::DashMap::new()),
+            cache: Arc::new(MetadataCache::default()),
+            cache_subscription: std::sync::OnceLock::new(),
         })
     }
 
@@ -281,28 +303,28 @@ impl ZoneMetaStore {
                 zone_id,
                 resolved,
             } => {
-                if let Some(node) = resolved.get() {
-                    return Ok(node);
+                if resolved.get().is_none() {
+                    let node = registry.get_node(zone_id).ok_or_else(|| {
+                        MetaStoreError::IOError(format!(
+                            "ZoneMetaStore: zone '{zone_id}' is not available on this node"
+                        ))
+                    })?;
+                    let _ = resolved.set(node);
                 }
-                let node = registry.get_node(zone_id).ok_or_else(|| {
-                    MetaStoreError::IOError(format!(
-                        "ZoneMetaStore: zone '{zone_id}' is not available on this node"
-                    ))
-                })?;
-                register_cache_invalidator(
-                    &node,
-                    &self.cache,
-                    &self.mount_point,
-                    &self.target_subtree,
-                );
-                // A concurrent resolve may win; both handles are equivalent
-                // clones of the same consensus, so either is correct.
-                let _ = resolved.set(node);
-                resolved.get().ok_or_else(|| {
+                let node = resolved.get().ok_or_else(|| {
                     MetaStoreError::IOError(format!(
                         "ZoneMetaStore: zone '{zone_id}' resolve raced to nothing"
                     ))
-                })
+                })?;
+                self.cache_subscription.get_or_init(|| {
+                    register_cache_invalidator(
+                        node,
+                        &self.cache,
+                        &self.mount_point,
+                        &self.target_subtree,
+                    )
+                });
+                Ok(node)
             }
         }
     }
@@ -334,6 +356,22 @@ impl ZoneMetaStore {
         // simply fails to match anything this store caches.
         project_zone_key(&self.mount_point, &self.target_subtree, zone_key)
             .unwrap_or_else(|| zone_key.to_string())
+    }
+
+    fn read_metadata_image(&self, path: &str) -> Result<Option<Vec<u8>>, MetaStoreError> {
+        let key = self.to_zone_key(path);
+        bridge_block_on(
+            &self.runtime,
+            self.node()?
+                .with_state_machine(move |state: &FullStateMachine| state.get_metadata(&key)),
+        )
+        .map_err(|error| MetaStoreError::IOError(format!("ZoneMetaStore.get({path}): {error}")))
+    }
+
+    fn decode_metadata(&self, bytes: &[u8]) -> Result<KernelFileMetadata, MetaStoreError> {
+        let mut metadata = proto_to_kernel(bytes)?;
+        metadata.path = self.to_global_path(&metadata.path);
+        Ok(metadata)
     }
 }
 
@@ -515,27 +553,12 @@ impl MetaStore for ZoneMetaStore {
     }
 
     fn get(&self, path: &str) -> Result<Option<KernelFileMetadata>, MetaStoreError> {
-        if let Some(cached) = self.cache.get(path) {
-            return Ok(Some(cached.clone()));
-        }
-        let zone_key = self.to_zone_key(path);
-        let key = zone_key.clone();
-        let fut = self
-            .node()?
-            .with_state_machine(move |sm: &FullStateMachine| sm.get_metadata(&key));
-        let bytes_opt = bridge_block_on(&self.runtime, fut)
-            .map_err(|e| MetaStoreError::IOError(format!("ZoneMetaStore.get({path}): {e}")))?;
-        match bytes_opt {
-            Some(bytes) => {
-                let mut kmeta = proto_to_kernel(&bytes)?;
-                // State machine stores zone-relative; hand callers
-                // the full path they expect.
-                kmeta.path = self.to_global_path(&kmeta.path);
-                self.cache.insert(path.to_string(), kmeta.clone());
-                Ok(Some(kmeta))
-            }
-            None => Ok(None),
-        }
+        self.cache.get_or_load(path, || {
+            self.read_metadata_image(path)?
+                .as_deref()
+                .map(|bytes| self.decode_metadata(bytes))
+                .transpose()
+        })
     }
 
     fn put(&self, path: &str, mut metadata: KernelFileMetadata) -> Result<(), MetaStoreError> {
@@ -559,40 +582,56 @@ impl MetaStore for ZoneMetaStore {
         // bytes we just wrote show up. Propose returns on leader commit;
         // on a follower, local apply lags by up to one raft tick.
         // SSOT = raft state machine.
-        let runtime = self.runtime.clone();
-        let node = self.node()?.clone();
-        let key = zone_key.clone();
         let _ = self.node()?.wait_until(
             || {
-                let poll_key = key.clone();
-                let observed = bridge_block_on(
-                    &runtime,
-                    node.with_state_machine(move |sm: &FullStateMachine| {
-                        sm.get_metadata(&poll_key)
+                matches!(
+                    self.cache.load_uncached(path, || {
+                        match self.read_metadata_image(path)? {
+                            Some(bytes) if bytes == value_snapshot => {
+                                self.decode_metadata(&bytes).map(Some)
+                            }
+                            _ => Ok(None),
+                        }
                     }),
-                );
-                matches!(&observed, Ok(Some(bytes)) if *bytes == value_snapshot)
+                    Ok(Some(_))
+                )
             },
             500,
         );
-        // Write-through: cache the caller-facing form (rewrite the
-        // path field back to global so cache reads match the get()
-        // contract).
-        let mut cache_meta = metadata;
-        cache_meta.path = self.to_global_path(&cache_meta.path);
-        self.cache.insert(path.to_string(), cache_meta);
         Ok(())
     }
 
     fn delete(&self, path: &str) -> Result<bool, MetaStoreError> {
         // Invalidate cache pre-propose (race-safe).
-        self.cache.remove(path);
+        self.cache.invalidate(path);
         let zone_key = self.to_zone_key(path);
         let cmd = Command::DeleteMetadata { key: zone_key };
         let result = bridge_block_on(&self.runtime, self.node()?.propose(cmd))
             .map_err(|e| MetaStoreError::IOError(format!("ZoneMetaStore.delete({path}): {e}")))?;
         require_metadata_success(result, "delete", path)?;
         Ok(true)
+    }
+
+    fn rename_path(
+        &self,
+        old_path: &str,
+        new_path: &str,
+        is_pas: bool,
+    ) -> Result<(), MetaStoreError> {
+        let node = self.node()?;
+        if !node.supports_conditional_metadata() {
+            return kernel::abc::meta_store::rename_metadata_path(self, old_path, new_path, is_pas);
+        }
+        let result = bridge_block_on(
+            &self.runtime,
+            node.rename_metadata(
+                self.to_zone_key(old_path),
+                self.to_zone_key(new_path),
+                is_pas,
+            ),
+        )
+        .map_err(|error| MetaStoreError::IOError(format!("ZoneMetaStore.rename_path: {error}")))?;
+        require_metadata_success(result, "rename", old_path)
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<KernelFileMetadata>, MetaStoreError> {

@@ -22,6 +22,7 @@ pub use contracts::lock_state::{HolderInfo, LockAcquireResult, LockEntry, LockIn
 use super::Result;
 
 mod conditional_metadata;
+mod metadata_rename;
 mod protected_metadata;
 pub use conditional_metadata::VersionedMetadata;
 
@@ -275,9 +276,24 @@ pub enum Command {
         expected_image: Option<Vec<u8>>,
         incarnation: [u8; 16],
     },
+    /// Move one metadata subtree in a single admitted SC transaction.
+    RenameMetadata {
+        old_key: String,
+        new_key: String,
+        is_pas: bool,
+    },
 }
 
 impl Command {
+    pub(crate) fn requires_fixed_local_storage(&self) -> bool {
+        matches!(
+            self,
+            Self::WriteVersionedMetadata { .. }
+                | Self::AdoptProtectedMetadata { .. }
+                | Self::RenameMetadata { .. }
+        )
+    }
+
     /// Ordinary commands that replace, remove or reinterpret a metadata image.
     pub(super) fn ordinary_metadata_key(&self) -> Option<&str> {
         match self {
@@ -991,7 +1007,8 @@ pub struct FullStateMachine {
     ///
     /// Elements are [`ApplyObserver`] — a `(dedup_key, cb)` pair so a
     /// keyed consumer (federation mount) replaces its prior registration
-    /// on re-install while anonymous ones (DCache) accumulate.
+    /// on re-install. Runtime subscriptions remove their anonymous entry
+    /// when the owning mount is dropped.
     apply_observers: Arc<parking_lot::RwLock<Vec<ApplyObserver>>>,
 }
 
@@ -1821,7 +1838,8 @@ impl FullStateMachine {
                  advance are one atomic txn); the non-txn path must never receive it"
                     .into(),
             )),
-            Command::WriteVersionedMetadata { .. } | Command::AdoptProtectedMetadata { .. } => Err(super::RaftError::InvalidState(
+            Command::WriteVersionedMetadata { .. } | Command::AdoptProtectedMetadata { .. }
+                | Command::RenameMetadata { .. } => Err(super::RaftError::InvalidState(
                 "versioned metadata requires a Raft-committed transaction".into(),
             )),
             Command::PutControlState {
@@ -1864,10 +1882,8 @@ impl FullStateMachine {
         command: &Command,
     ) -> Result<CommandResult> {
         if let Some(key) = command.ordinary_metadata_key() {
-            if self.protected_in_txn(txn, key)? {
-                return Ok(CommandResult::Error(
-                    "protected metadata requires a conditional write".into(),
-                ));
+            if let Some(refusal) = self.ordinary_metadata_refusal(txn, key)? {
+                return Ok(refusal);
             }
         }
         let meta_def = redb::TableDefinition::<&[u8], &[u8]>::new(self.metadata.name());
@@ -2190,6 +2206,12 @@ impl FullStateMachine {
                 expected_image,
                 incarnation,
             } => self.adopt_protected_in_txn(txn, key, expected_image.as_deref(), *incarnation),
+
+            Command::RenameMetadata {
+                old_key,
+                new_key,
+                is_pas,
+            } => self.rename_metadata_in_txn(txn, old_key, new_key, *is_pas),
 
             Command::Noop => Ok(CommandResult::Success),
 

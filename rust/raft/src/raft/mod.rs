@@ -39,6 +39,8 @@
 //! - [`WitnessStateMachine`]: Minimal state machine for witness nodes
 //! - [`RaftStorage`]: Persistent Raft log storage using sled
 
+#[cfg(feature = "consensus")]
+mod apply_observer;
 mod error;
 pub mod replication_log;
 mod state_machine;
@@ -55,6 +57,8 @@ mod storage;
 #[cfg(all(feature = "grpc", has_protos))]
 mod zone_registry;
 
+#[cfg(feature = "consensus")]
+pub use apply_observer::ApplySubscription;
 pub use error::{RaftError, Result};
 pub use replication_log::ReplicationLog;
 #[cfg(feature = "grpc")]
