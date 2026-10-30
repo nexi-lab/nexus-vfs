@@ -114,6 +114,19 @@ where
     Op: FnOnce() -> T + Send,
     T: Send,
 {
+    let mut operation = Some(block_on);
+    dispatch_erased(&mut || {
+        let operation = operation.take().expect("runtime operation called once");
+        operation()
+    })
+}
+
+// Share runtime selection and scoped-thread setup across concrete operations.
+#[inline(never)]
+fn dispatch_erased<T>(block_on: &mut (dyn FnMut() -> T + Send)) -> T
+where
+    T: Send,
+{
     match Handle::try_current() {
         Err(_) => block_on(),
         Ok(current) => match current.runtime_flavor() {
@@ -203,10 +216,14 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        assert_eq!(
-            agent.block_on(async { block_on_via(rt.handle(), async { 21 + 21 }) }),
-            42
-        );
+        let value = String::from("borrowed across the runtime bridge");
+        let observed = agent.block_on(async {
+            block_on_via(rt.handle(), async {
+                tokio::task::yield_now().await;
+                value.as_str()
+            })
+        });
+        assert_eq!(observed, value.as_str());
     }
 
     // block_on_portable — the self-contained tool-bridge form — same matrix.
