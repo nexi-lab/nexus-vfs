@@ -3,6 +3,7 @@
 use super::*;
 
 #[cfg(all(feature = "grpc", has_protos))]
+#[inline(never)]
 fn decode_rename_entry(
     image: &[u8],
     path: &str,

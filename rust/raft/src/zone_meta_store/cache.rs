@@ -71,12 +71,19 @@ impl MetadataCache {
         // serving the actor while this read waits for its queued snapshot.
         let value = load()?;
         if let Some(value) = &value {
-            let mut state = self.state.write();
-            if generation.is_some() && state.generation == generation {
-                state.entries.insert(path.into(), value.clone());
-            }
+            self.fill_if_current(path, generation, value);
         }
         Ok(value)
+    }
+
+    // Ordinary reads and write observations share one compiled cache-fill
+    // path while their read closures remain independently specialized.
+    #[inline(never)]
+    fn fill_if_current(&self, path: &str, generation: Option<u64>, value: &KernelFileMetadata) {
+        let mut state = self.state.write();
+        if generation.is_some() && state.generation == generation {
+            state.entries.insert(path.into(), value.clone());
+        }
     }
 
     pub(super) fn invalidate(&self, path: &str) {
