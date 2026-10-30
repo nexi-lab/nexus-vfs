@@ -175,6 +175,27 @@ jobs:
           target/release/${{ matrix.binary }} --help
           target/release/${{ matrix.operator_binary }} --help
 
+      - uses: actions/setup-python@v5
+        if: runner.os == 'Windows'
+        with:
+          python-version: '3.12'
+
+      # The same RPC/persistence/recovery journey as Cargo's all-features test,
+      # using these exact optimized Windows executables. Help/build and the
+      # daemon-only local-mount fixture cannot establish operator coverage.
+      - name: Qualify Windows operator MintAgent and credential recovery
+        if: runner.os == 'Windows'
+        shell: bash
+        run: python scripts/e2e/operator_agent_enrollment.py --daemon target/release/${{ matrix.binary }} --operator target/release/${{ matrix.operator_binary }} --output "$RUNNER_TEMP/operator-enrollment"
+
+      - name: Retain Windows operator journey evidence
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-operator-enrollment
+          path: ${{ runner.temp }}/operator-enrollment
+          if-no-files-found: error
+
       - uses: actions/setup-node@v4
         if: ${{ !matrix.target }}
         with:

@@ -16,6 +16,15 @@ Future normal release archives carry both distinctly named executables under
 the existing archive checksum; a client-only installation copies only the
 operator entry and leaves the selected running Node intact.
 
+The real-process journey in `scripts/e2e/operator_agent_enrollment.py` is shared
+by Cargo's all-features integration test and the optimized Windows binary CI
+job. It exercises actual Node-mTLS MintAgent issuance, persisted credentials,
+exact local receipt replay, concurrent requests, preflight refusals and Unknown
+across a private Node restart. Windows runs the built release executables and
+retains a source/binary-hashed receipt and raw logs. Build/`--help` checks alone
+do not qualify that journey. The runner requires Python 3.9 or newer and removes
+its own private Node keys/database on either outcome.
+
 An operator prepares policy explicitly, without minting:
 
 ```sh
