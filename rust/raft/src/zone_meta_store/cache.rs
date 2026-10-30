@@ -105,17 +105,58 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let manager = crate::ZoneManager::isolated(directory.path().to_str().unwrap()).unwrap();
         let zone = manager.create_zone("root", vec![]).unwrap();
-        let store = super::super::ZoneMetaStore::new(
-            zone.consensus_node().clone(),
+        let observers = zone.consensus_node().apply_observers_slot().unwrap();
+        let baseline = observers.read().len();
+        for index in 0..64 {
+            let store = super::super::ZoneMetaStore::new(
+                zone.consensus_node().clone(),
+                manager.runtime_handle(),
+                format!("/view-{index}"),
+            );
+            assert_eq!(observers.read().len(), baseline + 1);
+            let cache = Arc::downgrade(&store.cache);
+            drop(store);
+            assert!(
+                cache.upgrade().is_none(),
+                "the live actor must release the retired mount's cache"
+            );
+            assert_eq!(observers.read().len(), baseline);
+        }
+        manager.shutdown();
+    }
+
+    #[test]
+    fn deferred_mount_shares_one_subscription_across_concurrent_first_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = crate::ZoneManager::isolated(directory.path().to_str().unwrap()).unwrap();
+        let zone = manager.create_zone("root", vec![]).unwrap();
+        let observers = zone.consensus_node().apply_observers_slot().unwrap();
+        let baseline = observers.read().len();
+        let store = super::super::ZoneMetaStore::deferred_arc(
+            manager.registry(),
+            "root",
             manager.runtime_handle(),
             "/view".into(),
+            "/".into(),
         );
-        let cache = Arc::downgrade(&store.cache);
+        assert_eq!(observers.read().len(), baseline);
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let readers: Vec<_> = (0..8)
+            .map(|_| {
+                let store = store.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    assert!(store.get("/view/missing").unwrap().is_none());
+                })
+            })
+            .collect();
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        assert_eq!(observers.read().len(), baseline + 1);
         drop(store);
-        assert!(
-            cache.upgrade().is_none(),
-            "the live actor must release the retired mount's cache"
-        );
+        assert_eq!(observers.read().len(), baseline);
         manager.shutdown();
     }
 
