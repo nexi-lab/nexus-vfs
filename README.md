@@ -45,6 +45,11 @@ cargo build --release -p nexus-cluster
 
 The Python app layer connects via gRPC (`RPCTransport`).
 
+For explicitly authorized Codex A2A enrollment, the
+[operator Agent enrollment contract](docs/operator-agent-enrollment.md) describes
+the single-endpoint Node client, private grants and Unknown recovery. It reuses
+the installed daemon's MintAgent RPC without starting or replacing that daemon.
+
 ### HTTP search and relationship authorization
 
 Build `cargo build --release -p nexus-cluster --features http-api` and run the
