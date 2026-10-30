@@ -20,7 +20,7 @@ jobs:
           - os: windows-latest
             asset: nexus-vault-windows-x86_64.zip
             library: nexus_vault.dll
-          - os: macos-14
+          - os: macos-15
             asset: nexus-vault-macos-arm64.tar.gz
             library: libnexus_vault.dylib
     env:

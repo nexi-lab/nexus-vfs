@@ -45,12 +45,12 @@ jobs:
             package_dir: nexusd-cluster-linux-aarch64
             archive_name: nexusd-cluster-linux-aarch64.tar.gz
           - name: macos-aarch64
-            os: macos-14
+            os: macos-15
             bin: nexusd-cluster
             package_dir: nexusd-cluster-macos-aarch64
             archive_name: nexusd-cluster-macos-aarch64.tar.gz
           - name: macos-x86_64
-            os: macos-14
+            os: macos-15
             bin: nexusd-cluster
             target: x86_64-apple-darwin
             package_dir: nexusd-cluster-macos-x86_64
