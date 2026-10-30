@@ -635,7 +635,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
 
         config
             .membership_policy
-            .validate_storage(&config, &storage)?;
+            .validate_storage(&config, &storage, &state_machine)?;
 
         if !config.skip_bootstrap {
             // Bootstrap contract — `create_zone` only.  Under the
@@ -1284,7 +1284,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         // protocol. Refuse before serialization/forwarding: mixed members may
         // not even decode the new enum variant. A future activation gate must
         // replace this refusal only after membership and storage are enforced.
-        if matches!(command, Command::WriteVersionedMetadata { .. }) {
+        if command.requires_fixed_local_storage() {
             return Err(RaftError::Config(
                 "conditional metadata proposals are not activated".into(),
             ));
@@ -1333,17 +1333,37 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         expected: Option<Vec<u8>>,
         incarnation: [u8; 16],
     ) -> Result<CommandResult> {
-        if !self.supports_conditional_metadata() {
-            return Err(RaftError::UnsupportedOperation(
-                "conditional metadata requires fixed local membership",
-            ));
-        }
         let command = Command::WriteVersionedMetadata {
             key,
             value,
             expected,
             incarnation,
         };
+        self.submit_conditional_storage(command).await
+    }
+
+    #[cfg(all(feature = "grpc", has_protos))]
+    pub(crate) async fn adopt_protected_metadata(
+        &self,
+        key: String,
+        expected_image: Option<Vec<u8>>,
+        incarnation: [u8; 16],
+    ) -> Result<CommandResult> {
+        self.submit_conditional_storage(Command::AdoptProtectedMetadata {
+            key,
+            expected_image,
+            incarnation,
+        })
+        .await
+    }
+
+    #[cfg(all(feature = "grpc", has_protos))]
+    async fn submit_conditional_storage(&self, command: Command) -> Result<CommandResult> {
+        if !self.supports_conditional_metadata() {
+            return Err(RaftError::UnsupportedOperation(
+                "conditional metadata requires fixed local membership",
+            ));
+        }
         let receiver = self.enqueue_proposal(&command)?;
         // Once enqueued, any failure without a proven refusal is ambiguous.
         // The state machine may have committed before its answer was lost.
@@ -1567,7 +1587,12 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
     pub async fn propose_ec_local(&self, command: Command) -> Result<u64> {
         // Reject BEFORE appending to the EC WAL. A successful-looking local
         // no-op would otherwise be returned as a replicated write token.
-        if command.requires_conditional_sc() {
+        if self
+            .state_machine
+            .read()
+            .await
+            .requires_strong_consistency(&command)?
+        {
             return Err(RaftError::InvalidState(
                 "EC write to SC-managed content is unsupported".into(),
             ));
@@ -1614,7 +1639,12 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         command: Command,
         entry_timestamp: u64,
     ) -> Result<CommandResult> {
-        if command.requires_conditional_sc() {
+        if self
+            .state_machine
+            .read()
+            .await
+            .requires_strong_consistency(&command)?
+        {
             tracing::warn!("acknowledging skipped EC entry for SC-managed content");
             return Ok(CommandResult::Success);
         }
@@ -1700,6 +1730,25 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
     /// can accept the message.
     pub async fn step(&self, msg: Message) -> Result<()> {
         self.config.membership_policy.require_managed()?;
+        // ReadIndex also carries entries, whose data is an opaque request
+        // context. Only proposal/append entries contain serialized commands.
+        if matches!(
+            msg.get_msg_type(),
+            raft::eraftpb::MessageType::MsgAppend | raft::eraftpb::MessageType::MsgPropose
+        ) {
+            for entry in &msg.entries {
+                self.config.membership_policy.validate_entry(entry)?;
+            }
+        }
+        if msg.has_snapshot() && !msg.get_snapshot().data.is_empty() {
+            self.state_machine
+                .read()
+                .await
+                .validate_snapshot_membership(
+                    &msg.get_snapshot().data,
+                    self.config.membership_policy,
+                )?;
+        }
         self.msg_tx
             .send(RaftMsg::Step { msg })
             .await
@@ -2345,12 +2394,7 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                         continue;
                     }
 
-                    let (id_bytes, cmd_bytes) = entry.data.split_at(8);
-                    let proposal_id = u64::from_be_bytes(
-                        id_bytes.try_into().expect("split_at(8) guarantees 8 bytes"),
-                    );
-
-                    let command: Command = bincode::deserialize(cmd_bytes)?;
+                    let (proposal_id, command) = Command::from_log_data(&entry.data)?;
                     let result = sm.apply(entry.index, &command)?;
 
                     // Notify waiting proposal (if any) — direct HashMap, no lock
@@ -3630,11 +3674,14 @@ mod tests {
         // forward-to-leader path. Every caller must observe the
         // write from step 4.
         for (i, handle) in handles.iter().enumerate() {
-            let value = handle
-                .read_linearizable(|sm| sm.get_metadata("/test.txt"))
-                .await
-                .unwrap_or_else(|e| panic!("read_linearizable on node {i}: {e}"))
-                .unwrap_or_else(|e| panic!("get_metadata on node {i}: {e:?}"));
+            let value = tokio::time::timeout(
+                Duration::from_secs(5),
+                handle.read_linearizable(|sm| sm.get_metadata("/test.txt")),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("ReadIndex on node {i} must complete"))
+            .unwrap_or_else(|e| panic!("read_linearizable on node {i}: {e}"))
+            .unwrap_or_else(|e| panic!("get_metadata on node {i}: {e:?}"));
             assert_eq!(
                 value,
                 Some(b"hello world".to_vec()),

@@ -303,6 +303,7 @@ impl ZoneHandle {
             CommandResult::CasResult { success, .. } => Ok(success),
             CommandResult::Value(_) => Ok(true),
             CommandResult::ConditionalMetadata { .. }
+            | CommandResult::ProtectedMetadata { .. }
             | CommandResult::ConditionalMetadataUnsupported => Err(RaftError::InvalidState(
                 "versioned metadata requires its typed result, not a boolean proposal".into(),
             )),

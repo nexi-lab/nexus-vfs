@@ -1038,6 +1038,11 @@ impl ZoneRaftRegistry {
         let mut state_machine = FullStateMachine::new(&store).map_err(|e| {
             TransportError::Connection(format!("Failed to create state machine: {}", e))
         })?;
+        // Admission precedes rehydration, which writes the restored image back
+        // to disk. A rejected mode change must preserve the existing store.
+        state_machine
+            .validate_membership_policy(config.membership_policy)
+            .map_err(|e| TransportError::Connection(format!("Storage admission: {e}")))?;
 
         // R14 raft-rs contract fix: rehydrate advisory lock state from
         // any persisted snapshot before raft-rs gets the state machine.
@@ -1059,6 +1064,9 @@ impl ZoneRaftRegistry {
         if let Ok(snap) = raft_storage.snapshot(0, 0) {
             let meta = snap.get_metadata();
             if meta.index > 0 && !snap.data.is_empty() {
+                state_machine
+                    .validate_snapshot_membership(&snap.data, config.membership_policy)
+                    .map_err(|e| TransportError::Connection(format!("Snapshot admission: {e}")))?;
                 state_machine.restore_snapshot(&snap.data).map_err(|e| {
                     TransportError::Connection(format!(
                         "Failed to rehydrate state machine from stored snapshot at index {}: {}",

@@ -1,10 +1,10 @@
 //! Construction and ingress policy for a fixed local consensus group.
 
 use protobuf::Message;
-use raft::eraftpb::{ConfChange, ConfChangeType, ConfState, EntryType};
+use raft::eraftpb::{ConfChange, ConfChangeType, ConfState, Entry, EntryType};
 use raft::{GetEntriesContext, Storage};
 
-use super::{RaftConfig, RaftError, RaftStorage, Result};
+use super::{Command, RaftConfig, RaftError, RaftStorage, Result, StateMachine};
 
 /// The membership authority selected by the owning runtime at construction.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -12,6 +12,15 @@ pub enum MembershipPolicy {
     #[default]
     Managed,
     FixedLocal,
+}
+
+impl Command {
+    pub(crate) fn requires_fixed_local_storage(&self) -> bool {
+        matches!(
+            self,
+            Self::WriteVersionedMetadata { .. } | Self::AdoptProtectedMetadata { .. }
+        )
+    }
 }
 
 impl MembershipPolicy {
@@ -24,9 +33,35 @@ impl MembershipPolicy {
         Ok(())
     }
 
-    pub(crate) fn validate_storage(self, config: &RaftConfig, storage: &RaftStorage) -> Result<()> {
+    pub(crate) fn validate_entry(self, entry: &Entry) -> Result<()> {
+        if self == Self::Managed
+            && entry.get_entry_type() == EntryType::EntryNormal
+            && !entry.data.is_empty()
+        {
+            let (_, command) = Command::from_log_data(&entry.data)?;
+            if command.requires_fixed_local_storage() {
+                return Err(RaftError::Config(
+                    "conditional metadata log requires qualified fixed-local storage".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_storage(
+        self,
+        config: &RaftConfig,
+        storage: &RaftStorage,
+        state_machine: &dyn StateMachine,
+    ) -> Result<()> {
+        state_machine.validate_membership_policy(self)?;
         if self == Self::Managed {
-            return Ok(());
+            let first = storage.first_index_impl()?;
+            let last = storage.last_index_impl()?;
+            // Only the unapplied suffix can introduce a requirement not already
+            // reflected by the state machine's durable format marker.
+            let next = first.max(state_machine.last_applied_index().saturating_add(1));
+            return self.validate_retained_entries(storage, next, last, None);
         }
         if config.id == 0 || config.is_witness || !config.peers.is_empty() {
             return Err(invalid("requires one local voter and local bootstrap"));
@@ -51,12 +86,21 @@ impl MembershipPolicy {
         if snapshot.get_metadata().index > 0 {
             require_local(snapshot.get_metadata().get_conf_state(), config.id)?;
         }
-        // Admission also covers retained entries that a restart can replay or
-        // commit later. Read bounded batches once, before a driver owns storage.
+        self.validate_retained_entries(storage, first, last, Some(config.id))
+    }
+
+    // Admission covers retained entries that can be replayed or committed later.
+    // Bounded batches keep startup memory independent of retained log size.
+    fn validate_retained_entries(
+        self,
+        storage: &RaftStorage,
+        mut next: u64,
+        last: u64,
+        local_id: Option<u64>,
+    ) -> Result<()> {
         let end = last
             .checked_add(1)
             .ok_or_else(|| invalid("stored log index is exhausted"))?;
-        let mut next = first;
         while next < end {
             let entries = storage
                 .entries(
@@ -70,22 +114,24 @@ impl MembershipPolicy {
                 return Err(invalid("stored log is incomplete"));
             }
             for entry in entries {
+                self.validate_entry(&entry)?;
                 match entry.get_entry_type() {
                     EntryType::EntryNormal => {}
-                    EntryType::EntryConfChange => {
+                    EntryType::EntryConfChange if local_id.is_some() => {
                         let change =
                             ConfChange::parse_from_bytes(&entry.data).map_err(|error| {
                                 invalid(&format!("decode stored membership: {error}"))
                             })?;
                         if change.get_change_type() != ConfChangeType::AddNode
-                            || change.node_id != config.id
+                            || local_id != Some(change.node_id)
                         {
                             return Err(invalid("stored log changes local membership"));
                         }
                     }
-                    EntryType::EntryConfChangeV2 => {
+                    EntryType::EntryConfChangeV2 if local_id.is_some() => {
                         return Err(invalid("stored log contains a membership transition"));
                     }
+                    _ => {}
                 }
                 next = entry.index + 1;
             }

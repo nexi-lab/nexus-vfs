@@ -11,6 +11,12 @@ import shutil
 import subprocess
 import sys
 
+SUITES = [
+    ('owner', 'user_runtime', ['--exact', 'durable_cas_mount_reopens_immutable_content_with_the_owner_boundary']),
+    ('content', 'conditional_content', []),
+    ('protected', 'test_protected_zone_metadata', []),
+]
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -32,20 +38,17 @@ def main():
     from deploy.runtime.gvisor.install import stage
     from qualify import digest, run_logged, runtime_command, verify_release
 
+    required_executables = {executable for _, executable, _ in SUITES} | {'nexusd-cluster'}
     executables = {}
     for line in args.artifacts.read_text().splitlines():
         row = json.loads(line)
         if row.get('reason') == 'compiler-artifact' and row.get('executable'):
             name = row['target']['name']
-            if name in ('user_runtime', 'conditional_content', 'nexusd-cluster'):
+            if name in required_executables:
                 executables[name] = Path(row['executable']).resolve(strict=True)
-    assert set(executables) == {'user_runtime', 'conditional_content', 'nexusd-cluster'}
-    suites = [
-        ('owner', 'user_runtime', ['--exact', 'durable_cas_mount_reopens_immutable_content_with_the_owner_boundary']),
-        ('content', 'conditional_content', []),
-    ]
+    assert set(executables) == required_executables
     selected_counts = {}
-    for label, executable, selection in suites:
+    for label, executable, selection in SUITES:
         listed = subprocess.check_output([str(executables[executable]), *selection, '--list'], text=True)
         selected_counts[label] = sum(line.endswith(': test') for line in listed.splitlines())
         assert selected_counts[label] > 0, (label, listed)
@@ -84,7 +87,7 @@ def main():
             destination.chmod(0o755)
         state = work / 'state'
         state.mkdir()
-        for platform, is_directfs, suite in product(['ptrace', 'systrap'], [True, False], suites):
+        for platform, is_directfs, suite in product(['ptrace', 'systrap'], [True, False], SUITES):
             suite_label, executable, selection = suite
             label = platform + ('-direct' if is_directfs else '-lisafs') + '-' + suite_label
             data = work / label

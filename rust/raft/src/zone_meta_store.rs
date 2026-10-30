@@ -53,13 +53,31 @@
 
 use std::sync::Arc;
 
-use crate::prelude::{AppliedEntry, Command, FullStateMachine, ZoneConsensus};
+use crate::prelude::{AppliedEntry, Command, CommandResult, FullStateMachine, ZoneConsensus};
 use crate::transport::proto::nexus::core::FileMetadata as ProtoFileMetadata;
 use contracts::VFS_ROOT;
 use lib::rt::block_on_via as bridge_block_on;
 use prost::Message;
 
 mod conditional;
+mod protected;
+pub use protected::ProtectedMetadataAdoption;
+
+fn require_metadata_success(
+    result: CommandResult,
+    operation: &str,
+    path: &str,
+) -> Result<(), MetaStoreError> {
+    match result {
+        CommandResult::Success => Ok(()),
+        CommandResult::Error(error) => Err(MetaStoreError::IOError(format!(
+            "ZoneMetaStore.{operation}({path}) rejected: {error}"
+        ))),
+        _ => Err(MetaStoreError::IOError(format!(
+            "ZoneMetaStore.{operation}({path}): unexpected apply result"
+        ))),
+    }
+}
 
 use kernel::meta_store::{
     FileMetadata as KernelFileMetadata, MetaStore, MetaStoreError, StreamSegment,
@@ -133,7 +151,8 @@ fn register_cache_invalidator(
             Command::SetMetadata { key, .. }
             | Command::CasSetMetadata { key, .. }
             | Command::DeleteMetadata { key }
-            | Command::WriteVersionedMetadata { key, .. } => key.as_str(),
+            | Command::WriteVersionedMetadata { key, .. }
+            | Command::AdoptProtectedMetadata { key, .. } => key.as_str(),
             _ => return,
         };
         // Every mount on this zone observes every key it commits, so a key
@@ -535,15 +554,7 @@ impl MetaStore for ZoneMetaStore {
         };
         let result = bridge_block_on(&self.runtime, self.node()?.propose(cmd))
             .map_err(|e| MetaStoreError::IOError(format!("ZoneMetaStore.put({path}): {e}")))?;
-        match result {
-            crate::prelude::CommandResult::Success => {}
-            crate::prelude::CommandResult::Error(e) => {
-                return Err(MetaStoreError::IOError(format!(
-                    "ZoneMetaStore.put({path}) rejected: {e}"
-                )));
-            }
-            _ => {}
-        }
+        require_metadata_success(result, "put", path)?;
         // Read-your-writes: poll local state machine until the exact
         // bytes we just wrote show up. Propose returns on leader commit;
         // on a follower, local apply lags by up to one raft tick.
@@ -580,7 +591,8 @@ impl MetaStore for ZoneMetaStore {
         let cmd = Command::DeleteMetadata { key: zone_key };
         let result = bridge_block_on(&self.runtime, self.node()?.propose(cmd))
             .map_err(|e| MetaStoreError::IOError(format!("ZoneMetaStore.delete({path}): {e}")))?;
-        Ok(matches!(result, crate::prelude::CommandResult::Success))
+        require_metadata_success(result, "delete", path)?;
+        Ok(true)
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<KernelFileMetadata>, MetaStoreError> {

@@ -495,6 +495,7 @@ fn command_result_to_proto(result: &CommandResult) -> RaftResponse {
             result: None,
         },
         CommandResult::ConditionalMetadata { .. }
+        | CommandResult::ProtectedMetadata { .. }
         | CommandResult::ConditionalMetadataUnsupported => RaftResponse {
             success: false,
             error: Some("versioned metadata is not supported by this legacy response".into()),
@@ -955,7 +956,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
         // raw_command is also reachable over the generic public Propose RPC.
         // A missing dedicated file RPC does not isolate an enum variant. Return
         // a definite refusal before either direct or forwarded submission.
-        if matches!(&cmd, Command::WriteVersionedMetadata { .. }) {
+        if cmd.requires_fixed_local_storage() {
             return Err(Status::unimplemented(
                 "conditional metadata proposals are not activated",
             ));
