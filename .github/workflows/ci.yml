@@ -64,13 +64,15 @@ jobs:
       - name: Logical file size across CAS manifest and partial writes
         run: cargo test --locked -p backends --no-default-features --features driver-cas-local,driver-path-local,driver-local-connector --lib storage::cas_local::tests::manifest_shaped_content_keeps_its_logical_size_after_partial_writes
 
-  durable-runtime:
-    name: Durable CAS user runtime / Linux
+  durable-runtime-build:
+    name: Durable runtime executables / Linux
     runs-on: ubuntu-22.04
     timeout-minutes: 25
     env:
       CARGO_BUILD_JOBS: 1
-      MOSS_RUNTIME_TOOLS_REV: aa02a532fa8067506922102212459720fb421127
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-protoc
@@ -79,17 +81,40 @@ jobs:
           cache: false
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ci-durable-runtime-linux
+          shared-key: ci-durable-runtime-native-linux
+      - name: Verify source-bound executable transfer
+        run: python3 -m unittest discover -s scripts/e2e -p test_durable_artifacts.py
       - name: Required backend availability at startup
         run: cargo test --locked -p nexus-cluster --test user_runtime required_durable_backend_obeys_build_and_platform_at_startup
-      - name: Durable mount, owner confinement and process recovery
-        run: cargo test --locked -p nexus-cluster --features driver-cas-local --test user_runtime durable_cas_mount_reopens_immutable_content_with_the_owner_boundary
-      - name: Immutable peer objects and logical file contents over real gRPC
-        run: cargo test --locked -p nexus-cluster --features driver-cas-local --test cas_peer_blob
-      - name: Conditional content through isolated Raft and durable CAS
-        run: cargo test --locked -p nexus-cluster --features driver-cas-local --test conditional_content -- --test-threads=1
-      - name: Late peer reads existing sealed stream segments
-        run: cargo test --locked -p nexus-cluster --features driver-cas-local --test dt_stream_unbounded joiner_cold_reads_a_sealed_log_and_reports_unavailable_segments
+      - name: Build and record the shared runtime executables
+        run: |
+          cargo test --locked -p nexus-cluster --features driver-cas-local --test user_runtime --test conditional_content --test cas_peer_blob --test dt_stream_unbounded --no-run --message-format=json > "$RUNNER_TEMP/durable-runtime-artifacts.json"
+          cargo test --locked -p raft@0.1.0 --test test_protected_zone_metadata --no-run --message-format=json >> "$RUNNER_TEMP/durable-runtime-artifacts.json"
+          python3 scripts/e2e/durable_artifacts.py pack --artifacts "$RUNNER_TEMP/durable-runtime-artifacts.json" --directory "$RUNNER_TEMP/durable-runtime-bundle"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: durable-runtime-executables
+          path: ${{ runner.temp }}/durable-runtime-bundle
+          compression-level: 1
+          if-no-files-found: error
+
+  durable-runtime:
+    name: Durable CAS user runtime / Linux
+    needs: durable-runtime-build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    env:
+      MOSS_RUNTIME_TOOLS_REV: aa02a532fa8067506922102212459720fb421127
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: durable-runtime-executables
+          path: ${{ runner.temp }}/durable-runtime-bundle
+      - name: Restore the verified executables for this source tree
+        run: python3 scripts/e2e/durable_artifacts.py restore --directory "$RUNNER_TEMP/durable-runtime-bundle"
+      - name: Verify native owner, peer, content, stream and protected-record recovery
+        run: python3 scripts/e2e/durable_artifacts.py native --directory "$RUNNER_TEMP/durable-runtime-bundle"
       - uses: actions/checkout@v4
         with:
           repository: sudoprivacy/moss
@@ -98,15 +123,11 @@ jobs:
           sparse-checkout: |
             deploy/runtime/gvisor
             scripts/e2e/gvisor-sync
-      - name: Record the runtime executables
-        run: |
-          cargo test --locked -p nexus-cluster --features driver-cas-local --test user_runtime --test conditional_content --no-run --message-format=json > "$RUNNER_TEMP/durable-runtime-artifacts.json"
-          cargo test --locked -p raft@0.1.0 --test test_protected_zone_metadata --no-run --message-format=json >> "$RUNNER_TEMP/durable-runtime-artifacts.json"
       - name: Durable recovery under the qualified gVisor release
         run: |
           sudo unshare --mount --propagation private python3 scripts/e2e/durable_runtime.py \
             --moss-tools=.moss-runtime-tools \
-            --artifacts="$RUNNER_TEMP/durable-runtime-artifacts.json" \
+            --artifacts="$RUNNER_TEMP/durable-runtime-bundle/artifacts.json" \
             --results="$RUNNER_TEMP/durable-runtime-gvisor" \
             --cache="$RUNNER_TEMP/durable-runtime-cache" \
             --work-dir="$RUNNER_TEMP/durable-runtime-work" \
@@ -117,6 +138,16 @@ jobs:
         with:
           name: durable-runtime-gvisor
           path: ${{ runner.temp }}/durable-runtime-gvisor
+          if-no-files-found: warn
+      - name: Retain native runtime and transfer evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: durable-runtime-native
+          path: |
+            ${{ runner.temp }}/durable-runtime-bundle/manifest.json
+            ${{ runner.temp }}/durable-runtime-bundle/native-receipt.json
+            ${{ runner.temp }}/durable-runtime-bundle/native-*.log
           if-no-files-found: warn
 
   secret-file-permissions:
