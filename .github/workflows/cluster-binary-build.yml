@@ -104,7 +104,6 @@ jobs:
       # the build rather than trusting whoever adds the next matrix row to
       # remember.
       - name: Feature-carrying builds must say so in their name
-        if: matrix.features != ''
         shell: bash
         run: |
           set -euo pipefail
@@ -116,6 +115,10 @@ jobs:
             fi
           done
           echo "artifact name carries its features: ${{ matrix.features }}"
+          if [[ "${{ matrix.operator_artifact_name }}" != *"-operator-agent-enrollment" ]]; then
+            echo "::error::operator client artifact must name its operator-agent-enrollment feature"
+            exit 1
+          fi
 
       - name: Prepare native enrollment fixture
         if: matrix.artifact_name == 'nexusd-cluster-linux-x86_64'
