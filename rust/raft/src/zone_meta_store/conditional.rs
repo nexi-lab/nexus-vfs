@@ -1,6 +1,7 @@
 //! Conditional metadata reuses the zone's path projection and SC state machine.
 
 use super::{bridge_block_on, kernel_to_proto, proto_to_kernel, ZoneBinding, ZoneMetaStore};
+use crate::prelude::{FullStateMachine, ZoneConsensus};
 use crate::raft::{CommandResult, RaftError};
 use kernel::meta_store::{
     ConditionalMetadata, ConditionalMetadataError, ConditionalMetadataResult, FileMetadata,
@@ -19,9 +20,27 @@ pub(super) fn map_error(error: RaftError) -> ConditionalMetadataError {
 
 impl ZoneMetaStore {
     pub(super) fn conditional_metadata(&self) -> Option<&dyn ConditionalMetadata> {
-        match &self.binding {
-            ZoneBinding::Ready(node) if node.supports_conditional_metadata() => Some(self),
-            _ => None,
+        let node = match &self.binding {
+            ZoneBinding::Ready(node) => Some(node),
+            ZoneBinding::Deferred { resolved, .. } => resolved.get(),
+        };
+        // Provider lookup stays lazy. The operation resolves and validates the
+        // actual node before reading or submitting any conditional command.
+        if node.is_none_or(|node| node.supports_conditional_metadata()) {
+            Some(self)
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn conditional_node(
+        &self,
+    ) -> Result<&ZoneConsensus<FullStateMachine>, ConditionalMetadataError> {
+        let node = self.node().map_err(ConditionalMetadataError::Failed)?;
+        if node.supports_conditional_metadata() {
+            Ok(node)
+        } else {
+            Err(ConditionalMetadataError::Unsupported)
         }
     }
 }
@@ -31,9 +50,7 @@ impl ConditionalMetadata for ZoneMetaStore {
         &self,
         path: &str,
     ) -> Result<Option<MetadataSnapshot>, ConditionalMetadataError> {
-        self.conditional_metadata()
-            .ok_or(ConditionalMetadataError::Unsupported)?;
-        let node = self.node().map_err(ConditionalMetadataError::Failed)?;
+        let node = self.conditional_node()?;
         let key = self.to_zone_key(path);
         let image = bridge_block_on(
             &self.runtime,
@@ -60,9 +77,7 @@ impl ConditionalMetadata for ZoneMetaStore {
         mut metadata: FileMetadata,
         expected_version: Option<&[u8]>,
     ) -> Result<ConditionalMetadataResult, ConditionalMetadataError> {
-        self.conditional_metadata()
-            .ok_or(ConditionalMetadataError::Unsupported)?;
-        let node = self.node().map_err(ConditionalMetadataError::Failed)?;
+        let node = self.conditional_node()?;
         let key = self.to_zone_key(path);
         metadata.path = key.clone();
         let result = bridge_block_on(

@@ -72,6 +72,39 @@ async fn protected_ec_is_refused_before_wal_and_acknowledged_without_blocking_re
     let node = zone.consensus_node();
     node.read_linearizable(|_| ()).await.unwrap();
     let log_before = node.last_index();
+    // Deferred lookup offers the operation without materializing a zone. Each
+    // first operation must still reject an unqualified managed node itself.
+    for protect in [false, true] {
+        let store = nexus_raft::zone_meta_store::ZoneMetaStore::deferred_arc(
+            manager.registry(),
+            ZONE,
+            manager.runtime_handle(),
+            "/state".into(),
+            "/".into(),
+        );
+        let result = if protect {
+            store
+                .as_record_protection()
+                .unwrap()
+                .protect_record("/state/reader", &|_| {
+                    panic!("unqualified managed node cannot qualify content")
+                })
+                .map(|_| ())
+        } else {
+            store
+                .as_conditional_metadata()
+                .unwrap()
+                .read_versioned("/state/reader")
+                .map(|_| ())
+        };
+        assert!(matches!(
+            result,
+            Err(kernel::meta_store::ConditionalMetadataError::Unsupported)
+        ));
+        assert!(store.as_conditional_metadata().is_none());
+        assert!(store.as_record_protection().is_none());
+    }
+    assert_eq!(node.last_index(), log_before);
     let experimental = [
         Command::WriteVersionedMetadata {
             key: MANAGED.into(),

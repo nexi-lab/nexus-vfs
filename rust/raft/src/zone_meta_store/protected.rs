@@ -15,9 +15,7 @@ impl RecordProtection for ZoneMetaStore {
         path: &str,
         qualify: &dyn Fn(&FileMetadata) -> Result<(), MetaStoreError>,
     ) -> Result<RecordProtectionResult, ConditionalMetadataError> {
-        self.conditional_metadata()
-            .ok_or(ConditionalMetadataError::Unsupported)?;
-        let node = self.node().map_err(ConditionalMetadataError::Failed)?;
+        let node = self.conditional_node()?;
         let key = self.to_zone_key(path);
         let image = self
             .read_metadata_image(path)
