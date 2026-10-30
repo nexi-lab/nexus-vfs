@@ -1,7 +1,7 @@
 //! The storage control plane adopts a legacy image without changing its key.
 
 use super::{bridge_block_on, proto_to_kernel, ZoneMetaStore};
-use crate::raft::{CommandResult, FullStateMachine};
+use crate::raft::CommandResult;
 use kernel::meta_store::{
     ConditionalMetadataError, FileMetadata, MetaStoreError, RecordProtection,
     RecordProtectionResult, DT_REG,
@@ -19,11 +19,9 @@ impl RecordProtection for ZoneMetaStore {
             .ok_or(ConditionalMetadataError::Unsupported)?;
         let node = self.node().map_err(ConditionalMetadataError::Failed)?;
         let key = self.to_zone_key(path);
-        let image = bridge_block_on(
-            &self.runtime,
-            node.with_state_machine(|state: &FullStateMachine| state.get_metadata(&key)),
-        )
-        .map_err(map_error)?;
+        let image = self
+            .read_metadata_image(path)
+            .map_err(ConditionalMetadataError::Failed)?;
         if let Some(raw) = &image {
             let mut metadata = proto_to_kernel(raw).map_err(ConditionalMetadataError::Failed)?;
             if metadata.entry_type != DT_REG {
