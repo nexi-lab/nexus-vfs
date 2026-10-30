@@ -66,7 +66,7 @@ async fn certificate_reads_preserve_storage_and_committed_index_survives_restart
     ];
     let mut daemon = common::Daemon::spawn(&args, &env);
     daemon
-        .wait_for_log("Static topology applied", BUDGET)
+        .wait_for_log("VFS data plane ready", BUDGET)
         .await
         .unwrap();
     let mut node = client(port, &ca, &node_cert, &node_key).await;
@@ -211,7 +211,7 @@ async fn certificate_reads_preserve_storage_and_committed_index_survives_restart
 
     let mut restarted = common::Daemon::spawn(&args, &env);
     restarted
-        .wait_for_log("Static topology applied", BUDGET)
+        .wait_for_log("VFS data plane ready", BUDGET)
         .await
         .unwrap();
     let mut agent = client(port, &ca, &agent_cert, &agent_key).await;
