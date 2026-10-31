@@ -129,9 +129,7 @@ impl LocalMetaStore {
 
     /// Create an ephemeral namespace using the same metadata API and encoding.
     pub fn in_memory() -> Result<Self, MetaStoreError> {
-        let db = Database::builder()
-            .set_cache_size(1024 * 1024)
-            .create_with_backend(redb::backends::InMemoryBackend::new())
+        let db = lib::redb_storage::create_in_memory()
             .map_err(|e| MetaStoreError::IOError(format!("redb in-memory open: {e}")))?;
         Self::from_database(db, Path::new("in-memory"))
     }

@@ -1,10 +1,22 @@
-//! Crash-safe publication of new redb databases, shared by local and Raft stores.
+//! Native redb storage, shared by local and Raft stores.
+
+mod memory;
 
 use std::fs::File;
 use std::io::{self, ErrorKind};
 use std::path::Path;
 
 use redb::{Builder, Database, DatabaseError, StorageError};
+
+/// Create an ephemeral database whose memory follows its written pages.
+///
+/// The storage already lives in RAM, so redb reads it without a second page
+/// cache. Sparse backing leaves the database's unused growth reserve unallocated.
+pub fn create_in_memory() -> Result<Database, DatabaseError> {
+    Database::builder()
+        .set_cache_size(0)
+        .create_with_backend(memory::SparseMemoryBackend::default())
+}
 
 /// Open an existing database, or initialize and atomically publish a new one.
 ///
