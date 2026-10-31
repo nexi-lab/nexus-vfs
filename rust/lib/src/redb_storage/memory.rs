@@ -141,7 +141,7 @@ mod tests {
 
     #[test]
     fn redb_transactions_commit_abort_and_reclaim_storage_on_sparse_backing() {
-        use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+        use redb::{ReadableDatabase, TableDefinition};
         const TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("records");
         let mut database = super::super::create_in_memory().unwrap();
         let bytes = vec![23; PAGE_BYTES * 3 + 7];
