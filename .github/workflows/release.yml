@@ -100,7 +100,9 @@ jobs:
           # workflow_dispatch build, which correctly falls back to the crate
           # version rather than claiming a tag it is not.
           NEXUSD_BUILD_VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
-        run: cargo build --locked --release -p nexus-cluster --bin nexusd-cluster ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+        run: |
+          cargo build --locked --release -p nexus-cluster --bin nexusd-cluster ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+          cargo build --locked --release -p nexus-cluster --bin nexus-agent-enroll --features operator-agent-enrollment ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
 
       - name: Qualify the optimized binary before publication
         if: matrix.name == 'linux-x86_64'
@@ -121,11 +123,15 @@ jobs:
           mkdir -p "dist/${{ matrix.package_dir }}"
           BIN_DIR="target/${{ matrix.target && format('{0}/', matrix.target) || '' }}release"
           cp "$BIN_DIR/${{ matrix.bin }}" "dist/${{ matrix.package_dir }}/${{ matrix.bin }}"
+          operator_binary="nexus-agent-enroll"
+          if [ "$RUNNER_OS" = "Windows" ]; then operator_binary="$operator_binary.exe"; fi
+          cp "$BIN_DIR/$operator_binary" "dist/${{ matrix.package_dir }}/$operator_binary"
           if [ -f README.md ]; then
             cp README.md "dist/${{ matrix.package_dir }}/README.md"
           fi
           if [[ "${{ runner.os }}" != "Windows" ]]; then
             chmod +x "dist/${{ matrix.package_dir }}/${{ matrix.bin }}"
+            chmod +x "dist/${{ matrix.package_dir }}/$operator_binary"
           fi
 
       - name: Archive release payload (tar.gz)

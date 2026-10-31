@@ -39,6 +39,8 @@ mod csr_cli;
 mod managed_csr;
 #[cfg(feature = "experimental-managed-agent-csr")]
 mod managed_csr_binding;
+#[cfg(feature = "operator-agent-enrollment")]
+pub mod operator_enrollment;
 mod plugin_loading;
 mod runtime_backends;
 mod search_capabilities;
