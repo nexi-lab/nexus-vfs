@@ -40,6 +40,8 @@ jobs:
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
+            operator_binary: nexus-agent-enroll
+            operator_artifact_name: nexus-agent-enroll-linux-x86_64-operator-agent-enrollment
             max_size_bytes: 20764672  # 19.8 MiB. Measured 20,202,880 on the
                                       # rebased #364 (main's 1.99.0 baseline 19,515,016
                                       # plus the typed ZoneRuntime plane and the declared
@@ -49,6 +51,8 @@ jobs:
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
+            operator_binary: nexus-agent-enroll
+            operator_artifact_name: nexus-agent-enroll-macos-arm64-operator-agent-enrollment
             max_size_bytes: 18087936  # 17.25 MiB. Measured 17,419,600 on the
                                       # rebased #364 (main's 1.99.0 baseline 16,804,432
                                       # plus the #364/#361 stack); ~3.8% headroom.
@@ -57,6 +61,8 @@ jobs:
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster
+            operator_binary: nexus-agent-enroll
+            operator_artifact_name: nexus-agent-enroll-macos-x86_64-operator-agent-enrollment
             target: x86_64-apple-darwin
             max_size_bytes: 19148800  # 18.25 MiB. Measured 18,580,176 on the
                                       # rebased #364 (main's 1.99.0 baseline 17,947,120
@@ -66,6 +72,8 @@ jobs:
             package: nexus-cluster
             bin: nexusd-cluster
             binary: nexusd-cluster.exe
+            operator_binary: nexus-agent-enroll.exe
+            operator_artifact_name: nexus-agent-enroll-windows-x86_64-operator-agent-enrollment
             max_size_bytes: 19922944  # 19 MiB. Measured 19,324,416 on the
                                       # rebased #364 (main's 1.99.0 baseline 18,572,288
                                       # plus the #364/#361 stack); ~3.1% headroom.
@@ -96,7 +104,6 @@ jobs:
       # the build rather than trusting whoever adds the next matrix row to
       # remember.
       - name: Feature-carrying builds must say so in their name
-        if: matrix.features != ''
         shell: bash
         run: |
           set -euo pipefail
@@ -108,6 +115,10 @@ jobs:
             fi
           done
           echo "artifact name carries its features: ${{ matrix.features }}"
+          if [[ "${{ matrix.operator_artifact_name }}" != *"-operator-agent-enrollment" ]]; then
+            echo "::error::operator client artifact must name its operator-agent-enrollment feature"
+            exit 1
+          fi
 
       - name: Prepare native enrollment fixture
         if: matrix.artifact_name == 'nexusd-cluster-linux-x86_64'
@@ -128,28 +139,62 @@ jobs:
           path: ${{ runner.temp }}/release-enrollment
           if-no-files-found: error
 
-      - name: Check binary size
+      - name: Build the separate operator client
+        run: cargo build --release -p nexus-cluster --bin nexus-agent-enroll --features operator-agent-enrollment ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+
+      - name: Check daemon and operator client sizes
         shell: bash
         env:
           MAX_SIZE_BYTES: ${{ matrix.max_size_bytes }}
           BINARY_PATH: target/${{ matrix.target && format('{0}/', matrix.target) || '' }}release/${{ matrix.binary }}
+          OPERATOR_PATH: target/${{ matrix.target && format('{0}/', matrix.target) || '' }}release/${{ matrix.operator_binary }}
+          OPERATOR_ARTIFACT: ${{ matrix.operator_artifact_name }}
         run: |
           set -euo pipefail
-          if [ "$RUNNER_OS" = "macOS" ]; then
-            actual=$(stat -f '%z' "$BINARY_PATH")
-          else
-            actual=$(stat -c '%s' "$BINARY_PATH")
-          fi
-          echo "Binary size: $actual bytes (max: $MAX_SIZE_BYTES)"
-          if [ "$actual" -gt "$MAX_SIZE_BYTES" ]; then
-            echo "::error::${{ matrix.artifact_name }} exceeds its size budget ($actual > $MAX_SIZE_BYTES bytes)"
-            exit 1
-          fi
+          for candidate in "$BINARY_PATH" "$OPERATOR_PATH"; do
+            artifact="${{ matrix.artifact_name }}"
+            if [ "$candidate" = "$OPERATOR_PATH" ]; then
+              artifact="$OPERATOR_ARTIFACT"
+            fi
+            if [ "$RUNNER_OS" = "macOS" ]; then
+              actual=$(stat -f '%z' "$candidate")
+            else
+              actual=$(stat -c '%s' "$candidate")
+            fi
+            echo "$artifact binary size: $actual bytes (max: $MAX_SIZE_BYTES)"
+            if [ "$actual" -gt "$MAX_SIZE_BYTES" ]; then
+              echo "::error::$artifact exceeds its size budget ($actual > $MAX_SIZE_BYTES bytes)"
+              exit 1
+            fi
+          done
 
       - name: Sanity-check --help
         if: ${{ !matrix.target }}
         shell: bash
-        run: target/release/${{ matrix.binary }} --help
+        run: |
+          target/release/${{ matrix.binary }} --help
+          target/release/${{ matrix.operator_binary }} --help
+
+      - uses: actions/setup-python@v5
+        if: runner.os == 'Windows'
+        with:
+          python-version: '3.12'
+
+      # The same RPC/persistence/recovery journey as Cargo's all-features test,
+      # using these exact optimized Windows executables. Help/build and the
+      # daemon-only local-mount fixture cannot establish operator coverage.
+      - name: Qualify Windows operator MintAgent and credential recovery
+        if: runner.os == 'Windows'
+        shell: bash
+        run: python scripts/e2e/operator_agent_enrollment.py --daemon target/release/${{ matrix.binary }} --operator target/release/${{ matrix.operator_binary }} --output "$RUNNER_TEMP/operator-enrollment"
+
+      - name: Retain Windows operator journey evidence
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-operator-enrollment
+          path: ${{ runner.temp }}/operator-enrollment
+          if-no-files-found: error
 
       - uses: actions/setup-node@v4
         if: ${{ !matrix.target }}
@@ -173,5 +218,16 @@ jobs:
         with:
           name: ${{ matrix.artifact_name }}
           path: target/${{ matrix.target && format('{0}/', matrix.target) || '' }}release/${{ matrix.binary }}
+          if-no-files-found: error
+          retention-days: ${{ inputs.upload_retention_days }}
+
+      # This feature-carrying client is a separate executable, never a different
+      # daemon hidden behind the same version/name. Reuse the same native runner
+      # and unchanged per-platform size cap; no extra platform job is needed.
+      - name: Upload the operator-only client
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.operator_artifact_name }}
+          path: target/${{ matrix.target && format('{0}/', matrix.target) || '' }}release/${{ matrix.operator_binary }}
           if-no-files-found: error
           retention-days: ${{ inputs.upload_retention_days }}
