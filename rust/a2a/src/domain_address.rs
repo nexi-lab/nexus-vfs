@@ -7,12 +7,27 @@
 //! module. A separate unconditional namespace reservation denies this family
 //! to non-system callers. Older nodes lack that rule and must not host it.
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use data_encoding::{Encoding, Specification};
+use std::sync::LazyLock;
 
 const PREFIX: &str = "/collaboration/v1/";
-const MAX_SUBJECT_BYTES: usize = 128;
-const MAX_AGENT_SEGMENT: usize = 218;
+const MAX_SUBJECT_BYTES: usize = 124;
+/// A segment is also a host file name somewhere: 255 bytes is the common
+/// NAME_MAX, and the 124-byte subject bound keeps a segment within it.
+const MAX_AGENT_SEGMENT: usize = 255;
 const MAX_PAIR_PATH: usize = PREFIX.len() + 32 + 7 + MAX_AGENT_SEGMENT * 3 + 1 + 9;
+
+/// RFC 4648 base32 in lowercase, unpadded, with canonical trailing bits.
+/// Segments are therefore lowercase ASCII, so case-insensitive storage
+/// (default macOS and Windows file systems, case-folding indexes) keeps
+/// distinct addresses distinct. Base64 would let two subjects of one
+/// authority differ only in letter case.
+static BASE32: LazyLock<Encoding> = LazyLock::new(|| {
+    let mut spec = Specification::new();
+    spec.symbols.push_str("abcdefghijklmnopqrstuvwxyz234567");
+    spec.encoding()
+        .expect("lowercase RFC 4648 base32 is a valid specification")
+});
 
 pub(crate) fn validate_space_id(space: &str) -> Result<(), &'static str> {
     if space.len() != 32
@@ -42,7 +57,7 @@ impl AgentAddress {
             || subject.len() > MAX_SUBJECT_BYTES
             || subject.chars().any(char::is_control)
         {
-            return Err("Agent subject must contain 1..128 UTF-8 bytes without controls");
+            return Err("Agent subject must contain 1..124 UTF-8 bytes without controls");
         }
         Ok(Self { authority, subject })
     }
@@ -67,14 +82,15 @@ impl AgentAddress {
             .collect()
     }
 
-    /// One reversible, path-safe segment, bounded to 218 ASCII bytes. Display
-    /// aliases and the legacy `domain/agent/name` rendering are not this codec.
+    /// One reversible, path-safe segment of at most 255 lowercase ASCII bytes.
+    /// Display aliases and the legacy `domain/agent/name` rendering are not
+    /// this codec.
     #[must_use]
     pub fn segment(&self) -> String {
         format!(
-            "a1.{}.{}",
-            URL_SAFE_NO_PAD.encode(self.authority),
-            URL_SAFE_NO_PAD.encode(self.subject.as_bytes())
+            "a2.{}.{}",
+            BASE32.encode(&self.authority),
+            BASE32.encode(self.subject.as_bytes())
         )
     }
 
@@ -83,17 +99,17 @@ impl AgentAddress {
             return Err("Agent address exceeds the canonical segment bound");
         }
         let parts: Vec<_> = segment.split('.').collect();
-        let ["a1", authority, subject] = parts.as_slice() else {
+        let ["a2", authority, subject] = parts.as_slice() else {
             return Err("Unsupported or malformed Agent address");
         };
-        let authority: [u8; 32] = URL_SAFE_NO_PAD
-            .decode(authority)
+        let authority: [u8; 32] = BASE32
+            .decode(authority.as_bytes())
             .map_err(|_| "Invalid issuer fingerprint encoding")?
             .try_into()
             .map_err(|_| "Issuer fingerprint must be 32 bytes")?;
         let subject = String::from_utf8(
-            URL_SAFE_NO_PAD
-                .decode(subject)
+            BASE32
+                .decode(subject.as_bytes())
                 .map_err(|_| "Invalid subject encoding")?,
         )
         .map_err(|_| "Subject must be UTF-8")?;
@@ -244,26 +260,53 @@ mod tests {
 
     #[test]
     fn utf8_and_separators_are_exact_bounded_single_segments() {
-        for name in ["研发 🧪", "a/b\\c.d", &"x".repeat(128)] {
+        for name in ["研发 🧪", "a/b\\c.d", &"x".repeat(124), &"研".repeat(41)] {
             let address = agent(7, name);
             let segment = address.segment();
-            assert!(segment.len() <= 218);
+            assert!(segment.len() <= 255);
             assert!(!segment.contains('/') && !segment.contains('\\'));
             assert_eq!(AgentAddress::parse(&segment).unwrap().subject(), name);
         }
-        assert!(AgentAddress::new([1; 32], "x".repeat(129)).is_err());
+        assert_eq!(agent(7, &"x".repeat(124)).segment().len(), 255);
+        assert!(AgentAddress::new([1; 32], "x".repeat(125)).is_err());
         assert!(AgentAddress::new([1; 32], "bad\0name".into()).is_err());
     }
 
     #[test]
     fn rejects_alias_encodings_and_unknown_versions() {
         let value = agent(4, "worker").segment();
+        let authority = BASE32.encode(&[4; 32]);
+        assert_eq!(BASE32.encode(b"a"), "me");
         for invalid in [
             format!("{value}="),
-            value.replacen("a1.", "a2.", 1),
-            "a1.YQ.Yg".into(),
+            value.replacen("a2.", "a1.", 1),
+            format!("a2.{}", value["a2.".len()..].to_ascii_uppercase()),
+            // Same subject byte, nonzero trailing bits.
+            format!("a2.{authority}.mf"),
+            // The base64 form this version replaced.
+            "a1.BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ.d29ya2Vy".into(),
         ] {
-            assert!(AgentAddress::parse(&invalid).is_err());
+            assert!(AgentAddress::parse(&invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn case_insensitive_storage_keeps_distinct_addresses_distinct() {
+        // Under base64 these subjects of one authority encoded to
+        // `d29ya2Vy` and `d29Ya2Vy`, one file on a case-insensitive volume.
+        let pairs = [
+            ("worker", "woXker"),
+            ("nexus-mac-claude", "nexus-maI-claude"),
+        ];
+        for (a, b) in pairs {
+            let (a, b) = (agent(4, a).segment(), agent(4, b).segment());
+            assert_ne!(a.to_ascii_lowercase(), b.to_ascii_lowercase());
+        }
+        for name in ["Worker", "WORKER", "研发 🧪", "a/b\\c.d"] {
+            let segment = agent(9, name).segment();
+            assert!(segment
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b) || b == b'.'));
         }
     }
 
