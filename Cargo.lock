@@ -6,9 +6,9 @@ version = 4
 name = "a2a"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
  "blake3",
  "contracts",
+ "data-encoding",
  "kernel",
  "serde",
  "serde_json",

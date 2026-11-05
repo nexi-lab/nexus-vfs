@@ -14,8 +14,16 @@ path = "src/lib.rs"
 name = "nexusd-cluster"
 path = "src/main.rs"
 
+[[bin]]
+name = "nexus-agent-enroll"
+path = "src/operator_main.rs"
+required-features = ["operator-agent-enrollment"]
+
 [features]
 default = []
+# The operator is a client, not a daemon capability. Its own entry links only
+# the existing TLS/RPC/bundle helpers; default server builds pay no client cost.
+operator-agent-enrollment = []
 driver-cas-local = ["backends/driver-cas-local"]
 experimental-managed-agent-csr = ["dep:sha2"]
 rebac = ["dep:nexus-rebac"]
