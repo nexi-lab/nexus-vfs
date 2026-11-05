@@ -3,6 +3,42 @@ import test from 'node:test'
 import * as grpc from '@grpc/grpc-js'
 import { fixture } from './helpers/vfs-fixture.mjs'
 
+test('batch stat preserves the single-path metadata decoder, duplicates and missing positions', async () => {
+  const requests = []
+  const image = { found: true, path: '/project/a', size: '7', content_id: 'body',
+    mime_type: 'text/plain', is_directory: false, entry_type: 0, mode: 0o600,
+    version: 3, zone_id: 'project', created_at_ms: '123', modified_at_ms: '456',
+    last_writer_address: 'node:2028', link_target: '', owner_id: 'owner' }
+  const { client, close } = await fixture({
+    stat(_call, reply) { reply(null, image) },
+    batchStat(call, reply) {
+      requests.push(call.request)
+      reply(null, { results: call.request.paths.map(path => path === '/missing' ? { found: false } : image) })
+    },
+  })
+  try {
+    const paths = ['/project/a', '/missing', '/project/a']
+    const single = await client.stat(paths[0], 'owner-token')
+    const pending = client.batchStat(paths, 'owner-token')
+    paths.push('/changed-after-send')
+    assert.deepEqual(await pending, [single, null, single])
+    assert.deepEqual(requests, [{ paths: paths.slice(0, 3), auth_token: 'owner-token', zone_id: '' }])
+    assert.deepEqual(await client.batchStat([], 'owner-token'), [])
+  } finally { await close() }
+})
+
+test('batch stat refuses incomplete responses and preserves whole-request authorization errors', async () => {
+  const { client, close } = await fixture({ batchStat(call, reply) {
+    if (call.request.auth_token !== 'owner-token') {
+      reply({ code: grpc.status.PERMISSION_DENIED, details: 'Owner cannot read these paths' })
+    } else reply(null, { results: [{ found: false }] })
+  } })
+  try {
+    await assert.rejects(client.batchStat(['/a', '/b'], 'owner-token'), /incomplete positional response/)
+    await assert.rejects(client.batchStat(['/a', '/b'], 'another-token'), /PERMISSION_DENIED/)
+  } finally { await close() }
+})
+
 test('chmod sends native permissions and owner credentials through its typed RPC', async () => {
   const requests = []
   const { client, close } = await fixture({ chmod(call, reply) {

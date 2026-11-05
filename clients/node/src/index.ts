@@ -130,6 +130,7 @@ interface UnaryClient {
   Delete: GrpcMethod<DeleteRequest, DeleteResponse>
   Ping: GrpcMethod<PingRequest, PingResponse>
   Stat: GrpcMethod<StatRequest, StatResponse>
+  BatchStat: GrpcMethod<BatchStatRequest, BatchStatResponse>
   Readdir: GrpcMethod<ReaddirRequest, ReaddirResponse>
   Mkdir: GrpcMethod<MkdirRequest, MkdirResponse>
   StreamReadAt: GrpcMethod<StreamReadAtRequest, StreamReadAtResponse>
@@ -218,6 +219,15 @@ interface StatResponse {
   owner_id: string
   is_error: boolean
   error_payload: Buffer
+}
+type BatchStatItem = Omit<StatResponse, 'is_error' | 'error_payload'>
+interface BatchStatRequest {
+  paths: string[]
+  auth_token: string
+  zone_id: string
+}
+interface BatchStatResponse {
+  results: BatchStatItem[]
 }
 interface ReaddirRequest {
   path: string
@@ -346,6 +356,27 @@ export interface NexusStat {
   lastWriterAddress?: string
   linkTarget?: string
   ownerId?: string
+}
+
+/** Decode the common metadata image from single-path and vectored stat RPCs. */
+function decodeStat(response: BatchStatItem): NexusStat | null {
+  if (!response.found) return null
+  return {
+    path: response.path,
+    size: Number(response.size ?? 0),
+    contentId: response.content_id || undefined,
+    mimeType: response.mime_type || undefined,
+    isDirectory: response.is_directory,
+    entryType: response.entry_type,
+    mode: response.mode,
+    version: response.version,
+    zoneId: response.zone_id || undefined,
+    createdAtMs: response.created_at_ms ? Number(response.created_at_ms) : undefined,
+    modifiedAtMs: response.modified_at_ms ? Number(response.modified_at_ms) : undefined,
+    lastWriterAddress: response.last_writer_address || undefined,
+    linkTarget: response.link_target || undefined,
+    ownerId: response.owner_id || undefined,
+  }
 }
 
 export interface NexusServerInfo {
@@ -692,23 +723,20 @@ export class NexusVfsClient {
       zone_id: '',
     })
     if (response.is_error) throw vfsError(response.error_payload, 'stat')
-    if (!response.found) return null
-    return {
-      path: response.path,
-      size: Number(response.size ?? 0),
-      contentId: response.content_id || undefined,
-      mimeType: response.mime_type || undefined,
-      isDirectory: response.is_directory,
-      entryType: response.entry_type,
-      mode: response.mode,
-      version: response.version,
-      zoneId: response.zone_id || undefined,
-      createdAtMs: response.created_at_ms ? Number(response.created_at_ms) : undefined,
-      modifiedAtMs: response.modified_at_ms ? Number(response.modified_at_ms) : undefined,
-      lastWriterAddress: response.last_writer_address || undefined,
-      linkTarget: response.link_target || undefined,
-      ownerId: response.owner_id || undefined,
+    return decodeStat(response)
+  }
+
+  /** Metadata in request order, with null for absent paths; any authorization failure throws. */
+  async batchStat(paths: readonly string[], authToken: string): Promise<(NexusStat | null)[]> {
+    const request = {
+      paths: [...paths], auth_token: authToken, zone_id: '',
     }
+    const response = await this.unary<BatchStatRequest, BatchStatResponse>('BatchStat', 'batch stat', request)
+    const results = response.results ?? []
+    if (results.length !== request.paths.length) {
+      throw new Error('batch stat returned an incomplete positional response')
+    }
+    return results.map(decodeStat)
   }
 
   /**

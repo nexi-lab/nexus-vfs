@@ -57,6 +57,12 @@ const mounts = JSON.parse(await client.call('get_mount_points', '{}', authToken)
 client.close()
 ```
 
+`await client.batchStat(paths, authToken)` obtains metadata for several paths in
+one existing `BatchStat` RPC. Its results keep request order, including duplicate
+paths, and contain `null` for absent files. The server authorizes every requested
+path before reading metadata. Transport and authorization failures reject the
+whole call. `stat` and `batchStat` return the same metadata shape.
+
 For a script on local reference storage, `await client.chmod('/project/run.sh',
 0o700, authToken)` changes the native executable's permission bits. The call
 requires write permission. Missing files, unsupported backends, and older
