@@ -728,11 +728,12 @@ export class NexusVfsClient {
 
   /** Metadata in request order, with null for absent paths; any authorization failure throws. */
   async batchStat(paths: readonly string[], authToken: string): Promise<(NexusStat | null)[]> {
-    const response = await this.unary<BatchStatRequest, BatchStatResponse>('BatchStat', 'batch stat', {
+    const request = {
       paths: [...paths], auth_token: authToken, zone_id: '',
-    })
+    }
+    const response = await this.unary<BatchStatRequest, BatchStatResponse>('BatchStat', 'batch stat', request)
     const results = response.results ?? []
-    if (results.length !== paths.length) {
+    if (results.length !== request.paths.length) {
       throw new Error('batch stat returned an incomplete positional response')
     }
     return results.map(decodeStat)

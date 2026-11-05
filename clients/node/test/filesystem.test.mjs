@@ -19,8 +19,10 @@ test('batch stat preserves the single-path metadata decoder, duplicates and miss
   try {
     const paths = ['/project/a', '/missing', '/project/a']
     const single = await client.stat(paths[0], 'owner-token')
-    assert.deepEqual(await client.batchStat(paths, 'owner-token'), [single, null, single])
-    assert.deepEqual(requests, [{ paths, auth_token: 'owner-token', zone_id: '' }])
+    const pending = client.batchStat(paths, 'owner-token')
+    paths.push('/changed-after-send')
+    assert.deepEqual(await pending, [single, null, single])
+    assert.deepEqual(requests, [{ paths: paths.slice(0, 3), auth_token: 'owner-token', zone_id: '' }])
     assert.deepEqual(await client.batchStat([], 'owner-token'), [])
   } finally { await close() }
 })
