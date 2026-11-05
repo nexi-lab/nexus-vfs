@@ -50,14 +50,23 @@ different pins and must not be substituted for each other in native APIs.
 The experimental `a2a::domain_address::AgentAddress` codec is:
 
 ```text
-a1.<base64url-no-padding(32-byte issuer fingerprint)>.<base64url-no-padding(subject UTF-8)>
+a2.<base32(32-byte issuer fingerprint)>.<base32(subject UTF-8)>
 ```
 
-Values are reversible, canonical, single path segments of at most 218 ASCII
-bytes. The subject bound is 128 UTF-8 bytes with no control characters. This
-is an address-format bound; it does not replace the issuer's subject policy or
-establish that the subject appears in any valid certificate. No normalization,
-slash replacement, CN fallback or handwritten downstream codec is permitted.
+`base32` is RFC 4648 base32 in lowercase, unpadded, with zero trailing bits.
+Values are reversible, canonical, single path segments of at most 255
+lowercase ASCII bytes, so a segment is also a valid host file name. The subject
+bound is 124 UTF-8 bytes with no control characters. This is an address-format
+bound; it does not replace the issuer's subject policy or establish that the
+subject appears in any valid certificate. No normalization, slash replacement,
+CN fallback or handwritten downstream codec is permitted.
+
+The alphabet is single-case because transcripts and readers can land on
+case-insensitive storage: default macOS and Windows volumes and case-folding
+indexes. There, two segments that differ only in letter case are one name. A
+mixed-case encoding gives an authority's subjects such pairs (`worker` and
+`woXker` in base64url), so an Agent able to choose its own name could share
+another Agent's pair or reader leaf.
 
 An address is public data, not an authenticated principal. The authorizer must
 derive its caller from the current actual mTLS leaf or the trusted managed
