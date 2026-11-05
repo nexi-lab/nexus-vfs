@@ -82,5 +82,19 @@ test(
       }
       await assert.rejects(client.read(path, token))
     })
+
+    await t.test('batch stat reads real metadata in request order across creation and deletion', async () => {
+      const directory = `/vfs-client-batch-${process.pid}`
+      const path = directory + '/file.txt'
+      await client.mkdir(directory, token)
+      try {
+        await client.write(path, Buffer.from('batch metadata'), token)
+        const paths = [path, directory + '/missing', directory, path]
+        assert.deepEqual(await client.batchStat(paths, token),
+          await Promise.all(paths.map(value => client.stat(value, token))))
+        await client.delete(path, token)
+        assert.deepEqual(await client.batchStat([path, path], token), [null, null])
+      } finally { await client.delete(directory, token, { recursive: true }) }
+    })
   },
 )
