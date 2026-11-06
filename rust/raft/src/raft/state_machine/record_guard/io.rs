@@ -53,12 +53,18 @@ impl FullStateMachine {
         expected: &[u8],
     ) -> Result<(std::path::PathBuf, String)> {
         let txn = self.metadata.raw_db().begin_read().map_err(storage_error)?;
-        let binding = self
-            .record_io_control_in_read(&txn, BINDING_PREFIX, record)?
-            .ok_or(super::super::super::RaftError::UnsupportedOperation(
-                "record has no owner binding",
-            ))?;
-        let owner = String::from_utf8(binding).map_err(storage_error)?;
+        let owner = match self.record_io_control_in_read(&txn, BINDING_PREFIX, record)? {
+            Some(binding) => String::from_utf8(binding).map_err(storage_error)?,
+            // The owning service retains this same lifetime while qualifying
+            // a new child, before that child can have a permanent binding.
+            // Only explicit I/O enrollment admits this owner spelling.
+            None if self.is_record_io_owner_in_read(&txn, record)? => record.to_owned(),
+            None => {
+                return Err(super::super::super::RaftError::UnsupportedOperation(
+                    "record has no owner binding",
+                ));
+            }
+        };
         if !self.is_record_io_owner_in_read(&txn, &owner)? {
             return Err(super::super::super::RaftError::UnsupportedOperation(
                 "record owner I/O is not enrolled",

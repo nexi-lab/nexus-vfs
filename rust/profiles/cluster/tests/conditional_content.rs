@@ -10,6 +10,9 @@ mod protection;
 #[path = "conditional_content/guarded.rs"]
 mod guarded;
 
+#[path = "conditional_content/owner_control.rs"]
+mod owner_control;
+
 #[path = "conditional_content/rename.rs"]
 mod rename;
 

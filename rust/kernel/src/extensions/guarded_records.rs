@@ -24,6 +24,8 @@ pub trait GuardedRecords: Send + Sync {
 
     /// Retain actual storage I/O. The owner is checked after acquiring the
     /// lifetime guard too; the caller holds this guard through all work.
+    /// The path may be an explicitly enrolled owner or its bound child. Owner
+    /// I/O covers qualification of a new child before binding can commit.
     fn begin_record_io(
         &self,
         path: &str,

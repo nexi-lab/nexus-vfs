@@ -17,6 +17,40 @@ fn retire(store: &ZoneMetaStore, handle: &[u8]) -> Vec<u8> {
 }
 
 #[test]
+fn enrolled_owner_qualification_shares_child_io_exclusion_and_cannot_revive() {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = Runtime::open(directory.path());
+    let store = runtime.store("/", "/");
+    let handle = admit(&store);
+    assert!(store.begin_record_io(OWNER, &handle).is_err());
+    store.admit_record_io_owner(OWNER, &handle).unwrap();
+    assert!(store.begin_record_io("/unbound", &handle).is_err());
+    let lifetime = store.begin_record_io(OWNER, &handle).unwrap();
+    let terminal = retire(&store, &handle);
+    let mut content =
+        std::fs::File::create(directory.path().join("qualification-in-progress")).unwrap();
+    content
+        .write_all(b"real qualification work after retirement")
+        .unwrap();
+    content.sync_all().unwrap();
+    assert!(store
+        .try_exclude_retired_record_io(OWNER, &terminal)
+        .unwrap()
+        .is_none());
+    assert!(store.begin_record_io(OWNER, &handle).is_err());
+    assert!(store.begin_record_io(OWNER, &terminal).is_err());
+    assert!(store
+        .bind_record_guard("/late-child", None, OWNER, &handle)
+        .is_err());
+    drop(content);
+    drop(lifetime);
+    assert!(store
+        .try_exclude_retired_record_io(OWNER, &terminal)
+        .unwrap()
+        .is_some());
+}
+
+#[test]
 fn cancelled_reply_does_not_retire_real_io_and_finished_io_needs_no_process_exit() {
     let directory = tempfile::tempdir().unwrap();
     let runtime = Runtime::open(directory.path());
