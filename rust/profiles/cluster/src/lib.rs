@@ -44,6 +44,7 @@ pub mod operator_enrollment;
 mod plugin_loading;
 mod runtime_backends;
 mod search_capabilities;
+pub mod stream_observers;
 mod user_runtime;
 use auth_posture::{AuthPosture, AuthPostureInputs};
 use kernel::abc::object_store::ObjectStore;
@@ -3651,76 +3652,8 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         );
     }
 
-    // (2) Arm the cross-machine stream-wakeup observer PER ZONE: a
-    // replicated `AppendStreamEntry` (a transcript write on a
-    // peer) wakes a `sys_watch` parked on this replica. The observer is a
-    // generic raft primitive (`nexus_raft::stream_wakeup`), armed here —
-    // NOT in a2a — because it needs a `Weak<Kernel>` (the `Arc` lives
-    // here). It self-recovers the watched path from the wal-stream key, so
-    // no per-zone mapping is threaded in. Root covers node-local
-    // `/agents`; every federation mount (`--cluster-init-mount
-    // /agents=<zone>`) is what makes A2A cross-machine, because that zone's
-    // raft replicates the mailbox across members — and the wal DT_STREAM
-    // for a mailbox under that mount now proposes to THAT zone (see
-    // `setattr_stream`'s path-zone resolution), so the append actually
-    // reaches peers. These zones were created/joined by the BootAction
-    // block above, so they are loaded now; a zone joined at runtime after
-    // boot is a documented follow-up.
-    {
-        // Arm on every zone this node participates in. The wakeup is a
-        // property of raft-consensus membership, NOT of `--cluster-init-mount`:
-        // a JOINER reaches its shared zones via DiscoverZones /
-        // identity.zones with no `--cluster-init` (a `--cluster-init`
-        // alongside `--peers` is a fail-loud ambiguous boot — see
-        // `plan_boot_action` row 6), so keying off the init mounts would arm
-        // root only and silently drop the joiner's shared mailbox zone.
-        //
-        // Arming rides zone materialization rather than a boot-time sweep,
-        // which is both cheaper and more complete: a sweep would have to open
-        // every hosted zone to arm it (putting the whole catalog back on the
-        // boot path), and it could only ever cover the zones that existed at
-        // boot — a zone joined at runtime, or a hosted zone touched for the
-        // first time hours later, was silently left unarmed. Both observers
-        // register KEYED, so arming a zone twice replaces rather than
-        // accumulates.
-        let kernel_for_hook = Arc::downgrade(&kernel);
-        let runtime_for_hook = zm.runtime_handle();
-        let arm = move |zone_id: &str,
-                        consensus: &nexus_raft::prelude::ZoneConsensus<
-            nexus_raft::prelude::FullStateMachine,
-        >| {
-            // WAL paths are relative to the consensus that committed them.
-            nexus_raft::stream_wakeup::install_stream_wakeup_observer(
-                consensus,
-                kernel_for_hook.clone(),
-                zone_id,
-            );
-            // Same per-zone spine, sibling concern: a replicated
-            // `TrimStreamSegment` (a wal DT_STREAM over its retention budget)
-            // reclaims this node's own-origin cold blobs. Off the apply thread
-            // (disk I/O), so pass the runtime.
-            nexus_raft::stream_retention_gc::install_stream_trim_gc_observer(
-                consensus,
-                kernel_for_hook.clone(),
-                zone_id,
-                runtime_for_hook.clone(),
-            );
-            tracing::info!(zone_id = %zone_id, "a2a stream-wakeup + retention-GC observers armed");
-        };
-        let arm = Arc::new(arm);
-        let arm_for_hook = arm.clone();
-        zm.registry()
-            .add_on_materialized(Arc::new(move |zone_id, consensus| {
-                arm_for_hook(zone_id, consensus)
-            }));
-        // ...and whatever boot already made resident (root, and the credential
-        // zone when it differs), which materialized before the hook existed.
-        for zone_id in zm.registry().resident_zones() {
-            if let Some(zone) = zm.get_zone(&zone_id) {
-                arm(&zone_id, &zone.consensus_node());
-            }
-        }
-    }
+    stream_observers::install_wakeup(&kernel, &zm);
+    stream_observers::install_retention_gc(&kernel, &zm);
 
     // Post-transport substrate observability — dual of the peer-blob
     // installation just above.  peer_blob is what performs cross-node

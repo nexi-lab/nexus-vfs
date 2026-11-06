@@ -6,6 +6,14 @@ use kernel::meta_store::ConditionalMetadataResult;
 #[test]
 fn guarded_wal_append_wakes_a_parked_kernel_tail_through_its_mount() {
     let fixture = Fixture::open();
+    fixture.kernel.vfs_router_arc().add_federation_mount(
+        "/state",
+        "root",
+        Some(fixture.backend.clone()),
+        "root",
+        MANAGED,
+        false,
+    );
     let handle = admit(&fixture);
     let path = "/state/history";
     fixture
@@ -43,6 +51,7 @@ fn guarded_wal_append_wakes_a_parked_kernel_tail_through_its_mount() {
             &fixture.kernel,
             ops,
         );
+    nexus_cluster::stream_observers::install_wakeup(&fixture.kernel, &fixture.manager);
     let (result, received) = std::sync::mpsc::channel();
     let reader = {
         let kernel = fixture.kernel.clone();
