@@ -26,6 +26,10 @@ service NexusVFSService {
   // Each path must provide atomic metadata and durable immutable publication.
   rpc ReadVersioned(ReadVersionedRequest) returns (ReadVersionedResponse);
   rpc WriteIfVersion(WriteIfVersionRequest) returns (WriteIfVersionResponse);
+  // An admitted owner is mandatory for this pair. Separate methods ensure an
+  // older server refuses instead of ignoring an unknown owner field.
+  rpc ReadGuarded(ReadGuardedRequest) returns (ReadVersionedResponse);
+  rpc WriteGuarded(WriteGuardedRequest) returns (WriteIfVersionResponse);
   // Native permissions on local reference storage. Older servers return
   // UNIMPLEMENTED; an unsupported backend must never acknowledge a fake mode.
   rpc Chmod(ChmodRequest) returns (ChmodResponse);
@@ -207,6 +211,20 @@ message WriteIfVersionRequest {
   bytes content = 2; // The complete replacement image.
   string auth_token = 3;
   optional bytes expected_version = 4; // Absent requires an absent file.
+}
+
+message ReadGuardedRequest {
+  string path = 1;
+  string auth_token = 2;
+  bytes owner_version = 3;
+}
+
+message WriteGuardedRequest {
+  string path = 1;
+  bytes content = 2;
+  string auth_token = 3;
+  optional bytes expected_version = 4;
+  bytes owner_version = 5;
 }
 
 message ConditionalContentConflict {

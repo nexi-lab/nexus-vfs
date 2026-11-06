@@ -209,6 +209,7 @@ pub(super) async fn serve(
             &kernel,
             peer_client,
         );
+    super::stream_observers::install_wakeup(&kernel, &zones);
     let auth: Arc<dyn transport::auth::AuthProvider> =
         Arc::new(auth::ApiKeyAuthProvider::cert_identity_for_user_runtime(
             initial.bundle.server_name.clone(),

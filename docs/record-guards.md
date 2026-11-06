@@ -31,6 +31,11 @@ Process IDs, wall clocks and advisory lease expiry do not authorize commits.
 Mutations, owner comparisons and `last_applied` commit in one transaction.
 The apply functions perform no blob I/O or background work.
 
+The existing stream wakeup observer also handles guarded appends. It uses the
+durably applied outcome: an assigned offset wakes local stream readers and file
+watches, while a refused ordinary or guarded append publishes no write event.
+The observer retains only a weak Kernel reference and performs no storage I/O.
+
 An owner key and its permanently bound record paths identify one storage
 incarnation. Persistent Agent/SID indexes and Agent mailbox cursors retain
 their independent lifetimes. They must not become children of a particular
@@ -87,9 +92,26 @@ Recreating its path while an old handle exists would split the exclusion.
 File operations and lock waits run outside the Raft actor's apply transaction;
 only deterministic enrollment and owner decisions enter consensus.
 
+The Kernel's `read_guarded_content` and `replace_guarded_content` retain the
+lifetime handle through their synchronous content work and completion hooks.
+They share permission checks, link resolution and immutable publication with
+the existing conditional-content operations. A stale owner refuses before
+staging content; retirement during an admitted write is checked again in its
+final metadata transaction. A cancelled RPC must leave its blocking worker
+running with this handle until the actual operation finishes.
+
 These lifetime controls do not yet start a reclamation worker or wire every
 consumer's content publisher. The product deletion gate stays closed until
-those integrations are accepted.
+those integrations are accepted. The ordinary, unguarded content and syscall
+surfaces retain their existing contracts and do not qualify physical cleanup.
+
+The typed `ReadGuarded`/`WriteGuarded` RPC pair carries a required owner token
+and preserves the existing authenticated identity, runtime gateway delegation
+and request envelope. An older server returns `UNIMPLEMENTED`; a client must
+not retry through an unguarded operation. The blocking and asynchronous Rust
+clients share conditional response decoding, including uncertain write results.
+Server workers retain their Kernel I/O handle after the RPC reply is cancelled.
+These data operations do not grant clients owner admission or retirement rights.
 
 ## Acceptance and remaining integration
 

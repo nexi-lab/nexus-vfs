@@ -2,6 +2,7 @@
 
 use crate::abc::object_store::WriteResult;
 use crate::cas_engine::CASError;
+use crate::extensions::guarded_records::RecordIoGuard;
 use crate::meta_store::{
     ConditionalMetadataError, ConditionalMetadataResult, FileMetadata, MetadataSnapshot, DT_REG,
 };
@@ -75,22 +76,24 @@ impl Kernel {
         path: &str,
         ctx: &OperationContext,
     ) -> Result<Option<VersionedContent>, ConditionalContentError> {
-        self.read_versioned_content_at(path, ctx, 1)
+        self.read_versioned_content_at(path, ctx, None, 1)
     }
 
-    fn read_versioned_content_at(
+    pub(super) fn read_versioned_content_at(
         &self,
         path: &str,
         ctx: &OperationContext,
+        owner_version: Option<&[u8]>,
         link_hops: u8,
     ) -> Result<Option<VersionedContent>, ConditionalContentError> {
         validate_path_fast(path)?;
         self.apply_read_hooks(path, ctx)?;
         if let Some(target) = self.directory_link_target(path, &ctx.zone_id)? {
             require_link_hop(path, link_hops)?;
-            return self.read_versioned_content_at(&target, ctx, link_hops - 1);
+            return self.read_versioned_content_at(&target, ctx, owner_version, link_hops - 1);
         }
         let route = self.conditional_content_route(path, ctx)?;
+        let _io = self.content_io_guard(path, &route, owner_version)?;
         let Some(snapshot) = self.conditional_content_snapshot(path, &route)? else {
             return Ok(None);
         };
@@ -136,15 +139,16 @@ impl Kernel {
         content: &[u8],
         expected_version: Option<&[u8]>,
     ) -> Result<ConditionalContentResult, ConditionalContentError> {
-        self.replace_content_if_version_at(path, ctx, content, expected_version, 1)
+        self.replace_content_if_version_at(path, ctx, content, expected_version, None, 1)
     }
 
-    fn replace_content_if_version_at(
+    pub(super) fn replace_content_if_version_at(
         &self,
         path: &str,
         ctx: &OperationContext,
         content: &[u8],
         expected_version: Option<&[u8]>,
+        owner_version: Option<&[u8]>,
         link_hops: u8,
     ) -> Result<ConditionalContentResult, ConditionalContentError> {
         validate_path_fast(path)?;
@@ -157,10 +161,12 @@ impl Kernel {
                 ctx,
                 content,
                 expected_version,
+                owner_version,
                 link_hops - 1,
             );
         }
         let route = self.conditional_content_route(path, ctx)?;
+        let _io = self.content_io_guard(path, &route, owner_version)?;
         let old = self.conditional_content_snapshot(path, &route)?;
         if let Some(snapshot) = &old {
             require_regular(&snapshot.metadata)?;
@@ -189,12 +195,17 @@ impl Kernel {
         );
         let result = self
             .with_metastore_route(&route, |store| {
-                let operation = store
-                    .as_conditional_metadata()
-                    .ok_or(ConditionalContentError::Unsupported)?;
-                operation
-                    .replace_if_version(path, metadata, expected_version)
-                    .map_err(ConditionalContentError::from)
+                match owner_version {
+                    Some(owner_version) => store
+                        .as_guarded_records()
+                        .ok_or(ConditionalContentError::Unsupported)?
+                        .replace_guarded_record(path, metadata, expected_version, owner_version),
+                    None => store
+                        .as_conditional_metadata()
+                        .ok_or(ConditionalContentError::Unsupported)?
+                        .replace_if_version(path, metadata, expected_version),
+                }
+                .map_err(ConditionalContentError::from)
             })
             .ok_or(ConditionalContentError::Unsupported)??;
         Ok(match result {
@@ -206,6 +217,26 @@ impl Kernel {
                 ConditionalContentResult::Conflict { current_version }
             }
         })
+    }
+
+    fn content_io_guard(
+        &self,
+        path: &str,
+        route: &RouteResult,
+        owner_version: Option<&[u8]>,
+    ) -> Result<Option<Box<dyn RecordIoGuard>>, ConditionalContentError> {
+        let Some(owner_version) = owner_version else {
+            return Ok(None);
+        };
+        self.with_metastore_route(route, |store| {
+            store
+                .as_guarded_records()
+                .ok_or(ConditionalContentError::Unsupported)?
+                .begin_record_io(path, owner_version)
+                .map(Some)
+                .map_err(ConditionalContentError::from)
+        })
+        .ok_or(ConditionalContentError::Unsupported)?
     }
 
     pub(super) fn conditional_content_route(
