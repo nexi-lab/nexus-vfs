@@ -110,6 +110,15 @@ ingress node — draws on **BlockA2A** (Zhenhua Zou, Zhuotao Liu et al.,
 
 ## Managed-agent durable session recovery
 
+Agent registry mutations retain the exact registry incarnation authorized by
+the request's ownership check. State updates, heartbeats, signals and removal
+do not follow a PID that was reused while the request was in progress, and
+responses do not read a replacement process's descriptor. This fence uses the
+existing native `AgentInstance`; it does not change generic Call payloads.
+Independent CLI discovery still needs a host-scoped instance identity in its
+registration and query contract: a PID-only request cannot identify an earlier
+incarnation that had already exited before the request arrived.
+
 `managed_agent.start_session_v1` retains its existing `session_id` response:
 this is the registry pid used by `get_session_v1`, `cancel_v1`, and `/proc`.
 An in-process runtime can additionally return `durable_session_id`, the key of

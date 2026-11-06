@@ -12,7 +12,8 @@ use std::sync::Arc;
 
 use contracts::{resolve_agent_owner, resolve_agent_zone, AgentContextError, RustCallError};
 use kernel::core::agents::registry::{
-    AgentDescriptor, AgentError, AgentKind, AgentSignal, AgentState, ExternalProcessInfo,
+    AgentDescriptor, AgentError, AgentInstance, AgentKind, AgentSignal, AgentState,
+    ExternalProcessInfo,
 };
 use kernel::kernel::vfs_proto::CallResponse;
 use kernel::kernel::{Kernel, OperationContext};
@@ -219,8 +220,8 @@ fn authorize_agent_owner(
     kernel: &Arc<Kernel>,
     ctx: &OperationContext,
     pid: &str,
-) -> Result<(), Vec<u8>> {
-    let descriptor = kernel.agent_registry().get(pid).ok_or_else(|| {
+) -> Result<AgentInstance, Vec<u8>> {
+    let (instance, descriptor) = kernel.agent_registry().get_instance(pid).ok_or_else(|| {
         call_err(
             RpcErrorCode::FileNotFound,
             &format!("process not found: {pid}"),
@@ -231,7 +232,14 @@ fn authorize_agent_owner(
             "agent operation requires ownership or administrator privileges",
         ));
     }
-    Ok(())
+    Ok(instance)
+}
+
+fn agent_not_found(pid: &str) -> Vec<u8> {
+    call_err(
+        RpcErrorCode::FileNotFound,
+        &format!("process not found: {pid}"),
+    )
 }
 
 fn agent_descriptor_to_json(desc: &AgentDescriptor) -> serde_json::Value {
@@ -352,8 +360,11 @@ fn do_agent_unregister(
     params: &serde_json::Value,
 ) -> Result<Vec<u8>, Vec<u8>> {
     let pid = s(params, "pid");
-    authorize_agent_owner(kernel, ctx, &pid)?;
-    let removed = kernel.agent_registry().unregister(&pid).is_some();
+    let instance = authorize_agent_owner(kernel, ctx, &pid)?;
+    let removed = kernel
+        .agent_registry()
+        .unregister_instance(&instance)
+        .is_some();
     ok_json(serde_json::json!(removed))
 }
 
@@ -363,12 +374,15 @@ fn do_agent_unregister_external(
     params: &serde_json::Value,
 ) -> Result<Vec<u8>, Vec<u8>> {
     let pid = s(params, "pid");
-    authorize_agent_owner(kernel, ctx, &pid)?;
-    kernel
+    let instance = authorize_agent_owner(kernel, ctx, &pid)?;
+    let removed = kernel
         .agent_registry()
-        .unregister_external(&pid)
+        .unregister_external_instance(&instance)
         .map_err(agent_err_to_payload)?;
-    ok_json(serde_json::json!(true))
+    if !removed {
+        return Err(agent_not_found(&pid));
+    }
+    ok_json(serde_json::json!(removed))
 }
 
 /// Same ownership rule as every other agent method: the descriptor a
@@ -428,7 +442,7 @@ fn do_agent_update_state(
     params: &serde_json::Value,
 ) -> Result<Vec<u8>, Vec<u8>> {
     let pid = s(params, "pid");
-    authorize_agent_owner(kernel, ctx, &pid)?;
+    let instance = authorize_agent_owner(kernel, ctx, &pid)?;
     let state = opt_s(params, "state")
         .or_else(|| opt_s(params, "new_state"))
         .and_then(|s| AgentState::from_str(&s))
@@ -438,18 +452,15 @@ fn do_agent_update_state(
                 "invalid or missing agent state",
             )
         })?;
-    match kernel.agent_registry().update_state(&pid, state) {
-        Ok(true) => match kernel.agent_registry().get(&pid) {
+    match kernel
+        .agent_registry()
+        .update_instance_state(&instance, state, None)
+    {
+        Ok(true) => match kernel.agent_registry().get_instance_descriptor(&instance) {
             Some(desc) => ok_json(agent_descriptor_to_json(&desc)),
-            None => Err(call_err(
-                RpcErrorCode::FileNotFound,
-                &format!("process not found: {pid}"),
-            )),
+            None => Err(agent_not_found(&pid)),
         },
-        Ok(false) => Err(call_err(
-            RpcErrorCode::FileNotFound,
-            &format!("process not found: {pid}"),
-        )),
+        Ok(false) => Err(agent_not_found(&pid)),
         Err(err) => Err(agent_err_to_payload(err)),
     }
 }
@@ -460,7 +471,7 @@ fn do_agent_signal(
     params: &serde_json::Value,
 ) -> Result<Vec<u8>, Vec<u8>> {
     let pid = s(params, "pid");
-    authorize_agent_owner(kernel, ctx, &pid)?;
+    let instance = authorize_agent_owner(kernel, ctx, &pid)?;
     let sig = opt_s(params, "sig")
         .or_else(|| opt_s(params, "signal"))
         .and_then(|s| AgentSignal::from_str(&s))
@@ -487,8 +498,9 @@ fn do_agent_signal(
 
     let desc = kernel
         .agent_registry()
-        .signal(&pid, sig, payload)
-        .map_err(agent_err_to_payload)?;
+        .signal_instance(&instance, sig, payload)
+        .map_err(agent_err_to_payload)?
+        .ok_or_else(|| agent_not_found(&pid))?;
     ok_json(agent_descriptor_to_json(&desc))
 }
 
@@ -498,23 +510,77 @@ fn do_agent_heartbeat(
     params: &serde_json::Value,
 ) -> Result<Vec<u8>, Vec<u8>> {
     let pid = s(params, "pid");
-    authorize_agent_owner(kernel, ctx, &pid)?;
-    kernel
+    let instance = authorize_agent_owner(kernel, ctx, &pid)?;
+    let descriptor = kernel
         .agent_registry()
-        .heartbeat(&pid)
-        .map_err(agent_err_to_payload)?;
-    match kernel.agent_registry().get(&pid) {
-        Some(desc) => ok_json(agent_descriptor_to_json(&desc)),
-        None => Err(call_err(
-            RpcErrorCode::FileNotFound,
-            &format!("process not found: {pid}"),
-        )),
-    }
+        .heartbeat_instance(&instance)
+        .map_err(agent_err_to_payload)?
+        .ok_or_else(|| agent_not_found(&pid))?;
+    ok_json(agent_descriptor_to_json(&descriptor))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authorized_instance_does_not_follow_a_pid_reassigned_to_another_owner() {
+        let kernel = Arc::new(Kernel::new());
+        let owner = OperationContext::new("alice", "alpha", false, None, false);
+        let descriptor = kernel
+            .agent_registry()
+            .register_external(
+                "same-agent".into(),
+                "alice".into(),
+                "alpha".into(),
+                "same-connection".into(),
+                Some(42),
+                None,
+                None,
+                "grpc".into(),
+                None,
+                HashMap::new(),
+            )
+            .unwrap();
+        let authorized = authorize_agent_owner(&kernel, &owner, "42").unwrap();
+        kernel.agent_registry().unregister("42").unwrap();
+        let mut replacement = descriptor;
+        replacement.owner_id = "bob".into();
+        replacement.last_heartbeat_ms = Some(1000);
+        assert!(kernel.agent_registry().register(replacement));
+
+        assert!(!kernel
+            .agent_registry()
+            .update_instance_state(&authorized, AgentState::WarmingUp, None)
+            .unwrap());
+        assert!(kernel
+            .agent_registry()
+            .heartbeat_instance(&authorized)
+            .unwrap()
+            .is_none());
+        assert!(kernel
+            .agent_registry()
+            .signal_instance(&authorized, AgentSignal::Sigkill, None)
+            .unwrap()
+            .is_none());
+        assert!(!kernel
+            .agent_registry()
+            .unregister_external_instance(&authorized)
+            .unwrap());
+        assert!(kernel
+            .agent_registry()
+            .unregister_instance(&authorized)
+            .is_none());
+        assert!(kernel
+            .agent_registry()
+            .get_instance_descriptor(&authorized)
+            .is_none());
+        let current = kernel.agent_registry().get("42").unwrap();
+        assert_eq!(current.owner_id, "bob");
+        assert_eq!(current.state, AgentState::Registered);
+        assert_eq!(current.last_heartbeat_ms, Some(1000));
+        assert!(authorize_agent_owner(&kernel, &owner, "42").is_err());
+    }
 
     fn result_payload(response: kernel::kernel::vfs_proto::CallResponse) -> serde_json::Value {
         let payload: serde_json::Value =
