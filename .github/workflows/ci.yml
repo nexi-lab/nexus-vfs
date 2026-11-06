@@ -112,6 +112,17 @@ jobs:
           path: ${{ runner.temp }}/durable-runtime-bundle
       - name: Restore the verified executables for this source tree
         run: python3 scripts/e2e/durable_artifacts.py restore --directory "$RUNNER_TEMP/durable-runtime-bundle"
+      - name: Prepare the official previous storage reader
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir "$RUNNER_TEMP/record-guard-prior"
+          gh release download v0.8.29-rc.5 --repo nexi-lab/nexus-vfs --pattern nexusd-cluster-linux-x86_64.tar.gz --dir "$RUNNER_TEMP/record-guard-prior"
+          cd "$RUNNER_TEMP/record-guard-prior"
+          echo 'f8fdfe2b549ad6a34700fde1697daeb77737361f0b4d43faf91963fe2e8f5e6d  nexusd-cluster-linux-x86_64.tar.gz' | sha256sum --check --strict
+          tar --extract --gzip --file nexusd-cluster-linux-x86_64.tar.gz
+          test -x "$PWD/nexusd-cluster-linux-x86_64/nexusd-cluster"
+          echo "NEXUS_RECORD_GUARD_PRIOR_BINARY=$PWD/nexusd-cluster-linux-x86_64/nexusd-cluster" >> "$GITHUB_ENV"
       - name: Verify native owner, peer, content, stream and protected-record recovery
         run: python3 scripts/e2e/durable_artifacts.py native --directory "$RUNNER_TEMP/durable-runtime-bundle"
       - uses: actions/checkout@v4

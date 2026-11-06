@@ -96,6 +96,9 @@ def restore(directory, root):
 
 def native(directory):
     assert os.getpriority(os.PRIO_PROCESS, 0) == 0
+    # The protected-record journey must actually exercise the previous reader;
+    # omitting its external artifact must not turn that check into a CI pass.
+    assert Path(os.environ['NEXUS_RECORD_GUARD_PRIOR_BINARY']).is_file()
     executables = load_executables(directory/'artifacts.json', REQUIRED)
     manifest = json.loads((directory/'manifest.json').read_text())
     assert manifest['sourceTree'] == source_tree(Path.cwd().resolve())

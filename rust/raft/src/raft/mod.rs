@@ -65,9 +65,9 @@ pub use replication_log::ReplicationLog;
 pub use state_machine::MountApplyEvent;
 pub use state_machine::MountDecl;
 pub use state_machine::{
-    AppliedEntry, ApplyObserver, Command, CommandResult, FullStateMachine, HolderInfo,
-    LockAcquireResult, LockEntry, LockInfo, LockState, StateMachine, WitnessStateMachine,
-    WitnessStateMachineInMemory,
+    AppliedEntry, ApplyObserver, Command, CommandResult, FullStateMachine, GuardedRecordMutation,
+    HolderInfo, LockAcquireResult, LockEntry, LockInfo, LockState, StateMachine,
+    WitnessStateMachine, WitnessStateMachineInMemory,
 };
 
 pub use membership_policy::MembershipPolicy;

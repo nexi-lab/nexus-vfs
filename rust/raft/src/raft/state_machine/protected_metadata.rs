@@ -5,6 +5,10 @@ use super::*;
 
 const POLICY_PREFIX: &str = "protected:";
 const CONDITIONAL_ONLY: &[u8] = b"conditional-only-v1";
+const RECORD_OWNER: &[u8] = b"record-owner-v1";
+// The prior reader rejects this unknown requirement at boot/snapshot admission.
+// An ordinary later adoption must never downgrade this durable requirement.
+const GUARDED_RECORDS: &[u8] = b"guarded-records-v1";
 const REQUIREMENT: &str = "requires:protected-records-v1";
 
 fn requirement_key() -> Vec<u8> {
@@ -30,10 +34,18 @@ fn policy_key(path: &str) -> Vec<u8> {
 fn decode_policy(value: Option<Vec<u8>>) -> Result<bool> {
     match value {
         None => Ok(false),
-        Some(value) if value == CONDITIONAL_ONLY => Ok(true),
+        Some(value) if value == CONDITIONAL_ONLY || value == RECORD_OWNER => Ok(true),
         Some(_) => Err(super::super::RaftError::Storage(
             "invalid protected metadata policy".into(),
         )),
+    }
+}
+
+fn decode_requirement(value: Option<Vec<u8>>) -> Result<bool> {
+    match value.as_deref() {
+        None => Ok(false),
+        Some(CONDITIONAL_ONLY | GUARDED_RECORDS) => Ok(true),
+        Some(_) => Err(storage_error("unsupported protected-record storage format")),
     }
 }
 
@@ -67,7 +79,7 @@ impl FullStateMachine {
         policy: super::super::MembershipPolicy,
     ) -> Result<()> {
         validate_policy(
-            decode_policy(self.control_state.get(&requirement_key())?)?,
+            decode_requirement(self.control_state.get(&requirement_key())?)?,
             policy,
         )
     }
@@ -78,7 +90,7 @@ impl FullStateMachine {
     ) -> Result<()> {
         let key = String::from_utf8(requirement_key()).map_err(storage_error)?;
         validate_policy(
-            decode_policy(snapshot.control_state.get(&key).cloned())?,
+            decode_requirement(snapshot.control_state.get(&key).cloned())?,
             policy,
         )
     }
@@ -110,6 +122,14 @@ impl FullStateMachine {
         txn: &redb::WriteTransaction,
         path: &str,
     ) -> Result<bool> {
+        decode_policy(self.record_policy_in_txn(txn, path)?)
+    }
+
+    fn record_policy_in_txn(
+        &self,
+        txn: &redb::WriteTransaction,
+        path: &str,
+    ) -> Result<Option<Vec<u8>>> {
         let table = txn
             .open_table(redb::TableDefinition::<&[u8], &[u8]>::new(
                 self.control_state.name(),
@@ -119,7 +139,33 @@ impl FullStateMachine {
             .get(policy_key(path).as_slice())
             .map_err(storage_error)?
             .map(|v| v.value().to_vec());
-        decode_policy(value)
+        Ok(value)
+    }
+
+    pub(super) fn is_record_owner_in_txn(
+        &self,
+        txn: &redb::WriteTransaction,
+        path: &str,
+    ) -> Result<bool> {
+        Ok(self.record_policy_in_txn(txn, path)?.as_deref() == Some(RECORD_OWNER))
+    }
+
+    /// The existing policy is the role authority; no reverse binding index is
+    /// needed to keep an owner from later becoming another owner's child.
+    pub(super) fn mark_record_owner_in_txn(
+        &self,
+        txn: &redb::WriteTransaction,
+        path: &str,
+    ) -> Result<()> {
+        let mut table = txn
+            .open_table(redb::TableDefinition::<&[u8], &[u8]>::new(
+                self.control_state.name(),
+            ))
+            .map_err(storage_error)?;
+        table
+            .insert(policy_key(path).as_slice(), RECORD_OWNER)
+            .map_err(storage_error)?;
+        Ok(())
     }
 
     pub(super) fn adopt_protected_in_txn(
@@ -147,10 +193,36 @@ impl FullStateMachine {
         table
             .insert(policy_key(key).as_slice(), CONDITIONAL_ONLY)
             .map_err(storage_error)?;
-        table
-            .insert(requirement_key().as_slice(), CONDITIONAL_ONLY)
-            .map_err(storage_error)?;
+        drop(table);
+        self.require_record_format_in_txn(txn, false)?;
         Ok(CommandResult::ProtectedMetadata { protected: true })
+    }
+
+    pub(super) fn require_record_format_in_txn(
+        &self,
+        txn: &redb::WriteTransaction,
+        guarded: bool,
+    ) -> Result<()> {
+        let mut table = txn
+            .open_table(redb::TableDefinition::<&[u8], &[u8]>::new(
+                self.control_state.name(),
+            ))
+            .map_err(storage_error)?;
+        let key = requirement_key();
+        let current = table
+            .get(key.as_slice())
+            .map_err(storage_error)?
+            .map(|value| value.value().to_vec());
+        decode_requirement(current.clone())?;
+        let required = if guarded || current.as_deref() == Some(GUARDED_RECORDS) {
+            GUARDED_RECORDS
+        } else {
+            CONDITIONAL_ONLY
+        };
+        table
+            .insert(key.as_slice(), required)
+            .map_err(storage_error)?;
+        Ok(())
     }
 
     pub(super) fn ordinary_write_is_protected(&self, command: &Command) -> Result<bool> {

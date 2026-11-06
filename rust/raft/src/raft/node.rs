@@ -1392,6 +1392,23 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         }
     }
 
+    /// The storage owner uses the same qualified SC door as conditional files.
+    /// Generic, forwarded and EC proposal doors cannot submit these controls.
+    #[cfg(all(feature = "grpc", has_protos))]
+    pub(crate) async fn commit_record_storage(&self, command: Command) -> Result<CommandResult> {
+        if !matches!(
+            command,
+            Command::BindRecordGuard { .. }
+                | Command::GuardedRecord { .. }
+                | Command::RetireRecordGuard { .. }
+        ) {
+            return Err(RaftError::InvalidState(
+                "not a record storage command".into(),
+            ));
+        }
+        self.submit_conditional_storage(command).await
+    }
+
     #[cfg(all(feature = "grpc", has_protos))]
     pub(crate) async fn rename_metadata(
         &self,
