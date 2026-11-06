@@ -113,6 +113,31 @@ clients share conditional response decoding, including uncertain write results.
 Server workers retain their Kernel I/O handle after the RPC reply is cancelled.
 These data operations do not grant clients owner admission or retirement rights.
 
+## Trusted service controls
+
+The Kernel's regular-file control methods share the existing service-only
+protection boundary: `admit_record_content_io`, `bind_record_content_owner`,
+`retire_record_content_owner` and `try_exclude_retired_content_io`. They keep
+the caller's original identity, require metadata write permission, apply read
+hooks and recheck directory-link targets. They do not elevate an RPC caller.
+
+I/O enrollment qualifies the protected owner's exact immutable image and keeps
+its revision. Binding qualifies an existing regular file, or reserves an absent
+one, before the existing apply transaction compares that image. Both paths must
+use the same captured mount, backend and metastore; spell both through the same
+alias. These methods do not admit a legacy WAL or a cross-mount owner.
+
+Retirement preserves the owner's immutable application bytes and publishes the
+existing irreversible storage marker with its new revision. That marker is the
+authority. After an unknown reply, the service reads the current owner revision
+and validates it with the exclusion operation: `Ok(None)` confirms retirement
+while actual I/O remains, and `Ok(Some(handle))` additionally excludes that I/O.
+The service retains the handle through any future reclamation work. Neither
+result qualifies shared CAS reference ownership or starts reclamation.
+
+These controls currently serve native trusted services. RPC control admission,
+Session factory integration and automatic cleanup remain separate requirements.
+
 ## Acceptance and remaining integration
 
 `test_protected_zone_metadata` exercises the actual actor and durable database:
