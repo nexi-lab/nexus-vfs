@@ -121,9 +121,11 @@ protection boundary: `admit_record_content_io`, `bind_record_content_owner`,
 the caller's original identity, require metadata write permission, apply read
 hooks and recheck directory-link targets. They do not elevate an RPC caller.
 
-I/O enrollment qualifies the protected owner's exact immutable image and keeps
-its revision. Binding qualifies an existing regular file, or reserves an absent
-one, before the existing apply transaction compares that image. Both paths must
+Protect the owner's immutable image before metadata-only I/O enrollment, which
+keeps that image and revision. Binding holds the enrolled owner's native I/O
+guard while qualifying an existing regular file, or reserving an absent one,
+before the existing apply transaction compares that image. A retirement racing
+qualification cannot obtain exclusion while that actual work continues. Both paths must
 use the same captured mount, backend and metastore; spell both through the same
 alias. These methods do not admit a legacy WAL or a cross-mount owner.
 

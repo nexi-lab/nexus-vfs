@@ -18,7 +18,8 @@ fn storage_error(error: MetaStoreError) -> ConditionalContentError {
 impl Kernel {
     /// Enroll a fresh or quiescent protected owner for actual content I/O.
     /// The service must retire pre-enrollment consumers before calling this.
-    /// Qualification preserves its immutable image and exact revision.
+    /// Protect its immutable image with `protect_record_content` first. This
+    /// metadata-only enrollment preserves that image and its exact revision.
     pub fn admit_record_content_io(
         &self,
         path: &str,
@@ -27,20 +28,6 @@ impl Kernel {
     ) -> Result<(), ConditionalContentError> {
         let (path, route) = self.record_control_route(path, ctx)?;
         self.with_metastore_route(&route, |store| {
-            let snapshot = store
-                .as_conditional_metadata()
-                .ok_or(ConditionalContentError::Unsupported)?
-                .read_versioned(&path)?
-                .ok_or_else(|| {
-                    storage_error(MetaStoreError::IOError("record owner is absent".into()))
-                })?;
-            if snapshot.version != expected_version {
-                return Err(storage_error(MetaStoreError::IOError(
-                    "record owner revision changed".into(),
-                )));
-            }
-            self.qualify_record_content(&route, &snapshot.metadata)
-                .map_err(storage_error)?;
             store
                 .as_guarded_records()
                 .ok_or(ConditionalContentError::Unsupported)?
@@ -63,32 +50,33 @@ impl Kernel {
     ) -> Result<(), ConditionalContentError> {
         let (path, route) = self.record_control_route(path, ctx)?;
         let (owner_path, owner_route) = self.record_control_route(owner_path, ctx)?;
-        let fallback = self.metastore.read();
-        let store = route
-            .resolve_metastore(fallback.as_ref())
-            .ok_or(ConditionalContentError::Unsupported)?;
-        let owner_store = owner_route
-            .resolve_metastore(fallback.as_ref())
-            .ok_or(ConditionalContentError::Unsupported)?;
-        drop(fallback);
+        let same_store = match (&route.metastore, &owner_route.metastore) {
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+            (None, None) => true,
+            _ => false,
+        };
         if route.mount_point != owner_route.mount_point
             || route.zone_id != owner_route.zone_id
-            || !Arc::ptr_eq(&store, &owner_store)
+            || !same_store
             || !matches!((&route.backend, &owner_route.backend), (Some(left), Some(right)) if Arc::ptr_eq(left, right))
         {
             return Err(ConditionalContentError::Unsupported);
         }
-        let records = store
-            .as_guarded_records()
-            .ok_or(ConditionalContentError::Unsupported)?;
-        let metadata = store.get(&path).map_err(storage_error)?;
-        if let Some(metadata) = &metadata {
-            self.qualify_record_content(&route, metadata)
-                .map_err(storage_error)?;
-        }
-        records
-            .bind_record_guard(&path, metadata.as_ref(), &owner_path, owner_version)
-            .map_err(ConditionalContentError::from)
+        self.with_metastore_route(&route, |store| {
+            let records = store
+                .as_guarded_records()
+                .ok_or(ConditionalContentError::Unsupported)?;
+            let _io = records.begin_record_io(&owner_path, owner_version)?;
+            let metadata = store.get(&path).map_err(storage_error)?;
+            if let Some(metadata) = &metadata {
+                self.qualify_record_content(&route, metadata)
+                    .map_err(storage_error)?;
+            }
+            records
+                .bind_record_guard(&path, metadata.as_ref(), &owner_path, owner_version)
+                .map_err(ConditionalContentError::from)
+        })
+        .ok_or(ConditionalContentError::Unsupported)?
     }
 
     /// Permanently retire an owner without changing its immutable bytes.
