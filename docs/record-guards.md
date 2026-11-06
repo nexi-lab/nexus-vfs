@@ -31,6 +31,11 @@ Process IDs, wall clocks and advisory lease expiry do not authorize commits.
 Mutations, owner comparisons and `last_applied` commit in one transaction.
 The apply functions perform no blob I/O or background work.
 
+The existing stream wakeup observer also handles guarded appends. It uses the
+durably applied outcome: an assigned offset wakes local stream readers and file
+watches, while a refused ordinary or guarded append publishes no write event.
+The observer retains only a weak Kernel reference and performs no storage I/O.
+
 An owner key and its permanently bound record paths identify one storage
 incarnation. Persistent Agent/SID indexes and Agent mailbox cursors retain
 their independent lifetimes. They must not become children of a particular

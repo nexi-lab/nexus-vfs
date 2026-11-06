@@ -3,6 +3,79 @@
 use super::*;
 use kernel::meta_store::ConditionalMetadataResult;
 
+#[test]
+fn guarded_wal_append_wakes_a_parked_kernel_tail_through_its_mount() {
+    let fixture = Fixture::open();
+    let handle = admit(&fixture);
+    let path = "/state/history";
+    fixture
+        .store
+        .put(
+            path,
+            FileMetadata {
+                entry_type: kernel::meta_store::DT_STREAM,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    fixture
+        .store
+        .as_guarded_records()
+        .unwrap()
+        .bind_record_guard(
+            path,
+            fixture.store.get(path).unwrap().as_ref(),
+            OWNER,
+            &handle,
+        )
+        .unwrap();
+    // Use the actual production coordinator and its apply observer / cold
+    // materializer. The mounted spelling differs from the owning WAL path.
+    let ops = Arc::new(transport::federation::FederationClient::new(
+        fixture.kernel.runtime().clone(),
+        None,
+    ));
+    Arc::new(nexus_raft::distributed_coordinator::RaftDistributedCoordinator::new())
+        .install_with_kernel(
+            fixture.manager.clone(),
+            fixture.manager.runtime_handle(),
+            "127.0.0.1:0",
+            &fixture.kernel,
+            ops,
+        );
+    let (result, received) = std::sync::mpsc::channel();
+    let reader = {
+        let kernel = fixture.kernel.clone();
+        std::thread::spawn(move || {
+            result
+                .send(kernel.stream_read_at_blocking(path, 0, 10_000))
+                .unwrap();
+        })
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while fixture.kernel.stream_parked_readers(path, "root") != 1 {
+        assert!(std::time::Instant::now() < deadline, "tail never parked");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        fixture
+            .store
+            .as_guarded_records()
+            .unwrap()
+            .append_guarded_record(path, b"guarded durable turn", &handle)
+            .unwrap(),
+        0
+    );
+    let delivered = received.recv_timeout(Duration::from_secs(5));
+    reader.join().unwrap();
+    let (content, next) = delivered
+        .expect("the apply observer must wake the tail before its read timeout")
+        .unwrap();
+    assert_eq!(content, b"guarded durable turn");
+    assert_eq!(next, 1);
+    assert_eq!(fixture.kernel.stream_parked_readers(path, "root"), 0);
+}
+
 pub(super) const OWNER: &str = "/state/lifetime";
 pub(super) const RECORD: &str = "/state/register";
 

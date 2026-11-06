@@ -577,6 +577,9 @@ pub struct AppliedEntry<'a> {
     pub index: u64,
     /// The committed command.
     pub command: &'a Command,
+    /// Applied outcome. A committed proposal can still refuse its mutation;
+    /// observers must not report that refusal as a successful write.
+    pub result: &'a CommandResult,
     /// Key whose committed pre-image was a DT_MOUNT that this command
     /// removes / overwrites — captured before the write txn (the one
     /// fact not recomputable post-commit). ``None`` for everything else;
@@ -1275,7 +1278,13 @@ impl FullStateMachine {
     /// — ignoring the rest. Every observer runs under ``catch_unwind`` so
     /// a panicking one can't poison apply (raft's "apply must not fail").
     /// The no-observer path returns before building the entry.
-    fn emit_apply_observers(&self, index: u64, command: &Command, removed_mount_key: Option<&str>) {
+    fn emit_apply_observers(
+        &self,
+        index: u64,
+        command: &Command,
+        result: &CommandResult,
+        removed_mount_key: Option<&str>,
+    ) {
         // Snapshot the observer vec under the read lock, release before
         // invoking — observers must never reacquire this lock (a future
         // installer would deadlock) and must stay short to not stall the
@@ -1287,6 +1296,7 @@ impl FullStateMachine {
         let entry = AppliedEntry {
             index,
             command,
+            result,
             removed_mount_key,
         };
         for (_key, obs) in observers {
@@ -2487,8 +2497,10 @@ impl StateMachine for FullStateMachine {
         // via EC apply, so this is the sole + correct fire (no double-fire).
         // Skip on a stale-LWW no-op. EC applies carry no raft index — pass 0;
         // every registered observer keys on the command, not the index.
-        if applied && result.is_ok() {
-            self.emit_apply_observers(0, command, None);
+        if applied {
+            if let Ok(outcome) = &result {
+                self.emit_apply_observers(0, command, outcome, None);
+            }
         }
         result
     }
@@ -2684,7 +2696,7 @@ impl StateMachine for FullStateMachine {
         let removed_mount_key = delete_mount_key.as_deref();
         #[cfg(not(feature = "grpc"))]
         let removed_mount_key: Option<&str> = None;
-        self.emit_apply_observers(index, command, removed_mount_key);
+        self.emit_apply_observers(index, command, &result, removed_mount_key);
 
         Ok(result)
     }

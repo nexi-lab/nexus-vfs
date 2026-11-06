@@ -33,6 +33,8 @@ jobs:
       - run: cargo test -p raft@0.1.0 --lib -- zone_runtime::tests raft::storage::tests raft::replication_log::tests raft::zone_persistence::tests
       - name: Record I/O lifetime on the native filesystem
         run: 'cargo test --locked -p raft@0.1.0 --test test_protected_zone_metadata -- record_io::'
+      - name: Committed record notifications on the native filesystem
+        run: 'cargo test --locked -p raft@0.1.0 --test test_protected_zone_metadata -- record_wakeup::'
 
   # CAS has a different kernel feature/build graph. On Windows, compiling it
   # after both completed bootstrap suites exhausted the 25-minute job budget

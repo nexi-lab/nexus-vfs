@@ -14,7 +14,8 @@ use std::sync::{Arc, Weak};
 use kernel::core::stream::wal::watch_path_from_wal_stream_key;
 use kernel::kernel::Kernel;
 
-use crate::prelude::{AppliedEntry, Command, FullStateMachine, ZoneConsensus};
+use crate::prelude::{AppliedEntry, Command, CommandResult, FullStateMachine, ZoneConsensus};
+use crate::raft::GuardedRecordMutation;
 
 /// Install one keyed observer per zone consensus. Reinstallation replaces
 /// the observer; different zones have independent consensus instances.
@@ -30,7 +31,17 @@ pub fn install_stream_wakeup_observer(
     consensus.register_keyed_apply_observer(
         "a2a_stream_wakeup",
         Arc::new(move |entry: &AppliedEntry| {
-            if let Command::AppendStreamEntry { stream_prefix, .. } = &entry.command {
+            // The log also commits refusals. Only an assigned append offset
+            // proves that this entry actually published a stream record.
+            if !matches!(entry.result, CommandResult::Value(offset) if offset.len() == 8) {
+                return;
+            }
+            if let Command::AppendStreamEntry { stream_prefix, .. }
+            | Command::GuardedRecord {
+                mutation: GuardedRecordMutation::Append { stream_prefix, .. },
+                ..
+            } = &entry.command
+            {
                 if let Some(path) = watch_path_from_wal_stream_key(stream_prefix) {
                     if let Some(kernel) = kernel.upgrade() {
                         kernel.wake_stream_waiters_in_zone(path, &zone_id);
