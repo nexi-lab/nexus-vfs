@@ -120,6 +120,158 @@ impl Drop for Server {
 }
 
 #[test]
+fn guarded_rpc_keeps_owner_permissions_and_refuses_retired_publication() {
+    use super::guarded::{admit, retire, OWNER, RECORD};
+    let fixture = Fixture::open();
+    let handle = admit(&fixture);
+    let server = Server::open(&fixture);
+    let alice = server.client("alice");
+    let bob = server.client("bob");
+    let version = committed(
+        alice
+            .write_guarded(RECORD, b"guarded RPC content", None, &handle)
+            .unwrap(),
+    );
+    let snapshot = alice
+        .read_guarded("/alias/register", &handle)
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.content, b"guarded RPC content");
+    assert_eq!(snapshot.version, version);
+    assert!(matches!(
+        bob.read_guarded(RECORD, &handle),
+        Err(ConditionalContentError::Failed(_))
+    ));
+    assert!(matches!(
+        bob.write_guarded(RECORD, b"denied RPC payload", Some(&version), &handle),
+        Err(ConditionalContentError::Failed(_))
+    ));
+    assert!(matches!(
+        alice.write_guarded(RECORD, b"empty owner", Some(&version), &[]),
+        Err(ConditionalContentError::Failed(_))
+    ));
+    assert!(matches!(
+        alice.write_guarded(RECORD, b"empty expected version", Some(&[]), &handle),
+        Err(ConditionalContentError::Failed(_))
+    ));
+    let terminal = retire(fixture.store.as_ref(), &handle);
+    assert!(matches!(
+        alice.write_guarded(RECORD, b"retired RPC payload", Some(&version), &handle),
+        Err(ConditionalContentError::Failed(_))
+    ));
+    assert!(alice.read_guarded(RECORD, &terminal).is_err());
+    use kernel::abc::object_store::ObjectStore;
+    for content in [
+        b"denied RPC payload".as_slice(),
+        b"empty owner",
+        b"empty expected version",
+        b"retired RPC payload",
+    ] {
+        assert!(!fixture
+            .backend
+            .as_cas()
+            .unwrap()
+            .content_exists(&lib::hash::hash_content(content)));
+    }
+    assert!(fixture
+        .store
+        .as_guarded_records()
+        .unwrap()
+        .try_exclude_retired_record_io(OWNER, &terminal)
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn cancelled_guarded_rpc_keeps_its_blocking_worker_io_until_completion() {
+    use super::guarded::{admit, retire, OWNER, RECORD};
+    use kernel::kernel::vfs_proto::{
+        nexus_vfs_service_client::NexusVfsServiceClient, WriteGuardedRequest,
+    };
+    use std::sync::{mpsc, Mutex};
+
+    struct Completion {
+        entered: mpsc::Sender<()>,
+        resume: Mutex<mpsc::Receiver<()>>,
+    }
+    impl NativeInterceptHook for Completion {
+        fn name(&self) -> &str {
+            "guarded-rpc-completion"
+        }
+        fn on_post(&self, context: &HookContext) {
+            if matches!(context, HookContext::Write(_)) {
+                self.entered.send(()).unwrap();
+                self.resume
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+            }
+        }
+    }
+
+    let fixture = Fixture::open();
+    let handle = admit(&fixture);
+    let server = Server::open(&fixture);
+    let (entered, admission) = mpsc::channel();
+    let (resume, resumed) = mpsc::channel();
+    let service = fixture
+        .kernel
+        .enlist_hook_only_service("guarded-rpc-completion")
+        .unwrap();
+    fixture.kernel.register_service_hook(
+        &service,
+        Box::new(Completion {
+            entered,
+            resume: Mutex::new(resumed),
+        }),
+    );
+    let endpoint = server.endpoint.clone();
+    let owner_version = handle.clone();
+    let request = server.runtime.spawn(async move {
+        NexusVfsServiceClient::connect(endpoint)
+            .await
+            .unwrap()
+            .write_guarded(WriteGuardedRequest {
+                path: RECORD.into(),
+                content: b"real content before reply cancellation".to_vec(),
+                auth_token: "alice".into(),
+                expected_version: None,
+                owner_version,
+            })
+            .await
+    });
+    admission.recv_timeout(Duration::from_secs(10)).unwrap();
+    request.abort();
+    assert!(server.runtime.block_on(request).unwrap_err().is_cancelled());
+    let terminal = retire(fixture.store.as_ref(), &handle);
+    let records = fixture.store.as_guarded_records().unwrap();
+    assert!(records
+        .try_exclude_retired_record_io(OWNER, &terminal)
+        .unwrap()
+        .is_none());
+    resume.send(()).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let _exclusion = loop {
+        if let Some(guard) = records
+            .try_exclude_retired_record_io(OWNER, &terminal)
+            .unwrap()
+        {
+            break guard;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the completed worker retained its native I/O handle"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(server
+        .client("alice")
+        .write_guarded(RECORD, b"late completion", None, &handle)
+        .is_err());
+}
+
+#[test]
 fn metadata_mutation_authorization_is_shared_by_native_and_rpc_entrypoints() {
     use kernel::kernel::vfs_proto::{
         nexus_vfs_service_client::NexusVfsServiceClient, SetattrRequest,

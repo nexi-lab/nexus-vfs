@@ -35,12 +35,13 @@ use kernel::kernel::vfs_proto::{
     DeleteResponse, GetXattrBulkItem, GetXattrBulkRequest, GetXattrBulkResponse, GetXattrRequest,
     GetXattrResponse, InspectTargetRequest, InspectTargetResponse, IpcAck, IpcEmpty,
     IpcHasResponse, IpcPathRequest, LockRequest, LockResponse, MkdirRequest, MkdirResponse,
-    PingRequest, PingResponse, ReadRequest, ReadResponse, ReadVersionedRequest,
+    PingRequest, PingResponse, ReadGuardedRequest, ReadRequest, ReadResponse, ReadVersionedRequest,
     ReadVersionedResponse, ReaddirEntry, ReaddirRequest, ReaddirResponse, RenameRequest,
     RenameResponse, SetXattrRequest, SetXattrResponse, SetattrRequest, SetattrResponse,
     StatRequest, StatResponse, StreamCollectAllResponse, StreamReadAtRequest, StreamReadAtResponse,
     StreamWriteRequest, StreamWriteResponse, UnlockRequest, UnlockResponse, WatchRequest,
-    WatchResponse, WriteIfVersionRequest, WriteIfVersionResponse, WriteRequest, WriteResponse,
+    WatchResponse, WriteGuardedRequest, WriteIfVersionRequest, WriteIfVersionResponse,
+    WriteRequest, WriteResponse,
 };
 use kernel::kernel::{Kernel, KernelError, OperationContext};
 use kernel::Permission;
@@ -247,6 +248,7 @@ impl_authed_request!(
     MkdirRequest,
     PingRequest,
     ReadRequest,
+    ReadGuardedRequest,
     ReadVersionedRequest,
     ReaddirRequest,
     RenameRequest,
@@ -259,6 +261,7 @@ impl_authed_request!(
     UnlockRequest,
     WatchRequest,
     WriteRequest,
+    WriteGuardedRequest,
     WriteIfVersionRequest,
 );
 
@@ -679,6 +682,20 @@ where
 
 #[tonic::async_trait]
 impl NexusVfsService for VfsServiceImpl {
+    async fn read_guarded(
+        &self,
+        req: Request<ReadGuardedRequest>,
+    ) -> Result<Response<ReadVersionedResponse>, Status> {
+        self.read_guarded_content(req).await
+    }
+
+    async fn write_guarded(
+        &self,
+        req: Request<WriteGuardedRequest>,
+    ) -> Result<Response<WriteIfVersionResponse>, Status> {
+        self.write_guarded_content(req).await
+    }
+
     async fn read_versioned(
         &self,
         req: Request<ReadVersionedRequest>,
@@ -2383,6 +2400,18 @@ pub(crate) mod tests {
 
     #[tonic::async_trait]
     impl NexusVfsService for HubStub {
+        async fn read_guarded(
+            &self,
+            _: Request<ReadGuardedRequest>,
+        ) -> Result<Response<ReadVersionedResponse>, Status> {
+            Err(Status::unimplemented("guarded content is unsupported"))
+        }
+        async fn write_guarded(
+            &self,
+            _: Request<WriteGuardedRequest>,
+        ) -> Result<Response<WriteIfVersionResponse>, Status> {
+            Err(Status::unimplemented("guarded content is unsupported"))
+        }
         async fn read_versioned(
             &self,
             _: Request<ReadVersionedRequest>,

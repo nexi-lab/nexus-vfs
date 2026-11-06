@@ -7,6 +7,9 @@ mod rpc;
 #[path = "conditional_content/protection.rs"]
 mod protection;
 
+#[path = "conditional_content/guarded.rs"]
+mod guarded;
+
 #[path = "conditional_content/rename.rs"]
 mod rename;
 

@@ -138,6 +138,8 @@ gateway_methods! {
     write: WriteRequest => WriteResponse,
     read_versioned: ReadVersionedRequest => ReadVersionedResponse,
     write_if_version: WriteIfVersionRequest => WriteIfVersionResponse,
+    read_guarded: ReadGuardedRequest => ReadVersionedResponse,
+    write_guarded: WriteGuardedRequest => WriteIfVersionResponse,
     chmod: ChmodRequest => ChmodResponse,
     delete: DeleteRequest => DeleteResponse,
     mkdir: MkdirRequest => MkdirResponse,
