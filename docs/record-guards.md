@@ -122,7 +122,8 @@ the caller's original identity, require metadata write permission, apply read
 hooks and recheck directory-link targets. They do not elevate an RPC caller.
 
 Protect the owner's immutable image before metadata-only I/O enrollment, which
-keeps that image and revision. Binding holds the enrolled owner's native I/O
+keeps that image and revision. Read the revision after protection: initial
+protection or binding can allocate a new record revision. Binding holds the enrolled owner's native I/O
 guard while qualifying an existing regular file, or reserving an absent one,
 before the existing apply transaction compares that image. A retirement racing
 qualification cannot obtain exclusion while that actual work continues. Both paths must

@@ -221,18 +221,16 @@ fn binding_refuses_mixed_mount_authority_and_unqualified_content() {
         .kernel
         .bind_record_content_owner("/alias/register", "/alias/owner", &service(), &owner)
         .unwrap();
-    assert_eq!(
-        fixture
-            .kernel
-            .read_guarded_content(RECORD, &context(), &owner)
-            .unwrap()
-            .unwrap()
-            .version,
-        first
-    );
+    let bound = fixture
+        .kernel
+        .read_guarded_content(RECORD, &context(), &owner)
+        .unwrap()
+        .unwrap();
+    assert_eq!(bound.content, b"still writable");
+    assert_ne!(bound.version, first);
     assert!(fixture
         .kernel
-        .replace_content_if_version(RECORD, &context(), b"unguarded", Some(&first))
+        .replace_content_if_version(RECORD, &context(), b"unguarded", Some(&bound.version))
         .is_err());
 
     let invalid = "/state/missing-content";
