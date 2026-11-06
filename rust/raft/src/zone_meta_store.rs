@@ -554,6 +554,10 @@ pub(crate) fn kernel_to_proto(meta: &KernelFileMetadata) -> Vec<u8> {
 }
 
 impl MetaStore for ZoneMetaStore {
+    fn as_guarded_records(&self) -> Option<&dyn kernel::meta_store::GuardedRecords> {
+        self.conditional_metadata().map(|_| self as _)
+    }
+
     fn as_record_protection(&self) -> Option<&dyn kernel::meta_store::RecordProtection> {
         self.conditional_metadata().map(|_| self as _)
     }

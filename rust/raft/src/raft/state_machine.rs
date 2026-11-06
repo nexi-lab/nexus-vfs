@@ -307,6 +307,11 @@ pub enum Command {
         value: Vec<u8>,
         incarnation: [u8; 16],
     },
+    /// Enroll a fresh/quiescent owner in storage I/O lifetime tracking.
+    AdmitRecordIoOwner {
+        key: String,
+        expected_version: Vec<u8>,
+    },
 }
 
 impl Command {
@@ -319,6 +324,7 @@ impl Command {
                 | Self::BindRecordGuard { .. }
                 | Self::GuardedRecord { .. }
                 | Self::RetireRecordGuard { .. }
+                | Self::AdmitRecordIoOwner { .. }
         )
     }
 
@@ -986,6 +992,10 @@ fn decode_modified_at_unix(bytes: &[u8]) -> u64 {
 /// snapshots, the raft log is the durable record — advisory state is
 /// rebuilt by log replay on restart.
 pub struct FullStateMachine {
+    /// Local lifetime locks share this address across server/Kernel reopen.
+    /// This is not serialized, replicated or interpreted during Raft apply.
+    #[cfg(all(feature = "grpc", has_protos))]
+    record_io_directory: std::path::PathBuf,
     /// Metadata tree: path -> serialized FileMetadata.
     metadata: RedbTree,
     /// Raw-byte stream entries tree (R19.1b') — key -> opaque bytes.
@@ -1120,6 +1130,12 @@ impl FullStateMachine {
         };
 
         Ok(Self {
+            #[cfg(all(feature = "grpc", has_protos))]
+            record_io_directory: {
+                let mut path = store.path().as_os_str().to_owned();
+                path.push(".record-io");
+                path.into()
+            },
             metadata,
             stream_entries,
             control_state,
@@ -1868,7 +1884,8 @@ impl FullStateMachine {
             )),
             Command::WriteVersionedMetadata { .. } | Command::AdoptProtectedMetadata { .. }
                 | Command::RenameMetadata { .. } | Command::BindRecordGuard { .. }
-                | Command::GuardedRecord { .. } | Command::RetireRecordGuard { .. } => Err(super::RaftError::InvalidState(
+                | Command::GuardedRecord { .. } | Command::RetireRecordGuard { .. }
+                | Command::AdmitRecordIoOwner { .. } => Err(super::RaftError::InvalidState(
                 "versioned metadata requires a Raft-committed transaction".into(),
             )),
             Command::PutControlState {
@@ -1921,6 +1938,10 @@ impl FullStateMachine {
         let meta_def = redb::TableDefinition::<&[u8], &[u8]>::new(self.metadata.name());
 
         match command {
+            Command::AdmitRecordIoOwner {
+                key,
+                expected_version,
+            } => self.admit_record_io_in_txn(txn, key, expected_version),
             Command::BindRecordGuard {
                 key,
                 expected_image,

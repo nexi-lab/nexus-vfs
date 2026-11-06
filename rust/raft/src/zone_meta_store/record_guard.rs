@@ -8,6 +8,8 @@ use kernel::meta_store::{
     ConditionalMetadataError, ConditionalMetadataResult, FileMetadata, MetaStoreError,
 };
 
+mod io;
+
 fn refused(message: String) -> ConditionalMetadataError {
     ConditionalMetadataError::Failed(MetaStoreError::IOError(message))
 }
@@ -115,5 +117,73 @@ impl ZoneMetaStore {
             value: kernel_to_proto(&terminal_image),
             incarnation: rand::random(),
         })?)
+    }
+}
+
+impl kernel::meta_store::GuardedRecords for ZoneMetaStore {
+    fn admit_record_io_owner(
+        &self,
+        path: &str,
+        expected_version: &[u8],
+    ) -> Result<(), ConditionalMetadataError> {
+        Self::admit_record_io_owner(self, path, expected_version)
+    }
+
+    fn begin_record_io(
+        &self,
+        path: &str,
+        guard_version: &[u8],
+    ) -> Result<Box<dyn kernel::extensions::guarded_records::RecordIoGuard>, ConditionalMetadataError>
+    {
+        Self::begin_record_io(self, path, guard_version)
+    }
+
+    fn try_exclude_retired_record_io(
+        &self,
+        path: &str,
+        terminal_version: &[u8],
+    ) -> Result<
+        Option<Box<dyn kernel::extensions::guarded_records::RecordIoGuard>>,
+        ConditionalMetadataError,
+    > {
+        Self::try_exclude_retired_record_io(self, path, terminal_version)
+    }
+
+    fn bind_record_guard(
+        &self,
+        path: &str,
+        expected_image: Option<&FileMetadata>,
+        guard_path: &str,
+        guard_version: &[u8],
+    ) -> Result<(), ConditionalMetadataError> {
+        Self::bind_record_guard(self, path, expected_image, guard_path, guard_version)
+    }
+
+    fn replace_guarded_record(
+        &self,
+        path: &str,
+        metadata: FileMetadata,
+        expected_version: Option<&[u8]>,
+        guard_version: &[u8],
+    ) -> Result<ConditionalMetadataResult, ConditionalMetadataError> {
+        Self::replace_guarded_record(self, path, metadata, expected_version, guard_version)
+    }
+
+    fn append_guarded_record(
+        &self,
+        path: &str,
+        data: &[u8],
+        guard_version: &[u8],
+    ) -> Result<u64, ConditionalMetadataError> {
+        Self::append_guarded_record(self, path, data, guard_version)
+    }
+
+    fn retire_record_guard(
+        &self,
+        path: &str,
+        terminal_image: FileMetadata,
+        expected_version: &[u8],
+    ) -> Result<ConditionalMetadataResult, ConditionalMetadataError> {
+        Self::retire_record_guard(self, path, terminal_image, expected_version)
     }
 }

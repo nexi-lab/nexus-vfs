@@ -52,7 +52,15 @@ impl FullStateMachine {
     /// reads preserve their existing observation-only semantics.
     pub fn get_versioned_metadata(&self, key: &str) -> Result<VersionedMetadata> {
         let txn = self.metadata.raw_db().begin_read().map_err(storage_error)?;
-        if !is_managed_key(key) && !self.protected_in_read(&txn, key)? {
+        self.versioned_metadata_in_read(&txn, key)
+    }
+
+    pub(super) fn versioned_metadata_in_read(
+        &self,
+        txn: &redb::ReadTransaction,
+        key: &str,
+    ) -> Result<VersionedMetadata> {
+        if !is_managed_key(key) && !self.protected_in_read(txn, key)? {
             Self::require_managed_key(key)?;
         }
         let metadata = txn
