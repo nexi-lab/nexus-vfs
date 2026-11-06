@@ -117,3 +117,43 @@ impl ZoneMetaStore {
         })?)
     }
 }
+
+impl kernel::meta_store::GuardedRecords for ZoneMetaStore {
+    fn bind_record_guard(
+        &self,
+        path: &str,
+        expected_image: Option<&FileMetadata>,
+        guard_path: &str,
+        guard_version: &[u8],
+    ) -> Result<(), ConditionalMetadataError> {
+        Self::bind_record_guard(self, path, expected_image, guard_path, guard_version)
+    }
+
+    fn replace_guarded_record(
+        &self,
+        path: &str,
+        metadata: FileMetadata,
+        expected_version: Option<&[u8]>,
+        guard_version: &[u8],
+    ) -> Result<ConditionalMetadataResult, ConditionalMetadataError> {
+        Self::replace_guarded_record(self, path, metadata, expected_version, guard_version)
+    }
+
+    fn append_guarded_record(
+        &self,
+        path: &str,
+        data: &[u8],
+        guard_version: &[u8],
+    ) -> Result<u64, ConditionalMetadataError> {
+        Self::append_guarded_record(self, path, data, guard_version)
+    }
+
+    fn retire_record_guard(
+        &self,
+        path: &str,
+        terminal_image: FileMetadata,
+        expected_version: &[u8],
+    ) -> Result<ConditionalMetadataResult, ConditionalMetadataError> {
+        Self::retire_record_guard(self, path, terminal_image, expected_version)
+    }
+}

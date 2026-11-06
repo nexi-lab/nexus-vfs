@@ -279,6 +279,10 @@ fn legacy_images_and_unsupported_namespaces_fail_without_replacement() {
         .unwrap()
         .as_conditional_metadata()
         .is_none());
+    assert!(LocalMetaStore::in_memory()
+        .unwrap()
+        .as_guarded_records()
+        .is_none());
 }
 
 #[test]
@@ -306,6 +310,24 @@ fn managed_membership_keeps_the_optional_operations_closed() {
         MANAGED.into(),
     );
     assert!(store.as_conditional_metadata().is_none());
+    assert!(store.as_guarded_records().is_none());
+    let deferred = ZoneMetaStore::deferred_arc(
+        runtime.0.registry(),
+        "root",
+        runtime.0.runtime_handle(),
+        "/deferred".into(),
+        MANAGED.into(),
+    );
+    assert!(matches!(
+        deferred.as_guarded_records().unwrap().bind_record_guard(
+            "/deferred/record",
+            None,
+            "/deferred/owner",
+            &[1; 24]
+        ),
+        Err(ConditionalMetadataError::Unsupported)
+    ));
+    assert!(deferred.as_guarded_records().is_none());
     assert!(matches!(
         kernel::meta_store::ConditionalMetadata::read_versioned(&store, "/readers/file"),
         Err(ConditionalMetadataError::Unsupported)

@@ -22,11 +22,12 @@ fn admit(store: &ZoneMetaStore) -> Vec<u8> {
         )
         .unwrap();
     let history = store.get(HISTORY).unwrap().unwrap();
-    store
+    let guarded = store.as_guarded_records().unwrap();
+    guarded
         .bind_record_guard(HISTORY, Some(&history), OWNER, &owner.version)
         .unwrap();
     for record in [COMPLETION, ACK] {
-        store
+        guarded
             .bind_record_guard(record, None, OWNER, &owner.version)
             .unwrap();
     }
@@ -39,21 +40,22 @@ fn prepared_history_completion_and_ack_cannot_commit_after_retirement() {
     let runtime = Runtime::open(directory.path());
     let store = runtime.store("/", "/");
     let handle = admit(&store);
+    let guarded = store.as_guarded_records().unwrap();
     let prepared = image("prepared-before-delete");
     assert_eq!(
-        store
+        guarded
             .append_guarded_record(HISTORY, b"completed-turn", &handle)
             .unwrap(),
         0
     );
     assert!(matches!(
-        store
+        guarded
             .replace_guarded_record(COMPLETION, image("completed"), None, &handle)
             .unwrap(),
         ConditionalMetadataResult::Committed { .. }
     ));
     let completion = store.read_versioned(COMPLETION).unwrap().unwrap();
-    let terminal = store
+    let terminal = guarded
         .retire_record_guard(OWNER, image("deleted"), &handle)
         .unwrap();
     let ConditionalMetadataResult::Committed {
@@ -63,19 +65,19 @@ fn prepared_history_completion_and_ack_cannot_commit_after_retirement() {
         panic!("retirement must commit");
     };
 
-    assert!(store
+    assert!(guarded
         .append_guarded_record(HISTORY, b"old-runtime-reconnected", &handle)
         .is_err());
-    assert!(store
+    assert!(guarded
         .replace_guarded_record(COMPLETION, prepared, Some(&completion.version), &handle)
         .is_err());
-    assert!(store
+    assert!(guarded
         .replace_guarded_record(ACK, image("late-ack"), None, &handle)
         .is_err());
-    assert!(store
+    assert!(guarded
         .bind_record_guard("/sessions/session-a/new-writer", None, OWNER, &handle)
         .is_err());
-    assert!(store
+    assert!(guarded
         .bind_record_guard(
             "/sessions/session-a/new-writer",
             None,
