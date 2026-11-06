@@ -62,6 +62,7 @@ use prost::Message;
 mod cache;
 mod conditional;
 mod protected;
+mod record_guard;
 use cache::MetadataCache;
 
 fn require_metadata_success(
@@ -172,7 +173,13 @@ fn register_cache_invalidator(
             | Command::CasSetMetadata { key, .. }
             | Command::DeleteMetadata { key }
             | Command::WriteVersionedMetadata { key, .. }
-            | Command::AdoptProtectedMetadata { key, .. } => key.as_str(),
+            | Command::AdoptProtectedMetadata { key, .. }
+            | Command::BindRecordGuard { key, .. }
+            | Command::RetireRecordGuard { key, .. }
+            | Command::GuardedRecord {
+                mutation: crate::raft::GuardedRecordMutation::ReplaceMetadata { key, .. },
+                ..
+            } => key.as_str(),
             _ => return,
         };
         // Every mount on this zone observes every key it commits, so a key

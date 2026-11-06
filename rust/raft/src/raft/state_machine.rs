@@ -24,7 +24,9 @@ use super::Result;
 mod conditional_metadata;
 mod metadata_rename;
 mod protected_metadata;
+mod record_guard;
 pub use conditional_metadata::VersionedMetadata;
+pub use record_guard::GuardedRecordMutation;
 
 /// Command to be replicated through Raft.
 ///
@@ -282,6 +284,29 @@ pub enum Command {
         new_key: String,
         is_pas: bool,
     },
+    /// Bind the exact record image to a protected owner revision. The binding
+    /// and conditional-only policy are permanent, including while absent.
+    BindRecordGuard {
+        key: String,
+        expected_image: Option<Vec<u8>>,
+        guard_key: String,
+        guard_version: Vec<u8>,
+        incarnation: [u8; 16],
+    },
+    /// Execute one typed record mutation and its owner comparison in the SAME
+    /// apply transaction. This finite payload cannot contain nested commands.
+    GuardedRecord {
+        guard_version: Vec<u8>,
+        mutation: GuardedRecordMutation,
+    },
+    /// Publish the owner's terminal image and permanently revoke its handles.
+    /// The retained retirement record is also durable cleanup intent.
+    RetireRecordGuard {
+        key: String,
+        expected_version: Vec<u8>,
+        value: Vec<u8>,
+        incarnation: [u8; 16],
+    },
 }
 
 impl Command {
@@ -291,6 +316,9 @@ impl Command {
             Self::WriteVersionedMetadata { .. }
                 | Self::AdoptProtectedMetadata { .. }
                 | Self::RenameMetadata { .. }
+                | Self::BindRecordGuard { .. }
+                | Self::GuardedRecord { .. }
+                | Self::RetireRecordGuard { .. }
         )
     }
 
@@ -1839,7 +1867,8 @@ impl FullStateMachine {
                     .into(),
             )),
             Command::WriteVersionedMetadata { .. } | Command::AdoptProtectedMetadata { .. }
-                | Command::RenameMetadata { .. } => Err(super::RaftError::InvalidState(
+                | Command::RenameMetadata { .. } | Command::BindRecordGuard { .. }
+                | Command::GuardedRecord { .. } | Command::RetireRecordGuard { .. } => Err(super::RaftError::InvalidState(
                 "versioned metadata requires a Raft-committed transaction".into(),
             )),
             Command::PutControlState {
@@ -1881,6 +1910,9 @@ impl FullStateMachine {
         txn: &redb::WriteTransaction,
         command: &Command,
     ) -> Result<CommandResult> {
+        if let Some(refusal) = self.record_guard_refusal(txn, command)? {
+            return Ok(refusal);
+        }
         if let Some(key) = command.ordinary_metadata_key() {
             if let Some(refusal) = self.ordinary_metadata_refusal(txn, key)? {
                 return Ok(refusal);
@@ -1889,6 +1921,26 @@ impl FullStateMachine {
         let meta_def = redb::TableDefinition::<&[u8], &[u8]>::new(self.metadata.name());
 
         match command {
+            Command::BindRecordGuard {
+                key,
+                expected_image,
+                guard_key,
+                guard_version,
+                incarnation,
+            } => self.bind_record_guard_in_txn(
+                txn,
+                key,
+                expected_image.as_deref(),
+                guard_key,
+                guard_version,
+                *incarnation,
+            ),
+            Command::RetireRecordGuard {
+                key,
+                expected_version,
+                value,
+                incarnation,
+            } => self.retire_record_guard_in_txn(txn, key, expected_version, value, *incarnation),
             Command::SetMetadata { key, value } => {
                 self.refresh_tracked_version(txn, key)?;
                 let mut table = txn
@@ -1968,6 +2020,14 @@ impl FullStateMachine {
             Command::AppendStreamEntry {
                 stream_prefix,
                 data,
+            }
+            | Command::GuardedRecord {
+                mutation:
+                    GuardedRecordMutation::Append {
+                        stream_prefix,
+                        data,
+                    },
+                ..
             } => {
                 // Assign the offset HERE, at raft apply, in committed order — so
                 // a total order holds even across concurrent writers (the log
@@ -2005,6 +2065,18 @@ impl FullStateMachine {
                 content_id,
                 origin,
                 size,
+            }
+            | Command::GuardedRecord {
+                mutation:
+                    GuardedRecordMutation::Seal {
+                        stream_prefix,
+                        base,
+                        end,
+                        content_id,
+                        origin,
+                        size,
+                    },
+                ..
             } => {
                 // Deterministic, redb-only tiered-storage roll: write the cold
                 // segment index record, delete the sealed hot rows, advance the
@@ -2073,6 +2145,15 @@ impl FullStateMachine {
             Command::TrimStreamSegment {
                 stream_prefix,
                 up_to_seq,
+                ..
+            }
+            | Command::GuardedRecord {
+                mutation:
+                    GuardedRecordMutation::Trim {
+                        stream_prefix,
+                        up_to_seq,
+                        ..
+                    },
                 ..
             } => {
                 // Deterministic, redb-only retention trim: drop the cold segment
@@ -2199,6 +2280,16 @@ impl FullStateMachine {
                 value,
                 expected,
                 incarnation,
+            }
+            | Command::GuardedRecord {
+                mutation:
+                    GuardedRecordMutation::ReplaceMetadata {
+                        key,
+                        value,
+                        expected,
+                        incarnation,
+                    },
+                ..
             } => self.write_versioned_in_txn(txn, key, value, expected.as_deref(), *incarnation),
 
             Command::AdoptProtectedMetadata {

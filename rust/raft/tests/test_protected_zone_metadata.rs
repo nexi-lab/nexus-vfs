@@ -15,6 +15,9 @@ use std::time::Duration;
 
 const PATH: &str = "/conversations/stable-cid/readers/agent-a";
 
+#[path = "protected_zone_metadata/record_guard.rs"]
+mod record_guard;
+
 struct Runtime(Arc<ZoneManager>);
 
 impl Runtime {

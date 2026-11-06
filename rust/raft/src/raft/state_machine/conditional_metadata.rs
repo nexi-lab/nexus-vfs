@@ -121,7 +121,11 @@ impl FullStateMachine {
         Ok(value)
     }
 
-    fn revision_in_txn(&self, txn: &redb::WriteTransaction, key: &str) -> Result<Option<Vec<u8>>> {
+    pub(super) fn revision_in_txn(
+        &self,
+        txn: &redb::WriteTransaction,
+        key: &str,
+    ) -> Result<Option<Vec<u8>>> {
         let table = txn
             .open_table(redb::TableDefinition::<&[u8], &[u8]>::new(
                 self.control_state.name(),
