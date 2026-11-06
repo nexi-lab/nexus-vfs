@@ -10,11 +10,17 @@ fn service() -> OperationContext {
 }
 
 fn prepare(fixture: &Fixture) -> Vec<u8> {
-    let version = fixture.replace(OWNER, b"immutable owner payload", None);
+    fixture.replace(OWNER, b"immutable owner payload", None);
     fixture
         .kernel
         .protect_record_content(OWNER, &service())
         .unwrap();
+    let version = fixture
+        .kernel
+        .read_versioned_content(OWNER, &service())
+        .unwrap()
+        .unwrap()
+        .version;
     fixture
         .kernel
         .admit_record_content_io(OWNER, &service(), &version)
@@ -253,11 +259,17 @@ fn binding_refuses_mixed_mount_authority_and_unqualified_content() {
 #[test]
 fn terminal_readback_and_refusal_survive_restart_without_reclaiming_other_objects() {
     let fixture = Fixture::open();
-    let version = fixture.replace(OWNER, b"immutable owner payload", None);
+    fixture.replace(OWNER, b"immutable owner payload", None);
     fixture
         .kernel
         .protect_record_content(OWNER, &service())
         .unwrap();
+    let version = fixture
+        .kernel
+        .read_versioned_content(OWNER, &service())
+        .unwrap()
+        .unwrap()
+        .version;
     assert!(fixture
         .kernel
         .admit_record_content_io(OWNER, &service(), b"stale owner")
