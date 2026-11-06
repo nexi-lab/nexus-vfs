@@ -23,8 +23,8 @@ impl SpawnHandle for Handle {
     fn session_endpoint(&self) -> Option<&a2a::session::SessionEndpoint> {
         Some(&self.0)
     }
-    fn durable_session_id(&self) -> Option<&str> {
-        Some("session-original-managed-runtime")
+    fn durable_session_id(&self) -> Option<String> {
+        Some("session-original-managed-runtime".into())
     }
 }
 impl SpawnTask<Kernel> for Host {
