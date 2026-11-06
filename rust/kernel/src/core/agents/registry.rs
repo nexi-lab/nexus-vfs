@@ -444,17 +444,6 @@ impl AgentRegistry {
         }
     }
 
-    fn wake(&self, pid: &str) {
-        let notify = self
-            .agents
-            .get(pid)
-            .map(|record| Arc::clone(&record.identity));
-        if let Some(notify) = notify {
-            let _guard = notify.mutex.lock();
-            notify.state_changed.notify_all();
-        }
-    }
-
     /// Register a pre-built descriptor. Returns true if inserted (pid was
     /// new). Used by Rust callers that already constructed a descriptor;
     /// most call sites should prefer ``spawn``.
@@ -579,6 +568,11 @@ impl AgentRegistry {
         self.remove_instance(pid, None, false)
     }
 
+    /// Remove only the captured incarnation, without reaping its parent link.
+    pub fn unregister_instance(&self, instance: &AgentInstance) -> Option<AgentDescriptor> {
+        self.remove_instance(&instance.pid, Some(instance), false)
+    }
+
     /// Reap a process and remove it from its parent's child list.
     /// A termination callback keeps its incarnation reserved until cleanup ends.
     pub fn reap(&self, pid: &str) -> bool {
@@ -648,6 +642,12 @@ impl AgentRegistry {
             return None;
         }
         Some((record.instance(), record.descriptor.clone()))
+    }
+
+    /// Read a descriptor only while the captured incarnation is still present.
+    pub fn get_instance_descriptor(&self, instance: &AgentInstance) -> Option<AgentDescriptor> {
+        let record = self.agents.get(&instance.pid)?;
+        (!record.removing && record.matches(instance)).then(|| record.descriptor.clone())
     }
 
     /// Whether this exact incarnation is still present in the registry.
@@ -813,10 +813,30 @@ impl AgentRegistry {
     /// for protocol violations to mirror the Python contract; otherwise
     /// Ok(true) on success.
     pub fn heartbeat(&self, pid: &str) -> Result<bool, AgentError> {
-        let mut entry = match self.agents.get_mut(pid) {
-            Some(e) => e,
-            None => return Err(AgentError::NotFound(pid.to_string())),
+        self.heartbeat_inner(pid, None)?
+            .map(|_| true)
+            .ok_or_else(|| AgentError::NotFound(pid.to_string()))
+    }
+
+    /// Refresh and return only the captured external process under one guard.
+    pub fn heartbeat_instance(
+        &self,
+        instance: &AgentInstance,
+    ) -> Result<Option<AgentDescriptor>, AgentError> {
+        self.heartbeat_inner(&instance.pid, Some(instance))
+    }
+
+    fn heartbeat_inner(
+        &self,
+        pid: &str,
+        expected: Option<&AgentInstance>,
+    ) -> Result<Option<AgentDescriptor>, AgentError> {
+        let Some(mut entry) = self.agents.get_mut(pid) else {
+            return Ok(None);
         };
+        if entry.removing || expected.is_some_and(|instance| !entry.matches(instance)) {
+            return Ok(None);
+        }
         if entry.kind != AgentKind::Unmanaged {
             return Err(AgentError::InvalidKind(format!(
                 "heartbeat only for unmanaged processes: {pid}"
@@ -833,7 +853,7 @@ impl AgentRegistry {
             info.last_heartbeat_ms = Some(now);
         }
         entry.updated_at_ms = now;
-        Ok(true)
+        Ok(Some(entry.descriptor.clone()))
     }
 
     /// List all agents, optionally filtered by zone_id, owner_id, kind,
@@ -990,26 +1010,48 @@ impl AgentRegistry {
         sig: AgentSignal,
         payload: Option<HashMap<String, String>>,
     ) -> Result<AgentDescriptor, AgentError> {
+        self.signal_inner(pid, None, sig, payload)?
+            .ok_or_else(|| AgentError::NotFound(pid.to_string()))
+    }
+
+    /// Signal only the incarnation authorized by the caller's earlier read.
+    pub fn signal_instance(
+        &self,
+        instance: &AgentInstance,
+        sig: AgentSignal,
+        payload: Option<HashMap<String, String>>,
+    ) -> Result<Option<AgentDescriptor>, AgentError> {
+        self.signal_inner(&instance.pid, Some(instance), sig, payload)
+    }
+
+    fn signal_inner(
+        &self,
+        pid: &str,
+        expected: Option<&AgentInstance>,
+        sig: AgentSignal,
+        payload: Option<HashMap<String, String>>,
+    ) -> Result<Option<AgentDescriptor>, AgentError> {
         match sig {
-            AgentSignal::Sigterm => self.kill(pid, 0),
-            AgentSignal::Sigkill => self
-                .kill_instance_inner(pid, None, -9, true)?
-                .ok_or_else(|| AgentError::NotFound(pid.to_string())),
+            AgentSignal::Sigterm => self.kill_instance_inner(pid, expected, 0, false),
+            AgentSignal::Sigkill => self.kill_instance_inner(pid, expected, -9, true),
             AgentSignal::Sigusr1 => {
-                let mut entry = self
-                    .agents
-                    .get_mut(pid)
-                    .ok_or_else(|| AgentError::NotFound(pid.to_string()))?;
+                let Some(mut entry) = self.agents.get_mut(pid) else {
+                    return Ok(None);
+                };
+                if entry.removing || expected.is_some_and(|instance| !entry.matches(instance)) {
+                    return Ok(None);
+                }
                 if let Some(p) = payload {
                     for (k, v) in p {
                         entry.labels.insert(k, v);
                     }
                     entry.updated_at_ms = now_ms();
                 }
+                let instance = entry.instance();
                 let snapshot = entry.descriptor.clone();
                 drop(entry);
-                self.wake(pid);
-                Ok(snapshot)
+                self.finish_state_change(&instance, false);
+                Ok(Some(snapshot))
             }
         }
     }
@@ -1107,19 +1149,32 @@ impl AgentRegistry {
     /// Unregister an external process — TERMINATED + reap. Mirrors Python
     /// ``unregister_external``.
     pub fn unregister_external(&self, pid: &str) -> Result<(), AgentError> {
-        let entry = self
-            .agents
-            .get(pid)
+        let (instance, _) = self
+            .get_instance(pid)
             .ok_or_else(|| AgentError::NotFound(pid.to_string()))?;
+        self.unregister_external_instance(&instance).map(|_| ())
+    }
+
+    /// Retire only the external incarnation captured during authorization.
+    pub fn unregister_external_instance(
+        &self,
+        instance: &AgentInstance,
+    ) -> Result<bool, AgentError> {
+        let pid = &instance.pid;
+        let Some(entry) = self.agents.get(pid) else {
+            return Ok(false);
+        };
+        if entry.removing || !entry.matches(instance) {
+            return Ok(false);
+        }
         if entry.kind != AgentKind::Unmanaged {
             return Err(AgentError::InvalidKind(format!(
                 "unregister_external only for unmanaged processes: {pid}"
             )));
         }
-        let instance = entry.instance();
         drop(entry);
-        self.kill_instance_inner(pid, Some(&instance), 0, true)?;
-        Ok(())
+        self.kill_instance_inner(pid, Some(instance), 0, true)
+            .map(|descriptor| descriptor.is_some())
     }
 
     /// Drain: kill+reap every process. Used at shutdown.
@@ -1204,6 +1259,112 @@ mod tests {
         other.register(desc);
         assert!(other.kill_instance(&current, -9).unwrap().is_none());
         assert!(other.get("42").is_some());
+    }
+
+    fn external_desc() -> AgentDescriptor {
+        let mut descriptor = make_desc("42", "same-agent");
+        descriptor.kind = AgentKind::Unmanaged;
+        descriptor.external_info = Some(ExternalProcessInfo {
+            connection_id: "same-connection".to_string(),
+            last_heartbeat_ms: Some(1000),
+            ..Default::default()
+        });
+        descriptor.last_heartbeat_ms = Some(1000);
+        descriptor
+    }
+
+    #[test]
+    fn external_instance_operations_preserve_an_identical_pid_replacement() {
+        let registry = AgentRegistry::new();
+        let descriptor = external_desc();
+        let old = registry.register_instance(descriptor.clone()).unwrap();
+        registry.unregister("42").unwrap();
+        // Neither timestamps nor connection IDs distinguish these records.
+        let replacement = registry.register_instance(descriptor).unwrap();
+        let notifications = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&notifications);
+        registry.register_on_terminate(
+            "test",
+            Arc::new(move |_| {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }),
+        );
+
+        assert!(registry.heartbeat_instance(&old).unwrap().is_none());
+        assert!(!registry.unregister_external_instance(&old).unwrap());
+        assert!(registry.unregister_instance(&old).is_none());
+        assert!(registry.get_instance_descriptor(&old).is_none());
+        for signal in [
+            AgentSignal::Sigterm,
+            AgentSignal::Sigkill,
+            AgentSignal::Sigusr1,
+        ] {
+            assert!(registry
+                .signal_instance(
+                    &old,
+                    signal,
+                    Some(HashMap::from([(
+                        "retired".to_string(),
+                        "must-not-arrive".to_string()
+                    ),]))
+                )
+                .unwrap()
+                .is_none());
+        }
+        let current = registry.get_instance_descriptor(&replacement).unwrap();
+        assert_eq!(current.state, AgentState::Registered);
+        assert_eq!(current.last_heartbeat_ms, Some(1000));
+        assert_eq!(current.external_info.unwrap().last_heartbeat_ms, Some(1000));
+        assert_eq!(current.updated_at_ms, 1000);
+        assert!(current.labels.is_empty());
+        assert_eq!(notifications.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // A live handle from another registry is equally invalid here.
+        let foreign = AgentRegistry::new();
+        let foreign_instance = foreign.register_instance(external_desc()).unwrap();
+        assert!(registry
+            .heartbeat_instance(&foreign_instance)
+            .unwrap()
+            .is_none());
+        assert!(!registry
+            .unregister_external_instance(&foreign_instance)
+            .unwrap());
+        assert!(registry.unregister_instance(&foreign_instance).is_none());
+        assert!(registry.is_current_instance(&replacement));
+    }
+
+    #[test]
+    fn current_external_instance_operations_keep_existing_lifecycle_semantics() {
+        let registry = AgentRegistry::new();
+        let instance = registry.register_instance(external_desc()).unwrap();
+        let heartbeat = registry.heartbeat_instance(&instance).unwrap().unwrap();
+        assert!(heartbeat.last_heartbeat_ms.unwrap() >= 1000);
+        assert_eq!(
+            heartbeat.last_heartbeat_ms,
+            heartbeat.external_info.unwrap().last_heartbeat_ms
+        );
+        let labels = HashMap::from([("live".to_string(), "yes".to_string())]);
+        let signaled = registry
+            .signal_instance(&instance, AgentSignal::Sigusr1, Some(labels))
+            .unwrap()
+            .unwrap();
+        assert_eq!(signaled.labels.get("live").map(String::as_str), Some("yes"));
+        assert!(registry.unregister_external_instance(&instance).unwrap());
+        assert!(!registry.unregister_external_instance(&instance).unwrap());
+        assert!(registry.get("42").is_none());
+
+        for signal in [AgentSignal::Sigterm, AgentSignal::Sigkill] {
+            let instance = registry.register_instance(external_desc()).unwrap();
+            let terminated = registry
+                .signal_instance(&instance, signal, None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(terminated.state, AgentState::Terminated);
+            assert!(registry.get("42").is_none());
+        }
+        let instance = registry.register_instance(external_desc()).unwrap();
+        assert!(registry.unregister_instance(&instance).is_some());
+        assert!(registry.unregister_instance(&instance).is_none());
     }
 
     #[test]

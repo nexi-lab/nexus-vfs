@@ -2,6 +2,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use contracts::{OperationContext, MAX_GRPC_MESSAGE_BYTES};
+use kernel::core::agents::registry::AgentState;
 use kernel::kernel::vfs_proto::{
     nexus_vfs_service_client::NexusVfsServiceClient, CallRequest, CallResponse,
 };
@@ -168,5 +169,142 @@ async fn managed_agent_call_uses_authenticated_operation_context() {
     assert!(!owner_cancel.is_error);
     assert!(kernel.agent_registry().get(session_id).is_none());
 
+    server.abort();
+}
+
+#[tokio::test]
+async fn external_registry_lifecycle_keeps_owner_scope_after_pid_reuse() {
+    let kernel = Arc::new(Kernel::new());
+    let routes = build_vfs_routes(
+        Arc::clone(&kernel),
+        Arc::new(TestAuth),
+        Arc::new(OnceLock::new()),
+        DataPlaneReady::open(),
+        MAX_GRPC_MESSAGE_BYTES,
+        "external-registry-auth-test",
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        Server::builder()
+            .add_routes(routes)
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    let channel = Endpoint::from_shared(format!("http://{address}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut client = NexusVfsServiceClient::new(channel);
+    let registration = serde_json::json!({
+        "name": "same-agent",
+        "zone_id": "alpha",
+        "connection_id": "same-connection",
+        "host_pid": 424242,
+    });
+    let registered = call(
+        &mut client,
+        "alice",
+        "agent_register_external",
+        registration.clone(),
+    )
+    .await;
+    assert!(!registered.is_error);
+    let original = kernel.agent_registry().get_instance("424242").unwrap().0;
+    for method in [
+        "agent_heartbeat",
+        "agent_update_state",
+        "agent_signal",
+        "agent_unregister",
+        "agent_unregister_external",
+    ] {
+        let denied = call(
+            &mut client,
+            "mallory",
+            method,
+            serde_json::json!({
+                "pid": "424242", "state": "warming_up", "sig": "SIGKILL",
+            }),
+        )
+        .await;
+        assert!(denied.is_error, "foreign {method} must be denied");
+        let error: serde_json::Value = serde_json::from_slice(&denied.payload).unwrap();
+        assert_eq!(error["code"], -32003);
+    }
+    assert!(kernel.agent_registry().is_current_instance(&original));
+    for state in [AgentState::WarmingUp, AgentState::Ready] {
+        let updated = call(
+            &mut client,
+            "alice",
+            "agent_update_state",
+            serde_json::json!({"pid": "424242", "state": state.as_str()}),
+        )
+        .await;
+        assert!(!updated.is_error);
+        let body: serde_json::Value = serde_json::from_slice(&updated.payload).unwrap();
+        assert_eq!(body["result"]["owner_id"], "alice");
+        assert_eq!(body["result"]["state"], state.as_str());
+    }
+    let heartbeat = call(
+        &mut client,
+        "alice",
+        "agent_heartbeat",
+        serde_json::json!({"pid": "424242"}),
+    )
+    .await;
+    assert!(!heartbeat.is_error);
+    let retired = call(
+        &mut client,
+        "alice",
+        "agent_unregister_external",
+        serde_json::json!({"pid": "424242"}),
+    )
+    .await;
+    assert!(!retired.is_error);
+    assert!(kernel.agent_registry().get("424242").is_none());
+
+    let replacement = call(
+        &mut client,
+        "mallory",
+        "agent_register_external",
+        registration,
+    )
+    .await;
+    assert!(!replacement.is_error);
+    assert!(!kernel.agent_registry().is_current_instance(&original));
+    for method in [
+        "agent_heartbeat",
+        "agent_update_state",
+        "agent_signal",
+        "agent_unregister",
+        "agent_unregister_external",
+    ] {
+        let denied = call(
+            &mut client,
+            "alice",
+            method,
+            serde_json::json!({
+                "pid": "424242", "state": "warming_up", "sig": "SIGKILL",
+            }),
+        )
+        .await;
+        assert!(denied.is_error, "retired owner's {method} must be denied");
+        let error: serde_json::Value = serde_json::from_slice(&denied.payload).unwrap();
+        assert_eq!(error["code"], -32003);
+    }
+    let current = kernel.agent_registry().get("424242").unwrap();
+    assert_eq!(current.owner_id, "mallory");
+    assert_eq!(current.state, AgentState::Registered);
+    let retired = call(
+        &mut client,
+        "mallory",
+        "agent_unregister_external",
+        serde_json::json!({"pid": "424242"}),
+    )
+    .await;
+    assert!(!retired.is_error);
+    assert!(kernel.agent_registry().get("424242").is_none());
     server.abort();
 }
