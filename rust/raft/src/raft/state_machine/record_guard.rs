@@ -7,6 +7,8 @@
 use super::conditional_metadata::{storage_error, NAMESPACE};
 use super::*;
 
+mod io;
+
 const BINDING_PREFIX: &str = "guard:";
 const RETIRED_PREFIX: &str = "retired-guard:";
 

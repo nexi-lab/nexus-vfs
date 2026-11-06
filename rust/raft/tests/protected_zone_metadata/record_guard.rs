@@ -4,12 +4,12 @@ use super::*;
 use kernel::core::stream::wal::wal_stream_prefix;
 use kernel::meta_store::ConditionalMetadata;
 
-const OWNER: &str = "/sessions/session-a/lifetime";
-const HISTORY: &str = "/sessions/session-a/history";
+pub(super) const OWNER: &str = "/sessions/session-a/lifetime";
+pub(super) const HISTORY: &str = "/sessions/session-a/history";
 const COMPLETION: &str = "/sessions/session-a/completion";
 const ACK: &str = "/sessions/session-a/ack";
 
-fn admit(store: &ZoneMetaStore) -> Vec<u8> {
+pub(super) fn admit(store: &ZoneMetaStore) -> Vec<u8> {
     store.put(OWNER, image("live-owner")).unwrap();
     let owner = protected(store, OWNER).unwrap();
     store

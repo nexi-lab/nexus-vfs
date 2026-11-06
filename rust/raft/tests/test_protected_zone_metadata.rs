@@ -17,6 +17,8 @@ const PATH: &str = "/conversations/stable-cid/readers/agent-a";
 
 #[path = "protected_zone_metadata/record_guard.rs"]
 mod record_guard;
+#[path = "protected_zone_metadata/record_io.rs"]
+mod record_io;
 
 struct Runtime(Arc<ZoneManager>);
 

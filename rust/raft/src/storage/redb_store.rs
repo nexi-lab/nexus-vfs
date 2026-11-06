@@ -117,6 +117,9 @@ fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
 #[derive(Clone)]
 pub struct RedbStore {
     db: Arc<Database>,
+    /// Node-local storage address; it is never part of replicated state.
+    #[cfg(all(feature = "grpc", has_protos))]
+    path: Arc<std::path::PathBuf>,
     /// Monotonic ID generator (matches SledStore::generate_id behavior).
     next_id: Arc<AtomicU64>,
 }
@@ -139,6 +142,11 @@ impl RedbStore {
         )?;
         Ok(Self {
             db: Arc::new(db),
+            #[cfg(all(feature = "grpc", has_protos))]
+            path: Arc::new(
+                path.canonicalize()
+                    .map_err(|error| StorageError::Storage(redb::StorageError::Io(error)))?,
+            ),
             next_id: Arc::new(AtomicU64::new(0)),
         })
     }
@@ -152,13 +160,26 @@ impl RedbStore {
         let db = Database::builder()
             .set_cache_size(16 * 1024 * 1024)
             .create(tmpfile.path())?;
+        #[cfg(all(feature = "grpc", has_protos))]
+        let db_path = tmpfile
+            .path()
+            .canonicalize()
+            .map_err(|error| StorageError::Storage(redb::StorageError::Io(error)))?;
         // Keep the tempfile alive by leaking it (redb owns the file handle)
         // The OS will reclaim when the process exits
         std::mem::forget(tmpfile);
         Ok(Self {
             db: Arc::new(db),
+            #[cfg(all(feature = "grpc", has_protos))]
+            path: Arc::new(db_path),
             next_id: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// Native address used by storage-owned lifetime controls across reopen.
+    #[cfg(all(feature = "grpc", has_protos))]
+    pub(crate) fn path(&self) -> &Path {
+        self.path.as_path()
     }
 
     /// Get or create a named tree (table namespace).

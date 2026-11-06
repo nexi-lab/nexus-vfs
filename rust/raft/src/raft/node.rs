@@ -1401,6 +1401,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             Command::BindRecordGuard { .. }
                 | Command::GuardedRecord { .. }
                 | Command::RetireRecordGuard { .. }
+                | Command::AdmitRecordIoOwner { .. }
         ) {
             return Err(RaftError::InvalidState(
                 "not a record storage command".into(),

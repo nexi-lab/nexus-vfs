@@ -5,10 +5,39 @@ use crate::extensions::conditional_metadata::{
     ConditionalMetadataError, ConditionalMetadataResult,
 };
 
-/// These metadata controls require qualified immutable content at their caller.
-/// They do not provide OS locks, storage I/O drain or physical reclamation.
+/// Retain this storage-owned handle until the actual I/O has finished, including
+/// work that continues after its request future has been cancelled.
+pub trait RecordIoGuard: Send + Sync {}
+
+/// These controls require qualified immutable content at their caller.
+/// I/O enrollment is explicit; physical reclamation remains a separate control.
 /// All paths resolve in one owning store; versions are opaque storage tokens.
 pub trait GuardedRecords: Send + Sync {
+    /// Enroll a fresh/quiescent owner before admitting content I/O. This upgrades
+    /// the reader requirement and preserves its revision. The owning service
+    /// retires previous consumers before enrollment.
+    fn admit_record_io_owner(
+        &self,
+        path: &str,
+        expected_version: &[u8],
+    ) -> Result<(), ConditionalMetadataError>;
+
+    /// Retain actual storage I/O. The owner is checked after acquiring the
+    /// lifetime guard too; the caller holds this guard through all work.
+    fn begin_record_io(
+        &self,
+        path: &str,
+        guard_version: &[u8],
+    ) -> Result<Box<dyn RecordIoGuard>, ConditionalMetadataError>;
+
+    /// Return exclusive retirement coverage after every admitted I/O has ended.
+    /// None means an actual operation still holds its lifetime guard.
+    fn try_exclude_retired_record_io(
+        &self,
+        owner_path: &str,
+        terminal_version: &[u8],
+    ) -> Result<Option<Box<dyn RecordIoGuard>>, ConditionalMetadataError>;
+
     /// Compare the exact qualified image and permanently bind its owner.
     fn bind_record_guard(
         &self,

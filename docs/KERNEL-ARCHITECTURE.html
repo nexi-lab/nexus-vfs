@@ -741,7 +741,7 @@ graph LR
     <tr><td><code>ObjectStore</code></td><td><code>as_llm_streaming</code></td><td><code>rust/kernel/src/extensions/llm_streaming.rs</code></td><td><code>LlmStreamingBackend</code>: model-streaming storage operations</td></tr>
     <tr><td><code>MetaStore</code></td><td><code>as_conditional_metadata</code></td><td><code>rust/kernel/src/extensions/conditional_metadata.rs</code></td><td><code>ConditionalMetadata</code>: one committed image/revision snapshot and atomic conditional replacement</td></tr>
     <tr><td><code>MetaStore</code></td><td><code>as_record_protection</code></td><td><code>rust/kernel/src/extensions/record_protection.rs</code></td><td><code>RecordProtection</code>: qualify an authoritative file image and atomically admit conditional writes at its existing key</td></tr>
-    <tr><td><code>MetaStore</code></td><td><code>as_guarded_records</code></td><td><code>rust/kernel/src/extensions/guarded_records.rs</code></td><td><code>GuardedRecords</code>: bind record ownership, compare the owner at final metadata/WAL commit and permanently retire handles; content qualification, I/O drain and reclamation remain separate requirements</td></tr>
+    <tr><td><code>MetaStore</code></td><td><code>as_guarded_records</code></td><td><code>rust/kernel/src/extensions/guarded_records.rs</code></td><td><code>GuardedRecords</code>: owner binding, final metadata/WAL commit fences, permanent retirement and explicit native I/O lifetime enrollment/exclusion; content qualification, publisher integration and reclamation remain separate requirements</td></tr>
   </tbody>
 </table>
 
