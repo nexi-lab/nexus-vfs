@@ -1,5 +1,5 @@
 //! Real terminal -> local launcher -> inherited-terminal child. The ignored
-//! entries are subprocess fixtures, invoked only by the two parent PTY tests.
+//! entries are subprocess fixtures, invoked only by the parent PTY tests.
 
 use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
@@ -62,7 +62,14 @@ fn admitted_launcher_keeps_terminal_bytes_out_of_the_control_channel() {
 #[test]
 fn revoked_control_connection_stops_and_reaps_the_terminal_child() {
     let mut session = terminal("revoked_launcher_fixture");
-    session.expect("REVOKED_CHILD_REAPED").unwrap();
+    session
+        .expect("REVOKED_CHILD_REAPED")
+        .unwrap_or_else(|error| {
+            panic!(
+                "{error}; terminal: {}",
+                session.render(|screen| screen.contents())
+            )
+        });
     assert_eq!(session.expect_eof().unwrap(), 0);
 }
 
@@ -159,6 +166,9 @@ fn admitted_launcher(revoke: bool) {
                 let mut readiness = [0; 14];
                 stream.read_exact(&mut readiness).await.unwrap();
                 assert_eq!(&readiness, b"CONTROL_READY\n");
+                if revoke {
+                    println!("REVOKE_RUNTIME_READY");
+                }
                 // Readiness proves the first admission has consumed and closed
                 // its listener. Racing a second TCP connect against accept's
                 // return can enter the OS backlog and spend the full handshake
@@ -168,6 +178,9 @@ fn admitted_launcher(revoke: bool) {
                     "a terminal launch capability must be consumed exactly once"
                 );
                 if revoke {
+                    println!("REVOKE_CAPABILITY_CONSUMED");
+                    drop(stream);
+                    println!("REVOKE_MANAGER_DROPPED");
                     return;
                 }
                 let mut received = Vec::new();

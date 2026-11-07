@@ -4,7 +4,6 @@
 //! conversation endpoint; no public fd turn transport is created.
 
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -66,32 +65,9 @@ impl RawSpawn for KernelRawSpawn {
     fn prepare(&self, spec: ProcessLaunch) -> Result<Box<dyn PreparedRawSpawn>, String> {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| "subprocess hosting requires an active tokio runtime")?;
-        let execution = match spec {
-            ProcessLaunch::Daemon(spec) => {
-                if spec.cmd.is_empty() {
-                    return Err("spawn_spec.cmd is required".into());
-                }
-                let mut argv = vec![spec.cmd];
-                argv.extend(spec.args);
-                let cwd = if spec.cwd.is_empty() {
-                    PathBuf::from(".")
-                } else {
-                    PathBuf::from(spec.cwd)
-                };
-                let child = runtime
-                    .block_on(HostedSubprocess::spawn_no_pipes(argv, spec.env, &cwd))
-                    .map_err(|error| format!("launch session subprocess: {error}"))?;
-                if child.os_pid().is_none() {
-                    return Err("launched subprocess has no OS PID".into());
-                }
-                PreparedExecution::Owned(Box::new(child))
-            }
-            ProcessLaunch::Terminal(offer) => PreparedExecution::Terminal(
-                runtime
-                    .block_on(PreparedTerminalLaunch::connect(&offer))
-                    .map_err(|error| format!("prepare local terminal launcher: {error}"))?,
-            ),
-        };
+        // One executor entry for either placement. Keep resource preparation
+        // inside the same future rather than instantiating block_on per backend.
+        let execution = runtime.block_on(PreparedExecution::prepare(spec))?;
         Ok(Box::new(PreparedSubprocess {
             spawner: self.clone(),
             execution,
@@ -103,6 +79,36 @@ impl RawSpawn for KernelRawSpawn {
 enum PreparedExecution {
     Owned(Box<HostedSubprocess>),
     Terminal(PreparedTerminalLaunch),
+}
+
+impl PreparedExecution {
+    async fn prepare(launch: ProcessLaunch) -> Result<Self, String> {
+        match launch {
+            ProcessLaunch::Daemon(spec) => {
+                if spec.cmd.is_empty() {
+                    return Err("spawn_spec.cmd is required".into());
+                }
+                let mut argv = vec![spec.cmd];
+                argv.extend(spec.args);
+                let cwd = if spec.cwd.is_empty() {
+                    PathBuf::from(".")
+                } else {
+                    PathBuf::from(spec.cwd)
+                };
+                let child = HostedSubprocess::spawn_no_pipes(argv, spec.env, &cwd)
+                    .await
+                    .map_err(|error| format!("launch session subprocess: {error}"))?;
+                if child.os_pid().is_none() {
+                    return Err("launched subprocess has no OS PID".into());
+                }
+                Ok(Self::Owned(Box::new(child)))
+            }
+            ProcessLaunch::Terminal(offer) => PreparedTerminalLaunch::connect(&offer)
+                .await
+                .map(Self::Terminal)
+                .map_err(|error| format!("prepare local terminal launcher: {error}")),
+        }
+    }
 }
 
 struct PreparedSubprocess {
@@ -166,15 +172,10 @@ enum ProcessControl {
 }
 
 impl ProcessControl {
-    // Erase the two ownership backends at their lifetime boundary. The parent
-    // supervisor does not carry both process-wait state machines through every
-    // select branch. There is one allocation per wait, never per control frame.
-    fn wait(&mut self) -> Pin<Box<dyn std::future::Future<Output = ProcessExit> + Send + '_>> {
+    async fn wait(&mut self) -> ProcessExit {
         match self {
-            Self::Owned(child) => Box::pin(child.wait()),
-            Self::Terminal { closed, .. } => {
-                Box::pin(async move { closed.await.unwrap_or_default() })
-            }
+            Self::Owned(child) => child.wait().await,
+            Self::Terminal { closed, .. } => closed.await.unwrap_or_default(),
         }
     }
     async fn stop_and_wait(&mut self) -> ProcessExit {
