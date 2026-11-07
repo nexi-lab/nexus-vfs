@@ -155,14 +155,18 @@ fn admitted_launcher(revoke: bool) {
             let grant = serde_json::json!({"session_id":"fixture-managed-instance"});
             let manager = async move {
                 let prepared = PreparedTerminalLaunch::connect(&offer).await.unwrap();
-                assert!(
-                    PreparedTerminalLaunch::connect(&offer).await.is_err(),
-                    "a terminal launch capability must be consumed exactly once"
-                );
                 let mut stream = prepared.start(&grant).await.unwrap();
                 let mut readiness = [0; 14];
                 stream.read_exact(&mut readiness).await.unwrap();
                 assert_eq!(&readiness, b"CONTROL_READY\n");
+                // Readiness proves the first admission has consumed and closed
+                // its listener. Racing a second TCP connect against accept's
+                // return can enter the OS backlog and spend the full handshake
+                // timeout before the separate child shutdown grace even begins.
+                assert!(
+                    PreparedTerminalLaunch::connect(&offer).await.is_err(),
+                    "a terminal launch capability must be consumed exactly once"
+                );
                 if revoke {
                     return;
                 }
