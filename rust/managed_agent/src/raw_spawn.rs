@@ -362,14 +362,10 @@ impl KernelRawSpawn {
                 }
                 let message = serde_json::json!({"jsonrpc":"2.0", "method":"_nexus/diagnostic",
                     "params":{"stream":"stderr","text":String::from_utf8_lossy(&buffer[..count])}});
-                let writer = Arc::clone(&diagnostic_mailbox);
-                if !matches!(
-                    tokio::task::spawn_blocking(
-                        move || writer.send(SessionPayload::Rpc { message })
-                    )
-                    .await,
-                    Ok(Ok(()))
-                ) {
+                if send_payload(&diagnostic_mailbox, SessionPayload::Rpc { message })
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -415,10 +411,7 @@ impl KernelRawSpawn {
                     exit.code, exit.signal
                 )
             });
-            let _ = tokio::task::spawn_blocking(move || {
-                mailbox.send(SessionPayload::Closed { reason })
-            })
-            .await;
+            let _ = send_payload(&mailbox, SessionPayload::Closed { reason }).await;
             let _ = registry.kill_instance(&instance, exit.as_reap_code());
         });
         Ok(())
@@ -519,8 +512,16 @@ async fn forward_line(
         (control.observer)(state, reason);
         return Ok(());
     }
+    send_payload(mailbox, SessionPayload::Rpc { message }).await
+}
+
+/// All subprocess output uses the same blocking mailbox write boundary.
+async fn send_payload(
+    mailbox: &Arc<SessionMailbox<Kernel>>,
+    payload: SessionPayload,
+) -> Result<(), String> {
     let mailbox = Arc::clone(mailbox);
-    tokio::task::spawn_blocking(move || mailbox.send(SessionPayload::Rpc { message }))
+    tokio::task::spawn_blocking(move || mailbox.send(payload))
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|error| error.to_string())?
 }
