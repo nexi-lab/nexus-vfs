@@ -9,6 +9,7 @@ pub mod agent_context;
 pub mod agent_pid;
 pub mod constants;
 pub mod credential_intent;
+pub mod local_launch;
 pub mod lock_state;
 pub mod operation_context;
 pub mod operation_id;

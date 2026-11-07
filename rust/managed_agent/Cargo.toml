@@ -34,3 +34,6 @@ a2a = { workspace = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+subprocess = { path = "../subprocess" }
