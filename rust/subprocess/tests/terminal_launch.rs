@@ -237,9 +237,10 @@ fn admitted_guest_fixture() {
 }
 
 async fn spawn_guest() -> HostedSubprocess {
-    let mut environment: HashMap<_, _> = std::env::vars().collect();
+    let environment: HashMap<_, _> = std::env::vars().collect();
     #[cfg(unix)]
-    {
+    let environment = {
+        let mut environment = environment;
         // These read-only OS calls let the child verify the original session
         // and foreground process group, not merely `isatty(stdin)`.
         environment.insert(
@@ -250,7 +251,8 @@ async fn spawn_guest() -> HostedSubprocess {
             "TEST_LAUNCHER_PGRP".into(),
             unsafe { libc::getpgrp() }.to_string(),
         );
-    }
+        environment
+    };
     let mut child = HostedSubprocess::spawn_in_terminal(
         fixture_argv("terminal_guest_fixture"),
         environment,

@@ -4,6 +4,7 @@
 //! conversation endpoint; no public fd turn transport is created.
 
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -165,10 +166,15 @@ enum ProcessControl {
 }
 
 impl ProcessControl {
-    async fn wait(&mut self) -> ProcessExit {
+    // Erase the two ownership backends at their lifetime boundary. The parent
+    // supervisor does not carry both process-wait state machines through every
+    // select branch. There is one allocation per wait, never per control frame.
+    fn wait(&mut self) -> Pin<Box<dyn std::future::Future<Output = ProcessExit> + Send + '_>> {
         match self {
-            Self::Owned(child) => child.wait().await,
-            Self::Terminal { closed, .. } => closed.await.unwrap_or_default(),
+            Self::Owned(child) => Box::pin(child.wait()),
+            Self::Terminal { closed, .. } => {
+                Box::pin(async move { closed.await.unwrap_or_default() })
+            }
         }
     }
     async fn stop_and_wait(&mut self) -> ProcessExit {
