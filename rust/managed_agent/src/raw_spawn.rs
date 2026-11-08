@@ -299,123 +299,145 @@ impl KernelRawSpawn {
         let input_mailbox = Arc::clone(&mailbox);
         let input_stopped = Arc::clone(&stopped);
         let input_failed = failed_tx.clone();
-        let input = runtime.spawn(async move {
-            let stop = async {
-                match stop_input {
-                    Some(stop) => {
-                        let _ = stop.await;
+        let input = spawn_session_task(
+            &runtime,
+            Box::pin(async move {
+                let stop = async {
+                    match stop_input {
+                        Some(stop) => {
+                            let _ = stop.await;
+                        }
+                        None => std::future::pending::<()>().await,
                     }
-                    None => std::future::pending::<()>().await,
-                }
-            };
-            tokio::pin!(stop);
-            while !input_stopped.load(Ordering::Acquire) {
-                let reader = Arc::clone(&input_mailbox);
-                let message = tokio::select! {
-                    message = tokio::task::spawn_blocking(move || reader.receive(200)) => message,
-                    _ = &mut stop => { let _ = stdin.shutdown().await; break; },
                 };
-                match message {
-                    Ok(Ok(Some(SessionPayload::Rpc { message }))) => {
-                        let mut bytes = serde_json::to_vec(&message).expect("JSON value");
-                        bytes.push(b'\n');
-                        if let Err(error) = stdin.write_all(&bytes).await {
-                            let _ = input_failed.send(format!("session stdin failed: {error}"));
+                tokio::pin!(stop);
+                while !input_stopped.load(Ordering::Acquire) {
+                    let reader = Arc::clone(&input_mailbox);
+                    let message = tokio::select! {
+                        message = tokio::task::spawn_blocking(move || reader.receive(200)) => message,
+                        _ = &mut stop => { let _ = stdin.shutdown().await; break; },
+                    };
+                    match message {
+                        Ok(Ok(Some(SessionPayload::Rpc { message }))) => {
+                            let mut bytes = serde_json::to_vec(&message).expect("JSON value");
+                            bytes.push(b'\n');
+                            if let Err(error) = stdin.write_all(&bytes).await {
+                                let _ = input_failed.send(format!("session stdin failed: {error}"));
+                                break;
+                            }
+                            if let Err(error) = stdin.flush().await {
+                                let _ = input_failed
+                                    .send(format!("session stdin flush failed: {error}"));
+                                break;
+                            }
+                        }
+                        Ok(Ok(None)) => {}
+                        Ok(Ok(Some(SessionPayload::Closed { reason }))) | Ok(Err(reason)) => {
+                            let _ = input_failed.send(reason);
                             break;
                         }
-                        if let Err(error) = stdin.flush().await {
-                            let _ =
-                                input_failed.send(format!("session stdin flush failed: {error}"));
+                        Err(error) => {
+                            let _ = input_failed.send(error.to_string());
                             break;
                         }
-                    }
-                    Ok(Ok(None)) => {}
-                    Ok(Ok(Some(SessionPayload::Closed { reason }))) | Ok(Err(reason)) => {
-                        let _ = input_failed.send(reason);
-                        break;
-                    }
-                    Err(error) => {
-                        let _ = input_failed.send(error.to_string());
-                        break;
                     }
                 }
-            }
-        });
+            }),
+        );
         let output_mailbox = Arc::clone(&mailbox);
-        let output = runtime.spawn(async move {
-            let reason = pump_output(stdout, output_mailbox, control)
-                .await
-                .err()
-                .unwrap_or_else(|| "session subprocess closed stdout".into());
-            let _ = failed_tx.send(reason);
-        });
+        let output = spawn_session_task(
+            &runtime,
+            Box::pin(async move {
+                let reason = pump_output(stdout, output_mailbox, control)
+                    .await
+                    .err()
+                    .unwrap_or_else(|| "session subprocess closed stdout".into());
+                let _ = failed_tx.send(reason);
+            }),
+        );
         // Diagnostics use the same conversation, never a public fd side channel.
         let diagnostic_mailbox = Arc::clone(&mailbox);
-        let diagnostics = runtime.spawn(async move {
-            let Some(mut stderr) = stderr else {
-                return;
-            };
-            let mut buffer = [0; 8192];
-            while let Ok(count) = stderr.read(&mut buffer).await {
-                if count == 0 {
-                    break;
-                }
-                let message = serde_json::json!({"jsonrpc":"2.0", "method":"_nexus/diagnostic",
+        let diagnostics = spawn_session_task(
+            &runtime,
+            Box::pin(async move {
+                let Some(mut stderr) = stderr else {
+                    return;
+                };
+                let mut buffer = [0; 8192];
+                while let Ok(count) = stderr.read(&mut buffer).await {
+                    if count == 0 {
+                        break;
+                    }
+                    let message = serde_json::json!({"jsonrpc":"2.0", "method":"_nexus/diagnostic",
                     "params":{"stream":"stderr","text":String::from_utf8_lossy(&buffer[..count])}});
-                if send_payload(&diagnostic_mailbox, SessionPayload::Rpc { message })
+                    if send_payload(&diagnostic_mailbox, SessionPayload::Rpc { message })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }),
+        );
+        let registry = Arc::clone(&self.agent_registry);
+        spawn_session_task(
+            &runtime,
+            Box::pin(async move {
+                let (natural_exit, failure) = {
+                    let wait = process.wait();
+                    tokio::pin!(wait);
+                    tokio::select! {
+                        exit = &mut wait => (Some(exit), None),
+                        _ = cancel_rx => (None, Some("session terminated".to_string())),
+                        failure = failed_rx.recv() => (None, failure),
+                    }
+                };
+                let exit = match natural_exit {
+                    Some(exit) => exit,
+                    None => process.stop_and_wait().await,
+                };
+                stopped.store(true, Ordering::Release);
+                input.abort();
+                // Drain terminal responses before closure. Bound grandchildren
+                // retaining stdout so they cannot hold session teardown forever.
+                let mut output = output;
+                if tokio::time::timeout(Duration::from_secs(5), &mut output)
                     .await
                     .is_err()
                 {
-                    break;
+                    output.abort();
+                    let _ = output.await;
                 }
-            }
-        });
-        let registry = Arc::clone(&self.agent_registry);
-        runtime.spawn(async move {
-            let (natural_exit, failure) = {
-                let wait = process.wait();
-                tokio::pin!(wait);
-                tokio::select! {
-                    exit = &mut wait => (Some(exit), None),
-                    _ = cancel_rx => (None, Some("session terminated".to_string())),
-                    failure = failed_rx.recv() => (None, failure),
+                let mut diagnostics = diagnostics;
+                if tokio::time::timeout(Duration::from_secs(1), &mut diagnostics)
+                    .await
+                    .is_err()
+                {
+                    diagnostics.abort();
+                    let _ = diagnostics.await;
                 }
-            };
-            let exit = match natural_exit {
-                Some(exit) => exit,
-                None => process.stop_and_wait().await,
-            };
-            stopped.store(true, Ordering::Release);
-            input.abort();
-            // Drain terminal responses before closure. Bound grandchildren
-            // retaining stdout so they cannot hold session teardown forever.
-            let mut output = output;
-            if tokio::time::timeout(Duration::from_secs(5), &mut output)
-                .await
-                .is_err()
-            {
-                output.abort();
-                let _ = output.await;
-            }
-            let mut diagnostics = diagnostics;
-            if tokio::time::timeout(Duration::from_secs(1), &mut diagnostics)
-                .await
-                .is_err()
-            {
-                diagnostics.abort();
-                let _ = diagnostics.await;
-            }
-            let reason = failure.unwrap_or_else(|| {
-                format!(
-                    "subprocess exited: code={:?}, signal={:?}",
-                    exit.code, exit.signal
-                )
-            });
-            let _ = send_payload(&mailbox, SessionPayload::Closed { reason }).await;
-            let _ = registry.kill_instance(&instance, exit.as_reap_code());
-        });
+                let reason = failure.unwrap_or_else(|| {
+                    format!(
+                        "subprocess exited: code={:?}, signal={:?}",
+                        exit.code, exit.signal
+                    )
+                });
+                let _ = send_payload(&mailbox, SessionPayload::Closed { reason }).await;
+                let _ = registry.kill_instance(&instance, exit.as_reap_code());
+            }),
+        );
         Ok(())
     }
+}
+
+/// Share executor bookkeeping for the fixed set of subprocess workers.
+/// This adds one boxed future per worker at launch, never per event.
+#[inline(never)]
+fn spawn_session_task(
+    runtime: &tokio::runtime::Handle,
+    task: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+) -> tokio::task::JoinHandle<()> {
+    runtime.spawn(task)
 }
 
 /// ACP stdio uses newline-delimited JSON. Bound partial lines as well as complete frames.
