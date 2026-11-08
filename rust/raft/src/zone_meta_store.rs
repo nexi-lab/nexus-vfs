@@ -697,11 +697,8 @@ impl MetaStore for ZoneMetaStore {
             stream_prefix: stream_prefix.to_string(),
             data: data.to_vec(),
         };
-        let result = bridge_block_on(&self.runtime, self.node()?.propose(cmd)).map_err(|e| {
-            MetaStoreError::IOError(format!(
-                "ZoneMetaStore.append_stream_entry({stream_prefix}): {e}"
-            ))
-        })?;
+        let result = bridge_block_on(&self.runtime, self.node()?.propose(cmd))
+            .map_err(|e| append_error(stream_prefix, &e))?;
         match result {
             crate::prelude::CommandResult::Value(bytes) => <[u8; 8]>::try_from(bytes.as_slice())
                 .map(u64::from_be_bytes)
@@ -885,11 +882,50 @@ impl MetaStore for ZoneMetaStore {
     }
 }
 
+/// A failed append proposal, typed by what the raft layer knows about it: sent
+/// with no answer (it may have committed) or refused (nothing was applied).
+/// The two need different handling, a read-back versus a plain retry, and
+/// `RaftError::proposal_outcome_unknown` is the one place that decides which.
+fn append_error(stream_prefix: &str, e: &crate::prelude::RaftError) -> MetaStoreError {
+    let message = format!("ZoneMetaStore.append_stream_entry({stream_prefix}): {e}");
+    if e.proposal_outcome_unknown() {
+        MetaStoreError::OutcomeUnknown(message)
+    } else {
+        MetaStoreError::IOError(message)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::raft::ZoneRaftRegistry;
     use tempfile::TempDir;
+
+    /// A proposal that was sent without an answer may have committed; one the
+    /// cluster refused applied nothing. The append error keeps them apart.
+    #[test]
+    fn append_errors_say_whether_the_entry_may_have_committed() {
+        use crate::prelude::RaftError;
+        for unknown in [
+            RaftError::Transport("connection reset".into()),
+            RaftError::Timeout(10),
+            RaftError::ProposalDropped,
+            RaftError::ProposalOutcomeUnknown("lost".into()),
+        ] {
+            assert!(
+                matches!(
+                    append_error("p/", &unknown),
+                    MetaStoreError::OutcomeUnknown(_)
+                ),
+                "{unknown}"
+            );
+        }
+        let refused = RaftError::NotLeader { leader_hint: None };
+        assert!(matches!(
+            append_error("p/", &refused),
+            MetaStoreError::IOError(_)
+        ));
+    }
 
     /// Two mounts of ONE zone keep disjoint key spaces when they declare
     /// disjoint subtrees — and alias when they do not.

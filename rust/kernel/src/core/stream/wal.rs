@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use crate::abc::meta_store::MetaStore;
+use crate::abc::meta_store::{MetaStore, MetaStoreError};
 use crate::stream::{StreamBackend, StreamError};
 
 /// Side-table key prefix for wal-stream entries. Every entry is keyed
@@ -301,13 +301,25 @@ impl WalStreamCore {
     /// reading the same store sees it. This is the sole write path; a wal
     /// DT_STREAM exists to REPLICATE, so a write that can't commit fails loud
     /// rather than buffering and dropping.
-    pub fn write_sync(&self, data: &[u8]) -> Result<u64, String> {
+    pub fn write_sync(&self, data: &[u8]) -> Result<u64, MetaStoreError> {
         if self.closed.load(Ordering::Acquire) {
-            return Err(format!("WAL stream {} is closed", self.stream_id));
+            return Err(MetaStoreError::IOError(format!(
+                "WAL stream {} is closed",
+                self.stream_id
+            )));
         }
+        // Keep the store's error kind: whether the entry may have committed
+        // is what the caller acts on.
+        let at = |why: String| format!("append_stream_entry({}): {why}", self.prefix);
         self.store
             .append_stream_entry(&self.prefix, data)
-            .map_err(|e| format!("append_stream_entry({}): {e:?}", self.prefix))
+            .map_err(|e| match e {
+                MetaStoreError::OutcomeUnknown(why) => MetaStoreError::OutcomeUnknown(at(why)),
+                MetaStoreError::IOError(why) => MetaStoreError::IOError(at(why)),
+                other @ MetaStoreError::NotFound(_) => {
+                    MetaStoreError::IOError(at(other.to_string()))
+                }
+            })
     }
 
     /// Read the entry at `seq`.  `Ok(Some(bytes))` if present;
@@ -642,9 +654,16 @@ impl StreamBackend for WalStreamCore {
                 // The reason goes to the CALLER, not only to this log. It used
                 // to be replaced here by a canned "no reachable leader?" and
                 // reported as `Closed`, so a client learned neither what
-                // happened nor that the stream was still open — see
-                // `StreamError::NotReplicated`.
-                Err(StreamError::NotReplicated(e))
+                // happened nor that the stream was still open. Whether the
+                // entry may have committed travels with it — see
+                // `StreamError::OutcomeUnknown`.
+                Err(match e {
+                    MetaStoreError::OutcomeUnknown(why) => StreamError::OutcomeUnknown(why),
+                    MetaStoreError::IOError(why) => StreamError::NotReplicated(why),
+                    other @ MetaStoreError::NotFound(_) => {
+                        StreamError::NotReplicated(other.to_string())
+                    }
+                })
             }
         }
     }
@@ -789,7 +808,8 @@ mod tests {
         /// When set, `append_stream_entry` fails with this message — the store
         /// side of "the propose did not commit", which is the only way to reach
         /// the failing branch of `push` without a raft cluster.
-        append_error: Option<String>,
+        /// `(reason, outcome_unknown)` for a store that fails every append.
+        append_error: Option<(String, bool)>,
     }
 
     impl MetaStore for MemKvStore {
@@ -816,8 +836,12 @@ mod tests {
             stream_prefix: &str,
             data: &[u8],
         ) -> Result<u64, MetaStoreError> {
-            if let Some(why) = &self.append_error {
-                return Err(MetaStoreError::IOError(why.clone()));
+            if let Some((why, outcome_unknown)) = &self.append_error {
+                return Err(if *outcome_unknown {
+                    MetaStoreError::OutcomeUnknown(why.clone())
+                } else {
+                    MetaStoreError::IOError(why.clone())
+                });
             }
             let mut i = self.inner.lock().unwrap();
             let seq = *i.tails.get(stream_prefix).unwrap_or(&0);
@@ -996,7 +1020,14 @@ mod tests {
     fn store_that_refuses_appends(why: &str) -> Arc<dyn MetaStore> {
         Arc::new(MemKvStore {
             inner: Mutex::new(StreamKv::default()),
-            append_error: Some(why.to_string()),
+            append_error: Some((why.to_string(), false)),
+        })
+    }
+
+    fn store_whose_appends_go_unanswered(why: &str) -> Arc<dyn MetaStore> {
+        Arc::new(MemKvStore {
+            inner: Mutex::new(StreamKv::default()),
+            append_error: Some((why.to_string(), true)),
         })
     }
 
@@ -1015,7 +1046,7 @@ mod tests {
     #[test]
     fn a_refused_append_says_why_and_leaves_the_stream_open() {
         let c = WalStreamCore::new(
-            store_that_refuses_appends("propose timed out after 5s"),
+            store_that_refuses_appends("not leader, leader hint: None"),
             "mbox".into(),
         );
 
@@ -1025,15 +1056,34 @@ mod tests {
         };
         match &err {
             StreamError::NotReplicated(why) => assert!(
-                why.contains("propose timed out after 5s"),
+                why.contains("not leader, leader hint: None"),
                 "the store's own reason must reach the caller: {why}"
             ),
-            other => panic!("a failed append must not be reported as {other:?}"),
+            other => panic!("a refused append must not be reported as {other:?}"),
         }
         assert!(
             !StreamBackend::is_closed(&c),
             "only this append failed — the stream still takes the next one"
         );
+    }
+
+    /// An append that was sent and never answered may have committed. It must
+    /// say so, not report a refusal the caller would safely retry: that retry
+    /// is how a committed entry gets appended twice.
+    #[test]
+    fn an_unanswered_append_says_it_may_have_committed() {
+        let c = WalStreamCore::new(
+            store_whose_appends_go_unanswered("transport error: Timeout expired"),
+            "mbox".into(),
+        );
+        match StreamBackend::push(&c, b"hello") {
+            Err(StreamError::OutcomeUnknown(why)) => assert!(
+                why.contains("transport error: Timeout expired"),
+                "the store's own reason must reach the caller: {why}"
+            ),
+            other => panic!("an unanswered append must not be reported as {other:?}"),
+        }
+        assert!(!StreamBackend::is_closed(&c));
     }
 
     /// The core keeps NO local cursor — the store owns it. A fresh instance

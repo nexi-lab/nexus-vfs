@@ -150,6 +150,13 @@ pub enum KernelError {
     /// Federation bootstrap (env parsing, ZoneManager construction,
     /// create_zone/join_zone, reconcile) failed.
     Federation(String),
+    /// A replicated append was refused: nothing was appended, so a retry is
+    /// safe. Carries the whole sentence, like `IOError`.
+    NotCommitted(String),
+    /// A replicated append was sent and no answer came back: it may have
+    /// committed, so a blind retry may append it twice. Carries the whole
+    /// sentence, like `IOError`.
+    OutcomeUnknown(String),
 }
 
 /// The kernel's errors carry their own message.
@@ -195,6 +202,7 @@ impl std::fmt::Display for KernelError {
             Self::PermissionDenied(m) => write!(f, "permission denied: {m}"),
             Self::BackendError(m) => write!(f, "backend error: {m}"),
             Self::Federation(m) => write!(f, "federation: {m}"),
+            Self::NotCommitted(m) | Self::OutcomeUnknown(m) => write!(f, "{m}"),
         }
     }
 }
@@ -2942,12 +2950,15 @@ fn stream_mgr_err(e: crate::stream_manager::StreamManagerError) -> KernelError {
                 StreamError::Truncated(earliest, req) => {
                     KernelError::StreamTruncated(earliest, req)
                 }
-                // An append that did not commit is an I/O failure, NOT a closed
-                // stream: the reason travels verbatim so the client sees what
-                // happened instead of a Debug dump of the variant.
+                // An append that did not commit is an append failure, NOT a
+                // closed stream: the reason travels verbatim so the client sees
+                // what happened instead of a Debug dump of the variant.
                 StreamError::NotReplicated(why) => {
-                    KernelError::IOError(format!("stream append did not commit: {why}"))
+                    KernelError::NotCommitted(format!("stream append did not commit: {why}"))
                 }
+                StreamError::OutcomeUnknown(why) => KernelError::OutcomeUnknown(format!(
+                    "stream append outcome unknown, it may have committed: {why}"
+                )),
                 StreamError::ReadFailed(why) => {
                     KernelError::IOError(format!("stream read failed: {why}"))
                 }

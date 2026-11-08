@@ -113,8 +113,13 @@ pub struct FileMetadata {
 pub enum MetaStoreError {
     /// Key not found.
     NotFound(String),
-    /// Underlying I/O or storage error.
+    /// Underlying I/O or storage error. For a replicated write, a refusal:
+    /// nothing was applied, so a retry is safe.
     IOError(String),
+    /// A replicated write was sent and no answer came back: it may have
+    /// committed, so a retry may apply it twice. A caller that must not
+    /// duplicate the write reads the state back before retrying.
+    OutcomeUnknown(String),
 }
 
 /// An error that carries its own message.
@@ -129,6 +134,12 @@ impl std::fmt::Display for MetaStoreError {
         match self {
             Self::NotFound(key) => write!(f, "metastore key not found: {key}"),
             Self::IOError(msg) => write!(f, "metastore I/O error: {msg}"),
+            Self::OutcomeUnknown(msg) => {
+                write!(
+                    f,
+                    "metastore write outcome unknown, it may have committed: {msg}"
+                )
+            }
         }
     }
 }

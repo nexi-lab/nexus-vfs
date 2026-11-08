@@ -1003,15 +1003,24 @@ impl Kernel {
                     Err(crate::stream_manager::StreamManagerError::Backend(
                         crate::stream::StreamError::Closed(msg),
                     )) => return Err(KernelError::StreamClosed(msg.to_string())),
-                    // The append did not commit and the backend said why. Which
-                    // stream, and the reason as given — the two things a client
-                    // needs to decide what to do, and neither was reachable while
-                    // this arrived as a `Closed` carrying a canned guess.
+                    // The append failed and the backend said why. Which stream,
+                    // the reason as given, and whether it may have committed —
+                    // what a client needs to decide between a retry and a
+                    // read-back. None of it was reachable while this arrived as a
+                    // `Closed` carrying a canned guess.
                     Err(crate::stream_manager::StreamManagerError::Backend(
                         crate::stream::StreamError::NotReplicated(why),
                     )) => {
-                        return Err(KernelError::IOError(format!(
+                        return Err(KernelError::NotCommitted(format!(
                             "DT_STREAM append at {path} did not commit: {why}"
+                        )))
+                    }
+                    Err(crate::stream_manager::StreamManagerError::Backend(
+                        crate::stream::StreamError::OutcomeUnknown(why),
+                    )) => {
+                        return Err(KernelError::OutcomeUnknown(format!(
+                            "DT_STREAM append at {path}: outcome unknown, it may have \
+                             committed: {why}"
                         )))
                     }
                     // `Full` is BACKPRESSURE, not failure: the frame did not
