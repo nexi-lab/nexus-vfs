@@ -76,7 +76,14 @@ fn revoked_control_connection_stops_and_reaps_the_terminal_child() {
 #[test]
 fn admission_failure_reaps_a_child_that_has_not_connected_its_runtime() {
     let mut session = terminal("revoked_bootstrap_fixture");
-    session.expect("BOOTSTRAP_CHILD_REAPED").unwrap();
+    session
+        .expect("BOOTSTRAP_CHILD_REAPED")
+        .unwrap_or_else(|error| {
+            panic!(
+                "{error}; terminal: {}",
+                session.render(|screen| screen.contents())
+            )
+        });
     assert_eq!(session.expect_eof().unwrap(), 0);
 }
 
@@ -143,8 +150,12 @@ fn revoked_bootstrap_fixture() {
 #[test]
 #[ignore = "child stalls before connecting its managed runtime"]
 fn stalled_runtime_fixture() {
-    let marker = std::env::var("BOOT_STALL_MARKER").unwrap();
-    std::fs::write(marker, std::process::id().to_string()).unwrap();
+    let marker = std::path::PathBuf::from(std::env::var("BOOT_STALL_MARKER").unwrap());
+    // Existence releases the manager's cancellation barrier. Publish only
+    // after the complete PID is written; cancellation can kill us immediately.
+    let pending = marker.with_extension("pending");
+    std::fs::write(&pending, std::process::id().to_string()).unwrap();
+    std::fs::rename(pending, marker).unwrap();
     let mut input = String::new();
     io::stdin().read_line(&mut input).unwrap();
     panic!("bootstrap-stalled child must be cancelled before terminal input");
