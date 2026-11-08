@@ -13,6 +13,7 @@ use a2a::session_io::SessionMailbox;
 use dashmap::DashMap;
 use kernel::core::agents::registry::{AgentDescriptor, AgentInstance, AgentRegistry, AgentState};
 use kernel::kernel::{Kernel, OperationContext};
+use serde::Deserialize;
 use subprocess::terminal::PreparedTerminalLaunch;
 use subprocess::{HostedSubprocess, ProcessExit};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -487,7 +488,7 @@ async fn forward_line(
             .exit
             .take()
             .ok_or("unexpected terminal exit receipt")?;
-        let exit: ProcessExit = serde_json::from_value(message["params"].clone())
+        let exit: ProcessExit = ProcessExit::deserialize(&message["params"])
             .map_err(|error| format!("invalid terminal exit receipt: {error}"))?;
         if exit.code.is_some() && exit.signal.is_some() {
             return Err("terminal exit receipt has both a code and a signal".into());
