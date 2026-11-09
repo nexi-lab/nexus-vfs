@@ -32,37 +32,31 @@ pub fn replica_node_id_from_x509(cert: &X509Certificate<'_>) -> Result<Option<u6
     if replicas.next().is_some() {
         return Err("credential must carry exactly one replica identity".into());
     }
-    let node_id = replica
+    let value = replica
         .strip_prefix(PREFIX)
-        .and_then(|value| value.parse::<u64>().ok())
         .ok_or("invalid replica node ID")?;
-    let replica_uri = replica_identity_uri(node_id)?;
-    if replica_uri != replica {
+    if !matches!(value.as_bytes().first(), Some(b'1'..=b'9')) {
         return Err("replica node ID must be canonical".into());
     }
+    let node_id = value
+        .parse::<u64>()
+        .map_err(|_| "invalid replica node ID")?;
     super::user_runtime_name_from_x509(cert)?
         .ok_or("replica identity requires an owner runtime credential")?;
-    let subject = super::authorship::agent_name_from_x509(cert)
-        .ok_or("replica identity requires an agent subject")?;
-    let owner = super::authorship::owner_from_x509(cert)
-        .ok_or("replica identity requires a signed owner")?;
-    let expected = [
-        crate::agent_identity::agent_identity_uri(&subject),
-        crate::agent_identity::owner_uri(&owner),
-        replica_uri,
-    ];
     let mut seen = 0_u8;
     for entry in names {
         let GeneralName::URI(uri) = entry else {
             continue;
         };
-        let Some(index) = expected
-            .iter()
-            .position(|expected| expected.as_str() == *uri)
-        else {
+        let bit = if *uri == replica {
+            1
+        } else if crate::agent_identity::parse_agent_identity_uri_ref(uri).is_some() {
+            2
+        } else if crate::agent_identity::parse_owner_uri_ref(uri).is_some() {
+            4
+        } else {
             return Err("replica identity must name one owner and one agent subject".into());
         };
-        let bit = 1 << index;
         if seen & bit != 0 {
             return Err("replica identity must name one owner and one agent subject".into());
         }
@@ -80,6 +74,10 @@ mod tests {
     use rcgen::{Certificate, CertificateParams, ExtendedKeyUsagePurpose, KeyPair, SanType};
 
     fn certificate(uris: &[&str]) -> Certificate {
+        certificate_with_names(uris, Vec::new())
+    }
+
+    fn certificate_with_names(uris: &[&str], extra_names: Vec<SanType>) -> Certificate {
         let mut params =
             CertificateParams::new(vec![
                 super::super::user_runtime_server_name("alice").unwrap()
@@ -93,6 +91,7 @@ mod tests {
             uris.iter()
                 .map(|uri| SanType::URI((*uri).try_into().unwrap())),
         );
+        params.subject_alt_names.extend(extra_names);
         params.self_signed(&KeyPair::generate().unwrap()).unwrap()
     }
 
@@ -125,6 +124,42 @@ mod tests {
     }
 
     #[test]
+    fn replica_identity_accepts_the_full_nonzero_u64_range() {
+        for id in [1, u64::MAX] {
+            let uri = replica_identity_uri(id).unwrap();
+            let leaf = certificate(&["nexus://agent/session-a", "nexus://owner/alice", &uri]);
+            let (_, cert) = X509Certificate::from_der(leaf.der()).unwrap();
+            assert_eq!(replica_node_id_from_x509(&cert).unwrap(), Some(id));
+        }
+    }
+
+    #[test]
+    fn replica_identity_rejects_additional_dns_and_non_uri_names() {
+        for name in [
+            SanType::DnsName(
+                super::super::user_runtime_server_name("alice")
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            ),
+            SanType::DnsName("nexus-node".try_into().unwrap()),
+            SanType::IpAddress("127.0.0.1".parse().unwrap()),
+            SanType::Rfc822Name("alice@example.com".try_into().unwrap()),
+        ] {
+            let leaf = certificate_with_names(
+                &[
+                    "nexus://agent/session-a",
+                    "nexus://owner/alice",
+                    "nexus://replica/7",
+                ],
+                vec![name],
+            );
+            let (_, cert) = X509Certificate::from_der(leaf.der()).unwrap();
+            assert!(replica_node_id_from_x509(&cert).is_err());
+        }
+    }
+
+    #[test]
     fn replica_requires_one_canonical_identity_and_the_exact_owner_runtime_shape() {
         for uri in [
             "nexus://replica/0",
@@ -138,6 +173,18 @@ mod tests {
             assert!(replica_node_id_from_x509(&cert).is_err(), "{uri}");
         }
         for uris in [
+            vec!["nexus://agent/", "nexus://owner/alice", "nexus://replica/7"],
+            vec![
+                "nexus://agent/session-a",
+                "nexus://owner/",
+                "nexus://replica/7",
+            ],
+            vec![
+                "nexus://agent/session-a",
+                "nexus://agent/session-b",
+                "nexus://owner/alice",
+                "nexus://replica/7",
+            ],
             vec![
                 "nexus://agent/session-a",
                 "nexus://agent/session-a",
