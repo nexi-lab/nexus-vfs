@@ -316,13 +316,17 @@ impl std::error::Error for AgentError {}
 
 #[derive(Debug)]
 struct AgentNotify {
+    incarnation: Uuid,
+    requires_wire_incarnation: bool,
     mutex: Mutex<()>,
     state_changed: Condvar,
 }
 
 impl AgentNotify {
-    fn new() -> Self {
+    fn new(requires_wire_incarnation: bool) -> Self {
         Self {
+            incarnation: Uuid::new_v4(),
+            requires_wire_incarnation,
             mutex: Mutex::new(()),
             state_changed: Condvar::new(),
         }
@@ -341,11 +345,23 @@ impl AgentNotify {
 pub type OnTerminateCallback = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// A reference to one registry incarnation, retained across asynchronous work.
-/// It is local to this registry and never changes the PID or wire descriptor.
+/// Its wire incarnation names the same identity without changing the OS PID.
 #[derive(Clone, Debug)]
 pub struct AgentInstance {
     pid: String,
     identity: Arc<AgentNotify>,
+}
+
+impl AgentInstance {
+    /// Opaque identity allocated by this registry for this registration only.
+    pub fn incarnation(&self) -> Uuid {
+        self.identity.incarnation
+    }
+
+    /// Whether PID-only wire operations must refuse this registration.
+    pub fn requires_wire_incarnation(&self) -> bool {
+        self.identity.requires_wire_incarnation
+    }
 }
 
 struct AgentRecord {
@@ -453,13 +469,21 @@ impl AgentRegistry {
 
     /// Atomically register and retain this incarnation for delayed lifecycle work.
     pub fn register_instance(&self, desc: AgentDescriptor) -> Option<AgentInstance> {
+        self.register_instance_with_policy(desc, false)
+    }
+
+    fn register_instance_with_policy(
+        &self,
+        desc: AgentDescriptor,
+        requires_wire_incarnation: bool,
+    ) -> Option<AgentInstance> {
         use dashmap::mapref::entry::Entry;
         match self.agents.entry(desc.pid.clone()) {
             Entry::Occupied(_) => None,
             Entry::Vacant(v) => {
                 let record = AgentRecord {
                     descriptor: desc,
-                    identity: Arc::new(AgentNotify::new()),
+                    identity: Arc::new(AgentNotify::new(requires_wire_incarnation)),
                     callbacks_running: false,
                     removing: false,
                     managed_host_bound: false,
@@ -492,6 +516,35 @@ impl AgentRegistry {
         external_info: Option<ExternalProcessInfo>,
         labels: HashMap<String, String>,
     ) -> Result<AgentDescriptor, AgentError> {
+        self.spawn_with_instance(
+            name,
+            owner_id,
+            zone_id,
+            kind,
+            parent_pid,
+            pid,
+            cwd,
+            external_info,
+            labels,
+            false,
+        )
+        .map(|(_, descriptor)| descriptor)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_with_instance(
+        &self,
+        name: String,
+        owner_id: String,
+        zone_id: String,
+        kind: AgentKind,
+        parent_pid: Option<String>,
+        pid: Option<String>,
+        cwd: String,
+        external_info: Option<ExternalProcessInfo>,
+        labels: HashMap<String, String>,
+        requires_wire_incarnation: bool,
+    ) -> Result<(AgentInstance, AgentDescriptor), AgentError> {
         if let Some(ppid) = parent_pid.as_ref() {
             if !self.agents.contains_key(ppid) {
                 return Err(AgentError::NotFound(format!("parent not found: {ppid}")));
@@ -528,21 +581,21 @@ impl AgentRegistry {
         // concurrent spawns can settle on the same pid; the prior code
         // split contains_key from insert and let the explicit-pid and
         // uuid-derived paths race.
-        let final_pid = match pid {
+        let instance = match pid {
             Some(p) => {
                 desc.pid = p.clone();
-                if !self.register(desc.clone()) {
-                    return Err(AgentError::AlreadyExists(p));
-                }
-                p
+                self.register_instance_with_policy(desc.clone(), requires_wire_incarnation)
+                    .ok_or(AgentError::AlreadyExists(p))?
             }
             None => {
                 let mut out = None;
                 for _ in 0..100 {
                     let candidate = Uuid::new_v4().simple().to_string()[..12].to_string();
                     desc.pid = candidate.clone();
-                    if self.register(desc.clone()) {
-                        out = Some(candidate);
+                    if let Some(instance) =
+                        self.register_instance_with_policy(desc.clone(), requires_wire_incarnation)
+                    {
+                        out = Some(instance);
                         break;
                     }
                 }
@@ -552,12 +605,12 @@ impl AgentRegistry {
 
         if let Some(ppid) = parent_pid.as_ref() {
             if let Some(mut parent) = self.agents.get_mut(ppid) {
-                parent.children.push(final_pid.clone());
+                parent.children.push(instance.pid.clone());
                 parent.updated_at_ms = now;
             }
         }
 
-        Ok(desc)
+        Ok((instance, desc))
     }
 
     /// Unregister (remove) an agent by pid. Returns the descriptor if
@@ -1122,6 +1175,39 @@ impl AgentRegistry {
         parent_pid: Option<String>,
         labels: HashMap<String, String>,
     ) -> Result<AgentDescriptor, AgentError> {
+        self.register_external_with_instance(
+            name,
+            owner_id,
+            zone_id,
+            connection_id,
+            host_pid,
+            local_id,
+            remote_addr,
+            protocol,
+            parent_pid,
+            labels,
+            false,
+        )
+        .map(|(_, descriptor)| descriptor)
+    }
+
+    /// Register and return the exact instance allocated by the atomic insertion.
+    /// The wire policy belongs to this identity, not caller-controlled labels.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_external_with_instance(
+        &self,
+        name: String,
+        owner_id: String,
+        zone_id: String,
+        connection_id: String,
+        host_pid: Option<i64>,
+        local_id: Option<u32>,
+        remote_addr: Option<String>,
+        protocol: String,
+        parent_pid: Option<String>,
+        labels: HashMap<String, String>,
+        requires_wire_incarnation: bool,
+    ) -> Result<(AgentInstance, AgentDescriptor), AgentError> {
         let now = now_ms();
         let pid = match host_pid {
             Some(hp) => contracts::encode_agent_pid(hp, local_id),
@@ -1133,7 +1219,7 @@ impl AgentRegistry {
             protocol,
             last_heartbeat_ms: Some(now),
         };
-        self.spawn(
+        self.spawn_with_instance(
             name,
             owner_id,
             zone_id,
@@ -1143,6 +1229,7 @@ impl AgentRegistry {
             "/".to_string(),
             Some(info),
             labels,
+            requires_wire_incarnation,
         )
     }
 
@@ -1365,6 +1452,30 @@ mod tests {
         let instance = registry.register_instance(external_desc()).unwrap();
         assert!(registry.unregister_instance(&instance).is_some());
         assert!(registry.unregister_instance(&instance).is_none());
+    }
+
+    #[test]
+    fn wire_incarnations_belong_to_the_native_identity_not_descriptor_fields() {
+        let registry = AgentRegistry::new();
+        let descriptor = external_desc();
+        let old = registry
+            .register_instance_with_policy(descriptor.clone(), true)
+            .unwrap();
+        assert!(old.requires_wire_incarnation());
+        let captured = registry.get_instance("42").unwrap().0;
+        assert_eq!(old.incarnation(), captured.incarnation());
+        registry.unregister_instance(&old).unwrap();
+        let replacement = registry
+            .register_instance_with_policy(descriptor.clone(), true)
+            .unwrap();
+        assert_ne!(old.incarnation(), replacement.incarnation());
+        let foreign_registry = AgentRegistry::new();
+        let foreign = foreign_registry
+            .register_instance_with_policy(descriptor, true)
+            .unwrap();
+        assert_ne!(replacement.incarnation(), foreign.incarnation());
+        assert!(registry.heartbeat_instance(&old).unwrap().is_none());
+        assert!(registry.is_current_instance(&replacement));
     }
 
     #[test]

@@ -866,6 +866,9 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
             .agent_registry
             .get_instance(session_id)
             .ok_or_else(|| ManagedAgentError::UnknownSession(session_id.to_string()))?;
+        if descriptor.kind != AgentKind::Managed {
+            return Err(ManagedAgentError::UnknownSession(session_id.to_string()));
+        }
         Self::authorize_session_descriptor(&descriptor, ctx)?;
         Ok((instance, descriptor))
     }
