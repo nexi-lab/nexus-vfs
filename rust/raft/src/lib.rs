@@ -180,6 +180,8 @@ pub mod control_state_store;
 pub mod distributed_coordinator;
 #[cfg(all(feature = "grpc", has_protos))]
 pub mod foreign_ca_store;
+#[cfg(all(feature = "grpc", has_protos))]
+pub mod replica_binding_store;
 pub mod session_mint_admin;
 #[cfg(all(feature = "grpc", has_protos))]
 pub mod session_mint_allow_store;

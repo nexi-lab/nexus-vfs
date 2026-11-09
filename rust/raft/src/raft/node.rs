@@ -1431,6 +1431,28 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         self.submit_conditional_storage(command).await
     }
 
+    /// A typed control mutation shares the existing enforced-local SC door.
+    /// Managed membership needs protocol activation before this command can
+    /// enter its log or be forwarded to another binary.
+    #[cfg(all(feature = "grpc", has_protos))]
+    pub(crate) async fn commit_replica_binding(
+        &self,
+        request: contracts::replica_binding::ReplicaBindingRequest,
+    ) -> Result<CommandResult> {
+        if !self.supports_replica_binding() {
+            return Err(RaftError::UnsupportedOperation(
+                "replica binding protocol is not activated",
+            ));
+        }
+        self.submit_conditional_storage(Command::ApplyReplicaBinding(Box::new(request)))
+            .await
+    }
+
+    #[cfg(all(feature = "grpc", has_protos))]
+    pub(crate) fn supports_replica_binding(&self) -> bool {
+        self.config.membership_policy == super::MembershipPolicy::FixedLocal
+    }
+
     #[cfg(all(feature = "grpc", has_protos))]
     pub(crate) async fn rename_metadata(
         &self,

@@ -17,6 +17,8 @@ server name. The issuer assigns the nonzero replica ID. Zone membership
 determines its replication visibility. The shared certificate parser verifies
 the exact identity shape, including duplicate URI rejection. Proof-bound
 renewal preserves that identity while rotating the leaf key and serial.
+The [replica issuer contract](replica-issuer.md) owns durable allocation/PVC
+binding, operation reconciliation, renewal publication and retirement.
 
 ```mermaid
 flowchart LR

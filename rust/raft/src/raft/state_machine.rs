@@ -25,8 +25,14 @@ mod conditional_metadata;
 mod metadata_rename;
 mod protected_metadata;
 mod record_guard;
+mod replica_binding;
 pub use conditional_metadata::VersionedMetadata;
 pub use record_guard::GuardedRecordMutation;
+
+fn owned_control_namespace(namespace: &str) -> bool {
+    namespace == conditional_metadata::NAMESPACE
+        || namespace == contracts::constants::CONTROL_NS_REPLICA
+}
 
 /// Command to be replicated through Raft.
 ///
@@ -312,6 +318,9 @@ pub enum Command {
         key: String,
         expected_version: Vec<u8>,
     },
+    /// Atomically update the native replica binding and its original-operation
+    /// receipt in the existing control tree. Appended to preserve log indices.
+    ApplyReplicaBinding(Box<contracts::replica_binding::ReplicaBindingRequest>),
 }
 
 impl Command {
@@ -325,6 +334,7 @@ impl Command {
                 | Self::GuardedRecord { .. }
                 | Self::RetireRecordGuard { .. }
                 | Self::AdmitRecordIoOwner { .. }
+                | Self::ApplyReplicaBinding(_)
         )
     }
 
@@ -422,7 +432,7 @@ pub trait StateMachine: Send + Sync {
 
     /// Admission shared by EC origin, ingress and state-machine apply.
     fn requires_strong_consistency(&self, command: &Command) -> Result<bool> {
-        Ok(command.requires_conditional_sc())
+        Ok(command.requires_conditional_sc() || command.requires_replica_sc())
     }
 
     /// Apply a committed command to the state machine.
@@ -1898,6 +1908,9 @@ impl FullStateMachine {
                 | Command::AdmitRecordIoOwner { .. } => Err(super::RaftError::InvalidState(
                 "versioned metadata requires a Raft-committed transaction".into(),
             )),
+            Command::ApplyReplicaBinding(_) => Err(super::RaftError::InvalidState(
+                "replica binding requires a Raft-committed transaction".into(),
+            )),
             Command::PutControlState {
                 namespace,
                 key,
@@ -2260,9 +2273,9 @@ impl FullStateMachine {
                 if_absent,
             } => {
                 let def = redb::TableDefinition::<&[u8], &[u8]>::new(self.control_state.name());
-                if namespace == conditional_metadata::NAMESPACE {
+                if owned_control_namespace(namespace) {
                     return Ok(CommandResult::Error(
-                        "conditional revision control state is owned by its apply primitive".into(),
+                        "control state is owned by its typed apply primitive".into(),
                     ));
                 }
                 let mut table = txn
@@ -2292,9 +2305,9 @@ impl FullStateMachine {
 
             Command::DeleteControlState { namespace, key } => {
                 let def = redb::TableDefinition::<&[u8], &[u8]>::new(self.control_state.name());
-                if namespace == conditional_metadata::NAMESPACE {
+                if owned_control_namespace(namespace) {
                     return Ok(CommandResult::Error(
-                        "conditional revision control state is owned by its apply primitive".into(),
+                        "control state is owned by its typed apply primitive".into(),
                     ));
                 }
                 let mut table = txn
@@ -2305,6 +2318,8 @@ impl FullStateMachine {
                     .map_err(|e| super::RaftError::Storage(format!("remove control_state: {e}")))?;
                 Ok(CommandResult::Success)
             }
+
+            Command::ApplyReplicaBinding(request) => self.apply_replica_binding(txn, request),
 
             Command::WriteVersionedMetadata {
                 key,
@@ -2373,7 +2388,9 @@ impl StateMachine for FullStateMachine {
     }
 
     fn requires_strong_consistency(&self, command: &Command) -> Result<bool> {
-        Ok(command.requires_conditional_sc() || self.ordinary_write_is_protected(command)?)
+        Ok(command.requires_conditional_sc()
+            || command.requires_replica_sc()
+            || self.ordinary_write_is_protected(command)?)
     }
 
     fn apply_local(&mut self, command: &Command) -> Result<CommandResult> {

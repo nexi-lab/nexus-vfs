@@ -12,6 +12,7 @@ pub mod credential_intent;
 pub mod lock_state;
 pub mod operation_context;
 pub mod operation_id;
+pub mod replica_binding;
 pub mod rust_service;
 pub mod zone_id;
 pub mod zone_path;

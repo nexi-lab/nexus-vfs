@@ -6,6 +6,7 @@ on:
   pull_request:
     paths:
       - 'rust/raft/**'
+      - 'rust/contracts/src/replica_binding.rs'
       - 'rust/kernel/src/abc/meta_store.rs'
       - 'rust/kernel/src/core/meta_store/**'
       - 'rust/kernel/src/extensions/conditional_metadata.rs'
@@ -34,6 +35,10 @@ jobs:
           cache-key: node-control-${{ matrix.os }}
       - run: cargo test --locked -p raft@0.1.0 --test node_rpc_boundaries
       - run: cargo test --locked -p raft@0.1.0 --test generated_contract_binding
+      - name: Durable replica allocation authority
+        run: |
+          cargo test --locked -p raft@0.1.0 --lib raft::state_machine::replica_binding::tests
+          cargo test --locked -p raft@0.1.0 --test replica_binding_authority
       - name: Conditional metadata, local root and data-zone boundaries
         run: cargo test --locked -p raft@0.1.0 --test test_conditional_zone_metadata --test test_conditional_metadata_ec_boundary --test test_isolated_root_admission --test test_zone_owner_replication -- --test-threads=1
       - run: cargo test --locked -p raft@0.1.0 --lib transport::node_authority::tests
