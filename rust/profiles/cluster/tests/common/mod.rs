@@ -41,6 +41,7 @@ pub fn bin() -> &'static str {
 }
 
 mod ports;
+#[allow(unused_imports)] // Each integration test uses a different subset of the harness.
 pub use ports::{free_port, free_port_pair};
 
 /// A spawned `nexusd-cluster`, killed on drop. Reader threads capture
