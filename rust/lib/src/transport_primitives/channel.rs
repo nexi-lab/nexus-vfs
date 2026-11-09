@@ -31,11 +31,21 @@ pub async fn create_channel(
         .parse()
         .map_err(|e| TransportError::InvalidAddress(format!("{e}")))?;
     // TLS material selects the transport. A routing URI cannot disable it.
-    if config.tls.is_some() && uri.scheme() == Some(&tonic::codegen::http::uri::Scheme::HTTP) {
-        let mut parts = uri.into_parts();
-        parts.scheme = Some(tonic::codegen::http::uri::Scheme::HTTPS);
-        uri = tonic::codegen::http::Uri::from_parts(parts)
-            .map_err(|e| TransportError::InvalidAddress(format!("{e}")))?;
+    if config.tls.is_some() {
+        match uri.scheme_str() {
+            Some("http") => {
+                let mut parts = uri.into_parts();
+                parts.scheme = Some(tonic::codegen::http::uri::Scheme::HTTPS);
+                uri = tonic::codegen::http::Uri::from_parts(parts)
+                    .map_err(|e| TransportError::InvalidAddress(format!("{e}")))?;
+            }
+            Some("https") => {}
+            _ => {
+                return Err(TransportError::InvalidAddress(
+                    "TLS peer endpoints require an http or https routing URI".into(),
+                ))
+            }
+        }
     }
     let mut ep = tonic::transport::Endpoint::from_shared(uri.to_string())
         .map_err(|e| TransportError::InvalidAddress(format!("{e}")))?

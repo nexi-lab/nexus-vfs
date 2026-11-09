@@ -160,6 +160,31 @@ impl Drop for Fixture {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configured_tls_rejects_other_uri_schemes_before_an_rpc() {
+    let fixture = Fixture::start(false).await;
+    let config = lib::transport_primitives::ClientConfig {
+        tls: Some(fixture.tls(2)),
+        ..Default::default()
+    };
+    for scheme in ["ws", "h2c", "nexus"] {
+        let result = lib::transport_primitives::create_channel(
+            &format!("{scheme}://{}", fixture.address),
+            &config,
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(lib::transport_primitives::TransportError::InvalidAddress(_))
+            ),
+            "{scheme}: {result:?}"
+        );
+    }
+    assert!(fixture.calls.lock().unwrap().is_empty());
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scoped_content_never_falls_back_to_the_legacy_unscoped_rpc() {
     let fixture = Fixture::start(true).await;
     let client = PeerBlobClient::new(tokio::runtime::Handle::current());
