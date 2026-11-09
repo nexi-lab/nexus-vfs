@@ -5883,29 +5883,18 @@ impl nexus_raft::agent_minter::AgentMinter for FounderAgentMinter {
                     &ca_pem,
                     u64::try_from(now_ms).map_err(|_| "session renewal clock overflow")?,
                 )?;
-                let (cert_pem, key_pem) = if let Some(node_id) = verified.replica_node_id {
-                    nexus_raft::transport::generate_user_replica_cert(
-                        &verified.subject_id,
-                        &verified.owner_id,
-                        node_id,
-                        renewal.validity_secs,
-                        &ca_pem,
-                        &ca_key_pem,
-                    )?
+                let signer = if verified.runtime_server_name.is_some() {
+                    nexus_raft::transport::generate_user_runtime_cert
                 } else {
-                    let signer = if verified.runtime_server_name.is_some() {
-                        nexus_raft::transport::generate_user_runtime_cert
-                    } else {
-                        nexus_raft::transport::generate_session_agent_cert
-                    };
-                    signer(
-                        &verified.subject_id,
-                        &verified.owner_id,
-                        renewal.validity_secs,
-                        &ca_pem,
-                        &ca_key_pem,
-                    )?
+                    nexus_raft::transport::generate_session_agent_cert
                 };
+                let (cert_pem, key_pem) = signer(
+                    &verified.subject_id,
+                    &verified.owner_id,
+                    renewal.validity_secs,
+                    &ca_pem,
+                    &ca_key_pem,
+                )?;
                 Ok((cert_pem, key_pem, verified.subject_id))
             },
         )?;
@@ -7934,8 +7923,15 @@ mod tests {
                         proof: &proof,
                     },
                 )
-                .await
-                .unwrap();
+                .await;
+            if node_id.is_some() {
+                assert!(
+                    matches!(renewed, Err(ref error) if error == "replica renewal requires current allocation authority"),
+                    "ordinary session renewal must not bypass replica allocation authority"
+                );
+                continue;
+            }
+            let renewed = renewed.unwrap();
             let der = ::pem::parse(&renewed.cert_pem).unwrap();
             let (_, leaf) = X509Certificate::from_der(der.contents()).unwrap();
             assert_eq!(replica_node_id_from_x509(&leaf).unwrap(), node_id);

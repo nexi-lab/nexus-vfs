@@ -25,7 +25,6 @@ pub struct VerifiedSessionRenewal {
     pub owner_id: String,
     pub serial: Vec<u8>,
     pub runtime_server_name: Option<String>,
-    pub replica_node_id: Option<u64>,
 }
 
 /// Verify the existing key, issuer, credential lifetime and requester binding.
@@ -80,13 +79,16 @@ pub fn verify_session_renewal(
         .filter(|owner| !owner.is_empty())
         .ok_or("session renewal requires a signed owner")?;
     let runtime_server_name = lib::transport_primitives::user_runtime_name_from_x509(&cert)?;
-    let replica_node_id = lib::transport_primitives::replica_node_id_from_x509(&cert)?;
+    // Replica renewal also depends on the current durable allocation and
+    // issuer generation. This session proof cannot authorize that capability.
+    if lib::transport_primitives::replica_node_id_from_x509(&cert)?.is_some() {
+        return Err("replica renewal requires current allocation authority".into());
+    }
     Ok(VerifiedSessionRenewal {
         subject_id,
         owner_id,
         serial: cert.raw_serial().to_vec(),
         runtime_server_name,
-        replica_node_id,
     })
 }
 
@@ -105,9 +107,23 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
+            Self::with_replica(None)
+        }
+
+        fn with_replica(replica: Option<u64>) -> Self {
             let (ca, ca_key) = generate_zone_ca("root").unwrap();
-            let (cert, key) =
-                generate_session_agent_cert("session-fixture", "alice", 300, &ca, &ca_key).unwrap();
+            let (cert, key) = match replica {
+                Some(id) => crate::transport::generate_user_replica_cert(
+                    "session-fixture",
+                    "alice",
+                    id,
+                    300,
+                    &ca,
+                    &ca_key,
+                ),
+                None => generate_session_agent_cert("session-fixture", "alice", 300, &ca, &ca_key),
+            }
+            .unwrap();
             let (caller, _) = generate_agent_cert("moss", &ca, &ca_key).unwrap();
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -163,6 +179,27 @@ mod tests {
         assert_eq!(verified.owner_id, "alice");
         assert_eq!(verified.subject_id, "session-fixture");
         assert!(!verified.serial.is_empty());
+    }
+
+    #[test]
+    fn valid_replica_proof_does_not_authorize_session_renewal() {
+        let f = Fixture::with_replica(Some(19));
+        let proof = f.proof(300, f.now);
+        let message = session_renewal_message(
+            ::pem::parse(&f.cert).unwrap().contents(),
+            &f.caller,
+            300,
+            f.now,
+        );
+        assert_eq!(
+            lib::transport_primitives::authorship::verify(&message, &proof, &f.cert, &f.ca)
+                .unwrap(),
+            "session-fixture"
+        );
+        assert!(matches!(
+            f.verify(300, f.now, &proof, f.now),
+            Err(error) if error == "replica renewal requires current allocation authority"
+        ));
     }
 
     #[test]
