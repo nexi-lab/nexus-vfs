@@ -198,6 +198,8 @@ where
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
     }
+    // Keep generated RPC dispatch separate from the router's per-service adapter.
+    #[inline(never)]
     fn call(&mut self, mut request: http::Request<Body>) -> Self::Future {
         if !self.delegated.iter().any(|p| p == request.uri().path()) {
             match self.policy.check(request.extensions()) {
