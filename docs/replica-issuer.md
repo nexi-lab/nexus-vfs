@@ -106,8 +106,8 @@ context through the application backend.
 ## Regression coverage
 
 `raft/tests/replica_binding_authority.rs` exercises competing claims, original
-operation reconciliation, explicit retirement and replacement through the
-actual enforced-local Raft driver, and verifies managed-control refusal before
+operation reconciliation across cold restarts, explicit retirement and replacement
+through the actual enforced-local Raft driver, and verifies managed-control refusal before
 an unactivated command enters the log. State-machine tests cover snapshot restore,
 identity reservation retention, stale revisions, payload mismatch and refusal
 of generic/EC writes. The Node-control CI matrix runs these on Linux, Windows

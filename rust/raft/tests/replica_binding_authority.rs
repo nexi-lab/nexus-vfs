@@ -14,6 +14,34 @@ use nexus_raft::{
 };
 use std::sync::{Arc, Barrier};
 
+struct LocalAuthority {
+    store: Arc<RaftReplicaBindingStore>,
+    manager: Arc<ZoneManager>,
+}
+
+impl LocalAuthority {
+    fn open(dir: &std::path::Path) -> Self {
+        let manager = ZoneManager::isolated(dir.to_str().unwrap()).unwrap();
+        let root = manager
+            .create_zone(contracts::ROOT_ZONE_ID, vec![])
+            .unwrap();
+        assert!(root.wait_for_leader(std::time::Duration::from_secs(5)));
+        let node = root.consensus_node();
+        let runtime = manager.runtime_handle();
+        runtime.block_on(node.read_linearizable(|_| ())).unwrap();
+        Self {
+            store: Arc::new(RaftReplicaBindingStore::new(node, runtime)),
+            manager,
+        }
+    }
+}
+
+impl Drop for LocalAuthority {
+    fn drop(&mut self) {
+        self.manager.shutdown();
+    }
+}
+
 fn request(operation: &str, id: u64) -> ReplicaBindingRequest {
     ReplicaBindingRequest {
         operation_id: operation.into(),
@@ -34,15 +62,8 @@ fn request(operation: &str, id: u64) -> ReplicaBindingRequest {
 #[test]
 fn concurrent_claims_and_original_reconciliation_use_one_control_authority() {
     let dir = tempfile::tempdir().unwrap();
-    let manager = ZoneManager::isolated(dir.path().to_str().unwrap()).unwrap();
-    let root = manager
-        .create_zone(contracts::ROOT_ZONE_ID, vec![])
-        .unwrap();
-    assert!(root.wait_for_leader(std::time::Duration::from_secs(5)));
-    let node = root.consensus_node();
-    let runtime = manager.runtime_handle();
-    runtime.block_on(node.read_linearizable(|_| ())).unwrap();
-    let store = Arc::new(RaftReplicaBindingStore::new(node, runtime));
+    let authority = LocalAuthority::open(dir.path());
+    let store = &authority.store;
     let gate = Arc::new(Barrier::new(2));
     let workers: Vec<_> = (1..=2)
         .map(|index| {
@@ -135,8 +156,74 @@ fn concurrent_claims_and_original_reconciliation_use_one_control_authority() {
         Some(original_result.clone())
     );
     assert_eq!(store.current(&original.allocation).unwrap(), Some(replaced));
-    drop(store);
-    manager.shutdown();
+}
+
+#[test]
+fn cold_restart_recovers_original_operation_without_restoring_retired_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = request("persisted-before-client-recovery", 501);
+    let node_id = {
+        let authority = LocalAuthority::open(dir.path());
+        // Discard the caller's result. Recovery below uses only the retained
+        // original request and the reopened store, never an in-memory receipt.
+        assert!(matches!(
+            authority.store.apply(&original).unwrap(),
+            ReplicaBindingOutcome::Applied(_)
+        ));
+        authority.manager.node_id()
+    };
+    let committed = {
+        let authority = LocalAuthority::open(dir.path());
+        assert_eq!(authority.manager.node_id(), node_id);
+        let Some(ReplicaBindingOutcome::Applied(binding)) =
+            authority.store.reconcile(&original).unwrap()
+        else {
+            panic!("original operation survived restart")
+        };
+        assert_eq!(
+            (binding.replica_id, binding.revision, binding.generation),
+            (501, 1, 1)
+        );
+        assert_eq!(
+            authority.store.current_for_replica(501).unwrap(),
+            Some(binding.clone())
+        );
+        let retirement = ReplicaBindingRequest {
+            operation_id: "retire-recovered-allocation".into(),
+            allocation: original.allocation.clone(),
+            change: ReplicaBindingChange::Retire {
+                expected_revision: binding.revision,
+            },
+        };
+        assert!(matches!(
+            authority.store.apply(&retirement).unwrap(),
+            ReplicaBindingOutcome::Applied(_)
+        ));
+        binding
+    };
+    let authority = LocalAuthority::open(dir.path());
+    let replay = authority.store.apply(&original).unwrap();
+    assert_eq!(replay, ReplicaBindingOutcome::Applied(committed));
+    let retired = authority
+        .store
+        .current(&original.allocation)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (retired.state, retired.revision),
+        (ReplicaBindingState::Retired, 2)
+    );
+    assert_eq!(
+        authority.store.current_for_replica(501).unwrap(),
+        Some(retired)
+    );
+    let mut reuse = request("reuse-id-after-restart", 501);
+    reuse.allocation.allocation_id = "another-allocation".into();
+    assert_eq!(
+        authority.store.apply(&reuse).unwrap(),
+        ReplicaBindingOutcome::ReplicaIdReserved
+    );
+    assert_eq!(authority.store.current(&reuse.allocation).unwrap(), None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
