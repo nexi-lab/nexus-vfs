@@ -269,7 +269,7 @@ pub struct ZoneRaftRegistry {
     /// Base path for sled databases. Each zone gets `{base_path}/{zone_id}/`.
     base_path: PathBuf,
     storage_policy: ZoneStoragePolicy,
-    /// This node's global ID (same across all zones on this node).
+    /// Network replica ID. A fixed local root retains its own durable ID.
     node_id: u64,
     /// Shared TLS config — can be updated at runtime for plaintext→mTLS upgrade.
     /// All zones' client pools read from this on new connections.
@@ -337,7 +337,7 @@ pub type ZoneMaterializedCb =
 #[derive(Clone, Copy)]
 enum ZoneStoragePolicy {
     Managed,
-    LocalRoot,
+    LocalRoot { node_id: u64 },
     RootOnly,
 }
 
@@ -346,7 +346,7 @@ impl ZoneStoragePolicy {
         if zone_id == contracts::ROOT_ZONE_ID {
             return Ok(match self {
                 Self::Managed => super::MembershipPolicy::Managed,
-                Self::LocalRoot | Self::RootOnly => super::MembershipPolicy::FixedLocal,
+                Self::LocalRoot { .. } | Self::RootOnly => super::MembershipPolicy::FixedLocal,
             });
         }
         if matches!(self, Self::RootOnly) {
@@ -383,10 +383,13 @@ impl ZoneRaftRegistry {
     pub(crate) fn with_local_root(
         base_path: PathBuf,
         node_id: u64,
+        root_node_id: u64,
         tls: Option<TlsConfig>,
     ) -> Self {
         let mut registry = Self::with_tls(base_path, node_id, tls);
-        registry.storage_policy = ZoneStoragePolicy::LocalRoot;
+        registry.storage_policy = ZoneStoragePolicy::LocalRoot {
+            node_id: root_node_id,
+        };
         registry
     }
 
@@ -645,13 +648,14 @@ impl ZoneRaftRegistry {
         // which includes this node's own address; raft-rs expects
         // `config.peers` to list OTHER peers only, so including self would
         // produce a duplicate voter ID in ConfState.
+        let node_id = self.node_id_for_zone(zone_id);
         let peer_ids: Vec<u64> = peers
             .iter()
             .map(|p| p.id)
-            .filter(|&id| id != self.node_id)
+            .filter(|&id| id != node_id)
             .collect();
         let config = RaftConfig {
-            id: self.node_id,
+            id: node_id,
             peers: peer_ids,
             // Carry the registry's advertise address through to the
             // bootstrap `AddNode(self)` entry's `context` field so
@@ -733,12 +737,17 @@ impl ZoneRaftRegistry {
     pub fn open_persisted_zone(
         &self,
         zone_id: &str,
-        peers: Vec<NodeAddress>,
+        mut peers: Vec<NodeAddress>,
         runtime_handle: &tokio::runtime::Handle,
     ) -> Result<ZoneConsensus<FullStateMachine>, TransportError> {
+        // Network seed addresses belong to managed zones. The local root
+        // resumes its own ConfState and has no network routes.
+        if self.storage_policy.membership(zone_id)? == super::MembershipPolicy::FixedLocal {
+            peers.clear();
+        }
         self.clear_auto_join_suppression(zone_id);
         let config = RaftConfig {
-            id: self.node_id,
+            id: self.node_id_for_zone(zone_id),
             peers: vec![],
             skip_bootstrap: true,
             ..Default::default()
@@ -938,6 +947,7 @@ impl ZoneRaftRegistry {
         // ephemeral achieved role. See `identity::persist_zone_intent`.
         intended_role: crate::identity::IdentityZoneRole,
     ) -> Result<ZoneConsensus<FullStateMachine>, TransportError> {
+        let node_id = config.id;
         let membership_policy = self.storage_policy.membership(zone_id)?;
         if membership_policy == super::MembershipPolicy::FixedLocal {
             if !peers.is_empty() {
@@ -1140,14 +1150,14 @@ impl ZoneRaftRegistry {
         // member, not a transport peer — see `PeerMap` invariant).
         let peer_map: HashMap<u64, NodeAddress> = peers.into_iter().map(|p| (p.id, p)).collect();
         let shared_peers: SharedPeerMap =
-            Arc::new(RwLock::new(PeerMap::with_peers(self.node_id, peer_map)));
+            Arc::new(RwLock::new(PeerMap::with_peers(node_id, peer_map)));
 
         driver.set_peer_map(shared_peers.clone(), self.tls_config().is_some());
 
         // S3 Phase B: install ConfState apply mirror if the coordinator
         // has an identity_dir in scope.  Callback captures zone_id +
         // identity_dir + shared_peers (for u64 → NodeAddress lookup) +
-        // self.node_id (for self-address inclusion when peer_map has
+        // this zone's node ID (for self-address inclusion when peer_map has
         // not yet learned it).  Emits `persist_zone_members` calls that
         // survive `data_dir` wipes and drive the joiner auto-reconnect
         // path in [`crate::bootstrap`].
@@ -1181,7 +1191,7 @@ impl ZoneRaftRegistry {
             let zone_id_owned = zone_id.to_string();
             let peers_for_cb = shared_peers.clone();
             let self_addr_for_cb = self.self_address();
-            let self_node_id_for_cb = self.node_id;
+            let self_node_id_for_cb = node_id;
             let cb: crate::raft::ConfStateAppliedCb =
                 Arc::new(move |cs: &raft::eraftpb::ConfState, _self_id: u64| {
                     let all_ids: Vec<u64> = cs
@@ -1273,7 +1283,7 @@ impl ZoneRaftRegistry {
         tracing::info!(
             "Zone '{}' registered (local_node_id={}, peers={})",
             zone_id,
-            self.node_id,
+            node_id,
             shared_peers.read().unwrap().len()
         );
 
@@ -1288,7 +1298,7 @@ impl ZoneRaftRegistry {
             ZoneEntry {
                 node: handle.clone(),
                 peers: shared_peers,
-                node_id: self.node_id,
+                node_id,
                 shutdown_tx,
                 transport_handle,
                 persistence,
@@ -1482,8 +1492,18 @@ impl ZoneRaftRegistry {
         peers.insert(peer_id, parsed)
     }
 
-    /// Get the node_id for a zone (same across all zones on this node).
+    /// The network replica identity used by managed data zones.
     pub fn node_id(&self) -> u64 {
+        self.node_id
+    }
+
+    /// Select the durable local identity before opening or reporting a zone.
+    pub(crate) fn node_id_for_zone(&self, zone_id: &str) -> u64 {
+        if let ZoneStoragePolicy::LocalRoot { node_id } = self.storage_policy {
+            if zone_id == contracts::ROOT_ZONE_ID {
+                return node_id;
+            }
+        }
         self.node_id
     }
 
@@ -1548,8 +1568,8 @@ impl ZoneRaftRegistry {
 
         let ZoneEntry {
             node,
-            peers: _,
-            node_id: _,
+            peers,
+            node_id,
             shutdown_tx,
             transport_handle,
             persistence,
@@ -1585,7 +1605,7 @@ impl ZoneRaftRegistry {
                 zone_id: zone_id.to_string(),
                 deletion_epoch: epoch,
                 deleted_at_ms: now_ms(),
-                initiated_by_node: self.node_id,
+                initiated_by_node: node_id,
             }),
             None => persistence.write_tombstone(),
         };
@@ -1595,8 +1615,8 @@ impl ZoneRaftRegistry {
                 zone_id.to_string(),
                 ZoneEntry {
                     node,
-                    peers: Arc::new(RwLock::new(PeerMap::new(self.node_id))),
-                    node_id: self.node_id,
+                    peers,
+                    node_id,
                     shutdown_tx,
                     transport_handle,
                     persistence,
