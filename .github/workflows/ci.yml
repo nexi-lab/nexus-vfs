@@ -202,6 +202,28 @@ jobs:
           shared-key: ci-secret-file-permissions-${{ matrix.os }}
       - run: cargo test -p lib --features transport transport_primitives::secret_file --lib
 
+  runtime-observations:
+    name: Runtime observations / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    env:
+      CARGO_BUILD_JOBS: 1
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-2022, macos-15]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-protoc
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-runtime-observations-${{ matrix.os }}
+      - name: Real RPC instance, ownership, expiry and partial-directory journeys
+        run: cargo test --locked -p transport --test runtime_observation_rpc --test managed_agent_grpc_auth -- --test-threads=1
+
   process-instances:
     name: Process instance lifecycle / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
