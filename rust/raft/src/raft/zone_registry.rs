@@ -226,10 +226,6 @@ struct ZoneEntry {
     /// Known peers for this zone. Shared with TransportLoop for runtime ConfChange updates.
     peers: SharedPeerMap,
     /// This node's ID within the zone.
-    #[expect(
-        dead_code,
-        reason = "reserved for future ConfChange use; remove expect when used"
-    )]
     node_id: u64,
     /// Shutdown signal for the transport loop.
     shutdown_tx: watch::Sender<bool>,

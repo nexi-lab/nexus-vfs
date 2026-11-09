@@ -9,6 +9,7 @@ mod common;
 use kernel::meta_store::{ConditionalMetadataResult, FileMetadata, MetaStore};
 use nexus_raft::distributed_coordinator::bootstrap_or_join_zone;
 use nexus_raft::transport::proto::{
+    zone_api_service_client::ZoneApiServiceClient,
     zone_transport_service_client::ZoneTransportServiceClient, GetClusterInfoRequest,
     StepMessageRequest,
 };
@@ -66,12 +67,19 @@ fn node(id: u64, dir: &std::path::Path, addr: &str) -> nexus_raft::raft::Result<
 }
 
 async fn peer_client(address: &str) -> ZoneTransportServiceClient<tonic::transport::Channel> {
+    ZoneTransportServiceClient::new(peer_channel(address).await)
+}
+
+async fn peer_channel(address: &str) -> tonic::transport::Channel {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if let Ok(client) =
-                ZoneTransportServiceClient::connect(format!("http://{address}")).await
+            if let Ok(channel) =
+                tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+                    .unwrap()
+                    .connect()
+                    .await
             {
-                break client;
+                break channel;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -405,7 +413,7 @@ async fn replica_adoption_preserves_local_root_identity_and_writes_across_restar
         assert_eq!(data.id(), replica_id);
         assert_eq!(data.voters(), vec![replica_id]);
         assert_eq!(manager.cluster_status(AGENT_ZONE).node_id, replica_id);
-        let mut client = peer_client(&address).await;
+        let mut client = ZoneApiServiceClient::new(peer_channel(&address).await);
         for (zone, expected) in [("root", local_id), (AGENT_ZONE, replica_id)] {
             let info = client
                 .get_cluster_info(GetClusterInfoRequest {
