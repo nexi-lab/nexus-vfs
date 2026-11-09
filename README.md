@@ -115,9 +115,22 @@ the request's ownership check. State updates, heartbeats, signals and removal
 do not follow a PID that was reused while the request was in progress, and
 responses do not read a replacement process's descriptor. This fence uses the
 existing native `AgentInstance`; it does not change generic Call payloads.
-Independent CLI discovery still needs a host-scoped instance identity in its
-registration and query contract: a PID-only request cannot identify an earlier
-incarnation that had already exited before the request arrived.
+External clients can opt into `Call("agent_register_external_v2")` with the
+existing external registration fields. Its result includes an opaque
+`incarnation`, allocated by the same native registry insertion as the PID.
+Keep it with that registration and send it alongside `pid` to `agent_get`,
+`agent_update_state`, `agent_heartbeat`, `agent_signal`, `agent_unregister` and
+`agent_unregister_external`. Delayed tokens refuse a reused PID even when the
+owner, Agent name and connection ID are unchanged. Missing or malformed tokens
+cannot downgrade a v2 registration to a PID-only operation. Owner authorization
+still applies; an incarnation is not a credential. Owner-filtered `agent_list`
+returns each current v2 registration's incarnation from the same snapshot.
+Managed-session reads and controls refuse external registry entries.
+Legacy registrations retain their PID-only protocol. An older daemon refuses
+the new registration method rather than silently registering an unfenced
+process. These are node-local registry operations; independent CLI lifetime
+ownership, typed observations and authorized cross-node routing remain separate
+discovery work. No protobuf message changes are required for this Call contract.
 
 `managed_agent.start_session_v1` retains its existing `session_id` response:
 this is the registry pid used by `get_session_v1`, `cancel_v1`, and `/proc`.
