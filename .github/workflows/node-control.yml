@@ -37,6 +37,8 @@ jobs:
       - name: Conditional metadata and isolated membership boundaries
         run: cargo test --locked -p raft@0.1.0 --test test_conditional_zone_metadata --test test_conditional_metadata_ec_boundary --test test_isolated_root_admission -- --test-threads=1
       - run: cargo test --locked -p raft@0.1.0 --lib transport::node_authority::tests
+      - name: Raft membership controls EC recipients
+        run: cargo test --locked -p raft@0.1.0 --lib transport::transport_loop::tests
       - run: cargo test --locked -p raft@0.1.0 --lib agent_csr_client::tests
       - run: cargo test --locked -p raft@0.1.0 --lib zone_manager::tests::mismatched_node_certificate
 

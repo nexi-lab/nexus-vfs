@@ -1874,6 +1874,14 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         voter_ids_from_raw_node(&self.raw_node)
     }
 
+    /// Replication membership from the live Raft ProgressTracker, including
+    /// incoming/outgoing voters, learners and learners awaiting joint exit.
+    /// The address book supplies routes; it cannot add replication members.
+    #[inline]
+    pub(crate) fn is_replication_member(&self, node_id: u64) -> bool {
+        self.raw_node.raft.prs().get(node_id).is_some()
+    }
+
     /// Whether this node is the leader of its zone — a cheap `RawNode` state
     /// read. Gates the transport loop's leader-only quorum-at-risk WARN so a
     /// follower never false-alarms on a transient vote-send failure.
