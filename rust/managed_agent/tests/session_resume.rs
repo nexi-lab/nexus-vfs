@@ -236,10 +236,18 @@ fn providers_without_recovery_reject_it_instead_of_starting_fresh() {
     );
 }
 #[test]
-fn raw_spawns_and_paths_cannot_be_used_as_durable_recovery() {
+fn paths_aliases_and_unhosted_sessions_cannot_be_used_as_durable_recovery() {
     let kernel = Arc::new(Kernel::new());
     install_managed_agent_with_spawn(&kernel, Arc::new(Provider)).unwrap();
-    for id in ["", "../outside", "/sessions/other", "a\\b"] {
+    for id in [
+        "",
+        "../outside",
+        "/sessions/other",
+        "a\\b",
+        "latest",
+        "last",
+        "recent",
+    ] {
         assert!(call(
             &kernel,
             "start_session_v1",
@@ -247,12 +255,6 @@ fn raw_spawns_and_paths_cannot_be_used_as_durable_recovery() {
         )
         .is_err());
     }
-    assert!(call(
-        &kernel,
-        "start_session_v1",
-        json!({"agent_id":"agent","resume_session_id":"saved","spawn_spec":{"cmd":"echo"}})
-    )
-    .is_err());
     let slim = Arc::new(Kernel::new());
     managed_agent::install_managed_agent(&slim).unwrap();
     assert!(call(

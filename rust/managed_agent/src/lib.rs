@@ -59,6 +59,9 @@ use kernel::service_registry::{RustCallError, RustService};
 #[cfg(feature = "subprocess-host")]
 pub(crate) mod raw_spawn;
 
+#[cfg(feature = "subprocess-host")]
+mod durable_session;
+
 pub mod credential_binding;
 pub(crate) mod proc_entry;
 mod runtime_discovery;
@@ -170,7 +173,7 @@ pub(crate) struct StartSessionRequest {
     /// Launch policy (command, model and credentials) belongs to the embedder.
     #[serde(default)]
     pub spawn_spec: Option<SpawnSpec>,
-    /// Durable transcript to restore in an in-process runtime. This is NOT
+    /// Durable transcript to restore in a supporting hosted runtime. This is NOT
     /// the pid-valued `session_id` accepted by get/cancel.
     #[serde(default)]
     pub resume_session_id: Option<String>,
@@ -198,7 +201,7 @@ pub(crate) struct StartSessionResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_endpoint: Option<a2a::session::SessionEndpoint>,
     /// Runtime-owned transcript ID, when the spawn provider supports persistence.
-    /// Absent for raw subprocesses and providers without durable sessions.
+    /// Raw subprocesses report it through get/list only after original ACP establishment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub durable_session_id: Option<String>,
     pub workspace_path: String,
@@ -230,7 +233,7 @@ pub(crate) struct GetSessionResponse {
     /// nobody can check.
     pub owner_id: String,
     /// Runtime-owned transcript ID, when the spawn provider supports persistence.
-    /// Absent for raw subprocesses and providers without durable sessions.
+    /// Raw subprocesses report it only after original ACP establishment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub durable_session_id: Option<String>,
     pub workspace_path: String,
@@ -410,7 +413,21 @@ pub trait SpawnTask<K: KernelSyscall>: Send + Sync + 'static {
 pub(crate) trait RawSpawn: Send + Sync {
     /// Launch before registry insertion so the descriptor uses the actual child
     /// OS PID. Dropping an unattached launch terminates the child.
-    fn prepare(&self, spec: SpawnSpec) -> Result<Box<dyn PreparedRawSpawn>, String>;
+    fn prepare(
+        &self,
+        spec: SpawnSpec,
+        resume_session_id: Option<String>,
+    ) -> Result<Box<dyn PreparedRawSpawn>, String>;
+}
+
+/// Shared lexical contract for a runtime transcript, never an alias or path.
+fn valid_durable_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && !matches!(id, "latest" | "last" | "recent")
+        && id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
 }
 
 pub(crate) trait PreparedRawSpawn: Send {
@@ -523,19 +540,14 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
             ));
         }
         if let Some(id) = req.resume_session_id.as_deref() {
-            if id.is_empty()
-                || id.len() > 128
-                || !id
-                    .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
-            {
+            if !valid_durable_id(id) {
                 return Err(ManagedAgentError::InvalidArgument(
                     "resume_session_id must be a durable ID, not a path".into(),
                 ));
             }
-            if req.spawn_spec.is_some() || self.spawn_provider.is_none() {
+            if req.spawn_spec.is_none() && self.spawn_provider.is_none() {
                 return Err(ManagedAgentError::InvalidArgument(
-                    "resume_session_id requires an in-process runtime provider".into(),
+                    "resume_session_id requires a hosted runtime provider".into(),
                 ));
             }
         }
@@ -578,7 +590,11 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                     "spawn_spec requires the subprocess-host feature".into(),
                 )
             })?;
-            Some(spawner.prepare(spec).map_err(ManagedAgentError::Internal)?)
+            Some(
+                spawner
+                    .prepare(spec, req.resume_session_id.clone())
+                    .map_err(ManagedAgentError::Internal)?,
+            )
         } else {
             None
         };
