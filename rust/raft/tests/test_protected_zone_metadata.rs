@@ -689,9 +689,8 @@ fn ec_origin_peer_ingress_and_export_preserve_the_adopted_image() {
             runtime
                 .0
                 .runtime_handle()
-                .block_on(node.apply_ec_from_peer(mutation.clone(), u64::MAX))
-                .unwrap(),
-            CommandResult::Success
+                .block_on(node.apply_ec_from_peer(mutation.clone(), u64::MAX)),
+            Err(nexus_raft::raft::RaftError::Config(_))
         ));
         assert!(matches!(
             runtime

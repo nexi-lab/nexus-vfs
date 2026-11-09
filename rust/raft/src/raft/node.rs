@@ -1685,6 +1685,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         command: Command,
         entry_timestamp: u64,
     ) -> Result<CommandResult> {
+        self.config.membership_policy.require_managed()?;
         if self
             .state_machine
             .read()
