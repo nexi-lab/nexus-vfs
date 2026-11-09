@@ -328,6 +328,42 @@ pub trait SpawnHandle: Send + Sync {
     }
 }
 
+/// Native custody of a handle belongs to its registry incarnation, not a PID
+/// lookup alone. Providers keep the existing trait; the service binds them.
+pub(crate) struct HostedSession {
+    instance: AgentInstance,
+    handle: Box<dyn SpawnHandle>,
+}
+
+type HostedSessions = Arc<dashmap::DashMap<String, HostedSession>>;
+
+fn store_host_handle(
+    registry: &AgentRegistry,
+    handles: &HostedSessions,
+    pid: String,
+    instance: AgentInstance,
+    handle: Box<dyn SpawnHandle>,
+) -> Result<(), String> {
+    // All host insertions use the same map guard before the incarnation check.
+    // A late old attach cannot overwrite a replacement handle. An occupied
+    // stale slot also needs explicit cleanup; it is not replacement permission.
+    let reason = match handles.entry(pid) {
+        dashmap::mapref::entry::Entry::Vacant(slot) => {
+            if registry.is_current_instance(&instance) {
+                slot.insert(HostedSession { instance, handle });
+                return Ok(());
+            }
+            "host incarnation retired before handle attachment"
+        }
+        dashmap::mapref::entry::Entry::Occupied(_) => {
+            "host handle already attached or cleanup unresolved"
+        }
+    };
+    // Abort can call the registry again, so release the sidecar guard first.
+    handle.abort();
+    Err(reason.into())
+}
+
 /// Optional runtime session selection. Existing providers retain their spawn
 /// implementation and explicitly reject recovery until they implement it.
 #[derive(Clone, Debug, Default)]
@@ -461,7 +497,7 @@ pub(crate) struct ManagedAgentService<K: KernelSyscall> {
     /// on_terminate observer (registered in `install_returning`) removes
     /// and aborts the handle on session termination so the worker /
     /// supervisor leaves cleanly.
-    spawn_handles: Arc<dashmap::DashMap<String, Box<dyn SpawnHandle>>>,
+    spawn_handles: HostedSessions,
     /// Optional raw-subprocess control-plane spawner for the `spawn_spec`
     /// path. `Some` only when `install_returning` wired the Kernel-concrete
     /// [`raw_spawn::KernelRawSpawn`] (`subprocess-host`); `None`
@@ -833,7 +869,17 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                         "managed runtime incarnation retired before host binding".into(),
                     ));
                 }
-                self.spawn_handles.insert(pid.clone(), handle);
+                store_host_handle(
+                    &self.agent_registry,
+                    &self.spawn_handles,
+                    pid.clone(),
+                    instance.clone(),
+                    handle,
+                )
+                .map_err(|error| {
+                    let _ = self.agent_registry.kill_instance(&instance, 1);
+                    ManagedAgentError::Internal(error)
+                })?;
             }
         }
 
@@ -970,12 +1016,16 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
         let (session_endpoint, durable_session_id) = self
             .spawn_handles
             .get(&desc.pid)
-            .map(|handle| {
-                (
-                    handle.session_endpoint().cloned(),
-                    handle.durable_session_id().map(str::to_owned),
-                )
+            .map(|host| {
+                if host.instance.incarnation() != instance.incarnation() {
+                    return Err(ManagedAgentError::UnknownSession(desc.pid.clone()));
+                }
+                Ok((
+                    host.handle.session_endpoint().cloned(),
+                    host.handle.durable_session_id().map(str::to_owned),
+                ))
             })
+            .transpose()?
             .unwrap_or_default();
         // Never combine an authorized PCB with another incarnation's handle.
         if !self.agent_registry.is_current_instance(instance) {
@@ -1120,8 +1170,7 @@ impl ManagedAgentService<kernel::kernel::Kernel> {
         // control-plane spawner can share the SAME `agent_registry` +
         // `spawn_handles` the service and its on_terminate observer use.
         let agent_registry = Arc::clone(kernel.agent_registry());
-        let spawn_handles: Arc<dashmap::DashMap<String, Box<dyn SpawnHandle>>> =
-            Arc::new(dashmap::DashMap::new());
+        let spawn_handles: HostedSessions = Arc::new(dashmap::DashMap::new());
 
         // Raw ACP subprocess control-plane spawner (memory-DT_STREAM byte
         // tunnel). Kernel-concrete — built here because it drives
@@ -1184,10 +1233,12 @@ impl ManagedAgentService<kernel::kernel::Kernel> {
         kernel.agent_registry().register_on_terminate(
             Self::NAME,
             Arc::new(move |pid: &str| {
-                if let Some((_, handle)) = spawn_handles_for_cb.remove(pid) {
-                    handle.abort();
-                }
-                if let Some(desc) = registry_for_cb.get(pid) {
+                if let Some((instance, desc)) = registry_for_cb.get_instance(pid) {
+                    if let Some((_, host)) = spawn_handles_for_cb.remove_if(pid, |_, host| {
+                        host.instance.incarnation() == instance.incarnation()
+                    }) {
+                        host.handle.abort();
+                    }
                     unregister_proc_entry(kernel_for_cb.as_ref(), &desc);
                 }
             }),
@@ -1452,13 +1503,13 @@ impl<K: KernelSyscall> RustService for ManagedAgentService<K> {
                     ));
                 }
                 let is_current_channel =
-                    self.spawn_handles
-                        .get(&req.session_id)
-                        .is_some_and(|handle| {
-                            handle
+                    self.spawn_handles.get(&req.session_id).is_some_and(|host| {
+                        host.instance.incarnation() == instance.incarnation()
+                            && host
+                                .handle
                                 .session_endpoint()
                                 .is_some_and(|endpoint| endpoint.channel_id == req.channel_id)
-                        });
+                    });
                 let resp = if is_current_channel {
                     self.cancel_instance(&instance, CancelMode::Session)?
                 } else {

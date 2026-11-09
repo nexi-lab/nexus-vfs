@@ -10,7 +10,6 @@ use std::time::Duration;
 
 use a2a::session::{SessionEndpoint, SessionPayload, SessionSide, MAX_SESSION_FRAME_BYTES};
 use a2a::session_io::SessionMailbox;
-use dashmap::DashMap;
 use kernel::core::agents::registry::{AgentDescriptor, AgentInstance, AgentRegistry, AgentState};
 use kernel::kernel::{Kernel, OperationContext};
 use subprocess::HostedSubprocess;
@@ -18,7 +17,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
 use super::durable_session::DurableSession;
-use super::{PreparedRawSpawn, RawSpawn, SpawnHandle, SpawnSpec};
+use super::{
+    store_host_handle, HostedSessions, PreparedRawSpawn, RawSpawn, SpawnHandle, SpawnSpec,
+};
 
 struct SubprocessHandle {
     endpoint: SessionEndpoint,
@@ -44,14 +45,14 @@ impl SpawnHandle for SubprocessHandle {
 pub(crate) struct KernelRawSpawn {
     kernel: Arc<Kernel>,
     agent_registry: Arc<AgentRegistry>,
-    spawn_handles: Arc<DashMap<String, Box<dyn SpawnHandle>>>,
+    spawn_handles: HostedSessions,
 }
 
 impl KernelRawSpawn {
     pub(crate) fn new(
         kernel: Arc<Kernel>,
         agent_registry: Arc<AgentRegistry>,
-        spawn_handles: Arc<DashMap<String, Box<dyn SpawnHandle>>>,
+        spawn_handles: HostedSessions,
     ) -> Self {
         Self {
             kernel,
@@ -151,14 +152,17 @@ impl KernelRawSpawn {
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let (failed_tx, mut failed_rx) = mpsc::unbounded_channel::<String>();
         let stopped = Arc::new(AtomicBool::new(false));
-        self.spawn_handles.insert(
+        store_host_handle(
+            &self.agent_registry,
+            &self.spawn_handles,
             desc.pid.clone(),
+            instance.clone(),
             Box::new(SubprocessHandle {
                 endpoint,
                 cancel: parking_lot::Mutex::new(Some(cancel_tx)),
                 durable: Arc::clone(&durable),
             }),
-        );
+        )?;
         let input_mailbox = Arc::clone(&mailbox);
         let input_stopped = Arc::clone(&stopped);
         let input_failed = failed_tx.clone();

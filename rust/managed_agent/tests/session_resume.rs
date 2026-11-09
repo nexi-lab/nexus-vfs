@@ -382,3 +382,37 @@ fn session_snapshot_rejects_a_pid_replaced_during_attachment_lookup() {
     assert_eq!(replacement.state, AgentState::Registered);
     kernel.agent_registry().kill(pid, 0).unwrap();
 }
+
+#[test]
+fn replacement_present_before_lookup_cannot_inherit_the_old_handle() {
+    let kernel = Arc::new(Kernel::new());
+    install_managed_agent_with_spawn(&kernel, Arc::new(Provider)).unwrap();
+    let started = call(&kernel, "start_session_v1", json!({"agent_id":"original"})).unwrap();
+    let pid = started["session_id"].as_str().unwrap();
+    kernel.agent_registry().unregister(pid).unwrap();
+    let replacement = kernel
+        .agent_registry()
+        .register_instance(AgentDescriptor {
+            pid: pid.into(),
+            name: "replacement".into(),
+            owner_id: "operator".into(),
+            zone_id: "root".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(call(&kernel, "get_session_v1", json!({"session_id":pid})).is_err());
+    let cancel = call(
+        &kernel,
+        "cancel_v2",
+        json!({"session_id":pid,
+        "channel_id":started["session_endpoint"]["channel_id"]}),
+    )
+    .unwrap();
+    assert_eq!(cancel["cancelled"], false);
+    assert!(kernel.agent_registry().is_current_instance(&replacement));
+    assert!(!kernel.agent_registry().is_managed_host_bound(&replacement));
+    kernel
+        .agent_registry()
+        .kill_instance(&replacement, 0)
+        .unwrap();
+}
