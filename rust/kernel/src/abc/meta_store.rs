@@ -113,8 +113,16 @@ pub struct FileMetadata {
 pub enum MetaStoreError {
     /// Key not found.
     NotFound(String),
-    /// Underlying I/O or storage error.
+    /// Underlying I/O or storage error. In general this says nothing about
+    /// whether a replicated write committed: `ZoneMetaStore::put` still reports
+    /// every failed proposal this way, sent or not. Only where an operation's
+    /// contract says so (today [`MetaStore::append_stream_entry`]) does it mean
+    /// a refusal, with nothing applied.
     IOError(String),
+    /// A replicated write was sent and no answer came back: it may have
+    /// committed, so a retry may apply it twice. A caller that must not
+    /// duplicate the write reads the state back before retrying.
+    OutcomeUnknown(String),
 }
 
 /// An error that carries its own message.
@@ -129,6 +137,12 @@ impl std::fmt::Display for MetaStoreError {
         match self {
             Self::NotFound(key) => write!(f, "metastore key not found: {key}"),
             Self::IOError(msg) => write!(f, "metastore I/O error: {msg}"),
+            Self::OutcomeUnknown(msg) => {
+                write!(
+                    f,
+                    "metastore write outcome unknown, it may have committed: {msg}"
+                )
+            }
         }
     }
 }
@@ -429,6 +443,11 @@ pub trait MetaStore: Send + Sync {
     /// collide). The offset is assigned by the backend at its serialization
     /// point (``ZoneMetaStore`` → the raft apply), NOT by the caller — so a
     /// total order holds across concurrent writers and no two writers collide.
+    ///
+    /// Failure contract: `OutcomeUnknown` when the entry may have been
+    /// appended (the proposal was sent and not answered, or it committed and
+    /// the answer is unusable); `IOError` only for a refusal before anything
+    /// was proposed, so nothing was appended and a retry is safe.
     fn append_stream_entry(&self, stream_prefix: &str, data: &[u8]) -> Result<u64, MetaStoreError> {
         let _ = (stream_prefix, data);
         Err(MetaStoreError::IOError(

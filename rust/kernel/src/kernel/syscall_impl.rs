@@ -1003,13 +1003,22 @@ impl Kernel {
                     Err(crate::stream_manager::StreamManagerError::Backend(
                         crate::stream::StreamError::Closed(msg),
                     )) => return Err(KernelError::StreamClosed(msg.to_string())),
-                    // The backend did not CONFIRM the append. A lost Raft reply
-                    // can reach this branch after commit, so never tell the
-                    // caller it is safe to repeat a non-idempotent append.
+                    // The append failed and the backend said why. Which stream,
+                    // the reason as given, and whether it may have committed —
+                    // what a client needs to decide between a retry and a
+                    // read-back. None of it was reachable while this arrived as a
+                    // `Closed` carrying a canned guess.
                     Err(crate::stream_manager::StreamManagerError::Backend(
                         crate::stream::StreamError::NotReplicated(why),
                     )) => {
-                        return Err(KernelError::IOError(format!(
+                        return Err(KernelError::NotCommitted(format!(
+                            "DT_STREAM append at {path} did not commit: {why}"
+                        )))
+                    }
+                    Err(crate::stream_manager::StreamManagerError::Backend(
+                        crate::stream::StreamError::OutcomeUnknown(why),
+                    )) => {
+                        return Err(KernelError::OutcomeUnknown(format!(
                             "DT_STREAM append at {path} has UNKNOWN outcome; it may have committed; reconcile before retry: {why}"
                         )))
                     }

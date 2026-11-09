@@ -150,6 +150,13 @@ pub enum KernelError {
     /// Federation bootstrap (env parsing, ZoneManager construction,
     /// create_zone/join_zone, reconcile) failed.
     Federation(String),
+    /// A replicated append was refused: nothing was appended, so a retry is
+    /// safe. Carries the whole sentence, like `IOError`.
+    NotCommitted(String),
+    /// A replicated append was sent and no answer came back: it may have
+    /// committed, so a blind retry may append it twice. Carries the whole
+    /// sentence, like `IOError`.
+    OutcomeUnknown(String),
 }
 
 /// The kernel's errors carry their own message.
@@ -195,6 +202,7 @@ impl std::fmt::Display for KernelError {
             Self::PermissionDenied(m) => write!(f, "permission denied: {m}"),
             Self::BackendError(m) => write!(f, "backend error: {m}"),
             Self::Federation(m) => write!(f, "federation: {m}"),
+            Self::NotCommitted(m) | Self::OutcomeUnknown(m) => write!(f, "{m}"),
         }
     }
 }
@@ -2942,13 +2950,15 @@ fn stream_mgr_err(e: crate::stream_manager::StreamManagerError) -> KernelError {
                 StreamError::Truncated(earliest, req) => {
                     KernelError::StreamTruncated(earliest, req)
                 }
-                // Missing confirmation is not proof of non-commit. Keep the
-                // stream open and the backend reason, without inviting replay.
+                // An append that did not commit is an append failure, NOT a
+                // closed stream: the reason travels verbatim so the client sees
+                // what happened instead of a Debug dump of the variant.
                 StreamError::NotReplicated(why) => {
-                    KernelError::IOError(format!(
-                        "stream append has UNKNOWN outcome; it may have committed; reconcile before retry: {why}"
-                    ))
+                    KernelError::NotCommitted(format!("stream append did not commit: {why}"))
                 }
+                StreamError::OutcomeUnknown(why) => KernelError::OutcomeUnknown(format!(
+                    "stream append has UNKNOWN outcome; it may have committed; reconcile before retry: {why}"
+                )),
                 StreamError::ReadFailed(why) => {
                     KernelError::IOError(format!("stream read failed: {why}"))
                 }
@@ -3958,7 +3968,7 @@ mod tests {
         impl StreamBackend for LostReply {
             fn push(&self, data: &[u8]) -> Result<usize, StreamError> {
                 self.0.push(data)?;
-                Err(StreamError::NotReplicated(
+                Err(StreamError::OutcomeUnknown(
                     "lost forward-proposal reply".into(),
                 ))
             }
@@ -4008,6 +4018,7 @@ mod tests {
                 k.stream_write_nowait(path, b"accepted once", &ctx)
                     .expect_err("lost receipt must not report success")
             };
+            assert!(matches!(error, KernelError::OutcomeUnknown(_)), "{error:?}");
             let message = format!("{error:?}");
             assert!(message.contains("UNKNOWN outcome"), "{message}");
             assert!(message.contains("may have committed"), "{message}");
@@ -4928,7 +4939,7 @@ mod tests {
     //      surface here).
     mod federation_wal_e2e {
         use super::*;
-        use crate::abc::meta_store::MetaStore;
+        use crate::abc::meta_store::{FileMetadata, MetaStore, MetaStoreError};
         use crate::hal::distributed_coordinator::{
             ClusterInfo, CoordinatorResult, DistributedCoordinator, ShareInfo,
         };
@@ -4948,15 +4959,155 @@ mod tests {
 
         impl TestFederationCoordinator {
             fn new() -> Self {
+                Self::with_metastore(|local| local)
+            }
+
+            /// The tempdir-backed store, wrapped by `wrap` before it is handed out.
+            fn with_metastore(wrap: impl FnOnce(Arc<dyn MetaStore>) -> Arc<dyn MetaStore>) -> Self {
                 let tempdir = TempDir::new().expect("tempdir for fed-wal test");
                 let path = tempdir.path().join("fed-wal-metastore.redb");
                 let metastore: Arc<dyn MetaStore> =
                     Arc::new(LocalMetaStore::open(&path).expect("open LocalMetaStore"));
                 Self {
-                    metastore,
+                    metastore: wrap(metastore),
                     _tempdir: tempdir,
                 }
             }
+        }
+
+        /// A replicated store whose appends land but whose acknowledgement is
+        /// lost on the way back: each append is applied once, then reported as
+        /// an unknown outcome, as `ZoneMetaStore` does for a post-commit failure.
+        /// Inode writes go to the wrapped store.
+        struct LostAckStore {
+            inner: Arc<dyn MetaStore>,
+            entries: std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
+            tails: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+            appends: std::sync::atomic::AtomicUsize,
+        }
+
+        impl MetaStore for LostAckStore {
+            fn get(&self, path: &str) -> Result<Option<FileMetadata>, MetaStoreError> {
+                self.inner.get(path)
+            }
+            fn put(&self, path: &str, meta: FileMetadata) -> Result<(), MetaStoreError> {
+                self.inner.put(path, meta)
+            }
+            fn delete(&self, path: &str) -> Result<bool, MetaStoreError> {
+                self.inner.delete(path)
+            }
+            fn list(&self, prefix: &str) -> Result<Vec<FileMetadata>, MetaStoreError> {
+                self.inner.list(prefix)
+            }
+            fn exists(&self, path: &str) -> Result<bool, MetaStoreError> {
+                self.inner.exists(path)
+            }
+            fn append_stream_entry(
+                &self,
+                stream_prefix: &str,
+                data: &[u8],
+            ) -> Result<u64, MetaStoreError> {
+                self.appends
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut tails = self.tails.lock().unwrap();
+                let seq = tails.entry(stream_prefix.to_string()).or_insert(0);
+                self.entries
+                    .lock()
+                    .unwrap()
+                    .insert(format!("{stream_prefix}{seq}"), data.to_vec());
+                *seq += 1;
+                Err(MetaStoreError::OutcomeUnknown(
+                    "the proposal committed, but the acknowledgement was lost".into(),
+                ))
+            }
+            fn get_stream_entry(&self, key: &str) -> Result<Option<Vec<u8>>, MetaStoreError> {
+                Ok(self.entries.lock().unwrap().get(key).cloned())
+            }
+            fn stream_tail(&self, stream_prefix: &str) -> Result<u64, MetaStoreError> {
+                Ok(*self.tails.lock().unwrap().get(stream_prefix).unwrap_or(&0))
+            }
+        }
+
+        /// An append that landed but whose acknowledgement was lost must reach
+        /// the caller as "may have committed" through both write entry points,
+        /// `sys_write` and `stream_write_nowait`. Each write is applied exactly
+        /// once: nothing on the way retries it, because the retry is how a
+        /// committed entry gets appended twice.
+        #[test]
+        fn a_lost_append_ack_is_unknown_at_both_write_entry_points_and_lands_once() {
+            let slot: Arc<std::sync::OnceLock<Arc<LostAckStore>>> = Arc::default();
+            let fill = Arc::clone(&slot);
+            let coordinator = TestFederationCoordinator::with_metastore(move |local| {
+                let store = Arc::new(LostAckStore {
+                    inner: local,
+                    entries: std::sync::Mutex::default(),
+                    tails: std::sync::Mutex::default(),
+                    appends: std::sync::atomic::AtomicUsize::new(0),
+                });
+                let _ = fill.set(Arc::clone(&store));
+                store
+            });
+            let store = Arc::clone(slot.get().expect("the coordinator built the store"));
+            let kernel = Arc::new(Kernel::new());
+            kernel.set_distributed_coordinator(
+                Arc::new(coordinator) as Arc<dyn DistributedCoordinator>
+            );
+            kernel
+                .vfs_router
+                .add_mount("/proc", contracts::ROOT_ZONE_ID, None, false);
+            let path = "/proc/p-lost-ack/transcript";
+            let ctx = OperationContext::new("test", "root", true, None, true);
+            kernel
+                .sys_setattr(
+                    path,
+                    &ctx,
+                    DT_STREAM as i32,
+                    "",
+                    None,
+                    None,
+                    None,
+                    "wal",
+                    "root",
+                    false,
+                    65_536,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .expect("wal stream over the lost-ack store");
+
+            let via_sys_write = kernel.sys_write_with_link_depth(path, &ctx, b"first", 0, 1);
+            let via_stream_write = kernel.stream_write_nowait(path, b"second", &ctx);
+            for (entry_point, result) in [
+                ("sys_write", via_sys_write.map(|_| ())),
+                ("stream_write_nowait", via_stream_write.map(|_| ())),
+            ] {
+                match result {
+                    Err(KernelError::OutcomeUnknown(why)) => {
+                        assert!(why.contains("may have committed"), "{entry_point}: {why}")
+                    }
+                    other => panic!("{entry_point}: a lost ack must not read as {other:?}"),
+                }
+            }
+            assert_eq!(
+                store.appends.load(std::sync::atomic::Ordering::SeqCst),
+                2,
+                "each write is proposed once, never retried"
+            );
+            let entries = store.entries.lock().unwrap();
+            assert_eq!(
+                entries.values().map(Vec::as_slice).collect::<Vec<_>>(),
+                [b"first".as_slice(), b"second".as_slice()],
+                "each write landed exactly once"
+            );
         }
 
         impl DistributedCoordinator for TestFederationCoordinator {

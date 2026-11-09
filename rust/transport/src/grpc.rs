@@ -411,27 +411,7 @@ impl VfsServiceImpl {
     /// can no longer arrive as a Debug dump — which is the part a client could not
     /// parse and an operator could not read.
     pub(crate) fn map_kernel_err(&self, err: KernelError) -> (RpcErrorCode, String) {
-        let code = match &err {
-            KernelError::FileNotFound(_) => RpcErrorCode::FileNotFound,
-            KernelError::PermissionDenied(_) => RpcErrorCode::PermissionError,
-            KernelError::InvalidPath(_) => RpcErrorCode::InvalidPath,
-            // A backend's own refusal wording is the only signal available for
-            // whether a storage failure was really an authorization one.
-            KernelError::BackendError(m) => {
-                let lower = m.to_ascii_lowercase();
-                if lower.contains("permission")
-                    || lower.contains("denied")
-                    || lower.contains("read-only")
-                {
-                    RpcErrorCode::PermissionError
-                } else {
-                    RpcErrorCode::InternalError
-                }
-            }
-            KernelError::StreamTruncated(..) => RpcErrorCode::OffsetOutOfRange,
-            _ => RpcErrorCode::InternalError,
-        };
-        (code, err.to_string())
+        (kernel_err_code(&err), err.to_string())
     }
 
     /// Construct the requested backend through the registered provider, then
@@ -2037,7 +2017,42 @@ pub enum RpcErrorCode {
     /// requested offset was trimmed. Distinct from `InternalError` so a reader
     /// can catch it and reset to the stream's `earliest_offset`.
     OffsetOutOfRange = -32019,
+    /// A replicated append was sent and no answer came back: it may have
+    /// committed. A client that must not duplicate it reads the stream back
+    /// instead of retrying.
+    OutcomeUnknown = -32020,
+    /// A replicated append was refused: nothing was appended, so a retry is
+    /// safe. Distinct from `OutcomeUnknown` so a client can tell the two apart
+    /// without parsing the message.
+    NotCommitted = -32021,
     InternalError = -32603,
+}
+
+/// The wire code for a kernel error. The text always comes from the error's
+/// own `Display`; this picks only how specific a code the client gets.
+fn kernel_err_code(err: &KernelError) -> RpcErrorCode {
+    match err {
+        KernelError::FileNotFound(_) => RpcErrorCode::FileNotFound,
+        KernelError::PermissionDenied(_) => RpcErrorCode::PermissionError,
+        KernelError::InvalidPath(_) => RpcErrorCode::InvalidPath,
+        // A backend's own refusal wording is the only signal available for
+        // whether a storage failure was really an authorization one.
+        KernelError::BackendError(m) => {
+            let lower = m.to_ascii_lowercase();
+            if lower.contains("permission")
+                || lower.contains("denied")
+                || lower.contains("read-only")
+            {
+                RpcErrorCode::PermissionError
+            } else {
+                RpcErrorCode::InternalError
+            }
+        }
+        KernelError::StreamTruncated(..) => RpcErrorCode::OffsetOutOfRange,
+        KernelError::OutcomeUnknown(_) => RpcErrorCode::OutcomeUnknown,
+        KernelError::NotCommitted(_) => RpcErrorCode::NotCommitted,
+        _ => RpcErrorCode::InternalError,
+    }
 }
 
 pub(crate) fn encode_rpc_error(code: RpcErrorCode, message: &str) -> Vec<u8> {
@@ -2280,6 +2295,20 @@ fn status_to_code(s: &Status) -> RpcErrorCode {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A client decides between a read-back and a retry from the code alone,
+    /// so an unanswered append and a refused one must not share a code.
+    #[test]
+    fn append_failures_carry_whether_the_entry_may_have_committed() {
+        let unknown = KernelError::OutcomeUnknown("timeout".into());
+        let refused = KernelError::NotCommitted("not leader".into());
+        assert_eq!(kernel_err_code(&unknown) as i64, -32020);
+        assert_eq!(kernel_err_code(&refused) as i64, -32021);
+        assert_eq!(
+            kernel_err_code(&KernelError::IOError("disk".into())) as i64,
+            RpcErrorCode::InternalError as i64
+        );
+    }
 
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;

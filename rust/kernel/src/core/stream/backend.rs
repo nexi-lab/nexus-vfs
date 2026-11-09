@@ -20,30 +20,28 @@ pub enum StreamError {
     /// peer-fetch failures distinct from an empty or closed stream so a drain
     /// cannot report a partial transcript as a successful complete read.
     ReadFailed(String),
-    /// An append to a REPLICATING backend was not confirmed, with the backend's
-    /// own reason. The historical variant name does NOT prove non-commit.
+    /// An append to a REPLICATING backend was refused: nothing was appended,
+    /// so a retry is safe. The reason travels as the backend wrote it.
     ///
     /// Distinct from `Closed`, which it used to be reported as. The stream is
     /// alive and will take the next append; confirmation failed for THIS one.
     /// A client told the stream is closed stops tailing a mailbox that is
     /// perfectly healthy.
     ///
-    /// The reason travels as the backend wrote it, because the caller is who
-    /// acts on it and the alternative shipped for a while: every failure —
-    /// propose refused, commit timed out, metastore errored, a peer already
-    /// sealed the segment — arrived as one canned sentence guessing "no
+    /// Every failure used to arrive as one canned sentence guessing "no
     /// reachable leader?", which no client could check and which sent an
     /// investigation down the wrong path (nexi-lab/nexus-vfs#344).
-    ///
-    /// What is NOT yet machine-readable: whether the entry may have committed
-    /// anyway. A refused propose appended nothing (a retry is safe); a commit
-    /// that timed out may have replicated (a retry double-appends). `MetaStore`
-    /// flattens both to `MetaStoreError::IOError`, so today the distinction
-    /// may not survive the error text either. Until it is typed, expose an
-    /// UNKNOWN outcome conservatively, including for a definite rejection.
-    /// A caller must reconcile by reading the tail rather than blind-retrying;
-    /// an absent read alone is not proof an in-flight proposal cannot commit.
     NotReplicated(String),
+    /// An append to a REPLICATING backend was sent and no answer came back:
+    /// the entry may have committed, so a blind retry may append it twice. A
+    /// caller that must not duplicate it reads the tail before retrying; an
+    /// absent read alone is not proof an in-flight proposal cannot commit.
+    ///
+    /// Split from `NotReplicated`, which once stood for both. The raft layer
+    /// knew the difference (`RaftError::proposal_outcome_unknown`), but the
+    /// metastore flattened it to text, so a timed-out append that went on to
+    /// commit was reported as "did not commit" and resent.
+    OutcomeUnknown(String),
 }
 
 /// Uniform interface for stream backends (memory, shared memory, future gRPC).
