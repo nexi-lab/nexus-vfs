@@ -41,6 +41,10 @@ fn one_of_each() -> Vec<KernelError> {
         KernelError::PermissionDenied("zone b not in token".into()),
         KernelError::BackendError("s3: read-only bucket".into()),
         KernelError::Federation("no leader for zone b".into()),
+        KernelError::NotCommitted("DT_STREAM append at /s did not commit: not leader".into()),
+        KernelError::OutcomeUnknown(
+            "DT_STREAM append at /s: outcome unknown, it may have committed: timeout".into(),
+        ),
     ]
 }
 
