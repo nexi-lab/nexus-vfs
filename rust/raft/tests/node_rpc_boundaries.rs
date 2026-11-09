@@ -64,6 +64,7 @@ async fn fixed_local_root_refuses_incremental_ec_and_state_snapshots() {
     )
     .unwrap();
     let node = root.consensus_node();
+    node.read_linearizable(|_| ()).await.unwrap();
     let original_index = node.last_index();
     let original_wal = node.ec_wal_bounds();
     let address = common::node_bind_addr();
