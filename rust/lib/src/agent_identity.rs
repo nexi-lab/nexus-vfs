@@ -41,11 +41,15 @@ pub fn agent_identity_uri(name: &str) -> String {
 /// Inverse of [`agent_identity_uri`] — `None` for any URI that is not an agent
 /// identity or is malformed (a foreign SAN must never resolve to an agent).
 pub fn parse_agent_identity_uri(uri: &str) -> Option<String> {
+    parse_agent_identity_uri_ref(uri).map(str::to_owned)
+}
+
+pub(crate) fn parse_agent_identity_uri_ref(uri: &str) -> Option<&str> {
     let name = uri.strip_prefix(AGENT_IDENTITY_URI_PREFIX)?;
     if name.is_empty() {
         return None;
     }
-    Some(name.to_string())
+    Some(name)
 }
 
 /// Scheme + authority of the OWNER SAN: who a session agent acts for.
@@ -70,11 +74,15 @@ pub fn owner_uri(owner_id: &str) -> String {
 /// Inverse of [`owner_uri`] — `None` for any URI that is not an owner SAN or is
 /// malformed.
 pub fn parse_owner_uri(uri: &str) -> Option<String> {
+    parse_owner_uri_ref(uri).map(str::to_owned)
+}
+
+pub(crate) fn parse_owner_uri_ref(uri: &str) -> Option<&str> {
     let owner = uri.strip_prefix(OWNER_URI_PREFIX)?;
     if owner.is_empty() {
         return None;
     }
-    Some(owner.to_string())
+    Some(owner)
 }
 
 /// The agent name for a fresh session identity: `session-{uuid}`.
