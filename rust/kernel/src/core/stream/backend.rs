@@ -24,9 +24,9 @@ pub enum StreamError {
     /// so a retry is safe. The reason travels as the backend wrote it.
     ///
     /// Distinct from `Closed`, which it used to be reported as. The stream is
-    /// alive and will take the next append; what failed is THIS one. A client
-    /// told the stream is closed stops tailing a mailbox that is perfectly
-    /// healthy.
+    /// alive and will take the next append; confirmation failed for THIS one.
+    /// A client told the stream is closed stops tailing a mailbox that is
+    /// perfectly healthy.
     ///
     /// Every failure used to arrive as one canned sentence guessing "no
     /// reachable leader?", which no client could check and which sent an
@@ -34,7 +34,8 @@ pub enum StreamError {
     NotReplicated(String),
     /// An append to a REPLICATING backend was sent and no answer came back:
     /// the entry may have committed, so a blind retry may append it twice. A
-    /// caller that must not duplicate it reads the tail before retrying.
+    /// caller that must not duplicate it reads the tail before retrying; an
+    /// absent read alone is not proof an in-flight proposal cannot commit.
     ///
     /// Split from `NotReplicated`, which once stood for both. The raft layer
     /// knew the difference (`RaftError::proposal_outcome_unknown`), but the

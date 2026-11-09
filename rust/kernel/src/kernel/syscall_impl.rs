@@ -1019,8 +1019,7 @@ impl Kernel {
                         crate::stream::StreamError::OutcomeUnknown(why),
                     )) => {
                         return Err(KernelError::OutcomeUnknown(format!(
-                            "DT_STREAM append at {path}: outcome unknown, it may have \
-                             committed: {why}"
+                            "DT_STREAM append at {path} has UNKNOWN outcome; it may have committed; reconcile before retry: {why}"
                         )))
                     }
                     // `Full` is BACKPRESSURE, not failure: the frame did not
