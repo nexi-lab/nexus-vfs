@@ -351,7 +351,15 @@ fn store_host_handle(
     // stale slot also needs explicit cleanup; it is not replacement permission.
     let reason = match handles.entry(pid) {
         dashmap::mapref::entry::Entry::Vacant(slot) => {
-            if registry.is_current_instance(&instance) {
+            // A provider may complete all joins and publish Terminated before
+            // returning its handle. Its terminate callback has already run, so
+            // accepting that handle now would retain it without another cleanup
+            // callback. Check both incarnation and non-terminal state while the
+            // sidecar guard prevents a later callback from missing insertion.
+            if registry
+                .get_instance_descriptor(&instance)
+                .is_some_and(|descriptor| !descriptor.state.is_terminal())
+            {
                 let hosted = slot.insert(HostedSession {
                     instance,
                     handle: Arc::clone(&handle),
