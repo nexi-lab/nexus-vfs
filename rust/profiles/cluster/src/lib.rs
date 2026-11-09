@@ -46,6 +46,8 @@ mod runtime_backends;
 mod search_capabilities;
 pub mod stream_observers;
 mod user_runtime;
+#[cfg(feature = "driver-cas-local")]
+pub mod zone_content;
 use auth_posture::{AuthPosture, AuthPostureInputs};
 use kernel::abc::object_store::ObjectStore;
 use kernel::hal::object_store_provider::set_provider;

@@ -23,8 +23,8 @@ use super::proto::nexus::raft::{
     MintAgentResponse, MintKeyRequest, MintKeyResponse, MintSessionAgentRequest,
     MintSessionAgentResponse, NodeInfo as ProtoNodeInfo, ProposeRequest, ProposeResponse,
     QueryRequest, QueryResponse, RaftCommand, RaftQueryResponse, RaftResponse, ReadBlobRequest,
-    ReadBlobResponse, RegisterForeignCaRequest, RegisterForeignCaResponse, RemoveVoterRequest,
-    RemoveVoterResponse, RenewSessionAgentRequest, ReplicateEntriesRequest,
+    ReadBlobResponse, ReadZoneBlobRequest, RegisterForeignCaRequest, RegisterForeignCaResponse,
+    RemoveVoterRequest, RemoveVoterResponse, RenewSessionAgentRequest, ReplicateEntriesRequest,
     ReplicateEntriesResponse, RevokeAgentCertRequest, RevokeAgentCertResponse, RevokeKeyRequest,
     RevokeKeyResponse, SearchCapabilities, SnapshotEcStateRequest, SnapshotEcStateResponse,
     StepMessageRequest, StepMessageResponse, UnregisterForeignCaRequest,
@@ -841,6 +841,37 @@ struct ZoneApiServiceImpl {
 }
 
 impl ZoneApiServiceImpl {
+    async fn blob_response(
+        &self,
+        zone_id: Option<&str>,
+        content_id: &str,
+    ) -> Response<ReadBlobResponse> {
+        let fetcher = self
+            .blob_fetcher_slot
+            .as_ref()
+            .and_then(|slot| slot.read().as_ref().cloned());
+        let Some(fetcher) = fetcher else {
+            return Response::new(ReadBlobResponse {
+                content: Vec::new(),
+                error: "blob fetcher not installed".to_string(),
+            });
+        };
+        let result = match zone_id {
+            Some(zone) => fetcher.read_in_zone(zone, content_id).await,
+            None => fetcher.read(content_id).await,
+        };
+        Response::new(match result {
+            Ok(content) => ReadBlobResponse {
+                content,
+                error: String::new(),
+            },
+            Err(error) => ReadBlobResponse {
+                content: Vec::new(),
+                error,
+            },
+        })
+    }
+
     async fn agent_csr_response(
         &self,
         request: Request<super::proto::AgentCsrRequest>,
@@ -1666,26 +1697,20 @@ impl ZoneApiService for ZoneApiServiceImpl {
         request: Request<ReadBlobRequest>,
     ) -> std::result::Result<Response<ReadBlobResponse>, Status> {
         let req = request.into_inner();
-        let fetcher = self
-            .blob_fetcher_slot
-            .as_ref()
-            .and_then(|slot| slot.read().as_ref().cloned());
-        let Some(fetcher) = fetcher else {
-            return Ok(Response::new(ReadBlobResponse {
-                content: Vec::new(),
-                error: "blob fetcher not installed".to_string(),
-            }));
-        };
-        match fetcher.read(&req.content_id).await {
-            Ok(bytes) => Ok(Response::new(ReadBlobResponse {
-                content: bytes,
-                error: String::new(),
-            })),
-            Err(e) => Ok(Response::new(ReadBlobResponse {
-                content: Vec::new(),
-                error: e,
-            })),
-        }
+        Ok(self.blob_response(None, &req.content_id).await)
+    }
+
+    async fn read_zone_blob(
+        &self,
+        request: Request<ReadZoneBlobRequest>,
+    ) -> std::result::Result<Response<ReadBlobResponse>, Status> {
+        let req = request.into_inner();
+        contracts::validate_zone_id_for(contracts::ZoneIdUse::TenantCreate, &req.zone_id)
+            .map_err(|_| Status::invalid_argument("invalid data zone"))?;
+        get_zone_node(&self.registry, &req.zone_id)?;
+        Ok(self
+            .blob_response(Some(&req.zone_id), &req.content_id)
+            .await)
     }
 
     /// Sign an agent identity cert on the CA holder (founder) for a remote

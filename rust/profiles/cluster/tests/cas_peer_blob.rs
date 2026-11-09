@@ -152,7 +152,12 @@ async fn peer_blob_preserves_manifest_identity_and_logical_path_contents() {
     assert!(raw_chunk.error.is_empty(), "{}", raw_chunk.error);
     assert_eq!(raw_chunk.content, content);
     assert_eq!(lookup(&chunk), None);
-    let object_path = backend.as_cas().unwrap().transport().blob_path(&hash);
+    let object_path = backend
+        .as_cas()
+        .unwrap()
+        .transport()
+        .blob_path(&hash)
+        .unwrap();
     std::fs::write(&object_path, b"damaged object").unwrap();
     let damaged = client
         .read_blob(ReadBlobRequest {

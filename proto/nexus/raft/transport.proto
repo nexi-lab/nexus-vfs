@@ -115,6 +115,10 @@ service ZoneApiService {
   // metadata has been replicated ahead of content.
   rpc ReadBlob(ReadBlobRequest) returns (ReadBlobResponse);
 
+  // Read one immutable object or logical file from a named data zone.
+  // The server authorizes the zone and uses its physical content namespace.
+  rpc ReadZoneBlob(ReadZoneBlobRequest) returns (ReadBlobResponse);
+
   // MintAgent signs an agent identity cert (`nexus://agent/{subject_id}`) on the
   // CA holder (founder) for a caller on any cluster node — so an agent on a
   // joiner is provisioned without hand-carrying a private key. mTLS-gated to a
@@ -863,6 +867,11 @@ message ReadBlobRequest {
   // ``content_id`` in its own way (CAS=hash, PAS=backend_path, etc.).
   // The caller's kernel never inspects this field.
   string content_id = 3;
+}
+
+message ReadZoneBlobRequest {
+  string zone_id = 1;
+  string content_id = 2;
 }
 
 // ReadBlobResponse returns either the blob bytes or a non-empty `error`.
