@@ -392,7 +392,6 @@ impl AgentRegistry {
                 zone_id: zone.into(),
                 complete: true,
             },
-            peers: Vec::new(),
             instances: observations,
         }
     }

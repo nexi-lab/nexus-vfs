@@ -12,6 +12,9 @@ use nexus_raft::transport::{
 use tonic::transport::{Certificate, ClientTlsConfig, Identity, ServerTlsConfig};
 use transport::federation::{runtime_directory, FederationClient};
 
+const PEER_NAMESPACE: &str = "/runtime-observation-peers";
+const PEER_ZONE: &str = "runtime-collaboration";
+
 struct Membership(Vec<String>);
 
 // Membership is an input fixture. Production dispatch, authorization, TLS,
@@ -20,8 +23,12 @@ impl DistributedCoordinator for Membership {
     fn list_zones(&self, _: &Kernel) -> Vec<String> {
         vec!["root".into()]
     }
-    fn zone_peers(&self, _: &Kernel, _: &str) -> Vec<String> {
-        self.0.clone()
+    fn zone_peers(&self, _: &Kernel, zone: &str) -> Vec<String> {
+        if zone == PEER_ZONE {
+            self.0.clone()
+        } else {
+            Vec::new()
+        }
     }
     fn cluster_info(&self, _: &Kernel, _: &str) -> CoordinatorResult<ClusterInfo> {
         Err("unused".into())
@@ -62,9 +69,15 @@ struct TlsNode {
 
 impl TlsNode {
     async fn start(ca: &[u8], key: &[u8], node_id: u64, owner: &str) -> Self {
+        lib::transport_primitives::ensure_crypto_provider();
         let (cert, private) =
             generate_node_cert(node_id, "root", ca, key, &[], None).expect("node cert");
         let kernel = Arc::new(Kernel::new());
+        kernel.vfs_router_arc().add(
+            PEER_NAMESPACE,
+            "root",
+            kernel::core::vfs_router::MountEntry::new(None).with_target_zone(PEER_ZONE),
+        );
         let routes = build_vfs_routes(
             Arc::clone(&kernel),
             Arc::new(ApiKeyAuthProvider::cert_identity_only()),
@@ -116,7 +129,7 @@ impl TlsNode {
             kernel.runtime().handle().clone(),
             Some(tls.clone()),
         ));
-        runtime_directory::install(&kernel, pool).expect("install same pool");
+        runtime_directory::install(&kernel, pool, PEER_NAMESPACE).expect("install same pool");
         assert_eq!(
             Arc::strong_count(kernel.runtime()),
             1,
@@ -277,7 +290,8 @@ async fn authenticated_directory_preserves_owner_scope_and_partial_coverage() {
         None,
     ));
     assert!(first.node.kernel.unregister_service("runtime_directory"));
-    runtime_directory::install(&first.node.kernel, no_identity).expect("replace service");
+    runtime_directory::install(&first.node.kernel, no_identity, PEER_NAMESPACE)
+        .expect("replace service");
     let unavailable = first.directory(json!({})).await;
     assert_eq!(unavailable.unavailable.len(), 2);
     assert!(unavailable

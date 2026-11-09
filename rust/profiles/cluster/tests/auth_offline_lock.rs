@@ -68,4 +68,8 @@ async fn offline_auth_against_a_running_daemon_fails_cleanly_not_panics() {
         err.contains("daemon is running") || err.to_lowercase().contains("lock"),
         "the error should point at the running daemon / exclusive lock:\n{err}"
     );
+    assert!(
+        err.contains("stop the daemon, re-run this command, and start it again"),
+        "offline auth must give the same actionable storage guidance as other offline commands:\n{err}"
+    );
 }

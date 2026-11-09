@@ -140,14 +140,13 @@ pub struct RuntimeInventoryScope {
     pub complete: bool,
 }
 
-/// Peer addresses come from the node's coordinator, never runtime registrations.
-/// Each peer still authenticates the caller and reports its own scope.
+/// A node-local inventory contains facts and its exact authorized scope.
+/// Cross-node routing belongs to the owning host directory adapter.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeInventory {
     pub version: u32,
     pub scope: RuntimeInventoryScope,
-    pub peers: Vec<String>,
     pub instances: Vec<RuntimeObservation>,
 }
 

@@ -116,8 +116,7 @@ pub(super) fn dispatch(
         "agent_runtime_list_v1" => {
             let request: ListRuntimesRequest = parse(params)?;
             let (owner, zone) = resolve_runtime_scope(ctx, &request).map_err(agent_context_err)?;
-            let mut inventory = registry.runtime_inventory(owner.as_deref(), &zone);
-            inventory.peers = kernel.distributed_coordinator().zone_peers(kernel, &zone);
+            let inventory = registry.runtime_inventory(owner.as_deref(), &zone);
             ok_json(serde_json::to_value(inventory).map_err(|error| {
                 call_err(super::RpcErrorCode::InternalError, &error.to_string())
             })?)

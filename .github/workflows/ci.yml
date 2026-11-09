@@ -222,7 +222,7 @@ jobs:
         with:
           shared-key: ci-runtime-observations-${{ matrix.os }}
       - name: Real RPC instance, ownership, expiry and partial-directory journeys
-        run: cargo test --locked -p transport --test runtime_observation_rpc --test managed_agent_grpc_auth -- --test-threads=1
+        run: cargo test --locked -p transport --all-features --test runtime_observation_rpc --test managed_agent_grpc_auth -- --test-threads=1
 
   process-instances:
     name: Process instance lifecycle / ${{ matrix.os }}

@@ -15,10 +15,15 @@ use std::time::Duration;
 const NAME: &str = "runtime_directory";
 
 /// Reuses the coordinator's client; no new connection manager or runtime.
-pub fn install(kernel: &Arc<Kernel>, client: Arc<FederationClient>) -> Result<(), String> {
+pub fn install(
+    kernel: &Arc<Kernel>,
+    client: Arc<FederationClient>,
+    namespace: &str,
+) -> Result<(), String> {
     let service = Arc::new(DirectoryService {
         kernel: Arc::downgrade(kernel),
         client,
+        namespace: namespace.to_owned(),
     });
     kernel.register_rust_service(NAME, service.clone(), service.exports())
 }
@@ -26,6 +31,26 @@ pub fn install(kernel: &Arc<Kernel>, client: Arc<FederationClient>) -> Result<()
 struct DirectoryService {
     kernel: Weak<Kernel>,
     client: Arc<FederationClient>,
+    namespace: String,
+}
+
+impl DirectoryService {
+    fn peer_endpoints(&self, kernel: &Kernel, zone: &str) -> Result<Vec<String>, RustCallError> {
+        // Metadata authorization and host namespace routing are separate.
+        // A pure agent uses node-local root; its mailbox can live in a shared
+        // zone. The mount table and coordinator remain the routing SSOT.
+        let peer_zone = kernel
+            .vfs_router_arc()
+            .route(&self.namespace, zone)
+            .ok_or_else(|| RustCallError::Internal("runtime namespace is unroutable".into()))?
+            .zone_id;
+        let mut peers = kernel
+            .distributed_coordinator()
+            .zone_peers(kernel, &peer_zone);
+        peers.sort();
+        peers.dedup();
+        Ok(peers)
+    }
 }
 
 impl FederationClient {
@@ -63,7 +88,7 @@ impl FederationClient {
         }
         let envelope: serde_json::Value =
             serde_json::from_slice(&response.payload).map_err(|_| "invalid_response")?;
-        let mut inventory: RuntimeInventory =
+        let inventory: RuntimeInventory =
             serde_json::from_value(envelope["result"].clone()).map_err(|_| "invalid_response")?;
         if inventory.version != 1
             || !inventory.scope.complete
@@ -76,8 +101,6 @@ impl FederationClient {
         {
             return Err("invalid_scope");
         }
-        // Fan out only to the local coordinator's peers, never peer-supplied endpoints.
-        inventory.peers.clear();
         Ok(inventory)
     }
 }
@@ -114,9 +137,7 @@ impl RustService for DirectoryService {
         let local = kernel
             .agent_registry()
             .runtime_inventory(owner.as_deref(), &zone);
-        let mut peers = kernel.distributed_coordinator().zone_peers(&kernel, &zone);
-        peers.sort();
-        peers.dedup();
+        let peers = self.peer_endpoints(&kernel, &zone)?;
         let results = self.client.block_on_safely(async {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
             stream::iter(peers)
