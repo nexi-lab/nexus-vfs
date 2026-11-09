@@ -369,10 +369,13 @@ impl Kernel {
         {
             Some(meta) => meta,
             None => {
-                // MetaStore miss → try backend directly (all backend types
-                // uniformly).  LocalConnector hits the host fs by path here;
-                // PathLocal hits its backend slot; CAS / remote backends
-                // return miss (they have nothing to serve without a hash).
+                // A CAS file's content address comes from its metadata. The
+                // path alone supplies no object identity, even when it looks
+                // like a known hash. Path-addressed backends can discover a
+                // file directly in their own namespace.
+                if route.is_cas {
+                    return Err(not_found());
+                }
                 if let Some(data) = backend_read_or_miss(
                     route
                         .backend
