@@ -420,6 +420,8 @@ impl ZoneManager {
     }
 
     /// Host data-zone replicas alongside a root with fixed local membership.
+    /// The root uses its existing `.node_id`; `node_id` identifies the network
+    /// replica and never replaces the root's committed membership.
     /// The existing TLS, control authorization and per-zone Raft paths apply.
     #[allow(clippy::too_many_arguments)]
     pub fn with_local_root(
@@ -566,11 +568,16 @@ impl ZoneManager {
             RuntimeProfile::Networked => {
                 ZoneRaftRegistry::with_tls(PathBuf::from(base_path), node_id, tls_config.clone())
             }
-            RuntimeProfile::NetworkedLocalRoot => ZoneRaftRegistry::with_local_root(
-                PathBuf::from(base_path),
-                node_id,
-                tls_config.clone(),
-            ),
+            RuntimeProfile::NetworkedLocalRoot => {
+                let root_node_id = crate::distributed_coordinator::read_or_mint_node_id(base_path)
+                    .map_err(RaftError::Config)?;
+                ZoneRaftRegistry::with_local_root(
+                    PathBuf::from(base_path),
+                    node_id,
+                    root_node_id,
+                    tls_config.clone(),
+                )
+            }
             RuntimeProfile::IsolatedRoot => {
                 ZoneRaftRegistry::isolated_root(PathBuf::from(base_path), node_id)
             }
@@ -845,7 +852,7 @@ impl ZoneManager {
         self.create_zone(zone_id, self.current_peer_strings())
     }
 
-    /// This node's ID.
+    /// The network replica ID. Per-zone status reports the root's local ID.
     pub fn node_id(&self) -> u64 {
         self.node_id
     }
@@ -1625,7 +1632,7 @@ impl ZoneManager {
         let Some(node) = self.registry.get_node(zone_id) else {
             return ClusterStatus {
                 zone_id: zone_id.to_string(),
-                node_id: self.node_id,
+                node_id: self.registry.node_id_for_zone(zone_id),
                 has_store: false,
                 is_leader: false,
                 leader_id: 0,
@@ -1659,7 +1666,7 @@ impl ZoneManager {
         }
         ClusterStatus {
             zone_id: zone_id.to_string(),
-            node_id: self.node_id,
+            node_id: node.id(),
             has_store: true,
             is_leader: node.is_leader(),
             leader_id: node.leader_id().unwrap_or(0),

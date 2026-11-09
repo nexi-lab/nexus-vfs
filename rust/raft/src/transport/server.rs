@@ -1256,7 +1256,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
         let req = request.into_inner();
         let node = get_zone_node(&self.registry, &req.zone_id)?;
         let peers = self.registry.get_peers(&req.zone_id).unwrap_or_default();
-        let node_id = self.registry.node_id();
+        let node_id = node.id();
 
         let is_leader = node.is_leader();
         let leader_id = node.leader_id().unwrap_or(0);

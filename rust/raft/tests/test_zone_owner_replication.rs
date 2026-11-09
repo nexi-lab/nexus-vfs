@@ -8,6 +8,11 @@ mod common;
 
 use kernel::meta_store::{ConditionalMetadataResult, FileMetadata, MetaStore};
 use nexus_raft::distributed_coordinator::bootstrap_or_join_zone;
+use nexus_raft::transport::proto::{
+    zone_api_service_client::ZoneApiServiceClient,
+    zone_transport_service_client::ZoneTransportServiceClient, GetClusterInfoRequest,
+    StepMessageRequest,
+};
 use nexus_raft::transport::NodeAddress;
 use nexus_raft::zone_meta_store::ZoneMetaStore;
 use nexus_raft::ZoneManager;
@@ -24,27 +29,14 @@ const ROOT_PRIVATE: &str = "/__managed_content_v1__/private-root";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn peer_traffic_cannot_admit_an_unknown_zone_on_a_local_root_runtime() {
-    use nexus_raft::transport::proto::{
-        zone_transport_service_client::ZoneTransportServiceClient, StepMessageRequest,
-    };
     use protobuf::Message as _;
 
     let directory = tempfile::tempdir().unwrap();
     let address = common::node_bind_addr();
     let manager = node(31, directory.path(), &address).unwrap();
     found(&manager, "root", 31, &address).await;
-    let mut client = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if let Ok(client) =
-                ZoneTransportServiceClient::connect(format!("http://{address}")).await
-            {
-                break client;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("local data-zone listener starts");
+    let root_id = manager.cluster_status("root").node_id;
+    let mut client = peer_client(&address).await;
     let mut heartbeat = raft::eraftpb::Message {
         from: 32,
         to: 31,
@@ -65,17 +57,48 @@ async fn peer_traffic_cannot_admit_an_unknown_zone_on_a_local_root_runtime() {
     assert!(!directory.path().join("unadmitted-zone").exists());
     assert_eq!(
         manager.get_zone("root").unwrap().consensus_node().voters(),
-        vec![31]
+        vec![root_id]
     );
     manager.shutdown();
 }
 
 fn node(id: u64, dir: &std::path::Path, addr: &str) -> nexus_raft::raft::Result<Arc<ZoneManager>> {
+    node_with_peers(id, dir, addr, Vec::new())
+}
+
+async fn peer_client(address: &str) -> ZoneTransportServiceClient<tonic::transport::Channel> {
+    ZoneTransportServiceClient::new(peer_channel(address).await)
+}
+
+async fn peer_channel(address: &str) -> tonic::transport::Channel {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(channel) =
+                tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+                    .unwrap()
+                    .connect()
+                    .await
+            {
+                break channel;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("local data-zone listener starts")
+}
+
+fn node_with_peers(
+    id: u64,
+    dir: &std::path::Path,
+    addr: &str,
+    peers: Vec<String>,
+) -> nexus_raft::raft::Result<Arc<ZoneManager>> {
     ZoneManager::with_local_root(
         "agent-data-zone-probe",
         id,
         dir.to_str().unwrap(),
-        vec![],
+        peers,
         addr,
         None,
         Some(format!("http://{addr}")),
@@ -121,7 +144,7 @@ fn metadata(path: &str, kind: u8, zone: &str, owner: &str) -> FileMetadata {
     }
 }
 
-fn check_agent_state(manager: &ZoneManager) {
+fn check_agent_state(manager: &ZoneManager, root_id: u64) {
     assert_eq!(
         manager
             .get_zone(AGENT_ZONE)
@@ -165,7 +188,7 @@ fn check_agent_state(manager: &ZoneManager) {
     let root = store(manager, "root", "/");
     assert_eq!(
         manager.get_zone("root").unwrap().consensus_node().voters(),
-        vec![32]
+        vec![root_id]
     );
     assert_eq!(
         root.as_conditional_metadata()
@@ -199,6 +222,7 @@ async fn selected_zone_join_preserves_disjoint_paths_owner_link_and_wal_tables()
         found(&source, zone, 31, &source_addr).await;
     }
     found(&target, "root", 32, &target_addr).await;
+    let target_root_id = target.cluster_status("root").node_id;
     for (manager, owner) in [(&source, "user-source"), (&target, "user-target")] {
         let root = store(manager, "root", "/");
         assert!(matches!(
@@ -274,14 +298,14 @@ async fn selected_zone_join_preserves_disjoint_paths_owner_link_and_wal_tables()
             .await
             .unwrap();
     }
-    check_agent_state(&target);
+    check_agent_state(&target, target_root_id);
 
     // Local reads on the learner must remain complete when the sole voter stops.
     // This deliberately makes no claim about writes while that voter is offline.
     tokio::task::spawn_blocking(move || source.shutdown())
         .await
         .unwrap();
-    check_agent_state(&target);
+    check_agent_state(&target, target_root_id);
     tokio::task::spawn_blocking(move || target.shutdown())
         .await
         .unwrap();
@@ -289,21 +313,149 @@ async fn selected_zone_join_preserves_disjoint_paths_owner_link_and_wal_tables()
     // shutdown signals the transport tasks; their storage handles are released
     // asynchronously. Only retry that specific lock condition, with a bound.
     let restart_addr = common::node_bind_addr();
-    let restarted = tokio::time::timeout(Duration::from_secs(5), async {
+    let restarted = restart_node(32, target_dir.path(), &restart_addr, Vec::new()).await;
+    check_agent_state(&restarted, target_root_id);
+    tokio::task::spawn_blocking(move || restarted.shutdown())
+        .await
+        .unwrap();
+}
+
+async fn restart_node(
+    id: u64,
+    directory: &std::path::Path,
+    address: &str,
+    peers: Vec<String>,
+) -> Arc<ZoneManager> {
+    tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            match node(32, target_dir.path(), &restart_addr) {
+            match node_with_peers(id, directory, address, peers.clone()) {
                 Ok(manager) => break manager,
                 Err(nexus_raft::raft::RaftError::DataDirLocked(_)) => {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
-                Err(error) => panic!("restart target: {error}"),
+                Err(error) => panic!("restart local-root runtime: {error}"),
             }
         }
     })
     .await
-    .expect("target released its data directory");
-    check_agent_state(&restarted);
-    tokio::task::spawn_blocking(move || restarted.shutdown())
+    .expect("local-root runtime released its data directory")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replica_adoption_preserves_local_root_identity_and_writes_across_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let initial = ZoneManager::isolated(directory.path().to_str().unwrap()).unwrap();
+    let local_id = initial.node_id();
+    let replica_id = if local_id == 41 { 42 } else { 41 };
+    found(&initial, "root", local_id, "127.0.0.1:0").await;
+    let identity_path = directory.path().join(".node_id");
+    let identity_bytes = std::fs::read(&identity_path).unwrap();
+    let root = store(&initial, "root", "/");
+    assert!(matches!(
+        root.as_conditional_metadata()
+            .unwrap()
+            .replace_if_version(
+                ROOT_PRIVATE,
+                metadata(ROOT_PRIVATE, 0, "root", "user-alice"),
+                None,
+            )
+            .unwrap(),
+        ConditionalMetadataResult::Committed { .. }
+    ));
+    let original_commit = initial.cluster_status("root").commit_index;
+    drop(root);
+    tokio::task::spawn_blocking(move || initial.shutdown())
+        .await
+        .unwrap();
+
+    for round in 0..2 {
+        let address = common::node_bind_addr();
+        let manager = restart_node(
+            replica_id,
+            directory.path(),
+            &address,
+            vec![format!("{replica_id}@{address}")],
+        )
+        .await;
+        let root_node = manager.get_zone("root").unwrap().consensus_node();
+        root_node.campaign().await.unwrap();
+        let root_status = manager.cluster_status("root");
+        assert_eq!(manager.node_id(), replica_id);
+        assert_eq!(root_status.node_id, local_id);
+        assert_eq!(root_node.voters(), vec![local_id]);
+        assert!(root_status.commit_index >= original_commit);
+        assert!(manager.zone_peers("root").is_empty());
+        assert_eq!(std::fs::read(&identity_path).unwrap(), identity_bytes);
+        let root = store(&manager, "root", "/");
+        assert_eq!(
+            root.as_conditional_metadata()
+                .unwrap()
+                .read_versioned(ROOT_PRIVATE)
+                .unwrap()
+                .unwrap()
+                .metadata
+                .owner_id
+                .as_deref(),
+            Some("user-alice")
+        );
+        let path = format!("{ROOT_PRIVATE}-{round}");
+        assert!(matches!(
+            root.as_conditional_metadata()
+                .unwrap()
+                .replace_if_version(&path, metadata(&path, 0, "root", "user-alice"), None,)
+                .unwrap(),
+            ConditionalMetadataResult::Committed { .. }
+        ));
+        if round == 0 {
+            found(&manager, AGENT_ZONE, replica_id, &address).await;
+        }
+        let data = manager.get_zone(AGENT_ZONE).unwrap().consensus_node();
+        assert_eq!(data.id(), replica_id);
+        assert_eq!(data.voters(), vec![replica_id]);
+        assert_eq!(manager.cluster_status(AGENT_ZONE).node_id, replica_id);
+        let mut client = ZoneApiServiceClient::new(peer_channel(&address).await);
+        for (zone, expected) in [("root", local_id), (AGENT_ZONE, replica_id)] {
+            let info = client
+                .get_cluster_info(GetClusterInfoRequest {
+                    zone_id: zone.into(),
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(info.node_id, expected);
+            assert_eq!(info.config.unwrap().voters[0].id, expected);
+        }
+        drop(client);
+        drop(data);
+        drop(root);
+        drop(root_node);
+        tokio::task::spawn_blocking(move || manager.shutdown())
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_replica_removal_preserves_the_existing_route_map() {
+    let directory = tempfile::tempdir().unwrap();
+    let address = common::node_bind_addr();
+    let manager = node(41, directory.path(), &address).unwrap();
+    found(&manager, AGENT_ZONE, 41, &address).await;
+    let registry = manager.registry();
+    let endpoint = "http://127.0.0.1:2526";
+    assert!(registry.learn_peer_address(AGENT_ZONE, 42, endpoint));
+    let blocker = directory.path().join(AGENT_ZONE).join(".removed");
+    std::fs::create_dir(&blocker).unwrap();
+    let removal = registry.remove_zone(AGENT_ZONE).await;
+    std::fs::remove_dir(&blocker).unwrap();
+    assert!(removal.is_err());
+    assert_eq!(
+        registry.get_peers(AGENT_ZONE).unwrap()[&42].endpoint,
+        endpoint
+    );
+    assert_eq!(registry.get_node(AGENT_ZONE).unwrap().id(), 41);
+    assert!(manager.hosts_zone(AGENT_ZONE));
+    tokio::task::spawn_blocking(move || manager.shutdown())
         .await
         .unwrap();
 }
