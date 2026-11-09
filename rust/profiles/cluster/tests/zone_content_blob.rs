@@ -1,7 +1,8 @@
 //! Actual mTLS and native CAS namespaces; every byte belongs to a test fixture.
 #![cfg(all(feature = "driver-cas-local", target_os = "linux"))]
 
-mod common;
+#[path = "common/ports.rs"]
+mod ports;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -75,7 +76,7 @@ async fn scoped_blob_rpc_cannot_use_a_known_hash_or_forged_pointer_to_read_other
     std::fs::write(&tls.cert_path, server_cert).unwrap();
     std::fs::write(&tls.key_path, server_key).unwrap();
     std::fs::write(&tls.ca_path, &ca).unwrap();
-    let address = format!("127.0.0.1:{}", common::free_port());
+    let address = format!("127.0.0.1:{}", ports::free_port());
     let manager = ZoneManager::with_node_id(
         "zone-content-test",
         1,

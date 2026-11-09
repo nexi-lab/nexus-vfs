@@ -1,7 +1,8 @@
 //! Raw immutable objects and logical file reads share the existing peer RPC.
 #![cfg(feature = "driver-cas-local")]
 
-mod common;
+#[path = "common/ports.rs"]
+mod ports;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -56,7 +57,7 @@ async fn peer_blob_preserves_manifest_identity_and_logical_path_contents() {
 
     // This is an isolated plaintext test listener. Production Node admission
     // and owner mTLS are covered by the separate transport/runtime fixtures.
-    let address = format!("127.0.0.1:{}", common::free_port());
+    let address = format!("127.0.0.1:{}", ports::free_port());
     let manager = ZoneManager::with_node_id(
         "peer-blob-fixture",
         1,
