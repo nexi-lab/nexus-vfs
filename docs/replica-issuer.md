@@ -21,7 +21,7 @@ flowchart LR
 ## Binding authority
 
 `contracts::replica_binding` owns the native types.
-`RaftReplicaBindingStore` exposes three operations:
+`RaftReplicaBindingStore` exposes four operations:
 
 | Operation | Result |
 |---|---|
