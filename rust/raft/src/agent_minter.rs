@@ -154,6 +154,7 @@ pub trait AgentMinter: Send + Sync {
     /// Preserve the signed session owner and actor, with a fresh key and serial.
     /// The allow-listed minter must also prove possession of the current key;
     /// expiry or revocation closes renewal. No execution state is persisted.
+    /// Replica credentials require their allocation-bound issuer operation.
     async fn renew_session(
         &self,
         caller_cert_der: Option<Vec<u8>>,
