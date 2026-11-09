@@ -87,6 +87,7 @@ struct Fixture {
 
 impl Fixture {
     async fn start(is_tls: bool) -> Self {
+        lib::transport_primitives::ensure_crypto_provider();
         let (ca, ca_key) = generate_zone_ca("root").unwrap();
         let (cert, key) = generate_node_cert(1, "root", &ca, &ca_key, &[], None).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -216,7 +217,7 @@ async fn tls_configuration_encrypts_even_when_the_routing_uri_says_http() {
     let bytes = client
         .fetch_async(&format!("http://{}", server.address), "/private")
         .await
-        .unwrap();
+        .expect("configured routing URI must complete an authenticated TLS read");
     assert_eq!(bytes, BODY);
     assert_eq!(*server.calls.lock().unwrap(), vec![Some(2)]);
     drop(client);
@@ -228,10 +229,13 @@ async fn configured_tls_cannot_send_a_plaintext_blob_request() {
     let server = Fixture::start(false).await;
     let client = PeerBlobClient::new(tokio::runtime::Handle::current());
     client.install_tls_config(server.tls(2));
-    assert!(client
-        .fetch_async(&format!("http://{}", server.address), "/private")
-        .await
-        .is_err());
+    assert!(
+        client
+            .fetch_async(&format!("http://{}", server.address), "/private")
+            .await
+            .is_err(),
+        "TLS configuration must not admit a plaintext response"
+    );
     assert!(server.calls.lock().unwrap().is_empty());
     drop(client);
     server.shutdown().await;
@@ -259,7 +263,7 @@ async fn incomplete_credentials_invalidate_a_cached_plaintext_channel() {
         let error = client
             .fetch_async(&server.address, "/private")
             .await
-            .unwrap_err();
+            .expect_err("incomplete credentials must reject an existing plaintext channel");
         assert!(error.contains("requires both"), "{error}");
         assert!(client.channels.is_empty());
         assert_eq!(*server.calls.lock().unwrap(), vec![None]);
@@ -320,7 +324,7 @@ async fn an_old_dial_cannot_publish_its_channel_after_tls_rotation() {
         .await
         .unwrap()
         .unwrap()
-        .unwrap_err();
+        .expect_err("credential rotation must reject the previous in-flight dial");
     assert!(error.contains("changed while connecting"), "{error}");
     assert!(server.calls.lock().unwrap().is_empty());
     assert_eq!(
