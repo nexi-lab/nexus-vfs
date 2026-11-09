@@ -359,6 +359,12 @@ impl ZoneStoragePolicy {
 }
 
 impl ZoneRaftRegistry {
+    /// Whole-cluster registries may discover groups through Raft ingress.
+    /// A local-root runtime admits data zones explicitly through its owner.
+    pub(crate) fn permits_automatic_zone_join(&self) -> bool {
+        matches!(self.storage_policy, ZoneStoragePolicy::Managed)
+    }
+
     /// Create a new empty registry.
     ///
     /// # Arguments

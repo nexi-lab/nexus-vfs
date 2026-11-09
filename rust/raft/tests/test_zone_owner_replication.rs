@@ -22,6 +22,54 @@ const LINK: &str = "/agents/alice/sessions/sid-a";
 const STREAM: &str = "__wal_stream__/sessions/sid-a/transcript.jsonl/";
 const ROOT_PRIVATE: &str = "/__managed_content_v1__/private-root";
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_traffic_cannot_admit_an_unknown_zone_on_a_local_root_runtime() {
+    use nexus_raft::transport::proto::{
+        zone_transport_service_client::ZoneTransportServiceClient, StepMessageRequest,
+    };
+    use protobuf::Message as _;
+
+    let directory = tempfile::tempdir().unwrap();
+    let address = common::node_bind_addr();
+    let manager = node(31, directory.path(), &address).unwrap();
+    found(&manager, "root", 31, &address).await;
+    let mut client = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(client) =
+                ZoneTransportServiceClient::connect(format!("http://{address}")).await
+            {
+                break client;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("local data-zone listener starts");
+    let mut heartbeat = raft::eraftpb::Message {
+        from: 32,
+        to: 31,
+        term: 1,
+        ..Default::default()
+    };
+    heartbeat.set_msg_type(raft::eraftpb::MessageType::MsgHeartbeat);
+    let result = client
+        .step_message(StepMessageRequest {
+            zone_id: "unadmitted-zone".into(),
+            sender_address: "http://127.0.0.1:2126".into(),
+            message: heartbeat.write_to_bytes().unwrap(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(result.code(), tonic::Code::NotFound);
+    assert!(!manager.hosts_zone("unadmitted-zone"));
+    assert!(!directory.path().join("unadmitted-zone").exists());
+    assert_eq!(
+        manager.get_zone("root").unwrap().consensus_node().voters(),
+        vec![31]
+    );
+    manager.shutdown();
+}
+
 fn node(id: u64, dir: &std::path::Path, addr: &str) -> nexus_raft::raft::Result<Arc<ZoneManager>> {
     ZoneManager::with_local_root(
         "agent-data-zone-probe",

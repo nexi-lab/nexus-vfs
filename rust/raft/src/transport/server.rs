@@ -610,6 +610,9 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
         let node = match self.registry.get_node(&req.zone_id) {
             Some(n) => n,
             None => {
+                if !self.registry.permits_automatic_zone_join() {
+                    return Err(Status::not_found("zone is not admitted on this runtime"));
+                }
                 if self.registry.is_auto_join_suppressed(&req.zone_id) {
                     return Err(Status::not_found(format!(
                         "zone '{}' was recently removed on this node",
