@@ -37,6 +37,12 @@ jobs:
       - name: Conditional metadata and isolated membership boundaries
         run: cargo test --locked -p raft@0.1.0 --test test_conditional_zone_metadata --test test_conditional_metadata_ec_boundary --test test_isolated_root_admission -- --test-threads=1
       - run: cargo test --locked -p raft@0.1.0 --lib transport::node_authority::tests
+      - name: Owner replica identity and renewal boundaries
+        run: |
+          cargo test --locked -p lib --features transport --lib transport_primitives::replica_credential::tests
+          cargo test --locked -p raft@0.1.0 --lib transport::certgen::tests::replica_certificate_retains_owner_identity_without_node_authority
+          cargo test --locked -p raft@0.1.0 --lib transport::session_renewal::tests
+          cargo test --locked -p transport --lib peer_identity::tests::owner_replica_remains_an_owner_agent_on_the_existing_vfs_surface
       - run: cargo test --locked -p raft@0.1.0 --lib agent_csr_client::tests
       - run: cargo test --locked -p raft@0.1.0 --lib zone_manager::tests::mismatched_node_certificate
 
