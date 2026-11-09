@@ -128,7 +128,6 @@ async fn fixed_local_root_refuses_incremental_ec_and_state_snapshots() {
     assert_eq!(
         node.with_state_machine(|state| state.get_metadata("/private-root"))
             .await
-            .unwrap()
             .unwrap(),
         Some(b"local durable value".to_vec())
     );
