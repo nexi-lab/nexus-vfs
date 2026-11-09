@@ -12,13 +12,20 @@ type Observer = Arc<dyn Fn(AgentState, Option<String>) + Send + Sync>;
 struct Body {
     owner: Mutex<Option<(ManagedHostCleanup, Observer)>>,
     stops: AtomicUsize,
+    dropped_handles: AtomicUsize,
     malformed: bool,
     cancel_during_spawn: bool,
+    complete_during_spawn: bool,
 }
 struct Handle {
     body: Arc<Body>,
     endpoint: Option<a2a::session::SessionEndpoint>,
     stopped: AtomicBool,
+}
+impl Drop for Handle {
+    fn drop(&mut self) {
+        self.body.dropped_handles.fetch_add(1, Ordering::SeqCst);
+    }
 }
 impl SpawnHandle for Handle {
     fn abort(&self) {
@@ -52,6 +59,13 @@ impl SpawnTask<Kernel> for Provider {
         observer: Observer,
     ) -> Result<Box<dyn SpawnHandle>, String> {
         observer(AgentState::Ready, None);
+        if self.0.complete_during_spawn {
+            // No runtime threads exist in this fixture. Model the real race:
+            // all joins and the original terminal callback finish before the
+            // provider returns its newly created handle to the service.
+            assert!(cleanup.complete(Ok(())));
+            observer(AgentState::Terminated, None);
+        }
         *self.0.owner.lock().unwrap() = Some((cleanup, observer));
         if self.0.cancel_during_spawn {
             assert!(kernel.agent_registry().kill(&desc.pid, 0).is_err());
@@ -186,4 +200,22 @@ fn legacy_provider_is_refused_before_creating_any_runtime() {
         .agent_registry()
         .list(None, None, None, None)
         .is_empty());
+}
+
+#[test]
+fn completed_before_attachment_does_not_retain_an_already_retired_handle() {
+    let (kernel, body) = fixture(Body {
+        complete_during_spawn: true,
+        ..Default::default()
+    });
+    let error = call(&kernel, "start_session_v1", json!({"agent_id":"agent"})).unwrap_err();
+    assert!(
+        error.contains("retired before handle attachment"),
+        "{error}"
+    );
+    assert_eq!(body.stops.load(Ordering::SeqCst), 1);
+    assert_eq!(body.dropped_handles.load(Ordering::SeqCst), 1);
+    let records = kernel.agent_registry().list(None, None, None, None);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].state, AgentState::Terminated);
 }
