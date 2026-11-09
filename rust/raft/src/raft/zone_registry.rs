@@ -268,7 +268,7 @@ pub struct ZoneRaftRegistry {
     hosted: dashmap::DashSet<String>,
     /// Base path for sled databases. Each zone gets `{base_path}/{zone_id}/`.
     base_path: PathBuf,
-    membership_policy: super::MembershipPolicy,
+    storage_policy: ZoneStoragePolicy,
     /// This node's global ID (same across all zones on this node).
     node_id: u64,
     /// Shared TLS config — can be updated at runtime for plaintext→mTLS upgrade.
@@ -334,6 +334,30 @@ pub struct ZoneRaftRegistry {
 pub type ZoneMaterializedCb =
     Arc<dyn Fn(&str, &ZoneConsensus<FullStateMachine>) + Send + Sync + 'static>;
 
+#[derive(Clone, Copy)]
+enum ZoneStoragePolicy {
+    Managed,
+    LocalRoot,
+    RootOnly,
+}
+
+impl ZoneStoragePolicy {
+    fn membership(self, zone_id: &str) -> Result<super::MembershipPolicy, TransportError> {
+        if zone_id == contracts::ROOT_ZONE_ID {
+            return Ok(match self {
+                Self::Managed => super::MembershipPolicy::Managed,
+                Self::LocalRoot | Self::RootOnly => super::MembershipPolicy::FixedLocal,
+            });
+        }
+        if matches!(self, Self::RootOnly) {
+            return Err(TransportError::Connection(
+                "isolated root accepts its local root only".into(),
+            ));
+        }
+        Ok(super::MembershipPolicy::Managed)
+    }
+}
+
 impl ZoneRaftRegistry {
     /// Create a new empty registry.
     ///
@@ -346,7 +370,17 @@ impl ZoneRaftRegistry {
 
     pub(crate) fn isolated_root(base_path: PathBuf, node_id: u64) -> Self {
         let mut registry = Self::new(base_path, node_id);
-        registry.membership_policy = super::MembershipPolicy::FixedLocal;
+        registry.storage_policy = ZoneStoragePolicy::RootOnly;
+        registry
+    }
+
+    pub(crate) fn with_local_root(
+        base_path: PathBuf,
+        node_id: u64,
+        tls: Option<TlsConfig>,
+    ) -> Self {
+        let mut registry = Self::with_tls(base_path, node_id, tls);
+        registry.storage_policy = ZoneStoragePolicy::LocalRoot;
         registry
     }
 
@@ -356,7 +390,7 @@ impl ZoneRaftRegistry {
             zones: DashMap::new(),
             hosted: dashmap::DashSet::new(),
             base_path,
-            membership_policy: super::MembershipPolicy::Managed,
+            storage_policy: ZoneStoragePolicy::Managed,
             node_id,
             tls: Arc::new(RwLock::new(tls)),
             self_address: Arc::new(RwLock::new(String::new())),
@@ -650,7 +684,8 @@ impl ZoneRaftRegistry {
         learner: bool,
         runtime_handle: &tokio::runtime::Handle,
     ) -> Result<ZoneConsensus<FullStateMachine>, TransportError> {
-        self.membership_policy
+        self.storage_policy
+            .membership(zone_id)?
             .require_managed()
             .map_err(|error| TransportError::Connection(error.to_string()))?;
         self.clear_auto_join_suppression(zone_id);
@@ -774,13 +809,8 @@ impl ZoneRaftRegistry {
                 continue;
             }
             let zone_id = entry.file_name().to_string_lossy().into_owned();
-            if self.membership_policy == super::MembershipPolicy::FixedLocal
-                && zone_id != contracts::ROOT_ZONE_ID
-                && ZonePersistence::looks_like_zone_dir(&entry.path())
-            {
-                return Err(TransportError::Connection(
-                    "isolated root storage contains another zone".into(),
-                ));
+            if ZonePersistence::looks_like_zone_dir(&entry.path()) {
+                self.storage_policy.membership(&zone_id)?;
             }
             if self.index_persisted_zone_if_present(&zone_id) {
                 self.hosted.insert(zone_id);
@@ -902,13 +932,14 @@ impl ZoneRaftRegistry {
         // ephemeral achieved role. See `identity::persist_zone_intent`.
         intended_role: crate::identity::IdentityZoneRole,
     ) -> Result<ZoneConsensus<FullStateMachine>, TransportError> {
-        if self.membership_policy == super::MembershipPolicy::FixedLocal {
-            if zone_id != contracts::ROOT_ZONE_ID || !peers.is_empty() {
+        let membership_policy = self.storage_policy.membership(zone_id)?;
+        if membership_policy == super::MembershipPolicy::FixedLocal {
+            if !peers.is_empty() {
                 return Err(TransportError::Connection(
                     "isolated root accepts its local root only".into(),
                 ));
             }
-            config.membership_policy = self.membership_policy;
+            config.membership_policy = membership_policy;
         }
         // Fast path: zone already exists — no work needed.
         if let Some(entry) = self.zones.get(zone_id) {

@@ -6,7 +6,7 @@
 
 mod common;
 
-use kernel::meta_store::{FileMetadata, MetaStore};
+use kernel::meta_store::{ConditionalMetadataResult, FileMetadata, MetaStore};
 use nexus_raft::distributed_coordinator::bootstrap_or_join_zone;
 use nexus_raft::transport::NodeAddress;
 use nexus_raft::zone_meta_store::ZoneMetaStore;
@@ -20,9 +20,10 @@ const HOME: &str = "/agents/alice";
 const SESSION: &str = "/sessions/sid-a";
 const LINK: &str = "/agents/alice/sessions/sid-a";
 const STREAM: &str = "__wal_stream__/sessions/sid-a/transcript.jsonl/";
+const ROOT_PRIVATE: &str = "/__managed_content_v1__/private-root";
 
 fn node(id: u64, dir: &std::path::Path, addr: &str) -> nexus_raft::raft::Result<Arc<ZoneManager>> {
-    ZoneManager::with_node_id(
+    ZoneManager::with_local_root(
         "agent-data-zone-probe",
         id,
         dir.to_str().unwrap(),
@@ -36,7 +37,14 @@ fn node(id: u64, dir: &std::path::Path, addr: &str) -> nexus_raft::raft::Result<
 
 async fn found(manager: &Arc<ZoneManager>, zone: &str, id: u64, addr: &str) {
     manager
-        .create_zone_async(zone, vec![format!("{id}@{addr}")])
+        .create_zone_async(
+            zone,
+            if zone == "root" {
+                vec![]
+            } else {
+                vec![format!("{id}@{addr}")]
+            },
+        )
         .await
         .unwrap()
         .consensus_node()
@@ -107,6 +115,21 @@ fn check_agent_state(manager: &ZoneManager) {
     assert_eq!(manager.list_zones().len(), 2);
     assert!(!manager.hosts_zone(OTHER_ZONE));
     let root = store(manager, "root", "/");
+    assert_eq!(
+        manager.get_zone("root").unwrap().consensus_node().voters(),
+        vec![32]
+    );
+    assert_eq!(
+        root.as_conditional_metadata()
+            .unwrap()
+            .read_versioned(ROOT_PRIVATE)
+            .unwrap()
+            .unwrap()
+            .metadata
+            .owner_id
+            .as_deref(),
+        Some("user-target")
+    );
     let mounts = root.list("/").unwrap();
     for path in [HOME, SESSION] {
         let mount = mounts.iter().find(|m| m.path == path).unwrap();
@@ -128,6 +151,20 @@ async fn selected_zone_join_preserves_disjoint_paths_owner_link_and_wal_tables()
         found(&source, zone, 31, &source_addr).await;
     }
     found(&target, "root", 32, &target_addr).await;
+    for (manager, owner) in [(&source, "user-source"), (&target, "user-target")] {
+        let root = store(manager, "root", "/");
+        assert!(matches!(
+            root.as_conditional_metadata()
+                .unwrap()
+                .replace_if_version(ROOT_PRIVATE, metadata(ROOT_PRIVATE, 0, "root", owner), None,)
+                .unwrap(),
+            ConditionalMetadataResult::Committed { .. }
+        ));
+        assert!(manager.join_zone("root", vec![], true).is_err());
+    }
+    assert!(store(&source, AGENT_ZONE, HOME)
+        .as_conditional_metadata()
+        .is_none());
 
     {
         let home = store(&source, AGENT_ZONE, HOME);
