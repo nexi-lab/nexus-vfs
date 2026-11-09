@@ -18,6 +18,7 @@ on:
       - ".github/workflows/release.yml"
       - "scripts/e2e/cluster_binary_enrollment.py"
       - "scripts/e2e/operator_agent_enrollment.py"
+      - "scripts/ci/build_release_with_map.py"
   pull_request:
     paths:
       - "rust/**"
@@ -30,6 +31,7 @@ on:
       - ".github/workflows/release.yml"
       - "scripts/e2e/cluster_binary_enrollment.py"
       - "scripts/e2e/operator_agent_enrollment.py"
+      - "scripts/ci/build_release_with_map.py"
 
 jobs:
   build:
