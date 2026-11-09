@@ -8,6 +8,10 @@ mod common;
 
 use kernel::meta_store::{ConditionalMetadataResult, FileMetadata, MetaStore};
 use nexus_raft::distributed_coordinator::bootstrap_or_join_zone;
+use nexus_raft::transport::proto::{
+    zone_transport_service_client::ZoneTransportServiceClient, GetClusterInfoRequest,
+    StepMessageRequest,
+};
 use nexus_raft::transport::NodeAddress;
 use nexus_raft::zone_meta_store::ZoneMetaStore;
 use nexus_raft::ZoneManager;
@@ -24,9 +28,6 @@ const ROOT_PRIVATE: &str = "/__managed_content_v1__/private-root";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn peer_traffic_cannot_admit_an_unknown_zone_on_a_local_root_runtime() {
-    use nexus_raft::transport::proto::{
-        zone_transport_service_client::ZoneTransportServiceClient, StepMessageRequest,
-    };
     use protobuf::Message as _;
 
     let directory = tempfile::tempdir().unwrap();
@@ -34,18 +35,7 @@ async fn peer_traffic_cannot_admit_an_unknown_zone_on_a_local_root_runtime() {
     let manager = node(31, directory.path(), &address).unwrap();
     found(&manager, "root", 31, &address).await;
     let root_id = manager.cluster_status("root").node_id;
-    let mut client = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if let Ok(client) =
-                ZoneTransportServiceClient::connect(format!("http://{address}")).await
-            {
-                break client;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("local data-zone listener starts");
+    let mut client = peer_client(&address).await;
     let mut heartbeat = raft::eraftpb::Message {
         from: 32,
         to: 31,
@@ -73,6 +63,21 @@ async fn peer_traffic_cannot_admit_an_unknown_zone_on_a_local_root_runtime() {
 
 fn node(id: u64, dir: &std::path::Path, addr: &str) -> nexus_raft::raft::Result<Arc<ZoneManager>> {
     node_with_peers(id, dir, addr, Vec::new())
+}
+
+async fn peer_client(address: &str) -> ZoneTransportServiceClient<tonic::transport::Channel> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(client) =
+                ZoneTransportServiceClient::connect(format!("http://{address}")).await
+            {
+                break client;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("local data-zone listener starts")
 }
 
 fn node_with_peers(
@@ -400,6 +405,19 @@ async fn replica_adoption_preserves_local_root_identity_and_writes_across_restar
         assert_eq!(data.id(), replica_id);
         assert_eq!(data.voters(), vec![replica_id]);
         assert_eq!(manager.cluster_status(AGENT_ZONE).node_id, replica_id);
+        let mut client = peer_client(&address).await;
+        for (zone, expected) in [("root", local_id), (AGENT_ZONE, replica_id)] {
+            let info = client
+                .get_cluster_info(GetClusterInfoRequest {
+                    zone_id: zone.into(),
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(info.node_id, expected);
+            assert_eq!(info.config.unwrap().voters[0].id, expected);
+        }
+        drop(client);
         drop(data);
         drop(root);
         drop(root_node);
