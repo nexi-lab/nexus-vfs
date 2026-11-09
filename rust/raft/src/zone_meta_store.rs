@@ -699,24 +699,7 @@ impl MetaStore for ZoneMetaStore {
         };
         let result = bridge_block_on(&self.runtime, self.node()?.propose(cmd))
             .map_err(|e| append_error(stream_prefix, &e))?;
-        match result {
-            crate::prelude::CommandResult::Value(bytes) => <[u8; 8]>::try_from(bytes.as_slice())
-                .map(u64::from_be_bytes)
-                .map_err(|_| {
-                    MetaStoreError::IOError(format!(
-                        "ZoneMetaStore.append_stream_entry({stream_prefix}): apply returned a \
-                         non-u64 offset ({} bytes)",
-                        bytes.len()
-                    ))
-                }),
-            crate::prelude::CommandResult::Error(e) => Err(MetaStoreError::IOError(format!(
-                "ZoneMetaStore.append_stream_entry({stream_prefix}) rejected: {e}"
-            ))),
-            _ => Err(MetaStoreError::IOError(format!(
-                "ZoneMetaStore.append_stream_entry({stream_prefix}): unexpected apply result \
-                 (expected a Value offset)"
-            ))),
-        }
+        append_offset(stream_prefix, result)
     }
 
     fn get_stream_entry(&self, key: &str) -> Result<Option<Vec<u8>>, MetaStoreError> {
@@ -882,6 +865,32 @@ impl MetaStore for ZoneMetaStore {
     }
 }
 
+/// The offset a committed append was applied at.
+///
+/// `propose` returned, so the entry is in the raft log, and the apply only ever
+/// answers with its offset. Any other answer says nothing about whether the
+/// entry landed — it must not read as a refusal, or a caller retries an entry
+/// that is already there.
+fn append_offset(stream_prefix: &str, result: CommandResult) -> Result<u64, MetaStoreError> {
+    let unknown = |what: String| {
+        MetaStoreError::OutcomeUnknown(format!(
+            "ZoneMetaStore.append_stream_entry({stream_prefix}): the proposal committed, but {what}"
+        ))
+    };
+    match result {
+        CommandResult::Value(bytes) => <[u8; 8]>::try_from(bytes.as_slice())
+            .map(u64::from_be_bytes)
+            .map_err(|_| {
+                unknown(format!(
+                    "apply returned a non-u64 offset ({} bytes)",
+                    bytes.len()
+                ))
+            }),
+        CommandResult::Error(e) => Err(unknown(format!("apply answered with an error: {e}"))),
+        _ => Err(unknown("apply returned no offset".to_string())),
+    }
+}
+
 /// A failed append proposal, typed by what the raft layer knows about it: sent
 /// with no answer (it may have committed) or refused (nothing was applied).
 /// The two need different handling, a read-back versus a plain retry, and
@@ -925,6 +934,28 @@ mod tests {
             append_error("p/", &refused),
             MetaStoreError::IOError(_)
         ));
+    }
+
+    /// Once `propose` returns the entry is committed, so an answer without a
+    /// usable offset is an unknown outcome, never a refusal to retry.
+    #[test]
+    fn a_committed_append_without_an_offset_may_have_landed() {
+        assert_eq!(
+            append_offset("p/", CommandResult::Value(7u64.to_be_bytes().to_vec())).unwrap(),
+            7
+        );
+        for answer in [
+            CommandResult::Value(vec![1, 2, 3]),
+            CommandResult::Error("apply refused".into()),
+            CommandResult::Success,
+        ] {
+            match append_offset("p/", answer) {
+                Err(MetaStoreError::OutcomeUnknown(why)) => {
+                    assert!(why.contains("the proposal committed"), "{why}");
+                }
+                other => panic!("a committed append must not read as {other:?}"),
+            }
+        }
     }
 
     /// Two mounts of ONE zone keep disjoint key spaces when they declare
