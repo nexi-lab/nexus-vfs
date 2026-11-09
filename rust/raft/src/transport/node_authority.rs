@@ -12,7 +12,7 @@ use tonic::{
     transport::server::{TcpConnectInfo, TlsConnectInfo},
     Status,
 };
-use x509_parser::{certificate::X509Certificate, extensions::GeneralName, prelude::FromDer};
+use x509_parser::{certificate::X509Certificate, prelude::FromDer};
 
 /// Signed identity/time/role information, not proof of key possession. Network
 /// callers must supply the actual TLS leaf; a public certificate is not auth.
@@ -156,29 +156,7 @@ fn current_local_leaf<'a>(
 }
 
 fn node_certificate_identity(leaf: &X509Certificate<'_>) -> Result<LocalNodeCertificate, String> {
-    let san = leaf
-        .subject_alternative_name()
-        .map_err(|_| "invalid Node SAN")?
-        .ok_or("missing Node SAN")?;
-    let identities: Vec<_> = san
-        .value
-        .general_names
-        .iter()
-        .filter_map(|n| match n {
-            GeneralName::URI(uri) if uri.starts_with("nexus://") => Some(*uri),
-            _ => None,
-        })
-        .collect();
-    let [identity] = identities.as_slice() else {
-        return Err("Node certificate must carry exactly one Nexus identity".into());
-    };
-    let (zone_id, node_id) =
-        super::parse_node_identity_uri(identity).ok_or("certificate does not name a Node")?;
-    contracts::validate_zone_id_for(contracts::ZoneIdUse::ExistingRef, &zone_id)
-        .map_err(|e| e.to_string())?;
-    if super::node_identity_uri(&zone_id, node_id) != *identity {
-        return Err("Node identity is not canonical".into());
-    }
+    let (zone_id, node_id) = lib::transport_primitives::node_identity_from_x509(leaf)?;
     Ok(LocalNodeCertificate {
         node_id,
         zone_id,

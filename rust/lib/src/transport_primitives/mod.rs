@@ -15,7 +15,9 @@ mod crl;
 mod error;
 mod federated_tls;
 mod foreign_ca;
+mod node_credential;
 mod peer;
+mod peer_verifier;
 mod peer_blob_client;
 mod pool;
 mod replica_credential;
@@ -25,7 +27,7 @@ mod server_limits;
 mod tofu;
 
 pub use agent_credential::{AgentCredential, LoadedCredential, CREDENTIAL_MANIFEST};
-pub use channel::{create_channel, ensure_crypto_provider};
+pub use channel::{create_channel, create_peer_channel, ensure_crypto_provider};
 pub use config::{ClientConfig, ServerConfig, TlsConfig};
 pub use crl::{
     ca_spki_sha256, canonical_certificate_serial, verify_signed_crl, VerifiedCrl,
@@ -37,6 +39,7 @@ pub use federated_tls::{
     FederatedClientCertVerifier, ReloadableServerIdentity,
 };
 pub use foreign_ca::{first_certificate_der, CaFingerprint, ForeignCaAnchor, ForeignCaScope};
+pub use node_credential::{node_identity_from_x509, node_identity_uri, parse_node_identity_uri};
 pub use peer::{hostname_to_node_id, NodeAddress, PeerAddress};
 pub use peer_blob_client::{NoopPeerBlobClient, PeerBlobClient, PeerBlobResult};
 pub use pool::ConnectionPool;

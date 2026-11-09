@@ -7,7 +7,7 @@ use std::time::Duration;
 /// All fields are PEM-encoded bytes (read from files by the caller).
 /// Rust core holds bytes, not paths — file I/O happens at the boundary
 /// (CLI reads files). This makes the core testable with in-memory certs.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlsConfig {
     /// Server/client certificate (PEM).
     pub cert_pem: Vec<u8>,

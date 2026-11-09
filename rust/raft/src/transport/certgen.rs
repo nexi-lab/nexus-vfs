@@ -34,29 +34,7 @@ const CA_VALIDITY_DAYS: i64 = 365 * 10;
 /// A CSR is a public key and proof, not an unbounded certificate-policy input.
 const MAX_CSR_PEM_BYTES: usize = 16 * 1024;
 
-/// Scheme + authority of the identity URI SAN. Certificates are the
-/// only place a node's identity is stated in a way the far end can
-/// verify, so the format lives here — next to the code that mints it —
-/// and `transport::peer_identity` reads it back through
-/// [`parse_node_identity_uri`] rather than re-spelling it.
-const NODE_IDENTITY_URI_PREFIX: &str = "nexus://zone/";
-
-/// Build the identity URI SAN pinned into a node certificate:
-/// `nexus://zone/{zone_id}/node/{node_id}`.
-pub fn node_identity_uri(zone_id: &str, node_id: u64) -> String {
-    format!("{NODE_IDENTITY_URI_PREFIX}{zone_id}/node/{node_id}")
-}
-
-/// Inverse of [`node_identity_uri`] — `None` for any URI that is not
-/// ours or is malformed (a foreign SAN must never resolve to a peer).
-pub fn parse_node_identity_uri(uri: &str) -> Option<(String, u64)> {
-    let rest = uri.strip_prefix(NODE_IDENTITY_URI_PREFIX)?;
-    let (zone_id, node_id) = rest.split_once("/node/")?;
-    if zone_id.is_empty() {
-        return None;
-    }
-    Some((zone_id.to_string(), node_id.parse().ok()?))
-}
+pub use lib::transport_primitives::{node_identity_uri, parse_node_identity_uri};
 
 /// Parse a cluster CA (cert + private key, both PEM) into an rcgen `Issuer`
 /// ready to sign leaf certs. Shared by node/agent cert generation and CRL

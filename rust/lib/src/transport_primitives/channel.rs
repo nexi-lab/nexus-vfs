@@ -27,6 +27,29 @@ pub async fn create_channel(
     endpoint: &str,
     config: &ClientConfig,
 ) -> Result<tonic::transport::Channel, TransportError> {
+    create_channel_inner(endpoint, config, None).await
+}
+
+/// Connect to an exact signed Node or owner replica using the same transport
+/// configuration as other channels. The route carries no identity authority.
+pub async fn create_peer_channel(
+    endpoint: &str,
+    config: &ClientConfig,
+    expected: std::num::NonZeroU64,
+) -> Result<tonic::transport::Channel, TransportError> {
+    if config.tls.is_none() {
+        return Err(TransportError::Connection(
+            "authenticated peer channels require TLS".into(),
+        ));
+    }
+    create_channel_inner(endpoint, config, Some(expected)).await
+}
+
+async fn create_channel_inner(
+    endpoint: &str,
+    config: &ClientConfig,
+    expected: Option<std::num::NonZeroU64>,
+) -> Result<tonic::transport::Channel, TransportError> {
     let mut uri: tonic::codegen::http::Uri = endpoint
         .parse()
         .map_err(|e| TransportError::InvalidAddress(format!("{e}")))?;
@@ -63,7 +86,7 @@ pub async fn create_channel(
     }
 
     if let Some(ref tls) = config.tls {
-        ep = apply_tls(ep, tls)?;
+        ep = apply_tls(ep, tls, expected)?;
     }
 
     match tokio::time::timeout(config.connect_timeout, ep.connect()).await {
@@ -100,9 +123,9 @@ pub fn ensure_crypto_provider() {
 fn apply_tls(
     ep: tonic::transport::Endpoint,
     tls: &TlsConfig,
+    expected: Option<std::num::NonZeroU64>,
 ) -> Result<tonic::transport::Endpoint, TransportError> {
     ensure_crypto_provider();
-    let ca_cert = tonic::transport::Certificate::from_pem(&tls.ca_pem);
     let identity = tonic::transport::Identity::from_pem(&tls.cert_pem, &tls.key_pem);
 
     // Verify the peer against the fixed cluster server name (present in every
@@ -112,9 +135,19 @@ fn apply_tls(
     // its addresses and re-enroll on any overlay-IP change. See
     // `CLUSTER_TLS_SERVER_NAME`.
     let tls_config = tonic::transport::ClientTlsConfig::new()
-        .ca_certificate(ca_cert)
         .identity(identity)
         .domain_name(TlsConfig::CLUSTER_SERVER_NAME);
-
-    ep.tls_config(tls_config).map_err(TransportError::Tonic)
+    match expected {
+        Some(expected) => {
+            let verifier = super::peer_verifier::PeerVerifier::new(&tls.ca_pem, expected)
+                .map_err(TransportError::Connection)?;
+            ep.tls_config_with_verifier(tls_config, verifier)
+                .map_err(TransportError::Tonic)
+        }
+        None => ep
+            .tls_config(
+                tls_config.ca_certificate(tonic::transport::Certificate::from_pem(&tls.ca_pem)),
+            )
+            .map_err(TransportError::Tonic),
+    }
 }
