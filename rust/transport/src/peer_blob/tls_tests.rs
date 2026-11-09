@@ -161,6 +161,42 @@ impl Drop for Fixture {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn channel_connection_bounds_a_peer_that_accepts_without_handshaking() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("https://{}", listener.local_addr().unwrap());
+    let (ca_pem, ca_key) = generate_zone_ca("root").unwrap();
+    let (cert_pem, key_pem) = generate_node_cert(2, "root", &ca_pem, &ca_key, &[], None).unwrap();
+    let connection = tokio::spawn(async move {
+        lib::transport_primitives::create_channel(
+            &endpoint,
+            &lib::transport_primitives::ClientConfig {
+                connect_timeout: Duration::from_millis(250),
+                tls: Some(lib::transport_primitives::TlsConfig {
+                    ca_pem,
+                    cert_pem,
+                    key_pem,
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+    });
+    // Retain the actual socket: the peer neither closes it nor completes TLS.
+    let (_socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), connection)
+        .await
+        .expect("channel establishment exceeded its configured timeout")
+        .unwrap();
+    assert!(
+        result.is_err(),
+        "a silent peer completed channel establishment"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn configured_tls_rejects_other_uri_schemes_before_an_rpc() {
     let fixture = Fixture::start(false).await;
     let config = lib::transport_primitives::ClientConfig {
