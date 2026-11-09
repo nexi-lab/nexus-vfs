@@ -22,24 +22,22 @@ pub fn replica_node_id_from_x509(cert: &X509Certificate<'_>) -> Result<Option<u6
         return Ok(None);
     };
     let names = &san.value.general_names;
-    let replicas: Vec<_> = names
-        .iter()
-        .filter_map(|entry| match entry {
-            GeneralName::URI(uri) if uri.starts_with(PREFIX) => Some(*uri),
-            _ => None,
-        })
-        .collect();
-    if replicas.is_empty() {
+    let mut replicas = names.iter().filter_map(|entry| match entry {
+        GeneralName::URI(uri) if uri.starts_with(PREFIX) => Some(*uri),
+        _ => None,
+    });
+    let Some(replica) = replicas.next() else {
         return Ok(None);
-    }
-    let [replica] = replicas.as_slice() else {
-        return Err("credential must carry exactly one replica identity".into());
     };
+    if replicas.next().is_some() {
+        return Err("credential must carry exactly one replica identity".into());
+    }
     let node_id = replica
         .strip_prefix(PREFIX)
         .and_then(|value| value.parse::<u64>().ok())
         .ok_or("invalid replica node ID")?;
-    if replica_identity_uri(node_id)? != *replica {
+    let replica_uri = replica_identity_uri(node_id)?;
+    if replica_uri != replica {
         return Err("replica node ID must be canonical".into());
     }
     super::user_runtime_name_from_x509(cert)?
@@ -48,21 +46,29 @@ pub fn replica_node_id_from_x509(cert: &X509Certificate<'_>) -> Result<Option<u6
         .ok_or("replica identity requires an agent subject")?;
     let owner = super::authorship::owner_from_x509(cert)
         .ok_or("replica identity requires a signed owner")?;
-    let mut expected = vec![
+    let expected = [
         crate::agent_identity::agent_identity_uri(&subject),
         crate::agent_identity::owner_uri(&owner),
-        replica_identity_uri(node_id)?,
+        replica_uri,
     ];
-    let mut actual: Vec<_> = names
-        .iter()
-        .filter_map(|entry| match entry {
-            GeneralName::URI(uri) => Some(uri.to_string()),
-            _ => None,
-        })
-        .collect();
-    expected.sort_unstable();
-    actual.sort_unstable();
-    if actual != expected {
+    let mut seen = 0_u8;
+    for entry in names {
+        let GeneralName::URI(uri) = entry else {
+            continue;
+        };
+        let Some(index) = expected
+            .iter()
+            .position(|expected| expected.as_str() == *uri)
+        else {
+            return Err("replica identity must name one owner and one agent subject".into());
+        };
+        let bit = 1 << index;
+        if seen & bit != 0 {
+            return Err("replica identity must name one owner and one agent subject".into());
+        }
+        seen |= bit;
+    }
+    if seen != 0b111 {
         return Err("replica identity must name one owner and one agent subject".into());
     }
     Ok(Some(node_id))
@@ -98,6 +104,27 @@ mod tests {
     }
 
     #[test]
+    fn replica_identity_accepts_each_san_order() {
+        let uris = [
+            "nexus://agent/session-a",
+            "nexus://owner/alice",
+            "nexus://replica/7",
+        ];
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let leaf = certificate(&order.map(|index| uris[index]));
+            let (_, cert) = X509Certificate::from_der(leaf.der()).unwrap();
+            assert_eq!(replica_node_id_from_x509(&cert).unwrap(), Some(7));
+        }
+    }
+
+    #[test]
     fn replica_requires_one_canonical_identity_and_the_exact_owner_runtime_shape() {
         for uri in [
             "nexus://replica/0",
@@ -111,6 +138,24 @@ mod tests {
             assert!(replica_node_id_from_x509(&cert).is_err(), "{uri}");
         }
         for uris in [
+            vec![
+                "nexus://agent/session-a",
+                "nexus://agent/session-a",
+                "nexus://owner/alice",
+                "nexus://replica/7",
+            ],
+            vec![
+                "nexus://agent/session-a",
+                "nexus://owner/alice",
+                "nexus://owner/alice",
+                "nexus://replica/7",
+            ],
+            vec![
+                "nexus://agent/session-a",
+                "nexus://owner/alice",
+                "nexus://replica/7",
+                "nexus://unexpected/7",
+            ],
             vec!["nexus://agent/session-a", "nexus://replica/7"],
             vec!["nexus://owner/alice", "nexus://replica/7"],
             vec![
