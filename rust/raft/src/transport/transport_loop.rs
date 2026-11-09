@@ -1333,7 +1333,7 @@ mod tests {
 
     #[test]
     fn ec_recipients_follow_joint_membership_instead_of_learned_addresses() {
-        let (_directory, _handle, transport) = membership_fixture(ConfState {
+        let (_directory, handle, transport) = membership_fixture(ConfState {
             voters: vec![1, 2],
             voters_outgoing: vec![1, 3],
             learners: vec![4],
@@ -1343,6 +1343,12 @@ mod tests {
         assert_eq!(recipients(&transport), vec![2, 3, 4]);
         assert!(transport.peers.read().unwrap().contains_key(&5));
         assert_eq!(transport.driver.voter_ids(), vec![1, 2, 3]);
+        for id in 1..=5 {
+            assert_eq!(
+                handle.is_replication_member(id),
+                transport.driver.is_replication_member(id)
+            );
+        }
     }
 
     #[tokio::test]
@@ -1353,6 +1359,7 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(recipients(&transport), vec![2]);
+        assert!(handle.is_replication_member(2));
         transport.ec_peer_state.insert(2, mk_peer_state(7));
         tokio::time::timeout(Duration::from_secs(5), async {
             while !handle.is_leader() {
@@ -1381,6 +1388,10 @@ mod tests {
         let committed = change.await.unwrap().unwrap();
         assert_eq!(committed.voters, vec![1]);
         assert!(committed.learners.is_empty());
+        assert!(
+            !handle.is_replication_member(2),
+            "committed removal updates admission before returning"
+        );
         assert!(transport.peers.read().unwrap().contains_key(&2));
         assert!(recipients(&transport).is_empty());
         // A retired peer's progress cannot pin future compaction or count as

@@ -299,6 +299,14 @@ pub struct Membership {
     pub learner_matched: Vec<(u64, u64)>,
 }
 
+/// Ephemeral read view published by the Raft driver from its ProgressTracker.
+#[derive(Default)]
+struct MembershipSnapshot {
+    voters: Vec<u64>,
+    #[cfg(all(feature = "grpc", has_protos))]
+    members: Vec<u64>,
+}
+
 impl Membership {
     /// Is `node_id` a voter?
     #[inline]
@@ -418,14 +426,14 @@ pub struct ZoneConsensus<S: StateMachine + 'static> {
     /// Used by the transport layer to reject impossible leader commit hints
     /// before they reach raft-rs and trip its commit range assertion.
     cached_last_index: Arc<AtomicU64>,
-    /// Cached voter set (raft-rs SSOT: `ProgressTracker.conf().voters().ids()`),
+    /// Cached membership (raft-rs SSOT: `ProgressTracker`),
     /// mirrored by the driver via `refresh_cached_status_from_raw_node`
     /// on every advance().  SSOT-clean for [`Self::voters`] — the RPC
     /// surface (`GetClusterInfo.config.voters`) reflects the authoritative
     /// raft ConfState, NOT the transport-layer peer address book (which
     /// is a superset containing learners, witnesses, and stale
     /// wipe-rejoin ghosts).
-    cached_voters: Arc<parking_lot::RwLock<Vec<u64>>>,
+    cached_membership: Arc<parking_lot::RwLock<MembershipSnapshot>>,
     /// Shared clone of the state machine's ``last_applied`` atomic — not
     /// a second cache, the state machine IS the SSOT for applied index.
     /// ``commit_index`` reflects ``raft_log.committed`` which raft-rs
@@ -478,7 +486,7 @@ impl<S: StateMachine + 'static> Clone for ZoneConsensus<S> {
             cached_term: self.cached_term.clone(),
             cached_commit_index: self.cached_commit_index.clone(),
             cached_last_index: self.cached_last_index.clone(),
-            cached_voters: self.cached_voters.clone(),
+            cached_membership: self.cached_membership.clone(),
             applied_index_atom: self.applied_index_atom.clone(),
             replication_log: self.replication_log.clone(),
             #[cfg(all(feature = "grpc", has_protos))]
@@ -543,8 +551,8 @@ pub struct ZoneConsensusDriver<S: StateMachine + 'static> {
     cached_commit_index: Arc<AtomicU64>,
     /// Cached last log index (shared with handle for transport validation).
     cached_last_index: Arc<AtomicU64>,
-    /// Cached voter set (shared with handle for GetClusterInfo reads).
-    cached_voters: Arc<parking_lot::RwLock<Vec<u64>>>,
+    /// Cached membership shared with the handle for status and authorization.
+    cached_membership: Arc<parking_lot::RwLock<MembershipSnapshot>>,
     /// Shared peer map — updated when ConfChange adds/removes nodes.
     /// Set by `set_peer_map()` before the transport loop starts.
     #[cfg(all(feature = "grpc", has_protos))]
@@ -851,14 +859,14 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         let cached_term = Arc::new(AtomicU64::new(0));
         let cached_commit_index = Arc::new(AtomicU64::new(0));
         let cached_last_index = Arc::new(AtomicU64::new(0));
-        let cached_voters = Arc::new(parking_lot::RwLock::new(Vec::<u64>::new()));
+        let cached_membership = Arc::new(parking_lot::RwLock::new(MembershipSnapshot::default()));
         refresh_cached_status_from_raw_node(
             &raw_node,
             &cached_leader_id,
             &cached_term,
             &cached_commit_index,
             &cached_last_index,
-            &cached_voters,
+            &cached_membership,
         );
 
         // Bounded channel with backpressure
@@ -872,7 +880,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             cached_term: cached_term.clone(),
             cached_commit_index: cached_commit_index.clone(),
             cached_last_index: cached_last_index.clone(),
-            cached_voters: cached_voters.clone(),
+            cached_membership: cached_membership.clone(),
             applied_index_atom,
             replication_log,
             #[cfg(all(feature = "grpc", has_protos))]
@@ -905,7 +913,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             cached_term,
             cached_commit_index,
             cached_last_index,
-            cached_voters,
+            cached_membership,
             #[cfg(all(feature = "grpc", has_protos))]
             peer_map: None,
             #[cfg(all(feature = "grpc", has_protos))]
@@ -1043,7 +1051,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
 
     /// Snapshot of the current voter set (raft-rs SSOT).
     ///
-    /// Reads from `cached_voters`, mirrored by the driver's
+    /// Reads from `cached_membership`, mirrored by the driver's
     /// `refresh_cached_status_from_raw_node` post-advance — same
     /// eventual-consistency semantics as [`Self::leader_id`] and
     /// [`Self::term`].  Consumers: `ZoneApiService::GetClusterInfo`
@@ -1055,7 +1063,20 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
     /// toward quorum, and `GetClusterInfo.config.voters` must reflect
     /// only quorum-eligible members.
     pub fn voters(&self) -> Vec<u64> {
-        self.cached_voters.read().clone()
+        self.cached_membership.read().voters.clone()
+    }
+
+    /// Replication membership mirrored from the same authoritative tracker.
+    /// This point read keeps network ingress independent of the actor channel.
+    #[cfg(all(feature = "grpc", has_protos))]
+    pub(crate) fn is_replication_member(&self, node_id: u64) -> bool {
+        !self.msg_tx.is_closed()
+            && self
+                .cached_membership
+                .read()
+                .members
+                .binary_search(&node_id)
+                .is_ok()
     }
 
     /// Get the current raft log commit index (atomic read, no channel).
@@ -1878,6 +1899,7 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
     /// incoming/outgoing voters, learners and learners awaiting joint exit.
     /// The address book supplies routes; it cannot add replication members.
     #[inline]
+    #[cfg(all(feature = "grpc", has_protos))]
     pub(crate) fn is_replication_member(&self, node_id: u64) -> bool {
         self.raw_node.raft.prs().get(node_id).is_some()
     }
@@ -2543,6 +2565,8 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                         cb(&cs, self.config.id);
                     }
 
+                    self.update_cached_status();
+
                     // Notify waiting JoinZone caller (if any)
                     if let Some(tx) = self.pending_conf_changes.remove(&cc.node_id) {
                         let _ = tx.send(Ok(cs));
@@ -2622,6 +2646,8 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                     if let Some(ref cb) = self.conf_state_applied_cb {
                         cb(&cs, self.config.id);
                     }
+
+                    self.update_cached_status();
 
                     // Notify waiting JoinZone callers for each added node
                     for single in &cc.changes {
@@ -2712,7 +2738,7 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
             &self.cached_term,
             &self.cached_commit_index,
             &self.cached_last_index,
-            &self.cached_voters,
+            &self.cached_membership,
         );
     }
 }
@@ -2727,17 +2753,15 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
 /// other would silently drift — the exact hazard that produced the
 /// boot-race bug this helper exists to close.
 ///
-/// `voters` is a `RwLock<Vec<u64>>` rather than an atom because the
-/// voter set is variable-length; write cost is bounded (join/leave
-/// only, on ConfState apply — same rare rate as `conf_state_applied_cb`),
-/// read cost is a lock + clone into an owned Vec.
+/// Voters and all replication members share one ephemeral view. Status reads
+/// copy the voter list; admission checks read membership without allocating.
 fn refresh_cached_status_from_raw_node(
     raw_node: &RawNode<RaftStorage>,
     leader_id: &AtomicU64,
     term: &AtomicU64,
     commit_index: &AtomicU64,
     last_index: &AtomicU64,
-    voters: &parking_lot::RwLock<Vec<u64>>,
+    membership: &parking_lot::RwLock<MembershipSnapshot>,
 ) {
     leader_id.store(raw_node.raft.leader_id, Ordering::Relaxed);
     term.store(raw_node.raft.term, Ordering::Relaxed);
@@ -2748,7 +2772,17 @@ fn refresh_cached_status_from_raw_node(
     // semantics change (witness filter, joint-config handling, …)
     // has one place to land and cannot silently drift between the
     // driver's live read and the handle's cached mirror.
-    *voters.write() = voter_ids_from_raw_node(raw_node);
+    #[cfg(all(feature = "grpc", has_protos))]
+    let members = {
+        let mut members: Vec<u64> = raw_node.raft.prs().iter().map(|(id, _)| *id).collect();
+        members.sort_unstable();
+        members
+    };
+    *membership.write() = MembershipSnapshot {
+        voters: voter_ids_from_raw_node(raw_node),
+        #[cfg(all(feature = "grpc", has_protos))]
+        members,
+    };
 }
 
 /// Read the raft-rs `ProgressTracker` voter set from `raw_node` and
@@ -3022,7 +3056,7 @@ mod tests {
         assert!(!handle.is_leader());
     }
 
-    /// #7 dynamic-membership regression: `cached_voters` mirror MUST
+    /// #7 dynamic-membership regression: `cached_membership` mirror MUST
     /// update after a ConfChange applies, otherwise the handle-side
     /// `voters()` reads a stale set and `GetClusterInfo` under-reports
     /// membership after every join/leave.  Drives the raft loop
@@ -3037,7 +3071,7 @@ mod tests {
     /// majority for the AddNode commit, so the ConfChange lands
     /// without a live peer 2.
     #[tokio::test]
-    async fn test_cached_voters_updates_on_conf_change_apply() {
+    async fn test_cached_membership_updates_on_conf_change_apply() {
         let dir = TempDir::new().unwrap();
         let storage = RaftStorage::open(dir.path()).unwrap();
         let cs = ConfState {
@@ -3106,7 +3140,7 @@ mod tests {
         }
         assert!(
             mirrored,
-            "cached_voters must reflect the applied ConfChange within the bounded advance loop; \
+            "cached_membership must reflect the applied ConfChange within the bounded advance loop; \
              saw {:?} on last read",
             handle.voters()
         );
@@ -3308,7 +3342,7 @@ mod tests {
         // `peers` is intentionally non-empty: it is the transport
         // address book, NOT a ConfState seed.  The bug (#7) was that
         // this list bled into `GetClusterInfo.config.voters`; the fix
-        // pins voters to `cached_voters` populated from raft-rs's
+        // pins voters to `cached_membership` populated from raft-rs's
         // `ProgressTracker`, which for a fresh 1-voter bootstrap
         // holds exactly `[self.id]`.
         let config = RaftConfig {

@@ -165,12 +165,14 @@ impl RaftGrpcServer {
             session_mint_admin_slot: self.session_mint_admin_slot.clone(),
         };
         Ok((
-            NodeControlService::new(ZoneTransportServiceServer::new(raft), policy.clone(), &[]),
+            NodeControlService::new(ZoneTransportServiceServer::new(raft), policy.clone(), &[])
+                .with_owner_replica_data(),
             NodeControlService::new(
                 ZoneApiServiceServer::new(api),
                 policy,
                 AGENT_CREDENTIAL_METHODS,
-            ),
+            )
+            .with_owner_replica_data(),
         ))
     }
     pub fn new(registry: Arc<ZoneRaftRegistry>, config: ServerConfig) -> Self {
@@ -601,6 +603,11 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
         &self,
         request: Request<StepMessageRequest>,
     ) -> std::result::Result<Response<StepMessageResponse>, Status> {
+        super::node_authority::authorize_data_zone(
+            &request,
+            &self.registry,
+            &request.get_ref().zone_id,
+        )?;
         let message = match parse_raft_message(&request.get_ref().message) {
             Ok(message) => message,
             Err(response) => return Ok(Response::new(response)),
@@ -673,6 +680,11 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
         &self,
         request: Request<ReplicateEntriesRequest>,
     ) -> std::result::Result<Response<ReplicateEntriesResponse>, Status> {
+        super::node_authority::authorize_data_zone(
+            &request,
+            &self.registry,
+            &request.get_ref().zone_id,
+        )?;
         super::node_authority::authorize_ec_sender(&request, request.get_ref().sender_node_id)?;
         let req = request.into_inner();
         let node = get_zone_node(&self.registry, &req.zone_id)?;
@@ -761,6 +773,11 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
         &self,
         request: Request<SnapshotEcStateRequest>,
     ) -> std::result::Result<Response<SnapshotEcStateResponse>, Status> {
+        super::node_authority::authorize_data_zone(
+            &request,
+            &self.registry,
+            &request.get_ref().zone_id,
+        )?;
         super::node_authority::authorize_ec_sender(&request, request.get_ref().sender_node_id)?;
         let req = request.into_inner();
         let node = get_zone_node(&self.registry, &req.zone_id)?;
@@ -934,6 +951,11 @@ impl ZoneApiService for ZoneApiServiceImpl {
         &self,
         request: Request<ProposeRequest>,
     ) -> std::result::Result<Response<ProposeResponse>, Status> {
+        super::node_authority::authorize_data_zone(
+            &request,
+            &self.registry,
+            &request.get_ref().zone_id,
+        )?;
         let req = request.into_inner();
         let node = get_zone_node(&self.registry, &req.zone_id)?;
 
@@ -1058,6 +1080,11 @@ impl ZoneApiService for ZoneApiServiceImpl {
         &self,
         request: Request<QueryRequest>,
     ) -> std::result::Result<Response<QueryResponse>, Status> {
+        super::node_authority::authorize_data_zone(
+            &request,
+            &self.registry,
+            &request.get_ref().zone_id,
+        )?;
         let req = request.into_inner();
         let node = get_zone_node(&self.registry, &req.zone_id)?;
         let peers = self.registry.get_peers(&req.zone_id).unwrap_or_default();
@@ -1215,6 +1242,11 @@ impl ZoneApiService for ZoneApiServiceImpl {
         &self,
         request: Request<GetClusterInfoRequest>,
     ) -> std::result::Result<Response<GetClusterInfoResponse>, Status> {
+        super::node_authority::authorize_data_zone(
+            &request,
+            &self.registry,
+            &request.get_ref().zone_id,
+        )?;
         let req = request.into_inner();
         let node = get_zone_node(&self.registry, &req.zone_id)?;
         let peers = self.registry.get_peers(&req.zone_id).unwrap_or_default();
@@ -1670,6 +1702,11 @@ impl ZoneApiService for ZoneApiServiceImpl {
         &self,
         request: Request<GetSearchCapabilitiesRequest>,
     ) -> std::result::Result<Response<SearchCapabilities>, Status> {
+        super::node_authority::authorize_data_zone(
+            &request,
+            &self.registry,
+            &request.get_ref().zone_id,
+        )?;
         let zone_id = request.into_inner().zone_id;
         if !self.registry.hosts(&zone_id) {
             return Err(Status::not_found(format!("Zone '{}' not found", zone_id)));
@@ -1707,6 +1744,11 @@ impl ZoneApiService for ZoneApiServiceImpl {
         &self,
         request: Request<ReadZoneBlobRequest>,
     ) -> std::result::Result<Response<ReadBlobResponse>, Status> {
+        super::node_authority::authorize_data_zone(
+            &request,
+            &self.registry,
+            &request.get_ref().zone_id,
+        )?;
         let req = request.into_inner();
         contracts::validate_zone_id_for(contracts::ZoneIdUse::TenantCreate, &req.zone_id)
             .map_err(|_| Status::invalid_argument("invalid data zone"))?;

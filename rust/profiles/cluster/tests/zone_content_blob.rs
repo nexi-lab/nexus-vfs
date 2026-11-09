@@ -19,7 +19,8 @@ use nexus_raft::transport::proto::{
     zone_api_service_client::ZoneApiServiceClient, ReadBlobRequest, ReadZoneBlobRequest,
 };
 use nexus_raft::transport::{
-    generate_node_cert, generate_user_runtime_cert, generate_zone_ca, TlsConfig,
+    generate_node_cert, generate_user_replica_cert, generate_user_runtime_cert, generate_zone_ca,
+    TlsConfig,
 };
 use nexus_raft::zone_manager::TlsFiles;
 use nexus_raft::ZoneManager;
@@ -230,6 +231,16 @@ async fn scoped_blob_rpc_cannot_use_a_known_hash_or_forged_pointer_to_read_other
             .code(),
         tonic::Code::PermissionDenied
     );
+    assert_replica_membership_controls_content(
+        &manager,
+        &address,
+        &ca,
+        &ca_key,
+        &private_hash,
+        private_bytes,
+        &global_hash,
+    )
+    .await;
     let target = tempfile::tempdir().unwrap();
     let target_stores = ZoneCasLocalStores::open(target.path()).unwrap();
     let local = target_stores.prepare("agent-alice").unwrap();
@@ -257,4 +268,165 @@ async fn scoped_blob_rpc_cannot_use_a_known_hash_or_forged_pointer_to_read_other
     )
     .await
     .is_err());
+}
+
+async fn assert_replica_membership_controls_content(
+    manager: &Arc<ZoneManager>,
+    address: &str,
+    ca: &[u8],
+    ca_key: &[u8],
+    private_hash: &str,
+    private_bytes: &[u8],
+    global_hash: &str,
+) {
+    use nexus_raft::transport::proto::{
+        GetClusterInfoRequest, JoinZoneRequest, QueryRequest, RemoveVoterRequest,
+    };
+    let (cert, key) = generate_node_cert(99, "root", ca, ca_key, &[], None).unwrap();
+    let mut admin = connect(address, ca, cert, key).await;
+    for (zone, id) in [
+        ("agent-alice", 4),
+        ("conversation-alice-bob", 4),
+        ("agent-charlie", 5),
+    ] {
+        let receipt = admin
+            .join_zone(JoinZoneRequest {
+                zone_id: zone.into(),
+                node_id: id,
+                node_address: format!("https://127.0.0.1:{}", ports::free_port()),
+                as_learner: true,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(receipt.success, "{:?}", receipt.error);
+        assert!(manager
+            .get_zone(zone)
+            .unwrap()
+            .consensus_node()
+            .membership()
+            .await
+            .unwrap()
+            .learners
+            .contains(&id));
+    }
+    let (cert, key) =
+        generate_user_replica_cert("session-alice-replica", "owner-alice", 4, 300, ca, ca_key)
+            .unwrap();
+    let mut alice = connect(address, ca, cert, key).await;
+    let retained = alice
+        .read_zone_blob(request("agent-alice", private_hash))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(retained.error.is_empty());
+    assert_eq!(retained.content, private_bytes);
+    let forged = alice
+        .read_zone_blob(request("conversation-alice-bob", private_hash))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(forged.content.is_empty() && !forged.error.is_empty());
+    assert_eq!(
+        alice
+            .read_blob(ReadBlobRequest {
+                content_id: global_hash.into()
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    assert_eq!(
+        alice
+            .join_zone(JoinZoneRequest {
+                zone_id: "agent-alice".into(),
+                node_id: 5,
+                node_address: String::new(),
+                as_learner: true
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+
+    let (cert, key) = generate_user_replica_cert(
+        "session-charlie-replica",
+        "owner-charlie",
+        5,
+        300,
+        ca,
+        ca_key,
+    )
+    .unwrap();
+    let mut charlie = connect(address, ca, cert, key).await;
+    let own_zone = charlie
+        .read_zone_blob(request("agent-charlie", private_hash))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(own_zone.content.is_empty() && !own_zone.error.is_empty());
+    for zone in [
+        "root",
+        "__control__",
+        "agent-alice",
+        "conversation-alice-bob",
+        "unadmitted-data",
+    ] {
+        assert_eq!(
+            charlie
+                .read_zone_blob(request(zone, private_hash))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        assert_eq!(
+            charlie
+                .get_cluster_info(GetClusterInfoRequest {
+                    zone_id: zone.into()
+                })
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        assert_eq!(
+            charlie
+                .query(QueryRequest {
+                    zone_id: zone.into(),
+                    query: None,
+                    read_from_leader: false
+                })
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+    }
+    // Read admission reflects the completed removal on the existing connection.
+    let receipt = admin
+        .remove_voter(RemoveVoterRequest {
+            zone_id: "agent-alice".into(),
+            target_node_id: 4,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(receipt.success, "{:?}", receipt.error);
+    assert_eq!(
+        alice
+            .read_zone_blob(request("agent-alice", private_hash))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    assert!(alice
+        .get_cluster_info(GetClusterInfoRequest {
+            zone_id: "conversation-alice-bob".into()
+        })
+        .await
+        .is_ok());
 }
