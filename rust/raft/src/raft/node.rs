@@ -541,6 +541,8 @@ pub struct ZoneConsensusDriver<S: StateMachine + 'static> {
     proposal_id: Arc<AtomicU64>,
     /// Last tick time.
     last_tick: Instant,
+    /// A failed persistence/apply cut requires reopening the durable log.
+    failed: bool,
     /// Bounded channel receiver — messages from the handle.
     msg_rx: mpsc::Receiver<RaftMsg>,
     /// Cached leader ID (shared with handle for reads).
@@ -908,6 +910,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             read_request_counter: 0,
             proposal_id,
             last_tick: Instant::now(),
+            failed: false,
             msg_rx,
             cached_leader_id,
             cached_term,
@@ -2180,6 +2183,26 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
     /// `raw_node.advance()` — no TOCTOU race is possible because we are
     /// the sole owner.
     pub async fn advance(&mut self) -> Result<Vec<Message>> {
+        if self.failed {
+            return Err(RaftError::InvalidState(
+                "Raft driver stopped after a persistence or apply failure".into(),
+            ));
+        }
+        let result = self.advance_ready().await;
+        if result.is_err() {
+            self.failed = true;
+            self.msg_rx.close();
+            while self.msg_rx.try_recv().is_ok() {}
+            self.pending.clear();
+            self.pending_conf_changes.clear();
+            self.pending_reads_by_ctx.clear();
+            self.pending_reads_by_index.clear();
+            self.cached_leader_id.store(0, Ordering::Release);
+        }
+        result
+    }
+
+    async fn advance_ready(&mut self) -> Result<Vec<Message>> {
         let mut messages = vec![];
 
         // Tick if needed
@@ -2271,30 +2294,25 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                 .map_err(|e| RaftError::Storage(e.to_string()))?;
         }
 
-        // 3. Apply committed entries — NO lock drop needed, we own raw_node
-        //
-        // raft-rs ready contract: the `Ready` taken above MUST be
-        // acknowledged via `advance(ready)` + `advance_apply()` exactly
-        // once. Returning early on an apply error would leak the `Ready`,
-        // so raft-rs re-delivers the SAME committed entries on every
-        // subsequent tick — an infinite apply-error loop whose log spam
-        // and worker churn can starve the shared tokio runtime (the gRPC
-        // server then stops completing new HTTP/2 handshakes). So we
-        // capture any apply error, finish the ready lifecycle, and only
-        // surface the error afterwards — it fires once, not every tick.
+        // 3. Acknowledge apply only after every committed entry succeeds.
+        // On failure advance() closes this driver; reopening reconstructs the
+        // unapplied suffix from the durable log and state-machine index.
         let committed = ready.take_committed_entries();
-        let mut apply_err = None;
         if !committed.is_empty() {
             tracing::debug!(count = committed.len(), "raft.apply");
-            match self.apply_entries(committed).await {
-                // Fresh apply pointer may unblock linearizable reads.
-                Ok(()) => self.resolve_ready_reads().await,
-                Err(e) => apply_err = Some(e),
-            }
+            self.apply_entries(committed).await?;
+            self.resolve_ready_reads().await;
         }
 
         // Advance the ready — NO TOCTOU: we never dropped ownership
         let mut light_rd = self.raw_node.advance(ready);
+
+        // Persist the commit made visible by advance() before its application
+        // effects, as required by raft-rs's LightReady contract.
+        if light_rd.commit_index().is_some() {
+            let hard_state = self.raw_node.raft.hard_state();
+            self.raw_node.mut_store().set_hard_state(&hard_state)?;
+        }
 
         // Handle light ready
         if !light_rd.messages().is_empty() {
@@ -2303,10 +2321,8 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
 
         if !light_rd.committed_entries().is_empty() {
             let committed = light_rd.take_committed_entries();
-            match self.apply_entries(committed).await {
-                Ok(()) => self.resolve_ready_reads().await,
-                Err(e) => apply_err = apply_err.or(Some(e)),
-            }
+            self.apply_entries(committed).await?;
+            self.resolve_ready_reads().await;
         }
 
         self.raw_node.advance_apply();
@@ -2314,23 +2330,13 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         // Update cached status for handle reads
         self.update_cached_status();
 
-        // P2: bound the SC raft log — snapshot the applied state + compact the
-        // log up to it. Only when this ready advanced apply cleanly (a failed
-        // apply leaves the applied index / SM in an uncertain cut). Non-fatal:
-        // a failure leaves the log uncompacted and the next ready retries, so it
-        // never wedges the ready lifecycle.
-        if apply_err.is_none() {
-            if let Err(e) = self.maybe_snapshot_and_compact().await {
-                tracing::warn!(
-                    error = %e,
-                    "raft SC snapshot+compact failed; log stays, retried next ready"
-                );
-            }
-        }
-
-        // Surface any apply error now that the ready lifecycle is closed.
-        if let Some(e) = apply_err {
-            return Err(e);
+        // Compaction follows successful apply. A failed compaction retains the
+        // log and can be retried without acknowledging additional application.
+        if let Err(e) = self.maybe_snapshot_and_compact().await {
+            tracing::warn!(
+                error = %e,
+                "raft SC snapshot+compact failed; log stays, retried next ready"
+            );
         }
 
         // Layer 2: Witness campaign suppression (TiKV pattern).
@@ -2486,14 +2492,6 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
 
             match entry.get_entry_type() {
                 EntryType::EntryNormal => {
-                    if entry.data.len() < 8 {
-                        tracing::warn!(
-                            "Entry at index {} has data shorter than 8 bytes, skipping",
-                            entry.index
-                        );
-                        continue;
-                    }
-
                     let (proposal_id, command) = Command::from_log_data(&entry.data)?;
                     let result = sm.apply(entry.index, &command)?;
 
