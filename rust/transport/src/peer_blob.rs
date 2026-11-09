@@ -24,7 +24,7 @@ use dashmap::DashMap;
 use tokio::sync::Semaphore;
 
 use nexus_raft::transport::proto::nexus::raft::{
-    zone_api_service_client::ZoneApiServiceClient, ReadBlobRequest,
+    zone_api_service_client::ZoneApiServiceClient, ReadBlobRequest, ReadZoneBlobRequest,
 };
 
 /// Default per-peer permit count — caps outstanding RPCs per peer so one
@@ -191,6 +191,29 @@ impl PeerBlobClient {
         address: &str,
         content_id: &str,
     ) -> Result<Vec<u8>, String> {
+        self.fetch_scoped_async(address, None, content_id).await
+    }
+
+    /// Fetch only from the named data zone. Servers without this RPC refuse
+    /// the request; scoped reads retain their scope across version differences.
+    pub async fn fetch_in_zone_async(
+        &self,
+        address: &str,
+        zone_id: &str,
+        content_id: &str,
+    ) -> Result<Vec<u8>, String> {
+        contracts::validate_zone_id_for(contracts::ZoneIdUse::TenantCreate, zone_id)
+            .map_err(|error| error.to_string())?;
+        self.fetch_scoped_async(address, Some(zone_id), content_id)
+            .await
+    }
+
+    async fn fetch_scoped_async(
+        &self,
+        address: &str,
+        zone_id: Option<&str>,
+        content_id: &str,
+    ) -> Result<Vec<u8>, String> {
         // Global cap: total concurrent fetches across all peers.
         let _global_permit = self
             .global_semaphore
@@ -215,18 +238,32 @@ impl PeerBlobClient {
         let mut client = ZoneApiServiceClient::new(channel)
             .max_decoding_message_size(contracts::MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(contracts::MAX_GRPC_MESSAGE_BYTES);
-        let mut request = tonic::Request::new(ReadBlobRequest {
-            content_id: content_id.to_string(),
-        });
-        request.set_timeout(self.timeout);
-
-        let resp = client
-            .read_blob(request)
-            .await
-            .map_err(|e| format!("ReadBlob {}: {}", address, e))?
-            .into_inner();
+        let method = if zone_id.is_some() {
+            "ReadZoneBlob"
+        } else {
+            "ReadBlob"
+        };
+        let resp = match zone_id {
+            Some(zone_id) => {
+                let mut request = tonic::Request::new(ReadZoneBlobRequest {
+                    zone_id: zone_id.to_string(),
+                    content_id: content_id.to_string(),
+                });
+                request.set_timeout(self.timeout);
+                client.read_zone_blob(request).await
+            }
+            None => {
+                let mut request = tonic::Request::new(ReadBlobRequest {
+                    content_id: content_id.to_string(),
+                });
+                request.set_timeout(self.timeout);
+                client.read_blob(request).await
+            }
+        }
+        .map_err(|error| format!("{method} {address}: {error}"))?
+        .into_inner();
         if !resp.error.is_empty() {
-            return Err(format!("ReadBlob {} error: {}", address, resp.error));
+            return Err(format!("{method} {address} error: {}", resp.error));
         }
         Ok(resp.content)
     }
@@ -238,6 +275,16 @@ impl PeerBlobClient {
     pub(crate) fn fetch(&self, address: &str, content_id: &str) -> Result<Vec<u8>, String> {
         let fut = self.fetch_async(address, content_id);
         self.block_on_safely(fut)
+    }
+
+    /// Blocking scoped fetch on the same shared runtime and connection policy.
+    pub fn fetch_in_zone(
+        &self,
+        address: &str,
+        zone_id: &str,
+        content_id: &str,
+    ) -> Result<Vec<u8>, String> {
+        self.block_on_safely(self.fetch_in_zone_async(address, zone_id, content_id))
     }
 
     /// Re-entrancy-safe `block_on` — mirrors `FederationClient::block_on_safely`

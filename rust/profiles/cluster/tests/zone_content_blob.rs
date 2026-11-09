@@ -313,7 +313,31 @@ async fn assert_replica_membership_controls_content(
     let (cert, key) =
         generate_user_replica_cert("session-alice-replica", "owner-alice", 4, 300, ca, ca_key)
             .unwrap();
+    let alice_peer = transport::peer_blob::PeerBlobClient::new(tokio::runtime::Handle::current());
+    alice_peer.install_tls_config(TlsConfig {
+        ca_pem: ca.to_vec(),
+        cert_pem: cert.clone(),
+        key_pem: key.clone(),
+    });
     let mut alice = connect(address, ca, cert, key).await;
+    assert_eq!(
+        alice_peer
+            .fetch_in_zone_async(address, "agent-alice", "/memory.txt")
+            .await
+            .unwrap(),
+        private_bytes
+    );
+    assert_eq!(
+        alice_peer
+            .fetch_in_zone_async(address, "agent-alice", private_hash)
+            .await
+            .unwrap(),
+        private_bytes
+    );
+    assert!(alice_peer
+        .fetch_in_zone_async(address, "conversation-alice-bob", private_hash)
+        .await
+        .is_err());
     let retained = alice
         .read_zone_blob(request("agent-alice", private_hash))
         .await
@@ -360,7 +384,21 @@ async fn assert_replica_membership_controls_content(
         ca_key,
     )
     .unwrap();
+    let charlie_peer = transport::peer_blob::PeerBlobClient::new(tokio::runtime::Handle::current());
+    charlie_peer.install_tls_config(TlsConfig {
+        ca_pem: ca.to_vec(),
+        cert_pem: cert.clone(),
+        key_pem: key.clone(),
+    });
     let mut charlie = connect(address, ca, cert, key).await;
+    assert!(charlie_peer
+        .fetch_in_zone_async(address, "agent-alice", private_hash)
+        .await
+        .is_err());
+    assert!(charlie_peer
+        .fetch_in_zone_async(address, "agent-charlie", private_hash)
+        .await
+        .is_err());
     let own_zone = charlie
         .read_zone_blob(request("agent-charlie", private_hash))
         .await
@@ -415,6 +453,10 @@ async fn assert_replica_membership_controls_content(
         .unwrap()
         .into_inner();
     assert!(receipt.success, "{:?}", receipt.error);
+    assert!(alice_peer
+        .fetch_in_zone_async(address, "agent-alice", private_hash)
+        .await
+        .is_err());
     assert_eq!(
         alice
             .read_zone_blob(request("agent-alice", private_hash))

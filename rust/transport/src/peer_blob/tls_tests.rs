@@ -60,7 +60,14 @@ impl Service<http::Request<tonic::body::Body>> for BlobService {
     fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
         let handler = self.clone();
         Box::pin(async move {
-            assert_eq!(request.uri().path(), "/nexus.raft.ZoneApiService/ReadBlob");
+            if request.uri().path() != "/nexus.raft.ZoneApiService/ReadBlob" {
+                return Ok(http::Response::builder()
+                    .status(200)
+                    .header("grpc-status", "12")
+                    .header("content-type", "application/grpc")
+                    .body(tonic::body::Body::empty())
+                    .unwrap());
+            }
             let codec = tonic_prost::ProstCodec::<ReadBlobResponse, ReadBlobRequest>::default();
             Ok(tonic::server::Grpc::new(codec)
                 .unary(handler, request)
@@ -150,6 +157,30 @@ impl Drop for Fixture {
             task.abort();
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scoped_content_never_falls_back_to_the_legacy_unscoped_rpc() {
+    let fixture = Fixture::start(true).await;
+    let client = PeerBlobClient::new(tokio::runtime::Handle::current());
+    client.install_tls_config(fixture.tls(2));
+    let error = client
+        .fetch_in_zone_async(&fixture.address, "agent-alice", "private")
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains(&tonic::Code::Unimplemented.to_string()),
+        "{error}"
+    );
+    assert!(fixture.calls.lock().unwrap().is_empty());
+    for zone in ["", "root", "__control__", "../agent-alice"] {
+        assert!(client
+            .fetch_in_zone_async(&fixture.address, zone, "private")
+            .await
+            .is_err());
+    }
+    assert!(fixture.calls.lock().unwrap().is_empty());
+    fixture.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
