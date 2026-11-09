@@ -1,7 +1,8 @@
 //! Raw immutable objects and logical file reads share the existing peer RPC.
 #![cfg(feature = "driver-cas-local")]
 
-mod common;
+#[path = "common/ports.rs"]
+mod ports;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -56,7 +57,7 @@ async fn peer_blob_preserves_manifest_identity_and_logical_path_contents() {
 
     // This is an isolated plaintext test listener. Production Node admission
     // and owner mTLS are covered by the separate transport/runtime fixtures.
-    let address = format!("127.0.0.1:{}", common::free_port());
+    let address = format!("127.0.0.1:{}", ports::free_port());
     let manager = ZoneManager::with_node_id(
         "peer-blob-fixture",
         1,
@@ -152,7 +153,12 @@ async fn peer_blob_preserves_manifest_identity_and_logical_path_contents() {
     assert!(raw_chunk.error.is_empty(), "{}", raw_chunk.error);
     assert_eq!(raw_chunk.content, content);
     assert_eq!(lookup(&chunk), None);
-    let object_path = backend.as_cas().unwrap().transport().blob_path(&hash);
+    let object_path = backend
+        .as_cas()
+        .unwrap()
+        .transport()
+        .blob_path(&hash)
+        .unwrap();
     std::fs::write(&object_path, b"damaged object").unwrap();
     let damaged = client
         .read_blob(ReadBlobRequest {

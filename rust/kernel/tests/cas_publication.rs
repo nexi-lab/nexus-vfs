@@ -69,7 +69,7 @@ fn interrupted_final_object() -> (tempfile::TempDir, LocalCASTransport, Vec<u8>,
     let transport = LocalCASTransport::new(root.path(), true).unwrap();
     let complete = b"complete immutable object; the final bytes must all be present".to_vec();
     let hash = lib::hash::hash_content(&complete);
-    let path = transport.blob_path(&hash);
+    let path = transport.blob_path(&hash).unwrap();
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     // Inject the on-disk result of termination after final-path creation and
     // before write_all completes. No mock replaces the actual transport or FS.
@@ -87,7 +87,7 @@ fn a_partial_final_object_is_not_a_successful_deduplication_hit() {
     );
     assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
     assert_eq!(
-        std::fs::read(transport.blob_path(&hash)).unwrap(),
+        std::fs::read(transport.blob_path(&hash).unwrap()).unwrap(),
         &complete[..9]
     );
 }
@@ -102,7 +102,7 @@ fn prehashed_writes_also_refuse_a_partial_final_object() {
     );
     assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
     assert_eq!(
-        std::fs::read(transport.blob_path(&hash)).unwrap(),
+        std::fs::read(transport.blob_path(&hash).unwrap()).unwrap(),
         &complete[..9]
     );
 }
@@ -119,7 +119,7 @@ fn corrupt_regular_content_is_refused_without_rewriting_it() {
     let root = tempfile::tempdir().unwrap();
     let engine = CASEngine::new(LocalCASTransport::new(root.path(), true).unwrap());
     let hash = engine.write_content(b"original durable register").unwrap();
-    let path = engine.transport().blob_path(&hash);
+    let path = engine.transport().blob_path(&hash).unwrap();
     let corruption = b"different register bytes";
     std::fs::write(&path, corruption).unwrap();
     assert_corruption(engine.read_content(&hash).unwrap_err());
@@ -131,7 +131,7 @@ fn corrupt_regular_content_cannot_seed_a_partial_write() {
     let root = tempfile::tempdir().unwrap();
     let engine = CASEngine::new(LocalCASTransport::new(root.path(), true).unwrap());
     let hash = engine.write_content(b"original durable register").unwrap();
-    let path = engine.transport().blob_path(&hash);
+    let path = engine.transport().blob_path(&hash).unwrap();
     std::fs::write(&path, b"different register bytes").unwrap();
     assert_corruption(engine.write_partial(&hash, b"new", 4, &[]).unwrap_err());
     assert_eq!(std::fs::read(path).unwrap(), b"different register bytes");
@@ -142,7 +142,7 @@ fn substituted_manifest() -> (tempfile::TempDir, CASEngine, String, Vec<u8>) {
     let engine = CASEngine::new(LocalCASTransport::new(root.path(), true).unwrap());
     let hash = engine.write_content(&vec![b'a'; 17 * 1024 * 1024]).unwrap();
     assert!(engine.is_chunked(&hash));
-    let path = engine.transport().blob_path(&hash);
+    let path = engine.transport().blob_path(&hash).unwrap();
     let mut manifest: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     let first = &mut manifest["chunks"][0];
@@ -159,7 +159,7 @@ fn corrupt_manifest_is_refused_before_full_reassembly() {
     let (_root, engine, hash, substituted) = substituted_manifest();
     assert_corruption(engine.read_content(&hash).unwrap_err());
     assert_eq!(
-        std::fs::read(engine.transport().blob_path(&hash)).unwrap(),
+        std::fs::read(engine.transport().blob_path(&hash).unwrap()).unwrap(),
         substituted
     );
 }
@@ -187,7 +187,7 @@ fn mismatched_prehashed_input_is_refused_before_creating_an_object() {
         "mismatched prehashed input must be refused: {result:?}"
     );
     assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
-    assert!(!transport.blob_path(&claimed).exists());
+    assert!(!transport.blob_path(&claimed).unwrap().exists());
 }
 
 const WORKER_ROLE: &str = "NEXUS_CAS_PUBLICATION_WORKER";
@@ -310,7 +310,12 @@ fn concurrent_blob_publication(role: &str, durable: bool) {
         })
         .count();
     assert_eq!(winners, 1, "exactly one process must publish the cold blob");
-    let parent = transport.blob_path(&hash).parent().unwrap().to_path_buf();
+    let parent = transport
+        .blob_path(&hash)
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
     assert_eq!(std::fs::read_dir(parent).unwrap().count(), 1);
 }
 
@@ -331,7 +336,12 @@ fn concurrent_sidecar_replacement_preserves_complete_json() {
         workers.iter_mut().all(Worker::is_finished)
     });
     assert!(candidates.contains(&transport.read_meta(&hash).unwrap()));
-    let parent = transport.blob_path(&hash).parent().unwrap().to_path_buf();
+    let parent = transport
+        .blob_path(&hash)
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
     assert_eq!(std::fs::read_dir(parent).unwrap().count(), 2);
 }
 
@@ -345,7 +355,7 @@ fn open_sidecar_reader_retains_its_snapshot_across_replacements() {
     let original = br#"{"generation":0}"#;
     transport.write_meta(&hash, original).unwrap();
     let mut reader =
-        std::fs::File::open(transport.blob_path(&hash).with_extension("meta")).unwrap();
+        std::fs::File::open(transport.blob_path(&hash).unwrap().with_extension("meta")).unwrap();
     for generation in 1..=2 {
         let replacement = format!("{{\"generation\":{generation}}}");
         transport.write_meta(&hash, replacement.as_bytes()).unwrap();
@@ -491,13 +501,18 @@ fn failed_publication(mode: &str) {
         .unwrap()
         .contains("test result: ok. 1 passed;"));
     assert!(
-        !transport.blob_path(&hash).exists(),
+        !transport.blob_path(&hash).unwrap().exists(),
         "failed write published a partial blob"
     );
     if mode == "meta" {
         assert_eq!(transport.read_meta(&hash).unwrap(), previous_meta);
     }
-    let parent = transport.blob_path(&hash).parent().unwrap().to_path_buf();
+    let parent = transport
+        .blob_path(&hash)
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
     assert_eq!(
         std::fs::read_dir(parent).unwrap().count(),
         usize::from(mode == "meta")
@@ -561,7 +576,7 @@ fn durable_process_worker(root: &Path, mode: &str) {
     };
     if mode == "prepare" || mode == "file" {
         assert_eq!(error.raw_os_error(), Some(libc::EIO));
-        assert!(!transport.blob_path(&hash).exists());
+        assert!(!transport.blob_path(&hash).unwrap().exists());
     } else {
         let state = error
             .get_ref()
@@ -670,7 +685,7 @@ fn durable_failures_preserve_publication_state_and_retry_barriers() {
         let content = b"complete object acknowledged after file and namespace barriers";
         let hash = lib::hash::hash_content(content);
         let transport = LocalCASTransport::new(root.path(), false).unwrap();
-        let blob = transport.blob_path(&hash);
+        let blob = transport.blob_path(&hash).unwrap();
         if mode == "dedup" {
             transport.write_blob(content).unwrap();
         }
@@ -728,7 +743,7 @@ fn killed_publishers_recover_before_and_after_acknowledgement() {
         let content = b"complete object acknowledged after file and namespace barriers";
         let hash = lib::hash::hash_content(content);
         let transport = LocalCASTransport::new(root.path(), false).unwrap();
-        let target = transport.blob_path(&hash);
+        let target = transport.blob_path(&hash).unwrap();
         let fixture = durability_fixture();
         let trace = root.path().join("trace");
         let fault = if mode == "kill-before" {

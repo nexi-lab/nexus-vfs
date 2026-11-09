@@ -13,6 +13,7 @@ NATIVE_CASES = [
     ('availability', 'user_runtime', ['--exact', 'required_durable_backend_obeys_build_and_platform_at_startup']),
     ('owner', 'user_runtime', ['--exact', 'durable_cas_mount_reopens_immutable_content_with_the_owner_boundary']),
     ('peer', 'cas_peer_blob', []),
+    ('zone-content', 'zone_content_blob', []),
     ('content', 'conditional_content', []),
     ('stream', 'dt_stream_unbounded', ['--exact', 'joiner_cold_reads_a_sealed_log_and_reports_unavailable_segments']),
     ('protected', 'test_protected_zone_metadata', []),

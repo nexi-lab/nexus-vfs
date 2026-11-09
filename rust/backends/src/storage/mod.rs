@@ -18,6 +18,8 @@
 
 #[cfg(feature = "driver-cas-local")]
 pub mod cas_local;
+#[cfg(feature = "driver-cas-local")]
+pub mod zone_cas_local;
 #[cfg(feature = "driver-local-connector")]
 pub mod local_connector;
 #[cfg(feature = "driver-remote")]
