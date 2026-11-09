@@ -159,6 +159,7 @@ fn channel_config(
 struct CachedClient {
     client: RaftClient,
     created_at: Instant,
+    tls: Option<super::TlsConfig>,
 }
 
 /// A pool of gRPC clients for connecting to Raft peers.
@@ -210,19 +211,59 @@ impl RaftClientPool {
         // refreshing a stale entry (routine, TTL-driven) or connecting with no
         // prior entry, so the lifecycle event below logs at the right level
         // instead of an ambiguous reconnect line.
-        let stale_age_secs: Option<u64> = {
+        let (stale_age_secs, tls_snapshot) = {
             let clients = self.clients.read().await;
-            match clients.get(&addr.id) {
-                Some(cached) if cached.created_at.elapsed() < self.client_ttl => {
+            let tls = self.config.tls.read().unwrap();
+            let age = match clients.get(&addr.id) {
+                Some(cached)
+                    if cached.created_at.elapsed() < self.client_ttl
+                        && cached.client.endpoint() == addr.endpoint
+                        && cached.tls == *tls =>
+                {
                     return Ok(cached.client.clone());
                 }
-                Some(cached) => Some(cached.created_at.elapsed().as_secs()),
-                None => None,
-            }
+                Some(cached) if cached.created_at.elapsed() >= self.client_ttl => {
+                    Some(cached.created_at.elapsed().as_secs())
+                }
+                _ => None,
+            };
+            (age, tls.clone())
         };
 
         // Create new client (may replace a stale one).
-        let client = RaftClient::connect(&addr.endpoint, self.config.clone()).await?;
+        let expected = if tls_snapshot.is_some() {
+            Some(std::num::NonZeroU64::new(addr.id).ok_or_else(|| {
+                TransportError::Connection("authenticated peer requires a nonzero Node ID".into())
+            })?)
+        } else {
+            None
+        };
+        let client = RaftClient::connect_with_identity(
+            &addr.endpoint,
+            self.config.clone(),
+            tls_snapshot.clone(),
+            expected,
+        )
+        .await?;
+
+        // Store in pool with current timestamp.
+        {
+            let mut clients = self.clients.write().await;
+            let current_tls = self.config.tls.read().unwrap();
+            if *current_tls != tls_snapshot {
+                return Err(TransportError::Connection(
+                    "Raft TLS configuration changed while connecting".into(),
+                ));
+            }
+            clients.insert(
+                addr.id,
+                CachedClient {
+                    client: client.clone(),
+                    created_at: Instant::now(),
+                    tls: tls_snapshot,
+                },
+            );
+        }
 
         match stale_age_secs {
             Some(age_secs) => ClientPoolEvent::Refreshed {
@@ -235,18 +276,6 @@ impl RaftClientPool {
                 endpoint: &addr.endpoint,
             }
             .emit(),
-        }
-
-        // Store in pool with current timestamp.
-        {
-            let mut clients = self.clients.write().await;
-            clients.insert(
-                addr.id,
-                CachedClient {
-                    client: client.clone(),
-                    created_at: Instant::now(),
-                },
-            );
         }
 
         Ok(client)
@@ -283,6 +312,15 @@ impl RaftClient {
     /// Connect to a Raft node.
     pub async fn connect(endpoint: &str, config: ClientConfig) -> Result<Self> {
         let tls_snapshot = config.tls.read().unwrap().clone();
+        Self::connect_with_identity(endpoint, config, tls_snapshot, None).await
+    }
+
+    async fn connect_with_identity(
+        endpoint: &str,
+        config: ClientConfig,
+        tls_snapshot: Option<super::TlsConfig>,
+        expected: Option<std::num::NonZeroU64>,
+    ) -> Result<Self> {
         // Pre-dial diagnostic only (surfaces a hang inside `create_channel`);
         // the operator-facing lifecycle signal is emitted by the caller
         // (`RaftClientPool::get`) via `ClientPoolEvent` once the dial succeeds.
@@ -292,11 +330,14 @@ impl RaftClient {
             "dialing raft node",
         );
 
-        let channel = lib::transport_primitives::create_channel(
-            endpoint,
-            &channel_config(&config, tls_snapshot),
-        )
-        .await?;
+        let channel_config = channel_config(&config, tls_snapshot);
+        let channel = match expected {
+            Some(expected) => {
+                lib::transport_primitives::create_peer_channel(endpoint, &channel_config, expected)
+                    .await?
+            }
+            None => lib::transport_primitives::create_channel(endpoint, &channel_config).await?,
+        };
         let inner = ZoneTransportServiceClient::new(channel);
 
         Ok(Self {
@@ -1498,6 +1539,7 @@ mod tests {
                 42,
                 CachedClient {
                     client: create_dummy_client(),
+                    tls: None,
                     created_at: Instant::now(),
                 },
             );
@@ -1523,6 +1565,7 @@ mod tests {
                 99,
                 CachedClient {
                     client: create_dummy_client(),
+                    tls: None,
                     created_at: Instant::now() - Duration::from_secs(10),
                 },
             );
@@ -1547,6 +1590,7 @@ mod tests {
                 1,
                 CachedClient {
                     client: create_dummy_client(),
+                    tls: None,
                     created_at: now - Duration::from_secs(10),
                 },
             );
@@ -1555,6 +1599,7 @@ mod tests {
                 2,
                 CachedClient {
                     client: create_dummy_client(),
+                    tls: None,
                     created_at: now - Duration::from_secs(120),
                 },
             );
@@ -1563,6 +1608,7 @@ mod tests {
                 3,
                 CachedClient {
                     client: create_dummy_client(),
+                    tls: None,
                     created_at: now - Duration::from_secs(59),
                 },
             );

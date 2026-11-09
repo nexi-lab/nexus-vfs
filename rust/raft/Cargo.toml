@@ -92,6 +92,7 @@ protoc-bin-vendored = "3"
 
 [dev-dependencies]
 regex = { workspace = true }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 [features]
 default = ["full"]
