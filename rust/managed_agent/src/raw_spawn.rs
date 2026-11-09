@@ -162,6 +162,7 @@ impl KernelRawSpawn {
                 cancel: parking_lot::Mutex::new(Some(cancel_tx)),
                 durable: Arc::clone(&durable),
             }),
+            None,
         )?;
         let input_mailbox = Arc::clone(&mailbox);
         let input_stopped = Arc::clone(&stopped);

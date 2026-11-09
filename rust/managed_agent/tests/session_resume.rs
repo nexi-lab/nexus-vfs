@@ -17,6 +17,23 @@ impl SpawnHandle for Handle {
     }
 }
 impl SpawnTask<Kernel> for Provider {
+    // This fixture starts no threads, receivers or writers. Its synchronous
+    // body is fully finished before reporting joined cleanup.
+    fn spawn_with_cleanup(
+        &self,
+        kernel: Arc<Kernel>,
+        desc: kernel::core::agents::registry::AgentDescriptor,
+        options: SpawnOptions,
+        cleanup: kernel::core::agents::host_cleanup::ManagedHostCleanup,
+        observer: Arc<
+            dyn Fn(kernel::core::agents::registry::AgentState, Option<String>) + Send + Sync,
+        >,
+    ) -> Result<Box<dyn SpawnHandle>, String> {
+        let result = self.spawn_with_options(kernel, desc, options, observer);
+        assert!(cleanup.complete(Ok(())));
+        result
+    }
+
     fn spawn(
         &self,
         _: Arc<Kernel>,
@@ -43,6 +60,23 @@ impl SpawnTask<Kernel> for Provider {
 }
 struct LegacyProvider;
 impl SpawnTask<Kernel> for LegacyProvider {
+    // This fixture starts no threads, receivers or writers. Its synchronous
+    // body is fully finished before reporting joined cleanup.
+    fn spawn_with_cleanup(
+        &self,
+        kernel: Arc<Kernel>,
+        desc: kernel::core::agents::registry::AgentDescriptor,
+        options: SpawnOptions,
+        cleanup: kernel::core::agents::host_cleanup::ManagedHostCleanup,
+        observer: Arc<
+            dyn Fn(kernel::core::agents::registry::AgentState, Option<String>) + Send + Sync,
+        >,
+    ) -> Result<Box<dyn SpawnHandle>, String> {
+        let result = self.spawn_with_options(kernel, desc, options, observer);
+        assert!(cleanup.complete(Ok(())));
+        result
+    }
+
     fn spawn(
         &self,
         _: Arc<Kernel>,
@@ -318,6 +352,23 @@ fn replacement_race_fixture() -> (Arc<Kernel>, Arc<std::sync::atomic::AtomicBool
         }
     }
     impl SpawnTask<Kernel> for RaceProvider {
+        // This fixture starts no threads, receivers or writers. Its synchronous
+        // body is fully finished before reporting joined cleanup.
+        fn spawn_with_cleanup(
+            &self,
+            kernel: Arc<Kernel>,
+            desc: kernel::core::agents::registry::AgentDescriptor,
+            options: SpawnOptions,
+            cleanup: kernel::core::agents::host_cleanup::ManagedHostCleanup,
+            observer: Arc<
+                dyn Fn(kernel::core::agents::registry::AgentState, Option<String>) + Send + Sync,
+            >,
+        ) -> Result<Box<dyn SpawnHandle>, String> {
+            let result = self.spawn_with_options(kernel, desc, options, observer);
+            assert!(cleanup.complete(Ok(())));
+            result
+        }
+
         fn spawn(
             &self,
             _: Arc<Kernel>,

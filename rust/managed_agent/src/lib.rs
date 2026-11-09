@@ -310,8 +310,8 @@ impl std::error::Error for ManagedAgentError {}
 /// impls (e.g. the sudocode-runtime adapter) hold whatever
 /// in-process state the spawn body needs (worker thread join handle,
 /// abort signal, future tokio task handle). The services-tier sees
-/// only the abort capability — that's what the on_terminate observer
-/// needs to tear the loop down on session termination.
+/// the stop signal. The separate original-host cleanup latch carries the
+/// provider's joined outcome; abort alone never proves teardown.
 pub trait SpawnHandle: Send + Sync {
     /// Signal the spawn body to stop. Implementations MUST be
     /// idempotent — the on_terminate observer can fire concurrently
@@ -332,7 +332,7 @@ pub trait SpawnHandle: Send + Sync {
 /// lookup alone. Providers keep the existing trait; the service binds them.
 pub(crate) struct HostedSession {
     instance: AgentInstance,
-    handle: Box<dyn SpawnHandle>,
+    handle: Arc<dyn SpawnHandle>,
 }
 
 type HostedSessions = Arc<dashmap::DashMap<String, HostedSession>>;
@@ -343,15 +343,29 @@ fn store_host_handle(
     pid: String,
     instance: AgentInstance,
     handle: Box<dyn SpawnHandle>,
-) -> Result<(), String> {
+    cleanup: Option<&kernel::core::agents::host_cleanup::ManagedHostCleanup>,
+) -> Result<Arc<dyn SpawnHandle>, String> {
+    let handle: Arc<dyn SpawnHandle> = handle.into();
     // All host insertions use the same map guard before the incarnation check.
     // A late old attach cannot overwrite a replacement handle. An occupied
     // stale slot also needs explicit cleanup; it is not replacement permission.
     let reason = match handles.entry(pid) {
         dashmap::mapref::entry::Entry::Vacant(slot) => {
             if registry.is_current_instance(&instance) {
-                slot.insert(HostedSession { instance, handle });
-                return Ok(());
+                let hosted = slot.insert(HostedSession {
+                    instance,
+                    handle: Arc::clone(&handle),
+                });
+                drop(hosted);
+                if let Some(cleanup) = cleanup {
+                    let weak = Arc::downgrade(&handle);
+                    cleanup.set_stop_handler(Arc::new(move || {
+                        if let Some(handle) = weak.upgrade() {
+                            handle.abort();
+                        }
+                    }))?;
+                }
+                return Ok(handle);
             }
             "host incarnation retired before handle attachment"
         }
@@ -381,6 +395,24 @@ pub struct SpawnOptions {
 /// keeps the spawn body monomorphised against the same kernel
 /// concrete that the service holds.
 pub trait SpawnTask<K: KernelSyscall>: Send + Sync + 'static {
+    /// Start an in-process host which owns a native cleanup completion latch.
+    /// The provider must drive all existing writer/receiver/retirement joins,
+    /// complete the latch, and only then publish Closed/Terminated on success.
+    /// A spawn refusal may complete Ok only if no runtime resources were made.
+    /// Partial startup or teardown errors must retain an unconfirmed outcome.
+    /// Older providers are refused before their spawn method is called.
+    fn spawn_with_cleanup(
+        &self,
+        _kernel: Arc<K>,
+        _desc: AgentDescriptor,
+        _options: SpawnOptions,
+        cleanup: kernel::core::agents::host_cleanup::ManagedHostCleanup,
+        _state_observer: Arc<dyn Fn(AgentState, Option<String>) + Send + Sync>,
+    ) -> Result<Box<dyn SpawnHandle>, String> {
+        cleanup.complete(Ok(())); // The default has not started anything.
+        Err("this runtime does not support joined host cleanup completion".into())
+    }
+
     /// Spawn the per-pid runtime body. Returns an opaque handle the
     /// service stores in its `spawn_handles` sidecar; the
     /// on_terminate observer aborts via the handle on session
@@ -728,6 +760,15 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                         ManagedAgentError::Internal(error)
                     })?;
             } else if let Some(provider) = self.spawn_provider.as_ref() {
+                let cleanup = self
+                    .agent_registry
+                    .arm_host_cleanup(&instance)
+                    .ok_or_else(|| {
+                        ManagedAgentError::Internal(
+                            "host incarnation retired before cleanup ownership was established"
+                                .into(),
+                        )
+                    })?;
                 // Construct the SSOT state observer. AgentRegistry is
                 // the single writer of AgentState in the runtime path
                 // (see kernel::core::agents::registry::update_state +
@@ -802,12 +843,11 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                             }
                         }
                     });
-                // A refusal here is the session NOT starting: unwind the registration
-                // rather than leaving a pid whose runtime never existed, so a caller
-                // that retries after fixing the cause is not told the agent is
-                // already running.
+                // A provider may refuse before creating anything or fail after
+                // partial startup. Only its native completion latch can authorize
+                // retirement; an error string alone cannot distinguish those cases.
                 let handle = provider
-                    .spawn_with_options(
+                    .spawn_with_cleanup(
                         Arc::clone(&self.kernel),
                         desc,
                         SpawnOptions {
@@ -826,6 +866,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                                         >
                                 }),
                         },
+                        cleanup.clone(),
                         observer,
                     )
                     .map_err(|e| {
@@ -839,6 +880,17 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                         // message the refusal carries.
                         ManagedAgentError::Internal(format!("spawn agent runtime: {e}"))
                     })?;
+                // Retain even a malformed provider handle until its original
+                // cleanup finishes. Validation failure is not retirement.
+                let handle = store_host_handle(
+                    &self.agent_registry,
+                    &self.spawn_handles,
+                    pid.clone(),
+                    instance.clone(),
+                    handle,
+                    Some(&cleanup),
+                )
+                .map_err(ManagedAgentError::Internal)?;
                 if req
                     .resume_session_id
                     .as_deref()
@@ -869,17 +921,11 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                         "managed runtime incarnation retired before host binding".into(),
                     ));
                 }
-                store_host_handle(
-                    &self.agent_registry,
-                    &self.spawn_handles,
-                    pid.clone(),
-                    instance.clone(),
-                    handle,
-                )
-                .map_err(|error| {
-                    let _ = self.agent_registry.kill_instance(&instance, 1);
-                    ManagedAgentError::Internal(error)
-                })?;
+                if self.agent_registry.host_stop_requested(&instance) {
+                    return Err(ManagedAgentError::Internal(
+                        "host stop requested during startup; cleanup outcome unconfirmed".into(),
+                    ));
+                }
             }
         }
 
@@ -1030,6 +1076,11 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
         // Never combine an authorized PCB with another incarnation's handle.
         if !self.agent_registry.is_current_instance(instance) {
             return Err(ManagedAgentError::UnknownSession(desc.pid));
+        }
+        if self.agent_registry.host_stop_requested(instance) {
+            return Err(ManagedAgentError::Internal(
+                "host stopping; original custody retained until joined cleanup".into(),
+            ));
         }
         let workspace_path = format!("/proc/{}/workspace/", desc.pid);
         let model = desc.labels.get(MODEL_LABEL).cloned().unwrap_or_default();
@@ -1583,6 +1634,23 @@ mod tests {
         }
     }
     impl SpawnTask<Kernel> for ScriptedSpawn {
+        // This fixture starts no threads, receivers or writers. Its synchronous
+        // body is fully finished before reporting joined cleanup.
+        fn spawn_with_cleanup(
+            &self,
+            kernel: Arc<Kernel>,
+            desc: kernel::core::agents::registry::AgentDescriptor,
+            options: SpawnOptions,
+            cleanup: kernel::core::agents::host_cleanup::ManagedHostCleanup,
+            observer: Arc<
+                dyn Fn(kernel::core::agents::registry::AgentState, Option<String>) + Send + Sync,
+            >,
+        ) -> Result<Box<dyn SpawnHandle>, String> {
+            let result = self.spawn_with_options(kernel, desc, options, observer);
+            assert!(cleanup.complete(Ok(())));
+            result
+        }
+
         fn spawn_with_options(
             &self,
             kernel: Arc<Kernel>,
@@ -1613,6 +1681,23 @@ mod tests {
     /// host directory — refuses the session instead of dying on the daemon's thread.
     struct RefusingSpawn;
     impl SpawnTask<Kernel> for RefusingSpawn {
+        // This fixture starts no threads, receivers or writers. Its synchronous
+        // body is fully finished before reporting joined cleanup.
+        fn spawn_with_cleanup(
+            &self,
+            kernel: Arc<Kernel>,
+            desc: kernel::core::agents::registry::AgentDescriptor,
+            options: SpawnOptions,
+            cleanup: kernel::core::agents::host_cleanup::ManagedHostCleanup,
+            observer: Arc<
+                dyn Fn(kernel::core::agents::registry::AgentState, Option<String>) + Send + Sync,
+            >,
+        ) -> Result<Box<dyn SpawnHandle>, String> {
+            let result = self.spawn_with_options(kernel, desc, options, observer);
+            assert!(cleanup.complete(Ok(())));
+            result
+        }
+
         fn spawn_with_options(
             &self,
             kernel: Arc<Kernel>,
@@ -1753,6 +1838,23 @@ mod tests {
         seen: Arc<std::sync::Mutex<Vec<(usize, String, bool)>>>,
     }
     impl SpawnTask<Kernel> for ProbingSpawn {
+        // This fixture starts no threads, receivers or writers. Its synchronous
+        // body is fully finished before reporting joined cleanup.
+        fn spawn_with_cleanup(
+            &self,
+            kernel: Arc<Kernel>,
+            desc: kernel::core::agents::registry::AgentDescriptor,
+            options: SpawnOptions,
+            cleanup: kernel::core::agents::host_cleanup::ManagedHostCleanup,
+            observer: Arc<
+                dyn Fn(kernel::core::agents::registry::AgentState, Option<String>) + Send + Sync,
+            >,
+        ) -> Result<Box<dyn SpawnHandle>, String> {
+            let result = self.spawn_with_options(kernel, desc, options, observer);
+            assert!(cleanup.complete(Ok(())));
+            result
+        }
+
         fn spawn_with_options(
             &self,
             kernel: Arc<Kernel>,
