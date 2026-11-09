@@ -2942,11 +2942,12 @@ fn stream_mgr_err(e: crate::stream_manager::StreamManagerError) -> KernelError {
                 StreamError::Truncated(earliest, req) => {
                     KernelError::StreamTruncated(earliest, req)
                 }
-                // An append that did not commit is an I/O failure, NOT a closed
-                // stream: the reason travels verbatim so the client sees what
-                // happened instead of a Debug dump of the variant.
+                // Missing confirmation is not proof of non-commit. Keep the
+                // stream open and the backend reason, without inviting replay.
                 StreamError::NotReplicated(why) => {
-                    KernelError::IOError(format!("stream append did not commit: {why}"))
+                    KernelError::IOError(format!(
+                        "stream append has UNKNOWN outcome; it may have committed; reconcile before retry: {why}"
+                    ))
                 }
                 StreamError::ReadFailed(why) => {
                     KernelError::IOError(format!("stream read failed: {why}"))
@@ -3945,6 +3946,77 @@ mod tests {
             k.stream_read_at(path, 0).expect("read").is_none(),
             "a rejected append must leave the stream empty"
         );
+    }
+
+    /// A backend may commit before its response is lost. Both public write
+    /// paths must preserve that uncertainty and must not repeat the append.
+    #[test]
+    fn committed_stream_append_with_lost_reply_is_unknown_on_both_write_paths() {
+        use crate::stream::{MemoryStreamBackend, StreamBackend, StreamError};
+
+        struct LostReply(MemoryStreamBackend);
+        impl StreamBackend for LostReply {
+            fn push(&self, data: &[u8]) -> Result<usize, StreamError> {
+                self.0.push(data)?;
+                Err(StreamError::NotReplicated(
+                    "lost forward-proposal reply".into(),
+                ))
+            }
+            fn read_at(&self, offset: usize) -> Result<(Vec<u8>, usize), StreamError> {
+                self.0.read_at(offset)
+            }
+            fn read_batch(
+                &self,
+                offset: usize,
+                count: usize,
+            ) -> Result<(Vec<Vec<u8>>, usize), StreamError> {
+                self.0.read_batch(offset, count)
+            }
+            fn close(&self) {
+                self.0.close();
+            }
+            fn is_closed(&self) -> bool {
+                self.0.is_closed()
+            }
+            fn tail_offset(&self) -> usize {
+                self.0.tail_offset()
+            }
+            fn msg_count(&self) -> usize {
+                self.0.msg_count()
+            }
+        }
+
+        for use_syscall in [false, true] {
+            let k = Kernel::new();
+            k.add_mount("/s", "root", None, None, None, false).unwrap();
+            let path = "/s/committed";
+            let backend = Arc::new(LostReply(MemoryStreamBackend::new(4096)));
+            k.stream_manager.register(path, backend.clone()).unwrap();
+            k.write_stream_inode(path, 4096).unwrap();
+            let ctx = OperationContext::new("test", "root", true, None, true);
+            let error = if use_syscall {
+                crate::kernel::syscall::KernelSyscall::sys_write(
+                    &k,
+                    path,
+                    &ctx,
+                    b"accepted once",
+                    0,
+                )
+                .err()
+                .expect("lost receipt must not report success")
+            } else {
+                k.stream_write_nowait(path, b"accepted once", &ctx)
+                    .expect_err("lost receipt must not report success")
+            };
+            let message = format!("{error:?}");
+            assert!(message.contains("UNKNOWN outcome"), "{message}");
+            assert!(message.contains("may have committed"), "{message}");
+            assert!(message.contains("lost forward-proposal reply"), "{message}");
+            assert!(!message.contains("did not commit"), "{message}");
+            assert_eq!(backend.msg_count(), 1, "no implicit append retry");
+            assert_eq!(backend.read_at(0).unwrap().0, b"accepted once");
+            assert!(!backend.is_closed(), "lost reply does not close the stream");
+        }
     }
 
     /// `sys_setattr DT_MOUNT` dispatches a `FileEventType::Mount`

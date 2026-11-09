@@ -637,7 +637,7 @@ impl StreamBackend for WalStreamCore {
                 tracing::warn!(
                     stream_id = %self.stream_id,
                     error = %e,
-                    "wal DT_STREAM push failed to replicate — write rejected (fail-loud)"
+                    "wal DT_STREAM append confirmation failed — outcome UNKNOWN; reconcile before retry"
                 );
                 // The reason goes to the CALLER, not only to this log. It used
                 // to be replaced here by a canned "no reachable leader?" and
@@ -786,9 +786,8 @@ mod tests {
 
     struct MemKvStore {
         inner: Mutex<StreamKv>,
-        /// When set, `append_stream_entry` fails with this message — the store
-        /// side of "the propose did not commit", which is the only way to reach
-        /// the failing branch of `push` without a raft cluster.
+        /// When set, `append_stream_entry` fails with this message, exercising
+        /// the missing-confirmation branch of `push` without a raft cluster.
         append_error: Option<String>,
     }
 

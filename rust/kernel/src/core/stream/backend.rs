@@ -20,13 +20,13 @@ pub enum StreamError {
     /// peer-fetch failures distinct from an empty or closed stream so a drain
     /// cannot report a partial transcript as a successful complete read.
     ReadFailed(String),
-    /// An append to a REPLICATING backend did not commit, and this is the
-    /// backend's own reason for it.
+    /// An append to a REPLICATING backend was not confirmed, with the backend's
+    /// own reason. The historical variant name does NOT prove non-commit.
     ///
     /// Distinct from `Closed`, which it used to be reported as. The stream is
-    /// alive and will take the next append; what failed is THIS one. A client
-    /// told the stream is closed stops tailing a mailbox that is perfectly
-    /// healthy.
+    /// alive and will take the next append; confirmation failed for THIS one.
+    /// A client told the stream is closed stops tailing a mailbox that is
+    /// perfectly healthy.
     ///
     /// The reason travels as the backend wrote it, because the caller is who
     /// acts on it and the alternative shipped for a while: every failure —
@@ -39,8 +39,10 @@ pub enum StreamError {
     /// anyway. A refused propose appended nothing (a retry is safe); a commit
     /// that timed out may have replicated (a retry double-appends). `MetaStore`
     /// flattens both to `MetaStoreError::IOError`, so today the distinction
-    /// exists only in this text. Until it is typed, a caller that cares must
-    /// reconcile by reading the tail rather than blind-retrying.
+    /// may not survive the error text either. Until it is typed, expose an
+    /// UNKNOWN outcome conservatively, including for a definite rejection.
+    /// A caller must reconcile by reading the tail rather than blind-retrying;
+    /// an absent read alone is not proof an in-flight proposal cannot commit.
     NotReplicated(String),
 }
 
