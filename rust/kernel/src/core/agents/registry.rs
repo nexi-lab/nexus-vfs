@@ -18,6 +18,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
+#[path = "runtime_observation.rs"]
+mod runtime_observation;
+pub use runtime_observation::{RuntimeDirectoryLookup, RuntimeRegistryHost, RuntimeStatusSource};
+
 // ── ExternalProcessInfo ────────────────────────────────────────────────
 
 /// Connection metadata for external (gRPC/MCP) processes.
@@ -165,6 +169,24 @@ pub enum AgentState {
 }
 
 impl AgentState {
+    /// Compatibility projection of the shared engine facts, including input ownership.
+    pub fn project_foreground(
+        state: contracts::runtime_status::ForegroundState,
+    ) -> (Self, Option<String>) {
+        use contracts::runtime_status::{ForegroundState, InputReason};
+        match state {
+            ForegroundState::Idle => (Self::Ready, None),
+            ForegroundState::Running => (Self::Busy, None),
+            ForegroundState::AwaitingInput(reason) => (
+                Self::AwaitingInput,
+                Some(match reason {
+                    InputReason::Permission => "permission".into(),
+                    InputReason::Question => "question".into(),
+                }),
+            ),
+        }
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             AgentState::Registered => "REGISTERED",
@@ -372,6 +394,10 @@ struct AgentRecord {
     // Native host provenance, never a wire descriptor/label supplied by a
     // registry caller. It belongs to this exact incarnation and is not liveness.
     managed_host_bound: bool,
+    runtime: Option<runtime_observation::RuntimeObservationSource>,
+    runtime_last_seen: Option<std::time::Instant>,
+    runtime_registration: Option<String>,
+    runtime_revision: u64,
 }
 
 impl std::ops::Deref for AgentRecord {
@@ -389,6 +415,33 @@ impl std::ops::DerefMut for AgentRecord {
 }
 
 impl AgentRecord {
+    fn change_state(
+        &mut self,
+        new_state: AgentState,
+        reason: Option<String>,
+    ) -> Result<bool, AgentError> {
+        let reason = if new_state == AgentState::AwaitingInput {
+            reason
+        } else {
+            None
+        };
+        if self.state == new_state {
+            self.reason = reason;
+            return Ok(false);
+        }
+        if !self.state.can_transition_to(new_state) {
+            return Err(AgentError::InvalidTransition {
+                pid: self.pid.clone(),
+                from: self.state,
+                to: new_state,
+            });
+        }
+        self.state = new_state;
+        self.reason = reason;
+        self.updated_at_ms = now_ms();
+        Ok(true)
+    }
+
     fn matches(&self, instance: &AgentInstance) -> bool {
         Arc::ptr_eq(&self.identity, &instance.identity)
     }
@@ -405,6 +458,7 @@ impl AgentRecord {
 /// DashMap<pid, AgentRecord> for concurrent access; per-instance
 /// condvar wakes blocking waiters on state transitions.
 pub struct AgentRegistry {
+    runtime_scope: String,
     agents: DashMap<String, AgentRecord>,
     /// Termination observers — fired on `Terminated` transitions and on
     /// `reap`.  Keyed by `id` so callers can deregister; the order in
@@ -426,9 +480,47 @@ fn now_ms() -> u64 {
 impl AgentRegistry {
     pub fn new() -> Self {
         Self {
+            runtime_scope: Uuid::new_v4().to_string(),
             agents: DashMap::new(),
             on_terminate: RwLock::new(Vec::new()),
         }
+    }
+
+    /// Identifies this registry lifetime, including a restarted host at one address.
+    pub fn runtime_scope_id(&self) -> &str {
+        &self.runtime_scope
+    }
+
+    /// Export only an instance still owned by this registry.
+    pub fn runtime_instance_id(
+        &self,
+        instance: &AgentInstance,
+    ) -> Option<contracts::runtime_status::RuntimeInstanceId> {
+        self.is_current_instance(instance)
+            .then(|| self.runtime_instance_key(instance))
+    }
+
+    fn runtime_instance_key(
+        &self,
+        instance: &AgentInstance,
+    ) -> contracts::runtime_status::RuntimeInstanceId {
+        contracts::runtime_status::RuntimeInstanceId {
+            registry_id: self.runtime_scope.clone(),
+            pid: instance.pid.clone(),
+            incarnation: instance.incarnation().to_string(),
+        }
+    }
+
+    /// Resolve the caller's registered incarnation, never whichever owns its PID now.
+    pub fn get_runtime_instance(
+        &self,
+        id: &contracts::runtime_status::RuntimeInstanceId,
+    ) -> Option<(AgentInstance, AgentDescriptor)> {
+        if id.registry_id != self.runtime_scope {
+            return None;
+        }
+        let (instance, descriptor) = self.get_instance(&id.pid)?;
+        (instance.incarnation().to_string() == id.incarnation).then_some((instance, descriptor))
     }
 
     /// Register a termination callback. Idempotent on `id`: a second
@@ -477,6 +569,15 @@ impl AgentRegistry {
         desc: AgentDescriptor,
         requires_wire_incarnation: bool,
     ) -> Option<AgentInstance> {
+        self.register_instance_with_registration(desc, requires_wire_incarnation, None)
+    }
+
+    fn register_instance_with_registration(
+        &self,
+        desc: AgentDescriptor,
+        requires_wire_incarnation: bool,
+        runtime_registration: Option<String>,
+    ) -> Option<AgentInstance> {
         use dashmap::mapref::entry::Entry;
         match self.agents.entry(desc.pid.clone()) {
             Entry::Occupied(_) => None,
@@ -487,6 +588,10 @@ impl AgentRegistry {
                     callbacks_running: false,
                     removing: false,
                     managed_host_bound: false,
+                    runtime: None,
+                    runtime_last_seen: None,
+                    runtime_registration,
+                    runtime_revision: 0,
                 };
                 let instance = record.instance();
                 v.insert(record);
@@ -527,6 +632,7 @@ impl AgentRegistry {
             external_info,
             labels,
             false,
+            None,
         )
         .map(|(_, descriptor)| descriptor)
     }
@@ -544,6 +650,7 @@ impl AgentRegistry {
         external_info: Option<ExternalProcessInfo>,
         labels: HashMap<String, String>,
         requires_wire_incarnation: bool,
+        runtime_registration: Option<String>,
     ) -> Result<(AgentInstance, AgentDescriptor), AgentError> {
         if let Some(ppid) = parent_pid.as_ref() {
             if !self.agents.contains_key(ppid) {
@@ -584,17 +691,23 @@ impl AgentRegistry {
         let instance = match pid {
             Some(p) => {
                 desc.pid = p.clone();
-                self.register_instance_with_policy(desc.clone(), requires_wire_incarnation)
-                    .ok_or(AgentError::AlreadyExists(p))?
+                self.register_instance_with_registration(
+                    desc.clone(),
+                    requires_wire_incarnation,
+                    runtime_registration.clone(),
+                )
+                .ok_or(AgentError::AlreadyExists(p))?
             }
             None => {
                 let mut out = None;
                 for _ in 0..100 {
                     let candidate = Uuid::new_v4().simple().to_string()[..12].to_string();
                     desc.pid = candidate.clone();
-                    if let Some(instance) =
-                        self.register_instance_with_policy(desc.clone(), requires_wire_incarnation)
-                    {
+                    if let Some(instance) = self.register_instance_with_registration(
+                        desc.clone(),
+                        requires_wire_incarnation,
+                        runtime_registration.clone(),
+                    ) {
                         out = Some(instance);
                         break;
                     }
@@ -787,29 +900,10 @@ impl AgentRegistry {
         if entry.removing || expected.is_some_and(|instance| !entry.matches(instance)) {
             return Ok(false);
         }
-        let from = entry.state;
-        let effective_reason = if new_state == AgentState::AwaitingInput {
-            reason
-        } else {
-            None
-        };
-        if from == new_state {
-            // Same state: refresh the reason (e.g. a new AwaitingInput reason
-            // while already waiting) without a transition/observer fire.
-            entry.reason = effective_reason;
+        if !entry.change_state(new_state, reason)? {
             return Ok(true);
         }
-        if !from.can_transition_to(new_state) {
-            return Err(AgentError::InvalidTransition {
-                pid: pid.to_string(),
-                from,
-                to: new_state,
-            });
-        }
-        entry.state = new_state;
-        entry.reason = effective_reason;
-        entry.updated_at_ms = now_ms();
-        let terminated = new_state == AgentState::Terminated && from != AgentState::Terminated;
+        let terminated = new_state == AgentState::Terminated;
         let instance = entry.instance();
         if terminated {
             entry.callbacks_running = true;
@@ -906,6 +1000,7 @@ impl AgentRegistry {
             info.last_heartbeat_ms = Some(now);
         }
         entry.updated_at_ms = now;
+        entry.runtime_last_seen = Some(std::time::Instant::now());
         Ok(Some(entry.descriptor.clone()))
     }
 
@@ -1230,6 +1325,7 @@ impl AgentRegistry {
             Some(info),
             labels,
             requires_wire_incarnation,
+            None,
         )
     }
 

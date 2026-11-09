@@ -3185,11 +3185,12 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     // peer dispatch.  Without this the coordinator's `peer_*` impls
     // surface every cross-node dispatch as a silent miss via the
     // PR #94 observability warn-loud path (`grpc_ops not installed`).
-    let federation_client: Arc<dyn kernel::federation::grpc_ops::FederationGrpcOps> =
-        Arc::new(transport::federation::FederationClient::new(
-            Arc::clone(kernel.runtime()),
-            cluster_tls.clone(),
-        ));
+    let federation_client = Arc::new(transport::federation::FederationClient::new(
+        kernel.runtime().handle().clone(),
+        cluster_tls.clone(),
+    ));
+    transport::federation::runtime_directory::install(&kernel, Arc::clone(&federation_client))
+        .map_err(anyhow::Error::msg)?;
 
     // Construct the provider as `Arc<RaftDistributedCoordinator>` so
     // `install_with_kernel` can clone it into the kernel's coordinator
