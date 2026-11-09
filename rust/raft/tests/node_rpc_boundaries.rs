@@ -50,6 +50,94 @@ async fn listener_ready(address: &str) {
     .await
     .expect("isolated listener must bind");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fixed_local_root_refuses_incremental_ec_and_state_snapshots() {
+    let directory = tempfile::tempdir().unwrap();
+    let manager = nexus_raft::ZoneManager::isolated(directory.path().to_str().unwrap()).unwrap();
+    let root = manager.create_zone_async("root", vec![]).await.unwrap();
+    assert!(root.wait_for_leader(Duration::from_secs(5)));
+    root.set_metadata(
+        "/private-root",
+        b"local durable value".to_vec(),
+        nexus_raft::Consistency::Sc,
+    )
+    .unwrap();
+    let node = root.consensus_node();
+    let original_index = node.last_index();
+    let original_wal = node.ec_wal_bounds();
+    let address = common::node_bind_addr();
+    let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let (cert, key) =
+        generate_node_cert(manager.node_id(), "root", &ca, &ca_key, &[], None).unwrap();
+    let server = RaftGrpcServer::new(
+        manager.registry(),
+        ServerConfig {
+            bind_address: address.parse().unwrap(),
+            tls: Some(TlsConfig {
+                cert_pem: cert,
+                key_pem: key,
+                ca_pem: ca.clone(),
+            }),
+            ..Default::default()
+        },
+    );
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let listener = tokio::spawn(server.serve_with_shutdown(async move {
+        let _ = stopped.await;
+    }));
+    listener_ready(&address).await;
+    let (cert, key) = generate_node_cert(2, "root", &ca, &ca_key, &[], None).unwrap();
+    let channel = connect(&address, &ca, cert, key).await;
+    let mut client = ZoneTransportServiceClient::new(channel);
+    let entry = EcReplicationEntry {
+        seq: 1,
+        command: bincode::serialize(&Command::SetMetadata {
+            key: "/private-root".into(),
+            value: b"remote overwrite".to_vec(),
+        })
+        .unwrap(),
+        timestamp: u64::MAX,
+        node_id: 2,
+    };
+    let incremental = client
+        .replicate_entries(ReplicateEntriesRequest {
+            zone_id: "root".into(),
+            sender_node_id: 2,
+            entries: vec![entry.clone()],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!incremental.success);
+    assert_eq!(incremental.applied_up_to, 0);
+    let snapshot = client
+        .snapshot_ec_state(SnapshotEcStateRequest {
+            zone_id: "root".into(),
+            sender_node_id: 2,
+            entries: vec![entry],
+            covering_seq: 1,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!snapshot.success);
+    assert_eq!(snapshot.acked_up_to, 0);
+    assert_eq!(node.last_index(), original_index);
+    assert_eq!(node.ec_wal_bounds(), original_wal);
+    assert_eq!(
+        node.with_state_machine(|state| state.get_metadata("/private-root"))
+            .await
+            .unwrap()
+            .unwrap(),
+        Some(b"local durable value".to_vec())
+    );
+    drop(client);
+    stop.send(()).unwrap();
+    listener.await.unwrap().unwrap();
+    manager.shutdown();
+}
+
 fn put(key: &str) -> ProposeRequest {
     ProposeRequest {
         zone_id: "root".into(),
