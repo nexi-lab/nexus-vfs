@@ -178,11 +178,11 @@ pub(crate) struct StartSessionRequest {
     /// Launch policy (command, model and credentials) belongs to the embedder.
     #[serde(default)]
     pub spawn_spec: Option<SpawnSpec>,
-    /// A terminal's one-use local launcher capability. The authenticated
-    /// controller selects argv/environment locally and owns the OS Child.
+    /// A one-use local host capability. The authenticated controller admits
+    /// a session in the caller's existing process; it grants no OS PID authority.
     /// Mutually exclusive with daemon-owned `spawn_spec`.
     #[serde(default)]
-    pub local_launch: Option<contracts::local_launch::LaunchOffer>,
+    pub local_host: Option<contracts::local_host::LocalHostOffer>,
     /// Durable transcript to restore in an in-process runtime. This is NOT
     /// the pid-valued `session_id` accepted by get/cancel.
     #[serde(default)]
@@ -206,7 +206,7 @@ pub(crate) struct SpawnSpec {
 /// in the same managed-session path. Neither variant carries terminal bytes.
 pub(crate) enum ProcessLaunch {
     Daemon(SpawnSpec),
-    Terminal(contracts::local_launch::LaunchOffer),
+    Local(contracts::local_host::LocalHostOffer),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -616,12 +616,12 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                 "'agent_id' is required".into(),
             ));
         }
-        if req.spawn_spec.is_some() && req.local_launch.is_some() {
+        if req.spawn_spec.is_some() && req.local_host.is_some() {
             return Err(ManagedAgentError::InvalidArgument(
-                "spawn_spec and local_launch are mutually exclusive".into(),
+                "spawn_spec and local_host are mutually exclusive".into(),
             ));
         }
-        if let Some(offer) = &req.local_launch {
+        if let Some(offer) = &req.local_host {
             offer
                 .validate()
                 .map_err(|error| ManagedAgentError::InvalidArgument(error.into()))?;
@@ -632,9 +632,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                     "resume_session_id must be a durable ID, not a path".into(),
                 ));
             }
-            if req.spawn_spec.is_some()
-                || req.local_launch.is_some()
-                || self.spawn_provider.is_none()
+            if req.spawn_spec.is_some() || req.local_host.is_some() || self.spawn_provider.is_none()
             {
                 return Err(ManagedAgentError::InvalidArgument(
                     "resume_session_id requires an in-process runtime provider".into(),
@@ -648,7 +646,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
             .spawn_spec
             .take()
             .map(ProcessLaunch::Daemon)
-            .or_else(|| req.local_launch.take().map(ProcessLaunch::Terminal));
+            .or_else(|| req.local_host.take().map(ProcessLaunch::Local));
         let session_endpoint = if process_launch.is_some() || self.spawn_provider.is_some() {
             let controller = controller.filter(|id| !id.is_empty()).ok_or_else(|| {
                 ManagedAgentError::InvalidArgument(
@@ -1499,7 +1497,7 @@ mod tests {
             owner_id: "ethan".to_string(),
             zone_id: "root".to_string(),
             spawn_spec: None,
-            local_launch: None,
+            local_host: None,
             resume_session_id: None,
         }
     }

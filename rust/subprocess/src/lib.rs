@@ -52,7 +52,7 @@
 
 #![allow(dead_code)]
 
-pub mod terminal;
+pub mod local_host;
 
 use std::collections::HashMap;
 #[cfg(unix)]
@@ -204,37 +204,6 @@ impl HostedSubprocess {
             stdin: Some(stdin),
             stdout: Some(stdout),
             stderr: Some(stderr),
-            stdin_path: String::new(),
-            stdout_path: String::new(),
-            stderr_path: String::new(),
-        })
-    }
-
-    /// Launch from the terminal's local launcher, inheriting its three stdio
-    /// handles and OS session. No PTY, pipe, output pump or replay buffer is
-    /// created. The launcher remains the sole owner of the child handle and
-    /// must await `wait()` on both normal exit and cancellation.
-    ///
-    /// This must run in the terminal's process tree, not in a detached daemon:
-    /// inheriting a daemon's stdio cannot recover the caller's controlling TTY.
-    /// Any management protocol must use a separate control connection.
-    /// Environment and working-directory policy match `spawn_no_pipes`.
-    pub async fn spawn_in_terminal(
-        argv: Vec<String>,
-        env: HashMap<String, String>,
-        cwd: &Path,
-    ) -> Result<Self, SubprocessError> {
-        let child = spawn_child(
-            argv,
-            env,
-            cwd,
-            [Stdio::inherit(), Stdio::inherit(), Stdio::inherit()],
-        )?;
-        Ok(Self {
-            child,
-            stdin: None,
-            stdout: None,
-            stderr: None,
             stdin_path: String::new(),
             stdout_path: String::new(),
             stderr_path: String::new(),

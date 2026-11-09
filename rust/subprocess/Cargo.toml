@@ -27,7 +27,7 @@ uuid = { version = "1", features = ["v4"] }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-# Tokio's sockets must not leak into an inherited-terminal child, which would
+# Tokio's sockets must not leak into a host's tool subprocess, which would
 # keep the manager connection alive after its owner closes it. The compatibility
 # floor includes tokio-rs/mio#1946; no additional mio features are enabled.
 mio = { version = "1.2.1", default-features = false }

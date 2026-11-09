@@ -13,8 +13,7 @@ use a2a::session_io::SessionMailbox;
 use dashmap::DashMap;
 use kernel::core::agents::registry::{AgentDescriptor, AgentInstance, AgentRegistry, AgentState};
 use kernel::kernel::{Kernel, OperationContext};
-use serde::Deserialize;
-use subprocess::terminal::PreparedTerminalLaunch;
+use subprocess::local_host::PreparedLocalHost;
 use subprocess::{HostedSubprocess, ProcessExit};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
@@ -79,7 +78,7 @@ impl RawSpawn for KernelRawSpawn {
 
 enum PreparedExecution {
     Owned(Box<HostedSubprocess>),
-    Terminal(PreparedTerminalLaunch),
+    Local(PreparedLocalHost),
 }
 
 impl PreparedExecution {
@@ -104,10 +103,10 @@ impl PreparedExecution {
                 }
                 Ok(Self::Owned(Box::new(child)))
             }
-            ProcessLaunch::Terminal(offer) => PreparedTerminalLaunch::connect(&offer)
+            ProcessLaunch::Local(offer) => PreparedLocalHost::connect(&offer)
                 .await
-                .map(Self::Terminal)
-                .map_err(|error| format!("prepare local terminal launcher: {error}")),
+                .map(Self::Local)
+                .map_err(|error| format!("prepare local host: {error}")),
         }
     }
 }
@@ -122,7 +121,7 @@ impl PreparedRawSpawn for PreparedSubprocess {
     fn os_pid(&self) -> Option<u32> {
         match &self.execution {
             PreparedExecution::Owned(child) => child.os_pid(),
-            PreparedExecution::Terminal(_) => None,
+            PreparedExecution::Local(_) => None,
         }
     }
     fn attach(
@@ -150,53 +149,43 @@ struct ProcessIo {
     stdin: Writer,
     stdout: Reader,
     stderr: Option<Reader>,
-    stop_input: Option<oneshot::Receiver<()>>,
-    terminal_closed: Option<oneshot::Sender<ProcessExit>>,
+    host_closed: Option<oneshot::Sender<()>>,
 }
 
-struct TerminalControl {
-    exit: Option<oneshot::Sender<ProcessExit>>,
+struct LocalControl {
+    local: bool,
     durable: Arc<parking_lot::Mutex<Option<String>>>,
     observer: StateObserver,
     native_ready: bool,
 }
 
-/// The launcher is the sole OS supervisor of a delegated child. Closing its
-/// input requests stop; its EOF confirms the control owner has exited. A lost
-/// launcher reports unknown status, never a fabricated successful child exit.
+/// An owned Child can attest its exit. A terminal-owned process can only
+/// close its control connection; the shell retains OS wait/reap authority.
 enum ProcessControl {
     Owned(Box<HostedSubprocess>),
-    Terminal {
-        closed: oneshot::Receiver<ProcessExit>,
-        stop: Option<oneshot::Sender<()>>,
-    },
+    Local { closed: oneshot::Receiver<()> },
 }
 
 impl ProcessControl {
     async fn wait(&mut self) -> ProcessExit {
         match self {
             Self::Owned(child) => child.wait().await,
-            Self::Terminal { closed, .. } => closed.await.unwrap_or_default(),
+            // EOF/errors arrive through the shared output worker, preserving
+            // its actual failure reason rather than inventing a process exit.
+            Self::Local { .. } => std::future::pending().await,
         }
     }
-    async fn stop_and_wait(&mut self) -> ProcessExit {
+    async fn stop_and_wait(&mut self) -> Option<ProcessExit> {
         match self {
             Self::Owned(child) => {
                 child.kill().await;
-                child.wait().await
+                Some(child.wait().await)
             }
-            Self::Terminal { stop, closed } => {
-                if let Some(stop) = stop.take() {
-                    let _ = stop.send(());
-                }
-                // Only delegated ownership can lose its wait receipt. Keep
-                // daemon-owned Child reaping unchanged and report unknown
-                // rather than claiming success when the launcher disappears.
-                tokio::time::timeout(Duration::from_secs(10), closed)
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
-                    .unwrap_or_default()
+            Self::Local { closed } => {
+                // Input has already closed. Give the host's ordinary cleanup
+                // a bounded opportunity; this is not an OS exit receipt.
+                let _ = tokio::time::timeout(Duration::from_secs(10), closed).await;
+                None
             }
         }
     }
@@ -230,8 +219,7 @@ impl KernelRawSpawn {
             mut stdin,
             stdout,
             stderr,
-            stop_input,
-            terminal_closed,
+            host_closed,
         } = match execution {
             PreparedExecution::Owned(mut child) => {
                 let (stdin, stdout, stderr) = child
@@ -242,11 +230,10 @@ impl KernelRawSpawn {
                     stdin: Box::new(stdin),
                     stdout: Box::new(stdout),
                     stderr: Some(Box::new(stderr)),
-                    stop_input: None,
-                    terminal_closed: None,
+                    host_closed: None,
                 }
             }
-            PreparedExecution::Terminal(launch) => {
+            PreparedExecution::Local(launch) => {
                 // Bootstrap carries the admitted identity, not the registry's
                 // internal descriptor or OS process authority.
                 let grant = serde_json::json!({"instance": {
@@ -257,20 +244,15 @@ impl KernelRawSpawn {
                 }, "session_endpoint":endpoint});
                 let stream = runtime
                     .block_on(launch.start(&grant))
-                    .map_err(|error| format!("release local terminal launch: {error}"))?;
+                    .map_err(|error| format!("release local host: {error}"))?;
                 let (reader, writer) = stream.into_split();
                 let (closed_tx, closed_rx) = oneshot::channel();
-                let (stop_tx, stop_rx) = oneshot::channel();
                 ProcessIo {
-                    process: ProcessControl::Terminal {
-                        closed: closed_rx,
-                        stop: Some(stop_tx),
-                    },
+                    process: ProcessControl::Local { closed: closed_rx },
                     stdin: Box::new(writer),
                     stdout: Box::new(reader),
                     stderr: None,
-                    stop_input: Some(stop_rx),
-                    terminal_closed: Some(closed_tx),
+                    host_closed: Some(closed_tx),
                 }
             }
         };
@@ -278,13 +260,13 @@ impl KernelRawSpawn {
         let (failed_tx, mut failed_rx) = mpsc::unbounded_channel::<String>();
         let stopped = Arc::new(AtomicBool::new(false));
         let durable = Arc::new(parking_lot::Mutex::new(None));
-        let control = TerminalControl {
+        let control = LocalControl {
             durable: Arc::clone(&durable),
-            exit: terminal_closed,
+            local: host_closed.is_some(),
             observer: Arc::clone(&observer),
             native_ready: false,
         };
-        let is_terminal = control.exit.is_some();
+        let is_local = control.local;
         self.spawn_handles.insert(
             desc.pid.clone(),
             Box::new(SubprocessHandle {
@@ -293,7 +275,7 @@ impl KernelRawSpawn {
                 cancel: parking_lot::Mutex::new(Some(cancel_tx)),
             }),
         );
-        if !is_terminal {
+        if !is_local {
             observer(AgentState::Ready, None);
         }
 
@@ -303,21 +285,9 @@ impl KernelRawSpawn {
         let input = spawn_session_task(
             &runtime,
             Box::pin(async move {
-                let stop = async {
-                    match stop_input {
-                        Some(stop) => {
-                            let _ = stop.await;
-                        }
-                        None => std::future::pending::<()>().await,
-                    }
-                };
-                tokio::pin!(stop);
                 while !input_stopped.load(Ordering::Acquire) {
                     let reader = Arc::clone(&input_mailbox);
-                    let message = tokio::select! {
-                        message = tokio::task::spawn_blocking(move || reader.receive(200)) => message,
-                        _ = &mut stop => { let _ = stdin.shutdown().await; break; },
-                    };
+                    let message = tokio::task::spawn_blocking(move || reader.receive(200)).await;
                     match message {
                         Ok(Ok(Some(SessionPayload::Rpc { message }))) => {
                             let mut bytes = serde_json::to_vec(&message).expect("JSON value");
@@ -352,8 +322,9 @@ impl KernelRawSpawn {
                 let reason = pump_output(stdout, output_mailbox, control)
                     .await
                     .err()
-                    .unwrap_or_else(|| "session subprocess closed stdout".into());
+                    .unwrap_or_else(|| "session host control output closed".into());
                 let _ = failed_tx.send(reason);
+                drop(host_closed);
             }),
         );
         // Diagnostics use the same conversation, never a public fd side channel.
@@ -393,12 +364,15 @@ impl KernelRawSpawn {
                         failure = failed_rx.recv() => (None, failure),
                     }
                 };
+                stopped.store(true, Ordering::Release);
+                // Dropping the sole writer closes input for both placements.
+                // No further client command may be delivered after retirement.
+                input.abort();
+                let _ = input.await;
                 let exit = match natural_exit {
-                    Some(exit) => exit,
+                    Some(exit) => Some(exit),
                     None => process.stop_and_wait().await,
                 };
-                stopped.store(true, Ordering::Release);
-                input.abort();
                 // Drain terminal responses before closure. Bound grandchildren
                 // retaining stdout so they cannot hold session teardown forever.
                 let mut output = output;
@@ -417,14 +391,16 @@ impl KernelRawSpawn {
                     diagnostics.abort();
                     let _ = diagnostics.await;
                 }
-                let reason = failure.unwrap_or_else(|| {
-                    format!(
+                let reason = failure.unwrap_or_else(|| match exit {
+                    Some(exit) => format!(
                         "subprocess exited: code={:?}, signal={:?}",
                         exit.code, exit.signal
-                    )
+                    ),
+                    None => "host control closed; OS exit is unobserved".into(),
                 });
                 let _ = send_payload(&mailbox, SessionPayload::Closed { reason }).await;
-                let _ = registry.kill_instance(&instance, exit.as_reap_code());
+                let _ =
+                    registry.kill_instance(&instance, exit.map_or(-1, |exit| exit.as_reap_code()));
             }),
         );
         Ok(())
@@ -445,7 +421,7 @@ fn spawn_session_task(
 async fn pump_output<R: AsyncRead + Unpin>(
     mut reader: R,
     mailbox: Arc<SessionMailbox<Kernel>>,
-    mut control: TerminalControl,
+    mut control: LocalControl,
 ) -> Result<(), String> {
     let mut buffer = [0; 8192];
     let mut line = Vec::new();
@@ -479,26 +455,13 @@ async fn pump_output<R: AsyncRead + Unpin>(
 async fn forward_line(
     line: &[u8],
     mailbox: &Arc<SessionMailbox<Kernel>>,
-    control: &mut TerminalControl,
+    control: &mut LocalControl,
 ) -> Result<(), String> {
     let message: serde_json::Value =
         serde_json::from_slice(line).map_err(|e| format!("invalid subprocess ACP message: {e}"))?;
-    if message["method"] == contracts::local_launch::TERMINAL_EXIT_METHOD {
-        let sender = control
-            .exit
-            .take()
-            .ok_or("unexpected terminal exit receipt")?;
-        let exit: ProcessExit = ProcessExit::deserialize(&message["params"])
-            .map_err(|error| format!("invalid terminal exit receipt: {error}"))?;
-        if exit.code.is_some() && exit.signal.is_some() {
-            return Err("terminal exit receipt has both a code and a signal".into());
-        }
-        let _ = sender.send(exit);
-        return Ok(());
-    }
-    let ready = message["method"] == contracts::local_launch::TERMINAL_READY_METHOD;
-    if ready || message["method"] == contracts::local_launch::TERMINAL_SESSION_METHOD {
-        if control.exit.is_none() || ready == control.native_ready {
+    let ready = message["method"] == contracts::local_host::HOST_READY_METHOD;
+    if ready || message["method"] == contracts::local_host::HOST_SESSION_METHOD {
+        if !control.local || ready == control.native_ready {
             return Err("unexpected terminal session identity receipt".into());
         }
         let id = message["params"]["session_id"]
@@ -512,8 +475,8 @@ async fn forward_line(
         }
         return Ok(());
     }
-    if message["method"] == contracts::local_launch::TERMINAL_STATE_METHOD {
-        if !control.native_ready || control.exit.is_none() {
+    if message["method"] == contracts::local_host::HOST_STATE_METHOD {
+        if !control.native_ready || !control.local {
             return Err("terminal state requires a running native runtime".into());
         }
         let params = &message["params"];
