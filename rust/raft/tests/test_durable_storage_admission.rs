@@ -160,6 +160,48 @@ fn saved_image(path: &Path, compact: bool) -> Snapshot {
     snapshot
 }
 
+fn install_snapshot(source: &Path, target: &Path, snapshot: &Snapshot) {
+    std::fs::create_dir_all(target).unwrap();
+    // Local root identity is durable and independent of the network replica ID.
+    std::fs::copy(source.join(".node_id"), target.join(".node_id")).unwrap();
+    let mut persistence = ZonePersistence::create(target, "root").unwrap();
+    let storage = RaftStorage::open(persistence.raft_path()).unwrap();
+    storage.apply_snapshot(snapshot).unwrap();
+    let store = RedbStore::open(persistence.sm_path()).unwrap();
+    FullStateMachine::new(&store).unwrap();
+    persistence.commit();
+}
+
+#[test]
+fn replica_format_fixtures_for_previous_reader() {
+    let temporary = tempfile::tempdir().unwrap();
+    let destination = std::env::var_os("NEXUS_REPLICA_FORMAT_FIXTURES")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| temporary.path().to_owned());
+    for (name, case, compact) in [
+        ("applied", Case::Replica, false),
+        ("compacted", Case::ReplicaRetired, true),
+    ] {
+        let path = destination.join(name);
+        std::fs::create_dir_all(&path).unwrap();
+        populate(&path, case);
+        let snapshot = saved_image(&path, compact);
+        let persistence = ZonePersistence::open(&path, "root").unwrap();
+        let db = RedbStore::open(persistence.sm_path()).unwrap();
+        let state = FullStateMachine::new(&db).unwrap();
+        assert_eq!(
+            state
+                .get_control_state("content-version-v1", "requires:protected-records-v1")
+                .unwrap()
+                .as_deref(),
+            Some(b"replica-binding-v1".as_slice())
+        );
+        if compact {
+            install_snapshot(&path, &destination.join("snapshot"), &snapshot);
+        }
+    }
+}
+
 fn refuse_managed(path: &Path, id: u64, case: Case) {
     match ZoneManager::with_node_id(
         "unqualified-mode-change",
@@ -228,20 +270,7 @@ fn snapshot_only_restart_refuses_before_restoring_into_an_empty_store() {
         let snapshot = saved_image(source.path(), false);
         let expected = contents(source.path(), case);
         let target = tempfile::tempdir().unwrap();
-        // The retained local Raft identity is part of durable root recovery.
-        // A network replica ID is a separate identity when using local-root mode.
-        std::fs::copy(
-            source.path().join(".node_id"),
-            target.path().join(".node_id"),
-        )
-        .unwrap();
-        {
-            let persistence = ZonePersistence::create(target.path(), "root").unwrap();
-            let storage = RaftStorage::open(persistence.raft_path()).unwrap();
-            storage.apply_snapshot(&snapshot).unwrap();
-            let store = RedbStore::open(persistence.sm_path()).unwrap();
-            FullStateMachine::new(&store).unwrap();
-        }
+        install_snapshot(source.path(), target.path(), &snapshot);
         let empty = contents(target.path(), case);
         assert!(empty.control.is_empty());
         refuse_managed(target.path(), id, case);

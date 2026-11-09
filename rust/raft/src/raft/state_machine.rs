@@ -2380,7 +2380,6 @@ impl FullStateMachine {
 
 impl StateMachine for FullStateMachine {
     fn validate_membership_policy(&self, policy: super::MembershipPolicy) -> Result<()> {
-        self.validate_protected_storage_policy(policy)?;
         self.validate_owned_storage_policy(policy)
     }
 
@@ -2390,7 +2389,6 @@ impl StateMachine for FullStateMachine {
         policy: super::MembershipPolicy,
     ) -> Result<()> {
         let snapshot: Snapshot = bincode::deserialize(data)?;
-        Self::validate_protected_snapshot_policy(&snapshot, policy)?;
         Self::validate_owned_snapshot_policy(&snapshot, policy)
     }
 

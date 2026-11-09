@@ -36,7 +36,11 @@ Node identities and replica identities in the same issuer authority. The
 binding store retains replica reservations across retirement and replacement.
 
 The control-zone state machine applies each transition, replica reservation
-and operation receipt in the same transaction as its Raft last-applied marker.
+and operation receipt in the same transaction as its Raft last-applied marker
+and minimum storage-reader format. The format requirement increases monotonically
+at the existing storage-admission key and survives compaction and snapshots.
+Boot and snapshot admission check that the reader supports the retained format
+and that its membership policy qualifies the stored records.
 Generic control writes are refused for this owned namespace. EC admission
 requires these mutations to use the consensus path.
 
@@ -112,3 +116,9 @@ an unactivated command enters the log. State-machine tests cover snapshot restor
 identity reservation retention, stale revisions, payload mismatch and refusal
 of generic/EC writes. The Node-control CI matrix runs these on Linux, Windows
 and macOS.
+
+`test_durable_storage_admission.rs` covers applied and compacted restart,
+snapshot-only recovery, incoming snapshot refusal and successful fixed-local
+recovery. The Linux Node-control job also builds the pinned previous reader
+and opens current native fixtures, verifying format refusal before restore
+for both managed and fixed-local membership.

@@ -112,6 +112,10 @@ impl FullStateMachine {
         if let Err(error) = request.validate() {
             return Ok(CommandResult::Error(error));
         }
+        self.require_storage_format_in_txn(
+            txn,
+            super::storage_admission::StorageFormat::ReplicaBinding,
+        )?;
         let mut table = txn
             .open_table(redb::TableDefinition::<&[u8], &[u8]>::new(
                 self.control_state.name(),
@@ -266,6 +270,35 @@ mod tests {
             panic!("typed receipt")
         };
         bincode::deserialize(&bytes).unwrap()
+    }
+
+    #[test]
+    fn aborted_binding_apply_publishes_neither_format_nor_authority() {
+        let db = RedbStore::open_temporary().unwrap();
+        let mut sm = FullStateMachine::new(&db).unwrap();
+        let original = register("register-original", "primary", 31);
+        {
+            let txn = sm.control_state.raw_db().begin_write().unwrap();
+            sm.apply_replica_binding(&txn, &original).unwrap();
+            txn.abort().unwrap();
+        }
+        assert!(sm.list_control_state(NAMESPACE).unwrap().is_empty());
+        assert!(sm
+            .list_control_state(super::super::conditional_metadata::NAMESPACE)
+            .unwrap()
+            .is_empty());
+        assert_eq!(sm.last_applied_index(), 0);
+        assert!(matches!(
+            apply(&mut sm, 1, &original),
+            ReplicaBindingOutcome::Applied(_)
+        ));
+        assert_eq!(
+            sm.get_control_state("content-version-v1", "requires:protected-records-v1")
+                .unwrap()
+                .as_deref(),
+            Some(b"replica-binding-v1".as_slice())
+        );
+        assert_eq!(sm.last_applied_index(), 1);
     }
 
     #[test]

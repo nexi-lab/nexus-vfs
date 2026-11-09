@@ -1,31 +1,13 @@
 //! Conditional-only records retain their existing zone-relative metadata key.
 
 use super::conditional_metadata::storage_error;
+use super::storage_admission::StorageFormat;
 use super::*;
 
 const POLICY_PREFIX: &str = "protected:";
 const CONDITIONAL_ONLY: &[u8] = b"conditional-only-v1";
 const RECORD_OWNER: &[u8] = b"record-owner-v1";
 const RECORD_IO_OWNER: &[u8] = b"record-owner-io-v1";
-// The prior reader rejects this unknown requirement at boot/snapshot admission.
-// An ordinary later adoption must never downgrade this durable requirement.
-const GUARDED_RECORDS: &[u8] = b"guarded-records-v1";
-const RECORD_IO: &[u8] = b"guarded-record-io-v1";
-const REQUIREMENT: &str = "requires:protected-records-v1";
-
-fn requirement_key() -> Vec<u8> {
-    control_key(conditional_metadata::NAMESPACE, REQUIREMENT)
-}
-
-fn validate_policy(required: bool, policy: super::super::MembershipPolicy) -> Result<()> {
-    if required && policy != super::super::MembershipPolicy::FixedLocal {
-        return Err(super::super::RaftError::Config(
-            "protected records require qualified fixed-local storage".into(),
-        ));
-    }
-    Ok(())
-}
-
 fn policy_key(path: &str) -> Vec<u8> {
     control_key(
         conditional_metadata::NAMESPACE,
@@ -44,14 +26,6 @@ fn decode_policy(value: Option<Vec<u8>>) -> Result<bool> {
         Some(_) => Err(super::super::RaftError::Storage(
             "invalid protected metadata policy".into(),
         )),
-    }
-}
-
-fn decode_requirement(value: Option<Vec<u8>>) -> Result<bool> {
-    match value.as_deref() {
-        None => Ok(false),
-        Some(CONDITIONAL_ONLY | GUARDED_RECORDS | RECORD_IO) => Ok(true),
-        Some(_) => Err(storage_error("unsupported protected-record storage format")),
     }
 }
 
@@ -78,27 +52,6 @@ impl FullStateMachine {
                 String::from_utf8(key[prefix.len()..].to_vec()).map_err(storage_error)
             })
             .collect()
-    }
-
-    pub(super) fn validate_protected_storage_policy(
-        &self,
-        policy: super::super::MembershipPolicy,
-    ) -> Result<()> {
-        validate_policy(
-            decode_requirement(self.control_state.get(&requirement_key())?)?,
-            policy,
-        )
-    }
-
-    pub(super) fn validate_protected_snapshot_policy(
-        snapshot: &Snapshot,
-        policy: super::super::MembershipPolicy,
-    ) -> Result<()> {
-        let key = String::from_utf8(requirement_key()).map_err(storage_error)?;
-        validate_policy(
-            decode_requirement(snapshot.control_state.get(&key).cloned())?,
-            policy,
-        )
     }
 
     /// The policy is a durable fact in this zone's existing control store.
@@ -204,7 +157,7 @@ impl FullStateMachine {
         txn: &redb::WriteTransaction,
         path: &str,
     ) -> Result<()> {
-        self.require_record_format_in_txn(txn, true)?;
+        self.require_storage_format_in_txn(txn, StorageFormat::RecordIo)?;
         let mut table = txn
             .open_table(redb::TableDefinition::<&[u8], &[u8]>::new(
                 self.control_state.name(),
@@ -212,9 +165,6 @@ impl FullStateMachine {
             .map_err(storage_error)?;
         table
             .insert(policy_key(path).as_slice(), RECORD_IO_OWNER)
-            .map_err(storage_error)?;
-        table
-            .insert(requirement_key().as_slice(), RECORD_IO)
             .map_err(storage_error)?;
         Ok(())
     }
@@ -245,37 +195,8 @@ impl FullStateMachine {
             .insert(policy_key(key).as_slice(), CONDITIONAL_ONLY)
             .map_err(storage_error)?;
         drop(table);
-        self.require_record_format_in_txn(txn, false)?;
+        self.require_storage_format_in_txn(txn, StorageFormat::Conditional)?;
         Ok(CommandResult::ProtectedMetadata { protected: true })
-    }
-
-    pub(super) fn require_record_format_in_txn(
-        &self,
-        txn: &redb::WriteTransaction,
-        guarded: bool,
-    ) -> Result<()> {
-        let mut table = txn
-            .open_table(redb::TableDefinition::<&[u8], &[u8]>::new(
-                self.control_state.name(),
-            ))
-            .map_err(storage_error)?;
-        let key = requirement_key();
-        let current = table
-            .get(key.as_slice())
-            .map_err(storage_error)?
-            .map(|value| value.value().to_vec());
-        decode_requirement(current.clone())?;
-        let required = if current.as_deref() == Some(RECORD_IO) {
-            RECORD_IO
-        } else if guarded || current.as_deref() == Some(GUARDED_RECORDS) {
-            GUARDED_RECORDS
-        } else {
-            CONDITIONAL_ONLY
-        };
-        table
-            .insert(key.as_slice(), required)
-            .map_err(storage_error)?;
-        Ok(())
     }
 
     pub(super) fn ordinary_write_is_protected(&self, command: &Command) -> Result<bool> {

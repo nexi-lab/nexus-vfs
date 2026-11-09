@@ -15,6 +15,7 @@ on:
       - 'rust/lib/src/transport_primitives/**'
       - 'proto/nexus/raft/**'
       - '.github/workflows/node-control.yml'
+      - '.github/scripts/storage-format-compatibility.py'
       - '.github/actions/setup-rust-tests/**'
 
 env:
@@ -57,6 +58,18 @@ jobs:
         run: cargo test --locked -p transport --lib peer_blob::
       - run: cargo test --locked -p raft@0.1.0 --lib agent_csr_client::tests
       - run: cargo test --locked -p raft@0.1.0 --lib zone_manager::tests::mismatched_node_certificate
+      - name: Previous reader refuses the durable replica format
+        if: runner.os == 'Linux'
+        run: python3 .github/scripts/storage-format-compatibility.py --output "${{ runner.temp }}/replica-storage-compatibility"
+      - name: Preserve storage compatibility evidence
+        if: always() && runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: replica-storage-compatibility
+          path: |
+            ${{ runner.temp }}/replica-storage-compatibility/*.log
+            ${{ runner.temp }}/replica-storage-compatibility/receipt.json
+          if-no-files-found: warn
 
   runtime-enrollment:
     runs-on: ${{ matrix.os }}
