@@ -43,6 +43,8 @@ jobs:
           cargo test --locked -p raft@0.1.0 --lib transport::certgen::tests::replica_certificate_retains_owner_identity_without_node_authority
           cargo test --locked -p raft@0.1.0 --lib transport::session_renewal::tests
           cargo test --locked -p transport --lib peer_identity::tests::owner_replica_remains_an_owner_agent_on_the_existing_vfs_surface
+      - name: Raft membership controls EC recipients
+        run: cargo test --locked -p raft@0.1.0 --lib transport::transport_loop::tests
       - run: cargo test --locked -p raft@0.1.0 --lib agent_csr_client::tests
       - run: cargo test --locked -p raft@0.1.0 --lib zone_manager::tests::mismatched_node_certificate
 
