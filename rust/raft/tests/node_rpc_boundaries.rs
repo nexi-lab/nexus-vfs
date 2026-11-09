@@ -57,13 +57,13 @@ async fn fixed_local_root_refuses_incremental_ec_and_state_snapshots() {
     let manager = nexus_raft::ZoneManager::isolated(directory.path().to_str().unwrap()).unwrap();
     let root = manager.create_zone_async("root", vec![]).await.unwrap();
     assert!(root.wait_for_leader(Duration::from_secs(5)));
-    root.set_metadata(
-        "/private-root",
-        b"local durable value".to_vec(),
-        nexus_raft::Consistency::Sc,
-    )
-    .unwrap();
     let node = root.consensus_node();
+    node.propose(Command::SetMetadata {
+        key: "/private-root".into(),
+        value: b"local durable value".to_vec(),
+    })
+    .await
+    .unwrap();
     node.read_linearizable(|_| ()).await.unwrap();
     let original_index = node.last_index();
     let original_wal = node.ec_wal_bounds();
