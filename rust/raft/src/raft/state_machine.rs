@@ -26,12 +26,17 @@ mod metadata_rename;
 mod protected_metadata;
 mod record_guard;
 mod replica_binding;
+mod storage_admission;
 pub use conditional_metadata::VersionedMetadata;
 pub use record_guard::GuardedRecordMutation;
 
+const OWNED_CONTROL_NAMESPACES: &[&str] = &[
+    conditional_metadata::NAMESPACE,
+    contracts::constants::CONTROL_NS_REPLICA,
+];
+
 fn owned_control_namespace(namespace: &str) -> bool {
-    namespace == conditional_metadata::NAMESPACE
-        || namespace == contracts::constants::CONTROL_NS_REPLICA
+    OWNED_CONTROL_NAMESPACES.contains(&namespace)
 }
 
 /// Command to be replicated through Raft.
@@ -2375,7 +2380,8 @@ impl FullStateMachine {
 
 impl StateMachine for FullStateMachine {
     fn validate_membership_policy(&self, policy: super::MembershipPolicy) -> Result<()> {
-        self.validate_protected_storage_policy(policy)
+        self.validate_protected_storage_policy(policy)?;
+        self.validate_owned_storage_policy(policy)
     }
 
     fn validate_snapshot_membership(
@@ -2384,7 +2390,8 @@ impl StateMachine for FullStateMachine {
         policy: super::MembershipPolicy,
     ) -> Result<()> {
         let snapshot: Snapshot = bincode::deserialize(data)?;
-        Self::validate_protected_snapshot_policy(&snapshot, policy)
+        Self::validate_protected_snapshot_policy(&snapshot, policy)?;
+        Self::validate_owned_snapshot_policy(&snapshot, policy)
     }
 
     fn requires_strong_consistency(&self, command: &Command) -> Result<bool> {
