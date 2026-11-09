@@ -604,7 +604,7 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
         request: Request<StepMessageRequest>,
     ) -> std::result::Result<Response<StepMessageResponse>, Status> {
         super::node_authority::authorize_data_zone(
-            &request,
+            request.extensions(),
             &self.registry,
             &request.get_ref().zone_id,
         )?;
@@ -612,7 +612,7 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
             Ok(message) => message,
             Err(response) => return Ok(Response::new(response)),
         };
-        let peer = super::node_authority::authorize_raft_sender(&request, &message)?;
+        let peer = super::node_authority::authorize_raft_sender(request.extensions(), &message)?;
         let req = request.into_inner();
         let node = match self.registry.get_node(&req.zone_id) {
             Some(n) => n,
@@ -681,11 +681,14 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
         request: Request<ReplicateEntriesRequest>,
     ) -> std::result::Result<Response<ReplicateEntriesResponse>, Status> {
         super::node_authority::authorize_data_zone(
-            &request,
+            request.extensions(),
             &self.registry,
             &request.get_ref().zone_id,
         )?;
-        super::node_authority::authorize_ec_sender(&request, request.get_ref().sender_node_id)?;
+        super::node_authority::authorize_ec_sender(
+            request.extensions(),
+            request.get_ref().sender_node_id,
+        )?;
         let req = request.into_inner();
         let node = get_zone_node(&self.registry, &req.zone_id)?;
 
@@ -774,11 +777,14 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
         request: Request<SnapshotEcStateRequest>,
     ) -> std::result::Result<Response<SnapshotEcStateResponse>, Status> {
         super::node_authority::authorize_data_zone(
-            &request,
+            request.extensions(),
             &self.registry,
             &request.get_ref().zone_id,
         )?;
-        super::node_authority::authorize_ec_sender(&request, request.get_ref().sender_node_id)?;
+        super::node_authority::authorize_ec_sender(
+            request.extensions(),
+            request.get_ref().sender_node_id,
+        )?;
         let req = request.into_inner();
         let node = get_zone_node(&self.registry, &req.zone_id)?;
 
@@ -952,7 +958,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
         request: Request<ProposeRequest>,
     ) -> std::result::Result<Response<ProposeResponse>, Status> {
         super::node_authority::authorize_data_zone(
-            &request,
+            request.extensions(),
             &self.registry,
             &request.get_ref().zone_id,
         )?;
@@ -1081,7 +1087,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
         request: Request<QueryRequest>,
     ) -> std::result::Result<Response<QueryResponse>, Status> {
         super::node_authority::authorize_data_zone(
-            &request,
+            request.extensions(),
             &self.registry,
             &request.get_ref().zone_id,
         )?;
@@ -1243,7 +1249,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
         request: Request<GetClusterInfoRequest>,
     ) -> std::result::Result<Response<GetClusterInfoResponse>, Status> {
         super::node_authority::authorize_data_zone(
-            &request,
+            request.extensions(),
             &self.registry,
             &request.get_ref().zone_id,
         )?;
@@ -1703,7 +1709,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
         request: Request<GetSearchCapabilitiesRequest>,
     ) -> std::result::Result<Response<SearchCapabilities>, Status> {
         super::node_authority::authorize_data_zone(
-            &request,
+            request.extensions(),
             &self.registry,
             &request.get_ref().zone_id,
         )?;
@@ -1745,7 +1751,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
         request: Request<ReadZoneBlobRequest>,
     ) -> std::result::Result<Response<ReadBlobResponse>, Status> {
         super::node_authority::authorize_data_zone(
-            &request,
+            request.extensions(),
             &self.registry,
             &request.get_ref().zone_id,
         )?;
@@ -2945,7 +2951,7 @@ impl ZoneTransportService for WitnessServiceImpl {
             Ok(message) => message,
             Err(response) => return Ok(Response::new(response)),
         };
-        let peer = super::node_authority::authorize_raft_sender(&request, &message)?;
+        let peer = super::node_authority::authorize_raft_sender(request.extensions(), &message)?;
         let req = request.into_inner();
 
         // Route by zone_id — auto-join if zone not found (dynamic federation)

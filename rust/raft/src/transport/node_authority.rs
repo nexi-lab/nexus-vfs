@@ -10,7 +10,7 @@ use tonic::{
     codegen::{http, BoxFuture, Service},
     server::NamedService,
     transport::server::{TcpConnectInfo, TlsConnectInfo},
-    Request, Status,
+    Status,
 };
 use x509_parser::{certificate::X509Certificate, extensions::GeneralName, prelude::FromDer};
 
@@ -38,15 +38,11 @@ impl AuthenticatedPeer {
     }
 }
 
-fn authenticated_peer<T>(request: &Request<T>) -> Result<Option<AuthenticatedPeer>, Status> {
-    if let Some(peer) = request.extensions().get::<AuthenticatedPeer>() {
+fn authenticated_peer(extensions: &http::Extensions) -> Result<Option<AuthenticatedPeer>, Status> {
+    if let Some(peer) = extensions.get::<AuthenticatedPeer>() {
         return Ok(Some(*peer));
     }
-    if request
-        .extensions()
-        .get::<TlsConnectInfo<TcpConnectInfo>>()
-        .is_some()
-    {
+    if extensions.get::<TlsConnectInfo<TcpConnectInfo>>().is_some() {
         return Err(Status::permission_denied(
             "message requires an authenticated replication peer",
         ));
@@ -54,17 +50,18 @@ fn authenticated_peer<T>(request: &Request<T>) -> Result<Option<AuthenticatedPee
     Ok(None)
 }
 
-fn authenticated_node_id<T>(request: &Request<T>) -> Result<Option<u64>, Status> {
-    Ok(authenticated_peer(request)?.map(AuthenticatedPeer::node_id))
+fn authenticated_node_id(extensions: &http::Extensions) -> Result<Option<u64>, Status> {
+    Ok(authenticated_peer(extensions)?.map(AuthenticatedPeer::node_id))
 }
 
 /// Authorize before parsing payloads, learning routes or reading zone data.
-pub(super) fn authorize_data_zone<T>(
-    request: &Request<T>,
+#[inline(never)] // Share admission code across all typed RPC handlers.
+pub(super) fn authorize_data_zone(
+    extensions: &http::Extensions,
     registry: &crate::raft::ZoneRaftRegistry,
     zone_id: &str,
 ) -> Result<(), Status> {
-    let Some(AuthenticatedPeer::Replica(peer)) = authenticated_peer(request)? else {
+    let Some(AuthenticatedPeer::Replica(peer)) = authenticated_peer(extensions)? else {
         return Ok(());
     };
     let denied = || Status::permission_denied("replica is not admitted to the requested data zone");
@@ -78,8 +75,11 @@ pub(super) fn authorize_data_zone<T>(
 }
 
 /// Bind an EC sender to its connection before applying or acknowledging data.
-pub(super) fn authorize_ec_sender<T>(request: &Request<T>, sender: u64) -> Result<(), Status> {
-    if authenticated_node_id(request)?.is_some_and(|peer| peer != sender) {
+pub(super) fn authorize_ec_sender(
+    extensions: &http::Extensions,
+    sender: u64,
+) -> Result<(), Status> {
+    if authenticated_node_id(extensions)?.is_some_and(|peer| peer != sender) {
         return Err(Status::permission_denied(
             "message sender does not match the authenticated Node",
         ));
@@ -88,15 +88,15 @@ pub(super) fn authorize_ec_sender<T>(request: &Request<T>, sender: u64) -> Resul
 }
 
 /// Preserve raft-rs request relaying and return the actual transport peer.
-pub(super) fn authorize_raft_sender<T>(
-    request: &Request<T>,
+pub(super) fn authorize_raft_sender(
+    extensions: &http::Extensions,
     message: &raft::eraftpb::Message,
 ) -> Result<u64, Status> {
-    let Some(peer) = authenticated_node_id(request)? else {
+    let Some(peer) = authenticated_node_id(extensions)? else {
         return Ok(message.from);
     };
     if matches!(
-        authenticated_peer(request)?,
+        authenticated_peer(extensions)?,
         Some(AuthenticatedPeer::Replica(_))
     ) && message.get_msg_type() == raft::eraftpb::MessageType::MsgPropose
         && message.entries.iter().any(|entry| {
@@ -237,6 +237,11 @@ impl NodeControlPolicy {
 #[derive(Clone)]
 pub(super) struct NodeControlService<S> {
     inner: S,
+    admission: RequestAdmission,
+}
+
+#[derive(Clone)]
+struct RequestAdmission {
     policy: NodeControlPolicy,
     delegated: Arc<[String]>,
     replica_data: Arc<[String]>,
@@ -245,14 +250,16 @@ impl<S: NamedService> NodeControlService<S> {
     pub(super) fn new(inner: S, policy: NodeControlPolicy, delegated: &[&str]) -> Self {
         Self {
             inner,
-            policy,
-            delegated: method_paths(S::NAME, delegated),
-            replica_data: Arc::from([]),
+            admission: RequestAdmission {
+                policy,
+                delegated: method_paths(S::NAME, delegated),
+                replica_data: Arc::from([]),
+            },
         }
     }
 
     pub(super) fn with_owner_replica_data(mut self) -> Self {
-        self.replica_data = method_paths(S::NAME, REPLICA_DATA_METHODS);
+        self.admission.replica_data = method_paths(S::NAME, REPLICA_DATA_METHODS);
         self
     }
 }
@@ -271,6 +278,18 @@ where
         self.inner.poll_ready(cx)
     }
     fn call(&mut self, mut request: http::Request<Body>) -> Self::Future {
+        if let Err(status) = self.admission.check(&mut request) {
+            return Box::pin(async move { Ok(status.into_http()) });
+        }
+        Box::pin(self.inner.call(request))
+    }
+}
+
+impl RequestAdmission {
+    // The payload/service type has no role in authenticating the connection.
+    // Keep one implementation across all generated tonic service wrappers.
+    #[inline(never)]
+    fn check(&self, request: &mut http::Request<Body>) -> Result<(), Status> {
         if !self.delegated.iter().any(|p| p == request.uri().path()) {
             match self.policy.check(request.extensions()) {
                 Ok(Some(AuthenticatedPeer::Replica(_)))
@@ -279,22 +298,18 @@ where
                         .iter()
                         .any(|path| path == request.uri().path()) =>
                 {
-                    return Box::pin(async move {
-                        Ok(
-                            Status::permission_denied("operation requires a cluster Node")
-                                .into_http(),
-                        )
-                    });
+                    return Err(Status::permission_denied(
+                        "operation requires a cluster Node",
+                    ));
                 }
                 Ok(Some(peer)) => {
                     request.extensions_mut().insert(peer);
                 }
                 Ok(None) => {}
-                Err(status) => return Box::pin(async move { Ok(status.into_http()) }),
+                Err(status) => return Err(status),
             }
         }
-        let future = self.inner.call(request);
-        Box::pin(future)
+        Ok(())
     }
 }
 
