@@ -228,6 +228,13 @@ fn snapshot_only_restart_refuses_before_restoring_into_an_empty_store() {
         let snapshot = saved_image(source.path(), false);
         let expected = contents(source.path(), case);
         let target = tempfile::tempdir().unwrap();
+        // The retained local Raft identity is part of durable root recovery.
+        // A network replica ID is a separate identity when using local-root mode.
+        std::fs::copy(
+            source.path().join(".node_id"),
+            target.path().join(".node_id"),
+        )
+        .unwrap();
         {
             let persistence = ZonePersistence::create(target.path(), "root").unwrap();
             let storage = RaftStorage::open(persistence.raft_path()).unwrap();
