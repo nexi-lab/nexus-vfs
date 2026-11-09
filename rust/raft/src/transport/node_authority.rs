@@ -277,6 +277,8 @@ where
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
     }
+    // Keep generated RPC dispatch separate from the router's per-service adapter.
+    #[inline(never)]
     fn call(&mut self, mut request: http::Request<Body>) -> Self::Future {
         if let Err(status) = self.admission.check(&mut request) {
             return Box::pin(async move { Ok(status.into_http()) });
