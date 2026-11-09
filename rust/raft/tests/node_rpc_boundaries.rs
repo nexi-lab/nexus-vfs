@@ -19,7 +19,7 @@ use nexus_raft::{
     },
 };
 use protobuf::Message as _;
-use std::{sync::Arc, time::Duration};
+use std::{error::Error, sync::Arc, time::Duration};
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
 async fn connect(address: &str, ca: &[u8], cert: Vec<u8>, key: Vec<u8>) -> Channel {
@@ -103,6 +103,42 @@ impl PeerServer {
     }
 }
 
+#[derive(Clone, Copy)]
+enum PeerRefusal {
+    Identity(&'static str),
+    Issuer,
+}
+
+/// Preserve the TLS cause through tonic, hyper and the I/O error wrapper.
+/// A timeout, closed socket or unrelated certificate error cannot pass here.
+fn assert_peer_refusal(error: &lib::transport_primitives::TransportError, refusal: PeerRefusal) {
+    let mut cause: Option<&(dyn Error + 'static)> = Some(error);
+    while let Some(current) = cause {
+        if let Some(tls) = current.downcast_ref::<rustls::Error>() {
+            let matches = match (refusal, tls) {
+                (PeerRefusal::Identity(expected), rustls::Error::General(actual)) => {
+                    actual == expected
+                }
+                (
+                    PeerRefusal::Issuer,
+                    rustls::Error::InvalidCertificate(
+                        rustls::CertificateError::UnknownIssuer
+                        | rustls::CertificateError::BadSignature,
+                    ),
+                ) => true,
+                _ => false,
+            };
+            assert!(matches, "unexpected peer refusal: {error:?}");
+            return;
+        }
+        cause = match current.downcast_ref::<std::io::Error>() {
+            Some(io) => io.get_ref().map(|inner| inner as &(dyn Error + 'static)),
+            None => current.source(),
+        };
+    }
+    panic!("connection did not fail at TLS peer validation: {error:?}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn outgoing_peer_tls_binds_node_and_owner_replica_before_any_rpc() {
     use lib::transport_primitives::{create_peer_channel, ClientConfig};
@@ -110,6 +146,7 @@ async fn outgoing_peer_tls_binds_node_and_owner_replica_before_any_rpc() {
 
     let (ca, ca_key) = generate_zone_ca("root").unwrap();
     let (foreign_ca, foreign_key) = generate_zone_ca("root").unwrap();
+    let (other_named_ca, other_named_key) = generate_zone_ca("other-root").unwrap();
     let (client_cert, client_key) = generate_node_cert(2, "root", &ca, &ca_key, &[], None).unwrap();
     let config = ClientConfig {
         tls: Some(TlsConfig {
@@ -133,22 +170,33 @@ async fn outgoing_peer_tls_binds_node_and_owner_replica_before_any_rpc() {
         (
             "other node",
             generate_node_cert(8, "root", &ca, &ca_key, &[], None).unwrap(),
-            Some("server certificate does not name the expected replication peer"),
+            Some(PeerRefusal::Identity(
+                "server certificate does not name the expected replication peer",
+            )),
         ),
         (
             "other replica",
             generate_user_replica_cert("peer", "alice", 8, 300, &ca, &ca_key).unwrap(),
-            Some("server certificate does not name the expected replication peer"),
+            Some(PeerRefusal::Identity(
+                "server certificate does not name the expected replication peer",
+            )),
         ),
         (
             "runtime without replica",
             generate_user_runtime_cert("peer", "alice", 300, &ca, &ca_key).unwrap(),
-            Some("Node certificate must carry exactly one Nexus identity"),
+            Some(PeerRefusal::Identity(
+                "Node certificate must carry exactly one Nexus identity",
+            )),
         ),
         (
-            "other issuer",
+            "other issuer with the same distinguished name",
             generate_node_cert(7, "root", &foreign_ca, &foreign_key, &[], None).unwrap(),
-            Some("UnknownIssuer"),
+            Some(PeerRefusal::Issuer),
+        ),
+        (
+            "other issuer with a different distinguished name",
+            generate_node_cert(7, "root", &other_named_ca, &other_named_key, &[], None).unwrap(),
+            Some(PeerRefusal::Issuer),
         ),
     ];
     for (label, (cert_pem, key_pem), refusal) in cases {
@@ -161,7 +209,7 @@ async fn outgoing_peer_tls_binds_node_and_owner_replica_before_any_rpc() {
         let channel = create_peer_channel(&server.endpoint, &config, 7.try_into().unwrap()).await;
         if let Some(refusal) = refusal {
             let error = channel.expect_err("unexpected peer must fail before any RPC");
-            assert!(format!("{error:?}").contains(refusal), "{label}: {error:?}");
+            assert_peer_refusal(&error, refusal);
         } else {
             let mut rpc = ZoneApiServiceClient::new(channel.unwrap());
             let info = rpc
@@ -222,10 +270,9 @@ async fn raft_pool_rechecks_changed_routes_and_tls_before_reusing_a_channel() {
             .await
             .err()
             .expect("changed route or requested identity must be rechecked");
-        assert!(
-            format!("{error:?}")
-                .contains("server certificate does not name the expected replication peer"),
-            "{error:?}"
+        assert_peer_refusal(
+            &error,
+            PeerRefusal::Identity("server certificate does not name the expected replication peer"),
         );
     }
     tls.write().unwrap().as_mut().unwrap().ca_pem = generate_zone_ca("root").unwrap().0;
@@ -234,7 +281,7 @@ async fn raft_pool_rechecks_changed_routes_and_tls_before_reusing_a_channel() {
         .await
         .err()
         .expect("changed trust roots must invalidate an established channel");
-    assert!(format!("{error:?}").contains("UnknownIssuer"), "{error:?}");
+    assert_peer_refusal(&error, PeerRefusal::Issuer);
     drop(pool);
     expected.shutdown().await;
     other.shutdown().await;
