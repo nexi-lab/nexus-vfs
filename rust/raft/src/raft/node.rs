@@ -1877,6 +1877,7 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
     /// Replication membership from the live Raft ProgressTracker, including
     /// incoming/outgoing voters, learners and learners awaiting joint exit.
     /// The address book supplies routes; it cannot add replication members.
+    #[cfg(all(feature = "grpc", has_protos))]
     #[inline]
     pub(crate) fn is_replication_member(&self, node_id: u64) -> bool {
         self.raw_node.raft.prs().get(node_id).is_some()
