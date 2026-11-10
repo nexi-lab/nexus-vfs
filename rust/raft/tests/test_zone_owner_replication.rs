@@ -121,7 +121,7 @@ async fn found(manager: &Arc<ZoneManager>, zone: &str, id: u64, addr: &str) {
     ready(zone.consensus_node()).await;
 }
 
-async fn ready(node: Arc<nexus_raft::raft::ZoneConsensus<nexus_raft::raft::FullStateMachine>>) {
+async fn ready(node: nexus_raft::raft::ZoneConsensus<nexus_raft::raft::FullStateMachine>) {
     node.campaign().await.unwrap();
     // Campaign acknowledges the request. A reopened node can still be replaying
     // its committed membership; only an elected leader can accept new writes.
