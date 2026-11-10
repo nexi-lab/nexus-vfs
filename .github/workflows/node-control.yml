@@ -19,6 +19,10 @@ on:
 env:
   CARGO_BUILD_JOBS: 1
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   node-boundary:
     runs-on: ${{ matrix.os }}
