@@ -6,12 +6,16 @@
 
 use crate::{
     control_state_store::ControlStateStore,
-    prelude::{CommandResult, FullStateMachine, ZoneConsensus},
+    prelude::{Command, CommandResult, FullStateMachine, ZoneConsensus},
 };
 use contracts::{
     constants::CONTROL_NS_REPLICA,
+    node_identity::{NodeIdentity, NodeIdentityOutcome, NodeIdentityRequest},
     replica_binding::{
         ReplicaAllocation, ReplicaBinding, ReplicaBindingOutcome, ReplicaBindingRequest,
+    },
+    replica_credential::{
+        ReplicaCredential, ReplicaIssuanceOutcome, ReplicaIssuanceRequest, ReplicaIssuerAuthority,
     },
 };
 
@@ -38,6 +42,46 @@ impl RaftReplicaBindingStore {
         }
     }
 
+    /// Publish issuance facts using the same authority as allocation changes.
+    /// The trusted caller validates controller/CSR possession and retains the
+    /// original request; Unknown is reconciled with that exact operation.
+    pub fn issue(
+        &self,
+        request: &ReplicaIssuanceRequest,
+    ) -> Result<ReplicaIssuanceOutcome, ReplicaBindingError> {
+        request.validate().map_err(ReplicaBindingError::Invalid)?;
+        self.commit(Command::ApplyReplicaIssuance(Box::new(request.clone())))
+    }
+
+    pub fn issuer_authority(&self) -> Result<Option<ReplicaIssuerAuthority>, ReplicaBindingError> {
+        self.inner
+            .read_linearizable(|sm| sm.replica_issuer_authority())
+            .map_err(ReplicaBindingError::Unavailable)?
+            .map_err(|error| ReplicaBindingError::Unavailable(error.to_string()))
+    }
+
+    pub fn credential(&self, id: &str) -> Result<Option<ReplicaCredential>, ReplicaBindingError> {
+        contracts::validate_operation_id(id)
+            .map_err(|error| ReplicaBindingError::Invalid(error.to_string()))?;
+        let id = id.to_owned();
+        self.inner
+            .read_linearizable(move |sm| sm.replica_credential(&id))
+            .map_err(ReplicaBindingError::Unavailable)?
+            .map_err(|error| ReplicaBindingError::Unavailable(error.to_string()))
+    }
+
+    pub fn reconcile_issuance(
+        &self,
+        request: &ReplicaIssuanceRequest,
+    ) -> Result<Option<ReplicaIssuanceOutcome>, ReplicaBindingError> {
+        request.validate().map_err(ReplicaBindingError::Invalid)?;
+        let request = request.clone();
+        self.inner
+            .read_linearizable(move |sm| sm.replica_issuance_receipt(&request))
+            .map_err(ReplicaBindingError::Unavailable)?
+            .map_err(|error| ReplicaBindingError::Unavailable(error.to_string()))
+    }
+
     /// One proposal, with revision check and receipt at apply. The caller
     /// retains this exact request before submission and reconciles it on
     /// Unknown; it does not allocate another identity after a lost reply.
@@ -46,12 +90,30 @@ impl RaftReplicaBindingStore {
         request: &ReplicaBindingRequest,
     ) -> Result<ReplicaBindingOutcome, ReplicaBindingError> {
         request.validate().map_err(ReplicaBindingError::Invalid)?;
+        self.commit(Command::ApplyReplicaBinding(Box::new(request.clone())))
+    }
+
+    /// Reserve a founder/enrolled Node identity in the same ID index as replica
+    /// allocation. A new operation cannot reclaim an existing ID, even with
+    /// the same public key. Enrollment retains its original operation to retry.
+    pub fn reserve_node(
+        &self,
+        request: &NodeIdentityRequest,
+    ) -> Result<NodeIdentityOutcome, ReplicaBindingError> {
+        request.validate().map_err(ReplicaBindingError::Invalid)?;
+        self.commit(Command::ReserveNodeIdentity(Box::new(request.clone())))
+    }
+
+    fn commit<T: serde::de::DeserializeOwned>(
+        &self,
+        command: Command,
+    ) -> Result<T, ReplicaBindingError> {
         if !self.inner.supports_replica_binding() {
             return Err(ReplicaBindingError::Unsupported);
         }
         let result = self
             .inner
-            .commit_replica_binding(request.clone())
+            .commit_replica_control(command)
             .map_err(ReplicaBindingError::Unknown)?;
         let CommandResult::Value(bytes) = result else {
             return Err(ReplicaBindingError::Unknown(
@@ -64,6 +126,31 @@ impl RaftReplicaBindingStore {
             .read_barrier()
             .map_err(ReplicaBindingError::Unknown)?;
         Ok(outcome)
+    }
+
+    /// Read the retained Node key binding at one control-zone ReadIndex.
+    pub fn node_identity(&self, id: u64) -> Result<Option<NodeIdentity>, ReplicaBindingError> {
+        if id == 0 {
+            return Err(ReplicaBindingError::Invalid("Node ID is zero".into()));
+        }
+        self.inner
+            .read_linearizable(move |sm| sm.node_identity(id))
+            .map_err(ReplicaBindingError::Unavailable)?
+            .map_err(|e| ReplicaBindingError::Unavailable(e.to_string()))
+    }
+
+    /// Recover the exact original Node reservation. An absent receipt remains
+    /// unresolved while a previously submitted proposal can still commit.
+    pub fn reconcile_node(
+        &self,
+        request: &NodeIdentityRequest,
+    ) -> Result<Option<NodeIdentityOutcome>, ReplicaBindingError> {
+        request.validate().map_err(ReplicaBindingError::Invalid)?;
+        let request = request.clone();
+        self.inner
+            .read_linearizable(move |sm| sm.node_identity_receipt(&request))
+            .map_err(ReplicaBindingError::Unavailable)?
+            .map_err(|e| ReplicaBindingError::Unavailable(e.to_string()))
     }
 
     /// Observe the authoritative current generation at one ReadIndex.
