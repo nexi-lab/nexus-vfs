@@ -2,7 +2,12 @@
 //! sign ONLY a committed intent through the existing CA loader and rcgen signer.
 
 use super::*;
-use contracts::{AgentCertificateIntent, SignedAgentCertificate};
+use contracts::{
+    credential_intent::{CertificateIntent, CertificateIntentRef},
+    replica_binding::ReplicaBinding,
+    replica_credential::{ReplicaCertificateIntent, ReplicaIssuerAuthority},
+    AgentCertificateIntent, SignedAgentCertificate,
+};
 use rcgen::{PublicKeyData, SignatureAlgorithm, SigningKey, SubjectPublicKeyInfo};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
@@ -93,9 +98,16 @@ fn public_issuer(ca_pem: &[u8]) -> Result<(Vec<u8>, SubjectPublicKeyInfo, i64), 
 
 fn params_for_intent(intent: &AgentCertificateIntent) -> Result<CertificateParams, String> {
     intent.validate_shape()?;
-    let mut params =
+    let params =
         agent_certificate_params(&intent.agent_name, None, time::Duration::days(90), None)?;
-    params.serial_number = Some(rcgen::SerialNumber::from_slice(&intent.serial));
+    with_committed_fields(params, intent.certificate())
+}
+
+fn with_committed_fields(
+    mut params: CertificateParams,
+    intent: CertificateIntentRef<'_>,
+) -> Result<CertificateParams, String> {
+    params.serial_number = Some(rcgen::SerialNumber::from_slice(intent.serial));
     params.not_before = time::OffsetDateTime::from_unix_timestamp(intent.not_before_unix_s)
         .map_err(|_| "invalid intent start")?;
     params.not_after = time::OffsetDateTime::from_unix_timestamp(intent.not_after_unix_s)
@@ -111,20 +123,72 @@ pub fn prepare_agent_csr_intent(
     csr_pem: &[u8],
     ca_pem: &[u8],
 ) -> Result<AgentCertificateIntent, String> {
+    let params = agent_certificate_params(name, None, time::Duration::days(90), None)?;
+    let fields = prepare_certificate_intent(params, csr_pem, ca_pem)?;
+    let intent = AgentCertificateIntent {
+        version: 1,
+        agent_name: name.into(),
+        issuer_sha256: fields.issuer_sha256,
+        subject_public_key_info_der: fields.subject_public_key_info_der,
+        serial: fields.serial,
+        not_before_unix_s: fields.not_before_unix_s,
+        not_after_unix_s: fields.not_after_unix_s,
+        tbs_certificate_der: fields.tbs_certificate_der,
+    };
+    intent.validate_shape()?;
+    Ok(intent)
+}
+
+/// Prepare a short-lived owner replica certificate using the holder's CSR.
+/// The native issuer supplies the current binding and admitted CA revision.
+/// The returned public intent must commit before any private-key signing.
+pub fn prepare_replica_csr_intent(
+    binding: &ReplicaBinding,
+    authority: &ReplicaIssuerAuthority,
+    subject_name: &str,
+    validity_secs: u64,
+    csr_pem: &[u8],
+    ca_pem: &[u8],
+) -> Result<ReplicaCertificateIntent, String> {
+    binding.validate()?;
+    let params = user_replica_certificate_params(
+        subject_name,
+        &binding.allocation.owner_id,
+        binding.replica_id,
+        validity_secs,
+    )?;
+    let certificate = prepare_certificate_intent(params, csr_pem, ca_pem)?;
+    if authority.issuer_sha256 != Some(certificate.issuer_sha256) {
+        return Err("replica issuer does not match admitted CA".into());
+    }
+    let intent = ReplicaCertificateIntent {
+        version: 1,
+        binding: binding.clone(),
+        issuer_revision: authority.revision,
+        subject_name: subject_name.into(),
+        certificate,
+    };
+    intent.validate_shape()?;
+    Ok(intent)
+}
+
+fn prepare_certificate_intent(
+    mut params: CertificateParams,
+    csr_pem: &[u8],
+    ca_pem: &[u8],
+) -> Result<CertificateIntent, String> {
     use rand::Rng;
     let key = verified_csr_key(csr_pem)?;
     let (ca_der, public_key, issuer_expiry) = public_issuer(ca_pem)?;
-    let start = time::OffsetDateTime::now_utc().unix_timestamp();
-    let expiry = (start + 90 * 86400).min(issuer_expiry);
+    let start = params.not_before.unix_timestamp();
+    let expiry = params.not_after.unix_timestamp().min(issuer_expiry);
     if expiry <= start {
         return Err("issuer has no remaining validity".into());
     }
     let mut serial = [0u8; 20];
     rand::rng().fill_bytes(&mut serial);
     serial[0] = (serial[0] & 0x7f) | 1;
-    let mut intent = AgentCertificateIntent {
-        version: 1,
-        agent_name: name.into(),
+    let mut intent = CertificateIntent {
         issuer_sha256: Sha256::digest(&ca_der).into(),
         subject_public_key_info_der: key.subject_public_key_info(),
         serial: serial.to_vec(),
@@ -133,7 +197,7 @@ pub fn prepare_agent_csr_intent(
         // Filled by the public-key-only serializer, never persisted as this placeholder.
         tbs_certificate_der: vec![0],
     };
-    let params = params_for_intent(&intent)?;
+    params = with_committed_fields(params, intent.as_ref())?;
     let capture = CaptureTbs {
         public_key,
         captured: RefCell::new(None),
@@ -149,7 +213,6 @@ pub fn prepare_agent_csr_intent(
         .captured
         .into_inner()
         .ok_or("failed to serialize unsigned certificate")?;
-    intent.validate_shape()?;
     Ok(intent)
 }
 
@@ -161,16 +224,48 @@ pub fn sign_committed_agent_intent(
     ca_key_pem: &[u8],
 ) -> Result<SignedAgentCertificate, String> {
     let params = params_for_intent(intent)?;
+    sign_committed_certificate(params, intent.certificate(), ca_pem, ca_key_pem)
+}
+
+/// Sign the exact committed replica profile. Current allocation and issuer
+/// authorization are enforced by the native publication coordinator.
+pub fn sign_committed_replica_intent(
+    intent: &ReplicaCertificateIntent,
+    ca_pem: &[u8],
+    ca_key_pem: &[u8],
+) -> Result<SignedAgentCertificate, String> {
+    intent.validate_shape()?;
+    let fields = intent.certificate.as_ref();
+    let params = user_replica_certificate_params(
+        &intent.subject_name,
+        &intent.binding.allocation.owner_id,
+        intent.binding.replica_id,
+        (fields.not_after_unix_s - fields.not_before_unix_s) as u64,
+    )?;
+    sign_committed_certificate(
+        with_committed_fields(params, fields)?,
+        fields,
+        ca_pem,
+        ca_key_pem,
+    )
+}
+
+fn sign_committed_certificate(
+    params: CertificateParams,
+    intent: CertificateIntentRef<'_>,
+    ca_pem: &[u8],
+    ca_key_pem: &[u8],
+) -> Result<SignedAgentCertificate, String> {
     let (ca_der, public_key, expiry) = public_issuer(ca_pem)?;
     let actual_fingerprint: [u8; 32] = Sha256::digest(&ca_der).into();
-    if actual_fingerprint != intent.issuer_sha256 || intent.not_after_unix_s > expiry {
+    if &actual_fingerprint != intent.issuer_sha256 || intent.not_after_unix_s > expiry {
         return Err("committed intent issuer changed".into());
     }
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
     if now < intent.not_before_unix_s || now >= intent.not_after_unix_s {
         return Err("committed intent is not current; operator recovery required".into());
     }
-    let subject = SubjectPublicKeyInfo::from_der(&intent.subject_public_key_info_der)
+    let subject = SubjectPublicKeyInfo::from_der(intent.subject_public_key_info_der)
         .map_err(|_| "invalid committed SPKI")?;
     if subject.algorithm() != &PKCS_ECDSA_P256_SHA256 {
         return Err("committed subject must use P-256".into());
@@ -183,7 +278,7 @@ pub fn sign_committed_agent_intent(
     }
     let guarded = CommittedTbsKey {
         key: ca.key(),
-        expected: &intent.tbs_certificate_der,
+        expected: intent.tbs_certificate_der,
     };
     let ca_str = std::str::from_utf8(ca_pem).map_err(|_| "invalid issuer PEM encoding")?;
     let issuer =
