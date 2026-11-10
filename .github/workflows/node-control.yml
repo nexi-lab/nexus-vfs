@@ -8,6 +8,8 @@ on:
       - 'rust/raft/**'
       - 'rust/contracts/src/replica_binding.rs'
       - 'rust/contracts/src/node_identity.rs'
+      - 'rust/contracts/src/credential_intent.rs'
+      - 'rust/contracts/src/replica_credential.rs'
       - 'rust/kernel/src/abc/meta_store.rs'
       - 'rust/kernel/src/core/meta_store/**'
       - 'rust/kernel/src/extensions/conditional_metadata.rs'
