@@ -244,10 +244,15 @@ impl<S: NamedService> NodeControlService<S> {
 impl<S: NamedService> NamedService for NodeControlService<S> {
     const NAME: &'static str = S::NAME;
 }
-impl<S> Service<http::Request<Body>> for NodeControlService<S>
+impl<S, E> Service<http::Request<Body>> for NodeControlService<S>
 where
-    S: Service<http::Request<Body>, Response = http::Response<Body>> + Send + 'static,
-    S::Future: Send + 'static,
+    S: Service<
+            http::Request<Body>,
+            Response = http::Response<Body>,
+            Error = E,
+            Future = BoxFuture<http::Response<Body>, E>,
+        > + Send
+        + 'static,
 {
     type Response = http::Response<Body>;
     type Error = S::Error;
@@ -255,13 +260,11 @@ where
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
     }
-    // Keep generated RPC dispatch separate from the router's per-service adapter.
-    #[inline(never)]
     fn call(&mut self, mut request: http::Request<Body>) -> Self::Future {
         if let Err(status) = self.admission.check(&mut request) {
             return Box::pin(async move { Ok(status.into_http()) });
         }
-        Box::pin(self.inner.call(request))
+        self.inner.call(request)
     }
 }
 
