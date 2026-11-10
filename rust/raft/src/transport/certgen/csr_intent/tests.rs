@@ -153,7 +153,8 @@ fn replica_fixture() -> (ReplicaCertificateIntent, Vec<u8>, Vec<u8>) {
     let holder = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
     let mut request = CertificateParams::default();
     request.subject_alt_names = vec![SanType::URI("nexus://node/1".try_into().unwrap())];
-    request.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    request.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    request.extended_key_usages = vec![ExtendedKeyUsagePurpose::CodeSigning];
     let csr = request.serialize_request(&holder).unwrap().pem().unwrap();
     let intent = prepare_replica_csr_intent(
         &binding,
@@ -190,6 +191,10 @@ fn replica_csr_uses_current_owner_profile_and_ignores_requested_privileges() {
         .is_some_and(|value| value.value.ca));
     let eku = parsed.extended_key_usage().unwrap().unwrap();
     assert!(eku.value.client_auth && eku.value.server_auth);
+    assert!(!eku.value.code_signing);
+    let usage = parsed.key_usage().unwrap().unwrap();
+    assert!(usage.value.digital_signature());
+    assert!(!usage.value.key_cert_sign() && !usage.value.crl_sign());
     let san = parsed.subject_alternative_name().unwrap().unwrap();
     let sans = &san.value.general_names;
     let dns = lib::transport_primitives::user_runtime_server_name("owner-a").unwrap();
@@ -297,6 +302,29 @@ fn replica_preparation_requires_current_authority_and_short_lifetime() {
         &intent.subject_name,
         300,
         b"not a signed CSR",
+        &ca
+    )
+    .is_err());
+    // Encode the requested CA constraint explicitly: rcgen's CSR builder
+    // supports custom extensions but rejects its certificate-only is_ca field.
+    let mut ca_request = CertificateParams::default();
+    ca_request
+        .custom_extensions
+        .push(rcgen::CustomExtension::from_oid_content(
+            &[2, 5, 29, 19],
+            vec![0x30, 0x03, 0x01, 0x01, 0xff],
+        ));
+    let ca_csr = ca_request
+        .serialize_request(&holder)
+        .unwrap()
+        .pem()
+        .unwrap();
+    assert!(prepare_replica_csr_intent(
+        &intent.binding,
+        &authority,
+        &intent.subject_name,
+        300,
+        ca_csr.as_bytes(),
         &ca
     )
     .is_err());
