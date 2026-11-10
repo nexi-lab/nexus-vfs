@@ -702,11 +702,11 @@ async fn ec_decode_failures_preserve_replication_positions_until_complete_retry(
     let mut sender = RaftClient::connect(
         &server.endpoint,
         ClientConfig {
-            tls: Some(TlsConfig {
+            tls: Arc::new(std::sync::RwLock::new(Some(TlsConfig {
                 ca_pem: ca,
                 cert_pem: cert,
                 key_pem: key,
-            }),
+            }))),
             ..Default::default()
         },
     )
