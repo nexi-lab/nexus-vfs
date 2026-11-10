@@ -29,6 +29,7 @@ pub struct VerifiedSessionRenewal {
 
 /// Verify the existing key, issuer, credential lifetime and requester binding.
 /// Revocation and the replicated minter allow-list are the issuer's policy.
+#[inline(never)]
 pub fn verify_session_renewal(
     renewal: &SessionRenewal<'_>,
     caller_cert_der: &[u8],
