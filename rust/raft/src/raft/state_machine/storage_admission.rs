@@ -14,6 +14,7 @@ pub(super) enum StorageFormat {
     GuardedRecords,
     RecordIo,
     ReplicaBinding,
+    NodeIdentity,
 }
 
 impl StorageFormat {
@@ -23,6 +24,7 @@ impl StorageFormat {
             Self::GuardedRecords => b"guarded-records-v1",
             Self::RecordIo => b"guarded-record-io-v1",
             Self::ReplicaBinding => b"replica-binding-v1",
+            Self::NodeIdentity => b"node-identity-v1",
         }
     }
 
@@ -33,6 +35,7 @@ impl StorageFormat {
             Some(b"guarded-records-v1") => Ok(Some(Self::GuardedRecords)),
             Some(b"guarded-record-io-v1") => Ok(Some(Self::RecordIo)),
             Some(b"replica-binding-v1") => Ok(Some(Self::ReplicaBinding)),
+            Some(b"node-identity-v1") => Ok(Some(Self::NodeIdentity)),
             Some(_) => Err(storage_error("unsupported control storage format")),
         }
     }
@@ -40,7 +43,7 @@ impl StorageFormat {
     fn validate_policy(self, policy: MembershipPolicy) -> Result<()> {
         if policy != MembershipPolicy::FixedLocal {
             let records = match self {
-                Self::ReplicaBinding => "replica-binding records",
+                Self::ReplicaBinding | Self::NodeIdentity => "replica-binding records",
                 _ => "protected records",
             };
             return Err(RaftError::Config(format!(
@@ -167,6 +170,7 @@ mod tests {
             StorageFormat::GuardedRecords,
             StorageFormat::RecordIo,
             StorageFormat::ReplicaBinding,
+            StorageFormat::NodeIdentity,
         ] {
             let txn = state.control_state.raw_db().begin_write().unwrap();
             state.require_storage_format_in_txn(&txn, floor).unwrap();

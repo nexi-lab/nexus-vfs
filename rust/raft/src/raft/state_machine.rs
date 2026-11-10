@@ -23,6 +23,7 @@ use super::Result;
 
 mod conditional_metadata;
 mod metadata_rename;
+mod node_identity;
 mod protected_metadata;
 mod record_guard;
 mod replica_binding;
@@ -326,6 +327,9 @@ pub enum Command {
     /// Atomically update the native replica binding and its original-operation
     /// receipt in the existing control tree. Appended to preserve log indices.
     ApplyReplicaBinding(Box<contracts::replica_binding::ReplicaBindingRequest>),
+    /// Reserve an enrolled Node ID against the same durable identity index as
+    /// replica bindings. Appended to preserve existing command discriminants.
+    ReserveNodeIdentity(Box<contracts::node_identity::NodeIdentityRequest>),
 }
 
 impl Command {
@@ -340,6 +344,7 @@ impl Command {
                 | Self::RetireRecordGuard { .. }
                 | Self::AdmitRecordIoOwner { .. }
                 | Self::ApplyReplicaBinding(_)
+                | Self::ReserveNodeIdentity(_)
         )
     }
 
@@ -1913,7 +1918,7 @@ impl FullStateMachine {
                 | Command::AdmitRecordIoOwner { .. } => Err(super::RaftError::InvalidState(
                 "versioned metadata requires a Raft-committed transaction".into(),
             )),
-            Command::ApplyReplicaBinding(_) => Err(super::RaftError::InvalidState(
+            Command::ApplyReplicaBinding(_) | Command::ReserveNodeIdentity(_) => Err(super::RaftError::InvalidState(
                 "replica binding requires a Raft-committed transaction".into(),
             )),
             Command::PutControlState {
@@ -2325,6 +2330,7 @@ impl FullStateMachine {
             }
 
             Command::ApplyReplicaBinding(request) => self.apply_replica_binding(txn, request),
+            Command::ReserveNodeIdentity(request) => self.reserve_node_identity(txn, request),
 
             Command::WriteVersionedMetadata {
                 key,

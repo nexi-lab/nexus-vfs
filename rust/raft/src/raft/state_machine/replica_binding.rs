@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 impl Command {
     pub(crate) fn requires_replica_sc(&self) -> bool {
         match self {
-            Self::ApplyReplicaBinding(_) => true,
+            Self::ApplyReplicaBinding(_) | Self::ReserveNodeIdentity(_) => true,
             Self::PutControlState { namespace, .. }
             | Self::DeleteControlState { namespace, .. } => namespace == NAMESPACE,
             _ => false,
@@ -24,9 +24,9 @@ impl Command {
 }
 
 #[derive(Serialize, Deserialize)]
-struct Receipt {
-    request_hash: [u8; 32],
-    outcome: ReplicaBindingOutcome,
+pub(super) struct Receipt<T> {
+    pub(super) request_hash: [u8; 32],
+    pub(super) outcome: T,
 }
 
 pub(crate) fn allocation_key(allocation: &ReplicaAllocation) -> String {
@@ -39,12 +39,16 @@ fn operation_key(request: &ReplicaBindingRequest) -> String {
     format!("operation:{}", request.operation_id)
 }
 
-fn request_hash(request: &ReplicaBindingRequest) -> [u8; 32] {
+pub(super) fn request_hash(request: &impl Serialize) -> [u8; 32] {
     *blake3::hash(&bincode::serialize(request).expect("request serialization")).as_bytes()
 }
 
-fn storage_error(error: impl std::fmt::Display) -> super::super::RaftError {
+pub(super) fn storage_error(error: impl std::fmt::Display) -> super::super::RaftError {
     super::super::RaftError::Storage(format!("replica binding: {error}"))
+}
+
+pub(super) fn node_key(id: u64) -> Vec<u8> {
+    control_key(NAMESPACE, &format!("node:{id}"))
 }
 
 fn decode_binding(bytes: &[u8], allocation: &ReplicaAllocation) -> Result<ReplicaBinding> {
@@ -59,9 +63,13 @@ fn decode_binding(bytes: &[u8], allocation: &ReplicaAllocation) -> Result<Replic
 impl FullStateMachine {
     #[cfg(any(test, all(feature = "grpc", has_protos)))]
     pub(crate) fn replica_binding_by_id(&self, id: u64) -> Result<Option<ReplicaBinding>> {
-        let Some(pointer) = self.get_control_state(NAMESPACE, &format!("node:{id}"))? else {
+        let Some(pointer) = self.control_state.get(&node_key(id))? else {
             return Ok(None);
         };
+        if pointer == super::node_identity::identity_key(id) {
+            self.node_identity(id)?;
+            return Ok(None);
+        }
         if !pointer.starts_with(&control_key(NAMESPACE, "allocation:")) {
             return Err(storage_error("invalid replica allocation reference"));
         }
@@ -94,7 +102,7 @@ impl FullStateMachine {
     ) -> Result<Option<ReplicaBindingOutcome>> {
         self.get_control_state(NAMESPACE, &operation_key(request))?
             .map(|bytes| {
-                let receipt: Receipt = bincode::deserialize(&bytes)?;
+                let receipt: Receipt<ReplicaBindingOutcome> = bincode::deserialize(&bytes)?;
                 Ok(if receipt.request_hash == request_hash(request) {
                     receipt.outcome
                 } else {
@@ -124,7 +132,7 @@ impl FullStateMachine {
         let receipt_key = control_key(NAMESPACE, &operation_key(request));
         let digest = request_hash(request);
         if let Some(bytes) = table.get(receipt_key.as_slice()).map_err(storage_error)? {
-            let receipt: Receipt = bincode::deserialize(bytes.value())?;
+            let receipt: Receipt<ReplicaBindingOutcome> = bincode::deserialize(bytes.value())?;
             let outcome = if receipt.request_hash == digest {
                 receipt.outcome
             } else {
@@ -145,7 +153,7 @@ impl FullStateMachine {
                     request.change,
                     ReplicaBindingChange::Register { .. } | ReplicaBindingChange::Replace { .. }
                 );
-                let id_key = control_key(NAMESPACE, &format!("node:{}", binding.replica_id));
+                let id_key = node_key(binding.replica_id);
                 let occupied = reserve
                     && table
                         .get(id_key.as_slice())

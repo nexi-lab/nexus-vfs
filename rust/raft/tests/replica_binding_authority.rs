@@ -3,6 +3,7 @@
 //! exercised by the issuer composition, separately from this store boundary.
 #![cfg(all(feature = "grpc", has_protos))]
 
+use contracts::node_identity::{NodeIdentity, NodeIdentityOutcome, NodeIdentityRequest};
 use contracts::replica_binding::{
     ReplicaAllocation, ReplicaBindingChange, ReplicaBindingOutcome, ReplicaBindingRequest,
     ReplicaBindingState, ReplicaStorage,
@@ -57,6 +58,118 @@ fn request(operation: &str, id: u64) -> ReplicaBindingRequest {
             replica_id: id,
         },
     }
+}
+
+fn node_request(operation: &str, id: u64) -> NodeIdentityRequest {
+    NodeIdentityRequest {
+        operation_id: operation.into(),
+        identity: NodeIdentity {
+            node_id: id,
+            subject_public_key_sha256: [3; 32],
+        },
+    }
+}
+
+#[test]
+fn node_and_replica_claims_race_on_the_same_retained_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = LocalAuthority::open(dir.path());
+    let gate = Arc::new(Barrier::new(2));
+    let node = node_request("native-node", 701);
+    let replica = request("owner-replica", 701);
+    let worker = {
+        let store = authority.store.clone();
+        let gate = gate.clone();
+        let node = node.clone();
+        std::thread::spawn(move || {
+            gate.wait();
+            store.reserve_node(&node).unwrap()
+        })
+    };
+    gate.wait();
+    let replica_result = authority.store.apply(&replica).unwrap();
+    let node_result = worker.join().unwrap();
+    match (&node_result, &replica_result) {
+        (NodeIdentityOutcome::Reserved(identity), ReplicaBindingOutcome::ReplicaIdReserved) => {
+            assert_eq!(
+                authority.store.node_identity(701).unwrap().as_ref(),
+                Some(identity)
+            );
+            assert_eq!(authority.store.current_for_replica(701).unwrap(), None);
+            assert_eq!(authority.store.current(&replica.allocation).unwrap(), None);
+        }
+        (NodeIdentityOutcome::IdReserved, ReplicaBindingOutcome::Applied(binding)) => {
+            assert_eq!(authority.store.node_identity(701).unwrap(), None);
+            assert_eq!(
+                authority.store.current_for_replica(701).unwrap().as_ref(),
+                Some(binding)
+            );
+        }
+        other => panic!("exactly one native identity must own the ID: {other:?}"),
+    }
+    assert_eq!(
+        authority.store.reconcile_node(&node).unwrap(),
+        Some(node_result.clone())
+    );
+    assert_eq!(
+        authority.store.reconcile(&replica).unwrap(),
+        Some(replica_result.clone())
+    );
+    assert_eq!(authority.store.reserve_node(&node).unwrap(), node_result);
+    assert_eq!(authority.store.apply(&replica).unwrap(), replica_result);
+}
+
+#[test]
+fn node_enrollment_recovers_original_key_and_excludes_replacement_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = node_request("original-node-key", 702);
+    {
+        let authority = LocalAuthority::open(dir.path());
+        assert!(matches!(
+            authority.store.reserve_node(&original).unwrap(),
+            NodeIdentityOutcome::Reserved(_)
+        ));
+    }
+    let authority = LocalAuthority::open(dir.path());
+    let expected = NodeIdentityOutcome::Reserved(original.identity.clone());
+    assert_eq!(
+        authority.store.reconcile_node(&original).unwrap(),
+        Some(expected.clone())
+    );
+    assert_eq!(authority.store.reserve_node(&original).unwrap(), expected);
+    let mut changed = original.clone();
+    changed.identity.subject_public_key_sha256 = [4; 32];
+    assert_eq!(
+        authority.store.reserve_node(&changed).unwrap(),
+        NodeIdentityOutcome::OperationMismatch
+    );
+    assert_eq!(
+        authority.store.reconcile_node(&changed).unwrap(),
+        Some(NodeIdentityOutcome::OperationMismatch)
+    );
+    changed.operation_id = "replacement-node-key".into();
+    assert_eq!(
+        authority.store.reserve_node(&changed).unwrap(),
+        NodeIdentityOutcome::IdReserved
+    );
+    assert_eq!(
+        authority
+            .store
+            .apply(&request("reuse-node-for-replica", 702))
+            .unwrap(),
+        ReplicaBindingOutcome::ReplicaIdReserved
+    );
+    assert_eq!(
+        authority.store.node_identity(702).unwrap(),
+        Some(original.identity)
+    );
+    assert_eq!(
+        authority
+            .store
+            .reconcile_node(&node_request("unobserved", 703))
+            .unwrap(),
+        None
+    );
 }
 
 #[test]
@@ -251,6 +364,19 @@ async fn managed_control_refuses_before_unactivated_command_enters_the_log() {
     ));
     assert!(node
         .propose(Command::ApplyReplicaBinding(Box::new(request.clone())))
+        .await
+        .is_err());
+    let node_request = node_request("managed-node-refusal", 102);
+    assert!(matches!(
+        store.reserve_node(&node_request),
+        Err(ReplicaBindingError::Unsupported)
+    ));
+    assert!(node
+        .propose(Command::ReserveNodeIdentity(Box::new(node_request.clone())))
+        .await
+        .is_err());
+    assert!(node
+        .propose_ec(Command::ReserveNodeIdentity(Box::new(node_request)))
         .await
         .is_err());
     assert_eq!(node.last_index(), before);

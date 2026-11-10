@@ -35,6 +35,16 @@ The native allocator chooses the replica ID. Its reservations cover enrolled
 Node identities and replica identities in the same issuer authority. The
 binding store retains replica reservations across retirement and replacement.
 
+`reserve_node(request)` records an enrolled Node ID and the SHA-256 of its
+verified public key. `node_identity(id)` and `reconcile_node(request)` read
+the retained identity and original operation receipt through the same authority.
+Node enrollment and replica allocation contend on the same `node:<id>` index.
+Each reservation retains its original holder across retries and cold restart.
+The controller records the original operation and verified key before submitting
+it. Enrollment retries recover that exact operation; an existing identity's key
+rotation requires a separate authenticated transition. Founder enrollment uses
+the existing native Node ID and public key at this boundary.
+
 The control-zone state machine applies each transition, replica reservation
 and operation receipt in the same transaction as its Raft last-applied marker
 and minimum storage-reader format. The format requirement increases monotonically
@@ -43,6 +53,10 @@ Boot and snapshot admission check that the reader supports the retained format
 and that its membership policy qualifies the stored records.
 Generic control writes are refused for this owned namespace. EC admission
 requires these mutations to use the consensus path.
+
+Node reservation uses the `node-identity-v1` reader floor at that same admission
+key. Its ID record, public-key binding, original receipt and last-applied marker
+commit in one transaction. Existing allocation references retain their format.
 
 | Transition | Required current state | Result |
 |---|---|---|
@@ -116,6 +130,11 @@ an unactivated command enters the log. State-machine tests cover snapshot restor
 identity reservation retention, stale revisions, payload mismatch and refusal
 of generic/EC writes. The Node-control CI matrix runs these on Linux, Windows
 and macOS.
+
+The same real-Raft suite races Node enrollment against replica allocation and
+recovers the original public-key binding after restart. Durable-admission tests
+cover Node-only applied, compacted and snapshot images; the previous-reader
+fixture opens those images as well as replica images before any restore.
 
 `test_durable_storage_admission.rs` covers applied and compacted restart,
 snapshot-only recovery, incoming snapshot refusal and successful fixed-local

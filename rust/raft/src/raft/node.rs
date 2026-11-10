@@ -1438,17 +1438,21 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
     /// Managed membership needs protocol activation before this command can
     /// enter its log or be forwarded to another binary.
     #[cfg(all(feature = "grpc", has_protos))]
-    pub(crate) async fn commit_replica_binding(
-        &self,
-        request: contracts::replica_binding::ReplicaBindingRequest,
-    ) -> Result<CommandResult> {
+    pub(crate) async fn commit_replica_control(&self, command: Command) -> Result<CommandResult> {
         if !self.supports_replica_binding() {
             return Err(RaftError::UnsupportedOperation(
                 "replica binding protocol is not activated",
             ));
         }
-        self.submit_conditional_storage(Command::ApplyReplicaBinding(Box::new(request)))
-            .await
+        if !matches!(
+            command,
+            Command::ApplyReplicaBinding(_) | Command::ReserveNodeIdentity(_)
+        ) {
+            return Err(RaftError::InvalidState(
+                "not a replica control command".into(),
+            ));
+        }
+        self.submit_conditional_storage(command).await
     }
 
     #[cfg(all(feature = "grpc", has_protos))]

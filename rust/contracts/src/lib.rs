@@ -10,6 +10,7 @@ pub mod agent_pid;
 pub mod constants;
 pub mod credential_intent;
 pub mod lock_state;
+pub mod node_identity;
 pub mod operation_context;
 pub mod operation_id;
 pub mod replica_binding;

@@ -125,11 +125,8 @@ impl ControlStateStore {
         self.node.supports_replica_binding()
     }
 
-    pub(crate) fn commit_replica_binding(
-        &self,
-        request: contracts::replica_binding::ReplicaBindingRequest,
-    ) -> Result<CommandResult, String> {
-        bridge_block_on(&self.runtime, self.node.commit_replica_binding(request))
+    pub(crate) fn commit_replica_control(&self, command: Command) -> Result<CommandResult, String> {
+        bridge_block_on(&self.runtime, self.node.commit_replica_control(command))
             .map_err(|e| format!("replica binding proposal: {e}"))
     }
 

@@ -2,6 +2,7 @@
 //! storage admission boundary, including tombstones and retired allocations.
 #![cfg(all(feature = "grpc", has_protos))]
 
+use contracts::node_identity::{NodeIdentity, NodeIdentityOutcome, NodeIdentityRequest};
 use contracts::replica_binding::{
     ReplicaAllocation, ReplicaBindingChange, ReplicaBindingOutcome, ReplicaBindingRequest,
     ReplicaStorage,
@@ -30,20 +31,24 @@ enum Case {
     ContentDeleted,
     Replica,
     ReplicaRetired,
+    Node,
 }
 
-const CASES: [Case; 4] = [
+const CASES: [Case; 5] = [
     Case::Content,
     Case::ContentDeleted,
     Case::Replica,
     Case::ReplicaRetired,
+    Case::Node,
 ];
 
 impl Case {
     fn namespace(self) -> &'static str {
         match self {
             Self::Content | Self::ContentDeleted => "content-version-v1",
-            Self::Replica | Self::ReplicaRetired => contracts::constants::CONTROL_NS_REPLICA,
+            Self::Replica | Self::ReplicaRetired | Self::Node => {
+                contracts::constants::CONTROL_NS_REPLICA
+            }
         }
     }
 }
@@ -69,6 +74,21 @@ fn populate(path: &Path, case: Case) -> u64 {
     let runtime = Runtime::open(path);
     let node = runtime.0.get_zone("root").unwrap().consensus_node().clone();
     match case {
+        Case::Node => {
+            let store = RaftReplicaBindingStore::new(node.clone(), runtime.0.runtime_handle());
+            assert!(matches!(
+                store
+                    .reserve_node(&NodeIdentityRequest {
+                        operation_id: "original-node".into(),
+                        identity: NodeIdentity {
+                            node_id: 52,
+                            subject_public_key_sha256: [5; 32]
+                        },
+                    })
+                    .unwrap(),
+                NodeIdentityOutcome::Reserved(_)
+            ));
+        }
         Case::Content | Case::ContentDeleted => {
             let store = ZoneMetaStore::new_with_subtree(
                 node.clone(),
@@ -178,9 +198,35 @@ fn replica_format_fixtures_for_previous_reader() {
     let destination = std::env::var_os("NEXUS_REPLICA_FORMAT_FIXTURES")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| temporary.path().to_owned());
-    for (name, case, compact) in [
-        ("applied", Case::Replica, false),
-        ("compacted", Case::ReplicaRetired, true),
+    for (name, case, compact, snapshot_name, floor) in [
+        (
+            "applied",
+            Case::Replica,
+            false,
+            "snapshot",
+            b"replica-binding-v1".as_slice(),
+        ),
+        (
+            "compacted",
+            Case::ReplicaRetired,
+            true,
+            "snapshot",
+            b"replica-binding-v1".as_slice(),
+        ),
+        (
+            "node-applied",
+            Case::Node,
+            false,
+            "node-snapshot",
+            b"node-identity-v1".as_slice(),
+        ),
+        (
+            "node-compacted",
+            Case::Node,
+            true,
+            "node-snapshot",
+            b"node-identity-v1".as_slice(),
+        ),
     ] {
         let path = destination.join(name);
         std::fs::create_dir_all(&path).unwrap();
@@ -194,10 +240,10 @@ fn replica_format_fixtures_for_previous_reader() {
                 .get_control_state("content-version-v1", "requires:protected-records-v1")
                 .unwrap()
                 .as_deref(),
-            Some(b"replica-binding-v1".as_slice())
+            Some(floor)
         );
         if compact {
-            install_snapshot(&path, &destination.join("snapshot"), &snapshot);
+            install_snapshot(&path, &destination.join(snapshot_name), &snapshot);
         }
     }
 }

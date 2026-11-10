@@ -23,7 +23,14 @@ fn previous_reader_refuses_applied_compacted_and_snapshot_replica_formats() {
     let fixtures = std::path::PathBuf::from(
         std::env::var_os("NEXUS_REPLICA_FORMAT_FIXTURES").expect("fixture directory"),
     );
-    for fixture in ["applied", "compacted", "snapshot"] {
+    for fixture in [
+        "applied",
+        "compacted",
+        "snapshot",
+        "node-applied",
+        "node-compacted",
+        "node-snapshot",
+    ] {
         let path = fixtures.join(fixture);
         let id = {
             let persistence = ZonePersistence::open(&path, "root").unwrap();
@@ -31,7 +38,7 @@ fn previous_reader_refuses_applied_compacted_and_snapshot_replica_formats() {
             storage.conf_state().unwrap().voters[0]
         };
         let before = durable_contents(&path);
-        if fixture == "snapshot" {
+        if fixture.ends_with("snapshot") {
             assert_eq!(before, (0, vec![]));
         } else {
             assert!(before.0 > 0 && !before.1.is_empty());
