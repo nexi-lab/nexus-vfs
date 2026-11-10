@@ -114,18 +114,33 @@ impl ControlStateStore {
         self.put_inner(key, value, /* if_absent */ true)
     }
 
+    /// Typed stores submit their owning command through the same consensus
+    /// handle. A proposal error may follow a commit and remains unknown.
+    pub(crate) fn propose(&self, command: Command) -> Result<CommandResult, String> {
+        bridge_block_on(&self.runtime, self.node.propose(command))
+            .map_err(|e| format!("control proposal({}): {e}", self.namespace))
+    }
+
+    pub(crate) fn supports_replica_binding(&self) -> bool {
+        self.node.supports_replica_binding()
+    }
+
+    pub(crate) fn commit_replica_binding(
+        &self,
+        request: contracts::replica_binding::ReplicaBindingRequest,
+    ) -> Result<CommandResult, String> {
+        bridge_block_on(&self.runtime, self.node.commit_replica_binding(request))
+            .map_err(|e| format!("replica binding proposal: {e}"))
+    }
+
     fn put_inner(&self, key: &str, value: &[u8], if_absent: bool) -> Result<bool, String> {
         let ns = self.namespace;
-        let result = bridge_block_on(
-            &self.runtime,
-            self.node.propose(Command::PutControlState {
-                namespace: ns.to_string(),
-                key: key.to_string(),
-                value: value.to_vec(),
-                if_absent,
-            }),
-        )
-        .map_err(|e| format!("put({ns}/{key}): {e}"))?;
+        let result = self.propose(Command::PutControlState {
+            namespace: ns.to_string(),
+            key: key.to_string(),
+            value: value.to_vec(),
+            if_absent,
+        })?;
         if let CommandResult::Error(msg) = result {
             // The only expected rejection is the CAS conflict; surface anything
             // else (an upsert must never be refused).
@@ -151,14 +166,10 @@ impl ControlStateStore {
     pub fn delete(&self, key: &str) -> Result<bool, String> {
         let ns = self.namespace;
         let existed = self.get(key)?.is_some();
-        let result = bridge_block_on(
-            &self.runtime,
-            self.node.propose(Command::DeleteControlState {
-                namespace: ns.to_string(),
-                key: key.to_string(),
-            }),
-        )
-        .map_err(|e| format!("delete({ns}/{key}): {e}"))?;
+        let result = self.propose(Command::DeleteControlState {
+            namespace: ns.to_string(),
+            key: key.to_string(),
+        })?;
         if let CommandResult::Error(msg) = result {
             return Err(format!("delete({ns}/{key}) rejected: {msg}"));
         }

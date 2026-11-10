@@ -627,7 +627,8 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
                     }
                 }
                 Err(e) => {
-                    tracing::error!("advance() error: {}", e);
+                    tracing::error!(zone = %self.zone_id, error = %e, "Raft driver stopped; durable recovery required");
+                    break;
                 }
             }
 
