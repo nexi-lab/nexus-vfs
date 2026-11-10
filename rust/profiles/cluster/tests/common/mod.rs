@@ -221,8 +221,9 @@ impl Daemon {
     }
 
     /// Poll until the TCP `port` accepts a connection (came up) or the process
-    /// exits (refused to boot). `Ok(())` = serving; `Err(output)` = it exited
-    /// (with its captured logs) or the budget expired.
+    /// exits (refused to boot). This observes the socket, not datastore or
+    /// data-plane readiness: the Raft listener binds before boot completes.
+    /// Offline storage operations must use [`Self::wait_ready`] instead.
     pub async fn wait_tcp(&mut self, port: u16, budget: Duration) -> Result<(), String> {
         let deadline = Instant::now() + budget;
         while Instant::now() < deadline {
@@ -241,6 +242,13 @@ impl Daemon {
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
         Err(format!("timed out without serving:\n{}", self.drain()))
+    }
+
+    /// Observe the existing production data-plane-ready event after boot has
+    /// wired the kernel and applied topology. Capture INFO with [`LOG_FILTER`]
+    /// when spawning. No probe mutates a store that is still opening.
+    pub async fn wait_ready(&mut self, budget: Duration) -> Result<(), String> {
+        self.wait_for_log("VFS data plane ready", budget).await
     }
 
     /// Did the process exit within `budget`? Returns its captured logs if so.
