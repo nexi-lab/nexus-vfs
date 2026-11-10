@@ -14,7 +14,6 @@ pub fn replica_identity_uri(node_id: u64) -> Result<String, String> {
 
 /// Read the signed replica identity. The caller verifies issuer, lifetime and
 /// possession of the leaf key before using it as an authenticated identity.
-#[inline(never)]
 pub fn replica_node_id_from_x509(cert: &X509Certificate<'_>) -> Result<Option<u64>, String> {
     let Some(san) = cert
         .subject_alternative_name()

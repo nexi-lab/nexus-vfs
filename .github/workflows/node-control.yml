@@ -39,6 +39,7 @@ jobs:
       - run: cargo test --locked -p raft@0.1.0 --lib transport::node_authority::tests
       - name: Owner replica identity and renewal boundaries
         run: |
+          cargo test --locked -p lib --features transport --lib transport_primitives::authorship::tests
           cargo test --locked -p lib --features transport --lib transport_primitives::replica_credential::tests
           cargo test --locked -p raft@0.1.0 --lib transport::certgen::tests::replica_certificate_retains_owner_identity_without_node_authority
           cargo test --locked -p raft@0.1.0 --lib transport::session_renewal::tests

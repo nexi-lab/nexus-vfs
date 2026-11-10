@@ -29,7 +29,6 @@ pub struct VerifiedSessionRenewal {
 
 /// Verify the existing key, issuer, credential lifetime and requester binding.
 /// Revocation and the replicated minter allow-list are the issuer's policy.
-#[inline(never)]
 pub fn verify_session_renewal(
     renewal: &SessionRenewal<'_>,
     caller_cert_der: &[u8],
@@ -67,12 +66,8 @@ pub fn verify_session_renewal(
         renewal.validity_secs,
         renewal.issued_at_unix_ms,
     );
-    let subject_id = lib::transport_primitives::authorship::verify(
-        &message,
-        renewal.proof,
-        renewal.cert_pem,
-        ca_pem,
-    )?;
+    let subject_id =
+        lib::transport_primitives::authorship::verify_x509(&message, renewal.proof, &cert, ca_pem)?;
     if !subject_id.starts_with("session-") {
         return Err("only session credentials can be renewed".into());
     }
