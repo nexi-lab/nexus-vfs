@@ -19,7 +19,7 @@ on:
       - '.github/actions/setup-rust-tests/**'
 
 env:
-  CARGO_BUILD_JOBS: 1
+  CARGO_BUILD_JOBS: 2
 
 defaults:
   run:
@@ -87,7 +87,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust-tests
         with:
-          cache-key: runtime-enrollment-${{ matrix.os }}
+          cache-key: node-control-${{ matrix.os }}
       - run: cargo test --locked -p nexus-cluster --lib
       - name: Enroll, replicate credentials and restore the same Node identity
         run: cargo test --locked -p nexus-cluster --test node_enrollment --test cross_node_sk_replication -- --test-threads=1
@@ -103,7 +103,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust-tests
         with:
-          cache-key: managed-credentials-${{ matrix.os }}
+          cache-key: node-control-${{ matrix.os }}
       - run: cargo test --locked -p nexus-cluster --features experimental-managed-agent-csr --lib managed_csr::tests
       - run: cargo test --locked -p managed-agent --lib credential_binding::tests
       - run: 'cargo test --locked -p nexus-cluster --features experimental-managed-agent-csr --lib managed_csr_binding::'
