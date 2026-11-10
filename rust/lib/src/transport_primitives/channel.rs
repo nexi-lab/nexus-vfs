@@ -38,6 +38,25 @@ async fn connect_channel(
     endpoint: &str,
     config: &ClientConfig,
 ) -> Result<tonic::transport::Channel, TransportError> {
+    let ep = configured_endpoint(endpoint, config)?;
+    match tokio::time::timeout(config.connect_timeout, ep.connect()).await {
+        Ok(result) => result.map_err(TransportError::Tonic),
+        Err(_) => Err(TransportError::Connection(format!(
+            "connect to {endpoint} did not complete within {:?} — the peer may be accepting \
+             connections without completing a handshake",
+            config.connect_timeout
+        ))),
+    }
+}
+
+// URI and certificate preparation completes before the asynchronous dial. Keep
+// its parsing and error paths in one synchronous body across transport callers.
+#[inline(never)]
+#[allow(clippy::result_large_err)]
+fn configured_endpoint(
+    endpoint: &str,
+    config: &ClientConfig,
+) -> Result<tonic::transport::Endpoint, TransportError> {
     let mut uri: tonic::codegen::http::Uri = endpoint
         .parse()
         .map_err(|e| TransportError::InvalidAddress(format!("{e}")))?;
@@ -77,14 +96,7 @@ async fn connect_channel(
         ep = apply_tls(ep, tls)?;
     }
 
-    match tokio::time::timeout(config.connect_timeout, ep.connect()).await {
-        Ok(result) => result.map_err(TransportError::Tonic),
-        Err(_) => Err(TransportError::Connection(format!(
-            "connect to {endpoint} did not complete within {:?} — the peer may be accepting \
-             connections without completing a handshake",
-            config.connect_timeout
-        ))),
-    }
+    Ok(ep)
 }
 
 /// Install the process-level rustls `CryptoProvider` (ring) exactly once.
