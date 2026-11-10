@@ -246,6 +246,62 @@ async fn scoped_content_never_falls_back_to_the_legacy_unscoped_rpc() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocking_content_fetch_preserves_tls_and_scope() {
+    let fixture = Fixture::start(true).await;
+    let client = PeerBlobClient::new(tokio::runtime::Handle::current());
+    client.install_tls_config(fixture.tls(2));
+    assert_eq!(
+        client
+            .fetch(&format!("http://{}", fixture.address), "private")
+            .unwrap(),
+        BODY
+    );
+    let error = client
+        .fetch_in_zone(&fixture.address, "agent-alice", "private")
+        .unwrap_err();
+    assert!(
+        error.contains(&tonic::Code::Unimplemented.to_string()),
+        "{error}"
+    );
+    for zone in ["", "root", "__control__", "../agent-alice"] {
+        let error = client
+            .fetch_in_zone(&fixture.address, zone, "private")
+            .unwrap_err();
+        assert!(!error.contains("ReadZoneBlob"), "{zone}: {error}");
+    }
+    assert_eq!(*fixture.calls.lock().unwrap(), vec![Some(2)]);
+    drop(client);
+    fixture.shutdown().await;
+}
+
+#[test]
+fn blocking_content_fetch_uses_the_kernel_runtime_from_sync_and_current_thread_callers() {
+    let kernel = build_kernel_runtime();
+    let fixture = kernel.block_on(Fixture::start(true));
+    let client = PeerBlobClient::new(kernel.handle().clone());
+    client.install_tls_config(fixture.tls(2));
+    assert_eq!(client.fetch(&fixture.address, "private").unwrap(), BODY);
+
+    let agent = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    agent.block_on(async {
+        assert_eq!(client.fetch(&fixture.address, "private").unwrap(), BODY);
+        let error = client
+            .fetch_in_zone(&fixture.address, "agent-alice", "private")
+            .unwrap_err();
+        assert!(
+            error.contains(&tonic::Code::Unimplemented.to_string()),
+            "{error}"
+        );
+    });
+    assert_eq!(*fixture.calls.lock().unwrap(), vec![Some(2), Some(2)]);
+    drop(client);
+    kernel.block_on(fixture.shutdown());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tls_configuration_encrypts_even_when_the_routing_uri_says_http() {
     let server = Fixture::start(true).await;
     let client = PeerBlobClient::new(tokio::runtime::Handle::current());
