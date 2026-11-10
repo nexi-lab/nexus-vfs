@@ -2328,11 +2328,9 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
 
         self.raw_node.advance_apply();
 
-        if apply_err.is_none() {
-            // Persistence can commit the leader's first entry. Submit waiting
-            // reads before the transport loop decides whether it may park.
-            self.submit_ready_reads();
-        }
+        // Successful persistence and apply can commit the leader's first
+        // entry. Submit reads before the transport loop decides to park.
+        self.submit_ready_reads();
 
         // Update cached status for handle reads
         self.update_cached_status();

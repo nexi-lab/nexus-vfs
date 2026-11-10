@@ -119,6 +119,13 @@ async fn failed_apply_keeps_the_committed_suffix_for_cold_replay() {
         }
         assert!(driver.advance().await.is_err());
         assert_eq!(node.applied_index(), before);
+        assert!(tokio::time::timeout(
+            Duration::from_secs(5),
+            node.read_linearizable(StateMachine::last_applied_index)
+        )
+        .await
+        .expect("failed driver retained a linearizable read")
+        .is_err());
         assert!(node
             .with_state_machine(|s| s.inner.get_metadata("/later").unwrap())
             .await
