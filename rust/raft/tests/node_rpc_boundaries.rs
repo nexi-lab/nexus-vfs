@@ -19,7 +19,7 @@ use nexus_raft::{
     },
 };
 use protobuf::Message as _;
-use std::{sync::Arc, time::Duration};
+use std::{error::Error, sync::Arc, time::Duration};
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
 async fn connect(address: &str, ca: &[u8], cert: Vec<u8>, key: Vec<u8>) -> Channel {
@@ -49,6 +49,312 @@ async fn listener_ready(address: &str) {
     })
     .await
     .expect("isolated listener must bind");
+}
+
+struct PeerServer {
+    _directory: tempfile::TempDir,
+    registry: Arc<ZoneRaftRegistry>,
+    endpoint: String,
+    stop: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl PeerServer {
+    async fn start(tls: TlsConfig) -> Self {
+        lib::transport_primitives::ensure_crypto_provider();
+        let directory = tempfile::tempdir().unwrap();
+        let registry = Arc::new(ZoneRaftRegistry::new(directory.path().to_path_buf(), 7));
+        let root = registry
+            .create_zone("root", vec![], &tokio::runtime::Handle::current())
+            .unwrap();
+        root.campaign().await.unwrap();
+        let address = common::node_bind_addr();
+        let server = RaftGrpcServer::new(
+            registry.clone(),
+            ServerConfig {
+                bind_address: address.parse().unwrap(),
+                tls: Some(tls),
+                ..Default::default()
+            },
+        );
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            server
+                .serve_with_shutdown(async move {
+                    let _ = stopped.await;
+                })
+                .await
+                .unwrap();
+        });
+        listener_ready(&address).await;
+        Self {
+            _directory: directory,
+            registry,
+            endpoint: format!("http://{address}"),
+            stop,
+            task,
+        }
+    }
+
+    async fn shutdown(self) {
+        self.stop.send(()).unwrap();
+        self.task.await.unwrap();
+        self.registry.shutdown_all();
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PeerRefusal {
+    Identity(&'static str),
+    Issuer,
+}
+
+/// Preserve the TLS cause through tonic, hyper and the I/O error wrapper.
+/// A timeout, closed socket or unrelated certificate error cannot pass here.
+fn assert_peer_refusal(error: &lib::transport_primitives::TransportError, refusal: PeerRefusal) {
+    let mut cause: Option<&(dyn Error + 'static)> = Some(error);
+    while let Some(current) = cause {
+        if let Some(tls) = current.downcast_ref::<rustls::Error>() {
+            let matches = match (refusal, tls) {
+                (PeerRefusal::Identity(expected), rustls::Error::General(actual)) => {
+                    actual == expected
+                }
+                (
+                    PeerRefusal::Issuer,
+                    rustls::Error::InvalidCertificate(
+                        rustls::CertificateError::UnknownIssuer
+                        | rustls::CertificateError::BadSignature,
+                    ),
+                ) => true,
+                _ => false,
+            };
+            assert!(matches, "unexpected peer refusal: {error:?}");
+            return;
+        }
+        cause = match current.downcast_ref::<std::io::Error>() {
+            Some(io) => io.get_ref().map(|inner| inner as &(dyn Error + 'static)),
+            None => current.source(),
+        };
+    }
+    panic!("connection did not fail at TLS peer validation: {error:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outgoing_peer_tls_binds_node_and_owner_replica_before_any_rpc() {
+    use lib::transport_primitives::{create_peer_channel, ClientConfig};
+    use nexus_raft::transport::{generate_user_runtime_cert, proto::GetClusterInfoRequest};
+
+    let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let (foreign_ca, foreign_key) = generate_zone_ca("root").unwrap();
+    let (other_named_ca, other_named_key) = generate_zone_ca("other-root").unwrap();
+    let (client_cert, client_key) = generate_node_cert(2, "root", &ca, &ca_key, &[], None).unwrap();
+    let config = ClientConfig {
+        tls: Some(TlsConfig {
+            ca_pem: ca.clone(),
+            cert_pem: client_cert,
+            key_pem: client_key,
+        }),
+        ..Default::default()
+    };
+    let cases = [
+        (
+            "node",
+            generate_node_cert(7, "root", &ca, &ca_key, &[], None).unwrap(),
+            None,
+        ),
+        (
+            "replica",
+            generate_user_replica_cert("peer", "alice", 7, 300, &ca, &ca_key).unwrap(),
+            None,
+        ),
+        (
+            "other node",
+            generate_node_cert(8, "root", &ca, &ca_key, &[], None).unwrap(),
+            Some(PeerRefusal::Identity(
+                "server certificate does not name the expected replication peer",
+            )),
+        ),
+        (
+            "other replica",
+            generate_user_replica_cert("peer", "alice", 8, 300, &ca, &ca_key).unwrap(),
+            Some(PeerRefusal::Identity(
+                "server certificate does not name the expected replication peer",
+            )),
+        ),
+        (
+            "runtime without replica",
+            generate_user_runtime_cert("peer", "alice", 300, &ca, &ca_key).unwrap(),
+            Some(PeerRefusal::Identity(
+                "Node certificate must carry exactly one Nexus identity",
+            )),
+        ),
+        (
+            "other issuer with the same distinguished name",
+            generate_node_cert(7, "root", &foreign_ca, &foreign_key, &[], None).unwrap(),
+            Some(PeerRefusal::Issuer),
+        ),
+        (
+            "other issuer with a different distinguished name",
+            generate_node_cert(7, "root", &other_named_ca, &other_named_key, &[], None).unwrap(),
+            Some(PeerRefusal::Issuer),
+        ),
+    ];
+    for (label, (cert_pem, key_pem), refusal) in cases {
+        let server = PeerServer::start(TlsConfig {
+            ca_pem: ca.clone(),
+            cert_pem,
+            key_pem,
+        })
+        .await;
+        let channel = create_peer_channel(&server.endpoint, &config, 7.try_into().unwrap()).await;
+        if let Some(refusal) = refusal {
+            let error = channel.expect_err("unexpected peer must fail before any RPC");
+            assert_peer_refusal(&error, refusal);
+        } else {
+            let mut rpc = ZoneApiServiceClient::new(channel.unwrap());
+            let info = rpc
+                .get_cluster_info(GetClusterInfoRequest {
+                    zone_id: "root".into(),
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(info.node_id, 7, "{label}");
+            drop(rpc);
+        }
+        server.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raft_pool_rechecks_changed_routes_and_tls_before_reusing_a_channel() {
+    use nexus_raft::transport::{ClientConfig, NodeAddress, RaftClientPool};
+
+    let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let (cert_pem, key_pem) = generate_node_cert(7, "root", &ca, &ca_key, &[], None).unwrap();
+    let expected = PeerServer::start(TlsConfig {
+        ca_pem: ca.clone(),
+        cert_pem,
+        key_pem,
+    })
+    .await;
+    let (cert_pem, key_pem) = generate_node_cert(8, "root", &ca, &ca_key, &[], None).unwrap();
+    let other = PeerServer::start(TlsConfig {
+        ca_pem: ca.clone(),
+        cert_pem,
+        key_pem,
+    })
+    .await;
+    let (cert_pem, key_pem) = generate_node_cert(2, "root", &ca, &ca_key, &[], None).unwrap();
+    let tls = Arc::new(std::sync::RwLock::new(Some(TlsConfig {
+        ca_pem: ca,
+        cert_pem,
+        key_pem,
+    })));
+    let pool = RaftClientPool::with_config(ClientConfig {
+        tls: tls.clone(),
+        ..Default::default()
+    });
+    let address = NodeAddress::new(7, expected.endpoint.clone());
+    drop(
+        pool.get(&address)
+            .await
+            .expect("the expected peer connects"),
+    );
+    for address in [
+        NodeAddress::new(7, other.endpoint.clone()),
+        NodeAddress::new(8, expected.endpoint.clone()),
+    ] {
+        let error = pool
+            .get(&address)
+            .await
+            .err()
+            .expect("changed route or requested identity must be rechecked");
+        assert_peer_refusal(
+            &error,
+            PeerRefusal::Identity("server certificate does not name the expected replication peer"),
+        );
+    }
+    tls.write().unwrap().as_mut().unwrap().ca_pem = generate_zone_ca("root").unwrap().0;
+    let error = pool
+        .get(&address)
+        .await
+        .err()
+        .expect("changed trust roots must invalidate an established channel");
+    assert_peer_refusal(&error, PeerRefusal::Issuer);
+    drop(pool);
+    expected.shutdown().await;
+    other.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raft_pool_rejects_an_in_flight_dial_after_credentials_change() {
+    use nexus_raft::transport::{ClientConfig, NodeAddress, RaftClientPool};
+
+    let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let (cert_pem, key_pem) = generate_node_cert(7, "root", &ca, &ca_key, &[], None).unwrap();
+    let server = PeerServer::start(TlsConfig {
+        ca_pem: ca.clone(),
+        cert_pem,
+        key_pem,
+    })
+    .await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = NodeAddress::new(7, format!("http://{}", listener.local_addr().unwrap()));
+    let backend = server.endpoint.strip_prefix("http://").unwrap().to_owned();
+    let (connected, accepted) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let proxy = tokio::spawn(async move {
+        let (mut incoming, _) = listener.accept().await.unwrap();
+        connected.send(()).unwrap();
+        released.await.unwrap();
+        let mut outgoing = tokio::net::TcpStream::connect(backend).await.unwrap();
+        let _ = tokio::io::copy_bidirectional(&mut incoming, &mut outgoing).await;
+    });
+    let (cert_pem, key_pem) = generate_node_cert(2, "root", &ca, &ca_key, &[], None).unwrap();
+    let tls = Arc::new(std::sync::RwLock::new(Some(TlsConfig {
+        ca_pem: ca.clone(),
+        cert_pem,
+        key_pem,
+    })));
+    let pool = RaftClientPool::with_config(ClientConfig {
+        tls: tls.clone(),
+        ..Default::default()
+    });
+    let old_pool = pool.clone();
+    let dial = tokio::spawn(async move { old_pool.get(&address).await });
+    tokio::time::timeout(Duration::from_secs(5), accepted)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !dial.is_finished(),
+        "the old TLS handshake must still be pending"
+    );
+    let (cert_pem, key_pem) = generate_node_cert(3, "root", &ca, &ca_key, &[], None).unwrap();
+    *tls.write().unwrap() = Some(TlsConfig {
+        ca_pem: ca,
+        cert_pem,
+        key_pem,
+    });
+    release.send(()).unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(5), dial)
+        .await
+        .unwrap()
+        .unwrap()
+        .err()
+        .expect("a dial under the previous identity cannot publish a connection");
+    assert!(
+        error
+            .to_string()
+            .contains("TLS configuration changed while connecting"),
+        "{error}"
+    );
+    assert_eq!(pool.connection_count().await, 0);
+    drop(pool);
+    proxy.abort();
+    let _ = proxy.await;
+    server.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
