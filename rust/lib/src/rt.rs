@@ -109,24 +109,7 @@ impl Drop for OwnedRuntime {
 /// The scratch-thread hop is paid **only** on the current-thread branch (rare —
 /// an in-process managed agent crossing into async work); the hot multi-thread
 /// path keeps the zero-alloc `block_in_place`.
-fn dispatch<T, Op>(block_on: Op) -> T
-where
-    Op: FnOnce() -> T + Send,
-    T: Send,
-{
-    let mut operation = Some(block_on);
-    dispatch_erased(&mut || {
-        let operation = operation.take().expect("runtime operation called once");
-        operation()
-    })
-}
-
-// Share runtime selection and scoped-thread setup across concrete operations.
-#[inline(never)]
-fn dispatch_erased<T>(block_on: &mut (dyn FnMut() -> T + Send)) -> T
-where
-    T: Send,
-{
+fn dispatch(block_on: impl FnOnce() + Send) {
     match Handle::try_current() {
         Err(_) => block_on(),
         Ok(current) => match current.runtime_flavor() {
@@ -156,17 +139,29 @@ where
     F: std::future::Future + Send,
     F::Output: Send,
 {
-    let mut future = std::pin::pin!(fut);
-    block_on_erased(Some(handle), future.as_mut())
+    block_on(Some(handle), fut)
 }
 
-// Keep Tokio's scheduler bridge shared per output type. The caller owns and
-// pins its future on the stack; erasing the borrow adds no heap allocation.
+fn block_on<F>(handle: Option<&Handle>, future: F) -> F::Output
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
+    let mut output = None;
+    {
+        let future = std::pin::pin!(async { output = Some(future.await) });
+        block_on_erased(handle, future);
+    }
+    output.expect("runtime bridge future completed")
+}
+
+// The future and its output stay in the caller's stack frame. Tokio and the
+// scoped thread drive one unit-output future type, shared by every caller.
 #[inline(never)]
-fn block_on_erased<T: Send>(
+fn block_on_erased(
     handle: Option<&Handle>,
-    future: std::pin::Pin<&mut (dyn std::future::Future<Output = T> + Send + '_)>,
-) -> T {
+    future: std::pin::Pin<&mut (dyn std::future::Future<Output = ()> + Send + '_)>,
+) {
     dispatch(move || match handle {
         Some(handle) => handle.block_on(future),
         None => match Handle::try_current() {
@@ -189,6 +184,5 @@ where
     F: std::future::Future + Send,
     F::Output: Send,
 {
-    let mut future = std::pin::pin!(fut);
-    block_on_erased(None, future.as_mut())
+    block_on(None, fut)
 }

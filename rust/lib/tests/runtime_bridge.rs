@@ -103,3 +103,64 @@ fn portable_current_thread_ambient_does_not_panic() {
     });
     assert_eq!(observed, value.as_str());
 }
+
+#[test]
+fn owned_output_survives_the_current_thread_bridge_and_drops_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Output<'a>(&'a AtomicUsize, Vec<u8>);
+    impl Drop for Output<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let drops = AtomicUsize::new(0);
+    let rt = inner();
+    let agent = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let output = agent.block_on(async {
+        block_on_via(rt.handle(), async {
+            tokio::task::yield_now().await;
+            Ok::<_, String>(Output(&drops, vec![7; 1024]))
+        })
+    });
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    let output = output.unwrap();
+    assert_eq!(output.1, vec![7; 1024]);
+    drop(output);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn panicking_future_unwinds_and_releases_its_borrowed_state() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Guard<'a>(&'a AtomicUsize);
+    impl Drop for Guard<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let drops = AtomicUsize::new(0);
+    let rt = inner();
+    let agent = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        agent.block_on(async {
+            block_on_via(rt.handle(), async {
+                let _guard = Guard(&drops);
+                tokio::task::yield_now().await;
+                panic!("future failed");
+            });
+        });
+    }));
+    assert!(result.is_err());
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert_eq!(block_on_via(rt.handle(), async { 42 }), 42);
+}
