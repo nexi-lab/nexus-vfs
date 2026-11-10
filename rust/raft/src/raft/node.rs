@@ -64,6 +64,9 @@ use super::storage::RaftStorage;
 use super::PROPOSAL_TIMEOUT_SECS;
 use super::{Command, CommandResult, RaftError, Result};
 
+mod read_index;
+use read_index::PendingRead;
+
 /// Capacity of the bounded channel between [`ZoneConsensus`] handles and the
 /// [`ZoneConsensusDriver`] actor. Provides backpressure under sustained
 /// overload or network partitions, preventing unbounded memory growth.
@@ -528,7 +531,7 @@ pub struct ZoneConsensusDriver<S: StateMachine + 'static> {
     /// Pending linearizable reads waiting for raft-rs to emit a
     /// `ReadState`, keyed by the 8-byte request context we passed to
     /// `RawNode::read_index`.
-    pending_reads_by_ctx: HashMap<u64, oneshot::Sender<Result<()>>>,
+    pending_reads_by_ctx: HashMap<u64, PendingRead>,
     /// Pending linearizable reads that have their `read_index`
     /// assigned but are waiting for `state_machine.last_applied`
     /// to catch up. Drained after every `apply_entries` pass.
@@ -2155,18 +2158,11 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                 let _ = tx.send(result);
             }
             RaftMsg::ReadIndex { tx } => {
-                // Post a ReadIndex request to raft-rs and stash
-                // the oneshot by request context. The
-                // `ReadState` will appear in a later `advance()`
-                // ready, at which point we move it to
-                // `pending_reads_by_index` (or resolve
-                // immediately if apply already caught up).
+                // Keep the request until Raft can accept it. A newly elected
+                // leader drops ReadIndex until it commits its first entry.
                 let id = self.read_request_counter;
                 self.read_request_counter = self.read_request_counter.wrapping_add(1);
-                let ctx = id.to_be_bytes().to_vec();
-                tracing::trace!(read_request_id = id, "raft.driver.read_index");
-                self.raw_node.read_index(ctx);
-                self.pending_reads_by_ctx.insert(id, tx);
+                self.pending_reads_by_ctx.insert(id, PendingRead::new(tx));
             }
             RaftMsg::Membership { tx } => {
                 let _ = tx.send(read_membership(&self.raw_node));
@@ -2210,6 +2206,8 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
             self.raw_node.tick();
             self.last_tick = Instant::now();
         }
+
+        self.submit_ready_reads();
 
         // Process ready state
         if !self.raw_node.has_ready() {
@@ -2326,6 +2324,10 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         }
 
         self.raw_node.advance_apply();
+
+        // Successful persistence and apply can commit the leader's first
+        // entry. Submit reads before the transport loop decides to park.
+        self.submit_ready_reads();
 
         // Update cached status for handle reads
         self.update_cached_status();
@@ -2712,11 +2714,12 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                     .try_into()
                     .expect("length checked above"),
             );
-            let Some(tx) = self.pending_reads_by_ctx.remove(&id) else {
+            let Some(request) = self.pending_reads_by_ctx.remove(&id) else {
                 // Unknown context — likely a ReadIndex issued by a
                 // previous driver instance or a stale ctx; drop.
                 continue;
             };
+            let tx = request.tx;
             if applied >= state.index {
                 let _ = tx.send(Ok(()));
             } else {
