@@ -8,6 +8,10 @@ description = "Shared Rust utilities — bloom, hash, search, trigram, ReBAC, pa
 name = "lib"
 crate-type = ["rlib"]
 
+[[test]]
+name = "runtime_bridge"
+required-features = ["runtime-bridge"]
+
 [features]
 # Brings `lib::transport_primitives` (TLS, pool, addressing, TOFU trust
 # store, PeerBlobClient trait). Enabled by every peer crate that speaks
