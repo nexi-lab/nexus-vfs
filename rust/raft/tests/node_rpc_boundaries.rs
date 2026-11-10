@@ -678,6 +678,136 @@ fn metadata_entry(path: &str) -> EcReplicationEntry {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ec_decode_failures_preserve_replication_positions_until_complete_retry() {
+    use nexus_raft::transport::{ClientConfig, RaftClient, TransportError};
+
+    let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let (server_cert, server_key) = generate_node_cert(7, "root", &ca, &ca_key, &[], None).unwrap();
+    let server = PeerServer::start(TlsConfig {
+        ca_pem: ca.clone(),
+        cert_pem: server_cert,
+        key_pem: server_key,
+    })
+    .await;
+    let node = server.registry.get_node("root").unwrap();
+    let (cert, key) = generate_node_cert(2, "root", &ca, &ca_key, &[], None).unwrap();
+    let channel = connect(
+        server.endpoint.strip_prefix("http://").unwrap(),
+        &ca,
+        cert.clone(),
+        key.clone(),
+    )
+    .await;
+    let mut wire = ZoneTransportServiceClient::new(channel);
+    let mut sender = RaftClient::connect(
+        &server.endpoint,
+        ClientConfig {
+            tls: Some(TlsConfig {
+                ca_pem: ca,
+                cert_pem: cert,
+                key_pem: key,
+            }),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    for snapshot in [false, true] {
+        for corruption in ["unknown-command", "truncated", "trailing-fields"] {
+            let paths: Vec<_> = ["before", "failed", "after"]
+                .map(|part| format!("/{snapshot}/{corruption}/{part}"))
+                .into();
+            let good: Vec<_> = paths
+                .iter()
+                .enumerate()
+                .map(|(index, path)| EcReplicationEntry {
+                    seq: index as u64 + 1,
+                    ..metadata_entry(path)
+                })
+                .collect();
+            let mut broken = good.clone();
+            match corruption {
+                "unknown-command" => broken[1].command = u32::MAX.to_le_bytes().to_vec(),
+                "truncated" => {
+                    broken[1].command.pop();
+                }
+                "trailing-fields" => broken[1].command.extend_from_slice(b"unread fields"),
+                _ => unreachable!(),
+            }
+            if snapshot {
+                let result = wire
+                    .snapshot_ec_state(SnapshotEcStateRequest {
+                        zone_id: "root".into(),
+                        sender_node_id: 2,
+                        entries: broken.clone(),
+                        covering_seq: 100,
+                    })
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert!(!result.success, "{corruption}");
+                assert_eq!(result.acked_up_to, 0);
+                assert!(result.error.unwrap().contains("decode EC entry 2"));
+            } else {
+                let result = wire
+                    .replicate_entries(ReplicateEntriesRequest {
+                        zone_id: "root".into(),
+                        sender_node_id: 2,
+                        entries: broken.clone(),
+                    })
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert!(!result.success, "{corruption}");
+                assert_eq!(result.applied_up_to, 1);
+                assert!(result.error.unwrap().contains("decode EC entry 2"));
+            }
+            // The production client must expose a failure to the completion
+            // loop, which retains its WAL cursor and retries with backoff.
+            let failed = if snapshot {
+                sender
+                    .snapshot_ec_state("root".into(), broken, 100, 2)
+                    .await
+            } else {
+                sender.replicate_entries("root".into(), broken, 2).await
+            };
+            assert!(matches!(failed, Err(TransportError::Rpc(ref error))
+                if error.contains("decode EC entry 2")));
+            for (index, path) in paths.iter().enumerate() {
+                let path = path.clone();
+                let value = node
+                    .with_state_machine(move |state| state.get_metadata(&path))
+                    .await
+                    .unwrap();
+                assert_eq!(value.is_some(), index == 0);
+            }
+
+            // Replaying the complete compatible batch retains the prefix and
+            // applies every missing item before acknowledging the transfer.
+            let acknowledged = if snapshot {
+                sender.snapshot_ec_state("root".into(), good, 100, 2).await
+            } else {
+                sender.replicate_entries("root".into(), good, 2).await
+            }
+            .unwrap();
+            assert_eq!(acknowledged, if snapshot { 100 } else { 3 });
+            for path in paths {
+                assert_eq!(
+                    node.with_state_machine(move |state| state.get_metadata(&path))
+                        .await
+                        .unwrap(),
+                    Some(br#"{"fixture":"node sender boundary"}"#.to_vec())
+                );
+            }
+        }
+    }
+    drop(wire);
+    drop(sender);
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agents_and_foreign_nodes_cannot_propose_or_step_but_local_nodes_can() {
     let (ca, ca_key) = generate_zone_ca("root").unwrap();
     let (foreign, foreign_key) = generate_zone_ca("root").unwrap();

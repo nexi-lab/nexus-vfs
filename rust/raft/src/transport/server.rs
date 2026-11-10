@@ -14,8 +14,8 @@ use super::proto::nexus::raft::{
     zone_transport_service_server::{ZoneTransportService, ZoneTransportServiceServer},
     AllowSessionMinterRequest, AllowSessionMinterResponse, ClusterConfig as ProtoClusterConfig,
     DeleteZoneRequest, DeleteZoneResponse, DenySessionMinterRequest, DenySessionMinterResponse,
-    DiscoverZonesRequest, DiscoverZonesResponse, FederationZoneInfo, ForeignCaEntry,
-    GetClusterInfoRequest, GetClusterInfoResponse, GetCrlRequest, GetCrlResponse,
+    DiscoverZonesRequest, DiscoverZonesResponse, EcReplicationEntry, FederationZoneInfo,
+    ForeignCaEntry, GetClusterInfoRequest, GetClusterInfoResponse, GetCrlRequest, GetCrlResponse,
     GetMetadataResult, GetSearchCapabilitiesRequest, JoinClusterRequest, JoinClusterResponse,
     JoinZoneRequest, JoinZoneResponse, ListForeignCasRequest, ListForeignCasResponse,
     ListKeysRequest, ListKeysResponse, ListMetadataResult, ListSessionMintersRequest,
@@ -62,7 +62,7 @@ use crate::raft::{
     reconcile_peers_with_conf_state, Command, CommandResult, FullStateMachine, RaftError,
     WitnessStateMachine, ZoneConsensus, ZoneRaftRegistry,
 };
-use bincode;
+use bincode::Options;
 use dashmap::DashMap;
 use prost::Message;
 use protobuf::Message as ProtobufV2Message;
@@ -588,6 +588,24 @@ struct ZoneTransportServiceImpl {
     registry: Arc<ZoneRaftRegistry>,
 }
 
+/// Both EC transfer paths acknowledge only commands this reader understood and
+/// applied. A refusal retains the sender's position for a compatible retry.
+async fn apply_ec_entry(
+    node: &ZoneConsensus<FullStateMachine>,
+    entry: &EcReplicationEntry,
+) -> std::result::Result<(), String> {
+    let command = bincode::options()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .deserialize(&entry.command)
+        .map_err(|error| format!("decode EC entry {}: {error}", entry.seq))?;
+    match node.apply_ec_from_peer(command, entry.timestamp).await {
+        Ok(CommandResult::Error(error)) => Err(format!("apply EC entry {}: {error}", entry.seq)),
+        Ok(_) => Ok(()),
+        Err(error) => Err(format!("apply EC entry {}: {error}", entry.seq)),
+    }
+}
+
 #[tonic::async_trait]
 impl ZoneTransportService for ZoneTransportServiceImpl {
     /// Handle a raw raft-rs message forwarded from another node.
@@ -701,43 +719,8 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
         let mut max_applied: u64 = 0;
 
         for entry in &req.entries {
-            let command: Command = match bincode::deserialize(&entry.command) {
-                Ok(cmd) => cmd,
-                Err(e) => {
-                    // A bincode deserialize failure means the sender shipped
-                    // bytes this build cannot decode (version skew / corruption).
-                    // The entry is UNAPPLIABLE here — no build-local action can
-                    // ever make it decode — so the only choices are (a) halt the
-                    // whole peer's EC stream until the mismatch is fixed, or
-                    // (b) skip THIS entry and keep replicating the rest.
-                    //
-                    // We skip-LOUD (advance past it, warn), because for the EC
-                    // (AP) data plane availability wins: one undecodable entry
-                    // must not head-of-line-block a peer's entire mailbox
-                    // stream, and stalling would not "preserve" the entry — it
-                    // is unappliable regardless.  This is NOT silent: every drop
-                    // is warned with its seq, so a systematic skew shows up as a
-                    // flood of warns.  The SYSTEMATIC fix (make undecodable
-                    // entries impossible — a version-gate at JoinZone rejecting
-                    // mismatched builds, or a forward-compatible command
-                    // encoding) is the tracked follow-up; skip-loud is the
-                    // agreed interim.  Apply failures (below) stay hard-fail —
-                    // those may be transient and are worth a backed-off retry.
-                    tracing::warn!(
-                        seq = entry.seq,
-                        sender = req.sender_node_id,
-                        error = %e,
-                        "EC entry undecodable (version skew / corruption) — \
-                         QUARANTINED (skipped) so the peer's stream keeps flowing; \
-                         a flood here means a build mismatch to fix"
-                    );
-                    max_applied = max_applied.max(entry.seq);
-                    continue;
-                }
-            };
-
-            match node.apply_ec_from_peer(command, entry.timestamp).await {
-                Ok(_) => {
+            match apply_ec_entry(&node, entry).await {
+                Ok(()) => {
                     max_applied = max_applied.max(entry.seq);
                     tracing::trace!(
                         seq = entry.seq,
@@ -789,26 +772,8 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
         let node = get_zone_node(&self.registry, &req.zone_id)?;
 
         for entry in &req.entries {
-            let command: Command = match bincode::deserialize(&entry.command) {
-                Ok(cmd) => cmd,
-                Err(e) => {
-                    // Same skip-loud posture as ReplicateEntries: an undecodable
-                    // snapshot entry is unappliable here, so skip it (loud) and
-                    // keep applying the rest rather than fail the whole catch-up.
-                    tracing::warn!(
-                        seq = entry.seq,
-                        sender = req.sender_node_id,
-                        error = %e,
-                        "EC snapshot entry undecodable — QUARANTINED (skipped)"
-                    );
-                    continue;
-                }
-            };
-            if let Err(e) = node.apply_ec_from_peer(command, entry.timestamp).await {
-                // A snapshot apply failure (not a decode/skew issue) is real:
-                // fail the transfer so the sender retries the whole snapshot
-                // rather than leaving the peer half-caught-up.
-                tracing::warn!(seq = entry.seq, "EC snapshot apply failed: {}", e);
+            if let Err(e) = apply_ec_entry(&node, entry).await {
+                tracing::warn!(seq = entry.seq, "EC snapshot refused: {}", e);
                 return Ok(Response::new(SnapshotEcStateResponse {
                     success: false,
                     error: Some(format!("snapshot apply failed at seq {}: {}", entry.seq, e)),
