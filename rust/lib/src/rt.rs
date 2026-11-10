@@ -156,7 +156,18 @@ where
     F: std::future::Future + Send,
     F::Output: Send,
 {
-    dispatch(move || handle.block_on(fut))
+    let mut future = std::pin::pin!(fut);
+    block_on_erased(handle, future.as_mut())
+}
+
+// Keep Tokio's scheduler bridge shared per output type. The caller owns and
+// pins its future on the stack; erasing the borrow adds no heap allocation.
+#[inline(never)]
+fn block_on_erased<T: Send>(
+    handle: &Handle,
+    future: std::pin::Pin<&mut (dyn std::future::Future<Output = T> + Send + '_)>,
+) -> T {
+    dispatch(move || handle.block_on(future))
 }
 
 /// Run a **self-contained** future to completion from any context, without
