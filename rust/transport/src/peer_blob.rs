@@ -317,13 +317,21 @@ pub fn build_kernel_runtime() -> Arc<tokio::runtime::Runtime> {
 // ── HAL trait wiring ─────────────────────────────────────────────────
 //
 // Kernel holds an `Arc<dyn kernel::hal::peer::PeerBlobClient>`. The
-// impl block adapts the inherent `fetch` / `install_tls_config`
-// methods to the trait's `fetch` / `install_tls` shape.
+// This adapter preserves the selected read scope and shared TLS configuration.
 
 impl kernel::hal::peer::PeerBlobClient for PeerBlobClient {
     fn fetch(&self, addr: &str, content_id: &str) -> kernel::hal::peer::PeerBlobResult<Vec<u8>> {
         // Inherent method shadows the trait method — fully-qualify.
         PeerBlobClient::fetch(self, addr, content_id)
+    }
+
+    fn fetch_in_zone(
+        &self,
+        addr: &str,
+        zone_id: &str,
+        content_id: &str,
+    ) -> kernel::hal::peer::PeerBlobResult<Vec<u8>> {
+        PeerBlobClient::fetch_in_zone(self, addr, zone_id, content_id)
     }
 
     fn install_tls(&self, ca_pem: &[u8], cert_pem: Option<&[u8]>, key_pem: Option<&[u8]>) {
