@@ -30,37 +30,31 @@ type ConnectFuture<'a> =
 // is paid when opening a channel; pooled RPCs keep using the existing channel.
 #[inline(never)]
 pub fn create_channel<'a>(endpoint: &'a str, config: &'a ClientConfig) -> ConnectFuture<'a> {
-    Box::pin(connect_channel(endpoint, config))
+    Box::pin(connect_channel(endpoint, config, None))
+}
+
+/// Connect to an exact signed Node or owner replica using the same transport
+/// configuration as other channels. The route carries no identity authority.
+#[inline(never)]
+pub fn create_peer_channel<'a>(
+    endpoint: &'a str,
+    config: &'a ClientConfig,
+    expected: std::num::NonZeroU64,
+) -> ConnectFuture<'a> {
+    Box::pin(connect_channel(endpoint, config, Some(expected)))
 }
 
 #[allow(clippy::result_large_err)]
 async fn connect_channel(
     endpoint: &str,
     config: &ClientConfig,
+    expected: Option<std::num::NonZeroU64>,
 ) -> Result<tonic::transport::Channel, TransportError> {
-    create_channel_inner(endpoint, config, None).await
-}
-
-/// Connect to an exact signed Node or owner replica using the same transport
-/// configuration as other channels. The route carries no identity authority.
-pub async fn create_peer_channel(
-    endpoint: &str,
-    config: &ClientConfig,
-    expected: std::num::NonZeroU64,
-) -> Result<tonic::transport::Channel, TransportError> {
-    if config.tls.is_none() {
+    if expected.is_some() && config.tls.is_none() {
         return Err(TransportError::Connection(
             "authenticated peer channels require TLS".into(),
         ));
     }
-    create_channel_inner(endpoint, config, Some(expected)).await
-}
-
-async fn create_channel_inner(
-    endpoint: &str,
-    config: &ClientConfig,
-    expected: Option<std::num::NonZeroU64>,
-) -> Result<tonic::transport::Channel, TransportError> {
     let ep = configured_endpoint(endpoint, config, expected)?;
     match tokio::time::timeout(config.connect_timeout, ep.connect()).await {
         Ok(result) => result.map_err(TransportError::Tonic),
