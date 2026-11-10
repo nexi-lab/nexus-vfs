@@ -125,7 +125,7 @@ jobs:
         run: python3 scripts/e2e/cluster_binary_enrollment.py prepare --output "$RUNNER_TEMP/release-enrollment"
 
       - name: Build release binary
-        run: cargo build --release -p ${{ matrix.package }} --bin ${{ matrix.bin }} ${{ matrix.features && format('--features {0}', matrix.features) || '' }} ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+        run: python scripts/ci/build_release_with_map.py --package ${{ matrix.package }} --bin ${{ matrix.bin }} --artifact ${{ matrix.artifact_name }} --output "${{ runner.temp }}/cluster-link-maps" ${{ matrix.features && format('--features {0}', matrix.features) || '' }} ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
 
       - name: Qualify the optimized binary before publication
         if: matrix.artifact_name == 'nexusd-cluster-linux-x86_64'
@@ -140,7 +140,7 @@ jobs:
           if-no-files-found: error
 
       - name: Build the separate operator client
-        run: cargo build --release -p nexus-cluster --bin nexus-agent-enroll --features operator-agent-enrollment ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+        run: python scripts/ci/build_release_with_map.py --package nexus-cluster --bin nexus-agent-enroll --artifact ${{ matrix.operator_artifact_name }} --output "${{ runner.temp }}/cluster-link-maps" --features operator-agent-enrollment ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
 
       - name: Check daemon and operator client sizes
         shell: bash
@@ -167,6 +167,15 @@ jobs:
               exit 1
             fi
           done
+
+      - name: Retain linker size evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}-link-maps
+          path: ${{ runner.temp }}/cluster-link-maps
+          if-no-files-found: warn
+          retention-days: ${{ inputs.upload_retention_days }}
 
       - name: Sanity-check --help
         if: ${{ !matrix.target }}

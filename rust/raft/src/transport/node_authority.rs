@@ -187,10 +187,15 @@ impl<S: NamedService> NodeControlService<S> {
 impl<S: NamedService> NamedService for NodeControlService<S> {
     const NAME: &'static str = S::NAME;
 }
-impl<S> Service<http::Request<Body>> for NodeControlService<S>
+impl<S, E> Service<http::Request<Body>> for NodeControlService<S>
 where
-    S: Service<http::Request<Body>, Response = http::Response<Body>> + Send + 'static,
-    S::Future: Send + 'static,
+    S: Service<
+            http::Request<Body>,
+            Response = http::Response<Body>,
+            Error = E,
+            Future = BoxFuture<http::Response<Body>, E>,
+        > + Send
+        + 'static,
 {
     type Response = http::Response<Body>;
     type Error = S::Error;
@@ -208,8 +213,7 @@ where
                 Err(status) => return Box::pin(async move { Ok(status.into_http()) }),
             }
         }
-        let future = self.inner.call(request);
-        Box::pin(future)
+        self.inner.call(request)
     }
 }
 

@@ -7793,6 +7793,7 @@ mod tests {
         let renewed_id = transport::peer_identity::from_der(&der(&renewed.cert_pem)).unwrap();
         assert_eq!(renewed_id.owner, id.owner);
         assert_eq!(renewed_id.agent_name, id.agent_name);
+        assert_owner_runtime_renewal(&minter, &moss_cert, &ca_pem, &ca_key_pem).await;
         assert_ne!(renewed.key_pem, bundle.key_pem);
         assert_ne!(
             nexus_raft::transport::serial_from_cert_pem(&renewed.cert_pem).unwrap(),
@@ -7862,6 +7863,84 @@ mod tests {
             minter.store.list().expect("list").is_empty(),
             "session minting must not persist per-session state"
         );
+    }
+
+    async fn assert_owner_runtime_renewal(
+        minter: &FounderAgentMinter,
+        caller: &[u8],
+        ca: &[u8],
+        ca_key: &[u8],
+    ) {
+        use lib::transport_primitives::{authorship, replica_node_id_from_x509};
+        use nexus_raft::agent_minter::{AgentMinter, SessionRenewal};
+        use x509_parser::prelude::*;
+        for node_id in [None, Some(19)] {
+            let (cert, key) = if let Some(node) = node_id {
+                nexus_raft::transport::generate_user_replica_cert(
+                    "session-runtime-renewal",
+                    "alice",
+                    node,
+                    300,
+                    ca,
+                    ca_key,
+                )
+                .unwrap()
+            } else {
+                nexus_raft::transport::generate_user_runtime_cert(
+                    "session-runtime-renewal",
+                    "alice",
+                    300,
+                    ca,
+                    ca_key,
+                )
+                .unwrap()
+            };
+            let der = ::pem::parse(&cert).unwrap();
+            let caller_der = ::pem::parse(caller).unwrap();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            let proof = authorship::sign(
+                &nexus_raft::transport::session_renewal_message(
+                    der.contents(),
+                    caller_der.contents(),
+                    300,
+                    now,
+                ),
+                &key,
+            )
+            .unwrap();
+            let renewed = minter
+                .renew_session(
+                    Some(caller_der.into_contents()),
+                    SessionRenewal {
+                        cert_pem: &cert,
+                        validity_secs: 300,
+                        issued_at_unix_ms: now,
+                        proof: &proof,
+                    },
+                )
+                .await;
+            if node_id.is_some() {
+                assert!(
+                    matches!(renewed, Err(ref error) if error == "replica renewal requires current allocation authority"),
+                    "ordinary session renewal must not bypass replica allocation authority"
+                );
+                continue;
+            }
+            let renewed = renewed.unwrap();
+            let der = ::pem::parse(&renewed.cert_pem).unwrap();
+            let (_, leaf) = X509Certificate::from_der(der.contents()).unwrap();
+            assert_eq!(replica_node_id_from_x509(&leaf).unwrap(), node_id);
+            let peer = transport::peer_identity::classify_peer_cert_pem(&renewed.cert_pem, ca, &[])
+                .unwrap();
+            assert_eq!(peer.owner.as_deref(), Some("alice"));
+            assert_eq!(peer.agent_name.as_deref(), Some("session-runtime-renewal"));
+            assert!(!peer.is_cluster_node());
+            assert_ne!(renewed.key_pem, key);
+            assert_ne!(renewed.cert_pem, cert);
+        }
     }
 
     /// Revoking takes the certificate, because a session credential is never

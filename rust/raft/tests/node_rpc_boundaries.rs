@@ -14,8 +14,8 @@ use nexus_raft::{
     prelude::Command,
     raft::ZoneRaftRegistry,
     transport::{
-        generate_agent_cert, generate_node_cert, generate_zone_ca, RaftGrpcServer,
-        RaftWitnessServer, ServerConfig, TlsConfig, WitnessZoneRegistry,
+        generate_agent_cert, generate_node_cert, generate_user_replica_cert, generate_zone_ca,
+        RaftGrpcServer, RaftWitnessServer, ServerConfig, TlsConfig, WitnessZoneRegistry,
     },
 };
 use protobuf::Message as _;
@@ -409,10 +409,13 @@ async fn agents_and_foreign_nodes_cannot_propose_or_step_but_local_nodes_can() {
     }
 
     let domestic = generate_agent_cert("domestic-agent", &ca, &ca_key).unwrap();
+    let replica =
+        generate_user_replica_cert("session-replica", "alice", 19, 300, &ca, &ca_key).unwrap();
     let foreign_agent = generate_agent_cert("foreign-agent", &foreign, &foreign_key).unwrap();
     let foreign_node = generate_node_cert(2, "root", &foreign, &foreign_key, &[], None).unwrap();
     for (label, (cert, key)) in [
         ("domestic-agent", domestic),
+        ("owner-replica", replica),
         ("foreign-agent", foreign_agent),
         ("foreign-node", foreign_node),
     ] {

@@ -440,18 +440,48 @@ pub fn generate_user_runtime_cert(
     ca_cert_pem: &[u8],
     ca_key_pem: &[u8],
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
+    sign_agent_params(
+        user_runtime_certificate_params(name, owner_id, validity_secs)?,
+        ca_cert_pem,
+        ca_key_pem,
+    )
+}
+
+/// Sign an issuer-assigned replica identity on the owner's runtime credential.
+/// The issuer validates the durable box binding before calling this signer.
+pub fn generate_user_replica_cert(
+    name: &str,
+    owner_id: &str,
+    node_id: u64,
+    validity_secs: u64,
+    ca_cert_pem: &[u8],
+    ca_key_pem: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let mut params = user_runtime_certificate_params(name, owner_id, validity_secs)?;
+    params.subject_alt_names.push(SanType::URI(
+        lib::transport_primitives::replica_identity_uri(node_id)?
+            .as_str()
+            .try_into()
+            .map_err(|e| format!("replica identity SAN: {e}"))?,
+    ));
+    sign_agent_params(params, ca_cert_pem, ca_key_pem)
+}
+
+fn user_runtime_certificate_params(
+    name: &str,
+    owner_id: &str,
+    validity_secs: u64,
+) -> Result<CertificateParams, String> {
     use lib::transport_primitives::{user_runtime_server_name, USER_RUNTIME_MAX_VALIDITY_SECS};
     if validity_secs == 0 || validity_secs > USER_RUNTIME_MAX_VALIDITY_SECS {
         return Err("user runtime validity must be between 1 and 300 seconds".into());
     }
     let server_name = user_runtime_server_name(owner_id)?;
-    sign_agent_cert(
+    agent_certificate_params(
         name,
         Some(owner_id),
         time::Duration::seconds(validity_secs as i64),
         Some(&server_name),
-        ca_cert_pem,
-        ca_key_pem,
     )
 }
 
@@ -464,13 +494,24 @@ fn sign_agent_cert(
     ca_cert_pem: &[u8],
     ca_key_pem: &[u8],
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
+    sign_agent_params(
+        agent_certificate_params(name, owner_id, validity, server_name)?,
+        ca_cert_pem,
+        ca_key_pem,
+    )
+}
+
+fn sign_agent_params(
+    params: CertificateParams,
+    ca_cert_pem: &[u8],
+    ca_key_pem: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>), String> {
     let ca_issuer = ca_issuer_from_pem(ca_cert_pem, ca_key_pem)?;
 
     // Agent key pair (EC P-256), same algorithm as node certs.
     let agent_key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
         .map_err(|e| format!("Failed to generate agent key: {e}"))?;
 
-    let params = agent_certificate_params(name, owner_id, validity, server_name)?;
     let agent_cert = params
         .signed_by(&agent_key_pair, &ca_issuer)
         .map_err(|e| format!("Failed to sign agent cert: {e}"))?;
@@ -1027,6 +1068,54 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("owner"), "{err}");
+    }
+
+    #[test]
+    fn replica_certificate_retains_owner_identity_without_node_authority() {
+        use lib::transport_primitives::{
+            replica_node_id_from_x509, user_runtime_name_from_x509, user_runtime_server_name,
+        };
+        use x509_parser::prelude::*;
+        let (ca, key) = generate_zone_ca("root").unwrap();
+        let (bytes, private) =
+            generate_user_replica_cert("session-replica", "alice", 19, 300, &ca, &key).unwrap();
+        let pem = ::pem::parse(&bytes).unwrap();
+        let (_, cert) = X509Certificate::from_der(pem.contents()).unwrap();
+        assert_eq!(replica_node_id_from_x509(&cert).unwrap(), Some(19));
+        assert_eq!(
+            user_runtime_name_from_x509(&cert).unwrap(),
+            Some(user_runtime_server_name("alice").unwrap())
+        );
+        assert!(!cert.is_ca());
+        assert!(!cert.key_usage().unwrap().unwrap().value.key_cert_sign());
+        let signature =
+            lib::transport_primitives::authorship::sign(b"replica proof", &private).unwrap();
+        assert_eq!(
+            lib::transport_primitives::authorship::verify(
+                b"replica proof",
+                &signature,
+                &bytes,
+                &ca
+            )
+            .unwrap(),
+            "session-replica"
+        );
+        let ca_der = ::pem::parse(&ca).unwrap();
+        assert!(
+            super::super::current_local_node_certificate(pem.contents(), ca_der.contents())
+                .is_err()
+        );
+        for (node, validity) in [(0, 300), (19, 0), (19, 301), (19, u64::MAX)] {
+            assert!(generate_user_replica_cert(
+                "session-replica",
+                "alice",
+                node,
+                validity,
+                &ca,
+                &key
+            )
+            .is_err());
+        }
     }
 
     #[test]
