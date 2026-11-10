@@ -15,6 +15,7 @@ pub(super) enum StorageFormat {
     RecordIo,
     ReplicaBinding,
     NodeIdentity,
+    ReplicaIssuance,
 }
 
 impl StorageFormat {
@@ -25,6 +26,7 @@ impl StorageFormat {
             Self::RecordIo => b"guarded-record-io-v1",
             Self::ReplicaBinding => b"replica-binding-v1",
             Self::NodeIdentity => b"node-identity-v1",
+            Self::ReplicaIssuance => b"replica-issuance-v1",
         }
     }
 
@@ -36,6 +38,7 @@ impl StorageFormat {
             Some(b"guarded-record-io-v1") => Ok(Some(Self::RecordIo)),
             Some(b"replica-binding-v1") => Ok(Some(Self::ReplicaBinding)),
             Some(b"node-identity-v1") => Ok(Some(Self::NodeIdentity)),
+            Some(b"replica-issuance-v1") => Ok(Some(Self::ReplicaIssuance)),
             Some(_) => Err(storage_error("unsupported control storage format")),
         }
     }
@@ -43,7 +46,9 @@ impl StorageFormat {
     fn validate_policy(self, policy: MembershipPolicy) -> Result<()> {
         if policy != MembershipPolicy::FixedLocal {
             let records = match self {
-                Self::ReplicaBinding | Self::NodeIdentity => "replica-binding records",
+                Self::ReplicaBinding | Self::NodeIdentity | Self::ReplicaIssuance => {
+                    "replica-binding records"
+                }
                 _ => "protected records",
             };
             return Err(RaftError::Config(format!(
@@ -171,6 +176,7 @@ mod tests {
             StorageFormat::RecordIo,
             StorageFormat::ReplicaBinding,
             StorageFormat::NodeIdentity,
+            StorageFormat::ReplicaIssuance,
         ] {
             let txn = state.control_state.raw_db().begin_write().unwrap();
             state.require_storage_format_in_txn(&txn, floor).unwrap();

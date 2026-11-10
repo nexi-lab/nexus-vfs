@@ -14,6 +14,7 @@ pub mod node_identity;
 pub mod operation_context;
 pub mod operation_id;
 pub mod replica_binding;
+pub mod replica_credential;
 pub mod rust_service;
 pub mod zone_id;
 pub mod zone_path;

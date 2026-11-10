@@ -15,7 +15,9 @@ use serde::{Deserialize, Serialize};
 impl Command {
     pub(crate) fn requires_replica_sc(&self) -> bool {
         match self {
-            Self::ApplyReplicaBinding(_) | Self::ReserveNodeIdentity(_) => true,
+            Self::ApplyReplicaBinding(_)
+            | Self::ReserveNodeIdentity(_)
+            | Self::ApplyReplicaIssuance(_) => true,
             Self::PutControlState { namespace, .. }
             | Self::DeleteControlState { namespace, .. } => namespace == NAMESPACE,
             _ => false,
@@ -51,7 +53,10 @@ pub(super) fn node_key(id: u64) -> Vec<u8> {
     control_key(NAMESPACE, &format!("node:{id}"))
 }
 
-fn decode_binding(bytes: &[u8], allocation: &ReplicaAllocation) -> Result<ReplicaBinding> {
+pub(super) fn decode_binding(
+    bytes: &[u8],
+    allocation: &ReplicaAllocation,
+) -> Result<ReplicaBinding> {
     let binding: ReplicaBinding = bincode::deserialize(bytes)?;
     binding.validate().map_err(storage_error)?;
     if binding.allocation != *allocation {

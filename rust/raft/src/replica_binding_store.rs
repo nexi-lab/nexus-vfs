@@ -14,6 +14,9 @@ use contracts::{
     replica_binding::{
         ReplicaAllocation, ReplicaBinding, ReplicaBindingOutcome, ReplicaBindingRequest,
     },
+    replica_credential::{
+        ReplicaCredential, ReplicaIssuanceOutcome, ReplicaIssuanceRequest, ReplicaIssuerAuthority,
+    },
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -37,6 +40,46 @@ impl RaftReplicaBindingStore {
         Self {
             inner: ControlStateStore::new(node, runtime, CONTROL_NS_REPLICA),
         }
+    }
+
+    /// Publish issuance facts using the same authority as allocation changes.
+    /// The trusted caller validates controller/CSR possession and retains the
+    /// original request; Unknown is reconciled with that exact operation.
+    pub fn issue(
+        &self,
+        request: &ReplicaIssuanceRequest,
+    ) -> Result<ReplicaIssuanceOutcome, ReplicaBindingError> {
+        request.validate().map_err(ReplicaBindingError::Invalid)?;
+        self.commit(Command::ApplyReplicaIssuance(Box::new(request.clone())))
+    }
+
+    pub fn issuer_authority(&self) -> Result<Option<ReplicaIssuerAuthority>, ReplicaBindingError> {
+        self.inner
+            .read_linearizable(|sm| sm.replica_issuer_authority())
+            .map_err(ReplicaBindingError::Unavailable)?
+            .map_err(|error| ReplicaBindingError::Unavailable(error.to_string()))
+    }
+
+    pub fn credential(&self, id: &str) -> Result<Option<ReplicaCredential>, ReplicaBindingError> {
+        contracts::validate_operation_id(id)
+            .map_err(|error| ReplicaBindingError::Invalid(error.to_string()))?;
+        let id = id.to_owned();
+        self.inner
+            .read_linearizable(move |sm| sm.replica_credential(&id))
+            .map_err(ReplicaBindingError::Unavailable)?
+            .map_err(|error| ReplicaBindingError::Unavailable(error.to_string()))
+    }
+
+    pub fn reconcile_issuance(
+        &self,
+        request: &ReplicaIssuanceRequest,
+    ) -> Result<Option<ReplicaIssuanceOutcome>, ReplicaBindingError> {
+        request.validate().map_err(ReplicaBindingError::Invalid)?;
+        let request = request.clone();
+        self.inner
+            .read_linearizable(move |sm| sm.replica_issuance_receipt(&request))
+            .map_err(ReplicaBindingError::Unavailable)?
+            .map_err(|error| ReplicaBindingError::Unavailable(error.to_string()))
     }
 
     /// One proposal, with revision check and receipt at apply. The caller

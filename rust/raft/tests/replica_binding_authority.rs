@@ -15,6 +15,9 @@ use nexus_raft::{
 };
 use std::sync::{Arc, Barrier};
 
+#[path = "replica_binding_authority/issuance.rs"]
+mod issuance;
+
 struct LocalAuthority {
     store: Arc<RaftReplicaBindingStore>,
     manager: Arc<ZoneManager>,
@@ -377,6 +380,25 @@ async fn managed_control_refuses_before_unactivated_command_enters_the_log() {
         .is_err());
     assert!(node
         .propose_ec(Command::ReserveNodeIdentity(Box::new(node_request)))
+        .await
+        .is_err());
+    let issuer = contracts::replica_credential::ReplicaIssuanceRequest {
+        operation_id: "managed-issuer-refusal".into(),
+        change: contracts::replica_credential::ReplicaIssuanceChange::Authority {
+            expected_revision: None,
+            issuer_sha256: Some([8; 32]),
+        },
+    };
+    assert!(matches!(
+        store.issue(&issuer),
+        Err(ReplicaBindingError::Unsupported)
+    ));
+    assert!(node
+        .propose(Command::ApplyReplicaIssuance(Box::new(issuer.clone())))
+        .await
+        .is_err());
+    assert!(node
+        .propose_ec(Command::ApplyReplicaIssuance(Box::new(issuer)))
         .await
         .is_err());
     assert_eq!(node.last_index(), before);

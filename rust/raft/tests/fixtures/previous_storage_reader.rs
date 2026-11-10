@@ -30,6 +30,9 @@ fn previous_reader_refuses_applied_compacted_and_snapshot_replica_formats() {
         "node-applied",
         "node-compacted",
         "node-snapshot",
+        "issuer-applied",
+        "issuer-compacted",
+        "issuer-snapshot",
     ] {
         let path = fixtures.join(fixture);
         let id = {

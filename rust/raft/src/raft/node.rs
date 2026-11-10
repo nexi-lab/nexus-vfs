@@ -1446,7 +1446,9 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         }
         if !matches!(
             command,
-            Command::ApplyReplicaBinding(_) | Command::ReserveNodeIdentity(_)
+            Command::ApplyReplicaBinding(_)
+                | Command::ReserveNodeIdentity(_)
+                | Command::ApplyReplicaIssuance(_)
         ) {
             return Err(RaftError::InvalidState(
                 "not a replica control command".into(),

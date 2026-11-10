@@ -32,23 +32,29 @@ enum Case {
     Replica,
     ReplicaRetired,
     Node,
+    Issuer,
+    IssuerDisabled,
 }
 
-const CASES: [Case; 5] = [
+const CASES: [Case; 7] = [
     Case::Content,
     Case::ContentDeleted,
     Case::Replica,
     Case::ReplicaRetired,
     Case::Node,
+    Case::Issuer,
+    Case::IssuerDisabled,
 ];
 
 impl Case {
     fn namespace(self) -> &'static str {
         match self {
             Self::Content | Self::ContentDeleted => "content-version-v1",
-            Self::Replica | Self::ReplicaRetired | Self::Node => {
-                contracts::constants::CONTROL_NS_REPLICA
-            }
+            Self::Replica
+            | Self::ReplicaRetired
+            | Self::Node
+            | Self::Issuer
+            | Self::IssuerDisabled => contracts::constants::CONTROL_NS_REPLICA,
         }
     }
 }
@@ -74,6 +80,38 @@ fn populate(path: &Path, case: Case) -> u64 {
     let runtime = Runtime::open(path);
     let node = runtime.0.get_zone("root").unwrap().consensus_node().clone();
     match case {
+        Case::Issuer | Case::IssuerDisabled => {
+            use contracts::replica_credential::{
+                ReplicaIssuanceChange, ReplicaIssuanceOutcome, ReplicaIssuanceRequest,
+            };
+            let store = RaftReplicaBindingStore::new(node.clone(), runtime.0.runtime_handle());
+            assert!(matches!(
+                store
+                    .issue(&ReplicaIssuanceRequest {
+                        operation_id: "admit-current-ca".into(),
+                        change: ReplicaIssuanceChange::Authority {
+                            expected_revision: None,
+                            issuer_sha256: Some([8; 32])
+                        },
+                    })
+                    .unwrap(),
+                ReplicaIssuanceOutcome::AuthorityChanged(_)
+            ));
+            if matches!(case, Case::IssuerDisabled) {
+                assert!(matches!(
+                    store
+                        .issue(&ReplicaIssuanceRequest {
+                            operation_id: "disable-current-ca".into(),
+                            change: ReplicaIssuanceChange::Authority {
+                                expected_revision: Some(1),
+                                issuer_sha256: None
+                            },
+                        })
+                        .unwrap(),
+                    ReplicaIssuanceOutcome::AuthorityChanged(_)
+                ));
+            }
+        }
         Case::Node => {
             let store = RaftReplicaBindingStore::new(node.clone(), runtime.0.runtime_handle());
             assert!(matches!(
@@ -226,6 +264,20 @@ fn replica_format_fixtures_for_previous_reader() {
             true,
             "node-snapshot",
             b"node-identity-v1".as_slice(),
+        ),
+        (
+            "issuer-applied",
+            Case::Issuer,
+            false,
+            "issuer-snapshot",
+            b"replica-issuance-v1".as_slice(),
+        ),
+        (
+            "issuer-compacted",
+            Case::IssuerDisabled,
+            true,
+            "issuer-snapshot",
+            b"replica-issuance-v1".as_slice(),
         ),
     ] {
         let path = destination.join(name);
