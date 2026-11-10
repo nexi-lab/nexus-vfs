@@ -286,21 +286,18 @@ impl PeerBlobClient {
         self.fetch_scoped(address, Some(zone_id), content_id)
     }
 
-    /// Drive both blocking entry points through the same future and runtime
-    /// bridge. `block_in_place` releases a Tokio worker before blocking;
-    /// callers outside Tokio can enter the borrowed runtime directly.
+    /// Drive both blocking entry points through the shared runtime bridge,
+    /// including callers on a current-thread Agent runtime.
     fn fetch_scoped(
         &self,
         address: &str,
         zone_id: Option<&str>,
         content_id: &str,
     ) -> Result<Vec<u8>, String> {
-        let fut = self.fetch_scoped_async(address, zone_id, content_id);
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| self.runtime.block_on(fut))
-        } else {
-            self.runtime.block_on(fut)
-        }
+        lib::rt::block_on_via(
+            &self.runtime,
+            self.fetch_scoped_async(address, zone_id, content_id),
+        )
     }
 }
 
