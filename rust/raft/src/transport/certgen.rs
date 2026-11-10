@@ -435,6 +435,19 @@ pub fn generate_user_replica_cert(
     ca_cert_pem: &[u8],
     ca_key_pem: &[u8],
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
+    sign_agent_params(
+        user_replica_certificate_params(name, owner_id, node_id, validity_secs)?,
+        ca_cert_pem,
+        ca_key_pem,
+    )
+}
+
+fn user_replica_certificate_params(
+    name: &str,
+    owner_id: &str,
+    node_id: u64,
+    validity_secs: u64,
+) -> Result<CertificateParams, String> {
     let mut params = user_runtime_certificate_params(name, owner_id, validity_secs)?;
     params.subject_alt_names.push(SanType::URI(
         lib::transport_primitives::replica_identity_uri(node_id)?
@@ -442,7 +455,7 @@ pub fn generate_user_replica_cert(
             .try_into()
             .map_err(|e| format!("replica identity SAN: {e}"))?,
     ));
-    sign_agent_params(params, ca_cert_pem, ca_key_pem)
+    Ok(params)
 }
 
 fn user_runtime_certificate_params(
@@ -559,7 +572,10 @@ fn agent_certificate_params(
 mod csr_tests;
 
 mod csr_intent;
-pub use csr_intent::{prepare_agent_csr_intent, sign_committed_agent_intent};
+pub use csr_intent::{
+    prepare_agent_csr_intent, prepare_replica_csr_intent, sign_committed_agent_intent,
+    sign_committed_replica_intent,
+};
 
 /// Generate a self-signed root CA certificate for a zone.
 ///
