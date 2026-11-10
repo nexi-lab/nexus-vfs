@@ -319,7 +319,8 @@ fn corrupt_and_missing_immutable_objects_are_failures_instead_of_absence() {
         .as_cas()
         .unwrap()
         .transport()
-        .blob_path(metadata.content_id.as_ref().unwrap());
+        .blob_path(metadata.content_id.as_ref().unwrap())
+        .unwrap();
     std::fs::write(&object, b"corrupted").unwrap();
     assert!(matches!(
         fixture

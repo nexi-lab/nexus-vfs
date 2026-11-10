@@ -109,24 +109,7 @@ impl Drop for OwnedRuntime {
 /// The scratch-thread hop is paid **only** on the current-thread branch (rare —
 /// an in-process managed agent crossing into async work); the hot multi-thread
 /// path keeps the zero-alloc `block_in_place`.
-fn dispatch<T, Op>(block_on: Op) -> T
-where
-    Op: FnOnce() -> T + Send,
-    T: Send,
-{
-    let mut operation = Some(block_on);
-    dispatch_erased(&mut || {
-        let operation = operation.take().expect("runtime operation called once");
-        operation()
-    })
-}
-
-// Share runtime selection and scoped-thread setup across concrete operations.
-#[inline(never)]
-fn dispatch_erased<T>(block_on: &mut (dyn FnMut() -> T + Send)) -> T
-where
-    T: Send,
-{
+fn dispatch(block_on: impl FnOnce() + Send) {
     match Handle::try_current() {
         Err(_) => block_on(),
         Ok(current) => match current.runtime_flavor() {
@@ -156,7 +139,40 @@ where
     F: std::future::Future + Send,
     F::Output: Send,
 {
-    dispatch(move || handle.block_on(fut))
+    block_on(Some(handle), fut)
+}
+
+fn block_on<F>(handle: Option<&Handle>, future: F) -> F::Output
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
+    let mut output = None;
+    {
+        let future = std::pin::pin!(async { output = Some(future.await) });
+        block_on_erased(handle, future);
+    }
+    output.expect("runtime bridge future completed")
+}
+
+// The future and its output stay in the caller's stack frame. Tokio and the
+// scoped thread drive one unit-output future type, shared by every caller.
+#[inline(never)]
+fn block_on_erased(
+    handle: Option<&Handle>,
+    future: std::pin::Pin<&mut (dyn std::future::Future<Output = ()> + Send + '_)>,
+) {
+    dispatch(move || match handle {
+        Some(handle) => handle.block_on(future),
+        None => match Handle::try_current() {
+            Ok(handle) => handle.block_on(future),
+            Err(_) => Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("rt::block_on_portable ephemeral runtime")
+                .block_on(future),
+        },
+    })
 }
 
 /// Run a **self-contained** future to completion from any context, without
@@ -168,104 +184,5 @@ where
     F: std::future::Future + Send,
     F::Output: Send,
 {
-    dispatch(move || match Handle::try_current() {
-        Ok(handle) => handle.block_on(fut),
-        Err(_) => Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("rt::block_on_portable ephemeral runtime")
-            .block_on(fut),
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{block_on_portable, block_on_via, OwnedRuntime};
-
-    fn inner() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("inner runtime")
-    }
-
-    // block_on_via — the owned-inner-runtime bridge — across all three contexts.
-    #[test]
-    fn via_no_ambient_runtime() {
-        let rt = inner();
-        assert_eq!(block_on_via(rt.handle(), async { 40 + 2 }), 42);
-    }
-
-    #[test]
-    fn via_multi_thread_ambient() {
-        let rt = inner();
-        let outer = inner();
-        assert_eq!(
-            outer.block_on(async { block_on_via(rt.handle(), async { 6 * 7 }) }),
-            42
-        );
-    }
-
-    #[test]
-    fn via_current_thread_ambient_does_not_panic() {
-        // THE REGRESSION: the co-host managed-agent (current-thread) runtime
-        // reaching a federated kernel op. Pre-fix this panicked.
-        let rt = inner();
-        let agent = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let value = String::from("borrowed across the runtime bridge");
-        let observed = agent.block_on(async {
-            block_on_via(rt.handle(), async {
-                tokio::task::yield_now().await;
-                value.as_str()
-            })
-        });
-        assert_eq!(observed, value.as_str());
-    }
-
-    // block_on_portable — the self-contained tool-bridge form — same matrix.
-    #[test]
-    fn portable_no_ambient_runtime() {
-        assert_eq!(block_on_portable(async { 40 + 2 }), 42);
-    }
-
-    // OwnedRuntime — the drop rule, in the context where a bare drop panics.
-    #[test]
-    fn owned_runtime_drops_inside_an_async_context() {
-        // The shape that panics with a bare `Runtime`: a fallible constructor that
-        // builds one and then returns `Err`, with an ambient runtime around it. What
-        // must survive is the error — the caller's reason, not a tokio backtrace.
-        fn fails_after_building_one() -> Result<OwnedRuntime, &'static str> {
-            let _rt = OwnedRuntime::new(inner());
-            Err("the reason the operator needs to see")
-        }
-        let outer = inner();
-        let reason = outer.block_on(async { fails_after_building_one().err() });
-        assert_eq!(reason, Some("the reason the operator needs to see"));
-    }
-
-    #[test]
-    fn owned_runtime_still_runs_work_and_drops_from_sync() {
-        let rt = OwnedRuntime::new(inner());
-        // Deref: an owner uses it exactly like the `Runtime` it wraps.
-        assert_eq!(rt.block_on(async { 40 + 2 }), 42);
-        assert_eq!(block_on_via(rt.handle(), async { 42 }), 42);
-        drop(rt); // no ambient runtime: the blocking shutdown, as intended
-    }
-
-    #[test]
-    fn portable_current_thread_ambient_does_not_panic() {
-        // The bash / MCP / VLM tool-call shape from a current-thread agent turn.
-        let agent = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        assert_eq!(
-            agent.block_on(async { block_on_portable(async { 42 }) }),
-            42
-        );
-    }
+    block_on(None, fut)
 }

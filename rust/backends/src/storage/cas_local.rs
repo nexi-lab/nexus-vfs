@@ -139,6 +139,56 @@ mod tests {
     }
 
     #[test]
+    fn cas_mount_requires_metadata_even_for_a_known_content_hash() {
+        use kernel::kernel::{
+            convenience::{KernelConvenience, MountOptions},
+            syscall::KernelSyscall,
+            Kernel, KernelError,
+        };
+        use std::sync::Arc;
+
+        let (_tmp, backend) = setup();
+        let ctx = test_ctx();
+        let content = b"stored object with no file metadata";
+        let written = backend.write_content(content, "", &ctx, 0).unwrap();
+        let backend = Arc::new(backend);
+        let kernel = Kernel::new();
+        let admin = kernel::kernel::OperationContext::new("admin", "root", true, None, true);
+        kernel
+            .mount(
+                "/cas",
+                MountOptions::new(&admin, "cas").with_backend(backend.clone()),
+            )
+            .unwrap();
+        for path in [
+            "/cas/missing.reply".to_string(),
+            format!("/cas/{}", written.content_id),
+        ] {
+            assert!(
+                matches!(
+                    KernelSyscall::sys_read(&kernel, &path, &ctx, 0, 0),
+                    Err(KernelError::FileNotFound(_))
+                ),
+                "{path}"
+            );
+        }
+        // Direct CAS reads remain hash-addressed; the namespace refusal does
+        // not discard or reinterpret the stored object.
+        assert_eq!(
+            backend.read_content(&written.content_id, &ctx).unwrap(),
+            content
+        );
+        kernel.write("/cas/published", &ctx, content, 0).unwrap();
+        assert_eq!(
+            KernelSyscall::sys_read(&kernel, "/cas/published", &ctx, 0, 0)
+                .unwrap()
+                .data
+                .unwrap(),
+            content
+        );
+    }
+
+    #[test]
     fn test_cas_local_backend_write_and_read() {
         let (_tmp, backend) = setup();
         let ctx = test_ctx();
