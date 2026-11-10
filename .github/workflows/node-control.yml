@@ -6,9 +6,21 @@ on:
   pull_request:
     paths:
       - 'rust/raft/**'
+      - 'rust/contracts/src/replica_binding.rs'
+      - 'rust/contracts/src/node_identity.rs'
+      - 'rust/contracts/src/credential_intent.rs'
+      - 'rust/contracts/src/replica_credential.rs'
       - 'rust/kernel/src/abc/meta_store.rs'
       - 'rust/kernel/src/core/meta_store/**'
+      - 'rust/kernel/src/core/vfs_router.rs'
       - 'rust/kernel/src/extensions/conditional_metadata.rs'
+      - 'rust/kernel/src/federation/cold_segment.rs'
+      - 'rust/kernel/src/federation/cold_segment/**'
+      - 'rust/kernel/src/kernel/syscall_impl.rs'
+      - 'rust/kernel/src/kernel/mount.rs'
+      - 'rust/kernel/src/kernel/mount/**'
+      - 'rust/transport/src/peer_blob.rs'
+      - 'rust/transport/src/peer_blob/**'
       - 'rust/profiles/cluster/**'
       - 'rust/managed_agent/**'
       - 'rust/lib/src/transport_primitives/**'
@@ -17,6 +29,7 @@ on:
       - 'rust/lib/Cargo.toml'
       - 'proto/nexus/raft/**'
       - '.github/workflows/node-control.yml'
+      - '.github/scripts/storage-format-compatibility.py'
       - '.github/actions/setup-rust-tests/**'
 
 env:
@@ -41,6 +54,16 @@ jobs:
           cache-key: node-control-${{ matrix.os }}
       - run: cargo test --locked -p raft@0.1.0 --test node_rpc_boundaries
       - run: cargo test --locked -p raft@0.1.0 --test generated_contract_binding
+      - name: Durable replica allocation authority
+        run: |
+          cargo test --locked -p raft@0.1.0 --lib raft::state_machine::replica_binding::tests
+          cargo test --locked -p raft@0.1.0 --lib raft::state_machine::node_identity::tests
+          cargo test --locked -p raft@0.1.0 --lib raft::state_machine::replica_issuance::tests
+          cargo test --locked -p raft@0.1.0 --lib transport::certgen::csr_intent::tests
+          cargo test --locked -p raft@0.1.0 --lib raft::state_machine::storage_admission::tests
+          cargo test --locked -p raft@0.1.0 --test replica_binding_authority
+          cargo test --locked -p raft@0.1.0 --test test_durable_storage_admission -- --test-threads=1
+          cargo test --locked -p raft@0.1.0 --test test_raft_apply_failure -- --test-threads=1
       - name: Conditional metadata, local root and data-zone boundaries
         run: cargo test --locked -p raft@0.1.0 --test test_conditional_zone_metadata --test test_conditional_metadata_ec_boundary --test test_isolated_root_admission --test test_zone_owner_replication -- --test-threads=1
       - name: ReadIndex election, quorum and cancellation boundaries
@@ -61,6 +84,18 @@ jobs:
         run: 'cargo test --locked -p lib --features runtime-bridge --test runtime_bridge'
       - run: cargo test --locked -p raft@0.1.0 --lib agent_csr_client::tests
       - run: cargo test --locked -p raft@0.1.0 --lib zone_manager::tests::mismatched_node_certificate
+      - name: Previous reader refuses the durable replica format
+        if: runner.os == 'Linux'
+        run: python3 .github/scripts/storage-format-compatibility.py --output "${{ runner.temp }}/replica-storage-compatibility"
+      - name: Preserve storage compatibility evidence
+        if: always() && runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: replica-storage-compatibility
+          path: |
+            ${{ runner.temp }}/replica-storage-compatibility/*.log
+            ${{ runner.temp }}/replica-storage-compatibility/receipt.json
+          if-no-files-found: warn
 
   runtime-enrollment:
     runs-on: ${{ matrix.os }}

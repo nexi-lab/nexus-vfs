@@ -65,6 +65,10 @@ jobs:
         run: cargo test -p kernel --test cas_publication --test boot_metastore
       - name: Reject malformed content identifiers before filesystem access
         run: cargo test --locked -p kernel --lib core::cas::transport::tests::invalid_content_ids_are_refused_before_filesystem_access
+      - name: Cold peer reads retain their owning zone
+        run: cargo test --locked -p kernel --lib federation::cold_segment::tests
+      - name: Concurrent mounts retain complete storage pairs
+        run: cargo test --locked -p kernel --lib kernel::mount::tests
       - name: Batch write results and commit notifications on the native filesystem
         run: cargo test --locked -p kernel --test batch_write_outcomes
       - name: Durable CAS ObjectStore composition
@@ -76,6 +80,9 @@ jobs:
     name: Durable runtime executables / Linux
     runs-on: ubuntu-22.04
     timeout-minutes: 25
+    outputs:
+      artifact-id: ${{ steps.runtime-bundle.outputs.artifact-id }}
+      artifact-digest: ${{ steps.runtime-bundle.outputs.artifact-digest }}
     env:
       CARGO_BUILD_JOBS: 2
       CARGO_INCREMENTAL: '0'
@@ -99,6 +106,7 @@ jobs:
           cargo test --locked -p nexus-cluster -p raft@0.1.0 --features nexus-cluster/driver-cas-local --test user_runtime --test conditional_content --test cas_peer_blob --test zone_content_blob --test dt_stream_unbounded --test test_protected_zone_metadata --no-run --message-format=json > "$RUNNER_TEMP/durable-runtime-artifacts.json"
           python3 scripts/e2e/durable_artifacts.py pack --artifacts "$RUNNER_TEMP/durable-runtime-artifacts.json" --directory "$RUNNER_TEMP/durable-runtime-bundle"
       - uses: actions/upload-artifact@v4
+        id: runtime-bundle
         with:
           name: durable-runtime-executables
           path: ${{ runner.temp }}/durable-runtime-bundle
@@ -110,14 +118,24 @@ jobs:
     needs: durable-runtime-build
     runs-on: ubuntu-22.04
     timeout-minutes: 25
+    permissions:
+      contents: read
+      actions: read
     env:
       MOSS_RUNTIME_TOOLS_REV: aa02a532fa8067506922102212459720fb421127
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          name: durable-runtime-executables
-          path: ${{ runner.temp }}/durable-runtime-bundle
+      - name: Download the producer's immutable executable bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUNTIME_ARTIFACT_ID: ${{ needs.durable-runtime-build.outputs.artifact-id }}
+          RUNTIME_ARCHIVE_DIGEST: ${{ needs.durable-runtime-build.outputs.artifact-digest }}
+        run: >-
+          python3 scripts/e2e/durable_artifacts.py download
+          --repository "$GITHUB_REPOSITORY"
+          --artifact-id "$RUNTIME_ARTIFACT_ID"
+          --archive-digest "$RUNTIME_ARCHIVE_DIGEST"
+          --directory "$RUNNER_TEMP/durable-runtime-bundle"
       - name: Restore the verified executables for this source tree
         run: python3 scripts/e2e/durable_artifacts.py restore --directory "$RUNNER_TEMP/durable-runtime-bundle"
       - name: Prepare the official previous storage reader

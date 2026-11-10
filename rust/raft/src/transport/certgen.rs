@@ -34,29 +34,7 @@ const CA_VALIDITY_DAYS: i64 = 365 * 10;
 /// A CSR is a public key and proof, not an unbounded certificate-policy input.
 const MAX_CSR_PEM_BYTES: usize = 16 * 1024;
 
-/// Scheme + authority of the identity URI SAN. Certificates are the
-/// only place a node's identity is stated in a way the far end can
-/// verify, so the format lives here — next to the code that mints it —
-/// and `transport::peer_identity` reads it back through
-/// [`parse_node_identity_uri`] rather than re-spelling it.
-const NODE_IDENTITY_URI_PREFIX: &str = "nexus://zone/";
-
-/// Build the identity URI SAN pinned into a node certificate:
-/// `nexus://zone/{zone_id}/node/{node_id}`.
-pub fn node_identity_uri(zone_id: &str, node_id: u64) -> String {
-    format!("{NODE_IDENTITY_URI_PREFIX}{zone_id}/node/{node_id}")
-}
-
-/// Inverse of [`node_identity_uri`] — `None` for any URI that is not
-/// ours or is malformed (a foreign SAN must never resolve to a peer).
-pub fn parse_node_identity_uri(uri: &str) -> Option<(String, u64)> {
-    let rest = uri.strip_prefix(NODE_IDENTITY_URI_PREFIX)?;
-    let (zone_id, node_id) = rest.split_once("/node/")?;
-    if zone_id.is_empty() {
-        return None;
-    }
-    Some((zone_id.to_string(), node_id.parse().ok()?))
-}
+pub use lib::transport_primitives::{node_identity_uri, parse_node_identity_uri};
 
 /// Parse a cluster CA (cert + private key, both PEM) into an rcgen `Issuer`
 /// ready to sign leaf certs. Shared by node/agent cert generation and CRL
@@ -457,6 +435,19 @@ pub fn generate_user_replica_cert(
     ca_cert_pem: &[u8],
     ca_key_pem: &[u8],
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
+    sign_agent_params(
+        user_replica_certificate_params(name, owner_id, node_id, validity_secs)?,
+        ca_cert_pem,
+        ca_key_pem,
+    )
+}
+
+fn user_replica_certificate_params(
+    name: &str,
+    owner_id: &str,
+    node_id: u64,
+    validity_secs: u64,
+) -> Result<CertificateParams, String> {
     let mut params = user_runtime_certificate_params(name, owner_id, validity_secs)?;
     params.subject_alt_names.push(SanType::URI(
         lib::transport_primitives::replica_identity_uri(node_id)?
@@ -464,7 +455,7 @@ pub fn generate_user_replica_cert(
             .try_into()
             .map_err(|e| format!("replica identity SAN: {e}"))?,
     ));
-    sign_agent_params(params, ca_cert_pem, ca_key_pem)
+    Ok(params)
 }
 
 fn user_runtime_certificate_params(
@@ -581,7 +572,10 @@ fn agent_certificate_params(
 mod csr_tests;
 
 mod csr_intent;
-pub use csr_intent::{prepare_agent_csr_intent, sign_committed_agent_intent};
+pub use csr_intent::{
+    prepare_agent_csr_intent, prepare_replica_csr_intent, sign_committed_agent_intent,
+    sign_committed_replica_intent,
+};
 
 /// Generate a self-signed root CA certificate for a zone.
 ///

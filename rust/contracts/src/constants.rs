@@ -91,6 +91,8 @@ pub const CONTROL_NS_AUTH: &str = "auth";
 pub const CONTROL_NS_FOREIGN_CA: &str = "foreign-ca";
 /// Immutable collaboration-space bindings and irreversible revocations.
 pub const CONTROL_NS_COLLABORATION: &str = "collaboration";
+/// Native replica allocation bindings and their committed operation receipts.
+pub const CONTROL_NS_REPLICA: &str = "replica-binding";
 /// See [`CONTROL_NS_AUTH`].
 pub const CONTROL_NS_SESSION_MINT_ALLOW: &str = "session-mint-allow";
 /// See [`CONTROL_NS_AUTH`].
