@@ -322,7 +322,14 @@ impl KernelRawSpawn {
                 let reason = pump_output(stdout, output_mailbox, control)
                     .await
                     .err()
-                    .unwrap_or_else(|| "session host control output closed".into());
+                    .unwrap_or_else(|| {
+                        if is_local {
+                            "local host control output closed; OS exit is unobserved"
+                        } else {
+                            "subprocess closed stdout"
+                        }
+                        .into()
+                    });
                 let _ = failed_tx.send(reason);
                 drop(host_closed);
             }),
