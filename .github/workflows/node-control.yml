@@ -13,6 +13,7 @@ on:
       - 'rust/profiles/cluster/**'
       - 'rust/managed_agent/**'
       - 'rust/lib/src/transport_primitives/**'
+      - 'rust/lib/src/rt.rs'
       - 'proto/nexus/raft/**'
       - '.github/workflows/node-control.yml'
       - '.github/scripts/storage-format-compatibility.py'
@@ -61,6 +62,8 @@ jobs:
         run: cargo test --locked -p raft@0.1.0 --lib transport::transport_loop::tests
       - name: Content peer TLS configuration and connection rotation
         run: 'cargo test --locked -p transport --lib peer_blob::'
+      - name: Shared executor bridge across runtime flavors
+        run: 'cargo test --locked -p lib --features transport --lib rt::tests::'
       - run: cargo test --locked -p raft@0.1.0 --lib agent_csr_client::tests
       - run: cargo test --locked -p raft@0.1.0 --lib zone_manager::tests::mismatched_node_certificate
       - name: Previous reader refuses the durable replica format
