@@ -23,8 +23,8 @@ use super::proto::nexus::raft::{
     MintAgentResponse, MintKeyRequest, MintKeyResponse, MintSessionAgentRequest,
     MintSessionAgentResponse, NodeInfo as ProtoNodeInfo, ProposeRequest, ProposeResponse,
     QueryRequest, QueryResponse, RaftCommand, RaftQueryResponse, RaftResponse, ReadBlobRequest,
-    ReadBlobResponse, RegisterForeignCaRequest, RegisterForeignCaResponse, RemoveVoterRequest,
-    RemoveVoterResponse, RenewSessionAgentRequest, ReplicateEntriesRequest,
+    ReadBlobResponse, ReadZoneBlobRequest, RegisterForeignCaRequest, RegisterForeignCaResponse,
+    RemoveVoterRequest, RemoveVoterResponse, RenewSessionAgentRequest, ReplicateEntriesRequest,
     ReplicateEntriesResponse, RevokeAgentCertRequest, RevokeAgentCertResponse, RevokeKeyRequest,
     RevokeKeyResponse, SearchCapabilities, SnapshotEcStateRequest, SnapshotEcStateResponse,
     StepMessageRequest, StepMessageResponse, UnregisterForeignCaRequest,
@@ -165,12 +165,14 @@ impl RaftGrpcServer {
             session_mint_admin_slot: self.session_mint_admin_slot.clone(),
         };
         Ok((
-            NodeControlService::new(ZoneTransportServiceServer::new(raft), policy.clone(), &[]),
+            NodeControlService::new(ZoneTransportServiceServer::new(raft), policy.clone(), &[])
+                .with_owner_replica_data(),
             NodeControlService::new(
                 ZoneApiServiceServer::new(api),
                 policy,
                 AGENT_CREDENTIAL_METHODS,
-            ),
+            )
+            .with_owner_replica_data(),
         ))
     }
     pub fn new(registry: Arc<ZoneRaftRegistry>, config: ServerConfig) -> Self {
@@ -601,15 +603,23 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
         &self,
         request: Request<StepMessageRequest>,
     ) -> std::result::Result<Response<StepMessageResponse>, Status> {
+        super::node_authority::authorize_data_zone(
+            request.extensions(),
+            &self.registry,
+            &request.get_ref().zone_id,
+        )?;
         let message = match parse_raft_message(&request.get_ref().message) {
             Ok(message) => message,
             Err(response) => return Ok(Response::new(response)),
         };
-        let peer = super::node_authority::authorize_raft_sender(&request, &message)?;
+        let peer = super::node_authority::authorize_raft_sender(request.extensions(), &message)?;
         let req = request.into_inner();
         let node = match self.registry.get_node(&req.zone_id) {
             Some(n) => n,
             None => {
+                if !self.registry.permits_automatic_zone_join() {
+                    return Err(Status::not_found("zone is not admitted on this runtime"));
+                }
                 if self.registry.is_auto_join_suppressed(&req.zone_id) {
                     return Err(Status::not_found(format!(
                         "zone '{}' was recently removed on this node",
@@ -670,7 +680,15 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
         &self,
         request: Request<ReplicateEntriesRequest>,
     ) -> std::result::Result<Response<ReplicateEntriesResponse>, Status> {
-        super::node_authority::authorize_ec_sender(&request, request.get_ref().sender_node_id)?;
+        super::node_authority::authorize_data_zone(
+            request.extensions(),
+            &self.registry,
+            &request.get_ref().zone_id,
+        )?;
+        super::node_authority::authorize_ec_sender(
+            request.extensions(),
+            request.get_ref().sender_node_id,
+        )?;
         let req = request.into_inner();
         let node = get_zone_node(&self.registry, &req.zone_id)?;
 
@@ -758,7 +776,15 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
         &self,
         request: Request<SnapshotEcStateRequest>,
     ) -> std::result::Result<Response<SnapshotEcStateResponse>, Status> {
-        super::node_authority::authorize_ec_sender(&request, request.get_ref().sender_node_id)?;
+        super::node_authority::authorize_data_zone(
+            request.extensions(),
+            &self.registry,
+            &request.get_ref().zone_id,
+        )?;
+        super::node_authority::authorize_ec_sender(
+            request.extensions(),
+            request.get_ref().sender_node_id,
+        )?;
         let req = request.into_inner();
         let node = get_zone_node(&self.registry, &req.zone_id)?;
 
@@ -841,6 +867,37 @@ struct ZoneApiServiceImpl {
 }
 
 impl ZoneApiServiceImpl {
+    async fn blob_response(
+        &self,
+        zone_id: Option<&str>,
+        content_id: &str,
+    ) -> Response<ReadBlobResponse> {
+        let fetcher = self
+            .blob_fetcher_slot
+            .as_ref()
+            .and_then(|slot| slot.read().as_ref().cloned());
+        let Some(fetcher) = fetcher else {
+            return Response::new(ReadBlobResponse {
+                content: Vec::new(),
+                error: "blob fetcher not installed".to_string(),
+            });
+        };
+        let result = match zone_id {
+            Some(zone) => fetcher.read_in_zone(zone, content_id).await,
+            None => fetcher.read(content_id).await,
+        };
+        Response::new(match result {
+            Ok(content) => ReadBlobResponse {
+                content,
+                error: String::new(),
+            },
+            Err(error) => ReadBlobResponse {
+                content: Vec::new(),
+                error,
+            },
+        })
+    }
+
     async fn agent_csr_response(
         &self,
         request: Request<super::proto::AgentCsrRequest>,
@@ -900,6 +957,11 @@ impl ZoneApiService for ZoneApiServiceImpl {
         &self,
         request: Request<ProposeRequest>,
     ) -> std::result::Result<Response<ProposeResponse>, Status> {
+        super::node_authority::authorize_data_zone(
+            request.extensions(),
+            &self.registry,
+            &request.get_ref().zone_id,
+        )?;
         let req = request.into_inner();
         let node = get_zone_node(&self.registry, &req.zone_id)?;
 
@@ -1024,6 +1086,11 @@ impl ZoneApiService for ZoneApiServiceImpl {
         &self,
         request: Request<QueryRequest>,
     ) -> std::result::Result<Response<QueryResponse>, Status> {
+        super::node_authority::authorize_data_zone(
+            request.extensions(),
+            &self.registry,
+            &request.get_ref().zone_id,
+        )?;
         let req = request.into_inner();
         let node = get_zone_node(&self.registry, &req.zone_id)?;
         let peers = self.registry.get_peers(&req.zone_id).unwrap_or_default();
@@ -1181,6 +1248,11 @@ impl ZoneApiService for ZoneApiServiceImpl {
         &self,
         request: Request<GetClusterInfoRequest>,
     ) -> std::result::Result<Response<GetClusterInfoResponse>, Status> {
+        super::node_authority::authorize_data_zone(
+            request.extensions(),
+            &self.registry,
+            &request.get_ref().zone_id,
+        )?;
         let req = request.into_inner();
         let node = get_zone_node(&self.registry, &req.zone_id)?;
         let peers = self.registry.get_peers(&req.zone_id).unwrap_or_default();
@@ -1636,6 +1708,11 @@ impl ZoneApiService for ZoneApiServiceImpl {
         &self,
         request: Request<GetSearchCapabilitiesRequest>,
     ) -> std::result::Result<Response<SearchCapabilities>, Status> {
+        super::node_authority::authorize_data_zone(
+            request.extensions(),
+            &self.registry,
+            &request.get_ref().zone_id,
+        )?;
         let zone_id = request.into_inner().zone_id;
         if !self.registry.hosts(&zone_id) {
             return Err(Status::not_found(format!("Zone '{}' not found", zone_id)));
@@ -1666,26 +1743,25 @@ impl ZoneApiService for ZoneApiServiceImpl {
         request: Request<ReadBlobRequest>,
     ) -> std::result::Result<Response<ReadBlobResponse>, Status> {
         let req = request.into_inner();
-        let fetcher = self
-            .blob_fetcher_slot
-            .as_ref()
-            .and_then(|slot| slot.read().as_ref().cloned());
-        let Some(fetcher) = fetcher else {
-            return Ok(Response::new(ReadBlobResponse {
-                content: Vec::new(),
-                error: "blob fetcher not installed".to_string(),
-            }));
-        };
-        match fetcher.read(&req.content_id).await {
-            Ok(bytes) => Ok(Response::new(ReadBlobResponse {
-                content: bytes,
-                error: String::new(),
-            })),
-            Err(e) => Ok(Response::new(ReadBlobResponse {
-                content: Vec::new(),
-                error: e,
-            })),
-        }
+        Ok(self.blob_response(None, &req.content_id).await)
+    }
+
+    async fn read_zone_blob(
+        &self,
+        request: Request<ReadZoneBlobRequest>,
+    ) -> std::result::Result<Response<ReadBlobResponse>, Status> {
+        super::node_authority::authorize_data_zone(
+            request.extensions(),
+            &self.registry,
+            &request.get_ref().zone_id,
+        )?;
+        let req = request.into_inner();
+        contracts::validate_zone_id_for(contracts::ZoneIdUse::TenantCreate, &req.zone_id)
+            .map_err(|_| Status::invalid_argument("invalid data zone"))?;
+        get_zone_node(&self.registry, &req.zone_id)?;
+        Ok(self
+            .blob_response(Some(&req.zone_id), &req.content_id)
+            .await)
     }
 
     /// Sign an agent identity cert on the CA holder (founder) for a remote
@@ -2875,7 +2951,7 @@ impl ZoneTransportService for WitnessServiceImpl {
             Ok(message) => message,
             Err(response) => return Ok(Response::new(response)),
         };
-        let peer = super::node_authority::authorize_raft_sender(&request, &message)?;
+        let peer = super::node_authority::authorize_raft_sender(request.extensions(), &message)?;
         let req = request.into_inner();
 
         // Route by zone_id — auto-join if zone not found (dynamic federation)

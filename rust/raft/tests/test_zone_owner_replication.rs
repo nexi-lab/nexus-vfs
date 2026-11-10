@@ -6,7 +6,7 @@
 
 mod common;
 
-use kernel::meta_store::{FileMetadata, MetaStore};
+use kernel::meta_store::{ConditionalMetadataResult, FileMetadata, MetaStore};
 use nexus_raft::distributed_coordinator::bootstrap_or_join_zone;
 use nexus_raft::transport::NodeAddress;
 use nexus_raft::zone_meta_store::ZoneMetaStore;
@@ -20,9 +20,58 @@ const HOME: &str = "/agents/alice";
 const SESSION: &str = "/sessions/sid-a";
 const LINK: &str = "/agents/alice/sessions/sid-a";
 const STREAM: &str = "__wal_stream__/sessions/sid-a/transcript.jsonl/";
+const ROOT_PRIVATE: &str = "/__managed_content_v1__/private-root";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_traffic_cannot_admit_an_unknown_zone_on_a_local_root_runtime() {
+    use nexus_raft::transport::proto::{
+        zone_transport_service_client::ZoneTransportServiceClient, StepMessageRequest,
+    };
+    use protobuf::Message as _;
+
+    let directory = tempfile::tempdir().unwrap();
+    let address = common::node_bind_addr();
+    let manager = node(31, directory.path(), &address).unwrap();
+    found(&manager, "root", 31, &address).await;
+    let mut client = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(client) =
+                ZoneTransportServiceClient::connect(format!("http://{address}")).await
+            {
+                break client;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("local data-zone listener starts");
+    let mut heartbeat = raft::eraftpb::Message {
+        from: 32,
+        to: 31,
+        term: 1,
+        ..Default::default()
+    };
+    heartbeat.set_msg_type(raft::eraftpb::MessageType::MsgHeartbeat);
+    let result = client
+        .step_message(StepMessageRequest {
+            zone_id: "unadmitted-zone".into(),
+            sender_address: "http://127.0.0.1:2126".into(),
+            message: heartbeat.write_to_bytes().unwrap(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(result.code(), tonic::Code::NotFound);
+    assert!(!manager.hosts_zone("unadmitted-zone"));
+    assert!(!directory.path().join("unadmitted-zone").exists());
+    assert_eq!(
+        manager.get_zone("root").unwrap().consensus_node().voters(),
+        vec![31]
+    );
+    manager.shutdown();
+}
 
 fn node(id: u64, dir: &std::path::Path, addr: &str) -> nexus_raft::raft::Result<Arc<ZoneManager>> {
-    ZoneManager::with_node_id(
+    ZoneManager::with_local_root(
         "agent-data-zone-probe",
         id,
         dir.to_str().unwrap(),
@@ -36,7 +85,14 @@ fn node(id: u64, dir: &std::path::Path, addr: &str) -> nexus_raft::raft::Result<
 
 async fn found(manager: &Arc<ZoneManager>, zone: &str, id: u64, addr: &str) {
     manager
-        .create_zone_async(zone, vec![format!("{id}@{addr}")])
+        .create_zone_async(
+            zone,
+            if zone == "root" {
+                vec![]
+            } else {
+                vec![format!("{id}@{addr}")]
+            },
+        )
         .await
         .unwrap()
         .consensus_node()
@@ -107,6 +163,21 @@ fn check_agent_state(manager: &ZoneManager) {
     assert_eq!(manager.list_zones().len(), 2);
     assert!(!manager.hosts_zone(OTHER_ZONE));
     let root = store(manager, "root", "/");
+    assert_eq!(
+        manager.get_zone("root").unwrap().consensus_node().voters(),
+        vec![32]
+    );
+    assert_eq!(
+        root.as_conditional_metadata()
+            .unwrap()
+            .read_versioned(ROOT_PRIVATE)
+            .unwrap()
+            .unwrap()
+            .metadata
+            .owner_id
+            .as_deref(),
+        Some("user-target")
+    );
     let mounts = root.list("/").unwrap();
     for path in [HOME, SESSION] {
         let mount = mounts.iter().find(|m| m.path == path).unwrap();
@@ -128,6 +199,20 @@ async fn selected_zone_join_preserves_disjoint_paths_owner_link_and_wal_tables()
         found(&source, zone, 31, &source_addr).await;
     }
     found(&target, "root", 32, &target_addr).await;
+    for (manager, owner) in [(&source, "user-source"), (&target, "user-target")] {
+        let root = store(manager, "root", "/");
+        assert!(matches!(
+            root.as_conditional_metadata()
+                .unwrap()
+                .replace_if_version(ROOT_PRIVATE, metadata(ROOT_PRIVATE, 0, "root", owner), None,)
+                .unwrap(),
+            ConditionalMetadataResult::Committed { .. }
+        ));
+        assert!(manager.join_zone("root", vec![], true).is_err());
+    }
+    assert!(store(&source, AGENT_ZONE, HOME)
+        .as_conditional_metadata()
+        .is_none());
 
     {
         let home = store(&source, AGENT_ZONE, HOME);

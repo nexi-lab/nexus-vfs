@@ -14,8 +14,8 @@ use nexus_raft::{
     prelude::Command,
     raft::ZoneRaftRegistry,
     transport::{
-        generate_agent_cert, generate_node_cert, generate_zone_ca, RaftGrpcServer,
-        RaftWitnessServer, ServerConfig, TlsConfig, WitnessZoneRegistry,
+        generate_agent_cert, generate_node_cert, generate_user_replica_cert, generate_zone_ca,
+        RaftGrpcServer, RaftWitnessServer, ServerConfig, TlsConfig, WitnessZoneRegistry,
     },
 };
 use protobuf::Message as _;
@@ -136,6 +136,210 @@ async fn fixed_local_root_refuses_incremental_ec_and_state_snapshots() {
     stop.send(()).unwrap();
     listener.await.unwrap().unwrap();
     manager.shutdown();
+}
+
+async fn assert_owner_replica_data_scope(
+    registry: &Arc<ZoneRaftRegistry>,
+    address: &str,
+    ca: &[u8],
+    ca_key: &[u8],
+) {
+    use nexus_raft::transport::proto::{GetClusterInfoRequest, JoinZoneRequest, QueryRequest};
+    use raft::eraftpb::{ConfChangeType, Entry, EntryType, MessageType};
+    const ZONE: &str = "owner-replica-data";
+    let node = registry
+        .create_zone(ZONE, vec![], &tokio::runtime::Handle::current())
+        .unwrap();
+    node.campaign().await.unwrap();
+    let membership = node
+        .propose_conf_change(ConfChangeType::AddLearnerNode, 4, Vec::new())
+        .await
+        .unwrap();
+    assert!(membership.learners.contains(&4));
+    let (cert, key) =
+        generate_user_replica_cert("session-member", "alice", 4, 300, ca, ca_key).unwrap();
+    let channel = connect(address, ca, cert, key).await;
+    let mut member = ZoneApiServiceClient::new(channel.clone());
+    let mut proposal = put("member-data");
+    proposal.zone_id = ZONE.into();
+    assert!(member.propose(proposal).await.unwrap().into_inner().success);
+    assert_eq!(
+        node.read_linearizable(|sm| sm.get_control_state("node-boundary-fixture", "member-data"))
+            .await
+            .unwrap()
+            .unwrap(),
+        Some(b"private fixture value".to_vec())
+    );
+    assert!(member
+        .get_cluster_info(GetClusterInfoRequest {
+            zone_id: ZONE.into()
+        })
+        .await
+        .is_ok());
+    assert_eq!(
+        member
+            .join_zone(JoinZoneRequest {
+                zone_id: ZONE.into(),
+                node_id: 5,
+                node_address: String::new(),
+                as_learner: true
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    let mut member_transport = ZoneTransportServiceClient::new(channel);
+    let mut entry = metadata_entry("/member-ec");
+    entry.node_id = 4;
+    let applied = member_transport
+        .replicate_entries(ReplicateEntriesRequest {
+            zone_id: ZONE.into(),
+            entries: vec![entry],
+            sender_node_id: 4,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(applied.success);
+    assert_eq!(applied.applied_up_to, 1);
+    assert!(node
+        .read_linearizable(|sm| sm.get_metadata("/member-ec"))
+        .await
+        .unwrap()
+        .unwrap()
+        .is_some());
+    let mut membership_proposal = raft::eraftpb::Message {
+        from: 4,
+        to: 1,
+        ..Default::default()
+    };
+    membership_proposal.set_msg_type(MessageType::MsgPropose);
+    let mut change = Entry::default();
+    change.set_entry_type(EntryType::EntryConfChangeV2);
+    membership_proposal.entries.push(change);
+    assert_eq!(
+        member_transport
+            .step_message(StepMessageRequest {
+                zone_id: ZONE.into(),
+                message: membership_proposal.write_to_bytes().unwrap(),
+                sender_address: String::new(),
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+
+    let (cert, key) =
+        generate_user_replica_cert("session-outsider", "charlie", 5, 300, ca, ca_key).unwrap();
+    let channel = connect(address, ca, cert, key).await;
+    let mut outsider = ZoneApiServiceClient::new(channel.clone());
+    let mut attempted = put("outsider-data");
+    attempted.zone_id = ZONE.into();
+    assert_eq!(
+        outsider.propose(attempted).await.unwrap_err().code(),
+        tonic::Code::PermissionDenied
+    );
+    assert_eq!(
+        outsider
+            .query(QueryRequest {
+                zone_id: ZONE.into(),
+                query: None,
+                read_from_leader: false
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    assert_eq!(
+        outsider
+            .get_cluster_info(GetClusterInfoRequest {
+                zone_id: ZONE.into()
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    let mut transport = ZoneTransportServiceClient::new(channel);
+    assert_eq!(
+        transport
+            .replicate_entries(ReplicateEntriesRequest {
+                zone_id: ZONE.into(),
+                sender_node_id: 5,
+                entries: vec![metadata_entry("/outsider-ec")]
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    assert_eq!(
+        transport
+            .snapshot_ec_state(SnapshotEcStateRequest {
+                zone_id: ZONE.into(),
+                sender_node_id: 5,
+                covering_seq: 73,
+                entries: vec![metadata_entry("/outsider-snapshot")]
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    let mut snapshot = raft::eraftpb::Message {
+        from: 5,
+        to: 1,
+        term: 1,
+        ..Default::default()
+    };
+    snapshot.set_msg_type(MessageType::MsgSnapshot);
+    snapshot.mut_snapshot().mut_metadata().index = 10;
+    snapshot.mut_snapshot().mut_metadata().term = 1;
+    snapshot
+        .mut_snapshot()
+        .mut_metadata()
+        .mut_conf_state()
+        .voters = vec![1, 5];
+    for zone in [ZONE, "unadmitted-data"] {
+        assert_eq!(
+            transport
+                .step_message(StepMessageRequest {
+                    zone_id: zone.into(),
+                    message: snapshot.write_to_bytes().unwrap(),
+                    sender_address: "127.0.0.1:19997".into()
+                })
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+    }
+    assert!(!registry.hosts("unadmitted-data"));
+    assert!(!registry.get_peers(ZONE).unwrap().contains_key(&5));
+    for path in ["/outsider-ec", "/outsider-snapshot"] {
+        assert!(node
+            .read_linearizable(|sm| sm.get_metadata(path))
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none());
+    }
+    node.propose_conf_change(ConfChangeType::RemoveNode, 4, Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        member
+            .get_cluster_info(GetClusterInfoRequest {
+                zone_id: ZONE.into()
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
 }
 
 fn put(key: &str) -> ProposeRequest {
@@ -409,10 +613,13 @@ async fn agents_and_foreign_nodes_cannot_propose_or_step_but_local_nodes_can() {
     }
 
     let domestic = generate_agent_cert("domestic-agent", &ca, &ca_key).unwrap();
+    let replica =
+        generate_user_replica_cert("session-replica", "alice", 19, 300, &ca, &ca_key).unwrap();
     let foreign_agent = generate_agent_cert("foreign-agent", &foreign, &foreign_key).unwrap();
     let foreign_node = generate_node_cert(2, "root", &foreign, &foreign_key, &[], None).unwrap();
     for (label, (cert, key)) in [
         ("domestic-agent", domestic),
+        ("owner-replica", replica),
         ("foreign-agent", foreign_agent),
         ("foreign-node", foreign_node),
     ] {
@@ -453,6 +660,7 @@ async fn agents_and_foreign_nodes_cannot_propose_or_step_but_local_nodes_can() {
             assert!(!reply.success);
         }
     }
+    assert_owner_replica_data_scope(&registry, &address, &ca, &ca_key).await;
     stop.send(()).unwrap();
     running.await.unwrap();
     drop(node);
@@ -495,8 +703,9 @@ async fn witness_checks_the_authenticated_sender_before_auto_join() {
             .unwrap();
     });
     listener_ready(&address).await;
-    let (cert, key) = generate_node_cert(2, "root", &ca, &key, &[], None).unwrap();
-    let mut transport = ZoneTransportServiceClient::new(connect(&address, &ca, cert, key).await);
+    let (cert, node_key) = generate_node_cert(2, "root", &ca, &key, &[], None).unwrap();
+    let mut transport =
+        ZoneTransportServiceClient::new(connect(&address, &ca, cert, node_key).await);
     let mut message = raft::eraftpb::Message::default();
     message.set_msg_type(raft::eraftpb::MessageType::MsgHeartbeatResponse);
     message.set_from(7);
@@ -515,6 +724,22 @@ async fn witness_checks_the_authenticated_sender_before_auto_join() {
     assert!(registry.get_node(refused_zone).is_none());
     assert!(!private.path().join(refused_zone).exists());
     message.set_from(2);
+    let (cert, replica_key) =
+        generate_user_replica_cert("session-replica", "alice", 2, 300, &ca, &key).unwrap();
+    let mut replica =
+        ZoneTransportServiceClient::new(connect(&address, &ca, cert, replica_key).await);
+    let refused_zone = "owner-replica-witness-zone";
+    let refusal = replica
+        .step_message(StepMessageRequest {
+            message: message.write_to_bytes().unwrap(),
+            zone_id: refused_zone.into(),
+            sender_address: String::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(refusal.code(), tonic::Code::PermissionDenied);
+    assert!(registry.get_node(refused_zone).is_none());
+    assert!(!private.path().join(refused_zone).exists());
     let accepted_zone = "accepted-witness-zone";
     transport
         .step_message(StepMessageRequest {

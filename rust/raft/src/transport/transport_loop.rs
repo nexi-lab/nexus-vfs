@@ -654,6 +654,18 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
             .collect()
     }
 
+    /// Select routes for this zone's current Raft members. Learned or retained
+    /// addresses carry no authority to receive metadata, WAL or EC snapshots.
+    fn snapshot_replication_peers(&self) -> Vec<(u64, NodeAddress)> {
+        self.peers
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(id, _)| **id != self.node_id && self.driver.is_replication_member(**id))
+            .map(|(id, address)| (*id, address.clone()))
+            .collect()
+    }
+
     /// Send Raft messages to peers concurrently using JoinSet.
     ///
     /// Each peer send gets its own task with an independent timeout.
@@ -773,11 +785,9 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
             None => return, // No replication log (witness node)
         };
 
-        // Get current peer snapshot (read lock, released immediately).
-        // Peer-map carries voters AND learners; we replicate to both
-        // but quorum sizing must be voter-only (see `voter_ids` below).
-        let peer_map = self.snapshot_peers();
-        let peer_snapshot: Vec<(u64, NodeAddress)> = peer_map.into_iter().collect();
+        let peer_snapshot = self.snapshot_replication_peers();
+        self.ec_peer_state
+            .retain(|id, _| self.driver.is_replication_member(*id));
 
         // Voter set is the raft-rs SSOT — never derive total_voters from
         // `peer_snapshot.len() + 1`, which over-counts whenever any
@@ -1264,6 +1274,131 @@ fn ec_compact_floor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raft::{FullStateMachine, RaftConfig, RaftStorage, ReplicationLog, ZoneConsensus};
+    use crate::storage::RedbStore;
+    use raft::eraftpb::{ConfChangeType, ConfState};
+
+    fn membership_fixture(
+        membership: ConfState,
+    ) -> (
+        tempfile::TempDir,
+        ZoneConsensus<FullStateMachine>,
+        TransportLoop<FullStateMachine>,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = RaftStorage::open(directory.path()).unwrap();
+        storage.set_conf_state(&membership).unwrap();
+        let store = RedbStore::open(directory.path().join("state")).unwrap();
+        let config = RaftConfig {
+            id: 1,
+            skip_bootstrap: true,
+            ..Default::default()
+        };
+        let (handle, driver) = ZoneConsensus::new(
+            config,
+            storage,
+            FullStateMachine::new(&store).unwrap(),
+            Some(Arc::new(ReplicationLog::new(&store, 1).unwrap())),
+        )
+        .unwrap();
+        let addresses = crate::transport::PeerMap::with_peers(
+            1,
+            (1..=5)
+                .map(|id| {
+                    (
+                        id,
+                        NodeAddress::parse(&format!("{id}@127.0.0.1:{}", 25000 + id), false)
+                            .unwrap(),
+                    )
+                })
+                .collect(),
+        );
+        let transport = TransportLoop::new(
+            driver,
+            Arc::new(std::sync::RwLock::new(addresses)),
+            RaftClientPool::new(),
+        );
+        (directory, handle, transport)
+    }
+
+    fn recipients(transport: &TransportLoop<FullStateMachine>) -> Vec<u64> {
+        let mut ids: Vec<_> = transport
+            .snapshot_replication_peers()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[test]
+    fn ec_recipients_follow_joint_membership_instead_of_learned_addresses() {
+        let (_directory, handle, transport) = membership_fixture(ConfState {
+            voters: vec![1, 2],
+            voters_outgoing: vec![1, 3],
+            learners: vec![4],
+            learners_next: vec![3],
+            ..Default::default()
+        });
+        assert_eq!(recipients(&transport), vec![2, 3, 4]);
+        assert!(transport.peers.read().unwrap().contains_key(&5));
+        assert_eq!(transport.driver.voter_ids(), vec![1, 2, 3]);
+        for id in 1..=5 {
+            assert_eq!(
+                handle.is_replication_member(id),
+                transport.driver.is_replication_member(id)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_learner_removal_excludes_its_retained_route() {
+        let (_directory, handle, mut transport) = membership_fixture(ConfState {
+            voters: vec![1],
+            learners: vec![2],
+            ..Default::default()
+        });
+        assert_eq!(recipients(&transport), vec![2]);
+        assert!(handle.is_replication_member(2));
+        transport.ec_peer_state.insert(2, mk_peer_state(7));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !handle.is_leader() {
+                transport.driver.process_messages();
+                transport.driver.advance().await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("single voter becomes leader");
+        let caller = handle.clone();
+        let change = tokio::spawn(async move {
+            caller
+                .propose_conf_change(ConfChangeType::RemoveNode, 2, Vec::new())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !change.is_finished() {
+                transport.driver.process_messages();
+                transport.driver.advance().await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("learner removal commits");
+        let committed = change.await.unwrap().unwrap();
+        assert_eq!(committed.voters, vec![1]);
+        assert!(committed.learners.is_empty());
+        assert!(
+            !handle.is_replication_member(2),
+            "committed removal updates admission before returning"
+        );
+        assert!(transport.peers.read().unwrap().contains_key(&2));
+        assert!(recipients(&transport).is_empty());
+        // A retired peer's progress cannot pin future compaction or count as
+        // an acknowledgement when this zone subsequently changes membership.
+        transport.spawn_ec_replications();
+        assert!(!transport.ec_peer_state.contains_key(&2));
+    }
 
     #[test]
     fn compact_floor_holds_for_never_acked_peer_within_retention() {

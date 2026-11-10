@@ -2,6 +2,10 @@
 
 use super::config::{ClientConfig, TlsConfig};
 use super::error::TransportError;
+use std::{future::Future, pin::Pin};
+
+type ConnectFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<tonic::transport::Channel, TransportError>> + Send + 'a>>;
 
 /// Create a tonic Channel to the given endpoint with optional TLS.
 ///
@@ -22,12 +26,58 @@ use super::error::TransportError;
 /// So the caller's `connect_timeout` bounds the entire establishment. A caller that
 /// asks for 15 seconds gets an answer in 15 seconds, whichever layer stalls, which
 /// is the only version of a timeout a caller can reason about.
+// Share the connection state machine across transport consumers. The allocation
+// is paid when opening a channel; pooled RPCs keep using the existing channel.
+#[inline(never)]
+pub fn create_channel<'a>(endpoint: &'a str, config: &'a ClientConfig) -> ConnectFuture<'a> {
+    Box::pin(connect_channel(endpoint, config))
+}
+
 #[allow(clippy::result_large_err)]
-pub async fn create_channel(
+async fn connect_channel(
     endpoint: &str,
     config: &ClientConfig,
 ) -> Result<tonic::transport::Channel, TransportError> {
-    let mut ep = tonic::transport::Endpoint::from_shared(endpoint.to_string())
+    let ep = configured_endpoint(endpoint, config)?;
+    match tokio::time::timeout(config.connect_timeout, ep.connect()).await {
+        Ok(result) => result.map_err(TransportError::Tonic),
+        Err(_) => Err(TransportError::Connection(format!(
+            "connect to {endpoint} did not complete within {:?} — the peer may be accepting \
+             connections without completing a handshake",
+            config.connect_timeout
+        ))),
+    }
+}
+
+// URI and certificate preparation completes before the asynchronous dial. Keep
+// its parsing and error paths in one synchronous body across transport callers.
+#[inline(never)]
+#[allow(clippy::result_large_err)]
+fn configured_endpoint(
+    endpoint: &str,
+    config: &ClientConfig,
+) -> Result<tonic::transport::Endpoint, TransportError> {
+    let mut uri: tonic::codegen::http::Uri = endpoint
+        .parse()
+        .map_err(|e| TransportError::InvalidAddress(format!("{e}")))?;
+    // TLS material selects the transport. A routing URI cannot disable it.
+    if config.tls.is_some() {
+        match uri.scheme_str() {
+            Some("http") => {
+                let mut parts = uri.into_parts();
+                parts.scheme = Some(tonic::codegen::http::uri::Scheme::HTTPS);
+                uri = tonic::codegen::http::Uri::from_parts(parts)
+                    .map_err(|e| TransportError::InvalidAddress(format!("{e}")))?;
+            }
+            Some("https") => {}
+            _ => {
+                return Err(TransportError::InvalidAddress(
+                    "TLS peer endpoints require an http or https routing URI".into(),
+                ))
+            }
+        }
+    }
+    let mut ep = tonic::transport::Endpoint::from_shared(uri.to_string())
         .map_err(|e| TransportError::InvalidAddress(format!("{e}")))?
         .connect_timeout(config.connect_timeout)
         .timeout(config.request_timeout);
@@ -46,14 +96,7 @@ pub async fn create_channel(
         ep = apply_tls(ep, tls)?;
     }
 
-    match tokio::time::timeout(config.connect_timeout, ep.connect()).await {
-        Ok(result) => result.map_err(TransportError::Tonic),
-        Err(_) => Err(TransportError::Connection(format!(
-            "connect to {endpoint} did not complete within {:?} — the peer may be accepting \
-             connections without completing a handshake",
-            config.connect_timeout
-        ))),
-    }
+    Ok(ep)
 }
 
 /// Install the process-level rustls `CryptoProvider` (ring) exactly once.

@@ -24,7 +24,7 @@ use dashmap::DashMap;
 use tokio::sync::Semaphore;
 
 use nexus_raft::transport::proto::nexus::raft::{
-    zone_api_service_client::ZoneApiServiceClient, ReadBlobRequest,
+    zone_api_service_client::ZoneApiServiceClient, ReadBlobRequest, ReadZoneBlobRequest,
 };
 
 /// Default per-peer permit count — caps outstanding RPCs per peer so one
@@ -37,12 +37,28 @@ const DEFAULT_GLOBAL_PERMITS: usize = 16;
 /// Default per-RPC timeout. Matches Python `PeerBlobClient.timeout` default.
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
+enum TlsPolicy {
+    Plaintext,
+    Configured(lib::transport_primitives::TlsConfig),
+    Rejected(&'static str),
+}
+
+struct ConnectionPolicy {
+    generation: u64,
+    tls: TlsPolicy,
+}
+
+struct CachedChannel {
+    generation: u64,
+    channel: tonic::transport::Channel,
+}
+
 /// Shared peer-RPC client. Construct once per kernel, clone the `Arc` into
 /// any caller that needs to fetch blobs from peers.
 #[allow(dead_code)]
 pub struct PeerBlobClient {
     runtime: tokio::runtime::Handle,
-    channels: DashMap<String, tonic::transport::Channel>,
+    channels: DashMap<String, CachedChannel>,
     per_peer_semaphores: DashMap<String, Arc<Semaphore>>,
     global_semaphore: Arc<Semaphore>,
     timeout: Duration,
@@ -54,7 +70,7 @@ pub struct PeerBlobClient {
     /// (same cert material that `ZoneManager` uses for raft RPCs — one
     /// trust anchor per cluster). When absent, plaintext HTTP/2 — the
     /// docker federation test intentionally sets `NEXUS_RAFT_TLS=false`.
-    tls: parking_lot::RwLock<Option<lib::transport_primitives::TlsConfig>>,
+    policy: parking_lot::RwLock<ConnectionPolicy>,
 }
 
 #[allow(dead_code)]
@@ -73,7 +89,10 @@ impl PeerBlobClient {
             global_semaphore: Arc::new(Semaphore::new(DEFAULT_GLOBAL_PERMITS)),
             timeout: DEFAULT_RPC_TIMEOUT,
             per_peer_permits: DEFAULT_PER_PEER_PERMITS,
-            tls: parking_lot::RwLock::new(None),
+            policy: parking_lot::RwLock::new(ConnectionPolicy {
+                generation: 0,
+                tls: TlsPolicy::Plaintext,
+            }),
         }
     }
 
@@ -83,7 +102,20 @@ impl PeerBlobClient {
     /// reconnects over TLS. Called by the boot installer once the
     /// leader / joiner has resolved the cluster CA + node cert.
     pub fn install_tls_config(&self, tls: lib::transport_primitives::TlsConfig) {
-        *self.tls.write() = Some(tls);
+        self.replace_tls_policy(TlsPolicy::Configured(tls));
+    }
+
+    fn replace_tls_policy(&self, tls: TlsPolicy) {
+        let mut policy = self.policy.write();
+        policy.tls = match policy.generation.checked_add(1) {
+            Some(generation) => {
+                policy.generation = generation;
+                tls
+            }
+            None => TlsPolicy::Rejected("peer TLS generation exhausted"),
+        };
+        // Publication below holds a policy read guard, so an earlier dial
+        // cannot repopulate this pool after the credential transition.
         self.channels.clear();
     }
 
@@ -93,10 +125,20 @@ impl PeerBlobClient {
     /// (wraps a `tower` service). We cache one per peer so concurrent callers
     /// share a single HTTP/2 connection.
     async fn channel_for(&self, address: &str) -> Result<tonic::transport::Channel, String> {
-        if let Some(ch) = self.channels.get(address) {
-            return Ok(ch.clone());
-        }
-        let tls = self.tls.read().clone();
+        let (generation, tls) = {
+            let policy = self.policy.read();
+            let tls = match &policy.tls {
+                TlsPolicy::Plaintext => None,
+                TlsPolicy::Configured(tls) => Some(tls.clone()),
+                TlsPolicy::Rejected(error) => return Err((*error).into()),
+            };
+            if let Some(cached) = self.channels.get(address) {
+                if cached.generation == policy.generation {
+                    return Ok(cached.channel.clone());
+                }
+            }
+            (policy.generation, tls)
+        };
         let scheme = if tls.is_some() { "https" } else { "http" };
         let endpoint = if address.starts_with("http://") || address.starts_with("https://") {
             address.to_string()
@@ -110,10 +152,18 @@ impl PeerBlobClient {
         let channel = lib::transport_primitives::create_channel(&endpoint, &client_cfg)
             .await
             .map_err(|e| format!("peer channel {}: {}", address, e))?;
-        self.channels
+        let policy = self.policy.read();
+        if policy.generation != generation {
+            return Err("peer TLS configuration changed while connecting".into());
+        }
+        let cached = self
+            .channels
             .entry(address.to_string())
-            .or_insert_with(|| channel.clone());
-        Ok(channel)
+            .or_insert_with(|| CachedChannel {
+                generation,
+                channel,
+            });
+        Ok(cached.channel.clone())
     }
 
     /// Resolve (or create) the per-peer semaphore gating outstanding RPCs.
@@ -141,6 +191,31 @@ impl PeerBlobClient {
         address: &str,
         content_id: &str,
     ) -> Result<Vec<u8>, String> {
+        self.fetch_scoped_async(address, None, content_id).await
+    }
+
+    /// Fetch only from the named data zone. Servers without this RPC refuse
+    /// the request; scoped reads retain their scope across version differences.
+    pub async fn fetch_in_zone_async(
+        &self,
+        address: &str,
+        zone_id: &str,
+        content_id: &str,
+    ) -> Result<Vec<u8>, String> {
+        self.fetch_scoped_async(address, Some(zone_id), content_id)
+            .await
+    }
+
+    async fn fetch_scoped_async(
+        &self,
+        address: &str,
+        zone_id: Option<&str>,
+        content_id: &str,
+    ) -> Result<Vec<u8>, String> {
+        if let Some(zone_id) = zone_id {
+            contracts::validate_zone_id_for(contracts::ZoneIdUse::TenantCreate, zone_id)
+                .map_err(|error| error.to_string())?;
+        }
         // Global cap: total concurrent fetches across all peers.
         let _global_permit = self
             .global_semaphore
@@ -165,53 +240,64 @@ impl PeerBlobClient {
         let mut client = ZoneApiServiceClient::new(channel)
             .max_decoding_message_size(contracts::MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(contracts::MAX_GRPC_MESSAGE_BYTES);
-        let mut request = tonic::Request::new(ReadBlobRequest {
-            content_id: content_id.to_string(),
-        });
-        request.set_timeout(self.timeout);
-
-        let resp = client
-            .read_blob(request)
-            .await
-            .map_err(|e| format!("ReadBlob {}: {}", address, e))?
-            .into_inner();
+        let method = if zone_id.is_some() {
+            "ReadZoneBlob"
+        } else {
+            "ReadBlob"
+        };
+        let resp = match zone_id {
+            Some(zone_id) => {
+                let mut request = tonic::Request::new(ReadZoneBlobRequest {
+                    zone_id: zone_id.to_string(),
+                    content_id: content_id.to_string(),
+                });
+                request.set_timeout(self.timeout);
+                client.read_zone_blob(request).await
+            }
+            None => {
+                let mut request = tonic::Request::new(ReadBlobRequest {
+                    content_id: content_id.to_string(),
+                });
+                request.set_timeout(self.timeout);
+                client.read_blob(request).await
+            }
+        }
+        .map_err(|error| format!("{method} {address}: {error}"))?
+        .into_inner();
         if !resp.error.is_empty() {
-            return Err(format!("ReadBlob {} error: {}", address, resp.error));
+            return Err(format!("{method} {address} error: {}", resp.error));
         }
         Ok(resp.content)
     }
 
-    /// Blocking sync wrapper — drives ``fetch_async`` via the shared
-    /// runtime. Safe to call from any thread, including from a tokio
-    /// worker already executing on the same runtime: see
-    /// [`Self::block_on_safely`].
+    /// Blocking fetch on the shared runtime, including from a worker already
+    /// executing on that runtime.
     pub(crate) fn fetch(&self, address: &str, content_id: &str) -> Result<Vec<u8>, String> {
-        let fut = self.fetch_async(address, content_id);
-        self.block_on_safely(fut)
+        self.fetch_scoped(address, None, content_id)
     }
 
-    /// Re-entrancy-safe `block_on` — mirrors `FederationClient::block_on_safely`
-    /// (added in PR #74) and `RpcTransport::block_on` (kernel crate).
-    ///
-    /// `Handle::block_on` panics with "Cannot start a runtime from
-    /// within a runtime" when invoked from a thread that's currently
-    /// executing on that same runtime — which is exactly the shape a
-    /// kernel hot path takes when a gRPC handler / FUSE callback / raft
-    /// apply task calls into `Kernel::sys_read` → routing → backend →
-    /// `PeerBlobClient::fetch` on the shared kernel runtime.
-    ///
-    /// `block_in_place` releases the worker thread before delegating to
-    /// `Handle::block_on`, which IS safe to call from any context.
-    /// When the caller is NOT already on a tokio runtime we take the
-    /// plain `block_on` path so non-tokio callers (cli tools, sync
-    /// tests, the shutdown path) still work.
-    #[inline]
-    fn block_on_safely<F: std::future::Future>(&self, fut: F) -> F::Output {
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| self.runtime.block_on(fut))
-        } else {
-            self.runtime.block_on(fut)
-        }
+    /// Blocking scoped fetch on the same shared runtime and connection policy.
+    pub fn fetch_in_zone(
+        &self,
+        address: &str,
+        zone_id: &str,
+        content_id: &str,
+    ) -> Result<Vec<u8>, String> {
+        self.fetch_scoped(address, Some(zone_id), content_id)
+    }
+
+    /// Drive both blocking entry points through the shared runtime bridge,
+    /// including callers on a current-thread Agent runtime.
+    fn fetch_scoped(
+        &self,
+        address: &str,
+        zone_id: Option<&str>,
+        content_id: &str,
+    ) -> Result<Vec<u8>, String> {
+        lib::rt::block_on_via(
+            &self.runtime,
+            self.fetch_scoped_async(address, zone_id, content_id),
+        )
     }
 }
 
@@ -241,18 +327,10 @@ impl kernel::hal::peer::PeerBlobClient for PeerBlobClient {
     }
 
     fn install_tls(&self, ca_pem: &[u8], cert_pem: Option<&[u8]>, key_pem: Option<&[u8]>) {
-        // mTLS requires *both* a client cert and key — if either is
-        // missing the trait caller is in CA-only / server-auth mode,
-        // which the underlying `lib::transport_primitives::TlsConfig`
-        // does not yet model (its `cert_pem`/`key_pem` are `Vec<u8>`,
-        // not `Option<Vec<u8>>`). Drop the install in that case so the
-        // peer client stays plaintext rather than constructing an
-        // invalid mTLS bundle with empty client cert/key.
         let (Some(cert), Some(key)) = (cert_pem, key_pem) else {
-            tracing::warn!(
-                target = "peer_blob_client",
-                "install_tls called without cert_pem+key_pem; staying plaintext (CA-only mTLS not yet supported)",
-            );
+            self.replace_tls_policy(TlsPolicy::Rejected(
+                "peer mTLS requires both client certificate and private key",
+            ));
             return;
         };
         PeerBlobClient::install_tls_config(
@@ -335,3 +413,6 @@ mod tests {
         assert!(result.is_err(), "expected connection error, got Ok");
     }
 }
+
+#[cfg(test)]
+mod tls_tests;

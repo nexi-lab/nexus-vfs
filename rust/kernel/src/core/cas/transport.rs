@@ -19,14 +19,23 @@ use tempfile::TempPath;
 ///
 /// Matches Python `CASAddressingEngine._blob_key()`.
 #[inline]
-pub(crate) fn blob_key(content_id: &str) -> String {
-    debug_assert!(content_id.len() >= 4, "content_id must be at least 4 chars");
-    format!(
+pub(crate) fn blob_key(content_id: &str) -> io::Result<String> {
+    if content_id.len() != blake3::OUT_LEN * 2
+        || !content_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CAS content ID must be a canonical BLAKE3 hash",
+        ));
+    }
+    Ok(format!(
         "cas/{}/{}/{}",
         &content_id[..2],
         &content_id[2..4],
         content_id
-    )
+    ))
 }
 
 fn validate_content_hash(content_id: &str, actual: blake3::Hash) -> io::Result<()> {
@@ -234,7 +243,7 @@ impl LocalCASTransport {
 
     /// Publish an already verified hash without replacing a concurrent winner.
     fn publish_blob(&self, content: &[u8], content_id: &str) -> io::Result<bool> {
-        let path = self.resolve(&blob_key(content_id));
+        let path = self.resolve(&blob_key(content_id)?);
         if self.confirm_existing_blob(&path, content_id)? {
             return Ok(false);
         }
@@ -265,7 +274,7 @@ impl LocalCASTransport {
     ///
     /// Corresponds to Python `LocalTransport.fetch(CASAddressingEngine._blob_key(hash))`.
     pub fn read_blob(&self, content_id: &str) -> io::Result<Vec<u8>> {
-        let key = blob_key(content_id);
+        let key = blob_key(content_id)?;
         let path = self.resolve(&key);
         let content = std::fs::read(&path)?;
         validate_content_hash(content_id, blake3::hash(&content))?;
@@ -311,21 +320,18 @@ impl LocalCASTransport {
     ///
     /// Corresponds to Python `LocalTransport.exists(CASAddressingEngine._blob_key(hash))`.
     pub fn exists(&self, content_id: &str) -> bool {
-        let key = blob_key(content_id);
-        let path = self.resolve(&key);
-        path.is_file()
+        blob_key(content_id).is_ok_and(|key| self.resolve(&key).is_file())
     }
 
-    /// Get the absolute path of a CAS blob (for debugging/diagnostics).
+    /// Get the absolute path of a canonical hash for diagnostics.
     #[allow(dead_code)]
-    pub fn blob_path(&self, content_id: &str) -> PathBuf {
-        let key = blob_key(content_id);
-        self.resolve(&key)
+    pub fn blob_path(&self, content_id: &str) -> io::Result<PathBuf> {
+        Ok(self.resolve(&blob_key(content_id)?))
     }
 
     /// Get the size of a CAS blob in bytes.
     pub fn blob_size(&self, content_id: &str) -> io::Result<u64> {
-        let key = blob_key(content_id);
+        let key = blob_key(content_id)?;
         let path = self.resolve(&key);
         Ok(std::fs::metadata(&path)?.len())
     }
@@ -334,7 +340,7 @@ impl LocalCASTransport {
     /// chunked manifests for GC + Python-side `is_chunked` compatibility).
     /// Path is `cas/<h[0..2]>/<h[2..4]>/<hash>.meta`.
     pub fn write_meta(&self, content_id: &str, meta: &[u8]) -> io::Result<()> {
-        let key = blob_key(content_id);
+        let key = blob_key(content_id)?;
         let path = self.resolve(&format!("{}.meta", key));
         let mut staged = self.stage_file(&path, meta)?;
         // Rust's native replacement handles open readers on Windows through
@@ -351,7 +357,7 @@ impl LocalCASTransport {
     /// Returns `io::ErrorKind::NotFound` when the sidecar is absent (callers
     /// treat that as "not chunked").
     pub fn read_meta(&self, content_id: &str) -> io::Result<Vec<u8>> {
-        let key = blob_key(content_id);
+        let key = blob_key(content_id)?;
         let path = self.resolve(&format!("{}.meta", key));
         std::fs::read(&path)
     }
@@ -359,15 +365,13 @@ impl LocalCASTransport {
     /// Cheap existence check for the `.meta` sidecar — used by `is_chunked`
     /// as a fast-reject before the full read + JSON parse.
     pub fn meta_exists(&self, content_id: &str) -> bool {
-        let key = blob_key(content_id);
-        let path = self.resolve(&format!("{}.meta", key));
-        path.is_file()
+        blob_key(content_id).is_ok_and(|key| self.resolve(&format!("{}.meta", key)).is_file())
     }
 
     /// Remove the `.meta` sidecar. Absorbs `NotFound` (best-effort, matches
     /// Python's `contextlib.suppress(Exception)` in `delete_chunked`).
     pub fn remove_meta(&self, content_id: &str) -> io::Result<()> {
-        let key = blob_key(content_id);
+        let key = blob_key(content_id)?;
         let path = self.resolve(&format!("{}.meta", key));
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
@@ -377,7 +381,7 @@ impl LocalCASTransport {
     }
 
     pub fn remove_blob(&self, content_id: &str) -> io::Result<()> {
-        let key = blob_key(content_id);
+        let key = blob_key(content_id)?;
         let path = self.resolve(&key);
         std::fs::remove_file(&path)
     }
@@ -403,15 +407,48 @@ mod tests {
     #[test]
     fn test_blob_key_format() {
         let hash = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
-        let key = blob_key(hash);
+        let key = blob_key(hash).unwrap();
         assert_eq!(key, format!("cas/ab/cd/{}", hash));
     }
 
     #[test]
-    fn test_blob_key_short_prefix() {
-        let hash = "0011aabbccdd";
-        let key = blob_key(hash);
-        assert_eq!(key, "cas/00/11/0011aabbccdd");
+    fn invalid_content_ids_are_refused_before_filesystem_access() {
+        let (_tmp, transport) = setup();
+        let good = transport.write_blob(b"retained object").unwrap();
+        transport.write_meta(&good, b"retained metadata").unwrap();
+        for id in [
+            "",
+            "a",
+            "0011aabbccdd",
+            "../outside",
+            "/outside",
+            "é🦀",
+            &"0".repeat(63),
+            &"0".repeat(65),
+            &"A".repeat(64),
+            &"g".repeat(64),
+            &format!("{}../outside", "0".repeat(64)),
+        ] {
+            assert_eq!(
+                blob_key(id).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+            for result in [
+                transport.read_blob(id).map(|_| ()),
+                transport.blob_path(id).map(|_| ()),
+                transport.blob_size(id).map(|_| ()),
+                transport.read_meta(id).map(|_| ()),
+                transport.write_meta(id, b"invalid"),
+                transport.remove_meta(id),
+                transport.remove_blob(id),
+            ] {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+            }
+            assert!(!transport.exists(id));
+            assert!(!transport.meta_exists(id));
+        }
+        assert_eq!(transport.read_blob(&good).unwrap(), b"retained object");
+        assert_eq!(transport.read_meta(&good).unwrap(), b"retained metadata");
     }
 
     #[test]
@@ -444,7 +481,7 @@ mod tests {
 
         // First write creates the file
         let hash = transport.write_blob(content).unwrap();
-        let path = transport.blob_path(&hash);
+        let path = transport.blob_path(&hash).unwrap();
         let mtime1 = std::fs::metadata(&path).unwrap().modified().unwrap();
 
         // Second write is a no-op (CAS dedup)
@@ -605,7 +642,7 @@ mod tests {
         let content = b"path layout test";
         let hash = transport.write_blob(content).unwrap();
 
-        let path = transport.blob_path(&hash);
+        let path = transport.blob_path(&hash).unwrap();
         let path_str = path.to_string_lossy();
 
         // Verify 2-level directory structure: root/cas/XX/YY/hash

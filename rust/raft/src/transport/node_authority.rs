@@ -1,6 +1,5 @@
-//! Keep the cluster control plane Node-only even when the listener also admits
-//! domestic/foreign Agent certificates for cohosted VFS services. TLS admission
-//! is not Node authorization. No policy cache or second issuer is introduced.
+//! Authenticate cluster Nodes and owner replicas at the replication boundary.
+//! Replicas access admitted data zones; control operations retain Node authority.
 
 use std::{
     sync::Arc,
@@ -11,7 +10,7 @@ use tonic::{
     codegen::{http, BoxFuture, Service},
     server::NamedService,
     transport::server::{TcpConnectInfo, TlsConnectInfo},
-    Request, Status,
+    Status,
 };
 use x509_parser::{certificate::X509Certificate, extensions::GeneralName, prelude::FromDer};
 
@@ -24,29 +23,63 @@ pub struct LocalNodeCertificate {
     pub serial: Vec<u8>,
 }
 
-/// A Node ID taken from the actual authenticated TLS connection.
-#[derive(Clone)]
-struct AuthenticatedNodeId(u64);
+/// Identity taken from the authenticated TLS connection.
+#[derive(Clone, Copy)]
+enum AuthenticatedPeer {
+    Node(u64),
+    Replica(u64),
+}
 
-fn authenticated_node_id<T>(request: &Request<T>) -> Result<Option<u64>, Status> {
-    if let Some(peer) = request.extensions().get::<AuthenticatedNodeId>() {
-        return Ok(Some(peer.0));
+impl AuthenticatedPeer {
+    fn node_id(self) -> u64 {
+        match self {
+            Self::Node(id) | Self::Replica(id) => id,
+        }
     }
-    if request
-        .extensions()
-        .get::<TlsConnectInfo<TcpConnectInfo>>()
-        .is_some()
-    {
+}
+
+fn authenticated_peer(extensions: &http::Extensions) -> Result<Option<AuthenticatedPeer>, Status> {
+    if let Some(peer) = extensions.get::<AuthenticatedPeer>() {
+        return Ok(Some(*peer));
+    }
+    if extensions.get::<TlsConnectInfo<TcpConnectInfo>>().is_some() {
         return Err(Status::permission_denied(
-            "message requires an authenticated local Node",
+            "message requires an authenticated replication peer",
         ));
     }
     Ok(None)
 }
 
+fn authenticated_node_id(extensions: &http::Extensions) -> Result<Option<u64>, Status> {
+    Ok(authenticated_peer(extensions)?.map(AuthenticatedPeer::node_id))
+}
+
+/// Authorize before parsing payloads, learning routes or reading zone data.
+#[inline(never)] // Share admission code across all typed RPC handlers.
+pub(super) fn authorize_data_zone(
+    extensions: &http::Extensions,
+    registry: &crate::raft::ZoneRaftRegistry,
+    zone_id: &str,
+) -> Result<(), Status> {
+    let Some(AuthenticatedPeer::Replica(peer)) = authenticated_peer(extensions)? else {
+        return Ok(());
+    };
+    let denied = || Status::permission_denied("replica is not admitted to the requested data zone");
+    contracts::validate_zone_id_for(contracts::ZoneIdUse::TenantCreate, zone_id)
+        .map_err(|_| denied())?;
+    let node = registry.get_node(zone_id).ok_or_else(denied)?;
+    if !node.is_replication_member(peer) {
+        return Err(denied());
+    }
+    Ok(())
+}
+
 /// Bind an EC sender to its connection before applying or acknowledging data.
-pub(super) fn authorize_ec_sender<T>(request: &Request<T>, sender: u64) -> Result<(), Status> {
-    if authenticated_node_id(request)?.is_some_and(|peer| peer != sender) {
+pub(super) fn authorize_ec_sender(
+    extensions: &http::Extensions,
+    sender: u64,
+) -> Result<(), Status> {
+    if authenticated_node_id(extensions)?.is_some_and(|peer| peer != sender) {
         return Err(Status::permission_denied(
             "message sender does not match the authenticated Node",
         ));
@@ -55,13 +88,29 @@ pub(super) fn authorize_ec_sender<T>(request: &Request<T>, sender: u64) -> Resul
 }
 
 /// Preserve raft-rs request relaying and return the actual transport peer.
-pub(super) fn authorize_raft_sender<T>(
-    request: &Request<T>,
+pub(super) fn authorize_raft_sender(
+    extensions: &http::Extensions,
     message: &raft::eraftpb::Message,
 ) -> Result<u64, Status> {
-    let Some(peer) = authenticated_node_id(request)? else {
+    let Some(peer) = authenticated_node_id(extensions)? else {
         return Ok(message.from);
     };
+    if matches!(
+        authenticated_peer(extensions)?,
+        Some(AuthenticatedPeer::Replica(_))
+    ) && message.get_msg_type() == raft::eraftpb::MessageType::MsgPropose
+        && message.entries.iter().any(|entry| {
+            matches!(
+                entry.get_entry_type(),
+                raft::eraftpb::EntryType::EntryConfChange
+                    | raft::eraftpb::EntryType::EntryConfChangeV2
+            )
+        })
+    {
+        return Err(Status::permission_denied(
+            "membership proposals require a cluster Node",
+        ));
+    }
     let is_relayed_request = matches!(
         message.get_msg_type(),
         raft::eraftpb::MessageType::MsgPropose
@@ -83,6 +132,14 @@ pub fn current_local_node_certificate(
     der: &[u8],
     local_ca_der: &[u8],
 ) -> Result<LocalNodeCertificate, String> {
+    let leaf = current_local_leaf(der, local_ca_der)?;
+    node_certificate_identity(&leaf)
+}
+
+fn current_local_leaf<'a>(
+    der: &'a [u8],
+    local_ca_der: &[u8],
+) -> Result<X509Certificate<'a>, String> {
     let (rest, leaf) = X509Certificate::from_der(der).map_err(|_| "invalid Node certificate")?;
     if !rest.is_empty() || !leaf.validity().is_valid() {
         return Err("Node certificate is malformed or outside its validity window".into());
@@ -95,6 +152,10 @@ pub fn current_local_node_certificate(
     {
         return Err("Node certificate is not signed by the local cluster CA".into());
     }
+    Ok(leaf)
+}
+
+fn node_certificate_identity(leaf: &X509Certificate<'_>) -> Result<LocalNodeCertificate, String> {
     let san = leaf
         .subject_alternative_name()
         .map_err(|_| "invalid Node SAN")?
@@ -140,7 +201,7 @@ impl NodeControlPolicy {
                 .transpose()?,
         })
     }
-    fn check(&self, extensions: &http::Extensions) -> Result<Option<AuthenticatedNodeId>, Status> {
+    fn check(&self, extensions: &http::Extensions) -> Result<Option<AuthenticatedPeer>, Status> {
         // Explicit plaintext/development listeners retain their old contract.
         // They must not host the protected collaboration namespace.
         let Some(ca) = &self.local_ca else {
@@ -155,11 +216,19 @@ impl NodeControlPolicy {
         let leaf = certs
             .first()
             .ok_or_else(|| Status::permission_denied("missing Node mTLS leaf"))?;
-        current_local_node_certificate(leaf.as_ref(), ca)
-            .map(|peer| Some(AuthenticatedNodeId(peer.node_id)))
-            .map_err(|_| {
-                Status::permission_denied("Raft control requires a current local Node certificate")
-            })
+        let classify = || -> Result<AuthenticatedPeer, String> {
+            let certificate = current_local_leaf(leaf.as_ref(), ca)?;
+            if let Some(id) = lib::transport_primitives::replica_node_id_from_x509(&certificate)? {
+                return Ok(AuthenticatedPeer::Replica(id));
+            }
+            node_certificate_identity(&certificate)
+                .map(|node| AuthenticatedPeer::Node(node.node_id))
+        };
+        classify().map(Some).map_err(|_| {
+            Status::permission_denied(
+                "Raft control requires a current local Node or owner replica certificate",
+            )
+        })
     }
 }
 
@@ -168,29 +237,44 @@ impl NodeControlPolicy {
 #[derive(Clone)]
 pub(super) struct NodeControlService<S> {
     inner: S,
+    admission: RequestAdmission,
+}
+
+#[derive(Clone)]
+struct RequestAdmission {
     policy: NodeControlPolicy,
     delegated: Arc<[String]>,
+    replica_data: Arc<[String]>,
 }
 impl<S: NamedService> NodeControlService<S> {
     pub(super) fn new(inner: S, policy: NodeControlPolicy, delegated: &[&str]) -> Self {
         Self {
             inner,
-            policy,
-            delegated: delegated
-                .iter()
-                .map(|m| format!("/{}/{m}", S::NAME))
-                .collect::<Vec<_>>()
-                .into(),
+            admission: RequestAdmission {
+                policy,
+                delegated: method_paths(S::NAME, delegated),
+                replica_data: Arc::from([]),
+            },
         }
+    }
+
+    pub(super) fn with_owner_replica_data(mut self) -> Self {
+        self.admission.replica_data = method_paths(S::NAME, REPLICA_DATA_METHODS);
+        self
     }
 }
 impl<S: NamedService> NamedService for NodeControlService<S> {
     const NAME: &'static str = S::NAME;
 }
-impl<S> Service<http::Request<Body>> for NodeControlService<S>
+impl<S, E> Service<http::Request<Body>> for NodeControlService<S>
 where
-    S: Service<http::Request<Body>, Response = http::Response<Body>> + Send + 'static,
-    S::Future: Send + 'static,
+    S: Service<
+            http::Request<Body>,
+            Response = http::Response<Body>,
+            Error = E,
+            Future = BoxFuture<http::Response<Body>, E>,
+        > + Send
+        + 'static,
 {
     type Response = http::Response<Body>;
     type Error = S::Error;
@@ -199,19 +283,60 @@ where
         self.inner.poll_ready(cx)
     }
     fn call(&mut self, mut request: http::Request<Body>) -> Self::Future {
+        if let Err(status) = self.admission.check(&mut request) {
+            return Box::pin(async move { Ok(status.into_http()) });
+        }
+        self.inner.call(request)
+    }
+}
+
+impl RequestAdmission {
+    // The payload/service type has no role in authenticating the connection.
+    // Keep one implementation across all generated tonic service wrappers.
+    #[inline(never)]
+    fn check(&self, request: &mut http::Request<Body>) -> Result<(), Status> {
         if !self.delegated.iter().any(|p| p == request.uri().path()) {
             match self.policy.check(request.extensions()) {
+                Ok(Some(AuthenticatedPeer::Replica(_)))
+                    if !self
+                        .replica_data
+                        .iter()
+                        .any(|path| path == request.uri().path()) =>
+                {
+                    return Err(Status::permission_denied(
+                        "operation requires a cluster Node",
+                    ));
+                }
                 Ok(Some(peer)) => {
                     request.extensions_mut().insert(peer);
                 }
                 Ok(None) => {}
-                Err(status) => return Box::pin(async move { Ok(status.into_http()) }),
+                Err(status) => return Err(status),
             }
         }
-        let future = self.inner.call(request);
-        Box::pin(future)
+        Ok(())
     }
 }
+
+fn method_paths(service: &str, methods: &[&str]) -> Arc<[String]> {
+    methods
+        .iter()
+        .map(|method| format!("/{service}/{method}"))
+        .collect::<Vec<_>>()
+        .into()
+}
+
+/// Each typed handler below this gate also checks the same zone membership.
+const REPLICA_DATA_METHODS: &[&str] = &[
+    "StepMessage",
+    "ReplicateEntries",
+    "SnapshotEcState",
+    "Propose",
+    "Query",
+    "GetClusterInfo",
+    "GetSearchCapabilities",
+    "ReadZoneBlob",
+];
 
 /// These doors have their own current caller/allow-list/ownership policy in the
 /// native issuer. They never inherit Node authority from this exclusion.

@@ -315,6 +315,7 @@ pub struct ZoneManager {
 #[derive(Clone, Copy)]
 enum RuntimeProfile {
     Networked,
+    NetworkedLocalRoot,
     IsolatedRoot,
 }
 
@@ -415,6 +416,33 @@ impl ZoneManager {
             extra_grpc_services,
             load_policy,
             RuntimeProfile::Networked,
+        )
+    }
+
+    /// Host data-zone replicas alongside a root with fixed local membership.
+    /// The existing TLS, control authorization and per-zone Raft paths apply.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_local_root(
+        hostname: &str,
+        node_id: u64,
+        base_path: &str,
+        peers: Vec<String>,
+        bind_addr: &str,
+        tls: Option<TlsFiles>,
+        self_address: Option<String>,
+        extra_grpc_services: Option<tonic::service::Routes>,
+    ) -> Result<Arc<Self>> {
+        Self::with_node_id_profile(
+            hostname,
+            node_id,
+            base_path,
+            peers,
+            bind_addr,
+            tls,
+            self_address,
+            extra_grpc_services,
+            ZoneLoadPolicy::OnDemand,
+            RuntimeProfile::NetworkedLocalRoot,
         )
     }
 
@@ -538,6 +566,11 @@ impl ZoneManager {
             RuntimeProfile::Networked => {
                 ZoneRaftRegistry::with_tls(PathBuf::from(base_path), node_id, tls_config.clone())
             }
+            RuntimeProfile::NetworkedLocalRoot => ZoneRaftRegistry::with_local_root(
+                PathBuf::from(base_path),
+                node_id,
+                tls_config.clone(),
+            ),
             RuntimeProfile::IsolatedRoot => {
                 ZoneRaftRegistry::isolated_root(PathBuf::from(base_path), node_id)
             }
@@ -647,7 +680,7 @@ impl ZoneManager {
         // Owned: the failure message below names the address, and the task outlives
         // this borrow.
         let bind_for_error = bind_addr.to_string();
-        if matches!(profile, RuntimeProfile::Networked) {
+        if !matches!(profile, RuntimeProfile::IsolatedRoot) {
             runtime.spawn(async move {
                 let shutdown = async move {
                     let mut rx = shutdown_rx_server;

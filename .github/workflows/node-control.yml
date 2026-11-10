@@ -12,12 +12,19 @@ on:
       - 'rust/profiles/cluster/**'
       - 'rust/managed_agent/**'
       - 'rust/lib/src/transport_primitives/**'
+      - 'rust/lib/src/rt.rs'
+      - 'rust/lib/tests/runtime_bridge.rs'
+      - 'rust/lib/Cargo.toml'
       - 'proto/nexus/raft/**'
       - '.github/workflows/node-control.yml'
       - '.github/actions/setup-rust-tests/**'
 
 env:
-  CARGO_BUILD_JOBS: 1
+  CARGO_BUILD_JOBS: 2
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   node-boundary:
@@ -34,9 +41,24 @@ jobs:
           cache-key: node-control-${{ matrix.os }}
       - run: cargo test --locked -p raft@0.1.0 --test node_rpc_boundaries
       - run: cargo test --locked -p raft@0.1.0 --test generated_contract_binding
-      - name: Conditional metadata and isolated membership boundaries
-        run: cargo test --locked -p raft@0.1.0 --test test_conditional_zone_metadata --test test_conditional_metadata_ec_boundary --test test_isolated_root_admission -- --test-threads=1
+      - name: Conditional metadata, local root and data-zone boundaries
+        run: cargo test --locked -p raft@0.1.0 --test test_conditional_zone_metadata --test test_conditional_metadata_ec_boundary --test test_isolated_root_admission --test test_zone_owner_replication -- --test-threads=1
+      - name: ReadIndex election, quorum and cancellation boundaries
+        run: cargo test --locked -p raft@0.1.0 --lib raft::node::read_index::tests -- --test-threads=1
       - run: cargo test --locked -p raft@0.1.0 --lib transport::node_authority::tests
+      - name: Owner replica identity and renewal boundaries
+        run: |
+          cargo test --locked -p lib --features transport --lib transport_primitives::authorship::tests
+          cargo test --locked -p lib --features transport --lib transport_primitives::replica_credential::tests
+          cargo test --locked -p raft@0.1.0 --lib transport::certgen::tests::replica_certificate_retains_owner_identity_without_node_authority
+          cargo test --locked -p raft@0.1.0 --lib transport::session_renewal::tests
+          cargo test --locked -p transport --lib peer_identity::tests::owner_replica_remains_an_owner_agent_on_the_existing_vfs_surface
+      - name: Raft membership controls EC recipients
+        run: cargo test --locked -p raft@0.1.0 --lib transport::transport_loop::tests
+      - name: Content peer TLS configuration and connection rotation
+        run: 'cargo test --locked -p transport --lib peer_blob::'
+      - name: Shared executor bridge across runtime flavors
+        run: 'cargo test --locked -p lib --features runtime-bridge --test runtime_bridge'
       - run: cargo test --locked -p raft@0.1.0 --lib agent_csr_client::tests
       - run: cargo test --locked -p raft@0.1.0 --lib zone_manager::tests::mismatched_node_certificate
 
@@ -51,7 +73,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust-tests
         with:
-          cache-key: runtime-enrollment-${{ matrix.os }}
+          cache-key: node-control-${{ matrix.os }}
       - run: cargo test --locked -p nexus-cluster --lib
       - name: Enroll, replicate credentials and restore the same Node identity
         run: cargo test --locked -p nexus-cluster --test node_enrollment --test cross_node_sk_replication -- --test-threads=1
@@ -67,7 +89,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust-tests
         with:
-          cache-key: managed-credentials-${{ matrix.os }}
+          cache-key: node-control-${{ matrix.os }}
       - run: cargo test --locked -p nexus-cluster --features experimental-managed-agent-csr --lib managed_csr::tests
       - run: cargo test --locked -p managed-agent --lib credential_binding::tests
       - run: 'cargo test --locked -p nexus-cluster --features experimental-managed-agent-csr --lib managed_csr_binding::'
