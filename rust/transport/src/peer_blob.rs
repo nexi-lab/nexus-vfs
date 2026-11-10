@@ -202,8 +202,6 @@ impl PeerBlobClient {
         zone_id: &str,
         content_id: &str,
     ) -> Result<Vec<u8>, String> {
-        contracts::validate_zone_id_for(contracts::ZoneIdUse::TenantCreate, zone_id)
-            .map_err(|error| error.to_string())?;
         self.fetch_scoped_async(address, Some(zone_id), content_id)
             .await
     }
@@ -214,6 +212,10 @@ impl PeerBlobClient {
         zone_id: Option<&str>,
         content_id: &str,
     ) -> Result<Vec<u8>, String> {
+        if let Some(zone_id) = zone_id {
+            contracts::validate_zone_id_for(contracts::ZoneIdUse::TenantCreate, zone_id)
+                .map_err(|error| error.to_string())?;
+        }
         // Global cap: total concurrent fetches across all peers.
         let _global_permit = self
             .global_semaphore
@@ -268,13 +270,10 @@ impl PeerBlobClient {
         Ok(resp.content)
     }
 
-    /// Blocking sync wrapper — drives ``fetch_async`` via the shared
-    /// runtime. Safe to call from any thread, including from a tokio
-    /// worker already executing on the same runtime: see
-    /// [`Self::block_on_safely`].
+    /// Blocking fetch on the shared runtime, including from a worker already
+    /// executing on that runtime.
     pub(crate) fn fetch(&self, address: &str, content_id: &str) -> Result<Vec<u8>, String> {
-        let fut = self.fetch_async(address, content_id);
-        self.block_on_safely(fut)
+        self.fetch_scoped(address, None, content_id)
     }
 
     /// Blocking scoped fetch on the same shared runtime and connection policy.
@@ -284,31 +283,21 @@ impl PeerBlobClient {
         zone_id: &str,
         content_id: &str,
     ) -> Result<Vec<u8>, String> {
-        self.block_on_safely(self.fetch_in_zone_async(address, zone_id, content_id))
+        self.fetch_scoped(address, Some(zone_id), content_id)
     }
 
-    /// Re-entrancy-safe `block_on` — mirrors `FederationClient::block_on_safely`
-    /// (added in PR #74) and `RpcTransport::block_on` (kernel crate).
-    ///
-    /// `Handle::block_on` panics with "Cannot start a runtime from
-    /// within a runtime" when invoked from a thread that's currently
-    /// executing on that same runtime — which is exactly the shape a
-    /// kernel hot path takes when a gRPC handler / FUSE callback / raft
-    /// apply task calls into `Kernel::sys_read` → routing → backend →
-    /// `PeerBlobClient::fetch` on the shared kernel runtime.
-    ///
-    /// `block_in_place` releases the worker thread before delegating to
-    /// `Handle::block_on`, which IS safe to call from any context.
-    /// When the caller is NOT already on a tokio runtime we take the
-    /// plain `block_on` path so non-tokio callers (cli tools, sync
-    /// tests, the shutdown path) still work.
-    #[inline]
-    fn block_on_safely<F: std::future::Future>(&self, fut: F) -> F::Output {
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| self.runtime.block_on(fut))
-        } else {
-            self.runtime.block_on(fut)
-        }
+    /// Drive both blocking entry points through the shared runtime bridge,
+    /// including callers on a current-thread Agent runtime.
+    fn fetch_scoped(
+        &self,
+        address: &str,
+        zone_id: Option<&str>,
+        content_id: &str,
+    ) -> Result<Vec<u8>, String> {
+        lib::rt::block_on_via(
+            &self.runtime,
+            self.fetch_scoped_async(address, zone_id, content_id),
+        )
     }
 }
 
