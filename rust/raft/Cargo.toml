@@ -78,7 +78,7 @@ rcgen = { version = "0.14", features = ["pem", "x509-parser"], optional = true }
 x509-parser = { version = "0.18", features = ["verify"], optional = true }  # Read a cert serial + verify a CA-signed CRL (crl::verify_signature); `verify` declared explicitly, not via feature unification
 pem = { version = "3", optional = true }  # PEM parsing for CA fingerprint verification
 base64 = { version = "0.22", optional = true }  # Base64 encoding for CA fingerprint
-rand = { version = "0.10", optional = true }  # Random join-token password generation
+rand = { version = "0.10", optional = true }  # Read request incarnations and join-token passwords
 gethostname = { version = "1.1", optional = true }  # Hostname-based node ID derivation
 
 mimalloc = { workspace = true, optional = true }
@@ -106,12 +106,12 @@ async = ["tokio"]
 # Enable Raft consensus (tikv/raft-rs) — EXPERIMENTAL, default OFF.
 # Not used in production. Preserved for future multi-node support.
 # See: docs/rfcs/adr-raft-sled-strategy.md (Decision 2)
-consensus = ["raft", "protobuf", "slog", "async"]
+consensus = ["raft", "protobuf", "slog", "async", "rand"]
 
 # Enable gRPC transport (tonic + protobuf) — EXPERIMENTAL, default OFF.
 # Requires `consensus` feature. Not used in production.
 # See: docs/rfcs/adr-raft-sled-strategy.md (Decision 4)
-grpc = ["tonic", "prost", "tonic-prost", "lib/transport", "lib/runtime-bridge", "bytes", "dep:tonic-prost-build", "async", "tracing-subscriber", "consensus", "dashmap", "time", "sha2", "rcgen", "x509-parser", "pem", "base64", "gethostname", "rand"]
+grpc = ["tonic", "prost", "tonic-prost", "lib/transport", "lib/runtime-bridge", "bytes", "dep:tonic-prost-build", "async", "tracing-subscriber", "consensus", "dashmap", "time", "sha2", "rcgen", "x509-parser", "pem", "base64", "gethostname"]
 
 full = ["grpc", "consensus"]
 

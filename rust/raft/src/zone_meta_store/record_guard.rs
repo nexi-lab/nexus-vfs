@@ -6,6 +6,7 @@ use super::{bridge_block_on, kernel_to_proto, ZoneMetaStore};
 use crate::raft::{Command, CommandResult, GuardedRecordMutation};
 use kernel::meta_store::{
     ConditionalMetadataError, ConditionalMetadataResult, FileMetadata, MetaStoreError,
+    StreamSegment,
 };
 
 mod io;
@@ -101,6 +102,23 @@ impl ZoneMetaStore {
         }
     }
 
+    fn commit_guarded_stream(
+        &self,
+        mutation: GuardedRecordMutation,
+        guard_version: &[u8],
+    ) -> Result<(), ConditionalMetadataError> {
+        match self.commit_record(Command::GuardedRecord {
+            guard_version: guard_version.to_vec(),
+            mutation,
+        })? {
+            CommandResult::Success => Ok(()),
+            CommandResult::Error(message) => Err(refused(message)),
+            _ => Err(ConditionalMetadataError::Unknown(
+                "unexpected guarded stream mutation result".into(),
+            )),
+        }
+    }
+
     /// Publish a terminal owner image and irrevocably retire its handles in one
     /// commit. This retains cleanup intent; it does not reclaim physical data.
     pub fn retire_record_guard(
@@ -121,6 +139,10 @@ impl ZoneMetaStore {
 }
 
 impl kernel::meta_store::GuardedRecords for ZoneMetaStore {
+    fn record_storage_key(&self, path: &str) -> String {
+        self.to_zone_key(path)
+    }
+
     fn admit_record_io_owner(
         &self,
         path: &str,
@@ -176,6 +198,46 @@ impl kernel::meta_store::GuardedRecords for ZoneMetaStore {
         guard_version: &[u8],
     ) -> Result<u64, ConditionalMetadataError> {
         Self::append_guarded_record(self, path, data, guard_version)
+    }
+
+    fn seal_guarded_record(
+        &self,
+        path: &str,
+        segment: &StreamSegment,
+        guard_version: &[u8],
+    ) -> Result<(), ConditionalMetadataError> {
+        self.commit_guarded_stream(
+            GuardedRecordMutation::Seal {
+                stream_prefix: kernel::core::stream::wal::wal_stream_prefix(
+                    &self.to_zone_key(path),
+                ),
+                base: segment.base,
+                end: segment.end,
+                content_id: segment.content_id.clone(),
+                origin: segment.origin.clone(),
+                size: segment.size,
+            },
+            guard_version,
+        )
+    }
+
+    fn trim_guarded_record(
+        &self,
+        path: &str,
+        up_to_seq: u64,
+        trimmed: Vec<(String, String)>,
+        guard_version: &[u8],
+    ) -> Result<(), ConditionalMetadataError> {
+        self.commit_guarded_stream(
+            GuardedRecordMutation::Trim {
+                stream_prefix: kernel::core::stream::wal::wal_stream_prefix(
+                    &self.to_zone_key(path),
+                ),
+                up_to_seq,
+                trimmed,
+            },
+            guard_version,
+        )
     }
 
     fn retire_record_guard(
