@@ -316,18 +316,31 @@ fn concurrent_blob_publication(role: &str, durable: bool) {
 
 #[test]
 fn concurrent_sidecar_replacement_preserves_complete_json() {
+    concurrent_sidecar_replacement("meta", 1);
+}
+
+#[test]
+fn sidecar_opens_remain_readable_during_repeated_replacements() {
+    // Exercise opens racing the replacement itself, in addition to the held
+    // reader test below. Keep the same process rendezvous and deadline.
+    concurrent_sidecar_replacement("meta-stress", 32);
+}
+
+fn concurrent_sidecar_replacement(role: &str, reads_per_poll: usize) {
     let root = tempfile::tempdir().unwrap();
     let transport = LocalCASTransport::new(root.path(), true).unwrap();
     let hash = transport.write_blob(b"sidecar object").unwrap();
     let candidates: Vec<_> = (0..4).map(sidecar_content).collect();
     transport.write_meta(&hash, &candidates[0]).unwrap();
-    let mut workers = start_writers(root.path(), "meta");
+    let mut workers = start_writers(root.path(), role);
     wait_until(|| {
-        let bytes = transport.read_meta(&hash).unwrap();
-        assert!(
-            candidates.contains(&bytes),
-            "reader observed incomplete sidecar JSON"
-        );
+        for _ in 0..reads_per_poll {
+            let bytes = transport.read_meta(&hash).unwrap();
+            assert!(
+                candidates.contains(&bytes),
+                "reader observed incomplete sidecar JSON"
+            );
+        }
         workers.iter_mut().all(Worker::is_finished)
     });
     assert!(candidates.contains(&transport.read_meta(&hash).unwrap()));
@@ -340,7 +353,7 @@ fn open_sidecar_reader_retains_its_snapshot_across_replacements() {
     use std::io::Read;
 
     let root = tempfile::tempdir().unwrap();
-    let transport = LocalCASTransport::new(root.path(), true).unwrap();
+    let transport = LocalCASTransport::new(&root.path().join("metadata-中文-📘"), true).unwrap();
     let hash = transport.write_blob(b"open sidecar reader").unwrap();
     let original = br#"{"generation":0}"#;
     transport.write_meta(&hash, original).unwrap();
@@ -375,8 +388,8 @@ fn cas_process_worker() {
     } else {
         LocalCASTransport::new(root, true).unwrap()
     };
-    if role == "blob" || role == "meta" || is_durable {
-        let is_blob = role != "meta";
+    if role == "blob" || role == "meta" || role == "meta-stress" || is_durable {
+        let is_blob = role == "blob" || is_durable;
         let content = if is_blob {
             concurrent_content()
         } else {
@@ -399,7 +412,8 @@ fn cas_process_worker() {
             std::fs::write(root.join(format!("result-{id}")), published.to_string()).unwrap();
             assert!(!transport.write_blob_with_hash(&content, &hash).unwrap());
         } else {
-            for _ in 0..8 {
+            let replacements = if role == "meta-stress" { 128 } else { 8 };
+            for _ in 0..replacements {
                 transport.write_meta(&hash, &content).unwrap();
             }
         }

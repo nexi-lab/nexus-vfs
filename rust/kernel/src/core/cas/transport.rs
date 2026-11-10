@@ -337,9 +337,7 @@ impl LocalCASTransport {
         let key = blob_key(content_id);
         let path = self.resolve(&format!("{}.meta", key));
         let mut staged = self.stage_file(&path, meta)?;
-        // Rust's native replacement handles open readers on Windows through
-        // FileRenameInfoEx as well as the normal rename path on Unix.
-        std::fs::rename(&staged, &path)?;
+        lib::file_publication::replace_file(&staged, &path)?;
         staged.disable_cleanup(true);
         self.sync_published(&path)?;
         Ok(())
