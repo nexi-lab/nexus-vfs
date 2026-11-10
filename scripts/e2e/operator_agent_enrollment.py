@@ -116,8 +116,8 @@ class Journey:
         assert result.returncode == 0, (label, result.stderr.decode(errors="replace"))
         return json.loads(result.stdout)
 
-    def claim(self, actor, operation, workspace=None):
-        return {"version": 1, "actor": "codex-" + actor * 32,
+    def claim(self, actor, operation, workspace=None, frontend="codex"):
+        return {"version": 1, "actor": f"{frontend}-" + actor * 32,
                 "operationId": f"00000000-0000-4000-8000-00000000000{operation}",
                 "threadId": f"10000000-0000-4000-8000-00000000000{actor}",
                 "workspace": str(workspace or self.workspace)}
@@ -143,6 +143,9 @@ class Journey:
         wrong.write_text(json.dumps(policy | {"ownerCertificateSha256": "0" * 64}), encoding="utf-8")
         assert self.request("wrong-owner", self.claim("a", "1"), wrong)["outcome"] == "not_submitted"
         assert self.request("forged-owner", self.claim("a", "1") | {"owner": "another-owner"})["outcome"] == "not_submitted"
+        assert self.request("unknown-frontend", self.claim("a", "1", frontend="agent"))["outcome"] == "not_submitted"
+        uppercase = self.claim("a", "1", frontend="claude") | {"actor": "claude-" + "A" * 32}
+        assert self.request("uppercase-actor", uppercase)["outcome"] == "not_submitted"
         assert not state.exists(), "Local refusals must not reserve an operation"
 
         self.proof["stage"] = "mint and exact replay"
@@ -168,6 +171,13 @@ class Journey:
         selected = self.request("race-replay", racing)
         assert all(response == selected or response.get("outcome") == "unknown" for response in responses)
 
+        self.proof["stage"] = "Claude Code actor"
+        claude = self.claim("d", "4", frontend="claude")
+        claude_receipt = self.request("claude-mint", claude)
+        assert claude_receipt["actor"] == claude["actor"], claude_receipt
+        assert self.request("claude-replay", claude) == claude_receipt
+        assert (Path(claude_receipt["credentialDirectory"]) / "agent.pem").is_file()
+
         self.proof["stage"] = "Unknown across Node restart"
         self.stop()
         uncertain = self.claim("c", "3")
@@ -180,7 +190,7 @@ class Journey:
         assert pending.read_bytes() == attempt, "Recovery must retain the original operation"
         assert not (self.data / "agents" / uncertain["actor"]).exists(), "No offline mint or second RPC"
         self.proof.update(success=True, stage="complete", exactReceiptReplay=True,
-                          concurrentOneOperation=True, unknownNeverResubmitted=True,
+                          concurrentOneOperation=True, claudeActorMinted=True, unknownNeverResubmitted=True,
                           localRefusalsDoNotReserve=True)
 
     def finish(self):
