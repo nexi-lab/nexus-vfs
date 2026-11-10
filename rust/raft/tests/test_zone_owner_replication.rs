@@ -107,7 +107,7 @@ fn node_with_peers(
 }
 
 async fn found(manager: &Arc<ZoneManager>, zone: &str, id: u64, addr: &str) {
-    manager
+    let zone = manager
         .create_zone_async(
             zone,
             if zone == "root" {
@@ -117,10 +117,23 @@ async fn found(manager: &Arc<ZoneManager>, zone: &str, id: u64, addr: &str) {
             },
         )
         .await
-        .unwrap()
-        .consensus_node()
-        .campaign()
+        .unwrap();
+    ready(zone.consensus_node()).await;
+}
+
+async fn ready(node: Arc<nexus_raft::raft::ZoneConsensus<nexus_raft::raft::FullStateMachine>>) {
+    node.campaign().await.unwrap();
+    // Campaign acknowledges the request. A reopened node can still be replaying
+    // its committed membership; only an elected leader can accept new writes.
+    let observer = node.clone();
+    assert!(
+        tokio::task::spawn_blocking(move || observer.wait_for_leader(Duration::from_secs(5)))
+            .await
+            .unwrap()
+    );
+    tokio::time::timeout(Duration::from_secs(5), node.read_linearizable(|_| ()))
         .await
+        .unwrap()
         .unwrap();
 }
 
@@ -378,7 +391,7 @@ async fn replica_adoption_preserves_local_root_identity_and_writes_across_restar
         )
         .await;
         let root_node = manager.get_zone("root").unwrap().consensus_node();
-        root_node.campaign().await.unwrap();
+        ready(root_node.clone()).await;
         let root_status = manager.cluster_status("root");
         assert_eq!(manager.node_id(), replica_id);
         assert_eq!(root_status.node_id, local_id);
