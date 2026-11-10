@@ -65,7 +65,7 @@ use super::PROPOSAL_TIMEOUT_SECS;
 use super::{Command, CommandResult, RaftError, Result};
 
 mod read_index;
-use read_index::PendingRead;
+use read_index::{PendingRead, ReadContext, ReadRequestIds};
 
 /// Capacity of the bounded channel between [`ZoneConsensus`] handles and the
 /// [`ZoneConsensusDriver`] actor. Provides backpressure under sustained
@@ -357,7 +357,7 @@ pub enum RaftMsg {
     Campaign { tx: oneshot::Sender<Result<()>> },
     /// Linearizable read request (ReadIndex).
     ///
-    /// The driver calls `RawNode::read_index` with a unique 8-byte
+    /// The driver calls `RawNode::read_index` with a unique opaque
     /// request context, stores the oneshot sender in
     /// `pending_reads_by_ctx`, and the caller awaits. When raft-rs
     /// emits a `ReadState` (after the leader confirms via heartbeat
@@ -529,17 +529,15 @@ pub struct ZoneConsensusDriver<S: StateMachine + 'static> {
     /// Resolved in `apply_entries` when the ConfChange is committed.
     pending_conf_changes: HashMap<u64, oneshot::Sender<Result<ConfState>>>,
     /// Pending linearizable reads waiting for raft-rs to emit a
-    /// `ReadState`, keyed by the 8-byte request context we passed to
+    /// `ReadState`, keyed by the opaque request context we passed to
     /// `RawNode::read_index`.
-    pending_reads_by_ctx: HashMap<u64, PendingRead>,
+    pending_reads_by_ctx: HashMap<ReadContext, PendingRead>,
     /// Pending linearizable reads that have their `read_index`
     /// assigned but are waiting for `state_machine.last_applied`
     /// to catch up. Drained after every `apply_entries` pass.
     pending_reads_by_index: Vec<(u64, oneshot::Sender<Result<()>>)>,
-    /// Monotonic counter for the 8-byte `ReadIndex` request
-    /// context. Driver-local — the handle always passes 0 and
-    /// the driver assigns the real id (mirrors `Propose`).
-    read_request_counter: u64,
+    /// Node, driver incarnation and monotonic request sequence.
+    read_request_ids: ReadRequestIds,
     /// Proposal ID counter (shared with handle for ID generation).
     proposal_id: Arc<AtomicU64>,
     /// Last tick time.
@@ -902,6 +900,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             .map(|f| f.saturating_sub(1))
             .unwrap_or(0);
 
+        let read_request_ids = ReadRequestIds::new(config.id);
         let driver = ZoneConsensusDriver {
             raw_node,
             state_machine,
@@ -910,7 +909,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             pending_conf_changes: HashMap::new(),
             pending_reads_by_ctx: HashMap::new(),
             pending_reads_by_index: Vec::new(),
-            read_request_counter: 0,
+            read_request_ids,
             proposal_id,
             last_tick: Instant::now(),
             failed: false,
@@ -2160,8 +2159,12 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
             RaftMsg::ReadIndex { tx } => {
                 // Keep the request until Raft can accept it. A newly elected
                 // leader drops ReadIndex until it commits its first entry.
-                let id = self.read_request_counter;
-                self.read_request_counter = self.read_request_counter.wrapping_add(1);
+                let Some(id) = self.read_request_ids.allocate() else {
+                    let _ = tx.send(Err(RaftError::Config(
+                        "ReadIndex request sequence exhausted".into(),
+                    )));
+                    return;
+                };
                 self.pending_reads_by_ctx.insert(id, PendingRead::new(tx));
             }
             RaftMsg::Membership { tx } => {
@@ -2700,20 +2703,13 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         }
         let applied = self.state_machine.read().await.last_applied_index();
         for state in states {
-            if state.request_ctx.len() != 8 {
+            let Ok(id) = ReadContext::try_from(state.request_ctx.as_slice()) else {
                 tracing::warn!(
                     ctx_len = state.request_ctx.len(),
                     "raft.read_index: unexpected request_ctx length, dropping"
                 );
                 continue;
-            }
-            let id = u64::from_be_bytes(
-                state
-                    .request_ctx
-                    .as_slice()
-                    .try_into()
-                    .expect("length checked above"),
-            );
+            };
             let Some(request) = self.pending_reads_by_ctx.remove(&id) else {
                 // Unknown context — likely a ReadIndex issued by a
                 // previous driver instance or a stale ctx; drop.
