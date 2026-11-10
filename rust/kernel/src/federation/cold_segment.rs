@@ -13,7 +13,7 @@
 //!   `write_content` the segment blob, returning the id the backend assigned
 //!   (a CAS hash, or — in the cluster profile's path-addressed backend — the
 //!   storage path). Mirrors `sys_write`.
-//! * **read** — the same backend locally, else a whole-blob `ReadBlob` peer
+//! * **read** — the same backend locally, else a scoped `ReadZoneBlob` peer
 //!   fetch from the seal `origin`. Mirrors `sys_read` + `try_remote_fetch`.
 //!
 //! The field declaration (`Kernel::cold_segment_store`) lives on `Kernel`
@@ -124,7 +124,7 @@ impl Kernel {
     }
 
     /// Read a sealed segment blob by `content_id`: the local content backend,
-    /// else a whole-blob `ReadBlob` peer fetch from the seal `origin`. Mirrors
+    /// else a `ReadZoneBlob` peer fetch from the seal `origin`. Mirrors
     /// `sys_read` + `try_remote_fetch`.
     pub(crate) fn read_cold_segment(
         &self,
@@ -157,7 +157,7 @@ impl Kernel {
             if !is_self {
                 return self
                     .peer_client_arc()
-                    .fetch(origin, content_id)
+                    .fetch_in_zone(origin, zone_id, content_id)
                     .map_err(|e| {
                         format!("peer fetch cold segment {content_id} from {origin}: {e}")
                     });
@@ -267,3 +267,6 @@ impl ColdSegmentStore for KernelColdSegmentStore {
         k.read_cold_segment(stream_id, &self.zone, content_id, origin)
     }
 }
+
+#[cfg(test)]
+mod tests;

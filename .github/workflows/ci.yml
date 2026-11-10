@@ -63,6 +63,8 @@ jobs:
         run: cargo test -p kernel --test cas_publication --test boot_metastore
       - name: Reject malformed content identifiers before filesystem access
         run: cargo test --locked -p kernel --lib core::cas::transport::tests::invalid_content_ids_are_refused_before_filesystem_access
+      - name: Cold peer reads retain their owning zone
+        run: cargo test --locked -p kernel --lib federation::cold_segment::tests
       - name: Batch write results and commit notifications on the native filesystem
         run: cargo test --locked -p kernel --test batch_write_outcomes
       - name: Durable CAS ObjectStore composition

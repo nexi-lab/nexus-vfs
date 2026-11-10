@@ -543,13 +543,9 @@ impl Kernel {
         // not where those bytes live in any local backend.  Skipping the
         // local-backend probe in that case is correct: the local backend
         // necessarily has nothing addressable under "" anyway.
-        // `try_remote_fetch` further down handles the empty content_id
-        // path by falling back to the global `path` as the peer fetch
-        // key (line 527), routing through `last_writer_address` to the
-        // origin node's `BlobFetcher::read` which path-routes through
-        // its own `VFSRouter`.  The previous `return Err(not_found())`
-        // bail-out at this point pre-empted that fast path and broke
-        // every cross-node read of an observe-materialised entry.
+        // On a local miss, `try_remote_fetch` sends the owning zone's backing
+        // path to last_writer_address. The peer resolves its content identifier
+        // from that zone's own metadata.
         let content_id_opt = entry.content_id.as_deref().filter(|s| !s.is_empty());
 
         // 4. VFS lock (blocking acquire — wrapper releases GIL before calling this)
@@ -607,34 +603,22 @@ impl Kernel {
                 entry_type: DT_REG,
                 stream_next_offset: None,
             }),
-            // Local backend miss + metadata exists → federation path:
-            // try the origin encoded in backend_name. Otherwise it's a
-            // genuine miss.
-            None => self.try_remote_fetch(path, &entry),
+            // Project the authorized route into the peer's zone namespace.
+            None => {
+                let address = super::StreamAddress::from_route(path, &ctx.zone_id, Some(&route));
+                self.try_remote_fetch(path, &address, &entry)
+            }
         }
     }
 
-    /// Federation on-demand content fetch (store-and-forward).
-    ///
-    /// When local read of a Raft-replicated entry misses,
-    /// ``last_writer_address`` names the node that wrote it. We send
-    /// the *virtual path* over to that peer's ``ReadBlob`` RPC; the
-    /// peer's ``BlobFetcher::read`` self-routes through its own
-    /// ``VFSRouter`` exactly like a local ``sys_read`` and lets each
-    /// backend interpret the locally-stored ``content_id`` (CAS hash
-    /// or PAS backend_path) however it likes. The kernel performs no
-    /// CAS-vs-PAS dispatch — the peer's mount table answers that.
-    ///
-    /// Returns ``Err(FileNotFound)`` when ``last_writer_address`` is
-    /// unset, equals ``self_address``, or the remote call fails.
-    ///
-    /// This is a pure read: it fetches and returns peer bytes with no
-    /// local cache-back, so it takes neither the ``route`` (no backend
-    /// write) nor the ``ctx`` (no write authorization) the former
-    /// materialization needed.
+    /// Fetch a missing file through its owning zone and canonical backing path.
+    /// The peer resolves that path against its own zone metadata and content
+    /// store. The caller's visible spelling remains the event and error path.
+    /// Bytes are returned directly; reads leave the local content store alone.
     fn try_remote_fetch(
         &self,
         path: &str,
+        address: &super::StreamAddress,
         entry: &FileMetadata,
     ) -> Result<SysReadResult, KernelError> {
         let not_found = || KernelError::FileNotFound(path.to_string());
@@ -651,76 +635,26 @@ impl Kernel {
             }
         }
 
-        // Drive the RPC on the kernel-owned shared runtime — reusing
-        // the pooled tonic Channel from ``peer_client``. Avoid one-shot
-        // ``new_current_thread()`` per call so the runtime does not
-        // linger when the future has not finished draining.
-        //
-        // The key is the user-facing global ``path``, NEVER this entry's
-        // ``content_id``.
-        //
-        // ``content_id`` is a BACKEND-INTERNAL address — a CAS hash, or for a
-        // path-addressed mount the writer's ``backend_path``. The peer's
-        // ``BlobFetcher::read`` routes the key through its own ``VFSRouter``
-        // and keys any metadata it materializes on it, and neither is sound for
-        // a key that is not a caller path. Sending a `backend_path` reached the
-        // bytes anyway — a mount at `/agents` produced `health-founder.txt`,
-        // which fell to the peer's root-zone fallback and was then found by the
-        // fan-out in ``BlobFetcher::read`` — so the read passed while the
-        // routing underneath it was meaningless. Subtree-anchored backend paths
-        // (nexi-lab/nexus-vfs#361) made the same key `agents/health-founder.txt`,
-        // which trips the mount-prefix precondition in `under_mount` outright;
-        // that refusal is how this was found.
-        //
-        // A global path costs nothing in reach: the peer resolves it against
-        // ITS OWN metadata (`lookup_local_content_id`) to get whichever
-        // content_id its backends understand — a CAS hash where it is CAS, its
-        // own backend_path where it is PAS — and falls back to the route's
-        // `backend_path` on a cold metastore. That indirection is strictly
-        // wider than anything the writer's address could name, and it keeps a
-        // backend-internal identifier from crossing a node boundary at all.
-        // Raw-hash fetches with no path (CAS chunk fan-out) address `ReadBlob`
-        // directly and do not come through here.
-        //
-        // This is a pure read: the fetched bytes are returned to the
-        // caller and NOT written back into the local backend. Reads are
-        // on-demand — under §3g the CC path is a FUSE mount, so every
-        // `ls`/`cat` routes back through `try_remote_fetch` and pulls
-        // fresh peer bytes; there is no raw host-dir a reader bypasses,
-        // hence nothing to materialize. (The metastore rows the merged
-        // view needs are already raft-replicated independent of content.)
-        //
-        // ``peer_client`` is ``RwLock<Arc<dyn PeerBlobClient>>``;
-        // ``peer_client_arc()`` clones the Arc out from under the read
-        // lock so the actual fetch happens lock-free.
-        let fetch_key = path;
+        // Retain the owning zone from the authorized route. Its backing path
+        // is independent of either node's visible mount spelling.
+        let fetch_key = &address.path;
         let client = self.peer_client_arc();
-        let data = client.fetch(origin, fetch_key).map_err(|e| {
-            // Surface cross-node fetch failures — otherwise the error string
-            // is lost at the C-ABI boundary (only an errno reaches the FUSE
-            // plugin, which maps any non-not-found error to an opaque
-            // "Invalid request code"), making a broken read path silent.
-            tracing::warn!(
-                target: "kernel::observe",
-                path = %path,
-                origin = %origin,
-                fetch_key = %fetch_key,
-                "cross-node fetch failed: {e}",
-            );
-            KernelError::IOError(e)
-        })?;
-
-        // NOTE: no local cache-back. This used to write the fetched blob
-        // into the reader's local backend (`route.backend.write_content`),
-        // justified as a "failover requirement" citing a
-        // `TestLeaderFailover::test_failover_and_recovery` that never
-        // existed. Its only real load-bearing role was §3f raw-dir
-        // materialization (CC read the LocalConnector host dir directly,
-        // bypassing FUSE). Under §3g the CC path IS the FUSE mount, so
-        // reads are on-demand and no materialization is needed; cc-tasks
-        // is append-only with raft-replicated metastore rows, so no
-        // failover content cache is semantically required either. See the
-        // read-path decouple change (read ⊥ cache ⊥ materialize).
+        let data = client
+            .fetch_in_zone(origin, &address.zone, fetch_key)
+            .map_err(|e| {
+                // Surface cross-node fetch failures — otherwise the error string
+                // is lost at the C-ABI boundary (only an errno reaches the FUSE
+                // plugin, which maps any non-not-found error to an opaque
+                // "Invalid request code"), making a broken read path silent.
+                tracing::warn!(
+                    target: "kernel::observe",
+                    path = %path,
+                    origin = %origin,
+                    fetch_key = %fetch_key,
+                    "cross-node fetch failed: {e}",
+                );
+                KernelError::IOError(e)
+            })?;
 
         // Broadcast a `RemoteFetch` event to any registered
         // `MutationObserver` filtering that bit.  Kernel names only the
