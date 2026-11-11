@@ -66,6 +66,7 @@ use bincode::Options;
 use dashmap::DashMap;
 use prost::Message;
 use protobuf::Message as ProtobufV2Message;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -808,6 +809,45 @@ fn peer_cert_der<T>(request: &Request<T>) -> Option<Vec<u8>> {
         .and_then(|certs| certs.first().map(|c| c.as_ref().to_vec()))
 }
 
+/// Each member's dial endpoint from the zone's member-address records — the
+/// one source for addresses reported to clients, the local node's included.
+async fn recorded_endpoints(
+    node: &ZoneConsensus<FullStateMachine>,
+    use_tls: bool,
+) -> std::result::Result<HashMap<u64, String>, Status> {
+    use crate::raft::StateMachine;
+    let records = node
+        .with_state_machine(|sm| sm.member_addresses())
+        .await
+        .map_err(|e| Status::unavailable(format!("read member addresses: {e}")))?;
+    Ok(records
+        .into_iter()
+        .filter_map(|(id, address)| {
+            crate::raft::member_address::endpoint(id, &address, use_tls)
+                .map(|route| (id, route.endpoint))
+        })
+        .collect())
+}
+
+/// Voters and learners with their recorded addresses; a member without a
+/// record carries an empty address.
+fn cluster_config(
+    addresses: &HashMap<u64, String>,
+    voters: &[u64],
+    learners: &[u64],
+) -> ProtoClusterConfig {
+    let info = |id: u64, role: i32| ProtoNodeInfo {
+        id,
+        address: addresses.get(&id).cloned().unwrap_or_default(),
+        role,
+    };
+    ProtoClusterConfig {
+        voters: voters.iter().map(|&id| info(id, 0)).collect(),
+        learners: learners.iter().map(|&id| info(id, 1)).collect(),
+        witnesses: vec![],
+    }
+}
+
 /// Zone-routed implementation of the ZoneApiService gRPC trait.
 ///
 /// This is the strict-mTLS DATA plane. Node enrollment (cert provisioning) is
@@ -1236,54 +1276,31 @@ impl ZoneApiService for ZoneApiServiceImpl {
         )?;
         let req = request.into_inner();
         let node = get_zone_node(&self.registry, &req.zone_id)?;
-        let peers = self.registry.get_peers(&req.zone_id).unwrap_or_default();
         let node_id = node.id();
 
         let is_leader = node.is_leader();
         let leader_id = node.leader_id().unwrap_or(0);
         let term = node.term();
-        let leader_addr = peers.get(&leader_id).map(|a| a.endpoint.clone());
 
-        // Reuse the driver's membership query so voters and learners come
-        // from one ProgressTracker view. Do NOT union with `peers` — the
-        // peer address book is a superset (learners, witnesses,
-        // ghosts from wipe-rejoins), and unioning with a hand-added
-        // self entry produced the "leader appears twice in voters
-        // list" issue #7.  `peers` is used only to resolve id →
-        // endpoint address for each authoritative member. This is membership,
-        // not proof of reachability, feature support or a ReadIndex barrier.
+        // Voters and learners come from one ProgressTracker view; their
+        // addresses come from the zone's member-address records, so every
+        // member — this node included — reports the address the zone
+        // replicates for it, and a member without a record reports an
+        // empty one. This is membership, not proof of reachability,
+        // feature support or a ReadIndex barrier.
         let membership = node
             .membership()
             .await
             .map_err(|e| Status::unavailable(format!("read zone membership: {e}")))?;
-        let member_info = |id, role| ProtoNodeInfo {
-            id,
-            address: peers
-                .get(&id)
-                .map(|a| a.endpoint.clone())
-                .unwrap_or_default(),
-            role,
-        };
-        let voters = membership
-            .voters
-            .into_iter()
-            .map(|id| member_info(id, 0))
-            .collect();
-        let learners = membership
-            .learners
-            .into_iter()
-            .map(|id| member_info(id, 1))
-            .collect();
+        let addresses = recorded_endpoints(&node, self.registry.tls_config().is_some()).await?;
+        let leader_addr = addresses.get(&leader_id).cloned();
+        let config = cluster_config(&addresses, &membership.voters, &membership.learners);
 
         Ok(Response::new(GetClusterInfoResponse {
             node_id,
             leader_id,
             term,
-            config: Some(ProtoClusterConfig {
-                voters,
-                learners,
-                witnesses: vec![],
-            }),
+            config: Some(config),
             is_leader,
             leader_address: leader_addr,
         }))
@@ -1346,33 +1363,24 @@ impl ZoneApiService for ZoneApiServiceImpl {
         // lives at the DT_MOUNT entry, not here.)
         use raft::eraftpb::ConfChangeType;
 
-        // Peer map is stable across this handler; fetch once and build
-        // response configs from it. Closure captures `peers` by ref and
-        // takes id slices, so it needs no `Membership` type in scope and
-        // is safe to reuse across the awaits below.
-        // How far the leader has replicated to one learner. Takes the pairs as a
-        // slice for the same reason `make_config` takes id slices — no
-        // `Membership` type in scope here.
+        // How far the leader has replicated to one learner. Takes the pairs as
+        // a slice — no `Membership` type in scope here.
         fn matched_for(learner_matched: &[(u64, u64)], node_id: u64) -> u64 {
             learner_matched
                 .iter()
                 .find(|(id, _)| *id == node_id)
                 .map_or(0, |(_, matched)| *matched)
         }
-        let peers = self.registry.get_peers(&req.zone_id).unwrap_or_default();
-        let make_config = |voters: &[u64], learners: &[u64]| {
-            let info = |id: u64, role: i32| ProtoNodeInfo {
-                id,
-                address: peers
-                    .get(&id)
-                    .map(|a| a.endpoint.clone())
-                    .unwrap_or_default(),
-                role,
-            };
-            ProtoClusterConfig {
-                voters: voters.iter().map(|&id| info(id, 0)).collect(),
-                learners: learners.iter().map(|&id| info(id, 1)).collect(),
-                witnesses: vec![],
+        // Response configs carry the recorded member addresses, read after
+        // any membership change this handler commits (the change writes the
+        // joiner's record at its own index).
+        let use_tls = self.registry.tls_config().is_some();
+        let make_config = |voters: Vec<u64>, learners: Vec<u64>| {
+            let node = node.clone();
+            async move {
+                recorded_endpoints(&node, use_tls)
+                    .await
+                    .map(|addresses| cluster_config(&addresses, &voters, &learners))
             }
         };
         // Turn a raft error into the redirect/failure response shape.
@@ -1412,7 +1420,9 @@ impl ZoneApiService for ZoneApiServiceImpl {
                 success: true,
                 error: None,
                 leader_address: None,
-                config: Some(make_config(&membership.voters, &membership.learners)),
+                config: Some(
+                    make_config(membership.voters.clone(), membership.learners.clone()).await?,
+                ),
                 catching_up: false,
                 commit_index: 0,
                 applied_index: 0,
@@ -1441,7 +1451,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
                 success: true,
                 error: None,
                 leader_address: None,
-                config: Some(make_config(&m.voters, &m.learners)),
+                config: Some(make_config(m.voters.clone(), m.learners.clone()).await?),
                 catching_up: false,
                 commit_index: 0,
                 applied_index: 0,
@@ -1483,7 +1493,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
                     req.zone_id, req.node_address
                 )),
                 leader_address: None,
-                config: Some(make_config(&m.voters, &m.learners)),
+                config: Some(make_config(m.voters.clone(), m.learners.clone()).await?),
                 // Progress, not misconfiguration — see JoinZoneResponse.catching_up.
                 catching_up: true,
                 commit_index: m.commit_index,
@@ -1513,7 +1523,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
                         success: true,
                         error: None,
                         leader_address: None,
-                        config: Some(make_config(&conf_state.voters, &learners)),
+                        config: Some(make_config(conf_state.voters.clone(), learners).await?),
                         catching_up: false,
                         commit_index: 0,
                         applied_index: 0,
@@ -1536,7 +1546,9 @@ impl ZoneApiService for ZoneApiServiceImpl {
                     req.zone_id, req.node_address
                 )),
                 leader_address: None,
-                config: Some(make_config(&membership.voters, &membership.learners)),
+                config: Some(
+                    make_config(membership.voters.clone(), membership.learners.clone()).await?,
+                ),
                 catching_up: true,
                 commit_index: membership.commit_index,
                 applied_index: matched_for(&membership.learner_matched, req.node_id),

@@ -888,6 +888,7 @@ impl ZoneRuntimeBackend {
             leader_id: status.leader_id,
             voter_count: status.voter_count as u32,
             witness_count: status.witness_count as u32,
+            leader_contact_age_ms: status.leader_contact_age_ms,
         }
     }
 }

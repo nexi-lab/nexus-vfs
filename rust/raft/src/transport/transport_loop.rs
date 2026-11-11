@@ -1407,6 +1407,45 @@ mod tests {
         assert!(!transport.ec_peer_state.contains_key(&2));
     }
 
+    /// A member without a route is reported once per loss of its route,
+    /// not once per dropped message.
+    #[tokio::test]
+    async fn an_unrouted_member_is_reported_once_until_it_routes_again() {
+        let (_directory, _handle, mut transport) = membership_fixture(ConfState {
+            voters: vec![1],
+            learners: vec![9],
+            ..Default::default()
+        });
+        let to = |id: u64| {
+            let mut message = raft::eraftpb::Message::default();
+            message.set_msg_type(MessageType::MsgHeartbeat);
+            message.to = id;
+            message
+        };
+        transport.send_messages_fire_and_forget(vec![to(9), to(9)]);
+        transport.send_messages_fire_and_forget(vec![to(9)]);
+        assert_eq!(
+            transport.unrouted.iter().copied().collect::<Vec<_>>(),
+            vec![9]
+        );
+
+        transport
+            .peers
+            .write()
+            .unwrap()
+            .observe(9, NodeAddress::new(9, "http://127.0.0.1:1"));
+        transport.send_messages_fire_and_forget(vec![to(9)]);
+        assert!(
+            transport.unrouted.is_empty(),
+            "a routed send re-arms the warning for a later loss"
+        );
+        transport.send_messages_fire_and_forget(vec![to(7)]);
+        assert_eq!(
+            transport.unrouted.iter().copied().collect::<Vec<_>>(),
+            vec![7]
+        );
+    }
+
     #[test]
     fn compact_floor_holds_for_never_acked_peer_within_retention() {
         // A peer at acked_seq==0 (never acked) must pin the floor at 0 so its

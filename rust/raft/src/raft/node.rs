@@ -254,6 +254,41 @@ pub struct Membership {
     pub learner_matched: Vec<(u64, u64)>,
 }
 
+/// When this node last received a message from its current leader, measured
+/// in memory and never persisted: written by the driver on each step from the
+/// leader, read by the handle for status.
+struct LeaderContact {
+    started: Instant,
+    /// Milliseconds after `started`, plus one; zero before the first contact.
+    last: AtomicU64,
+}
+
+impl LeaderContact {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            last: AtomicU64::new(0),
+        }
+    }
+
+    fn touch(&self) {
+        let elapsed = self.started.elapsed().as_millis() as u64;
+        self.last
+            .store(elapsed.saturating_add(1), Ordering::Relaxed);
+    }
+
+    fn age(&self) -> Option<Duration> {
+        match self.last.load(Ordering::Relaxed) {
+            0 => None,
+            last => Some(
+                self.started
+                    .elapsed()
+                    .saturating_sub(Duration::from_millis(last - 1)),
+            ),
+        }
+    }
+}
+
 /// Ephemeral read view published by the Raft driver from its ProgressTracker.
 #[derive(Default)]
 struct MembershipSnapshot {
@@ -389,6 +424,8 @@ pub struct ZoneConsensus<S: StateMachine + 'static> {
     /// is a superset containing learners, witnesses, and stale
     /// wipe-rejoin ghosts).
     cached_membership: Arc<parking_lot::RwLock<MembershipSnapshot>>,
+    /// Last contact from the current leader, written by the driver.
+    leader_contact: Arc<LeaderContact>,
     /// Shared clone of the state machine's ``last_applied`` atomic — not
     /// a second cache, the state machine IS the SSOT for applied index.
     /// ``commit_index`` reflects ``raft_log.committed`` which raft-rs
@@ -442,6 +479,7 @@ impl<S: StateMachine + 'static> Clone for ZoneConsensus<S> {
             cached_commit_index: self.cached_commit_index.clone(),
             cached_last_index: self.cached_last_index.clone(),
             cached_membership: self.cached_membership.clone(),
+            leader_contact: self.leader_contact.clone(),
             applied_index_atom: self.applied_index_atom.clone(),
             replication_log: self.replication_log.clone(),
             #[cfg(all(feature = "grpc", has_protos))]
@@ -508,6 +546,8 @@ pub struct ZoneConsensusDriver<S: StateMachine + 'static> {
     cached_last_index: Arc<AtomicU64>,
     /// Cached membership shared with the handle for status and authorization.
     cached_membership: Arc<parking_lot::RwLock<MembershipSnapshot>>,
+    /// Last contact from the current leader, shared with the handle.
+    leader_contact: Arc<LeaderContact>,
     /// Shared peer map whose registered layer this driver derives from the
     /// applied member-address records. Set by `set_peer_map()` before the
     /// transport loop starts.
@@ -791,6 +831,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         let cached_commit_index = Arc::new(AtomicU64::new(0));
         let cached_last_index = Arc::new(AtomicU64::new(0));
         let cached_membership = Arc::new(parking_lot::RwLock::new(MembershipSnapshot::default()));
+        let leader_contact = Arc::new(LeaderContact::new());
         refresh_cached_status_from_raw_node(
             &raw_node,
             &cached_leader_id,
@@ -812,6 +853,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             cached_commit_index: cached_commit_index.clone(),
             cached_last_index: cached_last_index.clone(),
             cached_membership: cached_membership.clone(),
+            leader_contact: leader_contact.clone(),
             applied_index_atom,
             replication_log,
             #[cfg(all(feature = "grpc", has_protos))]
@@ -847,6 +889,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             cached_commit_index,
             cached_last_index,
             cached_membership,
+            leader_contact,
             #[cfg(all(feature = "grpc", has_protos))]
             peer_map: None,
             #[cfg(all(feature = "grpc", has_protos))]
@@ -981,6 +1024,17 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
     /// Get the current term (atomic read, no channel).
     pub fn term(&self) -> u64 {
         self.cached_term.load(Ordering::Relaxed)
+    }
+
+    /// Time since this node last received a message from its current
+    /// leader: zero on the leader itself, `None` before the first contact
+    /// since this zone became resident. Memory only, never persisted.
+    pub fn leader_contact_age(&self) -> Option<Duration> {
+        if self.is_leader() {
+            Some(Duration::ZERO)
+        } else {
+            self.leader_contact.age()
+        }
     }
 
     /// Snapshot of the current voter set (raft-rs SSOT).
@@ -1999,8 +2053,12 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                     msg_type = ?msg.get_msg_type(),
                     "raft.driver.step"
                 );
+                let from = msg.from;
                 if let Err(e) = self.raw_node.step(msg) {
                     tracing::warn!("raft step error: {}", e);
+                }
+                if from != 0 && from != self.config.id && from == self.raw_node.raft.leader_id {
+                    self.leader_contact.touch();
                 }
             }
             RaftMsg::Propose { data, tx, .. } => {

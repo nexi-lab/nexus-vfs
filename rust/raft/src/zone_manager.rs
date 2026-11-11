@@ -223,6 +223,9 @@ pub struct ClusterStatus {
     pub applied_index: u64,
     pub voter_count: usize,
     pub witness_count: usize,
+    /// Milliseconds since this node last heard from its current leader —
+    /// 0 on the leader, `None` before the first contact. Memory only.
+    pub leader_contact_age_ms: Option<u64>,
 }
 
 /// Local presence ladder for a zone — see [`ZoneManager::zone_presence`].
@@ -1542,6 +1545,7 @@ impl ZoneManager {
                 applied_index: 0,
                 voter_count: 0,
                 witness_count: 0,
+                leader_contact_age_ms: None,
             };
         };
         // Membership SSOT is raft's ConfState (the authoritative voter set),
@@ -1576,6 +1580,7 @@ impl ZoneManager {
             applied_index: node.applied_index(),
             voter_count,
             witness_count,
+            leader_contact_age_ms: node.leader_contact_age().map(|age| age.as_millis() as u64),
         }
     }
 
