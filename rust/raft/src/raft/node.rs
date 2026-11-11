@@ -2499,12 +2499,12 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         let mut sm = self.state_machine.write().await;
 
         for entry in entries {
-            if entry.data.is_empty() {
-                sm.apply(entry.index, &Command::Noop)?;
-                continue;
-            }
-
             match entry.get_entry_type() {
+                // A leader's empty entry, and a V1 entry raft-rs never writes
+                // empty, have no command to apply.
+                EntryType::EntryNormal | EntryType::EntryConfChange if entry.data.is_empty() => {
+                    sm.apply(entry.index, &Command::Noop)?;
+                }
                 EntryType::EntryNormal => {
                     let (proposal_id, command) = Command::from_log_data(&entry.data)?;
                     let result = sm.apply(entry.index, &command)?;
@@ -2589,7 +2589,13 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                         voter_count = cs.voters.len(),
                         "raft.conf_change.applied",
                     );
-                    sm.apply(entry.index, &Command::Noop)?;
+                    sm.apply_membership(
+                        entry.index,
+                        &super::member_address::conf_change_commands(
+                            &[(cc.get_change_type(), cc.node_id)],
+                            &cc.context,
+                        ),
+                    )?;
 
                     // S3 Phase B: mirror the fresh ConfState into
                     // `identity.json` so a subsequent `data_dir` wipe
@@ -2608,6 +2614,8 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                     }
                 }
                 EntryType::EntryConfChangeV2 => {
+                    // An empty V2 is raft-rs's automatic leave of a joint
+                    // configuration; it applies like any other change.
                     let cc: ConfChangeV2 = protobuf::Message::parse_from_bytes(&entry.data)
                         .map_err(|e| RaftError::Serialization(e.to_string()))?;
 
@@ -2675,7 +2683,15 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                         voters = ?cs.voters,
                         "raft.conf_change_v2.applied",
                     );
-                    sm.apply(entry.index, &Command::Noop)?;
+                    let changes: Vec<_> = cc
+                        .changes
+                        .iter()
+                        .map(|single| (single.get_change_type(), single.node_id))
+                        .collect();
+                    sm.apply_membership(
+                        entry.index,
+                        &super::member_address::conf_change_commands(&changes, &cc.context),
+                    )?;
 
                     // S3 Phase B: same identity mirror as the V1 arm.
                     if let Some(ref cb) = self.conf_state_applied_cb {
@@ -3453,6 +3469,146 @@ mod tests {
         }
         assert!(handle.is_leader(), "single voter must self-elect");
         (handle, driver, dir)
+    }
+
+    /// Advance `driver` until the applied membership satisfies `done`.
+    async fn advance_until_membership(
+        driver: &mut ZoneConsensusDriver<FullStateMachine>,
+        done: impl Fn(&Membership) -> bool,
+    ) {
+        for _ in 0..100 {
+            driver.process_messages();
+            driver
+                .advance()
+                .await
+                .expect("advance during membership apply");
+            let state = read_membership(&driver.raw_node);
+            let joint = !driver
+                .raw_node
+                .store()
+                .conf_state()
+                .unwrap()
+                .voters_outgoing
+                .is_empty();
+            if done(&state) && !joint {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!(
+            "membership change did not apply within the bounded loop: {:?} {:?}",
+            read_membership(&driver.raw_node),
+            driver.raw_node.store().conf_state()
+        );
+    }
+
+    async fn applied_member_addresses(
+        driver: &ZoneConsensusDriver<FullStateMachine>,
+    ) -> (Vec<(u64, String)>, u64) {
+        let sm = driver.state_machine.read().await;
+        let mut records = sm.member_addresses().unwrap();
+        records.sort();
+        (records, sm.last_applied_index())
+    }
+
+    /// A V1 change writes its address effect at its own log index: the
+    /// AddLearnerNode context becomes the learner's record, and RemoveNode
+    /// deletes it, each committed with that entry's applied marker.
+    #[tokio::test]
+    async fn conf_change_v1_writes_and_deletes_the_member_address_at_its_index() {
+        let (_handle, mut driver, _dir) = leader_1voter().await;
+
+        let mut add = ConfChange::default();
+        add.set_change_type(ConfChangeType::AddLearnerNode);
+        add.node_id = 2;
+        add.context = b"https://nexus-2:9000".to_vec().into();
+        driver.raw_node.propose_conf_change(vec![], add).unwrap();
+        let add_index = driver.raw_node.raft.raft_log.last_index();
+        advance_until_membership(&mut driver, |m| m.learners == vec![2]).await;
+        assert_eq!(
+            applied_member_addresses(&driver).await,
+            (vec![(2, "nexus-2:9000".to_string())], add_index)
+        );
+
+        let mut remove = ConfChange::default();
+        remove.set_change_type(ConfChangeType::RemoveNode);
+        remove.node_id = 2;
+        driver.raw_node.propose_conf_change(vec![], remove).unwrap();
+        let remove_index = driver.raw_node.raft.raft_log.last_index();
+        advance_until_membership(&mut driver, |m| m.learners.is_empty()).await;
+        assert_eq!(
+            applied_member_addresses(&driver).await,
+            (Vec::new(), remove_index)
+        );
+    }
+
+    /// The V2 arm derives the same effect from the shared context: a single
+    /// add is named, several adds are not, and a removal deletes.
+    #[tokio::test]
+    async fn conf_change_v2_writes_and_deletes_the_member_address_at_its_index() {
+        use raft::eraftpb::ConfChangeSingle;
+        fn v2(changes: &[(ConfChangeType, u64)], context: &[u8]) -> ConfChangeV2 {
+            let mut cc = ConfChangeV2::default();
+            cc.changes = changes
+                .iter()
+                .map(|&(change_type, node_id)| {
+                    let mut single = ConfChangeSingle::default();
+                    single.set_change_type(change_type);
+                    single.node_id = node_id;
+                    single
+                })
+                .collect::<Vec<_>>()
+                .into();
+            cc.context = context.to_vec().into();
+            cc
+        }
+        let (_handle, mut driver, _dir) = leader_1voter().await;
+
+        driver
+            .raw_node
+            .propose_conf_change(
+                vec![],
+                v2(&[(ConfChangeType::AddLearnerNode, 3)], b"nexus-3:9000"),
+            )
+            .unwrap();
+        let add_index = driver.raw_node.raft.raft_log.last_index();
+        advance_until_membership(&mut driver, |m| m.learners == vec![3]).await;
+        assert_eq!(
+            applied_member_addresses(&driver).await,
+            (vec![(3, "nexus-3:9000".to_string())], add_index)
+        );
+
+        // Two adds share one context, so neither is named; the joint
+        // transition and raft-rs's automatic leave apply without records.
+        driver
+            .raw_node
+            .propose_conf_change(
+                vec![],
+                v2(
+                    &[
+                        (ConfChangeType::AddLearnerNode, 4),
+                        (ConfChangeType::AddLearnerNode, 5),
+                    ],
+                    b"nexus-4:9000",
+                ),
+            )
+            .unwrap();
+        advance_until_membership(&mut driver, |m| m.learners == vec![3, 4, 5]).await;
+        assert_eq!(
+            applied_member_addresses(&driver).await.0,
+            vec![(3, "nexus-3:9000".to_string())]
+        );
+
+        driver
+            .raw_node
+            .propose_conf_change(vec![], v2(&[(ConfChangeType::RemoveNode, 3)], b""))
+            .unwrap();
+        let remove_index = driver.raw_node.raft.raft_log.last_index();
+        advance_until_membership(&mut driver, |m| m.learners == vec![4, 5]).await;
+        assert_eq!(
+            applied_member_addresses(&driver).await,
+            (Vec::new(), remove_index)
+        );
     }
 
     /// The promotion gate: a learner is tracked distinctly from voters, and

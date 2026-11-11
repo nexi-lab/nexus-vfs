@@ -67,6 +67,36 @@ pub(crate) fn delete(node_id: u64) -> Command {
     }
 }
 
+/// The address effect of one committed membership entry: a put for each add
+/// whose `context` names a dial address, a delete for each removal, in change
+/// order. A `ConfChangeV2` carries one shared `context`, which names the
+/// address of its single add; with several adds it names none. The result is
+/// a function of the entry bytes alone, so every replica derives the same
+/// records.
+#[cfg(feature = "consensus")]
+pub(crate) fn conf_change_commands(
+    changes: &[(raft::eraftpb::ConfChangeType, u64)],
+    context: &[u8],
+) -> Vec<Command> {
+    use raft::eraftpb::ConfChangeType;
+    let adds = changes
+        .iter()
+        .filter(|(change_type, _)| *change_type != ConfChangeType::RemoveNode)
+        .count();
+    let address = if adds == 1 {
+        std::str::from_utf8(context).ok()
+    } else {
+        None
+    };
+    changes
+        .iter()
+        .filter_map(|&(change_type, node_id)| match change_type {
+            ConfChangeType::RemoveNode => Some(delete(node_id)),
+            ConfChangeType::AddNode | ConfChangeType::AddLearnerNode => put(node_id, address?),
+        })
+        .collect()
+}
+
 /// Whether `command` writes a member-address record. Such a command changes
 /// state only as a committed Raft entry: the consistency classifier refuses it
 /// on the EC and local write paths, and an applied batch that contains one
@@ -139,6 +169,46 @@ mod tests {
                 "{given:?} must not become a record"
             );
         }
+    }
+
+    #[test]
+    fn a_membership_entry_names_the_address_of_its_single_add() {
+        use raft::eraftpb::ConfChangeType::{AddLearnerNode, AddNode, RemoveNode};
+        assert_eq!(
+            format!(
+                "{:?}",
+                conf_change_commands(&[(AddLearnerNode, 2)], b"https://nexus-2:2126")
+            ),
+            format!("{:?}", vec![put(2, "nexus-2:2126").unwrap()])
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                conf_change_commands(&[(AddNode, 2)], b"nexus-2:2126")
+            ),
+            format!("{:?}", vec![put(2, "nexus-2:2126").unwrap()])
+        );
+        assert_eq!(
+            format!("{:?}", conf_change_commands(&[(RemoveNode, 2)], b"")),
+            format!("{:?}", vec![delete(2)])
+        );
+        // An empty or unparsable context writes nothing.
+        assert!(conf_change_commands(&[(AddNode, 2)], b"").is_empty());
+        assert!(conf_change_commands(&[(AddNode, 2)], b"nexus-2").is_empty());
+        assert!(conf_change_commands(&[(AddNode, 2)], &[0xff]).is_empty());
+        // A shared V2 context cannot name several adds.
+        assert!(
+            conf_change_commands(&[(AddLearnerNode, 2), (AddLearnerNode, 3)], b"nexus-2:2126")
+                .is_empty()
+        );
+        // Removals keep their effect beside a single add.
+        assert_eq!(
+            format!(
+                "{:?}",
+                conf_change_commands(&[(RemoveNode, 3), (AddNode, 2)], b"nexus-2:2126")
+            ),
+            format!("{:?}", vec![delete(3), put(2, "nexus-2:2126").unwrap()])
+        );
     }
 
     #[test]
