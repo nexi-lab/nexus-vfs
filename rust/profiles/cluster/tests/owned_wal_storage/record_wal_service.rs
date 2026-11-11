@@ -2,6 +2,7 @@
 
 use backends::storage::cas_local::CasLocalBackend;
 use kernel::kernel::convenience::{KernelConvenience, MountOptions};
+#[cfg(target_os = "linux")]
 use kernel::kernel::syscall::KernelSyscall;
 use kernel::kernel::{Kernel, OperationContext};
 use kernel::meta_store::MetaStore;

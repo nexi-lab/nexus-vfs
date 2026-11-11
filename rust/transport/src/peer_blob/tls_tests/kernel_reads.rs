@@ -61,7 +61,9 @@ fn kernel_file_reads_keep_scope_and_backing_path_across_aliases() {
             .data,
         Some(BODY.to_vec())
     );
-    let error = KernelSyscall::sys_read(&kernel, "/visible-b/shared", &ctx, 0, 0).unwrap_err();
+    let error = KernelSyscall::sys_read(&kernel, "/visible-b/shared", &ctx, 0, 0)
+        .err()
+        .expect("another data zone must refuse the read");
     assert!(
         error
             .to_string()
@@ -97,7 +99,9 @@ fn kernel_file_reads_refuse_peers_without_scoped_content() {
         &fixture.address,
     );
     let ctx = OperationContext::new("reader", "root", true, None, true);
-    let error = KernelSyscall::sys_read(&kernel, "/visible/shared", &ctx, 0, 0).unwrap_err();
+    let error = KernelSyscall::sys_read(&kernel, "/visible/shared", &ctx, 0, 0)
+        .err()
+        .expect("a peer without scoped content must refuse the read");
     assert!(
         error
             .to_string()
