@@ -198,9 +198,15 @@ pub(super) async fn serve(
         bail!("user root zone has no leader; durable writes are unavailable");
     }
     let peer_client = Arc::new(transport::federation::FederationClient::new(
-        Arc::clone(kernel.runtime()),
+        kernel.runtime().handle().clone(),
         None,
     ));
+    transport::federation::runtime_directory::install(
+        &kernel,
+        Arc::clone(&peer_client),
+        a2a::A2A_INBOX_BASE,
+    )
+    .map_err(anyhow::Error::msg)?;
     Arc::new(nexus_raft::distributed_coordinator::RaftDistributedCoordinator::new())
         .install_with_kernel(
             Arc::clone(&zones),

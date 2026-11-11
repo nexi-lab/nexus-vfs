@@ -350,7 +350,9 @@ fn open_sidecar_reader_retains_its_snapshot_across_replacements() {
     use std::io::Read;
 
     let root = tempfile::tempdir().unwrap();
-    let transport = LocalCASTransport::new(root.path(), true).unwrap();
+    // Exercise the native replacement path with a non-ASCII storage root too.
+    let storage_root = root.path().join("sidecar-资料-🦀");
+    let transport = LocalCASTransport::new(&storage_root, true).unwrap();
     let hash = transport.write_blob(b"open sidecar reader").unwrap();
     let original = br#"{"generation":0}"#;
     transport.write_meta(&hash, original).unwrap();
@@ -364,6 +366,39 @@ fn open_sidecar_reader_retains_its_snapshot_across_replacements() {
     let mut retained = Vec::new();
     reader.read_to_end(&mut retained).unwrap();
     assert_eq!(retained, original);
+}
+
+#[cfg(windows)]
+#[test]
+fn delete_denied_sidecar_reader_preserves_the_committed_bytes_on_refusal() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let transport = LocalCASTransport::new(root.path(), true).unwrap();
+    let hash = transport
+        .write_blob(b"delete-denied sidecar reader")
+        .unwrap();
+    let original = br#"{"generation":0}"#;
+    let replacement = br#"{"generation":1}"#;
+    transport.write_meta(&hash, original).unwrap();
+    let path = transport.blob_path(&hash).unwrap().with_extension("meta");
+    let reader = std::fs::OpenOptions::new()
+        .read(true)
+        // FILE_SHARE_READ | FILE_SHARE_WRITE deliberately excludes DELETE.
+        // A genuine reader refusal must not be hidden by retries or deletion.
+        .share_mode(0x1 | 0x2)
+        .open(&path)
+        .unwrap();
+    let error = transport.write_meta(&hash, replacement).unwrap_err();
+    assert!(matches!(error.raw_os_error(), Some(5 | 32)), "{error}");
+    assert_eq!(transport.read_meta(&hash).unwrap(), original);
+    assert_eq!(
+        std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+        2
+    );
+    drop(reader);
+    transport.write_meta(&hash, replacement).unwrap();
+    assert_eq!(transport.read_meta(&hash).unwrap(), replacement);
 }
 
 #[test]

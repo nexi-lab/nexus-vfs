@@ -231,7 +231,8 @@ fn write_revoked_entries(path: &Path, entries: &[RevokedEntry]) -> Result<(), St
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, format!("{body}\n"))
         .map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("replace {}: {e}", path.display()))
+    lib::file_durability::replace_file(&tmp, path)
+        .map_err(|e| format!("replace {}: {e}", path.display()))
 }
 
 /// Record one revoked serial, with the certificate's `notAfter` when the caller

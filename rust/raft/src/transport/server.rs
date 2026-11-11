@@ -606,18 +606,37 @@ async fn apply_ec_entry(
     }
 }
 
-#[tonic::async_trait]
-impl ZoneTransportService for ZoneTransportServiceImpl {
-    /// Handle a raw raft-rs message forwarded from another node.
-    ///
-    /// Routes by zone_id to the correct Raft group's ZoneConsensus.
-    /// Unknown zones return `NotFound` — the local storage enumeration at
-    /// `PyZoneManager::new` (R15.e) is the authority for which groups this
-    /// node hosts. New dynamic zones arrive via `federation_create_zone`;
-    /// new replicas of existing zones arrive via leader snapshot delivery
-    /// after the ConfChange commits. No side-effectful auto-reopen from
-    /// disk in the message hot path.
-    async fn step_message(
+impl ZoneTransportServiceImpl {
+    // Zone creation is synchronous setup. Keep its allocations and error paths
+    // outside the future polled for every Raft message on both wire versions.
+    #[cold]
+    #[inline(never)]
+    fn join_step_zone(
+        &self,
+        zone_id: &str,
+    ) -> std::result::Result<ZoneConsensus<FullStateMachine>, Status> {
+        if !self.registry.permits_automatic_zone_join() {
+            return Err(Status::not_found("zone is not admitted on this runtime"));
+        }
+        if self.registry.is_auto_join_suppressed(zone_id) {
+            return Err(Status::not_found(format!(
+                "zone '{zone_id}' was recently removed on this node"
+            )));
+        }
+        let root_peers = self
+            .registry
+            .get_peers(contracts::ROOT_ZONE_ID)
+            .ok_or_else(|| Status::not_found(format!("zone '{zone_id}' not found on this node")))?;
+        // The transport authenticates the sender. The peer map supplies current
+        // addresses; the registry applies zone admission and membership rules.
+        let peers: Vec<NodeAddress> = root_peers.values().cloned().collect();
+        let handle = tokio::runtime::Handle::current();
+        self.registry
+            .join_zone(zone_id, peers, false, &handle)
+            .map_err(|e| Status::internal(format!("failed to auto-join zone '{zone_id}': {e}")))
+    }
+
+    async fn dispatch_step(
         &self,
         request: Request<StepMessageRequest>,
     ) -> std::result::Result<Response<StepMessageResponse>, Status> {
@@ -634,42 +653,7 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
         let req = request.into_inner();
         let node = match self.registry.get_node(&req.zone_id) {
             Some(n) => n,
-            None => {
-                if !self.registry.permits_automatic_zone_join() {
-                    return Err(Status::not_found("zone is not admitted on this runtime"));
-                }
-                if self.registry.is_auto_join_suppressed(&req.zone_id) {
-                    return Err(Status::not_found(format!(
-                        "zone '{}' was recently removed on this node",
-                        req.zone_id
-                    )));
-                }
-                let root_peers = self
-                    .registry
-                    .get_peers(contracts::ROOT_ZONE_ID)
-                    .ok_or_else(|| {
-                        Status::not_found(format!("zone '{}' not found on this node", req.zone_id))
-                    })?;
-                // Auto-join membership is gated by the transport
-                // layer's mTLS (when enabled).  Sender address is
-                // learned from `req.sender_address` after the
-                // join — under the opaque-ID contract the
-                // peer-map is the runtime SSOT (populated by inbound
-                // StepMessage), so a static "is sender in root
-                // peer-map" check was self-defeating: it rejected
-                // legit fresh joiners whose addresses had not yet
-                // been learned.
-                let peers: Vec<NodeAddress> = root_peers.values().cloned().collect();
-                let handle = tokio::runtime::Handle::current();
-                self.registry
-                    .join_zone(&req.zone_id, peers, false, &handle)
-                    .map_err(|e| {
-                        Status::internal(format!(
-                            "failed to auto-join zone '{}': {}",
-                            req.zone_id, e
-                        ))
-                    })?
-            }
+            None => self.join_step_zone(&req.zone_id)?,
         };
 
         // Learn the connected peer's address before stepping. Relayed requests
@@ -688,6 +672,32 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
             .learn_peer_address(&req.zone_id, peer, &req.sender_address);
 
         step_raft_message(&node, message, &req.zone_id, "").await
+    }
+}
+
+#[tonic::async_trait]
+impl ZoneTransportService for ZoneTransportServiceImpl {
+    /// Handle a raw raft-rs message forwarded from another node.
+    ///
+    /// Routes by zone_id to the correct Raft group's ZoneConsensus.
+    /// Unknown zones return `NotFound` — the local storage enumeration at
+    /// `PyZoneManager::new` (R15.e) is the authority for which groups this
+    /// node hosts. New dynamic zones arrive via `federation_create_zone`;
+    /// new replicas of existing zones arrive via leader snapshot delivery
+    /// after the ConfChange commits. No side-effectful auto-reopen from
+    /// disk in the message hot path.
+    async fn step_message(
+        &self,
+        request: Request<StepMessageRequest>,
+    ) -> std::result::Result<Response<StepMessageResponse>, Status> {
+        self.dispatch_step(request).await
+    }
+
+    async fn step_storage_v1(
+        &self,
+        request: Request<StepMessageRequest>,
+    ) -> std::result::Result<Response<StepMessageResponse>, Status> {
+        self.dispatch_step(request).await
     }
 
     /// Handle EC replication entries from a peer (Phase C).
@@ -2902,13 +2912,8 @@ struct WitnessServiceImpl {
     registry: Arc<WitnessZoneRegistry>,
 }
 
-#[tonic::async_trait]
-impl ZoneTransportService for WitnessServiceImpl {
-    /// Handle a raw raft-rs message forwarded from another node.
-    ///
-    /// Routes to the correct zone's ZoneConsensus by `req.zone_id`.
-    /// Auto-joins unknown zones (dynamic federation support).
-    async fn step_message(
+impl WitnessServiceImpl {
+    async fn dispatch_step(
         &self,
         request: Request<StepMessageRequest>,
     ) -> std::result::Result<Response<StepMessageResponse>, Status> {
@@ -2943,6 +2948,27 @@ impl ZoneTransportService for WitnessServiceImpl {
             .learn_peer_address(&req.zone_id, peer, &req.sender_address);
 
         step_raft_message(&node, message, &req.zone_id, "[Witness]").await
+    }
+}
+
+#[tonic::async_trait]
+impl ZoneTransportService for WitnessServiceImpl {
+    /// Handle a raw raft-rs message forwarded from another node.
+    ///
+    /// Routes to the correct zone's ZoneConsensus by `req.zone_id`.
+    /// Auto-joins unknown zones (dynamic federation support).
+    async fn step_message(
+        &self,
+        request: Request<StepMessageRequest>,
+    ) -> std::result::Result<Response<StepMessageResponse>, Status> {
+        self.dispatch_step(request).await
+    }
+
+    async fn step_storage_v1(
+        &self,
+        request: Request<StepMessageRequest>,
+    ) -> std::result::Result<Response<StepMessageResponse>, Status> {
+        self.dispatch_step(request).await
     }
 
     /// Witness nodes do not participate in EC replication.

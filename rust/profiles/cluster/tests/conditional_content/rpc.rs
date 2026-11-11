@@ -324,7 +324,7 @@ impl IndependentStreamStores {
 
     fn install_coordinator(receiver: &Fixture, source: &Fixture) {
         let ops = Arc::new(transport::federation::FederationClient::new(
-            receiver.kernel.runtime().clone(),
+            receiver.kernel.runtime().handle().clone(),
             None,
         ));
         Arc::new(nexus_raft::distributed_coordinator::RaftDistributedCoordinator::new())

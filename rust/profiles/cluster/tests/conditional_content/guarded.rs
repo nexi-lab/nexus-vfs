@@ -80,7 +80,7 @@ pub(super) const RECORD: &str = "/state/register";
 
 pub(super) fn install_stream_coordinator(fixture: &Fixture) {
     let ops = Arc::new(transport::federation::FederationClient::new(
-        fixture.kernel.runtime().clone(),
+        fixture.kernel.runtime().handle().clone(),
         None,
     ));
     Arc::new(nexus_raft::distributed_coordinator::RaftDistributedCoordinator::new())

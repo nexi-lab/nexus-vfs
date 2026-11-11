@@ -21,6 +21,7 @@
 // Federation client — wired by the cluster binary's gRPC transport layer.
 #![allow(dead_code, private_interfaces)]
 
+#[cfg(test)]
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,6 +37,8 @@ use nexus_raft::transport::proto::nexus::raft::{
     zone_api_service_client::ZoneApiServiceClient, JoinZoneRequest,
 };
 
+pub mod runtime_directory;
+
 /// Per-peer channel cache + shared runtime.
 ///
 /// TLS storage + channel build delegate to
@@ -45,7 +48,9 @@ use nexus_raft::transport::proto::nexus::raft::{
 /// timeout / keepalive defaults and TLS handshake logic serves both
 /// out-bound transport-tier clients.
 pub struct FederationClient {
-    runtime: Arc<tokio::runtime::Runtime>,
+    // The host owns shutdown. Peer pools may outlive a registry/service field
+    // during teardown and must never become a runtime's final async owner.
+    runtime: tokio::runtime::Handle,
     channels: DashMap<String, Channel>,
     /// Late-bound TLS material.  `None` until the boot installer wires
     /// the cluster CA + node cert (mirrors `PeerBlobClient::tls`); when
@@ -56,7 +61,7 @@ pub struct FederationClient {
 }
 
 impl FederationClient {
-    pub fn new(runtime: Arc<tokio::runtime::Runtime>, tls: Option<TlsConfig>) -> Self {
+    pub fn new(runtime: tokio::runtime::Handle, tls: Option<TlsConfig>) -> Self {
         Self {
             runtime,
             channels: DashMap::new(),
@@ -479,34 +484,18 @@ impl FederationClient {
 // arc; the coordinator's `peer_*` impls iterate `zone_peers` and
 // dispatch each non-self peer through this trait.
 //
-// CRITICAL: every block_on must go through `block_on_safely` so the
-// call is re-entrancy-safe when the caller already runs on a tokio
-// worker thread (gRPC handler, FUSE callback, raft apply task).
-// `Runtime::block_on` panics with "Cannot start a runtime from
-// within a runtime" if called from a thread that's currently
-// executing on that same runtime; `block_in_place` releases the
-// worker before delegating to `Handle::block_on`, which IS safe to
-// call from any context.  Mirrors `RpcTransport::block_on` (kernel
-// crate) — same SSOT for the runtime-recursion guard.
-//
-// PR #74 added this after PR #73's correct canonical-key fix
-// exposed the recursion: io.rs sys_stat / sys_readdir hooks call
-// FederationGrpcOps methods from the gRPC handler thread (which
-// runs on the kernel runtime), which is the same runtime this
-// client's `block_on` would try to enter.
+// Every synchronous entry uses lib::rt's shared ambient-runtime bridge.
+// The host retains runtime ownership; this pool only needs its Handle.
 
 impl FederationClient {
-    /// Run `fut` on the client's runtime in a way that's safe to
-    /// call from BOTH plain sync threads AND tokio worker threads
-    /// inside the same runtime.  Mirrors the kernel-side guard in
-    /// `kernel::rpc_transport::RpcTransport::block_on`.
+    /// Follow the common bridge for sync, multi-thread and current-thread callers.
     #[inline]
-    fn block_on_safely<F: std::future::Future>(&self, fut: F) -> F::Output {
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| self.runtime.handle().block_on(fut))
-        } else {
-            self.runtime.block_on(fut)
-        }
+    fn block_on_safely<F>(&self, fut: F) -> F::Output
+    where
+        F: std::future::Future + Send,
+        F::Output: Send,
+    {
+        lib::rt::block_on_via(&self.runtime, fut)
     }
 }
 
@@ -669,7 +658,7 @@ mod tests {
                 .unwrap(),
         );
         // Plaintext variant.
-        let plain = FederationClient::new(Arc::clone(&rt), None);
+        let plain = FederationClient::new(rt.handle().clone(), None);
         assert!(plain.tls.read().is_none());
 
         // TLS variant — the material isn't parsed until the first
@@ -678,7 +667,7 @@ mod tests {
         // sibling `PeerBlobClient` and `FederationClient` share a
         // single TLS material type.
         let tls = FederationClient::new(
-            rt,
+            rt.handle().clone(),
             Some(TlsConfig {
                 ca_pem: make_ca_pem("ca").into_bytes(),
                 cert_pem: make_ca_pem("node").into_bytes(),
@@ -700,7 +689,7 @@ mod tests {
                 .build()
                 .unwrap(),
         );
-        let client = FederationClient::new(Arc::clone(&rt), None);
+        let client = FederationClient::new(rt.handle().clone(), None);
         // Pre-seed a fake cached channel so we can assert it gets cleared.
         // We can't construct a real `tonic::transport::Channel` cheaply,
         // so verify by asserting the channels map is empty post-install
