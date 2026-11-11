@@ -15,12 +15,25 @@ path = "src/lib.rs"
 # + take_stdio_for_connection) is what the managed-agent tunnel pumps into
 # memory DT_STREAMs; cross-platform.
 kernel = { workspace = true }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "process", "io-util", "time", "sync", "macros"] }
+contracts = { workspace = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "process", "io-util", "time", "sync", "macros", "net", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
 
 # libc::dup is used ONLY by the unix raw-fd DT_PIPE path (spawn_from_argv →
 # the kernel's #[cfg(unix)] stdio-pipe backend). Not needed on Windows.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Tokio's sockets must not leak into a host's tool subprocess, which would
+# keep the manager connection alive after its owner closes it. The compatibility
+# floor includes tokio-rs/mio#1946; no additional mio features are enabled.
+mio = { version = "1.2.1", default-features = false }
+
+[dev-dependencies]
+pty-expect = { git = "https://github.com/sudoprivacy/pty-expect", rev = "16f4207bf5db6b5b08d81c040e1bb5dc6834716e" }
 
 [lints]
 workspace = true

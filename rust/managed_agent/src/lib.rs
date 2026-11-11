@@ -143,6 +143,14 @@ const MODEL_LABEL: &str = "model";
 
 use session::{alloc_pid, now_ms};
 
+fn valid_durable_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+}
+
 // ── Public request / response shapes ────────────────────────────────────
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -170,6 +178,11 @@ pub(crate) struct StartSessionRequest {
     /// Launch policy (command, model and credentials) belongs to the embedder.
     #[serde(default)]
     pub spawn_spec: Option<SpawnSpec>,
+    /// A one-use local host capability. The authenticated controller admits
+    /// a session in the caller's existing process; it grants no OS PID authority.
+    /// Mutually exclusive with daemon-owned `spawn_spec`.
+    #[serde(default)]
+    pub local_host: Option<contracts::local_host::LocalHostOffer>,
     /// Durable transcript to restore in an in-process runtime. This is NOT
     /// the pid-valued `session_id` accepted by get/cancel.
     #[serde(default)]
@@ -187,6 +200,13 @@ pub(crate) struct SpawnSpec {
     pub env: std::collections::HashMap<String, String>,
     #[serde(default)]
     pub cwd: String,
+}
+
+/// Process placement is an adapter choice; registration and authorization stay
+/// in the same managed-session path. Neither variant carries terminal bytes.
+pub(crate) enum ProcessLaunch {
+    Daemon(SpawnSpec),
+    Local(contracts::local_host::LocalHostOffer),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -320,7 +340,7 @@ pub trait SpawnHandle: Send + Sync {
     }
 
     /// Durable transcript identity, independent of the registry pid.
-    fn durable_session_id(&self) -> Option<&str> {
+    fn durable_session_id(&self) -> Option<String> {
         None
     }
 }
@@ -408,16 +428,21 @@ pub trait SpawnTask<K: KernelSyscall>: Send + Sync + 'static {
 pub(crate) trait RawSpawn: Send + Sync {
     /// Launch before registry insertion so the descriptor uses the actual child
     /// OS PID. Dropping an unattached launch terminates the child.
-    fn prepare(&self, spec: SpawnSpec) -> Result<Box<dyn PreparedRawSpawn>, String>;
+    fn prepare(&self, spec: ProcessLaunch) -> Result<Box<dyn PreparedRawSpawn>, String>;
 }
 
+type StateObserver = Arc<dyn Fn(AgentState, Option<String>) + Send + Sync>;
+
 pub(crate) trait PreparedRawSpawn: Send {
-    fn os_pid(&self) -> u32;
+    /// Only the daemon's own Child handle attests an OS PID here. Delegated
+    /// launchers use a logical registry identity and never grant PID authority.
+    fn os_pid(&self) -> Option<u32>;
     fn attach(
         self: Box<Self>,
         desc: &AgentDescriptor,
         instance: AgentInstance,
         endpoint: a2a::session::SessionEndpoint,
+        observer: StateObserver,
     ) -> Result<(), String>;
 }
 
@@ -507,6 +532,80 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
         self.start_session_for(req, Some("test-controller"))
     }
 
+    fn state_observer(&self, desc: &AgentDescriptor, instance: AgentInstance) -> StateObserver {
+        // Construct the SSOT state observer. AgentRegistry is
+        // the single writer of AgentState in the runtime path
+        // (see kernel::core::agents::registry::update_state +
+        // can_transition_to FSM); the spawn body reports an
+        // AgentState on each transition (the running-state
+        // subset WarmingUp/Ready/Busy — Registered/Suspended/
+        // Terminated are service-set at plant/teardown) and this
+        // closure forwards it through update_state.
+        // InvalidTransition is logged rather than panicked so
+        // an FSM bug in the runtime body surfaces as a warning
+        // instead of taking down the worker thread.
+        let registry = Arc::clone(&self.agent_registry);
+        let pid_for_observer = desc.pid.clone();
+        let observer_instance = instance;
+        let kernel_for_observer = Arc::clone(&self.kernel);
+        let agent_name = desc.name.clone();
+        let observer: Arc<dyn Fn(AgentState, Option<String>) + Send + Sync> =
+            Arc::new(move |state: AgentState, reason: Option<String>| {
+                // Note the pre-update AwaitingInput status so we publish
+                // only the attention enter/exit edges (bounded), not
+                // every Ready↔Busy flip.
+                let was_awaiting = registry
+                    .get(&pid_for_observer)
+                    .map(|d| d.state == AgentState::AwaitingInput)
+                    .unwrap_or(false);
+                match registry.update_instance_state(&observer_instance, state, reason.clone()) {
+                    Ok(true) => {}
+                    Ok(false) => return,
+                    Err(e) => {
+                        tracing::warn!(
+                            pid = %pid_for_observer,
+                            state = ?state,
+                            error = %e,
+                            "AgentRegistry.update_state rejected runtime-side transition",
+                        );
+                        return;
+                    }
+                }
+                // Publish the AwaitingInput enter/exit edge to the
+                // agent's replicated state stream — best-effort, so a
+                // non-stream / std deployment (no reader) never disturbs
+                // the agent.
+                let is_awaiting = state == AgentState::AwaitingInput;
+                if was_awaiting != is_awaiting {
+                    let event = serde_json::json!({
+                        "state": state.as_str(),
+                        "reason": reason,
+                    })
+                    .to_string();
+                    let ctx = kernel::kernel::OperationContext::new(
+                        "managed_agent",
+                        "root",
+                        true,
+                        None,
+                        true,
+                    );
+                    if let Err(e) = kernel_for_observer.sys_write(
+                        &a2a::agent_state_path(&agent_name),
+                        &ctx,
+                        event.as_bytes(),
+                        0,
+                    ) {
+                        tracing::warn!(
+                            agent = %agent_name,
+                            error = ?e,
+                            "publish agent attention state failed (best-effort)",
+                        );
+                    }
+                }
+            });
+        observer
+    }
+
     fn start_session_for(
         &self,
         mut req: StartSessionRequest,
@@ -517,18 +616,24 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                 "'agent_id' is required".into(),
             ));
         }
+        if req.spawn_spec.is_some() && req.local_host.is_some() {
+            return Err(ManagedAgentError::InvalidArgument(
+                "spawn_spec and local_host are mutually exclusive".into(),
+            ));
+        }
+        if let Some(offer) = &req.local_host {
+            offer
+                .validate()
+                .map_err(|error| ManagedAgentError::InvalidArgument(error.into()))?;
+        }
         if let Some(id) = req.resume_session_id.as_deref() {
-            if id.is_empty()
-                || id.len() > 128
-                || !id
-                    .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
-            {
+            if !valid_durable_session_id(id) {
                 return Err(ManagedAgentError::InvalidArgument(
                     "resume_session_id must be a durable ID, not a path".into(),
                 ));
             }
-            if req.spawn_spec.is_some() || self.spawn_provider.is_none() {
+            if req.spawn_spec.is_some() || req.local_host.is_some() || self.spawn_provider.is_none()
+            {
                 return Err(ManagedAgentError::InvalidArgument(
                     "resume_session_id requires an in-process runtime provider".into(),
                 ));
@@ -537,8 +642,12 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
         // Take the raw spawn spec out early — it selects the spawn
         // strategy below (raw ACP subprocess vs. runtime body) and the
         // rest of the descriptor build doesn't touch it.
-        let spawn_spec = req.spawn_spec.take();
-        let session_endpoint = if spawn_spec.is_some() || self.spawn_provider.is_some() {
+        let process_launch = req
+            .spawn_spec
+            .take()
+            .map(ProcessLaunch::Daemon)
+            .or_else(|| req.local_host.take().map(ProcessLaunch::Local));
+        let session_endpoint = if process_launch.is_some() || self.spawn_provider.is_some() {
             let controller = controller.filter(|id| !id.is_empty()).ok_or_else(|| {
                 ManagedAgentError::InvalidArgument(
                     "hosted sessions require an authenticated controller agent".into(),
@@ -567,17 +676,17 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
             req.zone_id.clone()
         };
 
-        let raw_session = if let Some(spec) = spawn_spec {
+        let raw_session = if let Some(spec) = process_launch {
             let spawner = self.raw_spawn.as_ref().ok_or_else(|| {
                 ManagedAgentError::InvalidArgument(
-                    "spawn_spec requires the subprocess-host feature".into(),
+                    "process launch requires the subprocess-host feature".into(),
                 )
             })?;
             Some(spawner.prepare(spec).map_err(ManagedAgentError::Internal)?)
         } else {
             None
         };
-        let os_pid = raw_session.as_ref().map(|child| child.os_pid());
+        let os_pid = raw_session.as_ref().and_then(|child| child.os_pid());
         let pid = if let Some(native) = os_pid {
             contracts::agent_pid::encode_agent_pid(i64::from(native), None)
         } else {
@@ -659,92 +768,20 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
             {
                 tracing::warn!(pid=%pid, error=%e, "ensure_agent_state_stream failed");
             }
+            let observer = self.state_observer(&desc, instance.clone());
             if let Some(child) = raw_session {
                 child
                     .attach(
                         &desc,
                         instance.clone(),
                         session_endpoint.clone().expect("hosted endpoint"),
+                        observer,
                     )
                     .map_err(|error| {
                         let _ = self.agent_registry.kill_instance(&instance, 127);
                         ManagedAgentError::Internal(error)
                     })?;
             } else if let Some(provider) = self.spawn_provider.as_ref() {
-                // Construct the SSOT state observer. AgentRegistry is
-                // the single writer of AgentState in the runtime path
-                // (see kernel::core::agents::registry::update_state +
-                // can_transition_to FSM); the spawn body reports an
-                // AgentState on each transition (the running-state
-                // subset WarmingUp/Ready/Busy — Registered/Suspended/
-                // Terminated are service-set at plant/teardown) and this
-                // closure forwards it through update_state.
-                // InvalidTransition is logged rather than panicked so
-                // an FSM bug in the runtime body surfaces as a warning
-                // instead of taking down the worker thread.
-                let registry = Arc::clone(&self.agent_registry);
-                let pid_for_observer = pid.clone();
-                let observer_instance = instance.clone();
-                let kernel_for_observer = Arc::clone(&self.kernel);
-                let agent_name = desc.name.clone();
-                let observer: Arc<dyn Fn(AgentState, Option<String>) + Send + Sync> =
-                    Arc::new(move |state: AgentState, reason: Option<String>| {
-                        // Note the pre-update AwaitingInput status so we publish
-                        // only the attention enter/exit edges (bounded), not
-                        // every Ready↔Busy flip.
-                        let was_awaiting = registry
-                            .get(&pid_for_observer)
-                            .map(|d| d.state == AgentState::AwaitingInput)
-                            .unwrap_or(false);
-                        match registry.update_instance_state(
-                            &observer_instance,
-                            state,
-                            reason.clone(),
-                        ) {
-                            Ok(true) => {}
-                            Ok(false) => return,
-                            Err(e) => {
-                                tracing::warn!(
-                                    pid = %pid_for_observer,
-                                    state = ?state,
-                                    error = %e,
-                                    "AgentRegistry.update_state rejected runtime-side transition",
-                                );
-                                return;
-                            }
-                        }
-                        // Publish the AwaitingInput enter/exit edge to the
-                        // agent's replicated state stream — best-effort, so a
-                        // non-stream / std deployment (no reader) never disturbs
-                        // the agent.
-                        let is_awaiting = state == AgentState::AwaitingInput;
-                        if was_awaiting != is_awaiting {
-                            let event = serde_json::json!({
-                                "state": state.as_str(),
-                                "reason": reason,
-                            })
-                            .to_string();
-                            let ctx = kernel::kernel::OperationContext::new(
-                                "managed_agent",
-                                "root",
-                                true,
-                                None,
-                                true,
-                            );
-                            if let Err(e) = kernel_for_observer.sys_write(
-                                &a2a::agent_state_path(&agent_name),
-                                &ctx,
-                                event.as_bytes(),
-                                0,
-                            ) {
-                                tracing::warn!(
-                                    agent = %agent_name,
-                                    error = ?e,
-                                    "publish agent attention state failed (best-effort)",
-                                );
-                            }
-                        }
-                    });
                 // A refusal here is the session NOT starting: unwind the registration
                 // rather than leaving a pid whose runtime never existed, so a caller
                 // that retries after fixing the cause is not told the agent is
@@ -770,18 +807,16 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                         // message the refusal carries.
                         ManagedAgentError::Internal(format!("spawn agent runtime: {e}"))
                     })?;
-                if req
-                    .resume_session_id
-                    .as_deref()
-                    .is_some_and(|requested| handle.durable_session_id() != Some(requested))
-                {
+                if req.resume_session_id.as_deref().is_some_and(|requested| {
+                    handle.durable_session_id().as_deref() != Some(requested)
+                }) {
                     handle.abort();
                     let _ = self.agent_registry.kill_instance(&instance, 1);
                     return Err(ManagedAgentError::Internal(
                         "runtime did not restore the requested durable session".into(),
                     ));
                 }
-                durable_session_id = handle.durable_session_id().map(str::to_owned);
+                durable_session_id = handle.durable_session_id();
                 if handle.session_endpoint() != session_endpoint.as_ref() {
                     handle.abort();
                     let _ = self.agent_registry.kill_instance(&instance, 1);
@@ -940,7 +975,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
             .map(|handle| {
                 (
                     handle.session_endpoint().cloned(),
-                    handle.durable_session_id().map(str::to_owned),
+                    handle.durable_session_id(),
                 )
             })
             .unwrap_or_default();
@@ -1465,6 +1500,7 @@ mod tests {
             owner_id: "ethan".to_string(),
             zone_id: "root".to_string(),
             spawn_spec: None,
+            local_host: None,
             resume_session_id: None,
         }
     }
