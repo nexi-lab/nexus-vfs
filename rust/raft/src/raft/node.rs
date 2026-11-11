@@ -345,6 +345,8 @@ pub enum RaftMsg {
     StorageActivationView {
         tx: oneshot::Sender<Result<StorageActivationView>>,
     },
+    /// Durably prepare this driver's local reader before member qualification.
+    PrepareReplicaControlReader { tx: oneshot::Sender<Result<()>> },
     /// Propose a configuration change (add/remove node).
     /// The tx resolves after the ConfChange is **committed and applied** (not just enqueued).
     ProposeConfChange {
@@ -1846,6 +1848,21 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         rx.await.map_err(|_| RaftError::ChannelClosed)?
     }
 
+    /// Prepare the owning driver's durable local reader format.
+    ///
+    /// Voters, learners and witnesses can prepare without leading the zone.
+    /// Success acknowledges the local storage transaction. Member authentication
+    /// and replicated protocol activation have separate authorities. A dropped
+    /// response can follow a committed preparation; repeating it is idempotent.
+    pub async fn prepare_replica_control_reader(&self) -> Result<()> {
+        self.config.membership_policy.require_managed()?;
+        let (tx, rx) = oneshot::channel();
+        self.msg_tx
+            .try_send(RaftMsg::PrepareReplicaControlReader { tx })
+            .map_err(channel_try_send_err)?;
+        rx.await.map_err(|_| RaftError::ChannelClosed)?
+    }
+
     /// Process a message from another node (sends through channel to driver).
     ///
     /// Uses `send().await` (blocking until space is available) instead of
@@ -2119,6 +2136,9 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
             }
             RaftMsg::StorageActivationView { tx } => {
                 let _ = tx.send(self.storage_activation_view());
+            }
+            RaftMsg::PrepareReplicaControlReader { tx } => {
+                let _ = tx.send(self.prepare_replica_control_reader());
             }
             RaftMsg::ProposeConfChange { change, tx } => {
                 if let Err(error) = self.config.membership_policy.require_managed() {
