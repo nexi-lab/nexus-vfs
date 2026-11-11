@@ -255,7 +255,13 @@ service ZoneApiService {
 message PrepareReplicaControlReaderRequest {
   string zone_id = 1;
 }
-message PrepareReplicaControlReaderResponse {}
+message PrepareReplicaControlReaderResponse {
+  // True only after the owning driver durably prepares and enforces
+  // StepReplicaControlV1 for both inbound and outbound traffic. Earlier
+  // readers return an empty reply, which decodes to false. Member-set
+  // validation and replicated activation remain separate.
+  bool replica_control_transport_v1 = 1;
+}
 
 message AgentCsrCapabilitiesRequest {}
 message AgentCsrCapabilitiesResponse {

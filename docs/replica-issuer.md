@@ -79,6 +79,11 @@ protocol admission. Raft acknowledgements continue to follow log persistence
 in the original Ready/advance loop. A cold driver derives the required dialect
 from its retained reader floor. Each outbound connection pins the destination's
 Node identity, and every reconnect uses the required method.
+Reader preparation reports `replica_control_transport_v1` only after the
+driver enforces that exchange. Member qualification requires this explicit
+acknowledgement over the original Node channel and retains its original
+configuration view across the network call. An earlier empty reply describes
+local reader preparation alone.
 This durable local format upgrade and the replicated activation fact have
 separate purposes: the former defines which program can open the files, while
 the latter enables commands for the zone after authenticated member checks.

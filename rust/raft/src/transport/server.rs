@@ -590,7 +590,9 @@ async fn prepare_replica_control_reader<S: crate::raft::StateMachine + Send + Sy
         .map_err(|error| {
             Status::failed_precondition(format!("reader preparation failed: {error}"))
         })?;
-    Ok(Response::new(PrepareReplicaControlReaderResponse {}))
+    Ok(Response::new(PrepareReplicaControlReaderResponse {
+        replica_control_transport_v1: true,
+    }))
 }
 
 /// Zone-routed implementation of the ZoneTransportService gRPC trait.

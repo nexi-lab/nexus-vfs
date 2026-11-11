@@ -43,6 +43,10 @@ async fn required_wire_prepares_full_node_and_refuses_both_legacy_methods() {
         .step_replica_control_v1(heartbeat(2, 7), "root".into(), String::new())
         .await
         .unwrap();
+    control
+        .prepare_replica_control_transport("root")
+        .await
+        .unwrap();
     assert_legacy_refusal(
         general
             .step_message(heartbeat(2, 7), "root".into(), String::new())
@@ -273,16 +277,6 @@ async fn original_transport_loop_uses_required_wire_for_new_learner_and_replicat
     })
     .await
     .expect("real transport must replicate ordinary data through the required method");
-    // A genuine same-zone ReadIndex roundtrip requires the follower's outgoing
-    // transport to use the required method as well.
-    assert_eq!(
-        learner
-            .read_linearizable(|state| state.get_metadata("/wire-control"))
-            .await
-            .unwrap()
-            .unwrap(),
-        Some(value)
-    );
     let clients = pool(node_tls(&ca, &key, 1));
     let mut legacy = clients
         .get(&NodeAddress::new(2, format!("http://{}", second.address)))
@@ -293,6 +287,16 @@ async fn original_transport_loop_uses_required_wire_for_new_learner_and_replicat
             .step_message(heartbeat(1, 2), zone.into(), String::new())
             .await
             .unwrap_err(),
+    );
+    // Check the incoming wire boundary before the ReadIndex roundtrip, so a
+    // sender using the wrong method fails its wire assertion directly.
+    assert_eq!(
+        learner
+            .read_linearizable(|state| state.get_metadata("/wire-control"))
+            .await
+            .unwrap()
+            .unwrap(),
+        Some(value)
     );
     assert!(learner
         .with_state_machine(

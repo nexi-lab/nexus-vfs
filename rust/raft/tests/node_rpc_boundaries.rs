@@ -2,6 +2,8 @@
 //! consensus data are isolated; no fleet endpoint or model is used.
 #![cfg(all(feature = "grpc", has_protos))]
 mod common;
+#[path = "node_rpc_boundaries/reader_capability.rs"]
+mod reader_capability;
 #[path = "node_rpc_boundaries/reader_preparation.rs"]
 mod reader_preparation;
 #[path = "node_rpc_boundaries/replica_transport.rs"]

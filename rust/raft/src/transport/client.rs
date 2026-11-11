@@ -11,11 +11,11 @@ use super::proto::nexus::raft::{
     DiscoverZonesRequest, EcReplicationEntry, ExtendLock, GetClusterInfoRequest, GetCrlRequest,
     GetLockInfo, GetMetadata, JoinClusterRequest, JoinZoneRequest, ListForeignCasRequest,
     ListKeysRequest, ListMetadata, ListSessionMintersRequest, MintAgentRequest, MintKeyRequest,
-    MintSessionAgentRequest, PrepareReplicaControlReaderRequest, ProposeRequest, PutMetadata,
-    QueryRequest, RaftCommand, RaftQuery, RegisterForeignCaRequest, ReleaseLock,
-    RemoveVoterRequest, RenewSessionAgentRequest, ReplicateEntriesRequest, RevokeAgentCertRequest,
-    RevokeKeyRequest, SnapshotEcStateRequest, StepMessageRequest, StepMessageResponse,
-    UnregisterForeignCaRequest,
+    MintSessionAgentRequest, PrepareReplicaControlReaderRequest,
+    PrepareReplicaControlReaderResponse, ProposeRequest, PutMetadata, QueryRequest, RaftCommand,
+    RaftQuery, RegisterForeignCaRequest, ReleaseLock, RemoveVoterRequest, RenewSessionAgentRequest,
+    ReplicateEntriesRequest, RevokeAgentCertRequest, RevokeKeyRequest, SnapshotEcStateRequest,
+    StepMessageRequest, StepMessageResponse, UnregisterForeignCaRequest,
 };
 use super::{NodeAddress, Result, TransportError};
 use std::collections::HashMap;
@@ -398,17 +398,41 @@ impl RaftClient {
     /// A successful reply acknowledges local durability, not protocol activation.
     /// Errors retain the original request; this method has no legacy fallback.
     pub async fn prepare_replica_control_reader(&mut self, zone_id: &str) -> Result<()> {
+        self.prepare_reader(zone_id).await.map(|_| ())
+    }
+
+    /// Prepare the original remote reader and require its current transport
+    /// capability. An earlier empty acknowledgement cannot qualify a member.
+    /// The caller retains the original configuration view across this await.
+    pub async fn prepare_replica_control_transport(&mut self, zone_id: &str) -> Result<()> {
+        if !self
+            .prepare_reader(zone_id)
+            .await?
+            .replica_control_transport_v1
+        {
+            return Err(TransportError::Rpc(
+                "peer did not acknowledge replica-control transport v1".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn prepare_reader(
+        &mut self,
+        zone_id: &str,
+    ) -> Result<PrepareReplicaControlReaderResponse> {
         if !self.is_node_channel {
             return Err(TransportError::Connection(
                 "storage reader preparation requires an exact cluster Node channel".into(),
             ));
         }
-        self.inner
+        Ok(self
+            .inner
             .prepare_replica_control_reader_v1(PrepareReplicaControlReaderRequest {
                 zone_id: zone_id.to_owned(),
             })
-            .await?;
-        Ok(())
+            .await?
+            .into_inner())
     }
 
     /// Send a raw raft-rs message to this node.
