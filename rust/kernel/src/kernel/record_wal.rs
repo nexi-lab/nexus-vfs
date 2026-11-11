@@ -14,6 +14,9 @@ use super::conditional_content::ConditionalContentError;
 use super::record_control::RecordContentOwner;
 use super::{Kernel, KernelError, OperationContext};
 
+mod recovery;
+pub use recovery::{RecordWalCreateError, RecordWalRecovery};
+
 /// An admitted WAL and lifecycle authority captured from the same store.
 /// Keep this pair for the complete Session consumer lifetime. A fresh lookup
 /// after a mount change cannot replace its original control capability.
@@ -70,7 +73,14 @@ impl Kernel {
             .as_ref()
             .cloned()
             .ok_or(ConditionalContentError::Unsupported)?;
-        self.create_record_wal_at(&path, &owner_path, &route, store, owner_version)
+        self.create_record_wal_at(
+            &path,
+            &owner_path,
+            &route,
+            Arc::clone(&store),
+            owner_version,
+            || self.record_wal_core(&path, &route, store, owner_version),
+        )
     }
 
     /// Create a WAL and retain its exact original lifecycle-control authority.
@@ -82,16 +92,29 @@ impl Kernel {
         owner_path: &str,
         ctx: &OperationContext,
         owner_version: &[u8],
-    ) -> Result<RecordWalHandle, ConditionalContentError> {
+    ) -> Result<RecordWalHandle, RecordWalCreateError> {
         let (path, owner_path, route) = self.record_wal_owner_route(path, owner_path, ctx)?;
         let store = route
             .metastore
             .as_ref()
             .cloned()
             .ok_or(ConditionalContentError::Unsupported)?;
-        let owner = RecordContentOwner::from_route(&route, &owner_path)?;
-        let wal = self.create_record_wal_at(&path, &owner_path, &route, store, owner_version)?;
-        Ok(RecordWalHandle { wal, owner })
+        let recovery = self.record_wal_recovery(
+            &path,
+            &owner_path,
+            &route,
+            Arc::clone(&store),
+            owner_version,
+        )?;
+        match self.create_record_wal_at(&path, &owner_path, &route, store, owner_version, || {
+            recovery.open().map(|handle| handle.wal)
+        }) {
+            Ok(wal) => Ok(RecordWalHandle {
+                wal,
+                owner: recovery.owner().clone(),
+            }),
+            Err(error) => Err(RecordWalCreateError::captured(error, recovery)),
+        }
     }
 
     fn record_wal_owner_route(
@@ -113,6 +136,7 @@ impl Kernel {
         route: &RouteResult,
         store: Arc<dyn MetaStore>,
         owner_version: &[u8],
+        admit: impl FnOnce() -> Result<WalStreamCore, ConditionalContentError>,
     ) -> Result<WalStreamCore, ConditionalContentError> {
         let records = store
             .as_guarded_records()
@@ -146,13 +170,11 @@ impl Kernel {
             None,
         );
         match records.replace_guarded_record(path, metadata, None, owner_version)? {
-            ConditionalMetadataResult::Committed { .. } => self
-                .record_wal_core(path, route, store, owner_version)
-                .map_err(|error| {
-                    ConditionalContentError::Unknown(format!(
-                        "owned WAL inode committed but handle admission failed: {error}"
-                    ))
-                }),
+            ConditionalMetadataResult::Committed { .. } => admit().map_err(|error| {
+                ConditionalContentError::Unknown(format!(
+                    "owned WAL inode committed but handle admission failed: {error}"
+                ))
+            }),
             ConditionalMetadataResult::Conflict { .. } => {
                 Err(refused("new owned WAL inode changed during creation"))
             }
@@ -196,15 +218,38 @@ impl Kernel {
             .as_ref()
             .cloned()
             .ok_or(ConditionalContentError::Unsupported)?;
-        // The binding is permanent. Check its actual canonical owner before
-        // pairing control; neither path spelling nor revision equality proves it.
-        store
+        self.record_wal_recovery(&path, &owner_path, &route, store, owner_version)?
+            .open()
+    }
+
+    fn record_wal_recovery(
+        &self,
+        path: &str,
+        owner_path: &str,
+        route: &RouteResult,
+        store: Arc<dyn MetaStore>,
+        owner_version: &[u8],
+    ) -> Result<RecordWalRecovery, ConditionalContentError> {
+        let owner = RecordContentOwner::from_route(route, owner_path)?;
+        let canonical = store
             .as_guarded_records()
             .ok_or(ConditionalContentError::Unsupported)?
-            .check_record_owner_binding(&path, &owner_path, owner_version)?;
-        let owner = RecordContentOwner::from_route(&route, &owner_path)?;
-        let wal = self.record_wal_core(&path, &route, store, owner_version)?;
-        Ok(RecordWalHandle { wal, owner })
+            .record_storage_key(path);
+        let backend = route
+            .backend
+            .as_ref()
+            .cloned()
+            .ok_or(ConditionalContentError::Unsupported)?;
+        let cold = self.cold_segment_store_for_backend(&route.zone_id, &canonical, backend);
+        Ok(RecordWalRecovery::new(
+            path,
+            owner_path,
+            owner_version,
+            store,
+            cold,
+            self.seal_policy(),
+            owner,
+        ))
     }
 
     fn record_wal_core(
@@ -217,31 +262,13 @@ impl Kernel {
         let records = store
             .as_guarded_records()
             .ok_or(ConditionalContentError::Unsupported)?;
-        let _io = records.begin_record_io(path, owner_version)?;
-        let metadata = store
-            .get(path)
-            .map_err(storage_error)?
-            .ok_or_else(|| refused("owned WAL inode is absent"))?;
-        if metadata.entry_type != DT_STREAM || metadata.size != 0 {
-            return Err(ConditionalContentError::Unsupported);
-        }
         let canonical = records.record_storage_key(path);
         let backend = route
             .backend
             .as_ref()
             .cloned()
             .ok_or(ConditionalContentError::Unsupported)?;
-        let core = match self.cold_segment_store_for_backend(&route.zone_id, &canonical, backend) {
-            Some(cold) => WalStreamCore::with_cold_tier(
-                Arc::clone(&store),
-                canonical,
-                cold,
-                self.seal_policy(),
-                0,
-            ),
-            None => WalStreamCore::new(Arc::clone(&store), canonical),
-        };
-        core.with_record_owner(path, owner_version.to_vec())
-            .map_err(ConditionalContentError::from)
+        let cold = self.cold_segment_store_for_backend(&route.zone_id, &canonical, backend);
+        recovery::open_core(path, store, owner_version, cold, self.seal_policy())
     }
 }

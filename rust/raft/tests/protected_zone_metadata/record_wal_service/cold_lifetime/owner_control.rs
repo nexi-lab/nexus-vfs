@@ -1,5 +1,8 @@
 //! The lifecycle authority follows original I/O across replacement and cloning.
 
+#[path = "owner_control/unknown.rs"]
+mod unknown;
+
 use super::{run_in_cold_child, service, wait_for, Cut, Fixture, PausedCas, HISTORY, OWNER};
 use kernel::core::stream::wal::wal_stream_prefix;
 use kernel::kernel::conditional_content::ConditionalContentResult;

@@ -10,14 +10,28 @@ use kernel::stream::StreamBackend;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-const CUT: &str = "post-inode handle-admission read fault";
+pub(super) const CUT: &str = "post-inode handle-admission read fault";
 
 /// Keep every mutation, revision and WAL read in the real store. The only
 /// injected result is one metadata read failure after the new inode exists.
-struct FailAfterInode {
+pub(super) struct FailAfterInode {
     inner: Arc<nexus_raft::zone_meta_store::ZoneMetaStore>,
     armed: AtomicBool,
     faults: AtomicUsize,
+}
+
+impl FailAfterInode {
+    pub(super) fn new(inner: Arc<nexus_raft::zone_meta_store::ZoneMetaStore>) -> Self {
+        Self {
+            inner,
+            armed: AtomicBool::new(true),
+            faults: AtomicUsize::new(0),
+        }
+    }
+
+    pub(super) fn fault_count(&self) -> usize {
+        self.faults.load(Ordering::SeqCst)
+    }
 }
 
 impl MetaStore for FailAfterInode {
@@ -102,11 +116,7 @@ fn kernel_owned_wal_post_commit_admission_fault_requires_original_readback() {
 
     let directory = tempfile::tempdir().unwrap();
     let (fixture, fault) = Fixture::open_with_store(directory.path(), true, |inner| {
-        Arc::new(FailAfterInode {
-            inner,
-            armed: AtomicBool::new(true),
-            faults: AtomicUsize::new(0),
-        })
+        Arc::new(FailAfterInode::new(inner))
     });
     let owner = fixture.enroll();
     match fixture

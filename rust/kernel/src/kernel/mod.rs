@@ -94,7 +94,7 @@ pub mod guarded_content;
 pub mod record_control;
 pub mod record_protection;
 mod record_wal;
-pub use record_wal::RecordWalHandle;
+pub use record_wal::{RecordWalCreateError, RecordWalHandle, RecordWalRecovery};
 // The service-boot declaration type consumed by `Kernel::bring_up_services`.
 // Re-exported so service crates + the composition/assembly binary can build
 // `ServiceDecl`s without reaching into the private `dispatch` submodule.
