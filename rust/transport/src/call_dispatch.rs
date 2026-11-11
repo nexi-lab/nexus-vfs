@@ -21,6 +21,9 @@ use tonic::{Response, Status};
 
 use crate::grpc::{encode_rpc_error, RpcErrorCode};
 
+#[path = "runtime_observation.rs"]
+mod runtime_observation;
+
 /// What to tell a caller that asked `Call` for something it does not carry.
 ///
 /// The generic surface is an escape hatch for registry-shaped operations and
@@ -80,6 +83,12 @@ pub fn dispatch(
         "agent_update_state" => do_agent_update_state(kernel, ctx, &params),
         "agent_signal" => do_agent_signal(kernel, ctx, &params),
         "agent_heartbeat" => do_agent_heartbeat(kernel, ctx, &params),
+        "agent_runtime_register_v1"
+        | "agent_runtime_publish_v1"
+        | "agent_runtime_heartbeat_v1"
+        | "agent_runtime_unregister_v1"
+        | "agent_runtime_get_v1"
+        | "agent_runtime_list_v1" => runtime_observation::dispatch(kernel, ctx, method, params),
 
         // Dot-notation: "service_name.method" → dispatch to registered
         // RustService or dylib plugin via Kernel::dispatch_rust_call.

@@ -418,7 +418,7 @@ fn atomic_write(path: &Path, ident: &Identity) -> Result<(), String> {
         f.sync_all()
             .map_err(|e| format!("sync tmp identity '{}': {e}", tmp.display()))?;
     }
-    fs::rename(&tmp, path)
+    lib::file_durability::replace_file(&tmp, path)
         .map_err(|e| format!("rename '{}' -> '{}': {e}", tmp.display(), path.display(),))
 }
 

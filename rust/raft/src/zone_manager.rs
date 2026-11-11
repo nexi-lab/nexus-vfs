@@ -24,6 +24,17 @@ use crate::zone_handle::ZoneHandle;
 use lib::rt::block_on_via as bridge_block_on;
 use lib::rt::OwnedRuntime;
 
+/// Preserve storage admission failures across eager, lazy and join opens.
+fn zone_open_error(
+    error: crate::transport::TransportError,
+    context: impl std::fmt::Display,
+) -> RaftError {
+    match error {
+        crate::transport::TransportError::DataDirLocked(path) => RaftError::DataDirLocked(path),
+        other => RaftError::Raft(format!("{context}: {other}")),
+    }
+}
+
 // ── Federation mount helpers ─────────────────────────────────────────
 
 /// DirEntryType codes — must match proto/nexus/core/metadata.proto and
@@ -635,17 +646,8 @@ impl ZoneManager {
         };
         registry
             .materialize_now(&eager, peer_addrs.clone(), runtime.handle())
-            .map_err(|e| match e {
-                // Kept typed rather than folded into the message: the caller's
-                // response to "someone else has this data dir" is a different one,
-                // and a CLI should not have to read prose to tell.
-                crate::transport::TransportError::DataDirLocked(path) => {
-                    RaftError::DataDirLocked(path)
-                }
-                other => RaftError::Raft(format!(
-                    "Failed to open zones {:?} on startup: {}",
-                    eager, other
-                )),
+            .map_err(|e| {
+                zone_open_error(e, format!("Failed to open zones {eager:?} on startup"))
             })?;
 
         let blob_fetcher_slot = crate::blob_fetcher::new_blob_fetcher_slot();
@@ -1037,7 +1039,7 @@ impl ZoneManager {
         let node = self
             .registry
             .create_zone(zone_id, peer_addrs, self.rt().handle())
-            .map_err(|e| RaftError::Raft(format!("Failed to create zone: {}", e)))?;
+            .map_err(|e| zone_open_error(e, "Failed to create zone"))?;
 
         Ok(ZoneHandle::new(
             node,
@@ -1085,7 +1087,7 @@ impl ZoneManager {
         let node = self
             .registry
             .join_zone(zone_id, peer_addrs, learner, self.rt().handle())
-            .map_err(|e| RaftError::Raft(format!("Failed to join zone: {}", e)))?;
+            .map_err(|e| zone_open_error(e, "Failed to join zone"))?;
 
         Ok(ZoneHandle::new(
             node,

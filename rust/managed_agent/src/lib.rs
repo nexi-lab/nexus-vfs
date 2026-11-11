@@ -331,6 +331,8 @@ pub trait SpawnHandle: Send + Sync {
 pub struct SpawnOptions {
     pub resume_session_id: Option<String>,
     pub session_endpoint: Option<a2a::session::SessionEndpoint>,
+    /// Exact host-owned instance. Binding only exposes engine facts.
+    pub runtime_observation: Option<Arc<dyn contracts::runtime_status::RuntimeObservationHost>>,
 }
 
 /// Spawn-task provider. `start_session` calls
@@ -422,6 +424,7 @@ pub(crate) trait PreparedRawSpawn: Send {
 }
 
 pub(crate) struct ManagedAgentService<K: KernelSyscall> {
+    runtime_directory: Option<kernel::core::agents::registry::RuntimeDirectoryLookup>,
     /// Shared kernel handle for `start_session` to stamp the per-pid
     /// procfs subtree (`/proc/{pid}/`, `/proc/{pid}/workspace/`,
     /// workspace shortcut DT_LINK, per-repo alias DT_LINKs) and for
@@ -459,6 +462,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
     /// land in the same metastore the assertion helpers read back.
     pub(crate) fn new(kernel: Arc<K>, agent_registry: Arc<AgentRegistry>) -> Self {
         Self {
+            runtime_directory: None,
             kernel,
             agent_registry,
             spawn_provider: None,
@@ -479,6 +483,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
         spawn_provider: Arc<dyn SpawnTask<K>>,
     ) -> Self {
         Self {
+            runtime_directory: None,
             kernel,
             agent_registry,
             spawn_provider: Some(spawn_provider),
@@ -756,6 +761,18 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                         SpawnOptions {
                             resume_session_id: req.resume_session_id.clone(),
                             session_endpoint: session_endpoint.clone(),
+                            runtime_observation:
+                                kernel::core::agents::registry::RuntimeRegistryHost::new(
+                                    Arc::clone(&self.agent_registry),
+                                    instance.clone(),
+                                    self.runtime_directory.clone(),
+                                )
+                                .map(|host| {
+                                    Arc::new(host)
+                                        as Arc<
+                                            dyn contracts::runtime_status::RuntimeObservationHost,
+                                        >
+                                }),
                         },
                         observer,
                     )
@@ -1104,7 +1121,22 @@ impl ManagedAgentService<kernel::kernel::Kernel> {
         #[cfg(not(feature = "subprocess-host"))]
         let raw_spawn: Option<Arc<dyn RawSpawn>> = None;
 
+        let weak_kernel = Arc::downgrade(kernel);
+        let runtime_directory: kernel::core::agents::registry::RuntimeDirectoryLookup =
+            Arc::new(move |owner, zone| {
+                let kernel = weak_kernel.upgrade().ok_or("runtime host retired")?;
+                let ctx = contracts::OperationContext::new(owner, zone, false, None, false);
+                let payload =
+                    serde_json::to_vec(&contracts::runtime_status::ListRuntimesRequest::default())
+                        .map_err(|error| error.to_string())?;
+                let result = kernel
+                    .dispatch_rust_call_ctx(&ctx, "runtime_directory", "list_v1", &payload)
+                    .ok_or("runtime directory is unavailable")?
+                    .map_err(|error| error.to_string())?;
+                serde_json::from_slice(&result).map_err(|error| error.to_string())
+            });
         let svc = Arc::new(ManagedAgentService {
+            runtime_directory: Some(runtime_directory),
             kernel: Arc::clone(kernel),
             agent_registry,
             spawn_provider,

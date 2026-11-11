@@ -1697,6 +1697,20 @@ fn data_dir_locked_error(data_dir: &std::path::Path, store_path: &str) -> anyhow
     )
 }
 
+/// Apply the same typed storage guidance when a zone opens after construction.
+fn zone_manager_error(
+    common: &CommonArgs,
+    context: impl std::fmt::Display,
+    error: nexus_raft::raft::RaftError,
+) -> anyhow::Error {
+    match error {
+        nexus_raft::raft::RaftError::DataDirLocked(store_path) => {
+            data_dir_locked_error(&common.data_dir, &store_path)
+        }
+        other => anyhow::anyhow!("{context}: {other}"),
+    }
+}
+
 /// Open a `ZoneManager` against the data dir, sharing the daemon's
 /// startup conventions. Used by both `daemon` and the offline
 /// `share`/`join` subcommands.
@@ -1910,12 +1924,7 @@ fn open_zone_manager(
         extra_grpc_services,
         load_policy,
     )
-    .map_err(|e| match e {
-        nexus_raft::raft::RaftError::DataDirLocked(store_path) => {
-            data_dir_locked_error(&common.data_dir, &store_path)
-        }
-        other => anyhow::anyhow!("ZoneManager::with_node_id: {other}"),
-    })?;
+    .map_err(|e| zone_manager_error(common, "ZoneManager::with_node_id", e))?;
 
     // S3 Phase B: hand the identity directory to the zone registry so
     // every future zone install (both static founder and JoinZone
@@ -3185,11 +3194,16 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     // peer dispatch.  Without this the coordinator's `peer_*` impls
     // surface every cross-node dispatch as a silent miss via the
     // PR #94 observability warn-loud path (`grpc_ops not installed`).
-    let federation_client: Arc<dyn kernel::federation::grpc_ops::FederationGrpcOps> =
-        Arc::new(transport::federation::FederationClient::new(
-            Arc::clone(kernel.runtime()),
-            cluster_tls.clone(),
-        ));
+    let federation_client = Arc::new(transport::federation::FederationClient::new(
+        kernel.runtime().handle().clone(),
+        cluster_tls.clone(),
+    ));
+    transport::federation::runtime_directory::install(
+        &kernel,
+        Arc::clone(&federation_client),
+        a2a::A2A_INBOX_BASE,
+    )
+    .map_err(anyhow::Error::msg)?;
 
     // Construct the provider as `Arc<RaftDistributedCoordinator>` so
     // `install_with_kernel` can clone it into the kernel's coordinator
@@ -5588,7 +5602,7 @@ fn open_auth_store(
     // re-founding it.
     if zm.get_zone(auth_zone).is_none() {
         zm.create_zone(auth_zone, Vec::new())
-            .map_err(|e| anyhow::anyhow!("open {auth_zone} zone: {e}"))?;
+            .map_err(|e| zone_manager_error(common, format!("open {auth_zone} zone"), e))?;
     }
     let cred_zone = zm
         .get_zone(auth_zone)

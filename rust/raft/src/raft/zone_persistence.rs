@@ -231,7 +231,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     std::io::Write::write_all(&mut file, bytes)?;
     file.sync_all()?;
     drop(file);
-    std::fs::rename(&tmp, path)?;
+    lib::file_durability::replace_file(&tmp, path)?;
     #[cfg(unix)]
     {
         // Persist the directory entry the rename just replaced. Opening a
