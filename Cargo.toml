@@ -180,7 +180,7 @@ regex-syntax = "0.8"
 crc32fast = "1.4"
 fastcdc = "4.0"
 mimalloc = { version = "0.1", default-features = false }
-tonic = { version = "0.14", features = ["transport", "tls-ring"] }
+tonic = { version = "0.14.6", features = ["transport", "tls-ring"] }
 prost = "0.14"
 tonic-prost = "0.14"
 

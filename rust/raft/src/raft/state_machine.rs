@@ -23,10 +23,23 @@ use super::Result;
 
 mod conditional_metadata;
 mod metadata_rename;
+mod node_identity;
 mod protected_metadata;
 mod record_guard;
+mod replica_binding;
+mod replica_issuance;
+mod storage_admission;
 pub use conditional_metadata::VersionedMetadata;
 pub use record_guard::GuardedRecordMutation;
+
+const OWNED_CONTROL_NAMESPACES: &[&str] = &[
+    conditional_metadata::NAMESPACE,
+    contracts::constants::CONTROL_NS_REPLICA,
+];
+
+fn owned_control_namespace(namespace: &str) -> bool {
+    OWNED_CONTROL_NAMESPACES.contains(&namespace)
+}
 
 /// Command to be replicated through Raft.
 ///
@@ -312,6 +325,15 @@ pub enum Command {
         key: String,
         expected_version: Vec<u8>,
     },
+    /// Atomically update the native replica binding and its original-operation
+    /// receipt in the existing control tree. Appended to preserve log indices.
+    ApplyReplicaBinding(Box<contracts::replica_binding::ReplicaBindingRequest>),
+    /// Reserve an enrolled Node ID against the same durable identity index as
+    /// replica bindings. Appended to preserve existing command discriminants.
+    ReserveNodeIdentity(Box<contracts::node_identity::NodeIdentityRequest>),
+    /// Compare issuer/binding authority and publish the original credential
+    /// receipt in the same transaction. Appended for log compatibility.
+    ApplyReplicaIssuance(Box<contracts::replica_credential::ReplicaIssuanceRequest>),
 }
 
 impl Command {
@@ -325,6 +347,9 @@ impl Command {
                 | Self::GuardedRecord { .. }
                 | Self::RetireRecordGuard { .. }
                 | Self::AdmitRecordIoOwner { .. }
+                | Self::ApplyReplicaBinding(_)
+                | Self::ReserveNodeIdentity(_)
+                | Self::ApplyReplicaIssuance(_)
         )
     }
 
@@ -422,7 +447,7 @@ pub trait StateMachine: Send + Sync {
 
     /// Admission shared by EC origin, ingress and state-machine apply.
     fn requires_strong_consistency(&self, command: &Command) -> Result<bool> {
-        Ok(command.requires_conditional_sc())
+        Ok(command.requires_conditional_sc() || command.requires_replica_sc())
     }
 
     /// Apply a committed command to the state machine.
@@ -1898,6 +1923,9 @@ impl FullStateMachine {
                 | Command::AdmitRecordIoOwner { .. } => Err(super::RaftError::InvalidState(
                 "versioned metadata requires a Raft-committed transaction".into(),
             )),
+            Command::ApplyReplicaBinding(_) | Command::ReserveNodeIdentity(_) | Command::ApplyReplicaIssuance(_) => Err(super::RaftError::InvalidState(
+                "replica binding requires a Raft-committed transaction".into(),
+            )),
             Command::PutControlState {
                 namespace,
                 key,
@@ -2260,9 +2288,9 @@ impl FullStateMachine {
                 if_absent,
             } => {
                 let def = redb::TableDefinition::<&[u8], &[u8]>::new(self.control_state.name());
-                if namespace == conditional_metadata::NAMESPACE {
+                if owned_control_namespace(namespace) {
                     return Ok(CommandResult::Error(
-                        "conditional revision control state is owned by its apply primitive".into(),
+                        "control state is owned by its typed apply primitive".into(),
                     ));
                 }
                 let mut table = txn
@@ -2292,9 +2320,9 @@ impl FullStateMachine {
 
             Command::DeleteControlState { namespace, key } => {
                 let def = redb::TableDefinition::<&[u8], &[u8]>::new(self.control_state.name());
-                if namespace == conditional_metadata::NAMESPACE {
+                if owned_control_namespace(namespace) {
                     return Ok(CommandResult::Error(
-                        "conditional revision control state is owned by its apply primitive".into(),
+                        "control state is owned by its typed apply primitive".into(),
                     ));
                 }
                 let mut table = txn
@@ -2305,6 +2333,10 @@ impl FullStateMachine {
                     .map_err(|e| super::RaftError::Storage(format!("remove control_state: {e}")))?;
                 Ok(CommandResult::Success)
             }
+
+            Command::ApplyReplicaBinding(request) => self.apply_replica_binding(txn, request),
+            Command::ReserveNodeIdentity(request) => self.reserve_node_identity(txn, request),
+            Command::ApplyReplicaIssuance(request) => self.apply_replica_issuance(txn, request),
 
             Command::WriteVersionedMetadata {
                 key,
@@ -2360,7 +2392,7 @@ impl FullStateMachine {
 
 impl StateMachine for FullStateMachine {
     fn validate_membership_policy(&self, policy: super::MembershipPolicy) -> Result<()> {
-        self.validate_protected_storage_policy(policy)
+        self.validate_owned_storage_policy(policy)
     }
 
     fn validate_snapshot_membership(
@@ -2369,11 +2401,13 @@ impl StateMachine for FullStateMachine {
         policy: super::MembershipPolicy,
     ) -> Result<()> {
         let snapshot: Snapshot = bincode::deserialize(data)?;
-        Self::validate_protected_snapshot_policy(&snapshot, policy)
+        Self::validate_owned_snapshot_policy(&snapshot, policy)
     }
 
     fn requires_strong_consistency(&self, command: &Command) -> Result<bool> {
-        Ok(command.requires_conditional_sc() || self.ordinary_write_is_protected(command)?)
+        Ok(command.requires_conditional_sc()
+            || command.requires_replica_sc()
+            || self.ordinary_write_is_protected(command)?)
     }
 
     fn apply_local(&mut self, command: &Command) -> Result<CommandResult> {

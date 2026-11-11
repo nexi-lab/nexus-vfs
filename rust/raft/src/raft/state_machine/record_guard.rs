@@ -231,7 +231,10 @@ impl FullStateMachine {
         }
         self.adopt_protected_in_txn(txn, key, expected_image, incarnation)?;
         self.mark_record_owner_in_txn(txn, guard_key)?;
-        self.require_record_format_in_txn(txn, true)?;
+        self.require_storage_format_in_txn(
+            txn,
+            super::storage_admission::StorageFormat::GuardedRecords,
+        )?;
         self.put_record_control_in_txn(txn, BINDING_PREFIX, key, guard_key.as_bytes())?;
         Ok(CommandResult::Success)
     }
@@ -281,7 +284,10 @@ impl FullStateMachine {
         let result =
             self.write_versioned_in_txn(txn, key, terminal_image, Some(expected), incarnation)?;
         self.mark_record_owner_in_txn(txn, key)?;
-        self.require_record_format_in_txn(txn, true)?;
+        self.require_storage_format_in_txn(
+            txn,
+            super::storage_admission::StorageFormat::GuardedRecords,
+        )?;
         match &result {
             CommandResult::ConditionalMetadata {
                 committed: true,

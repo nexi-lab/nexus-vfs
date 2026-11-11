@@ -17,6 +17,8 @@ server name. The issuer assigns the nonzero replica ID. Zone membership
 determines its replication visibility. The shared certificate parser verifies
 the exact identity shape, including duplicate URI rejection. Proof-bound
 renewal preserves that identity while rotating the leaf key and serial.
+The [replica issuer contract](replica-issuer.md) owns durable allocation/PVC
+binding, operation reconciliation, renewal publication and retirement.
 
 ```mermaid
 flowchart LR
@@ -49,6 +51,19 @@ their existing VFS semantics at the VFS boundary. Scoped peer clients use the
 same explicit RPC across versions and preserve an unsupported-method error.
 See [profile storage composition](../rust/profiles/README.md).
 
+## Outgoing replication identity
+
+The Raft peer pool connects to the Node ID selected by the transport's route.
+TLS verifies that exact signed Node or owner-replica ID, alongside the trusted
+CA chain, certificate lifetime, server key usage and handshake signature.
+Node certificates use the cluster service name; owner replicas use the service
+name derived from their signed owner. Credential issuance and both directions
+of TLS admission share the same identity parsers.
+
+Cached connections retain their route and TLS configuration. A route or
+credential change requires a fresh connection. A dial whose TLS configuration
+changed while it was connecting returns an error before publishing its channel.
+
 ## Control and local root
 
 Membership administration, global topology, unscoped `ReadBlob`, key
@@ -78,6 +93,8 @@ credential services; certificate-role parsing identifies the peer.
 `raft/tests/node_rpc_boundaries.rs` uses real mTLS and native Raft stores to
 check Node control, replica membership, removal on an existing connection,
 metadata/WAL/snapshot refusal, fixed-local EC refusal and witness isolation.
+It also exercises exact outgoing peer identity, owner-replica server names,
+foreign-issuer refusal, route changes and credential rotation during a dial.
 `profiles/cluster/tests/zone_content_blob.rs` checks real mTLS and durable
 Linux CAS namespaces, including known hashes and forged cross-zone pointers.
 `transport/src/peer_blob/tls_tests.rs` checks production client transport,
