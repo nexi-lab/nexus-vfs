@@ -11,7 +11,7 @@ flowchart LR
     Change[Committed ConfChange] -->|same index, same transaction| Record[member-address record]
     Register[Committed self-registration put] --> Record
     Record --> Registered[Peer map: registered layer]
-    Inbound[Authenticated inbound sender_address] --> Observed[Peer map: observed layer]
+    Inbound[Authenticated sender_address and admitted registrations] --> Observed[Peer map: observed layer]
     Registered --> Route{route id}
     Observed --> Route
     Route --> Send[Raft, EC and forwarding sends]
