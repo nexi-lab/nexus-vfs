@@ -523,6 +523,7 @@ async fn step_raft_message<S: crate::raft::StateMachine + Send + Sync + 'static>
     mut msg: raft::eraftpb::Message,
     zone_id: &str,
     log_prefix: &str,
+    protocol: crate::raft::RaftMessageProtocol,
 ) -> std::result::Result<Response<StepMessageResponse>, Status> {
     tracing::trace!(
         "{} StepMessage [zone={}]: type={:?}, from={}, to={}, term={}",
@@ -563,7 +564,7 @@ async fn step_raft_message<S: crate::raft::StateMachine + Send + Sync + 'static>
         }
     }
 
-    if let Err(e) = node.step(msg).await {
+    if let Err(e) = node.step_transport(msg, protocol).await {
         return Ok(Response::new(StepMessageResponse {
             success: false,
             error: Some(format!("Failed to step message: {}", e)),
@@ -589,7 +590,9 @@ async fn prepare_replica_control_reader<S: crate::raft::StateMachine + Send + Sy
         .map_err(|error| {
             Status::failed_precondition(format!("reader preparation failed: {error}"))
         })?;
-    Ok(Response::new(PrepareReplicaControlReaderResponse {}))
+    Ok(Response::new(PrepareReplicaControlReaderResponse {
+        replica_control_transport_v1: true,
+    }))
 }
 
 /// Zone-routed implementation of the ZoneTransportService gRPC trait.
@@ -652,7 +655,11 @@ impl ZoneTransportServiceImpl {
     async fn dispatch_step(
         &self,
         request: Request<StepMessageRequest>,
+        protocol: crate::raft::RaftMessageProtocol,
     ) -> std::result::Result<Response<StepMessageResponse>, Status> {
+        if protocol == crate::raft::RaftMessageProtocol::ReplicaControlV1 {
+            super::node_authority::require_authenticated_control_node(request.extensions())?;
+        }
         super::node_authority::authorize_data_zone(
             request.extensions(),
             &self.registry,
@@ -677,7 +684,7 @@ impl ZoneTransportServiceImpl {
         self.registry
             .learn_peer_address(&req.zone_id, peer, &req.sender_address);
 
-        step_raft_message(&node, message, &req.zone_id, "").await
+        step_raft_message(&node, message, &req.zone_id, "", protocol).await
     }
 }
 
@@ -705,14 +712,24 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
         &self,
         request: Request<StepMessageRequest>,
     ) -> std::result::Result<Response<StepMessageResponse>, Status> {
-        self.dispatch_step(request).await
+        self.dispatch_step(request, crate::raft::RaftMessageProtocol::Legacy)
+            .await
     }
 
     async fn step_storage_v1(
         &self,
         request: Request<StepMessageRequest>,
     ) -> std::result::Result<Response<StepMessageResponse>, Status> {
-        self.dispatch_step(request).await
+        self.dispatch_step(request, crate::raft::RaftMessageProtocol::Legacy)
+            .await
+    }
+
+    async fn step_replica_control_v1(
+        &self,
+        request: Request<StepMessageRequest>,
+    ) -> std::result::Result<Response<StepMessageResponse>, Status> {
+        self.dispatch_step(request, crate::raft::RaftMessageProtocol::ReplicaControlV1)
+            .await
     }
 
     /// Handle EC replication entries from a peer (Phase C).
@@ -2935,7 +2952,11 @@ impl WitnessServiceImpl {
     async fn dispatch_step(
         &self,
         request: Request<StepMessageRequest>,
+        protocol: crate::raft::RaftMessageProtocol,
     ) -> std::result::Result<Response<StepMessageResponse>, Status> {
+        if protocol == crate::raft::RaftMessageProtocol::ReplicaControlV1 {
+            super::node_authority::require_authenticated_control_node(request.extensions())?;
+        }
         let message = match parse_raft_message(&request.get_ref().message) {
             Ok(message) => message,
             Err(response) => return Ok(Response::new(response)),
@@ -2966,7 +2987,7 @@ impl WitnessServiceImpl {
         self.registry
             .learn_peer_address(&req.zone_id, peer, &req.sender_address);
 
-        step_raft_message(&node, message, &req.zone_id, "[Witness]").await
+        step_raft_message(&node, message, &req.zone_id, "[Witness]", protocol).await
     }
 }
 
@@ -2992,14 +3013,24 @@ impl ZoneTransportService for WitnessServiceImpl {
         &self,
         request: Request<StepMessageRequest>,
     ) -> std::result::Result<Response<StepMessageResponse>, Status> {
-        self.dispatch_step(request).await
+        self.dispatch_step(request, crate::raft::RaftMessageProtocol::Legacy)
+            .await
     }
 
     async fn step_storage_v1(
         &self,
         request: Request<StepMessageRequest>,
     ) -> std::result::Result<Response<StepMessageResponse>, Status> {
-        self.dispatch_step(request).await
+        self.dispatch_step(request, crate::raft::RaftMessageProtocol::Legacy)
+            .await
+    }
+
+    async fn step_replica_control_v1(
+        &self,
+        request: Request<StepMessageRequest>,
+    ) -> std::result::Result<Response<StepMessageResponse>, Status> {
+        self.dispatch_step(request, crate::raft::RaftMessageProtocol::ReplicaControlV1)
+            .await
     }
 
     /// Witness nodes do not participate in EC replication.

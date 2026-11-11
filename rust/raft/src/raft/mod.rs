@@ -75,10 +75,12 @@ pub use state_machine::{
 pub use membership_policy::MembershipPolicy;
 #[cfg(all(feature = "grpc", has_protos))]
 pub(crate) use node::MemberRegistration;
+#[cfg(all(feature = "grpc", has_protos))]
+pub use node::{PreparedReplicaControl, ReplicaPreparationError};
 #[cfg(feature = "consensus")]
 pub use node::{
-    RaftConfig, RaftMsg, StorageActivationView, StorageSubmission, ZoneConsensus,
-    ZoneConsensusDriver,
+    RaftConfig, RaftMessageProtocol, RaftMsg, StorageActivationView, StorageSubmission,
+    ZoneConsensus, ZoneConsensusDriver,
 };
 #[cfg(feature = "consensus")]
 pub(crate) use proposal::PROPOSAL_TIMEOUT_SECS;

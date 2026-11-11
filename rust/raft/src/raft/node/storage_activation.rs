@@ -32,6 +32,14 @@ impl StorageActivationView {
     }
 }
 
+/// The transport dialect attached to one inbound Raft exchange.
+/// The owning driver checks it against its durable local reader requirement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RaftMessageProtocol {
+    Legacy,
+    ReplicaControlV1,
+}
+
 /// A typed proposal constructed by its native storage authority.
 /// Admission metadata remains separate from the durable command encoding.
 pub struct StorageSubmission {
@@ -41,12 +49,42 @@ pub struct StorageSubmission {
 }
 
 impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
-    pub(super) fn prepare_replica_control_reader(&self) -> Result<()> {
+    pub(super) fn prepare_replica_control_reader(&mut self) -> Result<()> {
         self.config.membership_policy.require_managed()?;
         if self.failed {
             return Err(RaftError::InvalidState("Raft driver has failed".into()));
         }
-        self.raw_node.store().prepare_replica_control_reader()
+        if !self.replica_control_reader_prepared {
+            self.raw_node.store().prepare_replica_control_reader()?;
+            self.replica_control_reader_prepared = true;
+        }
+        Ok(())
+    }
+
+    /// The outbound dialect follows the original durable reader floor.
+    /// This derived driver cache is initialized from storage on every boot.
+    pub fn raft_message_protocol(&self) -> RaftMessageProtocol {
+        if self.replica_control_reader_prepared {
+            RaftMessageProtocol::ReplicaControlV1
+        } else {
+            RaftMessageProtocol::Legacy
+        }
+    }
+
+    pub(super) fn admit_raft_protocol(&mut self, protocol: RaftMessageProtocol) -> Result<()> {
+        self.config.membership_policy.require_managed()?;
+        if self.failed {
+            return Err(RaftError::InvalidState("Raft driver has failed".into()));
+        }
+        match protocol {
+            RaftMessageProtocol::ReplicaControlV1 => self.prepare_replica_control_reader(),
+            RaftMessageProtocol::Legacy if self.replica_control_reader_prepared => {
+                Err(RaftError::UnsupportedOperation(
+                    "prepared reader requires replica-control transport",
+                ))
+            }
+            RaftMessageProtocol::Legacy => Ok(()),
+        }
     }
 
     pub(super) fn storage_activation_view(&self) -> Result<StorageActivationView> {
