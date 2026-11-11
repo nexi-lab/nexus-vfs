@@ -37,8 +37,6 @@ jobs:
         run: 'cargo test --locked -p raft@0.1.0 --test test_protected_zone_metadata -- record_wakeup::'
       - name: Owned WAL I/O and background retirement on the native filesystem
         run: 'cargo test --locked -p raft@0.1.0 --test test_protected_zone_metadata -- record_wal::'
-      - name: Trusted Kernel WAL admission and platform refusal
-        run: 'cargo test --locked -p raft@0.1.0 --test test_protected_zone_metadata -- record_wal_service::'
 
   # CAS has a different kernel feature/build graph. On Windows, compiling it
   # after both completed bootstrap suites exhausted the 25-minute job budget
@@ -75,6 +73,8 @@ jobs:
         run: cargo test --locked -p kernel --test batch_write_outcomes
       - name: Durable CAS ObjectStore composition
         run: cargo test -p backends --no-default-features --features driver-cas-local --test cas_durable_backend --test zone_cas_local
+      - name: Trusted Kernel WAL admission and platform refusal
+        run: cargo test --locked -p nexus-cluster --features driver-cas-local --test owned_wal_storage
       - name: Logical file size across CAS manifest and partial writes
         run: cargo test --locked -p backends --no-default-features --features driver-cas-local,driver-path-local,driver-local-connector --lib storage::cas_local::tests::manifest_shaped_content_keeps_its_logical_size_after_partial_writes
 

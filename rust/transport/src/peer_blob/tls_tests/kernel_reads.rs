@@ -1,5 +1,6 @@
 //! Kernel mount routing through the production peer adapter and real mTLS.
 use super::*;
+use kernel::kernel::syscall::KernelSyscall;
 use kernel::kernel::{Kernel, OperationContext};
 use kernel::meta_store::{FileMetadata, LocalMetaStore, MetaStore, DT_REG};
 
@@ -55,15 +56,12 @@ fn kernel_file_reads_keep_scope_and_backing_path_across_aliases() {
         &fixture.address,
     );
     assert_eq!(
-        kernel
-            .sys_read("/visible-a/shared", &ctx, 0, 0)
+        KernelSyscall::sys_read(&kernel, "/visible-a/shared", &ctx, 0, 0)
             .unwrap()
             .data,
         Some(BODY.to_vec())
     );
-    let error = kernel
-        .sys_read("/visible-b/shared", &ctx, 0, 0)
-        .unwrap_err();
+    let error = KernelSyscall::sys_read(&kernel, "/visible-b/shared", &ctx, 0, 0).unwrap_err();
     assert!(
         error
             .to_string()
@@ -99,7 +97,7 @@ fn kernel_file_reads_refuse_peers_without_scoped_content() {
         &fixture.address,
     );
     let ctx = OperationContext::new("reader", "root", true, None, true);
-    let error = kernel.sys_read("/visible/shared", &ctx, 0, 0).unwrap_err();
+    let error = KernelSyscall::sys_read(&kernel, "/visible/shared", &ctx, 0, 0).unwrap_err();
     assert!(
         error
             .to_string()

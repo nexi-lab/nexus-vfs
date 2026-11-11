@@ -1,10 +1,53 @@
 //! Trusted Kernel admission over the actual native CAS and persistent Raft store.
 
-use super::*;
 use backends::storage::cas_local::CasLocalBackend;
 use kernel::kernel::convenience::{KernelConvenience, MountOptions};
 use kernel::kernel::syscall::KernelSyscall;
 use kernel::kernel::{Kernel, OperationContext};
+use kernel::meta_store::MetaStore;
+#[cfg(target_os = "linux")]
+use kernel::meta_store::{FileMetadata, RecordProtectionResult};
+use nexus_raft::zone_meta_store::ZoneMetaStore;
+use nexus_raft::ZoneManager;
+use std::sync::Arc;
+use std::time::Duration;
+
+struct Runtime(Arc<ZoneManager>);
+
+impl Runtime {
+    fn open(directory: &std::path::Path) -> Self {
+        let manager = ZoneManager::isolated(directory.to_str().unwrap()).unwrap();
+        let zone = manager.create_zone("root", vec![]).unwrap();
+        assert!(zone.wait_for_leader(Duration::from_secs(10)));
+        Self(manager)
+    }
+
+    fn store(&self, mount: &str, subtree: &str) -> ZoneMetaStore {
+        let zone = self.0.get_zone("root").unwrap();
+        ZoneMetaStore::new_with_subtree(
+            zone.consensus_node().clone(),
+            self.0.runtime_handle(),
+            mount.into(),
+            subtree.into(),
+        )
+    }
+}
+
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        self.0.shutdown();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn image(content: &str) -> FileMetadata {
+    FileMetadata {
+        content_id: Some(content.into()),
+        size: 41,
+        owner_id: Some("agent-owner".into()),
+        ..Default::default()
+    }
+}
 
 #[path = "record_wal_service/global_fallback.rs"]
 mod global_fallback;

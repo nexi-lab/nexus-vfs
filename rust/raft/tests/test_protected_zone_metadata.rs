@@ -23,8 +23,6 @@ mod record_io;
 mod record_wakeup;
 #[path = "protected_zone_metadata/record_wal.rs"]
 mod record_wal;
-#[path = "protected_zone_metadata/record_wal_service.rs"]
-mod record_wal_service;
 
 struct Runtime(Arc<ZoneManager>);
 
