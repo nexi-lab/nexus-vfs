@@ -52,6 +52,8 @@ jobs:
         os: [ubuntu-22.04, windows-2022, macos-15]
     env:
       CARGO_BUILD_JOBS: 1
+      # Functional storage tests use the unoptimized workspace test profile.
+      CARGO_PROFILE_TEST_OPT_LEVEL: 0
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-protoc
