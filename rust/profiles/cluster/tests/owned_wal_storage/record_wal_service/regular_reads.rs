@@ -288,6 +288,15 @@ fn kernel_batch_read_rechecks_consumer_enrollment_after_ordinary_lead_io() {
 
 #[test]
 fn kernel_peer_read_observes_only_the_captured_store_after_mount_replacement() {
+    captured_peer_read(false);
+}
+
+#[test]
+fn kernel_scoped_peer_read_observes_only_the_captured_store_after_mount_replacement() {
+    captured_peer_read(true);
+}
+
+fn captured_peer_read(scoped: bool) {
     let a_dir = tempfile::tempdir().unwrap();
     let b_dir = tempfile::tempdir().unwrap();
     let a_backend = Arc::new(CountedPath::new(&a_dir.path().join("content")));
@@ -333,12 +342,15 @@ fn kernel_peer_read_observes_only_the_captured_store_after_mount_replacement() {
     // Use the actual peer-served duality flag; local reads skip observation.
     let mut peer = service();
     peer.propagates_cross_node = true;
-    assert_eq!(
+    let bytes = if scoped {
+        a.kernel.read_local_zone_content("root", &path).unwrap()
+    } else {
         KernelSyscall::sys_read(a.kernel.as_ref(), &path, &peer, 0, 0)
             .unwrap()
-            .data,
-        Some(b"untracked original A bytes".to_vec())
-    );
+            .data
+            .unwrap()
+    };
+    assert_eq!(bytes, b"untracked original A bytes");
     assert!(
         a_backend.after_read.lock().unwrap().is_none(),
         "backend-read replacement cut was not reached"

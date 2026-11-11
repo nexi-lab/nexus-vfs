@@ -106,6 +106,7 @@ pub(crate) use stream_address::StreamAddress;
 mod locks;
 mod mount;
 mod observability;
+mod peer_content;
 mod plugins;
 pub mod syscall;
 pub mod syscall_async;

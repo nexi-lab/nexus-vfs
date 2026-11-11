@@ -35,12 +35,12 @@ fn cold_peer_reads_preserve_owning_zone() {
     kernel.set_peer_client(peer.clone());
     assert_eq!(
         kernel
-            .read_cold_segment("/history", "agent-alice", "same-hash", "writer:2028")
+            .read_cold_segment("/history", "agent-alice", 8, "same-hash", "writer:2028")
             .unwrap(),
         b"cold segment"
     );
     assert!(kernel
-        .read_cold_segment("/history", "agent-bob", "same-hash", "writer:2028")
+        .read_cold_segment("/history", "agent-bob", 8, "same-hash", "writer:2028")
         .is_err());
     assert_eq!(peer.legacy_calls.load(Ordering::SeqCst), 0);
     assert_eq!(
@@ -49,9 +49,13 @@ fn cold_peer_reads_preserve_owning_zone() {
             (
                 "writer:2028".into(),
                 "agent-alice".into(),
-                "same-hash".into()
+                "/__stream_segments__/agent-alice/history/8".into()
             ),
-            ("writer:2028".into(), "agent-bob".into(), "same-hash".into()),
+            (
+                "writer:2028".into(),
+                "agent-bob".into(),
+                "/__stream_segments__/agent-bob/history/8".into()
+            ),
         ]
     );
 }
@@ -69,7 +73,7 @@ fn cold_peer_reads_refuse_an_unscoped_client() {
     let peer = Arc::new(LegacyPeer(AtomicUsize::new(0)));
     kernel.set_peer_client(peer.clone());
     let error = kernel
-        .read_cold_segment("/history", "agent-alice", "same-hash", "writer:2028")
+        .read_cold_segment("/history", "agent-alice", 8, "same-hash", "writer:2028")
         .unwrap_err();
     assert!(error.contains("zone-scoped peer content is unavailable"));
     assert_eq!(peer.0.load(Ordering::SeqCst), 0);

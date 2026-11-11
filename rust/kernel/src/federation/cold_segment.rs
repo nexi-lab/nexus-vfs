@@ -22,6 +22,9 @@
 
 use std::sync::{Arc, Weak};
 
+mod address;
+pub use address::ColdSegmentAddress;
+
 use crate::abc::object_store::ObjectStore;
 use crate::core::stream::wal::{ColdSegmentStore, SealPolicy};
 use crate::kernel::{Kernel, OperationContext};
@@ -139,11 +142,14 @@ impl Kernel {
         &self,
         stream_path: &str,
         zone_id: &str,
+        base: u64,
         content_id: &str,
         origin: &str,
     ) -> Result<Vec<u8>, String> {
         self.read_cold_segment_from(
+            stream_path,
             zone_id,
+            base,
             content_id,
             origin,
             self.stream_content_backend(stream_path, zone_id),
@@ -152,7 +158,9 @@ impl Kernel {
 
     fn read_cold_segment_from(
         &self,
+        stream_path: &str,
         zone_id: &str,
+        base: u64,
         content_id: &str,
         origin: &str,
         backend: Option<Arc<dyn ObjectStore>>,
@@ -181,7 +189,11 @@ impl Kernel {
             if !is_self {
                 return self
                     .peer_client_arc()
-                    .fetch_in_zone(origin, zone_id, content_id)
+                    .fetch_in_zone(
+                        origin,
+                        zone_id,
+                        &ColdSegmentAddress { stream_path, base }.key(zone_id),
+                    )
                     .map_err(|e| {
                         format!("peer fetch cold segment {content_id} from {origin}: {e}")
                     });
@@ -275,7 +287,7 @@ fn write_cold_segment_to(
     );
     // Path-addressed caches include the owning zone; CAS derives its address
     // from the bytes. Both handles retain the same original segment format.
-    let seg_key = format!("/__stream_segments__/{zone_id}{stream_path}/{base}");
+    let seg_key = ColdSegmentAddress { stream_path, base }.key(zone_id);
     let wr = backend
         .write_content(bytes, &seg_key, &ctx, 0)
         .map_err(|e| format!("write cold segment ({stream_path} base {base}): {e:?}"))?;
@@ -329,15 +341,21 @@ impl ColdSegmentStore for KernelColdSegmentStore {
     fn read_segment(
         &self,
         stream_id: &str,
+        base: u64,
         content_id: &str,
         origin: &str,
     ) -> Result<Vec<u8>, String> {
         let k = self.kernel.upgrade().ok_or("kernel dropped")?;
         match self.captured_backend(stream_id)? {
-            Some(backend) => {
-                k.read_cold_segment_from(&self.zone, content_id, origin, Some(backend))
-            }
-            None => k.read_cold_segment(stream_id, &self.zone, content_id, origin),
+            Some(backend) => k.read_cold_segment_from(
+                stream_id,
+                &self.zone,
+                base,
+                content_id,
+                origin,
+                Some(backend),
+            ),
+            None => k.read_cold_segment(stream_id, &self.zone, base, content_id, origin),
         }
     }
 }

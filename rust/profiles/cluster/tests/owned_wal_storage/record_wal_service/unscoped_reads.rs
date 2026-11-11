@@ -175,6 +175,62 @@ fn kernel_owned_wal_excludes_generic_regular_reads_and_keeps_independent_content
 }
 
 #[test]
+fn kernel_owned_content_refuses_scoped_peer_reads_and_keeps_independent_content() {
+    const CONTENT: &str = "/sessions/service-session/completion";
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = Fixture::open(directory.path(), true);
+    let owner = fixture.enroll();
+    for path in [CONTENT, "/ordinary"] {
+        KernelSyscall::sys_write(fixture.kernel.as_ref(), path, &service(), b"same bytes", 0)
+            .unwrap();
+        assert_eq!(
+            fixture
+                .kernel
+                .read_local_zone_content("root", path)
+                .unwrap(),
+            b"same bytes"
+        );
+    }
+    fixture
+        .kernel
+        .protect_record_content(CONTENT, &service())
+        .unwrap();
+    fixture
+        .kernel
+        .bind_record_content_owner(CONTENT, OWNER, &service(), &owner)
+        .unwrap();
+    scoped_refusal(fixture.kernel.read_local_zone_content("root", CONTENT));
+    assert_eq!(
+        fixture
+            .kernel
+            .read_local_zone_content("root", "/ordinary")
+            .unwrap(),
+        b"same bytes"
+    );
+    assert_eq!(
+        fixture
+            .kernel
+            .read_guarded_content(CONTENT, &service(), &owner)
+            .unwrap()
+            .unwrap()
+            .content,
+        b"same bytes"
+    );
+    fixture
+        .kernel
+        .retire_record_content_owner(OWNER, &service(), &owner)
+        .unwrap();
+    scoped_refusal(fixture.kernel.read_local_zone_content("root", CONTENT));
+    assert_eq!(
+        fixture
+            .kernel
+            .read_local_zone_content("root", "/ordinary")
+            .unwrap(),
+        b"same bytes"
+    );
+}
+
+#[test]
 fn kernel_owned_wal_excludes_retained_unowned_handles_after_binding_and_restart() {
     let directory = tempfile::tempdir().unwrap();
     let fixture = Fixture::open(directory.path(), true);

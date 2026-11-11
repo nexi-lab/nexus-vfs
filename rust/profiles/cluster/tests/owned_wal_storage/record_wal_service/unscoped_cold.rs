@@ -29,7 +29,7 @@ impl ColdSegmentStore for NativeCold {
             .map_err(|error| format!("{error:?}"))
     }
 
-    fn read_segment(&self, _: &str, content_id: &str, _: &str) -> Result<Vec<u8>, String> {
+    fn read_segment(&self, _: &str, _: u64, content_id: &str, _: &str) -> Result<Vec<u8>, String> {
         self.reads.fetch_add(1, Ordering::SeqCst);
         self.backend
             .read_content(content_id, &service())
