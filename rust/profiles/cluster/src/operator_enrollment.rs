@@ -196,13 +196,18 @@ fn prepare(
         claim.version == 1 && uuid(&claim.operation_id) && uuid(&claim.thread_id),
         "invalid operation/thread identity"
     );
-    let suffix = claim.actor.strip_prefix("codex-").unwrap_or_default();
+    // Each native frontend (Codex thread, Claude Code session) mints its own
+    // random actor under its frontend's prefix; nothing else is issuable.
+    let suffix = ["codex-", "claude-"]
+        .iter()
+        .find_map(|prefix| claim.actor.strip_prefix(prefix))
+        .unwrap_or_default();
     ensure!(
         suffix.len() == 32
             && suffix
                 .bytes()
                 .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
-        "grant permits only codex-<32 lowercase hex> actors"
+        "grant permits only codex-<32 lowercase hex> or claude-<32 lowercase hex> actors"
     );
     ensure!(
         claim.workspace.is_absolute(),
