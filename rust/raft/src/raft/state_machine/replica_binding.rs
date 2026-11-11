@@ -17,7 +17,8 @@ impl Command {
         match self {
             Self::ApplyReplicaBinding(_)
             | Self::ReserveNodeIdentity(_)
-            | Self::ApplyReplicaIssuance(_) => true,
+            | Self::ApplyReplicaIssuance(_)
+            | Self::ActivateReplicaControl { .. } => true,
             Self::PutControlState { namespace, .. }
             | Self::DeleteControlState { namespace, .. } => namespace == NAMESPACE,
             _ => false,

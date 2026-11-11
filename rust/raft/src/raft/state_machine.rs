@@ -26,11 +26,13 @@ mod metadata_rename;
 mod node_identity;
 mod protected_metadata;
 mod record_guard;
+mod replica_activation;
 mod replica_binding;
 mod replica_issuance;
 mod storage_admission;
 pub use conditional_metadata::VersionedMetadata;
 pub use record_guard::GuardedRecordMutation;
+pub use replica_activation::ReplicaControlActivation;
 
 const OWNED_CONTROL_NAMESPACES: &[&str] = &[
     conditional_metadata::NAMESPACE,
@@ -334,6 +336,8 @@ pub enum Command {
     /// Compare issuer/binding authority and publish the original credential
     /// receipt in the same transaction. Appended for log compatibility.
     ApplyReplicaIssuance(Box<contracts::replica_credential::ReplicaIssuanceRequest>),
+    /// Commit the one-way reader-protocol activation and its original operation.
+    ActivateReplicaControl { operation_id: String },
 }
 
 impl Command {
@@ -415,6 +419,11 @@ pub enum CommandResult {
 /// File content is NOT stored in the state machine - it remains in
 /// the content-addressable storage (CAS) backend (S3, GCS, local).
 pub trait StateMachine: Send + Sync {
+    /// The committed activation fact; a transport probe is not a stored fact.
+    fn replica_control_activation(&self) -> Result<Option<ReplicaControlActivation>> {
+        Ok(None)
+    }
+
     /// Check durable storage requirements against the selected replica policy.
     fn validate_membership_policy(&self, _policy: super::MembershipPolicy) -> Result<()> {
         Ok(())
@@ -1928,7 +1937,8 @@ impl FullStateMachine {
                 | Command::AdmitRecordIoOwner { .. } => Err(super::RaftError::InvalidState(
                 "versioned metadata requires a Raft-committed transaction".into(),
             )),
-            Command::ApplyReplicaBinding(_) | Command::ReserveNodeIdentity(_) | Command::ApplyReplicaIssuance(_) => Err(super::RaftError::InvalidState(
+            Command::ApplyReplicaBinding(_) | Command::ReserveNodeIdentity(_) | Command::ApplyReplicaIssuance(_)
+                | Command::ActivateReplicaControl { .. } => Err(super::RaftError::InvalidState(
                 "replica binding requires a Raft-committed transaction".into(),
             )),
             Command::PutControlState {
@@ -2342,6 +2352,9 @@ impl FullStateMachine {
             Command::ApplyReplicaBinding(request) => self.apply_replica_binding(txn, request),
             Command::ReserveNodeIdentity(request) => self.reserve_node_identity(txn, request),
             Command::ApplyReplicaIssuance(request) => self.apply_replica_issuance(txn, request),
+            Command::ActivateReplicaControl { operation_id } => {
+                self.activate_replica_control_in_txn(txn, operation_id)
+            }
 
             Command::WriteVersionedMetadata {
                 key,
@@ -2485,6 +2498,10 @@ impl FullStateMachine {
 }
 
 impl StateMachine for FullStateMachine {
+    fn replica_control_activation(&self) -> Result<Option<ReplicaControlActivation>> {
+        self.read_replica_control_activation()
+    }
+
     fn validate_membership_policy(&self, policy: super::MembershipPolicy) -> Result<()> {
         self.validate_owned_storage_policy(policy)
     }
@@ -2495,7 +2512,7 @@ impl StateMachine for FullStateMachine {
         policy: super::MembershipPolicy,
     ) -> Result<()> {
         let snapshot: Snapshot = bincode::deserialize(data)?;
-        Self::validate_owned_snapshot_policy(&snapshot, policy)
+        self.validate_owned_snapshot_policy(&snapshot, policy)
     }
 
     fn requires_strong_consistency(&self, command: &Command) -> Result<bool> {
@@ -2849,6 +2866,10 @@ impl StateMachine for FullStateMachine {
 
     fn restore_snapshot(&mut self, data: &[u8]) -> Result<()> {
         let snapshot: Snapshot = bincode::deserialize(data)?;
+
+        // Check the reader format and original activation before replacing any
+        // durable state. The owning driver also checks its membership policy.
+        self.validate_owned_snapshot_policy(&snapshot, super::MembershipPolicy::FixedLocal)?;
 
         // Atomic restore for metadata: clear + repopulate in a single
         // redb transaction. Advisory locks are in-memory only — they

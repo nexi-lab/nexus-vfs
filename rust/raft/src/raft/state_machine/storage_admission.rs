@@ -16,6 +16,7 @@ pub(super) enum StorageFormat {
     ReplicaBinding,
     NodeIdentity,
     ReplicaIssuance,
+    ReplicaControlActive,
 }
 
 impl StorageFormat {
@@ -27,10 +28,11 @@ impl StorageFormat {
             Self::ReplicaBinding => b"replica-binding-v1",
             Self::NodeIdentity => b"node-identity-v1",
             Self::ReplicaIssuance => b"replica-issuance-v1",
+            Self::ReplicaControlActive => b"managed-replica-control-v2",
         }
     }
 
-    fn decode(bytes: Option<&[u8]>) -> Result<Option<Self>> {
+    pub(super) fn decode(bytes: Option<&[u8]>) -> Result<Option<Self>> {
         match bytes {
             None => Ok(None),
             Some(b"conditional-only-v1") => Ok(Some(Self::Conditional)),
@@ -39,6 +41,7 @@ impl StorageFormat {
             Some(b"replica-binding-v1") => Ok(Some(Self::ReplicaBinding)),
             Some(b"node-identity-v1") => Ok(Some(Self::NodeIdentity)),
             Some(b"replica-issuance-v1") => Ok(Some(Self::ReplicaIssuance)),
+            Some(b"managed-replica-control-v2") => Ok(Some(Self::ReplicaControlActive)),
             Some(_) => Err(storage_error("unsupported control storage format")),
         }
     }
@@ -46,9 +49,10 @@ impl StorageFormat {
     fn validate_policy(self, policy: MembershipPolicy) -> Result<()> {
         if policy != MembershipPolicy::FixedLocal {
             let records = match self {
-                Self::ReplicaBinding | Self::NodeIdentity | Self::ReplicaIssuance => {
-                    "replica-binding records"
-                }
+                Self::ReplicaBinding
+                | Self::NodeIdentity
+                | Self::ReplicaIssuance
+                | Self::ReplicaControlActive => "replica-binding records",
                 _ => "protected records",
             };
             return Err(RaftError::Config(format!(
@@ -59,7 +63,7 @@ impl StorageFormat {
     }
 }
 
-fn requirement_key() -> Vec<u8> {
+pub(super) fn requirement_key() -> Vec<u8> {
     // Preserve the existing reader admission key. Earlier readers reject an
     // unknown value here before admitting storage or restoring a snapshot.
     control_key(
@@ -116,6 +120,7 @@ impl FullStateMachine {
     }
 
     pub(super) fn validate_owned_storage_policy(&self, policy: MembershipPolicy) -> Result<()> {
+        self.read_replica_control_activation()?;
         validate_requirement(
             self.control_state.get(&requirement_key())?.as_deref(),
             policy,
@@ -132,10 +137,28 @@ impl FullStateMachine {
     }
 
     pub(super) fn validate_owned_snapshot_policy(
+        &self,
         snapshot: &Snapshot,
         policy: MembershipPolicy,
     ) -> Result<()> {
         let key = String::from_utf8(requirement_key()).map_err(storage_error)?;
+        let activation_key = String::from_utf8(super::replica_activation::activation_key())
+            .map_err(storage_error)?;
+        let incoming = super::replica_activation::decode_activation(
+            snapshot.control_state.get(&key).map(Vec::as_slice),
+            snapshot
+                .control_state
+                .get(&activation_key)
+                .map(Vec::as_slice),
+        )?;
+        if self
+            .read_replica_control_activation()?
+            .is_some_and(|current| incoming.as_ref() != Some(&current))
+        {
+            return Err(RaftError::Config(
+                "snapshot changes the committed replica activation".into(),
+            ));
+        }
         validate_requirement(snapshot.control_state.get(&key).map(Vec::as_slice), policy)?;
         validate_owned_namespaces(policy, |prefix| {
             Ok(snapshot
