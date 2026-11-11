@@ -73,7 +73,7 @@ pub(crate) use member_registration::MemberRegistration;
 mod read_index;
 use read_index::{PendingRead, ReadContext, ReadRequestIds};
 mod storage_activation;
-pub use storage_activation::{StorageActivationView, StorageSubmission};
+pub use storage_activation::{RaftMessageProtocol, StorageActivationView, StorageSubmission};
 #[cfg(all(test, feature = "grpc", has_protos))]
 mod storage_submission_tests;
 
@@ -330,6 +330,12 @@ impl Membership {
 pub enum RaftMsg {
     /// Feed an inbound Raft message (from a peer) into raft-rs.
     Step { msg: Message },
+    /// A network exchange acknowledges the driver's serialized admission.
+    StepTransport {
+        msg: Message,
+        protocol: RaftMessageProtocol,
+        tx: oneshot::Sender<Result<()>>,
+    },
     /// Propose a client command for replication.
     Propose {
         data: Vec<u8>,
@@ -525,6 +531,8 @@ pub struct ZoneConsensusDriver<S: StateMachine + 'static> {
     /// Process-local identity and configuration generation for probe results.
     incarnation: Arc<()>,
     membership_epoch: Option<u64>,
+    /// Derived from the mandatory Raft reader floor; updated after its commit.
+    replica_control_reader_prepared: bool,
     /// Shared state machine (shared with handle for reads).
     state_machine: Arc<RwLock<S>>,
     /// Node configuration.
@@ -881,11 +889,13 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             .map(|f| f.saturating_sub(1))
             .unwrap_or(0);
 
+        let replica_control_reader_prepared = raw_node.store().replica_control_reader_required()?;
         let read_request_ids = ReadRequestIds::new(config.id);
         let driver = ZoneConsensusDriver {
             raw_node,
             incarnation: Arc::new(()),
             membership_epoch: Some(0),
+            replica_control_reader_prepared,
             state_machine,
             config,
             pending: HashMap::new(),
@@ -1872,6 +1882,32 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
     /// correct behavior: the peer's gRPC call blocks until the driver
     /// can accept the message.
     pub async fn step(&self, msg: Message) -> Result<()> {
+        self.validate_step_message(&msg).await?;
+        self.msg_tx
+            .send(RaftMsg::Step { msg })
+            .await
+            .map_err(|_| RaftError::ChannelClosed)
+    }
+
+    /// Acknowledge network admission after the owning driver checks the current
+    /// reader floor. The response does not acknowledge persistence or commit of
+    /// the Raft message. Cancellation leaves normal Raft retransmission intact.
+    #[cfg(any(all(feature = "grpc", has_protos), test))]
+    pub(crate) async fn step_transport(
+        &self,
+        msg: Message,
+        protocol: RaftMessageProtocol,
+    ) -> Result<()> {
+        self.validate_step_message(&msg).await?;
+        let (tx, rx) = oneshot::channel();
+        self.msg_tx
+            .send(RaftMsg::StepTransport { msg, protocol, tx })
+            .await
+            .map_err(|_| RaftError::ChannelClosed)?;
+        rx.await.map_err(|_| RaftError::ChannelClosed)?
+    }
+
+    async fn validate_step_message(&self, msg: &Message) -> Result<()> {
         self.config.membership_policy.require_managed()?;
         // ReadIndex also carries entries, whose data is an opaque request
         // context. Only proposal/append entries contain serialized commands.
@@ -1892,10 +1928,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
                     self.config.membership_policy,
                 )?;
         }
-        self.msg_tx
-            .send(RaftMsg::Step { msg })
-            .await
-            .map_err(|_| RaftError::ChannelClosed)
+        Ok(())
     }
 
     /// Campaign to become leader (sends through channel to driver).
@@ -2107,19 +2140,12 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
     fn handle_msg(&mut self, msg: RaftMsg) {
         match msg {
             RaftMsg::Step { msg } => {
-                tracing::trace!(
-                    from = msg.from,
-                    to = msg.to,
-                    msg_type = ?msg.get_msg_type(),
-                    "raft.driver.step"
-                );
-                let from = msg.from;
-                if let Err(e) = self.raw_node.step(msg) {
-                    tracing::warn!("raft step error: {}", e);
+                if let Err(error) = self.step_message(msg, RaftMessageProtocol::Legacy) {
+                    tracing::warn!(%error, "raft step refused");
                 }
-                if from != 0 && from != self.config.id && from == self.raw_node.raft.leader_id {
-                    self.leader_contact.touch();
-                }
+            }
+            RaftMsg::StepTransport { msg, protocol, tx } => {
+                let _ = tx.send(self.step_message(msg, protocol));
             }
             RaftMsg::Propose { data, tx, .. } => self.propose_data(data, tx),
             RaftMsg::ProposeStorage { submission, tx } => {
@@ -2187,6 +2213,23 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                 let _ = tx.send(read_membership(&self.raw_node));
             }
         }
+    }
+
+    fn step_message(&mut self, msg: Message, protocol: RaftMessageProtocol) -> Result<()> {
+        self.admit_raft_protocol(protocol)?;
+        tracing::trace!(from = msg.from, to = msg.to, msg_type = ?msg.get_msg_type(),
+            ?protocol, "raft.driver.step");
+        let from = msg.from;
+        // The RPC acknowledges protocol admission. Raft responses, emitted by
+        // advance after persistence, carry consensus acknowledgement. Preserve
+        // raft-rs's independent rejection of stale or unknown-peer responses.
+        if let Err(error) = self.raw_node.step(msg) {
+            tracing::warn!(%error, "raft step error");
+        }
+        if from != 0 && from != self.config.id && from == self.raw_node.raft.leader_id {
+            self.leader_contact.touch();
+        }
+        Ok(())
     }
 
     fn propose_data(&mut self, data: Vec<u8>, tx: oneshot::Sender<Result<CommandResult>>) {

@@ -11,6 +11,7 @@ use tempfile::TempDir;
 
 mod activation;
 mod reader_preparation;
+mod reader_transport;
 
 fn node(
     policy: MembershipPolicy,

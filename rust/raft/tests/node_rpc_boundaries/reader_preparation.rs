@@ -8,7 +8,7 @@ use nexus_raft::{
     },
 };
 
-fn node_tls(ca: &[u8], key: &[u8], id: u64) -> TlsConfig {
+pub(super) fn node_tls(ca: &[u8], key: &[u8], id: u64) -> TlsConfig {
     let (cert_pem, key_pem) = generate_node_cert(id, "root", ca, key, &[], None).unwrap();
     TlsConfig {
         ca_pem: ca.to_vec(),
@@ -17,14 +17,14 @@ fn node_tls(ca: &[u8], key: &[u8], id: u64) -> TlsConfig {
     }
 }
 
-fn pool(tls: TlsConfig) -> RaftClientPool {
+pub(super) fn pool(tls: TlsConfig) -> RaftClientPool {
     RaftClientPool::with_config(ClientConfig {
         tls: Arc::new(std::sync::RwLock::new(Some(tls))),
         ..Default::default()
     })
 }
 
-async fn reopened(directory: &std::path::Path) -> RaftStorage {
+pub(super) async fn reopened(directory: &std::path::Path) -> RaftStorage {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match RaftStorage::open(directory.join("root/raft")) {

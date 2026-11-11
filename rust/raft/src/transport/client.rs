@@ -455,6 +455,30 @@ impl RaftClient {
         decode_step_response(response.into_inner())
     }
 
+    /// Send a required replica-control exchange on the exact Node channel.
+    /// Every reconnect uses the same RPC; an older method table refuses it.
+    pub async fn step_replica_control_v1(
+        &mut self,
+        message_bytes: Vec<u8>,
+        zone_id: String,
+        sender_address: String,
+    ) -> Result<()> {
+        if !self.is_node_channel {
+            return Err(TransportError::Connection(
+                "replica-control transport requires an exact cluster Node channel".into(),
+            ));
+        }
+        let response = self
+            .inner
+            .step_replica_control_v1(StepMessageRequest {
+                message: message_bytes,
+                zone_id,
+                sender_address,
+            })
+            .await?;
+        decode_step_response(response.into_inner())
+    }
+
     /// Send a batch of EC replication entries to this peer.
     ///
     /// Returns the highest sequence number the peer successfully applied.

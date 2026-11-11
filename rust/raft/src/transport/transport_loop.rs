@@ -28,7 +28,7 @@
 use super::client::RaftClientPool;
 use super::proto::nexus::raft::EcReplicationEntry;
 use super::{NodeAddress, SharedPeerMap};
-use crate::raft::{StateMachine, ZoneConsensusDriver};
+use crate::raft::{RaftMessageProtocol, StateMachine, ZoneConsensusDriver};
 use protobuf::Message as ProtobufV2Message;
 use raft::eraftpb::MessageType;
 use std::collections::{HashMap, HashSet};
@@ -674,6 +674,7 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
     /// Failed sends log a warning and evict the client from the pool
     /// (reconnected on next attempt).
     fn send_messages_fire_and_forget(&mut self, messages: Vec<raft::eraftpb::Message>) {
+        let protocol = self.driver.raft_message_protocol();
         // One shared lock resolves the whole batch; only the routes the batch
         // uses are cloned out.
         let routed: Vec<(NodeAddress, raft::eraftpb::Message)> = {
@@ -724,7 +725,7 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
             tokio::spawn(async move {
                 let result = tokio::time::timeout(
                     RAFT_SEND_TIMEOUT,
-                    send_raft_message(&client_pool, target_id, &addr, msg, zone_id, self_address),
+                    send_raft_message(&client_pool, &addr, msg, zone_id, self_address, protocol),
                 )
                 .await;
 
@@ -1113,25 +1114,32 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
 /// Send a single Raft message to a peer (used by parallel send tasks).
 async fn send_raft_message(
     client_pool: &RaftClientPool,
-    target_id: u64,
     addr: &NodeAddress,
     msg: raft::eraftpb::Message,
     zone_id: String,
     self_address: String,
+    protocol: RaftMessageProtocol,
 ) -> std::result::Result<(), String> {
+    let target_id = addr.id;
     let bytes = msg
         .write_to_bytes()
         .map_err(|e| format!("serialize error for node {}: {}", target_id, e))?;
 
-    let mut client = client_pool
-        .get(addr)
-        .await
-        .map_err(|e| format!("connect to node {} ({}): {}", target_id, addr.endpoint, e))?;
+    let mut client = match protocol {
+        RaftMessageProtocol::Legacy => client_pool.get(addr).await,
+        RaftMessageProtocol::ReplicaControlV1 => client_pool.get_node(addr).await,
+    }
+    .map_err(|e| format!("connect to node {} ({}): {}", target_id, addr.endpoint, e))?;
 
-    client
-        .step_message(bytes, zone_id, self_address)
-        .await
-        .map_err(|e| format!("send to node {} ({}): {}", target_id, addr.endpoint, e))
+    match protocol {
+        RaftMessageProtocol::Legacy => client.step_message(bytes, zone_id, self_address).await,
+        RaftMessageProtocol::ReplicaControlV1 => {
+            client
+                .step_replica_control_v1(bytes, zone_id, self_address)
+                .await
+        }
+    }
+    .map_err(|e| format!("send to node {} ({}): {}", target_id, addr.endpoint, e))
 }
 
 /// Await an EC send future under `timeout` and report the outcome back on the

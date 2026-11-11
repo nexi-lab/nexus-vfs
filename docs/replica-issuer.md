@@ -71,6 +71,14 @@ key. Ordinary Agent credentials, owner replicas and plaintext listeners carry
 their existing data-plane roles rather than storage-format control authority.
 The response acknowledges the original local preparation; member-set validation
 and the versioned replication exchange remain part of activation qualification.
+The prepared driver uses `StepReplicaControlV1` for every subsequent Raft
+exchange. The same driver serializes inbound dialect checks with preparation,
+including messages already waiting in its queue. Full nodes and witnesses
+persist the reader floor before admitting this method; their replies acknowledge
+protocol admission. Raft acknowledgements continue to follow log persistence
+in the original Ready/advance loop. A cold driver derives the required dialect
+from its retained reader floor. Each outbound connection pins the destination's
+Node identity, and every reconnect uses the required method.
 This durable local format upgrade and the replicated activation fact have
 separate purposes: the former defines which program can open the files, while
 the latter enables commands for the zone after authenticated member checks.

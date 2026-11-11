@@ -77,8 +77,8 @@ pub use membership_policy::MembershipPolicy;
 pub(crate) use node::MemberRegistration;
 #[cfg(feature = "consensus")]
 pub use node::{
-    RaftConfig, RaftMsg, StorageActivationView, StorageSubmission, ZoneConsensus,
-    ZoneConsensusDriver,
+    RaftConfig, RaftMessageProtocol, RaftMsg, StorageActivationView, StorageSubmission,
+    ZoneConsensus, ZoneConsensusDriver,
 };
 #[cfg(feature = "consensus")]
 pub(crate) use proposal::PROPOSAL_TIMEOUT_SECS;

@@ -391,6 +391,13 @@ async fn reader_preparation_never_falls_back_after_authenticated_legacy_reconnec
             matches!(error, TransportError::Status(ref status) if status.code() == tonic::Code::Unimplemented)
         );
         assert_eq!(unsupported_calls.load(Ordering::SeqCst), before + 1);
+        let error = client
+            .step_replica_control_v1(message(2, 7), "root".into(), String::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, TransportError::Status(ref status)
+            if status.code() == tonic::Code::Unimplemented));
+        assert_eq!(unsupported_calls.load(Ordering::SeqCst), before + 2);
         assert_eq!(
             legacy_calls.load(Ordering::SeqCst),
             original + 1,
@@ -402,5 +409,5 @@ async fn reader_preparation_never_falls_back_after_authenticated_legacy_reconnec
         task.await.unwrap();
     }
     assert_eq!(legacy_calls.load(Ordering::SeqCst), 2);
-    assert_eq!(unsupported_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(unsupported_calls.load(Ordering::SeqCst), 4);
 }
