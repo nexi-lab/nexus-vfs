@@ -14,7 +14,7 @@ use super::proto::nexus::raft::{
     MintSessionAgentRequest, ProposeRequest, PutMetadata, QueryRequest, RaftCommand, RaftQuery,
     RegisterForeignCaRequest, ReleaseLock, RemoveVoterRequest, RenewSessionAgentRequest,
     ReplicateEntriesRequest, RevokeAgentCertRequest, RevokeKeyRequest, SnapshotEcStateRequest,
-    StepMessageRequest, UnregisterForeignCaRequest,
+    StepMessageRequest, StepMessageResponse, UnregisterForeignCaRequest,
 };
 use super::{NodeAddress, Result, TransportError};
 use std::collections::HashMap;
@@ -308,6 +308,17 @@ pub struct RaftClient {
     inner: ZoneTransportServiceClient<Channel>,
 }
 
+fn decode_step_response(response: StepMessageResponse) -> Result<()> {
+    if !response.success {
+        return Err(TransportError::Rpc(
+            response
+                .error
+                .unwrap_or_else(|| "step_message failed".to_string()),
+        ));
+    }
+    Ok(())
+}
+
 impl RaftClient {
     /// Connect to a Raft node.
     pub async fn connect(endpoint: &str, config: ClientConfig) -> Result<Self> {
@@ -376,16 +387,25 @@ impl RaftClient {
         });
 
         let response = self.inner.step_message(request).await?;
-        let resp = response.into_inner();
+        decode_step_response(response.into_inner())
+    }
 
-        if !resp.success {
-            return Err(TransportError::Rpc(
-                resp.error
-                    .unwrap_or_else(|| "step_message failed".to_string()),
-            ));
-        }
-
-        Ok(())
+    /// Send through the storage-v1 reader boundary on every exchange.
+    /// An unsupported peer or reconnect failure is returned without retrying
+    /// the legacy method. This method grants neither zone nor storage authority.
+    pub async fn step_storage_v1(
+        &mut self,
+        message_bytes: Vec<u8>,
+        zone_id: String,
+        sender_address: String,
+    ) -> Result<()> {
+        let request = tonic::Request::new(StepMessageRequest {
+            message: message_bytes,
+            zone_id,
+            sender_address,
+        });
+        let response = self.inner.step_storage_v1(request).await?;
+        decode_step_response(response.into_inner())
     }
 
     /// Send a batch of EC replication entries to this peer.

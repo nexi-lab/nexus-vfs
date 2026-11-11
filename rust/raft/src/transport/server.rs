@@ -606,18 +606,8 @@ async fn apply_ec_entry(
     }
 }
 
-#[tonic::async_trait]
-impl ZoneTransportService for ZoneTransportServiceImpl {
-    /// Handle a raw raft-rs message forwarded from another node.
-    ///
-    /// Routes by zone_id to the correct Raft group's ZoneConsensus.
-    /// Unknown zones return `NotFound` — the local storage enumeration at
-    /// `PyZoneManager::new` (R15.e) is the authority for which groups this
-    /// node hosts. New dynamic zones arrive via `federation_create_zone`;
-    /// new replicas of existing zones arrive via leader snapshot delivery
-    /// after the ConfChange commits. No side-effectful auto-reopen from
-    /// disk in the message hot path.
-    async fn step_message(
+impl ZoneTransportServiceImpl {
+    async fn dispatch_step(
         &self,
         request: Request<StepMessageRequest>,
     ) -> std::result::Result<Response<StepMessageResponse>, Status> {
@@ -688,6 +678,32 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
             .learn_peer_address(&req.zone_id, peer, &req.sender_address);
 
         step_raft_message(&node, message, &req.zone_id, "").await
+    }
+}
+
+#[tonic::async_trait]
+impl ZoneTransportService for ZoneTransportServiceImpl {
+    /// Handle a raw raft-rs message forwarded from another node.
+    ///
+    /// Routes by zone_id to the correct Raft group's ZoneConsensus.
+    /// Unknown zones return `NotFound` — the local storage enumeration at
+    /// `PyZoneManager::new` (R15.e) is the authority for which groups this
+    /// node hosts. New dynamic zones arrive via `federation_create_zone`;
+    /// new replicas of existing zones arrive via leader snapshot delivery
+    /// after the ConfChange commits. No side-effectful auto-reopen from
+    /// disk in the message hot path.
+    async fn step_message(
+        &self,
+        request: Request<StepMessageRequest>,
+    ) -> std::result::Result<Response<StepMessageResponse>, Status> {
+        self.dispatch_step(request).await
+    }
+
+    async fn step_storage_v1(
+        &self,
+        request: Request<StepMessageRequest>,
+    ) -> std::result::Result<Response<StepMessageResponse>, Status> {
+        self.dispatch_step(request).await
     }
 
     /// Handle EC replication entries from a peer (Phase C).
@@ -2902,13 +2918,8 @@ struct WitnessServiceImpl {
     registry: Arc<WitnessZoneRegistry>,
 }
 
-#[tonic::async_trait]
-impl ZoneTransportService for WitnessServiceImpl {
-    /// Handle a raw raft-rs message forwarded from another node.
-    ///
-    /// Routes to the correct zone's ZoneConsensus by `req.zone_id`.
-    /// Auto-joins unknown zones (dynamic federation support).
-    async fn step_message(
+impl WitnessServiceImpl {
+    async fn dispatch_step(
         &self,
         request: Request<StepMessageRequest>,
     ) -> std::result::Result<Response<StepMessageResponse>, Status> {
@@ -2943,6 +2954,27 @@ impl ZoneTransportService for WitnessServiceImpl {
             .learn_peer_address(&req.zone_id, peer, &req.sender_address);
 
         step_raft_message(&node, message, &req.zone_id, "[Witness]").await
+    }
+}
+
+#[tonic::async_trait]
+impl ZoneTransportService for WitnessServiceImpl {
+    /// Handle a raw raft-rs message forwarded from another node.
+    ///
+    /// Routes to the correct zone's ZoneConsensus by `req.zone_id`.
+    /// Auto-joins unknown zones (dynamic federation support).
+    async fn step_message(
+        &self,
+        request: Request<StepMessageRequest>,
+    ) -> std::result::Result<Response<StepMessageResponse>, Status> {
+        self.dispatch_step(request).await
+    }
+
+    async fn step_storage_v1(
+        &self,
+        request: Request<StepMessageRequest>,
+    ) -> std::result::Result<Response<StepMessageResponse>, Status> {
+        self.dispatch_step(request).await
     }
 
     /// Witness nodes do not participate in EC replication.

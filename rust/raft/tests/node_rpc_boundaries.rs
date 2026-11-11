@@ -2,6 +2,8 @@
 //! consensus data are isolated; no fleet endpoint or model is used.
 #![cfg(all(feature = "grpc", has_protos))]
 mod common;
+#[path = "node_rpc_boundaries/storage_transport.rs"]
+mod storage_transport;
 
 use lib::transport_primitives::{FederatedClientCertVerifier, ForeignCaAnchor};
 use nexus_raft::transport::proto::{
@@ -1186,6 +1188,44 @@ async fn witness_checks_the_authenticated_sender_before_auto_join() {
         .await
         .unwrap();
     assert!(registry.get_node(accepted_zone).is_some());
+    let versioned_zone = "versioned-witness-zone";
+    transport
+        .step_storage_v1(StepMessageRequest {
+            message: message.write_to_bytes().unwrap(),
+            zone_id: versioned_zone.into(),
+            sender_address: "127.0.0.1:19998".into(),
+        })
+        .await
+        .unwrap();
+    assert!(registry.get_node(versioned_zone).is_some());
+    message.set_from(7);
+    let refused_zone = "versioned-forged-witness-zone";
+    assert_eq!(
+        transport
+            .step_storage_v1(StepMessageRequest {
+                message: message.write_to_bytes().unwrap(),
+                zone_id: refused_zone.into(),
+                sender_address: "127.0.0.1:19999".into(),
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    assert!(registry.get_node(refused_zone).is_none());
+    assert!(!private.path().join(refused_zone).exists());
+    assert_eq!(
+        replica
+            .step_storage_v1(StepMessageRequest {
+                message: vec![0xff],
+                zone_id: versioned_zone.into(),
+                sender_address: String::new(),
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
     stop.send(()).unwrap();
     running.await.unwrap();
     registry.shutdown_all();
