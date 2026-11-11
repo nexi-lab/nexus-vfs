@@ -756,7 +756,7 @@ pub fn read_or_mint_node_id(zones_dir: &str) -> Result<u64, String> {
                 tmp.sync_all()
                     .map_err(|e| format!("sync tmp node id file '{}': {e}", tmp_path.display()))?;
             }
-            std::fs::rename(&tmp_path, &final_path).map_err(|e| {
+            lib::file_durability::replace_file(&tmp_path, &final_path).map_err(|e| {
                 format!(
                     "rename '{}' -> '{}': {e}",
                     tmp_path.display(),

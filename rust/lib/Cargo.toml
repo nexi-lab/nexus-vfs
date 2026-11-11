@@ -45,7 +45,7 @@ runtime-bridge = ["dep:tokio", "tokio/rt", "tokio/rt-multi-thread"]
 redb-storage = ["dep:redb", "dep:tempfile", "file-storage"]
 
 # Native filesystem synchronization; excluded from portable algorithm callers.
-file-storage = []
+file-storage = ["dep:windows-sys"]
 
 [dependencies]
 # Constants SSOT — pulled unconditionally because the crate is
@@ -106,7 +106,7 @@ x509-parser = { version = "0.18", features = ["verify"], optional = true }
 getrandom = { version = "0.4", features = ["wasm_js"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_WindowsProgramming"] }
 
 [dev-dependencies]
 proptest = "1.5"

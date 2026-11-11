@@ -40,7 +40,7 @@ fn guarded_wal_append_wakes_a_parked_kernel_tail_through_its_mount() {
     // Use the actual production coordinator and its apply observer / cold
     // materializer. The mounted spelling differs from the owning WAL path.
     let ops = Arc::new(transport::federation::FederationClient::new(
-        fixture.kernel.runtime().clone(),
+        fixture.kernel.runtime().handle().clone(),
         None,
     ));
     Arc::new(nexus_raft::distributed_coordinator::RaftDistributedCoordinator::new())

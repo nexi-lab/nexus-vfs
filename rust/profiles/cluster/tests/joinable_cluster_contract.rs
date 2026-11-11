@@ -207,9 +207,9 @@ async fn share_against_a_running_daemon_explains_itself() {
     let e = env(&data, &id, &adv);
 
     let mut d = Daemon::spawn(&["--bind-addr", &adv], &e);
-    d.wait_tcp(port, BUDGET)
+    d.wait_ready(BUDGET)
         .await
-        .expect("daemon serves (holds the data-dir lock)");
+        .expect("daemon finishes boot (holds the data-dir lock)");
 
     let (ok, out, err) = cli(&e, &["share", MOUNT, "--zone-id", ZONE]);
     assert!(

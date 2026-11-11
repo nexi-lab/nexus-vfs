@@ -428,7 +428,7 @@ fn build_kernel(manager: &Arc<ZoneManager>, addr: &str) -> Arc<Kernel> {
         Arc::new(store(manager, "root")),
     );
     let ops = Arc::new(transport::federation::FederationClient::new(
-        Arc::clone(kernel.runtime()),
+        kernel.runtime().handle().clone(),
         None,
     ));
     Arc::new(RaftDistributedCoordinator::new()).install_with_kernel(

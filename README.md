@@ -132,6 +132,36 @@ process. These are node-local registry operations; independent CLI lifetime
 ownership, typed observations and authorized cross-node routing remain separate
 discovery work. No protobuf message changes are required for this Call contract.
 
+Transient engine observations use the shared Rust contract in
+`contracts::runtime_status`. The `agent_runtime_{register,publish,heartbeat,
+unregister,get,list}_v1` Call methods preserve separate running instances of
+one Agent or durable session. Their identity contains the registry's boot
+scope, logical PID and the same native `AgentInstance` incarnation used above.
+Runtime registrations require that incarnation on legacy operations too;
+their immutable wire policy cannot be downgraded by omitting a token.
+Registration retries additionally retain their admission intent, so a lost
+response cannot make a caller adopt a replacement registration.
+
+Foreground activity and background worker counts come from the engine's
+read-only `RuntimeFacts` source through `RuntimeObservationHost`. The registry
+owns observation revisions and expiry. Attendance (`online` or `unknown`) is
+independent of fact availability (`fresh`, `stale`, `unsupported` or
+`unavailable`). A heartbeat confirms attendance without refreshing old work
+facts. An expired observation never implies idle work or a confirmed exit.
+Neither transcript contents nor silence are an activity source.
+
+`runtime_directory.list_v1` uses the existing authenticated Rust-service and
+federation client to query coordinator-known peers. The host supplies its
+canonical discovery namespace; the existing VFS mount table selects that
+namespace's peer-routing zone. This stays separate from the caller's
+owner/zone metadata filter, since each node's root is local while its mailbox
+namespace can route through a shared zone. Queries use node mTLS rather than
+forwarding caller credentials,
+and reports unavailable scopes separately from complete empty inventories.
+Each registry remains authoritative for its own instances; this directory
+does not replicate activity or grant process control. Its peer queries share
+one bounded deadline. Unsupported or disconnected nodes remain explicit.
+
 `managed_agent.start_session_v1` retains its existing `session_id` response:
 this is the registry pid used by `get_session_v1`, `cancel_v1`, and `/proc`.
 An in-process runtime can additionally return `durable_session_id`, the key of
