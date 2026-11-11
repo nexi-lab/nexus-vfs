@@ -33,7 +33,7 @@ impl MembershipPolicy {
     pub(crate) fn validate_entry(self, entry: &Entry) -> Result<()> {
         if entry.get_entry_type() == EntryType::EntryNormal && !entry.data.is_empty() {
             let (_, command) = Command::from_log_data(&entry.data)?;
-            if self == Self::Managed && command.requires_fixed_local_storage() {
+            if self == Self::Managed && command.storage_protocol().is_some() {
                 return Err(RaftError::Config(
                     "conditional metadata log requires qualified fixed-local storage".into(),
                 ));

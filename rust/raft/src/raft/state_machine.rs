@@ -337,22 +337,6 @@ pub enum Command {
 }
 
 impl Command {
-    pub(crate) fn requires_fixed_local_storage(&self) -> bool {
-        matches!(
-            self,
-            Self::WriteVersionedMetadata { .. }
-                | Self::AdoptProtectedMetadata { .. }
-                | Self::RenameMetadata { .. }
-                | Self::BindRecordGuard { .. }
-                | Self::GuardedRecord { .. }
-                | Self::RetireRecordGuard { .. }
-                | Self::AdmitRecordIoOwner { .. }
-                | Self::ApplyReplicaBinding(_)
-                | Self::ReserveNodeIdentity(_)
-                | Self::ApplyReplicaIssuance(_)
-        )
-    }
-
     /// Ordinary commands that replace, remove or reinterpret a metadata image.
     pub(super) fn ordinary_metadata_key(&self) -> Option<&str> {
         match self {

@@ -44,6 +44,7 @@ mod apply_observer;
 mod error;
 pub mod replication_log;
 mod state_machine;
+mod storage_protocol;
 #[cfg(all(feature = "grpc", has_protos))]
 pub mod zone_persistence;
 
