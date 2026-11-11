@@ -233,14 +233,65 @@ async fn scoped_blob_rpc_cannot_use_a_known_hash_or_forged_pointer_to_read_other
             .code(),
         tonic::Code::PermissionDenied
     );
+    // The locator resolves the existing committed segment index in the same
+    // physically isolated namespace; a forged index cannot cross that boundary.
+    let sealed_path = "/sealed-history";
+    let prefix = wal_stream_prefix(sealed_path);
+    let segment_bytes = b"actual specialized cold segment bytes";
+    let segment_hash = namespaces[0]
+        .backend()
+        .write_content(segment_bytes, "", &boot, 0)
+        .unwrap()
+        .content_id;
+    for source in [&metadata[0], &metadata[1]] {
+        source
+            .put(
+                sealed_path,
+                FileMetadata {
+                    path: sealed_path.into(),
+                    entry_type: DT_STREAM,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        for record in [b"one", b"two"] {
+            source.append_stream_entry(&prefix, record).unwrap();
+        }
+        source
+            .seal_stream_segment(
+                &prefix,
+                0,
+                2,
+                &segment_hash,
+                address,
+                segment_bytes.len() as u64,
+            )
+            .unwrap();
+        assert_eq!(source.stream_floor(&prefix).unwrap(), 2);
+    }
+    let sealed_locator = ColdSegmentAddress {
+        stream_path: sealed_path,
+        base: 0,
+    }
+    .key("agent-alice");
+    let forged_locator = ColdSegmentAddress {
+        stream_path: sealed_path,
+        base: 0,
+    }
+    .key("conversation-alice-bob");
     assert_replica_membership_controls_content(
         &manager,
         &address,
         &ca,
         &ca_key,
-        &private_hash,
-        private_bytes,
-        &global_hash,
+        FixtureBlobs {
+            private_hash: &private_hash,
+            private_bytes,
+            global_hash: &global_hash,
+            sealed_locator: &sealed_locator,
+            forged_locator: &forged_locator,
+            segment_bytes,
+        },
     )
     .await;
     let target = tempfile::tempdir().unwrap();
@@ -272,18 +323,34 @@ async fn scoped_blob_rpc_cannot_use_a_known_hash_or_forged_pointer_to_read_other
     .is_err());
 }
 
+/// Original fixture-owned data; RPC admission still derives from actual mTLS.
+struct FixtureBlobs<'a> {
+    private_hash: &'a str,
+    private_bytes: &'a [u8],
+    global_hash: &'a str,
+    sealed_locator: &'a str,
+    forged_locator: &'a str,
+    segment_bytes: &'a [u8],
+}
+
 async fn assert_replica_membership_controls_content(
     manager: &Arc<ZoneManager>,
     address: &str,
     ca: &[u8],
     ca_key: &[u8],
-    private_hash: &str,
-    private_bytes: &[u8],
-    global_hash: &str,
+    blobs: FixtureBlobs<'_>,
 ) {
     use nexus_raft::transport::proto::{
         GetClusterInfoRequest, JoinZoneRequest, QueryRequest, RemoveVoterRequest,
     };
+    let FixtureBlobs {
+        private_hash,
+        private_bytes,
+        global_hash,
+        sealed_locator,
+        forged_locator,
+        segment_bytes,
+    } = blobs;
     let (cert, key) = generate_node_cert(99, "root", ca, ca_key, &[], None).unwrap();
     let mut admin = connect(address, ca, cert, key).await;
     for (zone, id) in [
@@ -340,65 +407,19 @@ async fn assert_replica_membership_controls_content(
         .fetch_in_zone_async(address, "conversation-alice-bob", private_hash)
         .await
         .is_err());
-    // The locator resolves the existing committed segment index in the same
-    // physically isolated namespace; a forged index cannot cross that boundary.
-    let sealed_path = "/sealed-history";
-    let prefix = wal_stream_prefix(sealed_path);
-    let segment_bytes = b"actual specialized cold segment bytes";
-    let segment_hash = namespaces[0]
-        .backend()
-        .write_content(segment_bytes, "", &boot, 0)
-        .unwrap()
-        .content_id;
-    for source in [&metadata[0], &metadata[1]] {
-        source
-            .put(
-                sealed_path,
-                FileMetadata {
-                    path: sealed_path.into(),
-                    entry_type: DT_STREAM,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        for record in [b"one", b"two"] {
-            source.append_stream_entry(&prefix, record).unwrap();
-        }
-        source
-            .seal_stream_segment(
-                &prefix,
-                0,
-                2,
-                &segment_hash,
-                address,
-                segment_bytes.len() as u64,
-            )
-            .unwrap();
-        assert_eq!(source.stream_floor(&prefix).unwrap(), 2);
-    }
-    let sealed_locator = ColdSegmentAddress {
-        stream_path: sealed_path,
-        base: 0,
-    }
-    .key("agent-alice");
     assert_eq!(
         alice_peer
-            .fetch_in_zone_async(address, "agent-alice", &sealed_locator)
+            .fetch_in_zone_async(address, "agent-alice", sealed_locator)
             .await
             .unwrap(),
         segment_bytes
     );
-    let forged_locator = ColdSegmentAddress {
-        stream_path: sealed_path,
-        base: 0,
-    }
-    .key("conversation-alice-bob");
     assert!(alice_peer
-        .fetch_in_zone_async(address, "conversation-alice-bob", &forged_locator)
+        .fetch_in_zone_async(address, "conversation-alice-bob", forged_locator)
         .await
         .is_err());
     assert!(alice_peer
-        .fetch_in_zone_async(address, "conversation-alice-bob", &sealed_locator)
+        .fetch_in_zone_async(address, "conversation-alice-bob", sealed_locator)
         .await
         .is_err());
     let retained = alice
@@ -521,7 +542,7 @@ async fn assert_replica_membership_controls_content(
         .await
         .is_err());
     assert!(alice_peer
-        .fetch_in_zone_async(address, "agent-alice", &sealed_locator)
+        .fetch_in_zone_async(address, "agent-alice", sealed_locator)
         .await
         .is_err());
     assert_eq!(
