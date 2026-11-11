@@ -48,6 +48,7 @@ jobs:
       - run: cargo test --locked -p raft@0.1.0 --test generated_contract_binding
       - name: Durable replica allocation authority
         run: |
+          cargo test --locked -p raft@0.1.0 --lib raft::node::storage_submission_tests
           cargo test --locked -p raft@0.1.0 --lib raft::state_machine::replica_binding::tests
           cargo test --locked -p raft@0.1.0 --lib raft::state_machine::node_identity::tests
           cargo test --locked -p raft@0.1.0 --lib raft::state_machine::replica_issuance::tests
