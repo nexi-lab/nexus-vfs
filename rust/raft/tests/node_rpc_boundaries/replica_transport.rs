@@ -4,6 +4,9 @@ use super::reader_preparation::{node_tls, pool, reopened};
 use super::*;
 use nexus_raft::transport::{NodeAddress, TransportError};
 
+#[path = "replica_transport/wire_observation.rs"]
+mod wire_observation;
+
 fn heartbeat(from: u64, to: u64) -> Vec<u8> {
     let mut message = raft::eraftpb::Message::default();
     message.set_msg_type(raft::eraftpb::MessageType::MsgHeartbeat);
